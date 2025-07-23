@@ -16,7 +16,7 @@ This document provides a comprehensive visual mapping of the DeepStream video pr
 
 RTSP Streams (config.py):
 ├── Living Room Camera: rtsp://192.168.3.214:7447/jdr9oLlBkjyl3gDm? (1920x1080) ✅ ENABLED
-├── Kitchen Camera: rtsp://192.168.3.214:7447/qt3VqVdZpgG1B4Vk? (1920x1080) ❌ DISABLED  
+├── Kitchen Camera: rtsp://192.168.3.214:7447/qt3VqVdZpgG1B4Vk? (1920x1080) ❌ DISABLED
 └── Family Room Camera: rtsp://192.168.3.214:7447/4qWTBhW6b4nLeUFE? (1280x720) ❌ DISABLED
 
 ┌─────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
@@ -155,7 +155,7 @@ deepstream_video_pipeline.py:
 └─────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
 
 ┌─────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
-│                                        UNIFIED GPU PIPELINE LAYER                                           │
+│                                        PYTHON APPLICATION LAYER                                             │
 └─────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
 
 main.py (DeepStreamProcessorWrapper):
@@ -163,32 +163,9 @@ main.py (DeepStreamProcessorWrapper):
 │  PIPELINE LOOP                                                                                              │
 ├─────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
 │ _processing_loop()                                                                                          │
-│ ├── Stage 1: DeepStream Read                                                                                │
-│ │   ├── deepstream_processor.read_gpu_tensor()                                                             │
-│ │   ├── GPU Tensor Validation                                                                               │
-│ │   └── Performance Optimization (if enabled)                                                               │
-│ │                                                                                                           │
-│ ├── Stage 2: DeepStream Preprocessing (Integrated)                                                          │
-│ │   ├── No additional preprocessing needed                                                                  │
-│ │   └── Use DeepStream preprocessed tensor directly                                                         │
-│ │                                                                                                           │
-│ ├── Stage 3: TensorRT Inference                                                                             │
-│ │   ├── _process_tensor_gpu_only()                                                                          │
-│ │   ├── GPUOnlyDetectionManager                                                                             │
-│ │   └── TensorRTModelManager (shared)                                                                       │
-│ │                                                                                                           │
-│ ├── Stage 4: Tracking (Optional)                                                                            │
-│ │   ├── TrackingSystem.update()                                                                             │
-│ │   └── ByteTrack algorithm                                                                                 │
-│ │                                                                                                           │
-│ ├── Stage 5: Visualization Conversion                                                                       │
-│ │   ├── _tensor_to_numpy_bgr() (ONLY GPU→CPU transfer)                                                     │
-│ │   └── OpenCV format for visualization                                                                     │
-│ │                                                                                                           │
-│ └── Stage 6: Analysis Frame Creation                                                                        │
-│     ├── AnalysisFrame object                                                                                │
-│     ├── DetectionResult conversion                                                                          │
-│     └── Output to analysis_frame_queue                                                                      │
+│ ├── Read from DeepStream: deepstream_processor.read_gpu_tensor()                                           │
+│ ├── Convert to AnalysisFrame: _convert_to_analysis_frame()                                                 │
+│ └── Output to analysis_frame_queue                                                                        │
 └─────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
 
 ┌─────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
@@ -301,11 +278,10 @@ WebSocket Clients:
 - **Memory**: GPU memory only (no CPU transfer)
 - **Fallback**: Inference metadata if preprocessing metadata unavailable
 
-### 4. Unified Pipeline
-- **Processing**: TensorRT inference on GPU
-- **Tracking**: ByteTrack algorithm (configurable)
-- **Conversion**: Single GPU→CPU transfer for visualization
-- **Output**: AnalysisFrame objects
+### 4. Python Application
+- **Wrapper**: `DeepStreamProcessorWrapper` coordinates the pipeline.
+- **Conversion**: Converts DeepStream metadata into `AnalysisFrame` objects.
+- **Output**: Pushes `AnalysisFrame` objects to a queue for the main application.
 
 ### 5. WebSocket Streaming
 - **Format**: Binary messages with JPEG frames

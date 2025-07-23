@@ -38,16 +38,16 @@ inverse-roi=0
 class-id=-1
 
 # Line crossing detection for stream 0
-[line-crossing-stream-0]
-enable=1
+#[line-crossing-stream-0]
+#enable=1
 # Define crossing line: Entry line across middle of frame (full width)
-line-crossing-Entry=0;360;1280;360
+#line-crossing-Entry=0;360;1280;360
 # Apply to all vehicle classes (0=vehicle, 2=person)
-class-id=-1
+#class-id=-1
 # Extended mode: 0=exact line crossing, 1=extended line
-extended=0
+#extended=0
 # Detection mode: loose, balanced, strict
-mode=balanced
+#mode=balanced
 
 # Direction detection for stream 0
 [direction-detection-stream-0]

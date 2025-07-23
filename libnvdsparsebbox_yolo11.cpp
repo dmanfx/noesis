@@ -26,6 +26,19 @@
 #include "nvdsinfer_custom_impl.h"
 
 #include "utils.h"
+#include <algorithm>
+
+// ------------------------------------------------------------
+// Uncomment the line below to enable verbose parser debugging.
+// #define Y11_DEBUG
+// ------------------------------------------------------------
+
+// Provide local clamp implementation to avoid undefined symbol at runtime
+inline float clamp(const float val, const float minVal, const float maxVal)
+{
+    return std::max(minVal, std::min(maxVal, val));
+}
+
 
 extern "C" bool
 NvDsInferParseYolo(std::vector<NvDsInferLayerInfo> const& outputLayersInfo, NvDsInferNetworkInfo const& networkInfo,
@@ -71,13 +84,34 @@ addBBoxProposal(const float bx1, const float by1, const float bx2, const float b
 
 static std::vector<NvDsInferParseObjectInfo>
 decodeTensorYolo(const float* output, const uint& outputSize, const uint& netW, const uint& netH,
-    const std::vector<float>& preclusterThreshold)
+    const std::vector<float>& preclusterThreshold, const unsigned int numClassesConfigured)
 {
   std::vector<NvDsInferParseObjectInfo> binfo;
+
+  static bool first_call = true;
+#ifdef Y11_DEBUG
+  std::cout << "YOLO11 Parser: Processing " << outputSize << " detections, configured for "
+            << numClassesConfigured << " classes" << std::endl;
+#else
+  if (first_call) {
+      std::cout << "YOLO11 Parser active – keeping class IDs in range 0-" << (numClassesConfigured - 1)
+                << std::endl;
+      first_call = false;
+  }
+#endif
 
   for (uint b = 0; b < outputSize; ++b) {
     float maxProb = output[b * 6 + 4];
     int maxIndex = (int) output[b * 6 + 5];
+
+    // Check if the detected class is within the configured range
+    if (maxIndex >= (int)numClassesConfigured) {
+#ifdef Y11_DEBUG
+      std::cout << "YOLO11 Parser: Skipping class " << maxIndex
+                << " (outside configured range)" << std::endl;
+#endif
+      continue;
+    }
 
     if (maxProb < preclusterThreshold[maxIndex]) {
       continue;
@@ -88,9 +122,17 @@ decodeTensorYolo(const float* output, const uint& outputSize, const uint& netW, 
     float bx2 = output[b * 6 + 2];
     float by2 = output[b * 6 + 3];
 
+#ifdef Y11_DEBUG
+    std::cout << "YOLO11 Parser: Adding detection - class: " << maxIndex
+              << ", confidence: " << maxProb << std::endl;
+#endif
+
     addBBoxProposal(bx1, by1, bx2, by2, netW, netH, maxIndex, maxProb, binfo);
   }
 
+#ifdef Y11_DEBUG
+  std::cout << "YOLO11 Parser: Total detections after filtering: " << binfo.size() << std::endl;
+#endif
   return binfo;
 }
 
@@ -109,8 +151,10 @@ NvDsInferParseCustomYolo(std::vector<NvDsInferLayerInfo> const& outputLayersInfo
   const NvDsInferLayerInfo& output = outputLayersInfo[0];
   const uint outputSize = output.inferDims.d[0];
 
+  // Pass numClassesConfigured to the decoder for class filtering
   std::vector<NvDsInferParseObjectInfo> outObjs = decodeTensorYolo((const float*) (output.buffer), outputSize,
-      networkInfo.width, networkInfo.height, detectionParams.perClassPreclusterThreshold);
+      networkInfo.width, networkInfo.height, detectionParams.perClassPreclusterThreshold, 
+      detectionParams.numClassesConfigured);
 
   objects.insert(objects.end(), outObjs.begin(), outObjs.end());
 

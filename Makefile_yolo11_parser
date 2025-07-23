@@ -1,0 +1,51 @@
+# Makefile for YOLO11 Custom Parser
+# DeepStream 7.1 + YOLO11 Integration
+
+# Compiler and flags
+CXX = g++
+CXXFLAGS = -std=c++14 -fPIC -shared -O2
+INCLUDES = -I/opt/nvidia/deepstream/deepstream-7.1/sources/includes \
+           -I/usr/local/cuda/include \
+           -I/usr/include/opencv4
+
+# Libraries
+LIBS = -L/opt/nvidia/deepstream/deepstream-7.1/lib \
+       -L/usr/local/cuda/lib64 \
+       -lnvinfer \
+       -lnvonnxparser \
+       -lcudart
+
+# Target
+TARGET = libnvdsparsebbox_yolo11.so
+
+# Source files
+SOURCES = libnvdsparsebbox_yolo11.cpp
+
+# Default target
+all: $(TARGET)
+
+$(TARGET): $(SOURCES)
+	$(CXX) $(CXXFLAGS) $(INCLUDES) -o $@ $^ $(LIBS)
+
+# Install target
+install: $(TARGET)
+	sudo cp $(TARGET) /opt/nvidia/deepstream/deepstream-7.1/lib/
+	sudo chmod 755 /opt/nvidia/deepstream/deepstream-7.1/lib/$(TARGET)
+
+# Clean target
+clean:
+	rm -f $(TARGET)
+
+# Test target
+test: $(TARGET)
+	@echo "Testing YOLO11 parser compilation..."
+	@if [ -f $(TARGET) ]; then \
+		echo "✓ Parser compiled successfully"; \
+		echo "✓ Library: $(TARGET)"; \
+		echo "✓ Size: $$(ls -lh $(TARGET) | awk '{print $$5}')"; \
+	else \
+		echo "✗ Parser compilation failed"; \
+		exit 1; \
+	fi
+
+.PHONY: all install clean test 

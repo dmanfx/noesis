@@ -1,0 +1,383 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# PyInstaller
+*.manifest
+*.spec
+
+# Installer logs
+pip-log.txt
+pip-delete-this-directory.txt
+
+# Unit test / coverage reports
+htmlcov/
+.tox/
+.nox/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+*.py,cover
+.hypothesis/
+.pytest_cache/
+cover/
+
+# Virtual environments
+.env
+.venv
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+bin/
+pyvenv.cfg
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# IPython
+profile_default/
+ipython_config.py
+
+# pyenv
+.python-version
+
+# pipenv
+Pipfile.lock
+
+# poetry
+poetry.lock
+
+# pdm
+.pdm.toml
+
+# PEP 582
+__pypackages__/
+
+# Celery stuff
+celerybeat-schedule
+celerybeat.pid
+
+# SageMath parsed files
+*.sage.py
+
+# Environments
+.env
+.venv
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+# Spyder project settings
+.spyderproject
+.spyproject
+
+# Rope project settings
+.ropeproject
+
+# mkdocs documentation
+/site
+
+# mypy
+.mypy_cache/
+.dmypy.json
+dmypy.json
+
+# Pyre type checker
+.pyre/
+
+# pytype static type analyzer
+.pytype/
+
+# Cython debug symbols
+cython_debug/
+
+# PyCharm
+.idea/
+
+# VS Code
+.vscode/
+*.code-workspace
+
+# DeepStream specific
+*.so
+*.engine
+*.trt
+*.onnx
+*.pt
+*.pth
+*.weights
+*.caffemodel
+*.prototxt
+*.uff
+*.uff.txt
+
+# Model files (large binary files)
+models/*.onnx
+models/*.pt
+models/*.pth
+models/*.engine
+models/*.trt
+models/*.weights
+models/*.caffemodel
+models/*.uff
+models/engines/
+models/incl/
+
+# Logs
+logs/
+*.log
+*.log.*
+debug_log.txt
+phase1_test.log
+mp4_test.log
+ds_dbg*.log
+gst_debug.log
+output.log
+profiler.jsonl
+
+# Output directories
+output/
+output/rtsp_0/
+output/test_deepstream/
+
+# Temporary files
+*.tmp
+*.temp
+*.swp
+*.swo
+*~
+
+# OS generated files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Backup files
+*.bak
+*.backup
+*.old
+migration_backup/
+config_backup_*.py
+
+# Build artifacts
+build/
+*.o
+*.obj
+*.exe
+*.dll
+*.so
+*.dylib
+*.a
+*.lib
+*.app
+
+# Custom build directories
+custom_preprocess_build/
+*.tar.gz
+*.tar.bz2
+*.zip
+
+# DeepStream build artifacts
+libnvdsparsebbox_*.so
+libcustom2d_preprocess*.so
+libproxy_fake.so
+
+# Configuration backups
+env_*.txt
+config_backup_*.py
+
+# Test artifacts
+.pytest_cache/
+.ruff_cache/
+test_*.log
+
+# Performance and profiling
+*.prof
+*.profile
+performance_*.log
+
+# Database files
+*.db
+*.sqlite
+*.sqlite3
+
+# Cache directories
+.cache/
+cache/
+__pycache__/
+
+# Documentation builds
+docs/_build/
+docs/build/
+
+# Node.js (for electron-frontend)
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Electron build
+electron-frontend/dist/
+electron-frontend/build/
+
+# Large media files
+*.mp4
+*.avi
+*.mov
+*.mkv
+*.flv
+*.wmv
+*.webm
+*.m4v
+*.3gp
+*.mp3
+*.wav
+*.flac
+*.aac
+*.ogg
+
+# Image files (if not needed in repo)
+*.png
+*.jpg
+*.jpeg
+*.gif
+*.bmp
+*.tiff
+*.svg
+*.ico
+*.webp
+
+# Screenshots (usually not needed in repo)
+Screenshot_*.png
+
+# Third party libraries
+third_party/
+installers/
+
+# Embedded git repositories
+DeepStream-Yolo/
+deepstream_python_apps/
+
+# System directories
+opt/
+bin/
+
+# Deprecated code
+.deprecated/
+
+# Environment specific
+.env.local
+.env.development
+.env.test
+.env.production
+
+# IDE specific
+*.sublime-project
+*.sublime-workspace
+
+# Temporary directories
+tmp/
+temp/
+.tmp/
+
+# Lock files (if using package managers)
+package-lock.json
+yarn.lock
+
+# Local configuration
+config.local.json
+config.local.py
+settings.local.py
+
+# GPU memory dumps
+*.dump
+*.core
+
+# TensorRT cache
+.trt_cache/
+
+# CUDA cache
+.nv/
+
+# DeepStream cache
+.nvds_cache/
+
+# Profiling data
+*.nsys-rep
+*.qdrep
+*.qdstrm
+
+# Performance reports
+performance_reports/
+benchmark_results/
+
+# Runtime data
+runtime_data/
+temp_data/
+
+# Backup archives
+*.tar
+*.gz
+*.bz2
+*.xz
+*.7z
+*.rar
+*.zip
+
+# Large data files
+*.csv
+*.json
+*.xml
+*.yaml
+*.yml
+data/
+datasets/
+
+# Model checkpoints
+checkpoints/
+*.ckpt
+*.pkl
+*.pickle
+
+# Jupyter notebook outputs
+*.ipynb
+
+# Documentation builds
+docs/build/
+docs/_build/
+site/
+
+# Local development
+.local/
+local/ 

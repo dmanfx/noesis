@@ -1,0 +1,1593 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <title>Smart Room Dashboard</title>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <script src="https://cdn.jsdelivr.net/npm/hls.js@latest"></script>
+    <style>
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            margin: 0;
+            padding: 0;
+            background-color: #f5f5f5;
+            color: #333;
+        }
+        
+        .dashboard {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            grid-template-rows: auto auto minmax(650px, auto);
+            grid-gap: 20px;
+            padding: 20px;
+            max-width: 1800px;
+            margin: 0 auto;
+        }
+        
+        .header {
+            grid-column: 1 / -1;
+            background-color: #2c3e50;
+            color: white;
+            padding: 15px;
+            border-radius: 5px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+        
+        .header h1 {
+            margin: 0;
+            font-size: 1.8rem;
+        }
+        
+        .stats-panel {
+            margin-top: 10px;
+            background: white;
+            border-radius: 5px;
+            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+            padding: 15px;
+        }
+        
+        .video-feed {
+            background: white;
+            border-radius: 5px;
+            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+            padding: 15px;
+            text-align: center;
+        }
+        
+        .top-down-view {
+            grid-column: 1 / -1;
+            background: white;
+            border-radius: 5px;
+            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+            padding: 15px;
+            text-align: center;
+            height: 500px;
+        }
+        
+        .analytics-view {
+            grid-column: 1 / -1;
+            background: white;
+            border-radius: 5px;
+            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+            padding: 15px;
+            text-align: center;
+            height: 500px;
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            grid-gap: 15px;
+        }
+        
+        .performance-view {
+            grid-column: 1 / -1;
+            background: white;
+            border-radius: 5px;
+            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+            padding: 15px;
+            text-align: center;
+        }
+        
+        h2 {
+            margin-top: 0;
+            color: #2c3e50;
+            border-bottom: 1px solid #eee;
+            padding-bottom: 10px;
+        }
+        
+        .video-feed img {
+            max-width: 100%;
+            height: auto;
+            border: 1px solid #ddd;
+            border-radius: 3px;
+        }
+        
+        .occupancy {
+            display: flex;
+            justify-content: space-around;
+            margin-bottom: 20px;
+        }
+        
+        .zone-count {
+            text-align: center;
+            padding: 10px;
+        }
+        
+        .zone-count h3 {
+            margin: 0;
+            font-size: 1.2rem;
+        }
+        
+        .zone-count .count {
+            font-size: 2rem;
+            font-weight: bold;
+            color: #2980b9;
+        }
+        
+        table {
+            width: 100%;
+            border-collapse: collapse;
+        }
+        
+        table th, table td {
+            padding: 8px;
+            text-align: left;
+            border-bottom: 1px solid #ddd;
+        }
+        
+        table th {
+            background-color: #f2f2f2;
+        }
+        
+        #floorPlan {
+            width: 100%;
+            height: 100%;
+            background-color: #f9f9f9;
+            border: 1px solid #ddd;
+        }
+        
+        #heatmapView {
+            width: 100%;
+            height: 100%;
+            background-color: #f9f9f9;
+            border: 1px solid #ddd;
+            position: relative;
+        }
+        
+        .person-marker {
+            position: absolute;
+            width: 12px;
+            height: 12px;
+            border-radius: 50%;
+            background-color: #e74c3c;
+            transform: translate(-50%, -50%);
+            box-shadow: 0 0 5px rgba(0,0,0,0.5);
+            z-index: 10;
+            transition: left 0.3s ease, top 0.3s ease; /* Smooth movement */
+        }
+        
+        .person-marker.selected {
+            width: 18px;
+            height: 18px;
+            background-color: #f39c12;
+            box-shadow: 0 0 8px rgba(243, 156, 18, 0.8);
+            z-index: 15;
+        }
+        
+        .person-id-label {
+            position: absolute;
+            top: -18px;
+            left: -5px;
+            font-size: 10px;
+            background-color: rgba(0,0,0,0.6);
+            color: white;
+            padding: 1px 4px;
+            border-radius: 3px;
+            font-weight: bold;
+        }
+        
+        .path-trail {
+            position: absolute;
+            height: 3px;
+            background-color: rgba(231, 76, 60, 0.5);
+            transform-origin: left center;
+            transition: opacity 0.5s ease;
+        }
+        
+        .living-room-zone, .kitchen-zone {
+            position: absolute;
+            border: 2px dashed #3498db;
+            background-color: rgba(52, 152, 219, 0.1);
+            z-index: 1;
+        }
+        
+        .zone-label {
+            position: absolute;
+            background-color: rgba(52, 152, 219, 0.7);
+            color: white;
+            padding: 3px 8px;
+            border-radius: 3px;
+            font-size: 12px;
+            z-index: 2;
+        }
+        
+        .heatmap-point {
+            position: absolute;
+            border-radius: 50%;
+            transform: translate(-50%, -50%);
+            opacity: 0.7;
+        }
+        
+        .system-metric {
+            display: inline-block;
+            margin: 10px;
+            padding: 15px;
+            background-color: #f8f9fa;
+            border-radius: 5px;
+            text-align: center;
+            min-width: 150px;
+        }
+        
+        .system-metric .value {
+            font-size: 1.5rem;
+            font-weight: bold;
+            color: #2980b9;
+        }
+        
+        .tabs {
+            display: flex;
+            margin-bottom: 15px;
+        }
+        
+        .tab {
+            padding: 10px 20px;
+            background-color: #f8f9fa;
+            border: 1px solid #ddd;
+            border-bottom: none;
+            border-radius: 5px 5px 0 0;
+            margin-right: 5px;
+            cursor: pointer;
+        }
+        
+        .tab.active {
+            background-color: #fff;
+            border-bottom: 1px solid #fff;
+        }
+        
+        .tab-content {
+            display: none;
+            height: 100%;
+        }
+        
+        .tab-content.active {
+            display: block;
+        }
+        
+        #dwellTimeChart, #trafficChart {
+            width: 100%;
+            height: 400px;
+            background-color: #f9f9f9;
+            border: 1px solid #ddd;
+        }
+        
+        .video-container {
+            position: relative;
+            margin-bottom: 10px;
+            background-color: #000;
+            width: 100%;
+            padding-top: 56.25%;
+            height: 0;
+        }
+        .video-container video {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            object-fit: contain;
+        }
+        .fullscreen-button {
+            position: absolute;
+            bottom: 10px;
+            right: 10px;
+            padding: 5px 10px;
+            background-color: rgba(0, 0, 0, 0.6);
+            color: white;
+            border: 1px solid white;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 12px;
+            z-index: 10;
+        }
+        .fullscreen-button:hover {
+            background-color: rgba(0, 0, 0, 0.8);
+        }
+
+        /* Style for the scrollable table container */
+        .scrollable-table-container {
+            max-height: 210px; /* Approx 4-5 rows + header */
+            overflow-y: auto;  /* Enable vertical scroll */
+            border: 1px solid #eee; /* Optional: visual border */
+            margin-bottom: 20px; /* Space below the table before the next heading */
+        }
+        
+        .camera-indicator {
+            position: absolute;
+            width: 16px;
+            height: 16px;
+            background-color: #3498db;
+            border-radius: 50%;
+            transform: translate(-50%, -50%);
+            z-index: 5;
+            box-shadow: 0 0 0 2px white;
+        }
+        
+        .camera-indicator:after {
+            content: '';
+            position: absolute;
+            width: 0;
+            height: 0;
+            bottom: -8px;
+            left: 50%;
+            transform: translateX(-50%);
+            border-left: 8px solid transparent;
+            border-right: 8px solid transparent;
+            border-top: 8px solid #3498db;
+        }
+        
+        .camera-label {
+            position: absolute;
+            top: -24px;
+            left: 50%;
+            transform: translateX(-50%);
+            background-color: rgba(52, 152, 219, 0.8);
+            color: white;
+            padding: 2px 6px;
+            border-radius: 3px;
+            font-size: 10px;
+            white-space: nowrap;
+        }
+        
+        /* Styles for highlighted table rows */
+        #tracked-people tbody tr {
+            cursor: pointer;
+            transition: background-color 0.2s;
+        }
+        
+        #tracked-people tbody tr:hover {
+            background-color: #f5f5f5;
+        }
+        
+        #tracked-people tbody tr.selected {
+            background-color: #f8f4e5;
+            border-left: 3px solid #f39c12;
+        }
+    </style>
+</head>
+<body>
+    <div class="dashboard">
+        <div class="header">
+            <h1>Smart Room Dashboard</h1>
+            <div>
+                <span id="date-time"></span>
+                <button onclick="refreshData()">Refresh Data</button>
+            </div>
+        </div>
+        
+        <div class="video-feed">
+            <h2>Living Room</h2>
+            <div class="video-container">
+                <video id="living-stream" autoplay muted playsinline></video>
+                <button class="fullscreen-button" data-video-id="living-stream">Fullscreen</button>
+            </div>
+        </div>
+        
+        <div class="video-feed">
+            <h2>Kitchen</h2>
+            <div class="video-container">
+                <video id="kitchen-stream" autoplay muted playsinline></video>
+                <button class="fullscreen-button" data-video-id="kitchen-stream">Fullscreen</button>
+            </div>
+        </div>
+        
+        <div class="stats-panel">
+            <h2>Room Occupancy</h2>
+            <div class="occupancy">
+                <div class="zone-count">
+                    <h3>Living Room</h3>
+                    <div id="living-room-count" class="count">0</div>
+                </div>
+                <div class="zone-count">
+                    <h3>Kitchen</h3>
+                    <div id="kitchen-count" class="count">0</div>
+                </div>
+            </div>
+            
+            <h2>Tracked People</h2>
+            <table id="tracked-people">
+                <thead>
+                    <tr>
+                        <th>Time</th>
+                        <th>ID</th>
+                        <th>Camera</th>
+                        <th>Zone</th>
+                        <th>Direction</th>
+                        <th>Speed (px/s)</th>
+                        <th>Dwell Time (s)</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <!-- Will be populated with JavaScript -->
+                </tbody>
+            </table>
+        </div>
+        
+        <div class="stats-panel" id="transitions-perf-panel">
+            <h2>Recent Zone Transitions</h2>
+            <div class="scrollable-table-container">
+                <table id="zone-transitions">
+                    <thead>
+                        <tr>
+                            <th>Time</th>
+                            <th>Person ID</th>
+                            <th>From</th>
+                            <th>To</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        <!-- Will be populated with JavaScript -->
+                    </tbody>
+                </table>
+            </div>
+            
+            <h2>System Performance</h2>
+            <div class="system-metrics">
+                <div class="system-metric">
+                    <div>Living Room FPS</div>
+                    <div id="fps-living" class="value">0</div>
+                </div>
+                <div class="system-metric">
+                    <div>Kitchen FPS</div>
+                    <div id="fps-kitchen" class="value">0</div>
+                </div>
+                <div class="system-metric">
+                    <div>Uptime</div>
+                    <div id="uptime" class="value">0s</div>
+                </div>
+                <div class="system-metric">
+                    <div>Detections</div>
+                    <div id="detections" class="value">0</div>
+                </div>
+            </div>
+        </div>
+        
+        <div class="top-down-view">
+            <h2>Top-Down View</h2>
+            <div id="floorPlan" style="position: relative;">
+                <!-- Zones will be added here -->
+                <div class="living-room-zone"></div>
+                <div class="zone-label living-room-label">Living Room</div>
+                
+                <div class="kitchen-zone"></div>
+                <div class="zone-label kitchen-label">Kitchen</div>
+                
+                <!-- Person markers and trails will be added dynamically -->
+            </div>
+        </div>
+        
+        <div class="analytics-view">
+            <div>
+                <h2>Movement Heatmap</h2>
+                <div class="tabs">
+                    <div class="tab active" onclick="switchTab('today', this)">Today</div>
+                    <div class="tab" onclick="switchTab('yesterday', this)">Yesterday</div>
+                    <div class="tab" onclick="switchTab('week', this)">This Week</div>
+                </div>
+                <div id="heatmapView" class="tab-content active" data-tab="today">
+                    <!-- Heatmap points will be rendered here dynamically -->
+                    <!-- Static zones removed - they are displayed in the Top-Down View -->
+                </div>
+                <div id="yesterdayHeatmap" class="tab-content" data-tab="yesterday">
+                    <!-- Yesterday's heatmap points -->
+                </div>
+                <div id="weekHeatmap" class="tab-content" data-tab="week">
+                    <!-- Weekly heatmap points -->
+                </div>
+            </div>
+            
+            <div>
+                <h2>Analytics</h2>
+                <div class="tabs">
+                    <div class="tab active" onclick="switchAnalyticsTab('dwell', this)">Dwell Time</div>
+                    <div class="tab" onclick="switchAnalyticsTab('traffic', this)">Traffic Flow</div>
+                </div>
+                <div id="dwellTimeAnalytics" class="tab-content active" data-tab="dwell">
+                    <div id="dwellTimeChart"></div>
+                </div>
+                <div id="trafficAnalytics" class="tab-content" data-tab="traffic">
+                    <div id="trafficChart"></div>
+                </div>
+            </div>
+        </div>
+    </div>
+    
+    <script>
+        // Set up floor plan dimensions to match our zones
+        function setupFloorPlan() {
+            const floorPlan = document.getElementById('floorPlan');
+            const floorPlanWidth = floorPlan.offsetWidth;
+            const floorPlanHeight = floorPlan.offsetHeight;
+            
+            // Living Room zone (0, 0, 480, 540) in our coordinate system
+            const livingRoomZone = document.querySelector('#floorPlan .living-room-zone');
+            livingRoomZone.style.left = '0px';
+            livingRoomZone.style.top = '0px';
+            livingRoomZone.style.width = (480 / 960 * floorPlanWidth) + 'px';
+            livingRoomZone.style.height = '100%';
+            
+            // Kitchen zone (480, 0, 960, 540) in our coordinate system
+            const kitchenZone = document.querySelector('#floorPlan .kitchen-zone');
+            kitchenZone.style.left = (480 / 960 * floorPlanWidth) + 'px';
+            kitchenZone.style.top = '0px';
+            kitchenZone.style.width = (480 / 960 * floorPlanWidth) + 'px';
+            kitchenZone.style.height = '100%';
+            
+            // Position zone labels
+            const livingRoomLabel = document.querySelector('#floorPlan .living-room-label');
+            livingRoomLabel.style.left = (240 / 960 * floorPlanWidth) + 'px';
+            livingRoomLabel.style.top = '20px';
+            
+            const kitchenLabel = document.querySelector('#floorPlan .kitchen-label');
+            kitchenLabel.style.left = (720 / 960 * floorPlanWidth) + 'px';
+            kitchenLabel.style.top = '20px';
+            
+            // Add camera indicators
+            addCameraIndicators(floorPlanWidth, floorPlanHeight);
+        }
+        
+        // Add camera position indicators
+        function addCameraIndicators(floorPlanWidth, floorPlanHeight) {
+            const floorPlan = document.getElementById('floorPlan');
+            
+            // Remove any existing indicators first
+            document.querySelectorAll('.camera-indicator').forEach(el => el.remove());
+            
+            // Define camera positions
+            const cameraPositions = {
+                'Living Room': {
+                    x: 480 - (480 * 1/8), // 1/8 from right edge of living room
+                    y: 0,
+                    label: 'Living Room Camera'
+                },
+                'Kitchen': {
+                    x: 960 - (480 * 1/3), // 1/3 from right edge of kitchen
+                    y: 0,
+                    label: 'Kitchen Camera'
+                }
+            };
+            
+            // Create camera indicators
+            Object.entries(cameraPositions).forEach(([id, cam]) => {
+                const indicator = document.createElement('div');
+                indicator.className = 'camera-indicator';
+                indicator.id = `camera-${id.replace(' ', '-')}`;
+                
+                // Position the indicator
+                const x = (cam.x / 960) * floorPlanWidth;
+                const y = (cam.y / 540) * floorPlanHeight;
+                indicator.style.left = `${x}px`;
+                indicator.style.top = `${y}px`;
+                
+                // Add label
+                const label = document.createElement('div');
+                label.className = 'camera-label';
+                label.textContent = cam.label;
+                indicator.appendChild(label);
+                
+                floorPlan.appendChild(indicator);
+            });
+        }
+        
+        // Update date and time
+        function updateDateTime() {
+            const now = new Date();
+            document.getElementById('date-time').textContent = now.toLocaleString();
+        }
+        
+        // Convert track coordinates to floor plan coordinates
+        function convertToFloorPlanCoordinates(x, y, container, cameraId) {
+            const containerElement = document.getElementById(container);
+            const containerWidth = containerElement.offsetWidth;
+            const containerHeight = containerElement.offsetHeight;
+            
+            // Define camera positions based on the requirements:
+            // Living Room camera: top side, 1/8 of the way in from the right
+            // Kitchen camera: top side, 1/3 of the way in from the right
+            const cameraPositions = {
+                'Living Room': {
+                    x: 480 - (480 * 1/8), // 480 - 60 = 420 (from right edge of living room)
+                    y: 0, // Top edge
+                    width: 480, // Zone width
+                    height: 540 // Zone height
+                },
+                'Kitchen': {
+                    x: 960 - (480 * 1/3), // 960 - 160 = 800 (from right edge of kitchen)
+                    y: 0, // Top edge
+                    width: 480, // Zone width
+                    height: 540 // Zone height
+                }
+            };
+            
+            // Map from our coordinate system (0-960, 0-540) to container size based on camera perspective
+            let floorX, floorY;
+            
+            // If we have a camera ID and it's in our mapping
+            if (cameraId && cameraPositions[cameraId]) {
+                const camera = cameraPositions[cameraId];
+                
+                // Calculate relative position from camera (0-1 scale)
+                // For a camera on the top edge, we map Y coordinate directly
+                // but X needs perspective correction - objects further away (higher Y) 
+                // should appear closer to the center
+                
+                // Simplified perspective mapping:
+                // 1. Normalize x to 0-1 within the camera's field of view
+                // 2. Apply perspective factor based on y-distance from camera
+                
+                // X coordinate (0-1 within camera's zone)
+                let normalizedX = x / 960; // First normalize to 0-1 across full width
+                
+                // Y coordinate (0-1 within camera's zone)
+                let normalizedY = y / 540; // Normalize to 0-1 in height
+                
+                // Adjust for perspective effects - objects farther away (higher y)
+                // should appear closer to the camera's forward vector
+                const perspectiveStrength = 0.3; // How much to adjust perspective (0-1)
+                const distanceFromCamera = normalizedY; // 0 at top, 1 at bottom
+                
+                // Calculate camera-relative x-coordinate
+                if (cameraId === 'Living Room') {
+                    // For Living Room (left side of floor plan)
+                    // Convert global x (0-960) to local zone x (0-480)
+                    const localX = Math.min(480, Math.max(0, x)); // Clamp to 0-480
+                    normalizedX = localX / 480; // Now 0-1 within this zone
+                    
+                    // Apply perspective correction
+                    normalizedX = normalizedX + (perspectiveStrength * distanceFromCamera * (0.5 - normalizedX));
+                    
+                    // Convert back to floor plan coordinates
+                    floorX = (normalizedX * camera.width) * (containerWidth / 960);
+                } else if (cameraId === 'Kitchen') {
+                    // For Kitchen (right side of floor plan)
+                    // Convert global x (0-960) to local zone x (0-480)
+                    const localX = Math.min(960, Math.max(480, x)) - 480; // Clamp to 480-960, then 0-480
+                    normalizedX = localX / 480; // Now 0-1 within this zone
+                    
+                    // Apply perspective correction
+                    normalizedX = normalizedX + (perspectiveStrength * distanceFromCamera * (0.5 - normalizedX));
+                    
+                    // Convert back to floor plan coordinates
+                    floorX = (480 + (normalizedX * camera.width)) * (containerWidth / 960);
+                }
+                
+                // Y coordinate is simpler - just map directly
+                floorY = normalizedY * containerHeight;
+            } else {
+                // Fallback to original direct mapping if no camera ID or unknown camera
+                floorX = (x / 960) * containerWidth;
+                floorY = (y / 540) * containerHeight;
+            }
+            
+            return { x: floorX, y: floorY };
+        }
+        
+        // Create or update person marker
+        function updatePersonMarker(personId, x, y, trailPoints, cameraId) {
+            const floorPlan = document.getElementById('floorPlan');
+            const coords = convertToFloorPlanCoordinates(x, y, 'floorPlan', cameraId);
+            
+            // Find or create person marker
+            let marker = document.getElementById(`person-${personId}`);
+            if (!marker) {
+                marker = document.createElement('div');
+                marker.id = `person-${personId}`;
+                marker.className = 'person-marker';
+                
+                // Create the ID label as a child element
+                const idLabel = document.createElement('div');
+                idLabel.className = 'person-id-label';
+                idLabel.textContent = personId;
+                marker.appendChild(idLabel);
+                
+                floorPlan.appendChild(marker);
+            }
+            
+            // Update position
+            marker.style.left = coords.x + 'px';
+            marker.style.top = coords.y + 'px';
+            
+            // Update trails if we have points
+            if (trailPoints && trailPoints.length > 1) {
+                // Remove old trails
+                const oldTrails = document.querySelectorAll(`.trail-${personId}`);
+                oldTrails.forEach(trail => trail.remove());
+                
+                // Create new trails (use last 10 points max)
+                const pointsToUse = trailPoints.slice(-10);
+                for (let i = 1; i < pointsToUse.length; i++) {
+                    const fromCoords = convertToFloorPlanCoordinates(pointsToUse[i-1].x, pointsToUse[i-1].y, 'floorPlan', cameraId);
+                    const toCoords = convertToFloorPlanCoordinates(pointsToUse[i].x, pointsToUse[i].y, 'floorPlan', cameraId);
+                    
+                    // Calculate distance and angle
+                    const dx = toCoords.x - fromCoords.x;
+                    const dy = toCoords.y - fromCoords.y;
+                    const distance = Math.sqrt(dx * dx + dy * dy);
+                    const angle = Math.atan2(dy, dx) * 180 / Math.PI;
+                    
+                    // Create trail segment
+                    const trail = document.createElement('div');
+                    trail.className = `path-trail trail-${personId}`;
+                    trail.style.left = fromCoords.x + 'px';
+                    trail.style.top = fromCoords.y + 'px';
+                    trail.style.width = distance + 'px';
+                    trail.style.transform = `rotate(${angle}deg)`;
+                    
+                    floorPlan.appendChild(trail);
+                }
+            }
+        }
+        
+        // Format uptime into human-readable format
+        function formatUptime(seconds) {
+            const days = Math.floor(seconds / (24 * 60 * 60));
+            seconds -= days * 24 * 60 * 60;
+            const hours = Math.floor(seconds / (60 * 60));
+            seconds -= hours * 60 * 60;
+            const minutes = Math.floor(seconds / 60);
+            seconds -= minutes * 60;
+            
+            if (days > 0) {
+                return `${days}d ${hours}h`;
+            } else if (hours > 0) {
+                return `${hours}h ${minutes}m`;
+            } else if (minutes > 0) {
+                return `${minutes}m ${seconds}s`;
+            } else {
+                return `${seconds}s`;
+            }
+        }
+        
+        // Update heatmap visualization in the specified container
+        // Accepts a date parameter ('', 'YYYY-MM-DD', or 'week') and the ID of the target container
+        function updateHeatmap(date, containerId) {
+            const heatmapContainer = document.getElementById(containerId);
+            if (!heatmapContainer) {
+                console.error("Heatmap container not found:", containerId);
+                return;
+            }
+            
+            // Clear existing heatmap points from the target container
+            const heatmapPoints = heatmapContainer.querySelectorAll('.heatmap-point');
+            heatmapPoints.forEach(point => point.remove());
+            
+            console.log(`Fetching heatmap data for date '${date}' into container '${containerId}'`); // Debug
+            
+            // Fetch heatmap data from the API
+            fetch(`/api/heatmap?date=${date || ''}`)
+                .then(response => {
+                    if (!response.ok) {
+                        throw new Error(`HTTP error fetching heatmap! Status: ${response.status}`);
+                    }
+                    return response.json();
+                })
+                .then(data => {
+                    console.log(`Heatmap data received for ${containerId}:`, data); // Debug output
+                    
+                    // Check if data is valid and contains heatmap points
+                    if (!data || !data.heatmap || data.heatmap.length === 0) {
+                        console.log(`No heatmap data available for ${containerId} on date ${date}`);
+                        // Optionally display a message in the container
+                        // heatmapContainer.innerHTML = '<p>No data available for this period.</p>';
+                        return;
+                    }
+                    
+                    // Find max value for color scaling across the retrieved points
+                    const maxValue = Math.max(1, ...data.heatmap.map(point => point.value)); // Use Math.max(1, ...) to avoid division by zero if all values are 0
+                    
+                    // Add heatmap points to the target container
+                    data.heatmap.forEach(point => {
+                        // Convert backend coordinates (0-960, 0-540) to the container's pixel coordinates
+                        const coords = convertToFloorPlanCoordinates(point.x, point.y, containerId);
+                        // Calculate intensity (0 to 1) based on point value relative to max value
+                        const intensity = point.value / maxValue;
+                        
+                        // Create the visual element for the heat point
+                        const heatPoint = document.createElement('div');
+                        heatPoint.className = 'heatmap-point';
+                        // Position the center of the point at the calculated coordinates
+                        heatPoint.style.left = coords.x + 'px';
+                        heatPoint.style.top = coords.y + 'px';
+                        // Define the size of the heatmap points
+                        heatPoint.style.width = '20px'; 
+                        heatPoint.style.height = '20px';
+                        
+                        // Set color based on intensity using a red gradient (more intense = more red, less green/blue)
+                        // We also scale opacity based on intensity for a smoother look
+                        const red = 255; // Always fully red
+                        const green = Math.floor(255 * (1 - intensity)); // Less intense = more green
+                        const blue = Math.floor(255 * (1 - intensity));  // Less intense = more blue
+                        const alpha = 0.3 + intensity * 0.7; // Base opacity 0.3, up to 1.0 for max intensity
+                        
+                        heatPoint.style.backgroundColor = `rgba(${red}, ${green}, ${blue}, ${alpha})`;
+                        
+                        // Add the point to the specified heatmap container
+                        heatmapContainer.appendChild(heatPoint);
+                    });
+                })
+                .catch(error => console.error(`Error fetching heatmap data for ${containerId}:`, error));
+        }
+        
+        // Switch tabs for heatmap view
+        function switchTab(tabName, tabElement) {
+            console.log("Switching heatmap tab to:", tabName); // Debug
+            
+            // Update active tab button styling
+            // Remove 'active' class from all sibling tabs
+            tabElement.parentNode.querySelectorAll('.tab').forEach(tab => tab.classList.remove('active'));
+            // Add 'active' class to the clicked tab
+            tabElement.classList.add('active');
+            
+            // Update active content panel visibility
+            const contentContainer = tabElement.closest('.analytics-view > div'); // Find the parent container holding the tabs and content
+            // Hide all tab content panels within this container
+            contentContainer.querySelectorAll('.tab-content').forEach(content => content.classList.remove('active'));
+            // Show the specific tab content panel corresponding to the clicked tab
+            const targetContentId = tabName + 'Heatmap'; // Assumes IDs like 'todayHeatmap', 'yesterdayHeatmap', 'weekHeatmap' - WAIT, the HTML uses 'heatmapView' for today. Let's adjust.
+            const actualTargetContentId = (tabName === 'today') ? 'heatmapView' : targetContentId;
+            const tabContent = contentContainer.querySelector(`#${actualTargetContentId}`);
+            if (tabContent) {
+                tabContent.classList.add('active');
+                
+                // Determine the date parameter for the API call based on the tab name
+                let dateParam = ''; // Default to today
+                if (tabName === 'yesterday') {
+                    // Calculate yesterday's date in YYYY-MM-DD format
+                    const yesterday = new Date();
+                    yesterday.setDate(yesterday.getDate() - 1);
+                    dateParam = yesterday.toISOString().split('T')[0];
+                } else if (tabName === 'week') {
+                    dateParam = 'week'; // Use the special 'week' keyword for the API
+                }
+                
+                // Load heatmap data for the selected tab and date into the correct container
+                updateHeatmap(dateParam, actualTargetContentId);
+            } else {
+                console.error("Target content panel not found for tab:", tabName, "Expected ID:", actualTargetContentId);
+            }
+        }
+        
+        // Switch analytics tabs
+        function switchAnalyticsTab(tabName, tabElement) {
+            // Update active tab
+            document.querySelectorAll('.analytics-view .tab').forEach(tab => tab.classList.remove('active'));
+            tabElement.classList.add('active');
+            
+            // Update active content
+            document.querySelectorAll('.analytics-view .tab-content').forEach(content => content.classList.remove('active'));
+            const tabContent = document.querySelector(`.analytics-view .tab-content[data-tab="${tabName}"]`);
+            tabContent.classList.add('active');
+            
+            // Update the chart based on selection
+            if (tabName === 'dwell') {
+                updateDwellTimeChart();
+            } else if (tabName === 'traffic') {
+                updateTrafficChart();
+            }
+        }
+        
+        // REWRITTEN: Create simple bar chart for average dwell time per zone using direct data
+        // Accepts the 'tracks' object from the API response
+        function updateDwellTimeChart(tracksData) {
+            const chartContainer = document.getElementById('dwellTimeChart');
+            chartContainer.innerHTML = ''; // Clear previous chart
+            console.log("Updating Dwell Time chart with data:", tracksData); // Debug
+            
+            // Initialize dwell time sums and counts per zone
+            const dwellTimes = {
+                'Living Room': { totalTime: 0, count: 0 },
+                'Kitchen': { totalTime: 0, count: 0 },
+                // Add other zones if necessary
+            };
+            
+            // Process the tracks data directly
+            Object.values(tracksData).forEach(track => {
+                // Use the dwell_time provided by the backend for the current zone
+                const zone = track.zone;
+                const dwellTime = track.dwell_time || 0; // Use provided dwell time
+                
+                if (zone && dwellTimes.hasOwnProperty(zone) && dwellTime > 0) {
+                    // We want AVERAGE dwell time, so we need both sum and count
+                    // Let's assume dwell_time *is* the average or current dwell for that track.
+                    // To get an overall average, we sum dwell times and divide by number of *people*
+                    dwellTimes[zone].totalTime += dwellTime;
+                    dwellTimes[zone].count += 1; 
+                }
+            });
+            
+            // Calculate average dwell time per zone
+            const avgDwellTimes = {};
+            let maxAvgDwell = 0;
+            Object.entries(dwellTimes).forEach(([zone, data]) => {
+                const avg = data.count > 0 ? data.totalTime / data.count : 0;
+                avgDwellTimes[zone] = avg;
+                if (avg > maxAvgDwell) {
+                    maxAvgDwell = avg;
+                }
+            });
+            maxAvgDwell = Math.max(1, maxAvgDwell); // Avoid division by zero for scaling
+            
+            console.log("Calculated Average Dwell Times:", avgDwellTimes); // Debug
+            
+            // --- Simple Bar Chart Rendering ---
+            const chart = document.createElement('div');
+            chart.style.display = 'flex';
+            chart.style.flexDirection = 'column';
+            chart.style.height = '100%';
+            chart.style.justifyContent = 'flex-end';
+            chart.style.alignItems = 'center';
+            chart.style.padding = '20px'; // Add padding
+            chart.style.boxSizing = 'border-box';
+            chart.ariaLabel = 'Average Dwell Time by Zone Chart'; // Accessibility
+
+            const barContainer = document.createElement('div');
+            barContainer.style.display = 'flex';
+            barContainer.style.width = '80%'; // Use less width for better spacing
+            barContainer.style.height = '80%';
+            barContainer.style.justifyContent = 'space-around';
+            barContainer.style.alignItems = 'flex-end';
+            barContainer.style.borderBottom = '1px solid #ccc'; // X-axis line
+
+            Object.entries(avgDwellTimes).forEach(([zone, avgTime]) => {
+                const barWrapper = document.createElement('div');
+                barWrapper.style.display = 'flex';
+                barWrapper.style.flexDirection = 'column';
+                barWrapper.style.alignItems = 'center';
+                barWrapper.style.width = '40%'; // Bar width
+                barWrapper.style.textAlign = 'center';
+
+                const bar = document.createElement('div');
+                const heightPercent = (avgTime / maxAvgDwell) * 100;
+                bar.style.width = '80%'; // Inner bar width
+                bar.style.height = `${heightPercent}%`;
+                // Use distinct colors per zone
+                bar.style.backgroundColor = zone === 'Living Room' ? '#3498db' : '#2ecc71'; 
+                bar.style.borderRadius = '5px 5px 0 0';
+                bar.setAttribute('role', 'presentation'); // Accessibility hint
+
+                const timeLabel = document.createElement('div');
+                timeLabel.textContent = `${avgTime.toFixed(1)}s`; // Display the average time
+                timeLabel.style.marginTop = '5px';
+                timeLabel.style.fontSize = '0.9em';
+
+                const zoneLabel = document.createElement('div');
+                zoneLabel.textContent = zone;
+                zoneLabel.style.marginTop = '10px';
+                zoneLabel.style.fontWeight = 'bold';
+                
+                barWrapper.appendChild(timeLabel); // Put time label above bar
+                barWrapper.appendChild(bar);
+                barWrapper.appendChild(zoneLabel); // Put zone label below bar
+                barContainer.appendChild(barWrapper);
+            });
+            
+            chart.appendChild(barContainer);
+            // Add a title
+            const title = document.createElement('h3');
+            title.textContent = 'Average Dwell Time per Zone (Active Tracks)';
+            title.style.textAlign = 'center';
+            title.style.marginBottom = '15px';
+            chartContainer.appendChild(title); // Add title first
+            chartContainer.appendChild(chart);
+        }
+        
+        // REWRITTEN: Create simple chart for traffic flow using direct data
+        // Accepts the 'transitions' array from the API response
+        function updateTrafficChart(transitionsData) {
+            const chartContainer = document.getElementById('trafficChart');
+            chartContainer.innerHTML = ''; // Clear previous chart
+            console.log("Updating Traffic Flow chart with data:", transitionsData); // Debug
+
+            // Initialize transition counts
+            const transitions = {
+                'Living Room to Kitchen': 0,
+                'Kitchen to Living Room': 0,
+                'Entered Living Room': 0,
+                'Entered Kitchen': 0,
+                'Left Living Room': 0,
+                'Left Kitchen': 0
+                // Can add more specific transitions if needed (e.g., Outside to Living Room)
+            };
+            
+            // Process the transitions data directly
+            (transitionsData || []).forEach(t => {
+                const from = t.from_zone || 'Outside'; // Treat null/undefined from_zone as 'Outside'
+                const to = t.to_zone;
+                
+                if (from === 'Outside' && to === 'Living Room') {
+                    transitions['Entered Living Room']++;
+                } else if (from === 'Outside' && to === 'Kitchen') {
+                    transitions['Entered Kitchen']++;
+                } else if (from === 'Living Room' && to === 'Outside') {
+                    transitions['Left Living Room']++;
+                } else if (from === 'Kitchen' && to === 'Outside') {
+                    transitions['Left Kitchen']++;
+                } else if (from === 'Living Room' && to === 'Kitchen') {
+                    transitions['Living Room to Kitchen']++;
+                } else if (from === 'Kitchen' && to === 'Living Room') {
+                    transitions['Kitchen to Living Room']++;
+                }
+            });
+            
+            console.log("Calculated Transition Counts:", transitions); // Debug
+
+            // --- Simple Horizontal Bar Chart Rendering ---
+            const maxTransitions = Math.max(1, ...Object.values(transitions)); // Avoid division by zero
+            
+            const chart = document.createElement('div');
+            chart.style.display = 'flex';
+            chart.style.flexDirection = 'column';
+            chart.style.height = '100%';
+            chart.style.padding = '20px';
+            chart.style.boxSizing = 'border-box';
+            chart.ariaLabel = 'Zone Transition Count Chart'; // Accessibility
+
+            const barContainer = document.createElement('div');
+            barContainer.style.display = 'flex';
+            barContainer.style.width = '100%';
+            barContainer.style.height = '90%'; // Use most of the height
+            barContainer.style.flexDirection = 'column';
+            barContainer.style.justifyContent = 'space-around'; // Space out rows
+
+            Object.entries(transitions).forEach(([transition, count]) => {
+                 if (count === 0) return; // Optionally hide transitions with zero count
+
+                const row = document.createElement('div');
+                row.style.display = 'flex';
+                row.style.alignItems = 'center';
+                row.style.width = '100%';
+                row.style.marginBottom = '8px'; // Space between rows
+
+                const label = document.createElement('div');
+                label.textContent = transition;
+                label.style.width = '35%'; // Label width
+                label.style.textAlign = 'right';
+                label.style.paddingRight = '10px';
+                label.style.fontSize = '0.9em';
+                label.style.overflow = 'hidden';
+                label.style.textOverflow = 'ellipsis';
+                label.style.whiteSpace = 'nowrap';
+
+
+                const barWrapper = document.createElement('div');
+                barWrapper.style.height = '20px'; // Bar height
+                barWrapper.style.width = '55%'; // Bar area width
+                barWrapper.style.backgroundColor = '#e0e0e0'; // Background for the bar area
+                barWrapper.style.borderRadius = '3px';
+                barWrapper.setAttribute('role', 'presentation'); // Accessibility
+
+                const bar = document.createElement('div');
+                const widthPercent = (count / maxTransitions) * 100;
+                bar.style.width = `${widthPercent}%`;
+                bar.style.height = '100%';
+                // Use different colors for different transition types? (e.g., entry vs exit vs internal)
+                let barColor = '#3498db'; // Default blue
+                 if (transition.startsWith('Entered')) barColor = '#2ecc71'; // Green for entry
+                 if (transition.startsWith('Left')) barColor = '#e74c3c'; // Red for exit
+                 if (transition.includes('to')) barColor = '#f1c40f'; // Yellow for internal
+                bar.style.backgroundColor = barColor; 
+                bar.style.borderRadius = '3px';
+                 bar.setAttribute('role', 'presentation');
+
+                const countLabel = document.createElement('div');
+                countLabel.textContent = count;
+                countLabel.style.width = '10%'; // Count label width
+                countLabel.style.textAlign = 'left';
+                countLabel.style.paddingLeft = '10px';
+                countLabel.style.fontSize = '0.9em';
+                countLabel.style.fontWeight = 'bold';
+
+                barWrapper.appendChild(bar);
+                row.appendChild(label);
+                row.appendChild(barWrapper);
+                row.appendChild(countLabel);
+                barContainer.appendChild(row);
+            });
+            
+            // Add Title
+            const title = document.createElement('h3');
+            title.textContent = 'Recent Zone Transitions';
+            title.style.textAlign = 'center';
+            title.style.marginBottom = '10px';
+            chartContainer.appendChild(title);
+            chartContainer.appendChild(barContainer);
+        }
+        
+        // Main function to fetch and update all dashboard data
+        function refreshData() {
+            // Fetch comprehensive dashboard data from a single endpoint
+            fetch('/api/dashboard_data')
+                .then(response => {
+                    // Check if the request was successful
+                    if (!response.ok) {
+                        // Log the error status and throw an error to be caught below
+                        console.error(`HTTP error fetching dashboard data! Status: ${response.status} ${response.statusText}`);
+                        throw new Error(`API Error: ${response.status}`);
+                    }
+                    // Parse the JSON response
+                    return response.json();
+                })
+                .then(data => {
+                    console.log("Dashboard data received:", data); 
+                    
+                    // --- Update Occupancy Counts ---
+                    // Find the elements by ID and update their text content
+                    // Use || 0 to default to 0 if a zone isn't present in the data
+                    document.getElementById('living-room-count').textContent = data.occupancy['Living Room'] || 0;
+                    document.getElementById('kitchen-count').textContent = data.occupancy['Kitchen'] || 0;
+                    
+                    // --- Update Tracked People Table ---
+                    const trackedPeopleTableBody = document.getElementById('tracked-people').getElementsByTagName('tbody')[0];
+                    trackedPeopleTableBody.innerHTML = ''; // Clear existing rows
+                    
+                    // Check if there are any tracks
+                    if (data.tracks && Object.keys(data.tracks).length > 0) {
+                        // Sort tracks by last seen time (most recent first) for better visibility
+                        const sortedTracks = Object.values(data.tracks) // Get array of track objects
+                            .sort((a, b) => b.last_seen - a.last_seen); // Sort descending by timestamp
+                        
+                        // Add a row for each track
+                        sortedTracks.forEach(track => {
+                            const row = trackedPeopleTableBody.insertRow();
+                            // Populate cells with track data, providing defaults for potentially missing fields
+                            row.insertCell(0).textContent = new Date(track.last_seen * 1000).toLocaleTimeString(); // Format timestamp
+                            row.insertCell(1).textContent = track.track_id;
+                            row.insertCell(2).textContent = track.camera || "N/A";
+                            row.insertCell(3).textContent = track.zone || "Unknown";
+                            row.insertCell(4).textContent = track.direction || "N/A";
+                            // Format numbers nicely, defaulting to "0.0"
+                            row.insertCell(5).textContent = track.speed ? track.speed.toFixed(1) : "0.0"; 
+                            row.insertCell(6).textContent = track.dwell_time ? track.dwell_time.toFixed(1) : "0.0";
+                        });
+                    } else {
+                        // Display a message if no people are currently tracked
+                        const row = trackedPeopleTableBody.insertRow();
+                        const cell = row.insertCell(0);
+                        cell.colSpan = 7; // Span across all columns
+                        cell.textContent = "No people currently tracked.";
+                        cell.style.textAlign = "center";
+                    }
+                    
+                    // --- Update Zone Transitions Table ---
+                    const transitionsTableBody = document.getElementById('zone-transitions').getElementsByTagName('tbody')[0];
+                    transitionsTableBody.innerHTML = ''; // Clear existing rows
+                    
+                    // Check if there are any transitions
+                    if (data.transitions && data.transitions.length > 0) {
+                        // Sort transitions by timestamp (most recent first) - assumes backend doesn't guarantee order
+                        // The backend already sorts, but defensive sorting here is okay.
+                        const sortedTransitions = [...data.transitions].sort((a, b) => b.timestamp - a.timestamp);
+                        
+                        // Add a row for each transition
+                        sortedTransitions.forEach(transition => {
+                            const row = transitionsTableBody.insertRow();
+                            // Format timestamp and populate cells
+                            const time = new Date(transition.timestamp * 1000).toLocaleTimeString();
+                            row.insertCell(0).textContent = time;
+                            row.insertCell(1).textContent = transition.track_id;
+                            // Display 'Outside' if from_zone is missing or null
+                            row.insertCell(2).textContent = transition.from_zone || 'Outside'; 
+                            row.insertCell(3).textContent = transition.to_zone;
+                        });
+                    } else {
+                        // Display a message if no recent transitions are available
+                        const row = transitionsTableBody.insertRow();
+                        const cell = row.insertCell(0);
+                        cell.colSpan = 4; // Span across all columns
+                        cell.textContent = "No recent zone transitions.";
+                        cell.style.textAlign = "center";
+                    }
+                    
+                    // --- Update Performance Metrics ---
+                    // Check if performance data exists
+                    if (data.performance) {
+                        document.getElementById('fps-living').textContent = data.performance.fps_living?.toFixed(1) || 'N/A';
+                        document.getElementById('fps-kitchen').textContent = data.performance.fps_kitchen?.toFixed(1) || 'N/A';
+                        // Calculate and display average detections (handle potential NaN/null)
+                        const avgDetections = (data.performance.avg_detections_living || 0) + (data.performance.avg_detections_kitchen || 0);
+                        document.getElementById('detections').textContent = avgDetections.toFixed(1);
+                         // Update Uptime (assuming it's now part of this payload)
+                         if (data.system_status && data.system_status.uptime) {
+                            document.getElementById('uptime').textContent = formatUptime(data.system_status.uptime);
+                         }
+                    } else {
+                         // Handle case where performance data might be missing
+                         document.getElementById('fps-living').textContent = 'N/A';
+                         document.getElementById('fps-kitchen').textContent = 'N/A';
+                         document.getElementById('detections').textContent = 'N/A';
+                    }
+
+                    // --- Update Top-Down View ---
+                    // Pass the necessary parts of the data (tracks and trails)
+                    if (data.tracks && data.trails) {
+                        updateTopDownView(data.tracks, data.trails);
+                    } else {
+                        console.warn("Missing tracks or trails data for Top-Down View update.");
+                         // Optionally clear the top-down view if data is missing
+                         clearTopDownView(); 
+                    }
+                    
+                    // --- Clean up Markers for Stale Tracks ---
+                    // Get IDs of currently active tracks from the data
+                    const currentTrackIds = data.tracks ? Object.keys(data.tracks).map(id => parseInt(id.split('_').pop())) : []; // Extract numeric ID part
+                    // Select all existing person markers on the floor plan
+                    document.querySelectorAll('#floorPlan .person-marker').forEach(marker => {
+                        // Extract the ID from the marker's HTML ID
+                        const markerId = parseInt(marker.id.replace('person-', ''));
+                        // If a marker's ID is not in the list of current track IDs, remove it and its trail
+                        if (!isNaN(markerId) && !currentTrackIds.includes(markerId)) {
+                            console.log(`Removing stale marker and trails for ID: ${markerId}`); // Debug
+                            marker.remove();
+                            // Remove associated trail segments
+                            document.querySelectorAll(`#floorPlan .trail-${markerId}`).forEach(trail => trail.remove());
+                        }
+                    });
+                    
+                    // --- Update Analytics Charts ---
+                    updateDwellTimeChart(data.tracks || {}); 
+                    updateTrafficChart(data.transitions || []); 
+                })
+                .catch(error => {
+                    // Log any errors during the fetch or processing
+                    console.error('Error fetching or processing dashboard data:', error);
+                    // Optionally update the UI to indicate an error
+                    const dateTimeElement = document.getElementById('date-time');
+                    if (dateTimeElement && !dateTimeElement.textContent.includes('[API Error]')) {
+                        dateTimeElement.textContent += ' [API Error]';
+                    }
+                     // Maybe clear some dynamic data areas or show placeholder messages
+                     clearDynamicDataOnError();
+                });
+        }
+        
+        // Function to clear dynamic data fields in case of API errors
+        function clearDynamicDataOnError() {
+            console.warn("Clearing dynamic data due to API error.");
+            document.getElementById('living-room-count').textContent = 'N/A';
+            document.getElementById('kitchen-count').textContent = 'N/A';
+            document.getElementById('tracked-people').getElementsByTagName('tbody')[0].innerHTML = '<tr><td colspan="7" style="text-align:center;">Error loading data</td></tr>';
+            document.getElementById('zone-transitions').getElementsByTagName('tbody')[0].innerHTML = '<tr><td colspan="4" style="text-align:center;">Error loading data</td></tr>';
+            document.getElementById('fps-living').textContent = 'N/A';
+            document.getElementById('fps-kitchen').textContent = 'N/A';
+            document.getElementById('detections').textContent = 'N/A';
+            clearTopDownView();
+            document.getElementById('dwellTimeChart').innerHTML = '<p style="text-align:center; padding-top:20px;">Error loading chart data</p>';
+            document.getElementById('trafficChart').innerHTML = '<p style="text-align:center; padding-top:20px;">Error loading chart data</p>';
+             // Optionally clear heatmap too, though it fetches separately
+             // document.getElementById('heatmapView').innerHTML = '<p style="text-align:center;">Error loading heatmap</p>'; 
+        }
+
+        // Variable to track currently selected person
+        let selectedPersonId = null;
+        
+        // Add this function to handle table row clicks
+        function setupTableRowClicks() {
+            // Add click event listeners to table rows
+            document.querySelector('#tracked-people tbody').addEventListener('click', function(e) {
+                // Find the closest row element (might have clicked on a cell)
+                const row = e.target.closest('tr');
+                if (!row) return; // Not a row click
+                
+                // Get the track ID from the second cell (index 1)
+                const trackId = row.cells[1]?.textContent;
+                if (!trackId) return;
+                
+                // Clear previous selection
+                document.querySelectorAll('#tracked-people tbody tr.selected').forEach(
+                    tr => tr.classList.remove('selected')
+                );
+                document.querySelectorAll('.person-marker.selected').forEach(
+                    marker => marker.classList.remove('selected')
+                );
+                
+                // If clicking the same person, just deselect
+                if (selectedPersonId === trackId) {
+                    selectedPersonId = null;
+                    return;
+                }
+                
+                // Select this row
+                row.classList.add('selected');
+                selectedPersonId = trackId;
+                
+                // Find and highlight the corresponding marker
+                const marker = document.getElementById(`person-${trackId}`);
+                if (marker) {
+                    marker.classList.add('selected');
+                    
+                    // Optional: Scroll the floor plan to center the marker
+                    const floorPlan = document.getElementById('floorPlan');
+                    const markerRect = marker.getBoundingClientRect();
+                    const floorPlanRect = floorPlan.getBoundingClientRect();
+                    
+                    // Calculate the position to center the viewport on the marker
+                    const centerX = markerRect.left + markerRect.width/2 - floorPlanRect.left;
+                    const centerY = markerRect.top + markerRect.height/2 - floorPlanRect.top;
+                    
+                    // Smoothly scroll the floor plan to center on the marker
+                    floorPlan.scrollTo({
+                        left: centerX - floorPlan.clientWidth/2,
+                        top: centerY - floorPlan.clientHeight/2,
+                        behavior: 'smooth'
+                    });
+                }
+            });
+        }
+
+        // Initialize the dashboard when the DOM is fully loaded
+        document.addEventListener('DOMContentLoaded', function() {
+            console.log("DOM fully loaded and parsed. Initializing dashboard."); // Debug
+            
+            // Set up the initial layout of the floor plan (zones, labels)
+            setupFloorPlan();
+            
+            // Set up click handlers for the tracked people table
+            setupTableRowClicks();
+            
+            // Set the initial date/time display
+            updateDateTime();
+            
+            // Perform the first data fetch and display update
+            refreshData();
+            
+            // Load the initial heatmap data for the default ('Today') tab
+            // We find the 'Today' tab element and simulate a click or call switchTab directly
+             const todayTab = document.querySelector('.analytics-view .tabs .tab[onclick*="today"]');
+             if(todayTab) {
+                 // Use switchTab to load data correctly for the 'heatmapView' container
+                 switchTab('today', todayTab); 
+             } else {
+                 console.error("Could not find the 'Today' heatmap tab for initial load.");
+                 // Fallback: explicitly call updateHeatmap for the default view
+                 // updateHeatmap('', 'heatmapView'); // Less ideal as it doesn't set active tab state
+             }
+
+            // --- Set up periodic updates ---
+            // Update the clock every second
+            setInterval(updateDateTime, 1000); 
+            // Refresh the main dashboard data every 3 seconds (adjust as needed)
+            setInterval(refreshData, 3000); 
+             // Note: Heatmap data is NOT refreshed automatically by interval. 
+             // It only updates when a tab is clicked. This might be desired, 
+             // or you might want a separate interval to refresh the *currently active* heatmap.
+            
+            // Handle window resize events
+            window.addEventListener('resize', () => {
+                 console.log("Window resized, re-running setupFloorPlan."); // Debug
+                // Redraw floor plan elements to fit new size
+                setupFloorPlan(); 
+                // Also redraw the currently active heatmap to fit new size
+                 const activeHeatmapTab = document.querySelector('.analytics-view .tabs .tab.active');
+                 if (activeHeatmapTab) {
+                     const tabName = activeHeatmapTab.getAttribute('onclick').match(/switchTab\('([^']+)'/)[1];
+                     switchTab(tabName, activeHeatmapTab); // Re-run switchTab to redraw the heatmap correctly
+                 }
+            });
+
+            // Setup HLS video streams
+            console.log("Initializing HLS video streams...");
+            const HLS_PLAYLIST_LIVING = '/hls/living/stream.m3u8';
+            const HLS_PLAYLIST_KITCHEN = '/hls/kitchen/stream.m3u8';
+            setupHlsVideo('living-stream', HLS_PLAYLIST_LIVING);
+            setupHlsVideo('kitchen-stream', HLS_PLAYLIST_KITCHEN);
+
+            // Set up fullscreen button listeners
+            document.querySelectorAll('.fullscreen-button').forEach(button => {
+                button.addEventListener('click', function() {
+                    const videoId = this.getAttribute('data-video-id');
+                    toggleFullscreen(videoId);
+                });
+            });
+
+            // Add listener for exiting fullscreen (e.g., pressing Esc)
+            document.addEventListener('fullscreenchange', function() {
+                if (!document.fullscreenElement) {
+                    // Optional: Add any logic needed when exiting fullscreen
+                     console.log("Exited fullscreen mode.");
+                }
+            });
+            // Add vendor-prefixed versions for wider compatibility
+             document.addEventListener('webkitfullscreenchange', () => { if(!document.webkitFullscreenElement) console.log("Exited fullscreen mode (webkit)."); });
+             document.addEventListener('mozfullscreenchange', () => { if(!document.mozFullScreenElement) console.log("Exited fullscreen mode (moz)."); });
+             document.addEventListener('MSFullscreenChange', () => { if(!document.msFullscreenElement) console.log("Exited fullscreen mode (ms)."); });
+        });
+
+        // Updated: Update the top-down view with tracks and trails
+        // Accepts tracks and trails objects directly from the API data
+        function updateTopDownView(tracks, trails) {
+            console.log("Updating top-down view with tracks:", tracks, "and trails:", trails); // Debug
+            
+            // Process each active track provided in the tracks object
+            Object.entries(tracks).forEach(([trackIdWithCam, track]) => {
+                // Extract the camera and numeric part of the track ID (e.g., 'Living_Room_123' -> 'Living Room' and 123)
+                const parts = trackIdWithCam.split('_');
+                const numericTrackId = parseInt(parts[parts.length - 1]);
+                
+                // Determine the camera ID by reconstructing all parts except the last numeric ID
+                const cameraId = parts.slice(0, -1).join(' ');
+                    
+                if (isNaN(numericTrackId)) {
+                    console.warn(`Could not parse numeric ID from ${trackIdWithCam}`);
+                    return;
+                }
+
+                // Ensure the track has valid position data (should be [x, y] tuple/array)
+                if (!track.position || !Array.isArray(track.position) || track.position.length !== 2) {
+                    console.warn(`Track ${trackIdWithCam} has invalid position data:`, track.position);
+                    return; // Skip this track if position is invalid
+                }
+                
+                const x = track.position[0];
+                const y = track.position[1];
+                
+                // Get trail data for this specific track ID from the trails object
+                const trailPoints = trails ? trails[trackIdWithCam] : null; // Use the full ID 'camera_id'
+                
+                // Update the marker and trail on the floor plan using the numeric ID and camera ID
+                updatePersonMarker(numericTrackId, x, y, trailPoints, cameraId);
+                
+                // Restore selection if this is the selected person
+                if (selectedPersonId == numericTrackId) {
+                    const marker = document.getElementById(`person-${numericTrackId}`);
+                    if (marker) {
+                        marker.classList.add('selected');
+                    }
+                }
+            });
+        }
+
+        // Helper function to clear all person markers and trails from the top-down view
+        function clearTopDownView() {
+             console.log("Clearing all markers and trails from Top-Down View.");
+             document.querySelectorAll('#floorPlan .person-marker').forEach(marker => marker.remove());
+             document.querySelectorAll('#floorPlan .path-trail').forEach(trail => trail.remove());
+        }
+
+        // Keep the debug logging function if it's still useful
+        // Add new debug metrics logging function
+        function logMetricsToConsole() {
+            fetch('/api/metrics_debug')
+                .then(response => response.json())
+                .then(data => {
+                    console.group(`Tracking Metrics (${data.formatted_time})`);
+                    
+                    // Log performance stats
+                    console.log('Performance:', data.performance);
+                    
+                    // Log occupancy
+                    console.log('Zone Occupancy:', data.occupancy);
+                    
+                    // Log active tracks
+                    console.log('Active Tracks:', data.active_tracks);
+                    
+                    // Log transitions
+                    console.log('Recent Transitions:', data.transitions);
+                    
+                    // Log trails data
+                    console.log('Trails:', data.trails);
+                    
+                    // Log raw data
+                    console.log('Raw Data:', data.raw_data);
+                    
+                    console.groupEnd();
+                })
+                .catch(error => console.error('Error fetching metrics debug data:', error));
+        }
+
+        // Run metrics logging every 5 seconds
+        setInterval(logMetricsToConsole, 5000);
+
+        // Function to initialize HLS video streams
+        function setupHlsVideo(videoId, playlistUrl) {
+            const video = document.getElementById(videoId);
+            if (!video) {
+                console.error(`Video element not found: ${videoId}`);
+                return;
+            }
+
+            if (Hls.isSupported()) {
+                console.log(`[HLS] hls.js is supported. Setting up ${videoId} for ${playlistUrl}`);
+                const hls = new Hls({
+                    // Optional HLS.js configurations for low latency
+                    // These are aggressive settings, adjust if unstable
+                    // maxBufferLength: 30, // default
+                    // maxMaxBufferLength: 600, // default
+                    liveSyncDurationCount: 2, // Keep buffer small (default 3)
+                    liveMaxLatencyDurationCount: 4, // How far behind edge to jump forward (default Infinity)
+                    fragLoadingMaxRetry: 4, // Retry fragment loading
+                    levelLoadingMaxRetry: 4 // Retry level loading
+                });
+                hls.loadSource(playlistUrl);
+                hls.attachMedia(video);
+                hls.on(Hls.Events.MANIFEST_PARSED, function() {
+                    console.log(`[HLS] Manifest parsed for ${videoId}, attempting to play.`);
+                    video.play().catch(e => console.error(`Autoplay failed for ${videoId}:`, e));
+                });
+                hls.on(Hls.Events.ERROR, function (event, data) {
+                     console.error(`[HLS Error - ${videoId}] Type: ${data.type}, Details: ${data.details}, Fatal: ${data.fatal}`);
+                     // Optional: Attempt recovery on certain errors
+                    if (data.fatal) {
+                        switch(data.type) {
+                        case Hls.ErrorTypes.NETWORK_ERROR:
+                            console.warn(`[HLS Recovery] Network error for ${videoId}, trying to recover...`);
+                            hls.startLoad();
+                            break;
+                        case Hls.ErrorTypes.MEDIA_ERROR:
+                            console.warn(`[HLS Recovery] Media error for ${videoId}, trying to recover...`);
+                             hls.recoverMediaError();
+                             break;
+                        default:
+                            // Cannot recover, destroy HLS instance?
+                            // hls.destroy();
+                            break;
+                        }
+                    }
+                });
+            } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
+                console.log(`[HLS] Native HLS supported by browser for ${videoId}. Setting src to ${playlistUrl}`);
+                // Native HLS support (mostly Safari)
+                video.src = playlistUrl;
+                video.addEventListener('loadedmetadata', function() {
+                    console.log(`[HLS] Metadata loaded for ${videoId}, attempting to play.`);
+                    video.play().catch(e => console.error(`Autoplay failed for ${videoId}:`, e));
+                });
+                video.addEventListener('error', function(e) {
+                    console.error(`[HLS Native Error - ${videoId}]`, video.error);
+                });
+            } else {
+                console.error(`[HLS] HLS is not supported on this browser for ${videoId}.`);
+                // Optionally display a message to the user
+            }
+        }
+
+        // Function to handle fullscreen requests
+        function toggleFullscreen(videoId) {
+            const videoElement = document.getElementById(videoId);
+            if (!videoElement) return;
+
+            if (!document.fullscreenElement) {
+                // Enter fullscreen
+                if (videoElement.requestFullscreen) {
+                    videoElement.requestFullscreen();
+                } else if (videoElement.mozRequestFullScreen) { /* Firefox */
+                    videoElement.mozRequestFullScreen();
+                } else if (videoElement.webkitRequestFullscreen) { /* Chrome, Safari & Opera */
+                    videoElement.webkitRequestFullscreen();
+                } else if (videoElement.msRequestFullscreen) { /* IE/Edge */
+                    videoElement.msRequestFullscreen();
+                }
+            } else {
+                // Exit fullscreen
+                if (document.exitFullscreen) {
+                    document.exitFullscreen();
+                } else if (document.mozCancelFullScreen) { /* Firefox */
+                    document.mozCancelFullScreen();
+                } else if (document.webkitExitFullscreen) { /* Chrome, Safari & Opera */
+                    document.webkitExitFullscreen();
+                } else if (document.msExitFullscreen) { /* IE/Edge */
+                    document.msExitFullscreen();
+                }
+            }
+        }
+    </script>
+</body>
+</html> 

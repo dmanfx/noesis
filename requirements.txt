@@ -1,0 +1,45 @@
+# Core dependencies
+numpy==1.24.3
+opencv-python==4.7.0.72
+torch==2.0.1
+torchvision==0.15.2
+pycuda==2022.2.2
+cupy-cuda11x==12.0.0
+PyNvVideoCodec==1.0.2
+#opencv_python_cuda==4.11.0.20250207
+
+# ML models
+ultralytics==8.0.124
+supervision==0.11.1
+#torchreid==1.4.0
+
+# Code quality & testing
+black==23.3.0
+ruff==0.0.262
+isort==5.12.0
+pytest==7.3.1
+
+# Web interface
+websockets==11.0.3
+aiohttp==3.8.4
+
+# Utilities
+tqdm==4.65.0
+pillow==9.5.0
+requests==2.30.0
+python-dotenv==1.0.0
+pyyaml==6.0.1
+prometheus-client==0.19.0
+
+# --- Added for FFmpeg GPU Decoding (Phase 2) ---
+av>=10.0.0  # PyAV for FFmpeg bindings
+psutil>=5.9.0  # System performance monitoring
+
+# --- Added for Appearance Re-ID (Phase 9) ---
+#torchreid>=1.0.4 # Updated to reflect manually installed version
+#git+https://github.com/KaiyangZhou/deep-person-reid@v1.0.6#egg=torchreid
+# --- Added the git location as pip only installs up to 0.2.5 (ish) ---
+
+
+# --- Added for 3D Coordinate Transformation (PLY processing) ---
+trimesh>=3.9.0 

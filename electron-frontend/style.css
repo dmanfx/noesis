@@ -1,0 +1,521 @@
+/* style.css */
+body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    margin: 0;
+    padding: 0;
+    background-color: #282c34;
+    color: #abb2bf;
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    min-height: 100vh;
+    overflow-x: hidden; /* Prevent horizontal scroll */
+}
+
+#app-container {
+    width: 98%;
+    max-width: 1800px; /* Adjust max-width as needed */
+    background-color: #3c4049;
+    border-radius: 8px;
+    box-shadow: 0 4px 15px rgba(0, 0, 0, 0.2);
+    padding: 15px 20px;
+    box-sizing: border-box;
+}
+
+header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    border-bottom: 1px solid #4f545f;
+    padding-bottom: 10px;
+    margin-bottom: 15px;
+    position: relative; /* Needed for absolute positioning of clock */
+    padding-right: 120px; /* Add padding to prevent overlap with clock */
+}
+
+header h1 {
+    margin: 0;
+    font-size: 1.8em;
+    color: #61afef;
+}
+
+#system-status {
+    font-size: 0.9em;
+    color: #98c379;
+}
+
+#clock {
+    position: absolute;
+    top: 5px; /* Adjust as needed */
+    right: 5px; /* Position top right */
+    font-size: 1.2em;
+    font-weight: bold;
+    color: #e5c07b;
+    background-color: rgba(40, 44, 52, 0.6); /* Slight background */
+    padding: 2px 8px;
+    border-radius: 4px;
+}
+
+main {
+    display: flex;
+    flex-direction: column; /* Stack video and stats vertically */
+    gap: 20px;
+}
+
+.video-section {
+    display: flex;
+    justify-content: space-around; /* Space out video containers */
+    gap: 20px;
+    flex-wrap: wrap; /* Allow wrapping on smaller screens */
+}
+
+.video-container {
+    flex: 1; /* Allow containers to grow */
+    min-width: 400px; /* Minimum width before wrapping */
+    max-width: 900px; /* Max width based on 1800px container */
+    background-color: #4f545f;
+    padding: 15px;
+    border-radius: 6px;
+    box-shadow: 0 2px 5px rgba(0, 0, 0, 0.15);
+    display: flex;
+    flex-direction: column;
+}
+
+.video-container h2 {
+    margin-top: 0;
+    margin-bottom: 10px;
+    color: #c678dd;
+    text-align: center;
+}
+
+.video-wrapper {
+    position: relative; /* For positioning canvas and button */
+    width: 100%;
+    /* Maintain aspect ratio (16:9) */
+    padding-top: 56.25%; /* 1080 / 1920 = 0.5625 */
+    background-color: #1e1e1e; /* Dark background for stream area */
+    overflow: hidden; /* Hide anything extending beyond */
+    border-radius: 4px;
+}
+
+.video-wrapper img,
+.video-wrapper canvas {
+    position: absolute;
+    top: 0;
+    left: 0;
+    width: 100%;
+    height: 100%;
+    object-fit: contain; /* Scale image while preserving aspect ratio */
+}
+
+.overlay-canvas {
+    pointer-events: none; /* Allow clicks to go through to image/video */
+    z-index: 10;
+}
+
+.fullscreen-btn {
+    position: absolute;
+    bottom: 5px;
+    right: 5px;
+    background-color: rgba(0, 0, 0, 0.4); /* Semi-transparent background */
+    color: white;
+    border: none;
+    border-radius: 3px;
+    padding: 3px 6px;
+    font-size: 0.8em;
+    cursor: pointer;
+    opacity: 0.3; /* Initially inconspicuous */
+    transition: opacity 0.2s ease-in-out;
+    z-index: 20; /* Above canvas */
+}
+
+.video-wrapper:hover .fullscreen-btn {
+    opacity: 1; /* Fully visible on hover */
+}
+
+.fullscreen-btn:hover {
+    background-color: rgba(0, 0, 0, 0.7);
+}
+
+/* Style for the element when it IS fullscreen */
+:-webkit-full-screen {
+    /* Hide other elements if needed */
+}
+:fullscreen {
+    /* Standard syntax */
+}
+
+/* Custom maximize styling */
+.maximized-stream {
+    position: fixed !important;
+    top: 0 !important;
+    left: 0 !important;
+    width: 100vw !important;
+    height: 100vh !important;
+    object-fit: contain !important;
+    background-color: #000 !important;
+    z-index: 1000 !important;
+    margin: 0 !important;
+    padding: 0 !important;
+    max-width: none !important;
+    max-height: none !important;
+}
+
+/* Ensure the fullscreen button stays visible with maximized stream */
+.fullscreen-btn-maximized {
+    position: fixed !important;
+    bottom: 20px !important;
+    right: 20px !important;
+    z-index: 1001 !important;
+    opacity: 0.7 !important;
+    background-color: rgba(0, 0, 0, 0.6) !important;
+}
+
+.fullscreen-btn-maximized:hover {
+    opacity: 1 !important;
+    background-color: rgba(0, 0, 0, 0.8) !important;
+}
+
+/* Performance stats in maximized mode */
+.perf-stats-maximized {
+    position: fixed !important;
+    bottom: 20px !important;
+    left: 20px !important;
+    z-index: 1001 !important;
+    background-color: rgba(0, 0, 0, 0.6) !important;
+    color: #56b6c2 !important;
+    padding: 5px 10px !important;
+    border-radius: 4px !important;
+    font-size: 0.9em !important;
+    font-weight: bold !important;
+}
+
+.perf-stats {
+    text-align: right;
+    font-size: 0.8em;
+    margin-top: 5px;
+    color: #56b6c2;
+}
+
+.stats-section {
+    display: flex;
+    justify-content: space-between;
+    gap: 15px;
+    flex-wrap: wrap; /* Allow wrapping */
+}
+
+.stats-card {
+    flex: 1;
+    min-width: 250px; /* Minimum width */
+    background-color: #4f545f;
+    padding: 15px;
+    border-radius: 6px;
+    box-shadow: 0 2px 5px rgba(0, 0, 0, 0.1);
+}
+
+.stats-card h3 {
+    margin-top: 0;
+    margin-bottom: 10px;
+    color: #61afef;
+    border-bottom: 1px solid #56b6c2;
+    padding-bottom: 5px;
+}
+
+.stats-card ul {
+    list-style: none;
+    padding: 0;
+    margin: 0;
+    max-height: 150px; /* Limit height for lists */
+    overflow-y: auto; /* Add scroll if needed */
+}
+
+.stats-card li {
+    margin-bottom: 5px;
+    font-size: 0.9em;
+}
+
+#track-details-content {
+    max-height: 180px; /* Limit height */
+    overflow-y: auto; /* Add scroll */
+    font-size: 0.9em;
+}
+
+.track-detail-item {
+    border-bottom: 1px dashed #5c6370;
+    padding-bottom: 5px;
+    margin-bottom: 8px;
+}
+
+.track-detail-item:last-child {
+    border-bottom: none;
+    margin-bottom: 0;
+}
+
+footer {
+    margin-top: 15px;
+    font-size: 0.85em;
+    color: #5c6370;
+    border-top: 1px solid #4f545f;
+    padding-top: 10px;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+}
+
+#connection-status {
+    font-weight: bold;
+}
+
+/* Simple scrollbar styling (optional) */
+::-webkit-scrollbar {
+    width: 8px;
+}
+
+::-webkit-scrollbar-track {
+    background: #3c4049;
+    border-radius: 4px;
+}
+
+::-webkit-scrollbar-thumb {
+    background-color: #5c6370;
+    border-radius: 4px;
+    border: 2px solid #3c4049; /* Creates padding around thumb */
+}
+
+::-webkit-scrollbar-thumb:hover {
+    background-color: #61afef;
+}
+
+h1, h2 {
+    color: #333;
+    border-bottom: 1px solid #ccc;
+    padding-bottom: 5px;
+}
+
+hr {
+    margin: 15px 0;
+}
+
+#zone-occupancy ul, #active-tracks-list ul, #zone-transitions-list ul {
+    list-style: none;
+    padding-left: 0;
+    max-height: 200px; /* Limit height */
+    overflow-y: auto; /* Add scroll */
+    border: 1px solid #ddd;
+    padding: 5px;
+    margin-top: 5px;
+}
+#zone-occupancy li, #active-tracks-list li, #zone-transitions-list li {
+    padding: 2px 0;
+}
+
+table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 0.9em;
+    margin-top: 5px;
+}
+
+th, td {
+    border: 1px solid #ddd;
+    padding: 4px 6px;
+    text-align: left;
+}
+
+th {
+    background-color: #e9e9e9;
+}
+
+#active-tracks-list, #zone-transitions-list {
+     max-height: 250px; /* Limit height */
+     overflow-y: auto; /* Add scroll */
+     display: block; /* Needed for overflow-y on table containers */
+     border: 1px solid #ddd;
+}
+
+#tracks-table-body td:nth-child(1),
+#tracks-table-body td:nth-child(5),
+#tracks-table-body td:nth-child(6) {
+    text-align: right;
+    width: 50px;
+}
+#tracks-table-body td:nth-child(2) { width: 40px; } /* Cam */
+#tracks-table-body td:nth-child(4) { width: 70px; } /* Pos */
+
+
+#transitions-table-body td:nth-child(1) { width: 80px; } /* Time */
+#transitions-table-body td:nth-child(2) { width: 40px; text-align: right;} /* ID */
+#transitions-table-body td:nth-child(3) { width: 40px; } /* Cam */
+
+/* Trails Canvas Styling (Phase 6/7) */
+/*
+#trails-canvas {
+    position: absolute;
+    top: 0;
+    left: 0;
+    width: 100%;
+    height: 100%;
+    pointer-events: none; // Allows interaction with elements underneath
+    z-index: 10; // Ensure it's above video feeds if overlaying directly
+}
+*/
+
+/* Footer Button Styling */
+.footer-button {
+    margin-left: 15px; /* Keep some space if other items were added */
+    padding: 4px 10px; /* Slightly adjust padding */
+    font-size: 0.85em; /* Match footer font size */
+    background-color: #4f545f; /* Darker background to match cards */
+    color: #abb2bf; /* Light text color */
+    border: 1px solid #5c6370; /* Slightly lighter border */
+    border-radius: 4px;
+    cursor: pointer;
+    transition: background-color 0.2s, border-color 0.2s;
+}
+
+.footer-button:hover {
+    background-color: #5c6370; /* Lighter background on hover */
+    border-color: #61afef; /* Accent border on hover */
+}
+
+.footer-button:active {
+    background-color: #454a54; /* Slightly darker on active */
+    border-color: #56b6c2; /* Different accent border on active */
+}
+
+/* Controls section styling */
+.controls-section {
+    display: flex;
+    justify-content: center;
+    gap: 20px;
+    flex-wrap: wrap;
+}
+
+.controls-content {
+    display: flex;
+    flex-direction: column;
+    gap: 15px;
+}
+
+/* Toggle switch styling */
+.toggle-label {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    cursor: pointer;
+    user-select: none;
+    color: #abb2bf;
+    font-size: 0.9em;
+}
+
+.toggle-label input[type="checkbox"] {
+    display: none;
+}
+
+.toggle-slider {
+    position: relative;
+    width: 50px;
+    height: 24px;
+    background-color: #4f545f;
+    border-radius: 12px;
+    transition: background-color 0.3s ease;
+}
+
+.toggle-slider::before {
+    content: '';
+    position: absolute;
+    width: 20px;
+    height: 20px;
+    border-radius: 50%;
+    background-color: #abb2bf;
+    top: 2px;
+    left: 2px;
+    transition: transform 0.3s ease, background-color 0.3s ease;
+}
+
+.toggle-label input[type="checkbox"]:checked + .toggle-slider {
+    background-color: #61afef;
+}
+
+.toggle-label input[type="checkbox"]:checked + .toggle-slider::before {
+    transform: translateX(26px);
+    background-color: #ffffff;
+}
+
+.toggle-label:hover .toggle-slider {
+    box-shadow: 0 0 5px rgba(97, 175, 239, 0.3);
+}
+
+/* Controls Section */
+.controls-section {
+    background: #2a2a2a;
+    border-radius: 8px;
+    padding: 20px;
+    margin-bottom: 20px;
+}
+
+.controls-content {
+    display: flex;
+    flex-direction: column;
+    gap: 20px;
+}
+
+.toggle-group, .settings-group {
+    display: flex;
+    flex-direction: column;
+    gap: 15px;
+}
+
+.toggle-group h4, .settings-group h4 {
+    margin: 0 0 10px 0;
+    color: #c678dd;
+    font-size: 1.1em;
+}
+
+.setting-item {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 10px;
+    background: #1e1e1e;
+    border-radius: 4px;
+}
+
+.setting-item label {
+    min-width: 150px;
+    color: #abb2bf;
+}
+
+.setting-item input[type="range"] {
+    flex: 1;
+    height: 6px;
+    background: #4a4a4a;
+    border-radius: 3px;
+    outline: none;
+    -webkit-appearance: none;
+}
+
+.setting-item input[type="range"]::-webkit-slider-thumb {
+    -webkit-appearance: none;
+    width: 18px;
+    height: 18px;
+    background: #c678dd;
+    border-radius: 50%;
+    cursor: pointer;
+}
+
+.setting-item input[type="range"]::-moz-range-thumb {
+    width: 18px;
+    height: 18px;
+    background: #c678dd;
+    border-radius: 50%;
+    cursor: pointer;
+    border: none;
+}
+
+.setting-item span {
+    min-width: 40px;
+    text-align: right;
+    color: #c678dd;
+    font-weight: bold;
+}

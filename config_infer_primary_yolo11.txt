@@ -1,7 +1,7 @@
 [property]
 gpu-id=0
 #net-scale-factor=0.0039215697906911373
-custom-lib-path=/opt/nvidia/deepstream/deepstream/lib/libnvdsinfer_custom_impl_Yolo.so
+custom-lib-path=/opt/nvidia/deepstream/deepstream-7.1/lib/libnvdsparsebbox_yolo11.so
 engine-create-func-name=NvDsInferYoloCudaEngineGet
 onnx-file=models/yolo11m.onnx
 model-engine-file=models/engines/yolo11m_ds.engine
@@ -15,7 +15,9 @@ network-mode=0
 # Enable output tensors so NvDsInferTensorMeta is attached (NVDSINFER_TENSOR_OUTPUT_META=12)
 output-tensor-meta=1
 network-type=0
-num-detected-classes=80
+# Set to 1 since we only want to detect persons (class 0)
+num-detected-classes=1
+operate-on-class-ids=0
 process-mode=1
 parse-bbox-func-name=NvDsInferParseYolo
 

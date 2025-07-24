@@ -84,27 +84,14 @@ class AppConfig:
         TARGET_FPS: int = 30  # Realistic target for RTX 3060 (increased from 10)
         ENABLE_PROFILING: bool = False  # Enable profiling to identify CPU usage sources
         
-        # Hardware Video Decoding Settings (DEPRECATED - Use DeepStream instead)
-        ENABLE_NVDEC: bool = False  # DEPRECATED: Use ENABLE_DEEPSTREAM instead
-        NVDEC_FALLBACK_TO_CPU: bool = False  # DEPRECATED: DeepStream handles GPU-only decoding
-        NVDEC_BUFFER_SIZE: int = 5  # DEPRECATED: DeepStream manages buffer sizes automatically
+       
         
         # GPU Frame Preprocessing Settings
         ENABLE_GPU_PREPROCESSING: bool = True  # FORCE GPU-accelerated frame preprocessing
         GPU_BATCH_SIZE: int = 2  # OPTIMIZED: Reduced from 4 to minimize GPU memory spikes
         GPU_PREPROCESSING_DEVICE: str = "cuda:0"  # GPU device for preprocessing
         
-        # CPU Preprocessing Settings (DEPRECATED - GPU-only operation)
-        ENABLE_OPTIMIZED_PREPROCESSING: bool = False  # DEPRECATED: Use GPU preprocessing only
-        PREPROCESSING_THREADS: int = 2  # DEPRECATED: Unused in GPU-only mode
-        PREPROCESSING_ALGORITHM: str = "INTER_LINEAR"  # DEPRECATED: Unused in GPU-only mode
-        
-        # Unified GPU Pipeline Settings (DEPRECATED - Use DeepStream directly)
-        USE_UNIFIED_GPU_PIPELINE: bool = False  # DEPRECATED: Set to False to use DeepStream directly
-        UNIFIED_PIPELINE_THREADS: Optional[int] = None  # Auto-calculated based on camera count (None = auto)
-        PIPELINE_QUEUE_TIMEOUT_MS: float = 5.0  # OPTIMIZED: Reduced from 10.0 for quicker response
-        ENABLE_PIPELINE_VALIDATION: bool = True  # Validate pipeline configuration on startup
-        
+                      
         # Performance and Profiling Settings
         PROFILING_SAMPLING_RATE: int = 100  # OPTIMIZED: Profile every 100th frame (reduced overhead)
         MEMORY_MONITORING_ENABLED: bool = True  # Enable GPU memory monitoring
@@ -120,22 +107,20 @@ class AppConfig:
         THREAD_PRIORITY: str = "HIGH"  # Thread priority: "NORMAL", "HIGH", "REALTIME"
         DECODER_THREAD_PRIORITY: str = "REALTIME"  # NVDEC decoder thread priority
         
-        # Legacy Settings (DEPRECATED - Remove in future versions)
-        USE_LEGACY_NVDEC_READER: bool = False  # DEPRECATED: Use DeepStream pipeline instead
-        
-        # PyNvVideoCodec GPU Reader Settings (DEPRECATED)
-        GPU_READER_QUEUE_SIZE: int = 30  # DEPRECATED: Use DeepStream queue management
-        GPU_READER_MAX_CONSECUTIVE_FAILURES: int = 10  # DEPRECATED: Use DeepStream error handling
-        
+                
         # DeepStream Pipeline Configuration (RECOMMENDED)
         ENABLE_DEEPSTREAM: bool = True  # Enable DeepStream pipeline for video processing
         DEEPSTREAM_SOURCE_LATENCY: int = 50  # Reduced latency for real-time processing
         DEEPSTREAM_MUX_BATCH_SIZE: int = 1  # Single frame processing for lower latency
         DEEPSTREAM_MUX_SCALE_MODE: int = 2  # 0=stretch, 1=crop, 2=letter-box
         DEEPSTREAM_PREPROCESS_CONFIG: str = "config_preproc.txt"  # Path to preprocessing config file
-        DEEPSTREAM_TRACKER_CONFIG: str = "config_tracker_nvdcf_batch.yml"  # Path to batch tracker config file
-        DEEPSTREAM_TRACKER_LIB: str = ""  # Empty string uses NvDCF, or path to custom tracker lib like "libbytetrack_ds.so"
+        DEEPSTREAM_TRACKER_CONFIG: str = "tracker_nvdcf.yml"  # Path to tracker config file
+        DEEPSTREAM_TRACKER_LIB: str = "/opt/nvidia/deepstream/deepstream/lib/libnvds_nvmultiobjecttracker.so"  # DeepStream tracker library
         DEEPSTREAM_ENABLE_OSD: bool = True  # Enable on-screen display for visualization
+        
+        # Unified GPU Pipeline Configuration
+        USE_UNIFIED_GPU_PIPELINE: bool = True  # Enable unified GPU pipeline for optimal performance
+        UNIFIED_PIPELINE_THREADS: Optional[int] = None  # Auto-calculated if None
         
         def __post_init__(self):
             """Post-initialization to handle deprecated settings and warnings."""
@@ -143,39 +128,6 @@ class AppConfig:
             import logging
             
             logger = logging.getLogger("config.ProcessingSettings")
-            
-            # Check for deprecated NVDEC settings
-            if self.ENABLE_NVDEC:
-                warnings.warn(
-                    "ENABLE_NVDEC is deprecated. Use ENABLE_DEEPSTREAM=True instead.",
-                    DeprecationWarning,
-                    stacklevel=2
-                )
-                logger.warning("⚠️  ENABLE_NVDEC is deprecated. Use ENABLE_DEEPSTREAM=True instead.")
-            
-            if self.NVDEC_FALLBACK_TO_CPU:
-                warnings.warn(
-                    "NVDEC_FALLBACK_TO_CPU is deprecated. DeepStream handles GPU-only decoding automatically.",
-                    DeprecationWarning,
-                    stacklevel=2
-                )
-                logger.warning("⚠️  NVDEC_FALLBACK_TO_CPU is deprecated. DeepStream handles GPU-only decoding automatically.")
-            
-            if self.USE_LEGACY_NVDEC_READER:
-                warnings.warn(
-                    "USE_LEGACY_NVDEC_READER is deprecated. Use DeepStream pipeline instead.",
-                    DeprecationWarning,
-                    stacklevel=2
-                )
-                logger.warning("⚠️  USE_LEGACY_NVDEC_READER is deprecated. Use DeepStream pipeline instead.")
-            
-            if self.ENABLE_OPTIMIZED_PREPROCESSING:
-                warnings.warn(
-                    "ENABLE_OPTIMIZED_PREPROCESSING is deprecated. GPU preprocessing is now the default.",
-                    DeprecationWarning,
-                    stacklevel=2
-                )
-                logger.warning("⚠️  ENABLE_OPTIMIZED_PREPROCESSING is deprecated. GPU preprocessing is now the default.")
             
             # Validate DeepStream configuration
             if self.ENABLE_DEEPSTREAM:
@@ -188,13 +140,6 @@ class AppConfig:
                 logger.info("✅ DeepStream pipeline enabled - recommended for optimal performance.")
             else:
                 logger.warning("⚠️  DeepStream pipeline disabled. Consider enabling for better performance.")
-            
-            # Validate legacy settings conflicts
-            if self.ENABLE_NVDEC and self.ENABLE_DEEPSTREAM:
-                logger.warning("⚠️  Both ENABLE_NVDEC and ENABLE_DEEPSTREAM are enabled. DeepStream will take precedence.")
-            
-            if not self.ENABLE_NVDEC and not self.ENABLE_DEEPSTREAM:
-                logger.error("❌ Neither ENABLE_NVDEC nor ENABLE_DEEPSTREAM is enabled. At least one must be enabled for video processing.")
             
             # Memory optimization warnings
             if self.GPU_MEMORY_POOL_SIZE_MB > 1000:
@@ -336,7 +281,7 @@ class AppConfig:
         # TrackingSystem configuration (matches tracking.py)
         INACTIVE_THRESHOLD_SECONDS: float = 1.0   # Time threshold to mark tracks as inactive
         TRACE_PERSISTENCE_SECONDS: float = 5.0    # Time to keep inactive traces
-        USE_NATIVE_DEEPSTREAM_TRACKER: bool = False  # If True, use DeepStream's native tracker IDs, skip Python tracking
+        USE_NATIVE_DEEPSTREAM_TRACKER: bool = True  # If True, use DeepStream's native tracker IDs, skip Python tracking
         
         def get_tracker_config(self) -> Dict[str, Any]:
             """Get configuration dict for TrackingSystem initialization"""
@@ -605,15 +550,10 @@ def validate_unified_pipeline_config(config: AppConfig) -> Dict[str, List[str]]:
                 "Unified GPU pipeline requires ENABLE_TENSORRT=True"
             )
         
-        # Check for video decoding capability (DeepStream or NVDEC)
-        if not config.processing.ENABLE_DEEPSTREAM and not config.processing.ENABLE_NVDEC:
+        # Check for video decoding capability (DeepStream)
+        if not config.processing.ENABLE_DEEPSTREAM:
             validation_results['errors'].append(
-                "Unified GPU pipeline requires either ENABLE_DEEPSTREAM=True or ENABLE_NVDEC=True for video decoding"
-            )
-        
-        if config.processing.NVDEC_FALLBACK_TO_CPU:
-            validation_results['errors'].append(
-                "NVDEC_FALLBACK_TO_CPU must be False for strict GPU-only operation"
+                "Unified GPU pipeline requires ENABLE_DEEPSTREAM=True for video decoding"
             )
         
         if not config.processing.ENABLE_GPU_PREPROCESSING:
@@ -628,10 +568,7 @@ def validate_unified_pipeline_config(config: AppConfig) -> Dict[str, List[str]]:
                 "ENABLE_MULTIPROCESSING must be False when using unified pipeline"
             )
         
-        if config.processing.ENABLE_OPTIMIZED_PREPROCESSING:
-            validation_results['warnings'].append(
-                "ENABLE_OPTIMIZED_PREPROCESSING is ignored in GPU-only mode"
-            )
+        # GPU preprocessing is now the default, no need to check ENABLE_OPTIMIZED_PREPROCESSING
         
         # Memory and performance settings validation
         if config.processing.MAX_QUEUE_SIZE > 30:
@@ -644,10 +581,7 @@ def validate_unified_pipeline_config(config: AppConfig) -> Dict[str, List[str]]:
                 f"Large GPU batch size ({config.processing.GPU_BATCH_SIZE}) may exceed GPU memory"
             )
         
-        if config.processing.NVDEC_BUFFER_SIZE > 10:
-            validation_results['warnings'].append(
-                f"Large NVDEC buffer ({config.processing.NVDEC_BUFFER_SIZE}) may increase memory usage"
-            )
+        # NVDEC buffer size is handled by DeepStream automatically
         
         # TensorRT configuration validation
         if not config.models.TENSORRT_FP16:

@@ -238,26 +238,36 @@ class DeepStreamProcessorWrapper:
             return None
     
     def get_pipeline_stats(self) -> dict:
-        """Get pipeline statistics"""
-        if hasattr(self, 'pipeline') and self.pipeline:
-            return self.pipeline.get_pipeline_stats()
+        """Return stats directly from the underlying DeepStreamVideoPipeline."""
+        if self.processor and hasattr(self.processor, 'get_stats'):
+            return self.processor.get_stats()
         return {}
 
     def get_performance_data(self) -> dict:
-        """Get performance data for WebSocket stats"""
+        """Get performance+telemetry data for WebSocket stats."""
+        # Base skeleton – keeps legacy keys the frontend may read
         stats = {
             'fps': 0.0,
             'frame_count': 0,
             'processing_time_ms': 0.0,
             'status': 'unknown'
         }
-        
-        # Get pipeline stats if available
+
+        # Fetch full DeepStream stats (includes tracking)
         pipeline_stats = self.get_pipeline_stats()
         if pipeline_stats:
+            # Expose under a predictable key for ApplicationManager
+            stats['deepstream_stats'] = pipeline_stats
+            # Also flatten top-level for backwards compatibility (fps, runtime, etc.)
             stats.update(pipeline_stats)
-        
+
         return stats
+
+    def get_stats(self):
+        """Get comprehensive stats including tracking telemetry"""
+        if hasattr(self.processor, 'get_stats'):
+            return self.processor.get_stats()
+        return {}
 
     def update_confidence_threshold(self, confidence_threshold: float) -> bool:
         """Update confidence threshold in real-time"""
@@ -840,6 +850,22 @@ class ApplicationManager:
             if camera_id in self.frame_processors:
                 processor = self.frame_processors[camera_id]
                 camera_stats.update(processor.get_performance_data())
+                
+                # Get comprehensive stats including tracking telemetry
+                if hasattr(processor, 'get_stats'):
+                    comprehensive_stats = processor.get_stats()
+                    
+                    # Handle both flat and nested tracking data layouts
+                    tracking_data = None
+                    if comprehensive_stats:
+                        if 'tracking' in comprehensive_stats:                       # flat layout
+                            tracking_data = comprehensive_stats['tracking']
+                        elif 'deepstream_stats' in comprehensive_stats and \
+                             'tracking' in comprehensive_stats['deepstream_stats']: # nested layout
+                            tracking_data = comprehensive_stats['deepstream_stats']['tracking']
+
+                    if tracking_data:
+                        camera_stats['tracking'] = tracking_data
 
             # Add to overall stats
             stats['cameras'][camera_id] = camera_stats

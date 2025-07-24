@@ -202,6 +202,13 @@ class DeepStreamVideoPipeline:
         self.frame_count = 0
         self.start_time = time.time()
         
+        # Initialize tracking state for telemetry
+        self.live_tracking_state: Dict[str, Any] = {
+            'active_tracks': [],
+            'occupancy': {},
+            'transitions': []
+        }
+        
         # Initialize GStreamer
         Gst.init(None)
         
@@ -1591,14 +1598,20 @@ class DeepStreamVideoPipeline:
             return None
     
     def _extract_analytics_obj_meta(self, obj_meta) -> Optional[Dict[str, Any]]:
-        """Extract analytics object metadata"""
+        """Extract analytics object metadata and normalize key names"""
         try:
             user_meta_list = obj_meta.obj_user_meta_list
             while user_meta_list:
                 user_meta = pyds.NvDsUserMeta.cast(user_meta_list.data)  # type: ignore
                 if user_meta.base_meta.meta_type == pyds.nvds_get_user_meta_type("NVIDIA.DSANALYTICSOBJ.USER_META"):  # type: ignore
                     analytics_obj_meta = pyds.NvDsAnalyticsObjInfo.cast(user_meta.user_meta_data)  # type: ignore
+                    # Normalize to DeepStream SDK key casing so downstream logic works
                     return {
+                        'dirStatus': analytics_obj_meta.dirStatus,
+                        'lcStatus': analytics_obj_meta.lcStatus,
+                        'ocStatus': analytics_obj_meta.ocStatus,
+                        'roiStatus': analytics_obj_meta.roiStatus,
+                        # Retain legacy snake_case keys for backward compatibility
                         'direction_status': analytics_obj_meta.dirStatus,
                         'line_crossing_status': analytics_obj_meta.lcStatus,
                         'overcrowding_status': analytics_obj_meta.ocStatus,
@@ -1716,6 +1729,10 @@ class DeepStreamVideoPipeline:
     def _parse_obj_meta(self, frame_meta) -> List[Dict[str, Any]]:
         """Return list(dict) with keys class_id, confidence, bbox, object_id, and analytics data."""
         detections = []
+        active_tracks = []
+        occupancy = {}
+        transitions = []
+        
         l_obj = frame_meta.obj_meta_list
         while l_obj:
             obj = pyds.NvDsObjectMeta.cast(l_obj.data)  # type: ignore
@@ -1729,10 +1746,48 @@ class DeepStreamVideoPipeline:
                 "object_id": obj.object_id,
             }
             
+            # Build tracking data for telemetry
+            track_dict = {
+                'track_id': obj.object_id,
+                'camera_id': f"camera_{frame_meta.source_id}",
+                'confidence': obj.confidence,
+                'bbox': [rect.left, rect.top, rect.width, rect.height],
+                'class_id': obj.class_id
+            }
+            
+            # Compute center point
+            center_x = rect.left + rect.width / 2
+            center_y = rect.top + rect.height / 2
+            track_dict['center'] = [center_x, center_y]
+            
+            # Add tracker confidence if available
+            if hasattr(obj, 'tracker_confidence'):
+                track_dict['tracker_confidence'] = obj.tracker_confidence
+            
+            active_tracks.append(track_dict)
+            
             # Phase 3.3: Add analytics metadata if available
             analytics_data = self._extract_analytics_obj_meta(obj)
             if analytics_data:
                 detection["analytics"] = analytics_data
+                
+                # Extract occupancy and transition data from analytics
+                if 'roiStatus' in analytics_data:
+                    roi_status = analytics_data['roiStatus']
+                    for zone_name, status in roi_status.items():
+                        if status == 1:  # Object is in this zone
+                            occupancy[zone_name] = occupancy.get(zone_name, 0) + 1
+                
+                if 'lcStatus' in analytics_data:
+                    lc_status = analytics_data['lcStatus']
+                    for line_name, status in lc_status.items():
+                        if status == 1:  # Object crossed this line
+                            transitions.append({
+                                'track_id': obj.object_id,
+                                'camera_id': f"camera_{frame_meta.source_id}",
+                                'line_name': line_name,
+                                'timestamp': time.time()
+                            })
             
             # Add secondary inference results if available
             secondary_data = self._extract_secondary_inference_meta(obj)
@@ -1745,6 +1800,16 @@ class DeepStreamVideoPipeline:
                 l_obj = l_obj.next
             except StopIteration:
                 break
+        
+        # Update live tracking state
+        self.live_tracking_state['active_tracks'] = active_tracks
+        self.live_tracking_state['occupancy'] = occupancy
+        self.live_tracking_state['transitions'].extend(transitions)
+        
+        # Keep only recent transitions (last 100)
+        if len(self.live_tracking_state['transitions']) > 100:
+            self.live_tracking_state['transitions'] = self.live_tracking_state['transitions'][-100:]
+        
         return detections
     
     def _extract_secondary_inference_meta(self, obj_meta) -> Optional[Dict[str, Any]]:
@@ -1972,7 +2037,8 @@ class DeepStreamVideoPipeline:
             'runtime_seconds': runtime,
             'batch_size': self.batch_size,
             'sources': len(self.sources),
-            'queue_size': self.tensor_queue.qsize()
+            'queue_size': self.tensor_queue.qsize(),
+            'tracking': self.live_tracking_state
         }
 
     def _on_new_jpeg_sample(self, appsink: GstApp.AppSink) -> Gst.FlowReturn:

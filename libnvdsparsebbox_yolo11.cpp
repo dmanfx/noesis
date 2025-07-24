@@ -90,14 +90,14 @@ decodeTensorYolo(const float* output, const uint& outputSize, const uint& netW, 
 
   static bool first_call = true;
 #ifdef Y11_DEBUG
-  std::cout << "YOLO11 Parser: Processing " << outputSize << " detections, configured for "
-            << numClassesConfigured << " classes" << std::endl;
+  // std::cout << "YOLO11 Parser: Processing " << outputSize << " detections, configured for "
+  //           << numClassesConfigured << " classes" << std::endl;
 #else
-  if (first_call) {
-      std::cout << "YOLO11 Parser active – keeping class IDs in range 0-" << (numClassesConfigured - 1)
-                << std::endl;
-      first_call = false;
-  }
+  // if (first_call) {
+  //     std::cout << "YOLO11 Parser active – keeping class IDs in range 0-" << (numClassesConfigured - 1)
+  //               << std::endl;
+  //     first_call = false;
+  // }
 #endif
 
   for (uint b = 0; b < outputSize; ++b) {
@@ -107,8 +107,8 @@ decodeTensorYolo(const float* output, const uint& outputSize, const uint& netW, 
     // Check if the detected class is within the configured range
     if (maxIndex >= (int)numClassesConfigured) {
 #ifdef Y11_DEBUG
-      std::cout << "YOLO11 Parser: Skipping class " << maxIndex
-                << " (outside configured range)" << std::endl;
+      // std::cout << "YOLO11 Parser: Skipping class " << maxIndex
+      //           << " (outside configured range)" << std::endl;
 #endif
       continue;
     }
@@ -123,15 +123,15 @@ decodeTensorYolo(const float* output, const uint& outputSize, const uint& netW, 
     float by2 = output[b * 6 + 3];
 
 #ifdef Y11_DEBUG
-    std::cout << "YOLO11 Parser: Adding detection - class: " << maxIndex
-              << ", confidence: " << maxProb << std::endl;
+    // std::cout << "YOLO11 Parser: Adding detection - class: " << maxIndex
+    //           << ", confidence: " << maxProb << std::endl;
 #endif
 
     addBBoxProposal(bx1, by1, bx2, by2, netW, netH, maxIndex, maxProb, binfo);
   }
 
 #ifdef Y11_DEBUG
-  std::cout << "YOLO11 Parser: Total detections after filtering: " << binfo.size() << std::endl;
+  // std::cout << "YOLO11 Parser: Total detections after filtering: " << binfo.size() << std::endl;
 #endif
   return binfo;
 }

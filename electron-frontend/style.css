@@ -449,15 +449,73 @@ th {
 /* Controls Section */
 .controls-section {
     background: #2a2a2a;
-    border-radius: 8px;
-    padding: 20px;
+    border-radius: 1px;
+    padding: 10px;
     margin-bottom: 20px;
+    transition: background-color 0.3s ease;
+}
+
+.controls-section.collapsed {
+    background: #1e1e1e;
+    padding: 1px 20px;
+}
+
+.controls-section.collapsed .controls-header {
+    margin-bottom: 0;
+}
+
+.controls-header {
+    display: flex;
+    align-items: center;
+    cursor: pointer;
+    margin-bottom: 15px;
+    gap: 10px;
+}
+
+.controls-header h3 {
+    margin: 0;
+    color: #c678dd;
+    font-size: 1.2em;
+}
+
+.collapse-toggle {
+    background: none;
+    border: none;
+    color: #abb2bf;
+    font-size: 1.2em;
+    font-weight: bold;
+    cursor: pointer;
+    padding: 2px 6px;
+    border-radius: 3px;
+    transition: all 0.3s ease;
+    min-width: 20px;
+    text-align: center;
+}
+
+.collapse-toggle:hover {
+    background-color: #3a3a3a;
+    color: #c678dd;
 }
 
 .controls-content {
     display: flex;
     flex-direction: column;
     gap: 20px;
+    transition: max-height 0.3s ease, opacity 0.3s ease;
+    overflow: hidden;
+    max-height: 0; /* Start collapsed by default */
+    opacity: 0;
+    margin: 0;
+    padding: 0;
+    pointer-events: none; /* Prevent interaction when collapsed */
+}
+
+.controls-content.expanded {
+    max-height: 500px; /* Set a reasonable max height for expanded state */
+    opacity: 1;
+    margin: initial;
+    padding: initial;
+    pointer-events: auto; /* Re-enable interaction when expanded */
 }
 
 .toggle-group, .settings-group {

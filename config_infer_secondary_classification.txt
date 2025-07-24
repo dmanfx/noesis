@@ -11,7 +11,7 @@ process-mode=2
 # Process only on detected objects from primary inference
 operate-on-gie-id=1
 # Operate on specific classes (0=vehicle, 2=person)
-operate-on-class-ids=0;2
+operate-on-class-ids=1
 # Minimum object dimensions for processing
 input-object-min-width=64
 input-object-min-height=64

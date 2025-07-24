@@ -31,7 +31,7 @@ display-font-size=12
 enable=1
 # Define ROI as polygon points (x1;y1;x2;y2;x3;y3;x4;y4)
 # Full frame ROI for maximum detection coverage
-roi-RF=0;0;1280;0;1280;720;0;720
+roi-Kitchen=0;0;1280;0;1280;720;0;720
 # Keep objects inside ROI (inverse-roi=0) or outside (inverse-roi=1)
 inverse-roi=0
 # Apply to all classes (-1) or specific class ID

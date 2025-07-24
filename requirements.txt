@@ -6,13 +6,16 @@ torchvision==0.22.1+cu126
 cupy-cuda12x==13.5.1
 PyNvVideoCodec==1.0.1
 
+# DeepStream dependencies
+PyGObject==3.42.1
+pyds
+
 # ML models
 ultralytics==8.3.166
 supervision==0.25.1
 torchreid==0.2.5
 
 # Code quality & testing
-ruff==0.12.3
 pytest==8.4.1
 
 # Web interface
@@ -35,7 +38,6 @@ tensorrt_cu12_libs==10.12.0.36
 # Model format support
 onnx==1.17.0
 onnxruntime==1.22.1
-onnxslim==0.1.59
 
 # Data manipulation and visualization
 pandas==2.3.1
@@ -44,8 +46,6 @@ scipy==1.15.3
 
 # Training and monitoring
 tensorboard==2.19.0
-tensorboard-data-server==0.7.2
 
 # Additional utilities
-gdown==5.2.0
-ultralytics-thop==2.0.14 
+gdown==5.2.0 

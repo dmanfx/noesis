@@ -853,6 +853,49 @@ document.addEventListener('DOMContentLoaded', () => {
         });
     }
 
+    // --- ADDED: Collapsible Controls Section ---
+    const controlsHeader = document.getElementById('controls-header');
+    const controlsContent = document.getElementById('controls-content');
+    const controlsSection = document.querySelector('.controls-section');
+    const collapseToggle = document.getElementById('controls-collapse-toggle');
+    
+    if (controlsHeader && controlsContent && controlsSection && collapseToggle) {
+        // Initialize state (collapsed by default)
+        let isCollapsed = true;
+        
+        // Function to toggle collapse state
+        function toggleCollapse() {
+            isCollapsed = !isCollapsed;
+            
+            if (isCollapsed) {
+                controlsContent.classList.remove('expanded');
+                controlsSection.classList.add('collapsed');
+                collapseToggle.textContent = '+';
+            } else {
+                controlsContent.classList.add('expanded');
+                controlsSection.classList.remove('collapsed');
+                collapseToggle.textContent = '−';
+            }
+        }
+        
+        // Apply initial collapsed state (no need to add collapsed class since it's default)
+        controlsSection.classList.add('collapsed');
+        collapseToggle.textContent = '+';
+        
+                // Add click event listeners
+                controlsHeader.addEventListener('click', (event) => {
+                    // Don't trigger if clicking on the toggle button itself
+                    if (event.target !== collapseToggle && !collapseToggle.contains(event.target)) {
+                        toggleCollapse();
+                    }
+                });
+                
+                collapseToggle.addEventListener('click', (event) => {
+                    event.stopPropagation(); // Prevent header click from also firing
+                    toggleCollapse();
+                });
+    }
+
     // Start WebSocket connection
     connectWebSocket();
 });

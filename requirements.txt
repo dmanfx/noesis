@@ -4,7 +4,8 @@ opencv-python==4.12.0.88
 torch==2.7.1+cu126
 torchvision==0.22.1+cu126
 cupy-cuda12x==13.5.1
-#PyNvVideoCodec==1.0.1
+PyNvVideoCodec==1.0.1
+
 
 # DeepStream dependencies
 PyGObject==3.42.1

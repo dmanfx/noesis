@@ -84,7 +84,13 @@ python main.py --video /path/to/your/video.mp4
 python main.py --webcam
 ```
 
-Once the application is running, you can view the output by opening the `index.html` file in the `electron-frontend` directory in a web browser.
+To start the dashboard UI in development mode run the following inside `electron-frontend`:
+
+```bash
+npm run dev
+```
+
+For a production build run `npm run build` and then launch Electron with `npm start`. This will open the bundled `dist/index.html` automatically.
 
 ## Documentation
 

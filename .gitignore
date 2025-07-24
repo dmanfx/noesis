@@ -1,0 +1,10 @@
+# Ignore node modules and build output
+node_modules/
+electron-frontend/node_modules/
+electron-frontend/dist/
+
+# Python cache
+__pycache__/
+
+# IDE and OS files
+.DS_Store

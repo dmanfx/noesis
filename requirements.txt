@@ -6,6 +6,7 @@ torchvision==0.22.1+cu126
 cupy-cuda12x==13.5.1
 PyNvVideoCodec==1.0.1
 
+
 # DeepStream dependencies
 PyGObject==3.42.1
 pyds

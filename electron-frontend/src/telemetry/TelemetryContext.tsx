@@ -1,4 +1,4 @@
-import React, {createContext, useContext, useState} from 'react';
+import React, {createContext, useContext, useState, useEffect} from 'react';
 
 export type TelemetryEntry = {
   group: string;
@@ -27,6 +27,14 @@ export const TelemetryProvider: React.FC<{children: React.ReactNode}> = ({childr
       return [...filtered, entry];
     });
   };
+
+  // expose publish function on window so legacy scripts can push telemetry
+  useEffect(() => {
+    (window as any).publishTelemetry = publish;
+    return () => {
+      delete (window as any).publishTelemetry;
+    };
+  }, [publish]);
 
   return (
     <TelemetryContext.Provider value={{entries, publish}}>

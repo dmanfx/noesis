@@ -27,6 +27,13 @@ const clockElem = document.getElementById('clock');
 const fullscreenBtns = document.querySelectorAll('.fullscreen-btn');
 const clearStatsButton = document.getElementById('clear-stats-btn');
 
+// Helper to publish telemetry into React context if available
+function publishEntry(group, key, value) {
+    if (window.publishTelemetry) {
+        window.publishTelemetry({ group, key, value, ts: Date.now() });
+    }
+}
+
 // --- FPS Tracking Variables ---
 const fpsTracking = {
     'living-room': {
@@ -96,6 +103,8 @@ function updateFPSDisplay(cameraType, fps) {
     
     if (perfElem) {
         perfElem.textContent = `FPS: ${fps.toFixed(1)}`;
+        const group = cameraType === 'living-room' ? 'Camera Living Room' : 'Camera Kitchen';
+        publishEntry(group, 'FPS', Number(fps.toFixed(1)));
     }
 }
 
@@ -126,6 +135,7 @@ function connectWebSocket() {
             connectionStatusElem.textContent = 'Status: Connected';
             connectionStatusElem.style.color = 'green';
         }
+        publishEntry('Connection', 'Status', 'Connected');
         currentRetries = 0; // Reset retries
         resetStatsDisplay(); // Reset stats on successful connect
         resetFPSTracking(); // Reset FPS tracking on successful connect
@@ -137,6 +147,7 @@ function connectWebSocket() {
             connectionStatusElem.textContent = `Status: Disconnected (Code: ${event.code}). Retrying...`;
             connectionStatusElem.style.color = 'red';
         }
+        publishEntry('Connection', 'Status', 'Disconnected');
         if(livingRoomStreamElem) livingRoomStreamElem.src = ""; // Clear images on disconnect
         if(kitchenStreamElem) kitchenStreamElem.src = "";
         resetFPSTracking(); // Reset FPS tracking on disconnect
@@ -390,6 +401,7 @@ function handleStatsUpdate(payload) {
         const minutes = Math.floor((uptimeSeconds % 3600) / 60);
         const seconds = Math.floor(uptimeSeconds % 60); // Use floor for integer seconds
         systemStatusElem.textContent = `Uptime: ${hours}h ${minutes}m ${seconds}s`;
+        publishEntry('Application', 'Uptime', uptimeSeconds);
     }
 
     // Performance, Occupancy, Active Tracks, Transitions (Now nested under payload.cameras[cameraId].tracking)
@@ -403,6 +415,15 @@ function handleStatsUpdate(payload) {
         for (const cameraId in payload.cameras) {
             const cameraData = payload.cameras[cameraId];
             if (!cameraData) continue;
+
+            // publish basic camera stats if available
+            const groupName = `Camera ${cameraId}`;
+            if (typeof cameraData.frame_count !== 'undefined') {
+                publishEntry(groupName, 'Frames', cameraData.frame_count);
+            }
+            if (typeof cameraData.processing_time_ms !== 'undefined') {
+                publishEntry(groupName, 'Proc ms', cameraData.processing_time_ms);
+            }
 
             // --- Performance is now handled by client-side FPS tracking ---
             // Backend FPS data is no longer used since we calculate it client-side
@@ -442,9 +463,11 @@ function handleStatsUpdate(payload) {
             if (sortedZones.length > 0) {
                 sortedZones.forEach(([zone, count]) => {
                     occupancyHTML += `<li><strong>${zone}:</strong> ${count}</li>`;
+                    publishEntry('Occupancy', zone, count);
                 });
             } else {
                 occupancyHTML += '<li>No occupancy data.</li>'; // Updated message
+                publishEntry('Occupancy', 'none', 0);
             }
             occupancyHTML += '</ul>';
             occupancyContentElem.innerHTML = occupancyHTML;
@@ -471,6 +494,10 @@ function handleStatsUpdate(payload) {
             trackDetailsContentElem.innerHTML = tracksHTML;
         }
 
+        // publish active track count and transition count
+        publishEntry('Tracking', 'Active Tracks', allActiveTracks.length);
+        publishEntry('Tracking', 'Transitions', allTransitions.length);
+
         // Update Transitions Display
         if (transitionsListElem) {
             let transitionsHTML = '';
@@ -493,6 +520,8 @@ function handleStatsUpdate(payload) {
         console.warn("Stats payload missing or invalid 'cameras' structure.");
         // Optionally reset parts of the UI
         resetStatsDisplay(); // Or reset specific parts like performance
+        publishEntry('Tracking', 'Active Tracks', 0);
+        publishEntry('Tracking', 'Transitions', 0);
     }
 
     // --- REMOVED Old Logic that assumed top-level keys --- 
@@ -531,6 +560,9 @@ function resetStatsDisplay() {
     if (trackDetailsContentElem) trackDetailsContentElem.innerHTML = 'Loading...';
     if (transitionsListElem) transitionsListElem.innerHTML = '<li>Loading...</li>';
     if (systemStatusElem) systemStatusElem.textContent = 'Uptime: 0s';
+    publishEntry('Tracking', 'Active Tracks', 0);
+    publishEntry('Tracking', 'Transitions', 0);
+    publishEntry('Occupancy', 'none', 0);
 }
 
 // --- Fullscreen Logic ---

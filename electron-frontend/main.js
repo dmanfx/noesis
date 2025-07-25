@@ -15,8 +15,8 @@ function createWindow() {
     },
   });
 
-  // Load the index.html of the app.
-  mainWindow.loadFile('index.html');
+  // Load the bundled React app
+  mainWindow.loadFile(path.join(__dirname, 'dist', 'index.html'));
 
   // Open the DevTools automatically if needed
   // mainWindow.webContents.openDevTools();

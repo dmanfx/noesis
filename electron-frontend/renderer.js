@@ -690,8 +690,8 @@ function syncDetectionToggle(toggleName, enabled) {
     }
 }
 
-// --- Initial Setup --- Run after DOM is loaded ---
-document.addEventListener('DOMContentLoaded', () => {
+// --- Initial Setup ---
+function initDashboard() {
     console.log('Renderer DOM fully loaded and parsed');
 
     // Log the presence of stream image elements
@@ -898,4 +898,10 @@ document.addEventListener('DOMContentLoaded', () => {
 
     // Start WebSocket connection
     connectWebSocket();
-});
+}
+
+if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', initDashboard);
+} else {
+    initDashboard();
+}

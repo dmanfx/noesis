@@ -1,12 +1,11 @@
 import React, { useEffect, useState } from 'react';
 import './style.css';
-import { TelemetryProvider, useTelemetry } from './telemetry/TelemetryContext';
+import { TelemetryProvider } from './telemetry/TelemetryContext';
 import { TelemetryDrawer } from './telemetry/TelemetryDrawer';
 import { TelemetryToggle } from './telemetry/TelemetryToggle';
 
 const Dashboard: React.FC = () => {
   const [drawerOpen, setDrawerOpen] = useState(false);
-  const { publish } = useTelemetry();
 
   useEffect(() => {
     // legacy renderer logic
@@ -18,16 +17,6 @@ const Dashboard: React.FC = () => {
     };
   }, []);
 
-  useEffect(() => {
-    // sample metrics
-    const interval = setInterval(() => {
-      publish({ group: 'System', key: 'CPU Load', value: `${Math.floor(Math.random()*100)} %`, ts: Date.now() });
-      publish({ group: 'YOLOv8', key: 'Inference Latency', value: `${Math.floor(Math.random()*50)+20} ms`, ts: Date.now() });
-      publish({ group: 'Decoder', key: 'Frame Rate', value: `${29 + Math.floor(Math.random()*3)} fps`, ts: Date.now() });
-      publish({ group: 'Tracker', key: 'Active Targets', value: Math.floor(Math.random()*5), ts: Date.now() });
-    }, 5000);
-    return () => clearInterval(interval);
-  }, [publish]);
 
   return (
     <div id="app-container">

@@ -85,7 +85,7 @@ Okay, `models.py` is an active, core component defining the application's primar
 
 I've analyzed `track.py`, noting its sophisticated `Track` class with rich state history—positions, keypoints, features, velocity, and state—plus state detection and EMA smoothing. However, since it's the data model for the deprecated `tracking_manager.py`, `track.py` is also deprecated. The active pipeline instead uses `models.TrackingResult`. The `detect_state` logic is a candidate for migration. Now, I'll examine `dashboard_server.py` and `simple_dashboard_server.py`, starting with the former.
 
-`dashboard_server.py` is an active, standalone web server for GPU pipeline monitoring. It uses `RealtimeMonitor` and `run_monitor_server` from `realtime_monitor.py` to provide a feature-rich dashboard with charts and alerts. It also includes a `stop_dashboard` function for external shutdown. It is not deprecated. Now, I'll examine `simple_dashboard_server.py` to compare them.
+`dashboard_server.py` previously provided an advanced monitoring dashboard built on `realtime_monitor.py`. Both files have since been removed. The remaining `simple_dashboard_server.py` offers a lightweight dashboard with minimal dependencies.
 
 I've analyzed `simple_dashboard_server.py` and found it to be a lightweight, self-contained alternative to `dashboard_server.py`. It uses Python's built-in `http.server`, embeds HTML as a string, and relies on a simple meta refresh for updates instead of WebSockets. The backend data source, `MetricsCollector`, is the same. Both servers are designed to be run as standalone scripts, with `main.py` only containing hooks to stop them. Therefore, `simple_dashboard_server.py` is a "lite" version, not deprecated.
 

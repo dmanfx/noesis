@@ -331,13 +331,6 @@ from database import DatabaseManager
 INTERRUPT_COUNT = 0
 MAX_SHUTDOWN_TIME = 15  # Maximum time to wait for graceful shutdown
 
-# Import dashboard stop functions
-try:
-    from dashboard_server import stop_dashboard as stop_dashboard_server
-    DASHBOARD_SERVER_AVAILABLE = True
-except ImportError:
-    DASHBOARD_SERVER_AVAILABLE = False
-
 try:
     from simple_dashboard_server import stop_dashboard as stop_simple_dashboard_server
     SIMPLE_DASHBOARD_SERVER_AVAILABLE = True
@@ -1130,13 +1123,6 @@ class ApplicationManager:
                 self.logger.error(f"Error stopping CPU profiling: {e}")
         
         # STEP 8: Stop dashboard servers
-        try:
-            if DASHBOARD_SERVER_AVAILABLE:
-                stop_dashboard_server()
-                self.logger.info("Stopped dashboard server")
-        except Exception as e:
-            self.logger.error(f"Error stopping dashboard server: {e}")
-        
         try:
             if SIMPLE_DASHBOARD_SERVER_AVAILABLE:
                 stop_simple_dashboard_server()

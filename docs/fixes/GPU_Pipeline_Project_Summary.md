@@ -132,7 +132,6 @@ tensor = nvdec_reader.read_gpu_tensor()  # Direct GPU tensor
 ### Performance & Monitoring
 - `performance_profiler.py` - Lightweight profiling
 - `performance_benchmark.py` - Automated benchmarking
-- `realtime_monitor.py` - Live monitoring dashboard
 - `gpu_pipeline_validator.py` - Zero-fallback validation
 
 ### Configuration & Support
@@ -175,11 +174,8 @@ python -c "from config import validate_unified_pipeline_config; validate_unified
 # Run performance benchmark
 python performance_benchmark.py --duration 300
 
-# Start with monitoring
-python realtime_monitor.py &
+# Start the application with the simple dashboard
 python main.py
-
-# Access dashboard at http://localhost:8080
 ```
 
 ## Lessons Learned

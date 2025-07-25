@@ -45,12 +45,94 @@ except ImportError:
 # Add current directory to path for imports
 sys.path.insert(0, str(Path(__file__).parent))
 
-try:
-    from realtime_monitor import MetricsCollector, AlertManager
-    MONITOR_AVAILABLE = True
-except ImportError:
-    MONITOR_AVAILABLE = False
-    print("⚠️  RealtimeMonitor not available - using mock data")
+from dataclasses import dataclass, asdict
+from collections import deque
+import psutil
+import pynvml
+
+# Basic metrics collector used when realtime_monitor.py is not available
+@dataclass
+class MetricSnapshot:
+    timestamp: float
+    cpu_percent: float
+    memory_percent: float
+    gpu_utilization: float
+    gpu_memory_percent: float
+    gpu_temperature: float
+    gpu_power_watts: float
+    frame_rate: float
+    latency_ms: float
+    active_streams: int
+
+    def to_dict(self):
+        return asdict(self)
+
+
+class MetricsCollector:
+    """Collect simple system metrics using psutil and NVML"""
+
+    def __init__(self, gpu_device: int = 0):
+        self.logger = logging.getLogger("MetricsCollector")
+        self.gpu_device = gpu_device
+        self.frame_times = deque(maxlen=100)
+        self.last_frame_time = None
+
+        try:
+            pynvml.nvmlInit()
+            self.gpu_handle = pynvml.nvmlDeviceGetHandleByIndex(gpu_device)
+            self.nvml = pynvml
+        except Exception as e:
+            self.logger.error(f"NVML initialization failed: {e}")
+            self.nvml = None
+
+    def collect(self) -> MetricSnapshot:
+        cpu_percent = psutil.cpu_percent(interval=0.1)
+        mem = psutil.virtual_memory()
+
+        gpu_util = 0.0
+        gpu_mem_percent = 0.0
+        gpu_temp = 0.0
+        gpu_power = 0.0
+
+        if self.nvml:
+            try:
+                util = self.nvml.nvmlDeviceGetUtilizationRates(self.gpu_handle)
+                gpu_util = util.gpu
+                mem_info = self.nvml.nvmlDeviceGetMemoryInfo(self.gpu_handle)
+                gpu_mem_percent = (mem_info.used / mem_info.total) * 100
+                gpu_temp = self.nvml.nvmlDeviceGetTemperature(
+                    self.gpu_handle, self.nvml.NVML_TEMPERATURE_GPU
+                )
+                gpu_power = self.nvml.nvmlDeviceGetPowerUsage(self.gpu_handle) / 1000.0
+            except Exception as e:
+                self.logger.error(f"NVML error: {e}")
+
+        if self.frame_times:
+            avg_frame_time = sum(self.frame_times) / len(self.frame_times)
+            frame_rate = 1.0 / avg_frame_time if avg_frame_time > 0 else 0.0
+        else:
+            frame_rate = 0.0
+
+        latency_ms = 0.0
+
+        return MetricSnapshot(
+            timestamp=time.time(),
+            cpu_percent=cpu_percent,
+            memory_percent=mem.percent,
+            gpu_utilization=gpu_util,
+            gpu_memory_percent=gpu_mem_percent,
+            gpu_temperature=gpu_temp,
+            gpu_power_watts=gpu_power,
+            frame_rate=frame_rate,
+            latency_ms=latency_ms,
+            active_streams=0,
+        )
+
+    def update_frame_time(self):
+        current_time = time.time()
+        if self.last_frame_time is not None:
+            self.frame_times.append(current_time - self.last_frame_time)
+        self.last_frame_time = current_time
 
 # Global instances for external cleanup
 _dashboard_instance = None
@@ -110,16 +192,11 @@ class SimpleDashboard:
         self.lock = threading.RLock()
         
         # Initialize metrics collector
-        if MONITOR_AVAILABLE:
-            try:
-                self.collector = MetricsCollector()
-                self.alert_manager = AlertManager()
-            except Exception:
-                self.collector = MockMetricsCollector()
-                self.alert_manager = None
-        else:
+        try:
+            self.collector = MetricsCollector()
+        except Exception:
             self.collector = MockMetricsCollector()
-            self.alert_manager = None
+        self.alert_manager = None
         
         self.logger = logging.getLogger("SimpleDashboard")
     

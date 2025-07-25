@@ -180,8 +180,8 @@ config.set_memory_pool_limit(trt.MemoryPoolType.WORKSPACE, 1 << 30)
 - **`advanced_resize_optimizer.py`**: Fixed deprecated API usage
 
 ### **New Infrastructure**
-- **`simple_dashboard_server.py`**: New lightweight monitoring dashboard
-- **`dashboard_server.py`**: Enhanced dashboard with full features (requires aiohttp)
+- **`simple_dashboard_server.py`**: Lightweight monitoring dashboard
+- **`dashboard_server.py`**: (removed) advanced dashboard built on the now-deleted `realtime_monitor.py`
 
 ### **Documentation**
 - **`GPU_Pipeline_Fixes_Implementation_Summary.md`**: This comprehensive summary

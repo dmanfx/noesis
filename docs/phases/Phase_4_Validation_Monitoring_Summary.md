@@ -83,31 +83,10 @@ Phase 4 established comprehensive validation and monitoring infrastructure to en
 
 ### 4.2 Monitoring Infrastructure
 
-#### 4.2.1 Real-Time Monitoring ✅
-**File**: `realtime_monitor.py`
-
-- **MetricsCollector**:
-  - System-wide CPU and memory monitoring
-  - GPU metrics via NVML (utilization, memory, temperature, power)
-  - Pipeline-specific metrics (FPS, latency, active streams)
-  
-- **AlertManager**:
-  - Configurable thresholds for all metrics
-  - Multi-level alerts (warning, critical)
-  - Alert history and callbacks
-  - Dynamic threshold adjustment
-  
-- **Web Dashboard**:
-  - Real-time metric visualization
-  - Historical charts (Chart.js)
-  - WebSocket live updates
-  - Alert notifications
-  - Responsive dark theme UI
-
-**Dashboard Features**:
-- Live metric cards with color-coded status
-- Real-time line charts for CPU/GPU trends
-- Alert feed with severity indicators
+#### 4.2.1 Real-Time Monitoring (Removed)
+The previous real-time monitoring implementation has been retired. The simplified
+dashboard in `simple_dashboard_server.py` now provides basic metric visualization
+without the `realtime_monitor.py` infrastructure.
 - WebSocket auto-reconnection
 - RESTful API for metric access
 
@@ -210,7 +189,7 @@ The real-time dashboard provides:
 ## Lessons Learned
 
 1. **Validation is Critical**: Automated validation caught several edge cases
-2. **Real-Time Monitoring Essential**: Live metrics enable quick issue detection
+2. **Monitoring Essential**: Live metrics enable quick issue detection
 3. **Baseline Comparison**: Regression testing prevents performance degradation
 4. **Web Dashboard Value**: Visual monitoring greatly aids troubleshooting
 
@@ -237,13 +216,6 @@ python automated_performance_tests.py --suite all
 python automated_performance_tests.py --suite regression || exit 1
 ```
 
-### Starting Real-Time Monitor
-```bash
-# Start monitor with dashboard
-python realtime_monitor.py --port 8080
-
-# Access dashboard at http://localhost:8080
-```
 
 ### Validating Pipeline
 ```bash

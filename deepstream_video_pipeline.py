@@ -1342,25 +1342,40 @@ class DeepStreamVideoPipeline:
             frame_meta_list = batch_meta.frame_meta_list
             while frame_meta_list:
                 frame_meta = pyds.NvDsFrameMeta.cast(frame_meta_list.data)  # type: ignore
-                
+
                 # Extract analytics frame metadata
                 analytics_frame_data = self._extract_analytics_frame_meta(frame_meta)
                 if analytics_frame_data:
-                    self.rate_limited_logger.debug(f"📊 Analytics Frame {frame_meta.frame_num}: {analytics_frame_data}")
-                
+                    self.rate_limited_logger.debug(
+                        f"📊 Analytics Frame {frame_meta.frame_num}: {analytics_frame_data}"
+                    )
+
                 # Extract analytics object metadata
                 obj_meta_list = frame_meta.obj_meta_list
                 while obj_meta_list:
                     obj_meta = pyds.NvDsObjectMeta.cast(obj_meta_list.data)  # type: ignore
                     analytics_obj_data = self._extract_analytics_obj_meta(obj_meta)
                     if analytics_obj_data:
-                        self.rate_limited_logger.debug(f"📊 Analytics Object {obj_meta.object_id}: {analytics_obj_data}")
-                    
+                        self.rate_limited_logger.debug(
+                            f"📊 Analytics Object {obj_meta.object_id}: {analytics_obj_data}"
+                        )
+
                     try:
                         obj_meta_list = obj_meta_list.next
                     except StopIteration:
                         break
-                
+
+                # Update live tracking state using existing parsing logic
+                # Only needed when using native OSD mode because _on_new_sample
+                # already updates tracking for the Python appsink path
+                if self.config.visualization.USE_NATIVE_DEEPSTREAM_OSD:
+                    try:
+                        self._parse_obj_meta(frame_meta)
+                    except Exception as e:
+                        self.logger.debug(
+                            f"Error updating tracking state from analytics probe: {e}"
+                        )
+
                 try:
                     frame_meta_list = frame_meta_list.next
                 except StopIteration:

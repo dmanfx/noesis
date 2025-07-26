@@ -92,6 +92,7 @@ class WebSocketServer:
                 )
             
             self.logger.info(f"WebSocket server running on {self.host}:{self.port}")
+            print(f"🚀 WebSocket server is LIVE on {self.host}:{self.port}")
             
         except OSError as e:
             self.logger.error(f"Failed to start server (Port {self.port} likely in use): {e}")
@@ -137,6 +138,7 @@ class WebSocketServer:
         client_ip = websocket.remote_address[0] if hasattr(websocket, 'remote_address') else "Unknown"
         self.connected_clients.add(websocket)
         self.logger.info(f"Client {client_ip} connected. Total clients: {len(self.connected_clients)}")
+        print(f"✅ Client {client_ip} connected! Total clients: {len(self.connected_clients)}")
         
         try:
             # Send initial detection configuration to new client
@@ -257,8 +259,10 @@ class WebSocketServer:
         
         except websockets.exceptions.ConnectionClosedOK:
             self.logger.info(f"Client {client_ip} disconnected normally.")
+            print(f"❌ Client {client_ip} disconnected normally.")
         except websockets.exceptions.ConnectionClosedError as e:
             self.logger.info(f"Client {client_ip} disconnected with error: {e}")
+            print(f"❌ Client {client_ip} disconnected with error: {e}")
         except Exception as e:
             self.logger.error(f"Unexpected error with client {client_ip}: {e}")
         finally:
@@ -266,6 +270,7 @@ class WebSocketServer:
             if websocket in self.connected_clients:
                 self.connected_clients.remove(websocket)
                 self.logger.info(f"Client {client_ip} removed. Total clients: {len(self.connected_clients)}")
+                print(f"👋 Client {client_ip} removed. Total clients: {len(self.connected_clients)}")
     
     async def broadcast(self, message):
         """Broadcast a message to all connected WebSocket clients

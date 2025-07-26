@@ -824,64 +824,78 @@ class ApplicationManager:
     @profile_function("ApplicationManager.get_stats")
     def _get_stats(self) -> Dict[str, Any]:
         """Get application statistics for WebSocket broadcasting"""
-        
-        stats = {
-            'timestamp': time.time(),
-            'application': {
-                'running': self.running,
-                'cameras_active': len(self.camera_sources),
-                'processors_active': len(self.frame_processors)
-            },
-            'cameras': {}
-        }
-        
-        # Add camera stats
-        for camera_id in self.camera_sources:
-            camera_stats = {}
-            
-            # Get stats from frame processor
-            if camera_id in self.frame_processors:
-                processor = self.frame_processors[camera_id]
-                camera_stats.update(processor.get_performance_data())
-                
-                # Get comprehensive stats including tracking telemetry
-                if hasattr(processor, 'get_stats'):
-                    comprehensive_stats = processor.get_stats()
-                    
-                    # Handle both flat and nested tracking data layouts
-                    tracking_data = None
-                    if comprehensive_stats:
-                        if 'tracking' in comprehensive_stats:                       # flat layout
-                            tracking_data = comprehensive_stats['tracking']
-                        elif 'deepstream_stats' in comprehensive_stats and \
-                             'tracking' in comprehensive_stats['deepstream_stats']: # nested layout
-                            tracking_data = comprehensive_stats['deepstream_stats']['tracking']
 
-                    if tracking_data:
-                        camera_stats['tracking'] = tracking_data
+        current_time = time.time()
+        uptime = current_time - getattr(self.config.app, "START_TIME", current_time)
 
-            # Add to overall stats
-            stats['cameras'][camera_id] = camera_stats
-        
-        # Add application-level profiling data if enabled
-        if self.perf_monitor and self.config.processing.ENABLE_PROFILING:
-            stats['application_profiling'] = aggregate_stats(self.perf_monitor)
-        
-        # Add comprehensive CPU profiling data if enabled
-        if self.cpu_profiler:
-            try:
-                cpu_stats = self.cpu_profiler.get_comprehensive_stats()
-                stats['cpu_profiling'] = cpu_stats
-                
-                # Save profile data periodically
-                if self.cpu_profiler.should_save_data():
-                    self.cpu_profiler.save_profile_data()
-                    
-            except Exception as e:
-                self.logger.warning(f"Error getting CPU profiling stats: {e}")
-                stats['cpu_profiling'] = {'error': str(e)}
-        
+        try:
+            stats = {
+                'timestamp': current_time,
+                'uptime': uptime,
+                'application': {
+                    'running': self.running,
+                    'cameras_active': len(self.camera_sources),
+                    'processors_active': len(self.frame_processors)
+                },
+                'cameras': {}
+            }
+
+            # Add camera stats
+            for camera_id in self.camera_sources:
+                camera_stats = {}
+
+                # Get stats from frame processor
+                if camera_id in self.frame_processors:
+                    processor = self.frame_processors[camera_id]
+                    camera_stats.update(processor.get_performance_data())
+
+                    # Get comprehensive stats including tracking telemetry
+                    if hasattr(processor, 'get_stats'):
+                        comprehensive_stats = processor.get_stats()
+
+                        # Handle both flat and nested tracking data layouts
+                        tracking_data = None
+                        if comprehensive_stats:
+                            if 'tracking' in comprehensive_stats:
+                                tracking_data = comprehensive_stats['tracking']
+                            elif 'deepstream_stats' in comprehensive_stats and 'tracking' in comprehensive_stats['deepstream_stats']:
+                                tracking_data = comprehensive_stats['deepstream_stats']['tracking']
+
+                        if tracking_data:
+                            camera_stats['tracking'] = tracking_data
+
+                # Add to overall stats
+                stats['cameras'][camera_id] = camera_stats
+
+            # Add application-level profiling data if enabled
+            if self.perf_monitor and self.config.processing.ENABLE_PROFILING:
+                stats['application_profiling'] = aggregate_stats(self.perf_monitor)
+
+            # Add comprehensive CPU profiling data if enabled
+            if self.cpu_profiler:
+                try:
+                    cpu_stats = self.cpu_profiler.get_comprehensive_stats()
+                    stats['cpu_profiling'] = cpu_stats
+
+                    # Save profile data periodically
+                    if self.cpu_profiler.should_save_data():
+                        self.cpu_profiler.save_profile_data()
+
+                except Exception as e:
+                    self.logger.warning(f"Error getting CPU profiling stats: {e}")
+                    stats['cpu_profiling'] = {'error': str(e)}
+
+        except Exception as e:
+            self.logger.error(f"Error gathering application stats: {e}")
+            stats = {
+                'timestamp': current_time,
+                'uptime': uptime,
+                'application': {'running': self.running},
+                'cameras': {}
+            }
+
         return stats
+        
 
     @profile_function("ApplicationManager.get_detection_config")
     def _get_detection_config(self) -> Dict[str, Any]:

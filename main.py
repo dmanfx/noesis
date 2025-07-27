@@ -36,6 +36,7 @@ from models import DetectionResult, TrackingResult, AnalysisFrame, convert_numpy
 from deepstream_video_pipeline import create_deepstream_video_processor
 # from gpu_pipeline import UnifiedGPUPipeline, cleanup_all_gpu_resources  # DEPRECATED
 from tracking import TrackingSystem
+from utils import RateLimitedLogger
 
 class DeepStreamProcessorWrapper:
     """Simple wrapper to provide UnifiedGPUPipeline interface for DeepStream processor"""

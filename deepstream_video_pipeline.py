@@ -24,7 +24,7 @@ import time
 import queue
 
 # Bypass libproxy issues by disabling GIO proxy resolver
-import os
+# import os  # Removed duplicate import
 
 # Add ctypes imports for PyCapsule handling
 import ctypes
@@ -155,7 +155,7 @@ class DeepStreamVideoPipeline:
         
         # Initialize pipeline components
         self.pipeline: Optional[Gst.Pipeline] = None
-        self.loop: Optional[GLib.MainLoop] = None
+        self.mainloop: Optional[GLib.MainLoop] = None
         self.websocket_server: Optional[WebSocketServer] = None
         self.backoff = ExponentialBackoff()
         # self.cuda_manager = CudaContextManager()  # Commented out - not available
@@ -354,7 +354,7 @@ class DeepStreamVideoPipeline:
                 if custom_props and "target-classes:" in custom_props:
                     class_string = custom_props.split("target-classes:")[1]
                     current_classes = [int(x) for x in class_string.split(',') if x.strip()]
-            except:
+            except (AttributeError, TypeError, ValueError):
                 # If no custom properties set, assume all classes are enabled
                 current_classes = list(range(80))  # COCO has 80 classes
             
@@ -415,19 +415,19 @@ class DeepStreamVideoPipeline:
                 # Get confidence threshold
                 try:
                     config['confidence_threshold'] = self.nvinfer.get_property("confidence-threshold")
-                except:
+                except (AttributeError, TypeError, ValueError):
                     config['confidence_threshold'] = 0.3
                 
                 # Get IOU threshold
                 try:
                     config['iou_threshold'] = self.nvinfer.get_property("iou-threshold")
-                except:
+                except (AttributeError, TypeError, ValueError):
                     config['iou_threshold'] = 0.45
                 
                 # Get detection enabled status
                 try:
                     config['detection_enabled'] = self.nvinfer.get_property("enable")
-                except:
+                except (AttributeError, TypeError, ValueError):
                     config['detection_enabled'] = True
                 
                 # Get target classes
@@ -438,7 +438,7 @@ class DeepStreamVideoPipeline:
                         config['target_classes'] = [int(x) for x in class_string.split(',') if x.strip()]
                     else:
                         config['target_classes'] = list(range(80))  # All COCO classes
-                except:
+                except (AttributeError, TypeError, ValueError):
                     config['target_classes'] = list(range(80))
             
             return config
@@ -606,7 +606,7 @@ class DeepStreamVideoPipeline:
             # Nvtracker configuration
             nvtracker.set_property("ll-lib-file", "/opt/nvidia/deepstream/deepstream/lib/libnvds_nvmultiobjecttracker.so")
             tracker_config_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config_tracker_nvdcf_batch.yml")
-                nvtracker.set_property("ll-config-file", tracker_config_path)
+            nvtracker.set_property("ll-config-file", tracker_config_path)
 
             # Nvdsanalytics configuration
             nvanalytics.set_property("config-file", "config_nvdsanalytics.txt")
@@ -619,11 +619,11 @@ class DeepStreamVideoPipeline:
 
             # JPEG sink configuration
             caps_post_osd.set_property("caps", Gst.Caps.from_string("video/x-raw(memory:NVMM), format=I420"))
-                appsink_jpeg.set_property("emit-signals", True)
-                appsink_jpeg.set_property("sync", False)
+            appsink_jpeg.set_property("emit-signals", True)
+            appsink_jpeg.set_property("sync", False)
             appsink_jpeg.set_property("max-buffers", 5)
-                appsink_jpeg.set_property("drop", True)
-                appsink_jpeg.connect("new-sample", self._on_new_jpeg_sample)
+            appsink_jpeg.set_property("drop", True)
+            appsink_jpeg.connect("new-sample", self._on_new_jpeg_sample)
 
             # --- Phase C: Add and Link Elements ---
             self.logger.info("------------- Adding and Linking All Elements-------------")
@@ -696,7 +696,7 @@ class DeepStreamVideoPipeline:
                 source.set_property("timeout", 5)
                 
                 self.logger.info(f"📡 Created RTSP source for: {source_config}")
-                else:
+            else:
                 # Dictionary config
                 source = Gst.ElementFactory.make("rtspsrc", f"rtspsrc-{index}")
                 source.set_property("location", source_config["url"])
@@ -722,13 +722,13 @@ class DeepStreamVideoPipeline:
             decoder = Gst.ElementFactory.make("nvv4l2decoder", f"decoder-{index}")
             if not decoder:
                 self.logger.error("Failed to create nvv4l2decoder element")
-            return None
+                return None
             
             # Create converter
             converter = Gst.ElementFactory.make("nvvideoconvert", f"converter-{index}")
             if not converter:
                 self.logger.error("Failed to create nvvideoconvert element")
-            return None
+                return None
         
             # Create capsfilter
             caps = Gst.Caps.from_string("video/x-raw(memory:NVMM), format=NV12")
@@ -748,10 +748,10 @@ class DeepStreamVideoPipeline:
             converter.link(capsfilter)
             
             # Handle dynamic pad from rtspsrc
-        def cb_newpad(decodebin, decoder_src_pad, data):
+            def cb_newpad(decodebin, decoder_src_pad, data):
                 self.logger.info(f"📡 New pad from rtspsrc: {decoder_src_pad.get_name()}")
-            caps = decoder_src_pad.get_current_caps()
-            if not caps:
+                caps = decoder_src_pad.get_current_caps()
+                if not caps:
                     caps = decoder_src_pad.query_caps(None)
                 structure = caps.get_structure(0)
                 name = structure.get_name()
@@ -763,7 +763,7 @@ class DeepStreamVideoPipeline:
                         if ret != Gst.PadLinkReturn.OK:
                             self.logger.error(f"Failed to link rtspsrc to depay: {ret}")
                     else:
-                            self.logger.info("✅ Successfully linked rtspsrc to depay")
+                        self.logger.info("✅ Successfully linked rtspsrc to depay")
                 else:
                     self.logger.warning(f"Unexpected pad type: {name}")
             
@@ -776,7 +776,7 @@ class DeepStreamVideoPipeline:
             self.logger.info(f"✅ Created source bin {index} successfully")
             return source_bin
             
-                except Exception as e:
+        except Exception as e:
             self.logger.error(f"Error creating source bin {index}: {e}")
             return None
 
@@ -786,7 +786,7 @@ class DeepStreamVideoPipeline:
         This function is kept for reference but should not be used.
         """
         self.logger.warning("_on_new_sample is deprecated and should not be called.")
-                return Gst.FlowReturn.OK
+        return Gst.FlowReturn.OK
     
     def _analytics_probe(self, pad, info, user_data):
         """Phase 3.1: Probe to capture analytics metadata from nvdsanalytics"""
@@ -1253,23 +1253,23 @@ class DeepStreamVideoPipeline:
                     roi_status = analytics_data['roiStatus']
                     self.logger.debug(f"📊 ROI status: {roi_status}")
                     if isinstance(roi_status, dict):
-                    for zone_name, status in roi_status.items():
-                        if status == 1:  # Object is in this zone
-                            occupancy[zone_name] = occupancy.get(zone_name, 0) + 1
+                        for zone_name, status in roi_status.items():
+                            if status == 1:  # Object is in this zone
+                                occupancy[zone_name] = occupancy.get(zone_name, 0) + 1
                                 self.logger.debug(f"📊 Object {obj.object_id} in zone {zone_name}")
                 
                 if 'lcStatus' in analytics_data:
                     lc_status = analytics_data['lcStatus']
                     self.logger.debug(f"📊 Line crossing status: {lc_status}")
                     if isinstance(lc_status, dict):
-                    for line_name, status in lc_status.items():
-                        if status == 1:  # Object crossed this line
-                            transitions.append({
-                                'track_id': obj.object_id,
-                                'camera_id': f"camera_{frame_meta.source_id}",
-                                'line_name': line_name,
-                                'timestamp': time.time()
-                            })
+                        for line_name, status in lc_status.items():
+                            if status == 1:  # Object crossed this line
+                                transitions.append({
+                                    'track_id': obj.object_id,
+                                    'camera_id': f"camera_{frame_meta.source_id}",
+                                    'line_name': line_name,
+                                    'timestamp': time.time()
+                                })
                                 self.logger.debug(f"📊 Object {obj.object_id} crossed line {line_name}")
             else:
                 self.logger.debug(f"📊 No analytics data for object {obj.object_id}")
@@ -1415,19 +1415,19 @@ class DeepStreamVideoPipeline:
             
             if not self.pipeline:
                 self.logger.error("❌ Pipeline not created")
-                    return False
+                return False
             
             # Set pipeline state to PLAYING
-                ret = self.pipeline.set_state(Gst.State.PLAYING)
-                if ret == Gst.StateChangeReturn.FAILURE:
+            ret = self.pipeline.set_state(Gst.State.PLAYING)
+            if ret == Gst.StateChangeReturn.FAILURE:
                 self.logger.error("❌ Failed to set pipeline to PLAYING state")
-                    return False
-                elif ret == Gst.StateChangeReturn.ASYNC:
+                return False
+            elif ret == Gst.StateChangeReturn.ASYNC:
                 self.logger.info("⏳ Pipeline state change is async, waiting...")
                 ret = self.pipeline.get_state(Gst.CLOCK_TIME_NONE)
                 if ret[0] != Gst.StateChangeReturn.SUCCESS:
                     self.logger.error(f"❌ Pipeline state change failed: {ret[0]}")
-                        return False
+                    return False
             
             self.running = True
             self.start_time = time.time()
@@ -1482,13 +1482,8 @@ class DeepStreamVideoPipeline:
             return False, None
         
         try:
-            # Get tensor with longer timeout to handle processing delays
-            tensor_data = self.tensor_queue.get(timeout=1.0)
-            return True, tensor_data
-        except queue.Empty:
-            # Log queue status for debugging
-            if self.logger.isEnabledFor(logging.DEBUG):
-                self.logger.debug(f"Queue empty - size: {self.tensor_queue.qsize()}, running: {self.running}")
+            # Since tensor_queue is no longer used (metadata extracted via probe),
+            # return empty result for compatibility
             return False, None
         except Exception as e:
             self.logger.error(f"Error reading tensor: {e}")

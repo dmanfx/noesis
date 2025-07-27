@@ -196,11 +196,13 @@ class DeepStreamVideoPipeline:
         self.sources = [{'url': rtsp_url, 'name': 'rtsp_source', 'width': 1920, 'height': 1080, 'enabled': True}]
         
         # Add missing attributes for compatibility
-        self.tensor_queue = queue.Queue(maxsize=30)
+        self.frame_count = 0
+        self.frame_count_lock = threading.Lock()
+        # The tensor_queue is no longer needed as metadata is extracted via probe
+        # self.tensor_queue = queue.Queue(maxsize=30) 
         # JPEG queue for GPU-encoded frames when native OSD is enabled
         self.jpeg_queue: queue.Queue[bytes] = queue.Queue(maxsize=30)
-        self.frame_count = 0
-        self.start_time = time.time()
+        self.start_time = 0  # Will be set in start()
         
         # Initialize tracking state for telemetry
         self.live_tracking_state: Dict[str, Any] = {
@@ -543,788 +545,248 @@ class DeepStreamVideoPipeline:
         except Exception as e:
             self.logger.error(f"Error during engine-file check: {e}")
 
-
     def _create_pipeline(self) -> bool:
-        """Create the DeepStream GStreamer pipeline."""
+        """Create the DeepStream GStreamer pipeline using a consolidated, linear assembly approach."""
         try:
-            # Validate DeepStream configuration first
-            if not self._validate_deepstream_config():
-                return False
-            
-            # Log available metadata types for debugging
-            self._log_available_metadata_types()
-            
-            # Check if nvdspreprocess is available
-            test_preprocess = Gst.ElementFactory.make("nvdspreprocess", "test")
-            if not test_preprocess:
-                self.logger.error("❌ nvdspreprocess element not available - check DeepStream installation")
-                raise RuntimeError("nvdspreprocess element not found")
-            else:
-                self.logger.info("✅ nvdspreprocess element available")
-                # Clean up test element
-                test_preprocess = None
-            
-            # Create pipeline
+            # --- Phase A: Create All Elements ---
+            self.logger.info("------------- Creating GStreamer Elements-------------")
             self.pipeline = Gst.Pipeline()
             if not self.pipeline:
                 raise RuntimeError("Failed to create pipeline")
-            self.logger.info(f"✅ Created pipeline: {self.pipeline}")
+
+            element_names = [
+                "nvstreammux", "nvdspreprocess", "nvinfer", "nvtracker", "nvdsanalytics", 
+                "nvvideoconvert", "nvdsosd", "nvvidconv_post_osd", "caps_post_osd", 
+                "nvjpegenc_gpu", "queue_jpeg", "appsink_jpeg"
+            ]
+            elements = [Gst.ElementFactory.make(name, name) for name in 
+                        ["nvstreammux", "nvdspreprocess", "nvinfer", "nvtracker", "nvdsanalytics", 
+                         "nvvideoconvert", "nvdsosd", "nvvideoconvert", "capsfilter", 
+                         "nvjpegenc", "queue", "appsink"]]
             
-            # Register custom metadata callbacks for preprocessing
-            try:
-                pyds.register_user_copyfunc(custom_preprocess_copy_func)
-                pyds.register_user_releasefunc(custom_preprocess_release_func)
-                self.logger.info("✅ Registered custom preprocessing metadata callbacks")
-            except Exception as e:
-                self.logger.warning(f"⚠️ Could not register custom callbacks: {e}")
+            # Assign unique names
+            for i, el in enumerate(elements):
+                if el:
+                    el.set_name(element_names[i])
+
+            streammux, preprocess, nvinfer, nvtracker, nvanalytics, nvvidconv, nvosd, \
+            nvvidconv_post, caps_post_osd, jpegenc_gpu, queue_jpeg, appsink_jpeg = elements
+
+            if not all(elements):
+                for el, name in zip(elements, element_names):
+                    if not el: self.logger.error(f"❌ Failed to create element: {name}")
+                raise RuntimeError("Failed to create one or more GStreamer elements.")
+            self.logger.info("✅ All GStreamer elements created successfully.")
+
+            # --- Phase B: Configure Elements ---
+            self.logger.info("------------- Configuring GStreamer Elements-------------")
             
-            # Set up bus message handling
+            # Bus and metadata callbacks
             bus = self.pipeline.get_bus()
             bus.add_signal_watch()
             bus.connect("message", self._on_bus_message)
-            
-            # Create nvstreammux
-            streammux = Gst.ElementFactory.make("nvstreammux", "nvstreammux")
-            if not streammux:
-                raise RuntimeError("Failed to create nvstreammux")
-            self.logger.info(f"✅ Created nvstreammux: {streammux}")
-            
-            # Configure streammux for batch processing
+            pyds.register_user_copyfunc(custom_preprocess_copy_func)
+            pyds.register_user_releasefunc(custom_preprocess_release_func)
+
+            # Streammux configuration
             streammux.set_property("batch-size", self.batch_size)
             streammux.set_property("width", 1280)
             streammux.set_property("height", 720)
             streammux.set_property("batched-push-timeout", 4000000)
             streammux.set_property("live-source", 1)
-            streammux.set_property("sync-inputs", 0)  # Disable input synchronization for better batch performance
-            streammux.set_property("drop-pipeline-eos", 1)  # Drop EOS events to prevent pipeline stalls
-            
-            # Normal pipeline with preprocessing and inference
-            # Create nvdspreprocess
-            preprocess = Gst.ElementFactory.make("nvdspreprocess", "nvdspreprocess")
-            if not preprocess:
-                raise RuntimeError("Failed to create nvdspreprocess")
-            self.logger.info(f"✅ Created nvdspreprocess: {preprocess}")
 
-            # Set nvdspreprocess properties for batch processing
+            # Preprocess configuration
             preprocess.set_property("config-file", self.config.processing.DEEPSTREAM_PREPROCESS_CONFIG)
-            preprocess.set_property("gpu-id", self.device_id)
-            preprocess.set_property("enable", True)
-            preprocess.set_property("process-on-frame", True)
-
-            self.logger.info(f"✅ nvdspreprocess configured: config={self.config.processing.DEEPSTREAM_PREPROCESS_CONFIG}, gpu-id={self.device_id}")
-
-            self.pipeline.add(preprocess)
-
-            # Phase 1: Add pad probe on nvdspreprocess sink pad to log buffer metadata
-            preprocess_sink_pad = preprocess.get_static_pad("sink")
-            if preprocess_sink_pad:
-                preprocess_sink_pad.add_probe(Gst.PadProbeType.BUFFER, self._preprocess_probe, 0)
-                self.logger.info("✅ Added metadata probe to nvdspreprocess sink pad")
-            else:
-                self.logger.warning("❌ Failed to get nvdspreprocess sink pad for probe")
-
-            # Check for pre-existing engine file before creating nvinfer
+            
+            # Nvinfer configuration
             self._check_for_engine_file(self.config_file)
-            # Create nvinfer
-            nvinfer = Gst.ElementFactory.make("nvinfer", "nvinfer_primary")
-            if not nvinfer:
-                raise RuntimeError("Failed to create nvinfer")
-            self.logger.info(f"✅ Created nvinfer: {nvinfer}")
             nvinfer.set_property("config-file-path", self.config_file)
             nvinfer.set_property("input-tensor-meta", True)
-            self.logger.info(f"✅ Set nvinfer input-tensor-meta=True")
-            
-            # Add probe to nvinfer source pad to validate inference output
-            nvinfer_src_pad = nvinfer.get_static_pad("src")
-            if nvinfer_src_pad:
-                nvinfer_src_pad.add_probe(Gst.PadProbeType.BUFFER, self._nvinfer_src_pad_buffer_probe, 0)
-                self.logger.info("✅ Added inference validation probe to nvinfer source pad")
-            else:
-                self.logger.warning("❌ Failed to get nvinfer source pad for validation probe")
-                
-            # Create nvtracker with configuration file
-            nvtracker = Gst.ElementFactory.make("nvtracker", "nvtracker")
-            if not nvtracker:
-                raise RuntimeError("Failed to create nvtracker")
-            self.logger.info(f"✅ Created nvtracker: {nvtracker}")
-                
-            # Set tracker properties for batch processing
+
+            # Nvtracker configuration
             nvtracker.set_property("ll-lib-file", "/opt/nvidia/deepstream/deepstream/lib/libnvds_nvmultiobjecttracker.so")
-            nvtracker.set_property("tracker-width", 640)
-            nvtracker.set_property("tracker-height", 384)
-            nvtracker.set_property("gpu-id", 0)
-            nvtracker.set_property("tracking-id-reset-mode", 0)  # Never reset tracking ID
-            
-            # Set tracker configuration file for batch processing
             tracker_config_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config_tracker_nvdcf_batch.yml")
-            if os.path.exists(tracker_config_path):
                 nvtracker.set_property("ll-config-file", tracker_config_path)
-                self.logger.info(f"✅ Set batch tracker config file: {tracker_config_path}")
-            else:
-                # Fallback to basic tracker config
-                fallback_config_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tracker_nvdcf.yml")
-                if os.path.exists(fallback_config_path):
-                    nvtracker.set_property("ll-config-file", fallback_config_path)
-                    self.logger.info(f"✅ Set fallback tracker config file: {fallback_config_path}")
-                else:
-                    self.logger.warning(f"⚠️ No tracker config file found, using default properties")
-                
-            # Phase 3.1: Create nvdsanalytics for advanced analytics
-            nvanalytics = Gst.ElementFactory.make("nvdsanalytics", "nvdsanalytics")
-            if not nvanalytics:
-                raise RuntimeError("Failed to create nvdsanalytics")
-            self.logger.info(f"✅ Created nvdsanalytics: {nvanalytics}")
-                
-            # Set nvdsanalytics configuration
+
+            # Nvdsanalytics configuration
             nvanalytics.set_property("config-file", "config_nvdsanalytics.txt")
                 
-            # Phase 3.2: Create secondary inference engine (SGIE) for classification
-            sgie = None  # Disabled for now to avoid engine file issues
-            # sgie = Gst.ElementFactory.make("nvinfer", "nvinfer_secondary")
-            # if not sgie:
-            #     self.logger.warning("Failed to create secondary inference engine - continuing without SGIE")
-            #     sgie = None
-            # else:
-            #     self.logger.info(f"✅ Created secondary inference engine: {sgie}")
-            #     sgie.set_property("config-file-path", "config_infer_secondary_classification.txt")
-                
-            # Create nvvideoconvert
-            nvvidconv = Gst.ElementFactory.make("nvvideoconvert", "nvvideoconvert")
-            if not nvvidconv:
-                raise RuntimeError("Failed to create nvvideoconvert")
-            self.logger.info(f"✅ Created nvvideoconvert: {nvvidconv}")
-            
-            # Create nvdsosd
-            nvosd = Gst.ElementFactory.make("nvdsosd", "nvosd_display")
-            if not nvosd:
-                raise RuntimeError("Failed to create nvdsosd")
-            self.logger.info(f"✅ Created nvdsosd: {nvosd}")
-            # Add nvosd to pipeline early so subsequent elements share the same bin
-            self.pipeline.add(nvosd)
-            
-            # Pipeline sink elements
-            appsink = None
+            # OSD Sink Pad Probe for metadata
+            osd_src_pad = nvosd.get_static_pad("src")
+            if not osd_src_pad: raise RuntimeError("Failed to get OSD source pad")
+            osd_src_pad.add_probe(Gst.PadProbeType.BUFFER, self.osd_sink_pad_buffer_probe, 0)
+            self.logger.info("✅ Added buffer probe to OSD source pad for metadata extraction")
 
-            if self.config.visualization.USE_NATIVE_DEEPSTREAM_OSD:
-                # GPU JPEG encoding path
-                nvvidconv_post = Gst.ElementFactory.make("nvvideoconvert", "nvvidconv_post_osd")
-                jpegenc_gpu    = Gst.ElementFactory.make("nvjpegenc", "nvjpegenc_gpu")
-                appsink_jpeg   = Gst.ElementFactory.make("appsink", "appsink_jpeg")
-                if not nvvidconv_post or not jpegenc_gpu or not appsink_jpeg:
-                    raise RuntimeError("Failed to create GPU JPEG encoding elements")
-                # Configure appsink for JPEG bytes
+            # JPEG sink configuration
+            caps_post_osd.set_property("caps", Gst.Caps.from_string("video/x-raw(memory:NVMM), format=I420"))
                 appsink_jpeg.set_property("emit-signals", True)
                 appsink_jpeg.set_property("sync", False)
-                appsink_jpeg.set_property("max-buffers", 1)
+            appsink_jpeg.set_property("max-buffers", 5)
                 appsink_jpeg.set_property("drop", True)
-
-                # Add to pipeline
-                self.pipeline.add(nvvidconv_post)
-                self.pipeline.add(jpegenc_gpu)
-                self.pipeline.add(appsink_jpeg)
-
-                # Link post OSD path
-                if not nvosd.link(nvvidconv_post):
-                    raise RuntimeError("Failed to link nvosd to nvvidconv_post")
-                if not nvvidconv_post.link(jpegenc_gpu):
-                    raise RuntimeError("Failed to link nvvidconv_post to nvjpegenc")
-                if not jpegenc_gpu.link(appsink_jpeg):
-                    raise RuntimeError("Failed to link nvjpegenc to appsink_jpeg")
-
-                # Connect callback
                 appsink_jpeg.connect("new-sample", self._on_new_jpeg_sample)
 
-                # Store reference
-                self.appsink = None
-                self.jpeg_appsink = appsink_jpeg
-            else:
-                # Classic appsink path for Python visualization
-                appsink = Gst.ElementFactory.make("appsink", "appsink_python")
-                if not appsink:
-                    raise RuntimeError("Failed to create appsink")
-                self.logger.info(f"✅ Created appsink: {appsink}")
-                appsink.set_property("emit-signals", True)
-                appsink.set_property("sync", False)
-                appsink.set_property("max-buffers", 1)
-                appsink.set_property("drop", True)
-                self.pipeline.add(appsink)
-                if not nvosd.link(appsink):
-                    raise RuntimeError("Failed to link nvdsosd to appsink")
-                appsink.connect("new-sample", self._on_new_sample)
-                self.appsink = appsink
-                self.jpeg_appsink = None
-                
-            # Add all elements to pipeline
-            self.pipeline.add(streammux)
-            self.pipeline.add(nvinfer)
-            self.pipeline.add(nvtracker)
-            self.pipeline.add(nvanalytics) # Added nvdsanalytics
-            if sgie:  # Add SGIE if created successfully
-                self.pipeline.add(sgie)
-            self.pipeline.add(nvvidconv)
-            self.pipeline.add(nvosd)
-
-                
-            # Store references
-            self.streammux = streammux
-            self.preprocess = preprocess
-            self.nvinfer = nvinfer
-            self.nvtracker = nvtracker
-            self.nvanalytics = nvanalytics  # Store nvdsanalytics reference
-            self.sgie = sgie  # Store secondary inference engine reference
-            self.nvvidconv = nvvidconv
-            self.nvosd = nvosd
-
-                
-            # Connect appsink signal only if using appsink
-            if appsink:
-                appsink.connect("new-sample", self._on_new_sample)
-                
-            # Phase 3.1: Add probe to capture analytics metadata
-            analytics_src_pad = nvanalytics.get_static_pad("src")
-            if analytics_src_pad:
-                analytics_src_pad.add_probe(Gst.PadProbeType.BUFFER, self._analytics_probe, 0)
-                self.logger.info("✅ Added analytics probe to nvdsanalytics")
+            # --- Phase C: Add and Link Elements ---
+            self.logger.info("------------- Adding and Linking All Elements-------------")
             
-            # Create and add source
+            # Add all elements to the pipeline
+            for el in elements:
+                self.pipeline.add(el)
+            
+            # Create and add the source bin
             source_bin = self._create_source_bin(0, {'url': self.rtsp_url})
-            if not source_bin:
-                raise RuntimeError("Failed to create source bin")
+            if not source_bin: raise RuntimeError("Failed to create source bin")
             self.pipeline.add(source_bin)
             
             # Link source to streammux
             source_pad = source_bin.get_static_pad("src")
             sink_pad = streammux.get_request_pad("sink_0")
             if source_pad.link(sink_pad) != Gst.PadLinkReturn.OK:
-                raise RuntimeError("Failed to link source to streammux")
+                raise RuntimeError("Failed to link source bin to streammux")
             
-            # Link elements based on mode
-            if not streammux.link(preprocess):
-                raise RuntimeError("Failed to link nvstreammux to nvdspreprocess")
-            if not preprocess.link(nvinfer):
-                raise RuntimeError("Failed to link nvdspreprocess to nvinfer")
-            if not nvinfer.link(nvtracker):
-                raise RuntimeError("Failed to link nvinfer to nvtracker")
-            if not nvtracker.link(nvanalytics): # Added nvdsanalytics link
-                raise RuntimeError("Failed to link nvtracker to nvdsanalytics")
+            # Link the main processing chain
+            if not streammux.link(preprocess): raise RuntimeError("Failed to link streammux to preprocess")
+            if not preprocess.link(nvinfer): raise RuntimeError("Failed to link preprocess to nvinfer")
+            if not nvinfer.link(nvtracker): raise RuntimeError("Failed to link nvinfer to nvtracker")
+            if not nvtracker.link(nvanalytics): raise RuntimeError("Failed to link nvtracker to nvanalytics")
+            if not nvanalytics.link(nvvidconv): raise RuntimeError("Failed to link nvanalytics to nvvidconv")
+            if not nvvidconv.link(nvosd): raise RuntimeError("Failed to link nvvidconv to nvosd")
             
-            # Phase 3.2: Link through SGIE if available
-            if sgie:
-                if not nvanalytics.link(sgie):
-                    raise RuntimeError("Failed to link nvdsanalytics to secondary inference")
-                if not sgie.link(nvvidconv):
-                    raise RuntimeError("Failed to link secondary inference to nvvideoconvert")
-                self.logger.info("✅ Pipeline linked with secondary inference engine")
-            else:
-                if not nvanalytics.link(nvvidconv):
-                    raise RuntimeError("Failed to link nvdsanalytics to nvvideoconvert")
-                self.logger.info("✅ Pipeline linked without secondary inference engine")
+            # Link the JPEG encoding sink chain
+            if not nvosd.link(nvvidconv_post): raise RuntimeError("Failed to link nvosd to nvvidconv_post")
+            if not nvvidconv_post.link(caps_post_osd): raise RuntimeError("Failed to link nvvidconv_post to caps_post_osd")
+            if not caps_post_osd.link(jpegenc_gpu): raise RuntimeError("Failed to link caps_post_osd to jpegenc_gpu")
+            if not jpegenc_gpu.link(queue_jpeg): raise RuntimeError("Failed to link jpegenc_gpu to queue_jpeg")
+            if not queue_jpeg.link(appsink_jpeg): raise RuntimeError("Failed to link queue_jpeg to appsink_jpeg")
             
-            if not nvvidconv.link(nvosd):
-                raise RuntimeError("Failed to link nvvideoconvert to nvdsosd")
+            # --- Finalization ---
+            self.logger.info("✅ Pipeline construction complete.")
             
-            # Link nvdsosd to appropriate sink based on mode
-            if self.config.visualization.USE_NATIVE_DEEPSTREAM_OSD:
-                # Native OSD mode - nvosd is already linked to JPEG encoding path
-                self.logger.info("✅ Pipeline linked with native OSD JPEG encoding")
-            elif appsink:
-                if not nvosd.link(appsink):
-                    raise RuntimeError("Failed to link nvdsosd to appsink")
-                self.logger.info("✅ Pipeline linked with appsink for Python processing")
-            else:
-                raise RuntimeError("No sink available for pipeline")
-            
-            self.logger.info("✅ All elements linked successfully (with simplified tracker)")
+            # Store references
+            self.streammux, self.preprocess, self.nvinfer, self.nvtracker, self.nvanalytics, \
+            self.nvvidconv, self.nvosd = streammux, preprocess, nvinfer, nvtracker, nvanalytics, nvvidconv, nvosd
+            self.jpeg_appsink = appsink_jpeg
             
             return True
             
         except Exception as e:
             self.logger.error(f"❌ Failed to create pipeline: {e}")
+            import traceback
+            self.logger.error(f"Full Traceback: {traceback.format_exc()}")
             return False
     
-    def _nvinfer_src_pad_buffer_probe(self, pad, info, u_data):
-        """Probe to validate inference output and detect black frame causes"""
-        try:
-            gst_buffer = info.get_buffer()
-            if not gst_buffer:
-                return Gst.PadProbeReturn.OK
-                
-            batch_meta = pyds.gst_buffer_get_nvds_batch_meta(hash(gst_buffer))
-            if not batch_meta:
-                return Gst.PadProbeReturn.OK
-                
-            # Count detections per frame
-            frame_meta_list = batch_meta.frame_meta_list
-            while frame_meta_list:
-                frame_meta = pyds.NvDsFrameMeta.cast(frame_meta_list.data)
-                obj_count = 0
-                l_obj = frame_meta.obj_meta_list
-                while l_obj:
-                    obj_count += 1
-                    try:
-                        l_obj = l_obj.next
-                    except StopIteration:
-                        break
-                
-                if obj_count == 0:
-                    self.logger.warning(f"⚠️ Frame {frame_meta.frame_num}: No detections - checking tensor")
-                    # Attempt to access tensor meta for debugging
-                    user_meta_list = frame_meta.frame_user_meta_list
-                    while user_meta_list:
-                        user_meta = pyds.NvDsUserMeta.cast(user_meta_list.data)
-                        if user_meta.base_meta.meta_type == NVDS_PREPROCESS_BATCH_META:
-                            self.logger.debug("Tensor meta present in probe")
-                            break
-                        user_meta_list = user_meta_list.next
-                else:
-                    self.logger.debug(f"✅ Frame {frame_meta.frame_num}: {obj_count} detections")
-                
-
-                
-                try:
-                    frame_meta_list = frame_meta_list.next
-                except StopIteration:
-                    break
-            
-            return Gst.PadProbeReturn.OK
-        except Exception as e:
-            self.logger.error(f"Error in nvinfer probe: {e}")
-            return Gst.PadProbeReturn.OK
-
     def _create_source_bin(self, index: int, source_config: Dict[str, Any]) -> Gst.Element:
-        """Create a source bin using DeepStream's canonical nvurisrcbin approach."""
-        bin_name = f"source-bin-{index:02d}"
-        
-        # Create source bin
-        source_bin = Gst.Bin.new(bin_name)
-        if not source_bin:
-            self.logger.error(f"❌ Failed to create source bin {index}")
-            return None
-        self.logger.info(f"✅ Created source bin {index}: {source_bin}")
-        
-        # Create nvurisrcbin - DeepStream's canonical source element
-        # This automatically handles demuxing, decoding, and format conversion
-        uri_decode_bin = Gst.ElementFactory.make("nvurisrcbin", f"uri-decode-bin-{index}")
-        if not uri_decode_bin:
-            self.logger.error(f"❌ Failed to create nvurisrcbin for source {index}")
-            return None
-        
-        # Set URI property
-        source_url = source_config['url']
-        uri_decode_bin.set_property("uri", source_url)
-        self.logger.info(f"✅ Set URI: {source_url}")
-        
-        # Configure nvurisrcbin properties
-        uri_decode_bin.set_property("gpu-id", self.device_id)
-        uri_decode_bin.set_property("cudadec-memtype", 0)  # Device memory for best performance
-        uri_decode_bin.set_property("source-id", index)  # Set deterministic source ID
-        
-        # Enable file-loop for file sources if needed
-        if source_url.startswith('file://'):
-            uri_decode_bin.set_property("file-loop", 1)
-            self.logger.info("✅ Enabled file-loop for file source")
-        
-        # Set RTSP-specific properties
-        if source_url.startswith('rtsp://') or source_url.startswith('rtsps://'):
-            # RTSP latency and drop settings are handled by child elements
-            # We'll configure them in the child-added callback
-            pass
-        
-        # Add to bin
-        source_bin.add(uri_decode_bin)
-        
-        # Create ghost pad (no target initially - will be set in pad-added callback)
-        ghost_pad = Gst.GhostPad.new_no_target("src", Gst.PadDirection.SRC)
-        if not ghost_pad:
-            self.logger.error(f"❌ Failed to create ghost pad for source bin {index}")
+        """Create source bin for RTSP stream."""
+        try:
+            # Create source bin
+            source_bin = Gst.Bin.new(f"source-bin-{index}")
+            
+            # Create source element based on config
+            if isinstance(source_config, str):
+                # RTSP URL string
+                source = Gst.ElementFactory.make("rtspsrc", f"rtspsrc-{index}")
+                source.set_property("location", source_config)
+                source.set_property("latency", 0)
+                source.set_property("drop-on-latency", True)
+                source.set_property("ntp-sync", False)
+                source.set_property("ntp-time-source", 3)  # Running time
+                source.set_property("buffer-mode", 4)  # Auto
+                source.set_property("protocols", "tcp")
+                source.set_property("tcp-timeout", 5000000)  # 5 seconds
+                source.set_property("retry", 3)
+                source.set_property("timeout", 5)
+                
+                self.logger.info(f"📡 Created RTSP source for: {source_config}")
+                else:
+                # Dictionary config
+                source = Gst.ElementFactory.make("rtspsrc", f"rtspsrc-{index}")
+                source.set_property("location", source_config["url"])
+                source.set_property("latency", 0)
+                source.set_property("drop-on-latency", True)
+                source.set_property("ntp-sync", False)
+                source.set_property("ntp-time-source", 3)
+                source.set_property("buffer-mode", 4)
+                source.set_property("protocols", "tcp")
+                source.set_property("tcp-timeout", 5000000)
+                source.set_property("retry", 3)
+                source.set_property("timeout", 5)
+                
+                self.logger.info(f"📡 Created RTSP source for: {source_config['url']}")
+            
+            # Create depay element
+            depay = Gst.ElementFactory.make("rtph264depay", f"depay-{index}")
+            if not depay:
+                self.logger.error("Failed to create rtph264depay element")
+                return None
+            
+            # Create decoder
+            decoder = Gst.ElementFactory.make("nvv4l2decoder", f"decoder-{index}")
+            if not decoder:
+                self.logger.error("Failed to create nvv4l2decoder element")
             return None
             
-        source_bin.add_pad(ghost_pad)
+            # Create converter
+            converter = Gst.ElementFactory.make("nvvideoconvert", f"converter-{index}")
+            if not converter:
+                self.logger.error("Failed to create nvvideoconvert element")
+            return None
         
-        # Connect pad-added signal to handle dynamic pad creation
+            # Create capsfilter
+            caps = Gst.Caps.from_string("video/x-raw(memory:NVMM), format=NV12")
+            capsfilter = Gst.ElementFactory.make("capsfilter", f"capsfilter-{index}")
+            capsfilter.set_property("caps", caps)
+            
+            # Add elements to bin
+            source_bin.add(source)
+            source_bin.add(depay)
+            source_bin.add(decoder)
+            source_bin.add(converter)
+            source_bin.add(capsfilter)
+            
+            # Link elements
+            depay.link(decoder)
+            decoder.link(converter)
+            converter.link(capsfilter)
+            
+            # Handle dynamic pad from rtspsrc
         def cb_newpad(decodebin, decoder_src_pad, data):
-            """Callback for when nvurisrcbin creates a new pad."""
-            self.logger.info(f"🔍 New pad added for source {index}: {decoder_src_pad.get_name()}")
-            
-            # Get pad capabilities
+                self.logger.info(f"📡 New pad from rtspsrc: {decoder_src_pad.get_name()}")
             caps = decoder_src_pad.get_current_caps()
             if not caps:
-                caps = decoder_src_pad.query_caps()
-            
-            if not caps:
-                self.logger.error(f"❌ Failed to get caps for pad {decoder_src_pad.get_name()}")
-                return
-            
-            # Check if this is a video pad
-            gststruct = caps.get_structure(0)
-            gstname = gststruct.get_name()
-            features = caps.get_features(0)
-            
-            self.logger.info(f"🔍 Pad caps: {gstname}, features: {features}")
-            
-            if gstname.find("video") != -1:
-                # Verify NVIDIA decoder was selected (NVMM memory features)
-                if features.contains("memory:NVMM"):
-                    # Link to ghost pad
-                    if not ghost_pad.set_target(decoder_src_pad):
-                        self.logger.error(f"❌ Failed to link decoder src pad to ghost pad for source {index}")
-                    else:
-                        self.logger.info(f"✅ Linked decoder src pad to ghost pad for source {index}")
-                else:
-                    self.logger.error(f"❌ Decodebin did not pick NVIDIA decoder plugin for source {index}")
-            
-        # Connect child-added signal to configure child elements
-        def decodebin_child_added(child_proxy, obj, name, user_data):
-            """Callback for when nvurisrcbin adds child elements."""
-            self.logger.info(f"🔍 Decodebin child added for source {index}: {name}")
-            
-            # Recursively connect to nested decodebins
-            if name.find("decodebin") != -1:
-                obj.connect("child-added", decodebin_child_added, user_data)
-            
-            # Configure nvv4l2decoder specifically to fix ioctl errors
-            if "nvv4l2decoder" in name:
-                self.logger.info(f"🔍 Found nvv4l2decoder: {name}")
-                try:
-                    # Set explicit properties to reduce ioctl warnings
-                    obj.set_property("gpu-id", self.device_id)
-                    obj.set_property("cudadec-memtype", 0)  # Device memory for best performance
-                    obj.set_property("skip-frames", 0)  # Don't skip frames
-                    obj.set_property("drop-frame-interval", 0)  # Don't drop frames
-                    
-                    
-                    self.logger.info(f"✅ Configured nvv4l2decoder properties for {name}: gpu-id={self.device_id}, device=/dev/nvidia0")
-                except Exception as e:
-                    self.logger.warning(f"⚠️ Could not configure nvv4l2decoder properties: {e}")
-            
-            # Configure RTSP source properties
-            if "source" in name:
-                source_element = child_proxy.get_by_name("source")
-                if source_element and source_element.find_property('drop-on-latency'):
-                    source_element.set_property("drop-on-latency", True)
-                    self.logger.info(f"✅ Set drop-on-latency for RTSP source {index}")
-        
-                # Set RTSP latency
-                if source_element and source_element.find_property('latency'):
-                    source_element.set_property("latency", self.config.processing.DEEPSTREAM_SOURCE_LATENCY)
-                    self.logger.info(f"✅ Set RTSP latency to {self.config.processing.DEEPSTREAM_SOURCE_LATENCY}ms for source {index}")
+                    caps = decoder_src_pad.query_caps(None)
+                structure = caps.get_structure(0)
+                name = structure.get_name()
                 
-                # Force TCP for RTSP to avoid UDP issues
-                if source_element and source_element.find_property('protocols'):
-                    source_element.set_property("protocols", 4)  # TCP only
-                    self.logger.info(f"✅ Set RTSP protocols to TCP for source {index}")
-        
-            # Add explicit caps negotiation for H.264 parser
-            if "h264parse" in name:
-                self.logger.info(f"🔍 Found h264parse: {name}")
-                # Rollback: do not override default parser properties
-                # obj.set_property("config-interval", -1)  # Removed custom property
-                # obj.set_property("disable-passthrough", False)  # Removed custom property
-                self.logger.info(f"ℹ️ Using default h264parse properties for {name}")
+                if name.find("application/x-rtp") != -1:
+                    sink_pad = depay.get_static_pad("sink")
+                    if not sink_pad.is_linked():
+                        ret = decoder_src_pad.link(sink_pad)
+                        if ret != Gst.PadLinkReturn.OK:
+                            self.logger.error(f"Failed to link rtspsrc to depay: {ret}")
+                    else:
+                            self.logger.info("✅ Successfully linked rtspsrc to depay")
+                else:
+                    self.logger.warning(f"Unexpected pad type: {name}")
             
-            # Add caps filter to ensure proper format negotiation
-            if "capsfilter" in name:
-                self.logger.info(f"🔍 Found capsfilter: {name}")
-                # Rollback: do not force custom caps, rely on upstream negotiation
-                # caps_str = "video/x-h264, stream-format=byte-stream, alignment=au, profile=main, level=4"
-                # caps = Gst.Caps.from_string(caps_str)
-                # obj.set_property("caps", caps)
-                # self.logger.info(f"✅ Set capsfilter caps: {caps_str}")
-        
-        # Connect callbacks
-        uri_decode_bin.connect("pad-added", cb_newpad, source_bin)
-        uri_decode_bin.connect("child-added", decodebin_child_added, source_bin)
-        
-        self.logger.info(f"✅ Created DeepStream source bin {index} with nvurisrcbin")
-        return source_bin
+            source.connect("pad-added", cb_newpad, None)
+            
+            # Set ghost pad
+            ghost_pad = Gst.GhostPad.new("src", capsfilter.get_static_pad("src"))
+            source_bin.add_pad(ghost_pad)
+            
+            self.logger.info(f"✅ Created source bin {index} successfully")
+            return source_bin
+            
+                except Exception as e:
+            self.logger.error(f"Error creating source bin {index}: {e}")
+            return None
 
     def _on_new_sample(self, appsink: GstApp.AppSink) -> Gst.FlowReturn:
-        """Process new sample from appsink with tensor extraction"""
-        try:
-            # Increment frame counter for conditional logging
-            self.frame_count += 1
-            
-            sample = appsink.emit("pull-sample")
-            if not sample:
-                self.logger.warning("No sample received from appsink")
-                return Gst.FlowReturn.ERROR
-                
-            buffer = sample.get_buffer()
-            if not buffer:
-                self.logger.warning("No buffer in sample")
-                return Gst.FlowReturn.ERROR
-                
-            # Get batch metadata
-            batch_meta = pyds.gst_buffer_get_nvds_batch_meta(hash(buffer))  # type: ignore
-            if not batch_meta:
-                self.consecutive_no_meta_count += 1
-                if self.consecutive_no_meta_count >= self.max_consecutive_no_meta:
-                    self.logger.error(f"No batch metadata for {self.consecutive_no_meta_count} consecutive frames")
+        """DEPRECATED - This function is no longer called. 
+        Metadata is handled by the OSD pad probe.
+        This function is kept for reference but should not be used.
+        """
+        self.logger.warning("_on_new_sample is deprecated and should not be called.")
                 return Gst.FlowReturn.OK
-                
-            # Reset error counter on successful metadata
-            self.consecutive_no_meta_count = 0
-            batch_user_meta_count = 0  # Add this line
-            
-            # Phase 1: Enhanced metadata search with conditional logging
-            tensor_meta = None
-            tensor_meta_found = False
-            user_meta_list = batch_meta.batch_user_meta_list
-            while user_meta_list:
-                user_meta = pyds.NvDsUserMeta.cast(user_meta_list.data)
-                meta_type = user_meta.base_meta.meta_type
-                
-                batch_user_meta_count += 1
-                meta_type_int = int(meta_type) if hasattr(meta_type, '__int__') else meta_type
-                
-                # Conditional debug logging (every 100th frame only)
-                if self.frame_count % 100 == 0:
-                    self.logger.debug(f"🔍 Batch meta type: {meta_type} (int: {meta_type_int})")
-                
-                # Check for custom metadata types in batch-level (rate-limited)
-                if hasattr(pyds.NvDsMetaType, 'NVDS_START_USER_META'):
-                    start_user_meta = int(pyds.NvDsMetaType.NVDS_START_USER_META)
-                    if meta_type_int >= start_user_meta:
-                        self.rate_limited_logger.debug(f"🔍 CUSTOM BATCH METADATA DETECTED: {meta_type} (int: {meta_type_int}) - User metadata type")
-                
-                # Look for NVDS_PREPROCESS_BATCH_META type (this is what nvdspreprocess attaches)
-                if int(meta_type) == NVDS_PREPROCESS_BATCH_META:
-                    # Rate-limited logging for metadata discovery
-                    self.rate_limited_logger.debug(f"✅ Found metadata type {NVDS_PREPROCESS_BATCH_META} (NVDS_PREPROCESS_BATCH_META)")
-                    # Register callbacks if not already done
-                    try:
-                        pyds.register_user_copyfunc(custom_preprocess_copy_func)
-                        pyds.register_user_releasefunc(custom_preprocess_release_func)
-                        if self.frame_count % 100 == 0:
-                            self.logger.debug("✅ Registered custom preprocessing callbacks")
-                    except Exception as e:
-                        if self.frame_count % 100 == 0:
-                            self.logger.debug(f"⚠️ Callbacks already registered or failed: {e}")
-                elif int(meta_type) == NVDSINFER_TENSOR_OUTPUT_META:
-                    self.rate_limited_logger.debug(f"✅ Found metadata type {NVDSINFER_TENSOR_OUTPUT_META} (NVDSINFER_TENSOR_OUTPUT_META)")
-                else:
-                    if self.frame_count % 100 == 0:
-                        self.logger.debug(f"🔍 Found metadata type: {meta_type} (int: {int(meta_type)})")
-                
-                if int(meta_type) == NVDS_PREPROCESS_BATCH_META:
-                    # Validate tensor metadata before extraction
-                    if self._validate_tensor_meta(user_meta.user_meta_data, NVDS_PREPROCESS_BATCH_META):
-                        tensor_meta = user_meta.user_meta_data  # PyCapsule
-                        tensor_meta_found = True
-                        self.rate_limited_logger.debug("✅ Found NVDS_PREPROCESS_BATCH_META PyCapsule")
-                        break
-                    else:
-                        self.rate_limited_logger.warning("❌ Invalid tensor metadata found - skipping")
-                try:
-                    user_meta_list = user_meta_list.next
-                except StopIteration:
-                    break
-            
-            # Scan frame-level user metadata for NVDSINFER_TENSOR_OUTPUT_META (from nvinfer)
-            frame_meta_list = batch_meta.frame_meta_list
-            while frame_meta_list:
-                frame_meta = pyds.NvDsFrameMeta.cast(frame_meta_list.data)  # type: ignore
-                frame_user_meta_count = 0
-                frame_user_meta_list = frame_meta.frame_user_meta_list
-                while frame_user_meta_list:
-                    frame_user_meta_count += 1
-                    user_meta = pyds.NvDsUserMeta.cast(frame_user_meta_list.data)  # type: ignore
-                    meta_type = user_meta.base_meta.meta_type
-                    
-                    # Conditional debug logging (every 100th frame only)
-                    meta_type_int = int(meta_type) if hasattr(meta_type, '__int__') else meta_type
-                    if self.frame_count % 100 == 0:
-                        self.logger.debug(f"🔍 Frame meta type: {meta_type} (int: {meta_type_int})")
-                    
-                    # Check for custom metadata types (user metadata starts from NVDS_START_USER_META)
-                    if hasattr(pyds.NvDsMetaType, 'NVDS_START_USER_META'):
-                        start_user_meta = int(pyds.NvDsMetaType.NVDS_START_USER_META)
-                        if meta_type_int >= start_user_meta:
-                            self.rate_limited_logger.debug(f"🔍 CUSTOM METADATA DETECTED: {meta_type} (int: {meta_type_int}) - User metadata type")
-                    
-                    # Look for NVDSINFER_TENSOR_OUTPUT_META type (this is what nvinfer attaches)
-                    if meta_type == pyds.NvDsMetaType.NVDSINFER_TENSOR_OUTPUT_META:
-                        infer_tensor_meta = pyds.NvDsInferTensorMeta.cast(user_meta.user_meta_data)  # type: ignore
-                        if infer_tensor_meta:
-                            # Convert NvDsInferTensorMeta to our tensor format if needed
-                            self.rate_limited_logger.debug("✅ Found inference tensor meta in frame-level NVDSINFER_TENSOR_OUTPUT_META")
-                            # For now, we'll use the preprocess tensor meta, but we could also use this
-                    try:
-                        frame_user_meta_list = frame_user_meta_list.next
-                    except StopIteration:
-                        break
-                if tensor_meta_found:
-                    break
-                try:
-                    frame_meta_list = frame_meta_list.next
-                except StopIteration:
-                    break
-            
-            # Phase 1: Log metadata search results (rate-limited)
-            if self.frame_count % 100 == 0:
-                self.logger.debug(f"🔍 Metadata search results: batch_user_meta_count={batch_user_meta_count}, "
-                               f"frame_user_meta_count={frame_user_meta_count}, tensor_meta_found={tensor_meta_found}")
-            
-            # Add detailed debug logging (every 100th frame only)
-            if self.frame_count % 100 == 0:
-                self.logger.debug(f"=== METADATA SEARCH DEBUG ===")
-                self.logger.debug(f"Expected tensor meta type: {NVDS_PREPROCESS_BATCH_META}")
-                self.logger.debug(f"Expected NVDSINFER_TENSOR_OUTPUT_META: {int(pyds.NvDsMetaType.NVDSINFER_TENSOR_OUTPUT_META)}")
-                if hasattr(pyds.NvDsMetaType, 'NVDS_START_USER_META'):
-                    self.logger.debug(f"NVDS_START_USER_META: {int(pyds.NvDsMetaType.NVDS_START_USER_META)}")
-                self.logger.debug(f"Found batch_user_meta_count: {batch_user_meta_count}")
-                self.logger.debug(f"Found frame_user_meta_count: {frame_user_meta_count}")
-                self.logger.debug(f"tensor_meta_found: {tensor_meta_found}")
-            
-            # Process frame metadata
-            frame_meta_list = batch_meta.frame_meta_list
-            while frame_meta_list:
-                fmeta = pyds.NvDsFrameMeta.cast(frame_meta_list.data)  # type: ignore
-                detections = self._parse_obj_meta(fmeta)
-
-                # Locate NVDSINFER_TENSOR_OUTPUT_META for this frame
-                infer_tensor_meta = None
-                fum = fmeta.frame_user_meta_list
-                while fum:
-                    u_meta = pyds.NvDsUserMeta.cast(fum.data)
-                    meta_type = u_meta.base_meta.meta_type
-                    meta_type_int = int(meta_type) if hasattr(meta_type, '__int__') else meta_type
-                    
-                    # Conditional debug logging for frame-level tensor search
-                    if self.frame_count % 100 == 0:
-                        self.logger.debug(f"🔍 Frame tensor search - meta type: {meta_type} (int: {meta_type_int})")
-                    
-                    # Check for custom metadata types in frame-level tensor search
-                    if hasattr(pyds.NvDsMetaType, 'NVDS_START_USER_META'):
-                        start_user_meta = int(pyds.NvDsMetaType.NVDS_START_USER_META)
-                        if meta_type_int >= start_user_meta:
-                            self.rate_limited_logger.debug(f"🔍 CUSTOM FRAME METADATA DETECTED: {meta_type} (int: {meta_type_int}) - User metadata type")
-                    
-                    if u_meta.base_meta.meta_type == pyds.NvDsMetaType.NVDSINFER_TENSOR_OUTPUT_META:
-                        infer_tensor_meta = pyds.NvDsInferTensorMeta.cast(u_meta.user_meta_data)
-                        self.rate_limited_logger.debug(f"✅ Found NVDSINFER_TENSOR_OUTPUT_META (type 12) in frame-level search")
-                        break
-                    try:
-                        fum = fum.next
-                    except StopIteration:
-                        break
-
-                # Extract tensor - try custom preprocessing metadata first, then fall back to inference metadata
-                gpu_tensor = None
-                if tensor_meta_found and tensor_meta:
-                    # Try custom preprocessing metadata (type 27)
-                    gpu_tensor = self._extract_tensor_from_meta(tensor_meta, fmeta.source_id)
-                    if gpu_tensor is not None:
-                        self.tensor_logger.debug(f"✅ GPU tensor extracted from custom preprocessing: shape={tuple(gpu_tensor.shape)}, dtype={gpu_tensor.dtype}")
-                    else:
-                        self.tensor_logger.debug("❌ Failed to extract tensor from custom preprocessing metadata")
-                
-                # Fall back to inference metadata if custom preprocessing failed
-                if gpu_tensor is None and infer_tensor_meta:
-                    gpu_tensor = self._extract_tensor_from_infer_meta(infer_tensor_meta)
-                    if gpu_tensor is not None:
-                        self.tensor_logger.debug(f"✅ GPU tensor extracted from inference metadata: shape={tuple(gpu_tensor.shape)}, dtype={gpu_tensor.dtype}")
-                    else:
-                        self.tensor_logger.debug("❌ Failed to extract tensor from inference metadata")
-                
-                if gpu_tensor is None:
-                    self.tensor_logger.debug("No GPU tensor extracted for this frame")
-                
-                frame_dict = {
-                    "detections": detections,
-                    "frame_num": fmeta.frame_num,
-                    "source_id": fmeta.source_id,
-                    "timestamp": time.time(),
-                    "tensor": gpu_tensor,  # Add tensor to frame data
-                }
-                
-                # Log diagnostic information (rate-limited)
-                self.detection_logger.debug(f"📊 Frame {fmeta.frame_num}: detections={len(detections)}, tensor={'✅' if gpu_tensor is not None else '❌'}")
-                
-                try:
-                    self.tensor_queue.put_nowait(frame_dict)
-                    if detections:  # Only log when we have detections
-                        self.logger.debug(f"✅ Queued {len(detections)} detections for frame {fmeta.frame_num}")
-                except queue.Full:
-                    self.logger.warning("tensor_queue full – dropping frame %d", fmeta.frame_num)
-                try:
-                    frame_meta_list = frame_meta_list.next
-                except StopIteration:
-                    break
-            return Gst.FlowReturn.OK
-            
-        except Exception as e:
-            self.logger.error(f"Error in _on_new_sample: {e}")
-            return Gst.FlowReturn.ERROR
-
-    def _preprocess_probe(self, pad, info, u_data):
-        """Phase 1: Probe to log buffer metadata from nvdspreprocess sink pad."""
-        try:
-            gst_buffer = info.get_buffer()
-            if not gst_buffer:
-                return Gst.PadProbeReturn.OK
-                
-            # Get batch metadata
-            batch_meta = pyds.gst_buffer_get_nvds_batch_meta(hash(gst_buffer))  # type: ignore
-            if not batch_meta:
-                return Gst.PadProbeReturn.OK
-                
-            # Count batch-level user metadata
-            batch_user_meta_count = 0
-            user_meta_list = batch_meta.batch_user_meta_list
-            while user_meta_list:
-                batch_user_meta_count += 1
-                user_meta = pyds.NvDsUserMeta.cast(user_meta_list.data)  # type: ignore
-                meta_type = user_meta.base_meta.meta_type
-                
-                # Check if this is NVDS_PREPROCESS_BATCH_META
-                # NVDS_PREPROCESS_BATCH_META = 27 (based on actual runtime observation)
-                if meta_type == 27:
-                    self.rate_limited_logger.debug("✅ Preprocess probe: Found NVDS_PREPROCESS_BATCH_META in batch-level!")
-                    preprocess_batch_meta = pyds.NvDsPreProcessBatchMeta.cast(user_meta.user_meta_data)  # type: ignore
-                    if preprocess_batch_meta and preprocess_batch_meta.tensor_meta:
-                        tensor_meta = preprocess_batch_meta.tensor_meta
-                        self.rate_limited_logger.debug(f"✅ Tensor meta details: buffer_size={tensor_meta.buffer_size}, tensor_shape={tensor_meta.tensor_shape}")
-                
-                try:
-                    user_meta_list = user_meta_list.next
-                except StopIteration:
-                    break
-                    
-            # Count frame-level user metadata
-            frame_user_meta_count = 0
-            frame_meta_list = batch_meta.frame_meta_list
-            while frame_meta_list:
-                frame_meta = pyds.NvDsFrameMeta.cast(frame_meta_list.data)  # type: ignore
-                frame_user_meta_list = frame_meta.frame_user_meta_list
-                while frame_user_meta_list:
-                    frame_user_meta_count += 1
-                    user_meta = pyds.NvDsUserMeta.cast(frame_user_meta_list.data)  # type: ignore
-                    meta_type = user_meta.base_meta.meta_type
-                    
-                    # Check if this is NVDSINFER_TENSOR_OUTPUT_META
-                    if meta_type == pyds.NvDsMetaType.NVDSINFER_TENSOR_OUTPUT_META:
-                        self.rate_limited_logger.debug("✅ Preprocess probe: Found NVDSINFER_TENSOR_OUTPUT_META in frame-level!")
-                        infer_tensor_meta = pyds.NvDsInferTensorMeta.cast(user_meta.user_meta_data)  # type: ignore
-                        self.rate_limited_logger.debug(f"✅ Inference tensor meta details: num_output_layers={infer_tensor_meta.num_output_layers}")
-                    
-                    try:
-                        frame_user_meta_list = frame_user_meta_list.next
-                    except StopIteration:
-                        break
-                try:
-                    frame_meta_list = frame_meta_list.next
-                except StopIteration:
-                    break
-                    
-            # Log metadata counts (rate-limited)
-            self.rate_limited_logger.debug(f"🔍 Preprocess probe: Batch user meta count: {batch_user_meta_count}, Frame user meta count: {frame_user_meta_count}")
-                    
-            return Gst.PadProbeReturn.OK
-            
-        except Exception as e:
-            self.logger.error(f"Error in preprocess probe: {e}")
-            return Gst.PadProbeReturn.OK
     
     def _analytics_probe(self, pad, info, user_data):
         """Phase 3.1: Probe to capture analytics metadata from nvdsanalytics"""
@@ -1789,12 +1251,17 @@ class DeepStreamVideoPipeline:
                 # Extract occupancy and transition data from analytics
                 if 'roiStatus' in analytics_data:
                     roi_status = analytics_data['roiStatus']
+                    self.logger.debug(f"📊 ROI status: {roi_status}")
+                    if isinstance(roi_status, dict):
                     for zone_name, status in roi_status.items():
                         if status == 1:  # Object is in this zone
                             occupancy[zone_name] = occupancy.get(zone_name, 0) + 1
+                                self.logger.debug(f"📊 Object {obj.object_id} in zone {zone_name}")
                 
                 if 'lcStatus' in analytics_data:
                     lc_status = analytics_data['lcStatus']
+                    self.logger.debug(f"📊 Line crossing status: {lc_status}")
+                    if isinstance(lc_status, dict):
                     for line_name, status in lc_status.items():
                         if status == 1:  # Object crossed this line
                             transitions.append({
@@ -1803,6 +1270,9 @@ class DeepStreamVideoPipeline:
                                 'line_name': line_name,
                                 'timestamp': time.time()
                             })
+                                self.logger.debug(f"📊 Object {obj.object_id} crossed line {line_name}")
+            else:
+                self.logger.debug(f"📊 No analytics data for object {obj.object_id}")
             
             # Add secondary inference results if available
             secondary_data = self._extract_secondary_inference_meta(obj)
@@ -1824,6 +1294,15 @@ class DeepStreamVideoPipeline:
         # Keep only recent transitions (last 100)
         if len(self.live_tracking_state['transitions']) > 100:
             self.live_tracking_state['transitions'] = self.live_tracking_state['transitions'][-100:]
+        
+        # Debug logging for tracking state
+        self.logger.debug(f"📊 Final tracking state - Active tracks: {len(active_tracks)}, Occupancy: {occupancy}, Transitions: {len(transitions)}")
+        if active_tracks:
+            self.logger.debug(f"📊 Active tracks sample: {active_tracks[:2]}")  # Show first 2 tracks
+        if occupancy:
+            self.logger.debug(f"📊 Occupancy: {occupancy}")
+        if transitions:
+            self.logger.debug(f"📊 Recent transitions: {transitions[-3:]}")  # Show last 3 transitions
         
         return detections
     
@@ -1932,62 +1411,64 @@ class DeepStreamVideoPipeline:
     def start(self) -> bool:
         """Start the DeepStream pipeline."""
         try:
-            # Create pipeline if not already created
+            self.logger.info("🚀 Starting DeepStream pipeline...")
+            
             if not self.pipeline:
-                if not self._create_pipeline():
+                self.logger.error("❌ Pipeline not created")
                     return False
             
-            # Create main loop
-            self.mainloop = GLib.MainLoop()
-            
-            # Start pipeline - first go to READY to allow pad creation
-            self.logger.info("🔍 Setting pipeline to READY state...")
-            if self.pipeline is not None:
-                ret = self.pipeline.set_state(Gst.State.READY)
-                self.logger.info(f"🔍 READY state change result: {ret}")
-                
-                if ret == Gst.StateChangeReturn.FAILURE:
-                    self.logger.error("❌ Failed to set pipeline to READY state")
-                    return False
-                
-                # Wait a moment for pads to be created
-                import time
-                time.sleep(0.1)
-                
-                # Now go to PLAYING
-                self.logger.info("🔍 Setting pipeline to PLAYING state...")
+            # Set pipeline state to PLAYING
                 ret = self.pipeline.set_state(Gst.State.PLAYING)
-                self.logger.info(f"🔍 PLAYING state change result: {ret}")
-                
                 if ret == Gst.StateChangeReturn.FAILURE:
-                    self.logger.error("❌ Failed to start pipeline - immediate failure")
+                self.logger.error("❌ Failed to set pipeline to PLAYING state")
                     return False
                 elif ret == Gst.StateChangeReturn.ASYNC:
-                    self.logger.info("🔍 Pipeline state change is async, waiting...")
-                    # Wait for state change to complete with longer timeout for TensorRT + RTSP
-                    ret2 = self.pipeline.get_state(30 * Gst.SECOND)  # 30 second timeout for TensorRT initialization
-                    self.logger.info(f"🔍 Final state change result: {ret2}")
-                    if ret2[0] == Gst.StateChangeReturn.FAILURE:
-                        self.logger.error("❌ Failed to start pipeline - async failure")
+                self.logger.info("⏳ Pipeline state change is async, waiting...")
+                ret = self.pipeline.get_state(Gst.CLOCK_TIME_NONE)
+                if ret[0] != Gst.StateChangeReturn.SUCCESS:
+                    self.logger.error(f"❌ Pipeline state change failed: {ret[0]}")
                         return False
-                    elif ret2[0] == Gst.StateChangeReturn.ASYNC:
-                        self.logger.warning("⚠️ Pipeline state change timed out, but continuing...")
-                        # For RTSP sources, timeout is often normal - continue anyway
-                        pass
             
             self.running = True
             self.start_time = time.time()
             
-            # Run main loop in thread
-            self.mainloop_thread = threading.Thread(target=self.mainloop.run, daemon=True)
+            # Start main loop in a separate thread
+            self.mainloop_thread = threading.Thread(target=self._run_mainloop, daemon=True)
             self.mainloop_thread.start()
             
-            self.logger.info("DeepStream pipeline started")
+            self.logger.info("✅ DeepStream pipeline started successfully")
+            
+            # Log pipeline state after a short delay
+            def check_pipeline_state():
+                time.sleep(2)
+                ret, state, pending = self.pipeline.get_state(0)
+                self.logger.info(f"📊 Pipeline state: {state}, pending: {pending}, ret: {ret}")
+                
+                # Check if we're receiving frames
+                if self.frame_count == 0:
+                    self.logger.warning("⚠️ No frames received yet - checking pipeline elements...")
+                    # Log element states
+                    it = self.pipeline.iterate_elements()
+                    while True:
+                        result, element = it.next()
+                        if result != Gst.IteratorResult.OK:
+                            break
+                        name = element.get_name()
+                        ret, state, pending = element.get_state(0)
+                        self.logger.info(f"📊 Element {name}: state={state}, pending={pending}, ret={ret}")
+            
+            threading.Thread(target=check_pipeline_state, daemon=True).start()
+            
             return True
             
         except Exception as e:
-            self.logger.error(f"Failed to start pipeline: {e}")
+            self.logger.error(f"❌ Error starting pipeline: {e}")
             return False
+
+    def _run_mainloop(self):
+        """Creates and runs the GLib MainLoop."""
+        self.mainloop = GLib.MainLoop()
+        self.mainloop.run()
     
     def read_gpu_tensor(self) -> Tuple[bool, Optional[Dict[str, Any]]]:
         """
@@ -2041,18 +1522,23 @@ class DeepStreamVideoPipeline:
     
     def get_stats(self) -> Dict[str, Any]:
         """Get pipeline statistics."""
-        runtime = time.time() - self.start_time if self.running else 0
-        fps = self.frame_count / runtime if runtime > 0 else 0
+        runtime = time.time() - self.start_time if self.running and self.start_time > 0 else 0
+        
+        # Use a lock to safely access frame_count
+        with self.frame_count_lock:
+            frame_count_copy = self.frame_count
+            
+        fps = frame_count_copy / runtime if runtime > 0 else 0
         
         return {
             'pipeline_type': 'deepstream',
             'running': self.running,
-            'frames_processed': self.frame_count,
+            'frames_processed': frame_count_copy,
             'fps': fps,
             'runtime_seconds': runtime,
             'batch_size': self.batch_size,
             'sources': len(self.sources),
-            'queue_size': self.tensor_queue.qsize(),
+            'queue_size': self.jpeg_queue.qsize() if hasattr(self, 'jpeg_queue') else 0,
             'tracking': self.live_tracking_state
         }
 
@@ -2191,6 +1677,42 @@ class DeepStreamVideoPipeline:
         except Exception as e:
             self.logger.error(f"❌ Failed to update target classes: {e}")
             return False
+
+    def osd_sink_pad_buffer_probe(self, pad, info, u_data):
+        """Pad probe function to extract metadata from the buffer."""
+        try:
+            gst_buffer = info.get_buffer()
+            if not gst_buffer:
+                return Gst.PadProbeReturn.OK
+
+            # Increment frame count here as this probe sees every frame
+            with self.frame_count_lock:
+                self.frame_count += 1
+            
+            if self.frame_count % 30 == 0:
+                self.logger.info(f"📹 Probe processing frame {self.frame_count}")
+
+            batch_meta = pyds.gst_buffer_get_nvds_batch_meta(hash(gst_buffer))
+            if not batch_meta:
+                return Gst.PadProbeReturn.OK
+
+            l_frame = batch_meta.frame_meta_list
+            while l_frame:
+                try:
+                    frame_meta = pyds.NvDsFrameMeta.cast(l_frame.data)
+                    # This function will now populate self.live_tracking_state
+                    self._parse_obj_meta(frame_meta)
+                except StopIteration:
+                    break
+                try:
+                    l_frame = l_frame.next
+                except StopIteration:
+                    break
+            
+            return Gst.PadProbeReturn.OK
+        except Exception as e:
+            self.logger.error(f"Error in OSD probe: {e}")
+            return Gst.PadProbeReturn.OK
 
 
 def create_deepstream_video_processor(

@@ -94,18 +94,21 @@ export const TelemetryDrawer: React.FC<DrawerProps> = ({open, onClose}) => {
           onChange={e => setFilter(e.target.value)}
         />
         <div style={{overflowY: 'auto', flex: 1}}>
-          {Object.entries(grouped).map(([group, items]) => (
+          {Object.entries(grouped).sort((a, b) => a[0].localeCompare(b[0])).map(([group, items]) => (
             <div key={group}>
               <GroupHeader>{group}</GroupHeader>
-              {items.map(item => (
-                <Row key={`${group}-${item.key}`}>
-                  <span>{item.key}</span>
-                  <Value>{item.value}</Value>
-                  <span style={{marginLeft: '8px', fontSize: '0.8em', opacity: 0.6}}>
-                    {Math.round((now - item.ts)/1000)}s ago
-                  </span>
-                </Row>
-              ))}
+              {items.map(item => {
+                const secondsAgo = Math.round((now - item.ts) / 1000);
+                return (
+                  <Row key={`${group}-${item.key}`}>
+                    <span>{item.key}</span>
+                    <Value>{String(item.value)}</Value>
+                    <span style={{ marginLeft: '8px', fontSize: '0.8em', opacity: 0.6, minWidth: '50px', textAlign: 'right' }}>
+                      {secondsAgo > 2 && `${secondsAgo}s ago`}
+                    </span>
+                  </Row>
+                );
+              })}
             </div>
           ))}
         </div>

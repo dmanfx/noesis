@@ -1,6 +1,6 @@
 import React, { useEffect, useState, useRef } from 'react';
 import './style.css';
-import { TelemetryProvider } from './telemetry/TelemetryContext';
+import { TelemetryProvider, useTelemetry } from './telemetry/TelemetryContext';
 import { TelemetryDrawer } from './telemetry/TelemetryDrawer';
 import { TelemetryToggle } from './telemetry/TelemetryToggle';
 
@@ -20,6 +20,7 @@ const Dashboard: React.FC = () => {
   const retryCountRef = useRef(0);
   const maxRetries = 10;
   const retryInterval = 5000;
+  const { publish } = useTelemetry();
 
   // FPS tracking
   const fpsTrackingRef = useRef({
@@ -52,8 +53,14 @@ const Dashboard: React.FC = () => {
       
       if (cameraType === 'living-room') {
         setLivingRoomFPS(`FPS: ${tracker.fps.toFixed(1)}`);
+        if (publish) {
+          publish({ group: 'Camera Living Room', key: 'FPS', value: Number(tracker.fps.toFixed(1)), ts: Date.now() });
+        }
       } else {
         setKitchenFPS(`FPS: ${tracker.fps.toFixed(1)}`);
+        if (publish) {
+          publish({ group: 'Camera Kitchen', key: 'FPS', value: Number(tracker.fps.toFixed(1)), ts: Date.now() });
+        }
       }
       
       tracker.lastUpdate = now;
@@ -75,7 +82,7 @@ const Dashboard: React.FC = () => {
 
   const processBinaryFrame = async (blob: Blob) => {
     try {
-      console.log('[WebSocket] Processing binary frame, blob size:', blob.size);
+      // console.log('[WebSocket] Processing binary frame, blob size:', blob.size);
       const arrayBuffer = await blob.arrayBuffer();
       const dataView = new DataView(arrayBuffer);
 
@@ -85,7 +92,7 @@ const Dashboard: React.FC = () => {
       }
 
       const cameraIdLen = dataView.getUint8(0);
-      console.log('[WebSocket] Camera ID length:', cameraIdLen);
+      // console.log('[WebSocket] Camera ID length:', cameraIdLen);
 
       if (arrayBuffer.byteLength < 1 + cameraIdLen) {
         console.error(`[WebSocket] Binary message too short for camera ID. Length: ${arrayBuffer.byteLength}, ID length: ${cameraIdLen}`);
@@ -94,11 +101,11 @@ const Dashboard: React.FC = () => {
 
       const cameraIdBytes = new Uint8Array(arrayBuffer, 1, cameraIdLen);
       const cameraId = new TextDecoder('utf-8').decode(cameraIdBytes);
-      console.log('[WebSocket] Camera ID:', cameraId);
+      // console.log('[WebSocket] Camera ID:', cameraId);
 
       const jpegDataOffset = 1 + cameraIdLen;
       const jpegData = arrayBuffer.slice(jpegDataOffset);
-      console.log('[WebSocket] JPEG data size:', jpegData.byteLength);
+      // console.log('[WebSocket] JPEG data size:', jpegData.byteLength);
 
       if (jpegData.byteLength === 0) {
         console.warn(`[WebSocket] Received binary message for camera '${cameraId}' with no JPEG data.`);
@@ -114,7 +121,7 @@ const Dashboard: React.FC = () => {
   };
 
   const displayFrame = (cameraId: string, imageBlob: Blob) => {
-    console.log('[displayFrame] Called with camera:', cameraId, 'blob size:', imageBlob?.size);
+    // console.log('[displayFrame] Called with camera:', cameraId, 'blob size:', imageBlob?.size);
     
     if (!imageBlob || !(imageBlob instanceof Blob)) {
       console.error(`Invalid image data for ${cameraId}, not a Blob:`, imageBlob);
@@ -123,19 +130,19 @@ const Dashboard: React.FC = () => {
 
     try {
       const imageUrl = URL.createObjectURL(imageBlob);
-      console.log('[displayFrame] Created object URL:', imageUrl);
+      // console.log('[displayFrame] Created object URL:', imageUrl);
       
       const normalizedCamId = cameraId.toLowerCase().trim();
-      console.log('[displayFrame] Normalized camera ID:', normalizedCamId);
+      // console.log('[displayFrame] Normalized camera ID:', normalizedCamId);
       
       let cameraType: 'living-room' | 'kitchen' | null = null;
       
       if (normalizedCamId === "rtsp_0" || normalizedCamId.includes("living") || normalizedCamId.includes("room1") || normalizedCamId === "1") {
         cameraType = 'living-room';
-        console.log('[displayFrame] Mapped to living room stream');
+        // console.log('[displayFrame] Mapped to living room stream');
       } else if (normalizedCamId === "rtsp_1" || normalizedCamId.includes("kitchen") || normalizedCamId.includes("room2") || normalizedCamId === "2") {
         cameraType = 'kitchen';
-        console.log('[displayFrame] Mapped to kitchen stream');
+        // console.log('[displayFrame] Mapped to kitchen stream');
       } else {
         console.warn(`Unknown camera ID: ${cameraId}`);
         URL.revokeObjectURL(imageUrl);
@@ -166,11 +173,20 @@ const Dashboard: React.FC = () => {
   const handleStatsUpdate = (payload: any) => {
     if (!payload) return;
 
-    console.log("Stats payload structure:", {
-      hasPayload: !!payload, 
-      hasCameras: !!payload.cameras, 
-      cameraIds: payload.cameras ? Object.keys(payload.cameras) : [],
-    });
+    // console.log("📊 Stats payload received:", {
+    //   hasPayload: !!payload, 
+    //   hasCameras: !!payload.cameras, 
+    //   cameraIds: payload.cameras ? Object.keys(payload.cameras) : [],
+    //   cameraData: payload.cameras ? Object.keys(payload.cameras).map(id => ({
+    //     id,
+    //     hasTracking: !!payload.cameras[id].tracking,
+    //     trackingKeys: payload.cameras[id].tracking ? Object.keys(payload.cameras[id].tracking) : [],
+    //     trackingData: payload.cameras[id].tracking,
+    //     fps: payload.cameras[id].fps,
+    //     frameCount: payload.cameras[id].frame_count,
+    //     status: payload.cameras[id].status
+    //   })) : []
+    // });
 
     // System Status & Uptime
     if (payload.uptime) {
@@ -179,6 +195,20 @@ const Dashboard: React.FC = () => {
       const minutes = Math.floor((uptimeSeconds % 3600) / 60);
       const seconds = Math.floor(uptimeSeconds % 60);
       setSystemStatus(`Uptime: ${hours}h ${minutes}m ${seconds}s`);
+      
+      // Publish to telemetry
+      if (publish) {
+        publish({ group: 'Application', key: 'Uptime', value: uptimeSeconds, ts: Date.now() });
+      }
+    }
+
+    // Application-level stats
+    if (payload.application) {
+      if (publish) {
+        publish({ group: 'Application', key: 'Running', value: payload.application.running ? 'Yes' : 'No', ts: Date.now() });
+        publish({ group: 'Application', key: 'Active Cameras', value: payload.application.cameras_active, ts: Date.now() });
+        publish({ group: 'Application', key: 'Active Processors', value: payload.application.processors_active, ts: Date.now() });
+      }
     }
 
     // Process camera data
@@ -191,8 +221,35 @@ const Dashboard: React.FC = () => {
         const cameraData = payload.cameras[cameraId];
         if (!cameraData) continue;
 
+        // console.log(`📊 Processing camera ${cameraId}:`, {
+        //   fps: cameraData.fps,
+        //   frameCount: cameraData.frame_count,
+        //   status: cameraData.status,
+        //   hasTracking: !!cameraData.tracking,
+        //   trackingData: cameraData.tracking
+        // });
+
+        // Publish basic camera stats
+        const groupName = `Camera ${cameraId}`;
+        if (publish) {
+          if (typeof cameraData.frame_count !== 'undefined') {
+            publish({ group: groupName, key: 'Frames', value: cameraData.frame_count, ts: Date.now() });
+          }
+          if (typeof cameraData.processing_time_ms !== 'undefined') {
+            publish({ group: groupName, key: 'Proc ms', value: cameraData.processing_time_ms, ts: Date.now() });
+          }
+          if (typeof cameraData.fps !== 'undefined') {
+            publish({ group: groupName, key: 'FPS', value: Number(cameraData.fps.toFixed(1)), ts: Date.now() });
+          }
+          if (typeof cameraData.status !== 'undefined') {
+            publish({ group: groupName, key: 'Status', value: cameraData.status, ts: Date.now() });
+          }
+        }
+
         const trackingData = cameraData.tracking;
         if (trackingData && typeof trackingData === 'object') {
+          // console.log(`📊 Camera ${cameraId} tracking data:`, trackingData);
+          
           if (trackingData.occupancy && typeof trackingData.occupancy === 'object') {
             for (const zone in trackingData.occupancy) {
               globalOccupancy[zone] = (globalOccupancy[zone] || 0) + trackingData.occupancy[zone];
@@ -206,6 +263,8 @@ const Dashboard: React.FC = () => {
           if (trackingData.transitions && Array.isArray(trackingData.transitions)) {
             allTransitions = allTransitions.concat(trackingData.transitions);
           }
+        } else {
+          // console.log(`📊 Camera ${cameraId} has no tracking data`);
         }
       }
 
@@ -214,10 +273,16 @@ const Dashboard: React.FC = () => {
       const sortedZones = Object.entries(globalOccupancy).sort(([, a], [, b]) => b - a);
       if (sortedZones.length > 0) {
         sortedZones.forEach(([zone, count]) => {
-          occupancyHTML += `<li><strong>${zone}:</strong> ${count}</li>`;
+          occupancyHTML += `<li><strong>${zone}:</strong> <span style="display: inline-block; min-width: 3ch; text-align: right;">${count}</span></li>`;
+          if (publish) {
+            publish({ group: 'Occupancy', key: zone, value: count, ts: Date.now() });
+          }
         });
       } else {
         occupancyHTML += '<li>No occupancy data.</li>';
+        if (publish) {
+          publish({ group: 'Occupancy', key: 'none', value: 0, ts: Date.now() });
+        }
       }
       occupancyHTML += '</ul>';
       setOccupancy(occupancyHTML);
@@ -226,19 +291,28 @@ const Dashboard: React.FC = () => {
       let tracksHTML = '';
       if (allActiveTracks.length > 0) {
         allActiveTracks.sort((a, b) => (a.track_id || 0) - (b.track_id || 0)).forEach(track => {
-          tracksHTML += `<div class="track-detail-item">`;
-          tracksHTML += `<strong>ID ${track.track_id || 'N/A'} (${track.camera_id || 'N/A'}):</strong><br>`;
-          tracksHTML += `Zone: ${track.zone || '-'}, Dwell: ${track.dwell_time?.toFixed(1) ?? '0.0'}s<br>`;
+          const dwellText = track.dwell_time?.toFixed(1) ?? '0.0';
           const center = track.center || ['N/A', 'N/A'];
           const velocity = track.velocity || [0, 0];
           const speed = Math.sqrt(velocity[0]**2 + velocity[1]**2);
-          tracksHTML += `Pos: [${center[0]}, ${center[1]}], Speed: ${speed?.toFixed(1) ?? '0.0'} px/s`;
+          const speedText = speed?.toFixed(1) ?? '0.0';
+          
+          tracksHTML += `<div class="track-detail-item">`;
+          tracksHTML += `<strong>ID ${track.track_id || 'N/A'} (${track.camera_id || 'N/A'}):</strong><br>`;
+          tracksHTML += `Zone: ${track.zone || '-'}, Dwell: <span style="display: inline-block; min-width: 4ch; text-align: right;">${dwellText}</span>s<br>`;
+          tracksHTML += `Pos: [${center[0]}, ${center[1]}], Speed: <span style="display: inline-block; min-width: 4ch; text-align: right;">${speedText}</span> px/s`;
           tracksHTML += `</div>`;
         });
       } else {
         tracksHTML = '<span>No active tracks.</span>';
       }
       setActiveTracks(tracksHTML);
+
+      // Publish tracking telemetry
+      if (publish) {
+        publish({ group: 'Tracking', key: 'Active Tracks', value: allActiveTracks.length, ts: Date.now() });
+        publish({ group: 'Tracking', key: 'Transitions', value: allTransitions.length, ts: Date.now() });
+      }
 
       // Update Transitions Display
       let transitionsHTML = '';
@@ -253,6 +327,19 @@ const Dashboard: React.FC = () => {
         transitionsHTML = '<li>No recent transitions.</li>';
       }
       setTransitions(transitionsHTML);
+    } else {
+      // Handle case where payload.cameras is missing or not an object
+      console.warn("Stats payload missing or invalid 'cameras' structure.");
+      // Reset telemetry for missing data
+      if (publish) {
+        publish({ group: 'Tracking', key: 'Active Tracks', value: 0, ts: Date.now() });
+        publish({ group: 'Tracking', key: 'Transitions', value: 0, ts: Date.now() });
+      }
+    }
+
+    // Publish connection status
+    if (publish) {
+      publish({ group: 'Connection', key: 'Status', value: 'Connected', ts: Date.now() });
     }
   };
 
@@ -267,11 +354,21 @@ const Dashboard: React.FC = () => {
       setConnectionStatus('Connected');
       retryCountRef.current = 0;
       resetFPSTracking();
+      
+      // Publish connection status to telemetry
+      if (publish) {
+        publish({ group: 'Connection', key: 'Status', value: 'Connected', ts: Date.now() });
+      }
     };
 
     socketRef.current.onclose = (event) => {
       console.log('WebSocket connection closed:', event.code, event.reason);
       setConnectionStatus(`Disconnected (Code: ${event.code}). Retrying...`);
+      
+      // Publish connection status to telemetry
+      if (publish) {
+        publish({ group: 'Connection', key: 'Status', value: 'Disconnected', ts: Date.now() });
+      }
       
       // Clear images on disconnect
       const livingRoomImg = document.getElementById('living-room-stream') as HTMLImageElement;
@@ -295,6 +392,11 @@ const Dashboard: React.FC = () => {
     socketRef.current.onerror = (error) => {
       console.error('WebSocket error:', error);
       setConnectionStatus('Error (Check console)');
+      
+      // Publish connection error to telemetry
+      if (publish) {
+        publish({ group: 'Connection', key: 'Status', value: 'Error', ts: Date.now() });
+      }
     };
 
     socketRef.current.onmessage = (event) => {
@@ -306,24 +408,24 @@ const Dashboard: React.FC = () => {
       } else {
         try {
           const data = JSON.parse(event.data);
-          console.log('[WebSocket] Parsed JSON message:', data);
+          // console.log('[WebSocket] Parsed JSON message:', data);
           
           if (data.type === 'stats' && data.payload) {
             handleStatsUpdate(data.payload);
           } else if (data.type === 'frame') {
-            console.log('[WebSocket] Received JSON frame format:', data);
+            // console.log('[WebSocket] Received JSON frame format:', data);
             // Handle JSON frame format if needed
           } else if (data.type === 'detection_config_sync') {
-            console.log('[WebSocket] Received detection config sync:', data.config);
+            // console.log('[WebSocket] Received detection config sync:', data.config);
             // Handle detection config sync
           } else if (data.type === 'detection_config_update') {
-            console.log('[WebSocket] Received detection config update:', data.config);
+            // console.log('[WebSocket] Received detection config update:', data.config);
             // Handle detection config update
           } else if (data.type === 'detection_toggle_update') {
-            console.log('[WebSocket] Received detection toggle update:', data);
+            // console.log('[WebSocket] Received detection toggle update:', data);
             // Handle detection toggle update
           } else {
-            console.log('[WebSocket] Received unknown JSON message format:', data);
+            // console.log('[WebSocket] Received unknown JSON message format:', data);
           }
         } catch (e) {
           console.error('[WebSocket] JSON parse error:', e, event.data);
@@ -578,7 +680,7 @@ const Dashboard: React.FC = () => {
               <img id="kitchen-stream" src="" alt="Kitchen Stream" width="640" height="360" />
               <button className="fullscreen-btn" data-target="kitchen-stream">Max</button>
             </div>
-            <div id="kitchen-perf" className="perf-stats">{kitchenFPS}</div>
+            <div id="kitchen-perf" className="perf-stats" style={{ minWidth: '80px', textAlign: 'right' }}>{kitchenFPS}</div>
           </div>
 
           <div className="video-container">
@@ -587,7 +689,7 @@ const Dashboard: React.FC = () => {
               <img id="living-room-stream" src="" alt="Living Room Stream" width="640" height="360" />
               <button className="fullscreen-btn" data-target="living-room-stream">Max</button>
             </div>
-            <div id="living-room-perf" className="perf-stats">{livingRoomFPS}</div>
+            <div id="living-room-perf" className="perf-stats" style={{ minWidth: '80px', textAlign: 'right' }}>{livingRoomFPS}</div>
           </div>
         </div>
 

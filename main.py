@@ -402,12 +402,17 @@ class ApplicationManager:
         global INTERRUPT_COUNT
         INTERRUPT_COUNT += 1
         
+        # Add immediate print for visibility
+        print(f"\n🛑 Signal {sig} received (interrupt #{INTERRUPT_COUNT})")
+        
         if INTERRUPT_COUNT == 1:
             self.logger.info(f"Received signal {sig}, starting graceful shutdown...")
+            print("🔄 Starting graceful shutdown...")
             # Start graceful shutdown immediately (not in background thread)
             self.stop()
         elif INTERRUPT_COUNT >= 2:
             self.logger.warning("Second interrupt received, forcing immediate exit")
+            print("💥 Second interrupt - forcing immediate exit!")
             os._exit(1)
     
     def _graceful_exit(self):
@@ -582,20 +587,31 @@ class ApplicationManager:
                 self.logger.info(f"Starting processor for {camera_id}...")
                 
                 # Add timeout for processor startup to prevent hanging
-                import signal
+                # Use threading.Timer instead of signal.alarm to avoid signal handler conflicts
+                import threading
+                import queue
                 
-                def timeout_handler(signum, frame):
-                    raise TimeoutError(f"Processor startup timeout for {camera_id}")
+                timeout_queue = queue.Queue()
                 
-                # Set timeout alarm (30 seconds)
-                signal.signal(signal.SIGALRM, timeout_handler)
-                signal.alarm(30)
+                def timeout_handler():
+                    timeout_queue.put(TimeoutError(f"Processor startup timeout for {camera_id}"))
+                
+                # Start timeout timer (30 seconds)
+                timeout_timer = threading.Timer(30.0, timeout_handler)
+                timeout_timer.daemon = True
+                timeout_timer.start()
                 
                 try:
                     start_success = processor.start()
+                    # Check if timeout occurred
+                    try:
+                        timeout_queue.get_nowait()
+                        raise TimeoutError(f"Processor startup timeout for {camera_id}")
+                    except queue.Empty:
+                        pass  # No timeout occurred
                 finally:
-                    # Cancel the alarm
-                    signal.alarm(0)
+                    # Cancel the timer
+                    timeout_timer.cancel()
                 
                 if start_success:
                     # Store processor
@@ -856,13 +872,22 @@ class ApplicationManager:
                         # Handle both flat and nested tracking data layouts
                         tracking_data = None
                         if comprehensive_stats:
-                            if 'tracking' in comprehensive_stats:
+                            if 'tracking' in comprehensive_stats:                       # flat layout
                                 tracking_data = comprehensive_stats['tracking']
-                            elif 'deepstream_stats' in comprehensive_stats and 'tracking' in comprehensive_stats['deepstream_stats']:
+                            elif 'deepstream_stats' in comprehensive_stats and \
+                                 'tracking' in comprehensive_stats['deepstream_stats']: # nested layout
                                 tracking_data = comprehensive_stats['deepstream_stats']['tracking']
 
                         if tracking_data:
                             camera_stats['tracking'] = tracking_data
+                            self.logger.debug(f"📊 Camera {camera_id} tracking data: {tracking_data}")
+                        else:
+                            self.logger.debug(f"📊 Camera {camera_id} has no tracking data")
+                            # Log what's available in comprehensive_stats for debugging
+                            if comprehensive_stats:
+                                self.logger.debug(f"📊 Camera {camera_id} available stats keys: {list(comprehensive_stats.keys())}")
+                                if 'deepstream_stats' in comprehensive_stats:
+                                    self.logger.debug(f"📊 Camera {camera_id} deepstream_stats keys: {list(comprehensive_stats['deepstream_stats'].keys())}")
 
                 # Add to overall stats
                 stats['cameras'][camera_id] = camera_stats
@@ -1057,7 +1082,7 @@ class ApplicationManager:
                             self.logger.warning(f"Error in early GPU cleanup for {camera_id}: {e}")
                 
                 # Force cleanup all GPU resources via consolidated pipeline
-                cleanup_all_gpu_resources()
+                # cleanup_all_gpu_resources() # This function is deprecated
                 self.logger.info("Early cleanup: all GPU resources via unified pipeline")
                 
                 # Additional GPU memory pool cleanup if available

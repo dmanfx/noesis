@@ -1,0 +1,30 @@
+# Phase 3.2: Secondary Inference Engine (SGIE) Configuration
+# This SGIE operates on detected vehicles from the primary inference
+[property]
+gpu-id=0
+# Use the same model as primary for now (in production, this would be a classification model)
+model-engine-file=models/engines/detection_fp16.engine
+labelfile-path=models/coco_labels.txt
+batch-size=1
+# Secondary inference mode
+process-mode=2
+# Process only on detected objects from primary inference
+operate-on-gie-id=1
+# Operate on specific classes (0=vehicle, 2=person)
+operate-on-class-ids=1
+# Minimum object dimensions for processing
+input-object-min-width=64
+input-object-min-height=64
+input-object-max-width=1920
+input-object-max-height=1080
+# Secondary inference unique ID
+gie-unique-id=2
+# Network configuration
+network-mode=1
+network-input-shape=1;3;224;224
+network-input-format=0
+# Classification thresholds
+classifier-threshold=0.5
+is-classifier=1
+# Interval for processing (process every frame)
+interval=0 

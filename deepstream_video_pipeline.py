@@ -138,9 +138,21 @@ class DeepStreamVideoPipeline:
     - appsink for tensor output
     """
     
-    def __init__(self, rtsp_url: str, config: AppConfig, websocket_port: int = 8765, 
+    def __init__(self, rtsp_url: str = "", config: AppConfig = None, websocket_port: int = 8765,
                  config_file: str = "config_infer_primary_yolo11.txt",
-                 preproc_config: str = "config_preproc.txt"):
+                 preproc_config: str = "config_preproc.txt",
+                 sources: Optional[List[Dict[str, Any]]] = None):
+        """Create a DeepStream video pipeline.
+
+        Args:
+            rtsp_url: Backwards compatible single-source URL. Ignored if ``sources`` is provided.
+            config: Application configuration object.
+            websocket_port: Unused but kept for API compatibility.
+            config_file: Primary nvinfer config path.
+            preproc_config: Preprocess config path.
+            sources: Optional list of source dictionaries. Each dictionary must contain
+                ``camera_id`` and ``url`` keys along with optional width/height.
+        """
         self.rtsp_url = rtsp_url
         self.websocket_port = websocket_port
         self.config_file = config_file
@@ -186,14 +198,29 @@ class DeepStreamVideoPipeline:
         }
         
         # Pipeline configuration - read batch size from config
-        config_batch_size = self.config.processing.DEEPSTREAM_MUX_BATCH_SIZE
+        config_batch_size = self.config.processing.DEEPSTREAM_MUX_BATCH_SIZE if self.config else 1
         self.batch_size = config_batch_size if config_batch_size > 0 else 1
         self.max_width = 1920
         self.max_height = 1080
         self.device_id = 0
-        
-        # Create sources list from single RTSP URL
-        self.sources = [{'url': rtsp_url, 'name': 'rtsp_source', 'width': 1920, 'height': 1080, 'enabled': True}]
+
+        # Determine active sources
+        if sources:
+            self.sources = sources
+        elif rtsp_url:
+            self.sources = [{
+                'camera_id': 'cam0',
+                'url': rtsp_url,
+                'name': 'rtsp_source',
+                'width': 1920,
+                'height': 1080,
+                'enabled': True
+            }]
+        else:
+            self.sources = []
+
+        if self.batch_size <= 0:
+            self.batch_size = max(1, len(self.sources))
         
         # Add missing attributes for compatibility
         self.frame_count = 0
@@ -201,7 +228,8 @@ class DeepStreamVideoPipeline:
         # The tensor_queue is no longer needed as metadata is extracted via probe
         # self.tensor_queue = queue.Queue(maxsize=30) 
         # JPEG queue for GPU-encoded frames when native OSD is enabled
-        self.jpeg_queue: queue.Queue[bytes] = queue.Queue(maxsize=30)
+        # Queue of (camera_id, jpeg_bytes)
+        self.jpeg_queue: queue.Queue[Tuple[str, bytes]] = queue.Queue(maxsize=30)
         self.start_time = 0  # Will be set in start()
         
         # Initialize tracking state for telemetry
@@ -555,22 +583,19 @@ class DeepStreamVideoPipeline:
                 raise RuntimeError("Failed to create pipeline")
 
             element_names = [
-                "nvstreammux", "nvdspreprocess", "nvinfer", "nvtracker", "nvdsanalytics", 
-                "nvvideoconvert", "nvdsosd", "nvvidconv_post_osd", "caps_post_osd", 
-                "nvjpegenc_gpu", "queue_jpeg", "appsink_jpeg"
+                "nvstreammux", "nvdspreprocess", "nvinfer", "nvtracker", "nvdsanalytics",
+                "nvstreamdemux"
             ]
-            elements = [Gst.ElementFactory.make(name, name) for name in 
-                        ["nvstreammux", "nvdspreprocess", "nvinfer", "nvtracker", "nvdsanalytics", 
-                         "nvvideoconvert", "nvdsosd", "nvvideoconvert", "capsfilter", 
-                         "nvjpegenc", "queue", "appsink"]]
+            elements = [Gst.ElementFactory.make(name, name) for name in
+                        ["nvstreammux", "nvdspreprocess", "nvinfer", "nvtracker", "nvdsanalytics",
+                         "nvstreamdemux"]]
             
             # Assign unique names
             for i, el in enumerate(elements):
                 if el:
                     el.set_name(element_names[i])
 
-            streammux, preprocess, nvinfer, nvtracker, nvanalytics, nvvidconv, nvosd, \
-            nvvidconv_post, caps_post_osd, jpegenc_gpu, queue_jpeg, appsink_jpeg = elements
+            streammux, preprocess, nvinfer, nvtracker, nvanalytics, demux = elements
 
             if not all(elements):
                 for el, name in zip(elements, element_names):
@@ -610,20 +635,6 @@ class DeepStreamVideoPipeline:
 
             # Nvdsanalytics configuration
             nvanalytics.set_property("config-file", "config_nvdsanalytics.txt")
-                
-            # OSD Sink Pad Probe for metadata
-            osd_src_pad = nvosd.get_static_pad("src")
-            if not osd_src_pad: raise RuntimeError("Failed to get OSD source pad")
-            osd_src_pad.add_probe(Gst.PadProbeType.BUFFER, self.osd_sink_pad_buffer_probe, 0)
-            self.logger.info("✅ Added buffer probe to OSD source pad for metadata extraction")
-
-            # JPEG sink configuration
-            caps_post_osd.set_property("caps", Gst.Caps.from_string("video/x-raw(memory:NVMM), format=I420"))
-            appsink_jpeg.set_property("emit-signals", True)
-            appsink_jpeg.set_property("sync", False)
-            appsink_jpeg.set_property("max-buffers", 5)
-            appsink_jpeg.set_property("drop", True)
-            appsink_jpeg.connect("new-sample", self._on_new_jpeg_sample)
 
             # --- Phase C: Add and Link Elements ---
             self.logger.info("------------- Adding and Linking All Elements-------------")
@@ -632,39 +643,86 @@ class DeepStreamVideoPipeline:
             for el in elements:
                 self.pipeline.add(el)
             
-            # Create and add the source bin
-            source_bin = self._create_source_bin(0, {'url': self.rtsp_url})
-            if not source_bin: raise RuntimeError("Failed to create source bin")
-            self.pipeline.add(source_bin)
-            
-            # Link source to streammux
-            source_pad = source_bin.get_static_pad("src")
-            sink_pad = streammux.get_request_pad("sink_0")
-            if source_pad.link(sink_pad) != Gst.PadLinkReturn.OK:
-                raise RuntimeError("Failed to link source bin to streammux")
+            # Create and add source bins
+            for idx, src in enumerate(self.sources):
+                source_bin = self._create_source_bin(idx, src)
+                if not source_bin:
+                    raise RuntimeError(f"Failed to create source bin {idx}")
+                self.pipeline.add(source_bin)
+
+                source_pad = source_bin.get_static_pad("src")
+                sink_pad = streammux.get_request_pad(f"sink_{idx}")
+                if source_pad.link(sink_pad) != Gst.PadLinkReturn.OK:
+                    raise RuntimeError(f"Failed to link source {idx} to streammux")
             
             # Link the main processing chain
-            if not streammux.link(preprocess): raise RuntimeError("Failed to link streammux to preprocess")
-            if not preprocess.link(nvinfer): raise RuntimeError("Failed to link preprocess to nvinfer")
-            if not nvinfer.link(nvtracker): raise RuntimeError("Failed to link nvinfer to nvtracker")
-            if not nvtracker.link(nvanalytics): raise RuntimeError("Failed to link nvtracker to nvanalytics")
-            if not nvanalytics.link(nvvidconv): raise RuntimeError("Failed to link nvanalytics to nvvidconv")
-            if not nvvidconv.link(nvosd): raise RuntimeError("Failed to link nvvidconv to nvosd")
-            
-            # Link the JPEG encoding sink chain
-            if not nvosd.link(nvvidconv_post): raise RuntimeError("Failed to link nvosd to nvvidconv_post")
-            if not nvvidconv_post.link(caps_post_osd): raise RuntimeError("Failed to link nvvidconv_post to caps_post_osd")
-            if not caps_post_osd.link(jpegenc_gpu): raise RuntimeError("Failed to link caps_post_osd to jpegenc_gpu")
-            if not jpegenc_gpu.link(queue_jpeg): raise RuntimeError("Failed to link jpegenc_gpu to queue_jpeg")
-            if not queue_jpeg.link(appsink_jpeg): raise RuntimeError("Failed to link queue_jpeg to appsink_jpeg")
+            if not streammux.link(preprocess):
+                raise RuntimeError("Failed to link streammux to preprocess")
+            if not preprocess.link(nvinfer):
+                raise RuntimeError("Failed to link preprocess to nvinfer")
+            if not nvinfer.link(nvtracker):
+                raise RuntimeError("Failed to link nvinfer to nvtracker")
+            if not nvtracker.link(nvanalytics):
+                raise RuntimeError("Failed to link nvtracker to nvanalytics")
+            if not nvanalytics.link(demux):
+                raise RuntimeError("Failed to link nvanalytics to demux")
+
+            self.branch_app_sinks = []
+            for idx, src in enumerate(self.sources):
+                conv = Gst.ElementFactory.make("nvvideoconvert", f"conv_{idx}")
+                osd = Gst.ElementFactory.make("nvdsosd", f"osd_{idx}")
+                conv_post = Gst.ElementFactory.make("nvvideoconvert", f"conv_post_{idx}")
+                caps = Gst.ElementFactory.make("capsfilter", f"caps_{idx}")
+                caps.set_property("caps", Gst.Caps.from_string("video/x-raw(memory:NVMM), format=I420"))
+                jpegenc = Gst.ElementFactory.make("nvjpegenc", f"jpegenc_{idx}")
+                queue_jpeg = Gst.ElementFactory.make("queue", f"queue_jpeg_{idx}")
+                appsink = Gst.ElementFactory.make("appsink", f"appsink_{idx}")
+                appsink.set_property("emit-signals", True)
+                appsink.set_property("sync", False)
+                appsink.set_property("max-buffers", 5)
+                appsink.set_property("drop", True)
+                cam_id = src.get("camera_id", f"cam{idx}")
+                appsink.connect("new-sample", self._on_new_jpeg_sample, cam_id)
+
+                for el in (conv, osd, conv_post, caps, jpegenc, queue_jpeg, appsink):
+                    if not el:
+                        raise RuntimeError("Failed to create element in branch")
+                    self.pipeline.add(el)
+
+                demux_pad = demux.get_request_pad(f"src_{idx}")
+                sink_pad = conv.get_static_pad("sink")
+                if demux_pad.link(sink_pad) != Gst.PadLinkReturn.OK:
+                    raise RuntimeError(f"Failed to link demux pad {idx}")
+
+                if not conv.link(osd):
+                    raise RuntimeError("conv->osd link failed")
+                osd_src_pad = osd.get_static_pad("src")
+                if not osd_src_pad:
+                    raise RuntimeError("Failed to get OSD src pad")
+                osd_src_pad.add_probe(Gst.PadProbeType.BUFFER, self.osd_sink_pad_buffer_probe, 0)
+                if not osd.link(conv_post):
+                    raise RuntimeError("osd->conv_post link failed")
+                if not conv_post.link(caps):
+                    raise RuntimeError("conv_post->caps link failed")
+                if not caps.link(jpegenc):
+                    raise RuntimeError("caps->jpegenc link failed")
+                if not jpegenc.link(queue_jpeg):
+                    raise RuntimeError("jpegenc->queue link failed")
+                if not queue_jpeg.link(appsink):
+                    raise RuntimeError("queue->appsink link failed")
+
+                self.branch_app_sinks.append(appsink)
             
             # --- Finalization ---
             self.logger.info("✅ Pipeline construction complete.")
             
             # Store references
-            self.streammux, self.preprocess, self.nvinfer, self.nvtracker, self.nvanalytics, \
-            self.nvvidconv, self.nvosd = streammux, preprocess, nvinfer, nvtracker, nvanalytics, nvvidconv, nvosd
-            self.jpeg_appsink = appsink_jpeg
+            self.streammux = streammux
+            self.preprocess = preprocess
+            self.nvinfer = nvinfer
+            self.nvtracker = nvtracker
+            self.nvanalytics = nvanalytics
+            self.demux = demux
             
             return True
             
@@ -1537,8 +1595,8 @@ class DeepStreamVideoPipeline:
             'tracking': self.live_tracking_state
         }
 
-    def _on_new_jpeg_sample(self, appsink: GstApp.AppSink) -> Gst.FlowReturn:
-        """Callback for GPU JPEG appsink – push encoded JPEG bytes to queue"""
+    def _on_new_jpeg_sample(self, appsink: GstApp.AppSink, camera_id: str) -> Gst.FlowReturn:
+        """Callback for GPU JPEG appsink – push encoded JPEG bytes with camera id"""
         try:
             sample = appsink.emit("pull-sample")
             if not sample:
@@ -1554,9 +1612,8 @@ class DeepStreamVideoPipeline:
                 jpeg_bytes = mapinfo.data  # bytes-like
                 if jpeg_bytes:
                     try:
-                        self.jpeg_queue.put_nowait(bytes(jpeg_bytes))
+                        self.jpeg_queue.put_nowait((camera_id, bytes(jpeg_bytes)))
                     except queue.Full:
-                        # Drop frame if queue full
                         pass
             finally:
                 buffer.unmap(mapinfo)
@@ -1565,13 +1622,13 @@ class DeepStreamVideoPipeline:
             self.logger.error(f"Error in _on_new_jpeg_sample: {e}")
             return Gst.FlowReturn.ERROR
 
-    def read_encoded_jpeg(self, timeout: float = 0.1) -> Tuple[bool, Optional[bytes]]:
-        """Return next encoded JPEG bytes from the GPU pipeline (native OSD mode)."""
+    def read_encoded_jpeg(self, timeout: float = 0.1) -> Tuple[bool, Optional[Tuple[str, bytes]]]:
+        """Return next encoded JPEG bytes with camera id from the GPU pipeline."""
         if not self.running:
             return False, None
         try:
-            jpeg_bytes = self.jpeg_queue.get(timeout=timeout)
-            return True, jpeg_bytes
+            data = self.jpeg_queue.get(timeout=timeout)
+            return True, data
         except queue.Empty:
             return False, None
 
@@ -1712,7 +1769,7 @@ class DeepStreamVideoPipeline:
 
 def create_deepstream_video_processor(
     camera_id: str,
-    source: Union[str, int, Dict],
+    sources: List[Dict[str, Any]],
     config: AppConfig
 ) -> DeepStreamVideoPipeline:
     """
@@ -1726,18 +1783,12 @@ def create_deepstream_video_processor(
     Returns:
         Configured DeepStream video pipeline
     """
-    # Convert source to URL string
-    if isinstance(source, dict):
-        source_url = source.get('url', '')
-    else:
-        source_url = str(source)
-    
     return DeepStreamVideoPipeline(
-        rtsp_url=source_url,
         config=config,
         websocket_port=8765,
         config_file="config_infer_primary_yolo11.txt",
-        preproc_config="config_preproc.txt"
+        preproc_config="config_preproc.txt",
+        sources=sources
     )
 
 

@@ -39,11 +39,11 @@ from tracking import TrackingSystem
 from utils import RateLimitedLogger
 
 class DeepStreamProcessorWrapper:
-    """Simple wrapper to provide UnifiedGPUPipeline interface for DeepStream processor"""
-    
-    def __init__(self, camera_id: str, source, config, output_queue=None, websocket_server=None):
+    """Wrapper around DeepStreamVideoPipeline supporting multiple sources."""
+
+    def __init__(self, camera_id: str, sources, config, output_queue=None, websocket_server=None):
         self.camera_id = camera_id
-        self.source = source
+        self.sources = sources
         self.config = config
         self.output_queue = output_queue
         self.websocket_server = websocket_server
@@ -59,7 +59,7 @@ class DeepStreamProcessorWrapper:
         try:
             self.processor = create_deepstream_video_processor(
                 camera_id=self.camera_id,
-                source=self.source,
+                sources=self.sources,
                 config=self.config
             )
             
@@ -88,9 +88,10 @@ class DeepStreamProcessorWrapper:
             try:
                 if self.config.visualization.USE_NATIVE_DEEPSTREAM_OSD:
                     # Forward GPU-encoded JPEG bytes directly
-                    success, jpeg_bytes = self.processor.read_encoded_jpeg()
-                    if success and jpeg_bytes and self.websocket_server:
-                        cam_id_bytes = self.camera_id.encode('utf-8')
+                    success, data = self.processor.read_encoded_jpeg()
+                    if success and data and self.websocket_server:
+                        cam_id, jpeg_bytes = data
+                        cam_id_bytes = cam_id.encode('utf-8')
                         msg = bytes([len(cam_id_bytes)]) + cam_id_bytes + jpeg_bytes
                         self.websocket_server.broadcast_sync(msg)
                     else:
@@ -569,75 +570,68 @@ class ApplicationManager:
         if not self.config.models.FORCE_GPU_ONLY:
             raise RuntimeError("GPU-only mode: GPU-only inference must be enabled")
         
+        sources_list = []
         for camera_id, source in self.camera_sources.items():
+            src_cfg = source if isinstance(source, dict) else {'url': str(source)}
+            src_cfg['camera_id'] = camera_id
+            sources_list.append(src_cfg)
+
+        try:
+            self.logger.info("Creating DeepStream processor wrapper for multi-camera pipeline")
+
+            processor = DeepStreamProcessorWrapper(
+                camera_id="multi",
+                sources=sources_list,
+                config=self.config,
+                output_queue=self.analysis_frame_queue,
+                websocket_server=None
+            )
+
+            # Start processor with timeout
+            self.logger.info("Starting multi-camera processor...")
+
+            import threading
+            import queue
+
+            timeout_queue = queue.Queue()
+
+            def timeout_handler():
+                timeout_queue.put(TimeoutError("Processor startup timeout"))
+
+            timeout_timer = threading.Timer(30.0, timeout_handler)
+            timeout_timer.daemon = True
+            timeout_timer.start()
+
             try:
-                self.logger.info(f"Starting unified GPU processor for camera {camera_id}")
-                
-                # Use DeepStream pipeline directly (bypass deprecated UnifiedGPUPipeline)
-                self.logger.info(f"Creating DeepStream processor wrapper for {camera_id}")
-                
-                processor = DeepStreamProcessorWrapper(
-                    camera_id=camera_id,
-                    source=source,
-                    config=self.config,
-                    output_queue=self.analysis_frame_queue,
-                    websocket_server=None  # will be set after WebSocket server starts
-                )
-                
-                # Start processor
-                self.logger.info(f"Starting processor for {camera_id}...")
-                
-                # Add timeout for processor startup to prevent hanging
-                # Use threading.Timer instead of signal.alarm to avoid signal handler conflicts
-                import threading
-                import queue
-                
-                timeout_queue = queue.Queue()
-                
-                def timeout_handler():
-                    timeout_queue.put(TimeoutError(f"Processor startup timeout for {camera_id}"))
-                
-                # Start timeout timer (30 seconds)
-                timeout_timer = threading.Timer(30.0, timeout_handler)
-                timeout_timer.daemon = True
-                timeout_timer.start()
-                
+                start_success = processor.start()
                 try:
-                    start_success = processor.start()
-                    # Check if timeout occurred
-                    try:
-                        timeout_queue.get_nowait()
-                        raise TimeoutError(f"Processor startup timeout for {camera_id}")
-                    except queue.Empty:
-                        pass  # No timeout occurred
-                finally:
-                    # Cancel the timer
-                    timeout_timer.cancel()
+                    timeout_queue.get_nowait()
+                    raise TimeoutError("Processor startup timeout")
+                except queue.Empty:
+                    pass
+            finally:
+                timeout_timer.cancel()
                 
-                if start_success:
-                    # Store processor
-                    self.frame_processors[camera_id] = processor
-                    self.logger.info(f"✅ Started unified GPU processor for camera {camera_id}")
-                else:
-                    self.logger.error(f"❌ Failed to start processor for camera {camera_id}")
-                    raise RuntimeError(f"Processor startup failed for {camera_id}")
-                
-            except Exception as e:
-                self.logger.error(f"❌ Error starting processor for camera {camera_id}: {e}")
-                
-                import traceback
-                traceback.print_exc()
-                # Continue with other cameras instead of failing completely
-                continue
-        
-        self.logger.info(f"✅ All unified GPU processors started successfully ({len(self.frame_processors)}/{len(self.camera_sources)} cameras)")
+            if start_success:
+                self.frame_processors["multi"] = processor
+                self.logger.info("✅ Started multi-camera processor")
+            else:
+                self.logger.error("❌ Failed to start multi-camera processor")
+                raise RuntimeError("Processor startup failed")
+
+        except Exception as e:
+            self.logger.error(f"❌ Error starting multi-camera processor: {e}")
+            import traceback
+            traceback.print_exc()
+            raise
+
+        self.logger.info("✅ All unified GPU processors started successfully (1)")
         
         # Verify at least one processor started
         if not self.frame_processors:
             raise RuntimeError("No frame processors started successfully")
-        elif len(self.frame_processors) < len(self.camera_sources):
-            self.logger.warning(f"⚠️  Only {len(self.frame_processors)}/{len(self.camera_sources)} cameras started successfully")
-            self.logger.warning("🔧 Check camera connectivity or configuration issues")
+        elif len(self.frame_processors) < 1:
+            self.logger.warning("⚠️  No processor started")
         
         # Give processors a moment to initialize
         time.sleep(1.0)

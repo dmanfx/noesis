@@ -113,8 +113,8 @@ class AppConfig:
         DEEPSTREAM_SOURCE_LATENCY: int = 50  # Reduced latency for real-time processing
         DEEPSTREAM_MUX_BATCH_SIZE: int = 1  # Single frame processing for lower latency
         DEEPSTREAM_MUX_SCALE_MODE: int = 2  # 0=stretch, 1=crop, 2=letter-box
-        DEEPSTREAM_PREPROCESS_CONFIG: str = "config_preproc.txt"  # Path to preprocessing config file
-        DEEPSTREAM_TRACKER_CONFIG: str = "tracker_nvdcf.yml"  # Path to tracker config file
+        DEEPSTREAM_PREPROCESS_CONFIG: str = "pipelines/config_preproc.txt"  # Path to preprocessing config file
+        DEEPSTREAM_TRACKER_CONFIG: str = "pipelines/tracker_nvdcf.yml"  # Path to tracker config file
         DEEPSTREAM_TRACKER_LIB: str = "/opt/nvidia/deepstream/deepstream/lib/libnvds_nvmultiobjecttracker.so"  # DeepStream tracker library
         DEEPSTREAM_ENABLE_OSD: bool = True  # Enable on-screen display for visualization
         

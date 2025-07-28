@@ -135,8 +135,8 @@ class TensorExtractionTester:
                 rtsp_url=self.source,
                 config=config,
                 websocket_port=8765,
-                config_file="config_infer_primary_yolo11.txt",
-                preproc_config="config_preproc.txt"
+                        config_file="pipelines/config_infer_primary_yolo11.txt",
+        preproc_config="pipelines/config_preproc.txt"
             )
             
             if not self.pipeline:

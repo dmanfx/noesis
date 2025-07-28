@@ -1,0 +1,19 @@
+---
+description: GRAPH rules for GStreamer/DeepStream pipeline work
+globs:
+  - "**/pipelines/**"
+  - "**/*.txt"
+  - "**/*.cfg"
+  - "**/*.ini"
+---
+
+# GRAPH Requirements
+- Emit a **runnable** pipeline (gst one-liner or DS config set).
+- Include a simple **diagram** and **explain each stage** in one sentence.
+- Default topology (tweak if needed): src → `nvstreammux` → `nvinfer` → `nvtracker` → [`nvdsanalytics` x1–2] → `nvvideoconvert` → display/sink.
+- Prefer **RTSP inputs** for testing; provide a local MP4 fallback only if requested.
+
+# Output
+- Pipeline text
+- Diagram
+- Notes on `interval`, `batch-size`, tracker config, analytics ROIs/polys

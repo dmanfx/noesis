@@ -1,0 +1,92 @@
+%YAML:1.0
+################################################################################
+# NVIDIA DeepStream NvDCF Low-Level Tracker Configuration - Batch Processing
+# Optimized for multi-stream batch processing with proper sub-batch handling
+################################################################################
+
+BaseConfig:
+  minDetectorConfidence: 0.25    # Minimum confidence for detector bbox to be considered for tracking
+  enableBatchProcess: 1          # Enable batch processing for better performance
+  maxBatchSize: 4                # Maximum batch size for processing
+  enableSubBatchProcess: 1       # Enable sub-batch processing
+  subBatchTimeoutMs: 100         # Timeout for sub-batch processing
+
+TargetManagement:
+  enableBboxUnClipping: 1    # Unclip bbox if likely to be clipped by image border
+  preserveStreamUpdateOrder: 1    # Preserve input streams' order for target IDs in batch mode
+  maxTargetsPerStream: 100   # Increased max targets per stream for batch processing
+  maxTargetsPerBatch: 200    # Maximum targets across all streams in a batch
+  maxTargetsPerSubBatch: 50  # Maximum targets per sub-batch
+
+  # Creation & Termination Policy
+  minIouDiff4NewTarget: 0.7    # IOU threshold to discard new detections that overlap with existing targets
+  minTrackerConfidence: 0.4    # Confidence threshold for shadow mode tracking
+  probationAge: 2    # Target age to be considered valid
+  maxShadowTrackingAge: 30    # Max shadow tracking length before termination
+  earlyTerminationAge: 1    # Early termination threshold during tentative period
+
+TrajectoryManagement:
+  useUniqueID: 0    # Use standard 32-bit tracker ID
+  enableBatchTrajectory: 1    # Enable batch trajectory management
+  batchTrajectoryUpdateInterval: 2    # Update trajectories every N frames in batch mode
+
+DataAssociator:
+  dataAssociatorType: 0    # Default data associator
+  associationMatcherType: 1    # Cascaded matching algorithm
+  checkClassMatch: 1    # Only associate same-class objects
+  enableBatchAssociation: 1    # Enable batch-based data association
+  batchAssociationThreshold: 0.3    # Threshold for batch association matching
+  subBatchAssociationThreshold: 0.4    # Threshold for sub-batch association matching
+
+  # Association Metric: Thresholds
+  minMatchingScore4Overall: 0.4    # Min total score
+  minMatchingScore4SizeSimilarity: 0.3    # Min bbox size similarity score
+  minMatchingScore4Iou: 0.2    # Min IOU score
+  minMatchingScore4VisualSimilarity: 0.5    # Min visual similarity score
+
+  # Association Metric: Weights
+  matchingScoreWeight4VisualSimilarity: 0.3    # Weight for visual similarity
+  matchingScoreWeight4SizeSimilarity: 0.4    # Weight for size similarity
+  matchingScoreWeight4Iou: 0.3    # Weight for IOU score
+
+  # Tentative detections
+  tentativeDetectorConfidence: 0.2    # Confidence threshold for tentative detections
+  minMatchingScore4TentativeIou: 0.5    # Min IOU for tentative detection matching
+
+StateEstimator:
+  stateEstimatorType: 1    # Simple state estimator
+  enableBatchStateEstimation: 1    # Enable batch state estimation
+
+  # Dynamics Modeling
+  processNoiseVar4Loc: 2.0    # Process noise variance for bbox center
+  processNoiseVar4Size: 1.0    # Process noise variance for bbox size
+  processNoiseVar4Vel: 0.1    # Process noise variance for velocity
+  measurementNoiseVar4Detector: 4.0    # Measurement noise variance for detector
+  measurementNoiseVar4Tracker: 8.0    # Measurement noise variance for tracker
+
+VisualTracker:
+  visualTrackerType: 1    # NvDCF visual tracker
+  enableBatchVisualTracking: 1    # Enable batch visual tracking
+
+  # NvDCF: Feature Extraction
+  useColorNames: 1    # Use ColorNames feature
+  useHog: 0    # Disable HOG for performance
+  featureImgSizeLevel: 2    # Medium feature image size for performance
+  featureFocusOffsetFactor_y: -0.1    # Hanning window center offset
+
+  # NvDCF: Correlation Filter
+  filterLr: 0.075    # Learning rate for DCF filter
+  filterChannelWeightsLr: 0.1    # Learning rate for channel weights
+  gaussianSigma: 0.75    # Gaussian standard deviation for desired response
+
+  # Batch Processing Optimizations
+  enableBatchFeatureExtraction: 1    # Enable batch feature extraction
+  batchFeatureUpdateInterval: 3    # Update features every N frames in batch mode
+  subBatchFeatureUpdateInterval: 2    # Update features every N frames in sub-batch mode
+
+# Sub-batch specific configurations
+SubBatchConfig:
+  0:  # Sub-batch 0
+    maxTargets: 50
+    timeoutMs: 50
+    enableProcessing: 1 

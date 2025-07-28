@@ -8,3 +8,7 @@ __pycache__/
 
 # IDE and OS files
 .DS_Store
+
+# Log files
+logs/
+*.log

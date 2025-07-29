@@ -139,8 +139,8 @@ class DeepStreamVideoPipeline:
     """
     
     def __init__(self, rtsp_url: str, config: AppConfig, websocket_port: int = 8765, 
-                 config_file: str = "config_infer_primary_yolo11.txt",
-                 preproc_config: str = "config_preproc.txt"):
+                 config_file: str = "pipelines/config_infer_primary_yolo11.txt",
+                 preproc_config: str = "pipelines/config_preproc.txt"):
         self.rtsp_url = rtsp_url
         self.websocket_port = websocket_port
         self.config_file = config_file
@@ -545,6 +545,68 @@ class DeepStreamVideoPipeline:
         except Exception as e:
             self.logger.error(f"Error during engine-file check: {e}")
 
+    def _remove_excluded_objects_probe(self, pad, info, udata):
+        gst_buffer = info.get_buffer()
+        if not gst_buffer:
+            return Gst.PadProbeReturn.OK
+
+        batch_meta = pyds.gst_buffer_get_nvds_batch_meta(hash(gst_buffer))
+        l_frame = batch_meta.frame_meta_list
+        removed_count = 0
+        while l_frame:
+            try:
+                frame_meta = pyds.NvDsFrameMeta.cast(l_frame.data)
+            except StopIteration:
+                break
+
+            l_obj = frame_meta.obj_meta_list
+            while l_obj:
+                try:
+                    obj_meta = pyds.NvDsObjectMeta.cast(l_obj.data)
+                    l_obj_next = l_obj.next
+                except StopIteration:
+                    break
+
+                # Inspect analytics meta for ROI status
+                remove = False
+                l_user = obj_meta.obj_user_meta_list
+                while l_user:
+                    try:
+                        user_meta = pyds.NvDsUserMeta.cast(l_user.data)
+                    except StopIteration:
+                        break
+
+                    if user_meta.base_meta.meta_type == pyds.nvds_get_user_meta_type("NVIDIA.DSANALYTICSOBJ.USER_META"):
+                        ainfo = pyds.NvDsAnalyticsObjInfo.cast(user_meta.user_meta_data)
+                        if ainfo and ainfo.roiStatus is not None:
+                            for label in ainfo.roiStatus:
+                                if label in ("RF1",):  # exclusion labels
+                                    remove = True
+                                    break
+                        if remove:
+                            break
+                    
+                    try:
+                        l_user = l_user.next
+                    except StopIteration:
+                        break
+
+                if remove:
+                    removed_count += 1
+                    pyds.nvds_remove_obj_meta_from_frame(frame_meta, obj_meta)
+
+                l_obj = l_obj_next
+            
+            try:
+                l_frame = l_frame.next
+            except StopIteration:
+                break
+        
+        if removed_count > 0 and self.frame_count <= 300:
+            self.logger.info(f"Frame {self.frame_count}: Removed {removed_count} objects from exclusion zone.")
+
+        return Gst.PadProbeReturn.OK
+
     def _create_pipeline(self) -> bool:
         """Create the DeepStream GStreamer pipeline using a consolidated, linear assembly approach."""
         try:
@@ -554,25 +616,44 @@ class DeepStreamVideoPipeline:
             if not self.pipeline:
                 raise RuntimeError("Failed to create pipeline")
 
-            element_names = [
-                "nvstreammux", "nvdspreprocess", "nvinfer", "nvtracker", "nvdsanalytics", 
-                "nvvideoconvert", "nvdsosd", "nvvidconv_post_osd", "caps_post_osd", 
-                "nvjpegenc_gpu", "queue_jpeg", "appsink_jpeg"
-            ]
-            elements = [Gst.ElementFactory.make(name, name) for name in 
-                        ["nvstreammux", "nvdspreprocess", "nvinfer", "nvtracker", "nvdsanalytics", 
-                         "nvvideoconvert", "nvdsosd", "nvvideoconvert", "capsfilter", 
-                         "nvjpegenc", "queue", "appsink"]]
+            # Create primary elements
+            streammux = Gst.ElementFactory.make("nvstreammux", "nvstreammux")
+            preprocess = Gst.ElementFactory.make("nvdspreprocess", "nvdspreprocess")
+            nvinfer = Gst.ElementFactory.make("nvinfer", "nvinfer")
             
-            # Assign unique names
-            for i, el in enumerate(elements):
-                if el:
-                    el.set_name(element_names[i])
+            # Analytics and Tracking
+            nvdsanalytics_exclude = Gst.ElementFactory.make("nvdsanalytics", "nvdsanalytics_exclude")
+            nvtracker = Gst.ElementFactory.make("nvtracker", "nvtracker")
+            nvdsanalytics_post = Gst.ElementFactory.make("nvdsanalytics", "nvdsanalytics_post")
+            
+            # OSD and Sink
+            nvvidconv = Gst.ElementFactory.make("nvvideoconvert", "nvvideoconvert")
+            nvosd = Gst.ElementFactory.make("nvdsosd", "nvdsosd")
+            
+            # JPEG encoding branch
+            nvvidconv_post_osd = Gst.ElementFactory.make("nvvideoconvert", "nvvidconv_post_osd")
+            caps_post_osd = Gst.ElementFactory.make("capsfilter", "caps_post_osd")
+            jpegenc_gpu = Gst.ElementFactory.make("nvjpegenc", "nvjpegenc_gpu")
+            queue_jpeg = Gst.ElementFactory.make("queue", "queue_jpeg")
+            appsink_jpeg = Gst.ElementFactory.make("appsink", "appsink_jpeg")
 
-            streammux, preprocess, nvinfer, nvtracker, nvanalytics, nvvidconv, nvosd, \
-            nvvidconv_post, caps_post_osd, jpegenc_gpu, queue_jpeg, appsink_jpeg = elements
+            # Queues for pipeline robustness
+            q_after_pgie = Gst.ElementFactory.make("queue", "q_after_pgie")
+            q_before_tracker = Gst.ElementFactory.make("queue", "q_before_tracker")
+            q_after_tracker = Gst.ElementFactory.make("queue", "q_after_tracker")
 
+            elements = [
+                streammux, preprocess, nvinfer, nvdsanalytics_exclude, nvtracker, nvdsanalytics_post,
+                nvvidconv, nvosd, nvvidconv_post_osd, caps_post_osd, jpegenc_gpu, queue_jpeg, appsink_jpeg,
+                q_after_pgie, q_before_tracker, q_after_tracker
+            ]
+            
             if not all(elements):
+                element_names = [
+                    "nvstreammux", "nvdspreprocess", "nvinfer", "nvdsanalytics_exclude", "nvtracker", 
+                    "nvdsanalytics_post", "nvvideoconvert", "nvdsosd", "nvvidconv_post_osd", "caps_post_osd", 
+                    "nvjpegenc_gpu", "queue_jpeg", "appsink_jpeg", "q_after_pgie", "q_before_tracker", "q_after_tracker"
+                ]
                 for el, name in zip(elements, element_names):
                     if not el: self.logger.error(f"❌ Failed to create element: {name}")
                 raise RuntimeError("Failed to create one or more GStreamer elements.")
@@ -581,37 +662,43 @@ class DeepStreamVideoPipeline:
             # --- Phase B: Configure Elements ---
             self.logger.info("------------- Configuring GStreamer Elements-------------")
             
-            # Bus and metadata callbacks
             bus = self.pipeline.get_bus()
             bus.add_signal_watch()
             bus.connect("message", self._on_bus_message)
-            pyds.register_user_copyfunc(custom_preprocess_copy_func)
-            pyds.register_user_releasefunc(custom_preprocess_release_func)
 
             # Streammux configuration
             streammux.set_property("batch-size", self.batch_size)
             streammux.set_property("width", 1280)
             streammux.set_property("height", 720)
-            streammux.set_property("batched-push-timeout", 4000000)
+            streammux.set_property("batched-push-timeout", 40000)
             streammux.set_property("live-source", 1)
 
-            # Preprocess configuration
             preprocess.set_property("config-file", self.config.processing.DEEPSTREAM_PREPROCESS_CONFIG)
             
-            # Nvinfer configuration
             self._check_for_engine_file(self.config_file)
             nvinfer.set_property("config-file-path", self.config_file)
             nvinfer.set_property("input-tensor-meta", True)
 
-            # Nvtracker configuration
+            # Exclusion analytics
+            nvdsanalytics_exclude.set_property("unique-id", 101)
+            nvdsanalytics_exclude.set_property("config-file", "pipelines/config_nvdsanalytics_exclude.ini")
+
+            # Tracker configuration
             nvtracker.set_property("ll-lib-file", "/opt/nvidia/deepstream/deepstream/lib/libnvds_nvmultiobjecttracker.so")
-            tracker_config_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config_tracker_nvdcf_batch.yml")
+            tracker_config_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "pipelines/config_tracker_nvdcf_batch.yml")
             nvtracker.set_property("ll-config-file", tracker_config_path)
 
-            # Nvdsanalytics configuration
-            nvanalytics.set_property("config-file", "config_nvdsanalytics.txt")
+            # Post-tracker analytics
+            nvdsanalytics_post.set_property("unique-id", 201)
+            nvdsanalytics_post.set_property("config-file", "pipelines/config_nvdsanalytics_post.ini")
                 
-            # OSD Sink Pad Probe for metadata
+            # Pad probe to remove excluded objects
+            exclude_src_pad = nvdsanalytics_exclude.get_static_pad("src")
+            if not exclude_src_pad: raise RuntimeError("Failed to get nvdsanalytics_exclude source pad")
+            exclude_src_pad.add_probe(Gst.PadProbeType.BUFFER, self._remove_excluded_objects_probe, None)
+            self.logger.info("✅ Added buffer probe to nvdsanalytics_exclude source pad for object removal")
+            
+            # OSD Sink Pad Probe for final metadata
             osd_src_pad = nvosd.get_static_pad("src")
             if not osd_src_pad: raise RuntimeError("Failed to get OSD source pad")
             osd_src_pad.add_probe(Gst.PadProbeType.BUFFER, self.osd_sink_pad_buffer_probe, 0)
@@ -628,32 +715,33 @@ class DeepStreamVideoPipeline:
             # --- Phase C: Add and Link Elements ---
             self.logger.info("------------- Adding and Linking All Elements-------------")
             
-            # Add all elements to the pipeline
             for el in elements:
                 self.pipeline.add(el)
             
-            # Create and add the source bin
             source_bin = self._create_source_bin(0, {'url': self.rtsp_url})
             if not source_bin: raise RuntimeError("Failed to create source bin")
             self.pipeline.add(source_bin)
             
-            # Link source to streammux
             source_pad = source_bin.get_static_pad("src")
             sink_pad = streammux.get_request_pad("sink_0")
             if source_pad.link(sink_pad) != Gst.PadLinkReturn.OK:
                 raise RuntimeError("Failed to link source bin to streammux")
             
-            # Link the main processing chain
+            # Link main processing chain
             if not streammux.link(preprocess): raise RuntimeError("Failed to link streammux to preprocess")
             if not preprocess.link(nvinfer): raise RuntimeError("Failed to link preprocess to nvinfer")
-            if not nvinfer.link(nvtracker): raise RuntimeError("Failed to link nvinfer to nvtracker")
-            if not nvtracker.link(nvanalytics): raise RuntimeError("Failed to link nvtracker to nvanalytics")
-            if not nvanalytics.link(nvvidconv): raise RuntimeError("Failed to link nvanalytics to nvvidconv")
+            if not nvinfer.link(q_after_pgie): raise RuntimeError("Failed to link nvinfer to q_after_pgie")
+            if not q_after_pgie.link(nvdsanalytics_exclude): raise RuntimeError("Failed to link q_after_pgie to nvdsanalytics_exclude")
+            if not nvdsanalytics_exclude.link(q_before_tracker): raise RuntimeError("Failed to link nvdsanalytics_exclude to q_before_tracker")
+            if not q_before_tracker.link(nvtracker): raise RuntimeError("Failed to link q_before_tracker to nvtracker")
+            if not nvtracker.link(q_after_tracker): raise RuntimeError("Failed to link nvtracker to q_after_tracker")
+            if not q_after_tracker.link(nvdsanalytics_post): raise RuntimeError("Failed to link q_after_tracker to nvdsanalytics_post")
+            if not nvdsanalytics_post.link(nvvidconv): raise RuntimeError("Failed to link nvdsanalytics_post to nvvidconv")
             if not nvvidconv.link(nvosd): raise RuntimeError("Failed to link nvvidconv to nvosd")
             
-            # Link the JPEG encoding sink chain
-            if not nvosd.link(nvvidconv_post): raise RuntimeError("Failed to link nvosd to nvvidconv_post")
-            if not nvvidconv_post.link(caps_post_osd): raise RuntimeError("Failed to link nvvidconv_post to caps_post_osd")
+            # Link JPEG encoding sink chain
+            if not nvosd.link(nvvidconv_post_osd): raise RuntimeError("Failed to link nvosd to nvvidconv_post_osd")
+            if not nvvidconv_post_osd.link(caps_post_osd): raise RuntimeError("Failed to link nvvidconv_post_osd to caps_post_osd")
             if not caps_post_osd.link(jpegenc_gpu): raise RuntimeError("Failed to link caps_post_osd to jpegenc_gpu")
             if not jpegenc_gpu.link(queue_jpeg): raise RuntimeError("Failed to link jpegenc_gpu to queue_jpeg")
             if not queue_jpeg.link(appsink_jpeg): raise RuntimeError("Failed to link queue_jpeg to appsink_jpeg")
@@ -662,8 +750,9 @@ class DeepStreamVideoPipeline:
             self.logger.info("✅ Pipeline construction complete.")
             
             # Store references
-            self.streammux, self.preprocess, self.nvinfer, self.nvtracker, self.nvanalytics, \
-            self.nvvidconv, self.nvosd = streammux, preprocess, nvinfer, nvtracker, nvanalytics, nvvidconv, nvosd
+            self.streammux, self.preprocess, self.nvinfer, self.nvtracker = streammux, preprocess, nvinfer, nvtracker
+            self.nvdsanalytics_exclude, self.nvdsanalytics_post = nvdsanalytics_exclude, nvdsanalytics_post
+            self.nvvidconv, self.nvosd = nvvidconv, nvosd
             self.jpeg_appsink = appsink_jpeg
             
             return True
@@ -1736,8 +1825,8 @@ def create_deepstream_video_processor(
         rtsp_url=source_url,
         config=config,
         websocket_port=8765,
-        config_file="config_infer_primary_yolo11.txt",
-        preproc_config="config_preproc.txt"
+        config_file="pipelines/config_infer_primary_yolo11.txt",
+        preproc_config="pipelines/config_preproc.txt"
     )
 
 
@@ -1745,45 +1834,36 @@ if __name__ == "__main__":
     # Test DeepStream pipeline
     import argparse
     from config import config
-    
+
     parser = argparse.ArgumentParser(description="Test DeepStream Video Pipeline")
-    parser.add_argument("--source", required=True, help="Video source (RTSP URL or file)")
-    parser.add_argument("--duration", type=int, default=10, help="Test duration in seconds")
+    
+    # Define the default RTSP URI
+    default_rtsp_uri = os.environ.get("NOESIS_RTSP_URI", "rtsps://192.168.3.214:7441/jdr9oLlBkjyl3gDm?enableSrtp")
+    
+    parser.add_argument("--source-uri", default=default_rtsp_uri, help="Video source (RTSP URL)")
+    parser.add_argument("--duration", type=int, default=30, help="Test duration in seconds")
     args = parser.parse_args()
-    
+
     logging.basicConfig(level=logging.INFO)
-    
+
     # Create pipeline
-    pipeline = create_deepstream_video_processor("test_cam", args.source, config)
-    
+    pipeline = create_deepstream_video_processor("test_cam", args.source_uri, config)
+
     if pipeline.start():
         print("✅ DeepStream pipeline started successfully")
-        
+
         # Read frames for specified duration
-        start = time.time()
-        frame_count = 0
-        last_detection_log_time = 0
-        detection_log_interval = 5  # seconds
+        start_time = time.time()
         
-        while time.time() - start < args.duration:
-            ret, tensor_data = pipeline.read_gpu_tensor()
-            if ret and tensor_data:
-                detections = tensor_data['detections']
-                current_time = time.time()
-                
-                # Only log detections when count > 0 and enough time has passed
-                if len(detections) > 0 and (current_time - last_detection_log_time) >= detection_log_interval:
-                    print(f"🔍 Detected {len(detections)} objects at {current_time - start:.1f}s")
-                    last_detection_log_time = current_time
-                
-                frame_count += 1
-            else:
-                time.sleep(0.01)
-        
+        while time.time() - start_time < args.duration:
+            # The main logic is handled by the pipeline and probes now.
+            # We just need to keep the script alive.
+            time.sleep(1)
+
         # Print statistics
         stats = pipeline.get_stats()
         print(f"\nPipeline statistics: {stats}")
-        
+
         pipeline.stop()
     else:
-        print("❌ Failed to start DeepStream pipeline") 
+        print("❌ Failed to start DeepStream pipeline")

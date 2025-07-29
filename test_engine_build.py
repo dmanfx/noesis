@@ -40,7 +40,7 @@ def test_engine_build():
     streammux.set_property("live-source", 1)
     
     # Configure nvinfer
-    nvinfer.set_property("config-file-path", "config_infer_primary_yolo11.txt")
+            nvinfer.set_property("config-file-path", "pipelines/config_infer_primary_yolo11.txt")
     nvinfer.set_property("input-tensor-meta", True)
     
     # Add elements to pipeline

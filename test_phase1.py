@@ -34,7 +34,7 @@ def test_phase1():
             rtsp_url=rtsp_url,
             config=config,
             websocket_port=8765,
-            preproc_config="config_preproc.txt"
+            preproc_config="pipelines/config_preproc.txt"
         )
         
         print("✅ Pipeline created successfully")

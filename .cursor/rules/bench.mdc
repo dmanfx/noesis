@@ -1,0 +1,13 @@
+---
+description: Minimal benchmarking policy
+globs:
+  - "**/*.md"
+  - "**/*.py"
+  - "**/bench/**"
+---
+
+# BENCH Requirements
+- Report: **fps**, **latency_ms**, optional **gpu.util**.
+- Include: **command used**, **resolution**, **batch**, **device**.
+- Provide a **PASS/FAIL** vs the stated target and a one-sentence interpretation.
+

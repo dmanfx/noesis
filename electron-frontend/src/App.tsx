@@ -22,6 +22,9 @@ const Dashboard: React.FC = () => {
   const retryInterval = 5000;
   const { publish } = useTelemetry();
 
+  const lastFpsUpdateTime = useRef(0);
+  const FPS_UPDATE_INTERVAL = 2000; // 2 seconds
+
   // FPS tracking
   const fpsTrackingRef = useRef({
     'living-room': { frameCount: 0, lastUpdate: Date.now(), fps: 0, frameHistory: [] as number[] },
@@ -29,17 +32,22 @@ const Dashboard: React.FC = () => {
   });
 
   const updateFPS = (cameraType: 'living-room' | 'kitchen') => {
-    const now = Date.now();
     const tracker = fpsTrackingRef.current[cameraType];
     
     tracker.frameCount++;
-    tracker.frameHistory.push(now);
+    tracker.frameHistory.push(Date.now());
     
     const maxFrames = 30;
     if (tracker.frameHistory.length > maxFrames) {
       tracker.frameHistory.shift();
     }
     
+    const now = Date.now();
+    if (now - lastFpsUpdateTime.current < FPS_UPDATE_INTERVAL) {
+        return;
+    }
+    lastFpsUpdateTime.current = now;
+
     if (now - tracker.lastUpdate >= 1000 || tracker.frameHistory.length >= maxFrames) {
       if (tracker.frameHistory.length >= 2) {
         const oldestFrame = tracker.frameHistory[0];
@@ -173,21 +181,6 @@ const Dashboard: React.FC = () => {
   const handleStatsUpdate = (payload: any) => {
     if (!payload) return;
 
-    // console.log("📊 Stats payload received:", {
-    //   hasPayload: !!payload, 
-    //   hasCameras: !!payload.cameras, 
-    //   cameraIds: payload.cameras ? Object.keys(payload.cameras) : [],
-    //   cameraData: payload.cameras ? Object.keys(payload.cameras).map(id => ({
-    //     id,
-    //     hasTracking: !!payload.cameras[id].tracking,
-    //     trackingKeys: payload.cameras[id].tracking ? Object.keys(payload.cameras[id].tracking) : [],
-    //     trackingData: payload.cameras[id].tracking,
-    //     fps: payload.cameras[id].fps,
-    //     frameCount: payload.cameras[id].frame_count,
-    //     status: payload.cameras[id].status
-    //   })) : []
-    // });
-
     // System Status & Uptime
     if (payload.uptime) {
       const uptimeSeconds = payload.uptime ?? 0;
@@ -217,19 +210,23 @@ const Dashboard: React.FC = () => {
       let allActiveTracks: any[] = [];
       let allTransitions: any[] = [];
       
+      const now = Date.now();
+      const shouldUpdateFps = now - lastFpsUpdateTime.current > FPS_UPDATE_INTERVAL;
+
       for (const cameraId in payload.cameras) {
         const cameraData = payload.cameras[cameraId];
         if (!cameraData) continue;
 
-        // console.log(`📊 Processing camera ${cameraId}:`, {
-        //   fps: cameraData.fps,
-        //   frameCount: cameraData.frame_count,
-        //   status: cameraData.status,
-        //   hasTracking: !!cameraData.tracking,
-        //   trackingData: cameraData.tracking
-        // });
+        // Throttled FPS state updates
+        if (shouldUpdateFps) {
+          if (cameraId === 'kitchen') {
+            setKitchenFPS(`FPS: ${cameraData.fps?.toFixed(1) ?? '0.0'}`);
+          } else if (cameraId === 'living-room') {
+            setLivingRoomFPS(`FPS: ${cameraData.fps?.toFixed(1) ?? '0.0'}`);
+          }
+        }
 
-        // Publish basic camera stats
+        // Publish basic camera stats (always publish for telemetry)
         const groupName = `Camera ${cameraId}`;
         if (publish) {
           if (typeof cameraData.frame_count !== 'undefined') {
@@ -246,10 +243,9 @@ const Dashboard: React.FC = () => {
           }
         }
 
+        // Process tracking data
         const trackingData = cameraData.tracking;
         if (trackingData && typeof trackingData === 'object') {
-          // console.log(`📊 Camera ${cameraId} tracking data:`, trackingData);
-          
           if (trackingData.occupancy && typeof trackingData.occupancy === 'object') {
             for (const zone in trackingData.occupancy) {
               globalOccupancy[zone] = (globalOccupancy[zone] || 0) + trackingData.occupancy[zone];
@@ -263,9 +259,11 @@ const Dashboard: React.FC = () => {
           if (trackingData.transitions && Array.isArray(trackingData.transitions)) {
             allTransitions = allTransitions.concat(trackingData.transitions);
           }
-        } else {
-          // console.log(`📊 Camera ${cameraId} has no tracking data`);
         }
+      }
+
+      if (shouldUpdateFps) {
+        lastFpsUpdateTime.current = now;
       }
 
       // Update Occupancy Display
@@ -361,7 +359,7 @@ const Dashboard: React.FC = () => {
       }
     };
 
-    socketRef.current.onclose = (event) => {
+    socketRef.current.onclose = (event: CloseEvent) => {
       console.log('WebSocket connection closed:', event.code, event.reason);
       setConnectionStatus(`Disconnected (Code: ${event.code}). Retrying...`);
       
@@ -389,7 +387,7 @@ const Dashboard: React.FC = () => {
       }
     };
 
-    socketRef.current.onerror = (error) => {
+    socketRef.current.onerror = (error: Event) => {
       console.error('WebSocket error:', error);
       setConnectionStatus('Error (Check console)');
       
@@ -399,7 +397,7 @@ const Dashboard: React.FC = () => {
       }
     };
 
-    socketRef.current.onmessage = (event) => {
+    socketRef.current.onmessage = (event: MessageEvent) => {
       if (event.data instanceof Blob) {
         processBinaryFrame(event.data);
       } else if (event.data instanceof ArrayBuffer) {
@@ -521,8 +519,9 @@ const Dashboard: React.FC = () => {
       button.addEventListener('click', () => handleFullscreen(button));
     });
 
-    // Escape key handler
-    const handleEscape = (event: KeyboardEvent) => {
+    // Keyboard event handler
+    const handleKeydown = (event: KeyboardEvent) => {
+      // Handle Escape key for fullscreen
       if (event.key === 'Escape') {
         document.querySelectorAll('.maximized-stream').forEach(stream => {
           stream.classList.remove('maximized-stream');
@@ -536,12 +535,28 @@ const Dashboard: React.FC = () => {
           stats.classList.remove('perf-stats-maximized');
         });
       }
+      
+      // Handle 'T' key for telemetry drawer toggle
+      if (event.key.toLowerCase() === 't') {
+        // Only trigger if not typing in an input field
+        const activeElement = document.activeElement;
+        const isInputField = activeElement && (
+          activeElement.tagName === 'INPUT' || 
+          activeElement.tagName === 'TEXTAREA' || 
+          (activeElement as HTMLElement).contentEditable === 'true'
+        );
+        
+        if (!isInputField) {
+          event.preventDefault();
+          setDrawerOpen((prev: boolean) => !prev);
+        }
+      }
     };
 
-    document.addEventListener('keydown', handleEscape);
+    document.addEventListener('keydown', handleKeydown);
 
     return () => {
-      document.removeEventListener('keydown', handleEscape);
+      document.removeEventListener('keydown', handleKeydown);
     };
   }, []);
 

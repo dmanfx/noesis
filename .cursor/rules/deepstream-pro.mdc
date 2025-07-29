@@ -14,11 +14,10 @@ globs:
 # Mandatory Preflight (evidence required)
 Before proposing any solution:
 1) **Summarize** (3–7 bullets total) the most relevant parts of:
-   - DS Overview → https://docs.nvidia.com/metropolis/deepstream/dev-guide/text/DS_Overview.html
-   - DS Developer Guide (TOC + specific components you intend to use) → https://docs.nvidia.com/metropolis/deepstream/dev-guide/
-2) **Map requirements → built-ins** by **exact element name** with 1‑line purpose each.
-   - Consider: `nvurisrcbin`, `nvstreammux`, `nvinfer`, `nvtracker`, `nvdsanalytics`, `nvvideoconvert`, `nvmultistreamtiler`, `nvstreamdemux`, `nvmsgconv`.
-3) **Cite at least one sample** (name + section/path) that demonstrates the pattern you’ll use (analytics ROIs, tracker config, mux/tiler topology, multi-source).
+   - **Primary Source (Local Docs):** The distilled documentation in `/docs/deepstream-docs/`. Start with the `README.md` to navigate.
+   - **Secondary Source (Fallback):** If the local docs are insufficient, consult the official NVIDIA Dev Guide (TOC + specific components you intend to use) → https://docs.nvidia.com/metropolis/deepstream/dev-guide/
+2) **Map requirements → built-ins** by **exact element name** with 1‑line purpose each, referencing `docs/deepstream-docs/02_GStreamer_Plugins.md`.
+3) **Cite at least one sample** (name + path) from `docs/deepstream-docs/03_Sample_Applications.md` that demonstrates the pattern you’ll use.
 4) **Declare config keys** you’ll touch and why (e.g., `batch-size`, `interval`, tracker params, analytics ROI polygons, tiler layout).
 
 # Working Principles
@@ -51,9 +50,9 @@ Before proposing any solution:
 - README/USAGE: run steps, key flags/paths, where to edit zones, known limitations.
 
 # Acceptance Checklist (agent must tick in output)
-- [ ] Preflight summary + links included (Overview + Dev Guide pages)
+- [ ] Preflight summary from local `docs/deepstream-docs/` included
 - [ ] Built-ins selected with rationale (by exact element names)
-- [ ] At least one relevant **sample** cited
+- [ ] At least one relevant **sample** cited from local docs
 - [ ] Runnable pipeline/config provided
 - [ ] Key knobs listed with reasons
 - [ ] Exclusion zones defined (if relevant) with scaling note
@@ -63,5 +62,5 @@ Before proposing any solution:
 # Stop & Ask Triggers
 - Missing or vague acceptance criteria
 - DS/TRT version mismatch likely to change behavior
-- Attempt to re‑implement a feature that DS already offers (without a gap analysis)
+- Attempt to re‑implement a feature that DS already offers (without a gap analysis from local docs)
 

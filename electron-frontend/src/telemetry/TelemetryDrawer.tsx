@@ -1,6 +1,6 @@
 import React, { useMemo, useState } from 'react';
 import styled from 'styled-components';
-import { useTelemetry, TelemetryEntry } from './TelemetryContext';
+import { TelemetryEntry, useTelemetry } from './TelemetryContext';
 
 const Overlay = styled.div`
   position: fixed;
@@ -67,6 +67,13 @@ interface DrawerProps {
   onClose: () => void;
 }
 
+const formatUptime = (seconds: number) => {
+    const h = Math.floor(seconds / 3600).toString().padStart(2, '0');
+    const m = Math.floor((seconds % 3600) / 60).toString().padStart(2, '0');
+    const s = Math.floor(seconds % 60).toString().padStart(2, '0');
+    return `${h}h ${m}m ${s}s`;
+};
+
 export const TelemetryDrawer: React.FC<DrawerProps> = ({open, onClose}) => {
   const { entries } = useTelemetry();
   const [filter, setFilter] = useState('');
@@ -91,7 +98,7 @@ export const TelemetryDrawer: React.FC<DrawerProps> = ({open, onClose}) => {
         <SearchInput
           placeholder="Filter keys..."
           value={filter}
-          onChange={e => setFilter(e.target.value)}
+          onChange={(e: React.ChangeEvent<HTMLInputElement>) => setFilter(e.target.value)}
         />
         <div style={{overflowY: 'auto', flex: 1}}>
           {Object.entries(grouped).sort((a, b) => a[0].localeCompare(b[0])).map(([group, items]) => (
@@ -102,7 +109,7 @@ export const TelemetryDrawer: React.FC<DrawerProps> = ({open, onClose}) => {
                 return (
                   <Row key={`${group}-${item.key}`}>
                     <span>{item.key}</span>
-                    <Value>{String(item.value)}</Value>
+                    <Value>{item.key === 'Uptime' ? formatUptime(item.value as number) : String(item.value)}</Value>
                     <span style={{ marginLeft: '8px', fontSize: '0.8em', opacity: 0.6, minWidth: '50px', textAlign: 'right' }}>
                       {secondsAgo > 2 && `${secondsAgo}s ago`}
                     </span>

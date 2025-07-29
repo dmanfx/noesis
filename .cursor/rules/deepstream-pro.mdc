@@ -1,0 +1,66 @@
+---
+description: DeepStream docs-first policy, output contracts, and checklists
+globs:
+  - "**/pipelines/**"
+  - "**/configs/**"
+  - "**/*.txt"
+  - "**/*.cfg"
+  - "**/*.ini"
+  - "**/*.yaml"
+  - "**/*.py"
+  - "**/*.md"
+---
+
+# Mandatory Preflight (evidence required)
+Before proposing any solution:
+1) **Summarize** (3–7 bullets total) the most relevant parts of:
+   - **Primary Source (Local Docs):** The distilled documentation in `/docs/deepstream-docs/`. Start with the `README.md` to navigate.
+   - **Secondary Source (Fallback):** If the local docs are insufficient, consult the official NVIDIA Dev Guide (TOC + specific components you intend to use) → https://docs.nvidia.com/metropolis/deepstream/dev-guide/
+2) **Map requirements → built-ins** by **exact element name** with 1‑line purpose each, referencing `docs/deepstream-docs/02_GStreamer_Plugins.md`.
+3) **Cite at least one sample** (name + path) from `docs/deepstream-docs/03_Sample_Applications.md` that demonstrates the pattern you’ll use.
+4) **Declare config keys** you’ll touch and why (e.g., `batch-size`, `interval`, tracker params, analytics ROI polygons, tiler layout).
+
+# Working Principles
+- Prefer **SDK features** over custom plugins; justify any plugin with a brief **gap analysis**.
+- Keep pipelines **reproducible**: provide full `gst-launch-1.0` or DS config file(s) and a **How to run** snippet.
+- Keep scope **tight** to acceptance criteria; extras become new issues.
+
+# Output Contracts (must appear in the agent’s message)
+## A) PLAN (short)
+- **Approach**: why these DS elements
+- **Dependencies**: DS/TRT versions assumed; call out potential mismatches
+- **Acceptance criteria**: FPS target, resolution, basic stability
+- **Handoff**: next step (GRAPH → FORGE)
+
+## B) PIPELINE & CONFIGS
+- **Runnable** `gst-launch-1.0 ...` (single line) **or** DS `.txt` files (inline or file list)
+- **Knobs touched**: list and justify (`interval`, `batch-size`, tracker cfg, analytics zones)
+- **Diagram**: mermaid or ASCII block diagram of the graph
+
+## C) EXCLUSION ZONES (if applicable)
+- Define **polygon(s)/rect(s)** per source in a separate include or dedicated section.
+- Use **two `nvdsanalytics` instances** when it simplifies disjoint zone logic (e.g., art-on-wall filters).
+- Provide a **coordinate table** (normalized or pixel, specify which) and a **note on scaling** to the source resolution.
+
+## D) BENCH (quick)
+- **Command used**, **environment note** (GPU, res, batch), **numbers**: `fps`, `latency_ms`, optional `gpu.util`.
+- **Verdict**: PASS/FAIL vs target and one sentence of interpretation.
+
+## E) DOCS TOUCH
+- README/USAGE: run steps, key flags/paths, where to edit zones, known limitations.
+
+# Acceptance Checklist (agent must tick in output)
+- [ ] Preflight summary from local `docs/deepstream-docs/` included
+- [ ] Built-ins selected with rationale (by exact element names)
+- [ ] At least one relevant **sample** cited from local docs
+- [ ] Runnable pipeline/config provided
+- [ ] Key knobs listed with reasons
+- [ ] Exclusion zones defined (if relevant) with scaling note
+- [ ] Bench numbers + verdict reported
+- [ ] README/USAGE updated
+
+# Stop & Ask Triggers
+- Missing or vague acceptance criteria
+- DS/TRT version mismatch likely to change behavior
+- Attempt to re‑implement a feature that DS already offers (without a gap analysis from local docs)
+

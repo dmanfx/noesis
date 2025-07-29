@@ -1,0 +1,12 @@
+---
+description: Minimal documentation contract
+globs:
+  - "README.md"
+  - "USAGE.md"
+  - "**/*.md"
+---
+
+# DOCS Touch
+- Add/Update a **Run** section (commands, config file paths).
+- Document **config knobs** that were changed and where to edit exclusion zones.
+- Note **known limitations** and **expected FPS** at the tested resolution.

@@ -13,8 +13,8 @@ const Dashboard: React.FC = () => {
   const [occupancy, setOccupancy] = useState('Loading...');
   const [activeTracks, setActiveTracks] = useState('Loading...');
   const [transitions, setTransitions] = useState('<li>Loading...</li>');
-  const [kitchenFPS, setKitchenFPS] = useState('FPS: 0.0');
-  const [livingRoomFPS, setLivingRoomFPS] = useState('FPS: 0.0');
+  const [frames, setFrames] = useState<Record<string, string>>({});
+  const [fpsMap, setFpsMap] = useState<Record<string, string>>({});
   
   const socketRef = useRef<WebSocket | null>(null);
   const retryCountRef = useRef(0);
@@ -23,70 +23,42 @@ const Dashboard: React.FC = () => {
   const { publish } = useTelemetry();
 
   // FPS tracking
-  const fpsTrackingRef = useRef({
-    'living-room': { frameCount: 0, lastUpdate: Date.now(), fps: 0, frameHistory: [] as number[] },
-    'kitchen': { frameCount: 0, lastUpdate: Date.now(), fps: 0, frameHistory: [] as number[] }
-  });
+  const fpsTrackingRef = useRef<Record<string, { frameHistory: number[]; lastUpdate: number; fps: number }>>({});
 
-  const updateFPS = (cameraType: 'living-room' | 'kitchen') => {
+  const updateFPS = (cameraId: string) => {
     const now = Date.now();
-    const tracker = fpsTrackingRef.current[cameraType];
-    
-    tracker.frameCount++;
-    tracker.frameHistory.push(now);
-    
-    const maxFrames = 30;
-    if (tracker.frameHistory.length > maxFrames) {
-      tracker.frameHistory.shift();
+    if (!fpsTrackingRef.current[cameraId]) {
+      fpsTrackingRef.current[cameraId] = { frameHistory: [], lastUpdate: now, fps: 0 };
     }
+    const tracker = fpsTrackingRef.current[cameraId];
     
-    if (now - tracker.lastUpdate >= 1000 || tracker.frameHistory.length >= maxFrames) {
-      if (tracker.frameHistory.length >= 2) {
-        const oldestFrame = tracker.frameHistory[0];
-        const newestFrame = tracker.frameHistory[tracker.frameHistory.length - 1];
-        const timeSpan = (newestFrame - oldestFrame) / 1000;
-        
-        if (timeSpan > 0) {
-          tracker.fps = (tracker.frameHistory.length - 1) / timeSpan;
-        }
+      tracker.frameHistory.push(now);
+      const maxFrames = 30;
+      if (tracker.frameHistory.length > maxFrames) {
+        tracker.frameHistory.shift();
       }
-      
-      if (cameraType === 'living-room') {
-        setLivingRoomFPS(`FPS: ${tracker.fps.toFixed(1)}`);
-        if (publish) {
-          publish({ group: 'Camera Living Room', key: 'FPS', value: Number(tracker.fps.toFixed(1)), ts: Date.now() });
+      if (now - tracker.lastUpdate >= 1000 || tracker.frameHistory.length >= maxFrames) {
+        if (tracker.frameHistory.length >= 2) {
+          const oldestFrame = tracker.frameHistory[0];
+          const newestFrame = tracker.frameHistory[tracker.frameHistory.length - 1];
+          const timeSpan = (newestFrame - oldestFrame) / 1000;
+          if (timeSpan > 0) {
+            tracker.fps = (tracker.frameHistory.length - 1) / timeSpan;
+          }
         }
-      } else {
-        setKitchenFPS(`FPS: ${tracker.fps.toFixed(1)}`);
+        setFpsMap(prev => ({ ...prev, [cameraId]: `FPS: ${tracker.fps.toFixed(1)}` }));
         if (publish) {
-          publish({ group: 'Camera Kitchen', key: 'FPS', value: Number(tracker.fps.toFixed(1)), ts: Date.now() });
+          publish({ group: `Camera ${cameraId}`, key: FPS, value: Number(tracker.fps.toFixed(1)), ts: Date.now() });
         }
+        tracker.lastUpdate = now;
       }
-      
-      tracker.lastUpdate = now;
-    }
   };
-
   const resetFPSTracking = () => {
-    for (const cameraType in fpsTrackingRef.current) {
-      fpsTrackingRef.current[cameraType as 'living-room' | 'kitchen'] = {
-        frameCount: 0,
-        lastUpdate: Date.now(),
-        fps: 0,
-        frameHistory: []
-      };
+    for (const cam in fpsTrackingRef.current) {
+      fpsTrackingRef.current[cam] = { frameHistory: [], lastUpdate: Date.now(), fps: 0 };
     }
-    setKitchenFPS('FPS: 0.0');
-    setLivingRoomFPS('FPS: 0.0');
+    setFpsMap({});
   };
-
-  const processBinaryFrame = async (blob: Blob) => {
-    try {
-      // console.log('[WebSocket] Processing binary frame, blob size:', blob.size);
-      const arrayBuffer = await blob.arrayBuffer();
-      const dataView = new DataView(arrayBuffer);
-
-      if (arrayBuffer.byteLength < 1) {
         console.error('[WebSocket] Received empty binary message.');
         return;
       }
@@ -121,54 +93,23 @@ const Dashboard: React.FC = () => {
   };
 
   const displayFrame = (cameraId: string, imageBlob: Blob) => {
-    // console.log('[displayFrame] Called with camera:', cameraId, 'blob size:', imageBlob?.size);
-    
     if (!imageBlob || !(imageBlob instanceof Blob)) {
-      console.error(`Invalid image data for ${cameraId}, not a Blob:`, imageBlob);
+      console.error(`Invalid image data for ${cameraId}`);
       return;
     }
-
     try {
-      const imageUrl = URL.createObjectURL(imageBlob);
-      // console.log('[displayFrame] Created object URL:', imageUrl);
-      
-      const normalizedCamId = cameraId.toLowerCase().trim();
-      // console.log('[displayFrame] Normalized camera ID:', normalizedCamId);
-      
-      let cameraType: 'living-room' | 'kitchen' | null = null;
-      
-      if (normalizedCamId === "rtsp_0" || normalizedCamId.includes("living") || normalizedCamId.includes("room1") || normalizedCamId === "1") {
-        cameraType = 'living-room';
-        // console.log('[displayFrame] Mapped to living room stream');
-      } else if (normalizedCamId === "rtsp_1" || normalizedCamId.includes("kitchen") || normalizedCamId.includes("room2") || normalizedCamId === "2") {
-        cameraType = 'kitchen';
-        // console.log('[displayFrame] Mapped to kitchen stream');
-      } else {
-        console.warn(`Unknown camera ID: ${cameraId}`);
-        URL.revokeObjectURL(imageUrl);
-        return;
-      }
-
-      // Update the image source
-      const imgElement = document.getElementById(cameraType === 'living-room' ? 'living-room-stream' : 'kitchen-stream') as HTMLImageElement;
-      if (imgElement) {
-        // Revoke previous URL if it exists
-        if (imgElement.dataset.objectUrl) {
-          URL.revokeObjectURL(imgElement.dataset.objectUrl);
-        }
-        imgElement.dataset.objectUrl = imageUrl;
-        imgElement.src = imageUrl;
-        
-        // Update FPS tracking
-        if (cameraType) {
-          updateFPS(cameraType);
-        }
-      }
-
-    } catch (error) {
-      console.error(`Error in displayFrame for ${cameraId}:`, error);
+      const url = URL.createObjectURL(imageBlob);
+      setFrames(prev => {
+        const old = prev[cameraId];
+        if (old) URL.revokeObjectURL(old);
+        return { ...prev, [cameraId]: url };
+      });
+      updateFPS(cameraId);
+    } catch (err) {
+      console.error(`displayFrame error for ${cameraId}:`, err);
     }
   };
+
 
   const handleStatsUpdate = (payload: any) => {
     if (!payload) return;
@@ -374,14 +315,9 @@ const Dashboard: React.FC = () => {
       const livingRoomImg = document.getElementById('living-room-stream') as HTMLImageElement;
       const kitchenImg = document.getElementById('kitchen-stream') as HTMLImageElement;
       if (livingRoomImg) livingRoomImg.src = "";
-      if (kitchenImg) kitchenImg.src = "";
-      
+      // Clear images on disconnect
+      setFrames({});
       resetFPSTracking();
-      
-      // Attempt to reconnect
-      if (retryCountRef.current < maxRetries) {
-        retryCountRef.current++;
-        console.log(`Attempting reconnect #${retryCountRef.current} in ${retryInterval / 1000} seconds...`);
         setTimeout(connectWebSocket, retryInterval);
       } else {
         console.error(`Max retries (${maxRetries}) reached. Stopping reconnection attempts.`);
@@ -485,15 +421,7 @@ const Dashboard: React.FC = () => {
         const isMaximized = targetElement.classList.contains('maximized-stream');
         
         let perfStatsElem = null;
-        if (targetId === 'kitchen-stream') {
-          perfStatsElem = document.getElementById('kitchen-perf');
-        } else if (targetId === 'living-room-stream') {
-          perfStatsElem = document.getElementById('living-room-perf');
-        }
-        
-        // Reset all videos to normal state first
-        document.querySelectorAll('.maximized-stream').forEach(stream => {
-          stream.classList.remove('maximized-stream');
+        let perfStatsElem = document.querySelector(`[data-perf="${targetId}"]`);
         });
         
         // Reset all buttons to normal state
@@ -674,23 +602,16 @@ const Dashboard: React.FC = () => {
 
       <main>
         <div className="video-section">
-          <div className="video-container">
-            <h2>Kitchen</h2>
-            <div className="video-wrapper">
-              <img id="kitchen-stream" src="" alt="Kitchen Stream" width="640" height="360" />
-              <button className="fullscreen-btn" data-target="kitchen-stream">Max</button>
+          {Object.entries(frames).map(([camId, src]) => (
+            <div className="video-container" key={camId}>
+              <h2>{camId}</h2>
+              <div className="video-wrapper">
+                <img id={`stream-${camId}`} src={src} alt={camId} width="640" height="360" />
+                <button className="fullscreen-btn" data-target={`stream-${camId}`}>Max</button>
+              </div>
+              <div className="perf-stats" data-perf={`stream-${camId}`} style={{ minWidth: '80px', textAlign: 'right' }}>{fpsMap[camId] || 'FPS: 0.0'}</div>
             </div>
-            <div id="kitchen-perf" className="perf-stats" style={{ minWidth: '80px', textAlign: 'right' }}>{kitchenFPS}</div>
-          </div>
-
-          <div className="video-container">
-            <h2>Living Room</h2>
-            <div className="video-wrapper">
-              <img id="living-room-stream" src="" alt="Living Room Stream" width="640" height="360" />
-              <button className="fullscreen-btn" data-target="living-room-stream">Max</button>
-            </div>
-            <div id="living-room-perf" className="perf-stats" style={{ minWidth: '80px', textAlign: 'right' }}>{livingRoomFPS}</div>
-          </div>
+          ))}
         </div>
 
         <div className="stats-section">

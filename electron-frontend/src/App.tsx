@@ -519,8 +519,9 @@ const Dashboard: React.FC = () => {
       button.addEventListener('click', () => handleFullscreen(button));
     });
 
-    // Escape key handler
-    const handleEscape = (event: KeyboardEvent) => {
+    // Keyboard event handler
+    const handleKeydown = (event: KeyboardEvent) => {
+      // Handle Escape key for fullscreen
       if (event.key === 'Escape') {
         document.querySelectorAll('.maximized-stream').forEach(stream => {
           stream.classList.remove('maximized-stream');
@@ -534,12 +535,28 @@ const Dashboard: React.FC = () => {
           stats.classList.remove('perf-stats-maximized');
         });
       }
+      
+      // Handle 'T' key for telemetry drawer toggle
+      if (event.key.toLowerCase() === 't') {
+        // Only trigger if not typing in an input field
+        const activeElement = document.activeElement;
+        const isInputField = activeElement && (
+          activeElement.tagName === 'INPUT' || 
+          activeElement.tagName === 'TEXTAREA' || 
+          (activeElement as HTMLElement).contentEditable === 'true'
+        );
+        
+        if (!isInputField) {
+          event.preventDefault();
+          setDrawerOpen((prev: boolean) => !prev);
+        }
+      }
     };
 
-    document.addEventListener('keydown', handleEscape);
+    document.addEventListener('keydown', handleKeydown);
 
     return () => {
-      document.removeEventListener('keydown', handleEscape);
+      document.removeEventListener('keydown', handleKeydown);
     };
   }, []);
 

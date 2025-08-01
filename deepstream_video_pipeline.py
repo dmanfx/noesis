@@ -22,6 +22,7 @@ import logging
 import threading
 import time
 import queue
+from collections import defaultdict, deque
 
 # Bypass libproxy issues by disabling GIO proxy resolver
 # import os  # Removed duplicate import
@@ -139,8 +140,8 @@ class DeepStreamVideoPipeline:
     """
     
     def __init__(self, rtsp_url: str, config: AppConfig, websocket_port: int = 8765, 
-                 config_file: str = "pipelines/config_infer_primary_yolo11.txt",
-                 preproc_config: str = "pipelines/config_preproc.txt"):
+                         config_file: str = "pipelines/config_infer_primary_yolo11.ini",
+        preproc_config: str = "pipelines/config_preproc.ini"):
         self.rtsp_url = rtsp_url
         self.websocket_port = websocket_port
         self.config_file = config_file
@@ -203,6 +204,19 @@ class DeepStreamVideoPipeline:
         # JPEG queue for GPU-encoded frames when native OSD is enabled
         self.jpeg_queue: queue.Queue[bytes] = queue.Queue(maxsize=30)
         self.start_time = 0  # Will be set in start()
+        
+        # Add tracking history for trail visualization
+        self.trail_history = defaultdict(lambda: deque(maxlen=self.config.visualization.TRAIL_LENGTH))
+        self.trail_visualization_enabled = True # Default to enabled
+        
+        # --- trail visualisation state ---
+        self.trail_last_seen: Dict[int, float] = {}
+        # seconds to keep a disappeared track's trail (configurable)
+        self.trail_timeout_s: float = self.config.visualization.TRAIL_TIMEOUT_S
+        # draw only on every Nth frame (≥1)
+        self.trail_draw_stride: int = self.config.visualization.TRAIL_DRAW_STRIDE
+        # show labels in trail visualization ONLY if enabled in config
+        self.trail_show_labels: bool = self.config.visualization.TRAIL_SHOW_LABELS
         
         # Initialize tracking state for telemetry
         self.live_tracking_state: Dict[str, Any] = {
@@ -602,7 +616,7 @@ class DeepStreamVideoPipeline:
             except StopIteration:
                 break
         
-        if removed_count > 0 and self.frame_count <= 300:
+        if removed_count > 4 and self.frame_count <= 300:
             self.logger.info(f"Frame {self.frame_count}: Removed {removed_count} objects from exclusion zone.")
 
         return Gst.PadProbeReturn.OK
@@ -691,18 +705,27 @@ class DeepStreamVideoPipeline:
             # Post-tracker analytics
             nvdsanalytics_post.set_property("unique-id", 201)
             nvdsanalytics_post.set_property("config-file", "pipelines/config_nvdsanalytics_post.ini")
+            
+            # Telemetry Probe for metadata extraction
+            analytics_src_pad = nvdsanalytics_post.get_static_pad("src")
+            if not analytics_src_pad: raise RuntimeError("Failed to get nvdsanalytics_post source pad")
+            analytics_src_pad.add_probe(Gst.PadProbeType.BUFFER, self._analytics_probe, 0)
+            self.logger.info("✅ Added buffer probe to nvdsanalytics_post source pad for telemetry extraction")
                 
+            nvosd.set_property('process-mode', 1)
+            nvosd.set_property('display-text', 1)
+            
             # Pad probe to remove excluded objects
             exclude_src_pad = nvdsanalytics_exclude.get_static_pad("src")
             if not exclude_src_pad: raise RuntimeError("Failed to get nvdsanalytics_exclude source pad")
             exclude_src_pad.add_probe(Gst.PadProbeType.BUFFER, self._remove_excluded_objects_probe, None)
             self.logger.info("✅ Added buffer probe to nvdsanalytics_exclude source pad for object removal")
             
-            # OSD Sink Pad Probe for final metadata
-            osd_src_pad = nvosd.get_static_pad("src")
-            if not osd_src_pad: raise RuntimeError("Failed to get OSD source pad")
-            osd_src_pad.add_probe(Gst.PadProbeType.BUFFER, self.osd_sink_pad_buffer_probe, 0)
-            self.logger.info("✅ Added buffer probe to OSD source pad for metadata extraction")
+            # OSD Sink Pad Probe for trail visualization
+            osd_sink_pad = nvosd.get_static_pad("sink")
+            if not osd_sink_pad: raise RuntimeError("Failed to get OSD sink pad")
+            osd_sink_pad.add_probe(Gst.PadProbeType.BUFFER, self._osd_sink_pad_buffer_probe, 0)
+            self.logger.info("✅ Added buffer probe to OSD sink pad for trail visualization")
 
             # JPEG sink configuration
             caps_post_osd.set_property("caps", Gst.Caps.from_string("video/x-raw(memory:NVMM), format=I420"))
@@ -878,65 +901,25 @@ class DeepStreamVideoPipeline:
         return Gst.FlowReturn.OK
     
     def _analytics_probe(self, pad, info, user_data):
-        """Phase 3.1: Probe to capture analytics metadata from nvdsanalytics"""
-        try:
-            gst_buffer = info.get_buffer()
-            if not gst_buffer:
-                return Gst.PadProbeReturn.OK
-                
-            # Get batch metadata
-            batch_meta = pyds.gst_buffer_get_nvds_batch_meta(hash(gst_buffer))  # type: ignore
-            if not batch_meta:
-                return Gst.PadProbeReturn.OK
-                
-            # Process frame metadata for analytics
-            frame_meta_list = batch_meta.frame_meta_list
-            while frame_meta_list:
-                frame_meta = pyds.NvDsFrameMeta.cast(frame_meta_list.data)  # type: ignore
-
-                # Extract analytics frame metadata
-                analytics_frame_data = self._extract_analytics_frame_meta(frame_meta)
-                if analytics_frame_data:
-                    self.rate_limited_logger.debug(
-                        f"📊 Analytics Frame {frame_meta.frame_num}: {analytics_frame_data}"
-                    )
-
-                # Extract analytics object metadata
-                obj_meta_list = frame_meta.obj_meta_list
-                while obj_meta_list:
-                    obj_meta = pyds.NvDsObjectMeta.cast(obj_meta_list.data)  # type: ignore
-                    analytics_obj_data = self._extract_analytics_obj_meta(obj_meta)
-                    if analytics_obj_data:
-                        self.rate_limited_logger.debug(
-                            f"📊 Analytics Object {obj_meta.object_id}: {analytics_obj_data}"
-                        )
-
-                    try:
-                        obj_meta_list = obj_meta_list.next
-                    except StopIteration:
-                        break
-
-                # Update live tracking state using existing parsing logic
-                # Only needed when using native OSD mode because _on_new_sample
-                # already updates tracking for the Python appsink path
-                if self.config.visualization.USE_NATIVE_DEEPSTREAM_OSD:
-                    try:
-                        self._parse_obj_meta(frame_meta)
-                    except Exception as e:
-                        self.logger.debug(
-                            f"Error updating tracking state from analytics probe: {e}"
-                        )
-
-                try:
-                    frame_meta_list = frame_meta_list.next
-                except StopIteration:
-                    break
-                    
+        """Probe to extract telemetry data after analytics."""
+        gst_buffer = info.get_buffer()
+        if not gst_buffer:
             return Gst.PadProbeReturn.OK
-            
-        except Exception as e:
-            self.logger.error(f"Error in analytics probe: {e}")
+
+        batch_meta = pyds.gst_buffer_get_nvds_batch_meta(hash(gst_buffer))
+        if not batch_meta:
             return Gst.PadProbeReturn.OK
+
+        l_frame = batch_meta.frame_meta_list
+        while l_frame:
+            try:
+                frame_meta = pyds.NvDsFrameMeta.cast(l_frame.data)
+                # This call updates self.live_tracking_state for telemetry
+                self._parse_obj_meta(frame_meta)
+                l_frame = l_frame.next
+            except StopIteration:
+                break
+        return Gst.PadProbeReturn.OK
     
     def _extract_tensor_from_meta(self, tensor_meta, source_id: int) -> Optional[torch.Tensor]:
         """Extract tensor from custom preprocessing metadata (type 27)"""
@@ -1385,7 +1368,8 @@ class DeepStreamVideoPipeline:
             self.live_tracking_state['transitions'] = self.live_tracking_state['transitions'][-100:]
         
         # Debug logging for tracking state
-        self.logger.debug(f"📊 Final tracking state - Active tracks: {len(active_tracks)}, Occupancy: {occupancy}, Transitions: {len(transitions)}")
+        if len(active_tracks) > 0:
+            self.logger.debug(f"📊 Final tracking state - Active tracks: {len(active_tracks)}, Occupancy: {occupancy}, Transitions: {len(transitions)}")
         if active_tracks:
             self.logger.debug(f"📊 Active tracks sample: {active_tracks[:2]}")  # Show first 2 tracks
         if occupancy:
@@ -1762,41 +1746,124 @@ class DeepStreamVideoPipeline:
             self.logger.error(f"❌ Failed to update target classes: {e}")
             return False
 
-    def osd_sink_pad_buffer_probe(self, pad, info, u_data):
-        """Pad probe function to extract metadata from the buffer."""
-        try:
-            gst_buffer = info.get_buffer()
-            if not gst_buffer:
-                return Gst.PadProbeReturn.OK
+    def toggle_trail_visualization(self, enabled: bool):
+          self.set_trail_visualization(enabled)
 
-            # Increment frame count here as this probe sees every frame
-            with self.frame_count_lock:
-                self.frame_count += 1
-            
-            if self.frame_count % 30 == 0:
-                self.logger.info(f"📹 Probe processing frame {self.frame_count}")
+    def set_trail_visualization(self, enabled: bool):
+        """Enable or disable trail visualization in real-time."""
+        self.logger.info(f"Setting trail visualization to: {enabled}")
+        self.trail_visualization_enabled = enabled
+        if not enabled:
+            # Clear history when disabling to prevent stale trails on re-enable
+            self.trail_history.clear()
+            self.trail_last_seen.clear()
 
-            batch_meta = pyds.gst_buffer_get_nvds_batch_meta(hash(gst_buffer))
-            if not batch_meta:
-                return Gst.PadProbeReturn.OK
-
-            l_frame = batch_meta.frame_meta_list
-            while l_frame:
-                try:
-                    frame_meta = pyds.NvDsFrameMeta.cast(l_frame.data)
-                    # This function will now populate self.live_tracking_state
-                    self._parse_obj_meta(frame_meta)
-                except StopIteration:
-                    break
-                try:
-                    l_frame = l_frame.next
-                except StopIteration:
-                    break
-            
+    def _osd_sink_pad_buffer_probe(self, pad, info, _):
+        """Probe to draw trails for tracked objects before OSD rendering."""
+        # Phase 0: early outs
+        if not self.trail_visualization_enabled:
+            self.trail_history.clear()
+            self.trail_last_seen.clear()
             return Gst.PadProbeReturn.OK
-        except Exception as e:
-            self.logger.error(f"Error in OSD probe: {e}")
+
+        gst_buffer = info.get_buffer()
+        if not gst_buffer:
             return Gst.PadProbeReturn.OK
+        batch_meta = pyds.gst_buffer_get_nvds_batch_meta(hash(gst_buffer))
+        if not batch_meta:
+            return Gst.PadProbeReturn.OK
+
+        now = time.time()
+
+        # Phase 1 ─ Update histories from current detections
+        l_frame = batch_meta.frame_meta_list
+        while l_frame:
+            frame_meta = pyds.NvDsFrameMeta.cast(l_frame.data)
+            l_obj = frame_meta.obj_meta_list
+            while l_obj:
+                obj_meta = pyds.NvDsObjectMeta.cast(l_obj.data)
+                tid = obj_meta.object_id
+                if tid != -1:
+                    cx = obj_meta.rect_params.left + obj_meta.rect_params.width / 2
+                    cy = obj_meta.rect_params.top  + obj_meta.rect_params.height
+                    self.trail_history[tid].append((cx, cy))
+                    self.trail_last_seen[tid] = now
+                l_obj = l_obj.next
+            l_frame = l_frame.next
+
+        # Phase 2 ─ Prune stale tracks
+        for tid in [
+            t for t, ts in list(self.trail_last_seen.items())
+            if now - ts > self.trail_timeout_s
+        ]:
+            self.trail_last_seen.pop(tid, None)
+            self.trail_history.pop(tid, None)
+
+
+
+        # ────────────────── Phase 3 ─ Draw all trails into one overlay
+        l_frame = batch_meta.frame_meta_list
+        while l_frame:
+            frame_meta = pyds.NvDsFrameMeta.cast(l_frame.data)
+
+            display_meta = pyds.nvds_acquire_display_meta_from_pool(batch_meta)
+            if not display_meta:                 # pool exhausted – skip
+                l_frame = l_frame.next
+                continue
+            display_meta.num_lines  = 0
+            display_meta.num_labels = 0
+
+            active_ids = [tid for tid, pts in self.trail_history.items()
+                          if len(pts) > 1]
+
+            budget_per_track = (250 // len(active_ids)) if active_ids else 250
+            budget_per_track = max(1, budget_per_track)
+
+            for tid in active_ids:
+                pts = list(self.trail_history[tid])[-(min(self.config.visualization.TRAIL_DRAW_SEGMENTS, budget_per_track) + 1):]
+
+                # draw segments
+                for idx in range(len(pts) - 1):  # -1 because we access idx+1
+                    if display_meta.num_lines >= 250:
+                        break
+                    
+                    # Check if we have enough line_params available
+                    if display_meta.num_lines >= len(display_meta.line_params):
+                        break
+
+                    x1, y1 = pts[idx]
+                    x2, y2 = pts[idx + 1]
+
+                    lp = display_meta.line_params[display_meta.num_lines]
+                    lp.line_width = 3
+                    lp.x1, lp.y1, lp.x2, lp.y2 = map(int, (x1, y1, x2, y2))
+                    alpha = max((idx + 1) / len(pts), 0.6)
+                    lp.line_color.set(1.0, 1.0, 0.0, alpha)   # bright yellow
+                    display_meta.num_lines += 1
+
+                # optional label
+                if (self.trail_show_labels
+                        and display_meta.num_labels < 16
+                        and display_meta.num_lines < 250
+                        and display_meta.num_labels < len(display_meta.text_params)):
+                    tp = display_meta.text_params[display_meta.num_labels]
+                    tp.display_text = f"id {tid}"
+                    tp.x_offset, tp.y_offset = map(int, pts[-1])
+                    tp.font_params.font_name = "Serif"
+                    tp.font_params.font_size = 12
+                    tp.font_params.font_color.set(1.0, 1.0, 0.0, 1.0)
+                    tp.set_bg_clr = 0
+                    display_meta.num_labels += 1
+
+                if display_meta.num_lines >= 250:
+                    break
+
+            pyds.nvds_add_display_meta_to_frame(frame_meta, display_meta)
+            l_frame = l_frame.next
+
+        return Gst.PadProbeReturn.OK
+
+
 
 
 def create_deepstream_video_processor(
@@ -1825,8 +1892,8 @@ def create_deepstream_video_processor(
         rtsp_url=source_url,
         config=config,
         websocket_port=8765,
-        config_file="pipelines/config_infer_primary_yolo11.txt",
-        preproc_config="pipelines/config_preproc.txt"
+        config_file="pipelines/config_infer_primary_yolo11.ini",
+        preproc_config="pipelines/config_preproc.ini"
     )
 
 

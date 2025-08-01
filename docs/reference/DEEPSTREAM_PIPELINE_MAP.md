@@ -120,6 +120,15 @@ deepstream_video_pipeline.py:
 │                                                                                                             │
 │ nvdsosd - DeepStream's on-screen display element that overlays bounding boxes, labels, and tracking information directly on video frames using GPU rendering.                                                                                          │
 │ ├── gpu-id: 0                                                                                               │
+│ ├── Pad Probe: _osd_sink_pad_buffer_probe()                                                                │
+│ ├── Motion Trail Visualization:                                                                             │
+│ │   ├── Trail History: self.trail_history[track_id] (deque with maxlen=TRAIL_LENGTH)                       │
+│ │   ├── Trail Timeout: self.trail_last_seen[track_id] (TRAIL_TIMEOUT_S expiry)                             │
+│ │   ├── Draw Stride: config.visualization.TRAIL_DRAW_STRIDE (every Nth frame)                              │
+│ │   ├── Line Budget: 250 lines divided across active tracks (TRAIL_DRAW_SEGMENTS per track)                │
+│ │   ├── Line Rendering: NvOSD_LineParams with bright yellow fade (min 0.6 alpha)                           │
+│ │   ├── Optional Labels: Track ID labels via NvOSD_TextParams (TRAIL_SHOW_LABELS)                          │
+│ │   └── GPU Memory: Zero-copy via pyds.nvds_add_display_meta_to_frame()                                    │
 │ └── On-screen display for visualization                                                                     │
 │                                                                                                             │
 │ Conditional Output Paths:                                                                                   │

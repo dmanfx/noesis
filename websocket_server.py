@@ -16,7 +16,8 @@ class WebSocketServer:
         port: int = 6008,
         event_loop: Optional[asyncio.AbstractEventLoop] = None,
         stats_callback: Optional[Callable[[], Dict[str, Any]]] = None,
-        toggle_callback: Optional[Callable[[str, bool], None]] = None
+        toggle_callback: Optional[Callable[[str, bool], None]] = None,
+        initial_trail_state: bool = True
     ):
         """Initialize the WebSocket server
         
@@ -26,12 +27,14 @@ class WebSocketServer:
             event_loop: Optional asyncio event loop
             stats_callback: Optional callback to get statistics
             toggle_callback: Optional callback to handle toggle updates
+            initial_trail_state: The initial state of the trail visualization
         """
         self.host = host
         self.port = port
         self.event_loop = event_loop
         self.stats_callback = stats_callback
         self.toggle_callback = toggle_callback
+        self.initial_trail_state = initial_trail_state
         self.connected_clients = set()
         self.server = None
         self.server_task = None
@@ -155,6 +158,17 @@ class WebSocketServer:
                         self.logger.info(f"Sent initial detection config to {client_ip}")
                 except Exception as e:
                     self.logger.warning(f"Could not send initial detection config to {client_ip}: {e}")
+
+            # Send initial trail visualization state to new client
+            try:
+                initial_trail_message = {
+                    'type': 'trail_visualization_enabled_update',
+                    'enabled': self.initial_trail_state
+                }
+                await websocket.send(json.dumps(initial_trail_message))
+                self.logger.info(f"Sent initial trail visualization state ({self.initial_trail_state}) to {client_ip}")
+            except Exception as e:
+                self.logger.warning(f"Could not send initial trail visualization state to {client_ip}: {e}")
             
             # Process messages from client
             async for message in websocket:
@@ -452,5 +466,4 @@ class WebSocketClient:
             self.logger.error(f"Listen error: {e}")
         finally:
             self.running = False 
-    
     

@@ -15,6 +15,7 @@ const Dashboard: React.FC = () => {
   const [transitions, setTransitions] = useState('<li>Loading...</li>');
   const [kitchenFPS, setKitchenFPS] = useState('FPS: 0.0');
   const [livingRoomFPS, setLivingRoomFPS] = useState('FPS: 0.0');
+  const [trailVisualizationEnabled, setTrailVisualizationEnabled] = useState(true);
   
   const socketRef = useRef<WebSocket | null>(null);
   const retryCountRef = useRef(0);
@@ -341,6 +342,17 @@ const Dashboard: React.FC = () => {
     }
   };
 
+  const sendTrailToggle = (enabled: boolean) => {
+    if (socketRef.current && socketRef.current.readyState === WebSocket.OPEN) {
+      const message = {
+        type: 'set_vis_toggle',
+        toggle_name: 'trail_visualization_enabled',
+        enabled: enabled,
+      };
+      socketRef.current.send(JSON.stringify(message));
+    }
+  };
+
   const connectWebSocket = () => {
     console.log(`Attempting to connect to ${WS_URL}...`);
     setConnectionStatus(`Connecting to ${WS_URL}...`);
@@ -422,6 +434,8 @@ const Dashboard: React.FC = () => {
           } else if (data.type === 'detection_toggle_update') {
             // console.log('[WebSocket] Received detection toggle update:', data);
             // Handle detection toggle update
+          } else if (data.type === 'trail_visualization_enabled_update') {
+            setTrailVisualizationEnabled(data.enabled);
           } else {
             // console.log('[WebSocket] Received unknown JSON message format:', data);
           }
@@ -560,82 +574,7 @@ const Dashboard: React.FC = () => {
     };
   }, []);
 
-  // Detection controls effect
-  useEffect(() => {
-    const sendDetectionToggle = (toggleName: string, enabled: boolean) => {
-      if (socketRef.current && socketRef.current.readyState === WebSocket.OPEN) {
-        const message = {
-          type: 'set_detection_toggle',
-          toggle_name: toggleName,
-          enabled: enabled
-        };
-        console.log('Sending detection toggle message:', message);
-        socketRef.current.send(JSON.stringify(message));
-      }
-    };
 
-    const sendDetectionConfig = (config: any) => {
-      if (socketRef.current && socketRef.current.readyState === WebSocket.OPEN) {
-        const message = {
-          type: 'update_detection_config',
-          config: config
-        };
-        console.log('Sending detection config message:', message);
-        socketRef.current.send(JSON.stringify(message));
-      }
-    };
-
-    // Detection type toggles
-    const toggleDetectPeople = document.getElementById('toggle-detect-people') as HTMLInputElement;
-    if (toggleDetectPeople) {
-      toggleDetectPeople.addEventListener('change', (event) => {
-        sendDetectionToggle('detect_people', (event.target as HTMLInputElement).checked);
-      });
-    }
-    
-    const toggleDetectVehicles = document.getElementById('toggle-detect-vehicles') as HTMLInputElement;
-    if (toggleDetectVehicles) {
-      toggleDetectVehicles.addEventListener('change', (event) => {
-        sendDetectionToggle('detect_vehicles', (event.target as HTMLInputElement).checked);
-      });
-    }
-    
-    const toggleDetectFurniture = document.getElementById('toggle-detect-furniture') as HTMLInputElement;
-    if (toggleDetectFurniture) {
-      toggleDetectFurniture.addEventListener('change', (event) => {
-        sendDetectionToggle('detect_furniture', (event.target as HTMLInputElement).checked);
-      });
-    }
-    
-    // Detection settings sliders
-    const confidenceThreshold = document.getElementById('confidence-threshold') as HTMLInputElement;
-    const confidenceValue = document.getElementById('confidence-value');
-    if (confidenceThreshold && confidenceValue) {
-      confidenceThreshold.addEventListener('input', (event) => {
-        const value = parseFloat((event.target as HTMLInputElement).value);
-        confidenceValue!.textContent = value.toFixed(2);
-        sendDetectionConfig({ confidence_threshold: value });
-      });
-    }
-    
-    const iouThreshold = document.getElementById('iou-threshold') as HTMLInputElement;
-    const iouValue = document.getElementById('iou-value');
-    if (iouThreshold && iouValue) {
-      iouThreshold.addEventListener('input', (event) => {
-        const value = parseFloat((event.target as HTMLInputElement).value);
-        iouValue!.textContent = value.toFixed(2);
-        sendDetectionConfig({ iou_threshold: value });
-      });
-    }
-    
-    // Detection enable/disable toggle
-    const toggleDetectionEnabled = document.getElementById('toggle-detection-enabled') as HTMLInputElement;
-    if (toggleDetectionEnabled) {
-      toggleDetectionEnabled.addEventListener('change', (event) => {
-        sendDetectionConfig({ detection_enabled: (event.target as HTMLInputElement).checked });
-      });
-    }
-  }, []);
 
   // Collapsible controls effect
   useEffect(() => {
@@ -767,6 +706,25 @@ const Dashboard: React.FC = () => {
                   Enable Detection
                 </label>
               </div>
+            </div>
+            <div className="settings-group">
+                <h4>Visualization Settings</h4>
+                <div className="setting-item">
+                    <label className="toggle-label">
+                                                                        <input
+                            type="checkbox"
+                            id="toggle-trail-visualization"
+                            checked={trailVisualizationEnabled}
+                            onChange={(e) => {
+                                const enabled = e.target.checked;
+                                setTrailVisualizationEnabled(enabled);
+                                sendTrailToggle(enabled);
+                            }}
+                        />
+                        <span className="toggle-slider"></span>
+                        Enable Object Trails
+                    </label>
+                </div>
             </div>
           </div>
         </div>

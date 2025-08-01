@@ -238,6 +238,11 @@ class DeepStreamProcessorWrapper:
             self.logger.error(f"Error converting to AnalysisFrame: {e}")
             return None
     
+    def set_trail_visualization(self, enabled: bool):
+        """Enable or disable trail visualization in real-time."""
+        if self.processor:
+            self.processor.set_trail_visualization(enabled)
+
     def get_pipeline_stats(self) -> dict:
         """Return stats directly from the underlying DeepStreamVideoPipeline."""
         if self.processor and hasattr(self.processor, 'get_stats'):
@@ -293,6 +298,11 @@ class DeepStreamProcessorWrapper:
         if self.processor and hasattr(self.processor, 'update_target_classes'):
             return self.processor.update_target_classes(target_classes)
         return False
+
+    def set_trail_visualization(self, enabled: bool):
+        """Pass-through to enable/disable trail visualization in the pipeline."""
+        if self.processor and hasattr(self.processor, 'set_trail_visualization'):
+            self.processor.set_trail_visualization(enabled)
 
 # Import TensorRT shutdown mode function
 try:
@@ -454,7 +464,8 @@ class ApplicationManager:
             port=self.config.websocket.PORT,
             event_loop=self.event_loop,
             stats_callback=self._get_stats,
-            toggle_callback=self._handle_toggle_update
+            toggle_callback=self._handle_toggle_update,
+            initial_trail_state=self.config.visualization.TRAIL_VISUALIZATION_ENABLED
         )
         
         # Add detection configuration callbacks
@@ -489,9 +500,10 @@ class ApplicationManager:
         if self.config.cameras.VIDEO_FILES:
             for i, video_file in enumerate(self.config.cameras.VIDEO_FILES):
                 if os.path.exists(video_file):
-                    camera_id = f"video_{i}"
+                    # Hardcode camera_id to 'rtsp_1' to route to the "Kitchen" player on the frontend
+                    camera_id = "rtsp_1"
                     self.camera_sources[camera_id] = video_file
-                    self.logger.info(f"Added video file as source: {video_file}")
+                    self.logger.info(f"Added video file as source: {video_file} with ID {camera_id}")
                 else:
                     self.logger.warning(f"Video file not found: {video_file}")
         
@@ -805,7 +817,7 @@ class ApplicationManager:
             # Construct binary message
             self.logger.debug(f"Camera ID length: {camera_id_length}, Camera ID bytes: {len(camera_id_bytes)}, JPEG data type: {type(jpeg_data)}, JPEG data length: {len(jpeg_data)}")
             binary_message = bytes([camera_id_length]) + camera_id_bytes + jpeg_data
-            self.logger.debug(f"Binary message type: {type(binary_message)}, length: {len(binary_message)}")
+            #self.logger.debug(f"Binary message type: {type(binary_message)}, length: {len(binary_message)}")
             
             # Broadcast frame via WebSocket with profiling  
             if self.websocket_server:
@@ -951,7 +963,10 @@ class ApplicationManager:
         self.logger.info(f"Handling toggle update: {toggle_name} = {enabled}")
         
         # Update visualization configuration
-        if hasattr(self.config.visualization, toggle_name.upper()):
+        if toggle_name == "trail_visualization_enabled":
+            for processor in self.frame_processors.values():
+                processor.set_trail_visualization(enabled)
+        elif hasattr(self.config.visualization, toggle_name.upper()):
             setattr(self.config.visualization, toggle_name.upper(), enabled)
             self.logger.info(f"Updated visualization config: {toggle_name.upper()} = {enabled}")
         else:
@@ -1230,15 +1245,25 @@ def update_config_from_args(args):
     # Camera options
     if args.webcam:
         config.cameras.USE_WEBCAM = True
-    if args.video:
+        # Disable other sources when webcam is used
+        config.cameras.VIDEO_FILES = []
+        config.cameras.RTSP_STREAMS = []
+    elif args.video:
         config.cameras.VIDEO_FILES = [args.video]
-    if args.rtsp:
+        # Disable other sources when video file is used
+        config.cameras.USE_WEBCAM = False
+        config.cameras.RTSP_STREAMS = []
+    elif args.rtsp:
         config.cameras.RTSP_STREAMS = [{
-        "name": "Command Line Stream",
-        "url": args.rtsp,
-        "width": 1920,  # Default resolution
-        "height": 1080
-    }]
+            "name": "Command Line Stream",
+            "url": args.rtsp,
+            "width": 1920,  # Default resolution
+            "height": 1080,
+            "enabled": True
+        }]
+        # Disable other sources when RTSP is used
+        config.cameras.USE_WEBCAM = False
+        config.cameras.VIDEO_FILES = []
     
     # Processing options
     if args.gpu_device:
@@ -1280,8 +1305,9 @@ def update_config_from_args(args):
         config.processing.ENABLE_GPU_PREPROCESSING = True
     if args.force_gpu_only:
         config.models.FORCE_GPU_ONLY = True
-    if args.use_unified_pipeline:
-        config.processing.USE_UNIFIED_GPU_PIPELINE = True
+    # DEPRECATED: Unified pipeline option removed - DeepStream-only now
+    # if args.use_unified_pipeline:
+    #     config.processing.USE_UNIFIED_GPU_PIPELINE = True
     
     # WebSocket options
     if args.websocket_host:

@@ -49,19 +49,13 @@ class PipelineManager:
         Enforces mutual exclusion between pipeline types.
         """
         with self.pipeline_lock:
-            # Force unified GPU pipeline if enabled
-            if getattr(config.processing, 'USE_UNIFIED_GPU_PIPELINE', True):
-                if not self._validate_unified_gpu_requirements(config):
-                    raise RuntimeError("Unified GPU pipeline requirements not met")
-                
-                self.active_pipeline = PipelineType.UNIFIED_GPU
-                self.logger.info("✅ Selected Unified GPU Pipeline (forced single pipeline)")
-                return PipelineType.UNIFIED_GPU
+            # DeepStream-only pipeline (unified pipeline concept deprecated)
+            if not self._validate_deepstream_requirements(config):
+                raise RuntimeError("DeepStream pipeline requirements not met")
             
-            # Legacy pipeline selection (deprecated)
-            self.logger.warning("⚠️ Legacy pipeline mode - should migrate to Unified GPU")
-            self.active_pipeline = PipelineType.NVDEC_LEGACY
-            return PipelineType.NVDEC_LEGACY
+            self.active_pipeline = PipelineType.UNIFIED_GPU  # Keep enum for compatibility
+            self.logger.info("✅ Selected DeepStream Pipeline")
+            return PipelineType.UNIFIED_GPU
     
     def register_processor(self, camera_id: str, processor) -> bool:
         """Register a processor instance to prevent conflicts"""
@@ -86,9 +80,13 @@ class PipelineManager:
         with self.pipeline_lock:
             return self.active_processors.copy()
     
-    def _validate_unified_gpu_requirements(self, config) -> bool:
-        """Validate requirements for unified GPU pipeline"""
+    def _validate_deepstream_requirements(self, config) -> bool:
+        """Validate requirements for DeepStream pipeline"""
         requirements = []
+        
+        # Check DeepStream is enabled
+        if not getattr(config.processing, 'ENABLE_DEEPSTREAM', False):
+            requirements.append("DeepStream not enabled")
         
         # Check CUDA availability
         try:
@@ -106,15 +104,11 @@ class PipelineManager:
         if not getattr(config.models, 'FORCE_GPU_ONLY', False):
             requirements.append("GPU-only mode not enabled")
         
-        # Check GPU preprocessing
-        if not getattr(config.processing, 'ENABLE_GPU_PREPROCESSING', False):
-            requirements.append("GPU preprocessing not enabled")
-        
         if requirements:
-            self.logger.error(f"❌ Unified GPU pipeline requirements failed: {requirements}")
+            self.logger.error(f"❌ DeepStream pipeline requirements failed: {requirements}")
             return False
         
-        self.logger.info("✅ Unified GPU pipeline requirements validated")
+        self.logger.info("✅ DeepStream pipeline requirements validated")
         return True
     
     def force_cleanup(self):

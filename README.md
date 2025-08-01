@@ -14,6 +14,7 @@ Noesis is a high-performance, real-time video analytics application designed for
     - **Line Crossing Detection**: Trigger events when objects cross a virtual line.
     - **Direction Detection**: Analyze the direction of object movement.
     - **Overcrowding Detection**: Monitor the number of objects in a defined area.
+- **Motion-Trail Visualization**: Draw persistent, fading trails behind tracked objects (GPU-rendered via `nvdsosd`) with configurable length, opacity, stride, and optional labels. Features intelligent line budget allocation and frame-rate optimization.
 - **Real-time Streaming**: Processed video and metadata are streamed in real-time to a web-based frontend via WebSockets, allowing for remote monitoring and control.
 - **Configurable Architecture**: Noesis is highly configurable, with the ability to toggle between native DeepStream components and custom Python-based logic for tasks like object tracking and visualization.
 - **Robust and Scalable**: Designed for production environments, with features like automatic pipeline recovery, health monitoring, and support for multiple camera streams.

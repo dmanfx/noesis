@@ -89,6 +89,19 @@ graph TD
 - The pipeline logs which path is used for both tracking and visualization.
 - This helps verify correct mode in production.
 
+### Motion Trail Visualization (NEW)
+- Each tracked object leaves a GPU-drawn trail rendered by `nvdsosd`.
+- Trail length, fade rate, and draw stride are configurable via:
+  - `config.visualization.TRAIL_LENGTH` (max trail points per track)
+  - `config.visualization.TRAIL_TIMEOUT_S` (seconds to keep trails after object disappears)
+  - `config.visualization.TRAIL_DRAW_STRIDE` (draw every Nth frame for performance)
+  - `config.visualization.TRAIL_DRAW_SEGMENTS` (max line segments to render per trail)
+  - `config.visualization.TRAIL_SHOW_LABELS` (show track ID labels on trails)
+- Intelligent line budget allocation: divides 250 available lines across active tracks
+- Frame-rate optimization: skips trail rendering on non-stride frames
+- Trails persist for up to 10 s after the object disappears and are pruned automatically
+- Bright yellow trails with fade effect (minimum 0.6 opacity for visibility)
+
 ---
 
 ## Overview

@@ -130,6 +130,9 @@ def setup_logging(log_level: int = logging.INFO, log_file: Optional[str] = None)
         datefmt='%Y-%m-%d %H:%M:%S'
     )
     
+    #Set logging level for websocket.server
+    logging.getLogger('websockets.server').setLevel(logging.WARNING)
+
     # Configure root logger
     root_logger = logging.getLogger()
     root_logger.setLevel(log_level)

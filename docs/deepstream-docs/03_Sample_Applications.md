@@ -3,7 +3,7 @@
 This document provides a guide to the most relevant DeepStream sample applications, focusing on the Python examples. Each entry includes a summary of the concepts it demonstrates, helping you quickly identify which sample to consult for a specific task.
 
 The Python samples are typically located in:
-`/opt/nvidia/deepstream/deepstream/sources/python/apps/`
+`/opt/nvidia/deepstream/deepstream/sources/apps/sample_apps/`
 
 ---
 

@@ -246,9 +246,8 @@ class PerformanceTestBase(unittest.TestCase):
             # Two camera test
             config['cameras']['RTSP_STREAMS'] = config['cameras']['RTSP_STREAMS'][:2]
             
-        # Ensure GPU pipeline is enabled
-        config['processing']['USE_UNIFIED_GPU_PIPELINE'] = True
-        config['processing']['ENABLE_DECOUPLED_PIPELINE'] = False
+        # Ensure DeepStream pipeline is enabled
+        config['processing']['ENABLE_DEEPSTREAM'] = True
         config['models']['FORCE_GPU_ONLY'] = True
         
         # Save test config

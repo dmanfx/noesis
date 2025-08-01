@@ -36,8 +36,6 @@ class AppConfig:
         LOG_LEVEL: int = 30  # WARNING level for production performance
         LOG_FILE: Optional[str] = "logs/app.log"
         DEBUG: bool = False  # Disable debug mode for performance
-        PERFORMANCE_MODE: bool = True  # Enable performance optimizations
-        ENABLE_DEBUG_LOGGING: bool = False  # Explicit debug control
     
     @dataclass
     class CameraSettings:
@@ -69,18 +67,13 @@ class AppConfig:
         ])
         CAMERA_WIDTH: int = 1920
         CAMERA_HEIGHT: int = 1080
-        FRAME_RATE: int = 30
     
     @dataclass
     class ProcessingSettings:
         """Frame processing settings that control threading, performance, and pipeline behavior"""
         ENABLE_PROCESSING: bool = True
-        ENABLE_THREADING: bool = True
-        ENABLE_MULTIPROCESSING: bool = False  # Keep disabled to avoid process explosion
         MAX_QUEUE_SIZE: int = 20  # OPTIMIZED: Reduced from 30 for lower latency
         ANALYSIS_FRAME_INTERVAL: int = 1  # Process every frame (removed artificial limitation)
-        FRAME_SKIP: int = 0  # No artificial frame skipping (removed limitation)
-        AUTO_FRAME_SKIP: bool = True  # Automatically adjust frame skip based on processing performance
         TARGET_FPS: int = 30  # Realistic target for RTX 3060 (increased from 10)
         ENABLE_PROFILING: bool = False  # Enable profiling to identify CPU usage sources
         
@@ -94,18 +87,13 @@ class AppConfig:
                       
         # Performance and Profiling Settings
         PROFILING_SAMPLING_RATE: int = 100  # OPTIMIZED: Profile every 100th frame (reduced overhead)
-        MEMORY_MONITORING_ENABLED: bool = True  # Enable GPU memory monitoring
-        PERFORMANCE_ALERTS_ENABLED: bool = True  # Enable performance degradation alerts
         
         # GPU Memory Optimization Settings (NEW for Phase 3.1.2)
         GPU_MEMORY_POOL_SIZE_MB: int = 500  # Pre-allocated GPU memory pool size
-        GPU_MEMORY_DEFRAG_INTERVAL: int = 1000  # Defragment memory every N frames
         ENABLE_MEMORY_POOLING: bool = True  # Use memory pooling for GPU operations
         
         # Thread Optimization Settings (NEW for Phase 3.1.2)
         USE_THREAD_AFFINITY: bool = True  # Pin threads to specific CPU cores
-        THREAD_PRIORITY: str = "HIGH"  # Thread priority: "NORMAL", "HIGH", "REALTIME"
-        DECODER_THREAD_PRIORITY: str = "REALTIME"  # NVDEC decoder thread priority
         
                 
         # DeepStream Pipeline Configuration (RECOMMENDED)
@@ -113,14 +101,14 @@ class AppConfig:
         DEEPSTREAM_SOURCE_LATENCY: int = 50  # Reduced latency for real-time processing
         DEEPSTREAM_MUX_BATCH_SIZE: int = 1  # Single frame processing for lower latency
         DEEPSTREAM_MUX_SCALE_MODE: int = 2  # 0=stretch, 1=crop, 2=letter-box
-        DEEPSTREAM_PREPROCESS_CONFIG: str = "pipelines/config_preproc.txt"  # Path to preprocessing config file
+        DEEPSTREAM_PREPROCESS_CONFIG: str = "pipelines/config_preproc.ini"  # Path to preprocessing config file
         DEEPSTREAM_TRACKER_CONFIG: str = "pipelines/tracker_nvdcf.yml"  # Path to tracker config file
         DEEPSTREAM_TRACKER_LIB: str = "/opt/nvidia/deepstream/deepstream/lib/libnvds_nvmultiobjecttracker.so"  # DeepStream tracker library
         DEEPSTREAM_ENABLE_OSD: bool = True  # Enable on-screen display for visualization
         
-        # Unified GPU Pipeline Configuration
-        USE_UNIFIED_GPU_PIPELINE: bool = True  # Enable unified GPU pipeline for optimal performance
-        UNIFIED_PIPELINE_THREADS: Optional[int] = None  # Auto-calculated if None
+        # DEPRECATED: Unified GPU Pipeline Configuration (removed - DeepStream-only now)
+        # USE_UNIFIED_GPU_PIPELINE: bool = True  # Enable unified GPU pipeline for optimal performance
+        # UNIFIED_PIPELINE_THREADS: Optional[int] = None  # Auto-calculated if None
         
         def __post_init__(self):
             """Post-initialization to handle deprecated settings and warnings."""
@@ -229,7 +217,12 @@ class AppConfig:
         TEXT_SCALE: float = 0.5
         TEXT_THICKNESS: int = 1
         TRACE_LENGTH: int = 30
-        TRAIL_LENGTH: int = 50
+        TRAIL_LENGTH: int = 200
+        TRAIL_DRAW_SEGMENTS: int = 100
+        TRAIL_VISUALIZATION_ENABLED: bool = True
+        TRAIL_TIMEOUT_S: float = 10.0  # seconds to keep a disappeared track's trail
+        TRAIL_DRAW_STRIDE: int = 2  # draw every Nth frame (≥1)
+        TRAIL_SHOW_LABELS: bool = False
         
         # Additional visual style settings referenced in logs
         KEYPOINT_RADIUS: int = 3          # Radius for keypoint visualization
@@ -261,6 +254,10 @@ class AppConfig:
             self.KEYPOINT_RADIUS = max(1, self.KEYPOINT_RADIUS)
             self.TRACE_THICKNESS = max(1, self.TRACE_THICKNESS)
             
+            # Validate trail parameters
+            self.TRAIL_TIMEOUT_S = max(0.1, self.TRAIL_TIMEOUT_S)
+            self.TRAIL_DRAW_STRIDE = max(1, self.TRAIL_DRAW_STRIDE)
+            
             # Validate encoding parameters
             self.NVENC_BITRATE = max(1000000, self.NVENC_BITRATE)  # Min 1 Mbps
             self.JPEG_QUALITY = max(1, min(100, self.JPEG_QUALITY))
@@ -276,8 +273,6 @@ class AppConfig:
         TRACK_THRESH: float = 0.25          # Low threshold to create tracks
         TRACK_BUFFER: int = 30              # Frames to keep track without detection  
         MATCH_THRESH: float = 0.75          # IoU threshold for matching
-        FRAME_RATE: int = 30                # Assumed frame rate for tracking
-        
         # TrackingSystem configuration (matches tracking.py)
         INACTIVE_THRESHOLD_SECONDS: float = 1.0   # Time threshold to mark tracks as inactive
         TRACE_PERSISTENCE_SECONDS: float = 5.0    # Time to keep inactive traces
@@ -289,7 +284,7 @@ class AppConfig:
                 "track_thresh": self.TRACK_THRESH,
                 "track_buffer": self.TRACK_BUFFER,
                 "match_thresh": self.MATCH_THRESH,
-                "frame_rate": self.FRAME_RATE,
+                "frame_rate": 30, # Default frame rate for tracking
             }
     
     @dataclass
@@ -297,17 +292,12 @@ class AppConfig:
         """Output settings for saving results to disk (frames, videos, detection data)#save #frame"""
         OUTPUT_DIR: str = "output"
         SAVE_FRAMES: bool = False
-        SAVE_VIDEO: bool = False
         SAVE_DETECTIONS: bool = False
         FRAME_SAVE_INTERVAL: int = 1  # Save every Nth frame
-        VIDEO_FPS: int = 15
-        VIDEO_CODEC: str = "mp4v"
-        JPEG_QUALITY: int = 90
     
     @dataclass
     class WebSocketSettings:
         """WebSocket server settings for broadcasting results to clients"""
-        ENABLE_SERVER: bool = True
         HOST: str = "0.0.0.0"  # Listen on all network interfaces
         PORT: int = 6008
         MAX_CLIENTS: int = 10
@@ -336,19 +326,9 @@ class AppConfig:
             len(self.cameras.VIDEO_FILES)
         )
     
-    def get_unified_pipeline_threads(self) -> int:
-        """
-        Get the number of threads for unified pipeline processing.
-        
-        Returns:
-            Number of threads needed (auto-calculated if not explicitly set)
-        """
-        if self.processing.UNIFIED_PIPELINE_THREADS is not None:
-            return self.processing.UNIFIED_PIPELINE_THREADS
-        
-        # Auto-calculate: one thread per camera source
-        camera_count = self.get_camera_count()
-        return max(1, camera_count)  # At least 1 thread even if no cameras configured
+    # DEPRECATED: get_unified_pipeline_threads method removed
+    # The system now uses DeepStream-only architecture
+    # Threading is handled internally by DeepStream
 
 
 # Create default configuration instance
@@ -515,245 +495,7 @@ def save_config_to_file(config: AppConfig, config_file: str) -> bool:
         return False
 
 
-def validate_unified_pipeline_config(config: AppConfig) -> Dict[str, List[str]]:
-    """
-    Validate configuration for unified GPU pipeline compatibility.
-    Enhanced with Phase 3.1.1 strict GPU-only enforcement.
-    
-    Args:
-        config: Configuration to validate
-        
-    Returns:
-        Dict with 'errors', 'warnings', and 'info' lists
-    """
-    import logging
-    
-    logger = logging.getLogger("config_validation")
-    
-    validation_results = {
-        'errors': [],
-        'warnings': [],
-        'info': []
-    }
-    
-    # Critical requirements for unified GPU pipeline
-    if config.processing.USE_UNIFIED_GPU_PIPELINE:
-        
-        # GPU-only requirements - STRICT ENFORCEMENT
-        if not config.models.FORCE_GPU_ONLY:
-            validation_results['errors'].append(
-                "Unified GPU pipeline requires FORCE_GPU_ONLY=True"
-            )
-        
-        if not config.models.ENABLE_TENSORRT:
-            validation_results['errors'].append(
-                "Unified GPU pipeline requires ENABLE_TENSORRT=True"
-            )
-        
-        # Check for video decoding capability (DeepStream)
-        if not config.processing.ENABLE_DEEPSTREAM:
-            validation_results['errors'].append(
-                "Unified GPU pipeline requires ENABLE_DEEPSTREAM=True for video decoding"
-            )
-        
-        if not config.processing.ENABLE_GPU_PREPROCESSING:
-            validation_results['errors'].append(
-                "Unified GPU pipeline requires ENABLE_GPU_PREPROCESSING=True"
-            )
-        
-        # Incompatible settings that must be disabled
-        
-        if config.processing.ENABLE_MULTIPROCESSING:
-            validation_results['errors'].append(
-                "ENABLE_MULTIPROCESSING must be False when using unified pipeline"
-            )
-        
-        # GPU preprocessing is now the default, no need to check ENABLE_OPTIMIZED_PREPROCESSING
-        
-        # Memory and performance settings validation
-        if config.processing.MAX_QUEUE_SIZE > 30:
-            validation_results['warnings'].append(
-                f"Large queue size ({config.processing.MAX_QUEUE_SIZE}) may increase latency and memory usage"
-            )
-        
-        if config.processing.GPU_BATCH_SIZE > 4:
-            validation_results['warnings'].append(
-                f"Large GPU batch size ({config.processing.GPU_BATCH_SIZE}) may exceed GPU memory"
-            )
-        
-        # NVDEC buffer size is handled by DeepStream automatically
-        
-        # TensorRT configuration validation
-        if not config.models.TENSORRT_FP16:
-            validation_results['warnings'].append(
-                "TENSORRT_FP16=True recommended for optimal performance and memory efficiency"
-            )
-        
-        if config.models.TENSORRT_WORKSPACE_SIZE > 4:
-            validation_results['warnings'].append(
-                f"Large TensorRT workspace ({config.models.TENSORRT_WORKSPACE_SIZE}GB) may reduce available GPU memory"
-            )
-        
-        # Thread configuration validation
-        num_cameras = config.get_camera_count()
-        required_threads = config.get_unified_pipeline_threads()
-        
-        # Only validate if threads are explicitly set (not auto-calculated)
-        if config.processing.UNIFIED_PIPELINE_THREADS is not None:
-            if config.processing.UNIFIED_PIPELINE_THREADS < num_cameras:
-                validation_results['errors'].append(
-                    f"UNIFIED_PIPELINE_THREADS ({config.processing.UNIFIED_PIPELINE_THREADS}) "
-                    f"must be >= number of cameras ({num_cameras})"
-                )
-        else:
-            # Auto-calculation is being used
-            validation_results['info'].append(
-                f"✅ Auto-calculated pipeline threads: {required_threads} (for {num_cameras} cameras)"
-            )
-        
-        # Performance optimization validation
-        if config.processing.ENABLE_PROFILING and config.processing.PROFILING_SAMPLING_RATE < 50:
-            validation_results['warnings'].append(
-                f"Low profiling sampling rate ({config.processing.PROFILING_SAMPLING_RATE}) may impact performance"
-            )
-        
-        # Tracking configuration validation
-        if config.tracking.ENABLE_TRACKING:
-            if config.tracking.TRACK_THRESH <= 0 or config.tracking.TRACK_THRESH > 1:
-                validation_results['errors'].append(
-                    f"TRACK_THRESH ({config.tracking.TRACK_THRESH}) must be between 0 and 1"
-                )
-            
-            if config.tracking.TRACK_BUFFER <= 0:
-                validation_results['errors'].append(
-                    f"TRACK_BUFFER ({config.tracking.TRACK_BUFFER}) must be positive"
-                )
-            
-            if config.tracking.MATCH_THRESH <= 0 or config.tracking.MATCH_THRESH > 1:
-                validation_results['errors'].append(
-                    f"MATCH_THRESH ({config.tracking.MATCH_THRESH}) must be between 0 and 1"
-                )
-            
-            if config.tracking.INACTIVE_THRESHOLD_SECONDS <= 0:
-                validation_results['errors'].append(
-                    f"INACTIVE_THRESHOLD_SECONDS ({config.tracking.INACTIVE_THRESHOLD_SECONDS}) must be positive"
-                )
-        
-        # Information messages
-        validation_results['info'].append(
-            f"✅ Unified GPU pipeline configured for {num_cameras} cameras with {required_threads} threads"
-        )
-        validation_results['info'].append(
-            f"✅ TensorRT FP16: {config.models.TENSORRT_FP16}"
-        )
-        validation_results['info'].append(
-            f"✅ GPU device: {config.models.DEVICE}"
-        )
-        validation_results['info'].append(
-            f"✅ Memory pooling: {'Enabled' if config.processing.ENABLE_MEMORY_POOLING else 'Disabled'}"
-        )
-        validation_results['info'].append(
-            f"✅ Tracking: {'Enabled' if config.tracking.ENABLE_TRACKING else 'Disabled'}"
-        )
-        
-        # Check for deprecated/obsolete settings
-        obsolete_settings = []
-        if hasattr(config.processing, 'PREPROCESSING_THREADS'):
-            obsolete_settings.append("PREPROCESSING_THREADS (unused in GPU-only mode)")
-        if hasattr(config.processing, 'PREPROCESSING_ALGORITHM'):
-            obsolete_settings.append("PREPROCESSING_ALGORITHM (unused in GPU-only mode)")
-        
-        if obsolete_settings:
-            validation_results['info'].append(
-                f"ℹ️  Obsolete settings can be removed: {', '.join(obsolete_settings)}"
-            )
-        
-    else:
-        # Legacy pipeline validation
-        validation_results['warnings'].append("⚠️  Using legacy pipeline - consider migrating to unified GPU pipeline")
-        
-        if config.models.FORCE_GPU_ONLY:
-            validation_results['errors'].append(
-                "FORCE_GPU_ONLY=True is incompatible with legacy pipeline"
-            )
-        
-        if config.processing.ENABLE_MEMORY_POOLING:
-            validation_results['warnings'].append(
-                "Memory pooling is only effective with unified GPU pipeline"
-            )
-    
-    # Log validation results
-    for error in validation_results['errors']:
-        logger.error(f"❌ Configuration Error: {error}")
-    
-    for warning in validation_results['warnings']:
-        logger.warning(f"⚠️  Configuration Warning: {warning}")
-    
-    for info in validation_results['info']:
-        logger.info(f"ℹ️  Configuration Info: {info}")
-    
-    return validation_results
-
-
-def get_pipeline_migration_guide() -> str:
-    """
-    Get migration guide for transitioning to unified GPU pipeline.
-    
-    Returns:
-        String with migration instructions
-    """
-    guide = """
-    📋 Unified GPU Pipeline Migration Guide
-    
-    Required Configuration Changes:
-    
-    1. Processing Settings:
-       - USE_UNIFIED_GPU_PIPELINE = True
-       - FORCE_GPU_ONLY = True
-       - ENABLE_TENSORRT = True
-       - ENABLE_GPU_PREPROCESSING = True
-       - ENABLE_MULTIPROCESSING = False (recommended)
-    
-    2. Hardware Requirements:
-       - NVIDIA GPU with CUDA support
-       - NVDEC support (recommended)
-       - Sufficient GPU memory for all models
-    
-    3. Performance Settings:
-       - TENSORRT_FP16 = True (recommended)
-       - NVDEC_FALLBACK_TO_CPU = False
-       - Adjust UNIFIED_PIPELINE_THREADS based on camera count
-    
-    4. Validation:
-       - Run validate_unified_pipeline_config() before deployment
-       - Test with all cameras to ensure GPU memory sufficiency
-       - Monitor performance metrics during initial deployment
-    
-    Benefits:
-       - Reduced CPU usage (target: 5-10% vs 60-70%)
-       - Eliminated multiprocessing overhead
-       - Improved memory efficiency
-       - Better GPU utilization
-    
-    Rollback:
-       - Set USE_UNIFIED_GPU_PIPELINE = False
-       - Revert FORCE_GPU_ONLY to False if needed
-       - Re-enable ENABLE_MULTIPROCESSING if desired
-    """
-    
-    return guide
-
-
-# Validate configuration on import if unified pipeline is enabled
-if config.processing.USE_UNIFIED_GPU_PIPELINE:
-    validation_results = validate_unified_pipeline_config(config)
-    
-    if validation_results['errors']:
-        import logging
-        logger = logging.getLogger("config")
-        logger.error("❌ Configuration validation failed for unified GPU pipeline")
-        for error in validation_results['errors']:
-            logger.error(f"   - {error}")
-        logger.info("🔧 Run get_pipeline_migration_guide() for help")
-    else:
-        print("✅ Unified GPU pipeline configuration validated successfully")
+# DEPRECATED: Unified GPU pipeline validation functions removed
+# The system now uses DeepStream-only architecture
+# These functions were part of a transitional unified pipeline concept
+# that has been superseded by the DeepStream implementation

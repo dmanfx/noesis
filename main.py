@@ -38,272 +38,6 @@ from deepstream_video_pipeline import create_deepstream_video_processor
 from tracking import TrackingSystem
 from utils import RateLimitedLogger
 
-class DeepStreamProcessorWrapper:
-    """Simple wrapper to provide UnifiedGPUPipeline interface for DeepStream processor"""
-    
-    def __init__(self, camera_id: str, source, config, output_queue=None, websocket_server=None):
-        self.camera_id = camera_id
-        self.source = source
-        self.config = config
-        self.output_queue = output_queue
-        self.websocket_server = websocket_server
-        self.processor = None
-        self.running = False
-        self.frame_count = 0
-        self.logger = logging.getLogger(f"DeepStreamWrapper-{camera_id}")
-        # Use rate-limited logger for performance-critical messages
-        self.rate_limited_logger = RateLimitedLogger(self.logger, rate_limit_seconds=5.0)
-        
-    def start(self) -> bool:
-        """Start the DeepStream processor"""
-        try:
-            self.processor = create_deepstream_video_processor(
-                camera_id=self.camera_id,
-                source=self.source,
-                config=self.config
-            )
-            
-            if not self.processor.start():
-                self.logger.error(f"Failed to start DeepStream processor for {self.camera_id}")
-                return False
-            
-            self.running = True
-            
-            # Start processing thread
-            self.processing_thread = threading.Thread(target=self._processing_loop, daemon=True)
-            self.processing_thread.start()
-            
-            self.logger.info(f"✅ DeepStream processor started for {self.camera_id}")
-            return True
-            
-        except Exception as e:
-            self.logger.error(f"Failed to start DeepStream processor: {e}")
-            return False
-    
-    def _processing_loop(self):
-        """Main processing loop that reads frames and puts them in the output queue"""
-        self.logger.info(f"Starting processing loop for {self.camera_id}")
-        
-        while self.running:
-            try:
-                if self.config.visualization.USE_NATIVE_DEEPSTREAM_OSD:
-                    # Forward GPU-encoded JPEG bytes directly
-                    success, jpeg_bytes = self.processor.read_encoded_jpeg()
-                    if success and jpeg_bytes and self.websocket_server:
-                        cam_id_bytes = self.camera_id.encode('utf-8')
-                        msg = bytes([len(cam_id_bytes)]) + cam_id_bytes + jpeg_bytes
-                        self.websocket_server.broadcast_sync(msg)
-                    else:
-                        time.sleep(0.005)
-                    continue
-                
-                ret, frame_data = self.processor.read_gpu_tensor()
-                
-                if ret and frame_data:
-                    self.frame_count += 1
-                    
-                    # Removed skip logic to restore frame processing for native OSD
-                    
-                    # Adaptive frame processing based on performance
-                    frame_start_time = time.time()
-                    
-                    # Convert frame data to AnalysisFrame and put in output queue
-                    if self.output_queue:
-                        try:
-                            analysis_frame = self._convert_to_analysis_frame(frame_data)
-                            if analysis_frame:
-                                self.output_queue.put_nowait(analysis_frame)
-                                if self.frame_count % 100 == 0:  # Rate-limited logging
-                                    self.logger.debug(f"Queued frame {self.frame_count} for {self.camera_id}")
-                        except queue.Full:
-                            self.rate_limited_logger.warning(f"Output queue full for {self.camera_id}")
-                        except Exception as e:
-                            self.logger.error(f"Error converting frame data: {e}")
-                    
-                    # Performance-based adaptive processing
-                    processing_time = time.time() - frame_start_time
-                    target_frame_time = 1.0 / self.config.processing.TARGET_FPS
-                    if processing_time > target_frame_time:
-                        # Skip next frame if we're falling behind
-                        if self.frame_count % 2 == 0:  # Adaptive frame skip
-                            continue
-                
-                else:
-                    # No frame data, sleep briefly
-                    time.sleep(0.01)
-                    
-            except Exception as e:
-                self.logger.error(f"Error in processing loop for {self.camera_id}: {e}")
-                time.sleep(0.1)
-        
-        self.logger.info(f"Processing loop stopped for {self.camera_id}")
-    
-    def stop(self):
-        """Stop the DeepStream processor"""
-        if self.processor:
-            self.processor.stop()
-        self.running = False
-        self.logger.info(f"DeepStream processor stopped for {self.camera_id}")
-    
-    def read_gpu_tensor(self):
-        """Read GPU tensor from DeepStream processor (legacy method - not used)"""
-        if not self.running or not self.processor:
-            return False, None
-        
-        # This method is kept for compatibility but the processing loop handles everything
-        return self.processor.read_gpu_tensor()
-    
-    def _convert_to_analysis_frame(self, frame_data):
-        """Convert DeepStream frame data to AnalysisFrame"""
-        try:
-            # Extract data from frame_data
-            detections = frame_data.get('detections', [])
-            gpu_tensor = frame_data.get('tensor')
-            source_id = frame_data.get('source_id', 0)
-            frame_num = frame_data.get('frame_num', self.frame_count)
-            timestamp = frame_data.get('timestamp', time.time())
-            
-            # Convert detections to DetectionResult objects
-            detection_results = []
-            for i, detection in enumerate(detections):
-                if isinstance(detection, dict):
-                    detection_result = DetectionResult(
-                        id=i,
-                        class_id=detection.get('class_id', 0),
-                        confidence=detection.get('confidence', 0.0),
-                        bbox=detection.get('bbox', (0.0, 0.0, 0.0, 0.0)),
-                        keypoints=detection.get('keypoints', None),
-                        mask=detection.get('mask', None)
-                    )
-                    detection_results.append(detection_result)
-            
-            # Convert tensor to numpy frame if available and not using native OSD
-            frame_numpy = None
-            if not self.config.visualization.USE_NATIVE_DEEPSTREAM_OSD and gpu_tensor is not None:
-                try:
-                    # Convert GPU tensor to numpy array for visualization
-                    if hasattr(gpu_tensor, 'cpu'):
-                        tensor_np = gpu_tensor.cpu().numpy()
-                    else:
-                        tensor_np = gpu_tensor.numpy()
-                    
-                    # Validate the converted tensor
-                    if tensor_np is None or tensor_np.size == 0:
-                        self.logger.warning(f"GPU tensor conversion resulted in empty tensor for {self.camera_id}")
-                        frame_numpy = None
-                    else:
-                        self.logger.debug(f"Successfully converted GPU tensor to numpy: shape={tensor_np.shape}, dtype={tensor_np.dtype}")
-                        
-                        # Convert from CHW to HWC format for OpenCV
-                        if tensor_np.shape[0] == 3:  # CHW format
-                            frame_numpy = np.transpose(tensor_np, (1, 2, 0))  # Convert to HWC
-                            self.logger.debug(f"Converted CHW to HWC: shape={frame_numpy.shape}")
-                        
-                        # Convert to uint8 if needed
-                        if frame_numpy.dtype != np.uint8:
-                            if frame_numpy.max() <= 1.0:  # Normalized to [0,1]
-                                frame_numpy = (frame_numpy * 255).astype(np.uint8)
-                            else:
-                                frame_numpy = frame_numpy.astype(np.uint8)
-                            self.logger.debug(f"Converted to uint8: shape={frame_numpy.shape}, dtype={frame_numpy.dtype}")
-                        
-                except Exception as e:
-                    self.logger.warning(f"Failed to convert GPU tensor to numpy: {e}")
-                    frame_numpy = None
-            
-            # Create fallback frame if no valid frame available and not using native OSD
-            if frame_numpy is None and not self.config.visualization.USE_NATIVE_DEEPSTREAM_OSD:
-                # Create a dummy frame for visualization
-                frame_numpy = np.zeros((self.config.cameras.CAMERA_HEIGHT, self.config.cameras.CAMERA_WIDTH, 3), dtype=np.uint8)
-                self.logger.debug(f"Created fallback frame for {self.camera_id}: shape={frame_numpy.shape}")
-            
-            # Create AnalysisFrame (without frame_tensor parameter)
-            analysis_frame = AnalysisFrame(
-                frame_id=frame_num,
-                camera_id=self.camera_id,
-                timestamp=timestamp,
-                frame=frame_numpy,
-                detections=detection_results,
-                tracks=[],  # No tracking data from DeepStream
-                frame_width=self.config.cameras.CAMERA_WIDTH,
-                frame_height=self.config.cameras.CAMERA_HEIGHT,
-                processing_time=0.0,  # Will be calculated by result processor
-                detection_time=0.0,
-                tracking_time=0.0
-            )
-            
-            return analysis_frame
-            
-        except Exception as e:
-            self.logger.error(f"Error converting to AnalysisFrame: {e}")
-            return None
-    
-    def set_trail_visualization(self, enabled: bool):
-        """Enable or disable trail visualization in real-time."""
-        if self.processor:
-            self.processor.set_trail_visualization(enabled)
-
-    def get_pipeline_stats(self) -> dict:
-        """Return stats directly from the underlying DeepStreamVideoPipeline."""
-        if self.processor and hasattr(self.processor, 'get_stats'):
-            return self.processor.get_stats()
-        return {}
-
-    def get_performance_data(self) -> dict:
-        """Get performance+telemetry data for WebSocket stats."""
-        # Base skeleton – keeps legacy keys the frontend may read
-        stats = {
-            'fps': 0.0,
-            'frame_count': 0,
-            'processing_time_ms': 0.0,
-            'status': 'unknown'
-        }
-
-        # Fetch full DeepStream stats (includes tracking)
-        pipeline_stats = self.get_pipeline_stats()
-        if pipeline_stats:
-            # Expose under a predictable key for ApplicationManager
-            stats['deepstream_stats'] = pipeline_stats
-            # Also flatten top-level for backwards compatibility (fps, runtime, etc.)
-            stats.update(pipeline_stats)
-
-        return stats
-
-    def get_stats(self):
-        """Get comprehensive stats including tracking telemetry"""
-        if hasattr(self.processor, 'get_stats'):
-            return self.processor.get_stats()
-        return {}
-
-    def update_confidence_threshold(self, confidence_threshold: float) -> bool:
-        """Update confidence threshold in real-time"""
-        if self.processor and hasattr(self.processor, 'update_confidence_threshold'):
-            return self.processor.update_confidence_threshold(confidence_threshold)
-        return False
-
-    def update_iou_threshold(self, iou_threshold: float) -> bool:
-        """Update IOU threshold in real-time"""
-        if self.processor and hasattr(self.processor, 'update_iou_threshold'):
-            return self.processor.update_iou_threshold(iou_threshold)
-        return False
-
-    def set_detection_enabled(self, enabled: bool) -> bool:
-        """Enable or disable detection in real-time"""
-        if self.processor and hasattr(self.processor, 'set_detection_enabled'):
-            return self.processor.set_detection_enabled(enabled)
-        return False
-
-    def update_target_classes(self, target_classes: List[int]) -> bool:
-        """Update target classes in real-time"""
-        if self.processor and hasattr(self.processor, 'update_target_classes'):
-            return self.processor.update_target_classes(target_classes)
-        return False
-
-    def set_trail_visualization(self, enabled: bool):
-        """Pass-through to enable/disable trail visualization in the pipeline."""
-        if self.processor and hasattr(self.processor, 'set_trail_visualization'):
-            self.processor.set_trail_visualization(enabled)
-
 # Import TensorRT shutdown mode function
 try:
     from tensorrt_inference import set_tensorrt_shutdown_mode
@@ -368,7 +102,7 @@ class ApplicationManager:
         self.running = False
         self.stop_event = threading.Event()
         self.camera_sources = {}
-        self.frame_processors = {}
+        self.multi_stream_processor = None  # Single multi-stream processor
         self.analysis_frame_queue = multiprocessing.Queue(maxsize=100)
         self.streaming_frame_queue = queue.Queue(maxsize=100)
         
@@ -492,17 +226,28 @@ class ApplicationManager:
         self.camera_sources = {}
         
         if self.config.cameras.USE_WEBCAM:
-            # Add webcam as source
-            self.camera_sources["webcam"] = 0
-            self.logger.info("Added webcam as source")
+            # Add webcam as a source entry
+            self.camera_sources["webcam"] = {
+                "url": "v4l2:///dev/video0",  # Example for V4L2 webcam
+                "name": "Webcam",
+                "width": self.config.cameras.CAMERA_WIDTH,
+                "height": self.config.cameras.CAMERA_HEIGHT,
+                "enabled": True
+            }
+            self.logger.info("Added webcam as a source")
             
         # Load video files
         if self.config.cameras.VIDEO_FILES:
             for i, video_file in enumerate(self.config.cameras.VIDEO_FILES):
                 if os.path.exists(video_file):
-                    # Hardcode camera_id to 'rtsp_1' to route to the "Kitchen" player on the frontend
-                    camera_id = "rtsp_1"
-                    self.camera_sources[camera_id] = video_file
+                    camera_id = f"video_{i}"
+                    self.camera_sources[camera_id] = {
+                        "url": f"file://{os.path.abspath(video_file)}",
+                        "name": f"Video File {i}",
+                        "width": self.config.cameras.CAMERA_WIDTH,
+                        "height": self.config.cameras.CAMERA_HEIGHT,
+                        "enabled": True
+                    }
                     self.logger.info(f"Added video file as source: {video_file} with ID {camera_id}")
                 else:
                     self.logger.warning(f"Video file not found: {video_file}")
@@ -547,8 +292,8 @@ class ApplicationManager:
         try:
             # Start unified GPU pipeline
             self.logger.info("🚀 Starting unified GPU pipeline...")
-            self._start_frame_processors()  # Uses UnifiedGPUPipeline exclusively
-            self.logger.info("✅ Frame processors started")
+            self._start_multi_stream_processor()
+            self.logger.info("✅ Multi-stream processor started")
             
             # Start result processing (ALWAYS needed for WebSocket streaming)
             self.logger.info("✅ Starting result processing...")
@@ -568,10 +313,10 @@ class ApplicationManager:
             traceback.print_exc()
             raise
     
-    @profile_function("ApplicationManager.start_frame_processors")
-    def _start_frame_processors(self):
-        """Start unified GPU frame processors for each camera source"""
-        self.logger.info("Starting unified GPU frame processors")
+    @profile_function("ApplicationManager.start_multi_stream_processor")
+    def _start_multi_stream_processor(self):
+        """Start single multi-stream DeepStream processor"""
+        self.logger.info("Starting multi-stream DeepStream processor")
         
         # Validate GPU-only configuration
         if not self.config.processing.ENABLE_DEEPSTREAM:
@@ -581,79 +326,42 @@ class ApplicationManager:
         if not self.config.models.FORCE_GPU_ONLY:
             raise RuntimeError("GPU-only mode: GPU-only inference must be enabled")
         
-        for camera_id, source in self.camera_sources.items():
-            try:
-                self.logger.info(f"Starting unified GPU processor for camera {camera_id}")
-                
-                # Use DeepStream pipeline directly (bypass deprecated UnifiedGPUPipeline)
-                self.logger.info(f"Creating DeepStream processor wrapper for {camera_id}")
-                
-                processor = DeepStreamProcessorWrapper(
-                    camera_id=camera_id,
-                    source=source,
-                    config=self.config,
-                    output_queue=self.analysis_frame_queue,
-                    websocket_server=None  # will be set after WebSocket server starts
-                )
-                
-                # Start processor
-                self.logger.info(f"Starting processor for {camera_id}...")
-                
-                # Add timeout for processor startup to prevent hanging
-                # Use threading.Timer instead of signal.alarm to avoid signal handler conflicts
-                import threading
-                import queue
-                
-                timeout_queue = queue.Queue()
-                
-                def timeout_handler():
-                    timeout_queue.put(TimeoutError(f"Processor startup timeout for {camera_id}"))
-                
-                # Start timeout timer (30 seconds)
-                timeout_timer = threading.Timer(30.0, timeout_handler)
-                timeout_timer.daemon = True
-                timeout_timer.start()
-                
-                try:
-                    start_success = processor.start()
-                    # Check if timeout occurred
-                    try:
-                        timeout_queue.get_nowait()
-                        raise TimeoutError(f"Processor startup timeout for {camera_id}")
-                    except queue.Empty:
-                        pass  # No timeout occurred
-                finally:
-                    # Cancel the timer
-                    timeout_timer.cancel()
-                
-                if start_success:
-                    # Store processor
-                    self.frame_processors[camera_id] = processor
-                    self.logger.info(f"✅ Started unified GPU processor for camera {camera_id}")
-                else:
-                    self.logger.error(f"❌ Failed to start processor for camera {camera_id}")
-                    raise RuntimeError(f"Processor startup failed for {camera_id}")
-                
-            except Exception as e:
-                self.logger.error(f"❌ Error starting processor for camera {camera_id}: {e}")
-                
-                import traceback
-                traceback.print_exc()
-                # Continue with other cameras instead of failing completely
-                continue
+        # Prepare sources list from all enabled camera sources
+        enabled_sources = [
+            source_config for source_config in self.camera_sources.values()
+            if isinstance(source_config, dict) and source_config.get("enabled", True)
+        ]
         
-        self.logger.info(f"✅ All unified GPU processors started successfully ({len(self.frame_processors)}/{len(self.camera_sources)} cameras)")
+        if not enabled_sources:
+            raise RuntimeError("No enabled camera sources found")
         
-        # Verify at least one processor started
-        if not self.frame_processors:
-            raise RuntimeError("No frame processors started successfully")
-        elif len(self.frame_processors) < len(self.camera_sources):
-            self.logger.warning(f"⚠️  Only {len(self.frame_processors)}/{len(self.camera_sources)} cameras started successfully")
-            self.logger.warning("🔧 Check camera connectivity or configuration issues")
+        self.logger.info(f"🎥 Creating single multi-stream DeepStream processor for {len(enabled_sources)} sources")
         
-        # Give processors a moment to initialize
-        time.sleep(1.0)
-        self.logger.info("Frame processors initialization complete")
+        try:
+            # Create single multi-stream processor
+            processor = create_deepstream_video_processor(
+                sources=enabled_sources,
+                config=self.config
+            )
+            
+            # Start the processor
+            self.logger.info("🚀 Starting multi-stream DeepStream processor...")
+            if not processor.start():
+                raise RuntimeError("Failed to start multi-stream DeepStream processor")
+            
+            # Store single processor (not per-camera)
+            self.multi_stream_processor = processor
+            self.logger.info(f"✅ Multi-stream DeepStream processor started successfully with {len(enabled_sources)} streams")
+            
+            # Give processor a moment to initialize
+            time.sleep(1.0)
+            self.logger.info("Multi-stream processor initialization complete")
+            
+        except Exception as e:
+            self.logger.error(f"❌ Error starting multi-stream processor: {e}")
+            import traceback
+            traceback.print_exc()
+            raise RuntimeError(f"Multi-stream processor startup failed: {e}")
     
     @profile_function("ApplicationManager.start_websocket_server")
     def _start_websocket_server(self):
@@ -698,9 +406,15 @@ class ApplicationManager:
             
             if self.websocket_thread.is_alive():
                 self.logger.info("✅ WebSocket server thread is running")
-                # Provide websocket_server instance to all frame processors
-                for proc in self.frame_processors.values():
-                    proc.websocket_server = self.websocket_server
+                # Provide websocket_server instance to the multi-stream processor
+                if hasattr(self, 'multi_stream_processor') and self.multi_stream_processor:
+                    self.multi_stream_processor.websocket_server = self.websocket_server
+                    self.logger.info("✅ WebSocket server instance provided to multi-stream processor")
+                    
+                    # Start JPEG processing loop for native DeepStream OSD mode
+                    self._start_jpeg_processing_loop()
+                else:
+                    self.logger.warning("⚠️ Multi-stream processor not available to assign WebSocket server")
             else:
                 self.logger.error("❌ WebSocket server thread failed to start")
                 
@@ -708,6 +422,75 @@ class ApplicationManager:
             self.logger.error(f"Failed to start WebSocket server thread: {e}")
             import traceback
             traceback.print_exc()
+
+    def _start_jpeg_processing_loop(self):
+        """Start JPEG processing loop for native DeepStream OSD mode"""
+        self.logger.info("Starting JPEG processing loop for native DeepStream OSD")
+        
+        def jpeg_processing_loop():
+            """Process JPEG frames from multi-stream processor and broadcast them"""
+            self.logger.info("JPEG processing loop started")
+            
+            # Get source information from multi-stream processor
+            source_info = getattr(self.multi_stream_processor, 'source_info', {})
+            if not source_info:
+                self.logger.error("No source info available from multi-stream processor")
+                return
+            
+            self.logger.info(f"Processing JPEG data for {len(source_info)} sources: {list(source_info.keys())}")
+            
+            heartbeat_t = time.time()
+            while self.running:
+                try:
+                    # Log JPEG loop tick for debugging
+                    #self.logger.debug("TRACE JPEG loop tick")
+                    
+                    # Heartbeat every 5 s
+                    if time.time() - heartbeat_t > 5:
+                        try:
+                            qsizes = {sid:q.qsize() for sid,q in self.multi_stream_processor.jpeg_queues.items()}
+                            self.logger.debug(f"JPEG loop heartbeat – queue sizes: {qsizes}")
+                        except Exception:
+                            pass
+                        heartbeat_t = time.time()
+                        # Process each source
+                    for source_id, info in source_info.items():
+                        if not self.running:
+                            break
+                            
+                        # Read JPEG data from multi-stream processor
+                        success, jpeg_bytes = self.multi_stream_processor.read_encoded_jpeg(source_id, timeout=0.1)
+                        
+                        if success and jpeg_bytes and self.websocket_server:
+                            # Use clean camera name for frontend
+                            camera_id = info['clean_name']
+                            cam_id_bytes = camera_id.encode('utf-8')
+                            
+                            # Construct binary message: [camera_id_length][camera_id][jpeg_data]
+                            if len(cam_id_bytes) <= 255:
+                                msg = bytes([len(cam_id_bytes)]) + cam_id_bytes + jpeg_bytes
+                                self.websocket_server.broadcast_sync(msg)
+                                self.logger.info(f"TRACE broadcast JPEG frame for {camera_id}: {len(jpeg_bytes)} bytes")
+                                self.rate_limited_logger.debug(f"Broadcast JPEG frame for {camera_id}: {len(jpeg_bytes)} bytes")
+                            else:
+                                self.logger.error(f"Camera ID too long: {len(cam_id_bytes)} bytes for {camera_id}")
+                
+                except Exception as e:
+                    self.logger.error(f"Error in JPEG processing loop: {e}")
+                    if not self.running:
+                        break
+                    time.sleep(0.1)  # Brief pause on error
+            
+            self.logger.info("JPEG processing loop stopped")
+        
+        # Start JPEG processing thread
+        self.jpeg_thread = threading.Thread(
+            target=jpeg_processing_loop,
+            name="JPEGProcessingThread", 
+            daemon=True
+        )
+        self.jpeg_thread.start()
+        self.logger.info("✅ JPEG processing thread started")
 
     @profile_function("ApplicationManager.start_result_processing")
     def _start_result_processing(self):
@@ -863,47 +646,63 @@ class ApplicationManager:
                 'uptime': uptime,
                 'application': {
                     'running': self.running,
-                    'cameras_active': len(self.camera_sources),
-                    'processors_active': len(self.frame_processors)
+                    'cameras_active': len([s for s in self.config.cameras.RTSP_STREAMS if s.get('enabled', True)]),
+                    'processors_active': 1 if hasattr(self, 'multi_stream_processor') and self.multi_stream_processor else 0
                 },
                 'cameras': {}
             }
 
-            # Add camera stats
-            for camera_id in self.camera_sources:
-                camera_stats = {}
-
-                # Get stats from frame processor
-                if camera_id in self.frame_processors:
-                    processor = self.frame_processors[camera_id]
-                    camera_stats.update(processor.get_performance_data())
-
-                    # Get comprehensive stats including tracking telemetry
-                    if hasattr(processor, 'get_stats'):
-                        comprehensive_stats = processor.get_stats()
-
-                        # Handle both flat and nested tracking data layouts
-                        tracking_data = None
-                        if comprehensive_stats:
-                            if 'tracking' in comprehensive_stats:                       # flat layout
-                                tracking_data = comprehensive_stats['tracking']
-                            elif 'deepstream_stats' in comprehensive_stats and \
-                                 'tracking' in comprehensive_stats['deepstream_stats']: # nested layout
-                                tracking_data = comprehensive_stats['deepstream_stats']['tracking']
-
-                        if tracking_data:
-                            camera_stats['tracking'] = tracking_data
-                            self.logger.debug(f"📊 Camera {camera_id} tracking data: {tracking_data}")
-                        else:
-                            self.logger.debug(f"📊 Camera {camera_id} has no tracking data")
-                            # Log what's available in comprehensive_stats for debugging
-                            if comprehensive_stats:
-                                self.logger.debug(f"📊 Camera {camera_id} available stats keys: {list(comprehensive_stats.keys())}")
-                                if 'deepstream_stats' in comprehensive_stats:
-                                    self.logger.debug(f"📊 Camera {camera_id} deepstream_stats keys: {list(comprehensive_stats['deepstream_stats'].keys())}")
-
-                # Add to overall stats
-                stats['cameras'][camera_id] = camera_stats
+            # Get stats from multi-stream processor
+            if hasattr(self, 'multi_stream_processor') and self.multi_stream_processor:
+                try:
+                    comprehensive_stats = self.multi_stream_processor.get_stats()
+                    self.logger.debug(f"📊 Multi-stream processor stats: {comprehensive_stats}")
+                    
+                    if comprehensive_stats and 'tracking' in comprehensive_stats:
+                        # comprehensive_stats['tracking'] is now {source_id: {occupancy, active_tracks, transitions}}
+                        per_stream_tracking = comprehensive_stats['tracking']
+                        
+                        # Map source_id back to camera names for UI
+                        source_info = getattr(self.multi_stream_processor, 'source_info', {})
+                        
+                        for source_id, stream_tracking_data in per_stream_tracking.items():
+                            if source_id in source_info:
+                                camera_name = source_info[source_id]['clean_name']  # e.g., 'living-room', 'kitchen', 'family-room'
+                                
+                                # Create camera stats for this stream
+                                camera_stats = {
+                                    'fps': comprehensive_stats.get('fps', 0) / len(per_stream_tracking) if per_stream_tracking else 0,
+                                    'frames_processed': comprehensive_stats.get('frames_processed', 0),
+                                    'status': 'running' if comprehensive_stats.get('running', False) else 'stopped',
+                                    'tracking': stream_tracking_data
+                                }
+                                
+                                stats['cameras'][camera_name] = camera_stats
+                                self.logger.debug(f"📊 Camera {camera_name} (source_id={source_id}) tracking data: {stream_tracking_data}")
+                            else:
+                                self.logger.warning(f"⚠️ Unknown source_id {source_id} in tracking data")
+                                
+                except Exception as e:
+                    self.logger.error(f"Error getting multi-stream processor stats: {e}")
+                    # Add empty camera stats for enabled streams
+                    for i, stream_config in enumerate(self.config.cameras.RTSP_STREAMS):
+                        if stream_config.get("enabled", True):
+                            camera_name = stream_config.get('name', f'Camera_{i}')
+                            if 'Living Room' in camera_name:
+                                clean_name = 'living-room'
+                            elif 'Kitchen' in camera_name:
+                                clean_name = 'kitchen'
+                            elif 'Family Room' in camera_name:
+                                clean_name = 'family-room'
+                            else:
+                                clean_name = camera_name.lower().replace(' ', '-').replace('_', '-')
+                            
+                            stats['cameras'][clean_name] = {
+                                'fps': 0,
+                                'frames_processed': 0,
+                                'status': 'error',
+                                'tracking': {'occupancy': {}, 'active_tracks': [], 'transitions': []}
+                            }
 
             # Add application-level profiling data if enabled
             if self.perf_monitor and self.config.processing.ENABLE_PROFILING:
@@ -964,8 +763,8 @@ class ApplicationManager:
         
         # Update visualization configuration
         if toggle_name == "trail_visualization_enabled":
-            for processor in self.frame_processors.values():
-                processor.set_trail_visualization(enabled)
+            if hasattr(self, 'multi_stream_processor') and self.multi_stream_processor:
+                self.multi_stream_processor.set_trail_visualization(enabled)
         elif hasattr(self.config.visualization, toggle_name.upper()):
             setattr(self.config.visualization, toggle_name.upper(), enabled)
             self.logger.info(f"Updated visualization config: {toggle_name.upper()} = {enabled}")
@@ -989,10 +788,9 @@ class ApplicationManager:
                 self.logger.info(f"Updated confidence threshold to: {new_threshold}")
                 
                 # Update DeepStream pipeline in real-time
-                for camera_id, processor in self.frame_processors.items():
-                    if hasattr(processor, 'update_confidence_threshold'):
-                        processor.update_confidence_threshold(new_threshold)
-                        self.logger.info(f"Updated confidence threshold for camera {camera_id}")
+                if hasattr(self, 'multi_stream_processor') and self.multi_stream_processor:
+                    self.multi_stream_processor.update_confidence_threshold(new_threshold)
+                    self.logger.info("Updated confidence threshold for multi-stream processor")
             
             if 'iou_threshold' in config_data:
                 new_iou = float(config_data['iou_threshold'])
@@ -1000,20 +798,18 @@ class ApplicationManager:
                 self.logger.info(f"Updated IOU threshold to: {new_iou}")
                 
                 # Update DeepStream pipeline in real-time
-                for camera_id, processor in self.frame_processors.items():
-                    if hasattr(processor, 'update_iou_threshold'):
-                        processor.update_iou_threshold(new_iou)
-                        self.logger.info(f"Updated IOU threshold for camera {camera_id}")
+                if hasattr(self, 'multi_stream_processor') and self.multi_stream_processor:
+                    self.multi_stream_processor.update_iou_threshold(new_iou)
+                    self.logger.info("Updated IOU threshold for multi-stream processor")
             
             if 'detection_enabled' in config_data:
                 enabled = bool(config_data['detection_enabled'])
                 self.logger.info(f"Detection enabled: {enabled}")
                 
                 # Update DeepStream pipeline in real-time
-                for camera_id, processor in self.frame_processors.items():
-                    if hasattr(processor, 'set_detection_enabled'):
-                        processor.set_detection_enabled(enabled)
-                        self.logger.info(f"Updated detection enabled for camera {camera_id}: {enabled}")
+                if hasattr(self, 'multi_stream_processor') and self.multi_stream_processor:
+                    self.multi_stream_processor.set_detection_enabled(enabled)
+                    self.logger.info(f"Updated detection enabled for multi-stream processor: {enabled}")
             
         except Exception as e:
             self.logger.error(f"Error updating detection configuration: {e}")
@@ -1042,22 +838,21 @@ class ApplicationManager:
                 target_classes = class_mapping[toggle_name]
                 
                 # Update DeepStream pipeline in real-time
-                for camera_id, processor in self.frame_processors.items():
-                    if hasattr(processor, 'update_target_classes'):
-                        if enabled:
-                            # Add classes to current target classes
-                            current_classes = getattr(self.config.models, 'TARGET_CLASSES', [])
-                            new_classes = list(set(current_classes + target_classes))
-                            self.config.models.TARGET_CLASSES = new_classes
-                            processor.update_target_classes(new_classes)
-                            self.logger.info(f"Added classes {target_classes} to camera {camera_id}")
-                        else:
-                            # Remove classes from current target classes
-                            current_classes = getattr(self.config.models, 'TARGET_CLASSES', [])
-                            new_classes = [c for c in current_classes if c not in target_classes]
-                            self.config.models.TARGET_CLASSES = new_classes
-                            processor.update_target_classes(new_classes)
-                            self.logger.info(f"Removed classes {target_classes} from camera {camera_id}")
+                if hasattr(self, 'multi_stream_processor') and self.multi_stream_processor:
+                    if enabled:
+                        # Add classes to current target classes
+                        current_classes = getattr(self.config.models, 'TARGET_CLASSES', [])
+                        new_classes = list(set(current_classes + target_classes))
+                        self.config.models.TARGET_CLASSES = new_classes
+                        self.multi_stream_processor.update_target_classes(new_classes)
+                        self.logger.info(f"Added classes {target_classes} to multi-stream processor")
+                    else:
+                        # Remove classes from current target classes
+                        current_classes = getattr(self.config.models, 'TARGET_CLASSES', [])
+                        new_classes = [c for c in current_classes if c not in target_classes]
+                        self.config.models.TARGET_CLASSES = new_classes
+                        self.multi_stream_processor.update_target_classes(new_classes)
+                        self.logger.info(f"Removed classes {target_classes} from multi-stream processor")
             else:
                 self.logger.warning(f"Unknown detection toggle: {toggle_name}")
                 
@@ -1086,16 +881,13 @@ class ApplicationManager:
         if torch.cuda.is_available() and torch.cuda.device_count() > 0:
             # Clean up TensorRT engines first, while CUDA context is still valid
             try:
-                # Clean up frame processor GPU detectors
-                if self.frame_processors:
-                    for camera_id, processor in self.frame_processors.items():
-                        try:
-                            if hasattr(processor, 'gpu_detector') and hasattr(processor.gpu_detector, 'model_manager'):
-                                if hasattr(processor.gpu_detector.model_manager, 'cleanup'):
-                                    processor.gpu_detector.model_manager.cleanup()
-                                    self.logger.info(f"Early cleanup: GPU detector for {camera_id}")
-                        except Exception as e:
-                            self.logger.warning(f"Error in early GPU cleanup for {camera_id}: {e}")
+                # Clean up multi-stream processor GPU resources
+                if hasattr(self, 'multi_stream_processor') and self.multi_stream_processor:
+                    try:
+                        # DeepStream handles its own GPU cleanup internally
+                        self.logger.info("Early cleanup: Multi-stream processor GPU resources")
+                    except Exception as e:
+                        self.logger.warning(f"Error in early GPU cleanup for multi-stream processor: {e}")
                 
                 # Force cleanup all GPU resources via consolidated pipeline
                 # cleanup_all_gpu_resources() # This function is deprecated
@@ -1115,16 +907,15 @@ class ApplicationManager:
         else:
             self.logger.warning("CUDA not available or no devices, skipping GPU cleanup")
         
-        # STEP 3: Stop frame processors (after GPU cleanup)
-        if self.frame_processors:
-            self.logger.info("Stopping frame processors")
-            for camera_id, processor in self.frame_processors.items():
-                try:
-                    processor.stop()
-                except Exception as e:
-                    self.logger.error(f"Error stopping processor for {camera_id}: {e}")
-            self.frame_processors.clear()
-            self.logger.info("Stopped frame processors")
+        # STEP 3: Stop multi-stream processor (after GPU cleanup)
+        if hasattr(self, 'multi_stream_processor') and self.multi_stream_processor:
+            self.logger.info("Stopping multi-stream processor")
+            try:
+                self.multi_stream_processor.stop()
+                self.multi_stream_processor = None
+                self.logger.info("Stopped multi-stream processor")
+            except Exception as e:
+                self.logger.error(f"Error stopping multi-stream processor: {e}")
         
         # STEP 4: Stop result processing thread
         if hasattr(self, 'result_thread') and self.result_thread:
@@ -1142,10 +933,8 @@ class ApplicationManager:
                 # Stop WebSocket server gracefully with timeout
                 if self.event_loop and not self.event_loop.is_closed():
                     try:
-                        asyncio.run_coroutine_threadsafe(
-                            asyncio.wait_for(self.websocket_server.stop(), timeout=3.0),
-                            self.event_loop
-                        ).result(timeout=4.0)
+                        fut = asyncio.run_coroutine_threadsafe(self.websocket_server.stop(), self.event_loop)
+                        fut.result(timeout=4.0)
                     except (asyncio.TimeoutError, Exception) as e:
                         self.logger.warning(f"WebSocket server stop timed out or failed: {e}")
                     
@@ -1220,7 +1009,7 @@ def parse_arguments():
     parser.add_argument('--enable-nvdec', action='store_true', help='Enable NVDEC hardware decoding')
     parser.add_argument('--enable-gpu-preprocessing', action='store_true', help='Enable GPU preprocessing')
     parser.add_argument('--force-gpu-only', action='store_true', help='Force GPU-only processing (no CPU fallbacks)')
-    parser.add_argument('--use-unified-pipeline', action='store_true', help='Use unified GPU pipeline')
+
     
     # WebSocket options
     parser.add_argument('--websocket-host', type=str, default='0.0.0.0', help='WebSocket server host')
@@ -1245,25 +1034,16 @@ def update_config_from_args(args):
     # Camera options
     if args.webcam:
         config.cameras.USE_WEBCAM = True
-        # Disable other sources when webcam is used
-        config.cameras.VIDEO_FILES = []
-        config.cameras.RTSP_STREAMS = []
-    elif args.video:
+    if args.video:
         config.cameras.VIDEO_FILES = [args.video]
-        # Disable other sources when video file is used
-        config.cameras.USE_WEBCAM = False
-        config.cameras.RTSP_STREAMS = []
-    elif args.rtsp:
-        config.cameras.RTSP_STREAMS = [{
+    if args.rtsp:
+        config.cameras.RTSP_STREAMS.append({
             "name": "Command Line Stream",
             "url": args.rtsp,
             "width": 1920,  # Default resolution
             "height": 1080,
             "enabled": True
-        }]
-        # Disable other sources when RTSP is used
-        config.cameras.USE_WEBCAM = False
-        config.cameras.VIDEO_FILES = []
+        })
     
     # Processing options
     if args.gpu_device:

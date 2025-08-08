@@ -15,6 +15,7 @@ const Dashboard: React.FC = () => {
   const [transitions, setTransitions] = useState('<li>Loading...</li>');
   const [kitchenFPS, setKitchenFPS] = useState('FPS: 0.0');
   const [livingRoomFPS, setLivingRoomFPS] = useState('FPS: 0.0');
+  const [familyRoomFPS, setFamilyRoomFPS] = useState('FPS: 0.0');
   const [trailVisualizationEnabled, setTrailVisualizationEnabled] = useState(true);
   
   const socketRef = useRef<WebSocket | null>(null);
@@ -29,10 +30,11 @@ const Dashboard: React.FC = () => {
   // FPS tracking
   const fpsTrackingRef = useRef({
     'living-room': { frameCount: 0, lastUpdate: Date.now(), fps: 0, frameHistory: [] as number[] },
-    'kitchen': { frameCount: 0, lastUpdate: Date.now(), fps: 0, frameHistory: [] as number[] }
+    'kitchen': { frameCount: 0, lastUpdate: Date.now(), fps: 0, frameHistory: [] as number[] },
+    'family-room': { frameCount: 0, lastUpdate: Date.now(), fps: 0, frameHistory: [] as number[] }
   });
 
-  const updateFPS = (cameraType: 'living-room' | 'kitchen') => {
+  const updateFPS = (cameraType: 'living-room' | 'kitchen' | 'family-room') => {
     const tracker = fpsTrackingRef.current[cameraType];
     
     tracker.frameCount++;
@@ -65,10 +67,15 @@ const Dashboard: React.FC = () => {
         if (publish) {
           publish({ group: 'Camera Living Room', key: 'FPS', value: Number(tracker.fps.toFixed(1)), ts: Date.now() });
         }
-      } else {
+      } else if (cameraType === 'kitchen') {
         setKitchenFPS(`FPS: ${tracker.fps.toFixed(1)}`);
         if (publish) {
           publish({ group: 'Camera Kitchen', key: 'FPS', value: Number(tracker.fps.toFixed(1)), ts: Date.now() });
+        }
+      } else if (cameraType === 'family-room') {
+        setFamilyRoomFPS(`FPS: ${tracker.fps.toFixed(1)}`);
+        if (publish) {
+          publish({ group: 'Camera Family Room', key: 'FPS', value: Number(tracker.fps.toFixed(1)), ts: Date.now() });
         }
       }
       
@@ -78,7 +85,7 @@ const Dashboard: React.FC = () => {
 
   const resetFPSTracking = () => {
     for (const cameraType in fpsTrackingRef.current) {
-      fpsTrackingRef.current[cameraType as 'living-room' | 'kitchen'] = {
+      fpsTrackingRef.current[cameraType as 'living-room' | 'kitchen' | 'family-room'] = {
         frameCount: 0,
         lastUpdate: Date.now(),
         fps: 0,
@@ -87,6 +94,7 @@ const Dashboard: React.FC = () => {
     }
     setKitchenFPS('FPS: 0.0');
     setLivingRoomFPS('FPS: 0.0');
+    setFamilyRoomFPS('FPS: 0.0');
   };
 
   const processBinaryFrame = async (blob: Blob) => {
@@ -144,7 +152,7 @@ const Dashboard: React.FC = () => {
       const normalizedCamId = cameraId.toLowerCase().trim();
       // console.log('[displayFrame] Normalized camera ID:', normalizedCamId);
       
-      let cameraType: 'living-room' | 'kitchen' | null = null;
+      let cameraType: 'living-room' | 'kitchen' | 'family-room' | null = null;
       
       if (normalizedCamId === "rtsp_0" || normalizedCamId.includes("living") || normalizedCamId.includes("room1") || normalizedCamId === "1") {
         cameraType = 'living-room';
@@ -152,6 +160,9 @@ const Dashboard: React.FC = () => {
       } else if (normalizedCamId === "rtsp_1" || normalizedCamId.includes("kitchen") || normalizedCamId.includes("room2") || normalizedCamId === "2") {
         cameraType = 'kitchen';
         // console.log('[displayFrame] Mapped to kitchen stream');
+      } else if (normalizedCamId === "rtsp_2" || normalizedCamId.includes("family") || normalizedCamId.includes("room3") || normalizedCamId === "3") {
+        cameraType = 'family-room';
+        // console.log('[displayFrame] Mapped to family room stream');
       } else {
         console.warn(`Unknown camera ID: ${cameraId}`);
         URL.revokeObjectURL(imageUrl);
@@ -159,7 +170,15 @@ const Dashboard: React.FC = () => {
       }
 
       // Update the image source
-      const imgElement = document.getElementById(cameraType === 'living-room' ? 'living-room-stream' : 'kitchen-stream') as HTMLImageElement;
+      let imgElement: HTMLImageElement | null = null;
+      if (cameraType === 'living-room') {
+        imgElement = document.getElementById('living-room-stream') as HTMLImageElement;
+      } else if (cameraType === 'kitchen') {
+        imgElement = document.getElementById('kitchen-stream') as HTMLImageElement;
+      } else if (cameraType === 'family-room') {
+        imgElement = document.getElementById('family-room-stream') as HTMLImageElement;
+      }
+      
       if (imgElement) {
         // Revoke previous URL if it exists
         if (imgElement.dataset.objectUrl) {
@@ -224,6 +243,8 @@ const Dashboard: React.FC = () => {
             setKitchenFPS(`FPS: ${cameraData.fps?.toFixed(1) ?? '0.0'}`);
           } else if (cameraId === 'living-room') {
             setLivingRoomFPS(`FPS: ${cameraData.fps?.toFixed(1) ?? '0.0'}`);
+          } else if (cameraId === 'family-room') {
+            setFamilyRoomFPS(`FPS: ${cameraData.fps?.toFixed(1) ?? '0.0'}`);
           }
         }
 
@@ -383,8 +404,10 @@ const Dashboard: React.FC = () => {
       // Clear images on disconnect
       const livingRoomImg = document.getElementById('living-room-stream') as HTMLImageElement;
       const kitchenImg = document.getElementById('kitchen-stream') as HTMLImageElement;
+      const familyRoomImg = document.getElementById('family-room-stream') as HTMLImageElement;
       if (livingRoomImg) livingRoomImg.src = "";
       if (kitchenImg) kitchenImg.src = "";
+      if (familyRoomImg) familyRoomImg.src = "";
       
       resetFPSTracking();
       
@@ -501,6 +524,8 @@ const Dashboard: React.FC = () => {
           perfStatsElem = document.getElementById('kitchen-perf');
         } else if (targetId === 'living-room-stream') {
           perfStatsElem = document.getElementById('living-room-perf');
+        } else if (targetId === 'family-room-stream') {
+          perfStatsElem = document.getElementById('family-room-perf');
         }
         
         // Reset all videos to normal state first
@@ -644,6 +669,15 @@ const Dashboard: React.FC = () => {
               <button className="fullscreen-btn" data-target="living-room-stream">Max</button>
             </div>
             <div id="living-room-perf" className="perf-stats" style={{ minWidth: '80px', textAlign: 'right' }}>{livingRoomFPS}</div>
+          </div>
+
+          <div className="video-container">
+            <h2>Family Room</h2>
+            <div className="video-wrapper">
+              <img id="family-room-stream" src="" alt="Family Room Stream" width="640" height="360" />
+              <button className="fullscreen-btn" data-target="family-room-stream">Max</button>
+            </div>
+            <div id="family-room-perf" className="perf-stats" style={{ minWidth: '80px', textAlign: 'right' }}>{familyRoomFPS}</div>
           </div>
         </div>
 

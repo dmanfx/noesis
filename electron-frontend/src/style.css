@@ -14,7 +14,7 @@ body {
 
 #app-container {
     width: 98%;
-    max-width: 1800px; /* Adjust max-width as needed */
+    max-width: 2000px; /* Increased max-width for 3 video players */
     background-color: #3c4049;
     border-radius: 8px;
     box-shadow: 0 4px 15px rgba(0, 0, 0, 0.2);
@@ -71,8 +71,8 @@ main {
 
 .video-container {
     flex: 1; /* Allow containers to grow */
-    min-width: 400px; /* Minimum width before wrapping */
-    max-width: 900px; /* Max width based on 1800px container */
+    min-width: 350px; /* Reduced minimum width for 3-column layout */
+    max-width: 600px; /* Reduced max width for better 3-column fit */
     background-color: #4f545f;
     padding: 15px;
     border-radius: 6px;

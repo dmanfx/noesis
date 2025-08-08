@@ -33,7 +33,7 @@ class AppConfig:
         APP_NAME: str = "YOLO Video Tracking"
         VERSION: str = "1.0.0"
         START_TIME: float = field(default_factory=time.time)
-        LOG_LEVEL: int = 30  # WARNING level for production performance
+        LOG_LEVEL: int = 30  # INFO level for development
         LOG_FILE: Optional[str] = "logs/app.log"
         DEBUG: bool = False  # Disable debug mode for performance
     
@@ -48,7 +48,7 @@ class AppConfig:
                 "url": "rtsp://192.168.3.214:7447/jdr9oLlBkjyl3gDm?",
                 "width": 1920,
                 "height": 1080,
-                "enabled": False
+                "enabled": True
             },
             {
                 "name": "Kitchen Camera", 
@@ -62,7 +62,7 @@ class AppConfig:
                 "url": "rtsp://192.168.3.214:7447/4qWTBhW6b4nLeUFE?",
                 "width": 1280,
                 "height": 720,
-                "enabled": False
+                "enabled": True
             }
         ])
         CAMERA_WIDTH: int = 1920
@@ -338,7 +338,7 @@ config = AppConfig()
 # Apply environment-based configuration overrides
 if os.getenv("DEBUG", "0") == "1":
     config.app.DEBUG = True
-    config.app.LOG_LEVEL = 10  # DEBUG
+    config.app.LOG_LEVEL = 10 # DEBUG
 
 # Resolve paths relative to the script location
 script_dir = os.path.dirname(os.path.abspath(__file__))

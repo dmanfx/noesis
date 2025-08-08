@@ -8,7 +8,7 @@ pipeline with DeepStream's optimized GStreamer elements.
 
 Key Features:
 - GPU-native video decoding with nvurisrcbin
-- Batch processing with nvstreammux
+- Batch processing with nvmultiurisrcbin
 - GPU preprocessing with nvdspreprocess
 - Zero-copy tensor output via appsink
 - Support for RTSP, file, and camera sources
@@ -25,16 +25,8 @@ import queue
 from collections import defaultdict, deque
 
 # Bypass libproxy issues by disabling GIO proxy resolver
-# import os  # Removed duplicate import
-
-# Add ctypes imports for PyCapsule handling
-import ctypes
-from ctypes import c_void_p, c_uint64, c_uint32, c_int, POINTER, Structure, c_char_p, c_float
-
-# ctypes import removed – no longer needed after switching to tensor meta path
 from typing import Optional, Tuple, Dict, Any, List, Union
 
-#import numpy as np
 import torch
 import cupy as cp  # For zero-copy GPU tensor handling
 import math
@@ -44,7 +36,7 @@ from torch.utils import dlpack  # Re-imported for explicit dlpack module usage
 import gi
 gi.require_version('Gst', '1.0')
 gi.require_version('GstApp', '1.0')
-from gi.repository import Gst, GLib, GstApp  # type: ignore  # noqa: E402
+from gi.repository import Gst, GLib, GstApp, GObject  # type: ignore  # noqa: E402
 
 # DeepStream imports
 sys.path.append('/opt/nvidia/deepstream/deepstream/lib')
@@ -54,78 +46,14 @@ import pyds  # type: ignore  # noqa: E402
 from websocket_server import WebSocketServer  # noqa: E402
 from exponential_backoff import ExponentialBackoff  # noqa: E402
 from utils import RateLimitedLogger  # noqa: E402
-# Remove redundant TensorRT imports - DeepStream handles inference natively
-# from cuda_context_manager import CudaContextManager  # Commented out - not available
-# from tensorrt_inference import GPUOnlyDetectionManager  # Removed - redundant with DeepStream
-# from gpu_pipeline import UnifiedGPUPipeline  # Removed - redundant with DeepStream
+import requests  # For REST API calls to nvmultiurisrcbin
 
 # Initialize GStreamer
 Gst.init(None)
 
 from config import AppConfig  # noqa: E402
-# from gpu_memory_pool import get_global_memory_pool  # Unused import
-
-# DeepStream metadata type constants
-NVDS_PREPROCESS_BATCH_META = 27
-NVDSINFER_TENSOR_OUTPUT_META = 12
-
-# NOTE: DeepStream preprocessing metadata uses C++ STL containers (std::vector, std::string)
-# which cannot be directly accessed via ctypes. The custom preprocessing library
-# works correctly and passes tensor data to nvinfer, but we cannot extract it from Python.
-# 
-# Original C++ structures for reference:
-# - NvDsPreProcessTensorMeta contains std::vector<int> tensor_shape and std::string tensor_name
-# - GstNvDsPreProcessBatchMeta contains std::vector<guint64> target_unique_ids and std::vector<NvDsRoiMeta> roi_vector
-# 
-# These cannot be mapped with ctypes, so we skip tensor extraction and let nvinfer use the data directly.
-
-# Define ctypes structures matching nvdspreprocess_meta.h
-class StdVectorInt(Structure):
-    _fields_ = [
-        ("begin", c_void_p),
-        ("end", c_void_p),
-        ("capacity", c_void_p)
-    ]
-
-class StdVectorULong(Structure):
-    _fields_ = [
-        ("begin", c_void_p),
-        ("end", c_void_p),
-        ("capacity", c_void_p)
-    ]
-
-class NvDsPreProcessTensorMeta(ctypes.Structure):
-    _fields_ = [
-        ("raw_tensor_buffer", ctypes.c_void_p),
-        ("buffer_size", ctypes.c_uint64),
-        ("tensor_shape", StdVectorInt),
-        ("data_type", ctypes.c_uint32),
-        ("tensor_name", ctypes.c_char_p),
-        ("gpu_id", ctypes.c_uint32),
-        ("private_data", ctypes.c_void_p),
-        ("meta_id", ctypes.c_uint32),
-        ("maintain_aspect_ratio", ctypes.c_int),
-        ("aspect_ratio", ctypes.c_float * 4),
-    ]
-
-class GstNvDsPreProcessBatchMeta(ctypes.Structure):
-    _fields_ = [
-        ("target_unique_ids", StdVectorULong),  # std::vector<guint64>
-        ("tensor_meta", ctypes.POINTER(NvDsPreProcessTensorMeta)),  # NvDsPreProcessTensorMeta*
-        ("roi_vector", ctypes.c_void_p),  # std::vector<NvDsRoiMeta> - pointer to vector
-        ("private_data", ctypes.c_void_p),  # void*
-    ]
 
 
-# Custom callback functions for preprocessing metadata
-def custom_preprocess_copy_func(data, user_data):
-    """Custom copy function for preprocessing metadata - simple pass-through"""
-    return data
-
-def custom_preprocess_release_func(data, user_data):
-    """Custom release function for preprocessing metadata - simple cleanup"""
-    # No deep cleanup needed - DeepStream manages the memory
-    pass
 
 
 class DeepStreamVideoPipeline:
@@ -134,20 +62,57 @@ class DeepStreamVideoPipeline:
     
     This pipeline uses:
     - nvurisrcbin for source handling (RTSP/file/camera)
-    - nvstreammux for batching
+    - nvmultiurisrcbin for batching
     - nvdspreprocess for GPU preprocessing
     - appsink for tensor output
     """
     
-    def __init__(self, rtsp_url: str, config: AppConfig, websocket_port: int = 8765, 
+    def __init__(self, sources: List[Dict[str, Any]], config: AppConfig, websocket_port: int = 8765, 
                          config_file: str = "pipelines/config_infer_primary_yolo11.ini",
         preproc_config: str = "pipelines/config_preproc.ini"):
-        self.rtsp_url = rtsp_url
+        # Multi-stream configuration
+        self.sources = [source for source in sources if source.get('enabled', True)]
         self.websocket_port = websocket_port
         self.config_file = config_file
         self.preproc_config = preproc_config
         self.config = config  # Store config as instance variable
         self.logger = logging.getLogger(__name__)
+        
+        # Create sensor_id to camera name mapping for telemetry (use stable 1-based IDs)
+        self.source_info = {}
+        self.sensor_ids: List[int] = []
+        self.source_idx_by_sensor_id: Dict[int, int] = {}
+        self.sensor_id_by_source_idx: Dict[int, int] = {}
+        for index, source in enumerate(self.sources):
+            sensor_id = int(source.get('sensor_id', index + 1))  # stable, non-zero
+            self.sensor_ids.append(sensor_id)
+            self.source_idx_by_sensor_id[sensor_id] = index
+            self.sensor_id_by_source_idx[index] = sensor_id
+
+            camera_name = source.get('name', f'Camera_{sensor_id}')
+            # Extract clean camera name for UI (e.g., "Living Room Camera" -> "living-room")
+            if 'Living Room' in camera_name:
+                clean_name = 'living-room'
+            elif 'Kitchen' in camera_name:
+                clean_name = 'kitchen'
+            elif 'Family Room' in camera_name:
+                clean_name = 'family-room'
+            else:
+                clean_name = camera_name.lower().replace(' ', '-').replace('_', '-')
+
+            self.source_info[sensor_id] = {
+                'name': camera_name,
+                'clean_name': clean_name,
+                'url': source.get('url', ''),
+                'width': source.get('width', 1920),
+                'height': source.get('height', 1080)
+            }
+        
+        self.logger.info(f"🎥 Initializing multi-stream pipeline with {len(self.sources)} sources:")
+        for sid in self.sensor_ids:
+            info = self.source_info[sid]
+            self.logger.info(f"  Sensor {sid}: {info['name']} ({info['clean_name']}) - {info['width']}x{info['height']}")
+        
         # Use rate-limited loggers for different types of messages
         self.rate_limited_logger = RateLimitedLogger(self.logger, rate_limit_seconds=5.0)
         self.metadata_logger = RateLimitedLogger(self.logger, rate_limit_seconds=5.0)
@@ -159,58 +124,45 @@ class DeepStreamVideoPipeline:
         self.mainloop: Optional[GLib.MainLoop] = None
         self.websocket_server: Optional[WebSocketServer] = None
         self.backoff = ExponentialBackoff()
-        # self.cuda_manager = CudaContextManager()  # Commented out - not available
+
         
         # Threading and state management
         self.running = False
         self.pipeline_thread: Optional[threading.Thread] = None
         self.websocket_thread: Optional[threading.Thread] = None
         
-        # Error tracking
-        self.consecutive_no_meta_count = 0
-        self.max_consecutive_no_meta = 10
+
         
-        # Phase 3.4: Enhanced fail-safe mechanisms
-        self.pipeline_health_check_interval = 30  # seconds
-        self.last_health_check = time.time()
-        self.pipeline_restart_count = 0
-        self.max_pipeline_restarts = 3
-        self.error_recovery_enabled = True
-        
-        # Pipeline performance monitoring
-        self.fps_monitor = {
-            'last_frame_time': time.time(),
-            'frame_intervals': [],
-            'avg_fps': 0.0,
-            'low_fps_count': 0,
-            'max_low_fps_count': 5
-        }
-        
-        # Pipeline configuration - read batch size from config
-        config_batch_size = self.config.processing.DEEPSTREAM_MUX_BATCH_SIZE
-        self.batch_size = config_batch_size if config_batch_size > 0 else 1
-        self.max_width = 1920
-        self.max_height = 1080
+        # Pipeline configuration - dynamic batch size based on number of sources
+        self.batch_size = len(self.sensor_ids)
+        # Use largest resolution for muxer output to accommodate all streams
+        self.max_width = max(source.get('width', 1920) for source in self.sources)
+        self.max_height = max(source.get('height', 1080) for source in self.sources)
         self.device_id = 0
+        # Default REST API port for nvmultiurisrcbin
+        self.multiurisrc_port = 9000
         
-        # Create sources list from single RTSP URL
-        self.sources = [{'url': rtsp_url, 'name': 'rtsp_source', 'width': 1920, 'height': 1080, 'enabled': True}]
+        self.logger.info(f"📊 Pipeline config: batch_size={self.batch_size}, resolution={self.max_width}x{self.max_height}")
         
         # Add missing attributes for compatibility
         self.frame_count = 0
         self.frame_count_lock = threading.Lock()
         # The tensor_queue is no longer needed as metadata is extracted via probe
-        # self.tensor_queue = queue.Queue(maxsize=30) 
-        # JPEG queue for GPU-encoded frames when native OSD is enabled
-        self.jpeg_queue: queue.Queue[bytes] = queue.Queue(maxsize=30)
+        # JPEG queues for GPU-encoded frames, keyed by sensor_id
+        self.jpeg_queues: Dict[int, queue.Queue[bytes]] = {
+            sensor_id: queue.Queue(maxsize=30) for sensor_id in self.sensor_ids
+        }
         self.start_time = 0  # Will be set in start()
         
         # Add tracking history for trail visualization
         self.trail_history = defaultdict(lambda: deque(maxlen=self.config.visualization.TRAIL_LENGTH))
-        self.trail_visualization_enabled = True # Default to enabled
+        # Respect config default for initial state
+        self.trail_visualization_enabled = bool(self.config.visualization.TRAIL_VISUALIZATION_ENABLED)
         
         # --- trail visualisation state ---
-        self.trail_last_seen: Dict[int, float] = {}
+        # Maintain histories per sensor_id to avoid cross-stream overlays
+        self.trail_last_seen_by_sensor: Dict[int, Dict[int, float]] = defaultdict(dict)
+        self.trail_history_by_sensor: Dict[int, defaultdict] = defaultdict(lambda: defaultdict(lambda: deque(maxlen=self.config.visualization.TRAIL_LENGTH)))
         # seconds to keep a disappeared track's trail (configurable)
         self.trail_timeout_s: float = self.config.visualization.TRAIL_TIMEOUT_S
         # draw only on every Nth frame (≥1)
@@ -218,12 +170,28 @@ class DeepStreamVideoPipeline:
         # show labels in trail visualization ONLY if enabled in config
         self.trail_show_labels: bool = self.config.visualization.TRAIL_SHOW_LABELS
         
-        # Initialize tracking state for telemetry
-        self.live_tracking_state: Dict[str, Any] = {
-            'active_tracks': [],
-            'occupancy': {},
-            'transitions': []
-        }
+        # Initialize tracking state for telemetry - per sensor_id
+        self.live_tracking_state: Dict[int, Dict[str, Any]] = {}
+        for sensor_id in self.sensor_ids:
+            self.live_tracking_state[sensor_id] = {
+                'active_tracks': [],
+                'occupancy': {},
+                'transitions': []
+            }
+        self.logger.info(f"📊 Initialized tracking state for {len(self.sensor_ids)} streams")
+
+        # JPEG branch tracking keyed by sensor_id
+        # Per-stream branch elements: queue, nvvideoconvert, caps, nvdsosd, nvjpegenc, appsink
+        self._stream_branch_elements: Dict[int, List[Gst.Element]] = {}
+        self._demux_requested_pads: Dict[int, Gst.Pad] = {}
+
+        # Demux pad calibration maps
+        self.demux_pad_to_source_id: Dict[str, int] = {}
+        self.source_id_to_demux_pad: Dict[int, str] = {}
+        # Demux pad reuse maps
+        self._demux_requested_pads_by_index: Dict[int, Gst.Pad] = {}
+        self._demux_requested_pads_by_sensor: Dict[int, Gst.Pad] = {}
+
         
         # Initialize GStreamer
         Gst.init(None)
@@ -231,56 +199,9 @@ class DeepStreamVideoPipeline:
         # Create pipeline elements
         self._create_pipeline()
 
-    def _is_pycapsule(self, obj) -> bool:
-        """Check if object is a PyCapsule"""
-        return hasattr(obj, '__class__') and 'PyCapsule' in str(obj.__class__)
-    
-    def _validate_tensor_meta(self, meta_data, meta_type: int) -> bool:
-        """Validate tensor metadata before extraction"""
-        if meta_type != NVDS_PREPROCESS_BATCH_META:
-                    return False
-        # Check if PyCapsule
-        if 'PyCapsule' not in str(type(meta_data)):
-            self.logger.warning("Not a PyCapsule")
-            return False
-        return True
 
-    def _log_available_metadata_types(self):
-        """Log all available metadata types for debugging"""
-        self.logger.info("=== AVAILABLE METADATA TYPES ===")
-        try:
-            for attr in dir(pyds.NvDsMetaType):
-                if not attr.startswith('_') and hasattr(getattr(pyds.NvDsMetaType, attr), '__int__'):
-                    value = getattr(pyds.NvDsMetaType, attr)
-                    self.logger.info(f"  {attr}: {int(value)}")
-        except Exception as e:
-            self.logger.error(f"Error logging metadata types: {e}")
-        self.logger.info("=== END METADATA TYPES ===")
 
-    def _validate_deepstream_config(self) -> bool:
-        """Validate DeepStream configuration before pipeline creation"""
-        try:
-            # Check preprocessing config file
-            if not os.path.exists(self.preproc_config):
-                self.logger.error(f"Preprocessing config file not found: {self.preproc_config}")
-                return False
-            
-            # Check inference config file
-            if not os.path.exists(self.config_file):
-                self.logger.error(f"Inference config file not found: {self.config_file}")
-                return False
-            
-            # Check custom library
-            custom_lib_path = "/opt/nvidia/deepstream/deepstream/lib/gst-plugins/libcustom2d_preprocess.so"
-            if not os.path.exists(custom_lib_path):
-                self.logger.error(f"Custom preprocessing library not found: {custom_lib_path}")
-                return False
-            
-            self.logger.info("✅ DeepStream configuration validation passed")
-            return True
-        except Exception as e:
-            self.logger.error(f"Error validating DeepStream config: {e}")
-            return False
+
 
     def update_detection_config(self, config_data: Dict[str, Any]) -> bool:
         """Update DeepStream detection configuration in real-time using GObject properties
@@ -621,8 +542,96 @@ class DeepStreamVideoPipeline:
 
         return Gst.PadProbeReturn.OK
 
+    def _configure_elements(self, elements: Dict[str, Any]) -> bool:
+        """Configure properties for all pipeline elements."""
+        try:
+            self.logger.info("------------- Configuring GStreamer Elements-------------")
+            
+            bus = self.pipeline.get_bus()
+            bus.add_signal_watch()
+            bus.connect("message", self._on_bus_message)
+
+            # Streammux configuration - dynamic batch size for multi-stream
+            # nvmultiurisrcbin (manages sources internally)
+            uri_list = ",".join(self.source_info[sid]['url'] for sid in self.sensor_ids)
+            # Use stable 1-based sensor IDs
+            sensor_id_list = ",".join(str(sid) for sid in self.sensor_ids)
+            elements['multiurisrc'].set_property("uri-list", uri_list)
+            elements['multiurisrc'].set_property("sensor-id-list", sensor_id_list)
+            elements['multiurisrc'].set_property("max-batch-size", self.batch_size)
+            elements['multiurisrc'].set_property("width", self.max_width)
+            elements['multiurisrc'].set_property("height", self.max_height)
+            elements['multiurisrc'].set_property("batched-push-timeout", 40000)
+            elements['multiurisrc'].set_property("live-source", 1)
+            elements['multiurisrc'].set_property("drop-pipeline-eos", 1)
+            elements['multiurisrc'].set_property("rtsp-reconnect-interval", 30)
+            elements['multiurisrc'].set_property("port", self.multiurisrc_port)
+            elements['multiurisrc'].set_property("ip-address", "localhost")
+            self.logger.info(f"📊 nvmultiurisrcbin configured: max-batch-size={self.batch_size}, resolution={self.max_width}x{self.max_height}")
+
+            elements['preprocess'].set_property("config-file", self.config.processing.DEEPSTREAM_PREPROCESS_CONFIG)
+            
+            self._check_for_engine_file(self.config_file)
+            elements['nvinfer'].set_property("config-file-path", self.config_file)
+            elements['nvinfer'].set_property("input-tensor-meta", True)
+
+            # Exclusion analytics
+            elements['nvdsanalytics_exclude'].set_property("unique-id", 101)
+            elements['nvdsanalytics_exclude'].set_property("config-file", "pipelines/config_nvdsanalytics_exclude.ini")
+
+            # Tracker configuration
+            elements['nvtracker'].set_property("ll-lib-file", "/opt/nvidia/deepstream/deepstream/lib/libnvds_nvmultiobjecttracker.so")
+            tracker_config_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "pipelines/config_tracker_nvdcf_batch.yml")
+            elements['nvtracker'].set_property("ll-config-file", tracker_config_path)
+
+            # Post-tracker analytics
+            elements['nvdsanalytics_post'].set_property("unique-id", 201)
+            elements['nvdsanalytics_post'].set_property("config-file", "pipelines/config_nvdsanalytics_post.ini")
+            
+            self.logger.info("✅ All elements configured successfully")
+            return True
+            
+        except Exception as e:
+            self.logger.error(f"❌ Error configuring elements: {e}")
+            return False
+
+    def _build_main_pipeline_chain(self, elements: Dict[str, Any]) -> bool:
+        """Link all main pipeline elements together."""
+        try:
+            self.logger.info("------------- Linking Main Pipeline Chain-------------")
+            
+            # Link main processing chain
+            if not elements['multiurisrc'].link(elements['preprocess']): 
+                raise RuntimeError("Failed to link nvmultiurisrcbin to preprocess")
+            else:
+                self.logger.info("TRACE linked nvmultiurisrcbin → preprocess")
+                
+            if not elements['preprocess'].link(elements['nvinfer']): 
+                raise RuntimeError("Failed to link preprocess to nvinfer")
+            if not elements['nvinfer'].link(elements['q_after_pgie']): 
+                raise RuntimeError("Failed to link nvinfer to q_after_pgie")
+            if not elements['q_after_pgie'].link(elements['nvdsanalytics_exclude']): 
+                raise RuntimeError("Failed to link q_after_pgie to nvdsanalytics_exclude")
+            if not elements['nvdsanalytics_exclude'].link(elements['q_before_tracker']): 
+                raise RuntimeError("Failed to link nvdsanalytics_exclude to q_before_tracker")
+            if not elements['q_before_tracker'].link(elements['nvtracker']): 
+                raise RuntimeError("Failed to link q_before_tracker to nvtracker")
+            if not elements['nvtracker'].link(elements['q_after_tracker']): 
+                raise RuntimeError("Failed to link nvtracker to q_after_tracker")
+            if not elements['q_after_tracker'].link(elements['nvdsanalytics_post']): 
+                raise RuntimeError("Failed to link q_after_tracker to nvdsanalytics_post")
+            if not elements['nvdsanalytics_post'].link(elements['demux']): 
+                raise RuntimeError("Failed to link nvdsanalytics_post to demux")
+
+            self.logger.info("✅ Main pipeline chain linked successfully")
+            return True
+            
+        except Exception as e:
+            self.logger.error(f"❌ Error linking pipeline chain: {e}")
+            return False
+
     def _create_pipeline(self) -> bool:
-        """Create the DeepStream GStreamer pipeline using a consolidated, linear assembly approach."""
+        """Create the DeepStream GStreamer pipeline using refactored helper functions."""
         try:
             # --- Phase A: Create All Elements ---
             self.logger.info("------------- Creating GStreamer Elements-------------")
@@ -631,7 +640,7 @@ class DeepStreamVideoPipeline:
                 raise RuntimeError("Failed to create pipeline")
 
             # Create primary elements
-            streammux = Gst.ElementFactory.make("nvstreammux", "nvstreammux")
+            multiurisrc = Gst.ElementFactory.make("nvmultiurisrcbin", "nvmultiurisrcbin")
             preprocess = Gst.ElementFactory.make("nvdspreprocess", "nvdspreprocess")
             nvinfer = Gst.ElementFactory.make("nvinfer", "nvinfer")
             
@@ -640,143 +649,94 @@ class DeepStreamVideoPipeline:
             nvtracker = Gst.ElementFactory.make("nvtracker", "nvtracker")
             nvdsanalytics_post = Gst.ElementFactory.make("nvdsanalytics", "nvdsanalytics_post")
             
-            # OSD and Sink
-            nvvidconv = Gst.ElementFactory.make("nvvideoconvert", "nvvideoconvert")
-            nvosd = Gst.ElementFactory.make("nvdsosd", "nvdsosd")
+
             
-            # JPEG encoding branch
-            nvvidconv_post_osd = Gst.ElementFactory.make("nvvideoconvert", "nvvidconv_post_osd")
-            caps_post_osd = Gst.ElementFactory.make("capsfilter", "caps_post_osd")
-            jpegenc_gpu = Gst.ElementFactory.make("nvjpegenc", "nvjpegenc_gpu")
-            queue_jpeg = Gst.ElementFactory.make("queue", "queue_jpeg")
-            appsink_jpeg = Gst.ElementFactory.make("appsink", "appsink_jpeg")
+            # Demuxer (per-branch OSD will be created downstream)
+            demux = Gst.ElementFactory.make("nvstreamdemux", "nvstreamdemux")
+            if not demux:
+                raise RuntimeError("Failed to create nvstreamdemux element.")
 
             # Queues for pipeline robustness
             q_after_pgie = Gst.ElementFactory.make("queue", "q_after_pgie")
             q_before_tracker = Gst.ElementFactory.make("queue", "q_before_tracker")
             q_after_tracker = Gst.ElementFactory.make("queue", "q_after_tracker")
 
-            elements = [
-                streammux, preprocess, nvinfer, nvdsanalytics_exclude, nvtracker, nvdsanalytics_post,
-                nvvidconv, nvosd, nvvidconv_post_osd, caps_post_osd, jpegenc_gpu, queue_jpeg, appsink_jpeg,
-                q_after_pgie, q_before_tracker, q_after_tracker
+            # Validate element creation
+            element_list = [
+                multiurisrc, preprocess, nvinfer, nvdsanalytics_exclude, nvtracker, nvdsanalytics_post,
+                demux, q_after_pgie, q_before_tracker, q_after_tracker
             ]
             
-            if not all(elements):
+            if not all(element_list):
                 element_names = [
-                    "nvstreammux", "nvdspreprocess", "nvinfer", "nvdsanalytics_exclude", "nvtracker", 
-                    "nvdsanalytics_post", "nvvideoconvert", "nvdsosd", "nvvidconv_post_osd", "caps_post_osd", 
-                    "nvjpegenc_gpu", "queue_jpeg", "appsink_jpeg", "q_after_pgie", "q_before_tracker", "q_after_tracker"
+                    "nvmultiurisrcbin", "nvdspreprocess", "nvinfer", "nvdsanalytics_exclude", "nvtracker", 
+                    "nvdsanalytics_post", "nvstreamdemux",
+                    "q_after_pgie", "q_before_tracker", "q_after_tracker"
                 ]
-                for el, name in zip(elements, element_names):
+                for el, name in zip(element_list, element_names):
                     if not el: self.logger.error(f"❌ Failed to create element: {name}")
                 raise RuntimeError("Failed to create one or more GStreamer elements.")
             self.logger.info("✅ All GStreamer elements created successfully.")
 
+            # Create elements dictionary for helper functions
+            elements = {
+                'multiurisrc': multiurisrc, 'preprocess': preprocess, 'nvinfer': nvinfer,
+                'nvdsanalytics_exclude': nvdsanalytics_exclude, 'nvtracker': nvtracker, 
+                'nvdsanalytics_post': nvdsanalytics_post, 'demux': demux,
+                'q_after_pgie': q_after_pgie, 'q_before_tracker': q_before_tracker, 
+                'q_after_tracker': q_after_tracker
+            }
+
             # --- Phase B: Configure Elements ---
-            self.logger.info("------------- Configuring GStreamer Elements-------------")
-            
-            bus = self.pipeline.get_bus()
-            bus.add_signal_watch()
-            bus.connect("message", self._on_bus_message)
+            if not self._configure_elements(elements):
+                raise RuntimeError("Failed to configure pipeline elements")
 
-            # Streammux configuration
-            streammux.set_property("batch-size", self.batch_size)
-            streammux.set_property("width", 1280)
-            streammux.set_property("height", 720)
-            streammux.set_property("batched-push-timeout", 40000)
-            streammux.set_property("live-source", 1)
+            # --- Phase C: Add Elements to Pipeline ---
+            self.logger.info("------------- Adding Elements to Pipeline-------------")
+            for el in element_list:
+                self.pipeline.add(el)
 
-            preprocess.set_property("config-file", self.config.processing.DEEPSTREAM_PREPROCESS_CONFIG)
-            
-            self._check_for_engine_file(self.config_file)
-            nvinfer.set_property("config-file-path", self.config_file)
-            nvinfer.set_property("input-tensor-meta", True)
-
-            # Exclusion analytics
-            nvdsanalytics_exclude.set_property("unique-id", 101)
-            nvdsanalytics_exclude.set_property("config-file", "pipelines/config_nvdsanalytics_exclude.ini")
-
-            # Tracker configuration
-            nvtracker.set_property("ll-lib-file", "/opt/nvidia/deepstream/deepstream/lib/libnvds_nvmultiobjecttracker.so")
-            tracker_config_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "pipelines/config_tracker_nvdcf_batch.yml")
-            nvtracker.set_property("ll-config-file", tracker_config_path)
-
-            # Post-tracker analytics
-            nvdsanalytics_post.set_property("unique-id", 201)
-            nvdsanalytics_post.set_property("config-file", "pipelines/config_nvdsanalytics_post.ini")
+            # --- Phase D: Setup Probes ---
+            self.logger.info("------------- Setting Up Buffer Probes-------------")
             
             # Telemetry Probe for metadata extraction
             analytics_src_pad = nvdsanalytics_post.get_static_pad("src")
             if not analytics_src_pad: raise RuntimeError("Failed to get nvdsanalytics_post source pad")
             analytics_src_pad.add_probe(Gst.PadProbeType.BUFFER, self._analytics_probe, 0)
             self.logger.info("✅ Added buffer probe to nvdsanalytics_post source pad for telemetry extraction")
-                
-            nvosd.set_property('process-mode', 1)
-            nvosd.set_property('display-text', 1)
             
             # Pad probe to remove excluded objects
             exclude_src_pad = nvdsanalytics_exclude.get_static_pad("src")
             if not exclude_src_pad: raise RuntimeError("Failed to get nvdsanalytics_exclude source pad")
             exclude_src_pad.add_probe(Gst.PadProbeType.BUFFER, self._remove_excluded_objects_probe, None)
             self.logger.info("✅ Added buffer probe to nvdsanalytics_exclude source pad for object removal")
-            
-            # OSD Sink Pad Probe for trail visualization
-            osd_sink_pad = nvosd.get_static_pad("sink")
-            if not osd_sink_pad: raise RuntimeError("Failed to get OSD sink pad")
-            osd_sink_pad.add_probe(Gst.PadProbeType.BUFFER, self._osd_sink_pad_buffer_probe, 0)
-            self.logger.info("✅ Added buffer probe to OSD sink pad for trail visualization")
 
-            # JPEG sink configuration
-            caps_post_osd.set_property("caps", Gst.Caps.from_string("video/x-raw(memory:NVMM), format=I420"))
-            appsink_jpeg.set_property("emit-signals", True)
-            appsink_jpeg.set_property("sync", False)
-            appsink_jpeg.set_property("max-buffers", 5)
-            appsink_jpeg.set_property("drop", True)
-            appsink_jpeg.connect("new-sample", self._on_new_jpeg_sample)
+            # Per-branch OSD probe will be attached in per-stream branches
 
-            # --- Phase C: Add and Link Elements ---
-            self.logger.info("------------- Adding and Linking All Elements-------------")
-            
-            for el in elements:
-                self.pipeline.add(el)
-            
-            source_bin = self._create_source_bin(0, {'url': self.rtsp_url})
-            if not source_bin: raise RuntimeError("Failed to create source bin")
-            self.pipeline.add(source_bin)
-            
-            source_pad = source_bin.get_static_pad("src")
-            sink_pad = streammux.get_request_pad("sink_0")
-            if source_pad.link(sink_pad) != Gst.PadLinkReturn.OK:
-                raise RuntimeError("Failed to link source bin to streammux")
-            
-            # Link main processing chain
-            if not streammux.link(preprocess): raise RuntimeError("Failed to link streammux to preprocess")
-            if not preprocess.link(nvinfer): raise RuntimeError("Failed to link preprocess to nvinfer")
-            if not nvinfer.link(q_after_pgie): raise RuntimeError("Failed to link nvinfer to q_after_pgie")
-            if not q_after_pgie.link(nvdsanalytics_exclude): raise RuntimeError("Failed to link q_after_pgie to nvdsanalytics_exclude")
-            if not nvdsanalytics_exclude.link(q_before_tracker): raise RuntimeError("Failed to link nvdsanalytics_exclude to q_before_tracker")
-            if not q_before_tracker.link(nvtracker): raise RuntimeError("Failed to link q_before_tracker to nvtracker")
-            if not nvtracker.link(q_after_tracker): raise RuntimeError("Failed to link nvtracker to q_after_tracker")
-            if not q_after_tracker.link(nvdsanalytics_post): raise RuntimeError("Failed to link q_after_tracker to nvdsanalytics_post")
-            if not nvdsanalytics_post.link(nvvidconv): raise RuntimeError("Failed to link nvdsanalytics_post to nvvidconv")
-            if not nvvidconv.link(nvosd): raise RuntimeError("Failed to link nvvidconv to nvosd")
-            
-            # Link JPEG encoding sink chain
-            if not nvosd.link(nvvidconv_post_osd): raise RuntimeError("Failed to link nvosd to nvvidconv_post_osd")
-            if not nvvidconv_post_osd.link(caps_post_osd): raise RuntimeError("Failed to link nvvidconv_post_osd to caps_post_osd")
-            if not caps_post_osd.link(jpegenc_gpu): raise RuntimeError("Failed to link caps_post_osd to jpegenc_gpu")
-            if not jpegenc_gpu.link(queue_jpeg): raise RuntimeError("Failed to link jpegenc_gpu to queue_jpeg")
-            if not queue_jpeg.link(appsink_jpeg): raise RuntimeError("Failed to link queue_jpeg to appsink_jpeg")
-            
+            # (Removed noisy mux src probe)
+
+            # Optional: Add probe to demux sink pad to trace buffer flow for first few frames
+            demux_sink = demux.get_static_pad("sink")
+            if demux_sink:
+                self.logger.debug("Adding buffer probe to demux sink pad (limited logging)")
+                demux_sink.add_probe(Gst.PadProbeType.BUFFER, self._demux_debug_probe, None)
+
+            # --- Phase E: Link Main Pipeline Chain ---
+            if not self._build_main_pipeline_chain(elements):
+                raise RuntimeError("Failed to link main pipeline chain")
+
+            # Store references early for downstream setup that accesses them
+            self.multiurisrc, self.preprocess, self.nvinfer, self.nvtracker = multiurisrc, preprocess, nvinfer, nvtracker
+            self.nvdsanalytics_exclude, self.nvdsanalytics_post = nvdsanalytics_exclude, nvdsanalytics_post
+            self.demux = demux
+
+            # --- Phase F: Calibrate demux pads and build per-stream branches with per-branch OSD ---
+            self._calibrate_demux_pad_source_map()
+            self.logger.info("🎥 Building per-stream branches with per-branch OSD and JPEG appsinks")
+            self._setup_stream_branches()
+
             # --- Finalization ---
             self.logger.info("✅ Pipeline construction complete.")
-            
-            # Store references
-            self.streammux, self.preprocess, self.nvinfer, self.nvtracker = streammux, preprocess, nvinfer, nvtracker
-            self.nvdsanalytics_exclude, self.nvdsanalytics_post = nvdsanalytics_exclude, nvdsanalytics_post
-            self.nvvidconv, self.nvosd = nvvidconv, nvosd
-            self.jpeg_appsink = appsink_jpeg
             
             return True
             
@@ -786,119 +746,13 @@ class DeepStreamVideoPipeline:
             self.logger.error(f"Full Traceback: {traceback.format_exc()}")
             return False
     
-    def _create_source_bin(self, index: int, source_config: Dict[str, Any]) -> Gst.Element:
-        """Create source bin for RTSP stream."""
-        try:
-            # Create source bin
-            source_bin = Gst.Bin.new(f"source-bin-{index}")
-            
-            # Create source element based on config
-            if isinstance(source_config, str):
-                # RTSP URL string
-                source = Gst.ElementFactory.make("rtspsrc", f"rtspsrc-{index}")
-                source.set_property("location", source_config)
-                source.set_property("latency", 0)
-                source.set_property("drop-on-latency", True)
-                source.set_property("ntp-sync", False)
-                source.set_property("ntp-time-source", 3)  # Running time
-                source.set_property("buffer-mode", 4)  # Auto
-                source.set_property("protocols", "tcp")
-                source.set_property("tcp-timeout", 5000000)  # 5 seconds
-                source.set_property("retry", 3)
-                source.set_property("timeout", 5)
-                
-                self.logger.info(f"📡 Created RTSP source for: {source_config}")
-            else:
-                # Dictionary config
-                source = Gst.ElementFactory.make("rtspsrc", f"rtspsrc-{index}")
-                source.set_property("location", source_config["url"])
-                source.set_property("latency", 0)
-                source.set_property("drop-on-latency", True)
-                source.set_property("ntp-sync", False)
-                source.set_property("ntp-time-source", 3)
-                source.set_property("buffer-mode", 4)
-                source.set_property("protocols", "tcp")
-                source.set_property("tcp-timeout", 5000000)
-                source.set_property("retry", 3)
-                source.set_property("timeout", 5)
-                
-                self.logger.info(f"📡 Created RTSP source for: {source_config['url']}")
-            
-            # Create depay element
-            depay = Gst.ElementFactory.make("rtph264depay", f"depay-{index}")
-            if not depay:
-                self.logger.error("Failed to create rtph264depay element")
-                return None
-            
-            # Create decoder
-            decoder = Gst.ElementFactory.make("nvv4l2decoder", f"decoder-{index}")
-            if not decoder:
-                self.logger.error("Failed to create nvv4l2decoder element")
-                return None
-            
-            # Create converter
-            converter = Gst.ElementFactory.make("nvvideoconvert", f"converter-{index}")
-            if not converter:
-                self.logger.error("Failed to create nvvideoconvert element")
-                return None
-        
-            # Create capsfilter
-            caps = Gst.Caps.from_string("video/x-raw(memory:NVMM), format=NV12")
-            capsfilter = Gst.ElementFactory.make("capsfilter", f"capsfilter-{index}")
-            capsfilter.set_property("caps", caps)
-            
-            # Add elements to bin
-            source_bin.add(source)
-            source_bin.add(depay)
-            source_bin.add(decoder)
-            source_bin.add(converter)
-            source_bin.add(capsfilter)
-            
-            # Link elements
-            depay.link(decoder)
-            decoder.link(converter)
-            converter.link(capsfilter)
-            
-            # Handle dynamic pad from rtspsrc
-            def cb_newpad(decodebin, decoder_src_pad, data):
-                self.logger.info(f"📡 New pad from rtspsrc: {decoder_src_pad.get_name()}")
-                caps = decoder_src_pad.get_current_caps()
-                if not caps:
-                    caps = decoder_src_pad.query_caps(None)
-                structure = caps.get_structure(0)
-                name = structure.get_name()
-                
-                if name.find("application/x-rtp") != -1:
-                    sink_pad = depay.get_static_pad("sink")
-                    if not sink_pad.is_linked():
-                        ret = decoder_src_pad.link(sink_pad)
-                        if ret != Gst.PadLinkReturn.OK:
-                            self.logger.error(f"Failed to link rtspsrc to depay: {ret}")
-                    else:
-                        self.logger.info("✅ Successfully linked rtspsrc to depay")
-                else:
-                    self.logger.warning(f"Unexpected pad type: {name}")
-            
-            source.connect("pad-added", cb_newpad, None)
-            
-            # Set ghost pad
-            ghost_pad = Gst.GhostPad.new("src", capsfilter.get_static_pad("src"))
-            source_bin.add_pad(ghost_pad)
-            
-            self.logger.info(f"✅ Created source bin {index} successfully")
-            return source_bin
-            
-        except Exception as e:
-            self.logger.error(f"Error creating source bin {index}: {e}")
-            return None
 
-    def _on_new_sample(self, appsink: GstApp.AppSink) -> Gst.FlowReturn:
-        """DEPRECATED - This function is no longer called. 
-        Metadata is handled by the OSD pad probe.
-        This function is kept for reference but should not be used.
-        """
-        self.logger.warning("_on_new_sample is deprecated and should not be called.")
-        return Gst.FlowReturn.OK
+
+
+
+
+
+
     
     def _analytics_probe(self, pad, info, user_data):
         """Probe to extract telemetry data after analytics."""
@@ -919,209 +773,17 @@ class DeepStreamVideoPipeline:
                 l_frame = l_frame.next
             except StopIteration:
                 break
+        if self.websocket_server and hasattr(self.websocket_server, 'broadcast_frame'):
+            for source_id, state in self.live_tracking_state.items():
+                if state['active_tracks']:  # Only send if data
+                    frame_data = {
+                        'source_id': source_id,
+                        'timestamp': time.time(),
+                        'tracking': state
+                    }
+                    self.websocket_server.broadcast_frame(frame_data)
         return Gst.PadProbeReturn.OK
-    
-    def _extract_tensor_from_meta(self, tensor_meta, source_id: int) -> Optional[torch.Tensor]:
-        """Extract tensor from custom preprocessing metadata (type 27)"""
-        try:
-            if not tensor_meta:
-                return None
-                
-            # Conditional debug logging (every 100th frame only)
-            if self.frame_count % 100 == 0:
-                self.logger.debug(f"=== CUSTOM PREPROCESS TENSOR EXTRACTION START ===")
-                self.logger.debug(f"Input tensor_meta type: {type(tensor_meta)}")
-            
-            # Check if this is a PyCapsule (raw C pointer)
-            if not self._is_pycapsule(tensor_meta):
-                self.logger.error("Not a PyCapsule - cannot extract tensor")
-                return None
-                
-            # Extract raw C pointer from PyCapsule
-            ctypes.pythonapi.PyCapsule_GetPointer.restype = c_void_p
-            ctypes.pythonapi.PyCapsule_GetPointer.argtypes = [ctypes.py_object, ctypes.c_char_p]
-            raw_ptr = ctypes.pythonapi.PyCapsule_GetPointer(tensor_meta, None)
-            
-            if not raw_ptr:
-                self.logger.error("Failed to extract pointer from PyCapsule")
-                return None
-                
-            if self.frame_count % 100 == 0:
-                self.logger.debug(f"Raw pointer extracted: {hex(raw_ptr)}")
-            
-            # Cast to GstNvDsPreProcessBatchMeta structure
-            batch_meta = ctypes.cast(raw_ptr, ctypes.POINTER(GstNvDsPreProcessBatchMeta)).contents
-            
-            # Get tensor meta pointer
-            if not batch_meta.tensor_meta:
-                self.logger.error("tensor_meta pointer is None")
-                return None
-                
-            # Access the first tensor meta (assuming single tensor per batch)
-            tensor_meta_struct = batch_meta.tensor_meta.contents
-            
-            # Extract tensor shape from std::vector<int>
-            shape_vector = tensor_meta_struct.tensor_shape
-            if not shape_vector.begin or not shape_vector.end:
-                self.logger.error("Shape vector begin or end is None")
-                return None
-                
-            # Calculate shape size
-            size = (int(shape_vector.end) - int(shape_vector.begin)) // ctypes.sizeof(ctypes.c_int)
-            
-            if size <= 0 or size > 10:  # Sanity check
-                self.logger.error(f"Invalid shape size: {size}")
-                return None
-                
-            # Extract shape array
-            shape_array = (ctypes.c_int * size).from_address(int(shape_vector.begin))
-            shape = list(shape_array)
-            
-            # Map data type
-            dtype_map = {
-                0: torch.float32,   # FLOAT32
-                1: torch.uint8,     # UINT8
-                2: torch.int8,      # INT8
-                3: torch.uint32,    # UINT32
-                4: torch.int32,     # INT32
-                5: torch.float16,   # FP16
-            }
-            dtype = dtype_map.get(tensor_meta_struct.data_type, torch.float32)
-            
-            # Extract tensor data
-            if not tensor_meta_struct.raw_tensor_buffer:
-                self.logger.error("raw_tensor_buffer is None")
-                return None
-                
-            # Get buffer size and validate
-            buffer_size = tensor_meta_struct.buffer_size
-            expected_size = math.prod(shape) * dtype.itemsize
-            
-            if buffer_size != expected_size:
-                self.rate_limited_logger.warning(f"Buffer size mismatch: {buffer_size} vs {expected_size}")
-            
-            # Create zero-copy GPU tensor using CuPy + DLPack
-            ptr = int(tensor_meta_struct.raw_tensor_buffer)
-            if ptr == 0:
-                self.logger.error("Invalid tensor buffer pointer")
-                return None
-                
-            # Map to CuPy dtype
-            cp_dtype_map = {
-                0: cp.float32,   # FLOAT32
-                1: cp.uint8,     # UINT8
-                2: cp.int8,      # INT8
-                3: cp.uint32,    # UINT32
-                4: cp.int32,     # INT32
-                5: cp.float16,   # FP16
-            }
-            cp_dtype = cp_dtype_map.get(tensor_meta_struct.data_type, cp.float32)
-            
-            # Wrap device memory without copy
-            mem = cp.cuda.UnownedMemory(ptr, buffer_size, self)
-            memptr = cp.cuda.MemoryPointer(mem, 0)
-            cp_array = cp.ndarray(shape, dtype=cp_dtype, memptr=memptr)
-            
-            # Convert to torch tensor via DLPack (zero-copy)
-            torch_tensor = torch.utils.dlpack.from_dlpack(cp_array.toDlpack())
-            
-            # Remove batch dimension: [1, 3, 640, 640] -> [3, 640, 640]
-            torch_tensor = torch_tensor.squeeze(0)
-            
-            if self.frame_count % 100 == 0:
-                self.logger.debug(f"✅ Successfully extracted tensor: {torch_tensor.shape}, {torch_tensor.dtype}")
-                self.logger.debug(f"=== CUSTOM PREPROCESS TENSOR EXTRACTION END (SUCCESS) ===")
-            return torch_tensor
-            
-        except Exception as e:
-            self.logger.error(f"Error extracting tensor from custom metadata: {e}")
-            if self.frame_count % 100 == 0:
-                import traceback
-                self.logger.debug(f"Traceback: {traceback.format_exc()}")
-            self.logger.debug(f"=== CUSTOM PREPROCESS TENSOR EXTRACTION END (FAILED) ===")
-            return None
 
-    # ------------------------------------------------------------------
-    # Inference tensor (NVDSINFER_TENSOR_OUTPUT_META) → GPU torch tensor
-    # ------------------------------------------------------------------
-    def _extract_tensor_from_infer_meta(self, infer_tensor_meta) -> Optional[torch.Tensor]:
-        """Zero-copy GPU tensor extraction using CuPy + DLPack.
-
-        Only the first output layer is handled (YOLO primary detector).
-        No host copies are performed – raw CUdeviceptr is wrapped by
-        CuPyʼs UnownedMemory and converted to a PyTorch tensor via DLPack.
-        """
-        try:
-            if infer_tensor_meta is None:
-                return None
-
-            if infer_tensor_meta.num_output_layers <= 0:
-                return None
-
-            layer = infer_tensor_meta.output_layers_info[0]
-
-            # Validate meta 
-            if not self._validate_infer_layer(layer):
-                self.logger.warning("Invalid inference layer meta detected – skipping tensor extraction")
-                return None
-
-            # Build shape list from NvDsInferDims
-            dims = pyds.get_dims(layer.inferDims)
-            shape = [dims.d[i] for i in range(dims.numDims)]
-            if not shape:
-                return None
-
-            # Map DeepStream data types to CuPy dtypes
-            dtype_map = {
-                0: cp.float32,   # FLOAT32
-                1: cp.uint8,     # UINT8
-                2: cp.int8,      # INT8
-                3: cp.uint32,    # UINT32
-                4: cp.int32,     # INT32
-                5: cp.float16,   # FP16
-            }
-            cp_dtype = dtype_map.get(layer.dataType, cp.float32)
-            itemsize = cp_dtype().nbytes
-
-            # Raw device pointer
-            ptr = int(layer.buffer)
-            if ptr == 0:
-                return None
-
-            n_elements = math.prod(shape)
-            nbytes = n_elements * itemsize
-
-            # Wrap device memory without copy
-            mem = cp.cuda.UnownedMemory(ptr, nbytes, self)
-            memptr = cp.cuda.MemoryPointer(mem, 0)
-            cp_array = cp.ndarray(shape, dtype=cp_dtype, memptr=memptr)
-
-            # Convert to torch tensor via DLPack (zero-copy)
-            torch_tensor = torch.utils.dlpack.from_dlpack(cp_array.toDlpack())
-            return torch_tensor
-
-        except Exception as e:
-            self.logger.error(f"Failed GPU tensor extraction: {e}")
-            return None
-
-    def _validate_infer_layer(self, layer) -> bool:
-        """Basic sanity checks on layer meta prior to extraction."""
-        try:
-            if layer.buffer == 0:
-                return False
-            dims = pyds.get_dims(layer.inferDims)
-            if dims.numElements <= 0:
-                return False
-            # Ensure inferred nbytes fits within 2GB to avoid overflow mistakes
-            dtype_sizes = {0:4,1:1,2:1,3:4,4:4,5:2}
-            bytes_per_item = dtype_sizes.get(layer.dataType, 4)
-            nbytes = dims.numElements * bytes_per_item
-            if nbytes <= 0 or nbytes > 2**31:
-                return False
-            return True
-        except Exception as e:
-            self.logger.debug(f"Inference layer validation error: {e}")
-            return False
 
     def _extract_analytics_frame_meta(self, frame_meta) -> Optional[Dict[str, Any]]:
         """Extract analytics frame metadata"""
@@ -1175,105 +837,7 @@ class DeepStreamVideoPipeline:
             self.logger.debug(f"Error extracting analytics object meta: {e}")
             return None
 
-    def _monitor_pipeline_health(self) -> bool:
-        """Phase 3.4: Monitor pipeline health and performance"""
-        try:
-            current_time = time.time()
-            
-            # Check if health check interval has passed
-            if current_time - self.last_health_check < self.pipeline_health_check_interval:
-                return True
-            
-            self.last_health_check = current_time
-            
-            # Check pipeline state
-            if self.pipeline:
-                state = self.pipeline.get_state(0)  # Non-blocking state check
-                if state[1] != Gst.State.PLAYING:
-                    self.logger.warning(f"⚠️ Pipeline not in PLAYING state: {state[1]}")
-                    return False
-            
-            # Check FPS performance
-            if self.fps_monitor['avg_fps'] < 5.0 and self.frame_count > 100:
-                self.fps_monitor['low_fps_count'] += 1
-                self.logger.warning(f"⚠️ Low FPS detected: {self.fps_monitor['avg_fps']:.2f} (count: {self.fps_monitor['low_fps_count']})")
-                
-                if self.fps_monitor['low_fps_count'] >= self.fps_monitor['max_low_fps_count']:
-                    self.logger.error("🚨 Persistent low FPS - pipeline may need restart")
-                    return False
-            else:
-                self.fps_monitor['low_fps_count'] = 0
-            
-            # Check for excessive no-metadata frames
-            if self.consecutive_no_meta_count >= self.max_consecutive_no_meta:
-                self.logger.error(f"🚨 No metadata for {self.consecutive_no_meta_count} consecutive frames")
-                return False
-            
-            # Log health status
-            self.logger.info(f"💚 Pipeline health OK - FPS: {self.fps_monitor['avg_fps']:.2f}, Frames: {self.frame_count}")
-            return True
-            
-        except Exception as e:
-            self.logger.error(f"Error in pipeline health monitoring: {e}")
-            return False
-    
-    def _attempt_pipeline_recovery(self) -> bool:
-        """Phase 3.4: Attempt to recover from pipeline errors"""
-        try:
-            if not self.error_recovery_enabled:
-                return False
-            
-            if self.pipeline_restart_count >= self.max_pipeline_restarts:
-                self.logger.error(f"🚨 Maximum pipeline restarts reached ({self.max_pipeline_restarts})")
-                return False
-            
-            self.logger.info(f"🔄 Attempting pipeline recovery (restart {self.pipeline_restart_count + 1}/{self.max_pipeline_restarts})")
-            
-            # Stop current pipeline
-            if self.pipeline:
-                self.pipeline.set_state(Gst.State.NULL)
-                time.sleep(2)  # Allow cleanup
-            
-            # Reset counters
-            self.consecutive_no_meta_count = 0
-            self.fps_monitor['low_fps_count'] = 0
-            self.frame_count = 0
-            
-            # Restart pipeline
-            if self._create_pipeline():
-                if self.start():
-                    self.pipeline_restart_count += 1
-                    self.logger.info(f"✅ Pipeline recovery successful")
-                    return True
-            
-            self.logger.error("❌ Pipeline recovery failed")
-            return False
-            
-        except Exception as e:
-            self.logger.error(f"Error in pipeline recovery: {e}")
-            return False
 
-    def _update_fps_monitor(self) -> None:
-        """Update FPS monitoring for health checks"""
-        try:
-            current_time = time.time()
-            if hasattr(self, 'fps_monitor') and self.fps_monitor['last_frame_time']:
-                interval = current_time - self.fps_monitor['last_frame_time']
-                self.fps_monitor['frame_intervals'].append(interval)
-                
-                # Keep only last 30 intervals for moving average
-                if len(self.fps_monitor['frame_intervals']) > 30:
-                    self.fps_monitor['frame_intervals'].pop(0)
-                
-                # Calculate average FPS
-                if len(self.fps_monitor['frame_intervals']) > 0:
-                    avg_interval = sum(self.fps_monitor['frame_intervals']) / len(self.fps_monitor['frame_intervals'])
-                    self.fps_monitor['avg_fps'] = 1.0 / avg_interval if avg_interval > 0 else 0.0
-            
-            self.fps_monitor['last_frame_time'] = current_time
-            
-        except Exception as e:
-            self.logger.debug(f"Error updating FPS monitor: {e}")
 
     def _parse_obj_meta(self, frame_meta) -> List[Dict[str, Any]]:
         """Return list(dict) with keys class_id, confidence, bbox, object_id, and analytics data."""
@@ -1281,6 +845,10 @@ class DeepStreamVideoPipeline:
         active_tracks = []
         occupancy = {}
         transitions = []
+        
+        # Normalize DeepStream 0-based index to configured 1-based sensor_id
+        ds_index = int(frame_meta.source_id)
+        sensor_id = self.sensor_id_by_source_idx.get(ds_index, ds_index)
         
         l_obj = frame_meta.obj_meta_list
         while l_obj:
@@ -1298,7 +866,7 @@ class DeepStreamVideoPipeline:
             # Build tracking data for telemetry
             track_dict = {
                 'track_id': obj.object_id,
-                'camera_id': f"camera_{frame_meta.source_id}",
+                'camera_id': f"camera_{sensor_id}",
                 'confidence': obj.confidence,
                 'bbox': [rect.left, rect.top, rect.width, rect.height],
                 'class_id': obj.class_id
@@ -1323,28 +891,47 @@ class DeepStreamVideoPipeline:
                 # Extract occupancy and transition data from analytics
                 if 'roiStatus' in analytics_data:
                     roi_status = analytics_data['roiStatus']
-                    self.logger.debug(f"📊 ROI status: {roi_status}")
+                    #self.logger.debug(f"📊 ROI status: {roi_status}")
+
+                    def bump(zone):
+                        zone = str(zone).strip()
+                        if zone:
+                            occupancy[zone] = occupancy.get(zone, 0) + 1
+                            #self.logger.debug(f"📊 Object {obj.object_id} in zone {zone}")
+
                     if isinstance(roi_status, dict):
-                        for zone_name, status in roi_status.items():
-                            if status == 1:  # Object is in this zone
-                                occupancy[zone_name] = occupancy.get(zone_name, 0) + 1
-                                self.logger.debug(f"📊 Object {obj.object_id} in zone {zone_name}")
+                        for z, status in roi_status.items():
+                            if status in (1, True, "IN", "inside"):
+                                bump(z)
+                    elif isinstance(roi_status, (list, tuple, set)):
+                        for z in roi_status:
+                            bump(z)
+                    elif isinstance(roi_status, str):
+                        for z in roi_status.split(','):
+                            bump(z)
+                
+                # Fallback to frame-level counts if no per-object ROI data
+                if not occupancy:
+                    frame_analytics = self._extract_analytics_frame_meta(frame_meta)
+                    if frame_analytics and isinstance(frame_analytics.get('objects_in_roi'), dict):
+                        occupancy.update(frame_analytics['objects_in_roi'])
+                        #self.logger.debug(f"📊 Using frame-level occupancy: {frame_analytics['objects_in_roi']}")
                 
                 if 'lcStatus' in analytics_data:
                     lc_status = analytics_data['lcStatus']
-                    self.logger.debug(f"📊 Line crossing status: {lc_status}")
+                    #self.logger.debug(f"📊 Line crossing status: {lc_status}")
                     if isinstance(lc_status, dict):
                         for line_name, status in lc_status.items():
                             if status == 1:  # Object crossed this line
                                 transitions.append({
                                     'track_id': obj.object_id,
-                                    'camera_id': f"camera_{frame_meta.source_id}",
+                                    'camera_id': f"camera_{sensor_id}",
                                     'line_name': line_name,
                                     'timestamp': time.time()
                                 })
-                                self.logger.debug(f"📊 Object {obj.object_id} crossed line {line_name}")
-            else:
-                self.logger.debug(f"📊 No analytics data for object {obj.object_id}")
+                                #self.logger.debug(f"📊 Object {obj.object_id} crossed line {line_name}")
+            #else:
+                #self.logger.debug(f"📊 No analytics data for object {obj.object_id}")
             
             # Add secondary inference results if available
             secondary_data = self._extract_secondary_inference_meta(obj)
@@ -1358,24 +945,27 @@ class DeepStreamVideoPipeline:
             except StopIteration:
                 break
         
-        # Update live tracking state
-        self.live_tracking_state['active_tracks'] = active_tracks
-        self.live_tracking_state['occupancy'] = occupancy
-        self.live_tracking_state['transitions'].extend(transitions)
-        
-        # Keep only recent transitions (last 100)
-        if len(self.live_tracking_state['transitions']) > 100:
-            self.live_tracking_state['transitions'] = self.live_tracking_state['transitions'][-100:]
+        # Update live tracking state for this specific stream
+        if sensor_id in self.live_tracking_state:
+            self.live_tracking_state[sensor_id]['active_tracks'] = active_tracks
+            self.live_tracking_state[sensor_id]['occupancy'] = occupancy
+            self.live_tracking_state[sensor_id]['transitions'].extend(transitions)
+            
+            # Keep only recent transitions (last 100) per stream
+            if len(self.live_tracking_state[sensor_id]['transitions']) > 100:
+                self.live_tracking_state[sensor_id]['transitions'] = self.live_tracking_state[sensor_id]['transitions'][-100:]
+        else:
+            self.logger.warning(f"⚠️ Unknown source_id {ds_index} (mapped→{sensor_id}) in frame metadata")
         
         # Debug logging for tracking state
-        if len(active_tracks) > 0:
-            self.logger.debug(f"📊 Final tracking state - Active tracks: {len(active_tracks)}, Occupancy: {occupancy}, Transitions: {len(transitions)}")
-        if active_tracks:
-            self.logger.debug(f"📊 Active tracks sample: {active_tracks[:2]}")  # Show first 2 tracks
-        if occupancy:
-            self.logger.debug(f"📊 Occupancy: {occupancy}")
-        if transitions:
-            self.logger.debug(f"📊 Recent transitions: {transitions[-3:]}")  # Show last 3 transitions
+        #if len(active_tracks) > 0:
+            #self.logger.debug(f"📊 Final tracking state - Active tracks: {len(active_tracks)}, Occupancy: {occupancy}, Transitions: {len(transitions)}")
+        #if active_tracks:
+            #self.logger.debug(f"📊 Active tracks sample: {active_tracks[:2]}")  # Show first 2 tracks
+        #if occupancy:
+            #self.logger.debug(f"📊 Occupancy: {occupancy}")
+        #if transitions:
+            #self.logger.debug(f"📊 Recent transitions: {transitions[-3:]}")  # Show last 3 transitions
         
         return detections
     
@@ -1400,51 +990,7 @@ class DeepStreamVideoPipeline:
             self.logger.debug(f"Error extracting secondary inference meta: {e}")
             return None
 
-    def _process_detections(self, frame_meta: Any, gpu_tensor: Optional[torch.Tensor] = None) -> None:
-        """Process object detections from frame metadata"""
-        try:
-            detections = []
-            
-            # Extract object metadata from DeepStream inference
-            obj_meta = frame_meta.obj_meta_list
-            while obj_meta:
-                obj_meta_data = pyds.NvDsObjectMeta.cast(obj_meta.data)  # type: ignore
-                
-                # Extract bounding box
-                rect = obj_meta_data.rect_params
-                detection = {
-                    'class_id': obj_meta_data.class_id,
-                    'confidence': obj_meta_data.confidence,
-                    'bbox': [rect.left, rect.top, rect.width, rect.height],
-                    'object_id': obj_meta_data.object_id
-                }
-                detections.append(detection)
-                
-                try:
-                    obj_meta = obj_meta.next
-                except StopIteration:
-                    break
-            
-            # Log detection results
-            if detections:
-                self.logger.info(f"✅ DeepStream detected {len(detections)} objects in frame {frame_meta.frame_num}")
-            
-            # Send to WebSocket if available (Phase 2: Remove tensor dependencies)
-            if self.websocket_server and detections:
-                frame_data = {
-                    'frame_num': frame_meta.frame_num,
-                    'timestamp': time.time(),
-                    'detections': detections,
-                    'source': 'deepstream_native'  # Phase 2: Mark as native DeepStream inference
-                }
-                # Use broadcast method that exists in WebSocketServer
-                if hasattr(self.websocket_server, 'broadcast_frame'):
-                    self.websocket_server.broadcast_frame(frame_data)
-                else:
-                    self.logger.debug("WebSocket server does not support broadcast_frame method")
-                
-        except Exception as e:
-            self.logger.error(f"Error processing detections: {e}")
+
     
     def _on_bus_message(self, bus, message):
         """Handle bus messages."""
@@ -1492,6 +1038,7 @@ class DeepStreamVideoPipeline:
             
             # Set pipeline state to PLAYING
             ret = self.pipeline.set_state(Gst.State.PLAYING)
+            self.logger.info(f"Pipeline set_state returned: {ret}")
             if ret == Gst.StateChangeReturn.FAILURE:
                 self.logger.error("❌ Failed to set pipeline to PLAYING state")
                 return False
@@ -1510,6 +1057,9 @@ class DeepStreamVideoPipeline:
             self.mainloop_thread.start()
             
             self.logger.info("✅ DeepStream pipeline started successfully")
+            
+            # Start video consumer loop
+            GObject.timeout_add(33, self._video_consumer_loop)
             
             # Log pipeline state after a short delay
             def check_pipeline_state():
@@ -1543,24 +1093,17 @@ class DeepStreamVideoPipeline:
         self.mainloop = GLib.MainLoop()
         self.mainloop.run()
     
-    def read_gpu_tensor(self) -> Tuple[bool, Optional[Dict[str, Any]]]:
+    def _video_consumer_loop(self) -> bool:
         """
-        Read next GPU tensor from the pipeline.
+        Video consumer loop placeholder. Main application handles JPEG broadcast.
+        Kept as a no-op to maintain timer without sending JSON with bytes.
         
         Returns:
-            Tuple of (success, tensor_dict) where tensor_dict contains
-            'tensor', 'source_id', 'frame_num', 'timestamp'
+            bool: True to keep the timeout active
         """
-        if not self.running:
-            return False, None
-        
-        try:
-            # Since tensor_queue is no longer used (metadata extracted via probe),
-            # return empty result for compatibility
-            return False, None
-        except Exception as e:
-            self.logger.error(f"Error reading tensor: {e}")
-            return False, None
+        return True  # keep the timeout active
+    
+
     
     def stop(self):
         """Stop the DeepStream pipeline."""
@@ -1573,6 +1116,8 @@ class DeepStreamVideoPipeline:
             self.logger.info("✅ Unregistered custom metadata callbacks")
         except Exception as e:
             self.logger.warning(f"⚠️ Could not unregister custom callbacks: {e}")
+        
+
         
         # Stop pipeline
         if self.pipeline:
@@ -1598,6 +1143,7 @@ class DeepStreamVideoPipeline:
             
         fps = frame_count_copy / runtime if runtime > 0 else 0
         
+        queue_sizes = {f"source_{src_id}": q.qsize() for src_id, q in self.jpeg_queues.items()}
         return {
             'pipeline_type': 'deepstream',
             'running': self.running,
@@ -1605,45 +1151,435 @@ class DeepStreamVideoPipeline:
             'fps': fps,
             'runtime_seconds': runtime,
             'batch_size': self.batch_size,
-            'sources': len(self.sources),
-            'queue_size': self.jpeg_queue.qsize() if hasattr(self, 'jpeg_queue') else 0,
+            'sources': len(self.sensor_ids),
+            'queue_sizes': queue_sizes,
             'tracking': self.live_tracking_state
         }
 
-    def _on_new_jpeg_sample(self, appsink: GstApp.AppSink) -> Gst.FlowReturn:
-        """Callback for GPU JPEG appsink – push encoded JPEG bytes to queue"""
+    def _demux_debug_probe(self, pad, info, user_data):
+        """Debug probe on nvstreamdemux sink to log frame source IDs"""
+        gst_buffer = info.get_buffer()
+        if not gst_buffer:
+            return Gst.PadProbeReturn.OK
+        batch_meta = pyds.gst_buffer_get_nvds_batch_meta(hash(gst_buffer))
+        if not batch_meta:
+            return Gst.PadProbeReturn.OK
+
+        # Log only first 6 frames to avoid spamming
+        if self.frame_count < 6:
+            source_ids = []
+            l_frame = batch_meta.frame_meta_list
+            while l_frame:
+                try:
+                    frame_meta = pyds.NvDsFrameMeta.cast(l_frame.data)
+                    source_ids.append(frame_meta.source_id)
+                    l_frame = l_frame.next
+                except StopIteration:
+                    break
+            self.logger.debug(f"demux sink frame source_ids (first frames): {source_ids}")
+            
+            # Safety check: Assert source_ids are the expected set
+            expected_source_ids = set(range(len(self.sensor_ids)))
+            actual_source_ids = set(source_ids)
+            if actual_source_ids != expected_source_ids:
+                self.logger.warning(f"⚠️ Unexpected source_ids in demux sink: expected {expected_source_ids}, got {actual_source_ids}")
+        # Continue normal flow without per-frame logging
+        return Gst.PadProbeReturn.OK
+
+    # --- Explicit JPEG branch setup using request pads ---
+    def _get_or_request_demux_pad(self, index: int) -> Optional[Gst.Pad]:
+        """Return existing requested demux pad for src_index or request it once."""
         try:
+            if index in self._demux_requested_pads_by_index:
+                return self._demux_requested_pads_by_index[index]
+            pad_name = f"src_{index}"
+            pad = self.demux.get_request_pad(pad_name)
+            if pad:
+                self._demux_requested_pads_by_index[index] = pad
+            return pad
+        except Exception as e:
+            self.logger.error(f"Failed to get/request demux pad for index {index}: {e}")
+            return None
+    def _calibrate_demux_pad_source_map(self) -> None:
+        """Calibrate mapping between demux src_%u pads and actual frame_meta.source_id.
+        Attaches one-shot probes to each src pad and records the first observed source_id."""
+        try:
+            self.demux_pad_to_source_id.clear()
+            self.source_id_to_demux_pad.clear()
+
+            pad_handler_ids: Dict[str, int] = {}
+
+            def _one_shot_probe(pad: Gst.Pad, info: Gst.PadProbeInfo, _user_data):
+                gst_buffer = info.get_buffer()
+                if not gst_buffer:
+                    return Gst.PadProbeReturn.OK
+                batch_meta = pyds.gst_buffer_get_nvds_batch_meta(hash(gst_buffer))
+                if not batch_meta:
+                    return Gst.PadProbeReturn.OK
+                l_frame = batch_meta.frame_meta_list
+                if not l_frame:
+                    return Gst.PadProbeReturn.OK
+                try:
+                    frame_meta = pyds.NvDsFrameMeta.cast(l_frame.data)
+                    src_id = int(frame_meta.source_id)
+                    pad_name = pad.get_name()
+                    # Record mapping if not already recorded
+                    if pad_name not in self.demux_pad_to_source_id:
+                        self.demux_pad_to_source_id[pad_name] = src_id
+                        self.source_id_to_demux_pad[src_id] = pad_name
+                        # Remove this probe after first mapping
+                        handler_id = pad_handler_ids.get(pad_name)
+                        if handler_id is not None:
+                            try:
+                                pad.remove_probe(handler_id)
+                            except Exception:
+                                pass
+                        # If we've mapped all sources, log once
+                        if len(self.source_id_to_demux_pad) >= len(self.sensor_ids):
+                            mapping_str = ", ".join([f"{k}→{v}" for k, v in sorted(self.demux_pad_to_source_id.items())])
+                            self.logger.info(f"nvstreamdemux mapping: {mapping_str}")
+                    # Fill sensor→pad reuse map
+                    try:
+                        for pad_name, sid in self.demux_pad_to_source_id.items():
+                            try:
+                                demux_index = int(pad_name.split('_')[1])
+                                pad_obj = self._get_or_request_demux_pad(demux_index)
+                                if pad_obj:
+                                    self._demux_requested_pads_by_sensor[sid] = pad_obj
+                            except Exception:
+                                continue
+                    except Exception:
+                        pass
+                except StopIteration:
+                    pass
+                return Gst.PadProbeReturn.OK
+
+            # Attach probes to all current requestable src pads by iterating indices
+            num_expected = max(len(self.sensor_ids), 1)
+            for idx in range(num_expected):
+                pad = self._get_or_request_demux_pad(idx)
+                if not pad:
+                    continue
+                pad_name = pad.get_name()
+                handler_id = pad.add_probe(Gst.PadProbeType.BUFFER, _one_shot_probe, None)
+                pad_handler_ids[pad_name] = handler_id
+
+            # Wait briefly for first frames to flow and mapping to populate
+            # Note: In Python API, we avoid busy waiting; mapping will complete as frames arrive.
+            self.logger.info("Calibrating demux pad → source_id mapping (will log once ready)...")
+        except Exception as e:
+            self.logger.warning(f"Failed to calibrate demux pad mapping: {e}")
+
+    def _setup_stream_branches(self) -> None:
+        for sensor_id in self.sensor_ids:
+            ok = self._add_jpeg_branch_for_sensor(sensor_id)
+            if not ok:
+                self.logger.error(f"❌ Failed to setup stream branch for sensor {sensor_id}")
+    def _configure_live_queue(self, q: Gst.Element) -> None:
+        q.set_property("max-size-buffers", 12)
+        q.set_property("max-size-bytes", 0)
+        q.set_property("leaky", 2)  # LEAK_DOWNSTREAM
+
+    def _caps_event_probe(self, pad: Gst.Pad, info: Gst.PadProbeInfo, stage: str):
+        try:
+            event = info.get_event()
+            if event and event.type == Gst.EventType.CAPS:
+                caps = event.parse_caps()
+                # Rate-limit logs per stage
+                if not hasattr(self, "_caps_probe_counts"):
+                    self._caps_probe_counts = {}
+                count = self._caps_probe_counts.get(stage, 0)
+                if count < 3:
+                    self.logger.debug(f"[caps] {stage}: {caps.to_string() if caps else 'None'}")
+                    self._caps_probe_counts[stage] = count + 1
+        except Exception as e:
+            # Do not disrupt pipeline on probe errors
+            self.logger.debug(f"caps probe error at {stage}: {e}")
+        return Gst.PadProbeReturn.OK
+
+    def _attach_caps_debug_probes(self, conv: Gst.Element, caps: Gst.Element, jpegenc: Gst.Element, sensor_id: int) -> None:
+        try:
+            conv_src = conv.get_static_pad("src")
+            if conv_src:
+                conv_src.add_probe(Gst.PadProbeType.EVENT_DOWNSTREAM, self._caps_event_probe, f"sensor {sensor_id} conv src")
+            caps_src = caps.get_static_pad("src")
+            if caps_src:
+                caps_src.add_probe(Gst.PadProbeType.EVENT_DOWNSTREAM, self._caps_event_probe, f"sensor {sensor_id} caps src")
+            enc_sink = jpegenc.get_static_pad("sink")
+            if enc_sink:
+                # Caps events flow downstream into encoder sink; observe what arrives
+                enc_sink.add_probe(Gst.PadProbeType.EVENT_DOWNSTREAM, self._caps_event_probe, f"sensor {sensor_id} nvjpegenc sink")
+                # Log template and currently queried caps once
+                try:
+                    tmpl = enc_sink.get_pad_template_caps()
+                    qcaps = enc_sink.query_caps(None)
+                    self.logger.debug(
+                        f"nvjpegenc sink template caps: {tmpl.to_string() if tmpl else 'Unknown'}; query caps: {qcaps.to_string() if qcaps else 'Unknown'}"
+                    )
+                except Exception:
+                    pass
+        except Exception as e:
+            self.logger.debug(f"Failed to attach caps probes for sensor {sensor_id}: {e}")
+
+    def _add_jpeg_branch_for_sensor(self, sensor_id: int) -> bool:
+        try:
+            if sensor_id in self._stream_branch_elements:
+                self.logger.debug(f"JPEG branch already exists for sensor {sensor_id}")
+                return True
+
+            branch_name_prefix = f"stream_branch_{sensor_id}"
+            queue = Gst.ElementFactory.make("queue", f"{branch_name_prefix}_queue")
+            conv_pre = Gst.ElementFactory.make("nvvideoconvert", f"{branch_name_prefix}_conv_pre")
+            caps_pre = Gst.ElementFactory.make("capsfilter", f"{branch_name_prefix}_caps_pre")
+            osd = Gst.ElementFactory.make("nvdsosd", f"{branch_name_prefix}_osd")
+            conv_post = Gst.ElementFactory.make("nvvideoconvert", f"{branch_name_prefix}_conv_post")
+            caps_post = Gst.ElementFactory.make("capsfilter", f"{branch_name_prefix}_caps_post")
+            jpegenc = Gst.ElementFactory.make("nvjpegenc", f"{branch_name_prefix}_enc")
+            sink = Gst.ElementFactory.make("appsink", f"{branch_name_prefix}_sink")
+
+            # Optimize nvjpegenc for realtime
+            try:
+                jpegenc.set_property("quality", 90)
+                jpegenc.set_property("preset-level", 1)  # fast
+            except Exception:
+                pass
+
+            if not all([queue, conv_pre, caps_pre, osd, conv_post, caps_post, jpegenc, sink]):
+                self.logger.error(f"❌ Failed to create elements for JPEG branch sensor {sensor_id}")
+                return False
+
+            self._configure_live_queue(queue)
+            # Pre-OSD RGBA and post-OSD I420
+            caps_pre.set_property("caps", Gst.Caps.from_string("video/x-raw(memory:NVMM), format=RGBA"))
+            caps_post.set_property("caps", Gst.Caps.from_string("video/x-raw(memory:NVMM), format=I420"))
+            sink.set_property("emit-signals", True)
+            sink.set_property("sync", False)
+            sink.set_property("max-buffers", 5)
+            sink.set_property("drop", True)
+            sink.connect("new-sample", self._on_new_jpeg_sample, sensor_id)
+
+            for el in (queue, conv_pre, caps_pre, osd, conv_post, caps_post, jpegenc, sink):
+                self.pipeline.add(el)
+
+            # Attach detailed caps negotiation probes (non-spammy)
+            self._attach_caps_debug_probes(conv_pre, caps_pre, jpegenc, sensor_id)
+            self._attach_caps_debug_probes(conv_post, caps_post, jpegenc, sensor_id)
+
+            # Link elements explicitly and validate
+            if not queue.link(conv_pre):
+                self.logger.error(f"❌ Failed to link queue→conv for sensor {sensor_id}")
+                for el in (queue, conv_pre, caps_pre, osd, conv_post, caps_post, jpegenc, sink):
+                    try:
+                        self.pipeline.remove(el)
+                    except Exception:
+                        pass
+                return False
+            if not conv_pre.link(caps_pre):
+                self.logger.error(f"❌ Failed to link conv→caps for sensor {sensor_id}")
+                for el in (queue, conv_pre, caps_pre, osd, conv_post, caps_post, jpegenc, sink):
+                    try:
+                        self.pipeline.remove(el)
+                    except Exception:
+                        pass
+                return False
+            if not caps_pre.link(osd):
+                self.logger.error(f"❌ Failed to link caps→osd for sensor {sensor_id}")
+                for el in (queue, conv_pre, caps_pre, osd, conv_post, caps_post, jpegenc, sink):
+                    try:
+                        self.pipeline.remove(el)
+                    except Exception:
+                        pass
+                return False
+            # Configure and attach per-branch OSD probe
+            try:
+                osd.set_property('process-mode', 0)
+                osd.set_property('display-text', 1)
+            except Exception:
+                pass
+            osd_sink_pad = osd.get_static_pad("sink")
+            if osd_sink_pad:
+                osd_sink_pad.add_probe(Gst.PadProbeType.BUFFER, self._per_branch_osd_probe, sensor_id)
+            if not osd.link(conv_post):
+                self.logger.error(f"❌ Failed to link osd→conv_post for sensor {sensor_id}")
+                for el in (queue, conv_pre, caps_pre, osd, conv_post, caps_post, jpegenc, sink):
+                    try:
+                        self.pipeline.remove(el)
+                    except Exception:
+                        pass
+                return False
+            if not conv_post.link(caps_post):
+                self.logger.error(f"❌ Failed to link conv_post→caps_post for sensor {sensor_id}")
+                for el in (queue, conv_pre, caps_pre, osd, conv_post, caps_post, jpegenc, sink):
+                    try:
+                        self.pipeline.remove(el)
+                    except Exception:
+                        pass
+                return False
+            if not caps_post.link(jpegenc):
+                self.logger.error(f"❌ Failed to link caps_post→jpegenc for sensor {sensor_id}")
+                for el in (queue, conv_pre, caps_pre, osd, conv_post, caps_post, jpegenc, sink):
+                    try:
+                        self.pipeline.remove(el)
+                    except Exception:
+                        pass
+                return False
+            if not jpegenc.link(sink):
+                self.logger.error(f"❌ Failed to link jpegenc→sink for sensor {sensor_id}")
+                for el in (queue, conv_pre, caps_pre, osd, conv_post, caps_post, jpegenc, sink):
+                    try:
+                        self.pipeline.remove(el)
+                    except Exception:
+                        pass
+                return False
+
+            # Request and link demux pad
+            # Demux pads are index-based (0..N-1). Map true sensor_id → demux index.
+            pad_name = self.source_id_to_demux_pad.get(sensor_id)
+            req_pad = None
+            if pad_name is None:
+                demux_index = self.source_idx_by_sensor_id.get(sensor_id, None)
+                if demux_index is None:
+                    self.logger.error(f"❌ No demux index for sensor {sensor_id}")
+                    for el in (queue, conv_pre, caps_pre, osd, conv_post, caps_post, jpegenc, sink):
+                        try:
+                            self.pipeline.remove(el)
+                        except Exception:
+                            pass
+                    return False
+                req_pad = self._get_or_request_demux_pad(demux_index)
+                pad_name = f"src_{demux_index}"
+            else:
+                # If we already know pad name, map to index and get/reuse pad
+                try:
+                    demux_index = int(pad_name.split('_')[1])
+                except Exception:
+                    demux_index = None
+                req_pad = self._get_or_request_demux_pad(demux_index) if demux_index is not None else None
+            if not req_pad:
+                self.logger.error(f"❌ Failed to request demux pad {pad_name} for sensor {sensor_id}")
+                for el in (queue, conv_pre, caps_pre, osd, conv_post, caps_post, jpegenc, sink):
+                    try:
+                        self.pipeline.remove(el)
+                    except Exception:
+                        pass
+                return False
+
+            sink_pad = queue.get_static_pad("sink")
+            # Ensure the queue sink pad is active before linking
+            if sink_pad is None:
+                self.logger.error(f"❌ Missing sink pad on queue for sensor {sensor_id}")
+                # Do not release req_pad here since it is managed in the reuse maps
+                for el in (queue, conv_pre, caps_pre, osd, conv_post, caps_post, jpegenc, sink):
+                    try:
+                        self.pipeline.remove(el)
+                    except Exception:
+                        pass
+                return False
+            link_ret = req_pad.link(sink_pad)
+            if link_ret != Gst.PadLinkReturn.OK:
+                self.logger.error(f"❌ Failed to link demux {pad_name} to JPEG queue for sensor {sensor_id} (ret={link_ret})")
+                # Do not release req_pad here since it is managed in the reuse maps
+                for el in (queue, conv_pre, caps_pre, osd, conv_post, caps_post, jpegenc, sink):
+                    try:
+                        self.pipeline.remove(el)
+                    except Exception:
+                        pass
+                return False
+
+            self._stream_branch_elements[sensor_id] = [queue, conv_pre, caps_pre, osd, conv_post, caps_post, jpegenc, sink]
+            self._demux_requested_pads[sensor_id] = req_pad
+            # If calibration already known, also map sensor→pad
+            self._demux_requested_pads_by_sensor[sensor_id] = req_pad
+
+            # If pipeline is already playing, sync states for dynamic add
+            if self.pipeline.get_state(0)[1] == Gst.State.PLAYING:
+                queue.sync_state_with_parent()
+                conv_pre.sync_state_with_parent()
+                caps_pre.sync_state_with_parent()
+                osd.sync_state_with_parent()
+                conv_post.sync_state_with_parent()
+                caps_post.sync_state_with_parent()
+                jpegenc.sync_state_with_parent()
+                sink.sync_state_with_parent()
+
+            self.logger.info(f"✅ JPEG branch ready for sensor {sensor_id} via request pad {pad_name}")
+            return True
+        except Exception as e:
+            self.logger.error(f"❌ Exception while adding JPEG branch for sensor {sensor_id}: {e}")
+            return False
+
+    def _remove_jpeg_branch_for_sensor(self, sensor_id: int) -> None:
+        try:
+            # Unlink and release request pad
+            req_pad = self._demux_requested_pads.pop(sensor_id, None)
+            if req_pad is not None:
+                try:
+                    self.demux.release_request_pad(req_pad)
+                except Exception as e:
+                    self.logger.debug(f"Error releasing request pad for sensor {sensor_id}: {e}")
+
+            # Remove elements
+            elements = self._stream_branch_elements.pop(sensor_id, None)
+            if elements:
+                for el in elements:
+                    try:
+                        el.set_state(Gst.State.NULL)
+                        self.pipeline.remove(el)
+                    except Exception as e:
+                        self.logger.debug(f"Error removing element {el.get_name()} for sensor {sensor_id}: {e}")
+            self.logger.info(f"✅ Removed JPEG branch for sensor {sensor_id}")
+        except Exception as e:
+            self.logger.debug(f"Error tearing down JPEG branch for sensor {sensor_id}: {e}")
+
+    def _setup_jpeg_branches_with_request_pads(self) -> None:
+        # Backward-compat alias; now builds full per-stream branches with OSD
+        self._setup_stream_branches()
+
+    def _demux_pad_removed_cb(self, demux, pad):
+        """Deprecated in this implementation: we use request pads per sensor."""
+        pad_name = pad.get_name()
+        self.logger.debug(f"Demuxer removed pad notification: {pad_name}")
+
+    def _on_new_jpeg_sample(self, appsink: GstApp.AppSink, sensor_id: int) -> Gst.FlowReturn:
+        """Callback for GPU JPEG appsink – push encoded JPEG bytes to the correct queue"""
+        try:
+            true_id = sensor_id
             sample = appsink.emit("pull-sample")
             if not sample:
                 return Gst.FlowReturn.ERROR
             buffer = sample.get_buffer()
             if not buffer:
                 return Gst.FlowReturn.ERROR
-            # Extract the full buffer contents
+            
             success, mapinfo = buffer.map(Gst.MapFlags.READ)
             if not success:
                 return Gst.FlowReturn.ERROR
+            
             try:
-                jpeg_bytes = mapinfo.data  # bytes-like
+                jpeg_bytes = mapinfo.data
                 if jpeg_bytes:
-                    try:
-                        self.jpeg_queue.put_nowait(bytes(jpeg_bytes))
-                    except queue.Full:
-                        # Drop frame if queue full
-                        pass
+                    if true_id in self.jpeg_queues:
+                        try:
+                            self.jpeg_queues[true_id].put_nowait(bytes(jpeg_bytes))
+                            # minimal logging to avoid spam
+                        except queue.Full:
+                            pass # Drop frame if queue is full
+                    else:
+                        self.rate_limited_logger.warning(f"No JPEG queue for source_id {true_id}")
             finally:
                 buffer.unmap(mapinfo)
+            
             return Gst.FlowReturn.OK
         except Exception as e:
-            self.logger.error(f"Error in _on_new_jpeg_sample: {e}")
+            self.logger.error(f"Error in _on_new_jpeg_sample for sensor {sensor_id}: {e}")
             return Gst.FlowReturn.ERROR
 
-    def read_encoded_jpeg(self, timeout: float = 0.1) -> Tuple[bool, Optional[bytes]]:
-        """Return next encoded JPEG bytes from the GPU pipeline (native OSD mode)."""
-        if not self.running:
+    def read_encoded_jpeg(self, source_id: int, timeout: float = 0.1) -> Tuple[bool, Optional[bytes]]:
+        """Return next encoded JPEG bytes for a specific sensor_id from the GPU pipeline."""
+        if not self.running or source_id not in self.jpeg_queues:
             return False, None
         try:
-            jpeg_bytes = self.jpeg_queue.get(timeout=timeout)
+            jpeg_bytes = self.jpeg_queues[source_id].get(timeout=timeout)
             return True, jpeg_bytes
         except queue.Empty:
             return False, None
@@ -1746,6 +1682,99 @@ class DeepStreamVideoPipeline:
             self.logger.error(f"❌ Failed to update target classes: {e}")
             return False
 
+    # ------------------------------------------------------------------
+    # Dynamic sensor management via nvmultiurisrcbin REST API
+    # ------------------------------------------------------------------
+    def add_sensor(self, sensor_id: int, uri: str) -> bool:
+        """Add a new sensor stream at runtime."""
+        try:
+            url = f"http://localhost:{self.multiurisrc_port}/stream"
+            payload = {"change": "add", "sensorId": str(sensor_id), "uri": uri}
+            resp = requests.post(url, json=payload, timeout=2)
+            if resp.status_code == 200:
+                self.logger.info(f"✅ Added sensor {sensor_id}: {uri}")
+                # Update internal state
+                if sensor_id not in self.sensor_ids:
+                    self.sensor_ids.append(sensor_id)
+                # Default metadata if unknown
+                self.source_info[sensor_id] = {
+                    'name': f'Camera_{sensor_id}',
+                    'clean_name': f'camera-{sensor_id}',
+                    'url': uri,
+                    'width': self.max_width,
+                    'height': self.max_height,
+                }
+                # Ensure queue and tracking state exist
+                if sensor_id not in self.jpeg_queues:
+                    self.jpeg_queues[sensor_id] = queue.Queue(maxsize=30)
+                if sensor_id not in self.live_tracking_state:
+                    self.live_tracking_state[sensor_id] = {
+                        'active_tracks': [], 'occupancy': {}, 'transitions': []
+                    }
+                # Request pad for new index and calibrate via one-shot probe
+                new_index = self.source_idx_by_sensor_id.get(sensor_id)
+                if new_index is not None:
+                    pad = self._get_or_request_demux_pad(new_index)
+                    if pad:
+                        # Attach a one-shot probe by reusing calibration method
+                        self._calibrate_demux_pad_source_map()
+                # Build stream branch (will use calibrated pad when ready)
+                ok = self._add_jpeg_branch_for_sensor(sensor_id)
+                if not ok:
+                    self.logger.error(f"❌ Failed to create JPEG branch for sensor {sensor_id}")
+                    return False
+                return True
+            else:
+                self.logger.error(f"❌ Failed to add sensor {sensor_id}: {resp.status_code} {resp.text}")
+                return False
+        except Exception as e:
+            self.logger.error(f"❌ Exception while adding sensor: {e}")
+            return False
+
+    def remove_sensor(self, sensor_id: int) -> bool:
+        """Remove an existing sensor stream at runtime."""
+        try:
+            url = f"http://localhost:{self.multiurisrc_port}/stream"
+            payload = {"change": "remove", "sensorId": str(sensor_id), "uri": ""}
+            resp = requests.post(url, json=payload, timeout=2)
+            if resp.status_code == 200:
+                self.logger.info(f"✅ Removed sensor {sensor_id}")
+                # Tear down request pad and branch
+                self._remove_jpeg_branch_for_sensor(sensor_id)
+                # Clean queues and tracking
+                self.jpeg_queues.pop(sensor_id, None)
+                self.live_tracking_state.pop(sensor_id, None)
+                self.source_info.pop(sensor_id, None)
+                if sensor_id in self.sensor_ids:
+                    try:
+                        self.sensor_ids.remove(sensor_id)
+                    except ValueError:
+                        pass
+                # Update demux mapping tables
+                pad_to_remove = self.source_id_to_demux_pad.pop(sensor_id, None)
+                if pad_to_remove:
+                    self.demux_pad_to_source_id.pop(pad_to_remove, None)
+                # Release demux pad for this sensor if tracked
+                pad_obj = self._demux_requested_pads_by_sensor.pop(sensor_id, None)
+                if pad_obj is not None:
+                    # Remove from index map too
+                    try:
+                        idx = int(pad_obj.get_name().split('_')[1])
+                        self._demux_requested_pads_by_index.pop(idx, None)
+                    except Exception:
+                        pass
+                    try:
+                        self.demux.release_request_pad(pad_obj)
+                    except Exception:
+                        pass
+                return True
+            else:
+                self.logger.error(f"❌ Failed to remove sensor {sensor_id}: {resp.status_code} {resp.text}")
+                return False
+        except Exception as e:
+            self.logger.error(f"❌ Exception while removing sensor: {e}")
+            return False
+
     def toggle_trail_visualization(self, enabled: bool):
           self.set_trail_visualization(enabled)
 
@@ -1756,14 +1785,18 @@ class DeepStreamVideoPipeline:
         if not enabled:
             # Clear history when disabling to prevent stale trails on re-enable
             self.trail_history.clear()
-            self.trail_last_seen.clear()
+            self.trail_history_by_sensor.clear()
+            self.trail_last_seen_by_sensor.clear()
 
     def _osd_sink_pad_buffer_probe(self, pad, info, _):
         """Probe to draw trails for tracked objects before OSD rendering."""
+        now = time.time()
         # Phase 0: early outs
         if not self.trail_visualization_enabled:
             self.trail_history.clear()
-            self.trail_last_seen.clear()
+            # Clear per-sensor maps
+            self.trail_history_by_sensor.clear()
+            self.trail_last_seen_by_sensor.clear()
             return Gst.PadProbeReturn.OK
 
         gst_buffer = info.get_buffer()
@@ -1772,10 +1805,8 @@ class DeepStreamVideoPipeline:
         batch_meta = pyds.gst_buffer_get_nvds_batch_meta(hash(gst_buffer))
         if not batch_meta:
             return Gst.PadProbeReturn.OK
-
-        now = time.time()
-
-        # Phase 1 ─ Update histories from current detections
+        
+        # Phase 1 ─ Update histories from current detections (global)
         l_frame = batch_meta.frame_meta_list
         while l_frame:
             frame_meta = pyds.NvDsFrameMeta.cast(l_frame.data)
@@ -1787,21 +1818,22 @@ class DeepStreamVideoPipeline:
                     cx = obj_meta.rect_params.left + obj_meta.rect_params.width / 2
                     cy = obj_meta.rect_params.top  + obj_meta.rect_params.height
                     self.trail_history[tid].append((cx, cy))
-                    self.trail_last_seen[tid] = now
+                    # Also maintain per-sensor state
+                    sid = int(frame_meta.source_id)
+                    self.trail_history_by_sensor[sid][tid].append((cx, cy))
+                    self.trail_last_seen_by_sensor[sid][tid] = now
                 l_obj = l_obj.next
             l_frame = l_frame.next
 
-        # Phase 2 ─ Prune stale tracks
-        for tid in [
-            t for t, ts in list(self.trail_last_seen.items())
-            if now - ts > self.trail_timeout_s
-        ]:
-            self.trail_last_seen.pop(tid, None)
-            self.trail_history.pop(tid, None)
+        # Phase 2 ─ Prune stale tracks (per-sensor maps)
+        for sid, last_seen_map in list(self.trail_last_seen_by_sensor.items()):
+            for tid in [t for t, ts in list(last_seen_map.items()) if now - ts > self.trail_timeout_s]:
+                self.trail_last_seen_by_sensor[sid].pop(tid, None)
+                self.trail_history_by_sensor[sid].pop(tid, None)
 
 
 
-        # ────────────────── Phase 3 ─ Draw all trails into one overlay
+        # ────────────────── Phase 3 ─ Draw all trails into one overlay (batched OSD legacy)
         l_frame = batch_meta.frame_meta_list
         while l_frame:
             frame_meta = pyds.NvDsFrameMeta.cast(l_frame.data)
@@ -1863,35 +1895,107 @@ class DeepStreamVideoPipeline:
 
         return Gst.PadProbeReturn.OK
 
+    def _per_branch_osd_probe(self, pad, info, sensor_id: int):
+        """Per-branch OSD sink probe to draw only for matching sensor_id using frame_meta.source_id."""
+        if not self.trail_visualization_enabled:
+            return Gst.PadProbeReturn.OK
+        gst_buffer = info.get_buffer()
+        if not gst_buffer:
+            return Gst.PadProbeReturn.OK
+        batch_meta = pyds.gst_buffer_get_nvds_batch_meta(hash(gst_buffer))
+        if not batch_meta:
+            return Gst.PadProbeReturn.OK
+        # Update trails for this sensor from current detections
+        now = time.time()
+        l_frame = batch_meta.frame_meta_list
+        while l_frame:
+            frame_meta = pyds.NvDsFrameMeta.cast(l_frame.data)
+            # Map DS index to configured sensor_id for display logic
+            ds_index_local = int(frame_meta.source_id)
+            mapped_sensor = self.sensor_id_by_source_idx.get(ds_index_local, ds_index_local)
+            if int(mapped_sensor) != int(sensor_id):
+                l_frame = l_frame.next
+                continue
+            l_obj = frame_meta.obj_meta_list
+            while l_obj:
+                obj_meta = pyds.NvDsObjectMeta.cast(l_obj.data)
+                tid = obj_meta.object_id
+                if tid != -1:
+                    cx = obj_meta.rect_params.left + obj_meta.rect_params.width / 2
+                    cy = obj_meta.rect_params.top  + obj_meta.rect_params.height
+                    self.trail_history_by_sensor[int(sensor_id)][tid].append((cx, cy))
+                    self.trail_last_seen_by_sensor[int(sensor_id)][tid] = now
+                l_obj = l_obj.next
+
+            # Prune stale trails for this sensor
+            for tid, ts in list(self.trail_last_seen_by_sensor[int(sensor_id)].items()):
+                if now - ts > self.trail_timeout_s:
+                    self.trail_last_seen_by_sensor[int(sensor_id)].pop(tid, None)
+                    self.trail_history_by_sensor[int(sensor_id)].pop(tid, None)
+
+            display_meta = pyds.nvds_acquire_display_meta_from_pool(batch_meta)
+            if not display_meta:
+                l_frame = l_frame.next
+                continue
+            display_meta.num_lines = 0
+            display_meta.num_labels = 0
+            # Draw trails for this sensor only
+            sensor_trails = self.trail_history_by_sensor.get(int(sensor_id), {})
+            active_ids = [tid for tid, pts in sensor_trails.items() if len(pts) > 1]
+            budget_per_track = (250 // len(active_ids)) if active_ids else 250
+            budget_per_track = max(1, budget_per_track)
+            for tid in active_ids:
+                pts = list(sensor_trails[tid])[-(min(self.config.visualization.TRAIL_DRAW_SEGMENTS, budget_per_track) + 1):]
+                for idx in range(len(pts) - 1):
+                    if display_meta.num_lines >= 250:
+                        break
+                    if display_meta.num_lines >= len(display_meta.line_params):
+                        break
+                    x1, y1 = pts[idx]
+                    x2, y2 = pts[idx + 1]
+                    lp = display_meta.line_params[display_meta.num_lines]
+                    lp.line_width = 3
+                    lp.x1, lp.y1, lp.x2, lp.y2 = map(int, (x1, y1, x2, y2))
+                    alpha = max((idx + 1) / len(pts), 0.6)
+                    lp.line_color.set(1.0, 1.0, 0.0, alpha)
+                    display_meta.num_lines += 1
+                if (self.trail_show_labels
+                        and display_meta.num_labels < 16
+                        and display_meta.num_lines < 250
+                        and display_meta.num_labels < len(display_meta.text_params)):
+                    tp = display_meta.text_params[display_meta.num_labels]
+                    tp.display_text = f"id {tid}"
+                    tp.x_offset, tp.y_offset = map(int, pts[-1])
+                    tp.font_params.font_name = "Serif"
+                    tp.font_params.font_size = 12
+                    tp.font_params.font_color.set(1.0, 1.0, 0.0, 1.0)
+                    tp.set_bg_clr = 0
+                    display_meta.num_labels += 1
+            pyds.nvds_add_display_meta_to_frame(frame_meta, display_meta)
+            l_frame = l_frame.next
+        return Gst.PadProbeReturn.OK
+
 
 
 
 def create_deepstream_video_processor(
-    camera_id: str,
-    source: Union[str, int, Dict],
+    sources: List[Dict[str, Any]],
     config: AppConfig
 ) -> DeepStreamVideoPipeline:
     """
-    Factory function to create DeepStream video processor.
+    Factory function to create multi-stream DeepStream video processor.
     
     Args:
-        camera_id: Camera identifier
-        source: Video source (file path, RTSP URL, or dict config)
+        sources: List of video source configurations from config.py
         config: Application configuration
         
     Returns:
-        Configured DeepStream video pipeline
+        Configured multi-stream DeepStream video pipeline
     """
-    # Convert source to URL string
-    if isinstance(source, dict):
-        source_url = source.get('url', '')
-    else:
-        source_url = str(source)
-    
     return DeepStreamVideoPipeline(
-        rtsp_url=source_url,
+        sources=sources,
         config=config,
-        websocket_port=8765,
+        websocket_port=config.websocket.PORT,
         config_file="pipelines/config_infer_primary_yolo11.ini",
         preproc_config="pipelines/config_preproc.ini"
     )
@@ -1913,8 +2017,18 @@ if __name__ == "__main__":
 
     logging.basicConfig(level=logging.INFO)
 
-    # Create pipeline
-    pipeline = create_deepstream_video_processor("test_cam", args.source_uri, config)
+    # Create test sources from enabled RTSP streams in config
+    test_sources = [stream for stream in config.cameras.RTSP_STREAMS if stream.get('enabled', True)]
+    if not test_sources:
+        print("❌ No enabled RTSP streams found in config")
+        exit(1)
+    
+    print(f"🎥 Testing with {len(test_sources)} streams:")
+    for i, source in enumerate(test_sources):
+        print(f"  Stream {i}: {source.get('name', 'Unknown')} - {source.get('url', 'No URL')}")
+    
+    # Create multi-stream pipeline
+    pipeline = create_deepstream_video_processor(test_sources, config)
 
     if pipeline.start():
         print("✅ DeepStream pipeline started successfully")

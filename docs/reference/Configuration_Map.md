@@ -1,0 +1,48 @@
+# Configuration Map (config.py → Pipeline)
+
+This document maps `config.py` sections and keys to their use in `deepstream_video_pipeline.py` and `websocket_server.py`.
+
+## cameras (AppConfig.CameraSettings)
+
+- `RTSP_STREAMS`: Used to build `sources` passed into `DeepStreamVideoPipeline`.
+  - Fields per stream: `name`, `url`, `width`, `height`, `enabled`
+- Derived inside pipeline:
+  - `batch_size = len(enabled sources)`
+  - `max_width = max(width)`, `max_height = max(height)`
+
+## processing (AppConfig.ProcessingSettings)
+
+- `DEEPSTREAM_PREPROCESS_CONFIG`: set on `nvdspreprocess.config-file`
+- Other DeepStream-related knobs exist but the pipeline derives batch/size from sources via `nvmultiurisrcbin`.
+
+## models (AppConfig.ModelsSettings)
+
+- `MODEL_PATH`: used in `_check_for_engine_file()` to infer candidate engine paths under `models/engines/`
+- `DETECTION_ENGINE_PATH`: optional override placed at highest priority in engine search
+- Runtime detection parameters are applied via `nvinfer` properties/methods
+
+## visualization (AppConfig.VisualizationSettings)
+
+- Trail visualization parameters consumed by `_osd_sink_pad_buffer_probe()`:
+  - `TRAIL_LENGTH`, `TRAIL_TIMEOUT_S`, `TRAIL_DRAW_STRIDE`, `TRAIL_SHOW_LABELS`, `TRAIL_DRAW_SEGMENTS`
+- `USE_NATIVE_DEEPSTREAM_OSD`: native OSD is used
+
+## websocket (AppConfig.WebSocketSettings)
+
+- `HOST`, `PORT`: passed to `WebSocketServer`
+- `MAX_FPS`, `JPEG_QUALITY`: primarily used in frontend/legacy paths; DeepStream branch controls encoder via `nvjpegenc`
+
+## tracking (AppConfig.TrackingSettings)
+
+- `USE_NATIVE_DEEPSTREAM_TRACKER`: DeepStream tracker is active
+
+## output (AppConfig.OutputSettings)
+
+- `OUTPUT_DIR`, `SAVE_FRAMES`: respected at higher layers when saving frames; DeepStream provides JPEG bytes
+
+## Runtime configuration via WebSocket
+
+- Detection config updates → `DeepStreamVideoPipeline.update_detection_config()`
+  - Sets `confidence-threshold`, `iou-threshold`, `enable`, `custom-lib-props` for target classes
+- Detection toggles → `update_detection_toggle()` for `detect_people`, `detect_vehicles`, `detect_furniture`
+- Visualization toggle → `set_trail_visualization()` via `toggle_callback`

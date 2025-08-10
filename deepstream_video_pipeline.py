@@ -192,6 +192,9 @@ class DeepStreamVideoPipeline:
         self._demux_requested_pads_by_index: Dict[int, Gst.Pad] = {}
         self._demux_requested_pads_by_sensor: Dict[int, Gst.Pad] = {}
 
+        # Local counter for demux probe observations (used to limit early debug logs)
+        self._demux_probe_seen: int = 0
+
         
         # Initialize GStreamer
         Gst.init(None)
@@ -1165,24 +1168,35 @@ class DeepStreamVideoPipeline:
         if not batch_meta:
             return Gst.PadProbeReturn.OK
 
-        # Log only first 6 frames to avoid spamming
-        if self.frame_count < 6:
-            source_ids = []
-            l_frame = batch_meta.frame_meta_list
-            while l_frame:
-                try:
-                    frame_meta = pyds.NvDsFrameMeta.cast(l_frame.data)
-                    source_ids.append(frame_meta.source_id)
-                    l_frame = l_frame.next
-                except StopIteration:
-                    break
-            self.logger.debug(f"demux sink frame source_ids (first frames): {source_ids}")
-            
-            # Safety check: Assert source_ids are the expected set
-            expected_source_ids = set(range(len(self.sensor_ids)))
-            actual_source_ids = set(source_ids)
-            if actual_source_ids != expected_source_ids:
-                self.logger.warning(f"⚠️ Unexpected source_ids in demux sink: expected {expected_source_ids}, got {actual_source_ids}")
+        # Gather source IDs present in this batch
+        source_ids: List[int] = []
+        l_frame = batch_meta.frame_meta_list
+        while l_frame:
+            try:
+                frame_meta = pyds.NvDsFrameMeta.cast(l_frame.data)
+                source_ids.append(frame_meta.source_id)
+                l_frame = l_frame.next
+            except StopIteration:
+                break
+
+        expected_source_ids = set(range(len(self.sensor_ids)))  # DeepStream uses 0..N-1 source indices
+        actual_source_ids = set(source_ids)
+        unexpected_ids = actual_source_ids - expected_source_ids
+        missing_ids = expected_source_ids - actual_source_ids
+
+        # Warn only if we see IDs outside expected range; this indicates a real issue
+        if unexpected_ids:
+            self.rate_limited_logger.warning(
+                f"⚠️ Demux sink saw unexpected source_ids {sorted(list(unexpected_ids))}; expected range 0..{len(self.sensor_ids)-1}"
+            )
+        else:
+            # It's normal for some sources to be absent in a given batch. Debug early a few times only.
+            if self._demux_probe_seen < 6 and missing_ids:
+                self.logger.debug(
+                    f"demux sink: some sources absent this batch (normal): missing {sorted(list(missing_ids))}, got {sorted(list(actual_source_ids))}"
+                )
+
+        self._demux_probe_seen += 1
         # Continue normal flow without per-frame logging
         return Gst.PadProbeReturn.OK
 
@@ -1920,6 +1934,16 @@ class DeepStreamVideoPipeline:
             while l_obj:
                 obj_meta = pyds.NvDsObjectMeta.cast(l_obj.data)
                 tid = obj_meta.object_id
+                # Update per-object bbox label to include track id and detector confidence
+                try:
+                    if tid != -1:
+                        conf_value = float(obj_meta.confidence)
+                        obj_meta.text_params.display_text = f"id {tid} ({conf_value:.2f})"
+                        # Keep background disabled to avoid covering content
+                        obj_meta.text_params.set_bg_clr = 0
+                except Exception:
+                    # Never break overlay on label formatting issues
+                    pass
                 if tid != -1:
                     cx = obj_meta.rect_params.left + obj_meta.rect_params.width / 2
                     cy = obj_meta.rect_params.top  + obj_meta.rect_params.height

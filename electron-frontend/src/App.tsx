@@ -17,6 +17,7 @@ const Dashboard: React.FC = () => {
   const [livingRoomFPS, setLivingRoomFPS] = useState('FPS: 0.0');
   const [familyRoomFPS, setFamilyRoomFPS] = useState('FPS: 0.0');
   const [trailVisualizationEnabled, setTrailVisualizationEnabled] = useState(true);
+  const [trailsCollapsed, setTrailsCollapsed] = useState(false);
   
   const socketRef = useRef<WebSocket | null>(null);
   const retryCountRef = useRef(0);
@@ -26,6 +27,104 @@ const Dashboard: React.FC = () => {
 
   const lastFpsUpdateTime = useRef(0);
   const FPS_UPDATE_INTERVAL = 2000; // 2 seconds
+
+  // --- Top-Down Trails (client-accumulated) ---
+  // cameraId -> trackId -> array of {x,y}
+  const trailHistRef = useRef<Record<string, Record<number, { x: number; y: number }[]>>>({});
+  // Keep trails decently long (avoid over-trimming)
+  const MAX_TRAIL_POINTS = 300;
+
+  const camToCanvasId = (cam: string) =>
+    cam.includes('kitchen') ? 'map-kitchen' :
+    cam.includes('living') ? 'map-living-room' :
+    cam.includes('family') ? 'map-family-room' : '';
+
+  const colorForId = (id: number) => {
+    const hue = (id * 47) % 360;
+    return `hsl(${hue}, 80%, 60%)`;
+  };
+
+  const clearAllMaps = () => {
+    ['map-kitchen', 'map-living-room', 'map-family-room'].forEach((id) => {
+      const c = document.getElementById(id) as HTMLCanvasElement | null;
+      const ctx = c?.getContext('2d');
+      if (c && ctx) ctx.clearRect(0, 0, c.width, c.height);
+    });
+  };
+
+  const updateTrailsAndDraw = (cameraId: string, activeTracks: any[]) => {
+    const tstore = trailHistRef.current;
+    if (!tstore[cameraId]) tstore[cameraId] = {};
+
+    for (const t of activeTracks) {
+      const tid = Number(t.track_id);
+      const center = t.center;
+      if (!Array.isArray(center) || center.length < 2) continue;
+      const [x, y] = center as [number, number];
+      if (!Number.isFinite(x) || !Number.isFinite(y)) continue;
+      if (!tstore[cameraId][tid]) tstore[cameraId][tid] = [];
+      const arr = tstore[cameraId][tid];
+      arr.push({ x, y });
+      if (arr.length > MAX_TRAIL_POINTS) arr.shift();
+    }
+
+    const canvasId = camToCanvasId(cameraId);
+    const canvas = document.getElementById(canvasId) as HTMLCanvasElement | null;
+    if (!canvas) return;
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return;
+
+    // Compute extents from stored points
+    let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+    for (const tid in tstore[cameraId]) {
+      const pts = tstore[cameraId][Number(tid)] || [];
+      for (const p of pts) {
+        if (p.x < minX) minX = p.x;
+        if (p.y < minY) minY = p.y;
+        if (p.x > maxX) maxX = p.x;
+        if (p.y > maxY) maxY = p.y;
+      }
+    }
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    if (!isFinite(minX) || !isFinite(minY) || !isFinite(maxX) || !isFinite(maxY)) return;
+
+    const pad = 10;
+    const sx = (canvas.width - 2 * pad) / Math.max(1, maxX - minX);
+    const sy = (canvas.height - 2 * pad) / Math.max(1, maxY - minY);
+
+    // Draw faint grid
+    ctx.strokeStyle = '#333';
+    ctx.lineWidth = 1;
+    for (let gx = 0; gx < canvas.width; gx += 20) {
+      ctx.beginPath(); ctx.moveTo(gx, 0); ctx.lineTo(gx, canvas.height); ctx.stroke();
+    }
+    for (let gy = 0; gy < canvas.height; gy += 20) {
+      ctx.beginPath(); ctx.moveTo(0, gy); ctx.lineTo(canvas.width, gy); ctx.stroke();
+    }
+
+    // Draw trails per track
+    Object.keys(tstore[cameraId]).forEach((tidStr) => {
+      const tid = Number(tidStr);
+      const pts = tstore[cameraId][tid];
+      if (!pts || pts.length < 2) return;
+      ctx.beginPath();
+      for (let i = 0; i < pts.length; i++) {
+        const px = pad + (pts[i].x - minX) * sx;
+        const py = pad + (pts[i].y - minY) * sy;
+        if (i === 0) ctx.moveTo(px, py); else ctx.lineTo(px, py);
+      }
+      ctx.strokeStyle = colorForId(tid);
+      ctx.lineWidth = 2;
+      ctx.stroke();
+
+      // Head point
+      const last = pts[pts.length - 1];
+      const hx = pad + (last.x - minX) * sx;
+      const hy = pad + (last.y - minY) * sy;
+      ctx.fillStyle = colorForId(tid);
+      ctx.beginPath(); ctx.arc(hx, hy, 3, 0, Math.PI * 2); ctx.fill();
+    });
+  };
 
   // FPS tracking
   const fpsTrackingRef = useRef({
@@ -347,6 +446,16 @@ const Dashboard: React.FC = () => {
         transitionsHTML = '<li>No recent transitions.</li>';
       }
       setTransitions(transitionsHTML);
+
+      // Render top-down trails using client-accumulated history
+      if (trailVisualizationEnabled) {
+        for (const cameraId in payload.cameras) {
+          const tracking = payload.cameras[cameraId]?.tracking;
+          if (tracking && Array.isArray(tracking.active_tracks)) {
+            updateTrailsAndDraw(cameraId, tracking.active_tracks);
+          }
+        }
+      }
     } else {
       // Handle case where payload.cameras is missing or not an object
       console.warn("Stats payload missing or invalid 'cameras' structure.");
@@ -457,6 +566,8 @@ const Dashboard: React.FC = () => {
           } else if (data.type === 'detection_toggle_update') {
             // console.log('[WebSocket] Received detection toggle update:', data);
             // Handle detection toggle update
+          } else if (data.type === 'toggle_update' && data.toggle_name === 'trail_visualization_enabled') {
+            setTrailVisualizationEnabled(!!data.enabled);
           } else if (data.type === 'trail_visualization_enabled_update') {
             setTrailVisualizationEnabled(data.enabled);
           } else {
@@ -477,6 +588,13 @@ const Dashboard: React.FC = () => {
       console.warn('WebSocket not connected. Cannot send clear_stats message.');
     }
   };
+
+  // Clear canvases when trails toggle is turned off
+  useEffect(() => {
+    if (!trailVisualizationEnabled) {
+      clearAllMaps();
+    }
+  }, [trailVisualizationEnabled]);
 
   useEffect(() => {
     // Start WebSocket connection
@@ -660,6 +778,10 @@ const Dashboard: React.FC = () => {
               <button className="fullscreen-btn" data-target="kitchen-stream">Max</button>
             </div>
             <div id="kitchen-perf" className="perf-stats" style={{ minWidth: '80px', textAlign: 'right' }}>{kitchenFPS}</div>
+            <div className={`trails-mini-map ${trailsCollapsed ? 'collapsed' : 'expanded'}`}>
+              <div className="mini-map-title">Top-Down (Kitchen)</div>
+              <canvas id="map-kitchen" width={220} height={140}></canvas>
+            </div>
           </div>
 
           <div className="video-container">
@@ -669,6 +791,10 @@ const Dashboard: React.FC = () => {
               <button className="fullscreen-btn" data-target="living-room-stream">Max</button>
             </div>
             <div id="living-room-perf" className="perf-stats" style={{ minWidth: '80px', textAlign: 'right' }}>{livingRoomFPS}</div>
+            <div className={`trails-mini-map ${trailsCollapsed ? 'collapsed' : 'expanded'}`}>
+              <div className="mini-map-title">Top-Down (Living Room)</div>
+              <canvas id="map-living-room" width={220} height={140}></canvas>
+            </div>
           </div>
 
           <div className="video-container">
@@ -678,7 +804,20 @@ const Dashboard: React.FC = () => {
               <button className="fullscreen-btn" data-target="family-room-stream">Max</button>
             </div>
             <div id="family-room-perf" className="perf-stats" style={{ minWidth: '80px', textAlign: 'right' }}>{familyRoomFPS}</div>
+            <div className={`trails-mini-map ${trailsCollapsed ? 'collapsed' : 'expanded'}`}>
+              <div className="mini-map-title">Top-Down (Family Room)</div>
+              <canvas id="map-family-room" width={220} height={140}></canvas>
+            </div>
           </div>
+        </div>
+
+        <div
+          id="trails-collapse-handle"
+          className={trailsCollapsed ? 'collapsed' : 'expanded'}
+          onClick={() => setTrailsCollapsed((v) => !v)}
+          title={trailsCollapsed ? 'Expand trails' : 'Collapse trails'}
+        >
+          <span>{trailsCollapsed ? 'Show trails ▾' : 'Hide trails ▸'}</span>
         </div>
 
         <div className="stats-section">

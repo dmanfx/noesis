@@ -402,6 +402,108 @@ th {
     margin-top: 0;
 }
 
+/* Container for trails and legend side by side */
+.trails-and-legend-container {
+    display: flex;
+    gap: 12px;
+    align-items: flex-start;
+    margin-top: 8px;
+}
+
+/* Tracking Legend Styling */
+.tracking-legend {
+    background-color: #4f545f;
+    border-radius: 6px;
+    padding: 12px;
+    box-shadow: 0 2px 5px rgba(0, 0, 0, 0.15);
+    min-width: 120px;
+    max-width: 180px;
+    transition: opacity 0.3s ease, transform 0.3s ease;
+}
+
+.tracking-legend.collapsed {
+    opacity: 0;
+    transform: translateX(-10px);
+}
+
+.legend-title {
+    font-size: 0.85em;
+    color: #e5c07b;
+    margin-bottom: 8px;
+    text-align: center;
+    font-weight: bold;
+    border-bottom: 1px solid #5c6370;
+    padding-bottom: 4px;
+}
+
+.legend-items {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    max-height: 140px;
+    overflow-y: auto;
+}
+
+.legend-item {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 4px 0;
+}
+
+.legend-color-dot {
+    width: 12px;
+    height: 12px;
+    border-radius: 50%;
+    border: 1px solid #5c6370;
+    flex-shrink: 0;
+}
+
+.legend-track-id {
+    font-size: 0.8em;
+    color: #abb2bf;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+/* Responsive adjustments for legend */
+@media (max-width: 1024px) {
+    .trails-and-legend-container {
+        flex-direction: column;
+        gap: 8px;
+    }
+
+    .tracking-legend {
+        min-width: auto;
+        max-width: 100%;
+    }
+
+    .legend-items {
+        max-height: 100px;
+    }
+}
+
+@media (max-width: 640px) {
+    .tracking-legend {
+        padding: 8px;
+        font-size: 0.75em;
+    }
+
+    .legend-item {
+        gap: 6px;
+    }
+
+    .legend-color-dot {
+        width: 10px;
+        height: 10px;
+    }
+
+    .legend-track-id {
+        font-size: 0.75em;
+    }
+}
+
 /* Minimal handle to toggle trails visibility */
 #trails-collapse-handle {
     display: inline-flex;

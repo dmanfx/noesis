@@ -4,6 +4,50 @@ import { TelemetryProvider, useTelemetry } from './telemetry/TelemetryContext';
 import { TelemetryDrawer } from './telemetry/TelemetryDrawer';
 import { TelemetryToggle } from './telemetry/TelemetryToggle';
 
+// Tracking ID Legend Component
+interface TrackingLegendProps {
+  tracks: Array<{
+    track_id: number;
+    camera_id: string;
+    zone?: string;
+    center?: [number, number];
+    dwell_time?: number;
+    velocity?: [number, number];
+  }>;
+  collapsed?: boolean;
+}
+
+const TrackingLegend: React.FC<TrackingLegendProps> = ({ tracks, collapsed = false }) => {
+  const colorForId = (id: number) => {
+    const hue = (id * 47) % 360;
+    return `hsl(${hue}, 80%, 60%)`;
+  };
+
+  if (collapsed || tracks.length === 0) {
+    return null;
+  }
+
+  // Sort tracks by ID for consistent display
+  const sortedTracks = [...tracks].sort((a, b) => a.track_id - b.track_id);
+
+  return (
+    <div className="tracking-legend">
+      <div className="legend-title">Track IDs</div>
+      <div className="legend-items">
+        {sortedTracks.map(track => (
+          <div key={track.track_id} className="legend-item">
+            <div
+              className="legend-color-dot"
+              style={{ backgroundColor: colorForId(track.track_id) }}
+            />
+            <span className="legend-track-id">ID {track.track_id}</span>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+};
+
 const WS_URL = 'ws://localhost:6008';
 
 const Dashboard: React.FC = () => {
@@ -18,6 +62,13 @@ const Dashboard: React.FC = () => {
   const [familyRoomFPS, setFamilyRoomFPS] = useState('FPS: 0.0');
   const [trailVisualizationEnabled, setTrailVisualizationEnabled] = useState(true);
   const [trailsCollapsed, setTrailsCollapsed] = useState(false);
+
+  // State to track active tracks per camera for the legend
+  const [activeTracksPerCamera, setActiveTracksPerCamera] = useState<Record<string, any[]>>({
+    'kitchen': [],
+    'living-room': [],
+    'family-room': []
+  });
   
   const socketRef = useRef<WebSocket | null>(null);
   const retryCountRef = useRef(0);
@@ -375,6 +426,12 @@ const Dashboard: React.FC = () => {
           
           if (trackingData.active_tracks && Array.isArray(trackingData.active_tracks)) {
             allActiveTracks = allActiveTracks.concat(trackingData.active_tracks);
+
+            // Update active tracks per camera for the legend
+            setActiveTracksPerCamera(prev => ({
+              ...prev,
+              [cameraId]: trackingData.active_tracks
+            }));
           }
 
           if (trackingData.transitions && Array.isArray(trackingData.transitions)) {
@@ -517,7 +574,14 @@ const Dashboard: React.FC = () => {
       if (livingRoomImg) livingRoomImg.src = "";
       if (kitchenImg) kitchenImg.src = "";
       if (familyRoomImg) familyRoomImg.src = "";
-      
+
+      // Clear active tracks for legend on disconnect
+      setActiveTracksPerCamera({
+        'kitchen': [],
+        'living-room': [],
+        'family-room': []
+      });
+
       resetFPSTracking();
       
       // Attempt to reconnect
@@ -778,9 +842,15 @@ const Dashboard: React.FC = () => {
               <button className="fullscreen-btn" data-target="kitchen-stream">Max</button>
             </div>
             <div id="kitchen-perf" className="perf-stats" style={{ minWidth: '80px', textAlign: 'right' }}>{kitchenFPS}</div>
-            <div className={`trails-mini-map ${trailsCollapsed ? 'collapsed' : 'expanded'}`}>
-              <div className="mini-map-title">Top-Down (Kitchen)</div>
-              <canvas id="map-kitchen" width={220} height={140}></canvas>
+            <div className="trails-and-legend-container">
+              <div className={`trails-mini-map ${trailsCollapsed ? 'collapsed' : 'expanded'}`}>
+                <div className="mini-map-title">Top-Down (Kitchen)</div>
+                <canvas id="map-kitchen" width={220} height={140}></canvas>
+              </div>
+              <TrackingLegend
+                tracks={activeTracksPerCamera['kitchen'] || []}
+                collapsed={trailsCollapsed}
+              />
             </div>
           </div>
 
@@ -791,9 +861,15 @@ const Dashboard: React.FC = () => {
               <button className="fullscreen-btn" data-target="living-room-stream">Max</button>
             </div>
             <div id="living-room-perf" className="perf-stats" style={{ minWidth: '80px', textAlign: 'right' }}>{livingRoomFPS}</div>
-            <div className={`trails-mini-map ${trailsCollapsed ? 'collapsed' : 'expanded'}`}>
-              <div className="mini-map-title">Top-Down (Living Room)</div>
-              <canvas id="map-living-room" width={220} height={140}></canvas>
+            <div className="trails-and-legend-container">
+              <div className={`trails-mini-map ${trailsCollapsed ? 'collapsed' : 'expanded'}`}>
+                <div className="mini-map-title">Top-Down (Living Room)</div>
+                <canvas id="map-living-room" width={220} height={140}></canvas>
+              </div>
+              <TrackingLegend
+                tracks={activeTracksPerCamera['living-room'] || []}
+                collapsed={trailsCollapsed}
+              />
             </div>
           </div>
 
@@ -804,9 +880,15 @@ const Dashboard: React.FC = () => {
               <button className="fullscreen-btn" data-target="family-room-stream">Max</button>
             </div>
             <div id="family-room-perf" className="perf-stats" style={{ minWidth: '80px', textAlign: 'right' }}>{familyRoomFPS}</div>
-            <div className={`trails-mini-map ${trailsCollapsed ? 'collapsed' : 'expanded'}`}>
-              <div className="mini-map-title">Top-Down (Family Room)</div>
-              <canvas id="map-family-room" width={220} height={140}></canvas>
+            <div className="trails-and-legend-container">
+              <div className={`trails-mini-map ${trailsCollapsed ? 'collapsed' : 'expanded'}`}>
+                <div className="mini-map-title">Top-Down (Family Room)</div>
+                <canvas id="map-family-room" width={220} height={140}></canvas>
+              </div>
+              <TrackingLegend
+                tracks={activeTracksPerCamera['family-room'] || []}
+                collapsed={trailsCollapsed}
+              />
             </div>
           </div>
         </div>

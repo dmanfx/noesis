@@ -278,8 +278,12 @@ export const TelemetryDrawer: React.FC<DrawerProps> = ({open, onClose}) => {
       if (entry.group === 'Connection' || entry.group === 'Application') {
         data.system.push(entry);
       }
-      // Camera performance metrics
-      else if (entry.group.startsWith('Camera ') && entry.key === 'FPS') {
+      // Camera performance metrics - only include client-side FPS tracking (frontend players)
+      else if (entry.group.startsWith('Camera ') &&
+               entry.key === 'FPS' &&
+               (entry.group === 'Camera Living Room' ||
+                entry.group === 'Camera Kitchen' ||
+                entry.group === 'Camera Family Room')) {
         data.performance.fps.push(entry);
       }
       else if (entry.group.startsWith('Camera ') && entry.key === 'Proc ms') {

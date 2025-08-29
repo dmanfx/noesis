@@ -2,11 +2,11 @@ from typing import List, Tuple, Dict, Optional, Any
 import cv2
 import numpy as np
 import random
-import supervision as sv  # Add Supervision import
+# Removed supervision import as it was causing segmentation fault
+# import supervision as sv
 import torch
 import logging
 
-from detection import Detection, Track
 from models import DetectionResult, TrackingResult
 
 # Import GPU visualization if available
@@ -83,7 +83,7 @@ class Visualizer:
     def draw_detections(
         self,
         frame: np.ndarray,
-        detections: List[Detection],
+        detections: List[DetectionResult],
         draw_labels: bool = True,
         draw_confidence: bool = False
     ) -> np.ndarray:
@@ -326,11 +326,12 @@ class VisualizationManager:
         self.nvenc_encoder = None
         self.nvjpeg_encoder = None
         
-        # Add direct Supervision annotators like in YOLOrun_dub.py
-        # BoxAnnotator only accepts thickness parameter
-        self.box_annotator = sv.BoxAnnotator(thickness=2)
-        self.label_annotator = sv.LabelAnnotator(text_thickness=2, text_scale=1.0)
-        self.trace_annotator = sv.TraceAnnotator(thickness=2, trace_length=30)
+        # REMOVED: Supervision annotators commented out due to segmentation fault
+        # # Add direct Supervision annotators like in YOLOrun_dub.py
+        # # BoxAnnotator only accepts thickness parameter
+        # self.box_annotator = sv.BoxAnnotator(thickness=2)
+        # self.label_annotator = sv.LabelAnnotator(text_thickness=2, text_scale=1.0)
+        # self.trace_annotator = sv.TraceAnnotator(thickness=2, trace_length=30)
         
     def initialize(self, config):
         """Initialize visualizer with configuration.
@@ -376,19 +377,20 @@ class VisualizationManager:
             except Exception as e:
                 self.logger.warning(f"Failed to initialize hardware encoders: {e}")
         
-        # Update Supervision annotators with config values
-        # BoxAnnotator only accepts thickness parameter
-        self.box_annotator = sv.BoxAnnotator(
-            thickness=config.visualization.BOX_THICKNESS
-        )
-        self.label_annotator = sv.LabelAnnotator(
-            text_thickness=config.visualization.TEXT_THICKNESS,
-            text_scale=config.visualization.TEXT_SCALE
-        )
-        self.trace_annotator = sv.TraceAnnotator(
-            thickness=config.visualization.BOX_THICKNESS,
-            trace_length=config.visualization.TRACE_LENGTH
-        )
+        # REMOVED: Supervision annotator updates commented out due to segmentation fault
+        # # Update Supervision annotators with config values
+        # # BoxAnnotator only accepts thickness parameter
+        # self.box_annotator = sv.BoxAnnotator(
+        #     thickness=config.visualization.BOX_THICKNESS
+        # )
+        # self.label_annotator = sv.LabelAnnotator(
+        #     text_thickness=config.visualization.TEXT_THICKNESS,
+        #     text_scale=config.visualization.TEXT_SCALE
+        # )
+        # self.trace_annotator = sv.TraceAnnotator(
+        #     thickness=config.visualization.BOX_THICKNESS,
+        #     trace_length=config.visualization.TRACE_LENGTH
+        # )
     
     def get_class_names(self):
         """Get class names, using default if visualizer is not initialized."""
@@ -646,13 +648,14 @@ class VisualizationManager:
                 
                 # Only proceed if we have valid boxes
                 if boxes:
-                    # Create Supervision Detections object
-                    sv_tracked_detections = sv.Detections(
-                        xyxy=np.array(boxes),
-                        confidence=np.array(confidence_values),
-                        class_id=np.array(class_ids),
-                        tracker_id=np.array(tracker_ids)
-                    )
+                    # REMOVED: Supervision Detections creation commented out due to segmentation fault
+                    # # Create Supervision Detections object
+                    # sv_tracked_detections = sv.Detections(
+                    #     xyxy=np.array(boxes),
+                    #     confidence=np.array(confidence_values),
+                    #     class_id=np.array(class_ids),
+                    #     tracker_id=np.array(tracker_ids)
+                    # )
                     
                     # Create labels only for tracks with valid bboxes (those in boxes list)
                     labels = []
@@ -694,9 +697,10 @@ class VisualizationManager:
                             labels.append(label_text)
                             valid_track_count += 1
                     
-                    # Apply annotations in sequence like YOLOrun_dub.py
-                    result = self.box_annotator.annotate(scene=result, detections=sv_tracked_detections)
-                    result = self.label_annotator.annotate(scene=result, detections=sv_tracked_detections, labels=labels)
+                    # REMOVED: Supervision annotations commented out due to segmentation fault
+                    # # Apply annotations in sequence like YOLOrun_dub.py
+                    # result = self.box_annotator.annotate(scene=result, detections=sv_tracked_detections)
+                    # result = self.label_annotator.annotate(scene=result, detections=sv_tracked_detections, labels=labels)
                     
                     # Draw custom traces using stored bottom-centre points instead of centroid
                     if show_traces:

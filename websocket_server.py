@@ -3,6 +3,7 @@ import asyncio
 import websockets
 import json
 import logging
+import time
 
 from models import convert_numpy_types
 
@@ -41,6 +42,7 @@ class WebSocketServer:
         self.running = True
         self.logger = logging.getLogger("WebSocketServer")
         self._stats_task = None # Added reference for the periodic stats task
+        self._last_stats_info_log: float = 0.0
     
     async def _periodic_stats_broadcast(self, interval_seconds: float = 1.0):
         """Periodically fetches and broadcasts stats."""
@@ -48,6 +50,7 @@ class WebSocketServer:
         while self.running:
             try:
                 if self.stats_callback and self.connected_clients: # Only send if callback exists and clients are connected
+                    self.logger.debug(f"📊 Broadcasting stats to {len(self.connected_clients)} clients")
                     stats_payload = self.stats_callback()
                     if stats_payload: # Ensure callback returned something
                         stats_message = {
@@ -55,13 +58,29 @@ class WebSocketServer:
                             'payload': stats_payload
                         }
                         await self.broadcast(stats_message)
+                        self.logger.debug("✅ Stats broadcast completed")
+
+                        # Periodic INFO log (every ~5s) to surface telemetry presence
+                        now = time.time()
+                        if now - self._last_stats_info_log >= 5.0:
+                            try:
+                                cam_count = len((stats_payload or {}).get('cameras', {}))
+                                uptime = (stats_payload or {}).get('uptime', 0)
+                                self.logger.info(f"📡 Stats sent to {len(self.connected_clients)} clients | cameras={cam_count} | uptime={uptime:.1f}s")
+                            except Exception:
+                                # Defensive: never break the loop due to logging
+                                pass
+                            self._last_stats_info_log = now
                     else:
                         self.logger.debug("Stats callback returned empty payload, skipping broadcast.")
                 elif not self.connected_clients:
                     self.logger.debug("No clients connected, skipping stats broadcast.")
-                    
-                # Wait for the next interval
-                await asyncio.sleep(interval_seconds)
+
+                # Wait for the next interval - use longer interval when no clients
+                if not self.connected_clients:
+                    await asyncio.sleep(5.0)  # 5 second interval when no clients
+                else:
+                    await asyncio.sleep(interval_seconds)  # Normal 1 second interval with clients
                 
             except asyncio.CancelledError:
                 self.logger.info("Periodic stats broadcast task cancelled.")
@@ -74,17 +93,22 @@ class WebSocketServer:
     async def start(self):
         """Start the WebSocket server and the periodic stats broadcast."""
         try:
-            # Create server
+            # Remember the running loop for cross-thread broadcasts
+            try:
+                self.event_loop = asyncio.get_running_loop()
+            except RuntimeError:
+                # No running loop; will be set by caller if needed
+                self.event_loop = None
+
+            # Create server with backpressure and heartbeat settings
             self.server = await websockets.serve(
                 self.handle_client,
                 self.host,
-                self.port
-            )
-            
-            # Create server task
-            self.server_task = asyncio.create_task(
-                self.server.wait_closed(), 
-                name="WebSocketServerWaitClosed"
+                self.port,
+                max_size=None,       # allow large binary frames
+                max_queue=1,         # minimize buffering to reduce latency
+                ping_interval=20,    # keep-alive pings
+                ping_timeout=20      # disconnect stale clients
             )
 
             # Start periodic stats broadcast task if callback is provided
@@ -93,10 +117,13 @@ class WebSocketServer:
                     self._periodic_stats_broadcast(),
                     name="PeriodicStatsBroadcast"
                 )
-            
+
             self.logger.info(f"WebSocket server running on {self.host}:{self.port}")
             print(f"🚀 WebSocket server is LIVE on {self.host}:{self.port}")
-            
+            print(f"📡 Server listening for connections on ws://{self.host}:{self.port}")
+            print(f"🔄 Periodic stats broadcast: {'ENABLED' if self.stats_callback else 'DISABLED'}")
+            self.logger.info("WebSocket server startup completed successfully")
+
         except OSError as e:
             self.logger.error(f"Failed to start server (Port {self.port} likely in use): {e}")
             raise
@@ -106,6 +133,7 @@ class WebSocketServer:
     
     async def stop(self):
         """Gracefully stop the WebSocket server and the periodic stats broadcast."""
+        self.logger.info("Stopping WebSocket server...")
         self.running = False
 
         # Cancel the periodic stats task first
@@ -117,19 +145,34 @@ class WebSocketServer:
                 self.logger.info("Periodic stats broadcast task successfully cancelled.")
             except Exception as e:
                  self.logger.error(f"Error waiting for stats task cancellation: {e}")
-        
+
         # Close all client connections
         if self.connected_clients:
-            close_tasks = [client.close() for client in self.connected_clients]
-            await asyncio.gather(*close_tasks, return_exceptions=True)
-            self.connected_clients.clear()
-        
+            try:
+                close_tasks = [client.close() for client in self.connected_clients]
+                await asyncio.gather(*close_tasks, return_exceptions=True)
+                self.connected_clients.clear()
+                self.logger.info(f"Closed {len(close_tasks)} client connections")
+            except Exception as e:
+                self.logger.warning(f"Error closing client connections: {e}")
+
         # Close server
         if self.server:
-            self.server.close()
-            await self.server.wait_closed()
-            self.server = None
-            self.logger.info("WebSocket server stopped")
+            try:
+                self.server.close()
+                await self.server.wait_closed()
+                self.server = None
+                self.logger.info("WebSocket server stopped successfully")
+            except Exception as e:
+                self.logger.error(f"Error stopping WebSocket server: {e}")
+
+        # Cancel server task if it exists
+        if self.server_task and not self.server_task.done():
+            self.server_task.cancel()
+            try:
+                await self.server_task
+            except asyncio.CancelledError:
+                pass
     
     async def handle_client(self, websocket, path=None):
         """Handle incoming WebSocket connections and messages
@@ -351,6 +394,14 @@ class WebSocketServer:
             
         if not self.running:
             return
+        # Guard against closed event loop
+        try:
+            if self.event_loop.is_closed():
+                self.logger.warning("Event loop is closed; dropping broadcast")
+                return
+        except Exception:
+            # If the loop object doesn't implement is_closed, proceed defensively
+            pass
             
         # Create a task in the event loop
         asyncio.run_coroutine_threadsafe(

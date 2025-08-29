@@ -4,14 +4,19 @@ GPU-Only Video Analysis Application
 
 This application provides real-time video analysis using a pure GPU pipeline:
 - NVDEC hardware video decoding (GPU)
-- GPU-accelerated frame preprocessing  
+- GPU-accelerated frame preprocessing
 - TensorRT inference (GPU)
 - Real-time WebSocket streaming
 
 The system uses ZERO CPU fallbacks - all operations must succeed on GPU.
 """
 
+import sys
+print("🚀 main.py script started!", flush=True)
+sys.stdout.flush()
 import argparse
+print("✅ argparse imported", flush=True)
+sys.stdout.flush()
 import asyncio
 import logging
 import multiprocessing
@@ -31,11 +36,9 @@ import cv2
 import numpy as np
 
 from config import AppConfig, config
-from detection import DetectionManager, PoseEstimator
 from models import DetectionResult, TrackingResult, AnalysisFrame, convert_numpy_types
 from deepstream_video_pipeline import create_deepstream_video_processor
 # from gpu_pipeline import UnifiedGPUPipeline, cleanup_all_gpu_resources  # DEPRECATED
-from tracking import TrackingSystem
 from utils import RateLimitedLogger
 
 # Import TensorRT shutdown mode function
@@ -53,12 +56,12 @@ spec = importlib.util.spec_from_file_location("root_utils", utils_file)
 root_utils = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(root_utils)
 
-# Import specific functions
+# Import specific functions from root utils (keep RateLimitedLogger from package)
 setup_logging = root_utils.setup_logging
 ensure_dir = root_utils.ensure_dir
 get_timestamp = root_utils.get_timestamp
 PerformanceMonitor = root_utils.PerformanceMonitor
-RateLimitedLogger = root_utils.RateLimitedLogger
+encode_frame = root_utils.encode_frame
 
 from utils.profiler import profile_step, aggregate_stats
 from utils.cpu_profiler import start_global_profiling, stop_global_profiling, get_global_profiler, profile_function
@@ -70,17 +73,13 @@ from websocket_server import WebSocketServer
 project_root = Path(__file__).parent.absolute()
 sys.path.insert(0, str(project_root))
 
-from database import DatabaseManager
+# Database integration is currently not active; DatabaseManager import removed
 
 # Global interrupt counter for clean shutdown handling
 INTERRUPT_COUNT = 0
 MAX_SHUTDOWN_TIME = 15  # Maximum time to wait for graceful shutdown
 
-try:
-    from simple_dashboard_server import stop_dashboard as stop_simple_dashboard_server
-    SIMPLE_DASHBOARD_SERVER_AVAILABLE = True
-except ImportError:
-    SIMPLE_DASHBOARD_SERVER_AVAILABLE = False
+
 
 import faulthandler; faulthandler.enable()
 
@@ -89,7 +88,7 @@ class ApplicationManager:
 
     def __init__(self, config: AppConfig):
         """Initialize the application manager
-        
+
         Args:
             config: Application configuration
         """
@@ -105,9 +104,12 @@ class ApplicationManager:
         self.multi_stream_processor = None  # Single multi-stream processor
         self.analysis_frame_queue = multiprocessing.Queue(maxsize=100)
         self.streaming_frame_queue = queue.Queue(maxsize=100)
+        # Cache for precomputed WebSocket headers per camera id
+        self._ws_header_cache: Dict[str, bytes] = {}
         
         # Initialize components
         self.websocket_server = None
+        self.websocket_loop = None
         self.visualization_manager = VisualizationManager()
         
         # Initialize async event loop
@@ -187,35 +189,68 @@ class ApplicationManager:
     @profile_function("ApplicationManager.initialize")
     def initialize(self):
         """Initialize application components"""
+        print("🔧 ApplicationManager.initialize() called", flush=True)
+        sys.stdout.flush()
         self.logger.info("Initializing application components")
-        
-        # Create event loop for async tasks
-        self.event_loop = asyncio.new_event_loop()
-        
-        # Initialize WebSocket server
-        self.websocket_server = WebSocketServer(
-            host=self.config.websocket.HOST,
-            port=self.config.websocket.PORT,
-            event_loop=self.event_loop,
-            stats_callback=self._get_stats,
-            toggle_callback=self._handle_toggle_update,
-            initial_trail_state=self.config.visualization.TRAIL_VISUALIZATION_ENABLED
-        )
-        
-        # Add detection configuration callbacks
-        self.websocket_server.detection_config_callback = self._handle_detection_config_update
-        self.websocket_server.detection_toggle_callback = self._handle_detection_toggle
-        
-        # Add detection config getter for initial sync
-        self.websocket_server.detection_config_getter = self._get_detection_config
-        
-        # Load camera sources
-        self._load_camera_sources()
-        
-        # Initialize output directory
-        ensure_dir(self.config.output.OUTPUT_DIR)
-        
-        self.logger.info("Application initialization complete")
+        print("✅ Logger initialized", flush=True)
+        sys.stdout.flush()
+
+        try:
+            print("🔧 Starting try block in initialize()", flush=True)
+            sys.stdout.flush()
+            # Create event loop for async tasks
+            print("🔧 About to create event loop...", flush=True)
+            sys.stdout.flush()
+            self.event_loop = asyncio.new_event_loop()
+            print("✅ Event loop created", flush=True)
+            sys.stdout.flush()
+
+            # Test accessing config properties
+            print("🔧 About to access config.websocket properties...", flush=True)
+            sys.stdout.flush()
+            host = self.config.websocket.HOST
+            port = self.config.websocket.PORT
+            trail_state = self.config.visualization.TRAIL_VISUALIZATION_ENABLED
+            print(f"✅ Config properties accessed: host={host}, port={port}, trail_state={trail_state}", flush=True)
+            sys.stdout.flush()
+
+            # Initialize WebSocket server
+            self.websocket_server = WebSocketServer(
+                host=host,
+                port=port,
+                event_loop=None,  # will run on thread's own loop
+                stats_callback=self._get_stats,
+                toggle_callback=self._handle_toggle_update,
+                initial_trail_state=trail_state
+            )
+
+            # Add detection configuration callbacks
+            self.websocket_server.detection_config_callback = self._handle_detection_config_update
+            self.websocket_server.detection_toggle_callback = self._handle_detection_toggle
+
+            # Add detection config getter for initial sync
+            self.websocket_server.detection_config_getter = self._get_detection_config
+
+            # Debug: Write to stderr instead of stdout
+            import os
+            os.write(2, b"DEBUG: About to load camera sources...\n")
+
+            # Load camera sources
+            os.write(2, b"DEBUG: Loading camera sources...\n")
+            self._load_camera_sources()
+            os.write(2, b"DEBUG: Camera sources loaded\n")
+
+            # Initialize output directory
+            ensure_dir(self.config.output.OUTPUT_DIR)
+
+            self.logger.info("Application initialization complete")
+            print("🎉 ApplicationManager.initialize() completed successfully")
+
+        except Exception as e:
+            print(f"❌ Exception in initialize(): {e}")
+            import traceback
+            traceback.print_exc()
+            raise
     
     @profile_function("ApplicationManager.load_camera_sources")
     def _load_camera_sources(self):
@@ -278,34 +313,51 @@ class ApplicationManager:
         # Check if we have any sources
         if not self.camera_sources:
             self.logger.warning("No camera sources found in configuration")
-    
+
     @profile_function("ApplicationManager.start")
     def start(self):
         """Start all application components"""
+        print("🎯 ApplicationManager.start() called!")
         if self.running:
+            print("⚠️ Application already running, returning")
             return
-            
+
+        print("🚀 Starting application components...")
         self.logger.info("Starting application")
         self.running = True
         self.stop_event.clear()
-        
+
         try:
+            # Start WebSocket server FIRST so frontend can connect while DS initializes
+            self.logger.info("🚀 Starting WebSocket server...")
+            self._start_websocket_server()
+            self.logger.info("✅ WebSocket server startup initiated")
+
             # Start unified GPU pipeline
             self.logger.info("🚀 Starting unified GPU pipeline...")
             self._start_multi_stream_processor()
             self.logger.info("✅ Multi-stream processor started")
-            
+
+            # Now that processor exists, wire WebSocket server to it and start JPEG loop
+            try:
+                if self.websocket_server and self.multi_stream_processor:
+                    self.multi_stream_processor.websocket_server = self.websocket_server
+                    self.logger.info("✅ Provided WebSocket server to multi-stream processor (post-start)")
+                    # Avoid starting duplicate JPEG processing loop
+                    if not hasattr(self, 'jpeg_thread') or not getattr(self, 'jpeg_thread').is_alive():
+                        self._start_jpeg_processing_loop()
+            except Exception as e:
+                self.logger.warning(f"Unable to attach WebSocket server to processor: {e}")
+
             # Start result processing (ALWAYS needed for WebSocket streaming)
             self.logger.info("✅ Starting result processing...")
             self._start_result_processing()
             self.logger.info("✅ Result processing started")
-            
-            # Start WebSocket server
-            self.logger.info("🚀 Starting WebSocket server...")
-            self._start_websocket_server()
-            self.logger.info("✅ WebSocket server startup initiated")
-            
+
             self.logger.info("🎉 Application started successfully")
+            print("🎉 Application started successfully")
+            print("🌐 WebSocket server ready - frontend can now connect!")
+            print(f"📡 Connect to: ws://{self.config.websocket.HOST}:{self.config.websocket.PORT}")
             
         except Exception as e:
             self.logger.error(f"❌ Application startup failed: {e}")
@@ -372,20 +424,43 @@ class ApplicationManager:
             
         # Start server in a background thread
         def run_websocket_server():
+            print("🎯 WebSocket server thread function called!")
             try:
-                # Set event loop for this thread
-                asyncio.set_event_loop(self.event_loop)
-                self.logger.info("WebSocket thread started, setting up event loop")
-                
+                # Create new event loop for this thread (don't share with main thread)
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+                print("🔧 WebSocket thread event loop created")
+                self.logger.info("WebSocket thread started, created new event loop")
+                # Keep reference for shutdown
+                self.websocket_loop = loop
+
+                # Provide the event loop to the WebSocket server so broadcast_sync works
+                try:
+                    if self.websocket_server is not None:
+                        self.websocket_server.event_loop = loop
+                except Exception as e:
+                    self.logger.warning(f"Unable to set WebSocket server event loop: {e}")
+
+                # Check if websocket server exists
+                if self.websocket_server is None:
+                    print("⚠️ WebSocket server is None, skipping startup")
+                    return
+
                 # Run server
                 self.logger.info("Starting WebSocket server...")
-                self.event_loop.run_until_complete(self.websocket_server.start())
+                loop.run_until_complete(self.websocket_server.start())
                 self.logger.info("WebSocket server started successfully")
-                
-                # Run event loop
+
+                # Run event loop to handle connections
                 self.logger.info("Starting WebSocket event loop...")
-                self.event_loop.run_forever()
-                
+                try:
+                    loop.run_forever()
+                except KeyboardInterrupt:
+                    self.logger.info("WebSocket server received keyboard interrupt")
+                finally:
+                    # Clean up the event loop
+                    loop.close()
+
             except Exception as e:
                 self.logger.error(f"WebSocket server thread failed: {e}")
                 import traceback
@@ -398,24 +473,37 @@ class ApplicationManager:
         )
         
         try:
+            print("🔧 About to start WebSocket server thread...")
             self.websocket_thread.start()
+            print("✅ WebSocket server thread started")
             self.logger.info(f"Started WebSocket server thread on {self.config.websocket.HOST}:{self.config.websocket.PORT}")
-            
+
             # Give the thread a moment to start
+            print("⏳ Waiting for WebSocket thread to initialize...")
             time.sleep(0.5)
-            
+
             if self.websocket_thread.is_alive():
+                print("✅ WebSocket server thread is alive")
                 self.logger.info("✅ WebSocket server thread is running")
+
+                # Wait a bit more for the websocket server to actually start listening
+                print("⏳ Waiting for WebSocket server to bind to port...")
+                time.sleep(2.0)  # Give it time to bind
+                print("✅ WebSocket server should be ready now")
+
                 # Provide websocket_server instance to the multi-stream processor
                 if hasattr(self, 'multi_stream_processor') and self.multi_stream_processor:
                     self.multi_stream_processor.websocket_server = self.websocket_server
                     self.logger.info("✅ WebSocket server instance provided to multi-stream processor")
-                    
+                    print("✅ WebSocket server instance provided to multi-stream processor")
+
                     # Start JPEG processing loop for native DeepStream OSD mode
                     self._start_jpeg_processing_loop()
                 else:
                     self.logger.warning("⚠️ Multi-stream processor not available to assign WebSocket server")
+                    print("⚠️ Multi-stream processor not available to assign WebSocket server")
             else:
+                print("❌ WebSocket server thread is NOT alive")
                 self.logger.error("❌ WebSocket server thread failed to start")
                 
         except Exception as e:
@@ -436,8 +524,18 @@ class ApplicationManager:
             if not source_info:
                 self.logger.error("No source info available from multi-stream processor")
                 return
-            
+            # Per-source counters to surface activity
+            frames_sent = {sid: 0 for sid in source_info.keys()}
+            last_info_log = time.time()
             self.logger.info(f"Processing JPEG data for {len(source_info)} sources: {list(source_info.keys())}")
+            # Precompute headers for each camera clean name
+            for sid, info in source_info.items():
+                camera_id = info['clean_name']
+                cam_id_bytes = camera_id.encode('utf-8')
+                if len(cam_id_bytes) <= 255:
+                    self._ws_header_cache[camera_id] = bytes([len(cam_id_bytes)]) + cam_id_bytes
+                else:
+                    self.logger.error(f"Camera ID too long to cache header: {camera_id}")
             
             heartbeat_t = time.time()
             while self.running:
@@ -464,23 +562,47 @@ class ApplicationManager:
                         if success and jpeg_bytes and self.websocket_server:
                             # Use clean camera name for frontend
                             camera_id = info['clean_name']
-                            cam_id_bytes = camera_id.encode('utf-8')
-                            
-                            # Construct binary message: [camera_id_length][camera_id][jpeg_data]
-                            if len(cam_id_bytes) <= 255:
-                                msg = bytes([len(cam_id_bytes)]) + cam_id_bytes + jpeg_bytes
-                                self.websocket_server.broadcast_sync(msg)
-                                self.logger.info(f"TRACE broadcast JPEG frame for {camera_id}: {len(jpeg_bytes)} bytes")
-                                self.rate_limited_logger.debug(f"Broadcast JPEG frame for {camera_id}: {len(jpeg_bytes)} bytes")
-                            else:
-                                self.logger.error(f"Camera ID too long: {len(cam_id_bytes)} bytes for {camera_id}")
+                            # Get or compute header
+                            header = self._ws_header_cache.get(camera_id)
+                            if header is None:
+                                cam_id_bytes = camera_id.encode('utf-8')
+                                if len(cam_id_bytes) <= 255:
+                                    header = bytes([len(cam_id_bytes)]) + cam_id_bytes
+                                    self._ws_header_cache[camera_id] = header
+                                else:
+                                    self.logger.error(f"Camera ID too long: {len(cam_id_bytes)} bytes for {camera_id}")
+                                    continue
+                            # Send precomputed header + payload
+                            msg = header + jpeg_bytes
+                            self.websocket_server.broadcast_sync(msg)
+                            # Count frames per source and occasionally surface INFO logs
+                            try:
+                                frames_sent[source_id] += 1
+                            except Exception:
+                                frames_sent[source_id] = 1
+                            self.rate_limited_logger.debug(f"Broadcast JPEG frame for {camera_id}: {len(jpeg_bytes)} bytes")
+
+                    # Periodic INFO summary: frames sent and JPEG queue sizes
+                    if time.time() - last_info_log >= 5.0:
+                        try:
+                            qsizes = {sid: q.qsize() for sid, q in self.multi_stream_processor.jpeg_queues.items()}
+                        except Exception:
+                            qsizes = {}
+                        summary_counts = {source_id: frames_sent.get(source_id, 0) for source_id in source_info.keys()}
+                        self.logger.info(f"📤 JPEG broadcast summary (last 5s): sent={summary_counts} | queues={qsizes} | clients={len(getattr(self.websocket_server, 'connected_clients', []))}")
+                        # Reset counters for next window
+                        frames_sent = {sid: 0 for sid in source_info.keys()}
+                        last_info_log = time.time()
                 
                 except Exception as e:
                     self.logger.error(f"Error in JPEG processing loop: {e}")
                     if not self.running:
                         break
                     time.sleep(0.1)  # Brief pause on error
-            
+
+                # Rate limit the loop to ~30 FPS instead of spinning at 100% CPU
+                time.sleep(0.033)
+
             self.logger.info("JPEG processing loop stopped")
         
         # Start JPEG processing thread
@@ -575,18 +697,16 @@ class ApplicationManager:
                     mask_alpha=self.config.visualization.MASK_ALPHA
                 )
             
-            # Encode frame for streaming with profiling
+            # Encode frame as JPEG (single operation, remove duplication)
+            jpeg_quality = int(getattr(self.config.visualization, 'JPEG_QUALITY', 85))
             if self.perf_monitor and self.config.processing.ENABLE_PROFILING:
                 with profile_step("frame_encoding", self.perf_monitor):
-                    # Encode frame as JPEG
-                    _, buffer = cv2.imencode('.jpg', annotated_frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
-                    self.logger.debug(f"JPEG buffer type: {type(buffer)}, shape: {getattr(buffer, 'shape', 'N/A')}")
-                    jpeg_data = buffer.tobytes()
+                    jpeg_data = encode_frame(annotated_frame, quality=jpeg_quality)
             else:
-                # Encode frame as JPEG
-                _, buffer = cv2.imencode('.jpg', annotated_frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
-                self.logger.debug(f"JPEG buffer type: {type(buffer)}, shape: {getattr(buffer, 'shape', 'N/A')}")
-                jpeg_data = buffer.tobytes()
+                jpeg_data = encode_frame(annotated_frame, quality=jpeg_quality)
+            if not jpeg_data:
+                self.logger.warning("JPEG encoding returned no data; skipping frame broadcast")
+                return
             
             # Create binary frame message for WebSocket broadcasting
             # Format: [camera_id_length(1 byte)][camera_id][jpeg_data]
@@ -597,9 +717,13 @@ class ApplicationManager:
                 self.logger.error(f"Camera ID too long: {camera_id_length} bytes")
                 return
                 
-            # Construct binary message
-            self.logger.debug(f"Camera ID length: {camera_id_length}, Camera ID bytes: {len(camera_id_bytes)}, JPEG data type: {type(jpeg_data)}, JPEG data length: {len(jpeg_data)}")
-            binary_message = bytes([camera_id_length]) + camera_id_bytes + jpeg_data
+            # Construct binary message using cached header per camera
+            if analysis_frame.camera_id not in self._ws_header_cache:
+                header = bytes([camera_id_length]) + camera_id_bytes
+                self._ws_header_cache[analysis_frame.camera_id] = header
+            header = self._ws_header_cache[analysis_frame.camera_id]
+            self.logger.debug(f"Camera ID length: {camera_id_length}, JPEG length: {len(jpeg_data)}")
+            binary_message = header + jpeg_data
             #self.logger.debug(f"Binary message type: {type(binary_message)}, length: {len(binary_message)}")
             
             # Broadcast frame via WebSocket with profiling  
@@ -930,21 +1054,23 @@ class ApplicationManager:
         if self.websocket_server:
             try:
                 self.logger.info("Stopping WebSocket server")
-                # Stop WebSocket server gracefully with timeout
-                if self.event_loop and not self.event_loop.is_closed():
+                # If websocket server thread loop exists, stop via that loop
+                if hasattr(self, 'websocket_loop') and self.websocket_loop:
                     try:
-                        fut = asyncio.run_coroutine_threadsafe(self.websocket_server.stop(), self.event_loop)
+                        fut = asyncio.run_coroutine_threadsafe(self.websocket_server.stop(), self.websocket_loop)
                         fut.result(timeout=4.0)
-                    except (asyncio.TimeoutError, Exception) as e:
-                        self.logger.warning(f"WebSocket server stop timed out or failed: {e}")
-                    
-                    # Close the event loop
-                    try:
-                        self.event_loop.close()
-                        asyncio.set_event_loop(None)
                     except Exception as e:
-                        self.logger.warning(f"Error closing event loop: {e}")
-                
+                        self.logger.warning(f"WebSocket server stop via thread loop failed/timed out: {e}")
+                    try:
+                        self.websocket_loop.call_soon_threadsafe(self.websocket_loop.stop)
+                    except Exception:
+                        pass
+                else:
+                    # Fallback: mark not running
+                    try:
+                        self.websocket_server.running = False
+                    except Exception:
+                        pass
                 self.logger.info("Stopped WebSocket server")
             except Exception as e:
                 self.logger.error(f"Error stopping WebSocket server: {e}")
@@ -965,14 +1091,6 @@ class ApplicationManager:
                 self.logger.info("Stopped comprehensive CPU profiling")
             except Exception as e:
                 self.logger.error(f"Error stopping CPU profiling: {e}")
-        
-        # STEP 8: Stop dashboard servers
-        try:
-            if SIMPLE_DASHBOARD_SERVER_AVAILABLE:
-                stop_simple_dashboard_server()
-                self.logger.info("Stopped simple dashboard server")
-        except Exception as e:
-            self.logger.error(f"Error stopping simple dashboard server: {e}")
         
         self.logger.info("Application stopped")
 
@@ -1115,24 +1233,31 @@ def update_config_from_args(args):
 
 def main():
     """Main application entry point"""
+    print("🔧 Starting main() function...")
     # Parse command line arguments
     args = parse_arguments()
-    
+    print("✅ Arguments parsed")
+
     # Update configuration from arguments
     update_config_from_args(args)
-    
+    print("✅ Configuration updated")
+
     # Set up logging
     setup_logging(
         log_level=config.app.LOG_LEVEL,
         log_file=config.app.LOG_FILE
     )
-    
+    print("✅ Logging setup complete")
+
     logger = logging.getLogger("main")
+    print("🔧 Logger created")
     logger.info("Starting GPU-Only Video Analysis Application")
     logger.info(f"Configuration: {config}")
-    
+
+    print("🔧 Creating application manager...")
     # Create application manager
     app_manager = ApplicationManager(config)
+    print("✅ Application manager created")
     
     try:
         # Initialize application

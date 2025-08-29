@@ -28,9 +28,7 @@ from collections import defaultdict, deque
 from typing import Optional, Tuple, Dict, Any, List, Union
 
 import torch
-import cupy as cp  # For zero-copy GPU tensor handling
 import math
-from torch.utils import dlpack  # Re-imported for explicit dlpack module usage
 
 # GStreamer imports
 import gi
@@ -44,12 +42,13 @@ import pyds  # type: ignore  # noqa: E402
 
 # Local imports
 from websocket_server import WebSocketServer  # noqa: E402
-from exponential_backoff import ExponentialBackoff  # noqa: E402
+
 from utils import RateLimitedLogger  # noqa: E402
 import requests  # For REST API calls to nvmultiurisrcbin
 
-# Initialize GStreamer
-Gst.init(None)
+# Defer GStreamer initialization to runtime to avoid crashing at import time
+# Some environments (or tracer/proxy setups) can abort during init; doing this
+# lazily makes failures easier to diagnose and avoids import-time crashes.
 
 from config import AppConfig  # noqa: E402
 
@@ -70,6 +69,15 @@ class DeepStreamVideoPipeline:
     def __init__(self, sources: List[Dict[str, Any]], config: AppConfig, websocket_port: int = 8765, 
                          config_file: str = "pipelines/config_infer_primary_yolo11.ini",
         preproc_config: str = "pipelines/config_preproc.ini"):
+        # Initialize GStreamer as early as possible, but at runtime (not module import)
+        try:
+            Gst.init(None)
+        except Exception as e:
+            # Provide clearer guidance if init fails
+            raise RuntimeError(f"Failed to initialize GStreamer: {e}.\n"
+                               f"Hints: ensure DeepStream is installed and environment is activated.\n"
+                               f"Try: source ./activate_deepstream.sh and verify gst-inspect-1.0 works.")
+
         # Multi-stream configuration
         self.sources = [source for source in sources if source.get('enabled', True)]
         self.websocket_port = websocket_port
@@ -123,7 +131,6 @@ class DeepStreamVideoPipeline:
         self.pipeline: Optional[Gst.Pipeline] = None
         self.mainloop: Optional[GLib.MainLoop] = None
         self.websocket_server: Optional[WebSocketServer] = None
-        self.backoff = ExponentialBackoff()
 
         
         # Threading and state management
@@ -143,6 +150,34 @@ class DeepStreamVideoPipeline:
         self.multiurisrc_port = 9000
         
         self.logger.info(f"📊 Pipeline config: batch_size={self.batch_size}, resolution={self.max_width}x{self.max_height}")
+        
+        # Preflight: verify required DeepStream plugins are available with helpful errors
+        try:
+            registry = Gst.Registry.get()
+            required = [
+                ("nvmultiurisrcbin", "DeepStream multi-URI source (nvmultiurisrcbin)"),
+                ("nvdspreprocess", "DeepStream preprocessor (nvdspreprocess)"),
+                ("nvinfer", "DeepStream inference (nvinfer)"),
+                ("nvstreamdemux", "DeepStream stream demux (nvstreamdemux)"),
+                ("nvdsosd", "DeepStream on-screen display (nvdsosd)"),
+                ("nvjpegenc", "NVIDIA JPEG encoder (nvjpegenc)")
+            ]
+            missing = []
+            for name, desc in required:
+                if not registry.find_feature(name, Gst.ElementFactory):
+                    missing.append(f"{name} – {desc}")
+            if missing:
+                hint_env = (
+                    "Required DeepStream plugins not found:\n  - " + "\n  - ".join(missing) +
+                    "\n\nFix: source DeepStream env and set GST paths, e.g.:\n"
+                    "  export DEEPSTREAM_DIR=/opt/nvidia/deepstream/deepstream\n"
+                    "  export GST_PLUGIN_PATH=$DEEPSTREAM_DIR/lib/gst-plugins:$GST_PLUGIN_PATH\n"
+                    "Also verify with: gst-inspect-1.0 nvmultiurisrcbin\n"
+                )
+                raise RuntimeError(hint_env)
+        except Exception as e:
+            # Bubble up with context so startup reports a clear error instead of aborting
+            raise
         
         # Add missing attributes for compatibility
         self.frame_count = 0
@@ -196,8 +231,7 @@ class DeepStreamVideoPipeline:
         self._demux_probe_seen: int = 0
 
         
-        # Initialize GStreamer
-        Gst.init(None)
+        # GStreamer already initialized at module import
         
         # Create pipeline elements
         self._create_pipeline()
@@ -1060,10 +1094,7 @@ class DeepStreamVideoPipeline:
             self.mainloop_thread.start()
             
             self.logger.info("✅ DeepStream pipeline started successfully")
-            
-            # Start video consumer loop
-            GObject.timeout_add(33, self._video_consumer_loop)
-            
+
             # Log pipeline state after a short delay
             def check_pipeline_state():
                 time.sleep(2)
@@ -1096,15 +1127,7 @@ class DeepStreamVideoPipeline:
         self.mainloop = GLib.MainLoop()
         self.mainloop.run()
     
-    def _video_consumer_loop(self) -> bool:
-        """
-        Video consumer loop placeholder. Main application handles JPEG broadcast.
-        Kept as a no-op to maintain timer without sending JSON with bytes.
-        
-        Returns:
-            bool: True to keep the timeout active
-        """
-        return True  # keep the timeout active
+
     
 
     

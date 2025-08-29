@@ -8,7 +8,24 @@ __pycache__/
 
 # IDE and OS files
 .DS_Store
+.vscode/
+
+
 
 # Log files
 logs/
 *.log
+output/
+
+#ignore archived folders
+legacy/
+
+
+#ignore dev docs
+docs/completed/
+docs/deprecated/
+docs/fixes/
+docs/implementation/
+docs/plans/
+docs/*.md
+

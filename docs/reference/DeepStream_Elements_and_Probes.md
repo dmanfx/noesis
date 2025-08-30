@@ -6,7 +6,6 @@ This document summarizes the elements created in `deepstream_video_pipeline.py`,
 
 - nvmultiurisrcbin (multiurisrc)
   - Properties: `uri-list`, `sensor-id-list`, `max-batch-size`, `width`, `height`, `batched-push-timeout=-1`, `live-source=1`, `drop-pipeline-eos=1`, `rtsp-reconnect-interval=30`, `port`, `ip-address="localhost"`
-  - Probe: src pad (debug trace of initial buffers)
 
 - nvdspreprocess (preprocess)
   - Properties: `config-file = config.processing.DEEPSTREAM_PREPROCESS_CONFIG`
@@ -29,10 +28,11 @@ This document summarizes the elements created in `deepstream_video_pipeline.py`,
 - nvstreamdemux (demux)
   - Pads: Request pads `src_%u` acquired once via helper and reused across calibration/branches
   - Calibration: one-shot probe maps pad → `frame_meta.source_id` (0-based) → configured `sensor_id`
+  - Probe: sink pad → demux debug probe (logs present source_ids per batch)
 
 - Per-branch nvdsosd (one per stream)
   - Properties: `process-mode=0` (GPU), `display-text=1`
-  - Probe: sink pad → `_osd_sink_pad_buffer_probe(sensor_id)` draws overlays only for that stream
+  - Probe: sink pad → `_per_branch_osd_probe(sensor_id)` draws overlays only for that stream
 
 ## Per-Stream Branch (per demux pad)
 

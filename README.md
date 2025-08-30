@@ -2,7 +2,7 @@
 
 Noesis is a high-performance, real-time video analytics application designed for pure GPU processing. It leverages the power of NVIDIA DeepStream to create an end-to-end pipeline that handles everything from video decoding to AI inference and streaming, all on the GPU. This approach minimizes CPU bottlenecks and provides a robust, scalable foundation for demanding video analysis tasks.
 
-![Pipeline Flow](docs/reference/pipeline_flow.png)
+See diagrams in `docs/reference/pipeline_flow.md`.
 
 ## Key Features
 
@@ -24,20 +24,19 @@ Noesis is a high-performance, real-time video analytics application designed for
 The Noesis pipeline is divided into two main layers:
 
 1.  **DeepStream Pipeline Layer**: This is the core of the application, where all heavy lifting is done. It's a GStreamer pipeline that uses a series of optimized plugins to:
-    - Decode multiple RTSP streams (`nvurisrcbin`).
-    - Batch them for efficient processing (`nvstreammux`).
+    - Decode and batch multiple streams (`nvmultiurisrcbin`).
     - Preprocess the frames for inference (`nvdspreprocess`).
     - Run a YOLOv11 object detection model (`nvinfer`).
     - Track objects across frames (`nvtracker`).
     - Perform high-level analytics (`nvdsanalytics`).
-    - Overlay visualizations on the video (`nvdsosd`).
+    - Overlay visualizations on the video per stream (`nvdsosd` in per-branch paths).
 
 2.  **Python Application Layer**: This layer acts as a high-level coordinator. It starts and stops the DeepStream pipeline, extracts metadata and processed frames, and handles application-level logic:
-    - The `DeepStreamProcessorWrapper` class encapsulates the DeepStream pipeline, providing a clean interface for the main application.
+    - The `DeepStreamVideoPipeline` class encapsulates the DeepStream pipeline, providing a clean interface for the main application.
     - The `ApplicationManager` coordinates all components, including the pipeline, WebSocket server, and result processing.
     - A `WebSocketServer` streams video and analytics data to a web frontend and allows for real-time configuration changes.
 
-For a more detailed breakdown of the pipeline, see the [DeepStream Pipeline Map](docs/reference/DEEPSTREAM_PIPELINE_MAP.md).
+For a more detailed breakdown of the pipeline, see the `docs/reference/DEEPSTREAM_PIPELINE_MAP.md`.
 
 ## Getting Started
 
@@ -63,7 +62,14 @@ For a more detailed breakdown of the pipeline, see the [DeepStream Pipeline Map]
     pip install -r requirements.txt
     ```
 
-3.  **Configure the pipeline**:
+3.  **Activate DeepStream environment (once per shell)**:
+    ```bash
+    source ./activate_deepstream.sh
+    # Optional sanity check
+    gst-inspect-1.0 nvmultiurisrcbin | head -n 5
+    ```
+
+4.  **Configure the pipeline**:
     - Edit `config.py` to set up your camera streams, model paths, and other pipeline settings.
     - Review the DeepStream configuration files (`config_infer_primary_yolo11.txt`, `config_preproc.txt`, etc.) to customize the inference and preprocessing steps.
 
@@ -88,6 +94,7 @@ python main.py --webcam
 To start the dashboard UI in development mode run the following inside `electron-frontend`:
 
 ```bash
+npm install
 npm run dev
 ```
 
@@ -95,8 +102,8 @@ For a production build run `npm run build` and then launch Electron with `npm st
 
 ## Documentation
 
-- **[DeepStream Pipeline Map](docs/reference/DEEPSTREAM_PIPELINE_MAP.md)**: A detailed, step-by-step map of the entire pipeline, from input to output.
-- **[Pipeline Flow](docs/pipeline_flow.md)**: A high-level overview of the pipeline's architecture with Mermaid diagrams.
+- `docs/reference/DEEPSTREAM_PIPELINE_MAP.md`: Detailed map of the entire pipeline, from input to output.
+- `docs/reference/pipeline_flow.md`: High-level architecture with Mermaid diagrams.
 
 ## Contributing
 
@@ -104,4 +111,4 @@ Contributions are welcome! Please feel free to submit a pull request or open an 
 
 ## License
 
-This project is licensed under the MIT License. See the `LICENSE` file for more details. 
+This project is licensed under the MIT License.

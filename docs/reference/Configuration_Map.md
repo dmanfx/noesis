@@ -23,18 +23,18 @@ This document maps `config.py` sections and keys to their use in `deepstream_vid
 
 ## visualization (AppConfig.VisualizationSettings)
 
-- Trail visualization parameters consumed by `_osd_sink_pad_buffer_probe()`:
+- Trail visualization parameters consumed by `_per_branch_osd_probe()`:
   - `TRAIL_LENGTH`, `TRAIL_TIMEOUT_S`, `TRAIL_DRAW_STRIDE`, `TRAIL_SHOW_LABELS`, `TRAIL_DRAW_SEGMENTS`
-- `USE_NATIVE_DEEPSTREAM_OSD`: native OSD is used
+- `USE_NATIVE_DEEPSTREAM_OSD`: application-level flag in `main.py` that bypasses Python annotation; DeepStream OSD runs in per-branch paths regardless.
 
 ## websocket (AppConfig.WebSocketSettings)
 
 - `HOST`, `PORT`: passed to `WebSocketServer`
-- `MAX_FPS`, `JPEG_QUALITY`: primarily used in frontend/legacy paths; DeepStream branch controls encoder via `nvjpegenc`
+- `MAX_FPS`, `JPEG_QUALITY`: front-end throttling defaults; note that `visualization.JPEG_QUALITY` now configures the DeepStream `nvjpegenc` quality used for binary frames
 
 ## tracking (AppConfig.TrackingSettings)
 
-- `USE_NATIVE_DEEPSTREAM_TRACKER`: DeepStream tracker is active
+- `USE_NATIVE_DEEPSTREAM_TRACKER`: currently informational; pipeline always uses `nvtracker`
 
 ## output (AppConfig.OutputSettings)
 

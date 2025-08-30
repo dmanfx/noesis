@@ -168,7 +168,7 @@ Analytics are configured via the two `nvdsanalytics` INI files and validated via
 
 ### ✅ Implemented Components
 1. **DeepStream Pipeline**: Complete with YOLO-11 integration
-2. **Zero-Copy Tensor Extraction**: Working with CuPy/PyTorch
+2. **Metadata via Buffer Probes**: Analytics/telemetry extracted without tensor appsinks
 3. **Native OSD Mode**: GPU-encoded JPEG streaming
 4. **Python OSD Mode**: Frame annotation and processing
 5. **WebSocket Server**: Binary frame streaming

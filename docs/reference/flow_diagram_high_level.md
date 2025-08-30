@@ -12,12 +12,11 @@ graph TD
     C --> D[nvinfer (YOLO11)]
     D --> E[nvtracker]
     E --> F[nvdsanalytics (post)]
-    F --> G[nvdsosd]
-    G --> H[nvstreamdemux]
+    F --> H[nvstreamdemux]
   end
 
   subgraph "Python Application"
-    H --> I[Dynamic JPEG Branches\nqueue → nvvideoconvert → caps(NV12, NVMM) → nvjpegenc → appsink]
+    H --> I[Dynamic JPEG Branches\nqueue → nvvideoconvert → caps(RGBA, NVMM) → nvdsosd → nvvideoconvert → caps(I420, NVMM) → nvjpegenc → appsink]
     I --> J[WebSocket Server]
     F -. telemetry .-> K[Analytics Probe\n(_analytics_probe)]
     K --> J

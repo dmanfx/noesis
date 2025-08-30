@@ -44,11 +44,39 @@ class WebSocketServer:
         self._stats_task = None # Added reference for the periodic stats task
         self._last_stats_info_log: float = 0.0
     
+    async def _cleanup_stale_connections(self):
+        """Periodically clean up any stale or closed connections"""
+        try:
+            stale_clients = set()
+            for client in self.connected_clients:
+                # Check if client connection is closed
+                if client.closed:
+                    stale_clients.add(client)
+
+            if stale_clients:
+                for client in stale_clients:
+                    if client in self.connected_clients:
+                        self.connected_clients.remove(client)
+                        client_ip = client.remote_address if hasattr(client, 'remote_address') else "Unknown"
+                        self.logger.info(f"Cleaned up stale connection for client {client_ip}")
+                self.logger.debug(f"Cleaned up {len(stale_clients)} stale connections")
+
+        except Exception as e:
+            self.logger.error(f"Error during connection cleanup: {e}")
+
     async def _periodic_stats_broadcast(self, interval_seconds: float = 1.0):
         """Periodically fetches and broadcasts stats."""
         self.logger.info(f"Starting periodic stats broadcast every {interval_seconds} seconds.")
+        cleanup_counter = 0
+
         while self.running:
             try:
+                # Periodic cleanup of stale connections (every 30 seconds)
+                cleanup_counter += 1
+                if cleanup_counter >= 30:
+                    await self._cleanup_stale_connections()
+                    cleanup_counter = 0
+
                 if self.stats_callback and self.connected_clients: # Only send if callback exists and clients are connected
                     self.logger.debug(f"📊 Broadcasting stats to {len(self.connected_clients)} clients")
                     stats_payload = self.stats_callback()
@@ -81,7 +109,7 @@ class WebSocketServer:
                     await asyncio.sleep(5.0)  # 5 second interval when no clients
                 else:
                     await asyncio.sleep(interval_seconds)  # Normal 1 second interval with clients
-                
+
             except asyncio.CancelledError:
                 self.logger.info("Periodic stats broadcast task cancelled.")
                 break # Exit loop if task is cancelled
@@ -176,7 +204,7 @@ class WebSocketServer:
     
     async def handle_client(self, websocket, path=None):
         """Handle incoming WebSocket connections and messages
-        
+
         Args:
             websocket: WebSocket connection
             path: WebSocket path
@@ -185,7 +213,7 @@ class WebSocketServer:
         self.connected_clients.add(websocket)
         self.logger.info(f"Client {client_ip} connected. Total clients: {len(self.connected_clients)}")
         print(f"✅ Client {client_ip} connected! Total clients: {len(self.connected_clients)}")
-        
+
         try:
             # Send initial detection configuration to new client
             if hasattr(self, 'detection_config_getter') and self.detection_config_getter:
@@ -212,12 +240,12 @@ class WebSocketServer:
                 self.logger.info(f"Sent initial trail visualization state ({self.initial_trail_state}) to {client_ip}")
             except Exception as e:
                 self.logger.warning(f"Could not send initial trail visualization state to {client_ip}: {e}")
-            
+
             # Process messages from client
             async for message in websocket:
                 try:
                     data = json.loads(message)
-                    
+
                     # Handle clear_stats command
                     if data.get('type') == 'clear_stats':
                         self.logger.info(f"Received clear_stats request from {client_ip}")
@@ -235,22 +263,22 @@ class WebSocketServer:
                                 await self.broadcast(stats_message)
                         else:
                             self.logger.warning("Stats callback not available to clear stats.")
-                    
+
                     # Handle visualization toggle command
                     elif data.get('type') == 'set_vis_toggle':
                         toggle_name = data.get('toggle_name')
                         enabled = data.get('enabled')
-                        
+
                         if toggle_name is not None and isinstance(enabled, bool):
                             self.logger.info(f"Received set_vis_toggle from {client_ip}: {toggle_name} = {enabled}")
-                            
+
                             # Call toggle callback if available
                             if self.toggle_callback:
                                 try:
                                     self.toggle_callback(toggle_name, enabled)
                                 except Exception as e:
                                     self.logger.error(f"Error in toggle callback: {e}")
-                            
+
                             # Broadcast to all clients including the sender
                             broadcast_message = {
                                 'type': 'toggle_update',
@@ -260,21 +288,21 @@ class WebSocketServer:
                             await self.broadcast(broadcast_message)
                         else:
                             self.logger.warning(f"Invalid set_vis_toggle message from {client_ip}: {data}")
-                    
+
                     # Handle detection configuration updates
                     elif data.get('type') == 'update_detection_config':
                         config_data = data.get('config', {})
-                        
+
                         if config_data:
                             self.logger.info(f"Received detection config update from {client_ip}: {config_data}")
-                            
+
                             # Call detection config callback if available
                             if hasattr(self, 'detection_config_callback') and self.detection_config_callback:
                                 try:
                                     self.detection_config_callback(config_data)
                                 except Exception as e:
                                     self.logger.error(f"Error in detection config callback: {e}")
-                            
+
                             # Broadcast to all clients including the sender
                             broadcast_message = {
                                 'type': 'detection_config_update',
@@ -283,22 +311,22 @@ class WebSocketServer:
                             await self.broadcast(broadcast_message)
                         else:
                             self.logger.warning(f"Invalid detection config message from {client_ip}: {data}")
-                    
+
                     # Handle individual detection toggles
                     elif data.get('type') == 'set_detection_toggle':
                         toggle_name = data.get('toggle_name')
                         enabled = data.get('enabled')
-                        
+
                         if toggle_name is not None and isinstance(enabled, bool):
                             self.logger.info(f"Received detection toggle from {client_ip}: {toggle_name} = {enabled}")
-                            
+
                             # Call detection toggle callback if available
                             if hasattr(self, 'detection_toggle_callback') and self.detection_toggle_callback:
                                 try:
                                     self.detection_toggle_callback(toggle_name, enabled)
                                 except Exception as e:
                                     self.logger.error(f"Error in detection toggle callback: {e}")
-                            
+
                             # Broadcast to all clients including the sender
                             broadcast_message = {
                                 'type': 'detection_toggle_update',
@@ -308,38 +336,41 @@ class WebSocketServer:
                             await self.broadcast(broadcast_message)
                         else:
                             self.logger.warning(f"Invalid detection toggle message from {client_ip}: {data}")
-                    
+
                 except json.JSONDecodeError:
                     self.logger.warning(f"Received non-JSON message from {client_ip}. Ignoring.")
                 except Exception as e:
                     self.logger.error(f"Error processing message from {client_ip}: {e}")
-        
+
         except websockets.exceptions.ConnectionClosedOK:
             self.logger.info(f"Client {client_ip} disconnected normally.")
             print(f"❌ Client {client_ip} disconnected normally.")
         except websockets.exceptions.ConnectionClosedError as e:
-            self.logger.info(f"Client {client_ip} disconnected with error: {e}")
+            self.logger.warning(f"Client {client_ip} disconnected with error: {e}")
             print(f"❌ Client {client_ip} disconnected with error: {e}")
         except Exception as e:
             self.logger.error(f"Unexpected error with client {client_ip}: {e}")
         finally:
-            # Ensure client is removed from set
-            if websocket in self.connected_clients:
-                self.connected_clients.remove(websocket)
+            # Ensure client is removed from set - use discard to avoid KeyError if already removed
+            try:
+                self.connected_clients.discard(websocket)
                 self.logger.info(f"Client {client_ip} removed. Total clients: {len(self.connected_clients)}")
                 print(f"👋 Client {client_ip} removed. Total clients: {len(self.connected_clients)}")
+            except Exception as e:
+                self.logger.warning(f"Error removing client {client_ip} from connected clients: {e}")
     
     async def broadcast(self, message):
         """Broadcast a message to all connected WebSocket clients
-        
+
         Args:
             message: Message to broadcast (dict, bytes, or string)
         """
         if not self.connected_clients:
             return
-            
+
         message_str = ""
-        
+        disconnected_clients = set()
+
         try:
             # Prepare message based on type
             if isinstance(message, dict):
@@ -352,10 +383,12 @@ class WebSocketServer:
                     *[client.send(message) for client in self.connected_clients],
                     return_exceptions=True
                 )
-                # Check for errors
+                # Check for errors and mark disconnected clients
                 for i, result in enumerate(results):
                     if isinstance(result, Exception):
                         client = list(self.connected_clients)[i] if i < len(self.connected_clients) else None
+                        if client:
+                            disconnected_clients.add(client)
                         client_ip = client.remote_address if client and hasattr(client, 'remote_address') else "Unknown"
                         self.logger.error(f"Failed to send binary message to {client_ip}: {result}")
                 return
@@ -365,22 +398,33 @@ class WebSocketServer:
             else:
                 self.logger.warning(f"Unknown message type: {type(message)}")
                 return
-                
+
             # Send string message to all clients
             results = await asyncio.gather(
                 *[client.send(message_str) for client in self.connected_clients],
                 return_exceptions=True
             )
-            
-            # Check for errors
+
+            # Check for errors and mark disconnected clients
             for i, result in enumerate(results):
                 if isinstance(result, Exception):
                     client = list(self.connected_clients)[i] if i < len(self.connected_clients) else None
+                    if client:
+                        disconnected_clients.add(client)
                     client_ip = client.remote_address if client and hasattr(client, 'remote_address') else "Unknown"
                     self.logger.error(f"Failed to send message to {client_ip}: {result}")
-        
+
         except Exception as e:
             self.logger.error(f"Broadcast error: {e}")
+        finally:
+            # Clean up disconnected clients from the set
+            if disconnected_clients:
+                for client in disconnected_clients:
+                    if client in self.connected_clients:
+                        self.connected_clients.remove(client)
+                        client_ip = client.remote_address if hasattr(client, 'remote_address') else "Unknown"
+                        self.logger.info(f"Removed disconnected client {client_ip} from connected clients")
+                self.logger.debug(f"Cleaned up {len(disconnected_clients)} disconnected clients")
     
     def broadcast_sync(self, message):
         """Synchronous version of broadcast for use from other threads

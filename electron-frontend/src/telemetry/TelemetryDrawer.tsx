@@ -42,6 +42,16 @@ const Header = styled.div`
   font-weight: bold;
   font-size: 14px;
   background: #1e1e1e;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+`;
+
+const HeaderClock = styled.span`
+  font-family: 'SF Mono', Monaco, 'Cascadia Code', monospace;
+  font-weight: 500;
+  font-size: 12px;
+  color: #9aa0a6; /* subtle */
 `;
 
 const SearchInput = styled.input`
@@ -241,6 +251,7 @@ const getCameraStatusColor = (value: string | number, key: string): 'good' | 'wa
 export const TelemetryDrawer: React.FC<DrawerProps> = ({open, onClose}) => {
   const { entries } = useTelemetry();
   const [filter, setFilter] = useState('');
+  const [drawerClock, setDrawerClock] = useState('--:--:--');
   const [collapsedSections, setCollapsedSections] = useState<CollapsedSections>({
     system: false,
     performance: false,
@@ -311,11 +322,28 @@ export const TelemetryDrawer: React.FC<DrawerProps> = ({open, onClose}) => {
 
   const now = Date.now();
 
+  // Subtle header clock for the drawer
+  React.useEffect(() => {
+    const updateClock = () => {
+      const d = new Date();
+      const hh = String(d.getHours()).padStart(2, '0');
+      const mm = String(d.getMinutes()).padStart(2, '0');
+      const ss = String(d.getSeconds()).padStart(2, '0');
+      setDrawerClock(`${hh}:${mm}:${ss}`);
+    };
+    updateClock();
+    const id = setInterval(updateClock, 1000);
+    return () => clearInterval(id);
+  }, []);
+
   return (
     <>
       {open && <Overlay onClick={onClose} />}
       <Drawer open={open}>
-        <Header>System Telemetry</Header>
+        <Header>
+          <span>System Telemetry</span>
+          <HeaderClock aria-label="Current time">{drawerClock}</HeaderClock>
+        </Header>
         <SearchInput
           placeholder="Filter metrics..."
           value={filter}

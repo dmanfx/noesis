@@ -1,0 +1,318 @@
+import React, { useMemo, useRef, useState } from 'react';
+import { StreamPanel } from './components/StreamPanel';
+import { MapPanel } from './components/MapPanel';
+import { ControlsPanel } from './components/ControlsPanel';
+import { LegendPanel } from './components/LegendPanel';
+import { TelemetryPanel } from './telemetry/TelemetryPanel';
+import { TelemetryProvider, useTelemetry } from './telemetry/TelemetryContext';
+import { TrailStore } from './lib/trails';
+import { cameraOrder } from './lib/camera';
+import { detectCameraKey, CameraKey } from './lib/camera';
+import { useWebSocketClient, StatsPayload } from './hooks/useWebSocketClient';
+
+const WS_URL = 'ws://localhost:6008';
+
+function Dashboard() {
+  const { publish } = useTelemetry();
+
+  // Stream image blobs
+  const [streams, setStreams] = useState<{ [k: string]: Blob | null }>({ 'living-room': null, 'kitchen': null, 'family-room': null });
+
+  // FPS tracking (exponential over short window)
+  const [fps, setFps] = useState<{ [k: string]: string }>({ 'living-room': 'FPS: 0.0', 'kitchen': 'FPS: 0.0', 'family-room': 'FPS: 0.0' });
+  const [fpsSeries, setFpsSeries] = useState<{ [k in CameraKey]: number[] }>({ 'living-room': [], 'kitchen': [], 'family-room': [] });
+  const fpsHistory = useRef<{ [k: string]: number[] }>({ 'living-room': [], 'kitchen': [], 'family-room': [] });
+
+  const computeFps = (key: 'living-room' | 'kitchen' | 'family-room') => {
+    const hist = fpsHistory.current[key];
+    const now = Date.now();
+    hist.push(now);
+    const maxN = 30; if (hist.length > maxN) hist.shift();
+    if (hist.length >= 2) {
+      const span = (hist[hist.length - 1] - hist[0]) / 1000;
+      if (span > 0) {
+        const fpsVal = (hist.length - 1) / span;
+        const txt = `FPS: ${fpsVal.toFixed(1)}`;
+        setFps(prev => ({ ...prev, [key]: txt }));
+        setFpsSeries(prev => {
+          const arr = [...(prev[key] || [])];
+          arr.push(Number(fpsVal.toFixed(1)));
+          if (arr.length > 120) arr.shift();
+          return { ...prev, [key]: arr } as any;
+        });
+        publish({ group: `Camera ${key.replace('-', ' ')}`, key: 'FPS', value: Number(fpsVal.toFixed(1)), ts: now });
+      }
+    }
+  };
+
+  // Occupancy/Tracks/Transitions
+  const [occupancy, setOccupancy] = useState<string>('');
+  const [trackDetailsHtml, setTrackDetailsHtml] = useState<string>('');
+  const [transitionsHtml, setTransitionsHtml] = useState<string>('');
+  const [tracksByCamera, setTracksByCamera] = useState<Record<string, Array<{track_id: number; camera_id: string; zone?: string; center?: [number, number]; dwell_time?: number; velocity?: [number, number] }>>>({});
+  const [tracksByCamKey, setTracksByCamKey] = useState<Record<CameraKey, Array<{track_id: number; camera_id: string}>>>({ 'living-room': [], 'kitchen': [], 'family-room': [] });
+  const [occByCamKey, setOccByCamKey] = useState<Record<CameraKey, Record<string, number>>>({ 'living-room': {}, 'kitchen': {}, 'family-room': {} });
+
+  const [trailEnabled, setTrailEnabled] = useState<boolean>(true);
+  const trailStoreRef = useRef(new TrailStore());
+
+  const [telemetryOpen, setTelemetryOpen] = useState(false);
+  // Auto-primary selection state
+  const [primaryKey, setPrimaryKey] = useState<CameraKey>(cameraOrder[0]);
+  const motionEmaRef = useRef<Record<CameraKey, number>>({ 'living-room': 0, 'kitchen': 0, 'family-room': 0 });
+  const lastSwitchRef = useRef<number>(0);
+  const EMA_ALPHA = 0.3; // smoothing factor for motion
+  const SWITCH_RATIO = 1.25; // require challenger to be 25% higher
+  const SWITCH_COOLDOWN_MS = 10000; // 10s minimum between switches
+
+  const onStats = (payload: StatsPayload) => {
+    // System status/uptime
+    const now = Date.now();
+    publish({ group: 'System', key: 'Uptime', value: Math.floor((payload.uptime ?? 0)), ts: now });
+
+    const cameras = payload.cameras || {};
+    const globalOcc: Record<string, number> = {};
+    let allTracks: any[] = [];
+    let allTrans: any[] = [];
+    const perCamTracks: Record<string, any[]> = {};
+    const perKeyTracks: Record<CameraKey, any[]> = { 'living-room': [], 'kitchen': [], 'family-room': [] };
+    const perKeyOcc: Record<CameraKey, Record<string, number>> = { 'living-room': {}, 'kitchen': {}, 'family-room': {} };
+    const perKeyTransCount: Record<CameraKey, number> = { 'living-room': 0, 'kitchen': 0, 'family-room': 0 };
+
+    for (const camId in cameras) {
+      const c = cameras[camId];
+      if (c?.status) publish({ group: `Camera ${camId}`, key: 'Status', value: c.status, ts: now });
+      const track = c?.tracking;
+      const camKey = detectCameraKey(camId) || (camId.toLowerCase().includes('kitchen') ? 'kitchen' : camId.toLowerCase().includes('living') || camId === '1' || camId === 'rtsp_0' ? 'living-room' : 'family-room');
+      if (track?.occupancy) {
+        for (const z in track.occupancy) globalOcc[z] = (globalOcc[z] || 0) + (track.occupancy as any)[z];
+        perKeyOcc[camKey] = track.occupancy;
+      }
+      if (Array.isArray(track?.active_tracks)) {
+        perCamTracks[camId] = track!.active_tracks;
+        allTracks = allTracks.concat(track!.active_tracks);
+        // trails
+        if (trailEnabled) {
+          for (const t of track!.active_tracks) {
+            const center = t.center; if (!Array.isArray(center) || center.length < 2) continue;
+            const key = camKey;
+            trailStoreRef.current.push(key as any, Number(t.track_id), { x: center[0]!, y: center[1]! });
+          }
+        }
+        perKeyTracks[camKey] = track!.active_tracks;
+      }
+      if (Array.isArray(track?.transitions)) {
+        allTrans = allTrans.concat(track!.transitions);
+        perKeyTransCount[camKey] = track!.transitions.length || 0;
+      }
+    }
+
+    // Occupancy HTML
+    let occHtml = '<ul style="margin:0;padding-left:16px">';
+    const sortedOcc = Object.entries(globalOcc).sort(([,a],[,b]) => b-a);
+    if (sortedOcc.length) {
+      sortedOcc.forEach(([zone, cnt]) => {
+        occHtml += `<li><strong>${zone}:</strong> <span style="display:inline-block;min-width:3ch;text-align:right;">${cnt}</span></li>`;
+        publish({ group: 'Occupancy', key: zone, value: cnt, ts: now });
+      });
+    } else {
+      occHtml += '<li>No occupancy data.</li>';
+      publish({ group: 'Occupancy', key: 'none', value: 0, ts: now });
+    }
+    occHtml += '</ul>';
+    setOccupancy(occHtml);
+
+    // Track details HTML
+    let tracksHtml = '';
+    if (allTracks.length) {
+      allTracks.sort((a,b) => (a.track_id||0) - (b.track_id||0)).forEach(t => {
+        const dwell = t.dwell_time?.toFixed(1) ?? '0.0';
+        const center = t.center || ['N/A','N/A'];
+        const vel = t.velocity || [0,0];
+        const speed = Math.sqrt(vel[0]**2 + vel[1]**2).toFixed(1);
+        tracksHtml += `<div><strong>ID ${t.track_id||'N/A'} (${t.camera_id || 'N/A'}):</strong><br/>Zone: ${t.zone||'-'}, Dwell: <span style="display:inline-block; min-width:4ch; text-align:right;">${dwell}</span>s<br/>Pos: [${center[0]}, ${center[1]}], Speed: <span style=\"display:inline-block; min-width:4ch; text-align:right;\">${speed}</span> px/s</div>`;
+      });
+    } else {
+      tracksHtml = '<span>No active tracks.</span>';
+    }
+    setTrackDetailsHtml(tracksHtml);
+    setTracksByCamera(perCamTracks);
+    setTracksByCamKey(perKeyTracks);
+    setOccByCamKey(perKeyOcc);
+
+    // Transitions
+    let transHtml = '';
+    if (allTrans.length) {
+      allTrans.sort((a, b) => (b.timestamp||0) - (a.timestamp||0)).slice(0,10).forEach(t => {
+        const ts = t.timestamp ? new Date(t.timestamp * 1000).toLocaleTimeString() : '??:??:??';
+        transHtml += `<li>[${ts}] ID ${t.track_id || 'N/A'} (${t.camera_id || 'N/A'}): ${t.from_zone || 'N/A'} → ${t.to_zone || 'N/A'}</li>`;
+      });
+    } else {
+      transHtml = '<li>No recent transitions.</li>';
+    }
+    setTransitionsHtml(transHtml);
+
+    publish({ group: 'Tracking', key: 'Active Tracks', value: allTracks.length, ts: now });
+    publish({ group: 'Tracking', key: 'Transitions', value: allTrans.length, ts: now });
+    publish({ group: 'Connection', key: 'Status', value: 'Connected', ts: now });
+
+    // --- Auto-promote primary based on motion heuristic ---
+    try {
+      const scores: Record<CameraKey, number> = { 'living-room': 0, 'kitchen': 0, 'family-room': 0 } as const as any;
+      (Object.keys(scores) as CameraKey[]).forEach((k) => {
+        const tracks = perKeyTracks[k] || [];
+        const n = tracks.length;
+        let avgSpeed = 0;
+        if (n > 0) {
+          let sum = 0;
+          for (const t of tracks) {
+            const v = t?.velocity || [0,0];
+            const s = Math.sqrt((v[0]||0)**2 + (v[1]||0)**2);
+            sum += s;
+          }
+          avgSpeed = sum / n;
+        }
+        const trans = perKeyTransCount[k] || 0;
+        // Weight: more tracks matters most, then speed, then transitions
+        scores[k] = n + 0.3 * avgSpeed + 0.1 * trans;
+      });
+
+      // Update EMA
+      const ema = motionEmaRef.current;
+      (Object.keys(scores) as CameraKey[]).forEach((k) => {
+        ema[k] = EMA_ALPHA * scores[k] + (1 - EMA_ALPHA) * (ema[k] || 0);
+      });
+
+      // Find challenger
+      const keys: CameraKey[] = ['living-room', 'kitchen', 'family-room'];
+      let best: CameraKey = primaryKey;
+      let bestVal = ema[primaryKey] ?? 0;
+      for (const k of keys) {
+        const v = ema[k] ?? 0;
+        if (v > bestVal) { best = k; bestVal = v; }
+      }
+
+      const nowMs = Date.now();
+      const since = nowMs - (lastSwitchRef.current || 0);
+      if (best !== primaryKey && since >= SWITCH_COOLDOWN_MS) {
+        const currentVal = ema[primaryKey] ?? 0;
+        if (bestVal > currentVal * SWITCH_RATIO) {
+          setPrimaryKey(best);
+          lastSwitchRef.current = nowMs;
+          publish({ group: 'UI', key: 'Primary Camera', value: best, ts: now });
+        }
+      }
+    } catch {
+      // defensive: never break stats handling
+    }
+  };
+
+  const onImage = (cam: 'living-room' | 'kitchen' | 'family-room', blob: Blob) => {
+    setStreams(prev => ({ ...prev, [cam]: blob }));
+    computeFps(cam);
+  };
+
+  const { status, sendClearStats, sendTrailToggle, sendDetectionConfig, sendDetectionToggle } = useWebSocketClient(WS_URL, {
+    onImage,
+    onStats,
+    onTrailToggle: (en) => setTrailEnabled(en)
+  });
+
+  const connectionChip = useMemo(() => {
+    const color = status === 'open' ? 'var(--good)' : status === 'connecting' ? 'var(--warn)' : 'var(--bad)';
+    const text = status === 'open' ? 'Connected' : status === 'connecting' ? 'Connecting…' : 'Disconnected';
+    return <span className="chip"><span className="status-dot" style={{ background: color }} />{text}</span>;
+  }, [status]);
+
+  const displayOrder = useMemo<CameraKey[]>(() => [primaryKey, ...cameraOrder.filter(k => k !== primaryKey)], [primaryKey]);
+
+  return (
+    <div className="shell">
+      <header className="topbar">
+        <div className="brand">
+          <div className="logo" />
+          <div>
+            <div className="title">OAI² Console</div>
+            <div className="subtitle">Spatial perception, calmly presented</div>
+          </div>
+        </div>
+        <div className="spacer" />
+        {connectionChip}
+        <button className="btn ghost" onClick={() => setTelemetryOpen(v => !v)}>Telemetry</button>
+      </header>
+      <main className="main">
+        <section className="streams">
+          <div className="slot-primary">
+            <StreamPanel
+              camera={displayOrder[0]}
+              blob={streams[displayOrder[0]]}
+              fpsText={fps[displayOrder[0]]}
+              fpsSeries={fpsSeries[displayOrder[0]]}
+            />
+          </div>
+          <div className="slot-bottom-left">
+            <StreamPanel
+              camera={displayOrder[1]}
+              blob={streams[displayOrder[1]]}
+              fpsText={fps[displayOrder[1]]}
+              fpsSeries={fpsSeries[displayOrder[1]]}
+            />
+          </div>
+          <div className="slot-bottom-right">
+            <StreamPanel
+              camera={displayOrder[2]}
+              blob={streams[displayOrder[2]]}
+              fpsText={fps[displayOrder[2]]}
+              fpsSeries={fpsSeries[displayOrder[2]]}
+            />
+          </div>
+        </section>
+
+        <section className="side">
+          <ControlsPanel
+            trailEnabled={trailEnabled}
+            setTrailEnabled={setTrailEnabled}
+            onSendTrail={sendTrailToggle}
+            onClearStats={sendClearStats}
+            onSendDetectionConfig={sendDetectionConfig}
+            onSendDetectionToggle={sendDetectionToggle}
+          />
+
+          <div className="panel card">
+            <div className="card-title">Zone Occupancy</div>
+            <div dangerouslySetInnerHTML={{ __html: occupancy }} />
+          </div>
+
+          <LegendPanel tracks={(Object.values(tracksByCamera).flat() as any[]).map(t => ({ track_id: t.track_id, camera_id: t.camera_id }))} />
+
+          <div className="panel card">
+            <div className="card-title">Active Tracks</div>
+            <div dangerouslySetInnerHTML={{ __html: trackDetailsHtml }} />
+          </div>
+
+          <div className="panel card">
+            <div className="card-title">Recent Transitions</div>
+            <ul style={{ margin: 0 }} dangerouslySetInnerHTML={{ __html: transitionsHtml }} />
+          </div>
+
+          <MapPanel store={trailStoreRef.current} visible={trailEnabled} />
+        </section>
+      </main>
+      <footer className="footer">
+        <span>WebSocket: {status}</span>
+        <span className="spacer" />
+        <span className="subtitle">Use the Fullscreen button on any stream</span>
+      </footer>
+
+      {telemetryOpen && <TelemetryPanel onClose={() => setTelemetryOpen(false)} />}
+    </div>
+  );
+}
+
+const App: React.FC = () => (
+  <TelemetryProvider>
+    <Dashboard />
+  </TelemetryProvider>
+);
+
+export default App;

@@ -29,8 +29,7 @@ header {
     border-bottom: 1px solid #4f545f;
     padding-bottom: 10px;
     margin-bottom: 15px;
-    position: relative; /* Needed for absolute positioning of clock */
-    padding-right: 120px; /* Add padding to prevent overlap with clock */
+    /* header-metrics handles right-side layout; no absolute positioning */
 }
 
 header h1 {
@@ -39,21 +38,44 @@ header h1 {
     color: #61afef;
 }
 
-#system-status {
-    font-size: 0.9em;
-    color: #98c379;
+/* Right-side header metrics (uptime + clock) */
+.header-metrics {
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+    gap: 10px;
 }
 
-#clock {
-    position: absolute;
-    top: 5px; /* Adjust as needed */
-    right: 5px; /* Position top right */
-    font-size: 1.2em;
-    font-weight: bold;
+/* Unified badge styling for uptime/clock */
+.metric-badge {
+    font-size: 0.9em;
+    font-weight: 600;
+    background-color: rgba(40, 44, 52, 0.6);
+    padding: 3px 10px;
+    border-radius: 6px;
+    line-height: 1.2;
+    border: 1px solid transparent;
+}
+
+/* Specific treatments */
+#system-status.metric-uptime {
+    color: #98c379;
+    border-color: rgba(152, 195, 121, 0.35);
+}
+
+#clock.metric-clock {
     color: #e5c07b;
-    background-color: rgba(40, 44, 52, 0.6); /* Slight background */
-    padding: 2px 8px;
-    border-radius: 4px;
+    border-color: rgba(229, 192, 123, 0.35);
+}
+
+/* On narrow screens, place them inline with spacing */
+/* Keep them inline even on small screens; allow wrapping when needed */
+@media (max-width: 480px) {
+    .header-metrics {
+        flex-wrap: wrap;
+        justify-content: flex-end;
+        gap: 6px;
+    }
 }
 
 main {

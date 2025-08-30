@@ -829,8 +829,10 @@ const Dashboard: React.FC = () => {
     <div id="app-container">
       <header>
         <h1>Smart Room Dashboard</h1>
-        <div id="system-status">{systemStatus}</div>
-        <div id="clock">--:--:--</div>
+        <div className="header-metrics">
+          <div id="system-status" className="metric-badge metric-uptime">{systemStatus}</div>
+          <div id="clock" className="metric-badge metric-clock">--:--:--</div>
+        </div>
       </header>
 
       <main>
@@ -1002,4 +1004,3 @@ const App: React.FC = () => (
 );
 
 export default App;
-

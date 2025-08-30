@@ -1374,9 +1374,10 @@ class DeepStreamVideoPipeline:
             jpegenc = Gst.ElementFactory.make("nvjpegenc", f"{branch_name_prefix}_enc")
             sink = Gst.ElementFactory.make("appsink", f"{branch_name_prefix}_sink")
 
-            # Optimize nvjpegenc for realtime
+            # Optimize nvjpegenc for realtime and respect configured JPEG quality
             try:
-                jpegenc.set_property("quality", 90)
+                quality = int(getattr(self.config.visualization, 'JPEG_QUALITY', 85))
+                jpegenc.set_property("quality", quality)
                 jpegenc.set_property("preset-level", 1)  # fast
             except Exception:
                 pass

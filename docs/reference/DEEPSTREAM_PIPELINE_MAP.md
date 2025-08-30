@@ -82,8 +82,8 @@ RTSP Streams (`config.py`):
 │ Per-Stream Visualization & JPEG Branch (Per demux pad):                                                     │
 │ ├── queue → nvvideoconvert (pre) → capsfilter (video/x-raw(memory:NVMM), format=RGBA) → nvdsosd →           │
 │ │   nvvideoconvert (post) → capsfilter (video/x-raw(memory:NVMM), format=I420) → nvjpegenc → appsink        │
-│ ├── OSD Probe (sink): `_osd_sink_pad_buffer_probe()` draws per-stream overlays using frame_meta.source_id.   │
-│ ├── nvjpegenc: GPU JPEG encode; quality=80, preset-level=1                                                  │
+│ ├── OSD Probe (sink): `_per_branch_osd_probe()` draws per-stream overlays using frame_meta.source_id.       │
+│ ├── nvjpegenc: GPU JPEG encode; quality = config.visualization.JPEG_QUALITY, preset-level=1                 │
 │ └── appsink: emits `new-sample`; callback enqueues JPEG to `jpeg_queues[sensor_id]`                          │
 └─────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
 
@@ -95,7 +95,7 @@ RTSP Streams (`config.py`):
 │ │   └── Removes objects detected within defined exclusion zones before they are tracked.                    │
 │ ├── nvdsanalytics_post (src pad): `_analytics_probe()`                                                      │
 │ │   └── Extracts final object metadata, including tracking IDs and analytics results (ROI, line crossing) for WebSocket telemetry.                                                                                                         │
-│ └── nvdsosd (sink pad): `_osd_sink_pad_buffer_probe()`                                                      │
+│ └── nvdsosd (sink pad): `_per_branch_osd_probe()`                                                           │
 │     └── Injects custom drawing commands (e.g., for motion trails) into the OSD overlay before rendering.     │
 └─────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
 
@@ -114,32 +114,15 @@ DeepStream integration is encapsulated in `DeepStreamVideoPipeline`, which start
 
 main.py (ApplicationManager):
 ┌─────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
-│  RESULT PROCESSING                                                                                          │
+│  JPEG FORWARDING (NATIVE DS OSD MODE)                                                                       │
 ├─────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
-│ _start_result_processing()                                                                                  │
-│ ├── process_results() thread                                                                                │
-│ ├── analysis_frame_queue.get()                                                                              │
-│ └── _process_analysis_frame()                                                                               │
+│ _start_jpeg_processing_loop()                                                                               │
+│ ├── Iterate sources via `multi_stream_processor.source_info`                                                │
+│ ├── For each sensor_id: `read_encoded_jpeg(sensor_id)`                                                     │
+│ ├── Prepend 1-byte length + UTF-8 camera id header                                                          │
+│ └── websocket_server.broadcast_sync(header + jpeg_bytes)                                                    │
 │                                                                                                             │
-│ _process_analysis_frame():                                                                                  │
-│ ├── Visualization:                                                                                          │
-│ │   ├── visualization_manager.annotate_frame()                                                             │
-│ │   ├── Detection boxes, tracking boxes, traces                                                            │
-│ │   ├── Keypoints, masks, labels                                                                            │
-│ │   └── Performance profiling (if enabled)                                                                  │
-│ │                                                                                                           │
-│ ├── Frame Encoding:                                                                                         │
-│ │   ├── cv2.imencode('.jpg', annotated_frame, [cv2.IMWRITE_JPEG_QUALITY, 85])                             │
-│ │   └── JPEG compression for WebSocket                                                                      │
-│ │                                                                                                           │
-│ ├── Binary Message Construction:                                                                            │
-│ │   ├── camera_id_bytes = analysis_frame.camera_id.encode('utf-8')                                        │
-│ │   ├── camera_id_length = len(camera_id_bytes)                                                            │
-│ │   └── binary_message = bytes([camera_id_length]) + camera_id_bytes + jpeg_data                           │
-│ │                                                                                                           │
-│ └── WebSocket Broadcasting:                                                                                 │
-│     ├── websocket_server.broadcast_sync(binary_message)                                                    │
-│     └── Frame saving (if enabled)                                                                           │
+│ Notes: JPEGs come from per-branch `nvjpegenc` appsinks; Python does not annotate or re-encode frames.        │
 └─────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
 
 See `docs/reference/WebSocket_API.md` for message types and runtime control endpoints.

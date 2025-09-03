@@ -7,7 +7,8 @@ export const StreamPanel: React.FC<{
   blob?: Blob | null;
   fpsText?: string;
   fpsSeries?: number[];
-}> = ({ camera, title, blob, fpsText, fpsSeries = [] }) => {
+  vacancyText?: string;
+}> = ({ camera, title, blob, fpsText, fpsSeries = [], vacancyText }) => {
   const [url, setUrl] = useState<string>('');
   const imgRef = useRef<HTMLImageElement>(null);
   const viewRef = useRef<HTMLDivElement>(null);
@@ -68,6 +69,15 @@ export const StreamPanel: React.FC<{
       <div className="stream-head">
         <div className="chip" title={camera}>{label}</div>
         <div className="chip mono" style={{ color: '#9db1c8' }}>{fpsText ?? 'FPS: 0.0'}</div>
+        {vacancyText ? (
+          <div
+            className="chip mono"
+            style={{ color: '#9db1c8' }}
+            title={`Vacant for ${vacancyText}`}
+          >
+            {vacancyText}
+          </div>
+        ) : null}
         <div className="spacer" />
         <div className="stream-tools">
           <button className="btn ghost" onClick={onMaximize} title="Toggle fullscreen">Fullscreen</button>

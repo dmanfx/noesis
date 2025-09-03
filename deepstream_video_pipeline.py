@@ -215,6 +215,18 @@ class DeepStreamVideoPipeline:
             }
         self.logger.info(f"📊 Initialized tracking state for {len(self.sensor_ids)} streams")
 
+        # Per-stream per-track zone dwell tracking state
+        # { sensor_id: { track_id: { 'current_zone': Optional[str], 'entry_time': Optional[float] } } }
+        self.track_zone_state_by_sensor: Dict[int, Dict[int, Dict[str, Any]]] = {
+            sensor_id: {} for sensor_id in self.sensor_ids
+        }
+
+        # Per-stream per-track motion state for velocity estimation (px/s)
+        # { sensor_id: { track_id: { 'last_center': [x, y], 'last_ts': float, 'vel_hist': deque([(vx,vy), ...]) } } }
+        self.track_motion_state_by_sensor: Dict[int, Dict[int, Dict[str, Any]]] = {
+            sensor_id: {} for sensor_id in self.sensor_ids
+        }
+
         # JPEG branch tracking keyed by sensor_id
         # Per-stream branch elements: queue, nvvideoconvert, caps, nvdsosd, nvjpegenc, appsink
         self._stream_branch_elements: Dict[int, List[Gst.Element]] = {}
@@ -894,6 +906,7 @@ class DeepStreamVideoPipeline:
             prev_occupancy = {}
 
         l_obj = frame_meta.obj_meta_list
+        now_ts = time.time()
         while l_obj:
             obj = pyds.NvDsObjectMeta.cast(l_obj.data)  # type: ignore
             rect = obj.rect_params
@@ -919,6 +932,32 @@ class DeepStreamVideoPipeline:
             center_x = rect.left + rect.width / 2
             center_y = rect.top + rect.height / 2
             track_dict['center'] = [center_x, center_y]
+
+            # Estimate velocity (px/s) using per-track motion state with short moving average
+            try:
+                motion_state = self.track_motion_state_by_sensor.setdefault(sensor_id, {}).setdefault(obj.object_id, {
+                    'last_center': None,
+                    'last_ts': None,
+                    'vel_hist': deque(maxlen=5)
+                })
+                last_center = motion_state.get('last_center')
+                last_ts = motion_state.get('last_ts')
+                if last_center is not None and last_ts is not None:
+                    dt = max(1e-3, now_ts - float(last_ts))
+                    vx = (center_x - float(last_center[0])) / dt
+                    vy = (center_y - float(last_center[1])) / dt
+                    motion_state['vel_hist'].append((vx, vy))
+                    # Compute average velocity over history
+                    if motion_state['vel_hist']:
+                        hvx = sum(v[0] for v in motion_state['vel_hist']) / len(motion_state['vel_hist'])
+                        hvy = sum(v[1] for v in motion_state['vel_hist']) / len(motion_state['vel_hist'])
+                        track_dict['velocity'] = [hvx, hvy]
+                # Update state
+                motion_state['last_center'] = [center_x, center_y]
+                motion_state['last_ts'] = now_ts
+            except Exception:
+                # Never allow velocity estimation errors to break telemetry
+                pass
             
             # Add tracker confidence if available
             if hasattr(obj, 'tracker_confidence'):
@@ -942,16 +981,58 @@ class DeepStreamVideoPipeline:
                             occupancy[zone] = occupancy.get(zone, 0) + 1
                             #self.logger.debug(f"📊 Object {obj.object_id} in zone {zone}")
 
+                    in_zones: List[str] = []
                     if isinstance(roi_status, dict):
                         for z, status in roi_status.items():
                             if status in (1, True, "IN", "inside"):
                                 bump(z)
+                                in_zones.append(str(z).strip())
                     elif isinstance(roi_status, (list, tuple, set)):
                         for z in roi_status:
                             bump(z)
+                            in_zones.append(str(z).strip())
                     elif isinstance(roi_status, str):
                         for z in roi_status.split(','):
                             bump(z)
+                            in_zones.append(str(z).strip())
+
+                    # Assign a primary zone (first one if multiple)
+                    current_zone = in_zones[0] if in_zones else None
+                    if current_zone:
+                        track_dict['zone'] = current_zone
+
+                        # Dwell time tracking per (sensor_id, track_id)
+                        try:
+                            zone_state = self.track_zone_state_by_sensor.setdefault(sensor_id, {}).setdefault(obj.object_id, {
+                                'current_zone': None,
+                                'entry_time': None
+                            })
+                            prev_zone = zone_state.get('current_zone')
+                            entry_time = zone_state.get('entry_time')
+                            if prev_zone == current_zone:
+                                # Continue dwell
+                                if entry_time is None:
+                                    # If we somehow missed entry, initialize now
+                                    zone_state['entry_time'] = now_ts
+                                    entry_time = now_ts
+                                dwell = max(0.0, now_ts - float(entry_time))
+                                track_dict['dwell_time'] = dwell
+                            else:
+                                # Zone changed (or first seen). Record transition if applicable.
+                                if prev_zone and prev_zone != current_zone:
+                                    transitions.append({
+                                        'track_id': obj.object_id,
+                                        'camera_id': f"camera_{sensor_id}",
+                                        'from_zone': prev_zone,
+                                        'to_zone': current_zone,
+                                        'timestamp': now_ts
+                                    })
+                                # Start new dwell timer
+                                zone_state['current_zone'] = current_zone
+                                zone_state['entry_time'] = now_ts
+                                track_dict['dwell_time'] = 0.0
+                        except Exception:
+                            pass
                 
                 # Fallback to frame-level counts if no per-object ROI data
                 if not occupancy:
@@ -975,6 +1056,35 @@ class DeepStreamVideoPipeline:
                                 #self.logger.debug(f"📊 Object {obj.object_id} crossed line {line_name}")
             #else:
                 #self.logger.debug(f"📊 No analytics data for object {obj.object_id}")
+
+            # Fallback zone/dwell: if no analytics zone detected, use camera room as zone
+            try:
+                if 'zone' not in track_dict or not track_dict['zone']:
+                    # Map sensor_id to clean camera name
+                    cam_info = self.source_info.get(sensor_id, {})
+                    fallback_zone = cam_info.get('clean_name') or cam_info.get('name')
+                    if fallback_zone:
+                        track_dict['zone'] = fallback_zone
+                        # Maintain simple dwell timer per (sensor_id, track_id) on this fallback zone
+                        zone_state = self.track_zone_state_by_sensor.setdefault(sensor_id, {}).setdefault(obj.object_id, {
+                            'current_zone': None,
+                            'entry_time': None
+                        })
+                        prev_zone = zone_state.get('current_zone')
+                        entry_time = zone_state.get('entry_time')
+                        if prev_zone == fallback_zone:
+                            if entry_time is None:
+                                zone_state['entry_time'] = now_ts
+                                entry_time = now_ts
+                            dwell = max(0.0, now_ts - float(entry_time))
+                            track_dict['dwell_time'] = dwell
+                        else:
+                            # Zone changed or first time
+                            zone_state['current_zone'] = fallback_zone
+                            zone_state['entry_time'] = now_ts
+                            track_dict['dwell_time'] = 0.0
+            except Exception:
+                pass
             
             # Add secondary inference results if available
             secondary_data = self._extract_secondary_inference_meta(obj)

@@ -887,6 +887,12 @@ class DeepStreamVideoPipeline:
         ds_index = int(frame_meta.source_id)
         sensor_id = self.sensor_id_by_source_idx.get(ds_index, ds_index)
         
+        # Keep a copy of previous occupancy to detect vacates
+        try:
+            prev_occupancy = dict(self.live_tracking_state.get(sensor_id, {}).get('occupancy', {}))
+        except Exception:
+            prev_occupancy = {}
+
         l_obj = frame_meta.obj_meta_list
         while l_obj:
             obj = pyds.NvDsObjectMeta.cast(l_obj.data)  # type: ignore
@@ -982,6 +988,44 @@ class DeepStreamVideoPipeline:
             except StopIteration:
                 break
         
+        # Publish occupancy deltas to integrations (MQTT/Influx)
+        try:
+            publisher = getattr(self, 'occupancy_publisher', None)
+            if publisher is not None and occupancy is not None:
+                # Publish current counts (rooms seen this frame)
+                first_flag = getattr(self, '_occ_pub_first', True)
+                for zone, cnt in occupancy.items():
+                    try:
+                        room_id = str(zone).strip()
+                        publisher.publish_state(room_id=room_id, occupied=(int(cnt) > 0), count=int(cnt), ts_ns=int(time.time_ns()))
+                        if first_flag:
+                            try:
+                                print(f"📡 Occupancy publish: {room_id} -> {int(cnt)}")
+                            except Exception:
+                                pass
+                    except Exception:
+                        pass
+                # Publish vacates for zones seen previously but not this frame
+                for zone in set(prev_occupancy.keys()) - set(occupancy.keys()):
+                    try:
+                        room_id = str(zone).strip()
+                        publisher.publish_state(room_id=room_id, occupied=False, count=0, ts_ns=int(time.time_ns()))
+                        if first_flag:
+                            try:
+                                print(f"📡 Occupancy publish: {room_id} -> 0 (vacate)")
+                            except Exception:
+                                pass
+                    except Exception:
+                        pass
+                if first_flag:
+                    try:
+                        self._occ_pub_first = False
+                    except Exception:
+                        pass
+        except Exception:
+            # Never allow publishing issues to affect the pipeline
+            pass
+
         # Update live tracking state for this specific stream
         if sensor_id in self.live_tracking_state:
             self.live_tracking_state[sensor_id]['active_tracks'] = active_tracks

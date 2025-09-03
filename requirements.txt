@@ -29,6 +29,10 @@ requests==2.32.4
 pyyaml==6.0.2
 psutil==7.0.0
 
+# Messaging & storage integrations
+paho-mqtt==2.1.0
+influxdb-client==1.48.0
+
 # --- Added packages that are installed but not in requirements.txt ---
 # Deep learning optimization
 tensorrt==10.12.0.36

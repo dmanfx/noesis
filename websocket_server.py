@@ -47,17 +47,35 @@ class WebSocketServer:
     async def _cleanup_stale_connections(self):
         """Periodically clean up any stale or closed connections"""
         try:
+            # Since the broadcast method already handles cleanup when connections fail,
+            # we'll make this cleanup much simpler and safer
             stale_clients = set()
+
             for client in self.connected_clients:
-                # Check if client connection is closed
-                if client.closed:
+                try:
+                    # Check various attributes that might indicate a closed connection
+                    is_closed = False
+
+                    # Try the most common attributes first
+                    if hasattr(client, 'closed') and getattr(client, 'closed', False):
+                        is_closed = True
+                    elif hasattr(client, 'close_code') and getattr(client, 'close_code', None) is not None:
+                        is_closed = True
+                    elif hasattr(client, 'state') and getattr(client, 'state', None) == 'CLOSED':
+                        is_closed = True
+
+                    if is_closed:
+                        stale_clients.add(client)
+
+                except Exception:
+                    # If we can't safely inspect the client, assume it's stale
                     stale_clients.add(client)
 
             if stale_clients:
                 for client in stale_clients:
                     if client in self.connected_clients:
                         self.connected_clients.remove(client)
-                        client_ip = client.remote_address if hasattr(client, 'remote_address') else "Unknown"
+                        client_ip = getattr(client, 'remote_address', 'Unknown') if hasattr(client, 'remote_address') else "Unknown"
                         self.logger.info(f"Cleaned up stale connection for client {client_ip}")
                 self.logger.debug(f"Cleaned up {len(stale_clients)} stale connections")
 
@@ -71,9 +89,9 @@ class WebSocketServer:
 
         while self.running:
             try:
-                # Periodic cleanup of stale connections (every 30 seconds)
+                # Periodic cleanup of stale connections (every 60 seconds, reduced frequency)
                 cleanup_counter += 1
-                if cleanup_counter >= 30:
+                if cleanup_counter >= 60:
                     await self._cleanup_stale_connections()
                     cleanup_counter = 0
 
@@ -129,14 +147,15 @@ class WebSocketServer:
                 self.event_loop = None
 
             # Create server with backpressure and heartbeat settings
+            # Increased ping interval and timeout for better stability
             self.server = await websockets.serve(
                 self.handle_client,
                 self.host,
                 self.port,
                 max_size=None,       # allow large binary frames
                 max_queue=1,         # minimize buffering to reduce latency
-                ping_interval=20,    # keep-alive pings
-                ping_timeout=20      # disconnect stale clients
+                ping_interval=60,    # keep-alive pings every 60 seconds (was 20)
+                ping_timeout=30      # wait 30 seconds for pong response (was 20)
             )
 
             # Start periodic stats broadcast task if callback is provided
@@ -150,6 +169,7 @@ class WebSocketServer:
             print(f"🚀 WebSocket server is LIVE on {self.host}:{self.port}")
             print(f"📡 Server listening for connections on ws://{self.host}:{self.port}")
             print(f"🔄 Periodic stats broadcast: {'ENABLED' if self.stats_callback else 'DISABLED'}")
+            print(f"💓 Keep-alive: ping every 60s, timeout 30s")
             self.logger.info("WebSocket server startup completed successfully")
 
         except OSError as e:
@@ -289,6 +309,20 @@ class WebSocketServer:
                         else:
                             self.logger.warning(f"Invalid set_vis_toggle message from {client_ip}: {data}")
 
+                    # Handle client heartbeat ping messages
+                    elif data.get('type') == 'ping':
+                        timestamp = data.get('timestamp')
+                        self.logger.debug(f"Received ping from {client_ip} (timestamp: {timestamp})")
+                        # Send pong response
+                        try:
+                            pong_message = {
+                                'type': 'pong',
+                                'timestamp': timestamp
+                            }
+                            await websocket.send(json.dumps(pong_message))
+                        except Exception as e:
+                            self.logger.warning(f"Failed to send pong response to {client_ip}: {e}")
+
                     # Handle detection configuration updates
                     elif data.get('type') == 'update_detection_config':
                         config_data = data.get('config', {})
@@ -343,11 +377,15 @@ class WebSocketServer:
                     self.logger.error(f"Error processing message from {client_ip}: {e}")
 
         except websockets.exceptions.ConnectionClosedOK:
-            self.logger.info(f"Client {client_ip} disconnected normally.")
+            self.logger.info(f"Client {client_ip} disconnected normally (code: 1000).")
             print(f"❌ Client {client_ip} disconnected normally.")
         except websockets.exceptions.ConnectionClosedError as e:
-            self.logger.warning(f"Client {client_ip} disconnected with error: {e}")
-            print(f"❌ Client {client_ip} disconnected with error: {e}")
+            # Log ping timeout errors as info instead of warning to reduce noise
+            if "keepalive ping timeout" in str(e).lower():
+                self.logger.info(f"Client {client_ip} disconnected due to ping timeout - connection cleaned up.")
+            else:
+                self.logger.warning(f"Client {client_ip} disconnected with error: {e}")
+                print(f"❌ Client {client_ip} disconnected with error: {e}")
         except Exception as e:
             self.logger.error(f"Unexpected error with client {client_ip}: {e}")
         finally:
@@ -370,6 +408,7 @@ class WebSocketServer:
 
         message_str = ""
         disconnected_clients = set()
+        active_clients = set(self.connected_clients)  # Create a copy to iterate over
 
         try:
             # Prepare message based on type
@@ -378,19 +417,23 @@ class WebSocketServer:
                 message = convert_numpy_types(message)
                 message_str = json.dumps(message)
             elif isinstance(message, bytes):
-                # Binary message
+                # Binary message - send to active clients only
                 results = await asyncio.gather(
-                    *[client.send(message) for client in self.connected_clients],
+                    *[client.send(message) for client in active_clients],
                     return_exceptions=True
                 )
                 # Check for errors and mark disconnected clients
                 for i, result in enumerate(results):
                     if isinstance(result, Exception):
-                        client = list(self.connected_clients)[i] if i < len(self.connected_clients) else None
+                        client = list(active_clients)[i] if i < len(active_clients) else None
                         if client:
                             disconnected_clients.add(client)
                         client_ip = client.remote_address if client and hasattr(client, 'remote_address') else "Unknown"
-                        self.logger.error(f"Failed to send binary message to {client_ip}: {result}")
+                        # Only log ping timeout errors to reduce noise, but still handle all exceptions
+                        if "keepalive ping timeout" in str(result):
+                            self.logger.debug(f"Client {client_ip} ping timeout - will be cleaned up")
+                        else:
+                            self.logger.error(f"Failed to send binary message to {client_ip}: {result}")
                 return
             elif isinstance(message, str):
                 # String message
@@ -399,32 +442,36 @@ class WebSocketServer:
                 self.logger.warning(f"Unknown message type: {type(message)}")
                 return
 
-            # Send string message to all clients
+            # Send string message to active clients only
             results = await asyncio.gather(
-                *[client.send(message_str) for client in self.connected_clients],
+                *[client.send(message_str) for client in active_clients],
                 return_exceptions=True
             )
 
             # Check for errors and mark disconnected clients
             for i, result in enumerate(results):
                 if isinstance(result, Exception):
-                    client = list(self.connected_clients)[i] if i < len(self.connected_clients) else None
+                    client = list(active_clients)[i] if i < len(active_clients) else None
                     if client:
                         disconnected_clients.add(client)
                     client_ip = client.remote_address if client and hasattr(client, 'remote_address') else "Unknown"
-                    self.logger.error(f"Failed to send message to {client_ip}: {result}")
+                    # Only log ping timeout errors as debug to reduce noise
+                    if "keepalive ping timeout" in str(result):
+                        self.logger.debug(f"Client {client_ip} ping timeout - will be cleaned up")
+                    else:
+                        self.logger.error(f"Failed to send message to {client_ip}: {result}")
 
         except Exception as e:
             self.logger.error(f"Broadcast error: {e}")
         finally:
-            # Clean up disconnected clients from the set
+            # Immediately clean up disconnected clients from the set
             if disconnected_clients:
                 for client in disconnected_clients:
                     if client in self.connected_clients:
                         self.connected_clients.remove(client)
                         client_ip = client.remote_address if hasattr(client, 'remote_address') else "Unknown"
                         self.logger.info(f"Removed disconnected client {client_ip} from connected clients")
-                self.logger.debug(f"Cleaned up {len(disconnected_clients)} disconnected clients")
+                self.logger.debug(f"Cleaned up {len(disconnected_clients)} disconnected clients during broadcast")
     
     def broadcast_sync(self, message):
         """Synchronous version of broadcast for use from other threads

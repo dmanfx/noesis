@@ -287,6 +287,28 @@ class AppConfig:
                 "match_thresh": self.MATCH_THRESH,
                 "frame_rate": 30, # Default frame rate for tracking
             }
+
+    @dataclass
+    class IntegrationsSettings:
+        """Integration settings for MQTT + Influx occupancy publishing"""
+        ENABLE_OCCUPANCY_PUBLISH: bool = True
+        HEARTBEAT_SEC: int = 60
+
+        # MQTT
+        BASE_TOPIC: str = "noesis/occupancy"
+        STATUS_TOPIC: str = "noesis/status"
+        MQTT_HOST: str = "127.0.0.1"
+        MQTT_PORT: int = 1883
+        MQTT_USERNAME: str = "noesis"
+        MQTT_PASSWORD: str = "damosquittopass"
+        MQTT_QOS: int = 1
+        MQTT_RETAIN: bool = True
+
+        # InfluxDB v2
+        INFLUX_URL: str = "http://127.0.0.1:8086"
+        INFLUX_ORG: str = "Lambda"
+        INFLUX_TOKEN: str = "mfVNLy3JpTXwuX-_ZN9r5dbXzLaXCW9F6isbA10i4r-tNE3aigcF1UqmMdDtPKskDhKk7-6iKtoIOEphpB14wA=="
+        INFLUX_BUCKET_RAW: str = "noesis_raw"
     
     @dataclass
     class OutputSettings:
@@ -314,6 +336,7 @@ class AppConfig:
     output: OutputSettings = field(default_factory=OutputSettings)
     websocket: WebSocketSettings = field(default_factory=WebSocketSettings)
     tracking: TrackingSettings = field(default_factory=TrackingSettings)
+    integrations: IntegrationsSettings = field(default_factory=IntegrationsSettings)
     
     def get_camera_count(self) -> int:
         """Calculate total number of camera sources configured."""
@@ -466,7 +489,17 @@ def save_config_to_file(config: AppConfig, config_file: str) -> bool:
         # Create configuration data structure for serialization
         config_data = {}
         
-        for section_name in ["app", "cameras", "processing", "models", "visualization", "output", "websocket", "tracking"]:
+        for section_name in [
+            "app",
+            "cameras",
+            "processing",
+            "models",
+            "visualization",
+            "output",
+            "websocket",
+            "tracking",
+            "integrations",
+        ]:
             section = getattr(config, section_name)
             section_data = {}
             

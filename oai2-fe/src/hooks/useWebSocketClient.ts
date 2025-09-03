@@ -29,21 +29,72 @@ export function useWebSocketClient(url: string, handlers: FrameHandlers) {
   const [status, setStatus] = useState<'connecting' | 'open' | 'closed' | 'error'>('connecting');
   const [retry, setRetry] = useState(0);
   const maxRetries = 10;
+  const heartbeatRef = useRef<NodeJS.Timeout | null>(null);
+  const reconnectTimeoutRef = useRef<NodeJS.Timeout | null>(null);
 
   useEffect(() => {
     let stop = false;
+
+    const startHeartbeat = (ws: WebSocket) => {
+      // Clear any existing heartbeat
+      if (heartbeatRef.current) {
+        clearInterval(heartbeatRef.current);
+      }
+
+      // Send a heartbeat every 30 seconds to keep connection alive
+      heartbeatRef.current = setInterval(() => {
+        if (ws.readyState === WebSocket.OPEN) {
+          try {
+            // Send a simple ping message that the server will echo back
+            ws.send(JSON.stringify({ type: 'ping', timestamp: Date.now() }));
+          } catch (e) {
+            console.warn('Failed to send heartbeat:', e);
+          }
+        }
+      }, 30000); // 30 seconds
+    };
+
+    const stopHeartbeat = () => {
+      if (heartbeatRef.current) {
+        clearInterval(heartbeatRef.current);
+        heartbeatRef.current = null;
+      }
+    };
+
     const connect = () => {
       setStatus('connecting');
+
+      // Clear any existing reconnect timeout
+      if (reconnectTimeoutRef.current) {
+        clearTimeout(reconnectTimeoutRef.current);
+        reconnectTimeoutRef.current = null;
+      }
+
       const ws = new WebSocket(url);
       socketRef.current = ws;
-      ws.onopen = () => setStatus('open');
-      ws.onclose = () => {
+
+      ws.onopen = () => {
+        setStatus('open');
+        startHeartbeat(ws);
+        console.log('WebSocket connected, heartbeat started');
+      };
+
+      ws.onclose = (event) => {
         setStatus('closed');
+        stopHeartbeat();
+        console.log(`WebSocket closed: code=${event.code}, reason=${event.reason}`);
+
         if (!stop && retry < maxRetries) {
-          setTimeout(() => setRetry(r => r + 1), 5000);
+          const delay = Math.min(5000 * Math.pow(2, retry), 30000); // Exponential backoff, max 30s
+          console.log(`Attempting reconnection ${retry + 1}/${maxRetries} in ${delay}ms`);
+          reconnectTimeoutRef.current = setTimeout(() => setRetry(r => r + 1), delay);
         }
       };
-      ws.onerror = () => setStatus('error');
+
+      ws.onerror = (error) => {
+        setStatus('error');
+        console.error('WebSocket error:', error);
+      };
       ws.onmessage = async (ev: MessageEvent) => {
         try {
           if (ev.data instanceof Blob) {
@@ -75,6 +126,25 @@ export function useWebSocketClient(url: string, handlers: FrameHandlers) {
             return;
           }
           const data = JSON.parse(ev.data);
+
+          // Handle ping messages by responding with pong
+          if (data.type === 'ping') {
+            try {
+              ws.send(JSON.stringify({ type: 'pong', timestamp: data.timestamp }));
+              console.debug('Sent pong response to server ping');
+            } catch (e) {
+              console.warn('Failed to send pong response:', e);
+            }
+            return;
+          }
+
+          // Handle pong responses from server
+          if (data.type === 'pong') {
+            const latency = Date.now() - (data.timestamp || 0);
+            console.debug(`Received pong from server (latency: ${latency}ms)`);
+            return;
+          }
+
           if (data.type === 'stats' && data.payload) {
             handlers.onStats(data.payload as StatsPayload);
           } else if (data.type === 'toggle_update' && data.toggle_name === 'trail_visualization_enabled') {
@@ -88,7 +158,15 @@ export function useWebSocketClient(url: string, handlers: FrameHandlers) {
       };
     };
     connect();
-    return () => { stop = true; socketRef.current?.close(); };
+    return () => {
+      stop = true;
+      stopHeartbeat();
+      if (reconnectTimeoutRef.current) {
+        clearTimeout(reconnectTimeoutRef.current);
+        reconnectTimeoutRef.current = null;
+      }
+      socketRef.current?.close();
+    };
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [url, retry]);
 

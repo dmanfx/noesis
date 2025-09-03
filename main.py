@@ -138,6 +138,8 @@ class ApplicationManager:
         # Register signal handlers
         signal.signal(signal.SIGINT, self._signal_handler)
         signal.signal(signal.SIGTERM, self._signal_handler)
+        # Integrations
+        self._occupancy_publisher = None
     
     def _signal_handler(self, sig, frame):
         """Handle termination signals with graceful shutdown
@@ -404,6 +406,48 @@ class ApplicationManager:
             # Store single processor (not per-camera)
             self.multi_stream_processor = processor
             self.logger.info(f"✅ Multi-stream DeepStream processor started successfully with {len(enabled_sources)} streams")
+
+            # Wire OccupancyPublisher if enabled
+            try:
+                if getattr(self.config.integrations, 'ENABLE_OCCUPANCY_PUBLISH', False):
+                    self.logger.info("🔌 Initializing OccupancyPublisher (MQTT + Influx)")
+                    try:
+                        print(f"🔌 OccupancyPublisher enabled: MQTT {self.config.integrations.MQTT_HOST}:{self.config.integrations.MQTT_PORT} base={self.config.integrations.BASE_TOPIC} | Influx bucket={self.config.integrations.INFLUX_BUCKET_RAW}")
+                    except Exception:
+                        pass
+                    from occupancy_publisher import OccupancyPublisher, OccupancyConfig
+                    occ_cfg = OccupancyConfig(
+                        enabled=True,
+                        heartbeat_sec=int(self.config.integrations.HEARTBEAT_SEC),
+                        base_topic=str(self.config.integrations.BASE_TOPIC),
+                        status_topic=str(self.config.integrations.STATUS_TOPIC),
+                        mqtt_host=str(self.config.integrations.MQTT_HOST),
+                        mqtt_port=int(self.config.integrations.MQTT_PORT),
+                        mqtt_username=str(self.config.integrations.MQTT_USERNAME),
+                        mqtt_password=str(self.config.integrations.MQTT_PASSWORD),
+                        mqtt_qos=int(self.config.integrations.MQTT_QOS),
+                        mqtt_retain=bool(self.config.integrations.MQTT_RETAIN),
+                        influx_url=str(self.config.integrations.INFLUX_URL),
+                        influx_org=str(self.config.integrations.INFLUX_ORG),
+                        influx_token=str(self.config.integrations.INFLUX_TOKEN),
+                        influx_bucket_raw=str(self.config.integrations.INFLUX_BUCKET_RAW),
+                    )
+                    pub = OccupancyPublisher(occ_cfg, logger=logging.getLogger("OccupancyPublisher"))
+                    self._occupancy_publisher = pub
+                    # attach to processor so DS code can emit from probe
+                    try:
+                        setattr(self.multi_stream_processor, 'occupancy_publisher', pub)
+                        self.logger.info("✅ Attached OccupancyPublisher to DeepStream processor")
+                        try:
+                            print("✅ OccupancyPublisher attached to DeepStream processor")
+                        except Exception:
+                            pass
+                    except Exception as e:
+                        self.logger.warning(f"Unable to attach OccupancyPublisher to processor: {e}")
+                else:
+                    self.logger.info("Occupancy publishing disabled via config")
+            except Exception as e:
+                self.logger.error(f"Error initializing OccupancyPublisher: {e}")
             
             # Give processor a moment to initialize
             time.sleep(1.0)
@@ -1040,6 +1084,16 @@ class ApplicationManager:
                 self.logger.info("Stopped multi-stream processor")
             except Exception as e:
                 self.logger.error(f"Error stopping multi-stream processor: {e}")
+
+        # Stop integrations (OccupancyPublisher)
+        if getattr(self, '_occupancy_publisher', None) is not None:
+            try:
+                self.logger.info("Stopping OccupancyPublisher")
+                self._occupancy_publisher.close()
+                self._occupancy_publisher = None
+                self.logger.info("Stopped OccupancyPublisher")
+            except Exception as e:
+                self.logger.error(f"Error stopping OccupancyPublisher: {e}")
         
         # STEP 4: Stop result processing thread
         if hasattr(self, 'result_thread') and self.result_thread:

@@ -230,6 +230,9 @@ class DeepStreamVideoPipeline:
         # JPEG branch tracking keyed by sensor_id
         # Per-stream branch elements: queue, nvvideoconvert, caps, nvdsosd, nvjpegenc, appsink
         self._stream_branch_elements: Dict[int, List[Gst.Element]] = {}
+
+        # Precompute and reuse track color cache (track_id -> (r,g,b))
+        self._track_color_cache: Dict[int, Tuple[float, float, float]] = {}
         self._demux_requested_pads: Dict[int, Gst.Pad] = {}
 
         # Demux pad calibration maps
@@ -1159,6 +1162,40 @@ class DeepStreamVideoPipeline:
             #self.logger.debug(f"📊 Recent transitions: {transitions[-3:]}")  # Show last 3 transitions
         
         return detections
+
+    # --- Color helpers to keep OSD boxes and trails consistent with UI legend ---
+    def _hsl_to_rgb(self, h: float, s: float, l: float) -> Tuple[float, float, float]:
+        """Convert HSL (0..360, 0..1, 0..1) to RGB floats 0..1."""
+        h = h % 360.0
+        s = max(0.0, min(1.0, s))
+        l = max(0.0, min(1.0, l))
+        c = (1.0 - abs(2.0 * l - 1.0)) * s
+        x = c * (1.0 - abs(((h / 60.0) % 2.0) - 1.0))
+        m = l - c / 2.0
+        rp = gp = bp = 0.0
+        if 0 <= h < 60:
+            rp, gp, bp = c, x, 0
+        elif 60 <= h < 120:
+            rp, gp, bp = x, c, 0
+        elif 120 <= h < 180:
+            rp, gp, bp = 0, c, x
+        elif 180 <= h < 240:
+            rp, gp, bp = 0, x, c
+        elif 240 <= h < 300:
+            rp, gp, bp = x, 0, c
+        else:  # 300..360
+            rp, gp, bp = c, 0, x
+        r, g, b = rp + m, gp + m, bp + m
+        return (max(0.0, min(1.0, r)), max(0.0, min(1.0, g)), max(0.0, min(1.0, b)))
+
+    def _color_for_track(self, track_id: int) -> Tuple[float, float, float]:
+        """Match FE colorForTrack: hsl((id*47)%360, 80%, 60%). Return RGB floats 0..1."""
+        if track_id in self._track_color_cache:
+            return self._track_color_cache[track_id]
+        hue = float((int(track_id) * 47) % 360)
+        r, g, b = self._hsl_to_rgb(hue, 0.80, 0.60)
+        self._track_color_cache[track_id] = (r, g, b)
+        return (r, g, b)
     
     def _extract_secondary_inference_meta(self, obj_meta) -> Optional[Dict[str, Any]]:
         """Extract secondary inference metadata from object"""
@@ -2062,7 +2099,11 @@ class DeepStreamVideoPipeline:
                     lp.line_width = 3
                     lp.x1, lp.y1, lp.x2, lp.y2 = map(int, (x1, y1, x2, y2))
                     alpha = max((idx + 1) / len(pts), 0.6)
-                    lp.line_color.set(1.0, 1.0, 0.0, alpha)   # bright yellow
+                    try:
+                        r, g, b = self._color_for_track(int(tid))
+                    except Exception:
+                        r, g, b = (1.0, 1.0, 0.0)
+                    lp.line_color.set(r, g, b, alpha)   # track-specific color
                     display_meta.num_lines += 1
 
                 # optional label
@@ -2075,7 +2116,11 @@ class DeepStreamVideoPipeline:
                     tp.x_offset, tp.y_offset = map(int, pts[-1])
                     tp.font_params.font_name = "Serif"
                     tp.font_params.font_size = 12
-                    tp.font_params.font_color.set(1.0, 1.0, 0.0, 1.0)
+                    try:
+                        r, g, b = self._color_for_track(int(tid))
+                    except Exception:
+                        r, g, b = (1.0, 1.0, 0.0)
+                    tp.font_params.font_color.set(r, g, b, 1.0)
                     tp.set_bg_clr = 0
                     display_meta.num_labels += 1
 
@@ -2119,6 +2164,13 @@ class DeepStreamVideoPipeline:
                         obj_meta.text_params.display_text = f"id {tid} ({conf_value:.2f})"
                         # Keep background disabled to avoid covering content
                         obj_meta.text_params.set_bg_clr = 0
+                        # Set bbox border color to match track color
+                        try:
+                            r, g, b = self._color_for_track(int(tid))
+                            obj_meta.rect_params.border_width = 3
+                            obj_meta.rect_params.border_color.set(r, g, b, 1.0)
+                        except Exception:
+                            pass
                 except Exception:
                     # Never break overlay on label formatting issues
                     pass
@@ -2159,7 +2211,11 @@ class DeepStreamVideoPipeline:
                     lp.line_width = 3
                     lp.x1, lp.y1, lp.x2, lp.y2 = map(int, (x1, y1, x2, y2))
                     alpha = max((idx + 1) / len(pts), 0.6)
-                    lp.line_color.set(1.0, 1.0, 0.0, alpha)
+                    try:
+                        r, g, b = self._color_for_track(int(tid))
+                    except Exception:
+                        r, g, b = (1.0, 1.0, 0.0)
+                    lp.line_color.set(r, g, b, alpha)
                     display_meta.num_lines += 1
                 if (self.trail_show_labels
                         and display_meta.num_labels < 16
@@ -2170,7 +2226,11 @@ class DeepStreamVideoPipeline:
                     tp.x_offset, tp.y_offset = map(int, pts[-1])
                     tp.font_params.font_name = "Serif"
                     tp.font_params.font_size = 12
-                    tp.font_params.font_color.set(1.0, 1.0, 0.0, 1.0)
+                    try:
+                        r, g, b = self._color_for_track(int(tid))
+                    except Exception:
+                        r, g, b = (1.0, 1.0, 0.0)
+                    tp.font_params.font_color.set(r, g, b, 1.0)
                     tp.set_bg_clr = 0
                     display_meta.num_labels += 1
             pyds.nvds_add_display_meta_to_frame(frame_meta, display_meta)

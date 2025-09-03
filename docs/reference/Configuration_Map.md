@@ -36,6 +36,15 @@ This document maps `config.py` sections and keys to their use in `deepstream_vid
 
 - `USE_NATIVE_DEEPSTREAM_TRACKER`: currently informational; pipeline always uses `nvtracker`
 
+## integrations (AppConfig.IntegrationsSettings)
+
+- `ENABLE_OCCUPANCY_PUBLISH`: toggles MQTT + Influx occupancy publishing
+- `HEARTBEAT_SEC`: heartbeat period for retained MQTT refresh (no Influx write)
+- MQTT: `BASE_TOPIC`, `STATUS_TOPIC`, `MQTT_HOST`, `MQTT_PORT`, `MQTT_USERNAME`, `MQTT_PASSWORD`, `MQTT_QOS`, `MQTT_RETAIN`
+  - Consumed to initialize `OccupancyPublisher` MQTT client and retained topics
+- Influx: `INFLUX_URL`, `INFLUX_ORG`, `INFLUX_TOKEN`, `INFLUX_BUCKET_RAW`
+  - Consumed to initialize `InfluxDBClient` and async write API
+
 ## output (AppConfig.OutputSettings)
 
 - `OUTPUT_DIR`, `SAVE_FRAMES`: respected at higher layers when saving frames; DeepStream provides JPEG bytes

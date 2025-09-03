@@ -22,6 +22,12 @@ Purpose: Inventory of DeepStream elements, properties, probes, and dynamic branc
 ### `Configuration_Map.md`
 Purpose: Mapping from `config.py` to pipeline components and runtime controls.
 
+### `Occupancy_Publishing.md`
+Purpose: Reference for the MQTT + InfluxDB occupancy publisher and HomeSeer integration.
+
+### `Integrations_Playbook.md`
+Purpose: Step-by-step integration guide for InfluxDB + HomeSeer and a reusable pattern to add future integrations and stats.
+
 ### `Dynamic_Sensors.md`
 Purpose: How to add/remove sources at runtime using `nvmultiurisrcbin` REST API.
 

@@ -1,12 +1,12 @@
-import React, { useMemo, useRef, useState } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { StreamPanel } from './components/StreamPanel';
 import { MapPanel } from './components/MapPanel';
 import { ControlsPanel } from './components/ControlsPanel';
-import { LegendPanel } from './components/LegendPanel';
+// LegendPanel removed; we now inline the legend dot next to each ID
 import { TelemetryPanel } from './telemetry/TelemetryPanel';
 import { TelemetryProvider, useTelemetry } from './telemetry/TelemetryContext';
 import { TrailStore } from './lib/trails';
-import { cameraOrder } from './lib/camera';
+import { cameraOrder, colorForTrack } from './lib/camera';
 import { detectCameraKey, CameraKey } from './lib/camera';
 import { useWebSocketClient, StatsPayload } from './hooks/useWebSocketClient';
 
@@ -45,13 +45,16 @@ function Dashboard() {
     }
   };
 
-  // Occupancy/Tracks/Transitions
+  // Occupancy/Tracks (transitions removed)
   const [occupancy, setOccupancy] = useState<string>('');
   const [trackDetailsHtml, setTrackDetailsHtml] = useState<string>('');
-  const [transitionsHtml, setTransitionsHtml] = useState<string>('');
+  // Transitions removed from UI
   const [tracksByCamera, setTracksByCamera] = useState<Record<string, Array<{track_id: number; camera_id: string; zone?: string; center?: [number, number]; dwell_time?: number; velocity?: [number, number] }>>>({});
   const [tracksByCamKey, setTracksByCamKey] = useState<Record<CameraKey, Array<{track_id: number; camera_id: string}>>>({ 'living-room': [], 'kitchen': [], 'family-room': [] });
   const [occByCamKey, setOccByCamKey] = useState<Record<CameraKey, Record<string, number>>>({ 'living-room': {}, 'kitchen': {}, 'family-room': {} });
+  // Vacancy timer state
+  const [vacancyText, setVacancyText] = useState<Record<CameraKey, string>>({ 'living-room': '', 'kitchen': '', 'family-room': '' });
+  const zeroSinceRef = useRef<Record<CameraKey, number | null>>({ 'living-room': null, 'kitchen': null, 'family-room': null });
 
   const [trailEnabled, setTrailEnabled] = useState<boolean>(true);
   const trailStoreRef = useRef(new TrailStore());
@@ -73,11 +76,12 @@ function Dashboard() {
     const cameras = payload.cameras || {};
     const globalOcc: Record<string, number> = {};
     let allTracks: any[] = [];
+    // Transitions disabled; keep placeholder for compatibility
     let allTrans: any[] = [];
     const perCamTracks: Record<string, any[]> = {};
     const perKeyTracks: Record<CameraKey, any[]> = { 'living-room': [], 'kitchen': [], 'family-room': [] };
     const perKeyOcc: Record<CameraKey, Record<string, number>> = { 'living-room': {}, 'kitchen': {}, 'family-room': {} };
-    const perKeyTransCount: Record<CameraKey, number> = { 'living-room': 0, 'kitchen': 0, 'family-room': 0 };
+    // const perKeyTransCount: Record<CameraKey, number> = { 'living-room': 0, 'kitchen': 0, 'family-room': 0 };
 
     for (const camId in cameras) {
       const c = cameras[camId];
@@ -101,10 +105,7 @@ function Dashboard() {
         }
         perKeyTracks[camKey] = track!.active_tracks;
       }
-      if (Array.isArray(track?.transitions)) {
-        allTrans = allTrans.concat(track!.transitions);
-        perKeyTransCount[camKey] = track!.transitions.length || 0;
-      }
+      // Transitions disabled
     }
 
     // Occupancy HTML
@@ -130,7 +131,8 @@ function Dashboard() {
         const center = t.center || ['N/A','N/A'];
         const vel = t.velocity || [0,0];
         const speed = Math.sqrt(vel[0]**2 + vel[1]**2).toFixed(1);
-        tracksHtml += `<div><strong>ID ${t.track_id||'N/A'} (${t.camera_id || 'N/A'}):</strong><br/>Zone: ${t.zone||'-'}, Dwell: <span style="display:inline-block; min-width:4ch; text-align:right;">${dwell}</span>s<br/>Pos: [${center[0]}, ${center[1]}], Speed: <span style=\"display:inline-block; min-width:4ch; text-align:right;\">${speed}</span> px/s</div>`;
+        const dotColor = colorForTrack(Number(t.track_id||0));
+        tracksHtml += `<div><strong><span class="dot" style="display:inline-block;width:10px;height:10px;border-radius:50%;background:${dotColor};margin-right:6px;vertical-align:middle;"></span>ID ${t.track_id||'N/A'}:</strong><br/>Zone: ${t.zone||'-'}, Dwell: <span style="display:inline-block; min-width:4ch; text-align:right;">${dwell}</span>s<br/>Pos: [${(typeof center[0]==='number'?Number(center[0]).toFixed(3):center[0])}, ${(typeof center[1]==='number'?Number(center[1]).toFixed(3):center[1])}], Speed: <span style="display:inline-block; min-width:4ch; text-align:right;">${speed}</span> px/s</div>`;
       });
     } else {
       tracksHtml = '<span>No active tracks.</span>';
@@ -139,21 +141,22 @@ function Dashboard() {
     setTracksByCamera(perCamTracks);
     setTracksByCamKey(perKeyTracks);
     setOccByCamKey(perKeyOcc);
-
-    // Transitions
-    let transHtml = '';
-    if (allTrans.length) {
-      allTrans.sort((a, b) => (b.timestamp||0) - (a.timestamp||0)).slice(0,10).forEach(t => {
-        const ts = t.timestamp ? new Date(t.timestamp * 1000).toLocaleTimeString() : '??:??:??';
-        transHtml += `<li>[${ts}] ID ${t.track_id || 'N/A'} (${t.camera_id || 'N/A'}): ${t.from_zone || 'N/A'} → ${t.to_zone || 'N/A'}</li>`;
+    // Update zero-since timestamps when occupancy changes
+    try {
+      (Object.keys(perKeyOcc) as CameraKey[]).forEach((k) => {
+        const sum = Object.values(perKeyOcc[k] || {}).reduce((a, b) => a + (b || 0), 0);
+        if (sum === 0) {
+          if (!zeroSinceRef.current[k]) zeroSinceRef.current[k] = Date.now();
+        } else {
+          zeroSinceRef.current[k] = null;
+          setVacancyText(prev => ({ ...prev, [k]: '' }));
+        }
       });
-    } else {
-      transHtml = '<li>No recent transitions.</li>';
+    } catch {
+      // defensive
     }
-    setTransitionsHtml(transHtml);
 
     publish({ group: 'Tracking', key: 'Active Tracks', value: allTracks.length, ts: now });
-    publish({ group: 'Tracking', key: 'Transitions', value: allTrans.length, ts: now });
     publish({ group: 'Connection', key: 'Status', value: 'Connected', ts: now });
 
     // --- Auto-promote primary based on motion heuristic ---
@@ -172,9 +175,8 @@ function Dashboard() {
           }
           avgSpeed = sum / n;
         }
-        const trans = perKeyTransCount[k] || 0;
-        // Weight: more tracks matters most, then speed, then transitions
-        scores[k] = n + 0.3 * avgSpeed + 0.1 * trans;
+        // Weight: more tracks matters most, then speed (transitions removed)
+        scores[k] = n + 0.3 * avgSpeed;
       });
 
       // Update EMA
@@ -218,6 +220,41 @@ function Dashboard() {
     onTrailToggle: (en) => setTrailEnabled(en)
   });
 
+  // Vacency timer updater (tick every second)
+  useEffect(() => {
+    const formatVacancy = (secs: number) => {
+      if (secs < 60) return `${secs} s`;
+      const m = Math.floor(secs / 60);
+      const s = secs % 60;
+      return `${m} m ${s} s`;
+    };
+
+    const id = setInterval(() => {
+      const now = Date.now();
+      setVacancyText(prev => {
+        let changed = false;
+        const next: Record<CameraKey, string> = { ...prev } as any;
+        (['living-room','kitchen','family-room'] as CameraKey[]).forEach(k => {
+          const started = zeroSinceRef.current[k];
+          if (!started) {
+            if (next[k] !== '') { next[k] = ''; changed = true; }
+            return;
+          }
+          const elapsed = Math.floor((now - started) / 1000) - 15; // start after 15s
+          if (elapsed >= 0) {
+            const txt = formatVacancy(elapsed);
+            if (next[k] !== txt) { next[k] = txt; changed = true; }
+          } else {
+            if (next[k] !== '') { next[k] = ''; changed = true; }
+          }
+        });
+        return changed ? next : prev;
+      });
+    }, 1000);
+    return () => clearInterval(id);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
   const connectionChip = useMemo(() => {
     const color = status === 'open' ? 'var(--good)' : status === 'connecting' ? 'var(--warn)' : 'var(--bad)';
     const text = status === 'open' ? 'Connected' : status === 'connecting' ? 'Connecting…' : 'Disconnected';
@@ -248,6 +285,7 @@ function Dashboard() {
               blob={streams[displayOrder[0]]}
               fpsText={fps[displayOrder[0]]}
               fpsSeries={fpsSeries[displayOrder[0]]}
+              vacancyText={vacancyText[displayOrder[0]]}
             />
           </div>
           <div className="slot-bottom-left">
@@ -256,6 +294,7 @@ function Dashboard() {
               blob={streams[displayOrder[1]]}
               fpsText={fps[displayOrder[1]]}
               fpsSeries={fpsSeries[displayOrder[1]]}
+              vacancyText={vacancyText[displayOrder[1]]}
             />
           </div>
           <div className="slot-bottom-right">
@@ -264,6 +303,7 @@ function Dashboard() {
               blob={streams[displayOrder[2]]}
               fpsText={fps[displayOrder[2]]}
               fpsSeries={fpsSeries[displayOrder[2]]}
+              vacancyText={vacancyText[displayOrder[2]]}
             />
           </div>
         </section>
@@ -283,17 +323,14 @@ function Dashboard() {
             <div dangerouslySetInnerHTML={{ __html: occupancy }} />
           </div>
 
-          <LegendPanel tracks={(Object.values(tracksByCamera).flat() as any[]).map(t => ({ track_id: t.track_id, camera_id: t.camera_id }))} />
+          { /* Legend removed; color dot is shown inline with each ID */ }
 
           <div className="panel card">
             <div className="card-title">Active Tracks</div>
             <div dangerouslySetInnerHTML={{ __html: trackDetailsHtml }} />
           </div>
 
-          <div className="panel card">
-            <div className="card-title">Recent Transitions</div>
-            <ul style={{ margin: 0 }} dangerouslySetInnerHTML={{ __html: transitionsHtml }} />
-          </div>
+          { /* Transitions panel removed */ }
 
           <MapPanel store={trailStoreRef.current} visible={trailEnabled} />
         </section>

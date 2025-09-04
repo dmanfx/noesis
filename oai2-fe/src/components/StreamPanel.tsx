@@ -1,4 +1,5 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
+import { createPortal } from 'react-dom';
 import { CameraKey, cameraLabel } from '../lib/camera';
 
 export const StreamPanel: React.FC<{
@@ -27,15 +28,21 @@ export const StreamPanel: React.FC<{
 
   const label = useMemo(() => title ?? cameraLabel(camera), [camera, title]);
 
+  const [maximized, setMaximized] = useState(false);
+
   const onMaximize = () => {
-    const el = imgRef.current?.parentElement;
-    if (!el) return;
-    if (!document.fullscreenElement) {
-      el.requestFullscreen?.();
-    } else {
-      document.exitFullscreen?.();
-    }
+    setMaximized((v) => !v);
   };
+
+  // Close on Escape when maximized
+  useEffect(() => {
+    if (!maximized) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') setMaximized(false);
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [maximized]);
 
   // Draw FPS sparkline in dedicated bar below the video
   useEffect(() => {
@@ -80,13 +87,25 @@ export const StreamPanel: React.FC<{
         ) : null}
         <div className="spacer" />
         <div className="stream-tools">
-          <button className="btn ghost" onClick={onMaximize} title="Toggle fullscreen">Fullscreen</button>
+          <button className="btn ghost" onClick={onMaximize} title="Toggle expand">
+            {maximized ? 'Collapse' : 'Expand'}
+          </button>
         </div>
       </div>
       <div className="stream-view" ref={viewRef}>
         <img ref={imgRef} alt={`${label} stream`} />
       </div>
       <div className="sparkbar"><canvas ref={sparkRef} /></div>
+
+      {maximized ? createPortal(
+        <div className="overlay-fullwindow" onClick={() => setMaximized(false)}>
+          <img src={url} alt={`${label} stream`} className="overlay-media" />
+          <button className="overlay-close" onClick={(e) => { e.stopPropagation(); setMaximized(false); }} title="Exit">
+            ✕
+          </button>
+        </div>,
+        document.body
+      ) : null}
     </div>
   );
 };

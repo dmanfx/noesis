@@ -137,3 +137,36 @@
   border: 1px solid var(--border); background: #0e131a; color: var(--muted);
 }
 .clear-btn:hover { color: #fff; border-color: #2e3d50; }
+
+/* In-window fullscreen overlay for streams */
+.overlay-fullwindow {
+  position: fixed;
+  inset: 0;
+  z-index: 9999;
+  background: #000;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.overlay-fullwindow .overlay-media,
+.overlay-media {
+  width: 100vw;
+  height: 100vh;
+  object-fit: contain;
+  display: block;
+}
+.overlay-close {
+  position: fixed;
+  top: 12px;
+  right: 12px;
+  z-index: 10000;
+  width: 32px;
+  height: 32px;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  background: #0e131a;
+  color: var(--text);
+  line-height: 30px;
+  text-align: center;
+}
+.overlay-close:hover { border-color: #2e3d50; }

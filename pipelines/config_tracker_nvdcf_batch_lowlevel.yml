@@ -22,7 +22,7 @@ TargetManagement:
   minIouDiff4NewTarget: 0.7    # IOU threshold to discard new detections that overlap with existing targets
   minTrackerConfidence: 0.4    # Confidence threshold for shadow mode tracking
   probationAge: 2    # Target age to be considered valid
-  maxShadowTrackingAge: 30    # Max shadow tracking length before termination
+  maxShadowTrackingAge: 180    # Max shadow tracking length before termination
   earlyTerminationAge: 1    # Early termination threshold during tentative period
 
 TrajectoryManagement:
@@ -45,13 +45,13 @@ DataAssociator:
   minMatchingScore4VisualSimilarity: 0.5    # Min visual similarity score
 
   # Association Metric: Weights
-  matchingScoreWeight4VisualSimilarity: 0.3    # Weight for visual similarity
+  matchingScoreWeight4VisualSimilarity: 0.6    # Weight for visual similarity
   matchingScoreWeight4SizeSimilarity: 0.4    # Weight for size similarity
-  matchingScoreWeight4Iou: 0.3    # Weight for IOU score
+  matchingScoreWeight4Iou: 0.2    # Weight for IOU score
 
   # Tentative detections
   tentativeDetectorConfidence: 0.2    # Confidence threshold for tentative detections
-  minMatchingScore4TentativeIou: 0.5    # Min IOU for tentative detection matching
+  minMatchingScore4TentativeIou: 0.3    # Min IOU for tentative detection matching
 
 StateEstimator:
   stateEstimatorType: 1    # Simple state estimator

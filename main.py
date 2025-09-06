@@ -535,17 +535,8 @@ class ApplicationManager:
                 time.sleep(2.0)  # Give it time to bind
                 print("✅ WebSocket server should be ready now")
 
-                # Provide websocket_server instance to the multi-stream processor
-                if hasattr(self, 'multi_stream_processor') and self.multi_stream_processor:
-                    self.multi_stream_processor.websocket_server = self.websocket_server
-                    self.logger.info("✅ WebSocket server instance provided to multi-stream processor")
-                    print("✅ WebSocket server instance provided to multi-stream processor")
-
-                    # Start JPEG processing loop for native DeepStream OSD mode
-                    self._start_jpeg_processing_loop()
-                else:
-                    self.logger.warning("⚠️ Multi-stream processor not available to assign WebSocket server")
-                    print("⚠️ Multi-stream processor not available to assign WebSocket server")
+                # WebSocket server wiring to multi-stream processor will happen later in start() method
+                # after the processor is created
             else:
                 print("❌ WebSocket server thread is NOT alive")
                 self.logger.error("❌ WebSocket server thread failed to start")
@@ -809,6 +800,25 @@ class ApplicationManager:
         uptime = current_time - getattr(self.config.app, "START_TIME", current_time)
 
         try:
+            # Helper: normalize backend room keys (e.g., "LivingRoom", "living-room")
+            # to Menon-friendly names with spaces (e.g., "Living Room").
+            def _normalize_room_name(name: Any) -> str:
+                try:
+                    s = str(name)
+                    if not s:
+                        return s
+                    # Replace common separators with space
+                    s2 = s.replace('_', ' ').replace('-', ' ')
+                    # Insert spaces before capital letters for CamelCase
+                    import re
+                    if ' ' not in s2 and any(c.islower() for c in s2) and any(c.isupper() for c in s2):
+                        s2 = re.sub(r'(?<!^)(?=[A-Z])', ' ', s2)
+                    # Normalize whitespace and Title Case
+                    s2 = ' '.join(s2.split())
+                    return s2.title()
+                except Exception:
+                    return str(name)
+
             stats = {
                 'timestamp': current_time,
                 'uptime': uptime,
@@ -837,12 +847,29 @@ class ApplicationManager:
                             if source_id in source_info:
                                 camera_name = source_info[source_id]['clean_name']  # e.g., 'living-room', 'kitchen', 'family-room'
                                 
-                                # Create camera stats for this stream
+                                # Create camera stats for this stream with normalized occupancy keys for frontend
+                                try:
+                                    raw_occ = (stream_tracking_data or {}).get('occupancy', {}) or {}
+                                    norm_occ = {}
+                                    for k, v in raw_occ.items():
+                                        try:
+                                            cnt = int(v) if v is not None else 0
+                                        except Exception:
+                                            cnt = 0
+                                        norm_occ[_normalize_room_name(k)] = max(0, cnt)
+                                    tracking_payload = {
+                                        'active_tracks': (stream_tracking_data or {}).get('active_tracks', []),
+                                        'transitions': (stream_tracking_data or {}).get('transitions', []),
+                                        'occupancy': norm_occ,
+                                    }
+                                except Exception:
+                                    tracking_payload = stream_tracking_data
+
                                 camera_stats = {
                                     'fps': comprehensive_stats.get('fps', 0) / len(per_stream_tracking) if per_stream_tracking else 0,
                                     'frames_processed': comprehensive_stats.get('frames_processed', 0),
                                     'status': 'running' if comprehensive_stats.get('running', False) else 'stopped',
-                                    'tracking': stream_tracking_data
+                                    'tracking': tracking_payload
                                 }
                                 
                                 stats['cameras'][camera_name] = camera_stats

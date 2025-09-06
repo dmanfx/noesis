@@ -52,8 +52,8 @@ class AppConfig:
             },
             {
                 "name": "Kitchen Camera", 
-                #"url": "rtsp://192.168.3.214:7447/qt3VqVdZpgG1B4Vk?",
-                "url": "udp://127.0.0.1:8554", # use with: sudo ffmpeg -re -stream_loop -1 -i /home/mayor/Downloads/kitchenclip.mp4 -c copy -f mpegts udp://0.0.0.0:8554
+                "url": "rtsp://192.168.3.214:7447/qt3VqVdZpgG1B4Vk?",
+                #"url": "udp://127.0.0.1:8554", # use with: sudo ffmpeg -re -stream_loop -1 -i /home/mayor/Downloads/kitchenclip.mp4 -c copy -f mpegts udp://0.0.0.0:8554
                 "width": 1920,
                 "height": 1080,
                 "enabled": True
@@ -150,7 +150,7 @@ class AppConfig:
         MODEL_PATH: str = "models/yolo11m.onnx"  # Path to detection model
         POSE_MODEL_PATH: str = "models/yolo11m-pose.pt"  # Path to pose estimation model
         SEGMENTATION_MODEL_PATH: str = "models/yolo11m-seg.pt"  # Path to segmentation model
-        REID_MODEL_PATH: str = "models/osnet_x1_0_market_256x128_amsgrad_ep150_stp60_lr0.0015_b64_fb10_softmax_labelsmooth_flip.pth"  # Path to ReID model
+        REID_MODEL_PATH: str = "models/osnet_ibn_x1_0_msmt17.pt"  # Path to ReID model
         MODEL_CONFIDENCE_THRESHOLD: float = 0.25  # Minimum confidence score for a detection
         MODEL_IOU_THRESHOLD: float = 0.45  # IoU threshold for NMS
         TARGET_CLASSES: List[int] = field(default_factory=lambda: [0,1])  # Empty list = all classes
@@ -188,6 +188,42 @@ class AppConfig:
         POSE_ENGINE_PATH: str = "models/engines/pose_fp16.engine"
         SEGMENTATION_ENGINE_PATH: str = "models/engines/segmentation_fp16.engine"
         REID_ENGINE_PATH: str = "models/engines/reid_fp16.engine"
+
+        # Global ReID (Stable ID) settings
+        REID_ENABLED: bool = True  # Enable global StableID assignment using embeddings
+        REID_EMBED_INTERVAL_S: float = 1.0  # Seconds between embedding refreshes per track
+        REID_MAX_GHOST_AGE_S: float = 60.0  # Max age (s) to keep ghost identities for re-association
+        REID_COS_SIM_THRESHOLD: float = 0.65  # Cosine similarity for same-camera ghost matches (more permissive)
+        REID_COS_SIM_HIGH_THRESHOLD: float = 0.78  # Cosine similarity for cross-camera/gallery match
+        REID_ALLOW_MULTI_ZONE_ACTIVE: bool = True  # Allow same stable_id active across cameras/zones
+        REID_MODEL_NAME: str = "osnet_ibn_x1_0"  # Backbone to use when model_path not provided
+        REID_IMAGE_SIZE: List[int] = field(default_factory=lambda: [256, 128])  # [H, W] for embedding crops
+        # ReID robustness tweaks
+        REID_CROP_EXPAND: float = 0.12  # Expand person crop bbox by this fraction per side
+        REID_TTA_FLIP: bool = True  # Test-time augmentation: average embedding with horizontal flip
+        REID_MIN_CROP_H: int = 64  # Skip embeddings if crop height below this (px)
+        REID_MIN_LAPLACIAN: float = 12.0  # Skip embedding update if crop too blurry (variance of Laplacian)
+        REID_ADAPTIVE_PENALTY: bool = True  # Penalize matches with large scale/brightness deltas
+        REID_SIZE_PENALTY_ALPHA: float = 0.08  # Weight for scale ratio penalty in similarity
+        REID_BRIGHTNESS_PENALTY_BETA: float = 0.05  # Weight for brightness delta penalty
+        # Additional disambiguation penalties (co-present adults with similar appearance)
+        REID_SPATIAL_PENALTY: bool = True          # Penalize reusing an active ID far away in the scene
+        REID_SPATIAL_PENALTY_DELTA: float = 0.06   # Weight for spatial distance penalty (relative to bbox diagonal)
+        REID_COLOR_PENALTY_GAMMA: float = 0.07     # Weight for color histogram mismatch penalty
+        # Partial feature fusion (PCB-like stripes and multi-scale halves)
+        REID_STRIPE_FUSION: bool = True  # Enable stripe/multi-crop fusion for embeddings
+        REID_STRIPE_COUNT: int = 3  # Number of vertical stripes to use (e.g., 3 or 6)
+        REID_MULTI_SCALE_CROPS: bool = True  # Include upper/lower halves in fusion
+        # Centroid smoothing
+        REID_EMA_ALPHA: float = 0.20  # EMA smoothing factor for per-identity centroid
+        # Anti-merge guard: when a stable_id is already active on the same sensor,
+        # require a small extra margin before allowing a new track to take that ID.
+        REID_ACTIVE_ID_GUARD_STRICT: bool = True
+        REID_ACTIVE_ID_GUARD_MARGIN: float = 0.03
+        # Ghost matching strictness: for ghosts older than this many seconds,
+        # require an extra margin above REID_COS_SIM_THRESHOLD to match.
+        REID_GHOST_STRICT_AGE_S: float = 2.0
+        REID_GHOST_EXTRA_MARGIN: float = 0.03
         
         # Performance Settings
         WARM_UP_ITERATIONS: int = 10  # Number of warm-up iterations for TensorRT
@@ -224,6 +260,7 @@ class AppConfig:
         TRAIL_TIMEOUT_S: float = 10.0  # seconds to keep a disappeared track's trail
         TRAIL_DRAW_STRIDE: int = 2  # draw every Nth frame (≥1)
         TRAIL_SHOW_LABELS: bool = False
+        TRAIL_MAX_SPEED_PX_PER_S: float = 600.0  # clamp trail movement speed
         
         # Additional visual style settings referenced in logs
         KEYPOINT_RADIUS: int = 3          # Radius for keypoint visualization
@@ -243,6 +280,19 @@ class AppConfig:
         NVENC_BITRATE: int = 4000000  # 4 Mbps
         JPEG_QUALITY: int = 85  # JPEG encoding quality
         USE_NATIVE_DEEPSTREAM_OSD: bool = True  # If True, use DeepStream's native OSD, skip Python annotation
+
+        # Bounding-box temporal smoothing (reduces size flicker/shudder)
+        BBOX_SMOOTHING_ENABLED: bool = True
+        # Exponential moving average factor for width/height (0..1). Lower = smoother.
+        BBOX_SMOOTHING_ALPHA: float = 0.2
+        # Anchor used when resizing the smoothed box: 'bottom' (bottom-center) or 'center'
+        BBOX_SMOOTHING_ANCHOR: str = 'bottom'
+        # Per-frame change clamp. New size is clamped to these ratios vs previous before EMA.
+        BBOX_SMOOTHING_MAX_GROWTH: float = 1.10  # allow up to +10% per frame
+        BBOX_SMOOTHING_MAX_SHRINK: float = 0.90  # allow up to -10% per frame
+        # Over-window drop limit: in any window, height cannot drop below ratio*recent_max
+        BBOX_MAX_DROP_WINDOW_S: float = 4.0
+        BBOX_MAX_DROP_RATIO: float = 0.85  # allow at most 15% drop over window
         
         def __post_init__(self):
             """Validate visualization settings."""
@@ -262,6 +312,34 @@ class AppConfig:
             # Validate encoding parameters
             self.NVENC_BITRATE = max(1000000, self.NVENC_BITRATE)  # Min 1 Mbps
             self.JPEG_QUALITY = max(1, min(100, self.JPEG_QUALITY))
+
+            # Validate bbox smoothing parameters
+            self.BBOX_SMOOTHING_ALPHA = min(1.0, max(0.0, float(self.BBOX_SMOOTHING_ALPHA)))
+            self.BBOX_SMOOTHING_ANCHOR = (self.BBOX_SMOOTHING_ANCHOR or 'bottom').lower()
+            if self.BBOX_SMOOTHING_ANCHOR not in ('bottom', 'center'):
+                self.BBOX_SMOOTHING_ANCHOR = 'bottom'
+            try:
+                self.BBOX_SMOOTHING_MAX_GROWTH = float(self.BBOX_SMOOTHING_MAX_GROWTH)
+                self.BBOX_SMOOTHING_MAX_SHRINK = float(self.BBOX_SMOOTHING_MAX_SHRINK)
+                self.BBOX_MAX_DROP_WINDOW_S = float(getattr(self, 'BBOX_MAX_DROP_WINDOW_S', 4.0))
+                self.BBOX_MAX_DROP_RATIO = float(getattr(self, 'BBOX_MAX_DROP_RATIO', 0.85))
+            except Exception:
+                self.BBOX_SMOOTHING_MAX_GROWTH = 1.2
+                self.BBOX_SMOOTHING_MAX_SHRINK = 0.85
+                self.BBOX_MAX_DROP_WINDOW_S = 4.0
+                self.BBOX_MAX_DROP_RATIO = 0.85
+            # Ensure sensible bounds
+            self.BBOX_SMOOTHING_MAX_GROWTH = max(1.0, self.BBOX_SMOOTHING_MAX_GROWTH)
+            self.BBOX_SMOOTHING_MAX_SHRINK = min(1.0, max(0.5, self.BBOX_SMOOTHING_MAX_SHRINK))
+            self.BBOX_MAX_DROP_WINDOW_S = max(0.5, self.BBOX_MAX_DROP_WINDOW_S)
+            self.BBOX_MAX_DROP_RATIO = min(1.0, max(0.5, self.BBOX_MAX_DROP_RATIO))
+
+            # Validate trail speed clamp
+            try:
+                self.TRAIL_MAX_SPEED_PX_PER_S = float(self.TRAIL_MAX_SPEED_PX_PER_S)
+            except Exception:
+                self.TRAIL_MAX_SPEED_PX_PER_S = 600.0
+            self.TRAIL_MAX_SPEED_PX_PER_S = max(10.0, self.TRAIL_MAX_SPEED_PX_PER_S)
     
     @dataclass
     class TrackingSettings:

@@ -325,6 +325,14 @@ class VisualizationManager:
         # NVENC encoder for hardware video encoding
         self.nvenc_encoder = None
         self.nvjpeg_encoder = None
+
+        # CPU-path bbox smoothing state and params (used when not using DeepStream OSD)
+        self._bbox_smooth_by_id: Dict[int, Dict[str, float]] = {}
+        self.bbox_smoothing_enabled: bool = True
+        self.bbox_smoothing_alpha: float = 0.3
+        self.bbox_smoothing_anchor: str = 'bottom'
+        self.bbox_smoothing_max_growth: float = 1.2
+        self.bbox_smoothing_max_shrink: float = 0.85
         
         # REMOVED: Supervision annotators commented out due to segmentation fault
         # # Add direct Supervision annotators like in YOLOrun_dub.py
@@ -350,6 +358,15 @@ class VisualizationManager:
             text_thickness=config.visualization.TEXT_THICKNESS,
             trail_length=config.visualization.TRACE_LENGTH
         )
+        # Bbox smoothing params
+        try:
+            self.bbox_smoothing_enabled = bool(getattr(config.visualization, 'BBOX_SMOOTHING_ENABLED', True))
+            self.bbox_smoothing_alpha = float(getattr(config.visualization, 'BBOX_SMOOTHING_ALPHA', 0.3))
+            self.bbox_smoothing_anchor = str(getattr(config.visualization, 'BBOX_SMOOTHING_ANCHOR', 'bottom')).lower()
+            self.bbox_smoothing_max_growth = float(getattr(config.visualization, 'BBOX_SMOOTHING_MAX_GROWTH', 1.2))
+            self.bbox_smoothing_max_shrink = float(getattr(config.visualization, 'BBOX_SMOOTHING_MAX_SHRINK', 0.85))
+        except Exception:
+            pass
         
         # Initialize hardware encoders if enabled
         if hasattr(config.visualization, 'USE_NVENC') and config.visualization.USE_NVENC and NVENC_AVAILABLE:
@@ -430,34 +447,8 @@ class VisualizationManager:
         Returns:
             Annotated frame
         """
-        # Use GPU visualization if enabled and tensor provided
-        if self.use_gpu and self.gpu_visualizer and frame_tensor is not None:
-            return self._annotate_frame_gpu(
-                frame_tensor=frame_tensor,
-                detections=detections,
-                tracks=tracks,
-                show_traces=show_traces,
-                show_detection_boxes=show_detection_boxes,
-                show_tracking_boxes=show_tracking_boxes,
-                show_keypoints=show_keypoints,
-                show_masks=show_masks,
-                mask_alpha=mask_alpha,
-                fps=fps
-            )
-        
-        # Otherwise use CPU visualization
-        return self._annotate_frame_cpu(
-            frame=frame,
-            detections=detections,
-            tracks=tracks,
-            show_traces=show_traces,
-            show_detection_boxes=show_detection_boxes,
-            show_tracking_boxes=show_tracking_boxes,
-            show_keypoints=show_keypoints,
-            show_masks=show_masks,
-            mask_alpha=mask_alpha,
-            fps=fps
-        )
+        # Visualization via Python is disabled; DeepStream OSD is the only drawing path.
+        raise RuntimeError("CPU/GPU Python visualization is disabled; use DeepStream OSD.")
     
     def _annotate_frame_gpu(
         self,
@@ -520,25 +511,8 @@ class VisualizationManager:
             return frame_np
             
         except Exception as e:
-            self.logger.error(f"GPU annotation failed: {e}")
-            # Fallback to CPU visualization
-            frame_np = frame_tensor.cpu().numpy()
-            if frame_np.shape[0] == 3:  # CHW format
-                frame_np = frame_np.transpose(1, 2, 0)
-            frame_np = (frame_np * 255).astype(np.uint8)
-            
-            return self._annotate_frame_cpu(
-                frame=frame_np,
-                detections=detections,
-                tracks=tracks,
-                show_traces=show_traces,
-                show_detection_boxes=show_detection_boxes,
-                show_tracking_boxes=show_tracking_boxes,
-                show_keypoints=show_keypoints,
-                show_masks=show_masks,
-                mask_alpha=mask_alpha,
-                fps=fps
-            )
+            # Do not fallback to CPU; break as requested
+            raise
     
     def _annotate_frame_cpu(
         self,
@@ -705,6 +679,39 @@ class VisualizationManager:
                     # Draw custom traces using stored bottom-centre points instead of centroid
                     if show_traces:
                         result = self._draw_custom_traces(result, tracks)
+
+                # Fallback drawing of tracking boxes with optional smoothing
+                try:
+                    if tracks and show_tracking_boxes:
+                        fh, fw = result.shape[:2]
+                        for tr in tracks:
+                            # Extract bbox
+                            bb = None
+                            if hasattr(tr, 'bbox') and tr.bbox is not None:
+                                bb = tr.bbox
+                            elif hasattr(tr, 'detection') and tr.detection is not None and hasattr(tr.detection, 'bbox'):
+                                bb = tr.detection.bbox
+                            if bb is None or not (isinstance(bb, (list, tuple, np.ndarray)) and len(bb) == 4):
+                                continue
+                            x1, y1, x2, y2 = map(float, bb)
+                            if self.bbox_smoothing_enabled and hasattr(tr, 'track_id'):
+                                x1, y1, x2, y2 = self._smooth_bbox_cpu(int(tr.track_id), (x1, y1, x2, y2), fw, fh)
+                            color = (0, 255, 0)
+                            cv2.rectangle(result, (int(x1), int(y1)), (int(x2), int(y2)), color, max(1, self.visualizer.thickness))
+                            # Label
+                            try:
+                                class_names = self.get_class_names()
+                                cid = getattr(tr.detection, 'class_id', 0) if hasattr(tr, 'detection') else 0
+                                cname = class_names[cid] if 0 <= cid < len(class_names) else 'Unknown'
+                                conf = getattr(tr.detection, 'confidence', 1.0) if hasattr(tr, 'detection') else 1.0
+                                label = f"{cname} #{int(tr.track_id)} {float(conf):.2f}"
+                                tsz = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, self.visualizer.text_scale, self.visualizer.text_thickness)[0]
+                                cv2.rectangle(result, (int(x1), int(y1) - tsz[1] - 5), (int(x1) + tsz[0], int(y1)), color, -1)
+                                cv2.putText(result, label, (int(x1), int(y1) - 5), cv2.FONT_HERSHEY_SIMPLEX, self.visualizer.text_scale, (0, 0, 0), self.visualizer.text_thickness)
+                            except Exception:
+                                pass
+                except Exception:
+                    pass
             
             # Draw detection boxes if enabled
             if show_detection_boxes and detections:
@@ -885,6 +892,48 @@ class VisualizationManager:
                 cv2.line(out, (int(p[0]), int(p[1])), (int(q[0]), int(q[1])), col, thickness)
 
         return out 
+
+    def _smooth_bbox_cpu(self, uid: int, bbox: Tuple[float, float, float, float], frame_w: int, frame_h: int) -> Tuple[float, float, float, float]:
+        """EMA-smooth a bbox (x1,y1,x2,y2) for a stable uid in CPU visualization.
+
+        Anchor is bottom-center by default. Change via self.bbox_smoothing_anchor.
+        Smooths width/height and re-anchors; clamps to frame.
+        """
+        try:
+            x1, y1, x2, y2 = map(float, bbox)
+            w = max(1.0, x2 - x1)
+            h = max(1.0, y2 - y1)
+            prev = self._bbox_smooth_by_id.get(int(uid))
+            if prev is not None:
+                pw = max(1.0, float(prev.get('w', w)))
+                ph = max(1.0, float(prev.get('h', h)))
+                max_g = self.bbox_smoothing_max_growth if self.bbox_smoothing_max_growth >= 1.0 else 1.0
+                min_s = self.bbox_smoothing_max_shrink if 0.0 < self.bbox_smoothing_max_shrink <= 1.0 else 0.85
+                w_clamped = max(pw * min_s, min(w, pw * max_g))
+                h_clamped = max(ph * min_s, min(h, ph * max_g))
+                a = self.bbox_smoothing_alpha
+                nw = pw + a * (w_clamped - pw)
+                nh = ph + a * (h_clamped - ph)
+            else:
+                nw, nh = w, h
+            if self.bbox_smoothing_anchor == 'center':
+                cx = x1 + w * 0.5
+                cy = y1 + h * 0.5
+                nx1 = cx - nw * 0.5
+                ny1 = cy - nh * 0.5
+            else:
+                cx = x1 + w * 0.5
+                by = y1 + h
+                nx1 = cx - nw * 0.5
+                ny1 = by - nh
+            nx1 = max(0.0, min(nx1, float(frame_w) - nw))
+            ny1 = max(0.0, min(ny1, float(frame_h) - nh))
+            nx2 = nx1 + nw
+            ny2 = ny1 + nh
+            self._bbox_smooth_by_id[int(uid)] = {'w': float(nw), 'h': float(nh)}
+            return float(nx1), float(ny1), float(nx2), float(ny2)
+        except Exception:
+            return tuple(map(float, bbox))  # type: ignore
     
     def _draw_masks(
         self,

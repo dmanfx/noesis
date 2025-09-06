@@ -26,6 +26,7 @@ from collections import defaultdict, deque
 
 # Bypass libproxy issues by disabling GIO proxy resolver
 from typing import Optional, Tuple, Dict, Any, List, Union
+import numpy as np
 
 import torch
 import math
@@ -51,6 +52,7 @@ import requests  # For REST API calls to nvmultiurisrcbin
 # lazily makes failures easier to diagnose and avoids import-time crashes.
 
 from config import AppConfig  # noqa: E402
+from reid.stable_id_manager import StableIDManager  # noqa: E402
 
 
 
@@ -204,7 +206,7 @@ class DeepStreamVideoPipeline:
         self.trail_draw_stride: int = self.config.visualization.TRAIL_DRAW_STRIDE
         # show labels in trail visualization ONLY if enabled in config
         self.trail_show_labels: bool = self.config.visualization.TRAIL_SHOW_LABELS
-        
+
         # Initialize tracking state for telemetry - per sensor_id
         self.live_tracking_state: Dict[int, Dict[str, Any]] = {}
         for sensor_id in self.sensor_ids:
@@ -214,6 +216,70 @@ class DeepStreamVideoPipeline:
                 'transitions': []
             }
         self.logger.info(f"📊 Initialized tracking state for {len(self.sensor_ids)} streams")
+
+        # --- bbox smoothing state (per sensor_id, per track_id) ---
+        try:
+            from collections import defaultdict as _dd
+            self._bbox_smooth_by_sensor: Dict[int, Dict[int, Dict[str, Any]]] = _dd(dict)
+        except Exception:
+            self._bbox_smooth_by_sensor = {}
+        self.bbox_smoothing_enabled: bool = bool(getattr(self.config.visualization, 'BBOX_SMOOTHING_ENABLED', True))
+        self.bbox_smoothing_alpha: float = float(getattr(self.config.visualization, 'BBOX_SMOOTHING_ALPHA', 0.3))
+        self.bbox_smoothing_anchor: str = str(getattr(self.config.visualization, 'BBOX_SMOOTHING_ANCHOR', 'bottom')).lower()
+        self.bbox_smoothing_max_growth: float = float(getattr(self.config.visualization, 'BBOX_SMOOTHING_MAX_GROWTH', 1.2))
+        self.bbox_smoothing_max_shrink: float = float(getattr(self.config.visualization, 'BBOX_SMOOTHING_MAX_SHRINK', 0.85))
+        self.bbox_max_drop_window_s: float = float(getattr(self.config.visualization, 'BBOX_MAX_DROP_WINDOW_S', 4.0))
+        self.bbox_max_drop_ratio: float = float(getattr(self.config.visualization, 'BBOX_MAX_DROP_RATIO', 0.85))
+        self.trail_max_speed_px_per_s: float = float(getattr(self.config.visualization, 'TRAIL_MAX_SPEED_PX_PER_S', 600.0))
+
+        # Global Stable ID manager (OSNet/appearance-based global IDs)
+        try:
+            reid_model_path = getattr(self.config.models, 'REID_MODEL_PATH', None)
+        except Exception:
+            reid_model_path = None
+        device = getattr(self.config.models, 'DEVICE', 'cuda:0')
+        # Pull model selection and crop size from config
+        try:
+            reid_model_name = getattr(self.config.models, 'REID_MODEL_NAME', 'osnet_ibn_x1_0')
+        except Exception:
+            reid_model_name = 'osnet_ibn_x1_0'
+        try:
+            img_h, img_w = getattr(self.config.models, 'REID_IMAGE_SIZE', [256, 128])
+            image_size = (int(img_h), int(img_w))
+        except Exception:
+            image_size = (256, 128)
+
+        self.stable_id_mgr = StableIDManager(
+            model_path=reid_model_path,
+            device=device,
+            model_name=str(reid_model_name),
+            image_size=image_size,
+            embed_interval_s=float(getattr(self.config.models, 'REID_EMBED_INTERVAL_S', 1.0)),
+            max_ghost_age_s=float(getattr(self.config.models, 'REID_MAX_GHOST_AGE_S', 60.0)),
+            cos_sim_threshold=float(getattr(self.config.models, 'REID_COS_SIM_THRESHOLD', 0.72)),
+            cos_sim_high_threshold=float(getattr(self.config.models, 'REID_COS_SIM_HIGH_THRESHOLD', 0.80)),
+            allow_multi_zone_active=bool(getattr(self.config.models, 'REID_ALLOW_MULTI_ZONE_ACTIVE', True)),
+            crop_expand=float(getattr(self.config.models, 'REID_CROP_EXPAND', 0.12)),
+            tta_flip=bool(getattr(self.config.models, 'REID_TTA_FLIP', True)),
+            min_crop_h=int(getattr(self.config.models, 'REID_MIN_CROP_H', 64)),
+            min_laplacian_var=float(getattr(self.config.models, 'REID_MIN_LAPLACIAN', 12.0)),
+            adaptive_penalty=bool(getattr(self.config.models, 'REID_ADAPTIVE_PENALTY', True)),
+            size_penalty_alpha=float(getattr(self.config.models, 'REID_SIZE_PENALTY_ALPHA', 0.08)),
+            brightness_penalty_beta=float(getattr(self.config.models, 'REID_BRIGHTNESS_PENALTY_BETA', 0.05)),
+            spatial_penalty=bool(getattr(self.config.models, 'REID_SPATIAL_PENALTY', True)),
+            spatial_penalty_delta=float(getattr(self.config.models, 'REID_SPATIAL_PENALTY_DELTA', 0.06)),
+            color_penalty_gamma=float(getattr(self.config.models, 'REID_COLOR_PENALTY_GAMMA', 0.07)),
+            stripe_fusion=bool(getattr(self.config.models, 'REID_STRIPE_FUSION', True)),
+            stripe_count=int(getattr(self.config.models, 'REID_STRIPE_COUNT', 3)),
+            multi_scale_crops=bool(getattr(self.config.models, 'REID_MULTI_SCALE_CROPS', True)),
+            ema_alpha=float(getattr(self.config.models, 'REID_EMA_ALPHA', 0.20)),
+            active_id_guard_strict=bool(getattr(self.config.models, 'REID_ACTIVE_ID_GUARD_STRICT', True)),
+            active_id_guard_margin=float(getattr(self.config.models, 'REID_ACTIVE_ID_GUARD_MARGIN', 0.03)),
+            ghost_strict_age_s=float(getattr(self.config.models, 'REID_GHOST_STRICT_AGE_S', 2.0)),
+            ghost_extra_margin=float(getattr(self.config.models, 'REID_GHOST_EXTRA_MARGIN', 0.03)),
+        )
+        # Latest per-sensor JPEG bytes for non-blocking crops
+        self._latest_jpeg_bytes_by_sensor: Dict[int, bytes] = {}
 
         # Per-stream per-track zone dwell tracking state
         # { sensor_id: { track_id: { 'current_zone': Optional[str], 'entry_time': Optional[float] } } }
@@ -908,8 +974,12 @@ class DeepStreamVideoPipeline:
         except Exception:
             prev_occupancy = {}
 
+        # Attempt to decode latest JPEG for this sensor for embedding crops
+        decoded_frame_bgr = self._decode_latest_jpeg_for_sensor(sensor_id)
+
         l_obj = frame_meta.obj_meta_list
         now_ts = time.time()
+        present_ds_ids: List[int] = []
         while l_obj:
             obj = pyds.NvDsObjectMeta.cast(l_obj.data)  # type: ignore
             rect = obj.rect_params
@@ -1094,7 +1164,35 @@ class DeepStreamVideoPipeline:
             if secondary_data:
                 detection["secondary_inference"] = secondary_data
             
+            # StableID: update or create global identity (persons only)
+            try:
+                if getattr(self.config.models, 'REID_ENABLED', True) and int(obj.class_id) == 0:  # person
+                    bbox_tuple = (float(rect.left), float(rect.top), float(rect.width), float(rect.height))
+                    zone_name = track_dict.get('zone') if isinstance(track_dict, dict) else None
+                    stable_id = self.stable_id_mgr.update(
+                        sensor_id=int(sensor_id),
+                        ds_obj_id=int(obj.object_id),
+                        bbox_ltrbwh=bbox_tuple,
+                        ts=float(now_ts),
+                        zone=str(zone_name) if zone_name else None,
+                        frame_bgr=decoded_frame_bgr,
+                    )
+                    track_dict['stable_id'] = int(stable_id)
+                else:
+                    track_dict['stable_id'] = None
+            except Exception:
+                try:
+                    track_dict['stable_id'] = None
+                except Exception:
+                    pass
+
             detections.append(detection)
+
+            # Track presence for removal bookkeeping
+            try:
+                present_ds_ids.append(int(obj.object_id))
+            except Exception:
+                pass
             
             try:
                 l_obj = l_obj.next
@@ -1139,6 +1237,13 @@ class DeepStreamVideoPipeline:
             # Never allow publishing issues to affect the pipeline
             pass
 
+        # End-of-frame: remove tracks not present and prune ghosts
+        try:
+            self.stable_id_mgr.remove_missing_tracks(int(sensor_id), present_ds_ids, float(now_ts))
+            self.stable_id_mgr.prune_ghosts(now_ts)
+        except Exception:
+            pass
+
         # Update live tracking state for this specific stream
         if sensor_id in self.live_tracking_state:
             self.live_tracking_state[sensor_id]['active_tracks'] = active_tracks
@@ -1162,6 +1267,24 @@ class DeepStreamVideoPipeline:
             #self.logger.debug(f"📊 Recent transitions: {transitions[-3:]}")  # Show last 3 transitions
         
         return detections
+
+    def _decode_latest_jpeg_for_sensor(self, sensor_id: int) -> Optional[np.ndarray]:
+        """Decode the latest JPEG bytes for a sensor to BGR np.ndarray.
+
+        Uses a side buffer populated by the appsink callback to avoid contention
+        with the broadcast loop. Returns None if decode fails or no bytes yet.
+        """
+        try:
+            jpeg_bytes = self._latest_jpeg_bytes_by_sensor.get(int(sensor_id))
+            if not jpeg_bytes:
+                return None
+            import numpy as _np
+            npbuf = _np.frombuffer(jpeg_bytes, dtype=_np.uint8)
+            import cv2 as _cv2
+            frame = _cv2.imdecode(npbuf, _cv2.IMREAD_COLOR)
+            return frame
+        except Exception:
+            return None
 
     # --- Color helpers to keep OSD boxes and trails consistent with UI legend ---
     def _hsl_to_rgb(self, h: float, s: float, l: float) -> Tuple[float, float, float]:
@@ -1229,6 +1352,26 @@ class DeepStreamVideoPipeline:
             self.logger.error(f"🚨 Pipeline error: {err.message}")
             self.logger.error(f"🚨 Debug info: {debug}")
             self.logger.error(f"🚨 Error source: {message.src.get_name() if message.src else 'unknown'}")
+            try:
+                src_name = message.src.get_name() if message.src else ''
+                # Provide actionable hint if source/decoder failed
+                if any(k in src_name for k in ('nvmultiurisrcbin', 'uridecodebin', 'rtspsrc', 'decodebin')):
+                    # Summarize configured sources to aid debugging
+                    try:
+                        sources = []
+                        for sid, info in getattr(self, 'source_info', {}).items():
+                            sources.append(f"[{sid}] {info.get('name','unknown')} -> {info.get('url','')}\n")
+                        if sources:
+                            self.logger.error(
+                                "🔎 One or more sources failed to start or connect.\n"
+                                "    • Verify each stream URL is reachable and producing frames.\n"
+                                "    • If using ffmpeg or a local generator, ensure it is running.\n"
+                                "Configured sources:\n" + "".join(sources).rstrip()
+                            )
+                    except Exception:
+                        pass
+            except Exception:
+                pass
             self.running = False
             if self.mainloop:
                 self.mainloop.quit()
@@ -1270,20 +1413,74 @@ class DeepStreamVideoPipeline:
             if ret == Gst.StateChangeReturn.FAILURE:
                 self.logger.error("❌ Failed to set pipeline to PLAYING state")
                 return False
-            elif ret == Gst.StateChangeReturn.ASYNC:
-                self.logger.info("⏳ Pipeline state change is async, waiting...")
-                ret = self.pipeline.get_state(Gst.CLOCK_TIME_NONE)
-                if ret[0] != Gst.StateChangeReturn.SUCCESS:
-                    self.logger.error(f"❌ Pipeline state change failed: {ret[0]}")
-                    return False
-            
+
+            # Start GLib mainloop early so bus callbacks can surface errors while we wait
             self.running = True
             self.start_time = time.time()
-            
-            # Start main loop in a separate thread
             self.mainloop_thread = threading.Thread(target=self._run_mainloop, daemon=True)
             self.mainloop_thread.start()
-            
+
+            # If async, wait with a finite timeout and surface element states on failure
+            if ret == Gst.StateChangeReturn.ASYNC:
+                self.logger.info("⏳ Pipeline state change is async, waiting up to 10s...")
+                # 10s timeout
+                timeout_ns = 10 * Gst.SECOND
+                ret_state = self.pipeline.get_state(timeout_ns)
+                if ret_state[0] != Gst.StateChangeReturn.SUCCESS:
+                    # Collect per-element states for diagnosis
+                    states = []
+                    try:
+                        it = self.pipeline.iterate_elements()
+                        while True:
+                            result, element = it.next()
+                            if result != Gst.IteratorResult.OK:
+                                break
+                            name = element.get_name()
+                            e_ret, e_state, e_pending = element.get_state(0)
+                            states.append((name, e_ret, e_state, e_pending))
+                    except Exception:
+                        pass
+
+                    # Heuristic: identify likely culprit class
+                    def _nick(x):
+                        try:
+                            return x.value_nick  # type: ignore[attr-defined]
+                        except Exception:
+                            return str(x)
+
+                    src_names = ("nvmultiurisrcbin", "uridecodebin", "rtspsrc", "urisrc", "decodebin")
+                    stuck_src = [s for s in states if any(n in s[0] for n in src_names) and _nick(s[2]) != 'playing']
+                    stuck_inf = [s for s in states if s[0] == 'nvinfer' and _nick(s[2]) != 'playing']
+                    stuck_trk = [s for s in states if s[0] == 'nvtracker' and _nick(s[2]) != 'playing']
+
+                    if stuck_src:
+                        name, e_ret, e_state, e_pending = stuck_src[0]
+                        self.logger.error(
+                            f"❌ Source loading timed out or failed (element {name} state={_nick(e_state)}, pending={_nick(e_pending)})."
+                        )
+                        self.logger.error("Hint: verify stream URLs or generators are active.")
+                    elif stuck_inf:
+                        name, e_ret, e_state, e_pending = stuck_inf[0]
+                        self.logger.error(
+                            f"❌ Inference element stalled (element {name} state={_nick(e_state)}, pending={_nick(e_pending)})."
+                        )
+                    elif stuck_trk:
+                        name, e_ret, e_state, e_pending = stuck_trk[0]
+                        self.logger.error(
+                            f"❌ Tracker element stalled (element {name} state={_nick(e_state)}, pending={_nick(e_pending)})."
+                        )
+                    else:
+                        self.logger.error(f"❌ Pipeline state change failed or timed out: {ret_state[0]}")
+
+                    # Debug-only: full element states
+                    if states:
+                        self.logger.debug("Element states:")
+                        for name, e_ret, e_state, e_pending in states:
+                            self.logger.debug(
+                                f"  • {name}: state={_nick(e_state)} pending={_nick(e_pending)} ret={e_ret}"
+                            )
+                    return False
+
             self.logger.info("✅ DeepStream pipeline started successfully")
 
             # Log pipeline state after a short delay
@@ -1795,6 +1992,11 @@ class DeepStreamVideoPipeline:
                             pass # Drop frame if queue is full
                     else:
                         self.rate_limited_logger.warning(f"No JPEG queue for source_id {true_id}")
+                    # Also store latest bytes for crop decoding
+                    try:
+                        self._latest_jpeg_bytes_by_sensor[int(true_id)] = bytes(jpeg_bytes)
+                    except Exception:
+                        pass
             finally:
                 buffer.unmap(mapinfo)
             
@@ -2161,7 +2363,17 @@ class DeepStreamVideoPipeline:
                 try:
                     if tid != -1:
                         conf_value = float(obj_meta.confidence)
-                        obj_meta.text_params.display_text = f"id {tid} ({conf_value:.2f})"
+                        # Resolve stable_id for overlay if available
+                        try:
+                            sid_map_key = (int(sensor_id), int(tid))
+                            stable_id = self.stable_id_mgr.active_tracks.get(sid_map_key, {}).get('stable_id')
+                        except Exception:
+                            stable_id = None
+                        if stable_id is not None:
+                            label = f"sid {int(stable_id)} ds {int(tid)} ({conf_value:.2f})"
+                        else:
+                            label = f"ds {int(tid)} ({conf_value:.2f})"
+                        obj_meta.text_params.display_text = label
                         # Keep background disabled to avoid covering content
                         obj_meta.text_params.set_bg_clr = 0
                         # Set bbox border color to match track color
@@ -2174,9 +2386,119 @@ class DeepStreamVideoPipeline:
                 except Exception:
                     # Never break overlay on label formatting issues
                     pass
+                # Apply bbox size smoothing (EMA with clamp), anchored to bottom-center by default
+                try:
+                    if self.bbox_smoothing_enabled and tid != -1:
+                        rect = obj_meta.rect_params
+                        left = float(rect.left)
+                        top = float(rect.top)
+                        width = max(1.0, float(rect.width))
+                        height = max(1.0, float(rect.height))
+
+                        # Prior state for this (sensor, track)
+                        sensor_map = self._bbox_smooth_by_sensor.setdefault(int(sensor_id), {})
+                        prev = sensor_map.get(int(tid))
+                        # Init entry with history deque
+                        if prev is None:
+                            from collections import deque as _deque
+                            prev = {'hist_h': _deque(maxlen=240)}  # ~8s at 30 FPS
+                            sensor_map[int(tid)] = prev
+
+                        # Maintain height history within time window
+                        hist = prev.get('hist_h')
+                        if hist is not None:
+                            # prune old
+                            while hist and (now - hist[0][0] > self.bbox_max_drop_window_s):
+                                hist.popleft()
+                            # append current observation
+                            hist.append((now, height))
+                            # compute recent max height
+                            try:
+                                max_h_recent = max(h for (ts, h) in hist) if hist else height
+                            except Exception:
+                                max_h_recent = height
+                            # Apply over-window drop limit (height cannot drop below ratio * recent max)
+                            min_allowed_h = float(max_h_recent) * float(self.bbox_max_drop_ratio)
+                            if height < min_allowed_h:
+                                height = min_allowed_h
+
+                        # Clamp change vs previous size before EMA
+                        if prev is not None:
+                            prev_w = max(1.0, float(prev.get('w', width)))
+                            prev_h = max(1.0, float(prev.get('h', height)))
+                            max_g = self.bbox_smoothing_max_growth
+                            min_s = self.bbox_smoothing_max_shrink
+                            # Ensure ratios are sensible
+                            if max_g < 1.0: max_g = 1.0
+                            if min_s <= 0.0 or min_s > 1.0: min_s = 0.85
+
+                            # Clamp raw observation before smoothing
+                            width_clamped = max(prev_w * min_s, min(width, prev_w * max_g))
+                            height_clamped = max(prev_h * min_s, min(height, prev_h * max_g))
+
+                            a = self.bbox_smoothing_alpha
+                            new_w = prev_w + a * (width_clamped - prev_w)
+                            new_h = prev_h + a * (height_clamped - prev_h)
+                        else:
+                            new_w, new_h = width, height
+
+                        # Anchor choice: bottom-center (default) or center
+                        if self.bbox_smoothing_anchor == 'center':
+                            cx = left + width * 0.5
+                            cy = top + height * 0.5
+                            new_left = cx - new_w * 0.5
+                            new_top = cy - new_h * 0.5
+                        else:
+                            # bottom-center
+                            cx = left + width * 0.5
+                            by = top + height
+                            new_left = cx - new_w * 0.5
+                            new_top = by - new_h
+
+                        # Clamp to frame bounds
+                        try:
+                            fw = float(frame_meta.source_frame_width)
+                            fh = float(frame_meta.source_frame_height)
+                            new_left = max(0.0, min(new_left, fw - new_w))
+                            new_top = max(0.0, min(new_top, fh - new_h))
+                        except Exception:
+                            pass
+
+                        # Apply smoothed box
+                        rect.left = float(new_left)
+                        rect.top = float(new_top)
+                        rect.width = float(max(1.0, new_w))
+                        rect.height = float(max(1.0, new_h))
+
+                        # Persist state with timestamp
+                        prev['w'] = float(new_w)
+                        prev['h'] = float(new_h)
+                        prev['ts'] = float(now)
+                except Exception:
+                    # Never break rendering on smoothing issues
+                    pass
+
                 if tid != -1:
-                    cx = obj_meta.rect_params.left + obj_meta.rect_params.width / 2
-                    cy = obj_meta.rect_params.top  + obj_meta.rect_params.height
+                    # Compute bottom-center with trail speed clamp
+                    cx_raw = obj_meta.rect_params.left + obj_meta.rect_params.width / 2
+                    cy_raw = obj_meta.rect_params.top  + obj_meta.rect_params.height
+                    prev_pts = self.trail_history_by_sensor[int(sensor_id)][tid]
+                    last_ts = self.trail_last_seen_by_sensor[int(sensor_id)].get(tid)
+                    cx, cy = cx_raw, cy_raw
+                    if prev_pts and last_ts is not None:
+                        px, py = prev_pts[-1]
+                        dt = max(0.0, float(now - last_ts))
+                        if dt > 0.0:
+                            dx = cx_raw - px
+                            dy = cy_raw - py
+                            dist = (dx*dx + dy*dy) ** 0.5
+                            max_step = float(self.trail_max_speed_px_per_s) * dt
+                            if dist > max_step > 0.0:
+                                scale = max_step / dist
+                                dx *= scale
+                                dy *= scale
+                                cx = px + dx
+                                cy = py + dy
                     self.trail_history_by_sensor[int(sensor_id)][tid].append((cx, cy))
                     self.trail_last_seen_by_sensor[int(sensor_id)][tid] = now
                 l_obj = l_obj.next
@@ -2186,6 +2508,13 @@ class DeepStreamVideoPipeline:
                 if now - ts > self.trail_timeout_s:
                     self.trail_last_seen_by_sensor[int(sensor_id)].pop(tid, None)
                     self.trail_history_by_sensor[int(sensor_id)].pop(tid, None)
+                    # Also prune bbox smoothing state
+                    try:
+                        _m = self._bbox_smooth_by_sensor.get(int(sensor_id))
+                        if _m and int(tid) in _m:
+                            _m.pop(int(tid), None)
+                    except Exception:
+                        pass
 
             display_meta = pyds.nvds_acquire_display_meta_from_pool(batch_meta)
             if not display_meta:

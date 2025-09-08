@@ -19,6 +19,8 @@ import sys
 import os
 os.environ['no_proxy'] = '*'
 import logging
+import configparser
+import re
 import threading
 import time
 import queue
@@ -280,6 +282,17 @@ class DeepStreamVideoPipeline:
         )
         # Latest per-sensor JPEG bytes for non-blocking crops
         self._latest_jpeg_bytes_by_sensor: Dict[int, bytes] = {}
+        # Decode gating for ReID crops (per sensor)
+        from collections import defaultdict as _dd
+        self._last_decode_ts_by_sensor: Dict[int, float] = _dd(float)
+        try:
+            self._reid_decode_min_interval_s: float = float(getattr(self.config.models, 'REID_DECODE_MIN_INTERVAL_S', 0.2))
+        except Exception:
+            self._reid_decode_min_interval_s = 0.2
+
+        # Exclusion ROIs parsed from nvdsanalytics exclude config (per DS source index)
+        # { stream_index(int): { normalized_label(str): [(x,y), ...] } }
+        self._exclusion_rois_by_stream: Dict[int, Dict[str, List[Tuple[float, float]]]] = {}
 
         # Per-stream per-track zone dwell tracking state
         # { sensor_id: { track_id: { 'current_zone': Optional[str], 'entry_time': Optional[float] } } }
@@ -620,9 +633,24 @@ class DeepStreamVideoPipeline:
                 except StopIteration:
                     break
 
-                # Inspect analytics meta for ROI status
-                remove = False
+                # Robust exclusion: use configured polygons per stream and require 100% bbox containment
+                try:
+                    ds_index = int(frame_meta.source_id)
+                except Exception:
+                    ds_index = int(getattr(frame_meta, 'source_id', 0))
+
+                exclusion_polys = self._exclusion_rois_by_stream.get(ds_index, {})
+
+                # Compute bbox corners (axis-aligned)
+                rect = obj_meta.rect_params
+                left, top, width, height = float(rect.left), float(rect.top), float(rect.width), float(rect.height)
+                x2, y2 = left + width, top + height
+                bbox_corners = [(left, top), (x2, top), (x2, y2), (left, y2)]
+
+                # Collect candidate polygons from analytics roiStatus when available
+                candidate_polys: List[List[Tuple[float, float]]] = []
                 l_user = obj_meta.obj_user_meta_list
+                roi_labels_set = set()
                 while l_user:
                     try:
                         user_meta = pyds.NvDsUserMeta.cast(l_user.data)
@@ -631,17 +659,26 @@ class DeepStreamVideoPipeline:
 
                     if user_meta.base_meta.meta_type == pyds.nvds_get_user_meta_type("NVIDIA.DSANALYTICSOBJ.USER_META"):
                         ainfo = pyds.NvDsAnalyticsObjInfo.cast(user_meta.user_meta_data)
-                        if ainfo and ainfo.roiStatus is not None:
-                            for label in ainfo.roiStatus:
-                                if label in ("RF1",):  # exclusion labels
-                                    remove = True
-                                    break
-                        if remove:
-                            break
-                    
+                        labels = self._normalize_roi_status_labels(getattr(ainfo, 'roiStatus', None))
+                        roi_labels_set |= labels
+                        for lbl in labels:
+                            poly = exclusion_polys.get(lbl)
+                            if poly:
+                                candidate_polys.append(poly)
                     try:
                         l_user = l_user.next
                     except StopIteration:
+                        break
+
+                # Fallback: if analytics didn't supply or no matching labels, consider all exclusion polys
+                if not candidate_polys and exclusion_polys:
+                    candidate_polys = list(exclusion_polys.values())
+
+                # Decide removal only if bbox is fully contained in at least one polygon
+                remove = False
+                for poly in candidate_polys:
+                    if self._bbox_fully_inside_polygon(bbox_corners, poly):
+                        remove = True
                         break
 
                 if remove:
@@ -659,6 +696,114 @@ class DeepStreamVideoPipeline:
             self.logger.info(f"Frame {self.frame_count}: Removed {removed_count} objects from exclusion zone.")
 
         return Gst.PadProbeReturn.OK
+
+    # ---- Exclusion ROI helpers ----
+    def _load_exclusion_rois_from_config(self, path: str) -> None:
+        """Parse nvdsanalytics exclude config and cache ROI polygons per stream index.
+
+        Sections are of the form [roi-filtering-stream-<index>], and keys like roi-<LABEL>=x;y;...
+        """
+        try:
+            cfg = configparser.ConfigParser()
+            read = cfg.read(path)
+            if not read:
+                self.logger.warning(f"⚠️ Exclusion ROI config not found or unreadable: {path}")
+                return
+            pat = re.compile(r"^roi-filtering-stream-(\d+)$", re.IGNORECASE)
+            total = 0
+            rois_by_stream: Dict[int, Dict[str, List[Tuple[float, float]]]] = {}
+            for section in cfg.sections():
+                m = pat.match(section.strip())
+                if not m:
+                    continue
+                sidx = int(m.group(1))
+                rois_by_stream.setdefault(sidx, {})
+                for key, val in cfg.items(section):
+                    if not key.lower().startswith('roi-'):
+                        continue
+                    label_raw = key[len('roi-'):]
+                    label_norm = self._normalize_roi_label(label_raw)
+                    pts = self._parse_points_list(val)
+                    if len(pts) >= 3:
+                        # Store under both normalized and original forms for robust lookup
+                        rois_by_stream[sidx][label_norm] = pts
+                        rois_by_stream[sidx][self._normalize_roi_label('roi-' + label_raw)] = pts
+                        total += 1
+            self._exclusion_rois_by_stream = rois_by_stream
+            if total:
+                self.logger.info(f"✅ Loaded {total} exclusion ROI(s) from {path}")
+            else:
+                self.logger.info(f"ℹ️ No exclusion ROIs found in {path}")
+        except Exception as e:
+            self.logger.error(f"Error parsing exclusion ROI config {path}: {e}")
+
+    def _parse_points_list(self, s: str) -> List[Tuple[float, float]]:
+        """Parse 'x1;y1; x2;y2; ...' into [(x1,y1), ...]."""
+        try:
+            # Split by delimiters and filter empties
+            tokens = re.split(r"[\s;,]+", s.strip())
+            nums = [float(t) for t in tokens if t != '']
+            pts: List[Tuple[float, float]] = []
+            for i in range(0, len(nums) - 1, 2):
+                pts.append((nums[i], nums[i + 1]))
+            return pts
+        except Exception:
+            return []
+
+    def _normalize_roi_label(self, label: str) -> str:
+        """Normalize ROI label for consistent matching (case-insensitive, strip 'roi-' prefix)."""
+        lbl = str(label).strip()
+        # Remove optional leading 'roi-'
+        if lbl.lower().startswith('roi-'):
+            lbl = lbl[4:]
+        return lbl.strip().lower()
+
+    def _normalize_roi_status_labels(self, roi_status: Any) -> set:
+        """Normalize various possible roiStatus formats into a set of comparable labels."""
+        labels = set()
+        try:
+            if roi_status is None:
+                return labels
+            if isinstance(roi_status, dict):
+                for k, v in roi_status.items():
+                    if v in (1, True, 'IN', 'inside', 'INROI', 'in'):
+                        labels.add(self._normalize_roi_label(k))
+            elif isinstance(roi_status, (list, tuple, set)):
+                for item in roi_status:
+                    labels.add(self._normalize_roi_label(str(item)))
+            elif isinstance(roi_status, str):
+                for token in re.split(r"[\s,;]+", roi_status.strip()):
+                    if token:
+                        labels.add(self._normalize_roi_label(token))
+        except Exception:
+            pass
+        return labels
+
+    def _point_in_polygon(self, x: float, y: float, poly: List[Tuple[float, float]]) -> bool:
+        """Ray casting algorithm for point-in-polygon. Includes boundary as inside."""
+        inside = False
+        n = len(poly)
+        if n < 3:
+            return False
+        for i in range(n):
+            x1, y1 = poly[i]
+            x2, y2 = poly[(i + 1) % n]
+            # Check if point is on a horizontal boundary
+            if (y == y1 == y2) and min(x1, x2) <= x <= max(x1, x2):
+                return True
+            # Ray intersects segment?
+            intersects = ((y1 > y) != (y2 > y)) and (
+                x < (x2 - x1) * (y - y1) / (y2 - y1 + 1e-9) + x1)
+            if intersects:
+                inside = not inside
+        return inside
+
+    def _bbox_fully_inside_polygon(self, corners: List[Tuple[float, float]], poly: List[Tuple[float, float]]) -> bool:
+        """Return True if all bbox corners are inside the polygon."""
+        for (px, py) in corners:
+            if not self._point_in_polygon(px, py, poly):
+                return False
+        return True
 
     def _configure_elements(self, elements: Dict[str, Any]) -> bool:
         """Configure properties for all pipeline elements."""
@@ -694,8 +839,11 @@ class DeepStreamVideoPipeline:
             elements['nvinfer'].set_property("input-tensor-meta", True)
 
             # Exclusion analytics
+            exclude_cfg_path = "pipelines/config_nvdsanalytics_exclude.ini"
             elements['nvdsanalytics_exclude'].set_property("unique-id", 101)
-            elements['nvdsanalytics_exclude'].set_property("config-file", "pipelines/config_nvdsanalytics_exclude.ini")
+            elements['nvdsanalytics_exclude'].set_property("config-file", exclude_cfg_path)
+            # Pre-parse exclusion ROIs for robust containment checks in pad probe
+            self._load_exclusion_rois_from_config(exclude_cfg_path)
 
             # Tracker configuration
             elements['nvtracker'].set_property("ll-lib-file", "/opt/nvidia/deepstream/deepstream/lib/libnvds_nvmultiobjecttracker.so")
@@ -891,15 +1039,8 @@ class DeepStreamVideoPipeline:
                 l_frame = l_frame.next
             except StopIteration:
                 break
-        if self.websocket_server and hasattr(self.websocket_server, 'broadcast_frame'):
-            for source_id, state in self.live_tracking_state.items():
-                if state['active_tracks']:  # Only send if data
-                    frame_data = {
-                        'source_id': source_id,
-                        'timestamp': time.time(),
-                        'tracking': state
-                    }
-                    self.websocket_server.broadcast_frame(frame_data)
+        # Note: Per-frame telemetry broadcast disabled to avoid client overload.
+        # Periodic stats broadcast (1 Hz) remains enabled via WebSocketServer.
         return Gst.PadProbeReturn.OK
 
 
@@ -974,8 +1115,8 @@ class DeepStreamVideoPipeline:
         except Exception:
             prev_occupancy = {}
 
-        # Attempt to decode latest JPEG for this sensor for embedding crops
-        decoded_frame_bgr = self._decode_latest_jpeg_for_sensor(sensor_id)
+        # Lazy-decode JPEG for ReID crops only when needed
+        decoded_frame_bgr = None
 
         l_obj = frame_meta.obj_meta_list
         now_ts = time.time()
@@ -1169,6 +1310,12 @@ class DeepStreamVideoPipeline:
                 if getattr(self.config.models, 'REID_ENABLED', True) and int(obj.class_id) == 0:  # person
                     bbox_tuple = (float(rect.left), float(rect.top), float(rect.width), float(rect.height))
                     zone_name = track_dict.get('zone') if isinstance(track_dict, dict) else None
+                    # Decode at most every N ms per sensor and only on-demand
+                    if decoded_frame_bgr is None:
+                        last_dec = float(self._last_decode_ts_by_sensor.get(int(sensor_id), 0.0))
+                        if (float(now_ts) - last_dec) >= float(self._reid_decode_min_interval_s):
+                            decoded_frame_bgr = self._decode_latest_jpeg_for_sensor(sensor_id)
+                            self._last_decode_ts_by_sensor[int(sensor_id)] = float(now_ts)
                     stable_id = self.stable_id_mgr.update(
                         sensor_id=int(sensor_id),
                         ds_obj_id=int(obj.object_id),

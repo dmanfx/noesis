@@ -22,6 +22,24 @@ import logging
 import multiprocessing
 import os
 os.environ['no_proxy'] = '*'
+
+# Configure NVIDIA DeepStream/nvinfer logging to reduce INFO noise
+# Set nvinfer to WARNING level (2) and other GStreamer elements to ERROR (1)
+if 'GST_DEBUG' not in os.environ:
+    os.environ['GST_DEBUG'] = '*:1,nvinfer:2'
+
+# Set NVIDIA DeepStream debug level to minimal
+if 'NVDS_DEBUG_LEVEL' not in os.environ:
+    os.environ['NVDS_DEBUG_LEVEL'] = '0'
+
+# Suppress TensorRT INFO messages
+if 'TF_CPP_MIN_LOG_LEVEL' not in os.environ:
+    os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'  # 0=INFO, 1=WARNING, 2=ERROR
+
+# Suppress TensorRT logger (if available)
+if 'TRT_LOGGER_LEVEL' not in os.environ:
+    os.environ['TRT_LOGGER_LEVEL'] = '2'  # 0=VERBOSE, 1=INFO, 2=WARNING, 3=ERROR
+
 import queue
 import signal
 import sys
@@ -495,15 +513,37 @@ class ApplicationManager:
                 loop.run_until_complete(self.websocket_server.start())
                 self.logger.info("WebSocket server started successfully")
 
+                # Set up shutdown handling
+                def shutdown_handler():
+                    """Handle shutdown signal for this thread"""
+                    self.logger.info("WebSocket thread received shutdown signal")
+                    try:
+                        # Stop the WebSocket server gracefully
+                        loop.run_until_complete(self.websocket_server.stop())
+                    except Exception as e:
+                        self.logger.warning(f"Error stopping WebSocket server in thread: {e}")
+                    finally:
+                        # Stop the event loop
+                        loop.stop()
+
                 # Run event loop to handle connections
                 self.logger.info("Starting WebSocket event loop...")
                 try:
                     loop.run_forever()
                 except KeyboardInterrupt:
                     self.logger.info("WebSocket server received keyboard interrupt")
+                    shutdown_handler()
                 finally:
-                    # Clean up the event loop
-                    loop.close()
+                    # Ensure cleanup happens even if shutdown_handler wasn't called
+                    try:
+                        if not loop.is_closed():
+                            loop.run_until_complete(self.websocket_server.stop())
+                    except Exception as e:
+                        self.logger.debug(f"WebSocket server already stopped or error during final cleanup: {e}")
+                    finally:
+                        # Clean up the event loop
+                        if not loop.is_closed():
+                            loop.close()
 
             except Exception as e:
                 self.logger.error(f"WebSocket server thread failed: {e}")
@@ -591,10 +631,32 @@ class ApplicationManager:
                         if not self.running:
                             break
                             
-                        # Read JPEG data from multi-stream processor
-                        success, jpeg_bytes = self.multi_stream_processor.read_encoded_jpeg(source_id, timeout=0.1)
-                        
-                        if success and jpeg_bytes and self.websocket_server:
+                        # Read and coalesce to latest JPEG for this source (drain queue)
+                        jpeg_bytes = None
+                        try:
+                            q = getattr(self.multi_stream_processor, 'jpeg_queues', {}).get(source_id)
+                        except Exception:
+                            q = None
+                        if q is not None:
+                            try:
+                                # Blocking read for first item
+                                jpeg_bytes = q.get(timeout=0.1)
+                                # Drain any additional queued frames to keep only the latest
+                                drained = 0
+                                while True:
+                                    try:
+                                        more = q.get_nowait()
+                                        jpeg_bytes = more
+                                        drained += 1
+                                    except queue.Empty:
+                                        break
+                                # Optional: debug drain count at low rate
+                                # if drained > 0:
+                                #     self.rate_limited_logger.debug(f"Drained {drained} frames for source {source_id}")
+                            except queue.Empty:
+                                jpeg_bytes = None
+
+                        if jpeg_bytes and self.websocket_server:
                             # Use clean camera name for frontend
                             camera_id = info['clean_name']
                             # Get or compute header
@@ -1135,33 +1197,39 @@ class ApplicationManager:
         if self.websocket_server:
             try:
                 self.logger.info("Stopping WebSocket server")
+                # Use the improved sync stop method
+                try:
+                    self.websocket_server.stop_sync()
+                except Exception as e:
+                    self.logger.warning(f"WebSocket server stop_sync failed: {e}")
+
                 # If websocket server thread loop exists, stop via that loop
                 if hasattr(self, 'websocket_loop') and self.websocket_loop:
                     try:
-                        fut = asyncio.run_coroutine_threadsafe(self.websocket_server.stop(), self.websocket_loop)
-                        fut.result(timeout=4.0)
-                    except Exception as e:
-                        self.logger.warning(f"WebSocket server stop via thread loop failed/timed out: {e}")
-                    try:
+                        # Schedule the event loop to stop
                         self.websocket_loop.call_soon_threadsafe(self.websocket_loop.stop)
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        self.logger.debug(f"Could not stop event loop: {e}")
                 else:
                     # Fallback: mark not running
                     try:
                         self.websocket_server.running = False
                     except Exception:
-                        pass
-                self.logger.info("Stopped WebSocket server")
+                        self.logger.debug(f"Could not mark WebSocket server as not running: {e}")
+                self.logger.info("✅ WebSocket server shutdown initiated")
             except Exception as e:
                 self.logger.error(f"Error stopping WebSocket server: {e}")
-        
+
         # STEP 6: Stop WebSocket thread
         if hasattr(self, 'websocket_thread') and self.websocket_thread:
             try:
-                self.logger.info("Stopping WebSocket thread")
-                safe_join(self.websocket_thread, timeout=2.0, name="websocket_thread")
-                self.logger.info("Stopped WebSocket thread")
+                self.logger.info("Waiting for WebSocket thread to complete...")
+                # Give more time for graceful shutdown
+                thread_joined = safe_join(self.websocket_thread, timeout=5.0, name="websocket_thread")
+                if thread_joined:
+                    self.logger.info("✅ WebSocket thread stopped gracefully")
+                else:
+                    self.logger.warning("⚠️ WebSocket thread did not stop within timeout, will be abandoned")
             except Exception as e:
                 self.logger.error(f"Error stopping WebSocket thread: {e}")
         

@@ -43,6 +43,10 @@ class WebSocketServer:
         self.logger = logging.getLogger("WebSocketServer")
         self._stats_task = None # Added reference for the periodic stats task
         self._last_stats_info_log: float = 0.0
+        # Binary frame coalescer state: keep only latest per camera
+        self._latest_binary_by_cam: Dict[str, bytes] = {}
+        self._binary_flush_task: Optional[asyncio.Task] = None
+        self._binary_sending: bool = False
     
     async def _cleanup_stale_connections(self):
         """Periodically clean up any stale or closed connections"""
@@ -184,6 +188,13 @@ class WebSocketServer:
         self.logger.info("Stopping WebSocket server...")
         self.running = False
 
+        # Cancel any pending binary flush task
+        if self._binary_flush_task and not self._binary_flush_task.done():
+            try:
+                self._binary_flush_task.cancel()
+            except Exception:
+                pass
+
         # Cancel the periodic stats task first
         if self._stats_task and not self._stats_task.done():
             self._stats_task.cancel()
@@ -221,6 +232,25 @@ class WebSocketServer:
                 await self.server_task
             except asyncio.CancelledError:
                 pass
+
+    def stop_sync(self):
+        """Synchronous stop method for use from other threads"""
+        self.logger.info("Stopping WebSocket server (sync mode)...")
+        self.running = False
+
+        # Create a task to run the async stop in the current event loop
+        try:
+            loop = asyncio.get_running_loop()
+            loop.create_task(self.stop())
+        except RuntimeError:
+            # No running loop, try to get the event loop from the instance
+            if hasattr(self, 'event_loop') and self.event_loop:
+                try:
+                    asyncio.run_coroutine_threadsafe(self.stop(), self.event_loop)
+                except Exception as e:
+                    self.logger.warning(f"Could not stop WebSocket server via event loop: {e}")
+            else:
+                self.logger.warning("No event loop available for WebSocket server shutdown")
     
     async def handle_client(self, websocket, path=None):
         """Handle incoming WebSocket connections and messages
@@ -417,23 +447,8 @@ class WebSocketServer:
                 message = convert_numpy_types(message)
                 message_str = json.dumps(message)
             elif isinstance(message, bytes):
-                # Binary message - send to active clients only
-                results = await asyncio.gather(
-                    *[client.send(message) for client in active_clients],
-                    return_exceptions=True
-                )
-                # Check for errors and mark disconnected clients
-                for i, result in enumerate(results):
-                    if isinstance(result, Exception):
-                        client = list(active_clients)[i] if i < len(active_clients) else None
-                        if client:
-                            disconnected_clients.add(client)
-                        client_ip = client.remote_address if client and hasattr(client, 'remote_address') else "Unknown"
-                        # Only log ping timeout errors to reduce noise, but still handle all exceptions
-                        if "keepalive ping timeout" in str(result):
-                            self.logger.debug(f"Client {client_ip} ping timeout - will be cleaned up")
-                        else:
-                            self.logger.error(f"Failed to send binary message to {client_ip}: {result}")
+                # Route binary frames into coalescer; actual sending is handled elsewhere
+                await self._coalesce_binary_and_maybe_flush(message)
                 return
             elif isinstance(message, str):
                 # String message
@@ -511,6 +526,95 @@ class WebSocketServer:
             "payload": convert_numpy_types(frame_data),
         }
         self.broadcast_sync(payload)
+
+    # ---------------- Binary coalescer helpers ----------------
+    def _extract_cam_id_from_binary(self, data: bytes) -> Optional[str]:
+        try:
+            if not data or len(data) < 1:
+                return None
+            id_len = data[0]
+            if len(data) < 1 + id_len:
+                return None
+            cam_id_bytes = data[1:1 + id_len]
+            return cam_id_bytes.decode('utf-8', errors='ignore')
+        except Exception:
+            return None
+
+    async def _coalesce_binary_and_maybe_flush(self, data: bytes) -> None:
+        """Keep only the latest binary frame per camera and schedule a flush if idle."""
+        try:
+            cam_id = self._extract_cam_id_from_binary(data)
+            if cam_id is None:
+                # If we cannot parse, fallback to immediate broadcast
+                await self._broadcast_binary_immediate(data)
+                return
+            # Coalesce latest per camera
+            self._latest_binary_by_cam[cam_id] = data
+
+            # Schedule a flush if not currently sending
+            if not self._binary_sending:
+                # Avoid creating multiple concurrent flushers
+                if self._binary_flush_task is None or self._binary_flush_task.done():
+                    self._binary_flush_task = asyncio.create_task(self._flush_binary_queue(), name="BinaryFlush")
+        except Exception as e:
+            self.logger.debug(f"Coalescer error: {e}")
+
+    async def _broadcast_binary_immediate(self, data: bytes) -> None:
+        """Fallback path to send a single binary payload to all clients."""
+        if not self.connected_clients:
+            return
+        active_clients = set(self.connected_clients)
+        results = await asyncio.gather(
+            *[client.send(data) for client in active_clients],
+            return_exceptions=True
+        )
+        disconnected_clients = set()
+        for i, result in enumerate(results):
+            if isinstance(result, Exception):
+                client = list(active_clients)[i] if i < len(active_clients) else None
+                if client:
+                    disconnected_clients.add(client)
+                client_ip = client.remote_address if client and hasattr(client, 'remote_address') else "Unknown"
+                if "keepalive ping timeout" in str(result).lower():
+                    self.logger.debug(f"Client {client_ip} ping timeout - will be cleaned up")
+                else:
+                    self.logger.error(f"Failed to send binary message to {client_ip}: {result}")
+        # Cleanup
+        if disconnected_clients:
+            for client in disconnected_clients:
+                if client in self.connected_clients:
+                    self.connected_clients.remove(client)
+                    client_ip = client.remote_address if hasattr(client, 'remote_address') else "Unknown"
+                    self.logger.info(f"Removed disconnected client {client_ip} from connected clients")
+
+    async def _flush_binary_queue(self) -> None:
+        """Flush latest binary frames per camera to all clients, dropping superseded frames."""
+        if self._binary_sending:
+            return
+        self._binary_sending = True
+        try:
+            # Loop while there is data and server running
+            while self.running and self._latest_binary_by_cam:
+                if not self.connected_clients:
+                    # No clients; keep latest for later but don't spin
+                    await asyncio.sleep(0.05)
+                    continue
+                # Snapshot current latest and clear for coalescing of new arrivals
+                batch = list(self._latest_binary_by_cam.items())
+                self._latest_binary_by_cam.clear()
+
+                # Send each camera's latest frame once
+                for cam_id, payload in batch:
+                    await self._broadcast_binary_immediate(payload)
+
+                # Yield control to allow new coalescing
+                await asyncio.sleep(0)
+        except asyncio.CancelledError:
+            pass
+        except Exception as e:
+            self.logger.error(f"Binary flush error: {e}")
+        finally:
+            self._binary_sending = False
 
 
 class WebSocketClient:

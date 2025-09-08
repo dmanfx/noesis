@@ -71,6 +71,8 @@ export function useWebSocketClient(url: string, handlers: FrameHandlers) {
       }
 
       const ws = new WebSocket(url);
+      // Prefer ArrayBuffer to avoid extra Blob conversions
+      try { ws.binaryType = 'arraybuffer'; } catch {}
       socketRef.current = ws;
 
       ws.onopen = () => {
@@ -97,23 +99,23 @@ export function useWebSocketClient(url: string, handlers: FrameHandlers) {
       };
       ws.onmessage = async (ev: MessageEvent) => {
         try {
-          if (ev.data instanceof Blob) {
-            const arrayBuffer = await ev.data.arrayBuffer();
-            if (arrayBuffer.byteLength < 1) return;
+          if (ev.data instanceof ArrayBuffer) {
+            const arrayBuffer = ev.data as ArrayBuffer;
             const view = new DataView(arrayBuffer);
             const idLen = view.getUint8(0);
             if (arrayBuffer.byteLength < 1 + idLen) return;
             const idBytes = new Uint8Array(arrayBuffer, 1, idLen);
             const id = new TextDecoder('utf-8').decode(idBytes);
             const jpeg = arrayBuffer.slice(1 + idLen);
-            const blob = new Blob([jpeg], { type: 'image/jpeg' });
+            const jpgBlob = new Blob([jpeg], { type: 'image/jpeg' });
             const cam = detectCameraKey(id);
-            if (cam) handlers.onImage(cam, blob);
+            if (cam) handlers.onImage(cam, jpgBlob);
             return;
           }
-          if (ev.data instanceof ArrayBuffer) {
-            const blob = new Blob([ev.data], { type: 'application/octet-stream' });
-            const arrayBuffer = await blob.arrayBuffer();
+          if (ev.data instanceof Blob) {
+            // Fallback path when proxies force Blob delivery
+            const arrayBuffer = await (ev.data as Blob).arrayBuffer();
+            if (arrayBuffer.byteLength < 1) return;
             const view = new DataView(arrayBuffer);
             const idLen = view.getUint8(0);
             if (arrayBuffer.byteLength < 1 + idLen) return;
@@ -185,4 +187,3 @@ export function useWebSocketClient(url: string, handlers: FrameHandlers) {
     sendDetectionToggle: (name: string, enabled: boolean) => sendJson({ type: 'set_detection_toggle', toggle_name: name, enabled })
   };
 }
-

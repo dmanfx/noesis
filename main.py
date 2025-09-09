@@ -14,31 +14,24 @@ The system uses ZERO CPU fallbacks - all operations must succeed on GPU.
 import sys
 print("🚀 main.py script started!", flush=True)
 sys.stdout.flush()
+
+# Set GStreamer debug BEFORE any other imports
+import os
+os.environ['GST_DEBUG'] = '*:0'  # Complete silence for all GStreamer
+os.environ['GST_DEBUG_NO_COLOR'] = '1'  # Disable colored output
+os.environ['no_proxy'] = '*'
+
+# Configure NVIDIA DeepStream/nvinfer logging to reduce INFO noise
+os.environ['NVDS_DEBUG_LEVEL'] = '0'  # Minimal DeepStream logging
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'  # Suppress TensorFlow/TensorRT INFO
+os.environ['TRT_LOGGER_LEVEL'] = '2'  # Suppress TensorRT logger INFO
+
 import argparse
 print("✅ argparse imported", flush=True)
 sys.stdout.flush()
 import asyncio
 import logging
 import multiprocessing
-import os
-os.environ['no_proxy'] = '*'
-
-# Configure NVIDIA DeepStream/nvinfer logging to reduce INFO noise
-# Set nvinfer to WARNING level (2) and other GStreamer elements to ERROR (1)
-if 'GST_DEBUG' not in os.environ:
-    os.environ['GST_DEBUG'] = '*:1,nvinfer:2'
-
-# Set NVIDIA DeepStream debug level to minimal
-if 'NVDS_DEBUG_LEVEL' not in os.environ:
-    os.environ['NVDS_DEBUG_LEVEL'] = '0'
-
-# Suppress TensorRT INFO messages
-if 'TF_CPP_MIN_LOG_LEVEL' not in os.environ:
-    os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'  # 0=INFO, 1=WARNING, 2=ERROR
-
-# Suppress TensorRT logger (if available)
-if 'TRT_LOGGER_LEVEL' not in os.environ:
-    os.environ['TRT_LOGGER_LEVEL'] = '2'  # 0=VERBOSE, 1=INFO, 2=WARNING, 3=ERROR
 
 import queue
 import signal

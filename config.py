@@ -224,6 +224,17 @@ class AppConfig:
         # require an extra margin above REID_COS_SIM_THRESHOLD to match.
         REID_GHOST_STRICT_AGE_S: float = 2.0
         REID_GHOST_EXTRA_MARGIN: float = 0.03
+        # Soft cap on concurrently active stable IDs
+        REID_MAX_ACTIVE_IDS_PER_SENSOR: int = 6
+        REID_NEW_ID_CONFIRM_FRAMES_AT_CAP: int = 2
+        REID_ACTIVE_EVICT_GRACE_S: float = 10.0
+        # Cross-camera handoff tuning
+        REID_XCAM_HANDOFF_WINDOW_S: float = 6.0
+        REID_XCAM_HANDOFF_MARGIN: float = 0.04
+        # Global ID pool soft-cap
+        REID_MAX_TOTAL_IDS: int = 12
+        REID_TOTAL_ID_REUSE: bool = True
+        REID_TOTAL_ID_REUSE_MIN_AGE_S: float = 600.0  # Only recycle IDs inactive this long and not active anywhere
         
         # Performance Settings
         WARM_UP_ITERATIONS: int = 10  # Number of warm-up iterations for TensorRT

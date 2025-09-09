@@ -56,6 +56,17 @@ class StableIDManager:
         # Ghost strictness
         ghost_strict_age_s: float = 2.0,
         ghost_extra_margin: float = 0.03,
+        # Soft cap on active IDs
+        max_active_ids_per_sensor: int = 6,
+        new_id_confirm_frames_at_cap: int = 2,
+        active_evict_grace_s: float = 10.0,
+        # Cross-camera handoff
+        xcam_handoff_window_s: float = 4.0,
+        xcam_handoff_margin: float = 0.02,
+        # Global ID pool soft-cap
+        max_total_ids: int = 12,
+        total_id_reuse: bool = True,
+        total_id_reuse_min_age_s: float = 600.0,
     ) -> None:
         self._lock = threading.RLock()
         self.extractor = EmbeddingExtractor(
@@ -88,6 +99,14 @@ class StableIDManager:
         self.active_id_guard_margin = float(active_id_guard_margin)
         self.ghost_strict_age_s = float(ghost_strict_age_s)
         self.ghost_extra_margin = float(ghost_extra_margin)
+        self.max_active_ids_per_sensor = int(max_active_ids_per_sensor)
+        self.new_id_confirm_frames_at_cap = int(new_id_confirm_frames_at_cap)
+        self.active_evict_grace_s = float(active_evict_grace_s)
+        self.xcam_handoff_window_s = float(xcam_handoff_window_s)
+        self.xcam_handoff_margin = float(xcam_handoff_margin)
+        self.max_total_ids = int(max_total_ids)
+        self.total_id_reuse = bool(total_id_reuse)
+        self.total_id_reuse_min_age_s = float(total_id_reuse_min_age_s)
 
         # Active tracks: (sensor_id, ds_obj_id) -> record
         self.active_tracks: Dict[Tuple[int, int], Dict] = {}
@@ -107,6 +126,10 @@ class StableIDManager:
         self.sid_last_bbox: Dict[int, BBox] = {}
         self.sid_last_brightness: Dict[int, float] = {}
         self.sid_last_color: Dict[int, np.ndarray] = {}
+        # Global last seen timestamp per stable_id (any sensor)
+        self.sid_global_last_seen: Dict[int, float] = {}
+        # Pending new-ID confirmation counters at cap
+        self._pending_new_counts: Dict[Tuple[int, int], int] = {}
 
         self.next_stable_id = 1
 
@@ -344,21 +367,95 @@ class StableIDManager:
                     if sid is None:
                         g_brightness = curr_brightness if curr_brightness is not None else None
                         g_id, g_sim = self._gallery_best(emb, sensor_id=int(sensor_id), curr_bbox=bbox_ltrbwh, curr_brightness=g_brightness, curr_color=curr_color)
-                        if g_id is not None and g_sim >= self.cos_sim_high_threshold:
-                            # If the candidate stable_id is already active on this sensor,
-                            # optionally require a small extra margin to avoid merging co-present people.
-                            can_take = True
-                            if self.active_id_guard_strict:
-                                active_pairs = self.active_zones.get(int(g_id), set())
-                                active_here = any(int(sid_sensor) == int(sensor_id) for (sid_sensor, _zone) in active_pairs)
-                                if active_here and (g_sim < (self.cos_sim_high_threshold + self.active_id_guard_margin)):
-                                    can_take = False
-                            if can_take and (self.allow_multi_zone_active or not self.active_zones.get(g_id)):
-                                sid = g_id
+                        if g_id is not None:
+                            # Cross-camera handoff: lower threshold if same ID seen recently on another sensor
+                            req = self.cos_sim_high_threshold
+                            last_glob = self.sid_global_last_seen.get(int(g_id))
+                            if last_glob is not None and (ts - float(last_glob)) <= self.xcam_handoff_window_s:
+                                req = max(0.0, req - self.xcam_handoff_margin)
+                            if g_sim >= req:
+                                # If the candidate stable_id is already active on this sensor,
+                                # optionally require a small extra margin to avoid merging co-present people.
+                                can_take = True
+                                if self.active_id_guard_strict:
+                                    active_pairs = self.active_zones.get(int(g_id), set())
+                                    active_here = any(int(sid_sensor) == int(sensor_id) for (sid_sensor, _zone) in active_pairs)
+                                    if active_here and (g_sim < (req + self.active_id_guard_margin)):
+                                        can_take = False
+                                if can_take and (self.allow_multi_zone_active or not self.active_zones.get(g_id)):
+                                    sid = g_id
 
                 if sid is None:
-                    sid = self.next_stable_id
-                    self.next_stable_id += 1
+                    # Soft-cap logic: confirm new ID over a few frames if at/over cap
+                    # Count currently active IDs on this sensor
+                    active_ids_here = {s for s, pairs in self.active_zones.items() if any(int(x) == int(sensor_id) for (x, _z) in pairs)}
+                    at_cap = len(active_ids_here) >= self.max_active_ids_per_sensor
+                    if at_cap and self.new_id_confirm_frames_at_cap > 0:
+                        cnt = self._pending_new_counts.get(key, 0) + 1
+                        self._pending_new_counts[key] = cnt
+                        if cnt < self.new_id_confirm_frames_at_cap:
+                            # Defer ID creation this frame; try again next update
+                            # Return a deterministic temporary ID derived from ds_obj_id to minimize churn
+                            # Note: negative IDs can be used to signal provisional labels in UI if desired
+                            return int(-abs(int(ds_obj_id)))
+                        # Before creating, evict stale actives if any
+                        now = float(ts)
+                        oldest_sid = None
+                        oldest_age = -1.0
+                        for sid_cand in list(active_ids_here):
+                            # Find last seen for this sid on this sensor
+                            ages = [now - rec2.get("last_seen_ts", now) for (s_id2, _ds2), rec2 in self.active_tracks.items() if int(s_id2) == int(sensor_id) and int(rec2.get("stable_id", -1)) == int(sid_cand)]
+                            age = max(ages) if ages else 0.0
+                            if age >= self.active_evict_grace_s and age > oldest_age:
+                                oldest_age = age
+                                oldest_sid = sid_cand
+                        if oldest_sid is not None:
+                            # Remove from active_zones to free a slot (ghost/history remain)
+                            try:
+                                pairs = self.active_zones.get(int(oldest_sid), set())
+                                pairs = {p for p in pairs if int(p[0]) != int(sensor_id)}
+                                if pairs:
+                                    self.active_zones[int(oldest_sid)] = pairs
+                                else:
+                                    self.active_zones.pop(int(oldest_sid), None)
+                            except Exception:
+                                pass
+                        # fall through to create new ID
+                    # Try global reuse before creating when total exceeds soft-cap
+                    total_ids = len(self.gallery)
+                    if self.total_id_reuse and total_ids >= self.max_total_ids:
+                        # Attempt to map into an existing identity with a slightly relaxed threshold
+                        if emb is not None:
+                            g_id2, g_sim2 = self._gallery_best(emb, sensor_id=int(sensor_id), curr_bbox=bbox_ltrbwh, curr_brightness=curr_brightness, curr_color=curr_color)
+                            req2 = max(0.0, self.cos_sim_high_threshold - 0.04)
+                            if g_id2 is not None and g_sim2 >= req2:
+                                sid = int(g_id2)
+                        if sid is None:
+                            # Recycle the least recently seen, fully inactive ID if old enough
+                            candidates = [int(s) for s in self.gallery.keys() if not self.active_zones.get(int(s))]
+                            oldest_sid = None
+                            oldest_age = -1.0
+                            now = float(ts)
+                            for s in candidates:
+                                age = now - float(self.sid_global_last_seen.get(int(s), 0.0))
+                                if age >= self.total_id_reuse_min_age_s and age > oldest_age:
+                                    oldest_age = age
+                                    oldest_sid = int(s)
+                            if oldest_sid is not None:
+                                # Clear per-id appearance except numeric id
+                                try:
+                                    self.gallery.pop(int(oldest_sid), None)
+                                    self.sid_centroid.pop(int(oldest_sid), None)
+                                    self.sid_last_bbox.pop(int(oldest_sid), None)
+                                    self.sid_last_brightness.pop(int(oldest_sid), None)
+                                    self.sid_last_color.pop(int(oldest_sid), None)
+                                except Exception:
+                                    pass
+                                sid = int(oldest_sid)
+                    # Create new stable ID now if still none
+                    if sid is None:
+                        sid = self.next_stable_id
+                        self.next_stable_id += 1
 
                 rec = {
                     "stable_id": int(sid),
@@ -415,6 +512,10 @@ class StableIDManager:
                 if curr_color is not None:
                     self.sid_last_color[sid_int] = curr_color.astype(np.float32)
             self.active_tracks[key] = rec
+            try:
+                self.sid_global_last_seen[int(rec["stable_id"])] = float(ts)
+            except Exception:
+                pass
             return int(rec["stable_id"])
 
     def remove_missing_tracks(self, sensor_id: int, present_ds_ids: List[int], ts: float) -> None:

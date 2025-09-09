@@ -279,6 +279,14 @@ class DeepStreamVideoPipeline:
             active_id_guard_margin=float(getattr(self.config.models, 'REID_ACTIVE_ID_GUARD_MARGIN', 0.03)),
             ghost_strict_age_s=float(getattr(self.config.models, 'REID_GHOST_STRICT_AGE_S', 2.0)),
             ghost_extra_margin=float(getattr(self.config.models, 'REID_GHOST_EXTRA_MARGIN', 0.03)),
+            max_active_ids_per_sensor=int(getattr(self.config.models, 'REID_MAX_ACTIVE_IDS_PER_SENSOR', 6)),
+            new_id_confirm_frames_at_cap=int(getattr(self.config.models, 'REID_NEW_ID_CONFIRM_FRAMES_AT_CAP', 2)),
+            active_evict_grace_s=float(getattr(self.config.models, 'REID_ACTIVE_EVICT_GRACE_S', 10.0)),
+            xcam_handoff_window_s=float(getattr(self.config.models, 'REID_XCAM_HANDOFF_WINDOW_S', 4.0)),
+            xcam_handoff_margin=float(getattr(self.config.models, 'REID_XCAM_HANDOFF_MARGIN', 0.02)),
+            max_total_ids=int(getattr(self.config.models, 'REID_MAX_TOTAL_IDS', 12)),
+            total_id_reuse=bool(getattr(self.config.models, 'REID_TOTAL_ID_REUSE', True)),
+            total_id_reuse_min_age_s=float(getattr(self.config.models, 'REID_TOTAL_ID_REUSE_MIN_AGE_S', 600.0)),
         )
         # Latest per-sensor JPEG bytes for non-blocking crops
         self._latest_jpeg_bytes_by_sensor: Dict[int, bytes] = {}

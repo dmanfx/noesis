@@ -281,12 +281,14 @@ class DeepStreamVideoPipeline:
             ghost_extra_margin=float(getattr(self.config.models, 'REID_GHOST_EXTRA_MARGIN', 0.03)),
             max_active_ids_per_sensor=int(getattr(self.config.models, 'REID_MAX_ACTIVE_IDS_PER_SENSOR', 6)),
             new_id_confirm_frames_at_cap=int(getattr(self.config.models, 'REID_NEW_ID_CONFIRM_FRAMES_AT_CAP', 2)),
+            new_id_hysteresis_frames=int(getattr(self.config.models, 'REID_NEW_ID_HYSTERESIS_FRAMES', 2)),
             active_evict_grace_s=float(getattr(self.config.models, 'REID_ACTIVE_EVICT_GRACE_S', 10.0)),
             xcam_handoff_window_s=float(getattr(self.config.models, 'REID_XCAM_HANDOFF_WINDOW_S', 4.0)),
             xcam_handoff_margin=float(getattr(self.config.models, 'REID_XCAM_HANDOFF_MARGIN', 0.02)),
             max_total_ids=int(getattr(self.config.models, 'REID_MAX_TOTAL_IDS', 12)),
             total_id_reuse=bool(getattr(self.config.models, 'REID_TOTAL_ID_REUSE', True)),
             total_id_reuse_min_age_s=float(getattr(self.config.models, 'REID_TOTAL_ID_REUSE_MIN_AGE_S', 600.0)),
+            sid_pool_file=str(getattr(self.config.models, 'REID_SID_POOL_FILE', '~/.noesis/sid_pool.json')),
         )
         # Latest per-sensor JPEG bytes for non-blocking crops
         self._latest_jpeg_bytes_by_sensor: Dict[int, bytes] = {}
@@ -1713,7 +1715,7 @@ class DeepStreamVideoPipeline:
         fps = frame_count_copy / runtime if runtime > 0 else 0
         
         queue_sizes = {f"source_{src_id}": q.qsize() for src_id, q in self.jpeg_queues.items()}
-        return {
+        stats = {
             'pipeline_type': 'deepstream',
             'running': self.running,
             'frames_processed': frame_count_copy,
@@ -1724,6 +1726,15 @@ class DeepStreamVideoPipeline:
             'queue_sizes': queue_sizes,
             'tracking': self.live_tracking_state
         }
+        # Attach ReID/SID allocator telemetry if available
+        try:
+            if hasattr(self, 'stable_id_mgr') and self.stable_id_mgr:
+                sid_metrics = self.stable_id_mgr.get_sid_metrics()
+                if sid_metrics:
+                    stats['reid'] = sid_metrics
+        except Exception:
+            pass
+        return stats
 
     def _demux_debug_probe(self, pad, info, user_data):
         """Debug probe on nvstreamdemux sink to log frame source IDs"""

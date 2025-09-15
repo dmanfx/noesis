@@ -1,7 +1,10 @@
 import threading
 import time
 from collections import defaultdict, deque
-from typing import Deque, Dict, List, Optional, Tuple
+from typing import Deque, Dict, List, Optional, Tuple, Any
+import heapq
+import os
+import json
 
 import numpy as np
 
@@ -67,6 +70,10 @@ class StableIDManager:
         max_total_ids: int = 12,
         total_id_reuse: bool = True,
         total_id_reuse_min_age_s: float = 600.0,
+        # New-ID hysteresis (global, even when not at cap)
+        new_id_hysteresis_frames: int = 2,
+        # SID allocator persistence (smarter restart)
+        sid_pool_file: str = "~/.noesis/sid_pool.json",
     ) -> None:
         self._lock = threading.RLock()
         self.extractor = EmbeddingExtractor(
@@ -107,6 +114,8 @@ class StableIDManager:
         self.max_total_ids = int(max_total_ids)
         self.total_id_reuse = bool(total_id_reuse)
         self.total_id_reuse_min_age_s = float(total_id_reuse_min_age_s)
+        self.new_id_hysteresis_frames = int(new_id_hysteresis_frames)
+        self.sid_pool_file = os.path.expanduser(str(sid_pool_file))
 
         # Active tracks: (sensor_id, ds_obj_id) -> record
         self.active_tracks: Dict[Tuple[int, int], Dict] = {}
@@ -132,6 +141,76 @@ class StableIDManager:
         self._pending_new_counts: Dict[Tuple[int, int], int] = {}
 
         self.next_stable_id = 1
+        # Free-list allocator state
+        self._free_sids: List[int] = []
+        self._free_sids_set: set[int] = set()
+        self._load_sid_pool()
+
+    # --------------- Allocator -----------------
+    def _alloc_sid(self) -> int:
+        if self._free_sids:
+            sid = heapq.heappop(self._free_sids)
+            try:
+                self._free_sids_set.remove(sid)
+            except KeyError:
+                pass
+            return int(sid)
+        sid = self.next_stable_id
+        self.next_stable_id += 1
+        return int(sid)
+
+    def _free_sid(self, sid: int) -> None:
+        try:
+            sid = int(sid)
+        except Exception:
+            return
+        if sid <= 0:
+            return
+        if sid in self._free_sids_set:
+            return
+        heapq.heappush(self._free_sids, sid)
+        self._free_sids_set.add(sid)
+        self._save_sid_pool()
+
+    def _purge_sid_state(self, sid: int) -> None:
+        try:
+            sid = int(sid)
+        except Exception:
+            return
+        try:
+            self.gallery.pop(sid, None)
+            self.sid_centroid.pop(sid, None)
+            self.sid_last_bbox.pop(sid, None)
+            self.sid_last_brightness.pop(sid, None)
+            self.sid_last_color.pop(sid, None)
+            self.active_zones.pop(sid, None)
+        except Exception:
+            pass
+
+    def _load_sid_pool(self) -> None:
+        try:
+            if not os.path.exists(self.sid_pool_file):
+                return
+            with open(self.sid_pool_file, 'r') as f:
+                data = json.load(f)
+            pool = data.get('free_sids', []) if isinstance(data, dict) else []
+            pool = [int(x) for x in pool if isinstance(x, int) and x > 0]
+            pool = sorted(set(pool))[:32]
+            for sid in pool:
+                if sid not in self._free_sids_set:
+                    heapq.heappush(self._free_sids, sid)
+                    self._free_sids_set.add(sid)
+        except Exception:
+            pass
+
+    def _save_sid_pool(self) -> None:
+        try:
+            pool = sorted(list(self._free_sids_set))[:32]
+            os.makedirs(os.path.dirname(self.sid_pool_file), exist_ok=True)
+            with open(self.sid_pool_file, 'w') as f:
+                json.dump({'free_sids': pool}, f)
+        except Exception:
+            pass
 
     # --------------- Utility -----------------
     @staticmethod
@@ -386,31 +465,29 @@ class StableIDManager:
                                     sid = g_id
 
                 if sid is None:
-                    # Soft-cap logic: confirm new ID over a few frames if at/over cap
-                    # Count currently active IDs on this sensor
+                    # Global new-ID hysteresis + soft-cap handling
                     active_ids_here = {s for s, pairs in self.active_zones.items() if any(int(x) == int(sensor_id) for (x, _z) in pairs)}
                     at_cap = len(active_ids_here) >= self.max_active_ids_per_sensor
+                    required = max(1, self.new_id_hysteresis_frames)
+                    if at_cap:
+                        required = max(required, self.new_id_confirm_frames_at_cap)
+                    cnt = self._pending_new_counts.get(key, 0) + 1
+                    self._pending_new_counts[key] = cnt
+                    if cnt < required:
+                        # Defer ID creation; provisional negative label for UI stability
+                        return int(-abs(int(ds_obj_id)))
                     if at_cap and self.new_id_confirm_frames_at_cap > 0:
-                        cnt = self._pending_new_counts.get(key, 0) + 1
-                        self._pending_new_counts[key] = cnt
-                        if cnt < self.new_id_confirm_frames_at_cap:
-                            # Defer ID creation this frame; try again next update
-                            # Return a deterministic temporary ID derived from ds_obj_id to minimize churn
-                            # Note: negative IDs can be used to signal provisional labels in UI if desired
-                            return int(-abs(int(ds_obj_id)))
-                        # Before creating, evict stale actives if any
+                        # Evict stale locals to free a slot
                         now = float(ts)
                         oldest_sid = None
                         oldest_age = -1.0
                         for sid_cand in list(active_ids_here):
-                            # Find last seen for this sid on this sensor
                             ages = [now - rec2.get("last_seen_ts", now) for (s_id2, _ds2), rec2 in self.active_tracks.items() if int(s_id2) == int(sensor_id) and int(rec2.get("stable_id", -1)) == int(sid_cand)]
                             age = max(ages) if ages else 0.0
                             if age >= self.active_evict_grace_s and age > oldest_age:
                                 oldest_age = age
                                 oldest_sid = sid_cand
                         if oldest_sid is not None:
-                            # Remove from active_zones to free a slot (ghost/history remain)
                             try:
                                 pairs = self.active_zones.get(int(oldest_sid), set())
                                 pairs = {p for p in pairs if int(p[0]) != int(sensor_id)}
@@ -454,8 +531,12 @@ class StableIDManager:
                                 sid = int(oldest_sid)
                     # Create new stable ID now if still none
                     if sid is None:
-                        sid = self.next_stable_id
-                        self.next_stable_id += 1
+                        sid = self._alloc_sid()
+                    # Clear pending counter after minting
+                    try:
+                        self._pending_new_counts.pop(key, None)
+                    except Exception:
+                        pass
 
                 rec = {
                     "stable_id": int(sid),
@@ -564,6 +645,67 @@ class StableIDManager:
             for sensor_id, dq in self.ghosts.items():
                 while dq and (t - float(dq[0].get("ts", 0.0))) > self.max_ghost_age_s:
                     dq.popleft()
+            # Return fully inactive SIDs to free-list after a cooldown (smarter reuse)
+            try:
+                active_sids = {int(rec.get("stable_id")) for rec in self.active_tracks.values()}
+                ghost_sids = set()
+                for dq in self.ghosts.values():
+                    for g in dq:
+                        try:
+                            ghost_sids.add(int(g.get("stable_id")))
+                        except Exception:
+                            pass
+                for sid, last_seen in list(self.sid_global_last_seen.items()):
+                    if sid in active_sids or sid in ghost_sids:
+                        continue
+                    if (t - float(last_seen)) >= max(2.0, self.active_evict_grace_s):
+                        self._purge_sid_state(sid)
+                        self._free_sid(sid)
+            except Exception:
+                pass
+
+    # --------------- Telemetry ----------------
+    def get_sid_metrics(self) -> Dict[str, Any]:
+        """Return SID allocator and activity metrics for telemetry."""
+        with self._lock:
+            try:
+                # Active unique SIDs across all sensors
+                active_sids = set()
+                active_by_sensor: Dict[int, set] = defaultdict(set)
+                for (s_id, _ds), rec in self.active_tracks.items():
+                    try:
+                        sid = int(rec.get("stable_id"))
+                        active_sids.add(sid)
+                        active_by_sensor[int(s_id)].add(sid)
+                    except Exception:
+                        pass
+                # Ghost unique SIDs
+                ghost_sids = set()
+                total_ghosts = 0
+                for dq in self.ghosts.values():
+                    total_ghosts += len(dq)
+                    for g in dq:
+                        try:
+                            ghost_sids.add(int(g.get("stable_id")))
+                        except Exception:
+                            pass
+                # Build per-sensor counts
+                active_counts = {int(k): len(v) for k, v in active_by_sensor.items()}
+                # Free pool size
+                free_pool_size = len(getattr(self, "_free_sids_set", set()))
+                pending_new = len(self._pending_new_counts)
+                return {
+                    "active_unique": len(active_sids),
+                    "active_by_sensor": active_counts,
+                    "ghost_unique": len(ghost_sids),
+                    "ghost_entries": total_ghosts,
+                    "gallery_ids": len(self.gallery),
+                    "free_sid_pool_size": free_pool_size,
+                    "next_sid": int(self.next_stable_id),
+                    "pending_new_count": int(pending_new),
+                }
+            except Exception:
+                return {}
 
     # --------------- Internal ---------------
     def _match_ghost(self, sensor_id: int, emb: np.ndarray, bbox: BBox, ts: float) -> Optional[int]:

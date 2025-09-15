@@ -278,6 +278,7 @@ export const TelemetryDrawer: React.FC<DrawerProps> = ({open, onClose}) => {
       },
       activity: [] as TelemetryEntry[],
       occupancy: [] as TelemetryEntry[],
+      reid: [] as TelemetryEntry[],
       details: [] as TelemetryEntry[]
     };
 
@@ -310,6 +311,10 @@ export const TelemetryDrawer: React.FC<DrawerProps> = ({open, onClose}) => {
       // Occupancy data
       else if (entry.group === 'Occupancy') {
         data.occupancy.push(entry);
+      }
+      // ReID / StableID metrics
+      else if (entry.group === 'ReID') {
+        data.reid.push(entry);
       }
       // Everything else goes to details
       else {
@@ -451,6 +456,26 @@ export const TelemetryDrawer: React.FC<DrawerProps> = ({open, onClose}) => {
                   )}
                 </>
               )}
+            </div>
+          )}
+
+          {/* ReID / StableID Section */}
+          {organizedData.reid.length > 0 && (
+            <div>
+              <SectionHeader
+                collapsible
+                onClick={() => toggleSection('details')}
+              >
+                <span>🧬 ReID / StableID</span>
+                <SectionToggle collapsed={collapsedSections.details}>▶</SectionToggle>
+              </SectionHeader>
+              {!collapsedSections.details && organizedData.reid.map(item => (
+                <MetricRow key={`reid-${item.key}`}>
+                  <MetricLabel>{item.key}</MetricLabel>
+                  <MetricValue>{String(item.value)}</MetricValue>
+                  <Timestamp></Timestamp>
+                </MetricRow>
+              ))}
             </div>
           )}
 

@@ -374,6 +374,25 @@ const Dashboard: React.FC = () => {
       }
     }
 
+    // ReID / StableID allocator telemetry
+    if (payload.reid) {
+      const r = payload.reid;
+      if (publish) {
+        if (typeof r.active_unique !== 'undefined') publish({ group: 'ReID', key: 'Active Unique', value: r.active_unique, ts: Date.now() });
+        if (typeof r.free_sid_pool_size !== 'undefined') publish({ group: 'ReID', key: 'Free SID Pool', value: r.free_sid_pool_size, ts: Date.now() });
+        if (typeof r.pending_new_count !== 'undefined') publish({ group: 'ReID', key: 'Pending New', value: r.pending_new_count, ts: Date.now() });
+        if (typeof r.next_sid !== 'undefined') publish({ group: 'ReID', key: 'Next SID', value: r.next_sid, ts: Date.now() });
+        if (typeof r.gallery_ids !== 'undefined') publish({ group: 'ReID', key: 'Session Gallery IDs', value: r.gallery_ids, ts: Date.now() });
+        if (typeof r.ghost_unique !== 'undefined') publish({ group: 'ReID', key: 'Ghost Unique', value: r.ghost_unique, ts: Date.now() });
+        if (typeof r.ghost_entries !== 'undefined') publish({ group: 'ReID', key: 'Ghost Entries', value: r.ghost_entries, ts: Date.now() });
+        if (r.active_by_sensor && typeof r.active_by_sensor === 'object') {
+          Object.keys(r.active_by_sensor).forEach((sid) => {
+            publish({ group: 'ReID', key: `Active SIDs (sensor ${sid})`, value: r.active_by_sensor[sid], ts: Date.now() });
+          });
+        }
+      }
+    }
+
     // Process camera data
     if (payload.cameras && typeof payload.cameras === 'object') {
       let globalOccupancy: { [key: string]: number } = {}; 

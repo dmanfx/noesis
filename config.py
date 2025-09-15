@@ -52,8 +52,8 @@ class AppConfig:
             },
             {
                 "name": "Kitchen Camera", 
-                "url": "rtsp://192.168.3.214:7447/qt3VqVdZpgG1B4Vk?",
-                #"url": "udp://127.0.0.1:8554", # use with: sudo ffmpeg -re -stream_loop -1 -i /home/mayor/Downloads/kitchenclip.mp4 -c copy -f mpegts udp://0.0.0.0:8554
+                #"url": "rtsp://192.168.3.214:7447/qt3VqVdZpgG1B4Vk?",
+                "url": "udp://127.0.0.1:8554", # use with: sudo ffmpeg -re -stream_loop -1 -i /home/mayor/Downloads/kitchenclip.mp4 -c copy -f mpegts udp://0.0.0.0:8554
                 "width": 1920,
                 "height": 1080,
                 "enabled": True
@@ -227,6 +227,7 @@ class AppConfig:
         # Soft cap on concurrently active stable IDs
         REID_MAX_ACTIVE_IDS_PER_SENSOR: int = 6
         REID_NEW_ID_CONFIRM_FRAMES_AT_CAP: int = 2
+        REID_NEW_ID_HYSTERESIS_FRAMES: int = 2  # Require N unmatched frames before minting any new SID
         REID_ACTIVE_EVICT_GRACE_S: float = 10.0
         # Cross-camera handoff tuning
         REID_XCAM_HANDOFF_WINDOW_S: float = 6.0
@@ -235,6 +236,8 @@ class AppConfig:
         REID_MAX_TOTAL_IDS: int = 12
         REID_TOTAL_ID_REUSE: bool = True
         REID_TOTAL_ID_REUSE_MIN_AGE_S: float = 600.0  # Only recycle IDs inactive this long and not active anywhere
+        # SID allocator persistence (smarter restart)
+        REID_SID_POOL_FILE: str = "~/.noesis/sid_pool.json"
         
         # Performance Settings
         WARM_UP_ITERATIONS: int = 10  # Number of warm-up iterations for TensorRT

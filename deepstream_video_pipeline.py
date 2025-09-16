@@ -235,61 +235,69 @@ class DeepStreamVideoPipeline:
         self.trail_max_speed_px_per_s: float = float(getattr(self.config.visualization, 'TRAIL_MAX_SPEED_PX_PER_S', 600.0))
 
         # Global Stable ID manager (OSNet/appearance-based global IDs)
+        # Respect REID_ENABLED to avoid loading model and consuming GPU if disabled
         try:
-            reid_model_path = getattr(self.config.models, 'REID_MODEL_PATH', None)
+            self.reid_enabled: bool = bool(getattr(self.config.models, 'REID_ENABLED', True))
         except Exception:
-            reid_model_path = None
-        device = getattr(self.config.models, 'DEVICE', 'cuda:0')
-        # Pull model selection and crop size from config
-        try:
-            reid_model_name = getattr(self.config.models, 'REID_MODEL_NAME', 'osnet_ibn_x1_0')
-        except Exception:
-            reid_model_name = 'osnet_ibn_x1_0'
-        try:
-            img_h, img_w = getattr(self.config.models, 'REID_IMAGE_SIZE', [256, 128])
-            image_size = (int(img_h), int(img_w))
-        except Exception:
-            image_size = (256, 128)
+            self.reid_enabled = True
 
-        self.stable_id_mgr = StableIDManager(
-            model_path=reid_model_path,
-            device=device,
-            model_name=str(reid_model_name),
-            image_size=image_size,
-            embed_interval_s=float(getattr(self.config.models, 'REID_EMBED_INTERVAL_S', 1.0)),
-            max_ghost_age_s=float(getattr(self.config.models, 'REID_MAX_GHOST_AGE_S', 60.0)),
-            cos_sim_threshold=float(getattr(self.config.models, 'REID_COS_SIM_THRESHOLD', 0.72)),
-            cos_sim_high_threshold=float(getattr(self.config.models, 'REID_COS_SIM_HIGH_THRESHOLD', 0.80)),
-            allow_multi_zone_active=bool(getattr(self.config.models, 'REID_ALLOW_MULTI_ZONE_ACTIVE', True)),
-            crop_expand=float(getattr(self.config.models, 'REID_CROP_EXPAND', 0.12)),
-            tta_flip=bool(getattr(self.config.models, 'REID_TTA_FLIP', True)),
-            min_crop_h=int(getattr(self.config.models, 'REID_MIN_CROP_H', 64)),
-            min_laplacian_var=float(getattr(self.config.models, 'REID_MIN_LAPLACIAN', 12.0)),
-            adaptive_penalty=bool(getattr(self.config.models, 'REID_ADAPTIVE_PENALTY', True)),
-            size_penalty_alpha=float(getattr(self.config.models, 'REID_SIZE_PENALTY_ALPHA', 0.08)),
-            brightness_penalty_beta=float(getattr(self.config.models, 'REID_BRIGHTNESS_PENALTY_BETA', 0.05)),
-            spatial_penalty=bool(getattr(self.config.models, 'REID_SPATIAL_PENALTY', True)),
-            spatial_penalty_delta=float(getattr(self.config.models, 'REID_SPATIAL_PENALTY_DELTA', 0.06)),
-            color_penalty_gamma=float(getattr(self.config.models, 'REID_COLOR_PENALTY_GAMMA', 0.07)),
-            stripe_fusion=bool(getattr(self.config.models, 'REID_STRIPE_FUSION', True)),
-            stripe_count=int(getattr(self.config.models, 'REID_STRIPE_COUNT', 3)),
-            multi_scale_crops=bool(getattr(self.config.models, 'REID_MULTI_SCALE_CROPS', True)),
-            ema_alpha=float(getattr(self.config.models, 'REID_EMA_ALPHA', 0.20)),
-            active_id_guard_strict=bool(getattr(self.config.models, 'REID_ACTIVE_ID_GUARD_STRICT', True)),
-            active_id_guard_margin=float(getattr(self.config.models, 'REID_ACTIVE_ID_GUARD_MARGIN', 0.03)),
-            ghost_strict_age_s=float(getattr(self.config.models, 'REID_GHOST_STRICT_AGE_S', 2.0)),
-            ghost_extra_margin=float(getattr(self.config.models, 'REID_GHOST_EXTRA_MARGIN', 0.03)),
-            max_active_ids_per_sensor=int(getattr(self.config.models, 'REID_MAX_ACTIVE_IDS_PER_SENSOR', 6)),
-            new_id_confirm_frames_at_cap=int(getattr(self.config.models, 'REID_NEW_ID_CONFIRM_FRAMES_AT_CAP', 2)),
-            new_id_hysteresis_frames=int(getattr(self.config.models, 'REID_NEW_ID_HYSTERESIS_FRAMES', 2)),
-            active_evict_grace_s=float(getattr(self.config.models, 'REID_ACTIVE_EVICT_GRACE_S', 10.0)),
-            xcam_handoff_window_s=float(getattr(self.config.models, 'REID_XCAM_HANDOFF_WINDOW_S', 4.0)),
-            xcam_handoff_margin=float(getattr(self.config.models, 'REID_XCAM_HANDOFF_MARGIN', 0.02)),
-            max_total_ids=int(getattr(self.config.models, 'REID_MAX_TOTAL_IDS', 12)),
-            total_id_reuse=bool(getattr(self.config.models, 'REID_TOTAL_ID_REUSE', True)),
-            total_id_reuse_min_age_s=float(getattr(self.config.models, 'REID_TOTAL_ID_REUSE_MIN_AGE_S', 600.0)),
-            sid_pool_file=str(getattr(self.config.models, 'REID_SID_POOL_FILE', '~/.noesis/sid_pool.json')),
-        )
+        self.stable_id_mgr = None
+        if self.reid_enabled:
+            try:
+                reid_model_path = getattr(self.config.models, 'REID_MODEL_PATH', None)
+            except Exception:
+                reid_model_path = None
+            device = getattr(self.config.models, 'DEVICE', 'cuda:0')
+            # Pull model selection and crop size from config
+            try:
+                reid_model_name = getattr(self.config.models, 'REID_MODEL_NAME', 'osnet_ibn_x1_0')
+            except Exception:
+                reid_model_name = 'osnet_ibn_x1_0'
+            try:
+                img_h, img_w = getattr(self.config.models, 'REID_IMAGE_SIZE', [256, 128])
+                image_size = (int(img_h), int(img_w))
+            except Exception:
+                image_size = (256, 128)
+
+            self.stable_id_mgr = StableIDManager(
+                model_path=reid_model_path,
+                device=device,
+                model_name=str(reid_model_name),
+                image_size=image_size,
+                embed_interval_s=float(getattr(self.config.models, 'REID_EMBED_INTERVAL_S', 1.0)),
+                max_ghost_age_s=float(getattr(self.config.models, 'REID_MAX_GHOST_AGE_S', 60.0)),
+                cos_sim_threshold=float(getattr(self.config.models, 'REID_COS_SIM_THRESHOLD', 0.72)),
+                cos_sim_high_threshold=float(getattr(self.config.models, 'REID_COS_SIM_HIGH_THRESHOLD', 0.80)),
+                allow_multi_zone_active=bool(getattr(self.config.models, 'REID_ALLOW_MULTI_ZONE_ACTIVE', True)),
+                crop_expand=float(getattr(self.config.models, 'REID_CROP_EXPAND', 0.12)),
+                tta_flip=bool(getattr(self.config.models, 'REID_TTA_FLIP', True)),
+                min_crop_h=int(getattr(self.config.models, 'REID_MIN_CROP_H', 64)),
+                min_laplacian_var=float(getattr(self.config.models, 'REID_MIN_LAPLACIAN', 12.0)),
+                adaptive_penalty=bool(getattr(self.config.models, 'REID_ADAPTIVE_PENALTY', True)),
+                size_penalty_alpha=float(getattr(self.config.models, 'REID_SIZE_PENALTY_ALPHA', 0.08)),
+                brightness_penalty_beta=float(getattr(self.config.models, 'REID_BRIGHTNESS_PENALTY_BETA', 0.05)),
+                spatial_penalty=bool(getattr(self.config.models, 'REID_SPATIAL_PENALTY', True)),
+                spatial_penalty_delta=float(getattr(self.config.models, 'REID_SPATIAL_PENALTY_DELTA', 0.06)),
+                color_penalty_gamma=float(getattr(self.config.models, 'REID_COLOR_PENALTY_GAMMA', 0.07)),
+                stripe_fusion=bool(getattr(self.config.models, 'REID_STRIPE_FUSION', True)),
+                stripe_count=int(getattr(self.config.models, 'REID_STRIPE_COUNT', 3)),
+                multi_scale_crops=bool(getattr(self.config.models, 'REID_MULTI_SCALE_CROPS', True)),
+                ema_alpha=float(getattr(self.config.models, 'REID_EMA_ALPHA', 0.20)),
+                active_id_guard_strict=bool(getattr(self.config.models, 'REID_ACTIVE_ID_GUARD_STRICT', True)),
+                active_id_guard_margin=float(getattr(self.config.models, 'REID_ACTIVE_ID_GUARD_MARGIN', 0.03)),
+                ghost_strict_age_s=float(getattr(self.config.models, 'REID_GHOST_STRICT_AGE_S', 2.0)),
+                ghost_extra_margin=float(getattr(self.config.models, 'REID_GHOST_EXTRA_MARGIN', 0.03)),
+                max_active_ids_per_sensor=int(getattr(self.config.models, 'REID_MAX_ACTIVE_IDS_PER_SENSOR', 6)),
+                new_id_confirm_frames_at_cap=int(getattr(self.config.models, 'REID_NEW_ID_CONFIRM_FRAMES_AT_CAP', 2)),
+                new_id_hysteresis_frames=int(getattr(self.config.models, 'REID_NEW_ID_HYSTERESIS_FRAMES', 2)),
+                active_evict_grace_s=float(getattr(self.config.models, 'REID_ACTIVE_EVICT_GRACE_S', 10.0)),
+                xcam_handoff_window_s=float(getattr(self.config.models, 'REID_XCAM_HANDOFF_WINDOW_S', 4.0)),
+                xcam_handoff_margin=float(getattr(self.config.models, 'REID_XCAM_HANDOFF_MARGIN', 0.02)),
+                max_total_ids=int(getattr(self.config.models, 'REID_MAX_TOTAL_IDS', 12)),
+                total_id_reuse=bool(getattr(self.config.models, 'REID_TOTAL_ID_REUSE', True)),
+                total_id_reuse_min_age_s=float(getattr(self.config.models, 'REID_TOTAL_ID_REUSE_MIN_AGE_S', 600.0)),
+                sid_pool_file=str(getattr(self.config.models, 'REID_SID_POOL_FILE', '~/.noesis/sid_pool.json')),
+            )
         # Latest per-sensor JPEG bytes for non-blocking crops
         self._latest_jpeg_bytes_by_sensor: Dict[int, bytes] = {}
         # Decode gating for ReID crops (per sensor)
@@ -842,14 +850,27 @@ class DeepStreamVideoPipeline:
             elements['multiurisrc'].set_property("ip-address", "localhost")
             self.logger.info(f"📊 nvmultiurisrcbin configured: max-batch-size={self.batch_size}, resolution={self.max_width}x{self.max_height}")
 
-            elements['preprocess'].set_property("config-file", self.config.processing.DEEPSTREAM_PREPROCESS_CONFIG)
-            
-            self._check_for_engine_file(self.config_file)
-            elements['nvinfer'].set_property("config-file-path", self.config_file)
+            # Resolve all config file paths to absolute so startup is independent of CWD
+            _root_dir = os.path.dirname(os.path.abspath(__file__))
+            # Preprocess config
+            _preproc_cfg = getattr(self.config.processing, 'DEEPSTREAM_PREPROCESS_CONFIG', 'pipelines/config_preproc.ini')
+            if _preproc_cfg and not os.path.isabs(_preproc_cfg):
+                _preproc_cfg = os.path.join(_root_dir, _preproc_cfg)
+            elements['preprocess'].set_property("config-file", _preproc_cfg)
+
+            # Primary nvinfer config
+            _nvinfer_cfg = self.config_file
+            if _nvinfer_cfg and not os.path.isabs(_nvinfer_cfg):
+                _nvinfer_cfg = os.path.join(_root_dir, _nvinfer_cfg)
+            # Use resolved path for engine-file check and element property
+            self._check_for_engine_file(_nvinfer_cfg)
+            elements['nvinfer'].set_property("config-file-path", _nvinfer_cfg)
             elements['nvinfer'].set_property("input-tensor-meta", True)
 
             # Exclusion analytics
             exclude_cfg_path = "pipelines/config_nvdsanalytics_exclude.ini"
+            if exclude_cfg_path and not os.path.isabs(exclude_cfg_path):
+                exclude_cfg_path = os.path.join(_root_dir, exclude_cfg_path)
             elements['nvdsanalytics_exclude'].set_property("unique-id", 101)
             elements['nvdsanalytics_exclude'].set_property("config-file", exclude_cfg_path)
             # Pre-parse exclusion ROIs for robust containment checks in pad probe
@@ -862,7 +883,10 @@ class DeepStreamVideoPipeline:
 
             # Post-tracker analytics
             elements['nvdsanalytics_post'].set_property("unique-id", 201)
-            elements['nvdsanalytics_post'].set_property("config-file", "pipelines/config_nvdsanalytics_post.ini")
+            _post_cfg_path = "pipelines/config_nvdsanalytics_post.ini"
+            if _post_cfg_path and not os.path.isabs(_post_cfg_path):
+                _post_cfg_path = os.path.join(_root_dir, _post_cfg_path)
+            elements['nvdsanalytics_post'].set_property("config-file", _post_cfg_path)
             
             self.logger.info("✅ All elements configured successfully")
             return True
@@ -1317,7 +1341,7 @@ class DeepStreamVideoPipeline:
             
             # StableID: update or create global identity (persons only)
             try:
-                if getattr(self.config.models, 'REID_ENABLED', True) and int(obj.class_id) == 0:  # person
+                if self.reid_enabled and (self.stable_id_mgr is not None) and int(obj.class_id) == 0:  # person
                     bbox_tuple = (float(rect.left), float(rect.top), float(rect.width), float(rect.height))
                     zone_name = track_dict.get('zone') if isinstance(track_dict, dict) else None
                     # Decode at most every N ms per sensor and only on-demand
@@ -1395,11 +1419,12 @@ class DeepStreamVideoPipeline:
             pass
 
         # End-of-frame: remove tracks not present and prune ghosts
-        try:
-            self.stable_id_mgr.remove_missing_tracks(int(sensor_id), present_ds_ids, float(now_ts))
-            self.stable_id_mgr.prune_ghosts(now_ts)
-        except Exception:
-            pass
+        if self.reid_enabled and (self.stable_id_mgr is not None):
+            try:
+                self.stable_id_mgr.remove_missing_tracks(int(sensor_id), present_ds_ids, float(now_ts))
+                self.stable_id_mgr.prune_ghosts(now_ts)
+            except Exception:
+                pass
 
         # Update live tracking state for this specific stream
         if sensor_id in self.live_tracking_state:
@@ -2141,21 +2166,34 @@ class DeepStreamVideoPipeline:
                 return Gst.FlowReturn.ERROR
             buffer = sample.get_buffer()
             if not buffer:
+                # Ensure sample is released on early exit
+                try:
+                    sample.unref()
+                except Exception:
+                    pass
                 return Gst.FlowReturn.ERROR
-            
+
             success, mapinfo = buffer.map(Gst.MapFlags.READ)
             if not success:
+                # Ensure sample is released on early exit
+                try:
+                    sample.unref()
+                except Exception:
+                    pass
                 return Gst.FlowReturn.ERROR
-            
+
             try:
                 jpeg_bytes = mapinfo.data
                 if jpeg_bytes:
                     if true_id in self.jpeg_queues:
                         try:
                             self.jpeg_queues[true_id].put_nowait(bytes(jpeg_bytes))
-                            # minimal logging to avoid spam
+                            # Count only frames successfully enqueued (exclude dropped frames)
+                            with self.frame_count_lock:
+                                self.frame_count += 1
                         except queue.Full:
-                            pass # Drop frame if queue is full
+                            # Drop frame if queue is full; do not increment frame_count
+                            pass
                     else:
                         self.rate_limited_logger.warning(f"No JPEG queue for source_id {true_id}")
                     # Also store latest bytes for crop decoding
@@ -2164,8 +2202,16 @@ class DeepStreamVideoPipeline:
                     except Exception:
                         pass
             finally:
-                buffer.unmap(mapinfo)
-            
+                try:
+                    buffer.unmap(mapinfo)
+                except Exception:
+                    pass
+                # Always unref the sample to avoid leaking refs/buffers
+                try:
+                    sample.unref()
+                except Exception:
+                    pass
+
             return Gst.FlowReturn.OK
         except Exception as e:
             self.logger.error(f"Error in _on_new_jpeg_sample for sensor {sensor_id}: {e}")

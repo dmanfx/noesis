@@ -1,5 +1,4 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
-import { createPortal } from 'react-dom';
 import { CameraKey, cameraLabel } from '../lib/camera';
 
 export const StreamPanel: React.FC<{
@@ -9,7 +8,13 @@ export const StreamPanel: React.FC<{
   fpsText?: string;
   fpsSeries?: number[];
   vacancyText?: string;
-}> = ({ camera, title, blob, fpsText, fpsSeries = [], vacancyText }) => {
+  // Expand and Lock are controlled by parent
+  isExpanded?: boolean;
+  onToggleExpand?: (camera: CameraKey) => void;
+  showLock?: boolean;
+  locked?: boolean;
+  onToggleLock?: () => void;
+}> = ({ camera, title, blob, fpsText, fpsSeries = [], vacancyText, isExpanded = false, onToggleExpand, showLock = false, locked = false, onToggleLock }) => {
   const [url, setUrl] = useState<string>('');
   const imgRef = useRef<HTMLImageElement>(null);
   const viewRef = useRef<HTMLDivElement>(null);
@@ -27,22 +32,6 @@ export const StreamPanel: React.FC<{
   }, [blob]);
 
   const label = useMemo(() => title ?? cameraLabel(camera), [camera, title]);
-
-  const [maximized, setMaximized] = useState(false);
-
-  const onMaximize = () => {
-    setMaximized((v) => !v);
-  };
-
-  // Close on Escape when maximized
-  useEffect(() => {
-    if (!maximized) return;
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') setMaximized(false);
-    };
-    window.addEventListener('keydown', onKey);
-    return () => window.removeEventListener('keydown', onKey);
-  }, [maximized]);
 
   // Draw FPS sparkline in dedicated bar below the video
   useEffect(() => {
@@ -87,8 +76,34 @@ export const StreamPanel: React.FC<{
         ) : null}
         <div className="spacer" />
         <div className="stream-tools">
-          <button className="btn ghost" onClick={onMaximize} title="Toggle expand">
-            {maximized ? 'Collapse' : 'Expand'}
+          {showLock ? (
+            <button
+              className="btn ghost"
+              onClick={onToggleLock}
+              title={locked ? 'Unlock stream order' : 'Lock stream order'}
+              aria-pressed={locked}
+            >
+              <svg width="18" height="18" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
+                {locked ? (
+                  <>
+                    <path d="M7 10V7a5 5 0 0 1 10 0v3" stroke="#cfe0ff" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"/>
+                    <rect x="5" y="10" width="14" height="10" rx="2" stroke="#cfe0ff" strokeWidth="2"/>
+                  </>
+                ) : (
+                  <>
+                    <path d="M7 10V7a5 5 0 0 1 9 0" stroke="#9db1c8" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"/>
+                    <rect x="5" y="10" width="14" height="10" rx="2" stroke="#9db1c8" strokeWidth="2"/>
+                  </>
+                )}
+              </svg>
+            </button>
+          ) : null}
+          <button
+            className="btn ghost"
+            onClick={() => onToggleExpand?.(camera)}
+            title="Toggle expand"
+          >
+            {isExpanded ? 'Collapse' : 'Expand'}
           </button>
         </div>
       </div>
@@ -96,16 +111,6 @@ export const StreamPanel: React.FC<{
         <img ref={imgRef} alt={`${label} stream`} />
       </div>
       <div className="sparkbar"><canvas ref={sparkRef} /></div>
-
-      {maximized ? createPortal(
-        <div className="overlay-fullwindow" onClick={() => setMaximized(false)}>
-          <img src={url} alt={`${label} stream`} className="overlay-media" />
-          <button className="overlay-close" onClick={(e) => { e.stopPropagation(); setMaximized(false); }} title="Exit">
-            ✕
-          </button>
-        </div>,
-        document.body
-      ) : null}
     </div>
   );
 };

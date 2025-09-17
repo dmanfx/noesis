@@ -1,7 +1,15 @@
 import { useEffect, useRef, useState } from 'react';
 import { CameraKey, detectCameraKey } from '../lib/camera';
 
-type Track = { track_id: number; camera_id: string; zone?: string; center?: [number, number]; dwell_time?: number; velocity?: [number, number] };
+type Track = {
+  track_id: number;
+  stable_id?: number | null;
+  camera_id: string;
+  zone?: string;
+  center?: [number, number];
+  dwell_time?: number;
+  velocity?: [number, number];
+};
 
 export type CamerasStats = Record<string, {
   status?: string;

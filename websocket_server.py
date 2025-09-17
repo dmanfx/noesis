@@ -47,6 +47,11 @@ class WebSocketServer:
         self._latest_binary_by_cam: Dict[str, bytes] = {}
         self._binary_flush_task: Optional[asyncio.Task] = None
         self._binary_sending: bool = False
+        # Optional calibration + RPC callbacks
+        self.calibration_getter: Optional[Callable[[], Dict[str, Any]]] = None
+        self.pixel_to_world_handler: Optional[Callable[[Dict[str, Any]], Dict[str, Any]]] = None
+        self.set_extrinsics_handler: Optional[Callable[[Dict[str, Any]], Dict[str, Any]]] = None
+        self.solve_pnp_handler: Optional[Callable[[Dict[str, Any]], Dict[str, Any]]] = None
     
     async def _cleanup_stale_connections(self):
         """Periodically clean up any stale or closed connections"""
@@ -291,6 +296,16 @@ class WebSocketServer:
             except Exception as e:
                 self.logger.warning(f"Could not send initial trail visualization state to {client_ip}: {e}")
 
+            # Send initial calibration bundle if available
+            try:
+                if callable(self.calibration_getter):
+                    bundle = self.calibration_getter() or {}
+                    if bundle:
+                        await websocket.send(json.dumps({'type': 'calibration-bundle', 'data': bundle}))
+                        self.logger.info(f"Sent calibration-bundle to {client_ip}")
+            except Exception as e:
+                self.logger.warning(f"Could not send calibration-bundle to {client_ip}: {e}")
+
             # Process messages from client
             async for message in websocket:
                 try:
@@ -375,6 +390,57 @@ class WebSocketServer:
                             await self.broadcast(broadcast_message)
                         else:
                             self.logger.warning(f"Invalid detection config message from {client_ip}: {data}")
+
+                    # ---- Spatial & calibration RPCs ----
+                    # legacy 'get_transformation' removed; calibration-bundle is source of truth
+
+                    elif data.get('type') == 'pixel_to_world':
+                        req = data
+                        result = {'type': 'pixel_to_world_result', 'reqId': req.get('reqId')}
+                        try:
+                            if callable(self.pixel_to_world_handler):
+                                out = self.pixel_to_world_handler(req) or {}
+                                result.update(out)
+                            else:
+                                result.update({'ok': False, 'error': 'no_handler'})
+                        except Exception as e:
+                            result.update({'ok': False, 'error': str(e)})
+                        try:
+                            await websocket.send(json.dumps(result))
+                        except Exception:
+                            pass
+
+                    elif data.get('type') == 'set_extrinsics':
+                        req = data
+                        result = {'type': 'set_extrinsics_result'}
+                        try:
+                            if callable(self.set_extrinsics_handler):
+                                out = self.set_extrinsics_handler(req) or {}
+                                result.update(out)
+                            else:
+                                result.update({'ok': False, 'error': 'no_handler'})
+                        except Exception as e:
+                            result.update({'ok': False, 'error': str(e)})
+                        try:
+                            await websocket.send(json.dumps(result))
+                        except Exception:
+                            pass
+
+                    elif data.get('type') == 'solve_pnp':
+                        req = data
+                        result = {'type': 'solve_pnp_result'}
+                        try:
+                            if callable(self.solve_pnp_handler):
+                                out = self.solve_pnp_handler(req) or {}
+                                result.update(out)
+                            else:
+                                result.update({'ok': False, 'error': 'no_handler'})
+                        except Exception as e:
+                            result.update({'ok': False, 'error': str(e)})
+                        try:
+                            await websocket.send(json.dumps(result))
+                        except Exception:
+                            pass
 
                     # Handle individual detection toggles
                     elif data.get('type') == 'set_detection_toggle':

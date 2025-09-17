@@ -90,8 +90,17 @@ This document describes the WebSocket server behavior and message schemas used b
 - Set detection toggle (class groups)
   - `{ "type": "set_detection_toggle", "toggle_name": "detect_people"|"detect_vehicles"|"detect_furniture", "enabled": bool }`
 
+- Spatial calibration
+  - Pixel to world
+    - Request: `{ "type": "pixel_to_world", "reqId": string, "camId": string, "u": number, "v": number }`
+    - Response: `{ "type": "pixel_to_world_result", "reqId": string, "ok": boolean, "world"?: [x,y,z], "error"?: string }`
+  - Set extrinsics
+    - Request: `{ "type": "set_extrinsics", "cameraId": string, "E"?: float[16], "Twc"?: float[16] }` (column‑major)
+    - Response: `{ "type": "set_extrinsics_result", "ok": boolean, "error"?: string }`
+
 ## Runtime Notes
 
 - JPEG frames are throttled by per-source `appsink` and queue size; oldest frames may be dropped under load.
 - Telemetry frames are emitted only when there is per-source tracking data.
+- Legacy `get_transformation`/`transformation` path has been removed. Use `calibration-bundle` as the source of truth.
 - Errors in per-client send are logged and do not disrupt other clients.

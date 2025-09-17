@@ -79,6 +79,8 @@ from utils.cpu_profiler import start_global_profiling, stop_global_profiling, ge
 from utils.interrupt import safe_join, safe_process_join
 from visualization import VisualizationManager
 from websocket_server import WebSocketServer
+from calibration_bundle import load_intrinsics, load_alignment, load_extrinsics, assemble_calibration_bundle, save_extrinsics
+from pixel_to_world import K_from_intrinsics, E_to_world_and_R, ray_from_pixel, intersect_floor, bbox_bottom_center
 
 # Ensure project root is in path
 project_root = Path(__file__).parent.absolute()
@@ -122,6 +124,10 @@ class ApplicationManager:
         self.websocket_server = None
         self.websocket_loop = None
         self.visualization_manager = VisualizationManager()
+        # Calibration state
+        self.calibration_bundle = None
+        self._intrinsics_models = None
+        self._calib_paths = {}
         
         # Initialize async event loop
         self.event_loop = None
@@ -252,6 +258,16 @@ class ApplicationManager:
             os.write(2, b"DEBUG: Loading camera sources...\n")
             self._load_camera_sources()
             os.write(2, b"DEBUG: Camera sources loaded\n")
+
+            # Load calibration & wire WebSocket RPCs
+            try:
+                self._load_calibration()
+                if self.websocket_server:
+                    self.websocket_server.calibration_getter = self._get_calibration_bundle
+                    self.websocket_server.pixel_to_world_handler = self._pixel_to_world_rpc
+                    self.websocket_server.set_extrinsics_handler = self._set_extrinsics_rpc
+            except Exception as e:
+                self.logger.warning(f"Calibration init failed: {e}")
 
             # Initialize output directory
             ensure_dir(self.config.output.OUTPUT_DIR)
@@ -463,6 +479,15 @@ class ApplicationManager:
             # Give processor a moment to initialize
             time.sleep(1.0)
             self.logger.info("Multi-stream processor initialization complete")
+
+            # Rebuild calibration now that DeepStream has canonical camera IDs
+            try:
+                self._load_calibration()
+                if self.websocket_server and (self.calibration_bundle is not None):
+                    self.websocket_server.broadcast_sync({'type': 'calibration-bundle', 'data': self.calibration_bundle})
+                    self.logger.info("📡 Re-broadcast calibration-bundle with canonical camera IDs")
+            except Exception as e:
+                self.logger.warning(f"Calibration rebuild after DeepStream init failed: {e}")
             
         except Exception as e:
             self.logger.error(f"❌ Error starting multi-stream processor: {e}")
@@ -735,6 +760,116 @@ class ApplicationManager:
         
         self.logger.info("Started result processing thread")
     
+    # ---------------------- Calibration helpers ----------------------
+    def _get_camera_ids(self) -> list:
+        ids = []
+        try:
+            if self.multi_stream_processor and getattr(self.multi_stream_processor, 'source_info', None):
+                for sid, info in self.multi_stream_processor.source_info.items():
+                    ids.append(str(info.get('clean_name') or info.get('name') or f"camera-{sid}"))
+                return ids
+        except Exception:
+            pass
+        try:
+            for i, stream in enumerate(self.config.cameras.RTSP_STREAMS):
+                if stream.get('enabled', True):
+                    name = stream.get('name', f'Camera {i+1}')
+                    clean = name.lower().replace(' ', '-').replace('_', '-')
+                    ids.append(clean)
+        except Exception:
+            pass
+        return ids
+
+    def _load_calibration(self) -> None:
+        # Resolve paths
+        try:
+            root_dir = str(Path(__file__).parent)
+        except Exception:
+            root_dir = os.getcwd()
+        intr_path = self.config.calibration.INTRINSICS_PATH
+        if not os.path.isabs(intr_path):
+            intr_path = os.path.join(root_dir, intr_path)
+        align_path = self.config.calibration.PLY_ALIGNMENT_PATH
+        if not os.path.isabs(align_path):
+            align_path = os.path.join(root_dir, align_path)
+        extr_path = self.config.calibration.CAMERA_CALIBRATION_PATH
+        if not os.path.isabs(extr_path):
+            extr_path = os.path.join(root_dir, extr_path)
+
+        # Load components
+        self._intrinsics_models = load_intrinsics(intr_path)
+        align = load_alignment(align_path)
+        extr = load_extrinsics(extr_path)
+
+        cam_ids = self._get_camera_ids()
+        model_map = dict(self.config.calibration.CAMERA_INTRINSICS_MODEL_MAP)
+        self.calibration_bundle = assemble_calibration_bundle(cam_ids, self._intrinsics_models, model_map, extr, align)
+        self._calib_paths = {'intrinsics': intr_path, 'alignment': align_path, 'extrinsics': extr_path}
+        self.logger.info(f"Calibration ready for cameras: {list(self.calibration_bundle.get('cameras', {}).keys())}")
+
+    def _get_calibration_bundle(self) -> dict:
+        return self.calibration_bundle or {}
+
+    def _pixel_to_world_rpc(self, req: dict) -> dict:
+        try:
+            cam_id = str(req.get('camId') or req.get('cameraId') or '')
+            u = float(req.get('u'))
+            v = float(req.get('v'))
+        except Exception:
+            return {'ok': False, 'error': 'invalid_args'}
+        calib = self.calibration_bundle or {}
+        cam = (calib.get('cameras') or {}).get(cam_id) or {}
+        intr = cam.get('intrinsics') or {}
+        E = (cam.get('extrinsics') or {}).get('E')
+        align = calib.get('align', {})
+        floor_y = float(align.get('floor_y') or 0.0)
+        K = K_from_intrinsics(intr)
+        if K is None or not isinstance(E, list) or len(E) != 16:
+            return {'ok': False, 'error': 'calibration_missing'}
+        pose = E_to_world_and_R(E)
+        if pose is None:
+            return {'ok': False, 'error': 'bad_extrinsics'}
+        Cw, Rwc = pose
+        O, D = ray_from_pixel(u, v, K, Cw, Rwc)
+        hit = intersect_floor(O, D, floor_y)
+        if hit is None:
+            return {'ok': False, 'error': 'no_intersection'}
+        return {'ok': True, 'world': [hit[0], hit[1], hit[2]]}
+
+    def _set_extrinsics_rpc(self, req: dict) -> dict:
+        try:
+            cam_id = str(req.get('cameraId'))
+        except Exception:
+            return {'ok': False, 'error': 'cameraId_required'}
+        E = None
+        try:
+            if isinstance(req.get('E'), list) and len(req['E']) == 16:
+                E = [float(x) for x in req['E']]
+            elif isinstance(req.get('Twc'), list) and len(req['Twc']) == 16:
+                Twc = np.array(req['Twc'], dtype=float).reshape((4, 4), order='F')
+                Emat = np.linalg.inv(Twc)
+                E = list(np.array(Emat, dtype=float).reshape(-1, order='F'))
+            else:
+                return {'ok': False, 'error': 'E_or_Twc_required'}
+        except Exception as e:
+            return {'ok': False, 'error': f'parse_error: {e}'}
+        ok = save_extrinsics(self._calib_paths.get('extrinsics', ''), cam_id, E)
+        if not ok:
+            return {'ok': False, 'error': 'persist_failed'}
+        # Rebuild bundle with updated extrinsics
+        extr = load_extrinsics(self._calib_paths.get('extrinsics', ''))
+        align = self.calibration_bundle.get('align', {}) if self.calibration_bundle else load_alignment(self._calib_paths.get('alignment', ''))
+        cam_ids = self._get_camera_ids()
+        model_map = dict(self.config.calibration.CAMERA_INTRINSICS_MODEL_MAP)
+        self.calibration_bundle = assemble_calibration_bundle(cam_ids, self._intrinsics_models or {}, model_map, extr, align)
+        # Broadcast updated bundle
+        try:
+            if self.websocket_server:
+                self.websocket_server.broadcast_sync({'type': 'calibration-bundle', 'data': self.calibration_bundle})
+        except Exception:
+            pass
+        return {'ok': True}
+    
     @profile_function("ApplicationManager.process_analysis_frame")
     def _process_analysis_frame(self, analysis_frame: AnalysisFrame):
         """Process analysis frame
@@ -917,6 +1052,39 @@ class ApplicationManager:
                                         'transitions': (stream_tracking_data or {}).get('transitions', []),
                                         'occupancy': norm_occ,
                                     }
+                                    # Augment active tracks with world coordinates if calibration available
+                                    try:
+                                        cam_cal = (self.calibration_bundle or {}).get('cameras', {}).get(camera_name) or {}
+                                        intr = cam_cal.get('intrinsics') or {}
+                                        E = (cam_cal.get('extrinsics') or {}).get('E')
+                                        align = (self.calibration_bundle or {}).get('align', {})
+                                        floor_y = float(align.get('floor_y') or 0.0)
+                                        K = K_from_intrinsics(intr)
+                                        if K is not None and isinstance(E, list) and len(E) == 16:
+                                            pose = E_to_world_and_R(E)
+                                            if pose is not None:
+                                                Cw, Rwc = pose
+                                                for t in tracking_payload.get('active_tracks', []) or []:
+                                                    try:
+                                                        bb = t.get('bbox')
+                                                        if isinstance(bb, list) and len(bb) == 4:
+                                                            fp = bbox_bottom_center(bb)
+                                                            if fp is not None:
+                                                                u, v = fp
+                                                                O, D = ray_from_pixel(u, v, K, Cw, Rwc)
+                                                                hit = intersect_floor(O, D, floor_y)
+                                                                if hit is not None:
+                                                                    t['world'] = [float(hit[0]), float(hit[1]), float(hit[2])]
+                                                                    t['world_valid'] = True
+                                                                else:
+                                                                    t['world_valid'] = False
+                                                    except Exception:
+                                                        try:
+                                                            t['world_valid'] = False
+                                                        except Exception:
+                                                            pass
+                                    except Exception:
+                                        pass
                                 except Exception:
                                     tracking_payload = stream_tracking_data
 

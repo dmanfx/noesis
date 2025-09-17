@@ -52,8 +52,8 @@ class AppConfig:
             },
             {
                 "name": "Kitchen Camera", 
-                "url": "rtsp://192.168.3.214:7447/qt3VqVdZpgG1B4Vk?",
-                #"url": "udp://127.0.0.1:8554", # use with: sudo ffmpeg -re -stream_loop -1 -i /home/mayor/Downloads/kitchenclip.mp4 -c copy -f mpegts udp://0.0.0.0:8554
+                #"url": "rtsp://192.168.3.214:7447/qt3VqVdZpgG1B4Vk?",
+                "url": "udp://127.0.0.1:8554", # use with: sudo ffmpeg -re -stream_loop -1 -i /home/mayor/Downloads/kitchenclip.mp4 -c copy -f mpegts udp://0.0.0.0:8554
                 "width": 1920,
                 "height": 1080,
                 "enabled": True
@@ -418,6 +418,22 @@ class AppConfig:
         MAX_CLIENTS: int = 10
         JPEG_QUALITY: int = 70  # JPEG quality for frame compression (0-100)
         MAX_FPS: int = 20  # Maximum FPS for WebSocket streaming
+
+    @dataclass
+    class CalibrationSettings:
+        """Calibration and spatial settings"""
+        INTRINSICS_PATH: str = "intrinsics.json"  # root-level intrinsics file
+        CAMERA_CALIBRATION_PATH: str = "config/camera_calibration.json"  # per-camera extrinsics, floor_y, units
+        PLY_ALIGNMENT_PATH: str = "config/ply_alignment.json"  # optional align matrix source
+        # Map Noesis camera IDs (clean_name) to intrinsics model keys in intrinsics.json
+        CAMERA_INTRINSICS_MODEL_MAP: Dict[str, str] = field(default_factory=lambda: {
+            'living-room': 'unifi_protect_g3_instant',
+            'kitchen': 'unifi_protect_g3_instant',
+            'family-room': 'unifi_protect_g4_instant',
+        })
+        ENABLE_MDE: bool = False
+        MDE_MAX_FPS: float = 1.0
+        DEPTH_SCALE_PER_CAMERA: Dict[str, float] = field(default_factory=dict)
     
     # Initialize all configuration sections with default values
     app: AppSettings = field(default_factory=AppSettings)
@@ -427,6 +443,7 @@ class AppConfig:
     visualization: VisualizationSettings = field(default_factory=VisualizationSettings)
     output: OutputSettings = field(default_factory=OutputSettings)
     websocket: WebSocketSettings = field(default_factory=WebSocketSettings)
+    calibration: CalibrationSettings = field(default_factory=CalibrationSettings)
     tracking: TrackingSettings = field(default_factory=TrackingSettings)
     integrations: IntegrationsSettings = field(default_factory=IntegrationsSettings)
     
@@ -580,7 +597,7 @@ def save_config_to_file(config: AppConfig, config_file: str) -> bool:
     try:
         # Create configuration data structure for serialization
         config_data = {}
-        
+
         for section_name in [
             "app",
             "cameras",
@@ -589,30 +606,31 @@ def save_config_to_file(config: AppConfig, config_file: str) -> bool:
             "visualization",
             "output",
             "websocket",
+            "calibration",
             "tracking",
             "integrations",
         ]:
             section = getattr(config, section_name)
             section_data = {}
-            
+
             for key in section.__annotations__:
                 value = getattr(section, key)
-                
+
                 # Convert non-serializable types (like tuples) to serializable ones (like lists)
                 if isinstance(value, tuple):
                     value = list(value)
-                
+
                 section_data[key] = value
-            
+
             config_data[section_name] = section_data
-        
+
         # Create directory if it doesn't exist
         os.makedirs(os.path.dirname(config_file), exist_ok=True)
-        
+
         # Save configuration to file
         with open(config_file, 'w') as f:
             json.dump(config_data, f, indent=4)
-        
+
         logger.info(f"Saved configuration to {config_file}")
         return True
     

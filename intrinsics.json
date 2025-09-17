@@ -1,0 +1,43 @@
+{
+  "version": "1.0.0",
+  "updated_at": "2025-09-16 21:07 EDT",
+  "unifi_protect_g3_instant": {
+    "model": "UVC-G3-INS",
+    "resolution": [1920, 1080],
+    "intrinsics": {
+      "fx": 656.10,
+      "fy": 956.39,
+      "cx": 960.00,
+      "cy": 540.00,
+      "distortion_coeffs": [0, 0, 0, 0, 0],
+      "K_matrix": [[656.10, 0, 960.00], [0, 956.39, 540.00], [0, 0, 1]]
+    },
+    "notes": "Distortion coefficients assumed zero due to lack of official data; calibrate for precision."
+  },
+  "unifi_protect_g4_instant": {
+    "model": "UVC-G4-INS",
+    "resolution": [1280, 720],
+    "intrinsics": {
+      "fx": 514.00,
+      "fy": 692.50,
+      "cx": 640.00,
+      "cy": 360.00,
+      "distortion_coeffs": [0, 0, 0, 0, 0],
+      "K_matrix": [[514.00, 0, 640.00], [0, 692.50, 360.00], [0, 0, 1]]
+    },
+    "notes": "Intrinsics scaled for 1280x720 resolution; distortion assumed zero; calibrate for precision."
+  },
+  "unifi_protect_g3_bullet": {
+    "model": "UVC-G3-BULLET",
+    "resolution": [1920, 1080],
+    "intrinsics": {
+      "fx": 1321.33,
+      "fy": 1370.87,
+      "cx": 960.00,
+      "cy": 540.00,
+      "distortion_coeffs": [0, 0, 0, 0, 0],
+      "K_matrix": [[1321.33, 0, 960.00], [0, 1370.87, 540.00], [0, 0, 1]]
+    },
+    "notes": "Distortion coefficients assumed zero due to lack of official data; calibrate for precision."
+  }
+}

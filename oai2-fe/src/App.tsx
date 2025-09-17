@@ -50,8 +50,8 @@ function Dashboard() {
   const [occupancy, setOccupancy] = useState<string>('');
   const [trackDetailsHtml, setTrackDetailsHtml] = useState<string>('');
   // Transitions removed from UI
-  const [tracksByCamera, setTracksByCamera] = useState<Record<string, Array<{track_id: number; camera_id: string; zone?: string; center?: [number, number]; dwell_time?: number; velocity?: [number, number] }>>>({});
-  const [tracksByCamKey, setTracksByCamKey] = useState<Record<CameraKey, Array<{track_id: number; camera_id: string}>>>({ 'living-room': [], 'kitchen': [], 'family-room': [] });
+  const [tracksByCamera, setTracksByCamera] = useState<Record<string, Array<{track_id: number; stable_id?: number | null; camera_id: string; zone?: string; center?: [number, number]; dwell_time?: number; velocity?: [number, number] }>>>({});
+  const [tracksByCamKey, setTracksByCamKey] = useState<Record<CameraKey, Array<{track_id: number; stable_id?: number | null; camera_id: string}>>>({ 'living-room': [], 'kitchen': [], 'family-room': [] });
   const [occByCamKey, setOccByCamKey] = useState<Record<CameraKey, Record<string, number>>>({ 'living-room': {}, 'kitchen': {}, 'family-room': {} });
   // Vacancy timer state
   const [vacancyText, setVacancyText] = useState<Record<CameraKey, string>>({ 'living-room': '', 'kitchen': '', 'family-room': '' });
@@ -103,7 +103,7 @@ function Dashboard() {
           for (const t of track!.active_tracks) {
             const center = t.center; if (!Array.isArray(center) || center.length < 2) continue;
             const key = camKey;
-            trailStoreRef.current.push(key as any, Number(t.track_id), { x: center[0]!, y: center[1]! });
+            trailStoreRef.current.push(key as any, Number((t.stable_id ?? t.track_id) || 0), { x: center[0]!, y: center[1]! });
           }
         }
         perKeyTracks[camKey] = track!.active_tracks;
@@ -129,13 +129,13 @@ function Dashboard() {
     // Track details HTML
     let tracksHtml = '';
     if (allTracks.length) {
-      allTracks.sort((a,b) => (a.track_id||0) - (b.track_id||0)).forEach(t => {
+      allTracks.sort((a,b) => (Number((a.stable_id ?? a.track_id) || 0)) - (Number((b.stable_id ?? b.track_id) || 0))).forEach(t => {
         const dwell = t.dwell_time?.toFixed(1) ?? '0.0';
         const center = t.center || ['N/A','N/A'];
         const vel = t.velocity || [0,0];
         const speed = Math.sqrt(vel[0]**2 + vel[1]**2).toFixed(1);
-        const dotColor = colorForTrack(Number(t.track_id||0));
-        tracksHtml += `<div><strong><span class="dot" style="display:inline-block;width:10px;height:10px;border-radius:50%;background:${dotColor};margin-right:6px;vertical-align:middle;"></span>ID ${t.track_id||'N/A'}:</strong><br/>Zone: ${t.zone||'-'}, Dwell: <span style="display:inline-block; min-width:4ch; text-align:right;">${dwell}</span>s<br/>Pos: [${(typeof center[0]==='number'?Number(center[0]).toFixed(3):center[0])}, ${(typeof center[1]==='number'?Number(center[1]).toFixed(3):center[1])}], Speed: <span style="display:inline-block; min-width:4ch; text-align:right;">${speed}</span> px/s</div>`;
+        const dotColor = colorForTrack(Number((t.stable_id ?? t.track_id) || 0));
+        tracksHtml += `<div><strong><span class="dot" style="display:inline-block;width:10px;height:10px;border-radius:50%;background:${dotColor};margin-right:6px;vertical-align:middle;"></span>SID ${t.stable_id ?? t.track_id ?? 'N/A'}:</strong><br/>Zone: ${t.zone||'-'}, Dwell: <span style="display:inline-block; min-width:4ch; text-align:right;">${dwell}</span>s<br/>Pos: [${(typeof center[0]==='number'?Number(center[0]).toFixed(3):center[0])}, ${(typeof center[1]==='number'?Number(center[1]).toFixed(3):center[1])}], Speed: <span style="display:inline-block; min-width:4ch; text-align:right;">${speed}</span> px/s</div>`;
       });
     } else {
       tracksHtml = '<span>No active tracks.</span>';
@@ -225,6 +225,21 @@ function Dashboard() {
     onStats,
     onTrailToggle: (en) => setTrailEnabled(en)
   });
+  
+  // Live EST/EDT clock for top bar
+  const [estTime, setEstTime] = useState<string>("");
+  useEffect(() => {
+    const fmt = new Intl.DateTimeFormat('en-US', {
+      timeZone: 'America/New_York',
+      hour: '2-digit', minute: '2-digit', second: '2-digit',
+      hour12: true,
+      timeZoneName: 'short'
+    });
+    const tick = () => setEstTime(fmt.format(new Date()));
+    tick();
+    const id = setInterval(tick, 1000);
+    return () => clearInterval(id);
+  }, []);
 
   // Vacency timer updater (tick every second)
   useEffect(() => {
@@ -268,6 +283,9 @@ function Dashboard() {
   }, [status]);
 
   const displayOrder = useMemo<CameraKey[]>(() => [primaryKey, ...cameraOrder.filter(k => k !== primaryKey)], [primaryKey]);
+  const timeChip = useMemo(() => (
+    estTime ? <span className="chip mono" title="Current time (US Eastern)">{estTime}</span> : null
+  ), [estTime]);
 
   // Fullscreen overlay that follows the selected camera's stream
   const [overlayUrl, setOverlayUrl] = useState<string>('');
@@ -303,6 +321,7 @@ function Dashboard() {
           </div>
         </div>
         <div className="spacer" />
+        {timeChip}
         {connectionChip}
         <button className="btn ghost" onClick={() => setTelemetryOpen(v => !v)}>Telemetry</button>
       </header>

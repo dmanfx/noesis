@@ -1,4 +1,5 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
+import { createPortal } from 'react-dom';
 import { StreamPanel } from './components/StreamPanel';
 import { MapPanel } from './components/MapPanel';
 import { ControlsPanel } from './components/ControlsPanel';
@@ -62,6 +63,8 @@ function Dashboard() {
   const [telemetryOpen, setTelemetryOpen] = useState(false);
   // Auto-primary selection state
   const [primaryKey, setPrimaryKey] = useState<CameraKey>(cameraOrder[0]);
+  const [locked, setLocked] = useState<boolean>(false);
+  const [expandedCamera, setExpandedCamera] = useState<CameraKey | null>(null);
   const motionEmaRef = useRef<Record<CameraKey, number>>({ 'living-room': 0, 'kitchen': 0, 'family-room': 0 });
   const lastSwitchRef = useRef<number>(0);
   const EMA_ALPHA = 0.3; // smoothing factor for motion
@@ -161,6 +164,9 @@ function Dashboard() {
 
     // --- Auto-promote primary based on motion heuristic ---
     try {
+      if (locked) {
+        return; // do not switch when locked
+      }
       const scores: Record<CameraKey, number> = { 'living-room': 0, 'kitchen': 0, 'family-room': 0 } as const as any;
       (Object.keys(scores) as CameraKey[]).forEach((k) => {
         const tracks = perKeyTracks[k] || [];
@@ -263,6 +269,29 @@ function Dashboard() {
 
   const displayOrder = useMemo<CameraKey[]>(() => [primaryKey, ...cameraOrder.filter(k => k !== primaryKey)], [primaryKey]);
 
+  // Fullscreen overlay that follows the selected camera's stream
+  const [overlayUrl, setOverlayUrl] = useState<string>('');
+  const expandedBlob = expandedCamera ? streams[expandedCamera] : null;
+
+  useEffect(() => {
+    if (!expandedCamera || !expandedBlob) {
+      setOverlayUrl('');
+      return;
+    }
+    const url = URL.createObjectURL(expandedBlob);
+    setOverlayUrl(url);
+    return () => URL.revokeObjectURL(url);
+  }, [expandedCamera, expandedBlob]);
+
+  useEffect(() => {
+    if (!expandedCamera) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') setExpandedCamera(null);
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [expandedCamera]);
+
   return (
     <div className="shell">
       <header className="topbar">
@@ -286,6 +315,11 @@ function Dashboard() {
               fpsText={fps[displayOrder[0]]}
               fpsSeries={fpsSeries[displayOrder[0]]}
               vacancyText={vacancyText[displayOrder[0]]}
+              showLock={true}
+              locked={locked}
+              onToggleLock={() => setLocked(v => !v)}
+              isExpanded={expandedCamera === displayOrder[0]}
+              onToggleExpand={(cam) => setExpandedCamera(prev => prev === cam ? null : cam)}
             />
           </div>
           <div className="slot-bottom-left">
@@ -295,6 +329,8 @@ function Dashboard() {
               fpsText={fps[displayOrder[1]]}
               fpsSeries={fpsSeries[displayOrder[1]]}
               vacancyText={vacancyText[displayOrder[1]]}
+              isExpanded={expandedCamera === displayOrder[1]}
+              onToggleExpand={(cam) => setExpandedCamera(prev => prev === cam ? null : cam)}
             />
           </div>
           <div className="slot-bottom-right">
@@ -304,6 +340,8 @@ function Dashboard() {
               fpsText={fps[displayOrder[2]]}
               fpsSeries={fpsSeries[displayOrder[2]]}
               vacancyText={vacancyText[displayOrder[2]]}
+              isExpanded={expandedCamera === displayOrder[2]}
+              onToggleExpand={(cam) => setExpandedCamera(prev => prev === cam ? null : cam)}
             />
           </div>
         </section>
@@ -340,6 +378,16 @@ function Dashboard() {
         <span className="spacer" />
         <span className="subtitle">Use the Fullscreen button on any stream</span>
       </footer>
+
+      {expandedCamera && overlayUrl ? createPortal(
+        <div className="overlay-fullwindow" onClick={() => setExpandedCamera(null)}>
+          <img src={overlayUrl} alt={`${expandedCamera} stream`} className="overlay-media" />
+          <button className="overlay-close" onClick={(e) => { e.stopPropagation(); setExpandedCamera(null); }} title="Exit">
+            ✕
+          </button>
+        </div>,
+        document.body
+      ) : null}
 
       {telemetryOpen && <TelemetryPanel onClose={() => setTelemetryOpen(false)} />}
     </div>

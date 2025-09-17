@@ -52,8 +52,8 @@ class AppConfig:
             },
             {
                 "name": "Kitchen Camera", 
-                #"url": "rtsp://192.168.3.214:7447/qt3VqVdZpgG1B4Vk?",
-                "url": "udp://127.0.0.1:8554", # use with: sudo ffmpeg -re -stream_loop -1 -i /home/mayor/Downloads/kitchenclip.mp4 -c copy -f mpegts udp://0.0.0.0:8554
+                "url": "rtsp://192.168.3.214:7447/qt3VqVdZpgG1B4Vk?",
+                #"url": "udp://127.0.0.1:8554", # use with: sudo ffmpeg -re -stream_loop -1 -i /home/mayor/Downloads/kitchenclip.mp4 -c copy -f mpegts udp://0.0.0.0:8554
                 "width": 1920,
                 "height": 1080,
                 "enabled": True

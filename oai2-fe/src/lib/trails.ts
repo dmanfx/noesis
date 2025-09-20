@@ -15,6 +15,14 @@ export class TrailStore {
     if (arr.length > MAX_POINTS) arr.shift();
   }
 
+  // Insert a gap marker so drawTrails breaks the polyline for this track
+  pushBreak(cam: CameraKey, trackId: number) {
+    if (!this.trails[cam][trackId]) this.trails[cam][trackId] = [];
+    const arr = this.trails[cam][trackId];
+    arr.push({ x: Number.NaN, y: Number.NaN });
+    if (arr.length > MAX_POINTS) arr.shift();
+  }
+
   clearAll() {
     this.trails = { 'living-room': {}, 'kitchen': {}, 'family-room': {} };
   }
@@ -24,7 +32,8 @@ export function drawTrails(
   canvas: HTMLCanvasElement,
   cam: CameraKey,
   store: TrailStore,
-  color: (id: number) => string
+  color: (id: number) => string,
+  viewport?: { xMin: number; xMax: number; yMin: number; yMax: number; invertY?: boolean; drawCameraMarker?: boolean }
 ) {
   const ctx = canvas.getContext('2d');
   if (!ctx) return;
@@ -32,17 +41,22 @@ export function drawTrails(
   ctx.clearRect(0, 0, canvas.width, canvas.height);
 
   let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
-  for (const tidStr in tracks) {
-    const pts = tracks[Number(tidStr)] || [];
-    for (const p of pts) {
-      if (p.x < minX) minX = p.x;
-      if (p.y < minY) minY = p.y;
-      if (p.x > maxX) maxX = p.x;
-      if (p.y > maxY) maxY = p.y;
+  if (viewport) {
+    minX = viewport.xMin; maxX = viewport.xMax;
+    minY = viewport.yMin; maxY = viewport.yMax;
+  } else {
+    for (const tidStr in tracks) {
+      const pts = tracks[Number(tidStr)] || [];
+      for (const p of pts) {
+        if (p.x < minX) minX = p.x;
+        if (p.y < minY) minY = p.y;
+        if (p.x > maxX) maxX = p.x;
+        if (p.y > maxY) maxY = p.y;
+      }
     }
-  }
-  if (!isFinite(minX) || !isFinite(minY) || !isFinite(maxX) || !isFinite(maxY)) {
-    return;
+    if (!isFinite(minX) || !isFinite(minY) || !isFinite(maxX) || !isFinite(maxY)) {
+      return;
+    }
   }
 
   const pad = 10;
@@ -61,21 +75,45 @@ export function drawTrails(
   for (const tidStr in tracks) {
     const tid = Number(tidStr);
     const pts = tracks[tid];
-    if (!pts || pts.length < 2) continue;
-    ctx.beginPath();
-    for (let i = 0; i < pts.length; i++) {
-      const px = pad + (pts[i].x - minX) * sx;
-      const py = pad + (pts[i].y - minY) * sy;
-      if (i === 0) ctx.moveTo(px, py); else ctx.lineTo(px, py);
-    }
+    if (!pts || pts.length === 0) continue;
+    let open = false;
+    let lastValid: Point | null = null;
     ctx.strokeStyle = color(tid);
     ctx.lineWidth = 2;
-    ctx.stroke();
-    const last = pts[pts.length - 1];
-    const hx = pad + (last.x - minX) * sx;
-    const hy = pad + (last.y - minY) * sy;
-    ctx.fillStyle = color(tid);
-    ctx.beginPath(); ctx.arc(hx, hy, 3, 0, Math.PI * 2); ctx.fill();
+    for (let i = 0; i < pts.length; i++) {
+      const p = pts[i];
+      const isGap = !Number.isFinite(p.x) || !Number.isFinite(p.y);
+      if (isGap) {
+        if (open) { ctx.stroke(); open = false; }
+        continue;
+      }
+      const px = pad + (p.x - minX) * sx;
+      const baseY = pad + (p.y - minY) * sy;
+      const py = viewport?.invertY ? (canvas.height - baseY) : baseY;
+      if (!open) { ctx.beginPath(); ctx.moveTo(px, py); open = true; }
+      else { ctx.lineTo(px, py); }
+      lastValid = p;
+    }
+    if (open) ctx.stroke();
+    if (lastValid) {
+      const hx = pad + (lastValid.x - minX) * sx;
+      const baseHy = pad + (lastValid.y - minY) * sy;
+      const hy = viewport?.invertY ? (canvas.height - baseHy) : baseHy;
+      ctx.fillStyle = color(tid);
+      ctx.beginPath(); ctx.arc(hx, hy, 3, 0, Math.PI * 2); ctx.fill();
+    }
+  }
+
+  // Optional camera marker at bottom center when viewport provided
+  if (viewport?.drawCameraMarker) {
+    const cx = canvas.width / 2;
+    const cy = canvas.height - pad;
+    ctx.fillStyle = '#ffcc00';
+    ctx.beginPath();
+    ctx.moveTo(cx, cy);
+    ctx.lineTo(cx - 8, cy - 12);
+    ctx.lineTo(cx + 8, cy - 12);
+    ctx.closePath();
+    ctx.fill();
   }
 }
-

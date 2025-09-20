@@ -8,6 +8,7 @@ import { TelemetryPanel } from './telemetry/TelemetryPanel';
 import { TelemetryProvider, useTelemetry } from './telemetry/TelemetryContext';
 import { TrailStore } from './lib/trails';
 import { cameraOrder, colorForTrack } from './lib/camera';
+import { getExtrinsics, worldToCamera } from './lib/calibration';
 import { detectCameraKey, CameraKey } from './lib/camera';
 import { useWebSocketClient, StatsPayload } from './hooks/useWebSocketClient';
 
@@ -59,6 +60,13 @@ function Dashboard() {
 
   const [trailEnabled, setTrailEnabled] = useState<boolean>(true);
   const trailStoreRef = useRef(new TrailStore());
+  const prevActiveRef = useRef<Record<CameraKey, Set<number>>>(
+    { 'living-room': new Set(), 'kitchen': new Set(), 'family-room': new Set() }
+  );
+  // Switch cams to world-space top-down when available
+  const usingWorldKitchenRef = useRef<boolean>(false);
+  const usingWorldLivingRef = useRef<boolean>(false);
+  const usingWorldFamilyRef = useRef<boolean>(false);
 
   const [telemetryOpen, setTelemetryOpen] = useState(false);
   // Auto-primary selection state
@@ -86,6 +94,10 @@ function Dashboard() {
     const perKeyOcc: Record<CameraKey, Record<string, number>> = { 'living-room': {}, 'kitchen': {}, 'family-room': {} };
     // const perKeyTransCount: Record<CameraKey, number> = { 'living-room': 0, 'kitchen': 0, 'family-room': 0 };
 
+    const seenNow: Record<CameraKey, Set<number>> = {
+      'living-room': new Set(), 'kitchen': new Set(), 'family-room': new Set()
+    };
+
     for (const camId in cameras) {
       const c = cameras[camId];
       if (c?.status) publish({ group: `Camera ${camId}`, key: 'Status', value: c.status, ts: now });
@@ -101,15 +113,82 @@ function Dashboard() {
         // trails
         if (trailEnabled) {
           for (const t of track!.active_tracks) {
-            const center = t.center; if (!Array.isArray(center) || center.length < 2) continue;
-            const key = camKey;
-            trailStoreRef.current.push(key as any, Number((t.stable_id ?? t.track_id) || 0), { x: center[0]!, y: center[1]! });
+            const key = camKey as CameraKey;
+            const sid = Number((t.stable_id ?? t.track_id) || 0);
+            if (!prevActiveRef.current[key]?.has(sid)) {
+              trailStoreRef.current.pushBreak(key, sid);
+            }
+            // Prefer camera-local space for kitchen when provided (x_cam,z_cam → canvas x,y)
+            const tw: any = t as any;
+            const hasWorld = Array.isArray(tw.world) && tw.world.length >= 3 && !!tw.world_valid;
+            if (key === 'kitchen' && hasWorld) {
+              if (!usingWorldKitchenRef.current) {
+                // First time we see valid world for kitchen, clear old pixel trails for that cam
+                try { (trailStoreRef.current.trails as any)['kitchen'] = {}; } catch {}
+                usingWorldKitchenRef.current = true;
+              }
+              const w = tw.world as [number, number, number];
+              const E = getExtrinsics('kitchen');
+              if (E) {
+                const pc = worldToCamera(E, w);
+                if (pc) {
+                  const xCam = pc[0];
+                  const zCam = pc[2];
+                  const depth = Math.abs(zCam);
+                  trailStoreRef.current.push(key, sid, { x: xCam, y: depth });
+                }
+              } else {
+                // Fallback to world XZ if extrinsics not loaded
+                trailStoreRef.current.push(key, sid, { x: Number(w[0] || 0), y: Number(w[2] || 0) });
+              }
+              seenNow[key].add(sid);
+            } else if (key === 'living-room' && hasWorld) {
+              if (!usingWorldLivingRef.current) {
+                try { (trailStoreRef.current.trails as any)['living-room'] = {}; } catch {}
+                usingWorldLivingRef.current = true;
+              }
+              const w = tw.world as [number, number, number];
+              const E = getExtrinsics('living-room');
+              if (E) {
+                const pc = worldToCamera(E, w);
+                if (pc) {
+                  const xCam = pc[0];
+                  const zCam = pc[2];
+                  const depth = Math.abs(zCam);
+                  trailStoreRef.current.push(key, sid, { x: xCam, y: depth });
+                }
+              }
+              seenNow[key].add(sid);
+            } else if (key === 'family-room' && hasWorld) {
+              if (!usingWorldFamilyRef.current) {
+                try { (trailStoreRef.current.trails as any)['family-room'] = {}; } catch {}
+                usingWorldFamilyRef.current = true;
+              }
+              const w = tw.world as [number, number, number];
+              const E = getExtrinsics('family-room');
+              if (E) {
+                const pc = worldToCamera(E, w);
+                if (pc) {
+                  const xCam = pc[0];
+                  const zCam = pc[2];
+                  const depth = Math.abs(zCam);
+                  trailStoreRef.current.push(key, sid, { x: xCam, y: depth });
+                }
+              }
+              seenNow[key].add(sid);
+            } else {
+              const center = t.center; if (!Array.isArray(center) || center.length < 2) continue;
+              trailStoreRef.current.push(key, sid, { x: center[0]!, y: center[1]! });
+              seenNow[key].add(sid);
+            }
           }
         }
         perKeyTracks[camKey] = track!.active_tracks;
       }
       // Transitions disabled
     }
+
+    prevActiveRef.current = seenNow;
 
     // Occupancy HTML
     let occHtml = '<ul style="margin:0;padding-left:16px">';

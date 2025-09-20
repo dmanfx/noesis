@@ -16,6 +16,7 @@ export const MapPanel: React.FC<{
       return;
     }
     if (canvLiving.current) drawTrails(canvLiving.current, 'living-room', store, colorForTrack);
+    // For kitchen, render trails using their native values and dynamic scaling; canvas size matches 30'x18' aspect
     if (canvKitchen.current) drawTrails(canvKitchen.current, 'kitchen', store, colorForTrack);
     if (canvFamily.current) drawTrails(canvFamily.current, 'family-room', store, colorForTrack);
   });
@@ -24,7 +25,16 @@ export const MapPanel: React.FC<{
     <div className="vstack panel card">
       <div className="card-title">Top‑Down • {cameraLabel(cam)}</div>
       <div className="map-wrap">
-        <canvas className="map" ref={ref} width={420} height={160} />
+        <canvas
+          className="map"
+          ref={ref}
+          width={420}
+          height={
+            cam === 'kitchen' ? 252 :
+            cam === 'family-room' ? 420 :
+            280
+          }
+        />
       </div>
     </div>
   );
@@ -39,4 +49,3 @@ export const MapPanel: React.FC<{
     </div>
   );
 };
-

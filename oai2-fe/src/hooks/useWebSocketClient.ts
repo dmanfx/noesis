@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from 'react';
+import { setCalibration } from '../lib/calibration';
 import { CameraKey, detectCameraKey } from '../lib/camera';
 
 type Track = {
@@ -157,6 +158,8 @@ export function useWebSocketClient(url: string, handlers: FrameHandlers) {
 
           if (data.type === 'stats' && data.payload) {
             handlers.onStats(data.payload as StatsPayload);
+          } else if (data.type === 'calibration-bundle' && data.data) {
+            try { setCalibration(data); } catch {}
           } else if (data.type === 'toggle_update' && data.toggle_name === 'trail_visualization_enabled') {
             handlers.onTrailToggle?.(!!data.enabled);
           } else if (data.type === 'trail_visualization_enabled_update') {

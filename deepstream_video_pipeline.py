@@ -327,6 +327,8 @@ class DeepStreamVideoPipeline:
         # JPEG branch tracking keyed by sensor_id
         # Per-stream branch elements: queue, nvvideoconvert, caps, nvdsosd, nvjpegenc, appsink
         self._stream_branch_elements: Dict[int, List[Gst.Element]] = {}
+        # Negotiated caps per sensor branch for accurate frame dimensions at OSD time
+        self._branch_caps_by_sensor: Dict[int, Tuple[int, int]] = {}
 
         # Precompute and reuse track color cache (track_id -> (r,g,b))
         self._track_color_cache: Dict[int, Tuple[float, float, float]] = {}
@@ -1908,6 +1910,43 @@ class DeepStreamVideoPipeline:
                 if count < 3:
                     self.logger.debug(f"[caps] {stage}: {caps.to_string() if caps else 'None'}")
                     self._caps_probe_counts[stage] = count + 1
+
+                # Extract negotiated width/height and cache per sensor if stage string encodes it
+                try:
+                    sensor_id = None
+                    # Expected stage patterns include: "sensor {id} conv src", "sensor {id} caps src", "sensor {id} nvjpegenc sink"
+                    if isinstance(stage, str) and "sensor" in stage:
+                        parts = stage.split()
+                        for i, p in enumerate(parts):
+                            if p == 'sensor' and i + 1 < len(parts):
+                                try:
+                                    sensor_id = int(parts[i + 1])
+                                except Exception:
+                                    sensor_id = None
+                                break
+                    if sensor_id is not None and caps and caps.get_size() > 0:
+                        s = caps.get_structure(0)
+                        w = None
+                        h = None
+                        try:
+                            ok, wi = s.get_int('width')  # type: ignore
+                            if ok:
+                                w = int(wi)
+                            ok, hi = s.get_int('height')  # type: ignore
+                            if ok:
+                                h = int(hi)
+                        except Exception:
+                            # Fallback parse from string
+                            cs = caps.to_string()
+                            import re as _re
+                            mw = _re.search(r"width=(\d+)", cs)
+                            mh = _re.search(r"height=(\d+)", cs)
+                            if mw: w = int(mw.group(1))
+                            if mh: h = int(mh.group(1))
+                        if w and h:
+                            self._branch_caps_by_sensor[int(sensor_id)] = (int(w), int(h))
+                except Exception:
+                    pass
         except Exception as e:
             # Do not disrupt pipeline on probe errors
             self.logger.debug(f"caps probe error at {stage}: {e}")
@@ -2667,12 +2706,30 @@ class DeepStreamVideoPipeline:
                             new_left = cx - new_w * 0.5
                             new_top = by - new_h
 
-                        # Clamp to frame bounds
+                        # Clamp to frame bounds using the ACTUAL surface dims at this stage
+                        # Using source_frame_width/height can be wrong for muxed streams.
                         try:
-                            fw = float(frame_meta.source_frame_width)
-                            fh = float(frame_meta.source_frame_height)
-                            new_left = max(0.0, min(new_left, fw - new_w))
-                            new_top = max(0.0, min(new_top, fh - new_h))
+                            # Prefer negotiated caps for this branch (actual frame dims at OSD)
+                            fw = fh = 0.0
+                            try:
+                                dims = self._branch_caps_by_sensor.get(int(sensor_id))
+                                if dims:
+                                    fw, fh = float(dims[0]), float(dims[1])
+                            except Exception:
+                                pass
+                            if not fw or not fh:
+                                try:
+                                    # Fallback to NvBufSurface queried from the current GstBuffer
+                                    surf = pyds.get_nvds_buf_surface(hash(gst_buffer), frame_meta.batch_id)  # type: ignore
+                                    sl = surf.surfaceList[frame_meta.batch_id]
+                                    fw = float(getattr(sl, 'width', 0) or 0)
+                                    fh = float(getattr(sl, 'height', 0) or 0)
+                                except Exception:
+                                    fw = float(frame_meta.source_frame_width)
+                                    fh = float(frame_meta.source_frame_height)
+                            if fw > 0 and fh > 0:
+                                new_left = max(0.0, min(new_left, fw - new_w))
+                                new_top = max(0.0, min(new_top, fh - new_h))
                         except Exception:
                             pass
 
@@ -2727,6 +2784,34 @@ class DeepStreamVideoPipeline:
                             _m.pop(int(tid), None)
                     except Exception:
                         pass
+
+            # Draw exclusion ROI polygons for this stream (plugin OSD disabled for exclude)
+            try:
+                ds_index = int(frame_meta.source_id)
+                rois = self._exclusion_rois_by_stream.get(ds_index, {})
+                if rois:
+                    roi_meta = pyds.nvds_acquire_display_meta_from_pool(batch_meta)
+                    if roi_meta:
+                        # Draw each polygon as connected line segments
+                        max_lines = len(roi_meta.line_params)
+                        for poly in rois.values():
+                            if len(poly) < 2:
+                                continue
+                            for i in range(len(poly)):
+                                if roi_meta.num_lines >= min(250, max_lines):
+                                    break
+                                x1, y1 = poly[i]
+                                x2, y2 = poly[(i + 1) % len(poly)]  # close polygon
+                                lp = roi_meta.line_params[roi_meta.num_lines]
+                                lp.line_width = 2
+                                lp.x1, lp.y1, lp.x2, lp.y2 = map(int, (x1, y1, x2, y2))
+                                # Red with strong alpha to stand out
+                                lp.line_color.set(1.0, 0.15, 0.15, 0.95)
+                                roi_meta.num_lines += 1
+                        pyds.nvds_add_display_meta_to_frame(frame_meta, roi_meta)
+            except Exception:
+                # Never break rendering on ROI overlay issues
+                pass
 
             display_meta = pyds.nvds_acquire_display_meta_from_pool(batch_meta)
             if not display_meta:

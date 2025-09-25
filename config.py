@@ -61,6 +61,7 @@ class AppConfig:
             {
                 "name": "Family Room Camera",
                 "url": "rtsp://192.168.3.214:7447/4qWTBhW6b4nLeUFE?",
+                # Correct resolution
                 "width": 1280,
                 "height": 720,
                 "enabled": True

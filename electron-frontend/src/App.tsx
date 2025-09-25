@@ -84,6 +84,18 @@ const Dashboard: React.FC = () => {
   const trailHistRef = useRef<Record<string, Record<number, { x: number; y: number }[]>>>({});
   // Keep trails decently long (avoid over-trimming)
   const MAX_TRAIL_POINTS = 300;
+  // Track last time each camera (zone) had any detections
+  const lastDetectionRef = useRef<Record<string, number>>({
+    'kitchen': 0,
+    'living-room': 0,
+    'family-room': 0,
+  });
+  // Ensure we only clear once per inactivity period
+  const trailsClearedRef = useRef<Record<string, boolean>>({
+    'kitchen': false,
+    'living-room': false,
+    'family-room': false,
+  });
 
   const camToCanvasId = (cam: string) =>
     cam.includes('kitchen') ? 'map-kitchen' :
@@ -101,6 +113,16 @@ const Dashboard: React.FC = () => {
       const ctx = c?.getContext('2d');
       if (c && ctx) ctx.clearRect(0, 0, c.width, c.height);
     });
+  };
+
+  const clearMap = (cameraId: string) => {
+    const canvasId = camToCanvasId(cameraId);
+    if (!canvasId) return;
+    const c = document.getElementById(canvasId) as HTMLCanvasElement | null;
+    const ctx = c?.getContext('2d');
+    if (c && ctx) ctx.clearRect(0, 0, c.width, c.height);
+    // Drop stored trails for this camera to actually clear history
+    if (trailHistRef.current[cameraId]) delete trailHistRef.current[cameraId];
   };
 
   const updateTrailsAndDraw = (cameraId: string, activeTracks: any[]) => {
@@ -528,6 +550,11 @@ const Dashboard: React.FC = () => {
         for (const cameraId in payload.cameras) {
           const tracking = payload.cameras[cameraId]?.tracking;
           if (tracking && Array.isArray(tracking.active_tracks)) {
+            // Update last detection time if there are active tracks
+            if (tracking.active_tracks.length > 0) {
+              lastDetectionRef.current[cameraId] = Date.now();
+              trailsClearedRef.current[cameraId as 'kitchen' | 'living-room' | 'family-room'] = false;
+            }
             updateTrailsAndDraw(cameraId, tracking.active_tracks);
           }
         }
@@ -558,6 +585,28 @@ const Dashboard: React.FC = () => {
       socketRef.current.send(JSON.stringify(message));
     }
   };
+
+  // Inactivity-based clearing of top-down trails per camera/zone.
+  useEffect(() => {
+    const INTERVAL_MS = 30_000; // check every 30s
+    const INACTIVITY_MS = 5 * 60_000; // 5 minutes
+
+    const cams = ['kitchen', 'living-room', 'family-room'];
+    const timer = setInterval(() => {
+      if (!trailVisualizationEnabled) return;
+      const now = Date.now();
+      for (const cam of cams) {
+        const last = lastDetectionRef.current[cam] || 0;
+        const alreadyCleared = trailsClearedRef.current[cam];
+        if (last > 0 && now - last >= INACTIVITY_MS && !alreadyCleared) {
+          clearMap(cam);
+          trailsClearedRef.current[cam] = true; // avoid repeated clears until activity resumes
+        }
+      }
+    }, INTERVAL_MS);
+
+    return () => clearInterval(timer);
+  }, [trailVisualizationEnabled]);
 
   const connectWebSocket = () => {
     console.log(`Attempting to connect to ${WS_URL}...`);
@@ -600,6 +649,11 @@ const Dashboard: React.FC = () => {
         'living-room': [],
         'family-room': []
       });
+
+      // Reset last detection timers and clear maps on disconnect
+      lastDetectionRef.current = { 'kitchen': 0, 'living-room': 0, 'family-room': 0 };
+      trailsClearedRef.current = { 'kitchen': false, 'living-room': false, 'family-room': false };
+      clearAllMaps();
 
       resetFPSTracking();
       

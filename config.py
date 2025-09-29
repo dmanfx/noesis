@@ -21,6 +21,7 @@ import time
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Dict, List, Optional, Any
+import configparser  # Add if not present
 
 
 @dataclass
@@ -33,7 +34,7 @@ class AppConfig:
         APP_NAME: str = "YOLO Video Tracking"
         VERSION: str = "1.0.0"
         START_TIME: float = field(default_factory=time.time)
-        LOG_LEVEL: int = 30  # INFO level for development
+        LOG_LEVEL: int = 20  # INFO
         LOG_FILE: Optional[str] = "logs/app.log"
         DEBUG: bool = False  # Disable debug mode for performance
     
@@ -432,6 +433,23 @@ class AppConfig:
             'kitchen': 'unifi_protect_g3_instant',
             'family-room': 'unifi_protect_g4_instant',
         })
+        CAMERA_SPECS: Dict[str, Dict[str, Any]] = field(default_factory=lambda: {
+            'living-room': {
+                'resolution': [1920, 1080],
+                'hfov_deg': 103.0,
+                'vfov_deg': 55.0,
+            },
+            'kitchen': {
+                'resolution': [1920, 1080],
+                'hfov_deg': 103.0,
+                'vfov_deg': 55.0,
+            },
+            'family-room': {
+                'resolution': [1280, 720],
+                'hfov_deg': 106.0,
+                'vfov_deg': 58.0,
+            },
+        })
         ENABLE_MDE: bool = False
         MDE_MAX_FPS: float = 1.0
         DEPTH_SCALE_PER_CAMERA: Dict[str, float] = field(default_factory=dict)
@@ -472,7 +490,7 @@ config = AppConfig()
 # Apply environment-based configuration overrides
 if os.getenv("DEBUG", "0") == "1":
     config.app.DEBUG = True
-    config.app.LOG_LEVEL = 10 # DEBUG
+    config.app.LOG_LEVEL = 20 # INFO
 
 # Resolve paths relative to the script location
 script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -644,3 +662,14 @@ def save_config_to_file(config: AppConfig, config_file: str) -> bool:
 # The system now uses DeepStream-only architecture
 # These functions were part of a transitional unified pipeline concept
 # that has been superseded by the DeepStream implementation
+
+def load_ma_config(path='config/mapanything.ini') -> dict:
+    """Load MapAnything configuration from INI file."""
+    config = configparser.ConfigParser()
+    try:
+        config.read(path)
+        ma_config = {section: dict(config.items(section)) for section in config.sections()}
+        return ma_config
+    except (configparser.Error, FileNotFoundError):
+        print(f"Warning: Could not load {path}; returning empty config.")
+        return {}

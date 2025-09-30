@@ -4,15 +4,19 @@ This guide documents how the Noesis pipeline integrates with external systems, u
 
 ## Scope
 
-- What we built: Occupancy state per ROI/zone published to MQTT (for automations) and InfluxDB (for history/analytics), consumed by HomeSeer via mcsMQTT.
+- What we built: Occupancy state per ROI/zone and MapAnything depth summaries published to MQTT/Influx (HOME automations + diagnostics dashboards).
 - Where it lives: Publisher in Python with config in `config.py`, wired into the DeepStream processor at runtime.
 - How to extend: Follow the same publisher pattern to add new topics/measurements or new sinks.
 
 ## Architecture
 
-- Data source: DeepStream probe computes per-frame analytics (occupancy counts, transitions, tracks) inside `deepstream_video_pipeline.py`.
-- Publisher: `occupancy_publisher.py` handles MQTT retained topics and Influx write-on-change, with background heartbeats for retained MQTT refresh.
-- Wiring: `main.py` builds `OccupancyConfig` from `config.integrations`, constructs `OccupancyPublisher`, and attaches it to the processor. The probe calls `publish_state()` when counts change or vacate.
+- Data sources:
+  - DeepStream probe computes per-frame analytics (occupancy counts, transitions, tracks) inside `deepstream_video_pipeline.py`.
+  - MapAnything scheduler produces depth summaries via `geometry.depth_source`.
+- Publishers:
+  - `occupancy_publisher.py` handles MQTT retained topics and Influx write-on-change for occupancy.
+  - `geometry.depth_publisher.DepthDiagnosticsPublisher` emits depth summaries and scale metrics.
+- Wiring: `main.py` builds the publishers from `config.integrations`, attaches them to the processor, and the respective probes call `publish_state()` / `publish_depth_summary()` when state changes.
 - Isolation: Publishing errors never impact the real-time pipeline; all calls are wrapped in try/except and async where applicable.
 
 ## Program Changes (Noesis)
@@ -23,18 +27,20 @@ This guide documents how the Noesis pipeline integrates with external systems, u
   - MQTT: `BASE_TOPIC`, `STATUS_TOPIC`, `MQTT_HOST`, `MQTT_PORT`, `MQTT_USERNAME`, `MQTT_PASSWORD`, `MQTT_QOS`, `MQTT_RETAIN`
   - Influx: `INFLUX_URL`, `INFLUX_ORG`, `INFLUX_TOKEN`, `INFLUX_BUCKET_RAW`
 
-2) Publisher component
-- File: `occupancy_publisher.py:76`
-- Behavior:
+2) Publisher components
+- `occupancy_publisher.py:76`: Handles occupancy MQTT + Influx.
   - On change → publish retained MQTT scalars + JSON envelope, write an Influx point with nanosecond precision.
   - On heartbeat → republish retained MQTT only (no Influx) to keep state visible to late subscribers.
   - Slugifies ROI names to stable `<room>` ids for topics/tags.
   - Deduplicates by `(occupied,count)` to avoid redundant writes.
   - Gracefully tolerates missing libs (paho-mqtt/influxdb-client) and connection issues.
+- `geometry/depth_publisher.py`: Handles MapAnything depth summaries.
+  - Publishes `{median,p10,p90,conf_mean,valid_ratio,sample_count}` to MQTT topic `noesis/geometry/<room>/<cam>/depth_summary`.
+  - Writes depth, scale, and pose metrics to Influx measurements `mde.depth.summary` and `mde.scale`.
 
 3) Wiring into runtime
-- File: `main.py:418`
-- Builds `OccupancyConfig` from `config.integrations` and attaches the created `OccupancyPublisher` to the running DeepStream processor (`self.multi_stream_processor.occupancy_publisher = pub`).
+- File: `main.py`
+- Builds `OccupancyConfig` and `DepthDiagnosticsPublisher` from `config.integrations`, then attaches them to the running processor so both occupancy and depth flows share the same MQTT/Influx credentials.
 
 4) Emission site in pipeline
 - File: `deepstream_video_pipeline.py:993`
@@ -118,8 +124,8 @@ This guide documents how the Noesis pipeline integrates with external systems, u
 - System/process stats: `main.py` (e.g., uptime, app metrics) or a dedicated metrics loop.
 - Web telemetry: follow `docs/reference/Telemetry_Schema.md` if you surface data to the front-end.
 
-5) Verify and observe
 - CLI tools: `mosquitto_sub`, `influx query`.
+- Depth summaries: subscribe to `noesis/geometry/#` to verify MapAnything statistics.
 - Logs: check for connection errors or missing libraries.
 
 ## Pattern: Adding More Occupancy/Analytics Fields

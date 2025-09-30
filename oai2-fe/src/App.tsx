@@ -11,6 +11,7 @@ import { cameraOrder, colorForTrack } from './lib/camera';
 import { getExtrinsics, worldToCamera } from './lib/calibration';
 import { detectCameraKey, CameraKey } from './lib/camera';
 import { useWebSocketClient, StatsPayload } from './hooks/useWebSocketClient';
+import DepthDrawer, { DepthDiagnosticsEntry, DepthDrawerEntry } from './components/DepthDrawer';
 
 const WS_URL = 'ws://localhost:6008';
 
@@ -69,6 +70,9 @@ function Dashboard() {
   const usingWorldFamilyRef = useRef<boolean>(false);
 
   const [telemetryOpen, setTelemetryOpen] = useState(false);
+  const [depthDrawerOpen, setDepthDrawerOpen] = useState(false);
+  const [maDiagnostics, setMaDiagnostics] = useState<Record<string, DepthDiagnosticsEntry>>({});
+  const [maDepthData, setMaDepthData] = useState<Record<string, DepthDrawerEntry>>({});
   // Auto-primary selection state
   const [primaryKey, setPrimaryKey] = useState<CameraKey>(cameraOrder[0]);
   const [locked, setLocked] = useState<boolean>(false);
@@ -299,10 +303,48 @@ function Dashboard() {
     computeFps(cam);
   };
 
-  const { status, sendClearStats, sendTrailToggle, sendDetectionConfig, sendDetectionToggle } = useWebSocketClient(WS_URL, {
+  const handleMADiagnostics = (payload: any) => {
+    const camId = payload?.cam_id || payload?.cameraId;
+    if (!camId) return;
+    setMaDiagnostics(prev => ({
+      ...prev,
+      [camId]: {
+        summary: payload.summary || {},
+        ts: payload.ts || Date.now()
+      }
+    }));
+  };
+
+  const handleMADepth = (payload: any) => {
+    const camId = payload?.cam_id || payload?.cameraId;
+    if (!camId || payload?.ok === false) return;
+    const shape = payload?.shape || payload?.depth_shape;
+    if (!Array.isArray(shape) || shape.length !== 2) return;
+    let depthB64 = payload.depth_b64 || payload.depth_z_b64;
+    if (!depthB64) return;
+    const confB64 = payload.conf_b64 || payload.conf;
+    let maskB64 = payload.mask_b64 || payload.mask;
+    if (Array.isArray(maskB64)) {
+      const maskArr = Uint8Array.from(maskB64.map((v: any) => (v ? 1 : 0)));
+      maskB64 = btoa(String.fromCharCode(...maskArr));
+    }
+    const entry: DepthDrawerEntry = {
+      ts: payload.ts || Date.now(),
+      depth_b64: depthB64,
+      conf_b64: confB64,
+      mask_b64: maskB64,
+      shape: [Number(shape[0]) || 0, Number(shape[1]) || 0]
+    };
+    if (!entry.shape[0] || !entry.shape[1]) return;
+    setMaDepthData(prev => ({ ...prev, [camId]: entry }));
+  };
+
+  const { status, sendClearStats, sendTrailToggle, sendDetectionConfig, sendDetectionToggle, requestMapAnythingDepth } = useWebSocketClient(WS_URL, {
     onImage,
     onStats,
-    onTrailToggle: (en) => setTrailEnabled(en)
+    onTrailToggle: (en) => setTrailEnabled(en),
+    onMADiagnostics: handleMADiagnostics,
+    onMADepth: handleMADepth
   });
   
   // Live EST/EDT clock for top bar
@@ -403,6 +445,7 @@ function Dashboard() {
         {timeChip}
         {connectionChip}
         <button className="btn ghost" onClick={() => setTelemetryOpen(v => !v)}>Telemetry</button>
+        <button className="btn ghost" onClick={() => setDepthDrawerOpen(v => !v)}>Depth</button>
       </header>
       <main className="main">
         <section className="streams">
@@ -486,6 +529,14 @@ function Dashboard() {
         </div>,
         document.body
       ) : null}
+
+      <DepthDrawer
+        open={depthDrawerOpen}
+        onClose={() => setDepthDrawerOpen(false)}
+        diagnostics={maDiagnostics}
+        depthData={maDepthData}
+        onRequestDepth={(camId) => requestMapAnythingDepth(camId)}
+      />
 
       {telemetryOpen && <TelemetryPanel onClose={() => setTelemetryOpen(false)} />}
     </div>

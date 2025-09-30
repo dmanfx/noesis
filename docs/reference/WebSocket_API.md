@@ -75,6 +75,8 @@ This document describes the WebSocket server behavior and message schemas used b
   - Detection config update: `{ "type":"detection_config_update", "config": { ... } }`
   - Detection toggle update: `{ "type":"detection_toggle_update", "toggle_name": string, "enabled": bool }`
   - Visualization toggle update: `{ "type":"toggle_update", "toggle_name": string, "enabled": bool }`
+  - MapAnything diagnostics: `{ "type": "ma_diagnostics", "cam_id": string, "summary": { "median": number, "p10": number, "p90": number, "conf_mean": number, "valid_ratio": number, "sample_count": number, "method"?: "mde"|"floor" }, "ts": int }`
+  - MapAnything depth payload: `{ "type": "ma_depth_response", "ok": boolean, "cam_id": string, "ts": int, "depth_b64"?: string, "conf_b64"?: string, "mask_b64"?: string, "shape": [height, width], "error"?: string }`
 
 ## Messages (Client → Server)
 
@@ -90,10 +92,14 @@ This document describes the WebSocket server behavior and message schemas used b
 - Set detection toggle (class groups)
   - `{ "type": "set_detection_toggle", "toggle_name": "detect_people"|"detect_vehicles"|"detect_furniture", "enabled": bool }`
 
+- Fetch MapAnything depth snapshot
+  - `{ "type": "get_ma_depth", "camId": string, "ts_max"?: int }`
+  - Response: `ma_depth_response`
+
 - Spatial calibration
   - Pixel to world
-    - Request: `{ "type": "pixel_to_world", "reqId": string, "camId": string, "u": number, "v": number }`
-    - Response: `{ "type": "pixel_to_world_result", "reqId": string, "ok": boolean, "world"?: [x,y,z], "error"?: string }`
+    - Request: `{ "type": "pixel_to_world", "request_id": string, "camId": string, "u": number, "v": number, "depth"?: number }`
+    - Response: `{ "type": "pixel_to_world_response", "request_id": string, "ok": boolean, "world"?: {"x": number, "y": number, "z": number}, "method"?: "mde"|"floor", "conf"?: number, "depth"?: number, "error"?: string }`
   - Set extrinsics
     - Request: `{ "type": "set_extrinsics", "cameraId": string, "E"?: float[16], "Twc"?: float[16] }` (column‑major)
     - Response: `{ "type": "set_extrinsics_result", "ok": boolean, "error"?: string }`

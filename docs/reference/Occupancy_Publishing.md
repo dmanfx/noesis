@@ -1,12 +1,13 @@
 # Occupancy Publishing (MQTT + InfluxDB + HomeSeer)
 
-This document describes how Noesis publishes room/zone occupancy to MQTT and InfluxDB, and how it connects to HomeSeer automations.
+This document describes how Noesis publishes room/zone occupancy and MapAnything depth summaries to MQTT and InfluxDB, and how those feeds connect to downstream automations and dashboards.
 
 ## Overview
 
 - Publishes retained MQTT topics per room/zone for automation.
-- Writes occupancy state changes to InfluxDB for history/analytics.
-- Heartbeat periodically refreshes retained MQTT topics without writing to Influx.
+- Publishes MapAnything depth summaries for diagnostics dashboards.
+- Writes occupancy and depth metrics to InfluxDB for history/analytics.
+- Heartbeat periodically refreshes retained topics without writing to Influx.
 
 Dependencies
 - Python: `paho-mqtt`, `influxdb-client` (see `requirements.txt`)
@@ -20,24 +21,32 @@ Dependencies
 
 ## MQTT Topics
 
-- Base: `noesis/occupancy/<room>` where `<room>` is a stable slug of the ROI/zone name.
-- Scalars (retained, QoS 1):
-  - `noesis/occupancy/<room>/occupied` → "0" or "1"
-  - `noesis/occupancy/<room>/count` → "0..N"
-- Envelope (retained, QoS 1):
-  - `noesis/occupancy/<room>` → JSON `{ ts: ISO8601, occupied: bool, count: int }`
+- Occupancy base: `noesis/occupancy/<room>` where `<room>` is a stable slug of the ROI/zone name.
+  - Scalars (retained, QoS 1):
+    - `noesis/occupancy/<room>/occupied` → "0" or "1"
+    - `noesis/occupancy/<room>/count` → "0..N"
+  - Envelope (retained, QoS 1): `{ ts: ISO8601, occupied: bool, count: int }`
+- Depth summaries: `noesis/geometry/<room>/<camera>/depth_summary` → `{ ts_us, median, p10, p90, conf_mean, valid_ratio, sample_count }`
 - Status: `noesis/status` → "online"/"offline" (retained) via MQTT LWT.
 
 Notes
-- Retained messages ensure HomeSeer and other subscribers see the latest state on connect.
+- Retained messages ensure subscribers see the latest state on connect.
 - Heartbeat republishes retained MQTT values on an interval; no Influx writes on heartbeat.
 
 ## InfluxDB Series
 
-- Measurement: `occupancy`
-- Tags: `room_id=<room>`
-- Fields: `occupied` (int 0/1), `count` (int)
-- Precision: nanoseconds
+- `occupancy` measurement
+  - Tags: `room_id=<room>`
+  - Fields: `occupied` (int 0/1), `count` (int)
+  - Precision: nanoseconds
+- `mde.depth.summary` measurement
+  - Tags: `camera`, `room`
+  - Fields: `median`, `p10`, `p90`, `conf_mean`, `valid_ratio`, `sample_count`
+  - Precision: microseconds
+- `mde.scale` measurement
+  - Tags: `camera`, `room`
+  - Fields: `scale`, `pose_error`
+  - Precision: nanoseconds
 - Bucket: `integrations.INFLUX_BUCKET_RAW` (default `noesis_raw`)
 - Writes occur only on changes to reduce volume.
 
@@ -64,7 +73,7 @@ Notes
 
 ## Verification
 
-- MQTT: `mosquitto_sub -h <host> -t 'noesis/occupancy/#' -u <user> -P <pass> -v`
+- MQTT: `mosquitto_sub -h <host> -t 'noesis/#' -u <user> -P <pass> -v`
 - Influx (example):
   - `from(bucket:"noesis_raw") |> range(start:-15m) |> filter(fn:(r)=> r._measurement=="occupancy") |> last()`
 

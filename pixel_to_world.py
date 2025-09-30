@@ -3,6 +3,13 @@ import numpy as np
 
 
 def K_from_intrinsics(intr: Dict[str, Any]) -> Optional[np.ndarray]:
+    if isinstance(intr, (list, tuple)) and len(intr) >= 4:
+        try:
+            fx = float(intr[0]); fy = float(intr[1])
+            cx = float(intr[2]); cy = float(intr[3])
+            return np.array([[fx, 0.0, cx], [0.0, fy, cy], [0.0, 0.0, 1.0]], dtype=float)
+        except Exception:
+            return None
     if not isinstance(intr, dict):
         return None
     if 'K3x3' in intr and isinstance(intr['K3x3'], list):
@@ -79,4 +86,3 @@ def bbox_bottom_center(bbox_ltw_h: list) -> Optional[Tuple[float, float]]:
         return cx, yb
     except Exception:
         return None
-

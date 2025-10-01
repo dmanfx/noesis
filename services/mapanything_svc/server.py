@@ -6,6 +6,7 @@ import base64
 import hashlib
 import logging
 import os
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -278,6 +279,12 @@ class ServiceState:
     async def _process_mono_request(self, request: MonoRequest) -> MonoResponse:
         model = await self.ensure_model_loaded()
         np_view, intrinsics = _decode_view(request.view)
+        if intrinsics is None:
+            h, w = np_view.shape[:2]
+            fx = fy = float(max(w, h))
+            cx = float(w) / 2.0
+            cy = float(h) / 2.0
+            intrinsics = np.array([[fx, 0.0, cx], [0.0, fy, cy], [0.0, 0.0, 1.0]], dtype=np.float32)
         prepared_inputs = preprocess_inputs(  # type: ignore[operator]
             [
                 {
@@ -333,6 +340,12 @@ class ServiceState:
         cam_order: List[str] = []
         for view in request.views:
             np_view, intrinsics = _decode_view(view)
+            if intrinsics is None:
+                h, w = np_view.shape[:2]
+                fx = fy = float(max(w, h))
+                cx = float(w) / 2.0
+                cy = float(h) / 2.0
+                intrinsics = np.array([[fx, 0.0, cx], [0.0, fy, cy], [0.0, 0.0, 1.0]], dtype=np.float32)
             prepared_entries.append({"img": np_view, "intrinsics": intrinsics})
             cam_order.append(view.cam_id)
         prepared_inputs = preprocess_inputs(  # type: ignore[operator]
@@ -535,6 +548,32 @@ config = load_service_config()
 logger = _create_logger()
 state = ServiceState(config=config, logger=logger)
 app = FastAPI(title="MapAnything Service", version="1.0.0")
+
+
+class _AccessLogOnceFilter(logging.Filter):
+    """Filter that allows a matching access log entry only the first time."""
+
+    def __init__(self, needle: str) -> None:
+        super().__init__()
+        self._needle = needle
+        self._seen = False
+        self._lock = threading.Lock()
+
+    def filter(self, record: logging.LogRecord) -> bool:  # pragma: no cover - logging behavior
+        try:
+            message = record.getMessage()
+        except Exception:
+            return True
+        if self._needle not in message:
+            return True
+        with self._lock:
+            if self._seen:
+                return False
+            self._seen = True
+            return True
+
+
+logging.getLogger("uvicorn.access").addFilter(_AccessLogOnceFilter("POST /infer_mono"))
 
 
 async def verify_api_key(x_api_key: Optional[str] = Header(None)) -> None:

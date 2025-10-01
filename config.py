@@ -53,8 +53,8 @@ class AppConfig:
             },
             {
                 "name": "Kitchen Camera", 
-                #"url": "rtsp://192.168.3.214:7447/qt3VqVdZpgG1B4Vk?",
-                "url": "udp://127.0.0.1:8554", # use with: sudo ffmpeg -re -stream_loop -1 -i /home/mayor/Downloads/kitchenclip.mp4 -c copy -f mpegts udp://0.0.0.0:8554
+                "url": "rtsp://192.168.3.214:7447/qt3VqVdZpgG1B4Vk?",
+                #"url": "udp://127.0.0.1:8554", # use with: sudo ffmpeg -re -stream_loop -1 -i /home/mayor/Downloads/kitchenclip.mp4 -c copy -f mpegts udp://0.0.0.0:8554
                 "width": 1920,
                 "height": 1080,
                 "enabled": True
@@ -418,7 +418,7 @@ class AppConfig:
         HOST: str = "0.0.0.0"  # Listen on all network interfaces
         PORT: int = 6008
         MAX_CLIENTS: int = 10
-        JPEG_QUALITY: int = 70  # JPEG quality for frame compression (0-100)
+        JPEG_QUALITY: int = 85  # JPEG quality for frame compression (0-100)
         MAX_FPS: int = 20  # Maximum FPS for WebSocket streaming
 
     @dataclass
@@ -450,8 +450,8 @@ class AppConfig:
                 'vfov_deg': 58.0,
             },
         })
-        ENABLE_MDE: bool = False
-        MDE_MAX_FPS: float = 1.0
+        ENABLE_MDE: bool = True
+        MDE_MAX_FPS: float = 2.0
         DEPTH_SCALE_PER_CAMERA: Dict[str, float] = field(default_factory=dict)
     
     # Initialize all configuration sections with default values

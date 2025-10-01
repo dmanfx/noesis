@@ -300,6 +300,16 @@ class ApplicationManager:
                     self.websocket_server.set_align_handler = self._set_align_rpc
                     if self.depth_source:
                         self.websocket_server.ma_depth_provider = lambda cam, ts_max=None: self.depth_source.load_latest_depth(cam, ts_max)
+                        self.websocket_server.floorplan_provider = (
+                            lambda cams=None, max_age=60.0, grid_res=0.5, max_extent=20.0, use_height=False:
+                                self.depth_source.generate_topdown_floorplan(
+                                    list(cams) if cams else [],
+                                    max_age_sec=max_age,
+                                    grid_res_m=grid_res,
+                                    max_extent_m=max_extent,
+                                    use_height=use_height,
+                                )
+                        )
             except Exception as e:
                 self.logger.warning(f"Calibration init failed: {e}")
 
@@ -412,6 +422,7 @@ class ApplicationManager:
                     # Avoid starting duplicate JPEG processing loop
                     if not hasattr(self, 'jpeg_thread') or not getattr(self, 'jpeg_thread').is_alive():
                         self._start_jpeg_processing_loop()
+                        self._start_mapanything_scheduler()
             except Exception as e:
                 self.logger.warning(f"Unable to attach WebSocket server to processor: {e}")
 
@@ -744,6 +755,98 @@ class ApplicationManager:
             import traceback
             traceback.print_exc()
 
+    def _start_mapanything_scheduler(self):
+        """Background loop to drive MapAnything mono inference from latest JPEGs."""
+        if not self.multi_stream_processor:
+            self.logger.warning("MapAnything scheduler not started (no multi-stream processor)")
+            return
+
+        self.logger.info("Starting MapAnything mono scheduler loop")
+
+        def loop():
+            last_pub = self._last_depth_publish
+            try:
+                mono_interval = getattr(self.depth_source, 'mono_interval', 0.5)
+            except Exception:
+                mono_interval = 0.5
+
+            while self.running and not self.stop_event.is_set():
+                try:
+                    # Snapshot source_info each tick to tolerate dynamic sources
+                    source_info = getattr(self.multi_stream_processor, 'source_info', {}) or {}
+                    now = time.time()
+                    for source_id, info in source_info.items():
+                        cam_id = str(info.get('clean_name') or info.get('name') or source_id)
+                        # Respect per-camera rate gating
+                        try:
+                            if not self.depth_source.should_infer(cam_id, now):
+                                continue
+                        except Exception:
+                            continue
+
+                        ok, jpeg_bytes = self.multi_stream_processor.read_encoded_jpeg(source_id, timeout=0.05)
+                        if not ok or not jpeg_bytes:
+                            continue
+
+                        # Decode JPEG -> BGR
+                        try:
+                            arr = np.frombuffer(jpeg_bytes, dtype=np.uint8)
+                            frame_bgr = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+                            if frame_bgr is None:
+                                continue
+                        except Exception:
+                            continue
+
+                        # Run mono inference
+                        try:
+                            result = self.depth_source.maybe_infer_mono(cam_id, frame_bgr, self.calibration_bundle, now)
+                        except Exception as e:
+                            self.logger.debug(f"MDE mono error for {cam_id}: {e}")
+                            result = None
+                        if result is None:
+                            continue
+
+                        # Cache latest result and summary
+                        self._latest_depth_results[cam_id] = result
+                        self._last_depth_summary[cam_id] = result.summary
+
+                        # Throttle diagnostics to ~5s per camera
+                        if (now - last_pub.get(cam_id, 0.0)) >= 5.0:
+                            last_pub[cam_id] = now
+                            room_id = self._camera_room_map.get(cam_id, cam_id)
+                            if self._depth_publisher:
+                                try:
+                                    self._depth_publisher.publish_depth_summary(result, room_id)
+                                except Exception as e:
+                                    self.logger.debug(f"Depth publisher error: {e}")
+
+                            summary_message = {
+                                'type': 'ma_diagnostics',
+                                'cam_id': cam_id,
+                                'summary': {
+                                    'median': result.summary.median,
+                                    'p10': result.summary.p10,
+                                    'p90': result.summary.p90,
+                                    'conf_mean': result.summary.conf_mean,
+                                    'valid_ratio': result.summary.valid_ratio,
+                                    'sample_count': result.summary.sample_count,
+                                    'method': 'mde' if result.summary.conf_mean >= getattr(self.depth_source, 'min_conf', 0.5) else 'floor'
+                                },
+                                'ts': result.ts_us
+                            }
+                            self._schedule_ws_broadcast(summary_message)
+                except Exception as e:
+                    self.logger.debug(f"MDE scheduler tick error: {e}")
+                finally:
+                    try:
+                        time.sleep(max(0.05, mono_interval * 0.5))
+                    except Exception:
+                        time.sleep(0.1)
+
+        t = threading.Thread(target=loop, name="MapAnythingScheduler", daemon=True)
+        t.start()
+        self.logger.info("✅ MapAnything mono scheduler loop started")
+
     def _start_jpeg_processing_loop(self):
         """Start JPEG processing loop for native DeepStream OSD mode"""
         self.logger.info("Starting JPEG processing loop for native DeepStream OSD")
@@ -955,6 +1058,11 @@ class ApplicationManager:
         self._calib_paths = {'intrinsics': intr_path, 'alignment': align_path, 'extrinsics': extr_path}
         camera_keys = sorted(list((self.calibration_bundle.get('cameras') or {}).get('K', {}).keys()))
         self.logger.info(f"Calibration ready for cameras (K): {camera_keys}")
+        if self.depth_source is not None:
+            try:
+                self.depth_source.calibration_bundle = self.calibration_bundle
+            except Exception:
+                pass
 
     def _get_calibration_bundle(self) -> dict:
         return self.calibration_bundle or {}
@@ -1114,6 +1222,11 @@ class ApplicationManager:
             align,
             camera_specs
         )
+        if self.depth_source is not None:
+            try:
+                self.depth_source.calibration_bundle = self.calibration_bundle
+            except Exception:
+                pass
         # Broadcast updated bundle
         try:
             if self.websocket_server:
@@ -1165,6 +1278,11 @@ class ApplicationManager:
                 align,
                 camera_specs
             )
+            if self.depth_source is not None:
+                try:
+                    self.depth_source.calibration_bundle = self.calibration_bundle
+                except Exception:
+                    pass
             
             # Re-broadcast to all clients
             try:

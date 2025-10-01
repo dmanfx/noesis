@@ -4,12 +4,14 @@ from __future__ import annotations
 import base64
 import json
 import logging
+import shutil
 import threading
 import time
+from collections import deque
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, Mapping, Optional, Tuple
+from typing import Any, Deque, Dict, List, Mapping, Optional, Tuple
 
 import cv2
 import numpy as np
@@ -46,12 +48,191 @@ class DepthResult:
 
 
 class DepthStorageManager:
-    """Persist depth outputs to Zarr for later consumption."""
+    """Persist depth outputs to Zarr for later consumption with retention enforcement."""
 
-    def __init__(self, base_path: Path) -> None:
+    def __init__(
+        self,
+        base_path: Path,
+        max_snapshots_per_camera: int,
+        retention_minutes: float,
+        max_total_bytes: Optional[int] = None,
+    ) -> None:
         self.base_path = base_path
         self.base_path.mkdir(parents=True, exist_ok=True)
         self._locks: Dict[str, threading.Lock] = {}
+        self._indices: Dict[str, Deque[Tuple[int, Path]]] = {}
+        self._logger = logging.getLogger(__name__)
+        self._max_snapshots = max(max_snapshots_per_camera, 0)
+        self._retention_us = max(0, int(retention_minutes * 60.0 * 1_000_000))
+        self._max_total_bytes = max_total_bytes if (max_total_bytes is not None and max_total_bytes > 0) else None
+        if self._max_total_bytes is not None and self._max_total_bytes < 10 * 1024 * 1024:
+            self._logger.warning(
+                "Configured max_total_bytes=%s is very small; increasing to 10MB minimum",
+                self._max_total_bytes,
+            )
+            self._max_total_bytes = 10 * 1024 * 1024
+        self._seed_existing_entries()
+
+    def _seed_existing_entries(self) -> None:
+        """Populate in-memory indices from disk on startup and prune if needed."""
+        for camera_dir in sorted(self.base_path.glob("*")):
+            if not camera_dir.is_dir():
+                continue
+            camera_id = camera_dir.name
+            index = self._indices.setdefault(camera_id, deque())
+            zarr_paths = []
+            for path in camera_dir.rglob("*.zarr"):
+                try:
+                    ts = int(path.stem)
+                except ValueError:
+                    continue
+                zarr_paths.append((ts, path))
+            if not zarr_paths:
+                continue
+            zarr_paths.sort(key=lambda item: item[0])
+            index.extend(zarr_paths)
+            self._enforce_limits(camera_id, index, now_ts=self._current_time_us())
+
+    def _current_time_us(self) -> int:
+        return int(time.time() * 1_000_000)
+
+    def _get_lock(self, camera_id: str) -> threading.Lock:
+        return self._locks.setdefault(camera_id, threading.Lock())
+
+    def _get_index(self, camera_id: str) -> Deque[Tuple[int, Path]]:
+        return self._indices.setdefault(camera_id, deque())
+
+    def _remove_snapshot(self, path: Path) -> None:
+        try:
+            if path.exists():
+                shutil.rmtree(path, ignore_errors=True)
+                # Clean up empty parent directories up to camera root
+                parent = path.parent
+                for _ in range(2):
+                    if parent == self.base_path or not parent.exists():
+                        break
+                    try:
+                        next(parent.iterdir())
+                    except StopIteration:
+                        parent.rmdir()
+                    parent = parent.parent
+        except Exception as exc:
+            self._logger.debug("Failed to remove snapshot %s: %s", path, exc)
+
+    def _enforce_limits(
+        self,
+        camera_id: str,
+        index: Deque[Tuple[int, Path]],
+        now_ts: Optional[int] = None,
+    ) -> None:
+        if not index:
+            return
+        now_ts = now_ts if now_ts is not None else self._current_time_us()
+        retention_cutoff = None
+        if self._retention_us > 0:
+            retention_cutoff = now_ts - self._retention_us
+
+        removed = 0
+        # Enforce retention duration first so age limit always wins
+        if retention_cutoff is not None:
+            while index and index[0][0] < retention_cutoff:
+                _, path = index.popleft()
+                self._remove_snapshot(path)
+                removed += 1
+
+        # Enforce max snapshot count with hysteresis to prevent thrash
+        if self._max_snapshots > 0 and len(index) > self._max_snapshots:
+            # determine floor based on 90% of max (at least 1)
+            target_len = max(1, int(self._max_snapshots * 0.9))
+            while len(index) > target_len:
+                _, path = index.popleft()
+                self._remove_snapshot(path)
+                removed += 1
+
+        if self._max_total_bytes is not None:
+            removed += self._enforce_total_size(camera_id, index)
+
+        if removed:
+            self._logger.info(
+                "Pruned %s depth snapshots for camera %s (max=%s, retention_us=%s)",
+                removed,
+                camera_id,
+                self._max_snapshots,
+                self._retention_us,
+            )
+
+    def _enforce_total_size(self, camera_id: str, index: Deque[Tuple[int, Path]]) -> int:
+        if not index:
+            return 0
+        total_bytes = 0
+        sizes: List[int] = []
+        for _, path in index:
+            try:
+                size = sum(file.stat().st_size for file in path.rglob('*') if file.is_file())
+            except FileNotFoundError:
+                size = 0
+            sizes.append(size)
+            total_bytes += size
+
+        removed = 0
+        while total_bytes > self._max_total_bytes and index:
+            ts, path = index.popleft()
+            size = sizes.pop(0)
+            total_bytes -= size
+            self._remove_snapshot(path)
+            removed += 1
+
+        if removed and total_bytes > self._max_total_bytes:
+            self._logger.warning(
+                "Total depth storage still above quota after pruning (camera=%s remaining=%s max=%s)",
+                camera_id,
+                total_bytes,
+                self._max_total_bytes,
+            )
+        return removed
+
+    def prune(self, camera_id: Optional[str] = None) -> int:
+        """Manual pruning entrypoint; returns number of snapshots removed."""
+        total_removed = 0
+        if camera_id:
+            lock = self._get_lock(camera_id)
+            with lock:
+                index = self._get_index(camera_id)
+                before = len(index)
+                self._enforce_limits(camera_id, index)
+                total_removed += max(0, before - len(index))
+            return total_removed
+
+        for cam_id in list(self._indices.keys()):
+            total_removed += self.prune(cam_id)
+        return total_removed
+
+    def purge_all(self, camera_id: Optional[str] = None) -> int:
+        """Remove all stored depth snapshots to start fresh."""
+        if camera_id is not None:
+            return self._purge_camera(camera_id)
+
+        total = 0
+        for cam_id in list(self._indices.keys()):
+            total += self._purge_camera(cam_id)
+        return total
+
+    def _purge_camera(self, camera_id: str) -> int:
+        removed = 0
+        lock = self._get_lock(camera_id)
+        with lock:
+            index = self._get_index(camera_id)
+            while index:
+                _, path = index.popleft()
+                self._remove_snapshot(path)
+                removed += 1
+        cam_dir = self.base_path / camera_id
+        if cam_dir.exists():
+            try:
+                next(cam_dir.iterdir())
+            except StopIteration:
+                cam_dir.rmdir()
+        return removed
 
     def store(
         self,
@@ -61,7 +242,7 @@ class DepthStorageManager:
         conf: np.ndarray,
         mask: np.ndarray,
     ) -> Path:
-        lock = self._locks.setdefault(camera_id, threading.Lock())
+        lock = self._get_lock(camera_id)
         with lock:
             timestamp = datetime.utcfromtimestamp(ts_us / 1_000_000.0)
             date_dir = timestamp.strftime("%Y%m%d")
@@ -101,25 +282,29 @@ class DepthStorageManager:
                 stored_at=time.time(),
                 shape=json.dumps(depth.shape),
             )
+            index = self._get_index(camera_id)
+            index.append((ts_us, dest_path))
+            self._enforce_limits(camera_id, index)
         return dest_path
 
     def latest_entry(self, camera_id: str, ts_max: Optional[int]) -> Optional[Path]:
-        camera_dir = self.base_path / camera_id
-        if not camera_dir.exists():
+        lock = self._get_lock(camera_id)
+        with lock:
+            index = self._get_index(camera_id)
+            if not index:
+                return None
+            # Drop missing files from the tail
+            while index and not index[-1][1].exists():
+                index.pop()
+            if not index:
+                return None
+            if ts_max is None:
+                return index[-1][1]
+            # Find newest entry <= ts_max
+            for ts, path in reversed(index):
+                if ts <= ts_max and path.exists():
+                    return path
             return None
-        candidates = []
-        for path in camera_dir.rglob('*.zarr'):
-            try:
-                ts = int(path.stem)
-            except ValueError:
-                continue
-            if ts_max is not None and ts > ts_max:
-                continue
-            candidates.append((ts, path))
-        if not candidates:
-            return None
-        candidates.sort(key=lambda item: item[0], reverse=True)
-        return candidates[0][1]
 
     def load_datasets(self, path: Path) -> Optional[Dict[str, np.ndarray]]:
         try:
@@ -139,7 +324,12 @@ class MapAnythingDepthSource:
         self.config = config or load_service_config()
         self.session = requests.Session()
         self.logger = RateLimitedLogger(logging.getLogger(__name__), rate_limit_seconds=2.0)
-        self.storage = DepthStorageManager(Path(self.config.storage.depth_base))
+        self.storage = DepthStorageManager(
+            Path(self.config.storage.depth_base),
+            max_snapshots_per_camera=self.config.storage.max_snapshots_per_camera,
+            retention_minutes=self.config.storage.snapshot_retention_minutes,
+            max_total_bytes=getattr(self.config.storage, 'max_total_bytes', None),
+        )
         self.min_conf = float(self.config.performance.min_conf)
         self.mono_interval = 1.0 / max(self.config.performance.mono_freq_hz, 1e-6)
         self.last_request_per_camera: Dict[str, float] = {}
@@ -177,7 +367,31 @@ class MapAnythingDepthSource:
         timestamp_s: float,
     ) -> DepthResult:
         view_result = build_mono_view(frame_bgr, camera_id, calib_bundle)
-        payload = {"view": view_result.payload}
+
+        view_payload = dict(view_result.payload)
+
+        # Ensure payload provides the tensor metadata expected by the service
+        shape = view_payload.get('shape')
+        if shape is None:
+            shape = list(view_result.resized_shape)
+        view_payload['shape'] = [int(shape[0]), int(shape[1]), int(shape[2])]
+
+        if 'img_b64' not in view_payload:
+            frame_rgb = view_result.payload.get('img')
+            if frame_rgb is None:
+                raise ValueError("MapAnything view payload missing img_b64 and raw img data")
+            img_bytes = np.ascontiguousarray(frame_rgb).tobytes()
+            view_payload['img_b64'] = base64.b64encode(img_bytes).decode('ascii')
+            view_payload.pop('img', None)
+
+        if 'cam_id' not in view_payload:
+            view_payload['cam_id'] = camera_id
+
+        if 'intrinsics' not in view_payload and view_result.intrinsics is not None:
+            view_payload['intrinsics'] = view_result.intrinsics.tolist()
+
+        payload = {"view": view_payload}
+
         response_json = self._post_json("/infer_mono", payload)
 
         depth, conf, mask = self._parse_response(response_json)
@@ -278,6 +492,243 @@ class MapAnythingDepthSource:
             'mask_b64': base64.b64encode(mask.tobytes()).decode('ascii'),
             'shape': [int(height), int(width)],
         }
+
+    def generate_topdown_floorplan(
+        self,
+        cameras: List[str],
+        max_age_sec: float = 60.0,
+        grid_res_m: float = 0.5,
+        max_extent_m: float = 20.0,
+        use_height: bool = False,
+    ) -> Dict[str, Any]:
+        """Aggregate latest MapAnything depths into a top-down XZ floorplan grid."""
+        now_us = int(time.time() * 1_000_000)
+        max_age_us = int(max(0.0, max_age_sec) * 1_000_000)
+        ts_cutoff = now_us - max_age_us if max_age_us > 0 else None
+
+        calib_bundle = getattr(self, 'calibration_bundle', None) or {}
+        cameras_node = calib_bundle.get('cameras') if isinstance(calib_bundle, dict) else {}
+        k_table = cameras_node.get('K') if isinstance(cameras_node, dict) else {}
+        e_table = cameras_node.get('E') if isinstance(cameras_node, dict) else {}
+
+        points_x = []
+        points_z = []
+        heights = [] if use_height else None
+
+        total_points = 0
+
+        cam_list = []
+        for cam in cameras or []:
+            if isinstance(cam, str) and cam:
+                cam_list.append(cam)
+        if not cam_list:
+            cam_list = list(k_table.keys()) if isinstance(k_table, dict) else []
+        else:
+            cam_list = list(dict.fromkeys(cam_list))
+
+        for cam_id in cam_list:
+            path = self.storage.latest_entry(cam_id, now_us)
+            if not path or (ts_cutoff is not None and int(path.stem) < ts_cutoff):
+                continue
+            datasets = self.storage.load_datasets(path)
+            if not datasets:
+                continue
+            depth = datasets.get('depth')
+            conf = datasets.get('conf')
+            mask = datasets.get('mask')
+            if depth is None or conf is None or mask is None:
+                continue
+
+            intr = None
+            extr = None
+            if isinstance(k_table, dict):
+                intr = k_table.get(cam_id)
+            if isinstance(e_table, dict):
+                extr = e_table.get(cam_id)
+
+            if intr is None or extr is None:
+                legacy_cam = cameras_node.get(cam_id) if isinstance(cameras_node, dict) else None
+                if isinstance(legacy_cam, dict):
+                    if intr is None:
+                        maybe_intr = legacy_cam.get('intrinsics')
+                        if isinstance(maybe_intr, (list, tuple)) and len(maybe_intr) == 9:
+                            intr = maybe_intr
+                    if extr is None:
+                        maybe_extr = legacy_cam.get('extrinsics')
+                        if isinstance(maybe_extr, dict):
+                            extr = maybe_extr.get('E')
+
+            if intr is None or extr is None:
+                continue
+
+            depth = np.asarray(depth, dtype=np.float32)
+            conf = np.asarray(conf, dtype=np.float32)
+            mask = np.asarray(mask, dtype=np.uint8) > 0
+            if depth.ndim != 2 or conf.shape != depth.shape or mask.shape != depth.shape:
+                continue
+
+            intr_arr = np.asarray(intr, dtype=np.float32).reshape(-1)
+            fx = fy = cx = cy = None
+            if intr_arr.size == 4:
+                fx, fy, cx, cy = [float(v) for v in intr_arr]
+            elif intr_arr.size == 9:
+                k_mat = intr_arr.reshape(3, 3)
+                fx = float(k_mat[0, 0])
+                fy = float(k_mat[1, 1])
+                cx = float(k_mat[0, 2])
+                cy = float(k_mat[1, 2])
+            else:
+                continue
+
+            if not all(np.isfinite([fx, fy, cx, cy])) or fx == 0.0 or fy == 0.0:
+                continue
+
+            valid = np.isfinite(depth)
+            valid &= depth > 0.1
+            valid &= depth < 50.0
+            valid &= mask
+            if np.isfinite(self.min_conf):
+                valid &= conf >= float(self.min_conf)
+
+            if not np.any(valid):
+                continue
+
+            h_img, w_img = depth.shape
+            grid_u, grid_v = np.meshgrid(
+                np.arange(w_img, dtype=np.float32),
+                np.arange(h_img, dtype=np.float32),
+                indexing='xy'
+            )
+
+            x_cam = (grid_u - cx) * depth / fx
+            y_cam = (grid_v - cy) * depth / fy
+            z_cam = depth
+
+            pts_cam = np.stack([x_cam[valid], y_cam[valid], z_cam[valid]], axis=1)
+            total_points += pts_cam.shape[0]
+
+            e_arr = np.asarray(extr, dtype=np.float32)
+            if e_arr.size == 16:
+                e_mat = e_arr.reshape(4, 4, order='F')
+            elif e_arr.shape == (3, 4):
+                e_mat = np.eye(4, dtype=np.float32)
+                e_mat[:3, :4] = e_arr
+            elif e_arr.shape == (4, 4):
+                e_mat = e_arr
+            else:
+                continue
+
+            try:
+                twc = np.linalg.inv(e_mat)
+            except np.linalg.LinAlgError:
+                continue
+
+            pts_cam_h = np.concatenate([pts_cam, np.ones((pts_cam.shape[0], 1), dtype=np.float32)], axis=1)
+            pts_world_h = pts_cam_h @ twc.T
+            pts_world = pts_world_h[:, :3]
+
+            points_x.extend(pts_world[:, 0].tolist())
+            points_z.extend(pts_world[:, 2].tolist())
+            if use_height and heights is not None:
+                heights.extend(pts_world[:, 1].tolist())
+
+        if not points_x or not points_z:
+            return {'error': 'no_points', 'ts': now_us, 'point_count': 0}
+
+        pts_x = np.array(points_x, dtype=np.float32)
+        pts_z = np.array(points_z, dtype=np.float32)
+
+        min_x = float(np.min(pts_x))
+        max_x = float(np.max(pts_x))
+        min_z = float(np.min(pts_z))
+        max_z = float(np.max(pts_z))
+
+        pad = 1.0
+        min_x -= pad
+        max_x += pad
+        min_z -= pad
+        max_z += pad
+
+        width_m = max_x - min_x
+        height_m = max_z - min_z
+        max_span = max(width_m, height_m)
+        half_extent = max_span / 2.0
+        if max_extent_m > 0:
+            half_extent = min(half_extent, max_extent_m / 2.0)
+
+        center_x = (min_x + max_x) * 0.5
+        center_z = (min_z + max_z) * 0.5
+        min_x = center_x - half_extent
+        max_x = center_x + half_extent
+        min_z = center_z - half_extent
+        max_z = center_z + half_extent
+
+        width_m = max(max_x - min_x, grid_res_m)
+        height_m = max(max_z - min_z, grid_res_m)
+        max_x = min_x + width_m
+        max_z = min_z + height_m
+
+        w_px = max(1, int(np.ceil(width_m / grid_res_m)))
+        h_px = max(1, int(np.ceil(height_m / grid_res_m)))
+
+        x_norm = np.clip((pts_x - min_x) / width_m, 0.0, 0.999999)
+        z_norm = np.clip((pts_z - min_z) / height_m, 0.0, 0.999999)
+        x_idx = np.floor(x_norm * w_px).astype(np.int32)
+        z_idx = np.floor(z_norm * h_px).astype(np.int32)
+
+        grid = np.zeros((h_px, w_px), dtype=np.float32)
+
+        if use_height and heights is not None:
+            heights_arr = np.array(heights, dtype=np.float32)
+            value_min = float(np.min(heights_arr)) if heights_arr.size else 0.0
+            value_max = float(np.max(heights_arr)) if heights_arr.size else 0.0
+            grid.fill(np.nan)
+            for xi, zi, val in zip(x_idx, z_idx, heights_arr):
+                current = grid[zi, xi]
+                if np.isnan(current):
+                    grid[zi, xi] = val
+                else:
+                    grid[zi, xi] = max(current, val)
+            if np.isnan(grid).any():
+                grid = np.nan_to_num(grid, nan=value_min)
+        else:
+            for xi, zi in zip(x_idx, z_idx):
+                grid[zi, xi] += 1.0
+            max_val = float(np.max(grid)) if grid.size else 0.0
+            if max_val > 0.0:
+                grid /= max_val
+            value_min = 0.0
+            value_max = 1.0
+
+        grid_bytes = grid.astype(np.float32, copy=False).ravel().tobytes()
+        grid_b64 = base64.b64encode(grid_bytes).decode('ascii')
+
+        bounds = {
+            'min_x': float(min_x),
+            'max_x': float(max_x),
+            'min_z': float(min_z),
+            'max_z': float(max_z),
+        }
+
+        payload: Dict[str, Any] = {
+            'grid_b64': grid_b64,
+            'grid_shape': [int(h_px), int(w_px)],
+            'bounds': bounds,
+            'scale_m_per_px': float(width_m / w_px if w_px else grid_res_m),
+            'use_height': bool(use_height),
+            'point_count': int(total_points),
+            'ts': now_us,
+        }
+
+        if use_height:
+            payload['value_min'] = float(value_min)
+            payload['value_max'] = float(value_max)
+
+        payload.setdefault('value_min', 0.0)
+        payload.setdefault('value_max', 1.0)
+        payload['cameras'] = list(cam_list)
+
+        return payload
 
 
 __all__ = [

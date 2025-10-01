@@ -4,6 +4,7 @@ import websockets
 import json
 import logging
 import time
+import uuid
 
 from models import convert_numpy_types
 
@@ -57,6 +58,7 @@ class WebSocketServer:
         self.solve_pnp_handler: Optional[Callable[[Dict[str, Any]], Dict[str, Any]]] = None
         self.set_align_handler: Optional[Callable[[Dict[str, Any]], Dict[str, Any]]] = None
         self.ma_depth_provider: Optional[Callable[[str, Optional[int]], Optional[Dict[str, Any]]]] = None
+        self.floorplan_provider: Optional[Callable[[Optional[list], float, float, float, bool], Optional[Dict[str, Any]]]] = None
 
     # ---------------- Menon telemetry helpers ----------------
     def _telemetry_now(self) -> float:
@@ -648,7 +650,14 @@ class WebSocketServer:
                         ts_max = None
                         if ts_max_val is not None:
                             try:
-                                ts_max = int(ts_max_val)
+                                ts = int(ts_max_val)
+                                # Normalize to microseconds:
+                                # <1e10 => seconds, <1e13 => milliseconds, else assume microseconds
+                                if ts < 10_000_000_000:
+                                    ts *= 1_000_000
+                                elif ts < 10_000_000_000_000:
+                                    ts *= 1_000
+                                ts_max = ts
                             except Exception:
                                 ts_max = None
                         result = {'type': 'ma_depth_response', 'cam_id': cam_id}
@@ -664,6 +673,41 @@ class WebSocketServer:
                                 result.update({'ok': False, 'error': str(exc)})
                         else:
                             result.update({'ok': False, 'error': 'no_provider'})
+                        try:
+                            await websocket.send(json.dumps(result))
+                        except Exception:
+                            pass
+
+                    elif data.get('type') == 'get_floorplan':
+                        request_id = data.get('request_id') or data.get('requestId') or str(uuid.uuid4())
+                        cameras_raw = data.get('cameras') if isinstance(data.get('cameras'), list) else []
+                        cameras = [str(cam) for cam in cameras_raw if isinstance(cam, str) and cam]
+                        max_age_sec = float(data.get('max_age_sec', data.get('maxAgeSec', 60.0)))
+                        grid_res_m = float(data.get('grid_res_m', data.get('gridResM', 0.5)))
+                        max_extent_m = float(data.get('max_extent_m', data.get('maxExtentM', 20.0)))
+                        use_height = bool(data.get('use_height', data.get('useHeight', False)))
+
+                        result = {
+                            'type': 'floorplan_response',
+                            'request_id': request_id,
+                            'cameras': cameras,
+                            'use_height': use_height,
+                        }
+
+                        provider = getattr(self, 'floorplan_provider', None)
+                        if callable(provider):
+                            try:
+                                payload = provider(cameras, max_age_sec, grid_res_m, max_extent_m, use_height)
+                                if payload:
+                                    result.update(payload)
+                                else:
+                                    result['error'] = 'no_payload'
+                            except Exception as exc:
+                                result['error'] = str(exc)
+                                self.logger.error(f"Floorplan generation error: {exc}")
+                        else:
+                            result['error'] = 'no_provider'
+
                         try:
                             await websocket.send(json.dumps(result))
                         except Exception:

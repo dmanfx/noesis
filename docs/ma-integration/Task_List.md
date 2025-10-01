@@ -303,7 +303,10 @@ This task list is designed for the coding agent to implement the integration sys
 2. **Unit: geometry** (dep: 1, 3h)
    - test_floor.py: synth depth plane; fit n error <0.05; pixel_to_world roundtrip <1cm.
    **As-built:**
-   - backprojection/plane fitting assertions ensure numeric stability.
+   - ✅ Implemented `tests/test_floor.py` with a 256x256 synthetic plane tilted 10° using scaled intrinsics from `intrinsics.json`.
+   - ✅ Floor RANSAC validates normal within 3° and offset within 5 cm against the ground-truth plane.
+   - ✅ Pixel→world→pixel roundtrip uses `config/camera_calibration.json` extrinsics with reprojection error <2 px (~1 cm) across 10 random samples.
+   - ✅ `pytest tests/test_floor.py -v` passes with all assertions on synthetic data.
 
 3. **Integration: fusion** (dep: 2, 3h)
    - test_fusion.py: load 4 sample jpegs (add to tests/data/); call multi; assert pose diff <1° to calib E.

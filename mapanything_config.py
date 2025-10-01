@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 from config import load_ma_config
 
@@ -23,15 +23,33 @@ def _to_float(raw: str) -> float:
     return float(_strip_comment(raw))
 
 
-def _normalize_amp(raw: str) -> str:
-    normalized = _strip_comment(raw).lower()
-    if normalized in {"bf16", "bfloat16"}:
-        return "bf16"
-    if normalized in {"fp16", "float16", "half"}:
-        return "fp16"
-    if normalized in {"fp32", "float32", "single"}:
-        return "fp32"
-    raise ValueError(f"Unsupported amp dtype: {raw}")
+def _to_optional_bytes(raw: Optional[str]) -> Optional[int]:
+    if raw is None:
+        return None
+    cleaned = _strip_comment(raw)
+    if not cleaned:
+        return None
+    lower = cleaned.lower()
+
+    suffix_multipliers = {
+        "k": 1024,
+        "kb": 1024,
+        "m": 1024 ** 2,
+        "mb": 1024 ** 2,
+        "g": 1024 ** 3,
+        "gb": 1024 ** 3,
+        "t": 1024 ** 4,
+        "tb": 1024 ** 4,
+    }
+
+    for suffix, multiplier in suffix_multipliers.items():
+        if lower.endswith(suffix):
+            number = lower[: -len(suffix)].strip()
+            if not number:
+                raise ValueError(f"Missing numeric component for byte size: {raw}")
+            return int(float(number) * multiplier)
+
+    return int(float(cleaned))
 
 
 @dataclass(frozen=True)
@@ -70,6 +88,9 @@ class PerformanceSettings:
 class StorageSettings:
     depth_base: str
     calib_base: str
+    max_snapshots_per_camera: int
+    snapshot_retention_minutes: float
+    max_total_bytes: Optional[int]
 
 
 @dataclass(frozen=True)
@@ -111,6 +132,9 @@ class ServiceConfig:
         storage = StorageSettings(
             depth_base=storage_section.get("depth_base", "data/depth"),
             calib_base=storage_section.get("calib_base", "data/calib"),
+            max_snapshots_per_camera=_to_int(storage_section.get("max_snapshots_per_camera", "600")),
+            snapshot_retention_minutes=_to_float(storage_section.get("snapshot_retention_minutes", "10")),
+            max_total_bytes=_to_optional_bytes(storage_section.get("max_total_bytes")),
         )
         return cls(service=service, inference=inference, performance=performance, storage=storage)
 

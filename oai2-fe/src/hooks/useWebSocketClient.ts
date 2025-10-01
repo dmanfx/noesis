@@ -33,6 +33,16 @@ export type FrameHandlers = {
   onTrailToggle?: (enabled: boolean) => void;
   onMADiagnostics?: (payload: any) => void;
   onMADepth?: (payload: any) => void;
+  onFloorplan?: (payload: any) => void;
+};
+
+export type FloorplanRequest = {
+  cameras?: string[];
+  maxAgeSec?: number;
+  gridResM?: number;
+  maxExtentM?: number;
+  useHeight?: boolean;
+  requestId?: string;
 };
 
 export function useWebSocketClient(url: string, handlers: FrameHandlers) {
@@ -170,6 +180,8 @@ export function useWebSocketClient(url: string, handlers: FrameHandlers) {
             handlers.onMADiagnostics?.(data);
           } else if (data.type === 'ma_depth_response') {
             handlers.onMADepth?.(data);
+          } else if (data.type === 'floorplan_response') {
+            handlers.onFloorplan?.(data);
           }
         } catch (e) {
           // swallow parsing errors
@@ -202,6 +214,19 @@ export function useWebSocketClient(url: string, handlers: FrameHandlers) {
     sendTrailToggle: (enabled: boolean) => sendJson({ type: 'set_vis_toggle', toggle_name: 'trail_visualization_enabled', enabled }),
     sendDetectionConfig: (config: any) => sendJson({ type: 'update_detection_config', config }),
     sendDetectionToggle: (name: string, enabled: boolean) => sendJson({ type: 'set_detection_toggle', toggle_name: name, enabled }),
-    requestMapAnythingDepth: (camId: string, tsMax?: number) => sendJson({ type: 'get_ma_depth', camId, ts_max: tsMax ?? Date.now() })
+    requestMapAnythingDepth: (camId: string, tsMax?: number) => sendJson({ type: 'get_ma_depth', camId, ts_max: tsMax ?? Date.now() }),
+    requestFloorplan: (options?: FloorplanRequest) => {
+      const requestId = options?.requestId || Date.now().toString();
+      const ok = sendJson({
+        type: 'get_floorplan',
+        request_id: requestId,
+        cameras: options?.cameras,
+        max_age_sec: options?.maxAgeSec ?? 60,
+        grid_res_m: options?.gridResM ?? 0.5,
+        max_extent_m: options?.maxExtentM ?? 20,
+        use_height: options?.useHeight ?? false
+      });
+      return ok ? requestId : '';
+    }
   };
 }

@@ -107,6 +107,8 @@ min_conf = 0.5
 [storage]
 depth_base = data/depth
 calib_base = data/calib
+max_snapshots_per_camera = 600
+snapshot_retention_minutes = 10
 ```
 - Parsed through `mapanything_config.load_service_config()` and shared across service and client components.
 - To override host/port at runtime, set `MA_SERVICE_HOST` / `MA_SERVICE_PORT` environment variables.
@@ -127,7 +129,8 @@ data/depth/<camera_id>/<YYYYMMDD>/<HH>/<timestamp_us>.zarr/
   mask (uint8)
   attrs: camera_id, timestamp_us, stored_at, shape
 ```
-- Managed by `DepthStorageManager` with Blosc (zstd) compression and 128×128 chunks.
+- Managed by `DepthStorageManager` with Blosc (zstd) compression and 128×128 chunks. The manager enforces
+  per-camera retention using a ring buffer (`max_snapshots_per_camera`) and time-based expiry (`snapshot_retention_minutes`).
 
 ### MQTT
 - Topic: `noesis/geometry/<room>/<cam>/depth_summary`

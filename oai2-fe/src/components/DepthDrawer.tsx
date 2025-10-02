@@ -641,31 +641,42 @@ const DepthDrawer = memo(function DepthDrawer({ open, onClose, diagnostics, dept
         <div className="content">
           {!cameras.length && <p>No MapAnything diagnostics received yet.</p>}
           {cameras.length > 0 && (
-            <div className="camera-select">
-              <label htmlFor="ma-depth-select">Camera</label>
-              <select
-                id="ma-depth-select"
-                value={selectedCamera}
-                onChange={(ev) => setSelectedCamera(ev.target.value)}
-              >
-                {cameras.map((cam) => (
-                  <option key={cam} value={cam}>{cam}</option>
-                ))}
-              </select>
+            <div className={`drawer-toolbar ${activeTab === 'heatmap' ? 'drawer-toolbar--heatmap' : ''}`}>
+              <label className="drawer-toolbar__camera" htmlFor="ma-depth-select">
+                <span className="drawer-toolbar__label">Camera</span>
+                <select
+                  id="ma-depth-select"
+                  value={selectedCamera}
+                  onChange={(ev) => setSelectedCamera(ev.target.value)}
+                >
+                  {cameras.map((cam) => (
+                    <option key={cam} value={cam}>{cam}</option>
+                  ))}
+                </select>
+              </label>
+              {activeTab === 'heatmap' && (
+                <div className="drawer-toolbar__actions">
+                  <button
+                    type="button"
+                    className="btn-icon"
+                    onClick={() => selectedCamera && onRequestDepth(selectedCamera)}
+                    disabled={!depthEntry}
+                    aria-label="Refresh depth frame"
+                  >
+                    <svg viewBox="0 0 16 16" aria-hidden="true">
+                      <path
+                        fill="currentColor"
+                        d="M8 2a5.5 5.5 0 0 1 3.804 9.49l1.068 1.068a.75.75 0 1 1-1.06 1.06l-2.5-2.5a.75.75 0 0 1 0-1.06l2.5-2.5a.75.75 0 1 1 1.06 1.06L11.66 9.19A4 4 0 1 0 8 12.5a.75.75 0 1 1 0 1.5A5.5 5.5 0 1 1 8 2Z"
+                      />
+                    </svg>
+                  </button>
+                </div>
+              )}
             </div>
           )}
 
           {activeTab === 'heatmap' && (
             <>
-              <div className="floorplan-controls">
-                <div className="floorplan-controls__actions">
-                  <button className="btn ghost" onClick={() => selectedCamera && onRequestDepth(selectedCamera)} disabled={!depthEntry}>Refresh Depth</button>
-                  <button className="btn ghost" onClick={() => fetchFloorplan()} disabled={floorplanStatus === 'loading'}>
-                    {floorplanStatus === 'loading' ? 'Loading...' : 'Refresh Floorplan'}
-                  </button>
-                </div>
-              </div>
-
               {floorplanError && <p className="floorplan-error">Error: {floorplanError}</p>}
               <div className="heatmap-grid">
                 <div className="heatmap-cell heatmap-cell--left">

@@ -22,25 +22,30 @@ type DiagnosticsEntry = {
   ts: number;
 };
 
-export type FloorplanEntry = {
-  type?: string;
-  request_id?: string;
+type FloorplanLayer = {
   grid_b64?: string;
   grid_shape?: [number, number];
-  bounds?: { min_x?: number; max_x?: number; min_z?: number; max_z?: number };
-  scale_m_per_px?: number;
-  use_height?: boolean;
-  point_count?: number;
-  ts?: number;
-  error?: string;
   value_min?: number;
   value_max?: number;
-  cameras?: string[];
+};
+
+export type FloorplanResponse = {
+  type?: string;
+  request_id?: string;
+  camera_id?: string;
+  ts?: number;
+  snapshot_ts?: number | null;
+  bounds?: { min_x?: number; max_x?: number; min_z?: number; max_z?: number };
+  scale_m_per_px?: number;
+  point_count?: number;
+  error?: string;
+  density?: FloorplanLayer;
+  height?: FloorplanLayer;
+  distance?: FloorplanLayer;
 };
 
 type FloorplanRequestOptions = {
-  cameras?: string[];
-  useHeight?: boolean;
+  camera?: string;
   requestId?: string;
   maxAgeSec?: number;
   gridResM?: number;
@@ -53,7 +58,7 @@ interface DepthDrawerProps {
   diagnostics: Record<string, DiagnosticsEntry>;
   depthData: Record<string, DepthEntry>;
   onRequestDepth: (cameraId: string) => void;
-  floorplan: FloorplanEntry | null;
+  floorplans: Record<string, FloorplanResponse>;
   onRequestFloorplan: (options: FloorplanRequestOptions) => string | void;
 }
 
@@ -65,8 +70,39 @@ const VIRIDIS = [
   [253, 231, 36],
 ];
 
-const DEFAULT_WIDTH = 400;
+const DEFAULT_WIDTH = 700;
 const MAX_WIDTH = 960;
+
+function generateGradient(palette: (t: number) => [number, number, number], steps = 12): string {
+  const stops: string[] = [];
+  for (let i = 0; i <= steps; i += 1) {
+    const t = i / steps;
+    const [r, g, b] = palette(t);
+    stops.push(`rgb(${r}, ${g}, ${b}) ${(t * 100).toFixed(1)}%`);
+  }
+  return `linear-gradient(to top, ${stops.join(', ')})`;
+}
+
+const turboGradient = generateGradient(turboColor);
+const viridisGradient = generateGradient((t) => viridisColor(t));
+const infernoGradient = generateGradient(infernoColor);
+const densityGradient = 'linear-gradient(to top, rgb(0,0,0) 0%, rgb(255,255,255) 100%)';
+
+function formatNumber(value?: number | null, digits = 2): string {
+  if (value === undefined || value === null || Number.isNaN(value)) return 'n/a';
+  const factor = 10 ** digits;
+  return `${Math.round(value * factor) / factor}`;
+}
+
+const applyCanvasSize = (canvas: HTMLCanvasElement) => {
+  const rect = canvas.getBoundingClientRect();
+  const width = rect.width || canvas.clientWidth || 1;
+  const height = rect.height || canvas.clientHeight || width;
+  const dpr = window.devicePixelRatio || 1;
+  canvas.width = Math.max(1, Math.round(width * dpr));
+  canvas.height = Math.max(1, Math.round(height * dpr));
+  return { width, height, dpr };
+};
 
 function decodeFloat32(base64?: string): Float32Array | null {
   if (!base64) return null;
@@ -113,7 +149,46 @@ function viridisColor(t: number): [number, number, number] {
   return [r, g, bl];
 }
 
-const DepthDrawer = memo(function DepthDrawer({ open, onClose, diagnostics, depthData, onRequestDepth, floorplan, onRequestFloorplan }: DepthDrawerProps) {
+function grayscaleColor(t: number): [number, number, number] {
+  const v = Math.round(255 * (1 - Math.min(1, Math.max(0, t))));
+  return [v, v, v];
+}
+
+function infernoColor(t: number): [number, number, number] {
+  const stops: Array<[number, [number, number, number]]> = [
+    [0, [0, 0, 4]],
+    [0.2, [35, 6, 59]],
+    [0.4, [99, 23, 94]],
+    [0.6, [159, 43, 73]],
+    [0.8, [218, 83, 32]],
+    [1, [252, 255, 164]],
+  ];
+  const clamped = Math.min(1, Math.max(0, t));
+  for (let i = 0; i < stops.length - 1; i += 1) {
+    const [posA, colorA] = stops[i];
+    const [posB, colorB] = stops[i + 1];
+    if (clamped >= posA && clamped <= posB) {
+      const frac = (clamped - posA) / (posB - posA || 1);
+      const r = Math.round(colorA[0] + (colorB[0] - colorA[0]) * frac);
+      const g = Math.round(colorA[1] + (colorB[1] - colorA[1]) * frac);
+      const b = Math.round(colorA[2] + (colorB[2] - colorA[2]) * frac);
+      return [r, g, b];
+    }
+  }
+  const last = stops[stops.length - 1][1];
+  return [last[0], last[1], last[2]];
+}
+
+function turboColor(t: number): [number, number, number] {
+  const x = Math.min(1, Math.max(0, t));
+  const r = 0.13572138 + x * (4.61539260 + x * (-42.66032258 + x * (132.13108234 + x * (-152.94239396 + x * 59.28637943))));
+  const g = 0.09140261 + x * (2.19418839 + x * (4.84296658 + x * (-14.18503333 + x * (4.27729857 + x * 2.82956604))));
+  const b = 0.10667330 + x * (12.64194608 + x * (-60.58204836 + x * (115.67994485 + x * (-87.60200647 + x * 26.70740952))));
+  const clamp = (v: number) => Math.round(Math.min(1, Math.max(0, v)) * 255);
+  return [clamp(r), clamp(g), clamp(b)];
+}
+
+const DepthDrawer = memo(function DepthDrawer({ open, onClose, diagnostics, depthData, onRequestDepth, floorplans, onRequestFloorplan }: DepthDrawerProps) {
   const cameras = useMemo(() => Object.keys(diagnostics).sort(), [diagnostics]);
   const [activeTab, setActiveTab] = useState<'heatmap' | 'stats' | 'histogram' | 'metrics'>('heatmap');
   const [selectedCamera, setSelectedCamera] = useState<string>('');
@@ -124,12 +199,84 @@ const DepthDrawer = memo(function DepthDrawer({ open, onClose, diagnostics, dept
   const activePointerIdRef = useRef<number | null>(null);
   const heatmapCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const histogramCanvasRef = useRef<HTMLCanvasElement | null>(null);
-  const floorplanCanvasRef = useRef<HTMLCanvasElement | null>(null);
-  const [showFloorplan, setShowFloorplan] = useState(false);
-  const [useHeightColormap, setUseHeightColormap] = useState(false);
+  const densityCanvasRef = useRef<HTMLCanvasElement | null>(null);
+  const heightCanvasRef = useRef<HTMLCanvasElement | null>(null);
+  const distanceCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const [floorplanStatus, setFloorplanStatus] = useState<'idle' | 'loading'>('idle');
   const [floorplanRequest, setFloorplanRequest] = useState<string>('');
-  const [floorplanCache, setFloorplanCache] = useState<{ density?: FloorplanEntry; height?: FloorplanEntry }>({});
+  const [heatmapRange, setHeatmapRange] = useState<{ min: number; max: number } | null>(null);
+  const [heatmapAspect, setHeatmapAspect] = useState<number | null>(null);
+  const clearCanvasElement = useCallback((canvas: HTMLCanvasElement | null) => {
+    if (!canvas) return;
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return;
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+  }, []);
+
+  const renderTopdownLayer = useCallback(
+    (canvas: HTMLCanvasElement | null, layer: FloorplanLayer | undefined, palette: (t: number) => [number, number, number]) => {
+      if (!canvas) return;
+      if (!layer || !layer.grid_b64 || !layer.grid_shape) {
+        clearCanvasElement(canvas);
+        return;
+      }
+      const [rows, cols] = layer.grid_shape;
+      if (!rows || !cols) {
+        clearCanvasElement(canvas);
+        return;
+      }
+      const values = decodeFloat32(layer.grid_b64);
+      if (!values || values.length < rows * cols) {
+        clearCanvasElement(canvas);
+        return;
+      }
+
+      const ctx = canvas.getContext('2d');
+      if (!ctx) return;
+
+      const offscreen = document.createElement('canvas');
+      offscreen.width = cols;
+      offscreen.height = rows;
+      const offCtx = offscreen.getContext('2d');
+      if (!offCtx) return;
+
+      const imageData = offCtx.createImageData(cols, rows);
+      const data = imageData.data;
+      const min = layer.value_min ?? 0;
+      const max = layer.value_max ?? 1;
+      const denom = max - min === 0 ? 1 : max - min;
+      for (let idx = 0; idx < values.length; idx += 1) {
+        const norm = Math.min(1, Math.max(0, (values[idx] - min) / denom));
+        const [r, g, b] = palette(norm);
+        const offset = idx * 4;
+        data[offset] = r;
+        data[offset + 1] = g;
+        data[offset + 2] = b;
+        data[offset + 3] = 255;
+      }
+      offCtx.putImageData(imageData, 0, 0);
+
+      const { width, height, dpr } = applyCanvasSize(canvas);
+
+      ctx.save();
+      ctx.scale(dpr, dpr);
+      ctx.clearRect(0, 0, width, height);
+      ctx.imageSmoothingEnabled = true;
+      ctx.translate(width / 2, height / 2);
+      ctx.rotate(Math.PI); // 180° rotation, no reflection
+      ctx.drawImage(offscreen, -width / 2, -height / 2, width, height);
+      ctx.restore();
+
+      ctx.save();
+      ctx.scale(dpr, dpr);
+      ctx.strokeStyle = '#ff4d4d';
+      ctx.lineWidth = 1.5;
+      ctx.strokeRect(1, 1, width - 2, height - 2);
+      ctx.restore();
+    },
+    [clearCanvasElement]
+  );
 
   useEffect(() => {
     if (!cameras.length) {
@@ -159,18 +306,19 @@ const DepthDrawer = memo(function DepthDrawer({ open, onClose, diagnostics, dept
   useEffect(() => {
     const canvas = heatmapCanvasRef.current;
     if (!canvas || !depthEntry || activeTab !== 'heatmap') return;
+
     const [height, width] = depthEntry.shape;
     const depthArray = decodeFloat32(depthEntry.depth_b64);
-    if (!depthArray || depthArray.length < width * height) return;
+    if (!depthArray || depthArray.length < width * height) {
+      setHeatmapRange(null);
+      setHeatmapAspect(null);
+      clearCanvasElement(canvas);
+      return;
+    }
+
     const confArray = decodeFloat32(depthEntry.conf_b64);
     const maskArray = decodeUint8(depthEntry.mask_b64);
 
-    canvas.width = width;
-    canvas.height = height;
-    const ctx = canvas.getContext('2d');
-    if (!ctx) return;
-    const imageData = ctx.createImageData(width, height);
-    const data = imageData.data;
     let minDepth = Number.POSITIVE_INFINITY;
     let maxDepth = Number.NEGATIVE_INFINITY;
     const total = width * height;
@@ -181,11 +329,27 @@ const DepthDrawer = memo(function DepthDrawer({ open, onClose, diagnostics, dept
       if (d < minDepth) minDepth = d;
       if (d > maxDepth) maxDepth = d;
     }
+
     if (!Number.isFinite(minDepth) || !Number.isFinite(maxDepth) || maxDepth <= minDepth) {
-      ctx.clearRect(0, 0, width, height);
+      clearCanvasElement(canvas);
+      setHeatmapRange(null);
+      setHeatmapAspect(null);
       return;
     }
+
     const range = maxDepth - minDepth;
+    setHeatmapRange({ min: minDepth, max: maxDepth });
+    const aspect = width / height;
+    setHeatmapAspect(aspect);
+
+    const offscreen = document.createElement('canvas');
+    offscreen.width = width;
+    offscreen.height = height;
+    const offCtx = offscreen.getContext('2d');
+    if (!offCtx) return;
+    const imageData = offCtx.createImageData(width, height);
+    const data = imageData.data;
+
     for (let i = 0; i < total; i += 1) {
       const d = depthArray[i];
       const idx = i * 4;
@@ -195,19 +359,43 @@ const DepthDrawer = memo(function DepthDrawer({ open, onClose, diagnostics, dept
         continue;
       }
       const norm = Math.min(1, Math.max(0, (d - minDepth) / range));
-      const [r, g, b] = viridisColor(norm);
-      let alpha = 0.8;
+      const [r, g, b] = turboColor(norm);
+      let alpha = 0.9;
       if (confArray && confArray.length > i) {
         const conf = Math.max(0, Math.min(1, confArray[i]));
-        alpha = 0.25 + conf * 0.75;
+        alpha = 0.3 + conf * 0.7;
       }
       data[idx] = r;
       data[idx + 1] = g;
       data[idx + 2] = b;
       data[idx + 3] = Math.round(alpha * 255);
     }
-    ctx.putImageData(imageData, 0, 0);
-  }, [depthEntry, activeTab]);
+
+    offCtx.putImageData(imageData, 0, 0);
+
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return;
+    const rect = canvas.getBoundingClientRect();
+    const targetWidth = rect.width || canvas.clientWidth || width;
+    const targetHeight = rect.height || canvas.clientHeight || targetWidth / aspect;
+    const dpr = window.devicePixelRatio || 1;
+    canvas.width = Math.max(1, Math.round(targetWidth * dpr));
+    canvas.height = Math.max(1, Math.round(targetHeight * dpr));
+
+    ctx.save();
+    ctx.scale(dpr, dpr);
+    ctx.clearRect(0, 0, targetWidth, targetHeight);
+    ctx.imageSmoothingEnabled = true;
+    ctx.drawImage(offscreen, 0, 0, targetWidth, targetHeight);
+    ctx.restore();
+  }, [depthEntry, activeTab, drawerWidth, clearCanvasElement]);
+
+  useEffect(() => {
+    if (!depthEntry) {
+      setHeatmapRange(null);
+      setHeatmapAspect(null);
+    }
+  }, [depthEntry]);
 
   useEffect(() => {
     const canvas = histogramCanvasRef.current;
@@ -284,159 +472,37 @@ const DepthDrawer = memo(function DepthDrawer({ open, onClose, diagnostics, dept
     ];
   }, [summary]);
 
-  const activeFloorplan = useMemo(() => (useHeightColormap ? floorplanCache.height : floorplanCache.density), [floorplanCache, useHeightColormap]);
-  const floorplanError = activeFloorplan?.error;
+  const cameraFloorplan = floorplans[selectedCamera];
+  const densityLayer = cameraFloorplan?.density;
+  const heightLayer = cameraFloorplan?.height;
+  const distanceLayer = cameraFloorplan?.distance;
+  const floorplanError = cameraFloorplan?.error;
+  const hasDensity = !!(densityLayer && densityLayer.grid_b64 && densityLayer.grid_shape);
+  const hasHeight = !!(heightLayer && heightLayer.grid_b64 && heightLayer.grid_shape);
+  const hasDistance = !!(distanceLayer && distanceLayer.grid_b64 && distanceLayer.grid_shape);
+  const heightMin = heightLayer?.value_min;
+  const heightMax = heightLayer?.value_max;
+  const heightMid = heightMin !== undefined && heightMax !== undefined ? (heightMin + heightMax) / 2 : undefined;
+  const distanceMin = distanceLayer?.value_min;
+  const distanceMax = distanceLayer?.value_max;
+  const distanceMid = distanceMin !== undefined && distanceMax !== undefined ? (distanceMin + distanceMax) / 2 : undefined;
+  const spanX = cameraFloorplan?.bounds ? Math.abs((cameraFloorplan.bounds.max_x ?? 0) - (cameraFloorplan.bounds.min_x ?? 0)) : undefined;
+  const spanZ = cameraFloorplan?.bounds ? Math.abs((cameraFloorplan.bounds.max_z ?? 0) - (cameraFloorplan.bounds.min_z ?? 0)) : undefined;
 
-  const clearFloorplanCanvas = useCallback(() => {
-    const canvas = floorplanCanvasRef.current;
-    if (!canvas) return;
-    const ctx = canvas.getContext('2d');
-    if (!ctx) return;
-    ctx.setTransform(1, 0, 0, 1, 0, 0);
-    ctx.clearRect(0, 0, canvas.width, canvas.height);
-  }, []);
+  const renderScale = (gradient: string, min?: number, _mid?: number, max?: number, unit = '') => (
+    <div className="color-scale">
+      <span className="color-scale__label color-scale__label--max">{formatNumber(max)}{unit}</span>
+      <div className="color-scale__bar" style={{ background: gradient }} />
+      <span className="color-scale__label color-scale__label--min">{formatNumber(min)}{unit}</span>
+    </div>
+  );
 
-  const renderFloorplan = useCallback((entry: FloorplanEntry) => {
-    const canvas = floorplanCanvasRef.current;
-    if (!canvas || !entry || !entry.grid_b64 || !entry.grid_shape || entry.error) return;
-    const [rows, cols] = entry.grid_shape;
-    if (!rows || !cols) return;
-    const values = decodeFloat32(entry.grid_b64);
-    if (!values || values.length < rows * cols) return;
 
-    const ctx = canvas.getContext('2d');
-    if (!ctx) return;
-
-    canvas.width = 400;
-    canvas.height = 400;
-
-    const offscreen = document.createElement('canvas');
-    offscreen.width = cols;
-    offscreen.height = rows;
-    const offCtx = offscreen.getContext('2d');
-    if (!offCtx) return;
-
-    const imageData = offCtx.createImageData(cols, rows);
-    const buffer = imageData.data;
-    const count = cols * rows;
-    const isHeight = !!entry.use_height;
-
-    let valueMin = typeof entry.value_min === 'number' && Number.isFinite(entry.value_min) ? entry.value_min : undefined;
-    let valueMax = typeof entry.value_max === 'number' && Number.isFinite(entry.value_max) ? entry.value_max : undefined;
-
-    if (isHeight && (valueMin === undefined || valueMax === undefined || valueMax <= valueMin)) {
-      let minObserved = Number.POSITIVE_INFINITY;
-      let maxObserved = Number.NEGATIVE_INFINITY;
-      for (let i = 0; i < count; i += 1) {
-        const val = values[i];
-        if (!Number.isFinite(val)) continue;
-        if (val < minObserved) minObserved = val;
-        if (val > maxObserved) maxObserved = val;
-      }
-      if (!Number.isFinite(minObserved) || !Number.isFinite(maxObserved) || maxObserved <= minObserved) {
-        minObserved = 0;
-        maxObserved = 1;
-      }
-      valueMin = minObserved;
-      valueMax = maxObserved;
-    }
-
-    if (!isHeight) {
-      valueMin = 0;
-      valueMax = 1;
-    }
-
-    const range = (valueMax ?? 1) - (valueMin ?? 0);
-    const safeRange = range <= 1e-6 ? 1 : range;
-
-    for (let idx = 0; idx < count; idx += 1) {
-      const valRaw = values[idx];
-      const val = Number.isFinite(valRaw) ? valRaw : 0;
-      let r = 255;
-      let g = 255;
-      let b = 255;
-      if (isHeight) {
-        const norm = Math.max(0, Math.min(1, ((val - (valueMin ?? 0)) / safeRange)));
-        const [vr, vg, vb] = viridisColor(norm);
-        r = vr;
-        g = vg;
-        b = vb;
-      } else {
-        const norm = Math.max(0, Math.min(1, val));
-        const gray = Math.round(255 * (1 - norm));
-        r = gray;
-        g = gray;
-        b = gray;
-      }
-      const offset = idx * 4;
-      buffer[offset] = r;
-      buffer[offset + 1] = g;
-      buffer[offset + 2] = b;
-      buffer[offset + 3] = 255;
-    }
-
-    offCtx.putImageData(imageData, 0, 0);
-
-    ctx.save();
-    ctx.setTransform(1, 0, 0, 1, 0, 0);
-    ctx.clearRect(0, 0, canvas.width, canvas.height);
-    ctx.imageSmoothingEnabled = true;
-    ctx.drawImage(offscreen, 0, 0, canvas.width, canvas.height);
-
-    // Draw bounding box outline
-    ctx.strokeStyle = '#ff4d4d';
-    ctx.lineWidth = 2;
-    ctx.strokeRect(1, 1, canvas.width - 2, canvas.height - 2);
-
-    const bounds = entry.bounds || {};
-    const widthMeters = typeof bounds.max_x === 'number' && typeof bounds.min_x === 'number' ? bounds.max_x - bounds.min_x : 0;
-    const heightMeters = typeof bounds.max_z === 'number' && typeof bounds.min_z === 'number' ? bounds.max_z - bounds.min_z : 0;
-    ctx.fillStyle = 'rgba(255,255,255,0.82)';
-    ctx.fillRect(8, 8, 150, 36);
-    ctx.fillStyle = '#111';
-    ctx.font = '12px system-ui';
-    ctx.fillText(`X span: ${widthMeters.toFixed(1)} m`, 14, 22);
-    ctx.fillText(`Z span: ${heightMeters.toFixed(1)} m`, 14, 36);
-    ctx.fillText(isHeight ? 'Height colormap' : 'Density', canvas.width - 130, 22);
-
-    if (widthMeters > 0.01) {
-      const barMeters = widthMeters >= 15 ? 5 : widthMeters >= 7 ? 2 : 1;
-      const pixelsPerMeter = canvas.width / widthMeters;
-      const barPx = Math.max(12, Math.min(canvas.width - 40, pixelsPerMeter * barMeters));
-      const barX = 24;
-      const barY = canvas.height - 32;
-      ctx.fillStyle = 'rgba(255,255,255,0.9)';
-      ctx.fillRect(barX, barY, barPx, 8);
-      ctx.strokeStyle = '#222';
-      ctx.lineWidth = 1;
-      ctx.strokeRect(barX, barY, barPx, 8);
-      ctx.fillStyle = '#111';
-      ctx.fillText(`${barMeters} m`, barX, barY - 4);
-    }
-
-    ctx.restore();
-  }, []);
-
-  useEffect(() => {
-    if (!floorplan || floorplan.type !== 'floorplan_response') return;
-    const key = floorplan.use_height ? 'height' : 'density';
-    setFloorplanCache(prev => ({ ...prev, [key === 'height' ? 'height' : 'density']: floorplan }));
-    if (!floorplan.request_id || floorplan.request_id === floorplanRequest || floorplanRequest === 'pending') {
-      setFloorplanStatus('idle');
-      setFloorplanRequest('');
-    }
-  }, [floorplan, floorplanRequest]);
-
-  const fetchFloorplan = useCallback((opts?: { useHeight?: boolean }) => {
-    if (!onRequestFloorplan || !open) return;
-    setFloorplanCache({});
-    clearFloorplanCanvas();
+  const fetchFloorplan = useCallback(() => {
+    if (!onRequestFloorplan || !open || !selectedCamera) return;
     setFloorplanStatus('loading');
-    const targetUseHeight = opts?.useHeight ?? useHeightColormap;
-    const cameraList = selectedCamera ? [selectedCamera] : [];
     const requestId = onRequestFloorplan({
-      cameras: cameraList,
-      useHeight: targetUseHeight,
+      camera: selectedCamera,
       requestId: Date.now().toString(),
       maxAgeSec: 60,
       gridResM: 0.5,
@@ -444,47 +510,58 @@ const DepthDrawer = memo(function DepthDrawer({ open, onClose, diagnostics, dept
     });
     if (typeof requestId === 'string' && requestId.length) {
       setFloorplanRequest(requestId);
-    } else if (requestId === undefined) {
-      setFloorplanRequest('pending');
     } else {
       setFloorplanRequest('');
       setFloorplanStatus('idle');
     }
-  }, [onRequestFloorplan, open, selectedCamera, useHeightColormap, clearFloorplanCanvas]);
+  }, [onRequestFloorplan, open, selectedCamera]);
+
 
   useEffect(() => {
-    if (!showFloorplan) return;
-    setFloorplanCache({});
-    clearFloorplanCanvas();
-  }, [selectedCamera, showFloorplan, clearFloorplanCanvas]);
+    if (activeTab !== 'heatmap' || !open) return;
 
-  useEffect(() => {
-    if (!showFloorplan || activeTab !== 'heatmap' || !open) {
-      if (!showFloorplan) {
+    if (floorplanRequest && !cameraFloorplan) {
+      clearCanvasElement(densityCanvasRef.current);
+      clearCanvasElement(heightCanvasRef.current);
+      clearCanvasElement(distanceCanvasRef.current);
+      return;
+    }
+
+    if (cameraFloorplan?.error) {
+      clearCanvasElement(densityCanvasRef.current);
+      clearCanvasElement(heightCanvasRef.current);
+      clearCanvasElement(distanceCanvasRef.current);
+      setFloorplanStatus('idle');
+      setFloorplanRequest('');
+      return;
+    }
+
+    if (cameraFloorplan) {
+      renderTopdownLayer(densityCanvasRef.current, densityLayer, grayscaleColor);
+      renderTopdownLayer(heightCanvasRef.current, heightLayer, infernoColor);
+      renderTopdownLayer(distanceCanvasRef.current, distanceLayer, viridisColor);
+
+      if (!floorplanRequest || !cameraFloorplan.request_id || cameraFloorplan.request_id === floorplanRequest) {
         setFloorplanStatus('idle');
         setFloorplanRequest('');
       }
-      return;
     }
-    if (activeFloorplan && !activeFloorplan.error) {
-      renderFloorplan(activeFloorplan);
-    } else if (!activeFloorplan) {
-      clearFloorplanCanvas();
-    }
-  }, [showFloorplan, activeTab, open, activeFloorplan, renderFloorplan, clearFloorplanCanvas]);
+  }, [activeTab, open, cameraFloorplan, densityLayer, heightLayer, distanceLayer, renderTopdownLayer, clearCanvasElement, floorplanRequest, drawerWidth]);
 
   useEffect(() => {
-    if (!showFloorplan || activeTab !== 'heatmap' || !open) return;
+    if (activeTab !== 'heatmap' || !open || !selectedCamera) return;
     const id = window.setInterval(() => {
-      fetchFloorplan();
+      if (floorplanStatus !== 'loading') {
+        fetchFloorplan();
+      }
     }, 30000);
     return () => window.clearInterval(id);
-  }, [showFloorplan, activeTab, open, fetchFloorplan]);
+  }, [activeTab, open, selectedCamera, floorplanStatus, fetchFloorplan]);
 
   useEffect(() => {
-    if (!showFloorplan || activeTab !== 'heatmap' || !open) return;
+    if (activeTab !== 'heatmap' || !open || !selectedCamera) return;
     fetchFloorplan();
-  }, [selectedCamera, showFloorplan, activeTab, open, fetchFloorplan]);
+  }, [selectedCamera, activeTab, open, fetchFloorplan]);
 
   useEffect(() => {
     if (!open) return;
@@ -579,92 +656,84 @@ const DepthDrawer = memo(function DepthDrawer({ open, onClose, diagnostics, dept
 
           {activeTab === 'heatmap' && (
             <>
-              {depthEntry ? (
-                <>
-                  <canvas ref={heatmapCanvasRef} className="heatmap" />
-                  <p style={{ fontSize: '12px', opacity: 0.7 }}>
-                    Updated {new Date(depthEntry.ts / 1000).toLocaleTimeString()} · resolution {depthEntry.shape[1]}×{depthEntry.shape[0]}
-                  </p>
-                  <button className="btn ghost" onClick={() => selectedCamera && onRequestDepth(selectedCamera)}>Refresh</button>
-                </>
-              ) : (
-                <p style={{ fontSize: '12px', opacity: 0.7 }}>No depth frame cached yet for this camera.</p>
-              )}
-              <div style={{ marginTop: '20px', borderTop: '1px solid rgba(255,255,255,0.15)', paddingTop: '12px' }}>
-                <div style={{ display: 'flex', gap: '12px', alignItems: 'center', flexWrap: 'wrap' }}>
-                  <label style={{ display: 'flex', alignItems: 'center', gap: '6px', fontSize: '13px' }}>
-                    <input
-                      type="checkbox"
-                      checked={showFloorplan}
-                      onChange={(ev) => {
-                        const next = ev.target.checked;
-                        setShowFloorplan(next);
-                        if (next) {
-                          setFloorplanStatus('loading');
-                        }
-                        if (next) {
-                          const cached = useHeightColormap ? floorplanCache.height : floorplanCache.density;
-                          if (cached && !cached.error) {
-                            renderFloorplan(cached);
-                          }
-                        } else {
-                          clearFloorplanCanvas();
-                          setFloorplanStatus('idle');
-                          setFloorplanRequest('');
-                        }
-                      }}
-                    />
-                    Show Floorplan (Top-down)
-                  </label>
-                  {showFloorplan && (
-                    <>
-                      <button className="btn ghost" onClick={() => fetchFloorplan()}>Refresh Floorplan</button>
-                      <label style={{ display: 'flex', alignItems: 'center', gap: '6px', fontSize: '13px' }}>
-                        <input
-                          type="checkbox"
-                          checked={useHeightColormap}
-                          onChange={(ev) => {
-                            const next = ev.target.checked;
-                            setUseHeightColormap(next);
-                            if (showFloorplan) {
-                              const cached = next ? floorplanCache.height : floorplanCache.density;
-                              if (cached && !cached.error) {
-                                renderFloorplan(cached);
-                              }
-                              fetchFloorplan({ useHeight: next });
-                            }
-                          }}
-                        />
-                        Height Colormap
-                      </label>
-                    </>
-                  )}
+              <div className="floorplan-controls">
+                <div className="floorplan-controls__actions">
+                  <button className="btn ghost" onClick={() => selectedCamera && onRequestDepth(selectedCamera)} disabled={!depthEntry}>Refresh Depth</button>
+                  <button className="btn ghost" onClick={() => fetchFloorplan()} disabled={floorplanStatus === 'loading'}>
+                    {floorplanStatus === 'loading' ? 'Loading...' : 'Refresh Floorplan'}
+                  </button>
                 </div>
-                {showFloorplan && (
-                  <div style={{ marginTop: '12px' }}>
-                    <canvas
-                      ref={floorplanCanvasRef}
-                      width={400}
-                      height={400}
-                      style={{ width: '100%', maxWidth: '400px', border: '1px solid rgba(255,255,255,0.2)', background: '#111' }}
-                    />
-                    {floorplanStatus === 'loading' && (
-                      <p style={{ fontSize: '12px', marginTop: '6px' }}>Loading floorplan…</p>
-                    )}
-                    {floorplanError && (
-                      <p style={{ fontSize: '12px', color: '#ff5c5c', marginTop: '6px' }}>Error: {floorplanError}</p>
-                    )}
-                    {!floorplanError && activeFloorplan && floorplanStatus !== 'loading' && (
-                      <p style={{ fontSize: '12px', opacity: 0.75, marginTop: '6px' }}>
-                        Points: {activeFloorplan.point_count ?? 0} · Updated {activeFloorplan.ts ? new Date(activeFloorplan.ts / 1000).toLocaleTimeString() : 'n/a'}
-                      </p>
-                    )}
-                    {!floorplanError && !activeFloorplan && floorplanStatus !== 'loading' && (
-                      <p style={{ fontSize: '12px', opacity: 0.75, marginTop: '6px' }}>Enable and refresh to generate the floorplan.</p>
-                    )}
-                  </div>
-                )}
               </div>
+
+              {floorplanError && <p className="floorplan-error">Error: {floorplanError}</p>}
+              <div className="heatmap-grid">
+                <div className="heatmap-cell heatmap-cell--left">
+                  <div className="heatmap-cell__scale">
+                    {renderScale(turboGradient, heatmapRange?.min ?? undefined, heatmapRange ? (heatmapRange.min + heatmapRange.max) / 2 : undefined, heatmapRange?.max ?? undefined, ' m')}
+                  </div>
+                  <div className="heatmap-cell__body">
+                    <div className="heatmap-cell__title">Camera Heatmap (Turbo)</div>
+                    <canvas
+                      ref={heatmapCanvasRef}
+                      className="heatmap-canvas"
+                      style={{ aspectRatio: heatmapAspect ? `${heatmapAspect}` : undefined }}
+                    />
+                  </div>
+                </div>
+                <div className="heatmap-cell heatmap-cell--right">
+                  <div className="heatmap-cell__body">
+                    <div className="heatmap-cell__title">Density (Grayscale)</div>
+                    <canvas ref={densityCanvasRef} className="heatmap-canvas" />
+                  </div>
+                  <div className="heatmap-cell__scale">
+                    {renderScale(densityGradient, 0, 0.5, 1)}
+                  </div>
+                </div>
+                <div className="heatmap-cell heatmap-cell--left">
+                  <div className="heatmap-cell__scale">
+                    {renderScale(infernoGradient, heightMin ?? undefined, heightMid ?? undefined, heightMax ?? undefined, ' m')}
+                  </div>
+                  <div className="heatmap-cell__body">
+                    <div className="heatmap-cell__title">Height (Inferno)</div>
+                    <canvas ref={heightCanvasRef} className="heatmap-canvas" />
+                  </div>
+                </div>
+                <div className="heatmap-cell heatmap-cell--right">
+                  <div className="heatmap-cell__body">
+                    <div className="heatmap-cell__title">Distance (Viridis)</div>
+                    <canvas ref={distanceCanvasRef} className="heatmap-canvas" />
+                  </div>
+                  <div className="heatmap-cell__scale">
+                    {renderScale(viridisGradient, distanceMin ?? undefined, distanceMid ?? undefined, distanceMax ?? undefined, ' m')}
+                  </div>
+                </div>
+              </div>
+
+              {/* Meta information below the grid */}
+              <div className="heatmap-meta">
+                <div className="heatmap-meta__item">
+                  {depthEntry
+                    ? `Updated ${new Date(depthEntry.ts / 1000).toLocaleTimeString()} · Resolution ${depthEntry.shape[1]}×${depthEntry.shape[0]}`
+                    : 'No depth frame cached yet for this camera.'}
+                </div>
+                <div className="heatmap-meta__item">
+                  {hasDensity ? 'Normalized point density' : 'Waiting for density data'}
+                </div>
+                <div className="heatmap-meta__item">
+                  {hasHeight ? 'Highest surface per cell.' : 'Waiting for height data'}
+                </div>
+                <div className="heatmap-meta__item">
+                  {hasDistance ? 'Average distance from camera.' : 'Waiting for distance data'}
+                </div>
+              </div>
+
+              {cameraFloorplan && !floorplanError && (
+                <p className="floorplan-meta">
+                  Points: {cameraFloorplan.point_count ?? 0}
+                  {spanX !== undefined && spanZ !== undefined ? ` · Span ${formatNumber(spanX)}m × ${formatNumber(spanZ)}m` : ''}
+                  {cameraFloorplan.ts ? ` · Updated ${new Date(cameraFloorplan.ts / 1000).toLocaleTimeString()}` : ''}
+                </p>
+              )}
             </>
           )}
 

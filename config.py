@@ -34,7 +34,7 @@ class AppConfig:
         APP_NAME: str = "YOLO Video Tracking"
         VERSION: str = "1.0.0"
         START_TIME: float = field(default_factory=time.time)
-        LOG_LEVEL: int = 20  # INFO
+        LOG_LEVEL: int = 30  # WARNING
         LOG_FILE: Optional[str] = "logs/app.log"
         DEBUG: bool = False  # Disable debug mode for performance
     

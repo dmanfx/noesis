@@ -11,7 +11,7 @@ import { cameraOrder, colorForTrack } from './lib/camera';
 import { getExtrinsics, worldToCamera } from './lib/calibration';
 import { detectCameraKey, CameraKey } from './lib/camera';
 import { useWebSocketClient, StatsPayload } from './hooks/useWebSocketClient';
-import DepthDrawer, { DepthDiagnosticsEntry, DepthDrawerEntry, FloorplanEntry } from './components/DepthDrawer';
+import DepthDrawer, { DepthDiagnosticsEntry, DepthDrawerEntry, FloorplanResponse } from './components/DepthDrawer';
 
 const WS_URL = 'ws://localhost:6008';
 
@@ -73,7 +73,7 @@ function Dashboard() {
   const [depthDrawerOpen, setDepthDrawerOpen] = useState(false);
   const [maDiagnostics, setMaDiagnostics] = useState<Record<string, DepthDiagnosticsEntry>>({});
   const [maDepthData, setMaDepthData] = useState<Record<string, DepthDrawerEntry>>({});
-  const [floorplanData, setFloorplanData] = useState<FloorplanEntry | null>(null);
+  const [floorplanData, setFloorplanData] = useState<Record<string, FloorplanResponse>>({});
   // Auto-primary selection state
   const [primaryKey, setPrimaryKey] = useState<CameraKey>(cameraOrder[0]);
   const [locked, setLocked] = useState<boolean>(false);
@@ -341,11 +341,11 @@ function Dashboard() {
   };
 
   const handleFloorplan = (payload: any) => {
-    if (!payload || payload.type !== 'floorplan_response') {
-      setFloorplanData(null);
-      return;
-    }
-    setFloorplanData(payload as FloorplanEntry);
+    if (!payload || payload.type !== 'floorplan_response') return;
+    const camRaw = payload.camera_id || payload.camera || (Array.isArray(payload.cameras) && payload.cameras[0]);
+    const camId = camRaw ? String(camRaw) : '';
+    if (!camId) return;
+    setFloorplanData(prev => ({ ...prev, [camId]: payload as FloorplanResponse }));
   };
 
   const { status, sendClearStats, sendTrailToggle, sendDetectionConfig, sendDetectionToggle, requestMapAnythingDepth, requestFloorplan } = useWebSocketClient(WS_URL, {
@@ -546,7 +546,7 @@ function Dashboard() {
         diagnostics={maDiagnostics}
         depthData={maDepthData}
         onRequestDepth={(camId) => requestMapAnythingDepth(camId)}
-        floorplan={floorplanData}
+        floorplans={floorplanData}
         onRequestFloorplan={(opts) => requestFloorplan(opts)}
       />
 

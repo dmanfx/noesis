@@ -153,6 +153,8 @@ class ApplicationManager:
         # Depth inference integration
         self.depth_source = MapAnythingDepthSource()
         self._depth_executor = ThreadPoolExecutor(max_workers=2)
+        self._depth_warmup_executor = ThreadPoolExecutor(max_workers=1)
+        self._depth_warmup_future: Optional[Future] = None
         self._pending_depth_futures: Dict[str, Future] = {}
         self._latest_depth_results: Dict[str, DepthResult] = {}
         self._camera_room_map: Dict[str, str] = {}
@@ -298,16 +300,15 @@ class ApplicationManager:
                     self.websocket_server.pixel_to_world_handler = self._pixel_to_world_rpc
                     self.websocket_server.set_extrinsics_handler = self._set_extrinsics_rpc
                     self.websocket_server.set_align_handler = self._set_align_rpc
-                    if self.depth_source:
-                        self.websocket_server.ma_depth_provider = lambda cam, ts_max=None: self.depth_source.load_latest_depth(cam, ts_max)
+                    if self.depth_source and self.websocket_server:
+                        self.websocket_server.ma_depth_provider = self.depth_source.load_latest_depth
                         self.websocket_server.floorplan_provider = (
-                            lambda cams=None, max_age=60.0, grid_res=0.5, max_extent=20.0, use_height=False:
+                            lambda cam=None, max_age=60.0, grid_res=0.5, max_extent=20.0, **_:
                                 self.depth_source.generate_topdown_floorplan(
-                                    list(cams) if cams else [],
+                                    str(cam) if cam else '',
                                     max_age_sec=max_age,
                                     grid_res_m=grid_res,
                                     max_extent_m=max_extent,
-                                    use_height=use_height,
                                 )
                         )
             except Exception as e:
@@ -1359,6 +1360,10 @@ class ApplicationManager:
             if result is not None:
                 self._latest_depth_results[camera_id] = result
                 self._last_depth_summary[camera_id] = result.summary
+                try:
+                    self.depth_source.update_depth_cache(result)
+                except Exception as exc:
+                    self.logger.debug(f"Depth cache update failed for {camera_id}: {exc}")
                 room_id = self._camera_room_map.get(camera_id, camera_id)
                 now = time.time()
                 last_pub = self._last_depth_publish.get(camera_id, 0.0)
@@ -1896,9 +1901,10 @@ class ApplicationManager:
         if self.websocket_server:
             try:
                 self.logger.info("Stopping WebSocket server")
+                stop_ok = False
                 # Use the improved sync stop method
                 try:
-                    self.websocket_server.stop_sync()
+                    stop_ok = self.websocket_server.stop_sync()
                 except Exception as e:
                     self.logger.warning(f"WebSocket server stop_sync failed: {e}")
 
@@ -1913,9 +1919,13 @@ class ApplicationManager:
                     # Fallback: mark not running
                     try:
                         self.websocket_server.running = False
-                    except Exception:
-                        self.logger.debug(f"Could not mark WebSocket server as not running: {e}")
-                self.logger.info("✅ WebSocket server shutdown initiated")
+                    except Exception as exc:
+                        self.logger.debug(f"Could not mark WebSocket server as not running: {exc}")
+
+                if stop_ok:
+                    self.logger.info("✅ WebSocket server shutdown initiated")
+                else:
+                    self.logger.warning("⚠️ WebSocket server stop did not confirm completion")
             except Exception as e:
                 self.logger.error(f"Error stopping WebSocket server: {e}")
 

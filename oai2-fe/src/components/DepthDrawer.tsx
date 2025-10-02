@@ -206,6 +206,24 @@ const DepthDrawer = memo(function DepthDrawer({ open, onClose, diagnostics, dept
   const [floorplanRequest, setFloorplanRequest] = useState<string>('');
   const [heatmapRange, setHeatmapRange] = useState<{ min: number; max: number } | null>(null);
   const [heatmapAspect, setHeatmapAspect] = useState<number | null>(null);
+
+  // Floorplan selection (declared early to avoid TDZ in hooks below)
+  const cameraFloorplan = floorplans[selectedCamera];
+  const densityLayer = cameraFloorplan?.density;
+  const heightLayer = cameraFloorplan?.height;
+  const distanceLayer = cameraFloorplan?.distance;
+  const floorplanError = cameraFloorplan?.error;
+  const hasDensity = !!(densityLayer && densityLayer.grid_b64 && densityLayer.grid_shape);
+  const hasHeight = !!(heightLayer && heightLayer.grid_b64 && heightLayer.grid_shape);
+  const hasDistance = !!(distanceLayer && distanceLayer.grid_b64 && distanceLayer.grid_shape);
+  const heightBase = heightLayer?.value_min ?? null;
+  const heightMaxRaw = heightLayer?.value_max ?? null;
+  const heightSpan = (heightBase !== null && heightMaxRaw !== null) ? Math.max(0, heightMaxRaw - heightBase) : null;
+  const distanceMin = distanceLayer?.value_min;
+  const distanceMax = distanceLayer?.value_max;
+  const distanceMid = distanceMin !== undefined && distanceMax !== undefined ? (distanceMin + distanceMax) / 2 : undefined;
+  const spanX = cameraFloorplan?.bounds ? Math.abs((cameraFloorplan.bounds.max_x ?? 0) - (cameraFloorplan.bounds.min_x ?? 0)) : undefined;
+  const spanZ = cameraFloorplan?.bounds ? Math.abs((cameraFloorplan.bounds.max_z ?? 0) - (cameraFloorplan.bounds.min_z ?? 0)) : undefined;
   const clearCanvasElement = useCallback((canvas: HTMLCanvasElement | null) => {
     if (!canvas) return;
     const ctx = canvas.getContext('2d');
@@ -263,9 +281,7 @@ const DepthDrawer = memo(function DepthDrawer({ open, onClose, diagnostics, dept
       ctx.scale(dpr, dpr);
       ctx.clearRect(0, 0, width, height);
       ctx.imageSmoothingEnabled = true;
-      ctx.translate(width / 2, height / 2);
-      ctx.rotate(Math.PI); // 180° rotation, no reflection
-      ctx.drawImage(offscreen, -width / 2, -height / 2, width, height);
+      ctx.drawImage(offscreen, 0, 0, width, height);
       ctx.restore();
 
       ctx.save();
@@ -472,22 +488,7 @@ const DepthDrawer = memo(function DepthDrawer({ open, onClose, diagnostics, dept
     ];
   }, [summary]);
 
-  const cameraFloorplan = floorplans[selectedCamera];
-  const densityLayer = cameraFloorplan?.density;
-  const heightLayer = cameraFloorplan?.height;
-  const distanceLayer = cameraFloorplan?.distance;
-  const floorplanError = cameraFloorplan?.error;
-  const hasDensity = !!(densityLayer && densityLayer.grid_b64 && densityLayer.grid_shape);
-  const hasHeight = !!(heightLayer && heightLayer.grid_b64 && heightLayer.grid_shape);
-  const hasDistance = !!(distanceLayer && distanceLayer.grid_b64 && distanceLayer.grid_shape);
-  const heightMin = heightLayer?.value_min;
-  const heightMax = heightLayer?.value_max;
-  const heightMid = heightMin !== undefined && heightMax !== undefined ? (heightMin + heightMax) / 2 : undefined;
-  const distanceMin = distanceLayer?.value_min;
-  const distanceMax = distanceLayer?.value_max;
-  const distanceMid = distanceMin !== undefined && distanceMax !== undefined ? (distanceMin + distanceMax) / 2 : undefined;
-  const spanX = cameraFloorplan?.bounds ? Math.abs((cameraFloorplan.bounds.max_x ?? 0) - (cameraFloorplan.bounds.min_x ?? 0)) : undefined;
-  const spanZ = cameraFloorplan?.bounds ? Math.abs((cameraFloorplan.bounds.max_z ?? 0) - (cameraFloorplan.bounds.min_z ?? 0)) : undefined;
+  // (moved above for TDZ safety)
 
   const renderScale = (gradient: string, min?: number, _mid?: number, max?: number, unit = '') => (
     <div className="color-scale">
@@ -691,7 +692,13 @@ const DepthDrawer = memo(function DepthDrawer({ open, onClose, diagnostics, dept
                 </div>
                 <div className="heatmap-cell heatmap-cell--left">
                   <div className="heatmap-cell__scale">
-                    {renderScale(infernoGradient, heightMin ?? undefined, heightMid ?? undefined, heightMax ?? undefined, ' m')}
+                    {renderScale(
+                      infernoGradient,
+                      heightSpan !== null ? 0 : undefined,
+                      heightSpan !== null ? Math.max(0, heightSpan / 2) : undefined,
+                      heightSpan !== null ? heightSpan : undefined,
+                      ' m'
+                    )}
                   </div>
                   <div className="heatmap-cell__body">
                     <div className="heatmap-cell__title">Height (Inferno)</div>

@@ -697,51 +697,48 @@ class MapAnythingDepthSource:
         pts_world_h = pts_cam_h @ twc.T
         pts_world = pts_world_h[:, :3]
 
-        pts_x = pts_world[:, 0]
-        pts_z = pts_world[:, 2]
-        pts_y = pts_world[:, 1]
         pts_depth = pts_cam[:, 2]
+        pts_y = pts_world[:, 1]
+        x_cam_pts = pts_cam[:, 0]
+        z_cam_pts = pts_cam[:, 2]
 
-        if pts_x.size == 0 or pts_z.size == 0:
+        if x_cam_pts.size == 0 or z_cam_pts.size == 0:
             return {'error': 'no_points', 'camera_id': camera_id, 'ts': now_us, 'point_count': 0}
 
-        min_x = float(np.min(pts_x))
-        max_x = float(np.max(pts_x))
-        min_z = float(np.min(pts_z))
-        max_z = float(np.max(pts_z))
+        pad_x = max(0.5, grid_res_m * 2.0)
+        pad_z = max(0.5, grid_res_m * 2.0)
 
-        pad = 1.0
-        min_x -= pad
-        max_x += pad
-        min_z -= pad
-        max_z += pad
+        max_x_abs = float(np.max(np.abs(x_cam_pts))) if x_cam_pts.size else 0.0
+        if not np.isfinite(max_x_abs):
+            max_x_abs = 0.0
+        forward_max = float(np.max(z_cam_pts)) if z_cam_pts.size else 0.0
+        if not np.isfinite(forward_max):
+            forward_max = 0.0
+
+        half_width = max_x_abs + pad_x
+        forward_extent = max(0.0, forward_max) + pad_z
+        if max_extent_m > 0:
+            half_width = min(half_width, max_extent_m * 0.5)
+            forward_extent = min(forward_extent, max_extent_m)
+
+        half_width = max(half_width, grid_res_m * 0.5)
+        forward_extent = max(forward_extent, grid_res_m)
+
+        min_x = -half_width
+        max_x = half_width
+        min_z = 0.0
+        max_z = forward_extent
 
         width_m = max_x - min_x
         height_m = max_z - min_z
-        max_span = max(width_m, height_m)
-        half_extent = max_span / 2.0
-        if max_extent_m > 0:
-            half_extent = min(half_extent, max_extent_m / 2.0)
-
-        center_x = (min_x + max_x) * 0.5
-        center_z = (min_z + max_z) * 0.5
-        min_x = center_x - half_extent
-        max_x = center_x + half_extent
-        min_z = center_z - half_extent
-        max_z = center_z + half_extent
-
-        width_m = max(max_x - min_x, grid_res_m)
-        height_m = max(max_z - min_z, grid_res_m)
-        max_x = min_x + width_m
-        max_z = min_z + height_m
 
         w_px = max(1, int(np.ceil(width_m / grid_res_m)))
         h_px = max(1, int(np.ceil(height_m / grid_res_m)))
 
-        x_norm = np.clip((pts_x - min_x) / width_m, 0.0, 0.999999)
-        z_norm = np.clip((pts_z - min_z) / height_m, 0.0, 0.999999)
-        x_idx = np.floor(x_norm * w_px).astype(np.int32)
-        z_idx = np.floor(z_norm * h_px).astype(np.int32)
+        x_norm = np.clip((x_cam_pts - min_x) / width_m, 0.0, 0.999999)
+        z_norm = np.clip((z_cam_pts - min_z) / height_m, 0.0, 0.999999)
+        x_idx = np.clip(np.floor(x_norm * w_px).astype(np.int32), 0, w_px - 1)
+        z_idx = np.clip(np.floor((1.0 - z_norm) * h_px).astype(np.int32), 0, h_px - 1)
 
         density_grid = np.zeros((h_px, w_px), dtype=np.float32)
         height_grid = np.full((h_px, w_px), np.nan, dtype=np.float32)
@@ -773,6 +770,10 @@ class MapAnythingDepthSource:
             height_grid = np.nan_to_num(height_grid, nan=min_height)
         height_min = float(np.min(height_grid)) if height_grid.size else 0.0
         height_max = float(np.max(height_grid)) if height_grid.size else 0.0
+        if height_grid.size:
+            height_grid = height_grid - height_min
+            height_min = 0.0
+            height_max = float(np.max(height_grid)) if height_grid.size else 0.0
 
         distance_grid = np.zeros((h_px, w_px), dtype=np.float32)
         nonzero_mask = distance_count > 0

@@ -52,6 +52,16 @@ def _to_optional_bytes(raw: Optional[str]) -> Optional[int]:
     return int(float(cleaned))
 
 
+def _normalize_amp(raw: str) -> str:
+    """Normalize AMP dtype string to one of: 'fp32', 'fp16', 'bf16'."""
+    cleaned = _strip_comment(raw).lower()
+    valid_options = {"fp32", "fp16", "bf16"}
+    if cleaned in valid_options:
+        return cleaned
+    # Default to bf16 if invalid
+    return "bf16"
+
+
 @dataclass(frozen=True)
 class ServiceSettings:
     host: str

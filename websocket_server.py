@@ -1,5 +1,6 @@
 from typing import Dict, Optional, Any, Callable
 import asyncio
+import concurrent.futures
 import websockets
 import json
 import logging
@@ -51,6 +52,14 @@ class WebSocketServer:
         # Lightweight telemetry for Menon calibration/coordinate RPCs
         self._telemetry: Dict[str, Dict[str, Any]] = {"rx": {}, "tx": {}}
         self._telemetry_task: Optional[asyncio.Task] = None
+        # RPC guardrails
+        self._depth_rpc_tracker: Dict[str, float] = {}
+        self._floorplan_rpc_tracker: Dict[str, float] = {}
+        self._depth_rate_limit_window = 0.5  # seconds per camera/client
+        self._floorplan_rate_limit_window = 2.0
+        self._depth_rpc_timeout = 4.0  # seconds
+        self._floorplan_rpc_timeout = 6.0
+        self._tracker_prune_window = 30.0
         # Optional calibration + RPC callbacks
         self.calibration_getter: Optional[Callable[[], Dict[str, Any]]] = None
         self.pixel_to_world_handler: Optional[Callable[[Dict[str, Any]], Dict[str, Any]]] = None
@@ -369,24 +378,50 @@ class WebSocketServer:
             except asyncio.CancelledError:
                 pass
 
-    def stop_sync(self):
+    def stop_sync(self, timeout: float = 5.0) -> bool:
         """Synchronous stop method for use from other threads"""
         self.logger.info("Stopping WebSocket server (sync mode)...")
         self.running = False
 
-        # Create a task to run the async stop in the current event loop
+        # Attempt to schedule the async stop on an active event loop
         try:
             loop = asyncio.get_running_loop()
-            loop.create_task(self.stop())
         except RuntimeError:
-            # No running loop, try to get the event loop from the instance
-            if hasattr(self, 'event_loop') and self.event_loop:
-                try:
-                    asyncio.run_coroutine_threadsafe(self.stop(), self.event_loop)
-                except Exception as e:
-                    self.logger.warning(f"Could not stop WebSocket server via event loop: {e}")
-            else:
-                self.logger.warning("No event loop available for WebSocket server shutdown")
+            loop = None
+
+        # If we're already running inside the websocket event loop thread, just schedule the coroutine
+        if loop is not None:
+            try:
+                loop.create_task(self.stop())
+                return True
+            except Exception as exc:
+                self.logger.warning(f"Could not schedule WebSocket stop on running loop: {exc}")
+                return False
+
+        target_loop = getattr(self, 'event_loop', None)
+        if not target_loop or target_loop.is_closed():
+            self.logger.warning("No event loop available for WebSocket server shutdown")
+            return False
+
+        if not target_loop.is_running():
+            self.logger.warning("WebSocket event loop not running during shutdown")
+            return False
+
+        try:
+            future = asyncio.run_coroutine_threadsafe(self.stop(), target_loop)
+        except Exception as exc:
+            self.logger.warning(f"Could not stop WebSocket server via event loop: {exc}")
+            return False
+
+        try:
+            future.result(timeout=timeout)
+            return True
+        except concurrent.futures.TimeoutError:
+            self.logger.warning(f"WebSocket server stop did not complete within {timeout}s")
+            return False
+        except Exception as exc:
+            self.logger.error(f"Error waiting for WebSocket server stop: {exc}")
+            return False
     
     async def handle_client(self, websocket, path=None):
         """Handle incoming WebSocket connections and messages
@@ -660,58 +695,99 @@ class WebSocketServer:
                                 ts_max = ts
                             except Exception:
                                 ts_max = None
+
+                        rate_key = f"{client_ip}:{cam_id or 'unknown'}"
+                        now = time.time()
+                        last = self._depth_rpc_tracker.get(rate_key, 0.0)
+                        if now - last < self._depth_rate_limit_window:
+                            self.logger.debug(f"Depth RPC throttled for {rate_key}")
+                            continue
+                        self._depth_rpc_tracker[rate_key] = now
+                        if len(self._depth_rpc_tracker) > 256:
+                            self._depth_rpc_tracker = {
+                                k: v for k, v in self._depth_rpc_tracker.items() if now - v <= self._tracker_prune_window
+                            }
+
                         result = {'type': 'ma_depth_response', 'cam_id': cam_id}
                         if cam_id and callable(self.ma_depth_provider):
                             try:
-                                payload = self.ma_depth_provider(cam_id, ts_max)
+                                payload = await asyncio.wait_for(
+                                    asyncio.to_thread(self.ma_depth_provider, cam_id, ts_max),
+                                    timeout=self._depth_rpc_timeout
+                                )
                                 if payload:
                                     result.update(payload)
                                     result['ok'] = True
+                                    # Pre-serialize heavy payload off loop
+                                    message_text = await asyncio.to_thread(json.dumps, result)
+                                    await websocket.send(message_text)
                                 else:
                                     result.update({'ok': False, 'error': 'not_available'})
+                                    await websocket.send(json.dumps(result))
+                            except asyncio.TimeoutError:
+                                self.logger.warning(f"Depth RPC timed out for {cam_id} from {client_ip}")
+                                result.update({'ok': False, 'error': 'timeout'})
+                                await websocket.send(json.dumps(result))
                             except Exception as exc:
                                 result.update({'ok': False, 'error': str(exc)})
+                                await websocket.send(json.dumps(result))
                         else:
                             result.update({'ok': False, 'error': 'no_provider'})
-                        try:
                             await websocket.send(json.dumps(result))
-                        except Exception:
-                            pass
 
                     elif data.get('type') == 'get_floorplan':
                         request_id = data.get('request_id') or data.get('requestId') or str(uuid.uuid4())
-                        cameras_raw = data.get('cameras') if isinstance(data.get('cameras'), list) else []
-                        cameras = [str(cam) for cam in cameras_raw if isinstance(cam, str) and cam]
+                        camera = data.get('camera')
+                        if not camera and isinstance(data.get('cameras'), list) and data['cameras']:
+                            camera = str(data['cameras'][0])
+                        camera = str(camera) if camera else ''
                         max_age_sec = float(data.get('max_age_sec', data.get('maxAgeSec', 60.0)))
                         grid_res_m = float(data.get('grid_res_m', data.get('gridResM', 0.5)))
                         max_extent_m = float(data.get('max_extent_m', data.get('maxExtentM', 20.0)))
-                        use_height = bool(data.get('use_height', data.get('useHeight', False)))
+
+                        rate_key = f"{client_ip}:{camera or 'unknown'}"
+                        now = time.time()
+                        last = self._floorplan_rpc_tracker.get(rate_key, 0.0)
+                        if now - last < self._floorplan_rate_limit_window:
+                            self.logger.debug(f"Floorplan RPC throttled for {rate_key}")
+                            continue
+                        self._floorplan_rpc_tracker[rate_key] = now
+                        if len(self._floorplan_rpc_tracker) > 256:
+                            self._floorplan_rpc_tracker = {
+                                k: v for k, v in self._floorplan_rpc_tracker.items() if now - v <= self._tracker_prune_window
+                            }
 
                         result = {
                             'type': 'floorplan_response',
                             'request_id': request_id,
-                            'cameras': cameras,
-                            'use_height': use_height,
+                            'camera_id': camera,
                         }
 
                         provider = getattr(self, 'floorplan_provider', None)
                         if callable(provider):
                             try:
-                                payload = provider(cameras, max_age_sec, grid_res_m, max_extent_m, use_height)
+                                payload = await asyncio.wait_for(
+                                    asyncio.to_thread(provider, camera, max_age_sec, grid_res_m, max_extent_m),
+                                    timeout=self._floorplan_rpc_timeout
+                                )
                                 if payload:
                                     result.update(payload)
+                                    message_text = await asyncio.to_thread(json.dumps, result)
+                                    await websocket.send(message_text)
                                 else:
                                     result['error'] = 'no_payload'
+                                    await websocket.send(json.dumps(result))
+                            except asyncio.TimeoutError:
+                                self.logger.warning(f"Floorplan RPC timed out for {camera} from {client_ip}")
+                                result['error'] = 'timeout'
+                                await websocket.send(json.dumps(result))
                             except Exception as exc:
                                 result['error'] = str(exc)
                                 self.logger.error(f"Floorplan generation error: {exc}")
+                                await websocket.send(json.dumps(result))
                         else:
                             result['error'] = 'no_provider'
-
-                        try:
                             await websocket.send(json.dumps(result))
-                        except Exception:
-                            pass
 
                     # Handle individual detection toggles
                     elif data.get('type') == 'set_detection_toggle':

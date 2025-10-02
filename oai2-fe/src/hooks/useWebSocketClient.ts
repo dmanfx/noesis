@@ -37,11 +37,10 @@ export type FrameHandlers = {
 };
 
 export type FloorplanRequest = {
-  cameras?: string[];
+  camera?: string;
   maxAgeSec?: number;
   gridResM?: number;
   maxExtentM?: number;
-  useHeight?: boolean;
   requestId?: string;
 };
 
@@ -220,11 +219,10 @@ export function useWebSocketClient(url: string, handlers: FrameHandlers) {
       const ok = sendJson({
         type: 'get_floorplan',
         request_id: requestId,
-        cameras: options?.cameras,
+        camera: options?.camera,
         max_age_sec: options?.maxAgeSec ?? 60,
         grid_res_m: options?.gridResM ?? 0.5,
-        max_extent_m: options?.maxExtentM ?? 20,
-        use_height: options?.useHeight ?? false
+        max_extent_m: options?.maxExtentM ?? 20
       });
       return ok ? requestId : '';
     }

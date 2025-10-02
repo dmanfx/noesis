@@ -105,12 +105,238 @@
   color: inherit;
   border-radius: 6px;
 }
-.depth-drawer canvas.heatmap {
+.floorplan-controls {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+  margin-bottom: 16px;
+}
+
+.floorplan-toggle {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 13px;
+}
+
+.floorplan-controls__actions {
+  display: flex;
+  gap: 8px;
+  margin-left: auto;
+  align-items: center;
+  flex-wrap: wrap;
+}
+
+.heatmap-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+  margin-bottom: 16px;
+}
+
+.heatmap-cell {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  gap: 12px;
+  align-items: stretch;
+}
+
+.heatmap-cell--right {
+  grid-template-columns: minmax(0, 1fr) auto;
+}
+
+.heatmap-cell__body {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  min-height: 0;
+}
+
+.heatmap-cell__title {
+  font-size: 12px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: rgba(255, 255, 255, 0.8);
+  font-weight: 500;
+  text-align: center;
+}
+
+.heatmap-canvas {
   width: 100%;
-  height: auto;
-  border-radius: 6px;
-  background: rgba(0, 0, 0, 0.4);
+  background: #0d1320;
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  border-radius: 4px;
+  aspect-ratio: 1 / 1;
+  flex: 1;
+}
+
+.heatmap-cell__scale {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  align-self: stretch;
+  height: 100%;
+}
+
+.heatmap-cell--left .color-scale,
+.heatmap-cell--right .color-scale {
+  width: 48px;
+  height: 100%;
+  gap: 8px;
+}
+
+.heatmap-cell--left .color-scale,
+.heatmap-cell--left .color-scale__labels,
+.heatmap-cell--right .color-scale,
+.heatmap-cell--right .color-scale__labels {
+  flex-direction: column;
+  align-items: center;
+}
+
+.color-scale__bar {
+  width: 18px;
+  min-height: 100%;
+  flex: 1;
+}
+
+.color-scale__label {
+  font-size: 10px;
+  white-space: nowrap;
+}
+
+.color-scale__label--max {
+  align-self: flex-start;
+}
+
+.color-scale__label--min {
+  align-self: flex-end;
+}
+
+@media (max-width: 560px) {
+  .heatmap-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .heatmap-cell,
+  .heatmap-cell--right {
+    grid-template-columns: auto minmax(0, 1fr);
+  }
+
+  .color-scale__bar {
+    min-height: 140px;
+  }
+}
+
+.heatmap-meta {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 12px;
   margin-bottom: 12px;
+}
+
+.heatmap-meta__item {
+  font-size: 11px;
+  opacity: 0.7;
+  padding: 6px 8px;
+  background: rgba(255, 255, 255, 0.03);
+  border-radius: 4px;
+  text-align: center;
+}
+
+.floorplan-error {
+  color: #ff5c5c;
+  font-size: 12px;
+  margin-bottom: 8px;
+}
+
+.floorplan-status {
+  font-size: 12px;
+  margin-bottom: 8px;
+  opacity: 0.8;
+}
+
+.floorplan-meta {
+  font-size: 12px;
+  opacity: 0.75;
+  margin-top: 14px;
+}
+
+.color-scale {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  width: 42px;
+  gap: 6px;
+}
+
+.color-scale__bar {
+  width: 16px;
+  flex: 1;
+  border-radius: 10px;
+  border: 1px solid rgba(255, 255, 255, 0.25);
+  min-height: 90px;
+}
+
+.color-scale__labels {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  font-size: 10px;
+  opacity: 0.75;
+  gap: 6px;
+}
+
+.color-scale__labels span {
+  white-space: nowrap;
+}
+
+/* Adjust color scale for rotated (horizontal) positioning */
+.heatmap-scale--turbo .color-scale,
+.heatmap-scale--density .color-scale {
+  flex-direction: row;
+  height: 42px;
+  width: auto;
+  gap: 8px;
+}
+
+.heatmap-scale--turbo .color-scale__bar,
+.heatmap-scale--density .color-scale__bar {
+  width: 90px;
+  height: 16px;
+  min-height: auto;
+  flex: none;
+}
+
+.heatmap-scale--turbo .color-scale__labels,
+.heatmap-scale--density .color-scale__labels {
+  flex-direction: row;
+  align-items: center;
+  gap: 4px;
+}
+
+.heatmap-single {
+  background: rgba(255, 255, 255, 0.05);
+  border-radius: 8px;
+  padding: 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.heatmap-single__content {
+  display: flex;
+  gap: 12px;
+  align-items: stretch;
+}
+
+.heatmap-single__content .floorplan-canvas {
+  aspect-ratio: auto;
+}
+
+.heatmap-single__meta {
+  font-size: 12px;
+  opacity: 0.75;
 }
 .depth-drawer .stat-grid {
   display: grid;

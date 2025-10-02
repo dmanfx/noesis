@@ -7,11 +7,11 @@ import logging
 import shutil
 import threading
 import time
-from collections import deque
+from collections import OrderedDict, deque
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Deque, Dict, List, Mapping, Optional, Tuple
+from typing import Any, Deque, Dict, Iterable, Mapping, Optional, Tuple
 
 import cv2
 import numpy as np
@@ -306,6 +306,9 @@ class DepthStorageManager:
                     return path
             return None
 
+    def all_cameras(self) -> Iterable[str]:
+        return list(self._indices.keys())
+
     def load_datasets(self, path: Path) -> Optional[Dict[str, np.ndarray]]:
         try:
             group = zarr.open_group(str(path), mode='r')
@@ -334,6 +337,11 @@ class MapAnythingDepthSource:
         self.mono_interval = 1.0 / max(self.config.performance.mono_freq_hz, 1e-6)
         self.last_request_per_camera: Dict[str, float] = {}
         self.timeout = 5.0
+        self._cache_lock = threading.Lock()
+        self._depth_payload_cache: "OrderedDict[str, Dict[str, Any]]" = OrderedDict()
+        self._floorplan_cache: "OrderedDict[Tuple[str, float, float], Dict[str, Any]]" = OrderedDict()
+        self._max_depth_cache_entries = 16
+        self._max_floorplan_cache_entries = 24
 
     def should_infer(self, camera_id: str, timestamp_s: float) -> bool:
         last = self.last_request_per_camera.get(camera_id)
@@ -474,6 +482,14 @@ class MapAnythingDepthSource:
         )
 
     def load_latest_depth(self, camera_id: str, ts_max: Optional[int] = None) -> Optional[Dict[str, Any]]:
+        cache_key = camera_id
+        with self._cache_lock:
+            cached = self._depth_payload_cache.get(cache_key)
+            if cached:
+                cached_ts = cached.get('ts', 0)
+                if ts_max is None or cached_ts <= (ts_max or cached_ts):
+                    return dict(cached)
+
         path = self.storage.latest_entry(camera_id, ts_max)
         if not path:
             return None
@@ -485,158 +501,209 @@ class MapAnythingDepthSource:
         mask = datasets['mask'].astype(np.uint8, copy=False)
         height, width = depth.shape[:2]
         ts_us = int(path.stem)
-        return {
+        payload = {
             'ts': ts_us,
             'depth_b64': base64.b64encode(depth.tobytes()).decode('ascii'),
             'conf_b64': base64.b64encode(conf.tobytes()).decode('ascii'),
             'mask_b64': base64.b64encode(mask.tobytes()).decode('ascii'),
             'shape': [int(height), int(width)],
         }
+        with self._cache_lock:
+            self._depth_payload_cache[cache_key] = dict(payload)
+            self._depth_payload_cache.move_to_end(cache_key, last=True)
+            while len(self._depth_payload_cache) > self._max_depth_cache_entries:
+                self._depth_payload_cache.popitem(last=False)
+        return payload
 
-    def generate_topdown_floorplan(
+    def update_depth_cache(self, result: DepthResult) -> None:
+        try:
+            depth_bytes = result.depth.astype(np.float32, copy=False).tobytes()
+            conf_bytes = result.conf.astype(np.float32, copy=False).tobytes()
+            mask_bytes = result.mask.astype(np.uint8, copy=False).tobytes()
+        except Exception as exc:
+            self.logger.debug(f"Depth cache serialization failed for {result.camera_id}: {exc}")
+            return
+        payload = {
+            'ts': result.ts_us,
+            'depth_b64': base64.b64encode(depth_bytes).decode('ascii'),
+            'conf_b64': base64.b64encode(conf_bytes).decode('ascii'),
+            'mask_b64': base64.b64encode(mask_bytes).decode('ascii'),
+            'shape': [int(result.depth.shape[0]), int(result.depth.shape[1])],
+        }
+        with self._cache_lock:
+            self._depth_payload_cache[result.camera_id] = payload
+            self._depth_payload_cache.move_to_end(result.camera_id, last=True)
+            while len(self._depth_payload_cache) > self._max_depth_cache_entries:
+                self._depth_payload_cache.popitem(last=False)
+
+    def precompute_for_cameras(
         self,
-        cameras: List[str],
+        camera_ids: Iterable[str],
         max_age_sec: float = 60.0,
         grid_res_m: float = 0.5,
         max_extent_m: float = 20.0,
-        use_height: bool = False,
+    ) -> None:
+        for cam_id in camera_ids:
+            if not cam_id:
+                continue
+            try:
+                self.load_latest_depth(cam_id)
+            except Exception as exc:
+                self.logger.debug(f"Depth cache warmup for {cam_id} failed: {exc}")
+                continue
+            try:
+                self.generate_topdown_floorplan(
+                    cam_id,
+                    max_age_sec=max_age_sec,
+                    grid_res_m=grid_res_m,
+                    max_extent_m=max_extent_m,
+                )
+            except Exception as exc:
+                self.logger.debug(f"Floorplan warmup for {cam_id} failed: {exc}")
+
+    def generate_topdown_floorplan(
+        self,
+        camera_id: str,
+        max_age_sec: float = 60.0,
+        grid_res_m: float = 0.5,
+        max_extent_m: float = 20.0,
     ) -> Dict[str, Any]:
-        """Aggregate latest MapAnything depths into a top-down XZ floorplan grid."""
+        """Generate a per-camera top-down (XZ) blueprint view from the latest depth snapshot."""
+        if not camera_id:
+            return {'error': 'camera_required', 'ts': int(time.time() * 1_000_000)}
+
+        cache_key = (camera_id, float(grid_res_m), float(max_extent_m))
+        with self._cache_lock:
+            cached = self._floorplan_cache.get(cache_key)
+            if cached:
+                age_us = int(time.time() * 1_000_000) - cached.get('snapshot_ts', cached.get('ts', 0))
+                if age_us <= int(max(0.0, max_age_sec) * 1_000_000):
+                    return dict(cached)
+
         now_us = int(time.time() * 1_000_000)
         max_age_us = int(max(0.0, max_age_sec) * 1_000_000)
         ts_cutoff = now_us - max_age_us if max_age_us > 0 else None
+
+        path_entry = self.storage.latest_entry(camera_id, now_us)
+        if not path_entry:
+            return {'error': 'no_depth', 'camera_id': camera_id, 'ts': now_us}
+
+        if ts_cutoff is not None:
+            try:
+                snapshot_ts = int(path_entry.stem)
+            except ValueError:
+                snapshot_ts = None
+            if snapshot_ts is None or snapshot_ts < ts_cutoff:
+                return {'error': 'stale_depth', 'camera_id': camera_id, 'ts': now_us}
+
+        datasets = self.storage.load_datasets(path_entry)
+        if not datasets:
+            return {'error': 'load_failed', 'camera_id': camera_id, 'ts': now_us}
+
+        depth = datasets.get('depth')
+        conf = datasets.get('conf')
+        mask = datasets.get('mask')
+        if depth is None or conf is None or mask is None:
+            return {'error': 'invalid_snapshot', 'camera_id': camera_id, 'ts': now_us}
 
         calib_bundle = getattr(self, 'calibration_bundle', None) or {}
         cameras_node = calib_bundle.get('cameras') if isinstance(calib_bundle, dict) else {}
         k_table = cameras_node.get('K') if isinstance(cameras_node, dict) else {}
         e_table = cameras_node.get('E') if isinstance(cameras_node, dict) else {}
 
-        points_x = []
-        points_z = []
-        heights = [] if use_height else None
+        intr = None
+        extr = None
+        if isinstance(k_table, dict):
+            intr = k_table.get(camera_id)
+        if isinstance(e_table, dict):
+            extr = e_table.get(camera_id)
 
-        total_points = 0
+        if intr is None or extr is None:
+            legacy_cam = cameras_node.get(camera_id) if isinstance(cameras_node, dict) else None
+            if isinstance(legacy_cam, dict):
+                if intr is None:
+                    maybe_intr = legacy_cam.get('intrinsics')
+                    if isinstance(maybe_intr, (list, tuple)) and len(maybe_intr) == 9:
+                        intr = maybe_intr
+                if extr is None:
+                    maybe_extr = legacy_cam.get('extrinsics')
+                    if isinstance(maybe_extr, dict):
+                        extr = maybe_extr.get('E')
 
-        cam_list = []
-        for cam in cameras or []:
-            if isinstance(cam, str) and cam:
-                cam_list.append(cam)
-        if not cam_list:
-            cam_list = list(k_table.keys()) if isinstance(k_table, dict) else []
+        if intr is None or extr is None:
+            return {'error': 'missing_calibration', 'camera_id': camera_id, 'ts': now_us}
+
+        depth = np.asarray(depth, dtype=np.float32)
+        conf = np.asarray(conf, dtype=np.float32)
+        mask = np.asarray(mask, dtype=np.uint8) > 0
+        if depth.ndim != 2 or conf.shape != depth.shape or mask.shape != depth.shape:
+            return {'error': 'shape_mismatch', 'camera_id': camera_id, 'ts': now_us}
+
+        intr_arr = np.asarray(intr, dtype=np.float32).reshape(-1)
+        if intr_arr.size == 4:
+            fx, fy, cx, cy = [float(v) for v in intr_arr]
+        elif intr_arr.size == 9:
+            k_mat = intr_arr.reshape(3, 3)
+            fx = float(k_mat[0, 0])
+            fy = float(k_mat[1, 1])
+            cx = float(k_mat[0, 2])
+            cy = float(k_mat[1, 2])
         else:
-            cam_list = list(dict.fromkeys(cam_list))
+            return {'error': 'bad_intrinsics', 'camera_id': camera_id, 'ts': now_us}
 
-        for cam_id in cam_list:
-            path = self.storage.latest_entry(cam_id, now_us)
-            if not path or (ts_cutoff is not None and int(path.stem) < ts_cutoff):
-                continue
-            datasets = self.storage.load_datasets(path)
-            if not datasets:
-                continue
-            depth = datasets.get('depth')
-            conf = datasets.get('conf')
-            mask = datasets.get('mask')
-            if depth is None or conf is None or mask is None:
-                continue
+        if not all(np.isfinite([fx, fy, cx, cy])) or fx == 0.0 or fy == 0.0:
+            return {'error': 'invalid_intrinsics', 'camera_id': camera_id, 'ts': now_us}
 
-            intr = None
-            extr = None
-            if isinstance(k_table, dict):
-                intr = k_table.get(cam_id)
-            if isinstance(e_table, dict):
-                extr = e_table.get(cam_id)
+        valid = np.isfinite(depth)
+        valid &= depth > 0.1
+        valid &= depth < 50.0
+        valid &= mask
+        if np.isfinite(self.min_conf):
+            valid &= conf >= float(self.min_conf)
 
-            if intr is None or extr is None:
-                legacy_cam = cameras_node.get(cam_id) if isinstance(cameras_node, dict) else None
-                if isinstance(legacy_cam, dict):
-                    if intr is None:
-                        maybe_intr = legacy_cam.get('intrinsics')
-                        if isinstance(maybe_intr, (list, tuple)) and len(maybe_intr) == 9:
-                            intr = maybe_intr
-                    if extr is None:
-                        maybe_extr = legacy_cam.get('extrinsics')
-                        if isinstance(maybe_extr, dict):
-                            extr = maybe_extr.get('E')
+        if not np.any(valid):
+            return {'error': 'no_points', 'camera_id': camera_id, 'ts': now_us, 'point_count': 0}
 
-            if intr is None or extr is None:
-                continue
+        h_img, w_img = depth.shape
+        grid_u, grid_v = np.meshgrid(
+            np.arange(w_img, dtype=np.float32),
+            np.arange(h_img, dtype=np.float32),
+            indexing='xy'
+        )
 
-            depth = np.asarray(depth, dtype=np.float32)
-            conf = np.asarray(conf, dtype=np.float32)
-            mask = np.asarray(mask, dtype=np.uint8) > 0
-            if depth.ndim != 2 or conf.shape != depth.shape or mask.shape != depth.shape:
-                continue
+        x_cam = (grid_u - cx) * depth / fx
+        y_cam = (grid_v - cy) * depth / fy
+        z_cam = depth
 
-            intr_arr = np.asarray(intr, dtype=np.float32).reshape(-1)
-            fx = fy = cx = cy = None
-            if intr_arr.size == 4:
-                fx, fy, cx, cy = [float(v) for v in intr_arr]
-            elif intr_arr.size == 9:
-                k_mat = intr_arr.reshape(3, 3)
-                fx = float(k_mat[0, 0])
-                fy = float(k_mat[1, 1])
-                cx = float(k_mat[0, 2])
-                cy = float(k_mat[1, 2])
-            else:
-                continue
+        pts_cam = np.stack([x_cam[valid], y_cam[valid], z_cam[valid]], axis=1)
 
-            if not all(np.isfinite([fx, fy, cx, cy])) or fx == 0.0 or fy == 0.0:
-                continue
+        e_arr = np.asarray(extr, dtype=np.float32)
+        if e_arr.size == 16:
+            e_mat = e_arr.reshape(4, 4, order='F')
+        elif e_arr.shape == (3, 4):
+            e_mat = np.eye(4, dtype=np.float32)
+            e_mat[:3, :4] = e_arr
+        elif e_arr.shape == (4, 4):
+            e_mat = e_arr
+        else:
+            return {'error': 'bad_extrinsics', 'camera_id': camera_id, 'ts': now_us}
 
-            valid = np.isfinite(depth)
-            valid &= depth > 0.1
-            valid &= depth < 50.0
-            valid &= mask
-            if np.isfinite(self.min_conf):
-                valid &= conf >= float(self.min_conf)
+        try:
+            twc = np.linalg.inv(e_mat)
+        except np.linalg.LinAlgError:
+            return {'error': 'extrinsics_singular', 'camera_id': camera_id, 'ts': now_us}
 
-            if not np.any(valid):
-                continue
+        pts_cam_h = np.concatenate([pts_cam, np.ones((pts_cam.shape[0], 1), dtype=np.float32)], axis=1)
+        pts_world_h = pts_cam_h @ twc.T
+        pts_world = pts_world_h[:, :3]
 
-            h_img, w_img = depth.shape
-            grid_u, grid_v = np.meshgrid(
-                np.arange(w_img, dtype=np.float32),
-                np.arange(h_img, dtype=np.float32),
-                indexing='xy'
-            )
+        pts_x = pts_world[:, 0]
+        pts_z = pts_world[:, 2]
+        pts_y = pts_world[:, 1]
+        pts_depth = pts_cam[:, 2]
 
-            x_cam = (grid_u - cx) * depth / fx
-            y_cam = (grid_v - cy) * depth / fy
-            z_cam = depth
-
-            pts_cam = np.stack([x_cam[valid], y_cam[valid], z_cam[valid]], axis=1)
-            total_points += pts_cam.shape[0]
-
-            e_arr = np.asarray(extr, dtype=np.float32)
-            if e_arr.size == 16:
-                e_mat = e_arr.reshape(4, 4, order='F')
-            elif e_arr.shape == (3, 4):
-                e_mat = np.eye(4, dtype=np.float32)
-                e_mat[:3, :4] = e_arr
-            elif e_arr.shape == (4, 4):
-                e_mat = e_arr
-            else:
-                continue
-
-            try:
-                twc = np.linalg.inv(e_mat)
-            except np.linalg.LinAlgError:
-                continue
-
-            pts_cam_h = np.concatenate([pts_cam, np.ones((pts_cam.shape[0], 1), dtype=np.float32)], axis=1)
-            pts_world_h = pts_cam_h @ twc.T
-            pts_world = pts_world_h[:, :3]
-
-            points_x.extend(pts_world[:, 0].tolist())
-            points_z.extend(pts_world[:, 2].tolist())
-            if use_height and heights is not None:
-                heights.extend(pts_world[:, 1].tolist())
-
-        if not points_x or not points_z:
-            return {'error': 'no_points', 'ts': now_us, 'point_count': 0}
-
-        pts_x = np.array(points_x, dtype=np.float32)
-        pts_z = np.array(points_z, dtype=np.float32)
+        if pts_x.size == 0 or pts_z.size == 0:
+            return {'error': 'no_points', 'camera_id': camera_id, 'ts': now_us, 'point_count': 0}
 
         min_x = float(np.min(pts_x))
         max_x = float(np.max(pts_x))
@@ -676,32 +743,46 @@ class MapAnythingDepthSource:
         x_idx = np.floor(x_norm * w_px).astype(np.int32)
         z_idx = np.floor(z_norm * h_px).astype(np.int32)
 
-        grid = np.zeros((h_px, w_px), dtype=np.float32)
+        density_grid = np.zeros((h_px, w_px), dtype=np.float32)
+        height_grid = np.full((h_px, w_px), np.nan, dtype=np.float32)
+        distance_sum = np.zeros((h_px, w_px), dtype=np.float32)
+        distance_count = np.zeros((h_px, w_px), dtype=np.uint32)
 
-        if use_height and heights is not None:
-            heights_arr = np.array(heights, dtype=np.float32)
-            value_min = float(np.min(heights_arr)) if heights_arr.size else 0.0
-            value_max = float(np.max(heights_arr)) if heights_arr.size else 0.0
-            grid.fill(np.nan)
-            for xi, zi, val in zip(x_idx, z_idx, heights_arr):
-                current = grid[zi, xi]
-                if np.isnan(current):
-                    grid[zi, xi] = val
-                else:
-                    grid[zi, xi] = max(current, val)
-            if np.isnan(grid).any():
-                grid = np.nan_to_num(grid, nan=value_min)
+        for xi, zi in zip(x_idx, z_idx):
+            density_grid[zi, xi] += 1.0
+
+        heights_arr = np.array(pts_y, dtype=np.float32)
+        for xi, zi, val in zip(x_idx, z_idx, heights_arr):
+            current = height_grid[zi, xi]
+            if np.isnan(current) or val > current:
+                height_grid[zi, xi] = val
+
+        for xi, zi, val in zip(x_idx, z_idx, pts_depth):
+            distance_sum[zi, xi] += float(val)
+            distance_count[zi, xi] += 1
+
+        density_max = float(np.max(density_grid)) if density_grid.size else 0.0
+        if density_max > 0.0:
+            density_grid /= density_max
+
+        if np.isnan(height_grid).any():
+            if not np.isnan(height_grid).all():
+                min_height = float(np.nanmin(height_grid))
+            else:
+                min_height = 0.0
+            height_grid = np.nan_to_num(height_grid, nan=min_height)
+        height_min = float(np.min(height_grid)) if height_grid.size else 0.0
+        height_max = float(np.max(height_grid)) if height_grid.size else 0.0
+
+        distance_grid = np.zeros((h_px, w_px), dtype=np.float32)
+        nonzero_mask = distance_count > 0
+        if np.any(nonzero_mask):
+            distance_grid[nonzero_mask] = distance_sum[nonzero_mask] / distance_count[nonzero_mask]
+            min_distance = float(np.min(distance_grid[nonzero_mask]))
+            max_distance = float(np.max(distance_grid[nonzero_mask]))
         else:
-            for xi, zi in zip(x_idx, z_idx):
-                grid[zi, xi] += 1.0
-            max_val = float(np.max(grid)) if grid.size else 0.0
-            if max_val > 0.0:
-                grid /= max_val
-            value_min = 0.0
-            value_max = 1.0
-
-        grid_bytes = grid.astype(np.float32, copy=False).ravel().tobytes()
-        grid_b64 = base64.b64encode(grid_bytes).decode('ascii')
+            min_distance = 0.0
+            max_distance = 0.0
 
         bounds = {
             'min_x': float(min_x),
@@ -711,22 +792,37 @@ class MapAnythingDepthSource:
         }
 
         payload: Dict[str, Any] = {
-            'grid_b64': grid_b64,
-            'grid_shape': [int(h_px), int(w_px)],
+            'camera_id': camera_id,
+            'ts': now_us,
+            'snapshot_ts': int(path_entry.stem) if path_entry.stem.isdigit() else None,
             'bounds': bounds,
             'scale_m_per_px': float(width_m / w_px if w_px else grid_res_m),
-            'use_height': bool(use_height),
-            'point_count': int(total_points),
-            'ts': now_us,
+            'point_count': int(pts_cam.shape[0]),
+            'density': {
+                'grid_b64': base64.b64encode(density_grid.astype(np.float32, copy=False).ravel().tobytes()).decode('ascii'),
+                'grid_shape': [int(h_px), int(w_px)],
+                'value_min': 0.0,
+                'value_max': 1.0,
+            },
+            'height': {
+                'grid_b64': base64.b64encode(height_grid.astype(np.float32, copy=False).ravel().tobytes()).decode('ascii'),
+                'grid_shape': [int(h_px), int(w_px)],
+                'value_min': float(height_min),
+                'value_max': float(height_max),
+            },
+            'distance': {
+                'grid_b64': base64.b64encode(distance_grid.astype(np.float32, copy=False).ravel().tobytes()).decode('ascii'),
+                'grid_shape': [int(h_px), int(w_px)],
+                'value_min': float(min_distance),
+                'value_max': float(max_distance),
+            },
         }
 
-        if use_height:
-            payload['value_min'] = float(value_min)
-            payload['value_max'] = float(value_max)
-
-        payload.setdefault('value_min', 0.0)
-        payload.setdefault('value_max', 1.0)
-        payload['cameras'] = list(cam_list)
+        with self._cache_lock:
+            self._floorplan_cache[cache_key] = dict(payload)
+            self._floorplan_cache.move_to_end(cache_key, last=True)
+            while len(self._floorplan_cache) > self._max_floorplan_cache_entries:
+                self._floorplan_cache.popitem(last=False)
 
         return payload
 

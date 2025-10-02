@@ -29,3 +29,6 @@ docs/implementation/
 docs/plans/
 docs/*.md
 
+#model folders
+data/depth/
+

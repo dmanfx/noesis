@@ -31,6 +31,17 @@ export type FrameHandlers = {
   onImage: (cam: CameraKey, blob: Blob) => void;
   onStats: (stats: StatsPayload) => void;
   onTrailToggle?: (enabled: boolean) => void;
+  onMADiagnostics?: (payload: any) => void;
+  onMADepth?: (payload: any) => void;
+  onFloorplan?: (payload: any) => void;
+};
+
+export type FloorplanRequest = {
+  camera?: string;
+  maxAgeSec?: number;
+  gridResM?: number;
+  maxExtentM?: number;
+  requestId?: string;
 };
 
 export function useWebSocketClient(url: string, handlers: FrameHandlers) {
@@ -164,6 +175,12 @@ export function useWebSocketClient(url: string, handlers: FrameHandlers) {
             handlers.onTrailToggle?.(!!data.enabled);
           } else if (data.type === 'trail_visualization_enabled_update') {
             handlers.onTrailToggle?.(!!data.enabled);
+          } else if (data.type === 'ma_diagnostics') {
+            handlers.onMADiagnostics?.(data);
+          } else if (data.type === 'ma_depth_response') {
+            handlers.onMADepth?.(data);
+          } else if (data.type === 'floorplan_response') {
+            handlers.onFloorplan?.(data);
           }
         } catch (e) {
           // swallow parsing errors
@@ -195,6 +212,19 @@ export function useWebSocketClient(url: string, handlers: FrameHandlers) {
     sendClearStats: () => sendJson({ type: 'clear_stats' }),
     sendTrailToggle: (enabled: boolean) => sendJson({ type: 'set_vis_toggle', toggle_name: 'trail_visualization_enabled', enabled }),
     sendDetectionConfig: (config: any) => sendJson({ type: 'update_detection_config', config }),
-    sendDetectionToggle: (name: string, enabled: boolean) => sendJson({ type: 'set_detection_toggle', toggle_name: name, enabled })
+    sendDetectionToggle: (name: string, enabled: boolean) => sendJson({ type: 'set_detection_toggle', toggle_name: name, enabled }),
+    requestMapAnythingDepth: (camId: string, tsMax?: number) => sendJson({ type: 'get_ma_depth', camId, ts_max: tsMax ?? Date.now() }),
+    requestFloorplan: (options?: FloorplanRequest) => {
+      const requestId = options?.requestId || Date.now().toString();
+      const ok = sendJson({
+        type: 'get_floorplan',
+        request_id: requestId,
+        camera: options?.camera,
+        max_age_sec: options?.maxAgeSec ?? 60,
+        grid_res_m: options?.gridResM ?? 0.5,
+        max_extent_m: options?.maxExtentM ?? 20
+      });
+      return ok ? requestId : '';
+    }
   };
 }

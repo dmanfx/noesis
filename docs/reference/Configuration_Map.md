@@ -44,10 +44,31 @@ This document maps `config.py` sections and keys to their use in `deepstream_vid
   - Consumed to initialize `OccupancyPublisher` MQTT client and retained topics
 - Influx: `INFLUX_URL`, `INFLUX_ORG`, `INFLUX_TOKEN`, `INFLUX_BUCKET_RAW`
   - Consumed to initialize `InfluxDBClient` and async write API
+  - MapAnything depth summaries piggyback on the same publisher (`DepthDiagnosticsPublisher`) using these credentials
 
 ## output (AppConfig.OutputSettings)
 
 - `OUTPUT_DIR`, `SAVE_FRAMES`: respected at higher layers when saving frames; DeepStream provides JPEG bytes
+
+## MapAnything configuration (`config/mapanything.ini`)
+
+Parsed by `mapanything_config.load_service_config()` and shared between `services/mapanything_svc` and `geometry/depth_source.py`.
+
+- `[service]`
+  - `host`, `port`: FastAPI bind address consumed by `run.sh` and `main.py` health checks
+  - `api_key`: Required header for `/infer_mono` and `/infer_multi`
+- `[inference]`
+  - `model_id`: HuggingFace repo id (must end with `-apache`)
+  - `device`: torch device string (e.g., `cuda:0`)
+  - `amp_dtype`: `bf16` or `fp16`
+  - `memory_efficient_mono`, `memory_efficient_multi`: Baseline flags toggled dynamically when VRAM usage exceeds 80%
+  - `apply_mask`, `mask_edges`, `confidence_percentile`: forwarded to MapAnything inference kwargs
+- `[performance]`
+  - `max_res`: Downsample cap applied in `mapanything_adapter`
+  - `mono_freq`, `multi_batch_size`, `multi_interval`: Scheduling hints used by `depth_source`
+  - `min_conf`: Confidence threshold for preferring MapAnything over floor-plane fallback
+- `[storage]`
+  - `depth_base`, `calib_base`: Root directories for Zarr depth snapshots and calibration archive
 
 ## Runtime configuration via WebSocket
 
@@ -55,3 +76,4 @@ This document maps `config.py` sections and keys to their use in `deepstream_vid
   - Sets `confidence-threshold`, `iou-threshold`, `enable`, `custom-lib-props` for target classes
 - Detection toggles → `update_detection_toggle()` for `detect_people`, `detect_vehicles`, `detect_furniture`
 - Visualization toggle → `set_trail_visualization()` via `toggle_callback`
+- MapAnything: `get_ma_depth` RPC and `ma_diagnostics` broadcast supply depth overlays to Menon and oai2-fe

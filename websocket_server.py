@@ -1,9 +1,11 @@
 from typing import Dict, Optional, Any, Callable
 import asyncio
+import concurrent.futures
 import websockets
 import json
 import logging
 import time
+import uuid
 
 from models import convert_numpy_types
 
@@ -47,11 +49,124 @@ class WebSocketServer:
         self._latest_binary_by_cam: Dict[str, bytes] = {}
         self._binary_flush_task: Optional[asyncio.Task] = None
         self._binary_sending: bool = False
+        # Lightweight telemetry for Menon calibration/coordinate RPCs
+        self._telemetry: Dict[str, Dict[str, Any]] = {"rx": {}, "tx": {}}
+        self._telemetry_task: Optional[asyncio.Task] = None
+        # RPC guardrails
+        self._depth_rpc_tracker: Dict[str, float] = {}
+        self._floorplan_rpc_tracker: Dict[str, float] = {}
+        self._depth_rate_limit_window = 0.5  # seconds per camera/client
+        self._floorplan_rate_limit_window = 2.0
+        self._depth_rpc_timeout = 4.0  # seconds
+        self._floorplan_rpc_timeout = 6.0
+        self._tracker_prune_window = 30.0
         # Optional calibration + RPC callbacks
         self.calibration_getter: Optional[Callable[[], Dict[str, Any]]] = None
         self.pixel_to_world_handler: Optional[Callable[[Dict[str, Any]], Dict[str, Any]]] = None
         self.set_extrinsics_handler: Optional[Callable[[Dict[str, Any]], Dict[str, Any]]] = None
         self.solve_pnp_handler: Optional[Callable[[Dict[str, Any]], Dict[str, Any]]] = None
+        self.set_align_handler: Optional[Callable[[Dict[str, Any]], Dict[str, Any]]] = None
+        self.ma_depth_provider: Optional[Callable[[str, Optional[int]], Optional[Dict[str, Any]]]] = None
+        self.floorplan_provider: Optional[Callable[[Optional[list], float, float, float, bool], Optional[Dict[str, Any]]]] = None
+
+    # ---------------- Menon telemetry helpers ----------------
+    def _telemetry_now(self) -> float:
+        try:
+            return time.time()
+        except Exception:
+            return 0.0
+
+    def _short_dict(self, d: Dict[str, Any]) -> Dict[str, Any]:
+        """Produce a compact view of calibration/coordinate payloads for logging."""
+        try:
+            t = d.get('type') if isinstance(d, dict) else None
+            out: Dict[str, Any] = {'type': t}
+            if t == 'set_align':
+                al = d.get('align', {}) if isinstance(d, dict) else {}
+                mx = al.get('matrix') if isinstance(al, dict) else None
+                out.update({
+                    'floor_y': al.get('floor_y'),
+                    's': (al.get('units') or {}).get('s_obj_to_m') if isinstance(al.get('units'), dict) else None,
+                    'matrix': f"len={len(mx)}" if isinstance(mx, list) else None
+                })
+            elif t == 'set_extrinsics':
+                out.update({
+                    'cameraId': d.get('cameraId'),
+                    'E': f"len={len(d.get('E'))}" if isinstance(d.get('E'), list) else None,
+                    'Twc': f"len={len(d.get('Twc'))}" if isinstance(d.get('Twc'), list) else None,
+                })
+            elif t == 'solve_pnp':
+                pts2 = d.get('points2D') if isinstance(d.get('points2D'), list) else None
+                pts3 = d.get('points3D') if isinstance(d.get('points3D'), list) else None
+                out.update({'cameraId': d.get('cameraId'), 'points2D': len(pts2) if pts2 else 0, 'points3D': len(pts3) if pts3 else 0})
+            elif t == 'pixel_to_world':
+                out.update({'camId': d.get('camId') or d.get('cameraId'), 'u': d.get('u'), 'v': d.get('v'), 'request_id': d.get('request_id') or d.get('reqId')})
+            elif t == 'pixel_to_world_response':
+                out.update({'ok': d.get('ok'), 'world': d.get('world'), 'request_id': d.get('request_id') or d.get('reqId')})
+            elif t == 'set_extrinsics_result' or t == 'set_align_result' or t == 'solve_pnp_result':
+                out.update({'ok': d.get('ok'), 'error': d.get('error')})
+            elif t == 'calibration-bundle':
+                data = d.get('data') if isinstance(d.get('data'), dict) else {}
+                cams = data.get('cameras') if isinstance(data.get('cameras'), dict) else {}
+                al = data.get('align') if isinstance(data.get('align'), dict) else {}
+                out.update({'cameras': len(cams), 'floor_y': al.get('floor_y'), 's': (al.get('units') or {}).get('s_obj_to_m') if isinstance(al.get('units'), dict) else None})
+            else:
+                # Default: include a shallow subset
+                for k in ('cameraId', 'camId', 'u', 'v', 'ok'):
+                    if k in d:
+                        out[k] = d.get(k)
+            return out
+        except Exception:
+            return {'type': d.get('type') if isinstance(d, dict) else None}
+
+    def _record_rx(self, msg: Dict[str, Any]) -> None:
+        try:
+            t = msg.get('type') if isinstance(msg, dict) else None
+            if t in {'set_align', 'set_extrinsics', 'solve_pnp', 'pixel_to_world'}:
+                self._telemetry['rx'][t] = {'t': self._telemetry_now(), 'data': self._short_dict(msg)}
+        except Exception:
+            pass
+
+    def _record_tx(self, msg: Dict[str, Any]) -> None:
+        try:
+            t = msg.get('type') if isinstance(msg, dict) else None
+            if t in {'calibration-bundle', 'set_align_result', 'set_extrinsics_result', 'solve_pnp_result', 'pixel_to_world_response'}:
+                self._telemetry['tx'][t] = {'t': self._telemetry_now(), 'data': self._short_dict(msg)}
+        except Exception:
+            pass
+
+    async def _periodic_menon_telemetry_log(self, interval_seconds: float = 1.0) -> None:
+        """Emit a concise 1 Hz INFO log with latest Menon calibration/coordinate RX/TX."""
+        keys_rx = ['set_align', 'set_extrinsics', 'solve_pnp', 'pixel_to_world']
+        keys_tx = ['calibration-bundle', 'set_align_result', 'set_extrinsics_result', 'solve_pnp_result', 'pixel_to_world_response']
+        while self.running:
+            try:
+                parts = []
+                # RX summary
+                rx_items = []
+                for k in keys_rx:
+                    entry = self._telemetry['rx'].get(k)
+                    if entry:
+                        rx_items.append(f"{k}:{entry['data']}")
+                parts.append(f"rx=[{'; '.join(rx_items) if rx_items else '-'}]")
+                # TX summary
+                tx_items = []
+                for k in keys_tx:
+                    entry = self._telemetry['tx'].get(k)
+                    if entry:
+                        tx_items.append(f"{k}:{entry['data']}")
+                parts.append(f"tx=[{'; '.join(tx_items) if tx_items else '-'}]")
+                self.logger.debug(f"MENON I/O | {' | '.join(parts)}")
+            except asyncio.CancelledError:
+                break
+            except Exception:
+                # Never fail loop due to logging issues
+                pass
+            finally:
+                try:
+                    await asyncio.sleep(interval_seconds)
+                except Exception:
+                    await asyncio.sleep(1.0)
     
     async def _cleanup_stale_connections(self):
         """Periodically clean up any stale or closed connections"""
@@ -121,7 +236,18 @@ class WebSocketServer:
                             try:
                                 cam_count = len((stats_payload or {}).get('cameras', {}))
                                 uptime = (stats_payload or {}).get('uptime', 0)
-                                self.logger.info(f"📡 Stats sent to {len(self.connected_clients)} clients | cameras={cam_count} | uptime={uptime:.1f}s")
+                                # Prepare compact payload dump (truncate to keep logs readable)
+                                try:
+                                    stats_json = json.dumps(stats_payload, separators=(',', ':'), default=str)
+                                except Exception:
+                                    stats_json = str(stats_payload)
+                                max_len = 4096
+                                if len(stats_json) > max_len:
+                                    extra = len(stats_json) - max_len
+                                    stats_json = stats_json[:max_len] + f"...(+{extra} chars)"
+                                self.logger.debug(
+                                    f"📡 Stats sent to {len(self.connected_clients)} clients | cameras={cam_count} | uptime={uptime:.1f}s | payload={stats_json}"
+                                )
                             except Exception:
                                 # Defensive: never break the loop due to logging
                                 pass
@@ -173,6 +299,12 @@ class WebSocketServer:
                     self._periodic_stats_broadcast(),
                     name="PeriodicStatsBroadcast"
                 )
+
+            # Always start Menon I/O telemetry logger (1 Hz)
+            self._telemetry_task = asyncio.create_task(
+                self._periodic_menon_telemetry_log(),
+                name="MenonTelemetryLogger"
+            )
 
             self.logger.info(f"WebSocket server running on {self.host}:{self.port}")
             print(f"🚀 WebSocket server is LIVE on {self.host}:{self.port}")
@@ -230,6 +362,14 @@ class WebSocketServer:
             except Exception as e:
                 self.logger.error(f"Error stopping WebSocket server: {e}")
 
+        # Cancel Menon telemetry task
+        if self._telemetry_task and not self._telemetry_task.done():
+            self._telemetry_task.cancel()
+            try:
+                await self._telemetry_task
+            except asyncio.CancelledError:
+                pass
+
         # Cancel server task if it exists
         if self.server_task and not self.server_task.done():
             self.server_task.cancel()
@@ -238,24 +378,50 @@ class WebSocketServer:
             except asyncio.CancelledError:
                 pass
 
-    def stop_sync(self):
+    def stop_sync(self, timeout: float = 5.0) -> bool:
         """Synchronous stop method for use from other threads"""
         self.logger.info("Stopping WebSocket server (sync mode)...")
         self.running = False
 
-        # Create a task to run the async stop in the current event loop
+        # Attempt to schedule the async stop on an active event loop
         try:
             loop = asyncio.get_running_loop()
-            loop.create_task(self.stop())
         except RuntimeError:
-            # No running loop, try to get the event loop from the instance
-            if hasattr(self, 'event_loop') and self.event_loop:
-                try:
-                    asyncio.run_coroutine_threadsafe(self.stop(), self.event_loop)
-                except Exception as e:
-                    self.logger.warning(f"Could not stop WebSocket server via event loop: {e}")
-            else:
-                self.logger.warning("No event loop available for WebSocket server shutdown")
+            loop = None
+
+        # If we're already running inside the websocket event loop thread, just schedule the coroutine
+        if loop is not None:
+            try:
+                loop.create_task(self.stop())
+                return True
+            except Exception as exc:
+                self.logger.warning(f"Could not schedule WebSocket stop on running loop: {exc}")
+                return False
+
+        target_loop = getattr(self, 'event_loop', None)
+        if not target_loop or target_loop.is_closed():
+            self.logger.warning("No event loop available for WebSocket server shutdown")
+            return False
+
+        if not target_loop.is_running():
+            self.logger.warning("WebSocket event loop not running during shutdown")
+            return False
+
+        try:
+            future = asyncio.run_coroutine_threadsafe(self.stop(), target_loop)
+        except Exception as exc:
+            self.logger.warning(f"Could not stop WebSocket server via event loop: {exc}")
+            return False
+
+        try:
+            future.result(timeout=timeout)
+            return True
+        except concurrent.futures.TimeoutError:
+            self.logger.warning(f"WebSocket server stop did not complete within {timeout}s")
+            return False
+        except Exception as exc:
+            self.logger.error(f"Error waiting for WebSocket server stop: {exc}")
+            return False
     
     async def handle_client(self, websocket, path=None):
         """Handle incoming WebSocket connections and messages
@@ -301,15 +467,37 @@ class WebSocketServer:
                 if callable(self.calibration_getter):
                     bundle = self.calibration_getter() or {}
                     if bundle:
-                        await websocket.send(json.dumps({'type': 'calibration-bundle', 'data': bundle}))
+                        msg = {'type': 'calibration-bundle', 'data': bundle}
+                        await websocket.send(json.dumps(msg))
+                        try:
+                            self._record_tx(msg)
+                        except Exception:
+                            pass
                         self.logger.info(f"Sent calibration-bundle to {client_ip}")
             except Exception as e:
                 self.logger.warning(f"Could not send calibration-bundle to {client_ip}: {e}")
+
+            # Send an immediate stats snapshot on connect for quicker UI readiness
+            try:
+                if self.stats_callback:
+                    snap = self.stats_callback() or {}
+                    if snap:
+                        safe_snap = convert_numpy_types(snap)
+                        stats_message = {'type': 'stats', 'payload': safe_snap}
+                        await websocket.send(json.dumps(stats_message))
+                        self.logger.info(f"Sent initial stats snapshot to {client_ip}")
+            except Exception as e:
+                self.logger.debug(f"Could not send initial stats snapshot to {client_ip}: {e}")
 
             # Process messages from client
             async for message in websocket:
                 try:
                     data = json.loads(message)
+                    # Record RX telemetry for Menon RPCs
+                    try:
+                        self._record_rx(data)
+                    except Exception:
+                        pass
 
                     # Handle clear_stats command
                     if data.get('type') == 'clear_stats':
@@ -396,7 +584,11 @@ class WebSocketServer:
 
                     elif data.get('type') == 'pixel_to_world':
                         req = data
-                        result = {'type': 'pixel_to_world_result', 'reqId': req.get('reqId')}
+                        req_id = req.get('request_id') or req.get('reqId')
+                        result = {'type': 'pixel_to_world_response'}
+                        if req_id is not None:
+                            result['request_id'] = req_id
+                            result.setdefault('reqId', req_id)
                         try:
                             if callable(self.pixel_to_world_handler):
                                 out = self.pixel_to_world_handler(req) or {}
@@ -405,6 +597,23 @@ class WebSocketServer:
                                 result.update({'ok': False, 'error': 'no_handler'})
                         except Exception as e:
                             result.update({'ok': False, 'error': str(e)})
+
+                        world_val = result.get('world')
+                        if isinstance(world_val, (list, tuple)) and len(world_val) >= 3:
+                            try:
+                                result['world'] = {
+                                    'x': float(world_val[0]),
+                                    'y': float(world_val[1]),
+                                    'z': float(world_val[2]),
+                                }
+                            except Exception:
+                                pass
+
+                        try:
+                            # Record TX telemetry and send
+                            self._record_tx(result)
+                        except Exception:
+                            pass
                         try:
                             await websocket.send(json.dumps(result))
                         except Exception:
@@ -422,6 +631,10 @@ class WebSocketServer:
                         except Exception as e:
                             result.update({'ok': False, 'error': str(e)})
                         try:
+                            try:
+                                self._record_tx(result)
+                            except Exception:
+                                pass
                             await websocket.send(json.dumps(result))
                         except Exception:
                             pass
@@ -438,9 +651,143 @@ class WebSocketServer:
                         except Exception as e:
                             result.update({'ok': False, 'error': str(e)})
                         try:
+                            try:
+                                self._record_tx(result)
+                            except Exception:
+                                pass
                             await websocket.send(json.dumps(result))
                         except Exception:
                             pass
+
+                    elif data.get('type') == 'set_align':
+                        req = data
+                        result = {'type': 'set_align_result'}
+                        try:
+                            if callable(self.set_align_handler):
+                                out = self.set_align_handler(req) or {}
+                                result.update(out)
+                            else:
+                                result.update({'ok': False, 'error': 'no_handler'})
+                        except Exception as e:
+                            result.update({'ok': False, 'error': str(e)})
+                        try:
+                            try:
+                                self._record_tx(result)
+                            except Exception:
+                                pass
+                            await websocket.send(json.dumps(result))
+                        except Exception:
+                            pass
+
+                    elif data.get('type') == 'get_ma_depth':
+                        cam_id = data.get('camId') or data.get('cameraId')
+                        ts_max_val = data.get('ts_max') if data.get('ts_max') is not None else data.get('tsMax')
+                        ts_max = None
+                        if ts_max_val is not None:
+                            try:
+                                ts = int(ts_max_val)
+                                # Normalize to microseconds:
+                                # <1e10 => seconds, <1e13 => milliseconds, else assume microseconds
+                                if ts < 10_000_000_000:
+                                    ts *= 1_000_000
+                                elif ts < 10_000_000_000_000:
+                                    ts *= 1_000
+                                ts_max = ts
+                            except Exception:
+                                ts_max = None
+
+                        rate_key = f"{client_ip}:{cam_id or 'unknown'}"
+                        now = time.time()
+                        last = self._depth_rpc_tracker.get(rate_key, 0.0)
+                        if now - last < self._depth_rate_limit_window:
+                            self.logger.debug(f"Depth RPC throttled for {rate_key}")
+                            continue
+                        self._depth_rpc_tracker[rate_key] = now
+                        if len(self._depth_rpc_tracker) > 256:
+                            self._depth_rpc_tracker = {
+                                k: v for k, v in self._depth_rpc_tracker.items() if now - v <= self._tracker_prune_window
+                            }
+
+                        result = {'type': 'ma_depth_response', 'cam_id': cam_id}
+                        if cam_id and callable(self.ma_depth_provider):
+                            try:
+                                payload = await asyncio.wait_for(
+                                    asyncio.to_thread(self.ma_depth_provider, cam_id, ts_max),
+                                    timeout=self._depth_rpc_timeout
+                                )
+                                if payload:
+                                    result.update(payload)
+                                    result['ok'] = True
+                                    # Pre-serialize heavy payload off loop
+                                    message_text = await asyncio.to_thread(json.dumps, result)
+                                    await websocket.send(message_text)
+                                else:
+                                    result.update({'ok': False, 'error': 'not_available'})
+                                    await websocket.send(json.dumps(result))
+                            except asyncio.TimeoutError:
+                                self.logger.warning(f"Depth RPC timed out for {cam_id} from {client_ip}")
+                                result.update({'ok': False, 'error': 'timeout'})
+                                await websocket.send(json.dumps(result))
+                            except Exception as exc:
+                                result.update({'ok': False, 'error': str(exc)})
+                                await websocket.send(json.dumps(result))
+                        else:
+                            result.update({'ok': False, 'error': 'no_provider'})
+                            await websocket.send(json.dumps(result))
+
+                    elif data.get('type') == 'get_floorplan':
+                        request_id = data.get('request_id') or data.get('requestId') or str(uuid.uuid4())
+                        camera = data.get('camera')
+                        if not camera and isinstance(data.get('cameras'), list) and data['cameras']:
+                            camera = str(data['cameras'][0])
+                        camera = str(camera) if camera else ''
+                        max_age_sec = float(data.get('max_age_sec', data.get('maxAgeSec', 60.0)))
+                        grid_res_m = float(data.get('grid_res_m', data.get('gridResM', 0.5)))
+                        max_extent_m = float(data.get('max_extent_m', data.get('maxExtentM', 20.0)))
+
+                        rate_key = f"{client_ip}:{camera or 'unknown'}"
+                        now = time.time()
+                        last = self._floorplan_rpc_tracker.get(rate_key, 0.0)
+                        if now - last < self._floorplan_rate_limit_window:
+                            self.logger.debug(f"Floorplan RPC throttled for {rate_key}")
+                            continue
+                        self._floorplan_rpc_tracker[rate_key] = now
+                        if len(self._floorplan_rpc_tracker) > 256:
+                            self._floorplan_rpc_tracker = {
+                                k: v for k, v in self._floorplan_rpc_tracker.items() if now - v <= self._tracker_prune_window
+                            }
+
+                        result = {
+                            'type': 'floorplan_response',
+                            'request_id': request_id,
+                            'camera_id': camera,
+                        }
+
+                        provider = getattr(self, 'floorplan_provider', None)
+                        if callable(provider):
+                            try:
+                                payload = await asyncio.wait_for(
+                                    asyncio.to_thread(provider, camera, max_age_sec, grid_res_m, max_extent_m),
+                                    timeout=self._floorplan_rpc_timeout
+                                )
+                                if payload:
+                                    result.update(payload)
+                                    message_text = await asyncio.to_thread(json.dumps, result)
+                                    await websocket.send(message_text)
+                                else:
+                                    result['error'] = 'no_payload'
+                                    await websocket.send(json.dumps(result))
+                            except asyncio.TimeoutError:
+                                self.logger.warning(f"Floorplan RPC timed out for {camera} from {client_ip}")
+                                result['error'] = 'timeout'
+                                await websocket.send(json.dumps(result))
+                            except Exception as exc:
+                                result['error'] = str(exc)
+                                self.logger.error(f"Floorplan generation error: {exc}")
+                                await websocket.send(json.dumps(result))
+                        else:
+                            result['error'] = 'no_provider'
+                            await websocket.send(json.dumps(result))
 
                     # Handle individual detection toggles
                     elif data.get('type') == 'set_detection_toggle':
@@ -503,14 +850,20 @@ class WebSocketServer:
             return
 
         message_str = ""
-        disconnected_clients = set()
-        active_clients = set(self.connected_clients)  # Create a copy to iterate over
+        disconnected_clients = []
+        # Use a list to preserve order for correct result-to-client mapping
+        active_clients = list(self.connected_clients)
 
         try:
             # Prepare message based on type
             if isinstance(message, dict):
                 # Convert to JSON string
                 message = convert_numpy_types(message)
+                # Record TX telemetry for tracked messages (e.g., calibration-bundle)
+                try:
+                    self._record_tx(message)
+                except Exception:
+                    pass
                 message_str = json.dumps(message)
             elif isinstance(message, bytes):
                 # Route binary frames into coalescer; actual sending is handled elsewhere
@@ -532,9 +885,9 @@ class WebSocketServer:
             # Check for errors and mark disconnected clients
             for i, result in enumerate(results):
                 if isinstance(result, Exception):
-                    client = list(active_clients)[i] if i < len(active_clients) else None
+                    client = active_clients[i] if i < len(active_clients) else None
                     if client:
-                        disconnected_clients.add(client)
+                        disconnected_clients.append(client)
                     client_ip = client.remote_address if client and hasattr(client, 'remote_address') else "Unknown"
                     # Only log ping timeout errors as debug to reduce noise
                     if "keepalive ping timeout" in str(result):
@@ -629,17 +982,17 @@ class WebSocketServer:
         """Fallback path to send a single binary payload to all clients."""
         if not self.connected_clients:
             return
-        active_clients = set(self.connected_clients)
+        active_clients = list(self.connected_clients)
         results = await asyncio.gather(
             *[client.send(data) for client in active_clients],
             return_exceptions=True
         )
-        disconnected_clients = set()
+        disconnected_clients = []
         for i, result in enumerate(results):
             if isinstance(result, Exception):
-                client = list(active_clients)[i] if i < len(active_clients) else None
+                client = active_clients[i] if i < len(active_clients) else None
                 if client:
-                    disconnected_clients.add(client)
+                    disconnected_clients.append(client)
                 client_ip = client.remote_address if client and hasattr(client, 'remote_address') else "Unknown"
                 if "keepalive ping timeout" in str(result).lower():
                     self.logger.debug(f"Client {client_ip} ping timeout - will be cleaned up")

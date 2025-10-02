@@ -31,6 +31,9 @@ Purpose: Step-by-step integration guide for InfluxDB + HomeSeer and a reusable p
 ### `Dynamic_Sensors.md`
 Purpose: How to add/remove sources at runtime using `nvmultiurisrcbin` REST API.
 
+### `MapAnything_Depth.md`
+Purpose: End-to-end reference for the MapAnything depth microservice, adapters, storage, diagnostics, and operations workflows.
+
 ## Usage
 
 Use these documents as the authoritative reference for architecture, configuration, implementation, performance, and runtime APIs.

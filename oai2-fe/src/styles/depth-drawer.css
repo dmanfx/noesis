@@ -216,7 +216,7 @@
   background: #0d1320;
   border: 1px solid rgba(255, 255, 255, 0.12);
   border-radius: 4px;
-  aspect-ratio: 1 / 1;
+  aspect-ratio: 16 / 9;  /* Fixed widescreen—inline styles will override if needed */
   flex: 1;
 }
 

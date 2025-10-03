@@ -72,6 +72,7 @@ const VIRIDIS = [
 
 const DEFAULT_WIDTH = 700;
 const MAX_WIDTH = 960;
+const WIDE_ASPECT = 16 / 9;
 
 function generateGradient(palette: (t: number) => [number, number, number], steps = 12): string {
   const stops: string[] = [];
@@ -205,7 +206,6 @@ const DepthDrawer = memo(function DepthDrawer({ open, onClose, diagnostics, dept
   const [floorplanStatus, setFloorplanStatus] = useState<'idle' | 'loading'>('idle');
   const [floorplanRequest, setFloorplanRequest] = useState<string>('');
   const [heatmapRange, setHeatmapRange] = useState<{ min: number; max: number } | null>(null);
-  const [heatmapAspect, setHeatmapAspect] = useState<number | null>(null);
 
   // Floorplan selection (declared early to avoid TDZ in hooks below)
   const cameraFloorplan = floorplans[selectedCamera];
@@ -275,12 +275,17 @@ const DepthDrawer = memo(function DepthDrawer({ open, onClose, diagnostics, dept
       }
       offCtx.putImageData(imageData, 0, 0);
 
-      const { width, height, dpr } = applyCanvasSize(canvas);
+      const { width } = applyCanvasSize(canvas);
+      const height = width / WIDE_ASPECT;  // Force 16:9 height
+      const dpr = window.devicePixelRatio || 1;
+      canvas.width = Math.max(1, Math.round(width * dpr));
+      canvas.height = Math.max(1, Math.round(height * dpr));
 
       ctx.save();
       ctx.scale(dpr, dpr);
       ctx.clearRect(0, 0, width, height);
       ctx.imageSmoothingEnabled = true;
+      // Stretch: Draw offscreen to full 16:9 destination
       ctx.drawImage(offscreen, 0, 0, width, height);
       ctx.restore();
 
@@ -327,7 +332,6 @@ const DepthDrawer = memo(function DepthDrawer({ open, onClose, diagnostics, dept
     const depthArray = decodeFloat32(depthEntry.depth_b64);
     if (!depthArray || depthArray.length < width * height) {
       setHeatmapRange(null);
-      setHeatmapAspect(null);
       clearCanvasElement(canvas);
       return;
     }
@@ -349,14 +353,11 @@ const DepthDrawer = memo(function DepthDrawer({ open, onClose, diagnostics, dept
     if (!Number.isFinite(minDepth) || !Number.isFinite(maxDepth) || maxDepth <= minDepth) {
       clearCanvasElement(canvas);
       setHeatmapRange(null);
-      setHeatmapAspect(null);
       return;
     }
 
     const range = maxDepth - minDepth;
     setHeatmapRange({ min: minDepth, max: maxDepth });
-    const aspect = width / height;
-    setHeatmapAspect(aspect);
 
     const offscreen = document.createElement('canvas');
     offscreen.width = width;
@@ -393,7 +394,7 @@ const DepthDrawer = memo(function DepthDrawer({ open, onClose, diagnostics, dept
     if (!ctx) return;
     const rect = canvas.getBoundingClientRect();
     const targetWidth = rect.width || canvas.clientWidth || width;
-    const targetHeight = rect.height || canvas.clientHeight || targetWidth / aspect;
+    const targetHeight = targetWidth / WIDE_ASPECT;  // Force 16:9
     const dpr = window.devicePixelRatio || 1;
     canvas.width = Math.max(1, Math.round(targetWidth * dpr));
     canvas.height = Math.max(1, Math.round(targetHeight * dpr));
@@ -402,6 +403,7 @@ const DepthDrawer = memo(function DepthDrawer({ open, onClose, diagnostics, dept
     ctx.scale(dpr, dpr);
     ctx.clearRect(0, 0, targetWidth, targetHeight);
     ctx.imageSmoothingEnabled = true;
+    // Stretch to 16:9 (minimal effect since native matches, but consistent)
     ctx.drawImage(offscreen, 0, 0, targetWidth, targetHeight);
     ctx.restore();
   }, [depthEntry, activeTab, drawerWidth, clearCanvasElement]);
@@ -409,7 +411,6 @@ const DepthDrawer = memo(function DepthDrawer({ open, onClose, diagnostics, dept
   useEffect(() => {
     if (!depthEntry) {
       setHeatmapRange(null);
-      setHeatmapAspect(null);
     }
   }, [depthEntry]);
 
@@ -688,14 +689,14 @@ const DepthDrawer = memo(function DepthDrawer({ open, onClose, diagnostics, dept
                     <canvas
                       ref={heatmapCanvasRef}
                       className="heatmap-canvas"
-                      style={{ aspectRatio: heatmapAspect ? `${heatmapAspect}` : undefined }}
+                      style={{ aspectRatio: `${WIDE_ASPECT}` }}
                     />
                   </div>
                 </div>
                 <div className="heatmap-cell heatmap-cell--right">
                   <div className="heatmap-cell__body">
                     <div className="heatmap-cell__title">Density (Grayscale)</div>
-                    <canvas ref={densityCanvasRef} className="heatmap-canvas" />
+                    <canvas ref={densityCanvasRef} className="heatmap-canvas" style={{ aspectRatio: `${WIDE_ASPECT}` }} />
                   </div>
                   <div className="heatmap-cell__scale">
                     {renderScale(densityGradient, 0, 0.5, 1)}
@@ -713,13 +714,13 @@ const DepthDrawer = memo(function DepthDrawer({ open, onClose, diagnostics, dept
                   </div>
                   <div className="heatmap-cell__body">
                     <div className="heatmap-cell__title">Height (Inferno)</div>
-                    <canvas ref={heightCanvasRef} className="heatmap-canvas" />
+                    <canvas ref={heightCanvasRef} className="heatmap-canvas" style={{ aspectRatio: `${WIDE_ASPECT}` }} />
                   </div>
                 </div>
                 <div className="heatmap-cell heatmap-cell--right">
                   <div className="heatmap-cell__body">
                     <div className="heatmap-cell__title">Distance (Viridis)</div>
-                    <canvas ref={distanceCanvasRef} className="heatmap-canvas" />
+                    <canvas ref={distanceCanvasRef} className="heatmap-canvas" style={{ aspectRatio: `${WIDE_ASPECT}` }} />
                   </div>
                   <div className="heatmap-cell__scale">
                     {renderScale(viridisGradient, distanceMin ?? undefined, distanceMid ?? undefined, distanceMax ?? undefined, ' m')}

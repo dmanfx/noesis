@@ -28,7 +28,14 @@ docs/fixes/
 docs/implementation/
 docs/plans/
 docs/*.md
+docs/ma-integration/*.md
+*.md
 
 #model folders
 data/depth/
+models/
+*/__init__.py
+external/
+.env
+tests/
 

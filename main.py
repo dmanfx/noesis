@@ -1961,6 +1961,12 @@ class ApplicationManager:
             except Exception as exc:
                 self.logger.debug(f"Depth publisher shutdown error: {exc}")
 
+        if getattr(self, 'depth_source', None) is not None:
+            try:
+                self.depth_source.close()
+            except Exception as exc:
+                self.logger.debug(f"Depth storage shutdown error: {exc}")
+
         # Always terminate the MapAnything microservice
         self._terminate_mapanything_process()
 

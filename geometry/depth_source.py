@@ -4,6 +4,7 @@ from __future__ import annotations
 import base64
 import json
 import logging
+import queue
 import shutil
 import threading
 import time
@@ -47,6 +48,16 @@ class DepthResult:
     storage_path: Path
 
 
+@dataclass(frozen=True)
+class _SnapshotJob:
+    camera_id: str
+    ts_us: int
+    depth: np.ndarray
+    conf: np.ndarray
+    mask: np.ndarray
+    dest_path: Path
+
+
 class DepthStorageManager:
     """Persist depth outputs to Zarr for later consumption with retention enforcement."""
 
@@ -56,6 +67,9 @@ class DepthStorageManager:
         max_snapshots_per_camera: int,
         retention_minutes: float,
         max_total_bytes: Optional[int] = None,
+        *,
+        enable_async: bool = True,
+        max_queue_size: int = 32,
     ) -> None:
         self.base_path = base_path
         self.base_path.mkdir(parents=True, exist_ok=True)
@@ -65,6 +79,12 @@ class DepthStorageManager:
         self._max_snapshots = max(max_snapshots_per_camera, 0)
         self._retention_us = max(0, int(retention_minutes * 60.0 * 1_000_000))
         self._max_total_bytes = max_total_bytes if (max_total_bytes is not None and max_total_bytes > 0) else None
+        self._async_enabled = bool(enable_async)
+        self._max_queue_size = max(1, int(max_queue_size)) if self._async_enabled else 0
+        self._queue: Optional["queue.Queue[_SnapshotJob]"] = None
+        self._stop_event: Optional[threading.Event] = None
+        self._writer_thread: Optional[threading.Thread] = None
+        self._last_queue_full_warning: float = 0.0
         if self._max_total_bytes is not None and self._max_total_bytes < 10 * 1024 * 1024:
             self._logger.warning(
                 "Configured max_total_bytes=%s is very small; increasing to 10MB minimum",
@@ -72,6 +92,8 @@ class DepthStorageManager:
             )
             self._max_total_bytes = 10 * 1024 * 1024
         self._seed_existing_entries()
+        if self._async_enabled:
+            self._start_writer()
 
     def _seed_existing_entries(self) -> None:
         """Populate in-memory indices from disk on startup and prune if needed."""
@@ -101,6 +123,106 @@ class DepthStorageManager:
 
     def _get_index(self, camera_id: str) -> Deque[Tuple[int, Path]]:
         return self._indices.setdefault(camera_id, deque())
+
+    def _start_writer(self) -> None:
+        if self._queue is not None:
+            return
+        self._queue = queue.Queue(maxsize=self._max_queue_size)
+        self._stop_event = threading.Event()
+
+        def _worker() -> None:
+            assert self._queue is not None
+            assert self._stop_event is not None
+            while True:
+                try:
+                    job = self._queue.get(timeout=0.2)
+                except queue.Empty:
+                    if self._stop_event.is_set():
+                        break
+                    continue
+                try:
+                    self._write_snapshot(job)
+                except Exception as exc:
+                    self._logger.error(f"Depth snapshot write failed for {job.camera_id}: {exc}")
+                finally:
+                    self._queue.task_done()
+
+        self._writer_thread = threading.Thread(target=_worker, name="DepthSnapshotWriter", daemon=True)
+        self._writer_thread.start()
+
+    def shutdown(self, *, wait: bool = True) -> None:
+        if not self._async_enabled or self._stop_event is None:
+            return
+        self._stop_event.set()
+        if wait and self._writer_thread is not None:
+            self._writer_thread.join(timeout=2.0)
+
+    def flush(self, timeout: Optional[float] = None) -> None:
+        if not self._async_enabled or self._queue is None:
+            return
+        if timeout is None:
+            self._queue.join()
+            return
+        deadline = time.time() + max(0.0, timeout)
+        while getattr(self._queue, "unfinished_tasks", 0) > 0:
+            if time.time() >= deadline:
+                break
+            time.sleep(0.01)
+
+    def _create_job(
+        self,
+        camera_id: str,
+        ts_us: int,
+        depth: np.ndarray,
+        conf: np.ndarray,
+        mask: np.ndarray,
+        dest_path: Path,
+    ) -> _SnapshotJob:
+        depth_c = np.ascontiguousarray(depth, dtype=np.float32).copy()
+        conf_c = np.ascontiguousarray(conf, dtype=np.float32).copy()
+        mask_c = np.ascontiguousarray(mask, dtype=np.uint8).copy()
+        return _SnapshotJob(camera_id, ts_us, depth_c, conf_c, mask_c, dest_path)
+
+    def _register_snapshot(self, camera_id: str, ts_us: int, dest_path: Path) -> None:
+        lock = self._get_lock(camera_id)
+        with lock:
+            index = self._get_index(camera_id)
+            index.append((ts_us, dest_path))
+            self._enforce_limits(camera_id, index)
+
+    def _write_snapshot(self, job: _SnapshotJob) -> None:
+        job.dest_path.parent.mkdir(parents=True, exist_ok=True)
+        compressor = Blosc(cname="zstd", clevel=5, shuffle=Blosc.SHUFFLE)
+        root = zarr.open_group(str(job.dest_path), mode="w")
+        chunk_shape = (min(128, job.depth.shape[0]), min(128, job.depth.shape[1]))
+        root.create_dataset(
+            "depth_z",
+            data=job.depth,
+            compressor=compressor,
+            chunks=chunk_shape,
+            overwrite=True,
+        )
+        root.create_dataset(
+            "conf",
+            data=job.conf,
+            compressor=compressor,
+            chunks=chunk_shape,
+            overwrite=True,
+        )
+        root.create_dataset(
+            "mask",
+            data=job.mask,
+            compressor=compressor,
+            chunks=chunk_shape,
+            overwrite=True,
+        )
+        root.attrs.update(
+            camera_id=job.camera_id,
+            timestamp_us=int(job.ts_us),
+            stored_at=time.time(),
+            shape=json.dumps(job.depth.shape),
+        )
+        self._register_snapshot(job.camera_id, job.ts_us, job.dest_path)
 
     def _remove_snapshot(self, path: Path) -> None:
         try:
@@ -242,49 +364,27 @@ class DepthStorageManager:
         conf: np.ndarray,
         mask: np.ndarray,
     ) -> Path:
-        lock = self._get_lock(camera_id)
-        with lock:
-            timestamp = datetime.utcfromtimestamp(ts_us / 1_000_000.0)
-            date_dir = timestamp.strftime("%Y%m%d")
-            hour_dir = timestamp.strftime("%H")
-            dest_dir = self.base_path / camera_id / date_dir / hour_dir
-            dest_dir.mkdir(parents=True, exist_ok=True)
-            filename = f"{ts_us}.zarr"
-            dest_path = dest_dir / filename
+        timestamp = datetime.utcfromtimestamp(ts_us / 1_000_000.0)
+        date_dir = timestamp.strftime("%Y%m%d")
+        hour_dir = timestamp.strftime("%H")
+        dest_dir = self.base_path / camera_id / date_dir / hour_dir
+        dest_path = dest_dir / f"{ts_us}.zarr"
 
-            compressor = Blosc(cname="zstd", clevel=5, shuffle=Blosc.SHUFFLE)
-            root = zarr.open_group(str(dest_path), mode="w")
-            chunk_shape = (min(128, depth.shape[0]), min(128, depth.shape[1]))
-            root.create_dataset(
-                "depth_z",
-                data=depth.astype(np.float32),
-                compressor=compressor,
-                chunks=chunk_shape,
-                overwrite=True,
-            )
-            root.create_dataset(
-                "conf",
-                data=conf.astype(np.float32),
-                compressor=compressor,
-                chunks=chunk_shape,
-                overwrite=True,
-            )
-            root.create_dataset(
-                "mask",
-                data=mask.astype(np.uint8),
-                compressor=compressor,
-                chunks=chunk_shape,
-                overwrite=True,
-            )
-            root.attrs.update(
-                camera_id=camera_id,
-                timestamp_us=int(ts_us),
-                stored_at=time.time(),
-                shape=json.dumps(depth.shape),
-            )
-            index = self._get_index(camera_id)
-            index.append((ts_us, dest_path))
-            self._enforce_limits(camera_id, index)
+        job = self._create_job(camera_id, ts_us, depth, conf, mask, dest_path)
+        if self._async_enabled and self._queue is not None:
+            try:
+                self._queue.put(job, timeout=0.25)
+                return dest_path
+            except queue.Full:
+                now = time.time()
+                if now - self._last_queue_full_warning >= 5.0:
+                    self._logger.warning(
+                        "Depth snapshot queue full; writing synchronously (size=%s)",
+                        self._max_queue_size,
+                    )
+                    self._last_queue_full_warning = now
+
+        self._write_snapshot(job)
         return dest_path
 
     def latest_entry(self, camera_id: str, ts_max: Optional[int]) -> Optional[Path]:
@@ -332,6 +432,8 @@ class MapAnythingDepthSource:
             max_snapshots_per_camera=self.config.storage.max_snapshots_per_camera,
             retention_minutes=self.config.storage.snapshot_retention_minutes,
             max_total_bytes=getattr(self.config.storage, 'max_total_bytes', None),
+            enable_async=getattr(self.config.storage, 'async_enabled', True),
+            max_queue_size=max(1, int(getattr(self.config.storage, 'queue_size', 32))),
         )
         self.min_conf = float(self.config.performance.min_conf)
         self.mono_interval = 1.0 / max(self.config.performance.mono_freq_hz, 1e-6)
@@ -342,6 +444,13 @@ class MapAnythingDepthSource:
         self._floorplan_cache: "OrderedDict[Tuple[str, float, float], Dict[str, Any]]" = OrderedDict()
         self._max_depth_cache_entries = 16
         self._max_floorplan_cache_entries = 24
+
+    def close(self) -> None:
+        try:
+            self.storage.flush(timeout=2.0)
+            self.storage.shutdown(wait=False)
+        except Exception:
+            pass
 
     def should_infer(self, camera_id: str, timestamp_s: float) -> bool:
         last = self.last_request_per_camera.get(camera_id)
@@ -438,13 +547,28 @@ class MapAnythingDepthSource:
         raise RuntimeError("MapAnything request failed after retries")
 
     def _parse_response(self, response: Dict[str, object]) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-        depth = np.array(response.get("depth_z"), dtype=np.float32)
-        conf = np.array(response.get("conf"), dtype=np.float32)
-        mask = np.array(response.get("mask"), dtype=bool)
-        if depth.ndim != 2 or conf.ndim != 2:
-            raise ValueError("Depth/conf arrays must be 2D")
-        if mask.shape != depth.shape:
-            mask = mask.reshape(depth.shape)
+        shape = response.get("shape")
+        if not (isinstance(shape, (list, tuple)) and len(shape) == 2):
+            raise ValueError(f"Depth response missing shape metadata (got {shape!r})")
+        height, width = int(shape[0]), int(shape[1])
+
+        depth_b64 = response.get("depth_b64") or response.get("depth_z_b64")
+        conf_b64 = response.get("conf_b64")
+        mask_b64 = response.get("mask_b64")
+        missing = [name for name, value in (
+            ("depth_b64", depth_b64),
+            ("conf_b64", conf_b64),
+            ("mask_b64", mask_b64),
+        ) if not isinstance(value, str)]
+        if missing:
+            raise ValueError(f"Depth response missing encoded tensors: {missing}")
+
+        try:
+            depth = np.frombuffer(base64.b64decode(depth_b64), dtype=np.float32).reshape((height, width))
+            conf = np.frombuffer(base64.b64decode(conf_b64), dtype=np.float32).reshape((height, width))
+            mask = np.frombuffer(base64.b64decode(mask_b64), dtype=np.uint8).reshape((height, width)).astype(bool)
+        except Exception as exc:
+            raise ValueError(f"Failed to decode depth response: {exc}") from exc
         return depth, conf, mask
 
     def _align_to_original_shape(

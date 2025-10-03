@@ -101,6 +101,8 @@ class StorageSettings:
     max_snapshots_per_camera: int
     snapshot_retention_minutes: float
     max_total_bytes: Optional[int]
+    async_enabled: bool
+    queue_size: int
 
 
 @dataclass(frozen=True)
@@ -145,6 +147,8 @@ class ServiceConfig:
             max_snapshots_per_camera=_to_int(storage_section.get("max_snapshots_per_camera", "600")),
             snapshot_retention_minutes=_to_float(storage_section.get("snapshot_retention_minutes", "10")),
             max_total_bytes=_to_optional_bytes(storage_section.get("max_total_bytes")),
+            async_enabled=_to_bool(storage_section.get("async_enabled", "true")),
+            queue_size=_to_int(storage_section.get("queue_size", "32")),
         )
         return cls(service=service, inference=inference, performance=performance, storage=storage)
 

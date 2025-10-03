@@ -105,9 +105,9 @@ class MonoRequest(BaseModel):
 
 class MonoResponse(BaseModel):
     cam_id: str
-    depth_z: List[List[float]]
-    conf: List[List[float]]
-    mask: List[List[bool]]
+    depth_b64: str
+    conf_b64: str
+    mask_b64: str
     shape: Tuple[int, int]
     ts_us: int
 
@@ -127,9 +127,10 @@ class MultiRequest(BaseModel):
 class MultiResponse(BaseModel):
     poses: Dict[str, List[float]]
     intrinsics: Dict[str, List[List[float]]]
-    depth_z: Dict[str, List[List[float]]]
-    conf: Dict[str, List[List[float]]]
-    mask: Dict[str, List[List[bool]]]
+    depth_b64: Dict[str, str]
+    conf_b64: Dict[str, str]
+    mask_b64: Dict[str, str]
+    shapes: Dict[str, Tuple[int, int]]
     scale: float
     ts_us: int
 
@@ -327,9 +328,9 @@ class ServiceState:
         shape = depth.shape
         return MonoResponse(
             cam_id=request.view.cam_id,
-            depth_z=depth.tolist(),
-            conf=conf.tolist(),
-            mask=mask.tolist(),
+            depth_b64=_encode_float32(depth),
+            conf_b64=_encode_float32(conf),
+            mask_b64=_encode_mask(mask),
             shape=(int(shape[0]), int(shape[1])),
             ts_us=int(time.time() * 1_000_000),
         )
@@ -376,18 +377,20 @@ class ServiceState:
         if len(predictions) != len(cam_order):
             raise RuntimeError("Mismatch between predictions and requested views")
 
-        depth_dict: Dict[str, List[List[float]]] = {}
-        conf_dict: Dict[str, List[List[float]]] = {}
-        mask_dict: Dict[str, List[List[bool]]] = {}
+        depth_b64: Dict[str, str] = {}
+        conf_b64: Dict[str, str] = {}
+        mask_b64: Dict[str, str] = {}
+        shapes: Dict[str, Tuple[int, int]] = {}
         poses: Dict[str, List[float]] = {}
         intrinsics_dict: Dict[str, List[List[float]]] = {}
         scales: List[float] = []
 
         for cam_id, pred in zip(cam_order, predictions):
             depth, conf, mask = _extract_prediction_slices(pred)
-            depth_dict[cam_id] = depth.tolist()
-            conf_dict[cam_id] = conf.tolist()
-            mask_dict[cam_id] = mask.tolist()
+            depth_b64[cam_id] = _encode_float32(depth)
+            conf_b64[cam_id] = _encode_float32(conf)
+            mask_b64[cam_id] = _encode_mask(mask)
+            shapes[cam_id] = (int(depth.shape[0]), int(depth.shape[1]))
 
             pose_tensor = pred.get("camera_poses")
             if pose_tensor is not None:
@@ -408,9 +411,10 @@ class ServiceState:
         return MultiResponse(
             poses=poses,
             intrinsics=intrinsics_dict,
-            depth_z=depth_dict,
-            conf=conf_dict,
-            mask=mask_dict,
+            depth_b64=depth_b64,
+            conf_b64=conf_b64,
+            mask_b64=mask_b64,
+            shapes=shapes,
             scale=scale,
             ts_us=int(time.time() * 1_000_000),
         )
@@ -473,6 +477,14 @@ def _fallback_preprocess(views: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             processed_entry["intrinsics"] = torch.as_tensor(entry["intrinsics"], dtype=torch.float32)[None]
         processed.append(processed_entry)
     return processed
+
+
+def _encode_float32(array: np.ndarray) -> str:
+    return base64.b64encode(np.ascontiguousarray(array, dtype=np.float32).tobytes()).decode('ascii')
+
+
+def _encode_mask(mask: np.ndarray) -> str:
+    return base64.b64encode(np.ascontiguousarray(mask.astype(np.uint8)).tobytes()).decode('ascii')
 
 
 def _extract_prediction_slices(pred: Dict[str, Any]) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:

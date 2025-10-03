@@ -49,8 +49,8 @@ export function useWebSocketClient(url: string, handlers: FrameHandlers) {
   const [status, setStatus] = useState<'connecting' | 'open' | 'closed' | 'error'>('connecting');
   const [retry, setRetry] = useState(0);
   const maxRetries = 10;
-  const heartbeatRef = useRef<NodeJS.Timeout | null>(null);
-  const reconnectTimeoutRef = useRef<NodeJS.Timeout | null>(null);
+  const heartbeatRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const reconnectTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   useEffect(() => {
     let stop = false;

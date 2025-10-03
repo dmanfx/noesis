@@ -13,7 +13,10 @@ import { detectCameraKey, CameraKey } from './lib/camera';
 import { useWebSocketClient, StatsPayload } from './hooks/useWebSocketClient';
 import DepthDrawer, { DepthDiagnosticsEntry, DepthDrawerEntry, FloorplanResponse } from './components/DepthDrawer';
 
-const WS_URL = 'ws://localhost:6008';
+const wsHost = import.meta.env.VITE_WS_HOST || window.location.hostname;
+const wsPort = Number(import.meta.env.VITE_WS_PORT || 6008);
+const wsProto = window.location.protocol === 'https:' ? 'wss' : 'ws';
+const WS_URL = import.meta.env.VITE_WS_URL || `${wsProto}://${wsHost}:${wsPort}`;
 
 function Dashboard() {
   const { publish } = useTelemetry();

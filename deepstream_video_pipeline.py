@@ -2785,34 +2785,6 @@ class DeepStreamVideoPipeline:
                     except Exception:
                         pass
 
-            # Draw exclusion ROI polygons for this stream (plugin OSD disabled for exclude)
-            try:
-                ds_index = int(frame_meta.source_id)
-                rois = self._exclusion_rois_by_stream.get(ds_index, {})
-                if rois:
-                    roi_meta = pyds.nvds_acquire_display_meta_from_pool(batch_meta)
-                    if roi_meta:
-                        # Draw each polygon as connected line segments
-                        max_lines = len(roi_meta.line_params)
-                        for poly in rois.values():
-                            if len(poly) < 2:
-                                continue
-                            for i in range(len(poly)):
-                                if roi_meta.num_lines >= min(250, max_lines):
-                                    break
-                                x1, y1 = poly[i]
-                                x2, y2 = poly[(i + 1) % len(poly)]  # close polygon
-                                lp = roi_meta.line_params[roi_meta.num_lines]
-                                lp.line_width = 2
-                                lp.x1, lp.y1, lp.x2, lp.y2 = map(int, (x1, y1, x2, y2))
-                                # Red with strong alpha to stand out
-                                lp.line_color.set(1.0, 0.15, 0.15, 0.95)
-                                roi_meta.num_lines += 1
-                        pyds.nvds_add_display_meta_to_frame(frame_meta, roi_meta)
-            except Exception:
-                # Never break rendering on ROI overlay issues
-                pass
-
             display_meta = pyds.nvds_acquire_display_meta_from_pool(batch_meta)
             if not display_meta:
                 l_frame = l_frame.next

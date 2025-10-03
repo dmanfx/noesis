@@ -34,9 +34,8 @@ class AppConfig:
         APP_NAME: str = "YOLO Video Tracking"
         VERSION: str = "1.0.0"
         START_TIME: float = field(default_factory=time.time)
-        LOG_LEVEL: int = 30  # WARNING
+        LOG_LEVEL: int = 30  # Warning
         LOG_FILE: Optional[str] = "logs/app.log"
-        DEBUG: bool = False  # Disable debug mode for performance
     
     @dataclass
     class CameraSettings:
@@ -487,10 +486,7 @@ class AppConfig:
 config = AppConfig()
 
 
-# Apply environment-based configuration overrides
-if os.getenv("DEBUG", "0") == "1":
-    config.app.DEBUG = True
-    config.app.LOG_LEVEL = 20 # INFO
+# No environment overrides for logging - use command-line args instead
 
 # Resolve paths relative to the script location
 script_dir = os.path.dirname(os.path.abspath(__file__))

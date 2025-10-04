@@ -359,6 +359,20 @@ function Dashboard() {
     onMADepth: handleMADepth,
     onFloorplan: handleFloorplan
   });
+
+  // Periodically request MapAnything floorplan bounds for each camera; fail-fast usage in MapPanel
+  useEffect(() => {
+    if (status !== 'open') return;
+    const cams: CameraKey[] = ['living-room', 'kitchen', 'family-room'];
+    const requestAll = () => {
+      cams.forEach((cam) => {
+        requestFloorplan({ camera: cam, maxAgeSec: 60, gridResM: 0.5, maxExtentM: 20 });
+      });
+    };
+    requestAll();
+    const id = window.setInterval(requestAll, 30000);
+    return () => window.clearInterval(id);
+  }, [status, requestFloorplan]);
   
   // Live EST/EDT clock for top bar
   const [estTime, setEstTime] = useState<string>("");
@@ -524,7 +538,16 @@ function Dashboard() {
 
           { /* Transitions panel removed */ }
 
-          <MapPanel store={trailStoreRef.current} visible={trailEnabled} />
+          <MapPanel
+            store={trailStoreRef.current}
+            visible={trailEnabled}
+            floorplans={floorplanData}
+            worldUsage={useMemo(() => ({
+              'living-room': usingWorldLivingRef.current,
+              'kitchen': usingWorldKitchenRef.current,
+              'family-room': usingWorldFamilyRef.current,
+            }), [tracksByCamKey, floorplanData])}
+          />
         </section>
       </main>
       <footer className="footer">

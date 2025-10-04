@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
 import { StreamPanel } from './components/StreamPanel';
 import { MapPanel } from './components/MapPanel';
@@ -7,9 +7,8 @@ import { ControlsPanel } from './components/ControlsPanel';
 import { TelemetryPanel } from './telemetry/TelemetryPanel';
 import { TelemetryProvider, useTelemetry } from './telemetry/TelemetryContext';
 import { TrailStore } from './lib/trails';
-import { cameraOrder, colorForTrack } from './lib/camera';
-import { getExtrinsics, worldToCamera } from './lib/calibration';
-import { detectCameraKey, CameraKey } from './lib/camera';
+import { cameraOrder, colorForTrack, cameraLabel, detectCameraKey, CameraKey } from './lib/camera';
+import { getExtrinsics, worldToCamera, getIntrinsics4, extractPoseFromExtrinsics, forwardXZFromExtrinsics } from './lib/calibration';
 import { useWebSocketClient, StatsPayload } from './hooks/useWebSocketClient';
 import DepthDrawer, { DepthDiagnosticsEntry, DepthDrawerEntry, FloorplanResponse } from './components/DepthDrawer';
 
@@ -17,6 +16,12 @@ const wsHost = import.meta.env.VITE_WS_HOST || window.location.hostname;
 const wsPort = Number(import.meta.env.VITE_WS_PORT || 6008);
 const wsProto = window.location.protocol === 'https:' ? 'wss' : 'ws';
 const WS_URL = import.meta.env.VITE_WS_URL || `${wsProto}://${wsHost}:${wsPort}`;
+
+const labelForCameraId = (camId: string): string => {
+  const key = detectCameraKey(camId);
+  if (key) return cameraLabel(key);
+  return camId;
+};
 
 function Dashboard() {
   const { publish } = useTelemetry();
@@ -77,12 +82,19 @@ function Dashboard() {
   const [maDiagnostics, setMaDiagnostics] = useState<Record<string, DepthDiagnosticsEntry>>({});
   const [maDepthData, setMaDepthData] = useState<Record<string, DepthDrawerEntry>>({});
   const [floorplanData, setFloorplanData] = useState<Record<string, FloorplanResponse>>({});
+  const [cameraStatuses, setCameraStatuses] = useState<Record<CameraKey, string>>({
+    'living-room': 'unknown',
+    'kitchen': 'unknown',
+    'family-room': 'unknown'
+  });
   // Auto-primary selection state
   const [primaryKey, setPrimaryKey] = useState<CameraKey>(cameraOrder[0]);
   const [locked, setLocked] = useState<boolean>(false);
   const [expandedCamera, setExpandedCamera] = useState<CameraKey | null>(null);
   const motionEmaRef = useRef<Record<CameraKey, number>>({ 'living-room': 0, 'kitchen': 0, 'family-room': 0 });
   const lastSwitchRef = useRef<number>(0);
+  const maDiagThrottleRef = useRef<Record<string, number>>({});
+  const lastCalibrationSignatureRef = useRef<string>('');
   const EMA_ALPHA = 0.3; // smoothing factor for motion
   const SWITCH_RATIO = 1.25; // require challenger to be 25% higher
   const SWITCH_COOLDOWN_MS = 10000; // 10s minimum between switches
@@ -93,6 +105,7 @@ function Dashboard() {
     publish({ group: 'System', key: 'Uptime', value: Math.floor((payload.uptime ?? 0)), ts: now });
 
     const cameras = payload.cameras || {};
+    const statusUpdates: Partial<Record<CameraKey, string>> = {};
     const globalOcc: Record<string, number> = {};
     let allTracks: any[] = [];
     // Transitions disabled; keep placeholder for compatibility
@@ -108,9 +121,14 @@ function Dashboard() {
 
     for (const camId in cameras) {
       const c = cameras[camId];
-      if (c?.status) publish({ group: `Camera ${camId}`, key: 'Status', value: c.status, ts: now });
       const track = c?.tracking;
       const camKey = detectCameraKey(camId) || (camId.toLowerCase().includes('kitchen') ? 'kitchen' : camId.toLowerCase().includes('living') || camId === '1' || camId === 'rtsp_0' ? 'living-room' : 'family-room');
+      if (camKey === 'living-room' || camKey === 'kitchen' || camKey === 'family-room') {
+        const statusText = typeof c?.status === 'string' && c.status.trim().length > 0
+          ? c.status
+          : (typeof c?.frame_count === 'number' && c.frame_count > 0 ? 'running' : 'unknown');
+        statusUpdates[camKey] = statusText;
+      }
       if (track?.occupancy) {
         for (const z in track.occupancy) globalOcc[z] = (globalOcc[z] || 0) + (track.occupancy as any)[z];
         perKeyOcc[camKey] = track.occupancy;
@@ -198,6 +216,10 @@ function Dashboard() {
 
     prevActiveRef.current = seenNow;
 
+    if (Object.keys(statusUpdates).length > 0) {
+      setCameraStatuses(prev => ({ ...prev, ...statusUpdates }));
+    }
+
     // Occupancy HTML
     let occHtml = '<ul style="margin:0;padding-left:16px">';
     const sortedOcc = Object.entries(globalOcc).sort(([,a],[,b]) => b-a);
@@ -247,7 +269,6 @@ function Dashboard() {
     }
 
     publish({ group: 'Tracking', key: 'Active Tracks', value: allTracks.length, ts: now });
-    publish({ group: 'Connection', key: 'Status', value: 'Connected', ts: now });
 
     // --- Auto-promote primary based on motion heuristic ---
     try {
@@ -307,6 +328,81 @@ function Dashboard() {
     computeFps(cam);
   };
 
+  const handleCalibrationBundle = useCallback((bundle: any) => {
+    if (!bundle || typeof bundle !== 'object') return;
+
+    let signature = '';
+    try {
+      signature = JSON.stringify({ cameras: bundle.cameras ?? {}, align: bundle.align ?? {} });
+    } catch {
+      signature = '';
+    }
+    if (signature && signature === lastCalibrationSignatureRef.current) {
+      return;
+    }
+    if (signature) {
+      lastCalibrationSignatureRef.current = signature;
+    }
+
+    const now = Date.now();
+    const publishNumeric = (group: string, key: string, raw: unknown, digits = 3) => {
+      if (typeof raw !== 'number' || !Number.isFinite(raw)) return;
+      publish({ group, key, value: Number(raw.toFixed(digits)), ts: now });
+    };
+
+    const alignData = bundle.align ?? {};
+    const floorYRaw = typeof alignData.floor_y === 'number'
+      ? alignData.floor_y
+      : typeof alignData.floorY === 'number'
+        ? alignData.floorY
+        : null;
+    if (floorYRaw !== null && Number.isFinite(floorYRaw)) {
+      publishNumeric('MapAnything Align', 'Floor Y (m)', floorYRaw, 3);
+    }
+    const units = alignData.units ?? {};
+    const scaleRaw = typeof units.s_obj_to_m === 'number' ? units.s_obj_to_m : null;
+    if (scaleRaw !== null && Number.isFinite(scaleRaw)) {
+      publishNumeric('MapAnything Align', 'Units (s_obj_to_m)', scaleRaw, 5);
+    }
+
+    cameraOrder.forEach((camKey) => {
+      const label = cameraLabel(camKey);
+      const intr = getIntrinsics4(camKey);
+      if (intr && intr.length >= 4) {
+        const [fx, fy, cx, cy] = intr.map((val) => Number(val));
+        publishNumeric('MapAnything Intrinsics', `${label} fx`, fx, 1);
+        publishNumeric('MapAnything Intrinsics', `${label} fy`, fy, 1);
+        publishNumeric('MapAnything Intrinsics', `${label} cx`, cx, 1);
+        publishNumeric('MapAnything Intrinsics', `${label} cy`, cy, 1);
+        if (typeof fx === 'number' && Number.isFinite(fx) && Math.abs(fx) > 1e-6) {
+          publishNumeric('MapAnything Pixel Scale', `${label} m/px @1m (H)`, 1 / fx, 4);
+        }
+        if (typeof fy === 'number' && Number.isFinite(fy) && Math.abs(fy) > 1e-6) {
+          publishNumeric('MapAnything Pixel Scale', `${label} m/px @1m (V)`, 1 / fy, 4);
+        }
+      }
+
+      const E = getExtrinsics(camKey);
+      if (E && Array.isArray(E) && E.length === 16) {
+        const pose = extractPoseFromExtrinsics(E);
+        if (pose) {
+          const [px, py, pz] = pose.Cw;
+          publishNumeric('MapAnything Pose', `${label} Position X (m)`, px, 2);
+          publishNumeric('MapAnything Pose', `${label} Position Y (m)`, py, 2);
+          publishNumeric('MapAnything Pose', `${label} Position Z (m)`, pz, 2);
+          if (floorYRaw !== null && Number.isFinite(floorYRaw)) {
+            publishNumeric('MapAnything Pose', `${label} Height Above Floor (m)`, py - floorYRaw, 2);
+          }
+        }
+        const forward = forwardXZFromExtrinsics(E);
+        if (forward) {
+          publishNumeric('MapAnything Pose', `${label} Forward X`, forward.fx, 3);
+          publishNumeric('MapAnything Pose', `${label} Forward Z`, forward.fz, 3);
+        }
+      }
+    });
+  }, [lastCalibrationSignatureRef, publish]);
+
   const handleMADiagnostics = (payload: any) => {
     const camId = payload?.cam_id || payload?.cameraId;
     if (!camId) return;
@@ -317,6 +413,33 @@ function Dashboard() {
         ts: payload.ts || Date.now()
       }
     }));
+
+    const now = Date.now();
+    const throttleKey = `diag:${camId}`;
+    const last = maDiagThrottleRef.current[throttleKey] || 0;
+    if (now - last < 4000) return;
+    maDiagThrottleRef.current[throttleKey] = now;
+
+    const label = labelForCameraId(camId);
+    const summary = payload.summary || {};
+    const publishDiag = (keySuffix: string, raw: unknown, digits = 2, allowString = false) => {
+      if (allowString && typeof raw === 'string') {
+        publish({ group: 'MapAnything Diagnostics', key: `${label} ${keySuffix}`, value: raw, ts: now });
+        return;
+      }
+      if (typeof raw !== 'number' || !Number.isFinite(raw)) return;
+      publish({ group: 'MapAnything Diagnostics', key: `${label} ${keySuffix}`, value: Number(raw.toFixed(digits)), ts: now });
+    };
+
+    publishDiag('Median Depth (m)', summary.median, 2);
+    publishDiag('Depth p10 (m)', summary.p10, 2);
+    publishDiag('Depth p90 (m)', summary.p90, 2);
+    publishDiag('Confidence Mean', summary.conf_mean, 3);
+    publishDiag('Valid Ratio', summary.valid_ratio, 3);
+    publishDiag('Valid Samples', summary.sample_count, 0);
+    if (summary.method) {
+      publishDiag('Method', summary.method, 2, true);
+    }
   };
 
   const handleMADepth = (payload: any) => {
@@ -341,6 +464,24 @@ function Dashboard() {
     };
     if (!entry.shape[0] || !entry.shape[1]) return;
     setMaDepthData(prev => ({ ...prev, [camId]: entry }));
+
+    const label = labelForCameraId(camId);
+    const now = Date.now();
+    publish({
+      group: 'MapAnything Depth',
+      key: `${label} Resolution`,
+      value: `${entry.shape[0]}x${entry.shape[1]}`,
+      ts: now
+    });
+    if (typeof payload?.ts === 'number' && Number.isFinite(payload.ts)) {
+      const ageMs = Math.max(0, now - Math.floor(payload.ts / 1000));
+      publish({
+        group: 'MapAnything Depth',
+        key: `${label} Snapshot Age (s)`,
+        value: Number((ageMs / 1000).toFixed(1)),
+        ts: now
+      });
+    }
   };
 
   const handleFloorplan = (payload: any) => {
@@ -349,12 +490,47 @@ function Dashboard() {
     const camId = camRaw ? String(camRaw) : '';
     if (!camId) return;
     setFloorplanData(prev => ({ ...prev, [camId]: payload as FloorplanResponse }));
+
+    const label = labelForCameraId(camId);
+    const now = Date.now();
+    if (typeof payload.scale_m_per_px === 'number' && Number.isFinite(payload.scale_m_per_px)) {
+      publish({
+        group: 'MapAnything Floorplan',
+        key: `${label} Scale (m/px)`,
+        value: Number(payload.scale_m_per_px.toFixed(4)),
+        ts: now
+      });
+    }
+    const bounds = payload.bounds || {};
+    if (
+      typeof bounds.min_x === 'number' && Number.isFinite(bounds.min_x) &&
+      typeof bounds.max_x === 'number' && Number.isFinite(bounds.max_x)
+    ) {
+      publish({
+        group: 'MapAnything Floorplan',
+        key: `${label} X Span (m)`,
+        value: Number((bounds.max_x - bounds.min_x).toFixed(2)),
+        ts: now
+      });
+    }
+    if (
+      typeof bounds.min_z === 'number' && Number.isFinite(bounds.min_z) &&
+      typeof bounds.max_z === 'number' && Number.isFinite(bounds.max_z)
+    ) {
+      publish({
+        group: 'MapAnything Floorplan',
+        key: `${label} Z Span (m)`,
+        value: Number((bounds.max_z - bounds.min_z).toFixed(2)),
+        ts: now
+      });
+    }
   };
 
   const { status, sendClearStats, sendTrailToggle, sendDetectionConfig, sendDetectionToggle, requestMapAnythingDepth, requestFloorplan } = useWebSocketClient(WS_URL, {
     onImage,
     onStats,
     onTrailToggle: (en) => setTrailEnabled(en),
+    onCalibration: handleCalibrationBundle,
     onMADiagnostics: handleMADiagnostics,
     onMADepth: handleMADepth,
     onFloorplan: handleFloorplan
@@ -411,8 +587,21 @@ function Dashboard() {
   }, []);
 
   const connectionChip = useMemo(() => {
-    const color = status === 'open' ? 'var(--good)' : status === 'connecting' ? 'var(--warn)' : 'var(--bad)';
-    const text = status === 'open' ? 'Connected' : status === 'connecting' ? 'Connecting…' : 'Disconnected';
+    let color = 'var(--bad)';
+    let text = 'Disconnected';
+    if (status === 'open') {
+      color = 'var(--good)';
+      text = 'Connected';
+    } else if (status === 'connecting') {
+      color = 'var(--warn)';
+      text = 'Connecting…';
+    } else if (status === 'closed') {
+      color = 'var(--bad)';
+      text = 'Closed';
+    } else if (status === 'error') {
+      color = 'var(--bad)';
+      text = 'Error';
+    }
     return <span className="chip"><span className="status-dot" style={{ background: color }} />{text}</span>;
   }, [status]);
 
@@ -553,7 +742,12 @@ function Dashboard() {
         onRequestFloorplan={(opts) => requestFloorplan(opts)}
       />
 
-      {telemetryOpen && <TelemetryPanel onClose={() => setTelemetryOpen(false)} />}
+      {telemetryOpen && (
+        <TelemetryPanel
+          onClose={() => setTelemetryOpen(false)}
+          cameraStatuses={cameraStatuses}
+        />
+      )}
     </div>
   );
 }

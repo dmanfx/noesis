@@ -31,6 +31,7 @@ export type FrameHandlers = {
   onImage: (cam: CameraKey, blob: Blob) => void;
   onStats: (stats: StatsPayload) => void;
   onTrailToggle?: (enabled: boolean) => void;
+  onCalibration?: (bundle: any) => void;
   onMADiagnostics?: (payload: any) => void;
   onMADepth?: (payload: any) => void;
   onFloorplan?: (payload: any) => void;
@@ -171,6 +172,11 @@ export function useWebSocketClient(url: string, handlers: FrameHandlers) {
             handlers.onStats(data.payload as StatsPayload);
           } else if (data.type === 'calibration-bundle' && data.data) {
             try { setCalibration(data); } catch {}
+            try {
+              handlers.onCalibration?.(data.data);
+            } catch (err) {
+              console.warn('Calibration handler failed', err);
+            }
           } else if (data.type === 'toggle_update' && data.toggle_name === 'trail_visualization_enabled') {
             handlers.onTrailToggle?.(!!data.enabled);
           } else if (data.type === 'trail_visualization_enabled_update') {

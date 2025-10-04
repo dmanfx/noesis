@@ -38,6 +38,7 @@ Key goals:
 
 ### Geometry Integration (`geometry/`)
 - `depth_source.py`: HTTP client for the microservice with retry/backoff, summary computation, Zarr persistence, and latest-depth RPC provider.
+  - Batches mono callers through `/infer_multi` when `[performance] multi_batch_size > 1`, flushing within ~5–20 ms so multiple cameras share preprocessing/inference work while still falling back to `/infer_mono` on errors.
 - `depth_publisher.py`: MQTT + Influx publisher for depth summaries (`noesis/geometry/<room>/<cam>/depth_summary` and `mde.depth.summary`, `mde.scale`, `mde.pose.error`).
 - `floor.py`: Backprojection and RANSAC utility to fit floor planes and map camera planes into world space.
 - `transform.py`: Extended pixel-to-world helper that prefers MapAnything depth when confidence exceeds configured threshold.
@@ -162,6 +163,7 @@ data/depth/<camera_id>/<YYYYMMDD>/<HH>/<timestamp_us>.zarr/
 - **Service launch**: `python3 main.py` automatically spawns the microservice; to run manually use `services/mapanything_svc/run.sh`.
 - **Checksum verification**: `scripts/verify_ma_weights.py` hashes the Apache weights and compares against `docs/ma-integration/weights.sha`.
 - **Performance smoke test**: `scripts/perf_test.py --iterations 20` measures average mono latency using the local service.
+- **Batch tuning**: `[performance] multi_batch_size` controls how many mono requests are grouped per `/infer_multi` call; reduce to `1` to disable batching or adjust alongside `multi_interval` when large camera fleets require stronger coalescing.
 - **Manual diagnostics**: `curl -H "X-API-Key: noesis_secret" -X POST http://127.0.0.1:8001/infer_mono -d '{...}'` to exercise the endpoint with encoded frames.
 - **Log awareness**: microservice logs memory-efficiency toggles, checksum status, and inference errors; Noesis logs indicate when motion gating skips frames.
 

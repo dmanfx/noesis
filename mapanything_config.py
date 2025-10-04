@@ -103,6 +103,8 @@ class StorageSettings:
     max_total_bytes: Optional[int]
     async_enabled: bool
     queue_size: int
+    async_workers: int
+    async_max_workers: int
 
 
 @dataclass(frozen=True)
@@ -149,6 +151,8 @@ class ServiceConfig:
             max_total_bytes=_to_optional_bytes(storage_section.get("max_total_bytes")),
             async_enabled=_to_bool(storage_section.get("async_enabled", "true")),
             queue_size=_to_int(storage_section.get("queue_size", "32")),
+            async_workers=_to_int(storage_section.get("async_workers", "0")),
+            async_max_workers=_to_int(storage_section.get("async_max_workers", "0")),
         )
         return cls(service=service, inference=inference, performance=performance, storage=storage)
 

@@ -4,6 +4,7 @@ from __future__ import annotations
 import base64
 import json
 import logging
+import os
 import queue
 import shutil
 import threading
@@ -12,7 +13,9 @@ from collections import OrderedDict, deque
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Deque, Dict, Iterable, Mapping, Optional, Tuple
+from typing import Any, Deque, Dict, Iterable, List, Mapping, Optional, Tuple
+
+from concurrent.futures import Future
 
 import cv2
 import numpy as np
@@ -58,6 +61,15 @@ class _SnapshotJob:
     dest_path: Path
 
 
+@dataclass(frozen=True)
+class _BatchItem:
+    camera_id: str
+    timestamp_s: float
+    view_result: ViewBuildResult
+    view_payload: Dict[str, object]
+    future: Future
+
+
 class DepthStorageManager:
     """Persist depth outputs to Zarr for later consumption with retention enforcement."""
 
@@ -70,6 +82,8 @@ class DepthStorageManager:
         *,
         enable_async: bool = True,
         max_queue_size: int = 32,
+        worker_count: int = 1,
+        max_worker_count: int = 0,
     ) -> None:
         self.base_path = base_path
         self.base_path.mkdir(parents=True, exist_ok=True)
@@ -81,9 +95,25 @@ class DepthStorageManager:
         self._max_total_bytes = max_total_bytes if (max_total_bytes is not None and max_total_bytes > 0) else None
         self._async_enabled = bool(enable_async)
         self._max_queue_size = max(1, int(max_queue_size)) if self._async_enabled else 0
+        self._initial_workers = 0
+        self._max_worker_count = 0
+        if self._async_enabled:
+            requested_workers = int(worker_count)
+            default_workers = self._default_worker_target()
+            if requested_workers <= 0:
+                requested_workers = default_workers
+            self._initial_workers = max(1, requested_workers)
+            requested_max = int(max_worker_count)
+            if requested_max <= 0:
+                requested_max = max(self._initial_workers, default_workers)
+            self._max_worker_count = max(self._initial_workers, requested_max)
+            self._max_queue_size = max(self._max_queue_size, self._initial_workers * 4)
         self._queue: Optional["queue.Queue[_SnapshotJob]"] = None
         self._stop_event: Optional[threading.Event] = None
-        self._writer_thread: Optional[threading.Thread] = None
+        self._writer_threads: List[threading.Thread] = []
+        self._worker_lock = threading.Lock()
+        self._worker_name_counter = 0
+        self._queue_put_timeout = 1.0
         self._last_queue_full_warning: float = 0.0
         if self._max_total_bytes is not None and self._max_total_bytes < 10 * 1024 * 1024:
             self._logger.warning(
@@ -94,6 +124,10 @@ class DepthStorageManager:
         self._seed_existing_entries()
         if self._async_enabled:
             self._start_writer()
+
+    def _default_worker_target(self) -> int:
+        cpu_count = os.cpu_count() or 1
+        return max(2, min(8, cpu_count))
 
     def _seed_existing_entries(self) -> None:
         """Populate in-memory indices from disk on startup and prune if needed."""
@@ -125,37 +159,55 @@ class DepthStorageManager:
         return self._indices.setdefault(camera_id, deque())
 
     def _start_writer(self) -> None:
-        if self._queue is not None:
+        if self._queue is not None or self._initial_workers <= 0:
             return
         self._queue = queue.Queue(maxsize=self._max_queue_size)
         self._stop_event = threading.Event()
+        with self._worker_lock:
+            for _ in range(self._initial_workers):
+                self._spawn_worker_locked()
 
-        def _worker() -> None:
-            assert self._queue is not None
-            assert self._stop_event is not None
-            while True:
-                try:
-                    job = self._queue.get(timeout=0.2)
-                except queue.Empty:
-                    if self._stop_event.is_set():
-                        break
-                    continue
-                try:
-                    self._write_snapshot(job)
-                except Exception as exc:
-                    self._logger.error(f"Depth snapshot write failed for {job.camera_id}: {exc}")
-                finally:
-                    self._queue.task_done()
+    def _spawn_worker_locked(self) -> None:
+        if self._queue is None or self._stop_event is None:
+            return
+        self._worker_name_counter += 1
+        thread = threading.Thread(
+            target=self._writer_loop,
+            name=f"DepthSnapshotWriter-{self._worker_name_counter}",
+            daemon=True,
+        )
+        self._writer_threads.append(thread)
+        thread.start()
 
-        self._writer_thread = threading.Thread(target=_worker, name="DepthSnapshotWriter", daemon=True)
-        self._writer_thread.start()
+    def _writer_loop(self) -> None:
+        assert self._queue is not None
+        assert self._stop_event is not None
+        while True:
+            try:
+                job = self._queue.get(timeout=0.2)
+            except queue.Empty:
+                if self._stop_event.is_set():
+                    break
+                continue
+            try:
+                self._write_snapshot(job)
+            except Exception as exc:
+                self._logger.error(f"Depth snapshot write failed for {job.camera_id}: {exc}")
+            finally:
+                self._queue.task_done()
 
     def shutdown(self, *, wait: bool = True) -> None:
         if not self._async_enabled or self._stop_event is None:
             return
         self._stop_event.set()
-        if wait and self._writer_thread is not None:
-            self._writer_thread.join(timeout=2.0)
+        if wait:
+            threads = self._collect_alive_threads()
+            for thread in threads:
+                thread.join(timeout=2.0)
+        with self._worker_lock:
+            self._writer_threads.clear()
+        self._queue = None
+        self._stop_event = None
 
     def flush(self, timeout: Optional[float] = None) -> None:
         if not self._async_enabled or self._queue is None:
@@ -373,9 +425,15 @@ class DepthStorageManager:
         job = self._create_job(camera_id, ts_us, depth, conf, mask, dest_path)
         if self._async_enabled and self._queue is not None:
             try:
-                self._queue.put(job, timeout=0.25)
+                self._queue.put(job, timeout=self._queue_put_timeout)
                 return dest_path
             except queue.Full:
+                if self._maybe_scale_workers():
+                    try:
+                        self._queue.put(job, timeout=self._queue_put_timeout)
+                        return dest_path
+                    except queue.Full:
+                        pass
                 now = time.time()
                 if now - self._last_queue_full_warning >= 5.0:
                     self._logger.warning(
@@ -386,6 +444,23 @@ class DepthStorageManager:
 
         self._write_snapshot(job)
         return dest_path
+
+    def _collect_alive_threads(self) -> List[threading.Thread]:
+        with self._worker_lock:
+            alive = [thread for thread in self._writer_threads if thread.is_alive()]
+            self._writer_threads = alive
+            return list(alive)
+
+    def _maybe_scale_workers(self) -> bool:
+        if not self._async_enabled or self._queue is None:
+            return False
+        with self._worker_lock:
+            alive = [thread for thread in self._writer_threads if thread.is_alive()]
+            self._writer_threads = alive
+            if len(alive) >= self._max_worker_count:
+                return False
+            self._spawn_worker_locked()
+            return True
 
     def latest_entry(self, camera_id: str, ts_max: Optional[int]) -> Optional[Path]:
         lock = self._get_lock(camera_id)
@@ -434,6 +509,8 @@ class MapAnythingDepthSource:
             max_total_bytes=getattr(self.config.storage, 'max_total_bytes', None),
             enable_async=getattr(self.config.storage, 'async_enabled', True),
             max_queue_size=max(1, int(getattr(self.config.storage, 'queue_size', 32))),
+            worker_count=int(getattr(self.config.storage, 'async_workers', 0)),
+            max_worker_count=int(getattr(self.config.storage, 'async_max_workers', 0)),
         )
         self.min_conf = float(self.config.performance.min_conf)
         self.mono_interval = 1.0 / max(self.config.performance.mono_freq_hz, 1e-6)
@@ -444,8 +521,26 @@ class MapAnythingDepthSource:
         self._floorplan_cache: "OrderedDict[Tuple[str, float, float], Dict[str, Any]]" = OrderedDict()
         self._max_depth_cache_entries = 16
         self._max_floorplan_cache_entries = 24
+        self._batch_lock = threading.Lock()
+        self._batch_condition = threading.Condition(self._batch_lock)
+        self._batch_queue: Deque[_BatchItem] = deque()
+        self._batch_worker: Optional[threading.Thread] = None
+        self._batch_shutdown = False
+        batch_size = max(1, int(getattr(self.config.performance, 'multi_batch_size', 1)))
+        self._batch_size = batch_size
+        # Flush quickly enough to avoid latency while still gathering a few cameras.
+        candidate_flush = self.mono_interval * 0.25
+        self._batch_flush_s = max(0.005, min(0.02, candidate_flush))
+        self._multi_batches_attempted = 0
+        self._multi_batches_succeeded = 0
+        self._multi_batches_fallback = 0
+        self._multi_scene_counter = 0
 
     def close(self) -> None:
+        try:
+            self._stop_batch_worker()
+        except Exception:
+            pass
         try:
             self.storage.flush(timeout=2.0)
             self.storage.shutdown(wait=False)
@@ -469,66 +564,254 @@ class MapAnythingDepthSource:
         if not self.should_infer(camera_id, ts):
             return None
         try:
-            result = self._infer_mono(camera_id, frame_bgr, calib_bundle, ts)
+            view_result, view_payload = self._prepare_view(camera_id, frame_bgr, calib_bundle)
+            if self._batch_size <= 1:
+                result = self._run_single_request(camera_id, ts, view_result, view_payload)
+            else:
+                result = self._submit_batch_request(camera_id, ts, view_result, view_payload)
             self.last_request_per_camera[camera_id] = ts
             return result
         except Exception as exc:
             self.logger.error(f"Mono depth inference failed for {camera_id}: {exc}")
             return None
 
-    def _infer_mono(
+    def _prepare_view(
         self,
         camera_id: str,
         frame_bgr: np.ndarray,
         calib_bundle: Optional[Mapping[str, object]],
-        timestamp_s: float,
-    ) -> DepthResult:
+    ) -> Tuple[ViewBuildResult, Dict[str, object]]:
         view_result = build_mono_view(frame_bgr, camera_id, calib_bundle)
+        payload = self._serialize_view_payload(camera_id, view_result)
+        return view_result, payload
 
+    def _serialize_view_payload(self, camera_id: str, view_result: ViewBuildResult) -> Dict[str, object]:
         view_payload = dict(view_result.payload)
+        view_payload['cam_id'] = camera_id
 
-        # Ensure payload provides the tensor metadata expected by the service
-        shape = view_payload.get('shape')
-        if shape is None:
-            shape = list(view_result.resized_shape)
+        shape = view_payload.get('shape') or view_result.resized_shape
         view_payload['shape'] = [int(shape[0]), int(shape[1]), int(shape[2])]
 
         if 'img_b64' not in view_payload:
-            frame_rgb = view_result.payload.get('img')
+            frame_rgb = view_payload.get('img')
             if frame_rgb is None:
-                raise ValueError("MapAnything view payload missing img_b64 and raw img data")
+                raise ValueError("MapAnything view payload missing img_b64 data")
             img_bytes = np.ascontiguousarray(frame_rgb).tobytes()
             view_payload['img_b64'] = base64.b64encode(img_bytes).decode('ascii')
-            view_payload.pop('img', None)
-
-        if 'cam_id' not in view_payload:
-            view_payload['cam_id'] = camera_id
+        view_payload.pop('img', None)
 
         if 'intrinsics' not in view_payload and view_result.intrinsics is not None:
             view_payload['intrinsics'] = view_result.intrinsics.tolist()
 
-        payload = {"view": view_payload}
+        return view_payload
 
-        response_json = self._post_json("/infer_mono", payload)
+    def _submit_batch_request(
+        self,
+        camera_id: str,
+        timestamp_s: float,
+        view_result: ViewBuildResult,
+        view_payload: Dict[str, object],
+    ) -> DepthResult:
+        future: Future = Future()
+        item = _BatchItem(
+            camera_id=camera_id,
+            timestamp_s=timestamp_s,
+            view_result=view_result,
+            view_payload=view_payload,
+            future=future,
+        )
+        with self._batch_condition:
+            self._start_batch_worker_locked()
+            self._batch_queue.append(item)
+            self._batch_condition.notify()
+        return future.result()
 
-        depth, conf, mask = self._parse_response(response_json)
-        depth, conf, mask = self._align_to_original_shape(depth, conf, mask, view_result)
+    def _start_batch_worker_locked(self) -> None:
+        if self._batch_worker is not None and self._batch_worker.is_alive():
+            return
+        self._batch_shutdown = False
+        self._batch_worker = threading.Thread(target=self._batch_loop, name="MapAnythingBatcher", daemon=True)
+        self._batch_worker.start()
 
+    def _batch_loop(self) -> None:
+        while True:
+            with self._batch_condition:
+                while not self._batch_queue and not self._batch_shutdown:
+                    self._batch_condition.wait()
+                if self._batch_shutdown and not self._batch_queue:
+                    return
+                if not self._batch_queue:
+                    continue
+                first = self._batch_queue.popleft()
+                batch: List[_BatchItem] = [first]
+                if self._batch_size > 1:
+                    deadline = time.perf_counter() + self._batch_flush_s
+                    while len(batch) < self._batch_size:
+                        if self._batch_queue:
+                            batch.append(self._batch_queue.popleft())
+                            continue
+                        if self._batch_shutdown:
+                            break
+                        remaining = deadline - time.perf_counter()
+                        if remaining <= 0:
+                            break
+                        self._batch_condition.wait(timeout=remaining)
+                    while self._batch_queue and len(batch) < self._batch_size:
+                        batch.append(self._batch_queue.popleft())
+            try:
+                self._process_batch(batch)
+            except Exception as exc:  # pragma: no cover - defensive logging
+                self.logger.error(f"Batch processing failed: {exc}")
+                for item in batch:
+                    if not item.future.done():
+                        item.future.set_exception(exc)
+
+    def _process_batch(self, batch: List[_BatchItem]) -> None:
+        if not batch:
+            return
+        if len(batch) == 1:
+            self._execute_single(batch[0])
+            return
+        self._multi_batches_attempted += 1
+        try:
+            parsed = self._invoke_multi(batch)
+        except Exception as exc:
+            self._multi_batches_fallback += 1
+            self.logger.warning(f"/infer_multi failed ({exc}); falling back to individual requests")
+            for item in batch:
+                self._execute_single(item, suppress_error_log=True)
+            return
+        self._multi_batches_succeeded += 1
+        for item in batch:
+            entry = parsed.get(item.camera_id)
+            if entry is None:
+                self.logger.warning(f"/infer_multi response missing camera {item.camera_id}; retrying singly")
+                self._execute_single(item, suppress_error_log=True)
+                continue
+            depth, conf, mask = entry
+            self._resolve_item(item, depth, conf, mask)
+
+    def _invoke_multi(self, batch: List[_BatchItem]) -> Dict[str, Tuple[np.ndarray, np.ndarray, np.ndarray]]:
+        scene_id = self._next_scene_id()
+        payload = {
+            'scene_id': scene_id,
+            'views': [dict(item.view_payload) for item in batch],
+        }
+        response_json = self._post_json('/infer_multi', payload)
+        return self._parse_multi_response(response_json)
+
+    def _execute_single(self, item: _BatchItem, *, suppress_error_log: bool = False) -> None:
+        try:
+            payload = {'view': dict(item.view_payload)}
+            response_json = self._post_json('/infer_mono', payload)
+            depth, conf, mask = self._parse_response(response_json)
+            self._resolve_item(item, depth, conf, mask)
+        except Exception as exc:
+            if not suppress_error_log:
+                self.logger.warning(f"/infer_mono fallback failed for {item.camera_id}: {exc}")
+            if not item.future.done():
+                item.future.set_exception(exc)
+
+    def _resolve_item(
+        self,
+        item: _BatchItem,
+        depth: np.ndarray,
+        conf: np.ndarray,
+        mask: np.ndarray,
+    ) -> None:
+        try:
+            result = self._finalize_depth_result(item.camera_id, item.timestamp_s, item.view_result, depth, conf, mask)
+            if not item.future.done():
+                item.future.set_result(result)
+        except Exception as exc:
+            if not item.future.done():
+                item.future.set_exception(exc)
+
+    def _finalize_depth_result(
+        self,
+        camera_id: str,
+        timestamp_s: float,
+        view_result: ViewBuildResult,
+        depth: np.ndarray,
+        conf: np.ndarray,
+        mask: np.ndarray,
+    ) -> DepthResult:
+        depth_aligned, conf_aligned, mask_aligned = self._align_to_original_shape(depth, conf, mask, view_result)
         ts_us = int(timestamp_s * 1_000_000)
-        storage_path = self.storage.store(camera_id, ts_us, depth, conf, mask)
-        summary = self._compute_summary(depth, conf, mask)
-
+        storage_path = self.storage.store(camera_id, ts_us, depth_aligned, conf_aligned, mask_aligned)
+        summary = self._compute_summary(depth_aligned, conf_aligned, mask_aligned)
         return DepthResult(
             camera_id=camera_id,
             ts_us=ts_us,
-            depth=depth,
-            conf=conf,
-            mask=mask,
+            depth=depth_aligned,
+            conf=conf_aligned,
+            mask=mask_aligned,
             intrinsics=view_result.native_intrinsics.copy() if view_result.native_intrinsics is not None else None,
             native_intrinsics=view_result.native_intrinsics.copy() if view_result.native_intrinsics is not None else None,
             summary=summary,
             storage_path=storage_path,
         )
+
+    def _run_single_request(
+        self,
+        camera_id: str,
+        timestamp_s: float,
+        view_result: ViewBuildResult,
+        view_payload: Dict[str, object],
+    ) -> DepthResult:
+        response_json = self._post_json('/infer_mono', {'view': dict(view_payload)})
+        depth, conf, mask = self._parse_response(response_json)
+        return self._finalize_depth_result(camera_id, timestamp_s, view_result, depth, conf, mask)
+
+    def _parse_multi_response(
+        self,
+        response: Dict[str, object],
+    ) -> Dict[str, Tuple[np.ndarray, np.ndarray, np.ndarray]]:
+        depth_map = response.get('depth_b64')
+        conf_map = response.get('conf_b64')
+        mask_map = response.get('mask_b64') or {}
+        shapes_map = response.get('shapes')
+        if not isinstance(depth_map, dict) or not isinstance(conf_map, dict) or not isinstance(shapes_map, dict):
+            raise ValueError('Multi response missing depth/conf/shape dictionaries')
+        results: Dict[str, Tuple[np.ndarray, np.ndarray, np.ndarray]] = {}
+        for cam_id, depth_b64 in depth_map.items():
+            shape = shapes_map.get(cam_id)
+            if not (isinstance(shape, (list, tuple)) and len(shape) == 2):
+                raise ValueError(f"Missing shape metadata for camera {cam_id}")
+            height, width = int(shape[0]), int(shape[1])
+            conf_b64 = conf_map.get(cam_id)
+            if not isinstance(conf_b64, str):
+                raise ValueError(f"Missing confidence tensor for camera {cam_id}")
+            mask_b64 = mask_map.get(cam_id)
+            try:
+                depth = np.frombuffer(base64.b64decode(depth_b64), dtype=np.float32).reshape((height, width))
+                conf = np.frombuffer(base64.b64decode(conf_b64), dtype=np.float32).reshape((height, width))
+                if isinstance(mask_b64, str):
+                    mask = np.frombuffer(base64.b64decode(mask_b64), dtype=np.uint8).reshape((height, width)).astype(bool)
+                else:
+                    mask = np.ones((height, width), dtype=bool)
+            except Exception as exc:
+                raise ValueError(f"Failed to decode multi response for camera {cam_id}: {exc}") from exc
+            results[cam_id] = (depth, conf, mask)
+        return results
+
+    def _next_scene_id(self) -> str:
+        self._multi_scene_counter = (self._multi_scene_counter + 1) % 1_000_000
+        return f"mono-batch-{self._multi_scene_counter}"
+
+    def _stop_batch_worker(self) -> None:
+        with self._batch_condition:
+            self._batch_shutdown = True
+            self._batch_condition.notify_all()
+        if self._batch_worker is not None and self._batch_worker.is_alive():
+            self._batch_worker.join(timeout=1.0)
+        pending: List[_BatchItem] = []
+        with self._batch_condition:
+            while self._batch_queue:
+                pending.append(self._batch_queue.popleft())
+        for item in pending:
+            if not item.future.done():
+                item.future.set_exception(RuntimeError('Batch worker stopped before completion'))
 
     def _post_json(self, endpoint: str, payload: Dict[str, object]) -> Dict[str, object]:
         url = f"{self.config.service.base_url}{endpoint}"
@@ -865,22 +1148,21 @@ class MapAnythingDepthSource:
         z_idx = np.clip(np.floor((1.0 - z_norm) * h_px).astype(np.int32), 0, h_px - 1)
 
         density_grid = np.zeros((h_px, w_px), dtype=np.float32)
-        height_grid = np.full((h_px, w_px), np.nan, dtype=np.float32)
         distance_sum = np.zeros((h_px, w_px), dtype=np.float32)
         distance_count = np.zeros((h_px, w_px), dtype=np.uint32)
+        height_grid = np.full((h_px, w_px), -np.inf, dtype=np.float32)
 
-        for xi, zi in zip(x_idx, z_idx):
-            density_grid[zi, xi] += 1.0
+        indices = (z_idx, x_idx)
+        np.add.at(density_grid, indices, 1.0)
+        np.add.at(distance_sum, indices, pts_depth.astype(np.float32, copy=False))
+        np.add.at(distance_count, indices, 1)
+        np.maximum.at(height_grid, indices, np.asarray(pts_y, dtype=np.float32))
 
-        heights_arr = np.array(pts_y, dtype=np.float32)
-        for xi, zi, val in zip(x_idx, z_idx, heights_arr):
-            current = height_grid[zi, xi]
-            if np.isnan(current) or val > current:
-                height_grid[zi, xi] = val
-
-        for xi, zi, val in zip(x_idx, z_idx, pts_depth):
-            distance_sum[zi, xi] += float(val)
-            distance_count[zi, xi] += 1
+        # Restore NaNs for empty cells after vectorised max accumulation
+        empty_cells = height_grid == -np.inf
+        if np.any(empty_cells):
+            height_grid = height_grid.astype(np.float32, copy=False)
+            height_grid[empty_cells] = np.nan
 
         density_max = float(np.max(density_grid)) if density_grid.size else 0.0
         if density_max > 0.0:

@@ -142,7 +142,7 @@ function Dashboard() {
                 if (pc) {
                   const xCam = pc[0];
                   const zCam = pc[2];
-                  const depth = Math.abs(zCam);
+                  const depth = Math.max(0, zCam);
                   trailStoreRef.current.push(key, sid, { x: xCam, y: depth });
                 }
               } else {
@@ -162,9 +162,12 @@ function Dashboard() {
                 if (pc) {
                   const xCam = pc[0];
                   const zCam = pc[2];
-                  const depth = Math.abs(zCam);
+                  const depth = Math.max(0, zCam);
                   trailStoreRef.current.push(key, sid, { x: xCam, y: depth });
                 }
+              } else {
+                // Fallback to world XZ if extrinsics not loaded
+                trailStoreRef.current.push(key, sid, { x: Number(w[0] || 0), y: Number(w[2] || 0) });
               }
               seenNow[key].add(sid);
             } else if (key === 'family-room' && hasWorld) {
@@ -179,9 +182,12 @@ function Dashboard() {
                 if (pc) {
                   const xCam = pc[0];
                   const zCam = pc[2];
-                  const depth = Math.abs(zCam);
+                  const depth = Math.max(0, zCam);
                   trailStoreRef.current.push(key, sid, { x: xCam, y: depth });
                 }
+              } else {
+                // Fallback to world XZ if extrinsics not loaded
+                trailStoreRef.current.push(key, sid, { x: Number(w[0] || 0), y: Number(w[2] || 0) });
               }
               seenNow[key].add(sid);
             } else {

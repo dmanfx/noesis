@@ -1,7 +1,7 @@
 # DeepStream Video Pipeline: Stream to WebSocket Map
 
 ## Overview
-This document provides a comprehensive visual mapping of the DeepStream video processing pipeline from RTSP stream input to WebSocket output, showing the current implementation status and data flow.
+This document maps the current DeepStream video processing pipeline from RTSP stream input to WebSocket output, reflecting the implementation in `deepstream_video_pipeline.py`.
 
 ## Pipeline Architecture
 
@@ -14,7 +14,7 @@ This document provides a comprehensive visual mapping of the DeepStream video pr
 │                                           INPUT LAYER                                                       │
 └─────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
 
-RTSP Streams (config.py):
+RTSP Streams (`config.py`):
 ├── Living Room Camera: rtsp://192.168.3.214:7447/jdr9oLlBkjyl3gDm? (1920x1080) ✅ ENABLED
 ├── Kitchen Camera: rtsp://192.168.3.214:7447/qt3VqVdZpgG1B4Vk? (1920x1080) ❌ DISABLED
 └── Family Room Camera: rtsp://192.168.3.214:7447/4qWTBhW6b4nLeUFE? (1280x720) ❌ DISABLED
@@ -23,71 +23,36 @@ RTSP Streams (config.py):
 │                                        DEEPSTREAM PIPELINE LAYER                                            │
 └─────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
 
-deepstream_video_pipeline.py:
+`deepstream_video_pipeline.py`:
 ┌─────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
-│  SOURCE BIN CREATION                                                                                        │
+│  MULTI-STREAM INPUT & BATCHING                                                                              │
 ├─────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
-│ nvurisrcbin (per source) - DeepStream's unified source element that handles RTSP, file, and camera inputs with automatic demuxing, decoding, and format conversion to GPU memory.                                                                                    │
-│ ├── URI: rtsp://192.168.3.214:7447/jdr9oLlBkjyl3gDm?                                                       │
-│ ├── GPU-ID: 0                                                                                               │
-│ ├── CUDA Memory Type: Device Memory (0)                                                                     │
-│ ├── RTSP Properties:                                                                                        │
-│ │   ├── drop-on-latency: True                                                                               │
-│ │   ├── latency: 50ms (config.processing.DEEPSTREAM_SOURCE_LATENCY)                                         │
-│ │   └── protocols: TCP only (4)                                                                             │
-│ └── Dynamic Pad Creation:                                                                                   │
-│     ├── pad-added signal → cb_newpad()                                                                      │
-│     └── child-added signal → decodebin_child_added()                                                        │
-└─────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
-
-┌─────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
-│  STREAM MULTIPLEXING                                                                                        │
-├─────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
-│ nvstreammux - DeepStream's batch multiplexer that combines multiple video streams into a single batch for efficient GPU processing, handling padding, scaling, and memory management.                                                                                                 │
-│ ├── batch-size: 1 (auto-calculated from enabled streams)                                                    │
-│ ├── width: 1280 (config.processing.DEEPSTREAM_MUX_SCALE_MODE=2)                                            │
-│ ├── height: 720 (config.processing.DEEPSTREAM_MUX_SCALE_MODE=2)                                             │
-│ ├── batched-push-timeout: 4000000ms                                                                         │
-│ ├── gpu-id: 0                                                                                               │
-│ ├── nvbuf-memory-type: 0 (CUDA device memory)                                                               │
-│ ├── enable-padding: 1                                                                                       │
+│ nvmultiurisrcbin - DeepStream's unified, high-level source element that internally handles multiple streams (RTSP/file/camera), including decoding, and batching into a single GPU memory stream for downstream processing. This replaces the legacy approach of using individual `nvurisrcbin` and `nvstreammux` elements.                                  │
+│ ├── uri-list: rtsp://...,rtsp://... (comma-separated list of source URLs)                                    │
+│ ├── sensor-id-list: 0,1,2 (comma-separated list of unique sensor IDs)                                          │
+│ ├── max-batch-size: 3 (auto-calculated from enabled streams)                                                │
+│ ├── width: 1920 (max source resolution)                                                                       │
+│ ├── height: 1080 (max source resolution)                                                                      │
+│ ├── batched-push-timeout: -1                                                                                  │
 │ ├── live-source: 1 (for RTSP streams)                                                                       │
-│ ├── sync-inputs: 0 (disable input synchronization for better batch performance)                              │
-│ └── drop-pipeline-eos: 1 (drop EOS events to prevent pipeline stalls)                                       │
-└─────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
-
-┌─────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
-│  GPU PREPROCESSING                                                                                          │
-├─────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
-│ nvdspreprocess - DeepStream's GPU-accelerated preprocessing element that handles tensor preparation for inference.                                                                                                                          │
-│ ├── config-file: config_preproc.txt                                                                         │
-│ ├── gpu-id: 0                                                                                               │
-│ ├── enable: True                                                                                            │
-│ ├── process-on-frame: True                                                                                  │
-│ ├── output-frame-meta: True                                                                                 │
-│ ├── output-tensor-meta: True                                                                                │
-│ ├── network-input-shape: 1;3;640;640                                                                        │
-│ ├── processing-width: 640                                                                                   │
-│ ├── processing-height: 640                                                                                  │
-│ ├── network-color-format: 0 (RGB)                                                                           │
-│ ├── tensor-data-type: 0 (FLOAT32)                                                                           │
-│ ├── custom-lib-path: /opt/nvidia/deepstream/deepstream/lib/gst-plugins/libcustom2d_preprocess.so            │
-│ └── custom-tensor-preparation-function: CustomTensorPreparation                                              │
+│ ├── drop-pipeline-eos: 1 (prevents pipeline stalls on stream EOS)                                           │
+│ ├── rtsp-reconnect-interval: 30 (seconds)                                                                   │
+│ ├── REST API Port: 9000 (for dynamic stream management)                                                     │
+│ └── Pad Probe (src): Logs initial batch buffers for debug validation.                                       │
 └─────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
 
 ┌─────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
 │  INFERENCE & TRACKING                                                                                       │
 ├─────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
 │ nvinfer (Primary GIE) - DeepStream's GPU inference engine that runs TensorRT models with custom parsers, providing hardware-accelerated AI inference with metadata extraction.                                                                                                   │
-│ ├── config-file-path: config_infer_primary_yolo11.txt                                                       │
-│ ├── YOLO-11 Custom Parser: libnvdsparsebbox_yolo11.so                                                       │
+│ ├── config-file-path: `pipelines/config_infer_primary_yolo11.ini`                                           │
+│ ├── YOLO-11 Custom Parser: `libnvdsparsebbox_yolo11.so`                                                     │
 │ ├── input-tensor-meta: True                                                                                 │
-│ ├── output-tensor-meta: True                                                                                │
-│ └── Pad Probe: _nvinfer_src_pad_buffer_probe()                                                              │
+│ └── Dynamic config: confidence, IOU, enable flag, and target classes via `custom-lib-props`                 │
 │                                                                                                             │
 │ nvtracker - DeepStream's object tracking element that maintains object identities across frames using algorithms like NvDCF, providing persistent tracking metadata.                                                                                        │
-│ ├── ll-config-file: config_tracker_nvdcf_batch.yml                                                         │
-│ ├── ll-lib-file: libnvds_nvmultiobjecttracker.so                                                            │
+│ ├── ll-config-file: `pipelines/config_tracker_nvdcf_batch.yml`                                              │
+│ ├── ll-lib-file: `/opt/nvidia/deepstream/deepstream/lib/libnvds_nvmultiobjecttracker.so`                    │
 │ ├── tracker-width: 640                                                                                      │
 │ ├── tracker-height: 384                                                                                     │
 │ ├── gpu-id: 0                                                                                               │
@@ -97,76 +62,51 @@ deepstream_video_pipeline.py:
 ┌─────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
 │  ANALYTICS PROCESSING                                                                                       │
 ├─────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
-│ nvdsanalytics - DeepStream's analytics element that provides advanced video analytics capabilities including ROI filtering, line crossing, direction detection, and overcrowding analysis.                                                                                    │
-│ ├── config-file: config_nvdsanalytics.txt                                                                   │
-│ ├── enable: 1                                                                                               │
-│ ├── config-width: 1280                                                                                      │
-│ ├── config-height: 720                                                                                      │
-│ ├── osd-mode: 2 (all info display)                                                                          │
-│ ├── display-font-size: 12                                                                                   │
-│ ├── ROI Filtering: Center area (320;180;960;180;960;540;320;540)                                           │
-│ ├── Line Crossing: Entry line (100;360;1180;360)                                                            │
-│ ├── Direction Detection: North, South, East, West vectors                                                   │
-│ ├── Overcrowding: Threshold 5 objects in full frame ROI                                                     │
-│ └── Pad Probe: _analytics_probe()                                                                           │
+│ nvdsanalytics (pre-tracker, exclusion) - Removes detections in exclusion ROIs before tracking.              │
+│ ├── unique-id: 101                                                                                          │
+│ ├── config-file: `pipelines/config_nvdsanalytics_exclude.ini`                                               │
+│ └── Pad Probe (src): `_remove_excluded_objects_probe()`                                                     │
+│                                                                                                             │
+│ nvdsanalytics (post-tracker) - Provides ROI counts, line-crossing, direction, overcrowding metadata.        │
+│ ├── unique-id: 201                                                                                          │
+│ ├── config-file: `pipelines/config_nvdsanalytics_post.ini`                                                  │
+│ └── Pad Probe (src): `_analytics_probe()` extracts telemetry                                                │
 └─────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
 
 ┌─────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
 │  VISUALIZATION & OUTPUT                                                                                     │
 ├─────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
-│ nvvideoconvert - DeepStream's GPU-accelerated video format converter that transforms video formats and color spaces for display and processing, maintaining GPU memory efficiency.                                                                                              │
-│ ├── gpu-id: 0                                                                                               │
-│ └── Format conversion for display                                                                           │
+│ nvstreamdemux - De-multiplexes the batched stream into individual streams, one per original source.         │
+│ └── Pads: Request pads `src_%u` acquired once and reused (no duplicates). Calibrated to actual `source_id`. │
 │                                                                                                             │
-│ nvdsosd - DeepStream's on-screen display element that overlays bounding boxes, labels, and tracking information directly on video frames using GPU rendering.                                                                                          │
-│ ├── gpu-id: 0                                                                                               │
-│ └── On-screen display for visualization                                                                     │
-│                                                                                                             │
-│ Conditional Output Paths:                                                                                   │
-│ ├── Native OSD Mode (USE_NATIVE_DEEPSTREAM_OSD=True):                                                       │
-│ │   ├── nvvideoconvert_post → nvjpegenc → appsink_jpeg                                                      │
-│ │   └── GPU-encoded JPEG bytes for direct WebSocket streaming                                               │
-│ └── Python OSD Mode (USE_NATIVE_DEEPSTREAM_OSD=False):                                                      │
-│     ├── appsink (classic)                                                                                   │
-│     ├── emit-signals: True                                                                                  │
-│     ├── max-buffers: 1                                                                                      │
-│     ├── drop: True                                                                                          │
-│     ├── sync: False                                                                                         │
-│     └── new-sample signal → _on_new_sample()                                                                │
+│ Per-Stream Visualization & JPEG Branch (Per demux pad):                                                     │
+│ ├── queue → nvvideoconvert (pre) → capsfilter (video/x-raw(memory:NVMM), format=RGBA) → nvdsosd →           │
+│ │   nvvideoconvert (post) → capsfilter (video/x-raw(memory:NVMM), format=I420) → nvjpegenc → appsink        │
+│ ├── OSD Probe (sink): `_per_branch_osd_probe()` draws per-stream overlays using frame_meta.source_id.       │
+│ ├── nvjpegenc: GPU JPEG encode; quality = config.visualization.JPEG_QUALITY, preset-level=1                 │
+│ └── appsink: emits `new-sample`; callback enqueues JPEG to `jpeg_queues[sensor_id]`                          │
 └─────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
 
 ┌─────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
-│  TENSOR EXTRACTION (Zero-Copy GPU)                                                                          │
+│  METADATA & TELEMETRY EXTRACTION (VIA BUFFER PROBES)                                                        │
 ├─────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
-│ _on_new_sample() Processing:                                                                                │
-│ ├── Batch Metadata: pyds.gst_buffer_get_nvds_batch_meta()                                                  │
-│ ├── Tensor Extraction:                                                                                      │
-│ │   ├── NvDsPreProcessBatchMeta (type 27) - Custom preprocessing metadata                                  │
-│ │   ├── NvDsPreProcessTensorMeta                                                                           │
-│ │   ├── CuPy Zero-Copy: cp.cuda.UnownedMemory()                                                            │
-│ │   └── PyTorch Tensor: torch.utils.dlpack.from_dlpack()                                                   │
-│ ├── Shape Handling:                                                                                         │
-│ │   ├── NCHW (order=0): (n, c, h, w)                                                                       │
-│ │   └── NHWC (order=1): (n, h, w, c) → permute(0, 3, 1, 2)                                                │
-│ ├── Fallback Tensor Extraction:                                                                             │
-│ │   ├── NvDsInferTensorMeta (type 12) - Inference metadata                                                 │
-│ │   └── Same zero-copy GPU tensor extraction process                                                        │
-│ └── Queue Output: tensor_queue.put()                                                                        │
+│ Instead of a final appsink, metadata is extracted at various points in the pipeline using buffer probes, which allows for inspection without disrupting the primary data flow.                                                                                                    │
+│ ├── nvdsanalytics_exclude (src pad): `_remove_excluded_objects_probe()`                                     │
+│ │   └── Removes objects detected within defined exclusion zones before they are tracked.                    │
+│ ├── nvdsanalytics_post (src pad): `_analytics_probe()`                                                      │
+│ │   └── Extracts final object metadata, including tracking IDs and analytics results (ROI, line crossing) for WebSocket telemetry.                                                                                                         │
+│ └── nvdsosd (sink pad): `_per_branch_osd_probe()`                                                           │
+│     └── Injects custom drawing commands (e.g., for motion trails) into the OSD overlay before rendering.     │
 └─────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
 
 ┌─────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
 │                                        PYTHON APPLICATION LAYER                                             │
 └─────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
 
-main.py (DeepStreamProcessorWrapper):
-┌─────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
-│  PIPELINE LOOP                                                                                              │
-├─────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
-│ _processing_loop()                                                                                          │
-│ ├── Read from DeepStream: deepstream_processor.read_gpu_tensor()                                           │
-│ ├── Convert to AnalysisFrame: _convert_to_analysis_frame()                                                 │
-│ └── Output to analysis_frame_queue                                                                        │
-└─────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+DeepStream integration is encapsulated in `DeepStreamVideoPipeline`, which starts/stops the pipeline and exposes:
+- `read_encoded_jpeg(source_id)` to retrieve per-source JPEG bytes
+- `get_stats()` for runtime metrics
+- Runtime controls: detection config, toggles, and trail visualization
 
 ┌─────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
 │                                        MAIN APPLICATION LAYER                                               │
@@ -174,59 +114,18 @@ main.py (DeepStreamProcessorWrapper):
 
 main.py (ApplicationManager):
 ┌─────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
-│  RESULT PROCESSING                                                                                          │
+│  JPEG FORWARDING (NATIVE DS OSD MODE)                                                                       │
 ├─────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
-│ _start_result_processing()                                                                                  │
-│ ├── process_results() thread                                                                                │
-│ ├── analysis_frame_queue.get()                                                                              │
-│ └── _process_analysis_frame()                                                                               │
+│ _start_jpeg_processing_loop()                                                                               │
+│ ├── Iterate sources via `multi_stream_processor.source_info`                                                │
+│ ├── For each sensor_id: `read_encoded_jpeg(sensor_id)`                                                     │
+│ ├── Prepend 1-byte length + UTF-8 camera id header                                                          │
+│ └── websocket_server.broadcast_sync(header + jpeg_bytes)                                                    │
 │                                                                                                             │
-│ _process_analysis_frame():                                                                                  │
-│ ├── Visualization:                                                                                          │
-│ │   ├── visualization_manager.annotate_frame()                                                             │
-│ │   ├── Detection boxes, tracking boxes, traces                                                            │
-│ │   ├── Keypoints, masks, labels                                                                            │
-│ │   └── Performance profiling (if enabled)                                                                  │
-│ │                                                                                                           │
-│ ├── Frame Encoding:                                                                                         │
-│ │   ├── cv2.imencode('.jpg', annotated_frame, [cv2.IMWRITE_JPEG_QUALITY, 85])                             │
-│ │   └── JPEG compression for WebSocket                                                                      │
-│ │                                                                                                           │
-│ ├── Binary Message Construction:                                                                            │
-│ │   ├── camera_id_bytes = analysis_frame.camera_id.encode('utf-8')                                        │
-│ │   ├── camera_id_length = len(camera_id_bytes)                                                            │
-│ │   └── binary_message = bytes([camera_id_length]) + camera_id_bytes + jpeg_data                           │
-│ │                                                                                                           │
-│ └── WebSocket Broadcasting:                                                                                 │
-│     ├── websocket_server.broadcast_sync(binary_message)                                                    │
-│     └── Frame saving (if enabled)                                                                           │
+│ Notes: JPEGs come from per-branch `nvjpegenc` appsinks; Python does not annotate or re-encode frames.        │
 └─────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
 
-┌─────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
-│                                        WEBSOCKET SERVER LAYER                                               │
-└─────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
-
-websocket_server.py (WebSocketServer):
-┌─────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
-│  SERVER MANAGEMENT                                                                                          │
-├─────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
-│ start()                                                                                                     │
-│ ├── websockets.serve(handle_client, host, port)                                                            │
-│ ├── _periodic_stats_broadcast() task                                                                        │
-│ └── Event loop management                                                                                   │
-│                                                                                                             │
-│ broadcast_sync()                                                                                            │
-│ ├── asyncio.run_coroutine_threadsafe()                                                                      │
-│ └── broadcast() coroutine                                                                                   │
-│                                                                                                             │
-│ broadcast()                                                                                                 │
-│ ├── Message type handling:                                                                                  │
-│ │   ├── dict → JSON string                                                                                  │
-│ │   ├── bytes → Binary message                                                                              │
-│ │   └── str → Direct string                                                                                 │
-│ ├── asyncio.gather() for all clients                                                                        │
-│ └── Error handling per client                                                                               │
-└─────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+See `docs/reference/WebSocket_API.md` for message types and runtime control endpoints.
 
 ┌─────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
 │  CLIENT HANDLING                                                                                            │
@@ -249,10 +148,11 @@ websocket_server.py (WebSocketServer):
 │                                           OUTPUT LAYER                                                      │
 └─────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
 
-WebSocket Clients:
-├── Binary Frame Messages: [camera_id_length][camera_id][jpeg_data]
-├── JSON Stats Messages: Performance metrics, system status
-└── Toggle Update Messages: Visualization control
+WebSocket Clients receive:
+- JSON stats messages: `{"type":"stats","payload":{...}}`
+- JSON telemetry frames: `{"type":"frame","payload":{...}}`
+- JPEG frame messages: `{"type":"video_frame","source_id":N,"jpeg_bytes":...}`
+- Runtime config broadcasts: detection and visualization updates
 
 ## Data Flow Summary
 
@@ -263,31 +163,28 @@ WebSocket Clients:
 - **Protocol**: RTSP over TCP with 50ms latency
 
 ### 2. DeepStream Processing
-- **Decoder**: nvurisrcbin with NVIDIA hardware decoder
-- **Memory**: CUDA device memory (zero-copy)
-- **Batching**: nvstreammux with batch size 1
-- **Preprocessing**: nvdspreprocess with custom library
+- **Input & Batching**: nvmultiurisrcbin handles all sources.
+- **Preprocessing**: nvdspreprocess (with custom library)
 - **Inference**: YOLO-11 with custom parser
-- **Tracking**: NvDCF tracker (configurable)
-- **Analytics**: nvdsanalytics with ROI, line crossing, direction detection
+- **Tracking**: NvDCF tracker
+- **Analytics**: nvdsanalytics
+- **Demuxing**: nvstreamdemux separates streams for output.
 
-### 3. Tensor Extraction
-- **Method**: Zero-copy GPU tensor extraction
-- **Library**: CuPy + PyTorch DLPack
-- **Format**: NCHW or NHWC tensors
-- **Memory**: GPU memory only (no CPU transfer)
-- **Fallback**: Inference metadata if preprocessing metadata unavailable
+### 3. Metadata Extraction
+- Method: Buffer probes on analytics and OSD pads.
+- Analytics Probe: Extracts tracking and analytics data for telemetry.
+- OSD Probe: Injects drawing commands for trail visualization.
+- No tensors are extracted in Python.
 
 ### 4. Python Application
-- **Wrapper**: `DeepStreamProcessorWrapper` coordinates the pipeline.
-- **Conversion**: Converts DeepStream metadata into `AnalysisFrame` objects.
-- **Output**: Pushes `AnalysisFrame` objects to a queue for the main application.
+- **Wrapper**: `DeepStreamVideoPipeline` class manages the GStreamer pipeline.
+- **Coordination**: Starts, stops, and monitors the pipeline.
+- **Output**: Provides methods to get encoded JPEGs from per-source queues.
 
 ### 5. WebSocket Streaming
-- **Format**: Binary messages with JPEG frames
-- **Structure**: [camera_id_length][camera_id][jpeg_data]
-- **Stats**: JSON messages with performance metrics
-- **Control**: Toggle messages for visualization
+- **Format**: Binary messages with per-source JPEG frames and JSON for telemetry.
+- **Structure**: JPEG bytes sent directly.
+- **Stats**: JSON messages with performance and tracking metrics.
 
 ## Performance Characteristics
 
@@ -315,16 +212,14 @@ WebSocket Clients:
 ## Current Status
 
 ### ✅ Implemented Components
-1. **DeepStream Pipeline**: Complete with YOLO-11 integration
-2. **Zero-Copy Tensor Extraction**: Working with CuPy/PyTorch
-3. **Native OSD Mode**: GPU-encoded JPEG streaming
-4. **Python OSD Mode**: Frame annotation and processing
-5. **WebSocket Server**: Binary frame streaming
-6. **Multi-camera Support**: Configurable RTSP streams
-7. **Performance Monitoring**: Comprehensive metrics
-8. **Error Handling**: Robust pipeline management
-9. **Analytics Integration**: ROI filtering, line crossing, direction detection
-10. **Configurable Tracking**: Native DeepStream vs. Python ByteTrack
+1. DeepStream pipeline with YOLO-11 integration
+2. GPU-encoded JPEG per-stream branches with appsink delivery
+3. Native OSD mode with custom trail visualization via probe
+4. WebSocket server: stats, telemetry, and frame broadcasting
+5. Multi-camera support via `nvmultiurisrcbin`
+6. Performance monitoring and robust error handling
+7. Analytics integration: exclusion + post-tracker analytics
+8. Runtime detection config and toggle updates
 
 ### 🔧 Configuration Options
 1. **Camera Sources**: RTSP streams with individual settings

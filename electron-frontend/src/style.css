@@ -5,16 +5,16 @@ body {
     padding: 0;
     background-color: #282c34;
     color: #abb2bf;
-    display: flex;
-    justify-content: center;
-    align-items: center;
+    display: block; /* allow app-container to span full width */
+    justify-content: initial;
+    align-items: initial;
     min-height: 100vh;
     overflow-x: hidden; /* Prevent horizontal scroll */
 }
 
 #app-container {
-    width: 98%;
-    max-width: 1800px; /* Adjust max-width as needed */
+    width: 98%; /* scale with window; no artificial cap */
+    max-width: none;
     background-color: #3c4049;
     border-radius: 8px;
     box-shadow: 0 4px 15px rgba(0, 0, 0, 0.2);
@@ -29,8 +29,7 @@ header {
     border-bottom: 1px solid #4f545f;
     padding-bottom: 10px;
     margin-bottom: 15px;
-    position: relative; /* Needed for absolute positioning of clock */
-    padding-right: 120px; /* Add padding to prevent overlap with clock */
+    /* header-metrics handles right-side layout; no absolute positioning */
 }
 
 header h1 {
@@ -39,40 +38,69 @@ header h1 {
     color: #61afef;
 }
 
-#system-status {
-    font-size: 0.9em;
-    color: #98c379;
+/* Right-side header metrics (uptime + clock) */
+.header-metrics {
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+    gap: 10px;
 }
 
-#clock {
-    position: absolute;
-    top: 5px; /* Adjust as needed */
-    right: 5px; /* Position top right */
-    font-size: 1.2em;
-    font-weight: bold;
+/* Unified badge styling for uptime/clock */
+.metric-badge {
+    font-size: 0.9em;
+    font-weight: 600;
+    background-color: rgba(40, 44, 52, 0.6);
+    padding: 3px 10px;
+    border-radius: 6px;
+    line-height: 1.2;
+    border: 1px solid transparent;
+}
+
+/* Specific treatments */
+#system-status.metric-uptime {
+    color: #98c379;
+    border-color: rgba(152, 195, 121, 0.35);
+}
+
+#clock.metric-clock {
     color: #e5c07b;
-    background-color: rgba(40, 44, 52, 0.6); /* Slight background */
-    padding: 2px 8px;
-    border-radius: 4px;
+    border-color: rgba(229, 192, 123, 0.35);
+}
+
+/* On narrow screens, place them inline with spacing */
+/* Keep them inline even on small screens; allow wrapping when needed */
+@media (max-width: 480px) {
+    .header-metrics {
+        flex-wrap: wrap;
+        justify-content: flex-end;
+        gap: 6px;
+    }
 }
 
 main {
-    display: flex;
-    flex-direction: column; /* Stack video and stats vertically */
-    gap: 20px;
+    display: block; /* natural block layout */
+}
+
+/* Provide outer side padding for the app, without constraining growth */
+#app-container > header,
+#app-container > main,
+#app-container > footer {
+    padding-left: max(10px, 2vw);
+    padding-right: max(10px, 2vw);
+    margin-left: auto;
+    margin-right: auto;
 }
 
 .video-section {
-    display: flex;
-    justify-content: space-around; /* Space out video containers */
+    display: grid;
+    grid-template-columns: repeat(3, minmax(280px, 1fr));
     gap: 20px;
-    flex-wrap: wrap; /* Allow wrapping on smaller screens */
+    align-items: start;
 }
 
 .video-container {
-    flex: 1; /* Allow containers to grow */
-    min-width: 400px; /* Minimum width before wrapping */
-    max-width: 900px; /* Max width based on 1800px container */
+    min-width: 0; /* allow grid to shrink item width as needed */
     background-color: #4f545f;
     padding: 15px;
     border-radius: 6px;
@@ -88,13 +116,23 @@ main {
     text-align: center;
 }
 
+/* Make performance stat text size scale a bit on smaller widths */
+/* Responsive breakpoints for grid */
+@media (max-width: 1024px) {
+    .video-section { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
+@media (max-width: 640px) {
+    .video-section { grid-template-columns: 1fr; }
+    .perf-stats { font-size: 0.75em; }
+    .mini-map-title { font-size: 0.85em; }
+}
+
 .video-wrapper {
-    position: relative; /* For positioning canvas and button */
+    position: relative;
     width: 100%;
-    /* Maintain aspect ratio (16:9) */
-    padding-top: 56.25%; /* 1080 / 1920 = 0.5625 */
-    background-color: #1e1e1e; /* Dark background for stream area */
-    overflow: hidden; /* Hide anything extending beyond */
+    aspect-ratio: 16 / 9; /* modern responsive aspect ratio */
+    background-color: #1e1e1e;
+    overflow: hidden;
     border-radius: 4px;
 }
 
@@ -348,17 +386,164 @@ th {
 #transitions-table-body td:nth-child(3) { width: 40px; } /* Cam */
 
 /* Trails Canvas Styling (Phase 6/7) */
-/*
-#trails-canvas {
-    position: absolute;
-    top: 0;
-    left: 0;
-    width: 100%;
-    height: 100%;
-    pointer-events: none; // Allows interaction with elements underneath
-    z-index: 10; // Ensure it's above video feeds if overlaying directly
+/* Top-Down Trails card */
+.trails-grid {
+    display: flex;
+    gap: 12px;
+    flex-wrap: wrap;
 }
-*/
+.mini-map {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 6px;
+}
+.mini-map-title {
+    font-size: 0.9em;
+    color: #e5c07b;
+}
+.mini-map canvas {
+    background: #1e1e1e;
+    border: 1px solid #444;
+    border-radius: 3px;
+    width: 100%;
+    height: auto; /* keep intrinsic aspect ratio (set by width/height attributes) */
+}
+
+/* Per-stream mini-map that can be collapsed elegantly */
+.trails-mini-map {
+    margin-top: 8px;
+    transition: max-height 0.3s ease, opacity 0.3s ease, margin 0.3s ease;
+    overflow: hidden;
+    max-height: 220px; /* canvas height + title */
+    opacity: 1;
+}
+.trails-mini-map.collapsed {
+    max-height: 0;
+    opacity: 0;
+    margin-top: 0;
+}
+
+/* Container for trails and legend side by side */
+.trails-and-legend-container {
+    display: flex;
+    gap: 12px;
+    align-items: flex-start;
+    margin-top: 8px;
+}
+
+/* Tracking Legend Styling */
+.tracking-legend {
+    background-color: #4f545f;
+    border-radius: 6px;
+    padding: 12px;
+    box-shadow: 0 2px 5px rgba(0, 0, 0, 0.15);
+    min-width: 120px;
+    max-width: 180px;
+    transition: opacity 0.3s ease, transform 0.3s ease;
+}
+
+.tracking-legend.collapsed {
+    opacity: 0;
+    transform: translateX(-10px);
+}
+
+.legend-title {
+    font-size: 0.85em;
+    color: #e5c07b;
+    margin-bottom: 8px;
+    text-align: center;
+    font-weight: bold;
+    border-bottom: 1px solid #5c6370;
+    padding-bottom: 4px;
+}
+
+.legend-items {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    max-height: 140px;
+    overflow-y: auto;
+}
+
+.legend-item {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 4px 0;
+}
+
+.legend-color-dot {
+    width: 12px;
+    height: 12px;
+    border-radius: 50%;
+    border: 1px solid #5c6370;
+    flex-shrink: 0;
+}
+
+.legend-track-id {
+    font-size: 0.8em;
+    color: #abb2bf;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+/* Responsive adjustments for legend */
+@media (max-width: 1024px) {
+    .trails-and-legend-container {
+        flex-direction: column;
+        gap: 8px;
+    }
+
+    .tracking-legend {
+        min-width: auto;
+        max-width: 100%;
+    }
+
+    .legend-items {
+        max-height: 100px;
+    }
+}
+
+@media (max-width: 640px) {
+    .tracking-legend {
+        padding: 8px;
+        font-size: 0.75em;
+    }
+
+    .legend-item {
+        gap: 6px;
+    }
+
+    .legend-color-dot {
+        width: 10px;
+        height: 10px;
+    }
+
+    .legend-track-id {
+        font-size: 0.75em;
+    }
+}
+
+/* Minimal handle to toggle trails visibility */
+#trails-collapse-handle {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    margin: 6px 0 12px 0;
+    cursor: pointer;
+    color: #abb2bf;
+    font-size: 0.85em;
+    opacity: 0.6;
+    transition: opacity 0.2s ease, transform 0.2s ease;
+}
+#trails-collapse-handle:hover {
+    opacity: 1;
+}
+#trails-collapse-handle.collapsed span::after {
+    content: '';
+}
 
 /* Footer Button Styling */
 .footer-button {

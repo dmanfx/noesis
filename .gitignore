@@ -2,13 +2,41 @@
 node_modules/
 electron-frontend/node_modules/
 electron-frontend/dist/
+oai2-fe/dist/
 
 # Python cache
 __pycache__/
 
 # IDE and OS files
 .DS_Store
+.vscode/
+
+
 
 # Log files
 logs/
 *.log
+output/
+
+#ignore archived folders
+legacy/
+
+
+#ignore dev docs
+docs/completed/
+docs/deprecated/
+docs/fixes/
+docs/implementation/
+docs/plans/
+docs/*.md
+docs/ma-integration/*.md
+*.md
+
+#model folders
+data/depth/
+models/
+*/__init__.py
+external/
+.env
+tests/
+

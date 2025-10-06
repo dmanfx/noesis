@@ -21,6 +21,7 @@ import time
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Dict, List, Optional, Any
+import configparser  # Add if not present
 
 
 @dataclass
@@ -33,11 +34,8 @@ class AppConfig:
         APP_NAME: str = "YOLO Video Tracking"
         VERSION: str = "1.0.0"
         START_TIME: float = field(default_factory=time.time)
-        LOG_LEVEL: int = 30  # WARNING level for production performance
+        LOG_LEVEL: int = 30  # Warning
         LOG_FILE: Optional[str] = "logs/app.log"
-        DEBUG: bool = False  # Disable debug mode for performance
-        PERFORMANCE_MODE: bool = True  # Enable performance optimizations
-        ENABLE_DEBUG_LOGGING: bool = False  # Explicit debug control
     
     @dataclass
     class CameraSettings:
@@ -50,11 +48,12 @@ class AppConfig:
                 "url": "rtsp://192.168.3.214:7447/jdr9oLlBkjyl3gDm?",
                 "width": 1920,
                 "height": 1080,
-                "enabled": False
+                "enabled": True
             },
             {
                 "name": "Kitchen Camera", 
                 "url": "rtsp://192.168.3.214:7447/qt3VqVdZpgG1B4Vk?",
+                #"url": "udp://127.0.0.1:8554", # use with: sudo ffmpeg -re -stream_loop -1 -i /home/mayor/Downloads/kitchenclip.mp4 -c copy -f mpegts udp://0.0.0.0:8554
                 "width": 1920,
                 "height": 1080,
                 "enabled": True
@@ -62,25 +61,21 @@ class AppConfig:
             {
                 "name": "Family Room Camera",
                 "url": "rtsp://192.168.3.214:7447/4qWTBhW6b4nLeUFE?",
+                # Correct resolution
                 "width": 1280,
                 "height": 720,
-                "enabled": False
+                "enabled": True
             }
         ])
         CAMERA_WIDTH: int = 1920
         CAMERA_HEIGHT: int = 1080
-        FRAME_RATE: int = 30
     
     @dataclass
     class ProcessingSettings:
         """Frame processing settings that control threading, performance, and pipeline behavior"""
         ENABLE_PROCESSING: bool = True
-        ENABLE_THREADING: bool = True
-        ENABLE_MULTIPROCESSING: bool = False  # Keep disabled to avoid process explosion
         MAX_QUEUE_SIZE: int = 20  # OPTIMIZED: Reduced from 30 for lower latency
         ANALYSIS_FRAME_INTERVAL: int = 1  # Process every frame (removed artificial limitation)
-        FRAME_SKIP: int = 0  # No artificial frame skipping (removed limitation)
-        AUTO_FRAME_SKIP: bool = True  # Automatically adjust frame skip based on processing performance
         TARGET_FPS: int = 30  # Realistic target for RTX 3060 (increased from 10)
         ENABLE_PROFILING: bool = False  # Enable profiling to identify CPU usage sources
         
@@ -94,18 +89,13 @@ class AppConfig:
                       
         # Performance and Profiling Settings
         PROFILING_SAMPLING_RATE: int = 100  # OPTIMIZED: Profile every 100th frame (reduced overhead)
-        MEMORY_MONITORING_ENABLED: bool = True  # Enable GPU memory monitoring
-        PERFORMANCE_ALERTS_ENABLED: bool = True  # Enable performance degradation alerts
         
         # GPU Memory Optimization Settings (NEW for Phase 3.1.2)
         GPU_MEMORY_POOL_SIZE_MB: int = 500  # Pre-allocated GPU memory pool size
-        GPU_MEMORY_DEFRAG_INTERVAL: int = 1000  # Defragment memory every N frames
         ENABLE_MEMORY_POOLING: bool = True  # Use memory pooling for GPU operations
         
         # Thread Optimization Settings (NEW for Phase 3.1.2)
         USE_THREAD_AFFINITY: bool = True  # Pin threads to specific CPU cores
-        THREAD_PRIORITY: str = "HIGH"  # Thread priority: "NORMAL", "HIGH", "REALTIME"
-        DECODER_THREAD_PRIORITY: str = "REALTIME"  # NVDEC decoder thread priority
         
                 
         # DeepStream Pipeline Configuration (RECOMMENDED)
@@ -113,14 +103,14 @@ class AppConfig:
         DEEPSTREAM_SOURCE_LATENCY: int = 50  # Reduced latency for real-time processing
         DEEPSTREAM_MUX_BATCH_SIZE: int = 1  # Single frame processing for lower latency
         DEEPSTREAM_MUX_SCALE_MODE: int = 2  # 0=stretch, 1=crop, 2=letter-box
-        DEEPSTREAM_PREPROCESS_CONFIG: str = "pipelines/config_preproc.txt"  # Path to preprocessing config file
+        DEEPSTREAM_PREPROCESS_CONFIG: str = "pipelines/config_preproc.ini"  # Path to preprocessing config file
         DEEPSTREAM_TRACKER_CONFIG: str = "pipelines/tracker_nvdcf.yml"  # Path to tracker config file
         DEEPSTREAM_TRACKER_LIB: str = "/opt/nvidia/deepstream/deepstream/lib/libnvds_nvmultiobjecttracker.so"  # DeepStream tracker library
         DEEPSTREAM_ENABLE_OSD: bool = True  # Enable on-screen display for visualization
         
-        # Unified GPU Pipeline Configuration
-        USE_UNIFIED_GPU_PIPELINE: bool = True  # Enable unified GPU pipeline for optimal performance
-        UNIFIED_PIPELINE_THREADS: Optional[int] = None  # Auto-calculated if None
+        # DEPRECATED: Unified GPU Pipeline Configuration (removed - DeepStream-only now)
+        # USE_UNIFIED_GPU_PIPELINE: bool = True  # Enable unified GPU pipeline for optimal performance
+        # UNIFIED_PIPELINE_THREADS: Optional[int] = None  # Auto-calculated if None
         
         def __post_init__(self):
             """Post-initialization to handle deprecated settings and warnings."""
@@ -161,7 +151,7 @@ class AppConfig:
         MODEL_PATH: str = "models/yolo11m.onnx"  # Path to detection model
         POSE_MODEL_PATH: str = "models/yolo11m-pose.pt"  # Path to pose estimation model
         SEGMENTATION_MODEL_PATH: str = "models/yolo11m-seg.pt"  # Path to segmentation model
-        REID_MODEL_PATH: str = "models/osnet_x1_0_market_256x128_amsgrad_ep150_stp60_lr0.0015_b64_fb10_softmax_labelsmooth_flip.pth"  # Path to ReID model
+        REID_MODEL_PATH: str = "models/osnet_ibn_x1_0_msmt17.pt"  # Path to ReID model
         MODEL_CONFIDENCE_THRESHOLD: float = 0.25  # Minimum confidence score for a detection
         MODEL_IOU_THRESHOLD: float = 0.45  # IoU threshold for NMS
         TARGET_CLASSES: List[int] = field(default_factory=lambda: [0,1])  # Empty list = all classes
@@ -199,6 +189,56 @@ class AppConfig:
         POSE_ENGINE_PATH: str = "models/engines/pose_fp16.engine"
         SEGMENTATION_ENGINE_PATH: str = "models/engines/segmentation_fp16.engine"
         REID_ENGINE_PATH: str = "models/engines/reid_fp16.engine"
+
+        # Global ReID (Stable ID) settings
+        REID_ENABLED: bool = True  # Enable global StableID assignment using embeddings
+        REID_EMBED_INTERVAL_S: float = 1.0  # Seconds between embedding refreshes per track
+        REID_MAX_GHOST_AGE_S: float = 60.0  # Max age (s) to keep ghost identities for re-association
+        REID_COS_SIM_THRESHOLD: float = 0.65  # Cosine similarity for same-camera ghost matches (more permissive)
+        REID_COS_SIM_HIGH_THRESHOLD: float = 0.78  # Cosine similarity for cross-camera/gallery match
+        REID_ALLOW_MULTI_ZONE_ACTIVE: bool = True  # Allow same stable_id active across cameras/zones
+        REID_MODEL_NAME: str = "osnet_ibn_x1_0"  # Backbone to use when model_path not provided
+        REID_IMAGE_SIZE: List[int] = field(default_factory=lambda: [256, 128])  # [H, W] for embedding crops
+        # ReID robustness tweaks
+        REID_CROP_EXPAND: float = 0.12  # Expand person crop bbox by this fraction per side
+        REID_TTA_FLIP: bool = True  # Test-time augmentation: average embedding with horizontal flip
+        REID_MIN_CROP_H: int = 64  # Skip embeddings if crop height below this (px)
+        REID_MIN_LAPLACIAN: float = 12.0  # Skip embedding update if crop too blurry (variance of Laplacian)
+        REID_ADAPTIVE_PENALTY: bool = True  # Penalize matches with large scale/brightness deltas
+        REID_SIZE_PENALTY_ALPHA: float = 0.08  # Weight for scale ratio penalty in similarity
+        REID_BRIGHTNESS_PENALTY_BETA: float = 0.05  # Weight for brightness delta penalty
+        # Additional disambiguation penalties (co-present adults with similar appearance)
+        REID_SPATIAL_PENALTY: bool = True          # Penalize reusing an active ID far away in the scene
+        REID_SPATIAL_PENALTY_DELTA: float = 0.06   # Weight for spatial distance penalty (relative to bbox diagonal)
+        REID_COLOR_PENALTY_GAMMA: float = 0.07     # Weight for color histogram mismatch penalty
+        # Partial feature fusion (PCB-like stripes and multi-scale halves)
+        REID_STRIPE_FUSION: bool = True  # Enable stripe/multi-crop fusion for embeddings
+        REID_STRIPE_COUNT: int = 3  # Number of vertical stripes to use (e.g., 3 or 6)
+        REID_MULTI_SCALE_CROPS: bool = True  # Include upper/lower halves in fusion
+        # Centroid smoothing
+        REID_EMA_ALPHA: float = 0.20  # EMA smoothing factor for per-identity centroid
+        # Anti-merge guard: when a stable_id is already active on the same sensor,
+        # require a small extra margin before allowing a new track to take that ID.
+        REID_ACTIVE_ID_GUARD_STRICT: bool = True
+        REID_ACTIVE_ID_GUARD_MARGIN: float = 0.03
+        # Ghost matching strictness: for ghosts older than this many seconds,
+        # require an extra margin above REID_COS_SIM_THRESHOLD to match.
+        REID_GHOST_STRICT_AGE_S: float = 2.0
+        REID_GHOST_EXTRA_MARGIN: float = 0.03
+        # Soft cap on concurrently active stable IDs
+        REID_MAX_ACTIVE_IDS_PER_SENSOR: int = 6
+        REID_NEW_ID_CONFIRM_FRAMES_AT_CAP: int = 2
+        REID_NEW_ID_HYSTERESIS_FRAMES: int = 2  # Require N unmatched frames before minting any new SID
+        REID_ACTIVE_EVICT_GRACE_S: float = 10.0
+        # Cross-camera handoff tuning
+        REID_XCAM_HANDOFF_WINDOW_S: float = 6.0
+        REID_XCAM_HANDOFF_MARGIN: float = 0.04
+        # Global ID pool soft-cap
+        REID_MAX_TOTAL_IDS: int = 12
+        REID_TOTAL_ID_REUSE: bool = True
+        REID_TOTAL_ID_REUSE_MIN_AGE_S: float = 600.0  # Only recycle IDs inactive this long and not active anywhere
+        # SID allocator persistence (smarter restart)
+        REID_SID_POOL_FILE: str = "~/.noesis/sid_pool.json"
         
         # Performance Settings
         WARM_UP_ITERATIONS: int = 10  # Number of warm-up iterations for TensorRT
@@ -229,7 +269,13 @@ class AppConfig:
         TEXT_SCALE: float = 0.5
         TEXT_THICKNESS: int = 1
         TRACE_LENGTH: int = 30
-        TRAIL_LENGTH: int = 50
+        TRAIL_LENGTH: int = 200
+        TRAIL_DRAW_SEGMENTS: int = 100
+        TRAIL_VISUALIZATION_ENABLED: bool = True
+        TRAIL_TIMEOUT_S: float = 10.0  # seconds to keep a disappeared track's trail
+        TRAIL_DRAW_STRIDE: int = 2  # draw every Nth frame (≥1)
+        TRAIL_SHOW_LABELS: bool = False
+        TRAIL_MAX_SPEED_PX_PER_S: float = 600.0  # clamp trail movement speed
         
         # Additional visual style settings referenced in logs
         KEYPOINT_RADIUS: int = 3          # Radius for keypoint visualization
@@ -249,6 +295,19 @@ class AppConfig:
         NVENC_BITRATE: int = 4000000  # 4 Mbps
         JPEG_QUALITY: int = 85  # JPEG encoding quality
         USE_NATIVE_DEEPSTREAM_OSD: bool = True  # If True, use DeepStream's native OSD, skip Python annotation
+
+        # Bounding-box temporal smoothing (reduces size flicker/shudder)
+        BBOX_SMOOTHING_ENABLED: bool = True
+        # Exponential moving average factor for width/height (0..1). Lower = smoother.
+        BBOX_SMOOTHING_ALPHA: float = 0.2
+        # Anchor used when resizing the smoothed box: 'bottom' (bottom-center) or 'center'
+        BBOX_SMOOTHING_ANCHOR: str = 'bottom'
+        # Per-frame change clamp. New size is clamped to these ratios vs previous before EMA.
+        BBOX_SMOOTHING_MAX_GROWTH: float = 1.10  # allow up to +10% per frame
+        BBOX_SMOOTHING_MAX_SHRINK: float = 0.90  # allow up to -10% per frame
+        # Over-window drop limit: in any window, height cannot drop below ratio*recent_max
+        BBOX_MAX_DROP_WINDOW_S: float = 4.0
+        BBOX_MAX_DROP_RATIO: float = 0.85  # allow at most 15% drop over window
         
         def __post_init__(self):
             """Validate visualization settings."""
@@ -261,9 +320,41 @@ class AppConfig:
             self.KEYPOINT_RADIUS = max(1, self.KEYPOINT_RADIUS)
             self.TRACE_THICKNESS = max(1, self.TRACE_THICKNESS)
             
+            # Validate trail parameters
+            self.TRAIL_TIMEOUT_S = max(0.1, self.TRAIL_TIMEOUT_S)
+            self.TRAIL_DRAW_STRIDE = max(1, self.TRAIL_DRAW_STRIDE)
+            
             # Validate encoding parameters
             self.NVENC_BITRATE = max(1000000, self.NVENC_BITRATE)  # Min 1 Mbps
             self.JPEG_QUALITY = max(1, min(100, self.JPEG_QUALITY))
+
+            # Validate bbox smoothing parameters
+            self.BBOX_SMOOTHING_ALPHA = min(1.0, max(0.0, float(self.BBOX_SMOOTHING_ALPHA)))
+            self.BBOX_SMOOTHING_ANCHOR = (self.BBOX_SMOOTHING_ANCHOR or 'bottom').lower()
+            if self.BBOX_SMOOTHING_ANCHOR not in ('bottom', 'center'):
+                self.BBOX_SMOOTHING_ANCHOR = 'bottom'
+            try:
+                self.BBOX_SMOOTHING_MAX_GROWTH = float(self.BBOX_SMOOTHING_MAX_GROWTH)
+                self.BBOX_SMOOTHING_MAX_SHRINK = float(self.BBOX_SMOOTHING_MAX_SHRINK)
+                self.BBOX_MAX_DROP_WINDOW_S = float(getattr(self, 'BBOX_MAX_DROP_WINDOW_S', 4.0))
+                self.BBOX_MAX_DROP_RATIO = float(getattr(self, 'BBOX_MAX_DROP_RATIO', 0.85))
+            except Exception:
+                self.BBOX_SMOOTHING_MAX_GROWTH = 1.2
+                self.BBOX_SMOOTHING_MAX_SHRINK = 0.85
+                self.BBOX_MAX_DROP_WINDOW_S = 4.0
+                self.BBOX_MAX_DROP_RATIO = 0.85
+            # Ensure sensible bounds
+            self.BBOX_SMOOTHING_MAX_GROWTH = max(1.0, self.BBOX_SMOOTHING_MAX_GROWTH)
+            self.BBOX_SMOOTHING_MAX_SHRINK = min(1.0, max(0.5, self.BBOX_SMOOTHING_MAX_SHRINK))
+            self.BBOX_MAX_DROP_WINDOW_S = max(0.5, self.BBOX_MAX_DROP_WINDOW_S)
+            self.BBOX_MAX_DROP_RATIO = min(1.0, max(0.5, self.BBOX_MAX_DROP_RATIO))
+
+            # Validate trail speed clamp
+            try:
+                self.TRAIL_MAX_SPEED_PX_PER_S = float(self.TRAIL_MAX_SPEED_PX_PER_S)
+            except Exception:
+                self.TRAIL_MAX_SPEED_PX_PER_S = 600.0
+            self.TRAIL_MAX_SPEED_PX_PER_S = max(10.0, self.TRAIL_MAX_SPEED_PX_PER_S)
     
     @dataclass
     class TrackingSettings:
@@ -276,8 +367,6 @@ class AppConfig:
         TRACK_THRESH: float = 0.25          # Low threshold to create tracks
         TRACK_BUFFER: int = 30              # Frames to keep track without detection  
         MATCH_THRESH: float = 0.75          # IoU threshold for matching
-        FRAME_RATE: int = 30                # Assumed frame rate for tracking
-        
         # TrackingSystem configuration (matches tracking.py)
         INACTIVE_THRESHOLD_SECONDS: float = 1.0   # Time threshold to mark tracks as inactive
         TRACE_PERSISTENCE_SECONDS: float = 5.0    # Time to keep inactive traces
@@ -289,30 +378,80 @@ class AppConfig:
                 "track_thresh": self.TRACK_THRESH,
                 "track_buffer": self.TRACK_BUFFER,
                 "match_thresh": self.MATCH_THRESH,
-                "frame_rate": self.FRAME_RATE,
+                "frame_rate": 30, # Default frame rate for tracking
             }
+
+    @dataclass
+    class IntegrationsSettings:
+        """Integration settings for MQTT + Influx occupancy publishing"""
+        ENABLE_OCCUPANCY_PUBLISH: bool = True
+        HEARTBEAT_SEC: int = 60
+
+        # MQTT
+        BASE_TOPIC: str = "noesis/occupancy"
+        STATUS_TOPIC: str = "noesis/status"
+        MQTT_HOST: str = "127.0.0.1"
+        MQTT_PORT: int = 1883
+        MQTT_USERNAME: str = "noesis"
+        MQTT_PASSWORD: str = "damosquittopass"
+        MQTT_QOS: int = 1
+        MQTT_RETAIN: bool = True
+
+        # InfluxDB v2
+        INFLUX_URL: str = "http://127.0.0.1:8086"
+        INFLUX_ORG: str = "Lambda"
+        INFLUX_TOKEN: str = "mfVNLy3JpTXwuX-_ZN9r5dbXzLaXCW9F6isbA10i4r-tNE3aigcF1UqmMdDtPKskDhKk7-6iKtoIOEphpB14wA=="
+        INFLUX_BUCKET_RAW: str = "noesis_raw"
     
     @dataclass
     class OutputSettings:
         """Output settings for saving results to disk (frames, videos, detection data)#save #frame"""
         OUTPUT_DIR: str = "output"
         SAVE_FRAMES: bool = False
-        SAVE_VIDEO: bool = False
         SAVE_DETECTIONS: bool = False
         FRAME_SAVE_INTERVAL: int = 1  # Save every Nth frame
-        VIDEO_FPS: int = 15
-        VIDEO_CODEC: str = "mp4v"
-        JPEG_QUALITY: int = 90
     
     @dataclass
     class WebSocketSettings:
         """WebSocket server settings for broadcasting results to clients"""
-        ENABLE_SERVER: bool = True
         HOST: str = "0.0.0.0"  # Listen on all network interfaces
         PORT: int = 6008
         MAX_CLIENTS: int = 10
-        JPEG_QUALITY: int = 70  # JPEG quality for frame compression (0-100)
+        JPEG_QUALITY: int = 85  # JPEG quality for frame compression (0-100)
         MAX_FPS: int = 20  # Maximum FPS for WebSocket streaming
+
+    @dataclass
+    class CalibrationSettings:
+        """Calibration and spatial settings"""
+        INTRINSICS_PATH: str = "intrinsics.json"  # root-level intrinsics file
+        CAMERA_CALIBRATION_PATH: str = "config/camera_calibration.json"  # per-camera extrinsics, floor_y, units
+        PLY_ALIGNMENT_PATH: str = "config/ply_alignment.json"  # optional align matrix source
+        # Map Noesis camera IDs (clean_name) to intrinsics model keys in intrinsics.json
+        CAMERA_INTRINSICS_MODEL_MAP: Dict[str, str] = field(default_factory=lambda: {
+            'living-room': 'unifi_protect_g3_instant',
+            'kitchen': 'unifi_protect_g3_instant',
+            'family-room': 'unifi_protect_g4_instant',
+        })
+        CAMERA_SPECS: Dict[str, Dict[str, Any]] = field(default_factory=lambda: {
+            'living-room': {
+                'resolution': [1920, 1080],
+                'hfov_deg': 103.0,
+                'vfov_deg': 55.0,
+            },
+            'kitchen': {
+                'resolution': [1920, 1080],
+                'hfov_deg': 103.0,
+                'vfov_deg': 55.0,
+            },
+            'family-room': {
+                'resolution': [1280, 720],
+                'hfov_deg': 106.0,
+                'vfov_deg': 58.0,
+            },
+        })
+        ENABLE_MDE: bool = True
+        MDE_MAX_FPS: float = 2.0
+        DEPTH_SCALE_PER_CAMERA: Dict[str, float] = field(default_factory=dict)
     
     # Initialize all configuration sections with default values
     app: AppSettings = field(default_factory=AppSettings)
@@ -322,7 +461,9 @@ class AppConfig:
     visualization: VisualizationSettings = field(default_factory=VisualizationSettings)
     output: OutputSettings = field(default_factory=OutputSettings)
     websocket: WebSocketSettings = field(default_factory=WebSocketSettings)
+    calibration: CalibrationSettings = field(default_factory=CalibrationSettings)
     tracking: TrackingSettings = field(default_factory=TrackingSettings)
+    integrations: IntegrationsSettings = field(default_factory=IntegrationsSettings)
     
     def get_camera_count(self) -> int:
         """Calculate total number of camera sources configured."""
@@ -336,29 +477,16 @@ class AppConfig:
             len(self.cameras.VIDEO_FILES)
         )
     
-    def get_unified_pipeline_threads(self) -> int:
-        """
-        Get the number of threads for unified pipeline processing.
-        
-        Returns:
-            Number of threads needed (auto-calculated if not explicitly set)
-        """
-        if self.processing.UNIFIED_PIPELINE_THREADS is not None:
-            return self.processing.UNIFIED_PIPELINE_THREADS
-        
-        # Auto-calculate: one thread per camera source
-        camera_count = self.get_camera_count()
-        return max(1, camera_count)  # At least 1 thread even if no cameras configured
+    # DEPRECATED: get_unified_pipeline_threads method removed
+    # The system now uses DeepStream-only architecture
+    # Threading is handled internally by DeepStream
 
 
 # Create default configuration instance
 config = AppConfig()
 
 
-# Apply environment-based configuration overrides
-if os.getenv("DEBUG", "0") == "1":
-    config.app.DEBUG = True
-    config.app.LOG_LEVEL = 10  # DEBUG
+# No environment overrides for logging - use command-line args instead
 
 # Resolve paths relative to the script location
 script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -484,29 +612,40 @@ def save_config_to_file(config: AppConfig, config_file: str) -> bool:
     try:
         # Create configuration data structure for serialization
         config_data = {}
-        
-        for section_name in ["app", "cameras", "processing", "models", "visualization", "output", "websocket", "tracking"]:
+
+        for section_name in [
+            "app",
+            "cameras",
+            "processing",
+            "models",
+            "visualization",
+            "output",
+            "websocket",
+            "calibration",
+            "tracking",
+            "integrations",
+        ]:
             section = getattr(config, section_name)
             section_data = {}
-            
+
             for key in section.__annotations__:
                 value = getattr(section, key)
-                
+
                 # Convert non-serializable types (like tuples) to serializable ones (like lists)
                 if isinstance(value, tuple):
                     value = list(value)
-                
+
                 section_data[key] = value
-            
+
             config_data[section_name] = section_data
-        
+
         # Create directory if it doesn't exist
         os.makedirs(os.path.dirname(config_file), exist_ok=True)
-        
+
         # Save configuration to file
         with open(config_file, 'w') as f:
             json.dump(config_data, f, indent=4)
-        
+
         logger.info(f"Saved configuration to {config_file}")
         return True
     
@@ -515,245 +654,18 @@ def save_config_to_file(config: AppConfig, config_file: str) -> bool:
         return False
 
 
-def validate_unified_pipeline_config(config: AppConfig) -> Dict[str, List[str]]:
-    """
-    Validate configuration for unified GPU pipeline compatibility.
-    Enhanced with Phase 3.1.1 strict GPU-only enforcement.
-    
-    Args:
-        config: Configuration to validate
-        
-    Returns:
-        Dict with 'errors', 'warnings', and 'info' lists
-    """
-    import logging
-    
-    logger = logging.getLogger("config_validation")
-    
-    validation_results = {
-        'errors': [],
-        'warnings': [],
-        'info': []
-    }
-    
-    # Critical requirements for unified GPU pipeline
-    if config.processing.USE_UNIFIED_GPU_PIPELINE:
-        
-        # GPU-only requirements - STRICT ENFORCEMENT
-        if not config.models.FORCE_GPU_ONLY:
-            validation_results['errors'].append(
-                "Unified GPU pipeline requires FORCE_GPU_ONLY=True"
-            )
-        
-        if not config.models.ENABLE_TENSORRT:
-            validation_results['errors'].append(
-                "Unified GPU pipeline requires ENABLE_TENSORRT=True"
-            )
-        
-        # Check for video decoding capability (DeepStream)
-        if not config.processing.ENABLE_DEEPSTREAM:
-            validation_results['errors'].append(
-                "Unified GPU pipeline requires ENABLE_DEEPSTREAM=True for video decoding"
-            )
-        
-        if not config.processing.ENABLE_GPU_PREPROCESSING:
-            validation_results['errors'].append(
-                "Unified GPU pipeline requires ENABLE_GPU_PREPROCESSING=True"
-            )
-        
-        # Incompatible settings that must be disabled
-        
-        if config.processing.ENABLE_MULTIPROCESSING:
-            validation_results['errors'].append(
-                "ENABLE_MULTIPROCESSING must be False when using unified pipeline"
-            )
-        
-        # GPU preprocessing is now the default, no need to check ENABLE_OPTIMIZED_PREPROCESSING
-        
-        # Memory and performance settings validation
-        if config.processing.MAX_QUEUE_SIZE > 30:
-            validation_results['warnings'].append(
-                f"Large queue size ({config.processing.MAX_QUEUE_SIZE}) may increase latency and memory usage"
-            )
-        
-        if config.processing.GPU_BATCH_SIZE > 4:
-            validation_results['warnings'].append(
-                f"Large GPU batch size ({config.processing.GPU_BATCH_SIZE}) may exceed GPU memory"
-            )
-        
-        # NVDEC buffer size is handled by DeepStream automatically
-        
-        # TensorRT configuration validation
-        if not config.models.TENSORRT_FP16:
-            validation_results['warnings'].append(
-                "TENSORRT_FP16=True recommended for optimal performance and memory efficiency"
-            )
-        
-        if config.models.TENSORRT_WORKSPACE_SIZE > 4:
-            validation_results['warnings'].append(
-                f"Large TensorRT workspace ({config.models.TENSORRT_WORKSPACE_SIZE}GB) may reduce available GPU memory"
-            )
-        
-        # Thread configuration validation
-        num_cameras = config.get_camera_count()
-        required_threads = config.get_unified_pipeline_threads()
-        
-        # Only validate if threads are explicitly set (not auto-calculated)
-        if config.processing.UNIFIED_PIPELINE_THREADS is not None:
-            if config.processing.UNIFIED_PIPELINE_THREADS < num_cameras:
-                validation_results['errors'].append(
-                    f"UNIFIED_PIPELINE_THREADS ({config.processing.UNIFIED_PIPELINE_THREADS}) "
-                    f"must be >= number of cameras ({num_cameras})"
-                )
-        else:
-            # Auto-calculation is being used
-            validation_results['info'].append(
-                f"✅ Auto-calculated pipeline threads: {required_threads} (for {num_cameras} cameras)"
-            )
-        
-        # Performance optimization validation
-        if config.processing.ENABLE_PROFILING and config.processing.PROFILING_SAMPLING_RATE < 50:
-            validation_results['warnings'].append(
-                f"Low profiling sampling rate ({config.processing.PROFILING_SAMPLING_RATE}) may impact performance"
-            )
-        
-        # Tracking configuration validation
-        if config.tracking.ENABLE_TRACKING:
-            if config.tracking.TRACK_THRESH <= 0 or config.tracking.TRACK_THRESH > 1:
-                validation_results['errors'].append(
-                    f"TRACK_THRESH ({config.tracking.TRACK_THRESH}) must be between 0 and 1"
-                )
-            
-            if config.tracking.TRACK_BUFFER <= 0:
-                validation_results['errors'].append(
-                    f"TRACK_BUFFER ({config.tracking.TRACK_BUFFER}) must be positive"
-                )
-            
-            if config.tracking.MATCH_THRESH <= 0 or config.tracking.MATCH_THRESH > 1:
-                validation_results['errors'].append(
-                    f"MATCH_THRESH ({config.tracking.MATCH_THRESH}) must be between 0 and 1"
-                )
-            
-            if config.tracking.INACTIVE_THRESHOLD_SECONDS <= 0:
-                validation_results['errors'].append(
-                    f"INACTIVE_THRESHOLD_SECONDS ({config.tracking.INACTIVE_THRESHOLD_SECONDS}) must be positive"
-                )
-        
-        # Information messages
-        validation_results['info'].append(
-            f"✅ Unified GPU pipeline configured for {num_cameras} cameras with {required_threads} threads"
-        )
-        validation_results['info'].append(
-            f"✅ TensorRT FP16: {config.models.TENSORRT_FP16}"
-        )
-        validation_results['info'].append(
-            f"✅ GPU device: {config.models.DEVICE}"
-        )
-        validation_results['info'].append(
-            f"✅ Memory pooling: {'Enabled' if config.processing.ENABLE_MEMORY_POOLING else 'Disabled'}"
-        )
-        validation_results['info'].append(
-            f"✅ Tracking: {'Enabled' if config.tracking.ENABLE_TRACKING else 'Disabled'}"
-        )
-        
-        # Check for deprecated/obsolete settings
-        obsolete_settings = []
-        if hasattr(config.processing, 'PREPROCESSING_THREADS'):
-            obsolete_settings.append("PREPROCESSING_THREADS (unused in GPU-only mode)")
-        if hasattr(config.processing, 'PREPROCESSING_ALGORITHM'):
-            obsolete_settings.append("PREPROCESSING_ALGORITHM (unused in GPU-only mode)")
-        
-        if obsolete_settings:
-            validation_results['info'].append(
-                f"ℹ️  Obsolete settings can be removed: {', '.join(obsolete_settings)}"
-            )
-        
-    else:
-        # Legacy pipeline validation
-        validation_results['warnings'].append("⚠️  Using legacy pipeline - consider migrating to unified GPU pipeline")
-        
-        if config.models.FORCE_GPU_ONLY:
-            validation_results['errors'].append(
-                "FORCE_GPU_ONLY=True is incompatible with legacy pipeline"
-            )
-        
-        if config.processing.ENABLE_MEMORY_POOLING:
-            validation_results['warnings'].append(
-                "Memory pooling is only effective with unified GPU pipeline"
-            )
-    
-    # Log validation results
-    for error in validation_results['errors']:
-        logger.error(f"❌ Configuration Error: {error}")
-    
-    for warning in validation_results['warnings']:
-        logger.warning(f"⚠️  Configuration Warning: {warning}")
-    
-    for info in validation_results['info']:
-        logger.info(f"ℹ️  Configuration Info: {info}")
-    
-    return validation_results
+# DEPRECATED: Unified GPU pipeline validation functions removed
+# The system now uses DeepStream-only architecture
+# These functions were part of a transitional unified pipeline concept
+# that has been superseded by the DeepStream implementation
 
-
-def get_pipeline_migration_guide() -> str:
-    """
-    Get migration guide for transitioning to unified GPU pipeline.
-    
-    Returns:
-        String with migration instructions
-    """
-    guide = """
-    📋 Unified GPU Pipeline Migration Guide
-    
-    Required Configuration Changes:
-    
-    1. Processing Settings:
-       - USE_UNIFIED_GPU_PIPELINE = True
-       - FORCE_GPU_ONLY = True
-       - ENABLE_TENSORRT = True
-       - ENABLE_GPU_PREPROCESSING = True
-       - ENABLE_MULTIPROCESSING = False (recommended)
-    
-    2. Hardware Requirements:
-       - NVIDIA GPU with CUDA support
-       - NVDEC support (recommended)
-       - Sufficient GPU memory for all models
-    
-    3. Performance Settings:
-       - TENSORRT_FP16 = True (recommended)
-       - NVDEC_FALLBACK_TO_CPU = False
-       - Adjust UNIFIED_PIPELINE_THREADS based on camera count
-    
-    4. Validation:
-       - Run validate_unified_pipeline_config() before deployment
-       - Test with all cameras to ensure GPU memory sufficiency
-       - Monitor performance metrics during initial deployment
-    
-    Benefits:
-       - Reduced CPU usage (target: 5-10% vs 60-70%)
-       - Eliminated multiprocessing overhead
-       - Improved memory efficiency
-       - Better GPU utilization
-    
-    Rollback:
-       - Set USE_UNIFIED_GPU_PIPELINE = False
-       - Revert FORCE_GPU_ONLY to False if needed
-       - Re-enable ENABLE_MULTIPROCESSING if desired
-    """
-    
-    return guide
-
-
-# Validate configuration on import if unified pipeline is enabled
-if config.processing.USE_UNIFIED_GPU_PIPELINE:
-    validation_results = validate_unified_pipeline_config(config)
-    
-    if validation_results['errors']:
-        import logging
-        logger = logging.getLogger("config")
-        logger.error("❌ Configuration validation failed for unified GPU pipeline")
-        for error in validation_results['errors']:
-            logger.error(f"   - {error}")
-        logger.info("🔧 Run get_pipeline_migration_guide() for help")
-    else:
-        print("✅ Unified GPU pipeline configuration validated successfully")
+def load_ma_config(path='config/mapanything.ini') -> dict:
+    """Load MapAnything configuration from INI file."""
+    config = configparser.ConfigParser()
+    try:
+        config.read(path)
+        ma_config = {section: dict(config.items(section)) for section in config.sections()}
+        return ma_config
+    except (configparser.Error, FileNotFoundError):
+        print(f"Warning: Could not load {path}; returning empty config.")
+        return {}

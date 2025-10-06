@@ -5,57 +5,39 @@ This folder contains the core reference documentation for the DeepStream video p
 ## Documents
 
 ### `pipeline_flow.md`
-**Purpose**: Comprehensive documentation of the DeepStream video processing pipeline flow and architecture.
-
-**Contents**:
-- Native tracking and visualization toggle configuration
-- Complete pipeline flow diagrams (Mermaid)
-- Detailed component flow descriptions
-- Performance improvements and characteristics
-- Configuration files documentation
-- Error handling and recovery mechanisms
-- Current implementation status
-- Testing and validation procedures
-
-**Use Case**: Primary reference for understanding the overall pipeline architecture, data flow, and implementation details.
+Purpose: Comprehensive documentation of the DeepStream video processing pipeline flow and architecture.
 
 ### `DEEPSTREAM_PIPELINE_MAP.md`
-**Purpose**: Visual mapping and detailed technical specification of the DeepStream pipeline from RTSP input to WebSocket output.
+Purpose: Visual mapping and detailed specification from RTSP input to WebSocket output.
 
-**Contents**:
-- Complete pipeline architecture diagram
-- Detailed component specifications
-- Configuration parameters and settings
-- Data flow summary
-- Performance characteristics
-- Current implementation status
-- Key features and capabilities
+### `WebSocket_API.md`
+Purpose: Message types and schemas for the WebSocket server, including runtime config updates and telemetry frames.
 
-**Use Case**: Technical reference for pipeline components, configuration details, and implementation specifications.
+### `Telemetry_Schema.md`
+Purpose: Detailed schema for analytics/telemetry payloads and stats produced by the pipeline.
+
+### `DeepStream_Elements_and_Probes.md`
+Purpose: Inventory of DeepStream elements, properties, probes, and dynamic branch behavior.
+
+### `Configuration_Map.md`
+Purpose: Mapping from `config.py` to pipeline components and runtime controls.
+
+### `Occupancy_Publishing.md`
+Purpose: Reference for the MQTT + InfluxDB occupancy publisher and HomeSeer integration.
+
+### `Integrations_Playbook.md`
+Purpose: Step-by-step integration guide for InfluxDB + HomeSeer and a reusable pattern to add future integrations and stats.
+
+### `Dynamic_Sensors.md`
+Purpose: How to add/remove sources at runtime using `nvmultiurisrcbin` REST API.
+
+### `MapAnything_Depth.md`
+Purpose: End-to-end reference for the MapAnything depth microservice, adapters, storage, diagnostics, and operations workflows.
 
 ## Usage
 
-These documents serve as the authoritative reference for:
-
-1. **Architecture Understanding**: How the DeepStream pipeline is structured and flows
-2. **Configuration Reference**: What settings are available and how to configure them
-3. **Implementation Details**: Technical specifications and component interactions
-4. **Performance Characteristics**: Expected performance metrics and optimization points
-5. **Troubleshooting**: Error handling and recovery mechanisms
+Use these documents as the authoritative reference for architecture, configuration, implementation, performance, and runtime APIs.
 
 ## Maintenance
 
-These documents should be updated whenever:
-- Pipeline architecture changes
-- New components are added
-- Configuration options are modified
-- Performance characteristics change
-- Implementation status updates
-
-## Related Documentation
-
-For implementation plans, fixes, and other documentation, see:
-- `../plans/` - Implementation plans and roadmaps
-- `../fixes/` - Bug fixes and troubleshooting guides
-- `../phases/` - Phase-by-phase implementation summaries
-- `../implementation/` - Detailed implementation guides 
+Update these docs when pipeline elements, configs, or runtime interfaces change. 

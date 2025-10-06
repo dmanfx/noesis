@@ -1,271 +1,130 @@
-# DeepStream Video Pipeline Flow Documentation
+% DeepStream Video Pipeline Flow Documentation
 
-## Native Tracking & Visualization Toggle (CURRENT IMPLEMENTATION)
+%% Overview
+This document describes the current video processing pipeline flow using NVIDIA DeepStream for end-to-end GPU processing, matching `deepstream_video_pipeline.py`.
 
-### Overview
-The current implementation provides configurable toggles for native DeepStream tracking (nvtracker) and on-screen display (nvdsosd) from Python config. This allows you to:
-- Use DeepStream's built-in object tracking and visualization (for maximum performance)
-- Or use custom Python-based tracking and annotation (for advanced features)
+%% Architecture Changes
 
-### Configuration Flags
-
-In `config.py`:
-
-```python
-class TrackingSettings:
-    USE_NATIVE_DEEPSTREAM_TRACKER: bool = False  # If True, use DeepStream's tracker IDs, skip Python tracking
-
-class VisualizationSettings:
-    USE_NATIVE_DEEPSTREAM_OSD: bool = True  # If True, use DeepStream's OSD, skip Python annotation
-```
-
-- **Default:** Native OSD is `True`, Native Tracker is `False`
-- **Set to `True`:** Native DeepStream tracker/OSD is used, Python logic is bypassed
-
-#### Example: Enable Both Native Features
-```python
-config.tracking.USE_NATIVE_DEEPSTREAM_TRACKER = True
-config.visualization.USE_NATIVE_DEEPSTREAM_OSD = True
-```
-
-#### Example: Use Only Custom Python Logic
-```python
-config.tracking.USE_NATIVE_DEEPSTREAM_TRACKER = False
-config.visualization.USE_NATIVE_DEEPSTREAM_OSD = False
-```
-
-### Pipeline Flow (Conditional)
-
-```mermaid
-graph TD
-    subgraph DeepStream GStreamer Pipeline
-        A[RTSP Stream] --> B[nvurisrcbin]
-        B --> C[nvstreammux]
-        C --> D[nvdspreprocess]
-        D --> E[nvinfer - Primary YOLO11]
-        E --> F[nvtracker - Object Tracking]
-        F --> G[nvdsanalytics - Advanced Analytics]
-        G --> H{Secondary Inference?}
-        H -->|Yes| I[nvinfer - Secondary Classification]
-        H -->|No| J[nvvidconv]
-        I --> J
-        J --> K[nvdsosd - On-Screen Display]
-        K --> L{OSD Mode}
-        L -->|Native| L1[nvjpegenc - GPU JPEG]
-        L -->|Python| L2[appsink - Frame Data]
-        L1 --> M1[appsink_jpeg - JPEG Bytes]
-        L2 --> M2[appsink - Frame & Metadata]
-    end
-
-    subgraph Python Application Processing
-        M1 -- JPEG Bytes --> N1[WebSocket Broadcasting]
-        M2 -- Frame & Metadata --> N2[UnifiedGPUPipeline]
-        N2 -- Detections --> N3{Tracking Toggle}
-        N3 -- Native --> N4[Use DeepStream object_id]
-        N3 -- Custom --> N5[Python TrackingSystem]
-        N4 --> N6[AnalysisFrame Creation]
-        N5 --> N6
-        N6 -- Annotated Frame --> N7{Visualization Toggle}
-        N7 -- Native --> N8[Use DeepStream OSD frame]
-        N7 -- Custom --> N9[Python annotate_frame]
-        N8 --> N10[WebSocket Broadcasting]
-        N9 --> N10
-    end
-```
-
-### How It Works
-- **Native Tracking:**
-  - Python uses the `object_id` from DeepStream's `nvtracker` for each detection.
-  - No Python-side tracking update is performed.
-- **Native OSD:**
-  - The frame from DeepStream (after `nvdsosd`) is GPU-encoded to JPEG using `nvjpegenc`.
-  - JPEG bytes are directly streamed to WebSocket clients.
-  - No Python-side annotation is performed.
-- **Switching:**
-  - You can toggle these features at runtime (if your app supports live config reloads).
-  - No restart is required for switching modes.
-
-### Logging
-- The pipeline logs which path is used for both tracking and visualization.
-- This helps verify correct mode in production.
-
----
-
-## Overview
-This document describes the complete video processing pipeline flow after the DeepStream refactoring. The pipeline now leverages NVIDIA DeepStream for end-to-end GPU processing, eliminating redundant inference and achieving significant performance improvements.
-
-## Architecture Changes
-
-### Before Refactoring (Hybrid Pipeline)
+%%% Before Refactoring (Hybrid Pipeline)
 The original pipeline had redundant processing:
 - DeepStream: RTSP decoding + preprocessing
 - Python: Separate TensorRT inference + tracking
 - Multiple CPU-GPU transfers and redundant computations
 
-### After Refactoring (Pure DeepStream Pipeline)
+%%% After Refactoring (Pure DeepStream Pipeline)
 The refactored pipeline eliminates redundancy:
 - **DeepStream**: Handles the entire video processing pipeline from decoding to inference and analytics, all on the GPU.
 - **Python**: Acts as a lightweight coordinator, receiving processed metadata and frames from DeepStream, and performing final post-processing steps like tracking updates and WebSocket broadcasting.
 - **Single Inference Path**: A single, efficient inference path within DeepStream, with advanced analytics capabilities.
 
-## Complete Pipeline Flow
+%% Complete Pipeline Flow
 
-```mermaid
+%%mermaid
 graph TD
-    subgraph DeepStream GStreamer Pipeline
-        A[RTSP Stream] --> B[nvurisrcbin]
-        B --> C[nvstreammux]
-        C --> D[nvdspreprocess]
-        D --> E[nvinfer - Primary YOLO11]
-        E --> F[nvtracker - Object Tracking]
-        F --> G[nvdsanalytics - Advanced Analytics]
-        G --> H{Secondary Inference?}
-        H -->|Yes| I[nvinfer - Secondary Classification]
-        H -->|No| J[nvvidconv]
-        I --> J
-        J --> K[nvdsosd - On-Screen Display]
-        K --> L{OSD Mode}
-        L -->|Native| L1[nvjpegenc - GPU JPEG]
-        L -->|Python| L2[appsink - Frame Data]
-        L1 --> M1[appsink_jpeg - JPEG Bytes]
-        L2 --> M2[appsink - Frame & Metadata]
+    subgraph "DeepStream GStreamer Pipeline"
+        A[RTSP Streams] --> B[nvmultiurisrcbin]
+        B --> C[nvdspreprocess]
+        C --> D[nvinfer - Primary YOLO11]
+        D --> E[nvdsanalytics (exclude)]
+        E --> F[nvtracker]
+        F --> G[nvdsanalytics (post)]
+        G --> H[nvstreamdemux]
     end
 
-    subgraph Python Application Processing
-        M1 -- JPEG Bytes --> N1[WebSocket Broadcasting]
-        M2 -- Frame & Metadata --> N2[DeepStreamProcessorWrapper]
-        N2 -- Detections --> N3{Tracking Toggle}
-        N3 -- Native --> N4[Use DeepStream object_id]
-        N3 -- Custom --> N5[Python TrackingSystem]
-        N4 --> N6[AnalysisFrame Creation]
-        N5 --> N6
-        N6 -- Annotated Frame --> N7{Visualization Toggle}
-        N7 -- Native --> N8[Use DeepStream OSD frame]
-        N7 -- Custom --> N9[Python annotate_frame]
-        N8 --> N10[WebSocket Broadcasting]
-        N9 --> N10
+    subgraph "Python Application"
+        I -- Demuxed Streams --> J[Dynamic JPEG Branches]
+        J -- Encoded JPEGs --> K[WebSocket Server]
+        L[Analytics Probe] -- Telemetry --> K
     end
-```
+%%
 
-## Detailed Component Flow
+%% Detailed Component Flow
 
-### 1. Video Input Processing
-```mermaid
+%%% 1. Video Input & Batching
+%%mermaid
 graph LR
-    A[RTSP/File/Camera] --> B[nvurisrcbin]
+    A[RTSP/File/Camera] --> B[nvmultiurisrcbin]
     B --> C[Hardware Decoding]
-    C --> D[GPU Memory]
-    D --> E[nvstreammux]
-    E --> F[Batched Frames]
-```
+    C --> D[GPU Memory Batch]
+    D --> E[nvdspreprocess]
+%%
 
-### 2. GPU Preprocessing
-```mermaid
-graph LR
-    A[Batched Frames] --> B[nvdspreprocess]
-    B --> C[Resize to 640x640]
-    C --> D[Normalize RGB]
-    D --> E[Tensor Format]
-    E --> F[GPU Tensor Meta]
-```
-
-### 3. Inference Pipeline
-```mermaid
+%%% 2. Inference & Analytics
+%%mermaid
 graph TD
-    A[GPU Tensor] --> B[Primary Inference - YOLO11]
-    B --> C[Detection Results]
+    A[Preprocessed Batch] --> B[Primary Inference - YOLO11]
+    B --> C[Exclusion Analytics]
     C --> D[Object Tracking]
-    D --> E[Analytics Processing]
-    E --> F{Secondary Inference?}
-    F -->|Enabled (optional)| G[Classification]
-    F -->|Disabled| H[Final Results]
-    G --> H
-```
+    D --> E[Post-Tracker Analytics]
+    E --> F[OSD Overlay]
+    F --> G[nvstreamdemux]
+%%
 
-### 4. Analytics and Metadata
-```mermaid
-graph LR
-    A[Tracked Objects] --> B[nvdsanalytics]
-    B --> C[ROI Filtering]
-    C --> D[Line Crossing]
-    D --> E[Direction Detection]
-    E --> F[Overcrowding]
-    F --> G[Analytics Metadata]
-```
-
-### 5. Python Application Processing (Post-DeepStream)
-```mermaid
+%%% 3. Output & Telemetry
+%%mermaid
 graph TD
-    A[appsink(DS) Output Frame & Metadata] --> B[Python: DeepStreamProcessorWrapper]
-    B --> C[Parse Detections]
-    C --> D[Update Tracking System]
-    D --> F[Create AnalysisFrame]
-    F --> G[Annotate Frame for Visualization]
-    F --> H[Broadcast Data via WebSocket]
-```
+    A[Demuxed Streams] --> B[Per-Stream Branches]
+    B --> C[nvdsosd (per-branch)]
+    C --> D[nvjpegenc (per-branch)]
+    D --> E[appsink (per-branch)]
+    E --> F[WebSocket Server]
+    G[Analytics Probe (batched)] --> F
+%%
 
-## Performance Improvements
+%% Performance Improvements
 
-### Code Reduction
+%%% Code Reduction
 - **deepstream_video_pipeline.py**: Complete DeepStream pipeline with GPU-accelerated processing
 - **main.py**: Simplified to use DeepStreamProcessorWrapper for coordination
 - **gpu_pipeline.py**: Deprecated in favor of direct DeepStream integration
 
-### Latency Improvements
+%%% Latency Improvements
 - **Before**: 80-120ms per frame (dual inference paths)
 - **After**: 30-50ms per frame (single, unified inference path)
 - **Improvement**: ~60% latency reduction
 
-### Memory Efficiency
+%%% Memory Efficiency
 - **Before**: Multiple GPU-CPU memory transfers for inference.
 - **After**: Data remains in GPU memory throughout the DeepStream pipeline.
 - **Improvement**: Significant reduction in memory bus traffic and CPU overhead.
 
-## Configuration Files
+%% Configuration Files
 
-### Primary Inference (YOLO11)
-```
-config_infer_primary_yolo11.txt
-- Model: YOLOv11 TensorRT engine (built from ONNX if not present)
+%%% Primary Inference (YOLO11)
+%%
+pipelines/config_infer_primary_yolo11.ini
+- Model: YOLOv11 TensorRT engine (auto-built if not present)
 - Input: 640x640 RGB
 - Classes: 80 COCO classes
-- Batch size: 1
-- GPU memory: Optimized
+- Batch size: derived from stream count
 - Custom parser: libnvdsparsebbox_yolo11.so
-```
+%%
 
-### Preprocessing Configuration
-```
-config_preproc.txt
+%%% Preprocessing Configuration
+%%
+pipelines/config_preproc.ini
 - Defines GPU-accelerated preprocessing steps
-- Resizing, color space conversion, and normalization
+- Resizing, color space conversion, normalization
 - Applied by the nvdspreprocess element
-- Custom library: libcustom2d_preprocess.so
-```
+%%
 
-### Analytics Configuration
-```
-config_nvdsanalytics.txt
-- ROI definitions for stream filtering
-- Line crossing detection with Entry line
-- Direction analysis (North, South, East, West)
-- Overcrowding detection (threshold: 5 objects)
-- Performance optimized
-```
+%%% Analytics Configuration
+%%
+pipelines/config_nvdsanalytics_exclude.ini (pre-tracker)
+pipelines/config_nvdsanalytics_post.ini (post-tracker)
+- ROI exclusions, ROI counts, line crossing, direction, overcrowding
+%%
 
-### Secondary Inference (Classification)
-```
-config_infer_secondary_classification.txt
-- Operates on primary detections
-- Processes vehicles and persons
-- Additional classification layers
-- Conditional processing (currently disabled in the pipeline)
-```
+%%% Secondary Inference (Classification)
+%%
+pipelines/config_infer_secondary_classification.ini
+- SGIE pathway present in code but not linked; reserved for future use
+%%
 
-## Error Handling and Recovery
+%% Error Handling and Recovery
 
-### Pipeline Health Monitoring
-```mermaid
+%%% Pipeline Health Monitoring
+%%mermaid
 graph TD
     A[Pipeline Monitor] --> B[FPS Tracking]
     B --> C[Error Detection]
@@ -275,51 +134,41 @@ graph TD
     F --> G[Pipeline Restart]
     G --> H[Resource Cleanup]
     H --> A
-```
+%%
 
-### Fail-safe Mechanisms
-- **Automatic Recovery**: The `DeepStreamVideoPipeline` includes logic to attempt up to 3 restarts on persistent errors.
-- **Performance Monitoring**: FPS is tracked, and warnings are logged if it drops below a threshold.
-- **Resource Management**: GPU memory is managed within the DeepStream context, and Python wrappers ensure proper cleanup.
-- **Graceful Degradation**: Secondary inference can be disabled without breaking the primary pipeline flow.
+%%% Fail-safe Mechanisms
+- Robust bus error handling and clean stop
+- Periodic stats broadcasting with backpressure awareness
+- Graceful teardown of dynamic branches on demux pad removal
 
-## Testing and Validation
+%% Testing and Validation
 
-### Multi-Camera Testing
-```bash
-# Test with a single RTSP stream via command line
-python main.py --rtsp "rtsp://192.168.3.214:7447/qt3VqVdZpgG1B4Vk?"
-```
+%%% Multi-Camera Testing
+%%bash
+python deepstream_video_pipeline.py  % uses RTSP streams from config.py
+%%
 
-### Performance Benchmarking
-```bash
-# Run with performance profiling enabled
-python main.py --rtsp "rtsp://192.168.3.214:7447/qt3VqVdZpgG1B4Vk?" --enable-profiling
-```
+%%% Performance Benchmarking
+Use `get_stats()` via the WebSocket periodic stats or directly from the pipeline instance.
 
-### Analytics Validation
-```bash
-# Analytics are configured in config_nvdsanalytics.txt and enabled by default
-# Run the main application to see analytics metadata in the logs 
-python main.py --rtsp "rtsp://192.168.3.214:7447/qt3VqVdZpgG1B4Vk?"
-```
+%%% Analytics Validation
+Analytics are configured via the two `nvdsanalytics` INI files and validated via the telemetry frames (`type:"frame"`).
 
-## Key Benefits Achieved
+%% Key Benefits Achieved
 
-1. **Elimination of Redundancy**: Single, unified inference path within DeepStream.
-2. **Native GPU Processing**: End-to-end GPU-accelerated pipeline from decoding to output.
-3. **Advanced Analytics**: Integrated `nvdsanalytics` for features like line crossing and ROI monitoring.
-4. **Robust Error Handling**: Automatic pipeline recovery and health monitoring.
-5. **Performance Optimization**: Significant latency and memory usage improvements.
-6. **Code Simplification**: Python code now serves as a high-level coordinator, not a low-level processor.
-7. **Production Ready**: Fail-safe mechanisms and monitoring make the pipeline suitable for production deployment.
-8. **Configurable Architecture**: Native vs. Python tracking and visualization can be toggled at runtime.
+1. Elimination of redundancy: Single inference path within DeepStream
+2. End-to-end GPU processing: decoding to output
+3. Advanced analytics: exclusion + post-tracker analytics
+4. Robust handling: error, teardown, and stats broadcasting
+5. Performance: low latency, minimal CPU-GPU transfers
+6. Simpler Python layer: coordination, telemetry, WebSocket only
+7. Runtime configurability: detection thresholds, class toggles, trail visualization
 
-## Current Implementation Status
+%% Current Implementation Status
 
-### ✅ Implemented Components
+%%% ✅ Implemented Components
 1. **DeepStream Pipeline**: Complete with YOLO-11 integration
-2. **Zero-Copy Tensor Extraction**: Working with CuPy/PyTorch
+2. **Metadata via Buffer Probes**: Analytics/telemetry extracted without tensor appsinks
 3. **Native OSD Mode**: GPU-encoded JPEG streaming
 4. **Python OSD Mode**: Frame annotation and processing
 5. **WebSocket Server**: Binary frame streaming
@@ -329,7 +178,7 @@ python main.py --rtsp "rtsp://192.168.3.214:7447/qt3VqVdZpgG1B4Vk?"
 9. **Analytics Integration**: ROI filtering, line crossing, direction detection
 10. **Configurable Tracking**: Native DeepStream vs. Python ByteTrack
 
-### 🔧 Configuration Options
+%%% 🔧 Configuration Options
 1. **Camera Sources**: RTSP streams with individual settings
 2. **Processing Pipeline**: DeepStream + TensorRT
 3. **Visualization**: Configurable display options (Native vs. Python)
@@ -337,7 +186,7 @@ python main.py --rtsp "rtsp://192.168.3.214:7447/qt3VqVdZpgG1B4Vk?"
 5. **Performance**: Profiling and optimization settings
 6. **Output**: WebSocket streaming and file saving
 
-### 📊 Monitoring Points
+%%% 📊 Monitoring Points
 1. **GPU Memory**: Real-time memory usage tracking
 2. **Pipeline Performance**: FPS and latency metrics
 3. **Error Rates**: Consecutive failure tracking
@@ -345,7 +194,7 @@ python main.py --rtsp "rtsp://192.168.3.214:7447/qt3VqVdZpgG1B4Vk?"
 5. **System Resources**: CPU and GPU utilization
 6. **Analytics Events**: ROI violations, line crossings, overcrowding
 
-## Future Enhancements
+%% Future Enhancements
 
 1. **Multi-GPU Support**: Scale processing across multiple GPUs for larger deployments.
 2. **Dynamic Model Loading**: Implement runtime switching of inference models without restarting the pipeline.
@@ -353,6 +202,6 @@ python main.py --rtsp "rtsp://192.168.3.214:7447/qt3VqVdZpgG1B4Vk?"
 4. **Edge Deployment**: Further optimize the pipeline for deployment on NVIDIA Jetson platforms.
 5. **Real-time Configuration**: Dynamic pipeline reconfiguration without restart.
 
-## Conclusion
+%% Conclusion
 
 The DeepStream refactoring successfully transformed the previous hybrid system into a pure GPU-native pipeline. This new architecture significantly improves performance, reduces code complexity, and provides a robust, scalable foundation for real-time video analytics with configurable tracking and visualization modes. 

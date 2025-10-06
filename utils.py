@@ -23,9 +23,11 @@ os.environ['no_proxy'] = '*'
 from datetime import datetime
 import threading
 from pathlib import Path
-import supervision as sv
-from geometry import Position, Zone, ZoneTransition
-from track import Track
+# Removed supervision import as it was causing segmentation fault
+# and the function that used it is no longer needed
+# import supervision as sv
+# from geometry import Position, Zone, ZoneTransition
+# from track import Track
 from collections import defaultdict
 
 # Constants
@@ -130,6 +132,9 @@ def setup_logging(log_level: int = logging.INFO, log_file: Optional[str] = None)
         datefmt='%Y-%m-%d %H:%M:%S'
     )
     
+    #Set logging level for websocket.server
+    logging.getLogger('websockets.server').setLevel(logging.WARNING)
+
     # Configure root logger
     root_logger = logging.getLogger()
     root_logger.setLevel(log_level)
@@ -588,12 +593,13 @@ def convert_np_for_json(obj):
         return [convert_np_for_json(item) for item in obj]  # Recursively convert lists
     elif isinstance(obj, dict):
         return {k: convert_np_for_json(v) for k, v in obj.items()}  # Recursively convert dict values
-    elif isinstance(obj, (Position, Zone, Track)):  # Handle custom objects if needed
-        return convert_np_for_json(obj.to_dict())
+    # REMOVED: Custom object handling commented out due to missing imports
+    # elif isinstance(obj, (Position, Zone, Track)):  # Handle custom objects if needed
+    #     return convert_np_for_json(obj.to_dict())
     return obj
 
 
-def filter_detections_by_exclusion_zones(detections: sv.Detections, exclusion_zones: dict, camera_id: str) -> sv.Detections:
+# def filter_detections_by_exclusion_zones(detections: sv.Detections, exclusion_zones: dict, camera_id: str) -> sv.Detections:
     """Filters detections based on whether their bottom-center point is inside any defined exclusion zones.
 
     Args:
@@ -604,116 +610,51 @@ def filter_detections_by_exclusion_zones(detections: sv.Detections, exclusion_zo
     Returns:
         sv.Detections: The filtered detections.
     """
-    # Check if exclusion zones are defined and if the specific camera has any
-    if not exclusion_zones or camera_id not in exclusion_zones:
-        return detections
+    # REMOVED: Function commented out due to supervision import causing segmentation fault
+    # and function no longer being used in current codebase
+    # # Check if exclusion zones are defined and if the specific camera has any
+    # if not exclusion_zones or camera_id not in exclusion_zones:
+    #     return detections
+    #
+    # cam_zones = exclusion_zones[camera_id]
+    # if not cam_zones:  # Check if the dictionary for the camera is empty
+    #     return detections
+    #
+    # # Get bottom-center coordinates of detections
+    # # Ensure xyxy is available and not empty before calculating anchor points
+    # if detections.xyxy is None or len(detections.xyxy) == 0:
+    #     return detections  # Return empty/original if no boxes
+    #
+    # anchor_points = detections.get_anchors_coordinates(sv.Position.BOTTOM_CENTER)
+    # include_mask = np.ones(len(detections), dtype=bool)
+    #
+    # for zone_name, coords in cam_zones.items():
+    #     # Assuming coords are (x1, y1, x2, y2)
+    #     x1, y1, x2, y2 = map(int, coords)  # Ensure integer coords
+    #     # Create polygon for zone checking (closed loop)
+    #     zone_polygon = np.array([
+    #         [x1, y1],
+    #         [x2, y1],
+    #         [x2, y2],
+    #         [x1, y2],
+    #         [x1, y1]  # Close the polygon
+    #     ], dtype=np.int32)
+    #
+    #     # Check which points are inside this zone
+    #     try:
+    #         # Use cv2.pointPolygonTest for each point
+    #         is_inside = np.array([cv2.pointPolygonTest(zone_polygon, tuple(map(int, point)), False) >= 0
+    #                             for point in anchor_points])
+    #
+    #         # Update mask: set to False if inside this exclusion zone
+    #         include_mask[is_inside] = False
+    #     except Exception as e_poly_check:
+    #         print(f"[Error] Checking exclusion zone '{zone_name}' failed: {e_poly_check}")
+    #         continue
+    #
+    # # Return only detections where the mask is True
+    # return detections[include_mask]
+    pass  # Function is disabled 
 
-    cam_zones = exclusion_zones[camera_id]
-    if not cam_zones:  # Check if the dictionary for the camera is empty
-        return detections
 
-    # Get bottom-center coordinates of detections
-    # Ensure xyxy is available and not empty before calculating anchor points
-    if detections.xyxy is None or len(detections.xyxy) == 0:
-        return detections  # Return empty/original if no boxes
-
-    anchor_points = detections.get_anchors_coordinates(sv.Position.BOTTOM_CENTER)
-    include_mask = np.ones(len(detections), dtype=bool)
-
-    for zone_name, coords in cam_zones.items():
-        # Assuming coords are (x1, y1, x2, y2)
-        x1, y1, x2, y2 = map(int, coords)  # Ensure integer coords
-        # Create polygon for zone checking (closed loop)
-        zone_polygon = np.array([
-            [x1, y1],
-            [x2, y1],
-            [x2, y2],
-            [x1, y2],
-            [x1, y1]  # Close the polygon
-        ], dtype=np.int32)
-
-        # Check which points are inside this zone
-        try:
-            # Use cv2.pointPolygonTest for each point
-            is_inside = np.array([cv2.pointPolygonTest(zone_polygon, tuple(map(int, point)), False) >= 0 
-                                for point in anchor_points])
-
-            # Update mask: set to False if inside this exclusion zone
-            include_mask[is_inside] = False
-        except Exception as e_poly_check:
-            print(f"[Error] Checking exclusion zone '{zone_name}' failed: {e_poly_check}")
-            continue
-
-    # Return only detections where the mask is True
-    return detections[include_mask] 
-
-
-class RateLimitedLogger:
-    """A logger wrapper that rate-limits log messages to prevent spam."""
-    
-    def __init__(self, logger: logging.Logger, rate_limit_seconds: float = 5.0):
-        """Initialize rate-limited logger.
-        
-        Args:
-            logger: The underlying logger instance
-            rate_limit_seconds: Minimum seconds between identical messages
-        """
-        self.logger = logger
-        self.rate_limit_seconds = rate_limit_seconds
-        self.last_log_times: Dict[str, float] = {}
-        self.lock = threading.Lock()
-    
-    def _get_message_key(self, level: int, message: str) -> str:
-        """Generate a unique key for rate limiting based on level and message."""
-        return f"{level}:{message}"
-    
-    def _should_log(self, message_key: str) -> bool:
-        """Check if enough time has passed to log this message again."""
-        current_time = time.time()
-        with self.lock:
-            last_time = self.last_log_times.get(message_key, 0)
-            if current_time - last_time >= self.rate_limit_seconds:
-                self.last_log_times[message_key] = current_time
-                return True
-            return False
-    
-    def debug(self, message: str, *args, **kwargs):
-        """Rate-limited debug logging."""
-        message_key = self._get_message_key(logging.DEBUG, message)
-        if self._should_log(message_key):
-            self.logger.debug(message, *args, **kwargs)
-    
-    def info(self, message: str, *args, **kwargs):
-        """Rate-limited info logging."""
-        message_key = self._get_message_key(logging.INFO, message)
-        if self._should_log(message_key):
-            self.logger.info(message, *args, **kwargs)
-    
-    def warning(self, message: str, *args, **kwargs):
-        """Rate-limited warning logging."""
-        message_key = self._get_message_key(logging.WARNING, message)
-        if self._should_log(message_key):
-            self.logger.warning(message, *args, **kwargs)
-    
-    def error(self, message: str, *args, **kwargs):
-        """Rate-limited error logging."""
-        message_key = self._get_message_key(logging.ERROR, message)
-        if self._should_log(message_key):
-            self.logger.error(message, *args, **kwargs)
-    
-    def critical(self, message: str, *args, **kwargs):
-        """Rate-limited critical logging."""
-        message_key = self._get_message_key(logging.CRITICAL, message)
-        if self._should_log(message_key):
-            self.logger.critical(message, *args, **kwargs)
-    
-    def log_detection_count(self, camera_id: str, detection_count: int, frame_id: int):
-        """Special method for logging detection counts with rate limiting.
-        
-        Only logs if detection_count > 0 and rate limit has passed.
-        """
-        if detection_count > 0:
-            message = f"Camera {camera_id} - Frame {frame_id}: {detection_count} detections"
-            message_key = self._get_message_key(logging.INFO, f"detection_count:{camera_id}")
-            if self._should_log(message_key):
-                self.logger.info(message) 
+# NOTE: RateLimitedLogger moved to utils/rate_limited_logger.py and re-exported via utils/__init__.py

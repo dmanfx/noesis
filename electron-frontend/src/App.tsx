@@ -4,6 +4,50 @@ import { TelemetryProvider, useTelemetry } from './telemetry/TelemetryContext';
 import { TelemetryDrawer } from './telemetry/TelemetryDrawer';
 import { TelemetryToggle } from './telemetry/TelemetryToggle';
 
+// Tracking ID Legend Component
+interface TrackingLegendProps {
+  tracks: Array<{
+    track_id: number;
+    camera_id: string;
+    zone?: string;
+    center?: [number, number];
+    dwell_time?: number;
+    velocity?: [number, number];
+  }>;
+  collapsed?: boolean;
+}
+
+const TrackingLegend: React.FC<TrackingLegendProps> = ({ tracks, collapsed = false }) => {
+  const colorForId = (id: number) => {
+    const hue = (id * 47) % 360;
+    return `hsl(${hue}, 80%, 60%)`;
+  };
+
+  if (collapsed || tracks.length === 0) {
+    return null;
+  }
+
+  // Sort tracks by ID for consistent display
+  const sortedTracks = [...tracks].sort((a, b) => a.track_id - b.track_id);
+
+  return (
+    <div className="tracking-legend">
+      <div className="legend-title">Track IDs</div>
+      <div className="legend-items">
+        {sortedTracks.map(track => (
+          <div key={track.track_id} className="legend-item">
+            <div
+              className="legend-color-dot"
+              style={{ backgroundColor: colorForId(track.track_id) }}
+            />
+            <span className="legend-track-id">ID {track.track_id}</span>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+};
+
 const WS_URL = 'ws://localhost:6008';
 
 const Dashboard: React.FC = () => {
@@ -15,6 +59,16 @@ const Dashboard: React.FC = () => {
   const [transitions, setTransitions] = useState('<li>Loading...</li>');
   const [kitchenFPS, setKitchenFPS] = useState('FPS: 0.0');
   const [livingRoomFPS, setLivingRoomFPS] = useState('FPS: 0.0');
+  const [familyRoomFPS, setFamilyRoomFPS] = useState('FPS: 0.0');
+  const [trailVisualizationEnabled, setTrailVisualizationEnabled] = useState(true);
+  const [trailsCollapsed, setTrailsCollapsed] = useState(false);
+
+  // State to track active tracks per camera for the legend
+  const [activeTracksPerCamera, setActiveTracksPerCamera] = useState<Record<string, any[]>>({
+    'kitchen': [],
+    'living-room': [],
+    'family-room': []
+  });
   
   const socketRef = useRef<WebSocket | null>(null);
   const retryCountRef = useRef(0);
@@ -25,13 +79,134 @@ const Dashboard: React.FC = () => {
   const lastFpsUpdateTime = useRef(0);
   const FPS_UPDATE_INTERVAL = 2000; // 2 seconds
 
+  // --- Top-Down Trails (client-accumulated) ---
+  // cameraId -> trackId -> array of {x,y}
+  const trailHistRef = useRef<Record<string, Record<number, { x: number; y: number }[]>>>({});
+  // Keep trails decently long (avoid over-trimming)
+  const MAX_TRAIL_POINTS = 300;
+  // Track last time each camera (zone) had any detections
+  const lastDetectionRef = useRef<Record<string, number>>({
+    'kitchen': 0,
+    'living-room': 0,
+    'family-room': 0,
+  });
+  // Ensure we only clear once per inactivity period
+  const trailsClearedRef = useRef<Record<string, boolean>>({
+    'kitchen': false,
+    'living-room': false,
+    'family-room': false,
+  });
+
+  const camToCanvasId = (cam: string) =>
+    cam.includes('kitchen') ? 'map-kitchen' :
+    cam.includes('living') ? 'map-living-room' :
+    cam.includes('family') ? 'map-family-room' : '';
+
+  const colorForId = (id: number) => {
+    const hue = (id * 47) % 360;
+    return `hsl(${hue}, 80%, 60%)`;
+  };
+
+  const clearAllMaps = () => {
+    ['map-kitchen', 'map-living-room', 'map-family-room'].forEach((id) => {
+      const c = document.getElementById(id) as HTMLCanvasElement | null;
+      const ctx = c?.getContext('2d');
+      if (c && ctx) ctx.clearRect(0, 0, c.width, c.height);
+    });
+  };
+
+  const clearMap = (cameraId: string) => {
+    const canvasId = camToCanvasId(cameraId);
+    if (!canvasId) return;
+    const c = document.getElementById(canvasId) as HTMLCanvasElement | null;
+    const ctx = c?.getContext('2d');
+    if (c && ctx) ctx.clearRect(0, 0, c.width, c.height);
+    // Drop stored trails for this camera to actually clear history
+    if (trailHistRef.current[cameraId]) delete trailHistRef.current[cameraId];
+  };
+
+  const updateTrailsAndDraw = (cameraId: string, activeTracks: any[]) => {
+    const tstore = trailHistRef.current;
+    if (!tstore[cameraId]) tstore[cameraId] = {};
+
+    for (const t of activeTracks) {
+      const tid = Number(t.track_id);
+      const center = t.center;
+      if (!Array.isArray(center) || center.length < 2) continue;
+      const [x, y] = center as [number, number];
+      if (!Number.isFinite(x) || !Number.isFinite(y)) continue;
+      if (!tstore[cameraId][tid]) tstore[cameraId][tid] = [];
+      const arr = tstore[cameraId][tid];
+      arr.push({ x, y });
+      if (arr.length > MAX_TRAIL_POINTS) arr.shift();
+    }
+
+    const canvasId = camToCanvasId(cameraId);
+    const canvas = document.getElementById(canvasId) as HTMLCanvasElement | null;
+    if (!canvas) return;
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return;
+
+    // Compute extents from stored points
+    let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+    for (const tid in tstore[cameraId]) {
+      const pts = tstore[cameraId][Number(tid)] || [];
+      for (const p of pts) {
+        if (p.x < minX) minX = p.x;
+        if (p.y < minY) minY = p.y;
+        if (p.x > maxX) maxX = p.x;
+        if (p.y > maxY) maxY = p.y;
+      }
+    }
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    if (!isFinite(minX) || !isFinite(minY) || !isFinite(maxX) || !isFinite(maxY)) return;
+
+    const pad = 10;
+    const sx = (canvas.width - 2 * pad) / Math.max(1, maxX - minX);
+    const sy = (canvas.height - 2 * pad) / Math.max(1, maxY - minY);
+
+    // Draw faint grid
+    ctx.strokeStyle = '#333';
+    ctx.lineWidth = 1;
+    for (let gx = 0; gx < canvas.width; gx += 20) {
+      ctx.beginPath(); ctx.moveTo(gx, 0); ctx.lineTo(gx, canvas.height); ctx.stroke();
+    }
+    for (let gy = 0; gy < canvas.height; gy += 20) {
+      ctx.beginPath(); ctx.moveTo(0, gy); ctx.lineTo(canvas.width, gy); ctx.stroke();
+    }
+
+    // Draw trails per track
+    Object.keys(tstore[cameraId]).forEach((tidStr) => {
+      const tid = Number(tidStr);
+      const pts = tstore[cameraId][tid];
+      if (!pts || pts.length < 2) return;
+      ctx.beginPath();
+      for (let i = 0; i < pts.length; i++) {
+        const px = pad + (pts[i].x - minX) * sx;
+        const py = pad + (pts[i].y - minY) * sy;
+        if (i === 0) ctx.moveTo(px, py); else ctx.lineTo(px, py);
+      }
+      ctx.strokeStyle = colorForId(tid);
+      ctx.lineWidth = 2;
+      ctx.stroke();
+
+      // Head point
+      const last = pts[pts.length - 1];
+      const hx = pad + (last.x - minX) * sx;
+      const hy = pad + (last.y - minY) * sy;
+      ctx.fillStyle = colorForId(tid);
+      ctx.beginPath(); ctx.arc(hx, hy, 3, 0, Math.PI * 2); ctx.fill();
+    });
+  };
+
   // FPS tracking
   const fpsTrackingRef = useRef({
     'living-room': { frameCount: 0, lastUpdate: Date.now(), fps: 0, frameHistory: [] as number[] },
-    'kitchen': { frameCount: 0, lastUpdate: Date.now(), fps: 0, frameHistory: [] as number[] }
+    'kitchen': { frameCount: 0, lastUpdate: Date.now(), fps: 0, frameHistory: [] as number[] },
+    'family-room': { frameCount: 0, lastUpdate: Date.now(), fps: 0, frameHistory: [] as number[] }
   });
 
-  const updateFPS = (cameraType: 'living-room' | 'kitchen') => {
+  const updateFPS = (cameraType: 'living-room' | 'kitchen' | 'family-room') => {
     const tracker = fpsTrackingRef.current[cameraType];
     
     tracker.frameCount++;
@@ -64,10 +239,15 @@ const Dashboard: React.FC = () => {
         if (publish) {
           publish({ group: 'Camera Living Room', key: 'FPS', value: Number(tracker.fps.toFixed(1)), ts: Date.now() });
         }
-      } else {
+      } else if (cameraType === 'kitchen') {
         setKitchenFPS(`FPS: ${tracker.fps.toFixed(1)}`);
         if (publish) {
           publish({ group: 'Camera Kitchen', key: 'FPS', value: Number(tracker.fps.toFixed(1)), ts: Date.now() });
+        }
+      } else if (cameraType === 'family-room') {
+        setFamilyRoomFPS(`FPS: ${tracker.fps.toFixed(1)}`);
+        if (publish) {
+          publish({ group: 'Camera Family Room', key: 'FPS', value: Number(tracker.fps.toFixed(1)), ts: Date.now() });
         }
       }
       
@@ -77,7 +257,7 @@ const Dashboard: React.FC = () => {
 
   const resetFPSTracking = () => {
     for (const cameraType in fpsTrackingRef.current) {
-      fpsTrackingRef.current[cameraType as 'living-room' | 'kitchen'] = {
+      fpsTrackingRef.current[cameraType as 'living-room' | 'kitchen' | 'family-room'] = {
         frameCount: 0,
         lastUpdate: Date.now(),
         fps: 0,
@@ -86,6 +266,7 @@ const Dashboard: React.FC = () => {
     }
     setKitchenFPS('FPS: 0.0');
     setLivingRoomFPS('FPS: 0.0');
+    setFamilyRoomFPS('FPS: 0.0');
   };
 
   const processBinaryFrame = async (blob: Blob) => {
@@ -143,7 +324,7 @@ const Dashboard: React.FC = () => {
       const normalizedCamId = cameraId.toLowerCase().trim();
       // console.log('[displayFrame] Normalized camera ID:', normalizedCamId);
       
-      let cameraType: 'living-room' | 'kitchen' | null = null;
+      let cameraType: 'living-room' | 'kitchen' | 'family-room' | null = null;
       
       if (normalizedCamId === "rtsp_0" || normalizedCamId.includes("living") || normalizedCamId.includes("room1") || normalizedCamId === "1") {
         cameraType = 'living-room';
@@ -151,6 +332,9 @@ const Dashboard: React.FC = () => {
       } else if (normalizedCamId === "rtsp_1" || normalizedCamId.includes("kitchen") || normalizedCamId.includes("room2") || normalizedCamId === "2") {
         cameraType = 'kitchen';
         // console.log('[displayFrame] Mapped to kitchen stream');
+      } else if (normalizedCamId === "rtsp_2" || normalizedCamId.includes("family") || normalizedCamId.includes("room3") || normalizedCamId === "3") {
+        cameraType = 'family-room';
+        // console.log('[displayFrame] Mapped to family room stream');
       } else {
         console.warn(`Unknown camera ID: ${cameraId}`);
         URL.revokeObjectURL(imageUrl);
@@ -158,7 +342,15 @@ const Dashboard: React.FC = () => {
       }
 
       // Update the image source
-      const imgElement = document.getElementById(cameraType === 'living-room' ? 'living-room-stream' : 'kitchen-stream') as HTMLImageElement;
+      let imgElement: HTMLImageElement | null = null;
+      if (cameraType === 'living-room') {
+        imgElement = document.getElementById('living-room-stream') as HTMLImageElement;
+      } else if (cameraType === 'kitchen') {
+        imgElement = document.getElementById('kitchen-stream') as HTMLImageElement;
+      } else if (cameraType === 'family-room') {
+        imgElement = document.getElementById('family-room-stream') as HTMLImageElement;
+      }
+      
       if (imgElement) {
         // Revoke previous URL if it exists
         if (imgElement.dataset.objectUrl) {
@@ -204,6 +396,25 @@ const Dashboard: React.FC = () => {
       }
     }
 
+    // ReID / StableID allocator telemetry
+    if (payload.reid) {
+      const r = payload.reid;
+      if (publish) {
+        if (typeof r.active_unique !== 'undefined') publish({ group: 'ReID', key: 'Active Unique', value: r.active_unique, ts: Date.now() });
+        if (typeof r.free_sid_pool_size !== 'undefined') publish({ group: 'ReID', key: 'Free SID Pool', value: r.free_sid_pool_size, ts: Date.now() });
+        if (typeof r.pending_new_count !== 'undefined') publish({ group: 'ReID', key: 'Pending New', value: r.pending_new_count, ts: Date.now() });
+        if (typeof r.next_sid !== 'undefined') publish({ group: 'ReID', key: 'Next SID', value: r.next_sid, ts: Date.now() });
+        if (typeof r.gallery_ids !== 'undefined') publish({ group: 'ReID', key: 'Session Gallery IDs', value: r.gallery_ids, ts: Date.now() });
+        if (typeof r.ghost_unique !== 'undefined') publish({ group: 'ReID', key: 'Ghost Unique', value: r.ghost_unique, ts: Date.now() });
+        if (typeof r.ghost_entries !== 'undefined') publish({ group: 'ReID', key: 'Ghost Entries', value: r.ghost_entries, ts: Date.now() });
+        if (r.active_by_sensor && typeof r.active_by_sensor === 'object') {
+          Object.keys(r.active_by_sensor).forEach((sid) => {
+            publish({ group: 'ReID', key: `Active SIDs (sensor ${sid})`, value: r.active_by_sensor[sid], ts: Date.now() });
+          });
+        }
+      }
+    }
+
     // Process camera data
     if (payload.cameras && typeof payload.cameras === 'object') {
       let globalOccupancy: { [key: string]: number } = {}; 
@@ -223,6 +434,8 @@ const Dashboard: React.FC = () => {
             setKitchenFPS(`FPS: ${cameraData.fps?.toFixed(1) ?? '0.0'}`);
           } else if (cameraId === 'living-room') {
             setLivingRoomFPS(`FPS: ${cameraData.fps?.toFixed(1) ?? '0.0'}`);
+          } else if (cameraId === 'family-room') {
+            setFamilyRoomFPS(`FPS: ${cameraData.fps?.toFixed(1) ?? '0.0'}`);
           }
         }
 
@@ -254,6 +467,12 @@ const Dashboard: React.FC = () => {
           
           if (trackingData.active_tracks && Array.isArray(trackingData.active_tracks)) {
             allActiveTracks = allActiveTracks.concat(trackingData.active_tracks);
+
+            // Update active tracks per camera for the legend
+            setActiveTracksPerCamera(prev => ({
+              ...prev,
+              [cameraId]: trackingData.active_tracks
+            }));
           }
 
           if (trackingData.transitions && Array.isArray(trackingData.transitions)) {
@@ -325,6 +544,21 @@ const Dashboard: React.FC = () => {
         transitionsHTML = '<li>No recent transitions.</li>';
       }
       setTransitions(transitionsHTML);
+
+      // Render top-down trails using client-accumulated history
+      if (trailVisualizationEnabled) {
+        for (const cameraId in payload.cameras) {
+          const tracking = payload.cameras[cameraId]?.tracking;
+          if (tracking && Array.isArray(tracking.active_tracks)) {
+            // Update last detection time if there are active tracks
+            if (tracking.active_tracks.length > 0) {
+              lastDetectionRef.current[cameraId] = Date.now();
+              trailsClearedRef.current[cameraId as 'kitchen' | 'living-room' | 'family-room'] = false;
+            }
+            updateTrailsAndDraw(cameraId, tracking.active_tracks);
+          }
+        }
+      }
     } else {
       // Handle case where payload.cameras is missing or not an object
       console.warn("Stats payload missing or invalid 'cameras' structure.");
@@ -340,6 +574,39 @@ const Dashboard: React.FC = () => {
       publish({ group: 'Connection', key: 'Status', value: 'Connected', ts: Date.now() });
     }
   };
+
+  const sendTrailToggle = (enabled: boolean) => {
+    if (socketRef.current && socketRef.current.readyState === WebSocket.OPEN) {
+      const message = {
+        type: 'set_vis_toggle',
+        toggle_name: 'trail_visualization_enabled',
+        enabled: enabled,
+      };
+      socketRef.current.send(JSON.stringify(message));
+    }
+  };
+
+  // Inactivity-based clearing of top-down trails per camera/zone.
+  useEffect(() => {
+    const INTERVAL_MS = 30_000; // check every 30s
+    const INACTIVITY_MS = 5 * 60_000; // 5 minutes
+
+    const cams = ['kitchen', 'living-room', 'family-room'];
+    const timer = setInterval(() => {
+      if (!trailVisualizationEnabled) return;
+      const now = Date.now();
+      for (const cam of cams) {
+        const last = lastDetectionRef.current[cam] || 0;
+        const alreadyCleared = trailsClearedRef.current[cam];
+        if (last > 0 && now - last >= INACTIVITY_MS && !alreadyCleared) {
+          clearMap(cam);
+          trailsClearedRef.current[cam] = true; // avoid repeated clears until activity resumes
+        }
+      }
+    }, INTERVAL_MS);
+
+    return () => clearInterval(timer);
+  }, [trailVisualizationEnabled]);
 
   const connectWebSocket = () => {
     console.log(`Attempting to connect to ${WS_URL}...`);
@@ -371,9 +638,23 @@ const Dashboard: React.FC = () => {
       // Clear images on disconnect
       const livingRoomImg = document.getElementById('living-room-stream') as HTMLImageElement;
       const kitchenImg = document.getElementById('kitchen-stream') as HTMLImageElement;
+      const familyRoomImg = document.getElementById('family-room-stream') as HTMLImageElement;
       if (livingRoomImg) livingRoomImg.src = "";
       if (kitchenImg) kitchenImg.src = "";
-      
+      if (familyRoomImg) familyRoomImg.src = "";
+
+      // Clear active tracks for legend on disconnect
+      setActiveTracksPerCamera({
+        'kitchen': [],
+        'living-room': [],
+        'family-room': []
+      });
+
+      // Reset last detection timers and clear maps on disconnect
+      lastDetectionRef.current = { 'kitchen': 0, 'living-room': 0, 'family-room': 0 };
+      trailsClearedRef.current = { 'kitchen': false, 'living-room': false, 'family-room': false };
+      clearAllMaps();
+
       resetFPSTracking();
       
       // Attempt to reconnect
@@ -422,6 +703,10 @@ const Dashboard: React.FC = () => {
           } else if (data.type === 'detection_toggle_update') {
             // console.log('[WebSocket] Received detection toggle update:', data);
             // Handle detection toggle update
+          } else if (data.type === 'toggle_update' && data.toggle_name === 'trail_visualization_enabled') {
+            setTrailVisualizationEnabled(!!data.enabled);
+          } else if (data.type === 'trail_visualization_enabled_update') {
+            setTrailVisualizationEnabled(data.enabled);
           } else {
             // console.log('[WebSocket] Received unknown JSON message format:', data);
           }
@@ -440,6 +725,13 @@ const Dashboard: React.FC = () => {
       console.warn('WebSocket not connected. Cannot send clear_stats message.');
     }
   };
+
+  // Clear canvases when trails toggle is turned off
+  useEffect(() => {
+    if (!trailVisualizationEnabled) {
+      clearAllMaps();
+    }
+  }, [trailVisualizationEnabled]);
 
   useEffect(() => {
     // Start WebSocket connection
@@ -487,6 +779,8 @@ const Dashboard: React.FC = () => {
           perfStatsElem = document.getElementById('kitchen-perf');
         } else if (targetId === 'living-room-stream') {
           perfStatsElem = document.getElementById('living-room-perf');
+        } else if (targetId === 'family-room-stream') {
+          perfStatsElem = document.getElementById('family-room-perf');
         }
         
         // Reset all videos to normal state first
@@ -560,82 +854,7 @@ const Dashboard: React.FC = () => {
     };
   }, []);
 
-  // Detection controls effect
-  useEffect(() => {
-    const sendDetectionToggle = (toggleName: string, enabled: boolean) => {
-      if (socketRef.current && socketRef.current.readyState === WebSocket.OPEN) {
-        const message = {
-          type: 'set_detection_toggle',
-          toggle_name: toggleName,
-          enabled: enabled
-        };
-        console.log('Sending detection toggle message:', message);
-        socketRef.current.send(JSON.stringify(message));
-      }
-    };
 
-    const sendDetectionConfig = (config: any) => {
-      if (socketRef.current && socketRef.current.readyState === WebSocket.OPEN) {
-        const message = {
-          type: 'update_detection_config',
-          config: config
-        };
-        console.log('Sending detection config message:', message);
-        socketRef.current.send(JSON.stringify(message));
-      }
-    };
-
-    // Detection type toggles
-    const toggleDetectPeople = document.getElementById('toggle-detect-people') as HTMLInputElement;
-    if (toggleDetectPeople) {
-      toggleDetectPeople.addEventListener('change', (event) => {
-        sendDetectionToggle('detect_people', (event.target as HTMLInputElement).checked);
-      });
-    }
-    
-    const toggleDetectVehicles = document.getElementById('toggle-detect-vehicles') as HTMLInputElement;
-    if (toggleDetectVehicles) {
-      toggleDetectVehicles.addEventListener('change', (event) => {
-        sendDetectionToggle('detect_vehicles', (event.target as HTMLInputElement).checked);
-      });
-    }
-    
-    const toggleDetectFurniture = document.getElementById('toggle-detect-furniture') as HTMLInputElement;
-    if (toggleDetectFurniture) {
-      toggleDetectFurniture.addEventListener('change', (event) => {
-        sendDetectionToggle('detect_furniture', (event.target as HTMLInputElement).checked);
-      });
-    }
-    
-    // Detection settings sliders
-    const confidenceThreshold = document.getElementById('confidence-threshold') as HTMLInputElement;
-    const confidenceValue = document.getElementById('confidence-value');
-    if (confidenceThreshold && confidenceValue) {
-      confidenceThreshold.addEventListener('input', (event) => {
-        const value = parseFloat((event.target as HTMLInputElement).value);
-        confidenceValue!.textContent = value.toFixed(2);
-        sendDetectionConfig({ confidence_threshold: value });
-      });
-    }
-    
-    const iouThreshold = document.getElementById('iou-threshold') as HTMLInputElement;
-    const iouValue = document.getElementById('iou-value');
-    if (iouThreshold && iouValue) {
-      iouThreshold.addEventListener('input', (event) => {
-        const value = parseFloat((event.target as HTMLInputElement).value);
-        iouValue!.textContent = value.toFixed(2);
-        sendDetectionConfig({ iou_threshold: value });
-      });
-    }
-    
-    // Detection enable/disable toggle
-    const toggleDetectionEnabled = document.getElementById('toggle-detection-enabled') as HTMLInputElement;
-    if (toggleDetectionEnabled) {
-      toggleDetectionEnabled.addEventListener('change', (event) => {
-        sendDetectionConfig({ detection_enabled: (event.target as HTMLInputElement).checked });
-      });
-    }
-  }, []);
 
   // Collapsible controls effect
   useEffect(() => {
@@ -683,8 +902,10 @@ const Dashboard: React.FC = () => {
     <div id="app-container">
       <header>
         <h1>Smart Room Dashboard</h1>
-        <div id="system-status">{systemStatus}</div>
-        <div id="clock">--:--:--</div>
+        <div className="header-metrics">
+          <div id="system-status" className="metric-badge metric-uptime">{systemStatus}</div>
+          <div id="clock" className="metric-badge metric-clock">--:--:--</div>
+        </div>
       </header>
 
       <main>
@@ -696,6 +917,16 @@ const Dashboard: React.FC = () => {
               <button className="fullscreen-btn" data-target="kitchen-stream">Max</button>
             </div>
             <div id="kitchen-perf" className="perf-stats" style={{ minWidth: '80px', textAlign: 'right' }}>{kitchenFPS}</div>
+            <div className="trails-and-legend-container">
+              <div className={`trails-mini-map ${trailsCollapsed ? 'collapsed' : 'expanded'}`}>
+                <div className="mini-map-title">Top-Down (Kitchen)</div>
+                <canvas id="map-kitchen" width={220} height={140}></canvas>
+              </div>
+              <TrackingLegend
+                tracks={activeTracksPerCamera['kitchen'] || []}
+                collapsed={trailsCollapsed}
+              />
+            </div>
           </div>
 
           <div className="video-container">
@@ -705,7 +936,45 @@ const Dashboard: React.FC = () => {
               <button className="fullscreen-btn" data-target="living-room-stream">Max</button>
             </div>
             <div id="living-room-perf" className="perf-stats" style={{ minWidth: '80px', textAlign: 'right' }}>{livingRoomFPS}</div>
+            <div className="trails-and-legend-container">
+              <div className={`trails-mini-map ${trailsCollapsed ? 'collapsed' : 'expanded'}`}>
+                <div className="mini-map-title">Top-Down (Living Room)</div>
+                <canvas id="map-living-room" width={220} height={140}></canvas>
+              </div>
+              <TrackingLegend
+                tracks={activeTracksPerCamera['living-room'] || []}
+                collapsed={trailsCollapsed}
+              />
+            </div>
           </div>
+
+          <div className="video-container">
+            <h2>Family Room</h2>
+            <div className="video-wrapper">
+              <img id="family-room-stream" src="" alt="Family Room Stream" width="640" height="360" />
+              <button className="fullscreen-btn" data-target="family-room-stream">Max</button>
+            </div>
+            <div id="family-room-perf" className="perf-stats" style={{ minWidth: '80px', textAlign: 'right' }}>{familyRoomFPS}</div>
+            <div className="trails-and-legend-container">
+              <div className={`trails-mini-map ${trailsCollapsed ? 'collapsed' : 'expanded'}`}>
+                <div className="mini-map-title">Top-Down (Family Room)</div>
+                <canvas id="map-family-room" width={220} height={140}></canvas>
+              </div>
+              <TrackingLegend
+                tracks={activeTracksPerCamera['family-room'] || []}
+                collapsed={trailsCollapsed}
+              />
+            </div>
+          </div>
+        </div>
+
+        <div
+          id="trails-collapse-handle"
+          className={trailsCollapsed ? 'collapsed' : 'expanded'}
+          onClick={() => setTrailsCollapsed((v) => !v)}
+          title={trailsCollapsed ? 'Expand trails' : 'Collapse trails'}
+        >
+          <span>{trailsCollapsed ? 'Show trails ▾' : 'Hide trails ▸'}</span>
         </div>
 
         <div className="stats-section">
@@ -768,6 +1037,25 @@ const Dashboard: React.FC = () => {
                 </label>
               </div>
             </div>
+            <div className="settings-group">
+                <h4>Visualization Settings</h4>
+                <div className="setting-item">
+                    <label className="toggle-label">
+                                                                        <input
+                            type="checkbox"
+                            id="toggle-trail-visualization"
+                            checked={trailVisualizationEnabled}
+                            onChange={(e) => {
+                                const enabled = e.target.checked;
+                                setTrailVisualizationEnabled(enabled);
+                                sendTrailToggle(enabled);
+                            }}
+                        />
+                        <span className="toggle-slider"></span>
+                        Enable Object Trails
+                    </label>
+                </div>
+            </div>
           </div>
         </div>
       </main>
@@ -789,4 +1077,3 @@ const App: React.FC = () => (
 );
 
 export default App;
-

@@ -5,7 +5,7 @@
 ################################################################################
 
 BaseConfig:
-  minDetectorConfidence: 0.25    # Minimum confidence for detector bbox to be considered for tracking
+  minDetectorConfidence: 0.3    # Minimum confidence for detector bbox to be considered for tracking
   enableBatchProcess: 1          # Enable batch processing for better performance
   maxBatchSize: 4                # Maximum batch size for processing
 
@@ -44,7 +44,7 @@ DataAssociator:
   matchingScoreWeight4Iou: 0.3    # Weight for IOU score
 
   # Tentative detections
-  tentativeDetectorConfidence: 0.2    # Confidence threshold for tentative detections
+  tentativeDetectorConfidence: 0.25    # Confidence threshold for tentative detections
   minMatchingScore4TentativeIou: 0.5    # Min IOU for tentative detection matching
 
 StateEstimator:

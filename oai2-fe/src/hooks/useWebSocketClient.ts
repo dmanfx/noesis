@@ -43,6 +43,7 @@ export type FloorplanRequest = {
   gridResM?: number;
   maxExtentM?: number;
   requestId?: string;
+  cacheOnly?: boolean;
 };
 
 export function useWebSocketClient(url: string, handlers: FrameHandlers) {
@@ -228,7 +229,8 @@ export function useWebSocketClient(url: string, handlers: FrameHandlers) {
         camera: options?.camera,
         max_age_sec: options?.maxAgeSec ?? 60,
         grid_res_m: options?.gridResM ?? 0.5,
-        max_extent_m: options?.maxExtentM ?? 20
+        max_extent_m: options?.maxExtentM ?? 20,
+        cache_only: options?.cacheOnly ?? false
       });
       return ok ? requestId : '';
     }

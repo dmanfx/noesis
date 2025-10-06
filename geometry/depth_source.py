@@ -519,6 +519,8 @@ class MapAnythingDepthSource:
         self._cache_lock = threading.Lock()
         self._depth_payload_cache: "OrderedDict[str, Dict[str, Any]]" = OrderedDict()
         self._floorplan_cache: "OrderedDict[Tuple[str, float, float], Dict[str, Any]]" = OrderedDict()
+        self._floorplan_store_dir = Path(self.config.storage.depth_base) / "floorplans"
+        self._floorplan_store_dir.mkdir(parents=True, exist_ok=True)
         self._max_depth_cache_entries = 16
         self._max_floorplan_cache_entries = 24
         self._batch_lock = threading.Lock()
@@ -922,6 +924,63 @@ class MapAnythingDepthSource:
                 self._depth_payload_cache.popitem(last=False)
         return payload
 
+    @staticmethod
+    def _sanitize_camera_id(camera_id: str) -> str:
+        safe = ''.join(ch if ch.isalnum() or ch in {'-', '_', '.'} else '_' for ch in camera_id.strip())
+        return safe or "camera"
+
+    @staticmethod
+    def _format_param(value: float) -> str:
+        text = f"{float(value):.6f}".rstrip('0').rstrip('.')
+        if not text:
+            text = "0"
+        if text.startswith('-'):
+            text = 'neg' + text[1:]
+        return text.replace('.', 'p')
+
+    def _floorplan_path(self, camera_id: str, grid_res_m: float, max_extent_m: float) -> Path:
+        safe_cam = self._sanitize_camera_id(camera_id)
+        filename = f"grid{self._format_param(grid_res_m)}__ext{self._format_param(max_extent_m)}.json"
+        return self._floorplan_store_dir / safe_cam / filename
+
+    def _load_floorplan_from_disk(
+        self,
+        camera_id: str,
+        grid_res_m: float,
+        max_extent_m: float,
+    ) -> Optional[Dict[str, Any]]:
+        path = self._floorplan_path(camera_id, grid_res_m, max_extent_m)
+        if not path.exists():
+            return None
+        try:
+            with path.open('r', encoding='utf-8') as fh:
+                payload = json.load(fh)
+            if isinstance(payload, dict):
+                payload.setdefault('camera_id', camera_id)
+                return payload
+        except Exception as exc:
+            self.logger.debug(f"Failed to load cached floorplan for {camera_id}: {exc}")
+        return None
+
+    def _persist_floorplan_to_disk(
+        self,
+        camera_id: str,
+        grid_res_m: float,
+        max_extent_m: float,
+        payload: Mapping[str, Any],
+    ) -> None:
+        path = self._floorplan_path(camera_id, grid_res_m, max_extent_m)
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            to_store = dict(payload)
+            to_store.pop('served_from_cache', None)
+            tmp_path = path.with_suffix(path.suffix + '.tmp')
+            with tmp_path.open('w', encoding='utf-8') as fh:
+                json.dump(to_store, fh, separators=(',', ':'))
+            tmp_path.replace(path)
+        except Exception as exc:
+            self.logger.debug(f"Failed to persist floorplan for {camera_id}: {exc}")
+
     def update_depth_cache(self, result: DepthResult) -> None:
         try:
             depth_bytes = result.depth.astype(np.float32, copy=False).tobytes()
@@ -974,20 +1033,46 @@ class MapAnythingDepthSource:
         max_age_sec: float = 60.0,
         grid_res_m: float = 0.5,
         max_extent_m: float = 20.0,
+        cache_only: bool = False,
     ) -> Dict[str, Any]:
         """Generate a per-camera top-down (XZ) blueprint view from the latest depth snapshot."""
         if not camera_id:
             return {'error': 'camera_required', 'ts': int(time.time() * 1_000_000)}
 
         cache_key = (camera_id, float(grid_res_m), float(max_extent_m))
+        now_us = int(time.time() * 1_000_000)
         with self._cache_lock:
             cached = self._floorplan_cache.get(cache_key)
             if cached:
-                age_us = int(time.time() * 1_000_000) - cached.get('snapshot_ts', cached.get('ts', 0))
+                if cache_only:
+                    payload = dict(cached)
+                    payload['served_from_cache'] = True
+                    return payload
+                age_us = now_us - cached.get('snapshot_ts', cached.get('ts', 0))
                 if age_us <= int(max(0.0, max_age_sec) * 1_000_000):
-                    return dict(cached)
+                    payload = dict(cached)
+                    payload['served_from_cache'] = True
+                    return payload
+            # Fall through to load from disk or recompute when cache is empty
+            # so callers receive a floorplan without additional interaction.
 
-        now_us = int(time.time() * 1_000_000)
+        disk_payload = self._load_floorplan_from_disk(camera_id, grid_res_m, max_extent_m)
+        if disk_payload:
+            snapshot_ts = disk_payload.get('snapshot_ts', disk_payload.get('ts'))
+            if isinstance(snapshot_ts, (int, float)):
+                age_us = now_us - int(snapshot_ts)
+            else:
+                age_us = None
+            if cache_only or age_us is None or age_us <= int(max(0.0, max_age_sec) * 1_000_000):
+                with self._cache_lock:
+                    self._floorplan_cache[cache_key] = dict(disk_payload)
+                    self._floorplan_cache.move_to_end(cache_key, last=True)
+                    while len(self._floorplan_cache) > self._max_floorplan_cache_entries:
+                        self._floorplan_cache.popitem(last=False)
+                payload = dict(disk_payload)
+                payload['served_from_cache'] = True
+                return payload
+
         max_age_us = int(max(0.0, max_age_sec) * 1_000_000)
         ts_cutoff = now_us - max_age_us if max_age_us > 0 else None
 
@@ -1224,6 +1309,11 @@ class MapAnythingDepthSource:
                 'value_max': float(max_distance),
             },
         }
+        payload['served_from_cache'] = False
+        payload['grid_res_m'] = float(grid_res_m)
+        payload['max_extent_m'] = float(max_extent_m)
+
+        self._persist_floorplan_to_disk(camera_id, grid_res_m, max_extent_m, payload)
 
         with self._cache_lock:
             self._floorplan_cache[cache_key] = dict(payload)

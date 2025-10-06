@@ -744,6 +744,7 @@ class WebSocketServer:
                         max_age_sec = float(data.get('max_age_sec', data.get('maxAgeSec', 60.0)))
                         grid_res_m = float(data.get('grid_res_m', data.get('gridResM', 0.5)))
                         max_extent_m = float(data.get('max_extent_m', data.get('maxExtentM', 20.0)))
+                        cache_only = bool(data.get('cache_only', data.get('cacheOnly', False)))
 
                         rate_key = f"{client_ip}:{camera or 'unknown'}"
                         now = time.time()
@@ -761,13 +762,14 @@ class WebSocketServer:
                             'type': 'floorplan_response',
                             'request_id': request_id,
                             'camera_id': camera,
+                            'cache_only': cache_only,
                         }
 
                         provider = getattr(self, 'floorplan_provider', None)
                         if callable(provider):
                             try:
                                 payload = await asyncio.wait_for(
-                                    asyncio.to_thread(provider, camera, max_age_sec, grid_res_m, max_extent_m),
+                                    asyncio.to_thread(provider, camera, max_age_sec, grid_res_m, max_extent_m, cache_only=cache_only),
                                     timeout=self._floorplan_rpc_timeout
                                 )
                                 if payload:

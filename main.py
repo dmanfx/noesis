@@ -303,12 +303,13 @@ class ApplicationManager:
                     if self.depth_source and self.websocket_server:
                         self.websocket_server.ma_depth_provider = self.depth_source.load_latest_depth
                         self.websocket_server.floorplan_provider = (
-                            lambda cam=None, max_age=60.0, grid_res=0.5, max_extent=20.0, **_:
+                            lambda cam=None, max_age=60.0, grid_res=0.5, max_extent=20.0, cache_only=False, **_:
                                 self.depth_source.generate_topdown_floorplan(
                                     str(cam) if cam else '',
                                     max_age_sec=max_age,
                                     grid_res_m=grid_res,
                                     max_extent_m=max_extent,
+                                    cache_only=cache_only,
                                 )
                         )
             except Exception as e:

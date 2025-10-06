@@ -35,6 +35,8 @@ export type FloorplanResponse = {
   camera_id?: string;
   ts?: number;
   snapshot_ts?: number | null;
+  served_from_cache?: boolean;
+  cache_only?: boolean;
   bounds?: { min_x?: number; max_x?: number; min_z?: number; max_z?: number };
   scale_m_per_px?: number;
   point_count?: number;
@@ -50,6 +52,7 @@ type FloorplanRequestOptions = {
   maxAgeSec?: number;
   gridResM?: number;
   maxExtentM?: number;
+  cacheOnly?: boolean;
 };
 
 interface DepthDrawerProps {
@@ -203,7 +206,7 @@ const DepthDrawer = memo(function DepthDrawer({ open, onClose, diagnostics, dept
   const densityCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const heightCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const distanceCanvasRef = useRef<HTMLCanvasElement | null>(null);
-  const [floorplanStatus, setFloorplanStatus] = useState<'idle' | 'loading'>('idle');
+  const [floorplanStatus, setFloorplanStatus] = useState<'idle' | 'loading' | 'checking'>('idle');
   const [floorplanRequest, setFloorplanRequest] = useState<string>('');
   const [heatmapRange, setHeatmapRange] = useState<{ min: number; max: number } | null>(null);
 
@@ -212,7 +215,8 @@ const DepthDrawer = memo(function DepthDrawer({ open, onClose, diagnostics, dept
   const densityLayer = cameraFloorplan?.density;
   const heightLayer = cameraFloorplan?.height;
   const distanceLayer = cameraFloorplan?.distance;
-  const floorplanError = cameraFloorplan?.error;
+  const floorplanError = cameraFloorplan?.error ?? null;
+  const servedFromCache = cameraFloorplan?.served_from_cache ?? false;
   const hasDensity = !!(densityLayer && densityLayer.grid_b64 && densityLayer.grid_shape);
   const hasHeight = !!(heightLayer && heightLayer.grid_b64 && heightLayer.grid_shape);
   const hasDistance = !!(distanceLayer && distanceLayer.grid_b64 && distanceLayer.grid_shape);
@@ -224,6 +228,15 @@ const DepthDrawer = memo(function DepthDrawer({ open, onClose, diagnostics, dept
   const distanceMid = distanceMin !== undefined && distanceMax !== undefined ? (distanceMin + distanceMax) / 2 : undefined;
   const spanX = cameraFloorplan?.bounds ? Math.abs((cameraFloorplan.bounds.max_x ?? 0) - (cameraFloorplan.bounds.min_x ?? 0)) : undefined;
   const spanZ = cameraFloorplan?.bounds ? Math.abs((cameraFloorplan.bounds.max_z ?? 0) - (cameraFloorplan.bounds.min_z ?? 0)) : undefined;
+  const floorplanStatusText = useMemo(() => {
+    if (!open || activeTab !== 'heatmap') return '';
+    if (floorplanStatus === 'loading') return 'Refreshing depth view...';
+    if (floorplanStatus === 'checking') return 'Checking cached floorplan...';
+    if (floorplanError) return `Floorplan error: ${floorplanError}`;
+    if (cameraFloorplan?.served_from_cache) return 'Showing cached floorplan. Press refresh to regenerate.';
+    if (cameraFloorplan) return 'Floorplan generated from the latest depth snapshot.';
+    return 'Waiting for floorplan data.';
+  }, [open, activeTab, floorplanStatus, floorplanError, cameraFloorplan]);
   const clearCanvasElement = useCallback((canvas: HTMLCanvasElement | null) => {
     if (!canvas) return;
     const ctx = canvas.getContext('2d');
@@ -500,15 +513,17 @@ const DepthDrawer = memo(function DepthDrawer({ open, onClose, diagnostics, dept
   );
 
 
-  const fetchFloorplan = useCallback(() => {
+  const requestFloorplan = useCallback((mode: 'cache-only' | 'regenerate') => {
     if (!onRequestFloorplan || !open || !selectedCamera) return;
-    setFloorplanStatus('loading');
+    const cacheOnly = mode === 'cache-only';
+    setFloorplanStatus(cacheOnly ? 'checking' : 'loading');
     const requestId = onRequestFloorplan({
       camera: selectedCamera,
       requestId: Date.now().toString(),
-      maxAgeSec: 60,
+      maxAgeSec: cacheOnly ? undefined : 0,
       gridResM: 0.5,
       maxExtentM: 20,
+      cacheOnly,
     });
     if (typeof requestId === 'string' && requestId.length) {
       setFloorplanRequest(requestId);
@@ -529,7 +544,7 @@ const DepthDrawer = memo(function DepthDrawer({ open, onClose, diagnostics, dept
       return;
     }
 
-    if (cameraFloorplan?.error) {
+    if (floorplanError) {
       clearCanvasElement(densityCanvasRef.current);
       clearCanvasElement(heightCanvasRef.current);
       clearCanvasElement(distanceCanvasRef.current);
@@ -548,22 +563,12 @@ const DepthDrawer = memo(function DepthDrawer({ open, onClose, diagnostics, dept
         setFloorplanRequest('');
       }
     }
-  }, [activeTab, open, cameraFloorplan, densityLayer, heightLayer, distanceLayer, renderTopdownLayer, clearCanvasElement, floorplanRequest, drawerWidth]);
+  }, [activeTab, open, cameraFloorplan, densityLayer, heightLayer, distanceLayer, renderTopdownLayer, clearCanvasElement, floorplanRequest, drawerWidth, floorplanError]);
 
   useEffect(() => {
     if (activeTab !== 'heatmap' || !open || !selectedCamera) return;
-    const id = window.setInterval(() => {
-      if (floorplanStatus !== 'loading') {
-        fetchFloorplan();
-      }
-    }, 30000);
-    return () => window.clearInterval(id);
-  }, [activeTab, open, selectedCamera, floorplanStatus, fetchFloorplan]);
-
-  useEffect(() => {
-    if (activeTab !== 'heatmap' || !open || !selectedCamera) return;
-    fetchFloorplan();
-  }, [selectedCamera, activeTab, open, fetchFloorplan]);
+    requestFloorplan('cache-only');
+  }, [selectedCamera, activeTab, open, requestFloorplan]);
 
   useEffect(() => {
     if (!open) return;
@@ -660,9 +665,14 @@ const DepthDrawer = memo(function DepthDrawer({ open, onClose, diagnostics, dept
                   <button
                     type="button"
                     className="btn-icon"
-                    onClick={() => selectedCamera && onRequestDepth(selectedCamera)}
-                    disabled={!depthEntry}
+                    onClick={() => {
+                      if (!selectedCamera) return;
+                      onRequestDepth(selectedCamera);
+                      requestFloorplan('regenerate');
+                    }}
+                    disabled={!depthEntry || floorplanStatus === 'loading'}
                     aria-label="Refresh depth frame"
+                    title={floorplanStatus === 'loading' ? 'Refreshing depth view...' : undefined}
                   >
                     <svg viewBox="0 0 16 16" aria-hidden="true">
                       <path
@@ -679,6 +689,9 @@ const DepthDrawer = memo(function DepthDrawer({ open, onClose, diagnostics, dept
           {activeTab === 'heatmap' && (
             <>
               {floorplanError && <p className="floorplan-error">Error: {floorplanError}</p>}
+              {floorplanStatusText && !floorplanError && (
+                <p className="floorplan-status">{floorplanStatusText}</p>
+              )}
               <div className="heatmap-grid">
                 <div className="heatmap-cell heatmap-cell--left">
                   <div className="heatmap-cell__scale">
@@ -750,7 +763,9 @@ const DepthDrawer = memo(function DepthDrawer({ open, onClose, diagnostics, dept
                 <p className="floorplan-meta">
                   Points: {cameraFloorplan.point_count ?? 0}
                   {spanX !== undefined && spanZ !== undefined ? ` · Span ${formatNumber(spanX)}m × ${formatNumber(spanZ)}m` : ''}
-                  {cameraFloorplan.ts ? ` · Updated ${new Date(cameraFloorplan.ts / 1000).toLocaleTimeString()}` : ''}
+                  {cameraFloorplan.ts
+                    ? ` · Updated ${new Date(cameraFloorplan.ts / 1000).toLocaleTimeString()}${servedFromCache ? ' (cached)' : ''}`
+                    : ''}
                 </p>
               )}
             </>

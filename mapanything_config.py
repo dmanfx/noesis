@@ -105,6 +105,12 @@ class StorageSettings:
     queue_size: int
     async_workers: int
     async_max_workers: int
+    # New optional tuning knobs
+    enforce_async: bool = True
+    enforce_interval_s: float = 1.0
+    quota_hysteresis_ratio: float = 0.9
+    zarr_clevel: int = 5
+    zarr_chunk_px: int = 128
 
 
 @dataclass(frozen=True)
@@ -153,6 +159,11 @@ class ServiceConfig:
             queue_size=_to_int(storage_section.get("queue_size", "32")),
             async_workers=_to_int(storage_section.get("async_workers", "0")),
             async_max_workers=_to_int(storage_section.get("async_max_workers", "0")),
+            enforce_async=_to_bool(storage_section.get("enforce_async", "true")),
+            enforce_interval_s=_to_float(storage_section.get("enforce_interval_s", "1.0")),
+            quota_hysteresis_ratio=_to_float(storage_section.get("quota_hysteresis_ratio", "0.9")),
+            zarr_clevel=_to_int(storage_section.get("zarr_clevel", "5")),
+            zarr_chunk_px=_to_int(storage_section.get("zarr_chunk_px", "128")),
         )
         return cls(service=service, inference=inference, performance=performance, storage=storage)
 

@@ -84,6 +84,12 @@ class DepthStorageManager:
         max_queue_size: int = 32,
         worker_count: int = 1,
         max_worker_count: int = 0,
+        # New tuning knobs
+        enforce_async: bool = True,
+        enforce_interval_s: float = 1.0,
+        size_hysteresis_ratio: float = 0.9,
+        zarr_clevel: int = 5,
+        zarr_chunk_px: int = 128,
     ) -> None:
         self.base_path = base_path
         self.base_path.mkdir(parents=True, exist_ok=True)
@@ -115,6 +121,15 @@ class DepthStorageManager:
         self._worker_name_counter = 0
         self._queue_put_timeout = 1.0
         self._last_queue_full_warning: float = 0.0
+        # Retention/size enforcement tuning
+        self._enforce_async = bool(enforce_async)
+        self._enforce_interval_s = max(0.05, float(enforce_interval_s))
+        self._size_hysteresis_ratio = min(1.0, max(0.1, float(size_hysteresis_ratio)))
+        self._zarr_clevel = max(0, int(zarr_clevel))
+        self._zarr_chunk_px = int(zarr_chunk_px)
+        # Background enforcement thread
+        self._enforce_thread: Optional[threading.Thread] = None
+        self._enforce_stop = threading.Event()
         if self._max_total_bytes is not None and self._max_total_bytes < 10 * 1024 * 1024:
             self._logger.warning(
                 "Configured max_total_bytes=%s is very small; increasing to 10MB minimum",
@@ -124,6 +139,9 @@ class DepthStorageManager:
         self._seed_existing_entries()
         if self._async_enabled:
             self._start_writer()
+        # Start async enforcement if enabled
+        if self._enforce_async:
+            self._start_enforcer()
 
     def _default_worker_target(self) -> int:
         cpu_count = os.cpu_count() or 1
@@ -196,7 +214,31 @@ class DepthStorageManager:
             finally:
                 self._queue.task_done()
 
+    def _start_enforcer(self) -> None:
+        if self._enforce_thread is not None:
+            return
+        def _loop() -> None:
+            while not self._enforce_stop.is_set():
+                try:
+                    # Prune all cameras; uses per-camera locks internally
+                    self.prune()
+                except Exception:
+                    pass
+                # Sleep a bit to batch work and avoid thrash
+                self._enforce_stop.wait(self._enforce_interval_s)
+        self._enforce_thread = threading.Thread(target=_loop, name="DepthRetentionEnforcer", daemon=True)
+        self._enforce_thread.start()
+
     def shutdown(self, *, wait: bool = True) -> None:
+        # Stop background enforcer
+        try:
+            self._enforce_stop.set()
+            if self._enforce_thread and wait:
+                self._enforce_thread.join(timeout=2.0)
+        except Exception:
+            pass
+        self._enforce_thread = None
+        # Stop async writers
         if not self._async_enabled or self._stop_event is None:
             return
         self._stop_event.set()
@@ -240,13 +282,19 @@ class DepthStorageManager:
         with lock:
             index = self._get_index(camera_id)
             index.append((ts_us, dest_path))
-            self._enforce_limits(camera_id, index)
+            # Defer enforcement to background thread if enabled
+            if not self._enforce_async:
+                self._enforce_limits(camera_id, index)
 
     def _write_snapshot(self, job: _SnapshotJob) -> None:
         job.dest_path.parent.mkdir(parents=True, exist_ok=True)
-        compressor = Blosc(cname="zstd", clevel=5, shuffle=Blosc.SHUFFLE)
+        compressor = Blosc(cname="zstd", clevel=self._zarr_clevel, shuffle=Blosc.SHUFFLE)
         root = zarr.open_group(str(job.dest_path), mode="w")
-        chunk_shape = (min(128, job.depth.shape[0]), min(128, job.depth.shape[1]))
+        if self._zarr_chunk_px and self._zarr_chunk_px > 0:
+            chunk_shape = (min(self._zarr_chunk_px, job.depth.shape[0]), min(self._zarr_chunk_px, job.depth.shape[1]))
+        else:
+            # Single-chunk per array to minimize file count
+            chunk_shape = job.depth.shape
         root.create_dataset(
             "depth_z",
             data=job.depth,
@@ -349,7 +397,9 @@ class DepthStorageManager:
             total_bytes += size
 
         removed = 0
-        while total_bytes > self._max_total_bytes and index:
+        # Hysteresis: prune down to a target below the hard cap to avoid frequent rescans
+        target_bytes = int(self._max_total_bytes * self._size_hysteresis_ratio)
+        while total_bytes > target_bytes and index:
             ts, path = index.popleft()
             size = sizes.pop(0)
             total_bytes -= size
@@ -511,6 +561,11 @@ class MapAnythingDepthSource:
             max_queue_size=max(1, int(getattr(self.config.storage, 'queue_size', 32))),
             worker_count=int(getattr(self.config.storage, 'async_workers', 0)),
             max_worker_count=int(getattr(self.config.storage, 'async_max_workers', 0)),
+            enforce_async=bool(getattr(self.config.storage, 'enforce_async', True)),
+            enforce_interval_s=float(getattr(self.config.storage, 'enforce_interval_s', 1.0)),
+            size_hysteresis_ratio=float(getattr(self.config.storage, 'quota_hysteresis_ratio', 0.9)),
+            zarr_clevel=int(getattr(self.config.storage, 'zarr_clevel', 5)),
+            zarr_chunk_px=int(getattr(self.config.storage, 'zarr_chunk_px', 128)),
         )
         self.min_conf = float(self.config.performance.min_conf)
         self.mono_interval = 1.0 / max(self.config.performance.mono_freq_hz, 1e-6)

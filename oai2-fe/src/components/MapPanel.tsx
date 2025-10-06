@@ -62,15 +62,9 @@ export const MapPanel: React.FC<{
       // Apply size
       if (canvas.width !== size.w) canvas.width = size.w;
       if (canvas.height !== size.h) canvas.height = size.h;
-      // Draw using fixed viewport from bounds; invertY for z-forward
-      drawTrails(canvas, cam, store, colorForTrack, {
-        xMin: Number(b.min_x ?? 0),
-        xMax: Number(b.max_x ?? 0),
-        yMin: Number(b.min_z ?? 0),
-        yMax: Number(b.max_z ?? 0),
-        invertY: true,
-        drawCameraMarker: useWorld,
-      });
+      // Draw using auto-fit extents based on incoming trail data.
+      // This avoids unit/scale mismatches between camera/world coords and floorplan bounds.
+      drawTrails(canvas, cam, store, colorForTrack);
     };
     drawFor('living-room', canvLiving);
     drawFor('kitchen', canvKitchen);

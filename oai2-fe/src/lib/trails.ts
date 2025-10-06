@@ -40,10 +40,47 @@ export function drawTrails(
   const tracks = store.trails[cam];
   ctx.clearRect(0, 0, canvas.width, canvas.height);
 
+  // Compute raw track-space bounds regardless of viewport to enable dynamic fallback
+  let trackMinX = Infinity, trackMinY = Infinity, trackMaxX = -Infinity, trackMaxY = -Infinity;
+  let totalValid = 0;
+  for (const tidStr in tracks) {
+    const pts = tracks[Number(tidStr)] || [];
+    for (const p of pts) {
+      if (!Number.isFinite(p.x) || !Number.isFinite(p.y)) continue;
+      totalValid++;
+      if (p.x < trackMinX) trackMinX = p.x;
+      if (p.y < trackMinY) trackMinY = p.y;
+      if (p.x > trackMaxX) trackMaxX = p.x;
+      if (p.y > trackMaxY) trackMaxY = p.y;
+    }
+  }
+
   let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+  let usingDynamicExtents = false;
   if (viewport) {
+    // Start with provided viewport
     minX = viewport.xMin; maxX = viewport.xMax;
     minY = viewport.yMin; maxY = viewport.yMax;
+    // If almost all points lie outside the provided viewport, fall back to data-driven extents
+    if (totalValid > 0) {
+      let inside = 0;
+      for (const tidStr in tracks) {
+        const pts = tracks[Number(tidStr)] || [];
+        for (const p of pts) {
+          if (!Number.isFinite(p.x) || !Number.isFinite(p.y)) continue;
+          if (p.x >= minX && p.x <= maxX && p.y >= minY && p.y <= maxY) inside++;
+        }
+      }
+      const fracInside = inside / totalValid;
+      if (!isFinite(fracInside) || fracInside < 0.05) {
+        // Use track-driven extents; guard against degenerate ranges
+        if (isFinite(trackMinX) && isFinite(trackMaxX) && isFinite(trackMinY) && isFinite(trackMaxY)) {
+          minX = trackMinX; maxX = trackMaxX;
+          minY = trackMinY; maxY = trackMaxY;
+          usingDynamicExtents = true;
+        }
+      }
+    }
   } else {
     for (const tidStr in tracks) {
       const pts = tracks[Number(tidStr)] || [];
@@ -134,11 +171,11 @@ export function drawTrails(
   }
 
   // Emit a concise log at most every 2s per camera
-  if (viewport && now - lastLogTs > 2000) {
+  if (now - lastLogTs > 2000) {
     // eslint-disable-next-line no-console
     console.info(
       `[trails] ${cam}: tracks=${trackCount}, points=${validPoints}/${totalPoints}, ` +
-      `extents=([${minX.toFixed(2)},${minY.toFixed(2)}]-[${maxX.toFixed(2)},${maxY.toFixed(2)}]), ` +
+      `extents=([${minX.toFixed(2)},${minY.toFixed(2)}]-[${maxX.toFixed(2)},${maxY.toFixed(2)}])${viewport ? (usingDynamicExtents ? ' dynamic' : ' viewport') : ' auto'}, ` +
       `canvas=${canvas.width}x${canvas.height}, outX:<${outXLo} >${outXHi}, outY:<${outYLo} >${outYHi}`
     );
     lastLogMap[cam] = now;

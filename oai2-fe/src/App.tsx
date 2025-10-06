@@ -191,8 +191,7 @@ function Dashboard() {
               }
               seenNow[key].add(sid);
             } else {
-              const center = t.center; if (!Array.isArray(center) || center.length < 2) continue;
-              trailStoreRef.current.push(key, sid, { x: center[0]!, y: center[1]! });
+              // Skip pixel-space centers for top-down trails; avoid mixing units with world/camera XZ
               seenNow[key].add(sid);
             }
           }

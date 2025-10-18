@@ -7,15 +7,19 @@ flowchart LR
   PRE[nvdspreprocess<br/>config: pipelines/config_preproc.ini]
   PGIE[nvinfer<br/>config: pipelines/config_infer_primary_yolo11.ini<br/>input-tensor-meta: true]
   EXA[nvdsanalytics_exclude<br/>uid:101<br/>config: pipelines/config_nvdsanalytics_exclude.ini]
+  MAP_PRE[nvdspreprocess<br/>config: pipelines/config_preprocess_mapanything_fused.ini
+           custom-lib: libmapanything_preprocess_fused.so]
+  SGIE[nvinfer<br/>uid:22<br/>config: pipelines/config_infer_secondary_mapanything_fused.ini]
   TRK[nvtracker<br/>lib: libnvds_nvmultiobjecttracker.so<br/>conf: pipelines/config_tracker_nvdcf_batch.yml]
   ANA[nvdsanalytics_post<br/>uid:201<br/>config: pipelines/config_nvdsanalytics_post.ini]
   DMX[nvstreamdemux]
 
   %% Flow
-  SRC --> PRE --> PGIE --> EXA --> TRK --> ANA --> DMX
+  SRC --> PRE --> PGIE --> EXA --> MAP_PRE --> SGIE --> TRK --> ANA --> DMX
 
   %% Probes
   EXA -- src pad probe --> P1[_remove_excluded_objects_probe]
+  SGIE -- src pad probe --> P4[_mapanything_depth_probe]
   ANA -- src pad probe --> P2[_analytics_probe]
   %% Debug probe on demux sink
   DMX -- sink pad probe --> P0[demux debug]
@@ -58,6 +62,7 @@ flowchart LR
 
   %% WebSocket data paths
   P2 -. telemetry .-> WS[WebSocketServer.broadcast_frame]
+  P4 -. depth meta .-> WS
   SINK -. JPEG bytes .-> QQ[jpeg_queues[source_id]]
   QQ -. periodic .-> W2[WebSocketServer.broadcast_sync {type:'video_frame'}]
 

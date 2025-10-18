@@ -17,17 +17,21 @@ Key Features:
 # Core imports
 import sys
 import os
-os.environ['no_proxy'] = '*'
+
+os.environ["no_proxy"] = "*"
 import logging
 import configparser
 import re
 import threading
 import time
 import queue
+import json
+import ctypes
+import tempfile
 from collections import defaultdict, deque
 
 # Bypass libproxy issues by disabling GIO proxy resolver
-from typing import Optional, Tuple, Dict, Any, List, Union
+from typing import Optional, Tuple, Dict, Any, List, Set, Iterable, TYPE_CHECKING
 import numpy as np
 
 import torch
@@ -35,19 +39,44 @@ import math
 
 # GStreamer imports
 import gi
-gi.require_version('Gst', '1.0')
-gi.require_version('GstApp', '1.0')
+
+gi.require_version("Gst", "1.0")
+gi.require_version("GstApp", "1.0")
 from gi.repository import Gst, GLib, GstApp, GObject  # type: ignore  # noqa: E402
 
 # DeepStream imports
-sys.path.append('/opt/nvidia/deepstream/deepstream/lib')
+sys.path.append("/opt/nvidia/deepstream/deepstream/lib")
 import pyds  # type: ignore  # noqa: E402
+
+# Define a stable custom meta type for our MapAnything depth user meta.
+# Prefer a named registration via nvds_get_user_meta_type so the value is
+# stable across runs and plays nicely with DeepStream bookkeeping. Fall back
+# to a slot in the user range if registration is unavailable.
+try:
+    CUSTOM_MDE_META_TYPE = int(
+        pyds.nvds_get_user_meta_type("Noesis.MapAnythingDepthMeta")
+    )
+except Exception:
+    CUSTOM_MDE_META_TYPE = int(pyds.NvDsMetaType.NVDS_START_USER_META) + 10
+
+_glib = ctypes.CDLL("libglib-2.0.so.0")
+_glib.g_strdup.argtypes = [ctypes.c_char_p]
+_glib.g_strdup.restype = ctypes.c_void_p
+
+
+def _alloc_display_text(text: Optional[str]) -> ctypes.c_char_p:
+    """Allocate a GLib-managed string for NvOSD display text."""
+    if not text:
+        return ctypes.c_char_p()
+    encoded = text.encode("utf-8")
+    ptr = _glib.g_strdup(encoded)
+    return ctypes.cast(ptr, ctypes.c_char_p)
 
 # Local imports
 from websocket_server import WebSocketServer  # noqa: E402
 
 from utils import RateLimitedLogger  # noqa: E402
-import requests  # For REST API calls to nvmultiurisrcbin
+import requests  # For REST API calls to nvmultiurisrcbin  # noqa: E402
 
 # Defer GStreamer initialization to runtime to avoid crashing at import time
 # Some environments (or tracer/proxy setups) can abort during init; doing this
@@ -55,106 +84,255 @@ import requests  # For REST API calls to nvmultiurisrcbin
 
 from config import AppConfig  # noqa: E402
 from reid.stable_id_manager import StableIDManager  # noqa: E402
+from geometry.transform import pixel_to_world, build_align_matrix  # noqa: E402
+from pixel_to_world import (
+    E_to_world_and_R,
+    ray_from_pixel,
+    intersect_floor,
+    bbox_bottom_center,
+)  # noqa: E402
+from pipelines import mapanything_depth_postprocess as ma_depth  # noqa: E402
+
+if TYPE_CHECKING:  # pragma: no cover - import for type checking only
+    from geometry.depth_source import MapAnythingDepthSource
 
 
+DEPTH_ANNOTATOR_TOLERANCE_US = 350_000
 
+_CAPSULE_NEW = ctypes.pythonapi.PyCapsule_New
+_CAPSULE_NEW.restype = ctypes.py_object
+_CAPSULE_NEW.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_void_p]
+_CAPSULE_GET_PTR = ctypes.pythonapi.PyCapsule_GetPointer
+_CAPSULE_GET_PTR.restype = ctypes.c_void_p
+_CAPSULE_GET_PTR.argtypes = [ctypes.py_object, ctypes.c_char_p]
+
+try:
+    NVDS_PREPROCESS_BATCH_META = int(
+        pyds.nvds_get_user_meta_type("NVIDIA.NvDsPreProcessBatchMeta")
+    )
+except Exception:
+    NVDS_PREPROCESS_BATCH_META = None
 
 class DeepStreamVideoPipeline:
     """
     DeepStream-based video pipeline for GPU-accelerated video processing.
-    
+
     This pipeline uses:
     - nvurisrcbin for source handling (RTSP/file/camera)
     - nvmultiurisrcbin for batching
     - nvdspreprocess for GPU preprocessing
     - appsink for tensor output
     """
-    
-    def __init__(self, sources: List[Dict[str, Any]], config: AppConfig, websocket_port: int = 8765, 
-                         config_file: str = "pipelines/config_infer_primary_yolo11.ini",
-        preproc_config: str = "pipelines/config_preproc.ini"):
+
+    def __init__(
+        self,
+        sources: List[Dict[str, Any]],
+        config: AppConfig,
+        websocket_port: int = 8765,
+        config_file: str = "pipelines/config_infer_primary_yolo11.ini",
+        preproc_config: str = "pipelines/config_preproc.ini",
+    ):
         # Initialize GStreamer as early as possible, but at runtime (not module import)
         try:
             Gst.init(None)
         except Exception as e:
             # Provide clearer guidance if init fails
-            raise RuntimeError(f"Failed to initialize GStreamer: {e}.\n"
-                               f"Hints: ensure DeepStream is installed and environment is activated.\n"
-                               f"Try: source ./activate_deepstream.sh and verify gst-inspect-1.0 works.")
+            raise RuntimeError(
+                f"Failed to initialize GStreamer: {e}.\n"
+                f"Hints: ensure DeepStream is installed and environment is activated.\n"
+                f"Try: source ./activate_deepstream.sh and verify gst-inspect-1.0 works."
+            )
 
         # Multi-stream configuration
-        self.sources = [source for source in sources if source.get('enabled', True)]
+        self.sources = [source for source in sources if source.get("enabled", True)]
         self.websocket_port = websocket_port
         self.config_file = config_file
         self.preproc_config = preproc_config
         self.config = config  # Store config as instance variable
         self.logger = logging.getLogger(__name__)
-        
+        self.module_dir = os.path.dirname(os.path.abspath(__file__))
+
+        processing_cfg = getattr(self.config, "processing", None)
+        self.mapanything_preprocess_config = getattr(
+            processing_cfg,
+            "DEEPSTREAM_MAPANYTHING_PREPROCESS_CONFIG",
+            "pipelines/config_preprocess_mapanything_fused.ini",
+        )
+        self.mapanything_sgie_config = getattr(
+            processing_cfg,
+            "DEEPSTREAM_MAPANYTHING_SGIE_CONFIG",
+            "pipelines/config_infer_secondary_mapanything_fused.ini",
+        )
+        self.mapanything_sgie_uid = 22
+        intrinsics_default = os.path.join(
+            self.module_dir, "models/mapanything_depth/intrinsics_table.txt"
+        )
+        self.mapanything_intrinsics_table = getattr(
+            processing_cfg,
+            "MAPANYTHING_INTRINSICS_TABLE",
+            intrinsics_default,
+        )
+        os.environ.setdefault("MA_INTRINSICS_TABLE", self.mapanything_intrinsics_table)
+
+        self.mapanything_preprocess: Optional[Gst.Element] = None
+        self.mapanything_sgie: Optional[Gst.Element] = None
+        self.mapanything_branch_enabled: bool = True
+        default_min_conf = getattr(processing_cfg, "MAPANYTHING_MIN_CONF", None)
+        try:
+            self._mapanything_min_conf = float(default_min_conf)
+        except (TypeError, ValueError):
+            self._mapanything_min_conf = 0.5
+
+        self.depth_source: Optional["MapAnythingDepthSource"] = None
+        self.calibration_bundle: Optional[Dict[str, Any]] = None
+        self.depth_meta_type: int = int(CUSTOM_MDE_META_TYPE)
+        self._depth_annotator_stats = {
+            "pts_hits": 0,
+            "pts_misses": 0,
+            "mde": 0,
+            "floor": 0,
+        }
+        self._depth_annotator_last_log = time.time()
+        self._mapanything_sgie_stats = {
+            "count": 0,
+            "last_log": time.time(),
+            "cam_ids": set(),
+        }
+
+        # Try to load optional C shim for robust ROI→object tensor meta attachment
+        self._shim_attach_tensors = None
+        self._shim_attach_depth_meta = None
+        self._shim_get_last_counts = None
+        self._shim_version = None
+        try:
+            shim_path = os.path.join(self.module_dir, "external/ds_preprocess_shim/libds_preprocess_shim.so")
+            if os.path.exists(shim_path):
+                lib = ctypes.CDLL(shim_path)
+                lib.ds_attach_roi_tensor_to_objects.argtypes = [ctypes.c_void_p, ctypes.c_uint]
+                lib.ds_attach_roi_tensor_to_objects.restype = ctypes.c_int
+                self._shim_attach_tensors = lib.ds_attach_roi_tensor_to_objects
+                lib.ds_preprocess_shim_get_last_counts.argtypes = [
+                    ctypes.POINTER(ctypes.c_int),
+                    ctypes.POINTER(ctypes.c_int),
+                    ctypes.POINTER(ctypes.c_int),
+                ]
+                lib.ds_preprocess_shim_get_last_counts.restype = None
+                self._shim_get_last_counts = lib.ds_preprocess_shim_get_last_counts
+                lib.ds_preprocess_shim_version.argtypes = []
+                lib.ds_preprocess_shim_version.restype = ctypes.c_int
+                try:
+                    self._shim_version = int(lib.ds_preprocess_shim_version())
+                except Exception:
+                    self._shim_version = None
+                lib.ds_attach_depth_payload_v2.argtypes = [
+                    ctypes.c_void_p,  # batch_meta
+                    ctypes.c_void_p,  # obj_meta
+                    ctypes.c_uint,    # meta_type
+                    ctypes.c_longlong,  # pts_us
+                    ctypes.c_char_p,  # method
+                    ctypes.c_double,  # depth_m
+                    ctypes.c_double,  # conf
+                    ctypes.c_int,     # samples
+                    ctypes.POINTER(ctypes.c_double),  # world ptr
+                    ctypes.c_int,     # world len
+                    ctypes.POINTER(ctypes.c_double),  # summary vals
+                    ctypes.POINTER(ctypes.c_int),     # summary mask
+                    ctypes.c_int,     # summary len
+                    ctypes.c_int,     # summary sample count
+                    ctypes.c_int,     # has scale
+                    ctypes.c_double,  # scale
+                    ctypes.POINTER(ctypes.c_double),  # pose ptr
+                    ctypes.c_int,     # pose len
+                ]
+                lib.ds_attach_depth_payload_v2.restype = ctypes.c_int
+                self._shim_attach_depth_meta = lib.ds_attach_depth_payload_v2
+                if self._shim_version is not None:
+                    self.logger.info(
+                        "Loaded DS preprocess shim: %s (version=0x%X)",
+                        shim_path,
+                        self._shim_version,
+                    )
+                else:
+                    self.logger.info("Loaded DS preprocess shim: %s", shim_path)
+                self.logger.debug(
+                    "DS preprocess shim configured for SGIE UID=%d",
+                    self.mapanything_sgie_uid,
+                )
+            else:
+                self.logger.info("DS preprocess shim not found (optional): %s", shim_path)
+        except Exception as e:
+            self.logger.debug("Failed to load DS preprocess shim: %s", e)
+
         # Create sensor_id to camera name mapping for telemetry (use stable 1-based IDs)
         self.source_info = {}
         self.sensor_ids: List[int] = []
         self.source_idx_by_sensor_id: Dict[int, int] = {}
         self.sensor_id_by_source_idx: Dict[int, int] = {}
         for index, source in enumerate(self.sources):
-            sensor_id = int(source.get('sensor_id', index + 1))  # stable, non-zero
+            sensor_id = int(source.get("sensor_id", index + 1))  # stable, non-zero
             self.sensor_ids.append(sensor_id)
             self.source_idx_by_sensor_id[sensor_id] = index
             self.sensor_id_by_source_idx[index] = sensor_id
 
-            camera_name = source.get('name', f'Camera_{sensor_id}')
+            camera_name = source.get("name", f"Camera_{sensor_id}")
             # Extract clean camera name for UI (e.g., "Living Room Camera" -> "living-room")
-            if 'Living Room' in camera_name:
-                clean_name = 'living-room'
-            elif 'Kitchen' in camera_name:
-                clean_name = 'kitchen'
-            elif 'Family Room' in camera_name:
-                clean_name = 'family-room'
+            if "Living Room" in camera_name:
+                clean_name = "living-room"
+            elif "Kitchen" in camera_name:
+                clean_name = "kitchen"
+            elif "Family Room" in camera_name:
+                clean_name = "family-room"
             else:
-                clean_name = camera_name.lower().replace(' ', '-').replace('_', '-')
+                clean_name = camera_name.lower().replace(" ", "-").replace("_", "-")
 
             self.source_info[sensor_id] = {
-                'name': camera_name,
-                'clean_name': clean_name,
-                'url': source.get('url', ''),
-                'width': source.get('width', 1920),
-                'height': source.get('height', 1080)
+                "name": camera_name,
+                "clean_name": clean_name,
+                "url": source.get("url", ""),
+                "width": source.get("width", 1920),
+                "height": source.get("height", 1080),
             }
-        
-        self.logger.info(f"🎥 Initializing multi-stream pipeline with {len(self.sources)} sources:")
+
+        self.logger.info(
+            f"🎥 Initializing multi-stream pipeline with {len(self.sources)} sources:"
+        )
         for sid in self.sensor_ids:
             info = self.source_info[sid]
-            self.logger.info(f"  Sensor {sid}: {info['name']} ({info['clean_name']}) - {info['width']}x{info['height']}")
-        
+            self.logger.info(
+                f"  Sensor {sid}: {info['name']} ({info['clean_name']}) - {info['width']}x{info['height']}"
+            )
+
         # Use rate-limited loggers for different types of messages
-        self.rate_limited_logger = RateLimitedLogger(self.logger, rate_limit_seconds=5.0)
+        self.rate_limited_logger = RateLimitedLogger(
+            self.logger, rate_limit_seconds=5.0
+        )
         self.metadata_logger = RateLimitedLogger(self.logger, rate_limit_seconds=5.0)
         self.tensor_logger = RateLimitedLogger(self.logger, rate_limit_seconds=2.0)
         self.detection_logger = RateLimitedLogger(self.logger, rate_limit_seconds=1.0)
-        
+
         # Initialize pipeline components
         self.pipeline: Optional[Gst.Pipeline] = None
         self.mainloop: Optional[GLib.MainLoop] = None
         self.websocket_server: Optional[WebSocketServer] = None
 
-        
         # Threading and state management
         self.running = False
         self.pipeline_thread: Optional[threading.Thread] = None
         self.websocket_thread: Optional[threading.Thread] = None
-        
 
-        
         # Pipeline configuration - dynamic batch size based on number of sources
         self.batch_size = len(self.sensor_ids)
         # Use largest resolution for muxer output to accommodate all streams
-        self.max_width = max(source.get('width', 1920) for source in self.sources)
-        self.max_height = max(source.get('height', 1080) for source in self.sources)
+        self.max_width = max(source.get("width", 1920) for source in self.sources)
+        self.max_height = max(source.get("height", 1080) for source in self.sources)
         self.device_id = 0
         # Default REST API port for nvmultiurisrcbin
         self.multiurisrc_port = 9000
-        
-        self.logger.info(f"📊 Pipeline config: batch_size={self.batch_size}, resolution={self.max_width}x{self.max_height}")
-        
+
+        self.logger.info(
+            f"📊 Pipeline config: batch_size={self.batch_size}, resolution={self.max_width}x{self.max_height}"
+        )
+
         # Preflight: verify required DeepStream plugins are available with helpful errors
         try:
             registry = Gst.Registry.get()
@@ -164,7 +342,7 @@ class DeepStreamVideoPipeline:
                 ("nvinfer", "DeepStream inference (nvinfer)"),
                 ("nvstreamdemux", "DeepStream stream demux (nvstreamdemux)"),
                 ("nvdsosd", "DeepStream on-screen display (nvdsosd)"),
-                ("nvjpegenc", "NVIDIA JPEG encoder (nvjpegenc)")
+                ("nvjpegenc", "NVIDIA JPEG encoder (nvjpegenc)"),
             ]
             missing = []
             for name, desc in required:
@@ -172,36 +350,45 @@ class DeepStreamVideoPipeline:
                     missing.append(f"{name} – {desc}")
             if missing:
                 hint_env = (
-                    "Required DeepStream plugins not found:\n  - " + "\n  - ".join(missing) +
-                    "\n\nFix: source DeepStream env and set GST paths, e.g.:\n"
+                    "Required DeepStream plugins not found:\n  - "
+                    + "\n  - ".join(missing)
+                    + "\n\nFix: source DeepStream env and set GST paths, e.g.:\n"
                     "  export DEEPSTREAM_DIR=/opt/nvidia/deepstream/deepstream\n"
                     "  export GST_PLUGIN_PATH=$DEEPSTREAM_DIR/lib/gst-plugins:$GST_PLUGIN_PATH\n"
                     "Also verify with: gst-inspect-1.0 nvmultiurisrcbin\n"
                 )
                 raise RuntimeError(hint_env)
-        except Exception as e:
+        except Exception:
             # Bubble up with context so startup reports a clear error instead of aborting
             raise
-        
+
         # Add missing attributes for compatibility
         self.frame_count = 0
         self.frame_count_lock = threading.Lock()
         # The tensor_queue is no longer needed as metadata is extracted via probe
         # JPEG queues for GPU-encoded frames, keyed by sensor_id
-        self.jpeg_queues: Dict[int, queue.Queue[bytes]] = {
+        self.jpeg_queues: Dict[int, queue.Queue[Tuple[bytes, Optional[int]]]] = {
             sensor_id: queue.Queue(maxsize=30) for sensor_id in self.sensor_ids
         }
         self.start_time = 0  # Will be set in start()
-        
+
         # Add tracking history for trail visualization
-        self.trail_history = defaultdict(lambda: deque(maxlen=self.config.visualization.TRAIL_LENGTH))
+        self.trail_history = defaultdict(
+            lambda: deque(maxlen=self.config.visualization.TRAIL_LENGTH)
+        )
         # Respect config default for initial state
-        self.trail_visualization_enabled = bool(self.config.visualization.TRAIL_VISUALIZATION_ENABLED)
-        
+        self.trail_visualization_enabled = bool(
+            self.config.visualization.TRAIL_VISUALIZATION_ENABLED
+        )
+
         # --- trail visualisation state ---
         # Maintain histories per sensor_id to avoid cross-stream overlays
         self.trail_last_seen_by_sensor: Dict[int, Dict[int, float]] = defaultdict(dict)
-        self.trail_history_by_sensor: Dict[int, defaultdict] = defaultdict(lambda: defaultdict(lambda: deque(maxlen=self.config.visualization.TRAIL_LENGTH)))
+        self.trail_history_by_sensor: Dict[int, defaultdict] = defaultdict(
+            lambda: defaultdict(
+                lambda: deque(maxlen=self.config.visualization.TRAIL_LENGTH)
+            )
+        )
         # seconds to keep a disappeared track's trail (configurable)
         self.trail_timeout_s: float = self.config.visualization.TRAIL_TIMEOUT_S
         # draw only on every Nth frame (≥1)
@@ -213,48 +400,75 @@ class DeepStreamVideoPipeline:
         self.live_tracking_state: Dict[int, Dict[str, Any]] = {}
         for sensor_id in self.sensor_ids:
             self.live_tracking_state[sensor_id] = {
-                'active_tracks': [],
-                'occupancy': {},
-                'transitions': []
+                "active_tracks": [],
+                "occupancy": {},
+                "transitions": [],
             }
-        self.logger.info(f"📊 Initialized tracking state for {len(self.sensor_ids)} streams")
+        self.logger.info(
+            f"📊 Initialized tracking state for {len(self.sensor_ids)} streams"
+        )
 
         # --- bbox smoothing state (per sensor_id, per track_id) ---
         try:
             from collections import defaultdict as _dd
-            self._bbox_smooth_by_sensor: Dict[int, Dict[int, Dict[str, Any]]] = _dd(dict)
+
+            self._bbox_smooth_by_sensor: Dict[int, Dict[int, Dict[str, Any]]] = _dd(
+                dict
+            )
         except Exception:
             self._bbox_smooth_by_sensor = {}
-        self.bbox_smoothing_enabled: bool = bool(getattr(self.config.visualization, 'BBOX_SMOOTHING_ENABLED', True))
-        self.bbox_smoothing_alpha: float = float(getattr(self.config.visualization, 'BBOX_SMOOTHING_ALPHA', 0.3))
-        self.bbox_smoothing_anchor: str = str(getattr(self.config.visualization, 'BBOX_SMOOTHING_ANCHOR', 'bottom')).lower()
-        self.bbox_smoothing_max_growth: float = float(getattr(self.config.visualization, 'BBOX_SMOOTHING_MAX_GROWTH', 1.2))
-        self.bbox_smoothing_max_shrink: float = float(getattr(self.config.visualization, 'BBOX_SMOOTHING_MAX_SHRINK', 0.85))
-        self.bbox_max_drop_window_s: float = float(getattr(self.config.visualization, 'BBOX_MAX_DROP_WINDOW_S', 4.0))
-        self.bbox_max_drop_ratio: float = float(getattr(self.config.visualization, 'BBOX_MAX_DROP_RATIO', 0.85))
-        self.trail_max_speed_px_per_s: float = float(getattr(self.config.visualization, 'TRAIL_MAX_SPEED_PX_PER_S', 600.0))
+        self.bbox_smoothing_enabled: bool = bool(
+            getattr(self.config.visualization, "BBOX_SMOOTHING_ENABLED", True)
+        )
+        self.bbox_smoothing_alpha: float = float(
+            getattr(self.config.visualization, "BBOX_SMOOTHING_ALPHA", 0.3)
+        )
+        self.bbox_smoothing_anchor: str = str(
+            getattr(self.config.visualization, "BBOX_SMOOTHING_ANCHOR", "bottom")
+        ).lower()
+        self.bbox_smoothing_max_growth: float = float(
+            getattr(self.config.visualization, "BBOX_SMOOTHING_MAX_GROWTH", 1.2)
+        )
+        self.bbox_smoothing_max_shrink: float = float(
+            getattr(self.config.visualization, "BBOX_SMOOTHING_MAX_SHRINK", 0.85)
+        )
+        self.bbox_max_drop_window_s: float = float(
+            getattr(self.config.visualization, "BBOX_MAX_DROP_WINDOW_S", 4.0)
+        )
+        self.bbox_max_drop_ratio: float = float(
+            getattr(self.config.visualization, "BBOX_MAX_DROP_RATIO", 0.85)
+        )
+        self.trail_max_speed_px_per_s: float = float(
+            getattr(self.config.visualization, "TRAIL_MAX_SPEED_PX_PER_S", 600.0)
+        )
 
         # Global Stable ID manager (OSNet/appearance-based global IDs)
         # Respect REID_ENABLED to avoid loading model and consuming GPU if disabled
         try:
-            self.reid_enabled: bool = bool(getattr(self.config.models, 'REID_ENABLED', True))
+            self.reid_enabled: bool = bool(
+                getattr(self.config.models, "REID_ENABLED", True)
+            )
         except Exception:
             self.reid_enabled = True
 
         self.stable_id_mgr = None
         if self.reid_enabled:
             try:
-                reid_model_path = getattr(self.config.models, 'REID_MODEL_PATH', None)
+                reid_model_path = getattr(self.config.models, "REID_MODEL_PATH", None)
             except Exception:
                 reid_model_path = None
-            device = getattr(self.config.models, 'DEVICE', 'cuda:0')
+            device = getattr(self.config.models, "DEVICE", "cuda:0")
             # Pull model selection and crop size from config
             try:
-                reid_model_name = getattr(self.config.models, 'REID_MODEL_NAME', 'osnet_ibn_x1_0')
+                reid_model_name = getattr(
+                    self.config.models, "REID_MODEL_NAME", "osnet_ibn_x1_0"
+                )
             except Exception:
-                reid_model_name = 'osnet_ibn_x1_0'
+                reid_model_name = "osnet_ibn_x1_0"
             try:
-                img_h, img_w = getattr(self.config.models, 'REID_IMAGE_SIZE', [256, 128])
+                img_h, img_w = getattr(
+                    self.config.models, "REID_IMAGE_SIZE", [256, 128]
+                )
                 image_size = (int(img_h), int(img_w))
             except Exception:
                 image_size = (256, 128)
@@ -264,53 +478,120 @@ class DeepStreamVideoPipeline:
                 device=device,
                 model_name=str(reid_model_name),
                 image_size=image_size,
-                embed_interval_s=float(getattr(self.config.models, 'REID_EMBED_INTERVAL_S', 1.0)),
-                max_ghost_age_s=float(getattr(self.config.models, 'REID_MAX_GHOST_AGE_S', 60.0)),
-                cos_sim_threshold=float(getattr(self.config.models, 'REID_COS_SIM_THRESHOLD', 0.72)),
-                cos_sim_high_threshold=float(getattr(self.config.models, 'REID_COS_SIM_HIGH_THRESHOLD', 0.80)),
-                allow_multi_zone_active=bool(getattr(self.config.models, 'REID_ALLOW_MULTI_ZONE_ACTIVE', True)),
-                crop_expand=float(getattr(self.config.models, 'REID_CROP_EXPAND', 0.12)),
-                tta_flip=bool(getattr(self.config.models, 'REID_TTA_FLIP', True)),
-                min_crop_h=int(getattr(self.config.models, 'REID_MIN_CROP_H', 64)),
-                min_laplacian_var=float(getattr(self.config.models, 'REID_MIN_LAPLACIAN', 12.0)),
-                adaptive_penalty=bool(getattr(self.config.models, 'REID_ADAPTIVE_PENALTY', True)),
-                size_penalty_alpha=float(getattr(self.config.models, 'REID_SIZE_PENALTY_ALPHA', 0.08)),
-                brightness_penalty_beta=float(getattr(self.config.models, 'REID_BRIGHTNESS_PENALTY_BETA', 0.05)),
-                spatial_penalty=bool(getattr(self.config.models, 'REID_SPATIAL_PENALTY', True)),
-                spatial_penalty_delta=float(getattr(self.config.models, 'REID_SPATIAL_PENALTY_DELTA', 0.06)),
-                color_penalty_gamma=float(getattr(self.config.models, 'REID_COLOR_PENALTY_GAMMA', 0.07)),
-                stripe_fusion=bool(getattr(self.config.models, 'REID_STRIPE_FUSION', True)),
-                stripe_count=int(getattr(self.config.models, 'REID_STRIPE_COUNT', 3)),
-                multi_scale_crops=bool(getattr(self.config.models, 'REID_MULTI_SCALE_CROPS', True)),
-                ema_alpha=float(getattr(self.config.models, 'REID_EMA_ALPHA', 0.20)),
-                active_id_guard_strict=bool(getattr(self.config.models, 'REID_ACTIVE_ID_GUARD_STRICT', True)),
-                active_id_guard_margin=float(getattr(self.config.models, 'REID_ACTIVE_ID_GUARD_MARGIN', 0.03)),
-                ghost_strict_age_s=float(getattr(self.config.models, 'REID_GHOST_STRICT_AGE_S', 2.0)),
-                ghost_extra_margin=float(getattr(self.config.models, 'REID_GHOST_EXTRA_MARGIN', 0.03)),
-                max_active_ids_per_sensor=int(getattr(self.config.models, 'REID_MAX_ACTIVE_IDS_PER_SENSOR', 6)),
-                new_id_confirm_frames_at_cap=int(getattr(self.config.models, 'REID_NEW_ID_CONFIRM_FRAMES_AT_CAP', 2)),
-                new_id_hysteresis_frames=int(getattr(self.config.models, 'REID_NEW_ID_HYSTERESIS_FRAMES', 2)),
-                active_evict_grace_s=float(getattr(self.config.models, 'REID_ACTIVE_EVICT_GRACE_S', 10.0)),
-                xcam_handoff_window_s=float(getattr(self.config.models, 'REID_XCAM_HANDOFF_WINDOW_S', 4.0)),
-                xcam_handoff_margin=float(getattr(self.config.models, 'REID_XCAM_HANDOFF_MARGIN', 0.02)),
-                max_total_ids=int(getattr(self.config.models, 'REID_MAX_TOTAL_IDS', 12)),
-                total_id_reuse=bool(getattr(self.config.models, 'REID_TOTAL_ID_REUSE', True)),
-                total_id_reuse_min_age_s=float(getattr(self.config.models, 'REID_TOTAL_ID_REUSE_MIN_AGE_S', 600.0)),
-                sid_pool_file=str(getattr(self.config.models, 'REID_SID_POOL_FILE', '~/.noesis/sid_pool.json')),
+                embed_interval_s=float(
+                    getattr(self.config.models, "REID_EMBED_INTERVAL_S", 1.0)
+                ),
+                max_ghost_age_s=float(
+                    getattr(self.config.models, "REID_MAX_GHOST_AGE_S", 60.0)
+                ),
+                cos_sim_threshold=float(
+                    getattr(self.config.models, "REID_COS_SIM_THRESHOLD", 0.72)
+                ),
+                cos_sim_high_threshold=float(
+                    getattr(self.config.models, "REID_COS_SIM_HIGH_THRESHOLD", 0.80)
+                ),
+                allow_multi_zone_active=bool(
+                    getattr(self.config.models, "REID_ALLOW_MULTI_ZONE_ACTIVE", True)
+                ),
+                crop_expand=float(
+                    getattr(self.config.models, "REID_CROP_EXPAND", 0.12)
+                ),
+                tta_flip=bool(getattr(self.config.models, "REID_TTA_FLIP", True)),
+                min_crop_h=int(getattr(self.config.models, "REID_MIN_CROP_H", 64)),
+                min_laplacian_var=float(
+                    getattr(self.config.models, "REID_MIN_LAPLACIAN", 12.0)
+                ),
+                adaptive_penalty=bool(
+                    getattr(self.config.models, "REID_ADAPTIVE_PENALTY", True)
+                ),
+                size_penalty_alpha=float(
+                    getattr(self.config.models, "REID_SIZE_PENALTY_ALPHA", 0.08)
+                ),
+                brightness_penalty_beta=float(
+                    getattr(self.config.models, "REID_BRIGHTNESS_PENALTY_BETA", 0.05)
+                ),
+                spatial_penalty=bool(
+                    getattr(self.config.models, "REID_SPATIAL_PENALTY", True)
+                ),
+                spatial_penalty_delta=float(
+                    getattr(self.config.models, "REID_SPATIAL_PENALTY_DELTA", 0.06)
+                ),
+                color_penalty_gamma=float(
+                    getattr(self.config.models, "REID_COLOR_PENALTY_GAMMA", 0.07)
+                ),
+                stripe_fusion=bool(
+                    getattr(self.config.models, "REID_STRIPE_FUSION", True)
+                ),
+                stripe_count=int(getattr(self.config.models, "REID_STRIPE_COUNT", 3)),
+                multi_scale_crops=bool(
+                    getattr(self.config.models, "REID_MULTI_SCALE_CROPS", True)
+                ),
+                ema_alpha=float(getattr(self.config.models, "REID_EMA_ALPHA", 0.20)),
+                active_id_guard_strict=bool(
+                    getattr(self.config.models, "REID_ACTIVE_ID_GUARD_STRICT", True)
+                ),
+                active_id_guard_margin=float(
+                    getattr(self.config.models, "REID_ACTIVE_ID_GUARD_MARGIN", 0.03)
+                ),
+                ghost_strict_age_s=float(
+                    getattr(self.config.models, "REID_GHOST_STRICT_AGE_S", 2.0)
+                ),
+                ghost_extra_margin=float(
+                    getattr(self.config.models, "REID_GHOST_EXTRA_MARGIN", 0.03)
+                ),
+                max_active_ids_per_sensor=int(
+                    getattr(self.config.models, "REID_MAX_ACTIVE_IDS_PER_SENSOR", 6)
+                ),
+                new_id_confirm_frames_at_cap=int(
+                    getattr(self.config.models, "REID_NEW_ID_CONFIRM_FRAMES_AT_CAP", 2)
+                ),
+                new_id_hysteresis_frames=int(
+                    getattr(self.config.models, "REID_NEW_ID_HYSTERESIS_FRAMES", 2)
+                ),
+                active_evict_grace_s=float(
+                    getattr(self.config.models, "REID_ACTIVE_EVICT_GRACE_S", 10.0)
+                ),
+                xcam_handoff_window_s=float(
+                    getattr(self.config.models, "REID_XCAM_HANDOFF_WINDOW_S", 4.0)
+                ),
+                xcam_handoff_margin=float(
+                    getattr(self.config.models, "REID_XCAM_HANDOFF_MARGIN", 0.02)
+                ),
+                max_total_ids=int(
+                    getattr(self.config.models, "REID_MAX_TOTAL_IDS", 12)
+                ),
+                total_id_reuse=bool(
+                    getattr(self.config.models, "REID_TOTAL_ID_REUSE", True)
+                ),
+                total_id_reuse_min_age_s=float(
+                    getattr(self.config.models, "REID_TOTAL_ID_REUSE_MIN_AGE_S", 600.0)
+                ),
+                sid_pool_file=str(
+                    getattr(
+                        self.config.models,
+                        "REID_SID_POOL_FILE",
+                        "~/.noesis/sid_pool.json",
+                    )
+                ),
             )
         # Latest per-sensor JPEG bytes for non-blocking crops
         self._latest_jpeg_bytes_by_sensor: Dict[int, bytes] = {}
         # Decode gating for ReID crops (per sensor)
         from collections import defaultdict as _dd
+
         self._last_decode_ts_by_sensor: Dict[int, float] = _dd(float)
         try:
-            self._reid_decode_min_interval_s: float = float(getattr(self.config.models, 'REID_DECODE_MIN_INTERVAL_S', 0.2))
+            self._reid_decode_min_interval_s: float = float(
+                getattr(self.config.models, "REID_DECODE_MIN_INTERVAL_S", 0.2)
+            )
         except Exception:
             self._reid_decode_min_interval_s = 0.2
 
         # Exclusion ROIs parsed from nvdsanalytics exclude config (per DS source index)
         # { stream_index(int): { normalized_label(str): [(x,y), ...] } }
-        self._exclusion_rois_by_stream: Dict[int, Dict[str, List[Tuple[float, float]]]] = {}
+        self._exclusion_rois_by_stream: Dict[
+            int, Dict[str, List[Tuple[float, float]]]
+        ] = {}
 
         # Per-stream per-track zone dwell tracking state
         # { sensor_id: { track_id: { 'current_zone': Optional[str], 'entry_time': Optional[float] } } }
@@ -344,116 +625,134 @@ class DeepStreamVideoPipeline:
         # Local counter for demux probe observations (used to limit early debug logs)
         self._demux_probe_seen: int = 0
 
-        
         # GStreamer already initialized at module import
-        
+
         # Create pipeline elements
         self._create_pipeline()
 
-
-
-
-
     def update_detection_config(self, config_data: Dict[str, Any]) -> bool:
         """Update DeepStream detection configuration in real-time using GObject properties
-        
+
         Args:
             config_data: Dictionary containing detection configuration updates
-            
+
         Returns:
             bool: True if update was successful, False otherwise
         """
         try:
-            if not hasattr(self, 'nvinfer') or not self.nvinfer:
-                self.logger.warning("nvinfer element not available for dynamic configuration")
+            if not hasattr(self, "nvinfer") or not self.nvinfer:
+                self.logger.warning(
+                    "nvinfer element not available for dynamic configuration"
+                )
                 return False
-            
+
             success = True
-            
+
             # Update confidence threshold
-            if 'confidence_threshold' in config_data:
+            if "confidence_threshold" in config_data:
                 try:
-                    new_threshold = float(config_data['confidence_threshold'])
+                    new_threshold = float(config_data["confidence_threshold"])
                     self.nvinfer.set_property("confidence-threshold", new_threshold)
-                    self.logger.info(f"✅ Updated DeepStream confidence threshold to: {new_threshold}")
+                    self.logger.info(
+                        f"✅ Updated DeepStream confidence threshold to: {new_threshold}"
+                    )
                 except Exception as e:
                     self.logger.error(f"❌ Failed to update confidence threshold: {e}")
                     success = False
-            
+
             # Update IOU threshold
-            if 'iou_threshold' in config_data:
+            if "iou_threshold" in config_data:
                 try:
-                    new_iou = float(config_data['iou_threshold'])
+                    new_iou = float(config_data["iou_threshold"])
                     self.nvinfer.set_property("iou-threshold", new_iou)
-                    self.logger.info(f"✅ Updated DeepStream IOU threshold to: {new_iou}")
+                    self.logger.info(
+                        f"✅ Updated DeepStream IOU threshold to: {new_iou}"
+                    )
                 except Exception as e:
                     self.logger.error(f"❌ Failed to update IOU threshold: {e}")
                     success = False
-            
+
             # Update detection enable/disable
-            if 'detection_enabled' in config_data:
+            if "detection_enabled" in config_data:
                 try:
-                    detection_enabled = bool(config_data['detection_enabled'])
+                    detection_enabled = bool(config_data["detection_enabled"])
                     self.nvinfer.set_property("enable", detection_enabled)
-                    self.logger.info(f"✅ Updated DeepStream detection enabled to: {detection_enabled}")
+                    self.logger.info(
+                        f"✅ Updated DeepStream detection enabled to: {detection_enabled}"
+                    )
                 except Exception as e:
                     self.logger.error(f"❌ Failed to update detection enabled: {e}")
                     success = False
-            
+
             # Update target classes via custom properties
-            if 'target_classes' in config_data:
+            if "target_classes" in config_data:
                 try:
-                    new_classes = config_data['target_classes']
+                    new_classes = config_data["target_classes"]
                     if isinstance(new_classes, list):
-                        class_string = ','.join(map(str, new_classes))
-                        self.nvinfer.set_property("custom-lib-props", f"target-classes:{class_string}")
-                        self.logger.info(f"✅ Updated DeepStream target classes to: {new_classes}")
+                        class_string = ",".join(map(str, new_classes))
+                        self.nvinfer.set_property(
+                            "custom-lib-props", f"target-classes:{class_string}"
+                        )
+                        self.logger.info(
+                            f"✅ Updated DeepStream target classes to: {new_classes}"
+                        )
                 except Exception as e:
                     self.logger.error(f"❌ Failed to update target classes: {e}")
                     success = False
-            
+
             return success
-            
+
         except Exception as e:
             self.logger.error(f"❌ Error in update_detection_config: {e}")
             return False
 
     def update_detection_toggle(self, toggle_name: str, enabled: bool) -> bool:
         """Update specific detection toggles using DeepStream GObject properties
-        
+
         Args:
             toggle_name: Name of the detection toggle to update
             enabled: Whether the detection should be enabled
-            
+
         Returns:
             bool: True if update was successful, False otherwise
         """
         try:
-            if not hasattr(self, 'nvinfer') or not self.nvinfer:
-                self.logger.warning("nvinfer element not available for dynamic configuration")
+            if not hasattr(self, "nvinfer") or not self.nvinfer:
+                self.logger.warning(
+                    "nvinfer element not available for dynamic configuration"
+                )
                 return False
-            
+
             # Get current target classes from nvinfer custom properties
             current_classes = []
             try:
                 custom_props = self.nvinfer.get_property("custom-lib-props")
                 if custom_props and "target-classes:" in custom_props:
                     class_string = custom_props.split("target-classes:")[1]
-                    current_classes = [int(x) for x in class_string.split(',') if x.strip()]
+                    current_classes = [
+                        int(x) for x in class_string.split(",") if x.strip()
+                    ]
             except (AttributeError, TypeError, ValueError):
                 # If no custom properties set, assume all classes are enabled
                 current_classes = list(range(80))  # COCO has 80 classes
-            
+
             # Update classes based on toggle
-            if toggle_name == 'detect_people':
+            if toggle_name == "detect_people":
                 class_id = 0  # person class
                 if enabled and class_id not in current_classes:
                     current_classes.append(class_id)
                 elif not enabled and class_id in current_classes:
                     current_classes.remove(class_id)
-                    
-            elif toggle_name == 'detect_vehicles':
-                vehicle_classes = [1, 2, 3, 5, 7, 8]  # bicycle, car, motorcycle, bus, truck, boat
+
+            elif toggle_name == "detect_vehicles":
+                vehicle_classes = [
+                    1,
+                    2,
+                    3,
+                    5,
+                    7,
+                    8,
+                ]  # bicycle, car, motorcycle, bus, truck, boat
                 if enabled:
                     for class_id in vehicle_classes:
                         if class_id not in current_classes:
@@ -462,9 +761,16 @@ class DeepStreamVideoPipeline:
                     for class_id in vehicle_classes:
                         if class_id in current_classes:
                             current_classes.remove(class_id)
-                            
-            elif toggle_name == 'detect_furniture':
-                furniture_classes = [13, 56, 57, 59, 60, 61]  # bench, chair, couch, bed, dining table, toilet
+
+            elif toggle_name == "detect_furniture":
+                furniture_classes = [
+                    13,
+                    56,
+                    57,
+                    59,
+                    60,
+                    61,
+                ]  # bench, chair, couch, bed, dining table, toilet
                 if enabled:
                     for class_id in furniture_classes:
                         if class_id not in current_classes:
@@ -473,85 +779,95 @@ class DeepStreamVideoPipeline:
                     for class_id in furniture_classes:
                         if class_id in current_classes:
                             current_classes.remove(class_id)
-            
+
             # Update DeepStream with new target classes
             if current_classes:
-                class_string = ','.join(map(str, current_classes))
-                self.nvinfer.set_property("custom-lib-props", f"target-classes:{class_string}")
-                self.logger.info(f"✅ Updated DeepStream target classes for {toggle_name}: {current_classes}")
+                class_string = ",".join(map(str, current_classes))
+                self.nvinfer.set_property(
+                    "custom-lib-props", f"target-classes:{class_string}"
+                )
+                self.logger.info(
+                    f"✅ Updated DeepStream target classes for {toggle_name}: {current_classes}"
+                )
                 return True
             else:
                 self.logger.warning(f"⚠️ No classes selected for {toggle_name}")
                 return False
-                
+
         except Exception as e:
             self.logger.error(f"❌ Error in update_detection_toggle: {e}")
             return False
 
     def get_current_detection_config(self) -> Dict[str, Any]:
         """Get current DeepStream detection configuration
-        
+
         Returns:
             Dict containing current detection settings
         """
         try:
             config = {}
-            
-            if hasattr(self, 'nvinfer') and self.nvinfer:
+
+            if hasattr(self, "nvinfer") and self.nvinfer:
                 # Get confidence threshold
                 try:
-                    config['confidence_threshold'] = self.nvinfer.get_property("confidence-threshold")
+                    config["confidence_threshold"] = self.nvinfer.get_property(
+                        "confidence-threshold"
+                    )
                 except (AttributeError, TypeError, ValueError):
-                    config['confidence_threshold'] = 0.3
-                
+                    config["confidence_threshold"] = 0.3
+
                 # Get IOU threshold
                 try:
-                    config['iou_threshold'] = self.nvinfer.get_property("iou-threshold")
+                    config["iou_threshold"] = self.nvinfer.get_property("iou-threshold")
                 except (AttributeError, TypeError, ValueError):
-                    config['iou_threshold'] = 0.45
-                
+                    config["iou_threshold"] = 0.45
+
                 # Get detection enabled status
                 try:
-                    config['detection_enabled'] = self.nvinfer.get_property("enable")
+                    config["detection_enabled"] = self.nvinfer.get_property("enable")
                 except (AttributeError, TypeError, ValueError):
-                    config['detection_enabled'] = True
-                
+                    config["detection_enabled"] = True
+
                 # Get target classes
                 try:
                     custom_props = self.nvinfer.get_property("custom-lib-props")
                     if custom_props and "target-classes:" in custom_props:
                         class_string = custom_props.split("target-classes:")[1]
-                        config['target_classes'] = [int(x) for x in class_string.split(',') if x.strip()]
+                        config["target_classes"] = [
+                            int(x) for x in class_string.split(",") if x.strip()
+                        ]
                     else:
-                        config['target_classes'] = list(range(80))  # All COCO classes
+                        config["target_classes"] = list(range(80))  # All COCO classes
                 except (AttributeError, TypeError, ValueError):
-                    config['target_classes'] = list(range(80))
-            
+                    config["target_classes"] = list(range(80))
+
             return config
-            
+
         except Exception as e:
             self.logger.error(f"❌ Error getting current detection config: {e}")
             return {}
 
     def _check_for_engine_file(self, config_file_path: str):
         """Checks for a pre-built TensorRT engine file and logs whether a rebuild is required.
-        
+
         This method intelligently determines the expected engine path based on:
         1. The actual model file specified in config.models.MODEL_PATH
         2. The engine path specified in the nvinfer config file
         3. Common engine naming patterns
-        
+
         Search locations:
         1. ./models/engines/ (primary location)
         2. ./models/ (fallback location)
         """
         try:
             # Get workspace root for path resolution
-            workspace_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "."))
-            
+            workspace_root = os.path.abspath(
+                os.path.join(os.path.dirname(__file__), ".")
+            )
+
             # Collect candidate engine paths -------------------------------------------------------
             candidate_paths: List[str] = []
-            
+
             # 1) Engine path from nvinfer config file
             engine_path_from_cfg: Optional[str] = None
             try:
@@ -561,75 +877,118 @@ class DeepStreamVideoPipeline:
                             engine_path_from_cfg = line.split("=", 1)[1].strip()
                             break
             except FileNotFoundError:
-                self.logger.warning(f"⚠️  nvinfer config file not found: {config_file_path}")
-            
+                self.logger.warning(
+                    f"⚠️  nvinfer config file not found: {config_file_path}"
+                )
+
             if engine_path_from_cfg:
                 candidate_paths.append(engine_path_from_cfg)
-            
+
             # 2) Generate engine path based on actual model file
-            if hasattr(self.config, "models") and hasattr(self.config.models, "MODEL_PATH"):
+            if hasattr(self.config, "models") and hasattr(
+                self.config.models, "MODEL_PATH"
+            ):
                 model_path = self.config.models.MODEL_PATH
                 if model_path:
                     # Extract model name and generate engine path
                     model_basename = os.path.splitext(os.path.basename(model_path))[0]
-                    
+
                     # Generate multiple possible engine names
                     engine_names = [
                         f"{model_basename}_fp16.engine",  # yolo11m_fp16.engine
-                        f"{model_basename}.engine",       # yolo11m.engine
+                        f"{model_basename}.engine",  # yolo11m.engine
                         f"{model_basename}_b1_gpu0_fp16.engine",  # yolo11m_b1_gpu0_fp16.engine
                         f"{model_basename}.onnx_b1_gpu0_fp16.engine",  # yolo11m.onnx_b1_gpu0_fp16.engine
-                        f"detection_fp16.engine",         # fallback
+                        f"detection_fp16.engine",  # fallback
                     ]
-                    
+
                     # Add to search paths in both locations
                     for engine_name in engine_names:
-                        candidate_paths.extend([
-                            os.path.join("models", "engines", engine_name),
-                            os.path.join("models", engine_name)
-                        ])
-            
+                        candidate_paths.extend(
+                            [
+                                os.path.join("models", "engines", engine_name),
+                                os.path.join("models", engine_name),
+                            ]
+                        )
+
             # 3) Config override (if specified)
-            if hasattr(self.config, "models") and hasattr(self.config.models, "DETECTION_ENGINE_PATH"):
+            if hasattr(self.config, "models") and hasattr(
+                self.config.models, "DETECTION_ENGINE_PATH"
+            ):
                 config_engine_path = self.config.models.DETECTION_ENGINE_PATH
                 if config_engine_path:
                     candidate_paths.insert(0, config_engine_path)  # Priority override
-            
+
             # Resolve & test ----------------------------------------------------------------
             for path in candidate_paths:
                 # Skip empty paths
                 if not path:
                     continue
-                    
+
                 # Resolve relative paths against workspace root
-                abs_path = path if os.path.isabs(path) else os.path.join(workspace_root, path)
-                
+                abs_path = (
+                    path if os.path.isabs(path) else os.path.join(workspace_root, path)
+                )
+
                 if os.path.exists(abs_path):
                     self.logger.info(f"✅ Found existing TensorRT engine: {abs_path}")
-                    self.logger.info(f"✅ Engine file size: {os.path.getsize(abs_path) / (1024*1024):.1f} MB")
+                    self.logger.info(
+                        f"✅ Engine file size: {os.path.getsize(abs_path) / (1024 * 1024):.1f} MB"
+                    )
                     return  # Engine found – no build required
-            
+
             # None of the candidates exist --------------------------------------------------
-            self.logger.warning("⚠️  No existing TensorRT engine found. nvinfer will build a new one (this may take several minutes)...")
+            self.logger.warning(
+                "⚠️  No existing TensorRT engine found. nvinfer will build a new one (this may take several minutes)..."
+            )
             self.logger.info(f"   Searched locations:")
             for path in candidate_paths:
                 if path:
-                    abs_path = path if os.path.isabs(path) else os.path.join(workspace_root, path)
+                    abs_path = (
+                        path
+                        if os.path.isabs(path)
+                        else os.path.join(workspace_root, path)
+                    )
                     self.logger.info(f"   - {abs_path}")
-            
+
             # Log the model that will be used for building
-            if hasattr(self.config, "models") and hasattr(self.config.models, "MODEL_PATH"):
+            if hasattr(self.config, "models") and hasattr(
+                self.config.models, "MODEL_PATH"
+            ):
                 model_path = self.config.models.MODEL_PATH
                 if model_path:
-                    abs_model_path = model_path if os.path.isabs(model_path) else os.path.join(workspace_root, model_path)
+                    abs_model_path = (
+                        model_path
+                        if os.path.isabs(model_path)
+                        else os.path.join(workspace_root, model_path)
+                    )
                     if os.path.exists(abs_model_path):
-                        self.logger.info(f"✅ Will build engine from model: {abs_model_path}")
-                        self.logger.info(f"   Model file size: {os.path.getsize(abs_model_path) / (1024*1024):.1f} MB")
+                        self.logger.info(
+                            f"✅ Will build engine from model: {abs_model_path}"
+                        )
+                        self.logger.info(
+                            f"   Model file size: {os.path.getsize(abs_model_path) / (1024 * 1024):.1f} MB"
+                        )
                     else:
                         self.logger.error(f"❌ Model file not found: {abs_model_path}")
-            
+
         except Exception as e:
             self.logger.error(f"Error during engine-file check: {e}")
+
+
+    def _is_object_excluded(self, obj_meta: "pyds.NvDsObjectMeta") -> bool:
+        """Determine whether an object was flagged for exclusion earlier."""
+        try:
+            if float(getattr(obj_meta, "confidence", 0.0)) < 0.0:
+                return True
+        except Exception:
+            pass
+        try:
+            if int(getattr(obj_meta, "class_id", 0)) < 0:
+                return True
+        except Exception:
+            pass
+        return False
 
     def _remove_excluded_objects_probe(self, pad, info, udata):
         gst_buffer = info.get_buffer()
@@ -653,48 +1012,54 @@ class DeepStreamVideoPipeline:
                 except StopIteration:
                     break
 
-                # Robust exclusion: use configured polygons per stream and require 100% bbox containment
                 try:
                     ds_index = int(frame_meta.source_id)
                 except Exception:
-                    ds_index = int(getattr(frame_meta, 'source_id', 0))
+                    ds_index = int(getattr(frame_meta, "source_id", 0))
 
                 exclusion_polys = self._exclusion_rois_by_stream.get(ds_index, {})
 
-                # Compute bbox corners (axis-aligned)
                 rect = obj_meta.rect_params
-                left, top, width, height = float(rect.left), float(rect.top), float(rect.width), float(rect.height)
+                left, top, width, height = (
+                    float(rect.left),
+                    float(rect.top),
+                    float(rect.width),
+                    float(rect.height),
+                )
                 x2, y2 = left + width, top + height
                 bbox_corners = [(left, top), (x2, top), (x2, y2), (left, y2)]
 
-                # Collect candidate polygons from analytics roiStatus when available
                 candidate_polys: List[List[Tuple[float, float]]] = []
                 l_user = obj_meta.obj_user_meta_list
-                roi_labels_set = set()
                 while l_user:
                     try:
                         user_meta = pyds.NvDsUserMeta.cast(l_user.data)
                     except StopIteration:
                         break
 
-                    if user_meta.base_meta.meta_type == pyds.nvds_get_user_meta_type("NVIDIA.DSANALYTICSOBJ.USER_META"):
+                    if user_meta.base_meta.meta_type == pyds.nvds_get_user_meta_type(
+                        "NVIDIA.DSANALYTICSOBJ.USER_META"
+                    ):
                         ainfo = pyds.NvDsAnalyticsObjInfo.cast(user_meta.user_meta_data)
-                        labels = self._normalize_roi_status_labels(getattr(ainfo, 'roiStatus', None))
-                        roi_labels_set |= labels
+                        labels = self._normalize_roi_status_labels(
+                            getattr(ainfo, "roiStatus", None)
+                        )
                         for lbl in labels:
-                            poly = exclusion_polys.get(lbl)
-                            if poly:
-                                candidate_polys.append(poly)
+                            raw_poly = exclusion_polys.get(lbl)
+                            sanitized = self._sanitize_polygon(raw_poly)
+                            if sanitized is not None:
+                                candidate_polys.append(sanitized)
                     try:
                         l_user = l_user.next
                     except StopIteration:
                         break
 
-                # Fallback: if analytics didn't supply or no matching labels, consider all exclusion polys
                 if not candidate_polys and exclusion_polys:
-                    candidate_polys = list(exclusion_polys.values())
+                    for raw_poly in exclusion_polys.values():
+                        sanitized = self._sanitize_polygon(raw_poly)
+                        if sanitized is not None:
+                            candidate_polys.append(sanitized)
 
-                # Decide removal only if bbox is fully contained in at least one polygon
                 remove = False
                 for poly in candidate_polys:
                     if self._bbox_fully_inside_polygon(bbox_corners, poly):
@@ -703,17 +1068,57 @@ class DeepStreamVideoPipeline:
 
                 if remove:
                     removed_count += 1
-                    pyds.nvds_remove_obj_meta_from_frame(frame_meta, obj_meta)
+                    try:
+                        obj_meta.confidence = float("-inf")
+                        obj_meta.class_id = -1
+                    except Exception:
+                        pass
+                    try:
+                        rect = obj_meta.rect_params
+                        rect.width = 0.0
+                        rect.height = 0.0
+                        rect.border_width = 0
+                    except Exception:
+                        pass
+                    try:
+                        tid = int(getattr(obj_meta, "object_id", -1))
+                    except Exception:
+                        tid = -1
+                    if tid != -1:
+                        try:
+                            self.trail_history.pop(tid, None)
+                        except Exception:
+                            pass
+                        try:
+                            self.track_motion_state_by_sensor.get(ds_index, {}).pop(
+                                tid, None
+                            )
+                        except Exception:
+                            pass
+                        try:
+                            sensor_trails = self.trail_history_by_sensor.get(ds_index)
+                            if sensor_trails is not None:
+                                sensor_trails.pop(tid, None)
+                        except Exception:
+                            pass
+                        try:
+                            last_seen_map = self.trail_last_seen_by_sensor.get(ds_index)
+                            if last_seen_map is not None:
+                                last_seen_map.pop(tid, None)
+                        except Exception:
+                            pass
 
                 l_obj = l_obj_next
-            
+
             try:
                 l_frame = l_frame.next
             except StopIteration:
                 break
-        
+
         if removed_count > 4 and self.frame_count <= 300:
-            self.logger.info(f"Frame {self.frame_count}: Removed {removed_count} objects from exclusion zone.")
+            self.logger.info(
+                f"Frame {self.frame_count}: Flagged {removed_count} objects from exclusion zone."
+            )
 
         return Gst.PadProbeReturn.OK
 
@@ -727,7 +1132,9 @@ class DeepStreamVideoPipeline:
             cfg = configparser.ConfigParser()
             read = cfg.read(path)
             if not read:
-                self.logger.warning(f"⚠️ Exclusion ROI config not found or unreadable: {path}")
+                self.logger.warning(
+                    f"⚠️ Exclusion ROI config not found or unreadable: {path}"
+                )
                 return
             pat = re.compile(r"^roi-filtering-stream-(\d+)$", re.IGNORECASE)
             total = 0
@@ -739,15 +1146,17 @@ class DeepStreamVideoPipeline:
                 sidx = int(m.group(1))
                 rois_by_stream.setdefault(sidx, {})
                 for key, val in cfg.items(section):
-                    if not key.lower().startswith('roi-'):
+                    if not key.lower().startswith("roi-"):
                         continue
-                    label_raw = key[len('roi-'):]
+                    label_raw = key[len("roi-") :]
                     label_norm = self._normalize_roi_label(label_raw)
                     pts = self._parse_points_list(val)
                     if len(pts) >= 3:
                         # Store under both normalized and original forms for robust lookup
                         rois_by_stream[sidx][label_norm] = pts
-                        rois_by_stream[sidx][self._normalize_roi_label('roi-' + label_raw)] = pts
+                        rois_by_stream[sidx][
+                            self._normalize_roi_label("roi-" + label_raw)
+                        ] = pts
                         total += 1
             self._exclusion_rois_by_stream = rois_by_stream
             if total:
@@ -762,7 +1171,7 @@ class DeepStreamVideoPipeline:
         try:
             # Split by delimiters and filter empties
             tokens = re.split(r"[\s;,]+", s.strip())
-            nums = [float(t) for t in tokens if t != '']
+            nums = [float(t) for t in tokens if t != ""]
             pts: List[Tuple[float, float]] = []
             for i in range(0, len(nums) - 1, 2):
                 pts.append((nums[i], nums[i + 1]))
@@ -774,20 +1183,20 @@ class DeepStreamVideoPipeline:
         """Normalize ROI label for consistent matching (case-insensitive, strip 'roi-' prefix)."""
         lbl = str(label).strip()
         # Remove optional leading 'roi-'
-        if lbl.lower().startswith('roi-'):
+        if lbl.lower().startswith("roi-"):
             lbl = lbl[4:]
         return lbl.strip().lower()
 
     def _normalize_roi_status_labels(self, roi_status: Any) -> set:
-        """Normalize various possible roiStatus formats into a set of comparable labels."""
+        """Normalize various roiStatus formats into comparable labels."""
         labels = set()
         try:
             if roi_status is None:
                 return labels
             if isinstance(roi_status, dict):
-                for k, v in roi_status.items():
-                    if v in (1, True, 'IN', 'inside', 'INROI', 'in'):
-                        labels.add(self._normalize_roi_label(k))
+                for key, value in roi_status.items():
+                    if value in (1, True, "IN", "inside", "INROI", "in"):
+                        labels.add(self._normalize_roi_label(key))
             elif isinstance(roi_status, (list, tuple, set)):
                 for item in roi_status:
                     labels.add(self._normalize_roi_label(str(item)))
@@ -799,7 +1208,33 @@ class DeepStreamVideoPipeline:
             pass
         return labels
 
-    def _point_in_polygon(self, x: float, y: float, poly: List[Tuple[float, float]]) -> bool:
+    def _sanitize_polygon(
+        self, poly: Optional[Iterable[Tuple[float, float]]]
+    ) -> Optional[List[Tuple[float, float]]]:
+        if not poly:
+            return None
+        sanitized: List[Tuple[float, float]] = []
+        try:
+            for pt in poly:
+                if pt is None:
+                    return None
+                if isinstance(pt, (list, tuple)) and len(pt) >= 2:
+                    x = float(pt[0])
+                    y = float(pt[1])
+                else:
+                    return None
+                if not math.isfinite(x) or not math.isfinite(y):
+                    return None
+                sanitized.append((x, y))
+        except Exception:
+            return None
+        if len(sanitized) < 3:
+            return None
+        return sanitized
+
+    def _point_in_polygon(
+        self, x: float, y: float, poly: List[Tuple[float, float]]
+    ) -> bool:
         """Ray casting algorithm for point-in-polygon. Includes boundary as inside."""
         inside = False
         n = len(poly)
@@ -813,14 +1248,17 @@ class DeepStreamVideoPipeline:
                 return True
             # Ray intersects segment?
             intersects = ((y1 > y) != (y2 > y)) and (
-                x < (x2 - x1) * (y - y1) / (y2 - y1 + 1e-9) + x1)
+                x < (x2 - x1) * (y - y1) / (y2 - y1 + 1e-9) + x1
+            )
             if intersects:
                 inside = not inside
         return inside
 
-    def _bbox_fully_inside_polygon(self, corners: List[Tuple[float, float]], poly: List[Tuple[float, float]]) -> bool:
+    def _bbox_fully_inside_polygon(
+        self, corners: List[Tuple[float, float]], poly: List[Tuple[float, float]]
+    ) -> bool:
         """Return True if all bbox corners are inside the polygon."""
-        for (px, py) in corners:
+        for px, py in corners:
             if not self._point_in_polygon(px, py, poly):
                 return False
         return True
@@ -828,37 +1266,45 @@ class DeepStreamVideoPipeline:
     def _configure_elements(self, elements: Dict[str, Any]) -> bool:
         """Configure properties for all pipeline elements."""
         try:
-            self.logger.info("------------- Configuring GStreamer Elements-------------")
-            
+            self.logger.info(
+                "------------- Configuring GStreamer Elements-------------"
+            )
+
             bus = self.pipeline.get_bus()
             bus.add_signal_watch()
             bus.connect("message", self._on_bus_message)
 
             # Streammux configuration - dynamic batch size for multi-stream
             # nvmultiurisrcbin (manages sources internally)
-            uri_list = ",".join(self.source_info[sid]['url'] for sid in self.sensor_ids)
+            uri_list = ",".join(self.source_info[sid]["url"] for sid in self.sensor_ids)
             # Use stable 1-based sensor IDs
             sensor_id_list = ",".join(str(sid) for sid in self.sensor_ids)
-            elements['multiurisrc'].set_property("uri-list", uri_list)
-            elements['multiurisrc'].set_property("sensor-id-list", sensor_id_list)
-            elements['multiurisrc'].set_property("max-batch-size", self.batch_size)
-            elements['multiurisrc'].set_property("width", self.max_width)
-            elements['multiurisrc'].set_property("height", self.max_height)
-            elements['multiurisrc'].set_property("batched-push-timeout", 40000)
-            elements['multiurisrc'].set_property("live-source", 1)
-            elements['multiurisrc'].set_property("drop-pipeline-eos", 1)
-            elements['multiurisrc'].set_property("rtsp-reconnect-interval", 30)
-            elements['multiurisrc'].set_property("port", self.multiurisrc_port)
-            elements['multiurisrc'].set_property("ip-address", "localhost")
-            self.logger.info(f"📊 nvmultiurisrcbin configured: max-batch-size={self.batch_size}, resolution={self.max_width}x{self.max_height}")
+            elements["multiurisrc"].set_property("uri-list", uri_list)
+            elements["multiurisrc"].set_property("sensor-id-list", sensor_id_list)
+            elements["multiurisrc"].set_property("max-batch-size", self.batch_size)
+            elements["multiurisrc"].set_property("width", self.max_width)
+            elements["multiurisrc"].set_property("height", self.max_height)
+            elements["multiurisrc"].set_property("batched-push-timeout", 40000)
+            elements["multiurisrc"].set_property("live-source", 1)
+            elements["multiurisrc"].set_property("drop-pipeline-eos", 1)
+            elements["multiurisrc"].set_property("rtsp-reconnect-interval", 30)
+            elements["multiurisrc"].set_property("port", self.multiurisrc_port)
+            elements["multiurisrc"].set_property("ip-address", "localhost")
+            self.logger.info(
+                f"📊 nvmultiurisrcbin configured: max-batch-size={self.batch_size}, resolution={self.max_width}x{self.max_height}"
+            )
 
             # Resolve all config file paths to absolute so startup is independent of CWD
             _root_dir = os.path.dirname(os.path.abspath(__file__))
             # Preprocess config
-            _preproc_cfg = getattr(self.config.processing, 'DEEPSTREAM_PREPROCESS_CONFIG', 'pipelines/config_preproc.ini')
+            _preproc_cfg = getattr(
+                self.config.processing,
+                "DEEPSTREAM_PREPROCESS_CONFIG",
+                "pipelines/config_preproc.ini",
+            )
             if _preproc_cfg and not os.path.isabs(_preproc_cfg):
                 _preproc_cfg = os.path.join(_root_dir, _preproc_cfg)
-            elements['preprocess'].set_property("config-file", _preproc_cfg)
+            elements["preprocess"].set_property("config-file", _preproc_cfg)
 
             # Primary nvinfer config
             _nvinfer_cfg = self.config_file
@@ -866,33 +1312,85 @@ class DeepStreamVideoPipeline:
                 _nvinfer_cfg = os.path.join(_root_dir, _nvinfer_cfg)
             # Use resolved path for engine-file check and element property
             self._check_for_engine_file(_nvinfer_cfg)
-            elements['nvinfer'].set_property("config-file-path", _nvinfer_cfg)
-            elements['nvinfer'].set_property("input-tensor-meta", True)
+            elements["nvinfer"].set_property("config-file-path", _nvinfer_cfg)
+            # Ensure raw tensor outputs can be attached if needed
+            try:
+                elements["nvinfer"].set_property("output-tensor-meta", True)
+            except Exception:
+                pass
+
+            if self.mapanything_branch_enabled:
+                _map_pre_cfg = self.mapanything_preprocess_config
+                if _map_pre_cfg and not os.path.isabs(_map_pre_cfg):
+                    _map_pre_cfg = os.path.join(_root_dir, _map_pre_cfg)
+                elements["mapanything_preprocess"].set_property(
+                    "config-file", _map_pre_cfg
+                )
+                try:
+                    self.logger.debug(
+                        "MapAnything Preprocess: config-file=%s", _map_pre_cfg
+                    )
+                except Exception:
+                    pass
+                _map_sgie_cfg = self.mapanything_sgie_config
+                if _map_sgie_cfg and not os.path.isabs(_map_sgie_cfg):
+                    _map_sgie_cfg = os.path.join(_root_dir, _map_sgie_cfg)
+                elements["mapanything_sgie"].set_property(
+                    "config-file-path", _map_sgie_cfg
+                )
+                
+                # Canonical DS 7.1 settings for SGIE consuming nvdspreprocess tensors
+                try:
+                    elements["mapanything_sgie"].set_property(
+                        "output-tensor-meta", True
+                    )
+                except Exception:
+                    pass
+                try:
+                    elements["mapanything_sgie"].set_property(
+                        "input-tensor-from-meta", True
+                    )
+                except Exception:
+                    pass
+                try:
+                    elements["mapanything_sgie"].set_property(
+                        "input-blob-names", "mapanything_fused"
+                    )
+                except Exception:
+                    pass
 
             # Exclusion analytics
             exclude_cfg_path = "pipelines/config_nvdsanalytics_exclude.ini"
             if exclude_cfg_path and not os.path.isabs(exclude_cfg_path):
                 exclude_cfg_path = os.path.join(_root_dir, exclude_cfg_path)
-            elements['nvdsanalytics_exclude'].set_property("unique-id", 101)
-            elements['nvdsanalytics_exclude'].set_property("config-file", exclude_cfg_path)
+            elements["nvdsanalytics_exclude"].set_property("unique-id", 101)
+            elements["nvdsanalytics_exclude"].set_property(
+                "config-file", exclude_cfg_path
+            )
             # Pre-parse exclusion ROIs for robust containment checks in pad probe
             self._load_exclusion_rois_from_config(exclude_cfg_path)
 
             # Tracker configuration
-            elements['nvtracker'].set_property("ll-lib-file", "/opt/nvidia/deepstream/deepstream/lib/libnvds_nvmultiobjecttracker.so")
-            tracker_config_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "pipelines/config_tracker_nvdcf_batch.yml")
-            elements['nvtracker'].set_property("ll-config-file", tracker_config_path)
+            elements["nvtracker"].set_property(
+                "ll-lib-file",
+                "/opt/nvidia/deepstream/deepstream/lib/libnvds_nvmultiobjecttracker.so",
+            )
+            tracker_config_path = os.path.join(
+                os.path.dirname(os.path.abspath(__file__)),
+                "pipelines/config_tracker_nvdcf_batch.yml",
+            )
+            elements["nvtracker"].set_property("ll-config-file", tracker_config_path)
 
             # Post-tracker analytics
-            elements['nvdsanalytics_post'].set_property("unique-id", 201)
+            elements["nvdsanalytics_post"].set_property("unique-id", 201)
             _post_cfg_path = "pipelines/config_nvdsanalytics_post.ini"
             if _post_cfg_path and not os.path.isabs(_post_cfg_path):
                 _post_cfg_path = os.path.join(_root_dir, _post_cfg_path)
-            elements['nvdsanalytics_post'].set_property("config-file", _post_cfg_path)
-            
+            elements["nvdsanalytics_post"].set_property("config-file", _post_cfg_path)
+
             self.logger.info("✅ All elements configured successfully")
             return True
-            
+
         except Exception as e:
             self.logger.error(f"❌ Error configuring elements: {e}")
             return False
@@ -901,36 +1399,71 @@ class DeepStreamVideoPipeline:
         """Link all main pipeline elements together."""
         try:
             self.logger.info("------------- Linking Main Pipeline Chain-------------")
-            
+
             # Link main processing chain
-            if not elements['multiurisrc'].link(elements['preprocess']): 
+            if not elements["multiurisrc"].link(elements["preprocess"]):
                 raise RuntimeError("Failed to link nvmultiurisrcbin to preprocess")
             else:
                 self.logger.info("TRACE linked nvmultiurisrcbin → preprocess")
-                
-            if not elements['preprocess'].link(elements['nvinfer']): 
+
+            if not elements["preprocess"].link(elements["nvinfer"]):
                 raise RuntimeError("Failed to link preprocess to nvinfer")
-            if not elements['nvinfer'].link(elements['q_after_pgie']): 
+            if not elements["nvinfer"].link(elements["q_after_pgie"]):
                 raise RuntimeError("Failed to link nvinfer to q_after_pgie")
-            if not elements['q_after_pgie'].link(elements['nvdsanalytics_exclude']): 
-                raise RuntimeError("Failed to link q_after_pgie to nvdsanalytics_exclude")
-            if not elements['nvdsanalytics_exclude'].link(elements['q_before_tracker']): 
-                raise RuntimeError("Failed to link nvdsanalytics_exclude to q_before_tracker")
-            if not elements['q_before_tracker'].link(elements['nvtracker']): 
+            if not elements["q_after_pgie"].link(elements["nvdsanalytics_exclude"]):
+                raise RuntimeError(
+                    "Failed to link q_after_pgie to nvdsanalytics_exclude"
+                )
+            if not elements["nvdsanalytics_exclude"].link(elements["q_after_exclude"]):
+                raise RuntimeError(
+                    "Failed to link nvdsanalytics_exclude to q_after_exclude"
+                )
+            if not elements["q_after_exclude"].link(elements["mapanything_preprocess"]):
+                raise RuntimeError(
+                    "Failed to link q_after_exclude to mapanything_preprocess"
+                )
+            if not elements["mapanything_preprocess"].link(elements["mapanything_sgie"]):
+                raise RuntimeError(
+                    "Failed to link mapanything_preprocess to mapanything_sgie"
+                )
+            # Add probe to check objects fed to SGIE input
+            map_pre_src = elements["mapanything_preprocess"].get_static_pad("src")
+            if map_pre_src:
+                map_pre_src.add_probe(
+                    Gst.PadProbeType.BUFFER, self._sgie_input_probe, None
+                )
+                self.logger.info(
+                    "✅ Added SGIE input probe to mapanything_preprocess src pad"
+                )
+            if not elements["mapanything_sgie"].link(elements["q_before_tracker"]):
+                raise RuntimeError("Failed to link mapanything_sgie to q_before_tracker")
+            if not elements["q_before_tracker"].link(elements["nvtracker"]):
                 raise RuntimeError("Failed to link q_before_tracker to nvtracker")
-            if not elements['nvtracker'].link(elements['q_after_tracker']): 
+            if not elements["nvtracker"].link(elements["q_after_tracker"]):
                 raise RuntimeError("Failed to link nvtracker to q_after_tracker")
-            if not elements['q_after_tracker'].link(elements['nvdsanalytics_post']): 
-                raise RuntimeError("Failed to link q_after_tracker to nvdsanalytics_post")
-            if not elements['nvdsanalytics_post'].link(elements['demux']): 
+            if not elements["q_after_tracker"].link(elements["nvdsanalytics_post"]):
+                raise RuntimeError(
+                    "Failed to link q_after_tracker to nvdsanalytics_post"
+                )
+            if not elements["nvdsanalytics_post"].link(elements["demux"]):
                 raise RuntimeError("Failed to link nvdsanalytics_post to demux")
 
             self.logger.info("✅ Main pipeline chain linked successfully")
             return True
-            
+
         except Exception as e:
             self.logger.error(f"❌ Error linking pipeline chain: {e}")
             return False
+
+    def set_mapanything_intrinsics_table(self, path: str) -> None:
+        if not path:
+            return
+        self.mapanything_intrinsics_table = path
+        os.environ["MA_INTRINSICS_TABLE"] = path
+
+    def open_mapanything_branch(self) -> None:
+        # Branch remains active; retained for API compatibility
+        self.logger.debug("MapAnything branch already active (fused SGIE path).")
 
     def _create_pipeline(self) -> bool:
         """Create the DeepStream GStreamer pipeline using refactored helper functions."""
@@ -942,17 +1475,40 @@ class DeepStreamVideoPipeline:
                 raise RuntimeError("Failed to create pipeline")
 
             # Create primary elements
-            multiurisrc = Gst.ElementFactory.make("nvmultiurisrcbin", "nvmultiurisrcbin")
+            multiurisrc = Gst.ElementFactory.make(
+                "nvmultiurisrcbin", "nvmultiurisrcbin"
+            )
             preprocess = Gst.ElementFactory.make("nvdspreprocess", "nvdspreprocess")
             nvinfer = Gst.ElementFactory.make("nvinfer", "nvinfer")
-            
-            # Analytics and Tracking
-            nvdsanalytics_exclude = Gst.ElementFactory.make("nvdsanalytics", "nvdsanalytics_exclude")
-            nvtracker = Gst.ElementFactory.make("nvtracker", "nvtracker")
-            nvdsanalytics_post = Gst.ElementFactory.make("nvdsanalytics", "nvdsanalytics_post")
-            
+            mapanything_branch_enabled = True
 
-            
+            mapanything_preprocess = Gst.ElementFactory.make(
+                "nvdspreprocess", "mapanything_preprocess"
+            )
+            if not mapanything_preprocess:
+                raise RuntimeError(
+                    "Required GStreamer element 'nvdspreprocess' not found. "
+                    "Ensure DeepStream preprocess plugin is installed."
+                )
+
+            mapanything_sgie = Gst.ElementFactory.make(
+                "nvinfer", "mapanything_sgie_fused"
+            )
+            if not mapanything_sgie:
+                raise RuntimeError(
+                    "Required GStreamer element 'nvinfer' not found. "
+                    "Ensure DeepStream inference plugin is installed."
+                )
+
+            # Analytics and Tracking
+            nvdsanalytics_exclude = Gst.ElementFactory.make(
+                "nvdsanalytics", "nvdsanalytics_exclude"
+            )
+            nvtracker = Gst.ElementFactory.make("nvtracker", "nvtracker")
+            nvdsanalytics_post = Gst.ElementFactory.make(
+                "nvdsanalytics", "nvdsanalytics_post"
+            )
+
             # Demuxer (per-branch OSD will be created downstream)
             demux = Gst.ElementFactory.make("nvstreamdemux", "nvstreamdemux")
             if not demux:
@@ -960,33 +1516,66 @@ class DeepStreamVideoPipeline:
 
             # Queues for pipeline robustness
             q_after_pgie = Gst.ElementFactory.make("queue", "q_after_pgie")
+            q_after_exclude = Gst.ElementFactory.make("queue", "q_after_exclude")
             q_before_tracker = Gst.ElementFactory.make("queue", "q_before_tracker")
             q_after_tracker = Gst.ElementFactory.make("queue", "q_after_tracker")
 
             # Validate element creation
             element_list = [
-                multiurisrc, preprocess, nvinfer, nvdsanalytics_exclude, nvtracker, nvdsanalytics_post,
-                demux, q_after_pgie, q_before_tracker, q_after_tracker
+                multiurisrc,
+                preprocess,
+                nvinfer,
+                mapanything_preprocess,
+                mapanything_sgie,
+                nvdsanalytics_exclude,
+                nvtracker,
+                nvdsanalytics_post,
+                demux,
+                q_after_pgie,
+                q_after_exclude,
+                q_before_tracker,
+                q_after_tracker,
             ]
-            
+
             if not all(element_list):
                 element_names = [
-                    "nvmultiurisrcbin", "nvdspreprocess", "nvinfer", "nvdsanalytics_exclude", "nvtracker", 
-                    "nvdsanalytics_post", "nvstreamdemux",
-                    "q_after_pgie", "q_before_tracker", "q_after_tracker"
+                    "nvmultiurisrcbin",
+                    "nvdspreprocess",
+                    "nvinfer",
+                    "mapanything_preprocess",
+                    "mapanything_sgie_fused",
+                    "nvdsanalytics_exclude",
+                    "nvtracker",
+                    "nvdsanalytics_post",
+                    "nvstreamdemux",
+                    "q_after_pgie",
+                    "q_after_exclude",
+                    "q_before_tracker",
+                    "q_after_tracker",
                 ]
                 for el, name in zip(element_list, element_names):
-                    if not el: self.logger.error(f"❌ Failed to create element: {name}")
+                    if not el:
+                        self.logger.error(f"❌ Failed to create element: {name}")
                 raise RuntimeError("Failed to create one or more GStreamer elements.")
             self.logger.info("✅ All GStreamer elements created successfully.")
 
+            self.mapanything_branch_enabled = mapanything_branch_enabled
+
             # Create elements dictionary for helper functions
             elements = {
-                'multiurisrc': multiurisrc, 'preprocess': preprocess, 'nvinfer': nvinfer,
-                'nvdsanalytics_exclude': nvdsanalytics_exclude, 'nvtracker': nvtracker, 
-                'nvdsanalytics_post': nvdsanalytics_post, 'demux': demux,
-                'q_after_pgie': q_after_pgie, 'q_before_tracker': q_before_tracker, 
-                'q_after_tracker': q_after_tracker
+                "multiurisrc": multiurisrc,
+                "preprocess": preprocess,
+                "nvinfer": nvinfer,
+                "mapanything_preprocess": mapanything_preprocess,
+                "mapanything_sgie": mapanything_sgie,
+                "nvdsanalytics_exclude": nvdsanalytics_exclude,
+                "nvtracker": nvtracker,
+                "nvdsanalytics_post": nvdsanalytics_post,
+                "demux": demux,
+                "q_after_pgie": q_after_pgie,
+                "q_after_exclude": q_after_exclude,
+                "q_before_tracker": q_before_tracker,
+                "q_after_tracker": q_after_tracker,
             }
 
             # --- Phase B: Configure Elements ---
@@ -1000,18 +1589,28 @@ class DeepStreamVideoPipeline:
 
             # --- Phase D: Setup Probes ---
             self.logger.info("------------- Setting Up Buffer Probes-------------")
-            
+
             # Telemetry Probe for metadata extraction
             analytics_src_pad = nvdsanalytics_post.get_static_pad("src")
-            if not analytics_src_pad: raise RuntimeError("Failed to get nvdsanalytics_post source pad")
-            analytics_src_pad.add_probe(Gst.PadProbeType.BUFFER, self._analytics_probe, 0)
-            self.logger.info("✅ Added buffer probe to nvdsanalytics_post source pad for telemetry extraction")
-            
+            if not analytics_src_pad:
+                raise RuntimeError("Failed to get nvdsanalytics_post source pad")
+            analytics_src_pad.add_probe(
+                Gst.PadProbeType.BUFFER, self._analytics_probe, 0
+            )
+            self.logger.info(
+                "✅ Added buffer probe to nvdsanalytics_post source pad for telemetry extraction"
+            )
+
             # Pad probe to remove excluded objects
             exclude_src_pad = nvdsanalytics_exclude.get_static_pad("src")
-            if not exclude_src_pad: raise RuntimeError("Failed to get nvdsanalytics_exclude source pad")
-            exclude_src_pad.add_probe(Gst.PadProbeType.BUFFER, self._remove_excluded_objects_probe, None)
-            self.logger.info("✅ Added buffer probe to nvdsanalytics_exclude source pad for object removal")
+            if not exclude_src_pad:
+                raise RuntimeError("Failed to get nvdsanalytics_exclude source pad")
+            exclude_src_pad.add_probe(
+                Gst.PadProbeType.BUFFER, self._remove_excluded_objects_probe, None
+            )
+            self.logger.info(
+                "✅ Added buffer probe to nvdsanalytics_exclude source pad for object removal"
+            )
 
             # Per-branch OSD probe will be attached in per-stream branches
 
@@ -1020,42 +1619,76 @@ class DeepStreamVideoPipeline:
             # Optional: Add probe to demux sink pad to trace buffer flow for first few frames
             demux_sink = demux.get_static_pad("sink")
             if demux_sink:
-                self.logger.debug("Adding buffer probe to demux sink pad (limited logging)")
-                demux_sink.add_probe(Gst.PadProbeType.BUFFER, self._demux_debug_probe, None)
+                self.logger.debug(
+                    "Adding buffer probe to demux sink pad (limited logging)"
+                )
+                demux_sink.add_probe(
+                    Gst.PadProbeType.BUFFER, self._demux_debug_probe, None
+                )
 
             # --- Phase E: Link Main Pipeline Chain ---
             if not self._build_main_pipeline_chain(elements):
                 raise RuntimeError("Failed to link main pipeline chain")
 
             # Store references early for downstream setup that accesses them
-            self.multiurisrc, self.preprocess, self.nvinfer, self.nvtracker = multiurisrc, preprocess, nvinfer, nvtracker
-            self.nvdsanalytics_exclude, self.nvdsanalytics_post = nvdsanalytics_exclude, nvdsanalytics_post
+            self.multiurisrc, self.preprocess, self.nvinfer, self.nvtracker = (
+                multiurisrc,
+                preprocess,
+                nvinfer,
+                nvtracker,
+            )
+            self.mapanything_preprocess = mapanything_preprocess
+            self.mapanything_sgie = mapanything_sgie
+            self.nvdsanalytics_exclude, self.nvdsanalytics_post = (
+                nvdsanalytics_exclude,
+                nvdsanalytics_post,
+            )
+            try:
+                self.logger.debug(
+                    "SGIE unique-id=%s",
+                    mapanything_sgie.get_property("unique-id"),
+                )
+            except Exception:
+                pass
             self.demux = demux
+
+            if self.mapanything_branch_enabled:
+                sgie_src_pad = mapanything_sgie.get_static_pad("src")
+                if sgie_src_pad:
+                    sgie_src_pad.add_probe(
+                        Gst.PadProbeType.BUFFER, self._mapanything_depth_probe, None
+                    )
+                    self.logger.info(
+                        "✅ Added MapAnything fused SGIE probe to mapanything_sgie_fused src pad"
+                    )
+                else:
+                    self.logger.warning(
+                        "⚠️ Unable to attach MapAnything SGIE probe – src pad unavailable"
+                    )
+            else:
+                self.logger.info(
+                    "ℹ️ MapAnything SGIE branch disabled; skipping depth probe attachment"
+                )
 
             # --- Phase F: Calibrate demux pads and build per-stream branches with per-branch OSD ---
             self._calibrate_demux_pad_source_map()
-            self.logger.info("🎥 Building per-stream branches with per-branch OSD and JPEG appsinks")
+            self.logger.info(
+                "🎥 Building per-stream branches with per-branch OSD and JPEG appsinks"
+            )
             self._setup_stream_branches()
 
             # --- Finalization ---
             self.logger.info("✅ Pipeline construction complete.")
-            
+
             return True
-            
+
         except Exception as e:
             self.logger.error(f"❌ Failed to create pipeline: {e}")
             import traceback
+
             self.logger.error(f"Full Traceback: {traceback.format_exc()}")
             return False
-    
 
-
-
-
-
-
-
-    
     def _analytics_probe(self, pad, info, user_data):
         """Probe to extract telemetry data after analytics."""
         gst_buffer = info.get_buffer()
@@ -1079,6 +1712,866 @@ class DeepStreamVideoPipeline:
         # Periodic stats broadcast (1 Hz) remains enabled via WebSocketServer.
         return Gst.PadProbeReturn.OK
 
+    def _mapanything_depth_probe(self, pad, info, user_data=None):
+        """Decode MapAnything SGIE tensors and attach depth metadata."""
+        gst_buffer = info.get_buffer()
+        if not gst_buffer:
+            return Gst.PadProbeReturn.OK
+
+        batch_meta = pyds.gst_buffer_get_nvds_batch_meta(hash(gst_buffer))
+        if not batch_meta:
+            return Gst.PadProbeReturn.OK
+
+        buf_pts_ns = getattr(gst_buffer, "pts", None)
+        buf_pts_us = None
+        if buf_pts_ns not in (None, Gst.CLOCK_TIME_NONE):
+            buf_pts_us = int(int(buf_pts_ns) // 1_000)
+
+        min_conf = float(
+            getattr(self.depth_source, "min_conf", self._mapanything_min_conf)
+        )
+
+        l_frame = batch_meta.frame_meta_list
+        while l_frame:
+            try:
+                frame_meta = pyds.NvDsFrameMeta.cast(l_frame.data)
+            except StopIteration:
+                break
+            except Exception:
+                l_frame = l_frame.next
+                continue
+
+            # Log batch-level user meta types once per frame for correlation
+            try:
+                batch_types = []
+                l_batch_user = getattr(batch_meta, "batch_user_meta_list", None)
+                while l_batch_user:
+                    try:
+                        bu = pyds.NvDsUserMeta.cast(l_batch_user.data)
+                        tval = None
+                        try:
+                            tval = int(getattr(bu.base_meta, "meta_type", None))
+                        except Exception:
+                            tval = None
+                        batch_types.append(tval)
+                    except Exception:
+                        pass
+                    l_batch_user = getattr(l_batch_user, "next", None)
+                self.logger.debug(
+                    "Depth probe: batch user meta types=%s", batch_types
+                )
+            except Exception:
+                pass
+
+            pts_us = None
+            frame_pts_ns = getattr(frame_meta, "buf_pts", None)
+            if frame_pts_ns not in (None, 0, Gst.CLOCK_TIME_NONE):
+                pts_us = int(int(frame_pts_ns) // 1_000)
+            elif buf_pts_us is not None:
+                pts_us = buf_pts_us
+
+            ds_index = int(getattr(frame_meta, "source_id", -1))
+            sensor_id = self.sensor_id_by_source_idx.get(ds_index)
+            if sensor_id is None:
+                l_frame = l_frame.next
+                continue
+
+            cam_info = self.source_info.get(sensor_id, {})
+            cam_id = str(
+                cam_info.get("clean_name") or cam_info.get("name") or sensor_id
+            )
+
+            self._depth_annotator_stats["pts_hits"] += 1
+
+            l_obj = frame_meta.obj_meta_list
+            if False and self._shim_attach_tensors is not None:
+                try:
+                    attached = int(
+                        self._shim_attach_tensors(
+                            ctypes.c_void_p(pyds.get_ptr(batch_meta)),
+                            ctypes.c_uint(self.mapanything_sgie_uid),
+                        )
+                    )
+                    if (
+                        self._shim_get_last_counts is not None
+                        and self.logger.isEnabledFor(logging.DEBUG)
+                    ):
+                        try:
+                            roi_count = ctypes.c_int()
+                            candidate_count = ctypes.c_int()
+                            attached_count = ctypes.c_int()
+                            self._shim_get_last_counts(
+                                ctypes.byref(roi_count),
+                                ctypes.byref(candidate_count),
+                                ctypes.byref(attached_count),
+                            )
+                            self.logger.debug(
+                                "Depth probe: shim stats roi=%d candidates=%d attached=%d",
+                                roi_count.value,
+                                candidate_count.value,
+                                attached_count.value,
+                            )
+                        except Exception:
+                            pass
+                    if attached > 0:
+                        self.logger.debug(
+                            "Depth probe: shim attached %d tensor metas to objects",
+                            attached,
+                        )
+                        # Dump object meta types after shim for verification
+                        debug_obj_types = []
+                        l_obj_dbg = frame_meta.obj_meta_list
+                        while l_obj_dbg:
+                            try:
+                                obj_dbg = pyds.NvDsObjectMeta.cast(l_obj_dbg.data)
+                                if self._is_object_excluded(obj_dbg):
+                                    l_obj_dbg = l_obj_dbg.next
+                                    continue
+                                types = []
+                                meta_list = obj_dbg.obj_user_meta_list
+                                while meta_list:
+                                    um = pyds.NvDsUserMeta.cast(meta_list.data)
+                                    try:
+                                        types.append(int(getattr(um.base_meta, "meta_type", None)))
+                                    except Exception:
+                                        types.append(None)
+                                    meta_list = meta_list.next
+                                debug_obj_types.append(
+                                    (
+                                        getattr(obj_dbg, "object_id", None),
+                                        types,
+                                    )
+                                )
+                            except Exception:
+                                pass
+                            l_obj_dbg = l_obj_dbg.next
+                        if debug_obj_types:
+                            self.logger.debug(
+                                "Depth probe: post-shim obj meta types=%s", debug_obj_types
+                            )
+                except Exception as e:
+                    self.logger.debug("Depth probe: shim invocation failed: %s", e)
+
+            while l_obj:
+                try:
+                    obj_meta = pyds.NvDsObjectMeta.cast(l_obj.data)
+                except StopIteration:
+                    break
+                except Exception:
+                    l_obj = l_obj.next
+                    continue
+
+                if self._is_object_excluded(obj_meta):
+                    l_obj = l_obj.next
+                    continue
+
+                try:
+                    if int(getattr(obj_meta, "object_id", -1)) == -1:
+                        l_obj = l_obj.next
+                        continue
+                except Exception:
+                    l_obj = l_obj.next
+                    continue
+
+                # Skip if depth meta already attached
+                has_depth_meta = False
+                user_meta_iter = getattr(obj_meta, "obj_user_meta_list", None)
+                while user_meta_iter:
+                    um = pyds.NvDsUserMeta.cast(user_meta_iter.data)
+                    try:
+                        if int(getattr(um.base_meta, "meta_type", -1)) == int(
+                            self.depth_meta_type
+                        ):
+                            has_depth_meta = True
+                            break
+                    except Exception:
+                        pass
+                    user_meta_iter = user_meta_iter.next
+                if has_depth_meta:
+                    l_obj = l_obj.next
+                    continue
+
+                try:
+                    self.logger.debug(
+                        "Depth probe: sensor=%s obj_id=%s class=%s comp_id=%s",
+                        cam_id,
+                        getattr(obj_meta, "object_id", None),
+                        getattr(obj_meta, "class_id", None),
+                        getattr(obj_meta, "unique_component_id", None),
+                    )
+                    classifier_meta = getattr(obj_meta, "classifier_meta_list", None)
+                    if classifier_meta:
+                        comp_ids = []
+                        l_classifier = classifier_meta
+                        while l_classifier:
+                            classifier = pyds.NvDsClassifierMeta.cast(l_classifier.data)
+                            comp_ids.append(getattr(classifier, "unique_component_id", None))
+                            l_classifier = l_classifier.next
+                        self.logger.debug(
+                            "Depth probe: classifier_meta component_ids=%s",
+                            comp_ids,
+                        )
+                except Exception:
+                    pass
+
+                # Debug: Log obj_meta user_meta types
+                obj_meta_types = []
+                try:
+                    user_meta_list = obj_meta.obj_user_meta_list
+                    while user_meta_list:
+                        user_meta = pyds.NvDsUserMeta.cast(user_meta_list.data)
+                        try:
+                            obj_meta_types.append(int(user_meta.base_meta.meta_type))
+                        except Exception:
+                            obj_meta_types.append(None)
+                        user_meta_list = user_meta_list.next
+                    self.logger.debug(
+                        "Depth probe: obj_meta user_meta types=%s for obj_id=%s",
+                        obj_meta_types,
+                        getattr(obj_meta, "object_id", None),
+                    )
+                except Exception:
+                    self.logger.debug("Depth probe: No obj_user_meta_list for obj_id=%s", getattr(obj_meta, "object_id", None))
+
+                tensor_meta, _ = self._find_tensor_meta_for_obj(
+                    batch_meta, frame_meta, obj_meta, self.mapanything_sgie_uid
+                )
+                if not tensor_meta:
+                    # Diagnostic: scan frame-level user meta for any tensor metas and log their UIDs
+                    try:
+                        uids = []
+                        fu = getattr(frame_meta, "frame_user_meta_list", None)
+                        while fu:
+                            try:
+                                um = pyds.NvDsUserMeta.cast(fu.data)
+                                mtype = None
+                                try:
+                                    mtype = int(getattr(um.base_meta, "meta_type", -1))
+                                except Exception:
+                                    mtype = None
+                                if (
+                                    mtype is not None
+                                    and mtype
+                                    == int(pyds.NvDsMetaType.NVDSINFER_TENSOR_OUTPUT_META)
+                                ):
+                                    tm = pyds.NvDsInferTensorMeta.cast(um.user_meta_data)
+                                    if tm:
+                                        uids.append(int(getattr(tm, "unique_id", -1)))
+                            except Exception:
+                                pass
+                            fu = getattr(fu, "next", None)
+                        if uids:
+                            self.logger.debug(
+                                "Depth probe: frame-level tensor metas present with UIDs=%s",
+                                uids,
+                            )
+                    except Exception:
+                        pass
+                    try:
+                        self.logger.debug(
+                            "Depth probe: no tensor meta for obj_id=%s (uid=%s)",
+                            getattr(obj_meta, "object_id", None),
+                            self.mapanything_sgie_uid,
+                        )
+                    except Exception:
+                        pass
+                    l_obj = l_obj.next
+                    continue
+
+                layers = self._tensor_layers_from_meta(tensor_meta)
+                if not layers:
+                    try:
+                        self.logger.debug(
+                            "Depth probe: tensor meta empty for obj_id=%s",
+                            getattr(obj_meta, "object_id", None),
+                        )
+                    except Exception:
+                        pass
+                    l_obj = l_obj.next
+                    continue
+
+                try:
+                    self.logger.debug(
+                        "Depth probe: layers for obj_id=%s -> %s",
+                        getattr(obj_meta, "object_id", None),
+                        list(layers.keys()),
+                    )
+                except Exception:
+                    pass
+
+                bundle = ma_depth.select_layers(layers)
+                depth_map = ma_depth.squeeze_hw(bundle.depth)
+                if depth_map is None or depth_map.size == 0:
+                    try:
+                        self.logger.debug(
+                            "Depth probe: no depth map for obj_id=%s",
+                            getattr(obj_meta, "object_id", None),
+                        )
+                    except Exception:
+                        pass
+                    l_obj = l_obj.next
+                    continue
+
+                conf_map = ma_depth.squeeze_hw(bundle.confidence)
+                mask_map = ma_depth.squeeze_hw(bundle.mask)
+                summary = ma_depth.compute_depth_summary(
+                    depth_map, conf_map, mask_map, min_conf=min_conf
+                )
+
+                rect = obj_meta.rect_params
+                bbox_tuple = (
+                    float(rect.left),
+                    float(rect.top),
+                    float(rect.width),
+                    float(rect.height),
+                )
+                anchor = bbox_bottom_center(
+                    [rect.left, rect.top, rect.width, rect.height]
+                ) or (
+                    float(rect.left + rect.width * 0.5),
+                    float(rect.top + rect.height),
+                )
+
+                depth_indices = ma_depth.anchor_to_depth_indices(
+                    anchor, bbox_tuple, depth_map.shape
+                )
+                depth_val, conf_val, sample_count = ma_depth.sample_depth_window(
+                    depth_map,
+                    depth_indices,
+                    window_sizes=(7, 11),
+                    confidence=conf_map,
+                    mask=mask_map,
+                    min_conf=min_conf,
+                )
+
+                if depth_val <= 0.0 and summary["median"] > 0.0:
+                    depth_val = summary["median"]
+                    conf_val = summary["conf_mean"]
+                    sample_count = summary["sample_count"]
+
+                method_name = "mde"
+                world = None
+                if depth_val > 0.0:
+                    try:
+                        world = self._to_world_from_snap(
+                            cam_id, anchor[0], anchor[1], depth_val, {}
+                        )
+                    except Exception:
+                        world = None
+                    if world is None:
+                        world = self._floor_intersect_world(
+                            cam_id, anchor[0], anchor[1], None
+                        )
+                else:
+                    method_name = "floor"
+                    floor_world = self._floor_intersect_world(
+                        cam_id, anchor[0], anchor[1], None
+                    )
+                    if floor_world is not None:
+                        world = floor_world
+                        depth_val = float(
+                            math.sqrt(
+                                floor_world[0] ** 2
+                                + floor_world[1] ** 2
+                                + floor_world[2] ** 2
+                            )
+                        )
+                        conf_val = float(
+                            self._sanitize_float(conf_val) or min_conf
+                        )
+                        sample_count = 0
+                    else:
+                        depth_val = 0.0
+
+                self._record_mapanything_sgie_detection(cam_id)
+                try:
+                    depth_clean = self._sanitize_float(depth_val)
+                    if depth_clean is None:
+                        depth_clean = 0.0
+                    conf_clean = self._sanitize_float(conf_val)
+                    if conf_clean is None:
+                        conf_clean = 0.0
+
+                    world_vals: Optional[List[float]] = None
+                    if world and len(world) == 3:
+                        sanitized_world = [self._sanitize_float(val) for val in world]
+                        if all(val is not None for val in sanitized_world):
+                            world_vals = [float(val) for val in sanitized_world if val is not None]
+
+                    summary_keys = ("median", "p10", "p90", "conf_mean", "valid_ratio")
+                    summary_vals_arr: List[float] = [0.0] * len(summary_keys)
+                    summary_mask_arr: List[int] = [0] * len(summary_keys)
+                    summary_sample_count = -1
+                    if summary:
+                        for idx, key in enumerate(summary_keys):
+                            sanitized = self._sanitize_float(summary.get(key))
+                            if sanitized is not None:
+                                summary_vals_arr[idx] = float(sanitized)
+                                summary_mask_arr[idx] = 1
+                        if "sample_count" in summary:
+                            try:
+                                summary_sample_count = int(summary.get("sample_count", -1))
+                            except Exception:
+                                summary_sample_count = -1
+
+                    scale_val = ma_depth.sanitize_scale(bundle.scale)
+                    scale_clean = self._sanitize_float(scale_val)
+                    has_scale = 1 if scale_clean is not None else 0
+                    if scale_clean is None:
+                        scale_clean = 0.0
+
+                    pose_vals = ma_depth.sanitize_pose(bundle.pose)
+
+                    attached_depth_meta = False
+                    if self._shim_attach_depth_meta is not None:
+                        pts_arg = ctypes.c_longlong(pts_us if pts_us is not None else -1)
+                        method_bytes = method_name.encode("utf-8") if method_name else b"floor"
+                        method_c = ctypes.c_char_p(method_bytes)
+
+                        world_len = 0
+                        if world_vals and len(world_vals) == 3:
+                            world_array = (ctypes.c_double * 3)(*world_vals)
+                            world_ptr = world_array
+                            world_len = 3
+                        else:
+                            world_array = None
+                            world_ptr = None
+
+                        summary_len = 0
+                        if any(summary_mask_arr):
+                            summary_len = len(summary_vals_arr)
+                            summary_vals_array = (ctypes.c_double * summary_len)(*summary_vals_arr)
+                            summary_mask_array = (ctypes.c_int * summary_len)(*summary_mask_arr)
+                            summary_vals_ptr = summary_vals_array
+                            summary_mask_ptr = summary_mask_array
+                        else:
+                            summary_vals_array = None
+                            summary_mask_array = None
+                            summary_vals_ptr = None
+                            summary_mask_ptr = None
+
+                        pose_len = 0
+                        if pose_vals:
+                            pose_len = len(pose_vals)
+                            pose_array = (ctypes.c_double * pose_len)(*pose_vals)
+                            pose_ptr = pose_array
+                        else:
+                            pose_array = None
+                            pose_ptr = None
+
+                        try:
+                            res = int(
+                                self._shim_attach_depth_meta(
+                                    ctypes.c_void_p(pyds.get_ptr(batch_meta)),
+                                    ctypes.c_void_p(pyds.get_ptr(obj_meta)),
+                                    ctypes.c_uint(self.depth_meta_type),
+                                    pts_arg,
+                                    method_c,
+                                    ctypes.c_double(depth_clean),
+                                    ctypes.c_double(conf_clean),
+                                    ctypes.c_int(int(sample_count)),
+                                    world_ptr,
+                                    ctypes.c_int(world_len),
+                                    summary_vals_ptr,
+                                    summary_mask_ptr,
+                                    ctypes.c_int(summary_len),
+                                    ctypes.c_int(summary_sample_count),
+                                    ctypes.c_int(has_scale),
+                                    ctypes.c_double(scale_clean),
+                                    pose_ptr,
+                                    ctypes.c_int(pose_len),
+                                )
+                            )
+                            attached_depth_meta = res > 0
+                        except Exception as attach_exc:
+                            self.logger.debug(
+                                "Depth probe: shim depth payload attach failed: %s",
+                                attach_exc,
+                            )
+
+                    if attached_depth_meta:
+                        try:
+                            self.logger.debug(
+                                "Depth probe: attached payload for obj_id=%s method=%s depth=%.3f conf=%.3f samples=%s",
+                                getattr(obj_meta, "object_id", None),
+                                method_name,
+                                depth_clean,
+                                conf_clean,
+                                sample_count,
+                            )
+                        except Exception:
+                            pass
+                    if method_name == "mde" and depth_val > 0.0:
+                        self._depth_annotator_stats["mde"] += 1
+                    else:
+                        self._depth_annotator_stats["floor"] += 1
+                except Exception as exc:
+                    self.logger.debug(
+                        f"Depth user meta attach failed for {cam_id}: {exc}"
+                    )
+
+                l_obj = l_obj.next
+
+            l_frame = l_frame.next
+
+        self._maybe_log_depth_annotator_stats()
+        self._maybe_log_mapanything_sgie_stats()
+        return Gst.PadProbeReturn.OK
+
+    def _sgie_input_probe(self, pad, info, user_data=None):
+        """Probe to log objects fed to SGIE input."""
+        gst_buffer = info.get_buffer()
+        if not gst_buffer:
+            return Gst.PadProbeReturn.OK
+
+        batch_meta = pyds.gst_buffer_get_nvds_batch_meta(hash(gst_buffer))
+        if not batch_meta:
+            self.logger.debug("SGIE input probe: No batch_meta")
+            return Gst.PadProbeReturn.OK
+
+        obj_count = 0
+        l_frame = batch_meta.frame_meta_list
+        while l_frame:
+            try:
+                frame_meta = pyds.NvDsFrameMeta.cast(l_frame.data)
+                obj_count += self._count_objects(frame_meta)
+            except Exception as e:
+                self.logger.debug(f"SGIE input probe: Error processing frame: {e}")
+            l_frame = l_frame.next
+
+        self.logger.debug(f"SGIE input probe: {obj_count} objects in batch")
+        return Gst.PadProbeReturn.OK
+
+    def _count_objects(self, frame_meta) -> int:
+        """Count class=0 objects in a frame."""
+        count = 0
+        l_obj = frame_meta.obj_meta_list
+        while l_obj:
+            try:
+                obj_meta = pyds.NvDsObjectMeta.cast(l_obj.data)
+                if getattr(obj_meta, "class_id", -1) == 0:
+                    count += 1
+            except Exception:
+                pass
+            l_obj = l_obj.next
+        return count
+
+    def _tensor_from_user_meta(
+        self, user_meta: Optional["pyds.NvDsUserMeta"], unique_id: int
+    ) -> Optional["pyds.NvDsInferTensorMeta"]:
+        if not user_meta:
+            return None
+        tensor_meta: Optional["pyds.NvDsInferTensorMeta"] = None
+        try:
+            tensor_meta = pyds.NvDsInferTensorMeta.cast(user_meta.user_meta_data)
+        except Exception:
+            tensor_meta = None
+        if tensor_meta and int(getattr(tensor_meta, "unique_id", -1)) == int(unique_id):
+            return tensor_meta
+
+        seg_meta: Optional["pyds.NvDsInferSegmentationMeta"] = None
+        try:
+            seg_meta = pyds.NvDsInferSegmentationMeta.cast(user_meta.user_meta_data)
+        except Exception:
+            seg_meta = None
+        if seg_meta is not None:
+            tensor_from_seg = self._convert_segmentation_meta_to_tensor(seg_meta)
+            if tensor_from_seg and int(getattr(tensor_from_seg, "unique_id", -1)) == int(
+                unique_id
+            ):
+                return tensor_from_seg
+        return None
+
+    def _find_tensor_meta_for_obj(
+        self, batch_meta, frame_meta, obj_meta, unique_id: int
+    ) -> Tuple[Optional["pyds.NvDsInferTensorMeta"], Optional[Dict[str, Any]]]:
+        # --- Step 1: object-level meta (works for many SGIE cases) ---
+        user_meta_list = getattr(obj_meta, "obj_user_meta_list", None)
+        while user_meta_list:
+            u = pyds.NvDsUserMeta.cast(user_meta_list.data)
+            try:
+                if int(u.base_meta.meta_type) == int(  # type: ignore[attr-defined]
+                    pyds.NvDsMetaType.NVDSINFER_TENSOR_OUTPUT_META
+                ):
+                    t = pyds.NvDsInferTensorMeta.cast(u.user_meta_data)
+                    if t and int(getattr(t, "unique_id", -1)) == int(unique_id):
+                        return t, None
+            except Exception:
+                pass
+            user_meta_list = getattr(user_meta_list, "next", None)
+
+        # --- Legacy frame-level tensor meta (existing fallback) ---
+        frame_user = getattr(frame_meta, "frame_user_meta_list", None)
+        while frame_user:
+            try:
+                fu = pyds.NvDsUserMeta.cast(frame_user.data)
+                tensor_meta = self._tensor_from_user_meta(fu, unique_id)
+                if tensor_meta:
+                    return tensor_meta, None
+            except Exception:
+                pass
+            frame_user = getattr(frame_user, "next", None)
+
+        return None, None
+
+    def _tensor_layers_from_meta(
+        self, tensor_meta: "pyds.NvDsInferTensorMeta"
+    ) -> Dict[str, np.ndarray]:
+        layers: Dict[str, np.ndarray] = {}
+        try:
+            num_layers = int(getattr(tensor_meta, "num_output_layers", 0))
+        except Exception:
+            num_layers = 0
+        for idx in range(num_layers):
+            try:
+                layer_info = pyds.get_nvds_LayerInfo(tensor_meta, idx)
+            except Exception:
+                continue
+            name = getattr(layer_info, "layerName", f"layer_{idx}")
+            if isinstance(name, bytes):
+                try:
+                    name = name.decode("utf-8", "ignore")
+                except Exception:
+                    name = f"layer_{idx}"
+            dims = getattr(layer_info, "inferDims", None)
+            shape: List[int] = []
+            if dims is not None:
+                try:
+                    num_dims = int(dims.numDims)
+                except Exception:
+                    num_dims = 0
+                for d in range(num_dims):
+                    try:
+                        dim_val = int(dims.d[d])
+                    except Exception:
+                        dim_val = 1
+                    shape.append(max(dim_val, 1))
+            if not shape:
+                try:
+                    total = int(layer_info.layerDims.numElements)
+                except Exception:
+                    total = 0
+                shape = [max(total, 1)]
+            try:
+                ptr = pyds.get_ptr(layer_info.buffer)
+            except Exception:
+                ptr = None
+            if not ptr:
+                continue
+            size = int(np.prod(shape, dtype=np.int64))
+            if size <= 0:
+                continue
+
+            ctype_scalar = ctypes.c_float
+            if hasattr(pyds, "NvDsInferDataType"):
+                data_type = getattr(layer_info, "dataType", None)
+                if data_type == pyds.NvDsInferDataType.INT8:
+                    ctype_scalar = ctypes.c_int8
+                elif data_type == getattr(pyds.NvDsInferDataType, "UINT8", None):
+                    ctype_scalar = ctypes.c_uint8
+                elif data_type == pyds.NvDsInferDataType.INT32:
+                    ctype_scalar = ctypes.c_int32
+                elif data_type == getattr(pyds.NvDsInferDataType, "HALF", None):
+                    ctype_scalar = ctypes.c_uint16
+                else:
+                    ctype_scalar = ctypes.c_float
+
+            try:
+                ctype_array = ctypes.cast(ptr, ctypes.POINTER(ctype_scalar))
+                np_array = np.ctypeslib.as_array(ctype_array, shape=(size,))
+                layers[str(name)] = np.array(np_array, copy=True).reshape(shape)
+            except Exception as exc:
+                self.logger.debug("Failed to copy tensor layer %s: %s", name, exc)
+        return layers
+
+    @staticmethod
+    def _convert_segmentation_meta_to_tensor(seg_meta):
+        """Placeholder to adapt segmentation meta if DS provides it."""
+        return None
+
+    @staticmethod
+    def _sanitize_float(value: Optional[float]) -> Optional[float]:
+        if value is None:
+            return None
+        try:
+            val = float(value)
+        except Exception:
+            return None
+        if not math.isfinite(val):
+            return None
+        return val
+
+    def _bundle_K(self, cam_id: str) -> Optional[np.ndarray]:
+        bundle = self.calibration_bundle
+        if not isinstance(bundle, dict):
+            return None
+        cameras = (
+            bundle.get("cameras") if isinstance(bundle.get("cameras"), dict) else None
+        )
+        if isinstance(cameras, dict):
+            k_table = cameras.get("K") if isinstance(cameras.get("K"), dict) else None
+            if isinstance(k_table, dict) and cam_id in k_table:
+                try:
+                    K = np.array(k_table[cam_id], dtype=float)
+                    return K.reshape((3, 3)) if K.size == 9 else K
+                except Exception:
+                    pass
+            cam_entry = cameras.get(cam_id)
+            if isinstance(cam_entry, dict):
+                for key in ("intrinsics", "K", "K3x3"):
+                    value = cam_entry.get(key)
+                    if value is None:
+                        continue
+                    try:
+                        K = np.array(value, dtype=float)
+                        return K.reshape((3, 3)) if K.size == 9 else K
+                    except Exception:
+                        continue
+        return None
+
+    def _bundle_E(self, cam_id: str) -> Optional[List[float]]:
+        bundle = self.calibration_bundle
+        if not isinstance(bundle, dict):
+            return None
+        cameras = (
+            bundle.get("cameras") if isinstance(bundle.get("cameras"), dict) else None
+        )
+        if isinstance(cameras, dict):
+            e_table = cameras.get("E") if isinstance(cameras.get("E"), dict) else None
+            if isinstance(e_table, dict) and cam_id in e_table:
+                value = e_table.get(cam_id)
+                if isinstance(value, list) and len(value) == 16:
+                    return value
+            cam_entry = cameras.get(cam_id)
+            if isinstance(cam_entry, dict):
+                maybe = cam_entry.get("extrinsics")
+                if isinstance(maybe, dict):
+                    value = maybe.get("E") or maybe.get("matrix")
+                    if isinstance(value, list) and len(value) == 16:
+                        return value
+        return None
+
+    def _bundle_align(self) -> Optional[Dict[str, Any]]:
+        bundle = self.calibration_bundle
+        if isinstance(bundle, dict):
+            align = bundle.get("align")
+            if isinstance(align, dict):
+                return align
+        return None
+
+    def _to_world_from_snap(
+        self,
+        cam_id: str,
+        u: float,
+        v: float,
+        depth_m: float,
+        snap: Dict[str, Any],
+    ) -> Optional[List[float]]:
+        if depth_m <= 0.0:
+            return None
+        K = snap.get("K")
+        if K is None:
+            K = snap.get("intrinsics")
+        if K is None:
+            K = snap.get("native_intrinsics")
+        if K is None:
+            K = self._bundle_K(cam_id)
+        if K is None:
+            return None
+        E = snap.get("E")
+        if E is None:
+            E = self._bundle_E(cam_id)
+        if E is None:
+            return None
+        align = self._bundle_align()
+        try:
+            world = pixel_to_world(u, v, depth_m, cam_id, K, E, align)
+            return [float(world[0]), float(world[1]), float(world[2])]
+        except Exception:
+            return None
+
+    def _floor_intersect_world(
+        self,
+        cam_id: str,
+        u: float,
+        v: float,
+        snap: Optional[Dict[str, Any]] = None,
+    ) -> Optional[List[float]]:
+        K = None
+        if snap:
+            K = snap.get("K")
+            if K is None:
+                K = snap.get("intrinsics")
+            if K is None:
+                K = snap.get("native_intrinsics")
+        if K is None:
+            K = self._bundle_K(cam_id)
+        E = None
+        if snap:
+            E = snap.get("E")
+        if E is None:
+            E = self._bundle_E(cam_id)
+        if K is None or E is None:
+            return None
+        try:
+            K_mat = np.array(K, dtype=float).reshape((3, 3))
+        except Exception:
+            return None
+        pose = E_to_world_and_R(E)
+        if pose is None:
+            return None
+        C_world, R_wc = pose
+        try:
+            origin, direction = ray_from_pixel(u, v, K_mat, C_world, R_wc)
+        except Exception:
+            return None
+        align = self._bundle_align()
+        floor_y = float((align or {}).get("floor_y") or 0.0)
+        hit = intersect_floor(origin, direction, floor_y)
+        if hit is None:
+            return None
+        align_matrix = build_align_matrix(align)
+        point = np.array([hit[0], hit[1], hit[2], 1.0], dtype=float)
+        aligned = align_matrix @ point
+        return [float(aligned[0]), float(aligned[1]), float(aligned[2])]
+
+    def _maybe_log_depth_annotator_stats(self) -> None:
+        now = time.time()
+        if (now - self._depth_annotator_last_log) < 5.0:
+            return
+        stats = self._depth_annotator_stats
+        self.logger.debug(
+            "Depth annotator stats: hits=%s misses=%s mde=%s floor=%s",
+            stats["pts_hits"],
+            stats["pts_misses"],
+            stats["mde"],
+            stats["floor"],
+        )
+        stats.update({"pts_hits": 0, "pts_misses": 0, "mde": 0, "floor": 0})
+        self._depth_annotator_last_log = now
+
+    def _record_mapanything_sgie_detection(self, cam_id: str) -> None:
+        stats = self._mapanything_sgie_stats
+        stats["count"] += 1
+        stats["cam_ids"].add(cam_id)
+
+    def _maybe_log_mapanything_sgie_stats(self) -> None:
+        stats = self._mapanything_sgie_stats
+        now = time.time()
+        elapsed = now - stats["last_log"]
+        if elapsed < 1.0:
+            return
+        count = stats["count"]
+        sources = ", ".join(sorted(stats["cam_ids"])) if stats["cam_ids"] else "none"
+        self.logger.debug(
+            "MapAnything SGIE processed %d detections over %.2fs (sources=%s)",
+            count,
+            elapsed,
+            sources,
+        )
+        stats["count"] = 0
+        stats["cam_ids"].clear()
+        stats["last_log"] = now
 
     def _extract_analytics_frame_meta(self, frame_meta) -> Optional[Dict[str, Any]]:
         """Extract analytics frame metadata"""
@@ -1086,13 +2579,17 @@ class DeepStreamVideoPipeline:
             user_meta_list = frame_meta.frame_user_meta_list
             while user_meta_list:
                 user_meta = pyds.NvDsUserMeta.cast(user_meta_list.data)  # type: ignore
-                if user_meta.base_meta.meta_type == pyds.nvds_get_user_meta_type("NVIDIA.DSANALYTICSFRAME.USER_META"):  # type: ignore
-                    analytics_frame_meta = pyds.NvDsAnalyticsFrameMeta.cast(user_meta.user_meta_data)  # type: ignore
+                if user_meta.base_meta.meta_type == pyds.nvds_get_user_meta_type(
+                    "NVIDIA.DSANALYTICSFRAME.USER_META"
+                ):  # type: ignore
+                    analytics_frame_meta = pyds.NvDsAnalyticsFrameMeta.cast(
+                        user_meta.user_meta_data
+                    )  # type: ignore
                     return {
-                        'objects_in_roi': analytics_frame_meta.objInROIcnt,
-                        'line_crossing_cumulative': analytics_frame_meta.objLCCumCnt,
-                        'line_crossing_current': analytics_frame_meta.objLCCurrCnt,
-                        'overcrowding_status': analytics_frame_meta.ocStatus
+                        "objects_in_roi": analytics_frame_meta.objInROIcnt,
+                        "line_crossing_cumulative": analytics_frame_meta.objLCCumCnt,
+                        "line_crossing_current": analytics_frame_meta.objLCCurrCnt,
+                        "overcrowding_status": analytics_frame_meta.ocStatus,
                     }
                 try:
                     user_meta_list = user_meta_list.next
@@ -1102,26 +2599,30 @@ class DeepStreamVideoPipeline:
         except Exception as e:
             self.logger.debug(f"Error extracting analytics frame meta: {e}")
             return None
-    
+
     def _extract_analytics_obj_meta(self, obj_meta) -> Optional[Dict[str, Any]]:
         """Extract analytics object metadata and normalize key names"""
         try:
             user_meta_list = obj_meta.obj_user_meta_list
             while user_meta_list:
                 user_meta = pyds.NvDsUserMeta.cast(user_meta_list.data)  # type: ignore
-                if user_meta.base_meta.meta_type == pyds.nvds_get_user_meta_type("NVIDIA.DSANALYTICSOBJ.USER_META"):  # type: ignore
-                    analytics_obj_meta = pyds.NvDsAnalyticsObjInfo.cast(user_meta.user_meta_data)  # type: ignore
+                if user_meta.base_meta.meta_type == pyds.nvds_get_user_meta_type(
+                    "NVIDIA.DSANALYTICSOBJ.USER_META"
+                ):  # type: ignore
+                    analytics_obj_meta = pyds.NvDsAnalyticsObjInfo.cast(
+                        user_meta.user_meta_data
+                    )  # type: ignore
                     # Normalize to DeepStream SDK key casing so downstream logic works
                     return {
-                        'dirStatus': analytics_obj_meta.dirStatus,
-                        'lcStatus': analytics_obj_meta.lcStatus,
-                        'ocStatus': analytics_obj_meta.ocStatus,
-                        'roiStatus': analytics_obj_meta.roiStatus,
+                        "dirStatus": analytics_obj_meta.dirStatus,
+                        "lcStatus": analytics_obj_meta.lcStatus,
+                        "ocStatus": analytics_obj_meta.ocStatus,
+                        "roiStatus": analytics_obj_meta.roiStatus,
                         # Retain legacy snake_case keys for backward compatibility
-                        'direction_status': analytics_obj_meta.dirStatus,
-                        'line_crossing_status': analytics_obj_meta.lcStatus,
-                        'overcrowding_status': analytics_obj_meta.ocStatus,
-                        'roi_status': analytics_obj_meta.roiStatus
+                        "direction_status": analytics_obj_meta.dirStatus,
+                        "line_crossing_status": analytics_obj_meta.lcStatus,
+                        "overcrowding_status": analytics_obj_meta.ocStatus,
+                        "roi_status": analytics_obj_meta.roiStatus,
                     }
                 try:
                     user_meta_list = user_meta_list.next
@@ -1132,7 +2633,63 @@ class DeepStreamVideoPipeline:
             self.logger.debug(f"Error extracting analytics object meta: {e}")
             return None
 
-
+    def _extract_depth_meta(self, obj_meta) -> Optional[Dict[str, Any]]:
+        """Extract MapAnything depth annotation from user meta."""
+        try:
+            user_meta_list = obj_meta.obj_user_meta_list
+            while user_meta_list:
+                user_meta = pyds.NvDsUserMeta.cast(user_meta_list.data)  # type: ignore
+                meta_type = None
+                try:
+                    meta_type = (
+                        user_meta.base_meta.meta_type
+                        if user_meta and user_meta.base_meta
+                        else None
+                    )
+                except Exception:
+                    meta_type = None
+                try:
+                    self.logger.debug(
+                        "Inspecting user meta: type=%s(%s) obj_id=%s",
+                        meta_type,
+                        int(meta_type) if meta_type is not None else None,
+                        getattr(obj_meta, "object_id", None),
+                    )
+                except Exception:
+                    pass
+                mtype_val = None
+                try:
+                    mtype_val = int(meta_type)
+                except Exception:
+                    mtype_val = None
+                # Only handle the MapAnything depth meta type we own; skip others.
+                if mtype_val is not None and mtype_val == int(CUSTOM_MDE_META_TYPE):
+                    data_ptr = ctypes.cast(user_meta.user_meta_data, ctypes.c_void_p).value
+                    if data_ptr:
+                        try:
+                            raw = ctypes.string_at(data_ptr).decode("utf-8", "ignore").rstrip("\x00")
+                            payload = json.loads(raw)
+                            if isinstance(payload, dict) and "mde" in payload:
+                                entry = payload["mde"]
+                                if isinstance(entry, dict):
+                                    try:
+                                        self.logger.debug(
+                                            "Extracted depth meta for obj_id=%s: %s",
+                                            getattr(obj_meta, "object_id", None),
+                                            entry,
+                                        )
+                                    except Exception:
+                                        pass
+                                    return entry
+                        except Exception:
+                            pass
+                try:
+                    user_meta_list = user_meta_list.next
+                except StopIteration:
+                    break
+        except Exception as exc:
+            self.logger.debug(f"Depth meta extraction failed: {exc}")
+        return None
 
     def _parse_obj_meta(self, frame_meta) -> List[Dict[str, Any]]:
         """Return list(dict) with keys class_id, confidence, bbox, object_id, and analytics data."""
@@ -1140,14 +2697,16 @@ class DeepStreamVideoPipeline:
         active_tracks = []
         occupancy = {}
         transitions = []
-        
+
         # Normalize DeepStream 0-based index to configured 1-based sensor_id
         ds_index = int(frame_meta.source_id)
         sensor_id = self.sensor_id_by_source_idx.get(ds_index, ds_index)
-        
+
         # Keep a copy of previous occupancy to detect vacates
         try:
-            prev_occupancy = dict(self.live_tracking_state.get(sensor_id, {}).get('occupancy', {}))
+            prev_occupancy = dict(
+                self.live_tracking_state.get(sensor_id, {}).get("occupancy", {})
+            )
         except Exception:
             prev_occupancy = {}
 
@@ -1159,8 +2718,11 @@ class DeepStreamVideoPipeline:
         present_ds_ids: List[int] = []
         while l_obj:
             obj = pyds.NvDsObjectMeta.cast(l_obj.data)  # type: ignore
+            if self._is_object_excluded(obj):
+                l_obj = l_obj.next
+                continue
             rect = obj.rect_params
-            
+
             # Basic detection data
             detection = {
                 "class_id": obj.class_id,
@@ -1168,190 +2730,217 @@ class DeepStreamVideoPipeline:
                 "bbox": [rect.left, rect.top, rect.width, rect.height],
                 "object_id": obj.object_id,
             }
-            
+
             # Build tracking data for telemetry
             track_dict = {
-                'track_id': obj.object_id,
-                'camera_id': f"camera_{sensor_id}",
-                'confidence': obj.confidence,
-                'bbox': [rect.left, rect.top, rect.width, rect.height],
-                'class_id': obj.class_id
+                "track_id": obj.object_id,
+                "camera_id": f"camera_{sensor_id}",
+                "confidence": obj.confidence,
+                "bbox": [rect.left, rect.top, rect.width, rect.height],
+                "class_id": obj.class_id,
             }
-            
+
             # Compute center point
             center_x = rect.left + rect.width / 2
             center_y = rect.top + rect.height / 2
-            track_dict['center'] = [center_x, center_y]
+            track_dict["center"] = [center_x, center_y]
 
             # Estimate velocity (px/s) using per-track motion state with short moving average
             try:
-                motion_state = self.track_motion_state_by_sensor.setdefault(sensor_id, {}).setdefault(obj.object_id, {
-                    'last_center': None,
-                    'last_ts': None,
-                    'vel_hist': deque(maxlen=5)
-                })
-                last_center = motion_state.get('last_center')
-                last_ts = motion_state.get('last_ts')
+                motion_state = self.track_motion_state_by_sensor.setdefault(
+                    sensor_id, {}
+                ).setdefault(
+                    obj.object_id,
+                    {"last_center": None, "last_ts": None, "vel_hist": deque(maxlen=5)},
+                )
+                last_center = motion_state.get("last_center")
+                last_ts = motion_state.get("last_ts")
                 if last_center is not None and last_ts is not None:
                     dt = max(1e-3, now_ts - float(last_ts))
                     vx = (center_x - float(last_center[0])) / dt
                     vy = (center_y - float(last_center[1])) / dt
-                    motion_state['vel_hist'].append((vx, vy))
+                    motion_state["vel_hist"].append((vx, vy))
                     # Compute average velocity over history
-                    if motion_state['vel_hist']:
-                        hvx = sum(v[0] for v in motion_state['vel_hist']) / len(motion_state['vel_hist'])
-                        hvy = sum(v[1] for v in motion_state['vel_hist']) / len(motion_state['vel_hist'])
-                        track_dict['velocity'] = [hvx, hvy]
+                    if motion_state["vel_hist"]:
+                        hvx = sum(v[0] for v in motion_state["vel_hist"]) / len(
+                            motion_state["vel_hist"]
+                        )
+                        hvy = sum(v[1] for v in motion_state["vel_hist"]) / len(
+                            motion_state["vel_hist"]
+                        )
+                        track_dict["velocity"] = [hvx, hvy]
                 # Update state
-                motion_state['last_center'] = [center_x, center_y]
-                motion_state['last_ts'] = now_ts
+                motion_state["last_center"] = [center_x, center_y]
+                motion_state["last_ts"] = now_ts
             except Exception:
                 # Never allow velocity estimation errors to break telemetry
                 pass
-            
+
             # Add tracker confidence if available
-            if hasattr(obj, 'tracker_confidence'):
-                track_dict['tracker_confidence'] = obj.tracker_confidence
-            
+            if hasattr(obj, "tracker_confidence"):
+                track_dict["tracker_confidence"] = obj.tracker_confidence
+
             active_tracks.append(track_dict)
-            
+
+            depth_meta = self._extract_depth_meta(obj)
+
             # Phase 3.3: Add analytics metadata if available
             analytics_data = self._extract_analytics_obj_meta(obj)
             if analytics_data:
                 detection["analytics"] = analytics_data
-                
+
                 # Extract occupancy and transition data from analytics
-                if 'roiStatus' in analytics_data:
-                    roi_status = analytics_data['roiStatus']
-                    #self.logger.debug(f"📊 ROI status: {roi_status}")
+                if "roiStatus" in analytics_data:
+                    roi_status = analytics_data["roiStatus"]
 
                     def bump(zone):
-                        zone = str(zone).strip()
-                        if zone:
-                            occupancy[zone] = occupancy.get(zone, 0) + 1
-                            #self.logger.debug(f"📊 Object {obj.object_id} in zone {zone}")
+                        zone_str = str(zone).strip()
+                        if zone_str:
+                            occupancy[zone_str] = occupancy.get(zone_str, 0) + 1
 
                     in_zones: List[str] = []
                     if isinstance(roi_status, dict):
-                        for z, status in roi_status.items():
+                        for zone, status in roi_status.items():
                             if status in (1, True, "IN", "inside"):
-                                bump(z)
-                                in_zones.append(str(z).strip())
+                                bump(zone)
+                                in_zones.append(str(zone).strip())
                     elif isinstance(roi_status, (list, tuple, set)):
-                        for z in roi_status:
-                            bump(z)
-                            in_zones.append(str(z).strip())
+                        for zone in roi_status:
+                            bump(zone)
+                            in_zones.append(str(zone).strip())
                     elif isinstance(roi_status, str):
-                        for z in roi_status.split(','):
-                            bump(z)
-                            in_zones.append(str(z).strip())
+                        for zone in roi_status.split(","):
+                            bump(zone)
+                            in_zones.append(str(zone).strip())
 
-                    # Assign a primary zone (first one if multiple)
                     current_zone = in_zones[0] if in_zones else None
                     if current_zone:
-                        track_dict['zone'] = current_zone
-
-                        # Dwell time tracking per (sensor_id, track_id)
+                        track_dict["zone"] = current_zone
                         try:
-                            zone_state = self.track_zone_state_by_sensor.setdefault(sensor_id, {}).setdefault(obj.object_id, {
-                                'current_zone': None,
-                                'entry_time': None
-                            })
-                            prev_zone = zone_state.get('current_zone')
-                            entry_time = zone_state.get('entry_time')
+                            zone_state = self.track_zone_state_by_sensor.setdefault(
+                                sensor_id, {}
+                            ).setdefault(
+                                obj.object_id,
+                                {
+                                    "current_zone": None,
+                                    "entry_time": None,
+                                },
+                            )
+                            prev_zone = zone_state.get("current_zone")
+                            entry_time = zone_state.get("entry_time")
                             if prev_zone == current_zone:
-                                # Continue dwell
                                 if entry_time is None:
-                                    # If we somehow missed entry, initialize now
-                                    zone_state['entry_time'] = now_ts
+                                    zone_state["entry_time"] = now_ts
                                     entry_time = now_ts
                                 dwell = max(0.0, now_ts - float(entry_time))
-                                track_dict['dwell_time'] = dwell
+                                track_dict["dwell_time"] = dwell
                             else:
-                                # Zone changed (or first seen). Record transition if applicable.
                                 if prev_zone and prev_zone != current_zone:
-                                    transitions.append({
-                                        'track_id': obj.object_id,
-                                        'camera_id': f"camera_{sensor_id}",
-                                        'from_zone': prev_zone,
-                                        'to_zone': current_zone,
-                                        'timestamp': now_ts
-                                    })
-                                # Start new dwell timer
-                                zone_state['current_zone'] = current_zone
-                                zone_state['entry_time'] = now_ts
-                                track_dict['dwell_time'] = 0.0
+                                    transitions.append(
+                                        {
+                                            "track_id": obj.object_id,
+                                            "camera_id": f"camera_{sensor_id}",
+                                            "from_zone": prev_zone,
+                                            "to_zone": current_zone,
+                                            "timestamp": now_ts,
+                                        }
+                                    )
+                                zone_state["current_zone"] = current_zone
+                                zone_state["entry_time"] = now_ts
+                                track_dict["dwell_time"] = 0.0
                         except Exception:
                             pass
-                
-                # Fallback to frame-level counts if no per-object ROI data
+
                 if not occupancy:
                     frame_analytics = self._extract_analytics_frame_meta(frame_meta)
-                    if frame_analytics and isinstance(frame_analytics.get('objects_in_roi'), dict):
-                        occupancy.update(frame_analytics['objects_in_roi'])
-                        #self.logger.debug(f"📊 Using frame-level occupancy: {frame_analytics['objects_in_roi']}")
-                
-                if 'lcStatus' in analytics_data:
-                    lc_status = analytics_data['lcStatus']
-                    #self.logger.debug(f"📊 Line crossing status: {lc_status}")
+                    if frame_analytics and isinstance(
+                        frame_analytics.get("objects_in_roi"), dict
+                    ):
+                        occupancy.update(frame_analytics["objects_in_roi"])
+
+                if "lcStatus" in analytics_data:
+                    lc_status = analytics_data["lcStatus"]
                     if isinstance(lc_status, dict):
                         for line_name, status in lc_status.items():
-                            if status == 1:  # Object crossed this line
-                                transitions.append({
-                                    'track_id': obj.object_id,
-                                    'camera_id': f"camera_{sensor_id}",
-                                    'line_name': line_name,
-                                    'timestamp': time.time()
-                                })
-                                #self.logger.debug(f"📊 Object {obj.object_id} crossed line {line_name}")
-            #else:
-                #self.logger.debug(f"📊 No analytics data for object {obj.object_id}")
+                            if status == 1:
+                                transitions.append(
+                                    {
+                                        "track_id": obj.object_id,
+                                        "camera_id": f"camera_{sensor_id}",
+                                        "line_name": line_name,
+                                        "timestamp": time.time(),
+                                    }
+                                )
+
+            if depth_meta:
+                detection["depth"] = depth_meta
+                track_dict["depth"] = depth_meta
 
             # Fallback zone/dwell: if no analytics zone detected, use camera room as zone
             try:
-                if 'zone' not in track_dict or not track_dict['zone']:
+                if "zone" not in track_dict or not track_dict["zone"]:
                     # Map sensor_id to clean camera name
                     cam_info = self.source_info.get(sensor_id, {})
-                    fallback_zone = cam_info.get('clean_name') or cam_info.get('name')
+                    fallback_zone = cam_info.get("clean_name") or cam_info.get("name")
                     if fallback_zone:
-                        track_dict['zone'] = fallback_zone
+                        track_dict["zone"] = fallback_zone
                         # Maintain simple dwell timer per (sensor_id, track_id) on this fallback zone
-                        zone_state = self.track_zone_state_by_sensor.setdefault(sensor_id, {}).setdefault(obj.object_id, {
-                            'current_zone': None,
-                            'entry_time': None
-                        })
-                        prev_zone = zone_state.get('current_zone')
-                        entry_time = zone_state.get('entry_time')
+                        zone_state = self.track_zone_state_by_sensor.setdefault(
+                            sensor_id, {}
+                        ).setdefault(
+                            obj.object_id, {"current_zone": None, "entry_time": None}
+                        )
+                        prev_zone = zone_state.get("current_zone")
+                        entry_time = zone_state.get("entry_time")
                         if prev_zone == fallback_zone:
                             if entry_time is None:
-                                zone_state['entry_time'] = now_ts
+                                zone_state["entry_time"] = now_ts
                                 entry_time = now_ts
                             dwell = max(0.0, now_ts - float(entry_time))
-                            track_dict['dwell_time'] = dwell
+                            track_dict["dwell_time"] = dwell
                         else:
                             # Zone changed or first time
-                            zone_state['current_zone'] = fallback_zone
-                            zone_state['entry_time'] = now_ts
-                            track_dict['dwell_time'] = 0.0
+                            zone_state["current_zone"] = fallback_zone
+                            zone_state["entry_time"] = now_ts
+                            track_dict["dwell_time"] = 0.0
             except Exception:
                 pass
-            
+
             # Add secondary inference results if available
             secondary_data = self._extract_secondary_inference_meta(obj)
             if secondary_data:
                 detection["secondary_inference"] = secondary_data
-            
+
             # StableID: update or create global identity (persons only)
             try:
-                if self.reid_enabled and (self.stable_id_mgr is not None) and int(obj.class_id) == 0:  # person
-                    bbox_tuple = (float(rect.left), float(rect.top), float(rect.width), float(rect.height))
-                    zone_name = track_dict.get('zone') if isinstance(track_dict, dict) else None
+                if (
+                    self.reid_enabled
+                    and (self.stable_id_mgr is not None)
+                    and int(obj.class_id) == 0
+                ):  # person
+                    bbox_tuple = (
+                        float(rect.left),
+                        float(rect.top),
+                        float(rect.width),
+                        float(rect.height),
+                    )
+                    zone_name = (
+                        track_dict.get("zone") if isinstance(track_dict, dict) else None
+                    )
                     # Decode at most every N ms per sensor and only on-demand
                     if decoded_frame_bgr is None:
-                        last_dec = float(self._last_decode_ts_by_sensor.get(int(sensor_id), 0.0))
-                        if (float(now_ts) - last_dec) >= float(self._reid_decode_min_interval_s):
-                            decoded_frame_bgr = self._decode_latest_jpeg_for_sensor(sensor_id)
-                            self._last_decode_ts_by_sensor[int(sensor_id)] = float(now_ts)
+                        last_dec = float(
+                            self._last_decode_ts_by_sensor.get(int(sensor_id), 0.0)
+                        )
+                        if (float(now_ts) - last_dec) >= float(
+                            self._reid_decode_min_interval_s
+                        ):
+                            decoded_frame_bgr = self._decode_latest_jpeg_for_sensor(
+                                sensor_id
+                            )
+                            self._last_decode_ts_by_sensor[int(sensor_id)] = float(
+                                now_ts
+                            )
                     stable_id = self.stable_id_mgr.update(
                         sensor_id=int(sensor_id),
                         ds_obj_id=int(obj.object_id),
@@ -1360,12 +2949,12 @@ class DeepStreamVideoPipeline:
                         zone=str(zone_name) if zone_name else None,
                         frame_bgr=decoded_frame_bgr,
                     )
-                    track_dict['stable_id'] = int(stable_id)
+                    track_dict["stable_id"] = int(stable_id)
                 else:
-                    track_dict['stable_id'] = None
+                    track_dict["stable_id"] = None
             except Exception:
                 try:
-                    track_dict['stable_id'] = None
+                    track_dict["stable_id"] = None
                 except Exception:
                     pass
 
@@ -1376,22 +2965,27 @@ class DeepStreamVideoPipeline:
                 present_ds_ids.append(int(obj.object_id))
             except Exception:
                 pass
-            
+
             try:
                 l_obj = l_obj.next
             except StopIteration:
                 break
-        
+
         # Publish occupancy deltas to integrations (MQTT/Influx)
         try:
-            publisher = getattr(self, 'occupancy_publisher', None)
+            publisher = getattr(self, "occupancy_publisher", None)
             if publisher is not None and occupancy is not None:
                 # Publish current counts (rooms seen this frame)
-                first_flag = getattr(self, '_occ_pub_first', True)
+                first_flag = getattr(self, "_occ_pub_first", True)
                 for zone, cnt in occupancy.items():
                     try:
                         room_id = str(zone).strip()
-                        publisher.publish_state(room_id=room_id, occupied=(int(cnt) > 0), count=int(cnt), ts_ns=int(time.time_ns()))
+                        publisher.publish_state(
+                            room_id=room_id,
+                            occupied=(int(cnt) > 0),
+                            count=int(cnt),
+                            ts_ns=int(time.time_ns()),
+                        )
                         if first_flag:
                             try:
                                 print(f"📡 Occupancy publish: {room_id} -> {int(cnt)}")
@@ -1403,7 +2997,12 @@ class DeepStreamVideoPipeline:
                 for zone in set(prev_occupancy.keys()) - set(occupancy.keys()):
                     try:
                         room_id = str(zone).strip()
-                        publisher.publish_state(room_id=room_id, occupied=False, count=0, ts_ns=int(time.time_ns()))
+                        publisher.publish_state(
+                            room_id=room_id,
+                            occupied=False,
+                            count=0,
+                            ts_ns=int(time.time_ns()),
+                        )
                         if first_flag:
                             try:
                                 print(f"📡 Occupancy publish: {room_id} -> 0 (vacate)")
@@ -1423,33 +3022,38 @@ class DeepStreamVideoPipeline:
         # End-of-frame: remove tracks not present and prune ghosts
         if self.reid_enabled and (self.stable_id_mgr is not None):
             try:
-                self.stable_id_mgr.remove_missing_tracks(int(sensor_id), present_ds_ids, float(now_ts))
-                self.stable_id_mgr.prune_ghosts(now_ts)
+                self.stable_id_mgr.remove_missing_tracks(
+                    int(sensor_id), present_ds_ids, float(now_ts)
+                )
             except Exception:
                 pass
 
         # Update live tracking state for this specific stream
         if sensor_id in self.live_tracking_state:
-            self.live_tracking_state[sensor_id]['active_tracks'] = active_tracks
-            self.live_tracking_state[sensor_id]['occupancy'] = occupancy
-            self.live_tracking_state[sensor_id]['transitions'].extend(transitions)
-            
+            self.live_tracking_state[sensor_id]["active_tracks"] = active_tracks
+            self.live_tracking_state[sensor_id]["occupancy"] = occupancy
+            self.live_tracking_state[sensor_id]["transitions"].extend(transitions)
+
             # Keep only recent transitions (last 100) per stream
-            if len(self.live_tracking_state[sensor_id]['transitions']) > 100:
-                self.live_tracking_state[sensor_id]['transitions'] = self.live_tracking_state[sensor_id]['transitions'][-100:]
+            if len(self.live_tracking_state[sensor_id]["transitions"]) > 100:
+                self.live_tracking_state[sensor_id]["transitions"] = (
+                    self.live_tracking_state[sensor_id]["transitions"][-100:]
+                )
         else:
-            self.logger.warning(f"⚠️ Unknown source_id {ds_index} (mapped→{sensor_id}) in frame metadata")
-        
+            self.logger.warning(
+                f"⚠️ Unknown source_id {ds_index} (mapped→{sensor_id}) in frame metadata"
+            )
+
         # Debug logging for tracking state
-        #if len(active_tracks) > 0:
-            #self.logger.debug(f"📊 Final tracking state - Active tracks: {len(active_tracks)}, Occupancy: {occupancy}, Transitions: {len(transitions)}")
-        #if active_tracks:
-            #self.logger.debug(f"📊 Active tracks sample: {active_tracks[:2]}")  # Show first 2 tracks
-        #if occupancy:
-            #self.logger.debug(f"📊 Occupancy: {occupancy}")
-        #if transitions:
-            #self.logger.debug(f"📊 Recent transitions: {transitions[-3:]}")  # Show last 3 transitions
-        
+        # if len(active_tracks) > 0:
+        # self.logger.debug(f"📊 Final tracking state - Active tracks: {len(active_tracks)}, Occupancy: {occupancy}, Transitions: {len(transitions)}")
+        # if active_tracks:
+        # self.logger.debug(f"📊 Active tracks sample: {active_tracks[:2]}")  # Show first 2 tracks
+        # if occupancy:
+        # self.logger.debug(f"📊 Occupancy: {occupancy}")
+        # if transitions:
+        # self.logger.debug(f"📊 Recent transitions: {transitions[-3:]}")  # Show last 3 transitions
+
         return detections
 
     def _decode_latest_jpeg_for_sensor(self, sensor_id: int) -> Optional[np.ndarray]:
@@ -1463,8 +3067,10 @@ class DeepStreamVideoPipeline:
             if not jpeg_bytes:
                 return None
             import numpy as _np
+
             npbuf = _np.frombuffer(jpeg_bytes, dtype=_np.uint8)
             import cv2 as _cv2
+
             frame = _cv2.imdecode(npbuf, _cv2.IMREAD_COLOR)
             return frame
         except Exception:
@@ -1503,48 +3109,60 @@ class DeepStreamVideoPipeline:
         r, g, b = self._hsl_to_rgb(hue, 0.80, 0.60)
         self._track_color_cache[track_id] = (r, g, b)
         return (r, g, b)
-    
+
     def _extract_secondary_inference_meta(self, obj_meta) -> Optional[Dict[str, Any]]:
         """Extract secondary inference metadata from object"""
         try:
             # Look for secondary inference results
             classifier_meta_list = obj_meta.classifier_meta_list
             if classifier_meta_list:
-                classifier_meta = pyds.NvDsClassifierMeta.cast(classifier_meta_list.data)  # type: ignore
+                classifier_meta = pyds.NvDsClassifierMeta.cast(
+                    classifier_meta_list.data
+                )  # type: ignore
                 if classifier_meta.unique_component_id == 2:  # Our SGIE ID
                     label_info_list = classifier_meta.label_info_list
                     if label_info_list:
                         label_info = pyds.NvDsLabelInfo.cast(label_info_list.data)  # type: ignore
                         return {
-                            'classification': label_info.result_label,
-                            'confidence': label_info.result_prob,
-                            'component_id': classifier_meta.unique_component_id
+                            "classification": label_info.result_label,
+                            "confidence": label_info.result_prob,
+                            "component_id": classifier_meta.unique_component_id,
                         }
             return None
         except Exception as e:
             self.logger.debug(f"Error extracting secondary inference meta: {e}")
             return None
 
-
-    
     def _on_bus_message(self, bus, message):
         """Handle bus messages."""
         msg_type = message.type
-        
+
         if msg_type == Gst.MessageType.ERROR:
             err, debug = message.parse_error()
             self.logger.error(f"🚨 Pipeline error: {err.message}")
             self.logger.error(f"🚨 Debug info: {debug}")
-            self.logger.error(f"🚨 Error source: {message.src.get_name() if message.src else 'unknown'}")
+            self.logger.error(
+                f"🚨 Error source: {message.src.get_name() if message.src else 'unknown'}"
+            )
             try:
-                src_name = message.src.get_name() if message.src else ''
+                src_name = message.src.get_name() if message.src else ""
                 # Provide actionable hint if source/decoder failed
-                if any(k in src_name for k in ('nvmultiurisrcbin', 'uridecodebin', 'rtspsrc', 'decodebin')):
+                if any(
+                    k in src_name
+                    for k in (
+                        "nvmultiurisrcbin",
+                        "uridecodebin",
+                        "rtspsrc",
+                        "decodebin",
+                    )
+                ):
                     # Summarize configured sources to aid debugging
                     try:
                         sources = []
-                        for sid, info in getattr(self, 'source_info', {}).items():
-                            sources.append(f"[{sid}] {info.get('name','unknown')} -> {info.get('url','')}\n")
+                        for sid, info in getattr(self, "source_info", {}).items():
+                            sources.append(
+                                f"[{sid}] {info.get('name', 'unknown')} -> {info.get('url', '')}\n"
+                            )
                         if sources:
                             self.logger.error(
                                 "🔎 One or more sources failed to start or connect.\n"
@@ -1559,38 +3177,40 @@ class DeepStreamVideoPipeline:
             self.running = False
             if self.mainloop:
                 self.mainloop.quit()
-        
+
         elif msg_type == Gst.MessageType.EOS:
             self.logger.info("End of stream")
             self.running = False
             if self.mainloop:
                 self.mainloop.quit()
-        
+
         elif msg_type == Gst.MessageType.WARNING:
             warn, debug = message.parse_warning()
             self.logger.warning(f"⚠️  Pipeline warning: {warn.message}")
             self.logger.warning(f"⚠️  Debug info: {debug}")
-        
+
         elif msg_type == Gst.MessageType.INFO:
             info, debug = message.parse_info()
             self.logger.info(f"ℹ️  Pipeline info: {info.message}")
-        
+
         elif msg_type == Gst.MessageType.STATE_CHANGED:
             if message.src == self.pipeline:
                 old_state, new_state, pending_state = message.parse_state_changed()
-                self.logger.info(f"🔄 Pipeline state changed: {old_state.value_nick} → {new_state.value_nick}")
-        
+                self.logger.info(
+                    f"🔄 Pipeline state changed: {old_state.value_nick} → {new_state.value_nick}"
+                )
+
         return True
-    
+
     def start(self) -> bool:
         """Start the DeepStream pipeline."""
         try:
             self.logger.info("🚀 Starting DeepStream pipeline...")
-            
+
             if not self.pipeline:
                 self.logger.error("❌ Pipeline not created")
                 return False
-            
+
             # Set pipeline state to PLAYING
             ret = self.pipeline.set_state(Gst.State.PLAYING)
             self.logger.info(f"Pipeline set_state returned: {ret}")
@@ -1601,12 +3221,16 @@ class DeepStreamVideoPipeline:
             # Start GLib mainloop early so bus callbacks can surface errors while we wait
             self.running = True
             self.start_time = time.time()
-            self.mainloop_thread = threading.Thread(target=self._run_mainloop, daemon=True)
+            self.mainloop_thread = threading.Thread(
+                target=self._run_mainloop, daemon=True
+            )
             self.mainloop_thread.start()
 
             # If async, wait with a finite timeout and surface element states on failure
             if ret == Gst.StateChangeReturn.ASYNC:
-                self.logger.info("⏳ Pipeline state change is async, waiting up to 10s...")
+                self.logger.info(
+                    "⏳ Pipeline state change is async, waiting up to 10s..."
+                )
                 # 10s timeout
                 timeout_ns = 10 * Gst.SECOND
                 ret_state = self.pipeline.get_state(timeout_ns)
@@ -1632,29 +3256,53 @@ class DeepStreamVideoPipeline:
                         except Exception:
                             return str(x)
 
-                    src_names = ("nvmultiurisrcbin", "uridecodebin", "rtspsrc", "urisrc", "decodebin")
-                    stuck_src = [s for s in states if any(n in s[0] for n in src_names) and _nick(s[2]) != 'playing']
-                    stuck_inf = [s for s in states if s[0] == 'nvinfer' and _nick(s[2]) != 'playing']
-                    stuck_trk = [s for s in states if s[0] == 'nvtracker' and _nick(s[2]) != 'playing']
+                    src_names = (
+                        "nvmultiurisrcbin",
+                        "uridecodebin",
+                        "rtspsrc",
+                        "urisrc",
+                        "decodebin",
+                    )
+                    stuck_src = [
+                        s
+                        for s in states
+                        if any(n in s[0] for n in src_names)
+                        and _nick(s[2]) != "playing"
+                    ]
+                    stuck_inf = [
+                        s
+                        for s in states
+                        if s[0] == "nvinfer" and _nick(s[2]) != "playing"
+                    ]
+                    stuck_trk = [
+                        s
+                        for s in states
+                        if s[0] == "nvtracker" and _nick(s[2]) != "playing"
+                    ]
 
+                    warning_prefix = "⚠️ Pipeline state change timed out"
                     if stuck_src:
                         name, e_ret, e_state, e_pending = stuck_src[0]
-                        self.logger.error(
-                            f"❌ Source loading timed out or failed (element {name} state={_nick(e_state)}, pending={_nick(e_pending)})."
+                        self.logger.warning(
+                            f"{warning_prefix}; source {name} state={_nick(e_state)} pending={_nick(e_pending)}"
                         )
-                        self.logger.error("Hint: verify stream URLs or generators are active.")
+                        self.logger.warning(
+                            "Hint: verify stream URLs or generators are active."
+                        )
                     elif stuck_inf:
                         name, e_ret, e_state, e_pending = stuck_inf[0]
-                        self.logger.error(
-                            f"❌ Inference element stalled (element {name} state={_nick(e_state)}, pending={_nick(e_pending)})."
+                        self.logger.warning(
+                            f"{warning_prefix}; inference element {name} state={_nick(e_state)} pending={_nick(e_pending)}"
                         )
                     elif stuck_trk:
                         name, e_ret, e_state, e_pending = stuck_trk[0]
-                        self.logger.error(
-                            f"❌ Tracker element stalled (element {name} state={_nick(e_state)}, pending={_nick(e_pending)})."
+                        self.logger.warning(
+                            f"{warning_prefix}; tracker element {name} state={_nick(e_state)} pending={_nick(e_pending)}"
                         )
                     else:
-                        self.logger.error(f"❌ Pipeline state change failed or timed out: {ret_state[0]}")
+                        self.logger.warning(
+                            f"{warning_prefix}: {ret_state[0]}"
+                        )
 
                     # Debug-only: full element states
                     if states:
@@ -1663,33 +3311,14 @@ class DeepStreamVideoPipeline:
                             self.logger.debug(
                                 f"  • {name}: state={_nick(e_state)} pending={_nick(e_pending)} ret={e_ret}"
                             )
-                    return False
+                    self.logger.warning(
+                        "Proceeding despite async pipeline state; monitoring bus messages for further errors."
+                    )
 
-            self.logger.info("✅ DeepStream pipeline started successfully")
+            self.logger.info("✅ DeepStream pipeline start requested")
 
-            # Log pipeline state after a short delay
-            def check_pipeline_state():
-                time.sleep(2)
-                ret, state, pending = self.pipeline.get_state(0)
-                self.logger.info(f"📊 Pipeline state: {state}, pending: {pending}, ret: {ret}")
-                
-                # Check if we're receiving frames
-                if self.frame_count == 0:
-                    self.logger.warning("⚠️ No frames received yet - checking pipeline elements...")
-                    # Log element states
-                    it = self.pipeline.iterate_elements()
-                    while True:
-                        result, element = it.next()
-                        if result != Gst.IteratorResult.OK:
-                            break
-                        name = element.get_name()
-                        ret, state, pending = element.get_state(0)
-                        self.logger.info(f"📊 Element {name}: state={state}, pending={pending}, ret={ret}")
-            
-            threading.Thread(target=check_pipeline_state, daemon=True).start()
-            
             return True
-            
+
         except Exception as e:
             self.logger.error(f"❌ Error starting pipeline: {e}")
             return False
@@ -1698,67 +3327,65 @@ class DeepStreamVideoPipeline:
         """Creates and runs the GLib MainLoop."""
         self.mainloop = GLib.MainLoop()
         self.mainloop.run()
-    
 
-    
-
-    
     def stop(self):
         """Stop the DeepStream pipeline."""
         self.logger.info("Stopping DeepStream pipeline")
         self.running = False
-        
+
         # Unregister custom callbacks
         try:
             pyds.unset_callback_funcs()
             self.logger.info("✅ Unregistered custom metadata callbacks")
         except Exception as e:
             self.logger.warning(f"⚠️ Could not unregister custom callbacks: {e}")
-        
 
-        
         # Stop pipeline
         if self.pipeline:
             self.pipeline.set_state(Gst.State.NULL)
-        
+
         # Stop main loop
         if self.mainloop:
             self.mainloop.quit()
-        
+
         # Wait for main loop thread
-        if hasattr(self, 'mainloop_thread') and self.mainloop_thread.is_alive():
+        if hasattr(self, "mainloop_thread") and self.mainloop_thread.is_alive():
             self.mainloop_thread.join(timeout=2.0)
-        
+
         self.logger.info("DeepStream pipeline stopped")
-    
+
     def get_stats(self) -> Dict[str, Any]:
         """Get pipeline statistics."""
-        runtime = time.time() - self.start_time if self.running and self.start_time > 0 else 0
-        
+        runtime = (
+            time.time() - self.start_time if self.running and self.start_time > 0 else 0
+        )
+
         # Use a lock to safely access frame_count
         with self.frame_count_lock:
             frame_count_copy = self.frame_count
-            
+
         fps = frame_count_copy / runtime if runtime > 0 else 0
-        
-        queue_sizes = {f"source_{src_id}": q.qsize() for src_id, q in self.jpeg_queues.items()}
+
+        queue_sizes = {
+            f"source_{src_id}": q.qsize() for src_id, q in self.jpeg_queues.items()
+        }
         stats = {
-            'pipeline_type': 'deepstream',
-            'running': self.running,
-            'frames_processed': frame_count_copy,
-            'fps': fps,
-            'runtime_seconds': runtime,
-            'batch_size': self.batch_size,
-            'sources': len(self.sensor_ids),
-            'queue_sizes': queue_sizes,
-            'tracking': self.live_tracking_state
+            "pipeline_type": "deepstream",
+            "running": self.running,
+            "frames_processed": frame_count_copy,
+            "fps": fps,
+            "runtime_seconds": runtime,
+            "batch_size": self.batch_size,
+            "sources": len(self.sensor_ids),
+            "queue_sizes": queue_sizes,
+            "tracking": self.live_tracking_state,
         }
         # Attach ReID/SID allocator telemetry if available
         try:
-            if hasattr(self, 'stable_id_mgr') and self.stable_id_mgr:
+            if hasattr(self, "stable_id_mgr") and self.stable_id_mgr:
                 sid_metrics = self.stable_id_mgr.get_sid_metrics()
                 if sid_metrics:
-                    stats['reid'] = sid_metrics
+                    stats["reid"] = sid_metrics
         except Exception:
             pass
         return stats
@@ -1783,7 +3410,9 @@ class DeepStreamVideoPipeline:
             except StopIteration:
                 break
 
-        expected_source_ids = set(range(len(self.sensor_ids)))  # DeepStream uses 0..N-1 source indices
+        expected_source_ids = set(
+            range(len(self.sensor_ids))
+        )  # DeepStream uses 0..N-1 source indices
         actual_source_ids = set(source_ids)
         unexpected_ids = actual_source_ids - expected_source_ids
         missing_ids = expected_source_ids - actual_source_ids
@@ -1791,7 +3420,7 @@ class DeepStreamVideoPipeline:
         # Warn only if we see IDs outside expected range; this indicates a real issue
         if unexpected_ids:
             self.rate_limited_logger.warning(
-                f"⚠️ Demux sink saw unexpected source_ids {sorted(list(unexpected_ids))}; expected range 0..{len(self.sensor_ids)-1}"
+                f"⚠️ Demux sink saw unexpected source_ids {sorted(list(unexpected_ids))}; expected range 0..{len(self.sensor_ids) - 1}"
             )
         else:
             # It's normal for some sources to be absent in a given batch. Debug early a few times only.
@@ -1818,6 +3447,7 @@ class DeepStreamVideoPipeline:
         except Exception as e:
             self.logger.error(f"Failed to get/request demux pad for index {index}: {e}")
             return None
+
     def _calibrate_demux_pad_source_map(self) -> None:
         """Calibrate mapping between demux src_%u pads and actual frame_meta.source_id.
         Attaches one-shot probes to each src pad and records the first observed source_id."""
@@ -1854,13 +3484,20 @@ class DeepStreamVideoPipeline:
                                 pass
                         # If we've mapped all sources, log once
                         if len(self.source_id_to_demux_pad) >= len(self.sensor_ids):
-                            mapping_str = ", ".join([f"{k}→{v}" for k, v in sorted(self.demux_pad_to_source_id.items())])
+                            mapping_str = ", ".join(
+                                [
+                                    f"{k}→{v}"
+                                    for k, v in sorted(
+                                        self.demux_pad_to_source_id.items()
+                                    )
+                                ]
+                            )
                             self.logger.info(f"nvstreamdemux mapping: {mapping_str}")
                     # Fill sensor→pad reuse map
                     try:
                         for pad_name, sid in self.demux_pad_to_source_id.items():
                             try:
-                                demux_index = int(pad_name.split('_')[1])
+                                demux_index = int(pad_name.split("_")[1])
                                 pad_obj = self._get_or_request_demux_pad(demux_index)
                                 if pad_obj:
                                     self._demux_requested_pads_by_sensor[sid] = pad_obj
@@ -1879,12 +3516,16 @@ class DeepStreamVideoPipeline:
                 if not pad:
                     continue
                 pad_name = pad.get_name()
-                handler_id = pad.add_probe(Gst.PadProbeType.BUFFER, _one_shot_probe, None)
+                handler_id = pad.add_probe(
+                    Gst.PadProbeType.BUFFER, _one_shot_probe, None
+                )
                 pad_handler_ids[pad_name] = handler_id
 
             # Wait briefly for first frames to flow and mapping to populate
             # Note: In Python API, we avoid busy waiting; mapping will complete as frames arrive.
-            self.logger.info("Calibrating demux pad → source_id mapping (will log once ready)...")
+            self.logger.info(
+                "Calibrating demux pad → source_id mapping (will log once ready)..."
+            )
         except Exception as e:
             self.logger.warning(f"Failed to calibrate demux pad mapping: {e}")
 
@@ -1892,7 +3533,10 @@ class DeepStreamVideoPipeline:
         for sensor_id in self.sensor_ids:
             ok = self._add_jpeg_branch_for_sensor(sensor_id)
             if not ok:
-                self.logger.error(f"❌ Failed to setup stream branch for sensor {sensor_id}")
+                self.logger.error(
+                    f"❌ Failed to setup stream branch for sensor {sensor_id}"
+                )
+
     def _configure_live_queue(self, q: Gst.Element) -> None:
         q.set_property("max-size-buffers", 12)
         q.set_property("max-size-bytes", 0)
@@ -1908,7 +3552,9 @@ class DeepStreamVideoPipeline:
                     self._caps_probe_counts = {}
                 count = self._caps_probe_counts.get(stage, 0)
                 if count < 3:
-                    self.logger.debug(f"[caps] {stage}: {caps.to_string() if caps else 'None'}")
+                    self.logger.debug(
+                        f"[caps] {stage}: {caps.to_string() if caps else 'None'}"
+                    )
                     self._caps_probe_counts[stage] = count + 1
 
                 # Extract negotiated width/height and cache per sensor if stage string encodes it
@@ -1918,7 +3564,7 @@ class DeepStreamVideoPipeline:
                     if isinstance(stage, str) and "sensor" in stage:
                         parts = stage.split()
                         for i, p in enumerate(parts):
-                            if p == 'sensor' and i + 1 < len(parts):
+                            if p == "sensor" and i + 1 < len(parts):
                                 try:
                                     sensor_id = int(parts[i + 1])
                                 except Exception:
@@ -1929,22 +3575,28 @@ class DeepStreamVideoPipeline:
                         w = None
                         h = None
                         try:
-                            ok, wi = s.get_int('width')  # type: ignore
+                            ok, wi = s.get_int("width")  # type: ignore
                             if ok:
                                 w = int(wi)
-                            ok, hi = s.get_int('height')  # type: ignore
+                            ok, hi = s.get_int("height")  # type: ignore
                             if ok:
                                 h = int(hi)
                         except Exception:
                             # Fallback parse from string
                             cs = caps.to_string()
                             import re as _re
+
                             mw = _re.search(r"width=(\d+)", cs)
                             mh = _re.search(r"height=(\d+)", cs)
-                            if mw: w = int(mw.group(1))
-                            if mh: h = int(mh.group(1))
+                            if mw:
+                                w = int(mw.group(1))
+                            if mh:
+                                h = int(mh.group(1))
                         if w and h:
-                            self._branch_caps_by_sensor[int(sensor_id)] = (int(w), int(h))
+                            self._branch_caps_by_sensor[int(sensor_id)] = (
+                                int(w),
+                                int(h),
+                            )
                 except Exception:
                     pass
         except Exception as e:
@@ -1952,18 +3604,32 @@ class DeepStreamVideoPipeline:
             self.logger.debug(f"caps probe error at {stage}: {e}")
         return Gst.PadProbeReturn.OK
 
-    def _attach_caps_debug_probes(self, conv: Gst.Element, caps: Gst.Element, jpegenc: Gst.Element, sensor_id: int) -> None:
+    def _attach_caps_debug_probes(
+        self, conv: Gst.Element, caps: Gst.Element, jpegenc: Gst.Element, sensor_id: int
+    ) -> None:
         try:
             conv_src = conv.get_static_pad("src")
             if conv_src:
-                conv_src.add_probe(Gst.PadProbeType.EVENT_DOWNSTREAM, self._caps_event_probe, f"sensor {sensor_id} conv src")
+                conv_src.add_probe(
+                    Gst.PadProbeType.EVENT_DOWNSTREAM,
+                    self._caps_event_probe,
+                    f"sensor {sensor_id} conv src",
+                )
             caps_src = caps.get_static_pad("src")
             if caps_src:
-                caps_src.add_probe(Gst.PadProbeType.EVENT_DOWNSTREAM, self._caps_event_probe, f"sensor {sensor_id} caps src")
+                caps_src.add_probe(
+                    Gst.PadProbeType.EVENT_DOWNSTREAM,
+                    self._caps_event_probe,
+                    f"sensor {sensor_id} caps src",
+                )
             enc_sink = jpegenc.get_static_pad("sink")
             if enc_sink:
                 # Caps events flow downstream into encoder sink; observe what arrives
-                enc_sink.add_probe(Gst.PadProbeType.EVENT_DOWNSTREAM, self._caps_event_probe, f"sensor {sensor_id} nvjpegenc sink")
+                enc_sink.add_probe(
+                    Gst.PadProbeType.EVENT_DOWNSTREAM,
+                    self._caps_event_probe,
+                    f"sensor {sensor_id} nvjpegenc sink",
+                )
                 # Log template and currently queried caps once
                 try:
                     tmpl = enc_sink.get_pad_template_caps()
@@ -1974,7 +3640,9 @@ class DeepStreamVideoPipeline:
                 except Exception:
                     pass
         except Exception as e:
-            self.logger.debug(f"Failed to attach caps probes for sensor {sensor_id}: {e}")
+            self.logger.debug(
+                f"Failed to attach caps probes for sensor {sensor_id}: {e}"
+            )
 
     def _add_jpeg_branch_for_sensor(self, sensor_id: int) -> bool:
         try:
@@ -1984,37 +3652,62 @@ class DeepStreamVideoPipeline:
 
             branch_name_prefix = f"stream_branch_{sensor_id}"
             queue = Gst.ElementFactory.make("queue", f"{branch_name_prefix}_queue")
-            conv_pre = Gst.ElementFactory.make("nvvideoconvert", f"{branch_name_prefix}_conv_pre")
-            caps_pre = Gst.ElementFactory.make("capsfilter", f"{branch_name_prefix}_caps_pre")
+            conv_pre = Gst.ElementFactory.make(
+                "nvvideoconvert", f"{branch_name_prefix}_conv_pre"
+            )
+            caps_pre = Gst.ElementFactory.make(
+                "capsfilter", f"{branch_name_prefix}_caps_pre"
+            )
             osd = Gst.ElementFactory.make("nvdsosd", f"{branch_name_prefix}_osd")
-            conv_post = Gst.ElementFactory.make("nvvideoconvert", f"{branch_name_prefix}_conv_post")
-            caps_post = Gst.ElementFactory.make("capsfilter", f"{branch_name_prefix}_caps_post")
+            conv_post = Gst.ElementFactory.make(
+                "nvvideoconvert", f"{branch_name_prefix}_conv_post"
+            )
+            caps_post = Gst.ElementFactory.make(
+                "capsfilter", f"{branch_name_prefix}_caps_post"
+            )
             jpegenc = Gst.ElementFactory.make("nvjpegenc", f"{branch_name_prefix}_enc")
             sink = Gst.ElementFactory.make("appsink", f"{branch_name_prefix}_sink")
 
             # Optimize nvjpegenc for realtime and respect configured JPEG quality
             try:
-                quality = int(getattr(self.config.visualization, 'JPEG_QUALITY', 85))
+                quality = int(getattr(self.config.visualization, "JPEG_QUALITY", 85))
                 jpegenc.set_property("quality", quality)
                 jpegenc.set_property("preset-level", 1)  # fast
             except Exception:
                 pass
 
-            if not all([queue, conv_pre, caps_pre, osd, conv_post, caps_post, jpegenc, sink]):
-                self.logger.error(f"❌ Failed to create elements for JPEG branch sensor {sensor_id}")
+            if not all(
+                [queue, conv_pre, caps_pre, osd, conv_post, caps_post, jpegenc, sink]
+            ):
+                self.logger.error(
+                    f"❌ Failed to create elements for JPEG branch sensor {sensor_id}"
+                )
                 return False
 
             self._configure_live_queue(queue)
             # Pre-OSD RGBA and post-OSD I420
-            caps_pre.set_property("caps", Gst.Caps.from_string("video/x-raw(memory:NVMM), format=RGBA"))
-            caps_post.set_property("caps", Gst.Caps.from_string("video/x-raw(memory:NVMM), format=I420"))
+            caps_pre.set_property(
+                "caps", Gst.Caps.from_string("video/x-raw(memory:NVMM), format=RGBA")
+            )
+            caps_post.set_property(
+                "caps", Gst.Caps.from_string("video/x-raw(memory:NVMM), format=I420")
+            )
             sink.set_property("emit-signals", True)
             sink.set_property("sync", False)
             sink.set_property("max-buffers", 5)
             sink.set_property("drop", True)
             sink.connect("new-sample", self._on_new_jpeg_sample, sensor_id)
 
-            for el in (queue, conv_pre, caps_pre, osd, conv_post, caps_post, jpegenc, sink):
+            for el in (
+                queue,
+                conv_pre,
+                caps_pre,
+                osd,
+                conv_post,
+                caps_post,
+                jpegenc,
+                sink,
+            ):
                 self.pipeline.add(el)
 
             # Attach detailed caps negotiation probes (non-spammy)
@@ -2023,8 +3716,19 @@ class DeepStreamVideoPipeline:
 
             # Link elements explicitly and validate
             if not queue.link(conv_pre):
-                self.logger.error(f"❌ Failed to link queue→conv for sensor {sensor_id}")
-                for el in (queue, conv_pre, caps_pre, osd, conv_post, caps_post, jpegenc, sink):
+                self.logger.error(
+                    f"❌ Failed to link queue→conv for sensor {sensor_id}"
+                )
+                for el in (
+                    queue,
+                    conv_pre,
+                    caps_pre,
+                    osd,
+                    conv_post,
+                    caps_post,
+                    jpegenc,
+                    sink,
+                ):
                     try:
                         self.pipeline.remove(el)
                     except Exception:
@@ -2032,7 +3736,16 @@ class DeepStreamVideoPipeline:
                 return False
             if not conv_pre.link(caps_pre):
                 self.logger.error(f"❌ Failed to link conv→caps for sensor {sensor_id}")
-                for el in (queue, conv_pre, caps_pre, osd, conv_post, caps_post, jpegenc, sink):
+                for el in (
+                    queue,
+                    conv_pre,
+                    caps_pre,
+                    osd,
+                    conv_post,
+                    caps_post,
+                    jpegenc,
+                    sink,
+                ):
                     try:
                         self.pipeline.remove(el)
                     except Exception:
@@ -2040,7 +3753,16 @@ class DeepStreamVideoPipeline:
                 return False
             if not caps_pre.link(osd):
                 self.logger.error(f"❌ Failed to link caps→osd for sensor {sensor_id}")
-                for el in (queue, conv_pre, caps_pre, osd, conv_post, caps_post, jpegenc, sink):
+                for el in (
+                    queue,
+                    conv_pre,
+                    caps_pre,
+                    osd,
+                    conv_post,
+                    caps_post,
+                    jpegenc,
+                    sink,
+                ):
                     try:
                         self.pipeline.remove(el)
                     except Exception:
@@ -2048,40 +3770,86 @@ class DeepStreamVideoPipeline:
                 return False
             # Configure and attach per-branch OSD probe
             try:
-                osd.set_property('process-mode', 0)
-                osd.set_property('display-text', 1)
+                osd.set_property("process-mode", 0)
+                osd.set_property("display-text", 1)
             except Exception:
                 pass
             osd_sink_pad = osd.get_static_pad("sink")
             if osd_sink_pad:
-                osd_sink_pad.add_probe(Gst.PadProbeType.BUFFER, self._per_branch_osd_probe, sensor_id)
+                osd_sink_pad.add_probe(
+                    Gst.PadProbeType.BUFFER, self._per_branch_osd_probe, sensor_id
+                )
             if not osd.link(conv_post):
-                self.logger.error(f"❌ Failed to link osd→conv_post for sensor {sensor_id}")
-                for el in (queue, conv_pre, caps_pre, osd, conv_post, caps_post, jpegenc, sink):
+                self.logger.error(
+                    f"❌ Failed to link osd→conv_post for sensor {sensor_id}"
+                )
+                for el in (
+                    queue,
+                    conv_pre,
+                    caps_pre,
+                    osd,
+                    conv_post,
+                    caps_post,
+                    jpegenc,
+                    sink,
+                ):
                     try:
                         self.pipeline.remove(el)
                     except Exception:
                         pass
                 return False
             if not conv_post.link(caps_post):
-                self.logger.error(f"❌ Failed to link conv_post→caps_post for sensor {sensor_id}")
-                for el in (queue, conv_pre, caps_pre, osd, conv_post, caps_post, jpegenc, sink):
+                self.logger.error(
+                    f"❌ Failed to link conv_post→caps_post for sensor {sensor_id}"
+                )
+                for el in (
+                    queue,
+                    conv_pre,
+                    caps_pre,
+                    osd,
+                    conv_post,
+                    caps_post,
+                    jpegenc,
+                    sink,
+                ):
                     try:
                         self.pipeline.remove(el)
                     except Exception:
                         pass
                 return False
             if not caps_post.link(jpegenc):
-                self.logger.error(f"❌ Failed to link caps_post→jpegenc for sensor {sensor_id}")
-                for el in (queue, conv_pre, caps_pre, osd, conv_post, caps_post, jpegenc, sink):
+                self.logger.error(
+                    f"❌ Failed to link caps_post→jpegenc for sensor {sensor_id}"
+                )
+                for el in (
+                    queue,
+                    conv_pre,
+                    caps_pre,
+                    osd,
+                    conv_post,
+                    caps_post,
+                    jpegenc,
+                    sink,
+                ):
                     try:
                         self.pipeline.remove(el)
                     except Exception:
                         pass
                 return False
             if not jpegenc.link(sink):
-                self.logger.error(f"❌ Failed to link jpegenc→sink for sensor {sensor_id}")
-                for el in (queue, conv_pre, caps_pre, osd, conv_post, caps_post, jpegenc, sink):
+                self.logger.error(
+                    f"❌ Failed to link jpegenc→sink for sensor {sensor_id}"
+                )
+                for el in (
+                    queue,
+                    conv_pre,
+                    caps_pre,
+                    osd,
+                    conv_post,
+                    caps_post,
+                    jpegenc,
+                    sink,
+                ):
                     try:
                         self.pipeline.remove(el)
                     except Exception:
@@ -2096,7 +3864,16 @@ class DeepStreamVideoPipeline:
                 demux_index = self.source_idx_by_sensor_id.get(sensor_id, None)
                 if demux_index is None:
                     self.logger.error(f"❌ No demux index for sensor {sensor_id}")
-                    for el in (queue, conv_pre, caps_pre, osd, conv_post, caps_post, jpegenc, sink):
+                    for el in (
+                        queue,
+                        conv_pre,
+                        caps_pre,
+                        osd,
+                        conv_post,
+                        caps_post,
+                        jpegenc,
+                        sink,
+                    ):
                         try:
                             self.pipeline.remove(el)
                         except Exception:
@@ -2107,13 +3884,28 @@ class DeepStreamVideoPipeline:
             else:
                 # If we already know pad name, map to index and get/reuse pad
                 try:
-                    demux_index = int(pad_name.split('_')[1])
+                    demux_index = int(pad_name.split("_")[1])
                 except Exception:
                     demux_index = None
-                req_pad = self._get_or_request_demux_pad(demux_index) if demux_index is not None else None
+                req_pad = (
+                    self._get_or_request_demux_pad(demux_index)
+                    if demux_index is not None
+                    else None
+                )
             if not req_pad:
-                self.logger.error(f"❌ Failed to request demux pad {pad_name} for sensor {sensor_id}")
-                for el in (queue, conv_pre, caps_pre, osd, conv_post, caps_post, jpegenc, sink):
+                self.logger.error(
+                    f"❌ Failed to request demux pad {pad_name} for sensor {sensor_id}"
+                )
+                for el in (
+                    queue,
+                    conv_pre,
+                    caps_pre,
+                    osd,
+                    conv_post,
+                    caps_post,
+                    jpegenc,
+                    sink,
+                ):
                     try:
                         self.pipeline.remove(el)
                     except Exception:
@@ -2123,9 +3915,20 @@ class DeepStreamVideoPipeline:
             sink_pad = queue.get_static_pad("sink")
             # Ensure the queue sink pad is active before linking
             if sink_pad is None:
-                self.logger.error(f"❌ Missing sink pad on queue for sensor {sensor_id}")
+                self.logger.error(
+                    f"❌ Missing sink pad on queue for sensor {sensor_id}"
+                )
                 # Do not release req_pad here since it is managed in the reuse maps
-                for el in (queue, conv_pre, caps_pre, osd, conv_post, caps_post, jpegenc, sink):
+                for el in (
+                    queue,
+                    conv_pre,
+                    caps_pre,
+                    osd,
+                    conv_post,
+                    caps_post,
+                    jpegenc,
+                    sink,
+                ):
                     try:
                         self.pipeline.remove(el)
                     except Exception:
@@ -2133,16 +3936,36 @@ class DeepStreamVideoPipeline:
                 return False
             link_ret = req_pad.link(sink_pad)
             if link_ret != Gst.PadLinkReturn.OK:
-                self.logger.error(f"❌ Failed to link demux {pad_name} to JPEG queue for sensor {sensor_id} (ret={link_ret})")
+                self.logger.error(
+                    f"❌ Failed to link demux {pad_name} to JPEG queue for sensor {sensor_id} (ret={link_ret})"
+                )
                 # Do not release req_pad here since it is managed in the reuse maps
-                for el in (queue, conv_pre, caps_pre, osd, conv_post, caps_post, jpegenc, sink):
+                for el in (
+                    queue,
+                    conv_pre,
+                    caps_pre,
+                    osd,
+                    conv_post,
+                    caps_post,
+                    jpegenc,
+                    sink,
+                ):
                     try:
                         self.pipeline.remove(el)
                     except Exception:
                         pass
                 return False
 
-            self._stream_branch_elements[sensor_id] = [queue, conv_pre, caps_pre, osd, conv_post, caps_post, jpegenc, sink]
+            self._stream_branch_elements[sensor_id] = [
+                queue,
+                conv_pre,
+                caps_pre,
+                osd,
+                conv_post,
+                caps_post,
+                jpegenc,
+                sink,
+            ]
             self._demux_requested_pads[sensor_id] = req_pad
             # If calibration already known, also map sensor→pad
             self._demux_requested_pads_by_sensor[sensor_id] = req_pad
@@ -2158,10 +3981,14 @@ class DeepStreamVideoPipeline:
                 jpegenc.sync_state_with_parent()
                 sink.sync_state_with_parent()
 
-            self.logger.info(f"✅ JPEG branch ready for sensor {sensor_id} via request pad {pad_name}")
+            self.logger.info(
+                f"✅ JPEG branch ready for sensor {sensor_id} via request pad {pad_name}"
+            )
             return True
         except Exception as e:
-            self.logger.error(f"❌ Exception while adding JPEG branch for sensor {sensor_id}: {e}")
+            self.logger.error(
+                f"❌ Exception while adding JPEG branch for sensor {sensor_id}: {e}"
+            )
             return False
 
     def _remove_jpeg_branch_for_sensor(self, sensor_id: int) -> None:
@@ -2172,7 +3999,9 @@ class DeepStreamVideoPipeline:
                 try:
                     self.demux.release_request_pad(req_pad)
                 except Exception as e:
-                    self.logger.debug(f"Error releasing request pad for sensor {sensor_id}: {e}")
+                    self.logger.debug(
+                        f"Error releasing request pad for sensor {sensor_id}: {e}"
+                    )
 
             # Remove elements
             elements = self._stream_branch_elements.pop(sensor_id, None)
@@ -2182,10 +4011,14 @@ class DeepStreamVideoPipeline:
                         el.set_state(Gst.State.NULL)
                         self.pipeline.remove(el)
                     except Exception as e:
-                        self.logger.debug(f"Error removing element {el.get_name()} for sensor {sensor_id}: {e}")
+                        self.logger.debug(
+                            f"Error removing element {el.get_name()} for sensor {sensor_id}: {e}"
+                        )
             self.logger.info(f"✅ Removed JPEG branch for sensor {sensor_id}")
         except Exception as e:
-            self.logger.debug(f"Error tearing down JPEG branch for sensor {sensor_id}: {e}")
+            self.logger.debug(
+                f"Error tearing down JPEG branch for sensor {sensor_id}: {e}"
+            )
 
     def _setup_jpeg_branches_with_request_pads(self) -> None:
         # Backward-compat alias; now builds full per-stream branches with OSD
@@ -2196,7 +4029,9 @@ class DeepStreamVideoPipeline:
         pad_name = pad.get_name()
         self.logger.debug(f"Demuxer removed pad notification: {pad_name}")
 
-    def _on_new_jpeg_sample(self, appsink: GstApp.AppSink, sensor_id: int) -> Gst.FlowReturn:
+    def _on_new_jpeg_sample(
+        self, appsink: GstApp.AppSink, sensor_id: int
+    ) -> Gst.FlowReturn:
         """Callback for GPU JPEG appsink – push encoded JPEG bytes to the correct queue"""
         try:
             true_id = sensor_id
@@ -2222,11 +4057,18 @@ class DeepStreamVideoPipeline:
                 return Gst.FlowReturn.ERROR
 
             try:
-                jpeg_bytes = mapinfo.data
-                if jpeg_bytes:
+                jpeg_data = mapinfo.data
+                pts_us: Optional[int] = None
+                pts_ns = getattr(buffer, "pts", None)
+                if pts_ns not in (None, Gst.CLOCK_TIME_NONE):
+                    pts_us = int(int(pts_ns) // 1_000)
+                if jpeg_data:
+                    payload_bytes = bytes(jpeg_data)
                     if true_id in self.jpeg_queues:
                         try:
-                            self.jpeg_queues[true_id].put_nowait(bytes(jpeg_bytes))
+                            self.jpeg_queues[true_id].put_nowait(
+                                (payload_bytes, pts_us)
+                            )
                             # Count only frames successfully enqueued (exclude dropped frames)
                             with self.frame_count_lock:
                                 self.frame_count += 1
@@ -2234,10 +4076,12 @@ class DeepStreamVideoPipeline:
                             # Drop frame if queue is full; do not increment frame_count
                             pass
                     else:
-                        self.rate_limited_logger.warning(f"No JPEG queue for source_id {true_id}")
+                        self.rate_limited_logger.warning(
+                            f"No JPEG queue for source_id {true_id}"
+                        )
                     # Also store latest bytes for crop decoding
                     try:
-                        self._latest_jpeg_bytes_by_sensor[int(true_id)] = bytes(jpeg_bytes)
+                        self._latest_jpeg_bytes_by_sensor[int(true_id)] = payload_bytes
                     except Exception:
                         pass
             finally:
@@ -2253,113 +4097,132 @@ class DeepStreamVideoPipeline:
 
             return Gst.FlowReturn.OK
         except Exception as e:
-            self.logger.error(f"Error in _on_new_jpeg_sample for sensor {sensor_id}: {e}")
+            self.logger.error(
+                f"Error in _on_new_jpeg_sample for sensor {sensor_id}: {e}"
+            )
             return Gst.FlowReturn.ERROR
 
-    def read_encoded_jpeg(self, source_id: int, timeout: float = 0.1) -> Tuple[bool, Optional[bytes]]:
-        """Return next encoded JPEG bytes for a specific sensor_id from the GPU pipeline."""
+    def read_encoded_jpeg(
+        self, source_id: int, timeout: float = 0.1
+    ) -> Tuple[bool, Optional[bytes], Optional[int]]:
+        """Return next encoded JPEG bytes and presentation timestamp for a sensor."""
         if not self.running or source_id not in self.jpeg_queues:
-            return False, None
+            return False, None, None
         try:
-            jpeg_bytes = self.jpeg_queues[source_id].get(timeout=timeout)
-            return True, jpeg_bytes
+            item = self.jpeg_queues[source_id].get(timeout=timeout)
         except queue.Empty:
-            return False, None
+            return False, None, None
+
+        if isinstance(item, tuple):
+            jpeg_bytes, pts_us = item
+        else:
+            jpeg_bytes, pts_us = item, None
+        return True, jpeg_bytes, pts_us
 
     def update_confidence_threshold(self, confidence_threshold: float) -> bool:
         """Update confidence threshold in real-time using GObject properties
-        
+
         Args:
             confidence_threshold: New confidence threshold (0.0-1.0)
-            
+
         Returns:
             bool: True if successful, False otherwise
         """
         try:
             if not self.pipeline or not self.nvinfer:
-                self.logger.warning("Pipeline or nvinfer not available for confidence threshold update")
+                self.logger.warning(
+                    "Pipeline or nvinfer not available for confidence threshold update"
+                )
                 return False
-            
+
             # Update nvinfer confidence threshold property
             self.nvinfer.set_property("confidence-threshold", confidence_threshold)
-            self.logger.info(f"✅ Updated confidence threshold to: {confidence_threshold}")
+            self.logger.info(
+                f"✅ Updated confidence threshold to: {confidence_threshold}"
+            )
             return True
-            
+
         except Exception as e:
             self.logger.error(f"❌ Failed to update confidence threshold: {e}")
             return False
 
     def update_iou_threshold(self, iou_threshold: float) -> bool:
         """Update IOU threshold in real-time using GObject properties
-        
+
         Args:
             iou_threshold: New IOU threshold (0.0-1.0)
-            
+
         Returns:
             bool: True if successful, False otherwise
         """
         try:
             if not self.pipeline or not self.nvinfer:
-                self.logger.warning("Pipeline or nvinfer not available for IOU threshold update")
+                self.logger.warning(
+                    "Pipeline or nvinfer not available for IOU threshold update"
+                )
                 return False
-            
+
             # Update nvinfer IOU threshold property
             self.nvinfer.set_property("iou-threshold", iou_threshold)
             self.logger.info(f"✅ Updated IOU threshold to: {iou_threshold}")
             return True
-            
+
         except Exception as e:
             self.logger.error(f"❌ Failed to update IOU threshold: {e}")
             return False
 
     def set_detection_enabled(self, enabled: bool) -> bool:
         """Enable or disable detection in real-time using GObject properties
-        
+
         Args:
             enabled: Whether detection should be enabled
-            
+
         Returns:
             bool: True if successful, False otherwise
         """
         try:
             if not self.pipeline or not self.nvinfer:
-                self.logger.warning("Pipeline or nvinfer not available for detection enable/disable")
+                self.logger.warning(
+                    "Pipeline or nvinfer not available for detection enable/disable"
+                )
                 return False
-            
+
             # Update nvinfer enable property
             self.nvinfer.set_property("enable", enabled)
             self.logger.info(f"✅ Updated detection enabled to: {enabled}")
             return True
-            
+
         except Exception as e:
             self.logger.error(f"❌ Failed to update detection enabled: {e}")
             return False
 
     def update_target_classes(self, target_classes: List[int]) -> bool:
         """Update target classes in real-time using GObject properties
-        
+
         Args:
             target_classes: List of class IDs to detect
-            
+
         Returns:
             bool: True if successful, False otherwise
         """
         try:
             if not self.pipeline or not self.nvinfer:
-                self.logger.warning("Pipeline or nvinfer not available for target classes update")
+                self.logger.warning(
+                    "Pipeline or nvinfer not available for target classes update"
+                )
                 return False
-            
+
             # Convert class list to string format for custom library
             class_string = ",".join(map(str, target_classes))
-            
+
             # Update custom library properties for class filtering
             # This requires the custom library to support class filtering via properties
             custom_props = f"target-classes:{class_string}"
             self.nvinfer.set_property("custom-lib-props", custom_props)
-            
+
             self.logger.info(f"✅ Updated target classes to: {target_classes}")
             return True
-            
+
         except Exception as e:
             self.logger.error(f"❌ Failed to update target classes: {e}")
             return False
@@ -2380,18 +4243,20 @@ class DeepStreamVideoPipeline:
                     self.sensor_ids.append(sensor_id)
                 # Default metadata if unknown
                 self.source_info[sensor_id] = {
-                    'name': f'Camera_{sensor_id}',
-                    'clean_name': f'camera-{sensor_id}',
-                    'url': uri,
-                    'width': self.max_width,
-                    'height': self.max_height,
+                    "name": f"Camera_{sensor_id}",
+                    "clean_name": f"camera-{sensor_id}",
+                    "url": uri,
+                    "width": self.max_width,
+                    "height": self.max_height,
                 }
                 # Ensure queue and tracking state exist
                 if sensor_id not in self.jpeg_queues:
                     self.jpeg_queues[sensor_id] = queue.Queue(maxsize=30)
                 if sensor_id not in self.live_tracking_state:
                     self.live_tracking_state[sensor_id] = {
-                        'active_tracks': [], 'occupancy': {}, 'transitions': []
+                        "active_tracks": [],
+                        "occupancy": {},
+                        "transitions": [],
                     }
                 # Request pad for new index and calibrate via one-shot probe
                 new_index = self.source_idx_by_sensor_id.get(sensor_id)
@@ -2403,11 +4268,15 @@ class DeepStreamVideoPipeline:
                 # Build stream branch (will use calibrated pad when ready)
                 ok = self._add_jpeg_branch_for_sensor(sensor_id)
                 if not ok:
-                    self.logger.error(f"❌ Failed to create JPEG branch for sensor {sensor_id}")
+                    self.logger.error(
+                        f"❌ Failed to create JPEG branch for sensor {sensor_id}"
+                    )
                     return False
                 return True
             else:
-                self.logger.error(f"❌ Failed to add sensor {sensor_id}: {resp.status_code} {resp.text}")
+                self.logger.error(
+                    f"❌ Failed to add sensor {sensor_id}: {resp.status_code} {resp.text}"
+                )
                 return False
         except Exception as e:
             self.logger.error(f"❌ Exception while adding sensor: {e}")
@@ -2441,7 +4310,7 @@ class DeepStreamVideoPipeline:
                 if pad_obj is not None:
                     # Remove from index map too
                     try:
-                        idx = int(pad_obj.get_name().split('_')[1])
+                        idx = int(pad_obj.get_name().split("_")[1])
                         self._demux_requested_pads_by_index.pop(idx, None)
                     except Exception:
                         pass
@@ -2451,14 +4320,16 @@ class DeepStreamVideoPipeline:
                         pass
                 return True
             else:
-                self.logger.error(f"❌ Failed to remove sensor {sensor_id}: {resp.status_code} {resp.text}")
+                self.logger.error(
+                    f"❌ Failed to remove sensor {sensor_id}: {resp.status_code} {resp.text}"
+                )
                 return False
         except Exception as e:
             self.logger.error(f"❌ Exception while removing sensor: {e}")
             return False
 
     def toggle_trail_visualization(self, enabled: bool):
-          self.set_trail_visualization(enabled)
+        self.set_trail_visualization(enabled)
 
     def set_trail_visualization(self, enabled: bool):
         """Enable or disable trail visualization in real-time."""
@@ -2487,7 +4358,7 @@ class DeepStreamVideoPipeline:
         batch_meta = pyds.gst_buffer_get_nvds_batch_meta(hash(gst_buffer))
         if not batch_meta:
             return Gst.PadProbeReturn.OK
-        
+
         # Phase 1 ─ Update histories from current detections (global)
         l_frame = batch_meta.frame_meta_list
         while l_frame:
@@ -2495,10 +4366,13 @@ class DeepStreamVideoPipeline:
             l_obj = frame_meta.obj_meta_list
             while l_obj:
                 obj_meta = pyds.NvDsObjectMeta.cast(l_obj.data)
+                if self._is_object_excluded(obj_meta):
+                    l_obj = l_obj.next
+                    continue
                 tid = obj_meta.object_id
                 if tid != -1:
                     cx = obj_meta.rect_params.left + obj_meta.rect_params.width / 2
-                    cy = obj_meta.rect_params.top  + obj_meta.rect_params.height
+                    cy = obj_meta.rect_params.top + obj_meta.rect_params.height
                     self.trail_history[tid].append((cx, cy))
                     # Also maintain per-sensor state
                     sid = int(frame_meta.source_id)
@@ -2509,11 +4383,13 @@ class DeepStreamVideoPipeline:
 
         # Phase 2 ─ Prune stale tracks (per-sensor maps)
         for sid, last_seen_map in list(self.trail_last_seen_by_sensor.items()):
-            for tid in [t for t, ts in list(last_seen_map.items()) if now - ts > self.trail_timeout_s]:
+            for tid in [
+                t
+                for t, ts in list(last_seen_map.items())
+                if now - ts > self.trail_timeout_s
+            ]:
                 self.trail_last_seen_by_sensor[sid].pop(tid, None)
                 self.trail_history_by_sensor[sid].pop(tid, None)
-
-
 
         # ────────────────── Phase 3 ─ Draw all trails into one overlay (batched OSD legacy)
         l_frame = batch_meta.frame_meta_list
@@ -2521,26 +4397,37 @@ class DeepStreamVideoPipeline:
             frame_meta = pyds.NvDsFrameMeta.cast(l_frame.data)
 
             display_meta = pyds.nvds_acquire_display_meta_from_pool(batch_meta)
-            if not display_meta:                 # pool exhausted – skip
+            if not display_meta:  # pool exhausted – skip
                 l_frame = l_frame.next
                 continue
-            display_meta.num_lines  = 0
+            display_meta.num_lines = 0
             display_meta.num_labels = 0
+            line_capacity = len(display_meta.line_params)
+            label_capacity = len(display_meta.text_params)
 
-            active_ids = [tid for tid, pts in self.trail_history.items()
-                          if len(pts) > 1]
+            active_ids = [
+                tid for tid, pts in self.trail_history.items() if len(pts) > 1
+            ]
 
-            budget_per_track = (250 // len(active_ids)) if active_ids else 250
+            budget_per_track = (line_capacity // len(active_ids)) if active_ids else line_capacity
             budget_per_track = max(1, budget_per_track)
 
             for tid in active_ids:
-                pts = list(self.trail_history[tid])[-(min(self.config.visualization.TRAIL_DRAW_SEGMENTS, budget_per_track) + 1):]
+                pts = list(self.trail_history[tid])[
+                    -(
+                        min(
+                            self.config.visualization.TRAIL_DRAW_SEGMENTS,
+                            budget_per_track,
+                        )
+                        + 1
+                    ) :
+                ]
 
                 # draw segments
                 for idx in range(len(pts) - 1):  # -1 because we access idx+1
-                    if display_meta.num_lines >= 250:
+                    if display_meta.num_lines >= line_capacity:
                         break
-                    
+
                     # Check if we have enough line_params available
                     if display_meta.num_lines >= len(display_meta.line_params):
                         break
@@ -2556,18 +4443,20 @@ class DeepStreamVideoPipeline:
                         r, g, b = self._color_for_track(int(tid))
                     except Exception:
                         r, g, b = (1.0, 1.0, 0.0)
-                    lp.line_color.set(r, g, b, alpha)   # track-specific color
+                    lp.line_color.set(r, g, b, alpha)  # track-specific color
                     display_meta.num_lines += 1
 
                 # optional label
-                if (self.trail_show_labels
-                        and display_meta.num_labels < 16
-                        and display_meta.num_lines < 250
-                        and display_meta.num_labels < len(display_meta.text_params)):
+                if (
+                    self.trail_show_labels
+                    and display_meta.num_labels < label_capacity
+                    and display_meta.num_lines < line_capacity
+                    and display_meta.num_labels < len(display_meta.text_params)
+                ):
                     tp = display_meta.text_params[display_meta.num_labels]
-                    tp.display_text = f"id {tid}"
+                    tp.display_text = _alloc_display_text(f"id {tid}")
                     tp.x_offset, tp.y_offset = map(int, pts[-1])
-                    tp.font_params.font_name = "Serif"
+                    tp.font_params.font_name = _alloc_display_text("Serif")
                     tp.font_params.font_size = 12
                     try:
                         r, g, b = self._color_for_track(int(tid))
@@ -2577,7 +4466,7 @@ class DeepStreamVideoPipeline:
                     tp.set_bg_clr = 0
                     display_meta.num_labels += 1
 
-                if display_meta.num_lines >= 250:
+                if display_meta.num_lines >= line_capacity:
                     break
 
             pyds.nvds_add_display_meta_to_frame(frame_meta, display_meta)
@@ -2602,13 +4491,18 @@ class DeepStreamVideoPipeline:
             frame_meta = pyds.NvDsFrameMeta.cast(l_frame.data)
             # Map DS index to configured sensor_id for display logic
             ds_index_local = int(frame_meta.source_id)
-            mapped_sensor = self.sensor_id_by_source_idx.get(ds_index_local, ds_index_local)
+            mapped_sensor = self.sensor_id_by_source_idx.get(
+                ds_index_local, ds_index_local
+            )
             if int(mapped_sensor) != int(sensor_id):
                 l_frame = l_frame.next
                 continue
             l_obj = frame_meta.obj_meta_list
             while l_obj:
                 obj_meta = pyds.NvDsObjectMeta.cast(l_obj.data)
+                if self._is_object_excluded(obj_meta):
+                    l_obj = l_obj.next
+                    continue
                 tid = obj_meta.object_id
                 # Update per-object bbox label to include track id and detector confidence
                 try:
@@ -2617,14 +4511,18 @@ class DeepStreamVideoPipeline:
                         # Resolve stable_id for overlay if available
                         try:
                             sid_map_key = (int(sensor_id), int(tid))
-                            stable_id = self.stable_id_mgr.active_tracks.get(sid_map_key, {}).get('stable_id')
+                            stable_id = self.stable_id_mgr.active_tracks.get(
+                                sid_map_key, {}
+                            ).get("stable_id")
                         except Exception:
                             stable_id = None
                         if stable_id is not None:
-                            label = f"sid {int(stable_id)} ds {int(tid)} ({conf_value:.2f})"
+                            label = (
+                                f"sid {int(stable_id)} ds {int(tid)} ({conf_value:.2f})"
+                            )
                         else:
                             label = f"ds {int(tid)} ({conf_value:.2f})"
-                        obj_meta.text_params.display_text = label
+                        obj_meta.text_params.display_text = _alloc_display_text(label)
                         # Keep background disabled to avoid covering content
                         obj_meta.text_params.set_bg_clr = 0
                         # Set bbox border color to match track color
@@ -2647,45 +4545,60 @@ class DeepStreamVideoPipeline:
                         height = max(1.0, float(rect.height))
 
                         # Prior state for this (sensor, track)
-                        sensor_map = self._bbox_smooth_by_sensor.setdefault(int(sensor_id), {})
+                        sensor_map = self._bbox_smooth_by_sensor.setdefault(
+                            int(sensor_id), {}
+                        )
                         prev = sensor_map.get(int(tid))
                         # Init entry with history deque
                         if prev is None:
                             from collections import deque as _deque
-                            prev = {'hist_h': _deque(maxlen=240)}  # ~8s at 30 FPS
+
+                            prev = {"hist_h": _deque(maxlen=240)}  # ~8s at 30 FPS
                             sensor_map[int(tid)] = prev
 
                         # Maintain height history within time window
-                        hist = prev.get('hist_h')
+                        hist = prev.get("hist_h")
                         if hist is not None:
                             # prune old
-                            while hist and (now - hist[0][0] > self.bbox_max_drop_window_s):
+                            while hist and (
+                                now - hist[0][0] > self.bbox_max_drop_window_s
+                            ):
                                 hist.popleft()
                             # append current observation
                             hist.append((now, height))
                             # compute recent max height
                             try:
-                                max_h_recent = max(h for (ts, h) in hist) if hist else height
+                                max_h_recent = (
+                                    max(h for (ts, h) in hist) if hist else height
+                                )
                             except Exception:
                                 max_h_recent = height
                             # Apply over-window drop limit (height cannot drop below ratio * recent max)
-                            min_allowed_h = float(max_h_recent) * float(self.bbox_max_drop_ratio)
+                            min_allowed_h = float(max_h_recent) * float(
+                                self.bbox_max_drop_ratio
+                            )
                             if height < min_allowed_h:
                                 height = min_allowed_h
 
                         # Clamp change vs previous size before EMA
                         if prev is not None:
-                            prev_w = max(1.0, float(prev.get('w', width)))
-                            prev_h = max(1.0, float(prev.get('h', height)))
+                            prev_w = max(1.0, float(prev.get("w", width)))
+                            prev_h = max(1.0, float(prev.get("h", height)))
                             max_g = self.bbox_smoothing_max_growth
                             min_s = self.bbox_smoothing_max_shrink
                             # Ensure ratios are sensible
-                            if max_g < 1.0: max_g = 1.0
-                            if min_s <= 0.0 or min_s > 1.0: min_s = 0.85
+                            if max_g < 1.0:
+                                max_g = 1.0
+                            if min_s <= 0.0 or min_s > 1.0:
+                                min_s = 0.85
 
                             # Clamp raw observation before smoothing
-                            width_clamped = max(prev_w * min_s, min(width, prev_w * max_g))
-                            height_clamped = max(prev_h * min_s, min(height, prev_h * max_g))
+                            width_clamped = max(
+                                prev_w * min_s, min(width, prev_w * max_g)
+                            )
+                            height_clamped = max(
+                                prev_h * min_s, min(height, prev_h * max_g)
+                            )
 
                             a = self.bbox_smoothing_alpha
                             new_w = prev_w + a * (width_clamped - prev_w)
@@ -2694,7 +4607,7 @@ class DeepStreamVideoPipeline:
                             new_w, new_h = width, height
 
                         # Anchor choice: bottom-center (default) or center
-                        if self.bbox_smoothing_anchor == 'center':
+                        if self.bbox_smoothing_anchor == "center":
                             cx = left + width * 0.5
                             cy = top + height * 0.5
                             new_left = cx - new_w * 0.5
@@ -2720,10 +4633,12 @@ class DeepStreamVideoPipeline:
                             if not fw or not fh:
                                 try:
                                     # Fallback to NvBufSurface queried from the current GstBuffer
-                                    surf = pyds.get_nvds_buf_surface(hash(gst_buffer), frame_meta.batch_id)  # type: ignore
+                                    surf = pyds.get_nvds_buf_surface(
+                                        hash(gst_buffer), frame_meta.batch_id
+                                    )  # type: ignore
                                     sl = surf.surfaceList[frame_meta.batch_id]
-                                    fw = float(getattr(sl, 'width', 0) or 0)
-                                    fh = float(getattr(sl, 'height', 0) or 0)
+                                    fw = float(getattr(sl, "width", 0) or 0)
+                                    fh = float(getattr(sl, "height", 0) or 0)
                                 except Exception:
                                     fw = float(frame_meta.source_frame_width)
                                     fh = float(frame_meta.source_frame_height)
@@ -2740,9 +4655,9 @@ class DeepStreamVideoPipeline:
                         rect.height = float(max(1.0, new_h))
 
                         # Persist state with timestamp
-                        prev['w'] = float(new_w)
-                        prev['h'] = float(new_h)
-                        prev['ts'] = float(now)
+                        prev["w"] = float(new_w)
+                        prev["h"] = float(new_h)
+                        prev["ts"] = float(now)
                 except Exception:
                     # Never break rendering on smoothing issues
                     pass
@@ -2750,7 +4665,7 @@ class DeepStreamVideoPipeline:
                 if tid != -1:
                     # Compute bottom-center with trail speed clamp
                     cx_raw = obj_meta.rect_params.left + obj_meta.rect_params.width / 2
-                    cy_raw = obj_meta.rect_params.top  + obj_meta.rect_params.height
+                    cy_raw = obj_meta.rect_params.top + obj_meta.rect_params.height
                     prev_pts = self.trail_history_by_sensor[int(sensor_id)][tid]
                     last_ts = self.trail_last_seen_by_sensor[int(sensor_id)].get(tid)
                     cx, cy = cx_raw, cy_raw
@@ -2760,7 +4675,7 @@ class DeepStreamVideoPipeline:
                         if dt > 0.0:
                             dx = cx_raw - px
                             dy = cy_raw - py
-                            dist = (dx*dx + dy*dy) ** 0.5
+                            dist = (dx * dx + dy * dy) ** 0.5
                             max_step = float(self.trail_max_speed_px_per_s) * dt
                             if dist > max_step > 0.0:
                                 scale = max_step / dist
@@ -2791,15 +4706,25 @@ class DeepStreamVideoPipeline:
                 continue
             display_meta.num_lines = 0
             display_meta.num_labels = 0
+            line_capacity = len(display_meta.line_params)
+            label_capacity = len(display_meta.text_params)
             # Draw trails for this sensor only
             sensor_trails = self.trail_history_by_sensor.get(int(sensor_id), {})
             active_ids = [tid for tid, pts in sensor_trails.items() if len(pts) > 1]
-            budget_per_track = (250 // len(active_ids)) if active_ids else 250
+            budget_per_track = (line_capacity // len(active_ids)) if active_ids else line_capacity
             budget_per_track = max(1, budget_per_track)
             for tid in active_ids:
-                pts = list(sensor_trails[tid])[-(min(self.config.visualization.TRAIL_DRAW_SEGMENTS, budget_per_track) + 1):]
+                pts = list(sensor_trails[tid])[
+                    -(
+                        min(
+                            self.config.visualization.TRAIL_DRAW_SEGMENTS,
+                            budget_per_track,
+                        )
+                        + 1
+                    ) :
+                ]
                 for idx in range(len(pts) - 1):
-                    if display_meta.num_lines >= 250:
+                    if display_meta.num_lines >= line_capacity:
                         break
                     if display_meta.num_lines >= len(display_meta.line_params):
                         break
@@ -2815,14 +4740,16 @@ class DeepStreamVideoPipeline:
                         r, g, b = (1.0, 1.0, 0.0)
                     lp.line_color.set(r, g, b, alpha)
                     display_meta.num_lines += 1
-                if (self.trail_show_labels
-                        and display_meta.num_labels < 16
-                        and display_meta.num_lines < 250
-                        and display_meta.num_labels < len(display_meta.text_params)):
+                if (
+                    self.trail_show_labels
+                    and display_meta.num_labels < label_capacity
+                    and display_meta.num_lines < line_capacity
+                    and display_meta.num_labels < len(display_meta.text_params)
+                ):
                     tp = display_meta.text_params[display_meta.num_labels]
-                    tp.display_text = f"id {tid}"
+                    tp.display_text = _alloc_display_text(f"id {tid}")
                     tp.x_offset, tp.y_offset = map(int, pts[-1])
-                    tp.font_params.font_name = "Serif"
+                    tp.font_params.font_name = _alloc_display_text("Serif")
                     tp.font_params.font_size = 12
                     try:
                         r, g, b = self._color_for_track(int(tid))
@@ -2836,19 +4763,16 @@ class DeepStreamVideoPipeline:
         return Gst.PadProbeReturn.OK
 
 
-
-
 def create_deepstream_video_processor(
-    sources: List[Dict[str, Any]],
-    config: AppConfig
+    sources: List[Dict[str, Any]], config: AppConfig
 ) -> DeepStreamVideoPipeline:
     """
     Factory function to create multi-stream DeepStream video processor.
-    
+
     Args:
         sources: List of video source configurations from config.py
         config: Application configuration
-        
+
     Returns:
         Configured multi-stream DeepStream video pipeline
     """
@@ -2857,7 +4781,7 @@ def create_deepstream_video_processor(
         config=config,
         websocket_port=config.websocket.PORT,
         config_file="pipelines/config_infer_primary_yolo11.ini",
-        preproc_config="pipelines/config_preproc.ini"
+        preproc_config="pipelines/config_preproc.ini",
     )
 
 
@@ -2867,26 +4791,36 @@ if __name__ == "__main__":
     from config import config
 
     parser = argparse.ArgumentParser(description="Test DeepStream Video Pipeline")
-    
+
     # Define the default RTSP URI
-    default_rtsp_uri = os.environ.get("NOESIS_RTSP_URI", "rtsps://192.168.3.214:7441/jdr9oLlBkjyl3gDm?enableSrtp")
-    
-    parser.add_argument("--source-uri", default=default_rtsp_uri, help="Video source (RTSP URL)")
-    parser.add_argument("--duration", type=int, default=30, help="Test duration in seconds")
+    default_rtsp_uri = os.environ.get(
+        "NOESIS_RTSP_URI", "rtsps://192.168.3.214:7441/jdr9oLlBkjyl3gDm?enableSrtp"
+    )
+
+    parser.add_argument(
+        "--source-uri", default=default_rtsp_uri, help="Video source (RTSP URL)"
+    )
+    parser.add_argument(
+        "--duration", type=int, default=30, help="Test duration in seconds"
+    )
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO)
 
     # Create test sources from enabled RTSP streams in config
-    test_sources = [stream for stream in config.cameras.RTSP_STREAMS if stream.get('enabled', True)]
+    test_sources = [
+        stream for stream in config.cameras.RTSP_STREAMS if stream.get("enabled", True)
+    ]
     if not test_sources:
         print("❌ No enabled RTSP streams found in config")
         exit(1)
-    
+
     print(f"🎥 Testing with {len(test_sources)} streams:")
     for i, source in enumerate(test_sources):
-        print(f"  Stream {i}: {source.get('name', 'Unknown')} - {source.get('url', 'No URL')}")
-    
+        print(
+            f"  Stream {i}: {source.get('name', 'Unknown')} - {source.get('url', 'No URL')}"
+        )
+
     # Create multi-stream pipeline
     pipeline = create_deepstream_video_processor(test_sources, config)
 
@@ -2895,7 +4829,7 @@ if __name__ == "__main__":
 
         # Read frames for specified duration
         start_time = time.time()
-        
+
         while time.time() - start_time < args.duration:
             # The main logic is handled by the pipeline and probes now.
             # We just need to keep the script alive.

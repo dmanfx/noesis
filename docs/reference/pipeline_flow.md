@@ -23,18 +23,21 @@ The refactored pipeline eliminates redundancy:
 graph TD
     subgraph "DeepStream GStreamer Pipeline"
         A[RTSP Streams] --> B[nvmultiurisrcbin]
-        B --> C[nvdspreprocess]
+        B --> C[nvdspreprocess (primary)]
         C --> D[nvinfer - Primary YOLO11]
         D --> E[nvdsanalytics (exclude)]
-        E --> F[nvtracker]
-        F --> G[nvdsanalytics (post)]
-        G --> H[nvstreamdemux]
+        E --> F[nvdspreprocess (MapAnything fused)]
+        F --> G[nvinfer - MapAnything SGIE (UID 22)]
+        G --> H[nvtracker]
+        H --> I[nvdsanalytics (post)]
+        I --> J[nvstreamdemux]
     end
 
     subgraph "Python Application"
-        I -- Demuxed Streams --> J[Dynamic JPEG Branches]
-        J -- Encoded JPEGs --> K[WebSocket Server]
-        L[Analytics Probe] -- Telemetry --> K
+        J -- Demuxed Streams --> K[Dynamic JPEG Branches]
+        K -- Encoded JPEGs --> L[WebSocket Server]
+        M[Analytics Probe] -- Telemetry --> L
+        N[MapAnything Depth Probe] -- Depth Metadata --> L
     end
 %%
 
@@ -54,10 +57,12 @@ graph LR
 graph TD
     A[Preprocessed Batch] --> B[Primary Inference - YOLO11]
     B --> C[Exclusion Analytics]
-    C --> D[Object Tracking]
-    D --> E[Post-Tracker Analytics]
-    E --> F[OSD Overlay]
-    F --> G[nvstreamdemux]
+    C --> D[MapAnything Fused Preprocess]
+    D --> E[MapAnything SGIE (UID 22)]
+    E --> F[Object Tracking]
+    F --> G[Post-Tracker Analytics]
+    G --> H[OSD Overlay]
+    H --> I[nvstreamdemux]
 %%
 
 %%% 3. Output & Telemetry
@@ -69,6 +74,7 @@ graph TD
     D --> E[appsink (per-branch)]
     E --> F[WebSocket Server]
     G[Analytics Probe (batched)] --> F
+    H[MapAnything Depth Probe] --> F
 %%
 
 %% Performance Improvements
@@ -106,6 +112,11 @@ pipelines/config_preproc.ini
 - Defines GPU-accelerated preprocessing steps
 - Resizing, color space conversion, normalization
 - Applied by the nvdspreprocess element
+
+pipelines/config_preprocess_mapanything_fused.ini
+- Loads the custom fused-input preprocess library
+- Crops PGIE ROIs, normalizes RGB, appends intrinsics channels
+- Provides tensor meta `mapanything_fused` for the SGIE
 %%
 
 %%% Analytics Configuration
@@ -119,6 +130,11 @@ pipelines/config_nvdsanalytics_post.ini (post-tracker)
 %%
 pipelines/config_infer_secondary_classification.ini
 - SGIE pathway present in code but not linked; reserved for future use
+
+pipelines/config_infer_secondary_mapanything_fused.ini
+- `nvinfer` SGIE consuming the fused tensor
+- Loads `ma_model_fp16_b3_fused.plan` (TensorRT FP16, batch 3)
+- Emits tensor metadata for `_mapanything_depth_probe`
 %%
 
 %% Error Handling and Recovery

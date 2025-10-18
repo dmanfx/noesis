@@ -6,6 +6,7 @@ import base64
 import hashlib
 import logging
 import os
+import signal
 import threading
 import time
 from dataclasses import dataclass
@@ -551,6 +552,16 @@ def _create_logger() -> RateLimitedLogger:
     return RateLimitedLogger(base_logger, rate_limit_seconds=2.0)
 
 
+def monitor_parent() -> None:
+    """Monitor parent process and shutdown server if parent dies."""
+    while True:
+        if os.getppid() == 1:
+            logger.info("Parent process died, shutting down MapAnything service")
+            os.kill(os.getpid(), signal.SIGTERM)
+            break
+        time.sleep(1)
+
+
 # ---------------------------------------------------------------------------
 # FastAPI wiring
 # ---------------------------------------------------------------------------
@@ -603,6 +614,8 @@ async def on_startup() -> None:
     os.environ.setdefault("CUDA_VISIBLE_DEVICES", state.config.inference.device.split(":")[-1])
     torch.backends.cuda.matmul.allow_tf32 = True
     await state.ensure_model_loaded()
+    # Start parent process monitor thread
+    threading.Thread(target=monitor_parent, daemon=True).start()
 
 
 @app.get("/health", response_model=HealthResponse)

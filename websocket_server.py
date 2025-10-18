@@ -20,6 +20,7 @@ class WebSocketServer:
         event_loop: Optional[asyncio.AbstractEventLoop] = None,
         stats_callback: Optional[Callable[[], Dict[str, Any]]] = None,
         toggle_callback: Optional[Callable[[str, bool], None]] = None,
+        depth_panel_callback: Optional[Callable[[bool], None]] = None,
         initial_trail_state: bool = True
     ):
         """Initialize the WebSocket server
@@ -37,6 +38,7 @@ class WebSocketServer:
         self.event_loop = event_loop
         self.stats_callback = stats_callback
         self.toggle_callback = toggle_callback
+        self.depth_panel_callback = depth_panel_callback
         self.initial_trail_state = initial_trail_state
         self.connected_clients = set()
         self.server = None
@@ -45,6 +47,7 @@ class WebSocketServer:
         self.logger = logging.getLogger("WebSocketServer")
         self._stats_task = None # Added reference for the periodic stats task
         self._last_stats_info_log: float = 0.0
+        self._depth_panel_state: bool = False
         # Binary frame coalescer state: keep only latest per camera
         self._latest_binary_by_cam: Dict[str, bytes] = {}
         self._binary_flush_task: Optional[asyncio.Task] = None
@@ -578,6 +581,16 @@ class WebSocketServer:
                             await self.broadcast(broadcast_message)
                         else:
                             self.logger.warning(f"Invalid detection config message from {client_ip}: {data}")
+
+                    elif data.get('type') == 'depth_panel_state':
+                        is_open = bool(data.get('open'))
+                        self._depth_panel_state = is_open
+                        self.logger.info(f"Depth panel state from {client_ip}: {'open' if is_open else 'closed'}")
+                        if self.depth_panel_callback:
+                            try:
+                                self.depth_panel_callback(is_open)
+                            except Exception as e:
+                                self.logger.error(f"Error in depth panel callback: {e}")
 
                     # ---- Spatial & calibration RPCs ----
                     # legacy 'get_transformation' removed; calibration-bundle is source of truth

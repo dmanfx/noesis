@@ -107,6 +107,14 @@ class AppConfig:
         DEEPSTREAM_TRACKER_CONFIG: str = "pipelines/tracker_nvdcf.yml"  # Path to tracker config file
         DEEPSTREAM_TRACKER_LIB: str = "/opt/nvidia/deepstream/deepstream/lib/libnvds_nvmultiobjecttracker.so"  # DeepStream tracker library
         DEEPSTREAM_ENABLE_OSD: bool = True  # Enable on-screen display for visualization
+        DEEPSTREAM_MAPANYTHING_PREPROCESS_CONFIG: str = (
+            "pipelines/config_preprocess_mapanything_fused.ini"
+        )
+        DEEPSTREAM_MAPANYTHING_SGIE_CONFIG: str = (
+            "pipelines/config_infer_secondary_mapanything_fused.ini"
+        )
+        MAPANYTHING_INTRINSICS_TABLE: str = "models/mapanything_depth/intrinsics_table.txt"
+        MAPANYTHING_MIN_CONF: float = 0.5
         
         # DEPRECATED: Unified GPU Pipeline Configuration (removed - DeepStream-only now)
         # USE_UNIFIED_GPU_PIPELINE: bool = True  # Enable unified GPU pipeline for optimal performance

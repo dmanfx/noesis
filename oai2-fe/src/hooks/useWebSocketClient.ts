@@ -1,8 +1,33 @@
-import { useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { setCalibration } from '../lib/calibration';
 import { CameraKey, detectCameraKey } from '../lib/camera';
 
-type Track = {
+export interface TrackDepth {
+  method?: string;
+  depth_m?: number;
+  conf?: number;
+  median?: number;
+  p10?: number;
+  p90?: number;
+  conf_mean?: number;
+  valid_ratio?: number;
+  samples?: number;
+  summary_sample_count?: number;
+  scale?: number;
+  pose?: number[];
+  summary?: {
+    median?: number;
+    p10?: number;
+    p90?: number;
+    conf_mean?: number;
+    valid_ratio?: number;
+    sample_count?: number;
+  };
+  world?: [number, number, number];
+  pts_us?: number;
+}
+
+export type Track = {
   track_id: number;
   stable_id?: number | null;
   camera_id: string;
@@ -10,6 +35,12 @@ type Track = {
   center?: [number, number];
   dwell_time?: number;
   velocity?: [number, number];
+  bbox?: [number, number, number, number];
+  world?: [number, number, number];
+  world_valid?: boolean;
+  tracker_confidence?: number;
+  class_id?: number;
+  depth?: TrackDepth;
 };
 
 export type CamerasStats = Record<string, {
@@ -170,6 +201,11 @@ export function useWebSocketClient(url: string, handlers: FrameHandlers) {
           }
 
           if (data.type === 'stats' && data.payload) {
+            try {
+              console.log('[WS] stats payload', data.payload);
+            } catch {
+              // console logging best-effort
+            }
             handlers.onStats(data.payload as StatsPayload);
           } else if (data.type === 'calibration-bundle' && data.data) {
             try { setCalibration(data); } catch {}
@@ -207,12 +243,17 @@ export function useWebSocketClient(url: string, handlers: FrameHandlers) {
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [url, retry]);
 
-  const sendJson = (obj: any) => {
+  const sendJson = useCallback((obj: any) => {
     const ws = socketRef.current;
     if (!ws || ws.readyState !== WebSocket.OPEN) return false;
     ws.send(JSON.stringify(obj));
     return true;
-  };
+  }, []);
+
+  const sendDepthPanelState = useCallback(
+    (open: boolean) => sendJson({ type: 'depth_panel_state', open }),
+    [sendJson]
+  );
 
   return {
     status,
@@ -233,6 +274,7 @@ export function useWebSocketClient(url: string, handlers: FrameHandlers) {
         cache_only: options?.cacheOnly ?? false
       });
       return ok ? requestId : '';
-    }
+    },
+    sendDepthPanelState
   };
 }

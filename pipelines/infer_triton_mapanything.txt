@@ -1,0 +1,52 @@
+################################################################################
+# MapAnything Triton SGIE configuration
+################################################################################
+
+infer_config {
+  unique_id: 12
+  gpu_ids: [0]
+  max_batch_size: 3
+  backend {
+    inputs: [
+      { name: "images" },
+      { name: "intrinsics" }
+    ]
+    outputs: [
+      { name: "depth" },
+      { name: "confidence" }
+    ]
+    triton {
+      model_name: "mapanything_depth"
+      version: -1
+      model_repo {
+        root: "__MODEL_REPO_ROOT__"
+        strict_model_config: true
+      }
+    }
+    output_mem_type: MEMORY_TYPE_GPU
+  }
+
+  input_tensor_from_meta {
+    is_first_dim_batch: true
+  }
+
+  extra {
+    custom_process_funcion: "CreateInferServerCustomProcess"
+    output_buffer_pool_size: 6
+  }
+
+  custom_lib {
+    path: "__CUSTOM_LIB_PATH__"
+  }
+}
+
+input_control {
+  process_mode: PROCESS_MODE_CLIP_OBJECTS
+  operate_on_gie_id: 1
+  operate_on_class_ids: 0
+  secondary_reinfer_interval: 0
+}
+
+output_control {
+  output_tensor_meta: true
+}

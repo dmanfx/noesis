@@ -60,6 +60,12 @@ Key goals:
   - `src/components/DepthDrawer.tsx`: Slide-out diagnostics drawer with heatmap canvas, stats, histogram, and metrics.
   - `src/styles/depth-drawer.css`: Styling for the diagnostics drawer.
 
+## Model Export & TensorRT
+- `export_ma_onnx/export_to_onnx.py` now exports the fused single-input variant by default. The ONNX graph expects a tensor named `mapanything_fused` with shape `(B, 12, H, W)` (`RGB` + tiled 3×3 intrinsics) and lives under `ma_onnx_out_fused/`.
+- The exporter writes `model_fused.onnx`, a simplified copy `model_fused_sim.onnx` (best-effort via `onnxsim`), and `export_report.txt` summarizing checker/ORT status.
+- TensorRT builds target `models/engines/ma_model_fp16_b3_fused.plan` with `mapanything_fused` min/opt/max shapes of `1x12x518x518`, `3x12x518x518`, and `3x12x518x518`. Capture `logs/trtexec_fused_verbose.log` (and tail) when running `trtexec` on a CUDA host.
+- Existing DeepStream configs reference the fused binding only—legacy two-input plans remain available behind the `--no-fused-input` exporter flag for emergency rollbacks.
+
 ## REST & RPC Interfaces
 
 ### Microservice API
@@ -183,5 +189,55 @@ data/depth/<camera_id>/<YYYYMMDD>/<HH>/<timestamp_us>.zarr/
 - `docs/reference/WebSocket_API.md`: Message schemas (updated with MapAnything topics).
 - `docs/reference/Configuration_Map.md`: Config key mapping, including MapAnything entries.
 - `docs/reference/Integrations_Playbook.md`: MQTT/Influx integration details expanded to cover depth summaries.
+
+## DeepStream SGIE Integration
+
+- The DeepStream graph now routes MapAnything depth inference through **`nvdspreprocess → nvinfer (mapanything_sgie_fused)`**, immediately after the exclusion analytics stage and before NvDCF tracking. The fused SGIE consumes a single `(B,12,518,518)` tensor that carries RGB plus broadcast intrinsics channels.
+- Configuration artifacts:
+  - `pipelines/config_preprocess_mapanything_fused.ini` loads the custom preprocess library (`libmapanything_preprocess_fused.so`). It crops PGIE ROIs, normalizes RGB, and appends nine intrinsics channels by reading `MA_INTRINSICS_TABLE`. DeepStream 7.1 expects `network-input-shape=3;12;518;518` (batch;channel;height;width for our three-way SGIE batch) and now requires `scaling-filter=1` plus `scaling-pool-memory-type=2` to satisfy the parser.
+  - `pipelines/config_infer_secondary_mapanything_fused.ini` points `nvinfer` at the fused TensorRT plan (`models/engines/ma_model_fp16_b3_fused.plan`) and exposes tensor metadata with unique ID `22`.
+  - Set overrides via `processing.DEEPSTREAM_MAPANYTHING_PREPROCESS_CONFIG` and `processing.DEEPSTREAM_MAPANYTHING_SGIE_CONFIG` when running outside the repo root. The constructor also ensures `MA_INTRINSICS_TABLE` is set to the configured or default path.
+- Intrinsics table format (per camera):
+
+  ```text
+  <source_id> fx 0 cx 0 fy cy 0 0 1
+  ```
+
+  Each row lists nine floats (row-major 3×3 matrix). Multiple cameras simply append additional lines (source IDs come from DeepStream frame meta).
+- `deepstream_video_pipeline.py` resolves absolute paths for the preprocess/SGIE configs and sets `input-tensor-meta` on both elements so tensor data flows to the pad probe. Intrinsics can be overridden at runtime via the `MA_INTRINSICS_TABLE` environment variable or `set_mapanything_intrinsics_table()`.
+- The MapAnything pad probe still attaches an `NVDS_USER_OBJ_META` payload identical to the legacy service contract. The fused SGIE is the only change in the data path; downstream consumers remain compatible:
+
+```json
+{
+  "mde": {
+    "pts_us": 123456789,
+    "method": "mde",
+    "depth_m": 1.24,
+    "conf": 0.78,
+    "samples": 12,
+    "median": 1.22,
+    "p10": 1.05,
+    "p90": 1.38,
+    "conf_mean": 0.80,
+    "valid_ratio": 0.62,
+    "summary_sample_count": 276,
+    "scale": 0.97,
+    "pose": [0.01, -0.12, 0.34, ...],
+    "world": [0.45, 1.82, 0.15],
+    "summary": {
+      "median": 1.22,
+      "p10": 1.05,
+      "p90": 1.38,
+      "conf_mean": 0.80,
+      "valid_ratio": 0.62,
+      "sample_count": 276
+    }
+  }
+}
+```
+
+- Downstream consumers (tracker, analytics, WebSocket telemetry) continue to read `depth["mde"]`; the additional statistics surface richer context without changing existing keys.
+- During validation expect logs from both `nvdspreprocess` (crop preparation) and `nvinfer` (`NvDsInferContext[UID 22]`). Depth probe messages (`MapAnything depth cam=…`) confirm metadata is attached before NvDCF.
+- Smoke test: `PYTHONPATH=. python3 deepstream_video_pipeline.py --config pipelines/config_infer_primary_yolo11.ini` and watch stdout for preprocess, fused SGIE load, and depth probe lines. Ensure the intrinsics table exists or set `MA_INTRINSICS_TABLE` before start-up.
 
 Maintain this document as the authoritative reference whenever the MapAnything service, adapters, metrics, or front-end diagnostics evolve.

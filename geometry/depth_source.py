@@ -1,4 +1,5 @@
 """HTTP client and storage utilities for MapAnything depth inference."""
+
 from __future__ import annotations
 
 import base64
@@ -9,11 +10,11 @@ import queue
 import shutil
 import threading
 import time
-from collections import OrderedDict, deque
+from collections import OrderedDict, defaultdict, deque
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Deque, Dict, Iterable, List, Mapping, Optional, Tuple
+from typing import Any, Callable, Deque, DefaultDict, Dict, Iterable, List, Mapping, Optional, Set, Tuple
 
 from concurrent.futures import Future
 
@@ -41,7 +42,9 @@ class DepthSummary:
 @dataclass(frozen=True)
 class DepthResult:
     camera_id: str
+    sensor_id: Optional[int]
     ts_us: int
+    frame_pts_us: Optional[int]
     depth: np.ndarray
     conf: np.ndarray
     mask: np.ndarray
@@ -68,6 +71,7 @@ class _BatchItem:
     view_result: ViewBuildResult
     view_payload: Dict[str, object]
     future: Future
+    sensor_id: Optional[int]
 
 
 class DepthStorageManager:
@@ -98,7 +102,11 @@ class DepthStorageManager:
         self._logger = logging.getLogger(__name__)
         self._max_snapshots = max(max_snapshots_per_camera, 0)
         self._retention_us = max(0, int(retention_minutes * 60.0 * 1_000_000))
-        self._max_total_bytes = max_total_bytes if (max_total_bytes is not None and max_total_bytes > 0) else None
+        self._max_total_bytes = (
+            max_total_bytes
+            if (max_total_bytes is not None and max_total_bytes > 0)
+            else None
+        )
         self._async_enabled = bool(enable_async)
         self._max_queue_size = max(1, int(max_queue_size)) if self._async_enabled else 0
         self._initial_workers = 0
@@ -130,7 +138,10 @@ class DepthStorageManager:
         # Background enforcement thread
         self._enforce_thread: Optional[threading.Thread] = None
         self._enforce_stop = threading.Event()
-        if self._max_total_bytes is not None and self._max_total_bytes < 10 * 1024 * 1024:
+        if (
+            self._max_total_bytes is not None
+            and self._max_total_bytes < 10 * 1024 * 1024
+        ):
             self._logger.warning(
                 "Configured max_total_bytes=%s is very small; increasing to 10MB minimum",
                 self._max_total_bytes,
@@ -210,13 +221,16 @@ class DepthStorageManager:
             try:
                 self._write_snapshot(job)
             except Exception as exc:
-                self._logger.error(f"Depth snapshot write failed for {job.camera_id}: {exc}")
+                self._logger.error(
+                    f"Depth snapshot write failed for {job.camera_id}: {exc}"
+                )
             finally:
                 self._queue.task_done()
 
     def _start_enforcer(self) -> None:
         if self._enforce_thread is not None:
             return
+
         def _loop() -> None:
             while not self._enforce_stop.is_set():
                 try:
@@ -226,7 +240,10 @@ class DepthStorageManager:
                     pass
                 # Sleep a bit to batch work and avoid thrash
                 self._enforce_stop.wait(self._enforce_interval_s)
-        self._enforce_thread = threading.Thread(target=_loop, name="DepthRetentionEnforcer", daemon=True)
+
+        self._enforce_thread = threading.Thread(
+            target=_loop, name="DepthRetentionEnforcer", daemon=True
+        )
         self._enforce_thread.start()
 
     def shutdown(self, *, wait: bool = True) -> None:
@@ -288,10 +305,15 @@ class DepthStorageManager:
 
     def _write_snapshot(self, job: _SnapshotJob) -> None:
         job.dest_path.parent.mkdir(parents=True, exist_ok=True)
-        compressor = Blosc(cname="zstd", clevel=self._zarr_clevel, shuffle=Blosc.SHUFFLE)
+        compressor = Blosc(
+            cname="zstd", clevel=self._zarr_clevel, shuffle=Blosc.SHUFFLE
+        )
         root = zarr.open_group(str(job.dest_path), mode="w")
         if self._zarr_chunk_px and self._zarr_chunk_px > 0:
-            chunk_shape = (min(self._zarr_chunk_px, job.depth.shape[0]), min(self._zarr_chunk_px, job.depth.shape[1]))
+            chunk_shape = (
+                min(self._zarr_chunk_px, job.depth.shape[0]),
+                min(self._zarr_chunk_px, job.depth.shape[1]),
+            )
         else:
             # Single-chunk per array to minimize file count
             chunk_shape = job.depth.shape
@@ -383,14 +405,18 @@ class DepthStorageManager:
                 self._retention_us,
             )
 
-    def _enforce_total_size(self, camera_id: str, index: Deque[Tuple[int, Path]]) -> int:
+    def _enforce_total_size(
+        self, camera_id: str, index: Deque[Tuple[int, Path]]
+    ) -> int:
         if not index:
             return 0
         total_bytes = 0
         sizes: List[int] = []
         for _, path in index:
             try:
-                size = sum(file.stat().st_size for file in path.rglob('*') if file.is_file())
+                size = sum(
+                    file.stat().st_size for file in path.rglob("*") if file.is_file()
+                )
             except FileNotFoundError:
                 size = 0
             sizes.append(size)
@@ -536,11 +562,11 @@ class DepthStorageManager:
 
     def load_datasets(self, path: Path) -> Optional[Dict[str, np.ndarray]]:
         try:
-            group = zarr.open_group(str(path), mode='r')
-            depth = np.array(group['depth_z'])
-            conf = np.array(group['conf'])
-            mask = np.array(group['mask'])
-            return {'depth': depth, 'conf': conf, 'mask': mask}
+            group = zarr.open_group(str(path), mode="r")
+            depth = np.array(group["depth_z"])
+            conf = np.array(group["conf"])
+            mask = np.array(group["mask"])
+            return {"depth": depth, "conf": conf, "mask": mask}
         except Exception:
             return None
 
@@ -551,22 +577,68 @@ class MapAnythingDepthSource:
     def __init__(self, config: Optional[ServiceConfig] = None) -> None:
         self.config = config or load_service_config()
         self.session = requests.Session()
-        self.logger = RateLimitedLogger(logging.getLogger(__name__), rate_limit_seconds=2.0)
+        self.logger = RateLimitedLogger(
+            logging.getLogger(__name__), rate_limit_seconds=2.0
+        )
         self.storage = DepthStorageManager(
             Path(self.config.storage.depth_base),
             max_snapshots_per_camera=self.config.storage.max_snapshots_per_camera,
             retention_minutes=self.config.storage.snapshot_retention_minutes,
-            max_total_bytes=getattr(self.config.storage, 'max_total_bytes', None),
-            enable_async=getattr(self.config.storage, 'async_enabled', True),
-            max_queue_size=max(1, int(getattr(self.config.storage, 'queue_size', 32))),
-            worker_count=int(getattr(self.config.storage, 'async_workers', 0)),
-            max_worker_count=int(getattr(self.config.storage, 'async_max_workers', 0)),
-            enforce_async=bool(getattr(self.config.storage, 'enforce_async', True)),
-            enforce_interval_s=float(getattr(self.config.storage, 'enforce_interval_s', 1.0)),
-            size_hysteresis_ratio=float(getattr(self.config.storage, 'quota_hysteresis_ratio', 0.9)),
-            zarr_clevel=int(getattr(self.config.storage, 'zarr_clevel', 5)),
-            zarr_chunk_px=int(getattr(self.config.storage, 'zarr_chunk_px', 128)),
+            max_total_bytes=getattr(self.config.storage, "max_total_bytes", None),
+            enable_async=getattr(self.config.storage, "async_enabled", True),
+            max_queue_size=max(1, int(getattr(self.config.storage, "queue_size", 32))),
+            worker_count=int(getattr(self.config.storage, "async_workers", 0)),
+            max_worker_count=int(getattr(self.config.storage, "async_max_workers", 0)),
+            enforce_async=bool(getattr(self.config.storage, "enforce_async", True)),
+            enforce_interval_s=float(
+                getattr(self.config.storage, "enforce_interval_s", 1.0)
+            ),
+            size_hysteresis_ratio=float(
+                getattr(self.config.storage, "quota_hysteresis_ratio", 0.9)
+            ),
+            zarr_clevel=int(getattr(self.config.storage, "zarr_clevel", 5)),
+            zarr_chunk_px=int(getattr(self.config.storage, "zarr_chunk_px", 128)),
         )
+        self._auto_disable_after_intrinsics = bool(
+            getattr(self.config.storage, "intrinsics_auto_disable", True)
+        )
+        self._intrinsics_path = Path(
+            getattr(
+                self.config.storage,
+                "intrinsics_table_path",
+                "models/mapanything_depth/intrinsics_table.txt",
+            )
+        )
+        self._intrinsics_conf_threshold = float(
+            getattr(self.config.storage, "intrinsics_conf_threshold", 0.7)
+        )
+        self._intrinsics_min_snapshots = max(
+            0, int(getattr(self.config.storage, "intrinsics_min_snapshots", 3))
+        )
+        fallback_snapshots = int(
+            getattr(self.config.storage, "intrinsics_fallback_snapshots", 0)
+        )
+        if fallback_snapshots <= 0:
+            fallback_snapshots = max(1, self._intrinsics_min_snapshots * 2)
+        self._intrinsics_fallback_snapshots = max(
+            self._intrinsics_min_snapshots, fallback_snapshots
+        )
+        self._intrinsics_lock = threading.Lock()
+        self._intrinsics_saved: Set[str] = set()
+        self._snapshots_per_sensor: DefaultDict[str, int] = defaultdict(int)
+        self._conf_sum_per_sensor: DefaultDict[str, float] = defaultdict(float)
+        self._seen_sensor_ids: Set[str] = set()
+        self._intrinsics_best_conf: DefaultDict[str, float] = defaultdict(
+            lambda: float("-inf")
+        )
+        self._intrinsics_best_matrix: Dict[str, np.ndarray] = {}
+        self._camera_sensor_map: Dict[str, int] = {}
+        self._expected_sensor_ids: Set[str] = set()
+        self._intrinsics_ready_callback: Optional[Callable[[], None]] = None
+        self._intrinsics_ready = False
+        self._missing_sensor_logged: Set[str] = set()
+        self._inference_enabled = True
+        self._initialize_intrinsics_tracking()
         self.min_conf = float(self.config.performance.min_conf)
         self.mono_interval = 1.0 / max(self.config.performance.mono_freq_hz, 1e-6)
         self.last_request_per_camera: Dict[str, float] = {}
@@ -578,12 +650,22 @@ class MapAnythingDepthSource:
         self._floorplan_store_dir.mkdir(parents=True, exist_ok=True)
         self._max_depth_cache_entries = 16
         self._max_floorplan_cache_entries = 24
+        self._pending_pts_us: Optional[int] = None
+        self._pending_pts_by_cam: Dict[str, Deque[int]] = {}
+        self._pts_lock = threading.Lock()
+        self._ring_by_cam: Dict[str, Deque[Dict[str, Any]]] = {}
+        self._ring_lock = threading.Lock()
+        self._ring_max = 6
+        self._latest_depth_result_objs: Dict[str, DepthResult] = {}
+        self._latest_result_lock = threading.Lock()
         self._batch_lock = threading.Lock()
         self._batch_condition = threading.Condition(self._batch_lock)
         self._batch_queue: Deque[_BatchItem] = deque()
         self._batch_worker: Optional[threading.Thread] = None
         self._batch_shutdown = False
-        batch_size = max(1, int(getattr(self.config.performance, 'multi_batch_size', 1)))
+        batch_size = max(
+            1, int(getattr(self.config.performance, "multi_batch_size", 1))
+        )
         self._batch_size = batch_size
         # Flush quickly enough to avoid latency while still gathering a few cameras.
         candidate_flush = self.mono_interval * 0.25
@@ -604,11 +686,493 @@ class MapAnythingDepthSource:
         except Exception:
             pass
 
+    def _initialize_intrinsics_tracking(self) -> None:
+        try:
+            self._intrinsics_path.parent.mkdir(parents=True, exist_ok=True)
+        except Exception as exc:
+            self.logger.warning(
+                "Failed to ensure intrinsics directory %s: %s",
+                self._intrinsics_path.parent,
+                exc,
+            )
+        entries = self._read_intrinsics_entries()
+        persisted_entries: Dict[str, Tuple[Optional[str], np.ndarray]] = {
+            sensor_id: (comment, matrix)
+            for sensor_id, (comment, matrix) in entries.items()
+            if comment
+        }
+        placeholder_entries: Dict[str, Tuple[Optional[str], np.ndarray]] = {
+            sensor_id: (comment, matrix)
+            for sensor_id, (comment, matrix) in entries.items()
+            if sensor_id not in persisted_entries
+        }
+        disable_on_start = False
+        if persisted_entries:
+            with self._intrinsics_lock:
+                for sensor_id, (_, matrix) in persisted_entries.items():
+                    self._intrinsics_saved.add(sensor_id)
+                    self._intrinsics_best_matrix[sensor_id] = matrix.copy()
+                    self._intrinsics_best_conf[sensor_id] = float("inf")
+                if self._auto_disable_after_intrinsics:
+                    self._inference_enabled = False
+                    disable_on_start = True
+            self.logger.info(
+                "Loaded %d persisted intrinsics entries from %s",
+                len(persisted_entries),
+                self._intrinsics_path,
+            )
+        if placeholder_entries:
+            self.logger.debug(
+                "Intrinsics table %s contains %d placeholder entries (no camera metadata)",
+                self._intrinsics_path,
+                len(placeholder_entries),
+            )
+        elif self._auto_disable_after_intrinsics:
+            self.logger.debug(
+                "Intrinsics table %s empty; inference will run until thresholds met",
+                self._intrinsics_path,
+            )
+        if disable_on_start:
+            self.logger.info(
+                "MapAnything inference disabled on startup (persisted intrinsics present)"
+            )
+
+        with self._intrinsics_lock:
+            if self._evaluate_intrinsics_ready_locked():
+                self._intrinsics_ready = True
+
+    def configure_sensor_mapping(self, mapping: Mapping[str, int]) -> None:
+        ready_transition = False
+        should_enable = False
+        with self._intrinsics_lock:
+            self._camera_sensor_map = dict(mapping)
+            self._expected_sensor_ids = {str(sensor_id) for sensor_id in mapping.values()}
+            self._missing_sensor_logged.clear()
+            if self._evaluate_intrinsics_ready_locked():
+                if not self._intrinsics_ready:
+                    self._intrinsics_ready = True
+                    ready_transition = True
+            else:
+                if (
+                    self._auto_disable_after_intrinsics
+                    and not self._inference_enabled
+                ):
+                    should_enable = True
+        if should_enable:
+            self.enable_inference(True, source="intrinsics_pending")
+        if ready_transition:
+            self._notify_intrinsics_ready()
+
+    def set_intrinsics_ready_callback(
+        self, callback: Optional[Callable[[], None]]
+    ) -> None:
+        self._intrinsics_ready_callback = callback
+        if callback and self._intrinsics_ready:
+            try:
+                callback()
+            except Exception as exc:
+                self.logger.warning(
+                    "Intrinsics-ready callback raised an exception: %s", exc
+                )
+
+    def _notify_intrinsics_ready(self) -> None:
+        callback = self._intrinsics_ready_callback
+        if callback:
+            try:
+                callback()
+            except Exception as exc:
+                self.logger.warning(
+                    "Intrinsics-ready callback raised an exception: %s", exc
+                )
+
+    def _resolve_sensor_key(
+        self, camera_id: str, sensor_id: Optional[int]
+    ) -> Optional[str]:
+        sensor = sensor_id
+        if sensor is None:
+            sensor = self._camera_sensor_map.get(camera_id)
+        if sensor is None:
+            return None
+        return str(sensor)
+
+    def _evaluate_intrinsics_ready_locked(self) -> bool:
+        if self._expected_sensor_ids:
+            target = set(self._expected_sensor_ids)
+        else:
+            target = set(self._seen_sensor_ids)
+        return bool(target) and target.issubset(self._intrinsics_saved)
+
+    @staticmethod
+    def _intrinsics_sort_key(sensor_id: str) -> Tuple[int, object]:
+        try:
+            return (0, int(sensor_id))
+        except Exception:
+            return (1, sensor_id)
+
+    def _read_intrinsics_entries(
+        self,
+    ) -> "OrderedDict[str, Tuple[Optional[str], np.ndarray]]":
+        entries: "OrderedDict[str, Tuple[Optional[str], np.ndarray]]" = OrderedDict()
+        if not self._intrinsics_path.exists():
+            return entries
+        pending_comment: Optional[str] = None
+        try:
+            with self._intrinsics_path.open("r", encoding="utf-8") as fh:
+                for raw_line in fh:
+                    stripped = raw_line.strip()
+                    if not stripped:
+                        pending_comment = None
+                        continue
+                    if stripped.startswith("#"):
+                        if stripped.lower().startswith("# camera"):
+                            pending_comment = stripped
+                        else:
+                            pending_comment = None
+                        continue
+                    parts = stripped.split()
+                    if len(parts) < 10:
+                        pending_comment = None
+                        continue
+                    sensor_id = parts[0].strip()
+                    try:
+                        values = [float(part) for part in parts[1:10]]
+                    except ValueError:
+                        pending_comment = None
+                        continue
+                    matrix = np.array(values, dtype=np.float32).reshape((3, 3))
+                    entries[sensor_id] = (pending_comment, matrix)
+                    pending_comment = None
+        except Exception as exc:
+            self.logger.warning(
+                "Failed to read intrinsics table %s: %s",
+                self._intrinsics_path,
+                exc,
+            )
+        return entries
+
+    def _write_intrinsics_entries(
+        self, entries: "Mapping[str, Tuple[Optional[str], np.ndarray]]"
+    ) -> None:
+        try:
+            self._intrinsics_path.parent.mkdir(parents=True, exist_ok=True)
+        except Exception as exc:
+            self.logger.warning(
+                "Failed to ensure intrinsics directory %s: %s",
+                self._intrinsics_path.parent,
+                exc,
+            )
+            raise
+        ordered_keys = sorted(entries.keys(), key=self._intrinsics_sort_key)
+        try:
+            with self._intrinsics_path.open("w", encoding="utf-8") as fh:
+                fh.write("# source_id fx 0 cx 0 fy cy 0 0 1\n")
+                for sensor_id in ordered_keys:
+                    comment, matrix = entries[sensor_id]
+                    if comment:
+                        fh.write(f"{comment}\n")
+                    values = " ".join(
+                        f"{float(value):.6f}" for value in matrix.reshape(-1)
+                    )
+                    fh.write(f"{sensor_id} {values}\n")
+        except Exception as exc:
+            self.logger.warning(
+                "Failed to write intrinsics table %s: %s",
+                self._intrinsics_path,
+                exc,
+            )
+            raise
+
+    def _pending_queue(self, camera_id: str) -> Deque[int]:
+        queue = self._pending_pts_by_cam.get(camera_id)
+        if queue is None:
+            queue = deque()
+            self._pending_pts_by_cam[camera_id] = queue
+        return queue
+
+    def _push_pending_pts(self, camera_id: str, pts_us: int) -> None:
+        with self._pts_lock:
+            dq = self._pending_queue(camera_id)
+            dq.append(int(pts_us))
+
+    def _pop_pending_pts(self, camera_id: str) -> Optional[int]:
+        with self._pts_lock:
+            dq = self._pending_pts_by_cam.get(camera_id)
+            if not dq:
+                return None
+            value = dq.popleft()
+            if not dq:
+                self._pending_pts_by_cam.pop(camera_id, None)
+            return value
+
+    def _ring(self, camera_id: str) -> Deque[Dict[str, Any]]:
+        ring = self._ring_by_cam.get(camera_id)
+        if ring is None or ring.maxlen != self._ring_max:
+            ring = deque(maxlen=self._ring_max)
+            self._ring_by_cam[camera_id] = ring
+        return ring
+
+    def put_snapshot(self, result: DepthResult) -> None:
+        snapshot = {
+            "camera_id": result.camera_id,
+            "sensor_id": result.sensor_id,
+            "ts_us": result.ts_us,
+            "frame_pts_us": result.frame_pts_us,
+            "depth": result.depth,
+            "conf": result.conf,
+            "mask": result.mask,
+            "intrinsics": result.intrinsics,
+            "native_intrinsics": result.native_intrinsics,
+            "summary": result.summary,
+            "storage_path": result.storage_path,
+            "K": result.intrinsics
+            if result.intrinsics is not None
+            else result.native_intrinsics,
+        }
+        with self._ring_lock:
+            ring = self._ring(result.camera_id)
+            ring.append(snapshot)
+        # Debug: print each persisted snapshot (helps correlate with probe logs)
+        try:
+            print(
+                f"[DepthSource] snapshot cam={result.camera_id} pts={result.frame_pts_us} ts={result.ts_us}"
+            )
+        except Exception:
+            pass
+
+    def get_by_pts(
+        self,
+        camera_id: str,
+        target_pts_us: Optional[int],
+        tolerance_us: int = 350_000,
+    ) -> Optional[Dict[str, Any]]:
+        if target_pts_us is None:
+            return None
+        with self._ring_lock:
+            ring = list(self._ring_by_cam.get(camera_id) or [])
+        if not ring:
+            return None
+        best: Optional[Dict[str, Any]] = None
+        best_delta = tolerance_us + 1
+        for snap in ring:
+            candidate = snap.get("frame_pts_us") or snap.get("ts_us")
+            if candidate is None:
+                continue
+            try:
+                delta = abs(int(candidate) - int(target_pts_us))
+            except Exception:
+                continue
+            if delta < best_delta:
+                best = snap
+                best_delta = delta
+        # Debug: when closest candidate exceeds tolerance, log miss details
+        if best is not None and best_delta > tolerance_us:
+            try:
+                print(
+                    f"[DepthSource] pts miss cam={camera_id} target={target_pts_us} "
+                    f"best={best.get('frame_pts_us')} delta={best_delta} tol={tolerance_us}"
+                )
+            except Exception:
+                pass
+        if best is not None and best_delta <= tolerance_us:
+            return best
+        return None
+
+    def get_latest_numpy(self, camera_id: str) -> Optional[Dict[str, Any]]:
+        with self._ring_lock:
+            ring = self._ring_by_cam.get(camera_id)
+            if not ring:
+                return None
+            return ring[-1]
+
+    def _maybe_record_intrinsics(self, result: DepthResult) -> None:
+        native = result.native_intrinsics
+        summary = result.summary
+        if native is None or native.shape != (3, 3) or summary is None:
+            return
+
+        sensor_key = self._resolve_sensor_key(result.camera_id, result.sensor_id)
+        if sensor_key is None:
+            if result.camera_id not in self._missing_sensor_logged:
+                self.logger.debug(
+                    "Skipping intrinsics persistence for %s (sensor mapping unavailable)",
+                    result.camera_id,
+                )
+                self._missing_sensor_logged.add(result.camera_id)
+            return
+
+        disable_after = False
+        ready_transition = False
+        saved_payload: Optional[
+            Tuple[str, str, float, float, float, float, float, float, int, bool]
+        ] = None
+
+        try:
+            intrinsics_matrix = np.array(native, dtype=np.float32, copy=True).reshape(
+                (3, 3)
+            )
+        except Exception:
+            return
+
+        with self._intrinsics_lock:
+            if sensor_key in self._intrinsics_saved:
+                return
+
+            conf_mean = float(getattr(summary, "conf_mean", 0.0))
+            if not np.isfinite(conf_mean):
+                conf_mean = 0.0
+            self._snapshots_per_sensor[sensor_key] += 1
+            self._conf_sum_per_sensor[sensor_key] += conf_mean
+            count = self._snapshots_per_sensor[sensor_key]
+
+            best_conf_prev = self._intrinsics_best_conf[sensor_key]
+            if np.isfinite(conf_mean) and conf_mean > best_conf_prev:
+                self._intrinsics_best_conf[sensor_key] = conf_mean
+                self._intrinsics_best_matrix[sensor_key] = intrinsics_matrix.copy()
+            elif sensor_key not in self._intrinsics_best_matrix:
+                self._intrinsics_best_matrix[sensor_key] = intrinsics_matrix.copy()
+
+            avg_conf = self._conf_sum_per_sensor[sensor_key] / float(count)
+            best_conf = max(self._intrinsics_best_conf[sensor_key], conf_mean)
+            if count < self._intrinsics_min_snapshots:
+                self._seen_sensor_ids.add(sensor_key)
+                return
+
+            fallback_persist = False
+            if best_conf < self._intrinsics_conf_threshold:
+                if (
+                    self._intrinsics_fallback_snapshots <= 0
+                    or count < self._intrinsics_fallback_snapshots
+                ):
+                    self._seen_sensor_ids.add(sensor_key)
+                    return
+                fallback_persist = True
+
+            matrix_to_store = self._intrinsics_best_matrix.get(
+                sensor_key, intrinsics_matrix
+            )
+            fx = float(matrix_to_store[0, 0])
+            fy = float(matrix_to_store[1, 1])
+            cx = float(matrix_to_store[0, 2])
+            cy = float(matrix_to_store[1, 2])
+
+            entries = self._read_intrinsics_entries()
+            existing_entry = entries.get(sensor_key)
+            comment = existing_entry[0] if existing_entry else None
+            if not comment and result.camera_id:
+                comment = f"# camera {sensor_key} {result.camera_id}"
+            entries[sensor_key] = (comment, matrix_to_store.copy())
+            try:
+                self._write_intrinsics_entries(entries)
+            except Exception as exc:
+                self.logger.warning(
+                    "Failed to persist intrinsics for sensor %s (%s): %s",
+                    sensor_key,
+                    result.camera_id,
+                    exc,
+                )
+                return
+
+            self._intrinsics_saved.add(sensor_key)
+            self._seen_sensor_ids.add(sensor_key)
+
+            if self._evaluate_intrinsics_ready_locked():
+                if not self._intrinsics_ready:
+                    self._intrinsics_ready = True
+                    ready_transition = True
+                if self._auto_disable_after_intrinsics and self._inference_enabled:
+                    disable_after = True
+
+            saved_payload = (
+                result.camera_id,
+                sensor_key,
+                fx,
+                fy,
+                cx,
+                cy,
+                avg_conf,
+                best_conf,
+                count,
+                fallback_persist,
+            )
+
+        if saved_payload is None:
+            return
+
+        cam_id, sensor_key, fx, fy, cx, cy, avg_conf, best_conf, count, fallback = (
+            saved_payload
+        )
+        if fallback:
+            self.logger.warning(
+                "Persisted intrinsics for sensor %s (%s) via fallback "
+                "(fx=%.3f fy=%.3f cx=%.3f cy=%.3f; avg_conf=%.3f best_conf=%.3f over %d samples)",
+                sensor_key,
+                cam_id,
+                fx,
+                fy,
+                cx,
+                cy,
+                avg_conf,
+                best_conf,
+                count,
+            )
+        else:
+            self.logger.info(
+                "Persisted native intrinsics for sensor %s (%s) "
+                "(fx=%.3f fy=%.3f cx=%.3f cy=%.3f; avg_conf=%.3f best_conf=%.3f over %d samples)",
+                sensor_key,
+                cam_id,
+                fx,
+                fy,
+                cx,
+                cy,
+                avg_conf,
+                best_conf,
+                count,
+            )
+        if ready_transition:
+            self._notify_intrinsics_ready()
+        if disable_after:
+            self.enable_inference(False, source="auto_intrinsics_saved")
+
+    def _record_depth_result(self, result: DepthResult) -> None:
+        try:
+            self.update_depth_cache(result)
+        except Exception as exc:
+            self.logger.debug(
+                f"Depth cache update failed for {result.camera_id}: {exc}"
+            )
+        with self._latest_result_lock:
+            self._latest_depth_result_objs[result.camera_id] = result
+        try:
+            self.put_snapshot(result)
+        except Exception as exc:
+            self.logger.debug(f"Depth ring update failed for {result.camera_id}: {exc}")
+
     def should_infer(self, camera_id: str, timestamp_s: float) -> bool:
         last = self.last_request_per_camera.get(camera_id)
         if last is None:
             return True
         return (timestamp_s - last) >= self.mono_interval
+
+    def enable_inference(self, enable: bool, *, source: str = "manual") -> None:
+        desired = bool(enable)
+        with self._intrinsics_lock:
+            if self._inference_enabled == desired:
+                return
+            self._inference_enabled = desired
+            if desired:
+                self.last_request_per_camera.clear()
+                self._snapshots_per_sensor.clear()
+                self._conf_sum_per_sensor.clear()
+        state = "enabled" if desired else "disabled"
+        self.logger.info("MapAnything inference %s (%s)", state, source)
+
+    def is_inference_enabled(self) -> bool:
+        with self._intrinsics_lock:
+            return self._inference_enabled
+
+    def auto_disable_enabled(self) -> bool:
+        return bool(self._auto_disable_after_intrinsics)
 
     def maybe_infer_mono(
         self,
@@ -616,16 +1180,28 @@ class MapAnythingDepthSource:
         frame_bgr: np.ndarray,
         calib_bundle: Optional[Mapping[str, object]],
         timestamp_s: Optional[float] = None,
+        *,
+        sensor_id: Optional[int] = None,
     ) -> Optional[DepthResult]:
         ts = timestamp_s or time.time()
+        if not self.is_inference_enabled():
+            return None
         if not self.should_infer(camera_id, ts):
             return None
         try:
-            view_result, view_payload = self._prepare_view(camera_id, frame_bgr, calib_bundle)
+            view_result, view_payload = self._prepare_view(
+                camera_id, frame_bgr, calib_bundle
+            )
             if self._batch_size <= 1:
-                result = self._run_single_request(camera_id, ts, view_result, view_payload)
+                result = self._run_single_request(
+                    camera_id, sensor_id, ts, view_result, view_payload
+                )
+                if result is not None:
+                    self._record_depth_result(result)
             else:
-                result = self._submit_batch_request(camera_id, ts, view_result, view_payload)
+                result = self._submit_batch_request(
+                    camera_id, ts, view_result, view_payload, sensor_id
+                )
             self.last_request_per_camera[camera_id] = ts
             return result
         except Exception as exc:
@@ -638,27 +1214,41 @@ class MapAnythingDepthSource:
         frame_bgr: np.ndarray,
         calib_bundle: Optional[Mapping[str, object]],
     ) -> Tuple[ViewBuildResult, Dict[str, object]]:
-        view_result = build_mono_view(frame_bgr, camera_id, calib_bundle)
+        view_result = build_mono_view(
+            frame_bgr,
+            camera_id,
+            calib_bundle,
+            pts_us=self._pending_pts_us,
+        )
         payload = self._serialize_view_payload(camera_id, view_result)
         return view_result, payload
 
-    def _serialize_view_payload(self, camera_id: str, view_result: ViewBuildResult) -> Dict[str, object]:
+    def _serialize_view_payload(
+        self, camera_id: str, view_result: ViewBuildResult
+    ) -> Dict[str, object]:
         view_payload = dict(view_result.payload)
-        view_payload['cam_id'] = camera_id
+        view_payload["cam_id"] = camera_id
 
-        shape = view_payload.get('shape') or view_result.resized_shape
-        view_payload['shape'] = [int(shape[0]), int(shape[1]), int(shape[2])]
+        shape = view_payload.get("shape") or view_result.resized_shape
+        view_payload["shape"] = [int(shape[0]), int(shape[1]), int(shape[2])]
 
-        if 'img_b64' not in view_payload:
-            frame_rgb = view_payload.get('img')
+        if "img_b64" not in view_payload:
+            frame_rgb = view_payload.get("img")
             if frame_rgb is None:
                 raise ValueError("MapAnything view payload missing img_b64 data")
             img_bytes = np.ascontiguousarray(frame_rgb).tobytes()
-            view_payload['img_b64'] = base64.b64encode(img_bytes).decode('ascii')
-        view_payload.pop('img', None)
+            view_payload["img_b64"] = base64.b64encode(img_bytes).decode("ascii")
+        view_payload.pop("img", None)
 
-        if 'intrinsics' not in view_payload and view_result.intrinsics is not None:
-            view_payload['intrinsics'] = view_result.intrinsics.tolist()
+        if "intrinsics" not in view_payload and view_result.intrinsics is not None:
+            view_payload["intrinsics"] = view_result.intrinsics.tolist()
+
+        pending_pts = self._pending_pts_us
+        if pending_pts is not None:
+            pts_int = int(pending_pts)
+            view_payload["pts_us"] = pts_int
+            self._push_pending_pts(camera_id, pts_int)
+            self._pending_pts_us = None
 
         return view_payload
 
@@ -668,6 +1258,7 @@ class MapAnythingDepthSource:
         timestamp_s: float,
         view_result: ViewBuildResult,
         view_payload: Dict[str, object],
+        sensor_id: Optional[int],
     ) -> DepthResult:
         future: Future = Future()
         item = _BatchItem(
@@ -676,6 +1267,7 @@ class MapAnythingDepthSource:
             view_result=view_result,
             view_payload=view_payload,
             future=future,
+            sensor_id=sensor_id,
         )
         with self._batch_condition:
             self._start_batch_worker_locked()
@@ -687,7 +1279,9 @@ class MapAnythingDepthSource:
         if self._batch_worker is not None and self._batch_worker.is_alive():
             return
         self._batch_shutdown = False
-        self._batch_worker = threading.Thread(target=self._batch_loop, name="MapAnythingBatcher", daemon=True)
+        self._batch_worker = threading.Thread(
+            target=self._batch_loop, name="MapAnythingBatcher", daemon=True
+        )
         self._batch_worker.start()
 
     def _batch_loop(self) -> None:
@@ -731,10 +1325,12 @@ class MapAnythingDepthSource:
             return
         self._multi_batches_attempted += 1
         try:
-            parsed = self._invoke_multi(batch)
+            parsed, intrinsics_map = self._invoke_multi(batch)
         except Exception as exc:
             self._multi_batches_fallback += 1
-            self.logger.warning(f"/infer_multi failed ({exc}); falling back to individual requests")
+            self.logger.warning(
+                f"/infer_multi failed ({exc}); falling back to individual requests"
+            )
             for item in batch:
                 self._execute_single(item, suppress_error_log=True)
             return
@@ -742,30 +1338,42 @@ class MapAnythingDepthSource:
         for item in batch:
             entry = parsed.get(item.camera_id)
             if entry is None:
-                self.logger.warning(f"/infer_multi response missing camera {item.camera_id}; retrying singly")
+                self.logger.warning(
+                    f"/infer_multi response missing camera {item.camera_id}; retrying singly"
+                )
                 self._execute_single(item, suppress_error_log=True)
                 continue
             depth, conf, mask = entry
-            self._resolve_item(item, depth, conf, mask)
+            intrinsics = intrinsics_map.get(item.camera_id)
+            self._resolve_item(item, depth, conf, mask, intrinsics=intrinsics)
 
-    def _invoke_multi(self, batch: List[_BatchItem]) -> Dict[str, Tuple[np.ndarray, np.ndarray, np.ndarray]]:
+    def _invoke_multi(
+        self, batch: List[_BatchItem]
+    ) -> Tuple[
+        Dict[str, Tuple[np.ndarray, np.ndarray, np.ndarray]],
+        Dict[str, np.ndarray],
+    ]:
         scene_id = self._next_scene_id()
         payload = {
-            'scene_id': scene_id,
-            'views': [dict(item.view_payload) for item in batch],
+            "scene_id": scene_id,
+            "views": [dict(item.view_payload) for item in batch],
         }
-        response_json = self._post_json('/infer_multi', payload)
+        response_json = self._post_json("/infer_multi", payload)
         return self._parse_multi_response(response_json)
 
-    def _execute_single(self, item: _BatchItem, *, suppress_error_log: bool = False) -> None:
+    def _execute_single(
+        self, item: _BatchItem, *, suppress_error_log: bool = False
+    ) -> None:
         try:
-            payload = {'view': dict(item.view_payload)}
-            response_json = self._post_json('/infer_mono', payload)
-            depth, conf, mask = self._parse_response(response_json)
-            self._resolve_item(item, depth, conf, mask)
+            payload = {"view": dict(item.view_payload)}
+            response_json = self._post_json("/infer_mono", payload)
+            depth, conf, mask, intrinsics = self._parse_response(response_json)
+            self._resolve_item(item, depth, conf, mask, intrinsics=intrinsics)
         except Exception as exc:
             if not suppress_error_log:
-                self.logger.warning(f"/infer_mono fallback failed for {item.camera_id}: {exc}")
+                self.logger.warning(
+                    f"/infer_mono fallback failed for {item.camera_id}: {exc}"
+                )
             if not item.future.done():
                 item.future.set_exception(exc)
 
@@ -775,62 +1383,132 @@ class MapAnythingDepthSource:
         depth: np.ndarray,
         conf: np.ndarray,
         mask: np.ndarray,
+        *,
+        intrinsics: Optional[np.ndarray] = None,
     ) -> None:
         try:
-            result = self._finalize_depth_result(item.camera_id, item.timestamp_s, item.view_result, depth, conf, mask)
+            result = self._finalize_depth_result(
+                item.camera_id,
+                item.sensor_id,
+                item.timestamp_s,
+                item.view_result,
+                depth,
+                conf,
+                mask,
+                intrinsics_override=intrinsics,
+            )
+            self._record_depth_result(result)
             if not item.future.done():
                 item.future.set_result(result)
         except Exception as exc:
             if not item.future.done():
                 item.future.set_exception(exc)
 
+    def _select_intrinsics(
+        self,
+        view_result: ViewBuildResult,
+        override_intrinsics: Optional[np.ndarray],
+    ) -> Optional[np.ndarray]:
+        matrix = self._coerce_intrinsics_matrix(override_intrinsics)
+        if matrix is not None:
+            scale_x, scale_y = view_result.scale_factors
+            return self._unscale_intrinsics(matrix, scale_x, scale_y)
+        if view_result.native_intrinsics is not None:
+            return np.array(view_result.native_intrinsics, dtype=np.float32, copy=True)
+        if view_result.intrinsics is not None:
+            scale_x, scale_y = view_result.scale_factors
+            scaled = np.array(view_result.intrinsics, dtype=np.float32, copy=True)
+            return self._unscale_intrinsics(scaled, scale_x, scale_y)
+        return None
+
     def _finalize_depth_result(
         self,
         camera_id: str,
+        sensor_id: Optional[int],
         timestamp_s: float,
         view_result: ViewBuildResult,
         depth: np.ndarray,
         conf: np.ndarray,
         mask: np.ndarray,
+        *,
+        intrinsics_override: Optional[np.ndarray] = None,
     ) -> DepthResult:
-        depth_aligned, conf_aligned, mask_aligned = self._align_to_original_shape(depth, conf, mask, view_result)
+        depth_aligned, conf_aligned, mask_aligned = self._align_to_original_shape(
+            depth, conf, mask, view_result
+        )
         ts_us = int(timestamp_s * 1_000_000)
-        storage_path = self.storage.store(camera_id, ts_us, depth_aligned, conf_aligned, mask_aligned)
+        storage_path = self.storage.store(
+            camera_id, ts_us, depth_aligned, conf_aligned, mask_aligned
+        )
         summary = self._compute_summary(depth_aligned, conf_aligned, mask_aligned)
-        return DepthResult(
+        frame_pts_us = self._pop_pending_pts(camera_id)
+        intrinsics_matrix = self._select_intrinsics(view_result, intrinsics_override)
+        result = DepthResult(
             camera_id=camera_id,
+            sensor_id=sensor_id,
             ts_us=ts_us,
+            frame_pts_us=frame_pts_us,
             depth=depth_aligned,
             conf=conf_aligned,
             mask=mask_aligned,
-            intrinsics=view_result.native_intrinsics.copy() if view_result.native_intrinsics is not None else None,
-            native_intrinsics=view_result.native_intrinsics.copy() if view_result.native_intrinsics is not None else None,
+            intrinsics=intrinsics_matrix.copy() if intrinsics_matrix is not None else None,
+            native_intrinsics=intrinsics_matrix.copy()
+            if intrinsics_matrix is not None
+            else None,
             summary=summary,
             storage_path=storage_path,
         )
+        try:
+            self._maybe_record_intrinsics(result)
+        except Exception as exc:
+            self.logger.debug(
+                "Intrinsics persistence skipped for %s: %s", camera_id, exc
+            )
+        return result
 
     def _run_single_request(
         self,
         camera_id: str,
+        sensor_id: Optional[int],
         timestamp_s: float,
         view_result: ViewBuildResult,
         view_payload: Dict[str, object],
     ) -> DepthResult:
-        response_json = self._post_json('/infer_mono', {'view': dict(view_payload)})
-        depth, conf, mask = self._parse_response(response_json)
-        return self._finalize_depth_result(camera_id, timestamp_s, view_result, depth, conf, mask)
+        response_json = self._post_json("/infer_mono", {"view": dict(view_payload)})
+        depth, conf, mask, intrinsics_override = self._parse_response(response_json)
+        return self._finalize_depth_result(
+            camera_id,
+            sensor_id,
+            timestamp_s,
+            view_result,
+            depth,
+            conf,
+            mask,
+            intrinsics_override=intrinsics_override,
+        )
 
     def _parse_multi_response(
         self,
         response: Dict[str, object],
-    ) -> Dict[str, Tuple[np.ndarray, np.ndarray, np.ndarray]]:
-        depth_map = response.get('depth_b64')
-        conf_map = response.get('conf_b64')
-        mask_map = response.get('mask_b64') or {}
-        shapes_map = response.get('shapes')
-        if not isinstance(depth_map, dict) or not isinstance(conf_map, dict) or not isinstance(shapes_map, dict):
-            raise ValueError('Multi response missing depth/conf/shape dictionaries')
+    ) -> Tuple[
+        Dict[str, Tuple[np.ndarray, np.ndarray, np.ndarray]],
+        Dict[str, np.ndarray],
+    ]:
+        depth_map = response.get("depth_b64")
+        conf_map = response.get("conf_b64")
+        mask_map = response.get("mask_b64") or {}
+        shapes_map = response.get("shapes")
+        if (
+            not isinstance(depth_map, dict)
+            or not isinstance(conf_map, dict)
+            or not isinstance(shapes_map, dict)
+        ):
+            raise ValueError("Multi response missing depth/conf/shape dictionaries")
         results: Dict[str, Tuple[np.ndarray, np.ndarray, np.ndarray]] = {}
+        intrinsics_raw = response.get("intrinsics")
+        intrinsics_map: Dict[str, np.ndarray] = {}
+        if not isinstance(intrinsics_raw, Mapping):
+            intrinsics_raw = {}
         for cam_id, depth_b64 in depth_map.items():
             shape = shapes_map.get(cam_id)
             if not (isinstance(shape, (list, tuple)) and len(shape) == 2):
@@ -841,16 +1519,30 @@ class MapAnythingDepthSource:
                 raise ValueError(f"Missing confidence tensor for camera {cam_id}")
             mask_b64 = mask_map.get(cam_id)
             try:
-                depth = np.frombuffer(base64.b64decode(depth_b64), dtype=np.float32).reshape((height, width))
-                conf = np.frombuffer(base64.b64decode(conf_b64), dtype=np.float32).reshape((height, width))
+                depth = np.frombuffer(
+                    base64.b64decode(depth_b64), dtype=np.float32
+                ).reshape((height, width))
+                conf = np.frombuffer(
+                    base64.b64decode(conf_b64), dtype=np.float32
+                ).reshape((height, width))
                 if isinstance(mask_b64, str):
-                    mask = np.frombuffer(base64.b64decode(mask_b64), dtype=np.uint8).reshape((height, width)).astype(bool)
+                    mask = (
+                        np.frombuffer(base64.b64decode(mask_b64), dtype=np.uint8)
+                        .reshape((height, width))
+                        .astype(bool)
+                    )
                 else:
                     mask = np.ones((height, width), dtype=bool)
             except Exception as exc:
-                raise ValueError(f"Failed to decode multi response for camera {cam_id}: {exc}") from exc
+                raise ValueError(
+                    f"Failed to decode multi response for camera {cam_id}: {exc}"
+                ) from exc
             results[cam_id] = (depth, conf, mask)
-        return results
+            raw_intrinsics = intrinsics_raw.get(cam_id)
+            matrix = self._coerce_intrinsics_matrix(raw_intrinsics)
+            if matrix is not None:
+                intrinsics_map[cam_id] = matrix
+        return results, intrinsics_map
 
     def _next_scene_id(self) -> str:
         self._multi_scene_counter = (self._multi_scene_counter + 1) % 1_000_000
@@ -868,25 +1560,69 @@ class MapAnythingDepthSource:
                 pending.append(self._batch_queue.popleft())
         for item in pending:
             if not item.future.done():
-                item.future.set_exception(RuntimeError('Batch worker stopped before completion'))
+                item.future.set_exception(
+                    RuntimeError("Batch worker stopped before completion")
+                )
 
-    def _post_json(self, endpoint: str, payload: Dict[str, object]) -> Dict[str, object]:
+    def _post_json(
+        self, endpoint: str, payload: Dict[str, object]
+    ) -> Dict[str, object]:
         url = f"{self.config.service.base_url}{endpoint}"
         headers = {"X-API-Key": self.config.service.api_key}
         backoff = 0.5
         for attempt in range(1, 4):
             try:
-                response = self.session.post(url, json=payload, headers=headers, timeout=self.timeout)
+                response = self.session.post(
+                    url, json=payload, headers=headers, timeout=self.timeout
+                )
                 if response.status_code == 200:
                     return response.json()
-                self.logger.warning(f"MapAnything service returned {response.status_code}: {response.text}")
+                self.logger.warning(
+                    f"MapAnything service returned {response.status_code}: {response.text}"
+                )
             except requests.RequestException as exc:
-                self.logger.warning(f"MapAnything request failed (attempt {attempt}): {exc}")
+                self.logger.warning(
+                    f"MapAnything request failed (attempt {attempt}): {exc}"
+                )
             time.sleep(backoff)
             backoff = min(backoff * 2.0, 4.0)
         raise RuntimeError("MapAnything request failed after retries")
 
-    def _parse_response(self, response: Dict[str, object]) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    @staticmethod
+    def _coerce_intrinsics_matrix(value: object) -> Optional[np.ndarray]:
+        if value is None:
+            return None
+        try:
+            arr = np.asarray(value, dtype=np.float32)
+        except Exception:
+            return None
+        if arr.shape == (3, 3):
+            return arr.astype(np.float32, copy=True)
+        if arr.size == 9:
+            try:
+                return arr.reshape((3, 3)).astype(np.float32, copy=True)
+            except Exception:
+                return None
+        return None
+
+    @staticmethod
+    def _unscale_intrinsics(
+        matrix: np.ndarray, scale_x: float, scale_y: float
+    ) -> np.ndarray:
+        result = np.array(matrix, dtype=np.float32, copy=True)
+        sx = float(scale_x)
+        sy = float(scale_y)
+        if abs(sx) <= 1e-6:
+            sx = 1.0
+        if abs(sy) <= 1e-6:
+            sy = 1.0
+        result[0, :] /= sx
+        result[1, :] /= sy
+        return result
+
+    def _parse_response(
+        self, response: Dict[str, object]
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, Optional[np.ndarray]]:
         shape = response.get("shape")
         if not (isinstance(shape, (list, tuple)) and len(shape) == 2):
             raise ValueError(f"Depth response missing shape metadata (got {shape!r})")
@@ -895,21 +1631,34 @@ class MapAnythingDepthSource:
         depth_b64 = response.get("depth_b64") or response.get("depth_z_b64")
         conf_b64 = response.get("conf_b64")
         mask_b64 = response.get("mask_b64")
-        missing = [name for name, value in (
-            ("depth_b64", depth_b64),
-            ("conf_b64", conf_b64),
-            ("mask_b64", mask_b64),
-        ) if not isinstance(value, str)]
+        missing = [
+            name
+            for name, value in (
+                ("depth_b64", depth_b64),
+                ("conf_b64", conf_b64),
+                ("mask_b64", mask_b64),
+            )
+            if not isinstance(value, str)
+        ]
         if missing:
             raise ValueError(f"Depth response missing encoded tensors: {missing}")
 
         try:
-            depth = np.frombuffer(base64.b64decode(depth_b64), dtype=np.float32).reshape((height, width))
-            conf = np.frombuffer(base64.b64decode(conf_b64), dtype=np.float32).reshape((height, width))
-            mask = np.frombuffer(base64.b64decode(mask_b64), dtype=np.uint8).reshape((height, width)).astype(bool)
+            depth = np.frombuffer(
+                base64.b64decode(depth_b64), dtype=np.float32
+            ).reshape((height, width))
+            conf = np.frombuffer(base64.b64decode(conf_b64), dtype=np.float32).reshape(
+                (height, width)
+            )
+            mask = (
+                np.frombuffer(base64.b64decode(mask_b64), dtype=np.uint8)
+                .reshape((height, width))
+                .astype(bool)
+            )
         except Exception as exc:
             raise ValueError(f"Failed to decode depth response: {exc}") from exc
-        return depth, conf, mask
+        intrinsics_matrix = self._coerce_intrinsics_matrix(response.get("intrinsics"))
+        return depth, conf, mask, intrinsics_matrix
 
     def _align_to_original_shape(
         self,
@@ -922,19 +1671,41 @@ class MapAnythingDepthSource:
         current_h, current_w = depth.shape[:2]
         if (target_h, target_w) == (current_h, current_w):
             return depth, conf, mask
-        depth_resized = cv2.resize(depth, (target_w, target_h), interpolation=cv2.INTER_LINEAR)
-        conf_resized = cv2.resize(conf, (target_w, target_h), interpolation=cv2.INTER_LINEAR)
-        mask_uint8 = cv2.resize(mask.astype(np.uint8), (target_w, target_h), interpolation=cv2.INTER_NEAREST)
+        depth_resized = cv2.resize(
+            depth, (target_w, target_h), interpolation=cv2.INTER_LINEAR
+        )
+        conf_resized = cv2.resize(
+            conf, (target_w, target_h), interpolation=cv2.INTER_LINEAR
+        )
+        mask_uint8 = cv2.resize(
+            mask.astype(np.uint8), (target_w, target_h), interpolation=cv2.INTER_NEAREST
+        )
         mask_resized = mask_uint8.astype(bool)
         return depth_resized, conf_resized, mask_resized
 
-    def _compute_summary(self, depth: np.ndarray, conf: np.ndarray, mask: np.ndarray) -> DepthSummary:
+    def _compute_summary(
+        self, depth: np.ndarray, conf: np.ndarray, mask: np.ndarray
+    ) -> DepthSummary:
         valid = mask & np.isfinite(depth) & (conf >= self.min_conf) & (depth > 0.0)
         total = depth.size
         if total == 0:
-            return DepthSummary(median=0.0, p10=0.0, p90=0.0, conf_mean=0.0, valid_ratio=0.0, sample_count=0)
+            return DepthSummary(
+                median=0.0,
+                p10=0.0,
+                p90=0.0,
+                conf_mean=0.0,
+                valid_ratio=0.0,
+                sample_count=0,
+            )
         if not np.any(valid):
-            return DepthSummary(median=0.0, p10=0.0, p90=0.0, conf_mean=float(conf.mean()), valid_ratio=0.0, sample_count=0)
+            return DepthSummary(
+                median=0.0,
+                p10=0.0,
+                p90=0.0,
+                conf_mean=float(conf.mean()),
+                valid_ratio=0.0,
+                sample_count=0,
+            )
         valid_depth = depth[valid]
         return DepthSummary(
             median=float(np.median(valid_depth)),
@@ -945,12 +1716,14 @@ class MapAnythingDepthSource:
             sample_count=int(valid.sum()),
         )
 
-    def load_latest_depth(self, camera_id: str, ts_max: Optional[int] = None) -> Optional[Dict[str, Any]]:
+    def load_latest_depth(
+        self, camera_id: str, ts_max: Optional[int] = None
+    ) -> Optional[Dict[str, Any]]:
         cache_key = camera_id
         with self._cache_lock:
             cached = self._depth_payload_cache.get(cache_key)
             if cached:
-                cached_ts = cached.get('ts', 0)
+                cached_ts = cached.get("ts", 0)
                 if ts_max is None or cached_ts <= (ts_max or cached_ts):
                     return dict(cached)
 
@@ -960,17 +1733,17 @@ class MapAnythingDepthSource:
         datasets = self.storage.load_datasets(path)
         if not datasets:
             return None
-        depth = datasets['depth'].astype(np.float32, copy=False)
-        conf = datasets['conf'].astype(np.float32, copy=False)
-        mask = datasets['mask'].astype(np.uint8, copy=False)
+        depth = datasets["depth"].astype(np.float32, copy=False)
+        conf = datasets["conf"].astype(np.float32, copy=False)
+        mask = datasets["mask"].astype(np.uint8, copy=False)
         height, width = depth.shape[:2]
         ts_us = int(path.stem)
         payload = {
-            'ts': ts_us,
-            'depth_b64': base64.b64encode(depth.tobytes()).decode('ascii'),
-            'conf_b64': base64.b64encode(conf.tobytes()).decode('ascii'),
-            'mask_b64': base64.b64encode(mask.tobytes()).decode('ascii'),
-            'shape': [int(height), int(width)],
+            "ts": ts_us,
+            "depth_b64": base64.b64encode(depth.tobytes()).decode("ascii"),
+            "conf_b64": base64.b64encode(conf.tobytes()).decode("ascii"),
+            "mask_b64": base64.b64encode(mask.tobytes()).decode("ascii"),
+            "shape": [int(height), int(width)],
         }
         with self._cache_lock:
             self._depth_payload_cache[cache_key] = dict(payload)
@@ -981,19 +1754,24 @@ class MapAnythingDepthSource:
 
     @staticmethod
     def _sanitize_camera_id(camera_id: str) -> str:
-        safe = ''.join(ch if ch.isalnum() or ch in {'-', '_', '.'} else '_' for ch in camera_id.strip())
+        safe = "".join(
+            ch if ch.isalnum() or ch in {"-", "_", "."} else "_"
+            for ch in camera_id.strip()
+        )
         return safe or "camera"
 
     @staticmethod
     def _format_param(value: float) -> str:
-        text = f"{float(value):.6f}".rstrip('0').rstrip('.')
+        text = f"{float(value):.6f}".rstrip("0").rstrip(".")
         if not text:
             text = "0"
-        if text.startswith('-'):
-            text = 'neg' + text[1:]
-        return text.replace('.', 'p')
+        if text.startswith("-"):
+            text = "neg" + text[1:]
+        return text.replace(".", "p")
 
-    def _floorplan_path(self, camera_id: str, grid_res_m: float, max_extent_m: float) -> Path:
+    def _floorplan_path(
+        self, camera_id: str, grid_res_m: float, max_extent_m: float
+    ) -> Path:
         safe_cam = self._sanitize_camera_id(camera_id)
         filename = f"grid{self._format_param(grid_res_m)}__ext{self._format_param(max_extent_m)}.json"
         return self._floorplan_store_dir / safe_cam / filename
@@ -1008,10 +1786,10 @@ class MapAnythingDepthSource:
         if not path.exists():
             return None
         try:
-            with path.open('r', encoding='utf-8') as fh:
+            with path.open("r", encoding="utf-8") as fh:
                 payload = json.load(fh)
             if isinstance(payload, dict):
-                payload.setdefault('camera_id', camera_id)
+                payload.setdefault("camera_id", camera_id)
                 return payload
         except Exception as exc:
             self.logger.debug(f"Failed to load cached floorplan for {camera_id}: {exc}")
@@ -1028,10 +1806,10 @@ class MapAnythingDepthSource:
         try:
             path.parent.mkdir(parents=True, exist_ok=True)
             to_store = dict(payload)
-            to_store.pop('served_from_cache', None)
-            tmp_path = path.with_suffix(path.suffix + '.tmp')
-            with tmp_path.open('w', encoding='utf-8') as fh:
-                json.dump(to_store, fh, separators=(',', ':'))
+            to_store.pop("served_from_cache", None)
+            tmp_path = path.with_suffix(path.suffix + ".tmp")
+            with tmp_path.open("w", encoding="utf-8") as fh:
+                json.dump(to_store, fh, separators=(",", ":"))
             tmp_path.replace(path)
         except Exception as exc:
             self.logger.debug(f"Failed to persist floorplan for {camera_id}: {exc}")
@@ -1042,14 +1820,16 @@ class MapAnythingDepthSource:
             conf_bytes = result.conf.astype(np.float32, copy=False).tobytes()
             mask_bytes = result.mask.astype(np.uint8, copy=False).tobytes()
         except Exception as exc:
-            self.logger.debug(f"Depth cache serialization failed for {result.camera_id}: {exc}")
+            self.logger.debug(
+                f"Depth cache serialization failed for {result.camera_id}: {exc}"
+            )
             return
         payload = {
-            'ts': result.ts_us,
-            'depth_b64': base64.b64encode(depth_bytes).decode('ascii'),
-            'conf_b64': base64.b64encode(conf_bytes).decode('ascii'),
-            'mask_b64': base64.b64encode(mask_bytes).decode('ascii'),
-            'shape': [int(result.depth.shape[0]), int(result.depth.shape[1])],
+            "ts": result.ts_us,
+            "depth_b64": base64.b64encode(depth_bytes).decode("ascii"),
+            "conf_b64": base64.b64encode(conf_bytes).decode("ascii"),
+            "mask_b64": base64.b64encode(mask_bytes).decode("ascii"),
+            "shape": [int(result.depth.shape[0]), int(result.depth.shape[1])],
         }
         with self._cache_lock:
             self._depth_payload_cache[result.camera_id] = payload
@@ -1092,7 +1872,7 @@ class MapAnythingDepthSource:
     ) -> Dict[str, Any]:
         """Generate a per-camera top-down (XZ) blueprint view from the latest depth snapshot."""
         if not camera_id:
-            return {'error': 'camera_required', 'ts': int(time.time() * 1_000_000)}
+            return {"error": "camera_required", "ts": int(time.time() * 1_000_000)}
 
         cache_key = (camera_id, float(grid_res_m), float(max_extent_m))
         now_us = int(time.time() * 1_000_000)
@@ -1101,31 +1881,39 @@ class MapAnythingDepthSource:
             if cached:
                 if cache_only:
                     payload = dict(cached)
-                    payload['served_from_cache'] = True
+                    payload["served_from_cache"] = True
                     return payload
-                age_us = now_us - cached.get('snapshot_ts', cached.get('ts', 0))
+                age_us = now_us - cached.get("snapshot_ts", cached.get("ts", 0))
                 if age_us <= int(max(0.0, max_age_sec) * 1_000_000):
                     payload = dict(cached)
-                    payload['served_from_cache'] = True
+                    payload["served_from_cache"] = True
                     return payload
             # Fall through to load from disk or recompute when cache is empty
             # so callers receive a floorplan without additional interaction.
 
-        disk_payload = self._load_floorplan_from_disk(camera_id, grid_res_m, max_extent_m)
+        disk_payload = self._load_floorplan_from_disk(
+            camera_id, grid_res_m, max_extent_m
+        )
         if disk_payload:
-            snapshot_ts = disk_payload.get('snapshot_ts', disk_payload.get('ts'))
+            snapshot_ts = disk_payload.get("snapshot_ts", disk_payload.get("ts"))
             if isinstance(snapshot_ts, (int, float)):
                 age_us = now_us - int(snapshot_ts)
             else:
                 age_us = None
-            if cache_only or age_us is None or age_us <= int(max(0.0, max_age_sec) * 1_000_000):
+            if (
+                cache_only
+                or age_us is None
+                or age_us <= int(max(0.0, max_age_sec) * 1_000_000)
+            ):
                 with self._cache_lock:
                     self._floorplan_cache[cache_key] = dict(disk_payload)
                     self._floorplan_cache.move_to_end(cache_key, last=True)
-                    while len(self._floorplan_cache) > self._max_floorplan_cache_entries:
+                    while (
+                        len(self._floorplan_cache) > self._max_floorplan_cache_entries
+                    ):
                         self._floorplan_cache.popitem(last=False)
                 payload = dict(disk_payload)
-                payload['served_from_cache'] = True
+                payload["served_from_cache"] = True
                 return payload
 
         max_age_us = int(max(0.0, max_age_sec) * 1_000_000)
@@ -1133,7 +1921,7 @@ class MapAnythingDepthSource:
 
         path_entry = self.storage.latest_entry(camera_id, now_us)
         if not path_entry:
-            return {'error': 'no_depth', 'camera_id': camera_id, 'ts': now_us}
+            return {"error": "no_depth", "camera_id": camera_id, "ts": now_us}
 
         if ts_cutoff is not None:
             try:
@@ -1141,22 +1929,24 @@ class MapAnythingDepthSource:
             except ValueError:
                 snapshot_ts = None
             if snapshot_ts is None or snapshot_ts < ts_cutoff:
-                return {'error': 'stale_depth', 'camera_id': camera_id, 'ts': now_us}
+                return {"error": "stale_depth", "camera_id": camera_id, "ts": now_us}
 
         datasets = self.storage.load_datasets(path_entry)
         if not datasets:
-            return {'error': 'load_failed', 'camera_id': camera_id, 'ts': now_us}
+            return {"error": "load_failed", "camera_id": camera_id, "ts": now_us}
 
-        depth = datasets.get('depth')
-        conf = datasets.get('conf')
-        mask = datasets.get('mask')
+        depth = datasets.get("depth")
+        conf = datasets.get("conf")
+        mask = datasets.get("mask")
         if depth is None or conf is None or mask is None:
-            return {'error': 'invalid_snapshot', 'camera_id': camera_id, 'ts': now_us}
+            return {"error": "invalid_snapshot", "camera_id": camera_id, "ts": now_us}
 
-        calib_bundle = getattr(self, 'calibration_bundle', None) or {}
-        cameras_node = calib_bundle.get('cameras') if isinstance(calib_bundle, dict) else {}
-        k_table = cameras_node.get('K') if isinstance(cameras_node, dict) else {}
-        e_table = cameras_node.get('E') if isinstance(cameras_node, dict) else {}
+        calib_bundle = getattr(self, "calibration_bundle", None) or {}
+        cameras_node = (
+            calib_bundle.get("cameras") if isinstance(calib_bundle, dict) else {}
+        )
+        k_table = cameras_node.get("K") if isinstance(cameras_node, dict) else {}
+        e_table = cameras_node.get("E") if isinstance(cameras_node, dict) else {}
 
         intr = None
         extr = None
@@ -1166,25 +1956,31 @@ class MapAnythingDepthSource:
             extr = e_table.get(camera_id)
 
         if intr is None or extr is None:
-            legacy_cam = cameras_node.get(camera_id) if isinstance(cameras_node, dict) else None
+            legacy_cam = (
+                cameras_node.get(camera_id) if isinstance(cameras_node, dict) else None
+            )
             if isinstance(legacy_cam, dict):
                 if intr is None:
-                    maybe_intr = legacy_cam.get('intrinsics')
+                    maybe_intr = legacy_cam.get("intrinsics")
                     if isinstance(maybe_intr, (list, tuple)) and len(maybe_intr) == 9:
                         intr = maybe_intr
                 if extr is None:
-                    maybe_extr = legacy_cam.get('extrinsics')
+                    maybe_extr = legacy_cam.get("extrinsics")
                     if isinstance(maybe_extr, dict):
-                        extr = maybe_extr.get('E')
+                        extr = maybe_extr.get("E")
 
         if intr is None or extr is None:
-            return {'error': 'missing_calibration', 'camera_id': camera_id, 'ts': now_us}
+            return {
+                "error": "missing_calibration",
+                "camera_id": camera_id,
+                "ts": now_us,
+            }
 
         depth = np.asarray(depth, dtype=np.float32)
         conf = np.asarray(conf, dtype=np.float32)
         mask = np.asarray(mask, dtype=np.uint8) > 0
         if depth.ndim != 2 or conf.shape != depth.shape or mask.shape != depth.shape:
-            return {'error': 'shape_mismatch', 'camera_id': camera_id, 'ts': now_us}
+            return {"error": "shape_mismatch", "camera_id": camera_id, "ts": now_us}
 
         intr_arr = np.asarray(intr, dtype=np.float32).reshape(-1)
         if intr_arr.size == 4:
@@ -1196,10 +1992,10 @@ class MapAnythingDepthSource:
             cx = float(k_mat[0, 2])
             cy = float(k_mat[1, 2])
         else:
-            return {'error': 'bad_intrinsics', 'camera_id': camera_id, 'ts': now_us}
+            return {"error": "bad_intrinsics", "camera_id": camera_id, "ts": now_us}
 
         if not all(np.isfinite([fx, fy, cx, cy])) or fx == 0.0 or fy == 0.0:
-            return {'error': 'invalid_intrinsics', 'camera_id': camera_id, 'ts': now_us}
+            return {"error": "invalid_intrinsics", "camera_id": camera_id, "ts": now_us}
 
         valid = np.isfinite(depth)
         valid &= depth > 0.1
@@ -1209,13 +2005,18 @@ class MapAnythingDepthSource:
             valid &= conf >= float(self.min_conf)
 
         if not np.any(valid):
-            return {'error': 'no_points', 'camera_id': camera_id, 'ts': now_us, 'point_count': 0}
+            return {
+                "error": "no_points",
+                "camera_id": camera_id,
+                "ts": now_us,
+                "point_count": 0,
+            }
 
         h_img, w_img = depth.shape
         grid_u, grid_v = np.meshgrid(
             np.arange(w_img, dtype=np.float32),
             np.arange(h_img, dtype=np.float32),
-            indexing='xy'
+            indexing="xy",
         )
 
         x_cam = (grid_u - cx) * depth / fx
@@ -1226,21 +2027,27 @@ class MapAnythingDepthSource:
 
         e_arr = np.asarray(extr, dtype=np.float32)
         if e_arr.size == 16:
-            e_mat = e_arr.reshape(4, 4, order='F')
+            e_mat = e_arr.reshape(4, 4, order="F")
         elif e_arr.shape == (3, 4):
             e_mat = np.eye(4, dtype=np.float32)
             e_mat[:3, :4] = e_arr
         elif e_arr.shape == (4, 4):
             e_mat = e_arr
         else:
-            return {'error': 'bad_extrinsics', 'camera_id': camera_id, 'ts': now_us}
+            return {"error": "bad_extrinsics", "camera_id": camera_id, "ts": now_us}
 
         try:
             twc = np.linalg.inv(e_mat)
         except np.linalg.LinAlgError:
-            return {'error': 'extrinsics_singular', 'camera_id': camera_id, 'ts': now_us}
+            return {
+                "error": "extrinsics_singular",
+                "camera_id": camera_id,
+                "ts": now_us,
+            }
 
-        pts_cam_h = np.concatenate([pts_cam, np.ones((pts_cam.shape[0], 1), dtype=np.float32)], axis=1)
+        pts_cam_h = np.concatenate(
+            [pts_cam, np.ones((pts_cam.shape[0], 1), dtype=np.float32)], axis=1
+        )
         pts_world_h = pts_cam_h @ twc.T
         pts_world = pts_world_h[:, :3]
 
@@ -1250,7 +2057,12 @@ class MapAnythingDepthSource:
         z_cam_pts = pts_cam[:, 2]
 
         if x_cam_pts.size == 0 or z_cam_pts.size == 0:
-            return {'error': 'no_points', 'camera_id': camera_id, 'ts': now_us, 'point_count': 0}
+            return {
+                "error": "no_points",
+                "camera_id": camera_id,
+                "ts": now_us,
+                "point_count": 0,
+            }
 
         pad_x = max(0.5, grid_res_m * 2.0)
         pad_z = max(0.5, grid_res_m * 2.0)
@@ -1324,7 +2136,9 @@ class MapAnythingDepthSource:
         distance_grid = np.zeros((h_px, w_px), dtype=np.float32)
         nonzero_mask = distance_count > 0
         if np.any(nonzero_mask):
-            distance_grid[nonzero_mask] = distance_sum[nonzero_mask] / distance_count[nonzero_mask]
+            distance_grid[nonzero_mask] = (
+                distance_sum[nonzero_mask] / distance_count[nonzero_mask]
+            )
             min_distance = float(np.min(distance_grid[nonzero_mask]))
             max_distance = float(np.max(distance_grid[nonzero_mask]))
         else:
@@ -1332,41 +2146,47 @@ class MapAnythingDepthSource:
             max_distance = 0.0
 
         bounds = {
-            'min_x': float(min_x),
-            'max_x': float(max_x),
-            'min_z': float(min_z),
-            'max_z': float(max_z),
+            "min_x": float(min_x),
+            "max_x": float(max_x),
+            "min_z": float(min_z),
+            "max_z": float(max_z),
         }
 
         payload: Dict[str, Any] = {
-            'camera_id': camera_id,
-            'ts': now_us,
-            'snapshot_ts': int(path_entry.stem) if path_entry.stem.isdigit() else None,
-            'bounds': bounds,
-            'scale_m_per_px': float(width_m / w_px if w_px else grid_res_m),
-            'point_count': int(pts_cam.shape[0]),
-            'density': {
-                'grid_b64': base64.b64encode(density_grid.astype(np.float32, copy=False).ravel().tobytes()).decode('ascii'),
-                'grid_shape': [int(h_px), int(w_px)],
-                'value_min': 0.0,
-                'value_max': 1.0,
+            "camera_id": camera_id,
+            "ts": now_us,
+            "snapshot_ts": int(path_entry.stem) if path_entry.stem.isdigit() else None,
+            "bounds": bounds,
+            "scale_m_per_px": float(width_m / w_px if w_px else grid_res_m),
+            "point_count": int(pts_cam.shape[0]),
+            "density": {
+                "grid_b64": base64.b64encode(
+                    density_grid.astype(np.float32, copy=False).ravel().tobytes()
+                ).decode("ascii"),
+                "grid_shape": [int(h_px), int(w_px)],
+                "value_min": 0.0,
+                "value_max": 1.0,
             },
-            'height': {
-                'grid_b64': base64.b64encode(height_grid.astype(np.float32, copy=False).ravel().tobytes()).decode('ascii'),
-                'grid_shape': [int(h_px), int(w_px)],
-                'value_min': float(height_min),
-                'value_max': float(height_max),
+            "height": {
+                "grid_b64": base64.b64encode(
+                    height_grid.astype(np.float32, copy=False).ravel().tobytes()
+                ).decode("ascii"),
+                "grid_shape": [int(h_px), int(w_px)],
+                "value_min": float(height_min),
+                "value_max": float(height_max),
             },
-            'distance': {
-                'grid_b64': base64.b64encode(distance_grid.astype(np.float32, copy=False).ravel().tobytes()).decode('ascii'),
-                'grid_shape': [int(h_px), int(w_px)],
-                'value_min': float(min_distance),
-                'value_max': float(max_distance),
+            "distance": {
+                "grid_b64": base64.b64encode(
+                    distance_grid.astype(np.float32, copy=False).ravel().tobytes()
+                ).decode("ascii"),
+                "grid_shape": [int(h_px), int(w_px)],
+                "value_min": float(min_distance),
+                "value_max": float(max_distance),
             },
         }
-        payload['served_from_cache'] = False
-        payload['grid_res_m'] = float(grid_res_m)
-        payload['max_extent_m'] = float(max_extent_m)
+        payload["served_from_cache"] = False
+        payload["grid_res_m"] = float(grid_res_m)
+        payload["max_extent_m"] = float(max_extent_m)
 
         self._persist_floorplan_to_disk(camera_id, grid_res_m, max_extent_m, payload)
 

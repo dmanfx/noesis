@@ -14,6 +14,16 @@ This document summarizes the elements created in `deepstream_video_pipeline.py`,
   - Properties: `config-file-path = pipelines/config_infer_primary_yolo11.ini`, `input-tensor-meta=True`
   - Runtime updates (via Python): `confidence-threshold`, `iou-threshold`, `enable`, `custom-lib-props="target-classes:<ids>"`
 
+- nvdspreprocess (mapanything_preprocess)
+  - Properties: `config-file = pipelines/config_preprocess_mapanything_fused.ini`
+  - Custom library resolves to `pipelines/mapanything_preprocess_fused/libmapanything_preprocess_fused.so`
+  - Emits fused tensor meta (`mapanything_fused`, FP16) for the SGIE
+
+- nvinfer (mapanything_sgie_fused)
+  - Properties: `config-file-path = pipelines/config_infer_secondary_mapanything_fused.ini`, `input-tensor-meta=True`, `unique-id=22`
+  - Loads TensorRT engine `models/engines/ma_model_fp16_b3_fused.plan`
+  - Probe: src pad → `_mapanything_depth_probe` (decodes depth/conf tensors, attaches NVDS user meta)
+
 - nvdsanalytics (nvdsanalytics_exclude)
   - Properties: `unique-id=101`, `config-file=pipelines/config_nvdsanalytics_exclude.ini`
   - Probe: src pad → `_remove_excluded_objects_probe()` (drops objects in exclusion ROIs)

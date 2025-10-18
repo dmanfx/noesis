@@ -646,23 +646,24 @@ class StableIDManager:
                 while dq and (t - float(dq[0].get("ts", 0.0))) > self.max_ghost_age_s:
                     dq.popleft()
             # Return fully inactive SIDs to free-list after a cooldown (smarter reuse)
-            try:
-                active_sids = {int(rec.get("stable_id")) for rec in self.active_tracks.values()}
-                ghost_sids = set()
-                for dq in self.ghosts.values():
-                    for g in dq:
-                        try:
-                            ghost_sids.add(int(g.get("stable_id")))
-                        except Exception:
-                            pass
-                for sid, last_seen in list(self.sid_global_last_seen.items()):
-                    if sid in active_sids or sid in ghost_sids:
-                        continue
-                    if (t - float(last_seen)) >= max(2.0, self.active_evict_grace_s):
-                        self._purge_sid_state(sid)
-                        self._free_sid(sid)
-            except Exception:
-                pass
+            active_sids = {
+                int(rec.get("stable_id"))
+                for rec in self.active_tracks.values()
+                if rec is not None and "stable_id" in rec
+            }
+            ghost_sids = set()
+            for dq in self.ghosts.values():
+                for g in dq:
+                    try:
+                        ghost_sids.add(int(g.get("stable_id")))
+                    except Exception:
+                        pass
+            for sid, last_seen in list(self.sid_global_last_seen.items()):
+                if sid in active_sids or sid in ghost_sids:
+                    continue
+                if (t - float(last_seen)) >= max(2.0, self.active_evict_grace_s):
+                    self._purge_sid_state(sid)
+                    self._free_sid(sid)
 
     # --------------- Telemetry ----------------
     def get_sid_metrics(self) -> Dict[str, Any]:

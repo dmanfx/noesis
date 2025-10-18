@@ -60,8 +60,8 @@ function Dashboard() {
   const [occupancy, setOccupancy] = useState<string>('');
   const [trackDetailsHtml, setTrackDetailsHtml] = useState<string>('');
   // Transitions removed from UI
-  const [tracksByCamera, setTracksByCamera] = useState<Record<string, Array<{track_id: number; stable_id?: number | null; camera_id: string; zone?: string; center?: [number, number]; dwell_time?: number; velocity?: [number, number] }>>>({});
-  const [tracksByCamKey, setTracksByCamKey] = useState<Record<CameraKey, Array<{track_id: number; stable_id?: number | null; camera_id: string}>>>({ 'living-room': [], 'kitchen': [], 'family-room': [] });
+  const [tracksByCamera, setTracksByCamera] = useState<Record<string, Track[]>>({});
+  const [tracksByCamKey, setTracksByCamKey] = useState<Record<CameraKey, Track[]>>({ 'living-room': [], 'kitchen': [], 'family-room': [] });
   const [occByCamKey, setOccByCamKey] = useState<Record<CameraKey, Record<string, number>>>({ 'living-room': {}, 'kitchen': {}, 'family-room': {} });
   // Vacancy timer state
   const [vacancyText, setVacancyText] = useState<Record<CameraKey, string>>({ 'living-room': '', 'kitchen': '', 'family-room': '' });
@@ -107,11 +107,11 @@ function Dashboard() {
     const cameras = payload.cameras || {};
     const statusUpdates: Partial<Record<CameraKey, string>> = {};
     const globalOcc: Record<string, number> = {};
-    let allTracks: any[] = [];
+    let allTracks: Track[] = [];
     // Transitions disabled; keep placeholder for compatibility
     let allTrans: any[] = [];
-    const perCamTracks: Record<string, any[]> = {};
-    const perKeyTracks: Record<CameraKey, any[]> = { 'living-room': [], 'kitchen': [], 'family-room': [] };
+    const perCamTracks: Record<string, Track[]> = {};
+    const perKeyTracks: Record<CameraKey, Track[]> = { 'living-room': [], 'kitchen': [], 'family-room': [] };
     const perKeyOcc: Record<CameraKey, Record<string, number>> = { 'living-room': {}, 'kitchen': {}, 'family-room': {} };
     // const perKeyTransCount: Record<CameraKey, number> = { 'living-room': 0, 'kitchen': 0, 'family-room': 0 };
 
@@ -134,26 +134,26 @@ function Dashboard() {
         perKeyOcc[camKey] = track.occupancy;
       }
       if (Array.isArray(track?.active_tracks)) {
-        perCamTracks[camId] = track!.active_tracks;
-        allTracks = allTracks.concat(track!.active_tracks);
+        perCamTracks[camId] = track!.active_tracks as Track[];
+        allTracks = allTracks.concat(track!.active_tracks as Track[]);
         // trails
         if (trailEnabled) {
-          for (const t of track!.active_tracks) {
+          for (const t of track!.active_tracks as Track[]) {
             const key = camKey as CameraKey;
             const sid = Number((t.stable_id ?? t.track_id) || 0);
             if (!prevActiveRef.current[key]?.has(sid)) {
               trailStoreRef.current.pushBreak(key, sid);
             }
             // Prefer camera-local space for kitchen when provided (x_cam,z_cam → canvas x,y)
-            const tw: any = t as any;
-            const hasWorld = Array.isArray(tw.world) && tw.world.length >= 3 && !!tw.world_valid;
+            const worldArr = t.world;
+            const hasWorld = Array.isArray(worldArr) && worldArr.length >= 3 && !!t.world_valid;
             if (key === 'kitchen' && hasWorld) {
               if (!usingWorldKitchenRef.current) {
                 // First time we see valid world for kitchen, clear old pixel trails for that cam
                 try { (trailStoreRef.current.trails as any)['kitchen'] = {}; } catch {}
                 usingWorldKitchenRef.current = true;
               }
-              const w = tw.world as [number, number, number];
+              const w = worldArr as [number, number, number];
               const E = getExtrinsics('kitchen');
               if (E) {
                 const pc = worldToCamera(E, w);
@@ -173,7 +173,7 @@ function Dashboard() {
                 try { (trailStoreRef.current.trails as any)['living-room'] = {}; } catch {}
                 usingWorldLivingRef.current = true;
               }
-              const w = tw.world as [number, number, number];
+              const w = worldArr as [number, number, number];
               const E = getExtrinsics('living-room');
               if (E) {
                 const pc = worldToCamera(E, w);
@@ -190,7 +190,7 @@ function Dashboard() {
                 try { (trailStoreRef.current.trails as any)['family-room'] = {}; } catch {}
                 usingWorldFamilyRef.current = true;
               }
-              const w = tw.world as [number, number, number];
+              const w = worldArr as [number, number, number];
               const E = getExtrinsics('family-room');
               if (E) {
                 const pc = worldToCamera(E, w);
@@ -209,7 +209,7 @@ function Dashboard() {
             }
           }
         }
-        perKeyTracks[camKey] = track!.active_tracks;
+        perKeyTracks[camKey] = track!.active_tracks as Track[];
       }
       // Transitions disabled
     }
@@ -244,7 +244,53 @@ function Dashboard() {
         const vel = t.velocity || [0,0];
         const speed = Math.sqrt(vel[0]**2 + vel[1]**2).toFixed(1);
         const dotColor = colorForTrack(Number((t.stable_id ?? t.track_id) || 0));
-        tracksHtml += `<div><strong><span class="dot" style="display:inline-block;width:10px;height:10px;border-radius:50%;background:${dotColor};margin-right:6px;vertical-align:middle;"></span>SID ${t.stable_id ?? t.track_id ?? 'N/A'}:</strong><br/>Zone: ${t.zone||'-'}, Dwell: <span style="display:inline-block; min-width:4ch; text-align:right;">${dwell}</span>s<br/>Pos: [${(typeof center[0]==='number'?Number(center[0]).toFixed(3):center[0])}, ${(typeof center[1]==='number'?Number(center[1]).toFixed(3):center[1])}], Speed: <span style="display:inline-block; min-width:4ch; text-align:right;">${speed}</span> px/s</div>`;
+        const depthInfo = t.depth;
+        let depthHtml = '<br/>Depth: <span style="display:inline-block; min-width:5ch; text-align:right;">-</span><br/>World: [-]';
+        if (depthInfo) {
+          const method = String(depthInfo.method ?? '-');
+          const depthVal = typeof depthInfo.depth_m === 'number' && Number.isFinite(depthInfo.depth_m)
+            ? depthInfo.depth_m.toFixed(2)
+            : 'N/A';
+          const confVal = typeof depthInfo.conf === 'number' && Number.isFinite(depthInfo.conf)
+            ? depthInfo.conf.toFixed(2)
+            : 'N/A';
+          const world = depthInfo.world ?? t.world;
+          let worldStr = '-';
+          if (Array.isArray(world) && world.length === 3 && world.every((v) => typeof v === 'number' && Number.isFinite(v))) {
+            worldStr = world.map((v) => Number(v).toFixed(2)).join(', ');
+          }
+          depthHtml = `<br/>Depth: <span style=\"display:inline-block; min-width:5ch; text-align:right;\">${depthVal}</span> m (${method}, conf ${confVal})` +
+            `<br/>World: [${worldStr}]`;
+          try {
+            publish({
+              group: 'Depth',
+              key: `SID ${t.stable_id ?? t.track_id ?? 'N/A'}`,
+              value: depthInfo.depth_m ?? 'N/A',
+              ts: now,
+            });
+          } catch {
+            // telemetry publishing is best-effort
+          }
+          try {
+            console.log('[UI] depth payload', {
+              camera: camId,
+              trackId: t.track_id,
+              stableId: t.stable_id,
+              depth: depthInfo.depth_m,
+              conf: depthInfo.conf,
+              method,
+              world: world ?? t.world,
+            });
+          } catch {
+            // console logging best-effort
+          }
+        } else if (Array.isArray(t.world) && t.world.length === 3 && t.world.every((v) => typeof v === 'number' && Number.isFinite(v))) {
+          const world = t.world as [number, number, number];
+          const worldStr = world.map((v) => Number(v).toFixed(2)).join(', ');
+          depthHtml = `<br/>Depth: <span style=\"display:inline-block; min-width:5ch; text-align:right;\">-</span>` +
+            `<br/>World: [${worldStr}]`;
+        }
+        tracksHtml += `<div><strong><span class=\"dot\" style=\"display:inline-block;width:10px;height:10px;border-radius:50%;background:${dotColor};margin-right:6px;vertical-align:middle;\"></span>SID ${t.stable_id ?? t.track_id ?? 'N/A'}:</strong><br/>Zone: ${t.zone||'-'}, Dwell: <span style=\"display:inline-block; min-width:4ch; text-align:right;\">${dwell}</span>s<br/>Pos: [${(typeof center[0]==='number'?Number(center[0]).toFixed(3):center[0])}, ${(typeof center[1]==='number'?Number(center[1]).toFixed(3):center[1])}], Speed: <span style=\"display:inline-block; min-width:4ch; text-align:right;\">${speed}</span> px/s${depthHtml}</div>`;
       });
     } else {
       tracksHtml = '<span>No active tracks.</span>';
@@ -526,7 +572,7 @@ function Dashboard() {
     }
   };
 
-  const { status, sendClearStats, sendTrailToggle, sendDetectionConfig, sendDetectionToggle, requestMapAnythingDepth, requestFloorplan } = useWebSocketClient(WS_URL, {
+  const { status, sendClearStats, sendTrailToggle, sendDetectionConfig, sendDetectionToggle, sendDepthPanelState, requestMapAnythingDepth, requestFloorplan } = useWebSocketClient(WS_URL, {
     onImage,
     onStats,
     onTrailToggle: (en) => setTrailEnabled(en),
@@ -535,6 +581,16 @@ function Dashboard() {
     onMADepth: handleMADepth,
     onFloorplan: handleFloorplan
   });
+
+  useEffect(() => {
+    sendDepthPanelState(depthDrawerOpen);
+  }, [depthDrawerOpen, sendDepthPanelState]);
+
+  useEffect(() => {
+    if (status === 'open') {
+      sendDepthPanelState(depthDrawerOpen);
+    }
+  }, [status, depthDrawerOpen, sendDepthPanelState]);
   
   // Live EST/EDT clock for top bar
   const [estTime, setEstTime] = useState<string>("");

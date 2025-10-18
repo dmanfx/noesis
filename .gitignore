@@ -35,8 +35,14 @@ docs/ma-integration/*.md
 #model folders
 data/depth/
 models/
+!models/mapanything_depth/
+models/mapanything_depth/**/*.plan
 */__init__.py
 external/
 .env
 tests/
-
+ma_onnx_out/
+ma_onnx_out_clean/
+export_ma_onnx/
+ma_onnx_out_fused/
+pipelines/mapanything_preprocess_fused/

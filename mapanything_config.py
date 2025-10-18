@@ -111,6 +111,10 @@ class StorageSettings:
     quota_hysteresis_ratio: float = 0.9
     zarr_clevel: int = 5
     zarr_chunk_px: int = 128
+    intrinsics_table_path: str = "models/mapanything_depth/intrinsics_table.txt"
+    intrinsics_conf_threshold: float = 0.7
+    intrinsics_min_snapshots: int = 3
+    intrinsics_auto_disable: bool = True
 
 
 @dataclass(frozen=True)
@@ -129,7 +133,7 @@ class ServiceConfig:
 
         service = ServiceSettings(
             host=service_section.get("host", "127.0.0.1"),
-            port=_to_int(service_section.get("port", "8001")),
+            port=_to_int(service_section.get("port", "8003")),
             api_key=service_section.get("api_key", "noesis_secret"),
         )
         inference = InferenceSettings(
@@ -164,6 +168,18 @@ class ServiceConfig:
             quota_hysteresis_ratio=_to_float(storage_section.get("quota_hysteresis_ratio", "0.9")),
             zarr_clevel=_to_int(storage_section.get("zarr_clevel", "5")),
             zarr_chunk_px=_to_int(storage_section.get("zarr_chunk_px", "128")),
+            intrinsics_table_path=storage_section.get(
+                "intrinsics_table_path", "models/mapanything_depth/intrinsics_table.txt"
+            ),
+            intrinsics_conf_threshold=_to_float(
+                storage_section.get("intrinsics_conf_threshold", "0.7")
+            ),
+            intrinsics_min_snapshots=_to_int(
+                storage_section.get("intrinsics_min_snapshots", "3")
+            ),
+            intrinsics_auto_disable=_to_bool(
+                storage_section.get("intrinsics_auto_disable", "true")
+            ),
         )
         return cls(service=service, inference=inference, performance=performance, storage=storage)
 

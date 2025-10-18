@@ -42,13 +42,24 @@ RTSP Streams (`config.py`):
 └─────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
 
 ┌─────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
-│  INFERENCE & TRACKING                                                                                       │
+│  INFERENCE, MAPANYTHING SGIE & TRACKING                                                                      │
 ├─────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
 │ nvinfer (Primary GIE) - DeepStream's GPU inference engine that runs TensorRT models with custom parsers, providing hardware-accelerated AI inference with metadata extraction.                                                                                                   │
 │ ├── config-file-path: `pipelines/config_infer_primary_yolo11.ini`                                           │
 │ ├── YOLO-11 Custom Parser: `libnvdsparsebbox_yolo11.so`                                                     │
 │ ├── input-tensor-meta: True                                                                                 │
 │ └── Dynamic config: confidence, IOU, enable flag, and target classes via `custom-lib-props`                 │
+│                                                                                                             │
+│ MapAnything fused branch (secondary path)                                                                   │
+│ ├── nvdspreprocess `mapanything_preprocess`                                                                 │
+│ │   • Config: `pipelines/config_preprocess_mapanything_fused.ini`                                           │
+│ │   • Custom lib: `pipelines/mapanything_preprocess_fused/libmapanything_preprocess_fused.so`               │
+│ │   • Responsibilities: crop PGIE ROIs, normalize RGB, append nine intrinsics channels using intrinsics table│
+│ ├── nvinfer `mapanything_sgie_fused` (UID 22)                                                               │
+│ │   • Config: `pipelines/config_infer_secondary_mapanything_fused.ini`                                      │
+│ │   • Engine: `models/engines/ma_model_fp16_b3_fused.plan`                                                  │
+│ │   • Emits tensor meta (`mapanything_fused` → depth/conf tensors) consumed by `_mapanything_depth_probe`   │
+│ └── Environment handling: `MA_INTRINSICS_TABLE` default set by pipeline constructor                         │
 │                                                                                                             │
 │ nvtracker - DeepStream's object tracking element that maintains object identities across frames using algorithms like NvDCF, providing persistent tracking metadata.                                                                                        │
 │ ├── ll-config-file: `pipelines/config_tracker_nvdcf_batch.yml`                                              │
@@ -164,17 +175,21 @@ WebSocket Clients receive:
 
 ### 2. DeepStream Processing
 - **Input & Batching**: nvmultiurisrcbin handles all sources.
-- **Preprocessing**: nvdspreprocess (with custom library)
-- **Inference**: YOLO-11 with custom parser
+- **Preprocessing**:
+  - Primary `nvdspreprocess` driven by `config_preproc.ini`
+  - Secondary fused `nvdspreprocess` (MapAnything) with custom library and intrinsics table
+- **Inference**:
+  - PGIE: YOLO-11 with custom parser
+  - SGIE: MapAnything fused TensorRT plan (`ma_model_fp16_b3_fused.plan`)
 - **Tracking**: NvDCF tracker
-- **Analytics**: nvdsanalytics
+- **Analytics**: nvdsanalytics (exclude + post)
 - **Demuxing**: nvstreamdemux separates streams for output.
 
 ### 3. Metadata Extraction
-- Method: Buffer probes on analytics and OSD pads.
-- Analytics Probe: Extracts tracking and analytics data for telemetry.
-- OSD Probe: Injects drawing commands for trail visualization.
-- No tensors are extracted in Python.
+- Method: Buffer probes on analytics pads plus the MapAnything SGIE branch.
+- `_mapanything_depth_probe`: reads tensor meta (UID 22), computes depth summaries, attaches NVDS user meta.
+- Analytics probe: Extracts tracking and analytics data for telemetry.
+- OSD probe: Injects drawing commands for trail visualization.
 
 ### 4. Python Application
 - **Wrapper**: `DeepStreamVideoPipeline` class manages the GStreamer pipeline.

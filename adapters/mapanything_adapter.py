@@ -1,4 +1,5 @@
 """Adapters for preparing DeepStream frames for MapAnything inference."""
+
 from __future__ import annotations
 
 import base64
@@ -36,6 +37,7 @@ def build_mono_view(
     calib_bundle: Optional[Mapping[str, object]],
     *,
     max_resolution: Optional[int] = None,
+    pts_us: Optional[int] = None,
 ) -> ViewBuildResult:
     """Convert a DeepStream BGR frame into a MapAnything-ready payload.
 
@@ -61,9 +63,15 @@ def build_mono_view(
     resized_shape = resized_rgb.shape
 
     intrinsics = _resolve_intrinsics(cam_id, calib_bundle)
-    intrinsics_scaled = _scale_intrinsics(intrinsics, scale_x, scale_y) if intrinsics is not None else None
+    intrinsics_scaled = (
+        _scale_intrinsics(intrinsics, scale_x, scale_y)
+        if intrinsics is not None
+        else None
+    )
 
     payload = _encode_view_payload(cam_id, resized_rgb, intrinsics_scaled)
+    if pts_us is not None:
+        payload["pts_us"] = int(pts_us)
     return ViewBuildResult(
         payload=payload,
         original_shape=original_shape,
@@ -105,7 +113,9 @@ def _convert_to_rgb(frame_bgr: np.ndarray) -> np.ndarray:
     return cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
 
 
-def _resize_frame(frame_rgb: np.ndarray, max_resolution: int) -> Tuple[np.ndarray, float, float]:
+def _resize_frame(
+    frame_rgb: np.ndarray, max_resolution: int
+) -> Tuple[np.ndarray, float, float]:
     height, width = frame_rgb.shape[:2]
     if max_resolution <= 0:
         return frame_rgb, 1.0, 1.0
@@ -115,13 +125,17 @@ def _resize_frame(frame_rgb: np.ndarray, max_resolution: int) -> Tuple[np.ndarra
     scale = max_resolution / float(max_dim)
     new_width = max(1, int(round(width * scale)))
     new_height = max(1, int(round(height * scale)))
-    resized = cv2.resize(frame_rgb, (new_width, new_height), interpolation=cv2.INTER_AREA)
+    resized = cv2.resize(
+        frame_rgb, (new_width, new_height), interpolation=cv2.INTER_AREA
+    )
     scale_x = new_width / width
     scale_y = new_height / height
     return resized, scale_x, scale_y
 
 
-def _resolve_intrinsics(cam_id: str, calib_bundle: Optional[Mapping[str, object]]) -> Optional[np.ndarray]:
+def _resolve_intrinsics(
+    cam_id: str, calib_bundle: Optional[Mapping[str, object]]
+) -> Optional[np.ndarray]:
     if cam_id in _INTRINSICS_CACHE:
         return _INTRINSICS_CACHE[cam_id].copy()
     matrix = _extract_intrinsics_from_bundle(cam_id, calib_bundle)
@@ -131,14 +145,16 @@ def _resolve_intrinsics(cam_id: str, calib_bundle: Optional[Mapping[str, object]
     return matrix.copy()
 
 
-def _extract_intrinsics_from_bundle(cam_id: str, calib_bundle: Optional[Mapping[str, object]]) -> Optional[np.ndarray]:
+def _extract_intrinsics_from_bundle(
+    cam_id: str, calib_bundle: Optional[Mapping[str, object]]
+) -> Optional[np.ndarray]:
     if not calib_bundle:
         _logger.warning(f"No calibration bundle available for {cam_id}")
         return None
-    cameras = calib_bundle.get('cameras') if isinstance(calib_bundle, Mapping) else None
+    cameras = calib_bundle.get("cameras") if isinstance(calib_bundle, Mapping) else None
     matrix = None
     if isinstance(cameras, Mapping):
-        k_table = cameras.get('K') if isinstance(cameras.get('K'), Mapping) else None
+        k_table = cameras.get("K") if isinstance(cameras.get("K"), Mapping) else None
         if isinstance(k_table, Mapping):
             matrix = _coerce_intrinsics(k_table.get(cam_id))
         if matrix is None and cam_id in cameras:
@@ -146,7 +162,9 @@ def _extract_intrinsics_from_bundle(cam_id: str, calib_bundle: Optional[Mapping[
         if matrix is None:
             e_table = cameras.get(cam_id)
             if isinstance(e_table, Mapping):
-                matrix = _coerce_intrinsics(e_table.get('K') or e_table.get('intrinsics'))
+                matrix = _coerce_intrinsics(
+                    e_table.get("K") or e_table.get("intrinsics")
+                )
     if matrix is None:
         _logger.warning(f"Unable to find intrinsics for camera {cam_id}")
     return matrix
@@ -160,25 +178,31 @@ def _coerce_intrinsics(value: object) -> Optional[np.ndarray]:
     if isinstance(value, (list, tuple)):
         if len(value) == 4:
             fx, fy, cx, cy = map(float, value)
-            return np.array([[fx, 0.0, cx], [0.0, fy, cy], [0.0, 0.0, 1.0]], dtype=np.float32)
+            return np.array(
+                [[fx, 0.0, cx], [0.0, fy, cy], [0.0, 0.0, 1.0]], dtype=np.float32
+            )
         if len(value) == 9:
             arr = np.array(value, dtype=np.float32).reshape((3, 3))
             return arr
     if isinstance(value, Mapping):
-        for key in ('K', 'K3x3', 'matrix'):
+        for key in ("K", "K3x3", "matrix"):
             matrix = _coerce_intrinsics(value.get(key))  # type: ignore[index]
             if matrix is not None:
                 return matrix
-        if all(k in value for k in ('fx', 'fy', 'cx', 'cy')):
-            fx = float(value['fx'])
-            fy = float(value['fy'])
-            cx = float(value['cx'])
-            cy = float(value['cy'])
-            return np.array([[fx, 0.0, cx], [0.0, fy, cy], [0.0, 0.0, 1.0]], dtype=np.float32)
+        if all(k in value for k in ("fx", "fy", "cx", "cy")):
+            fx = float(value["fx"])
+            fy = float(value["fy"])
+            cx = float(value["cx"])
+            cy = float(value["cy"])
+            return np.array(
+                [[fx, 0.0, cx], [0.0, fy, cy], [0.0, 0.0, 1.0]], dtype=np.float32
+            )
     return None
 
 
-def _scale_intrinsics(intrinsics: Optional[np.ndarray], scale_x: float, scale_y: float) -> Optional[np.ndarray]:
+def _scale_intrinsics(
+    intrinsics: Optional[np.ndarray], scale_x: float, scale_y: float
+) -> Optional[np.ndarray]:
     if intrinsics is None:
         return None
     scaled = intrinsics.astype(np.float32).copy()
@@ -189,21 +213,23 @@ def _scale_intrinsics(intrinsics: Optional[np.ndarray], scale_x: float, scale_y:
     return scaled
 
 
-def _encode_view_payload(cam_id: str, frame_rgb: np.ndarray, intrinsics: Optional[np.ndarray]) -> Dict[str, object]:
+def _encode_view_payload(
+    cam_id: str, frame_rgb: np.ndarray, intrinsics: Optional[np.ndarray]
+) -> Dict[str, object]:
     frame_contiguous = np.ascontiguousarray(frame_rgb)
-    img_b64 = base64.b64encode(frame_contiguous.tobytes()).decode('ascii')
+    img_b64 = base64.b64encode(frame_contiguous.tobytes()).decode("ascii")
     payload: Dict[str, object] = {
-        'cam_id': cam_id,
-        'img_b64': img_b64,
-        'shape': (frame_rgb.shape[0], frame_rgb.shape[1], frame_rgb.shape[2]),
+        "cam_id": cam_id,
+        "img_b64": img_b64,
+        "shape": (frame_rgb.shape[0], frame_rgb.shape[1], frame_rgb.shape[2]),
     }
     if intrinsics is not None:
-        payload['intrinsics'] = intrinsics.tolist()
+        payload["intrinsics"] = intrinsics.tolist()
     return payload
 
 
 __all__ = [
-    'build_mono_view',
-    'build_multi_views',
-    'ViewBuildResult',
+    "build_mono_view",
+    "build_multi_views",
+    "ViewBuildResult",
 ]

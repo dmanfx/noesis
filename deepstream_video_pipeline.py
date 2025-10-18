@@ -27,6 +27,7 @@ import time
 import queue
 import json
 import ctypes
+import json
 import tempfile
 from collections import defaultdict, deque
 
@@ -71,6 +72,38 @@ def _alloc_display_text(text: Optional[str]) -> ctypes.c_char_p:
     encoded = text.encode("utf-8")
     ptr = _glib.g_strdup(encoded)
     return ctypes.cast(ptr, ctypes.c_char_p)
+
+
+def _safe_cstring_from_ptr(ptr_val: int) -> Optional[str]:
+    """Best-effort, bounded read of C char* into Python str.
+
+    Attempts pyds.get_string when available, otherwise falls back to a bounded
+    ctypes.string_at to reduce risk of runaway reads. Returns None on failure.
+    """
+    try:
+        if not ptr_val:
+            return None
+        # Prefer pyds.get_string if available in this environment
+        try:
+            cptr = ctypes.cast(ctypes.c_void_p(ptr_val), ctypes.c_char_p)
+            getter = getattr(pyds, "get_string", None)
+            if callable(getter):
+                s = getter(cptr)  # type: ignore[misc]
+                if isinstance(s, str):
+                    return s
+        except Exception:
+            # Fall through to bounded raw read
+            pass
+
+        # Bounded raw read with a sane cap to minimize fault surface
+        MAX_READ = 1 << 20  # 1 MiB cap
+        raw = ctypes.string_at(ptr_val, MAX_READ)
+        nul = raw.find(b"\x00")
+        if nul != -1:
+            raw = raw[:nul]
+        return raw.decode("utf-8", "ignore")
+    except Exception:
+        return None
 
 # Local imports
 from websocket_server import WebSocketServer  # noqa: E402
@@ -2667,7 +2700,9 @@ class DeepStreamVideoPipeline:
                     data_ptr = ctypes.cast(user_meta.user_meta_data, ctypes.c_void_p).value
                     if data_ptr:
                         try:
-                            raw = ctypes.string_at(data_ptr).decode("utf-8", "ignore").rstrip("\x00")
+                            raw = _safe_cstring_from_ptr(int(data_ptr))
+                            if not raw:
+                                raise ValueError("empty payload")
                             payload = json.loads(raw)
                             if isinstance(payload, dict) and "mde" in payload:
                                 entry = payload["mde"]

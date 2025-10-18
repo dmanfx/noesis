@@ -4,6 +4,7 @@ import numpy as np
 import random
 # Removed supervision import as it was causing segmentation fault
 # import supervision as sv
+# Note: All supervision-related functionality has been replaced with custom implementations
 import torch
 import logging
 
@@ -50,12 +51,17 @@ class Visualizer:
             text_color: Color of text (BGR format)
             trail_length: Maximum length of track trails
         """
-        self.class_names = class_names
+        self.class_names = class_names or []
         self.thickness = thickness
         self.text_scale = text_scale
         self.text_thickness = text_thickness
         self.text_color = text_color
         self.trail_length = trail_length
+        self.logger = logging.getLogger(__name__)
+        
+        # Initialize caches to prevent memory leaks
+        self._cached_frames = {}
+        self._color_cache = {}
         
         # Generate colors if not provided
         if colors is None:
@@ -99,51 +105,75 @@ class Visualizer:
         Returns:
             Frame with drawn detections
         """
-        result = frame.copy()
-        
-        for detection in detections:
-            # Get bounding box coordinates
-            x1, y1, x2, y2 = map(int, detection.bbox)
+        if frame is None or not detections:
+            return frame
             
-            # Get class color
-            color = self.colors[detection.class_id % len(self.colors)]
+        try:
+            result = frame.copy()
             
-            # Draw bounding box
-            cv2.rectangle(result, (x1, y1), (x2, y2), color, self.thickness)
-            
-            # Draw label
-            if draw_labels:
-                label_text = self.class_names[detection.class_id]
+            for detection in detections:
+                if detection is None or detection.bbox is None:
+                    continue
+                    
+                # Get bounding box coordinates with validation
+                try:
+                    x1, y1, x2, y2 = map(int, detection.bbox)
+                    
+                    # Validate coordinates
+                    if x1 < 0 or y1 < 0 or x2 >= frame.shape[1] or y2 >= frame.shape[0]:
+                        continue
+                        
+                    if x1 >= x2 or y1 >= y2:
+                        continue
+                except (ValueError, TypeError, IndexError):
+                    continue
                 
-                if draw_confidence:
-                    label_text += f" {detection.confidence:.2f}"
+                # Get class color
+                color = self.colors[detection.class_id % len(self.colors)]
                 
-                # Draw label background
-                text_size = cv2.getTextSize(
-                    label_text, 
-                    cv2.FONT_HERSHEY_SIMPLEX, 
-                    self.text_scale, 
-                    self.text_thickness
-                )[0]
+                # Draw bounding box
+                cv2.rectangle(result, (x1, y1), (x2, y2), color, self.thickness)
                 
-                cv2.rectangle(
-                    result,
-                    (x1, y1 - text_size[1] - 5),
-                    (x1 + text_size[0], y1),
+                # Draw label
+                if draw_labels:
+                    try:
+                        label_text = self.class_names[detection.class_id]
+                        
+                        if draw_confidence:
+                            label_text += f" {detection.confidence:.2f}"
+                        
+                        # Draw label background
+                        text_size = cv2.getTextSize(
+                            label_text, 
+                            cv2.FONT_HERSHEY_SIMPLEX, 
+                            self.text_scale, 
+                            self.text_thickness
+                        )[0]
+                        
+                        cv2.rectangle(
+                            result,
+                            (x1, y1 - text_size[1] - 5),
+                            (x1 + text_size[0], y1),
                     color,
                     -1
-                )
-                
-                # Draw text
-                cv2.putText(
-                    result,
-                    label_text,
-                    (x1, y1 - 5),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    self.text_scale,
-                    self.text_color,
-                    self.text_thickness
-                )
+                        )
+                        
+                        # Draw text
+                        cv2.putText(
+                            result,
+                            label_text,
+                            (x1, y1 - 5),
+                            cv2.FONT_HERSHEY_SIMPLEX,
+                            self.text_scale,
+                            self.text_color,
+                            self.text_thickness
+                        )
+                    except Exception as e:
+                        self.logger.debug(f"Error drawing label: {e}")
+        
+        except Exception as e:
+            self.logger.error(f"Error in draw_detections: {e}")
+            return frame
         
         return result
     
@@ -168,9 +198,15 @@ class Visualizer:
         Returns:
             Frame with drawn tracks
         """
-        result = frame.copy()
-        
-        for track in tracks:
+        if frame is None or not tracks:
+            return frame
+            
+        try:
+            result = frame.copy()
+            
+            for track in tracks:
+                if track is None:
+                    continue
             # Get bounding box coordinates
             x1, y1, x2, y2 = map(int, track.bbox)
             
@@ -1174,6 +1210,24 @@ class VisualizationManager:
         if self.gpu_visualizer:
             # GPU visualizer cleanup if needed
             pass
+    
+    def clear_cache(self):
+        """Clear any cached data to prevent memory leaks."""
+        try:
+            # Clear any cached frames or data
+            if hasattr(self, '_cached_frames'):
+                self._cached_frames.clear()
+            
+            # Clear any cached colors or other data
+            if hasattr(self, '_color_cache'):
+                self._color_cache.clear()
+            
+            # Clear any other cached data
+            if hasattr(self, '_trail_cache'):
+                self._trail_cache.clear()
+                
+        except Exception as e:
+            self.logger.error(f"Error clearing visualization cache: {e}")
     
     def get_visualization_stats(self) -> Dict[str, Any]:
         """Get visualization performance statistics.

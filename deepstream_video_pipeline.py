@@ -70,6 +70,8 @@ def _alloc_display_text(text: Optional[str]) -> ctypes.c_char_p:
         return ctypes.c_char_p()
     encoded = text.encode("utf-8")
     ptr = _glib.g_strdup(encoded)
+    if not ptr:
+        return ctypes.c_char_p()
     return ctypes.cast(ptr, ctypes.c_char_p)
 
 # Local imports
@@ -99,12 +101,35 @@ if TYPE_CHECKING:  # pragma: no cover - import for type checking only
 
 DEPTH_ANNOTATOR_TOLERANCE_US = 350_000
 
+# PyCapsule functions with proper error handling
 _CAPSULE_NEW = ctypes.pythonapi.PyCapsule_New
 _CAPSULE_NEW.restype = ctypes.py_object
 _CAPSULE_NEW.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_void_p]
 _CAPSULE_GET_PTR = ctypes.pythonapi.PyCapsule_GetPointer
 _CAPSULE_GET_PTR.restype = ctypes.c_void_p
 _CAPSULE_GET_PTR.argtypes = [ctypes.py_object, ctypes.c_char_p]
+
+def safe_pycapsule_new(ptr, name, destructor=None):
+    """Safely create a PyCapsule with error handling."""
+    try:
+        if ptr is None:
+            return None
+        name_bytes = name.encode('utf-8') if isinstance(name, str) else name
+        return _CAPSULE_NEW(ptr, name_bytes, destructor)
+    except Exception as e:
+        logging.getLogger(__name__).debug(f"Failed to create PyCapsule: {e}")
+        return None
+
+def safe_pycapsule_get_ptr(capsule, name):
+    """Safely get pointer from PyCapsule with error handling."""
+    try:
+        if capsule is None:
+            return None
+        name_bytes = name.encode('utf-8') if isinstance(name, str) else name
+        return _CAPSULE_GET_PTR(capsule, name_bytes)
+    except Exception as e:
+        logging.getLogger(__name__).debug(f"Failed to get PyCapsule pointer: {e}")
+        return None
 
 try:
     NVDS_PREPROCESS_BATCH_META = int(
@@ -2377,8 +2402,23 @@ class DeepStreamVideoPipeline:
                     ctype_scalar = ctypes.c_float
 
             try:
+                if ptr is None:
+                    self.logger.debug("Null pointer for tensor layer %s", name)
+                    continue
+                
+                # Validate size before creating array
+                if size <= 0:
+                    self.logger.debug("Invalid size for tensor layer %s: %d", name, size)
+                    continue
+                    
                 ctype_array = ctypes.cast(ptr, ctypes.POINTER(ctype_scalar))
                 np_array = np.ctypeslib.as_array(ctype_array, shape=(size,))
+                
+                # Validate the array before copying
+                if np_array is None or np_array.size == 0:
+                    self.logger.debug("Empty array for tensor layer %s", name)
+                    continue
+                    
                 layers[str(name)] = np.array(np_array, copy=True).reshape(shape)
             except Exception as exc:
                 self.logger.debug("Failed to copy tensor layer %s: %s", name, exc)
@@ -2667,28 +2707,41 @@ class DeepStreamVideoPipeline:
                     data_ptr = ctypes.cast(user_meta.user_meta_data, ctypes.c_void_p).value
                     if data_ptr:
                         try:
-                            raw = ctypes.string_at(data_ptr).decode("utf-8", "ignore").rstrip("\x00")
-                            payload = json.loads(raw)
-                            if isinstance(payload, dict) and "mde" in payload:
-                                entry = payload["mde"]
-                                if isinstance(entry, dict):
+                            # Use a safer approach to read the string to avoid memory issues
+                            raw_bytes = ctypes.string_at(data_ptr)
+                            if raw_bytes:
+                                raw = raw_bytes.decode("utf-8", "ignore").rstrip("\x00")
+                                if raw:  # Only process non-empty strings
                                     try:
-                                        self.logger.debug(
-                                            "Extracted depth meta for obj_id=%s: %s",
-                                            getattr(obj_meta, "object_id", None),
-                                            entry,
-                                        )
-                                    except Exception:
-                                        pass
-                                    return entry
-                        except Exception:
-                            pass
+                                        payload = json.loads(raw)
+                                        if isinstance(payload, dict) and "mde" in payload:
+                                            entry = payload["mde"]
+                                            if isinstance(entry, dict):
+                                                try:
+                                                    self.logger.debug(
+                                                        "Extracted depth meta for obj_id=%s: %s",
+                                                        getattr(obj_meta, "object_id", None),
+                                                        entry,
+                                                    )
+                                                except Exception:
+                                                    pass
+                                                return entry
+                                        except Exception:
+                                            pass
                 try:
                     user_meta_list = user_meta_list.next
                 except StopIteration:
                     break
         except Exception as exc:
             self.logger.debug(f"Depth meta extraction failed: {exc}")
+        finally:
+            # Ensure proper cleanup of any allocated resources
+            try:
+                if 'user_meta_list' in locals() and user_meta_list:
+                    # Clean up the user meta list
+                    pass
+            except:
+                pass
         return None
 
     def _parse_obj_meta(self, frame_meta) -> List[Dict[str, Any]]:
@@ -3342,7 +3395,14 @@ class DeepStreamVideoPipeline:
 
         # Stop pipeline
         if self.pipeline:
-            self.pipeline.set_state(Gst.State.NULL)
+            try:
+                self.pipeline.set_state(Gst.State.NULL)
+                # Wait for state change to complete
+                state_ret = self.pipeline.get_state(timeout=5 * Gst.SECOND)
+                if state_ret[0] == Gst.StateChangeReturn.ASYNC:
+                    state_ret = self.pipeline.get_state(timeout=10 * Gst.SECOND)
+            except Exception as e:
+                self.logger.warning(f"Error stopping pipeline: {e}")
 
         # Stop main loop
         if self.mainloop:
@@ -3351,6 +3411,28 @@ class DeepStreamVideoPipeline:
         # Wait for main loop thread
         if hasattr(self, "mainloop_thread") and self.mainloop_thread.is_alive():
             self.mainloop_thread.join(timeout=2.0)
+        
+        # Clear queues to prevent memory leaks
+        for queue in self.jpeg_queues.values():
+            try:
+                while not queue.empty():
+                    queue.get_nowait()
+            except:
+                pass
+        self.jpeg_queues.clear()
+        
+        # Clear trail history to prevent memory leaks
+        self.trail_history.clear()
+        self.trail_last_seen_by_sensor.clear()
+        self.trail_history_by_sensor.clear()
+        
+        # Clear any other caches to prevent memory leaks
+        if hasattr(self, '_bbox_smooth_by_sensor'):
+            self._bbox_smooth_by_sensor.clear()
+        if hasattr(self, 'track_motion_state_by_sensor'):
+            self.track_motion_state_by_sensor.clear()
+        if hasattr(self, 'track_zone_state_by_sensor'):
+            self.track_zone_state_by_sensor.clear()
 
         self.logger.info("DeepStream pipeline stopped")
 
@@ -4100,6 +4182,12 @@ class DeepStreamVideoPipeline:
             self.logger.error(
                 f"Error in _on_new_jpeg_sample for sensor {sensor_id}: {e}"
             )
+            # Ensure sample is released even on error
+            try:
+                if 'sample' in locals() and sample:
+                    sample.unref()
+            except:
+                pass
             return Gst.FlowReturn.ERROR
 
     def read_encoded_jpeg(

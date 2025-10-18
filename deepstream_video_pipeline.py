@@ -59,18 +59,35 @@ try:
 except Exception:
     CUSTOM_MDE_META_TYPE = int(pyds.NvDsMetaType.NVDS_START_USER_META) + 10
 
-_glib = ctypes.CDLL("libglib-2.0.so.0")
-_glib.g_strdup.argtypes = [ctypes.c_char_p]
-_glib.g_strdup.restype = ctypes.c_void_p
+# GLib helpers for safe text allocations for OSD (DeepStream will g_free)
+try:
+    _glib = ctypes.CDLL("libglib-2.0.so.0")
+    _glib.g_strdup.argtypes = [ctypes.c_char_p]
+    _glib.g_strdup.restype = ctypes.c_void_p
 
+    def _alloc_display_text(text: Optional[str]) -> ctypes.c_char_p:
+        """Allocate a GLib-managed string for NvOSD display text.
 
-def _alloc_display_text(text: Optional[str]) -> ctypes.c_char_p:
-    """Allocate a GLib-managed string for NvOSD display text."""
-    if not text:
+        DeepStream/NvOSD expects ownership of the text pointer and will free it
+        with g_free after use. We therefore must allocate using g_strdup rather
+        than passing a Python-managed buffer. If GLib is unavailable, return
+        a NULL pointer to disable the label safely.
+        """
+        if not text:
+            return ctypes.c_char_p()
+        encoded = text.encode("utf-8")
+        ptr = _glib.g_strdup(encoded)
+        return ctypes.cast(ptr, ctypes.c_char_p)
+except Exception:
+    _glib = None
+
+    def _alloc_display_text(text: Optional[str]) -> ctypes.c_char_p:
+        # Safe fallback when GLib is unavailable: return NULL so DS skips text
         return ctypes.c_char_p()
-    encoded = text.encode("utf-8")
-    ptr = _glib.g_strdup(encoded)
-    return ctypes.cast(ptr, ctypes.c_char_p)
+
+# Safety cap when reading C strings from user meta to avoid scanning
+# unbounded memory if a null terminator is missing due to malformed data.
+MAX_META_STRING_BYTES = 65536
 
 # Local imports
 from websocket_server import WebSocketServer  # noqa: E402
@@ -2667,7 +2684,13 @@ class DeepStreamVideoPipeline:
                     data_ptr = ctypes.cast(user_meta.user_meta_data, ctypes.c_void_p).value
                     if data_ptr:
                         try:
-                            raw = ctypes.string_at(data_ptr).decode("utf-8", "ignore").rstrip("\x00")
+                            # Read at most MAX_META_STRING_BYTES to avoid scanning unbounded memory.
+                            buf = ctypes.string_at(data_ptr, MAX_META_STRING_BYTES)
+                            # Truncate at first NUL if present
+                            nul_idx = buf.find(b"\x00")
+                            if nul_idx != -1:
+                                buf = buf[:nul_idx]
+                            raw = buf.decode("utf-8", "ignore")
                             payload = json.loads(raw)
                             if isinstance(payload, dict) and "mde" in payload:
                                 entry = payload["mde"]

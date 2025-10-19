@@ -260,7 +260,11 @@ class Visualizer:
                     pt1 = (int((trail[i][0] + trail[i][2]) / 2), int((trail[i][1] + trail[i][3]) / 2))
                     pt2 = (int((trail[i+1][0] + trail[i+1][2]) / 2), int((trail[i+1][1] + trail[i+1][3]) / 2))
                     cv2.line(result, pt1, pt2, color, self.thickness)
-        
+
+        except Exception as e:
+            self.logger.error(f"Error in draw_tracks: {e}")
+            return frame
+
         return result
     
     def add_info_text(

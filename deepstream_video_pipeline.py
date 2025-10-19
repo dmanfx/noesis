@@ -140,8 +140,6 @@ from pixel_to_world import (
     intersect_floor,
     bbox_bottom_center,
 )  # noqa: E402
-from pipelines import mapanything_depth_postprocess as ma_depth  # noqa: E402
-
 if TYPE_CHECKING:  # pragma: no cover - import for type checking only
     from geometry.depth_source import MapAnythingDepthSource
 
@@ -1785,7 +1783,7 @@ class DeepStreamVideoPipeline:
         return Gst.PadProbeReturn.OK
 
     def _mapanything_depth_probe(self, pad, info, user_data=None):
-        """Decode MapAnything SGIE tensors and attach depth metadata."""
+        """Consume MapAnything depth metadata attached by the native shim."""
         gst_buffer = info.get_buffer()
         if not gst_buffer:
             return Gst.PadProbeReturn.OK
@@ -1794,14 +1792,8 @@ class DeepStreamVideoPipeline:
         if not batch_meta:
             return Gst.PadProbeReturn.OK
 
-        buf_pts_ns = getattr(gst_buffer, "pts", None)
-        buf_pts_us = None
-        if buf_pts_ns not in (None, Gst.CLOCK_TIME_NONE):
-            buf_pts_us = int(int(buf_pts_ns) // 1_000)
-
-        min_conf = float(
-            getattr(self.depth_source, "min_conf", self._mapanything_min_conf)
-        )
+        if self._shim_attach_depth_meta is None and self._shim_attach_tensors is None:
+            return Gst.PadProbeReturn.OK
 
         l_frame = batch_meta.frame_meta_list
         while l_frame:
@@ -1812,35 +1804,6 @@ class DeepStreamVideoPipeline:
             except Exception:
                 l_frame = l_frame.next
                 continue
-
-            # Log batch-level user meta types once per frame for correlation
-            try:
-                batch_types = []
-                l_batch_user = getattr(batch_meta, "batch_user_meta_list", None)
-                while l_batch_user:
-                    try:
-                        bu = pyds.NvDsUserMeta.cast(l_batch_user.data)
-                        tval = None
-                        try:
-                            tval = int(getattr(bu.base_meta, "meta_type", None))
-                        except Exception:
-                            tval = None
-                        batch_types.append(tval)
-                    except Exception:
-                        pass
-                    l_batch_user = getattr(l_batch_user, "next", None)
-                self.logger.debug(
-                    "Depth probe: batch user meta types=%s", batch_types
-                )
-            except Exception:
-                pass
-
-            pts_us = None
-            frame_pts_ns = getattr(frame_meta, "buf_pts", None)
-            if frame_pts_ns not in (None, 0, Gst.CLOCK_TIME_NONE):
-                pts_us = int(int(frame_pts_ns) // 1_000)
-            elif buf_pts_us is not None:
-                pts_us = buf_pts_us
 
             ds_index = int(getattr(frame_meta, "source_id", -1))
             sensor_id = self.sensor_id_by_source_idx.get(ds_index)
@@ -1855,75 +1818,18 @@ class DeepStreamVideoPipeline:
 
             self._depth_annotator_stats["pts_hits"] += 1
 
-            l_obj = frame_meta.obj_meta_list
-            if False and self._shim_attach_tensors is not None:
+            if self._shim_attach_tensors is not None:
                 try:
-                    attached = int(
-                        self._shim_attach_tensors(
-                            ctypes.c_void_p(pyds.get_ptr(batch_meta)),
-                            ctypes.c_uint(self.mapanything_sgie_uid),
-                        )
+                    self._shim_attach_tensors(
+                        ctypes.c_void_p(pyds.get_ptr(batch_meta)),
+                        ctypes.c_uint(self.mapanything_sgie_uid),
                     )
-                    if (
-                        self._shim_get_last_counts is not None
-                        and self.logger.isEnabledFor(logging.DEBUG)
-                    ):
-                        try:
-                            roi_count = ctypes.c_int()
-                            candidate_count = ctypes.c_int()
-                            attached_count = ctypes.c_int()
-                            self._shim_get_last_counts(
-                                ctypes.byref(roi_count),
-                                ctypes.byref(candidate_count),
-                                ctypes.byref(attached_count),
-                            )
-                            self.logger.debug(
-                                "Depth probe: shim stats roi=%d candidates=%d attached=%d",
-                                roi_count.value,
-                                candidate_count.value,
-                                attached_count.value,
-                            )
-                        except Exception:
-                            pass
-                    if attached > 0:
-                        self.logger.debug(
-                            "Depth probe: shim attached %d tensor metas to objects",
-                            attached,
-                        )
-                        # Dump object meta types after shim for verification
-                        debug_obj_types = []
-                        l_obj_dbg = frame_meta.obj_meta_list
-                        while l_obj_dbg:
-                            try:
-                                obj_dbg = pyds.NvDsObjectMeta.cast(l_obj_dbg.data)
-                                if self._is_object_excluded(obj_dbg):
-                                    l_obj_dbg = l_obj_dbg.next
-                                    continue
-                                types = []
-                                meta_list = obj_dbg.obj_user_meta_list
-                                while meta_list:
-                                    um = pyds.NvDsUserMeta.cast(meta_list.data)
-                                    try:
-                                        types.append(int(getattr(um.base_meta, "meta_type", None)))
-                                    except Exception:
-                                        types.append(None)
-                                    meta_list = meta_list.next
-                                debug_obj_types.append(
-                                    (
-                                        getattr(obj_dbg, "object_id", None),
-                                        types,
-                                    )
-                                )
-                            except Exception:
-                                pass
-                            l_obj_dbg = l_obj_dbg.next
-                        if debug_obj_types:
-                            self.logger.debug(
-                                "Depth probe: post-shim obj meta types=%s", debug_obj_types
-                            )
-                except Exception as e:
-                    self.logger.debug("Depth probe: shim invocation failed: %s", e)
+                except Exception as attach_err:
+                    self.logger.debug(
+                        "Depth probe: shim tensor attach failed: %s", attach_err
+                    )
 
+            l_obj = frame_meta.obj_meta_list
             while l_obj:
                 try:
                     obj_meta = pyds.NvDsObjectMeta.cast(l_obj.data)
@@ -1937,350 +1843,19 @@ class DeepStreamVideoPipeline:
                     l_obj = l_obj.next
                     continue
 
-                try:
-                    if int(getattr(obj_meta, "object_id", -1)) == -1:
-                        l_obj = l_obj.next
-                        continue
-                except Exception:
-                    l_obj = l_obj.next
-                    continue
-
-                # Skip if depth meta already attached
-                has_depth_meta = False
-                user_meta_iter = getattr(obj_meta, "obj_user_meta_list", None)
-                while user_meta_iter:
-                    um = pyds.NvDsUserMeta.cast(user_meta_iter.data)
+                depth_payload = self._extract_depth_meta(obj_meta)
+                if depth_payload:
+                    self._record_mapanything_sgie_detection(cam_id)
+                    method_name = depth_payload.get("method")
+                    depth_val = depth_payload.get("depth_m", 0.0)
                     try:
-                        if int(getattr(um.base_meta, "meta_type", -1)) == int(
-                            self.depth_meta_type
-                        ):
-                            has_depth_meta = True
-                            break
+                        depth_val = float(depth_val if depth_val is not None else 0.0)
                     except Exception:
-                        pass
-                    user_meta_iter = user_meta_iter.next
-                if has_depth_meta:
-                    l_obj = l_obj.next
-                    continue
-
-                try:
-                    self.logger.debug(
-                        "Depth probe: sensor=%s obj_id=%s class=%s comp_id=%s",
-                        cam_id,
-                        getattr(obj_meta, "object_id", None),
-                        getattr(obj_meta, "class_id", None),
-                        getattr(obj_meta, "unique_component_id", None),
-                    )
-                    classifier_meta = getattr(obj_meta, "classifier_meta_list", None)
-                    if classifier_meta:
-                        comp_ids = []
-                        l_classifier = classifier_meta
-                        while l_classifier:
-                            classifier = pyds.NvDsClassifierMeta.cast(l_classifier.data)
-                            comp_ids.append(getattr(classifier, "unique_component_id", None))
-                            l_classifier = l_classifier.next
-                        self.logger.debug(
-                            "Depth probe: classifier_meta component_ids=%s",
-                            comp_ids,
-                        )
-                except Exception:
-                    pass
-
-                # Debug: Log obj_meta user_meta types
-                obj_meta_types = []
-                try:
-                    user_meta_list = obj_meta.obj_user_meta_list
-                    while user_meta_list:
-                        user_meta = pyds.NvDsUserMeta.cast(user_meta_list.data)
-                        try:
-                            obj_meta_types.append(int(user_meta.base_meta.meta_type))
-                        except Exception:
-                            obj_meta_types.append(None)
-                        user_meta_list = user_meta_list.next
-                    self.logger.debug(
-                        "Depth probe: obj_meta user_meta types=%s for obj_id=%s",
-                        obj_meta_types,
-                        getattr(obj_meta, "object_id", None),
-                    )
-                except Exception:
-                    self.logger.debug("Depth probe: No obj_user_meta_list for obj_id=%s", getattr(obj_meta, "object_id", None))
-
-                tensor_meta, _ = self._find_tensor_meta_for_obj(
-                    batch_meta, frame_meta, obj_meta, self.mapanything_sgie_uid
-                )
-                if not tensor_meta:
-                    # Diagnostic: scan frame-level user meta for any tensor metas and log their UIDs
-                    try:
-                        uids = []
-                        fu = getattr(frame_meta, "frame_user_meta_list", None)
-                        while fu:
-                            try:
-                                um = pyds.NvDsUserMeta.cast(fu.data)
-                                mtype = None
-                                try:
-                                    mtype = int(getattr(um.base_meta, "meta_type", -1))
-                                except Exception:
-                                    mtype = None
-                                if (
-                                    mtype is not None
-                                    and mtype
-                                    == int(pyds.NvDsMetaType.NVDSINFER_TENSOR_OUTPUT_META)
-                                ):
-                                    tm = pyds.NvDsInferTensorMeta.cast(um.user_meta_data)
-                                    if tm:
-                                        uids.append(int(getattr(tm, "unique_id", -1)))
-                            except Exception:
-                                pass
-                            fu = getattr(fu, "next", None)
-                        if uids:
-                            self.logger.debug(
-                                "Depth probe: frame-level tensor metas present with UIDs=%s",
-                                uids,
-                            )
-                    except Exception:
-                        pass
-                    try:
-                        self.logger.debug(
-                            "Depth probe: no tensor meta for obj_id=%s (uid=%s)",
-                            getattr(obj_meta, "object_id", None),
-                            self.mapanything_sgie_uid,
-                        )
-                    except Exception:
-                        pass
-                    l_obj = l_obj.next
-                    continue
-
-                layers = self._tensor_layers_from_meta(tensor_meta)
-                if not layers:
-                    try:
-                        self.logger.debug(
-                            "Depth probe: tensor meta empty for obj_id=%s",
-                            getattr(obj_meta, "object_id", None),
-                        )
-                    except Exception:
-                        pass
-                    l_obj = l_obj.next
-                    continue
-
-                try:
-                    self.logger.debug(
-                        "Depth probe: layers for obj_id=%s -> %s",
-                        getattr(obj_meta, "object_id", None),
-                        list(layers.keys()),
-                    )
-                except Exception:
-                    pass
-
-                bundle = ma_depth.select_layers(layers)
-                depth_map = ma_depth.squeeze_hw(bundle.depth)
-                if depth_map is None or depth_map.size == 0:
-                    try:
-                        self.logger.debug(
-                            "Depth probe: no depth map for obj_id=%s",
-                            getattr(obj_meta, "object_id", None),
-                        )
-                    except Exception:
-                        pass
-                    l_obj = l_obj.next
-                    continue
-
-                conf_map = ma_depth.squeeze_hw(bundle.confidence)
-                mask_map = ma_depth.squeeze_hw(bundle.mask)
-                summary = ma_depth.compute_depth_summary(
-                    depth_map, conf_map, mask_map, min_conf=min_conf
-                )
-
-                rect = obj_meta.rect_params
-                bbox_tuple = (
-                    float(rect.left),
-                    float(rect.top),
-                    float(rect.width),
-                    float(rect.height),
-                )
-                anchor = bbox_bottom_center(
-                    [rect.left, rect.top, rect.width, rect.height]
-                ) or (
-                    float(rect.left + rect.width * 0.5),
-                    float(rect.top + rect.height),
-                )
-
-                depth_indices = ma_depth.anchor_to_depth_indices(
-                    anchor, bbox_tuple, depth_map.shape
-                )
-                depth_val, conf_val, sample_count = ma_depth.sample_depth_window(
-                    depth_map,
-                    depth_indices,
-                    window_sizes=(7, 11),
-                    confidence=conf_map,
-                    mask=mask_map,
-                    min_conf=min_conf,
-                )
-
-                if depth_val <= 0.0 and summary["median"] > 0.0:
-                    depth_val = summary["median"]
-                    conf_val = summary["conf_mean"]
-                    sample_count = summary["sample_count"]
-
-                method_name = "mde"
-                world = None
-                if depth_val > 0.0:
-                    try:
-                        world = self._to_world_from_snap(
-                            cam_id, anchor[0], anchor[1], depth_val, {}
-                        )
-                    except Exception:
-                        world = None
-                    if world is None:
-                        world = self._floor_intersect_world(
-                            cam_id, anchor[0], anchor[1], None
-                        )
-                else:
-                    method_name = "floor"
-                    floor_world = self._floor_intersect_world(
-                        cam_id, anchor[0], anchor[1], None
-                    )
-                    if floor_world is not None:
-                        world = floor_world
-                        depth_val = float(
-                            math.sqrt(
-                                floor_world[0] ** 2
-                                + floor_world[1] ** 2
-                                + floor_world[2] ** 2
-                            )
-                        )
-                        conf_val = float(
-                            self._sanitize_float(conf_val) or min_conf
-                        )
-                        sample_count = 0
-                    else:
                         depth_val = 0.0
-
-                self._record_mapanything_sgie_detection(cam_id)
-                try:
-                    depth_clean = self._sanitize_float(depth_val)
-                    if depth_clean is None:
-                        depth_clean = 0.0
-                    conf_clean = self._sanitize_float(conf_val)
-                    if conf_clean is None:
-                        conf_clean = 0.0
-
-                    world_vals: Optional[List[float]] = None
-                    if world and len(world) == 3:
-                        sanitized_world = [self._sanitize_float(val) for val in world]
-                        if all(val is not None for val in sanitized_world):
-                            world_vals = [float(val) for val in sanitized_world if val is not None]
-
-                    summary_keys = ("median", "p10", "p90", "conf_mean", "valid_ratio")
-                    summary_vals_arr: List[float] = [0.0] * len(summary_keys)
-                    summary_mask_arr: List[int] = [0] * len(summary_keys)
-                    summary_sample_count = -1
-                    if summary:
-                        for idx, key in enumerate(summary_keys):
-                            sanitized = self._sanitize_float(summary.get(key))
-                            if sanitized is not None:
-                                summary_vals_arr[idx] = float(sanitized)
-                                summary_mask_arr[idx] = 1
-                        if "sample_count" in summary:
-                            try:
-                                summary_sample_count = int(summary.get("sample_count", -1))
-                            except Exception:
-                                summary_sample_count = -1
-
-                    scale_val = ma_depth.sanitize_scale(bundle.scale)
-                    scale_clean = self._sanitize_float(scale_val)
-                    has_scale = 1 if scale_clean is not None else 0
-                    if scale_clean is None:
-                        scale_clean = 0.0
-
-                    pose_vals = ma_depth.sanitize_pose(bundle.pose)
-
-                    attached_depth_meta = False
-                    if self._shim_attach_depth_meta is not None:
-                        pts_arg = ctypes.c_longlong(pts_us if pts_us is not None else -1)
-                        method_bytes = method_name.encode("utf-8") if method_name else b"floor"
-                        method_c = ctypes.c_char_p(method_bytes)
-
-                        world_len = 0
-                        if world_vals and len(world_vals) == 3:
-                            world_array = (ctypes.c_double * 3)(*world_vals)
-                            world_ptr = world_array
-                            world_len = 3
-                        else:
-                            world_array = None
-                            world_ptr = None
-
-                        summary_len = 0
-                        if any(summary_mask_arr):
-                            summary_len = len(summary_vals_arr)
-                            summary_vals_array = (ctypes.c_double * summary_len)(*summary_vals_arr)
-                            summary_mask_array = (ctypes.c_int * summary_len)(*summary_mask_arr)
-                            summary_vals_ptr = summary_vals_array
-                            summary_mask_ptr = summary_mask_array
-                        else:
-                            summary_vals_array = None
-                            summary_mask_array = None
-                            summary_vals_ptr = None
-                            summary_mask_ptr = None
-
-                        pose_len = 0
-                        if pose_vals:
-                            pose_len = len(pose_vals)
-                            pose_array = (ctypes.c_double * pose_len)(*pose_vals)
-                            pose_ptr = pose_array
-                        else:
-                            pose_array = None
-                            pose_ptr = None
-
-                        try:
-                            res = int(
-                                self._shim_attach_depth_meta(
-                                    ctypes.c_void_p(pyds.get_ptr(batch_meta)),
-                                    ctypes.c_void_p(pyds.get_ptr(obj_meta)),
-                                    ctypes.c_uint(self.depth_meta_type),
-                                    pts_arg,
-                                    method_c,
-                                    ctypes.c_double(depth_clean),
-                                    ctypes.c_double(conf_clean),
-                                    ctypes.c_int(int(sample_count)),
-                                    world_ptr,
-                                    ctypes.c_int(world_len),
-                                    summary_vals_ptr,
-                                    summary_mask_ptr,
-                                    ctypes.c_int(summary_len),
-                                    ctypes.c_int(summary_sample_count),
-                                    ctypes.c_int(has_scale),
-                                    ctypes.c_double(scale_clean),
-                                    pose_ptr,
-                                    ctypes.c_int(pose_len),
-                                )
-                            )
-                            attached_depth_meta = res > 0
-                        except Exception as attach_exc:
-                            self.logger.debug(
-                                "Depth probe: shim depth payload attach failed: %s",
-                                attach_exc,
-                            )
-
-                    if attached_depth_meta:
-                        try:
-                            self.logger.debug(
-                                "Depth probe: attached payload for obj_id=%s method=%s depth=%.3f conf=%.3f samples=%s",
-                                getattr(obj_meta, "object_id", None),
-                                method_name,
-                                depth_clean,
-                                conf_clean,
-                                sample_count,
-                            )
-                        except Exception:
-                            pass
                     if method_name == "mde" and depth_val > 0.0:
                         self._depth_annotator_stats["mde"] += 1
                     else:
                         self._depth_annotator_stats["floor"] += 1
-                except Exception as exc:
-                    self.logger.debug(
-                        f"Depth user meta attach failed for {cam_id}: {exc}"
-                    )
 
                 l_obj = l_obj.next
 
@@ -2327,166 +1902,6 @@ class DeepStreamVideoPipeline:
                 pass
             l_obj = l_obj.next
         return count
-
-    def _tensor_from_user_meta(
-        self, user_meta: Optional["pyds.NvDsUserMeta"], unique_id: int
-    ) -> Optional["pyds.NvDsInferTensorMeta"]:
-        if not user_meta:
-            return None
-        tensor_meta: Optional["pyds.NvDsInferTensorMeta"] = None
-        try:
-            tensor_meta = pyds.NvDsInferTensorMeta.cast(user_meta.user_meta_data)
-        except Exception:
-            tensor_meta = None
-        if tensor_meta and int(getattr(tensor_meta, "unique_id", -1)) == int(unique_id):
-            return tensor_meta
-
-        seg_meta: Optional["pyds.NvDsInferSegmentationMeta"] = None
-        try:
-            seg_meta = pyds.NvDsInferSegmentationMeta.cast(user_meta.user_meta_data)
-        except Exception:
-            seg_meta = None
-        if seg_meta is not None:
-            tensor_from_seg = self._convert_segmentation_meta_to_tensor(seg_meta)
-            if tensor_from_seg and int(getattr(tensor_from_seg, "unique_id", -1)) == int(
-                unique_id
-            ):
-                return tensor_from_seg
-        return None
-
-    def _find_tensor_meta_for_obj(
-        self, batch_meta, frame_meta, obj_meta, unique_id: int
-    ) -> Tuple[Optional["pyds.NvDsInferTensorMeta"], Optional[Dict[str, Any]]]:
-        # --- Step 1: object-level meta (works for many SGIE cases) ---
-        user_meta_list = getattr(obj_meta, "obj_user_meta_list", None)
-        while user_meta_list:
-            u = pyds.NvDsUserMeta.cast(user_meta_list.data)
-            try:
-                if int(u.base_meta.meta_type) == int(  # type: ignore[attr-defined]
-                    pyds.NvDsMetaType.NVDSINFER_TENSOR_OUTPUT_META
-                ):
-                    t = pyds.NvDsInferTensorMeta.cast(u.user_meta_data)
-                    if t and int(getattr(t, "unique_id", -1)) == int(unique_id):
-                        return t, None
-            except Exception:
-                pass
-            user_meta_list = getattr(user_meta_list, "next", None)
-
-        # --- Legacy frame-level tensor meta (existing fallback) ---
-        frame_user = getattr(frame_meta, "frame_user_meta_list", None)
-        while frame_user:
-            try:
-                fu = pyds.NvDsUserMeta.cast(frame_user.data)
-                tensor_meta = self._tensor_from_user_meta(fu, unique_id)
-                if tensor_meta:
-                    return tensor_meta, None
-            except Exception:
-                pass
-            frame_user = getattr(frame_user, "next", None)
-
-        return None, None
-
-    def _tensor_layers_from_meta(
-        self, tensor_meta: "pyds.NvDsInferTensorMeta"
-    ) -> Dict[str, np.ndarray]:
-        layers: Dict[str, np.ndarray] = {}
-        try:
-            num_layers = int(getattr(tensor_meta, "num_output_layers", 0))
-        except Exception:
-            num_layers = 0
-        for idx in range(num_layers):
-            try:
-                layer_info = pyds.get_nvds_LayerInfo(tensor_meta, idx)
-            except Exception:
-                continue
-            name = getattr(layer_info, "layerName", f"layer_{idx}")
-            if isinstance(name, bytes):
-                try:
-                    name = name.decode("utf-8", "ignore")
-                except Exception:
-                    name = f"layer_{idx}"
-            dims = getattr(layer_info, "inferDims", None)
-            shape: List[int] = []
-            if dims is not None:
-                try:
-                    num_dims = int(dims.numDims)
-                except Exception:
-                    num_dims = 0
-                for d in range(num_dims):
-                    try:
-                        dim_val = int(dims.d[d])
-                    except Exception:
-                        dim_val = 1
-                    shape.append(max(dim_val, 1))
-            if not shape:
-                try:
-                    total = int(layer_info.layerDims.numElements)
-                except Exception:
-                    total = 0
-                shape = [max(total, 1)]
-            try:
-                ptr = pyds.get_ptr(layer_info.buffer)
-            except Exception:
-                ptr = None
-            if not ptr:
-                continue
-            size = int(np.prod(shape, dtype=np.int64))
-            if size <= 0:
-                continue
-
-            ctype_scalar = ctypes.c_float
-            if hasattr(pyds, "NvDsInferDataType"):
-                data_type = getattr(layer_info, "dataType", None)
-                if data_type == pyds.NvDsInferDataType.INT8:
-                    ctype_scalar = ctypes.c_int8
-                elif data_type == getattr(pyds.NvDsInferDataType, "UINT8", None):
-                    ctype_scalar = ctypes.c_uint8
-                elif data_type == pyds.NvDsInferDataType.INT32:
-                    ctype_scalar = ctypes.c_int32
-                elif data_type == getattr(pyds.NvDsInferDataType, "HALF", None):
-                    ctype_scalar = ctypes.c_uint16
-                else:
-                    ctype_scalar = ctypes.c_float
-
-            try:
-                if ptr is None:
-                    self.logger.debug("Null pointer for tensor layer %s", name)
-                    continue
-                
-                # Validate size before creating array
-                if size <= 0:
-                    self.logger.debug("Invalid size for tensor layer %s: %d", name, size)
-                    continue
-                    
-                ctype_array = ctypes.cast(ptr, ctypes.POINTER(ctype_scalar))
-                np_array = np.ctypeslib.as_array(ctype_array, shape=(size,))
-                
-                # Validate the array before copying
-                if np_array is None or np_array.size == 0:
-                    self.logger.debug("Empty array for tensor layer %s", name)
-                    continue
-                    
-                layers[str(name)] = np.array(np_array, copy=True).reshape(shape)
-            except Exception as exc:
-                self.logger.debug("Failed to copy tensor layer %s: %s", name, exc)
-        return layers
-
-    @staticmethod
-    def _convert_segmentation_meta_to_tensor(seg_meta):
-        """Placeholder to adapt segmentation meta if DS provides it."""
-        return None
-
-    @staticmethod
-    def _sanitize_float(value: Optional[float]) -> Optional[float]:
-        if value is None:
-            return None
-        try:
-            val = float(value)
-        except Exception:
-            return None
-        if not math.isfinite(val):
-            return None
-        return val
 
     def _bundle_K(self, cam_id: str) -> Optional[np.ndarray]:
         bundle = self.calibration_bundle
@@ -2775,8 +2190,10 @@ class DeepStreamVideoPipeline:
                                                 except Exception:
                                                     pass
                                                 return entry
-                                        except Exception:
-                                            pass
+                                    except Exception:
+                                        pass
+                        except Exception:
+                            pass
                 try:
                     user_meta_list = user_meta_list.next
                 except StopIteration:
@@ -4164,65 +3581,48 @@ class DeepStreamVideoPipeline:
         self, appsink: GstApp.AppSink, sensor_id: int
     ) -> Gst.FlowReturn:
         """Callback for GPU JPEG appsink – push encoded JPEG bytes to the correct queue"""
+        sample: Optional[Gst.Sample] = None  # type: ignore[attr-defined]
+        buffer: Optional[Gst.Buffer] = None
+        mapinfo = None
         try:
             true_id = sensor_id
             sample = appsink.emit("pull-sample")
             if not sample:
                 return Gst.FlowReturn.ERROR
+
             buffer = sample.get_buffer()
             if not buffer:
-                # Ensure sample is released on early exit
-                try:
-                    sample.unref()
-                except Exception:
-                    pass
                 return Gst.FlowReturn.ERROR
 
             success, mapinfo = buffer.map(Gst.MapFlags.READ)
             if not success:
-                # Ensure sample is released on early exit
-                try:
-                    sample.unref()
-                except Exception:
-                    pass
                 return Gst.FlowReturn.ERROR
 
-            try:
-                jpeg_data = mapinfo.data
-                pts_us: Optional[int] = None
-                pts_ns = getattr(buffer, "pts", None)
-                if pts_ns not in (None, Gst.CLOCK_TIME_NONE):
-                    pts_us = int(int(pts_ns) // 1_000)
-                if jpeg_data:
-                    payload_bytes = bytes(jpeg_data)
-                    if true_id in self.jpeg_queues:
-                        try:
-                            self.jpeg_queues[true_id].put_nowait(
-                                (payload_bytes, pts_us)
-                            )
-                            # Count only frames successfully enqueued (exclude dropped frames)
-                            with self.frame_count_lock:
-                                self.frame_count += 1
-                        except queue.Full:
-                            # Drop frame if queue is full; do not increment frame_count
-                            pass
-                    else:
-                        self.rate_limited_logger.warning(
-                            f"No JPEG queue for source_id {true_id}"
-                        )
-                    # Also store latest bytes for crop decoding
+            jpeg_data = mapinfo.data
+            pts_us: Optional[int] = None
+            pts_ns = getattr(buffer, "pts", None)
+            if pts_ns not in (None, Gst.CLOCK_TIME_NONE):
+                pts_us = int(int(pts_ns) // 1_000)
+            if jpeg_data:
+                payload_bytes = bytes(jpeg_data)
+                if true_id in self.jpeg_queues:
                     try:
-                        self._latest_jpeg_bytes_by_sensor[int(true_id)] = payload_bytes
-                    except Exception:
+                        self.jpeg_queues[true_id].put_nowait(
+                            (payload_bytes, pts_us)
+                        )
+                        # Count only frames successfully enqueued (exclude dropped frames)
+                        with self.frame_count_lock:
+                            self.frame_count += 1
+                    except queue.Full:
+                        # Drop frame if queue is full; do not increment frame_count
                         pass
-            finally:
+                else:
+                    self.rate_limited_logger.warning(
+                        f"No JPEG queue for source_id {true_id}"
+                    )
+                # Also store latest bytes for crop decoding
                 try:
-                    buffer.unmap(mapinfo)
-                except Exception:
-                    pass
-                # Always unref the sample to avoid leaking refs/buffers
-                try:
-                    sample.unref()
+                    self._latest_jpeg_bytes_by_sensor[int(true_id)] = payload_bytes
                 except Exception:
                     pass
 
@@ -4231,13 +3631,15 @@ class DeepStreamVideoPipeline:
             self.logger.error(
                 f"Error in _on_new_jpeg_sample for sensor {sensor_id}: {e}"
             )
-            # Ensure sample is released even on error
-            try:
-                if 'sample' in locals() and sample:
-                    sample.unref()
-            except:
-                pass
             return Gst.FlowReturn.ERROR
+        finally:
+            if buffer is not None and mapinfo is not None:
+                try:
+                    buffer.unmap(mapinfo)
+                except Exception:
+                    pass
+            sample = None
+            buffer = None
 
     def read_encoded_jpeg(
         self, source_id: int, timeout: float = 0.1

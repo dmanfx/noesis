@@ -2197,6 +2197,33 @@ class MapAnythingDepthSource:
                 self._floorplan_cache.popitem(last=False)
 
         return payload
+    
+    def close(self):
+        """Close the depth source and clean up resources."""
+        try:
+            # Stop the executor
+            if hasattr(self, '_executor') and self._executor:
+                self._executor.shutdown(wait=False, cancel_futures=True)
+            
+            # Clear all caches and queues
+            self._snapshots_per_sensor.clear()
+            self._conf_sum_per_sensor.clear()
+            self._intrinsics_best_conf.clear()
+            
+            # Clear the depth cache
+            if hasattr(self, '_depth_cache'):
+                self._depth_cache.clear()
+            
+            # Clear the intrinsics cache
+            if hasattr(self, '_intrinsics_cache'):
+                self._intrinsics_cache.clear()
+            
+            # Clear the floorplan cache
+            if hasattr(self, '_floorplan_cache'):
+                self._floorplan_cache.clear()
+                
+        except Exception as e:
+            self.logger.error(f"Error closing depth source: {e}")
 
 
 __all__ = [

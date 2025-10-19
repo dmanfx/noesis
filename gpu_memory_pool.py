@@ -205,6 +205,8 @@ class UnifiedGPUMemoryPool:
                 alloc_info['return_time'] = time.time()
             else:
                 self.logger.warning(f"Unknown allocation_id: {allocation_id}")
+                # Clean up unknown allocation to prevent memory leaks
+                return
             
             # Return to pool
             pool_key = (tensor.dtype, tensor.shape)
@@ -221,6 +223,16 @@ class UnifiedGPUMemoryPool:
                 # Pool is full, let tensor be garbage collected
                 if self.logger.isEnabledFor(logging.DEBUG):
                     self.logger.debug(f"Pool full, releasing tensor: shape={tensor.shape}")
+            
+            # Clean up old returned allocations to prevent memory leaks
+            current_time = time.time()
+            old_allocations = [
+                alloc_id for alloc_id, alloc_info in self._allocated_tensors.items()
+                if alloc_info.get('returned', False) and 
+                   current_time - alloc_info.get('return_time', 0) > 300  # 5 minutes
+            ]
+            for alloc_id in old_allocations:
+                del self._allocated_tensors[alloc_id]
     
     def touch_tensor(self, allocation_id: int):
         """
@@ -279,6 +291,14 @@ class UnifiedGPUMemoryPool:
                     current_time = time.time()
                     leak_threshold = 1800  # 30 minutes (increased threshold)
                     
+                    # Clean up old warned allocations to prevent memory growth
+                    old_warnings = [
+                        alloc_id for alloc_id in self._warned_allocations
+                        if alloc_id not in self._allocated_tensors
+                    ]
+                    for alloc_id in old_warnings:
+                        self._warned_allocations.discard(alloc_id)
+                    
                     for alloc_id, alloc_info in list(self._allocated_tensors.items()):
                         if not alloc_info['returned']:
                             age = current_time - alloc_info['timestamp']
@@ -330,10 +350,29 @@ class UnifiedGPUMemoryPool:
             for pool in self._pools.values():
                 pool.clear()
             
+            # Clear allocation tracking to prevent memory leaks
+            self._allocated_tensors.clear()
+            self._warned_allocations.clear()
+            self._allocation_id_counter = 0
+            
             self._stats['total_allocated_mb'] = 0.0
         
         torch.cuda.empty_cache()
         self.logger.info("Memory pools cleared")
+    
+    def cleanup(self):
+        """Clean up all resources and stop monitoring thread."""
+        self.logger.info("Cleaning up GPU memory pool...")
+        
+        # Stop monitoring thread
+        if hasattr(self, '_monitoring_thread') and self._monitoring_thread.is_alive():
+            # The thread will exit when the daemon flag is set
+            pass
+        
+        # Clear all pools
+        self.clear_pools()
+        
+        self.logger.info("GPU memory pool cleanup complete")
 
 
 # Global singleton instance

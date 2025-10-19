@@ -139,8 +139,20 @@ MAX_SHUTDOWN_TIME = 15  # Maximum time to wait for graceful shutdown
 
 
 import faulthandler
+import signal
+import sys
 
+# Enable faulthandler for better crash debugging
 faulthandler.enable()
+
+# Set up signal handlers for graceful shutdown
+def signal_handler(signum, frame):
+    """Handle signals for graceful shutdown."""
+    print(f"\n🛑 Received signal {signum}, initiating graceful shutdown...")
+    sys.exit(0)
+
+signal.signal(signal.SIGINT, signal_handler)
+signal.signal(signal.SIGTERM, signal_handler)
 
 
 class ApplicationManager:
@@ -186,7 +198,8 @@ class ApplicationManager:
         try:
             # Use a fixed 350 ms PTS join window for depth snapshot matching
             self.depth_source.lookup_tolerance_us = 350_000
-        except Exception:
+        except Exception as e:
+            self.logger.warning(f"Could not set depth source lookup tolerance: {e}")
             pass
         self._depth_executor = ThreadPoolExecutor(max_workers=2)
         self._depth_warmup_executor = ThreadPoolExecutor(max_workers=1)
@@ -249,7 +262,11 @@ class ApplicationManager:
             self.logger.info(f"Received signal {sig}, starting graceful shutdown...")
             print("🔄 Starting graceful shutdown...")
             # Start graceful shutdown immediately (not in background thread)
-            self.stop()
+            try:
+                self.stop()
+            except Exception as e:
+                self.logger.error(f"Error during graceful shutdown: {e}")
+                os._exit(1)
         elif INTERRUPT_COUNT >= 2:
             self.logger.warning("Second interrupt received, forcing immediate exit")
             print("💥 Second interrupt - forcing immediate exit!")
@@ -279,6 +296,14 @@ class ApplicationManager:
 
         except Exception as e:
             self.logger.error(f"Error during graceful shutdown: {e}")
+            try:
+                # Try to clean up as much as possible before exiting
+                import gc
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+            except:
+                pass
             os._exit(1)
 
     @profile_function("ApplicationManager.initialize")
@@ -2602,6 +2627,9 @@ class ApplicationManager:
         if torch.cuda.is_available() and torch.cuda.device_count() > 0:
             # Clean up TensorRT engines first, while CUDA context is still valid
             try:
+                # Clear CUDA cache to free up memory
+                torch.cuda.empty_cache()
+                torch.cuda.synchronize()
                 # Clean up multi-stream processor GPU resources
                 if (
                     hasattr(self, "multi_stream_processor")
@@ -2628,7 +2656,7 @@ class ApplicationManager:
                     from gpu_memory_pool import get_global_memory_pool
 
                     memory_pool = get_global_memory_pool()
-                    memory_pool.clear_pools()
+                    memory_pool.cleanup()
                     self.logger.info("Early cleanup: GPU memory pools")
                 except Exception as e:
                     self.logger.debug(f"GPU memory pool cleanup not available: {e}")
@@ -2760,11 +2788,141 @@ class ApplicationManager:
 
         # Always terminate the MapAnything microservice
         self._terminate_mapanything_process()
+        
+        # Clean up database connections
+        try:
+            from database import close_all_connections
+            close_all_connections()
+            self.logger.info("Database connections closed")
+        except Exception as e:
+            self.logger.debug(f"Error closing database connections: {e}")
 
         # Clean up PyTorch JIT temp directories
         self._cleanup_pytorch_jit_temp_dirs()
+        
+        # Force garbage collection to clean up any remaining objects
+        import gc
+        gc.collect()
+        
+        # Clear CUDA cache if available
+        try:
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                torch.cuda.synchronize()
+        except Exception as e:
+            self.logger.debug(f"Error clearing CUDA cache: {e}")
+        
+        # Clear any remaining references
+        self.camera_sources.clear()
+        self._ws_header_cache.clear()
+        
+        # Clean up visualization manager
+        if hasattr(self, 'visualization_manager') and self.visualization_manager:
+            try:
+                # Clear any cached data in the visualization manager
+                if hasattr(self.visualization_manager, 'clear_cache'):
+                    self.visualization_manager.clear_cache()
+            except Exception as e:
+                self.logger.debug(f"Error cleaning up visualization manager: {e}")
+        
+        # Clear any remaining references to prevent memory leaks
+        self.multi_stream_processor = None
+        self.websocket_server = None
+        self.websocket_loop = None
+        self.visualization_manager = None
+        self.depth_source = None
+        
+        # Clear any remaining references to prevent memory leaks
+        self.calibration_bundle = None
+        self._intrinsics_models = None
+        self._calib_paths = None
+        self._mapanything_process = None
+        
+        # Clear any remaining references to prevent memory leaks
+        self._occupancy_publisher = None
+        self._depth_publisher = None
+        self._depth_executor = None
+        
+        # Clear any remaining references to prevent memory leaks
+        self._backup_task = None
+        self._ws_header_cache = None
+        
+        # Clear any remaining references to prevent memory leaks
+        self.analysis_frame_queue = None
+        self.streaming_frame_queue = None
+        
+        # Clear any remaining references to prevent memory leaks
+        self.stop_event = None
+        self.camera_sources = None
+        
+        # Clear any remaining references to prevent memory leaks
+        self.config = None
+        self.logger = None
+        self.rate_limited_logger = None
+        
+        # Clear any remaining references to prevent memory leaks
+        self.running = False
+        
+        # Clear any remaining references to prevent memory leaks
+        self._depth_panel_open = False
+        
+        # Clear any remaining references to prevent memory leaks
+        self._intrinsics_models = None
+        self._calib_paths = None
+        
+        # Clear any remaining references to prevent memory leaks
+        self._mapanything_process = None
+        
+        # Clear any remaining references to prevent memory leaks
+        self._occupancy_publisher = None
+        
+        # Clear analysis and streaming queues
+        try:
+            while not self.analysis_frame_queue.empty():
+                self.analysis_frame_queue.get_nowait()
+        except:
+            pass
+            
+        try:
+            while not self.streaming_frame_queue.empty():
+                self.streaming_frame_queue.get_nowait()
+        except:
+            pass
 
         self.logger.info("Application stopped")
+        
+        # Final cleanup to prevent memory leaks
+        try:
+            # Clear any remaining references to prevent memory leaks
+            self._depth_publisher = None
+            self._depth_executor = None
+            self._backup_task = None
+            self._ws_header_cache = None
+            self.analysis_frame_queue = None
+            self.streaming_frame_queue = None
+            self.stop_event = None
+            self.camera_sources = None
+            self.config = None
+            self.logger = None
+            self.rate_limited_logger = None
+            self.running = False
+            self._depth_panel_open = False
+            self._intrinsics_models = None
+            self._calib_paths = None
+            self._mapanything_process = None
+            self._occupancy_publisher = None
+            
+            # Force final garbage collection
+            import gc
+            gc.collect()
+            
+            # Clear CUDA cache if available
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                torch.cuda.synchronize()
+        except Exception as e:
+            # Ignore errors during final cleanup
+            pass
 
     def _cleanup_pytorch_jit_temp_dirs(self):
         """Clean up stale PyTorch JIT temp directories in /tmp/."""
@@ -3006,7 +3164,19 @@ def main():
 
         # Wait for termination signal
         while app_manager.running:
-            time.sleep(1.0)
+            try:
+                time.sleep(1.0)
+            except KeyboardInterrupt:
+                logger.info("Received keyboard interrupt, shutting down...")
+                break
+            except Exception as e:
+                logger.error(f"Error in main loop: {e}")
+                # Try to clean up before exiting
+                try:
+                    app_manager.stop()
+                except:
+                    pass
+                break
 
     except KeyboardInterrupt:
         logger.info("Received keyboard interrupt, shutting down...")

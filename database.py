@@ -281,9 +281,28 @@ class DatabaseManager:
             cursor.execute('DELETE FROM tracks WHERE last_seen < ?', (cutoff_time,))
             deleted_tracks = cursor.rowcount
             
-            # Cleanup Heatmap Data
-            cutoff_date = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d")
-            cursor.execute('DELETE FROM heatmap_data WHERE date < ?', (cutoff_date,))
+            # Cleanup H            return deleted_tracks, deleted_heatmap
+        except sqlite3.Error as e:
+            print(f"[DB Error] Error cleaning up old data: {e}")
+            return 0, 0
+    
+    def close(self):
+        """Close database connections to prevent memory leaks."""
+        try:
+            if hasattr(local_storage, 'db_conn'):
+                local_storage.db_conn.close()
+                delattr(local_storage, 'db_conn')
+        except Exception as e:
+            print(f"Error closing database connection: {e}")
+
+def close_all_connections():
+    """Close all database connections to prevent memory leaks."""
+    try:
+        if hasattr(local_storage, 'db_conn'):
+            local_storage.db_conn.close()
+            delattr(local_storage, 'db_conn')
+    except Exception as e:
+        print(f"Error closing database connection: {e}")off_date,))
             deleted_heatmap = cursor.rowcount
             
             conn.commit()

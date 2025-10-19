@@ -59,20 +59,67 @@ try:
 except Exception:
     CUSTOM_MDE_META_TYPE = int(pyds.NvDsMetaType.NVDS_START_USER_META) + 10
 
-_glib = ctypes.CDLL("libglib-2.0.so.0")
-_glib.g_strdup.argtypes = [ctypes.c_char_p]
-_glib.g_strdup.restype = ctypes.c_void_p
+# GLib helpers for safe text allocations for OSD (DeepStream will g_free)
+try:
+    _glib = ctypes.CDLL("libglib-2.0.so.0")
+    _glib.g_strdup.argtypes = [ctypes.c_char_p]
+    _glib.g_strdup.restype = ctypes.c_void_p
+
+    def _alloc_display_text(text: Optional[str]) -> ctypes.c_char_p:
+        """Allocate a GLib-managed string for NvOSD display text.
+
+        DeepStream/NvOSD expects ownership of the text pointer and will free it
+        with g_free after use. We therefore must allocate using g_strdup rather
+        than passing a Python-managed buffer. If GLib is unavailable, return
+        a NULL pointer to disable the label safely.
+        """
+        if not text:
+            return ctypes.c_char_p()
+        encoded = text.encode("utf-8")
+        ptr = _glib.g_strdup(encoded)
+        return ctypes.cast(ptr, ctypes.c_char_p)
+except Exception:
+    _glib = None
+
+    def _alloc_display_text(text: Optional[str]) -> ctypes.c_char_p:
+        # Safe fallback when GLib is unavailable: return NULL so DS skips text
+        return ctypes.c_char_p()
+
+# Safety cap when reading C strings from user meta to avoid scanning
+# unbounded memory if a null terminator is missing due to malformed data.
+MAX_META_STRING_BYTES = 65536
 
 
-def _alloc_display_text(text: Optional[str]) -> ctypes.c_char_p:
-    """Allocate a GLib-managed string for NvOSD display text."""
-    if not text:
-        return ctypes.c_char_p()
-    encoded = text.encode("utf-8")
-    ptr = _glib.g_strdup(encoded)
-    if not ptr:
-        return ctypes.c_char_p()
-    return ctypes.cast(ptr, ctypes.c_char_p)
+def _safe_cstring_from_ptr(ptr_val: int) -> Optional[str]:
+    """Best-effort, bounded read of C char* into Python str.
+
+    Attempts pyds.get_string when available, otherwise falls back to a bounded
+    ctypes.string_at to reduce risk of runaway reads. Returns None on failure.
+    """
+    try:
+        if not ptr_val:
+            return None
+        # Prefer pyds.get_string if available in this environment
+        try:
+            cptr = ctypes.cast(ctypes.c_void_p(ptr_val), ctypes.c_char_p)
+            getter = getattr(pyds, "get_string", None)
+            if callable(getter):
+                s = getter(cptr)  # type: ignore[misc]
+                if isinstance(s, str):
+                    return s
+        except Exception:
+            # Fall through to bounded raw read
+            pass
+
+        # Bounded raw read with a sane cap to minimize fault surface
+        MAX_READ = 1 << 20  # 1 MiB cap
+        raw = ctypes.string_at(ptr_val, MAX_READ)
+        nul = raw.find(b"\x00")
+        if nul != -1:
+            raw = raw[:nul]
+        return raw.decode("utf-8", "ignore")
+    except Exception:
+        return None
 
 # Local imports
 from websocket_server import WebSocketServer  # noqa: E402
@@ -2707,11 +2754,13 @@ class DeepStreamVideoPipeline:
                     data_ptr = ctypes.cast(user_meta.user_meta_data, ctypes.c_void_p).value
                     if data_ptr:
                         try:
-                            # Use a safer approach to read the string to avoid memory issues
-                            raw_bytes = ctypes.string_at(data_ptr)
-                            if raw_bytes:
-                                raw = raw_bytes.decode("utf-8", "ignore").rstrip("\x00")
-                                if raw:  # Only process non-empty strings
+                            raw = _safe_cstring_from_ptr(int(data_ptr))
+                            if not raw:
+                                raise ValueError("empty payload")
+                            payload = json.loads(raw)
+                            if isinstance(payload, dict) and "mde" in payload:
+                                entry = payload["mde"]
+                                if isinstance(entry, dict):
                                     try:
                                         payload = json.loads(raw)
                                         if isinstance(payload, dict) and "mde" in payload:

@@ -27,7 +27,6 @@ import time
 import queue
 import json
 import ctypes
-import json
 import tempfile
 from collections import defaultdict, deque
 

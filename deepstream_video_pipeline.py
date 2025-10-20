@@ -269,25 +269,13 @@ class DeepStreamVideoPipeline:
             "cam_ids": set(),
         }
 
-        # Try to load optional C shim for robust ROI→object tensor meta attachment
-        self._shim_attach_tensors = None
+        # Try to load optional C shim for robust depth JSON meta attachment
         self._shim_attach_depth_meta = None
-        self._shim_get_last_counts = None
         self._shim_version = None
         try:
             shim_path = os.path.join(self.module_dir, "external/ds_preprocess_shim/libds_preprocess_shim.so")
             if os.path.exists(shim_path):
                 lib = ctypes.CDLL(shim_path)
-                lib.ds_attach_roi_tensor_to_objects.argtypes = [ctypes.c_void_p, ctypes.c_uint]
-                lib.ds_attach_roi_tensor_to_objects.restype = ctypes.c_int
-                self._shim_attach_tensors = lib.ds_attach_roi_tensor_to_objects
-                lib.ds_preprocess_shim_get_last_counts.argtypes = [
-                    ctypes.POINTER(ctypes.c_int),
-                    ctypes.POINTER(ctypes.c_int),
-                    ctypes.POINTER(ctypes.c_int),
-                ]
-                lib.ds_preprocess_shim_get_last_counts.restype = None
-                self._shim_get_last_counts = lib.ds_preprocess_shim_get_last_counts
                 lib.ds_preprocess_shim_version.argtypes = []
                 lib.ds_preprocess_shim_version.restype = ctypes.c_int
                 try:
@@ -1383,9 +1371,9 @@ class DeepStreamVideoPipeline:
             # Use resolved path for engine-file check and element property
             self._check_for_engine_file(_nvinfer_cfg)
             elements["nvinfer"].set_property("config-file-path", _nvinfer_cfg)
-            # Ensure raw tensor outputs can be attached if needed
+            # Disable raw tensor meta; SGIE path consumes ROI tensors via preprocess
             try:
-                elements["nvinfer"].set_property("output-tensor-meta", True)
+                elements["nvinfer"].set_property("output-tensor-meta", False)
             except Exception:
                 pass
 
@@ -1412,7 +1400,7 @@ class DeepStreamVideoPipeline:
                 # Canonical DS 7.1 settings for SGIE consuming nvdspreprocess tensors
                 try:
                     elements["mapanything_sgie"].set_property(
-                        "output-tensor-meta", True
+                        "output-tensor-meta", False
                     )
                 except Exception:
                     pass
@@ -1792,9 +1780,6 @@ class DeepStreamVideoPipeline:
         if not batch_meta:
             return Gst.PadProbeReturn.OK
 
-        if self._shim_attach_depth_meta is None and self._shim_attach_tensors is None:
-            return Gst.PadProbeReturn.OK
-
         l_frame = batch_meta.frame_meta_list
         while l_frame:
             try:
@@ -1817,17 +1802,6 @@ class DeepStreamVideoPipeline:
             )
 
             self._depth_annotator_stats["pts_hits"] += 1
-
-            if self._shim_attach_tensors is not None:
-                try:
-                    self._shim_attach_tensors(
-                        ctypes.c_void_p(pyds.get_ptr(batch_meta)),
-                        ctypes.c_uint(self.mapanything_sgie_uid),
-                    )
-                except Exception as attach_err:
-                    self.logger.debug(
-                        "Depth probe: shim tensor attach failed: %s", attach_err
-                    )
 
             l_obj = frame_meta.obj_meta_list
             while l_obj:

@@ -371,7 +371,9 @@ class DeepStreamVideoPipeline:
         # Initialize pipeline components
         self.pipeline: Optional[Gst.Pipeline] = None
         self.mainloop: Optional[GLib.MainLoop] = None
-        self.websocket_server: Optional[WebSocketServer] = None
+        self._websocket_server: Optional[WebSocketServer] = None
+        # Historical alias used by downstream code paths (e.g., Menon frontend)
+        self.ws: Optional[Any] = None
 
         # Threading and state management
         self.running = False
@@ -687,6 +689,16 @@ class DeepStreamVideoPipeline:
 
         # Create pipeline elements
         self._create_pipeline()
+
+    @property
+    def websocket_server(self) -> Optional[WebSocketServer]:
+        return self._websocket_server
+
+    @websocket_server.setter
+    def websocket_server(self, server: Optional[WebSocketServer]) -> None:
+        self._websocket_server = server
+        # Maintain compatibility with legacy broadcast helpers that expect self.ws
+        self.ws = server
 
     def update_detection_config(self, config_data: Dict[str, Any]) -> bool:
         """Update DeepStream detection configuration in real-time using GObject properties
@@ -1780,6 +1792,7 @@ class DeepStreamVideoPipeline:
         if not batch_meta:
             return Gst.PadProbeReturn.OK
 
+        objs_in_batch = 0
         l_frame = batch_meta.frame_meta_list
         while l_frame:
             try:
@@ -1813,13 +1826,73 @@ class DeepStreamVideoPipeline:
                     l_obj = l_obj.next
                     continue
 
+                objs_in_batch += 1
+
                 if self._is_object_excluded(obj_meta):
                     l_obj = l_obj.next
                     continue
 
+                meta_type_val = int(self.depth_meta_type)
+                has_depth_meta = False
+                user_meta_node = obj_meta.obj_user_meta_list
+                while user_meta_node:
+                    try:
+                        user_meta = pyds.NvDsUserMeta.cast(user_meta_node.data)
+                        base_meta = getattr(user_meta, "base_meta", None)
+                        if base_meta is not None:
+                            try:
+                                if int(getattr(base_meta, "meta_type", -1)) == meta_type_val:
+                                    has_depth_meta = True
+                                    break
+                            except Exception:
+                                pass
+                    except Exception:
+                        pass
+                    try:
+                        user_meta_node = user_meta_node.next
+                    except StopIteration:
+                        break
+
+                attached = 1 if has_depth_meta else 0
+                try:
+                    self.logger.debug("MA depth: attached=%d (uid=22)", attached)
+                except Exception:
+                    pass
+                if has_depth_meta:
+                    try:
+                        self.logger.debug(
+                            "MA depth: obj %s has depth meta", obj_meta.object_id
+                        )
+                    except Exception:
+                        pass
+
                 depth_payload = self._extract_depth_meta(obj_meta)
                 if depth_payload:
                     self._record_mapanything_sgie_detection(cam_id)
+                    depth_val_log = depth_payload.get("depth_m")
+                    if depth_val_log is not None:
+                        try:
+                            self.logger.debug("MA depth: depth_m=%s", depth_val_log)
+                        except Exception:
+                            pass
+                    publisher = getattr(self, "ws", None) or self.websocket_server
+                    if publisher:
+                        message = {
+                            "sid": sensor_id,
+                            "depth_m": depth_payload.get("depth_m"),
+                            "conf": depth_payload.get("conf"),
+                        }
+                        try:
+                            if hasattr(publisher, "publish"):
+                                publisher.publish("depth_probe", message)
+                            elif hasattr(publisher, "broadcast_sync"):
+                                publisher.broadcast_sync(
+                                    {"type": "depth_probe", "payload": message}
+                                )
+                        except Exception as exc:
+                            self.logger.debug(
+                                "MA depth: ws publish failed: %s", exc, exc_info=False
+                            )
                     method_name = depth_payload.get("method")
                     depth_val = depth_payload.get("depth_m", 0.0)
                     try:
@@ -1835,6 +1908,10 @@ class DeepStreamVideoPipeline:
 
             l_frame = l_frame.next
 
+        try:
+            self.logger.debug("MA depth: objs_in_batch=%d", objs_in_batch)
+        except Exception:
+            pass
         self._maybe_log_depth_annotator_stats()
         self._maybe_log_mapanything_sgie_stats()
         return Gst.PadProbeReturn.OK
@@ -2052,25 +2129,9 @@ class DeepStreamVideoPipeline:
     def _extract_analytics_frame_meta(self, frame_meta) -> Optional[Dict[str, Any]]:
         """Extract analytics frame metadata"""
         try:
-            user_meta_list = frame_meta.frame_user_meta_list
-            while user_meta_list:
-                user_meta = pyds.NvDsUserMeta.cast(user_meta_list.data)  # type: ignore
-                if user_meta.base_meta.meta_type == pyds.nvds_get_user_meta_type(
-                    "NVIDIA.DSANALYTICSFRAME.USER_META"
-                ):  # type: ignore
-                    analytics_frame_meta = pyds.NvDsAnalyticsFrameMeta.cast(
-                        user_meta.user_meta_data
-                    )  # type: ignore
-                    return {
-                        "objects_in_roi": analytics_frame_meta.objInROIcnt,
-                        "line_crossing_cumulative": analytics_frame_meta.objLCCumCnt,
-                        "line_crossing_current": analytics_frame_meta.objLCCurrCnt,
-                        "overcrowding_status": analytics_frame_meta.ocStatus,
-                    }
-                try:
-                    user_meta_list = user_meta_list.next
-                except StopIteration:
-                    break
+            if not hasattr(frame_meta, "frame_user_meta_list"):
+                return None
+            # Frame-level user meta inspection removed
             return None
         except Exception as e:
             self.logger.debug(f"Error extracting analytics frame meta: {e}")
@@ -2124,15 +2185,6 @@ class DeepStreamVideoPipeline:
                     )
                 except Exception:
                     meta_type = None
-                try:
-                    self.logger.debug(
-                        "Inspecting user meta: type=%s(%s) obj_id=%s",
-                        meta_type,
-                        int(meta_type) if meta_type is not None else None,
-                        getattr(obj_meta, "object_id", None),
-                    )
-                except Exception:
-                    pass
                 mtype_val = None
                 try:
                     mtype_val = int(meta_type)

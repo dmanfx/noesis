@@ -133,7 +133,6 @@ class ApplicationManager:
         # Initialize state
         self.running = False
         self.stop_event = threading.Event()
-        self.camera_sources = {}
         self.multi_stream_processor = None  # Single multi-stream processor
         try:
             self.analysis_frame_queue = multiprocessing.Queue(maxsize=100)
@@ -288,15 +287,6 @@ class ApplicationManager:
             # Add detection config getter for initial sync
             self.websocket_server.detection_config_getter = self._get_detection_config
 
-            # Debug: Write to stderr instead of stdout
-            import os
-            os.write(2, b"DEBUG: About to load camera sources...\n")
-
-            # Load camera sources
-            os.write(2, b"DEBUG: Loading camera sources...\n")
-            self._load_camera_sources()
-            os.write(2, b"DEBUG: Camera sources loaded\n")
-
             # Load calibration & wire WebSocket RPCs
             try:
                 self._load_calibration()
@@ -332,68 +322,6 @@ class ApplicationManager:
             traceback.print_exc()
             raise
     
-    @profile_function("ApplicationManager.load_camera_sources")
-    def _load_camera_sources(self):
-        """Load camera sources from configuration"""
-        self.logger.info("Loading camera sources")
-        
-        # Clear existing sources
-        self.camera_sources = {}
-        
-        if self.config.cameras.USE_WEBCAM:
-            # Add webcam as a source entry
-            self.camera_sources["webcam"] = {
-                "url": "v4l2:///dev/video0",  # Example for V4L2 webcam
-                "name": "Webcam",
-                "width": self.config.cameras.CAMERA_WIDTH,
-                "height": self.config.cameras.CAMERA_HEIGHT,
-                "enabled": True
-            }
-            self.logger.info("Added webcam as a source")
-            
-        # Load video files
-        if self.config.cameras.VIDEO_FILES:
-            for i, video_file in enumerate(self.config.cameras.VIDEO_FILES):
-                if os.path.exists(video_file):
-                    camera_id = f"video_{i}"
-                    self.camera_sources[camera_id] = {
-                        "url": f"file://{os.path.abspath(video_file)}",
-                        "name": f"Video File {i}",
-                        "width": self.config.cameras.CAMERA_WIDTH,
-                        "height": self.config.cameras.CAMERA_HEIGHT,
-                        "enabled": True
-                    }
-                    self.logger.info(f"Added video file as source: {video_file} with ID {camera_id}")
-                else:
-                    self.logger.warning(f"Video file not found: {video_file}")
-        
-        # Load RTSP streams
-        if self.config.cameras.RTSP_STREAMS:
-            for i, stream_config in enumerate(self.config.cameras.RTSP_STREAMS):
-                # Skip disabled streams
-                if not stream_config.get("enabled", True):
-                    self.logger.info(f"Skipping disabled stream: {stream_config.get('name', f'Camera {i+1}')}")
-                    continue
-                    
-                camera_id = f"rtsp_{i}"
-                stream_name = stream_config.get("name", f"Camera {i+1}")
-                stream_url = stream_config["url"]
-                stream_width = stream_config["width"]
-                stream_height = stream_config["height"]
-                
-                # Store the full stream config for later use
-                self.camera_sources[camera_id] = {
-                    "url": stream_url,
-                    "name": stream_name,
-                    "width": stream_width,
-                    "height": stream_height
-                }
-                self.logger.info(f"Added RTSP stream as source: {stream_name} ({stream_url}) - {stream_width}x{stream_height}")
-        
-        # Check if we have any sources
-        if not self.camera_sources:
-            self.logger.warning("No camera sources found in configuration")
-
     @profile_function("ApplicationManager.start")
     def start(self):
         """Start all application components"""

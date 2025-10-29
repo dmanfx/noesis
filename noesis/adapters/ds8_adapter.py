@@ -31,16 +31,13 @@ import time
 import queue
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
-try:
-    import gi  # type: ignore
-    gi.require_version("Gst", "1.0")
-    gi.require_version("GstApp", "1.0")
-    from gi.repository import Gst, GLib, GstApp  # type: ignore
-except Exception:  # pragma: no cover - allow import without GI for tests
-    gi = None
-    Gst = None
-    GLib = None
-    GstApp = None
+
+import gi  # type: ignore
+gi.require_version("GstApp", "1.0")
+gi.require_version("Gst", "1.0")
+gi.require_version("GstRtsp", "1.0")
+from gi.repository import Gst, GLib, GstApp, GstRtsp  # type: ignore
+
 
 
 class DS8Adapter:
@@ -48,73 +45,27 @@ class DS8Adapter:
         self.config = config
         self.logger = self._get_logger()
 
-        camera_cfg = getattr(self.config, "cameras", None)
-        default_width = int(getattr(camera_cfg, "CAMERA_WIDTH", 1920)) if camera_cfg else 1920
-        default_height = int(getattr(camera_cfg, "CAMERA_HEIGHT", 1080)) if camera_cfg else 1080
+        # Require deepstream-test5 style config for nvmultiurisrcbin
+        self.ds_multiurisrc_cfg = str(getattr(self.config.processing, "DS_MULTIURISRC_CONFIG", "") or "").strip()
+        if not self.ds_multiurisrc_cfg or not os.path.exists(self.ds_multiurisrc_cfg):
+            raise RuntimeError("DS_MULTIURISRC_CONFIG missing or not found; provide a deepstream-test5 style config file")
 
-        self.sources: List[Dict[str, Any]] = []
+        self._ds_src_settings = self._parse_multiurisrc_config(self.ds_multiurisrc_cfg)
 
-        def _append_source(entry: Dict[str, Any], fallback_name: str, source_type: str) -> None:
-            url = str(entry.get("url", "") or "").strip()
-            if not url:
-                self.logger.warning("Skipping %s source without URL", source_type)
-                return
-            name = entry.get("name") or fallback_name
-            self.sources.append(
-                {
-                    "name": name,
-                    "clean_name": self._clean_name(name),
-                    "url": url,
-                    "width": int(entry.get("width", default_width)),
-                    "height": int(entry.get("height", default_height)),
-                    "type": source_type,
-                }
-            )
-
-        rtsp_streams = getattr(camera_cfg, "RTSP_STREAMS", []) if camera_cfg else []
-        for stream in rtsp_streams:
-            if isinstance(stream, dict) and stream.get("enabled", True):
-                _append_source(stream, stream.get("name") or f"Camera {len(self.sources)+1}", "rtsp")
-
-        if camera_cfg and getattr(camera_cfg, "USE_WEBCAM", False):
-            webcam_url = str(getattr(camera_cfg, "WEBCAM_URL", "v4l2:///dev/video0"))
-            webcam_entry = {
-                "name": "Webcam",
-                "url": webcam_url,
-                "width": default_width,
-                "height": default_height,
-            }
-            _append_source(webcam_entry, "Webcam", "webcam")
-
-        video_files = getattr(camera_cfg, "VIDEO_FILES", []) if camera_cfg else []
-        for idx, video_path in enumerate(video_files or []):
-            if not isinstance(video_path, str) or not video_path:
-                continue
-            abs_path = os.path.abspath(video_path)
-            if not os.path.exists(abs_path) and not video_path.startswith("file://"):
-                self.logger.warning("Skipping file source (not found): %s", abs_path)
-                continue
-            url = video_path if video_path.startswith("file://") else f"file://{abs_path}"
-            file_entry = {
-                "name": f"Video File {idx}",
-                "url": url,
-                "width": default_width,
-                "height": default_height,
-            }
-            _append_source(file_entry, file_entry["name"], "file")
-
-        # Canonical per-source info (sensor ids 0..N-1)
+        # Canonical per-source info (sensor ids 0..N-1), built from config file
+        uris = self._ds_src_settings.get("uris", [])
+        names = self._ds_src_settings.get("sensor_names", [])
+        width = int(self._ds_src_settings.get("mux_width", 1920))
+        height = int(self._ds_src_settings.get("mux_height", 1080))
         self.source_info: Dict[int, Dict[str, Any]] = {}
-        for idx, src in enumerate(self.sources):
-            name = src.get("name") or f"Camera {idx+1}"
-            clean = self._clean_name(name)
+        for idx, uri in enumerate(uris):
+            name = names[idx] if idx < len(names) and names[idx] else f"Camera {idx+1}"
             self.source_info[idx] = {
                 "name": name,
-                "clean_name": clean,
-                "url": src.get("url", ""),
-                "width": int(src.get("width", default_width)),
-                "height": int(src.get("height", default_height)),
-                "type": src.get("type", "rtsp"),
+                "clean_name": self._clean_name(name),
+                "url": uri,
+                "width": width,
+                "height": height,
             }
 
         # Queues for encoded JPEG payloads
@@ -326,6 +277,122 @@ class DS8Adapter:
         except Exception:
             pass
 
+    def _parse_multiurisrc_config(self, path: str) -> Dict[str, Any]:
+        import configparser
+        cfg = configparser.ConfigParser(interpolation=None, delimiters=("="))
+        with open(path, "r", encoding="utf-8") as f:
+            cfg.read_file(f)
+        out: Dict[str, Any] = {}
+        # source-list
+        sl = cfg["source-list"] if cfg.has_section("source-list") else {}
+        def _split_list(v: str) -> List[str]:
+            return [s.strip() for s in (v or "").split(";") if s.strip()]
+        uris = _split_list(sl.get("list", "")) if sl else []
+        out["uris"] = uris
+        out["sensor_ids"] = _split_list(sl.get("sensor-id-list", "")) if sl else []
+        out["sensor_names"] = _split_list(sl.get("sensor-name-list", "")) if sl else []
+        out["max_batch_size"] = int(sl.get("max-batch-size", "0") or 0) if sl else 0
+        out["http_ip"] = sl.get("http-ip", "") if sl else ""
+        out["http_port"] = int(sl.get("http-port", "0") or 0) if sl else 0
+
+        # source-attr-all
+        saa = cfg["source-attr-all"] if cfg.has_section("source-attr-all") else {}
+        out["latency"] = int(saa.get("latency", "0") or 0) if saa else 0
+        out["cudadec_memtype"] = int(saa.get("cudadec-memtype", "0") or 0) if saa else 0
+        out["gpu_id"] = int(saa.get("gpu-id", "0") or 0) if saa else 0
+        out["rtsp_reconnect_interval_sec"] = int(saa.get("rtsp-reconnect-interval-sec", "0") or 0) if saa else 0
+        out["init_rtsp_reconnect_interval_sec"] = int(saa.get("init-rtsp-reconnect-interval-sec", "0") or 0) if saa else 0
+        out["rtsp_reconnect_attempts"] = int(saa.get("rtsp-reconnect-attempts", "0") or 0) if saa else 0
+
+        # streammux
+        sm = cfg["streammux"] if cfg.has_section("streammux") else {}
+        out["batched_push_timeout"] = int(sm.get("batched-push-timeout", "33333") or 33333) if sm else 33333
+        out["mux_width"] = int(sm.get("width", "1920") or 1920) if sm else 1920
+        out["mux_height"] = int(sm.get("height", "1080") or 1080) if sm else 1080
+        out["enable_padding"] = int(sm.get("enable-padding", "0") or 0) if sm else 0
+        out["drop_pipeline_eos"] = int(sm.get("drop-pipeline-eos", "1") or 1) if sm else 1
+        out["live_source"] = int(sm.get("live-source", "1") or 1) if sm else 1
+        return out
+
+    def _configure_rtspsrc_children(self, multi_bin) -> None:
+        if not Gst or not isinstance(multi_bin, Gst.Bin):
+            return
+        try:
+            iterator = multi_bin.iterate_recurse()
+        except Exception:
+            return
+        tcp_value = None
+        applied = False
+        if GstRtsp is not None:
+            try:
+                tcp_value = int(GstRtsp.RTSPLowerTrans.TCP)
+            except Exception:
+                tcp_value = 4
+        if tcp_value is None:
+            tcp_value = 4
+        # Use latency from config file if provided
+        desired_latency = int(self._ds_src_settings.get("latency", 0) or 0) or 100
+        try:
+            while True:
+                res, element = iterator.next()
+                if res == Gst.IteratorResult.OK:
+                    if not isinstance(element, Gst.Element):
+                        continue
+                    factory = element.get_factory()
+                    factory_name = factory.get_name() if factory else ""
+                    name = element.get_name() or factory_name or "unknown"
+                    try:
+                        if factory_name == "rtspsrc" or name.startswith("rtspsrc"):
+                            try:
+                                element.set_property("protocols", tcp_value)
+                            except Exception:
+                                pass
+                            try:
+                                element.set_property("latency", desired_latency)
+                            except Exception:
+                                pass
+                            try:
+                                element.set_property("do-rtsp-keep-alive", True)
+                            except Exception:
+                                pass
+                            try:
+                                if element.find_property("drop-on-latency"):
+                                    element.set_property("drop-on-latency", False)
+                            except Exception:
+                                pass
+                            applied = True
+                            continue
+                        if factory_name in {"nvurisrcbin", "dsnvurisrcbin"} or "dsnvurisrcbin" in name:
+                            try:
+                                if element.find_property("select-rtp-protocol"):
+                                    element.set_property("select-rtp-protocol", 4)
+                            except Exception:
+                                pass
+                            try:
+                                if element.find_property("latency"):
+                                    element.set_property("latency", desired_latency)
+                            except Exception:
+                                pass
+                            try:
+                                if element.find_property("rtsp-reconnect-interval"):
+                                    element.set_property("rtsp-reconnect-interval", int(self._ds_src_settings.get("rtsp_reconnect_interval_sec", 0) or 0))
+                            except Exception:
+                                pass
+                            applied = True
+                    except Exception as err:
+                        self.logger.warning("Failed to tune RTSP source %s: %s", name, err)
+                elif res == Gst.IteratorResult.DONE:
+                    break
+                else:
+                    continue
+        finally:
+            try:
+                iterator.free()
+            except Exception:
+                pass
+        if applied:
+            self.logger.info("Applied RTSP tuning to nvmultiurisrcbin children")
+
     def _build_pipeline(self) -> None:
         self.pipeline = Gst.Pipeline.new("ds8_pipeline")
         if not self.pipeline:
@@ -383,9 +450,15 @@ class DS8Adapter:
         mosaic_sink = self._make("appsink", "mosaic_sink")
 
         # Configure source properties
-        uris = [str(self.source_info[i]["url"]) for i in sorted(self.source_info.keys())]
-        uri_list = " ".join(uris)
-        sensor_ids = ",".join(str(i) for i in sorted(self.source_info.keys()))
+        # Apply nvmultiurisrcbin configuration from file
+        cfg = self._ds_src_settings
+        uris = cfg.get("uris", [])
+        sensor_ids_list = cfg.get("sensor_ids", [])
+        # If sensor-id-list absent, build 0..N-1
+        if not sensor_ids_list:
+            sensor_ids_list = [str(i) for i in range(len(uris))]
+        uri_list = ",".join(uris)
+        sensor_ids = ",".join(sensor_ids_list)
         try:
             src.set_property("uri-list", uri_list)
         except Exception:
@@ -395,30 +468,39 @@ class DS8Adapter:
         except Exception:
             pass
         try:
-            src.set_property("max-batch-size", len(self.source_info))
+            mb = int(cfg.get("max_batch_size", 0) or 0) or len(uris)
+            src.set_property("max-batch-size", mb)
         except Exception:
             pass
         try:
-            w = max(int(v["width"]) for v in self.source_info.values())
-            h = max(int(v["height"]) for v in self.source_info.values())
+            w = int(cfg.get("mux_width", 1920) or 1920)
+            h = int(cfg.get("mux_height", 1080) or 1080)
         except Exception:
             w, h = 1920, 1080
-        for k, v in ("width", w), ("height", h), ("live-source", 1), ("drop-pipeline-eos", 1):
+        for k, v in (("width", w), ("height", h), ("live-source", int(cfg.get("live_source", 1) or 1)), ("drop-pipeline-eos", int(cfg.get("drop_pipeline_eos", 1) or 1))):
             try:
                 src.set_property(k, v)
             except Exception:
                 pass
+        # Sample config: set reconnect interval (seconds) if property exists
         for k, v in {
-            "latency": 0,
-            
+            "rtsp-reconnect-interval": int(cfg.get("rtsp_reconnect_interval_sec", 0) or 0),
+            "init-rtsp-reconnect-interval": int(cfg.get("init_rtsp_reconnect_interval_sec", 0) or 0),
+            "rtsp-reconnect-attempts": int(cfg.get("rtsp_reconnect_attempts", 0) or 0),
+            "cudadec-memtype": int(cfg.get("cudadec_memtype", 0) or 0),
+            "gpu-id": int(cfg.get("gpu_id", 0) or 0),
+            "ip-address": str(cfg.get("http_ip", "") or ""),
+            "port": int(cfg.get("http_port", 0) or 0),
         }.items():
             try:
                 src.set_property(k, v)
             except Exception as e:
-                self.logger.warning(f"RTSP prop {k} failed: {e}")
+                # ignore unsupported properties on this build
+                self.logger.debug(f"nvmultiurisrcbin prop {k} not set: {e}")
         try:
-            src.set_property("batched-push-timeout", 50000)
-            self.logger.info("Set batched-push-timeout to 50000")
+            bpt = int(cfg.get("batched_push_timeout", 33333) or 33333)
+            src.set_property("batched-push-timeout", bpt)
+            self.logger.info(f"Set batched-push-timeout to {bpt}")
         except Exception as e:
             self.logger.warning("Failed to set batched-push-timeout: %s", e)
         for k, v in {"cudadec-memtype": 0, "drop-frame-interval": 0}.items():
@@ -433,6 +515,8 @@ class DS8Adapter:
             time.sleep(0.1)
             src.set_state(Gst.State.READY)
             self.logger.info("nvmultiurisrcbin pad negotiation complete")
+            # Tune child rtspsrc per sample config (latency, protocols, keep-alive)
+            self._configure_rtspsrc_children(src)
         except Exception as e:
             self.logger.error(f"Source negotiation failed: {e}")
 

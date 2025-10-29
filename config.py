@@ -65,6 +65,13 @@ class AppConfig:
                 "width": 1280,
                 "height": 720,
                 "enabled": True
+            },
+            {
+                "name": "Kitchen Clip",
+                "url": "file:///home/mayor/Downloads/kitchenclip.mp4",
+                "width": 1920,
+                "height": 1080,
+                "enabled": False
             }
         ])
         CAMERA_WIDTH: int = 1920
@@ -109,6 +116,8 @@ class AppConfig:
         DEEPSTREAM_TRACKER_CONFIG: str = "pipelines/config_tracker_nvdcf_batch.yml"  # Path to tracker config file
         DEEPSTREAM_TRACKER_LIB: str = "/opt/nvidia/deepstream/deepstream/lib/libnvds_nvmultiobjecttracker.so"  # DeepStream tracker library
         DEEPSTREAM_ENABLE_OSD: bool = True  # Enable on-screen display for visualization
+        # DeepStream multi-URI source config (required for DS8Adapter)
+        DS_MULTIURISRC_CONFIG: str = "pipelines/noesis_multiurisrcbin.ini"
         
         # DEPRECATED: Unified GPU Pipeline Configuration (removed - DeepStream-only now)
         # USE_UNIFIED_GPU_PIPELINE: bool = True  # Enable unified GPU pipeline for optimal performance

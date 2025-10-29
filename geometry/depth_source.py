@@ -21,11 +21,20 @@ import cv2
 import numpy as np
 import requests
 import zarr
-from numcodecs import Blosc
 
 from adapters.mapanything_adapter import ViewBuildResult, build_mono_view
 from mapanything_config import ServiceConfig, load_service_config
 from utils.rate_limited_logger import RateLimitedLogger
+
+try:  # zarr v3 codec shim
+    from zarr.codecs import Blosc as _ZarrBlosc  # type: ignore
+except Exception:
+    _ZarrBlosc = None  # type: ignore
+
+try:
+    from numcodecs import Blosc as _NumcodecsBlosc  # type: ignore
+except Exception:
+    _NumcodecsBlosc = None  # type: ignore
 
 
 @dataclass(frozen=True)
@@ -286,36 +295,66 @@ class DepthStorageManager:
             if not self._enforce_async:
                 self._enforce_limits(camera_id, index)
 
+    def _make_blosc_compressor(self) -> Optional[Any]:
+        if self._zarr_clevel <= 0:
+            return None
+        if _ZarrBlosc is not None:
+            try:
+                return _ZarrBlosc(cname="zstd", clevel=int(self._zarr_clevel))
+            except Exception:
+                self._logger.debug("zarr.codecs.Blosc unavailable; falling back to numcodecs")
+        if _NumcodecsBlosc is not None:
+            try:
+                shuffle = getattr(_NumcodecsBlosc, "SHUFFLE", 1)
+                return _NumcodecsBlosc(cname="zstd", clevel=int(self._zarr_clevel), shuffle=shuffle, blocksize=0)
+            except Exception:
+                self._logger.debug("numcodecs.Blosc unavailable; storing uncompressed")
+        return None
+
+    def _create_zarr_dataset(
+        self,
+        root: "zarr.hierarchy.Group",
+        name: str,
+        data: np.ndarray,
+        chunk_shape: Tuple[int, int],
+        compressor: Optional[Any],
+    ) -> None:
+        create_kwargs = {
+            "shape": tuple(int(dim) for dim in data.shape),
+            "data": data,
+            "chunks": tuple(int(dim) for dim in chunk_shape),
+            "overwrite": True,
+        }
+        if compressor is not None:
+            create_kwargs["compressor"] = compressor
+        try:
+            root.create_dataset(name, **create_kwargs)
+            return
+        except TypeError as exc:
+            # Retry using the zarr v3 compressors API, otherwise fall back to uncompressed.
+            self._logger.debug("create_dataset fallback for %s due to %s", name, exc)
+            create_kwargs.pop("compressor", None)
+            if compressor is not None:
+                try:
+                    create_kwargs["compressors"] = [compressor]
+                    root.create_dataset(name, **create_kwargs)
+                    return
+                except TypeError:
+                    create_kwargs.pop("compressors", None)
+        root.create_dataset(name, **create_kwargs)
+
     def _write_snapshot(self, job: _SnapshotJob) -> None:
         job.dest_path.parent.mkdir(parents=True, exist_ok=True)
-        compressor = Blosc(cname="zstd", clevel=self._zarr_clevel, shuffle=Blosc.SHUFFLE)
+        compressor = self._make_blosc_compressor()
         root = zarr.open_group(str(job.dest_path), mode="w")
         if self._zarr_chunk_px and self._zarr_chunk_px > 0:
             chunk_shape = (min(self._zarr_chunk_px, job.depth.shape[0]), min(self._zarr_chunk_px, job.depth.shape[1]))
         else:
             # Single-chunk per array to minimize file count
             chunk_shape = job.depth.shape
-        root.create_dataset(
-            "depth_z",
-            data=job.depth,
-            compressor=compressor,
-            chunks=chunk_shape,
-            overwrite=True,
-        )
-        root.create_dataset(
-            "conf",
-            data=job.conf,
-            compressor=compressor,
-            chunks=chunk_shape,
-            overwrite=True,
-        )
-        root.create_dataset(
-            "mask",
-            data=job.mask,
-            compressor=compressor,
-            chunks=chunk_shape,
-            overwrite=True,
-        )
+        self._create_zarr_dataset(root, "depth_z", job.depth, chunk_shape, compressor)
+        self._create_zarr_dataset(root, "conf", job.conf, chunk_shape, compressor)
+        self._create_zarr_dataset(root, "mask", job.mask, chunk_shape, compressor)
         root.attrs.update(
             camera_id=job.camera_id,
             timestamp_us=int(job.ts_us),

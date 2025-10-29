@@ -1,0 +1,174 @@
+# DS8 nvdsanalytics configuration replicating the legacy DS7 analytics stages
+# while introducing an optional depth-aware rejection filter. This file is
+# consumed by the DS8 pipeline scaffold to configure both nvdsanalytics
+# instances and the BatchMetadataOperator that culls shallow detections.
+
+version: 1  # Schema revision understood by the DS8 analytics config loader.
+
+analytics:
+  enable: true  # Global toggle for all analytics stages built from this file.
+
+  stages:
+    exclude:  # Pre-tracker ROI filtering that previously lived in config_nvdsanalytics_exclude.ini.
+      plugin: nvdsanalytics  # DeepStream analytics plugin instance name.
+      unique_id: 101  # Preserve the DS7 unique-id to keep downstream metadata stable.
+      osd_mode: 0  # Disable plugin-rendered OSD (handled by the unified DS8 OSD branch).
+      display_font_size: 4
+      config_width: 1920  # Coordinate space width used for ROI polygon vertices.
+      config_height: 1080  # Coordinate space height used for ROI polygon vertices.
+      defaults:
+        class_ids: [-1]  # Apply ROI filtering to every class unless overridden per stream.
+        inverse_roi: false  # Keep objects inside the ROI polygons (drop everything outside).
+
+      streams:
+        0:
+          label: living_room  # RTSP source 0: Living Room camera.
+          roi_filtering:
+            enable: true
+            rois:
+              - id: RF1
+                description: "Living room picture wall exclusion zone."
+                points_px:  # Polygon vertices expressed as (x, y) pixel coordinates.
+                  - [100, 100]
+                  - [200, 200]
+                  - [200, 300]
+                  - [100, 300]
+
+        1:
+          label: kitchen  # RTSP source 1: Kitchen camera.
+          roi_filtering:
+            enable: true
+            rois:
+              - id: RF1
+                description: "Kitchen wall photo exclusion zone (scaled from DS7 coordinates)."
+                points_px:
+                  - [1434, 102]
+                  - [1777, 183]
+                  - [1762, 412]
+                  - [1419, 363]
+
+        2:
+          label: family_room  # RTSP source 2: Family Room camera.
+          roi_filtering:
+            enable: true
+            rois:
+              - id: RF1
+                description: "Family room wall art exclusion zone."
+                points_px:
+                  - [910, 400]
+                  - [1090, 400]
+                  - [1090, 550]
+                  - [910, 550]
+
+    post:  # Post-tracker analytics that previously lived in config_nvdsanalytics_post.ini.
+      plugin: nvdsanalytics
+      unique_id: 201
+      osd_mode: 0
+      display_font_size: 12
+      config_width: 1920
+      config_height: 1080
+
+      streams:
+        0:
+          label: living_room
+          direction_detection:
+            enable: true
+            class_ids: [-1]  # Monitor all object classes for directional flow.
+            vectors:  # Direction vectors mirror the DS7 setup (scaled to 1920x1080).
+              - id: North
+                start_px: [960, 300]
+                end_px: [960, 150]
+              - id: South
+                start_px: [960, 780]
+                end_px: [960, 930]
+              - id: East
+                start_px: [750, 540]
+                end_px: [900, 540]
+              - id: West
+                start_px: [1170, 540]
+                end_px: [1020, 540]
+          overcrowding:
+            enable: true
+            class_ids: [0]  # Class 0 == vehicle/person per DS7 label map; matches historic tuning.
+            object_threshold: 1  # Trigger as soon as at least one object appears in the ROI.
+            roi:
+              id: LivingRoom
+              points_px:
+                - [0, 0]
+                - [1920, 0]
+                - [1920, 1080]
+                - [0, 1080]
+
+        1:
+          label: kitchen
+          direction_detection:
+            enable: true
+            class_ids: [-1]
+            vectors:
+              - id: North
+                start_px: [960, 300]
+                end_px: [960, 150]
+              - id: South
+                start_px: [960, 780]
+                end_px: [960, 930]
+              - id: East
+                start_px: [750, 540]
+                end_px: [900, 540]
+              - id: West
+                start_px: [1170, 540]
+                end_px: [1020, 540]
+          overcrowding:
+            enable: true
+            class_ids: [0]
+            object_threshold: 1
+            roi:
+              id: Kitchen
+              points_px:
+                - [0, 0]
+                - [1920, 0]
+                - [1920, 1080]
+                - [0, 1080]
+
+        2:
+          label: family_room
+          direction_detection:
+            enable: true
+            class_ids: [-1]
+            vectors:
+              - id: North
+                start_px: [960, 300]
+                end_px: [960, 150]
+              - id: South
+                start_px: [960, 780]
+                end_px: [960, 930]
+              - id: East
+                start_px: [750, 540]
+                end_px: [900, 540]
+              - id: West
+                start_px: [1170, 540]
+                end_px: [1020, 540]
+          overcrowding:
+            enable: true
+            class_ids: [0]
+            object_threshold: 1
+            roi:
+              id: FamilyRoom
+              points_px:
+                - [0, 0]
+                - [1920, 0]
+                - [1920, 1080]
+                - [0, 1080]
+
+# Optional depth-based rejection stage inserted immediately after MapAnything (MA) SGIE.
+# The BatchMetadataOperator inspects per-object depth statistics and drops detections that
+# appear too close to the floor plane, mitigating noisy depth hallucinations.
+depth_floor_filter:
+  enable: false  # Toggle on once depth calibration is validated; keeps parity with DS7 by default.
+  operator: batch_metadata  # Executed by the BatchMetadataOperator helper in the DS8 pipeline.
+  attach_point: post_mapanything  # Symbolic name consumed by the pipeline to place the probe.
+  params:
+    object_meta_key: ma_depth_stats  # User-meta dictionary written by the MapAnything branch.
+    min_depth_m: 0.05  # Objects with min depth below this threshold are discarded.
+    compare_field: min_depth_m  # Field inside the meta dict that encodes minimum observed depth.
+    missing_policy: passthrough  # Keep detections when depth stats are absent or stale.
+    action: drop_object  # Remove the offending object (and associated tensor meta) from the batch.

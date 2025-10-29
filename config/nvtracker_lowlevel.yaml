@@ -1,0 +1,76 @@
+################################################################################
+# Noesis DeepStream 8 NvDCF low-level tracker configuration
+# ------------------------------------------------------------------------------
+# Lifted from pipelines/config_tracker_nvdcf_batch_lowlevel.yml to keep parity
+# with the DS7 deployment while colocating all tracker configs under config/.
+################################################################################
+
+BaseConfig:
+  minDetectorConfidence: 0.25
+  enableBatchProcess: 1
+  maxBatchSize: 4
+  enableSubBatchProcess: 1
+  subBatchTimeoutMs: 100
+
+TargetManagement:
+  enableBboxUnClipping: 1
+  preserveStreamUpdateOrder: 1
+  maxTargetsPerStream: 100
+  maxTargetsPerBatch: 200
+  maxTargetsPerSubBatch: 50
+  minIouDiff4NewTarget: 0.7
+  minTrackerConfidence: 0.4
+  probationAge: 2
+  maxShadowTrackingAge: 180
+  earlyTerminationAge: 1
+
+TrajectoryManagement:
+  useUniqueID: 0
+  enableBatchTrajectory: 1
+  batchTrajectoryUpdateInterval: 2
+
+DataAssociator:
+  dataAssociatorType: 0
+  associationMatcherType: 1
+  checkClassMatch: 1
+  enableBatchAssociation: 1
+  batchAssociationThreshold: 0.3
+  subBatchAssociationThreshold: 0.4
+  minMatchingScore4Overall: 0.4
+  minMatchingScore4SizeSimilarity: 0.3
+  minMatchingScore4Iou: 0.2
+  minMatchingScore4VisualSimilarity: 0.5
+  matchingScoreWeight4VisualSimilarity: 0.6
+  matchingScoreWeight4SizeSimilarity: 0.4
+  matchingScoreWeight4Iou: 0.2
+  tentativeDetectorConfidence: 0.2
+  minMatchingScore4TentativeIou: 0.3
+
+StateEstimator:
+  stateEstimatorType: 1
+  enableBatchStateEstimation: 1
+  processNoiseVar4Loc: 2.0
+  processNoiseVar4Size: 1.0
+  processNoiseVar4Vel: 0.1
+  measurementNoiseVar4Detector: 4.0
+  measurementNoiseVar4Tracker: 8.0
+
+VisualTracker:
+  visualTrackerType: 1
+  enableBatchVisualTracking: 1
+  useColorNames: 1
+  useHog: 0
+  featureImgSizeLevel: 2
+  featureFocusOffsetFactor_y: -0.1
+  filterLr: 0.075
+  filterChannelWeightsLr: 0.1
+  gaussianSigma: 0.75
+  enableBatchFeatureExtraction: 1
+  batchFeatureUpdateInterval: 3
+  subBatchFeatureUpdateInterval: 2
+
+SubBatchConfig:
+  0:
+    maxTargets: 50
+    timeoutMs: 50
+    enableProcessing: 1

@@ -100,6 +100,41 @@
 
 ---
 
+## Appendix — DS8 Migration Deltas (High‑Level)
+
+This appendix captures what changes under DeepStream 8 compared to the DS7.1 patterns described above. It is a planning aid; implementation details live in the DS8 plan/blueprint.
+
+- Configuration model
+  - DS7.1 used multiple INI/TXT configs per element (nvinfer, nvdsanalytics, preproc).
+  - DS8 consolidates into YAML: `config/infer.yaml` (sources+models), `config/nvdsanalytics.yaml`, `config/nvtracker.yaml`, plus `config/cameras.yaml` for intrinsics.
+
+- Pipeline assembly
+  - DS7.1 pipeline was built directly in Python/GStreamer (this document’s diagram).
+  - DS8 uses Python Service Maker (pyservicemaker) to instantiate the graph; custom logic moves into pad‑probe hooks (`BatchMetadataOperator`) rather than ad‑hoc probes.
+
+- Sources and batching
+  - DS7.1: `nvmultiurisrcbin` and separate preproc config.
+  - DS8: declare sources under YAML; Service Maker manages mux/batch per config.
+
+- Inference configuration
+  - DS7.1: INI with engine paths per stage.
+  - DS8: YAML models with explicit `gie_id` and engine path under `models.*`.
+
+- Metadata + operators
+  - DS7.1: custom pad‑probes scattered across elements.
+  - DS8: attach focused hooks for intrinsics injection, SGIE tensor post‑process (e.g., MapAnything), and analytics reloads using `BatchMetadataOperator`.
+
+- Runtime control
+  - DS8 formalizes REST shims for depth bursts and analytics ROI edits (FastAPI apps). No change to the websocket transport; message types may evolve to match the dashboard.
+
+- Engines / TRT
+  - DS8 aligns on TensorRT 10.x; engine paths live in YAML rather than INI.
+
+Where to look in this repo for DS8 equivalents:
+- Pipeline + lifecycle: `noesis/pipelines/ds8_pipeline.py`
+- Hooks (intrinsics, MA post‑process, analytics reload): `noesis/pipelines/hooks.py`
+- YAML owners: `config/infer.yaml`, `config/nvdsanalytics.yaml`, `config/nvtracker.yaml`, `config/cameras.yaml`
+
 ## 4. Implementation Status - **COMPLETED** ✅
 
 ### A. ✅ Stabilised Preprocessing

@@ -1,7 +1,5 @@
 # Ignore node modules and build output
 node_modules/
-electron-frontend/node_modules/
-electron-frontend/dist/
 oai2-fe/dist/
 
 # Python cache
@@ -11,8 +9,6 @@ __pycache__/
 .DS_Store
 .vscode/
 
-
-
 # Log files
 logs/
 *.log
@@ -20,7 +16,7 @@ output/
 
 #ignore archived folders
 legacy/
-
+orchestration/
 
 #ignore dev docs
 docs/completed/
@@ -39,4 +35,10 @@ models/
 external/
 .env
 tests/
+ma_onnx_out/
+ma_onnx_out_fused/
+ma_onnx_out_clean/
+ma_onnxTRT/
+./ma_onnx_out.tar.gz
+.git/
 

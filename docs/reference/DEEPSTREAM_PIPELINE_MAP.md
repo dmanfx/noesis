@@ -1,7 +1,7 @@
 # DeepStream Video Pipeline: Stream to WebSocket Map
 
 ## Overview
-This document maps the current DeepStream video processing pipeline from RTSP stream input to WebSocket output, reflecting the implementation in `deepstream_video_pipeline.py`.
+This document maps the current DeepStream video processing pipeline from RTSP stream input to WebSocket output. It reflects the legacy DS7 implementation in `deepstream_video_pipeline.py` and the new DS8 canonical path added in the DS8 builder/runtime.
 
 ## Pipeline Architecture
 
@@ -23,7 +23,7 @@ RTSP Streams (`config.py`):
 │                                        DEEPSTREAM PIPELINE LAYER                                            │
 └─────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
 
-`deepstream_video_pipeline.py`:
+`deepstream_video_pipeline.py` (DS7 parity) and DS8 path (pyservicemaker):
 ┌─────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
 │  MULTI-STREAM INPUT & BATCHING                                                                              │
 ├─────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
@@ -44,19 +44,38 @@ RTSP Streams (`config.py`):
 ┌─────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
 │  INFERENCE & TRACKING                                                                                       │
 ├─────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
-│ nvinfer (Primary GIE) - DeepStream's GPU inference engine that runs TensorRT models with custom parsers, providing hardware-accelerated AI inference with metadata extraction.                                                                                                   │
+│ nvinfer (Primary GIE) - DeepStream's GPU inference engine that runs TensorRT models with custom parsers, 
+providing hardware-accelerated AI inference with metadata extraction.                                         │
 │ ├── config-file-path: `pipelines/config_infer_primary_yolo11.ini`                                           │
 │ ├── YOLO-11 Custom Parser: `libnvdsparsebbox_yolo11.so`                                                     │
 │ ├── input-tensor-meta: True                                                                                 │
 │ └── Dynamic config: confidence, IOU, enable flag, and target classes via `custom-lib-props`                 │
 │                                                                                                             │
-│ nvtracker - DeepStream's object tracking element that maintains object identities across frames using algorithms like NvDCF, providing persistent tracking metadata.                                                                                        │
+│ nvtracker - DeepStream's object tracking element that maintains object identities across frames 
+using algorithms like NvDCF, providing persistent tracking metadata.                                          │
 │ ├── ll-config-file: `pipelines/config_tracker_nvdcf_batch.yml`                                              │
 │ ├── ll-lib-file: `/opt/nvidia/deepstream/deepstream/lib/libnvds_nvmultiobjecttracker.so`                    │
 │ ├── tracker-width: 640                                                                                      │
 │ ├── tracker-height: 384                                                                                     │
 │ ├── gpu-id: 0                                                                                               │
 │ └── tracking-id-reset-mode: 0 (Never reset tracking ID)                                                     │
+└─────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+│  DS8 FRAME OUTPUT (GPU JPEG → WebSocket)                                                                     │
+├─────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+│ Post-tracker, a tee forks the stream to analytics and frame output. The frame path mirrors DS7 per-stream   │
+│ JPEG branches using GPU-only elements.                                                                       │
+│                                                                                                              │
+│ frame_output_tee → nvstreamdemux → (per-stream)                                                              │
+│   queue(leaky=2,max-size-buffers=12) → nvvideoconvert → caps RGBA(NVMM) → [nvdsosd] →                        │
+│   nvvideoconvert → caps I420(NVMM) → nvjpegenc(quality=85,preset=1) → appsink(emit-signals=true,drop=true)   │
+│                                                                                                              │
+│ YAML gating (config/infer.yaml):                                                                             │
+│   output.enable_frames: true | output.codec: jpeg | output.jpeg_quality: 85 | output.overlays: false         │
+│                                                                                                              │
+│ Runtime attaches pyservicemaker Receivers (tips="new-sample") to per-stream appsinks for frame events.      │
+│ Only final encoded bytes are touched by CPU for socket I/O.                                                  │
 └─────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
 
 ┌─────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
@@ -90,13 +109,15 @@ RTSP Streams (`config.py`):
 ┌─────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
 │  METADATA & TELEMETRY EXTRACTION (VIA BUFFER PROBES)                                                        │
 ├─────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
-│ Instead of a final appsink, metadata is extracted at various points in the pipeline using buffer probes, which allows for inspection without disrupting the primary data flow.                                                                                                    │
+│ Instead of a final appsink, metadata is extracted at various points in the pipeline using buffer probes, 
+which allows for inspection without disrupting the primary data flow.                                         │
 │ ├── nvdsanalytics_exclude (src pad): `_remove_excluded_objects_probe()`                                     │
 │ │   └── Removes objects detected within defined exclusion zones before they are tracked.                    │
 │ ├── nvdsanalytics_post (src pad): `_analytics_probe()`                                                      │
-│ │   └── Extracts final object metadata, including tracking IDs and analytics results (ROI, line crossing) for WebSocket telemetry.                                                                                                         │
+│ │   └── Extracts final object metadata, including tracking IDs and analytics results (ROI, line crossing) 
+for WebSocket telemetry.                                                                                      │
 │ └── nvdsosd (sink pad): `_per_branch_osd_probe()`                                                           │
-│     └── Injects custom drawing commands (e.g., for motion trails) into the OSD overlay before rendering.     │
+│     └── Injects custom drawing commands (e.g., for motion trails) into the OSD overlay before rendering.    │
 └─────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
 
 ┌─────────────────────────────────────────────────────────────────────────────────────────────────────────────┐

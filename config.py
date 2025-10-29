@@ -99,12 +99,14 @@ class AppConfig:
         
                 
         # DeepStream Pipeline Configuration (RECOMMENDED)
+        USE_DS8: bool = True  # Select DS8Adapter pipeline (GI) instead of DS7
         ENABLE_DEEPSTREAM: bool = True  # Enable DeepStream pipeline for video processing
         DEEPSTREAM_SOURCE_LATENCY: int = 50  # Reduced latency for real-time processing
         DEEPSTREAM_MUX_BATCH_SIZE: int = 1  # Single frame processing for lower latency
         DEEPSTREAM_MUX_SCALE_MODE: int = 2  # 0=stretch, 1=crop, 2=letter-box
         DEEPSTREAM_PREPROCESS_CONFIG: str = "pipelines/config_preproc.ini"  # Path to preprocessing config file
-        DEEPSTREAM_TRACKER_CONFIG: str = "pipelines/tracker_nvdcf.yml"  # Path to tracker config file
+        DEEPSTREAM_INFER_CONFIG: str = "pipelines/config_infer_primary_yolo11.ini"  # Primary nvinfer INI
+        DEEPSTREAM_TRACKER_CONFIG: str = "pipelines/config_tracker_nvdcf_batch.yml"  # Path to tracker config file
         DEEPSTREAM_TRACKER_LIB: str = "/opt/nvidia/deepstream/deepstream/lib/libnvds_nvmultiobjecttracker.so"  # DeepStream tracker library
         DEEPSTREAM_ENABLE_OSD: bool = True  # Enable on-screen display for visualization
         
@@ -419,6 +421,10 @@ class AppConfig:
         MAX_CLIENTS: int = 10
         JPEG_QUALITY: int = 85  # JPEG quality for frame compression (0-100)
         MAX_FPS: int = 20  # Maximum FPS for WebSocket streaming
+        # Mosaic broadcast (DS7 compatibility shim): when True, per-camera WS frames are gated
+        # and a single mosaic image is broadcast under MOSAIC_TARGET_CAMERA id.
+        MOSAIC_BROADCAST: bool = True
+        MOSAIC_TARGET_CAMERA: str = "living-room"
 
     @dataclass
     class CalibrationSettings:

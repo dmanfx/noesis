@@ -1,0 +1,57 @@
+# DeepStream 8 inference builder configuration for Noesis full-frame pipeline.
+# This file is treated as the single source of truth for PGIE (YOLOv11) and
+# SGIE (MapAnything) model definitions consumed by the pyservicemaker scaffold.
+
+version: 1  # Schema revision for the in-house inference builder loader.
+
+batch_size: 3  # Process one camera feed per inference batch.
+
+streammux:
+  width: 1920
+  height: 1080
+  live-source: 1
+  gpu-id: 0
+
+#sources:
+  # - element: nvurisrcbin
+  #   uri: rtsp://192.168.3.214:7447/jdr9oLlBkjyl3gDm?  # Livingroom camera.
+  #   gpu-id: 0
+  #   cudadec-memtype: 0
+  #   live-source: 1
+  #   rtsp-reconnect-interval-sec: 2
+  # - element: nvurisrcbin
+  #   uri: rtsp://192.168.3.214:7447/qt3VqVdZpgG1B4Vk?  # Kitchen camera.
+  #   gpu-id: 0
+  #   cudadec-memtype: 0
+  #   live-source: 1
+  #   rtsp-reconnect-interval-sec: 2
+  # - element: nvurisrcbin
+  #   uri: rtsp://192.168.3.214:7447/4qWTBhW6b4nLeUFE?  # Family room camera.
+  #   gpu-id: 0
+  #   cudadec-memtype: 0
+  #   live-source: 1
+  #   rtsp-reconnect-interval-sec: 2
+  #- element: nvurisrcbin
+  #  uri: file:///home/mayor/Downloads/kitchenclip.mp4  # MP4 video file source.
+  #  gpu-id: 0
+  #  cudadec-memtype: 0
+  #  live-source: 0  # File source, not live stream
+
+models:
+  pgie:
+    config-file-path: pipelines/config_infer_primary_yolo11.ini
+  mapanything:
+    enable: false
+analytics:
+  enable: false
+
+sinks:
+  - type: fakesink  # Placeholder sink for dry runs and CI validation.
+    sync: false  # Disable clock sync to maximise pipeline throughput during tests.
+
+# DS8 frame output (GPU JPEG over WebSocket)
+output:
+  enable_frames: false  # tiled mode disables per-camera WS branches
+  codec: jpeg
+  jpeg_quality: 85
+  overlays: false

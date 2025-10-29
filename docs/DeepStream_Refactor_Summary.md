@@ -108,3 +108,23 @@ python setup_nvbufsurface.py build_ext --inplace
 - Dynamic batch size optimization
 - Advanced OSD customization
 - Multi-stream synchronization 
+
+---
+
+## DS8 Migration Mapping (High‑Level)
+
+This refactor summary targets DS6.x/7.x style integration. Under DeepStream 8, the following differences apply and must be reflected in the migration:
+
+- Configs → YAML
+  - Move element INIs/TXTs to YAML: `config/infer.yaml` (sources + PGIE/SGIE), `config/nvdsanalytics.yaml`, `config/nvtracker.yaml`. Provide `config/cameras.yaml` for intrinsics.
+
+- Pipeline construction → Service Maker
+  - Replace direct GStreamer assembly with Python Service Maker (`pyservicemaker`). Keep custom processing in `BatchMetadataOperator` hooks (intrinsics, SGIE tensor post‑processing, analytics reloads).
+
+- Runtime control → REST shims
+  - Provide FastAPI endpoints for depth bursts and analytics ROI edits. Websocket transport remains for telemetry.
+
+- Engines / TensorRT
+  - Point engine paths from YAML and ensure compatibility with DS8 (TensorRT 10.x). Rebuild only if missing/incompatible.
+
+This is a documentation‑only mapping for DS8; actual implementation is tracked in the DS8 Master Migration Plan and Blueprint.

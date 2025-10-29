@@ -1,0 +1,47 @@
+# DS8 Cameras Configuration (Template)
+#
+# This file is a template for `config/cameras.yaml`, consumed by
+# `noesis/metadata/intrinsics.py` to attach per-frame intrinsics user-meta.
+#
+# Sources to derive from in this repo:
+# - Intrinsics models: `intrinsics.json` (see `calibration_bundle.load_intrinsics`)
+# - Extrinsics/alignment: `config/camera_calibration.json`, `ply_alignment.json`
+# - Camera specs (names/resolution/urls): `config.AppConfig.CameraSettings.RTSP_STREAMS` in `config.py`
+#
+# Minimal structure expected by the loader/tests:
+# - `cameras` mapping from source_id → intrinsics payload
+# - Optional `intrinsics_models` for reusable models referenced by `model` keys
+
+version: 1
+
+cameras:
+  0:
+    # Either embed intrinsics directly…
+    intrinsics:
+      fx: 640.0
+      fy: 645.0
+      cx: 320.0
+      cy: 240.0
+      # Optional distortion coefficients
+      k1: 0.0
+      k2: 0.0
+      k3: 0.0
+    height_m: 2.5
+    # …or reference a model defined under `intrinsics_models`:
+    # model: g4
+
+  1:
+    model: g4
+    height_m: 2.7
+
+intrinsics_models:
+  g4:
+    intrinsics:
+      # You may specify either fx/fy/cx/cy…
+      fx: 500.0
+      fy: 505.0
+      cx: 320.0
+      cy: 240.0
+      # …or a 3x3 camera matrix under K3x3
+      # K3x3: [500.0, 0.0, 320.0, 0.0, 505.0, 240.0, 0.0, 0.0, 1.0]
+

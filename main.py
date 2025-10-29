@@ -17,7 +17,7 @@ sys.stdout.flush()
 
 # Set GStreamer debug BEFORE any other imports
 import os
-os.environ['GST_DEBUG'] = '*:0'  # Complete silence for all GStreamer
+os.environ['GST_DEBUG'] = '*:4'  # Complete silence for all GStreamer
 os.environ['GST_DEBUG_NO_COLOR'] = '1'  # Disable colored output
 os.environ['no_proxy'] = '*'
 
@@ -53,7 +53,8 @@ from config import AppConfig, config, load_ma_config
 from geometry.depth_source import DepthResult, DepthSummary, MapAnythingDepthSource
 from geometry.depth_publisher import DepthDiagnosticsPublisher, DiagnosticsConfig
 from models import DetectionResult, TrackingResult, AnalysisFrame, convert_numpy_types
-from deepstream_video_pipeline import create_deepstream_video_processor
+# DS8 adapter for GStreamer-based pipeline (no DS7 instantiation)
+from noesis.adapters.ds8_adapter import DS8Adapter
 # from gpu_pipeline import UnifiedGPUPipeline, cleanup_all_gpu_resources  # DEPRECATED
 from utils import RateLimitedLogger
 
@@ -134,7 +135,11 @@ class ApplicationManager:
         self.stop_event = threading.Event()
         self.camera_sources = {}
         self.multi_stream_processor = None  # Single multi-stream processor
-        self.analysis_frame_queue = multiprocessing.Queue(maxsize=100)
+        try:
+            self.analysis_frame_queue = multiprocessing.Queue(maxsize=100)
+        except Exception:
+            # Fallback in restricted environments (e.g., no semaphores)
+            self.analysis_frame_queue = queue.Queue(maxsize=100)
         self.streaming_frame_queue = queue.Queue(maxsize=100)
         # Cache for precomputed WebSocket headers per camera id
         self._ws_header_cache: Dict[str, bytes] = {}
@@ -424,6 +429,9 @@ class ApplicationManager:
                     # Avoid starting duplicate JPEG processing loop
                     if not hasattr(self, 'jpeg_thread') or not getattr(self, 'jpeg_thread').is_alive():
                         self._start_jpeg_processing_loop()
+                        # Start mosaic publisher if configured (maps mosaic to a single camera id)
+                        if getattr(self.config.websocket, 'MOSAIC_BROADCAST', False):
+                            self._start_mosaic_broadcast()
                         self._start_mapanything_scheduler()
             except Exception as e:
                 self.logger.warning(f"Unable to attach WebSocket server to processor: {e}")
@@ -455,8 +463,8 @@ class ApplicationManager:
     
     @profile_function("ApplicationManager.start_multi_stream_processor")
     def _start_multi_stream_processor(self):
-        """Start single multi-stream DeepStream processor"""
-        self.logger.info("Starting multi-stream DeepStream processor")
+        """Start single multi-stream video processor (DS8 by default)."""
+        self.logger.info("Starting multi-stream video processor (DS8)")
         
         # Validate GPU-only configuration
         if not self.config.processing.ENABLE_DEEPSTREAM:
@@ -466,32 +474,26 @@ class ApplicationManager:
         if not self.config.models.FORCE_GPU_ONLY:
             raise RuntimeError("GPU-only mode: GPU-only inference must be enabled")
         
-        # Prepare sources list from all enabled camera sources
-        enabled_sources = [
-            source_config for source_config in self.camera_sources.values()
-            if isinstance(source_config, dict) and source_config.get("enabled", True)
-        ]
-        
-        if not enabled_sources:
-            raise RuntimeError("No enabled camera sources found")
-        
-        self.logger.info(f"🎥 Creating single multi-stream DeepStream processor for {len(enabled_sources)} sources")
-        
         try:
-            # Create single multi-stream processor
-            processor = create_deepstream_video_processor(
-                sources=enabled_sources,
-                config=self.config
-            )
-            
+            # Choose DS8 by default; no DS7 import/instantiation in this module
+            if getattr(self.config.processing, 'USE_DS8', True):
+                processor = DS8Adapter(config=self.config)
+            else:
+                raise RuntimeError("DS7 pipeline fallback disabled in this build; set processing.USE_DS8=True")
+
+            source_count = len(getattr(processor, "source_info", {}) or {})
+            if source_count == 0:
+                raise RuntimeError("No enabled sources available for DS8Adapter pipeline")
+            self.logger.info(f"🎥 Creating single multi-stream processor for {source_count} sources")
+
             # Start the processor
-            self.logger.info("🚀 Starting multi-stream DeepStream processor...")
+            self.logger.info("🚀 Starting multi-stream processor...")
             if not processor.start():
-                raise RuntimeError("Failed to start multi-stream DeepStream processor")
-            
+                raise RuntimeError("Failed to start multi-stream processor")
+
             # Store single processor (not per-camera)
             self.multi_stream_processor = processor
-            self.logger.info(f"✅ Multi-stream DeepStream processor started successfully with {len(enabled_sources)} streams")
+            self.logger.info(f"✅ Multi-stream processor started successfully with {source_count} streams")
             try:
                 source_info = getattr(self.multi_stream_processor, 'source_info', None)
                 if isinstance(source_info, dict):
@@ -772,6 +774,7 @@ class ApplicationManager:
             except Exception:
                 mono_interval = 0.5
 
+            dry_last_log: Dict[str, float] = {}
             while self.running and not self.stop_event.is_set():
                 try:
                     # Snapshot source_info each tick to tolerate dynamic sources
@@ -788,6 +791,11 @@ class ApplicationManager:
 
                         ok, jpeg_bytes = self.multi_stream_processor.read_encoded_jpeg(source_id, timeout=0.05)
                         if not ok or not jpeg_bytes:
+                            # Rate-limited dryness log per camera
+                            t0 = dry_last_log.get(cam_id, 0.0)
+                            if (now - t0) >= 5.0:
+                                self.logger.debug(f"MDE scheduler: no frame available for {cam_id} (sid={source_id})")
+                                dry_last_log[cam_id] = now
                             continue
 
                         # Decode JPEG -> BGR
@@ -919,6 +927,11 @@ class ApplicationManager:
                             except queue.Empty:
                                 jpeg_bytes = None
 
+                        # If mosaic mode is enabled, skip per-camera WS broadcast
+                        if getattr(self.config.websocket, 'MOSAIC_BROADCAST', False):
+                            # Optionally, we could cache latest JPEGs here for reuse
+                            continue
+
                         if jpeg_bytes and self.websocket_server:
                             # Use clean camera name for frontend
                             camera_id = info['clean_name']
@@ -973,6 +986,73 @@ class ApplicationManager:
         )
         self.jpeg_thread.start()
         self.logger.info("✅ JPEG processing thread started")
+
+    def _start_mosaic_broadcast(self):
+        """Start a background thread that composites a mosaic from latest JPEGs and broadcasts it under a target camera id."""
+        if not getattr(self.config.websocket, 'MOSAIC_BROADCAST', False):
+            return
+
+        target_cam = getattr(self.config.websocket, 'MOSAIC_TARGET_CAMERA', 'living-room')
+        fps_limit = max(1, int(getattr(self.config.websocket, 'MAX_FPS', 10)))
+        period = 1.0 / float(fps_limit)
+
+        # Resolve sensor ordering and prepare cache for last-decoded frames
+        try:
+            source_info = getattr(self.multi_stream_processor, 'source_info', {}) or {}
+            sensor_ids = list(source_info.keys())
+        except Exception:
+            sensor_ids = []
+
+        last_frames: Dict[int, Any] = {}
+
+        def _decode(b: bytes):
+            import numpy as _np
+            a = _np.frombuffer(b, dtype=_np.uint8)
+            return cv2.imdecode(a, cv2.IMREAD_COLOR)
+
+        def _mosaic_loop():
+            next_tick = time.time()
+            header = None
+            if self.websocket_server:
+                cam_id_bytes = target_cam.encode('utf-8')
+                if len(cam_id_bytes) <= 255:
+                    header = bytes([len(cam_id_bytes)]) + cam_id_bytes
+            sent = 0
+            t_start = time.time()
+            last_log = t_start
+            last_bytes = 0
+            while self.running and not self.stop_event.is_set():
+                ok = False
+                data = None
+                try:
+                    if hasattr(self.multi_stream_processor, 'read_mosaic_jpeg'):
+                        ok, data = self.multi_stream_processor.read_mosaic_jpeg(timeout=0.1)
+                except Exception:
+                    ok, data = False, None
+                if ok and data and header and self.websocket_server:
+                    self.websocket_server.broadcast_sync(header + data)
+                    sent += 1
+                    last_bytes = len(data)
+                # Log every ~2s
+                now = time.time()
+                if (now - last_log) >= 2.0:
+                    try:
+                        qsz = getattr(self.multi_stream_processor, 'mosaic_queue', queue.Queue()).qsize()
+                    except Exception:
+                        qsz = -1
+                    elapsed = max(1e-3, now - t_start)
+                    fps = sent / elapsed
+                    self.logger.debug(f"Mosaic feed: {fps:.1f} fps, last={last_bytes} bytes, q={qsz}")
+                    last_log = now
+                # Throttle to target FPS
+                next_tick += period
+                sleep_for = next_tick - time.time()
+                if sleep_for > 0:
+                    time.sleep(min(sleep_for, period))
+
+        t = threading.Thread(target=_mosaic_loop, name="MosaicPublisher", daemon=True)
+        t.start()
+        self.logger.info("✅ Mosaic broadcast thread started (target=%s)", target_cam)
 
     @profile_function("ApplicationManager.start_result_processing")
     def _start_result_processing(self):

@@ -191,6 +191,8 @@ class DeepStreamVideoPipeline:
         self.jpeg_queues: Dict[int, queue.Queue[bytes]] = {
             sensor_id: queue.Queue(maxsize=30) for sensor_id in self.sensor_ids
         }
+        # GPU mosaic JPEG queue (tiled view)
+        self.mosaic_queue: queue.Queue[bytes] = queue.Queue(maxsize=10)
         self.start_time = 0  # Will be set in start()
         
         # Add tracking history for trail visualization
@@ -837,8 +839,8 @@ class DeepStreamVideoPipeline:
             # Streammux configuration - dynamic batch size for multi-stream
             # nvmultiurisrcbin (manages sources internally)
             uri_list = ",".join(self.source_info[sid]['url'] for sid in self.sensor_ids)
-            # Use stable 1-based sensor IDs
-            sensor_id_list = ",".join(str(sid) for sid in self.sensor_ids)
+            # DS uses 0..N-1 source indices internally; ensure sensor-id-list matches
+            sensor_id_list = ",".join(str(i) for i in range(self.batch_size))
             elements['multiurisrc'].set_property("uri-list", uri_list)
             elements['multiurisrc'].set_property("sensor-id-list", sensor_id_list)
             elements['multiurisrc'].set_property("max-batch-size", self.batch_size)
@@ -854,20 +856,67 @@ class DeepStreamVideoPipeline:
 
             # Resolve all config file paths to absolute so startup is independent of CWD
             _root_dir = os.path.dirname(os.path.abspath(__file__))
-            # Preprocess config
-            _preproc_cfg = getattr(self.config.processing, 'DEEPSTREAM_PREPROCESS_CONFIG', 'pipelines/config_preproc.ini')
-            if _preproc_cfg and not os.path.isabs(_preproc_cfg):
-                _preproc_cfg = os.path.join(_root_dir, _preproc_cfg)
-            elements['preprocess'].set_property("config-file", _preproc_cfg)
+            # Preprocess config (optional, default disabled)
+            disable_preproc = str(os.environ.get("NOESIS_DISABLE_PREPROC", "1")).strip().lower() in {"1","true","yes","y"}
+            if disable_preproc:
+                self.logger.info("Preprocess stage disabled via NOESIS_DISABLE_PREPROC (default)")
+            else:
+                _preproc_cfg = getattr(self.config.processing, 'DEEPSTREAM_PREPROCESS_CONFIG', 'pipelines/config_preproc.ini')
+                if _preproc_cfg and not os.path.isabs(_preproc_cfg):
+                    _preproc_cfg = os.path.join(_root_dir, _preproc_cfg)
+                elements['preprocess'].set_property("config-file", _preproc_cfg)
 
-            # Primary nvinfer config
-            _nvinfer_cfg = self.config_file
-            if _nvinfer_cfg and not os.path.isabs(_nvinfer_cfg):
-                _nvinfer_cfg = os.path.join(_root_dir, _nvinfer_cfg)
-            # Use resolved path for engine-file check and element property
-            self._check_for_engine_file(_nvinfer_cfg)
-            elements['nvinfer'].set_property("config-file-path", _nvinfer_cfg)
-            elements['nvinfer'].set_property("input-tensor-meta", True)
+            # Primary nvinfer config — allow DS8 YAML override via env flag
+            use_ds8_yaml = str(os.environ.get("NOESIS_USE_INFER_YAML", os.environ.get("NOESIS_USE_DS8_YAML", "1"))).strip().lower() in {"1","true","yes","y"}
+            if use_ds8_yaml:
+                try:
+                    from noesis.config.adapters import nvinfer_props_from_infer_yaml
+                    # Default to repo-root/config/infer.yaml (file lives at repo root)
+                    yaml_path = os.environ.get(
+                        "NOESIS_INFER_YAML",
+                        os.path.join(os.path.dirname(os.path.abspath(__file__)), "config", "infer.yaml"),
+                    )
+                    props = nvinfer_props_from_infer_yaml(yaml_path)
+                    if props:
+                        self.logger.info("Using DS8 infer.yaml for nvinfer properties: %s", yaml_path)
+                        self.logger.debug("nvinfer DS8 props: %s", props)
+                        for key, val in props.items():
+                            try:
+                                elements['nvinfer'].set_property(key, val)
+                            except Exception:
+                                self.logger.debug("Unable to set nvinfer property %s=%s", key, val)
+                        # Always make tensor meta available to downstream consumers
+                        try:
+                            elements['nvinfer'].set_property("input-tensor-meta", True)
+                        except Exception:
+                            pass
+                        # Ensure nvinfer still has a configuration file path (plugin requires it)
+                        _nvinfer_cfg = self.config_file
+                        if _nvinfer_cfg and not os.path.isabs(_nvinfer_cfg):
+                            _nvinfer_cfg = os.path.join(_root_dir, _nvinfer_cfg)
+                        if _nvinfer_cfg and os.path.exists(_nvinfer_cfg):
+                            try:
+                                elements['nvinfer'].set_property("config-file-path", _nvinfer_cfg)
+                                self.logger.debug("nvinfer config-file-path set to %s (base INI)", _nvinfer_cfg)
+                            except Exception:
+                                self.logger.debug("Failed to set nvinfer config-file-path to %s", _nvinfer_cfg)
+                        else:
+                            self.logger.warning("No base nvinfer INI found at %s; plugin may require a config file", _nvinfer_cfg)
+                    else:
+                        self.logger.warning("infer.yaml did not yield nvinfer properties; falling back to INI")
+                        use_ds8_yaml = False
+                except Exception as exc:
+                    self.logger.warning("Failed to apply DS8 infer.yaml override: %s", exc)
+                    use_ds8_yaml = False
+
+            if not use_ds8_yaml:
+                _nvinfer_cfg = self.config_file
+                if _nvinfer_cfg and not os.path.isabs(_nvinfer_cfg):
+                    _nvinfer_cfg = os.path.join(_root_dir, _nvinfer_cfg)
+                # Use resolved path for engine-file check and element property
+                self._check_for_engine_file(_nvinfer_cfg)
+                elements['nvinfer'].set_property("config-file-path", _nvinfer_cfg)
+                elements['nvinfer'].set_property("input-tensor-meta", True)
 
             # Exclusion analytics
             exclude_cfg_path = "pipelines/config_nvdsanalytics_exclude.ini"
@@ -878,17 +927,43 @@ class DeepStreamVideoPipeline:
             # Pre-parse exclusion ROIs for robust containment checks in pad probe
             self._load_exclusion_rois_from_config(exclude_cfg_path)
 
-            # Tracker configuration
+            # Tracker configuration — optional DS8 YAML override via env
             elements['nvtracker'].set_property("ll-lib-file", "/opt/nvidia/deepstream/deepstream/lib/libnvds_nvmultiobjecttracker.so")
-            tracker_config_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "pipelines/config_tracker_nvdcf_batch.yml")
-            elements['nvtracker'].set_property("ll-config-file", tracker_config_path)
+            use_ds8_tracker_yaml = str(os.environ.get("NOESIS_USE_TRACKER_YAML", "1")).strip().lower() in {"1","true","yes","y"}
+            ds8_tracker_cfg = None
+            if use_ds8_tracker_yaml:
+                try:
+                    from noesis.config.adapters import tracker_config_from_yaml
+                    ds8_tracker_cfg = tracker_config_from_yaml()
+                except Exception:
+                    ds8_tracker_cfg = None
+            if ds8_tracker_cfg:
+                elements['nvtracker'].set_property("ll-config-file", ds8_tracker_cfg)
+                self.logger.info("Using DS8 tracker config: %s", ds8_tracker_cfg)
+            else:
+                tracker_config_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "pipelines/config_tracker_nvdcf_batch.yml")
+                elements['nvtracker'].set_property("ll-config-file", tracker_config_path)
 
             # Post-tracker analytics
             elements['nvdsanalytics_post'].set_property("unique-id", 201)
-            _post_cfg_path = "pipelines/config_nvdsanalytics_post.ini"
-            if _post_cfg_path and not os.path.isabs(_post_cfg_path):
-                _post_cfg_path = os.path.join(_root_dir, _post_cfg_path)
-            elements['nvdsanalytics_post'].set_property("config-file", _post_cfg_path)
+            # Only use DS8 analytics YAML when explicitly enabled (DS7 parser expects INI)
+            use_ds8_analytics_yaml = str(os.environ.get("NOESIS_USE_ANALYTICS_YAML", "0")).strip().lower() in {"1","true","yes","y"}
+            ds8_analytics_cfg = None
+            if use_ds8_analytics_yaml:
+                try:
+                    from noesis.config.adapters import analytics_config_from_yaml
+                    ds8_analytics_cfg = analytics_config_from_yaml()
+                except Exception:
+                    ds8_analytics_cfg = None
+            if ds8_analytics_cfg:
+                elements['nvdsanalytics_exclude'].set_property("config-file", ds8_analytics_cfg)
+                elements['nvdsanalytics_post'].set_property("config-file", ds8_analytics_cfg)
+                self.logger.info("Using DS8 analytics config: %s", ds8_analytics_cfg)
+            else:
+                _post_cfg_path = "pipelines/config_nvdsanalytics_post.ini"
+                if _post_cfg_path and not os.path.isabs(_post_cfg_path):
+                    _post_cfg_path = os.path.join(_root_dir, _post_cfg_path)
+                elements['nvdsanalytics_post'].set_property("config-file", _post_cfg_path)
             
             self.logger.info("✅ All elements configured successfully")
             return True
@@ -902,14 +977,17 @@ class DeepStreamVideoPipeline:
         try:
             self.logger.info("------------- Linking Main Pipeline Chain-------------")
             
-            # Link main processing chain
-            if not elements['multiurisrc'].link(elements['preprocess']): 
-                raise RuntimeError("Failed to link nvmultiurisrcbin to preprocess")
+            # Link main processing chain (optionally bypass preprocess)
+            disable_preproc = str(os.environ.get("NOESIS_DISABLE_PREPROC", "1")).strip().lower() in {"1","true","yes","y"}
+            if disable_preproc:
+                if not elements['multiurisrc'].link(elements['nvinfer']): 
+                    raise RuntimeError("Failed to link nvmultiurisrcbin to nvinfer (preproc disabled)")
             else:
+                if not elements['multiurisrc'].link(elements['preprocess']): 
+                    raise RuntimeError("Failed to link nvmultiurisrcbin to preprocess")
                 self.logger.info("TRACE linked nvmultiurisrcbin → preprocess")
-                
-            if not elements['preprocess'].link(elements['nvinfer']): 
-                raise RuntimeError("Failed to link preprocess to nvinfer")
+                if not elements['preprocess'].link(elements['nvinfer']): 
+                    raise RuntimeError("Failed to link preprocess to nvinfer")
             if not elements['nvinfer'].link(elements['q_after_pgie']): 
                 raise RuntimeError("Failed to link nvinfer to q_after_pgie")
             if not elements['q_after_pgie'].link(elements['nvdsanalytics_exclude']): 
@@ -922,8 +1000,7 @@ class DeepStreamVideoPipeline:
                 raise RuntimeError("Failed to link nvtracker to q_after_tracker")
             if not elements['q_after_tracker'].link(elements['nvdsanalytics_post']): 
                 raise RuntimeError("Failed to link q_after_tracker to nvdsanalytics_post")
-            if not elements['nvdsanalytics_post'].link(elements['demux']): 
-                raise RuntimeError("Failed to link nvdsanalytics_post to demux")
+            # Post-analytics fanout is handled later via main_tee
 
             self.logger.info("✅ Main pipeline chain linked successfully")
             return True
@@ -953,10 +1030,19 @@ class DeepStreamVideoPipeline:
             
 
             
-            # Demuxer (per-branch OSD will be created downstream)
+            # Split to per-stream branches and a mosaic branch
             demux = Gst.ElementFactory.make("nvstreamdemux", "nvstreamdemux")
             if not demux:
                 raise RuntimeError("Failed to create nvstreamdemux element.")
+            main_tee = Gst.ElementFactory.make("tee", "main_tee")
+
+            # Mosaic branch elements (GPU tiler → JPEG appsink)
+            mosaic_q = Gst.ElementFactory.make("queue", "mosaic_q")
+            mosaic_tiler = Gst.ElementFactory.make("nvmultistreamtiler", "mosaic_tiler")
+            mosaic_conv = Gst.ElementFactory.make("nvvideoconvert", "mosaic_conv")
+            mosaic_caps = Gst.ElementFactory.make("capsfilter", "mosaic_caps")
+            mosaic_enc = Gst.ElementFactory.make("nvjpegenc", "mosaic_enc")
+            mosaic_sink = Gst.ElementFactory.make("appsink", "mosaic_sink")
 
             # Queues for pipeline robustness
             q_after_pgie = Gst.ElementFactory.make("queue", "q_after_pgie")
@@ -964,17 +1050,28 @@ class DeepStreamVideoPipeline:
             q_after_tracker = Gst.ElementFactory.make("queue", "q_after_tracker")
 
             # Validate element creation
-            element_list = [
-                multiurisrc, preprocess, nvinfer, nvdsanalytics_exclude, nvtracker, nvdsanalytics_post,
-                demux, q_after_pgie, q_before_tracker, q_after_tracker
-            ]
+            # Respect NOESIS_DISABLE_PREPROC for element presence in the pipeline
+            _disable_preproc = str(os.environ.get("NOESIS_DISABLE_PREPROC", "1")).strip().lower() in {"1","true","yes","y"}
+            element_list = [multiurisrc]
+            if not _disable_preproc:
+                element_list.append(preprocess)
+            element_list.extend([
+                nvinfer, nvdsanalytics_exclude, nvtracker, nvdsanalytics_post,
+                main_tee, demux, q_after_pgie, q_before_tracker, q_after_tracker,
+                mosaic_q, mosaic_tiler, mosaic_conv, mosaic_caps, mosaic_enc, mosaic_sink
+            ])
             
             if not all(element_list):
-                element_names = [
-                    "nvmultiurisrcbin", "nvdspreprocess", "nvinfer", "nvdsanalytics_exclude", "nvtracker", 
-                    "nvdsanalytics_post", "nvstreamdemux",
-                    "q_after_pgie", "q_before_tracker", "q_after_tracker"
+                element_names_all = [
+                    "nvmultiurisrcbin", "nvdspreprocess", "nvinfer", "nvdsanalytics_exclude", "nvtracker",
+                    "nvdsanalytics_post", "tee", "nvstreamdemux", "q_after_pgie", "q_before_tracker", "q_after_tracker",
+                    "mosaic_q", "nvmultistreamtiler", "nvvideoconvert", "capsfilter", "nvjpegenc", "appsink"
                 ]
+                # Build the corresponding names list for created elements
+                element_names = []
+                if multiurisrc: element_names.append("nvmultiurisrcbin")
+                if not _disable_preproc and preprocess: element_names.append("nvdspreprocess")
+                element_names.extend(["nvinfer", "nvdsanalytics_exclude", "nvtracker", "nvdsanalytics_post", "nvstreamdemux", "q_after_pgie", "q_before_tracker", "q_after_tracker"])  # type: ignore[list-item]
                 for el, name in zip(element_list, element_names):
                     if not el: self.logger.error(f"❌ Failed to create element: {name}")
                 raise RuntimeError("Failed to create one or more GStreamer elements.")
@@ -984,9 +1081,11 @@ class DeepStreamVideoPipeline:
             elements = {
                 'multiurisrc': multiurisrc, 'preprocess': preprocess, 'nvinfer': nvinfer,
                 'nvdsanalytics_exclude': nvdsanalytics_exclude, 'nvtracker': nvtracker, 
-                'nvdsanalytics_post': nvdsanalytics_post, 'demux': demux,
+                'nvdsanalytics_post': nvdsanalytics_post, 'main_tee': main_tee, 'demux': demux,
                 'q_after_pgie': q_after_pgie, 'q_before_tracker': q_before_tracker, 
-                'q_after_tracker': q_after_tracker
+                'q_after_tracker': q_after_tracker,
+                'mosaic_q': mosaic_q, 'mosaic_tiler': mosaic_tiler, 'mosaic_conv': mosaic_conv, 'mosaic_caps': mosaic_caps,
+                'mosaic_enc': mosaic_enc, 'mosaic_sink': mosaic_sink
             }
 
             # --- Phase B: Configure Elements ---
@@ -998,20 +1097,55 @@ class DeepStreamVideoPipeline:
             for el in element_list:
                 self.pipeline.add(el)
 
+            # Configure mosaic branch properties
+            try:
+                mosaic_q.set_property("leaky", 2)
+                mosaic_q.set_property("max-size-buffers", 12)
+                # Tiler output resolution
+                mosaic_tiler.set_property("width", int(self.max_width))
+                mosaic_tiler.set_property("height", int(self.max_height))
+            except Exception:
+                pass
+            try:
+                mosaic_caps.set_property("caps", Gst.Caps.from_string("video/x-raw(memory:NVMM), format=I420"))
+            except Exception:
+                pass
+            try:
+                mosaic_enc.set_property("quality", int(getattr(self.config.visualization, 'JPEG_QUALITY', 85)))
+                mosaic_enc.set_property("preset-level", 1)
+            except Exception:
+                pass
+            mosaic_sink.set_property("emit-signals", True)
+            mosaic_sink.set_property("drop", True)
+            mosaic_sink.set_property("sync", False)
+            mosaic_sink.set_property("max-buffers", 1)
+            mosaic_sink.connect("new-sample", self._on_new_mosaic_sample)
+
             # --- Phase D: Setup Probes ---
             self.logger.info("------------- Setting Up Buffer Probes-------------")
             
             # Telemetry Probe for metadata extraction
+            try:
+                _pyds_ok = hasattr(pyds, 'gst_buffer_get_nvds_batch_meta')
+            except Exception:
+                _pyds_ok = False
+
             analytics_src_pad = nvdsanalytics_post.get_static_pad("src")
             if not analytics_src_pad: raise RuntimeError("Failed to get nvdsanalytics_post source pad")
-            analytics_src_pad.add_probe(Gst.PadProbeType.BUFFER, self._analytics_probe, 0)
-            self.logger.info("✅ Added buffer probe to nvdsanalytics_post source pad for telemetry extraction")
+            if _pyds_ok:
+                analytics_src_pad.add_probe(Gst.PadProbeType.BUFFER, self._analytics_probe, 0)
+                self.logger.info("✅ Added buffer probe to nvdsanalytics_post source pad for telemetry extraction")
+            else:
+                self.logger.info("Skipping analytics telemetry probe (pyds legacy meta API unavailable)")
             
             # Pad probe to remove excluded objects
             exclude_src_pad = nvdsanalytics_exclude.get_static_pad("src")
             if not exclude_src_pad: raise RuntimeError("Failed to get nvdsanalytics_exclude source pad")
-            exclude_src_pad.add_probe(Gst.PadProbeType.BUFFER, self._remove_excluded_objects_probe, None)
-            self.logger.info("✅ Added buffer probe to nvdsanalytics_exclude source pad for object removal")
+            if _pyds_ok:
+                exclude_src_pad.add_probe(Gst.PadProbeType.BUFFER, self._remove_excluded_objects_probe, None)
+                self.logger.info("✅ Added buffer probe to nvdsanalytics_exclude source pad for object removal")
+            else:
+                self.logger.info("Skipping exclusion removal probe (pyds legacy meta API unavailable)")
 
             # Per-branch OSD probe will be attached in per-stream branches
 
@@ -1019,7 +1153,7 @@ class DeepStreamVideoPipeline:
 
             # Optional: Add probe to demux sink pad to trace buffer flow for first few frames
             demux_sink = demux.get_static_pad("sink")
-            if demux_sink:
+            if demux_sink and _pyds_ok:
                 self.logger.debug("Adding buffer probe to demux sink pad (limited logging)")
                 demux_sink.add_probe(Gst.PadProbeType.BUFFER, self._demux_debug_probe, None)
 
@@ -1031,9 +1165,37 @@ class DeepStreamVideoPipeline:
             self.multiurisrc, self.preprocess, self.nvinfer, self.nvtracker = multiurisrc, preprocess, nvinfer, nvtracker
             self.nvdsanalytics_exclude, self.nvdsanalytics_post = nvdsanalytics_exclude, nvdsanalytics_post
             self.demux = demux
+            self.main_tee = main_tee
 
             # --- Phase F: Calibrate demux pads and build per-stream branches with per-branch OSD ---
-            self._calibrate_demux_pad_source_map()
+            try:
+                self._pyds_ok = hasattr(pyds, 'gst_buffer_get_nvds_batch_meta')
+            except Exception:
+                self._pyds_ok = False
+            if self._pyds_ok:
+                self._calibrate_demux_pad_source_map()
+            else:
+                self.logger.info("Skipping demux pad calibration (pyds legacy meta API unavailable)")
+
+            # Link mosaic branch: nvdsanalytics_post → main_tee → mosaic_q → mosaic_tiler → mosaic_conv → mosaic_caps → mosaic_enc → mosaic_sink
+            if not nvdsanalytics_post.link(main_tee):
+                raise RuntimeError("Failed to link nvdsanalytics_post to main_tee")
+            if not main_tee.link(mosaic_q):
+                raise RuntimeError("Failed to link main_tee to mosaic_q")
+            if not mosaic_q.link(mosaic_tiler):
+                raise RuntimeError("Failed to link mosaic_q to mosaic_tiler")
+            if not mosaic_tiler.link(mosaic_conv):
+                raise RuntimeError("Failed to link mosaic_tiler to mosaic_conv")
+            if not mosaic_conv.link(mosaic_caps):
+                raise RuntimeError("Failed to link mosaic_conv to mosaic_caps")
+            if not mosaic_caps.link(mosaic_enc):
+                raise RuntimeError("Failed to link mosaic_caps to mosaic_enc")
+            if not mosaic_enc.link(mosaic_sink):
+                raise RuntimeError("Failed to link mosaic_enc to mosaic_sink")
+
+            # Also link main_tee → demux to preserve per-stream branches
+            if not main_tee.link(demux):
+                raise RuntimeError("Failed to link main_tee to demux")
             self.logger.info("🎥 Building per-stream branches with per-branch OSD and JPEG appsinks")
             self._setup_stream_branches()
 
@@ -1595,6 +1757,55 @@ class DeepStreamVideoPipeline:
             ret = self.pipeline.set_state(Gst.State.PLAYING)
             self.logger.info(f"Pipeline set_state returned: {ret}")
             if ret == Gst.StateChangeReturn.FAILURE:
+                # Try to surface immediate bus error
+                try:
+                    bus = self.pipeline.get_bus()
+                    msg = bus.timed_pop_filtered(2 * Gst.SECOND, Gst.MessageType.ERROR | Gst.MessageType.WARNING)
+                    if msg:
+                        try:
+                            if msg.type == Gst.MessageType.ERROR:
+                                err, dbg = msg.parse_error()
+                                self.logger.error(f"🚨 Pipeline error (pre-loop): {err.message}")
+                                self.logger.error(f"🚨 Debug info: {dbg}")
+                                self.logger.error(f"🚨 Error source: {msg.src.get_name() if msg.src else 'unknown'}")
+                            elif msg.type == Gst.MessageType.WARNING:
+                                warn, dbg = msg.parse_warning()
+                                self.logger.warning(f"⚠️ Pipeline warn (pre-loop): {warn.message}")
+                                self.logger.warning(f"⚠️ Debug info: {dbg}")
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+
+                # Inspect pad linking to identify not-linked spots
+                try:
+                    it = self.pipeline.iterate_elements()
+                    while True:
+                        res, el = it.next()
+                        if res != Gst.IteratorResult.OK:
+                            break
+                        try:
+                            pit = el.iterate_pads()
+                        except Exception:
+                            continue
+                        linked = []
+                        unlinked = []
+                        while True:
+                            pres, pad = pit.next()
+                            if pres != Gst.IteratorResult.OK:
+                                break
+                            try:
+                                if pad.is_linked():
+                                    linked.append(pad.get_name())
+                                else:
+                                    unlinked.append(pad.get_name())
+                            except Exception:
+                                pass
+                        if unlinked:
+                            self.logger.debug(f"element {el.get_name()} has unlinked pads: {unlinked}; linked: {linked}")
+                except Exception:
+                    pass
+
                 self.logger.error("❌ Failed to set pipeline to PLAYING state")
                 return False
 
@@ -2052,8 +2263,12 @@ class DeepStreamVideoPipeline:
                 osd.set_property('display-text', 1)
             except Exception:
                 pass
+            try:
+                _pyds_ok = hasattr(pyds, 'gst_buffer_get_nvds_batch_meta')
+            except Exception:
+                _pyds_ok = False
             osd_sink_pad = osd.get_static_pad("sink")
-            if osd_sink_pad:
+            if osd_sink_pad and _pyds_ok:
                 osd_sink_pad.add_probe(Gst.PadProbeType.BUFFER, self._per_branch_osd_probe, sensor_id)
             if not osd.link(conv_post):
                 self.logger.error(f"❌ Failed to link osd→conv_post for sensor {sensor_id}")
@@ -2255,6 +2470,55 @@ class DeepStreamVideoPipeline:
         except Exception as e:
             self.logger.error(f"Error in _on_new_jpeg_sample for sensor {sensor_id}: {e}")
             return Gst.FlowReturn.ERROR
+
+    def _on_new_mosaic_sample(self, appsink: GstApp.AppSink) -> Gst.FlowReturn:
+        """Appsink callback for mosaic JPEG branch."""
+        try:
+            sample = appsink.emit("pull-sample")
+            if not sample:
+                return Gst.FlowReturn.ERROR
+            buffer = sample.get_buffer()
+            if not buffer:
+                try:
+                    sample.unref()
+                except Exception:
+                    pass
+                return Gst.FlowReturn.ERROR
+            success, mapinfo = buffer.map(Gst.MapFlags.READ)
+            if not success:
+                try:
+                    sample.unref()
+                except Exception:
+                    pass
+                return Gst.FlowReturn.ERROR
+            try:
+                data = mapinfo.data
+                if data:
+                    try:
+                        self.mosaic_queue.put_nowait(bytes(data))
+                    except queue.Full:
+                        pass
+            finally:
+                try:
+                    buffer.unmap(mapinfo)
+                except Exception:
+                    pass
+                try:
+                    sample.unref()
+                except Exception:
+                    pass
+            return Gst.FlowReturn.OK
+        except Exception as e:
+            self.logger.error(f"Error in _on_new_mosaic_sample: {e}")
+            return Gst.FlowReturn.ERROR
+
+    def read_mosaic_jpeg(self, timeout: float = 0.1) -> Tuple[bool, Optional[bytes]]:
+        """Return the latest mosaic JPEG bytes, if available."""
+        try:
+            jpeg_bytes = self.mosaic_queue.get(timeout=timeout)
+            return True, jpeg_bytes
+        except queue.Empty:
+            return False, None
 
     def read_encoded_jpeg(self, source_id: int, timeout: float = 0.1) -> Tuple[bool, Optional[bytes]]:
         """Return next encoded JPEG bytes for a specific sensor_id from the GPU pipeline."""

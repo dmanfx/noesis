@@ -164,6 +164,13 @@ class DS8Adapter:
         self.running = True
         self._activated = True
         self.logger.info("DS8Adapter pipeline PLAYING with %d sources", len(self.source_info))
+        # After entering PLAYING, tune RTSP child properties safely
+        try:
+            src_el = self._elements.get("src")
+            if src_el is not None:
+                self._configure_rtspsrc_children(src_el)
+        except Exception:
+            pass
         return True
 
     def stop(self) -> None:
@@ -287,9 +294,13 @@ class DS8Adapter:
         sl = cfg["source-list"] if cfg.has_section("source-list") else {}
         def _split_list(v: str) -> List[str]:
             return [s.strip() for s in (v or "").split(";") if s.strip()]
-        uris = _split_list(sl.get("list", "")) if sl else []
+        list_raw = sl.get("list", "") if sl else ""
+        uris = _split_list(list_raw)
+        out["uris_raw"] = list_raw
         out["uris"] = uris
-        out["sensor_ids"] = _split_list(sl.get("sensor-id-list", "")) if sl else []
+        sensor_ids_raw = sl.get("sensor-id-list", "") if sl else ""
+        out["sensor_ids_raw"] = sensor_ids_raw
+        out["sensor_ids"] = _split_list(sensor_ids_raw)
         out["sensor_names"] = _split_list(sl.get("sensor-name-list", "")) if sl else []
         out["max_batch_size"] = int(sl.get("max-batch-size", "0") or 0) if sl else 0
         out["http_ip"] = sl.get("http-ip", "") if sl else ""
@@ -330,8 +341,9 @@ class DS8Adapter:
                 tcp_value = 4
         if tcp_value is None:
             tcp_value = 4
-        # Use latency from config file if provided
-        desired_latency = int(self._ds_src_settings.get("latency", 0) or 0) or 100
+        # Use latency from config file if provided, but clamp to a sane max
+        cfg_latency = int(self._ds_src_settings.get("latency", 0) or 0)
+        desired_latency = int(min(cfg_latency if cfg_latency > 0 else 100, 500))
         try:
             while True:
                 res, element = iterator.next()
@@ -453,20 +465,19 @@ class DS8Adapter:
         # Apply nvmultiurisrcbin configuration from file
         cfg = self._ds_src_settings
         uris = cfg.get("uris", [])
-        sensor_ids_list = cfg.get("sensor_ids", [])
-        # If sensor-id-list absent, build 0..N-1
-        if not sensor_ids_list:
-            sensor_ids_list = [str(i) for i in range(len(uris))]
-        uri_list = ",".join(uris)
-        sensor_ids = ",".join(sensor_ids_list)
+        # Prefer the raw semicolon-separated list exactly as in the INI
+        uri_list = str(cfg.get("uris_raw", "") or ";".join(uris))
+        sensor_ids = str(cfg.get("sensor_ids_raw", "") or "")
         try:
             src.set_property("uri-list", uri_list)
-        except Exception:
-            pass
-        try:
-            src.set_property("sensor-id-list", sensor_ids)
-        except Exception:
-            pass
+            self.logger.info(f"nvmultiurisrcbin uri-list set ({len(uris)} uris)")
+        except Exception as e:
+            self.logger.warning(f"Failed to set uri-list on nvmultiurisrcbin: {e}")
+        if sensor_ids:
+            try:
+                src.set_property("sensor-id-list", sensor_ids)
+            except Exception:
+                pass
         try:
             mb = int(cfg.get("max_batch_size", 0) or 0) or len(uris)
             src.set_property("max-batch-size", mb)
@@ -511,12 +522,6 @@ class DS8Adapter:
 
         try:
             self.pipeline.add(src)
-            src.set_state(Gst.State.PAUSED)
-            time.sleep(0.1)
-            src.set_state(Gst.State.READY)
-            self.logger.info("nvmultiurisrcbin pad negotiation complete")
-            # Tune child rtspsrc per sample config (latency, protocols, keep-alive)
-            self._configure_rtspsrc_children(src)
         except Exception as e:
             self.logger.error(f"Source negotiation failed: {e}")
 
@@ -625,23 +630,7 @@ class DS8Adapter:
             if el is not None:
                 self.pipeline.add(el)
 
-        # Link nvmultiurisrcbin -> pre_tee with dynamic pad-added handler and static attempt
-        def _on_multiurisrc_pad_added(_bin, pad):
-            try:
-                sink = tee.get_static_pad("sink")
-                if sink and not sink.is_linked():
-                    result = pad.link(sink)
-                    if result == Gst.PadLinkReturn.OK:
-                        self.logger.info(f"Pad linked: src pad {pad.get_name()} to tee.sink")
-                    else:
-                        self.logger.error(f"Pad link failed: {Gst.PadLinkReturn.get_name(result)}")
-            except Exception as e:
-                self.logger.error("pad-added handler error: %s", e)
-        try:
-            src.connect("pad-added", _on_multiurisrc_pad_added)
-        except Exception:
-            self.logger.debug("Could not connect pad-added on nvmultiurisrcbin")
-        # Try static link as well (harmless if dynamic-only)
+        # Link nvmultiurisrcbin -> pre_tee via static pads (src pad is always present)
         try:
             spad = src.get_static_pad("src")
             sink = tee.get_static_pad("sink")
@@ -649,9 +638,9 @@ class DS8Adapter:
                 if spad.link(sink) == Gst.PadLinkReturn.OK:
                     self.logger.info("linked nvmultiurisrcbin → pre_tee (static)")
                 else:
-                    self.logger.warning("Static link nvmultiurisrcbin → pre_tee failed; waiting for pad-added")
+                    self.logger.warning("Static link nvmultiurisrcbin → pre_tee failed")
         except Exception:
-            self.logger.debug("Static pad link attempt failed; will rely on pad-added")
+            self.logger.debug("Static pad link attempt failed")
 
         # Tee branch 1: pre_tee → q_to_demux → pre_demux
         tee2demux = tee.get_request_pad("src_%u")

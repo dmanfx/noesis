@@ -17,7 +17,8 @@ sys.stdout.flush()
 
 # Set GStreamer debug BEFORE any other imports
 import os
-os.environ['GST_DEBUG'] = '*:4'  # Complete silence for all GStreamer
+# Respect pre-set GST_DEBUG if provided; default to *:4 otherwise
+os.environ['GST_DEBUG'] = os.environ.get('GST_DEBUG', '*:4')
 os.environ['GST_DEBUG_NO_COLOR'] = '1'  # Disable colored output
 os.environ['no_proxy'] = '*'
 

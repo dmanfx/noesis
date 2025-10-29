@@ -104,6 +104,9 @@ class AppConfig:
         DEEPSTREAM_MUX_BATCH_SIZE: int = 1  # Single frame processing for lower latency
         DEEPSTREAM_MUX_SCALE_MODE: int = 2  # 0=stretch, 1=crop, 2=letter-box
         DEEPSTREAM_PREPROCESS_CONFIG: str = "pipelines/config_preproc.ini"  # Path to preprocessing config file
+        DEEPSTREAM_ENABLE_DEPTH: bool = True  # Enable Depth Anything V2 SGIE for metric depth
+        DEEPSTREAM_DEPTH_CONFIG: str = "pipelines/config_infer_secondary_depth_anything_v2.ini"
+        DEEPSTREAM_DEPTH_UNIQUE_ID: int = 2
         DEEPSTREAM_TRACKER_CONFIG: str = "pipelines/tracker_nvdcf.yml"  # Path to tracker config file
         DEEPSTREAM_TRACKER_LIB: str = "/opt/nvidia/deepstream/deepstream/lib/libnvds_nvmultiobjecttracker.so"  # DeepStream tracker library
         DEEPSTREAM_ENABLE_OSD: bool = True  # Enable on-screen display for visualization
@@ -123,11 +126,20 @@ class AppConfig:
             if self.ENABLE_DEEPSTREAM:
                 if not self.DEEPSTREAM_PREPROCESS_CONFIG:
                     logger.warning("⚠️  DEEPSTREAM_PREPROCESS_CONFIG is empty. Using default preprocessing.")
-                
+
                 if self.DEEPSTREAM_MUX_BATCH_SIZE <= 0:
                     logger.warning("⚠️  DEEPSTREAM_MUX_BATCH_SIZE <= 0. Will be auto-calculated from enabled streams.")
-                
+
                 logger.info("✅ DeepStream pipeline enabled - recommended for optimal performance.")
+
+                if self.DEEPSTREAM_ENABLE_DEPTH:
+                    logger.info(
+                        "✅ Depth Anything V2 SGIE enabled. Metric depth metadata will be attached to detections."
+                    )
+                else:
+                    logger.warning(
+                        "⚠️  Depth SGIE disabled. Tracker and analytics will not receive metric depth metadata."
+                    )
             else:
                 logger.warning("⚠️  DeepStream pipeline disabled. Consider enabling for better performance.")
             

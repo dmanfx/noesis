@@ -24,6 +24,7 @@ import re
 import threading
 import time
 import queue
+import ctypes
 from collections import defaultdict, deque
 
 # Bypass libproxy issues by disabling GIO proxy resolver
@@ -197,6 +198,19 @@ class DeepStreamVideoPipeline:
         self.trail_history = defaultdict(lambda: deque(maxlen=self.config.visualization.TRAIL_LENGTH))
         # Respect config default for initial state
         self.trail_visualization_enabled = bool(self.config.visualization.TRAIL_VISUALIZATION_ENABLED)
+
+        # Depth Anything V2 SGIE configuration
+        self.depth_enabled: bool = bool(getattr(self.config.processing, "DEEPSTREAM_ENABLE_DEPTH", True))
+        self.depth_unique_id: int = int(getattr(self.config.processing, "DEEPSTREAM_DEPTH_UNIQUE_ID", 2))
+        self.depth_output_layer: str = "pred"
+        # Use misc_obj_info slots for depth statistics [median, mean, min, max]
+        self._depth_misc_indices = {
+            'median': 0,
+            'mean': 1,
+            'min': 2,
+            'max': 3,
+        }
+        self.depth_sgie: Optional[Gst.Element] = None
         
         # --- trail visualisation state ---
         # Maintain histories per sensor_id to avoid cross-stream overlays
@@ -869,6 +883,27 @@ class DeepStreamVideoPipeline:
             elements['nvinfer'].set_property("config-file-path", _nvinfer_cfg)
             elements['nvinfer'].set_property("input-tensor-meta", True)
 
+            # Depth SGIE configuration
+            depth_cfg_path = getattr(
+                self.config.processing,
+                'DEEPSTREAM_DEPTH_CONFIG',
+                'pipelines/config_infer_secondary_depth_anything_v2.ini'
+            )
+            if depth_cfg_path and not os.path.isabs(depth_cfg_path):
+                depth_cfg_path = os.path.join(_root_dir, depth_cfg_path)
+            if self.depth_enabled:
+                self._check_for_engine_file(depth_cfg_path)
+                elements['nvinfer_depth'].set_property("config-file-path", depth_cfg_path)
+                elements['nvinfer_depth'].set_property("input-tensor-meta", True)
+                elements['nvinfer_depth'].set_property("unique-id", int(self.depth_unique_id))
+                self.logger.info(
+                    "✅ Depth SGIE configured (config=%s, unique-id=%s)", depth_cfg_path, self.depth_unique_id
+                )
+            else:
+                elements['nvinfer_depth'].set_property("config-file-path", depth_cfg_path)
+                elements['nvinfer_depth'].set_property("enable", False)
+                self.logger.info("⚠️  Depth SGIE disabled via config; passing buffers without depth inference")
+
             # Exclusion analytics
             exclude_cfg_path = "pipelines/config_nvdsanalytics_exclude.ini"
             if exclude_cfg_path and not os.path.isabs(exclude_cfg_path):
@@ -912,11 +947,15 @@ class DeepStreamVideoPipeline:
                 raise RuntimeError("Failed to link preprocess to nvinfer")
             if not elements['nvinfer'].link(elements['q_after_pgie']): 
                 raise RuntimeError("Failed to link nvinfer to q_after_pgie")
-            if not elements['q_after_pgie'].link(elements['nvdsanalytics_exclude']): 
+            if not elements['q_after_pgie'].link(elements['nvdsanalytics_exclude']):
                 raise RuntimeError("Failed to link q_after_pgie to nvdsanalytics_exclude")
-            if not elements['nvdsanalytics_exclude'].link(elements['q_before_tracker']): 
-                raise RuntimeError("Failed to link nvdsanalytics_exclude to q_before_tracker")
-            if not elements['q_before_tracker'].link(elements['nvtracker']): 
+            if not elements['nvdsanalytics_exclude'].link(elements['q_before_depth']):
+                raise RuntimeError("Failed to link nvdsanalytics_exclude to q_before_depth")
+            if not elements['q_before_depth'].link(elements['nvinfer_depth']):
+                raise RuntimeError("Failed to link q_before_depth to nvinfer_depth")
+            if not elements['nvinfer_depth'].link(elements['q_before_tracker']):
+                raise RuntimeError("Failed to link nvinfer_depth to q_before_tracker")
+            if not elements['q_before_tracker'].link(elements['nvtracker']):
                 raise RuntimeError("Failed to link q_before_tracker to nvtracker")
             if not elements['nvtracker'].link(elements['q_after_tracker']): 
                 raise RuntimeError("Failed to link nvtracker to q_after_tracker")
@@ -932,6 +971,210 @@ class DeepStreamVideoPipeline:
             self.logger.error(f"❌ Error linking pipeline chain: {e}")
             return False
 
+    def _reset_depth_slots(self, obj_meta) -> None:
+        """Clear misc_obj_info slots reserved for depth stats."""
+        try:
+            for idx in self._depth_misc_indices.values():
+                obj_meta.misc_obj_info[idx] = 0.0
+        except Exception:
+            pass
+
+    def _tensor_layer_to_numpy(self, tensor_meta, layer_name: str) -> Optional[np.ndarray]:
+        """Convert NvDsInferTensorMeta layer to a CPU numpy array."""
+        try:
+            num_layers = int(getattr(tensor_meta, 'num_output_layers', 0))
+            for i in range(num_layers):
+                layer = tensor_meta.output_layers_info[i]
+                raw_name = layer.layerName
+                if isinstance(raw_name, bytes):
+                    name = raw_name.decode('utf-8', errors='ignore')
+                else:
+                    name = str(raw_name)
+                if name != layer_name:
+                    continue
+
+                dims = layer.inferDims
+                dims_list: List[int] = []
+                for d_idx in range(int(dims.numDims)):
+                    dim_val = int(dims.d[d_idx])
+                    if dim_val > 0:
+                        dims_list.append(dim_val)
+
+                if not dims_list:
+                    return None
+
+                num_elems = int(np.prod(dims_list))
+                if num_elems <= 0:
+                    return None
+
+                ptr = pyds.get_ptr(layer.buffer)
+                c_float_p = ctypes.POINTER(ctypes.c_float)
+                data_ptr = ctypes.cast(ptr, c_float_p)
+                np_array = np.ctypeslib.as_array(data_ptr, shape=(num_elems,))
+                np_array = np.array(np_array, copy=True)
+
+                arr = np_array.reshape(dims_list)
+                arr = np.squeeze(arr)
+                if arr.ndim == 3:
+                    if arr.shape[0] in (1, 3):
+                        arr = arr[0]
+                    elif arr.shape[-1] in (1, 3):
+                        arr = arr[..., 0]
+                    else:
+                        arr = arr.reshape((-1, arr.shape[-2], arr.shape[-1]))[0]
+                elif arr.ndim == 1:
+                    side = int(np.sqrt(arr.size))
+                    if side * side == arr.size:
+                        arr = arr.reshape((side, side))
+
+                if arr.ndim != 2:
+                    if arr.ndim >= 2:
+                        arr = np.reshape(arr, (arr.shape[-2], arr.shape[-1]))
+                    else:
+                        arr = arr.reshape((1, arr.shape[0]))
+
+                return arr.astype(np.float32, copy=False)
+        except Exception as exc:
+            self.logger.debug(f"Depth tensor conversion failed: {exc}")
+        return None
+
+    def _compute_depth_stats_from_tensor(self, tensor_meta) -> Optional[Dict[str, Any]]:
+        depth_map = self._tensor_layer_to_numpy(tensor_meta, self.depth_output_layer)
+        if depth_map is None:
+            return None
+
+        valid_mask = np.isfinite(depth_map) & (depth_map > 0.0)
+        num_valid = int(np.count_nonzero(valid_mask))
+        total = int(depth_map.size)
+        if num_valid == 0 or total == 0:
+            return None
+
+        depth_values = depth_map[valid_mask]
+        stats = {
+            'median_m': float(np.median(depth_values)),
+            'mean_m': float(np.mean(depth_values)),
+            'min_m': float(np.min(depth_values)),
+            'max_m': float(np.max(depth_values)),
+            'valid_ratio': float(num_valid / max(1, total)),
+            'num_valid_pixels': num_valid,
+            'num_pixels': total,
+            'map_shape': tuple(int(x) for x in depth_map.shape),
+        }
+        return stats
+
+    def _attach_depth_to_obj(self, obj_meta) -> None:
+        """Extract DA V2 tensor output for an object and write stats into metadata."""
+        self._reset_depth_slots(obj_meta)
+
+        user_meta_list = obj_meta.obj_user_meta_list
+        while user_meta_list:
+            try:
+                user_meta = pyds.NvDsUserMeta.cast(user_meta_list.data)
+            except StopIteration:
+                break
+            except Exception:
+                user_meta = None
+
+            if user_meta and user_meta.base_meta.meta_type == pyds.NvDsMetaType.NVDSINFER_TENSOR_OUTPUT_META:
+                tensor_meta = pyds.NvDsInferTensorMeta.cast(user_meta.user_meta_data)
+                if tensor_meta and int(getattr(tensor_meta, 'unique_id', -1)) == int(self.depth_unique_id):
+                    stats = self._compute_depth_stats_from_tensor(tensor_meta)
+                    if stats:
+                        try:
+                            obj_meta.misc_obj_info[self._depth_misc_indices['median']] = stats['median_m']
+                            obj_meta.misc_obj_info[self._depth_misc_indices['mean']] = stats['mean_m']
+                            obj_meta.misc_obj_info[self._depth_misc_indices['min']] = stats['min_m']
+                            obj_meta.misc_obj_info[self._depth_misc_indices['max']] = stats['max_m']
+                            setattr(obj_meta, 'depth_valid_ratio', stats['valid_ratio'])
+                            setattr(obj_meta, 'depth_num_valid_pixels', stats['num_valid_pixels'])
+                            setattr(obj_meta, 'depth_num_pixels', stats['num_pixels'])
+                            setattr(obj_meta, 'depth_map_shape', stats['map_shape'])
+                        except Exception:
+                            pass
+                    break
+
+            try:
+                user_meta_list = user_meta_list.next
+            except StopIteration:
+                break
+
+    def _depth_probe(self, pad, info, user_data):
+        if not self.depth_enabled:
+            return Gst.PadProbeReturn.OK
+
+        gst_buffer = info.get_buffer()
+        if not gst_buffer:
+            return Gst.PadProbeReturn.OK
+
+        batch_meta = pyds.gst_buffer_get_nvds_batch_meta(hash(gst_buffer))
+        if not batch_meta:
+            return Gst.PadProbeReturn.OK
+
+        l_frame = batch_meta.frame_meta_list
+        while l_frame:
+            try:
+                frame_meta = pyds.NvDsFrameMeta.cast(l_frame.data)
+            except StopIteration:
+                break
+            except Exception:
+                frame_meta = None
+
+            if frame_meta:
+                l_obj = frame_meta.obj_meta_list
+                while l_obj:
+                    try:
+                        obj_meta = pyds.NvDsObjectMeta.cast(l_obj.data)
+                    except StopIteration:
+                        break
+                    except Exception:
+                        obj_meta = None
+
+                    if obj_meta:
+                        self._attach_depth_to_obj(obj_meta)
+
+                    try:
+                        l_obj = l_obj.next
+                    except StopIteration:
+                        break
+
+            try:
+                l_frame = l_frame.next
+            except StopIteration:
+                break
+
+        return Gst.PadProbeReturn.OK
+
+    def _extract_depth_stats(self, obj_meta) -> Optional[Dict[str, Any]]:
+        try:
+            median = float(obj_meta.misc_obj_info[self._depth_misc_indices['median']])
+            mean = float(obj_meta.misc_obj_info[self._depth_misc_indices['mean']])
+            dmin = float(obj_meta.misc_obj_info[self._depth_misc_indices['min']])
+            dmax = float(obj_meta.misc_obj_info[self._depth_misc_indices['max']])
+            if not (np.isfinite(median) and median > 0.0) and not (np.isfinite(mean) and mean > 0.0):
+                return None
+
+            depth_stats = {
+                'median_m': median,
+                'mean_m': mean,
+                'min_m': dmin,
+                'max_m': dmax,
+            }
+            valid_ratio = getattr(obj_meta, 'depth_valid_ratio', None)
+            if valid_ratio is not None:
+                depth_stats['valid_ratio'] = float(valid_ratio)
+            num_valid = getattr(obj_meta, 'depth_num_valid_pixels', None)
+            if num_valid is not None:
+                depth_stats['num_valid_pixels'] = int(num_valid)
+            num_pixels = getattr(obj_meta, 'depth_num_pixels', None)
+            if num_pixels is not None:
+                depth_stats['num_pixels'] = int(num_pixels)
+            map_shape = getattr(obj_meta, 'depth_map_shape', None)
+            if map_shape is not None:
+                depth_stats['map_shape'] = map_shape
+            return depth_stats
+        except Exception:
+            return None
+
     def _create_pipeline(self) -> bool:
         """Create the DeepStream GStreamer pipeline using refactored helper functions."""
         try:
@@ -945,6 +1188,7 @@ class DeepStreamVideoPipeline:
             multiurisrc = Gst.ElementFactory.make("nvmultiurisrcbin", "nvmultiurisrcbin")
             preprocess = Gst.ElementFactory.make("nvdspreprocess", "nvdspreprocess")
             nvinfer = Gst.ElementFactory.make("nvinfer", "nvinfer")
+            nvinfer_depth = Gst.ElementFactory.make("nvinfer", "nvinfer_depth")
             
             # Analytics and Tracking
             nvdsanalytics_exclude = Gst.ElementFactory.make("nvdsanalytics", "nvdsanalytics_exclude")
@@ -960,20 +1204,21 @@ class DeepStreamVideoPipeline:
 
             # Queues for pipeline robustness
             q_after_pgie = Gst.ElementFactory.make("queue", "q_after_pgie")
+            q_before_depth = Gst.ElementFactory.make("queue", "q_before_depth")
             q_before_tracker = Gst.ElementFactory.make("queue", "q_before_tracker")
             q_after_tracker = Gst.ElementFactory.make("queue", "q_after_tracker")
 
             # Validate element creation
             element_list = [
-                multiurisrc, preprocess, nvinfer, nvdsanalytics_exclude, nvtracker, nvdsanalytics_post,
-                demux, q_after_pgie, q_before_tracker, q_after_tracker
+                multiurisrc, preprocess, nvinfer, nvinfer_depth, nvdsanalytics_exclude, nvtracker, nvdsanalytics_post,
+                demux, q_after_pgie, q_before_depth, q_before_tracker, q_after_tracker
             ]
             
             if not all(element_list):
                 element_names = [
-                    "nvmultiurisrcbin", "nvdspreprocess", "nvinfer", "nvdsanalytics_exclude", "nvtracker", 
+                    "nvmultiurisrcbin", "nvdspreprocess", "nvinfer", "nvinfer_depth", "nvdsanalytics_exclude", "nvtracker",
                     "nvdsanalytics_post", "nvstreamdemux",
-                    "q_after_pgie", "q_before_tracker", "q_after_tracker"
+                    "q_after_pgie", "q_before_depth", "q_before_tracker", "q_after_tracker"
                 ]
                 for el, name in zip(element_list, element_names):
                     if not el: self.logger.error(f"❌ Failed to create element: {name}")
@@ -983,9 +1228,10 @@ class DeepStreamVideoPipeline:
             # Create elements dictionary for helper functions
             elements = {
                 'multiurisrc': multiurisrc, 'preprocess': preprocess, 'nvinfer': nvinfer,
-                'nvdsanalytics_exclude': nvdsanalytics_exclude, 'nvtracker': nvtracker, 
+                'nvinfer_depth': nvinfer_depth, 'nvdsanalytics_exclude': nvdsanalytics_exclude, 'nvtracker': nvtracker,
                 'nvdsanalytics_post': nvdsanalytics_post, 'demux': demux,
-                'q_after_pgie': q_after_pgie, 'q_before_tracker': q_before_tracker, 
+                'q_after_pgie': q_after_pgie, 'q_before_depth': q_before_depth,
+                'q_before_tracker': q_before_tracker,
                 'q_after_tracker': q_after_tracker
             }
 
@@ -1013,6 +1259,15 @@ class DeepStreamVideoPipeline:
             exclude_src_pad.add_probe(Gst.PadProbeType.BUFFER, self._remove_excluded_objects_probe, None)
             self.logger.info("✅ Added buffer probe to nvdsanalytics_exclude source pad for object removal")
 
+            if self.depth_enabled:
+                depth_src_pad = nvinfer_depth.get_static_pad("src")
+                if not depth_src_pad:
+                    raise RuntimeError("Failed to get nvinfer_depth source pad")
+                depth_src_pad.add_probe(Gst.PadProbeType.BUFFER, self._depth_probe, None)
+                self.logger.info("✅ Added buffer probe to depth SGIE for metric depth extraction")
+            else:
+                self.logger.info("ℹ️  Depth SGIE disabled; skipping depth metadata probe")
+
             # Per-branch OSD probe will be attached in per-stream branches
 
             # (Removed noisy mux src probe)
@@ -1029,6 +1284,7 @@ class DeepStreamVideoPipeline:
 
             # Store references early for downstream setup that accesses them
             self.multiurisrc, self.preprocess, self.nvinfer, self.nvtracker = multiurisrc, preprocess, nvinfer, nvtracker
+            self.depth_sgie = nvinfer_depth
             self.nvdsanalytics_exclude, self.nvdsanalytics_post = nvdsanalytics_exclude, nvdsanalytics_post
             self.demux = demux
 
@@ -1168,7 +1424,7 @@ class DeepStreamVideoPipeline:
                 "bbox": [rect.left, rect.top, rect.width, rect.height],
                 "object_id": obj.object_id,
             }
-            
+
             # Build tracking data for telemetry
             track_dict = {
                 'track_id': obj.object_id,
@@ -1177,6 +1433,11 @@ class DeepStreamVideoPipeline:
                 'bbox': [rect.left, rect.top, rect.width, rect.height],
                 'class_id': obj.class_id
             }
+
+            depth_stats = self._extract_depth_stats(obj)
+            if depth_stats:
+                detection['depth'] = depth_stats
+                track_dict['depth'] = depth_stats
             
             # Compute center point
             center_x = rect.left + rect.width / 2

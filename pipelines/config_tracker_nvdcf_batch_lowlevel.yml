@@ -1,4 +1,3 @@
-%YAML:1.0
 ################################################################################
 # NVIDIA DeepStream NvDCF Low-Level Tracker Configuration - Batch Processing
 # Optimized for multi-stream batch processing with proper sub-batch handling

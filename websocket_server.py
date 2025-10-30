@@ -293,6 +293,16 @@ class WebSocketServer:
                 ping_timeout=30      # wait 30 seconds for pong response (was 20)
             )
 
+            # If bound to port 0 (ephemeral), capture the actual port
+            try:
+                if self.port in (0, None) and self.server and getattr(self.server, 'sockets', None):
+                    sock = self.server.sockets[0]
+                    bound = sock.getsockname()
+                    if isinstance(bound, tuple) and len(bound) >= 2:
+                        self.port = int(bound[1])
+            except Exception:
+                pass
+
             # Start periodic stats broadcast task if callback is provided
             if self.stats_callback:
                 self._stats_task = asyncio.create_task(
@@ -378,6 +388,33 @@ class WebSocketServer:
             except asyncio.CancelledError:
                 pass
 
+    def _force_close_server(self) -> bool:
+        """Best-effort fallback to close listening sockets when the event loop is unavailable."""
+        server = self.server
+        if not server:
+            return True
+
+        try:
+            # Close the asyncio server without awaiting wait_closed (loop may be unavailable)
+            server.close()
+        except Exception as exc:
+            self.logger.error(f"Forced WebSocket server close failed: {exc}")
+            return False
+
+        # Explicitly close bound sockets to free the port immediately
+        sockets = getattr(server, "sockets", None)
+        if sockets:
+            for sock in sockets:
+                try:
+                    sock.close()
+                except Exception:
+                    pass
+
+        self.server = None
+        self.connected_clients.clear()
+        self.logger.info("WebSocket server sockets closed via fallback path")
+        return True
+
     def stop_sync(self, timeout: float = 5.0) -> bool:
         """Synchronous stop method for use from other threads"""
         self.logger.info("Stopping WebSocket server (sync mode)...")
@@ -399,30 +436,38 @@ class WebSocketServer:
                 return False
 
         target_loop = getattr(self, 'event_loop', None)
+        deadline = time.time() + timeout
+
+        # Allow the worker thread a moment to publish its loop reference
+        while (target_loop is None or target_loop.is_closed()) and time.time() < deadline:
+            time.sleep(0.05)
+            target_loop = getattr(self, 'event_loop', None)
+
         if not target_loop or target_loop.is_closed():
-            self.logger.warning("No event loop available for WebSocket server shutdown")
-            return False
+            self.logger.warning("No event loop available for WebSocket server shutdown; forcing close")
+            return self._force_close_server()
 
         if not target_loop.is_running():
-            self.logger.warning("WebSocket event loop not running during shutdown")
-            return False
+            self.logger.warning("WebSocket event loop not running during shutdown; forcing close")
+            return self._force_close_server()
 
         try:
             future = asyncio.run_coroutine_threadsafe(self.stop(), target_loop)
         except Exception as exc:
             self.logger.warning(f"Could not stop WebSocket server via event loop: {exc}")
-            return False
+            return self._force_close_server()
 
         try:
-            future.result(timeout=timeout)
+            remaining = max(0.1, deadline - time.time())
+            future.result(timeout=remaining)
             return True
         except concurrent.futures.TimeoutError:
-            self.logger.warning(f"WebSocket server stop did not complete within {timeout}s")
-            return False
+            self.logger.warning(f"WebSocket server stop did not complete within {timeout}s; forcing close")
+            return self._force_close_server()
         except Exception as exc:
             self.logger.error(f"Error waiting for WebSocket server stop: {exc}")
-            return False
-    
+            return self._force_close_server()
+
     async def handle_client(self, websocket, path=None):
         """Handle incoming WebSocket connections and messages
 

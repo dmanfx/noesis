@@ -519,6 +519,15 @@ class ApplicationManager:
         except ValueError:
             port = 8001
 
+        # Pre-flight: if a healthy service already responds on host:port, skip spawning
+        try:
+            if self._is_mapanything_healthy(host, port):
+                self.logger.info("MapAnything service already healthy at %s:%s; skipping start", host, port)
+                return
+        except Exception as exc:
+            # Continue to spawn; health probe is best-effort
+            self.logger.debug(f"MapAnything preflight health check failed: {exc}")
+
         env = os.environ.copy()
         env.setdefault('PYTORCH_ENABLE_MPS_FALLBACK', '1')
 
@@ -536,6 +545,21 @@ class ApplicationManager:
             self.logger.error("MapAnything service failed to report healthy; terminating process")
             self._terminate_mapanything_process()
             raise
+
+    def _is_mapanything_healthy(self, host: str, port: int, timeout: float = 2.0) -> bool:
+        """Return True if an existing MapAnything service is healthy on host:port."""
+        try:
+            conn = http.client.HTTPConnection(host, port, timeout=timeout)
+            try:
+                conn.request("GET", "/health")
+                resp = conn.getresponse()
+                if resp.status == 200:
+                    return True
+            finally:
+                conn.close()
+        except Exception:
+            pass
+        return False
 
     def _wait_for_mapanything_ready(self, host: str, port: int, timeout: float = 30.0) -> None:
         """Poll the service health endpoint until it responds or timeout expires."""
@@ -610,10 +634,27 @@ class ApplicationManager:
                     print("⚠️ WebSocket server is None, skipping startup")
                     return
 
-                # Run server
+                # Run server with a fallback if the configured port is busy
                 self.logger.info("Starting WebSocket server...")
-                loop.run_until_complete(self.websocket_server.start())
-                self.logger.info("WebSocket server started successfully")
+                try:
+                    loop.run_until_complete(self.websocket_server.start())
+                except OSError as e:
+                    # If port in use, fall back to ephemeral port
+                    if getattr(e, 'errno', None) == 98 or 'address already in use' in str(e).lower():
+                        try:
+                            self.logger.warning(
+                                f"WebSocket port {self.websocket_server.port} busy; falling back to ephemeral port"
+                            )
+                            self.websocket_server.port = 0
+                            loop.run_until_complete(self.websocket_server.start())
+                        except Exception as e2:
+                            self.logger.error(f"WebSocket fallback start failed: {e2}")
+                            raise
+                    else:
+                        raise
+                self.logger.info(
+                    f"WebSocket server started successfully on {self.websocket_server.host}:{self.websocket_server.port}"
+                )
 
                 # Set up shutdown handling
                 def shutdown_handler():

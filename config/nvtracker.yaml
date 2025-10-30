@@ -1,7 +1,5 @@
 # Noesis DeepStream 8 NvDCF tracker configuration (DS8 canonical schema)
 
-%YAML:1.0
-
 BaseConfig:
   minDetectorConfidence: 0.0
 

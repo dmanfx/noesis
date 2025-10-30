@@ -1,4 +1,3 @@
-%YAML:1.0
 ################################################################################
 # NVIDIA DeepStream NvDCF Tracker Configuration - Batch Processing Optimized
 # Optimized for RTSP streams with person detection and batch processing

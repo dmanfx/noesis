@@ -162,7 +162,16 @@ class DS8Adapter:
             self._errors.append("Pipeline failed to enter PLAYING")
             self.logger.error("DS8 pipeline failed to start (PLAYING)")
             return False
-        time.sleep(2.0)
+        # After state transition begins, re-apply RTSP tuning once children exist
+        try:
+            # Small delay to allow internal bins to instantiate
+            time.sleep(0.5)
+            src_el = self._elements.get("src")
+            if src_el is not None:
+                self._configure_rtspsrc_children(src_el)
+        except Exception:
+            pass
+        time.sleep(1.5)
         try:
             change_return, state, pending = self.pipeline.get_state(0)
             self.logger.info(f"Pipeline state after PLAYING: {state.value_name}, pending: {pending.value_name}")
@@ -318,6 +327,12 @@ class DS8Adapter:
         out["rtsp_reconnect_interval_sec"] = int(saa.get("rtsp-reconnect-interval-sec", "0") or 0) if saa else 0
         out["init_rtsp_reconnect_interval_sec"] = int(saa.get("init-rtsp-reconnect-interval-sec", "0") or 0) if saa else 0
         out["rtsp_reconnect_attempts"] = int(saa.get("rtsp-reconnect-attempts", "0") or 0) if saa else 0
+        # Prefer TCP for RTSP by default if provided
+        try:
+            sel = saa.get("select-rtp-protocol", "") if saa else ""
+            out["select_rtp_protocol"] = int(str(sel).strip() or 0)
+        except Exception:
+            out["select_rtp_protocol"] = 0
 
         # streammux
         sm = cfg["streammux"] if cfg.has_section("streammux") else {}
@@ -424,10 +439,9 @@ class DS8Adapter:
                 else:
                     continue
         finally:
-            try:
-                iterator.free()
-            except Exception:
-                pass
+            # In GI, the iterator is managed by the binding; avoid explicit free()
+            # to prevent potential double-free during interpreter shutdown.
+            iterator = None
         if tuned_count:
             self.logger.info("Applied RTSP tuning to %d rtspsrc element(s)", tuned_count)
         if applied:
@@ -516,7 +530,13 @@ class DS8Adapter:
             h = int(cfg.get("mux_height", 1080) or 1080)
         except Exception:
             w, h = 1920, 1080
-        for k, v in (("width", w), ("height", h), ("live-source", int(cfg.get("live_source", 1) or 1)), ("drop-pipeline-eos", int(cfg.get("drop_pipeline_eos", 1) or 1))):
+        for k, v in (
+            ("width", w),
+            ("height", h),
+            ("live-source", int(cfg.get("live_source", 1) or 1)),
+            ("drop-pipeline-eos", int(cfg.get("drop_pipeline_eos", 1) or 1)),
+            ("latency", int(cfg.get("latency", 0) or 0)),
+        ):
             try:
                 src.set_property(k, v)
             except Exception:
@@ -530,6 +550,8 @@ class DS8Adapter:
             "gpu-id": int(cfg.get("gpu_id", 0) or 0),
             "ip-address": str(cfg.get("http_ip", "") or ""),
             "port": int(cfg.get("http_port", 0) or 0),
+            # Ensure TCP for RTP when specified in config
+            "select-rtp-protocol": int(cfg.get("select_rtp_protocol", 0) or 0),
         }.items():
             try:
                 src.set_property(k, v)

@@ -157,16 +157,16 @@ class WebSocketServer:
                         tx_items.append(f"{k}:{entry['data']}")
                 parts.append(f"tx=[{'; '.join(tx_items) if tx_items else '-'}]")
                 self.logger.debug(f"MENON I/O | {' | '.join(parts)}")
+
+                # Sleep with proper cancellation handling
+                await asyncio.sleep(interval_seconds)
+
             except asyncio.CancelledError:
+                # Properly handle cancellation
                 break
             except Exception:
                 # Never fail loop due to logging issues
                 pass
-            finally:
-                try:
-                    await asyncio.sleep(interval_seconds)
-                except Exception:
-                    await asyncio.sleep(1.0)
     
     async def _cleanup_stale_connections(self):
         """Periodically clean up any stale or closed connections"""

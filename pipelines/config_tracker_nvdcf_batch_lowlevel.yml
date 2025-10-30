@@ -5,18 +5,13 @@
 
 BaseConfig:
   minDetectorConfidence: 0.25    # Minimum confidence for detector bbox to be considered for tracking
-  enableBatchProcess: 1          # Enable batch processing for better performance
-  maxBatchSize: 4                # Maximum batch size for processing
-  enableSubBatchProcess: 1       # Enable sub-batch processing
-  subBatchTimeoutMs: 100         # Timeout for sub-batch processing
-
+  #enableBatchProcess: 1          # Enable batch processing for better performance
+  
 TargetManagement:
   enableBboxUnClipping: 1    # Unclip bbox if likely to be clipped by image border
   preserveStreamUpdateOrder: 1    # Preserve input streams' order for target IDs in batch mode
   maxTargetsPerStream: 100   # Increased max targets per stream for batch processing
-  maxTargetsPerBatch: 200    # Maximum targets across all streams in a batch
-  maxTargetsPerSubBatch: 50  # Maximum targets per sub-batch
-
+ 
   # Creation & Termination Policy
   minIouDiff4NewTarget: 0.7    # IOU threshold to discard new detections that overlap with existing targets
   minTrackerConfidence: 0.4    # Confidence threshold for shadow mode tracking
@@ -26,17 +21,12 @@ TargetManagement:
 
 TrajectoryManagement:
   useUniqueID: 0    # Use standard 32-bit tracker ID
-  enableBatchTrajectory: 1    # Enable batch trajectory management
-  batchTrajectoryUpdateInterval: 2    # Update trajectories every N frames in batch mode
 
 DataAssociator:
   dataAssociatorType: 0    # Default data associator
   associationMatcherType: 1    # Cascaded matching algorithm
   checkClassMatch: 1    # Only associate same-class objects
-  enableBatchAssociation: 1    # Enable batch-based data association
-  batchAssociationThreshold: 0.3    # Threshold for batch association matching
-  subBatchAssociationThreshold: 0.4    # Threshold for sub-batch association matching
-
+  
   # Association Metric: Thresholds
   minMatchingScore4Overall: 0.4    # Min total score
   minMatchingScore4SizeSimilarity: 0.3    # Min bbox size similarity score
@@ -54,7 +44,7 @@ DataAssociator:
 
 StateEstimator:
   stateEstimatorType: 1    # Simple state estimator
-  enableBatchStateEstimation: 1    # Enable batch state estimation
+  #enableBatchStateEstimation: 1    # Enable batch state estimation
 
   # Dynamics Modeling
   processNoiseVar4Loc: 2.0    # Process noise variance for bbox center
@@ -65,7 +55,6 @@ StateEstimator:
 
 VisualTracker:
   visualTrackerType: 1    # NvDCF visual tracker
-  enableBatchVisualTracking: 1    # Enable batch visual tracking
 
   # NvDCF: Feature Extraction
   useColorNames: 1    # Use ColorNames feature
@@ -78,10 +67,6 @@ VisualTracker:
   filterChannelWeightsLr: 0.1    # Learning rate for channel weights
   gaussianSigma: 0.75    # Gaussian standard deviation for desired response
 
-  # Batch Processing Optimizations
-  enableBatchFeatureExtraction: 1    # Enable batch feature extraction
-  batchFeatureUpdateInterval: 3    # Update features every N frames in batch mode
-  subBatchFeatureUpdateInterval: 2    # Update features every N frames in sub-batch mode
 
 # Sub-batch specific configurations
 SubBatchConfig:

@@ -171,12 +171,27 @@ class DS8Adapter:
                 self._configure_rtspsrc_children(src_el)
         except Exception:
             pass
+        # Give the pipeline a moment to transition and then query with a real timeout
         time.sleep(1.5)
         try:
-            change_return, state, pending = self.pipeline.get_state(0)
+            # Wait up to 5 seconds for the state change to complete
+            change_return, state, pending = self.pipeline.get_state(5 * Gst.SECOND)
             self.logger.info(f"Pipeline state after PLAYING: {state.value_name}, pending: {pending.value_name}")
             if state != Gst.State.PLAYING:
-                self.logger.error("Pipeline failed to reach PLAYING")
+                # Many live/RTSP pipelines report ASYNC/NO_PREROLL and take longer to settle.
+                # Treat this as a transitional condition instead of an error if we're headed to PLAYING.
+                try:
+                    pending_name = pending.value_name  # may raise if pending is None
+                except Exception:
+                    pending_name = str(pending)
+                if pending == Gst.State.PLAYING or change_return in (
+                    Gst.StateChangeReturn.ASYNC,
+                    Gst.StateChangeReturn.NO_PREROLL,
+                ):
+                    self.logger.warning("Pipeline still transitioning to PLAYING (state=%s, pending=%s)", state.value_name, pending_name)
+                else:
+                    self._errors.append("Pipeline did not reach PLAYING")
+                    self.logger.error("Pipeline failed to reach PLAYING")
         except Exception as e:
             self.logger.error("Pipeline state query failed: %s", e)
 
@@ -473,8 +488,8 @@ class DS8Adapter:
             try:
                 preproc.set_property("config-file", os.path.abspath(preproc_cfg))
                 self.logger.info(f"nvdspreprocess enabled with config {preproc_cfg}")
-                preproc_caps = self._make("capsfilter", "preproc_caps")
-                preproc_caps.set_property("caps", Gst.Caps.from_string("video/x-raw(memory:NVMM), format=RGBA, width=640, height=640"))
+                # Do not force video caps after preprocess; nvdspreprocess outputs tensors via meta.
+                # Keep video buffers heterogeneous per nvstreammux2 semantics.
             except Exception as e:
                 self.logger.error(f"nvdspreprocess setup failed: {e}; falling back to nvinfer scaling")
                 preproc = None
@@ -691,8 +706,6 @@ class DS8Adapter:
         base_elements = [tee, q_to_demux, q_to_mosaic, demux]
         if preproc:
             base_elements.append(preproc)
-        if preproc_caps:
-            base_elements.append(preproc_caps)
         base_elements.extend([pgie, tracker, analytics, mosaic_q, tiler, mosaic_conv_pre, mosaic_caps_rgba, mosaic_osd, mosaic_conv_post, mosaic_caps, mosaic_enc, mosaic_sink])
         for el in base_elements:
             if el is not None:
@@ -744,8 +757,8 @@ class DS8Adapter:
                 self.logger.info("linked pre_tee → pre_to_mosaic_q → nvinfer")
 
         # Link mosaic chain after analytics
-        if preproc and preproc_caps:
-            chain = [preproc, preproc_caps, pgie, tracker, analytics, mosaic_q, tiler, mosaic_conv_pre, mosaic_caps_rgba, mosaic_osd, mosaic_conv_post, mosaic_caps, mosaic_enc, mosaic_sink]
+        if preproc:
+            chain = [preproc, pgie, tracker, analytics, mosaic_q, tiler, mosaic_conv_pre, mosaic_caps_rgba, mosaic_osd, mosaic_conv_post, mosaic_caps, mosaic_enc, mosaic_sink]
         else:
             chain = [pgie, tracker, analytics, mosaic_q, tiler, mosaic_conv_pre, mosaic_caps_rgba, mosaic_osd, mosaic_conv_post, mosaic_caps, mosaic_enc, mosaic_sink]
         for a, b in zip(chain, chain[1:]):
@@ -756,8 +769,8 @@ class DS8Adapter:
             else:
                 if a is analytics and b is mosaic_q:
                     self.logger.info("linked nvdsanalytics_post → mosaic_q")
-                if a is preproc_caps and b is pgie:
-                    self.logger.info("Linked preproc → caps → nvinfer")
+                if preproc and a is preproc and b is pgie:
+                    self.logger.info("Linked nvdspreprocess → nvinfer (tensor meta)")
 
         # Per-stream MDE branches from demux using requested pads src_i
         for idx in sorted(self.source_info.keys()):

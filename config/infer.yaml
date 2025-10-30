@@ -6,11 +6,11 @@ version: 1  # Schema revision for the in-house inference builder loader.
 
 batch_size: 3  # Process one camera feed per inference batch.
 
-streammux:
-  width: 1920
-  height: 1080
-  live-source: 1
-  gpu-id: 0
+#streammux:
+#  width: 1920
+#  height: 1080
+#  live-source: 1
+#  gpu-id: 0
 
 #sources:
   # - element: nvurisrcbin

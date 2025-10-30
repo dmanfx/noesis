@@ -1,4 +1,4 @@
-# 05. Performance Tuning & Optimization (dGPU)
+# 05. Performance Tuning & Optimization (DS8)
 
 This document covers key strategies and configurations for optimizing the performance of DeepStream applications on a dGPU setup.
 
@@ -47,6 +47,12 @@ The primary goal is to maximize **throughput** (the number of frames or streams 
     *   If you need to access frame data on the CPU (e.g., in a probe function), do so sparingly. Accessing the metadata is cheap; accessing the pixel data itself can cause a performance-killing `cudaMemcpy` operation. The `pyds.get_nvds_buf_surface()` function is an example of an operation that can trigger this if not used carefully.
 
 ### 5. Input Resolution and Framerate
+
+### 6. DS8-specific tools and notes
+
+- New `nvstreammux` variant has expanded tuning options; see 12_NvStreamMux_New_Guide.md.
+- DeepStream PipeTuner can help search parameter spaces for optimal throughput/latency on supported pipelines.
+- When using Triton (`nvinferserver`), revisit batch sizes and dynamic batching in Triton configs to match `nvstreammux`.
 
 *   **Impact:** High.
 *   **Concept:** The size and rate of the input data directly impact the workload.

@@ -941,7 +941,7 @@ class DeepStreamVideoPipeline:
                 elements['nvtracker'].set_property("ll-config-file", ds8_tracker_cfg)
                 self.logger.info("Using DS8 tracker config: %s", ds8_tracker_cfg)
             else:
-                tracker_config_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "pipelines/config_tracker_nvdcf_batch.yml")
+                tracker_config_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config/nvtracker.yaml")
                 elements['nvtracker'].set_property("ll-config-file", tracker_config_path)
 
             # Post-tracker analytics

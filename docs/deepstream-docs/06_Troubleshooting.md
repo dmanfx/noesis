@@ -1,4 +1,4 @@
-# 06. Troubleshooting & FAQ (dGPU)
+# 06. Troubleshooting & FAQ (DS8)
 
 This document provides a list of common issues, questions, and troubleshooting steps for developing DeepStream applications on a dGPU with Ubuntu.
 
@@ -64,3 +64,12 @@ This document provides a list of common issues, questions, and troubleshooting s
 2.  **Check `nvstreammux` properties:** If `num-surfaces-per-frame` is set, ensure it's not excessively high.
 3.  **Check Number of Streams:** Processing many high-resolution streams simultaneously requires a large amount of memory for the decoded buffers in the `nvstreammux`.
 4.  **Use `nvidia-smi`:** Monitor the "Memory-Usage" column of the `nvidia-smi` output while your application is running to see exactly how much VRAM is being used. 
+
+---
+
+### DS8 notes
+
+- Switching between legacy/new `nvstreammux`? Clear GStreamer registry cache (`~/.cache/gstreamer-1.0/registry.*.bin`) and re-run `gst-inspect`.
+- Missing parsers/decoders in containers? Install `gstreamer1.0-libav` and `gstreamer1.0-plugins-good`.
+- OpenCV features disabled? Some DS8 sample plugins need `WITH_OPENCV=1` at build time to enable OpenCV.
+- Triton slower than expected? Compare with native `nvinfer` and adjust batch sizes; consider disabling dynamic batching if it hurts latency for small batches.

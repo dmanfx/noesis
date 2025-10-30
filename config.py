@@ -113,7 +113,7 @@ class AppConfig:
         DEEPSTREAM_MUX_SCALE_MODE: int = 2  # 0=stretch, 1=crop, 2=letter-box
         DEEPSTREAM_PREPROCESS_CONFIG: str = "pipelines/config_preproc.ini"  # Path to preprocessing config file
         DEEPSTREAM_INFER_CONFIG: str = "pipelines/config_infer_primary_yolo11.ini"  # Primary nvinfer INI
-        DEEPSTREAM_TRACKER_CONFIG: str = "pipelines/config_tracker_nvdcf_batch.yml"  # Path to tracker config file
+        DEEPSTREAM_TRACKER_CONFIG: str = "pipelines/config_tracker_nvdcf_batch.yml"  # DS8 NvDCF tracker wrapper config
         DEEPSTREAM_TRACKER_LIB: str = "/opt/nvidia/deepstream/deepstream/lib/libnvds_nvmultiobjecttracker.so"  # DeepStream tracker library
         DEEPSTREAM_ENABLE_OSD: bool = True  # Enable on-screen display for visualization
         # DeepStream multi-URI source config (required for DS8Adapter)

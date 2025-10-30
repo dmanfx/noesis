@@ -38,6 +38,8 @@ gi.require_version("Gst", "1.0")
 gi.require_version("GstRtsp", "1.0")
 from gi.repository import Gst, GLib, GstApp, GstRtsp  # type: ignore
 
+import yaml
+
 
 
 class DS8Adapter:
@@ -124,6 +126,15 @@ class DS8Adapter:
             self.logger.exception("Failed to build DS8 pipeline: %s", e)
             return False
 
+        # Apply RTSP tuning before moving the pipeline out of NULL to ensure
+        # protocol and latency choices take effect during negotiation.
+        try:
+            src_el = self._elements.get("src")
+            if src_el is not None:
+                self._configure_rtspsrc_children(src_el)
+        except Exception as err:
+            self.logger.debug("RTSP child tuning skipped prior to PLAYING: %s", err)
+
         if not self.pipeline:
             self._errors.append("Pipeline not created")
             return False
@@ -164,13 +175,6 @@ class DS8Adapter:
         self.running = True
         self._activated = True
         self.logger.info("DS8Adapter pipeline PLAYING with %d sources", len(self.source_info))
-        # After entering PLAYING, tune RTSP child properties safely
-        try:
-            src_el = self._elements.get("src")
-            if src_el is not None:
-                self._configure_rtspsrc_children(src_el)
-        except Exception:
-            pass
         return True
 
     def stop(self) -> None:
@@ -329,6 +333,11 @@ class DS8Adapter:
         if not Gst or not isinstance(multi_bin, Gst.Bin):
             return
         try:
+            if multi_bin.find_property("drop-audio"):
+                multi_bin.set_property("drop-audio", True)
+        except Exception as exc:
+            self.logger.debug("nvmultiurisrcbin drop-audio property failed: %s", exc)
+        try:
             iterator = multi_bin.iterate_recurse()
         except Exception:
             return
@@ -344,6 +353,7 @@ class DS8Adapter:
         # Use latency from config file if provided, but clamp to a sane max
         cfg_latency = int(self._ds_src_settings.get("latency", 0) or 0)
         desired_latency = int(min(cfg_latency if cfg_latency > 0 else 100, 500))
+        tuned_count = 0
         try:
             while True:
                 res, element = iterator.next()
@@ -368,10 +378,26 @@ class DS8Adapter:
                             except Exception:
                                 pass
                             try:
+                                if element.find_property("tcp-timeout"):
+                                    element.set_property("tcp-timeout", max(desired_latency, 100))
+                            except Exception:
+                                pass
+                            try:
                                 if element.find_property("drop-on-latency"):
                                     element.set_property("drop-on-latency", False)
                             except Exception:
                                 pass
+                            try:
+                                if element.find_property("ntp-sync"):
+                                    element.set_property("ntp-sync", True)
+                            except Exception:
+                                pass
+                            try:
+                                if element.find_property("player-idle-timeout"):
+                                    element.set_property("player-idle-timeout", 0)
+                            except Exception:
+                                pass
+                            tuned_count += 1
                             applied = True
                             continue
                         if factory_name in {"nvurisrcbin", "dsnvurisrcbin"} or "dsnvurisrcbin" in name:
@@ -402,6 +428,8 @@ class DS8Adapter:
                 iterator.free()
             except Exception:
                 pass
+        if tuned_count:
+            self.logger.info("Applied RTSP tuning to %d rtspsrc element(s)", tuned_count)
         if applied:
             self.logger.info("Applied RTSP tuning to nvmultiurisrcbin children")
 
@@ -552,21 +580,39 @@ class DS8Adapter:
             self.logger.info("nvinfer ready with tensor-meta=1")
 
         # Tracker configuration (NvDCF) with forced absolute paths
-        ll_cfg_raw = getattr(self.config.processing, "DEEPSTREAM_TRACKER_CONFIG", "")
-        ll_lib_raw = getattr(self.config.processing, "DEEPSTREAM_TRACKER_LIB", "")
-        ll_cfg = os.path.abspath(ll_cfg_raw) if ll_cfg_raw else ""
-        ll_lib = os.path.abspath(ll_lib_raw) if ll_lib_raw else ""
+        tracker_cfg_raw = getattr(self.config.processing, "DEEPSTREAM_TRACKER_CONFIG", "")
+        tracker_cfg_path = os.path.abspath(tracker_cfg_raw) if tracker_cfg_raw else ""
+        tracker_lib_raw = getattr(self.config.processing, "DEEPSTREAM_TRACKER_LIB", "")
+        tracker_lib_path = os.path.abspath(tracker_lib_raw) if tracker_lib_raw else ""
         try:
-            if ll_cfg:
-                tracker.set_property("ll-config-file", ll_cfg)
-                self.logger.info(f"nvtracker ll-config-file set to {ll_cfg}")
-            if ll_lib:
-                tracker.set_property("ll-lib-file", ll_lib)
-                self.logger.info(f"nvtracker ll-lib-file set to {ll_lib}")
-            tracker.set_property("enable-batch-process", 1)
-            tracker.set_property("enable-past-frame", 1)
+            if tracker_cfg_path and os.path.exists(tracker_cfg_path):
+                tracker_dir = os.path.dirname(tracker_cfg_path) or os.getcwd()
+                tracker_doc: Dict[str, Any] = {}
+                try:
+                    with open(tracker_cfg_path, "r", encoding="utf-8") as fh:
+                        tracker_doc = yaml.safe_load(fh) or {}
+                except Exception as err:
+                    self.logger.debug("Failed to parse tracker YAML %s: %s", tracker_cfg_path, err)
+                    tracker_doc = {}
+
+                tracker_section = tracker_doc.get("tracker") if isinstance(tracker_doc, dict) else None
+                if isinstance(tracker_section, dict) and tracker_section:
+                    for key, value in tracker_section.items():
+                        if isinstance(value, str) and key.endswith("config-file") and not os.path.isabs(value):
+                            value = os.path.abspath(os.path.join(tracker_dir, value))
+                        tracker.set_property(key, value)
+                        self.logger.debug("nvtracker property %s set", key)
+                else:
+                    tracker.set_property("ll-config-file", tracker_cfg_path)
+                    self.logger.info("nvtracker ll-config-file set to %s", tracker_cfg_path)
+            elif tracker_cfg_path:
+                self.logger.warning("nvtracker config path %s not found", tracker_cfg_path)
+
+            if tracker_lib_path:
+                tracker.set_property("ll-lib-file", tracker_lib_path)
+                self.logger.info("nvtracker ll-lib-file set to %s", tracker_lib_path)
         except Exception as e:
-            self.logger.error(f"nvtracker config load failed: {e}; using defaults (degraded mode)")
+            self.logger.error("nvtracker config setup failed: %s; using defaults (degraded mode)", e)
 
         # Tiler and encoder caps/props
         try:

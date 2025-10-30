@@ -1,70 +1,66 @@
-################################################################################
-# Noesis DeepStream 8 NvDCF tracker configuration
-# ------------------------------------------------------------------------------
-# This file ports the existing DS7 NvDCF tracker settings to the DS8 YAML
-# schema.  The intent is to preserve IOU/KLT behaviour, maintain the original
-# tuning for ID stability, and guarantee that tracker metadata survives the tee
-# fan-out in the DS8 pipeline.
-################################################################################
+# Noesis DeepStream 8 NvDCF tracker configuration (DS8 canonical schema)
 
-tracker:
-  tracker-width: 640            # Match PGIE resolution to avoid ROI scaling.
-  tracker-height: 640
-  gpu-id: 0
-  enable-past-frame: 1          # Preserve past-frame meta so tee branches share IDs.
-  display-tracking-id: 0
-  tracking-id-reset-mode: 0     # Never reset IDs unless stream restarts.
-  ll-lib-file: /opt/nvidia/deepstream/deepstream/lib/libnvds_nvmultiobjecttracker.so
-  ll-config-file: nvtracker_lowlevel.yaml  # Resolved relative to this file.
+%YAML:1.0
 
-batch_config:
-  #enable_batch_processing: 1
-  max_batch_size: 4
-  sub_batch_size: 1
-  batch_timeout_ms: 100
-  enable_sub_batch_processing: 1
+BaseConfig:
+  minDetectorConfidence: 0.0
 
-NvDCF:
-  useColorNames: 1
-  useHog: 0
-  useHist: 1
-  maxMatchingFrameGap: 40
-  maxTrackingFrameGap: 90
-  stateEstimatorType: 1
-  visualTrackerType: 1
+TargetManagement:
+  enableBboxUnClipping: 1
+  preserveStreamUpdateOrder: 0
+  maxTargetsPerStream: 150
+  minIouDiff4NewTarget: 0.55
+  minTrackerConfidence: 0.4
+  probationAge: 2
+  maxShadowTrackingAge: 180
+  earlyTerminationAge: 1
+
+TrajectoryManagement:
+  useUniqueID: 0
+
+DataAssociator:
   dataAssociatorType: 0
   associationMatcherType: 0
-  matchingThresholdLocal: 0.55
-  matchingThresholdGlobal: 0.2
+  checkClassMatch: 1
+  minMatchingScore4Overall: 0.4
+  minMatchingScore4SizeSimilarity: 0.35
+  minMatchingScore4Iou: 0.2
+  minMatchingScore4VisualSimilarity: 0.5
+  matchingScoreWeight4VisualSimilarity: 0.33
+  matchingScoreWeight4SizeSimilarity: 0.42
+  matchingScoreWeight4Iou: 0.35
+  tentativeDetectorConfidence: 0.2
+  minMatchingScore4TentativeIou: 0.5
+
+StateEstimator:
+  stateEstimatorType: 1
   processNoiseVar4Loc: 2.0
   processNoiseVar4Size: 1.0
   processNoiseVar4Vel: 0.1
   measurementNoiseVar4Detector: 4.0
   measurementNoiseVar4Tracker: 16.0
+
+VisualTracker:
+  visualTrackerType: 1
+  useColorNames: 1
+  useHog: 0
+  useHist: 1
   featureImgSizeLevel: 3
   featureFocusOffsetFactor_y: -0.1
   featureFocusOffsetFactor_x: 0.0
-  templateUpdateInterval: 12
-  searchRegionPaddingScale: 5.0
   filterLr: 0.075
   filterChannelWeightsLr: 0.015
   gaussianSigma: 0.75
+
+AppearanceModel:
   useReidFeature: 1
   reidFeatureSize: 128
   reidHistorySize: 400
-  minTrackerConfidence: 0.4
-  minTargetBboxSize: 10
-  minDetectorConfidence: 0.0
-  targetVisibilityThreshold: 0.3
-  maxShadowTrackingAge: 180
-  trackExponentialSmoothingLr_loc: 0.5
-  trackExponentialSmoothingLr_scale: 0.3
-  trackExponentialSmoothingLr_velocity: 0.05
-  locUncertaintyThreshold: 50.0
 
-sub_batches:
-  0:
-    ll-config-file: nvtracker_lowlevel.yaml
-    enable_batch_processing: 1
-    max_targets_per_sub_batch: 50
-    sub_batch_timeout_ms: 50
+ShadowTracker:
+  targetVisibilityThreshold: 0.3
+  minDetectorConfidence: 0.0
+  minTargetBboxSize: 10
+
+Misc:
+  locUncertaintyThreshold: 50.0

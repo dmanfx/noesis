@@ -1,4 +1,4 @@
-# 04. Using Custom Models with DeepStream
+# 04. Using Custom Models with DeepStream (DS8)
 
 This document outlines the process and best practices for integrating custom-trained AI models into a DeepStream pipeline. The core plugin for this is `nvinfer`.
 
@@ -12,6 +12,8 @@ DeepStream does not directly use models in their native format (like TensorFlow 
 *   **Kernel Auto-Tuning:** Selecting the most efficient CUDA kernels for the target dGPU.
 
 The result of this process is a `.engine` file, which is a self-contained, optimized version of your model ready for deployment.
+
+Important for DS8: Engines must be built with TensorRT 10.x for this release. Rebuild from ONNX if you are migrating from earlier DeepStream/TensorRT versions.
 
 ## The Workflow for Custom Models
 

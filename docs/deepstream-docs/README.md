@@ -1,34 +1,32 @@
-# NVIDIA DeepStream SDK - Distilled Documentation
+# NVIDIA DeepStream SDK 8 – Project Docs
 
-Welcome to the project-specific, distilled documentation for the NVIDIA DeepStream SDK. This collection of documents is designed to be the primary source of truth for any development work involving DeepStream within this project.
+This folder provides a self-contained, distilled reference for NVIDIA DeepStream SDK 8. Content is paraphrased and tailored for fast, offline lookup by engineers and agents working in this repo. It focuses on x86/dGPU and adds Jetson notes where behavior diverges.
 
-The information contained here has been carefully extracted and summarized from the official NVIDIA DeepStream documentation, with a specific focus on our use case: a dGPU-based deployment on Ubuntu. Irrelevant information (e.g., for Jetson or WSL platforms) has been omitted to provide a clear and focused learning path.
+Start with 01_Core_Concepts.md for a quick mental model. Use the plugin and cheat sheets for implementation details and the migration and Docker pages when moving between environments or versions.
+
+## DeepStream 8 Highlights
+
+- Supports latest NVIDIA platforms including Blackwell dGPUs and Jetson Thor.
+- Ships Docker images for x86/ARM and Jetson; development inside x86 containers is supported.
+- Integrates Triton Inference Server; use `nvinferserver` or NvDsTritonExt for model serving.
+- New/updated plugins and flows: `nvmultiurisrcbin`, `nvstreammux` (new), REST control for select plugins.
+- TensorRT 10.x required; engines from older DS may need rebuild and recalibration.
 
 ## Table of Contents
 
-This documentation is organized into several key areas. It is recommended to start with the `01_Core_Concepts.md` to get a foundational understanding of DeepStream.
+1.  Core Concepts & Architecture – `01_Core_Concepts.md`
+2.  GStreamer Plugins (updated for DS8) – `02_GStreamer_Plugins.md`
+3.  Sample Applications – `03_Sample_Applications.md`
+4.  Using Custom Models – `04_Custom_Models.md`
+5.  Performance & Tuning – `05_Performance.md`
+6.  Troubleshooting & FAQ – `06_Troubleshooting.md`
+7.  3D DeepStream Overview – `07_3D_DeepStream.md`
+8.  Migration to DeepStream 8 – `08_Migration_to_DS8.md`
+9.  Docker & Installation – `09_Docker_and_Installation.md`
+10. Triton Integration – `10_Triton_Integration.md`
+11. nvmultiurisrcbin Cheat Sheet – `11_NvMultiUriSrcBin_CheatSheet.md`
+12. nvstreammux (New) Guide – `12_NvStreamMux_New_Guide.md`
+13. REST API Server – `13_REST_API_Server.md`
+14. Known Issues & Limitations – `14_Known_Issues_DS8.md`
 
-1.  [**Core Concepts & Architecture**](./01_Core_Concepts.md)
-    *   Understanding the DeepStream pipeline.
-    *   High-level architecture.
-    *   Application development workflow.
-
-2.  [**GStreamer Plugins**](./02_GStreamer_Plugins.md)
-    *   A comprehensive guide to the GStreamer plugins relevant to our dGPU setup.
-    *   Details on what each plugin does, its key properties, and its outputs.
-
-3.  [**Sample Applications Guide**](./03_Sample_Applications.md)
-    *   A curated list of C/C++ and Python sample applications.
-    *   Summaries of what each sample demonstrates to quickly find relevant examples.
-
-4.  [**Using Custom Models**](./04_Custom_Models.md)
-    *   Instructions and best practices for integrating custom AI models into DeepStream pipelines.
-
-5.  [**Performance Tuning & Optimization**](./05_Performance.md)
-    *   Techniques and configurations for optimizing pipeline performance on dGPU.
-
-6.  [**Troubleshooting & FAQ**](./06_Troubleshooting.md)
-    *   A collection of common issues, solutions, and frequently asked questions for dGPU on Ubuntu.
-
-7.  [**3D DeepStream**](./07_3D_DeepStream.md)
-    *   Documentation on the 3D capabilities of DeepStream that may be relevant for future use cases. 
+These docs summarize NVIDIA’s official DeepStream 8 developer guide and release notes. For full details, consult NVIDIA’s site.

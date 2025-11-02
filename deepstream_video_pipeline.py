@@ -47,7 +47,6 @@ import pyds  # type: ignore  # noqa: E402
 from websocket_server import WebSocketServer  # noqa: E402
 
 from utils import RateLimitedLogger  # noqa: E402
-import requests  # For REST API calls to nvmultiurisrcbin
 
 # Defer GStreamer initialization to runtime to avoid crashing at import time
 # Some environments (or tracer/proxy setups) can abort during init; doing this
@@ -152,6 +151,30 @@ class DeepStreamVideoPipeline:
         self.device_id = 0
         # Default REST API port for nvmultiurisrcbin
         self.multiurisrc_port = 9000
+        # Flag indicating we detected an existing REST server on the desired port
+        self._multiurisrc_rest_already_running = False
+
+        # Safety check: if port is already in use, don't start another REST server
+        try:
+            import socket
+
+            def _port_in_use(host: str, port: int, timeout: float = 0.25) -> bool:
+                try:
+                    with socket.create_connection((host, int(port)), timeout=timeout):
+                        return True
+                except Exception:
+                    return False
+
+            if _port_in_use("localhost", self.multiurisrc_port):
+                # Keep using 9000 for REST calls, but disable creating a new server instance
+                self._multiurisrc_rest_already_running = True
+                self.logger.info(
+                    f"🔒 Port {self.multiurisrc_port} already in use; assuming nvmultiurisrcbin REST is active. "
+                    "Will disable starting another REST server for this pipeline instance."
+                )
+        except Exception:
+            # Non-fatal: if detection fails, proceed as usual
+            pass
         
         self.logger.info(f"📊 Pipeline config: batch_size={self.batch_size}, resolution={self.max_width}x{self.max_height}")
         
@@ -850,7 +873,18 @@ class DeepStreamVideoPipeline:
             elements['multiurisrc'].set_property("live-source", 1)
             elements['multiurisrc'].set_property("drop-pipeline-eos", 1)
             elements['multiurisrc'].set_property("rtsp-reconnect-interval", 30)
-            elements['multiurisrc'].set_property("port", self.multiurisrc_port)
+            # Respect previously detected port-in-use condition. Passing 0 disables REST server per plugin docs.
+            try:
+                if getattr(self, "_multiurisrc_rest_already_running", False):
+                    elements['multiurisrc'].set_property("port", 0)
+                    self.logger.info(
+                        f"ℹ️ Skipping nvmultiurisrcbin REST server start (port {self.multiurisrc_port} already in use)."
+                    )
+                else:
+                    elements['multiurisrc'].set_property("port", self.multiurisrc_port)
+            except Exception as e:
+                # If setting port fails for any reason, log and continue (pipeline may still run)
+                self.logger.warning(f"⚠️ Unable to set nvmultiurisrcbin REST port: {e}")
             elements['multiurisrc'].set_property("ip-address", "localhost")
             self.logger.info(f"📊 nvmultiurisrcbin configured: max-batch-size={self.batch_size}, resolution={self.max_width}x{self.max_height}")
 
@@ -2628,98 +2662,7 @@ class DeepStreamVideoPipeline:
             self.logger.error(f"❌ Failed to update target classes: {e}")
             return False
 
-    # ------------------------------------------------------------------
-    # Dynamic sensor management via nvmultiurisrcbin REST API
-    # ------------------------------------------------------------------
-    def add_sensor(self, sensor_id: int, uri: str) -> bool:
-        """Add a new sensor stream at runtime."""
-        try:
-            url = f"http://localhost:{self.multiurisrc_port}/stream"
-            payload = {"change": "add", "sensorId": str(sensor_id), "uri": uri}
-            resp = requests.post(url, json=payload, timeout=2)
-            if resp.status_code == 200:
-                self.logger.info(f"✅ Added sensor {sensor_id}: {uri}")
-                # Update internal state
-                if sensor_id not in self.sensor_ids:
-                    self.sensor_ids.append(sensor_id)
-                # Default metadata if unknown
-                self.source_info[sensor_id] = {
-                    'name': f'Camera_{sensor_id}',
-                    'clean_name': f'camera-{sensor_id}',
-                    'url': uri,
-                    'width': self.max_width,
-                    'height': self.max_height,
-                }
-                # Ensure queue and tracking state exist
-                if sensor_id not in self.jpeg_queues:
-                    self.jpeg_queues[sensor_id] = queue.Queue(maxsize=30)
-                if sensor_id not in self.live_tracking_state:
-                    self.live_tracking_state[sensor_id] = {
-                        'active_tracks': [], 'occupancy': {}, 'transitions': []
-                    }
-                # Request pad for new index and calibrate via one-shot probe
-                new_index = self.source_idx_by_sensor_id.get(sensor_id)
-                if new_index is not None:
-                    pad = self._get_or_request_demux_pad(new_index)
-                    if pad:
-                        # Attach a one-shot probe by reusing calibration method
-                        self._calibrate_demux_pad_source_map()
-                # Build stream branch (will use calibrated pad when ready)
-                ok = self._add_jpeg_branch_for_sensor(sensor_id)
-                if not ok:
-                    self.logger.error(f"❌ Failed to create JPEG branch for sensor {sensor_id}")
-                    return False
-                return True
-            else:
-                self.logger.error(f"❌ Failed to add sensor {sensor_id}: {resp.status_code} {resp.text}")
-                return False
-        except Exception as e:
-            self.logger.error(f"❌ Exception while adding sensor: {e}")
-            return False
-
-    def remove_sensor(self, sensor_id: int) -> bool:
-        """Remove an existing sensor stream at runtime."""
-        try:
-            url = f"http://localhost:{self.multiurisrc_port}/stream"
-            payload = {"change": "remove", "sensorId": str(sensor_id), "uri": ""}
-            resp = requests.post(url, json=payload, timeout=2)
-            if resp.status_code == 200:
-                self.logger.info(f"✅ Removed sensor {sensor_id}")
-                # Tear down request pad and branch
-                self._remove_jpeg_branch_for_sensor(sensor_id)
-                # Clean queues and tracking
-                self.jpeg_queues.pop(sensor_id, None)
-                self.live_tracking_state.pop(sensor_id, None)
-                self.source_info.pop(sensor_id, None)
-                if sensor_id in self.sensor_ids:
-                    try:
-                        self.sensor_ids.remove(sensor_id)
-                    except ValueError:
-                        pass
-                # Update demux mapping tables
-                pad_to_remove = self.source_id_to_demux_pad.pop(sensor_id, None)
-                if pad_to_remove:
-                    self.demux_pad_to_source_id.pop(pad_to_remove, None)
-                # Release demux pad for this sensor if tracked
-                pad_obj = self._demux_requested_pads_by_sensor.pop(sensor_id, None)
-                if pad_obj is not None:
-                    # Remove from index map too
-                    try:
-                        idx = int(pad_obj.get_name().split('_')[1])
-                        self._demux_requested_pads_by_index.pop(idx, None)
-                    except Exception:
-                        pass
-                    try:
-                        self.demux.release_request_pad(pad_obj)
-                    except Exception:
-                        pass
-                return True
-            else:
-                self.logger.error(f"❌ Failed to remove sensor {sensor_id}: {resp.status_code} {resp.text}")
-                return False
-        except Exception as e:
-            self.logger.error(f"❌ Exception while removing sensor: {e}")
-            return False
+    # Dynamic add/remove stream API logic removed per project guidance.
 
     def toggle_trail_visualization(self, enabled: bool):
           self.set_trail_visualization(enabled)

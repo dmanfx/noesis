@@ -158,8 +158,8 @@ class WebSocketServer:
                 parts.append(f"tx=[{'; '.join(tx_items) if tx_items else '-'}]")
                 self.logger.debug(f"MENON I/O | {' | '.join(parts)}")
 
-                # Sleep with proper cancellation handling
-                await asyncio.sleep(interval_seconds)
+                # Sleep with proper cancellation handling (cap at 1 second for responsiveness)
+                await asyncio.sleep(min(interval_seconds, 1.0))
 
             except asyncio.CancelledError:
                 # Properly handle cancellation
@@ -257,11 +257,9 @@ class WebSocketServer:
                 elif not self.connected_clients:
                     self.logger.debug("No clients connected, skipping stats broadcast.")
 
-                # Wait for the next interval - use longer interval when no clients
-                if not self.connected_clients:
-                    await asyncio.sleep(5.0)  # 5 second interval when no clients
-                else:
-                    await asyncio.sleep(interval_seconds)  # Normal 1 second interval with clients
+                # Wait for the next interval - use shorter intervals to allow for cancellation
+                sleep_time = 5.0 if not self.connected_clients else interval_seconds
+                await asyncio.sleep(min(sleep_time, 1.0))  # Cap at 1 second for responsiveness
 
             except asyncio.CancelledError:
                 self.logger.info("Periodic stats broadcast task cancelled.")
@@ -335,22 +333,38 @@ class WebSocketServer:
         self.logger.info("Stopping WebSocket server...")
         self.running = False
 
+        # Immediately cancel all background tasks to prevent them from continuing
+        tasks_to_cancel = []
+
         # Cancel any pending binary flush task
         if self._binary_flush_task and not self._binary_flush_task.done():
-            try:
-                self._binary_flush_task.cancel()
-            except Exception:
-                pass
+            self._binary_flush_task.cancel()
+            tasks_to_cancel.append(self._binary_flush_task)
 
-        # Cancel the periodic stats task first
+        # Cancel the periodic stats task
         if self._stats_task and not self._stats_task.done():
+            self.logger.info("Cancelling periodic stats broadcast task...")
             self._stats_task.cancel()
+            tasks_to_cancel.append(self._stats_task)
+
+        # Cancel Menon telemetry task
+        if self._telemetry_task and not self._telemetry_task.done():
+            self.logger.info("Cancelling Menon telemetry task...")
+            self._telemetry_task.cancel()
+            tasks_to_cancel.append(self._telemetry_task)
+
+        # Cancel server task if it exists
+        if self.server_task and not self.server_task.done():
+            self.server_task.cancel()
+            tasks_to_cancel.append(self.server_task)
+
+        # Wait for all tasks to cancel
+        if tasks_to_cancel:
             try:
-                await self._stats_task # Wait for cancellation
-            except asyncio.CancelledError:
-                self.logger.info("Periodic stats broadcast task successfully cancelled.")
+                await asyncio.gather(*tasks_to_cancel, return_exceptions=True)
+                self.logger.info(f"Successfully cancelled {len(tasks_to_cancel)} background tasks")
             except Exception as e:
-                 self.logger.error(f"Error waiting for stats task cancellation: {e}")
+                self.logger.warning(f"Error waiting for task cancellation: {e}")
 
         # Close all client connections
         if self.connected_clients:
@@ -371,22 +385,6 @@ class WebSocketServer:
                 self.logger.info("WebSocket server stopped successfully")
             except Exception as e:
                 self.logger.error(f"Error stopping WebSocket server: {e}")
-
-        # Cancel Menon telemetry task
-        if self._telemetry_task and not self._telemetry_task.done():
-            self._telemetry_task.cancel()
-            try:
-                await self._telemetry_task
-            except asyncio.CancelledError:
-                pass
-
-        # Cancel server task if it exists
-        if self.server_task and not self.server_task.done():
-            self.server_task.cancel()
-            try:
-                await self.server_task
-            except asyncio.CancelledError:
-                pass
 
     def _force_close_server(self) -> bool:
         """Best-effort fallback to close listening sockets when the event loop is unavailable."""
@@ -415,7 +413,7 @@ class WebSocketServer:
         self.logger.info("WebSocket server sockets closed via fallback path")
         return True
 
-    def stop_sync(self, timeout: float = 5.0) -> bool:
+    def stop_sync(self, timeout: float = 2.0) -> bool:
         """Synchronous stop method for use from other threads"""
         self.logger.info("Stopping WebSocket server (sync mode)...")
         self.running = False
@@ -466,7 +464,10 @@ class WebSocketServer:
             return self._force_close_server()
         except Exception as exc:
             self.logger.error(f"Error waiting for WebSocket server stop: {exc}")
-            return self._force_close_server()
+            # Try force close on any exception
+            force_result = self._force_close_server()
+            self.logger.info(f"Force close attempted: {force_result}")
+            return force_result
 
     async def handle_client(self, websocket, path=None):
         """Handle incoming WebSocket connections and messages

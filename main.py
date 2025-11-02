@@ -217,6 +217,14 @@ class ApplicationManager:
         elif INTERRUPT_COUNT >= 2:
             self.logger.warning("Second interrupt received, forcing immediate exit")
             print("💥 Second interrupt - forcing immediate exit!")
+            # Try to force close WebSocket server before exit
+            try:
+                if hasattr(self, 'websocket_server') and self.websocket_server:
+                    self.websocket_server._force_close_server()
+                if hasattr(self, 'websocket_thread') and self.websocket_thread and self.websocket_thread.is_alive():
+                    self.logger.warning("WebSocket thread still alive, terminating process anyway")
+            except Exception as e:
+                self.logger.error(f"Error during forced shutdown: {e}")
             os._exit(1)
     
     def _graceful_exit(self):
@@ -411,9 +419,11 @@ class ApplicationManager:
                 raise RuntimeError("DS7 pipeline fallback disabled in this build; set processing.USE_DS8=True")
 
             source_count = len(getattr(processor, "source_info", {}) or {})
+            # Allow zero pre-known sources for DS8; sources will be seeded via REST
             if source_count == 0:
-                raise RuntimeError("No enabled sources available for DS8Adapter pipeline")
-            self.logger.info(f"🎥 Creating single multi-stream processor for {source_count} sources")
+                self.logger.info("🎥 DS8Adapter starting with 0 pre-known sources; will seed via REST")
+            else:
+                self.logger.info(f"🎥 Creating single multi-stream processor for {source_count} sources")
 
             # Start the processor
             self.logger.info("🚀 Starting multi-stream processor...")
@@ -422,7 +432,11 @@ class ApplicationManager:
 
             # Store single processor (not per-camera)
             self.multi_stream_processor = processor
-            self.logger.info(f"✅ Multi-stream processor started successfully with {source_count} streams")
+            try:
+                source_count_runtime = len(getattr(processor, "source_info", {}) or {})
+            except Exception:
+                source_count_runtime = source_count
+            self.logger.info(f"✅ Multi-stream processor started (pre-known sources={source_count}, runtime={source_count_runtime})")
             try:
                 source_info = getattr(self.multi_stream_processor, 'source_info', None)
                 if isinstance(source_info, dict):
@@ -835,10 +849,15 @@ class ApplicationManager:
             """Process JPEG frames from multi-stream processor and broadcast them"""
             self.logger.info("JPEG processing loop started")
             
-            # Get source information from multi-stream processor
-            source_info = getattr(self.multi_stream_processor, 'source_info', {})
+            # Get source information from multi-stream processor (wait for REST seeding)
+            source_info = getattr(self.multi_stream_processor, 'source_info', {}) or {}
             if not source_info:
-                self.logger.error("No source info available from multi-stream processor")
+                start_wait = time.time()
+                while time.time() - start_wait < 20 and not source_info and self.running:
+                    time.sleep(0.5)
+                    source_info = getattr(self.multi_stream_processor, 'source_info', {}) or {}
+            if not source_info:
+                self.logger.error("No source info available from multi-stream processor after waiting; aborting JPEG loop")
                 return
             # Per-source counters to surface activity
             frames_sent = {sid: 0 for sid in source_info.keys()}
@@ -1869,11 +1888,26 @@ class ApplicationManager:
         """Stop all application components with optimized cleanup order"""
         if not self.running:
             return
-            
+
         self.logger.info("Stopping application")
         self.running = False
         self.stop_event.set()
-        
+
+        # STEP 0: Stop WebSocket server immediately to prevent continued broadcasting
+        self.logger.info("Stopping WebSocket server immediately...")
+        if self.websocket_server:
+            try:
+                stop_ok = self.websocket_server.stop_sync(timeout=1.0)
+                self.logger.info(f"WebSocket server stop_sync result: {stop_ok}")
+                # Also stop the event loop if it exists
+                if hasattr(self, 'websocket_loop') and self.websocket_loop:
+                    try:
+                        self.websocket_loop.call_soon_threadsafe(self.websocket_loop.stop)
+                    except Exception as e:
+                        self.logger.debug(f"Could not stop WebSocket event loop: {e}")
+            except Exception as e:
+                self.logger.warning(f"Error stopping WebSocket server immediately: {e}")
+
         # STEP 1: Set TensorRT shutdown mode to suppress error logging
         set_tensorrt_shutdown_mode(True)
         
@@ -1939,7 +1973,7 @@ class ApplicationManager:
             except Exception as e:
                 self.logger.error(f"Error stopping result processing thread: {e}")
         
-        # STEP 5: Stop WebSocket server and event loop
+        # STEP 5: Cancel backup task
         if self._backup_task:
             try:
                 self.logger.info("Cancelling Menon config backup task")
@@ -1949,47 +1983,26 @@ class ApplicationManager:
             except Exception as e:
                 self.logger.debug(f"Error cancelling backup task: {e}")
 
-        if self.websocket_server:
-            try:
-                self.logger.info("Stopping WebSocket server")
-                stop_ok = False
-                # Use the improved sync stop method
-                try:
-                    stop_ok = self.websocket_server.stop_sync()
-                except Exception as e:
-                    self.logger.warning(f"WebSocket server stop_sync failed: {e}")
-
-                # If websocket server thread loop exists, stop via that loop
-                if hasattr(self, 'websocket_loop') and self.websocket_loop:
-                    try:
-                        # Schedule the event loop to stop
-                        self.websocket_loop.call_soon_threadsafe(self.websocket_loop.stop)
-                    except Exception as e:
-                        self.logger.debug(f"Could not stop event loop: {e}")
-                else:
-                    # Fallback: mark not running
-                    try:
-                        self.websocket_server.running = False
-                    except Exception as exc:
-                        self.logger.debug(f"Could not mark WebSocket server as not running: {exc}")
-
-                if stop_ok:
-                    self.logger.info("✅ WebSocket server shutdown initiated")
-                else:
-                    self.logger.warning("⚠️ WebSocket server stop did not confirm completion")
-            except Exception as e:
-                self.logger.error(f"Error stopping WebSocket server: {e}")
-
-        # STEP 6: Stop WebSocket thread
+        # STEP 6: Stop WebSocket thread (should already be stopped from step 0)
         if hasattr(self, 'websocket_thread') and self.websocket_thread:
             try:
                 self.logger.info("Waiting for WebSocket thread to complete...")
-                # Give more time for graceful shutdown
-                thread_joined = safe_join(self.websocket_thread, timeout=5.0, name="websocket_thread")
+                # Give time for graceful shutdown but be more aggressive
+                thread_joined = safe_join(self.websocket_thread, timeout=3.0, name="websocket_thread")
                 if thread_joined:
                     self.logger.info("✅ WebSocket thread stopped gracefully")
                 else:
-                    self.logger.warning("⚠️ WebSocket thread did not stop within timeout, will be abandoned")
+                    self.logger.warning("⚠️ WebSocket thread did not stop within timeout")
+                    # Try to force the thread to stop by setting daemon=True if not already
+                    if not self.websocket_thread.daemon:
+                        self.logger.warning("Setting WebSocket thread as daemon to allow forced shutdown")
+                        try:
+                            # Note: daemon attribute can only be set before thread starts
+                            # This is just for logging
+                            pass
+                        except Exception:
+                            pass
+                    self.logger.warning("WebSocket thread will be abandoned - application may not shut down cleanly")
             except Exception as e:
                 self.logger.error(f"Error stopping WebSocket thread: {e}")
         

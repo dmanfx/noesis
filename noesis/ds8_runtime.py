@@ -264,11 +264,45 @@ def _build_rest_app() -> "FastAPI":
 
 
 def _start_rest_server(app: "FastAPI", host: str, port: int) -> tuple[Optional["uvicorn.Server"], Optional[threading.Thread]]:
+    """Start the FastAPI REST server unless the port is already in use.
+
+    If something is already listening on the requested host/port, we assume a
+    REST instance is active and skip starting another one to avoid conflicts.
+    """
     try:
         import uvicorn
     except Exception:
         logging.getLogger(__name__).warning("uvicorn not available; REST server disabled")
         return None, None
+
+    # Safety check: skip starting another REST server if port is already in use
+    try:
+        import socket
+
+        def _can_connect(_host: str, _port: int, timeout: float = 0.25) -> bool:
+            try:
+                with socket.create_connection((_host, int(_port)), timeout=timeout):
+                    return True
+            except Exception:
+                return False
+
+        # Normalize host for connectivity test when binding to all interfaces
+        test_host = host
+        if not test_host or test_host == "0.0.0.0":
+            test_host = "127.0.0.1"
+        elif test_host == "::":
+            test_host = "::1"
+
+        if _can_connect(test_host, port):
+            logging.getLogger(__name__).info(
+                "REST port %s is already in use on %s; assuming server active and skipping start",
+                port,
+                test_host,
+            )
+            return None, None
+    except Exception:
+        # Non-fatal: if the check fails, proceed to start server
+        pass
 
     config = uvicorn.Config(app=app, host=host, port=port, log_level="info", access_log=False)
     server = uvicorn.Server(config=config)

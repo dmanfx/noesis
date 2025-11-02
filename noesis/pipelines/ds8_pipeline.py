@@ -160,18 +160,15 @@ def build_pipeline(yaml_path: str | Path) -> DS8Pipeline:
     # relative to the YAML file directory. This ensures DS plugins can locate
     # engine and config files regardless of the current working directory.
     base_dir = path.parent.resolve()
-    try:
-        models_cfg = cfg.get("models", {}) or {}
-        for key, m in list(models_cfg.items()):
-            if not isinstance(m, dict):
-                continue
-            eng = m.get("engine")
-            if isinstance(eng, str) and eng and not Path(eng).is_absolute():
-                abs_eng = (base_dir / eng).resolve()
-                m["engine"] = str(abs_eng)
-        cfg["models"] = models_cfg
-    except Exception:
-        errors = []  # dummy to satisfy linter in case of future refactors
+    models_cfg = cfg.get("models", {}) or {}
+    for key, m in list(models_cfg.items()):
+        if not isinstance(m, dict):
+            continue
+        eng = m.get("engine")
+        if isinstance(eng, str) and eng and not Path(eng).is_absolute():
+            abs_eng = (base_dir / eng).resolve()
+            m["engine"] = str(abs_eng)
+    cfg["models"] = models_cfg
 
     def _abs_or_same(p: Any) -> Any:
         if isinstance(p, str) and p:
@@ -468,10 +465,7 @@ def enable_depth(seconds: int = 20) -> Dict[str, Any]:
     end_at = now + max(0, int(seconds))
 
     if pipeline._timer is not None:
-        try:
-            pipeline._timer.cancel()
-        except Exception:  # pragma: no cover - defensive cleanup
-            pass
+        pipeline._timer.cancel()
 
     pipeline.mark_depth_enabled(True)
 

@@ -17,6 +17,7 @@ output/
 #ignore archived folders
 legacy/
 orchestration/
+noesis_template/
 
 #ignore dev docs
 docs/completed/

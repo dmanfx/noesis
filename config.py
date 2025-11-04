@@ -428,8 +428,8 @@ class AppConfig:
         HOST: str = "0.0.0.0"  # Listen on all network interfaces
         PORT: int = 6008
         MAX_CLIENTS: int = 10
-        JPEG_QUALITY: int = 85  # JPEG quality for frame compression (0-100)
-        MAX_FPS: int = 20  # Maximum FPS for WebSocket streaming
+        JPEG_QUALITY: int = 100  # JPEG quality for frame compression (0-100)
+        MAX_FPS: int = 30  # Maximum FPS for WebSocket streaming
         # Mosaic broadcast (DS7 compatibility shim): when True, per-camera WS frames are gated
         # and a single mosaic image is broadcast under MOSAIC_TARGET_CAMERA id.
         MOSAIC_BROADCAST: bool = True

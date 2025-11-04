@@ -11,10 +11,7 @@ export const StreamPanel: React.FC<{
   // Expand and Lock are controlled by parent
   isExpanded?: boolean;
   onToggleExpand?: (camera: CameraKey) => void;
-  showLock?: boolean;
-  locked?: boolean;
-  onToggleLock?: () => void;
-}> = ({ camera, title, blob, fpsText, fpsSeries = [], vacancyText, isExpanded = false, onToggleExpand, showLock = false, locked = false, onToggleLock }) => {
+}> = ({ camera, title, blob, fpsText, fpsSeries = [], vacancyText, isExpanded = false, onToggleExpand }) => {
   const [url, setUrl] = useState<string>('');
   const imgRef = useRef<HTMLImageElement>(null);
   const viewRef = useRef<HTMLDivElement>(null);
@@ -76,28 +73,6 @@ export const StreamPanel: React.FC<{
         ) : null}
         <div className="spacer" />
         <div className="stream-tools">
-          {showLock ? (
-            <button
-              className="btn ghost"
-              onClick={onToggleLock}
-              title={locked ? 'Unlock stream order' : 'Lock stream order'}
-              aria-pressed={locked}
-            >
-              <svg width="18" height="18" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
-                {locked ? (
-                  <>
-                    <path d="M7 10V7a5 5 0 0 1 10 0v3" stroke="#cfe0ff" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"/>
-                    <rect x="5" y="10" width="14" height="10" rx="2" stroke="#cfe0ff" strokeWidth="2"/>
-                  </>
-                ) : (
-                  <>
-                    <path d="M7 10V7a5 5 0 0 1 9 0" stroke="#9db1c8" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"/>
-                    <rect x="5" y="10" width="14" height="10" rx="2" stroke="#9db1c8" strokeWidth="2"/>
-                  </>
-                )}
-              </svg>
-            </button>
-          ) : null}
           <button
             className="btn ghost"
             onClick={() => onToggleExpand?.(camera)}

@@ -87,17 +87,9 @@ function Dashboard() {
     'kitchen': 'unknown',
     'family-room': 'unknown'
   });
-  // Auto-primary selection state
-  const [primaryKey, setPrimaryKey] = useState<CameraKey>(cameraOrder[0]);
-  const [locked, setLocked] = useState<boolean>(false);
   const [expandedCamera, setExpandedCamera] = useState<CameraKey | null>(null);
-  const motionEmaRef = useRef<Record<CameraKey, number>>({ 'living-room': 0, 'kitchen': 0, 'family-room': 0 });
-  const lastSwitchRef = useRef<number>(0);
   const maDiagThrottleRef = useRef<Record<string, number>>({});
   const lastCalibrationSignatureRef = useRef<string>('');
-  const EMA_ALPHA = 0.3; // smoothing factor for motion
-  const SWITCH_RATIO = 1.25; // require challenger to be 25% higher
-  const SWITCH_COOLDOWN_MS = 10000; // 10s minimum between switches
 
   const onStats = (payload: StatsPayload) => {
     // System status/uptime
@@ -269,58 +261,6 @@ function Dashboard() {
     }
 
     publish({ group: 'Tracking', key: 'Active Tracks', value: allTracks.length, ts: now });
-
-    // --- Auto-promote primary based on motion heuristic ---
-    try {
-      if (locked) {
-        return; // do not switch when locked
-      }
-      const scores: Record<CameraKey, number> = { 'living-room': 0, 'kitchen': 0, 'family-room': 0 } as const as any;
-      (Object.keys(scores) as CameraKey[]).forEach((k) => {
-        const tracks = perKeyTracks[k] || [];
-        const n = tracks.length;
-        let avgSpeed = 0;
-        if (n > 0) {
-          let sum = 0;
-          for (const t of tracks) {
-            const v = t?.velocity || [0,0];
-            const s = Math.sqrt((v[0]||0)**2 + (v[1]||0)**2);
-            sum += s;
-          }
-          avgSpeed = sum / n;
-        }
-        // Weight: more tracks matters most, then speed (transitions removed)
-        scores[k] = n + 0.3 * avgSpeed;
-      });
-
-      // Update EMA
-      const ema = motionEmaRef.current;
-      (Object.keys(scores) as CameraKey[]).forEach((k) => {
-        ema[k] = EMA_ALPHA * scores[k] + (1 - EMA_ALPHA) * (ema[k] || 0);
-      });
-
-      // Find challenger
-      const keys: CameraKey[] = ['living-room', 'kitchen', 'family-room'];
-      let best: CameraKey = primaryKey;
-      let bestVal = ema[primaryKey] ?? 0;
-      for (const k of keys) {
-        const v = ema[k] ?? 0;
-        if (v > bestVal) { best = k; bestVal = v; }
-      }
-
-      const nowMs = Date.now();
-      const since = nowMs - (lastSwitchRef.current || 0);
-      if (best !== primaryKey && since >= SWITCH_COOLDOWN_MS) {
-        const currentVal = ema[primaryKey] ?? 0;
-        if (bestVal > currentVal * SWITCH_RATIO) {
-          setPrimaryKey(best);
-          lastSwitchRef.current = nowMs;
-          publish({ group: 'UI', key: 'Primary Camera', value: best, ts: now });
-        }
-      }
-    } catch {
-      // defensive: never break stats handling
-    }
   };
 
   const onImage = (cam: 'living-room' | 'kitchen' | 'family-room', blob: Blob) => {
@@ -605,7 +545,6 @@ function Dashboard() {
     return <span className="chip"><span className="status-dot" style={{ background: color }} />{text}</span>;
   }, [status]);
 
-  const displayOrder = useMemo<CameraKey[]>(() => [primaryKey, ...cameraOrder.filter(k => k !== primaryKey)], [primaryKey]);
   const timeChip = useMemo(() => (
     estTime ? <span className="chip mono" title="Current time (US Eastern)">{estTime}</span> : null
   ), [estTime]);
@@ -651,42 +590,15 @@ function Dashboard() {
       </header>
       <main className="main">
         <section className="streams">
-          <div className="slot-primary">
-            <StreamPanel
-              camera={displayOrder[0]}
-              blob={streams[displayOrder[0]]}
-              fpsText={fps[displayOrder[0]]}
-              fpsSeries={fpsSeries[displayOrder[0]]}
-              vacancyText={vacancyText[displayOrder[0]]}
-              showLock={true}
-              locked={locked}
-              onToggleLock={() => setLocked(v => !v)}
-              isExpanded={expandedCamera === displayOrder[0]}
-              onToggleExpand={(cam) => setExpandedCamera(prev => prev === cam ? null : cam)}
-            />
-          </div>
-          <div className="slot-bottom-left">
-            <StreamPanel
-              camera={displayOrder[1]}
-              blob={streams[displayOrder[1]]}
-              fpsText={fps[displayOrder[1]]}
-              fpsSeries={fpsSeries[displayOrder[1]]}
-              vacancyText={vacancyText[displayOrder[1]]}
-              isExpanded={expandedCamera === displayOrder[1]}
-              onToggleExpand={(cam) => setExpandedCamera(prev => prev === cam ? null : cam)}
-            />
-          </div>
-          <div className="slot-bottom-right">
-            <StreamPanel
-              camera={displayOrder[2]}
-              blob={streams[displayOrder[2]]}
-              fpsText={fps[displayOrder[2]]}
-              fpsSeries={fpsSeries[displayOrder[2]]}
-              vacancyText={vacancyText[displayOrder[2]]}
-              isExpanded={expandedCamera === displayOrder[2]}
-              onToggleExpand={(cam) => setExpandedCamera(prev => prev === cam ? null : cam)}
-            />
-          </div>
+          <StreamPanel
+            camera="living-room"
+            blob={streams['living-room']}
+            fpsText={fps['living-room']}
+            fpsSeries={fpsSeries['living-room']}
+            vacancyText={vacancyText['living-room']}
+            isExpanded={expandedCamera === 'living-room'}
+            onToggleExpand={(cam) => setExpandedCamera(prev => prev === cam ? null : cam)}
+          />
         </section>
 
         <section className="side">

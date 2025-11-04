@@ -109,6 +109,7 @@ class DS8Adapter:
         self._probe_counts: Dict[str, int] = {}
         self._probe_last_log: Dict[str, float] = {}
 
+
         # Allow attaching external publisher(s) for parity with DS7 (no-op here)
         self.occupancy_publisher = None
         # REST seeding guard
@@ -346,17 +347,10 @@ class DS8Adapter:
                 return Gst.PadProbeReturn.OK
             if not ev:
                 return Gst.PadProbeReturn.OK
-            try:
-                # Prefer the core helper if available
-                try:
-                    name = Gst.event_type_get_name(ev.type)  # type: ignore[attr-defined]
-                except Exception:
-                    name = str(getattr(ev, 'type', 'unknown'))
-                self_ref.logger.debug("event %s: %s", lbl, name)
-            except Exception:
-                pass
             return Gst.PadProbeReturn.OK
         pad.add_probe(Gst.PadProbeType.EVENT_DOWNSTREAM, _ev)
+
+    
 
     def _load_multiuri_config(self, path: str) -> Dict[str, Dict[str, str]]:
         cp = configparser.ConfigParser(strict=False)
@@ -375,6 +369,76 @@ class DS8Adapter:
         if not uris:
             raise RuntimeError(f"No URIs found in [source-list] list= of {path}")
         return uris
+
+    def _attach_osd_text_probe(self, osd_el) -> None:
+        """Append confidence to OSD text safely on the OSD sink pad.
+
+        Updates NvDsObjectMeta.text_params.display_text to include
+        "<label> <conf> ID:<id>" for each object. Probe must not raise.
+        """
+        if not osd_el:
+            return
+        pad = None
+        try:
+            pad = osd_el.get_static_pad("sink")
+        except Exception:
+            pad = None
+        if pad is None:
+            return
+
+        def _cb(_pad, info, self_ref=self):
+            try:
+                buf = info.get_buffer()
+                if not buf:
+                    return Gst.PadProbeReturn.OK
+                try:
+                    import pyds  # type: ignore
+                except Exception:
+                    return Gst.PadProbeReturn.OK
+                try:
+                    batch_meta = pyds.gst_buffer_get_nvds_batch_meta(hash(buf))
+                except Exception:
+                    batch_meta = None
+                if not batch_meta:
+                    return Gst.PadProbeReturn.OK
+                l_frame = getattr(batch_meta, 'frame_meta_list', None)
+                while l_frame:
+                    try:
+                        frame_meta = pyds.NvDsFrameMeta.cast(l_frame.data)
+                    except Exception:
+                        l_frame = l_frame.next
+                        continue
+                    l_obj = frame_meta.obj_meta_list
+                    while l_obj:
+                        try:
+                            obj_meta = pyds.NvDsObjectMeta.cast(l_obj.data)
+                            # Build "label conf ID" text
+                            label = getattr(obj_meta, 'obj_label', '') or ''
+                            conf = float(getattr(obj_meta, 'confidence', 0.0) or 0.0)
+                            oid = int(getattr(obj_meta, 'object_id', -1) or -1)
+                            txt = f"{label} {conf:.2f} ID:{oid}".strip()
+                            # Assign display text directly (prefer plain string in DS8 Python bindings)
+                            tp = obj_meta.text_params
+                            tp.display_text = txt
+                            # Keep background disabled to avoid occlusion
+                            try:
+                                tp.set_bg_clr = 0
+                            except Exception:
+                                pass
+                            obj_meta.text_params = tp
+                        except Exception:
+                            pass
+                        l_obj = l_obj.next
+                    l_frame = l_frame.next
+            except Exception:
+                # Never propagate from probe
+                pass
+            return Gst.PadProbeReturn.OK
+
+        try:
+            pad.add_probe(Gst.PadProbeType.BUFFER, _cb)
+        except Exception:
+            pass
 
     def _build_pipeline(self) -> None:
         self.pipeline = Gst.Pipeline.new("ds8_pipeline")
@@ -409,7 +473,39 @@ class DS8Adapter:
 
         # PGIE / tracker / analytics / tiler / encode branch
         pgie = self._make("nvinfer", "pgie")
+        # Configure nvinfer with primary config
+        infer_cfg = str(getattr(self.config.processing, "DEEPSTREAM_INFER_CONFIG", "") or "").strip()
+        if infer_cfg:
+            infer_cfg_abs = os.path.abspath(infer_cfg)
+            if not os.path.exists(infer_cfg_abs):
+                raise RuntimeError(f"nvinfer config not found: {infer_cfg_abs}")
+            try:
+                pgie.set_property("config-file-path", infer_cfg_abs)
+            except Exception:
+                pgie.set_property("config-file", infer_cfg_abs)
+            self.logger.info("nvinfer configured with %s", infer_cfg_abs)
+        else:
+            raise RuntimeError("DEEPSTREAM_INFER_CONFIG is empty; set processing.DEEPSTREAM_INFER_CONFIG")
         tracker = self._make("nvtracker", "tracker")
+        # Configure nvtracker (library + YAML config) if provided
+        try:
+            trk_lib = str(getattr(self.config.processing, "DEEPSTREAM_TRACKER_LIB", "") or "").strip()
+            if trk_lib:
+                tracker.set_property("ll-lib-file", trk_lib)
+                self.logger.info("nvtracker ll-lib-file set: %s", trk_lib)
+        except Exception:
+            pass
+        try:
+            trk_cfg = str(getattr(self.config.processing, "DEEPSTREAM_TRACKER_CONFIG", "") or "").strip()
+            if trk_cfg:
+                trk_cfg_abs = os.path.abspath(trk_cfg)
+                if os.path.exists(trk_cfg_abs):
+                    tracker.set_property("ll-config-file", trk_cfg_abs)
+                    self.logger.info("nvtracker ll-config-file set: %s", trk_cfg_abs)
+                else:
+                    self.logger.warning("nvtracker config not found: %s", trk_cfg_abs)
+        except Exception:
+            pass
         analytics_cfg = self._select_analytics_cfg()
         try:
             analytics = self._make("nvdsanalytics", "analytics")
@@ -438,9 +534,6 @@ class DS8Adapter:
         if not disable_egl:
             try:
                 egl_q = self._make("queue", "egl_q")
-                egl_tiler = self._make("nvmultistreamtiler", "egl_tiler")
-                egl_conv = self._make("nvvideoconvert", "egl_conv")
-                egl_caps_rgba = self._make("capsfilter", "egl_caps_rgba")
                 egl_sink = self._make("nveglglessink", "egl_sink")
                 self.logger.info("EGL display branch enabled (nveglglessink created)")
             except Exception as exc:
@@ -483,6 +576,7 @@ class DS8Adapter:
         tiler.set_property("height", h)
         mosaic_osd.set_property("process-mode", 0)  # GPU mode
         mosaic_osd.set_property("display-text", 1)
+        mosaic_osd.set_property("display-bbox", 1)
         mosaic_caps_rgba.set_property("caps", Gst.Caps.from_string("video/x-raw(memory:NVMM), format=RGBA"))
         mosaic_caps.set_property("caps", Gst.Caps.from_string("video/x-raw(memory:NVMM), format=I420"))
         try:
@@ -497,18 +591,21 @@ class DS8Adapter:
         mosaic_sink.set_property("sync", False)
         mosaic_sink.set_property("drop", True)
         mosaic_sink.set_property("max-buffers", 1)
+        # Wire appsink to push encoded mosaic JPEGs into the queue for WebSocket broadcast
+        try:
+            mosaic_sink.connect("new-sample", self._on_new_mosaic_sample)
+            self.logger.info("mosaic appsink new-sample connected")
+        except Exception:
+            # Non-fatal: leave mosaic broadcast disabled if connect fails
+            self.logger.warning("Unable to connect mosaic appsink new-sample")
 
         if not disable_egl and egl_q is not None:
             self._set_q_leaky(egl_q)
-            # Match template: force a 2x2 grid; unused tiles remain black
-            egl_tiler.set_property("rows", 2)
-            egl_tiler.set_property("columns", 2)
-            egl_tiler.set_property("width", w)
-            egl_tiler.set_property("height", h)
-            # Ensure RGBA NVMM buffers to satisfy nvegltransform expectations
-            egl_caps_rgba.set_property("caps", Gst.Caps.from_string("video/x-raw(memory:NVMM), format=RGBA"))
-            egl_sink.set_property("sync", False)
-            egl_sink.set_property("qos", False)
+            try:
+                egl_sink.set_property("sync", False)
+                egl_sink.set_property("qos", False)
+            except Exception:
+                pass
 
         # Add base elements
         base_elements = []
@@ -519,40 +616,104 @@ class DS8Adapter:
             if preproc:
                 base_elements.append(preproc)
             base_elements.extend([pgie, tracker, analytics, post_analytics_tee])
-        if not disable_egl and all([egl_q, egl_tiler, egl_conv, egl_caps_rgba, egl_sink]):
-            base_elements.extend([egl_q, egl_tiler, egl_conv, egl_caps_rgba, egl_sink])
+        if not disable_egl and egl_q and egl_sink:
+            base_elements.extend([egl_q, egl_sink])
         for el in base_elements:
             if el is not None:
                 self.pipeline.add(el)
-        # Direct link in minimal path: nvmultiurisrcbin → nvvideoconvert(pre_video) → mosaic_q
+        # Direct link in minimal path: nvmultiurisrcbin → nvvideoconvert(pre_video) → nvinfer → nvtracker → nvdsanalytics → [tee|mosaic_q]
         if minimal_pre_infer:
             pre_video = self._make("nvvideoconvert", "pre_video")
+            # Ensure pgie is added in minimal path
             self.pipeline.add(pre_video)
+            self.pipeline.add(pgie)
+            self.pipeline.add(tracker)
+            self.pipeline.add(analytics)
             if not src.link(pre_video):
                 raise RuntimeError("Failed to link nvmultiurisrcbin -> pre_video")
             pre_video_sink_pad = pre_video.get_static_pad("sink")
-            if not disable_egl and all([egl_q, egl_tiler, egl_conv, egl_caps_rgba, egl_sink]):
-                pre_video_tee = self._make("tee", "pre_video_tee")
-                self.pipeline.add(pre_video_tee)
-                if not pre_video.link(pre_video_tee):
-                    raise RuntimeError("Failed to link pre_video -> pre_video_tee")
-                tee2mosaic = pre_video_tee.get_request_pad("src_%u")
-                mosaic_sink_pad = mosaic_q.get_static_pad("sink")
-                if tee2mosaic is None or mosaic_sink_pad is None or tee2mosaic.link(mosaic_sink_pad) != Gst.PadLinkReturn.OK:
-                    raise RuntimeError("Failed to link pre_video tee to mosaic_q")
-                tee2egl = pre_video_tee.get_request_pad("src_%u")
+            # Insert nvinfer between pre_video and downstream branches
+            if not pre_video.link(pgie):
+                raise RuntimeError("Failed to link pre_video -> nvinfer")
+            if not pgie.link(tracker):
+                raise RuntimeError("Failed to link nvinfer -> nvtracker")
+            if not tracker.link(analytics):
+                raise RuntimeError("Failed to link nvtracker -> nvdsanalytics")
+            # Build shared display chain: analytics → tiler → conv_pre → caps_rgba → osd → tee
+            # Link analytics to shared tiler
+            if not analytics.link(tiler):
+                raise RuntimeError("Failed to link nvdsanalytics -> mosaic_tiler (shared)")
+            shared_chain = [tiler, mosaic_conv_pre, mosaic_caps_rgba, mosaic_osd]
+            for a, b in zip(shared_chain, shared_chain[1:]):
+                if not a.link(b):
+                    raise RuntimeError(f"Failed to link {a.name} -> {b.name}")
+            # Attach OSD text probe to add confidence to display text
+            self._attach_osd_text_probe(mosaic_osd)
+            try:
+                self.pipeline.add(post_analytics_tee)
+            except Exception:
+                pass
+            if not mosaic_osd.link(post_analytics_tee):
+                raise RuntimeError("Failed to link mosaic_osd -> post_analytics_tee")
+            # Branch to sinks: JPEG and EGL
+            tee2mosaic = post_analytics_tee.get_request_pad("src_%u")
+            mosaic_sink_pad = mosaic_q.get_static_pad("sink")
+            if tee2mosaic is None or mosaic_sink_pad is None or tee2mosaic.link(mosaic_sink_pad) != Gst.PadLinkReturn.OK:
+                raise RuntimeError("Failed to link post_analytics_tee to mosaic_q")
+            self._attach_flow_probe(tee2mosaic, "post_analytics_tee → mosaic_q")
+            if not disable_egl and egl_q and egl_sink:
+                tee2egl = post_analytics_tee.get_request_pad("src_%u")
                 egl_sink_pad = egl_q.get_static_pad("sink")
                 if tee2egl is None or egl_sink_pad is None or tee2egl.link(egl_sink_pad) != Gst.PadLinkReturn.OK:
-                    raise RuntimeError("Failed to link pre_video tee to egl_q")
-                self._attach_flow_probe(tee2mosaic, "pre_video_tee → mosaic_q")
-                self._attach_flow_probe(tee2egl, "pre_video_tee → egl_q")
+                    raise RuntimeError("Failed to link post_analytics_tee to egl_q")
+                self._attach_flow_probe(tee2egl, "post_analytics_tee → egl_q")
             else:
-                if not pre_video.link(mosaic_q):
-                    raise RuntimeError("Failed to link pre_video -> mosaic_q")
-            self.logger.info("linked nvmultiurisrcbin → pre_video → mosaic_q")
+                # No EGL; still build shared chain but link directly to mosaic branch
+                if not analytics.link(tiler):
+                    raise RuntimeError("Failed to link nvdsanalytics -> mosaic_tiler (shared)")
+                for a, b in zip([tiler, mosaic_conv_pre, mosaic_caps_rgba, mosaic_osd], [mosaic_conv_pre, mosaic_caps_rgba, mosaic_osd, None]):
+                    if b is None:
+                        break
+                    if not a.link(b):
+                        raise RuntimeError(f"Failed to link {a.name} -> {b.name}")
+                # Attach OSD text probe (no tee in this branch)
+                self._attach_osd_text_probe(mosaic_osd)
+                if not mosaic_osd.link(mosaic_q):
+                    raise RuntimeError("Failed to link mosaic_osd -> mosaic_q")
+                self.logger.info("linked analytics → shared_tiler/osd → mosaic_q (no EGL)")
+            if not (not disable_egl and egl_q and egl_sink):
+                pass
+            else:
+                self.logger.info("linked analytics → shared_tiler/osd → tee → [mosaic|egl]")
             self._attach_flow_probe(src.get_static_pad("src"), "nvmultiurisrcbin.src")
             if pre_video_sink_pad:
                 self._attach_flow_probe(pre_video_sink_pad, "pre_video.sink")
+            # Add probes on nvinfer pads for visibility
+            try:
+                self._attach_flow_probe(pgie.get_static_pad("sink"), "nvinfer.sink")
+            except Exception:
+                pass
+            try:
+                self._attach_flow_probe(pgie.get_static_pad("src"), "nvinfer.src")
+            except Exception:
+                pass
+            try:
+                self._attach_flow_probe(tracker.get_static_pad("sink"), "nvtracker.sink")
+            except Exception:
+                pass
+            try:
+                self._attach_flow_probe(tracker.get_static_pad("src"), "nvtracker.src")
+            except Exception:
+                pass
+            try:
+                self._attach_flow_probe(analytics.get_static_pad("sink"), "nvdsanalytics.sink")
+            except Exception:
+                pass
+            try:
+                self._attach_flow_probe(analytics.get_static_pad("src"), "nvdsanalytics.src")
+            except Exception:
+                pass
+            
         else:
             # Direct link: nvmultiurisrcbin → [preprocess]|nvinfer
             first_el = preproc if preproc else pgie
@@ -565,11 +726,12 @@ class DS8Adapter:
             pgie_sink_pad = pgie.get_static_pad("sink")
             self._attach_flow_probe(pgie_sink_pad, "nvinfer.sink")
         # Add deeper probes along mosaic chain to pinpoint stalls
-        self._attach_flow_probe(pgie.get_static_pad("src"), "nvinfer.src")
-        self._attach_flow_probe(tracker.get_static_pad("sink"), "nvtracker.sink")
-        self._attach_flow_probe(tracker.get_static_pad("src"), "nvtracker.src")
-        self._attach_flow_probe(analytics.get_static_pad("sink"), "nvdsanalytics.sink")
-        self._attach_flow_probe(analytics.get_static_pad("src"), "nvdsanalytics.src")
+        if not minimal_pre_infer:
+            self._attach_flow_probe(pgie.get_static_pad("src"), "nvinfer.src")
+            self._attach_flow_probe(tracker.get_static_pad("sink"), "nvtracker.sink")
+            self._attach_flow_probe(tracker.get_static_pad("src"), "nvtracker.src")
+            self._attach_flow_probe(analytics.get_static_pad("sink"), "nvdsanalytics.sink")
+            self._attach_flow_probe(analytics.get_static_pad("src"), "nvdsanalytics.src")
         self._attach_flow_probe(mosaic_q.get_static_pad("src"), "mosaic_q.src")
         self._attach_flow_probe(tiler.get_static_pad("sink"), "mosaic_tiler.sink")
         self._attach_flow_probe(tiler.get_static_pad("src"), "mosaic_tiler.src")
@@ -604,18 +766,23 @@ class DS8Adapter:
             if tee2mosaic_post.link(mosaic_sink_pad) != Gst.PadLinkReturn.OK:
                 raise RuntimeError("Failed to link post_analytics_tee to mosaic_q")
             self._attach_flow_probe(tee2mosaic_post, "post_analytics_tee → mosaic_q")
-        mosaic_chain = [mosaic_q, tiler, mosaic_conv_pre, mosaic_caps_rgba, mosaic_osd, mosaic_conv_post, mosaic_caps, mosaic_enc, mosaic_sink]
-        for a, b in zip(mosaic_chain, mosaic_chain[1:]):
-            if not a.link(b):
-                raise RuntimeError(f"Failed to link {a.name} -> {b.name}")
-        self.logger.info("linked nvdsanalytics_post → mosaic_q → mosaic_sink")
+        # Link mosaic branch chain from its per-branch queue to encoder/appsink
+        if minimal_pre_infer:
+            mosaic_branch_chain = [mosaic_q, mosaic_conv_post, mosaic_caps, mosaic_enc, mosaic_sink]
+            for a, b in zip(mosaic_branch_chain, mosaic_branch_chain[1:]):
+                if not a.link(b):
+                    raise RuntimeError(f"Failed to link {a.name} -> {b.name}")
+            self.logger.info("linked tee → mosaic_q → jpegenc → appsink")
+        else:
+            mosaic_chain = [mosaic_q, tiler, mosaic_conv_pre, mosaic_caps_rgba, mosaic_osd, mosaic_conv_post, mosaic_caps, mosaic_enc, mosaic_sink]
+            for a, b in zip(mosaic_chain, mosaic_chain[1:]):
+                if not a.link(b):
+                    raise RuntimeError(f"Failed to link {a.name} -> {b.name}")
+            self.logger.info("linked nvdsanalytics_post → mosaic_q → mosaic_sink")
 
         # Branch 2: optional EGL display
-        if not disable_egl and all([egl_q, egl_tiler, egl_conv, egl_caps_rgba, egl_sink]):
-            if minimal_pre_infer:
-                if pre_video_tee:
-                    self._attach_flow_probe(egl_q.get_static_pad("sink"), "pre_video → egl_q")
-            else:
+        if not disable_egl and egl_q and egl_sink:
+            if not minimal_pre_infer:
                 tee2egl = post_analytics_tee.get_request_pad("src_%u")
                 egl_sink_pad = egl_q.get_static_pad("sink")
                 if tee2egl is None or egl_sink_pad is None:
@@ -623,24 +790,10 @@ class DS8Adapter:
                 if tee2egl.link(egl_sink_pad) != Gst.PadLinkReturn.OK:
                     raise RuntimeError("Failed to link post_analytics_tee to egl_q")
                 self._attach_flow_probe(tee2egl, "post_analytics_tee → egl_q")
-            egl_chain = [egl_q, egl_tiler, egl_conv, egl_caps_rgba, egl_sink]
-            for a, b in zip(egl_chain, egl_chain[1:]):
-                if not a.link(b):
-                    raise RuntimeError(f"Failed to link {a.name} -> {b.name}")
-            self.logger.info("linked nvdsanalytics_post → egl_tiler → nveglglessink")
-            # Add deeper probes on EGL chain to pinpoint stalls
-            try:
-                self._attach_flow_probe(egl_conv.get_static_pad("sink"), "egl_conv.sink")
-            except Exception:
-                pass
-            try:
-                self._attach_flow_probe(egl_caps_rgba.get_static_pad("src"), "egl_caps_rgba.src")
-            except Exception:
-                pass
-            try:
-                self._attach_flow_probe(egl_sink.get_static_pad("sink"), "egl_sink.sink")
-            except Exception:
-                pass
+            # Link final EGL queue to sink (shared chain already produced RGBA)
+            if not egl_q.link(egl_sink):
+                raise RuntimeError("Failed to link egl_q -> nveglglessink")
+            self.logger.info("linked tee → egl_q → nveglglessink")
 
         # CPU display fallback removed (temporary feature)
 
@@ -724,6 +877,12 @@ class DS8Adapter:
             data = bytes(mapinfo.data) if mapinfo and mapinfo.data else None
             if data:
                 try:
+                    # Latest-wins: drain any pending items to keep latency low
+                    while True:
+                        try:
+                            _ = self.mosaic_queue.get_nowait()
+                        except queue.Empty:
+                            break
                     self.mosaic_queue.put_nowait(data)
                     self._mosaic_counter += 1
                     if self._mosaic_counter % 300 == 0:

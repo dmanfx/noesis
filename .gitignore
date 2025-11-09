@@ -45,3 +45,7 @@ ma_onnxTRT/
 pipelines/*.so
 
 
+#external folders/files
+.venv_ds/
+
+

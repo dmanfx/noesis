@@ -107,6 +107,8 @@ class AppConfig:
         # DeepStream Pipeline Configuration (RECOMMENDED)
         USE_DS8: bool = True  # Select DS8Adapter pipeline (GI) instead of DS7
         ENABLE_DEEPSTREAM: bool = True  # Enable DeepStream pipeline for video processing
+        # Select primary model variant for DeepStream: True = instance segmentation (seg), False = detection-only (det)
+        USE_SEGMENTATION_MODEL: bool = True
         DEEPSTREAM_SOURCE_LATENCY: int = 50  # Reduced latency for real-time processing
         DEEPSTREAM_MUX_BATCH_SIZE: int = 1  # Single frame processing for lower latency
         DEEPSTREAM_MUX_SCALE_MODE: int = 2  # 0=stretch, 1=crop, 2=letter-box
@@ -304,7 +306,7 @@ class AppConfig:
         NVENC_BITRATE: int = 4000000  # 4 Mbps
         JPEG_QUALITY: int = 85  # JPEG encoding quality
         USE_NATIVE_DEEPSTREAM_OSD: bool = True  # If True, use DeepStream's native OSD, skip Python annotation
-        ENABLE_EGL: bool = True  # Enable EGL display branch in DeepStream pipeline
+        ENABLE_EGL: bool = False  # Enable EGL display branch in DeepStream pipeline
 
         # Bounding-box temporal smoothing (reduces size flicker/shudder)
         BBOX_SMOOTHING_ENABLED: bool = True

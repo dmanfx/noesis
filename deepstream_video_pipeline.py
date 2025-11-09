@@ -799,8 +799,20 @@ class DeepStreamVideoPipeline:
                     # Fallback defaults: mask on, bbox off, text on, CPU mode
                     mosaic_osd.set_property("process-mode", 1)
                     mosaic_osd.set_property("display-text", 1)
+                    # Default to seg-friendly visuals; override below if detection-only model is selected
                     mosaic_osd.set_property("display-bbox", 0)
                     mosaic_osd.set_property("display-mask", 1)
+
+                # If detection-only model is active, prefer bounding boxes and hide masks regardless of INI
+                try:
+                    use_seg = bool(getattr(self.config.processing, 'USE_SEGMENTATION_MODEL', True))
+                    if not use_seg:
+                        mosaic_osd.set_property("display-mask", 0)
+                        mosaic_osd.set_property("display-bbox", 1)
+                        mosaic_osd.set_property("display-text", 1)
+                        self.logger.info("OSD adjusted for detection-only model: bbox=1, mask=0")
+                except Exception:
+                    pass
 
             # Configure live queues with consistent leaky buffering
             for queue_name in ("q_after_pgie", "q_before_tracker", "q_after_tracker", "mosaic_q", "jpeg_q", "egl_q"):
@@ -2057,6 +2069,13 @@ class DeepStreamVideoPipeline:
         line_budget_max = 250
         label_budget_max = 16
 
+        # Holdover cache for recent masks/bboxes per (sensor, track)
+        # Used to reduce visible flicker when PGIE skips frames (interval>0)
+        if not hasattr(self, "_mask_holdover_cache"):
+            self._mask_holdover_cache = {}
+        hold_ms = int(getattr(self.config.visualization, "MASK_HOLDOVER_MS", 250) or 250)
+        hold_s = max(0.0, min(2.0, hold_ms / 1000.0))
+
         for frame_meta in frames:
             drawn_count = 0
             try:
@@ -2176,6 +2195,53 @@ class DeepStreamVideoPipeline:
                     rect.border_color.set(r, g, b, 1.0)
                 except Exception as e:
                     self.logger.debug(f"Setting rect border failed for tid={tid}: {e}")
+
+                # ---------------- Holdover mask/bbox to reduce flicker ----------------
+                try:
+                    key = (int(sensor_id), int(tid))
+                    left = float(getattr(rect, "left", 0.0) or 0.0)
+                    top = float(getattr(rect, "top", 0.0) or 0.0)
+                    width = float(getattr(rect, "width", 0.0) or 0.0)
+                    height = float(getattr(rect, "height", 0.0) or 0.0)
+
+                    cache = self._mask_holdover_cache.get(key)
+                    has_detection = (confidence is not None) and (float(confidence) >= 0.0)
+
+                    # Update cache on frames with detections
+                    if has_detection and width > 1 and height > 1:
+                        self._mask_holdover_cache[key] = {
+                            "ts": now,
+                            "bbox": (left, top, width, height),
+                            "color": (r, g, b),
+                        }
+                    # If this is a tracker-only frame, paint a faint holdover rect if fresh
+                    elif cache and (now - float(cache.get("ts", 0.0)) <= hold_s):
+                        # Draw a translucent rectangle via DisplayMeta as a visual holdover
+                        # This is separate from nvdsosd display-bbox to avoid global toggles
+                        try:
+                            display_meta = pyds.nvds_acquire_display_meta_from_pool(batch_meta)
+                            if display_meta:
+                                # Respect budgets
+                                if display_meta.num_rects < len(display_meta.rect_params):
+                                    rp = display_meta.rect_params[display_meta.num_rects]
+                                    cl, ct, cw, ch = cache.get("bbox", (left, top, width, height))
+                                    rp.left = float(cl)
+                                    rp.top = float(ct)
+                                    rp.width = float(cw)
+                                    rp.height = float(ch)
+                                    cr, cg, cb = cache.get("color", (r, g, b))
+                                    # Semi-transparent fill; thin border
+                                    rp.has_bg_color = 1
+                                    rp.bg_color.set(cr, cg, cb, 0.20)
+                                    rp.border_width = 2
+                                    rp.border_color.set(cr, cg, cb, 0.8)
+                                    display_meta.num_rects += 1
+                                    pyds.nvds_add_display_meta_to_frame(frame_meta, display_meta)
+                        except Exception as e:
+                            self.logger.debug(f"Holdover draw failed for tid={tid}: {e}")
+                except Exception:
+                    # Never break probe due to holdover logic
+                    pass
 
                 left = float(getattr(rect, "left", 0.0))
                 top = float(getattr(rect, "top", 0.0))

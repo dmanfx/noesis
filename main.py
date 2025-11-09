@@ -436,10 +436,13 @@ class ApplicationManager:
             raise RuntimeError("GPU-only mode: GPU-only inference must be enabled")
         
         try:
+            # Choose primary nvinfer INI based on model variant flag
+            use_seg = bool(getattr(self.config.processing, 'USE_SEGMENTATION_MODEL', True))
+            nvinfer_ini = "pipelines/config_infer_primary_yolo11_seg.ini" if use_seg else "pipelines/config_infer_primary_yolo11.ini"
             processor = DeepStreamVideoPipeline(
                 config=self.config,
                 websocket_port=self.config.websocket.PORT,
-                config_file="pipelines/config_infer_primary_yolo11_seg.ini",
+                config_file=nvinfer_ini,
             )
             source_count = len(getattr(processor, "source_info", {}) or {})
             if source_count == 0:

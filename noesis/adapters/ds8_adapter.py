@@ -420,6 +420,15 @@ class DS8Adapter:
                             # Assign display text directly (prefer plain string in DS8 Python bindings)
                             tp = obj_meta.text_params
                             tp.display_text = txt
+                            # Increase font size and choose a readable font
+                            try:
+                                tp.font_params.font_name = "Sans"
+                            except Exception:
+                                pass
+                            try:
+                                tp.font_params.font_size = 22
+                            except Exception:
+                                pass
                             # Keep background disabled to avoid occlusion
                             try:
                                 tp.set_bg_clr = 0

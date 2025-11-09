@@ -2100,13 +2100,28 @@ class DeepStreamVideoPipeline:
                     except Exception as e:
                         self.logger.debug(f"stable_id lookup failed for tid={tid}: {e}")
                         stable_id = None
-                label = f"ds {int(tid)} ({confidence:.2f})"
+                # Prefer human-readable class label + confidence; optionally append stable ID
+                try:
+                    cls_label = getattr(obj_meta, 'obj_label', '') or ''
+                except Exception:
+                    cls_label = ''
+                base_label = cls_label.strip() if cls_label else f"class {meta_ops.get_class_id(operator, obj_meta)}"
+                label = f"{base_label} {confidence:.2f}"
                 if stable_id not in (None, "", -1):
-                    label = f"sid {int(stable_id)} ds {int(tid)} ({confidence:.2f})"
+                    label = f"{label} sid {int(stable_id)}"
 
                 try:
                     text_params = obj_meta.text_params
                     text_params.display_text = label
+                    # Make label font larger and readable
+                    try:
+                        text_params.font_params.font_name = "Sans"
+                    except Exception:
+                        pass
+                    try:
+                        text_params.font_params.font_size = 22
+                    except Exception:
+                        pass
                     try:
                         text_params.set_bg_clr = 0
                     except Exception as e:

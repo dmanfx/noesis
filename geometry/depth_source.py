@@ -207,21 +207,56 @@ class DepthStorageManager:
         thread.start()
 
     def _writer_loop(self) -> None:
-        assert self._queue is not None
-        assert self._stop_event is not None
+        # Defensive loop that tolerates shutdown races and empty queue timeouts.
+        # This is intentionally conservative to avoid noisy thread exceptions
+        # while retaining async snapshot functionality.
+        try:
+            q = self._queue
+            stop = self._stop_event
+        except Exception:
+            q = None
+            stop = None
         while True:
             try:
-                job = self._queue.get(timeout=0.2)
-            except queue.Empty:
-                if self._stop_event.is_set():
+                # Refresh local refs each iteration in case shutdown mutated them
+                if q is None or stop is None:
+                    q = self._queue
+                    stop = self._stop_event
+                if q is None:
+                    # Queue no longer available; exit quietly
                     break
-                continue
-            try:
-                self._write_snapshot(job)
-            except Exception as exc:
-                self._logger.error(f"Depth snapshot write failed for {job.camera_id}: {exc}")
-            finally:
-                self._queue.task_done()
+                try:
+                    job = q.get(timeout=0.2)
+                except queue.Empty:
+                    try:
+                        if stop is None:
+                            stop = self._stop_event
+                        if stop is not None and stop.is_set():
+                            break
+                    except Exception:
+                        # If stop flag is unavailable, exit defensively
+                        break
+                    continue
+                try:
+                    self._write_snapshot(job)
+                except Exception as exc:
+                    # Keep processing other jobs; log at error level
+                    self._logger.error(f"Depth snapshot write failed for {getattr(job, 'camera_id', 'unknown')}: {exc}")
+                finally:
+                    try:
+                        q.task_done()
+                    except Exception:
+                        pass
+            except Exception:
+                # Any unexpected error should not tear down the thread noisily.
+                # Re-check shutdown and either continue or exit quietly.
+                try:
+                    stop = self._stop_event
+                    if stop is not None and stop.is_set():
+                        break
+                except Exception:
+                    break
+                time.sleep(0.05)
 
     def _start_enforcer(self) -> None:
         if self._enforce_thread is not None:
@@ -251,12 +286,17 @@ class DepthStorageManager:
         if not self._async_enabled or self._stop_event is None:
             return
         self._stop_event.set()
-        if wait:
-            threads = self._collect_alive_threads()
-            for thread in threads:
-                thread.join(timeout=2.0)
+        # Always give workers a small window to exit to avoid races
+        join_timeout = 2.0 if wait else 0.5
+        threads = self._collect_alive_threads()
+        for thread in threads:
+            try:
+                thread.join(timeout=join_timeout)
+            except Exception:
+                pass
         with self._worker_lock:
             self._writer_threads.clear()
+        # Only clear references after attempting joins to prevent attr races
         self._queue = None
         self._stop_event = None
 

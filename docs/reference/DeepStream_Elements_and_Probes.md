@@ -34,6 +34,12 @@ This document summarizes the elements created in `deepstream_video_pipeline.py`,
   - Properties: `process-mode=0` (GPU), `display-text=1`
   - Probe: sink pad → `_per_branch_osd_probe(sensor_id)` draws overlays only for that stream
 
+## Metadata Handling (Operator)
+
+- For any probe that reads or mutates metadata, prefer the shared helpers in `pipelines/meta_ops.py`.
+  - Operator-first traversal with safe `pyds` fallbacks keeps code concise and DS8-compatible.
+  - See: docs/reference/Metadata_Ops.md
+
 ## Per-Stream Branch (per demux pad)
 
 - Chain: `queue → nvvideoconvert (pre) → caps (video/x-raw(memory:NVMM), format=RGBA) → nvdsosd → nvvideoconvert (post) → caps (video/x-raw(memory:NVMM), format=I420) → nvjpegenc → appsink`

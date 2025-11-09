@@ -54,8 +54,7 @@ from config import AppConfig, config, load_ma_config
 from geometry.depth_source import DepthResult, DepthSummary, MapAnythingDepthSource
 from geometry.depth_publisher import DepthDiagnosticsPublisher, DiagnosticsConfig
 from models import DetectionResult, TrackingResult, AnalysisFrame, convert_numpy_types
-# DS8 adapter for GStreamer-based pipeline (no DS7 instantiation)
-from noesis.adapters.ds8_adapter import DS8Adapter
+from deepstream_video_pipeline import DeepStreamVideoPipeline
 # from gpu_pipeline import UnifiedGPUPipeline, cleanup_all_gpu_resources  # DEPRECATED
 from utils import RateLimitedLogger
 
@@ -156,16 +155,27 @@ class ApplicationManager:
         # MapAnything microservice process handle
         self._mapanything_process: Optional[subprocess.Popen[str]] = None
         # Depth inference integration
-        self.depth_source = MapAnythingDepthSource()
-        self._depth_executor = ThreadPoolExecutor(max_workers=2)
-        self._depth_warmup_executor = ThreadPoolExecutor(max_workers=1)
-        self._depth_warmup_future: Optional[Future] = None
-        self._pending_depth_futures: Dict[str, Future] = {}
-        self._latest_depth_results: Dict[str, DepthResult] = {}
-        self._camera_room_map: Dict[str, str] = {}
-        self._last_depth_publish: Dict[str, float] = {}
-        self._last_depth_summary: Dict[str, DepthSummary] = {}
-        self._depth_publisher = self._create_depth_publisher()
+        # DISABLED: MapAnything - re-enable post-merge
+        # self.depth_source = MapAnythingDepthSource()
+        # self._depth_executor = ThreadPoolExecutor(max_workers=2)
+        # self._depth_warmup_executor = ThreadPoolExecutor(max_workers=1)
+        # self._depth_warmup_future: Optional[Future] = None
+        # self._pending_depth_futures: Dict[str, Future] = {}
+        # self._latest_depth_results: Dict[str, DepthResult] = {}
+        # self._camera_room_map: Dict[str, str] = {}
+        # self._last_depth_publish: Dict[str, float] = {}
+        # self._last_depth_summary: Dict[str, DepthSummary] = {}
+        # self._depth_publisher = self._create_depth_publisher()
+        self.depth_source = None
+        self._depth_executor = None
+        self._depth_warmup_executor = None
+        self._depth_warmup_future = None
+        self._pending_depth_futures = {}
+        self._latest_depth_results = {}
+        self._camera_room_map = {}
+        self._last_depth_publish = {}
+        self._last_depth_summary = {}
+        self._depth_publisher = None
         
         # Initialize async event loop
         self.event_loop = None
@@ -195,6 +205,8 @@ class ApplicationManager:
         signal.signal(signal.SIGTERM, self._signal_handler)
         # Integrations
         self._occupancy_publisher = None
+        # Shutdown state
+        self._shutting_down = False
     
     def _signal_handler(self, sig, frame):
         """Handle termination signals with graceful shutdown
@@ -210,10 +222,19 @@ class ApplicationManager:
         print(f"\n🛑 Signal {sig} received (interrupt #{INTERRUPT_COUNT})")
         
         if INTERRUPT_COUNT == 1:
-            self.logger.info(f"Received signal {sig}, starting graceful shutdown...")
-            print("🔄 Starting graceful shutdown...")
-            # Start graceful shutdown immediately (not in background thread)
-            self.stop()
+            if not self._shutting_down:
+                self._shutting_down = True
+                self.logger.info(f"Received signal {sig}, starting graceful shutdown...")
+                print("🔄 Starting graceful shutdown...")
+                # Run graceful shutdown in a dedicated thread to avoid heavy work in signal handler
+                try:
+                    import threading
+                    t = threading.Thread(target=self._graceful_exit, name="graceful_exit", daemon=True)
+                    t.start()
+                except Exception as e:
+                    self.logger.error(f"Failed to start graceful exit thread: {e}")
+                    # Fallback to direct stop if thread creation fails
+                    self.stop()
         elif INTERRUPT_COUNT >= 2:
             self.logger.warning("Second interrupt received, forcing immediate exit")
             print("💥 Second interrupt - forcing immediate exit!")
@@ -304,18 +325,19 @@ class ApplicationManager:
                     self.websocket_server.pixel_to_world_handler = self._pixel_to_world_rpc
                     self.websocket_server.set_extrinsics_handler = self._set_extrinsics_rpc
                     self.websocket_server.set_align_handler = self._set_align_rpc
-                    if self.depth_source and self.websocket_server:
-                        self.websocket_server.ma_depth_provider = self.depth_source.load_latest_depth
-                        self.websocket_server.floorplan_provider = (
-                            lambda cam=None, max_age=60.0, grid_res=0.5, max_extent=20.0, cache_only=False, **_:
-                                self.depth_source.generate_topdown_floorplan(
-                                    str(cam) if cam else '',
-                                    max_age_sec=max_age,
-                                    grid_res_m=grid_res,
-                                    max_extent_m=max_extent,
-                                    cache_only=cache_only,
-                                )
-                        )
+                    # DISABLED: MapAnything providers - re-enable post-merge
+                    # if self.depth_source and self.websocket_server:
+                    #     self.websocket_server.ma_depth_provider = self.depth_source.load_latest_depth
+                    #     self.websocket_server.floorplan_provider = (
+                    #         lambda cam=None, max_age=60.0, grid_res=0.5, max_extent=20.0, cache_only=False, **_:
+                    #             self.depth_source.generate_topdown_floorplan(
+                    #                 str(cam) if cam else '',
+                    #                 max_age_sec=max_age,
+                    #                 grid_res_m=grid_res,
+                    #                 max_extent_m=max_extent,
+                    #                 cache_only=cache_only,
+                    #             )
+                    #     )
             except Exception as e:
                 self.logger.warning(f"Calibration init failed: {e}")
 
@@ -345,8 +367,9 @@ class ApplicationManager:
         self.stop_event.clear()
 
         try:
-            # Launch MapAnything inference microservice
-            self._start_mapanything_service()
+            # Launch MapAnything inference microservice (disabled by default)
+            if getattr(self.config.integrations, 'ENABLE_MAPANYTHING', False):
+                self._start_mapanything_service()
 
             # Start WebSocket server FIRST so frontend can connect while DS initializes
             self.logger.info("🚀 Starting WebSocket server...")
@@ -369,7 +392,8 @@ class ApplicationManager:
                         # Start mosaic publisher if configured (maps mosaic to a single camera id)
                         if getattr(self.config.websocket, 'MOSAIC_BROADCAST', False):
                             self._start_mosaic_broadcast()
-                        self._start_mapanything_scheduler()
+                        # DISABLED: MapAnything - re-enable post-merge
+                        # self._start_mapanything_scheduler()
             except Exception as e:
                 self.logger.warning(f"Unable to attach WebSocket server to processor: {e}")
 
@@ -400,8 +424,8 @@ class ApplicationManager:
     
     @profile_function("ApplicationManager.start_multi_stream_processor")
     def _start_multi_stream_processor(self):
-        """Start single multi-stream video processor (DS8 by default)."""
-        self.logger.info("Starting multi-stream video processor (DS8)")
+        """Start single multi-stream video processor (merged pipeline)."""
+        self.logger.info("Starting multi-stream video processor (Merged DS7+DS8)")
         
         # Validate GPU-only configuration
         if not self.config.processing.ENABLE_DEEPSTREAM:
@@ -412,16 +436,14 @@ class ApplicationManager:
             raise RuntimeError("GPU-only mode: GPU-only inference must be enabled")
         
         try:
-            # Choose DS8 by default; no DS7 import/instantiation in this module
-            if getattr(self.config.processing, 'USE_DS8', True):
-                processor = DS8Adapter(config=self.config)
-            else:
-                raise RuntimeError("DS7 pipeline fallback disabled in this build; set processing.USE_DS8=True")
-
+            processor = DeepStreamVideoPipeline(
+                config=self.config,
+                websocket_port=self.config.websocket.PORT,
+                config_file="pipelines/config_infer_primary_yolo11_seg.ini",
+            )
             source_count = len(getattr(processor, "source_info", {}) or {})
-            # Allow zero pre-known sources for DS8; sources will be seeded via REST
             if source_count == 0:
-                self.logger.info("🎥 DS8Adapter starting with 0 pre-known sources; will seed via REST")
+                self.logger.info("🎥 Multi-stream processor initializing without pre-known sources")
             else:
                 self.logger.info(f"🎥 Creating single multi-stream processor for {source_count} sources")
 
@@ -743,218 +765,155 @@ class ApplicationManager:
             import traceback
             traceback.print_exc()
 
-    def _start_mapanything_scheduler(self):
-        """Background loop to drive MapAnything mono inference from latest JPEGs."""
-        if not self.multi_stream_processor:
-            self.logger.warning("MapAnything scheduler not started (no multi-stream processor)")
-            return
-
-        self.logger.info("Starting MapAnything mono scheduler loop")
-
-        def loop():
-            last_pub = self._last_depth_publish
-            try:
-                mono_interval = getattr(self.depth_source, 'mono_interval', 0.5)
-            except Exception:
-                mono_interval = 0.5
-
-            dry_last_log: Dict[str, float] = {}
-            while self.running and not self.stop_event.is_set():
-                try:
-                    # Snapshot source_info each tick to tolerate dynamic sources
-                    source_info = getattr(self.multi_stream_processor, 'source_info', {}) or {}
-                    now = time.time()
-                    for source_id, info in source_info.items():
-                        cam_id = str(info.get('clean_name') or info.get('name') or source_id)
-                        # Respect per-camera rate gating
-                        try:
-                            if not self.depth_source.should_infer(cam_id, now):
-                                continue
-                        except Exception:
-                            continue
-
-                        ok, jpeg_bytes = self.multi_stream_processor.read_encoded_jpeg(source_id, timeout=0.05)
-                        if not ok or not jpeg_bytes:
-                            # Rate-limited dryness log per camera
-                            t0 = dry_last_log.get(cam_id, 0.0)
-                            if (now - t0) >= 5.0:
-                                self.logger.debug(f"MDE scheduler: no frame available for {cam_id} (sid={source_id})")
-                                dry_last_log[cam_id] = now
-                            continue
-
-                        # Decode JPEG -> BGR
-                        try:
-                            arr = np.frombuffer(jpeg_bytes, dtype=np.uint8)
-                            frame_bgr = cv2.imdecode(arr, cv2.IMREAD_COLOR)
-                            if frame_bgr is None:
-                                continue
-                        except Exception:
-                            continue
-
-                        # Run mono inference
-                        try:
-                            result = self.depth_source.maybe_infer_mono(cam_id, frame_bgr, self.calibration_bundle, now)
-                        except Exception as e:
-                            self.logger.debug(f"MDE mono error for {cam_id}: {e}")
-                            result = None
-                        if result is None:
-                            continue
-
-                        # Cache latest result and summary
-                        self._latest_depth_results[cam_id] = result
-                        self._last_depth_summary[cam_id] = result.summary
-
-                        # Throttle diagnostics to ~5s per camera
-                        if (now - last_pub.get(cam_id, 0.0)) >= 5.0:
-                            last_pub[cam_id] = now
-                            room_id = self._camera_room_map.get(cam_id, cam_id)
-                            if self._depth_publisher:
-                                try:
-                                    self._depth_publisher.publish_depth_summary(result, room_id)
-                                except Exception as e:
-                                    self.logger.debug(f"Depth publisher error: {e}")
-
-                            summary_message = {
-                                'type': 'ma_diagnostics',
-                                'cam_id': cam_id,
-                                'summary': {
-                                    'median': result.summary.median,
-                                    'p10': result.summary.p10,
-                                    'p90': result.summary.p90,
-                                    'conf_mean': result.summary.conf_mean,
-                                    'valid_ratio': result.summary.valid_ratio,
-                                    'sample_count': result.summary.sample_count,
-                                    'method': 'mde' if result.summary.conf_mean >= getattr(self.depth_source, 'min_conf', 0.5) else 'floor'
-                                },
-                                'ts': result.ts_us
-                            }
-                            self._schedule_ws_broadcast(summary_message)
-                except Exception as e:
-                    self.logger.debug(f"MDE scheduler tick error: {e}")
-                finally:
-                    try:
-                        time.sleep(max(0.05, mono_interval * 0.5))
-                    except Exception:
-                        time.sleep(0.1)
-
-        t = threading.Thread(target=loop, name="MapAnythingScheduler", daemon=True)
-        t.start()
-        self.logger.info("✅ MapAnything mono scheduler loop started")
+    # DISABLED: MapAnything scheduler - re-enable and adapt to mosaic input later
+    # def _start_mapanything_scheduler(self):
+    #     """Background loop to drive MapAnything mono inference from latest JPEGs."""
+    #     if not self.multi_stream_processor:
+    #         self.logger.warning("MapAnything scheduler not started (no multi-stream processor)")
+    #         return
+    #
+    #     self.logger.info("Starting MapAnything mono scheduler loop")
+    #
+    #     def loop():
+    #         last_pub = self._last_depth_publish
+    #         try:
+    #             mono_interval = getattr(self.depth_source, 'mono_interval', 0.5)
+    #         except Exception:
+    #             mono_interval = 0.5
+    #
+    #         dry_last_log: Dict[str, float] = {}
+    #         while self.running and not self.stop_event.is_set():
+    #             try:
+    #                 # Snapshot source_info each tick to tolerate dynamic sources
+    #                 source_info = getattr(self.multi_stream_processor, 'source_info', {}) or {}
+    #                 now = time.time()
+    #                 for source_id, info in source_info.items():
+    #                     cam_id = str(info.get('clean_name') or info.get('name') or source_id)
+    #                     # Respect per-camera rate gating
+    #                     try:
+    #                         if not self.depth_source.should_infer(cam_id, now):
+    #                             continue
+    #                     except Exception:
+    #                         continue
+    #
+    #                     ok, jpeg_bytes = self.multi_stream_processor.read_mosaic_jpeg(timeout=0.05)
+    #                     if not ok or not jpeg_bytes:
+    #                         # Rate-limited dryness log per camera
+    #                         t0 = dry_last_log.get(cam_id, 0.0)
+    #                         if (now - t0) >= 5.0:
+    #                             self.logger.debug(f"MDE scheduler: no frame available for {cam_id} (sid={source_id})")
+    #                             dry_last_log[cam_id] = now
+    #                         continue
+    #
+    #                     # Decode JPEG -> BGR
+    #                     try:
+    #                         arr = np.frombuffer(jpeg_bytes, dtype=np.uint8)
+    #                         frame_bgr = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+    #                         if frame_bgr is None:
+    #                             continue
+    #                     except Exception:
+    #                         continue
+    #
+    #                     # Run mono inference
+    #                     try:
+    #                         result = self.depth_source.maybe_infer_mono(cam_id, frame_bgr, self.calibration_bundle, now)
+    #                     except Exception as e:
+    #                         self.logger.debug(f"MDE mono error for {cam_id}: {e}")
+    #                         result = None
+    #                     if result is None:
+    #                         continue
+    #
+    #                     # Cache latest result and summary
+    #                     self._latest_depth_results[cam_id] = result
+    #                     self._last_depth_summary[cam_id] = result.summary
+    #
+    #                     # Throttle diagnostics to ~5s per camera
+    #                     if (now - last_pub.get(cam_id, 0.0)) >= 5.0:
+    #                         last_pub[cam_id] = now
+    #                         room_id = self._camera_room_map.get(cam_id, cam_id)
+    #                         if self._depth_publisher:
+    #                             try:
+    #                                 self._depth_publisher.publish_depth_summary(result, room_id)
+    #                             except Exception as e:
+    #                                 self.logger.debug(f"Depth publisher error: {e}")
+    #
+    #                         summary_message = {
+    #                             'type': 'ma_diagnostics',
+    #                             'cam_id': cam_id,
+    #                             'summary': {
+    #                                 'median': result.summary.median,
+    #                                 'p10': result.summary.p10,
+    #                                 'p90': result.summary.p90,
+    #                                 'conf_mean': result.summary.conf_mean,
+    #                                 'valid_ratio': result.summary.valid_ratio,
+    #                                 'sample_count': result.summary.sample_count,
+    #                                 'method': 'mde' if result.summary.conf_mean >= getattr(self.depth_source, 'min_conf', 0.5) else 'floor'
+    #                             },
+    #                             'ts': result.ts_us
+    #                         }
+    #                         self._schedule_ws_broadcast(summary_message)
+    #             except Exception as e:
+    #                 self.logger.debug(f"MDE scheduler tick error: {e}")
+    #             finally:
+    #                 try:
+    #                     time.sleep(max(0.05, mono_interval * 0.5))
+    #                 except Exception:
+    #                     time.sleep(0.1)
+    #
+    #     t = threading.Thread(target=loop, name="MapAnythingScheduler", daemon=True)
+    #     t.start()
+    #     self.logger.info("✅ MapAnything mono scheduler loop started")
 
     def _start_jpeg_processing_loop(self):
         """Start JPEG processing loop for native DeepStream OSD mode"""
         self.logger.info("Starting JPEG processing loop for native DeepStream OSD")
+        if not getattr(self.config.websocket, 'MOSAIC_BROADCAST', True):
+            self.logger.info("Mosaic broadcast disabled; skipping JPEG loop")
+            return
         
         def jpeg_processing_loop():
             """Process JPEG frames from multi-stream processor and broadcast them"""
             self.logger.info("JPEG processing loop started")
-            
-            # Get source information from multi-stream processor (wait for REST seeding)
-            source_info = getattr(self.multi_stream_processor, 'source_info', {}) or {}
-            if not source_info:
-                start_wait = time.time()
-                while time.time() - start_wait < 20 and not source_info and self.running:
-                    time.sleep(0.5)
-                    source_info = getattr(self.multi_stream_processor, 'source_info', {}) or {}
-            if not source_info:
-                self.logger.error("No source info available from multi-stream processor after waiting; aborting JPEG loop")
+
+            target_cam = getattr(self.config.websocket, 'MOSAIC_TARGET_CAMERA', 'mosaic')
+            cam_id_bytes = target_cam.encode('utf-8')
+            if len(cam_id_bytes) > 255:
+                self.logger.error(f"Mosaic camera ID too long to encode header: {target_cam}")
                 return
-            # Per-source counters to surface activity
-            frames_sent = {sid: 0 for sid in source_info.keys()}
+            header = bytes([len(cam_id_bytes)]) + cam_id_bytes
+            frames_sent = 0
             last_info_log = time.time()
-            self.logger.info(f"Processing JPEG data for {len(source_info)} sources: {list(source_info.keys())}")
-            # Precompute headers for each camera clean name
-            for sid, info in source_info.items():
-                camera_id = info['clean_name']
-                cam_id_bytes = camera_id.encode('utf-8')
-                if len(cam_id_bytes) <= 255:
-                    self._ws_header_cache[camera_id] = bytes([len(cam_id_bytes)]) + cam_id_bytes
-                else:
-                    self.logger.error(f"Camera ID too long to cache header: {camera_id}")
-            
-            heartbeat_t = time.time()
             while self.running:
                 try:
-                    # Log JPEG loop tick for debugging
-                    #self.logger.debug("TRACE JPEG loop tick")
-                    
-                    # Heartbeat every 5 s
-                    if time.time() - heartbeat_t > 5:
-                        try:
-                            qsizes = {sid:q.qsize() for sid,q in self.multi_stream_processor.jpeg_queues.items()}
-                            self.logger.debug(f"JPEG loop heartbeat – queue sizes: {qsizes}")
-                        except Exception:
-                            pass
-                        heartbeat_t = time.time()
-                        # Process each source
-                    for source_id, info in source_info.items():
-                        if not self.running:
-                            break
-                            
-                        # Read and coalesce to latest JPEG for this source (drain queue)
-                        jpeg_bytes = None
-                        try:
-                            q = getattr(self.multi_stream_processor, 'jpeg_queues', {}).get(source_id)
-                        except Exception:
-                            q = None
-                        if q is not None:
-                            try:
-                                # Blocking read for first item
-                                jpeg_bytes = q.get(timeout=0.1)
-                                # Drain any additional queued frames to keep only the latest
-                                drained = 0
-                                while True:
-                                    try:
-                                        more = q.get_nowait()
-                                        jpeg_bytes = more
-                                        drained += 1
-                                    except queue.Empty:
-                                        break
-                                # Optional: debug drain count at low rate
-                                # if drained > 0:
-                                #     self.rate_limited_logger.debug(f"Drained {drained} frames for source {source_id}")
-                            except queue.Empty:
-                                jpeg_bytes = None
-
-                        # If mosaic mode is enabled, skip per-camera WS broadcast
-                        if getattr(self.config.websocket, 'MOSAIC_BROADCAST', False):
-                            # Optionally, we could cache latest JPEGs here for reuse
-                            continue
-
-                        if jpeg_bytes and self.websocket_server:
-                            # Use clean camera name for frontend
-                            camera_id = info['clean_name']
-                            # Get or compute header
-                            header = self._ws_header_cache.get(camera_id)
-                            if header is None:
-                                cam_id_bytes = camera_id.encode('utf-8')
-                                if len(cam_id_bytes) <= 255:
-                                    header = bytes([len(cam_id_bytes)]) + cam_id_bytes
-                                    self._ws_header_cache[camera_id] = header
-                                else:
-                                    self.logger.error(f"Camera ID too long: {len(cam_id_bytes)} bytes for {camera_id}")
-                                    continue
-                            # Send precomputed header + payload
-                            msg = header + jpeg_bytes
-                            self.websocket_server.broadcast_sync(msg)
-                            # Count frames per source and occasionally surface INFO logs
-                            try:
-                                frames_sent[source_id] += 1
-                            except Exception:
-                                frames_sent[source_id] = 1
-                            self.rate_limited_logger.debug(f"Broadcast JPEG frame for {camera_id}: {len(jpeg_bytes)} bytes")
-
-                    # Periodic INFO summary: frames sent and JPEG queue sizes
                     if time.time() - last_info_log >= 5.0:
                         try:
-                            qsizes = {sid: q.qsize() for sid, q in self.multi_stream_processor.jpeg_queues.items()}
+                            mosaic_queue = getattr(self.multi_stream_processor, 'mosaic_queue', None)
+                            qsize = mosaic_queue.qsize() if mosaic_queue is not None else 'N/A'
                         except Exception:
-                            qsizes = {}
-                        summary_counts = {source_id: frames_sent.get(source_id, 0) for source_id in source_info.keys()}
-                        self.logger.debug(f"📤 JPEG broadcast summary (last 5s): sent={summary_counts} | queues={qsizes} | clients={len(getattr(self.websocket_server, 'connected_clients', []))}")
-                        # Reset counters for next window
-                        frames_sent = {sid: 0 for sid in source_info.keys()}
+                            qsize = 'N/A'
+                        clients = len(getattr(self.websocket_server, 'connected_clients', [])) if self.websocket_server else 0
+                        self.logger.debug(f"JPEG loop heartbeat – mosaic queue: {qsize}")
+                        self.logger.debug(f"📤 JPEG broadcast summary (last 5s): sent={frames_sent} | clients={clients}")
+                        frames_sent = 0
                         last_info_log = time.time()
+
+                    ok = False
+                    jpeg_bytes = None
+                    try:
+                        if hasattr(self.multi_stream_processor, 'read_mosaic_jpeg'):
+                            ok, jpeg_bytes = self.multi_stream_processor.read_mosaic_jpeg(timeout=0.1)
+                    except Exception as read_exc:
+                        self.logger.debug(f"read_mosaic_jpeg error: {read_exc}")
+                        ok, jpeg_bytes = False, None
+                    if not ok or not jpeg_bytes:
+                        time.sleep(0.033)
+                        continue
+
+                    if self.websocket_server:
+                        msg = header + jpeg_bytes
+                        self.websocket_server.broadcast_sync(msg)
+                        frames_sent += 1
+                        self.rate_limited_logger.debug(f"Broadcast mosaic JPEG: {len(jpeg_bytes)} bytes")
                 
                 except Exception as e:
                     self.logger.error(f"Error in JPEG processing loop: {e}")
@@ -984,20 +943,6 @@ class ApplicationManager:
         target_cam = getattr(self.config.websocket, 'MOSAIC_TARGET_CAMERA', 'living-room')
         fps_limit = max(1, int(getattr(self.config.websocket, 'MAX_FPS', 10)))
         period = 1.0 / float(fps_limit)
-
-        # Resolve sensor ordering and prepare cache for last-decoded frames
-        try:
-            source_info = getattr(self.multi_stream_processor, 'source_info', {}) or {}
-            sensor_ids = list(source_info.keys())
-        except Exception:
-            sensor_ids = []
-
-        last_frames: Dict[int, Any] = {}
-
-        def _decode(b: bytes):
-            import numpy as _np
-            a = _np.frombuffer(b, dtype=_np.uint8)
-            return cv2.imdecode(a, cv2.IMREAD_COLOR)
 
         def _mosaic_loop():
             next_tick = time.time()
@@ -1369,6 +1314,8 @@ class ApplicationManager:
             return {'ok': False, 'error': str(e)}
 
     def _create_depth_publisher(self) -> Optional[DepthDiagnosticsPublisher]:
+        if not getattr(self.config.integrations, 'ENABLE_MAPANYTHING', False):
+            return None
         try:
             integrations = self.config.integrations
             if not getattr(integrations, 'ENABLE_OCCUPANCY_PUBLISH', True):
@@ -1393,7 +1340,7 @@ class ApplicationManager:
             return None
 
     def _schedule_depth_inference(self, analysis_frame: AnalysisFrame) -> None:
-        if self.depth_source is None:
+        if self.depth_source is None or self._depth_executor is None:
             return
         if analysis_frame.frame is None:
             return
@@ -1911,38 +1858,9 @@ class ApplicationManager:
         # STEP 1: Set TensorRT shutdown mode to suppress error logging
         set_tensorrt_shutdown_mode(True)
         
-        # STEP 2: Early GPU cleanup BEFORE stopping processors (while CUDA context is valid)
-        self.logger.info("Starting early GPU resource cleanup...")
-        
-        # Check if CUDA is available before attempting GPU cleanup
-        if torch.cuda.is_available() and torch.cuda.device_count() > 0:
-            # Clean up TensorRT engines first, while CUDA context is still valid
-            try:
-                # Clean up multi-stream processor GPU resources
-                if hasattr(self, 'multi_stream_processor') and self.multi_stream_processor:
-                    try:
-                        # DeepStream handles its own GPU cleanup internally
-                        self.logger.info("Early cleanup: Multi-stream processor GPU resources")
-                    except Exception as e:
-                        self.logger.warning(f"Error in early GPU cleanup for multi-stream processor: {e}")
-                
-                # Force cleanup all GPU resources via consolidated pipeline
-                # cleanup_all_gpu_resources() # This function is deprecated
-                self.logger.info("Early cleanup: all GPU resources via unified pipeline")
-                
-                # Additional GPU memory pool cleanup if available
-                try:
-                    from gpu_memory_pool import get_global_memory_pool
-                    memory_pool = get_global_memory_pool()
-                    memory_pool.clear_pools()
-                    self.logger.info("Early cleanup: GPU memory pools")
-                except Exception as e:
-                    self.logger.debug(f"GPU memory pool cleanup not available: {e}")
-                    
-            except Exception as e:
-                self.logger.warning(f"Error during early GPU cleanup: {e}")
-        else:
-            self.logger.warning("CUDA not available or no devices, skipping GPU cleanup")
+        # STEP 2: Defer GPU cleanup until after pipeline fully stops to avoid cudaErrorCudartUnloading
+        self._defer_gpu_cleanup = True
+        self.logger.info("Deferring GPU resource cleanup until after pipeline stops")
         
         # STEP 3: Stop multi-stream processor (after GPU cleanup)
         if hasattr(self, 'multi_stream_processor') and self.multi_stream_processor:
@@ -2014,10 +1932,32 @@ class ApplicationManager:
             except Exception as e:
                 self.logger.error(f"Error stopping CPU profiling: {e}")
 
-        try:
-            self._depth_executor.shutdown(wait=False, cancel_futures=True)
-        except Exception as exc:
-            self.logger.debug(f"Depth executor shutdown error: {exc}")
+        # STEP 8: Final GPU cleanup AFTER all processors/threads have stopped
+        if getattr(self, "_defer_gpu_cleanup", False):
+            # Check if CUDA is available before attempting GPU cleanup
+            if torch.cuda.is_available() and torch.cuda.device_count() > 0:
+                try:
+                    self.logger.info("Final GPU cleanup: releasing memory pools and caches")
+                    # Additional GPU memory pool cleanup if available
+                    try:
+                        from gpu_memory_pool import get_global_memory_pool
+                        memory_pool = get_global_memory_pool()
+                        # Stop monitor and clear pools safely
+                        memory_pool.shutdown()
+                        self.logger.info("Final GPU cleanup: GPU memory pools released")
+                    except Exception as e:
+                        self.logger.debug(f"GPU memory pool cleanup not available: {e}")
+                except Exception as e:
+                    self.logger.warning(f"Error during final GPU cleanup: {e}")
+            else:
+                self.logger.info("CUDA not available or no devices during final GPU cleanup, skipping")
+
+        executor = getattr(self, '_depth_executor', None)
+        if executor is not None:
+            try:
+                executor.shutdown(wait=False, cancel_futures=True)
+            except Exception as exc:
+                self.logger.debug(f"Depth executor shutdown error: {exc}")
 
         if getattr(self, '_depth_publisher', None) is not None:
             try:

@@ -82,6 +82,8 @@ class UnifiedGPUMemoryPool:
         # Pre-allocate common sizes
         self._preallocate_common_sizes()
         
+        # Stop signal for background thread
+        self._stop_event = threading.Event()
         # Start monitoring thread if enabled
         if self.enable_monitoring:
             self._monitoring_thread = threading.Thread(target=self._monitor_memory, daemon=True)
@@ -270,9 +272,13 @@ class UnifiedGPUMemoryPool:
     
     def _monitor_memory(self):
         """Background thread to monitor memory usage and detect leaks."""
-        while True:
+        while not self._stop_event.is_set():
             try:
-                time.sleep(300)  # Check every 5 minutes (reduced frequency)
+                # Sleep in small chunks so we can react quickly to shutdown
+                for _ in range(300):
+                    if self._stop_event.is_set():
+                        break
+                    time.sleep(1.0)
                 
                 with self._lock:
                     # Check for memory leaks
@@ -301,6 +307,7 @@ class UnifiedGPUMemoryPool:
                 
             except Exception as e:
                 self.logger.error(f"Error in memory monitoring: {e}")
+        self.logger.debug("GPU memory pool monitor thread exiting")
     
     def get_stats(self) -> Dict[str, any]:
         """Get memory pool statistics."""
@@ -334,6 +341,20 @@ class UnifiedGPUMemoryPool:
         
         torch.cuda.empty_cache()
         self.logger.info("Memory pools cleared")
+
+    def shutdown(self):
+        """Stop monitoring thread and clear pools safely."""
+        try:
+            self._stop_event.set()
+            if getattr(self, "_monitoring_thread", None) is not None and self._monitoring_thread.is_alive():
+                self._monitoring_thread.join(timeout=2.0)
+        except Exception:
+            pass
+        try:
+            self.clear_pools()
+        except Exception:
+            # Avoid raising during shutdown
+            pass
 
 
 # Global singleton instance

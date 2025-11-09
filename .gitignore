@@ -42,4 +42,6 @@ ma_onnx_out_clean/
 ma_onnxTRT/
 ./ma_onnx_out.tar.gz
 .git/
+pipelines/*.so
+
 

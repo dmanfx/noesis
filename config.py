@@ -19,7 +19,6 @@ import os
 os.environ['no_proxy'] = '*'
 import time
 from dataclasses import dataclass, field
-from datetime import datetime
 from typing import Dict, List, Optional, Any
 import configparser  # Add if not present
 
@@ -34,7 +33,7 @@ class AppConfig:
         APP_NAME: str = "YOLO Video Tracking"
         VERSION: str = "1.0.0"
         START_TIME: float = field(default_factory=time.time)
-        LOG_LEVEL: int = 30  # Warning
+        LOG_LEVEL: int = 30  #info = 20, Warning = 30, Error = 40
         LOG_FILE: Optional[str] = "logs/app.log"
     
     @dataclass
@@ -125,7 +124,6 @@ class AppConfig:
         
         def __post_init__(self):
             """Post-initialization to handle deprecated settings and warnings."""
-            import warnings
             import logging
             
             logger = logging.getLogger("config.ProcessingSettings")
@@ -306,6 +304,7 @@ class AppConfig:
         NVENC_BITRATE: int = 4000000  # 4 Mbps
         JPEG_QUALITY: int = 85  # JPEG encoding quality
         USE_NATIVE_DEEPSTREAM_OSD: bool = True  # If True, use DeepStream's native OSD, skip Python annotation
+        ENABLE_EGL: bool = True  # Enable EGL display branch in DeepStream pipeline
 
         # Bounding-box temporal smoothing (reduces size flicker/shudder)
         BBOX_SMOOTHING_ENABLED: bool = True
@@ -395,6 +394,7 @@ class AppConfig:
     @dataclass
     class IntegrationsSettings:
         """Integration settings for MQTT + Influx occupancy publishing"""
+        ENABLE_MAPANYTHING: bool = False
         ENABLE_OCCUPANCY_PUBLISH: bool = True
         HEARTBEAT_SEC: int = 60
 

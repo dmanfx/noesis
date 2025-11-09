@@ -369,7 +369,16 @@ def build_pipeline(yaml_path: str | Path) -> DS8Pipeline:
     osd = Component(
         name="osd",
         element="nvdsosd",
-        config={},
+        config={
+            # CPU mode for broader compatibility; adjust if you prefer GPU path
+            "process-mode": 1,
+            # Show instance segmentation masks from NvDsInferInstanceMaskInfo
+            "display-mask": 1,
+            # Hide bbox rectangles to emphasize masks; set to 1 if you want both
+            "display-bbox": 0,
+            # Keep labels visible (class name + confidence)
+            "display-text": 1,
+        },
         downstream=[],
     )
     pipeline.components[osd.name] = osd

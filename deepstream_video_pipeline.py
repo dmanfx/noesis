@@ -762,11 +762,45 @@ class DeepStreamVideoPipeline:
 
             mosaic_osd = elements.get('mosaic_osd')
             if mosaic_osd:
-                mosaic_osd.set_property("process-mode", 1)
-                mosaic_osd.set_property("display-text", 1)
-                mosaic_osd.set_property("display-bbox", 1)
-                # Enable mask rendering for instance segmentation
-                mosaic_osd.set_property("display-mask", 1)
+                # Prefer configuration via INI, similar to other plugins
+                _osd_cfg = getattr(self.config.processing, 'DEEPSTREAM_OSD_CONFIG', 'pipelines/config_osd.ini')
+                if _osd_cfg and not os.path.isabs(_osd_cfg):
+                    _osd_cfg = os.path.join(_root_dir, _osd_cfg)
+                applied_osd_cfg = False
+                if _osd_cfg and os.path.exists(_osd_cfg):
+                    try:
+                        cp = configparser.ConfigParser(interpolation=None, delimiters=("="))
+                        cp.read(_osd_cfg)
+                        if cp.has_section('property'):
+                            for key, raw in cp.items('property'):
+                                val_s = str(raw).strip()
+                                val_l = val_s.lower()
+                                if val_l in {"true", "yes", "y"}:
+                                    val = True
+                                elif val_l in {"false", "no", "n"}:
+                                    val = False
+                                else:
+                                    try:
+                                        if val_s.isdigit() or (val_s.startswith('-') and val_s[1:].isdigit()):
+                                            val = int(val_s)
+                                        else:
+                                            val = float(val_s)
+                                    except Exception:
+                                        val = val_s
+                                try:
+                                    mosaic_osd.set_property(key, val)
+                                except Exception as e:
+                                    self.logger.warning(f"Unable to set nvdsosd property {key}={val} from {_osd_cfg}: {e}")
+                            applied_osd_cfg = True
+                            self.logger.info("✅ Using nvdsosd config: %s", _osd_cfg)
+                    except Exception as e:
+                        self.logger.warning(f"Failed to apply nvdsosd config {_osd_cfg}: {e}")
+                if not applied_osd_cfg:
+                    # Fallback defaults: mask on, bbox off, text on, CPU mode
+                    mosaic_osd.set_property("process-mode", 1)
+                    mosaic_osd.set_property("display-text", 1)
+                    mosaic_osd.set_property("display-bbox", 0)
+                    mosaic_osd.set_property("display-mask", 1)
 
             # Configure live queues with consistent leaky buffering
             for queue_name in ("q_after_pgie", "q_before_tracker", "q_after_tracker", "mosaic_q", "jpeg_q", "egl_q"):

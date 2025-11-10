@@ -17,22 +17,131 @@ try:  # DeepStream Python bindings
 except Exception:  # pragma: no cover - DS runtime optional at import time
     pyds = None  # type: ignore
 
-try:  # DS8 operator
+try:  # DS8 operator (pyds style)
     from pyds import NvDsBatchMetaOperator  # type: ignore
 except Exception:  # pragma: no cover
     NvDsBatchMetaOperator = None  # type: ignore
+
+# Optional: DS8 Service Maker operator (separate package in DS8)
+try:  # pragma: no cover - optional at import time
+    from pyservicemaker._pydeepstream import (  # type: ignore
+        BatchMetadataOperator as _SMBatchMetadataOperator,
+        BatchMetadata as _SMBatchMetadata,
+        FrameMetadata as _SMFrameMetadata,
+        ObjectMetadata as _SMObjectMetadata,
+        AnalyticsFrameMeta as _SMAnalyticsFrameMeta,
+        AnalyticsObjInfo as _SMAnalyticsObjInfo,
+    )
+except Exception:  # pragma: no cover
+    _SMBatchMetadataOperator = None  # type: ignore
+    _SMBatchMetadata = None  # type: ignore
+    _SMFrameMetadata = None  # type: ignore
+    _SMObjectMetadata = None  # type: ignore
+    _SMAnalyticsFrameMeta = None  # type: ignore
+    _SMAnalyticsObjInfo = None  # type: ignore
 
 
 # ------------------------- Operator lifecycle -------------------------
 
 def create_operator(gst_buffer: Any) -> Optional[Any]:
-    if NvDsBatchMetaOperator is None:
-        return None
-    try:
-        return NvDsBatchMetaOperator(gst_buffer)  # type: ignore[call-arg]
-    except Exception:
-        logger.debug("NvDsBatchMetaOperator construction failed", exc_info=True)
-        return None
+    """Create a metadata operator for the given Gst.Buffer.
+
+    Preference order:
+    1) DS8 pyds NvDsBatchMetaOperator if available
+    2) DS8 Service Maker BatchMetadataOperator wrapper if available
+    3) None (legacy traversal only)
+    """
+    # 1) Native DS8 pyds operator
+    if NvDsBatchMetaOperator is not None:
+        try:
+            return NvDsBatchMetaOperator(gst_buffer)  # type: ignore[call-arg]
+        except Exception:
+            logger.debug("NvDsBatchMetaOperator construction failed", exc_info=True)
+
+    # 2) DS8 Service Maker operator wrapper
+    if _SMBatchMetadataOperator is not None:
+        try:
+            return _ServiceMakerOperator(gst_buffer)
+        except Exception:
+            logger.debug("Service Maker BatchMetadataOperator construction failed", exc_info=True)
+
+    # 3) Fallback to legacy traversal (return None)
+    return None
+
+
+class _ServiceMakerOperator:
+    """Lightweight adapter over DS8 Service Maker BatchMetadataOperator.
+
+    Exposes a minimal interface compatible with meta_ops helpers by providing:
+    - get_frames() -> List[FrameMetadata]
+    - get_objects(frame_meta) -> List[ObjectMetadata]
+    - iter_user_meta(holder, level) -> List[Any] (analytics-only convenience)
+
+    Notes:
+    - This wrapper does not currently implement mutation helpers (e.g., remove_object).
+      For removals, meta_ops.remove_object falls back to pyds API if available.
+    """
+
+    __slots__ = ("_op", "_gst_buffer", "is_service_maker")
+
+    def __init__(self, gst_buffer: Any) -> None:
+        if _SMBatchMetadataOperator is None:
+            raise RuntimeError("Service Maker operator unavailable")
+        self._gst_buffer = gst_buffer
+        self._op = _SMBatchMetadataOperator(gst_buffer)  # type: ignore[call-arg]
+        # Hint for helper functions
+        self.is_service_maker = True
+
+    def _with_batch(self, fn):
+        result = []
+
+        def _cb(batch_meta: _SMBatchMetadata):  # type: ignore[type-arg]
+            try:
+                res = fn(batch_meta)
+                if res is not None:
+                    # normalize to list for easy return
+                    if isinstance(res, list):
+                        result.extend(res)
+                    else:
+                        result.append(res)
+            except Exception:
+                logger.debug("Service Maker handle_metadata callback failed", exc_info=True)
+
+        try:
+            self._op.handle_metadata(_cb)
+        except Exception:
+            logger.debug("Service Maker handle_metadata failed", exc_info=True)
+        return result
+
+    # Frame/object traversal
+    def get_frames(self) -> List[Any]:
+        def _collect(batch: Any) -> List[Any]:
+            items = getattr(batch, "frame_items", None)
+            return list(items) if items is not None else []
+
+        frames = self._with_batch(_collect)
+        return frames
+
+    def __iter__(self):  # allow list(operator) pattern
+        return iter(self.get_frames())
+
+    def get_objects(self, frame_meta: Any) -> List[Any]:
+        try:
+            items = getattr(frame_meta, "object_items", None)
+            return list(items) if items is not None else []
+        except Exception:
+            return []
+
+    # Analytics user-meta convenience iterator for Service Maker typed metadata
+    def iter_user_meta(self, holder: Any, level: str) -> List[Any]:
+        try:
+            if level == "frame":
+                items = getattr(holder, "nvdsanalytics_frame_items", None)
+            else:
+                items = getattr(holder, "nvdsanalytics_obj_items", None)
+            return list(items) if items is not None else []
+        except Exception:
+            return []
 
 
 def _ensure_iterable(value: Any) -> List[Any]:
@@ -147,7 +256,19 @@ def iter_objects(operator: Optional[Any], frame_meta: Any) -> List[Any]:
 
 def iter_user_meta(operator: Optional[Any], holder: Any, level: str) -> List[Any]:
     metas: List[Any] = []
+    # Prefer operator-provided iteration
     if operator is not None:
+        # Service Maker typed metadata support
+        sm_iter = getattr(operator, "iter_user_meta", None)
+        if callable(sm_iter):
+            try:
+                metas = _ensure_iterable(sm_iter(holder, level))
+                if metas:
+                    return metas
+            except Exception:
+                logger.debug("Service Maker iter_user_meta failed", exc_info=True)
+
+        # pyds NvDsBatchMetaOperator node-list traversal if available
         get_list = getattr(operator, "get_user_meta_list", None)
         get_meta = getattr(operator, "get_user_meta", None)
         get_next = getattr(operator, "get_next_user_meta", None)
@@ -314,6 +435,13 @@ def remove_object(operator: Optional[Any], frame_meta: Any, obj_meta: Any) -> bo
 # ------------------------- Analytics casting -------------------------
 
 def cast_analytics_obj_info(operator: Optional[Any], user_meta: Any) -> Optional[Any]:
+    # Service Maker typed analytics object info
+    try:
+        if _SMAnalyticsObjInfo is not None and isinstance(user_meta, _SMAnalyticsObjInfo):
+            return user_meta
+    except Exception:
+        pass
+    # pyds NvDsBatchMetaOperator casting
     if operator is not None:
         caster = getattr(operator, "cast_to_analytics_obj_info", None)
         if callable(caster):
@@ -330,6 +458,13 @@ def cast_analytics_obj_info(operator: Optional[Any], user_meta: Any) -> Optional
 
 
 def cast_analytics_frame_meta(operator: Optional[Any], user_meta: Any) -> Optional[Any]:
+    # Service Maker typed analytics frame meta
+    try:
+        if _SMAnalyticsFrameMeta is not None and isinstance(user_meta, _SMAnalyticsFrameMeta):
+            return user_meta
+    except Exception:
+        pass
+    # pyds NvDsBatchMetaOperator casting
     if operator is not None:
         caster = getattr(operator, "cast_to_analytics_frame_meta", None)
         if callable(caster):
@@ -346,6 +481,25 @@ def cast_analytics_frame_meta(operator: Optional[Any], user_meta: Any) -> Option
 
 
 def get_meta_type(operator: Optional[Any], user_meta: Any) -> Any:
+    # Service Maker typed metadata emulates NvDs meta type identifiers
+    try:
+        if _SMAnalyticsObjInfo is not None and isinstance(user_meta, _SMAnalyticsObjInfo):
+            if pyds is not None:
+                try:
+                    return pyds.nvds_get_user_meta_type("NVIDIA.DSANALYTICSOBJ.USER_META")  # type: ignore
+                except Exception:
+                    return "NVIDIA.DSANALYTICSOBJ.USER_META"
+            return "NVIDIA.DSANALYTICSOBJ.USER_META"
+        if _SMAnalyticsFrameMeta is not None and isinstance(user_meta, _SMAnalyticsFrameMeta):
+            if pyds is not None:
+                try:
+                    return pyds.nvds_get_user_meta_type("NVIDIA.DSANALYTICSFRAME.USER_META")  # type: ignore
+                except Exception:
+                    return "NVIDIA.DSANALYTICSFRAME.USER_META"
+            return "NVIDIA.DSANALYTICSFRAME.USER_META"
+    except Exception:
+        pass
+
     if operator is not None:
         getter = getattr(operator, "get_meta_type", None)
         if callable(getter):

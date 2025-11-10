@@ -196,6 +196,15 @@ class DeepStreamVideoPipeline:
         self.egl_queue: Optional[Gst.Element] = None
         self.egl_sink: Optional[Gst.Element] = None
         self._egl_tee_pad: Optional[Gst.Pad] = None
+        # MapAnything on-demand branch state (pre-PGIE tee → demux → per-stream appsinks)
+        self._pre_pgie_tee: Optional[Gst.Element] = None
+        self._ma_demux: Optional[Gst.Element] = None
+        self._ma_branch_ready: bool = False
+        self._ma_demux_requested_src: Dict[int, Gst.Pad] = {}
+        self._ma_valves: Dict[int, Gst.Element] = {}
+        self._ma_sinks: Dict[int, GstApp.AppSink] = {}
+        self._ma_frame_queues: Dict[int, queue.Queue] = {sid: queue.Queue(maxsize=1) for sid in self.sensor_ids}
+        self._ma_branch_lock = threading.Lock()
         
         # Add tracking history for trail visualization (per sensor_id, per track_id)
         self.trail_history_by_sensor: Dict[int, Dict[int, deque]] = defaultdict(
@@ -487,6 +496,296 @@ class DeepStreamVideoPipeline:
             self.logger.debug("Pruned %s object(s) via post-analytics exclusion probe", removed_total)
 
         return Gst.PadProbeReturn.OK
+
+    # ---------------- MapAnything on-demand branch ----------------
+    # Rationale:
+    # - Insert a thread boundary immediately after nvstreamdemux via a tiny, leaky queue so
+    #   demux never back-pressures the tee or main PGIE branch.
+    # - Place the valve AFTER that queue; when "drop=True" it still consumes and drops so the
+    #   upstream remains unblocked. When toggled on, only the specific per-stream leg flows.
+    # - Use SystemMemory BGR caps for the appsink to produce CPU-accessible frames for MA RPC.
+    # - Keep pre_pgie_tee.allow-not-linked=True for dynamic attach/detach safety.
+    def _setup_mapanything_branch(self, elements: Dict[str, Any]) -> None:
+        """Create and link a pre-PGIE tee → nvstreamdemux → per-stream BGR appsinks with valves.
+
+        Frames only flow when valves are opened on-demand. By default, valves drop all buffers.
+        """
+        pre_tee: Gst.Element = elements['pre_pgie_tee']
+        pre_ma_q: Gst.Element = elements.get('pre_pgie_q_ma')
+        ma_demux: Gst.Element = elements['ma_demux']
+
+        # Link pre_tee → ma_demux via requested src pad
+        tee_src1 = pre_tee.get_request_pad("src_1")
+        if not tee_src1:
+            raise RuntimeError("Failed to request pre_pgie_tee src_1 pad for MA branch")
+        if pre_ma_q is not None:
+            pre_ma_sink = pre_ma_q.get_static_pad("sink")
+            if not pre_ma_sink:
+                raise RuntimeError("Failed to get pre_pgie_q_ma sink pad")
+            if tee_src1.link(pre_ma_sink) != Gst.PadLinkReturn.OK:
+                raise RuntimeError("Failed to link pre_pgie_tee to pre_pgie_q_ma")
+            if not pre_ma_q.link(ma_demux):
+                raise RuntimeError("Failed to link pre_pgie_q_ma to ma_demux")
+        else:
+            demux_sink = ma_demux.get_static_pad("sink")
+            if not demux_sink:
+                raise RuntimeError("Failed to get ma_demux sink pad")
+            if tee_src1.link(demux_sink) != Gst.PadLinkReturn.OK:
+                raise RuntimeError("Failed to link pre_pgie_tee to ma_demux")
+
+        # Build per-stream branches
+        for sensor_id in self.sensor_ids:
+            stream_id = self._stream_id_for_sensor(sensor_id)
+            q = Gst.ElementFactory.make("queue", f"ma_q_{stream_id}")
+            valve = Gst.ElementFactory.make("valve", f"ma_valve_{stream_id}")
+            conv = Gst.ElementFactory.make("nvvideoconvert", f"ma_conv_{stream_id}")
+            caps = Gst.ElementFactory.make("capsfilter", f"ma_caps_{stream_id}")
+            sink = Gst.ElementFactory.make("appsink", f"ma_sink_{stream_id}")
+            if not all([q, valve, conv, caps, sink]):
+                raise RuntimeError(f"Failed to create MapAnything branch elements for stream {stream_id}")
+            try:
+                self.pipeline.add(q); self.pipeline.add(valve); self.pipeline.add(conv); self.pipeline.add(caps); self.pipeline.add(sink)
+            except Exception:
+                pass
+            # Keep MA queue tiny and leaky so it can never backpressure upstream
+            try:
+                q.set_property("max-size-buffers", 1)
+                q.set_property("max-size-bytes", 0)
+                q.set_property("max-size-time", 0)
+                q.set_property("leaky", 2)  # LEAK_DOWNSTREAM
+            except Exception:
+                pass
+            # Configure caps to request CPU/SystemMemory BGR frames
+            caps.set_property("caps", Gst.Caps.from_string("video/x-raw(memory:SystemMemory), format=BGR"))
+            # Configure valve to be open initially (allows caps negotiation), will be closed after negotiation completes
+            valve.set_property("drop", False)
+            # Configure appsink for on-demand single-buffer
+            sink.set_property("emit-signals", True)
+            sink.set_property("drop", True)
+            sink.set_property("sync", False)
+            sink.set_property("max-buffers", 1)
+            # Connect callback
+            sink.connect("new-sample", self._on_new_ma_frame, sensor_id)
+            # Link static elements (queue BEFORE valve)
+            if not q.link(valve):
+                raise RuntimeError(f"Failed to link ma_q to valve for stream {stream_id}")
+            if not valve.link(conv):
+                raise RuntimeError(f"Failed to link valve to conv for stream {stream_id}")
+            if not conv.link(caps):
+                raise RuntimeError(f"Failed to link ma_conv to caps for stream {stream_id}")
+            if not caps.link(sink):
+                raise RuntimeError(f"Failed to link ma_caps to sink for stream {stream_id}")
+            # Link demux src_%u → (optional identity) → q
+            pad = ma_demux.get_request_pad(f"src_{stream_id}")
+            if not pad:
+                raise RuntimeError(f"Failed to request ma_demux src_{stream_id} pad")
+            # Optional identity to isolate allocation/caps; safe to fall back if creation fails
+            identity_el = None
+            try:
+                identity_el = Gst.ElementFactory.make("identity", f"ma_ident_{stream_id}")
+                if identity_el:
+                    identity_el.set_property("single-segment", True)
+                    self.pipeline.add(identity_el)
+            except Exception:
+                identity_el = None
+
+            if identity_el is not None:
+                ident_sink = identity_el.get_static_pad("sink")
+                if not ident_sink:
+                    raise RuntimeError(f"Failed to get identity sink pad for stream {stream_id}")
+                if pad.link(ident_sink) != Gst.PadLinkReturn.OK:
+                    raise RuntimeError(f"Failed to link ma_demux src_{stream_id} to identity_{stream_id}")
+                if not identity_el.link(q):
+                    raise RuntimeError(f"Failed to link identity_{stream_id} to ma_q_{stream_id}")
+            else:
+                q_sink = q.get_static_pad("sink")
+                if not q_sink:
+                    raise RuntimeError(f"Failed to get ma_q sink pad for stream {stream_id}")
+                if pad.link(q_sink) != Gst.PadLinkReturn.OK:
+                    raise RuntimeError(f"Failed to link ma_demux src_{stream_id} to ma_q_{stream_id}")
+            # Track branch components
+            self._ma_demux_requested_src[stream_id] = pad
+            self._ma_valves[sensor_id] = valve
+            self._ma_sinks[sensor_id] = sink  # type: ignore[assignment]
+            # Verify caps memory type for MA caps
+            try:
+                capstr = caps.get_property("caps").to_string()
+                if not capstr.startswith("video/x-raw(memory:SystemMemory)"):
+                    self.logger.debug("MA caps for sensor %s (stream %s) negotiated to %s", sensor_id, stream_id, capstr)
+            except Exception:
+                pass
+        # Save top-level for helpers
+        self._pre_pgie_tee = pre_tee
+        self._ma_demux = ma_demux
+
+    def _stream_id_for_sensor(self, sensor_id: int) -> int:
+        """Return the nvstreammux/demux stream index for a given sensor_id.
+
+        Uses the registration order mapping populated at init time.
+        """
+        try:
+            return int(self.source_idx_by_sensor_id.get(int(sensor_id), int(sensor_id)))
+        except Exception:
+            return int(sensor_id)
+
+    def enable_mapanything_for_sensor(self, sensor_id: int) -> None:
+        valve = self._ma_valves.get(sensor_id)
+        if not valve:
+            self.logger.warning("No MA valve for sensor %s", sensor_id)
+            return
+        try:
+            GLib.idle_add(valve.set_property, "drop", False, priority=GLib.PRIORITY_HIGH)
+        except Exception:
+            try:
+                valve.set_property("drop", False)
+            except Exception:
+                pass
+
+    def disable_mapanything_for_sensor(self, sensor_id: int) -> None:
+        valve = self._ma_valves.get(sensor_id)
+        if not valve:
+            self.logger.warning("No MA valve for sensor %s", sensor_id)
+            return
+        try:
+            GLib.idle_add(valve.set_property, "drop", True, priority=GLib.PRIORITY_HIGH)
+        except Exception:
+            try:
+                valve.set_property("drop", True)
+            except Exception:
+                pass
+
+    def enable_mapanything_all(self) -> None:
+        for sid in list(self._ma_valves.keys()):
+            self.enable_mapanything_for_sensor(sid)
+
+    def disable_mapanything_all(self) -> None:
+        for sid in list(self._ma_valves.keys()):
+            self.disable_mapanything_for_sensor(sid)
+
+    def _teardown_mapanything_branch(self) -> None:
+        # Close valves first to stop downstream while consuming/dropping
+        for sid, valve in list(self._ma_valves.items()):
+            try:
+                valve.set_property("drop", True)
+            except Exception:
+                pass
+        # Release requested demux pads
+        for stream_id, pad in list(self._ma_demux_requested_src.items()):
+            try:
+                if self._ma_demux and pad:
+                    self._ma_demux.release_request_pad(pad)
+            except Exception:
+                pass
+            self._ma_demux_requested_src.pop(stream_id, None)
+
+    def _on_new_ma_frame(self, appsink: GstApp.AppSink, sensor_id: int) -> Gst.FlowReturn:
+        try:
+            sample = appsink.emit("pull-sample")
+            if not sample:
+                return Gst.FlowReturn.OK
+            buf = sample.get_buffer()
+            caps = sample.get_caps()
+            if not buf or not caps:
+                return Gst.FlowReturn.OK
+            s = caps.get_structure(0)
+            width = s.get_value('width') if s and s.has_field('width') else None
+            height = s.get_value('height') if s and s.has_field('height') else None
+            if not isinstance(width, int) or not isinstance(height, int):
+                return Gst.FlowReturn.OK
+            success, map_info = buf.map(Gst.MapFlags.READ)
+            if not success:
+                return Gst.FlowReturn.OK
+            try:
+                frame = memoryview(map_info.data)[:]
+                # BGR packed
+                try:
+                    import numpy as _np
+                    arr = _np.frombuffer(frame, dtype=_np.uint8)
+                    arr = arr.reshape((int(height), int(width), 3))
+                except Exception:
+                    arr = None
+                if arr is not None:
+                    q = self._ma_frame_queues.get(sensor_id)
+                    if q is not None:
+                        # Clear stale frame if present to keep latest
+                        try:
+                            while not q.empty():
+                                q.get_nowait()
+                        except Exception:
+                            pass
+                        try:
+                            q.put_nowait(arr.copy())
+                        except Exception:
+                            pass
+            finally:
+                buf.unmap(map_info)
+        except Exception:
+            pass
+        return Gst.FlowReturn.OK
+
+    def _set_ma_valve(self, sensor_id: int, drop: bool) -> None:
+        valve = self._ma_valves.get(sensor_id)
+        if not valve:
+            return
+        try:
+            # Prefer scheduling onto GLib loop if available
+            if self.mainloop:
+                def _apply():
+                    try:
+                        valve.set_property("drop", bool(drop))
+                    except Exception:
+                        pass
+                    return False
+                GLib.idle_add(_apply)
+            else:
+                valve.set_property("drop", bool(drop))
+        except Exception:
+            pass
+
+    def _close_ma_valves_after_negotiation(self) -> bool:
+        """Close all MA valves after caps negotiation completes.
+        
+        This allows the nvstreamdemux to complete caps negotiation with all
+        downstream elements before we shut off the flow, preventing the demux
+        from blocking the tee and main pipeline.
+        
+        Returns False to stop the timeout callback from being called again.
+        """
+        # Close all valves
+        for sensor_id in list(self._ma_valves.keys()):
+            self.disable_mapanything_for_sensor(sensor_id)
+        self.logger.info("✅ Closed all MA valves after caps negotiation")
+        return False  # Stop the timeout callback
+
+    def read_ma_bgr(self, sensor_id: int, timeout: float = 1.5):
+        """Open the MA valve for a single frame and return BGR ndarray, then close valve.
+
+        Returns None if branch not ready or on timeout/error.
+        """
+        if not self._ma_branch_ready:
+            return None
+        if sensor_id not in self._ma_frame_queues:
+            return None
+        q = self._ma_frame_queues[sensor_id]
+        # Flush any stale entry
+        try:
+            while not q.empty():
+                q.get_nowait()
+        except Exception:
+            pass
+        # Open valve and wait briefly for a single frame
+        self._set_ma_valve(sensor_id, False)
+        # Allow frames to start flowing through the cold demux path
+        time.sleep(0.1)
+        try:
+            frame = q.get(timeout=max(0.05, float(timeout)))
+            self.logger.debug(f"Successfully captured frame for sensor {sensor_id}")
+            return frame
+        except Exception as exc:
+            self.logger.warning(f"Failed to capture frame for sensor {sensor_id} within timeout: {exc}")
+            return None
+        finally:
+            self._set_ma_valve(sensor_id, True)
 
     # ---- Exclusion ROI helpers ----
     def _post_load_exclusion_rois_from_config(self, path: Optional[str] = None) -> None:
@@ -815,7 +1114,7 @@ class DeepStreamVideoPipeline:
                     pass
 
             # Configure live queues with consistent leaky buffering
-            for queue_name in ("q_after_pgie", "q_before_tracker", "q_after_tracker", "mosaic_q", "jpeg_q", "egl_q"):
+            for queue_name in ("q_before_tracker", "q_after_tracker", "mosaic_q", "jpeg_q", "egl_q"):
                 queue_el = elements.get(queue_name)
                 if queue_el:
                     self._configure_live_queue(queue_el)
@@ -832,23 +1131,33 @@ class DeepStreamVideoPipeline:
         try:
             self.logger.info("------------- Linking Main Pipeline Chain-------------")
             
-            # Link main processing chain
+            # Link main processing chain with pre-PGIE tee
             if not elements['multiurisrc'].link(elements['nvdspreprocess']):
                 raise RuntimeError("Failed to link nvmultiurisrcbin to nvdspreprocess")
-            if not elements['nvdspreprocess'].link(elements['nvinfer']):
-                raise RuntimeError("Failed to link nvdspreprocess to nvinfer")
-            if not elements['nvinfer'].link(elements['q_after_pgie']): 
-                raise RuntimeError("Failed to link nvinfer to q_after_pgie")
-            # Add probe after nvinfer to verify detections
-            q_after_pgie_sink_pad = elements['q_after_pgie'].get_static_pad("sink")
-            if q_after_pgie_sink_pad:
-                q_after_pgie_sink_pad.add_probe(
+            # Insert pre-PGIE tee for MapAnything branch
+            if not elements['nvdspreprocess'].link(elements['pre_pgie_tee']):
+                raise RuntimeError("Failed to link nvdspreprocess to pre_pgie_tee")
+            # pre_pgie_tee → pre_pgie_q_main → nvinfer
+            pre_tee_src0 = elements['pre_pgie_tee'].get_request_pad("src_0")
+            if not pre_tee_src0:
+                raise RuntimeError("Failed to request pre_pgie_tee src_0 pad")
+            pre_main_sink = elements['pre_pgie_q_main'].get_static_pad("sink")
+            if not pre_main_sink:
+                raise RuntimeError("Failed to get pre_pgie_q_main sink pad")
+            if pre_tee_src0.link(pre_main_sink) != Gst.PadLinkReturn.OK:
+                raise RuntimeError("Failed to link pre_pgie_tee to pre_pgie_q_main")
+            if not elements['pre_pgie_q_main'].link(elements['nvinfer']):
+                raise RuntimeError("Failed to link pre_pgie_q_main to nvinfer")
+            # Add probe directly to nvinfer src pad to verify detections
+            nvinfer_src_pad = elements['nvinfer'].get_static_pad("src")
+            if nvinfer_src_pad:
+                nvinfer_src_pad.add_probe(
                     Gst.PadProbeType.BUFFER, self._nvinfer_output_probe, None
                 )
                 self.logger.info("✅ Attached nvinfer output probe for debugging")
             
-            if not elements['q_after_pgie'].link(elements['q_before_tracker']):
-                raise RuntimeError("Failed to link q_after_pgie to q_before_tracker")
+            if not elements['nvinfer'].link(elements['q_before_tracker']):
+                raise RuntimeError("Failed to link nvinfer to q_before_tracker")
             if not elements['q_before_tracker'].link(elements['nvtracker']): 
                 raise RuntimeError("Failed to link q_before_tracker to nvtracker")
             if not elements['nvtracker'].link(elements['q_after_tracker']): 
@@ -876,6 +1185,24 @@ class DeepStreamVideoPipeline:
             # Create primary elements
             multiurisrc = Gst.ElementFactory.make("nvmultiurisrcbin", "nvmultiurisrcbin")
             nvdspreprocess = Gst.ElementFactory.make("nvdspreprocess", "nvdspreprocess")
+            # Pre-PGIE tee (for MapAnything branch)
+            pre_pgie_tee = Gst.ElementFactory.make("tee", "pre_pgie_tee")
+            if pre_pgie_tee:
+                try:
+                    pre_pgie_tee.set_property("allow-not-linked", True)
+                except Exception:
+                    pass
+            # Queues right after tee to isolate backpressure
+            pre_pgie_q_main = Gst.ElementFactory.make("queue", "pre_pgie_q_main")
+            pre_pgie_q_ma = Gst.ElementFactory.make("queue", "pre_pgie_q_ma")
+            if pre_pgie_q_ma:
+                try:
+                    pre_pgie_q_ma.set_property("leaky", 2)  # downstream
+                    pre_pgie_q_ma.set_property("max-size-buffers", 1)
+                    pre_pgie_q_ma.set_property("max-size-bytes", 0)
+                    pre_pgie_q_ma.set_property("max-size-time", 0)
+                except Exception:
+                    pass
             nvinfer = Gst.ElementFactory.make("nvinfer", "nvinfer")
             
             # Analytics and Tracking
@@ -886,13 +1213,16 @@ class DeepStreamVideoPipeline:
             
             # Split to mosaic branch (tee duplicates post-analytics stream)
             main_tee = Gst.ElementFactory.make("tee", "main_tee")
+            # MapAnything demux (splits pre-PGIE batched buffers)
+            ma_demux = Gst.ElementFactory.make("nvstreamdemux", "ma_demux")
 
-            # Mosaic branch elements (GPU tiler → JPEG appsink)
+            # Mosaic branch elements (GPU tiler → RGBA → OSD → Tee → JPEG/EGL)
             mosaic_q = Gst.ElementFactory.make("queue", "mosaic_q")
             mosaic_tiler = Gst.ElementFactory.make("nvmultistreamtiler", "mosaic_tiler")
             mosaic_conv_pre = Gst.ElementFactory.make("nvvideoconvert", "mosaic_conv_pre")
             mosaic_caps_rgba = Gst.ElementFactory.make("capsfilter", "mosaic_caps_rgba")
             mosaic_osd = Gst.ElementFactory.make("nvdsosd", "mosaic_osd")
+            # Single post-OSD convert to I420 for nvjpegenc
             mosaic_conv_post = Gst.ElementFactory.make("nvvideoconvert", "mosaic_conv_post")
             mosaic_caps = Gst.ElementFactory.make("capsfilter", "mosaic_caps")
             mosaic_enc = Gst.ElementFactory.make("nvjpegenc", "mosaic_enc")
@@ -907,7 +1237,6 @@ class DeepStreamVideoPipeline:
                 egl_sink = Gst.ElementFactory.make("nveglglessink", "egl_sink")
 
             # Queues for pipeline robustness
-            q_after_pgie = Gst.ElementFactory.make("queue", "q_after_pgie")
             q_before_tracker = Gst.ElementFactory.make("queue", "q_before_tracker")
             q_after_tracker = Gst.ElementFactory.make("queue", "q_after_tracker")
 
@@ -916,11 +1245,13 @@ class DeepStreamVideoPipeline:
 
             # Validate element creation and assemble elements to add
             element_list = [
-                multiurisrc, nvdspreprocess, nvinfer, nvtracker, nvdsanalytics_post,
-                main_tee, q_after_pgie, q_before_tracker, q_after_tracker,
+                multiurisrc, nvdspreprocess, pre_pgie_tee, pre_pgie_q_main, pre_pgie_q_ma, nvinfer, nvtracker, nvdsanalytics_post,
+                main_tee, q_before_tracker, q_after_tracker,
                 mosaic_q, mosaic_tiler, mosaic_conv_pre, mosaic_caps_rgba, mosaic_osd,
                 jpeg_q, mosaic_conv_post, mosaic_caps, mosaic_enc, mosaic_sink
             ]
+            # Include MA demux now; per-stream branches will be added in a helper
+            element_list.append(ma_demux)
             if enable_egl:
                 element_list.extend([egl_q, egl_sink])
             
@@ -934,10 +1265,11 @@ class DeepStreamVideoPipeline:
                 if nvinfer:
                     element_names.append("nvinfer")
                 element_names.extend([
+                    "nvstreamdemux",
                     "nvtracker", "nvdsanalytics_post", "tee",
-                    "q_after_pgie", "q_before_tracker", "q_after_tracker",
-                    "mosaic_q", "nvmultistreamtiler", "nvvideoconvert",
-                    "capsfilter", "nvdsosd", "queue", "nvvideoconvert",
+                    "queue", "queue",
+                    "q_before_tracker", "q_after_tracker",
+                    "mosaic_q", "nvmultistreamtiler", "nvvideoconvert", "capsfilter", "nvdsosd", "queue", "nvvideoconvert",
                     "capsfilter", "nvjpegenc", "appsink"
                 ])  # type: ignore[list-item]
                 if enable_egl:
@@ -950,15 +1282,15 @@ class DeepStreamVideoPipeline:
 
             # Create elements dictionary for helper functions
             elements = {
-                'multiurisrc': multiurisrc, 'nvdspreprocess': nvdspreprocess, 'nvinfer': nvinfer,
+                'multiurisrc': multiurisrc, 'nvdspreprocess': nvdspreprocess, 'pre_pgie_tee': pre_pgie_tee, 'pre_pgie_q_main': pre_pgie_q_main, 'pre_pgie_q_ma': pre_pgie_q_ma, 'nvinfer': nvinfer,
                 'nvtracker': nvtracker, 
                 'nvdsanalytics_post': nvdsanalytics_post, 'main_tee': main_tee,
-                'q_after_pgie': q_after_pgie, 'q_before_tracker': q_before_tracker, 
+                'q_before_tracker': q_before_tracker, 
                 'q_after_tracker': q_after_tracker,
-                'mosaic_q': mosaic_q, 'mosaic_tiler': mosaic_tiler, 'mosaic_conv_pre': mosaic_conv_pre,
-                'mosaic_caps_rgba': mosaic_caps_rgba, 'mosaic_osd': mosaic_osd, 'jpeg_q': jpeg_q, 'mosaic_conv_post': mosaic_conv_post,
+                'mosaic_q': mosaic_q, 'mosaic_tiler': mosaic_tiler, 'mosaic_conv_pre': mosaic_conv_pre, 'mosaic_caps_rgba': mosaic_caps_rgba, 'mosaic_osd': mosaic_osd, 'jpeg_q': jpeg_q, 'mosaic_conv_post': mosaic_conv_post,
                 'mosaic_caps': mosaic_caps, 'mosaic_enc': mosaic_enc, 'mosaic_sink': mosaic_sink,
                 'egl_q': egl_q, 'egl_sink': egl_sink,
+                'ma_demux': ma_demux,
                 }
 
             # --- Phase B: Configure Elements ---
@@ -1038,9 +1370,18 @@ class DeepStreamVideoPipeline:
             #self.pipeline.add(main_tee)
             self.logger.info("main_tee added to pipeline post-OSD")
 
+            # Build MapAnything on-demand branch (pre-PGIE demux → per-stream BGR appsinks)
+            try:
+                self._setup_mapanything_branch(elements)
+                self._ma_branch_ready = True
+                self.logger.info("✅ MapAnything pre-PGIE branch constructed (valves default DROP)")
+            except Exception as exc:
+                self._ma_branch_ready = False
+                self.logger.warning(f"MapAnything branch unavailable: {exc}")
+
             # Temporary instrumentation: count PGIE objects immediately after nvinfer
             try:
-                nvinfer_debug_pad = q_after_pgie.get_static_pad("sink") if q_after_pgie else None
+                nvinfer_debug_pad = nvinfer.get_static_pad("src") if nvinfer else None
                 if nvinfer_debug_pad:
                     nvinfer_debug_pad.add_probe(
                         Gst.PadProbeType.BUFFER,
@@ -1049,7 +1390,7 @@ class DeepStreamVideoPipeline:
                     )
                     self.logger.info("✅ Attached nvinfer object debug probe (temporary)")
                 else:
-                    self.logger.warning("nvinfer object debug probe skipped: q_after_pgie sink pad unavailable")
+                    self.logger.warning("nvinfer object debug probe skipped: nvinfer src pad unavailable")
             except Exception as exc:
                 self.logger.warning(f"Failed to attach nvinfer object debug probe: {exc}")
 
@@ -1061,7 +1402,7 @@ class DeepStreamVideoPipeline:
             if not mosaic_tiler.link(mosaic_conv_pre):
                 raise RuntimeError("Failed to link mosaic_tiler to mosaic_conv_pre")
             if not mosaic_conv_pre.link(mosaic_caps_rgba):
-                raise RuntimeError("Failed to link mosaic_conv_pre to mosaic_caps_rgba")
+                raise RuntimeError("Failed to link mosaic_conv_pre to RGBA caps")
             if not mosaic_caps_rgba.link(mosaic_osd):
                 raise RuntimeError("Failed to link mosaic_caps_rgba to mosaic_osd")
             # Tee immediately after OSD so EGL can consume RGBA directly; JPEG branch converts to I420
@@ -1760,6 +2101,13 @@ class DeepStreamVideoPipeline:
 
             self.logger.info("✅ DeepStream pipeline started successfully")
             self._activated = True
+
+            # Close MA valves after caps negotiation completes
+            # This allows the nvstreamdemux to negotiate caps with all downstream
+            # elements before we shut off flow, preventing the demux from blocking
+            if self._ma_branch_ready:
+                # Schedule valve closing after 500ms to allow caps negotiation to complete
+                GLib.timeout_add(500, self._close_ma_valves_after_negotiation)
 
             # Log pipeline state after a short delay
             def check_pipeline_state():

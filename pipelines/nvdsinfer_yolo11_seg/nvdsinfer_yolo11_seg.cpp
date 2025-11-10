@@ -53,15 +53,24 @@ static void addSegProposal(const float* maskData, std::size_t maskLen,
                            unsigned netW, unsigned netH,
                            NvDsInferInstanceMaskInfo& b) {
   if (!maskData || maskLen == 0) return;
-  b.mask_width  = netW / 4;
-  b.mask_height = netH / 4;
-  const std::size_t expected = (std::size_t)b.mask_width * (std::size_t)b.mask_height;
-  const std::size_t copyLen = std::min(maskLen, expected);
+  // Infer mask grid from vector length (supports 128x128, 160x160, etc.)
+  unsigned side = (unsigned)std::lround(std::sqrt((double)maskLen));
+  if ((std::size_t)side * (std::size_t)side != maskLen) {
+    // Fallback to net/4 if length is unexpected
+    side = std::max(1u, (unsigned)(netW / 4));
+    // Optionally: log a warning here
+  }
+  b.mask_width  = side;
+  b.mask_height = side;
+  const std::size_t expected = (std::size_t)side * (std::size_t)side;
   b.mask_size = (unsigned)(expected * sizeof(float));
   b.mask = new float[expected];
+  // Copy exactly expected elements; if exporter emitted less/more, clamp
+  const std::size_t copyLen = std::min(maskLen, expected);
   std::memcpy(b.mask, maskData, copyLen * sizeof(float));
-  // zero-pad if exporter emits extra/truncated
-  for (std::size_t i = copyLen; i < expected; ++i) b.mask[i] = 0.f;
+  if (copyLen < expected) {
+    std::memset(b.mask + copyLen, 0, (expected - copyLen) * sizeof(float));
+  }
 }
 
 static bool parseFused(

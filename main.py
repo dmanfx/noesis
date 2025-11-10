@@ -325,19 +325,28 @@ class ApplicationManager:
                     self.websocket_server.pixel_to_world_handler = self._pixel_to_world_rpc
                     self.websocket_server.set_extrinsics_handler = self._set_extrinsics_rpc
                     self.websocket_server.set_align_handler = self._set_align_rpc
-                    # DISABLED: MapAnything providers - re-enable post-merge
-                    # if self.depth_source and self.websocket_server:
-                    #     self.websocket_server.ma_depth_provider = self.depth_source.load_latest_depth
-                    #     self.websocket_server.floorplan_provider = (
-                    #         lambda cam=None, max_age=60.0, grid_res=0.5, max_extent=20.0, cache_only=False, **_:
-                    #             self.depth_source.generate_topdown_floorplan(
-                    #                 str(cam) if cam else '',
-                    #                 max_age_sec=max_age,
-                    #                 grid_res_m=grid_res,
-                    #                 max_extent_m=max_extent,
-                    #                 cache_only=cache_only,
-                    #             )
-                    #     )
+                    # MapAnything: wire on-demand depth provider using pre-PGIE branch
+                    try:
+                        if getattr(self.config.integrations, 'ENABLE_MAPANYTHING', True):
+                            # Lazily construct depth source client
+                            self.depth_source = MapAnythingDepthSource()
+                            self.websocket_server.ma_depth_provider = self._ma_depth_provider
+                            # Optional BEV/floorplan provider (cached or on-demand)
+                            self.websocket_server.floorplan_provider = (
+                                lambda camera=None, max_age_sec=60.0, grid_res_m=0.5, max_extent_m=20.0, cache_only=False, **_:
+                                    self.depth_source.generate_topdown_floorplan(
+                                        str(camera) if camera else '',
+                                        max_age_sec=float(max_age_sec),
+                                        grid_res_m=float(grid_res_m),
+                                        max_extent_m=float(max_extent_m),
+                                        cache_only=bool(cache_only),
+                                    )
+                            )
+                            self.logger.info("✅ MapAnything WebSocket providers wired (on-demand depth + floorplan)")
+                        else:
+                            self.logger.info("MapAnything disabled by config; skipping WS providers")
+                    except Exception as exc:
+                        self.logger.warning(f"Failed to wire MapAnything providers: {exc}")
             except Exception as e:
                 self.logger.warning(f"Calibration init failed: {e}")
 
@@ -937,6 +946,96 @@ class ApplicationManager:
         )
         self.jpeg_thread.start()
         self.logger.info("✅ JPEG processing thread started")
+
+    def _resolve_sensor_id(self, cam_id: str) -> Optional[int]:
+        """Map a camera identifier to the DeepStream sensor index."""
+        try:
+            if cam_id is None:
+                return None
+            cam_text = str(cam_id).strip()
+            # Numeric ids map directly
+            if cam_text.isdigit():
+                return int(cam_text)
+            # Match against clean_name entries
+            if self.multi_stream_processor and getattr(self.multi_stream_processor, 'source_info', None):
+                for sid, info in self.multi_stream_processor.source_info.items():
+                    name = info.get('clean_name') or info.get('name')
+                    if isinstance(name, str) and name.strip() == cam_text:
+                        return int(sid)
+            return None
+        except Exception:
+            return None
+
+    def _ma_depth_provider(self, cam_id: str, ts_max: Optional[int] = None) -> Optional[Dict[str, Any]]:
+        """Handle 'get_ma_depth' RPC: on-demand capture → infer → return latest payload.
+
+        - Opens a per-camera valve for one frame from the pre-PGIE branch
+        - Invokes MapAnything mono inference
+        - Returns latest depth payload (base64 arrays + shape + ts)
+        """
+        try:
+            if not self.depth_source:
+                return None
+            # Serve cache when available and meets ts_max
+            cached = self.depth_source.load_latest_depth(str(cam_id), ts_max)
+            if cached is not None and ts_max is not None:
+                # If cache satisfies ts_max, return without forcing capture
+                try:
+                    if int(cached.get('ts', 0)) <= int(ts_max):
+                        return cached
+                except Exception:
+                    pass
+            sid = self._resolve_sensor_id(str(cam_id))
+            self.logger.info(f"MapAnything depth request for camera {cam_id} (sensor_id={sid})")
+            if sid is None or self.multi_stream_processor is None:
+                if sid is None:
+                    self.logger.warning(f"Could not resolve sensor_id for camera {cam_id}")
+                return cached
+            # Request a single BGR frame on-demand
+            frame_bgr = None
+            try:
+                if hasattr(self.multi_stream_processor, 'read_ma_bgr'):
+                    frame_bgr = self.multi_stream_processor.read_ma_bgr(int(sid), timeout=1.25)
+            except Exception as exc:
+                self.logger.debug(f"read_ma_bgr failed for {cam_id}: {exc}")
+                frame_bgr = None
+            if frame_bgr is None:
+                self.logger.warning(f"Failed to capture frame for {cam_id} within timeout")
+                return cached
+            self.logger.info(f"Captured frame for {cam_id}, running inference")
+            # Run mono inference; calibration bundle prepared during initialize
+            bundle = getattr(self, 'calibration_bundle', None)
+            ts = time.time()
+            result = self.depth_source.maybe_infer_mono(str(cam_id), frame_bgr, bundle, ts)
+            if result is not None:
+                try:
+                    self.depth_source.update_depth_cache(result)
+                except Exception:
+                    pass
+                # Broadcast diagnostics message to frontend
+                summary_message = {
+                    'type': 'ma_diagnostics',
+                    'cam_id': cam_id,
+                    'summary': {
+                        'median': result.summary.median,
+                        'p10': result.summary.p10,
+                        'p90': result.summary.p90,
+                        'conf_mean': result.summary.conf_mean,
+                        'valid_ratio': result.summary.valid_ratio,
+                        'sample_count': result.summary.sample_count,
+                        'method': 'mde' if result.summary.conf_mean >= getattr(self.depth_source, 'min_conf', 0.5) else 'floor'
+                    },
+                    'ts': result.ts_us
+                }
+                self._schedule_ws_broadcast(summary_message)
+                self.logger.info(f"MapAnything inference completed for {cam_id}")
+                payload = self.depth_source.load_latest_depth(str(cam_id))
+                return payload or cached
+            self.logger.warning(f"MapAnything inference returned None for {cam_id}")
+            return cached
+        except Exception as exc:
+            self.logger.warning(f"MapAnything provider error for {cam_id}: {exc}")
+            return None
 
     def _start_mosaic_broadcast(self):
         """Start a background thread that composites a mosaic from latest JPEGs and broadcasts it under a target camera id."""

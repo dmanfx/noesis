@@ -159,6 +159,7 @@ class DeepStreamVideoPipeline:
         self._state_watch_names = {
             "src",
             "nvinfer",
+            "nvdsroiexclude",
             "nvtracker",
             "nvdsanalytics_post",
             "mosaic_q",
@@ -1018,6 +1019,34 @@ class DeepStreamVideoPipeline:
                 # Enable tensor meta for downstream ReID/analytics checks; remove if proven unnecessary
                 elements['nvinfer'].set_property("input-tensor-meta", False)
 
+            nvdsroiexclude = elements.get('nvdsroiexclude')
+            if nvdsroiexclude:
+                exclude_cfg = getattr(
+                    self.config.processing,
+                    "DEEPSTREAM_EXCLUDE_CONFIG",
+                    "pipelines/config_nvdsanalytics_exclude.ini",
+                )
+                if exclude_cfg and not os.path.isabs(exclude_cfg):
+                    exclude_cfg = os.path.join(_root_dir, exclude_cfg)
+                if exclude_cfg and os.path.exists(exclude_cfg):
+                    nvdsroiexclude.set_property("config-file", exclude_cfg)
+                    # Default to source-id to avoid batch-order/pad-index ambiguity
+                    # Use env NOESIS_DS_EXCLUDE_ID_MODE=pad-index only if you explicitly
+                    # sort batches or want pad-index semantics.
+                    id_mode = os.environ.get("NOESIS_DS_EXCLUDE_ID_MODE", "source-id").strip().lower()
+                    try:
+                        if id_mode in {"pad-index", "pad_index"}:
+                            nvdsroiexclude.set_property("id-mode", "pad-index")
+                        else:
+                            nvdsroiexclude.set_property("id-mode", "source-id")
+                    except Exception:
+                        pass
+                    self.logger.info("✅ Using nvdsroiexclude config: %s", exclude_cfg)
+                else:
+                    self.logger.warning("⚠️ nvdsroiexclude config file not found: %s", exclude_cfg)
+            else:
+                self.logger.warning("nvdsroiexclude element missing; ROI exclusion disabled")
+
             # Tracker configuration — retain DS7 static config (no YAML overrides)
             elements['nvtracker'].set_property(
                 "ll-lib-file", "/opt/nvidia/deepstream/deepstream/lib/libnvds_nvmultiobjecttracker.so"
@@ -1148,16 +1177,12 @@ class DeepStreamVideoPipeline:
                 raise RuntimeError("Failed to link pre_pgie_tee to pre_pgie_q_main")
             if not elements['pre_pgie_q_main'].link(elements['nvinfer']):
                 raise RuntimeError("Failed to link pre_pgie_q_main to nvinfer")
-            # Add probe directly to nvinfer src pad to verify detections
-            nvinfer_src_pad = elements['nvinfer'].get_static_pad("src")
-            if nvinfer_src_pad:
-                nvinfer_src_pad.add_probe(
-                    Gst.PadProbeType.BUFFER, self._nvinfer_output_probe, None
-                )
-                self.logger.info("✅ Attached nvinfer output probe for debugging")
+            # Removed unstable Python probe on nvinfer src (caused occasional segfaults)
             
-            if not elements['nvinfer'].link(elements['q_before_tracker']):
-                raise RuntimeError("Failed to link nvinfer to q_before_tracker")
+            if not elements['nvinfer'].link(elements['nvdsroiexclude']):
+                raise RuntimeError("Failed to link nvinfer to nvdsroiexclude")
+            if not elements['nvdsroiexclude'].link(elements['q_before_tracker']):
+                raise RuntimeError("Failed to link nvdsroiexclude to q_before_tracker")
             if not elements['q_before_tracker'].link(elements['nvtracker']): 
                 raise RuntimeError("Failed to link q_before_tracker to nvtracker")
             if not elements['nvtracker'].link(elements['q_after_tracker']): 
@@ -1204,7 +1229,8 @@ class DeepStreamVideoPipeline:
                 except Exception:
                     pass
             nvinfer = Gst.ElementFactory.make("nvinfer", "nvinfer")
-            
+            nvdsroiexclude = Gst.ElementFactory.make("nvdsroiexclude", "nvdsroiexclude")
+
             # Analytics and Tracking
             nvtracker = Gst.ElementFactory.make("nvtracker", "nvtracker")
             nvdsanalytics_post = Gst.ElementFactory.make("nvdsanalytics", "nvdsanalytics_post")
@@ -1245,7 +1271,7 @@ class DeepStreamVideoPipeline:
 
             # Validate element creation and assemble elements to add
             element_list = [
-                multiurisrc, nvdspreprocess, pre_pgie_tee, pre_pgie_q_main, pre_pgie_q_ma, nvinfer, nvtracker, nvdsanalytics_post,
+                multiurisrc, nvdspreprocess, pre_pgie_tee, pre_pgie_q_main, pre_pgie_q_ma, nvinfer, nvdsroiexclude, nvtracker, nvdsanalytics_post,
                 main_tee, q_before_tracker, q_after_tracker,
                 mosaic_q, mosaic_tiler, mosaic_conv_pre, mosaic_caps_rgba, mosaic_osd,
                 jpeg_q, mosaic_conv_post, mosaic_caps, mosaic_enc, mosaic_sink
@@ -1266,6 +1292,7 @@ class DeepStreamVideoPipeline:
                     element_names.append("nvinfer")
                 element_names.extend([
                     "nvstreamdemux",
+                    "nvdsroiexclude",
                     "nvtracker", "nvdsanalytics_post", "tee",
                     "queue", "queue",
                     "q_before_tracker", "q_after_tracker",
@@ -1283,6 +1310,7 @@ class DeepStreamVideoPipeline:
             # Create elements dictionary for helper functions
             elements = {
                 'multiurisrc': multiurisrc, 'nvdspreprocess': nvdspreprocess, 'pre_pgie_tee': pre_pgie_tee, 'pre_pgie_q_main': pre_pgie_q_main, 'pre_pgie_q_ma': pre_pgie_q_ma, 'nvinfer': nvinfer,
+                'nvdsroiexclude': nvdsroiexclude,
                 'nvtracker': nvtracker, 
                 'nvdsanalytics_post': nvdsanalytics_post, 'main_tee': main_tee,
                 'q_before_tracker': q_before_tracker, 
@@ -1346,12 +1374,12 @@ class DeepStreamVideoPipeline:
             analytics_src_pad = nvdsanalytics_post.get_static_pad("src")
             if not analytics_src_pad:
                 raise RuntimeError("Failed to get nvdsanalytics_post source pad")
-            analytics_src_pad.add_probe(
-                Gst.PadProbeType.BUFFER, self._post_remove_excluded_objects_probe, None
-            )
-            self.logger.info("✅ Added buffer probe to nvdsanalytics_post src pad for exclusion pruning")
-            analytics_src_pad.add_probe(Gst.PadProbeType.BUFFER, self._analytics_probe, 0)
-            self.logger.info("✅ Added buffer probe to nvdsanalytics_post source pad for telemetry extraction")
+            disable_analytics_probe = str(os.environ.get("NOESIS_DISABLE_ANALYTICS_PROBE", "0")).strip().lower() in {"1","true","yes","y"}
+            if disable_analytics_probe:
+                self.logger.warning("Skipping analytics telemetry probe due to NOESIS_DISABLE_ANALYTICS_PROBE")
+            else:
+                analytics_src_pad.add_probe(Gst.PadProbeType.BUFFER, self._analytics_probe, 0)
+                self.logger.info("✅ Added buffer probe to nvdsanalytics_post source pad for telemetry extraction")
             
             # Per-branch OSD probe will be attached in per-stream branches
 
@@ -1379,20 +1407,7 @@ class DeepStreamVideoPipeline:
                 self._ma_branch_ready = False
                 self.logger.warning(f"MapAnything branch unavailable: {exc}")
 
-            # Temporary instrumentation: count PGIE objects immediately after nvinfer
-            try:
-                nvinfer_debug_pad = nvinfer.get_static_pad("src") if nvinfer else None
-                if nvinfer_debug_pad:
-                    nvinfer_debug_pad.add_probe(
-                        Gst.PadProbeType.BUFFER,
-                        self._nvinfer_object_debug_probe,
-                        None,
-                    )
-                    self.logger.info("✅ Attached nvinfer object debug probe (temporary)")
-                else:
-                    self.logger.warning("nvinfer object debug probe skipped: nvinfer src pad unavailable")
-            except Exception as exc:
-                self.logger.warning(f"Failed to attach nvinfer object debug probe: {exc}")
+            # Removed unstable nvinfer debug probe (caused occasional segfaults on DS meta iteration)
 
             # Link mosaic branch so both outputs receive the same post-OSD RGBA mosaic
             if not nvdsanalytics_post.link(mosaic_q):
@@ -1434,10 +1449,13 @@ class DeepStreamVideoPipeline:
             if not mosaic_osd_sink_pad:
                 self.logger.warning("Failed to get mosaic_osd sink pad")
             if mosaic_osd_sink_pad:
-                mosaic_osd_sink_pad.add_probe(
-                    Gst.PadProbeType.BUFFER, self._mosaic_osd_probe, None
-                )
-                self.logger.info("✅ Attached mosaic OSD probe")
+                if str(os.environ.get("NOESIS_DISABLE_MOSAIC_OSD_PROBE", "0")).strip().lower() in {"1","true","yes","y"}:
+                    self.logger.warning("Skipping mosaic OSD probe due to NOESIS_DISABLE_MOSAIC_OSD_PROBE")
+                else:
+                    mosaic_osd_sink_pad.add_probe(
+                        Gst.PadProbeType.BUFFER, self._mosaic_osd_probe, None
+                    )
+                    self.logger.info("✅ Attached mosaic OSD probe")
             egl_branch_enabled = bool(enable_egl and egl_q and egl_sink)
             if egl_branch_enabled:
                 tee_src_pad = main_tee.get_request_pad("src_1")
@@ -1466,6 +1484,8 @@ class DeepStreamVideoPipeline:
             self._attach_flow_probe(multiurisrc.get_static_pad("src"), "nvmultiurisrcbin.src")
             self._attach_flow_probe(nvinfer.get_static_pad("sink"), "nvinfer.sink")
             self._attach_flow_probe(nvinfer.get_static_pad("src"), "nvinfer.src")
+            self._attach_flow_probe(nvdsroiexclude.get_static_pad("sink"), "nvdsroiexclude.sink")
+            self._attach_flow_probe(nvdsroiexclude.get_static_pad("src"), "nvdsroiexclude.src")
             self._attach_flow_probe(nvtracker.get_static_pad("sink"), "nvtracker.sink")
             self._attach_flow_probe(nvtracker.get_static_pad("src"), "nvtracker.src")
             self._attach_flow_probe(nvdsanalytics_post.get_static_pad("sink"), "nvdsanalytics_post.sink")

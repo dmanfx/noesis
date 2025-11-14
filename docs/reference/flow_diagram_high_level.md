@@ -10,7 +10,8 @@ graph TD
     A --> B[nvmultiurisrcbin\n(batching, decode)]
     B --> C[nvdspreprocess]
     C --> D[nvinfer (YOLO11)]
-    D --> E[nvtracker]
+    D --> X[nvdsroiexclude\n(pre-tracker ROI filter)]
+    X --> E[nvtracker]
     E --> F[nvdsanalytics (post)]
     F --> H[nvstreamdemux]
   end

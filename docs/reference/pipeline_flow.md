@@ -25,8 +25,8 @@ graph TD
         A[RTSP Streams] --> B[nvmultiurisrcbin]
         B --> C[nvdspreprocess]
         C --> D[nvinfer - Primary YOLO11]
-        D --> E[nvdsanalytics (exclude)]
-        E --> F[nvtracker]
+        D --> X[nvdsroiexclude (pre-tracker ROI exclude)]
+        X --> F[nvtracker]
         F --> G[nvdsanalytics (post)]
         G --> H[nvstreamdemux]
     end
@@ -53,7 +53,7 @@ graph LR
 %%mermaid
 graph TD
     A[Preprocessed Batch] --> B[Primary Inference - YOLO11]
-    B --> C[Exclusion Analytics]
+    B --> C[nvdsroiexclude (Exclusion)]
     C --> D[Object Tracking]
     D --> E[Post-Tracker Analytics]
     E --> F[OSD Overlay]
@@ -110,9 +110,9 @@ pipelines/config_preproc.ini
 
 %%% Analytics Configuration
 %%
-pipelines/config_nvdsanalytics_exclude.ini (pre-tracker)
+pipelines/config_nvdsanalytics_exclude.ini (used by nvdsroiexclude, pre-tracker)
 pipelines/config_nvdsanalytics_post.ini (post-tracker)
-- ROI exclusions, ROI counts, line crossing, direction, overcrowding
+- Static ROI exclusion (pre-tracker), ROI counts, line crossing, direction, overcrowding (post)
 %%
 
 %%% Secondary Inference (Classification)

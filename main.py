@@ -17,9 +17,7 @@ sys.stdout.flush()
 
 # Set GStreamer debug BEFORE any other imports
 import os
-# Respect pre-set GST_DEBUG if provided; default to *:4 otherwise
-os.environ['GST_DEBUG'] = os.environ.get('GST_DEBUG', '*:4')
-os.environ['GST_DEBUG_NO_COLOR'] = '1'  # Disable colored output
+
 os.environ['no_proxy'] = '*'
 
 # Configure NVIDIA DeepStream/nvinfer logging to reduce INFO noise

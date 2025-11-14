@@ -31,6 +31,9 @@ Purpose: Step-by-step integration guide for InfluxDB + HomeSeer and a reusable p
 ### `Metadata_Ops.md`
 Purpose: How and when to use the shared metadata operator helpers (`pipelines/meta_ops.py`) to traverse, read, and modify DeepStream metadata (DS8 operator with DS7 fallbacks).
 
+### `Static_ROI_Exclusion.md`
+Purpose: Detailed reference for the `nvdsroiexclude` plugin (static ROI pruning pre‑tracker), config syntax, stream keying (`id-mode`), coordinate mapping with tiler, OSD overlays, build/install, and troubleshooting.
+
 ### `Dynamic_Sensors.md`
 Purpose: How to add/remove sources at runtime using `nvmultiurisrcbin` REST API.
 

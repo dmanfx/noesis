@@ -8,6 +8,7 @@ falling back to legacy pyds traversal when the operator is unavailable.
 from __future__ import annotations
 
 import logging
+import os
 from typing import Any, List, Optional
 
 logger = logging.getLogger(__name__)
@@ -27,6 +28,7 @@ try:  # pragma: no cover - optional at import time
     from pyservicemaker._pydeepstream import (  # type: ignore
         BatchMetadataOperator as _SMBatchMetadataOperator,
         BatchMetadata as _SMBatchMetadata,
+        Buffer as _SMBuffer,
         FrameMetadata as _SMFrameMetadata,
         ObjectMetadata as _SMObjectMetadata,
         AnalyticsFrameMeta as _SMAnalyticsFrameMeta,
@@ -43,6 +45,19 @@ except Exception:  # pragma: no cover
 
 # ------------------------- Operator lifecycle -------------------------
 
+def _sm_enabled() -> bool:
+    """Return True only when explicitly enabled via env.
+
+    To minimize crash risk while DS8 Service Maker stabilizes,
+    default to disabled unless NOESIS_ENABLE_SM is truthy.
+    """
+    try:
+        val = str(os.environ.get("NOESIS_ENABLE_SM", "")).strip().lower()
+        return val in {"1", "true", "yes", "y", "on"}
+    except Exception:
+        return False
+
+
 def create_operator(gst_buffer: Any) -> Optional[Any]:
     """Create a metadata operator for the given Gst.Buffer.
 
@@ -58,8 +73,8 @@ def create_operator(gst_buffer: Any) -> Optional[Any]:
         except Exception:
             logger.debug("NvDsBatchMetaOperator construction failed", exc_info=True)
 
-    # 2) DS8 Service Maker operator wrapper
-    if _SMBatchMetadataOperator is not None:
+    # 2) DS8 Service Maker operator wrapper (opt-in only)
+    if _SMBatchMetadataOperator is not None and _sm_enabled():
         try:
             return _ServiceMakerOperator(gst_buffer)
         except Exception:
@@ -82,45 +97,41 @@ class _ServiceMakerOperator:
       For removals, meta_ops.remove_object falls back to pyds API if available.
     """
 
-    __slots__ = ("_op", "_gst_buffer", "is_service_maker")
+    __slots__ = ("_gst_buffer", "_batch_ref", "is_service_maker")
 
     def __init__(self, gst_buffer: Any) -> None:
         if _SMBatchMetadataOperator is None:
             raise RuntimeError("Service Maker operator unavailable")
         self._gst_buffer = gst_buffer
-        self._op = _SMBatchMetadataOperator(gst_buffer)  # type: ignore[call-arg]
+        # Keep a reference to SM Buffer+BatchMetadata to ensure lifetime spans probe
+        self._batch_ref = None
         # Hint for helper functions
         self.is_service_maker = True
 
-    def _with_batch(self, fn):
-        result = []
-
-        def _cb(batch_meta: _SMBatchMetadata):  # type: ignore[type-arg]
-            try:
-                res = fn(batch_meta)
-                if res is not None:
-                    # normalize to list for easy return
-                    if isinstance(res, list):
-                        result.extend(res)
-                    else:
-                        result.append(res)
-            except Exception:
-                logger.debug("Service Maker handle_metadata callback failed", exc_info=True)
-
+    def _get_batch(self) -> Optional[Any]:
         try:
-            self._op.handle_metadata(_cb)
+            # Reuse existing refs if available
+            if self._batch_ref is not None:
+                return self._batch_ref[1]
+            sm_buf = _SMBuffer(self._gst_buffer)
+            batch_meta = getattr(sm_buf, "batch_meta", None)
+            # Store tuple to keep underlying memory alive
+            self._batch_ref = (sm_buf, batch_meta)
+            return batch_meta
         except Exception:
-            logger.debug("Service Maker handle_metadata failed", exc_info=True)
-        return result
+            logger.debug("Service Maker: failed to get BatchMetadata from Buffer", exc_info=True)
+            return None
 
     # Frame/object traversal
     def get_frames(self) -> List[Any]:
-        def _collect(batch: Any) -> List[Any]:
+        batch = self._get_batch()
+        if batch is None:
+            return []
+        try:
             items = getattr(batch, "frame_items", None)
             return list(items) if items is not None else []
-
-        frames = self._with_batch(_collect)
-        return frames
+        except Exception:
+            return []
 
     def __iter__(self):  # allow list(operator) pattern
         return iter(self.get_frames())
@@ -142,6 +153,63 @@ class _ServiceMakerOperator:
             return list(items) if items is not None else []
         except Exception:
             return []
+
+    # ---------- Accessors to avoid fallback mixing ----------
+    def get_source_id(self, frame_meta: Any) -> int:
+        try:
+            return int(getattr(frame_meta, "source_id"))
+        except Exception:
+            try:
+                return int(getattr(frame_meta, "pad_index"))
+            except Exception:
+                return 0
+
+    def get_object_id(self, obj_meta: Any) -> int:
+        try:
+            return int(getattr(obj_meta, "object_id"))
+        except Exception:
+            return 0
+
+    def get_class_id(self, obj_meta: Any) -> int:
+        try:
+            return int(getattr(obj_meta, "class_id"))
+        except Exception:
+            return -1
+
+    def get_confidence(self, obj_meta: Any) -> float:
+        try:
+            return float(getattr(obj_meta, "confidence"))
+        except Exception:
+            return 0.0
+
+    def get_tracker_confidence(self, obj_meta: Any) -> Optional[float]:
+        try:
+            val = getattr(obj_meta, "tracker_confidence")
+            return float(val) if val is not None else None
+        except Exception:
+            return None
+
+    def get_rect_params(self, obj_meta: Any) -> Optional[Any]:
+        try:
+            return getattr(obj_meta, "rect_params", None)
+        except Exception:
+            return None
+
+    def get_frame_width(self, frame_meta: Any) -> float:
+        for name in ("source_width", "pipeline_width"):
+            try:
+                return float(getattr(frame_meta, name))
+            except Exception:
+                continue
+        return 0.0
+
+    def get_frame_height(self, frame_meta: Any) -> float:
+        for name in ("source_height", "pipeline_height"):
+            try:
+                return float(getattr(frame_meta, name))
+            except Exception:
+                continue
+        return 0.0
 
 
 def _ensure_iterable(value: Any) -> List[Any]:
@@ -181,6 +249,11 @@ def iter_frames(operator: Optional[Any], gst_buffer: Any) -> List[Any]:
     if frames:
         return frames
 
+    # Avoid mixing backends: if Service Maker operator is active, do not fall back
+    if has_operator and getattr(operator, "is_service_maker", False):
+        logger.debug("iter_frames: Service Maker operator returned empty; skipping legacy fallback")
+        return []
+
     # Otherwise, fall back to legacy pyds traversal
     logger.debug("iter_frames: DS8 operator returned empty, falling back to legacy traversal (has_operator=%s, buffer_hash=%s)", has_operator, hash(gst_buffer))
     if pyds is None:
@@ -218,6 +291,11 @@ def iter_objects(operator: Optional[Any], frame_meta: Any) -> List[Any]:
     # If operator path yielded objects, return them
     if objs:
         return objs
+
+    # Avoid mixing backends: if Service Maker operator is active, do not fall back
+    if has_operator and getattr(operator, "is_service_maker", False):
+        logger.debug("iter_objects: Service Maker operator returned zero; skipping legacy fallback")
+        return []
 
     # Otherwise, fall back to legacy frame's obj_meta_list traversal
     logger.debug("iter_objects: DS8 operator returned zero objects, falling back to legacy traversal (has_operator=%s)", has_operator)
@@ -410,6 +488,10 @@ def rect_to_corners(rect: Any) -> List[tuple[float, float]]:
 
 def remove_object(operator: Optional[Any], frame_meta: Any, obj_meta: Any) -> bool:
     if operator is not None:
+        if getattr(operator, "is_service_maker", False):
+            # No safe Python mutation API under Service Maker; skip
+            logger.debug("remove_object: Service Maker active; skipping removal")
+            return False
         remover = getattr(operator, "remove_object", None)
         if callable(remover):
             try:

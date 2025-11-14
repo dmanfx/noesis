@@ -48,7 +48,7 @@ RTSP Streams (`config.py`):
 providing hardware-accelerated AI inference with metadata extraction.                                         │
 │ ├── config-file-path: `pipelines/config_infer_primary_yolo11.ini`                                           │
 │ ├── YOLO-11 Custom Parser: `libnvdsparsebbox_yolo11.so`                                                     │
-│ ├── input-tensor-meta: True                                                                                 │
+│ ├── input-tensor-meta: False                                                                                 │
 │ └── Dynamic config: confidence, IOU, enable flag, and target classes via `custom-lib-props`                 │
 │                                                                                                             │
 │ nvtracker - DeepStream's object tracking element that maintains object identities across frames 
@@ -81,10 +81,10 @@ using algorithms like NvDCF, providing persistent tracking metadata.            
 ┌─────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
 │  ANALYTICS PROCESSING                                                                                       │
 ├─────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
-│ nvdsanalytics (pre-tracker, exclusion) - Removes detections in exclusion ROIs before tracking.              │
-│ ├── unique-id: 101                                                                                          │
+│ nvdsroiexclude (pre-tracker) - Removes detections in exclusion ROIs before tracking.              │
+│ ├── config-file: `pipelines/config_nvdsanalytics_exclude.ini`                                                                                          │
 │ ├── config-file: `pipelines/config_nvdsanalytics_exclude.ini`                                               │
-│ └── Pad Probe (src): `_remove_excluded_objects_probe()`                                                     │
+│ └── id-mode: `pad-index|source-id` (stream association); OSD via display meta if `[property].osd-mode != 0`                                                     │
 │                                                                                                             │
 │ nvdsanalytics (post-tracker) - Provides ROI counts, line-crossing, direction, overcrowding metadata.        │
 │ ├── unique-id: 201                                                                                          │
@@ -111,7 +111,7 @@ using algorithms like NvDCF, providing persistent tracking metadata.            
 ├─────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
 │ Instead of a final appsink, metadata is extracted at various points in the pipeline using buffer probes, 
 which allows for inspection without disrupting the primary data flow.                                         │
-│ ├── nvdsanalytics_exclude (src pad): `_remove_excluded_objects_probe()`                                     │
+│ ├── (no pre-tracker Python probe; exclusion handled in `nvdsroiexclude`)                                     │
 │ │   └── Removes objects detected within defined exclusion zones before they are tracked.                    │
 │ ├── nvdsanalytics_post (src pad): `_analytics_probe()`                                                      │
 │ │   └── Extracts final object metadata, including tracking IDs and analytics results (ROI, line crossing) 

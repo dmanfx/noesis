@@ -11,12 +11,12 @@ This document summarizes the elements created in `deepstream_video_pipeline.py`,
   - Properties: `config-file = config.processing.DEEPSTREAM_PREPROCESS_CONFIG`
 
 - nvinfer (nvinfer)
-  - Properties: `config-file-path = pipelines/config_infer_primary_yolo11.ini`, `input-tensor-meta=True`
+  - Properties: `config-file-path = pipelines/config_infer_primary_yolo11.ini`, `input-tensor-meta=False`
   - Runtime updates (via Python): `confidence-threshold`, `iou-threshold`, `enable`, `custom-lib-props="target-classes:<ids>"`
 
-- nvdsanalytics (nvdsanalytics_exclude)
-  - Properties: `unique-id=101`, `config-file=pipelines/config_nvdsanalytics_exclude.ini`
-  - Probe: src pad → `_remove_excluded_objects_probe()` (drops objects in exclusion ROIs)
+- nvdsroiexclude (pre-tracker ROI exclude)
+  - Properties: `config-file=pipelines/config_nvdsanalytics_exclude.ini`, `id-mode=pad-index|source-id`
+  - Behavior: In-place metadata transform that removes objects fully inside static ROIs and optionally draws ROI outlines (via display meta). No pad probes required.
 
 - nvtracker (nvtracker)
   - Properties: `ll-lib-file=/opt/nvidia/deepstream/deepstream/lib/libnvds_nvmultiobjecttracker.so`, `ll-config-file=pipelines/config_tracker_nvdcf_batch.yml`

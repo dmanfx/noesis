@@ -120,10 +120,7 @@ class AppConfig:
         # DeepStream multi-URI source config (required for DS8Adapter)
         DS_MULTIURISRC_CONFIG: str = "pipelines/noesis_multiurisrcbin.ini"
         
-        # DEPRECATED: Unified GPU Pipeline Configuration (removed - DeepStream-only now)
-        # USE_UNIFIED_GPU_PIPELINE: bool = True  # Enable unified GPU pipeline for optimal performance
-        # UNIFIED_PIPELINE_THREADS: Optional[int] = None  # Auto-calculated if None
-        
+                
         def __post_init__(self):
             """Post-initialization to handle deprecated settings and warnings."""
             import logging

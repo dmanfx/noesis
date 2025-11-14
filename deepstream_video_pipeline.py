@@ -825,9 +825,9 @@ class DeepStreamVideoPipeline:
                         total += 1
             self._exclusion_rois_by_stream = rois_by_stream
             if total:
-                self.logger.info(f"✅ Loaded {total} exclusion ROI(s) from {path}")
+                self.logger.debug(f"✅ Loaded {total} exclusion ROI(s) from {path}")
             else:
-                self.logger.info(f"ℹ️ No exclusion ROIs found in {path}")
+                self.logger.debug(f"ℹ️ No exclusion ROIs found in {path}")
         except Exception as e:
             self.logger.error(f"Error parsing exclusion ROI config {path}: {e}")
 
@@ -1374,7 +1374,7 @@ class DeepStreamVideoPipeline:
             try:
                 self._setup_mapanything_branch(elements)
                 self._ma_branch_ready = True
-                self.logger.info("✅ MapAnything pre-PGIE branch constructed (valves default DROP)")
+                self.logger.info("✅ MapAnything pre-PGIE branch constructed (valves opened for negotiation, auto-close after startup)")
             except Exception as exc:
                 self._ma_branch_ready = False
                 self.logger.warning(f"MapAnything branch unavailable: {exc}")
@@ -2364,12 +2364,12 @@ class DeepStreamVideoPipeline:
                 for obj in objects:
                     class_id = meta_ops.get_class_id(operator, obj)
                     confidence = meta_ops.get_confidence(operator, obj)
-                    self.logger.info("🎯 nvinfer output: class_id=%d, confidence=%.3f", class_id, confidence)
+                    #self.logger.info("🎯 nvinfer output: class_id=%d, confidence=%.3f", class_id, confidence)
         
-        if total_objects > 0:
-            self.logger.info("✅ nvinfer output probe: %d object(s) detected across %d frame(s)", total_objects, len(frames))
-        elif len(frames) > 0:
-            self.logger.debug("⚠️  nvinfer output probe: No objects detected in %d frame(s)", len(frames))
+        #if total_objects > 0:
+        #    self.logger.info("✅ nvinfer output probe: %d object(s) detected across %d frame(s)", total_objects, len(frames))
+        #elif len(frames) > 0:
+        #    self.logger.debug("⚠️  nvinfer output probe: No objects detected in %d frame(s)", len(frames))
         
         return Gst.PadProbeReturn.OK
 
@@ -2408,7 +2408,7 @@ class DeepStreamVideoPipeline:
             objects = meta_ops.iter_objects(operator, frame_meta)
             total_objects += len(objects)
         if total_objects > 0:
-            self.logger.info("🔍 OSD probe: Found %d object(s) across %d frame(s)", total_objects, len(frames))
+            self.logger.debug("🔍 OSD probe: Found %d object(s) across %d frame(s)", total_objects, len(frames))
         else:
             self.logger.debug("OSD probe: No objects detected in %d frame(s)", len(frames))
 

@@ -306,7 +306,7 @@ class AppConfig:
         NVENC_BITRATE: int = 4000000  # 4 Mbps
         JPEG_QUALITY: int = 85  # JPEG encoding quality
         USE_NATIVE_DEEPSTREAM_OSD: bool = True  # If True, use DeepStream's native OSD, skip Python annotation
-        ENABLE_EGL: bool = True  # Enable EGL display branch in DeepStream pipeline
+        ENABLE_EGL: bool = False  # Enable EGL display branch in DeepStream pipeline
 
         # Bounding-box temporal smoothing (reduces size flicker/shudder)
         BBOX_SMOOTHING_ENABLED: bool = True
@@ -396,7 +396,7 @@ class AppConfig:
     @dataclass
     class IntegrationsSettings:
         """Integration settings for MQTT + Influx occupancy publishing"""
-        ENABLE_MAPANYTHING: bool = False
+        ENABLE_MAPANYTHING: bool = True
         ENABLE_OCCUPANCY_PUBLISH: bool = True
         HEARTBEAT_SEC: int = 60
 

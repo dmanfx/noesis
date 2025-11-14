@@ -3,11 +3,14 @@ from __future__ import annotations
 
 import base64
 import logging
+import threading
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Dict, Mapping, MutableMapping, Optional, Tuple
 
 import cv2
 import numpy as np
+import yaml
 
 from mapanything_config import load_service_config
 from utils.rate_limited_logger import RateLimitedLogger
@@ -28,6 +31,10 @@ class ViewBuildResult:
 _logger = RateLimitedLogger(logging.getLogger(__name__), rate_limit_seconds=5.0)
 _config = load_service_config()
 _INTRINSICS_CACHE: MutableMapping[str, np.ndarray] = {}
+_FALLBACK_CAM_YAML_CACHE: Optional[Dict[str, object]] = None
+_FALLBACK_CAM_YAML_MTIME: Optional[float] = None
+_FALLBACK_LOCK = threading.Lock()
+_CAMERAS_YAML_PATH = Path("config/cameras.yaml")
 
 
 def build_mono_view(
@@ -148,8 +155,80 @@ def _extract_intrinsics_from_bundle(cam_id: str, calib_bundle: Optional[Mapping[
             if isinstance(e_table, Mapping):
                 matrix = _coerce_intrinsics(e_table.get('K') or e_table.get('intrinsics'))
     if matrix is None:
+        matrix = _fallback_intrinsics_from_cameras_yaml(cam_id)
+    if matrix is None:
         _logger.warning(f"Unable to find intrinsics for camera {cam_id}")
+    elif cam_id not in _INTRINSICS_CACHE:
+        _logger.info(f"Using fallback intrinsics for camera {cam_id}")
     return matrix
+
+
+def _fallback_intrinsics_from_cameras_yaml(cam_id: str) -> Optional[np.ndarray]:
+    try:
+        with _FALLBACK_LOCK:
+            if not _CAMERAS_YAML_PATH.exists():
+                return None
+            global _FALLBACK_CAM_YAML_CACHE, _FALLBACK_CAM_YAML_MTIME
+            mtime = _CAMERAS_YAML_PATH.stat().st_mtime
+            if _FALLBACK_CAM_YAML_CACHE is None or _FALLBACK_CAM_YAML_MTIME != mtime:
+                data = yaml.safe_load(_CAMERAS_YAML_PATH.read_text(encoding='utf-8')) or {}
+                _FALLBACK_CAM_YAML_CACHE = data
+                _FALLBACK_CAM_YAML_MTIME = mtime
+            else:
+                data = _FALLBACK_CAM_YAML_CACHE or {}
+    except Exception as exc:
+        _logger.debug(f"Failed to load fallback cameras.yaml: {exc}")
+        return None
+
+    if not isinstance(data, Mapping):
+        return None
+    cameras = data.get('cameras') or data.get('sources') or {}
+    models = data.get('intrinsics_models') or data.get('models') or {}
+    entry = None
+    target = cam_id.strip().lower()
+    for key, value in cameras.items():
+        if not isinstance(value, Mapping):
+            continue
+        name = str(value.get('name') or key).strip().lower()
+        if name == target:
+            entry = value
+            break
+    if entry is None:
+        # Try to parse numeric index from IDs like 'camera-1', 'camera_1', 'rtsp_0', or plain digits
+        idx: Optional[int] = None
+        try:
+            lower = target
+            if lower.startswith('camera-') or lower.startswith('camera_'):
+                num = lower.split('-', 1)[-1] if '-' in lower else lower.split('_', 1)[-1]
+                if num.isdigit():
+                    # camera-1 refers to DS index 0
+                    idx = max(0, int(num) - 1)
+            elif lower.startswith('rtsp_') or lower.startswith('rtsp-'):
+                num = lower.split('_', 1)[-1] if '_' in lower else lower.split('-', 1)[-1]
+                if num.isdigit():
+                    idx = int(num)
+            elif lower.isdigit():
+                # Ambiguous: treat as DS index
+                idx = int(lower)
+        except Exception:
+            idx = None
+        if idx is not None:
+            for key, value in cameras.items():
+                try:
+                    key_int = int(str(key))
+                except Exception:
+                    continue
+                if key_int == idx and isinstance(value, Mapping):
+                    entry = value
+                    break
+        if entry is None:
+            return None
+    intr_data = entry.get('intrinsics')
+    if intr_data is None:
+        model_key = entry.get('model') or entry.get('intrinsics_model')
+        if model_key and model_key in models and isinstance(models[model_key], Mapping):
+            intr_data = models[model_key].get('intrinsics') or models[model_key]
+    return _coerce_intrinsics(intr_data)
 
 
 def _coerce_intrinsics(value: object) -> Optional[np.ndarray]:

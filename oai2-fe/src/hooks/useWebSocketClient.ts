@@ -210,6 +210,12 @@ export function useWebSocketClient(url: string, handlers: FrameHandlers) {
   const sendJson = (obj: any) => {
     const ws = socketRef.current;
     if (!ws || ws.readyState !== WebSocket.OPEN) return false;
+    try {
+      if (obj && (obj.type === 'get_ma_depth' || obj.type === 'get_floorplan')) {
+        // eslint-disable-next-line no-console
+        console.debug('[WS] send', obj.type, { ...obj, img_b64: undefined });
+      }
+    } catch {}
     ws.send(JSON.stringify(obj));
     return true;
   };
@@ -220,18 +226,21 @@ export function useWebSocketClient(url: string, handlers: FrameHandlers) {
     sendTrailToggle: (enabled: boolean) => sendJson({ type: 'set_vis_toggle', toggle_name: 'trail_visualization_enabled', enabled }),
     sendDetectionConfig: (config: any) => sendJson({ type: 'update_detection_config', config }),
     sendDetectionToggle: (name: string, enabled: boolean) => sendJson({ type: 'set_detection_toggle', toggle_name: name, enabled }),
-    requestMapAnythingDepth: (camId: string, tsMax?: number) => sendJson({ type: 'get_ma_depth', camId, ts_max: tsMax ?? Date.now() }),
+    // Force fresh depth capture on refresh: ts_max=-1 ensures server prefers new inference over cache
+    requestMapAnythingDepth: (camId: string, _tsMax?: number) => sendJson({ type: 'get_ma_depth', camId, ts_max: -1 }),
     requestFloorplan: (options?: FloorplanRequest) => {
       const requestId = options?.requestId || Date.now().toString();
-      const ok = sendJson({
+      const payload = {
         type: 'get_floorplan',
         request_id: requestId,
         camera: options?.camera,
+        // For regenerate flows, callers should pass maxAgeSec=0 to ignore staleness
         max_age_sec: options?.maxAgeSec ?? 60,
         grid_res_m: options?.gridResM ?? 0.5,
         max_extent_m: options?.maxExtentM ?? 20,
         cache_only: options?.cacheOnly ?? false
-      });
+      };
+      const ok = sendJson(payload);
       return ok ? requestId : '';
     }
   };

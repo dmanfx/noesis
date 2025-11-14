@@ -29,7 +29,7 @@
 .main {
   min-height: 0; /* allow inner scrolls */
   display: grid;
-  grid-template-columns: 1.15fr 0.85fr; /* streams | side panels */
+  grid-template-columns: 1.6fr 0.4fr; /* streams | side panels (wider video) */
   gap: 16px; padding: 16px;
 }
 

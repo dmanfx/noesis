@@ -1,7 +1,8 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
 import { StreamPanel } from './components/StreamPanel';
-import { MapPanel } from './components/MapPanel';
+// MapPanel moved into a drawer
+// import { MapPanel } from './components/MapPanel';
 import { ControlsPanel } from './components/ControlsPanel';
 // LegendPanel removed; we now inline the legend dot next to each ID
 import { TelemetryPanel } from './telemetry/TelemetryPanel';
@@ -11,6 +12,7 @@ import { cameraOrder, colorForTrack, cameraLabel, detectCameraKey, CameraKey } f
 import { getExtrinsics, worldToCamera, getIntrinsics4, extractPoseFromExtrinsics, forwardXZFromExtrinsics } from './lib/calibration';
 import { useWebSocketClient, StatsPayload } from './hooks/useWebSocketClient';
 import DepthDrawer, { DepthDiagnosticsEntry, DepthDrawerEntry, FloorplanResponse } from './components/DepthDrawer';
+import TopDownDrawer from './components/TopDownDrawer';
 
 const wsHost = import.meta.env.VITE_WS_HOST || window.location.hostname;
 const wsPort = Number(import.meta.env.VITE_WS_PORT || 6008);
@@ -87,6 +89,7 @@ function Dashboard() {
     'kitchen': 'unknown',
     'family-room': 'unknown'
   });
+  const [availableCameras, setAvailableCameras] = useState<string[]>([]);
   const [expandedCamera, setExpandedCamera] = useState<CameraKey | null>(null);
   const maDiagThrottleRef = useRef<Record<string, number>>({});
   const lastCalibrationSignatureRef = useRef<string>('');
@@ -97,6 +100,7 @@ function Dashboard() {
     publish({ group: 'System', key: 'Uptime', value: Math.floor((payload.uptime ?? 0)), ts: now });
 
     const cameras = payload.cameras || {};
+    setAvailableCameras(Object.keys(cameras));
     const statusUpdates: Partial<Record<CameraKey, string>> = {};
     const globalOcc: Record<string, number> = {};
     let allTracks: any[] = [];
@@ -475,6 +479,15 @@ function Dashboard() {
     onMADepth: handleMADepth,
     onFloorplan: handleFloorplan
   });
+
+  const handleRequestDepth = useCallback((camId: string) => {
+    if (!camId) return;
+    requestMapAnythingDepth(camId);
+  }, [requestMapAnythingDepth]);
+
+  const handleRequestFloorplan = useCallback((options?: { camera?: string; requestId?: string; maxAgeSec?: number; gridResM?: number; maxExtentM?: number; cacheOnly?: boolean }) => {
+    return requestFloorplan(options);
+  }, [requestFloorplan]);
   
   // Live EST/EDT clock for top bar
   const [estTime, setEstTime] = useState<string>("");
@@ -552,6 +565,7 @@ function Dashboard() {
   // Fullscreen overlay that follows the selected camera's stream
   const [overlayUrl, setOverlayUrl] = useState<string>('');
   const expandedBlob = expandedCamera ? streams[expandedCamera] : null;
+  const [topDownOpen, setTopDownOpen] = useState<boolean>(false);
 
   useEffect(() => {
     if (!expandedCamera || !expandedBlob) {
@@ -586,6 +600,7 @@ function Dashboard() {
         {timeChip}
         {connectionChip}
         <button className="btn ghost" onClick={() => setTelemetryOpen(v => !v)}>Telemetry</button>
+        <button className="btn ghost" onClick={() => setTopDownOpen(v => !v)}>Top‑Down</button>
         <button className="btn ghost" onClick={() => setDepthDrawerOpen(v => !v)}>Depth</button>
       </header>
       <main className="main">
@@ -623,9 +638,7 @@ function Dashboard() {
             <div dangerouslySetInnerHTML={{ __html: trackDetailsHtml }} />
           </div>
 
-          { /* Transitions panel removed */ }
-
-          <MapPanel store={trailStoreRef.current} visible={trailEnabled} />
+          { /* Transitions panel removed; Top‑Down moved to drawer */ }
         </section>
       </main>
       <footer className="footer">
@@ -649,9 +662,16 @@ function Dashboard() {
         onClose={() => setDepthDrawerOpen(false)}
         diagnostics={maDiagnostics}
         depthData={maDepthData}
-        onRequestDepth={(camId) => requestMapAnythingDepth(camId)}
+        onRequestDepth={handleRequestDepth}
         floorplans={floorplanData}
-        onRequestFloorplan={(opts) => requestFloorplan(opts)}
+        onRequestFloorplan={handleRequestFloorplan}
+        availableCameras={availableCameras}
+      />
+
+      <TopDownDrawer
+        open={topDownOpen}
+        onClose={() => setTopDownOpen(false)}
+        store={trailStoreRef.current}
       />
 
       {telemetryOpen && (

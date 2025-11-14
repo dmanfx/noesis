@@ -45,10 +45,11 @@ import time
 import json
 import torch
 from pathlib import Path
-from typing import Dict, List, Optional, Any, Union
+from typing import Dict, List, Optional, Any, Union, Set
 
 import cv2
 import numpy as np
+import yaml
 
 from config import AppConfig, config, load_ma_config
 from geometry.depth_source import DepthResult, DepthSummary, MapAnythingDepthSource
@@ -111,6 +112,10 @@ sys.path.insert(0, str(project_root))
 # Global interrupt counter for clean shutdown handling
 INTERRUPT_COUNT = 0
 MAX_SHUTDOWN_TIME = 15  # Maximum time to wait for graceful shutdown
+# Global shutdown event for signal-safe coordination
+_shutdown_event = threading.Event()
+# Global force exit flag for signal-safe access
+_force_exit_flag = False
 
 
 
@@ -176,6 +181,12 @@ class ApplicationManager:
         self._last_depth_publish = {}
         self._last_depth_summary = {}
         self._depth_publisher = None
+        self._mapanything_scheduler_thread: Optional[threading.Thread] = None
+        self._friendly_name_by_sensor: Dict[int, str] = {}
+        self._camera_alias_map: Dict[str, int] = {}
+        self._sensor_aliases: Dict[int, Set[str]] = {}
+        self._preferred_camera_ids: Set[str] = set(getattr(self.config.calibration, 'CAMERA_INTRINSICS_MODEL_MAP', {}).keys())
+        self._cameras_yaml_names: Dict[int, str] = {}
         
         # Initialize async event loop
         self.event_loop = None
@@ -209,67 +220,48 @@ class ApplicationManager:
         self._shutting_down = False
     
     def _signal_handler(self, sig, frame):
-        """Handle termination signals with graceful shutdown
+        """Handle termination signals - MINIMAL signal-safe handler
+        
+        Signal handlers must be minimal and avoid:
+        - Logging (not signal-safe)
+        - Thread creation (can cause issues)
+        - Accessing instance variables (use globals instead)
+        - Complex operations
         
         Args:
             sig: Signal number
             frame: Current stack frame
         """
-        global INTERRUPT_COUNT
+        global INTERRUPT_COUNT, _shutdown_event, _force_exit_flag
         INTERRUPT_COUNT += 1
         
-        # Add immediate print for visibility
-        print(f"\n🛑 Signal {sig} received (interrupt #{INTERRUPT_COUNT})")
+        # Use write() to stderr - this is signal-safe
+        import sys
+        try:
+            sys.stderr.write(f"\n🛑 Signal {sig} received (interrupt #{INTERRUPT_COUNT})\n")
+            sys.stderr.flush()
+        except Exception:
+            pass  # Ignore errors in signal handler
         
         if INTERRUPT_COUNT == 1:
-            if not self._shutting_down:
-                self._shutting_down = True
-                self.logger.info(f"Received signal {sig}, starting graceful shutdown...")
-                print("🔄 Starting graceful shutdown...")
-                # Run graceful shutdown in a dedicated thread to avoid heavy work in signal handler
-                try:
-                    import threading
-                    t = threading.Thread(target=self._graceful_exit, name="graceful_exit", daemon=True)
-                    t.start()
-                except Exception as e:
-                    self.logger.error(f"Failed to start graceful exit thread: {e}")
-                    # Fallback to direct stop if thread creation fails
-                    self.stop()
-        elif INTERRUPT_COUNT >= 2:
-            self.logger.warning("Second interrupt received, forcing immediate exit")
-            print("💥 Second interrupt - forcing immediate exit!")
-            # Try to force close WebSocket server before exit
+            # First interrupt - set shutdown flag for main loop to handle
+            _shutdown_event.set()
             try:
-                if hasattr(self, 'websocket_server') and self.websocket_server:
-                    self.websocket_server._force_close_server()
-                if hasattr(self, 'websocket_thread') and self.websocket_thread and self.websocket_thread.is_alive():
-                    self.logger.warning("WebSocket thread still alive, terminating process anyway")
-            except Exception as e:
-                self.logger.error(f"Error during forced shutdown: {e}")
-            os._exit(1)
-    
-    def _graceful_exit(self):
-        """Perform graceful shutdown with timeout"""
-        try:
-            self.logger.info("Starting graceful shutdown process...")
-            start_time = time.time()
-            
-            # Call stop method
-            self.stop()
-            
-            # Wait for shutdown to complete or timeout
-            while self.running and (time.time() - start_time) < MAX_SHUTDOWN_TIME:
-                time.sleep(0.1)
-            
-            if self.running:
-                self.logger.error(f"Graceful shutdown timed out after {MAX_SHUTDOWN_TIME}s, forcing exit")
-                os._exit(1)
-            else:
-                self.logger.info("Graceful shutdown completed successfully")
-                os._exit(0)
-                
-        except Exception as e:
-            self.logger.error(f"Error during graceful shutdown: {e}")
+                sys.stderr.write("🔄 Starting graceful shutdown...\n")
+                sys.stderr.flush()
+            except Exception:
+                pass
+        elif INTERRUPT_COUNT >= 2:
+            # Second interrupt - force immediate exit
+            try:
+                sys.stderr.write("💥 Second interrupt - forcing immediate exit!\n")
+                sys.stderr.flush()
+            except Exception:
+                pass
+            # Set global force exit flag
+            _force_exit_flag = True
+            _shutdown_event.set()
+            # Use os._exit() only from signal handler context, not from threads
             os._exit(1)
     
     @profile_function("ApplicationManager.initialize")
@@ -330,19 +322,19 @@ class ApplicationManager:
                         if getattr(self.config.integrations, 'ENABLE_MAPANYTHING', True):
                             # Lazily construct depth source client
                             self.depth_source = MapAnythingDepthSource()
-                            self.websocket_server.ma_depth_provider = self._ma_depth_provider
-                            # Optional BEV/floorplan provider (cached or on-demand)
-                            self.websocket_server.floorplan_provider = (
-                                lambda camera=None, max_age_sec=60.0, grid_res_m=0.5, max_extent_m=20.0, cache_only=False, **_:
-                                    self.depth_source.generate_topdown_floorplan(
-                                        str(camera) if camera else '',
-                                        max_age_sec=float(max_age_sec),
-                                        grid_res_m=float(grid_res_m),
-                                        max_extent_m=float(max_extent_m),
-                                        cache_only=bool(cache_only),
-                                    )
-                            )
-                            self.logger.info("✅ MapAnything WebSocket providers wired (on-demand depth + floorplan)")
+                            if self.websocket_server:
+                                self.websocket_server.ma_depth_provider = self.depth_source.load_latest_depth
+                                self.websocket_server.floorplan_provider = (
+                                    lambda camera=None, max_age_sec=60.0, grid_res_m=0.5, max_extent_m=20.0, cache_only=False, **_:
+                                        self.depth_source.generate_topdown_floorplan(
+                                            str(camera) if camera else '',
+                                            max_age_sec=float(max_age_sec),
+                                            grid_res_m=float(grid_res_m),
+                                            max_extent_m=float(max_extent_m),
+                                            cache_only=bool(cache_only),
+                                        )
+                                )
+                            self.logger.info("✅ MapAnything WebSocket providers wired (cached depth + floorplan)")
                         else:
                             self.logger.info("MapAnything disabled by config; skipping WS providers")
                     except Exception as exc:
@@ -411,6 +403,12 @@ class ApplicationManager:
             self._start_result_processing()
             self.logger.info("✅ Result processing started")
 
+            # Kick off MapAnything depth scheduler once pipeline and depth source are ready
+            try:
+                self._start_mapanything_scheduler()
+            except Exception as exc:
+                self.logger.warning(f"Unable to start MapAnything scheduler: {exc}")
+
             self.logger.info("🎉 Application started successfully")
             print("🎉 Application started successfully")
             print("🌐 WebSocket server ready - frontend can now connect!")
@@ -472,14 +470,9 @@ class ApplicationManager:
                 source_count_runtime = source_count
             self.logger.info(f"✅ Multi-stream processor started (pre-known sources={source_count}, runtime={source_count_runtime})")
             try:
-                source_info = getattr(self.multi_stream_processor, 'source_info', None)
-                if isinstance(source_info, dict):
-                    for info in source_info.values():
-                        clean_name = info.get('clean_name') or info.get('name')
-                        if isinstance(clean_name, str):
-                            self._camera_room_map[clean_name] = clean_name
+                self._apply_friendly_camera_names(processor)
             except Exception as exc:
-                self.logger.debug(f"Unable to build camera-room mapping: {exc}")
+                self.logger.debug(f"Unable to normalize camera aliases: {exc}")
 
             # Wire OccupancyPublisher if enabled
             try:
@@ -541,6 +534,152 @@ class ApplicationManager:
             import traceback
             traceback.print_exc()
             raise RuntimeError(f"Multi-stream processor startup failed: {e}")
+
+    # ---------------------- Camera metadata helpers ----------------------
+    def _apply_friendly_camera_names(self, processor: DeepStreamVideoPipeline) -> None:
+        source_info = getattr(processor, 'source_info', None)
+        if not isinstance(source_info, dict):
+            return
+        yaml_names = self._load_cameras_yaml_names()
+        self._friendly_name_by_sensor.clear()
+        self._camera_alias_map.clear()
+        self._sensor_aliases.clear()
+
+        for sensor_key, info in source_info.items():
+            try:
+                sensor_id = int(sensor_key)
+            except Exception:
+                try:
+                    sensor_id = int(getattr(sensor_key, 'value', -1))
+                except Exception:
+                    continue
+
+            friendly = yaml_names.get(sensor_id)
+            if not friendly:
+                candidate = info.get('clean_name') or info.get('friendly_name') or info.get('name') or f"camera-{sensor_id}"
+                friendly = self._strip_camera_suffix(self._slugify_camera_name(candidate))
+            slug = self._strip_camera_suffix(self._slugify_camera_name(friendly))
+            if not slug:
+                slug = f"camera-{sensor_id}"
+
+            info['friendly_name'] = slug
+            info['clean_name'] = slug
+            self._friendly_name_by_sensor[sensor_id] = slug
+            self._camera_room_map[slug] = slug
+            self._register_camera_aliases(sensor_id, slug, info)
+
+        self._preferred_camera_ids = set(self._friendly_name_by_sensor.values())
+
+    def _load_cameras_yaml_names(self) -> Dict[int, str]:
+        path = Path("config/cameras.yaml")
+        if not path.exists():
+            return {}
+        try:
+            data = yaml.safe_load(path.read_text(encoding='utf-8')) or {}
+        except Exception as exc:
+            self.logger.debug(f"Unable to read cameras.yaml: {exc}")
+            return {}
+        cameras = data.get('cameras') or data.get('sources') or {}
+        mapping: Dict[int, str] = {}
+        for key, entry in cameras.items():
+            if not isinstance(entry, dict):
+                continue
+            try:
+                idx = int(str(key))
+            except Exception:
+                continue
+            name = entry.get('name') or entry.get('clean_name')
+            slug = self._strip_camera_suffix(self._slugify_camera_name(name))
+            if slug:
+                mapping[idx] = slug
+        return mapping
+
+    @staticmethod
+    def _slugify_camera_name(name: Optional[str]) -> str:
+        if not name:
+            return ''
+        text = str(name).strip().lower()
+        for ch in ('/', '\\'):
+            text = text.replace(ch, '-')
+        text = text.replace('_', '-').replace(' ', '-')
+        while '--' in text:
+            text = text.replace('--', '-')
+        return text.strip('-')
+
+    @staticmethod
+    def _strip_camera_suffix(value: Optional[str]) -> str:
+        if not value:
+            return ''
+        text = value
+        for suffix in ('-camera', '-cam'):
+            if text.endswith(suffix):
+                text = text[: -len(suffix)]
+        return text.strip('-')
+
+    def _register_camera_aliases(self, sensor_id: int, friendly: str, info: Optional[Dict[str, Any]] = None) -> None:
+        alias_set = self._sensor_aliases.setdefault(sensor_id, set())
+
+        def add(alias: Optional[str]) -> None:
+            if not alias:
+                return
+            alias_text = str(alias).strip()
+            if not alias_text:
+                return
+            slug = self._strip_camera_suffix(self._slugify_camera_name(alias_text))
+            if slug:
+                alias_set.add(slug)
+                self._add_camera_alias(slug, sensor_id)
+            self._add_camera_alias(alias_text, sensor_id)
+
+        add(friendly)
+        if info:
+            add(info.get('name'))
+            add(info.get('clean_name'))
+            add(info.get('friendly_name'))
+        add(f"camera-{sensor_id}")
+        add(f"camera_{sensor_id}")
+        add(f"camera-{sensor_id + 1}")
+        add(f"camera_{sensor_id + 1}")
+        add(f"rtsp_{sensor_id}")
+        add(f"rtsp_{sensor_id + 1}")
+        add(str(sensor_id))
+        add(str(sensor_id + 1))
+
+    def _add_camera_alias(self, alias: Optional[str], sensor_id: int) -> None:
+        if alias is None:
+            return
+        normalized = str(alias).strip().lower()
+        if normalized and normalized not in self._camera_alias_map:
+            self._camera_alias_map[normalized] = sensor_id
+
+    def _augment_calibration_bundle_with_aliases(self) -> None:
+        if not isinstance(self.calibration_bundle, dict):
+            return
+        cameras_node = self.calibration_bundle.setdefault('cameras', {})
+        if not isinstance(cameras_node, dict):
+            return
+        k_node = cameras_node.setdefault('K', {})
+        e_node = cameras_node.setdefault('E', {})
+        if not isinstance(k_node, dict) or not isinstance(e_node, dict):
+            return
+
+        for sensor_id, aliases in self._sensor_aliases.items():
+            friendly = self._friendly_name_by_sensor.get(sensor_id)
+            if not friendly:
+                continue
+            friendly_k = k_node.get(friendly)
+            friendly_e = e_node.get(friendly)
+            if friendly_k is None and friendly_e is None:
+                continue
+            for alias in aliases:
+                if not alias or alias == friendly:
+                    continue
+                if alias in k_node:
+                    continue
+                if friendly_k is not None:
+                    k_node[alias] = list(friendly_k)
+                if friendly_e is not None and alias not in e_node:
+                    e_node[alias] = list(friendly_e)
 
     def _start_mapanything_service(self) -> None:
         """Launch the MapAnything FastAPI microservice if not already running."""
@@ -876,6 +1015,100 @@ class ApplicationManager:
     #     t.start()
     #     self.logger.info("✅ MapAnything mono scheduler loop started")
 
+    def _start_mapanything_scheduler(self) -> None:
+        """Background loop that keeps MapAnything depth caches warm."""
+        if self.depth_source is None:
+            self.logger.warning("Depth source unavailable; scheduler not started")
+            return
+        if not self.multi_stream_processor:
+            self.logger.info("Multi-stream processor not ready; scheduler deferred")
+            return
+        if self._mapanything_scheduler_thread and self._mapanything_scheduler_thread.is_alive():
+            return
+
+        def _loop() -> None:
+            mono_interval = float(getattr(self.depth_source, 'mono_interval', 0.5) or 0.5)
+            mono_interval = max(0.1, mono_interval)
+            self.logger.info("MapAnything scheduler loop running (interval %.2fs)", mono_interval)
+            while self.running and not self.stop_event.is_set():
+                try:
+                    source_info = getattr(self.multi_stream_processor, 'source_info', {}) or {}
+                    now = time.time()
+                    for sensor_id, info in source_info.items():
+                        if not self.running or self.stop_event.is_set():
+                            break
+                        cam_id = str(info.get('clean_name') or info.get('name') or f"camera-{sensor_id}")
+                        try:
+                            if not self.depth_source.should_infer(cam_id, now):
+                                continue
+                        except Exception:
+                            continue
+                        frame_bgr = None
+                        try:
+                            frame_bgr = self.multi_stream_processor.read_ma_bgr(int(sensor_id), timeout=1.0)
+                        except Exception as exc:
+                            self.logger.debug(f"read_ma_bgr failed for {cam_id}: {exc}")
+                            continue
+                        if frame_bgr is None:
+                            continue
+                        try:
+                            result = self.depth_source.maybe_infer_mono(cam_id, frame_bgr, self.calibration_bundle, now)
+                        except Exception as exc:
+                            self.logger.debug(f"MapAnything inference failed for {cam_id}: {exc}")
+                            result = None
+                        if result is None:
+                            continue
+                        self._latest_depth_results[cam_id] = result
+                        self._last_depth_summary[cam_id] = result.summary
+                        try:
+                            self.depth_source.update_depth_cache(result)
+                        except Exception as exc:
+                            self.logger.debug(f"Depth cache update failed for {cam_id}: {exc}")
+                        try:
+                            self.logger.info(f"MapAnything inference completed for {cam_id}")
+                        except Exception:
+                            pass
+                        last_pub = self._last_depth_publish.get(cam_id, 0.0)
+                        if (now - last_pub) >= 5.0:
+                            self._last_depth_publish[cam_id] = now
+                            room_id = self._camera_room_map.get(cam_id, cam_id)
+                            if self._depth_publisher:
+                                try:
+                                    self._depth_publisher.publish_depth_summary(result, room_id)
+                                except Exception as exc:
+                                    self.logger.debug(f"Depth publisher error for {cam_id}: {exc}")
+                            summary_message = {
+                                'type': 'ma_diagnostics',
+                                'cam_id': cam_id,
+                                'summary': {
+                                    'median': result.summary.median,
+                                    'p10': result.summary.p10,
+                                    'p90': result.summary.p90,
+                                    'conf_mean': result.summary.conf_mean,
+                                    'valid_ratio': result.summary.valid_ratio,
+                                    'sample_count': result.summary.sample_count,
+                                    'method': 'mde' if result.summary.conf_mean >= getattr(self.depth_source, 'min_conf', 0.5) else 'floor'
+                                },
+                                'ts': result.ts_us
+                            }
+                            self._schedule_ws_broadcast(summary_message)
+                except Exception as exc:
+                    self.logger.debug(f"MapAnything scheduler tick error: {exc}")
+                finally:
+                    try:
+                        time.sleep(max(0.05, mono_interval * 0.5))
+                    except Exception:
+                        time.sleep(0.1)
+            self.logger.info("MapAnything scheduler loop stopped")
+
+        self._mapanything_scheduler_thread = threading.Thread(
+            target=_loop,
+            name="MapAnythingScheduler",
+            daemon=True,
+        )
+        self._mapanything_scheduler_thread.start()
+        self.logger.info("✅ MapAnything scheduler thread started")
+
     def _start_jpeg_processing_loop(self):
         """Start JPEG processing loop for native DeepStream OSD mode"""
         self.logger.info("Starting JPEG processing loop for native DeepStream OSD")
@@ -953,6 +1186,14 @@ class ApplicationManager:
             if cam_id is None:
                 return None
             cam_text = str(cam_id).strip()
+            normalized = cam_text.lower()
+            if normalized in self._camera_alias_map:
+                return int(self._camera_alias_map[normalized])
+            slug = self._strip_camera_suffix(self._slugify_camera_name(cam_text))
+            if slug:
+                slug_norm = slug.lower()
+                if slug_norm in self._camera_alias_map:
+                    return int(self._camera_alias_map[slug_norm])
             # Numeric ids map directly
             if cam_text.isdigit():
                 return int(cam_text)
@@ -1122,24 +1363,61 @@ class ApplicationManager:
         self.logger.info("Started result processing thread")
     
     # ---------------------- Calibration helpers ----------------------
-    def _get_camera_ids(self) -> list:
-        ids = []
+    def _get_camera_ids(self, extr_data: Optional[Dict[str, Any]] = None) -> list:
+        candidates: List[str] = []
+        seen: Set[str] = set()
+
+        def add(name: Optional[str]) -> None:
+            slug = self._strip_camera_suffix(self._slugify_camera_name(name))
+            if not slug or slug in seen:
+                return
+            seen.add(slug)
+            candidates.append(slug)
+
+        for friendly in self._friendly_name_by_sensor.values():
+            add(friendly)
+        for key in getattr(self.config.calibration, 'CAMERA_INTRINSICS_MODEL_MAP', {}) or {}:
+            add(key)
+        specs = getattr(self.config.calibration, 'CAMERA_SPECS', {}) or {}
+        for key in specs.keys():
+            add(key)
+        for name in self._preferred_camera_ids:
+            add(name)
+        yaml_names = self._load_cameras_yaml_names()
+        for value in yaml_names.values():
+            add(value)
+        if extr_data:
+            cams = extr_data.get('cameras') if isinstance(extr_data, dict) else {}
+            if isinstance(cams, dict):
+                for key in cams.keys():
+                    add(key)
+
+        if candidates:
+            return candidates
+
         try:
             if self.multi_stream_processor and getattr(self.multi_stream_processor, 'source_info', None):
                 for sid, info in self.multi_stream_processor.source_info.items():
-                    ids.append(str(info.get('clean_name') or info.get('name') or f"camera-{sid}"))
-                return ids
+                    name = info.get('clean_name') or info.get('name') or f"camera-{sid}"
+                    add(name)
         except Exception:
             pass
+        if seen:
+            return list(seen)
+
         try:
             for i, stream in enumerate(self.config.cameras.RTSP_STREAMS):
                 if stream.get('enabled', True):
                     name = stream.get('name', f'Camera {i+1}')
-                    clean = name.lower().replace(' ', '-').replace('_', '-')
-                    ids.append(clean)
+                    add(name)
         except Exception:
             pass
-        return ids
+
+        if candidates:
+            return candidates
+        if seen:
+            return list(seen)
+        return []
 
     def _load_calibration(self) -> None:
         # Resolve paths
@@ -1162,7 +1440,7 @@ class ApplicationManager:
         align = load_alignment(align_path)
         extr = load_extrinsics(extr_path)
 
-        cam_ids = self._get_camera_ids()
+        cam_ids = self._get_camera_ids(extr)
         model_map = dict(self.config.calibration.CAMERA_INTRINSICS_MODEL_MAP)
         camera_specs = dict(getattr(self.config.calibration, 'CAMERA_SPECS', {}) or {})
         self.calibration_bundle = assemble_calibration_bundle(
@@ -1173,6 +1451,82 @@ class ApplicationManager:
             align,
             camera_specs
         )
+        self._augment_calibration_bundle_with_aliases()
+        # Augment bundle to align DS8 clean IDs (e.g., 'camera-1') with friendly names from cameras.yaml
+        try:
+            yaml_path = Path("config/cameras.yaml")
+            if yaml_path.exists():
+                import yaml  # type: ignore
+                data = yaml.safe_load(yaml_path.read_text(encoding='utf-8')) or {}
+                cams = (data.get('cameras') or data.get('sources') or {}) if isinstance(data, dict) else {}
+                models = (data.get('intrinsics_models') or data.get('models') or {}) if isinstance(data, dict) else {}
+                # Build DS index -> friendly name + model
+                idx_to_name: Dict[int, str] = {}
+                idx_to_model: Dict[int, str] = {}
+                for key, entry in cams.items():
+                    if not isinstance(entry, dict):
+                        continue
+                    try:
+                        idx = int(str(key))
+                    except Exception:
+                        continue
+                    nm = entry.get('name')
+                    if isinstance(nm, str) and nm.strip():
+                        idx_to_name[idx] = nm.strip()
+                    mk = entry.get('model') or entry.get('intrinsics_model')
+                    if isinstance(mk, str) and mk.strip():
+                        idx_to_model[idx] = mk.strip()
+                # Mutate bundle in-place: add K/E entries for 'camera-N' IDs using friendly counterparts
+                cams_node = self.calibration_bundle.setdefault('cameras', {})  # type: ignore[assignment]
+                k_node = cams_node.setdefault('K', {}) if isinstance(cams_node, dict) else {}
+                e_node = cams_node.setdefault('E', {}) if isinstance(cams_node, dict) else {}
+                for ds_id, info in getattr(self.multi_stream_processor, 'source_info', {}).items():
+                    try:
+                        cam_clean = str(info.get('clean_name') or info.get('name') or f"camera-{ds_id}")
+                        friendly = idx_to_name.get(int(ds_id))
+                    except Exception:
+                        cam_clean = f"camera-{ds_id}"
+                        friendly = None
+                    # Provide K for cam_clean using either existing friendly K or model map
+                    if isinstance(k_node, dict) and cam_clean not in k_node:
+                        k_src = None
+                        if friendly and isinstance(k_node, dict):
+                            k_src = k_node.get(friendly)
+                        if k_src is None and friendly:
+                            # Derive from intrinsics model if available
+                            from calibration_bundle import _derive_k_from_intrinsics_model  # type: ignore
+                            mk = idx_to_model.get(int(ds_id))
+                            k_tuple = _derive_k_from_intrinsics_model(mk, self._intrinsics_models or {})
+                            if k_tuple is not None:
+                                fx, fy, cx, cy = k_tuple
+                                k_src = [fx, fy, cx, cy]
+                        if k_src is None and friendly:
+                            # Fallback: read intrinsics from cameras.yaml models or per-camera section
+                            try:
+                                model_sec = models.get(idx_to_model.get(int(ds_id), ''), {}) if isinstance(models, dict) else {}
+                                intr = None
+                                if isinstance(model_sec, dict):
+                                    intr = model_sec.get('intrinsics') or model_sec
+                                if intr is None and isinstance(cams.get(int(ds_id), {}), dict):
+                                    intr = cams[int(ds_id)].get('intrinsics')
+                                if isinstance(intr, dict):
+                                    fx = float(intr.get('fx'))
+                                    fy = float(intr.get('fy'))
+                                    cx = float(intr.get('cx'))
+                                    cy = float(intr.get('cy'))
+                                    if all(np.isfinite([fx, fy, cx, cy])):  # type: ignore[name-defined]
+                                        k_src = [fx, fy, cx, cy]
+                            except Exception:
+                                pass
+                        if k_src is not None:
+                            k_node[cam_clean] = list(k_src)
+                    # Provide E for cam_clean by copying from friendly name if present
+                    if isinstance(e_node, dict) and cam_clean not in e_node and friendly and isinstance(e_node, dict):
+                        e_src = e_node.get(friendly)
+                        if isinstance(e_src, list) and len(e_src) == 16:
+                            e_node[cam_clean] = list(e_src)
+        except Exception as exc:
+            self.logger.debug(f"Calibration bundle augmentation skipped: {exc}")
         self._calib_paths = {'intrinsics': intr_path, 'alignment': align_path, 'extrinsics': extr_path}
         camera_keys = sorted(list((self.calibration_bundle.get('cameras') or {}).get('K', {}).keys()))
         self.logger.info(f"Calibration ready for cameras (K): {camera_keys}")
@@ -1329,7 +1683,7 @@ class ApplicationManager:
         # Rebuild bundle with updated extrinsics
         extr = load_extrinsics(self._calib_paths.get('extrinsics', ''))
         align = self.calibration_bundle.get('align', {}) if self.calibration_bundle else load_alignment(self._calib_paths.get('alignment', ''))
-        cam_ids = self._get_camera_ids()
+        cam_ids = self._get_camera_ids(extr)
         model_map = dict(self.config.calibration.CAMERA_INTRINSICS_MODEL_MAP)
         camera_specs = dict(getattr(self.config.calibration, 'CAMERA_SPECS', {}) or {})
         self.calibration_bundle = assemble_calibration_bundle(
@@ -1340,6 +1694,7 @@ class ApplicationManager:
             align,
             camera_specs
         )
+        self._augment_calibration_bundle_with_aliases()
         if self.depth_source is not None:
             try:
                 self.depth_source.calibration_bundle = self.calibration_bundle
@@ -1385,7 +1740,7 @@ class ApplicationManager:
             # Reload and rebuild bundle
             align = load_alignment(self._calib_paths.get('alignment', ''))
             extr = load_extrinsics(self._calib_paths.get('extrinsics', ''))
-            cam_ids = self._get_camera_ids()
+            cam_ids = self._get_camera_ids(extr)
             model_map = dict(self.config.calibration.CAMERA_INTRINSICS_MODEL_MAP)
             camera_specs = dict(getattr(self.config.calibration, 'CAMERA_SPECS', {}) or {})
             self.calibration_bundle = assemble_calibration_bundle(
@@ -1396,6 +1751,7 @@ class ApplicationManager:
                 align,
                 camera_specs
             )
+            self._augment_calibration_bundle_with_aliases()
             if self.depth_source is not None:
                 try:
                     self.depth_source.calibration_bundle = self.calibration_bundle
@@ -1793,6 +2149,21 @@ class ApplicationManager:
                     self.logger.warning(f"Error getting CPU profiling stats: {e}")
                     stats['cpu_profiling'] = {'error': str(e)}
 
+            try:
+                source_info = getattr(self.multi_stream_processor, 'source_info', {}) or {}
+            except Exception:
+                source_info = {}
+            default_tracking = {'occupancy': {}, 'active_tracks': [], 'transitions': []}
+            for sid, info in source_info.items():
+                cam_key = str(info.get('clean_name') or info.get('name') or f"camera-{sid}")
+                if cam_key not in stats['cameras']:
+                    stats['cameras'][cam_key] = {
+                        'fps': 0,
+                        'frames_processed': stats.get('frames_processed', 0),
+                        'status': 'running' if stats.get('running') else 'unknown',
+                        'tracking': dict(default_tracking),
+                    }
+
         except Exception as e:
             self.logger.error(f"Error gathering application stats: {e}")
             stats = {
@@ -1973,6 +2344,16 @@ class ApplicationManager:
                 self.logger.info("Stopped multi-stream processor")
             except Exception as e:
                 self.logger.error(f"Error stopping multi-stream processor: {e}")
+
+        scheduler_thread = getattr(self, '_mapanything_scheduler_thread', None)
+        if scheduler_thread:
+            try:
+                self.logger.info("Stopping MapAnything scheduler thread")
+                scheduler_thread.join(timeout=2.0)
+            except Exception:
+                pass
+            finally:
+                self._mapanything_scheduler_thread = None
 
         # Stop integrations (OccupancyPublisher)
         if getattr(self, '_occupancy_publisher', None) is not None:
@@ -2217,6 +2598,9 @@ def update_config_from_args(args):
 
 def main():
     """Main application entry point"""
+    # Declare globals at the top of the function
+    global _force_exit_flag, _shutdown_event
+    
     print("🔧 Starting main() function...")
     # Parse command line arguments
     args = parse_arguments()
@@ -2253,20 +2637,32 @@ def main():
         # Keep application running
         logger.info("Application running. Press Ctrl+C to stop.")
         
-        # Wait for termination signal
-        while app_manager.running:
-            time.sleep(1.0)
+        # Wait for termination signal or shutdown event
+        # Check both the running flag and the global shutdown event
+        # This allows signal handler to trigger shutdown safely
+        while app_manager.running and not _shutdown_event.is_set():
+            # Check shutdown event more frequently for responsiveness
+            if _shutdown_event.wait(timeout=0.5):
+                logger.info("Shutdown signal received, initiating graceful shutdown...")
+                break
+            
+        # If force exit was requested, exit immediately
+        if _force_exit_flag:
+            logger.warning("Force exit requested, terminating immediately")
+            os._exit(1)
             
     except KeyboardInterrupt:
         logger.info("Received keyboard interrupt, shutting down...")
+        _shutdown_event.set()
     except Exception as e:
         logger.error(f"Application error: {e}")
         import traceback
         traceback.print_exc()
     finally:
         # Clean shutdown
-        app_manager.stop()
-        logger.info("Application shutdown complete")
+        if not _force_exit_flag:
+            app_manager.stop()
+            logger.info("Application shutdown complete")
 
 
 if __name__ == "__main__":

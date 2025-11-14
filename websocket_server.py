@@ -741,6 +741,16 @@ class WebSocketServer:
                                 ts_max = ts
                             except Exception:
                                 ts_max = None
+                        # Treat negative ts_max as "latest" (ignore staleness)
+                        if ts_max is not None and ts_max < 0:
+                            ts_max = None
+
+                        provider = self.ma_depth_provider if callable(self.ma_depth_provider) else None
+                        result = {'type': 'ma_depth_response', 'cam_id': cam_id}
+                        if not cam_id or provider is None:
+                            result.update({'ok': False, 'error': 'no_provider'})
+                            await websocket.send(json.dumps(result))
+                            continue
 
                         rate_key = f"{client_ip}:{cam_id or 'unknown'}"
                         now = time.time()
@@ -754,11 +764,9 @@ class WebSocketServer:
                                 k: v for k, v in self._depth_rpc_tracker.items() if now - v <= self._tracker_prune_window
                             }
 
-                        result = {'type': 'ma_depth_response', 'cam_id': cam_id}
-                        if cam_id and callable(self.ma_depth_provider):
-                            try:
+                        try:
                                 payload = await asyncio.wait_for(
-                                    asyncio.to_thread(self.ma_depth_provider, cam_id, ts_max),
+                                    asyncio.to_thread(provider, cam_id, ts_max),
                                     timeout=self._depth_rpc_timeout
                                 )
                                 if payload:
@@ -770,15 +778,12 @@ class WebSocketServer:
                                 else:
                                     result.update({'ok': False, 'error': 'not_available'})
                                     await websocket.send(json.dumps(result))
-                            except asyncio.TimeoutError:
-                                self.logger.warning(f"Depth RPC timed out for {cam_id} from {client_ip}")
-                                result.update({'ok': False, 'error': 'timeout'})
-                                await websocket.send(json.dumps(result))
-                            except Exception as exc:
-                                result.update({'ok': False, 'error': str(exc)})
-                                await websocket.send(json.dumps(result))
-                        else:
-                            result.update({'ok': False, 'error': 'no_provider'})
+                        except asyncio.TimeoutError:
+                            self.logger.warning(f"Depth RPC timed out for {cam_id} from {client_ip}")
+                            result.update({'ok': False, 'error': 'timeout'})
+                            await websocket.send(json.dumps(result))
+                        except Exception as exc:
+                            result.update({'ok': False, 'error': str(exc)})
                             await websocket.send(json.dumps(result))
 
                     elif data.get('type') == 'get_floorplan':
@@ -792,6 +797,18 @@ class WebSocketServer:
                         max_extent_m = float(data.get('max_extent_m', data.get('maxExtentM', 20.0)))
                         cache_only = bool(data.get('cache_only', data.get('cacheOnly', False)))
 
+                        provider = getattr(self, 'floorplan_provider', None)
+                        result = {
+                            'type': 'floorplan_response',
+                            'request_id': request_id,
+                            'camera_id': camera,
+                            'cache_only': cache_only,
+                        }
+                        if not callable(provider):
+                            result['error'] = 'no_provider'
+                            await websocket.send(json.dumps(result))
+                            continue
+
                         rate_key = f"{client_ip}:{camera or 'unknown'}"
                         now = time.time()
                         last = self._floorplan_rpc_tracker.get(rate_key, 0.0)
@@ -804,37 +821,25 @@ class WebSocketServer:
                                 k: v for k, v in self._floorplan_rpc_tracker.items() if now - v <= self._tracker_prune_window
                             }
 
-                        result = {
-                            'type': 'floorplan_response',
-                            'request_id': request_id,
-                            'camera_id': camera,
-                            'cache_only': cache_only,
-                        }
-
-                        provider = getattr(self, 'floorplan_provider', None)
-                        if callable(provider):
-                            try:
-                                payload = await asyncio.wait_for(
-                                    asyncio.to_thread(provider, camera, max_age_sec, grid_res_m, max_extent_m, cache_only=cache_only),
-                                    timeout=self._floorplan_rpc_timeout
-                                )
-                                if payload:
-                                    result.update(payload)
-                                    message_text = await asyncio.to_thread(json.dumps, result)
-                                    await websocket.send(message_text)
-                                else:
-                                    result['error'] = 'no_payload'
-                                    await websocket.send(json.dumps(result))
-                            except asyncio.TimeoutError:
-                                self.logger.warning(f"Floorplan RPC timed out for {camera} from {client_ip}")
-                                result['error'] = 'timeout'
+                        try:
+                            payload = await asyncio.wait_for(
+                                asyncio.to_thread(provider, camera, max_age_sec, grid_res_m, max_extent_m, cache_only=cache_only),
+                                timeout=self._floorplan_rpc_timeout
+                            )
+                            if payload:
+                                result.update(payload)
+                                message_text = await asyncio.to_thread(json.dumps, result)
+                                await websocket.send(message_text)
+                            else:
+                                result['error'] = 'no_payload'
                                 await websocket.send(json.dumps(result))
-                            except Exception as exc:
-                                result['error'] = str(exc)
-                                self.logger.error(f"Floorplan generation error: {exc}")
-                                await websocket.send(json.dumps(result))
-                        else:
-                            result['error'] = 'no_provider'
+                        except asyncio.TimeoutError:
+                            self.logger.warning(f"Floorplan RPC timed out for {camera} from {client_ip}")
+                            result['error'] = 'timeout'
+                            await websocket.send(json.dumps(result))
+                        except Exception as exc:
+                            result['error'] = str(exc)
+                            self.logger.error(f"Floorplan generation error: {exc}")
                             await websocket.send(json.dumps(result))
 
                     # Handle individual detection toggles

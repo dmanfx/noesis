@@ -332,9 +332,7 @@ class ApplicationManager:
                             # Lazily construct depth source client
                             self.depth_source = MapAnythingDepthSource()
                             if self.websocket_server:
-                                # Use on-demand provider that captures a pre-PGIE frame and runs inference if cache misses
-                                self.websocket_server.ma_depth_provider = self._ma_depth_provider
-                                # Floorplan generation uses cached/latest depth
+                                self.websocket_server.ma_depth_provider = self.depth_source.load_latest_depth
                                 self.websocket_server.floorplan_provider = (
                                     lambda camera=None, max_age_sec=60.0, grid_res_m=0.5, max_extent_m=20.0, cache_only=False, **_:
                                         self.depth_source.generate_topdown_floorplan(
@@ -345,7 +343,7 @@ class ApplicationManager:
                                             cache_only=bool(cache_only),
                                         )
                                 )
-                            self.logger.info("✅ MapAnything WebSocket providers wired (on-demand depth + floorplan)")
+                            self.logger.info("✅ MapAnything WebSocket providers wired (cached depth + floorplan)")
                         else:
                             self.logger.info("MapAnything disabled by config; skipping WS providers")
                     except Exception as exc:
@@ -403,6 +401,8 @@ class ApplicationManager:
                     if not hasattr(self, 'jpeg_thread') or not getattr(self, 'jpeg_thread').is_alive():
                         self._start_jpeg_processing_loop()
                         # Start mosaic publisher if configured (maps mosaic to a single camera id)
+                        if getattr(self.config.websocket, 'MOSAIC_BROADCAST', False):
+                            self._start_mosaic_broadcast()
                         # DISABLED: MapAnything - re-enable post-merge
                         # self._start_mapanything_scheduler()
             except Exception as e:
@@ -1379,6 +1379,59 @@ class ApplicationManager:
         except Exception as exc:
             self.logger.warning(f"MapAnything provider error for {cam_id}: {exc}")
             return None
+
+    def _start_mosaic_broadcast(self):
+        """Start a background thread that composites a mosaic from latest JPEGs and broadcasts it under a target camera id."""
+        if not getattr(self.config.websocket, 'MOSAIC_BROADCAST', False):
+            return
+
+        target_cam = getattr(self.config.websocket, 'MOSAIC_TARGET_CAMERA', 'living-room')
+        fps_limit = max(1, int(getattr(self.config.websocket, 'MAX_FPS', 10)))
+        period = 1.0 / float(fps_limit)
+
+        def _mosaic_loop():
+            next_tick = time.time()
+            header = None
+            if self.websocket_server:
+                cam_id_bytes = target_cam.encode('utf-8')
+                if len(cam_id_bytes) <= 255:
+                    header = bytes([len(cam_id_bytes)]) + cam_id_bytes
+            sent = 0
+            t_start = time.time()
+            last_log = t_start
+            last_bytes = 0
+            while self.running and not self.stop_event.is_set():
+                ok = False
+                data = None
+                try:
+                    if hasattr(self.multi_stream_processor, 'read_mosaic_jpeg'):
+                        ok, data = self.multi_stream_processor.read_mosaic_jpeg(timeout=0.1)
+                except Exception:
+                    ok, data = False, None
+                if ok and data and header and self.websocket_server:
+                    self.websocket_server.broadcast_sync(header + data)
+                    sent += 1
+                    last_bytes = len(data)
+                # Log every ~2s
+                now = time.time()
+                if (now - last_log) >= 2.0:
+                    try:
+                        qsz = getattr(self.multi_stream_processor, 'mosaic_queue', queue.Queue()).qsize()
+                    except Exception:
+                        qsz = -1
+                    elapsed = max(1e-3, now - t_start)
+                    fps = sent / elapsed
+                    #elf.logger.debug(f"Mosaic feed: {fps:.1f} fps, last={last_bytes} bytes, q={qsz}")
+                    last_log = now
+                # Throttle to target FPS
+                next_tick += period
+                sleep_for = next_tick - time.time()
+                if sleep_for > 0:
+                    time.sleep(min(sleep_for, period))
+
+        t = threading.Thread(target=_mosaic_loop, name="MosaicPublisher", daemon=True)
+        t.start()
+        self.logger.info("✅ Mosaic broadcast thread started (target=%s)", target_cam)
 
     @profile_function("ApplicationManager.start_result_processing")
     def _start_result_processing(self):

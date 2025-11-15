@@ -30,6 +30,9 @@ function Dashboard() {
 
   // Stream image blobs
   const [streams, setStreams] = useState<{ [k: string]: Blob | null }>({ 'living-room': null, 'kitchen': null, 'family-room': null });
+  const [bevImages, setBevImages] = useState<Record<CameraKey, string | null>>({ 'living-room': null, 'kitchen': null, 'family-room': null });
+  const bevUrlRef = useRef<Record<CameraKey, string | null>>({ 'living-room': null, 'kitchen': null, 'family-room': null });
+  const [bevMeta, setBevMeta] = useState<Record<CameraKey, any>>({ 'living-room': undefined, 'kitchen': undefined, 'family-room': undefined });
 
   // FPS tracking (exponential over short window)
   const [fps, setFps] = useState<{ [k: string]: string }>({ 'living-room': 'FPS: 0.0', 'kitchen': 'FPS: 0.0', 'family-room': 'FPS: 0.0' });
@@ -470,8 +473,43 @@ function Dashboard() {
     }
   };
 
-  const { status, sendClearStats, sendTrailToggle, sendDetectionConfig, sendDetectionToggle, requestMapAnythingDepth, requestFloorplan } = useWebSocketClient(WS_URL, {
+  const handleBevImage = useCallback((cam: CameraKey, blob: Blob) => {
+    const url = URL.createObjectURL(blob);
+    setBevImages((prev) => {
+      if (bevUrlRef.current[cam]) {
+        URL.revokeObjectURL(bevUrlRef.current[cam]!);
+      }
+      bevUrlRef.current[cam] = url;
+      return { ...prev, [cam]: url };
+    });
+  }, []);
+
+  useEffect(() => () => {
+    Object.values(bevUrlRef.current).forEach((url) => {
+      if (url) URL.revokeObjectURL(url);
+    });
+  }, []);
+
+  const handleBevMeta = useCallback((payload: any) => {
+    const cam = detectCameraKey(payload.cameraId || payload.camId);
+    if (!cam) return;
+    setBevMeta((prev) => ({ ...prev, [cam]: payload }));
+  }, []);
+
+  const {
+    status,
+    sendClearStats,
+    sendTrailToggle,
+    sendDetectionConfig,
+    sendDetectionToggle,
+    requestMapAnythingDepth,
+    requestFloorplan,
+    sendBevConfig,
+    sendBevOverlay
+  } = useWebSocketClient(WS_URL, {
     onImage,
+    onBevImage: handleBevImage,
+    onBevMeta: handleBevMeta,
     onStats,
     onTrailToggle: (en) => setTrailEnabled(en),
     onCalibration: handleCalibrationBundle,
@@ -479,6 +517,14 @@ function Dashboard() {
     onMADepth: handleMADepth,
     onFloorplan: handleFloorplan
   });
+
+  const handleBevConfigUpdate = useCallback((cam: CameraKey, cfg: { mpp: number; xMin: number; xMax: number; zMin: number; zMax: number }) => {
+    sendBevConfig(cam, cfg);
+  }, [sendBevConfig]);
+
+  const handleBevOverlayToggle = useCallback((cam: CameraKey, enabled: boolean) => {
+    sendBevOverlay(cam, enabled);
+  }, [sendBevOverlay]);
 
   const handleRequestDepth = useCallback((camId: string) => {
     if (!camId) return;
@@ -671,7 +717,10 @@ function Dashboard() {
       <TopDownDrawer
         open={topDownOpen}
         onClose={() => setTopDownOpen(false)}
-        store={trailStoreRef.current}
+        images={bevImages}
+        meta={bevMeta}
+        onUpdateConfig={handleBevConfigUpdate}
+        onToggleOverlay={handleBevOverlayToggle}
       />
 
       {telemetryOpen && (

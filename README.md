@@ -104,6 +104,7 @@ For a production build run `npm run build` and then launch Electron with `npm st
 
 - `docs/reference/DEEPSTREAM_PIPELINE_MAP.md`: Detailed map of the entire pipeline, from input to output.
 - `docs/reference/pipeline_flow.md`: High-level architecture with Mermaid diagrams.
+- `docs/reference/Static_ROI_Exclusion.md`: ROI exclusion plugin usage, stream ID vs pad index mapping, and stream shuffle checklist.
 
 ## Contributing
 

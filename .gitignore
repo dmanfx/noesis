@@ -1,6 +1,9 @@
 # Ignore node modules and build output
 node_modules/
 oai2-fe/dist/
+csrc/
+build/
+
 
 # Python cache
 __pycache__/
@@ -47,5 +50,6 @@ pipelines/*.so
 
 #external folders/files
 .venv_ds/
+newvisions-redesign-mockup
 
 

@@ -24,11 +24,13 @@ import threading
 import time
 import queue
 import socket
+import ctypes
 from collections import defaultdict, deque
 
 # Bypass libproxy issues by disabling GIO proxy resolver
 from typing import Optional, Tuple, Dict, Any, List
 import math
+import numpy as np
 
 # GStreamer imports
 import gi
@@ -170,6 +172,8 @@ class DeepStreamVideoPipeline:
             "mosaic_sink",
             "egl_q",
             "egl_sink",
+            "post_analytics_bev_q",
+            "analytics_fanout_q",
         }
 
         
@@ -206,6 +210,13 @@ class DeepStreamVideoPipeline:
         self._ma_sinks: Dict[int, GstApp.AppSink] = {}
         self._ma_frame_queues: Dict[int, queue.Queue] = {sid: queue.Queue(maxsize=1) for sid in self.sensor_ids}
         self._ma_branch_lock = threading.Lock()
+
+        # Post-analytics BEV branch state (nvdsanalytics_post → tee → demux → per-stream BGR appsinks)
+        self._post_analytics_tee: Optional[Gst.Element] = None
+        self._bev_demux: Optional[Gst.Element] = None
+        self._bev_branch_ready: bool = False
+        self._bev_frame_queues: Dict[int, queue.Queue] = {sid: queue.Queue(maxsize=1) for sid in self.sensor_ids}
+        self._bev_requested_src: Dict[int, Gst.Pad] = {}
         
         # Add tracking history for trail visualization (per sensor_id, per track_id)
         self.trail_history_by_sensor: Dict[int, Dict[int, deque]] = defaultdict(
@@ -565,6 +576,12 @@ class DeepStreamVideoPipeline:
             sink.set_property("drop", True)
             sink.set_property("sync", False)
             sink.set_property("max-buffers", 1)
+            # Critical for live pipelines: don't make BEV appsink participate in preroll
+            try:
+                sink.set_property("async", False)
+                sink.set_property("enable-last-sample", False)
+            except Exception:
+                pass
             # Connect callback
             sink.connect("new-sample", self._on_new_ma_frame, sensor_id)
             # Link static elements (queue BEFORE valve)
@@ -618,6 +635,159 @@ class DeepStreamVideoPipeline:
         # Save top-level for helpers
         self._pre_pgie_tee = pre_tee
         self._ma_demux = ma_demux
+
+    def _setup_bev_branch(self, elements: Dict[str, Any]) -> None:
+        """Create and link a post-analytics tee → nvstreamdemux → per-stream BGR appsinks.
+
+        Always-on design (no valve):
+        - Place a tiny, leaky queue immediately after the tee so the BEV leg can never
+          backpressure the tee or the main pipeline. Feed directly into the demux.
+        - Keep caps on per-stream branches as SystemMemory BGR for CPU access.
+        - Attach lightweight flow probes to aid debugging of buffer flow.
+        """
+        post_analytics_tee: Gst.Element = elements['post_analytics_tee']
+        bev_demux: Gst.Element = elements['bev_demux']
+        if post_analytics_tee is None or bev_demux is None:
+            raise RuntimeError("post_analytics_tee or bev_demux missing; cannot build BEV branch")
+
+        bev_branch_q = Gst.ElementFactory.make("queue", "post_analytics_bev_q")
+        if bev_branch_q is None:
+            raise RuntimeError("Failed to create post-analytics BEV queue")
+        try:
+            bev_branch_q.set_property("leaky", 2)
+            bev_branch_q.set_property("max-size-buffers", 1)
+            bev_branch_q.set_property("max-size-bytes", 0)
+            bev_branch_q.set_property("max-size-time", 0)
+        except Exception:
+            pass
+        self.pipeline.add(bev_branch_q)
+
+        tee_src = post_analytics_tee.get_request_pad("src_1")
+        if not tee_src:
+            raise RuntimeError("Failed to request post_analytics_tee src_1 pad for BEV branch")
+        bev_q_sink = bev_branch_q.get_static_pad("sink")
+        if not bev_q_sink:
+            raise RuntimeError("Failed to get post-analytics BEV queue sink pad")
+        # Queue immediately after tee to avoid backpressure, then feed demux
+        if tee_src.link(bev_q_sink) != Gst.PadLinkReturn.OK:
+            raise RuntimeError("Failed to link post_analytics_tee to BEV queue")
+        # Optional: bypass demux for isolation testing (env NOESIS_BEV_BYPASS=1)
+        try:
+            import os as _os
+            _bypass = str(_os.environ.get("NOESIS_BEV_BYPASS", "0")).strip().lower() in {"1","true","yes","y"}
+        except Exception:
+            _bypass = False
+        if _bypass:
+            fakesink = Gst.ElementFactory.make("fakesink", "bev_bypass_fakesink")
+            if fakesink:
+                try:
+                    fakesink.set_property("sync", False)
+                except Exception:
+                    pass
+                try:
+                    self.pipeline.add(fakesink)
+                    if not bev_branch_q.link(fakesink):
+                        raise RuntimeError("Failed to link BEV queue to fakesink (bypass)")
+                    self.logger.warning("⚠️ NOESIS_BEV_BYPASS enabled: BEV demux bypassed to fakesink")
+                except Exception as exc:
+                    self.logger.warning(f"BEV bypass failed, falling back to demux: {exc}")
+                    if not bev_branch_q.link(bev_demux):
+                        raise RuntimeError("Failed to link BEV queue to bev_demux")
+            else:
+                if not bev_branch_q.link(bev_demux):
+                    raise RuntimeError("Failed to link BEV queue to bev_demux")
+        else:
+            if not bev_branch_q.link(bev_demux):
+                raise RuntimeError("Failed to link BEV queue to bev_demux")
+
+        # Attach flow probes for fast diagnosis of buffer flow
+        try:
+            self._attach_flow_probe(tee_src, "post_analytics_tee.src_1 (BEV)")
+        except Exception:
+            pass
+        try:
+            self._attach_flow_probe(bev_branch_q.get_static_pad("src"), "post_analytics_bev_q.src")
+        except Exception:
+            pass
+        try:
+            self._attach_flow_probe(bev_demux.get_static_pad("sink"), "bev_demux.sink")
+        except Exception:
+            pass
+
+        for sensor_id in self.sensor_ids:
+            stream_id = self._stream_id_for_sensor(sensor_id)
+            q = Gst.ElementFactory.make("queue", f"bev_q_{stream_id}")
+            ident = None
+            conv = Gst.ElementFactory.make("nvvideoconvert", f"bev_conv_{stream_id}")
+            caps = Gst.ElementFactory.make("capsfilter", f"bev_caps_{stream_id}")
+            sink = Gst.ElementFactory.make("appsink", f"bev_sink_{stream_id}")
+            # Optional identity to isolate caps/allocation (best-effort)
+            try:
+                ident = Gst.ElementFactory.make("identity", f"bev_ident_{stream_id}")
+                if ident:
+                    ident.set_property("single-segment", True)
+            except Exception:
+                ident = None
+            if not all([q, conv, caps, sink]) or (ident is None and False):
+                raise RuntimeError(f"Failed to create BEV branch elements for stream {stream_id}")
+            try:
+                if ident:
+                    self.pipeline.add(ident)
+                self.pipeline.add(q); self.pipeline.add(conv); self.pipeline.add(caps); self.pipeline.add(sink)
+            except Exception:
+                pass
+            try:
+                q.set_property("leaky", 2)
+                q.set_property("max-size-buffers", 1)
+                q.set_property("max-size-bytes", 0)
+                q.set_property("max-size-time", 0)
+            except Exception:
+                pass
+            caps.set_property("caps", Gst.Caps.from_string("video/x-raw(memory:SystemMemory), format=BGR"))
+            sink.set_property("emit-signals", True)
+            sink.set_property("drop", True)
+            sink.set_property("sync", False)
+            sink.set_property("max-buffers", 1)
+            sink.connect("new-sample", self._on_new_bev_frame, sensor_id)
+
+            if not q.link(conv):
+                raise RuntimeError(f"Failed to link bev_q_{stream_id} to converter")
+            if not conv.link(caps):
+                raise RuntimeError(f"Failed to link bev_conv_{stream_id} to caps")
+            if not caps.link(sink):
+                raise RuntimeError(f"Failed to link bev_caps_{stream_id} to sink")
+
+            # Flow probe per-stream queue to observe demux fanout
+            try:
+                self._attach_flow_probe(q.get_static_pad("src"), f"bev_q_{stream_id}.src")
+            except Exception:
+                pass
+
+            pad = bev_demux.get_request_pad(f"src_{stream_id}")
+            if not pad:
+                raise RuntimeError(f"Failed to request bev_demux src_{stream_id} pad")
+            # Link demux → optional identity → q
+            if ident is not None:
+                ident_sink = ident.get_static_pad("sink")
+                if not ident_sink:
+                    raise RuntimeError(f"Failed to get bev_ident_{stream_id} sink pad")
+                if pad.link(ident_sink) != Gst.PadLinkReturn.OK:
+                    raise RuntimeError(f"Failed to link bev_demux src_{stream_id} to bev_ident_{stream_id}")
+                if not ident.link(q):
+                    raise RuntimeError(f"Failed to link bev_ident_{stream_id} to bev_q_{stream_id}")
+            else:
+                sink_pad = q.get_static_pad("sink")
+                if not sink_pad:
+                    raise RuntimeError(f"Failed to get bev_q_{stream_id} sink pad")
+                if pad.link(sink_pad) != Gst.PadLinkReturn.OK:
+                    raise RuntimeError(f"Failed to link bev_demux src_{stream_id} to bev_q_{stream_id}")
+            self._bev_requested_src[stream_id] = pad
+
+        self._bev_demux = bev_demux
+        self._post_analytics_tee = post_analytics_tee
+        
+
+        # No valve used; branch is always-on
 
     def _stream_id_for_sensor(self, sensor_id: int) -> int:
         """Return the nvstreammux/demux stream index for a given sensor_id.
@@ -724,6 +894,195 @@ class DeepStreamVideoPipeline:
             pass
         return Gst.FlowReturn.OK
 
+    def _on_new_bev_frame(self, appsink: GstApp.AppSink, sensor_id: int) -> Gst.FlowReturn:
+        sample = None
+        buf = None
+        map_info = None
+        try:
+            sample = appsink.emit("pull-sample")
+            if not sample:
+                return Gst.FlowReturn.OK
+            buf = sample.get_buffer()
+            caps = sample.get_caps()
+            if not buf or not caps:
+                return Gst.FlowReturn.OK
+            s = caps.get_structure(0)
+            width = s.get_value('width') if s and s.has_field('width') else None
+            height = s.get_value('height') if s and s.has_field('height') else None
+            if not isinstance(width, int) or not isinstance(height, int):
+                return Gst.FlowReturn.OK
+            success, map_info = buf.map(Gst.MapFlags.READ)
+            if not success:
+                return Gst.FlowReturn.OK
+            frame = np.frombuffer(map_info.data, dtype=np.uint8)
+            frame = frame.reshape((int(height), int(width), 3))
+            frame_copy = frame.copy()
+
+            # Log first successful BEV sample per sensor to confirm flow
+            try:
+                if not hasattr(self, "_bev_first_logged"):
+                    self._bev_first_logged = set()
+                if sensor_id not in self._bev_first_logged:
+                    self.logger.info("🎞️ First BEV sample received for sensor %s: %sx%s", sensor_id, width, height)
+                    self._bev_first_logged.add(sensor_id)
+            except Exception:
+                pass
+
+            operator = meta_ops.create_operator(buf)
+            frames = meta_ops.iter_frames(operator, buf)
+            frame_meta = frames[0] if frames else None
+            if frame_meta is None:
+                return Gst.FlowReturn.OK
+            frame_num = int(getattr(frame_meta, "frame_num", -1) or -1)
+            ntp_ts = int(getattr(frame_meta, "ntp_timestamp", 0) or 0)
+            footpoints: List[Dict[str, Any]] = []
+            frame_width = float(getattr(frame_meta, "source_frame_width", width) or width)
+            frame_height = float(getattr(frame_meta, "source_frame_height", height) or height)
+            for obj_meta in meta_ops.iter_objects(operator, frame_meta):
+                class_id = meta_ops.get_class_id(operator, obj_meta)
+                if class_id not in (0, 1):  # prioritize person class (0) but allow overrides
+                    continue
+                fp = self._footpoint_from_object(operator, obj_meta, frame_width, frame_height)
+                if fp:
+                    footpoints.append(fp)
+
+            entry = {
+                'frame': frame_copy,
+                'frame_num': frame_num,
+                'ntp_ts': ntp_ts,
+                'pts': int(buf.pts) if buf.pts != Gst.CLOCK_TIME_NONE else None,
+                'footpoints': footpoints,
+                'sensor_id': sensor_id,
+                'width': width,
+                'height': height,
+            }
+            q = self._bev_frame_queues.get(sensor_id)
+            if q is not None:
+                try:
+                    while not q.empty():
+                        q.get_nowait()
+                except Exception:
+                    pass
+                try:
+                    q.put_nowait(entry)
+                except Exception:
+                    pass
+        except Exception:
+            self.logger.debug("BEV appsink callback failed", exc_info=True)
+        finally:
+            try:
+                if buf and map_info:
+                    buf.unmap(map_info)
+            except Exception:
+                pass
+            try:
+                if sample:
+                    sample.unref()
+            except Exception:
+                pass
+        return Gst.FlowReturn.OK
+
+    def _footpoint_from_object(self, operator: Optional[Any], obj_meta: Any, frame_width: float, frame_height: float) -> Optional[Dict[str, Any]]:
+        rect = meta_ops.get_rect_params(operator, obj_meta)
+        if rect is None:
+            return None
+        left = float(getattr(rect, "left", 0.0))
+        top = float(getattr(rect, "top", 0.0))
+        width = float(getattr(rect, "width", 0.0))
+        height = float(getattr(rect, "height", 0.0))
+        obj_id = meta_ops.get_object_id(operator, obj_meta)
+
+        mask = self._extract_mask_array(obj_meta)
+        method = "bbox"
+        if mask is not None:
+            mask_fp = self._footpoint_from_mask_pixels(mask)
+            if mask_fp is not None:
+                mx, my, method = mask_fp
+                if mask.shape[1] > 0 and mask.shape[0] > 0:
+                    u = left + (mx / float(mask.shape[1])) * width
+                    v = top + (my / float(mask.shape[0])) * height
+                else:
+                    u = left + width * 0.5
+                    v = top + height
+            else:
+                u = left + width * 0.5
+                v = top + height
+        else:
+            u = left + width * 0.5
+            v = top + height
+        u = float(np.clip(u, 0.0, frame_width))
+        v = float(np.clip(v, 0.0, frame_height))
+        return {'u': u, 'v': v, 'track_id': obj_id, 'method': method}
+
+    @staticmethod
+    def _footpoint_from_mask_pixels(mask: np.ndarray) -> Optional[Tuple[float, float, str]]:
+        if mask.size == 0:
+            return None
+        binary = mask > 0
+        height, width = binary.shape
+        band = max(8, int(height * 0.03))
+        start = max(0, height - band)
+        best = None
+        best_len = 0
+        for y in range(start, height):
+            row = binary[y]
+            if not row.any():
+                continue
+            run_start = None
+            run_len = 0
+            best_row = None
+            for x, val in enumerate(row):
+                if val:
+                    if run_start is None:
+                        run_start = x
+                        run_len = 1
+                    else:
+                        run_len += 1
+                else:
+                    if run_start is not None and run_len > 0:
+                        if best_row is None or run_len > best_row[2]:
+                            best_row = (run_start, x - 1, run_len)
+                    run_start = None
+                    run_len = 0
+            if run_start is not None and run_len > 0:
+                if best_row is None or run_len > best_row[2]:
+                    best_row = (run_start, width - 1, run_len)
+            if best_row and best_row[2] >= best_len:
+                best = (y, best_row)
+                best_len = best_row[2]
+        if best:
+            y_row, (x_start, x_end, _) = best
+            return ((x_start + x_end) * 0.5, float(y_row), "mask-run")
+        coords = np.column_stack(np.nonzero(binary))
+        if coords.size > 0:
+            cx = float(np.mean(coords[:, 1]))
+            cy = float(np.max(coords[:, 0]))
+            return (cx, cy, "mask-centroid")
+        return None
+
+    @staticmethod
+    def _extract_mask_array(obj_meta: Any) -> Optional[np.ndarray]:
+        mask_params = getattr(obj_meta, "mask_params", None)
+        if mask_params is None:
+            return None
+        width = int(getattr(mask_params, "width", 0))
+        height = int(getattr(mask_params, "height", 0))
+        pitch = int(getattr(mask_params, "pitch", width))
+        size = int(getattr(mask_params, "size", width * height))
+        data_ptr = getattr(mask_params, "data", None)
+        if not data_ptr or width <= 0 or height <= 0 or size <= 0:
+            return None
+        try:
+            try:
+                ptr = ctypes.cast(data_ptr, ctypes.POINTER(ctypes.c_uint8 * size))
+            except TypeError:
+                ptr = ctypes.cast(int(data_ptr), ctypes.POINTER(ctypes.c_uint8 * size))
+            np_array = np.ctypeslib.as_array(ptr.contents)
+            mask = np_array.reshape((height, pitch))[:, :width]
+            return mask.copy()
+        except Exception:
+            return None
+
     def _set_ma_valve(self, sensor_id: int, drop: bool) -> None:
         valve = self._ma_valves.get(sensor_id)
         if not valve:
@@ -787,6 +1146,18 @@ class DeepStreamVideoPipeline:
             return None
         finally:
             self._set_ma_valve(sensor_id, True)
+
+    def read_bev_frame(self, sensor_id: int, timeout: float = 0.5) -> Optional[Dict[str, Any]]:
+        """Retrieve the latest BEV branch frame (BGR) and metadata for a sensor."""
+        if not self._bev_branch_ready:
+            return None
+        q = self._bev_frame_queues.get(sensor_id)
+        if q is None:
+            return None
+        try:
+            return q.get(timeout=max(0.01, float(timeout)))
+        except Exception:
+            return None
 
     # ---- Exclusion ROI helpers ----
     def _post_load_exclusion_rois_from_config(self, path: Optional[str] = None) -> None:
@@ -1143,7 +1514,7 @@ class DeepStreamVideoPipeline:
                     pass
 
             # Configure live queues with consistent leaky buffering
-            for queue_name in ("q_before_tracker", "q_after_tracker", "mosaic_q", "jpeg_q", "egl_q"):
+            for queue_name in ("q_before_tracker", "mosaic_q", "jpeg_q", "egl_q", "analytics_fanout_q"):
                 queue_el = elements.get(queue_name)
                 if queue_el:
                     self._configure_live_queue(queue_el)
@@ -1185,10 +1556,8 @@ class DeepStreamVideoPipeline:
                 raise RuntimeError("Failed to link nvdsroiexclude to q_before_tracker")
             if not elements['q_before_tracker'].link(elements['nvtracker']): 
                 raise RuntimeError("Failed to link q_before_tracker to nvtracker")
-            if not elements['nvtracker'].link(elements['q_after_tracker']): 
-                raise RuntimeError("Failed to link nvtracker to q_after_tracker")
-            if not elements['q_after_tracker'].link(elements['nvdsanalytics_post']): 
-                raise RuntimeError("Failed to link q_after_tracker to nvdsanalytics_post")
+            if not elements['nvtracker'].link(elements['nvdsanalytics_post']): 
+                raise RuntimeError("Failed to link nvtracker to nvdsanalytics_post")
             # Post-analytics fanout is handled later via main_tee
 
             self.logger.info("✅ Main pipeline chain linked successfully")
@@ -1234,13 +1603,26 @@ class DeepStreamVideoPipeline:
             # Analytics and Tracking
             nvtracker = Gst.ElementFactory.make("nvtracker", "nvtracker")
             nvdsanalytics_post = Gst.ElementFactory.make("nvdsanalytics", "nvdsanalytics_post")
-            
+            # Decoupling queue between analytics and post-analytics tee to avoid fanout backpressure
+            analytics_fanout_q = Gst.ElementFactory.make("queue", "analytics_fanout_q")
+            post_analytics_tee = Gst.ElementFactory.make("tee", "post_analytics_tee")
+            if post_analytics_tee:
+                try:
+                    post_analytics_tee.set_property("allow-not-linked", True)
+                except Exception:
+                    pass
 
-            
-            # Split to mosaic branch (tee duplicates post-analytics stream)
+            # Split to mosaic sinks (JPEG/EGL) after OSD via a tee
             main_tee = Gst.ElementFactory.make("tee", "main_tee")
+            if main_tee:
+                try:
+                    main_tee.set_property("allow-not-linked", True)
+                except Exception:
+                    pass
             # MapAnything demux (splits pre-PGIE batched buffers)
             ma_demux = Gst.ElementFactory.make("nvstreamdemux", "ma_demux")
+            # Post-analytics BEV demux
+            bev_demux = Gst.ElementFactory.make("nvstreamdemux", "bev_demux")
 
             # Mosaic branch elements (GPU tiler → RGBA → OSD → Tee → JPEG/EGL)
             mosaic_q = Gst.ElementFactory.make("queue", "mosaic_q")
@@ -1264,20 +1646,45 @@ class DeepStreamVideoPipeline:
 
             # Queues for pipeline robustness
             q_before_tracker = Gst.ElementFactory.make("queue", "q_before_tracker")
-            q_after_tracker = Gst.ElementFactory.make("queue", "q_after_tracker")
 
             # Add a queue for JPEG branch to decouple tee from encoder
             jpeg_q = Gst.ElementFactory.make("queue", "jpeg_q")
 
+            # Configure queues that sit immediately downstream of tees to be tiny & leaky
+            try:
+                if mosaic_q:
+                    mosaic_q.set_property("leaky", 2)
+                    mosaic_q.set_property("max-size-buffers", 1)
+                    mosaic_q.set_property("max-size-bytes", 0)
+                    mosaic_q.set_property("max-size-time", 0)
+            except Exception:
+                pass
+            try:
+                if analytics_fanout_q:
+                    analytics_fanout_q.set_property("leaky", 2)
+                    analytics_fanout_q.set_property("max-size-buffers", 1)
+                    analytics_fanout_q.set_property("max-size-bytes", 0)
+                    analytics_fanout_q.set_property("max-size-time", 0)
+            except Exception:
+                pass
+            try:
+                if jpeg_q:
+                    jpeg_q.set_property("leaky", 2)
+                    jpeg_q.set_property("max-size-buffers", 1)
+                    jpeg_q.set_property("max-size-bytes", 0)
+                    jpeg_q.set_property("max-size-time", 0)
+            except Exception:
+                pass
+
             # Validate element creation and assemble elements to add
             element_list = [
                 multiurisrc, nvdspreprocess, pre_pgie_tee, pre_pgie_q_main, pre_pgie_q_ma, nvinfer, nvdsroiexclude, nvtracker, nvdsanalytics_post,
-                main_tee, q_before_tracker, q_after_tracker,
+                analytics_fanout_q, post_analytics_tee, main_tee, q_before_tracker,
                 mosaic_q, mosaic_tiler, mosaic_conv_pre, mosaic_caps_rgba, mosaic_osd,
                 jpeg_q, mosaic_conv_post, mosaic_caps, mosaic_enc, mosaic_sink
             ]
             # Include MA demux now; per-stream branches will be added in a helper
-            element_list.append(ma_demux)
+            element_list.extend([ma_demux, bev_demux])
             if enable_egl:
                 element_list.extend([egl_q, egl_sink])
             
@@ -1294,8 +1701,8 @@ class DeepStreamVideoPipeline:
                     "nvstreamdemux",
                     "nvdsroiexclude",
                     "nvtracker", "nvdsanalytics_post", "tee",
-                    "queue", "queue",
-                    "q_before_tracker", "q_after_tracker",
+                    "queue",
+                    "q_before_tracker",
                     "mosaic_q", "nvmultistreamtiler", "nvvideoconvert", "capsfilter", "nvdsosd", "queue", "nvvideoconvert",
                     "capsfilter", "nvjpegenc", "appsink"
                 ])  # type: ignore[list-item]
@@ -1312,13 +1719,12 @@ class DeepStreamVideoPipeline:
                 'multiurisrc': multiurisrc, 'nvdspreprocess': nvdspreprocess, 'pre_pgie_tee': pre_pgie_tee, 'pre_pgie_q_main': pre_pgie_q_main, 'pre_pgie_q_ma': pre_pgie_q_ma, 'nvinfer': nvinfer,
                 'nvdsroiexclude': nvdsroiexclude,
                 'nvtracker': nvtracker, 
-                'nvdsanalytics_post': nvdsanalytics_post, 'main_tee': main_tee,
-                'q_before_tracker': q_before_tracker, 
-                'q_after_tracker': q_after_tracker,
+                'nvdsanalytics_post': nvdsanalytics_post, 'analytics_fanout_q': analytics_fanout_q, 'post_analytics_tee': post_analytics_tee, 'main_tee': main_tee,
+                'q_before_tracker': q_before_tracker,
                 'mosaic_q': mosaic_q, 'mosaic_tiler': mosaic_tiler, 'mosaic_conv_pre': mosaic_conv_pre, 'mosaic_caps_rgba': mosaic_caps_rgba, 'mosaic_osd': mosaic_osd, 'jpeg_q': jpeg_q, 'mosaic_conv_post': mosaic_conv_post,
                 'mosaic_caps': mosaic_caps, 'mosaic_enc': mosaic_enc, 'mosaic_sink': mosaic_sink,
                 'egl_q': egl_q, 'egl_sink': egl_sink,
-                'ma_demux': ma_demux,
+                'ma_demux': ma_demux, 'bev_demux': bev_demux,
                 }
 
             # --- Phase B: Configure Elements ---
@@ -1392,6 +1798,7 @@ class DeepStreamVideoPipeline:
             self.multiurisrc, self.nvinfer, self.nvtracker = multiurisrc, nvinfer, nvtracker
             self.nvdsanalytics_post = nvdsanalytics_post
             self.main_tee = main_tee
+            self._post_analytics_tee = post_analytics_tee
             # Store mosaic elements for diagnostics (caps dumps)
             self.mosaic_osd = mosaic_osd
             self.mosaic_enc = mosaic_enc
@@ -1399,19 +1806,46 @@ class DeepStreamVideoPipeline:
             self.logger.info("main_tee added to pipeline post-OSD")
 
             # Build MapAnything on-demand branch (pre-PGIE demux → per-stream BGR appsinks)
+            _disable_ma = False
             try:
-                self._setup_mapanything_branch(elements)
-                self._ma_branch_ready = True
-                self.logger.info("✅ MapAnything pre-PGIE branch constructed (valves opened for negotiation, auto-close after startup)")
-            except Exception as exc:
+                import os as _os
+                _disable_ma = str(_os.environ.get("NOESIS_DISABLE_MA_BRANCH", "0")).strip().lower() in {"1","true","yes","y"}
+            except Exception:
+                _disable_ma = False
+            if _disable_ma:
                 self._ma_branch_ready = False
-                self.logger.warning(f"MapAnything branch unavailable: {exc}")
+                self.logger.warning("⏭️ Skipping MapAnything pre-PGIE branch due to NOESIS_DISABLE_MA_BRANCH")
+            else:
+                try:
+                    self._setup_mapanything_branch(elements)
+                    self._ma_branch_ready = True
+                    self.logger.info("✅ MapAnything pre-PGIE branch constructed (valves opened for negotiation, auto-close after startup)")
+                except Exception as exc:
+                    self._ma_branch_ready = False
+                    self.logger.warning(f"MapAnything branch unavailable: {exc}")
 
-            # Removed unstable nvinfer debug probe (caused occasional segfaults on DS meta iteration)
-
-            # Link mosaic branch so both outputs receive the same post-OSD RGBA mosaic
-            if not nvdsanalytics_post.link(mosaic_q):
-                raise RuntimeError("Failed to link nvdsanalytics_post to mosaic_q")
+            # Link post-analytics tee to mosaic branch FIRST to ensure upstream caps settle
+            # Insert a decoupling queue between analytics and tee to avoid tee fanout stalling upstream
+            analytics_fanout_q = elements.get('analytics_fanout_q')
+            if analytics_fanout_q is None:
+                raise RuntimeError("analytics_fanout_q missing; cannot build analytics fanout")
+            if not nvdsanalytics_post.link(analytics_fanout_q):
+                raise RuntimeError("Failed to link nvdsanalytics_post to analytics_fanout_q")
+            if not analytics_fanout_q.link(post_analytics_tee):
+                raise RuntimeError("Failed to link analytics_fanout_q to post_analytics_tee")
+            post_analytics_mosaic_pad = post_analytics_tee.get_request_pad("src_0")
+            if not post_analytics_mosaic_pad:
+                raise RuntimeError("Failed to request post_analytics_tee src_0 pad")
+            mosaic_q_sink = mosaic_q.get_static_pad("sink")
+            if not mosaic_q_sink:
+                raise RuntimeError("Failed to get mosaic_q sink pad")
+            if post_analytics_mosaic_pad.link(mosaic_q_sink) != Gst.PadLinkReturn.OK:
+                raise RuntimeError("Failed to link post_analytics_tee to mosaic_q")
+            # Observe mosaic flow from tee
+            try:
+                self._attach_flow_probe(post_analytics_mosaic_pad, "post_analytics_tee.src_0 (MOSAIC)")
+            except Exception:
+                pass
             if not mosaic_q.link(mosaic_tiler):
                 raise RuntimeError("Failed to link mosaic_q to mosaic_tiler")
             if not mosaic_tiler.link(mosaic_conv_pre):
@@ -1420,9 +1854,36 @@ class DeepStreamVideoPipeline:
                 raise RuntimeError("Failed to link mosaic_conv_pre to RGBA caps")
             if not mosaic_caps_rgba.link(mosaic_osd):
                 raise RuntimeError("Failed to link mosaic_caps_rgba to mosaic_osd")
+            # If EGL is enabled, force OSD to GPU mode to ensure NVMM RGBA for nveglglessink
+            try:
+                if enable_egl and mosaic_osd:
+                    mosaic_osd.set_property("process-mode", 0)  # GPU mode
+                    self.logger.info("OSD set to GPU mode for EGL compatibility")
+            except Exception:
+                pass
+
             # Tee immediately after OSD so EGL can consume RGBA directly; JPEG branch converts to I420
             if not mosaic_osd.link(main_tee):
                 raise RuntimeError("Failed to link mosaic_osd to main_tee")
+
+            # Now build BEV post-analytics branch (per-stream CPU BGR appsinks) off src_1
+            _disable_bev = False
+            try:
+                import os as _os
+                _disable_bev = str(_os.environ.get("NOESIS_DISABLE_BEV", "0")).strip().lower() in {"1","true","yes","y"}
+            except Exception:
+                _disable_bev = False
+            if _disable_bev:
+                self._bev_branch_ready = False
+                self.logger.warning("⏭️ Skipping BEV branch due to NOESIS_DISABLE_BEV")
+            else:
+                try:
+                    self._setup_bev_branch(elements)
+                    self._bev_branch_ready = True
+                    self.logger.info("✅ BEV branch constructed (post-analytics tee → per-stream BGR appsinks)")
+                except Exception as exc:
+                    self._bev_branch_ready = False
+                    self.logger.warning(f"BEV branch unavailable: {exc}")
             self.logger.info("✅ Post-OSD tee configured for shared mosaic outputs")
 
             # JPEG branch: tee → jpeg_q → nvvideoconvert → I420 caps → nvjpegenc → appsink
@@ -1490,6 +1951,14 @@ class DeepStreamVideoPipeline:
             self._attach_flow_probe(nvtracker.get_static_pad("src"), "nvtracker.src")
             self._attach_flow_probe(nvdsanalytics_post.get_static_pad("sink"), "nvdsanalytics_post.sink")
             self._attach_flow_probe(nvdsanalytics_post.get_static_pad("src"), "nvdsanalytics_post.src")
+            try:
+                _afq = elements.get('analytics_fanout_q')
+                if _afq:
+                    self._attach_flow_probe(_afq.get_static_pad("src"), "analytics_fanout_q.src")
+            except Exception:
+                pass
+            if post_analytics_tee:
+                self._attach_flow_probe(post_analytics_tee.get_static_pad("sink"), "post_analytics_tee.sink")
             self._attach_flow_probe(mosaic_q.get_static_pad("src"), "mosaic_q.src")
             self._attach_flow_probe(mosaic_tiler.get_static_pad("sink"), "mosaic_tiler.sink")
             self._attach_flow_probe(mosaic_tiler.get_static_pad("src"), "mosaic_tiler.src")
@@ -2154,6 +2623,9 @@ class DeepStreamVideoPipeline:
                     self._dump_pad_caps(getattr(self, 'mosaic_enc', None), "sink", "mosaic_enc.sink")
                     if getattr(self, 'egl_enabled', False):
                         self._dump_pad_caps(getattr(self, 'egl_sink', None), "sink", "egl_sink.sink")
+                    self._dump_pad_caps(getattr(self, '_post_analytics_tee', None), "sink", "post_analytics_tee.sink")
+                    self._dump_pad_caps(getattr(self, '_bev_demux', None), "sink", "bev_demux.sink")
+                    
                 except Exception as exc:
                     self.logger.warning(f"Caps dump failed: {exc}")
             
@@ -2243,7 +2715,11 @@ class DeepStreamVideoPipeline:
         q.set_property("leaky", 2)  # LEAK_DOWNSTREAM
 
     def _attach_flow_probe(self, pad: Optional[Gst.Pad], label: str) -> None:
-        """Attach a lightweight BUFFER probe that logs flow statistics periodically."""
+        """Attach a lightweight BUFFER probe that logs flow statistics periodically.
+
+        Also emits a one-time attachment log so we can verify probes are present
+        even before any buffers arrive.
+        """
         if not pad:
             self.logger.debug(f"Skipping flow probe for {label}: pad unavailable")
             return
@@ -2261,7 +2737,7 @@ class DeepStreamVideoPipeline:
                 probe_state = user_data
                 probe_state["count"] += 1
                 now = time.time()
-                if now - probe_state["last_log"] >= 2.0:
+                if now - probe_state["last_log"] >= 1.0:
                     delta = probe_state["count"] - probe_state["last_logged_count"]
                     self.logger.info(f"flow[{label}]: {delta} buffers in {now - probe_state['last_log']:.1f}s")
                     probe_state["last_logged_count"] = probe_state["count"]
@@ -2269,6 +2745,11 @@ class DeepStreamVideoPipeline:
                 return Gst.PadProbeReturn.OK
 
             pad.add_probe(Gst.PadProbeType.BUFFER, _probe, state)
+            # One-time attachment confirmation
+            try:
+                self.logger.info(f"🔎 Flow probe attached: {label}")
+            except Exception:
+                pass
         except Exception as exc:
             self.logger.warning(f"Unable to attach flow probe for {label}: {exc}")
 

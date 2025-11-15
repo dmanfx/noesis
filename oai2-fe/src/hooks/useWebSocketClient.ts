@@ -29,6 +29,8 @@ export interface StatsPayload {
 
 export type FrameHandlers = {
   onImage: (cam: CameraKey, blob: Blob) => void;
+  onBevImage?: (cam: CameraKey, blob: Blob) => void;
+  onBevMeta?: (payload: any) => void;
   onStats: (stats: StatsPayload) => void;
   onTrailToggle?: (enabled: boolean) => void;
   onCalibration?: (bundle: any) => void;
@@ -130,6 +132,11 @@ export function useWebSocketClient(url: string, handlers: FrameHandlers) {
             const id = new TextDecoder('utf-8').decode(idBytes);
             const jpeg = arrayBuffer.slice(1 + idLen);
             const jpgBlob = new Blob([jpeg], { type: 'image/jpeg' });
+            if (id.startsWith('bev:')) {
+              const cam = detectCameraKey(id.slice(4));
+              if (cam && handlers.onBevImage) handlers.onBevImage(cam, jpgBlob);
+              return;
+            }
             const cam = detectCameraKey(id);
             if (cam) handlers.onImage(cam, jpgBlob);
             return;
@@ -145,6 +152,11 @@ export function useWebSocketClient(url: string, handlers: FrameHandlers) {
             const id = new TextDecoder('utf-8').decode(idBytes);
             const jpeg = arrayBuffer.slice(1 + idLen);
             const jpgBlob = new Blob([jpeg], { type: 'image/jpeg' });
+            if (id.startsWith('bev:')) {
+              const cam = detectCameraKey(id.slice(4));
+              if (cam && handlers.onBevImage) handlers.onBevImage(cam, jpgBlob);
+              return;
+            }
             const cam = detectCameraKey(id);
             if (cam) handlers.onImage(cam, jpgBlob);
             return;
@@ -188,6 +200,8 @@ export function useWebSocketClient(url: string, handlers: FrameHandlers) {
             handlers.onMADepth?.(data);
           } else if (data.type === 'floorplan_response') {
             handlers.onFloorplan?.(data);
+          } else if (data.type === 'bev-frame') {
+            handlers.onBevMeta?.(data);
           }
         } catch (e) {
           // swallow parsing errors
@@ -242,6 +256,8 @@ export function useWebSocketClient(url: string, handlers: FrameHandlers) {
       };
       const ok = sendJson(payload);
       return ok ? requestId : '';
-    }
+    },
+    sendBevConfig: (camId: string, config: any) => sendJson({ type: 'bev-config', cameraId: camId, config }),
+    sendBevOverlay: (camId: string, enabled: boolean) => sendJson({ type: 'bev-overlay', cameraId: camId, enabled })
   };
 }

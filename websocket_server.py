@@ -52,6 +52,9 @@ class WebSocketServer:
         # Lightweight telemetry for Menon calibration/coordinate RPCs
         self._telemetry: Dict[str, Dict[str, Any]] = {"rx": {}, "tx": {}}
         self._telemetry_task: Optional[asyncio.Task] = None
+        # Optional BEV control callbacks
+        self.bev_config_callback: Optional[Callable[[str, Dict[str, Any]], None]] = None
+        self.bev_overlay_callback: Optional[Callable[[str, bool], None]] = None
         # RPC guardrails
         self._depth_rpc_tracker: Dict[str, float] = {}
         self._floorplan_rpc_tracker: Dict[str, float] = {}
@@ -156,7 +159,7 @@ class WebSocketServer:
                     if entry:
                         tx_items.append(f"{k}:{entry['data']}")
                 parts.append(f"tx=[{'; '.join(tx_items) if tx_items else '-'}]")
-                self.logger.debug(f"MENON I/O | {' | '.join(parts)}")
+                #self.logger.debug(f"MENON I/O | {' | '.join(parts)}")
 
                 # Sleep with proper cancellation handling (cap at 1 second for responsiveness)
                 await asyncio.sleep(min(interval_seconds, 1.0))
@@ -255,7 +258,8 @@ class WebSocketServer:
                     else:
                         self.logger.debug("Stats callback returned empty payload, skipping broadcast.")
                 elif not self.connected_clients:
-                    self.logger.debug("No clients connected, skipping stats broadcast.")
+                    #self.logger.debug("No clients connected, skipping stats broadcast.")
+                    pass
 
                 # Wait for the next interval - use shorter intervals to allow for cancellation
                 sleep_time = 5.0 if not self.connected_clients else interval_seconds
@@ -624,6 +628,40 @@ class WebSocketServer:
                             await self.broadcast(broadcast_message)
                         else:
                             self.logger.warning(f"Invalid detection config message from {client_ip}: {data}")
+
+                    # Handle BEV config overrides
+                    elif data.get('type') == 'bev-config':
+                        cam_id = data.get('cameraId') or data.get('camId')
+                        cfg = data.get('config') or {}
+                        if isinstance(cam_id, str) and isinstance(cfg, dict):
+                            self.logger.info("Received BEV config for %s: %s", cam_id, cfg)
+                            if callable(self.bev_config_callback):
+                                try:
+                                    self.bev_config_callback(cam_id, cfg)
+                                except Exception as exc:
+                                    self.logger.error("BEV config callback failed: %s", exc)
+                            ack = {
+                                'type': 'bev-config-ack',
+                                'cameraId': cam_id,
+                                'config': cfg,
+                            }
+                            await self.broadcast(ack)
+                        else:
+                            self.logger.warning("Invalid BEV config payload from %s: %s", client_ip, data)
+
+                    elif data.get('type') == 'bev-overlay':
+                        cam_id = data.get('cameraId') or data.get('camId')
+                        enabled = data.get('enabled')
+                        if isinstance(cam_id, str) and isinstance(enabled, bool):
+                            self.logger.info("Received BEV overlay toggle for %s: %s", cam_id, enabled)
+                            if callable(self.bev_overlay_callback):
+                                try:
+                                    self.bev_overlay_callback(cam_id, enabled)
+                                except Exception as exc:
+                                    self.logger.error("BEV overlay callback failed: %s", exc)
+                            await self.broadcast({'type': 'bev-overlay-update', 'cameraId': cam_id, 'enabled': enabled})
+                        else:
+                            self.logger.warning("Invalid BEV overlay message from %s: %s", client_ip, data)
 
                     # ---- Spatial & calibration RPCs ----
                     # legacy 'get_transformation' removed; calibration-bundle is source of truth

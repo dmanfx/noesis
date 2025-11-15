@@ -90,6 +90,7 @@ from utils.cpu_profiler import start_global_profiling, stop_global_profiling, ge
 from utils.interrupt import safe_join, safe_process_join
 from visualization import VisualizationManager
 from websocket_server import WebSocketServer
+from telemetry.bev_renderer import BevRenderer, CalibrationSnapshot, Footpoint
 from calibration_bundle import (
     load_intrinsics,
     load_alignment,
@@ -185,6 +186,11 @@ class ApplicationManager:
         self._sensor_aliases: Dict[int, Set[str]] = {}
         self._preferred_camera_ids: Set[str] = set(getattr(self.config.calibration, 'CAMERA_INTRINSICS_MODEL_MAP', {}).keys())
         self._cameras_yaml_names: Dict[int, str] = {}
+        # BEV rendering state
+        self.bev_renderer: Optional[BevRenderer] = None
+        self._bev_worker_thread: Optional[threading.Thread] = None
+        self._bev_worker_stop: Optional[threading.Event] = None
+        self._bev_last_publish: Dict[str, float] = {}
         
         # Initialize async event loop
         self.event_loop = None
@@ -307,6 +313,11 @@ class ApplicationManager:
             # Add detection config getter for initial sync
             self.websocket_server.detection_config_getter = self._get_detection_config
 
+            # Wire BEV controls
+            self.websocket_server.bev_config_callback = self._handle_bev_config_update
+            self.websocket_server.bev_overlay_callback = self._handle_bev_overlay_update
+            self.bev_renderer = BevRenderer(self.websocket_server)
+
             # Load calibration & wire WebSocket RPCs
             try:
                 self._load_calibration()
@@ -321,7 +332,9 @@ class ApplicationManager:
                             # Lazily construct depth source client
                             self.depth_source = MapAnythingDepthSource()
                             if self.websocket_server:
-                                self.websocket_server.ma_depth_provider = self.depth_source.load_latest_depth
+                                # Use on-demand provider that captures a pre-PGIE frame and runs inference if cache misses
+                                self.websocket_server.ma_depth_provider = self._ma_depth_provider
+                                # Floorplan generation uses cached/latest depth
                                 self.websocket_server.floorplan_provider = (
                                     lambda camera=None, max_age_sec=60.0, grid_res_m=0.5, max_extent_m=20.0, cache_only=False, **_:
                                         self.depth_source.generate_topdown_floorplan(
@@ -332,7 +345,7 @@ class ApplicationManager:
                                             cache_only=bool(cache_only),
                                         )
                                 )
-                            self.logger.info("✅ MapAnything WebSocket providers wired (cached depth + floorplan)")
+                            self.logger.info("✅ MapAnything WebSocket providers wired (on-demand depth + floorplan)")
                         else:
                             self.logger.info("MapAnything disabled by config; skipping WS providers")
                     except Exception as exc:
@@ -379,6 +392,7 @@ class ApplicationManager:
             self.logger.info("🚀 Starting unified GPU pipeline...")
             self._start_multi_stream_processor()
             self.logger.info("✅ Multi-stream processor started")
+            self._start_bev_worker()
 
             # Now that processor exists, wire WebSocket server to it and start JPEG loop
             try:
@@ -389,8 +403,6 @@ class ApplicationManager:
                     if not hasattr(self, 'jpeg_thread') or not getattr(self, 'jpeg_thread').is_alive():
                         self._start_jpeg_processing_loop()
                         # Start mosaic publisher if configured (maps mosaic to a single camera id)
-                        if getattr(self.config.websocket, 'MOSAIC_BROADCAST', False):
-                            self._start_mosaic_broadcast()
                         # DISABLED: MapAnything - re-enable post-merge
                         # self._start_mapanything_scheduler()
             except Exception as e:
@@ -1107,6 +1119,99 @@ class ApplicationManager:
         self._mapanything_scheduler_thread.start()
         self.logger.info("✅ MapAnything scheduler thread started")
 
+    def _start_bev_worker(self) -> None:
+        if not self.multi_stream_processor:
+            self.logger.debug("BEV worker skipped (processor unavailable)")
+            return
+        if self.bev_renderer is None:
+            self.bev_renderer = BevRenderer(self.websocket_server)
+        if self._bev_worker_thread and self._bev_worker_thread.is_alive():
+            return
+        self._bev_worker_stop = threading.Event()
+        self._bev_worker_thread = threading.Thread(target=self._bev_worker_loop, name="BEVWorker", daemon=True)
+        self._bev_worker_thread.start()
+
+    def _stop_bev_worker(self) -> None:
+        if self._bev_worker_stop:
+            self._bev_worker_stop.set()
+        if self._bev_worker_thread:
+            try:
+                self._bev_worker_thread.join(timeout=2.0)
+            except Exception:
+                pass
+        self._bev_worker_thread = None
+        self._bev_worker_stop = None
+
+    def _bev_worker_loop(self) -> None:
+        min_interval = 0.1
+        while self._bev_worker_stop and not self._bev_worker_stop.is_set():
+            processor = self.multi_stream_processor
+            if not processor:
+                time.sleep(0.1)
+                continue
+            sensor_ids = list(getattr(processor, 'sensor_ids', []) or [])
+            any_frame = False
+            for sensor_id in sensor_ids:
+                if self._bev_worker_stop and self._bev_worker_stop.is_set():
+                    break
+                entry = processor.read_bev_frame(sensor_id, timeout=0.02)
+                if not entry:
+                    continue
+                any_frame = True
+                camera_id = self._friendly_name_by_sensor.get(sensor_id, f"camera-{sensor_id}")
+                calib = self._build_calibration_snapshot(camera_id, entry.get('width'), entry.get('height'))
+                if calib is None or not self.bev_renderer:
+                    continue
+                now = time.time()
+                if now - self._bev_last_publish.get(camera_id, 0.0) < min_interval:
+                    continue
+                self._bev_last_publish[camera_id] = now
+                points = [
+                    Footpoint(
+                        u=float(fp.get('u', 0.0)),
+                        v=float(fp.get('v', 0.0)),
+                        method=str(fp.get('method', 'bbox')),
+                        track_id=fp.get('track_id'),
+                    )
+                    for fp in entry.get('footpoints', [])
+                ]
+                timestamp_us = entry.get('ntp_ts') or int(now * 1_000_000)
+                try:
+                    self.bev_renderer.render_and_publish(camera_id, calib, entry['frame'], points, timestamp_us)
+                except Exception as exc:
+                    self.logger.debug("BEV render failed for %s: %s", camera_id, exc, exc_info=True)
+            if not any_frame:
+                time.sleep(0.01)
+
+    def _build_calibration_snapshot(self, camera_id: str, width: Optional[int], height: Optional[int]) -> Optional[CalibrationSnapshot]:
+        bundle = self.calibration_bundle or {}
+        cameras_node = bundle.get('cameras') or {}
+        k_table = cameras_node.get('K') or {}
+        e_table = cameras_node.get('E') or {}
+        intr = k_table.get(camera_id)
+        extr = e_table.get(camera_id)
+        if intr is None or extr is None:
+            return None
+        if len(intr) == 4:
+            fx, fy, cx, cy = [float(v) for v in intr]
+            K = np.array([[fx, 0.0, cx], [0.0, fy, cy], [0.0, 0.0, 1.0]], dtype=np.float64)
+        elif len(intr) == 9:
+            K = np.array(intr, dtype=np.float64).reshape((3, 3))
+        else:
+            return None
+        if len(extr) != 16:
+            return None
+        floor_y = float(((bundle.get('align') or {}).get('floor_y')) or 0.0)
+        w = int(width or self.config.cameras.CAMERA_WIDTH)
+        h = int(height or self.config.cameras.CAMERA_HEIGHT)
+        return CalibrationSnapshot(
+            camera_id=camera_id,
+            intrinsics=K,
+            extrinsics_col_major=[float(x) for x in extr],
+            floor_y=floor_y,
+            image_size=(w, h),
+        )
+
     def _start_jpeg_processing_loop(self):
         """Start JPEG processing loop for native DeepStream OSD mode"""
         self.logger.info("Starting JPEG processing loop for native DeepStream OSD")
@@ -1135,7 +1240,6 @@ class ApplicationManager:
                         except Exception:
                             qsize = 'N/A'
                         clients = len(getattr(self.websocket_server, 'connected_clients', [])) if self.websocket_server else 0
-                        self.logger.debug(f"JPEG loop heartbeat – mosaic queue: {qsize}")
                         self.logger.debug(f"📤 JPEG broadcast summary (last 5s): sent={frames_sent} | clients={clients}")
                         frames_sent = 0
                         last_info_log = time.time()
@@ -1275,59 +1379,6 @@ class ApplicationManager:
         except Exception as exc:
             self.logger.warning(f"MapAnything provider error for {cam_id}: {exc}")
             return None
-
-    def _start_mosaic_broadcast(self):
-        """Start a background thread that composites a mosaic from latest JPEGs and broadcasts it under a target camera id."""
-        if not getattr(self.config.websocket, 'MOSAIC_BROADCAST', False):
-            return
-
-        target_cam = getattr(self.config.websocket, 'MOSAIC_TARGET_CAMERA', 'living-room')
-        fps_limit = max(1, int(getattr(self.config.websocket, 'MAX_FPS', 10)))
-        period = 1.0 / float(fps_limit)
-
-        def _mosaic_loop():
-            next_tick = time.time()
-            header = None
-            if self.websocket_server:
-                cam_id_bytes = target_cam.encode('utf-8')
-                if len(cam_id_bytes) <= 255:
-                    header = bytes([len(cam_id_bytes)]) + cam_id_bytes
-            sent = 0
-            t_start = time.time()
-            last_log = t_start
-            last_bytes = 0
-            while self.running and not self.stop_event.is_set():
-                ok = False
-                data = None
-                try:
-                    if hasattr(self.multi_stream_processor, 'read_mosaic_jpeg'):
-                        ok, data = self.multi_stream_processor.read_mosaic_jpeg(timeout=0.1)
-                except Exception:
-                    ok, data = False, None
-                if ok and data and header and self.websocket_server:
-                    self.websocket_server.broadcast_sync(header + data)
-                    sent += 1
-                    last_bytes = len(data)
-                # Log every ~2s
-                now = time.time()
-                if (now - last_log) >= 2.0:
-                    try:
-                        qsz = getattr(self.multi_stream_processor, 'mosaic_queue', queue.Queue()).qsize()
-                    except Exception:
-                        qsz = -1
-                    elapsed = max(1e-3, now - t_start)
-                    fps = sent / elapsed
-                    self.logger.debug(f"Mosaic feed: {fps:.1f} fps, last={last_bytes} bytes, q={qsz}")
-                    last_log = now
-                # Throttle to target FPS
-                next_tick += period
-                sleep_for = next_tick - time.time()
-                if sleep_for > 0:
-                    time.sleep(min(sleep_for, period))
-
-        t = threading.Thread(target=_mosaic_loop, name="MosaicPublisher", daemon=True)
-        t.start()
-        self.logger.info("✅ Mosaic broadcast thread started (target=%s)", target_cam)
 
     @profile_function("ApplicationManager.start_result_processing")
     def _start_result_processing(self):
@@ -2301,6 +2352,26 @@ class ApplicationManager:
             import traceback
             self.logger.debug(f"Full traceback: {traceback.format_exc()}")
 
+    def _handle_bev_config_update(self, camera_id: str, cfg: Dict[str, Any]) -> None:
+        if not camera_id:
+            return
+        if not self.bev_renderer:
+            self.bev_renderer = BevRenderer(self.websocket_server)
+        try:
+            self.bev_renderer.update_config(camera_id, cfg or {})
+            self.logger.info("Updated BEV config for %s: %s", camera_id, cfg)
+        except Exception as exc:
+            self.logger.warning("BEV config update failed for %s: %s", camera_id, exc)
+
+    def _handle_bev_overlay_update(self, camera_id: str, enabled: bool) -> None:
+        if not camera_id or not self.bev_renderer:
+            return
+        try:
+            self.bev_renderer.set_overlay(camera_id, enabled)
+            self.logger.info("Set BEV overlay for %s -> %s", camera_id, enabled)
+        except Exception as exc:
+            self.logger.warning("Failed to update BEV overlay for %s: %s", camera_id, exc)
+
     @profile_function("ApplicationManager.stop")
     def stop(self):
         """Stop all application components with optimized cleanup order"""
@@ -2325,6 +2396,9 @@ class ApplicationManager:
                         self.logger.debug(f"Could not stop WebSocket event loop: {e}")
             except Exception as e:
                 self.logger.warning(f"Error stopping WebSocket server immediately: {e}")
+
+        # Stop BEV worker before tearing down pipeline
+        self._stop_bev_worker()
 
         # STEP 1: Set TensorRT shutdown mode to suppress error logging
         set_tensorrt_shutdown_mode(True)

@@ -22,6 +22,7 @@ from geometry.depth_source import DepthStorageManager
 from mapanything_config import load_service_config
 from noesis.pipelines import ds8_pipeline, hooks
 from noesis.telemetry.publishers import DepthTelemetryPublisher, TrackingTelemetryPublisher
+from noesis.telemetry.bev import BevRenderer
 from websocket_server import WebSocketServer
 from pyservicemaker.flow import BufferRetriever, Receiver  # type: ignore
 import logging as _logging
@@ -367,6 +368,9 @@ def main() -> int:
         port=args.ws_port,
         stats_callback=_build_stats_callback(pipeline),
     )
+    bev_renderer = BevRenderer(ws_server)
+    ws_server.bev_config_callback = lambda cam_id, cfg: bev_renderer.update_config(cam_id, cfg)
+    ws_server.bev_overlay_callback = lambda cam_id, enabled: bev_renderer.update_config(cam_id, {"overlay": enabled})
     depth_pub = DepthTelemetryPublisher(ws_server)
     tracking_pub = TrackingTelemetryPublisher(ws_server)
 

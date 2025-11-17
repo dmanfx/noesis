@@ -10,8 +10,8 @@ import { TelemetryProvider, useTelemetry } from './telemetry/TelemetryContext';
 import { TrailStore } from './lib/trails';
 import { cameraOrder, colorForTrack, cameraLabel, detectCameraKey, CameraKey } from './lib/camera';
 import { getExtrinsics, worldToCamera, getIntrinsics4, extractPoseFromExtrinsics, forwardXZFromExtrinsics } from './lib/calibration';
-import { useWebSocketClient, StatsPayload } from './hooks/useWebSocketClient';
-import DepthDrawer, { DepthDiagnosticsEntry, DepthDrawerEntry, FloorplanResponse } from './components/DepthDrawer';
+import { useWebSocketClient, StatsPayload, DepthRequestStrategy } from './hooks/useWebSocketClient';
+import DepthDrawer, { DepthDiagnosticsEntry, DepthDrawerEntry, DepthMetaEntry, FloorplanResponse } from './components/DepthDrawer';
 import TopDownDrawer from './components/TopDownDrawer';
 
 const wsHost = import.meta.env.VITE_WS_HOST || window.location.hostname;
@@ -86,6 +86,8 @@ function Dashboard() {
   const [depthDrawerOpen, setDepthDrawerOpen] = useState(false);
   const [maDiagnostics, setMaDiagnostics] = useState<Record<string, DepthDiagnosticsEntry>>({});
   const [maDepthData, setMaDepthData] = useState<Record<string, DepthDrawerEntry>>({});
+  const depthMetaRef = useRef<Record<string, DepthMetaEntry>>({});
+  const [maDepthMeta, setMaDepthMeta] = useState<Record<string, DepthMetaEntry>>({});
   const [floorplanData, setFloorplanData] = useState<Record<string, FloorplanResponse>>({});
   const [cameraStatuses, setCameraStatuses] = useState<Record<CameraKey, string>>({
     'living-room': 'unknown',
@@ -389,21 +391,39 @@ function Dashboard() {
     }
   };
 
-  const handleMADepth = (payload: any) => {
-    const camId = payload?.cam_id || payload?.cameraId;
-    if (!camId || payload?.ok === false) return;
-    const shape = payload?.shape || payload?.depth_shape;
+  const handleMADepth = (message: any) => {
+    if (!message) return;
+    const parseTimestampUs = (value: any): number | undefined => {
+      if (typeof value === 'number' && Number.isFinite(value)) return Number(value);
+      if (typeof value === 'string') {
+        const parsed = Number(value);
+        if (Number.isFinite(parsed)) return parsed;
+      }
+      return undefined;
+    };
+    const candidatePayload = (message.payload && typeof message.payload === 'object') ? message.payload : message;
+    const camSource = message.camera || message.cam_id || message.cameraId || message.camera_id || message.camId;
+    const payloadCamera = candidatePayload?.camera || candidatePayload?.cam_id || candidatePayload?.cameraId || candidatePayload?.camera_id;
+    const camId = String(camSource || payloadCamera || '')
+      .trim();
+    if (!camId || (message?.ok === false && !candidatePayload?.depth_b64)) return;
+    const shape = candidatePayload?.shape || candidatePayload?.depth_shape;
     if (!Array.isArray(shape) || shape.length !== 2) return;
-    let depthB64 = payload.depth_b64 || payload.depth_z_b64;
+    const depthB64 = candidatePayload.depth_b64 || candidatePayload.depth_z_b64;
     if (!depthB64) return;
-    const confB64 = payload.conf_b64 || payload.conf;
-    let maskB64 = payload.mask_b64 || payload.mask;
+    const confB64 = candidatePayload.conf_b64 || candidatePayload.conf;
+    let maskB64 = candidatePayload.mask_b64 || candidatePayload.mask;
     if (Array.isArray(maskB64)) {
       const maskArr = Uint8Array.from(maskB64.map((v: any) => (v ? 1 : 0)));
       maskB64 = btoa(String.fromCharCode(...maskArr));
     }
+    const tsFromResponse = parseTimestampUs(message.ts_us);
+    const tsFromPayload = parseTimestampUs(candidatePayload?.ts);
+    const tsUs = tsFromResponse ?? tsFromPayload ?? Math.floor(Date.now() * 1000);
+    const prevTs = depthMetaRef.current[camId]?.tsUs ?? 0;
+    if (prevTs && tsUs < prevTs) return;
     const entry: DepthDrawerEntry = {
-      ts: payload.ts || Date.now(),
+      ts: tsUs,
       depth_b64: depthB64,
       conf_b64: confB64,
       mask_b64: maskB64,
@@ -411,6 +431,15 @@ function Dashboard() {
     };
     if (!entry.shape[0] || !entry.shape[1]) return;
     setMaDepthData(prev => ({ ...prev, [camId]: entry }));
+
+    const meta: DepthMetaEntry = {
+      tsUs,
+      servedFromCache: typeof message.served_from_cache === 'boolean' ? message.served_from_cache : undefined,
+      requestId: message.request_id || message.requestId || undefined,
+      error: typeof message.error === 'string' ? message.error : undefined
+    };
+    depthMetaRef.current[camId] = meta;
+    setMaDepthMeta(prev => ({ ...prev, [camId]: meta }));
 
     const label = labelForCameraId(camId);
     const now = Date.now();
@@ -420,8 +449,9 @@ function Dashboard() {
       value: `${entry.shape[0]}x${entry.shape[1]}`,
       ts: now
     });
-    if (typeof payload?.ts === 'number' && Number.isFinite(payload.ts)) {
-      const ageMs = Math.max(0, now - Math.floor(payload.ts / 1000));
+    const tsForAge = tsFromPayload ?? tsUs;
+    if (typeof tsForAge === 'number' && Number.isFinite(tsForAge)) {
+      const ageMs = Math.max(0, now - Math.floor(tsForAge / 1000));
       publish({
         group: 'MapAnything Depth',
         key: `${label} Snapshot Age (s)`,
@@ -505,7 +535,8 @@ function Dashboard() {
     requestMapAnythingDepth,
     requestFloorplan,
     sendBevConfig,
-    sendBevOverlay
+    sendBevOverlay,
+    notifyMaHeatmapReady
   } = useWebSocketClient(WS_URL, {
     onImage,
     onBevImage: handleBevImage,
@@ -526,9 +557,14 @@ function Dashboard() {
     sendBevOverlay(cam, enabled);
   }, [sendBevOverlay]);
 
-  const handleRequestDepth = useCallback((camId: string) => {
+  const requestDepthFresh = useCallback((camId: string) => {
     if (!camId) return;
-    requestMapAnythingDepth(camId);
+    requestMapAnythingDepth(camId, 'fresh');
+  }, [requestMapAnythingDepth]);
+
+  const requestDepthCached = useCallback((camId: string) => {
+    if (!camId) return;
+    requestMapAnythingDepth(camId, 'cache-first');
   }, [requestMapAnythingDepth]);
 
   const handleRequestFloorplan = useCallback((options?: { camera?: string; requestId?: string; maxAgeSec?: number; gridResM?: number; maxExtentM?: number; cacheOnly?: boolean }) => {
@@ -708,7 +744,10 @@ function Dashboard() {
         onClose={() => setDepthDrawerOpen(false)}
         diagnostics={maDiagnostics}
         depthData={maDepthData}
-        onRequestDepth={handleRequestDepth}
+        depthMeta={maDepthMeta}
+        onRequestDepthFresh={requestDepthFresh}
+        onRequestDepthCached={requestDepthCached}
+        onHeatmapReady={notifyMaHeatmapReady}
         floorplans={floorplanData}
         onRequestFloorplan={handleRequestFloorplan}
         availableCameras={availableCameras}

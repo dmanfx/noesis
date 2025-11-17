@@ -48,6 +48,8 @@ export type FloorplanRequest = {
   cacheOnly?: boolean;
 };
 
+export type DepthRequestStrategy = 'fresh' | 'cache-first';
+
 export function useWebSocketClient(url: string, handlers: FrameHandlers) {
   const socketRef = useRef<WebSocket | null>(null);
   const [status, setStatus] = useState<'connecting' | 'open' | 'closed' | 'error'>('connecting');
@@ -55,6 +57,7 @@ export function useWebSocketClient(url: string, handlers: FrameHandlers) {
   const maxRetries = 10;
   const heartbeatRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const reconnectTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const depthInFlightRef = useRef<Record<string, Set<string>>>({});
 
   useEffect(() => {
     let stop = false;
@@ -197,6 +200,18 @@ export function useWebSocketClient(url: string, handlers: FrameHandlers) {
           } else if (data.type === 'ma_diagnostics') {
             handlers.onMADiagnostics?.(data);
           } else if (data.type === 'ma_depth_response') {
+            const cam = data.camera || data.cam_id || data.cameraId || data.camera_id || data.camId;
+            const requestId = data.request_id || data.requestId || data.requestID;
+            if (cam) {
+              const key = String(cam);
+              const pending = depthInFlightRef.current[key];
+              if (pending && requestId) {
+                pending.delete(String(requestId));
+              }
+              if (pending && pending.size === 0) {
+                delete depthInFlightRef.current[key];
+              }
+            }
             handlers.onMADepth?.(data);
           } else if (data.type === 'floorplan_response') {
             handlers.onFloorplan?.(data);
@@ -234,14 +249,59 @@ export function useWebSocketClient(url: string, handlers: FrameHandlers) {
     return true;
   };
 
+  const normalizeTsUs = (value?: number): number | undefined => {
+    if (typeof value !== 'number' || !Number.isFinite(value) || value < 0) return undefined;
+    if (value < 1_000_000_000) return Math.floor(value * 1_000_000);
+    if (value < 1_000_000_000_000) return Math.floor(value * 1000);
+    return Math.floor(value);
+  };
+
+  const computeTsMaxUs = (strategy: DepthRequestStrategy, override?: number): number | undefined => {
+    const normalized = normalizeTsUs(override);
+    if (typeof normalized === 'number') {
+      return normalized;
+    }
+    if (strategy === 'cache-first') {
+      return Math.floor(Date.now() * 1000);
+    }
+    return undefined;
+  };
+
+  const registerDepthRequest = (cameraId: string, requestId: string) => {
+    if (!cameraId || !requestId) return;
+    const bucket = depthInFlightRef.current[cameraId] || new Set<string>();
+    bucket.add(requestId);
+    depthInFlightRef.current[cameraId] = bucket;
+  };
+
   return {
     status,
     sendClearStats: () => sendJson({ type: 'clear_stats' }),
     sendTrailToggle: (enabled: boolean) => sendJson({ type: 'set_vis_toggle', toggle_name: 'trail_visualization_enabled', enabled }),
     sendDetectionConfig: (config: any) => sendJson({ type: 'update_detection_config', config }),
     sendDetectionToggle: (name: string, enabled: boolean) => sendJson({ type: 'set_detection_toggle', toggle_name: name, enabled }),
-    // Force fresh depth capture on refresh: ts_max=-1 ensures server prefers new inference over cache
-    requestMapAnythingDepth: (camId: string, _tsMax?: number) => sendJson({ type: 'get_ma_depth', camId, ts_max: -1 }),
+    requestMapAnythingDepth: (camId: string, strategy: DepthRequestStrategy = 'fresh', tsMaxOverride?: number) => {
+      if (!camId) return false;
+      const existing = depthInFlightRef.current[camId];
+      if (strategy === 'cache-first' && existing && existing.size > 0) {
+        return false;
+      }
+      const requestId = `${camId}-${Date.now()}-${Math.random().toString(16).slice(2, 8)}`;
+      const tsMaxUs = computeTsMaxUs(strategy, tsMaxOverride);
+      const payload: Record<string, unknown> = {
+        type: 'get_ma_depth',
+        camera: camId,
+        request_id: requestId
+      };
+      if (typeof tsMaxUs === 'number') {
+        payload.ts_max_us = tsMaxUs;
+      }
+      const ok = sendJson(payload);
+      if (ok) {
+        registerDepthRequest(camId, requestId);
+      }
+      return ok;
+    },
     requestFloorplan: (options?: FloorplanRequest) => {
       const requestId = options?.requestId || Date.now().toString();
       const payload = {
@@ -258,6 +318,7 @@ export function useWebSocketClient(url: string, handlers: FrameHandlers) {
       return ok ? requestId : '';
     },
     sendBevConfig: (camId: string, config: any) => sendJson({ type: 'bev-config', cameraId: camId, config }),
-    sendBevOverlay: (camId: string, enabled: boolean) => sendJson({ type: 'bev-overlay', cameraId: camId, enabled })
+    sendBevOverlay: (camId: string, enabled: boolean) => sendJson({ type: 'bev-overlay', cameraId: camId, enabled }),
+    notifyMaHeatmapReady: (camId: string) => sendJson({ type: 'ma_heatmap_ready', cameraId: camId })
   };
 }

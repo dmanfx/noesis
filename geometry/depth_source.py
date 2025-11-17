@@ -1024,16 +1024,26 @@ class MapAnythingDepthSource:
             sample_count=int(valid.sum()),
         )
 
-    def load_latest_depth(self, camera_id: str, ts_max: Optional[int] = None) -> Optional[Dict[str, Any]]:
+    def load_latest_depth(self, camera_id: str, ts_max_us: Optional[int] = None) -> Optional[Dict[str, Any]]:
+        """Return the newest cached payload up to ts_max_us (microseconds)."""
         cache_key = camera_id
+        ts_cutoff = None
+        if ts_max_us is not None:
+            try:
+                ts_cutoff = int(ts_max_us)
+            except Exception:
+                ts_cutoff = None
         with self._cache_lock:
             cached = self._depth_payload_cache.get(cache_key)
             if cached:
-                cached_ts = cached.get('ts', 0)
-                if ts_max is None or cached_ts <= (ts_max or cached_ts):
+                try:
+                    cached_ts = int(cached.get('ts', 0) or 0)
+                except Exception:
+                    cached_ts = 0
+                if ts_cutoff is None or cached_ts <= ts_cutoff:
                     return dict(cached)
 
-        path = self.storage.latest_entry(camera_id, ts_max)
+        path = self.storage.latest_entry(camera_id, ts_cutoff)
         if not path:
             return None
         datasets = self.storage.load_datasets(path)
@@ -1172,6 +1182,15 @@ class MapAnythingDepthSource:
         """Generate a per-camera top-down (XZ) blueprint view from the latest depth snapshot."""
         if not camera_id:
             return {'error': 'camera_required', 'ts': int(time.time() * 1_000_000)}
+
+        # Ensure any recently queued depth snapshots are flushed to disk before attempting
+        # to read for a regenerate request. This avoids a race where floorplan generation
+        # runs immediately after inference but before the async writer persists the zarr.
+        if not cache_only:
+            try:
+                self.storage.flush(timeout=1.5)
+            except Exception:
+                pass
 
         cache_key = (camera_id, float(grid_res_m), float(max_extent_m))
         now_us = int(time.time() * 1_000_000)

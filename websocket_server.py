@@ -55,6 +55,8 @@ class WebSocketServer:
         # Optional BEV control callbacks
         self.bev_config_callback: Optional[Callable[[str, Dict[str, Any]], None]] = None
         self.bev_overlay_callback: Optional[Callable[[str, bool], None]] = None
+        # Optional MA heatmap ready callback (called with cameraId)
+        self.ma_ready_callback: Optional[Callable[[str], None]] = None
         # RPC guardrails
         self._depth_rpc_tracker: Dict[str, float] = {}
         self._floorplan_rpc_tracker: Dict[str, float] = {}
@@ -69,7 +71,7 @@ class WebSocketServer:
         self.set_extrinsics_handler: Optional[Callable[[Dict[str, Any]], Dict[str, Any]]] = None
         self.solve_pnp_handler: Optional[Callable[[Dict[str, Any]], Dict[str, Any]]] = None
         self.set_align_handler: Optional[Callable[[Dict[str, Any]], Dict[str, Any]]] = None
-        self.ma_depth_provider: Optional[Callable[[str, Optional[int]], Optional[Dict[str, Any]]]] = None
+        self.ma_depth_provider: Optional[Callable[[str, Optional[Any], Optional[str]], Optional[Dict[str, Any]]]] = None
         self.floorplan_provider: Optional[Callable[[Optional[list], float, float, float, bool], Optional[Dict[str, Any]]]] = None
 
     # ---------------- Menon telemetry helpers ----------------
@@ -663,6 +665,15 @@ class WebSocketServer:
                         else:
                             self.logger.warning("Invalid BEV overlay message from %s: %s", client_ip, data)
 
+                    elif data.get('type') == 'ma_heatmap_ready':
+                        cam_id = data.get('cameraId') or data.get('camId')
+                        if isinstance(cam_id, str) and callable(self.ma_ready_callback):
+                            try:
+                                self.ma_ready_callback(cam_id)
+                            except Exception:
+                                pass
+                        # no ack required; server action is side-effect only
+
                     # ---- Spatial & calibration RPCs ----
                     # legacy 'get_transformation' removed; calibration-bundle is source of truth
 
@@ -764,33 +775,42 @@ class WebSocketServer:
                             pass
 
                     elif data.get('type') == 'get_ma_depth':
-                        cam_id = data.get('camId') or data.get('cameraId')
-                        ts_max_val = data.get('ts_max') if data.get('ts_max') is not None else data.get('tsMax')
-                        ts_max = None
-                        if ts_max_val is not None:
-                            try:
-                                ts = int(ts_max_val)
-                                # Normalize to microseconds:
-                                # <1e10 => seconds, <1e13 => milliseconds, else assume microseconds
-                                if ts < 10_000_000_000:
-                                    ts *= 1_000_000
-                                elif ts < 10_000_000_000_000:
-                                    ts *= 1_000
-                                ts_max = ts
-                            except Exception:
-                                ts_max = None
-                        # Treat negative ts_max as "latest" (ignore staleness)
-                        if ts_max is not None and ts_max < 0:
-                            ts_max = None
+                        camera = (
+                            data.get('camera')
+                            or data.get('cameraId')
+                            or data.get('camera_id')
+                            or data.get('camId')
+                        )
+                        request_id = (
+                            data.get('request_id')
+                            or data.get('requestId')
+                            or data.get('requestID')
+                        )
+                        if not request_id:
+                            request_id = str(uuid.uuid4())
+                        ts_max_us = (
+                            data.get('ts_max_us')
+                            or data.get('tsMaxUs')
+                            or data.get('ts_maxUS')
+                            or data.get('tsMax_us')
+                        )
+                        if ts_max_us is None:
+                            ts_max_us = data.get('ts_max') or data.get('tsMax')
 
                         provider = self.ma_depth_provider if callable(self.ma_depth_provider) else None
-                        result = {'type': 'ma_depth_response', 'cam_id': cam_id}
-                        if not cam_id or provider is None:
-                            result.update({'ok': False, 'error': 'no_provider'})
+                        if not camera or provider is None:
+                            result = {
+                                'type': 'ma_depth_response',
+                                'camera': camera,
+                                'request_id': request_id,
+                                'served_from_cache': False,
+                                'error': 'no_provider',
+                                'ok': False,
+                            }
                             await websocket.send(json.dumps(result))
                             continue
 
-                        rate_key = f"{client_ip}:{cam_id or 'unknown'}"
+                        rate_key = f"{client_ip}:{camera}"
                         now = time.time()
                         last = self._depth_rpc_tracker.get(rate_key, 0.0)
                         if now - last < self._depth_rate_limit_window:
@@ -803,25 +823,52 @@ class WebSocketServer:
                             }
 
                         try:
-                                payload = await asyncio.wait_for(
-                                    asyncio.to_thread(provider, cam_id, ts_max),
-                                    timeout=self._depth_rpc_timeout
-                                )
-                                if payload:
-                                    result.update(payload)
-                                    result['ok'] = True
-                                    # Pre-serialize heavy payload off loop
-                                    message_text = await asyncio.to_thread(json.dumps, result)
-                                    await websocket.send(message_text)
-                                else:
-                                    result.update({'ok': False, 'error': 'not_available'})
-                                    await websocket.send(json.dumps(result))
+                            payload = await asyncio.wait_for(
+                                asyncio.to_thread(provider, camera, ts_max_us, request_id),
+                                timeout=self._depth_rpc_timeout,
+                            )
+                            if payload:
+                                if 'type' not in payload:
+                                    payload['type'] = 'ma_depth_response'
+                                payload.setdefault('camera', camera)
+                                if request_id and 'request_id' not in payload:
+                                    payload['request_id'] = request_id
+                                payload.setdefault('served_from_cache', False)
+                                payload.setdefault('ts_us', 0)
+                                payload.setdefault('ok', 'error' not in payload)
+                                safe_payload = convert_numpy_types(payload)
+                                message_text = await asyncio.to_thread(json.dumps, safe_payload)
+                                await websocket.send(message_text)
+                            else:
+                                result = {
+                                    'type': 'ma_depth_response',
+                                    'camera': camera,
+                                    'request_id': request_id,
+                                    'served_from_cache': False,
+                                    'error': 'not_available',
+                                    'ok': False,
+                                }
+                                await websocket.send(json.dumps(result))
                         except asyncio.TimeoutError:
-                            self.logger.warning(f"Depth RPC timed out for {cam_id} from {client_ip}")
-                            result.update({'ok': False, 'error': 'timeout'})
+                            self.logger.warning(f"Depth RPC timed out for {camera} from {client_ip}")
+                            result = {
+                                'type': 'ma_depth_response',
+                                'camera': camera,
+                                'request_id': request_id,
+                                'served_from_cache': False,
+                                'error': 'timeout',
+                                'ok': False,
+                            }
                             await websocket.send(json.dumps(result))
                         except Exception as exc:
-                            result.update({'ok': False, 'error': str(exc)})
+                            result = {
+                                'type': 'ma_depth_response',
+                                'camera': camera,
+                                'request_id': request_id,
+                                'served_from_cache': False,
+                                'error': str(exc),
+                                'ok': False,
+                            }
                             await websocket.send(json.dumps(result))
 
                     elif data.get('type') == 'get_floorplan':

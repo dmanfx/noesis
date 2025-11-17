@@ -210,6 +210,9 @@ class DeepStreamVideoPipeline:
         self._ma_sinks: Dict[int, GstApp.AppSink] = {}
         self._ma_frame_queues: Dict[int, queue.Queue] = {sid: queue.Queue(maxsize=1) for sid in self.sensor_ids}
         self._ma_branch_lock = threading.Lock()
+        # Track initial-open window for MA valves; FE will close per-sensor when heatmap ready
+        self._ma_initial_open: bool = True
+        self._ma_safety_close_scheduled: bool = False
 
         # Post-analytics BEV branch state (nvdsanalytics_post → tee → demux → per-stream BGR appsinks)
         self._post_analytics_tee: Optional[Gst.Element] = None
@@ -632,9 +635,27 @@ class DeepStreamVideoPipeline:
                     self.logger.debug("MA caps for sensor %s (stream %s) negotiated to %s", sensor_id, stream_id, capstr)
             except Exception:
                 pass
+            # Attach flow probes on MA branch for diagnostics
+            try:
+                self._attach_flow_probe(q.get_static_pad("src"), f"ma_q_{stream_id}.src")
+            except Exception:
+                pass
+            try:
+                self._attach_flow_probe(valve.get_static_pad("src"), f"ma_valve_{stream_id}.src")
+            except Exception:
+                pass
+            try:
+                self._attach_flow_probe(caps.get_static_pad("src"), f"ma_caps_{stream_id}.src")
+            except Exception:
+                pass
         # Save top-level for helpers
         self._pre_pgie_tee = pre_tee
         self._ma_demux = ma_demux
+        # Top-level MA demux sink probe
+        try:
+            self._attach_flow_probe(ma_demux.get_static_pad("sink"), "ma_demux.sink")
+        except Exception:
+            pass
 
     def _setup_bev_branch(self, elements: Dict[str, Any]) -> None:
         """Create and link a post-analytics tee → nvstreamdemux → per-stream BGR appsinks.
@@ -833,6 +854,24 @@ class DeepStreamVideoPipeline:
         for sid in list(self._ma_valves.keys()):
             self.disable_mapanything_for_sensor(sid)
 
+    def is_mapanything_enabled_for_sensor(self, sensor_id: int) -> bool:
+        """Check if MapAnything valve is currently open (enabled) for a sensor.
+        
+        Returns True if valve is open (drop=False), False if closed (drop=True) or not available.
+        """
+        if not self._ma_branch_ready:
+            return False
+        valve = self._ma_valves.get(sensor_id)
+        if not valve:
+            return False
+        try:
+            # Query the drop property: False means valve is open (enabled), True means closed (disabled)
+            drop = valve.get_property("drop")
+            return not bool(drop)
+        except Exception:
+            # If we can't query the property, assume disabled for safety
+            return False
+
     def _teardown_mapanything_branch(self) -> None:
         # Close valves first to stop downstream while consuming/dropping
         for sid, valve in list(self._ma_valves.items()):
@@ -848,6 +887,8 @@ class DeepStreamVideoPipeline:
             except Exception:
                 pass
             self._ma_demux_requested_src.pop(stream_id, None)
+        self._ma_initial_open = False
+        self._ma_safety_close_scheduled = False
 
     def _on_new_ma_frame(self, appsink: GstApp.AppSink, sensor_id: int) -> Gst.FlowReturn:
         try:
@@ -876,6 +917,10 @@ class DeepStreamVideoPipeline:
                 except Exception:
                     arr = None
                 if arr is not None:
+                    try:
+                        self.logger.debug(f"MA new-sample sensor={sensor_id} size={width}x{height}")
+                    except Exception:
+                        pass
                     q = self._ma_frame_queues.get(sensor_id)
                     if q is not None:
                         # Clear stale frame if present to keep latest
@@ -888,6 +933,7 @@ class DeepStreamVideoPipeline:
                             q.put_nowait(arr.copy())
                         except Exception:
                             pass
+                    # FE-driven close will manage valves; no per-frame auto-close
             finally:
                 buf.unmap(map_info)
         except Exception:
@@ -1104,7 +1150,7 @@ class DeepStreamVideoPipeline:
 
     def _close_ma_valves_after_negotiation(self) -> bool:
         """Close all MA valves after caps negotiation completes.
-        
+
         This allows the nvstreamdemux to complete caps negotiation with all
         downstream elements before we shut off the flow, preventing the demux
         from blocking the tee and main pipeline.
@@ -1115,7 +1161,23 @@ class DeepStreamVideoPipeline:
         for sensor_id in list(self._ma_valves.keys()):
             self.disable_mapanything_for_sensor(sensor_id)
         self.logger.info("✅ Closed all MA valves after caps negotiation")
+        self._ma_initial_open = False
         return False  # Stop the timeout callback
+
+    def _close_ma_valves_after_startup(self) -> bool:
+        """Safety timeout to close any MA valves still open after startup window."""
+        if not self._ma_branch_ready:
+            return False
+        if not self._ma_initial_open:
+            return False
+        for sensor_id in list(self._ma_valves.keys()):
+            try:
+                self.disable_mapanything_for_sensor(sensor_id)
+            except Exception:
+                pass
+        self._ma_initial_open = False
+        self.logger.info("✅ Safety timeout elapsed; closed remaining MA valves")
+        return False
 
     def read_ma_bgr(self, sensor_id: int, timeout: float = 1.5):
         """Open the MA valve for a single frame and return BGR ndarray, then close valve.
@@ -1126,6 +1188,8 @@ class DeepStreamVideoPipeline:
             return None
         if sensor_id not in self._ma_frame_queues:
             return None
+        # Check if valve was closed before we attempt capture (for warning suppression)
+        valve_was_closed = not self.is_mapanything_enabled_for_sensor(sensor_id)
         q = self._ma_frame_queues[sensor_id]
         # Flush any stale entry
         try:
@@ -1133,16 +1197,27 @@ class DeepStreamVideoPipeline:
                 q.get_nowait()
         except Exception:
             pass
-        # Open valve and wait briefly for a single frame
+        # Open valve and wait briefly for frames to start; increase prime for first-sample reliability
         self._set_ma_valve(sensor_id, False)
-        # Allow frames to start flowing through the cold demux path
-        time.sleep(0.1)
         try:
-            frame = q.get(timeout=max(0.05, float(timeout)))
-            self.logger.debug(f"Successfully captured frame for sensor {sensor_id}")
-            return frame
-        except Exception as exc:
-            self.logger.warning(f"Failed to capture frame for sensor {sensor_id} within timeout: {exc}")
+            time.sleep(1.0)
+        except Exception:
+            pass
+        # Poll until timeout expires
+        end_by = time.time() + max(0.1, float(timeout))
+        try:
+            while time.time() < end_by:
+                try:
+                    frame = q.get_nowait()
+                    self.logger.debug(f"Successfully captured frame for sensor {sensor_id}")
+                    return frame
+                except Exception:
+                    time.sleep(0.05)
+            # If valve was closed before the call, timeout is expected - log at debug level
+            if valve_was_closed:
+                self.logger.debug(f"Failed to capture frame for sensor {sensor_id} within timeout (valve was closed)")
+            else:
+                self.logger.warning(f"Failed to capture frame for sensor {sensor_id} within timeout")
             return None
         finally:
             self._set_ma_valve(sensor_id, True)
@@ -1819,6 +1894,9 @@ class DeepStreamVideoPipeline:
                 try:
                     self._setup_mapanything_branch(elements)
                     self._ma_branch_ready = True
+                    self._ma_initial_open = True
+                    self._ma_first_frames_seen = {sid: 0 for sid in self.sensor_ids}
+                    self._ma_safety_close_scheduled = False
                     self.logger.info("✅ MapAnything pre-PGIE branch constructed (valves opened for negotiation, auto-close after startup)")
                 except Exception as exc:
                     self._ma_branch_ready = False
@@ -2591,12 +2669,15 @@ class DeepStreamVideoPipeline:
             self.logger.info("✅ DeepStream pipeline started successfully")
             self._activated = True
 
-            # Close MA valves after caps negotiation completes
-            # This allows the nvstreamdemux to negotiate caps with all downstream
-            # elements before we shut off flow, preventing the demux from blocking
-            if self._ma_branch_ready:
-                # Schedule valve closing after 500ms to allow caps negotiation to complete
-                GLib.timeout_add(500, self._close_ma_valves_after_negotiation)
+            # During startup, keep MA valves open so each stream can emit a few frames,
+            # then auto-close either per-sensor (via appsink callback) or via safety timeout.
+            if self._ma_branch_ready and not self._ma_safety_close_scheduled:
+                self._ma_safety_close_scheduled = True
+                try:
+                    # Long failsafe close (15s) if no FE connects to signal readiness
+                    GLib.timeout_add(15000, self._close_ma_valves_after_startup)
+                except Exception:
+                    GLib.timeout_add(500, self._close_ma_valves_after_negotiation)
 
             # Log pipeline state after a short delay
             def check_pipeline_state():
@@ -2638,9 +2719,23 @@ class DeepStreamVideoPipeline:
             return False
 
     def _run_mainloop(self):
-        """Creates and runs the GLib MainLoop."""
-        self.mainloop = GLib.MainLoop()
-        self.mainloop.run()
+        """Creates and runs the GLib MainLoop.
+        
+        This thread blocks SIGINT to prevent interruption during GPU operations,
+        which can cause illegal instruction errors. Shutdown is handled via
+        mainloop.quit() called from the mainloop's own context.
+        """
+        import signal
+        # Block SIGINT in this thread to prevent interrupting GPU operations
+        # The main thread will handle shutdown gracefully via mainloop.quit()
+        signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGINT, signal.SIGTERM})
+        
+        try:
+            self.mainloop = GLib.MainLoop()
+            self.mainloop.run()
+        finally:
+            # Restore signal mask when exiting
+            signal.pthread_sigmask(signal.SIG_UNBLOCK, {signal.SIGINT, signal.SIGTERM})
     
 
     
@@ -2658,21 +2753,44 @@ class DeepStreamVideoPipeline:
         except Exception as e:
             self.logger.warning(f"⚠️ Could not unregister custom callbacks: {e}")
         
-
-        
-        # Stop pipeline
+        # Stop pipeline first - this stops GPU operations gracefully
         if self.pipeline:
-            self.pipeline.set_state(Gst.State.NULL)
+            try:
+                self.pipeline.set_state(Gst.State.NULL)
+                # Wait for state change to complete
+                ret = self.pipeline.get_state(timeout=Gst.CLOCK_TIME_NONE)
+                if ret[0] == Gst.StateChangeReturn.FAILURE:
+                    self.logger.warning("Pipeline state change to NULL failed")
+            except Exception as e:
+                self.logger.warning(f"Error stopping pipeline: {e}")
         
-        # Stop main loop
+        # Stop main loop - must be called from mainloop's own thread context
+        # Use GLib.idle_add to schedule quit() in the mainloop thread
         if self.mainloop:
-            self.mainloop.quit()
+            try:
+                # Schedule quit() to run in the mainloop's context
+                GLib.idle_add(self._quit_mainloop)
+            except Exception as e:
+                self.logger.warning(f"Error scheduling mainloop quit: {e}")
+                # Fallback: try direct quit if idle_add fails
+                try:
+                    self.mainloop.quit()
+                except Exception:
+                    pass
         
-        # Wait for main loop thread
+        # Wait for main loop thread to finish
         if hasattr(self, 'mainloop_thread') and self.mainloop_thread.is_alive():
-            self.mainloop_thread.join(timeout=2.0)
+            self.mainloop_thread.join(timeout=3.0)
+            if self.mainloop_thread.is_alive():
+                self.logger.warning("Mainloop thread did not terminate within timeout")
         
         self.logger.info("DeepStream pipeline stopped")
+    
+    def _quit_mainloop(self):
+        """Callback to quit mainloop from its own thread context."""
+        if self.mainloop and self.mainloop.is_running():
+            self.mainloop.quit()
+        return False  # Don't call again
     
     def get_stats(self) -> Dict[str, Any]:
         """Get pipeline statistics."""

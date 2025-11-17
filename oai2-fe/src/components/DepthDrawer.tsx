@@ -10,6 +10,13 @@ type DepthEntry = {
   shape: [number, number];
 };
 
+export type DepthMetaEntry = {
+  tsUs?: number;
+  servedFromCache?: boolean;
+  requestId?: string;
+  error?: string;
+};
+
 type DiagnosticsEntry = {
   summary: {
     median?: number;
@@ -61,7 +68,10 @@ interface DepthDrawerProps {
   onClose: () => void;
   diagnostics: Record<string, DiagnosticsEntry>;
   depthData: Record<string, DepthEntry>;
-  onRequestDepth: (cameraId: string) => void;
+  depthMeta?: Record<string, DepthMetaEntry>;
+  onRequestDepthFresh: (cameraId: string) => void;
+  onRequestDepthCached: (cameraId: string) => void;
+  onHeatmapReady: (cameraId: string) => void;
   floorplans: Record<string, FloorplanResponse>;
   onRequestFloorplan: (options: FloorplanRequestOptions) => string | void;
   availableCameras: string[];
@@ -194,9 +204,14 @@ function turboColor(t: number): [number, number, number] {
   return [clamp(r), clamp(g), clamp(b)];
 }
 
-const DepthDrawer = memo(function DepthDrawer({ open, onClose, diagnostics, depthData, onRequestDepth, floorplans, onRequestFloorplan, availableCameras }: DepthDrawerProps) {
-  // Show cameras in dropdown only when depth data is present (cached or newly generated)
-  const cameras = useMemo(() => Object.keys(depthData).sort(), [depthData]);
+const DepthDrawer = memo(function DepthDrawer({ open, onClose, diagnostics, depthData, depthMeta = {}, onRequestDepthFresh, onRequestDepthCached, onHeatmapReady, floorplans, onRequestFloorplan, availableCameras }: DepthDrawerProps) {
+  // Show cameras from either available list or present depth data (union)
+  const cameras = useMemo(() => {
+    const set = new Set<string>();
+    (availableCameras || []).forEach((c) => { if (c) set.add(c); });
+    Object.keys(depthData || {}).forEach((c) => { if (c) set.add(c); });
+    return Array.from(set).sort();
+  }, [availableCameras, depthData]);
   const [activeTab, setActiveTab] = useState<'heatmap' | 'stats' | 'histogram' | 'metrics'>('heatmap');
   const [selectedCamera, setSelectedCamera] = useState<string>('');
   const [drawerWidth, setDrawerWidth] = useState<number>(DEFAULT_WIDTH);
@@ -214,6 +229,7 @@ const DepthDrawer = memo(function DepthDrawer({ open, onClose, diagnostics, dept
   const [heatmapRange, setHeatmapRange] = useState<{ min: number; max: number } | null>(null);
   const warmupScheduledRef = useRef(false);
   const warmupTimersRef = useRef<number[]>([]);
+  const heatmapNotifiedRef = useRef<Set<string>>(new Set());
 
   // Floorplan selection (declared early to avoid TDZ in hooks below)
   const cameraFloorplan = floorplans[selectedCamera];
@@ -221,7 +237,7 @@ const DepthDrawer = memo(function DepthDrawer({ open, onClose, diagnostics, dept
   const heightLayer = cameraFloorplan?.height;
   const distanceLayer = cameraFloorplan?.distance;
   const floorplanError = cameraFloorplan?.error ?? null;
-  const servedFromCache = cameraFloorplan?.served_from_cache ?? false;
+  const floorplanServedFromCache = cameraFloorplan?.served_from_cache ?? false;
   const hasDensity = !!(densityLayer && densityLayer.grid_b64 && densityLayer.grid_shape);
   const hasHeight = !!(heightLayer && heightLayer.grid_b64 && heightLayer.grid_shape);
   const hasDistance = !!(distanceLayer && distanceLayer.grid_b64 && distanceLayer.grid_shape);
@@ -329,7 +345,7 @@ const DepthDrawer = memo(function DepthDrawer({ open, onClose, diagnostics, dept
 
   useEffect(() => {
     if (!open || !selectedCamera) return;
-    onRequestDepth(selectedCamera);
+    onRequestDepthFresh(selectedCamera);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [open, selectedCamera]);
 
@@ -340,6 +356,7 @@ const DepthDrawer = memo(function DepthDrawer({ open, onClose, diagnostics, dept
   }, [open]);
 
   const depthEntry = selectedCamera ? depthData[selectedCamera] : undefined;
+  const depthMetaEntry = selectedCamera && depthMeta ? depthMeta[selectedCamera] : undefined;
   const summaryEntry = selectedCamera ? diagnostics[selectedCamera] : undefined;
 
   useEffect(() => {
@@ -425,6 +442,17 @@ const DepthDrawer = memo(function DepthDrawer({ open, onClose, diagnostics, dept
     ctx.drawImage(offscreen, 0, 0, targetWidth, targetHeight);
     ctx.restore();
   }, [depthEntry, activeTab, drawerWidth, clearCanvasElement]);
+
+  // Notify backend once per camera when heatmap is rendered (cache-first or fresh)
+  useEffect(() => {
+    if (!open || activeTab !== 'heatmap') return;
+    if (!selectedCamera || !depthEntry) return;
+    if (heatmapNotifiedRef.current.has(selectedCamera)) return;
+    try {
+      onHeatmapReady(selectedCamera);
+      heatmapNotifiedRef.current.add(selectedCamera);
+    } catch {}
+  }, [open, activeTab, selectedCamera, depthEntry, onHeatmapReady]);
 
   useEffect(() => {
     if (!depthEntry) {
@@ -565,8 +593,8 @@ const DepthDrawer = memo(function DepthDrawer({ open, onClose, diagnostics, dept
     const unique = Array.from(new Set(cameraList)).filter(Boolean);
     if (!unique.length) return;
     warmupTimersRef.current.forEach((id) => window.clearTimeout(id));
-    warmupTimersRef.current = unique.map((cam, idx) => window.setTimeout(() => onRequestDepth(cam), idx * spacingMs));
-  }, [onRequestDepth]);
+    warmupTimersRef.current = unique.map((cam, idx) => window.setTimeout(() => onRequestDepthCached(cam), idx * spacingMs));
+  }, [onRequestDepthCached]);
 
 
   useEffect(() => {
@@ -622,14 +650,18 @@ const DepthDrawer = memo(function DepthDrawer({ open, onClose, diagnostics, dept
   const handleRefreshAll = useCallback(() => {
     if (!availableCameras.length) return;
     try { console.debug('[UI] refresh all depth', availableCameras); } catch {}
-    scheduleDepthBatch(availableCameras);
+    // Stagger fresh requests to avoid backpressure and throttling
+    const spacingMs = 200;
+    availableCameras.forEach((cam, idx) => {
+      window.setTimeout(() => onRequestDepthFresh(cam), idx * spacingMs);
+    });
     // Issue floorplan regenerate for every camera to ensure layers are produced
     availableCameras.forEach((cam) => {
       try {
         onRequestFloorplan({ camera: cam, requestId: Date.now().toString(), maxAgeSec: 0, gridResM: 0.5, maxExtentM: 20.0, cacheOnly: false });
       } catch {}
     });
-  }, [availableCameras, scheduleDepthBatch, onRequestFloorplan]);
+  }, [availableCameras, onRequestDepthFresh, onRequestFloorplan]);
 
   useEffect(() => {
     if (!open) return;
@@ -731,7 +763,7 @@ const DepthDrawer = memo(function DepthDrawer({ open, onClose, diagnostics, dept
                     onClick={() => {
                       if (!selectedCamera) return;
                       try { console.debug('[UI] refresh depth', selectedCamera); } catch {}
-                      onRequestDepth(selectedCamera);
+                      onRequestDepthFresh(selectedCamera);
                       requestFloorplan('regenerate');
                     }}
                     disabled={floorplanStatus === 'loading'}
@@ -816,9 +848,14 @@ const DepthDrawer = memo(function DepthDrawer({ open, onClose, diagnostics, dept
               {/* Meta information below the grid */}
               <div className="heatmap-meta">
                 <div className="heatmap-meta__item">
-                  {depthEntry
-                    ? `Updated ${new Date(depthEntry.ts / 1000).toLocaleTimeString()} · Resolution ${depthEntry.shape[1]}×${depthEntry.shape[0]}`
-                    : 'No depth frame cached yet for this camera.'}
+                  {depthEntry ? (() => {
+                    const parts = [`Updated ${new Date(depthEntry.ts / 1000).toLocaleTimeString()}`];
+                    if (depthMetaEntry && typeof depthMetaEntry.servedFromCache === 'boolean') {
+                      parts.push(depthMetaEntry.servedFromCache ? 'from cache' : 'fresh');
+                    }
+                    parts.push(`Resolution ${depthEntry.shape[1]}×${depthEntry.shape[0]}`);
+                    return parts.join(' · ');
+                  })() : 'No depth frame cached yet for this camera.'}
                 </div>
                 <div className="heatmap-meta__item">
                   {hasDensity ? 'Normalized point density' : 'Waiting for density data'}
@@ -836,7 +873,7 @@ const DepthDrawer = memo(function DepthDrawer({ open, onClose, diagnostics, dept
                   Points: {cameraFloorplan.point_count ?? 0}
                   {spanX !== undefined && spanZ !== undefined ? ` · Span ${formatNumber(spanX)}m × ${formatNumber(spanZ)}m` : ''}
                   {cameraFloorplan.ts
-                    ? ` · Updated ${new Date(cameraFloorplan.ts / 1000).toLocaleTimeString()}${servedFromCache ? ' (cached)' : ''}`
+                    ? ` · Updated ${new Date(cameraFloorplan.ts / 1000).toLocaleTimeString()}${floorplanServedFromCache ? ' (cached)' : ''}`
                     : ''}
                 </p>
               )}

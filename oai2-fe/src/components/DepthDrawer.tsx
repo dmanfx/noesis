@@ -30,7 +30,7 @@ type DiagnosticsEntry = {
   ts: number;
 };
 
-type FloorplanLayer = {
+export type FloorplanLayer = {
   grid_b64?: string;
   grid_shape?: [number, number];
   value_min?: number;
@@ -77,13 +77,16 @@ interface DepthDrawerProps {
   availableCameras: string[];
 }
 
-const VIRIDIS = [
-  [68, 1, 84],
-  [59, 82, 139],
-  [33, 145, 140],
-  [94, 201, 98],
-  [253, 231, 36],
-];
+import {
+  applyCanvasSize,
+  decodeFloat32,
+  decodeUint8,
+  grayscaleColor,
+  infernoColor,
+  renderLayerToCanvas,
+  turboColor,
+  viridisColor
+} from '../lib/renderUtils';
 
 const DEFAULT_WIDTH = 700;
 const MAX_WIDTH = 960;
@@ -108,100 +111,6 @@ function formatNumber(value?: number | null, digits = 2): string {
   if (value === undefined || value === null || Number.isNaN(value)) return 'n/a';
   const factor = 10 ** digits;
   return `${Math.round(value * factor) / factor}`;
-}
-
-const applyCanvasSize = (canvas: HTMLCanvasElement) => {
-  const rect = canvas.getBoundingClientRect();
-  const width = rect.width || canvas.clientWidth || 1;
-  const height = rect.height || canvas.clientHeight || width;
-  const dpr = window.devicePixelRatio || 1;
-  canvas.width = Math.max(1, Math.round(width * dpr));
-  canvas.height = Math.max(1, Math.round(height * dpr));
-  return { width, height, dpr };
-};
-
-function decodeFloat32(base64?: string): Float32Array | null {
-  if (!base64) return null;
-  try {
-    const binary = atob(base64);
-    const len = binary.length;
-    const bytes = new Uint8Array(len);
-    for (let i = 0; i < len; i += 1) {
-      bytes[i] = binary.charCodeAt(i);
-    }
-    return new Float32Array(bytes.buffer);
-  } catch (err) {
-    console.error('Failed to decode float32 payload', err);
-    return null;
-  }
-}
-
-function decodeUint8(base64?: string): Uint8Array | null {
-  if (!base64) return null;
-  try {
-    const binary = atob(base64);
-    const len = binary.length;
-    const bytes = new Uint8Array(len);
-    for (let i = 0; i < len; i += 1) {
-      bytes[i] = binary.charCodeAt(i);
-    }
-    return bytes;
-  } catch (err) {
-    console.error('Failed to decode uint8 payload', err);
-    return null;
-  }
-}
-
-function viridisColor(t: number): [number, number, number] {
-  const clamped = Math.min(1, Math.max(0, t));
-  const scaled = clamped * (VIRIDIS.length - 1);
-  const idx = Math.floor(scaled);
-  const frac = scaled - idx;
-  const a = VIRIDIS[idx];
-  const b = VIRIDIS[Math.min(idx + 1, VIRIDIS.length - 1)];
-  const r = Math.round(a[0] + (b[0] - a[0]) * frac);
-  const g = Math.round(a[1] + (b[1] - a[1]) * frac);
-  const bl = Math.round(a[2] + (b[2] - a[2]) * frac);
-  return [r, g, bl];
-}
-
-function grayscaleColor(t: number): [number, number, number] {
-  const v = Math.round(255 * (1 - Math.min(1, Math.max(0, t))));
-  return [v, v, v];
-}
-
-function infernoColor(t: number): [number, number, number] {
-  const stops: Array<[number, [number, number, number]]> = [
-    [0, [0, 0, 4]],
-    [0.2, [35, 6, 59]],
-    [0.4, [99, 23, 94]],
-    [0.6, [159, 43, 73]],
-    [0.8, [218, 83, 32]],
-    [1, [252, 255, 164]],
-  ];
-  const clamped = Math.min(1, Math.max(0, t));
-  for (let i = 0; i < stops.length - 1; i += 1) {
-    const [posA, colorA] = stops[i];
-    const [posB, colorB] = stops[i + 1];
-    if (clamped >= posA && clamped <= posB) {
-      const frac = (clamped - posA) / (posB - posA || 1);
-      const r = Math.round(colorA[0] + (colorB[0] - colorA[0]) * frac);
-      const g = Math.round(colorA[1] + (colorB[1] - colorA[1]) * frac);
-      const b = Math.round(colorA[2] + (colorB[2] - colorA[2]) * frac);
-      return [r, g, b];
-    }
-  }
-  const last = stops[stops.length - 1][1];
-  return [last[0], last[1], last[2]];
-}
-
-function turboColor(t: number): [number, number, number] {
-  const x = Math.min(1, Math.max(0, t));
-  const r = 0.13572138 + x * (4.61539260 + x * (-42.66032258 + x * (132.13108234 + x * (-152.94239396 + x * 59.28637943))));
-  const g = 0.09140261 + x * (2.19418839 + x * (4.84296658 + x * (-14.18503333 + x * (4.27729857 + x * 2.82956604))));
-  const b = 0.10667330 + x * (12.64194608 + x * (-60.58204836 + x * (115.67994485 + x * (-87.60200647 + x * 26.70740952))));
-  const clamp = (v: number) => Math.round(Math.min(1, Math.max(0, v)) * 255);
-  return [clamp(r), clamp(g), clamp(b)];
 }
 
 const DepthDrawer = memo(function DepthDrawer({ open, onClose, diagnostics, depthData, depthMeta = {}, onRequestDepthFresh, onRequestDepthCached, onHeatmapReady, floorplans, onRequestFloorplan, availableCameras }: DepthDrawerProps) {
@@ -268,69 +177,9 @@ const DepthDrawer = memo(function DepthDrawer({ open, onClose, diagnostics, dept
 
   const renderTopdownLayer = useCallback(
     (canvas: HTMLCanvasElement | null, layer: FloorplanLayer | undefined, palette: (t: number) => [number, number, number]) => {
-      if (!canvas) return;
-      if (!layer || !layer.grid_b64 || !layer.grid_shape) {
-        clearCanvasElement(canvas);
-        return;
-      }
-      const [rows, cols] = layer.grid_shape;
-      if (!rows || !cols) {
-        clearCanvasElement(canvas);
-        return;
-      }
-      const values = decodeFloat32(layer.grid_b64);
-      if (!values || values.length < rows * cols) {
-        clearCanvasElement(canvas);
-        return;
-      }
-
-      const ctx = canvas.getContext('2d');
-      if (!ctx) return;
-
-      const offscreen = document.createElement('canvas');
-      offscreen.width = cols;
-      offscreen.height = rows;
-      const offCtx = offscreen.getContext('2d');
-      if (!offCtx) return;
-
-      const imageData = offCtx.createImageData(cols, rows);
-      const data = imageData.data;
-      const min = layer.value_min ?? 0;
-      const max = layer.value_max ?? 1;
-      const denom = max - min === 0 ? 1 : max - min;
-      for (let idx = 0; idx < values.length; idx += 1) {
-        const norm = Math.min(1, Math.max(0, (values[idx] - min) / denom));
-        const [r, g, b] = palette(norm);
-        const offset = idx * 4;
-        data[offset] = r;
-        data[offset + 1] = g;
-        data[offset + 2] = b;
-        data[offset + 3] = 255;
-      }
-      offCtx.putImageData(imageData, 0, 0);
-
-      const { width } = applyCanvasSize(canvas);
-      const height = width / WIDE_ASPECT;  // Force 16:9 height
-      const dpr = window.devicePixelRatio || 1;
-      canvas.width = Math.max(1, Math.round(width * dpr));
-      canvas.height = Math.max(1, Math.round(height * dpr));
-
-      ctx.save();
-      ctx.scale(dpr, dpr);
-      ctx.clearRect(0, 0, width, height);
-      ctx.imageSmoothingEnabled = true;
-      // Stretch: Draw offscreen to full 16:9 destination
-      ctx.drawImage(offscreen, 0, 0, width, height);
-      ctx.restore();
-
-      ctx.save();
-      ctx.scale(dpr, dpr);
-      ctx.strokeStyle = '#ff4d4d';
-      ctx.lineWidth = 1.5;
-      ctx.strokeRect(1, 1, width - 2, height - 2);
-      ctx.restore();
+      renderLayerToCanvas(canvas, layer, palette, WIDE_ASPECT);
     },
-    [clearCanvasElement]
+    []
   );
 
   useEffect(() => {
@@ -451,7 +300,7 @@ const DepthDrawer = memo(function DepthDrawer({ open, onClose, diagnostics, dept
     try {
       onHeatmapReady(selectedCamera);
       heatmapNotifiedRef.current.add(selectedCamera);
-    } catch {}
+    } catch { }
   }, [open, activeTab, selectedCamera, depthEntry, onHeatmapReady]);
 
   useEffect(() => {
@@ -559,7 +408,7 @@ const DepthDrawer = memo(function DepthDrawer({ open, onClose, diagnostics, dept
       maxExtentM: 20,
       cacheOnly,
     };
-    try { console.debug('[UI] floorplan request', { mode, ...req }); } catch {}
+    try { console.debug('[UI] floorplan request', { mode, ...req }); } catch { }
     const requestId = onRequestFloorplan(req);
     if (typeof requestId === 'string' && requestId.length) {
       setFloorplanRequest(requestId);
@@ -600,7 +449,7 @@ const DepthDrawer = memo(function DepthDrawer({ open, onClose, diagnostics, dept
   useEffect(() => {
     if (open && availableCameras.length && !warmupScheduledRef.current) {
       // Warm up by requesting fresh depth for all available cameras
-      try { console.debug('[UI] warmup depth batch', availableCameras); } catch {}
+      try { console.debug('[UI] warmup depth batch', availableCameras); } catch { }
       scheduleDepthBatch(availableCameras);
       warmupScheduledRef.current = true;
     }
@@ -649,7 +498,7 @@ const DepthDrawer = memo(function DepthDrawer({ open, onClose, diagnostics, dept
 
   const handleRefreshAll = useCallback(() => {
     if (!availableCameras.length) return;
-    try { console.debug('[UI] refresh all depth', availableCameras); } catch {}
+    try { console.debug('[UI] refresh all depth', availableCameras); } catch { }
     // Stagger fresh requests to avoid backpressure and throttling
     const spacingMs = 200;
     availableCameras.forEach((cam, idx) => {
@@ -659,7 +508,7 @@ const DepthDrawer = memo(function DepthDrawer({ open, onClose, diagnostics, dept
     availableCameras.forEach((cam) => {
       try {
         onRequestFloorplan({ camera: cam, requestId: Date.now().toString(), maxAgeSec: 0, gridResM: 0.5, maxExtentM: 20.0, cacheOnly: false });
-      } catch {}
+      } catch { }
     });
   }, [availableCameras, onRequestDepthFresh, onRequestFloorplan]);
 
@@ -762,7 +611,7 @@ const DepthDrawer = memo(function DepthDrawer({ open, onClose, diagnostics, dept
                     className="btn-icon"
                     onClick={() => {
                       if (!selectedCamera) return;
-                      try { console.debug('[UI] refresh depth', selectedCamera); } catch {}
+                      try { console.debug('[UI] refresh depth', selectedCamera); } catch { }
                       onRequestDepthFresh(selectedCamera);
                       requestFloorplan('regenerate');
                     }}

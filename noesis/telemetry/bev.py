@@ -1,12 +1,17 @@
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple, Any
 
 import cv2
 import numpy as np
+import time
+import math
 
-from geometry.homography import compose_bev_homography
+from geometry.homography import Plane, parse_extrinsics, ray_from_pixel, intersect_plane
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -16,6 +21,7 @@ class CalibrationSnapshot:
     extrinsics_col_major: Sequence[float]  # 16 values, world→camera
     floor_y: float
     image_size: Tuple[int, int]
+    unit_scale: float = 1.0
 
 
 @dataclass
@@ -25,6 +31,8 @@ class BevConfig:
     z_range: Tuple[float, float] = (0.0, 12.0)
     overlay: bool = True
     max_px: int = 768
+    auto_fit_extents: bool = True
+    max_distance_m: float = 8.0
 
 
 @dataclass
@@ -46,7 +54,7 @@ class BevResult:
 
 class HomographyCache:
     def __init__(self) -> None:
-        self._cache: Dict[str, Tuple[np.ndarray, Tuple[int, int]]] = {}
+        self._cache: Dict[str, np.ndarray] = {}
 
     @staticmethod
     def _hash_matrix(matrix: np.ndarray) -> int:
@@ -55,7 +63,6 @@ class HomographyCache:
     def _key(
         self,
         calib: CalibrationSnapshot,
-        cfg: BevConfig,
     ) -> str:
         return "::".join(
             [
@@ -64,32 +71,29 @@ class HomographyCache:
                 f"K={self._hash_matrix(calib.intrinsics)}",
                 f"E={hash(tuple(float(x) for x in calib.extrinsics_col_major))}",
                 f"floor={calib.floor_y:.4f}",
-                f"x={cfg.x_range}",
-                f"z={cfg.z_range}",
-                f"mpp={cfg.meters_per_px:.4f}",
+                f"s={float(getattr(calib, 'unit_scale', 1.0)):.6f}",
             ]
         )
 
     def get(
         self,
         calib: CalibrationSnapshot,
-        cfg: BevConfig,
-    ) -> Tuple[np.ndarray, Tuple[int, int]]:
-        key = self._key(calib, cfg)
+    ) -> np.ndarray:
+        key = self._key(calib)
         cached = self._cache.get(key)
         if cached is not None:
             return cached
-        H, bev_size = compose_bev_homography(
+        
+        from geometry.homography import img_to_plane_homography
+        H = img_to_plane_homography(
             calib.intrinsics,
             calib.extrinsics_col_major,
             calib.floor_y,
             calib.image_size,
-            cfg.x_range,
-            cfg.z_range,
-            cfg.meters_per_px,
+            float(getattr(calib, "unit_scale", 1.0) or 1.0),
         )
-        self._cache[key] = (H, bev_size)
-        return H, bev_size
+        self._cache[key] = H
+        return H
 
 
 class BevRenderer:
@@ -97,6 +101,24 @@ class BevRenderer:
         self.ws = ws_server
         self.config_per_cam: Dict[str, BevConfig] = {}
         self.h_cache = HomographyCache()
+        # Last known good homography per camera for resilience
+        self._last_h_by_cam: Dict[str, np.ndarray] = {}
+        # Auto-computed extents per camera
+        self._auto_extents_by_camera: Dict[str, Tuple[Tuple[float, float], Tuple[float, float]]] = {}
+
+    def publish_status(self, camera_id: str, **fields: Any) -> None:
+        """Publish a lightweight BEV status/error message to clients."""
+        try:
+            payload: Dict[str, Any] = {
+                "type": "bev-status",
+                "cameraId": str(camera_id),
+                "ts": int(time.time() * 1_000_000),
+            }
+            payload.update({k: v for k, v in fields.items() if k is not None})
+            if hasattr(self.ws, "broadcast_sync"):
+                self.ws.broadcast_sync(payload)
+        except Exception:
+            pass
 
     def update_config(self, camera_id: str, cfg: Dict[str, float]) -> BevConfig:
         current = self.config_per_cam.get(camera_id, BevConfig())
@@ -112,6 +134,8 @@ class BevRenderer:
             ),
             overlay=bool(cfg.get("overlay", current.overlay)),
             max_px=current.max_px,
+            auto_fit_extents=bool(cfg.get("autoFitExtents", current.auto_fit_extents)),
+            max_distance_m=float(cfg.get("maxDistanceM", current.max_distance_m)),
         )
         self.config_per_cam[camera_id] = next_cfg
         return next_cfg
@@ -131,49 +155,112 @@ class BevRenderer:
         timestamp_us: int,
     ) -> None:
         cfg = self.config_per_cam.get(camera_id, BevConfig())
-        H_img2bev, (width_px, height_px) = self.h_cache.get(calib, cfg)
-        long_edge = max(width_px, height_px)
-        H_to_use = H_img2bev
-        if long_edge > cfg.max_px:
-            scale = cfg.max_px / float(long_edge)
-            width_px = max(1, int(width_px * scale))
-            height_px = max(1, int(height_px * scale))
-            S = np.array([[scale, 0.0, 0.0], [0.0, scale, 0.0], [0.0, 0.0, 1.0]], dtype=np.float64)
-            H_to_use = S @ H_img2bev
+        
+        # Compute or fetch extents for this camera
+        x_range = cfg.x_range
+        z_range = cfg.z_range
+        
+        if cfg.auto_fit_extents:
+            # Robust key including calibration version to prevent stale frustums
+            ext_hash = hash(tuple(float(x) for x in calib.extrinsics_col_major))
+            intr_hash = HomographyCache._hash_matrix(calib.intrinsics)
+            key = f"{camera_id}::{ext_hash}::{intr_hash}"
+            
+            auto_extents = self._auto_extents_by_camera.get(key)
+            if auto_extents is None:
+                from geometry.homography import compute_ground_frustum_aabb
+                x_range_auto, z_range_auto = compute_ground_frustum_aabb(
+                    calib.intrinsics,
+                    calib.extrinsics_col_major,
+                    calib.floor_y,
+                    calib.image_size,
+                    calib.unit_scale,
+                    cfg.max_distance_m,
+                    padding_m=0.25,
+                )
+                auto_extents = (x_range_auto, z_range_auto)
+                self._auto_extents_by_camera[key] = auto_extents
+            x_range, z_range = auto_extents
+        
+        # Create a temporary config with the actual extents to use for homography computation
+        # (Not strictly needed for metric homography, but good for context)
+        
+        # Compute or reuse homography; fallback to last good if current fails
+        H_img2plane = None
+        try:
+            H_img2plane = self.h_cache.get(calib)
+            self._last_h_by_cam[camera_id] = H_img2plane
+        except Exception as e:
+            logger.warning("BEV: homography computation failed for %s: %s", camera_id, e)
+            cached_result = self._last_h_by_cam.get(camera_id)
+            if cached_result is None:
+                # No homography at all yet; notify clients of failure once per attempt window.
+                self.publish_status(camera_id, error="homography_failed", details=str(e))
+                return
+            H_img2plane = cached_result
+            
+        # Create a tiny placeholder image to satisfy the protocol.
+        bev = np.zeros((1, 1, 3), dtype=np.uint8)
 
-        bev = cv2.warpPerspective(frame_bgr, H_to_use, (width_px, height_px), flags=cv2.INTER_LINEAR)
         bev_points: List[Dict[str, float]] = []
 
-        if cfg.overlay:
-            self._draw_grid(bev, cfg)
+        # Calculate Camera Yaw and Position for Local Transformation
+        # We want points relative to the camera (Local Frame), aligned with the camera view.
+        R_wc, C_world = parse_extrinsics(calib.extrinsics_col_major)
+        scale = float(calib.unit_scale or 1.0)
+        C_world = C_world * scale
+        
+        # Camera forward vector in camera frame is [0, 0, 1] (assuming standard CV frame)
+        # In World frame:
+        dir_world = R_wc @ np.array([0.0, 0.0, 1.0])
+        # Yaw is angle in XZ plane. atan2(x, z) gives 0 for +Z (North), pi/2 for +X (East)
+        yaw = math.atan2(dir_world[0], dir_world[2])
+        cos_yaw = math.cos(-yaw)
+        sin_yaw = math.sin(-yaw)
 
         for fp in footpoints:
             vec = np.array([fp.u, fp.v, 1.0], dtype=np.float64)
-            bev_pt = H_to_use @ vec
-            w = bev_pt[2] if bev_pt[2] else 1.0
-            bx = float(bev_pt[0] / w)
-            by = float(bev_pt[1] / w)
-            if np.isnan(bx) or np.isnan(by):
+            # H maps [u, v, 1] -> [x_meters, z_meters, w] (World Coordinates)
+            world_pt = H_img2plane @ vec
+            w = world_pt[2] if world_pt[2] else 1.0
+            wx = float(world_pt[0] / w)
+            wz = float(world_pt[1] / w)
+            
+            if np.isnan(wx) or np.isnan(wz):
                 continue
-            bev_points.append({'x': bx, 'y': by, 'method': fp.method, 'trackId': fp.track_id})
-            if cfg.overlay:
-                cv2.circle(
-                    bev,
-                    (int(np.clip(round(bx), 0, width_px - 1)), int(np.clip(round(by), 0, height_px - 1))),
-                    4,
-                    (0, 255, 255),
-                    thickness=-1,
-                    lineType=cv2.LINE_AA,
-                )
+            
+            # Transform World -> Local Camera Frame
+            # 1. Translate
+            dx = wx - C_world[0]
+            dz = wz - C_world[2]
+            
+            # 2. Rotate by -Yaw
+            lx = dx * cos_yaw - dz * sin_yaw
+            lz = dx * sin_yaw + dz * cos_yaw
 
+            # The frontend expects 'x' and 'y' in the JSON list.
+            # We map Local X -> JSON x, Local Z -> JSON y
+            bev_points.append({'x': lx, 'y': lz, 'method': fp.method, 'trackId': fp.track_id})
+
+        # Update config to reflect the actual extents used
+        result_config = BevConfig(
+            meters_per_px=cfg.meters_per_px,
+            x_range=x_range,
+            z_range=z_range,
+            overlay=cfg.overlay,
+            max_px=cfg.max_px,
+            auto_fit_extents=cfg.auto_fit_extents,
+            max_distance_m=cfg.max_distance_m,
+        )
+        
         result = BevResult(
             camera_id=camera_id,
             bev_bgr=bev,
             bev_points=bev_points,
-            config=cfg,
+            config=result_config,
             timestamp_us=timestamp_us,
         )
-        self._publish(result)
+        self._publish(result, calib, H_img2plane)
 
     def _draw_grid(self, bev: np.ndarray, cfg: BevConfig) -> None:
         if cfg.meters_per_px <= 0:
@@ -186,9 +273,11 @@ class BevRenderer:
         for y in range(0, height, major_step_px):
             cv2.line(bev, (0, y), (width - 1, y), color, 1, lineType=cv2.LINE_AA)
 
-    def _publish(self, result: BevResult) -> None:
+    def _publish(self, result: BevResult, calib: CalibrationSnapshot, H_to_use: np.ndarray) -> None:
         ok, jpeg = cv2.imencode(".jpg", result.bev_bgr, [int(cv2.IMWRITE_JPEG_QUALITY), 70])
         if not ok:
+            # Surface encoding failures so FE can show a message instead of a broken icon
+            self.publish_status(result.camera_id, error="jpeg_encode_failed")
             return
         payload = jpeg.tobytes()
         # Use the same header scheme as mosaic: a single camera-id string
@@ -196,6 +285,22 @@ class BevRenderer:
         header = f"bev:{result.camera_id}".encode("utf-8")
         framed = bytes([len(header)]) + header + payload
         try:
+            # Compute a quick sanity sample: image bottom-center ray intersection in meters (XZ)
+            sample_xz: Optional[Tuple[float, float]] = None
+            try:
+                width_src, height_src = calib.image_size
+                u = float(max(0.0, width_src * 0.5))
+                v = float(max(0.0, height_src - 1))
+                R_wc, C_world = parse_extrinsics(calib.extrinsics_col_major)
+                scale = float(calib.unit_scale or 1.0)
+                C_world = C_world * scale
+                plane = Plane.horizontal(float(calib.floor_y) * scale)
+                origin, direction = ray_from_pixel(u, v, calib.intrinsics, R_wc, C_world)
+                hit = intersect_plane(origin, direction, plane)
+                if hit is not None:
+                    sample_xz = (float(hit[0]), float(hit[2]))
+            except Exception:
+                sample_xz = None
             status = {
                 "type": "bev-frame",
                 "cameraId": result.camera_id,
@@ -209,6 +314,9 @@ class BevRenderer:
                 "zMax": result.config.z_range[1],
                 "overlay": result.config.overlay,
                 "footpoints": result.bev_points,
+                # Optional: flattened 3x3 homography for client-side debug/overlays
+                "H": [float(x) for x in H_to_use.reshape(-1)],
+                "sampleXZ": list(sample_xz) if sample_xz is not None else None,
             }
             if hasattr(self.ws, "broadcast_sync"):
                 self.ws.broadcast_sync(status)
@@ -226,5 +334,6 @@ class BevRenderer:
                         )
                 except Exception:
                     pass
-        except Exception:
-            pass
+        except Exception as e:
+            print("BEV publish failed:", e)
+            return

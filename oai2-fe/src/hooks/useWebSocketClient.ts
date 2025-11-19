@@ -217,6 +217,8 @@ export function useWebSocketClient(url: string, handlers: FrameHandlers) {
             handlers.onFloorplan?.(data);
           } else if (data.type === 'bev-frame') {
             handlers.onBevMeta?.(data);
+          } else if (data.type === 'bev-status') {
+            handlers.onBevMeta?.(data);
           }
         } catch (e) {
           // swallow parsing errors

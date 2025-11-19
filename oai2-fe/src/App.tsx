@@ -65,8 +65,8 @@ function Dashboard() {
   const [occupancy, setOccupancy] = useState<string>('');
   const [trackDetailsHtml, setTrackDetailsHtml] = useState<string>('');
   // Transitions removed from UI
-  const [tracksByCamera, setTracksByCamera] = useState<Record<string, Array<{track_id: number; stable_id?: number | null; camera_id: string; zone?: string; center?: [number, number]; dwell_time?: number; velocity?: [number, number] }>>>({});
-  const [tracksByCamKey, setTracksByCamKey] = useState<Record<CameraKey, Array<{track_id: number; stable_id?: number | null; camera_id: string}>>>({ 'living-room': [], 'kitchen': [], 'family-room': [] });
+  const [tracksByCamera, setTracksByCamera] = useState<Record<string, Array<{ track_id: number; stable_id?: number | null; camera_id: string; zone?: string; center?: [number, number]; dwell_time?: number; velocity?: [number, number] }>>>({});
+  const [tracksByCamKey, setTracksByCamKey] = useState<Record<CameraKey, Array<{ track_id: number; stable_id?: number | null; camera_id: string }>>>({ 'living-room': [], 'kitchen': [], 'family-room': [] });
   const [occByCamKey, setOccByCamKey] = useState<Record<CameraKey, Record<string, number>>>({ 'living-room': {}, 'kitchen': {}, 'family-room': {} });
   // Vacancy timer state
   const [vacancyText, setVacancyText] = useState<Record<CameraKey, string>>({ 'living-room': '', 'kitchen': '', 'family-room': '' });
@@ -151,7 +151,7 @@ function Dashboard() {
             if (key === 'kitchen' && hasWorld) {
               if (!usingWorldKitchenRef.current) {
                 // First time we see valid world for kitchen, clear old pixel trails for that cam
-                try { (trailStoreRef.current.trails as any)['kitchen'] = {}; } catch {}
+                try { (trailStoreRef.current.trails as any)['kitchen'] = {}; } catch { }
                 usingWorldKitchenRef.current = true;
               }
               const w = tw.world as [number, number, number];
@@ -171,7 +171,7 @@ function Dashboard() {
               seenNow[key].add(sid);
             } else if (key === 'living-room' && hasWorld) {
               if (!usingWorldLivingRef.current) {
-                try { (trailStoreRef.current.trails as any)['living-room'] = {}; } catch {}
+                try { (trailStoreRef.current.trails as any)['living-room'] = {}; } catch { }
                 usingWorldLivingRef.current = true;
               }
               const w = tw.world as [number, number, number];
@@ -188,7 +188,7 @@ function Dashboard() {
               seenNow[key].add(sid);
             } else if (key === 'family-room' && hasWorld) {
               if (!usingWorldFamilyRef.current) {
-                try { (trailStoreRef.current.trails as any)['family-room'] = {}; } catch {}
+                try { (trailStoreRef.current.trails as any)['family-room'] = {}; } catch { }
                 usingWorldFamilyRef.current = true;
               }
               const w = tw.world as [number, number, number];
@@ -223,7 +223,7 @@ function Dashboard() {
 
     // Occupancy HTML
     let occHtml = '<ul style="margin:0;padding-left:16px">';
-    const sortedOcc = Object.entries(globalOcc).sort(([,a],[,b]) => b-a);
+    const sortedOcc = Object.entries(globalOcc).sort(([, a], [, b]) => b - a);
     if (sortedOcc.length) {
       sortedOcc.forEach(([zone, cnt]) => {
         occHtml += `<li><strong>${zone}:</strong> <span style="display:inline-block;min-width:3ch;text-align:right;">${cnt}</span></li>`;
@@ -239,13 +239,27 @@ function Dashboard() {
     // Track details HTML
     let tracksHtml = '';
     if (allTracks.length) {
-      allTracks.sort((a,b) => (Number((a.stable_id ?? a.track_id) || 0)) - (Number((b.stable_id ?? b.track_id) || 0))).forEach(t => {
+      allTracks.sort((a, b) => (Number((a.stable_id ?? a.track_id) || 0)) - (Number((b.stable_id ?? b.track_id) || 0))).forEach(t => {
         const dwell = t.dwell_time?.toFixed(1) ?? '0.0';
-        const center = t.center || ['N/A','N/A'];
-        const vel = t.velocity || [0,0];
-        const speed = Math.sqrt(vel[0]**2 + vel[1]**2).toFixed(1);
+        const center = t.center || ['N/A', 'N/A'];
+        const vel = t.velocity || [0, 0];
+        const speed = Math.sqrt(vel[0] ** 2 + vel[1] ** 2).toFixed(1);
         const dotColor = colorForTrack(Number((t.stable_id ?? t.track_id) || 0));
-        tracksHtml += `<div><strong><span class="dot" style="display:inline-block;width:10px;height:10px;border-radius:50%;background:${dotColor};margin-right:6px;vertical-align:middle;"></span>SID ${t.stable_id ?? t.track_id ?? 'N/A'}:</strong><br/>Zone: ${t.zone||'-'}, Dwell: <span style="display:inline-block; min-width:4ch; text-align:right;">${dwell}</span>s<br/>Pos: [${(typeof center[0]==='number'?Number(center[0]).toFixed(3):center[0])}, ${(typeof center[1]==='number'?Number(center[1]).toFixed(3):center[1])}], Speed: <span style="display:inline-block; min-width:4ch; text-align:right;">${speed}</span> px/s</div>`;
+
+        // Look up metric coordinates from BEV meta if available
+        let metricPos = '';
+        const tid = t.track_id; // or stable_id? BEV uses track_id from DS.
+        // Find which camera this track belongs to
+        const camKey = Object.keys(perKeyTracks).find(k => perKeyTracks[k as CameraKey]?.some(tt => tt.track_id === tid)) as CameraKey | undefined;
+
+        if (camKey && bevMeta[camKey]?.footpoints) {
+          const fp = bevMeta[camKey]!.footpoints!.find(p => p.trackId === tid);
+          if (fp) {
+            metricPos = `Metric: [${fp.x.toFixed(2)}m, ${fp.y.toFixed(2)}m]<br/>`;
+          }
+        }
+
+        tracksHtml += `<div><strong><span class="dot" style="display:inline-block;width:10px;height:10px;border-radius:50%;background:${dotColor};margin-right:6px;vertical-align:middle;"></span>SID ${t.stable_id ?? t.track_id ?? 'N/A'}:</strong><br/>Zone: ${t.zone || '-'}, Dwell: <span style="display:inline-block; min-width:4ch; text-align:right;">${dwell}</span>s<br/>${metricPos}Pos: [${(typeof center[0] === 'number' ? Number(center[0]).toFixed(3) : center[0])}, ${(typeof center[1] === 'number' ? Number(center[1]).toFixed(3) : center[1])}], Speed: <span style="display:inline-block; min-width:4ch; text-align:right;">${speed}</span> px/s</div>`;
       });
     } else {
       tracksHtml = '<span>No active tracks.</span>';
@@ -466,9 +480,13 @@ function Dashboard() {
     const camRaw = payload.camera_id || payload.camera || (Array.isArray(payload.cameras) && payload.cameras[0]);
     const camId = camRaw ? String(camRaw) : '';
     if (!camId) return;
-    setFloorplanData(prev => ({ ...prev, [camId]: payload as FloorplanResponse }));
 
-    const label = labelForCameraId(camId);
+    // Normalize key to match UI components (e.g. 'kitchen_camera' -> 'kitchen')
+    const key = detectCameraKey(camId) || camId;
+
+    setFloorplanData(prev => ({ ...prev, [key]: payload as FloorplanResponse }));
+
+    const label = labelForCameraId(key);
     const now = Date.now();
     if (typeof payload.scale_m_per_px === 'number' && Number.isFinite(payload.scale_m_per_px)) {
       publish({
@@ -570,7 +588,7 @@ function Dashboard() {
   const handleRequestFloorplan = useCallback((options?: { camera?: string; requestId?: string; maxAgeSec?: number; gridResM?: number; maxExtentM?: number; cacheOnly?: boolean }) => {
     return requestFloorplan(options);
   }, [requestFloorplan]);
-  
+
   // Live EST/EDT clock for top bar
   const [estTime, setEstTime] = useState<string>("");
   useEffect(() => {
@@ -600,7 +618,7 @@ function Dashboard() {
       setVacancyText(prev => {
         let changed = false;
         const next: Record<CameraKey, string> = { ...prev } as any;
-        (['living-room','kitchen','family-room'] as CameraKey[]).forEach(k => {
+        (['living-room', 'kitchen', 'family-room'] as CameraKey[]).forEach(k => {
           const started = zeroSinceRef.current[k];
           if (!started) {
             if (next[k] !== '') { next[k] = ''; changed = true; }
@@ -618,7 +636,7 @@ function Dashboard() {
       });
     }, 1000);
     return () => clearInterval(id);
-  // eslint-disable-next-line react-hooks/exhaustive-deps
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   const connectionChip = useMemo(() => {
@@ -647,7 +665,6 @@ function Dashboard() {
   // Fullscreen overlay that follows the selected camera's stream
   const [overlayUrl, setOverlayUrl] = useState<string>('');
   const expandedBlob = expandedCamera ? streams[expandedCamera] : null;
-  const [topDownOpen, setTopDownOpen] = useState<boolean>(false);
 
   useEffect(() => {
     if (!expandedCamera || !expandedBlob) {
@@ -658,6 +675,24 @@ function Dashboard() {
     setOverlayUrl(url);
     return () => URL.revokeObjectURL(url);
   }, [expandedCamera, expandedBlob]);
+
+  const [topDownOpen, setTopDownOpen] = useState<boolean>(false);
+
+  // Request floorplans when TopDown view is opened
+  useEffect(() => {
+    if (topDownOpen) {
+      cameraOrder.forEach(cam => {
+        requestFloorplan({
+          camera: cam,
+          requestId: `td-${Date.now()}`,
+          maxAgeSec: 600, // Accept cached up to 10 mins
+          gridResM: 0.5,
+          maxExtentM: 20,
+          cacheOnly: false
+        });
+      });
+    }
+  }, [topDownOpen, requestFloorplan]);
 
   useEffect(() => {
     if (!expandedCamera) return;
@@ -713,14 +748,14 @@ function Dashboard() {
             <div dangerouslySetInnerHTML={{ __html: occupancy }} />
           </div>
 
-          { /* Legend removed; color dot is shown inline with each ID */ }
+          { /* Legend removed; color dot is shown inline with each ID */}
 
           <div className="panel card">
             <div className="card-title">Active Tracks</div>
             <div dangerouslySetInnerHTML={{ __html: trackDetailsHtml }} />
           </div>
 
-          { /* Transitions panel removed; Top‑Down moved to drawer */ }
+          { /* Transitions panel removed; Top‑Down moved to drawer */}
         </section>
       </main>
       <footer className="footer">
@@ -758,6 +793,8 @@ function Dashboard() {
         onClose={() => setTopDownOpen(false)}
         images={bevImages}
         meta={bevMeta}
+        floorplans={floorplanData}
+        tracks={tracksByCamKey}
         onUpdateConfig={handleBevConfigUpdate}
         onToggleOverlay={handleBevOverlayToggle}
       />

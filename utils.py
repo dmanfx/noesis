@@ -132,8 +132,18 @@ def setup_logging(log_level: int = logging.INFO, log_file: Optional[str] = None)
         datefmt='%Y-%m-%d %H:%M:%S'
     )
     
-    #Set logging level for websocket.server
-    logging.getLogger('websockets.server').setLevel(logging.WARNING)
+    # Define filter to suppress benign websocket handshake errors
+    class WebsocketsHandshakeErrorFilter(logging.Filter):
+        def filter(self, record):
+            # Filter out "opening handshake failed" errors which happen when clients disconnect early
+            if record.name == 'websockets.server' and 'opening handshake failed' in str(record.msg):
+                return False
+            return True
+
+    # Set logging level for websocket.server and add filter
+    ws_logger = logging.getLogger('websockets.server')
+    ws_logger.setLevel(logging.WARNING)
+    ws_logger.addFilter(WebsocketsHandshakeErrorFilter())
 
     # Configure root logger
     root_logger = logging.getLogger()

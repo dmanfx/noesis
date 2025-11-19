@@ -1,24 +1,16 @@
-import React, { useEffect, useMemo, useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import '../styles/topdown-drawer.css';
 import { CameraKey, cameraLabel } from '../lib/camera';
+import { FloorplanResponse } from './DepthDrawer';
+import { renderLayerToCanvas, infernoColor } from '../lib/renderUtils';
 
 type BevMeta = {
   cameraId: string;
-  mpp?: number;
-  xMin?: number;
-  xMax?: number;
-  zMin?: number;
-  zMax?: number;
-  overlay?: boolean;
-};
-
-type ControlState = {
-  mpp: string;
-  xMin: string;
-  xMax: string;
-  zMin: string;
-  zMax: string;
-  overlay: boolean;
+  // Metric coordinates of detected objects
+  footpoints?: Array<{ x: number; y: number; method: string; trackId?: number }>;
+  // Optional status/error fields from server
+  error?: string;
+  details?: string;
 };
 
 type Props = {
@@ -26,139 +18,227 @@ type Props = {
   onClose: () => void;
   images: Record<CameraKey, string | null>;
   meta: Record<CameraKey, BevMeta | undefined>;
+  floorplans: Record<string, FloorplanResponse>;
+  tracks: Record<CameraKey, Array<{ track_id: number; stable_id?: number | null }>>;
   onUpdateConfig: (cam: CameraKey, cfg: { mpp: number; xMin: number; xMax: number; zMin: number; zMax: number }) => void;
   onToggleOverlay: (cam: CameraKey, enabled: boolean) => void;
 };
 
 const cameras: CameraKey[] = ['living-room', 'kitchen', 'family-room'];
 
-const deriveState = (meta?: BevMeta): ControlState => ({
-  mpp: meta?.mpp !== undefined ? meta.mpp.toFixed(3) : '0.05',
-  xMin: meta?.xMin !== undefined ? meta.xMin.toFixed(2) : '-4.00',
-  xMax: meta?.xMax !== undefined ? meta.xMax.toFixed(2) : '4.00',
-  zMin: meta?.zMin !== undefined ? meta.zMin.toFixed(2) : '0.00',
-  zMax: meta?.zMax !== undefined ? meta.zMax.toFixed(2) : '12.00',
-  overlay: meta?.overlay !== undefined ? meta.overlay : true,
-});
-
-const sanitize = (value: string, fallback: number) => {
-  const parsed = parseFloat(value);
-  if (Number.isFinite(parsed)) return parsed;
-  return fallback;
-};
-
 const BevPanel: React.FC<{
   cam: CameraKey;
-  image: string | null;
-  control: ControlState;
-  onChange: (next: ControlState) => void;
-  onUpdate: () => void;
-  onToggleOverlay: (enabled: boolean) => void;
-}> = ({ cam, image, control, onChange, onUpdate, onToggleOverlay }) => {
+  meta?: BevMeta;
+  floorplan?: FloorplanResponse;
+  tracks?: Array<{ track_id: number; stable_id?: number | null }>;
+}> = ({ cam, meta, floorplan, tracks }) => {
   const label = cameraLabel(cam);
+  const canvasRef = useRef<HTMLCanvasElement>(null);
+  const [overlayEnabled, setOverlayEnabled] = useState(true);
+
+  // Smoothing state: Map<trackId, { x: number, y: number, lastSeen: number, velocity: {x:number, y:number} }>
+  const smoothState = useRef<Map<number, { x: number; y: number; lastSeen: number; stableId?: string }>>(new Map());
+  const animationFrameRef = useRef<number>();
+
+  // Update smooth state when meta changes
+  useEffect(() => {
+    const now = Date.now();
+    const state = smoothState.current;
+
+    if (meta?.footpoints) {
+      meta.footpoints.forEach(pt => {
+        if (pt.trackId === undefined) return;
+
+        const targetX = pt.x;
+        const targetY = pt.y; // Backend Z
+
+        // Find stable ID
+        let sid = `${pt.trackId}`;
+        if (tracks) {
+          const t = tracks.find(tr => tr.track_id === pt.trackId);
+          if (t && t.stable_id !== undefined && t.stable_id !== null) {
+            sid = `${t.stable_id}`;
+          }
+        }
+
+        state.set(pt.trackId, {
+          x: targetX,
+          y: targetY,
+          lastSeen: now,
+          stableId: sid
+        });
+      });
+    }
+
+    // Prune old tracks
+    for (const [id, data] of state.entries()) {
+      if (now - data.lastSeen > 1000) { // 1 second hysteresis
+        state.delete(id);
+      }
+    }
+  }, [meta, tracks]);
+
+  // Render loop
+  useEffect(() => {
+    const render = () => {
+      const cvs = canvasRef.current;
+      if (!cvs) return;
+      const ctx = cvs.getContext('2d');
+      if (!ctx) return;
+
+      // 1. Draw Background
+      const heightLayer = floorplan?.height;
+      const hasFloorplan = !!(heightLayer && heightLayer.grid_b64 && heightLayer.grid_shape);
+
+      if (hasFloorplan) {
+        // Note: renderLayerToCanvas clears the canvas internally and may resize it
+        renderLayerToCanvas(cvs, heightLayer, infernoColor);
+      } else {
+        ctx.fillStyle = '#111';
+        ctx.fillRect(0, 0, cvs.width, cvs.height);
+      }
+
+      // Re-read dimensions after potential resize
+      const width = cvs.width;
+      const height = cvs.height;
+
+      // 2. Coordinate System
+      let xMin = -4;
+      let xMax = 4;
+      let zMin = 0;
+      let zMax = 12;
+
+      if (floorplan?.bounds && floorplan.scale_m_per_px) {
+        const b = floorplan.bounds;
+        if (typeof b.min_x === 'number' && typeof b.max_x === 'number' &&
+          typeof b.min_z === 'number' && typeof b.max_z === 'number') {
+          xMin = b.min_x;
+          xMax = b.max_x;
+          zMin = b.min_z;
+          zMax = b.max_z;
+        }
+      }
+
+      // Debug logging (throttled)
+      if (Math.random() < 0.01) {
+        console.log(`[BevPanel ${cam}] Bounds: [${xMin}, ${xMax}]x[${zMin}, ${zMax}], Canvas: ${width}x${height}`);
+        if (meta?.footpoints && meta.footpoints.length > 0) {
+          console.log(`[BevPanel ${cam}] Footpoint:`, meta.footpoints[0]);
+        }
+      }
+
+      const drawX = (mx: number) => ((mx - xMin) / (xMax - xMin)) * width;
+      const drawY = (mz: number) => height - ((mz - zMin) / (zMax - zMin)) * height;
+
+      // 3. Draw Grid
+      if (overlayEnabled) {
+        ctx.strokeStyle = 'rgba(255, 255, 255, 0.1)';
+        ctx.lineWidth = 1;
+        ctx.beginPath();
+        const startX = Math.ceil(xMin);
+        for (let x = startX; x <= xMax; x++) {
+          const u = drawX(x);
+          ctx.moveTo(u, 0);
+          ctx.lineTo(u, height);
+        }
+        const startZ = Math.ceil(zMin);
+        for (let z = startZ; z <= zMax; z++) {
+          const v = drawY(z);
+          ctx.moveTo(0, v);
+          ctx.lineTo(width, v);
+        }
+        ctx.stroke();
+
+        // Origin
+        ctx.strokeStyle = 'rgba(255, 255, 255, 0.3)';
+        ctx.lineWidth = 2;
+        ctx.beginPath();
+        if (zMin <= 0 && zMax >= 0) {
+          const v0 = drawY(0);
+          ctx.moveTo(0, v0);
+          ctx.lineTo(width, v0);
+        }
+        if (xMin <= 0 && xMax >= 0) {
+          const u0 = drawX(0);
+          ctx.moveTo(u0, 0);
+          ctx.lineTo(u0, height);
+        }
+        ctx.stroke();
+      }
+
+      // 4. Draw Smoothed Dots
+      const now = Date.now();
+      smoothState.current.forEach((pt, id) => {
+        const age = now - pt.lastSeen;
+        if (age > 500) return; // Don't draw if too old (but keep in state for 1s)
+
+        const px = drawX(pt.x);
+        const py = drawY(pt.y);
+
+        // Fade out if stale
+        const alpha = Math.max(0, 1 - age / 500);
+
+        ctx.globalAlpha = alpha;
+        ctx.beginPath();
+        ctx.arc(px, py, 6, 0, 2 * Math.PI);
+        ctx.fillStyle = '#0ff';
+        ctx.fill();
+        ctx.strokeStyle = '#000';
+        ctx.lineWidth = 1.5;
+        ctx.stroke();
+
+        if (pt.stableId) {
+          ctx.fillStyle = '#fff';
+          ctx.font = 'bold 12px sans-serif';
+          ctx.shadowColor = 'black';
+          ctx.shadowBlur = 4;
+          ctx.fillText(pt.stableId, px + 8, py - 8);
+          ctx.shadowBlur = 0;
+        }
+        ctx.globalAlpha = 1.0;
+      });
+
+      animationFrameRef.current = requestAnimationFrame(render);
+    };
+
+    render();
+    return () => {
+      if (animationFrameRef.current) cancelAnimationFrame(animationFrameRef.current);
+    };
+  }, [floorplan, overlayEnabled]);
+
   return (
     <div className="td-cell">
-      <div className="td-title">Top-Down • {label}</div>
-      <div className="td-image-wrap">
-        {image ? <img src={image} alt={`${label} BEV`} /> : <div className="td-placeholder">Waiting for BEV…</div>}
+      <div className="td-title">
+        {label}
+        <span className="td-subtitle">{floorplan ? ' • Height Map' : ' • No Map Data'}</span>
       </div>
-      <div className="td-controls">
-        <label>
-          m/px
-          <input
-            type="number"
-            step="0.01"
-            min="0.01"
-            value={control.mpp}
-            onChange={(e) => onChange({ ...control, mpp: e.target.value })}
+      <div className="td-image-wrap" style={{ background: '#000', display: 'flex', justifyContent: 'center', alignItems: 'center', position: 'relative' }}>
+        {meta?.error ? (
+          <div className="td-placeholder">BEV Error: {meta.error}{meta.details ? ` — ${meta.details}` : ''}</div>
+        ) : (
+          <canvas
+            ref={canvasRef}
+            style={{ width: '100%', height: '100%', objectFit: 'contain' }}
           />
-        </label>
-        <label>
-          X min (m)
-          <input
-            type="number"
-            step="0.1"
-            value={control.xMin}
-            onChange={(e) => onChange({ ...control, xMin: e.target.value })}
-          />
-        </label>
-        <label>
-          X max (m)
-          <input
-            type="number"
-            step="0.1"
-            value={control.xMax}
-            onChange={(e) => onChange({ ...control, xMax: e.target.value })}
-          />
-        </label>
-        <label>
-          Z min (m)
-          <input
-            type="number"
-            step="0.1"
-            value={control.zMin}
-            onChange={(e) => onChange({ ...control, zMin: e.target.value })}
-          />
-        </label>
-        <label>
-          Z max (m)
-          <input
-            type="number"
-            step="0.1"
-            value={control.zMax}
-            onChange={(e) => onChange({ ...control, zMax: e.target.value })}
-          />
-        </label>
-        <button type="button" onClick={onUpdate}>
-          Apply
-        </button>
-        <label className="td-overlay-toggle">
-          <input
-            type="checkbox"
-            checked={control.overlay}
-            onChange={(e) => {
-              onChange({ ...control, overlay: e.target.checked });
-              onToggleOverlay(e.target.checked);
-            }}
-          />
-          Show overlay
-        </label>
+        )}
+        <div style={{ position: 'absolute', bottom: 8, right: 8 }}>
+          <label className="td-overlay-toggle" style={{ background: 'rgba(0,0,0,0.5)', padding: '4px 8px', borderRadius: 4, color: 'white', fontSize: '12px' }}>
+            <input
+              type="checkbox"
+              checked={overlayEnabled}
+              onChange={(e) => setOverlayEnabled(e.target.checked)}
+              style={{ marginRight: 6 }}
+            />
+            Grid
+          </label>
+        </div>
       </div>
     </div>
   );
 };
 
-const TopDownDrawer: React.FC<Props> = ({ open, onClose, images, meta, onUpdateConfig, onToggleOverlay }) => {
-  const [controlState, setControlState] = useState<Record<CameraKey, ControlState>>(() => {
-    const initial: Partial<Record<CameraKey, ControlState>> = {};
-    cameras.forEach((cam) => {
-      initial[cam] = deriveState(meta[cam]);
-    });
-    return initial as Record<CameraKey, ControlState>;
-  });
-
-  useEffect(() => {
-    setControlState((prev) => {
-      const next = { ...prev };
-      cameras.forEach((cam) => {
-        next[cam] = deriveState(meta[cam]);
-      });
-      return next;
-    });
-  }, [meta]);
-
-  const handleUpdate = (cam: CameraKey) => {
-    const ctrl = controlState[cam];
-    const payload = {
-      mpp: sanitize(ctrl.mpp, 0.05),
-      xMin: sanitize(ctrl.xMin, -4),
-      xMax: sanitize(ctrl.xMax, 4),
-      zMin: sanitize(ctrl.zMin, 0),
-      zMax: sanitize(ctrl.zMax, 12),
-    };
-    onUpdateConfig(cam, payload);
-  };
-
+const TopDownDrawer: React.FC<Props> = ({ open, onClose, meta, floorplans, tracks }) => {
   return (
     <>
       <div className={open ? 'td-overlay open' : 'td-overlay'} onClick={onClose} />
@@ -173,11 +253,9 @@ const TopDownDrawer: React.FC<Props> = ({ open, onClose, images, meta, onUpdateC
               <BevPanel
                 key={cam}
                 cam={cam}
-                image={images[cam] ?? null}
-                control={controlState[cam]}
-                onChange={(next) => setControlState((prev) => ({ ...prev, [cam]: next }))}
-                onUpdate={() => handleUpdate(cam)}
-                onToggleOverlay={(en) => onToggleOverlay(cam, en)}
+                meta={meta[cam]}
+                floorplan={floorplans[cam]}
+                tracks={tracks[cam]}
               />
             ))}
           </div>
@@ -188,3 +266,4 @@ const TopDownDrawer: React.FC<Props> = ({ open, onClose, images, meta, onUpdateC
 };
 
 export default TopDownDrawer;
+

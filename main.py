@@ -1199,9 +1199,18 @@ class ApplicationManager:
                 any_frame = True
                 camera_id = self._friendly_name_by_sensor.get(sensor_id, f"camera-{sensor_id}")
                 calib = self._build_calibration_snapshot(camera_id, entry.get('width'), entry.get('height'))
-                if calib is None or not self.bev_renderer:
-                    continue
                 now = time.time()
+                if calib is None:
+                    # Surface calibration issues to the frontend at a limited rate
+                    if self.bev_renderer and (now - self._bev_last_publish.get(camera_id, 0.0) >= min_interval):
+                        try:
+                            self._bev_last_publish[camera_id] = now
+                            self.bev_renderer.publish_status(camera_id, error="calibration_missing")
+                        except Exception:
+                            pass
+                    continue
+                if not self.bev_renderer:
+                    continue
                 if now - self._bev_last_publish.get(camera_id, 0.0) < min_interval:
                     continue
                 self._bev_last_publish[camera_id] = now
@@ -1214,6 +1223,10 @@ class ApplicationManager:
                     )
                     for fp in entry.get('footpoints', [])
                 ]
+                # DEBUG: Log incoming footpoints count to verify data flow
+                # if points:
+                #    self.logger.debug(f"BEV Worker: {camera_id} has {len(points)} footpoints. First: {points[0]}")
+                
                 timestamp_us = entry.get('ntp_ts') or int(now * 1_000_000)
                 try:
                     self.bev_renderer.render_and_publish(camera_id, calib, entry['frame'], points, timestamp_us)
@@ -1240,15 +1253,44 @@ class ApplicationManager:
             return None
         if len(extr) != 16:
             return None
-        floor_y = float(((bundle.get('align') or {}).get('floor_y')) or 0.0)
+        align_node = (bundle.get('align') or {}) if isinstance(bundle, dict) else {}
+        floor_y = float((align_node.get('floor_y')) or 0.0)
+        # Plumb unit scale from alignment (object units → meters); default to 1.0 if not set
+        try:
+            units = align_node.get('units') or {}
+            unit_scale = float(units.get('s_obj_to_m', 1.0)) if isinstance(units, dict) else 1.0
+            if not np.isfinite(unit_scale) or unit_scale <= 0.0:
+                unit_scale = 1.0
+        except Exception:
+            unit_scale = 1.0
         w = int(width or self.config.cameras.CAMERA_WIDTH)
         h = int(height or self.config.cameras.CAMERA_HEIGHT)
+        # If the calibration intrinsics were derived at a different resolution,
+        # scale K to the current frame size to keep pinhole model consistent.
+        try:
+            specs = getattr(self.config.calibration, 'CAMERA_SPECS', {}) or {}
+            spec = specs.get(camera_id) if isinstance(specs, dict) else None
+            res = spec.get('resolution') if isinstance(spec, dict) else None
+            if isinstance(res, (list, tuple)) and len(res) >= 2:
+                base_w = int(res[0]) or 0
+                base_h = int(res[1]) or 0
+                if base_w > 0 and base_h > 0 and (base_w != w or base_h != h):
+                    sx = float(w) / float(base_w)
+                    sy = float(h) / float(base_h)
+                    K = K.copy()
+                    K[0, 0] *= sx
+                    K[0, 2] *= sx
+                    K[1, 1] *= sy
+                    K[1, 2] *= sy
+        except Exception:
+            pass
         return CalibrationSnapshot(
             camera_id=camera_id,
             intrinsics=K,
             extrinsics_col_major=[float(x) for x in extr],
             floor_y=floor_y,
             image_size=(w, h),
+            unit_scale=unit_scale,
         )
 
     def _start_jpeg_processing_loop(self):

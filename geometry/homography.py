@@ -8,9 +8,10 @@ from both the backend processing path and tests.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Sequence, Tuple
+from typing import Iterable, Sequence, Tuple
 
 import cv2
+import math
 import numpy as np
 
 
@@ -69,6 +70,87 @@ def intersect_plane(origin: np.ndarray, direction: np.ndarray, plane: Plane) -> 
     return origin + t * direction
 
 
+def compute_ground_frustum_aabb(
+    K: np.ndarray,
+    E_col_major_16: Iterable[float],
+    floor_y: float,
+    image_size: Tuple[int, int],
+    unit_scale: float,
+    max_distance_m: float,
+    padding_m: float = 0.25,
+) -> Tuple[Tuple[float, float], Tuple[float, float]]:
+    """
+    Compute an axis-aligned bounding box (AABB) on the ground plane (Y = floor_y)
+    that covers the camera's visible floor region, in *meters*.
+
+    Returns:
+        (x_min, x_max), (z_min, z_max)
+    """
+    R_wc, C_world = parse_extrinsics(E_col_major_16)
+    scale = float(unit_scale or 1.0)
+    C_world = C_world * scale
+    floor_y_m = float(floor_y) * scale
+    plane = Plane.horizontal(floor_y_m)
+
+    width, height = image_size
+
+    # Build sample pixels on the image that are likely to see the floor
+    # Use a grid instead of fixed bottom-row samples to catch high-horizon/tilted views
+    grid_steps_x = 8
+    grid_steps_y = 8
+    xs = np.linspace(0, width - 1, grid_steps_x)
+    ys = np.linspace(0, height - 1, grid_steps_y)
+    samples = [(float(x), float(y)) for x in xs for y in ys]
+
+    xz_hits = []
+    for u, v in samples:
+        origin, direction = ray_from_pixel(float(u), float(v), K, R_wc, C_world)
+        hit = intersect_plane(origin, direction, plane)
+        if hit is None:
+            continue
+        dx = float(hit[0] - C_world[0])
+        dz = float(hit[2] - C_world[2])
+        dist = math.hypot(dx, dz)
+
+        if dist > max_distance_m and dist > 1e-6:
+            scale_d = max_distance_m / dist
+            hit = np.array(
+                [
+                    C_world[0] + dx * scale_d,
+                    hit[1],  # keep Y
+                    C_world[2] + dz * scale_d,
+                ],
+                dtype=np.float64,
+            )
+        xz_hits.append((hit[2], hit[0]))
+
+    if len(xz_hits) < 3:
+        # Fallback extents
+        return (-4.0, 4.0), (0.0, 12.0)
+
+    xs = [p[0] for p in xz_hits]
+    zs = [p[1] for p in xz_hits]
+    x_min = min(xs) - padding_m
+    x_max = max(xs) + padding_m
+    z_min = min(zs) - padding_m
+    z_max = max(zs) + padding_m
+
+    # Ensure z_min is not negative
+    z_min = max(0.0, z_min)
+
+    # Ensure the extents are at least some minimal size
+    if (x_max - x_min) < 1.0:
+        cx = 0.5 * (x_min + x_max)
+        x_min = cx - 0.5
+        x_max = cx + 0.5
+    if (z_max - z_min) < 1.0:
+        cz = 0.5 * (z_min + z_max)
+        z_min = cz - 0.5
+        z_max = cz + 0.5
+
+    return (x_min, x_max), (z_min, z_max)
+
+
 def image_corners(width: int, height: int) -> Tuple[Tuple[float, float], ...]:
     return (
         (0.0, 0.0),
@@ -83,6 +165,7 @@ def img_to_plane_homography(
     E_col_major_16: Sequence[float],
     floor_y: float,
     image_size: Tuple[int, int],
+    unit_scale: float = 1.0,
 ) -> np.ndarray:
     """
     Build a 3x3 homography that maps image pixels to ground plane XZ metres.
@@ -90,25 +173,47 @@ def img_to_plane_homography(
     if K.shape != (3, 3):
         raise ValueError("Intrinsics K must be 3x3")
     width, height = image_size
-    plane = Plane.horizontal(floor_y)
+    scale = float(unit_scale or 1.0)
+    plane = Plane.horizontal(float(floor_y) * scale)
     R_wc, C_world = parse_extrinsics(E_col_major_16)
+    C_world = C_world * scale
 
-    img_pts = []
-    plane_pts = []
-    for (u, v) in image_corners(width, height):
-        origin, direction = ray_from_pixel(u, v, K, R_wc, C_world)
-        hit = intersect_plane(origin, direction, plane)
-        if hit is None:
-            raise ValueError("Image corner ray does not intersect the floor plane")
-        img_pts.append([u, v])
-        plane_pts.append([hit[0], hit[2]])  # map to (X,Z)
+    def try_build(points: Sequence[Tuple[float, float]]) -> np.ndarray | None:
+        img_pts: list[list[float]] = []
+        plane_pts: list[list[float]] = []
+        for (u, v) in points:
+            origin, direction = ray_from_pixel(u, v, K, R_wc, C_world)
+            hit = intersect_plane(origin, direction, plane)
+            if hit is None:
+                continue
+            img_pts.append([u, v])
+            plane_pts.append([hit[0], hit[2]])  # Map to world (X, Z)
+        
+        if len(img_pts) < 4:
+            return None
+            
+        src = np.array(img_pts, dtype=np.float32)
+        dst = np.array(plane_pts, dtype=np.float32)
+        
+        # Use RANSAC if we have enough points to handle outliers, though ray casting should be clean
+        H, mask = cv2.findHomography(src, dst, cv2.RANSAC, 5.0)
+        if H is None or H.shape != (3, 3):
+            return None
+        return H
 
-    src = np.array(img_pts, dtype=np.float32)
-    dst = np.array(plane_pts, dtype=np.float32)
-    H = cv2.getPerspectiveTransform(src, dst)
-    if H is None or H.shape != (3, 3):
-        raise RuntimeError("Failed to compute image→plane homography")
-    return H
+    # Generate a grid of samples across the whole image to find valid ground plane projections.
+    # This handles cases where the bottom band might be looking at the horizon or ceiling.
+    grid_steps_x = 8
+    grid_steps_y = 8
+    xs = np.linspace(0, width - 1, grid_steps_x)
+    ys = np.linspace(0, height - 1, grid_steps_y)
+    grid_points = [(float(x), float(y)) for x in xs for y in ys]
+    
+    H = try_build(grid_points)
+    if H is not None:
+        return H
+
+    raise RuntimeError("Failed to compute image→plane homography (no valid ray-plane intersections found in grid search)")
 
 
 def plane_to_bev_affine(
@@ -158,11 +263,12 @@ def compose_bev_homography(
     x_range: Tuple[float, float],
     z_range: Tuple[float, float],
     meters_per_px: float,
+    unit_scale: float = 1.0,
 ) -> Tuple[np.ndarray, Tuple[int, int]]:
     """
     Compose the final image→BEV homography and output dimensions.
     """
-    H_img2plane = img_to_plane_homography(K, E_col_major_16, floor_y, image_size)
+    H_img2plane = img_to_plane_homography(K, E_col_major_16, floor_y, image_size, unit_scale=unit_scale)
     A_plane2bev, bev_size = plane_to_bev_affine(x_range, z_range, meters_per_px)
     M = A_plane2bev @ H_img2plane
     return M, bev_size
@@ -171,6 +277,9 @@ def compose_bev_homography(
 __all__ = [
     "Plane",
     "parse_extrinsics",
+    "ray_from_pixel",
+    "intersect_plane",
+    "compute_ground_frustum_aabb",
     "img_to_plane_homography",
     "plane_to_bev_affine",
     "compose_bev_homography",

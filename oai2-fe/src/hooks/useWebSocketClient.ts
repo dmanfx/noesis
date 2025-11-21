@@ -37,6 +37,7 @@ export type FrameHandlers = {
   onMADiagnostics?: (payload: any) => void;
   onMADepth?: (payload: any) => void;
   onFloorplan?: (payload: any) => void;
+  onAutoCalibrateResult?: (payload: any) => void;
 };
 
 export type FloorplanRequest = {
@@ -177,6 +178,12 @@ export function useWebSocketClient(url: string, handlers: FrameHandlers) {
             return;
           }
 
+          if (data.type === 'auto_calibrate_result') {
+            try { console.debug('[WS] auto-calibrate result', data); } catch {}
+            try { handlers.onAutoCalibrateResult?.(data); } catch {}
+            return;
+          }
+
           // Handle pong responses from server
           if (data.type === 'pong') {
             const latency = Date.now() - (data.timestamp || 0);
@@ -282,6 +289,7 @@ export function useWebSocketClient(url: string, handlers: FrameHandlers) {
     sendTrailToggle: (enabled: boolean) => sendJson({ type: 'set_vis_toggle', toggle_name: 'trail_visualization_enabled', enabled }),
     sendDetectionConfig: (config: any) => sendJson({ type: 'update_detection_config', config }),
     sendDetectionToggle: (name: string, enabled: boolean) => sendJson({ type: 'set_detection_toggle', toggle_name: name, enabled }),
+    sendAutoCalibrate: (camId?: string) => sendJson({ type: 'auto_calibrate_pose', camera: camId }),
     requestMapAnythingDepth: (camId: string, strategy: DepthRequestStrategy = 'fresh', tsMaxOverride?: number) => {
       if (!camId) return false;
       const existing = depthInFlightRef.current[camId];

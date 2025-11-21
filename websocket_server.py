@@ -73,6 +73,8 @@ class WebSocketServer:
         self.set_align_handler: Optional[Callable[[Dict[str, Any]], Dict[str, Any]]] = None
         self.ma_depth_provider: Optional[Callable[[str, Optional[Any], Optional[str]], Optional[Dict[str, Any]]]] = None
         self.floorplan_provider: Optional[Callable[[Optional[list], float, float, float, bool], Optional[Dict[str, Any]]]] = None
+        # Optional auto-calibration handler (cameraId -> result)
+        self.auto_calibrate_handler: Optional[Callable[[Optional[str]], Dict[str, Any]]] = None
 
     # ---------------- Menon telemetry helpers ----------------
     def _telemetry_now(self) -> float:
@@ -673,6 +675,28 @@ class WebSocketServer:
                             except Exception:
                                 pass
                         # no ack required; server action is side-effect only
+
+                    elif data.get('type') == 'auto_calibrate_pose':
+                        cam_id = data.get('camera') or data.get('cameraId') or data.get('camId')
+                        result = {'type': 'auto_calibrate_result'}
+                        if callable(self.auto_calibrate_handler):
+                            try:
+                                out = await asyncio.wait_for(
+                                    asyncio.to_thread(self.auto_calibrate_handler, cam_id if isinstance(cam_id, str) else None),
+                                    timeout=15.0
+                                )
+                                if isinstance(out, dict):
+                                    result.update(out)
+                            except asyncio.TimeoutError:
+                                result.update({'ok': False, 'error': 'timeout'})
+                            except Exception as exc:
+                                result.update({'ok': False, 'error': str(exc)})
+                        else:
+                            result.update({'ok': False, 'error': 'no_handler'})
+                        try:
+                            await websocket.send(json.dumps(result))
+                        except Exception:
+                            pass
 
                     # ---- Spatial & calibration RPCs ----
                     # legacy 'get_transformation' removed; calibration-bundle is source of truth

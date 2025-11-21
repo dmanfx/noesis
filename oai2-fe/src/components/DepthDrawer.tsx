@@ -404,7 +404,7 @@ const DepthDrawer = memo(function DepthDrawer({ open, onClose, diagnostics, dept
       requestId: Date.now().toString(),
       // Regenerate ignores staleness by passing maxAgeSec=0
       maxAgeSec: cacheOnly ? undefined : 0,
-      gridResM: 0.5,
+      gridResM: 0.15,
       maxExtentM: 20,
       cacheOnly,
     };

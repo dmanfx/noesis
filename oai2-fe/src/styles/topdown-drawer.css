@@ -25,6 +25,30 @@
   transition: transform 0.25s ease;
 }
 .td-drawer.open { transform: translateX(0); }
+.td-drawer-resize-handle {
+  position: absolute;
+  top: 0;
+  left: -4px;
+  width: 8px;
+  height: 100%;
+  cursor: ew-resize;
+  touch-action: none;
+  z-index: 2;
+}
+.td-drawer-resize-handle::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  border-radius: 4px;
+  background: linear-gradient(to right, rgba(88, 214, 141, 0.3), rgba(88, 214, 141, 0));
+  opacity: 0;
+  transition: opacity 0.15s ease;
+}
+.td-drawer-resize-handle:focus-visible::after,
+.td-drawer-resize-handle:hover::after,
+.td-drawer.open .td-drawer-resize-handle:active::after {
+  opacity: 1;
+}
 
 .td-header {
   display: flex;

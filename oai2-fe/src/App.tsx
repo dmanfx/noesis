@@ -554,7 +554,8 @@ function Dashboard() {
     requestFloorplan,
     sendBevConfig,
     sendBevOverlay,
-    notifyMaHeatmapReady
+    notifyMaHeatmapReady,
+    sendAutoCalibrate
   } = useWebSocketClient(WS_URL, {
     onImage,
     onBevImage: handleBevImage,
@@ -564,7 +565,19 @@ function Dashboard() {
     onCalibration: handleCalibrationBundle,
     onMADiagnostics: handleMADiagnostics,
     onMADepth: handleMADepth,
-    onFloorplan: handleFloorplan
+    onFloorplan: handleFloorplan,
+    onAutoCalibrateResult: (payload) => {
+      const ok = payload?.ok;
+      const updated = Array.isArray(payload?.updated) ? payload.updated : [];
+      const err = typeof payload?.error === 'string' ? payload.error : '';
+      if (ok && updated.length) {
+        setCalibrateToast({ text: `Calibrated: ${updated.join(', ')}`, kind: 'success', ts: Date.now() });
+      } else {
+        setCalibrateToast({ text: err || 'Calibration failed', kind: 'error', ts: Date.now() });
+      }
+      // Clear after a short delay
+      window.setTimeout(() => setCalibrateToast(null), 3000);
+    }
   });
 
   const handleBevConfigUpdate = useCallback((cam: CameraKey, cfg: { mpp: number; xMin: number; xMax: number; zMin: number; zMax: number }) => {
@@ -677,6 +690,7 @@ function Dashboard() {
   }, [expandedCamera, expandedBlob]);
 
   const [topDownOpen, setTopDownOpen] = useState<boolean>(false);
+  const [calibrateToast, setCalibrateToast] = useState<{ text: string; kind: 'info' | 'success' | 'error'; ts: number } | null>(null);
 
   // Request floorplans when TopDown view is opened
   useEffect(() => {
@@ -686,7 +700,7 @@ function Dashboard() {
           camera: cam,
           requestId: `td-${Date.now()}`,
           maxAgeSec: 600, // Accept cached up to 10 mins
-          gridResM: 0.5,
+          gridResM: 0.15,
           maxExtentM: 20,
           cacheOnly: false
         });
@@ -797,6 +811,10 @@ function Dashboard() {
         tracks={tracksByCamKey}
         onUpdateConfig={handleBevConfigUpdate}
         onToggleOverlay={handleBevOverlayToggle}
+        onCalibrateAll={() => {
+          setCalibrateToast({ text: 'Calibrating…', kind: 'info', ts: Date.now() });
+          sendAutoCalibrate();
+        }}
       />
 
       {telemetryOpen && (
@@ -804,6 +822,27 @@ function Dashboard() {
           onClose={() => setTelemetryOpen(false)}
           cameraStatuses={cameraStatuses}
         />
+      )}
+      {calibrateToast && (
+        <div
+          className={`toast toast--${calibrateToast.kind}`}
+          style={{
+            position: 'fixed',
+            bottom: 20,
+            left: '50%',
+            transform: 'translateX(-50%)',
+            padding: '10px 14px',
+            borderRadius: 8,
+            background: calibrateToast.kind === 'success' ? '#2ecc71' : calibrateToast.kind === 'error' ? '#e74c3c' : '#34495e',
+            color: '#fff',
+            boxShadow: '0 6px 18px rgba(0,0,0,0.25)',
+            zIndex: 9999,
+            minWidth: '220px',
+            textAlign: 'center'
+          }}
+        >
+          {calibrateToast.text}
+        </div>
       )}
     </div>
   );

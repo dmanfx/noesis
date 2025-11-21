@@ -326,6 +326,7 @@ class ApplicationManager:
                     self.websocket_server.pixel_to_world_handler = self._pixel_to_world_rpc
                     self.websocket_server.set_extrinsics_handler = self._set_extrinsics_rpc
                     self.websocket_server.set_align_handler = self._set_align_rpc
+                    self.websocket_server.auto_calibrate_handler = self._auto_calibrate_from_depth
                     # Close MA valves per-sensor once FE heatmap is ready
                     try:
                         self.websocket_server.ma_ready_callback = self._on_ma_heatmap_ready
@@ -1981,6 +1982,39 @@ class ApplicationManager:
         except Exception:
             pass
         return {'ok': True}
+
+    def _auto_calibrate_from_depth(self, camera_id: Optional[str] = None) -> dict:
+        """
+        Trigger auto-calibration using the latest cached depth. For each camera that
+        succeeds, apply the new extrinsics via _set_extrinsics_rpc so the bundle and
+        broadcasts stay consistent.
+        """
+        try:
+            from scripts.auto_calibrate_from_depth import auto_calibrate_from_latest_depth
+        except Exception as exc:
+            return {'ok': False, 'error': f'import_failed: {exc}'}
+
+        cameras = [camera_id] if camera_id else None
+        res = auto_calibrate_from_latest_depth(cameras, persist=False)
+        results = res.get('results') if isinstance(res, dict) else []
+        updated: list = []
+        for entry in results or []:
+            if not isinstance(entry, dict):
+                continue
+            if not entry.get('ok'):
+                continue
+            cam = entry.get('cameraId')
+            e_mat = entry.get('E')
+            if cam and e_mat:
+                out = self._set_extrinsics_rpc({'cameraId': cam, 'E': e_mat})
+                if out.get('ok'):
+                    updated.append(cam)
+        return {
+            'ok': bool(updated),
+            'results': results or [],
+            'updated': updated,
+            'error': res.get('error') if isinstance(res, dict) else None
+        }
 
     def _set_align_rpc(self, req: dict) -> dict:
         try:

@@ -683,7 +683,7 @@ class WebSocketServer:
                             try:
                                 out = await asyncio.wait_for(
                                     asyncio.to_thread(self.auto_calibrate_handler, cam_id if isinstance(cam_id, str) else None),
-                                    timeout=15.0
+                                    timeout=30.0
                                 )
                                 if isinstance(out, dict):
                                     result.update(out)

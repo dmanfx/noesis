@@ -33,6 +33,7 @@ function Dashboard() {
   const [bevImages, setBevImages] = useState<Record<CameraKey, string | null>>({ 'living-room': null, 'kitchen': null, 'family-room': null });
   const bevUrlRef = useRef<Record<CameraKey, string | null>>({ 'living-room': null, 'kitchen': null, 'family-room': null });
   const [bevMeta, setBevMeta] = useState<Record<CameraKey, any>>({ 'living-room': undefined, 'kitchen': undefined, 'family-room': undefined });
+  const bevMetaRef = useRef<Record<CameraKey, any>>({ 'living-room': undefined, 'kitchen': undefined, 'family-room': undefined });
 
   // FPS tracking (exponential over short window)
   const [fps, setFps] = useState<{ [k: string]: string }>({ 'living-room': 'FPS: 0.0', 'kitchen': 'FPS: 0.0', 'family-room': 'FPS: 0.0' });
@@ -239,27 +240,35 @@ function Dashboard() {
     // Track details HTML
     let tracksHtml = '';
     if (allTracks.length) {
+      const findCamForTrack = (track: any): CameraKey | undefined => {
+        const keyFromTrack = detectCameraKey(String(track.camera_id || ''));
+        if (keyFromTrack) return keyFromTrack;
+        return (Object.keys(perKeyTracks) as CameraKey[]).find(k => perKeyTracks[k]?.some(tt => tt.track_id === track.track_id));
+      };
+
+      const metricForTrack = (track: any): { x: number; y: number } | null => {
+        const camKey = findCamForTrack(track);
+        if (!camKey) return null;
+        const meta = bevMetaRef.current[camKey];
+        if (!meta?.footpoints) return null;
+        const fp = (meta.footpoints as any[]).find((p) => Number(p.trackId) === Number(track.track_id));
+        if (!fp) return null;
+        const mx = Number(fp.x);
+        const mz = Number(fp.y);
+        if (!Number.isFinite(mx) || !Number.isFinite(mz)) return null;
+        return { x: mx, y: mz };
+      };
+
       allTracks.sort((a, b) => (Number((a.stable_id ?? a.track_id) || 0)) - (Number((b.stable_id ?? b.track_id) || 0))).forEach(t => {
         const dwell = t.dwell_time?.toFixed(1) ?? '0.0';
         const center = t.center || ['N/A', 'N/A'];
         const vel = t.velocity || [0, 0];
         const speed = Math.sqrt(vel[0] ** 2 + vel[1] ** 2).toFixed(1);
         const dotColor = colorForTrack(Number((t.stable_id ?? t.track_id) || 0));
+        const metric = metricForTrack(t);
 
-        // Look up metric coordinates from BEV meta if available
-        let metricPos = '';
-        const tid = t.track_id; // or stable_id? BEV uses track_id from DS.
-        // Find which camera this track belongs to
-        const camKey = Object.keys(perKeyTracks).find(k => perKeyTracks[k as CameraKey]?.some(tt => tt.track_id === tid)) as CameraKey | undefined;
-
-        if (camKey && bevMeta[camKey]?.footpoints) {
-          const fp = bevMeta[camKey]!.footpoints!.find(p => p.trackId === tid);
-          if (fp) {
-            metricPos = `Metric: [${fp.x.toFixed(2)}m, ${fp.y.toFixed(2)}m]<br/>`;
-          }
-        }
-
-        tracksHtml += `<div><strong><span class="dot" style="display:inline-block;width:10px;height:10px;border-radius:50%;background:${dotColor};margin-right:6px;vertical-align:middle;"></span>SID ${t.stable_id ?? t.track_id ?? 'N/A'}:</strong><br/>Zone: ${t.zone || '-'}, Dwell: <span style="display:inline-block; min-width:4ch; text-align:right;">${dwell}</span>s<br/>${metricPos}Pos: [${(typeof center[0] === 'number' ? Number(center[0]).toFixed(3) : center[0])}, ${(typeof center[1] === 'number' ? Number(center[1]).toFixed(3) : center[1])}], Speed: <span style="display:inline-block; min-width:4ch; text-align:right;">${speed}</span> px/s</div>`;
+        const metricText = metric ? `[${metric.x.toFixed(2)} m, ${metric.y.toFixed(2)} m]` : 'N/A';
+        tracksHtml += `<div><strong><span class="dot" style="display:inline-block;width:10px;height:10px;border-radius:50%;background:${dotColor};margin-right:6px;vertical-align:middle;"></span>SID ${t.stable_id ?? t.track_id ?? 'N/A'}:</strong><br/>Zone: ${t.zone || '-'}, Dwell: <span style="display:inline-block; min-width:4ch; text-align:right;">${dwell}</span>s<br/>Metric (BEV): ${metricText}<br/>Pixel Pos: [${(typeof center[0] === 'number' ? Number(center[0]).toFixed(3) : center[0])}, ${(typeof center[1] === 'number' ? Number(center[1]).toFixed(3) : center[1])}], Speed: <span style="display:inline-block; min-width:4ch; text-align:right;">${speed}</span> px/s</div>`;
       });
     } else {
       tracksHtml = '<span>No active tracks.</span>';
@@ -541,6 +550,7 @@ function Dashboard() {
   const handleBevMeta = useCallback((payload: any) => {
     const cam = detectCameraKey(payload.cameraId || payload.camId);
     if (!cam) return;
+    bevMetaRef.current = { ...bevMetaRef.current, [cam]: payload };
     setBevMeta((prev) => ({ ...prev, [cam]: payload }));
   }, []);
 

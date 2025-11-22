@@ -123,15 +123,21 @@ class DeepStreamVideoPipeline:
         self.source_idx_by_sensor_id = {sid: sid for sid in self.sensor_ids}
         self.sensor_id_by_source_idx = {idx: idx for idx in self.sensor_ids}
         self.source_info = {}
+        self._source_name_by_sensor: Dict[int, str] = {}
         for idx, uri in enumerate(self._uris):
             name = f"Camera {idx + 1}"
+            clean_name = self._clean_camera_name(name)
             self.source_info[idx] = {
                 "name": name,
-                "clean_name": self._clean_camera_name(name),
+                "clean_name": clean_name,
                 "url": uri,
                 "width": width,
                 "height": height,
             }
+            if clean_name:
+                self._source_name_by_sensor[idx] = clean_name
+            else:
+                self._source_name_by_sensor[idx] = name
 
         self.logger.info("🎥 Initializing multi-stream pipeline with %d sources from %s", len(self.sensor_ids), self.ds_multiurisrc_cfg_resolved)
         for sid, info in self.source_info.items():
@@ -252,6 +258,9 @@ class DeepStreamVideoPipeline:
         self.bbox_smoothing_alpha: float = float(getattr(self.config.visualization, 'BBOX_SMOOTHING_ALPHA', 0.3))
         self.bbox_smoothing_anchor: str = str(getattr(self.config.visualization, 'BBOX_SMOOTHING_ANCHOR', 'bottom')).lower()
         self.bbox_smoothing_max_growth: float = float(getattr(self.config.visualization, 'BBOX_SMOOTHING_MAX_GROWTH', 1.2))
+
+        # Last known good BEV footpoint per sensor/track (for robustness against bad bboxes)
+        self._last_good_footpoint_by_sensor: Dict[int, Dict[int, Dict[str, float]]] = defaultdict(dict)
         self.bbox_smoothing_max_shrink: float = float(getattr(self.config.visualization, 'BBOX_SMOOTHING_MAX_SHRINK', 0.85))
         self.bbox_max_drop_window_s: float = float(getattr(self.config.visualization, 'BBOX_MAX_DROP_WINDOW_S', 4.0))
         self.bbox_max_drop_ratio: float = float(getattr(self.config.visualization, 'BBOX_MAX_DROP_RATIO', 0.85))
@@ -979,6 +988,28 @@ class DeepStreamVideoPipeline:
             frame_meta = frames[0] if frames else None
             if frame_meta is None:
                 return Gst.FlowReturn.OK
+            cam_info = self.source_info.get(sensor_id, {}) if isinstance(self.source_info, dict) else {}
+            camera_name = cam_info.get('clean_name') or cam_info.get('name')
+            if camera_name:
+                try:
+                    self._source_name_by_sensor[int(sensor_id)] = camera_name
+                except Exception:
+                    pass
+            try:
+                frame_source_idx = int(getattr(frame_meta, "source_id", sensor_id) or sensor_id)
+            except Exception:
+                frame_source_idx = sensor_id
+            source_name = self._source_name_by_sensor.get(frame_source_idx, camera_name)
+            if source_name == "kitchen":
+                source_frame_width = int(getattr(frame_meta, "source_frame_width", -1) or -1)
+                source_frame_height = int(getattr(frame_meta, "source_frame_height", -1) or -1)
+                self.logger.warning(
+                    "[FP kitchen] new_frame: source_frame=%dx%d sample=%dx%d",
+                    source_frame_width,
+                    source_frame_height,
+                    width,
+                    height,
+                )
             frame_num = int(getattr(frame_meta, "frame_num", -1) or -1)
             ntp_ts = int(getattr(frame_meta, "ntp_timestamp", 0) or 0)
             footpoints: List[Dict[str, Any]] = []
@@ -988,9 +1019,49 @@ class DeepStreamVideoPipeline:
                 class_id = meta_ops.get_class_id(operator, obj_meta)
                 if class_id not in (0, 1):  # prioritize person class (0) but allow overrides
                     continue
-                fp = self._footpoint_from_object(operator, obj_meta, frame_width, frame_height)
+
+                obj_id = meta_ops.get_object_id(operator, obj_meta)
+                fp = self._footpoint_from_object(
+                    operator,
+                    obj_meta,
+                    frame_width,
+                    frame_height,
+                    frame_meta=frame_meta,
+                    source_name=source_name,
+                )
                 if fp:
+                    track_id = fp.get('track_id', obj_id)
+                    try:
+                        track_key = int(track_id) if track_id is not None else int(obj_id)
+                    except Exception:
+                        track_key = int(obj_id)
+                    try:
+                        self._last_good_footpoint_by_sensor[sensor_id][track_key] = {
+                            'u': float(fp.get('u', 0.0)),
+                            'v': float(fp.get('v', 0.0)),
+                            'track_id': track_key,
+                            'method': str(fp.get('method', 'bbox')),
+                        }
+                    except Exception:
+                        pass
                     footpoints.append(fp)
+                else:
+                    # Reuse last known good footpoint for this track if available
+                    last_fp = None
+                    try:
+                        last_fp = self._last_good_footpoint_by_sensor.get(sensor_id, {}).get(int(obj_id))
+                    except Exception:
+                        last_fp = None
+                    if last_fp is not None:
+                        if source_name == "kitchen":
+                            try:
+                                self.logger.warning(
+                                    "[FP kitchen] reusing last-good footpoint for track=%s", obj_id
+                                )
+                            except Exception:
+                                pass
+                        # Append a shallow copy so callers can mutate safely
+                        footpoints.append(dict(last_fp))
 
             entry = {
                 'frame': frame_copy,
@@ -1028,7 +1099,15 @@ class DeepStreamVideoPipeline:
                 pass
         return Gst.FlowReturn.OK
 
-    def _footpoint_from_object(self, operator: Optional[Any], obj_meta: Any, frame_width: float, frame_height: float) -> Optional[Dict[str, Any]]:
+    def _footpoint_from_object(
+        self,
+        operator: Optional[Any],
+        obj_meta: Any,
+        frame_width: float,
+        frame_height: float,
+        frame_meta: Optional[Any] = None,
+        source_name: Optional[str] = None,
+    ) -> Optional[Dict[str, Any]]:
         rect = meta_ops.get_rect_params(operator, obj_meta)
         if rect is None:
             return None
@@ -1038,26 +1117,94 @@ class DeepStreamVideoPipeline:
         height = float(getattr(rect, "height", 0.0))
         obj_id = meta_ops.get_object_id(operator, obj_meta)
 
+        # === DEBUG: Kitchen-only bbox diagnostics ===
+        if source_name == "kitchen":
+            bottom_raw = top + height
+
+            self.logger.warning(
+                "[FP kitchen] frame_size: sample=%dx%d source=%dx%d",
+                frame_width,
+                frame_height,
+                getattr(frame_meta, "source_frame_width", -1) if frame_meta else -1,
+                getattr(frame_meta, "source_frame_height", -1) if frame_meta else -1,
+            )
+
+            self.logger.warning(
+                "[FP kitchen] rect raw: top=%.1f height=%.1f bottom_raw=%.1f frame_h=%.1f",
+                top,
+                height,
+                bottom_raw,
+                frame_height,
+            )
+
+            rp = getattr(obj_meta, "rect_params", None)
+            det_info = getattr(obj_meta, "detector_bbox_info", None)
+            det = getattr(det_info, "org_bbox_coords", None)
+            trk_info = getattr(obj_meta, "tracker_bbox_info", None)
+            trk = getattr(trk_info, "org_bbox_coords", None)
+
+            self.logger.warning(
+                "[FP kitchen] rects: rp=(top=%.1f,h=%.1f) det=(top=%.1f,h=%.1f) trk=(top=%.1f,h=%.1f)",
+                getattr(rp, "top", -1.0),
+                getattr(rp, "height", -1.0),
+                getattr(det, "top", -1.0),
+                getattr(det, "height", -1.0),
+                getattr(trk, "top", -1.0),
+                getattr(trk, "height", -1.0),
+            )
+        # === END DEBUG ===
+
+        log_kitchen = source_name == "kitchen"
         mask = self._extract_mask_array(obj_meta)
         method = "bbox"
+
+        # Compute candidate footpoint in image space (before validation)
         if mask is not None:
+            if log_kitchen:
+                try:
+                    mask_pixel_count = int(np.count_nonzero(mask))
+                except Exception:
+                    mask_pixel_count = 0
+                self.logger.warning("[FP kitchen] have-mask size=%d", mask_pixel_count)
             mask_fp = self._footpoint_from_mask_pixels(mask)
             if mask_fp is not None:
                 mx, my, method = mask_fp
                 if mask.shape[1] > 0 and mask.shape[0] > 0:
-                    u = left + (mx / float(mask.shape[1])) * width
-                    v = top + (my / float(mask.shape[0])) * height
+                    u_candidate = left + (mx / float(mask.shape[1])) * width
+                    v_candidate = top + (my / float(mask.shape[0])) * height
                 else:
-                    u = left + width * 0.5
-                    v = top + height
+                    u_candidate = left + width * 0.5
+                    v_candidate = top + height
             else:
-                u = left + width * 0.5
-                v = top + height
+                u_candidate = left + width * 0.5
+                v_candidate = top + height
         else:
-            u = left + width * 0.5
-            v = top + height
-        u = float(np.clip(u, 0.0, frame_width))
-        v = float(np.clip(v, 0.0, frame_height))
+            if log_kitchen:
+                self.logger.warning("[FP kitchen] no-mask fallback")
+            u_candidate = left + width * 0.5
+            v_candidate = top + height
+
+        # Always clamp horizontally into the frame
+        u = float(np.clip(u_candidate, 0.0, frame_width))
+
+        # For vertical coordinate, treat out-of-range bottoms as invalid instead of clamping
+        if v_candidate < 0.0 or v_candidate > frame_height:
+            if log_kitchen:
+                try:
+                    self.logger.warning(
+                        "[FP kitchen] dropping out-of-range bottom_raw=%.1f frame_h=%.1f (obj_id=%s)",
+                        v_candidate,
+                        frame_height,
+                        obj_id,
+                    )
+                except Exception:
+                    pass
+            return None
+
+        v = float(v_candidate)
+
+        if log_kitchen:
+            self.logger.warning("[FP kitchen] using method=%s v=%d", method, int(round(v)))
         return {'u': u, 'v': v, 'track_id': obj_id, 'method': method}
 
     @staticmethod
@@ -2857,7 +3004,7 @@ class DeepStreamVideoPipeline:
                 now = time.time()
                 if now - probe_state["last_log"] >= 1.0:
                     delta = probe_state["count"] - probe_state["last_logged_count"]
-                    self.logger.info(f"flow[{label}]: {delta} buffers in {now - probe_state['last_log']:.1f}s")
+                    self.logger.debug(f"flow[{label}]: {delta} buffers in {now - probe_state['last_log']:.1f}s")
                     probe_state["last_logged_count"] = probe_state["count"]
                     probe_state["last_log"] = now
                 return Gst.PadProbeReturn.OK

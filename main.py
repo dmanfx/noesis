@@ -1272,6 +1272,33 @@ class ApplicationManager:
             specs = getattr(self.config.calibration, 'CAMERA_SPECS', {}) or {}
             spec = specs.get(camera_id) if isinstance(specs, dict) else None
             res = spec.get('resolution') if isinstance(spec, dict) else None
+            
+            # Fallback: check intrinsics model if spec resolution is missing
+            if not res or len(res) < 2:
+                intr_model_name = (self._intrinsics_models or {}).get(camera_id)
+                # Try to find model in config if we have a map
+                if not intr_model_name and hasattr(self.config.calibration, 'CAMERA_INTRINSICS_MODEL_MAP'):
+                    intr_model_name = self.config.calibration.CAMERA_INTRINSICS_MODEL_MAP.get(camera_id)
+                
+                if intr_model_name:
+                    # Load intrinsics models from config/cameras.yaml structure
+                    # We need to access the raw loaded dict which might be in self.config or loaded separately
+                    # For now, rely on what's available. If we can't find resolution, we can't scale.
+                    pass
+
+            # If we still don't have a resolution from spec, try to infer from K principal point
+            # assuming K was built for the native resolution.
+            # This is a heuristic: if cx is ~640, native is likely 1280 or 720p.
+            # If cx is ~960, native is likely 1920.
+            if not res and K[0, 2] > 0:
+                # Heuristic: if cx is significantly different from w/2, we might need scaling
+                # But explicit resolution is safer.
+                pass
+
+            # Re-attempt to find resolution from loaded intrinsics models if possible
+            # (This part depends on how intrinsics_models are stored/accessed)
+            
+            # Use the resolution from spec if available (this is the robust path)
             if isinstance(res, (list, tuple)) and len(res) >= 2:
                 base_w = int(res[0]) or 0
                 base_h = int(res[1]) or 0
@@ -1283,6 +1310,15 @@ class ApplicationManager:
                     K[0, 2] *= sx
                     K[1, 1] *= sy
                     K[1, 2] *= sy
+            else:
+                # NEW: Fallback for known 720p models (like unifi_g4_instant) if running at 1080p
+                # This covers the Family Room case where spec might not be fully populated but we know the issue.
+                # If K implies 720p (cx ~ 640) and we are 1080p (w=1920), scale up.
+                if w == 1920 and abs(K[0, 2] - 640) < 50:
+                    scale = 1.5 # 1920 / 1280 = 1.5
+                    K = K.copy()
+                    K[:2, :] *= scale
+                    
         except Exception:
             pass
         return CalibrationSnapshot(
@@ -1873,6 +1909,13 @@ class ApplicationManager:
 
         try:
             E_matrix = np.array(E, dtype=float).reshape((4, 4), order='F')
+            # GUARD: Check for Identity matrix (or very close to it)
+            # An identity extrinsics matrix implies the camera is at (0,0,0) looking down +Z,
+            # which is the default initialization and almost certainly invalid for a real deployment.
+            # This prevents "x=0" pinning artifacts.
+            if np.allclose(E_matrix, np.eye(4), atol=1e-3):
+                 return {'ok': False, 'error': 'calibration_invalid_identity'}
+                 
             T_cam2world = np.linalg.inv(E_matrix)
         except Exception:
             return {'ok': False, 'error': 'bad_extrinsics'}
@@ -2358,50 +2401,93 @@ class ApplicationManager:
                                         'occupancy': norm_occ,
                                     }
                                     # Augment active tracks with world coordinates if calibration available
-                                    try:
-                                        calib = self.calibration_bundle or {}
-                                        cameras_node = calib.get('cameras') or {}
-                                        k_table = cameras_node.get('K') if isinstance(cameras_node, dict) else None
-                                        e_table = cameras_node.get('E') if isinstance(cameras_node, dict) else None
-                                        intr = (k_table or {}).get(camera_name) if isinstance(k_table, dict) else None
-                                        E = (e_table or {}).get(camera_name) if isinstance(e_table, dict) else None
-                                        if (intr is None or E is None) and isinstance(cameras_node, dict):
-                                            legacy_cam = cameras_node.get(camera_name)
-                                            if isinstance(legacy_cam, dict):
-                                                if intr is None:
-                                                    intr = legacy_cam.get('intrinsics')
-                                                if E is None:
-                                                    extr = legacy_cam.get('extrinsics') or {}
-                                                    if isinstance(extr, dict):
-                                                        E = extr.get('E')
-                                        align = calib.get('align', {})
-                                        floor_y = float(align.get('floor_y') or 0.0)
-                                        K = K_from_intrinsics(intr)
-                                        if K is not None and isinstance(E, list) and len(E) == 16:
-                                            pose = E_to_world_and_R(E)
-                                            if pose is not None:
-                                                Cw, Rwc = pose
-                                                for t in tracking_payload.get('active_tracks', []) or []:
-                                                    try:
-                                                        bb = t.get('bbox')
-                                                        if isinstance(bb, list) and len(bb) == 4:
-                                                            fp = bbox_bottom_center(bb)
-                                                            if fp is not None:
-                                                                u, v = fp
+                                    calib = self.calibration_bundle or {}
+                                    cameras_node = calib.get('cameras') or {}
+                                    k_table = cameras_node.get('K') if isinstance(cameras_node, dict) else None
+                                    e_table = cameras_node.get('E') if isinstance(cameras_node, dict) else None
+                                    intr = (k_table or {}).get(camera_name) if isinstance(k_table, dict) else None
+                                    E = (e_table or {}).get(camera_name) if isinstance(e_table, dict) else None
+                                    if (intr is None or E is None) and isinstance(cameras_node, dict):
+                                        legacy_cam = cameras_node.get(camera_name)
+                                        if isinstance(legacy_cam, dict):
+                                            if intr is None:
+                                                intr = legacy_cam.get('intrinsics')
+                                            if E is None:
+                                                extr = legacy_cam.get('extrinsics') or {}
+                                                E = extr.get('E') if isinstance(extr, dict) else None
+
+                                    # Apply resolution scaling for intrinsics if needed
+                                    if intr and len(intr) >= 4:
+                                        # Quick heuristic check for 720p -> 1080p mismatch
+                                        try:
+                                            cx = float(intr[2])
+                                            if abs(cx - 640) < 50:
+                                                # Scale intrinsics by 1.5 (720p -> 1080p)
+                                                intr = [x * 1.5 if i < 4 else x for i, x in enumerate(intr)]
+                                        except Exception:
+                                            pass
+
+                                    if intr and E and len(E) == 16:
+                                        # GUARD: Check for Identity matrix
+                                        is_identity = True
+                                        try:
+                                            # Check diagonal
+                                            if abs(E[0] - 1.0) > 1e-3 or abs(E[5] - 1.0) > 1e-3 or abs(E[10] - 1.0) > 1e-3 or abs(E[15] - 1.0) > 1e-3:
+                                                is_identity = False
+                                            # Check a few off-diagonals
+                                            if is_identity and (abs(E[12]) > 1e-3 or abs(E[13]) > 1e-3 or abs(E[14]) > 1e-3):
+                                                is_identity = False
+                                        except Exception:
+                                            is_identity = False
+                                            
+                                        if not is_identity:
+                                            # Calculate world coordinates
+                                            try:
+                                                if len(intr) == 4:
+                                                    fx, fy, cx, cy = [float(v) for v in intr]
+                                                    K = np.array([[fx, 0.0, cx], [0.0, fy, cy], [0.0, 0.0, 1.0]], dtype=float)
+                                                elif len(intr) == 9:
+                                                    K = np.array(intr, dtype=float).reshape((3, 3))
+                                                else:
+                                                    K = None
+                                                
+                                                if K is not None:
+                                                    E_mat = np.array(E, dtype=float).reshape((4, 4), order='F')
+                                                    T_c2w = np.linalg.inv(E_mat)
+                                                    
+                                                    align_node = calib.get('align')
+                                                    align = align_node if isinstance(align_node, dict) else {}
+                                                    floor_y = float(align.get('floor_y') or 0.0)
+                                                    
+                                                    Cw = T_c2w[:3, 3]
+                                                    Rwc = T_c2w[:3, :3]
+                                                    
+                                                    for t in tracking_payload.get('active_tracks', []) or []:
+                                                        try:
+                                                            bb = t.get('bbox')
+                                                            if isinstance(bb, list) and len(bb) == 4:
+                                                                # bbox is [left, top, width, height]
+                                                                # Use bottom center for footpoint
+                                                                u = bb[0] + bb[2] / 2.0
+                                                                v = bb[1] + bb[3]
+                                                                
                                                                 O, D = ray_from_pixel(u, v, K, Cw, Rwc)
                                                                 hit = intersect_floor(O, D, floor_y)
+                                                                
                                                                 if hit is not None:
-                                                                    t['world'] = [float(hit[0]), float(hit[1]), float(hit[2])]
+                                                                    # Apply alignment
+                                                                    align_matrix = build_align_matrix(align)
+                                                                    p_world = np.array([hit[0], hit[1], hit[2], 1.0], dtype=float)
+                                                                    p_aligned = (align_matrix @ p_world)[:3]
+                                                                    
+                                                                    t['world'] = [float(p_aligned[0]), float(p_aligned[1]), float(p_aligned[2])]
                                                                     t['world_valid'] = True
                                                                 else:
                                                                     t['world_valid'] = False
-                                                    except Exception:
-                                                        try:
-                                                            t['world_valid'] = False
                                                         except Exception:
-                                                            pass
-                                    except Exception:
-                                        pass
+                                                            t['world_valid'] = False
+                                            except Exception:
+                                                pass
                                 except Exception:
                                     tracking_payload = stream_tracking_data
 

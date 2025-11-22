@@ -238,6 +238,19 @@ class BevRenderer:
             lx = dx * cos_yaw - dz * sin_yaw
             lz = dx * sin_yaw + dz * cos_yaw
 
+            if camera_id == "kitchen":
+                logger.warning(
+                    "[BEV kitchen] fp track=%s method=%s pixel=(%.1f, %.1f) world=(%.2f, %.2f) local=(%.2f, %.2f)",
+                    fp.track_id,
+                    fp.method,
+                    fp.u,
+                    fp.v,
+                    wx,
+                    wz,
+                    lx,
+                    lz,
+                )
+
             # The frontend expects 'x' and 'y' in the JSON list.
             # We map Local X -> JSON x, Local Z -> JSON y
             bev_points.append({'x': lx, 'y': lz, 'method': fp.method, 'trackId': fp.track_id})
@@ -301,6 +314,17 @@ class BevRenderer:
                     sample_xz = (float(hit[0]), float(hit[2]))
             except Exception:
                 sample_xz = None
+            if sample_xz is not None and result.camera_id == "kitchen":
+                dx = sample_xz[0] - float(C_world[0])
+                dz = sample_xz[1] - float(C_world[2])
+                dist = math.hypot(dx, dz)
+                logger.warning(
+                    "[BEV %s] bottom-center floor hit: xz=(%.2f, %.2f) dist=%.2f m",
+                    result.camera_id,
+                    sample_xz[0],
+                    sample_xz[1],
+                    dist,
+                )
             status = {
                 "type": "bev-frame",
                 "cameraId": result.camera_id,

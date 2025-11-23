@@ -191,10 +191,13 @@ def assemble_calibration_bundle(
     k_table: Dict[str, list] = {}
     e_table: Dict[str, list] = {}
     for cam_id in camera_ids:
-        spec = (camera_specs or {}).get(cam_id) if isinstance(camera_specs, dict) else None
-        k_tuple = _derive_k_from_specs(spec or {}) if spec else None
+        # Prefer canonical intrinsics.json models, using CAMERA_INTRINSICS_MODEL_MAP,
+        # and fall back to CAMERA_SPECS FOV-only derivation when needed.
+        k_tuple = _derive_k_from_intrinsics_model(model_map.get(cam_id), intrinsics_models or {})
         if k_tuple is None:
-            k_tuple = _derive_k_from_intrinsics_model(model_map.get(cam_id), intrinsics_models or {})
+            spec = (camera_specs or {}).get(cam_id) if isinstance(camera_specs, dict) else None
+            if spec:
+                k_tuple = _derive_k_from_specs(spec or {})
         if k_tuple is not None:
             fx, fy, cx, cy = k_tuple
             k_table[cam_id] = [fx, fy, cx, cy]

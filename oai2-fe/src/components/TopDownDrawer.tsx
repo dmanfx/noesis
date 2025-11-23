@@ -122,14 +122,6 @@ const BevPanel: React.FC<{
         }
       }
 
-      // Debug logging (throttled)
-      if (Math.random() < 0.01) {
-        console.log(`[BevPanel ${cam}] Bounds: [${xMin}, ${xMax}]x[${zMin}, ${zMax}], Canvas: ${width}x${height}`);
-        if (meta?.footpoints && meta.footpoints.length > 0) {
-          console.log(`[BevPanel ${cam}] Footpoint:`, meta.footpoints[0]);
-        }
-      }
-
       const drawX = (mx: number) => ((mx - xMin) / (xMax - xMin)) * width;
       // Flip X so left side of the image maps to left on canvas (previously mirrored)
       const drawXFlipped = (mx: number) => width - ((mx - xMin) / (xMax - xMin)) * width;

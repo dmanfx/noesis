@@ -111,6 +111,45 @@
 .telemetry-header { padding: 10px 12px; border-bottom: 1px solid var(--border); display: flex; align-items: center; gap: 10px; }
 .telemetry-body { padding: 10px 12px; max-height: 55vh; overflow: auto; }
 .telemetry-item { display: grid; grid-template-columns: 100px 1fr max-content; gap: 8px; font-size: 12px; padding: 6px 0; border-bottom: 1px dashed rgba(255,255,255,0.06); }
+.telemetry-section {
+  margin-bottom: 10px;
+  padding-bottom: 6px;
+  border-bottom: 1px dashed rgba(255, 255, 255, 0.08);
+}
+.telemetry-section-title {
+  font-size: 12px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--muted);
+  margin-bottom: 4px;
+}
+.telemetry-subsection {
+  margin-bottom: 6px;
+}
+.telemetry-subsection-title {
+  font-size: 11px;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--muted);
+  margin-bottom: 2px;
+}
+.telemetry-subsection-body {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.telemetry-data-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  font-size: 12px;
+  padding: 3px 0;
+  color: var(--text);
+  border-bottom: 1px dotted rgba(255, 255, 255, 0.08);
+}
+.telemetry-data-row:last-child {
+  border-bottom: none;
+}
 .camera-status-row { display: flex; justify-content: space-between; gap: 12px; margin-bottom: 12px; }
 .camera-status-card { flex: 1 1 0%; background: rgba(17, 24, 33, 0.8); border: 1px solid rgba(255, 255, 255, 0.06); border-radius: 10px; padding: 8px 6px; text-align: center; }
 .camera-status-label { font-size: 11px; color: var(--muted); margin-bottom: 4px; text-transform: uppercase; letter-spacing: 0.04em; }

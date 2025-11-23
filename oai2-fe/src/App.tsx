@@ -19,6 +19,15 @@ const wsPort = Number(import.meta.env.VITE_WS_PORT || 6008);
 const wsProto = window.location.protocol === 'https:' ? 'wss' : 'ws';
 const WS_URL = import.meta.env.VITE_WS_URL || `${wsProto}://${wsHost}:${wsPort}`;
 
+type CameraPoseSummary = {
+  x: number;
+  y: number;
+  z: number;
+  heightAboveFloor?: number | null;
+  forwardFx?: number | null;
+  forwardFz?: number | null;
+};
+
 const labelForCameraId = (camId: string): string => {
   const key = detectCameraKey(camId);
   if (key) return cameraLabel(key);
@@ -94,6 +103,11 @@ function Dashboard() {
     'living-room': 'unknown',
     'kitchen': 'unknown',
     'family-room': 'unknown'
+  });
+  const [cameraPoses, setCameraPoses] = useState<Record<CameraKey, CameraPoseSummary | null>>({
+    'living-room': null,
+    'kitchen': null,
+    'family-room': null
   });
   const [availableCameras, setAvailableCameras] = useState<string[]>([]);
   const [expandedCamera, setExpandedCamera] = useState<CameraKey | null>(null);
@@ -337,6 +351,12 @@ function Dashboard() {
       publishNumeric('MapAnything Align', 'Units (s_obj_to_m)', scaleRaw, 5);
     }
 
+    const poseByCam: Record<CameraKey, CameraPoseSummary | null> = {
+      'living-room': null,
+      'kitchen': null,
+      'family-room': null
+    };
+
     cameraOrder.forEach((camKey) => {
       const label = cameraLabel(camKey);
       const intr = getIntrinsics4(camKey);
@@ -356,24 +376,51 @@ function Dashboard() {
 
       const E = getExtrinsics(camKey);
       if (E && Array.isArray(E) && E.length === 16) {
+        let poseSummary: CameraPoseSummary | null = null;
         const pose = extractPoseFromExtrinsics(E);
         if (pose) {
           const [px, py, pz] = pose.Cw;
           publishNumeric('MapAnything Pose', `${label} Position X (m)`, px, 2);
           publishNumeric('MapAnything Pose', `${label} Position Y (m)`, py, 2);
           publishNumeric('MapAnything Pose', `${label} Position Z (m)`, pz, 2);
+          let heightAboveFloor: number | null = null;
           if (floorYRaw !== null && Number.isFinite(floorYRaw)) {
-            publishNumeric('MapAnything Pose', `${label} Height Above Floor (m)`, py - floorYRaw, 2);
+            const h = py - floorYRaw;
+            publishNumeric('MapAnything Pose', `${label} Height Above Floor (m)`, h, 2);
+            heightAboveFloor = h;
           }
+          poseSummary = {
+            x: px,
+            y: py,
+            z: pz,
+            heightAboveFloor,
+            forwardFx: null,
+            forwardFz: null
+          };
         }
         const forward = forwardXZFromExtrinsics(E);
         if (forward) {
           publishNumeric('MapAnything Pose', `${label} Forward X`, forward.fx, 3);
           publishNumeric('MapAnything Pose', `${label} Forward Z`, forward.fz, 3);
+          if (poseSummary) {
+            poseSummary.forwardFx = forward.fx;
+            poseSummary.forwardFz = forward.fz;
+          } else {
+            poseSummary = {
+              x: NaN,
+              y: NaN,
+              z: NaN,
+              heightAboveFloor: null,
+              forwardFx: forward.fx,
+              forwardFz: forward.fz
+            };
+          }
         }
+        poseByCam[camKey] = poseSummary;
       }
     });
-  }, [lastCalibrationSignatureRef, publish]);
+    setCameraPoses(poseByCam);
+  }, [lastCalibrationSignatureRef, publish, setCameraPoses]);
 
   const handleMADiagnostics = (payload: any) => {
     const camId = payload?.cam_id || payload?.cameraId;
@@ -831,6 +878,7 @@ function Dashboard() {
         <TelemetryPanel
           onClose={() => setTelemetryOpen(false)}
           cameraStatuses={cameraStatuses}
+          cameraPoses={cameraPoses}
         />
       )}
       {calibrateToast && (

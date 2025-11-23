@@ -466,6 +466,10 @@ class DeepStreamVideoPipeline:
         return uris
 
     def _post_remove_excluded_objects_probe(self, pad, info, udata):
+        # Early return if pipeline is shutting down to prevent race conditions
+        if not self.running:
+            return Gst.PadProbeReturn.OK
+        
         gst_buffer = info.get_buffer()
         if not gst_buffer:
             return Gst.PadProbeReturn.OK
@@ -900,6 +904,10 @@ class DeepStreamVideoPipeline:
         self._ma_safety_close_scheduled = False
 
     def _on_new_ma_frame(self, appsink: GstApp.AppSink, sensor_id: int) -> Gst.FlowReturn:
+        # Early return if pipeline is shutting down to prevent race conditions
+        if not self.running:
+            return Gst.FlowReturn.OK
+        
         try:
             sample = appsink.emit("pull-sample")
             if not sample:
@@ -950,6 +958,11 @@ class DeepStreamVideoPipeline:
         return Gst.FlowReturn.OK
 
     def _on_new_bev_frame(self, appsink: GstApp.AppSink, sensor_id: int) -> Gst.FlowReturn:
+        # Early return if pipeline is shutting down to prevent race conditions
+        # with pyds callback unregistration
+        if not self.running:
+            return Gst.FlowReturn.OK
+        
         sample = None
         buf = None
         map_info = None
@@ -1000,21 +1013,16 @@ class DeepStreamVideoPipeline:
             except Exception:
                 frame_source_idx = sensor_id
             source_name = self._source_name_by_sensor.get(frame_source_idx, camera_name)
-            if source_name == "kitchen":
-                source_frame_width = int(getattr(frame_meta, "source_frame_width", -1) or -1)
-                source_frame_height = int(getattr(frame_meta, "source_frame_height", -1) or -1)
-                self.logger.warning(
-                    "[FP kitchen] new_frame: source_frame=%dx%d sample=%dx%d",
-                    source_frame_width,
-                    source_frame_height,
-                    width,
-                    height,
-                )
             frame_num = int(getattr(frame_meta, "frame_num", -1) or -1)
             ntp_ts = int(getattr(frame_meta, "ntp_timestamp", 0) or 0)
             footpoints: List[Dict[str, Any]] = []
-            frame_width = float(getattr(frame_meta, "source_frame_width", width) or width)
-            frame_height = float(getattr(frame_meta, "source_frame_height", height) or height)
+            # For BEV footpoint computation, operate in the post-mux sample space
+            # (caps width/height), not the original source resolution. Using
+            # source_frame_* here can cause out-of-range checks to incorrectly
+            # reject valid bboxes for cameras that were upscaled by nvstreammux
+            # (e.g., family-room 720p → 1080p).
+            frame_width = float(width)
+            frame_height = float(height)
             for obj_meta in meta_ops.iter_objects(operator, frame_meta):
                 class_id = meta_ops.get_class_id(operator, obj_meta)
                 if class_id not in (0, 1):  # prioritize person class (0) but allow overrides
@@ -1053,10 +1061,10 @@ class DeepStreamVideoPipeline:
                     except Exception:
                         last_fp = None
                     if last_fp is not None:
-                        if source_name == "kitchen":
+                        if source_name == "family-room":
                             try:
                                 self.logger.warning(
-                                    "[FP kitchen] reusing last-good footpoint for track=%s", obj_id
+                                    "[FP family-room] reusing last-good footpoint for track=%s", obj_id
                                 )
                             except Exception:
                                 pass
@@ -1108,64 +1116,30 @@ class DeepStreamVideoPipeline:
         frame_meta: Optional[Any] = None,
         source_name: Optional[str] = None,
     ) -> Optional[Dict[str, Any]]:
-        rect = meta_ops.get_rect_params(operator, obj_meta)
-        if rect is None:
+        rect_params = meta_ops.get_rect_params(operator, obj_meta)
+        if rect_params is None:
             return None
-        left = float(getattr(rect, "left", 0.0))
-        top = float(getattr(rect, "top", 0.0))
-        width = float(getattr(rect, "width", 0.0))
-        height = float(getattr(rect, "height", 0.0))
+
+        det_info = getattr(obj_meta, "detector_bbox_info", None)
+        det = getattr(det_info, "org_bbox_coords", None) if det_info is not None else None
+
+        if det and (getattr(det, "width", 0.0) > 0 and getattr(det, "height", 0.0) > 0):
+            top = float(getattr(det, "top", 0.0))
+            left = float(getattr(det, "left", 0.0))
+            width = float(getattr(det, "width", 0.0))
+            height = float(getattr(det, "height", 0.0))
+        else:
+            top = float(getattr(rect_params, "top", 0.0))
+            left = float(getattr(rect_params, "left", 0.0))
+            width = float(getattr(rect_params, "width", 0.0))
+            height = float(getattr(rect_params, "height", 0.0))
         obj_id = meta_ops.get_object_id(operator, obj_meta)
 
-        # === DEBUG: Kitchen-only bbox diagnostics ===
-        if source_name == "kitchen":
-            bottom_raw = top + height
-
-            self.logger.warning(
-                "[FP kitchen] frame_size: sample=%dx%d source=%dx%d",
-                frame_width,
-                frame_height,
-                getattr(frame_meta, "source_frame_width", -1) if frame_meta else -1,
-                getattr(frame_meta, "source_frame_height", -1) if frame_meta else -1,
-            )
-
-            self.logger.warning(
-                "[FP kitchen] rect raw: top=%.1f height=%.1f bottom_raw=%.1f frame_h=%.1f",
-                top,
-                height,
-                bottom_raw,
-                frame_height,
-            )
-
-            rp = getattr(obj_meta, "rect_params", None)
-            det_info = getattr(obj_meta, "detector_bbox_info", None)
-            det = getattr(det_info, "org_bbox_coords", None)
-            trk_info = getattr(obj_meta, "tracker_bbox_info", None)
-            trk = getattr(trk_info, "org_bbox_coords", None)
-
-            self.logger.warning(
-                "[FP kitchen] rects: rp=(top=%.1f,h=%.1f) det=(top=%.1f,h=%.1f) trk=(top=%.1f,h=%.1f)",
-                getattr(rp, "top", -1.0),
-                getattr(rp, "height", -1.0),
-                getattr(det, "top", -1.0),
-                getattr(det, "height", -1.0),
-                getattr(trk, "top", -1.0),
-                getattr(trk, "height", -1.0),
-            )
-        # === END DEBUG ===
-
-        log_kitchen = source_name == "kitchen"
         mask = self._extract_mask_array(obj_meta)
         method = "bbox"
 
         # Compute candidate footpoint in image space (before validation)
         if mask is not None:
-            if log_kitchen:
-                try:
-                    mask_pixel_count = int(np.count_nonzero(mask))
-                except Exception:
-                    mask_pixel_count = 0
-                self.logger.warning("[FP kitchen] have-mask size=%d", mask_pixel_count)
             mask_fp = self._footpoint_from_mask_pixels(mask)
             if mask_fp is not None:
                 mx, my, method = mask_fp
@@ -1179,32 +1153,23 @@ class DeepStreamVideoPipeline:
                 u_candidate = left + width * 0.5
                 v_candidate = top + height
         else:
-            if log_kitchen:
-                self.logger.warning("[FP kitchen] no-mask fallback")
             u_candidate = left + width * 0.5
-            v_candidate = top + height
+            bottom_raw = top + height
+            if 0 <= bottom_raw <= frame_height:
+                v_candidate = bottom_raw
+            else:
+                return None
 
         # Always clamp horizontally into the frame
         u = float(np.clip(u_candidate, 0.0, frame_width))
 
-        # For vertical coordinate, treat out-of-range bottoms as invalid instead of clamping
-        if v_candidate < 0.0 or v_candidate > frame_height:
-            if log_kitchen:
-                try:
-                    self.logger.warning(
-                        "[FP kitchen] dropping out-of-range bottom_raw=%.1f frame_h=%.1f (obj_id=%s)",
-                        v_candidate,
-                        frame_height,
-                        obj_id,
-                    )
-                except Exception:
-                    pass
+        # For vertical coordinate, clamp modest out-of-range bottoms into the frame,
+        # and only treat extreme values as invalid to avoid stale-footpoint reuse.
+        margin = max(2.0, 0.01 * float(frame_height))
+        if v_candidate < -margin or v_candidate > (frame_height + margin):
             return None
 
-        v = float(v_candidate)
-
-        if log_kitchen:
-            self.logger.warning("[FP kitchen] using method=%s v=%d", method, int(round(v)))
+        v = float(np.clip(v_candidate, 0.0, frame_height))
         return {'u': u, 'v': v, 'track_id': obj_id, 'method': method}
 
     @staticmethod
@@ -2223,6 +2188,10 @@ class DeepStreamVideoPipeline:
     
     def _analytics_probe(self, pad, info, user_data):
         """Probe to extract telemetry data after analytics."""
+        # Early return if pipeline is shutting down to prevent race conditions
+        if not self.running:
+            return Gst.PadProbeReturn.OK
+        
         gst_buffer = info.get_buffer()
         if not gst_buffer:
             return Gst.PadProbeReturn.OK
@@ -2248,6 +2217,10 @@ class DeepStreamVideoPipeline:
 
     def _nvinfer_object_debug_probe(self, _pad, info, _user_data):
         """Temporary instrumentation to inspect PGIE object metadata."""
+        # Early return if pipeline is shutting down to prevent race conditions
+        if not self.running:
+            return Gst.PadProbeReturn.OK
+        
         gst_buffer = info.get_buffer()
         if not gst_buffer:
             return Gst.PadProbeReturn.OK
@@ -2891,16 +2864,11 @@ class DeepStreamVideoPipeline:
     def stop(self):
         """Stop the DeepStream pipeline."""
         self.logger.info("Stopping DeepStream pipeline")
+        # Set running flag first to prevent callbacks from executing during shutdown
         self.running = False
         
-        # Unregister custom callbacks
-        try:
-            pyds.unset_callback_funcs()
-            self.logger.info("✅ Unregistered custom metadata callbacks")
-        except Exception as e:
-            self.logger.warning(f"⚠️ Could not unregister custom callbacks: {e}")
-        
-        # Stop pipeline first - this stops GPU operations gracefully
+        # Stop pipeline first - this stops GPU operations gracefully and prevents
+        # new callbacks from being invoked
         if self.pipeline:
             try:
                 self.pipeline.set_state(Gst.State.NULL)
@@ -2925,11 +2893,22 @@ class DeepStreamVideoPipeline:
                 except Exception:
                     pass
         
-        # Wait for main loop thread to finish
+        # Wait for main loop thread to finish - this ensures all callbacks have completed
         if hasattr(self, 'mainloop_thread') and self.mainloop_thread.is_alive():
             self.mainloop_thread.join(timeout=3.0)
             if self.mainloop_thread.is_alive():
                 self.logger.warning("Mainloop thread did not terminate within timeout")
+        
+        # Skip unregistering callbacks during shutdown to avoid illegal instruction errors.
+        # During shutdown, GPU/CUDA resources may be in an inconsistent state, causing
+        # pyds.unset_callback_funcs() to trigger SIGILL (illegal instruction). Since:
+        # 1. Callbacks are already protected by self.running=False checks
+        # 2. Pipeline is stopped (no new buffers will trigger callbacks)
+        # 3. Mainloop thread has finished (no callbacks are executing)
+        # It is safe to skip this cleanup step. The callbacks won't be invoked anyway.
+        # Note: This is a known issue with pyds during shutdown - the library tries to
+        # access GPU resources that may already be torn down.
+        self.logger.debug("Skipping pyds.unset_callback_funcs() during shutdown to avoid illegal instruction errors")
         
         self.logger.info("DeepStream pipeline stopped")
     
@@ -3042,6 +3021,10 @@ class DeepStreamVideoPipeline:
 
     def _on_new_mosaic_sample(self, appsink: GstApp.AppSink) -> Gst.FlowReturn:
         """Appsink callback for mosaic JPEG branch."""
+        # Early return if pipeline is shutting down to prevent race conditions
+        if not self.running:
+            return Gst.FlowReturn.OK
+        
         try:
             sample = appsink.emit("pull-sample")
             if not sample:
@@ -3115,6 +3098,10 @@ class DeepStreamVideoPipeline:
 
     def _nvinfer_output_probe(self, _pad, info, _user_data):
         """Probe after nvinfer to verify detections are being produced."""
+        # Early return if pipeline is shutting down to prevent race conditions
+        if not self.running:
+            return Gst.PadProbeReturn.OK
+        
         gst_buffer = info.get_buffer()
         if not gst_buffer:
             return Gst.PadProbeReturn.OK
@@ -3141,6 +3128,10 @@ class DeepStreamVideoPipeline:
 
     def _mosaic_osd_probe(self, _pad, info, _user_data):
         """Single mosaic OSD probe that handles labels, bbox smoothing, and trail rendering."""
+        # Early return if pipeline is shutting down to prevent race conditions
+        if not self.running:
+            return Gst.PadProbeReturn.OK
+        
         # Provide a breadcrumb so we can confirm probe execution during development.
         self.logger.debug("Mosaic OSD probe fired")
 

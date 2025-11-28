@@ -13,11 +13,13 @@ import { getExtrinsics, worldToCamera, getIntrinsics4, extractPoseFromExtrinsics
 import { useWebSocketClient, StatsPayload, DepthRequestStrategy } from './hooks/useWebSocketClient';
 import DepthDrawer, { DepthDiagnosticsEntry, DepthDrawerEntry, DepthMetaEntry, FloorplanResponse } from './components/DepthDrawer';
 import TopDownDrawer from './components/TopDownDrawer';
+import { BevView, BevMeta } from './components/BevView';
 
 const wsHost = import.meta.env.VITE_WS_HOST || window.location.hostname;
 const wsPort = Number(import.meta.env.VITE_WS_PORT || 6008);
 const wsProto = window.location.protocol === 'https:' ? 'wss' : 'ws';
 const WS_URL = import.meta.env.VITE_WS_URL || `${wsProto}://${wsHost}:${wsPort}`;
+const streamDisplayCams: CameraKey[] = ['living-room'];
 
 type CameraPoseSummary = {
   x: number;
@@ -41,8 +43,8 @@ function Dashboard() {
   const [streams, setStreams] = useState<{ [k: string]: Blob | null }>({ 'living-room': null, 'kitchen': null, 'family-room': null });
   const [bevImages, setBevImages] = useState<Record<CameraKey, string | null>>({ 'living-room': null, 'kitchen': null, 'family-room': null });
   const bevUrlRef = useRef<Record<CameraKey, string | null>>({ 'living-room': null, 'kitchen': null, 'family-room': null });
-  const [bevMeta, setBevMeta] = useState<Record<CameraKey, any>>({ 'living-room': undefined, 'kitchen': undefined, 'family-room': undefined });
-  const bevMetaRef = useRef<Record<CameraKey, any>>({ 'living-room': undefined, 'kitchen': undefined, 'family-room': undefined });
+  const [bevMeta, setBevMeta] = useState<Record<CameraKey, BevMeta | undefined>>({ 'living-room': undefined, 'kitchen': undefined, 'family-room': undefined });
+  const bevMetaRef = useRef<Record<CameraKey, BevMeta | undefined>>({ 'living-room': undefined, 'kitchen': undefined, 'family-room': undefined });
 
   // FPS tracking (exponential over short window)
   const [fps, setFps] = useState<{ [k: string]: string }>({ 'living-room': 'FPS: 0.0', 'kitchen': 'FPS: 0.0', 'family-room': 'FPS: 0.0' });
@@ -113,6 +115,7 @@ function Dashboard() {
   const [expandedCamera, setExpandedCamera] = useState<CameraKey | null>(null);
   const maDiagThrottleRef = useRef<Record<string, number>>({});
   const lastCalibrationSignatureRef = useRef<string>('');
+  const lastDepthFloorplanTsRef = useRef<Record<string, number>>({});
 
   const onStats = (payload: StatsPayload) => {
     // System status/uptime
@@ -594,8 +597,9 @@ function Dashboard() {
     });
   }, []);
 
-  const handleBevMeta = useCallback((payload: any) => {
-    const cam = detectCameraKey(payload.cameraId || payload.camId);
+  const handleBevMeta = useCallback((payload: BevMeta) => {
+    if (!payload) return;
+    const cam = detectCameraKey((payload.cameraId || payload.camId || '').toString());
     if (!cam) return;
     bevMetaRef.current = { ...bevMetaRef.current, [cam]: payload };
     setBevMeta((prev) => ({ ...prev, [cam]: payload }));
@@ -658,6 +662,43 @@ function Dashboard() {
   const handleRequestFloorplan = useCallback((options?: { camera?: string; requestId?: string; maxAgeSec?: number; gridResM?: number; maxExtentM?: number; cacheOnly?: boolean }) => {
     return requestFloorplan(options);
   }, [requestFloorplan]);
+
+  useEffect(() => {
+    const timers: number[] = [];
+    cameraOrder.forEach((cam, idx) => {
+      const timer = window.setTimeout(() => {
+        handleRequestFloorplan({
+          camera: cam,
+          requestId: `bev-cache-${cam}-${Date.now()}`,
+          maxAgeSec: 600,
+          gridResM: 0.15,
+          maxExtentM: 20,
+          cacheOnly: true
+        });
+      }, idx * 120);
+      timers.push(timer);
+    });
+    return () => {
+      timers.forEach((id) => window.clearTimeout(id));
+    };
+  }, [handleRequestFloorplan]);
+
+  useEffect(() => {
+    Object.entries(maDepthMeta || {}).forEach(([camId, meta]) => {
+      if (!meta || typeof meta.tsUs !== 'number') return;
+      const prev = lastDepthFloorplanTsRef.current[camId] || 0;
+      if (meta.tsUs <= prev) return;
+      lastDepthFloorplanTsRef.current[camId] = meta.tsUs;
+      handleRequestFloorplan({
+        camera: camId,
+        requestId: `bev-refresh-${camId}-${meta.tsUs}`,
+        maxAgeSec: 0,
+        gridResM: 0.15,
+        maxExtentM: 20,
+        cacheOnly: false
+      });
+    });
+  }, [maDepthMeta, handleRequestFloorplan]);
 
   // Live EST/EDT clock for top bar
   const [estTime, setEstTime] = useState<string>("");
@@ -793,15 +834,32 @@ function Dashboard() {
       </header>
       <main className="main">
         <section className="streams">
-          <StreamPanel
-            camera="living-room"
-            blob={streams['living-room']}
-            fpsText={fps['living-room']}
-            fpsSeries={fpsSeries['living-room']}
-            vacancyText={vacancyText['living-room']}
-            isExpanded={expandedCamera === 'living-room'}
-            onToggleExpand={(cam) => setExpandedCamera(prev => prev === cam ? null : cam)}
-          />
+          <div className={`stream-tiler${streamDisplayCams.length === 1 ? ' stream-tiler--single' : ''}`}>
+            {streamDisplayCams.map((cam) => (
+              <StreamPanel
+                key={`stream-${cam}`}
+                camera={cam}
+                blob={streams[cam]}
+                fpsText={fps[cam]}
+                fpsSeries={fpsSeries[cam]}
+                vacancyText={vacancyText[cam]}
+                isExpanded={expandedCamera === cam}
+                onToggleExpand={(cameraKey) => setExpandedCamera(prev => prev === cameraKey ? null : cameraKey)}
+              />
+            ))}
+          </div>
+          <div className="bev-row">
+            {cameraOrder.map((cam) => (
+              <BevView
+                key={`bev-${cam}`}
+                cam={cam}
+                meta={bevMeta[cam]}
+                floorplan={floorplanData[cam]}
+                tracks={tracksByCamKey[cam]}
+                variant="inline"
+              />
+            ))}
+          </div>
         </section>
 
         <section className="side">

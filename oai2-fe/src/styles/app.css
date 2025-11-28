@@ -177,7 +177,7 @@
   border-radius: 10px;
   overflow: hidden;
   background: #020509;
-  aspect-ratio: 5 / 2;
+  aspect-ratio: 2 / 1;
 }
 .bev-inline-body canvas {
   width: 100%;

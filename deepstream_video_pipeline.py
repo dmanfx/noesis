@@ -114,6 +114,8 @@ class DeepStreamVideoPipeline:
             ini_max_batch = len(self._uris)
         self.max_width = width
         self.max_height = height
+        self._tiler_rows = 1
+        self._tiler_columns = 3
         self._batched_push_timeout = int(streammux_cfg.get("batched-push-timeout", "40000"))
         self._select_rtp_protocol = int(source_attr_cfg.get("select-rtp-protocol", "4"))
         self.batch_size = max(ini_max_batch, len(self._uris))
@@ -1927,12 +1929,15 @@ class DeepStreamVideoPipeline:
             try:
                 base_width = max(1, int(self.max_width))
                 base_height = max(1, int(self.max_height))
-                mosaic_tiler.set_property("rows", 2)
-                mosaic_tiler.set_property("columns", 2)
-                mosaic_tiler.set_property("width", base_width * 2)
-                mosaic_tiler.set_property("height", base_height * 2)
+                tiler_rows = self._tiler_rows
+                tiler_columns = self._tiler_columns
+                mosaic_tiler.set_property("rows", tiler_rows)
+                mosaic_tiler.set_property("columns", tiler_columns)
+                mosaic_tiler.set_property("width", base_width * tiler_columns)
+                mosaic_tiler.set_property("height", base_height * tiler_rows)
                 self.logger.info(
-                    f"🎛️ Configured mosaic tiler for 2x2 grid at {base_width * 2}x{base_height * 2}"
+                    f"🎛️ Configured mosaic tiler for {tiler_rows}x{tiler_columns} grid at "
+                    f"{base_width * tiler_columns}x{base_height * tiler_rows}"
                 )
             except Exception as exc:
                 raise RuntimeError(f"Failed to configure tiler grid/resolution: {exc}") from exc
@@ -3208,9 +3213,9 @@ class DeepStreamVideoPipeline:
                 except Exception as e:
                     self.logger.debug(f"Failed to read frame height: {e}")
 
-            # Full mosaic dimensions (tiler configured 2x2)
-            full_width = float(self.max_width * 2)
-            full_height = float(self.max_height * 2)
+            # Full mosaic dimensions (tiler configured 1x3)
+            full_width = float(self.max_width * self._tiler_columns)
+            full_height = float(self.max_height * self._tiler_rows)
 
             tile_left = 0.0
             tile_top = 0.0

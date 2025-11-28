@@ -579,8 +579,8 @@ class DS8Adapter:
         minimal_pre_infer = True
 
         # Tiler and encoder caps/props
-        tiler.set_property("rows", 2)
-        tiler.set_property("columns", 2)
+        tiler.set_property("rows", 1)
+        tiler.set_property("columns", 3)
         tiler.set_property("width", w)
         tiler.set_property("height", h)
         mosaic_osd.set_property("process-mode", 0)  # GPU mode

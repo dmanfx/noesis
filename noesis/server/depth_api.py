@@ -110,6 +110,7 @@ logger = logging.getLogger(__name__)
 
 PIPELINE_CONFIG_ENV = "NOESIS_DS8_PIPELINE_CONFIG"
 DEFAULT_PIPELINE_CONFIG = Path("config/infer.yaml")
+_STUB_WARNING_EMITTED = False
 
 
 class DepthRefreshResponse(BaseModel):
@@ -131,6 +132,13 @@ def ensure_pipeline_ready() -> bool:
 
     Returns True when the pipeline is ready; False otherwise.
     """
+    global _STUB_WARNING_EMITTED
+    if USING_PIPELINE_STUB and not _STUB_WARNING_EMITTED:
+        logger.warning(
+            "Depth API running with stub pipeline (NOESIS_DEPTH_API_FORCE_STUB=%s or DS8 libs unavailable)",
+            os.environ.get(FORCE_STUB_ENV, ""),
+        )
+        _STUB_WARNING_EMITTED = True
     try:
         get_pipeline()
         return True

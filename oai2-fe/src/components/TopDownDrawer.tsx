@@ -11,6 +11,7 @@ type Props = {
   meta: Record<CameraKey, BevMeta | undefined>;
   floorplans: Record<string, FloorplanResponse>;
   tracks: Record<CameraKey, Array<{ track_id: number; stable_id?: number | null }>>;
+  trailEnabled?: boolean;
   onUpdateConfig: (cam: CameraKey, cfg: { mpp: number; xMin: number; xMax: number; zMin: number; zMax: number }) => void;
   onToggleOverlay: (cam: CameraKey, enabled: boolean) => void;
   onCalibrateAll?: () => void;
@@ -20,7 +21,7 @@ const cameras: CameraKey[] = ['living-room', 'kitchen', 'family-room'];
 const DEFAULT_WIDTH = 420;
 const MAX_WIDTH = 1080;
 
-const TopDownDrawer: React.FC<Props> = ({ open, onClose, meta, floorplans, tracks, onCalibrateAll }) => {
+const TopDownDrawer: React.FC<Props> = ({ open, onClose, meta, floorplans, tracks, onCalibrateAll, trailEnabled = true }) => {
   const [drawerWidth, setDrawerWidth] = useState<number>(DEFAULT_WIDTH);
   const drawerRef = useRef<HTMLElement | null>(null);
   const isResizingRef = useRef(false);
@@ -119,6 +120,7 @@ const TopDownDrawer: React.FC<Props> = ({ open, onClose, meta, floorplans, track
                 meta={meta[cam]}
                 floorplan={floorplans[cam]}
                 tracks={tracks[cam]}
+                trailEnabled={trailEnabled}
                 variant="drawer"
               />
             ))}

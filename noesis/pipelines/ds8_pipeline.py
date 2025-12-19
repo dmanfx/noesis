@@ -1,20 +1,30 @@
 from __future__ import annotations
 
 import logging
+import math
+import os
+import json
 import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import yaml
 
 logger = logging.getLogger(__name__)
 
 try:  # DS8 runtime provides this; tests can still run without it.
-    from pyservicemaker.pipeline import Pipeline as DSPipeline
+    from pyservicemaker import Pipeline as DSPipeline
 except Exception:  # pragma: no cover - import-safe fallback when DS libs absent
     DSPipeline = None  # type: ignore
+
+try:  # Flow BufferOperator may not be available on all DS8 builds
+    # DS8 docs: from pyservicemaker import BufferOperator, Probe
+    from pyservicemaker import BufferOperator, Probe  # type: ignore[attr-defined]
+except Exception:  # pragma: no cover - optional dependency or older DS8 build
+    BufferOperator = None  # type: ignore
+    Probe = None  # type: ignore
 
 
 @dataclass
@@ -34,37 +44,50 @@ class DS8Pipeline:
     prepared: bool = False
     activated: bool = False
     depth_enabled: bool = False
+    depth_gate_supported: bool = False
     errors: List[str] = field(default_factory=list)
     valve_name: Optional[str] = None
+    depth_gate_attach: Optional[str] = None
     depth_frame_samples: List[float] = field(default_factory=list)
     depth_last_toggle: float = 0.0
+    frame_size: Tuple[int, int] = field(default_factory=lambda: (0, 0))
+    analytics_reload_count: int = 0
     _timer: Optional[threading.Timer] = field(default=None, init=False, repr=False)
+    _prime_timer: Optional[threading.Timer] = field(default=None, init=False, repr=False)
     _depth_lock: threading.Lock = field(default_factory=threading.Lock, init=False, repr=False)
 
+    def _set_valve_drop(self, drop: bool) -> bool:
+        valve = self._resolve_valve()
+        if valve is None:
+            return False
+        drop_bool = bool(drop)
+        valve.config["drop"] = drop_bool
+        ds = getattr(self, "ds_pipeline", None)
+        if ds is not None:
+            try:
+                node = ds[valve.name]  # type: ignore[index]
+                node.set({"drop": drop_bool})
+            except Exception:
+                logger.exception("Failed to set valve.drop=%s on %s", drop_bool, valve.name)
+        return True
+
     def mark_depth_enabled(self, enabled: bool) -> None:
-        drop = not enabled
-        fps_recent = 0.0
         timestamp = time.time()
+        fps_recent = 0.0
         with self._depth_lock:
+            self.depth_enabled = enabled
+            self.depth_last_toggle = timestamp
             if not enabled:
                 fps_recent = self._depth_fps_locked(window=5.0, now=timestamp)
                 self.depth_frame_samples.clear()
-            self.depth_enabled = enabled
-            self.depth_last_toggle = timestamp
-
-        valve = self._resolve_valve()
-        if valve is not None:
-            valve.config["drop"] = drop
-            if self.ds_pipeline is not None and hasattr(self.ds_pipeline, "set_property"):
-                try:
-                    self.ds_pipeline.set_property(valve.name, "drop", drop)  # type: ignore[attr-defined]
-                except Exception as exc:  # pragma: no cover - defensive safeguard
-                    self.errors.append(f"valve:{valve.name}:{exc}")
-
+        # Drive upstream valve (if present) so MapAnything inference is physically gated.
+        drop_state = not enabled
+        if self._set_valve_drop(drop_state):
+            logger.info("Depth gate toggled: enabled=%s valve.drop=%s", enabled, drop_state)
         if enabled:
-            logger.info("Depth valve enabled; allowing frames to MapAnything")
+            logger.info("Depth branch enabled; allowing frames to MapAnything")
         else:
-            logger.info("Depth valve disabled; recent MapAnything FPS %.2f", fps_recent)
+            logger.info("Depth branch disabled; recent MapAnything FPS %.2f", fps_recent)
 
     def _resolve_valve(self) -> Optional[Component]:
         if not self.valve_name:
@@ -95,6 +118,25 @@ class DS8Pipeline:
     def _trim_depth_samples_locked(self, now: float, keep_seconds: float) -> None:
         cutoff = now - keep_seconds
         self.depth_frame_samples = [ts for ts in self.depth_frame_samples if ts >= cutoff]
+
+
+class DepthGateOperator(BufferOperator):  # pragma: no cover - runtime only
+    """Drop buffers when depth is disabled to gate MapAnything processing."""
+
+    def __init__(self, pipeline: DS8Pipeline) -> None:
+        super().__init__()
+        self.pipeline = pipeline
+        self._last_drop_logged = False
+
+    def handle_buffer(self, buffer) -> bool:  # type: ignore[override]
+        enabled = getattr(self.pipeline, "depth_enabled", False)
+        if not enabled:
+            if not self._last_drop_logged:
+                logger.debug("DepthGateOperator dropping buffer (depth disabled)")
+                self._last_drop_logged = True
+            return False
+        self._last_drop_logged = False
+        return True
 
 
 _PIPELINE_SINGLETON: Optional[DS8Pipeline] = None
@@ -145,6 +187,105 @@ def _apply_component_config(
             errors.append(f"prop:{component.name}:{key}:{exc}")
 
 
+def _safe_link(ds_pipeline: Optional[DSPipeline], errors: List[str], *names: str) -> None:
+    """Link pipeline components by name, recording failures as actionable errors."""
+    if ds_pipeline is None or len(names) < 2:
+        return
+    path = "->".join(names)
+    try:
+        ds_pipeline.link(*names)
+    except Exception as exc:  # pragma: no cover - depends on runtime plugins
+        errors.append(f"link:{path}:{exc}")
+
+
+def _attach_depth_gate(pipeline: DS8Pipeline) -> None:
+    """Attach a Probe-wrapped BufferOperator gate to the configured depth branch."""
+    # If an upstream valve was configured, treat gating as supported without BufferOperator.
+    valve = pipeline._resolve_valve()
+    if valve is not None:
+        pipeline.depth_gate_supported = True
+        # Ensure initial drop state respects current depth_enabled flag.
+        try:
+            if pipeline.ds_pipeline is not None:
+                node = pipeline.ds_pipeline[valve.name]  # type: ignore[index]
+                node.set({"drop": not pipeline.depth_enabled})
+        except Exception:
+            pipeline.errors.append(f"depth_valve_set:{valve.name}")
+        return
+    if BufferOperator is None or Probe is None:
+        pipeline.depth_gate_supported = False
+        return
+    if pipeline.ds_pipeline is None:
+        pipeline.depth_gate_supported = False
+        return
+    target = pipeline.depth_gate_attach
+    if not target or target not in pipeline.components:
+        pipeline.depth_gate_supported = False
+        return
+    try:
+        gate = DepthGateOperator(pipeline)
+        probe = Probe("depth_gate", gate)
+        pipeline.ds_pipeline.attach(target, probe)
+        pipeline.depth_gate_supported = True
+    except Exception as exc:  # pragma: no cover - runtime dependent
+        pipeline.depth_gate_supported = False
+        pipeline.errors.append(f"depth_gate_attach:{target}:{exc}")
+
+
+def _attach_fps_probes(pipeline: DS8Pipeline) -> None:
+    """Optionally attach lightweight FPS probes to key nodes for debugging.
+
+    Enabled only when NOESIS_DS8_FPS_PROBE is truthy (\"1\", \"true\", \"yes\", \"on\").
+    Probes log cumulative frame counts and approximate FPS at INFO level.
+    """
+    if BufferOperator is None or Probe is None:
+        return
+    if pipeline.ds_pipeline is None:
+        return
+
+    flag = os.environ.get("NOESIS_DS8_FPS_PROBE", "")
+    if str(flag).strip().lower() not in ("1", "true", "yes", "on"):
+        return
+
+    ds = pipeline.ds_pipeline
+
+    class _FPSProbe(BufferOperator):  # pragma: no cover - runtime diagnostics
+        def __init__(self, name: str) -> None:
+            super().__init__()
+            self.name = name
+            self._count = 0
+            self._t0 = time.time()
+
+        def handle_buffer(self, buffer) -> bool:  # type: ignore[override]
+            self._count += 1
+            if self._count in (1, 10, 100) or (self._count % 100) == 0:
+                now = time.time()
+                dt = max(0.001, now - self._t0)
+                fps = self._count / dt
+                logger.info("FPSProbe[%s]: frames=%d, fps=%.2f", self.name, self._count, fps)
+            return True
+
+    debug_nodes = [
+        # Core graph stages (sources do not support probes reliably here)
+        "streammux",
+        "yolo11_pgie",
+        "tracker",
+        "analytics",
+        "tiler",
+        "osd",
+    ]
+
+    for node_name in debug_nodes:
+        if node_name not in pipeline.components:
+            continue
+        try:
+            probe = Probe(f"fps_{node_name}", _FPSProbe(node_name))
+            ds.attach(node_name, probe)
+            logger.info("FPS probe attached to '%s' (NOESIS_DS8_FPS_PROBE=1)", node_name)
+        except Exception as exc:  # pragma: no cover - runtime dependent
+            pipeline.errors.append(f"fps_probe_attach:{node_name}:{exc}")
+
+
 def build_pipeline(yaml_path: str | Path) -> DS8Pipeline:
     """Create the DS8 pipeline skeleton from YAML using pyservicemaker primitives."""
     global _PIPELINE_SINGLETON
@@ -156,19 +297,12 @@ def build_pipeline(yaml_path: str | Path) -> DS8Pipeline:
     with path.open("r", encoding="utf-8") as stream:
         cfg: Dict[str, Any] = yaml.safe_load(stream) or {}
 
+    errors: List[str] = []
+
     # Normalize relative paths in the configuration to be absolute, resolved
     # relative to the YAML file directory. This ensures DS plugins can locate
     # engine and config files regardless of the current working directory.
     base_dir = path.parent.resolve()
-    models_cfg = cfg.get("models", {}) or {}
-    for key, m in list(models_cfg.items()):
-        if not isinstance(m, dict):
-            continue
-        eng = m.get("engine")
-        if isinstance(eng, str) and eng and not Path(eng).is_absolute():
-            abs_eng = (base_dir / eng).resolve()
-            m["engine"] = str(abs_eng)
-    cfg["models"] = models_cfg
 
     def _abs_or_same(p: Any) -> Any:
         if isinstance(p, str) and p:
@@ -183,8 +317,57 @@ def build_pipeline(yaml_path: str | Path) -> DS8Pipeline:
             return str((base_dir / p).resolve())
         return p
 
+    def _nvinfer_props(raw: Dict[str, Any]) -> Dict[str, Any]:
+        cfg = dict(raw) if isinstance(raw, dict) else {}
+        engine = cfg.pop("engine", None)
+        if isinstance(engine, str) and engine:
+            cfg["model-engine-file"] = _abs_or_same(engine)
+        bs = cfg.pop("batch_size", cfg.pop("batch-size", None))
+        if bs is not None:
+            try:
+                cfg["batch-size"] = int(bs)
+            except Exception:
+                cfg["batch-size"] = bs
+        gie_id = cfg.pop("gie_id", cfg.pop("gie-id", None))
+        if gie_id is not None:
+            try:
+                cfg["unique-id"] = int(gie_id)
+            except Exception:
+                cfg["unique-id"] = gie_id
+        cfg.pop("network_mode", None)
+        attach = cfg.pop("attach_tensor_meta", None)
+        if attach is not None:
+            cfg["output-tensor-meta"] = bool(attach)
+        cfg.pop("force_engine_rebuild", None)
+        cfg.pop("enable", None)
+        cfg.pop("name", None)
+        return cfg
+
+    models_cfg = cfg.get("models", {}) or {}
+    for key, m in list(models_cfg.items()):
+        if not isinstance(m, dict):
+            continue
+        eng = m.get("engine")
+        if isinstance(eng, str) and eng and not Path(eng).is_absolute():
+            abs_eng = (base_dir / eng).resolve()
+            m["engine"] = str(abs_eng)
+        cfg_file = m.get("config-file-path") or m.get("config-file")
+        if isinstance(cfg_file, str) and cfg_file:
+            m_key = "config-file-path" if "config-file-path" in m else "config-file"
+            m[m_key] = _abs_or_same(cfg_file)
+        if m.get("force_engine_rebuild") and eng:
+            try:
+                eng_path = Path(m["engine"])
+                if eng_path.exists():
+                    eng_path.unlink()
+                    logger.info("Removed existing engine to force rebuild: %s", eng_path)
+            except Exception as exc:
+                errors.append(f"engine_rebuild:{eng}:{exc}")
+    cfg["models"] = models_cfg
+
     ds_pipeline: Optional[DSPipeline] = None
-    errors: List[str] = []
+    if DSPipeline is None:
+        errors.append("pyservicemaker:unavailable")
     if DSPipeline is not None:
         try:
             ds_pipeline = DSPipeline("noesis-ds8")
@@ -212,51 +395,172 @@ def build_pipeline(yaml_path: str | Path) -> DS8Pipeline:
     }
     cfg["output"] = sanitised_output_cfg
 
-    # Sources feed into nvstreammux. Prefer NVIDIA's nvurisrcbin to ensure NVDEC on target GPU.
-    for idx, src_cfg in enumerate(sources):
-        name = f"source_{idx}"
-        # Allow per-source override via YAML; default to nvurisrcbin for DS8.
-        element = str(src_cfg.get("element", "nvurisrcbin")).strip() or "nvurisrcbin"
+    # Parse mosaic_output config for JPEG/RTSP/WebRTC toggle support
+    mosaic_output_raw = cfg.get("mosaic_output") or {}
+    jpeg_enabled = bool(mosaic_output_raw.get("jpeg_enabled", False))
+    rtsp_enabled = bool(mosaic_output_raw.get("rtsp_enabled", False))
+    rtsp_port = int(mosaic_output_raw.get("rtsp_port", 8554) or 8554)
+    rtsp_path = str(mosaic_output_raw.get("rtsp_path", "mosaic")).strip() or "mosaic"
+    mosaic_webrtc_enabled = bool(mosaic_output_raw.get("mosaic_webrtc_enabled", False))
+    video_bitrate_kbps = int(mosaic_output_raw.get("video_bitrate_kbps", 4000) or 4000)
+    encoder_cfg = str(mosaic_output_raw.get("encoder", "nvh264enc")).strip() or "nvh264enc"
+    # RTSP encoder/GOP tuning (applies to nvrtspoutsinkbin).
+    # Defaults are chosen to minimize "connected but black" WebRTC starts by ensuring frequent IDR frames.
+    rtsp_iframeinterval = int(mosaic_output_raw.get("rtsp_iframeinterval", mosaic_output_raw.get("iframeinterval", 30)) or 30)
+    rtsp_idrinterval = int(mosaic_output_raw.get("rtsp_idrinterval", mosaic_output_raw.get("idrinterval", 30)) or 30)
+    rtsp_profile = int(mosaic_output_raw.get("rtsp_profile", mosaic_output_raw.get("profile", 0)) or 0)
 
-        # Start from provided mapping but ensure required keys are present and clean.
-        cfg = dict(src_cfg)
-        cfg.pop("element", None)
-        # Always carry the URI forward.
-        cfg["uri"] = src_cfg.get("uri")
+    # Environment overrides so toggles actually affect the built graph
+    env_jpeg = os.environ.get("NOESIS_MOSAIC_JPEG_ENABLED")
+    if env_jpeg is not None:
+        jpeg_enabled = str(env_jpeg).strip().lower() in ("1", "true", "yes", "on")
+    env_rtsp = os.environ.get("NOESIS_MOSAIC_RTSP_ENABLED")
+    if env_rtsp is not None:
+        rtsp_enabled = str(env_rtsp).strip().lower() in ("1", "true", "yes", "on")
+    env_webrtc = os.environ.get("NOESIS_MOSAIC_WEBRTC_ENABLED")
+    if env_webrtc is not None:
+        mosaic_webrtc_enabled = str(env_webrtc).strip().lower() in ("1", "true", "yes", "on")
+    # WebRTC gateway requires RTSP output
+    if mosaic_webrtc_enabled and not rtsp_enabled:
+        rtsp_enabled = True
 
-        # Sensible defaults for nvurisrcbin to keep decode on the selected GPU and NVMM.
-        if element == "nvurisrcbin":
-            cfg.setdefault("gpu-id", 0)
-            cfg.setdefault("cudadec-memtype", 0)  # NVBUF_MEM_DEFAULT
-            cfg.setdefault("live-source", 1)
-            # Optional resilience for RTSP
-            cfg.setdefault("rtsp-reconnect-interval-sec", 2)
+    # Preserve encoder selection for diagnostics/future wiring.
+    # Note: current RTSP output uses nvrtspoutsinkbin (internal encoder).
+    encoder_name = encoder_cfg
 
-        component = Component(name=name, element=element, config=cfg, downstream=["streammux"])
-        pipeline.components[name] = component
-        _safe_add(ds_pipeline, component, pipeline.errors)
-        _apply_component_config(ds_pipeline, component, pipeline.errors)
+    cfg["mosaic_output"] = {
+        "jpeg_enabled": jpeg_enabled,
+        "rtsp_enabled": rtsp_enabled,
+        "rtsp_port": rtsp_port,
+        "rtsp_path": rtsp_path,
+        "mosaic_webrtc_enabled": mosaic_webrtc_enabled,
+        "video_bitrate_kbps": video_bitrate_kbps,
+        "encoder": encoder_name,
+        "rtsp_iframeinterval": rtsp_iframeinterval,
+        "rtsp_idrinterval": rtsp_idrinterval,
+        "rtsp_profile": rtsp_profile,
+    }
+
+    # Decide source topology:
+    # - Default: use nvmultiurisrcbin as a combined source+streammux (more stable with RTSP).
+    # - Legacy/debug: set NOESIS_DS8_USE_NVURISRCBIN=1 to use per-source nvurisrcbin + nvstreammux.
+    use_nvuris = str(os.environ.get("NOESIS_DS8_USE_NVURISRCBIN", "")).strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
 
     streammux_cfg = dict(cfg.get("streammux") or {})
     streammux_cfg.setdefault("batch-size", batch_size)
     streammux_cfg.setdefault("width", 1920)
     streammux_cfg.setdefault("height", 1080)
     streammux_cfg.setdefault("live-source", 1)
-    # Default GPU assignment mirrors source 0 when available.
+    # Preserve input aspect by padding when streammux scales to the configured size.
+    streammux_cfg.setdefault("enable-padding", 1)
     first_gpu = sources[0].get("gpu-id") if sources else 0
     streammux_cfg.setdefault("gpu-id", first_gpu if first_gpu is not None else 0)
 
-    streammux = Component(
-        name="streammux",
-        element="nvstreammux",
-        config=streammux_cfg,
-        downstream=["yolo11_pgie"],
-    )
+    if use_nvuris:
+        # Original path: separate nvurisrcbin elements feeding nvstreammux.
+        for idx, src_cfg in enumerate(sources):
+            name = f"source_{idx}"
+            element = str(src_cfg.get("element", "nvurisrcbin")).strip() or "nvurisrcbin"
+            src_props = dict(src_cfg)
+            src_props.pop("element", None)
+            src_props["uri"] = src_cfg.get("uri")
+            if element == "nvurisrcbin":
+                src_props.setdefault("gpu-id", 0)
+                src_props.setdefault("cudadec-memtype", 0)
+            component = Component(name=name, element=element, config=src_props, downstream=["streammux"])
+            pipeline.components[name] = component
+            _safe_add(ds_pipeline, component, pipeline.errors)
+            _apply_component_config(ds_pipeline, component, pipeline.errors)
+
+        streammux = Component(
+            name="streammux",
+            element="nvstreammux",
+            config=streammux_cfg,
+            downstream=["yolo11_pgie"],
+        )
+    else:
+        # DS7-style multi-URI source: nvmultiurisrcbin performs source ingest + mux.
+        uris = [str(s.get("uri") or "").strip() for s in sources if str(s.get("uri") or "").strip()]
+        uri_list = ",".join(uris)
+        sensor_id_list = ",".join(str(i) for i in range(len(uris))) if uris else ""
+
+        multi_cfg: Dict[str, Any] = {
+            "uri-list": uri_list,
+            "sensor-id-list": sensor_id_list,
+            "max-batch-size": batch_size,
+            "width": streammux_cfg.get("width", 1920),
+            "height": streammux_cfg.get("height", 1080),
+            "batched-push-timeout": streammux_cfg.get("batched-push-timeout", 40000),
+            "live-source": streammux_cfg.get("live-source", 1),
+            "enable-padding": streammux_cfg.get("enable-padding", 1),
+            "nvbuf-memory-type": streammux_cfg.get("nvbuf-memory-type", 0),
+            "sync-inputs": streammux_cfg.get("sync-inputs", 0),
+            "gpu-id": streammux_cfg.get("gpu-id", 0),
+            # Align key behavioral knobs with DS7's nvmultiurisrcbin INI:
+            # - Avoid propagating EOS downstream when all sources hit EOS.
+            # - Disable REST control API (port=0) since DS8 drives URIs from YAML.
+            "drop-pipeline-eos": 1,
+            "cache-buffer": streammux_cfg.get("cache-buffer", 0),
+            "sort-batch": streammux_cfg.get("sort-batch", 0),
+            "align-first-buffer": streammux_cfg.get("align-first-buffer", 0),
+            "port": "0",
+        }
+        # Optional RTSP tuning derived from per-source config
+        if sources:
+            sample = dict(sources[0])
+            if "latency" in sample:
+                multi_cfg["latency"] = sample.get("latency", 100)
+            if "select-rtp-protocol" in sample:
+                multi_cfg["select-rtp-protocol"] = sample.get("select-rtp-protocol", 0)
+            if "cudadec-memtype" in sample:
+                multi_cfg["cudadec-memtype"] = sample.get("cudadec-memtype", 0)
+        # Reasonable RTSP reconnect defaults (mirrors DS7 INI)
+        multi_cfg.setdefault("rtsp-reconnect-interval", 10)
+        multi_cfg.setdefault("init-rtsp-reconnect-interval", 5)
+        multi_cfg.setdefault("rtsp-reconnect-attempts", 4)
+
+        streammux = Component(
+            name="streammux",
+            element="nvmultiurisrcbin",
+            config=multi_cfg,
+            downstream=["yolo11_pgie"],
+        )
+
     pipeline.components[streammux.name] = streammux
+    try:
+        pipeline.frame_size = (
+            int(streammux_cfg.get("width", 0) or 0),
+            int(streammux_cfg.get("height", 0) or 0),
+        )
+    except Exception:
+        pipeline.frame_size = (0, 0)
     _safe_add(ds_pipeline, streammux, pipeline.errors)
     _apply_component_config(ds_pipeline, streammux, pipeline.errors)
 
-    pgie_cfg = models.get("pgie", {})
+    preprocess_cfg = dict(cfg.get("preprocess") or {})
+    preprocess_enabled = bool(preprocess_cfg.get("enable", True) and preprocess_cfg)
+    preprocess_component: Optional[Component] = None
+    if preprocess_enabled:
+        preprocess_cfg.pop("enable", None)
+        if "config-file" in preprocess_cfg:
+            preprocess_cfg["config-file"] = _abs_or_same(preprocess_cfg["config-file"])  # type: ignore[index]
+        preprocess_component = Component(
+            name="preprocess",
+            element=preprocess_cfg.pop("element", "nvdspreprocess"),
+            config=preprocess_cfg,
+            downstream=["yolo11_pgie"],
+        )
+        pipeline.components[preprocess_component.name] = preprocess_component
+        _safe_add(ds_pipeline, preprocess_component, pipeline.errors)
+        _apply_component_config(ds_pipeline, preprocess_component, pipeline.errors)
+        streammux.downstream = [preprocess_component.name]
+
+    pgie_cfg = _nvinfer_props(models.get("pgie", {}))
     primary = Component(
         name="yolo11_pgie",
         element="nvinfer",
@@ -266,6 +570,10 @@ def build_pipeline(yaml_path: str | Path) -> DS8Pipeline:
     pipeline.components[primary.name] = primary
     _safe_add(ds_pipeline, primary, pipeline.errors)
     _apply_component_config(ds_pipeline, primary, pipeline.errors)
+    if preprocess_component is None:
+        streammux.downstream = [primary.name]
+    else:
+        preprocess_component.downstream = [primary.name]
 
     tee_component = Component(
         name="main_tee",
@@ -297,69 +605,204 @@ def build_pipeline(yaml_path: str | Path) -> DS8Pipeline:
     _safe_add(ds_pipeline, tracker, pipeline.errors)
     _apply_component_config(ds_pipeline, tracker, pipeline.errors)
 
-    analytics_cfg_raw = cfg.get("analytics", {"config-file": "pipelines/config_nvdsanalytics.ini"})
+    analytics_cfg_raw = cfg.get("analytics", {"config-file": "pipelines/config_nvdsanalytics_post.ini"})
     analytics_cfg = dict(analytics_cfg_raw) if isinstance(analytics_cfg_raw, dict) else {}
     analytics_enabled = bool(analytics_cfg.get("enable", True))
+    env_analytics_path = os.environ.get("NOESIS_ANALYTICS_CONFIG")
+    if env_analytics_path:
+        analytics_cfg["stages_config"] = env_analytics_path
+    stages_config_path = analytics_cfg.get("stages_config")
+    if stages_config_path:
+        try:
+            stages_path = Path(_abs_or_same(stages_config_path))  # type: ignore[arg-type]
+            with stages_path.open("r", encoding="utf-8") as fh:
+                loaded = yaml.safe_load(fh) or {}
+                analytics_cfg.setdefault("stages", loaded.get("analytics", {}).get("stages", {}))
+            analytics_cfg["stages_config"] = str(stages_path)
+        except Exception as exc:
+            pipeline.errors.append(f"analytics:stages_config:{exc}")
     if "config-file" in analytics_cfg:
         analytics_cfg["config-file"] = _abs_or_same(analytics_cfg["config-file"])  # type: ignore[index]
+    exclude_cfg = dict(analytics_cfg.get("exclude") or {})
+    exclude_enabled = bool(exclude_cfg.get("enable", False))
+    exclude_component: Optional[Component] = None
+    if exclude_enabled:
+        exclude_cfg.pop("enable", None)
+        if "config-file" in exclude_cfg:
+            exclude_cfg["config-file"] = _abs_or_same(exclude_cfg["config-file"])  # type: ignore[index]
+        exclude_component = Component(
+            name="analytics_exclude",
+            element=exclude_cfg.pop("element", "nvdsanalytics"),
+            config=exclude_cfg,
+            downstream=["tracker"],
+        )
+        pipeline.components[exclude_component.name] = exclude_component
+        _safe_add(ds_pipeline, exclude_component, pipeline.errors)
+        _apply_component_config(ds_pipeline, exclude_component, pipeline.errors)
+    analytics_cfg.pop("exclude", None)
+    cfg["analytics"] = analytics_cfg
+
+    analytics = None
     if analytics_enabled and analytics_cfg.get("config-file"):
+        analytics_component_cfg = dict(analytics_cfg)
+        analytics_component_cfg.pop("stages", None)
+        analytics_component_cfg.pop("stages_config", None)
         analytics = Component(
             name="analytics",
             element="nvdsanalytics",
-            config=analytics_cfg,
+            config=analytics_component_cfg,
             downstream=[],
         )
         pipeline.components[analytics.name] = analytics
         _safe_add(ds_pipeline, analytics, pipeline.errors)
         _apply_component_config(ds_pipeline, analytics, pipeline.errors)
-    else:
-        analytics = None
 
-    # Optional SGIE (MapAnything) branch; allow disabling via YAML (models.mapanything.enable=false)
+    # Optional full-frame MapAnything branch; allow disabling via YAML (models.mapanything.enable=false)
     mapanything: Optional[Component] = None
+    mapanything_sink: Optional[Component] = None
     mapanything_cfg_raw = models.get("mapanything")
     sgie_enabled = False
     if isinstance(mapanything_cfg_raw, dict):
         sgie_enabled = bool(mapanything_cfg_raw.get("enable", True)) and bool(mapanything_cfg_raw)
 
+    primary_branch = exclude_component.name if exclude_component is not None else tracker.name
+    tee_downstreams: List[str] = [primary_branch]
+
     if sgie_enabled:
         mapanything_cfg = dict(mapanything_cfg_raw)
-        valve_name = mapanything_cfg.pop("valve_name", "mapanything_valve")
-        mapanything_name = mapanything_cfg.get("name", "mapanything_fullframe")
-        valve = Component(
-            name=valve_name,
-            element="valve",
-            config={"drop": True},
-            downstream=[mapanything_name],
-        )
-        pipeline.components[valve.name] = valve
-        _safe_add(ds_pipeline, valve, pipeline.errors)
-        _apply_component_config(ds_pipeline, valve, pipeline.errors)
-
+        mapanything_cfg.setdefault("attach_tensor_meta", True)
+        mapanything_cfg.setdefault("gie_id", 2)
+        mapanything_cfg = _nvinfer_props(mapanything_cfg)
+        mapanything_name = str(mapanything_cfg.get("name", "mapanything_fullframe"))
         mapanything = Component(
             name=mapanything_name,
             element="nvinfer",
             config=mapanything_cfg,
             downstream=[],
         )
+        # Insert an upstream valve so MapAnything can be gated without consuming GPU.
+        mapanything_queue = Component(
+            name="mapanything_queue",
+            element="queue",
+            config={"max-size-buffers": 1, "leaky": 2},
+            downstream=[],
+        )
+        pipeline.components[mapanything_queue.name] = mapanything_queue
+        _safe_add(ds_pipeline, mapanything_queue, pipeline.errors)
+        _apply_component_config(ds_pipeline, mapanything_queue, pipeline.errors)
+
+        mapanything_valve = Component(
+            name="mapanything_valve",
+            element="valve",
+            # Default to dropping so MapAnything inference stays OFF unless explicitly enabled.
+            # activate() briefly opens the valve to allow preroll/caps negotiation.
+            config={"drop": True, "drop-mode": 1},  # forward-sticky-events
+            downstream=[],
+        )
+        pipeline.components[mapanything_valve.name] = mapanything_valve
+        _safe_add(ds_pipeline, mapanything_valve, pipeline.errors)
+        _apply_component_config(ds_pipeline, mapanything_valve, pipeline.errors)
+
         pipeline.components[mapanything.name] = mapanything
         _safe_add(ds_pipeline, mapanything, pipeline.errors)
-        valve.downstream = [mapanything.name]
-        tee_component.downstream = ["tracker", valve.name]
-        pipeline.valve_name = valve.name
+        tee_downstreams.append(mapanything_queue.name)
         _apply_component_config(ds_pipeline, mapanything, pipeline.errors)
-    else:
-        tee_component.downstream = ["tracker"]
+        pipeline.depth_gate_attach = mapanything.name
+        pipeline.valve_name = mapanything_valve.name
+        pipeline.depth_gate_supported = True
+        # Drop MapAnything branch output after tensor processing; tensors are consumed via probe.
+        mapanything_sink = Component(
+            name=f"{mapanything.name}_sink",
+            element="fakesink",
+            config={"sync": False},
+            downstream=[],
+        )
+        pipeline.components[mapanything_sink.name] = mapanything_sink
+        mapanything.downstream = [mapanything_sink.name]
+        _safe_add(ds_pipeline, mapanything_sink, pipeline.errors)
+        _apply_component_config(ds_pipeline, mapanything_sink, pipeline.errors)
+        # Wire MapAnything branch through queue → valve → SGIE → sink
+        mapanything_queue.downstream = [mapanything_valve.name]
+        mapanything_valve.downstream = [mapanything.name]
+
+    tee_component.downstream = tee_downstreams
 
     # Insert a tiled renderer stage in DS8 path (mosaic). This avoids per-camera branches.
+    source_count = (
+        len([s for s in sources if str(s.get("uri") or "").strip()])
+        if use_nvuris
+        else len(uris)
+    ) or 1
+    tiler_square_seq_grid_env = str(os.environ.get("NOESIS_MOSAIC_TILER_SQUARE_SEQ_GRID", "")).strip().lower()
+    tiler_square_seq_grid = tiler_square_seq_grid_env in ("1", "true", "yes", "on")
+    tiler_columns_env = str(os.environ.get("NOESIS_MOSAIC_TILER_COLUMNS", "")).strip()
+    tiler_rows_env = str(os.environ.get("NOESIS_MOSAIC_TILER_ROWS", "")).strip()
+    tiler_columns_override = tiler_columns_env.isdigit()
+    tiler_rows_override = tiler_rows_env.isdigit()
+    tiler_columns: Optional[int] = int(tiler_columns_env) if tiler_columns_override else None
+    tiler_rows: Optional[int] = int(tiler_rows_env) if tiler_rows_override else None
+    if tiler_columns_override or tiler_rows_override:
+        # Explicit layout override; disable square auto-tiling.
+        tiler_square_seq_grid = False
+
+    tiler_cfg: Dict[str, Any] = {
+        "gpu-id": streammux_cfg.get("gpu-id", 0),
+        "width": streammux_cfg.get("width", 1920),
+        "height": streammux_cfg.get("height", 1080),
+    }
+    if tiler_square_seq_grid:
+        # Use the plugin's square layout mode to keep tile aspect aligned to the output aspect.
+        # This avoids the common 1xN layout that makes tiles tall/skinny when output is 1920x1080.
+        tiler_cfg["square-seq-grid"] = True
+    else:
+        base_columns = tiler_columns if tiler_columns is not None else 3
+        base_rows = tiler_rows if tiler_rows is not None else 1
+        columns = max(1, base_columns)
+        rows = max(1, base_rows)
+        if not tiler_rows_override and source_count > columns * rows:
+            rows = max(rows, math.ceil(source_count / columns))
+        tiler_cfg["columns"] = columns
+        tiler_cfg["rows"] = rows
+        if columns > 1 or rows > 1:
+            # Preserve per-tile aspect ratio by sizing the *overall* mosaic to a multiple of a
+            # 16:9-ish tile size, rather than forcing tiles into streammux-sized output cells.
+            mux_w = int(streammux_cfg.get("width", 1920) or 1920)
+            mux_h = int(streammux_cfg.get("height", 1080) or 1080)
+            mux_w = max(1, mux_w)
+            mux_h = max(1, mux_h)
+            tile_h_env = str(os.environ.get("NOESIS_MOSAIC_TILER_TILE_HEIGHT", "")).strip()
+            tile_h = int(tile_h_env) if tile_h_env.isdigit() else min(mux_h, 720)
+            tile_h = max(2, int(tile_h))
+            if tile_h % 2:
+                tile_h += 1
+            mux_aspect = mux_w / mux_h if mux_h else (16.0 / 9.0)
+            tile_w = int(round(tile_h * mux_aspect))
+            tile_w = max(2, tile_w)
+            if tile_w % 2:
+                tile_w += 1
+            tiler_cfg["width"] = int(tile_w * columns)
+            tiler_cfg["height"] = int(tile_h * rows)
+
+    logger.info(
+        json.dumps(
+            {
+                "event": "ds8_mosaic_tiler_config",
+                "source_count": source_count,
+                "width": int(tiler_cfg.get("width", 0) or 0),
+                "height": int(tiler_cfg.get("height", 0) or 0),
+                "square_seq_grid": bool(tiler_cfg.get("square-seq-grid", False)),
+                "columns": tiler_cfg.get("columns"),
+                "rows": tiler_cfg.get("rows"),
+                "streammux_enable_padding": int(streammux_cfg.get("enable-padding", 0) or 0),
+            },
+            separators=(",", ":"),
+        )
+    )
+
     tiler = Component(
         name="tiler",
         element="nvmultistreamtiler",
-        config={
-            "gpu-id": streammux_cfg.get("gpu-id", 0),
-            "width": streammux_cfg.get("width", 1920),
-            "height": streammux_cfg.get("height", 1080),
-        },
+        config=tiler_cfg,
         downstream=[],
     )
     pipeline.components[tiler.name] = tiler
@@ -385,37 +828,273 @@ def build_pipeline(yaml_path: str | Path) -> DS8Pipeline:
     _safe_add(ds_pipeline, osd, pipeline.errors)
     _apply_component_config(ds_pipeline, osd, pipeline.errors)
 
-    # Route main chain through tiler → osd → sinks
+    # Tee branches should not be allowed to stall the whole graph if a branch is
+    # missing/unlinked at runtime (e.g. optional RTSP/WebRTC output paths).
+    sink_tee = Component(name="sink_tee", element="tee", config={"allow-not-linked": True}, downstream=[])
+    pipeline.components[sink_tee.name] = sink_tee
+    _safe_add(ds_pipeline, sink_tee, pipeline.errors)
+    _apply_component_config(ds_pipeline, sink_tee, pipeline.errors)
+
+    # Route main chain through tiler → osd → sink tee → sinks
+    if exclude_component is not None:
+        exclude_component.downstream = [tracker.name]
+
     if analytics is not None:
-        analytics.downstream = [tiler.name]
         tracker.downstream = ["analytics"]
+        analytics.downstream = [tiler.name]
     else:
         tracker.downstream = [tiler.name]
+
     if mapanything is not None:
-        mapanything.downstream = [tiler.name]
+        mapanything.downstream = [mapanything_sink.name]
     tiler.downstream = ["osd"]
 
     if not sinks:
-        sinks = [{"type": "fakesink", "sync": False}]
+        # Default sinks reserved for Flow retrievers (mosaic/BEV branches).
+        sinks = [{"name": "mosaic_sink", "type": "fakesink", "sync": False}]
 
-    for idx, sink_cfg in enumerate(sinks):
-        sink_name = f"sink_{idx}"
-        element = sink_cfg.get("type", "fakesink")
+    sink_names: List[str] = []
+    mosaic_sink_cfg: Optional[Dict[str, Any]] = None
+    other_sinks: List[Dict[str, Any]] = []
+    for sink_cfg in sinks:
+        cfg_copy = dict(sink_cfg)
+        name = cfg_copy.get("name", "")
+        if str(name) == "mosaic_sink":
+            mosaic_sink_cfg = cfg_copy
+        else:
+            other_sinks.append(cfg_copy)
+
+    # Build non-mosaic sinks directly off the sink tee.
+    for idx, sink_cfg in enumerate(other_sinks):
+        sink_props = dict(sink_cfg)
+        sink_name = sink_props.pop("name", f"sink_{idx}")
+        element = sink_props.pop("type", "fakesink")
+        sink_names.append(sink_name)
         component = Component(
             name=sink_name,
             element=element,
-            config=sink_cfg,
+            config=sink_props,
             downstream=[],
         )
         pipeline.components[component.name] = component
-        osd.downstream.append(component.name)
+        sink_tee.downstream.append(component.name)
         _safe_add(ds_pipeline, component, pipeline.errors)
         _apply_component_config(ds_pipeline, component, pipeline.errors)
 
+    # Build mosaic branch with GPU convert + JPEG encode before the sink.
+    # Only create JPEG branch if jpeg_enabled is True
+    mosaic_branch = {}
+    if mosaic_sink_cfg is not None and jpeg_enabled:
+        sink_props = dict(mosaic_sink_cfg)
+        sink_props.pop("name", None)
+        sink_props.pop("type", None)
+        appsink_props = {
+            "emit-signals": True,
+            "sync": False,
+            "max-buffers": 1,
+            "drop": True,
+        }
+        appsink_props.update(sink_props)
+        mosaic_convert = Component(
+            name="mosaic_convert",
+            element="nvvideoconvert",
+            config={
+                "gpu-id": streammux_cfg.get("gpu-id", 0),
+                # Use default memory type to allow CPU-compatible surfaces for nvjpegenc.
+                "nvbuf-memory-type": 0,
+            },
+            downstream=[],
+        )
+        mosaic_enc = Component(
+            name="mosaic_enc",
+            element="nvjpegenc",
+            config={"quality": jpeg_quality},
+            downstream=[],
+        )
+        mosaic_tee = Component(
+            name="mosaic_tee",
+            element="tee",
+            config={},
+            downstream=[],
+        )
+        mosaic_sink_queue = Component(
+            name="mosaic_sink_queue",
+            element="queue",
+            config={
+                "leaky": 2,  # drop oldest when full
+                "max-size-buffers": 1,
+                "max-size-bytes": 0,
+                "max-size-time": 0,
+            },
+            downstream=[],
+        )
+        mosaic_sink = Component(
+            name="mosaic_sink",
+            element="fakesink",   # keep placeholder but do not use it
+            config={"sync": False},
+            downstream=[],
+        )
+        mosaic_appsink = Component(
+            name="mosaic_appsink",
+            element="appsink",
+            config=appsink_props,
+            downstream=[],
+        )
+
+        mosaic_branch = {
+            "convert": mosaic_convert,
+            "enc": mosaic_enc,
+            "tee": mosaic_tee,
+            "queue": mosaic_sink_queue,
+            "appsink": mosaic_appsink,
+        }
+        for comp in mosaic_branch.values():
+            pipeline.components[comp.name] = comp
+            _safe_add(ds_pipeline, comp, pipeline.errors)
+            _apply_component_config(ds_pipeline, comp, pipeline.errors)
+        pipeline.components[mosaic_sink.name] = mosaic_sink
+        _safe_add(ds_pipeline, mosaic_sink, pipeline.errors)
+        _apply_component_config(ds_pipeline, mosaic_sink, pipeline.errors)
+        sink_tee.downstream.append(mosaic_convert.name)
+        mosaic_tee.downstream = [mosaic_sink_queue.name]
+
+        sink_names.append(mosaic_appsink.name)
+
+    # Build RTSP branch if rtsp_enabled is True
+    # This branch taps raw video surfaces from sink_tee, encodes to H.264, and outputs via RTSP
+    # The RTSP output can be consumed by the WebRTC gateway for browser delivery
+    rtsp_branch = {}
+    if rtsp_enabled:
+        # Always put a queue immediately after the tee so this branch cannot backpressure
+        # the main analytics/mosaic path when RTSP clients are slow or absent.
+        rtsp_queue = Component(
+            name="rtsp_queue",
+            element="queue",
+            config={
+                "leaky": 2,
+                "max-size-buffers": 4,
+                "max-size-bytes": 0,
+                "max-size-time": 0,
+            },
+            downstream=[],
+        )
+        rtsp_vconv = Component(
+            name="rtsp_vconv",
+            element="nvvideoconvert",
+            config={
+                "gpu-id": streammux_cfg.get("gpu-id", 0),
+                "nvbuf-memory-type": 0,
+            },
+            downstream=[],
+        )
+        # nvrtspoutsinkbin handles encoding, RTP payloading, and RTSP server internally
+        # enc-type: 0=H264 hardware, 1=H265 hardware
+        # bitrate is in kbps for nvrtspoutsinkbin
+        rtsp_mount = f"/{rtsp_path}" if not rtsp_path.startswith("/") else rtsp_path
+        rtsp_out = Component(
+            name="rtsp_out",
+            element="nvrtspoutsinkbin",
+            config={
+                "rtsp-port": rtsp_port,
+                "rtsp-mount-point": rtsp_mount,
+                "enc-type": 0,  # H264
+                "bitrate": video_bitrate_kbps * 1000,  # nvrtspoutsinkbin expects bps
+                # Force frequent IDR frames so WebRTC peers can start decoding quickly after connect.
+                "iframeinterval": max(1, int(rtsp_iframeinterval)),
+                "idrinterval": max(1, int(rtsp_idrinterval)),
+                # 0=baseline, 1=main, 2=high (H.264); keep baseline for broad browser compatibility.
+                "profile": int(rtsp_profile),
+                # Avoid stalling the main pipeline if the RTSP sink runs behind.
+                "sync": False,
+            },
+            downstream=[],
+        )
+
+        rtsp_branch = {
+            "queue": rtsp_queue,
+            "vconv": rtsp_vconv,
+            "out": rtsp_out,
+        }
+        for comp in rtsp_branch.values():
+            pipeline.components[comp.name] = comp
+            _safe_add(ds_pipeline, comp, pipeline.errors)
+            _apply_component_config(ds_pipeline, comp, pipeline.errors)
+        sink_tee.downstream.append(rtsp_queue.name)
+
     # No per-camera frame branches in tiled mode
 
+    # Link graph now that all nodes exist.
+    def _link(src: str, dst: str) -> None:
+        if src not in pipeline.components or dst not in pipeline.components:
+            return
+        _safe_link(ds_pipeline, pipeline.errors, src, dst)
+
+    for source in pipeline.components:
+        if source.startswith("source_"):
+            _link(source, "streammux")
+
+    if preprocess_component is not None:
+        _link("streammux", preprocess_component.name)
+        _link(preprocess_component.name, primary.name)
+    else:
+        _link("streammux", primary.name)
+
+    _link(primary.name, tee_component.name)
+    _link(tee_component.name, primary_branch)
+    if exclude_component is not None:
+        _link(exclude_component.name, tracker.name)
+    if mapanything is not None:
+        mapanything_queue = pipeline.components.get("mapanything_queue")
+        mapanything_valve = pipeline.components.get("mapanything_valve")
+        if mapanything_queue is not None:
+            _link(tee_component.name, mapanything_queue.name)
+        if mapanything_valve is not None:
+            _link(mapanything_queue.name if mapanything_queue else tee_component.name, mapanything_valve.name)
+            _link(mapanything_valve.name, mapanything.name)
+        else:
+            _link(tee_component.name, mapanything.name)
+        if mapanything_sink is not None:
+            _link(mapanything.name, mapanything_sink.name)
+
+    if analytics is not None:
+        _link(tracker.name, analytics.name)
+        _link(analytics.name, tiler.name)
+    else:
+        _link(tracker.name, tiler.name)
+
+    _link(tiler.name, osd.name)
+    _link(osd.name, sink_tee.name)
+    if mosaic_branch:
+        _link(sink_tee.name, mosaic_branch["convert"].name)
+        _link(mosaic_branch["convert"].name, mosaic_branch["enc"].name)
+        _link(mosaic_branch["enc"].name, mosaic_branch["tee"].name)
+        _link(mosaic_branch["tee"].name, mosaic_branch["queue"].name)
+
+        # Link queue → mosaic_appsink (dedicated listener branch)
+        _link(mosaic_branch["queue"].name, mosaic_branch["appsink"].name)
+
+    # Link RTSP branch: sink_tee → rtsp_queue → rtsp_vconv → rtsp_out
+    # (nvrtspoutsinkbin handles encoding and RTP payloading internally)
+    if rtsp_branch:
+        rtsp_queue = rtsp_branch.get("queue")
+        if rtsp_queue is not None:
+            _link(sink_tee.name, rtsp_queue.name)
+            _link(rtsp_queue.name, rtsp_branch["vconv"].name)
+        else:
+            _link(sink_tee.name, rtsp_branch["vconv"].name)
+        _link(rtsp_branch["vconv"].name, rtsp_branch["out"].name)
+
+    for sink_name in sink_names:
+        if mosaic_branch and sink_name == "mosaic_appsink":
+            continue
+        _link(sink_tee.name, sink_name)
+
+    _attach_depth_gate(pipeline)
+    _attach_fps_probes(pipeline)
     _PIPELINE_SINGLETON = pipeline
-    pipeline.mark_depth_enabled(False)
+    # Depth is disabled by default; the MapAnything gate is closed shortly after activation
+    # (see activate()) to avoid a "stuck-at-PAUSED" preroll issue when the valve is closed
+    # before negotiation completes.
     return pipeline
 
 
@@ -425,51 +1104,95 @@ def get_pipeline() -> DS8Pipeline:
     return _PIPELINE_SINGLETON
 
 
-def prepare() -> bool:
+def prepare(on_message=None) -> bool:
     pipeline = get_pipeline()
-    pipeline.prepared = True
-    return True
+    if pipeline.errors:
+        logger.error("Cannot prepare DS8 pipeline; errors present: %s", pipeline.errors)
+        return False
+    if pipeline.ds_pipeline is None:
+        pipeline.errors.append("pyservicemaker:unavailable")
+        logger.error("Cannot prepare DS8 pipeline; pyservicemaker unavailable")
+        return False
+    try:
+        if on_message is not None:
+            result = pipeline.ds_pipeline.prepare(on_message)  # type: ignore[union-attr]
+        else:
+            result = pipeline.ds_pipeline.prepare()  # type: ignore[union-attr]
+        # pyservicemaker.Pipeline.prepare() returns 1 on success, -1 on failure.
+        if isinstance(result, int) and result != 1:
+            pipeline.errors.append(f"prepare:return:{result}")
+            logger.error("DS8 pipeline prepare returned non-success code: %s", result)
+            pipeline.prepared = False
+            return False
+        pipeline.prepared = True
+        return True
+    except Exception as exc:  # pragma: no cover - depends on runtime implementation
+        pipeline.errors.append(f"prepare:{exc}")
+        logger.error("DS8 pipeline prepare failed: %s", exc)
+        pipeline.prepared = False
+        return False
 
 
 def activate() -> bool:
     pipeline = get_pipeline()
     if not pipeline.prepared:
-        prepare()
+        if not prepare():
+            return False
     # Attempt to start the underlying DS8 Service Maker pipeline if available.
-    started = False
     ds = getattr(pipeline, "ds_pipeline", None)
     if ds is None:
-        # Running in dry-run mode (no DS8 bindings available); keep API success for tests
-        logger.warning("DS8 bindings not available; running in dry-run mode (no GPU activity)")
+        logger.error("DS8 bindings not available; activation aborted")
+        pipeline.activated = False
+        return False
+    try:
+        # Prime MapAnything branch negotiation: leave the valve open briefly so SGIE can preroll,
+        # then close it if depth remains disabled (default). Without this, closing the valve
+        # before the first preroll buffer can stall the whole pipeline.
+        if pipeline._prime_timer is not None:
+            try:
+                pipeline._prime_timer.cancel()
+            except Exception:
+                pass
+            pipeline._prime_timer = None
+        if pipeline.valve_name:
+            pipeline._set_valve_drop(False)
+        ds.activate()  # type: ignore[union-attr]
         pipeline.activated = True
+        if pipeline.valve_name and not pipeline.depth_enabled:
+            prime_env = os.environ.get("NOESIS_MAPANYTHING_GATE_PRIME_SECONDS", "1.0")
+            try:
+                prime_seconds = float(str(prime_env).strip())
+            except Exception:
+                prime_seconds = 1.0
+            prime_seconds = max(0.1, min(10.0, prime_seconds))
+
+            def _close_gate() -> None:
+                with pipeline._depth_lock:
+                    if pipeline.depth_enabled:
+                        return
+                pipeline._set_valve_drop(True)
+                logger.info("MapAnything gate primed; closed valve after %.2fs", prime_seconds)
+
+            timer = threading.Timer(prime_seconds, _close_gate)
+            timer.daemon = True
+            timer.start()
+            pipeline._prime_timer = timer
         return True
-
-    for method_name in ("start", "run", "play"):
-        try:
-            method = getattr(ds, method_name, None)
-            if callable(method):
-                method()
-                started = True
-                break
-        except Exception as exc:  # pragma: no cover - depends on runtime implementation
-            pipeline.errors.append(f"activate:{method_name}:{exc}")
-
-    if not started and hasattr(ds, "set_state"):
-        try:
-            ds.set_state("PLAYING")  # best-effort fallback if supported
-            started = True
-        except Exception as exc:  # pragma: no cover - depends on runtime implementation
-            pipeline.errors.append(f"activate:set_state:{exc}")
-
-    pipeline.activated = True
-    if not started:
-        logger.warning("DS8 pipeline could not be started (no known start method). GPU pipeline may be idle.")
-    return started or True
+    except Exception as exc:  # pragma: no cover - depends on runtime implementation
+        pipeline.errors.append(f"activate:{exc}")
+        logger.error("DS8 pipeline activation failed: %s", exc)
+        pipeline.activated = False
+        return False
 
 
 def enable_depth(seconds: int = 20) -> Dict[str, Any]:
     """Enable the MapAnything depth branch for a limited time window."""
     pipeline = get_pipeline()
+    if not pipeline.depth_gate_supported:
+        warning = "Depth gating not configured; depth branch will not be dropped upstream (logical gating only)."
+        if warning not in pipeline.errors:
+            pipeline.errors.append(warning)
+        logger.warning(warning)
     now = time.time()
     end_at = now + max(0, int(seconds))
 

@@ -1,9 +1,10 @@
 from __future__ import annotations
 
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple, Mapping
 
 import copy
 import logging
+import configparser
 import os
 import threading
 from pathlib import Path
@@ -20,11 +21,13 @@ app = FastAPI(title="Noesis DS8 Analytics API")
 
 ANALYTICS_CONFIG_ENV = "NOESIS_ANALYTICS_CONFIG"
 DEFAULT_ANALYTICS_CONFIG = Path("config/nvdsanalytics.yaml")
+DEFAULT_EXCLUDE_CONFIG = Path("config/config_nvdsanalytics_exclude.ini")
 
 _CONFIG_LOCK = threading.Lock()
 _CONFIG_CACHE: Optional[Dict[str, Any]] = None
 _CONFIG_PATH: Optional[Path] = None
 _RELOAD_HOOK: Optional[Callable[[str, Dict[str, Any]], None]] = None
+_RELOAD_COUNTER: int = 0
 
 
 def _resolve_analytics_config() -> Path:
@@ -53,8 +56,14 @@ def _load_config(force: bool = False) -> Dict[str, Any]:
 
 
 def _store_config(config: Dict[str, Any]) -> None:
-    """Persist the in-memory cache to keep GET responses consistent."""
+    """Persist the in-memory cache and write through to disk."""
     global _CONFIG_CACHE
+    path = _CONFIG_PATH or _resolve_analytics_config()
+    try:
+        with path.open("w", encoding="utf-8") as stream:
+            yaml.safe_dump(config, stream, sort_keys=False)
+    except Exception as exc:
+        logger.exception("Failed to write analytics config to %s: %s", path, exc)
     _CONFIG_CACHE = copy.deepcopy(config)
 
 
@@ -62,6 +71,113 @@ def register_reload_hook(callback: Callable[[str, Dict[str, Any]], None]) -> Non
     """Allow the pipeline to subscribe for hot-reload notifications."""
     global _RELOAD_HOOK
     _RELOAD_HOOK = callback
+
+
+def _resolve_exclude_config_path() -> Path:
+    """Determine the config file used by the exclusion element."""
+    env_path = os.environ.get("NOESIS_ANALYTICS_EXCLUDE_CONFIG")
+    if env_path:
+        return Path(env_path).expanduser()
+    try:
+        from noesis.pipelines import ds8_pipeline
+
+        graph = ds8_pipeline.get_pipeline()
+        component = graph.components.get("analytics_exclude") if graph else None
+        cfg_file = None
+        if component and isinstance(component.config, dict):
+            cfg_file = component.config.get("config-file")
+        if cfg_file:
+            return Path(cfg_file).expanduser()
+    except Exception:
+        pass
+    return DEFAULT_EXCLUDE_CONFIG
+
+
+def _coerce_roi_points(roi: Mapping[str, Any]) -> List[float]:
+    coords: List[float] = []
+    for point in roi.get("points_px", []) or []:
+        if not isinstance(point, (list, tuple)) or len(point) < 2:
+            continue
+        try:
+            px = float(point[0])
+            py = float(point[1])
+        except Exception:
+            continue
+        coords.extend([px, py])
+    return coords
+
+
+def _persist_exclude_ini(stage_cfg: Dict[str, Any], path: Path) -> None:
+    """Render an nvdsroiexclude-style INI from the DS8 analytics stage config."""
+    parser = configparser.ConfigParser()
+    parser.optionxform = str  # preserve hyphenated keys
+
+    defaults = stage_cfg.get("defaults") or {}
+    default_class_ids = defaults.get("class_ids") or []
+    default_class_id = int(default_class_ids[0]) if default_class_ids else -1
+    inverse_default = bool(defaults.get("inverse_roi", False))
+
+    width = int(stage_cfg.get("config_width", 1920) or 1920)
+    height = int(stage_cfg.get("config_height", 1080) or 1080)
+    parser["property"] = {
+        "enable": "1",
+        "osd-mode": str(stage_cfg.get("osd_mode", 0) or 0),
+        "display-font-size": str(stage_cfg.get("display_font_size", 12) or 12),
+        "config-width": str(width),
+        "config-height": str(height),
+    }
+
+    streams_cfg = stage_cfg.get("streams") or {}
+    for stream_id, stream_cfg in streams_cfg.items():
+        section = f"roi-filtering-stream-{stream_id}"
+        roi_filtering = stream_cfg.get("roi_filtering") or {}
+        enable = bool(roi_filtering.get("enable", False))
+        class_ids = (
+            roi_filtering.get("class_ids")
+            or stream_cfg.get("class_ids")
+            or default_class_ids
+        )
+        class_id = int(class_ids[0]) if class_ids else default_class_id
+        inverse_roi = roi_filtering.get(
+            "inverse_roi", stream_cfg.get("inverse_roi", inverse_default)
+        )
+        section_values: Dict[str, str] = {
+            "enable": "1" if enable else "0",
+            "class-id": str(class_id),
+            "inverse-roi": "1" if inverse_roi else "0",
+        }
+
+        rois = roi_filtering.get("rois") or []
+        for roi in rois:
+            roi_id = str(roi.get("id") or roi.get("label") or "").strip() or "roi"
+            coords = _coerce_roi_points(roi)
+            if len(coords) < 6:  # need at least 3 points
+                continue
+            try:
+                rounded = [str(int(round(val))) for val in coords]
+            except Exception:
+                rounded = [str(val) for val in coords]
+            section_values[f"roi-{roi_id}"] = ";".join(rounded)
+
+        parser[section] = section_values
+
+    path = path.expanduser()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as stream:
+        parser.write(stream)
+
+
+def _sync_exclude_stage(stage_name: str, stage_cfg: Dict[str, Any]) -> Optional[Path]:
+    """Keep the exclusion INI in sync with the DS8 analytics YAML."""
+    if stage_name != "exclude":
+        return None
+    try:
+        target = _resolve_exclude_config_path()
+        _persist_exclude_ini(stage_cfg, target)
+        return target
+    except Exception as exc:
+        logger.warning("Failed to persist exclusion config: %s", exc)
+        return None
 
 
 class ROI(BaseModel):
@@ -175,29 +291,46 @@ def _apply_updates(stage_cfg: Dict[str, Any], request: ROIUpdateRequest) -> None
 
 
 def _trigger_reload(stage_name: str, stage_cfg: Dict[str, Any]) -> bool:
+    global _RELOAD_COUNTER
     payload = copy.deepcopy(stage_cfg)
+    exclude_path = _sync_exclude_stage(stage_name, payload)
+    _RELOAD_COUNTER += 1
+    logger.info("Analytics reload applied for stage %s (reload_count=%s)", stage_name, _RELOAD_COUNTER)
+    reloaded = False
 
     if _RELOAD_HOOK is not None:
         try:
             _RELOAD_HOOK(stage_name, payload)
-            return True
+            reloaded = True
         except Exception:  # pragma: no cover - defensive logging
             logger.exception("Analytics reload hook failed for stage %s", stage_name)
-            return False
 
+    graph = None
     try:
         from noesis.pipelines import ds8_pipeline
 
         graph = ds8_pipeline.get_pipeline()
     except Exception:
-        return False
+        graph = None
 
-    component = graph.components.get("analytics") if graph else None
-    if component is None:
-        return False
+    if graph is not None:
+        analytics_cfg = graph.config.setdefault("analytics", {})
+        analytics_cfg.setdefault("stages", {})[stage_name] = payload
 
-    component.config.setdefault("runtime_updates", {})[stage_name] = payload
-    return True
+        component = graph.components.get("analytics")
+        if component is not None:
+            component.config.setdefault("runtime_updates", {})[stage_name] = payload
+            if exclude_path and stage_name == "exclude":
+                component.config.setdefault("exclude_config_path", str(exclude_path))
+
+        if stage_name == "exclude":
+            exclude_component = graph.components.get("analytics_exclude")
+            if exclude_component is not None:
+                exclude_component.config.setdefault("runtime_updates", {})[stage_name] = payload
+                if exclude_path:
+                    exclude_component.config["config-file"] = str(exclude_path)
+
+    return reloaded or graph is not None
 
 
 @app.get("/api/v1/analytics/rois", response_model=ROIListResponse)

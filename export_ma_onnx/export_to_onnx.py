@@ -38,56 +38,126 @@ class MapAnythingDepthWrapper(nn.Module):
         mean_tensor: torch.Tensor,
         std_tensor: torch.Tensor,
         use_fused_input: bool,
+        *,
+        return_conf_mask: bool = False,
+        include_intrinsics: bool = False,
+        fx_default: float = 1000.0,
+        fy_default: float = 1000.0,
     ) -> None:
         super().__init__()
         self.model = base_model
         self.norm_type = normalization_type
         self.use_fused_input = use_fused_input
+        self.return_conf_mask = bool(return_conf_mask)
+        self.include_intrinsics = bool(include_intrinsics)
+        self.fx_default = float(fx_default)
+        self.fy_default = float(fy_default)
         self.register_buffer("mean", mean_tensor)
         self.register_buffer("std", std_tensor)
 
-    def forward(
-        self,
-        fused_or_images: torch.Tensor,
-        intrinsics: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
+    def _build_intrinsics(self, images: torch.Tensor) -> torch.Tensor:
+        _, _, height, width = images.shape
+        device = images.device
+        dtype = images.dtype
+        intrinsics = torch.tensor(
+            [
+                self.fx_default,
+                0.0,
+                float(width) / 2.0,
+                0.0,
+                self.fy_default,
+                float(height) / 2.0,
+                0.0,
+                0.0,
+                1.0,
+            ],
+            device=device,
+            dtype=dtype,
+        ).view(1, 3, 3)
+        return intrinsics.expand(images.size(0), -1, -1)
+
+    def forward(self, fused_or_images: torch.Tensor):  # type: ignore[override]
+        """ONNX-exportable forward wrapper around `MapAnything.forward()`.
+
+        IMPORTANT: Do not call `MapAnything.infer()` here. The `infer()` path performs
+        postprocessing with numpy conversions (e.g. edge masks) which breaks ONNX export
+        and can yield incorrect/traced graphs. We call `forward()` and derive:
+        - `depth`: `pts3d_cam[..., 2]` (Z-depth in camera frame)
+        - `conf`: model confidence (if available)
+        - `mask`: non-ambiguous mask (if available)
+        using torch ops only.
+        """
         if self.use_fused_input:
-            if intrinsics is not None:
-                raise ValueError("Fused-input wrapper expects a single tensor argument")
             fused = fused_or_images
             if fused.dim() != 4:
                 raise ValueError(f"Expected fused tensor with shape (N,12,H,W), got {tuple(fused.shape)}")
             if fused.size(1) != 12:
                 raise ValueError(f"Expected fused tensor to have 12 channels, got {fused.size(1)}")
             images = fused[:, :3, :, :]
-            intr_map = fused[:, 3:, :, :]
-            # Average spatial dimensions to recover the flattened 3x3 intrinsics.
-            intr_flat = intr_map.mean(dim=(-2, -1))
-            intrinsics_mat = intr_flat.view(-1, 3, 3)
+            intrinsics_mat = None
+            if self.include_intrinsics:
+                intr_map = fused[:, 3:, :, :]
+                # Average spatial dimensions to recover the flattened 3x3 intrinsics.
+                intr_flat = intr_map.mean(dim=(-2, -1))
+                intrinsics_mat = intr_flat.view(-1, 3, 3)
         else:
             images = fused_or_images
-            if intrinsics is None:
-                raise ValueError("Two-input wrapper requires intrinsics tensor")
-            intrinsics_mat = intrinsics
             if images.dim() != 4:
                 raise ValueError(f"Expected images with shape (N,3,H,W), got {tuple(images.shape)}")
-            if intrinsics_mat.dim() != 3:
-                raise ValueError(f"Expected intrinsics with shape (N,3,3), got {tuple(intrinsics_mat.shape)}")
-            if images.size(0) != intrinsics_mat.size(0):
-                raise ValueError(f"Batch size mismatch: images {images.size(0)} vs intrinsics {intrinsics_mat.size(0)}")
+            if images.size(1) != 3:
+                raise ValueError(f"Expected images to have 3 channels, got {images.size(1)}")
+            intrinsics_mat = self._build_intrinsics(images) if self.include_intrinsics else None
 
         normalized = (images - self.mean) / self.std
 
         view = {
-            "img": normalized[0].unsqueeze(0),
-            "intrinsics": intrinsics_mat[0].unsqueeze(0),
+            "img": normalized,
             "data_norm_type": [self.norm_type],
         }
-        output = self.model.infer([view])
-        output_dict = output[0]
-        depth_tensor = output_dict["depth_along_ray"] if "depth_along_ray" in output_dict else output_dict["depth_z"]
-        depth = depth_tensor[0, :, :, 0]
-        return depth.unsqueeze(0).unsqueeze(0)
+
+        # `MapAnything.forward()` accepts ray directions in camera frame, not raw intrinsics.
+        if intrinsics_mat is not None:
+            from mapanything.utils.geometry import get_rays_in_camera_frame  # type: ignore
+
+            _, ray_dirs = get_rays_in_camera_frame(
+                intrinsics=intrinsics_mat,
+                height=int(images.shape[-2]),
+                width=int(images.shape[-1]),
+                normalize_to_unit_sphere=True,
+            )
+            view["ray_directions_cam"] = ray_dirs
+
+        preds = self.model.forward([view], memory_efficient_inference=False)
+        if not isinstance(preds, (list, tuple)) or not preds:
+            raise RuntimeError("MapAnything.forward returned no outputs")
+        out = preds[0]
+        if not isinstance(out, dict):
+            raise TypeError(f"Expected MapAnything.forward output dict, got {type(out)!r}")
+
+        if "pts3d_cam" in out:
+            depth_z = out["pts3d_cam"][..., 2]  # (N, H, W)
+        elif "depth_along_ray" in out:
+            depth_z = out["depth_along_ray"].squeeze(-1)
+        else:
+            raise KeyError("MapAnything.forward output missing pts3d_cam/depth_along_ray")
+
+        depth_out = depth_z.unsqueeze(1).to(torch.float32)  # (N, 1, H, W)
+        if not self.return_conf_mask:
+            return depth_out
+
+        conf = out.get("conf")
+        if conf is None:
+            conf_out = torch.zeros_like(depth_out)
+        else:
+            conf_out = conf.unsqueeze(1).to(torch.float32)
+
+        non_ambiguous_mask = out.get("non_ambiguous_mask")
+        if non_ambiguous_mask is None:
+            mask_out = torch.ones_like(depth_out)
+        else:
+            mask_out = non_ambiguous_mask.to(torch.float32).unsqueeze(1)
+
+        return depth_out, conf_out, mask_out
 
 @dataclass
 class ExportConfig:
@@ -102,29 +172,64 @@ class ExportConfig:
     repo_url: Optional[str]
     repo_branch: Optional[str]
     fused_input: bool
+    hf_model_id: Optional[str]
+    include_intrinsics: bool
+    return_conf_mask: bool
+    skip_ort: bool
+    skip_simplify: bool
+    skip_shape_inference: bool
 
 
 def parse_args() -> ExportConfig:
     parser = argparse.ArgumentParser(description="Export MapAnything monocular depth model to ONNX")
     parser.add_argument("--repo", required=True, help="Path to the MapAnything repository")
-    parser.add_argument("--outdir", default="ma_onnx_out_fused", help="Directory where ONNX files will be written")
-    parser.add_argument("--h", type=int, default=512, help="Input image height")
-    parser.add_argument("--w", type=int, default=512, help="Input image width")
+    parser.add_argument("--outdir", default="ma_onnx_out_clean", help="Directory where ONNX files will be written")
+    # For 1920x1080 sources, MapAnything preprocess uses max side=518 and rounds to patch-size (14):
+    # 518x294 (W×H). Keep these as the default export dims for DS8 full-frame inference.
+    parser.add_argument("--h", type=int, default=294, help="Input image height (default: 294 for 16:9 sources)")
+    parser.add_argument("--w", type=int, default=518, help="Input image width (default: 518 for 16:9 sources)")
     parser.add_argument("--opset", type=int, default=17, help="ONNX opset version")
     parser.add_argument("--ckpt", default="", help="Optional checkpoint path for weight loading")
+    parser.add_argument(
+        "--hf-model-id",
+        default="facebook/map-anything-apache",
+        help="HuggingFace model id to load via MapAnything.from_pretrained (recommended; pass '' to disable).",
+    )
     parser.add_argument("--repo-url", default=None, help="Repository URL for reporting")
     parser.add_argument("--repo-branch", default=None, help="Repository branch for reporting")
-    fused_help = "Export fused single-input variant (mapanything_fused). Disable for legacy two-input export."
+    parser.add_argument("--skip-ort", action="store_true", help="Skip ONNX Runtime smoke test (saves RAM/time).")
+    parser.add_argument("--skip-simplify", action="store_true", help="Skip onnxsim simplification (saves RAM/time).")
+    parser.add_argument("--skip-shape-inference", action="store_true", help="Skip ONNX shape inference step.")
+    fused_help = "Export fused 12-channel input variant (mapanything_fused). Disable to export images-only model."
     if hasattr(argparse, "BooleanOptionalAction"):
         parser.add_argument(
             "--fused-input",
             action=argparse.BooleanOptionalAction,  # type: ignore[attr-defined]
-            default=True,
+            default=False,
             help=fused_help,
         )
     else:  # pragma: no cover - fallback for older Python
-        parser.add_argument("--fused-input", dest="fused_input", action="store_true", default=True, help=fused_help)
+        parser.add_argument("--fused-input", dest="fused_input", action="store_true", default=False, help=fused_help)
         parser.add_argument("--no-fused-input", dest="fused_input", action="store_false")
+    intrinsics_help = "Whether to compute ray_directions_cam from intrinsics (images-only inference works without calibration inputs)."
+    if hasattr(argparse, "BooleanOptionalAction"):
+        parser.add_argument(
+            "--include-intrinsics",
+            action=argparse.BooleanOptionalAction,  # type: ignore[attr-defined]
+            default=False,
+            help=intrinsics_help,
+        )
+        parser.add_argument(
+            "--return-conf-mask",
+            action=argparse.BooleanOptionalAction,  # type: ignore[attr-defined]
+            default=True,
+            help="Return depth + conf + mask outputs (for DS8 tensor meta postprocess).",
+        )
+    else:  # pragma: no cover
+        parser.add_argument("--include-intrinsics", dest="include_intrinsics", action="store_true", default=False, help=intrinsics_help)
+        parser.add_argument("--no-include-intrinsics", dest="include_intrinsics", action="store_false")
+        parser.add_argument("--return-conf-mask", dest="return_conf_mask", action="store_true", default=True, help="Return depth + conf + mask outputs.")
+        parser.add_argument("--no-return-conf-mask", dest="return_conf_mask", action="store_false")
     args = parser.parse_args()
 
     repo_path = Path(args.repo).resolve()
@@ -148,6 +253,12 @@ def parse_args() -> ExportConfig:
         repo_url=args.repo_url,
         repo_branch=args.repo_branch,
         fused_input=bool(args.fused_input),
+        hf_model_id=str(args.hf_model_id).strip() or None,
+        include_intrinsics=bool(getattr(args, "include_intrinsics", False)),
+        return_conf_mask=bool(getattr(args, "return_conf_mask", True)),
+        skip_ort=bool(getattr(args, "skip_ort", False)),
+        skip_simplify=bool(getattr(args, "skip_simplify", False)),
+        skip_shape_inference=bool(getattr(args, "skip_shape_inference", False)),
     )
 
 
@@ -178,6 +289,7 @@ def load_model(cfg: ExportConfig) -> Dict[str, Any]:
 
     from hydra import compose, initialize_config_dir  # type: ignore
     from mapanything.models import init_model  # type: ignore
+    from mapanything.models import MapAnything  # type: ignore
     from uniception.models.encoders.image_normalizations import (  # type: ignore
         IMAGE_NORMALIZATION_DICT,
     )
@@ -186,42 +298,51 @@ def load_model(cfg: ExportConfig) -> Dict[str, Any]:
     if not configs_dir.exists():
         raise FileNotFoundError(f"Could not locate configs directory at {configs_dir}")
 
-    LOGGER.info("Composing Hydra config for MapAnything model")
-    with initialize_config_dir(config_dir=str(configs_dir), job_name="ma_export", version_base=None):
-        hydra_cfg = compose(config_name="model/mapanything.yaml")
-
-        model_section = hydra_cfg.model
-    model_str = model_section.model_str
-    model_config = model_section.model_config
-    torch_hub_force_reload = bool(model_section.get("torch_hub_force_reload", False))
-
-    @contextlib.contextmanager
-    def disable_dinov2_pretrained_download():
-        import torch.hub as torch_hub  # Local import to avoid global mutation if torch is unavailable
-        original_load = torch_hub.load
-        def patched_load(repo_or_dir, model, *args, **kwargs):
-            if repo_or_dir == "facebookresearch/dinov2":
-                kwargs.setdefault("pretrained", False)
-                kwargs.setdefault("weights", None)
-                LOGGER.info("Patching torch.hub.load for %s to avoid pretrained weights", model)
-            return original_load(repo_or_dir, model, *args, **kwargs)
-        torch_hub.load = patched_load  # type: ignore[assignment]
-        try:
-            yield
-        finally:
-            torch_hub.load = original_load  # type: ignore[assignment]
-
-    LOGGER.info("Instantiating model '%s'", model_str)
-    with disable_dinov2_pretrained_download():
-        model = init_model(
-            model_str=model_str,
-            model_config=model_config,
-            torch_hub_force_reload=torch_hub_force_reload,
-        )
-    model.eval()
-
     checkpoint_status = "no checkpoint provided"
     checkpoint_error: Optional[str] = None
+
+    if cfg.hf_model_id:
+        LOGGER.info("Loading MapAnything via HuggingFace: %s", cfg.hf_model_id)
+        model = MapAnything.from_pretrained(cfg.hf_model_id)
+        model.eval()
+        checkpoint_status = f"hf:{cfg.hf_model_id}"
+    else:
+        LOGGER.info("Composing Hydra config for MapAnything model")
+        with initialize_config_dir(config_dir=str(configs_dir), job_name="ma_export", version_base=None):
+            hydra_cfg = compose(config_name="model/mapanything.yaml")
+
+            model_section = hydra_cfg.model
+        model_str = model_section.model_str
+        model_config = model_section.model_config
+        torch_hub_force_reload = bool(model_section.get("torch_hub_force_reload", False))
+
+        @contextlib.contextmanager
+        def disable_dinov2_pretrained_download():
+            import torch.hub as torch_hub  # Local import to avoid global mutation if torch is unavailable
+            original_load = torch_hub.load
+
+            def patched_load(repo_or_dir, model, *args, **kwargs):
+                if repo_or_dir == "facebookresearch/dinov2":
+                    kwargs.setdefault("pretrained", False)
+                    kwargs.setdefault("weights", None)
+                    LOGGER.info("Patching torch.hub.load for %s to avoid pretrained weights", model)
+                return original_load(repo_or_dir, model, *args, **kwargs)
+
+            torch_hub.load = patched_load  # type: ignore[assignment]
+            try:
+                yield
+            finally:
+                torch_hub.load = original_load  # type: ignore[assignment]
+
+        LOGGER.info("Instantiating model '%s'", model_str)
+        with disable_dinov2_pretrained_download():
+            model = init_model(
+                model_str=model_str,
+                model_config=model_config,
+                torch_hub_force_reload=torch_hub_force_reload,
+            )
+        model.eval()
+
     if cfg.checkpoint_path:
         LOGGER.info("Loading checkpoint from %s", cfg.checkpoint_path)
         try:
@@ -251,7 +372,22 @@ def load_model(cfg: ExportConfig) -> Dict[str, Any]:
         mean = torch.tensor(img_norm.mean, dtype=torch.float32).view(1, -1, 1, 1)
         std = torch.tensor(img_norm.std, dtype=torch.float32).view(1, -1, 1, 1)
 
-    wrapper = MapAnythingDepthWrapper(model, norm_type, mean, std, use_fused_input=cfg.fused_input)
+    wrapper = MapAnythingDepthWrapper(
+        model,
+        norm_type,
+        mean,
+        std,
+        use_fused_input=cfg.fused_input,
+        include_intrinsics=cfg.include_intrinsics,
+        return_conf_mask=cfg.return_conf_mask,
+    )
+    # Prefer exporting on CUDA when available (MapAnything forward can be very slow on CPU).
+    try:
+        target_device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        wrapper.to(target_device)
+        LOGGER.info("Moved export wrapper to device: %s", target_device)
+    except Exception as exc:  # pragma: no cover - best effort
+        LOGGER.warning("Failed to move wrapper to CUDA; exporting on CPU: %s", exc)
 
     import inspect
 
@@ -284,8 +420,17 @@ def export_onnx(wrapper: nn.Module, cfg: ExportConfig, artifacts: Dict[str, Any]
         width = ((width // 14) + 1) * 14 if width % 14 != 0 else width
         print(f"[WARNING] Adjusting input size from {orig_height}x{orig_width} to {height}x{width} to satisfy encoder patch size 14")
 
-    dummy_images = torch.rand(1, 3, height, width, dtype=torch.float32)
-    dummy_intrinsics = torch.eye(3, dtype=torch.float32).unsqueeze(0)
+    try:
+        export_device = next(wrapper.parameters()).device
+    except StopIteration:
+        export_device = getattr(getattr(wrapper, "mean", None), "device", torch.device("cpu"))
+
+    dummy_images = torch.rand(1, 3, height, width, dtype=torch.float32, device=export_device)
+    dummy_images_cpu = dummy_images.detach().cpu()
+
+    output_names = ["depth"]
+    if cfg.return_conf_mask:
+        output_names = ["depth", "conf", "mask"]
 
     if cfg.fused_input:
         intr_template = torch.tensor(
@@ -301,20 +446,19 @@ def export_onnx(wrapper: nn.Module, cfg: ExportConfig, artifacts: Dict[str, Any]
                 1.0,
             ],
             dtype=torch.float32,
+            device=export_device,
         ).view(1, 9, 1, 1)
         dummy_intr_map = intr_template.expand(-1, -1, height, width)
         dummy_fused = torch.cat([dummy_images, dummy_intr_map], dim=1)
+        dummy_fused_cpu = dummy_fused.detach().cpu()
         export_inputs = (dummy_fused,)
         input_names = ["mapanything_fused"]
-        dynamic_axes_inputs = {"mapanything_fused": {0: "batch", 2: "height", 3: "width"}}
+        dynamic_axes_inputs = {"mapanything_fused": {0: "batch"}}
         model_path = cfg.outdir / "model_fused.onnx"
     else:
-        export_inputs = (dummy_images, dummy_intrinsics)
-        input_names = ["images", "intrinsics"]
-        dynamic_axes_inputs = {
-            "images": {0: "batch"},
-            "intrinsics": {0: "batch"},
-        }
+        export_inputs = (dummy_images,)
+        input_names = ["images"]
+        dynamic_axes_inputs = {"images": {0: "batch"}}
         model_path = cfg.outdir / "model.onnx"
 
     print(f"[INFO] Exporting static ONNX model to {model_path}")
@@ -323,18 +467,28 @@ def export_onnx(wrapper: nn.Module, cfg: ExportConfig, artifacts: Dict[str, Any]
         export_inputs,
         model_path.as_posix(),
         export_params=True,
+        dynamo=False,
         opset_version=cfg.opset,
         do_constant_folding=True,
         input_names=input_names,
-        output_names=["depth"],
+        output_names=output_names,
         dynamic_axes={
             **dynamic_axes_inputs,
-            "depth": {0: "batch", 2: "height", 3: "width"},
+            **{name: {0: "batch"} for name in output_names},
         },
     )
 
     static_external = False
-    onnx_model = onnx.load(model_path.as_posix(), load_external_data=True)
+    # Avoid loading massive external tensor blobs into memory unless needed.
+    onnx_model = onnx.load(model_path.as_posix(), load_external_data=False)
+    external_data_path = model_path.with_suffix(model_path.suffix + ".data")
+    try:
+        if any(t.data_location == onnx.TensorProto.EXTERNAL for t in onnx_model.graph.initializer):
+            static_external = True
+    except Exception:
+        pass
+    if external_data_path.exists():
+        static_external = True
 
     def sanitize_infinite_constants(model: onnx.ModelProto) -> bool:
         modified = False
@@ -344,7 +498,12 @@ def export_onnx(wrapper: nn.Module, cfg: ExportConfig, artifacts: Dict[str, Any]
             for attr in node.attribute:
                 if attr.name != "value" or attr.type != onnx.AttributeProto.TENSOR:
                     continue
-                arr = numpy_helper.to_array(attr.t)
+                try:
+                    arr = numpy_helper.to_array(attr.t)
+                except Exception:
+                    continue
+                if not np.issubdtype(arr.dtype, np.floating):
+                    continue
                 if not np.isinf(arr).any():
                     continue
                 dtype = arr.dtype
@@ -361,19 +520,25 @@ def export_onnx(wrapper: nn.Module, cfg: ExportConfig, artifacts: Dict[str, Any]
             onnx_model,
             model_path.as_posix(),
             save_as_external_data=True,
-            all_tensors_to_one_file=False,
+            all_tensors_to_one_file=True,
+            location=external_data_path.name,
         )
-        onnx_model = onnx.load(model_path.as_posix(), load_external_data=True)
+        static_external = True
 
     LOGGER.info("Running ONNX checker")
     onnx.checker.check_model(model_path.as_posix())
 
-    LOGGER.info("Running shape inference")
-    inferred_path = cfg.outdir / ("model_fused-inferred.onnx" if cfg.fused_input else "model-inferred.onnx")
-    onnx.shape_inference.infer_shapes_path(model_path.as_posix(), inferred_path.as_posix())
+    if cfg.skip_shape_inference:
+        LOGGER.info("Skipping shape inference (--skip-shape-inference)")
+    else:
+        LOGGER.info("Running shape inference")
+        inferred_path = cfg.outdir / ("model_fused-inferred.onnx" if cfg.fused_input else "model-inferred.onnx")
+        onnx.shape_inference.infer_shapes_path(model_path.as_posix(), inferred_path.as_posix())
 
     simplified_model_path: Optional[Path] = None
-    if onnxsim is None:
+    if cfg.skip_simplify:
+        simplifier_status = "skipped (--skip-simplify)"
+    elif onnxsim is None:
         simplifier_status = "onnxsim not installed"
     else:
         simplifier_target = cfg.outdir / ("model_fused_sim.onnx" if cfg.fused_input else "model_sim.onnx")
@@ -381,7 +546,6 @@ def export_onnx(wrapper: nn.Module, cfg: ExportConfig, artifacts: Dict[str, Any]
             LOGGER.info("Running onnxsim simplification")
             input_shapes = {"mapanything_fused": [1, 12, height, width]} if cfg.fused_input else {
                 "images": [1, 3, height, width],
-                "intrinsics": [1, 3, 3],
             }
             simplified_model, check_ok = onnxsim.simplify(
                 model_path.as_posix(),
@@ -399,21 +563,22 @@ def export_onnx(wrapper: nn.Module, cfg: ExportConfig, artifacts: Dict[str, Any]
 
     unique_ops = sorted({node.op_type for node in onnx_model.graph.node})
 
-    LOGGER.info("Running ONNX Runtime smoke test")
-    ort_session = ort.InferenceSession(model_path.as_posix(), providers=["CPUExecutionProvider"])
-    if cfg.fused_input:
-        ort_inputs = {"mapanything_fused": dummy_fused.numpy()}
+    if cfg.skip_ort:
+        LOGGER.info("Skipping ONNX Runtime smoke test (--skip-ort)")
+        ort_result = {"skipped": True}
     else:
-        ort_inputs = {
-            "images": dummy_images.numpy(),
-            "intrinsics": dummy_intrinsics.numpy(),
+        LOGGER.info("Running ONNX Runtime smoke test")
+        ort_session = ort.InferenceSession(model_path.as_posix(), providers=["CPUExecutionProvider"])
+        if cfg.fused_input:
+            ort_inputs = {"mapanything_fused": dummy_fused_cpu.numpy()}
+        else:
+            ort_inputs = {"images": dummy_images_cpu.numpy()}
+        ort_outputs = ort_session.run(None, ort_inputs)
+        ort_result = {
+            "num_outputs": len(ort_outputs),
+            "shapes": [list(out.shape) for out in ort_outputs],
+            "dtypes": [str(out.dtype) for out in ort_outputs],
         }
-    ort_outputs = ort_session.run(None, ort_inputs)
-    ort_result = {
-        "num_outputs": len(ort_outputs),
-        "shapes": [list(out.shape) for out in ort_outputs],
-        "dtypes": [str(out.dtype) for out in ort_outputs],
-    }
 
     dynamic_status = "not attempted"
     dynamic_error: Optional[str] = None
@@ -468,6 +633,9 @@ def write_report(
         f"Wrapper module: {__name__}.MapAnythingDepthWrapper",
         f"Normalization type: {artifacts['norm_type']}",
         f"Fused input enabled: {cfg.fused_input}",
+        f"Include intrinsics: {cfg.include_intrinsics}",
+        f"Return conf/mask: {cfg.return_conf_mask}",
+        f"HuggingFace model id: {cfg.hf_model_id or 'none'}",
         "",
         "Input specification:",
     ]
@@ -475,28 +643,30 @@ def write_report(
         lines.extend(
             [
                 f"  mapanything_fused: (N, 12, H, W) float32 (H={export_info['height']}, W={export_info['width']})",
-                "    ▹ channels 0-2 = RGB (normalized), channels 3-11 = tiled 3x3 intrinsics",
+                "    ▹ channels 0-2 = RGB in 0..1 range, channels 3-11 = tiled 3x3 intrinsics",
             ]
         )
     else:
         lines.extend(
             [
                 f"  images:  (N, 3, H, W) float32, normalized to 0..1 (H={export_info['height']}, W={export_info['width']})",
-                "  intrinsics: (N, 3, 3) float32",
+                "    ▹ ray_directions_cam computed from pinhole intrinsics" if cfg.include_intrinsics else "    ▹ images-only (no calibration inputs)",
             ]
         )
     lines.extend(
         [
             "Output specification:",
             "  depth:   (N, 1, H, W) float32",
+            "  conf:    (N, 1, H, W) float32" if cfg.return_conf_mask else "",
+            "  mask:    (N, 1, H, W) float32" if cfg.return_conf_mask else "",
             "",
             f"Opset: {cfg.opset}",
             f"Unique ONNX ops ({len(unique_ops)}): {', '.join(unique_ops)}",
             "",
             "ONNX Runtime smoke test:",
-            f"  outputs: {ort_info['num_outputs']}",
-            f"  shapes: {ort_info['shapes']}",
-            f"  dtypes: {ort_info['dtypes']}",
+            "  skipped: true" if ort_info.get("skipped") else f"  outputs: {ort_info.get('num_outputs')}",
+            "" if ort_info.get("skipped") else f"  shapes: {ort_info.get('shapes')}",
+            "" if ort_info.get("skipped") else f"  dtypes: {ort_info.get('dtypes')}",
             "",
             f"Checkpoint status: {artifacts['checkpoint_status']}",
         ]
@@ -548,8 +718,11 @@ def main() -> None:
     wrapper: MapAnythingDepthWrapper = artifacts["wrapper"]
 
     # Test wrapper
-    dummy_images = torch.rand(1, 3, height, width, dtype=torch.float32)
-    dummy_intrinsics = torch.eye(3, dtype=torch.float32).unsqueeze(0)
+    try:
+        export_device = next(wrapper.parameters()).device
+    except StopIteration:
+        export_device = getattr(getattr(wrapper, "mean", None), "device", torch.device("cpu"))
+    dummy_images = torch.rand(1, 3, height, width, dtype=torch.float32, device=export_device)
     if cfg.fused_input:
         intr_template = torch.tensor(
             [
@@ -564,13 +737,17 @@ def main() -> None:
                 1.0,
             ],
             dtype=torch.float32,
+            device=export_device,
         ).view(1, 9, 1, 1)
         dummy_intr_map = intr_template.expand(-1, -1, height, width)
         dummy_fused = torch.cat([dummy_images, dummy_intr_map], dim=1)
-        test_depth = wrapper(dummy_fused)
+        test_outputs = wrapper(dummy_fused)
     else:
-        test_depth = wrapper(dummy_images, dummy_intrinsics)
-    print("Test depth shape:", test_depth.shape)
+        test_outputs = wrapper(dummy_images)
+    if isinstance(test_outputs, (tuple, list)):
+        print("Test output shapes:", [tuple(getattr(x, "shape", ())) for x in test_outputs])
+    else:
+        print("Test output shape:", tuple(getattr(test_outputs, "shape", ())))
 
     wrapper.eval()
 

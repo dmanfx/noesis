@@ -1,57 +1,139 @@
-# DeepStream 8 inference builder configuration for Noesis full-frame pipeline.
-# This file is treated as the single source of truth for PGIE (YOLOv11) and
-# SGIE (MapAnything) model definitions consumed by the pyservicemaker scaffold.
+# DeepStream 8 canonical configuration for the DS8 pipeline.
+# Aligns with DS7 behavior (multi-URI sources, NvDCF tracker, analytics ROIs)
+# while using Service Maker Pipeline APIs.
 
-version: 1  # Schema revision for the in-house inference builder loader.
+version: 1
 
-batch_size: 3  # Process one camera feed per inference batch.
+# Process all three sources per batch.
+batch_size: 3
 
-#streammux:
-#  width: 1920
-#  height: 1080
-#  live-source: 1
-#  gpu-id: 0
+streammux:
+  width: 1920
+  height: 1080
+  batch-size: 3
+  live-source: 1
+  batched-push-timeout: 40000
+  enable-padding: 1
+  nvbuf-memory-type: 0
+  sync-inputs: 0
+  gpu-id: 0
 
-#sources:
-  # - element: nvurisrcbin
-  #   uri: rtsp://192.168.3.214:7447/jdr9oLlBkjyl3gDm?  # Livingroom camera.
-  #   gpu-id: 0
-  #   cudadec-memtype: 0
-  #   live-source: 1
-  #   rtsp-reconnect-interval-sec: 2
-  # - element: nvurisrcbin
-  #   uri: rtsp://192.168.3.214:7447/qt3VqVdZpgG1B4Vk?  # Kitchen camera.
-  #   gpu-id: 0
-  #   cudadec-memtype: 0
-  #   live-source: 1
-  #   rtsp-reconnect-interval-sec: 2
-  # - element: nvurisrcbin
-  #   uri: rtsp://192.168.3.214:7447/4qWTBhW6b4nLeUFE?  # Family room camera.
-  #   gpu-id: 0
-  #   cudadec-memtype: 0
-  #   live-source: 1
-  #   rtsp-reconnect-interval-sec: 2
-  #- element: nvurisrcbin
-  #  uri: file:///home/mayor/Downloads/kitchenclip.mp4  # MP4 video file source.
-  #  gpu-id: 0
-  #  cudadec-memtype: 0
-  #  live-source: 0  # File source, not live stream
+sources:
+  - element: nvurisrcbin
+    uri: rtsp://192.168.3.214:7447/jdr9oLlBkjyl3gDm?
+    gpu-id: 0
+    cudadec-memtype: 0
+    latency: 100
+    select-rtp-protocol: 4
+  - element: nvurisrcbin
+    uri: rtsp://192.168.3.214:7447/qt3VqVdZpgG1B4Vk?
+    gpu-id: 0
+    cudadec-memtype: 0
+    latency: 100
+    select-rtp-protocol: 4
+  - element: nvurisrcbin
+    uri: rtsp://192.168.3.214:7447/4qWTBhW6b4nLeUFE?
+    gpu-id: 0
+    cudadec-memtype: 0
+    latency: 100
+    select-rtp-protocol: 4
+
+
+preprocess:
+  enable: true
+  config-file: pipelines/config_preproc.ini
 
 models:
   pgie:
-    config-file-path: pipelines/config_infer_primary_yolo11.ini
+    config-file-path: pipelines/config_infer_primary_yolo11_seg.ini
+    engine: /home/mayor/Noesis_Devel/models/engines/yolo11s-seg_cust_fused.engine
+    batch_size: 3
+    gie_id: 1
+    network_mode: fp16
+    attach_tensor_meta: false
   mapanything:
-    enable: false
+    enable: true
+    name: mapanything_fullframe
+    config-file-path: pipelines/config_infer_secondary_mapanything.ini
+    engine: /home/mayor/Noesis_Devel/models/mapanything_depth/1/model.plan
+    batch_size: 3
+    gie_id: 2
+    attach_tensor_meta: true
+
+tracker:
+  config-file: config/nvtracker.yaml
+  ll-lib-file: /opt/nvidia/deepstream/deepstream/lib/libnvds_nvmultiobjecttracker.so
+
 analytics:
-  enable: false
+  enable: true
+  config-file: config/config_nvdsanalytics_post.ini
+  stages_config: config/nvdsanalytics.yaml
+  exclude:
+    enable: true
+    element: nvdsroiexclude
+    config-file: config/config_nvdsanalytics_exclude.ini
 
 sinks:
-  - type: fakesink  # Placeholder sink for dry runs and CI validation.
-    sync: false  # Disable clock sync to maximise pipeline throughput during tests.
+  - name: mosaic_sink
+    type: fakesink  # JPEG mosaic is tapped at mosaic_enc by MosaicForwardOperator; sink is a drop target.
+    sync: false
+  - name: bev_sink
+    type: fakesink
+    sync: false  # Placeholder for future BEV retrieval; current BEV path uses telemetry hooks, not Flow/appsinks.
 
-# DS8 frame output (GPU JPEG over WebSocket)
+# DS8 frame output (GPU JPEG over WebSocket via MosaicForwardOperator)
 output:
-  enable_frames: false  # tiled mode disables per-camera WS branches
+  enable_frames: false  # Tiled mode; frames are delivered as a JPEG mosaic from mosaic_enc over WebSocket.
   codec: jpeg
   jpeg_quality: 85
   overlays: false
+
+# Mosaic output configuration: parallel JPEG, RTSP, and WebRTC paths
+mosaic_output:
+  jpeg_enabled: false        # NVJPEG/appsink mosaic is deprecated; keep off unless explicitly enabled
+  rtsp_enabled: false        # Disable RTSP mosaic output (debug: no nvrtspoutsinkbin)
+  rtsp_port: 8554            # RTSP server port (unused when rtsp_enabled is false)
+  rtsp_path: "mosaic"        # RTSP stream path (url: rtsp://host:port/path)
+  mosaic_webrtc_enabled: false  # Disable WebRTC gateway (debug; requires RTSP mosaic)
+  video_bitrate_kbps: 4000   # H.264 encoder bitrate
+  encoder: "nvh264enc"       # H.264 encoder (fallback to x264enc if unavailable)
+  # RTSP encoder tuning for faster WebRTC startup:
+  # Frequent IDR frames reduce "connected but black" (RTP bytes flowing but 0 decoded frames) on late joins.
+  rtsp_iframeinterval: 30    # IDR/I-frame interval in frames (nvrtspoutsinkbin)
+  rtsp_idrinterval: 30       # IDR interval in frames (nvrtspoutsinkbin)
+  rtsp_profile: 0            # 0=baseline, 1=main, 2=high (H.264)
+
+# Visualization overlays rendered into the mosaic stream (tiler → osd).
+visualization:
+  trails:
+    enabled: true
+    # Restrict trails to people only (class_id 0).
+    class_ids: [0]
+    # Time-window trail history (seconds).
+    window_s: 8.0
+    # Downsample point updates (reduce jitter and CPU) while still drawing every frame.
+    draw_stride: 2
+    # Decimation: only add a point if moved enough, or enough time elapsed.
+    min_step_px: 2.0
+    min_dt_s: 0.08
+    # Footpoint smoothing time constant (seconds).
+    smooth_tau_s: 0.25
+    # Clamp trail jumps (pixels per second).
+    max_speed_px_per_s: 600.0
+    # Keep trails bounded by BOTH time and points (whichever is smaller).
+    # DS8 cost is mostly per-segment draw calls; tune this first if CPU is high.
+    max_points_per_track: 257
+    # Max number of segments rendered per track per frame.
+    max_segments_per_track: 64
+    # Max number of tracks rendered per frame (across the mosaic).
+    max_tracks: 8
+    # Rendering budgets (hard caps).
+    max_lines: 800
+    # DisplayMeta blocks are small, but each can only hold a limited number of primitives.
+    # Increase this to draw multiple long trails concurrently.
+    max_display_metas: 32
+    line_width: 3
+    min_alpha: 0.15
+    show_labels: false
+    # Color key: use StableIDManager stable_id when available.
+    color_key: stable_id

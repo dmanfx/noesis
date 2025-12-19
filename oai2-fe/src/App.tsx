@@ -11,6 +11,8 @@ import { TrailStore } from './lib/trails';
 import { cameraOrder, colorForTrack, cameraLabel, detectCameraKey, CameraKey } from './lib/camera';
 import { getExtrinsics, worldToCamera, getIntrinsics4, extractPoseFromExtrinsics, forwardXZFromExtrinsics } from './lib/calibration';
 import { useWebSocketClient, StatsPayload, DepthRequestStrategy } from './hooks/useWebSocketClient';
+import { useWebRTCClient } from './hooks/useWebRTCClient';
+import { StreamMode } from './components/StreamPanel';
 import DepthDrawer, { DepthDiagnosticsEntry, DepthDrawerEntry, DepthMetaEntry, FloorplanResponse } from './components/DepthDrawer';
 import TopDownDrawer from './components/TopDownDrawer';
 import { BevView, BevMeta } from './components/BevView';
@@ -51,7 +53,21 @@ function Dashboard() {
   const [fpsSeries, setFpsSeries] = useState<{ [k in CameraKey]: number[] }>({ 'living-room': [], 'kitchen': [], 'family-room': [] });
   const fpsHistory = useRef<{ [k: string]: number[] }>({ 'living-room': [], 'kitchen': [], 'family-room': [] });
 
-  const computeFps = (key: 'living-room' | 'kitchen' | 'family-room') => {
+  const updateFps = useCallback((key: CameraKey, fpsValRaw: number, tsOverride?: number) => {
+    const ts = tsOverride ?? Date.now();
+    const safe = Number.isFinite(fpsValRaw) ? Math.max(0, Number(fpsValRaw)) : 0;
+    const rounded = Number(safe.toFixed(1));
+    setFps(prev => ({ ...prev, [key]: `FPS: ${rounded.toFixed(1)}` }));
+    setFpsSeries(prev => {
+      const arr = [...(prev[key] || [])];
+      arr.push(rounded);
+      if (arr.length > 120) arr.shift();
+      return { ...prev, [key]: arr } as any;
+    });
+    publish({ group: `Camera ${key.replace('-', ' ')}`, key: 'FPS', value: rounded, ts });
+  }, [publish]);
+
+  const computeFps = useCallback((key: CameraKey) => {
     const hist = fpsHistory.current[key];
     const now = Date.now();
     hist.push(now);
@@ -60,18 +76,14 @@ function Dashboard() {
       const span = (hist[hist.length - 1] - hist[0]) / 1000;
       if (span > 0) {
         const fpsVal = (hist.length - 1) / span;
-        const txt = `FPS: ${fpsVal.toFixed(1)}`;
-        setFps(prev => ({ ...prev, [key]: txt }));
-        setFpsSeries(prev => {
-          const arr = [...(prev[key] || [])];
-          arr.push(Number(fpsVal.toFixed(1)));
-          if (arr.length > 120) arr.shift();
-          return { ...prev, [key]: arr } as any;
-        });
-        publish({ group: `Camera ${key.replace('-', ' ')}`, key: 'FPS', value: Number(fpsVal.toFixed(1)), ts: now });
+        updateFps(key, fpsVal, now);
       }
     }
-  };
+  }, [updateFps]);
+
+  const handleWebrtcFps = useCallback((fpsVal: number) => {
+    streamDisplayCams.forEach((cam) => updateFps(cam, fpsVal));
+  }, [updateFps]);
 
   // Occupancy/Tracks (transitions removed)
   const [occupancy, setOccupancy] = useState<string>('');
@@ -116,6 +128,10 @@ function Dashboard() {
   const maDiagThrottleRef = useRef<Record<string, number>>({});
   const lastCalibrationSignatureRef = useRef<string>('');
   const lastDepthFloorplanTsRef = useRef<Record<string, number>>({});
+
+  // Stream mode is fixed to WebRTC (former JPEG toggle removed)
+  const streamMode: StreamMode = 'webrtc';
+  const [webrtcError, setWebrtcError] = useState<string | null>(null);
 
   const onStats = (payload: StatsPayload) => {
     // System status/uptime
@@ -312,7 +328,7 @@ function Dashboard() {
     publish({ group: 'Tracking', key: 'Active Tracks', value: allTracks.length, ts: now });
   };
 
-  const onImage = (cam: 'living-room' | 'kitchen' | 'family-room', blob: Blob) => {
+  const onImage = (cam: CameraKey, blob: Blob) => {
     setStreams(prev => ({ ...prev, [cam]: blob }));
     computeFps(cam);
   };
@@ -605,6 +621,10 @@ function Dashboard() {
     setBevMeta((prev) => ({ ...prev, [cam]: payload }));
   }, []);
 
+  // WebRTC handler refs (to break circular dependency with useWebSocketClient)
+  const webrtcHandleAnswerRef = useRef<(sdp: string) => Promise<void>>(() => Promise.resolve());
+  const webrtcHandleIceCandidateRef = useRef<(candidate: RTCIceCandidateInit) => Promise<void>>(() => Promise.resolve());
+
   const {
     status,
     sendClearStats,
@@ -616,7 +636,9 @@ function Dashboard() {
     sendBevConfig,
     sendBevOverlay,
     notifyMaHeatmapReady,
-    sendAutoCalibrate
+    sendAutoCalibrate,
+    sendWebRTCOffer,
+    sendWebRTCIceCandidate,
   } = useWebSocketClient(WS_URL, {
     onImage,
     onBevImage: handleBevImage,
@@ -636,10 +658,53 @@ function Dashboard() {
       } else {
         setCalibrateToast({ text: err || 'Calibration failed', kind: 'error', ts: Date.now() });
       }
-      // Clear after a short delay
       window.setTimeout(() => setCalibrateToast(null), 3000);
-    }
+    },
+    // WebRTC signaling handlers (use refs to avoid circular dependency)
+    onWebRTCAnswer: (sdp) => webrtcHandleAnswerRef.current(sdp),
+    onWebRTCIceCandidate: (candidate) => webrtcHandleIceCandidateRef.current(candidate),
+    onWebRTCError: (error) => {
+      console.error('[WebRTC] Error:', error);
+      setWebrtcError(error);
+    },
   });
+
+  // Initialize WebRTC client hook
+  const webrtc = useWebRTCClient(
+    status === 'open' ? { sendOffer: sendWebRTCOffer, sendIceCandidate: sendWebRTCIceCandidate } : null,
+    {
+      debug: true,
+      onVideoFps: handleWebrtcFps,
+    }
+  );
+
+  // Populate refs after webrtc hook is initialized
+  useEffect(() => {
+    webrtcHandleAnswerRef.current = webrtc.handleAnswer;
+    webrtcHandleIceCandidateRef.current = webrtc.handleIceCandidate;
+  }, [webrtc.handleAnswer, webrtc.handleIceCandidate]);
+
+  // Auto-connect WebRTC when the websocket is open
+  // Use a ref to track if we've already initiated connection
+  const webrtcConnectedRef = useRef(false);
+  useEffect(() => {
+    if (status === 'open') {
+      // Only connect if we haven't already
+      if (!webrtcConnectedRef.current) {
+        webrtcConnectedRef.current = true;
+        webrtc.connect().catch((err) => {
+          console.error('[WebRTC] Connect failed:', err);
+          setWebrtcError(String(err));
+          webrtcConnectedRef.current = false; // Allow retry on failure
+        });
+      }
+    }
+    // Reset the ref and close the peer connection whenever the socket drops
+    if (status !== 'open') {
+      webrtcConnectedRef.current = false;
+      webrtc.disconnect();
+    }
+  }, [status, webrtc.connect, webrtc.disconnect]);
 
   const handleBevConfigUpdate = useCallback((cam: CameraKey, cfg: { mpp: number; xMin: number; xMax: number; zMin: number; zMax: number }) => {
     sendBevConfig(cam, cfg);
@@ -845,6 +910,8 @@ function Dashboard() {
                 vacancyText={vacancyText[cam]}
                 isExpanded={expandedCamera === cam}
                 onToggleExpand={(cameraKey) => setExpandedCamera(prev => prev === cameraKey ? null : cameraKey)}
+                streamMode={streamMode}
+                videoRef={streamMode === 'webrtc' ? webrtc.videoRef : undefined}
               />
             ))}
           </div>
@@ -856,6 +923,7 @@ function Dashboard() {
                 meta={bevMeta[cam]}
                 floorplan={floorplanData[cam]}
                 tracks={tracksByCamKey[cam]}
+                trailEnabled={trailEnabled}
                 variant="inline"
               />
             ))}
@@ -924,6 +992,7 @@ function Dashboard() {
         meta={bevMeta}
         floorplans={floorplanData}
         tracks={tracksByCamKey}
+        trailEnabled={trailEnabled}
         onUpdateConfig={handleBevConfigUpdate}
         onToggleOverlay={handleBevOverlayToggle}
         onCalibrateAll={() => {

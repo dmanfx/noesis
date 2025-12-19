@@ -1,0 +1,13 @@
+# DeepStream 8 Structure (Noesis DS8)
+
+This file is a lightweight reference for the current DS8 runtime wiring in this repo.
+
+## Canonical mosaic delivery (WebRTC)
+
+- DS8 pipeline (`noesis/pipelines/ds8_pipeline.py`) builds the tiled mosaic (`nvmultistreamtiler` + `nvdsosd`) and, when enabled, an RTSP mosaic output (`nvrtspoutsinkbin` named `rtsp_out`).
+- `noesis/mosaic_webrtc_gateway.py` consumes the RTSP stream and serves a WebRTC video track to the browser.
+- `websocket_server.py` is used for WebRTC signaling (`webrtc_offer` / `webrtc_answer` / `webrtc_ice_candidate`) and for non-video telemetry (stats, tracking, depth, BEV).
+
+## Flow
+
+Flow/`BufferRetriever` is not used for mosaic video. Flow remains reserved for future tensor/raw-frame retrieval use cases.

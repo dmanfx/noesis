@@ -138,6 +138,10 @@ const DepthDrawer = memo(function DepthDrawer({ open, onClose, diagnostics, dept
   const [heatmapRange, setHeatmapRange] = useState<{ min: number; max: number } | null>(null);
   const warmupScheduledRef = useRef(false);
   const warmupTimersRef = useRef<number[]>([]);
+  const floorplanWarmupTimersRef = useRef<number[]>([]);
+  const floorplanPrefetchScheduledRef = useRef<Set<string>>(new Set());
+  const floorplanPrefetchedRef = useRef<Set<string>>(new Set());
+  const onRequestFloorplanRef = useRef(onRequestFloorplan);
   const heatmapNotifiedRef = useRef<Set<string>>(new Set());
 
   // Floorplan selection (declared early to avoid TDZ in hooks below)
@@ -175,6 +179,10 @@ const DepthDrawer = memo(function DepthDrawer({ open, onClose, diagnostics, dept
     ctx.clearRect(0, 0, canvas.width, canvas.height);
   }, []);
 
+  useEffect(() => {
+    onRequestFloorplanRef.current = onRequestFloorplan;
+  }, [onRequestFloorplan]);
+
   const renderTopdownLayer = useCallback(
     (canvas: HTMLCanvasElement | null, layer: FloorplanLayer | undefined, palette: (t: number) => [number, number, number]) => {
       renderLayerToCanvas(canvas, layer, palette, WIDE_ASPECT);
@@ -194,7 +202,7 @@ const DepthDrawer = memo(function DepthDrawer({ open, onClose, diagnostics, dept
 
   useEffect(() => {
     if (!open || !selectedCamera) return;
-    onRequestDepthFresh(selectedCamera);
+    onRequestDepthCached(selectedCamera);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [open, selectedCamera]);
 
@@ -229,18 +237,34 @@ const DepthDrawer = memo(function DepthDrawer({ open, onClose, diagnostics, dept
     for (let i = 0; i < total; i += 1) {
       const d = depthArray[i];
       const maskOk = !maskArray || maskArray[i] > 0;
-      if (!Number.isFinite(d) || d <= 0 || !maskOk) continue;
+      if (!Number.isFinite(d) || !maskOk) continue;
       if (d < minDepth) minDepth = d;
       if (d > maxDepth) maxDepth = d;
     }
 
-    if (!Number.isFinite(minDepth) || !Number.isFinite(maxDepth) || maxDepth <= minDepth) {
+    // Fallback when all valid samples are zero/negative: use the raw finite span
+    if (!Number.isFinite(minDepth) || !Number.isFinite(maxDepth)) {
+      minDepth = Number.POSITIVE_INFINITY;
+      maxDepth = Number.NEGATIVE_INFINITY;
+      for (let i = 0; i < total; i += 1) {
+        const d = depthArray[i];
+        if (!Number.isFinite(d)) continue;
+        if (d < minDepth) minDepth = d;
+        if (d > maxDepth) maxDepth = d;
+      }
+    }
+
+    if (!Number.isFinite(minDepth) || !Number.isFinite(maxDepth)) {
       clearCanvasElement(canvas);
       setHeatmapRange(null);
       return;
     }
 
-    const range = maxDepth - minDepth;
+    let range = maxDepth - minDepth;
+    if (range <= 0) {
+      range = Math.max(Math.abs(maxDepth) || 1, 1);
+      maxDepth = minDepth + range;
+    }
     setHeatmapRange({ min: minDepth, max: maxDepth });
 
     const offscreen = document.createElement('canvas');
@@ -396,7 +420,9 @@ const DepthDrawer = memo(function DepthDrawer({ open, onClose, diagnostics, dept
 
 
   const requestFloorplan = useCallback((mode: 'cache-only' | 'regenerate') => {
-    if (!onRequestFloorplan || !open || !selectedCamera) return;
+    if (!open || !selectedCamera) return;
+    const requestFn = onRequestFloorplanRef.current;
+    if (!requestFn) return;
     const cacheOnly = mode === 'cache-only';
     setFloorplanStatus(cacheOnly ? 'checking' : 'loading');
     const req = {
@@ -409,14 +435,14 @@ const DepthDrawer = memo(function DepthDrawer({ open, onClose, diagnostics, dept
       cacheOnly,
     };
     try { console.debug('[UI] floorplan request', { mode, ...req }); } catch { }
-    const requestId = onRequestFloorplan(req);
+    const requestId = requestFn(req);
     if (typeof requestId === 'string' && requestId.length) {
       setFloorplanRequest(requestId);
     } else {
       setFloorplanRequest('');
       setFloorplanStatus('idle');
     }
-  }, [onRequestFloorplan, open, selectedCamera]);
+  }, [open, selectedCamera]);
 
   useEffect(() => {
     if (!cameras.length) {
@@ -435,6 +461,10 @@ const DepthDrawer = memo(function DepthDrawer({ open, onClose, diagnostics, dept
       warmupTimersRef.current.forEach((id) => window.clearTimeout(id));
       warmupTimersRef.current = [];
       warmupScheduledRef.current = false;
+      floorplanWarmupTimersRef.current.forEach((id) => window.clearTimeout(id));
+      floorplanWarmupTimersRef.current = [];
+      floorplanPrefetchScheduledRef.current.clear();
+      floorplanPrefetchedRef.current.clear();
     };
   }, []);
 
@@ -459,6 +489,59 @@ const DepthDrawer = memo(function DepthDrawer({ open, onClose, diagnostics, dept
       warmupTimersRef.current = [];
     }
   }, [open, availableCameras, scheduleDepthBatch]);
+
+  useEffect(() => {
+    if (!open) {
+      floorplanPrefetchedRef.current.clear();
+      floorplanPrefetchScheduledRef.current.clear();
+      floorplanWarmupTimersRef.current.forEach((id) => window.clearTimeout(id));
+      floorplanWarmupTimersRef.current = [];
+    }
+  }, [open]);
+
+  useEffect(() => {
+    if (!open || !cameras.length) return;
+    const requestFn = onRequestFloorplanRef.current;
+    if (!requestFn) return;
+
+    const spacingMs = 60;
+    const ts = Date.now();
+    const missing = cameras.filter((cam) => {
+      if (!cam) return false;
+      if (floorplans[cam]) return false;
+      if (floorplanPrefetchedRef.current.has(cam)) return false;
+      if (floorplanPrefetchScheduledRef.current.has(cam)) return false;
+      return true;
+    });
+
+    if (!missing.length) return;
+
+    try { console.debug('[UI] warmup floorplan cache', missing); } catch { }
+
+    const baseDelay = floorplanWarmupTimersRef.current.length * spacingMs;
+    missing.forEach((cam, idx) => {
+      floorplanPrefetchScheduledRef.current.add(cam);
+      const requestId = `drawer-cache-${cam}-${ts}-${idx}`;
+      if (cam === selectedCamera) {
+        setFloorplanStatus('checking');
+        setFloorplanRequest(requestId);
+      }
+      const timer = window.setTimeout(() => {
+        floorplanPrefetchScheduledRef.current.delete(cam);
+        floorplanPrefetchedRef.current.add(cam);
+        try {
+          requestFn({
+            camera: cam,
+            requestId,
+            gridResM: 0.15,
+            maxExtentM: 20,
+            cacheOnly: true,
+          });
+        } catch { }
+      }, baseDelay + (idx * spacingMs));
+      floorplanWarmupTimersRef.current.push(timer);
+    });
+  }, [open, cameras, floorplans, selectedCamera]);
 
   useEffect(() => {
     if (activeTab !== 'heatmap' || !open) return;
@@ -490,27 +573,6 @@ const DepthDrawer = memo(function DepthDrawer({ open, onClose, diagnostics, dept
       }
     }
   }, [activeTab, open, cameraFloorplan, densityLayer, heightLayer, distanceLayer, renderTopdownLayer, clearCanvasElement, floorplanRequest, drawerWidth, floorplanError]);
-
-  useEffect(() => {
-    if (activeTab !== 'heatmap' || !open || !selectedCamera) return;
-    requestFloorplan('cache-only');
-  }, [selectedCamera, activeTab, open, requestFloorplan]);
-
-  const handleRefreshAll = useCallback(() => {
-    if (!availableCameras.length) return;
-    try { console.debug('[UI] refresh all depth', availableCameras); } catch { }
-    // Stagger fresh requests to avoid backpressure and throttling
-    const spacingMs = 200;
-    availableCameras.forEach((cam, idx) => {
-      window.setTimeout(() => onRequestDepthFresh(cam), idx * spacingMs);
-    });
-    // Issue floorplan regenerate for every camera to ensure layers are produced
-    availableCameras.forEach((cam) => {
-      try {
-        onRequestFloorplan({ camera: cam, requestId: Date.now().toString(), maxAgeSec: 0, gridResM: 0.5, maxExtentM: 20.0, cacheOnly: false });
-      } catch { }
-    });
-  }, [availableCameras, onRequestDepthFresh, onRequestFloorplan]);
 
   useEffect(() => {
     if (!open) return;
@@ -625,14 +687,6 @@ const DepthDrawer = memo(function DepthDrawer({ open, onClose, diagnostics, dept
                         d="M8 2a5.5 5.5 0 0 1 3.804 9.49l1.068 1.068a.75.75 0 1 1-1.06 1.06l-2.5-2.5a.75.75 0 0 1 0-1.06l2.5-2.5a.75.75 0 1 1 1.06 1.06L11.66 9.19A4 4 0 1 0 8 12.5a.75.75 0 1 1 0 1.5A5.5 5.5 0 1 1 8 2Z"
                       />
                     </svg>
-                  </button>
-                  <button
-                    type="button"
-                    className="btn ghost"
-                    onClick={handleRefreshAll}
-                    disabled={!cameras.length}
-                  >
-                    Refresh all
                   </button>
                 </div>
               )}

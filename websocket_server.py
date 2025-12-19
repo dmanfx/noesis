@@ -75,6 +75,71 @@ class WebSocketServer:
         self.floorplan_provider: Optional[Callable[[Optional[list], float, float, float, bool], Optional[Dict[str, Any]]]] = None
         # Optional auto-calibration handler (cameraId -> result)
         self.auto_calibrate_handler: Optional[Callable[[Optional[str]], Dict[str, Any]]] = None
+        # WebRTC signaling: webrtcbin element reference (legacy direct approach)
+        self.webrtc_elem: Optional[Any] = None
+        # WebRTC gateway reference (new RTSP-based gateway approach)
+        self.webrtc_gateway: Optional[Any] = None
+        # WebRTC signaling ownership: only the connection that most recently sent a
+        # webrtc_offer should receive webrtc_answer / server ICE candidates.
+        self._webrtc_owner: Optional[Any] = None
+        self._webrtc_owner_ip: Optional[str] = None
+
+    def _get_webrtc_owner(self) -> Optional[Any]:
+        owner = self._webrtc_owner
+        if owner is None:
+            return None
+        if owner in self.connected_clients:
+            return owner
+        # Owner disconnected; clear to avoid sending signaling to stale sockets.
+        self._webrtc_owner = None
+        self._webrtc_owner_ip = None
+        return None
+
+    async def _send_to_client(self, websocket, message) -> None:
+        """Send a message to one client, mirroring broadcast() semantics."""
+        if not websocket or websocket not in self.connected_clients:
+            return
+
+        try:
+            if isinstance(message, dict):
+                message = convert_numpy_types(message)
+                try:
+                    self._record_tx(message)
+                except Exception:
+                    pass
+                await websocket.send(json.dumps(message))
+            elif isinstance(message, str):
+                await websocket.send(message)
+            elif isinstance(message, bytes):
+                await websocket.send(message)
+            else:
+                self.logger.warning("Unknown message type for send_to_client: %s", type(message))
+        except Exception as exc:
+            client_ip = websocket.remote_address if hasattr(websocket, 'remote_address') else "Unknown"
+            self.logger.debug("Failed to send message to %s: %s", client_ip, exc)
+            try:
+                self.connected_clients.discard(websocket)
+            except Exception:
+                pass
+
+    def send_to_client_sync(self, websocket, message) -> None:
+        """Thread-safe one-client send for use from other threads."""
+        if not self.event_loop:
+            self.logger.error("No event loop available for send_to_client_sync")
+            return
+        if not self.running:
+            return
+        try:
+            if self.event_loop.is_closed():
+                self.logger.warning("Event loop is closed; dropping send_to_client")
+                return
+        except Exception:
+            pass
+
+        asyncio.run_coroutine_threadsafe(
+            self._send_to_client(websocket, message),
+            self.event_loop
+        )
 
     # ---------------- Menon telemetry helpers ----------------
     def _telemetry_now(self) -> float:
@@ -141,6 +206,199 @@ class WebSocketServer:
                 self._telemetry['tx'][t] = {'t': self._telemetry_now(), 'data': self._short_dict(msg)}
         except Exception:
             pass
+
+    # ---------------- WebRTC signaling helpers ----------------
+    def attach_webrtc_endpoint(self, webrtc_elem: Any) -> None:
+        """Register webrtcbin element for signaling and attach GStreamer callbacks."""
+        self.webrtc_elem = webrtc_elem
+        self.logger.info("WebRTC endpoint attached to WebSocketServer")
+
+        # Try to connect GStreamer signal handlers for negotiation and ICE candidates
+        try:
+            # on-negotiation-needed: webrtcbin requests offer creation
+            webrtc_elem.connect("on-negotiation-needed", self._on_webrtc_negotiation_needed)
+            # on-ice-candidate: webrtcbin has a local ICE candidate to send
+            webrtc_elem.connect("on-ice-candidate", self._on_webrtc_ice_candidate)
+            self.logger.info("Connected GStreamer webrtcbin signals")
+        except Exception as exc:
+            self.logger.warning("Failed to connect webrtcbin signals: %s", exc)
+
+    def _on_webrtc_negotiation_needed(self, *args) -> None:
+        """Called when webrtcbin needs to create/send an offer."""
+        self.logger.debug("webrtcbin: on-negotiation-needed")
+        # In most server-as-sender scenarios, we wait for browser to send offer
+        # This callback is here for future use if server initiates
+
+    def _on_webrtc_ice_candidate(self, webrtc, mline_index: int, candidate: str) -> None:
+        """Called when webrtcbin has a local ICE candidate to send to peer."""
+        try:
+            msg = {
+                'type': 'webrtc_ice_candidate',
+                'candidate': candidate,
+                'sdpMLineIndex': mline_index,
+            }
+            owner = self._get_webrtc_owner()
+            if owner is not None:
+                self.send_to_client_sync(owner, msg)
+            else:
+                self.broadcast_sync(msg)
+            self.logger.debug("Sent ICE candidate to clients: mline=%d", mline_index)
+        except Exception as exc:
+            self.logger.warning("Failed to send ICE candidate: %s", exc)
+
+    async def _handle_webrtc_offer(self, websocket, data: Dict[str, Any]) -> None:
+        """Handle incoming WebRTC offer from browser client."""
+        if self.webrtc_elem is None:
+            await websocket.send(json.dumps({'type': 'webrtc_error', 'error': 'no_webrtc_element'}))
+            return
+
+        sdp = data.get('sdp')
+        if not sdp:
+            await websocket.send(json.dumps({'type': 'webrtc_error', 'error': 'missing_sdp'}))
+            return
+
+        try:
+            from gi.repository import Gst, GstSdp, GstWebRTC
+
+            # Parse and set remote description
+            res, sdpmsg = GstSdp.SDPMessage.new_from_text(sdp)
+            if res != GstSdp.SDPResult.OK:
+                raise ValueError("Failed to parse SDP")
+
+            offer = GstWebRTC.WebRTCSessionDescription.new(
+                GstWebRTC.WebRTCSDPType.OFFER, sdpmsg
+            )
+            self.webrtc_elem.emit("set-remote-description", offer, None)
+
+            # Create answer
+            promise = Gst.Promise.new()
+            self.webrtc_elem.emit("create-answer", None, promise)
+            promise.wait()
+            reply = promise.get_reply()
+            answer = reply.get_value("answer")
+            if answer is None:
+                raise ValueError("Failed to create answer")
+
+            self.webrtc_elem.emit("set-local-description", answer, None)
+
+            # Send answer to client
+            response = {
+                'type': 'webrtc_answer',
+                'sdp': answer.sdp.as_text(),
+            }
+            await websocket.send(json.dumps(response))
+            self.logger.info("Sent WebRTC answer to client")
+
+        except Exception as exc:
+            self.logger.error("WebRTC offer handling failed: %s", exc)
+            await websocket.send(json.dumps({'type': 'webrtc_error', 'error': str(exc)}))
+
+    async def _handle_webrtc_ice_candidate(self, websocket, data: Dict[str, Any]) -> None:
+        """Handle incoming ICE candidate from browser client."""
+        if self.webrtc_elem is None:
+            return
+
+        candidate = data.get('candidate')
+        sdp_mline_index = data.get('sdpMLineIndex', 0)
+
+        if candidate:
+            try:
+                self.webrtc_elem.emit("add-ice-candidate", sdp_mline_index, candidate)
+                self.logger.debug("Added ICE candidate from client: mline=%d", sdp_mline_index)
+            except Exception as exc:
+                self.logger.warning("Failed to add ICE candidate: %s", exc)
+
+    # ---------------- WebRTC Gateway methods (new RTSP-based approach) ----------------
+
+    def register_webrtc_gateway(self, gateway: Any) -> None:
+        """Register the MosaicWebRTCGateway for signaling."""
+        self.webrtc_gateway = gateway
+        self.logger.info("WebRTC gateway registered with WebSocketServer")
+
+    def send_webrtc_answer(self, sdp: str) -> None:
+        """Send WebRTC answer SDP to the owning client (fallback: broadcast)."""
+        msg = {"type": "webrtc_answer", "sdp": sdp}
+        owner = self._get_webrtc_owner()
+        if owner is not None:
+            self.logger.info("<<< Sending webrtc_answer to WebRTC owner %s", self._webrtc_owner_ip or "unknown")
+        else:
+            self.logger.info("<<< Sending webrtc_answer to %d connected clients", len(self.connected_clients))
+        try:
+            import json as _json, time as _time
+
+            with open("/home/mayor/Noesis_Devel/.cursor/debug.log", "a", encoding="utf-8") as _f:
+                _f.write(
+                    _json.dumps(
+                        {
+                            "sessionId": "debug-session",
+                            "runId": "run1",
+                            "hypothesisId": "H4",
+                            "location": "websocket_server.py:send_webrtc_answer",
+                            "message": "send webrtc_answer",
+                            "data": {"clients": len(self.connected_clients), "sdp_lines": len((sdp or '').splitlines())},
+                            "timestamp": int(_time.time() * 1000),
+                        }
+                    )
+                    + "\n"
+                )
+        except Exception:
+            pass
+        if owner is not None:
+            self.send_to_client_sync(owner, msg)
+        else:
+            self.broadcast_sync(msg)
+
+    def send_webrtc_ice(self, mline_index: int, candidate: str) -> None:
+        """Send WebRTC ICE candidate to the owning client (fallback: broadcast)."""
+        msg = {
+            "type": "webrtc_ice_candidate",
+            "candidate": candidate,
+            "sdpMLineIndex": mline_index,
+        }
+        owner = self._get_webrtc_owner()
+        if owner is not None:
+            self.logger.info(
+                "<<< Sending webrtc_ice_candidate (mline=%d) to WebRTC owner %s",
+                mline_index,
+                self._webrtc_owner_ip or "unknown",
+            )
+        else:
+            self.logger.info("<<< Sending webrtc_ice_candidate (mline=%d) to %d clients", mline_index, len(self.connected_clients))
+        try:
+            import json as _json, time as _time
+
+            with open("/home/mayor/Noesis_Devel/.cursor/debug.log", "a", encoding="utf-8") as _f:
+                _f.write(
+                    _json.dumps(
+                        {
+                            "sessionId": "debug-session",
+                            "runId": "run1",
+                            "hypothesisId": "H4",
+                            "location": "websocket_server.py:send_webrtc_ice",
+                            "message": "send webrtc_ice_candidate",
+                            "data": {"clients": len(self.connected_clients), "mline": int(mline_index)},
+                            "timestamp": int(_time.time() * 1000),
+                        }
+                    )
+                    + "\n"
+                )
+        except Exception:
+            pass
+        if owner is not None:
+            self.send_to_client_sync(owner, msg)
+        else:
+            self.broadcast_sync(msg)
+
+    def send_webrtc_error(self, error: str) -> None:
+        """Send WebRTC error to the owning client (fallback: broadcast)."""
+        msg = {"type": "webrtc_error", "error": error}
+        owner = self._get_webrtc_owner()
+        if owner is not None:
+            self.send_to_client_sync(owner, msg)
+            self.logger.warning("<<< WebRTC error (owner=%s): %s", self._webrtc_owner_ip or "unknown", error)
+        else:
+            self.broadcast_sync(msg)
+            self.logger.warning("<<< Broadcast WebRTC error: %s", error)
 
     async def _periodic_menon_telemetry_log(self, interval_seconds: float = 1.0) -> None:
         """Emit a concise 1 Hz INFO log with latest Menon calibration/coordinate RX/TX."""
@@ -976,6 +1234,120 @@ class WebSocketServer:
                         else:
                             self.logger.warning(f"Invalid detection toggle message from {client_ip}: {data}")
 
+                    # Handle WebRTC signaling: offer from browser
+                    elif data.get('type') == 'webrtc_offer':
+                        self.logger.info(">>> Received webrtc_offer from client %s", client_ip)
+                        if self.webrtc_gateway is not None or self.webrtc_elem is not None:
+                            prev_owner = self._get_webrtc_owner()
+                            if prev_owner is not None and prev_owner is not websocket:
+                                try:
+                                    await prev_owner.send(json.dumps({'type': 'webrtc_error', 'error': 'webrtc_taken_over'}))
+                                except Exception:
+                                    pass
+                            self._webrtc_owner = websocket
+                            self._webrtc_owner_ip = client_ip
+                        # Prefer gateway if registered, otherwise fall back to legacy approach
+                        if self.webrtc_gateway is not None:
+                            sdp = data.get('sdp', '')
+                            sdp_lines = len(sdp.split('\n')) if sdp else 0
+                            self.logger.info("    Gateway registered, forwarding offer (%d SDP lines)", sdp_lines)
+                            try:
+                                import json as _json, time as _time
+
+                                with open("/home/mayor/Noesis_Devel/.cursor/debug.log", "a", encoding="utf-8") as _f:
+                                    _f.write(
+                                        _json.dumps(
+                                            {
+                                                "sessionId": "debug-session",
+                                                "runId": "run1",
+                                                "hypothesisId": "H4",
+                                                "location": "websocket_server.py:handle_client",
+                                                "message": "rx webrtc_offer",
+                                                "data": {"client": client_ip, "sdp_lines": sdp_lines},
+                                                "timestamp": int(_time.time() * 1000),
+                                            }
+                                        )
+                                        + "\n"
+                                    )
+                            except Exception:
+                                pass
+                            try:
+                                from pathlib import Path
+
+                                offer_dir = Path("/home/mayor/Noesis_Devel/.cursor/webrtc_offers")
+                                offer_dir.mkdir(parents=True, exist_ok=True)
+                                ts_ms = int(_time.time() * 1000)
+                                safe_client = str(client_ip).replace(":", "_")
+                                offer_path = offer_dir / f"offer_{ts_ms}_{safe_client}.sdp"
+                                offer_path.write_text(sdp or "", encoding="utf-8")
+                                with open("/home/mayor/Noesis_Devel/.cursor/debug.log", "a", encoding="utf-8") as _f:
+                                    _f.write(
+                                        _json.dumps(
+                                            {
+                                                "sessionId": "debug-session",
+                                                "runId": "run1",
+                                                "hypothesisId": "H4",
+                                                "location": "websocket_server.py:handle_client",
+                                                "message": "saved webrtc_offer",
+                                                "data": {
+                                                    "client": client_ip,
+                                                    "path": str(offer_path),
+                                                    "sdp_lines": sdp_lines,
+                                                },
+                                                "timestamp": ts_ms,
+                                            }
+                                        )
+                                        + "\n"
+                                    )
+                            except Exception:
+                                pass
+                            self.webrtc_gateway.accept_offer(sdp)
+                        else:
+                            self.logger.warning("    No gateway registered, using legacy handler")
+                            await self._handle_webrtc_offer(websocket, data)
+
+                    # Handle WebRTC signaling: ICE candidate from browser
+                    elif data.get('type') == 'webrtc_ice_candidate':
+                        self.logger.info(">>> Received webrtc_ice_candidate from client %s", client_ip)
+                        owner = self._get_webrtc_owner()
+                        if owner is not None and owner is not websocket:
+                            try:
+                                await websocket.send(json.dumps({'type': 'webrtc_error', 'error': 'webrtc_not_owner'}))
+                            except Exception:
+                                pass
+                            continue
+                        if owner is None and (self.webrtc_gateway is not None or self.webrtc_elem is not None):
+                            self._webrtc_owner = websocket
+                            self._webrtc_owner_ip = client_ip
+                        # Prefer gateway if registered
+                        if self.webrtc_gateway is not None:
+                            candidate = data.get('candidate', '')
+                            mline_index = data.get('sdpMLineIndex', 0)
+                            self.logger.info("    Adding ICE candidate (mline=%d): %s...", mline_index, candidate[:50] if candidate else '')
+                            try:
+                                import json as _json, time as _time
+
+                                with open("/home/mayor/Noesis_Devel/.cursor/debug.log", "a", encoding="utf-8") as _f:
+                                    _f.write(
+                                        _json.dumps(
+                                            {
+                                                "sessionId": "debug-session",
+                                                "runId": "run1",
+                                                "hypothesisId": "H4",
+                                                "location": "websocket_server.py:handle_client",
+                                                "message": "rx webrtc_ice_candidate",
+                                                "data": {"client": client_ip, "mline": int(mline_index)},
+                                                "timestamp": int(_time.time() * 1000),
+                                            }
+                                        )
+                                        + "\n"
+                                    )
+                            except Exception:
+                                pass
+                            self.webrtc_gateway.accept_ice(candidate, mline_index)
+                        else:
+                            await self._handle_webrtc_ice_candidate(websocket, data)
+
                 except json.JSONDecodeError:
                     self.logger.warning(f"Received non-JSON message from {client_ip}. Ignoring.")
                 except Exception as e:
@@ -997,6 +1369,9 @@ class WebSocketServer:
             # Ensure client is removed from set - use discard to avoid KeyError if already removed
             try:
                 self.connected_clients.discard(websocket)
+                if self._webrtc_owner is websocket:
+                    self._webrtc_owner = None
+                    self._webrtc_owner_ip = None
                 self.logger.info(f"Client {client_ip} removed. Total clients: {len(self.connected_clients)}")
                 print(f"👋 Client {client_ip} removed. Total clients: {len(self.connected_clients)}")
             except Exception as e:

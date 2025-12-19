@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from 'react';
 import { setCalibration } from '../lib/calibration';
 import { CameraKey, detectCameraKey } from '../lib/camera';
+import { wsLog } from '../lib/wsLogger';
 
 type Track = {
   track_id: number;
@@ -38,6 +39,10 @@ export type FrameHandlers = {
   onMADepth?: (payload: any) => void;
   onFloorplan?: (payload: any) => void;
   onAutoCalibrateResult?: (payload: any) => void;
+  // WebRTC signaling handlers
+  onWebRTCAnswer?: (sdp: string) => void;
+  onWebRTCIceCandidate?: (candidate: RTCIceCandidateInit) => void;
+  onWebRTCError?: (error: string) => void;
 };
 
 export type FloorplanRequest = {
@@ -60,6 +65,32 @@ export function useWebSocketClient(url: string, handlers: FrameHandlers) {
   const reconnectTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const depthInFlightRef = useRef<Record<string, Set<string>>>({});
 
+  const summarizeWsMessage = (obj: any): Record<string, unknown> => {
+    if (!obj || typeof obj !== 'object') return {};
+    const type = (obj as any).type;
+    const base: Record<string, unknown> = {
+      type,
+      request_id: (obj as any).request_id ?? (obj as any).requestId,
+      camera: (obj as any).camera ?? (obj as any).cam_id ?? (obj as any).camera_id ?? (obj as any).cameraId,
+    };
+    if (type === 'get_floorplan') {
+      return {
+        ...base,
+        max_age_sec: (obj as any).max_age_sec,
+        grid_res_m: (obj as any).grid_res_m,
+        max_extent_m: (obj as any).max_extent_m,
+        cache_only: (obj as any).cache_only,
+      };
+    }
+    if (type === 'get_ma_depth') {
+      return {
+        ...base,
+        ts_max_us: (obj as any).ts_max_us,
+      };
+    }
+    return base;
+  };
+
   useEffect(() => {
     let stop = false;
 
@@ -76,7 +107,7 @@ export function useWebSocketClient(url: string, handlers: FrameHandlers) {
             // Send a simple ping message that the server will echo back
             ws.send(JSON.stringify({ type: 'ping', timestamp: Date.now() }));
           } catch (e) {
-            console.warn('Failed to send heartbeat:', e);
+            wsLog.warn('[WS] Failed to send heartbeat:', e);
           }
         }
       }, 30000); // 30 seconds
@@ -100,30 +131,30 @@ export function useWebSocketClient(url: string, handlers: FrameHandlers) {
 
       const ws = new WebSocket(url);
       // Prefer ArrayBuffer to avoid extra Blob conversions
-      try { ws.binaryType = 'arraybuffer'; } catch {}
+      try { ws.binaryType = 'arraybuffer'; } catch { }
       socketRef.current = ws;
 
       ws.onopen = () => {
         setStatus('open');
         startHeartbeat(ws);
-        console.log('WebSocket connected, heartbeat started');
+        wsLog.info('[WS] Connected (heartbeat started)');
       };
 
       ws.onclose = (event) => {
         setStatus('closed');
         stopHeartbeat();
-        console.log(`WebSocket closed: code=${event.code}, reason=${event.reason}`);
+        wsLog.info('[WS] Closed', { code: event.code, reason: event.reason });
 
         if (!stop && retry < maxRetries) {
           const delay = Math.min(5000 * Math.pow(2, retry), 30000); // Exponential backoff, max 30s
-          console.log(`Attempting reconnection ${retry + 1}/${maxRetries} in ${delay}ms`);
+          wsLog.info('[WS] Reconnect scheduled', { attempt: retry + 1, maxRetries, delayMs: delay });
           reconnectTimeoutRef.current = setTimeout(() => setRetry(r => r + 1), delay);
         }
       };
 
       ws.onerror = (error) => {
         setStatus('error');
-        console.error('WebSocket error:', error);
+        wsLog.error('[WS] Error:', error);
       };
       ws.onmessage = async (ev: MessageEvent) => {
         try {
@@ -171,30 +202,30 @@ export function useWebSocketClient(url: string, handlers: FrameHandlers) {
           if (data.type === 'ping') {
             try {
               ws.send(JSON.stringify({ type: 'pong', timestamp: data.timestamp }));
-              console.debug('Sent pong response to server ping');
+              wsLog.debug('[WS] Sent pong response to server ping');
             } catch (e) {
-              console.warn('Failed to send pong response:', e);
+              wsLog.warn('[WS] Failed to send pong response:', e);
             }
             return;
           }
 
           if (data.type === 'auto_calibrate_result') {
-            try { console.debug('[WS] auto-calibrate result', data); } catch {}
-            try { handlers.onAutoCalibrateResult?.(data); } catch {}
+            wsLog.debug('[WS] auto-calibrate result', data);
+            try { handlers.onAutoCalibrateResult?.(data); } catch { }
             return;
           }
 
           // Handle pong responses from server
           if (data.type === 'pong') {
             const latency = Date.now() - (data.timestamp || 0);
-            console.debug(`Received pong from server (latency: ${latency}ms)`);
+            wsLog.debug('[WS] Received pong', { latencyMs: latency });
             return;
           }
 
           if (data.type === 'stats' && data.payload) {
             handlers.onStats(data.payload as StatsPayload);
           } else if (data.type === 'calibration-bundle' && data.data) {
-            try { setCalibration(data); } catch {}
+            try { setCalibration(data); } catch { }
             try {
               handlers.onCalibration?.(data.data);
             } catch (err) {
@@ -227,6 +258,18 @@ export function useWebSocketClient(url: string, handlers: FrameHandlers) {
           } else if (data.type === 'bev-status') {
             handlers.onBevMeta?.(data);
           }
+          // WebRTC signaling responses from server
+          else if (data.type === 'webrtc_answer' && data.sdp) {
+            handlers.onWebRTCAnswer?.(data.sdp);
+          } else if (data.type === 'webrtc_ice_candidate' && data.candidate) {
+            handlers.onWebRTCIceCandidate?.({
+              candidate: data.candidate,
+              sdpMLineIndex: data.sdpMLineIndex ?? 0,
+              sdpMid: data.sdpMid,
+            });
+          } else if (data.type === 'webrtc_error') {
+            handlers.onWebRTCError?.(data.error || 'Unknown WebRTC error');
+          }
         } catch (e) {
           // swallow parsing errors
         }
@@ -242,18 +285,23 @@ export function useWebSocketClient(url: string, handlers: FrameHandlers) {
       }
       socketRef.current?.close();
     };
-  // eslint-disable-next-line react-hooks/exhaustive-deps
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [url, retry]);
 
   const sendJson = (obj: any) => {
     const ws = socketRef.current;
     if (!ws || ws.readyState !== WebSocket.OPEN) return false;
-    try {
-      if (obj && (obj.type === 'get_ma_depth' || obj.type === 'get_floorplan')) {
-        // eslint-disable-next-line no-console
-        console.debug('[WS] send', obj.type, { ...obj, img_b64: undefined });
-      }
-    } catch {}
+    if (obj && (obj.type === 'get_ma_depth' || obj.type === 'get_floorplan')) {
+      const summary = summarizeWsMessage(obj);
+      const key = `send:${String(obj.type)}:${String((summary as any).camera ?? '')}`;
+      wsLog.debugRateLimited(
+        key,
+        ['[WS] send', String(obj.type), summary],
+        () => {
+          wsLog.debug('payload', { ...obj, img_b64: undefined });
+        }
+      );
+    }
     ws.send(JSON.stringify(obj));
     return true;
   };
@@ -329,6 +377,14 @@ export function useWebSocketClient(url: string, handlers: FrameHandlers) {
     },
     sendBevConfig: (camId: string, config: any) => sendJson({ type: 'bev-config', cameraId: camId, config }),
     sendBevOverlay: (camId: string, enabled: boolean) => sendJson({ type: 'bev-overlay', cameraId: camId, enabled }),
-    notifyMaHeatmapReady: (camId: string) => sendJson({ type: 'ma_heatmap_ready', cameraId: camId })
+    notifyMaHeatmapReady: (camId: string) => sendJson({ type: 'ma_heatmap_ready', cameraId: camId }),
+    // WebRTC signaling senders
+    sendWebRTCOffer: (sdp: string) => sendJson({ type: 'webrtc_offer', sdp }),
+    sendWebRTCIceCandidate: (candidate: RTCIceCandidateInit) => sendJson({
+      type: 'webrtc_ice_candidate',
+      candidate: candidate.candidate,
+      sdpMLineIndex: candidate.sdpMLineIndex,
+      sdpMid: candidate.sdpMid,
+    }),
   };
 }

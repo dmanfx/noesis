@@ -1,0 +1,14 @@
+# DeepStream 8: `pyservicemaker` / Pipeline API / Flow API (Noesis notes)
+
+This repo uses DS8 Service Maker in two ways:
+
+- **Pipeline API** is used to build the media graph in `noesis/pipelines/ds8_pipeline.py`.
+- **Flow API** is currently deferred (not used for mosaic delivery).
+
+## Canonical mosaic delivery
+
+Mosaic video is delivered via RTSP output from the DS8 pipeline plus an RTSP→WebRTC gateway:
+
+- DS8 pipeline outputs RTSP via `nvrtspoutsinkbin` (`rtsp_out`).
+- `noesis/mosaic_webrtc_gateway.py` consumes RTSP and serves a WebRTC video track.
+- WebSocket is signaling-only for WebRTC (offer/answer/ICE).

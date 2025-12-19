@@ -20,6 +20,20 @@ def nvinfer_props_from_infer_yaml(yaml_path: str | Path) -> Dict[str, Any]:
 
     Returns keys compatible with Gst nvinfer element set_property calls.
     """
+    base_dir = Path(yaml_path).parent.resolve()
+    repo_root = base_dir.parent
+
+    def _resolve(path_val: str | Path) -> str:
+        if not path_val:
+            return ""
+        p = Path(path_val)
+        if p.is_absolute():
+            return str(p)
+        text = str(path_val)
+        if text.startswith(("config/", "models/", "pipelines/")):
+            return str((repo_root / text).resolve())
+        return str((base_dir / p).resolve())
+
     cfg = _load_yaml(yaml_path)
     models = cfg.get("models", {}) or {}
     pgie = models.get("pgie", {}) or {}
@@ -27,15 +41,30 @@ def nvinfer_props_from_infer_yaml(yaml_path: str | Path) -> Dict[str, Any]:
 
     engine = pgie.get("engine")
     if isinstance(engine, str) and engine:
-        props["model-engine-file"] = str(Path(yaml_path).parent.joinpath(engine).resolve())
+        props["model-engine-file"] = _resolve(engine)
+
+    cfg_path = pgie.get("config-file-path") or pgie.get("config-file")
+    if isinstance(cfg_path, str) and cfg_path:
+        props["config-file-path"] = _resolve(cfg_path)
 
     bs = pgie.get("batch_size")
     if isinstance(bs, int) and bs > 0:
         props["batch-size"] = bs
+    else:
+        try:
+            if int(bs) > 0:
+                props["batch-size"] = int(bs)
+        except Exception:
+            pass
 
     gie_id = pgie.get("gie_id")
-    if isinstance(gie_id, int) and gie_id > 0:
-        props["unique-id"] = gie_id
+    try:
+        if gie_id is not None:
+            val = int(gie_id)
+            if val > 0:
+                props["unique-id"] = val
+    except Exception:
+        pass
 
     nm = (pgie.get("network_mode") or "").strip().lower()
     if nm:
@@ -57,4 +86,3 @@ def tracker_config_from_yaml(default_path: str | Path = "config/nvtracker.yaml")
 def analytics_config_from_yaml(default_path: str | Path = "config/nvdsanalytics.yaml") -> Optional[str]:
     p = Path(default_path)
     return str(p.resolve()) if p.exists() else None
-

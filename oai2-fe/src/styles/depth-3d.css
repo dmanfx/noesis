@@ -1,0 +1,205 @@
+.depth3d-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(4, 6, 10, 0.65);
+  z-index: 1300;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  backdrop-filter: blur(2px);
+}
+
+.depth3d-modal {
+  width: 82vw;
+  height: 82vh;
+  background: #0c111b;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 14px;
+  box-shadow: 0 28px 64px rgba(0, 0, 0, 0.55);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.depth3d-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 14px 18px;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+  gap: 12px;
+}
+
+.depth3d-title {
+  font-size: 16px;
+  font-weight: 700;
+  color: #f5f8ff;
+}
+
+.depth3d-subtitle {
+  font-size: 12px;
+  color: rgba(255, 255, 255, 0.65);
+}
+
+.depth3d-controls {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.depth3d-controls .btn {
+  padding: 6px 10px;
+  font-size: 12px;
+}
+
+.depth3d-controls .btn.danger {
+  color: #ffb3b3;
+}
+
+.depth3d-autorefresh {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  color: rgba(255, 255, 255, 0.75);
+  padding: 6px 8px;
+  border-radius: 6px;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+}
+
+.depth3d-body {
+  flex: 1;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 260px;
+  gap: 0;
+  height: 100%;
+}
+
+.depth3d-canvas {
+  position: relative;
+  background: #05070d;
+}
+
+.depth3d-view {
+  position: absolute;
+  inset: 0;
+}
+
+.depth3d-sidebar {
+  border-left: 1px solid rgba(255, 255, 255, 0.08);
+  padding: 14px 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  background: linear-gradient(180deg, rgba(18, 26, 42, 0.9), rgba(12, 17, 28, 0.9));
+  overflow-y: auto;
+}
+
+.depth3d-meta {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 6px;
+}
+
+.depth3d-meta__label {
+  font-size: 12px;
+  color: rgba(255, 255, 255, 0.55);
+  letter-spacing: 0.04em;
+}
+
+.depth3d-meta__value {
+  font-size: 13px;
+  color: #f5f8ff;
+  font-weight: 600;
+}
+
+.depth3d-info {
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 10px;
+  padding: 10px 12px;
+  background: rgba(255, 255, 255, 0.02);
+}
+
+.depth3d-control input[type="range"] {
+  width: 100%;
+}
+
+.depth3d-control select {
+  width: 100%;
+  background: rgba(255, 255, 255, 0.04);
+  color: #f5f8ff;
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  border-radius: 8px;
+  padding: 6px 8px;
+}
+
+.depth3d-control {
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 10px;
+  padding: 10px 12px;
+  background: rgba(255, 255, 255, 0.02);
+}
+
+.depth3d-checkbox {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  color: #f5f8ff;
+  font-size: 13px;
+  padding: 8px 10px;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 10px;
+  background: rgba(255, 255, 255, 0.02);
+}
+
+.depth3d-toast {
+  position: absolute;
+  bottom: 12px;
+  left: 50%;
+  transform: translateX(-50%);
+  background: rgba(0, 0, 0, 0.7);
+  color: #f5f8ff;
+  padding: 8px 12px;
+  border-radius: 8px;
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  font-size: 12px;
+  pointer-events: none;
+}
+
+.depth3d-toast.error {
+  background: rgba(178, 34, 34, 0.85);
+  border-color: rgba(255, 102, 102, 0.4);
+}
+
+.depth3d-debug {
+  position: absolute;
+  left: 12px;
+  bottom: 12px;
+  padding: 8px 10px;
+  border-radius: 8px;
+  background: rgba(0, 0, 0, 0.55);
+  color: #d9e2f2;
+  font-size: 11px;
+  line-height: 1.4;
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  pointer-events: none;
+  z-index: 2;
+}
+
+@media (max-width: 1024px) {
+  .depth3d-modal {
+    width: 94vw;
+    height: 90vh;
+  }
+  .depth3d-body {
+    grid-template-columns: 1fr;
+  }
+  .depth3d-sidebar {
+    border-left: none;
+    border-top: 1px solid rgba(255, 255, 255, 0.08);
+    flex-direction: row;
+    flex-wrap: wrap;
+    gap: 8px 16px;
+  }
+}

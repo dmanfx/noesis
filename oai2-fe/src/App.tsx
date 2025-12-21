@@ -932,11 +932,6 @@ function Dashboard() {
       </header>
       <main className="main">
         <section className={`streams${streamsExpanded ? ' streams--expanded' : ''}`}>
-          {streamsExpanded && (
-            <button className="mosaic-close" onClick={collapseStreams} title="Collapse mosaic">
-              Collapse view
-            </button>
-          )}
           <div className={`stream-tiler${streamDisplayCams.length === 1 ? ' stream-tiler--single' : ''}`}>
             {streamDisplayCams.map((cam) => (
               <StreamPanel

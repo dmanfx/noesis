@@ -96,10 +96,19 @@ def _parse_args() -> argparse.Namespace:
         default=int(os.environ.get("NOESIS_REST_PORT", "8080")),
         help="REST port to bind when enabled.",
     )
-    parser.add_argument(
+    rest_group = parser.add_mutually_exclusive_group()
+    rest_group.add_argument(
         "--enable-rest",
+        dest="enable_rest",
         action="store_true",
-        help="Start the DS8 FastAPI application (depth + analytics).",
+        default=True,
+        help="Start the DS8 FastAPI application (depth + analytics). Enabled by default.",
+    )
+    rest_group.add_argument(
+        "--disable-rest",
+        dest="enable_rest",
+        action="store_false",
+        help="Disable the DS8 FastAPI application (depth + analytics).",
     )
     parser.add_argument(
         "--storage-base",
@@ -1486,6 +1495,8 @@ def _start_pyservicemaker_wait_loop(
 
 
 def main() -> int:
+    os.environ.setdefault("NOESIS_MOSAIC_WEBRTC_ENABLED", "1")
+    os.environ.setdefault("NOESIS_DEPTH_ENABLE_SECONDS", "0")
     args = _parse_args()
     logging.basicConfig(
         level=getattr(logging, args.log_level.upper(), logging.INFO),

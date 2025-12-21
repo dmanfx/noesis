@@ -5,6 +5,31 @@
   grid-template-rows: 64px 1fr 36px;
 }
 
+.shell--streams-expanded {
+  grid-template-rows: 0fr 1fr 0fr;
+}
+.shell--streams-expanded .topbar,
+.shell--streams-expanded .footer {
+  display: none;
+}
+.shell--streams-expanded .main {
+  position: fixed;
+  inset: 0;
+  grid-template-columns: 1fr;
+  gap: 10px;
+  padding: 16px;
+  background: rgba(4, 7, 13, 0.95);
+  z-index: 30;
+  overflow: hidden;
+  align-items: stretch;
+}
+.shell--streams-expanded .side {
+  display: none;
+}
+.shell--streams-expanded .telemetry-panel {
+  display: none;
+}
+
 .topbar {
   padding: 10px 14px;
   display: flex;
@@ -36,19 +61,93 @@
 .streams {
   min-width: 0;
   min-height: 0;
+  position: relative;
   display: flex;
   flex-direction: column;
   gap: 6px;
   overflow: visible;
+}
+.mosaic-close {
+  display: none;
+}
+.streams--expanded .mosaic-close {
+  display: inline-flex;
+  justify-self: end;
+  align-self: center;
+  align-items: center;
+  justify-content: center;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  background: rgba(10, 14, 22, 0.85);
+  color: var(--text);
+  font-size: 12px;
+  padding: 6px 14px;
+  cursor: pointer;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.25);
+  transition: border-color 0.2s ease, background 0.2s ease;
+}
+.streams--expanded .mosaic-close:hover {
+  border-color: #5a73c9;
 }
 .stream-tiler,
 .bev-row {
   display: grid;
   grid-template-columns: repeat(3, minmax(0, 1fr));
   gap: 10px;
+  min-width: 0;
 }
 .bev-row {
   margin-top: 4px;
+}
+.shell--streams-expanded .streams {
+  position: relative;
+  height: 100%;
+  display: grid;
+  grid-template-columns: 1fr;
+  grid-template-rows: auto minmax(0, 1fr) minmax(0, 1fr);
+  gap: 12px;
+  align-content: stretch;
+  overflow: hidden;
+}
+.shell--streams-expanded .stream-tiler,
+.shell--streams-expanded .bev-row {
+  height: 100%;
+  width: 100%;
+  align-content: stretch;
+  min-height: 0;
+}
+.shell--streams-expanded .stream-tiler {
+  grid-template-rows: 1fr;
+}
+.shell--streams-expanded .stream-tools .btn {
+  display: none;
+}
+.shell--streams-expanded .stream-card {
+  height: 100%;
+  min-height: 0;
+}
+.shell--streams-expanded .stream-view {
+  aspect-ratio: auto;
+  height: 100%;
+  min-height: 0;
+  flex: 1;
+}
+.shell--streams-expanded .sparkbar {
+  margin-top: auto;
+}
+.shell--streams-expanded .bev-row {
+  grid-auto-rows: minmax(0, 1fr);
+}
+.shell--streams-expanded .bev-inline-card {
+  height: 100%;
+}
+.shell--streams-expanded .bev-inline-body {
+  flex: 1;
+  min-height: 0;
+}
+.shell--streams-expanded .bev-inline-body canvas,
+.shell--streams-expanded .bev-inline-body .bev-inline-placeholder {
+  height: 100%;
 }
 @media (max-width: 980px) {
   .main { grid-template-columns: 1fr; }
@@ -83,6 +182,7 @@
   overflow: clip;
   display: flex;
   flex-direction: column;
+  min-width: 0;
   border: none;
   background: transparent;
   box-shadow: none;
@@ -156,6 +256,7 @@
   padding: 8px;
   display: flex;
   flex-direction: column;
+  min-width: 0;
   gap: 6px;
 }
 .bev-inline-head {

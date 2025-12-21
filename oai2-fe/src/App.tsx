@@ -1,5 +1,4 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { createPortal } from 'react-dom';
 import { StreamPanel } from './components/StreamPanel';
 // MapPanel moved into a drawer
 // import { MapPanel } from './components/MapPanel';
@@ -838,19 +837,31 @@ function Dashboard() {
     estTime ? <span className="chip mono" title="Current time (US Eastern)">{estTime}</span> : null
   ), [estTime]);
 
-  // Fullscreen overlay that follows the selected camera's stream
-  const [overlayUrl, setOverlayUrl] = useState<string>('');
-  const expandedBlob = expandedCamera ? streams[expandedCamera] : null;
-
-  useEffect(() => {
-    if (!expandedCamera || !expandedBlob) {
-      setOverlayUrl('');
-      return;
+  const streamsExpanded = Boolean(expandedCamera);
+  const requestAppFullscreen = useCallback(() => {
+    const root = document.documentElement;
+    if (!document.fullscreenElement && root?.requestFullscreen) {
+      root.requestFullscreen().catch(() => undefined);
     }
-    const url = URL.createObjectURL(expandedBlob);
-    setOverlayUrl(url);
-    return () => URL.revokeObjectURL(url);
-  }, [expandedCamera, expandedBlob]);
+  }, []);
+  const exitAppFullscreen = useCallback(() => {
+    if (document.fullscreenElement && document.exitFullscreen) {
+      document.exitFullscreen().catch(() => undefined);
+    }
+  }, []);
+  const collapseStreams = useCallback(() => {
+    setExpandedCamera(null);
+    exitAppFullscreen();
+  }, [exitAppFullscreen]);
+  const handleToggleExpand = useCallback((cameraKey: CameraKey) => {
+    const next = expandedCamera === cameraKey ? null : cameraKey;
+    setExpandedCamera(next);
+    if (next) {
+      requestAppFullscreen();
+    } else {
+      exitAppFullscreen();
+    }
+  }, [expandedCamera, exitAppFullscreen, requestAppFullscreen]);
 
   const [topDownOpen, setTopDownOpen] = useState<boolean>(false);
   const [calibrateToast, setCalibrateToast] = useState<{ text: string; kind: 'info' | 'success' | 'error'; ts: number } | null>(null);
@@ -874,14 +885,36 @@ function Dashboard() {
   useEffect(() => {
     if (!expandedCamera) return;
     const onKey = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') setExpandedCamera(null);
+      if (e.key === 'Escape') collapseStreams();
     };
     window.addEventListener('keydown', onKey);
     return () => window.removeEventListener('keydown', onKey);
-  }, [expandedCamera]);
+  }, [collapseStreams, expandedCamera]);
+
+  useEffect(() => {
+    if (streamsExpanded) {
+      document.body.style.overflow = 'hidden';
+    } else {
+      document.body.style.overflow = '';
+      exitAppFullscreen();
+    }
+    return () => {
+      document.body.style.overflow = '';
+    };
+  }, [exitAppFullscreen, streamsExpanded]);
+
+  useEffect(() => {
+    const onFullscreenChange = () => {
+      if (!document.fullscreenElement && streamsExpanded) {
+        setExpandedCamera(null);
+      }
+    };
+    document.addEventListener('fullscreenchange', onFullscreenChange);
+    return () => document.removeEventListener('fullscreenchange', onFullscreenChange);
+  }, [streamsExpanded]);
 
   return (
-    <div className="shell">
+    <div className={`shell${streamsExpanded ? ' shell--streams-expanded' : ''}`}>
       <header className="topbar">
         <div className="brand">
           <div className="logo" />
@@ -898,7 +931,12 @@ function Dashboard() {
         <button className="btn ghost" onClick={() => setDepthDrawerOpen(v => !v)}>Depth</button>
       </header>
       <main className="main">
-        <section className="streams">
+        <section className={`streams${streamsExpanded ? ' streams--expanded' : ''}`}>
+          {streamsExpanded && (
+            <button className="mosaic-close" onClick={collapseStreams} title="Collapse mosaic">
+              Collapse view
+            </button>
+          )}
           <div className={`stream-tiler${streamDisplayCams.length === 1 ? ' stream-tiler--single' : ''}`}>
             {streamDisplayCams.map((cam) => (
               <StreamPanel
@@ -909,7 +947,7 @@ function Dashboard() {
                 fpsSeries={fpsSeries[cam]}
                 vacancyText={vacancyText[cam]}
                 isExpanded={expandedCamera === cam}
-                onToggleExpand={(cameraKey) => setExpandedCamera(prev => prev === cameraKey ? null : cameraKey)}
+                onToggleExpand={handleToggleExpand}
                 streamMode={streamMode}
                 videoRef={streamMode === 'webrtc' ? webrtc.videoRef : undefined}
               />
@@ -960,16 +998,6 @@ function Dashboard() {
         <span className="spacer" />
         <span className="subtitle">Use the Fullscreen button on any stream</span>
       </footer>
-
-      {expandedCamera && overlayUrl ? createPortal(
-        <div className="overlay-fullwindow" onClick={() => setExpandedCamera(null)}>
-          <img src={overlayUrl} alt={`${expandedCamera} stream`} className="overlay-media" />
-          <button className="overlay-close" onClick={(e) => { e.stopPropagation(); setExpandedCamera(null); }} title="Exit">
-            ✕
-          </button>
-        </div>,
-        document.body
-      ) : null}
 
       <DepthDrawer
         open={depthDrawerOpen}

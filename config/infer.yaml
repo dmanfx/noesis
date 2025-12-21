@@ -91,10 +91,10 @@ output:
 # Mosaic output configuration: parallel JPEG, RTSP, and WebRTC paths
 mosaic_output:
   jpeg_enabled: false        # NVJPEG/appsink mosaic is deprecated; keep off unless explicitly enabled
-  rtsp_enabled: false        # Disable RTSP mosaic output (debug: no nvrtspoutsinkbin)
+  rtsp_enabled: true         # Enable RTSP mosaic output (required for WebRTC gateway)
   rtsp_port: 8554            # RTSP server port (unused when rtsp_enabled is false)
   rtsp_path: "mosaic"        # RTSP stream path (url: rtsp://host:port/path)
-  mosaic_webrtc_enabled: false  # Disable WebRTC gateway (debug; requires RTSP mosaic)
+  mosaic_webrtc_enabled: true   # Enable WebRTC gateway (consumes the local RTSP mosaic)
   video_bitrate_kbps: 4000   # H.264 encoder bitrate
   encoder: "nvh264enc"       # H.264 encoder (fallback to x264enc if unavailable)
   # RTSP encoder tuning for faster WebRTC startup:

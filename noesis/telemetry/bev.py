@@ -566,11 +566,12 @@ class BevRenderer:
                         state = _BevTrailTrackState(points=deque(maxlen=max_points))
                         cam_tracks[track_id] = state
                     state.last_seen_ts = float(now_s)
-                    if stable_id not in (None, "", -1):
-                        try:
-                            state.stable_id = int(stable_id)
-                        except Exception:
-                            pass
+                    try:
+                        stable_id_int = int(stable_id) if stable_id not in (None, "", -1) else None
+                    except Exception:
+                        stable_id_int = None
+                    if stable_id_int is not None and stable_id_int > 0:
+                        state.stable_id = int(stable_id_int)
 
                     # Always prune old samples so disappeared tracks naturally fade out.
                     while state.points and (now_s - float(state.points[0][0])) > window_s:
@@ -658,11 +659,13 @@ class BevRenderer:
                         continue
                     pts = self._resample_points(pts, segments_budget)
                     key_id = int(track_id)
-                    if self._trail_cfg.color_key == "stable_id" and stable_id not in (None, "", -1):
+                    if self._trail_cfg.color_key == "stable_id":
                         try:
-                            key_id = int(stable_id)
+                            stable_id_int = int(stable_id) if stable_id not in (None, "", -1) else None
                         except Exception:
-                            key_id = int(track_id)
+                            stable_id_int = None
+                        if stable_id_int is not None and stable_id_int > 0:
+                            key_id = int(stable_id_int)
                     base_bgr = self._color_for_key(key_id)
                     for idx in range(len(pts) - 1):
                         ts0, x1, z1 = pts[idx]
@@ -686,11 +689,13 @@ class BevRenderer:
                 if p is None:
                     continue
                 key_id = int(track_id)
-                if self._trail_cfg.color_key == "stable_id" and stable_id not in (None, "", -1):
+                if self._trail_cfg.color_key == "stable_id":
                     try:
-                        key_id = int(stable_id)
+                        stable_id_int = int(stable_id) if stable_id not in (None, "", -1) else None
                     except Exception:
-                        key_id = int(track_id)
+                        stable_id_int = None
+                    if stable_id_int is not None and stable_id_int > 0:
+                        key_id = int(stable_id_int)
                 base_bgr = self._color_for_key(key_id)
                 cv2.circle(bev, p, 4, base_bgr, -1, lineType=cv2.LINE_AA)
 

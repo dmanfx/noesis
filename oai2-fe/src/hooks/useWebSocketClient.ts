@@ -23,9 +23,26 @@ export type CamerasStats = Record<string, {
   }
 }>;
 
+export type MosaicLayout = {
+  mosaic_w?: number;
+  mosaic_h?: number;
+  rows?: number | null;
+  cols?: number | null;
+  source_count?: number;
+  sources?: Array<{ source_id: number; camera_id: string }>;
+  frame_w?: number;
+  frame_h?: number;
+  square_seq_grid?: boolean;
+  tile_order?: string;
+};
+
 export interface StatsPayload {
   uptime?: number;
   cameras?: CamerasStats;
+  pipeline?: {
+    analytics_reload_count?: number;
+    mosaic_layout?: MosaicLayout;
+  };
 }
 
 export type FrameHandlers = {

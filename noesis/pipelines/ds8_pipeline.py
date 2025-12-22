@@ -349,8 +349,7 @@ def build_pipeline(yaml_path: str | Path) -> DS8Pipeline:
             continue
         eng = m.get("engine")
         if isinstance(eng, str) and eng and not Path(eng).is_absolute():
-            abs_eng = (base_dir / eng).resolve()
-            m["engine"] = str(abs_eng)
+            m["engine"] = _abs_or_same(eng)
         cfg_file = m.get("config-file-path") or m.get("config-file")
         if isinstance(cfg_file, str) and cfg_file:
             m_key = "config-file-path" if "config-file-path" in m else "config-file"
@@ -605,6 +604,27 @@ def build_pipeline(yaml_path: str | Path) -> DS8Pipeline:
     _safe_add(ds_pipeline, tracker, pipeline.errors)
     _apply_component_config(ds_pipeline, tracker, pipeline.errors)
 
+    # Optional per-object ReID SGIE (OSNet) for StableID assignment.
+    reid: Optional[Component] = None
+    reid_cfg_raw = models.get("reid")
+    reid_enabled = False
+    if isinstance(reid_cfg_raw, dict):
+        reid_enabled = bool(reid_cfg_raw.get("enable", True)) and bool(reid_cfg_raw)
+    if reid_enabled:
+        raw = dict(reid_cfg_raw) if isinstance(reid_cfg_raw, dict) else {}
+        reid_name = str(raw.get("name") or "reid_osnet").strip() or "reid_osnet"
+        reid_cfg = _nvinfer_props(raw)
+        reid = Component(
+            name=reid_name,
+            element="nvinfer",
+            config=reid_cfg,
+            downstream=["analytics"],
+        )
+        pipeline.components[reid.name] = reid
+        _safe_add(ds_pipeline, reid, pipeline.errors)
+        _apply_component_config(ds_pipeline, reid, pipeline.errors)
+        tracker.downstream = [reid.name]
+
     analytics_cfg_raw = cfg.get("analytics", {"config-file": "pipelines/config_nvdsanalytics_post.ini"})
     analytics_cfg = dict(analytics_cfg_raw) if isinstance(analytics_cfg_raw, dict) else {}
     analytics_enabled = bool(analytics_cfg.get("enable", True))
@@ -840,10 +860,18 @@ def build_pipeline(yaml_path: str | Path) -> DS8Pipeline:
         exclude_component.downstream = [tracker.name]
 
     if analytics is not None:
-        tracker.downstream = ["analytics"]
-        analytics.downstream = [tiler.name]
+        tracker.downstream = [analytics.name]
+        if reid is not None:
+            analytics.downstream = [reid.name]
+            reid.downstream = [tiler.name]
+        else:
+            analytics.downstream = [tiler.name]
     else:
-        tracker.downstream = [tiler.name]
+        if reid is not None:
+            tracker.downstream = [reid.name]
+            reid.downstream = [tiler.name]
+        else:
+            tracker.downstream = [tiler.name]
 
     if mapanything is not None:
         mapanything.downstream = [mapanything_sink.name]
@@ -1058,9 +1086,17 @@ def build_pipeline(yaml_path: str | Path) -> DS8Pipeline:
 
     if analytics is not None:
         _link(tracker.name, analytics.name)
-        _link(analytics.name, tiler.name)
+        if reid is not None:
+            _link(analytics.name, reid.name)
+            _link(reid.name, tiler.name)
+        else:
+            _link(analytics.name, tiler.name)
     else:
-        _link(tracker.name, tiler.name)
+        if reid is not None:
+            _link(tracker.name, reid.name)
+            _link(reid.name, tiler.name)
+        else:
+            _link(tracker.name, tiler.name)
 
     _link(tiler.name, osd.name)
     _link(osd.name, sink_tee.name)

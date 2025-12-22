@@ -74,14 +74,22 @@ class StableIDManager:
         new_id_hysteresis_frames: int = 2,
         # SID allocator persistence (smarter restart)
         sid_pool_file: str = "~/.noesis/sid_pool.json",
+        # External embedding support (e.g., DeepStream SGIE tensor outputs).
+        # When disabled, embeddings are extracted internally from BGR crops.
+        use_extractor: bool = True,
     ) -> None:
         self._lock = threading.RLock()
-        self.extractor = EmbeddingExtractor(
-            model_path=model_path,
-            device=device,
-            image_size=image_size,
-            model_name=model_name,
-        )
+        self._use_extractor = bool(use_extractor)
+        self.extractor: Optional[EmbeddingExtractor]
+        if self._use_extractor:
+            self.extractor = EmbeddingExtractor(
+                model_path=model_path,
+                device=device,
+                image_size=image_size,
+                model_name=model_name,
+            )
+        else:
+            self.extractor = None
 
         self.embed_interval_s = float(embed_interval_s)
         self.max_ghost_age_s = float(max_ghost_age_s)
@@ -139,6 +147,7 @@ class StableIDManager:
         self.sid_global_last_seen: Dict[int, float] = {}
         # Pending new-ID confirmation counters at cap
         self._pending_new_counts: Dict[Tuple[int, int], int] = {}
+        self._pending_new_ts: Dict[Tuple[int, int], float] = {}
 
         self.next_stable_id = 1
         # Free-list allocator state
@@ -307,6 +316,8 @@ class StableIDManager:
             else:
                 batch = crops
 
+            if self.extractor is None:
+                return None
             feats = self.extractor.extract(batch)
             if feats is None or feats.shape[0] < 1:
                 return None
@@ -393,6 +404,7 @@ class StableIDManager:
         ts: float,
         zone: Optional[str],
         frame_bgr: Optional[np.ndarray] = None,
+        embedding: Optional[np.ndarray] = None,
     ) -> int:
         """Update or create stable_id for a DS track.
 
@@ -405,6 +417,8 @@ class StableIDManager:
             is_new = rec is None
 
             emb: Optional[np.ndarray] = None
+            curr_brightness: Optional[float] = None
+            curr_color: Optional[np.ndarray] = None
             need_embed = False
             if is_new:
                 need_embed = True
@@ -413,7 +427,16 @@ class StableIDManager:
                 if ts - float(last_emb_ts) >= self.embed_interval_s:
                     need_embed = True
 
-            if need_embed:
+            # Prefer caller-supplied embeddings (e.g., from DeepStream SGIE tensor meta).
+            if need_embed and embedding is not None:
+                try:
+                    vec = np.asarray(embedding, dtype=np.float32).reshape(-1)
+                    if vec.size > 0:
+                        n = float(np.linalg.norm(vec) + 1e-12)
+                        emb = (vec / n).astype(np.float32)
+                except Exception:
+                    emb = None
+            elif need_embed and self._use_extractor:
                 crop = self._crop(frame_bgr, bbox_ltrbwh, expand=self.crop_expand)
                 if crop is not None:
                     # Quality gating to avoid embedding drift on tiny/blurred crops
@@ -427,14 +450,8 @@ class StableIDManager:
                     # Record brightness for adaptive penalties
                     if emb is not None:
                         curr_brightness = self._crop_brightness(crop)
-                    else:
-                        curr_brightness = None
                     # Compute color hist for additional discrimination
                     curr_color = self._crop_color_hist(crop)
-                else:
-                    curr_color = None
-            else:
-                curr_color = None
 
             # New track: try to match
             if is_new:
@@ -444,8 +461,13 @@ class StableIDManager:
                     sid = self._match_ghost(sensor_id, emb, bbox_ltrbwh, ts)
                     # Cross-camera active/gallery match if enabled
                     if sid is None:
-                        g_brightness = curr_brightness if curr_brightness is not None else None
-                        g_id, g_sim = self._gallery_best(emb, sensor_id=int(sensor_id), curr_bbox=bbox_ltrbwh, curr_brightness=g_brightness, curr_color=curr_color)
+                        g_id, g_sim = self._gallery_best(
+                            emb,
+                            sensor_id=int(sensor_id),
+                            curr_bbox=bbox_ltrbwh,
+                            curr_brightness=curr_brightness,
+                            curr_color=curr_color,
+                        )
                         if g_id is not None:
                             # Cross-camera handoff: lower threshold if same ID seen recently on another sensor
                             req = self.cos_sim_high_threshold
@@ -465,6 +487,14 @@ class StableIDManager:
                                     sid = g_id
 
                 if sid is None:
+                    # If embeddings are externally supplied (extractor disabled) and we don't have one yet,
+                    # do not mint an "allocator-only" stable_id. Defer until an embedding arrives.
+                    if emb is None and not self._use_extractor:
+                        cnt = self._pending_new_counts.get(key, 0) + 1
+                        self._pending_new_counts[key] = cnt
+                        self._pending_new_ts[key] = float(ts)
+                        return int(-abs(int(ds_obj_id)))
+
                     # Global new-ID hysteresis + soft-cap handling
                     active_ids_here = {s for s, pairs in self.active_zones.items() if any(int(x) == int(sensor_id) for (x, _z) in pairs)}
                     at_cap = len(active_ids_here) >= self.max_active_ids_per_sensor
@@ -473,6 +503,7 @@ class StableIDManager:
                         required = max(required, self.new_id_confirm_frames_at_cap)
                     cnt = self._pending_new_counts.get(key, 0) + 1
                     self._pending_new_counts[key] = cnt
+                    self._pending_new_ts[key] = float(ts)
                     if cnt < required:
                         # Defer ID creation; provisional negative label for UI stability
                         return int(-abs(int(ds_obj_id)))
@@ -535,6 +566,7 @@ class StableIDManager:
                     # Clear pending counter after minting
                     try:
                         self._pending_new_counts.pop(key, None)
+                        self._pending_new_ts.pop(key, None)
                     except Exception:
                         pass
 
@@ -599,6 +631,28 @@ class StableIDManager:
                 pass
             return int(rec["stable_id"])
 
+    def needs_embedding(self, sensor_id: int, ds_obj_id: int, ts: float) -> bool:
+        """Return True when an embedding update is due for the given track.
+
+        - New tracks always need an embedding.
+        - Tracks without an embedding need one.
+        - In extractor mode, respect embed_interval_s exactly.
+        - In external-embedding mode (use_extractor=False), treat embed_interval_s <= 0
+          as "only once" (avoid re-consuming SGIE tensor outputs every frame).
+        """
+        key = (int(sensor_id), int(ds_obj_id))
+        with self._lock:
+            rec = self.active_tracks.get(key)
+            if rec is None:
+                return True
+            if rec.get("emb") is None:
+                return True
+            last_emb_ts = float(rec.get("last_emb_ts", 0.0) or 0.0)
+            interval = float(self.embed_interval_s)
+            if not self._use_extractor and interval <= 0.0:
+                return False
+            return (float(ts) - last_emb_ts) >= interval
+
     def remove_missing_tracks(self, sensor_id: int, present_ds_ids: List[int], ts: float) -> None:
         """Move tracks not present this frame to ghost lists and update active_zones.
 
@@ -661,6 +715,15 @@ class StableIDManager:
                     if (t - float(last_seen)) >= max(2.0, self.active_evict_grace_s):
                         self._purge_sid_state(sid)
                         self._free_sid(sid)
+            except Exception:
+                pass
+            # Prune pending new-track counters that haven't been seen recently.
+            try:
+                cutoff = t - max(2.0, float(self.active_evict_grace_s))
+                for key, last_ts in list(self._pending_new_ts.items()):
+                    if float(last_ts) < cutoff:
+                        self._pending_new_ts.pop(key, None)
+                        self._pending_new_counts.pop(key, None)
             except Exception:
                 pass
 

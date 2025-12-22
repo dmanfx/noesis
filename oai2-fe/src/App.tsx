@@ -9,17 +9,21 @@ import { TelemetryProvider, useTelemetry } from './telemetry/TelemetryContext';
 import { TrailStore } from './lib/trails';
 import { cameraOrder, colorForTrack, cameraLabel, detectCameraKey, CameraKey } from './lib/camera';
 import { getExtrinsics, worldToCamera, getIntrinsics4, extractPoseFromExtrinsics, forwardXZFromExtrinsics } from './lib/calibration';
-import { useWebSocketClient, StatsPayload, DepthRequestStrategy } from './hooks/useWebSocketClient';
+import { useWebSocketClient, StatsPayload, DepthRequestStrategy, MosaicLayout } from './hooks/useWebSocketClient';
 import { useWebRTCClient } from './hooks/useWebRTCClient';
 import { StreamMode } from './components/StreamPanel';
 import DepthDrawer, { DepthDiagnosticsEntry, DepthDrawerEntry, DepthMetaEntry, FloorplanResponse } from './components/DepthDrawer';
 import TopDownDrawer from './components/TopDownDrawer';
 import { BevView, BevMeta } from './components/BevView';
+import RoiEditorDrawer from './components/RoiEditorDrawer';
 
 const wsHost = import.meta.env.VITE_WS_HOST || window.location.hostname;
 const wsPort = Number(import.meta.env.VITE_WS_PORT || 6008);
 const wsProto = window.location.protocol === 'https:' ? 'wss' : 'ws';
 const WS_URL = import.meta.env.VITE_WS_URL || `${wsProto}://${wsHost}:${wsPort}`;
+// Prefer same-origin `/api/...` (Vite dev proxy or prod reverse-proxy) to avoid CORS.
+// Override with `VITE_REST_URL` if the REST API is intentionally hosted elsewhere.
+const REST_URL = import.meta.env.VITE_REST_URL || '';
 const streamDisplayCams: CameraKey[] = ['living-room'];
 
 type CameraPoseSummary = {
@@ -35,6 +39,26 @@ const labelForCameraId = (camId: string): string => {
   const key = detectCameraKey(camId);
   if (key) return cameraLabel(key);
   return camId;
+};
+
+const normalizeCameraIdKey = (value: unknown): string => String(value ?? '').toLowerCase().trim();
+
+const buildMosaicCameraIdToSlotKey = (layout: MosaicLayout | null): Record<string, CameraKey> => {
+  const map: Record<string, CameraKey> = {};
+  if (!layout || !Array.isArray(layout.sources)) return map;
+  for (const src of layout.sources) {
+    const sourceId = Number((src as any).source_id);
+    if (!Number.isFinite(sourceId)) continue;
+    const slotKey = cameraOrder[sourceId as 0 | 1 | 2];
+    if (!slotKey) continue;
+    const cameraId = normalizeCameraIdKey((src as any).camera_id);
+    if (cameraId) map[cameraId] = slotKey;
+    map[String(sourceId)] = slotKey;
+    map[`rtsp_${sourceId}`] = slotKey;
+    map[`camera_${sourceId}`] = slotKey;
+    map[`source_${sourceId}`] = slotKey;
+  }
+  return map;
 };
 
 function Dashboard() {
@@ -124,18 +148,40 @@ function Dashboard() {
   });
   const [availableCameras, setAvailableCameras] = useState<string[]>([]);
   const [expandedCamera, setExpandedCamera] = useState<CameraKey | null>(null);
+  const [roiDrawerOpen, setRoiDrawerOpen] = useState(false);
+  const [mosaicLayout, setMosaicLayout] = useState<MosaicLayout | null>(null);
+  const [analyticsReloadCount, setAnalyticsReloadCount] = useState<number>(0);
   const maDiagThrottleRef = useRef<Record<string, number>>({});
   const lastCalibrationSignatureRef = useRef<string>('');
   const lastDepthFloorplanTsRef = useRef<Record<string, number>>({});
+  const mosaicCameraIdToSlotKeyRef = useRef<Record<string, CameraKey>>({});
 
   // Stream mode is fixed to WebRTC (former JPEG toggle removed)
   const streamMode: StreamMode = 'webrtc';
   const [webrtcError, setWebrtcError] = useState<string | null>(null);
 
+  const resolveDisplayCameraKey = useCallback((rawId: unknown): CameraKey | null => {
+    const id = normalizeCameraIdKey(rawId);
+    if (!id) return null;
+    const mapped = mosaicCameraIdToSlotKeyRef.current[id];
+    if (mapped) return mapped;
+    return detectCameraKey(id);
+  }, []);
+
   const onStats = (payload: StatsPayload) => {
     // System status/uptime
     const now = Date.now();
     publish({ group: 'System', key: 'Uptime', value: Math.floor((payload.uptime ?? 0)), ts: now });
+
+    const nextLayout = payload.pipeline?.mosaic_layout;
+    if (nextLayout) {
+      setMosaicLayout(nextLayout);
+      mosaicCameraIdToSlotKeyRef.current = buildMosaicCameraIdToSlotKey(nextLayout);
+    }
+    const reloadCount = payload.pipeline?.analytics_reload_count;
+    if (typeof reloadCount === 'number') {
+      setAnalyticsReloadCount(reloadCount);
+    }
 
     const cameras = payload.cameras || {};
     setAvailableCameras(Object.keys(cameras));
@@ -156,7 +202,8 @@ function Dashboard() {
     for (const camId in cameras) {
       const c = cameras[camId];
       const track = c?.tracking;
-      const camKey = detectCameraKey(camId) || (camId.toLowerCase().includes('kitchen') ? 'kitchen' : camId.toLowerCase().includes('living') || camId === '1' || camId === 'rtsp_0' ? 'living-room' : 'family-room');
+      const camKey = resolveDisplayCameraKey(camId);
+      if (!camKey) continue;
       if (camKey === 'living-room' || camKey === 'kitchen' || camKey === 'family-room') {
         const statusText = typeof c?.status === 'string' && c.status.trim().length > 0
           ? c.status
@@ -273,7 +320,7 @@ function Dashboard() {
     let tracksHtml = '';
     if (allTracks.length) {
       const findCamForTrack = (track: any): CameraKey | undefined => {
-        const keyFromTrack = detectCameraKey(String(track.camera_id || ''));
+        const keyFromTrack = resolveDisplayCameraKey(String(track.camera_id || ''));
         if (keyFromTrack) return keyFromTrack;
         return (Object.keys(perKeyTracks) as CameraKey[]).find(k => perKeyTracks[k]?.some(tt => tt.track_id === track.track_id));
       };
@@ -492,9 +539,9 @@ function Dashboard() {
     const candidatePayload = (message.payload && typeof message.payload === 'object') ? message.payload : message;
     const camSource = message.camera || message.cam_id || message.cameraId || message.camera_id || message.camId;
     const payloadCamera = candidatePayload?.camera || candidatePayload?.cam_id || candidatePayload?.cameraId || candidatePayload?.camera_id;
-    const camId = String(camSource || payloadCamera || '')
+    const rawCamId = String(camSource || payloadCamera || '')
       .trim();
-    if (!camId || (message?.ok === false && !candidatePayload?.depth_b64)) return;
+    if (!rawCamId || (message?.ok === false && !candidatePayload?.depth_b64)) return;
     const shape = candidatePayload?.shape || candidatePayload?.depth_shape;
     if (!Array.isArray(shape) || shape.length !== 2) return;
     const depthB64 = candidatePayload.depth_b64 || candidatePayload.depth_z_b64;
@@ -508,7 +555,9 @@ function Dashboard() {
     const tsFromResponse = parseTimestampUs(message.ts_us);
     const tsFromPayload = parseTimestampUs(candidatePayload?.ts);
     const tsUs = tsFromResponse ?? tsFromPayload ?? Math.floor(Date.now() * 1000);
-    const prevTs = depthMetaRef.current[camId]?.tsUs ?? 0;
+    const resolvedCamKey = resolveDisplayCameraKey(rawCamId);
+    const storageKey = resolvedCamKey ?? rawCamId;
+    const prevTs = depthMetaRef.current[storageKey]?.tsUs ?? 0;
     if (prevTs && tsUs < prevTs) return;
     const entry: DepthDrawerEntry = {
       ts: tsUs,
@@ -518,18 +567,19 @@ function Dashboard() {
       shape: [Number(shape[0]) || 0, Number(shape[1]) || 0]
     };
     if (!entry.shape[0] || !entry.shape[1]) return;
-    setMaDepthData(prev => ({ ...prev, [camId]: entry }));
+    setMaDepthData(prev => ({ ...prev, [storageKey]: entry }));
 
     const meta: DepthMetaEntry = {
       tsUs,
       servedFromCache: typeof message.served_from_cache === 'boolean' ? message.served_from_cache : undefined,
       requestId: message.request_id || message.requestId || undefined,
-      error: typeof message.error === 'string' ? message.error : undefined
+      error: typeof message.error === 'string' ? message.error : undefined,
+      sourceCameraId: rawCamId,
     };
-    depthMetaRef.current[camId] = meta;
-    setMaDepthMeta(prev => ({ ...prev, [camId]: meta }));
+    depthMetaRef.current[storageKey] = meta;
+    setMaDepthMeta(prev => ({ ...prev, [storageKey]: meta }));
 
-    const label = labelForCameraId(camId);
+    const label = labelForCameraId(storageKey);
     const now = Date.now();
     publish({
       group: 'MapAnything Depth',
@@ -614,11 +664,11 @@ function Dashboard() {
 
   const handleBevMeta = useCallback((payload: BevMeta) => {
     if (!payload) return;
-    const cam = detectCameraKey((payload.cameraId || payload.camId || '').toString());
+    const cam = resolveDisplayCameraKey((payload.cameraId || payload.camId || '').toString());
     if (!cam) return;
     bevMetaRef.current = { ...bevMetaRef.current, [cam]: payload };
     setBevMeta((prev) => ({ ...prev, [cam]: payload }));
-  }, []);
+  }, [resolveDisplayCameraKey]);
 
   // WebRTC handler refs (to break circular dependency with useWebSocketClient)
   const webrtcHandleAnswerRef = useRef<(sdp: string) => Promise<void>>(() => Promise.resolve());
@@ -750,13 +800,17 @@ function Dashboard() {
   useEffect(() => {
     Object.entries(maDepthMeta || {}).forEach(([camId, meta]) => {
       if (!meta || typeof meta.tsUs !== 'number') return;
+      // If the depth payload was remapped to a different UI camera key, do not auto-regenerate
+      // floorplans off that signal; it can overwrite a good cached floorplan with a mismatched one.
+      if (meta.sourceCameraId && meta.sourceCameraId !== camId) return;
       const prev = lastDepthFloorplanTsRef.current[camId] || 0;
       if (meta.tsUs <= prev) return;
       lastDepthFloorplanTsRef.current[camId] = meta.tsUs;
       handleRequestFloorplan({
         camera: camId,
         requestId: `bev-refresh-${camId}-${meta.tsUs}`,
-        maxAgeSec: 0,
+        // Prefer cache-first behavior to avoid regenerating topdowns while snapshots are being written.
+        maxAgeSec: 600,
         gridResM: 0.15,
         maxExtentM: 20,
         cacheOnly: false
@@ -929,6 +983,7 @@ function Dashboard() {
         <button className="btn ghost" onClick={() => setTelemetryOpen(v => !v)}>Telemetry</button>
         <button className="btn ghost" onClick={() => setTopDownOpen(v => !v)}>Top‑Down</button>
         <button className="btn ghost" onClick={() => setDepthDrawerOpen(v => !v)}>Depth</button>
+        <button className="btn ghost" onClick={() => setRoiDrawerOpen(v => !v)}>ROIs</button>
       </header>
       <main className="main">
         <section className={`streams${streamsExpanded ? ' streams--expanded' : ''}`}>
@@ -1022,6 +1077,14 @@ function Dashboard() {
           setCalibrateToast({ text: 'Calibrating…', kind: 'info', ts: Date.now() });
           sendAutoCalibrate();
         }}
+      />
+      <RoiEditorDrawer
+        open={roiDrawerOpen}
+        onClose={() => setRoiDrawerOpen(false)}
+        restBaseUrl={REST_URL}
+        mosaicLayout={mosaicLayout}
+        videoRef={webrtc.videoRef}
+        analyticsReloadCount={analyticsReloadCount}
       />
 
       {telemetryOpen && (

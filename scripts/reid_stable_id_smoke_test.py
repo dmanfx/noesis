@@ -58,15 +58,18 @@ def _spawn_runtime(args: argparse.Namespace) -> subprocess.Popen:
         args.pipeline_config,
         "--cameras-config",
         args.cameras_config,
+        "--disable-rest",
     ]
     if args.depth_seconds is not None:
         cmd.extend(["--depth-enable-seconds", str(args.depth_seconds)])
     env = os.environ.copy()
     env.setdefault("NOESIS_REID_ENABLED", "1")
+    env.setdefault("NOESIS_DS8_USE_NVURISRCBIN", "1")
     env.setdefault("NOESIS_MOSAIC_JPEG_ENABLED", "0")
     env.setdefault("NOESIS_MOSAIC_RTSP_ENABLED", "0")
     env.setdefault("NOESIS_MOSAIC_WEBRTC_ENABLED", "0")
-    env.setdefault("NOESIS_REID_TEST_MODE", "1")
+    if args.synthetic:
+        env.setdefault("NOESIS_REID_TEST_MODE", "1")
     proc = subprocess.Popen(cmd, env=env)
     return proc
 
@@ -74,14 +77,19 @@ def _spawn_runtime(args: argparse.Namespace) -> subprocess.Popen:
 def main() -> int:
     parser = argparse.ArgumentParser(description="Stable ID smoke test")
     parser.add_argument("--ws", default="ws://127.0.0.1:6008", help="WebSocket URL")
-    parser.add_argument("--pipeline-config", default="config/infer.yaml")
+    parser.add_argument("--pipeline-config", default="config/infer_smoke_reid.yaml")
     parser.add_argument("--cameras-config", default="config/cameras.yaml")
     parser.add_argument("--no-spawn", action="store_true", help="Do not spawn runtime")
     parser.add_argument("--duration", type=float, default=12.0)
     parser.add_argument(
+        "--synthetic",
+        action="store_true",
+        help="Inject a synthetic stable_id track when no detections are present (NOESIS_REID_TEST_MODE=1).",
+    )
+    parser.add_argument(
         "--depth-seconds",
         type=int,
-        default=120,
+        default=0,
         help="Enable depth on startup for this many seconds (omit to use runtime default).",
     )
     args = parser.parse_args()
@@ -110,6 +118,12 @@ def main() -> int:
         for tid, sid_counts in result["seen"].items():
             for sid, count in sid_counts.items():
                 if sid is None:
+                    continue
+                try:
+                    sid_int = int(sid)
+                except Exception:
+                    continue
+                if sid_int <= 0:
                     continue
                 if count >= 2:
                     print(f"[PASS] stable_id {sid} persisted across frames for track {tid}")

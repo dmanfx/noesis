@@ -42,6 +42,7 @@ tests/
 ma_onnx_out/
 ma_onnx_out_fused/
 ma_onnx_out_clean/
+ma_onnx_out_forward/
 ma_onnxTRT/
 ./ma_onnx_out.tar.gz
 .git/

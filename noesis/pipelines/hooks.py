@@ -34,6 +34,7 @@ except Exception:  # pragma: no cover - handled gracefully when absent
     pyds = None  # type: ignore
 
 logger = logging.getLogger(__name__)
+_REID_DLPACK_DEBUG_LOGGED = False
 
 
 def attach_intrinsics_hook(
@@ -115,8 +116,8 @@ def attach_analytics_telemetry_hook(
     if tracking_pub is None:
         raise ValueError("tracking_pub must be provided for analytics telemetry")
 
-    component = pipeline.components.get("analytics")
-    if component is None:
+    analytics_component = pipeline.components.get("analytics")
+    if analytics_component is None:
         raise KeyError("analytics component missing; cannot attach telemetry hook")
 
     processor = _AnalyticsTelemetryProcessor(
@@ -127,7 +128,21 @@ def attach_analytics_telemetry_hook(
         bev_renderer=bev_renderer,
         bev_calibration=bev_calibration,
     )
-    component.config["_analytics_processor"] = processor
+    analytics_component.config["_analytics_processor"] = processor
+
+    # When the ReID SGIE is enabled, attach telemetry downstream of it so tensor meta
+    # is still valid when accessed (Service Maker tensor wrappers can be unsafe later).
+    attach_component = analytics_component
+    try:
+        models_cfg = getattr(pipeline, "config", {}).get("models", {}) or {}
+        reid_cfg = models_cfg.get("reid") or {}
+        if isinstance(reid_cfg, dict) and bool(reid_cfg.get("enable", True)):
+            reid_name = str(reid_cfg.get("name") or "reid_osnet").strip() or "reid_osnet"
+            candidate = pipeline.components.get(reid_name)
+            if candidate is not None:
+                attach_component = candidate
+    except Exception:
+        attach_component = analytics_component
 
     if pipeline.ds_pipeline is None or BatchMetadataOperator is None or Probe is None:
         logger.debug("Stored analytics telemetry processor for lazy execution (pyservicemaker unavailable)")
@@ -135,8 +150,8 @@ def attach_analytics_telemetry_hook(
 
     try:
         probe = Probe("analytics_telemetry", _AnalyticsTelemetryOperator(processor))
-        pipeline.ds_pipeline.attach(component.name, probe)
-        logger.info("Attached analytics telemetry probe to %s", component.name)
+        pipeline.ds_pipeline.attach(attach_component.name, probe)
+        logger.info("Attached analytics telemetry probe to %s", attach_component.name)
     except Exception:  # pragma: no cover - depends on DS runtime availability
         logger.exception("Failed to attach analytics telemetry probe")
 
@@ -186,6 +201,29 @@ def attach_trail_overlay_hook(
         logger.info("Attached trail overlay probe to %s", attach_component.name)
     except Exception:  # pragma: no cover - depends on DS runtime availability
         logger.exception("Failed to attach trail overlay probe")
+
+
+def attach_osd_label_hook(pipeline: "DS8Pipeline") -> None:
+    """Attach a DS8 hook that stamps object labels with detection confidence."""
+    osd_component = pipeline.components.get("osd")
+    if osd_component is None:
+        raise KeyError("osd component missing; cannot attach OSD label hook")
+
+    # Attach upstream of nvdsosd so the text is rendered in the mosaic overlay.
+    attach_component = pipeline.components.get("tiler") or osd_component
+    processor = _OsdLabelProcessor.from_pipeline_config(getattr(pipeline, "config", {}) or {})
+    attach_component.config["_osd_label_processor"] = processor
+
+    if pipeline.ds_pipeline is None or BatchMetadataOperator is None or Probe is None:
+        logger.debug("Stored OSD label processor for lazy execution (pyservicemaker unavailable)")
+        return
+
+    try:
+        probe = Probe("osd_labels", _OsdLabelOperator(processor))
+        pipeline.ds_pipeline.attach(attach_component.name, probe)
+        logger.info("Attached OSD label probe to %s", attach_component.name)
+    except Exception:  # pragma: no cover - depends on DS runtime availability
+        logger.exception("Failed to attach OSD label probe")
 
 
 def attach_analytics_reload_bridge(
@@ -1623,12 +1661,15 @@ class TrailOverlayProcessor:
                 except Exception:
                     stable_id = None
 
+            stable_id_int = None
+            try:
+                stable_id_int = int(stable_id)
+            except Exception:
+                stable_id_int = None
+
             key_id = int(track_id)
-            if self.config.color_key == "stable_id" and stable_id not in (None, "", -1):
-                try:
-                    key_id = int(stable_id)
-                except Exception:
-                    key_id = int(track_id)
+            if self.config.color_key == "stable_id" and stable_id_int is not None and stable_id_int > 0:
+                key_id = int(stable_id_int)
             r, g, b = self._color_for_key(key_id)
 
             line = ds_osd.Line()
@@ -1689,8 +1730,8 @@ class TrailOverlayProcessor:
             label_budget -= 1
             _ts, last_x, last_y = pts[-1]
             text = ds_osd.Text()
-            if stable_id not in (None, "", -1):
-                text.display_text = f"sid {stable_id}"
+            if stable_id_int is not None and stable_id_int > 0:
+                text.display_text = f"sid {stable_id_int}"
             else:
                 text.display_text = f"id {track_id}"
             text.x_offset = int(last_x)
@@ -1751,6 +1792,297 @@ class _AnalyticsTelemetryProcessor:
     _stable_id_enabled: bool = field(default=True, init=False, repr=False)
     _bev_class_ids: frozenset[int] = field(default_factory=lambda: frozenset({0}), init=False, repr=False)
     _bev_class_ids_ready: bool = field(default=False, init=False, repr=False)
+    _reid_unique_id: int = field(default=3, init=False, repr=False)
+    _reid_layer_name: str = field(default="features", init=False, repr=False)
+    _reid_logged_shape: bool = field(default=False, init=False, repr=False)
+    _reid_debug_last_log: float = field(default=0.0, init=False, repr=False)
+    _reid_debug_frames: int = field(default=0, init=False, repr=False)
+    _reid_debug_objects: int = field(default=0, init=False, repr=False)
+    _reid_debug_people: int = field(default=0, init=False, repr=False)
+    _reid_debug_emb_found: int = field(default=0, init=False, repr=False)
+    _reid_debug_emb_missing: int = field(default=0, init=False, repr=False)
+
+    def __post_init__(self) -> None:
+        # Discover the ReID SGIE unique-id from the built pipeline config when present.
+        try:
+            models_cfg = getattr(self.pipeline, "config", {}).get("models", {}) or {}
+            reid_cfg = models_cfg.get("reid") or {}
+            if isinstance(reid_cfg, dict):
+                gie_id = reid_cfg.get("gie_id", reid_cfg.get("gie-id", None))
+                if gie_id is not None:
+                    self._reid_unique_id = int(gie_id)
+        except Exception:
+            self._reid_unique_id = 3
+
+    @staticmethod
+    def _tensor_to_embedding(layer_tensor: Any) -> Optional[np.ndarray]:
+        """Convert a Service Maker Tensor (dlpack) into a 1D float32 embedding."""
+        if layer_tensor is None:
+            return None
+        flag = str(os.environ.get("NOESIS_REID_NO_DLPACK", "")).strip().lower()
+        if flag in ("1", "true", "yes", "on"):
+            try:
+                shape = getattr(layer_tensor, "shape", None)
+                if shape is not None and hasattr(shape, "__len__") and len(shape) >= 1 and int(shape[-1]) == 512:
+                    emb = np.zeros((512,), dtype=np.float32)
+                    emb[0] = 1.0
+                    return emb
+            except Exception:
+                return None
+        dlpack_debug_enabled = str(os.environ.get("NOESIS_REID_DLPACK_DEBUG", "")).strip().lower() in (
+            "1",
+            "true",
+            "yes",
+            "on",
+        )
+        try:
+            import ctypes
+            import ctypes.util
+
+            capsule_name = None
+            used_versioned = False
+            ver_major = None
+            ver_minor = None
+            ndim = None
+            shape = None
+            dtype_bits = None
+            dtype_code = None
+            dtype_lanes = None
+            dev_type = None
+
+            def _fail(reason: str) -> Optional[np.ndarray]:
+                global _REID_DLPACK_DEBUG_LOGGED
+                if dlpack_debug_enabled and not _REID_DLPACK_DEBUG_LOGGED:
+                    logger.info(
+                        "ReID DLPack decode failed: reason=%s capsule=%s versioned=%s ver=%s.%s ndim=%s shape=%s dtype=(code=%s bits=%s lanes=%s) dev_type=%s",
+                        reason,
+                        capsule_name,
+                        used_versioned,
+                        ver_major,
+                        ver_minor,
+                        ndim,
+                        shape,
+                        dtype_code,
+                        dtype_bits,
+                        dtype_lanes,
+                        dev_type,
+                    )
+                    _REID_DLPACK_DEBUG_LOGGED = True
+                return None
+
+            class _DLDevice(ctypes.Structure):
+                _fields_ = [("device_type", ctypes.c_int), ("device_id", ctypes.c_int)]
+
+            class _DLDataType(ctypes.Structure):
+                _fields_ = [("code", ctypes.c_uint8), ("bits", ctypes.c_uint8), ("lanes", ctypes.c_uint16)]
+
+            class _DLTensor(ctypes.Structure):
+                _fields_ = [
+                    ("data", ctypes.c_void_p),
+                    ("device", _DLDevice),
+                    ("ndim", ctypes.c_int),
+                    ("dtype", _DLDataType),
+                    ("shape", ctypes.POINTER(ctypes.c_int64)),
+                    ("strides", ctypes.POINTER(ctypes.c_int64)),
+                    ("byte_offset", ctypes.c_uint64),
+                ]
+
+            class _DLManagedTensor(ctypes.Structure):
+                _fields_ = [("dl_tensor", _DLTensor), ("manager_ctx", ctypes.c_void_p), ("deleter", ctypes.c_void_p)]
+
+            class _DLPackVersion(ctypes.Structure):
+                _fields_ = [("major", ctypes.c_int32), ("minor", ctypes.c_int32)]
+
+            class _DLManagedTensorVersioned(ctypes.Structure):
+                _fields_ = [
+                    ("version", _DLPackVersion),
+                    ("dl_tensor", _DLTensor),
+                    ("manager_ctx", ctypes.c_void_p),
+                    ("deleter", ctypes.c_void_p),
+                ]
+
+            dlpack_capsule = layer_tensor.__dlpack__(None)
+            raw_name = None
+            try:
+                get_name = ctypes.pythonapi.PyCapsule_GetName
+                get_name.restype = ctypes.c_char_p
+                get_name.argtypes = [ctypes.py_object]
+                raw_name = get_name(dlpack_capsule)
+                capsule_name = raw_name.decode("utf-8", "replace") if raw_name else None
+            except Exception:
+                capsule_name = None
+            get_ptr = ctypes.pythonapi.PyCapsule_GetPointer
+            get_ptr.restype = ctypes.c_void_p
+            get_ptr.argtypes = [ctypes.py_object, ctypes.c_char_p]
+            managed_ptr = get_ptr(dlpack_capsule, raw_name)
+            if not managed_ptr:
+                return _fail("capsule_get_pointer")
+
+            dl = None
+            deleter_ptr = None
+            try:
+                managed_v = ctypes.cast(managed_ptr, ctypes.POINTER(_DLManagedTensorVersioned))
+                ver = managed_v.contents.version
+                dl_candidate = managed_v.contents.dl_tensor
+                ver_major = int(ver.major)
+                ver_minor = int(ver.minor)
+                ndim_candidate = int(dl_candidate.ndim)
+                dtype_bits_candidate = int(dl_candidate.dtype.bits)
+                dtype_code_candidate = int(dl_candidate.dtype.code)
+                dev_type_candidate = int(dl_candidate.device.device_type)
+                plausible = (
+                    0 <= ver_major <= 10
+                    and 0 <= ver_minor <= 10
+                    and 1 <= ndim_candidate <= 8
+                    and dtype_bits_candidate in (8, 16, 32, 64)
+                    and 0 <= dtype_code_candidate <= 8
+                    and 1 <= dev_type_candidate <= 32
+                    and int(dl_candidate.data or 0) != 0
+                )
+                if plausible:
+                    dl = dl_candidate
+                    deleter_ptr = managed_v.contents.deleter
+                    used_versioned = True
+            except Exception:
+                dl = None
+                deleter_ptr = None
+            if dl is None:
+                managed = ctypes.cast(managed_ptr, ctypes.POINTER(_DLManagedTensor))
+                dl = managed.contents.dl_tensor
+                deleter_ptr = managed.contents.deleter
+
+            ndim = int(dl.ndim)
+            if ndim < 1:
+                return _fail("ndim")
+            shape = [int(dl.shape[i]) for i in range(ndim)]
+            total = 1
+            for dim in shape:
+                total *= max(1, int(dim))
+            dtype_bits = int(dl.dtype.bits)
+            dtype_code = int(dl.dtype.code)
+            dtype_lanes = int(dl.dtype.lanes)
+            if dtype_code != 2 or dtype_bits != 32 or dtype_lanes != 1:
+                return _fail("dtype")
+            nbytes = int(total * (dtype_bits // 8) * dtype_lanes)
+            if nbytes <= 0:
+                return _fail("nbytes")
+
+            out = np.empty((total,), dtype=np.float32)
+            dst_ptr = ctypes.c_void_p(int(out.ctypes.data))
+            src_ptr = ctypes.c_void_p(int(dl.data) + int(dl.byte_offset))
+            dev_type = int(dl.device.device_type)
+
+            if dev_type in (1, 3):  # kDLCPU / kDLCUDAHost
+                ctypes.memmove(dst_ptr, src_ptr, nbytes)
+            elif dev_type in (2, 13):  # kDLCUDA / kDLCUDAManaged
+                cudart_path = ctypes.util.find_library("cudart")
+                if not cudart_path:
+                    return _fail("cudart")
+                cudart = ctypes.CDLL(cudart_path)
+                cuda_memcpy = cudart.cudaMemcpy
+                cuda_memcpy.restype = ctypes.c_int
+                cuda_memcpy.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int]
+                err = int(cuda_memcpy(dst_ptr, src_ptr, ctypes.c_size_t(nbytes), ctypes.c_int(2)))
+                if err != 0:
+                    return _fail(f"cudaMemcpy:{err}")
+            else:
+                return _fail("device_type")
+
+            call_deleter = str(os.environ.get("NOESIS_REID_DLPACK_CALL_DELETER", "")).strip().lower() in (
+                "1",
+                "true",
+                "yes",
+                "on",
+            )
+            if call_deleter and deleter_ptr:
+                deleter = ctypes.CFUNCTYPE(None, ctypes.c_void_p)(deleter_ptr)
+                deleter(managed_ptr)
+
+            emb = out.reshape(-1).astype(np.float32, copy=False)
+            if emb.size < 1:
+                return _fail("empty")
+            n = float(np.linalg.norm(emb) + 1e-12)
+            return (emb / n).astype(np.float32)
+        except Exception as exc:
+            global _REID_DLPACK_DEBUG_LOGGED
+            if dlpack_debug_enabled and not _REID_DLPACK_DEBUG_LOGGED:
+                logger.info("ReID DLPack decode raised: %s", exc, exc_info=True)
+                _REID_DLPACK_DEBUG_LOGGED = True
+            return None
+
+    def _extract_reid_embedding_ds8(self, obj_meta: Any) -> Optional[np.ndarray]:
+        """Extract OSNet embedding from DS8 object tensor meta (SGIE output)."""
+        tensor_items_iter = getattr(obj_meta, "tensor_items", None)
+        if tensor_items_iter is None:
+            return None
+        # Snapshot iterator to avoid lifetime/iteration hazards in some DS builds.
+        try:
+            tensor_items = list(tensor_items_iter)
+        except Exception:
+            tensor_items = tensor_items_iter or []
+        for item in tensor_items:
+            try:
+                if not item:
+                    continue
+            except Exception:
+                pass
+            try:
+                tensor_output = item.as_tensor_output()
+            except Exception:
+                continue
+            try:
+                if not tensor_output:
+                    continue
+            except Exception:
+                pass
+            try:
+                layers = tensor_output.get_layers()
+            except Exception:
+                continue
+            if not isinstance(layers, dict) or not layers:
+                continue
+            layer_tensor = layers.get(self._reid_layer_name)
+            if layer_tensor is None:
+                # If the layer name is unknown, fall back to a likely embedding output.
+                if len(layers) == 1:
+                    try:
+                        layer_tensor = next(iter(layers.values()))
+                    except Exception:
+                        layer_tensor = None
+                else:
+                    # Prefer a layer whose shape looks like a 512-D vector.
+                    for candidate in layers.values():
+                        try:
+                            shape = getattr(candidate, "shape", None)
+                            if shape is None:
+                                continue
+                            if hasattr(shape, "__len__") and len(shape) >= 1 and int(shape[-1]) == 512:
+                                layer_tensor = candidate
+                                break
+                        except Exception:
+                            continue
+            emb = self._tensor_to_embedding(layer_tensor)
+            if emb is None:
+                continue
+            if not self._reid_logged_shape:
+                try:
+                    shape = getattr(layer_tensor, "shape", None)
+                    dtype = getattr(layer_tensor, "dtype", None)
+                    dev = getattr(layer_tensor, "device_type", None)
+                    keys = list(layers.keys())
+                    logger.info(
+                        "ReID SGIE tensor observed: expected_unique_id=%s layers=%s shape=%s dtype=%s device=%s",
+                        int(self._reid_unique_id),
+                        keys,
+                        shape,
+                        dtype,
+                        dev,
+                    )
+                except Exception:
+                    pass
+                self._reid_logged_shape = True
+            return emb
+        return None
 
     def handle_frame_ds8(self, frame_meta: Any) -> None:
         """Extract tracking telemetry for a single frame using DS8 pyservicemaker API."""
@@ -1766,6 +2098,9 @@ class _AnalyticsTelemetryProcessor:
             present_track_ids: set[int] = set()
             footpoints: List[Footpoint] = []
             frame_dims = self._frame_dims()
+            reid_debug = str(os.environ.get("NOESIS_REID_DEBUG", "")).strip().lower() in ("1", "true", "yes", "on")
+            if reid_debug:
+                self._reid_debug_frames += 1
 
             # DS8 API: frame_meta.object_items is an iterable
             object_items = getattr(frame_meta, "object_items", None) or []
@@ -1773,6 +2108,8 @@ class _AnalyticsTelemetryProcessor:
                 track = self._build_track_dict_ds8(obj_meta, camera_id)
                 if track is None:
                     continue
+                if reid_debug:
+                    self._reid_debug_objects += 1
                 
                 track_id = int(track.get("track_id", -1))
                 present_track_ids.add(track_id)
@@ -1797,15 +2134,49 @@ class _AnalyticsTelemetryProcessor:
                 zone = track.get("zone")
                 dwell = self._update_dwell_time(sensor_id, track_id, zone, now_ts)
                 track["dwell_time"] = dwell
-                frame_crop = self._reid_crop_from_track(track, frame_dims)
-                track["stable_id"] = self._maybe_assign_stable_id(
-                    sensor_id=sensor_id,
-                    track_id=track_id,
-                    bbox=track.get("bbox"),
-                    zone=zone,
-                    ts=now_ts,
-                    frame_bgr=frame_crop,
-                )
+                try:
+                    class_id = int(track.get("class_id", -1))
+                except Exception:
+                    class_id = -1
+                if class_id == 0:
+                    if reid_debug:
+                        self._reid_debug_people += 1
+                    emb = None
+                    need_emb = True
+                    mgr = getattr(self.pipeline, "stable_id_mgr", None)
+                    if mgr is None:
+                        need_emb = False
+                    else:
+                        needs_fn = getattr(mgr, "needs_embedding", None)
+                        if callable(needs_fn):
+                            try:
+                                need_emb = bool(needs_fn(int(sensor_id), int(track_id), float(now_ts)))
+                            except Exception:
+                                need_emb = True
+                        else:
+                            try:
+                                rec = mgr.active_tracks.get((int(sensor_id), int(track_id)))
+                                need_emb = rec is None or rec.get("emb") is None
+                            except Exception:
+                                need_emb = True
+                    if need_emb:
+                        emb = self._extract_reid_embedding_ds8(obj_meta)
+                        if reid_debug:
+                            if emb is None:
+                                self._reid_debug_emb_missing += 1
+                            else:
+                                self._reid_debug_emb_found += 1
+                    track["stable_id"] = self._maybe_assign_stable_id(
+                        sensor_id=sensor_id,
+                        track_id=track_id,
+                        bbox=track.get("bbox"),
+                        zone=zone,
+                        ts=now_ts,
+                        frame_bgr=None,
+                        embedding=emb,
+                    )
+                else:
+                    track["stable_id"] = None
                 if zone:
                     occupancy_counts[zone] = occupancy_counts.get(zone, 0) + 1
                     logger.debug(f"Track {track_id} in zone {zone}, occupancy now: {occupancy_counts[zone]}")
@@ -1823,6 +2194,25 @@ class _AnalyticsTelemetryProcessor:
             self._cleanup_zone_state(sensor_id, present_track_ids)
             self._maintain_stable_ids(sensor_id, present_track_ids, now_ts)
             self._active_tracks[sensor_id] = tracks
+
+            if reid_debug:
+                if (now_ts - float(self._reid_debug_last_log)) >= 1.0:
+                    logger.info(
+                        "ReID debug: frames=%d tracks=%d people=%d emb_found=%d emb_missing=%d reid_unique_id=%d layer=%s",
+                        int(self._reid_debug_frames),
+                        int(self._reid_debug_objects),
+                        int(self._reid_debug_people),
+                        int(self._reid_debug_emb_found),
+                        int(self._reid_debug_emb_missing),
+                        int(self._reid_unique_id),
+                        str(self._reid_layer_name),
+                    )
+                    self._reid_debug_last_log = float(now_ts)
+                    self._reid_debug_frames = 0
+                    self._reid_debug_objects = 0
+                    self._reid_debug_people = 0
+                    self._reid_debug_emb_found = 0
+                    self._reid_debug_emb_missing = 0
 
             if not tracks and os.environ.get("NOESIS_REID_TEST_MODE") == "1":
                 synthetic = {
@@ -1894,14 +2284,14 @@ class _AnalyticsTelemetryProcessor:
                 zone = track.get("zone")
                 dwell = self._update_dwell_time(sensor_id, track_id, zone, now_ts)
                 track["dwell_time"] = dwell
-                frame_crop = self._reid_crop_from_track(track, frame_dims)
                 track["stable_id"] = self._maybe_assign_stable_id(
                     sensor_id=sensor_id,
                     track_id=track_id,
                     bbox=track.get("bbox"),
                     zone=zone,
                     ts=now_ts,
-                    frame_bgr=frame_crop,
+                    frame_bgr=None,
+                    embedding=None,
                 )
                 if zone:
                     occupancy_counts[zone] = occupancy_counts.get(zone, 0) + 1
@@ -2029,6 +2419,8 @@ class _AnalyticsTelemetryProcessor:
         try:
             stable_id = int(stable_id) if stable_id not in (None, "", -1) else None
         except Exception:
+            stable_id = None
+        if stable_id is not None and stable_id <= 0:
             stable_id = None
         return Footpoint(u=u, v=v, method="bbox", track_id=track_id, stable_id=stable_id)
 
@@ -2249,7 +2641,11 @@ class _AnalyticsTelemetryProcessor:
 
             if meta_type is not None:
                 if current_type != meta_type:
-                    continue
+                    # Unit tests (and some wrappers) may expose meta_type as a string while
+                    # DeepStream provides an integer enum value. Accept the canonical string
+                    # sentinel as equivalent when the numeric type is unavailable on the object.
+                    if str(current_type) != "NVIDIA.DSANALYTICSOBJ.USER_META":
+                        continue
             else:
                 if str(current_type) != "NVIDIA.DSANALYTICSOBJ.USER_META":
                     continue
@@ -2303,6 +2699,7 @@ class _AnalyticsTelemetryProcessor:
         zone: Optional[str],
         ts: float,
         frame_bgr: Optional[np.ndarray],
+        embedding: Optional[np.ndarray] = None,
     ) -> Optional[int]:
         """Bridge to StableIDManager if present on the pipeline."""
         if track_id < 0 or not self._stable_id_enabled:
@@ -2332,10 +2729,15 @@ class _AnalyticsTelemetryProcessor:
                 ts=float(ts),
                 zone=str(zone) if zone else None,
                 frame_bgr=frame_bgr,
+                embedding=embedding,
             )
-            if stable_id is None:
-                return int(track_id)
-            return int(stable_id)
+            try:
+                stable_id_int = int(stable_id)
+            except Exception:
+                return None
+            if stable_id_int <= 0:
+                return None
+            return stable_id_int
         except Exception:
             logger.exception("StableIDManager update failed for sensor %s track %s", sensor_id, track_id)
             self._stable_id_enabled = False
@@ -2520,6 +2922,169 @@ class _AnalyticsTelemetryProcessor:
             "active_tracks": self._active_tracks.get(sensor_id, []),
             "transitions": self._transitions_state.get(sensor_id, []),
         }
+
+
+@dataclass
+class _OsdLabelProcessor:
+    decimals: int = 2
+    font_size: Optional[int] = 22
+    font_name: Optional[str] = "Sans"
+
+    @staticmethod
+    def from_pipeline_config(pipeline_cfg: Mapping[str, Any]) -> "_OsdLabelProcessor":
+        cfg: Mapping[str, Any] = {}
+        vis_cfg = pipeline_cfg.get("visualization") or {}
+        if isinstance(vis_cfg, Mapping):
+            raw = vis_cfg.get("osd_labels") or {}
+            if isinstance(raw, Mapping):
+                cfg = raw
+
+        def _int(value: Any, default: int) -> int:
+            try:
+                return int(value)
+            except Exception:
+                return int(default)
+
+        def _str(value: Any) -> str:
+            try:
+                return str(value)
+            except Exception:
+                return ""
+
+        decimals = _int(cfg.get("decimals", 2), 2)
+        decimals = max(0, decimals)
+
+        font_size_env = str(os.environ.get("NOESIS_OSD_LABEL_FONT_SIZE", "")).strip()
+        font_size_raw = font_size_env if font_size_env else cfg.get("font_size", 22)
+        font_size = _int(font_size_raw, 22)
+        font_size = max(1, font_size)
+
+        font_name_env = str(os.environ.get("NOESIS_OSD_LABEL_FONT_NAME", "")).strip()
+        font_name_raw = font_name_env if font_name_env else cfg.get("font_name", "Sans")
+        font_name = _str(font_name_raw).strip() or "Sans"
+
+        return _OsdLabelProcessor(
+            decimals=decimals,
+            font_size=font_size,
+            font_name=font_name,
+        )
+
+    def handle_frame_ds8(self, frame_meta: Any) -> None:
+        object_items = getattr(frame_meta, "object_items", None) or []
+        for obj_meta in object_items:
+            self._apply_label(obj_meta)
+
+    def handle_frame(self, frame_meta: Any) -> None:
+        cast = _resolve_pyds_cast("NvDsObjectMeta")
+        for obj_meta in _iter_meta_entries(getattr(frame_meta, "obj_meta_list", None), cast):
+            if obj_meta is None:
+                continue
+            self._apply_label(obj_meta)
+
+    def _apply_label(self, obj_meta: Any) -> None:
+        text_params = getattr(obj_meta, "text_params", None)
+        if text_params is None or not hasattr(text_params, "display_text"):
+            return
+        label = self._format_label(obj_meta, text_params)
+        if not label:
+            return
+        try:
+            text_params.display_text = label
+        except Exception:
+            pass
+        self._apply_font(text_params)
+
+    def _apply_font(self, text_params: Any) -> None:
+        if self.font_size is None and not self.font_name:
+            return
+        font_params = getattr(text_params, "font_params", None)
+        if font_params is None:
+            return
+        if self.font_name:
+            try:
+                font_params.font_name = str(self.font_name)
+            except Exception:
+                pass
+        if self.font_size is not None:
+            try:
+                font_params.font_size = int(self.font_size)
+            except Exception:
+                pass
+
+    def _format_label(self, obj_meta: Any, text_params: Any) -> str:
+        try:
+            existing = str(getattr(text_params, "display_text", "") or "").strip()
+        except Exception:
+            existing = ""
+        if existing:
+            base_label = existing
+        else:
+            label = ""
+            for attr in ("label", "obj_label"):
+                try:
+                    value = getattr(obj_meta, attr, None)
+                except Exception:
+                    value = None
+                if value:
+                    label = str(value).strip()
+                if label:
+                    break
+            if not label:
+                try:
+                    class_id = int(getattr(obj_meta, "class_id", -1))
+                except Exception:
+                    class_id = -1
+                label = f"class {class_id}" if class_id >= 0 else "class"
+            parts = [label]
+            try:
+                object_id = int(getattr(obj_meta, "object_id", -1))
+            except Exception:
+                object_id = -1
+            if object_id >= 0:
+                parts.append(str(object_id))
+            base_label = " ".join(parts).strip()
+
+        try:
+            confidence = float(getattr(obj_meta, "confidence", float("nan")))
+        except Exception:
+            confidence = float("nan")
+        if not math.isfinite(confidence) or confidence < 0.0:
+            return base_label
+        decimals = max(0, int(self.decimals))
+        conf_text = f"{confidence:.{decimals}f}"
+        if base_label.endswith(conf_text):
+            return base_label
+        if base_label:
+            return f"{base_label} {conf_text}"
+        return conf_text
+
+
+class _OsdLabelOperator(BatchMetadataOperator):  # pragma: no cover - requires DeepStream runtime
+    def __init__(self, processor: _OsdLabelProcessor) -> None:
+        super().__init__()
+        self._processor = processor
+
+    def handle_metadata(self, batch_meta: Any) -> None:
+        if batch_meta is None:
+            return
+
+        frame_items = getattr(batch_meta, "frame_items", None)
+        if frame_items is not None:
+            for frame_meta in frame_items:
+                try:
+                    self._processor.handle_frame_ds8(frame_meta)
+                except Exception:
+                    logger.exception("Failed to stamp OSD labels within batch metadata (DS8)")
+            return
+
+        cast = _resolve_pyds_cast("NvDsFrameMeta")
+        for frame_meta in _iter_meta_entries(getattr(batch_meta, "frame_meta_list", None), cast):
+            if frame_meta is None:
+                continue
+            try:
+                self._processor.handle_frame(frame_meta)
+            except Exception:
+                logger.exception("Failed to stamp OSD labels within batch metadata")
 
 
 class _AnalyticsTelemetryOperator(BatchMetadataOperator):  # pragma: no cover - requires DeepStream runtime

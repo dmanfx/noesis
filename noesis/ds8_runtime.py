@@ -196,14 +196,22 @@ def _build_stable_id_manager(logger: logging.Logger):
         model_name = os.environ.get("NOESIS_REID_MODEL_NAME", "osnet_x1_0")
         img_h = int(os.environ.get("NOESIS_REID_IMAGE_H", "256") or 256)
         img_w = int(os.environ.get("NOESIS_REID_IMAGE_W", "128") or 128)
+        embed_interval_s = float(os.environ.get("NOESIS_REID_EMBED_INTERVAL_S", "0.0") or 0.0)
         mgr = StableIDManager(
             model_path=model_path,
             device=device,
             model_name=model_name,
             image_size=(img_h, img_w),
             allow_multi_zone_active=True,
+            # DS8 stable IDs source embeddings from an explicit OSNet SGIE; do not load torchreid.
+            use_extractor=False,
+            embed_interval_s=embed_interval_s,
         )
-        logger.info("Stable ID manager initialised (device=%s, model=%s)", device, model_name)
+        logger.info(
+            "Stable ID manager initialised (SGIE embeddings; allow_multi_zone_active=%s, embed_interval_s=%.3f)",
+            True,
+            embed_interval_s,
+        )
         return mgr
     except Exception as exc:
         logger.warning("Stable ID manager init failed; continuing without stable IDs: %s", exc)
@@ -356,6 +364,46 @@ def _build_stats_callback(
 ) -> Callable[[], Dict[str, object]]:
     start_time = time.time()
 
+    def _mosaic_layout() -> Optional[Dict[str, object]]:
+        tiler = pipeline.components.get("tiler")
+        tiler_cfg = tiler.config if tiler and isinstance(tiler.config, dict) else {}
+        try:
+            frame_w, frame_h = pipeline.frame_size
+        except Exception:
+            frame_w, frame_h = (0, 0)
+
+        sources = [
+            {"source_id": int(source_id), "camera_id": str(name)}
+            for source_id, name in sorted(camera_labels.items(), key=lambda item: int(item[0]))
+        ]
+        source_count = len(sources)
+
+        mosaic_w = int(tiler_cfg.get("width", 0) or 0)
+        mosaic_h = int(tiler_cfg.get("height", 0) or 0)
+        cols_raw = tiler_cfg.get("columns")
+        rows_raw = tiler_cfg.get("rows")
+        cols = int(cols_raw) if cols_raw is not None else None
+        rows = int(rows_raw) if rows_raw is not None else None
+        square_seq_grid = bool(tiler_cfg.get("square-seq-grid", False))
+
+        layout: Dict[str, object] = {
+            "source_count": source_count,
+            "sources": sources,
+            "tile_order": "source-id",
+            "frame_w": int(frame_w or 0),
+            "frame_h": int(frame_h or 0),
+            "square_seq_grid": square_seq_grid,
+        }
+        if mosaic_w:
+            layout["mosaic_w"] = mosaic_w
+        if mosaic_h:
+            layout["mosaic_h"] = mosaic_h
+        if cols is not None:
+            layout["cols"] = cols
+        if rows is not None:
+            layout["rows"] = rows
+        return layout
+
     def _normalize_room_name(name: Any) -> str:
         try:
             s = str(name)
@@ -433,6 +481,7 @@ def _build_stats_callback(
                 "depth_enabled": pipeline.depth_enabled,
                 "depth_fps": depth_fps,
                 "analytics_reload_count": reload_count,
+                "mosaic_layout": _mosaic_layout(),
                 "errors": list(pipeline.errors),
             },
             "cameras": cameras_stats,
@@ -856,9 +905,23 @@ def _stop_websocket_server(
 
 def _build_rest_app() -> "FastAPI":
     from fastapi import FastAPI
+    from fastapi.middleware.cors import CORSMiddleware
     from noesis.server import analytics_api, depth_api
 
     app = FastAPI(title="Noesis DS8 Runtime API")
+    origins_env = os.environ.get("NOESIS_REST_CORS_ORIGINS", "").strip()
+    allow_all = os.environ.get("NOESIS_REST_CORS_ALLOW_ALL", "").strip().lower() in {"1", "true", "yes", "on"}
+    origins = [origin.strip() for origin in origins_env.split(",") if origin.strip()] if origins_env else []
+    if allow_all and "*" not in origins:
+        origins = ["*"]
+    if origins:
+        app.add_middleware(
+            CORSMiddleware,
+            allow_origins=origins,
+            allow_credentials=True,
+            allow_methods=["*"],
+            allow_headers=["*"],
+        )
     app.include_router(depth_api.app.router)
     app.include_router(analytics_api.app.router)
     return app
@@ -1334,61 +1397,18 @@ def _on_pyservicemaker_message(
     if not _PYSERVICEMAKER_MSGS:
         return
 
+    # State transition messages are extremely chatty and (depending on the backend build)
+    # attribute access can be unsafe. Keep them OFF by default and enable only when needed.
+    log_state = str(os.environ.get("NOESIS_DS8_STATE_LOG", "")).strip().lower() in ("1", "true", "yes", "on")
+
     if isinstance(message, EOSMessage):
         logger.warning("⚠️ EOS received on pipeline (unexpected for live sources)")
         if state is not None:
             state["pipeline_failed"] = True
-        #region agent log
-        try:
-            with open("/home/mayor/Noesis_Devel/.cursor/debug.log", "a", encoding="utf-8") as _f:
-                _f.write(
-                    json.dumps(
-                        {
-                            "sessionId": "debug-session",
-                            "runId": "run1",
-                            "hypothesisId": "H1",
-                            "location": "ds8_runtime.py:_on_pyservicemaker_message",
-                            "message": "EOS message received",
-                            "data": {"type": "EOSMessage"},
-                            "timestamp": int(time.time() * 1000),
-                        }
-                    )
-                    + "\n"
-                )
-        except Exception:
-            pass
-        #endregion
     elif isinstance(message, StateTransitionMessage):
-        logger.info(
-            "🔄 Pipeline state: %s → %s (origin: %s)",
-            message.old_state,
-            message.new_state,
-            getattr(message, 'origin', 'unknown'),
-        )
-        #region agent log
-        try:
-            with open("/home/mayor/Noesis_Devel/.cursor/debug.log", "a", encoding="utf-8") as _f:
-                _f.write(
-                    json.dumps(
-                        {
-                            "sessionId": "debug-session",
-                            "runId": "run1",
-                            "hypothesisId": "H1",
-                            "location": "ds8_runtime.py:_on_pyservicemaker_message",
-                            "message": "State transition",
-                            "data": {
-                                "old": getattr(message, "old_state", None),
-                                "new": getattr(message, "new_state", None),
-                                "origin": getattr(message, "origin", None),
-                            },
-                            "timestamp": int(time.time() * 1000),
-                        }
-                    )
-                    + "\n"
-                )
-        except Exception:
-            pass
-        #endregion
+        if log_state:
+            # Avoid touching message attributes unless explicitly enabled.
+            logger.info("DS8 state transition (origin=%s)", getattr(message, "origin", "unknown"))
     else:
         logger.debug("Pipeline message: %s", type(message).__name__)
 
@@ -1949,6 +1969,10 @@ def main() -> int:
         hooks.attach_trail_overlay_hook(pipeline, config=trails_cfg)
     except Exception:
         logger.exception("Failed to attach DS8 trail overlay hook")
+    try:
+        hooks.attach_osd_label_hook(pipeline)
+    except Exception:
+        logger.exception("Failed to attach DS8 OSD label hook")
 
     ws_server = WebSocketServer(
         host=args.ws_host,

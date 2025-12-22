@@ -15,6 +15,8 @@ export type DepthMetaEntry = {
   servedFromCache?: boolean;
   requestId?: string;
   error?: string;
+  // Raw camera id as reported by backend (may differ from UI key if remapped)
+  sourceCameraId?: string;
 };
 
 type DiagnosticsEntry = {
@@ -190,6 +192,31 @@ const DepthDrawer = memo(function DepthDrawer({ open, onClose, diagnostics, dept
     []
   );
 
+  const requestFloorplan = useCallback((mode: 'cache-only' | 'regenerate') => {
+    if (!open || !selectedCamera) return;
+    const requestFn = onRequestFloorplanRef.current;
+    if (!requestFn) return;
+    const cacheOnly = mode === 'cache-only';
+    setFloorplanStatus(cacheOnly ? 'checking' : 'loading');
+    const req = {
+      camera: selectedCamera,
+      requestId: Date.now().toString(),
+      // Regenerate ignores staleness by passing maxAgeSec=0
+      maxAgeSec: cacheOnly ? undefined : 0,
+      gridResM: 0.15,
+      maxExtentM: 20,
+      cacheOnly,
+    };
+    try { console.debug('[UI] floorplan request', { mode, ...req }); } catch { }
+    const requestId = requestFn(req);
+    if (typeof requestId === 'string' && requestId.length) {
+      setFloorplanRequest(requestId);
+    } else {
+      setFloorplanRequest('');
+      setFloorplanStatus('idle');
+    }
+  }, [open, selectedCamera]);
+
   useEffect(() => {
     if (!cameras.length) {
       setSelectedCamera('');
@@ -316,6 +343,20 @@ const DepthDrawer = memo(function DepthDrawer({ open, onClose, diagnostics, dept
     ctx.restore();
   }, [depthEntry, activeTab, drawerWidth, clearCanvasElement]);
 
+  // Avoid showing stale topdown canvases when switching cameras.
+  useEffect(() => {
+    if (!open || activeTab !== 'heatmap') return;
+    clearCanvasElement(densityCanvasRef.current);
+    clearCanvasElement(heightCanvasRef.current);
+    clearCanvasElement(distanceCanvasRef.current);
+  }, [open, activeTab, selectedCamera, clearCanvasElement]);
+
+  // When switching cameras, try to load the cached floorplan for that camera.
+  useEffect(() => {
+    if (!open || activeTab !== 'heatmap' || !selectedCamera) return;
+    requestFloorplan('cache-only');
+  }, [open, activeTab, selectedCamera, requestFloorplan]);
+
   // Notify backend once per camera when heatmap is rendered (cache-first or fresh)
   useEffect(() => {
     if (!open || activeTab !== 'heatmap') return;
@@ -408,8 +449,6 @@ const DepthDrawer = memo(function DepthDrawer({ open, onClose, diagnostics, dept
     ];
   }, [summary]);
 
-  // (moved above for TDZ safety)
-
   const renderScale = (gradient: string, min?: number, _mid?: number, max?: number, unit = '') => (
     <div className="color-scale">
       <span className="color-scale__label color-scale__label--max">{formatNumber(max)}{unit}</span>
@@ -417,32 +456,6 @@ const DepthDrawer = memo(function DepthDrawer({ open, onClose, diagnostics, dept
       <span className="color-scale__label color-scale__label--min">{formatNumber(min)}{unit}</span>
     </div>
   );
-
-
-  const requestFloorplan = useCallback((mode: 'cache-only' | 'regenerate') => {
-    if (!open || !selectedCamera) return;
-    const requestFn = onRequestFloorplanRef.current;
-    if (!requestFn) return;
-    const cacheOnly = mode === 'cache-only';
-    setFloorplanStatus(cacheOnly ? 'checking' : 'loading');
-    const req = {
-      camera: selectedCamera,
-      requestId: Date.now().toString(),
-      // Regenerate ignores staleness by passing maxAgeSec=0
-      maxAgeSec: cacheOnly ? undefined : 0,
-      gridResM: 0.15,
-      maxExtentM: 20,
-      cacheOnly,
-    };
-    try { console.debug('[UI] floorplan request', { mode, ...req }); } catch { }
-    const requestId = requestFn(req);
-    if (typeof requestId === 'string' && requestId.length) {
-      setFloorplanRequest(requestId);
-    } else {
-      setFloorplanRequest('');
-      setFloorplanStatus('idle');
-    }
-  }, [open, selectedCamera]);
 
   useEffect(() => {
     if (!cameras.length) {

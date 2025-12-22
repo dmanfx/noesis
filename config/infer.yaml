@@ -51,6 +51,14 @@ models:
     gie_id: 1
     network_mode: fp16
     attach_tensor_meta: false
+  reid:
+    enable: true
+    name: reid_osnet
+    config-file-path: pipelines/config_infer_secondary_reid_osnet.ini
+    engine: models/engines/reid_osnet_ibn_msmt17_dyn_b16_fp16.engine
+    batch_size: 16
+    gie_id: 3
+    attach_tensor_meta: true
   mapanything:
     enable: true
     name: mapanything_fullframe

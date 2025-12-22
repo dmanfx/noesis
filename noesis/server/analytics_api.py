@@ -39,6 +39,36 @@ def _resolve_analytics_config() -> Path:
     return path
 
 
+def _normalize_stream_keys(config: Dict[str, Any]) -> None:
+    analytics = config.get("analytics")
+    if not isinstance(analytics, dict):
+        return
+    stages = analytics.get("stages")
+    if not isinstance(stages, dict):
+        return
+
+    for stage_name, stage_cfg in stages.items():
+        if not isinstance(stage_cfg, dict):
+            continue
+        streams = stage_cfg.get("streams")
+        if not isinstance(streams, dict):
+            continue
+
+        normalized: Dict[str, Any] = {}
+        origin_types: Dict[str, str] = {}
+        for key, value in streams.items():
+            key_str = str(key)
+            origin = "str" if isinstance(key, str) else "num"
+            if key_str in normalized:
+                if origin == "str" and origin_types.get(key_str) != "str":
+                    normalized[key_str] = value
+                    origin_types[key_str] = origin
+                continue
+            normalized[key_str] = value
+            origin_types[key_str] = origin
+        stage_cfg["streams"] = normalized
+
+
 def _load_config(force: bool = False) -> Dict[str, Any]:
     """Load the nvdsanalytics configuration, caching for subsequent requests."""
     global _CONFIG_CACHE, _CONFIG_PATH
@@ -50,6 +80,8 @@ def _load_config(force: bool = False) -> Dict[str, Any]:
     with path.open("r", encoding="utf-8") as stream:
         config = yaml.safe_load(stream) or {}
 
+    _normalize_stream_keys(config)
+
     _CONFIG_CACHE = copy.deepcopy(config)
     _CONFIG_PATH = path
     return config
@@ -59,6 +91,7 @@ def _store_config(config: Dict[str, Any]) -> None:
     """Persist the in-memory cache and write through to disk."""
     global _CONFIG_CACHE
     path = _CONFIG_PATH or _resolve_analytics_config()
+    _normalize_stream_keys(config)
     try:
         with path.open("w", encoding="utf-8") as stream:
             yaml.safe_dump(config, stream, sort_keys=False)
@@ -237,7 +270,14 @@ def _stage_to_response(stage_name: str, stage_cfg: Dict[str, Any]) -> ROIListRes
     streams_cfg = stage_cfg.get("streams", {})
     streams: List[ROIStreamState] = []
 
-    for stream_id, stream_cfg in streams_cfg.items():
+    def _stream_sort_key(item: Tuple[str, Any]) -> Tuple[int, str]:
+        key = item[0]
+        try:
+            return (0, f"{int(key):08d}")
+        except Exception:
+            return (1, str(key))
+
+    for stream_id, stream_cfg in sorted(streams_cfg.items(), key=_stream_sort_key):
         roi_filtering = stream_cfg.get("roi_filtering", {})
         enable = bool(roi_filtering.get("enable", False))
         raw_rois = roi_filtering.get("rois", []) or []

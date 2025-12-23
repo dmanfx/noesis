@@ -33,8 +33,8 @@ class StableIDManager:
         max_ghost_age_s: float = 60.0,
         ghost_queue_max: int = 200,
         gallery_size: int = 20,
-        cos_sim_threshold: float = 0.72,
-        cos_sim_high_threshold: float = 0.80,
+        cos_sim_threshold: float = 0.62,
+        cos_sim_high_threshold: float = 0.72,
         allow_multi_zone_active: bool = True,
         # Robustness/appearance tuning
         crop_expand: float = 0.12,
@@ -57,8 +57,8 @@ class StableIDManager:
         active_id_guard_strict: bool = True,
         active_id_guard_margin: float = 0.03,
         # Ghost strictness
-        ghost_strict_age_s: float = 2.0,
-        ghost_extra_margin: float = 0.03,
+        ghost_strict_age_s: float = 8.0,
+        ghost_extra_margin: float = 0.01,
         # Soft cap on active IDs
         max_active_ids_per_sensor: int = 6,
         new_id_confirm_frames_at_cap: int = 2,

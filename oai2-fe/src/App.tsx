@@ -13,9 +13,9 @@ import { useWebSocketClient, StatsPayload, DepthRequestStrategy, MosaicLayout } 
 import { useWebRTCClient } from './hooks/useWebRTCClient';
 import { StreamMode } from './components/StreamPanel';
 import DepthDrawer, { DepthDiagnosticsEntry, DepthDrawerEntry, DepthMetaEntry, FloorplanResponse } from './components/DepthDrawer';
-import TopDownDrawer from './components/TopDownDrawer';
 import { BevView, BevMeta } from './components/BevView';
 import RoiEditorDrawer from './components/RoiEditorDrawer';
+import SettingsCorner from './components/SettingsCorner';
 
 const wsHost = import.meta.env.VITE_WS_HOST || window.location.hostname;
 const wsPort = Number(import.meta.env.VITE_WS_PORT || 6008);
@@ -66,8 +66,6 @@ function Dashboard() {
 
   // Stream image blobs
   const [streams, setStreams] = useState<{ [k: string]: Blob | null }>({ 'living-room': null, 'kitchen': null, 'family-room': null });
-  const [bevImages, setBevImages] = useState<Record<CameraKey, string | null>>({ 'living-room': null, 'kitchen': null, 'family-room': null });
-  const bevUrlRef = useRef<Record<CameraKey, string | null>>({ 'living-room': null, 'kitchen': null, 'family-room': null });
   const [bevMeta, setBevMeta] = useState<Record<CameraKey, BevMeta | undefined>>({ 'living-room': undefined, 'kitchen': undefined, 'family-room': undefined });
   const bevMetaRef = useRef<Record<CameraKey, BevMeta | undefined>>({ 'living-room': undefined, 'kitchen': undefined, 'family-room': undefined });
 
@@ -645,23 +643,6 @@ function Dashboard() {
     }
   };
 
-  const handleBevImage = useCallback((cam: CameraKey, blob: Blob) => {
-    const url = URL.createObjectURL(blob);
-    setBevImages((prev) => {
-      if (bevUrlRef.current[cam]) {
-        URL.revokeObjectURL(bevUrlRef.current[cam]!);
-      }
-      bevUrlRef.current[cam] = url;
-      return { ...prev, [cam]: url };
-    });
-  }, []);
-
-  useEffect(() => () => {
-    Object.values(bevUrlRef.current).forEach((url) => {
-      if (url) URL.revokeObjectURL(url);
-    });
-  }, []);
-
   const handleBevMeta = useCallback((payload: BevMeta) => {
     if (!payload) return;
     const cam = resolveDisplayCameraKey((payload.cameraId || payload.camId || '').toString());
@@ -682,15 +663,12 @@ function Dashboard() {
     sendDetectionToggle,
     requestMapAnythingDepth,
     requestFloorplan,
-    sendBevConfig,
-    sendBevOverlay,
     notifyMaHeatmapReady,
     sendAutoCalibrate,
     sendWebRTCOffer,
     sendWebRTCIceCandidate,
   } = useWebSocketClient(WS_URL, {
     onImage,
-    onBevImage: handleBevImage,
     onBevMeta: handleBevMeta,
     onStats,
     onTrailToggle: (en) => setTrailEnabled(en),
@@ -699,6 +677,7 @@ function Dashboard() {
     onMADepth: handleMADepth,
     onFloorplan: handleFloorplan,
     onAutoCalibrateResult: (payload) => {
+      setIsCalibrating(false);
       const ok = payload?.ok;
       const updated = Array.isArray(payload?.updated) ? payload.updated : [];
       const err = typeof payload?.error === 'string' ? payload.error : '';
@@ -754,14 +733,6 @@ function Dashboard() {
       webrtc.disconnect();
     }
   }, [status, webrtc.connect, webrtc.disconnect]);
-
-  const handleBevConfigUpdate = useCallback((cam: CameraKey, cfg: { mpp: number; xMin: number; xMax: number; zMin: number; zMax: number }) => {
-    sendBevConfig(cam, cfg);
-  }, [sendBevConfig]);
-
-  const handleBevOverlayToggle = useCallback((cam: CameraKey, enabled: boolean) => {
-    sendBevOverlay(cam, enabled);
-  }, [sendBevOverlay]);
 
   const requestDepthFresh = useCallback((camId: string) => {
     if (!camId) return;
@@ -917,24 +888,19 @@ function Dashboard() {
     }
   }, [expandedCamera, exitAppFullscreen, requestAppFullscreen]);
 
-  const [topDownOpen, setTopDownOpen] = useState<boolean>(false);
   const [calibrateToast, setCalibrateToast] = useState<{ text: string; kind: 'info' | 'success' | 'error'; ts: number } | null>(null);
+  const [isCalibrating, setIsCalibrating] = useState<boolean>(false);
 
-  // Request floorplans when TopDown view is opened
   useEffect(() => {
-    if (topDownOpen) {
-      cameraOrder.forEach(cam => {
-        requestFloorplan({
-          camera: cam,
-          requestId: `td-${Date.now()}`,
-          maxAgeSec: 600, // Accept cached up to 10 mins
-          gridResM: 0.15,
-          maxExtentM: 20,
-          cacheOnly: false
-        });
-      });
-    }
-  }, [topDownOpen, requestFloorplan]);
+    if (status !== 'open') setIsCalibrating(false);
+  }, [status]);
+
+  const handleAutoCalibrateAll = useCallback(() => {
+    if (status !== 'open' || isCalibrating) return;
+    setCalibrateToast({ text: 'Calibrating…', kind: 'info', ts: Date.now() });
+    setIsCalibrating(true);
+    sendAutoCalibrate();
+  }, [isCalibrating, sendAutoCalibrate, status]);
 
   useEffect(() => {
     if (!expandedCamera) return;
@@ -981,7 +947,6 @@ function Dashboard() {
         {timeChip}
         {connectionChip}
         <button className="btn ghost" onClick={() => setTelemetryOpen(v => !v)}>Telemetry</button>
-        <button className="btn ghost" onClick={() => setTopDownOpen(v => !v)}>Top‑Down</button>
         <button className="btn ghost" onClick={() => setDepthDrawerOpen(v => !v)}>Depth</button>
         <button className="btn ghost" onClick={() => setRoiDrawerOpen(v => !v)}>ROIs</button>
       </header>
@@ -1040,7 +1005,7 @@ function Dashboard() {
             <div dangerouslySetInnerHTML={{ __html: trackDetailsHtml }} />
           </div>
 
-          { /* Transitions panel removed; Top‑Down moved to drawer */}
+          { /* Transitions panel removed */}
         </section>
       </main>
       <footer className="footer">
@@ -1062,22 +1027,6 @@ function Dashboard() {
         onRequestFloorplan={handleRequestFloorplan}
         availableCameras={availableCameras}
       />
-
-      <TopDownDrawer
-        open={topDownOpen}
-        onClose={() => setTopDownOpen(false)}
-        images={bevImages}
-        meta={bevMeta}
-        floorplans={floorplanData}
-        tracks={tracksByCamKey}
-        trailEnabled={trailEnabled}
-        onUpdateConfig={handleBevConfigUpdate}
-        onToggleOverlay={handleBevOverlayToggle}
-        onCalibrateAll={() => {
-          setCalibrateToast({ text: 'Calibrating…', kind: 'info', ts: Date.now() });
-          sendAutoCalibrate();
-        }}
-      />
       <RoiEditorDrawer
         open={roiDrawerOpen}
         onClose={() => setRoiDrawerOpen(false)}
@@ -1094,6 +1043,11 @@ function Dashboard() {
           cameraPoses={cameraPoses}
         />
       )}
+      <SettingsCorner
+        connected={status === 'open'}
+        calibrating={isCalibrating}
+        onCalibrate={handleAutoCalibrateAll}
+      />
       {calibrateToast && (
         <div
           className={`toast toast--${calibrateToast.kind}`}

@@ -8,10 +8,10 @@ TargetManagement:
   preserveStreamUpdateOrder: 0
   maxTargetsPerStream: 150
   minIouDiff4NewTarget: 0.55
-  minTrackerConfidence: 0.4
+  minTrackerConfidence: 0.2
   probationAge: 2
-  maxShadowTrackingAge: 180
-  earlyTerminationAge: 1
+  maxShadowTrackingAge: 300
+  earlyTerminationAge: 10
 
 TrajectoryManagement:
   useUniqueID: 0
@@ -56,7 +56,7 @@ AppearanceModel:
   reidHistorySize: 400
 
 ShadowTracker:
-  targetVisibilityThreshold: 0.3
+  targetVisibilityThreshold: 0.15
   minDetectorConfidence: 0.0
   minTargetBboxSize: 10
 

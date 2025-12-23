@@ -111,37 +111,26 @@ mosaic_output:
   rtsp_idrinterval: 30       # IDR interval in frames (nvrtspoutsinkbin)
   rtsp_profile: 0            # 0=baseline, 1=main, 2=high (H.264)
 
-# Visualization overlays rendered into the mosaic stream (tiler → osd).
-visualization:
+visualization: # Visualization overlays rendered into the mosaic stream (tiler → osd).
   trails:
-    enabled: true
-    # Restrict trails to people only (class_id 0).
-    class_ids: [0]
-    # Time-window trail history (seconds).
-    window_s: 8.0
-    # Downsample point updates (reduce jitter and CPU) while still drawing every frame.
-    draw_stride: 2
-    # Decimation: only add a point if moved enough, or enough time elapsed.
-    min_step_px: 2.0
-    min_dt_s: 0.08
-    # Footpoint smoothing time constant (seconds).
-    smooth_tau_s: 0.25
-    # Clamp trail jumps (pixels per second).
-    max_speed_px_per_s: 600.0
-    # Keep trails bounded by BOTH time and points (whichever is smaller).
-    # DS8 cost is mostly per-segment draw calls; tune this first if CPU is high.
-    max_points_per_track: 257
-    # Max number of segments rendered per track per frame.
-    max_segments_per_track: 64
-    # Max number of tracks rendered per frame (across the mosaic).
-    max_tracks: 8
-    # Rendering budgets (hard caps).
-    max_lines: 800
-    # DisplayMeta blocks are small, but each can only hold a limited number of primitives.
-    # Increase this to draw multiple long trails concurrently.
-    max_display_metas: 32
-    line_width: 3
-    min_alpha: 0.15
-    show_labels: false
-    # Color key: use StableIDManager stable_id when available.
-    color_key: stable_id
+    enabled: true # Enable trails overlay.
+    class_ids: [0] # Restrict trails to people only (class_id 0).
+    window_s: 8.0 # Time-window trail history (seconds).
+    draw_stride: 2 # Downsample point updates (reduce jitter and CPU).
+    min_step_px: 2.0 # Decimate: only add a point if moved enough.
+    min_dt_s: 0.08 # Decimate: or enough time elapsed (seconds).
+    smooth_tau_s: 0.25 # Footpoint smoothing time constant (seconds).
+    max_speed_px_per_s: 600.0 # Clamp trail jumps (pixels per second).
+    max_points_per_track: 257 # Bound trails by BOTH time and points.
+    max_segments_per_track: 64 # Max segments rendered per track per frame.
+    max_tracks: 8 # Max tracks rendered per frame (across the mosaic).
+    max_lines: 800 # Rendering budget (hard cap).
+    max_display_metas: 32 # DisplayMeta blocks for long trails.
+    line_width: 3 # Trail line width (pixels).
+    min_alpha: 0.15 # Minimum alpha for trail fade.
+    show_labels: false # Show ID labels along trails.
+    color_key: stable_id # Use StableIDManager stable_id when available.
+  osd_labels:
+    font_size: 32 # Label font size for nvdsosd text overlay.
+    font_name: Sans # Font family for labels.
+    decimals: 2 # Confidence decimals.

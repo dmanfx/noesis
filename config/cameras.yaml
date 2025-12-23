@@ -35,10 +35,10 @@ cameras:
     model: unifi_g3_instant
     height_m: 2.6
   1:
-    name: family-room
-    model: unifi_g4_instant
-    height_m: 1.5
-  2:
     name: kitchen
     model: unifi_g3_instant
     height_m: 2.7
+  2:
+    name: family-room
+    model: unifi_g4_instant
+    height_m: 1.5

@@ -16,6 +16,7 @@ __pycache__/
 logs/
 *.log
 output/
+.cursor/
 
 #ignore archived folders
 legacy/

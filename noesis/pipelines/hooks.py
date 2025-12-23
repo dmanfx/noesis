@@ -2998,16 +2998,30 @@ class _OsdLabelProcessor:
         if self.font_size is None and not self.font_name:
             return
         font_params = getattr(text_params, "font_params", None)
-        if font_params is None:
+        if font_params is not None:
+            if self.font_name:
+                try:
+                    font_params.font_name = str(self.font_name)
+                except Exception:
+                    pass
+            if self.font_size is not None:
+                try:
+                    font_params.font_size = int(self.font_size)
+                except Exception:
+                    pass
+            return
+
+        font = getattr(text_params, "font", None)
+        if font is None:
             return
         if self.font_name:
             try:
-                font_params.font_name = str(self.font_name)
+                font.name = str(self.font_name)
             except Exception:
                 pass
         if self.font_size is not None:
             try:
-                font_params.font_size = int(self.font_size)
+                font.size = int(self.font_size)
             except Exception:
                 pass
 

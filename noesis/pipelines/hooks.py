@@ -2228,6 +2228,10 @@ class _AnalyticsTelemetryProcessor:
                 present_track_ids.add(1)
 
             if not tracks:
+                try:
+                    self._publish_bev(sensor_id, camera_id, frame_meta, footpoints)
+                except Exception:
+                    logger.exception("BEV publish failed for sensor %s", sensor_id)
                 return
 
             try:
@@ -2325,6 +2329,10 @@ class _AnalyticsTelemetryProcessor:
                 present_track_ids.add(1)
 
             if not tracks:
+                try:
+                    self._publish_bev(sensor_id, camera_id, frame_meta, footpoints)
+                except Exception:
+                    logger.exception("BEV publish failed for sensor %s", sensor_id)
                 return
 
             try:
@@ -2482,13 +2490,8 @@ class _AnalyticsTelemetryProcessor:
         if calib is None:
             return
         ts_us = self._frame_timestamp_us(frame_meta)
-        frame_w, frame_h = calib.image_size if calib.image_size else self._frame_dims()
-        if frame_w <= 0 or frame_h <= 0:
-            frame_w, frame_h = self._frame_dims()
-        if frame_w <= 0 or frame_h <= 0:
-            frame_w, frame_h = 1920, 1080
         try:
-            frame_bgr = np.zeros((int(frame_h), int(frame_w), 3), dtype=np.uint8)
+            frame_bgr = np.zeros((1, 1, 3), dtype=np.uint8)
             self.bev_renderer.render_and_publish(
                 camera_id=camera_id,
                 calib=calib,
@@ -2998,30 +3001,23 @@ class _OsdLabelProcessor:
         if self.font_size is None and not self.font_name:
             return
         font_params = getattr(text_params, "font_params", None)
-        if font_params is not None:
-            if self.font_name:
-                try:
-                    font_params.font_name = str(self.font_name)
-                except Exception:
-                    pass
-            if self.font_size is not None:
-                try:
-                    font_params.font_size = int(self.font_size)
-                except Exception:
-                    pass
+        if font_params is None:
             return
-
-        font = getattr(text_params, "font", None)
-        if font is None:
-            return
-        if self.font_name:
+        if self.font_name and ds_osd is not None:
             try:
-                font.name = str(self.font_name)
+                name = str(self.font_name).strip()
+                family = None
+                if name:
+                    family = getattr(getattr(ds_osd, "FontFamily", None), name, None)
+                    if family is None:
+                        family = getattr(getattr(ds_osd, "FontFamily", None), name.capitalize(), None)
+                if family is not None:
+                    font_params.name = family
             except Exception:
                 pass
         if self.font_size is not None:
             try:
-                font.size = int(self.font_size)
+                font_params.size = int(self.font_size)
             except Exception:
                 pass
 

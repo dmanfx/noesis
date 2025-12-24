@@ -32,13 +32,15 @@ const DEFAULT_Z_MAX = 12;
 type TrailPoint = { x: number; y: number; t: number };
 type TrailTrack = { points: TrailPoint[]; lastSeen: number; label: string; colorId: number };
 
-const TRAIL_WINDOW_MS = 8000;
+const TRAIL_WINDOW_MS = 20000;
 const TRAIL_MIN_DT_MS = 80;
 const TRAIL_MIN_STEP_M = 0.05;
 const TRAIL_GAP_MS = 650;
 const TRAIL_MAX_TRACKS = 8;
 const TRAIL_LINE_WIDTH = 2.5;
 const TRAIL_MIN_ALPHA = 0.12;
+const TRAIL_STALE_BLINK_START_MS = 700;
+const TRAIL_STALE_BLINK_PERIOD_MS = 1400;
 
 export const BevView: React.FC<BevViewProps> = ({
   cam,
@@ -290,6 +292,54 @@ export const BevView: React.FC<BevViewProps> = ({
       const hueForId = (id: number) => (id * 47) % 360;
       const hsla = (id: number, a: number) => `hsla(${hueForId(id)}, 80%, 60%, ${a})`;
 
+      // Time-based pruning must run even when BEV meta updates stop, otherwise
+      // the last-seen trail head can stick around indefinitely.
+      try {
+        const state = smoothState.current;
+        for (const [id, data] of state.entries()) {
+          if (now - data.lastSeen > 1000) {
+            state.delete(id);
+          }
+        }
+      } catch {
+        // defensive
+      }
+      try {
+        const trails = trailsRef.current;
+        if (!trailEnabled) {
+          trails.clear();
+        } else {
+          for (const [key, track] of trails.entries()) {
+            const pts = track.points;
+            if (!pts.length) {
+              trails.delete(key);
+              continue;
+            }
+            let cut = 0;
+            while (cut < pts.length && (now - pts[cut].t) > TRAIL_WINDOW_MS) cut += 1;
+            if (cut > 0) track.points = pts.slice(cut);
+            while (track.points.length && (!Number.isFinite(track.points[0].x) || !Number.isFinite(track.points[0].y))) {
+              track.points.shift();
+            }
+            if (track.points.length === 0) {
+              trails.delete(key);
+              continue;
+            }
+            if (now - track.lastSeen > (TRAIL_WINDOW_MS + 2000)) {
+              trails.delete(key);
+            }
+          }
+          if (trails.size > TRAIL_MAX_TRACKS) {
+            const ordered = Array.from(trails.entries()).sort((a, b) => a[1].lastSeen - b[1].lastSeen);
+            for (let i = 0; i < ordered.length - TRAIL_MAX_TRACKS; i += 1) {
+              trails.delete(ordered[i][0]);
+            }
+          }
+        }
+      } catch {
+        // defensive
+      }
+
       if (trailEnabled) {
         const tracksToDraw = Array.from(trailsRef.current.values());
         for (const tr of tracksToDraw) {
@@ -337,10 +387,15 @@ export const BevView: React.FC<BevViewProps> = ({
             const ageMs = Math.max(0, now - lastValid.t);
             const frac = Math.max(0, Math.min(1, 1 - (ageMs / TRAIL_WINDOW_MS)));
             const alpha = TRAIL_MIN_ALPHA + (1 - TRAIL_MIN_ALPHA) * frac;
+            const staleMs = Math.max(0, now - (tr.lastSeen || 0));
+            const blinkPhase = (2 * Math.PI * (now % TRAIL_STALE_BLINK_PERIOD_MS)) / TRAIL_STALE_BLINK_PERIOD_MS;
+            const blink = staleMs >= TRAIL_STALE_BLINK_START_MS
+              ? (0.35 + 0.65 * (0.5 + 0.5 * Math.sin(blinkPhase)))
+              : 1.0;
             const px = drawXFlipped(lastValid.x);
             const py = drawY(lastValid.y);
 
-            ctx.fillStyle = hsla(tr.colorId, Math.min(1, alpha + 0.25));
+            ctx.fillStyle = hsla(tr.colorId, Math.min(1, (alpha * blink) + 0.25));
             ctx.strokeStyle = 'rgba(0, 0, 0, 0.65)';
             ctx.lineWidth = 1.5;
             ctx.beginPath();

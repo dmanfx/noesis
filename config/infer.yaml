@@ -131,6 +131,6 @@ visualization: # Visualization overlays rendered into the mosaic stream (tiler â
     show_labels: false # Show ID labels along trails.
     color_key: stable_id # Use StableIDManager stable_id when available.
   osd_labels:
-    font_size: 32 # Label font size for nvdsosd text overlay.
-    font_name: Sans # Font family for labels.
+    font_size: 18 # Label font size for nvdsosd text overlay.
+    font_name: Serif # Font family (must match ds_osd.FontFamily).
     decimals: 2 # Confidence decimals.

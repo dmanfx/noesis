@@ -1969,10 +1969,6 @@ def main() -> int:
         hooks.attach_trail_overlay_hook(pipeline, config=trails_cfg)
     except Exception:
         logger.exception("Failed to attach DS8 trail overlay hook")
-    try:
-        hooks.attach_osd_label_hook(pipeline)
-    except Exception:
-        logger.exception("Failed to attach DS8 OSD label hook")
 
     bev_cfg = pipeline.config.get("bev") or {}
     bev_jpeg_enabled = bool(bev_cfg.get("jpeg_enabled", False))

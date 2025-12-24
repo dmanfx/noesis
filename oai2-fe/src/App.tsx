@@ -1036,6 +1036,8 @@ function Dashboard() {
         floorplans={floorplanData}
         onRequestFloorplan={handleRequestFloorplan}
         availableCameras={availableCameras}
+        mosaicLayout={mosaicLayout}
+        videoRef={webrtc.videoRef}
       />
       <RoiEditorDrawer
         open={roiDrawerOpen}

@@ -1,5 +1,6 @@
-import { PointerEvent as ReactPointerEvent, memo, useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { cameraLabel, detectCameraKey } from '../lib/camera';
+import { PointerEvent as ReactPointerEvent, memo, useCallback, useEffect, useMemo, useRef, useState, RefObject } from 'react';
+import { CameraKey, cameraIndex, cameraLabel, detectCameraKey } from '../lib/camera';
+import type { MosaicLayout } from '../hooks/useWebSocketClient';
 import '../styles/depth-drawer.css';
 
 type DepthEntry = {
@@ -77,6 +78,8 @@ interface DepthDrawerProps {
   floorplans: Record<string, FloorplanResponse>;
   onRequestFloorplan: (options: FloorplanRequestOptions) => string | void;
   availableCameras: string[];
+  mosaicLayout?: MosaicLayout | null;
+  videoRef?: RefObject<HTMLVideoElement>;
 }
 
 import {
@@ -89,10 +92,12 @@ import {
   turboColor,
   viridisColor
 } from '../lib/renderUtils';
+import { buildExtrudedFloorplanModel, DEFAULT_OBSTACLE_SETTINGS, renderExtrudedFloorplanToCanvas } from '../lib/extrudedFloorplan';
 
 const DEFAULT_WIDTH = 700;
 const MAX_WIDTH = 960;
 const WIDE_ASPECT = 16 / 9;
+const EXTRUDED_ASPECT = 4 / 3;
 
 function generateGradient(palette: (t: number) => [number, number, number], steps = 12): string {
   const stops: string[] = [];
@@ -115,7 +120,21 @@ function formatNumber(value?: number | null, digits = 2): string {
   return `${Math.round(value * factor) / factor}`;
 }
 
-const DepthDrawer = memo(function DepthDrawer({ open, onClose, diagnostics, depthData, depthMeta = {}, onRequestDepthFresh, onRequestDepthCached, onHeatmapReady, floorplans, onRequestFloorplan, availableCameras }: DepthDrawerProps) {
+const DepthDrawer = memo(function DepthDrawer({
+  open,
+  onClose,
+  diagnostics,
+  depthData,
+  depthMeta = {},
+  onRequestDepthFresh,
+  onRequestDepthCached,
+  onHeatmapReady,
+  floorplans,
+  onRequestFloorplan,
+  availableCameras,
+  mosaicLayout,
+  videoRef,
+}: DepthDrawerProps) {
   // Show cameras from either available list or present depth data (union)
   const cameras = useMemo(() => {
     const set = new Set<string>();
@@ -123,7 +142,7 @@ const DepthDrawer = memo(function DepthDrawer({ open, onClose, diagnostics, dept
     Object.keys(depthData || {}).forEach((c) => { if (c) set.add(c); });
     return Array.from(set).sort();
   }, [availableCameras, depthData]);
-  const [activeTab, setActiveTab] = useState<'heatmap' | 'stats' | 'histogram' | 'metrics'>('heatmap');
+  const [activeTab, setActiveTab] = useState<'heatmap' | '3d' | 'stats' | 'histogram' | 'metrics'>('heatmap');
   const [selectedCamera, setSelectedCamera] = useState<string>('');
   const [drawerWidth, setDrawerWidth] = useState<number>(DEFAULT_WIDTH);
   const drawerRef = useRef<HTMLDivElement | null>(null);
@@ -135,6 +154,17 @@ const DepthDrawer = memo(function DepthDrawer({ open, onClose, diagnostics, dept
   const densityCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const heightCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const distanceCanvasRef = useRef<HTMLCanvasElement | null>(null);
+  const streamPreviewCanvasRef = useRef<HTMLCanvasElement | null>(null);
+  const extrudedCanvasRef = useRef<HTMLCanvasElement | null>(null);
+  const [primitivesShowPreview, setPrimitivesShowPreview] = useState(true);
+  const [primitivesShowBoxes, setPrimitivesShowBoxes] = useState(true);
+  const [primitivesSelectedBoxId, setPrimitivesSelectedBoxId] = useState<string | null>(null);
+  const [primitivesHeightExaggeration, setPrimitivesHeightExaggeration] = useState(1.6);
+  const [primitivesMinHeightM, setPrimitivesMinHeightM] = useState(DEFAULT_OBSTACLE_SETTINGS.minHeightM);
+  const [primitivesMinDensity, setPrimitivesMinDensity] = useState(DEFAULT_OBSTACLE_SETTINGS.minDensity);
+  const [primitivesMinFootprintM2, setPrimitivesMinFootprintM2] = useState(DEFAULT_OBSTACLE_SETTINGS.minFootprintM2);
+  const [primitivesMaxBoxes, setPrimitivesMaxBoxes] = useState(DEFAULT_OBSTACLE_SETTINGS.maxBoxes);
+  const [primitivesMaxCells, setPrimitivesMaxCells] = useState(DEFAULT_OBSTACLE_SETTINGS.maxCells);
   const [floorplanStatus, setFloorplanStatus] = useState<'idle' | 'loading' | 'checking'>('idle');
   const [floorplanRequest, setFloorplanRequest] = useState<string>('');
   const [heatmapRange, setHeatmapRange] = useState<{ min: number; max: number } | null>(null);
@@ -165,7 +195,7 @@ const DepthDrawer = memo(function DepthDrawer({ open, onClose, diagnostics, dept
   const spanX = cameraFloorplan?.bounds ? Math.abs((cameraFloorplan.bounds.max_x ?? 0) - (cameraFloorplan.bounds.min_x ?? 0)) : undefined;
   const spanZ = cameraFloorplan?.bounds ? Math.abs((cameraFloorplan.bounds.max_z ?? 0) - (cameraFloorplan.bounds.min_z ?? 0)) : undefined;
   const floorplanStatusText = useMemo(() => {
-    if (!open || activeTab !== 'heatmap') return '';
+    if (!open || (activeTab !== 'heatmap' && activeTab !== '3d')) return '';
     if (floorplanStatus === 'loading') return 'Refreshing depth view...';
     if (floorplanStatus === 'checking') return 'Checking cached floorplan...';
     if (floorplanError) return `Floorplan error: ${floorplanError}`;
@@ -353,7 +383,7 @@ const DepthDrawer = memo(function DepthDrawer({ open, onClose, diagnostics, dept
 
   // When switching cameras, try to load the cached floorplan for that camera.
   useEffect(() => {
-    if (!open || activeTab !== 'heatmap' || !selectedCamera) return;
+    if (!open || (activeTab !== 'heatmap' && activeTab !== '3d') || !selectedCamera) return;
     requestFloorplan('cache-only');
   }, [open, activeTab, selectedCamera, requestFloorplan]);
 
@@ -367,6 +397,140 @@ const DepthDrawer = memo(function DepthDrawer({ open, onClose, diagnostics, dept
       heatmapNotifiedRef.current.add(selectedCamera);
     } catch { }
   }, [open, activeTab, selectedCamera, depthEntry, onHeatmapReady]);
+
+  useEffect(() => {
+    setPrimitivesSelectedBoxId(null);
+  }, [selectedCamera]);
+
+  const drawStreamPreview = useCallback(() => {
+    const canvas = streamPreviewCanvasRef.current;
+    const ctx = canvas?.getContext('2d');
+    if (!canvas || !ctx) return;
+
+    const rect = canvas.getBoundingClientRect();
+    const targetW = rect.width || canvas.clientWidth || 1;
+    const targetH = targetW / WIDE_ASPECT;
+    const dpr = window.devicePixelRatio || 1;
+    const nextW = Math.max(1, Math.round(targetW * dpr));
+    const nextH = Math.max(1, Math.round(targetH * dpr));
+    if (canvas.width !== nextW || canvas.height !== nextH) {
+      canvas.width = nextW;
+      canvas.height = nextH;
+    }
+
+    ctx.save();
+    ctx.scale(dpr, dpr);
+    ctx.clearRect(0, 0, targetW, targetH);
+
+    const video = videoRef?.current ?? null;
+    const layout = mosaicLayout ?? null;
+    const cols = layout?.cols ?? null;
+    const rows = layout?.rows ?? null;
+    const camKey = detectCameraKey(selectedCamera) as CameraKey | null;
+    if (!video || !video.videoWidth || !video.videoHeight || !cols || !rows || !camKey) {
+      ctx.fillStyle = '#0d1320';
+      ctx.fillRect(0, 0, targetW, targetH);
+      ctx.fillStyle = 'rgba(255,255,255,0.65)';
+      ctx.font = '12px sans-serif';
+      ctx.textAlign = 'center';
+      ctx.fillText('Preview unavailable', targetW / 2, targetH / 2);
+      ctx.restore();
+      return;
+    }
+
+    const sourceId = cameraIndex(camKey);
+    let tileIndex = sourceId;
+    const sources = layout?.sources || [];
+    if (sources.length) {
+      const idx = sources.findIndex((src) => src.source_id === sourceId);
+      if (idx >= 0) tileIndex = idx;
+    }
+    if (layout?.source_count && tileIndex >= layout.source_count) {
+      ctx.restore();
+      return;
+    }
+
+    const c = tileIndex % cols;
+    const r = Math.floor(tileIndex / cols);
+    const vw = video.videoWidth;
+    const vh = video.videoHeight;
+    const sx = Math.round((c * vw) / cols);
+    const sy = Math.round((r * vh) / rows);
+    const sw = Math.round(((c + 1) * vw) / cols) - sx;
+    const sh = Math.round(((r + 1) * vh) / rows) - sy;
+    ctx.drawImage(video, sx, sy, sw, sh, 0, 0, targetW, targetH);
+    ctx.restore();
+  }, [mosaicLayout, selectedCamera, videoRef]);
+
+  useEffect(() => {
+    if (!open || activeTab !== '3d' || !primitivesShowPreview) return;
+    let raf = 0;
+    const tick = () => {
+      drawStreamPreview();
+      raf = window.requestAnimationFrame(tick);
+    };
+    raf = window.requestAnimationFrame(tick);
+    return () => window.cancelAnimationFrame(raf);
+  }, [open, activeTab, primitivesShowPreview, drawStreamPreview]);
+
+  useEffect(() => {
+    if (!open || activeTab !== '3d' || primitivesShowPreview) return;
+    clearCanvasElement(streamPreviewCanvasRef.current);
+  }, [open, activeTab, primitivesShowPreview, clearCanvasElement]);
+
+  const primitivesModel = useMemo(() => {
+    if (!cameraFloorplan || cameraFloorplan.error) return null;
+    return buildExtrudedFloorplanModel(
+      {
+        bounds: cameraFloorplan.bounds,
+        height: cameraFloorplan.height,
+        density: cameraFloorplan.density,
+      },
+      {
+        maxCells: primitivesMaxCells,
+        minHeightM: primitivesMinHeightM,
+        minDensity: primitivesMinDensity,
+        minFootprintM2: primitivesMinFootprintM2,
+        maxBoxes: primitivesMaxBoxes,
+      }
+    );
+  }, [cameraFloorplan, primitivesMaxBoxes, primitivesMaxCells, primitivesMinDensity, primitivesMinFootprintM2, primitivesMinHeightM]);
+
+  const obstacleBoxes = primitivesModel?.boxes ?? [];
+
+  useEffect(() => {
+    if (primitivesSelectedBoxId && obstacleBoxes.every((b) => b.id !== primitivesSelectedBoxId)) {
+      setPrimitivesSelectedBoxId(null);
+    }
+  }, [obstacleBoxes, primitivesSelectedBoxId]);
+
+  useEffect(() => {
+    if (!open || activeTab !== '3d') return;
+    renderExtrudedFloorplanToCanvas(
+      extrudedCanvasRef.current,
+      primitivesModel,
+      {
+        forceAspect: EXTRUDED_ASPECT,
+        heightExaggeration: primitivesHeightExaggeration,
+        minHeightM: primitivesMinHeightM,
+        minDensity: primitivesMinDensity,
+        showBoxes: primitivesShowBoxes,
+        selectedBoxId: primitivesSelectedBoxId,
+        palette: infernoColor,
+        background: '#0d1320',
+      }
+    );
+  }, [
+    open,
+    activeTab,
+    primitivesModel,
+    primitivesHeightExaggeration,
+    primitivesMinHeightM,
+    primitivesMinDensity,
+    primitivesShowBoxes,
+    primitivesSelectedBoxId,
+    drawerWidth,
+  ]);
 
   useEffect(() => {
     if (!depthEntry) {
@@ -557,28 +721,34 @@ const DepthDrawer = memo(function DepthDrawer({ open, onClose, diagnostics, dept
   }, [open, cameras, floorplans, selectedCamera]);
 
   useEffect(() => {
-    if (activeTab !== 'heatmap' || !open) return;
+    if ((activeTab !== 'heatmap' && activeTab !== '3d') || !open) return;
 
     if (floorplanRequest && !cameraFloorplan) {
-      clearCanvasElement(densityCanvasRef.current);
-      clearCanvasElement(heightCanvasRef.current);
-      clearCanvasElement(distanceCanvasRef.current);
+      if (activeTab === 'heatmap') {
+        clearCanvasElement(densityCanvasRef.current);
+        clearCanvasElement(heightCanvasRef.current);
+        clearCanvasElement(distanceCanvasRef.current);
+      }
       return;
     }
 
     if (floorplanError) {
-      clearCanvasElement(densityCanvasRef.current);
-      clearCanvasElement(heightCanvasRef.current);
-      clearCanvasElement(distanceCanvasRef.current);
+      if (activeTab === 'heatmap') {
+        clearCanvasElement(densityCanvasRef.current);
+        clearCanvasElement(heightCanvasRef.current);
+        clearCanvasElement(distanceCanvasRef.current);
+      }
       setFloorplanStatus('idle');
       setFloorplanRequest('');
       return;
     }
 
     if (cameraFloorplan) {
-      renderTopdownLayer(densityCanvasRef.current, densityLayer, grayscaleColor);
-      renderTopdownLayer(heightCanvasRef.current, heightLayer, infernoColor);
-      renderTopdownLayer(distanceCanvasRef.current, distanceLayer, viridisColor);
+      if (activeTab === 'heatmap') {
+        renderTopdownLayer(densityCanvasRef.current, densityLayer, grayscaleColor);
+        renderTopdownLayer(heightCanvasRef.current, heightLayer, infernoColor);
+        renderTopdownLayer(distanceCanvasRef.current, distanceLayer, viridisColor);
+      }
 
       if (!floorplanRequest || !cameraFloorplan.request_id || cameraFloorplan.request_id === floorplanRequest) {
         setFloorplanStatus('idle');
@@ -657,6 +827,7 @@ const DepthDrawer = memo(function DepthDrawer({ open, onClose, diagnostics, dept
         </header>
         <div className="tabs">
           <button className={activeTab === 'heatmap' ? 'active' : ''} onClick={() => setActiveTab('heatmap')}>Heatmap</button>
+          <button className={activeTab === '3d' ? 'active' : ''} onClick={() => setActiveTab('3d')}>3D</button>
           <button className={activeTab === 'stats' ? 'active' : ''} onClick={() => setActiveTab('stats')}>Stats</button>
           <button className={activeTab === 'histogram' ? 'active' : ''} onClick={() => setActiveTab('histogram')}>Histogram</button>
           <button className={activeTab === 'metrics' ? 'active' : ''} onClick={() => setActiveTab('metrics')}>Metrics</button>
@@ -664,7 +835,7 @@ const DepthDrawer = memo(function DepthDrawer({ open, onClose, diagnostics, dept
         <div className="content">
           {!cameras.length && <p>No MapAnything diagnostics received yet.</p>}
           {cameras.length > 0 && (
-            <div className={`drawer-toolbar ${activeTab === 'heatmap' ? 'drawer-toolbar--heatmap' : ''}`}>
+            <div className={`drawer-toolbar ${(activeTab === 'heatmap' || activeTab === '3d') ? 'drawer-toolbar--heatmap' : ''}`}>
               <label className="drawer-toolbar__camera" htmlFor="ma-depth-select">
                 <span className="drawer-toolbar__label">Camera</span>
                 <select
@@ -679,7 +850,7 @@ const DepthDrawer = memo(function DepthDrawer({ open, onClose, diagnostics, dept
                   })}
                 </select>
               </label>
-              {activeTab === 'heatmap' && (
+              {(activeTab === 'heatmap' || activeTab === '3d') && (
                 <div className="drawer-toolbar__actions">
                   <button
                     type="button"
@@ -793,6 +964,163 @@ const DepthDrawer = memo(function DepthDrawer({ open, onClose, diagnostics, dept
                     : ''}
                 </p>
               )}
+            </>
+          )}
+
+          {activeTab === '3d' && (
+            <>
+              {floorplanError && <p className="floorplan-error">Error: {floorplanError}</p>}
+              {floorplanStatusText && !floorplanError && (
+                <p className="floorplan-status">{floorplanStatusText}</p>
+              )}
+
+              <div className="primitives-layout">
+                <div className="primitives-panel">
+                  <div className="primitives-panel__title">Camera Tile (ROI-style)</div>
+                  <canvas
+                    ref={streamPreviewCanvasRef}
+                    className="primitives-canvas"
+                    style={{ aspectRatio: `${WIDE_ASPECT}` }}
+                  />
+                  <label className="primitives-toggle">
+                    <input
+                      type="checkbox"
+                      checked={primitivesShowPreview}
+                      onChange={(e) => setPrimitivesShowPreview(e.target.checked)}
+                    />
+                    <span>Live preview</span>
+                  </label>
+                  <div className="primitives-hint">
+                    Cropped from the mosaic, like the ROI editor.
+                  </div>
+                </div>
+
+                <div className="primitives-panel">
+                  <div className="primitives-panel__title">Extruded Floorplan Primitives</div>
+                  <canvas
+                    ref={extrudedCanvasRef}
+                    className="primitives-canvas primitives-canvas--extruded"
+                    style={{ aspectRatio: `${EXTRUDED_ASPECT}` }}
+                  />
+                  <div className="primitives-submeta">
+                    {primitivesModel
+                      ? `Grid ${primitivesModel.cols}×${primitivesModel.rows} · max height ${formatNumber(primitivesModel.maxHeightM)} m`
+                      : 'Waiting for floorplan grids…'}
+                  </div>
+                </div>
+              </div>
+
+              <details className="primitives-details">
+                <summary>Obstacle boxes ({obstacleBoxes.length})</summary>
+                <div className="primitives-boxes">
+                  <label className="primitives-toggle primitives-toggle--inline">
+                    <input
+                      type="checkbox"
+                      checked={primitivesShowBoxes}
+                      onChange={(e) => setPrimitivesShowBoxes(e.target.checked)}
+                    />
+                    <span>Draw boxes</span>
+                  </label>
+                  {obstacleBoxes.length === 0 ? (
+                    <div className="primitives-empty">No obstacle clusters detected at current thresholds.</div>
+                  ) : (
+                    <div className="primitives-box-list">
+                      {obstacleBoxes.map((box, idx) => (
+                        <button
+                          key={box.id}
+                          type="button"
+                          className={primitivesSelectedBoxId === box.id ? 'primitives-box active' : 'primitives-box'}
+                          onClick={() => setPrimitivesSelectedBoxId((prev) => (prev === box.id ? null : box.id))}
+                        >
+                          <span className="primitives-box__idx">#{idx + 1}</span>
+                          <span className="primitives-box__dims">
+                            {formatNumber(box.widthM, 2)}×{formatNumber(box.depthM, 2)} m
+                          </span>
+                          <span className="primitives-box__h">h={formatNumber(box.heightM, 2)} m</span>
+                        </button>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              </details>
+
+              <details className="primitives-details">
+                <summary>3D settings (noise filter)</summary>
+                <div className="primitives-settings">
+                  <div className="primitives-row">
+                    <label>Min height</label>
+                    <input
+                      type="range"
+                      min={0.05}
+                      max={1.2}
+                      step={0.05}
+                      value={primitivesMinHeightM}
+                      onChange={(e) => setPrimitivesMinHeightM(parseFloat(e.target.value))}
+                    />
+                    <span className="primitives-value">{formatNumber(primitivesMinHeightM, 2)} m</span>
+                  </div>
+                  <div className="primitives-row">
+                    <label>Min footprint</label>
+                    <input
+                      type="range"
+                      min={0.05}
+                      max={2.0}
+                      step={0.05}
+                      value={primitivesMinFootprintM2}
+                      onChange={(e) => setPrimitivesMinFootprintM2(parseFloat(e.target.value))}
+                    />
+                    <span className="primitives-value">{formatNumber(primitivesMinFootprintM2, 2)} m²</span>
+                  </div>
+                  <div className="primitives-row">
+                    <label>Min density</label>
+                    <input
+                      type="range"
+                      min={0}
+                      max={0.3}
+                      step={0.01}
+                      value={primitivesMinDensity}
+                      onChange={(e) => setPrimitivesMinDensity(parseFloat(e.target.value))}
+                    />
+                    <span className="primitives-value">{formatNumber(primitivesMinDensity, 2)}</span>
+                  </div>
+                  <div className="primitives-row">
+                    <label>Height exaggeration</label>
+                    <input
+                      type="range"
+                      min={0.6}
+                      max={3.0}
+                      step={0.1}
+                      value={primitivesHeightExaggeration}
+                      onChange={(e) => setPrimitivesHeightExaggeration(parseFloat(e.target.value))}
+                    />
+                    <span className="primitives-value">{formatNumber(primitivesHeightExaggeration, 1)}×</span>
+                  </div>
+                  <div className="primitives-row">
+                    <label>Quality</label>
+                    <input
+                      type="range"
+                      min={60}
+                      max={220}
+                      step={10}
+                      value={primitivesMaxCells}
+                      onChange={(e) => setPrimitivesMaxCells(parseInt(e.target.value, 10))}
+                    />
+                    <span className="primitives-value">{primitivesMaxCells} max</span>
+                  </div>
+                  <div className="primitives-row">
+                    <label>Max boxes</label>
+                    <input
+                      type="range"
+                      min={3}
+                      max={24}
+                      step={1}
+                      value={primitivesMaxBoxes}
+                      onChange={(e) => setPrimitivesMaxBoxes(parseInt(e.target.value, 10))}
+                    />
+                    <span className="primitives-value">{primitivesMaxBoxes}</span>
+                  </div>
+                </div>
+              </details>
             </>
           )}
 

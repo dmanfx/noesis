@@ -130,6 +130,17 @@ def attach_analytics_telemetry_hook(
     )
     analytics_component.config["_analytics_processor"] = processor
 
+    # OSD label stamping is handled inside the telemetry hook so per-source IDs remain intact
+    # (tiler can collapse source_id in downstream metadata). This keeps mosaic labels aligned
+    # with BEV + active-tracks stable IDs.
+    try:
+        osd_label_processor = _OsdLabelProcessor.from_pipeline_config(getattr(pipeline, "config", {}) or {})
+        osd_label_processor.stable_id_mgr = getattr(pipeline, "stable_id_mgr", None)
+        setattr(pipeline, "osd_label_processor", osd_label_processor)
+        processor.osd_label_processor = osd_label_processor
+    except Exception:
+        logger.exception("Failed to initialize OSD label processor; mosaic labels may be missing")
+
     # When the ReID SGIE is enabled, attach telemetry downstream of it so tensor meta
     # is still valid when accessed (Service Maker tensor wrappers can be unsafe later).
     attach_component = analytics_component
@@ -1788,6 +1799,7 @@ class _AnalyticsTelemetryProcessor:
     sensor_id_map: Mapping[int, int]
     bev_renderer: Any = None
     bev_calibration: Any = None
+    osd_label_processor: Any = None
     _analytics_obj_meta_type: Any = field(default=None, init=False, repr=False)
     _zone_state: Dict[int, Dict[int, Dict[str, Any]]] = field(default_factory=dict, init=False, repr=False)
     _occupancy_state: Dict[int, Dict[str, int]] = field(default_factory=dict, init=False, repr=False)
@@ -2170,7 +2182,7 @@ class _AnalyticsTelemetryProcessor:
                                 self._reid_debug_emb_missing += 1
                             else:
                                 self._reid_debug_emb_found += 1
-                    track["stable_id"] = self._maybe_assign_stable_id(
+                    stable_id = self._maybe_assign_stable_id(
                         sensor_id=sensor_id,
                         track_id=track_id,
                         bbox=track.get("bbox"),
@@ -2179,8 +2191,11 @@ class _AnalyticsTelemetryProcessor:
                         frame_bgr=None,
                         embedding=emb,
                     )
+                    track["stable_id"] = stable_id
+                    self._stamp_osd_label_ds8(obj_meta, sensor_id=sensor_id, stable_id=stable_id)
                 else:
                     track["stable_id"] = None
+                    self._stamp_osd_label_ds8(obj_meta, sensor_id=sensor_id, stable_id=None)
                 if zone:
                     occupancy_counts[zone] = occupancy_counts.get(zone, 0) + 1
                     logger.debug(f"Track {track_id} in zone {zone}, occupancy now: {occupancy_counts[zone]}")
@@ -2292,7 +2307,7 @@ class _AnalyticsTelemetryProcessor:
                 zone = track.get("zone")
                 dwell = self._update_dwell_time(sensor_id, track_id, zone, now_ts)
                 track["dwell_time"] = dwell
-                track["stable_id"] = self._maybe_assign_stable_id(
+                stable_id = self._maybe_assign_stable_id(
                     sensor_id=sensor_id,
                     track_id=track_id,
                     bbox=track.get("bbox"),
@@ -2301,6 +2316,8 @@ class _AnalyticsTelemetryProcessor:
                     frame_bgr=None,
                     embedding=None,
                 )
+                track["stable_id"] = stable_id
+                self._stamp_osd_label(obj_meta, sensor_id=sensor_id, stable_id=stable_id)
                 if zone:
                     occupancy_counts[zone] = occupancy_counts.get(zone, 0) + 1
                     logger.debug(f"Track {track_id} in zone {zone}, occupancy now: {occupancy_counts[zone]}")
@@ -2928,6 +2945,28 @@ class _AnalyticsTelemetryProcessor:
             "transitions": self._transitions_state.get(sensor_id, []),
         }
 
+    def _stamp_osd_label_ds8(self, obj_meta: Any, *, sensor_id: int, stable_id: Optional[int]) -> None:
+        proc = self.osd_label_processor
+        if proc is None:
+            proc = getattr(self.pipeline, "osd_label_processor", None)
+        if proc is None:
+            return
+        try:
+            proc._apply_label(obj_meta, sensor_id=int(sensor_id), stable_id_override=stable_id)
+        except Exception:
+            logger.debug("OSD label stamp failed (DS8)", exc_info=True)
+
+    def _stamp_osd_label(self, obj_meta: Any, *, sensor_id: int, stable_id: Optional[int]) -> None:
+        proc = self.osd_label_processor
+        if proc is None:
+            proc = getattr(self.pipeline, "osd_label_processor", None)
+        if proc is None:
+            return
+        try:
+            proc._apply_label(obj_meta, sensor_id=int(sensor_id), stable_id_override=stable_id)
+        except Exception:
+            logger.debug("OSD label stamp failed", exc_info=True)
+
 
 @dataclass
 class _OsdLabelProcessor:
@@ -2979,7 +3018,7 @@ class _OsdLabelProcessor:
         sensor_id = self._frame_source_id(frame_meta)
         object_items = getattr(frame_meta, "object_items", None) or []
         for obj_meta in object_items:
-            self._apply_label(obj_meta, sensor_id=sensor_id)
+            self._apply_label(obj_meta, sensor_id=sensor_id, stable_id_override=None)
 
     def handle_frame(self, frame_meta: Any) -> None:
         sensor_id = self._frame_source_id(frame_meta)
@@ -2987,13 +3026,13 @@ class _OsdLabelProcessor:
         for obj_meta in _iter_meta_entries(getattr(frame_meta, "obj_meta_list", None), cast):
             if obj_meta is None:
                 continue
-            self._apply_label(obj_meta, sensor_id=sensor_id)
+            self._apply_label(obj_meta, sensor_id=sensor_id, stable_id_override=None)
 
-    def _apply_label(self, obj_meta: Any, *, sensor_id: int) -> None:
+    def _apply_label(self, obj_meta: Any, *, sensor_id: int, stable_id_override: Optional[int] = None) -> None:
         text_params = getattr(obj_meta, "text_params", None)
         if text_params is None or not hasattr(text_params, "display_text"):
             return
-        label = self._format_label(obj_meta, text_params, sensor_id=sensor_id)
+        label = self._format_label(obj_meta, text_params, sensor_id=sensor_id, stable_id_override=stable_id_override)
         if not label:
             return
         try:
@@ -3066,7 +3105,14 @@ class _OsdLabelProcessor:
             return None
         return stable_id_int
 
-    def _format_label(self, obj_meta: Any, text_params: Any, *, sensor_id: int) -> str:
+    def _format_label(
+        self,
+        obj_meta: Any,
+        text_params: Any,
+        *,
+        sensor_id: int,
+        stable_id_override: Optional[int] = None,
+    ) -> str:
         label = ""
         for attr in ("label", "obj_label"):
             try:
@@ -3096,9 +3142,15 @@ class _OsdLabelProcessor:
         parts: List[str] = [label]
         # Stable IDs are people-only; avoid showing raw tracker IDs for other classes.
         if class_id == 0 and track_id >= 0:
-            stable_id = self._lookup_stable_id(sensor_id, track_id)
-            if stable_id is not None:
-                parts.append(f"{stable_id}")
+            stable_id = stable_id_override
+            if stable_id is None:
+                stable_id = self._lookup_stable_id(sensor_id, track_id)
+            try:
+                stable_id_int = int(stable_id) if stable_id is not None else None
+            except Exception:
+                stable_id_int = None
+            if stable_id_int is not None and stable_id_int > 0:
+                parts.append(f"{stable_id_int}")
             else:
                 parts.append("XX")
         base_label = " ".join([p for p in parts if p]).strip()

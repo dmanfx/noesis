@@ -1,4 +1,4 @@
-import { FloorplanLayer } from '../components/DepthDrawer';
+import type { FloorplanLayer } from '../components/DepthDrawer';
 
 export const VIRIDIS = [
   [68, 1, 84],

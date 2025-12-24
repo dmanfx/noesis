@@ -111,6 +111,10 @@ mosaic_output:
   rtsp_idrinterval: 30       # IDR interval in frames (nvrtspoutsinkbin)
   rtsp_profile: 0            # 0=baseline, 1=main, 2=high (H.264)
 
+bev:
+  jpeg_enabled: false
+  jpeg_quality: 70
+
 visualization: # Visualization overlays rendered into the mosaic stream (tiler → osd).
   trails:
     enabled: true # Enable trails overlay.

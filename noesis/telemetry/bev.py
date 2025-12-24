@@ -144,10 +144,12 @@ class _BevTrailTrackState:
 @dataclass
 class BevResult:
     camera_id: str
-    bev_bgr: np.ndarray
+    bev_bgr: Optional[np.ndarray]
     bev_points: List[Dict[str, float]]
     config: BevConfig
     timestamp_us: int
+    width_px: int
+    height_px: int
 
 
 class HomographyCache:
@@ -195,7 +197,14 @@ class HomographyCache:
 
 
 class BevRenderer:
-    def __init__(self, ws_server, trails_cfg: Optional[Dict[str, Any]] = None) -> None:
+    def __init__(
+        self,
+        ws_server,
+        trails_cfg: Optional[Dict[str, Any]] = None,
+        *,
+        jpeg_enabled: bool = False,
+        jpeg_quality: int = 70,
+    ) -> None:
         self.ws = ws_server
         self._lock = threading.Lock()
         self.config_per_cam: Dict[str, BevConfig] = {}
@@ -210,6 +219,8 @@ class BevRenderer:
         self._trail_tracks_by_cam: Dict[str, Dict[int, _BevTrailTrackState]] = {}
         self._trail_frame_counts: Dict[str, int] = {}
         self._trail_color_cache: Dict[int, Tuple[int, int, int]] = {}
+        self._jpeg_enabled = bool(jpeg_enabled)
+        self._jpeg_quality = max(1, min(100, int(jpeg_quality)))
 
     def set_trails_enabled(self, enabled: bool) -> None:
         with self._lock:
@@ -400,12 +411,13 @@ class BevRenderer:
         self,
         camera_id: str,
         calib: CalibrationSnapshot,
-        frame_bgr: np.ndarray,
-        footpoints: List[Footpoint],
-        timestamp_us: int,
+        frame_bgr: Optional[np.ndarray] = None,
+        footpoints: Optional[List[Footpoint]] = None,
+        timestamp_us: int = 0,
     ) -> None:
         now_s = float(timestamp_us) / 1_000_000.0
         cfg = self.config_per_cam.get(camera_id, BevConfig())
+        footpoints = footpoints or []
 
         with self._lock:
             # Prune fully expired trails for this camera so we can decide whether it's
@@ -470,7 +482,9 @@ class BevRenderer:
                 height_px = max(1, int(height_px * scale))
                 effective_mpp = base_mpp / max(scale, 1e-6)
 
-        bev = np.zeros((max(1, height_px), max(1, width_px), 3), dtype=np.uint8)
+        bev: Optional[np.ndarray] = None
+        if self._jpeg_enabled:
+            bev = np.zeros((max(1, height_px), max(1, width_px), 3), dtype=np.uint8)
 
         # Compute or reuse homography; fallback to last good if current fails
         H_img2plane = None
@@ -644,7 +658,7 @@ class BevRenderer:
                     trails_to_draw.append((track_id, state.stable_id, pts))
 
         # Draw grid + trails + footpoints if overlay is enabled
-        if result_config.overlay:
+        if bev is not None and result_config.overlay:
             self._draw_grid(bev, result_config)
             if trails_to_draw:
                 inv_window = 1.0 / max(0.1, float(self._trail_cfg.window_s))
@@ -705,6 +719,8 @@ class BevRenderer:
             bev_points=bev_points,
             config=result_config,
             timestamp_us=timestamp_us,
+            width_px=width_px,
+            height_px=height_px,
         )
         self._publish(result, calib, H_img2plane)
 
@@ -720,16 +736,6 @@ class BevRenderer:
             cv2.line(bev, (0, y), (width - 1, y), color, 1, lineType=cv2.LINE_AA)
 
     def _publish(self, result: BevResult, calib: CalibrationSnapshot, H_to_use: np.ndarray) -> None:
-        ok, jpeg = cv2.imencode(".jpg", result.bev_bgr, [int(cv2.IMWRITE_JPEG_QUALITY), 70])
-        if not ok:
-            # Surface encoding failures so FE can show a message instead of a broken icon
-            self.publish_status(result.camera_id, error="jpeg_encode_failed")
-            return
-        payload = jpeg.tobytes()
-        # Use the same header scheme as mosaic: a single camera-id string
-        # Frontend distinguishes stream type via the preceding JSON message (type='bev-frame').
-        header = f"bev:{result.camera_id}".encode("utf-8")
-        framed = bytes([len(header)]) + header + payload
         try:
             # Compute a quick sanity sample: image bottom-center ray intersection in meters (XZ)
             sample_xz: Optional[Tuple[float, float]] = None
@@ -751,8 +757,8 @@ class BevRenderer:
                 "type": "bev-frame",
                 "cameraId": result.camera_id,
                 "ts": result.timestamp_us,
-                "w": int(result.bev_bgr.shape[1]),
-                "h": int(result.bev_bgr.shape[0]),
+                "w": int(result.width_px),
+                "h": int(result.height_px),
                 "mpp": result.config.meters_per_px,
                 "xMin": result.config.x_range[0],
                 "xMax": result.config.x_range[1],
@@ -766,15 +772,27 @@ class BevRenderer:
             }
             if hasattr(self.ws, "broadcast_sync"):
                 self.ws.broadcast_sync(status)
-                self.ws.broadcast_sync(framed)
+                if self._jpeg_enabled and result.bev_bgr is not None:
+                    ok, jpeg = cv2.imencode(
+                        ".jpg",
+                        result.bev_bgr,
+                        [int(cv2.IMWRITE_JPEG_QUALITY), int(self._jpeg_quality)],
+                    )
+                    if not ok:
+                        self.publish_status(result.camera_id, error="jpeg_encode_failed")
+                        return
+                    payload = jpeg.tobytes()
+                    header = f"bev:{result.camera_id}".encode("utf-8")
+                    framed = bytes([len(header)]) + header + payload
+                    self.ws.broadcast_sync(framed)
                 try:
                     # Lightweight visibility that a BEV frame was queued for broadcast
                     if hasattr(self.ws, "logger") and self.ws.logger:
                         self.ws.logger.debug(
                             "BEV publish %s: %sx%s, points=%d, overlay=%s",
                             result.camera_id,
-                            int(result.bev_bgr.shape[1]),
-                            int(result.bev_bgr.shape[0]),
+                            int(result.width_px),
+                            int(result.height_px),
                             len(result.bev_points),
                             result.config.overlay,
                         )

@@ -212,6 +212,7 @@ def attach_osd_label_hook(pipeline: "DS8Pipeline") -> None:
     # Attach upstream of nvdsosd so the text is rendered in the mosaic overlay.
     attach_component = pipeline.components.get("tiler") or osd_component
     processor = _OsdLabelProcessor.from_pipeline_config(getattr(pipeline, "config", {}) or {})
+    processor.stable_id_mgr = getattr(pipeline, "stable_id_mgr", None)
     attach_component.config["_osd_label_processor"] = processor
 
     if pipeline.ds_pipeline is None or BatchMetadataOperator is None or Probe is None:
@@ -1668,8 +1669,11 @@ class TrailOverlayProcessor:
                 stable_id_int = None
 
             key_id = int(track_id)
-            if self.config.color_key == "stable_id" and stable_id_int is not None and stable_id_int > 0:
-                key_id = int(stable_id_int)
+            if self.config.color_key == "stable_id":
+                if stable_id_int is not None and stable_id_int > 0:
+                    key_id = int(stable_id_int)
+                else:
+                    key_id = ((int(sensor_id) + 1) << 32) + int(track_id)
             r, g, b = self._color_for_key(key_id)
 
             line = ds_osd.Line()
@@ -1733,7 +1737,7 @@ class TrailOverlayProcessor:
             if stable_id_int is not None and stable_id_int > 0:
                 text.display_text = f"sid {stable_id_int}"
             else:
-                text.display_text = f"id {track_id}"
+                text.display_text = "sid XX"
             text.x_offset = int(last_x)
             text.y_offset = int(last_y)
             try:
@@ -2491,11 +2495,9 @@ class _AnalyticsTelemetryProcessor:
             return
         ts_us = self._frame_timestamp_us(frame_meta)
         try:
-            frame_bgr = np.zeros((1, 1, 3), dtype=np.uint8)
             self.bev_renderer.render_and_publish(
                 camera_id=camera_id,
                 calib=calib,
-                frame_bgr=frame_bgr,
                 footpoints=list(footpoints),
                 timestamp_us=ts_us,
             )
@@ -2932,6 +2934,7 @@ class _OsdLabelProcessor:
     decimals: int = 2
     font_size: Optional[int] = 22
     font_name: Optional[str] = "Sans"
+    stable_id_mgr: Any = field(default=None, repr=False)
 
     @staticmethod
     def from_pipeline_config(pipeline_cfg: Mapping[str, Any]) -> "_OsdLabelProcessor":
@@ -2973,22 +2976,24 @@ class _OsdLabelProcessor:
         )
 
     def handle_frame_ds8(self, frame_meta: Any) -> None:
+        sensor_id = self._frame_source_id(frame_meta)
         object_items = getattr(frame_meta, "object_items", None) or []
         for obj_meta in object_items:
-            self._apply_label(obj_meta)
+            self._apply_label(obj_meta, sensor_id=sensor_id)
 
     def handle_frame(self, frame_meta: Any) -> None:
+        sensor_id = self._frame_source_id(frame_meta)
         cast = _resolve_pyds_cast("NvDsObjectMeta")
         for obj_meta in _iter_meta_entries(getattr(frame_meta, "obj_meta_list", None), cast):
             if obj_meta is None:
                 continue
-            self._apply_label(obj_meta)
+            self._apply_label(obj_meta, sensor_id=sensor_id)
 
-    def _apply_label(self, obj_meta: Any) -> None:
+    def _apply_label(self, obj_meta: Any, *, sensor_id: int) -> None:
         text_params = getattr(obj_meta, "text_params", None)
         if text_params is None or not hasattr(text_params, "display_text"):
             return
-        label = self._format_label(obj_meta, text_params)
+        label = self._format_label(obj_meta, text_params, sensor_id=sensor_id)
         if not label:
             return
         try:
@@ -3021,38 +3026,82 @@ class _OsdLabelProcessor:
             except Exception:
                 pass
 
-    def _format_label(self, obj_meta: Any, text_params: Any) -> str:
-        try:
-            existing = str(getattr(text_params, "display_text", "") or "").strip()
-        except Exception:
-            existing = ""
-        if existing:
-            base_label = existing
-        else:
-            label = ""
-            for attr in ("label", "obj_label"):
-                try:
-                    value = getattr(obj_meta, attr, None)
-                except Exception:
-                    value = None
-                if value:
-                    label = str(value).strip()
-                if label:
-                    break
-            if not label:
-                try:
-                    class_id = int(getattr(obj_meta, "class_id", -1))
-                except Exception:
-                    class_id = -1
-                label = f"class {class_id}" if class_id >= 0 else "class"
-            parts = [label]
+    def _frame_source_id(self, frame_meta: Any) -> int:
+        for attr in ("source_id", "pad_index", "camera_id"):
+            value = getattr(frame_meta, attr, None)
+            if value is None:
+                continue
             try:
-                object_id = int(getattr(obj_meta, "object_id", -1))
+                return int(value)
             except Exception:
-                object_id = -1
-            if object_id >= 0:
-                parts.append(str(object_id))
-            base_label = " ".join(parts).strip()
+                continue
+        return 0
+
+    def _lookup_stable_id(self, sensor_id: int, track_id: int) -> Optional[int]:
+        mgr = self.stable_id_mgr
+        if mgr is None:
+            return None
+        key = (int(sensor_id), int(track_id))
+        rec = None
+        lock = getattr(mgr, "_lock", None)
+        if lock is not None:
+            try:
+                with lock:
+                    rec = getattr(mgr, "active_tracks", {}).get(key)
+            except Exception:
+                rec = None
+        else:
+            try:
+                rec = getattr(mgr, "active_tracks", {}).get(key)
+            except Exception:
+                rec = None
+        if not isinstance(rec, dict):
+            return None
+        stable_id = rec.get("stable_id")
+        try:
+            stable_id_int = int(stable_id)
+        except Exception:
+            return None
+        if stable_id_int <= 0:
+            return None
+        return stable_id_int
+
+    def _format_label(self, obj_meta: Any, text_params: Any, *, sensor_id: int) -> str:
+        label = ""
+        for attr in ("label", "obj_label"):
+            try:
+                value = getattr(obj_meta, attr, None)
+            except Exception:
+                value = None
+            if value:
+                label = str(value).strip()
+            if label:
+                break
+        if not label:
+            try:
+                class_id = int(getattr(obj_meta, "class_id", -1))
+            except Exception:
+                class_id = -1
+            label = f"class {class_id}" if class_id >= 0 else "class"
+
+        try:
+            class_id = int(getattr(obj_meta, "class_id", -1))
+        except Exception:
+            class_id = -1
+        try:
+            track_id = int(getattr(obj_meta, "object_id", -1))
+        except Exception:
+            track_id = -1
+
+        parts: List[str] = [label]
+        # Stable IDs are people-only; avoid showing raw tracker IDs for other classes.
+        if class_id == 0 and track_id >= 0:
+            stable_id = self._lookup_stable_id(sensor_id, track_id)
+            if stable_id is not None:
+                parts.append(f"{stable_id}")
+            else:
+                parts.append("XX")
+        base_label = " ".join([p for p in parts if p]).strip()
 
         try:
             confidence = float(getattr(obj_meta, "confidence", float("nan")))

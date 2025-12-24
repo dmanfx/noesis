@@ -1974,6 +1974,18 @@ def main() -> int:
     except Exception:
         logger.exception("Failed to attach DS8 OSD label hook")
 
+    bev_cfg = pipeline.config.get("bev") or {}
+    bev_jpeg_enabled = bool(bev_cfg.get("jpeg_enabled", False))
+    bev_jpeg_quality = int(bev_cfg.get("jpeg_quality", 70) or 70)
+    bev_env = os.environ.get("NOESIS_BEV_JPEG_ENABLED")
+    if bev_env is not None:
+        env_text = str(bev_env).strip().lower()
+        if env_text in ("1", "true", "yes", "on"):
+            bev_jpeg_enabled = True
+        elif env_text in ("0", "false", "no", "off"):
+            bev_jpeg_enabled = False
+    logger.info("BEV JPEG output enabled=%s (quality=%s)", bev_jpeg_enabled, bev_jpeg_quality)
+
     ws_server = WebSocketServer(
         host=args.ws_host,
         port=args.ws_port,
@@ -2006,7 +2018,12 @@ def main() -> int:
     ws_server.floorplan_provider = _ds8_floorplan_provider
     ws_server.calibration_getter = calibration_provider.calibration_bundle
     setattr(pipeline, "ws_server", ws_server)
-    bev_renderer = BevRenderer(ws_server, trails_cfg=trails_cfg)
+    bev_renderer = BevRenderer(
+        ws_server,
+        trails_cfg=trails_cfg,
+        jpeg_enabled=bev_jpeg_enabled,
+        jpeg_quality=bev_jpeg_quality,
+    )
     ws_server.bev_config_callback = lambda cam_id, cfg: bev_renderer.update_config(cam_id, cfg)
     ws_server.bev_overlay_callback = lambda cam_id, enabled: bev_renderer.update_config(cam_id, {"overlay": enabled})
     depth_pub = DepthTelemetryPublisher(ws_server)

@@ -1,26 +1,51 @@
 import { CameraKey } from './camera';
 
 type Point = { x: number; y: number };
-type Trails = Record<CameraKey, Record<number, Point[]>>;
+type Trails = Record<CameraKey, Record<string, { points: Point[]; colorId: number }>>;
 
 const MAX_POINTS = 300;
 
 export class TrailStore {
   trails: Trails = { 'living-room': {}, 'kitchen': {}, 'family-room': {} };
 
-  push(cam: CameraKey, trackId: number, pt: Point) {
-    if (!this.trails[cam][trackId]) this.trails[cam][trackId] = [];
-    const arr = this.trails[cam][trackId];
+  push(cam: CameraKey, key: string, pt: Point, colorId: number) {
+    if (!this.trails[cam][key]) this.trails[cam][key] = { points: [], colorId };
+    const entry = this.trails[cam][key];
+    entry.colorId = colorId;
+    const arr = entry.points;
     arr.push(pt);
     if (arr.length > MAX_POINTS) arr.shift();
   }
 
   // Insert a gap marker so drawTrails breaks the polyline for this track
-  pushBreak(cam: CameraKey, trackId: number) {
-    if (!this.trails[cam][trackId]) this.trails[cam][trackId] = [];
-    const arr = this.trails[cam][trackId];
+  pushBreak(cam: CameraKey, key: string, colorId: number) {
+    if (!this.trails[cam][key]) this.trails[cam][key] = { points: [], colorId };
+    const entry = this.trails[cam][key];
+    entry.colorId = colorId;
+    const arr = entry.points;
     arr.push({ x: Number.NaN, y: Number.NaN });
     if (arr.length > MAX_POINTS) arr.shift();
+  }
+
+  migrate(cam: CameraKey, fromKey: string, toKey: string, toColorId: number): void {
+    if (fromKey === toKey) {
+      if (this.trails[cam][toKey]) this.trails[cam][toKey].colorId = toColorId;
+      return;
+    }
+    const fromEntry = this.trails[cam][fromKey];
+    const toEntry = this.trails[cam][toKey];
+    if (fromEntry && !toEntry) {
+      this.trails[cam][toKey] = { points: fromEntry.points, colorId: toColorId };
+      delete this.trails[cam][fromKey];
+      return;
+    }
+    if (fromEntry && toEntry) {
+      toEntry.points.push({ x: Number.NaN, y: Number.NaN });
+      toEntry.points.push(...fromEntry.points);
+      toEntry.colorId = toColorId;
+      while (toEntry.points.length > MAX_POINTS) toEntry.points.shift();
+      delete this.trails[cam][fromKey];
+    }
   }
 
   clearAll() {
@@ -45,8 +70,8 @@ export function drawTrails(
     minX = viewport.xMin; maxX = viewport.xMax;
     minY = viewport.yMin; maxY = viewport.yMax;
   } else {
-    for (const tidStr in tracks) {
-      const pts = tracks[Number(tidStr)] || [];
+    for (const key in tracks) {
+      const pts = tracks[key]?.points || [];
       for (const p of pts) {
         if (p.x < minX) minX = p.x;
         if (p.y < minY) minY = p.y;
@@ -72,13 +97,13 @@ export function drawTrails(
     ctx.beginPath(); ctx.moveTo(0, gy); ctx.lineTo(canvas.width, gy); ctx.stroke();
   }
 
-  for (const tidStr in tracks) {
-    const tid = Number(tidStr);
-    const pts = tracks[tid];
+  for (const key in tracks) {
+    const track = tracks[key];
+    const pts = track?.points;
     if (!pts || pts.length === 0) continue;
     let open = false;
     let lastValid: Point | null = null;
-    ctx.strokeStyle = color(tid);
+    ctx.strokeStyle = color(track.colorId);
     ctx.lineWidth = 2;
     for (let i = 0; i < pts.length; i++) {
       const p = pts[i];
@@ -99,7 +124,7 @@ export function drawTrails(
       const hx = pad + (lastValid.x - minX) * sx;
       const baseHy = pad + (lastValid.y - minY) * sy;
       const hy = viewport?.invertY ? (canvas.height - baseHy) : baseHy;
-      ctx.fillStyle = color(tid);
+      ctx.fillStyle = color(track.colorId);
       ctx.beginPath(); ctx.arc(hx, hy, 3, 0, Math.PI * 2); ctx.fill();
     }
   }

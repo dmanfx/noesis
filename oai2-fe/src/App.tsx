@@ -7,7 +7,7 @@ import { ControlsPanel } from './components/ControlsPanel';
 import { TelemetryPanel } from './telemetry/TelemetryPanel';
 import { TelemetryProvider, useTelemetry } from './telemetry/TelemetryContext';
 import { TrailStore } from './lib/trails';
-import { cameraOrder, colorForTrack, cameraLabel, detectCameraKey, CameraKey } from './lib/camera';
+import { cameraOrder, colorForTrack, cameraLabel, detectCameraKey, CameraKey, colorIdForPerson, identityKeyForPerson } from './lib/camera';
 import { getExtrinsics, worldToCamera, getIntrinsics4, extractPoseFromExtrinsics, forwardXZFromExtrinsics } from './lib/calibration';
 import { useWebSocketClient, StatsPayload, DepthRequestStrategy, MosaicLayout } from './hooks/useWebSocketClient';
 import { useWebRTCClient } from './hooks/useWebRTCClient';
@@ -119,7 +119,7 @@ function Dashboard() {
 
   const [trailEnabled, setTrailEnabled] = useState<boolean>(true);
   const trailStoreRef = useRef(new TrailStore());
-  const prevActiveRef = useRef<Record<CameraKey, Set<number>>>(
+  const prevActiveRef = useRef<Record<CameraKey, Set<string>>>(
     { 'living-room': new Set(), 'kitchen': new Set(), 'family-room': new Set() }
   );
   // Switch cams to world-space top-down when available
@@ -193,7 +193,7 @@ function Dashboard() {
     const perKeyOcc: Record<CameraKey, Record<string, number>> = { 'living-room': {}, 'kitchen': {}, 'family-room': {} };
     // const perKeyTransCount: Record<CameraKey, number> = { 'living-room': 0, 'kitchen': 0, 'family-room': 0 };
 
-    const seenNow: Record<CameraKey, Set<number>> = {
+    const seenNow: Record<CameraKey, Set<string>> = {
       'living-room': new Set(), 'kitchen': new Set(), 'family-room': new Set()
     };
 
@@ -219,9 +219,16 @@ function Dashboard() {
         if (trailEnabled) {
           for (const t of track!.active_tracks) {
             const key = camKey as CameraKey;
-            const sid = Number((t.stable_id ?? t.track_id) || 0);
-            if (!prevActiveRef.current[key]?.has(sid)) {
-              trailStoreRef.current.pushBreak(key, sid);
+            const trackKey = identityKeyForPerson(key, null, t.track_id);
+            const hasStableId = typeof t.stable_id === 'number' && Number.isFinite(t.stable_id) && t.stable_id > 0;
+            const stableKey = hasStableId ? identityKeyForPerson(key, t.stable_id, t.track_id) : null;
+            const activeKey = stableKey ?? trackKey;
+            const colorId = colorIdForPerson(key, t.stable_id, t.track_id);
+
+            if (stableKey && prevActiveRef.current[key]?.has(trackKey) && !prevActiveRef.current[key]?.has(stableKey)) {
+              trailStoreRef.current.migrate(key, trackKey, stableKey, colorId);
+            } else if (!prevActiveRef.current[key]?.has(activeKey)) {
+              trailStoreRef.current.pushBreak(key, activeKey, colorId);
             }
             // Prefer camera-local space for kitchen when provided (x_cam,z_cam → canvas x,y)
             const tw: any = t as any;
@@ -240,13 +247,13 @@ function Dashboard() {
                   const xCam = pc[0];
                   const zCam = pc[2];
                   const depth = Math.abs(zCam);
-                  trailStoreRef.current.push(key, sid, { x: xCam, y: depth });
+                  trailStoreRef.current.push(key, activeKey, { x: xCam, y: depth }, colorId);
                 }
               } else {
                 // Fallback to world XZ if extrinsics not loaded
-                trailStoreRef.current.push(key, sid, { x: Number(w[0] || 0), y: Number(w[2] || 0) });
+                trailStoreRef.current.push(key, activeKey, { x: Number(w[0] || 0), y: Number(w[2] || 0) }, colorId);
               }
-              seenNow[key].add(sid);
+              seenNow[key].add(activeKey);
             } else if (key === 'living-room' && hasWorld) {
               if (!usingWorldLivingRef.current) {
                 try { (trailStoreRef.current.trails as any)['living-room'] = {}; } catch { }
@@ -260,10 +267,10 @@ function Dashboard() {
                   const xCam = pc[0];
                   const zCam = pc[2];
                   const depth = Math.abs(zCam);
-                  trailStoreRef.current.push(key, sid, { x: xCam, y: depth });
+                  trailStoreRef.current.push(key, activeKey, { x: xCam, y: depth }, colorId);
                 }
               }
-              seenNow[key].add(sid);
+              seenNow[key].add(activeKey);
             } else if (key === 'family-room' && hasWorld) {
               if (!usingWorldFamilyRef.current) {
                 try { (trailStoreRef.current.trails as any)['family-room'] = {}; } catch { }
@@ -277,14 +284,14 @@ function Dashboard() {
                   const xCam = pc[0];
                   const zCam = pc[2];
                   const depth = Math.abs(zCam);
-                  trailStoreRef.current.push(key, sid, { x: xCam, y: depth });
+                  trailStoreRef.current.push(key, activeKey, { x: xCam, y: depth }, colorId);
                 }
               }
-              seenNow[key].add(sid);
+              seenNow[key].add(activeKey);
             } else {
               const center = t.center; if (!Array.isArray(center) || center.length < 2) continue;
-              trailStoreRef.current.push(key, sid, { x: center[0]!, y: center[1]! });
-              seenNow[key].add(sid);
+              trailStoreRef.current.push(key, activeKey, { x: center[0]!, y: center[1]! }, colorId);
+              seenNow[key].add(activeKey);
             }
           }
         }
@@ -341,7 +348,10 @@ function Dashboard() {
         const center = t.center || ['N/A', 'N/A'];
         const vel = t.velocity || [0, 0];
         const speed = Math.sqrt(vel[0] ** 2 + vel[1] ** 2).toFixed(1);
-        const dotColor = colorForTrack(Number((t.stable_id ?? t.track_id) || 0));
+        const camKey = findCamForTrack(t);
+        const dotColor = camKey
+          ? colorForTrack(colorIdForPerson(camKey, t.stable_id, t.track_id))
+          : colorForTrack(Number((t.stable_id ?? t.track_id) || 0));
         const metric = metricForTrack(t);
 
         const metricText = metric ? `[${metric.x.toFixed(2)} m, ${metric.y.toFixed(2)} m]` : 'N/A';

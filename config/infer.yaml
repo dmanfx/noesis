@@ -116,6 +116,8 @@ bev:
   jpeg_quality: 70
 
 visualization: # Visualization overlays rendered into the mosaic stream (tiler → osd).
+  instance_masks:
+    alpha: 0.35 # Mask overlay opacity (stable-id keyed color; matches BEV + Active Tracks hue math).
   trails:
     enabled: true # Enable trails overlay.
     class_ids: [0] # Restrict trails to people only (class_id 0).

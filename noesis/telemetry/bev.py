@@ -42,7 +42,6 @@ class Footpoint:
     u: float
     v: float
     method: str = "bbox"
-    track_id: Optional[int] = None
     stable_id: Optional[int] = None
 
 
@@ -501,7 +500,7 @@ class BevRenderer:
             H_img2plane = cached_result
 
         bev_points: List[Dict[str, float]] = []
-        current_local_by_track: Dict[int, Tuple[float, float, Optional[int]]] = {}
+        current_local_by_sid: Dict[int, Tuple[float, float]] = {}
 
         # Calculate Camera Yaw and Position for Local Transformation
         # We want points relative to the camera (Local Frame), aligned with the camera view.
@@ -537,15 +536,17 @@ class BevRenderer:
             lx = dx * cos_yaw - dz * sin_yaw
             lz = dx * sin_yaw + dz * cos_yaw
 
+            try:
+                stable_id = int(fp.stable_id) if fp.stable_id is not None else None
+            except Exception:
+                stable_id = None
+            if stable_id is None or stable_id <= 0:
+                continue
+
             # The frontend expects 'x' and 'y' in the JSON list.
             # We map Local X -> JSON x, Local Z -> JSON y
-            bev_points.append({'x': lx, 'y': lz, 'method': fp.method, 'trackId': fp.track_id, 'stableId': fp.stable_id})
-            try:
-                track_id = int(fp.track_id) if fp.track_id is not None else -1
-            except Exception:
-                track_id = -1
-            if track_id >= 0:
-                current_local_by_track[track_id] = (float(lx), float(lz), fp.stable_id)
+            bev_points.append({'x': lx, 'y': lz, 'method': fp.method, 'stableId': stable_id})
+            current_local_by_sid[int(stable_id)] = (float(lx), float(lz))
 
         # Update config to reflect the actual extents used
         result_config = BevConfig(
@@ -558,7 +559,7 @@ class BevRenderer:
             max_distance_m=cfg.max_distance_m,
         )
 
-        trails_to_draw: List[Tuple[int, Optional[int], List[Tuple[float, float, float]]]] = []
+        trails_to_draw: List[Tuple[int, List[Tuple[float, float, float]]]] = []
         with self._lock:
             trails_enabled = bool(self._trails_enabled) and bool(self._trail_cfg.enabled)
             cam_tracks = self._trail_tracks_by_cam.setdefault(camera_id, {})
@@ -574,18 +575,13 @@ class BevRenderer:
             window_s = float(self._trail_cfg.window_s)
 
             if trails_enabled:
-                for track_id, (lx, lz, stable_id) in current_local_by_track.items():
-                    state = cam_tracks.get(track_id)
+                for stable_id, (lx, lz) in current_local_by_sid.items():
+                    state = cam_tracks.get(stable_id)
                     if state is None:
                         state = _BevTrailTrackState(points=deque(maxlen=max_points))
-                        cam_tracks[track_id] = state
+                        cam_tracks[stable_id] = state
                     state.last_seen_ts = float(now_s)
-                    try:
-                        stable_id_int = int(stable_id) if stable_id not in (None, "", -1) else None
-                    except Exception:
-                        stable_id_int = None
-                    if stable_id_int is not None and stable_id_int > 0:
-                        state.stable_id = int(stable_id_int)
+                    state.stable_id = int(stable_id)
 
                     # Always prune old samples so disappeared tracks naturally fade out.
                     while state.points and (now_s - float(state.points[0][0])) > window_s:
@@ -638,24 +634,24 @@ class BevRenderer:
 
             # Remove fully expired tracks to keep memory bounded.
             expired: List[int] = []
-            for track_id, state in cam_tracks.items():
+            for stable_id, state in cam_tracks.items():
                 while state.points and (now_s - float(state.points[0][0])) > window_s:
                     state.points.popleft()
                 if not state.points and (now_s - float(state.last_seen_ts)) > window_s:
-                    expired.append(track_id)
-            for track_id in expired:
-                cam_tracks.pop(track_id, None)
+                    expired.append(stable_id)
+            for stable_id in expired:
+                cam_tracks.pop(stable_id, None)
 
             if trails_enabled and cam_tracks:
                 # Select a bounded number of tracks to render.
                 track_items = list(cam_tracks.items())
                 track_items.sort(key=lambda item: float(getattr(item[1], "last_seen_ts", 0.0)), reverse=True)
                 max_tracks = max(1, int(self._trail_cfg.max_tracks))
-                for track_id, state in track_items[:max_tracks]:
+                for stable_id, state in track_items[:max_tracks]:
                     pts = list(state.points)
                     if len(pts) < 2:
                         continue
-                    trails_to_draw.append((track_id, state.stable_id, pts))
+                    trails_to_draw.append((int(stable_id), pts))
 
         # Draw grid + trails + footpoints if overlay is enabled
         if bev is not None and result_config.overlay:
@@ -664,7 +660,7 @@ class BevRenderer:
                 inv_window = 1.0 / max(0.1, float(self._trail_cfg.window_s))
                 min_alpha = float(self._trail_cfg.min_alpha)
                 line_width = int(self._trail_cfg.line_width)
-                for track_id, stable_id, pts in trails_to_draw:
+                for stable_id, pts in trails_to_draw:
                     if len(pts) < 2:
                         continue
                     segments_available = len(pts) - 1
@@ -672,15 +668,7 @@ class BevRenderer:
                     if segments_budget <= 0:
                         continue
                     pts = self._resample_points(pts, segments_budget)
-                    key_id = int(track_id)
-                    if self._trail_cfg.color_key == "stable_id":
-                        try:
-                            stable_id_int = int(stable_id) if stable_id not in (None, "", -1) else None
-                        except Exception:
-                            stable_id_int = None
-                        if stable_id_int is not None and stable_id_int > 0:
-                            key_id = int(stable_id_int)
-                    base_bgr = self._color_for_key(key_id)
+                    base_bgr = self._color_for_key(int(stable_id))
                     for idx in range(len(pts) - 1):
                         ts0, x1, z1 = pts[idx]
                         _ts1, x2, z2 = pts[idx + 1]
@@ -698,19 +686,11 @@ class BevRenderer:
                         )
                         cv2.line(bev, p1, p2, color, line_width, lineType=cv2.LINE_AA)
 
-            for track_id, (lx, lz, stable_id) in current_local_by_track.items():
+            for stable_id, (lx, lz) in current_local_by_sid.items():
                 p = self._local_to_px(lx, lz, result_config, bev.shape[:2])
                 if p is None:
                     continue
-                key_id = int(track_id)
-                if self._trail_cfg.color_key == "stable_id":
-                    try:
-                        stable_id_int = int(stable_id) if stable_id not in (None, "", -1) else None
-                    except Exception:
-                        stable_id_int = None
-                    if stable_id_int is not None and stable_id_int > 0:
-                        key_id = int(stable_id_int)
-                base_bgr = self._color_for_key(key_id)
+                base_bgr = self._color_for_key(int(stable_id))
                 cv2.circle(bev, p, 4, base_bgr, -1, lineType=cv2.LINE_AA)
 
         result = BevResult(

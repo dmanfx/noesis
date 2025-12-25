@@ -118,8 +118,8 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--log-level",
-        default=os.environ.get("NOESIS_LOG_LEVEL", "INFO"),
-        help="Logging level (default: INFO).",
+        default=os.environ.get("NOESIS_LOG_LEVEL", "WARNING"),
+        help="Logging level (default: WARNING).",
     )
     parser.add_argument(
         "--depth-enable-seconds",
@@ -197,6 +197,8 @@ def _build_stable_id_manager(logger: logging.Logger):
         img_h = int(os.environ.get("NOESIS_REID_IMAGE_H", "256") or 256)
         img_w = int(os.environ.get("NOESIS_REID_IMAGE_W", "128") or 128)
         embed_interval_s = float(os.environ.get("NOESIS_REID_EMBED_INTERVAL_S", "0.0") or 0.0)
+        new_id_hysteresis_frames = int(os.environ.get("NOESIS_REID_NEW_ID_HYSTERESIS_FRAMES", "1") or 1)
+        new_id_confirm_frames_at_cap = int(os.environ.get("NOESIS_REID_NEW_ID_CONFIRM_FRAMES_AT_CAP", "1") or 1)
         mgr = StableIDManager(
             model_path=model_path,
             device=device,
@@ -206,11 +208,15 @@ def _build_stable_id_manager(logger: logging.Logger):
             # DS8 stable IDs source embeddings from an explicit OSNet SGIE; do not load torchreid.
             use_extractor=False,
             embed_interval_s=embed_interval_s,
+            new_id_hysteresis_frames=new_id_hysteresis_frames,
+            new_id_confirm_frames_at_cap=new_id_confirm_frames_at_cap,
         )
         logger.info(
-            "Stable ID manager initialised (SGIE embeddings; allow_multi_zone_active=%s, embed_interval_s=%.3f)",
+            "Stable ID manager initialised (SGIE embeddings; allow_multi_zone_active=%s, embed_interval_s=%.3f, new_id_hysteresis_frames=%d, new_id_confirm_frames_at_cap=%d)",
             True,
             embed_interval_s,
+            new_id_hysteresis_frames,
+            new_id_confirm_frames_at_cap,
         )
         return mgr
     except Exception as exc:
@@ -1519,7 +1525,7 @@ def main() -> int:
     os.environ.setdefault("NOESIS_DEPTH_ENABLE_SECONDS", "0")
     args = _parse_args()
     logging.basicConfig(
-        level=getattr(logging, args.log_level.upper(), logging.INFO),
+        level=getattr(logging, args.log_level.upper(), logging.WARNING),
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
     logger = logging.getLogger("ds8.runtime")

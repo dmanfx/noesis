@@ -4,8 +4,7 @@ import { CameraKey, detectCameraKey } from '../lib/camera';
 import { wsLog } from '../lib/wsLogger';
 
 type Track = {
-  track_id: number;
-  stable_id?: number | null;
+  stable_id: number;
   camera_id: string;
   zone?: string;
   center?: [number, number];
@@ -19,7 +18,7 @@ export type CamerasStats = Record<string, {
   tracking?: {
     occupancy?: Record<string, number>;
     active_tracks?: Track[];
-    transitions?: Array<{ timestamp?: number; track_id?: number; from_zone?: string; to_zone?: string; camera_id?: string }>;
+    transitions?: Array<{ timestamp?: number; stable_id?: number; from_zone?: string; to_zone?: string; camera_id?: string; line_name?: string }>;
   }
 }>;
 

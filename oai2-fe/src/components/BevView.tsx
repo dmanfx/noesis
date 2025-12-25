@@ -6,7 +6,7 @@ import { renderLayerToCanvas, infernoColor } from '../lib/renderUtils';
 export type BevMeta = {
   cameraId?: string;
   camId?: string;
-  footpoints?: Array<{ x: number; y: number; method: string; trackId?: number; stableId?: number | null }>;
+  footpoints?: Array<{ x: number; y: number; method: string; stableId: number }>;
   xMin?: number;
   xMax?: number;
   zMin?: number;
@@ -19,7 +19,6 @@ type BevViewProps = {
   cam: CameraKey;
   meta?: BevMeta;
   floorplan?: FloorplanResponse;
-  tracks?: Array<{ track_id: number; stable_id?: number | null }>;
   trailEnabled?: boolean;
   variant?: 'drawer' | 'inline';
 };
@@ -46,7 +45,6 @@ export const BevView: React.FC<BevViewProps> = ({
   cam,
   meta,
   floorplan,
-  tracks,
   trailEnabled = true,
   variant = 'drawer'
 }) => {
@@ -73,43 +71,25 @@ export const BevView: React.FC<BevViewProps> = ({
 
     if (meta?.footpoints) {
       meta.footpoints.forEach(pt => {
-        if (pt.trackId === undefined) return;
-
         const targetX = pt.x;
         const targetY = pt.y;
 
-        const stableFromMeta = typeof pt.stableId === 'number' && Number.isFinite(pt.stableId) ? pt.stableId : null;
-        const stableFromTracks = tracks?.find(tr => tr.track_id === pt.trackId)?.stable_id ?? null;
-        const stableId = stableFromMeta ?? stableFromTracks;
-        const stableNum = (typeof stableId === 'number' && Number.isFinite(stableId)) ? stableId : null;
-        const hasStable = stableNum !== null && stableNum > 0;
-        const colorId = colorIdForPerson(cam, stableNum, pt.trackId);
+        const stableNum = typeof pt.stableId === 'number' && Number.isFinite(pt.stableId) ? pt.stableId : null;
+        if (stableNum === null || stableNum <= 0) return;
+        const colorId = colorIdForPerson(cam, stableNum);
 
-        state.set(pt.trackId, {
+        state.set(stableNum, {
           x: targetX,
           y: targetY,
           lastSeen: now,
-          stableId: hasStable ? `${stableNum}` : undefined,
+          stableId: `${stableNum}`,
           colorId
         });
 
         if (!trailEnabled) return;
 
-        const trackKey = identityKeyForPerson(cam, null, pt.trackId);
-        const stableKey = hasStable ? identityKeyForPerson(cam, stableNum, pt.trackId) : null;
-        const key = stableKey ?? trackKey;
-        const labelText = hasStable ? `${stableNum}` : `${pt.trackId}`;
-
-        // If stable-id becomes available after earlier track-id-only samples, migrate history.
-        if (hasStable) {
-          if (!trails.has(key) && trails.has(trackKey)) {
-            const existing = trails.get(trackKey);
-            if (existing) {
-              trails.delete(trackKey);
-              trails.set(key, { ...existing, label: labelText, colorId });
-            }
-          }
-        }
+        const key = identityKeyForPerson(cam, stableNum);
+        const labelText = `${stableNum}`;
 
         const entry = trails.get(key) ?? { points: [], lastSeen: 0, label: labelText, colorId };
         const pts = entry.points;
@@ -173,7 +153,7 @@ export const BevView: React.FC<BevViewProps> = ({
     } else {
       trails.clear();
     }
-  }, [meta, tracks, trailEnabled]);
+  }, [meta, trailEnabled]);
 
   useEffect(() => {
     const render = () => {

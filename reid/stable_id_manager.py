@@ -148,6 +148,8 @@ class StableIDManager:
         # Pending new-ID confirmation counters at cap
         self._pending_new_counts: Dict[Tuple[int, int], int] = {}
         self._pending_new_ts: Dict[Tuple[int, int], float] = {}
+        # Pending stable IDs for new tracks (avoid negative provisional IDs).
+        self._pending_new_sids: Dict[Tuple[int, int], int] = {}
 
         self.next_stable_id = 1
         # Free-list allocator state
@@ -487,14 +489,6 @@ class StableIDManager:
                                     sid = g_id
 
                 if sid is None:
-                    # If embeddings are externally supplied (extractor disabled) and we don't have one yet,
-                    # do not mint an "allocator-only" stable_id. Defer until an embedding arrives.
-                    if emb is None and not self._use_extractor:
-                        cnt = self._pending_new_counts.get(key, 0) + 1
-                        self._pending_new_counts[key] = cnt
-                        self._pending_new_ts[key] = float(ts)
-                        return int(-abs(int(ds_obj_id)))
-
                     # Global new-ID hysteresis + soft-cap handling
                     active_ids_here = {s for s, pairs in self.active_zones.items() if any(int(x) == int(sensor_id) for (x, _z) in pairs)}
                     at_cap = len(active_ids_here) >= self.max_active_ids_per_sensor
@@ -505,8 +499,17 @@ class StableIDManager:
                     self._pending_new_counts[key] = cnt
                     self._pending_new_ts[key] = float(ts)
                     if cnt < required:
-                        # Defer ID creation; provisional negative label for UI stability
-                        return int(-abs(int(ds_obj_id)))
+                        # Defer *finalizing* the ID, but still return a positive stable_id so
+                        # user-facing telemetry never needs to fall back to raw tracker IDs.
+                        pending_sid = self._pending_new_sids.get(key)
+                        if pending_sid is None:
+                            pending_sid = int(self._alloc_sid())
+                            self._pending_new_sids[key] = int(pending_sid)
+                        return int(pending_sid)
+                    # Confirmation reached: use the pending stable_id if one was allocated.
+                    pending_sid = self._pending_new_sids.get(key)
+                    if pending_sid is not None:
+                        sid = int(pending_sid)
                     if at_cap and self.new_id_confirm_frames_at_cap > 0:
                         # Evict stale locals to free a slot
                         now = float(ts)
@@ -567,8 +570,17 @@ class StableIDManager:
                     try:
                         self._pending_new_counts.pop(key, None)
                         self._pending_new_ts.pop(key, None)
+                        self._pending_new_sids.pop(key, None)
                     except Exception:
                         pass
+
+                # Creating an active record: clear any pending state for this track key.
+                try:
+                    self._pending_new_counts.pop(key, None)
+                    self._pending_new_ts.pop(key, None)
+                    self._pending_new_sids.pop(key, None)
+                except Exception:
+                    pass
 
                 rec = {
                     "stable_id": int(sid),
@@ -604,6 +616,70 @@ class StableIDManager:
                 rec["zone"] = zone
                 self.active_zones[int(rec["stable_id"])].add((int(sensor_id), rec["zone"]))
             if emb is not None:
+                # If we minted an allocator-only ID before an embedding arrived (external-embedding mode),
+                # try to reconcile the first embedding against ghosts/gallery and optionally remap to the
+                # matched stable_id. This keeps cross-camera matching viable even when the first frame(s)
+                # lacked tensor meta.
+                if rec.get("emb") is None:
+                    try:
+                        current_sid = int(rec.get("stable_id"))
+                    except Exception:
+                        current_sid = int(rec["stable_id"])
+                    candidate_sid = None
+                    try:
+                        candidate_sid = self._match_ghost(sensor_id, emb, bbox_ltrbwh, ts)
+                    except Exception:
+                        candidate_sid = None
+                    if candidate_sid is None:
+                        try:
+                            g_id, g_sim = self._gallery_best(
+                                emb,
+                                sensor_id=int(sensor_id),
+                                curr_bbox=bbox_ltrbwh,
+                                curr_brightness=curr_brightness,
+                                curr_color=curr_color,
+                            )
+                        except Exception:
+                            g_id, g_sim = None, -1.0
+                        if g_id is not None:
+                            req = self.cos_sim_high_threshold
+                            last_glob = self.sid_global_last_seen.get(int(g_id))
+                            if last_glob is not None and (ts - float(last_glob)) <= self.xcam_handoff_window_s:
+                                req = max(0.0, req - self.xcam_handoff_margin)
+                            if float(g_sim) >= float(req):
+                                can_take = True
+                                if self.active_id_guard_strict:
+                                    active_pairs = self.active_zones.get(int(g_id), set())
+                                    active_here = any(int(sid_sensor) == int(sensor_id) for (sid_sensor, _zone) in active_pairs)
+                                    if active_here and (float(g_sim) < (float(req) + self.active_id_guard_margin)):
+                                        can_take = False
+                                if can_take and (self.allow_multi_zone_active or not self.active_zones.get(g_id)):
+                                    candidate_sid = int(g_id)
+                    if candidate_sid is not None and int(candidate_sid) > 0 and int(candidate_sid) != int(current_sid):
+                        old_sid = int(current_sid)
+                        new_sid = int(candidate_sid)
+                        try:
+                            old_zone = rec.get("zone", "default")
+                            pairs = self.active_zones.get(old_sid, set())
+                            if (int(sensor_id), old_zone) in pairs:
+                                pairs.remove((int(sensor_id), old_zone))
+                            if pairs:
+                                self.active_zones[old_sid] = pairs
+                            else:
+                                self.active_zones.pop(old_sid, None)
+                        except Exception:
+                            pass
+                        rec["stable_id"] = int(new_sid)
+                        self.active_zones[int(new_sid)].add((int(sensor_id), rec.get("zone", "default")))
+                        # If the old ID had no appearance state and is now unused, recycle it immediately.
+                        try:
+                            still_used = any(int(r.get("stable_id", -1)) == old_sid for r in self.active_tracks.values())
+                        except Exception:
+                            still_used = True
+                        if not still_used and (old_sid not in self.gallery):
+                            self._purge_sid_state(old_sid)
+                            self._free_sid(old_sid)
+
                 rec["emb"] = emb
                 rec["last_emb_ts"] = float(ts)
                 sid_int = int(rec["stable_id"]) 
@@ -660,6 +736,19 @@ class StableIDManager:
         """
         with self._lock:
             present_set = set(int(i) for i in present_ds_ids)
+            # Also prune any pending new-track state for IDs that vanished before confirmation.
+            try:
+                pending_keys = [
+                    k
+                    for k in list(self._pending_new_ts.keys())
+                    if int(k[0]) == int(sensor_id) and int(k[1]) not in present_set
+                ]
+                for k in pending_keys:
+                    self._pending_new_counts.pop(k, None)
+                    self._pending_new_ts.pop(k, None)
+                    self._pending_new_sids.pop(k, None)
+            except Exception:
+                pass
             to_remove: List[Tuple[int, int]] = []
             for (s_id, ds_id), rec in self.active_tracks.items():
                 if int(s_id) != int(sensor_id):

@@ -23,20 +23,16 @@ export function cameraIndex(cam: CameraKey): number {
   return 2;
 }
 
-export function colorIdForPerson(cam: CameraKey, stableId?: number | null, trackId?: number | null): number {
+export function colorIdForPerson(_cam: CameraKey, stableId?: number | null): number {
   const stable = typeof stableId === 'number' && Number.isFinite(stableId) ? stableId : null;
   if (stable !== null && stable > 0) return stable;
-  const rawTrack = typeof trackId === 'number' && Number.isFinite(trackId) ? trackId : 0;
-  const trackInt = Math.max(0, Math.floor(rawTrack));
-  return (cameraIndex(cam) + 1) * COLOR_NS_STRIDE + trackInt;
+  return 0;
 }
 
-export function identityKeyForPerson(cam: CameraKey, stableId?: number | null, trackId?: number | null): string {
+export function identityKeyForPerson(_cam: CameraKey, stableId?: number | null): string {
   const stable = typeof stableId === 'number' && Number.isFinite(stableId) ? stableId : null;
   if (stable !== null && stable > 0) return `s:${stable}`;
-  const rawTrack = typeof trackId === 'number' && Number.isFinite(trackId) ? trackId : 0;
-  const trackInt = Math.max(0, Math.floor(rawTrack));
-  return `t:${cam}:${trackInt}`;
+  return 's:0';
 }
 
 export function cameraLabel(key: CameraKey): string {

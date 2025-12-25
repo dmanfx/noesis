@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import colorsys
 import logging
 import math
 import os
@@ -1806,10 +1807,15 @@ class _AnalyticsTelemetryProcessor:
     _active_tracks: Dict[int, List[Dict[str, Any]]] = field(default_factory=dict, init=False, repr=False)
     _transitions_state: Dict[int, List[Dict[str, Any]]] = field(default_factory=dict, init=False, repr=False)
     _stable_id_enabled: bool = field(default=True, init=False, repr=False)
+    _fallback_sid_by_key: Dict[Tuple[int, int], int] = field(default_factory=dict, init=False, repr=False)
+    _fallback_sid_last_seen: Dict[Tuple[int, int], float] = field(default_factory=dict, init=False, repr=False)
+    _fallback_sid_next: int = field(default=1, init=False, repr=False)
     _bev_class_ids: frozenset[int] = field(default_factory=lambda: frozenset({0}), init=False, repr=False)
     _bev_class_ids_ready: bool = field(default=False, init=False, repr=False)
     _reid_unique_id: int = field(default=3, init=False, repr=False)
     _reid_layer_name: str = field(default="features", init=False, repr=False)
+    _mask_alpha: float = field(default=0.35, init=False, repr=False)
+    _mask_alpha_ready: bool = field(default=False, init=False, repr=False)
     _reid_logged_shape: bool = field(default=False, init=False, repr=False)
     _reid_debug_last_log: float = field(default=0.0, init=False, repr=False)
     _reid_debug_frames: int = field(default=0, init=False, repr=False)
@@ -2112,57 +2118,50 @@ class _AnalyticsTelemetryProcessor:
             frame_id = int(getattr(frame_meta, "frame_number", -1))
             occupancy_counts: Dict[str, int] = {}
             present_track_ids: set[int] = set()
+            present_stable_ids: set[int] = set()
             footpoints: List[Footpoint] = []
             frame_dims = self._frame_dims()
+
             reid_debug = str(os.environ.get("NOESIS_REID_DEBUG", "")).strip().lower() in ("1", "true", "yes", "on")
             if reid_debug:
                 self._reid_debug_frames += 1
 
-            # DS8 API: frame_meta.object_items is an iterable
             object_items = getattr(frame_meta, "object_items", None) or []
             for obj_meta in object_items:
-                track = self._build_track_dict_ds8(obj_meta, camera_id)
-                if track is None:
+                raw = self._build_track_dict_ds8(obj_meta, camera_id)
+                if raw is None:
                     continue
                 if reid_debug:
                     self._reid_debug_objects += 1
-                
-                track_id = int(track.get("track_id", -1))
+
+                track_id = int(raw.get("track_id", -1))
+                if track_id < 0:
+                    continue
                 present_track_ids.add(track_id)
 
-                # Handle line crossings from analytics
-                analytics = track.get("analytics")
-                if analytics and "lcStatus" in analytics:
-                    lc = analytics["lcStatus"]
-                    if isinstance(lc, dict):
-                        for line_name, status in lc.items():
-                            if status == 1:
-                                self._record_transition(
-                                    sensor_id=sensor_id,
-                                    track_id=track_id,
-                                    line_name=line_name,
-                                    ts=now_ts,
-                                )
-
-                if "stable_id" not in track:
-                    track["stable_id"] = None
-                
-                zone = track.get("zone")
-                dwell = self._update_dwell_time(sensor_id, track_id, zone, now_ts)
-                track["dwell_time"] = dwell
                 try:
-                    class_id = int(track.get("class_id", -1))
+                    class_id = int(raw.get("class_id", -1))
                 except Exception:
                     class_id = -1
-                if class_id == 0:
-                    if reid_debug:
-                        self._reid_debug_people += 1
-                    emb = None
-                    need_emb = True
+
+                zone = raw.get("zone")
+
+                # People-only public identity. Do not show raw tracker IDs.
+                if class_id != 0:
+                    self._stamp_osd_label_ds8(obj_meta, sensor_id=sensor_id, stable_id=None)
+                    continue
+
+                if not zone:
+                    zone = _fallback_zone_from_camera(camera_id)
+
+                if reid_debug:
+                    self._reid_debug_people += 1
+
+                emb = None
+                if self._stable_id_enabled:
                     mgr = getattr(self.pipeline, "stable_id_mgr", None)
-                    if mgr is None:
-                        need_emb = False
-                    else:
+                    if mgr is not None:
+                        need_emb = True
                         needs_fn = getattr(mgr, "needs_embedding", None)
                         if callable(needs_fn):
                             try:
@@ -2175,68 +2174,101 @@ class _AnalyticsTelemetryProcessor:
                                 need_emb = rec is None or rec.get("emb") is None
                             except Exception:
                                 need_emb = True
-                    if need_emb:
-                        emb = self._extract_reid_embedding_ds8(obj_meta)
-                        if reid_debug:
-                            if emb is None:
-                                self._reid_debug_emb_missing += 1
-                            else:
-                                self._reid_debug_emb_found += 1
-                    stable_id = self._maybe_assign_stable_id(
-                        sensor_id=sensor_id,
-                        track_id=track_id,
-                        bbox=track.get("bbox"),
-                        zone=zone,
-                        ts=now_ts,
-                        frame_bgr=None,
-                        embedding=emb,
-                    )
-                    track["stable_id"] = stable_id
-                    self._stamp_osd_label_ds8(obj_meta, sensor_id=sensor_id, stable_id=stable_id)
-                else:
-                    track["stable_id"] = None
+
+                        if need_emb:
+                            emb = self._extract_reid_embedding_ds8(obj_meta)
+                            if reid_debug:
+                                if emb is None:
+                                    self._reid_debug_emb_missing += 1
+                                else:
+                                    self._reid_debug_emb_found += 1
+
+                stable_id = self._maybe_assign_stable_id(
+                    sensor_id=sensor_id,
+                    track_id=track_id,
+                    bbox=raw.get("bbox"),
+                    zone=zone,
+                    ts=now_ts,
+                    frame_bgr=None,
+                    embedding=emb,
+                )
+                if stable_id is None:
+                    # People should always have a stable_id; if we can't produce one, show placeholder.
                     self._stamp_osd_label_ds8(obj_meta, sensor_id=sensor_id, stable_id=None)
+                    continue
+
+                stable_id_int = int(stable_id)
+                present_stable_ids.add(stable_id_int)
+
+                # Stamp OSD label early so mosaic never falls back to tracker IDs.
+                self._stamp_osd_label_ds8(obj_meta, sensor_id=sensor_id, stable_id=stable_id_int)
+                self._apply_instance_mask_color_ds8(obj_meta, stable_id=stable_id_int)
+
+                dwell = self._update_dwell_time(sensor_id, stable_id_int, zone, now_ts)
+
+                analytics = raw.get("analytics")
+                if analytics and "lcStatus" in analytics:
+                    lc = analytics["lcStatus"]
+                    if isinstance(lc, dict):
+                        for line_name, status in lc.items():
+                            if status == 1:
+                                self._record_transition(
+                                    sensor_id=sensor_id,
+                                    stable_id=stable_id_int,
+                                    line_name=line_name,
+                                    ts=now_ts,
+                                )
+
                 if zone:
                     occupancy_counts[zone] = occupancy_counts.get(zone, 0) + 1
-                    logger.debug(f"Track {track_id} in zone {zone}, occupancy now: {occupancy_counts[zone]}")
-                track["frame_id"] = frame_id
-                
-                # Augment track with world coordinates if calibration is available
-                self._augment_track_with_world(sensor_id, camera_id, track)
 
-                tracks.append(track)
-                fp = self._footpoint_from_track(track, frame_dims)
+                public_track: Dict[str, Any] = {
+                    "stable_id": stable_id_int,
+                    "camera_id": camera_id,
+                    "bbox": raw.get("bbox"),
+                    "center": raw.get("center"),
+                    "class_id": 0,
+                    "confidence": raw.get("confidence"),
+                    "tracker_confidence": raw.get("tracker_confidence"),
+                    "analytics": raw.get("analytics"),
+                    "zone": zone,
+                    "frame_id": frame_id,
+                    "dwell_time": dwell,
+                }
+
+                self._augment_track_with_world(sensor_id, camera_id, public_track)
+                tracks.append(public_track)
+
+                fp = self._footpoint_from_track(public_track, frame_dims)
                 if fp is not None:
                     footpoints.append(fp)
 
             self._publish_occupancy(sensor_id, occupancy_counts)
-            self._cleanup_zone_state(sensor_id, present_track_ids)
+            self._cleanup_zone_state(sensor_id, present_stable_ids)
             self._maintain_stable_ids(sensor_id, present_track_ids, now_ts)
             self._active_tracks[sensor_id] = tracks
 
-            if reid_debug:
-                if (now_ts - float(self._reid_debug_last_log)) >= 1.0:
-                    logger.info(
-                        "ReID debug: frames=%d tracks=%d people=%d emb_found=%d emb_missing=%d reid_unique_id=%d layer=%s",
-                        int(self._reid_debug_frames),
-                        int(self._reid_debug_objects),
-                        int(self._reid_debug_people),
-                        int(self._reid_debug_emb_found),
-                        int(self._reid_debug_emb_missing),
-                        int(self._reid_unique_id),
-                        str(self._reid_layer_name),
-                    )
-                    self._reid_debug_last_log = float(now_ts)
-                    self._reid_debug_frames = 0
-                    self._reid_debug_objects = 0
-                    self._reid_debug_people = 0
-                    self._reid_debug_emb_found = 0
-                    self._reid_debug_emb_missing = 0
+            if reid_debug and (now_ts - float(self._reid_debug_last_log)) >= 1.0:
+                logger.info(
+                    "ReID debug: frames=%d tracks=%d people=%d emb_found=%d emb_missing=%d reid_unique_id=%d layer=%s",
+                    int(self._reid_debug_frames),
+                    int(self._reid_debug_objects),
+                    int(self._reid_debug_people),
+                    int(self._reid_debug_emb_found),
+                    int(self._reid_debug_emb_missing),
+                    int(self._reid_unique_id),
+                    str(self._reid_layer_name),
+                )
+                self._reid_debug_last_log = float(now_ts)
+                self._reid_debug_frames = 0
+                self._reid_debug_objects = 0
+                self._reid_debug_people = 0
+                self._reid_debug_emb_found = 0
+                self._reid_debug_emb_missing = 0
 
             if not tracks and os.environ.get("NOESIS_REID_TEST_MODE") == "1":
                 synthetic = {
                     "camera_id": camera_id,
-                    "track_id": 1,
                     "stable_id": 1,
                     "bbox": (0.0, 0.0, 10.0, 10.0),
                     "frame_id": frame_id,
@@ -2244,6 +2276,7 @@ class _AnalyticsTelemetryProcessor:
                     "class_id": 0,
                 }
                 tracks.append(synthetic)
+                present_stable_ids.add(1)
                 present_track_ids.add(1)
 
             if not tracks:
@@ -2276,19 +2309,52 @@ class _AnalyticsTelemetryProcessor:
             frame_id = int(getattr(frame_meta, "frame_num", -1))
             occupancy_counts: Dict[str, int] = {}
             present_track_ids: set[int] = set()
+            present_stable_ids: set[int] = set()
             footpoints: List[Footpoint] = []
             frame_dims = self._frame_dims()
 
             for obj_meta in self._iter_object_meta(frame_meta):
-                track = self._build_track_dict(obj_meta, camera_id)
-                if track is None:
+                raw = self._build_track_dict(obj_meta, camera_id)
+                if raw is None:
                     continue
-                
-                track_id = int(track.get("track_id", -1))
+
+                track_id = int(raw.get("track_id", -1))
+                if track_id < 0:
+                    continue
                 present_track_ids.add(track_id)
 
-                # Handle line crossings from analytics
-                analytics = track.get("analytics")
+                try:
+                    class_id = int(raw.get("class_id", -1))
+                except Exception:
+                    class_id = -1
+                zone = raw.get("zone")
+                if class_id != 0:
+                    self._stamp_osd_label(obj_meta, sensor_id=sensor_id, stable_id=None)
+                    continue
+
+                if not zone:
+                    zone = _fallback_zone_from_camera(camera_id)
+
+                stable_id = self._maybe_assign_stable_id(
+                    sensor_id=sensor_id,
+                    track_id=track_id,
+                    bbox=raw.get("bbox"),
+                    zone=zone,
+                    ts=now_ts,
+                    frame_bgr=None,
+                    embedding=None,
+                )
+                if stable_id is None:
+                    self._stamp_osd_label(obj_meta, sensor_id=sensor_id, stable_id=None)
+                    continue
+
+                stable_id_int = int(stable_id)
+                present_stable_ids.add(stable_id_int)
+
+                self._stamp_osd_label(obj_meta, sensor_id=sensor_id, stable_id=stable_id_int)
+                dwell = self._update_dwell_time(sensor_id, stable_id_int, zone, now_ts)
+
+                analytics = raw.get("analytics")
                 if analytics and "lcStatus" in analytics:
                     lc = analytics["lcStatus"]
                     if isinstance(lc, dict):
@@ -2296,50 +2362,43 @@ class _AnalyticsTelemetryProcessor:
                             if status == 1:
                                 self._record_transition(
                                     sensor_id=sensor_id,
-                                    track_id=track_id,
+                                    stable_id=stable_id_int,
                                     line_name=line_name,
                                     ts=now_ts,
                                 )
 
-                if "stable_id" not in track:
-                    track["stable_id"] = None
-                
-                zone = track.get("zone")
-                dwell = self._update_dwell_time(sensor_id, track_id, zone, now_ts)
-                track["dwell_time"] = dwell
-                stable_id = self._maybe_assign_stable_id(
-                    sensor_id=sensor_id,
-                    track_id=track_id,
-                    bbox=track.get("bbox"),
-                    zone=zone,
-                    ts=now_ts,
-                    frame_bgr=None,
-                    embedding=None,
-                )
-                track["stable_id"] = stable_id
-                self._stamp_osd_label(obj_meta, sensor_id=sensor_id, stable_id=stable_id)
                 if zone:
                     occupancy_counts[zone] = occupancy_counts.get(zone, 0) + 1
-                    logger.debug(f"Track {track_id} in zone {zone}, occupancy now: {occupancy_counts[zone]}")
-                track["frame_id"] = frame_id
-                
-                # Augment track with world coordinates if calibration is available
-                self._augment_track_with_world(sensor_id, camera_id, track)
 
-                tracks.append(track)
-                fp = self._footpoint_from_track(track, frame_dims)
+                public_track: Dict[str, Any] = {
+                    "stable_id": stable_id_int,
+                    "camera_id": camera_id,
+                    "bbox": raw.get("bbox"),
+                    "center": raw.get("center"),
+                    "class_id": 0,
+                    "confidence": raw.get("confidence"),
+                    "tracker_confidence": raw.get("tracker_confidence"),
+                    "analytics": raw.get("analytics"),
+                    "zone": zone,
+                    "frame_id": frame_id,
+                    "dwell_time": dwell,
+                }
+
+                self._augment_track_with_world(sensor_id, camera_id, public_track)
+                tracks.append(public_track)
+
+                fp = self._footpoint_from_track(public_track, frame_dims)
                 if fp is not None:
                     footpoints.append(fp)
 
             self._publish_occupancy(sensor_id, occupancy_counts)
-            self._cleanup_zone_state(sensor_id, present_track_ids)
+            self._cleanup_zone_state(sensor_id, present_stable_ids)
             self._maintain_stable_ids(sensor_id, present_track_ids, now_ts)
             self._active_tracks[sensor_id] = tracks
 
             if not tracks and os.environ.get("NOESIS_REID_TEST_MODE") == "1":
                 synthetic = {
                     "camera_id": camera_id,
-                    "track_id": 1,
                     "stable_id": 1,
                     "bbox": (0.0, 0.0, 10.0, 10.0),
                     "frame_id": frame_id,
@@ -2347,6 +2406,7 @@ class _AnalyticsTelemetryProcessor:
                     "class_id": 0,
                 }
                 tracks.append(synthetic)
+                present_stable_ids.add(1)
                 present_track_ids.add(1)
 
             if not tracks:
@@ -2377,6 +2437,80 @@ class _AnalyticsTelemetryProcessor:
             except Exception:
                 continue
         return 0
+
+    def _ensure_mask_alpha(self) -> float:
+        if self._mask_alpha_ready:
+            return float(self._mask_alpha)
+
+        alpha = 0.35
+        try:
+            vis_cfg = (getattr(self.pipeline, "config", {}) or {}).get("visualization") or {}
+            if isinstance(vis_cfg, Mapping):
+                masks_cfg = vis_cfg.get("instance_masks") or vis_cfg.get("masks") or {}
+                if isinstance(masks_cfg, Mapping):
+                    raw = masks_cfg.get("alpha", masks_cfg.get("mask_alpha", alpha))
+                    if raw is not None:
+                        alpha = float(raw)
+        except Exception:
+            alpha = 0.35
+
+        env = str(os.environ.get("NOESIS_INSTANCE_MASK_ALPHA", "")).strip()
+        if env:
+            try:
+                alpha = float(env)
+            except Exception:
+                pass
+
+        alpha = float(max(0.0, min(1.0, alpha)))
+        self._mask_alpha = alpha
+        self._mask_alpha_ready = True
+        return alpha
+
+    @staticmethod
+    def _stable_id_color_rgb(stable_id: int) -> Tuple[float, float, float]:
+        hue = float((int(stable_id) * 47) % 360)
+        r, g, b = colorsys.hls_to_rgb(hue / 360.0, 0.60, 0.80)
+        return float(r), float(g), float(b)
+
+    def _apply_instance_mask_color_ds8(self, obj_meta: Any, *, stable_id: int) -> None:
+        """Force instance mask color to be stable-id keyed (matches FE hue math)."""
+        rect = getattr(obj_meta, "rect_params", None)
+        if rect is None:
+            return
+        mask_params = getattr(obj_meta, "mask_params", None)
+        if mask_params is None:
+            return
+        try:
+            if getattr(mask_params, "data", None) is None:
+                return
+            size = int(getattr(mask_params, "size", 0) or 0)
+            if size <= 0:
+                return
+        except Exception:
+            return
+
+        alpha = self._ensure_mask_alpha()
+        r, g, b = self._stable_id_color_rgb(int(stable_id))
+
+        try:
+            border = getattr(rect, "border_color", None)
+            if border is not None:
+                setter = getattr(border, "set", None)
+                if callable(setter):
+                    setter(float(r), float(g), float(b), float(alpha))
+                else:
+                    setattr(border, "red", float(r))
+                    setattr(border, "green", float(g))
+                    setattr(border, "blue", float(b))
+                    setattr(border, "alpha", float(alpha))
+        except Exception:
+            pass
+
+        # Ensure masks aren't clipped by box border thickness (bboxes are disabled by default in DS8).
+        try:
+            setattr(rect, "border_width", 0)
+        except Exception:
+            pass
 
     def _frame_dims(self) -> Tuple[int, int]:
         try:
@@ -2439,19 +2573,15 @@ class _AnalyticsTelemetryProcessor:
             v = float(np.clip(v, 0.0, float(frame_h)))
         if frame_w:
             u = float(np.clip(u, 0.0, float(frame_w)))
-        track_id = track.get("track_id")
-        try:
-            track_id = int(track_id)
-        except Exception:
-            pass
+
         stable_id = track.get("stable_id")
         try:
-            stable_id = int(stable_id) if stable_id not in (None, "", -1) else None
+            stable_id_int = int(stable_id) if stable_id not in (None, "", -1) else None
         except Exception:
-            stable_id = None
-        if stable_id is not None and stable_id <= 0:
-            stable_id = None
-        return Footpoint(u=u, v=v, method="bbox", track_id=track_id, stable_id=stable_id)
+            stable_id_int = None
+        if stable_id_int is not None and stable_id_int <= 0:
+            stable_id_int = None
+        return Footpoint(u=u, v=v, method="bbox", stable_id=stable_id_int)
 
     def _frame_timestamp_us(self, frame_meta: Any) -> int:
         pts_ns = int(_meta_lookup(frame_meta, "buf_pts", "buffer_pts", "pts", default=0) or 0)
@@ -2712,6 +2842,31 @@ class _AnalyticsTelemetryProcessor:
             self._analytics_obj_meta_type = None
         return self._analytics_obj_meta_type
 
+    def _fallback_stable_id(self, sensor_id: int, track_id: int, ts: float) -> int:
+        """Allocate a stable_id when the real StableIDManager is unavailable/unhealthy.
+
+        This keeps user-facing payloads free of raw tracker IDs while ensuring every
+        visible person always has a numeric stable_id.
+        """
+        key = (int(sensor_id), int(track_id))
+        sid = self._fallback_sid_by_key.get(key)
+        if sid is None:
+            # Try to start after any already-allocated StableIDManager range to reduce
+            # collisions if we fallback mid-run.
+            if self._fallback_sid_next <= 1:
+                mgr = getattr(self.pipeline, "stable_id_mgr", None)
+                next_sid = getattr(mgr, "next_stable_id", None) if mgr is not None else None
+                if next_sid is not None:
+                    try:
+                        self._fallback_sid_next = max(int(self._fallback_sid_next), int(next_sid))
+                    except Exception:
+                        pass
+            sid = int(self._fallback_sid_next)
+            self._fallback_sid_next = int(self._fallback_sid_next) + 1
+            self._fallback_sid_by_key[key] = sid
+        self._fallback_sid_last_seen[key] = float(ts)
+        return int(sid)
+
     def _maybe_assign_stable_id(
         self,
         *,
@@ -2723,11 +2878,12 @@ class _AnalyticsTelemetryProcessor:
         frame_bgr: Optional[np.ndarray],
         embedding: Optional[np.ndarray] = None,
     ) -> Optional[int]:
-        """Bridge to StableIDManager if present on the pipeline."""
-        if track_id < 0 or not self._stable_id_enabled:
-            return None
-        mgr = getattr(self.pipeline, "stable_id_mgr", None)
-        if mgr is None:
+        """Return a positive stable_id for a tracked person.
+
+        Prefers StableIDManager (ReID) when healthy; falls back to an internal
+        allocator so user-facing IDs never expose raw tracker IDs.
+        """
+        if track_id < 0:
             return None
         if bbox is None or len(bbox) < 4:
             return None
@@ -2743,27 +2899,26 @@ class _AnalyticsTelemetryProcessor:
                 )
             except Exception:
                 safe_bbox = bbox
-        try:
-            stable_id = mgr.update(
-                sensor_id=int(sensor_id),
-                ds_obj_id=int(track_id),
-                bbox_ltrbwh=(float(safe_bbox[0]), float(safe_bbox[1]), float(safe_bbox[2]), float(safe_bbox[3])),
-                ts=float(ts),
-                zone=str(zone) if zone else None,
-                frame_bgr=frame_bgr,
-                embedding=embedding,
-            )
+        mgr = getattr(self.pipeline, "stable_id_mgr", None)
+        if self._stable_id_enabled and mgr is not None:
             try:
+                stable_id = mgr.update(
+                    sensor_id=int(sensor_id),
+                    ds_obj_id=int(track_id),
+                    bbox_ltrbwh=(float(safe_bbox[0]), float(safe_bbox[1]), float(safe_bbox[2]), float(safe_bbox[3])),
+                    ts=float(ts),
+                    zone=str(zone) if zone else None,
+                    frame_bgr=frame_bgr,
+                    embedding=embedding,
+                )
                 stable_id_int = int(stable_id)
+                if stable_id_int > 0:
+                    return stable_id_int
             except Exception:
-                return None
-            if stable_id_int <= 0:
-                return None
-            return stable_id_int
-        except Exception:
-            logger.exception("StableIDManager update failed for sensor %s track %s", sensor_id, track_id)
-            self._stable_id_enabled = False
-            return None
+                logger.exception("StableIDManager update failed for sensor %s track %s", sensor_id, track_id)
+                self._stable_id_enabled = False
+
+        return self._fallback_stable_id(sensor_id, track_id, float(ts))
 
     def _reid_crop_from_track(
         self,
@@ -2813,72 +2968,97 @@ class _AnalyticsTelemetryProcessor:
         present_track_ids: Iterable[int],
         ts: float,
     ) -> None:
-        """Clean up missing tracks and ghosts on the StableIDManager."""
+        """Maintain StableIDManager state and prune fallback IDs."""
+        now_ts = float(ts)
+        sensor_id_int = int(sensor_id)
+        present_set = {int(tid) for tid in present_track_ids}
+
         mgr = getattr(self.pipeline, "stable_id_mgr", None)
-        if mgr is None:
-            return
+        if self._stable_id_enabled and mgr is not None:
+            try:
+                mgr.remove_missing_tracks(sensor_id_int, list(present_set), now_ts)
+                mgr.prune_ghosts(now_ts)
+            except Exception:
+                logger.exception("StableIDManager maintenance failed for sensor %s", sensor_id_int)
+                self._stable_id_enabled = False
+
+        # Maintain fallback stable IDs so they don't leak forever when the real ReID manager
+        # is unavailable or returns invalid IDs.
         try:
-            mgr.remove_missing_tracks(int(sensor_id), list(present_track_ids), float(ts))
-            mgr.prune_ghosts(float(ts))
+            ttl_s = float(os.environ.get("NOESIS_FALLBACK_STABLE_ID_TTL_S", "15.0") or 15.0)
         except Exception:
-            logger.exception("StableIDManager maintenance failed for sensor %s", sensor_id)
-            self._stable_id_enabled = False
+            ttl_s = 15.0
+        ttl_s = max(0.0, ttl_s)
+
+        if not self._fallback_sid_by_key:
+            return
+
+        for key in list(self._fallback_sid_by_key.keys()):
+            key_sensor, key_track = key
+            if int(key_sensor) != sensor_id_int:
+                continue
+            if int(key_track) in present_set:
+                continue
+            last_seen = float(self._fallback_sid_last_seen.get(key, 0.0) or 0.0)
+            if ttl_s <= 0.0 or (now_ts - last_seen) >= ttl_s:
+                self._fallback_sid_by_key.pop(key, None)
+                self._fallback_sid_last_seen.pop(key, None)
 
     def _update_dwell_time(
         self,
         sensor_id: int,
-        track_id: int,
+        stable_id: int,
         zone: Optional[str],
         now_ts: float,
     ) -> Optional[float]:
         """Maintain per-track zone entry time to compute dwell seconds."""
-        if track_id < 0:
+        if stable_id <= 0:
             return None
-        state = self._zone_state.setdefault(sensor_id, {})
-        entry = state.get(track_id, {})
+        state = self._zone_state.setdefault(int(sensor_id), {})
+        entry = state.get(int(stable_id), {})
         current_zone = entry.get("zone")
         entry_time = entry.get("entry")
 
         if not zone:
-            state[track_id] = {"zone": None, "entry": None}
+            state[int(stable_id)] = {"zone": None, "entry": None}
             return None
 
         if current_zone == zone:
             if entry_time is None:
-                entry_time = now_ts
-            state[track_id] = {"zone": zone, "entry": entry_time}
-            return max(0.0, now_ts - float(entry_time))
+                entry_time = float(now_ts)
+            state[int(stable_id)] = {"zone": zone, "entry": float(entry_time)}
+            return max(0.0, float(now_ts) - float(entry_time))
 
-        # Zone change detected
-        if current_zone and zone and current_zone != zone:
+        # Zone change detected.
+        if current_zone and current_zone != zone:
             self._record_transition(
-                sensor_id=sensor_id,
-                track_id=track_id,
-                from_zone=current_zone,
-                to_zone=zone,
-                ts=now_ts,
+                sensor_id=int(sensor_id),
+                stable_id=int(stable_id),
+                from_zone=str(current_zone),
+                to_zone=str(zone),
+                ts=float(now_ts),
             )
 
-        state[track_id] = {"zone": zone, "entry": now_ts}
+        state[int(stable_id)] = {"zone": zone, "entry": float(now_ts)}
         return 0.0
 
     def _record_transition(
         self,
         sensor_id: int,
-        track_id: int,
+        stable_id: int,
         ts: float,
         from_zone: Optional[str] = None,
         to_zone: Optional[str] = None,
         line_name: Optional[str] = None,
     ) -> None:
         """Store a zone transition or line crossing event."""
-        trans_list = self._transitions_state.setdefault(sensor_id, [])
-        camera_id = self.camera_labels.get(sensor_id, f"camera_{sensor_id}")
-        
+        trans_list = self._transitions_state.setdefault(int(sensor_id), [])
+        camera_id = self.camera_labels.get(int(sensor_id), f"camera_{int(sensor_id)}")
+
         event: Dict[str, Any] = {
-            "track_id": track_id,
-            "camera_id": camera_id,
-            "timestamp": ts,
+            "stable_id": int(stable_id),
+            "camera_id": str(camera_id),
+            "timestamp": float(ts),
         }
         if from_zone and to_zone:
             event["from_zone"] = from_zone
@@ -2889,18 +3069,17 @@ class _AnalyticsTelemetryProcessor:
             return
 
         trans_list.append(event)
-        # Keep buffer bounded (last 100 events per sensor)
         if len(trans_list) > 100:
-            self._transitions_state[sensor_id] = trans_list[-100:]
+            self._transitions_state[int(sensor_id)] = trans_list[-100:]
 
-    def _cleanup_zone_state(self, sensor_id: int, active_track_ids: set[int]) -> None:
-        """Remove stale zone entries for tracks no longer present."""
-        state = self._zone_state.get(sensor_id)
+    def _cleanup_zone_state(self, sensor_id: int, active_stable_ids: set[int]) -> None:
+        """Remove stale zone entries for stable IDs no longer present."""
+        state = self._zone_state.get(int(sensor_id))
         if not state:
             return
-        for tid in list(state.keys()):
-            if tid not in active_track_ids:
-                state.pop(tid, None)
+        for sid in list(state.keys()):
+            if int(sid) not in active_stable_ids:
+                state.pop(sid, None)
 
     def _publish_occupancy(self, sensor_id: int, occupancy_counts: Mapping[str, int]) -> None:
         logger.debug(f"DS8 occupancy counts for sensor {sensor_id}: {dict(occupancy_counts)}")
@@ -3689,6 +3868,23 @@ def _primary_zone_from_analytics(analytics_meta: Mapping[str, Any]) -> Optional[
         if label:
             return label
     return None
+
+
+def _fallback_zone_from_camera(camera_id: Any) -> Optional[str]:
+    """Fallback for Zone/Dwell/Occupancy when nvdsanalytics ROI labels are absent.
+
+    Treat each camera/stream as its own room so UI occupancy and dwell timers remain useful
+    even when the analytics config does not emit per-object `roiStatus`.
+    """
+    try:
+        value = str(camera_id).strip()
+    except Exception:
+        return None
+    if not value:
+        return None
+    value = value.replace("_", " ").replace("-", " ")
+    value = " ".join(value.split())
+    return value.title()
 
 
 # Type checking imports (avoids circular at runtime)

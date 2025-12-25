@@ -110,8 +110,18 @@ function Dashboard() {
   const [occupancy, setOccupancy] = useState<string>('');
   const [trackDetailsHtml, setTrackDetailsHtml] = useState<string>('');
   // Transitions removed from UI
-  const [tracksByCamera, setTracksByCamera] = useState<Record<string, Array<{ track_id: number; stable_id?: number | null; camera_id: string; zone?: string; center?: [number, number]; dwell_time?: number; velocity?: [number, number] }>>>({});
-  const [tracksByCamKey, setTracksByCamKey] = useState<Record<CameraKey, Array<{ track_id: number; stable_id?: number | null; camera_id: string }>>>({ 'living-room': [], 'kitchen': [], 'family-room': [] });
+  type ActiveTrack = {
+    stable_id: number;
+    camera_id: string;
+    zone?: string;
+    center?: [number, number];
+    dwell_time?: number;
+    velocity?: [number, number];
+    world?: [number, number, number];
+    world_valid?: boolean;
+  };
+  const [tracksByCamera, setTracksByCamera] = useState<Record<string, ActiveTrack[]>>({});
+  const [tracksByCamKey, setTracksByCamKey] = useState<Record<CameraKey, ActiveTrack[]>>({ 'living-room': [], 'kitchen': [], 'family-room': [] });
   const [occByCamKey, setOccByCamKey] = useState<Record<CameraKey, Record<string, number>>>({ 'living-room': {}, 'kitchen': {}, 'family-room': {} });
   // Vacancy timer state
   const [vacancyText, setVacancyText] = useState<Record<CameraKey, string>>({ 'living-room': '', 'kitchen': '', 'family-room': '' });
@@ -217,17 +227,14 @@ function Dashboard() {
         allTracks = allTracks.concat(track!.active_tracks);
         // trails
         if (trailEnabled) {
-          for (const t of track!.active_tracks) {
+          for (const t of track!.active_tracks as ActiveTrack[]) {
             const key = camKey as CameraKey;
-            const trackKey = identityKeyForPerson(key, null, t.track_id);
-            const hasStableId = typeof t.stable_id === 'number' && Number.isFinite(t.stable_id) && t.stable_id > 0;
-            const stableKey = hasStableId ? identityKeyForPerson(key, t.stable_id, t.track_id) : null;
-            const activeKey = stableKey ?? trackKey;
-            const colorId = colorIdForPerson(key, t.stable_id, t.track_id);
+            const stableId = Number(t.stable_id);
+            if (!Number.isFinite(stableId) || stableId <= 0) continue;
+            const activeKey = identityKeyForPerson(key, stableId);
+            const colorId = colorIdForPerson(key, stableId);
 
-            if (stableKey && prevActiveRef.current[key]?.has(trackKey) && !prevActiveRef.current[key]?.has(stableKey)) {
-              trailStoreRef.current.migrate(key, trackKey, stableKey, colorId);
-            } else if (!prevActiveRef.current[key]?.has(activeKey)) {
+            if (!prevActiveRef.current[key]?.has(activeKey)) {
               trailStoreRef.current.pushBreak(key, activeKey, colorId);
             }
             // Prefer camera-local space for kitchen when provided (x_cam,z_cam → canvas x,y)
@@ -326,8 +333,7 @@ function Dashboard() {
     if (allTracks.length) {
       const findCamForTrack = (track: any): CameraKey | undefined => {
         const keyFromTrack = resolveDisplayCameraKey(String(track.camera_id || ''));
-        if (keyFromTrack) return keyFromTrack;
-        return (Object.keys(perKeyTracks) as CameraKey[]).find(k => perKeyTracks[k]?.some(tt => tt.track_id === track.track_id));
+        return keyFromTrack ?? undefined;
       };
 
       const metricForTrack = (track: any): { x: number; y: number } | null => {
@@ -335,7 +341,7 @@ function Dashboard() {
         if (!camKey) return null;
         const meta = bevMetaRef.current[camKey];
         if (!meta?.footpoints) return null;
-        const fp = (meta.footpoints as any[]).find((p) => Number(p.trackId) === Number(track.track_id));
+        const fp = (meta.footpoints as any[]).find((p) => Number(p.stableId) === Number(track.stable_id));
         if (!fp) return null;
         const mx = Number(fp.x);
         const mz = Number(fp.y);
@@ -343,19 +349,19 @@ function Dashboard() {
         return { x: mx, y: mz };
       };
 
-      allTracks.sort((a, b) => (Number((a.stable_id ?? a.track_id) || 0)) - (Number((b.stable_id ?? b.track_id) || 0))).forEach(t => {
+      allTracks.sort((a, b) => Number(a.stable_id || 0) - Number(b.stable_id || 0)).forEach(t => {
         const dwell = t.dwell_time?.toFixed(1) ?? '0.0';
         const center = t.center || ['N/A', 'N/A'];
         const vel = t.velocity || [0, 0];
         const speed = Math.sqrt(vel[0] ** 2 + vel[1] ** 2).toFixed(1);
         const camKey = findCamForTrack(t);
         const dotColor = camKey
-          ? colorForTrack(colorIdForPerson(camKey, t.stable_id, t.track_id))
-          : colorForTrack(Number((t.stable_id ?? t.track_id) || 0));
+          ? colorForTrack(colorIdForPerson(camKey, t.stable_id))
+          : colorForTrack(Number(t.stable_id || 0));
         const metric = metricForTrack(t);
 
         const metricText = metric ? `[${metric.x.toFixed(2)} m, ${metric.y.toFixed(2)} m]` : 'N/A';
-        tracksHtml += `<div><strong><span class="dot" style="display:inline-block;width:10px;height:10px;border-radius:50%;background:${dotColor};margin-right:6px;vertical-align:middle;"></span>SID ${t.stable_id ?? t.track_id ?? 'N/A'}:</strong><br/>Zone: ${t.zone || '-'}, Dwell: <span style="display:inline-block; min-width:4ch; text-align:right;">${dwell}</span>s<br/>Metric (BEV): ${metricText}<br/>Pixel Pos: [${(typeof center[0] === 'number' ? Number(center[0]).toFixed(3) : center[0])}, ${(typeof center[1] === 'number' ? Number(center[1]).toFixed(3) : center[1])}], Speed: <span style="display:inline-block; min-width:4ch; text-align:right;">${speed}</span> px/s</div>`;
+        tracksHtml += `<div><strong><span class="dot" style="display:inline-block;width:10px;height:10px;border-radius:50%;background:${dotColor};margin-right:6px;vertical-align:middle;"></span>SID ${t.stable_id ?? 'N/A'}:</strong><br/>Zone: ${t.zone || '-'}, Dwell: <span style="display:inline-block; min-width:4ch; text-align:right;">${dwell}</span>s<br/>Metric (BEV): ${metricText}<br/>Pixel Pos: [${(typeof center[0] === 'number' ? Number(center[0]).toFixed(3) : center[0])}, ${(typeof center[1] === 'number' ? Number(center[1]).toFixed(3) : center[1])}], Speed: <span style="display:inline-block; min-width:4ch; text-align:right;">${speed}</span> px/s</div>`;
       });
     } else {
       tracksHtml = '<span>No active tracks.</span>';

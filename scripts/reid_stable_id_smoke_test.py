@@ -38,15 +38,19 @@ async def _collect_tracking(uri: str, duration: float = 10.0) -> dict:
                 continue
             tracks = payload.get("tracks") or []
             for track in tracks:
-                tid = track.get("track_id")
                 sid = track.get("stable_id")
-                if tid is None:
+                cam = track.get("camera_id")
+                if sid is None:
                     continue
-                tid_key = str(tid)
-                seen.setdefault(tid_key, {})
-                seen[tid_key][sid] = seen[tid_key].get(sid, 0) + 1
-                if sid is not None:
-                    non_null.add(tid_key)
+                try:
+                    sid_int = int(sid)
+                except Exception:
+                    continue
+                if sid_int <= 0:
+                    continue
+                key = f"{cam}:{sid_int}" if cam else str(sid_int)
+                seen[key] = seen.get(key, 0) + 1
+                non_null.add(key)
         return {"seen": seen, "non_null": non_null}
 
 
@@ -115,19 +119,10 @@ def main() -> int:
         if not result["non_null"]:
             print("[FAIL] no stable_id values observed")
             return 1
-        for tid, sid_counts in result["seen"].items():
-            for sid, count in sid_counts.items():
-                if sid is None:
-                    continue
-                try:
-                    sid_int = int(sid)
-                except Exception:
-                    continue
-                if sid_int <= 0:
-                    continue
-                if count >= 2:
-                    print(f"[PASS] stable_id {sid} persisted across frames for track {tid}")
-                    return 0
+        for key, count in result["seen"].items():
+            if count >= 2:
+                print(f"[PASS] stable_id persisted across frames for {key}")
+                return 0
         print("[FAIL] stable_id did not persist across frames")
         return 1
     finally:

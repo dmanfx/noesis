@@ -18,6 +18,7 @@ export type FloorplanLike = {
   bounds?: FloorplanBounds;
   height?: GridLayer;
   density?: GridLayer;
+  gradient?: GridLayer;
 };
 
 export type ObstacleBox = {

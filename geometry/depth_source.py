@@ -20,6 +20,7 @@ from concurrent.futures import Future
 import cv2
 import numpy as np
 import requests
+import scipy.ndimage as ndi
 import zarr
 
 from adapters.mapanything_adapter import ViewBuildResult, build_mono_view
@@ -797,7 +798,7 @@ class DepthStorageManager:
         self,
         camera_id: str,
         max_age_sec: float = 60.0,
-        grid_res_m: float = 0.5,
+        grid_res_m: float = 0.15,
         max_extent_m: float = 20.0,
         cache_only: bool = False,
     ) -> Dict[str, Any]:
@@ -917,12 +918,12 @@ class DepthStorageManager:
         if not all(np.isfinite([fx, fy, cx, cy])) or fx == 0.0 or fy == 0.0:
             return {'error': 'invalid_intrinsics', 'camera_id': camera_id, 'ts': now_us}
 
+        # PERMISSIVE validity: only reject truly invalid depth values
+        # Do NOT hard-filter by mask or confidence - use them as soft weights instead
         valid = np.isfinite(depth)
         valid &= depth > 0.1
         valid &= depth < 50.0
-        valid &= mask
-        if np.isfinite(self.min_conf):
-            valid &= conf >= float(self.min_conf)
+        # Note: mask and conf are used as weights below, not hard filters
 
         if not np.any(valid):
             grid = np.zeros((1, 1), dtype=np.float32)
@@ -962,6 +963,19 @@ class DepthStorageManager:
                 while len(self._floorplan_cache) > self._max_floorplan_cache_entries:
                     self._floorplan_cache.popitem(last=False)
             return payload
+
+        # Extract confidence values for valid points - use as weights, not filter
+        # Combine mask (as 0/1) and conf into a single weight
+        # Points inside mask with high conf get weight ~1.0
+        # Points outside mask or low conf get lower weights but still contribute
+        # Soften the mask: give masked-out points a small weight (0.15) instead of 0
+        soft_mask = np.where(mask, 1.0, 0.15).astype(np.float32)
+        # Clamp confidence to [0.05, 1.0] to avoid zero weights
+        conf_clamped = np.clip(conf, 0.05, 1.0)
+        # Combined weight = soft_mask * confidence
+        combined_weight = soft_mask * conf_clamped
+        # Extract weights for valid points
+        pts_weight = combined_weight[valid].astype(np.float32)
 
         h_img, w_img = depth.shape
         grid_u, grid_v = np.meshgrid(
@@ -1044,16 +1058,39 @@ class DepthStorageManager:
         distance_count = np.zeros((h_px, w_px), dtype=np.uint32)
         height_grid = np.full((h_px, w_px), -np.inf, dtype=np.float32)
 
+        # Confidence-weighted height aggregation
+        weighted_height_sum = np.zeros((h_px, w_px), dtype=np.float64)
+        weight_sum = np.zeros((h_px, w_px), dtype=np.float64)
+
         indices = (z_idx, x_idx)
+        # Density: count of points (unweighted for backward compat)
         np.add.at(density_grid, indices, 1.0)
-        np.add.at(distance_sum, indices, pts_depth.astype(np.float32, copy=False))
+        # Distance: weighted by confidence
+        np.add.at(distance_sum, indices, (pts_depth * pts_weight).astype(np.float32, copy=False))
         np.add.at(distance_count, indices, 1)
+        # Height: accumulate weighted sum and weights for weighted mean
+        np.add.at(weighted_height_sum, indices, (pts_y * pts_weight).astype(np.float64))
+        np.add.at(weight_sum, indices, pts_weight.astype(np.float64))
+        # Also track max height (still useful for some visualizations)
         np.maximum.at(height_grid, indices, np.asarray(pts_y, dtype=np.float32))
 
+        # Compute confidence-weighted mean height
+        # Use weighted mean where we have weights, otherwise fall back to max
+        has_weight = weight_sum > 1e-9
+        weighted_mean_height = np.where(
+            has_weight,
+            weighted_height_sum / weight_sum,
+            height_grid
+        ).astype(np.float32)
+
+        # For cells with no points at all, mark as NaN
         empty_cells = height_grid == -np.inf
         if np.any(empty_cells):
-            height_grid = height_grid.astype(np.float32, copy=False)
+            weighted_mean_height[empty_cells] = np.nan
             height_grid[empty_cells] = np.nan
+
+        # Use weighted mean as the primary height grid (preserves detail better than max)
+        height_grid = weighted_mean_height
 
         density_max = float(np.max(density_grid)) if density_grid.size else 0.0
         if density_max > 0.0:
@@ -1071,6 +1108,41 @@ class DepthStorageManager:
             height_grid = height_grid - height_min
             height_min = 0.0
             height_max = float(np.max(height_grid)) if height_grid.size else 0.0
+
+        # Compute height gradient magnitude for edge detection
+        # First, fill empty/NaN cells with floor level so boundaries don't create false edges
+        height_for_gradient = height_grid.copy()
+        floor_level = float(np.nanmin(height_grid)) if np.any(np.isfinite(height_grid)) else 0.0
+        height_for_gradient = np.nan_to_num(
+            height_for_gradient,
+            nan=floor_level,
+            posinf=floor_level,
+            neginf=floor_level,
+        )
+
+        # Also mask cells with zero density (no points) to floor level
+        if density_grid is not None:
+            empty_mask = density_grid < 1e-6
+            height_for_gradient[empty_mask] = floor_level
+
+        # Sobel filters capture directional derivatives
+        gx = ndi.sobel(height_for_gradient, axis=1, mode='nearest')
+        gz = ndi.sobel(height_for_gradient, axis=0, mode='nearest')
+        gradient_mag = np.sqrt(gx ** 2 + gz ** 2)
+
+        # Use 95th percentile normalization to prevent outliers from dominating
+        gradient_flat = gradient_mag[np.isfinite(gradient_mag)]
+        if gradient_flat.size > 0:
+            gradient_p95 = float(np.percentile(gradient_flat, 95))
+            if gradient_p95 > 1e-6:
+                gradient_grid = np.clip(gradient_mag / gradient_p95, 0.0, 1.0).astype(np.float32)
+            else:
+                gradient_grid = np.zeros_like(height_grid, dtype=np.float32)
+        else:
+            gradient_grid = np.zeros_like(height_grid, dtype=np.float32)
+
+        # Clean up any remaining NaN
+        gradient_grid = np.nan_to_num(gradient_grid, nan=0.0, posinf=0.0, neginf=0.0)
 
         distance_grid = np.zeros((h_px, w_px), dtype=np.float32)
         nonzero_mask = distance_count > 0
@@ -1113,6 +1185,12 @@ class DepthStorageManager:
                 'grid_shape': [int(h_px), int(w_px)],
                 'value_min': float(min_distance),
                 'value_max': float(max_distance),
+            },
+            'gradient': {
+                'grid_b64': base64.b64encode(gradient_grid.astype(np.float32, copy=False).ravel().tobytes()).decode('ascii'),
+                'grid_shape': [int(h_px), int(w_px)],
+                'value_min': 0.0,
+                'value_max': 1.0,
             },
         }
         payload['served_from_cache'] = False
@@ -1806,15 +1884,27 @@ class MapAnythingDepthSource:
         if not all(np.isfinite([fx, fy, cx, cy])) or fx == 0.0 or fy == 0.0:
             return {'error': 'invalid_intrinsics', 'camera_id': camera_id, 'ts': now_us}
 
+        # PERMISSIVE validity: only reject truly invalid depth values
+        # Do NOT hard-filter by mask or confidence - use them as soft weights instead
         valid = np.isfinite(depth)
         valid &= depth > 0.1
         valid &= depth < 50.0
-        valid &= mask
-        if np.isfinite(self.min_conf):
-            valid &= conf >= float(self.min_conf)
+        # Note: mask and conf are used as weights below, not hard filters
 
         if not np.any(valid):
             return {'error': 'no_points', 'camera_id': camera_id, 'ts': now_us, 'point_count': 0}
+
+        # Extract confidence values for valid points - use as weights, not filter
+        # Combine mask (as 0/1) and conf into a single weight
+        # Points inside mask with high conf get weight ~1.0
+        # Points outside mask or low conf get lower weights but still contribute
+        soft_mask = np.where(mask, 1.0, 0.15).astype(np.float32)
+        # Clamp confidence to [0.05, 1.0] to avoid zero weights
+        conf_clamped = np.clip(conf, 0.05, 1.0)
+        # Combined weight = soft_mask * confidence
+        combined_weight = soft_mask * conf_clamped
+        # Extract weights for valid points
+        pts_weight = combined_weight[valid].astype(np.float32)
 
         h_img, w_img = depth.shape
         grid_u, grid_v = np.meshgrid(
@@ -1897,17 +1987,39 @@ class MapAnythingDepthSource:
         distance_count = np.zeros((h_px, w_px), dtype=np.uint32)
         height_grid = np.full((h_px, w_px), -np.inf, dtype=np.float32)
 
+        # Confidence-weighted height aggregation
+        weighted_height_sum = np.zeros((h_px, w_px), dtype=np.float64)
+        weight_sum = np.zeros((h_px, w_px), dtype=np.float64)
+
         indices = (z_idx, x_idx)
+        # Density: count of points (unweighted for backward compat)
         np.add.at(density_grid, indices, 1.0)
-        np.add.at(distance_sum, indices, pts_depth.astype(np.float32, copy=False))
+        # Distance: weighted by confidence
+        np.add.at(distance_sum, indices, (pts_depth * pts_weight).astype(np.float32, copy=False))
         np.add.at(distance_count, indices, 1)
+        # Height: accumulate weighted sum and weights for weighted mean
+        np.add.at(weighted_height_sum, indices, (pts_y * pts_weight).astype(np.float64))
+        np.add.at(weight_sum, indices, pts_weight.astype(np.float64))
+        # Also track max height (still useful for some visualizations)
         np.maximum.at(height_grid, indices, np.asarray(pts_y, dtype=np.float32))
 
-        # Restore NaNs for empty cells after vectorised max accumulation
+        # Compute confidence-weighted mean height
+        # Use weighted mean where we have weights, otherwise fall back to max
+        has_weight = weight_sum > 1e-9
+        weighted_mean_height = np.where(
+            has_weight,
+            weighted_height_sum / weight_sum,
+            height_grid
+        ).astype(np.float32)
+
+        # For cells with no points at all, mark as NaN
         empty_cells = height_grid == -np.inf
         if np.any(empty_cells):
-            height_grid = height_grid.astype(np.float32, copy=False)
+            weighted_mean_height[empty_cells] = np.nan
             height_grid[empty_cells] = np.nan
+
+        # Use weighted mean as the primary height grid (preserves detail better than max)
+        height_grid = weighted_mean_height
 
         density_max = float(np.max(density_grid)) if density_grid.size else 0.0
         if density_max > 0.0:
@@ -1925,6 +2037,41 @@ class MapAnythingDepthSource:
             height_grid = height_grid - height_min
             height_min = 0.0
             height_max = float(np.max(height_grid)) if height_grid.size else 0.0
+
+        # Compute height gradient magnitude for edge detection
+        # First, fill empty/NaN cells with floor level so boundaries don't create false edges
+        height_for_gradient = height_grid.copy()
+        floor_level = float(np.nanmin(height_grid)) if np.any(np.isfinite(height_grid)) else 0.0
+        height_for_gradient = np.nan_to_num(
+            height_for_gradient,
+            nan=floor_level,
+            posinf=floor_level,
+            neginf=floor_level,
+        )
+
+        # Also mask cells with zero density (no points) to floor level
+        if density_grid is not None:
+            empty_mask = density_grid < 1e-6
+            height_for_gradient[empty_mask] = floor_level
+
+        # Sobel filters capture directional derivatives
+        gx = ndi.sobel(height_for_gradient, axis=1, mode='nearest')
+        gz = ndi.sobel(height_for_gradient, axis=0, mode='nearest')
+        gradient_mag = np.sqrt(gx ** 2 + gz ** 2)
+
+        # Use 95th percentile normalization to prevent outliers from dominating
+        gradient_flat = gradient_mag[np.isfinite(gradient_mag)]
+        if gradient_flat.size > 0:
+            gradient_p95 = float(np.percentile(gradient_flat, 95))
+            if gradient_p95 > 1e-6:
+                gradient_grid = np.clip(gradient_mag / gradient_p95, 0.0, 1.0).astype(np.float32)
+            else:
+                gradient_grid = np.zeros_like(height_grid, dtype=np.float32)
+        else:
+            gradient_grid = np.zeros_like(height_grid, dtype=np.float32)
+
+        # Clean up any remaining NaN
+        gradient_grid = np.nan_to_num(gradient_grid, nan=0.0, posinf=0.0, neginf=0.0)
 
         distance_grid = np.zeros((h_px, w_px), dtype=np.float32)
         nonzero_mask = distance_count > 0
@@ -1967,6 +2114,12 @@ class MapAnythingDepthSource:
                 'grid_shape': [int(h_px), int(w_px)],
                 'value_min': float(min_distance),
                 'value_max': float(max_distance),
+            },
+            'gradient': {
+                'grid_b64': base64.b64encode(gradient_grid.astype(np.float32, copy=False).ravel().tobytes()).decode('ascii'),
+                'grid_shape': [int(h_px), int(w_px)],
+                'value_min': 0.0,
+                'value_max': 1.0,
             },
         }
         payload['served_from_cache'] = False

@@ -55,6 +55,7 @@ export type FloorplanResponse = {
   density?: FloorplanLayer;
   height?: FloorplanLayer;
   distance?: FloorplanLayer;
+  gradient?: FloorplanLayer;
 };
 
 type FloorplanRequestOptions = {

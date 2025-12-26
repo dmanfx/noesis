@@ -21,7 +21,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from calibration_bundle import assemble_calibration_bundle, load_alignment, load_extrinsics, load_intrinsics
+from calibration_bundle import assemble_calibration_bundle, load_alignment, load_extrinsics, load_intrinsics, save_extrinsics
 from geometry.depth_source import DepthStorageManager
 from mapanything_config import load_service_config
 from noesis.pipelines import ds8_pipeline, hooks
@@ -231,7 +231,8 @@ class _CalibrationProvider:
         self._loader = CameraConfigLoader(cameras_path)
         self._intrinsics_models = load_intrinsics(str(REPO_ROOT / "intrinsics.json"))
         self._align = load_alignment(str(REPO_ROOT / "config" / "ply_alignment.json"))
-        self._extrinsics = load_extrinsics(str(REPO_ROOT / "config" / "camera_calibration.json"))
+        self._extrinsics_path = REPO_ROOT / "config" / "camera_calibration.json"
+        self._extrinsics = load_extrinsics(str(self._extrinsics_path))
         try:
             from config import config as legacy_config  # type: ignore
 
@@ -254,6 +255,11 @@ class _CalibrationProvider:
 
     def set_camera_labels(self, labels: Dict[int, str]) -> None:
         self._camera_labels = dict(labels or {})
+        self._bundle_cache = None
+
+    def reload_extrinsics(self) -> None:
+        """Reload extrinsics from camera_calibration.json without touching alignment."""
+        self._extrinsics = load_extrinsics(str(self._extrinsics_path))
         self._bundle_cache = None
 
     def snapshot(self, source_id: int, camera_id: str) -> Optional["CalibrationSnapshot"]:
@@ -1619,6 +1625,155 @@ def main() -> int:
 
     camera_labels = _load_camera_labels(cameras_path)
     storage_manager = _build_storage_manager(args)
+    auto_calibrate_lock = threading.Lock()
+
+    def _resolve_auto_calibrate_cameras(camera_id: Optional[str]) -> list[str]:
+        if camera_id is None or not str(camera_id).strip():
+            ordered = [
+                name
+                for _, name in sorted(camera_labels.items(), key=lambda item: int(item[0]))
+                if isinstance(name, str)
+            ]
+            seen: set[str] = set()
+            cameras: list[str] = []
+            for name in ordered:
+                if name in seen:
+                    continue
+                cameras.append(name)
+                seen.add(name)
+            return cameras
+
+        request_camera = str(camera_id).strip()
+        canonical_camera = request_camera
+        try:
+            cam_idx = int(request_camera)
+        except Exception:
+            cam_idx = None
+        if cam_idx is not None and cam_idx in camera_labels:
+            canonical_camera = camera_labels[cam_idx]
+        else:
+            reverse_labels = {v: k for k, v in camera_labels.items()}
+            if canonical_camera in reverse_labels:
+                canonical_camera = request_camera
+        return [canonical_camera]
+
+    def _read_latest_depth_ts(camera_id: str) -> int:
+        if storage_manager is None:
+            return 0
+        try:
+            payload = storage_manager.load_latest_depth(camera_id, None)
+        except Exception:
+            return 0
+        if not isinstance(payload, dict):
+            return 0
+        try:
+            return int(payload.get("ts", 0) or 0)
+        except Exception:
+            return 0
+
+    def _ds8_auto_calibrate_handler(camera_id: Optional[str] = None) -> Dict[str, Any]:
+        if not auto_calibrate_lock.acquire(blocking=False):
+            return {"ok": False, "results": [], "updated": [], "error": "busy"}
+        try:
+            if not pipeline.activated:
+                return {"ok": False, "results": [], "updated": [], "error": "pipeline_not_running"}
+            if storage_manager is None:
+                return {"ok": False, "results": [], "updated": [], "error": "depth_source_unavailable"}
+            depth_branch_present = bool(
+                pipeline.depth_gate_attach and pipeline.depth_gate_attach in pipeline.components
+            )
+            if not depth_branch_present:
+                return {"ok": False, "results": [], "updated": [], "error": "depth_branch_unavailable"}
+
+            cameras = _resolve_auto_calibrate_cameras(camera_id)
+            if not cameras:
+                return {"ok": False, "results": [], "updated": [], "error": "no_cameras_configured"}
+
+            baseline_ts = {cam: _read_latest_depth_ts(cam) for cam in cameras}
+
+            enable_env = os.environ.get("NOESIS_AUTOCALIB_ENABLE_SECONDS", "10")
+            try:
+                enable_seconds = int(float(str(enable_env).strip()))
+            except Exception:
+                enable_seconds = 10
+            enable_seconds = max(1, min(15, enable_seconds))
+
+            if not pipeline.depth_enabled:
+                try:
+                    ds8_pipeline.enable_depth(seconds=enable_seconds)
+                except Exception:
+                    logger.warning("Auto-calibrate failed to enable depth burst", exc_info=True)
+
+            wait_timeout_s = min(float(enable_seconds) + 2.0, 18.0)
+            deadline = time.time() + wait_timeout_s
+            fresh = set()
+            while time.time() < deadline and len(fresh) < len(cameras):
+                for cam in cameras:
+                    latest_ts = _read_latest_depth_ts(cam)
+                    if latest_ts > baseline_ts.get(cam, 0):
+                        fresh.add(cam)
+                if len(fresh) >= len(cameras):
+                    break
+                time.sleep(0.12)
+
+            try:
+                from scripts.auto_calibrate_from_depth import auto_calibrate_from_latest_depth
+            except Exception as exc:
+                return {
+                    "ok": False,
+                    "results": [],
+                    "updated": [],
+                    "error": f"import_failed: {exc}",
+                }
+
+            try:
+                res = auto_calibrate_from_latest_depth(cameras, persist=False)
+            except Exception as exc:
+                return {"ok": False, "results": [], "updated": [], "error": str(exc) or "calibration_failed"}
+
+            results = res.get("results") if isinstance(res, dict) else []
+            updated: list[str] = []
+            persist_failed = False
+            calib_path = str(REPO_ROOT / "config" / "camera_calibration.json")
+
+            for entry in results or []:
+                if not isinstance(entry, dict):
+                    continue
+                if not entry.get("ok"):
+                    continue
+                cam = entry.get("cameraId")
+                e_mat = entry.get("E")
+                if not cam or not e_mat:
+                    continue
+                if save_extrinsics(calib_path, cam, e_mat):
+                    updated.append(cam)
+                else:
+                    persist_failed = True
+
+            top_error = res.get("error") if isinstance(res, dict) else None
+            if not updated and persist_failed and not top_error:
+                top_error = "persist_failed"
+
+            if updated:
+                calibration_provider.reload_extrinsics()
+                try:
+                    storage_manager.calibration_bundle = calibration_provider.calibration_bundle()
+                except Exception:
+                    logger.debug("Unable to refresh storage calibration bundle", exc_info=True)
+                try:
+                    bundle = calibration_provider.calibration_bundle()
+                    ws_server.broadcast_sync({"type": "calibration-bundle", "data": bundle})
+                except Exception:
+                    logger.debug("Failed to broadcast calibration bundle", exc_info=True)
+
+            return {
+                "ok": bool(updated),
+                "results": results or [],
+                "updated": updated,
+                "error": top_error,
+            }
+        finally:
+            auto_calibrate_lock.release()
 
     def _ds8_ma_depth_provider(
         cam_id: str,
@@ -2019,6 +2174,7 @@ def main() -> int:
     ws_server.ma_depth_provider = _ds8_ma_depth_provider
     ws_server.floorplan_provider = _ds8_floorplan_provider
     ws_server.calibration_getter = calibration_provider.calibration_bundle
+    ws_server.auto_calibrate_handler = _ds8_auto_calibrate_handler
     setattr(pipeline, "ws_server", ws_server)
     bev_renderer = BevRenderer(
         ws_server,

@@ -102,15 +102,26 @@ export const applyCanvasSize = (canvas: HTMLCanvasElement, widthOverride?: numbe
   return { width, height, dpr };
 };
 
+type RenderLayerOptions = {
+  forceAspect?: number;
+  fit?: 'stretch' | 'contain';
+  background?: string;
+  contentPaddingPx?: number;
+};
+
+type RenderLayerResult = {
+  contentRectPx: { x: number; y: number; w: number; h: number };
+};
+
 export function renderLayerToCanvas(
   canvas: HTMLCanvasElement | null,
   layer: FloorplanLayer | undefined,
   palette: (t: number) => [number, number, number],
-  forceAspect?: number
-) {
-  if (!canvas) return;
+  options?: number | RenderLayerOptions
+): RenderLayerResult | null {
+  if (!canvas) return null;
   const ctx = canvas.getContext('2d');
-  if (!ctx) return;
+  if (!ctx) return null;
 
   const clear = () => {
     ctx.setTransform(1, 0, 0, 1, 0, 0);
@@ -119,24 +130,24 @@ export function renderLayerToCanvas(
 
   if (!layer || !layer.grid_b64 || !layer.grid_shape) {
     clear();
-    return;
+    return null;
   }
   const [rows, cols] = layer.grid_shape;
   if (!rows || !cols) {
     clear();
-    return;
+    return null;
   }
   const values = decodeFloat32(layer.grid_b64);
   if (!values || values.length < rows * cols) {
     clear();
-    return;
+    return null;
   }
 
   const offscreen = document.createElement('canvas');
   offscreen.width = cols;
   offscreen.height = rows;
   const offCtx = offscreen.getContext('2d');
-  if (!offCtx) return;
+  if (!offCtx) return null;
 
   const imageData = offCtx.createImageData(cols, rows);
   const data = imageData.data;
@@ -155,26 +166,68 @@ export function renderLayerToCanvas(
   }
   offCtx.putImageData(imageData, 0, 0);
 
-  const { width } = applyCanvasSize(canvas);
+  const fit = typeof options === 'number' ? 'stretch' : (options?.fit ?? 'stretch');
+  const forceAspect = typeof options === 'number' ? options : options?.forceAspect;
+  const background = (typeof options === 'object' && options?.background) ? options.background : '#000';
+  const paddingCss = (typeof options === 'object' && options?.contentPaddingPx)
+    ? Math.max(0, Number(options.contentPaddingPx) || 0)
+    : 0;
+  const dpr = window.devicePixelRatio || 1;
 
-  // Determine target height
-  let height = canvas.height / (window.devicePixelRatio || 1);
-  if (forceAspect) {
-    height = width / forceAspect;
-  } else {
-    // Preserve aspect ratio of the grid
-    const aspect = cols / rows;
+  let { width, height } = applyCanvasSize(canvas);
+  if (fit === 'stretch') {
+    const aspect = forceAspect || (cols / rows);
     height = width / aspect;
   }
-
-  const dpr = window.devicePixelRatio || 1;
   canvas.width = Math.max(1, Math.round(width * dpr));
   canvas.height = Math.max(1, Math.round(height * dpr));
+
+  const contentAspect = forceAspect || (cols / rows);
+  let contentW = width;
+  let contentH = height;
+  let contentX = 0;
+  let contentY = 0;
+
+  if (fit === 'contain') {
+    const canvasAspect = width / height;
+    if (canvasAspect > contentAspect) {
+      contentH = height;
+      contentW = height * contentAspect;
+      contentX = (width - contentW) * 0.5;
+    } else {
+      contentW = width;
+      contentH = width / contentAspect;
+      contentY = (height - contentH) * 0.5;
+    }
+  }
+
+  if (paddingCss > 0) {
+    const shrink = paddingCss * 2;
+    if (contentW > shrink && contentH > shrink) {
+      contentX += paddingCss;
+      contentY += paddingCss;
+      contentW -= shrink;
+      contentH -= shrink;
+    }
+  }
 
   ctx.save();
   ctx.scale(dpr, dpr);
   ctx.clearRect(0, 0, width, height);
-  ctx.imageSmoothingEnabled = false; // Pixelated for grid? Or true for smooth? Usually smooth for heatmap.
-  ctx.drawImage(offscreen, 0, 0, width, height);
+  if (fit === 'contain' && background) {
+    ctx.fillStyle = background;
+    ctx.fillRect(0, 0, width, height);
+  }
+  ctx.imageSmoothingEnabled = false;
+  ctx.drawImage(offscreen, contentX, contentY, contentW, contentH);
   ctx.restore();
+
+  return {
+    contentRectPx: {
+      x: contentX * dpr,
+      y: contentY * dpr,
+      w: contentW * dpr,
+      h: contentH * dpr
+    }
+  };
 }

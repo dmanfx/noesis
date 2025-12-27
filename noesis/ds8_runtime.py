@@ -2113,8 +2113,7 @@ def main() -> int:
     bind_occupancy_publisher(pipeline, None)
     # Stable ID manager is optional; attach slot so hooks can discover it.
     setattr(pipeline, "stable_id_mgr", stable_id_mgr)
-
-    hooks.attach_intrinsics_hook(pipeline, config_path=cameras_path)
+    # Intrinsics are served via the calibration bundle (`_CalibrationProvider`) rather than per-frame user meta.
 
     trails_cfg: Dict[str, Any] = {}
     try:
@@ -2134,6 +2133,9 @@ def main() -> int:
     bev_cfg = pipeline.config.get("bev") or {}
     bev_jpeg_enabled = bool(bev_cfg.get("jpeg_enabled", False))
     bev_jpeg_quality = int(bev_cfg.get("jpeg_quality", 70) or 70)
+    bev_smoothing_cfg = bev_cfg.get("smoothing") if isinstance(bev_cfg, dict) else None
+    if not isinstance(bev_smoothing_cfg, dict):
+        bev_smoothing_cfg = None
     bev_env = os.environ.get("NOESIS_BEV_JPEG_ENABLED")
     if bev_env is not None:
         env_text = str(bev_env).strip().lower()
@@ -2179,6 +2181,7 @@ def main() -> int:
     bev_renderer = BevRenderer(
         ws_server,
         trails_cfg=trails_cfg,
+        smoothing_cfg=bev_smoothing_cfg,
         jpeg_enabled=bev_jpeg_enabled,
         jpeg_quality=bev_jpeg_quality,
     )

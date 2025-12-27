@@ -218,7 +218,7 @@ const DepthDrawer = memo(function DepthDrawer({
 
   const renderTopdownLayer = useCallback(
     (canvas: HTMLCanvasElement | null, layer: FloorplanLayer | undefined, palette: (t: number) => [number, number, number]) => {
-      renderLayerToCanvas(canvas, layer, palette, WIDE_ASPECT);
+      renderLayerToCanvas(canvas, layer, palette, { fit: 'contain' });
     },
     []
   );

@@ -30,6 +30,7 @@ const DEFAULT_Z_MAX = 12;
 
 type TrailPoint = { x: number; y: number; t: number };
 type TrailTrack = { points: TrailPoint[]; lastSeen: number; label: string; colorId: number };
+type ContentRect = { x: number; y: number; w: number; h: number };
 
 const TRAIL_WINDOW_MS = 20000;
 const TRAIL_MIN_DT_MS = 80;
@@ -58,6 +59,7 @@ export const BevView: React.FC<BevViewProps> = ({
   const bgCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const bgKeyRef = useRef<string>('');
   const bgSizeRef = useRef<{ w: number; h: number }>({ w: 0, h: 0 });
+  const bgContentRectRef = useRef<ContentRect | null>(null);
   const metaRef = useRef<BevMeta | undefined>(meta);
 
   useEffect(() => {
@@ -164,47 +166,7 @@ export const BevView: React.FC<BevViewProps> = ({
 
       const metaNow = metaRef.current;
       const aspect = variant === 'inline' ? 2 : (4 / 3);
-
-      const heightLayer = floorplan?.height;
-      const hasFloorplan = !!(heightLayer && heightLayer.grid_b64 && heightLayer.grid_shape);
-
-      // Cache the floorplan render so we don't re-decode base64 every animation frame.
-      const dpr = window.devicePixelRatio || 1;
-      const rect = cvs.getBoundingClientRect();
-      const expectedW = Math.max(1, Math.round((rect.width || 1) * dpr));
-      const expectedH = Math.max(1, Math.round((rect.height || 1) * dpr));
-      const key = hasFloorplan
-        ? `${floorplan?.snapshot_ts ?? floorplan?.ts ?? ''}:${heightLayer?.grid_shape?.join('x')}:${heightLayer?.value_min ?? ''}:${heightLayer?.value_max ?? ''}:${heightLayer?.grid_b64?.length ?? ''}:${aspect}`
-        : `none:${aspect}`;
-
-      const bg = bgCanvasRef.current ?? (bgCanvasRef.current = document.createElement('canvas'));
-      const bgSize = bgSizeRef.current;
-      const bgNeedsRedraw = bgKeyRef.current !== key || bgSize.w !== expectedW || bgSize.h !== expectedH;
-
-      if (bgNeedsRedraw) {
-        if (hasFloorplan) {
-          renderLayerToCanvas(cvs, heightLayer, infernoColor, aspect);
-        } else {
-          cvs.width = expectedW;
-          cvs.height = expectedH;
-          ctx.fillStyle = '#111';
-          ctx.fillRect(0, 0, cvs.width, cvs.height);
-        }
-        bg.width = cvs.width;
-        bg.height = cvs.height;
-        const bgCtx = bg.getContext('2d');
-        bgCtx?.drawImage(cvs, 0, 0);
-        bgKeyRef.current = key;
-        bgSizeRef.current = { w: cvs.width, h: cvs.height };
-      }
-
-      // Start frame from cached background.
-      ctx.setTransform(1, 0, 0, 1, 0, 0);
-      ctx.clearRect(0, 0, cvs.width, cvs.height);
-      ctx.drawImage(bg, 0, 0);
-
-      const width = cvs.width;
-      const height = cvs.height;
+      const fitMode = 'contain';
 
       let xMin = DEFAULT_X_MIN;
       let xMax = DEFAULT_X_MAX;
@@ -231,9 +193,83 @@ export const BevView: React.FC<BevViewProps> = ({
         zMax = metaNow.zMax;
       }
 
-      const drawX = (mx: number) => ((mx - xMin) / (xMax - xMin)) * width;
-      const drawXFlipped = (mx: number) => width - ((mx - xMin) / (xMax - xMin)) * width;
-      const drawY = (mz: number) => height - ((mz - zMin) / (zMax - zMin)) * height;
+      const boundsSpanX = Math.max(1e-6, xMax - xMin);
+      const boundsSpanZ = Math.max(1e-6, zMax - zMin);
+      const boundsAspect = boundsSpanX / boundsSpanZ;
+
+      const heightLayer = floorplan?.height;
+      const hasFloorplan = !!(heightLayer && heightLayer.grid_b64 && heightLayer.grid_shape);
+
+      // Cache the floorplan render so we don't re-decode base64 every animation frame.
+      const dpr = window.devicePixelRatio || 1;
+      const rect = cvs.getBoundingClientRect();
+      const canvasWidthCss = Math.max(1, rect.width || 1);
+      const canvasHeightCss = Math.max(1, rect.height || 1);
+      const expectedW = Math.max(1, Math.round(canvasWidthCss * dpr));
+      const expectedH = Math.max(1, Math.round(canvasHeightCss * dpr));
+      let padCss = 0;
+      if (hasFloorplan && Array.isArray(heightLayer?.grid_shape)) {
+        const [rows, cols] = heightLayer.grid_shape;
+        if (rows && cols) {
+          const canvasAspect = canvasWidthCss / canvasHeightCss;
+          let contentW = canvasWidthCss;
+          let contentH = canvasHeightCss;
+          if (canvasAspect > boundsAspect) {
+            contentH = canvasHeightCss;
+            contentW = canvasHeightCss * boundsAspect;
+          } else {
+            contentW = canvasWidthCss;
+            contentH = canvasWidthCss / boundsAspect;
+          }
+          const cellPx = Math.min(contentW / cols, contentH / rows);
+          padCss = Math.max(0, cellPx * 0.5);
+        }
+      }
+
+      const key = hasFloorplan
+        ? `${floorplan?.snapshot_ts ?? floorplan?.ts ?? ''}:${heightLayer?.grid_shape?.join('x')}:${heightLayer?.value_min ?? ''}:${heightLayer?.value_max ?? ''}:${heightLayer?.grid_b64?.length ?? ''}:${aspect}:${fitMode}:${boundsAspect.toFixed(6)}:${padCss.toFixed(3)}`
+        : `none:${aspect}:${fitMode}:${boundsAspect.toFixed(6)}:${padCss.toFixed(3)}`;
+
+      const bg = bgCanvasRef.current ?? (bgCanvasRef.current = document.createElement('canvas'));
+      const bgSize = bgSizeRef.current;
+      const bgNeedsRedraw = bgKeyRef.current !== key || bgSize.w !== expectedW || bgSize.h !== expectedH;
+
+      if (bgNeedsRedraw) {
+        if (hasFloorplan) {
+          const rendered = renderLayerToCanvas(cvs, heightLayer, infernoColor, {
+            fit: fitMode,
+            forceAspect: boundsAspect,
+            contentPaddingPx: padCss
+          });
+          bgContentRectRef.current = rendered?.contentRectPx ?? { x: 0, y: 0, w: cvs.width, h: cvs.height };
+        } else {
+          cvs.width = expectedW;
+          cvs.height = expectedH;
+          ctx.fillStyle = '#111';
+          ctx.fillRect(0, 0, cvs.width, cvs.height);
+          bgContentRectRef.current = { x: 0, y: 0, w: cvs.width, h: cvs.height };
+        }
+        bg.width = cvs.width;
+        bg.height = cvs.height;
+        const bgCtx = bg.getContext('2d');
+        bgCtx?.drawImage(cvs, 0, 0);
+        bgKeyRef.current = key;
+        bgSizeRef.current = { w: cvs.width, h: cvs.height };
+      }
+
+      // Start frame from cached background.
+      ctx.setTransform(1, 0, 0, 1, 0, 0);
+      ctx.clearRect(0, 0, cvs.width, cvs.height);
+      ctx.drawImage(bg, 0, 0);
+
+      const width = cvs.width;
+      const height = cvs.height;
+      const contentRect = bgContentRectRef.current ?? { x: 0, y: 0, w: width, h: height };
+
+      const drawX = (mx: number) => contentRect.x + ((mx - xMin) / (xMax - xMin)) * contentRect.w;
+      const drawXFlipped = (mx: number) => contentRect.x + contentRect.w - ((mx - xMin) / (xMax - xMin)) * contentRect.w;
+      const drawY = (mz: number) => contentRect.y + contentRect.h - ((mz - zMin) / (zMax - zMin)) * contentRect.h;
+      const inBounds = (mx: number, mz: number) => mx >= xMin && mx <= xMax && mz >= zMin && mz <= zMax;
 
       if (overlayEnabled) {
         ctx.strokeStyle = 'rgba(255, 255, 255, 0.1)';
@@ -242,14 +278,14 @@ export const BevView: React.FC<BevViewProps> = ({
         const startX = Math.ceil(xMin);
         for (let x = startX; x <= xMax; x++) {
           const u = drawXFlipped(x);
-          ctx.moveTo(u, 0);
-          ctx.lineTo(u, height);
+          ctx.moveTo(u, contentRect.y);
+          ctx.lineTo(u, contentRect.y + contentRect.h);
         }
         const startZ = Math.ceil(zMin);
         for (let z = startZ; z <= zMax; z++) {
           const v = drawY(z);
-          ctx.moveTo(0, v);
-          ctx.lineTo(width, v);
+          ctx.moveTo(contentRect.x, v);
+          ctx.lineTo(contentRect.x + contentRect.w, v);
         }
         ctx.stroke();
 
@@ -258,13 +294,13 @@ export const BevView: React.FC<BevViewProps> = ({
         ctx.beginPath();
         if (zMin <= 0 && zMax >= 0) {
           const v0 = drawY(0);
-          ctx.moveTo(0, v0);
-          ctx.lineTo(width, v0);
+          ctx.moveTo(contentRect.x, v0);
+          ctx.lineTo(contentRect.x + contentRect.w, v0);
         }
         if (xMin <= 0 && xMax >= 0) {
           const u0 = drawXFlipped(0);
-          ctx.moveTo(u0, 0);
-          ctx.lineTo(u0, height);
+          ctx.moveTo(u0, contentRect.y);
+          ctx.lineTo(u0, contentRect.y + contentRect.h);
         }
         ctx.stroke();
       }
@@ -335,7 +371,7 @@ export const BevView: React.FC<BevViewProps> = ({
           let prev: TrailPoint | null = null;
           for (let i = 0; i < pts.length; i += 1) {
             const p = pts[i];
-            const isGap = !Number.isFinite(p.x) || !Number.isFinite(p.y);
+            const isGap = !Number.isFinite(p.x) || !Number.isFinite(p.y) || !inBounds(p.x, p.y);
             if (isGap) {
               prev = null;
               continue;
@@ -360,7 +396,7 @@ export const BevView: React.FC<BevViewProps> = ({
           let lastValid: TrailPoint | null = null;
           for (let i = pts.length - 1; i >= 0; i -= 1) {
             const p = pts[i];
-            if (Number.isFinite(p.x) && Number.isFinite(p.y)) {
+            if (Number.isFinite(p.x) && Number.isFinite(p.y) && inBounds(p.x, p.y)) {
               lastValid = p;
               break;
             }
@@ -391,6 +427,7 @@ export const BevView: React.FC<BevViewProps> = ({
       smoothState.current.forEach((pt) => {
         const age = now - pt.lastSeen;
         if (age > 500) return;
+        if (!Number.isFinite(pt.x) || !Number.isFinite(pt.y) || !inBounds(pt.x, pt.y)) return;
 
         const px = drawXFlipped(pt.x);
         const py = drawY(pt.y);

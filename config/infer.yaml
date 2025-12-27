@@ -114,6 +114,14 @@ mosaic_output:
 bev:
   jpeg_enabled: false
   jpeg_quality: 70
+  smoothing:
+    enabled: true
+    max_speed_mps: 4.0    # Physical gate (meters/sec): cap per-frame travel by speed * dt
+    max_jump_m: 0.75      # Extra slack for homography jitter (meters)
+    alpha: 0.45           # Alpha-beta filter position gain (0..1)
+    beta: 0.10            # Alpha-beta filter velocity gain (0..1)
+    ttl_s: 2.5            # Forget track state after not seen for this long
+    reset_after_s: 1.25   # If dt exceeds this, accept measurement and reset filter
 
 visualization: # Visualization overlays rendered into the mosaic stream (tiler → osd).
   instance_masks:

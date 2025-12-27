@@ -918,6 +918,49 @@ class DepthStorageManager:
         if not all(np.isfinite([fx, fy, cx, cy])) or fx == 0.0 or fy == 0.0:
             return {'error': 'invalid_intrinsics', 'camera_id': camera_id, 'ts': now_us}
 
+        # Align intrinsics to the depth raster resolution, preserving aspect (letterbox).
+        target_h, target_w = depth.shape
+        base_w = None
+        base_h = None
+        meta_node = calib_bundle.get('meta') if isinstance(calib_bundle, dict) else None
+        specs_node = meta_node.get('camera_specs') if isinstance(meta_node, dict) else None
+        spec = specs_node.get(camera_id) if isinstance(specs_node, dict) else None
+        if isinstance(spec, dict):
+            res = spec.get('resolution')
+            if isinstance(res, (list, tuple)) and len(res) >= 2:
+                try:
+                    base_w = int(res[0])
+                    base_h = int(res[1])
+                except Exception:
+                    base_w = None
+                    base_h = None
+            if base_w is None or base_h is None:
+                try:
+                    base_w = int(spec.get('width', 0) or 0) or base_w
+                    base_h = int(spec.get('height', 0) or 0) or base_h
+                except Exception:
+                    base_w = base_w
+                    base_h = base_h
+        if base_w is None or base_h is None:
+            try:
+                base_w = int(round(float(cx) * 2.0))
+                base_h = int(round(float(cy) * 2.0))
+            except Exception:
+                base_w = None
+                base_h = None
+        if (
+            base_w and base_h and target_w and target_h
+            and base_w > 0 and base_h > 0
+            and target_w > 0 and target_h > 0
+        ):
+            s = min(float(target_w) / float(base_w), float(target_h) / float(base_h))
+            pad_x = (float(target_w) - float(base_w) * s) * 0.5
+            pad_y = (float(target_h) - float(base_h) * s) * 0.5
+            fx *= s
+            fy *= s
+            cx = cx * s + pad_x
+            cy = cy * s + pad_y
+
         # PERMISSIVE validity: only reject truly invalid depth values
         # Do NOT hard-filter by mask or confidence - use them as soft weights instead
         valid = np.isfinite(depth)
@@ -1077,11 +1120,14 @@ class DepthStorageManager:
         # Compute confidence-weighted mean height
         # Use weighted mean where we have weights, otherwise fall back to max
         has_weight = weight_sum > 1e-9
-        weighted_mean_height = np.where(
-            has_weight,
-            weighted_height_sum / weight_sum,
-            height_grid
-        ).astype(np.float32)
+        # Avoid invalid division warnings: np.where evaluates both branches eagerly.
+        weighted_mean_height = height_grid.astype(np.float32, copy=True)
+        np.divide(
+            weighted_height_sum,
+            weight_sum,
+            out=weighted_mean_height,
+            where=has_weight,
+        )
 
         # For cells with no points at all, mark as NaN
         empty_cells = height_grid == -np.inf
@@ -2006,11 +2052,14 @@ class MapAnythingDepthSource:
         # Compute confidence-weighted mean height
         # Use weighted mean where we have weights, otherwise fall back to max
         has_weight = weight_sum > 1e-9
-        weighted_mean_height = np.where(
-            has_weight,
-            weighted_height_sum / weight_sum,
-            height_grid
-        ).astype(np.float32)
+        # Avoid invalid division warnings: np.where evaluates both branches eagerly.
+        weighted_mean_height = height_grid.astype(np.float32, copy=True)
+        np.divide(
+            weighted_height_sum,
+            weight_sum,
+            out=weighted_mean_height,
+            where=has_weight,
+        )
 
         # For cells with no points at all, mark as NaN
         empty_cells = height_grid == -np.inf

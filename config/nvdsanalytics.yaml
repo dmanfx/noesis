@@ -30,6 +30,17 @@ analytics:
                 - 470.0
               - - 169.0
                 - 224.0
+            - id: RF4
+              description: TV
+              points_px:
+              - - 1103.0
+                - 207.0
+              - - 1096.0
+                - 424.0
+              - - 1370.0
+                - 435.0
+              - - 1385.0
+                - 251.0
         '1':
           label: kitchen
           roi_filtering:

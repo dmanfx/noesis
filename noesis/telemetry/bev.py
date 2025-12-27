@@ -12,6 +12,7 @@ import math
 import threading
 
 from geometry.homography import Plane, parse_extrinsics, ray_from_pixel, intersect_plane
+from noesis.telemetry.motion_smoothing import MotionGatedAlphaBetaSmoother, MotionSmoothingConfig
 
 logger = logging.getLogger(__name__)
 
@@ -34,7 +35,7 @@ class BevConfig:
     overlay: bool = True
     max_px: int = 768
     auto_fit_extents: bool = True
-    max_distance_m: float = 8.0
+    max_distance_m: float = 20.0
 
 
 @dataclass
@@ -200,6 +201,7 @@ class BevRenderer:
         self,
         ws_server,
         trails_cfg: Optional[Dict[str, Any]] = None,
+        smoothing_cfg: Optional[Dict[str, Any]] = None,
         *,
         jpeg_enabled: bool = False,
         jpeg_quality: int = 70,
@@ -218,6 +220,8 @@ class BevRenderer:
         self._trail_tracks_by_cam: Dict[str, Dict[int, _BevTrailTrackState]] = {}
         self._trail_frame_counts: Dict[str, int] = {}
         self._trail_color_cache: Dict[int, Tuple[int, int, int]] = {}
+        self._smoothing_cfg = MotionSmoothingConfig.from_mapping(smoothing_cfg or {})
+        self._smoother = MotionGatedAlphaBetaSmoother(self._smoothing_cfg)
         self._jpeg_enabled = bool(jpeg_enabled)
         self._jpeg_quality = max(1, min(100, int(jpeg_quality)))
 
@@ -414,6 +418,8 @@ class BevRenderer:
         footpoints: Optional[List[Footpoint]] = None,
         timestamp_us: int = 0,
     ) -> None:
+        if timestamp_us <= 0:
+            timestamp_us = int(time.time() * 1_000_000)
         now_s = float(timestamp_us) / 1_000_000.0
         cfg = self.config_per_cam.get(camera_id, BevConfig())
         footpoints = footpoints or []
@@ -500,6 +506,7 @@ class BevRenderer:
             H_img2plane = cached_result
 
         bev_points: List[Dict[str, float]] = []
+        raw_local_points: List[Tuple[int, float, float, str]] = []
         current_local_by_sid: Dict[int, Tuple[float, float]] = {}
 
         # Calculate Camera Yaw and Position for Local Transformation
@@ -516,6 +523,8 @@ class BevRenderer:
         cos_yaw = math.cos(-yaw)
         sin_yaw = math.sin(-yaw)
 
+        max_distance_m = float(cfg.max_distance_m or 0.0)
+
         for fp in footpoints:
             vec = np.array([fp.u, fp.v, 1.0], dtype=np.float64)
             # H maps [u, v, 1] -> [x_meters, z_meters, w] (World Coordinates)
@@ -524,7 +533,7 @@ class BevRenderer:
             wx = float(world_pt[0] / w)
             wz = float(world_pt[1] / w)
             
-            if np.isnan(wx) or np.isnan(wz):
+            if not math.isfinite(wx) or not math.isfinite(wz):
                 continue
             
             # Transform World -> Local Camera Frame
@@ -536,6 +545,13 @@ class BevRenderer:
             lx = dx * cos_yaw - dz * sin_yaw
             lz = dx * sin_yaw + dz * cos_yaw
 
+            if not math.isfinite(lx) or not math.isfinite(lz):
+                continue
+            if max_distance_m > 0.0 and math.hypot(lx, lz) > max_distance_m:
+                # Guardrail: discard near-horizon homography outliers so the UI doesn't draw
+                # teleporting streaks outside the floorplan extents.
+                continue
+
             try:
                 stable_id = int(fp.stable_id) if fp.stable_id is not None else None
             except Exception:
@@ -543,10 +559,18 @@ class BevRenderer:
             if stable_id is None or stable_id <= 0:
                 continue
 
-            # The frontend expects 'x' and 'y' in the JSON list.
-            # We map Local X -> JSON x, Local Z -> JSON y
-            bev_points.append({'x': lx, 'y': lz, 'method': fp.method, 'stableId': stable_id})
-            current_local_by_sid[int(stable_id)] = (float(lx), float(lz))
+            raw_local_points.append((int(stable_id), float(lx), float(lz), str(fp.method)))
+
+        with self._lock:
+            if self._smoother.enabled:
+                self._smoother.prune(now_s)
+            for stable_id, lx, lz, method in raw_local_points:
+                if self._smoother.enabled:
+                    lx, lz = self._smoother.update((camera_id, int(stable_id)), now_s, lx, lz)
+                # The frontend expects 'x' and 'y' in the JSON list.
+                # We map Local X -> JSON x, Local Z -> JSON y
+                bev_points.append({'x': float(lx), 'y': float(lz), 'method': method, 'stableId': int(stable_id)})
+                current_local_by_sid[int(stable_id)] = (float(lx), float(lz))
 
         # Update config to reflect the actual extents used
         result_config = BevConfig(

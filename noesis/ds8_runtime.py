@@ -3,9 +3,11 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import configparser
 import json
 import logging
 import os
+import subprocess
 import signal
 import socket
 import sys
@@ -21,12 +23,20 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from calibration_bundle import assemble_calibration_bundle, load_alignment, load_extrinsics, load_intrinsics, save_extrinsics
+from calibration_bundle import (
+    assemble_calibration_bundle,
+    load_alignment,
+    load_extrinsics,
+    load_intrinsics,
+    save_alignment,
+    save_extrinsics,
+)
 from geometry.depth_source import DepthStorageManager
 from mapanything_config import load_service_config
 from noesis.pipelines import ds8_pipeline, hooks
 from noesis.metadata.intrinsics import CameraConfigLoader
 from noesis.telemetry.publishers import DepthTelemetryPublisher, TrackingTelemetryPublisher, bind_occupancy_publisher
+from noesis.diagnostics.telemetry_log import TrackingDiagnosticsLogger
 from noesis.telemetry.bev import BevRenderer, CalibrationSnapshot
 from websocket_server import WebSocketServer
 
@@ -56,23 +66,436 @@ except Exception:
     _PYSERVICEMAKER_MSGS = False
 
 
+_PGIE_PROFILES = ("yolo11_seg", "rfdetr_seg")
+_ENV_TRUE = ("1", "true", "yes", "y", "on")
+_TRACKING_MODES = ("legacy", "v3dt")
+
+
+def _deep_merge_dict(base: Any, overlay: Any) -> Any:
+    if isinstance(base, dict) and isinstance(overlay, dict):
+        merged = dict(base)
+        for key, value in overlay.items():
+            merged[key] = _deep_merge_dict(merged.get(key), value) if key in merged else value
+        return merged
+    return overlay
+
+
+def _resolve_pipeline_cfg_path(yaml_path: Path, raw: str) -> Path:
+    value = str(raw or "").strip()
+    if not value:
+        return Path("")
+    candidate = Path(value)
+    if candidate.is_absolute():
+        return candidate
+    base_dir = yaml_path.parent.resolve()
+    repo_root = REPO_ROOT
+    if value.startswith(("config/", "models/", "pipelines/")):
+        return (repo_root / candidate).resolve()
+    return (base_dir / candidate).resolve()
+
+
+def _parse_dewarper_dst_intrinsics(
+    config_path: Path, logger: logging.Logger
+) -> Optional[Tuple[float, float, float, float, Optional[int], Optional[int]]]:
+    try:
+        text = config_path.read_text(encoding="utf-8")
+    except Exception as exc:
+        logger.error("Dewarp intrinsics check failed: unable to read %s: %s", config_path, exc)
+        return None
+
+    dst_focal: Optional[Tuple[float, float]] = None
+    dst_pp: Optional[Tuple[float, float]] = None
+    dst_width: Optional[int] = None
+    dst_height: Optional[int] = None
+
+    for line in text.splitlines():
+        raw = line.split("#", 1)[0].strip()
+        if not raw:
+            continue
+        if raw.startswith("dst-focal-length="):
+            parts = raw.split("=", 1)[1].split(";")
+            if len(parts) >= 2:
+                try:
+                    dst_focal = (float(parts[0].strip()), float(parts[1].strip()))
+                except Exception:
+                    dst_focal = None
+        elif raw.startswith("dst-principal-point="):
+            parts = raw.split("=", 1)[1].split(";")
+            if len(parts) >= 2:
+                try:
+                    dst_pp = (float(parts[0].strip()), float(parts[1].strip()))
+                except Exception:
+                    dst_pp = None
+        elif raw.startswith("output-width="):
+            try:
+                dst_width = int(float(raw.split("=", 1)[1].strip()))
+            except Exception:
+                dst_width = None
+        elif raw.startswith("output-height="):
+            try:
+                dst_height = int(float(raw.split("=", 1)[1].strip()))
+            except Exception:
+                dst_height = None
+
+    if dst_focal and dst_pp:
+        return dst_focal[0], dst_focal[1], dst_pp[0], dst_pp[1], dst_width, dst_height
+    return None
+
+
+def _coerce_positive_int(value: Any) -> Optional[int]:
+    try:
+        parsed = int(value)
+    except Exception:
+        try:
+            parsed = int(float(value))
+        except Exception:
+            return None
+    return parsed if parsed > 0 else None
+
+
+def _validate_dewarper_intrinsics_sync(
+    pipeline_path: Path, cameras_path: Path, logger: logging.Logger
+) -> bool:
+    try:
+        pipeline_cfg = yaml.safe_load(pipeline_path.read_text(encoding="utf-8")) or {}
+    except Exception as exc:
+        logger.error("Dewarp intrinsics check failed: unable to read %s: %s", pipeline_path, exc)
+        return False
+
+    sources = pipeline_cfg.get("sources")
+    if not isinstance(sources, list):
+        return True
+
+    if not cameras_path.exists():
+        logger.warning("Dewarp intrinsics check skipped: cameras config missing: %s", cameras_path)
+        return True
+
+    streammux_cfg = pipeline_cfg.get("streammux") if isinstance(pipeline_cfg, dict) else None
+    mux_width = _coerce_positive_int((streammux_cfg or {}).get("width")) if isinstance(streammux_cfg, dict) else None
+    mux_height = _coerce_positive_int((streammux_cfg or {}).get("height")) if isinstance(streammux_cfg, dict) else None
+
+    loader = CameraConfigLoader(cameras_path)
+    ok = True
+    tol_abs = 1e-2
+    tol_rel_scaled = 0.015
+
+    for idx, source in enumerate(sources):
+        if not isinstance(source, dict):
+            continue
+        dewarp_cfg = source.get("dewarper")
+        if not (isinstance(dewarp_cfg, dict) and bool(dewarp_cfg.get("enable", False))):
+            continue
+
+        config_raw = str(dewarp_cfg.get("config-file") or "").strip()
+        if not config_raw:
+            logger.error(
+                "Dewarp intrinsics check failed: source %d has dewarper enabled but no config-file",
+                idx,
+            )
+            ok = False
+            continue
+
+        config_path = _resolve_pipeline_cfg_path(pipeline_path, config_raw)
+        if not config_path.exists():
+            logger.error(
+                "Dewarp intrinsics check failed: dewarper config not found for source %d: %s",
+                idx,
+                config_path,
+            )
+            ok = False
+            continue
+
+        dst = _parse_dewarper_dst_intrinsics(config_path, logger)
+        if dst is None:
+            logger.warning(
+                "Dewarp intrinsics check skipped: dst-focal-length/principal-point missing in %s",
+                config_path,
+            )
+            continue
+
+        intr = loader.get(idx)
+        if intr is None:
+            logger.error(
+                "Dewarp intrinsics check failed: no intrinsics for source %d in %s",
+                idx,
+                cameras_path,
+            )
+            ok = False
+            continue
+
+        fx, fy, cx, cy, dst_width, dst_height = dst
+        scaled = False
+        if (
+            dst_width
+            and dst_height
+            and mux_width
+            and mux_height
+            and (dst_width != mux_width or dst_height != mux_height)
+        ):
+            # Streammux scaling changes the effective intrinsics seen by SV3DT.
+            scale_x = mux_width / float(dst_width)
+            scale_y = mux_height / float(dst_height)
+            fx *= scale_x
+            fy *= scale_y
+            cx *= scale_x
+            cy *= scale_y
+            scaled = True
+
+        tol_rel = tol_rel_scaled if scaled else 0.0
+
+        def _within_tol(expected: float, actual: float) -> bool:
+            return abs(expected - actual) <= max(tol_abs, tol_rel * max(abs(expected), abs(actual)))
+
+        expected = {"fx": fx, "fy": fy, "cx": cx, "cy": cy}
+        actual = {"fx": intr.fx, "fy": intr.fy, "cx": intr.cx, "cy": intr.cy}
+        diffs = {key: abs(expected[key] - actual[key]) for key in expected}
+        mismatch = {key: val for key, val in diffs.items() if not _within_tol(expected[key], actual[key])}
+        if mismatch:
+            scale_note = ""
+            if scaled:
+                scale_note = (
+                    f" scaled_from={dst_width}x{dst_height} to={mux_width}x{mux_height}"
+                    f" tol_rel={tol_rel:.3f}"
+                )
+            logger.error(
+                "Dewarp intrinsics mismatch for source %d (tol_abs=%.4f): "
+                "dewarper dst=(fx=%.6f, fy=%.6f, cx=%.6f, cy=%.6f) "
+                "cameras=(fx=%.6f, fy=%.6f, cx=%.6f, cy=%.6f)%s diffs=%s "
+                "config=%s cameras=%s",
+                idx,
+                tol_abs,
+                fx,
+                fy,
+                cx,
+                cy,
+                intr.fx,
+                intr.fy,
+                intr.cx,
+                intr.cy,
+                scale_note,
+                mismatch,
+                config_path,
+                cameras_path,
+            )
+            ok = False
+
+    return ok
+
+
+def _preflight_pgie_profile(profile: str, pipeline_cfg: Dict[str, Any], yaml_path: Path, logger: logging.Logger) -> None:
+    if profile != "rfdetr_seg":
+        return
+
+    preprocess_cfg = pipeline_cfg.get("preprocess") if isinstance(pipeline_cfg, dict) else None
+    preprocess_path_raw = (preprocess_cfg or {}).get("config-file") if isinstance(preprocess_cfg, dict) else None
+    preprocess_path = _resolve_pipeline_cfg_path(yaml_path, str(preprocess_path_raw or ""))
+    if not preprocess_path.exists():
+        raise SystemExit(f"[FATAL] RF-DETR profile requires preprocess config-file at: {preprocess_path}")
+
+    models_cfg = pipeline_cfg.get("models") if isinstance(pipeline_cfg, dict) else None
+    pgie_cfg = (models_cfg or {}).get("pgie") if isinstance(models_cfg, dict) else None
+    pgie_ini_raw = (pgie_cfg or {}).get("config-file-path") if isinstance(pgie_cfg, dict) else None
+    pgie_ini = _resolve_pipeline_cfg_path(yaml_path, str(pgie_ini_raw or ""))
+    if not pgie_ini.exists():
+        raise SystemExit(f"[FATAL] RF-DETR profile requires PGIE config-file-path at: {pgie_ini}")
+
+    engine_raw = (pgie_cfg or {}).get("engine") if isinstance(pgie_cfg, dict) else None
+    engine_path = _resolve_pipeline_cfg_path(yaml_path, str(engine_raw or ""))
+    if not str(engine_raw or "").strip():
+        raise SystemExit("[FATAL] RF-DETR profile requires models.pgie.engine to be set")
+
+    parser = configparser.ConfigParser()
+    parser.read(pgie_ini, encoding="utf-8")
+    props = parser["property"] if parser.has_section("property") else {}
+
+    lib_raw = str(props.get("custom-lib-path", "") or "").strip()
+    lib_path = _resolve_pipeline_cfg_path(yaml_path, lib_raw)
+    if not lib_raw or not lib_path.exists():
+        raise SystemExit(
+            "[FATAL] RF-DETR PGIE custom parser library missing.\n"
+            f"PGIE INI: {pgie_ini}\n"
+            f"custom-lib-path: {lib_raw or '<unset>'}\n"
+            f"resolved: {lib_path}\n"
+            "Build it with: make -C pipelines/nvdsinfer_rfdetr_seg\n"
+        )
+
+    gie_uid = str(props.get("gie-unique-id", "") or "").strip()
+    if gie_uid and gie_uid != "1":
+        raise SystemExit(f"[FATAL] RF-DETR PGIE gie-unique-id must remain 1 (got {gie_uid})")
+
+    if engine_path.exists():
+        logger.info("RF-DETR PGIE engine found: %s", engine_path)
+        return
+
+    onnx_raw = str(props.get("onnx-file", "") or "").strip()
+    onnx_path = _resolve_pipeline_cfg_path(yaml_path, onnx_raw)
+    if not onnx_raw or not onnx_path.exists():
+        raise SystemExit(
+            "[FATAL] RF-DETR PGIE engine is missing and no ONNX is available to rebuild it.\n"
+            f"engine (from YAML models.pgie.engine): {engine_path}\n"
+            f"onnx-file (from PGIE INI): {onnx_raw or '<unset>'}\n"
+            f"resolved: {onnx_path}\n"
+        )
+
+    logger.warning(
+        "RF-DETR PGIE engine missing (%s); nvinfer will attempt to build it from ONNX (%s) on startup.",
+        engine_path,
+        onnx_path,
+    )
+
+
+def _materialize_effective_pipeline_yaml(
+    base_yaml_path: Path,
+    profile: str,
+    logger: logging.Logger,
+) -> Path:
+    try:
+        base_cfg = yaml.safe_load(base_yaml_path.read_text(encoding="utf-8")) or {}
+    except Exception as exc:
+        raise SystemExit(f"[FATAL] Unable to read DS8 pipeline YAML: {base_yaml_path} ({exc})") from exc
+    if not isinstance(base_cfg, dict):
+        raise SystemExit(f"[FATAL] DS8 pipeline YAML must be a mapping (got {type(base_cfg).__name__}): {base_yaml_path}")
+
+    overlay: Dict[str, Any] = {}
+    if profile == "rfdetr_seg":
+        overlay = {
+            "preprocess": {"config-file": "pipelines/config_preproc_rfdetr_432.ini"},
+            "models": {
+                "pgie": {
+                    "config-file-path": "pipelines/config_infer_primary_rfdetr_seg.ini",
+                    "engine": str((REPO_ROOT / "models" / "engines" / "rfdetr_seg_preview_432_b3_fp16.engine").resolve()),
+                }
+            },
+        }
+
+    effective_cfg = _deep_merge_dict(base_cfg, overlay)
+    if not isinstance(effective_cfg, dict):
+        raise SystemExit("[FATAL] Internal error: effective pipeline config is not a mapping")
+
+    preprocess_cfg = effective_cfg.get("preprocess") if isinstance(effective_cfg, dict) else None
+    preprocess_path_raw = (preprocess_cfg or {}).get("config-file") if isinstance(preprocess_cfg, dict) else None
+    models_cfg = effective_cfg.get("models") if isinstance(effective_cfg, dict) else None
+    pgie_cfg = (models_cfg or {}).get("pgie") if isinstance(models_cfg, dict) else None
+    pgie_ini_raw = (pgie_cfg or {}).get("config-file-path") if isinstance(pgie_cfg, dict) else None
+    engine_raw = (pgie_cfg or {}).get("engine") if isinstance(pgie_cfg, dict) else None
+
+    logger.info("PGIE profile: %s", profile)
+    logger.info(
+        "PGIE (effective): preprocess.config-file=%s, models.pgie.config-file-path=%s, models.pgie.engine=%s",
+        preprocess_path_raw,
+        pgie_ini_raw,
+        engine_raw,
+    )
+
+    out_dir = (REPO_ROOT / "build").resolve()
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out_path = out_dir / f"effective_pipeline_{profile}.yaml"
+    out_path.write_text(yaml.safe_dump(effective_cfg, sort_keys=False), encoding="utf-8")
+
+    _preflight_pgie_profile(profile, effective_cfg, out_path, logger)
+    return out_path
+
+
+def _maybe_autogen_v3dt_caminfo(pipeline_path: Path, cameras_path: Path, logger: logging.Logger) -> bool:
+    """Optionally regenerate V3DT camInfo files from current calibration.
+
+    Controlled by `NOESIS_V3DT_AUTOGEN_CAMINFO` (default: 0).
+    """
+    flag = str(os.environ.get("NOESIS_V3DT_AUTOGEN_CAMINFO", "0") or "").strip().lower()
+    if flag not in _ENV_TRUE:
+        return True
+
+    try:
+        pipeline_cfg = yaml.safe_load(pipeline_path.read_text(encoding="utf-8")) or {}
+    except Exception as exc:
+        logger.error("V3DT autogen camInfo failed: unable to read %s: %s", pipeline_path, exc)
+        return False
+
+    tracker_cfg = pipeline_cfg.get("tracker") or {}
+    ll_cfg_path = str((tracker_cfg or {}).get("config-file") or "").strip()
+    if not ll_cfg_path.startswith("config/v3dt/"):
+        logger.info(
+            "V3DT autogen camInfo: skipped (tracker config not under config/v3dt/): %s",
+            ll_cfg_path or "<missing>",
+        )
+        return True
+
+    # Use the streammux output resolution for camInfo generation.
+    #
+    # Even if `nvtracker` internally rescales frames for tracking, SV3DT’s camInfo projection
+    # matrix is consumed in the pixel coordinate system of the frames flowing through the
+    # pipeline (i.e., streammux output). Using `tracker-width/height` here can introduce
+    # non-uniform scaling (e.g., 1920×1056 vs 1920×1080) and distort SV3DT’s projected 3D
+    # object model, which in practice can cause sporadic tracks and “stretched line” cuboids.
+    streammux_cfg = pipeline_cfg.get("streammux") or {}
+    try:
+        target_w = int((streammux_cfg or {}).get("width") or 1920)
+        target_h = int((streammux_cfg or {}).get("height") or 1080)
+    except Exception:
+        target_w, target_h = 1920, 1080
+
+    script = (REPO_ROOT / "scripts" / "generate_v3dt_caminfo.py").resolve()
+    if not script.exists():
+        logger.error("V3DT autogen camInfo failed: missing %s", script)
+        return False
+
+    cmd = [
+        sys.executable,
+        str(script),
+        "--pipeline-config",
+        str(pipeline_path),
+        "--cameras-config",
+        str(cameras_path),
+        "--target-width",
+        str(int(target_w)),
+        "--target-height",
+        str(int(target_h)),
+    ]
+    logger.warning("V3DT autogen camInfo enabled; running: %s", " ".join(cmd))
+    try:
+        subprocess.run(cmd, check=True, env=dict(os.environ))
+    except Exception as exc:
+        logger.error("V3DT autogen camInfo failed (command error): %s", exc)
+        return False
+
+    return True
+
+
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Noesis DS8 runtime harness")
 
-    default_pipeline = Path(os.environ.get("NOESIS_DS8_PIPELINE_CONFIG", REPO_ROOT / "config" / "infer.yaml"))
-    default_cameras = Path(os.environ.get("NOESIS_CAMERAS_CONFIG", REPO_ROOT / "config" / "cameras.yaml"))
+    default_pgie_profile = str(os.environ.get("NOESIS_PGIE_PROFILE", "yolo11_seg") or "").strip() or "yolo11_seg"
 
     parser.add_argument(
         "--pipeline-config",
         type=Path,
-        default=default_pipeline,
+        default=None,
         help="Path to the DS8 pipeline YAML definition.",
+    )
+    parser.add_argument(
+        "--pgie-profile",
+        choices=_PGIE_PROFILES,
+        default=default_pgie_profile,
+        help="PGIE profile overlay (default: yolo11_seg). Env: NOESIS_PGIE_PROFILE",
     )
     parser.add_argument(
         "--cameras-config",
         type=Path,
-        default=default_cameras,
+        default=None,
         help="Path to the cameras YAML used for intrinsics.",
+    )
+    parser.add_argument(
+        "--tracking-mode",
+        choices=_TRACKING_MODES,
+        default=None,
+        help="Tracking mode selection (legacy or v3dt). Env: NOESIS_TRACKING_MODE",
+    )
+    parser.add_argument(
+        "--v3dt",
+        dest="v3dt",
+        action="store_true",
+        default=False,
+        help="Shortcut for --tracking-mode v3dt.",
     )
     parser.add_argument(
         "--ws-host",
@@ -128,6 +551,170 @@ def _parse_args() -> argparse.Namespace:
         help="Enable the MapAnything depth valve for this many seconds on startup (0 to disable).",
     )
     return parser.parse_args()
+
+
+def _normalize_tracking_mode(value: Any) -> str:
+    mode = str(value or "").strip().lower()
+    if mode in ("v3dt", "sv3dt", "mv3dt", "3d"):
+        return "v3dt"
+    if mode in ("legacy", "2d", "baseline", "standard", "default"):
+        return "legacy"
+    if not mode or mode == "auto":
+        return "legacy"
+    logging.getLogger("ds8.runtime").warning("Unknown tracking mode '%s'; defaulting to legacy", value)
+    return "legacy"
+
+
+def _resolve_tracking_mode(args: argparse.Namespace) -> str:
+    if args.tracking_mode:
+        return _normalize_tracking_mode(args.tracking_mode)
+    if getattr(args, "v3dt", False):
+        return "v3dt"
+    env_mode = os.environ.get("NOESIS_TRACKING_MODE", "")
+    if str(env_mode).strip():
+        return _normalize_tracking_mode(env_mode)
+    return "legacy"
+
+
+def _mode_default_paths(mode: str) -> Tuple[Path, Path]:
+    if mode == "v3dt":
+        return (
+            REPO_ROOT / "config" / "infer_v3dt_baseline.yaml",
+            REPO_ROOT / "config" / "cameras_v3dt_baseline.yaml",
+        )
+    return (REPO_ROOT / "config" / "infer.yaml", REPO_ROOT / "config" / "cameras.yaml")
+
+
+def _resolve_pipeline_and_camera_paths(
+    args: argparse.Namespace, tracking_mode: str, logger: logging.Logger
+) -> Tuple[Path, Path]:
+    default_pipeline, default_cameras = _mode_default_paths(tracking_mode)
+    pipeline_src = "default"
+    cameras_src = "default"
+
+    pipeline_path = args.pipeline_config
+    if pipeline_path is not None:
+        pipeline_src = "cli"
+    else:
+        env_pipeline = os.environ.get("NOESIS_DS8_PIPELINE_CONFIG", "")
+        if str(env_pipeline).strip():
+            pipeline_path = Path(env_pipeline)
+            pipeline_src = "env"
+        else:
+            pipeline_path = default_pipeline
+
+    cameras_path = args.cameras_config
+    if cameras_path is not None:
+        cameras_src = "cli"
+    else:
+        env_cameras = os.environ.get("NOESIS_CAMERAS_CONFIG", "")
+        if str(env_cameras).strip():
+            cameras_path = Path(env_cameras)
+            cameras_src = "env"
+        else:
+            cameras_path = default_cameras
+
+    pipeline_path = Path(pipeline_path)
+    cameras_path = Path(cameras_path)
+    logger.info(
+        "Tracking mode '%s' resolved pipeline=%s (%s), cameras=%s (%s)",
+        tracking_mode,
+        pipeline_path,
+        pipeline_src,
+        cameras_path,
+        cameras_src,
+    )
+    return pipeline_path, cameras_path
+
+
+def _load_pipeline_config(path: Path, logger: logging.Logger) -> Optional[Dict[str, Any]]:
+    try:
+        data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    except Exception as exc:
+        logger.error("Unable to read pipeline config %s: %s", path, exc)
+        return None
+    if not isinstance(data, dict):
+        logger.error("Pipeline config must be a mapping: %s", path)
+        return None
+    return data
+
+
+def _resolve_tracker_config_path(pipeline_cfg: Dict[str, Any], pipeline_path: Path) -> Optional[Path]:
+    tracker_cfg = pipeline_cfg.get("tracker") or {}
+    raw = (tracker_cfg or {}).get("config-file") if isinstance(tracker_cfg, dict) else None
+    if not raw:
+        return None
+    return _resolve_pipeline_cfg_path(pipeline_path, raw)
+
+
+def _tracker_under_v3dt_dir(path: Path) -> bool:
+    v3dt_root = (REPO_ROOT / "config" / "v3dt").resolve()
+    try:
+        path.resolve().relative_to(v3dt_root)
+        return True
+    except Exception:
+        return False
+
+
+def _validate_v3dt_tracking_guardrails(pipeline_path: Path, logger: logging.Logger) -> bool:
+    pipeline_cfg = _load_pipeline_config(pipeline_path, logger)
+    if pipeline_cfg is None:
+        return False
+    tracker_path = _resolve_tracker_config_path(pipeline_cfg, pipeline_path)
+    if tracker_path is None:
+        logger.error("Tracking mode 'v3dt' requires tracker.config-file to be set in %s", pipeline_path)
+        return False
+    if not tracker_path.exists():
+        logger.error("Tracking mode 'v3dt' tracker config missing: %s", tracker_path)
+        return False
+    if not _tracker_under_v3dt_dir(tracker_path):
+        logger.error(
+            "Tracking mode 'v3dt' requires tracker config under config/v3dt/ (got %s)",
+            tracker_path,
+        )
+        return False
+    try:
+        tracker_cfg = yaml.safe_load(tracker_path.read_text(encoding="utf-8")) or {}
+    except Exception as exc:
+        logger.error("Unable to read V3DT tracker config %s: %s", tracker_path, exc)
+        return False
+    if not isinstance(tracker_cfg, dict):
+        logger.error("V3DT tracker config must be a mapping: %s", tracker_path)
+        return False
+    omp = tracker_cfg.get("ObjectModelProjection") or {}
+    caminfo = (omp or {}).get("cameraModelFilepath") if isinstance(omp, dict) else None
+    if isinstance(caminfo, (list, tuple)) and caminfo:
+        return True
+    if isinstance(caminfo, str) and caminfo.strip():
+        return True
+    logger.error(
+        "Tracking mode 'v3dt' requires ObjectModelProjection.cameraModelFilepath in %s",
+        tracker_path,
+    )
+    return False
+
+
+def _warn_legacy_with_v3dt_tracker(pipeline_path: Path, logger: logging.Logger) -> None:
+    pipeline_cfg = _load_pipeline_config(pipeline_path, logger)
+    if pipeline_cfg is None:
+        return
+    tracker_path = _resolve_tracker_config_path(pipeline_cfg, pipeline_path)
+    if tracker_path is None:
+        return
+    if _tracker_under_v3dt_dir(tracker_path):
+        logger.warning(
+            "Tracking mode 'legacy' with V3DT tracker config %s; V3DT meta/bbox3d will be ignored",
+            tracker_path,
+        )
+
+
+def _ensure_v3dt_meta_extension(logger: logging.Logger) -> bool:
+    try:
+        import noesis_v3dt_meta_ext  # type: ignore  # noqa: F401
+    except Exception as exc:
+        logger.error("Tracking mode 'v3dt' requires noesis_v3dt_meta_ext; import failed: %s", exc)
+        return False
+    return True
 
 
 def _load_camera_labels(path: Path) -> Dict[int, str]:
@@ -229,6 +816,7 @@ class _CalibrationProvider:
 
     def __init__(self, cameras_path: Path, pipeline_cfg: Dict[str, object]) -> None:
         self._loader = CameraConfigLoader(cameras_path)
+        self._camera_model_res = self._load_camera_model_resolutions(cameras_path)
         self._intrinsics_models = load_intrinsics(str(REPO_ROOT / "intrinsics.json"))
         self._align = load_alignment(str(REPO_ROOT / "config" / "ply_alignment.json"))
         self._extrinsics_path = REPO_ROOT / "config" / "camera_calibration.json"
@@ -253,6 +841,59 @@ class _CalibrationProvider:
         self._camera_labels: Dict[int, str] = {}
         self._bundle_cache: Optional[Dict[str, object]] = None
 
+    @staticmethod
+    def _resolution_from_entry(entry: Any) -> Optional[Tuple[int, int]]:
+        if not isinstance(entry, dict):
+            return None
+        res = entry.get("resolution")
+        if isinstance(res, (list, tuple)) and len(res) >= 2:
+            try:
+                w = int(res[0])
+                h = int(res[1])
+                if w > 0 and h > 0:
+                    return w, h
+            except Exception:
+                return None
+        intr = entry.get("intrinsics")
+        if isinstance(intr, dict):
+            res = intr.get("resolution")
+            if isinstance(res, (list, tuple)) and len(res) >= 2:
+                try:
+                    w = int(res[0])
+                    h = int(res[1])
+                    if w > 0 and h > 0:
+                        return w, h
+                except Exception:
+                    return None
+        return None
+
+    @classmethod
+    def _load_camera_model_resolutions(cls, cameras_path: Path) -> Dict[str, Tuple[int, int]]:
+        try:
+            data = yaml.safe_load(Path(cameras_path).read_text()) or {}
+        except Exception:
+            return {}
+        models = data.get("intrinsics_models") or {}
+        cameras = data.get("cameras") or {}
+        if not isinstance(models, dict) or not isinstance(cameras, dict):
+            return {}
+        model_res: Dict[str, Tuple[int, int]] = {}
+        for key, entry in models.items():
+            res = cls._resolution_from_entry(entry)
+            if res:
+                model_res[str(key)] = res
+        cam_res: Dict[str, Tuple[int, int]] = {}
+        for entry in cameras.values():
+            if not isinstance(entry, dict):
+                continue
+            name = entry.get("name")
+            model = entry.get("model") or entry.get("intrinsics_model")
+            if isinstance(name, str) and isinstance(model, str):
+                res = model_res.get(model)
+                if res:
+                    cam_res[name] = res
+        return cam_res
+
     def set_camera_labels(self, labels: Dict[int, str]) -> None:
         self._camera_labels = dict(labels or {})
         self._bundle_cache = None
@@ -260,6 +901,11 @@ class _CalibrationProvider:
     def reload_extrinsics(self) -> None:
         """Reload extrinsics from camera_calibration.json without touching alignment."""
         self._extrinsics = load_extrinsics(str(self._extrinsics_path))
+        self._bundle_cache = None
+
+    def reload_alignment(self) -> None:
+        """Reload alignment from ply_alignment.json."""
+        self._align = load_alignment(str(REPO_ROOT / "config" / "ply_alignment.json"))
         self._bundle_cache = None
 
     def snapshot(self, source_id: int, camera_id: str) -> Optional["CalibrationSnapshot"]:
@@ -293,6 +939,9 @@ class _CalibrationProvider:
 
         # Align intrinsics with the current streammux resolution (mirror DS7 scaling rules).
         base_w = base_h = None
+        res = self._camera_model_res.get(camera_id)
+        if res:
+            base_w, base_h = res
         try:
             spec = (self._camera_specs or {}).get(camera_id) if isinstance(self._camera_specs, dict) else None
             if isinstance(spec, dict):
@@ -358,15 +1007,41 @@ class _CalibrationProvider:
         )
         cams_node = bundle.setdefault("cameras", {})
         k_table = cams_node.setdefault("K", {})
-        if not k_table:
-            for src_id, cam_name in self._camera_labels.items():
-                intr = self._loader.get(src_id)
-                if intr is None:
-                    continue
+        frame_w, frame_h = self._frame_size
+        if frame_w <= 0 or frame_h <= 0:
+            frame_w, frame_h = 1920, 1080
+        for src_id, cam_name in self._camera_labels.items():
+            intr = self._loader.get(src_id)
+            if intr is None:
+                continue
+            try:
+                fx = float(intr.fx)
+                fy = float(intr.fy)
+                cx = float(intr.cx)
+                cy = float(intr.cy)
+            except Exception:
+                continue
+            base_w = base_h = 0
+            res = self._camera_model_res.get(cam_name)
+            if res:
+                base_w, base_h = res
+            if base_w <= 0 or base_h <= 0:
                 try:
-                    k_table[cam_name] = [float(intr.fx), float(intr.fy), float(intr.cx), float(intr.cy)]
+                    base_w = int(round(cx * 2.0))
+                    base_h = int(round(cy * 2.0))
                 except Exception:
-                    continue
+                    base_w = base_h = 0
+            if base_w > 0 and base_h > 0 and (base_w != frame_w or base_h != frame_h):
+                try:
+                    sx = float(frame_w) / float(base_w)
+                    sy = float(frame_h) / float(base_h)
+                    fx *= sx
+                    cx *= sx
+                    fy *= sy
+                    cy *= sy
+                except Exception:
+                    pass
+            k_table[cam_name] = [fx, fy, cx, cy]
         self._bundle_cache = bundle
         return dict(bundle)
 
@@ -1601,8 +2276,15 @@ def main() -> int:
     except Exception:
         signal.signal(signal.SIGTERM, _signal_handler)
 
-    pipeline_path = Path(args.pipeline_config).expanduser().resolve()
-    cameras_path = Path(args.cameras_config).expanduser().resolve()
+    tracking_mode = _resolve_tracking_mode(args)
+    os.environ["NOESIS_TRACKING_MODE"] = tracking_mode
+    if tracking_mode not in _TRACKING_MODES:
+        logger.warning("Normalized tracking mode '%s' is unknown; defaulting to legacy", tracking_mode)
+        tracking_mode = "legacy"
+
+    pipeline_path, cameras_path = _resolve_pipeline_and_camera_paths(args, tracking_mode, logger)
+    pipeline_path = pipeline_path.expanduser().resolve()
+    cameras_path = cameras_path.expanduser().resolve()
 
     # Ensure process CWD is the repo root so relative paths in YAML (engines, configs)
     # resolve correctly for DS8 plugins and hooks.
@@ -1614,8 +2296,24 @@ def main() -> int:
     if not pipeline_path.exists():
         logger.error("Pipeline configuration not found: %s", pipeline_path)
         return 1
+    if tracking_mode == "v3dt":
+        if not _ensure_v3dt_meta_extension(logger):
+            return 1
+        if not _validate_v3dt_tracking_guardrails(pipeline_path, logger):
+            return 1
+    else:
+        _warn_legacy_with_v3dt_tracker(pipeline_path, logger)
 
-    os.environ.setdefault("NOESIS_DS8_PIPELINE_CONFIG", str(pipeline_path))
+    base_pipeline_path = pipeline_path
+    pipeline_path = _materialize_effective_pipeline_yaml(base_pipeline_path, str(args.pgie_profile), logger)
+    logger.info("Building DS8 pipeline from %s (base: %s)", pipeline_path, base_pipeline_path)
+
+    if not _maybe_autogen_v3dt_caminfo(pipeline_path, cameras_path, logger):
+        return 1
+    if not _validate_dewarper_intrinsics_sync(pipeline_path, cameras_path, logger):
+        return 1
+
+    os.environ["NOESIS_DS8_PIPELINE_CONFIG"] = str(pipeline_path)
     try:
         from noesis.server import analytics_api
 
@@ -2037,7 +2735,6 @@ def main() -> int:
             )
             return {"error": str(exc) or "floorplan_failed", "camera_id": camera_id}
 
-    logger.info("Building DS8 pipeline from %s", pipeline_path)
     pipeline = ds8_pipeline.build_pipeline(pipeline_path)
     setattr(pipeline, "camera_labels", camera_labels)
     if getattr(pipeline, "ds_pipeline", None) is None:
@@ -2177,6 +2874,267 @@ def main() -> int:
     ws_server.floorplan_provider = _ds8_floorplan_provider
     ws_server.calibration_getter = calibration_provider.calibration_bundle
     ws_server.auto_calibrate_handler = _ds8_auto_calibrate_handler
+
+    def _broadcast_calibration_bundle() -> None:
+        try:
+            bundle = calibration_provider.calibration_bundle()
+        except Exception:
+            logger.debug("Failed to build calibration bundle for broadcast", exc_info=True)
+            return
+        if storage_manager is not None:
+            try:
+                storage_manager.calibration_bundle = bundle
+            except Exception:
+                logger.debug("Failed to update storage calibration bundle", exc_info=True)
+        try:
+            ws_server.broadcast_sync({"type": "calibration-bundle", "data": bundle})
+        except Exception:
+            logger.debug("Failed to broadcast calibration bundle", exc_info=True)
+
+    def _resolve_ws_camera_id(raw: object) -> Optional[str]:
+        if isinstance(raw, dict):
+            # Menon sometimes sends {"id","name"} objects.
+            raw = raw.get("id") or raw.get("name") or raw.get("cameraId") or raw.get("camera")
+        if raw is None:
+            return None
+        text = str(raw).strip()
+        return text or None
+
+    def _camera_to_source_id(camera_id: str) -> Optional[int]:
+        text = str(camera_id).strip()
+        if not text:
+            return None
+        try:
+            idx = int(text)
+        except Exception:
+            idx = None
+        if idx is not None and idx in camera_labels:
+            return idx
+        for sid, cam in camera_labels.items():
+            if cam == text:
+                return int(sid)
+        return None
+
+    def _maybe_coerce_extrinsics_translation_to_meters(E_col_major: list[float]) -> tuple[list[float], Optional[str]]:
+        mode = str(os.environ.get("NOESIS_EXTRINSICS_INPUT_UNITS", "auto") or "").strip().lower()
+        if mode in ("m", "meter", "meters"):
+            return E_col_major, None
+        if mode in ("cm", "centimeter", "centimeters"):
+            note = "cm→m (NOESIS_EXTRINSICS_INPUT_UNITS=cm)"
+            try:
+                Emat = np.array(E_col_major, dtype=np.float64).reshape((4, 4), order="F")
+                Emat[:3, 3] *= 0.01
+                return list(Emat.flatten(order="F")), note
+            except Exception:
+                return E_col_major, note
+
+        # auto: camera height in home scenes should not be tens/hundreds of meters.
+        try:
+            Emat = np.array(E_col_major, dtype=np.float64).reshape((4, 4), order="F")
+            Twc = np.linalg.inv(Emat)
+            C_y = float(Twc[1, 3])
+            if abs(C_y) > 20.0 and abs(C_y / 100.0) < 20.0:
+                Emat[:3, 3] *= 0.01
+                return list(Emat.flatten(order="F")), f"cm→m (auto; |C_y|={abs(C_y):.3f} too large for meters)"
+        except Exception:
+            pass
+        return E_col_major, None
+
+    def _set_extrinsics_handler(req: Dict[str, Any]) -> Dict[str, Any]:
+        cam_id = _resolve_ws_camera_id(req.get("cameraId") or req.get("camera") or req.get("camId") or req.get("id"))
+        if not cam_id:
+            return {"ok": False, "error": "cameraId_required"}
+
+        E: Optional[list[float]] = None
+        try:
+            if isinstance(req.get("E"), list) and len(req["E"]) == 16:
+                E = [float(x) for x in req["E"]]
+            elif isinstance(req.get("Twc"), list) and len(req["Twc"]) == 16:
+                Twc = np.array(req["Twc"], dtype=np.float64).reshape((4, 4), order="F")
+                Emat = np.linalg.inv(Twc)
+                E = list(Emat.flatten(order="F"))
+            else:
+                return {"ok": False, "error": "E_or_Twc_required"}
+        except Exception as exc:
+            return {"ok": False, "error": f"parse_error: {exc}"}
+
+        try:
+            sid = _camera_to_source_id(cam_id)
+            sid_text = "?" if sid is None else str(sid)
+            logger.warning("WS RX set_extrinsics camera=%s sid=%s E_col_major=%s", cam_id, sid_text, E)
+            try:
+                with np.printoptions(precision=6, suppress=True, linewidth=200):
+                    Emat = np.array(E, dtype=np.float64).reshape((4, 4), order="F")
+                    logger.warning("WS RX set_extrinsics camera=%s E_matrix=%s", cam_id, str(Emat))
+            except Exception:
+                pass
+        except Exception:
+            pass
+
+        E, units_note = _maybe_coerce_extrinsics_translation_to_meters(E)
+        if units_note:
+            logger.warning("set_extrinsics: coerced translation units for %s: %s", cam_id, units_note)
+            try:
+                logger.warning("WS RX set_extrinsics camera=%s E_col_major_coerced=%s", cam_id, E)
+                with np.printoptions(precision=6, suppress=True, linewidth=200):
+                    Emat = np.array(E, dtype=np.float64).reshape((4, 4), order="F")
+                    logger.warning("WS RX set_extrinsics camera=%s E_matrix_coerced=%s", cam_id, str(Emat))
+            except Exception:
+                pass
+
+        try:
+            E_matrix = np.array(E, dtype=np.float64).reshape((4, 4), order="F")
+            if np.allclose(E_matrix, np.eye(4), atol=1e-3):
+                return {"ok": False, "error": "calibration_invalid_identity"}
+        except Exception:
+            return {"ok": False, "error": "bad_extrinsics"}
+
+        calib_path = str(REPO_ROOT / "config" / "camera_calibration.json")
+        if not save_extrinsics(calib_path, cam_id, E):
+            return {"ok": False, "error": "persist_failed"}
+
+        logger.warning("WS set_extrinsics persisted camera=%s path=%s", cam_id, calib_path)
+
+        calibration_provider.reload_extrinsics()
+        _broadcast_calibration_bundle()
+        return {"ok": True, "cameraId": cam_id}
+
+    def _set_align_handler(req: Dict[str, Any]) -> Dict[str, Any]:
+        align_update = req.get("align")
+        if not isinstance(align_update, dict):
+            return {"ok": False, "error": "align_required"}
+        matrix = align_update.get("matrix")
+        if matrix is not None and (not isinstance(matrix, list) or len(matrix) != 16):
+            return {"ok": False, "error": "invalid_matrix"}
+        floor_y = align_update.get("floor_y")
+        if floor_y is not None and not isinstance(floor_y, (int, float)):
+            return {"ok": False, "error": "invalid_floor_y"}
+        units = align_update.get("units") if isinstance(align_update.get("units"), dict) else None
+        if isinstance(units, dict) and "s_obj_to_m" in units:
+            try:
+                sval = float(units.get("s_obj_to_m"))
+                if not (sval > 0):
+                    return {"ok": False, "error": "invalid_s_obj_to_m"}
+            except Exception:
+                return {"ok": False, "error": "invalid_s_obj_to_m"}
+
+        try:
+            floor_y_log = align_update.get("floor_y")
+            s_obj_to_m_log = (units or {}).get("s_obj_to_m") if isinstance(units, dict) else None
+            matrix_log = align_update.get("matrix")
+            matrix_len = len(matrix_log) if isinstance(matrix_log, list) else None
+            logger.warning(
+                "WS RX set_align floor_y=%s s_obj_to_m=%s matrix_len=%s",
+                floor_y_log,
+                s_obj_to_m_log,
+                matrix_len,
+            )
+        except Exception:
+            pass
+
+        align_path = str(REPO_ROOT / "config" / "ply_alignment.json")
+        if not save_alignment(align_path, align_update):
+            return {"ok": False, "error": "persist_failed"}
+
+        logger.warning("WS set_align persisted path=%s", align_path)
+
+        calibration_provider.reload_alignment()
+        _broadcast_calibration_bundle()
+        return {"ok": True}
+
+    def _pixel_to_world_handler(req: Dict[str, Any]) -> Dict[str, Any]:
+        cam_id = _resolve_ws_camera_id(req.get("cameraId") or req.get("camera") or req.get("camId") or req.get("id"))
+        if not cam_id:
+            return {"ok": False, "error": "cameraId_required"}
+        src_id = _camera_to_source_id(cam_id)
+        if src_id is None:
+            return {"ok": False, "error": "unknown_camera"}
+
+        try:
+            u = float(req.get("u"))
+            v = float(req.get("v"))
+        except Exception:
+            return {"ok": False, "error": "uv_required"}
+
+        depth_m: Optional[float] = None
+        try:
+            raw_depth = req.get("depth_m", req.get("depth"))
+            if raw_depth is not None:
+                depth_m = float(raw_depth)
+        except Exception:
+            depth_m = None
+
+        snap = calibration_provider.snapshot(int(src_id), str(camera_labels.get(int(src_id), cam_id)))
+        if snap is None:
+            return {"ok": False, "error": "calibration_missing"}
+
+        K = np.array(snap.intrinsics, dtype=np.float64)
+        E_col_major = list(snap.extrinsics_col_major)
+        floor_y = float(snap.floor_y or 0.0)
+        unit_scale = float(snap.unit_scale or 1.0)
+        if not (np.isfinite(unit_scale) and unit_scale > 0):
+            unit_scale = 1.0
+
+        try:
+            Emat = np.array(E_col_major, dtype=np.float64).reshape((4, 4), order="F")
+            Twc = np.linalg.inv(Emat)
+            R_wc = Twc[:3, :3].copy()
+            C_world = (Twc[:3, 3].copy()) * unit_scale
+            floor_y_m = float(floor_y) * unit_scale
+        except Exception:
+            return {"ok": False, "error": "bad_extrinsics"}
+
+        method = "floor"
+        world_point: Optional[list[float]] = None
+
+        if depth_m is not None and np.isfinite(depth_m) and depth_m > 0:
+            try:
+                fx = float(K[0, 0])
+                fy = float(K[1, 1])
+                cx = float(K[0, 2])
+                cy = float(K[1, 2])
+                x_cam = (u - cx) / fx * depth_m * unit_scale
+                y_cam = (v - cy) / fy * depth_m * unit_scale
+                z_cam = depth_m * unit_scale
+                p_world = (R_wc @ np.array([x_cam, y_cam, z_cam], dtype=np.float64)) + C_world
+                world_point = [float(p_world[0]), float(p_world[1]), float(p_world[2])]
+                method = "depth"
+            except Exception:
+                world_point = None
+                method = "floor"
+
+        if world_point is None:
+            try:
+                uv1 = np.array([u, v, 1.0], dtype=np.float64)
+                dir_cam = np.linalg.inv(K) @ uv1
+                norm = float(np.linalg.norm(dir_cam))
+                if norm <= 1e-9:
+                    return {"ok": False, "error": "invalid_ray"}
+                dir_cam = dir_cam / norm
+                dir_world = R_wc @ dir_cam
+                denom = float(dir_world[1])
+                if abs(denom) < 1e-9:
+                    return {"ok": False, "error": "no_intersection"}
+                t = (floor_y_m - float(C_world[1])) / denom
+                if t < 0:
+                    return {"ok": False, "error": "no_intersection"}
+                hit = C_world + float(t) * dir_world
+                world_point = [float(hit[0]), float(hit[1]), float(hit[2])]
+                method = "floor"
+            except Exception:
+                return {"ok": False, "error": "no_intersection"}
+
+        return {
+            "ok": True,
+            "world": list(world_point),
+            "world_point": list(world_point),
+            "method": method,
+        }
+
+    ws_server.set_extrinsics_handler = _set_extrinsics_handler
+    ws_server.set_align_handler = _set_align_handler
+    ws_server.pixel_to_world_handler = _pixel_to_world_handler
+
     setattr(pipeline, "ws_server", ws_server)
     bev_renderer = BevRenderer(
         ws_server,
@@ -2189,6 +3147,9 @@ def main() -> int:
     ws_server.bev_overlay_callback = lambda cam_id, enabled: bev_renderer.update_config(cam_id, {"overlay": enabled})
     depth_pub = DepthTelemetryPublisher(ws_server)
     tracking_pub = TrackingTelemetryPublisher(ws_server)
+    diagnostics_logger = TrackingDiagnosticsLogger.from_env()
+    if diagnostics_logger:
+        logger.info("V3DT diagnostics logging enabled: %s", diagnostics_logger.output_path)
 
     # Attach MapAnything postprocess only if SGIE is present/enabled
     try:
@@ -2214,9 +3175,11 @@ def main() -> int:
     hooks.attach_analytics_telemetry_hook(
         pipeline,
         tracking_pub=tracking_pub,
+        tracking_mode=tracking_mode,
         camera_labels=camera_labels,
         bev_renderer=bev_renderer,
         bev_calibration=calibration_provider,
+        diagnostics_logger=diagnostics_logger,
     )
     hooks.attach_exclude_prune_hook(pipeline)
     hooks.attach_analytics_reload_bridge(pipeline)
@@ -2429,6 +3392,11 @@ def main() -> int:
         storage_manager.shutdown(wait=True)
     except Exception:
         pass
+    try:
+        if diagnostics_logger is not None:
+            diagnostics_logger.close()
+    except Exception:
+        logger.exception("Error closing diagnostics logger")
 
     _stop_rest_server(rest_server, rest_thread)
 

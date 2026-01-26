@@ -5,8 +5,7 @@ version: 1
 # batch (3) matches the shipped YOLO engine and we can observe cross-camera IDs.
 #
 # Run with:
-#   NOESIS_DS8_USE_NVURISRCBIN=1 NOESIS_REID_DEBUG=1 \\
-#   NOESIS_MOSAIC_JPEG_ENABLED=0 NOESIS_MOSAIC_RTSP_ENABLED=0 NOESIS_MOSAIC_WEBRTC_ENABLED=0 \\
+#   NOESIS_REID_DEBUG=1 NOESIS_MOSAIC_JPEG_ENABLED=0 NOESIS_MOSAIC_RTSP_ENABLED=0 NOESIS_MOSAIC_WEBRTC_ENABLED=0 \\
 #   python3 noesis/ds8_runtime.py --pipeline-config config/infer_smoke_reid.yaml --disable-rest
 
 batch_size: 3

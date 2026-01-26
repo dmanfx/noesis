@@ -34,6 +34,16 @@ try:  # pragma: no cover - DeepStream bindings are optional during unit tests
 except Exception:  # pragma: no cover - handled gracefully when absent
     pyds = None  # type: ignore
 
+try:  # pragma: no cover - optional native bridge for V3DT meta
+    import noesis_v3dt_meta_ext  # type: ignore
+except Exception:  # pragma: no cover - extension unavailable in tests
+    noesis_v3dt_meta_ext = None  # type: ignore
+
+try:  # pragma: no cover - diagnostics optional in tests
+    from noesis.diagnostics.telemetry_log import TrackingDiagnosticsLogger
+except Exception:  # pragma: no cover - fallback when diagnostics are absent
+    TrackingDiagnosticsLogger = None  # type: ignore
+
 logger = logging.getLogger(__name__)
 _REID_DLPACK_DEBUG_LOGGED = False
 
@@ -108,10 +118,12 @@ def attach_analytics_telemetry_hook(
     pipeline: "DS8Pipeline",
     *,
     tracking_pub: "TrackingTelemetryPublisher",
+    tracking_mode: Optional[str] = None,
     camera_labels: Optional[Mapping[int, str]] = None,
     sensor_id_map: Optional[Mapping[int, int]] = None,
     bev_renderer: Any | None = None,
     bev_calibration: Any | None = None,
+    diagnostics_logger: "TrackingDiagnosticsLogger" | None = None,
 ) -> None:
     """Attach a BatchMetadataOperator that extracts analytics telemetry."""
     if tracking_pub is None:
@@ -124,10 +136,12 @@ def attach_analytics_telemetry_hook(
     processor = _AnalyticsTelemetryProcessor(
         pipeline=pipeline,
         tracking_pub=tracking_pub,
+        tracking_mode=tracking_mode,
         camera_labels=camera_labels or {},
         sensor_id_map=sensor_id_map or {},
         bev_renderer=bev_renderer,
         bev_calibration=bev_calibration,
+        diagnostics_logger=diagnostics_logger,
     )
     analytics_component.config["_analytics_processor"] = processor
 
@@ -1798,8 +1812,10 @@ class _AnalyticsTelemetryProcessor:
     tracking_pub: "TrackingTelemetryPublisher"
     camera_labels: Mapping[int, str]
     sensor_id_map: Mapping[int, int]
+    tracking_mode: Optional[str] = None
     bev_renderer: Any = None
     bev_calibration: Any = None
+    diagnostics_logger: Any = None
     osd_label_processor: Any = None
     _analytics_obj_meta_type: Any = field(default=None, init=False, repr=False)
     _zone_state: Dict[int, Dict[int, Dict[str, Any]]] = field(default_factory=dict, init=False, repr=False)
@@ -1823,6 +1839,14 @@ class _AnalyticsTelemetryProcessor:
     _reid_debug_people: int = field(default=0, init=False, repr=False)
     _reid_debug_emb_found: int = field(default=0, init=False, repr=False)
     _reid_debug_emb_missing: int = field(default=0, init=False, repr=False)
+    _diag_logged: bool = field(default=False, init=False, repr=False)
+    _tracking_mode: str = field(default="legacy", init=False, repr=False)
+    _world_frame: str = field(default="camera_local", init=False, repr=False)
+    _v3dt_meta_enabled: bool = field(default=True, init=False, repr=False)
+    _v3dt_meta_logged_missing: bool = field(default=False, init=False, repr=False)
+    _v3dt_caminfo_paths: Dict[int, Path] = field(default_factory=dict, init=False, repr=False)
+    _v3dt_caminfo_cache: Dict[int, Tuple[str, List[List[float]]]] = field(default_factory=dict, init=False, repr=False)
+    _v3dt_caminfo_logged_missing: bool = field(default=False, init=False, repr=False)
 
     def __post_init__(self) -> None:
         # Discover the ReID SGIE unique-id from the built pipeline config when present.
@@ -1836,11 +1860,220 @@ class _AnalyticsTelemetryProcessor:
         except Exception:
             self._reid_unique_id = 3
 
+        self._tracking_mode = self._resolve_tracking_mode(self.tracking_mode)
+
+        try:
+            v3dt_cfg = getattr(self.pipeline, "config", {}).get("v3dt", {}) or {}
+            frame = v3dt_cfg.get("world_frame") if isinstance(v3dt_cfg, dict) else None
+            if frame:
+                self._world_frame = str(frame)
+        except Exception:
+            self._world_frame = "camera_local"
+
+        flag = str(os.environ.get("NOESIS_V3DT_META_EXTRACT", "1") or "").strip().lower()
+        self._v3dt_meta_enabled = flag in ("", "1", "true", "yes", "y", "on")
+        if not self._tracking_mode_is_v3dt():
+            self._v3dt_meta_enabled = False
+        if self._tracking_mode_is_v3dt():
+            self._ensure_v3dt_caminfo_paths()
+        self._warn_on_tracking_mode_mismatch()
+
+    def _tracking_mode_is_v3dt(self) -> bool:
+        return str(self._tracking_mode or "").strip().lower() == "v3dt"
+
+    def _resolve_tracking_mode(self, override: Optional[str] = None) -> str:
+        if override is not None and str(override).strip():
+            return self._normalize_tracking_mode(override)
+        env_mode = str(os.environ.get("NOESIS_TRACKING_MODE", "") or "").strip()
+        if env_mode:
+            return self._normalize_tracking_mode(env_mode)
+        try:
+            cfg = getattr(self.pipeline, "config", {}) or {}
+        except Exception:
+            cfg = {}
+        if isinstance(cfg, Mapping):
+            raw_mode = cfg.get("tracking_mode")
+            if raw_mode:
+                return self._normalize_tracking_mode(raw_mode)
+            v3dt_cfg = cfg.get("v3dt")
+            if isinstance(v3dt_cfg, Mapping):
+                raw_mode = v3dt_cfg.get("tracking_mode") or v3dt_cfg.get("mode")
+                if raw_mode:
+                    return self._normalize_tracking_mode(raw_mode)
+            tracker_cfg = cfg.get("tracker")
+            if isinstance(tracker_cfg, Mapping):
+                cfg_path = tracker_cfg.get("config-file")
+                if cfg_path and "config/v3dt/" in str(cfg_path):
+                    return "v3dt"
+        return "legacy"
+
+    @staticmethod
+    def _normalize_tracking_mode(value: Any) -> str:
+        mode = str(value or "").strip().lower()
+        if mode in ("v3dt", "sv3dt", "mv3dt", "3d"):
+            return "v3dt"
+        if mode in ("legacy", "2d", "baseline", "standard", "default"):
+            return "legacy"
+        if not mode or mode == "auto":
+            return "legacy"
+        logger.warning("Unknown tracking_mode '%s'; defaulting to legacy", value)
+        return "legacy"
+
+    def _warn_on_tracking_mode_mismatch(self) -> None:
+        try:
+            tracker_cfg = getattr(self.pipeline, "config", {}).get("tracker", {}) or {}
+        except Exception:
+            tracker_cfg = {}
+        cfg_path = tracker_cfg.get("config-file") if isinstance(tracker_cfg, Mapping) else None
+        if not cfg_path:
+            return
+        cfg_path = str(cfg_path)
+        using_v3dt_tracker = "config/v3dt/" in cfg_path
+        if using_v3dt_tracker and not self._tracking_mode_is_v3dt():
+            logger.warning(
+                "Tracking mode '%s' with V3DT tracker config %s; V3DT meta/world will be ignored",
+                self._tracking_mode,
+                cfg_path,
+            )
+        if self._tracking_mode_is_v3dt() and not using_v3dt_tracker:
+            logger.warning(
+                "Tracking mode 'v3dt' without V3DT tracker config (%s); V3DT meta may be absent",
+                cfg_path,
+            )
+
+    def _ensure_v3dt_caminfo_paths(self) -> None:
+        if not self._tracking_mode_is_v3dt():
+            return
+        if self._v3dt_caminfo_paths:
+            return
+        try:
+            tracker_cfg = getattr(self.pipeline, "config", {}).get("tracker", {}) or {}
+        except Exception:
+            tracker_cfg = {}
+        cfg_path = tracker_cfg.get("config-file") if isinstance(tracker_cfg, Mapping) else None
+        if not cfg_path:
+            return
+        repo_root = Path(__file__).resolve().parents[2]
+        cfg_path = Path(cfg_path)
+        if not cfg_path.is_absolute():
+            cfg_path = repo_root / cfg_path
+        if not cfg_path.exists():
+            if not self._v3dt_caminfo_logged_missing:
+                logger.warning("V3DT camInfo config missing: %s", cfg_path)
+                self._v3dt_caminfo_logged_missing = True
+            return
+        try:
+            tracker_data = yaml.safe_load(cfg_path.read_text(encoding="utf-8")) or {}
+        except Exception:
+            return
+        projection_cfg = tracker_data.get("ObjectModelProjection") if isinstance(tracker_data, Mapping) else None
+        cam_paths = projection_cfg.get("cameraModelFilepath") if isinstance(projection_cfg, Mapping) else None
+        if not isinstance(cam_paths, list):
+            return
+        for idx, item in enumerate(cam_paths):
+            if not isinstance(item, str) or not item:
+                continue
+            path = Path(item)
+            if not path.is_absolute():
+                path = repo_root / path
+            self._v3dt_caminfo_paths[int(idx)] = path
+
+    def _v3dt_projection_for_source(self, source_id: int) -> Optional[Tuple[str, List[List[float]]]]:
+        if not self._tracking_mode_is_v3dt():
+            return None
+        cached = self._v3dt_caminfo_cache.get(source_id)
+        if cached is not None:
+            return cached
+        self._ensure_v3dt_caminfo_paths()
+        caminfo_path = self._v3dt_caminfo_paths.get(int(source_id))
+        if caminfo_path is None or not caminfo_path.exists():
+            return None
+        try:
+            caminfo = yaml.safe_load(caminfo_path.read_text(encoding="utf-8")) or {}
+        except Exception:
+            return None
+        key = "projectionMatrix_3x4_w2p"
+        data = caminfo.get(key)
+        if not isinstance(data, list) or len(data) != 12:
+            key = "projectionMatrix_3x4"
+            data = caminfo.get(key)
+        if not isinstance(data, list) or len(data) != 12:
+            return None
+        P = [data[0:4], data[4:8], data[8:12]]
+        cached = (key, P)
+        self._v3dt_caminfo_cache[int(source_id)] = cached
+        return cached
+
+    @staticmethod
+    def _project_point(P: Sequence[Sequence[float]], xyz: Sequence[float]) -> Optional[Tuple[float, float]]:
+        try:
+            x, y, z = float(xyz[0]), float(xyz[1]), float(xyz[2])
+        except Exception:
+            return None
+        try:
+            w = (
+                float(P[2][0]) * x
+                + float(P[2][1]) * y
+                + float(P[2][2]) * z
+                + float(P[2][3])
+            )
+            if abs(w) < 1e-9:
+                return None
+            u = (
+                float(P[0][0]) * x
+                + float(P[0][1]) * y
+                + float(P[0][2]) * z
+                + float(P[0][3])
+            ) / w
+            v = (
+                float(P[1][0]) * x
+                + float(P[1][1]) * y
+                + float(P[1][2]) * z
+                + float(P[1][3])
+            ) / w
+            if not (math.isfinite(u) and math.isfinite(v)):
+                return None
+            return float(u), float(v)
+        except Exception:
+            return None
+
+    def _image_base_from_bbox3d(
+        self,
+        source_id: int,
+        bbox3d: Mapping[str, Any],
+        frame_dims: Tuple[int, int],
+    ) -> Optional[List[float]]:
+        proj = self._v3dt_projection_for_source(source_id)
+        if proj is None:
+            return None
+        key, P = proj
+        try:
+            x = float(bbox3d.get("xCentre"))
+            y = float(bbox3d.get("yCentre"))
+            z = float(bbox3d.get("zCentre"))
+            z_len = float(bbox3d.get("zLen"))
+        except Exception:
+            return None
+        if not (math.isfinite(x) and math.isfinite(y) and math.isfinite(z) and math.isfinite(z_len)):
+            return None
+        z_base = z - 0.5 * z_len
+        uv = self._project_point(P, (x, y, z_base))
+        if uv is None:
+            return None
+        u, v = uv
+        if key == "projectionMatrix_3x4":
+            frame_w, frame_h = frame_dims
+            if frame_w and frame_h:
+                u += float(frame_w) * 0.5
+                v += float(frame_h) * 0.5
+        return [float(u), float(v)]
+
     @staticmethod
     def _tensor_to_embedding(layer_tensor: Any) -> Optional[np.ndarray]:
         """Convert a Service Maker Tensor (dlpack) into a 1D float32 embedding."""
         if layer_tensor is None:
             return None
+
         flag = str(os.environ.get("NOESIS_REID_NO_DLPACK", "")).strip().lower()
         if flag in ("1", "true", "yes", "on"):
             try:
@@ -2032,6 +2265,58 @@ class _AnalyticsTelemetryProcessor:
                 _REID_DLPACK_DEBUG_LOGGED = True
             return None
 
+    def _log_diag_session_start(self) -> None:
+        if not self.diagnostics_logger or self._diag_logged:
+            return
+        self._diag_logged = True
+        try:
+            payload = {
+                "type": "v3dt_session_start",
+                "ts": time.time(),
+                "camera_labels": dict(self.camera_labels or {}),
+                "sensor_id_map": dict(self.sensor_id_map or {}),
+                "pipeline_config": getattr(self.pipeline, "config", {}),
+                "env": {k: v for k, v in os.environ.items() if k.startswith("NOESIS_")},
+            }
+            self.diagnostics_logger.log_event(payload)
+        except Exception:
+            logger.debug("Failed to log V3DT diagnostics session start", exc_info=True)
+
+    def _extract_v3dt_meta_ds8(self, obj_meta: Any) -> Optional[Dict[str, Any]]:
+        if not self._v3dt_meta_enabled or not self._tracking_mode_is_v3dt():
+            return None
+        if noesis_v3dt_meta_ext is None:
+            if not self._v3dt_meta_logged_missing:
+                logger.warning("V3DT meta extraction disabled; noesis_v3dt_meta_ext is unavailable")
+                self._v3dt_meta_logged_missing = True
+            return None
+        try:
+            result = noesis_v3dt_meta_ext.extract_obj_3d_meta(obj_meta)
+        except Exception:
+            return None
+        if result is None:
+            return None
+        if isinstance(result, dict):
+            return result
+        try:
+            return dict(result)
+        except Exception:
+            return None
+
+    @staticmethod
+    def _world_from_bbox3d(bbox3d: Mapping[str, Any]) -> Optional[List[float]]:
+        try:
+            x = float(bbox3d.get("xCentre"))
+            y = float(bbox3d.get("yCentre"))
+            z = float(bbox3d.get("zCentre"))
+            z_len = float(bbox3d.get("zLen"))
+        except Exception:
+            return None
+        if not (math.isfinite(x) and math.isfinite(y) and math.isfinite(z) and math.isfinite(z_len)):
+            return None
+        # SV3DT uses Z-up; place the footpoint on the ground plane (Z = center - 0.5 * height).
+        return [float(x), float(y), float(z - 0.5 * z_len)]
+
     def _extract_reid_embedding_ds8(self, obj_meta: Any) -> Optional[np.ndarray]:
         """Extract OSNet embedding from DS8 object tensor meta (SGIE output)."""
         tensor_items_iter = getattr(obj_meta, "tensor_items", None)
@@ -2113,8 +2398,10 @@ class _AnalyticsTelemetryProcessor:
             sensor_id = self.sensor_id_map.get(source_id, source_id)
             camera_id = self.camera_labels.get(sensor_id, f"camera_{sensor_id}")
             now_ts = time.time()
+            self._log_diag_session_start()
 
             tracks: List[Dict[str, Any]] = []
+            diagnostics_tracks: List[Dict[str, Any]] = []
             frame_id = int(getattr(frame_meta, "frame_number", -1))
             occupancy_counts: Dict[str, int] = {}
             present_track_ids: set[int] = set()
@@ -2131,6 +2418,15 @@ class _AnalyticsTelemetryProcessor:
                 raw = self._build_track_dict_ds8(obj_meta, camera_id)
                 if raw is None:
                     continue
+                if self._tracking_mode_is_v3dt():
+                    bbox3d = raw.get("bbox3d")
+                    if isinstance(bbox3d, dict):
+                        image_base = self._image_base_from_bbox3d(int(source_id), bbox3d, frame_dims)
+                        if image_base is not None:
+                            raw["image_base"] = image_base
+                diag_track = dict(raw)
+                diag_track["frame_id"] = frame_id
+                diag_track["source_id"] = int(source_id)
                 if reid_debug:
                     self._reid_debug_objects += 1
 
@@ -2149,6 +2445,7 @@ class _AnalyticsTelemetryProcessor:
                 # People-only public identity. Do not show raw tracker IDs.
                 if class_id != 0:
                     self._stamp_osd_label_ds8(obj_meta, sensor_id=sensor_id, stable_id=None)
+                    diagnostics_tracks.append(diag_track)
                     continue
 
                 if not zone:
@@ -2195,6 +2492,7 @@ class _AnalyticsTelemetryProcessor:
                 if stable_id is None:
                     # People should always have a stable_id; if we can't produce one, show placeholder.
                     self._stamp_osd_label_ds8(obj_meta, sensor_id=sensor_id, stable_id=None)
+                    diagnostics_tracks.append(diag_track)
                     continue
 
                 stable_id_int = int(stable_id)
@@ -2235,9 +2533,34 @@ class _AnalyticsTelemetryProcessor:
                     "frame_id": frame_id,
                     "dwell_time": dwell,
                 }
+                for key in (
+                    "bbox3d",
+                    "velocity3d",
+                    "visibility",
+                    "image_foot",
+                    "image_base",
+                    "world",
+                    "world_valid",
+                    "world_frame",
+                    "world_source",
+                ):
+                    if key in raw:
+                        public_track[key] = raw.get(key)
 
                 self._augment_track_with_world(sensor_id, camera_id, public_track)
+                diag_track.update(
+                    {
+                        "stable_id": stable_id_int,
+                        "zone": zone,
+                        "dwell_time": dwell,
+                        "world": public_track.get("world"),
+                        "world_valid": public_track.get("world_valid"),
+                        "world_frame": public_track.get("world_frame"),
+                        "world_source": public_track.get("world_source"),
+                    }
+                )
                 tracks.append(public_track)
+                diagnostics_tracks.append(diag_track)
 
                 fp = self._footpoint_from_track(public_track, frame_dims)
                 if fp is not None:
@@ -2247,6 +2570,37 @@ class _AnalyticsTelemetryProcessor:
             self._cleanup_zone_state(sensor_id, present_stable_ids)
             self._maintain_stable_ids(sensor_id, present_track_ids, now_ts)
             self._active_tracks[sensor_id] = tracks
+
+            if self.diagnostics_logger:
+                bbox3d_count = 0
+                world_count = 0
+                people_count = 0
+                for item in diagnostics_tracks:
+                    if not isinstance(item, dict):
+                        continue
+                    if int(item.get("class_id", -1)) == 0:
+                        people_count += 1
+                    if isinstance(item.get("bbox3d"), dict):
+                        bbox3d_count += 1
+                    if isinstance(item.get("world"), list):
+                        world_count += 1
+                self.diagnostics_logger.log_frame(
+                    {
+                        "type": "v3dt_tracking_frame",
+                        "ts": float(now_ts),
+                        "ts_us": int(self._frame_timestamp_us(frame_meta)),
+                        "source_id": int(source_id),
+                        "camera_id": camera_id,
+                        "frame_id": frame_id,
+                        "tracks": diagnostics_tracks,
+                        "counts": {
+                            "tracks": len(diagnostics_tracks),
+                            "people_tracks": people_count,
+                            "bbox3d_tracks": bbox3d_count,
+                            "world_tracks": world_count,
+                        },
+                    }
+                )
 
             if reid_debug and (now_ts - float(self._reid_debug_last_log)) >= 1.0:
                 logger.info(
@@ -2304,8 +2658,10 @@ class _AnalyticsTelemetryProcessor:
             sensor_id = self.sensor_id_map.get(source_id, source_id)
             camera_id = self.camera_labels.get(sensor_id, f"camera_{sensor_id}")
             now_ts = time.time()
+            self._log_diag_session_start()
 
             tracks: List[Dict[str, Any]] = []
+            diagnostics_tracks: List[Dict[str, Any]] = []
             frame_id = int(getattr(frame_meta, "frame_num", -1))
             occupancy_counts: Dict[str, int] = {}
             present_track_ids: set[int] = set()
@@ -2317,6 +2673,9 @@ class _AnalyticsTelemetryProcessor:
                 raw = self._build_track_dict(obj_meta, camera_id)
                 if raw is None:
                     continue
+                diag_track = dict(raw)
+                diag_track["frame_id"] = frame_id
+                diag_track["source_id"] = int(source_id)
 
                 track_id = int(raw.get("track_id", -1))
                 if track_id < 0:
@@ -2330,6 +2689,7 @@ class _AnalyticsTelemetryProcessor:
                 zone = raw.get("zone")
                 if class_id != 0:
                     self._stamp_osd_label(obj_meta, sensor_id=sensor_id, stable_id=None)
+                    diagnostics_tracks.append(diag_track)
                     continue
 
                 if not zone:
@@ -2346,6 +2706,7 @@ class _AnalyticsTelemetryProcessor:
                 )
                 if stable_id is None:
                     self._stamp_osd_label(obj_meta, sensor_id=sensor_id, stable_id=None)
+                    diagnostics_tracks.append(diag_track)
                     continue
 
                 stable_id_int = int(stable_id)
@@ -2383,9 +2744,33 @@ class _AnalyticsTelemetryProcessor:
                     "frame_id": frame_id,
                     "dwell_time": dwell,
                 }
+                for key in (
+                    "bbox3d",
+                    "velocity3d",
+                    "visibility",
+                    "image_foot",
+                    "world",
+                    "world_valid",
+                    "world_frame",
+                    "world_source",
+                ):
+                    if key in raw:
+                        public_track[key] = raw.get(key)
 
                 self._augment_track_with_world(sensor_id, camera_id, public_track)
+                diag_track.update(
+                    {
+                        "stable_id": stable_id_int,
+                        "zone": zone,
+                        "dwell_time": dwell,
+                        "world": public_track.get("world"),
+                        "world_valid": public_track.get("world_valid"),
+                        "world_frame": public_track.get("world_frame"),
+                        "world_source": public_track.get("world_source"),
+                    }
+                )
                 tracks.append(public_track)
+                diagnostics_tracks.append(diag_track)
 
                 fp = self._footpoint_from_track(public_track, frame_dims)
                 if fp is not None:
@@ -2395,6 +2780,37 @@ class _AnalyticsTelemetryProcessor:
             self._cleanup_zone_state(sensor_id, present_stable_ids)
             self._maintain_stable_ids(sensor_id, present_track_ids, now_ts)
             self._active_tracks[sensor_id] = tracks
+
+            if self.diagnostics_logger:
+                bbox3d_count = 0
+                world_count = 0
+                people_count = 0
+                for item in diagnostics_tracks:
+                    if not isinstance(item, dict):
+                        continue
+                    if int(item.get("class_id", -1)) == 0:
+                        people_count += 1
+                    if isinstance(item.get("bbox3d"), dict):
+                        bbox3d_count += 1
+                    if isinstance(item.get("world"), list):
+                        world_count += 1
+                self.diagnostics_logger.log_frame(
+                    {
+                        "type": "v3dt_tracking_frame",
+                        "ts": float(now_ts),
+                        "ts_us": int(self._frame_timestamp_us(frame_meta)),
+                        "source_id": int(source_id),
+                        "camera_id": camera_id,
+                        "frame_id": frame_id,
+                        "tracks": diagnostics_tracks,
+                        "counts": {
+                            "tracks": len(diagnostics_tracks),
+                            "people_tracks": people_count,
+                            "bbox3d_tracks": bbox3d_count,
+                            "world_tracks": world_count,
+                        },
+                    }
+                )
 
             if not tracks and os.environ.get("NOESIS_REID_TEST_MODE") == "1":
                 synthetic = {
@@ -2522,6 +2938,29 @@ class _AnalyticsTelemetryProcessor:
     def _footpoint_from_track(
         self, track: Mapping[str, Any], frame_dims: Tuple[int, int]
     ) -> Optional[Footpoint]:
+        def _parse_uv(value: Any) -> Optional[Tuple[float, float]]:
+            if not isinstance(value, (list, tuple)) or len(value) < 2:
+                return None
+            try:
+                u = float(value[0])
+                v = float(value[1])
+            except Exception:
+                return None
+            if not math.isfinite(u) or not math.isfinite(v):
+                return None
+            return u, v
+
+        def _clip_uv(u: float, v: float) -> Optional[Tuple[float, float]]:
+            frame_w, frame_h = frame_dims
+            if frame_h:
+                margin = max(2.0, 0.01 * float(frame_h))
+                if v < -margin or v > (frame_h + margin):
+                    return None
+                v = float(np.clip(v, 0.0, float(frame_h)))
+            if frame_w:
+                u = float(np.clip(u, 0.0, float(frame_w)))
+            return u, v
+
         try:
             class_id = int(track.get("class_id", -1))
         except Exception:
@@ -2554,25 +2993,43 @@ class _AnalyticsTelemetryProcessor:
 
         if class_id not in self._bev_class_ids:
             return None
-        bbox = track.get("bbox")
-        if not bbox or len(bbox) < 4:
-            return None
-        try:
-            left, top, width, height = [float(x) for x in bbox[:4]]
-        except Exception:
-            return None
-        if width <= 0.0 or height <= 0.0:
-            return None
-        u = left + width * 0.5
-        v = top + height
-        frame_w, frame_h = frame_dims
-        if frame_h:
-            margin = max(2.0, 0.01 * float(frame_h))
-            if v < -margin or v > (frame_h + margin):
+        u = v = None
+        method = None
+
+        use_image_meta = self._tracking_mode_is_v3dt()
+        if use_image_meta:
+            if track.get("world_source") != "bbox3d" and not isinstance(track.get("bbox3d"), dict):
+                use_image_meta = False
+
+        if use_image_meta:
+            for key, label in (("image_base", "image_base"), ("image_foot", "image_foot")):
+                uv = _parse_uv(track.get(key))
+                if uv is None:
+                    continue
+                clipped = _clip_uv(*uv)
+                if clipped is None:
+                    continue
+                u, v = clipped
+                method = label
+                break
+
+        if u is None or v is None:
+            bbox = track.get("bbox")
+            if not bbox or len(bbox) < 4:
                 return None
-            v = float(np.clip(v, 0.0, float(frame_h)))
-        if frame_w:
-            u = float(np.clip(u, 0.0, float(frame_w)))
+            try:
+                left, top, width, height = [float(x) for x in bbox[:4]]
+            except Exception:
+                return None
+            if width <= 0.0 or height <= 0.0:
+                return None
+            u = left + width * 0.5
+            v = top + height
+            clipped = _clip_uv(float(u), float(v))
+            if clipped is None:
+                return None
+            u, v = clipped
+            method = "bbox"
 
         stable_id = track.get("stable_id")
         try:
@@ -2581,7 +3038,7 @@ class _AnalyticsTelemetryProcessor:
             stable_id_int = None
         if stable_id_int is not None and stable_id_int <= 0:
             stable_id_int = None
-        return Footpoint(u=u, v=v, method="bbox", stable_id=stable_id_int)
+        return Footpoint(u=u, v=v, method=method or "bbox", stable_id=stable_id_int)
 
     def _frame_timestamp_us(self, frame_meta: Any) -> int:
         pts_ns = int(_meta_lookup(frame_meta, "buf_pts", "buffer_pts", "pts", default=0) or 0)
@@ -2592,6 +3049,10 @@ class _AnalyticsTelemetryProcessor:
     def _augment_track_with_world(self, sensor_id: int, camera_id: str, track: Dict[str, Any]) -> None:
         """Calculate world coordinates for a track if calibration is available."""
         if self.bev_calibration is None:
+            return
+        if track.get("world_source") == "bbox3d":
+            return
+        if track.get("world") is not None and track.get("world_valid") is True:
             return
         
         try:
@@ -2619,6 +3080,8 @@ class _AnalyticsTelemetryProcessor:
             if hit is not None:
                 track["world"] = [float(hit[0]), float(hit[1]), float(hit[2])]
                 track["world_valid"] = True
+                track["world_frame"] = self._world_frame
+                track["world_source"] = "ray"
             else:
                 track["world_valid"] = False
         except Exception:
@@ -2687,6 +3150,19 @@ class _AnalyticsTelemetryProcessor:
             "confidence": confidence,
             "center": _bbox_center(bbox),
         }
+
+        if self._tracking_mode_is_v3dt():
+            v3dt_meta = self._extract_v3dt_meta_ds8(obj_meta)
+            if v3dt_meta:
+                track.update(v3dt_meta)
+                bbox3d = v3dt_meta.get("bbox3d")
+                if isinstance(bbox3d, dict):
+                    world = self._world_from_bbox3d(bbox3d)
+                    if world is not None:
+                        track["world"] = world
+                        track["world_valid"] = True
+                        track["world_frame"] = self._world_frame
+                        track["world_source"] = "bbox3d"
 
         tracker_conf = getattr(obj_meta, "tracker_confidence", None)
         if tracker_conf is not None:
@@ -3082,12 +3558,10 @@ class _AnalyticsTelemetryProcessor:
                 state.pop(sid, None)
 
     def _publish_occupancy(self, sensor_id: int, occupancy_counts: Mapping[str, int]) -> None:
-        logger.debug(f"DS8 occupancy counts for sensor {sensor_id}: {dict(occupancy_counts)}")
         publisher = getattr(self.pipeline, "occupancy_publisher", None)
         previous = self._occupancy_state.get(sensor_id, {})
         self._occupancy_state[sensor_id] = dict(occupancy_counts)
         if publisher is None:
-            logger.debug(f"No occupancy publisher for sensor {sensor_id}")
             return
 
         now_ns = time.time_ns()

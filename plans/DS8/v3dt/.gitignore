@@ -1,0 +1,3 @@
+# Repo root `.gitignore` ignores `*.md`; we want these planning docs tracked.
+!*.md
+

@@ -1,9 +1,10 @@
 from typing import Dict, Optional, Any, Callable
 import asyncio
 import concurrent.futures
-import websockets
+from websockets.legacy.server import serve
 import json
 import logging
+import os
 import time
 import uuid
 
@@ -421,17 +422,21 @@ class WebSocketServer:
                     if entry:
                         tx_items.append(f"{k}:{entry['data']}")
                 parts.append(f"tx=[{'; '.join(tx_items) if tx_items else '-'}]")
-                #self.logger.debug(f"MENON I/O | {' | '.join(parts)}")
-
-                # Sleep with proper cancellation handling (cap at 1 second for responsiveness)
-                await asyncio.sleep(min(interval_seconds, 1.0))
-
+                env_flag = str(os.environ.get("NOESIS_MENON_IO_DEBUG", "")).strip().lower()
+                if env_flag in ("1", "true", "yes", "on"):
+                    self.logger.debug(f"MENON I/O | {' | '.join(parts)}")
             except asyncio.CancelledError:
                 # Properly handle cancellation
                 break
             except Exception:
                 # Never fail loop due to logging issues
                 pass
+            finally:
+                # Always yield to avoid event loop starvation
+                try:
+                    await asyncio.sleep(min(interval_seconds, 1.0))
+                except asyncio.CancelledError:
+                    break
     
     async def _cleanup_stale_connections(self):
         """Periodically clean up any stale or closed connections"""
@@ -538,16 +543,14 @@ class WebSocketServer:
     async def start(self):
         """Start the WebSocket server and the periodic stats broadcast."""
         try:
-            # Remember the running loop for cross-thread broadcasts
+            # Capture the running loop for cross-thread callbacks
             try:
                 self.event_loop = asyncio.get_running_loop()
             except RuntimeError:
-                # No running loop; will be set by caller if needed
                 self.event_loop = None
 
-            # Create server with backpressure and heartbeat settings
-            # Increased ping interval and timeout for better stability
-            self.server = await websockets.serve(
+            # Start the server (legacy API for compatibility)
+            self.server = await serve(
                 self.handle_client,
                 self.host,
                 self.port,
@@ -593,7 +596,6 @@ class WebSocketServer:
         except Exception as e:
             self.logger.error(f"Server failed: {e}")
             raise
-    
     async def stop(self):
         """Gracefully stop the WebSocket server and the periodic stats broadcast."""
         self.logger.info("Stopping WebSocket server...")
@@ -736,13 +738,12 @@ class WebSocketServer:
             return force_result
 
     async def handle_client(self, websocket, path=None):
-        """Handle incoming WebSocket connections and messages
-
-        Args:
-            websocket: WebSocket connection
-            path: WebSocket path
-        """
-        client_ip = websocket.remote_address[0] if hasattr(websocket, 'remote_address') else "Unknown"
+        """Handle incoming WebSocket connections and messages."""
+        try:
+            client_ip = websocket.remote_address[0] if hasattr(websocket, 'remote_address') else "Unknown"
+        except Exception as exc:
+            self.logger.error(f"handle_client: unable to read remote address: {exc}")
+            client_ip = "Unknown"
         self.connected_clients.add(websocket)
         self.logger.info(f"Client {client_ip} connected. Total clients: {len(self.connected_clients)}")
         print(f"✅ Client {client_ip} connected! Total clients: {len(self.connected_clients)}")

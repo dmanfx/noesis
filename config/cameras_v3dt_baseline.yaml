@@ -1,0 +1,57 @@
+version: 1
+intrinsics_models:
+  unifi_g3_instant:
+    intrinsics:
+      fx: 656.1
+      fy: 956.39
+      cx: 960.0
+      cy: 540.0
+      k1: 0.0
+      k2: 0.0
+      k3: 0.0
+  unifi_g4_instant:
+    intrinsics:
+      fx: 514.0
+      fy: 692.5
+      cx: 640.0
+      cy: 360.0
+      k1: 0.0
+      k2: 0.0
+      k3: 0.0
+  unifi_g4_instant_charuco_rtsp_720_rectified:
+    resolution:
+    - 1280
+    - 720
+    intrinsics:
+      fx: 774.5219229701734
+      fy: 774.237000074667
+      cx: 639.5
+      cy: 359.5
+      k1: 0.0
+      k2: 0.0
+      k3: 0.0
+  unifi_g4_instant_charuco_rtsp_dewarp_1080_virtual:
+    resolution:
+    - 1920
+    - 1080
+    intrinsics:
+      fx: 1161.78288445526
+      fy: 1161.3555001120005
+      cx: 959.25
+      cy: 539.25
+      k1: 0.0
+      k2: 0.0
+      k3: 0.0
+cameras:
+  0:
+    name: living-room
+    model: unifi_g3_instant
+    height_m: 2.6
+  1:
+    name: kitchen
+    model: unifi_g3_instant
+    height_m: 2.7
+  2:
+    name: family-room
+    model: unifi_g4_instant_charuco_rtsp_dewarp_1080_virtual
+    height_m: 2.0

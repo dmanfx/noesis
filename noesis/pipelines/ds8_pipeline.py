@@ -198,6 +198,53 @@ def _safe_link(ds_pipeline: Optional[DSPipeline], errors: List[str], *names: str
         errors.append(f"link:{path}:{exc}")
 
 
+def _safe_link_with_hints(
+    ds_pipeline: Optional[DSPipeline],
+    errors: List[str],
+    source: str,
+    sink: str,
+    source_hint: str,
+    sink_hint: str,
+) -> None:
+    """Link pipeline components with explicit pad hints (e.g., streammux sink pads)."""
+    if ds_pipeline is None:
+        return
+    try:
+        ds_pipeline.link((source, sink), (source_hint, sink_hint))
+    except Exception as exc:  # pragma: no cover - depends on runtime plugins
+        errors.append(f"link:{source}->{sink}({source_hint}->{sink_hint}):{exc}")
+
+
+def _read_dewarper_output_size(config_path: Optional[str]) -> Optional[Tuple[int, int]]:
+    """Parse nvdewarper config to extract output-width/output-height."""
+    if not config_path:
+        return None
+    path = Path(config_path)
+    if not path.exists():
+        return None
+    width = height = None
+    try:
+        for line in path.read_text(encoding="utf-8").splitlines():
+            raw = line.strip()
+            if not raw or raw.startswith("#"):
+                continue
+            if raw.startswith("output-width="):
+                try:
+                    width = int(raw.split("=", 1)[1].strip())
+                except Exception:
+                    continue
+            elif raw.startswith("output-height="):
+                try:
+                    height = int(raw.split("=", 1)[1].strip())
+                except Exception:
+                    continue
+    except Exception:
+        return None
+    if width and height:
+        return width, height
+    return None
+
+
 def _attach_depth_gate(pipeline: DS8Pipeline) -> None:
     """Attach a Probe-wrapped BufferOperator gate to the configured depth branch."""
     # If an upstream valve was configured, treat gating as supported without BufferOperator.
@@ -289,6 +336,25 @@ def _attach_fps_probes(pipeline: DS8Pipeline) -> None:
 def build_pipeline(yaml_path: str | Path) -> DS8Pipeline:
     """Create the DS8 pipeline skeleton from YAML using pyservicemaker primitives."""
     global _PIPELINE_SINGLETON
+
+    def _env_truthy(name: str, default: bool = False) -> bool:
+        raw = os.environ.get(name)
+        if raw is None:
+            return bool(default)
+        val = str(raw).strip().lower()
+        if val in ("1", "true", "yes", "y", "on"):
+            return True
+        if val in ("0", "false", "no", "n", "off"):
+            return False
+        return bool(default)
+
+    def _is_local_mp4_uri(uri: str) -> bool:
+        value = str(uri or "").strip()
+        if not value:
+            return False
+        if not value.lower().startswith("file:"):
+            return False
+        return value.lower().endswith(".mp4")
 
     path = Path(yaml_path)
     if not path.exists():
@@ -440,16 +506,6 @@ def build_pipeline(yaml_path: str | Path) -> DS8Pipeline:
         "rtsp_profile": rtsp_profile,
     }
 
-    # Decide source topology:
-    # - Default: use nvmultiurisrcbin as a combined source+streammux (more stable with RTSP).
-    # - Legacy/debug: set NOESIS_DS8_USE_NVURISRCBIN=1 to use per-source nvurisrcbin + nvstreammux.
-    use_nvuris = str(os.environ.get("NOESIS_DS8_USE_NVURISRCBIN", "")).strip().lower() in (
-        "1",
-        "true",
-        "yes",
-        "on",
-    )
-
     streammux_cfg = dict(cfg.get("streammux") or {})
     streammux_cfg.setdefault("batch-size", batch_size)
     streammux_cfg.setdefault("width", 1920)
@@ -460,31 +516,136 @@ def build_pipeline(yaml_path: str | Path) -> DS8Pipeline:
     first_gpu = sources[0].get("gpu-id") if sources else 0
     streammux_cfg.setdefault("gpu-id", first_gpu if first_gpu is not None else 0)
 
-    if use_nvuris:
-        # Original path: separate nvurisrcbin elements feeding nvstreammux.
-        for idx, src_cfg in enumerate(sources):
-            name = f"source_{idx}"
-            element = str(src_cfg.get("element", "nvurisrcbin")).strip() or "nvurisrcbin"
-            src_props = dict(src_cfg)
-            src_props.pop("element", None)
-            src_props["uri"] = src_cfg.get("uri")
-            if element == "nvurisrcbin":
-                src_props.setdefault("gpu-id", 0)
-                src_props.setdefault("cudadec-memtype", 0)
-            component = Component(name=name, element=element, config=src_props, downstream=["streammux"])
-            pipeline.components[name] = component
-            _safe_add(ds_pipeline, component, pipeline.errors)
-            _apply_component_config(ds_pipeline, component, pipeline.errors)
+    def _dewarper_enabled(source_cfg: Dict[str, Any]) -> bool:
+        raw = source_cfg.get("dewarper")
+        return isinstance(raw, dict) and bool(raw.get("enable", False))
 
+    use_dewarper = any(_dewarper_enabled(s) for s in sources)
+    streammux_element = str(streammux_cfg.pop("element", "") or "").strip()
+    if not streammux_element:
+        streammux_element = "nvstreammux" if use_dewarper else "nvmultiurisrcbin"
+
+    # Track source output nodes when linking into nvstreammux.
+    source_nodes: List[str] = []
+
+    # Precompute URIs for tiler layout / diagnostics.
+    uris = [str(s.get("uri") or "").strip() for s in sources if str(s.get("uri") or "").strip()]
+
+    if use_dewarper:
+        # Per-source pipeline: nvurisrcbin → (optional dewarper) → nvstreammux
         streammux = Component(
             name="streammux",
-            element="nvstreammux",
+            element=streammux_element,
             config=streammux_cfg,
             downstream=["yolo11_pgie"],
         )
+        pipeline.components[streammux.name] = streammux
+        _safe_add(ds_pipeline, streammux, pipeline.errors)
+        _apply_component_config(ds_pipeline, streammux, pipeline.errors)
+
+        loop_local_mp4 = _env_truthy("NOESIS_DS8_LOOP_LOCAL_MP4", default=True)
+        for idx, source_cfg in enumerate(sources):
+            props = dict(source_cfg)
+            dewarp_cfg_raw = props.pop("dewarper", None)
+            element = props.pop("element", "nvurisrcbin")
+            uri = str(props.get("uri") or "").strip()
+            if uri:
+                props["uri"] = uri
+            props.setdefault("source-id", idx)
+            props.setdefault("gpu-id", streammux_cfg.get("gpu-id", 0))
+            if uri.lower().startswith("rtsp"):
+                # Align RTSP reconnect defaults with DS7 nvmultiurisrcbin behavior.
+                props.setdefault("rtsp-reconnect-interval", 10)
+                props.setdefault("init-rtsp-reconnect-interval", 5)
+                props.setdefault("rtsp-reconnect-attempts", 4)
+            if loop_local_mp4 and _is_local_mp4_uri(uri):
+                props.setdefault("file-loop", True)
+
+            source = Component(
+                name=f"source_{idx}",
+                element=element,
+                config=props,
+                downstream=[],
+            )
+            pipeline.components[source.name] = source
+            _safe_add(ds_pipeline, source, pipeline.errors)
+            _apply_component_config(ds_pipeline, source, pipeline.errors)
+
+            dewarp_cfg = dict(dewarp_cfg_raw) if isinstance(dewarp_cfg_raw, dict) else {}
+            dewarp_enabled = bool(dewarp_cfg.get("enable", False))
+            if dewarp_enabled:
+                dewarp_cfg.pop("enable", None)
+                if "config-file" in dewarp_cfg:
+                    dewarp_cfg["config-file"] = _abs_or_same(dewarp_cfg["config-file"])  # type: ignore[index]
+                dewarp_out = _read_dewarper_output_size(dewarp_cfg.get("config-file"))
+                dewarp_cfg.setdefault("source-id", idx)
+                dewarp_cfg.setdefault("gpu-id", streammux_cfg.get("gpu-id", 0))
+                dewarp_cfg.setdefault("nvbuf-memory-type", streammux_cfg.get("nvbuf-memory-type", 0))
+
+                conv = Component(
+                    name=f"dewarper_conv_{idx}",
+                    element="nvvideoconvert",
+                    config={
+                        "gpu-id": streammux_cfg.get("gpu-id", 0),
+                        "nvbuf-memory-type": streammux_cfg.get("nvbuf-memory-type", 0),
+                    },
+                    downstream=[],
+                )
+                caps_in = Component(
+                    name=f"dewarper_caps_{idx}",
+                    element="capsfilter",
+                    config={"caps": "video/x-raw(memory:NVMM),format=RGBA"},
+                    downstream=[],
+                )
+                dewarper = Component(
+                    name=f"dewarper_{idx}",
+                    element="nvdewarper",
+                    config=dewarp_cfg,
+                    downstream=[],
+                )
+                caps_out_caps = "video/x-raw(memory:NVMM),format=RGBA"
+                if dewarp_out:
+                    caps_out_caps = f"{caps_out_caps},width={dewarp_out[0]},height={dewarp_out[1]}"
+                caps_out = Component(
+                    name=f"dewarper_caps_out_{idx}",
+                    element="capsfilter",
+                    config={"caps": caps_out_caps},
+                    downstream=[],
+                )
+                post_conv = Component(
+                    name=f"dewarper_post_conv_{idx}",
+                    element="nvvideoconvert",
+                    config={
+                        "gpu-id": streammux_cfg.get("gpu-id", 0),
+                        "nvbuf-memory-type": streammux_cfg.get("nvbuf-memory-type", 0),
+                    },
+                    downstream=[],
+                )
+                post_caps_caps = "video/x-raw(memory:NVMM),format=NV12"
+                if dewarp_out:
+                    post_caps_caps = f"{post_caps_caps},width={dewarp_out[0]},height={dewarp_out[1]}"
+                post_caps = Component(
+                    name=f"dewarper_post_caps_{idx}",
+                    element="capsfilter",
+                    config={"caps": post_caps_caps},
+                    downstream=[],
+                )
+                for comp in (conv, caps_in, dewarper, caps_out, post_conv, post_caps):
+                    pipeline.components[comp.name] = comp
+                    _safe_add(ds_pipeline, comp, pipeline.errors)
+                    _apply_component_config(ds_pipeline, comp, pipeline.errors)
+
+                _safe_link(ds_pipeline, pipeline.errors, source.name, conv.name)
+                _safe_link(ds_pipeline, pipeline.errors, conv.name, caps_in.name)
+                _safe_link(ds_pipeline, pipeline.errors, caps_in.name, dewarper.name)
+                _safe_link(ds_pipeline, pipeline.errors, dewarper.name, caps_out.name)
+                _safe_link(ds_pipeline, pipeline.errors, caps_out.name, post_conv.name)
+                _safe_link(ds_pipeline, pipeline.errors, post_conv.name, post_caps.name)
+                source_nodes.append(post_caps.name)
+            else:
+                source_nodes.append(source.name)
     else:
         # DS7-style multi-URI source: nvmultiurisrcbin performs source ingest + mux.
-        uris = [str(s.get("uri") or "").strip() for s in sources if str(s.get("uri") or "").strip()]
         uri_list = ",".join(uris)
         sensor_id_list = ",".join(str(i) for i in range(len(uris))) if uris else ""
 
@@ -509,6 +670,14 @@ def build_pipeline(yaml_path: str | Path) -> DS8Pipeline:
             "align-first-buffer": streammux_cfg.get("align-first-buffer", 0),
             "port": "0",
         }
+        loop_local_mp4 = _env_truthy("NOESIS_DS8_LOOP_LOCAL_MP4", default=True)
+        local_mp4_indices = [idx for idx, uri in enumerate(uris) if _is_local_mp4_uri(uri)]
+        if loop_local_mp4 and local_mp4_indices:
+            # Verified via `gst-inspect-1.0 nvmultiurisrcbin`:
+            # file-loop: Loop file sources after EOS. Src type must be source-type-uri
+            # and uri starting with 'file:/'.
+            multi_cfg["file-loop"] = True
+            logger.info("DS8: enabled nvmultiurisrcbin file-loop for local mp4 sources: %s", local_mp4_indices)
         # Optional RTSP tuning derived from per-source config
         if sources:
             sample = dict(sources[0])
@@ -530,7 +699,10 @@ def build_pipeline(yaml_path: str | Path) -> DS8Pipeline:
             downstream=["yolo11_pgie"],
         )
 
-    pipeline.components[streammux.name] = streammux
+        pipeline.components[streammux.name] = streammux
+        _safe_add(ds_pipeline, streammux, pipeline.errors)
+        _apply_component_config(ds_pipeline, streammux, pipeline.errors)
+
     try:
         pipeline.frame_size = (
             int(streammux_cfg.get("width", 0) or 0),
@@ -538,8 +710,6 @@ def build_pipeline(yaml_path: str | Path) -> DS8Pipeline:
         )
     except Exception:
         pipeline.frame_size = (0, 0)
-    _safe_add(ds_pipeline, streammux, pipeline.errors)
-    _apply_component_config(ds_pipeline, streammux, pipeline.errors)
 
     preprocess_cfg = dict(cfg.get("preprocess") or {})
     preprocess_enabled = bool(preprocess_cfg.get("enable", True) and preprocess_cfg)
@@ -748,11 +918,7 @@ def build_pipeline(yaml_path: str | Path) -> DS8Pipeline:
     tee_component.downstream = tee_downstreams
 
     # Insert a tiled renderer stage in DS8 path (mosaic). This avoids per-camera branches.
-    source_count = (
-        len([s for s in sources if str(s.get("uri") or "").strip()])
-        if use_nvuris
-        else len(uris)
-    ) or 1
+    source_count = len(uris) or 1
     tiler_square_seq_grid_env = str(os.environ.get("NOESIS_MOSAIC_TILER_SQUARE_SEQ_GRID", "")).strip().lower()
     tiler_square_seq_grid = tiler_square_seq_grid_env in ("1", "true", "yes", "on")
     tiler_columns_env = str(os.environ.get("NOESIS_MOSAIC_TILER_COLUMNS", "")).strip()
@@ -1057,9 +1223,9 @@ def build_pipeline(yaml_path: str | Path) -> DS8Pipeline:
             return
         _safe_link(ds_pipeline, pipeline.errors, src, dst)
 
-    for source in pipeline.components:
-        if source.startswith("source_"):
-            _link(source, "streammux")
+    if source_nodes:
+        for source_name in source_nodes:
+            _link(source_name, "streammux")
 
     if preprocess_component is not None:
         _link("streammux", preprocess_component.name)

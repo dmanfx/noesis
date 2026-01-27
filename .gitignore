@@ -17,11 +17,13 @@ logs/
 *.log
 output/
 .cursor/
+diagnostics/
 
 #ignore archived folders
 legacy/
 orchestration/
 noesis_template/
+config/archive*
 
 #ignore dev docs
 docs/completed/

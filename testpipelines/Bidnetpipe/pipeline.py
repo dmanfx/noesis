@@ -10,8 +10,8 @@ import threading
 
 from pyservicemaker import Pipeline, Probe
 
-from Bidnetpipe import model_setup, sources
-from Bidnetpipe.probes import SegmentationHeartbeat
+from . import model_setup, sources
+from .probes import SegmentationHeartbeat
 
 
 @dataclass

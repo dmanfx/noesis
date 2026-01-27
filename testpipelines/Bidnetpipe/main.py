@@ -7,7 +7,7 @@ import os
 import threading
 from pathlib import Path
 
-from Bidnetpipe import custom_parser, model_setup, pipeline, sources
+from . import custom_parser, model_setup, pipeline, sources
 
 
 def _parse_args() -> argparse.Namespace:

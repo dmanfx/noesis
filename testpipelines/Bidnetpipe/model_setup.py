@@ -42,7 +42,7 @@ LABELS_JSON_PATH = LABELS_DIR / "labels.json"
 
 NVINFER_CONFIG_PATH = Path("config/nvinfer_bisenetv2_seg.txt")
 ENGINE_PATH = ENGINE_DIR / "bisenetv2_ade20k_b3_fp16.engine"
-CUSTOM_PARSER_LIB_PATH = Path("Bidnetpipe/custom/libbidnet_segparser.so")
+CUSTOM_PARSER_LIB_PATH = Path(__file__).resolve().parent / "custom" / "libbidnet_segparser.so"
 
 
 @dataclass

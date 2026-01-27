@@ -309,10 +309,10 @@ class BevRenderer:
             return u_px, v_px
         return None
 
-    def _compute_auto_extents_local(
+    def _compute_auto_extents_world(
         self, calib: CalibrationSnapshot, cfg: BevConfig
     ) -> Tuple[Tuple[float, float], Tuple[float, float]]:
-        """Compute camera-local BEV extents so footpoints and ranges share the same frame."""
+        """Compute world-frame BEV extents so footpoints and ranges share the same frame."""
         width, height = calib.image_size
         if width <= 0 or height <= 0:
             return (-4.0, 4.0), (0.0, 12.0)
@@ -322,15 +322,9 @@ class BevRenderer:
         C_world = C_world * scale
         plane = Plane.horizontal(float(calib.floor_y) * scale)
 
-        # Align samples with camera forward axis for local coordinates
-        dir_world = R_wc @ np.array([0.0, 0.0, 1.0])
-        yaw = math.atan2(dir_world[0], dir_world[2])
-        cos_yaw = math.cos(-yaw)
-        sin_yaw = math.sin(-yaw)
-
         xs = np.linspace(0, max(0.0, float(width - 1)), 8)
         ys = np.linspace(0, max(0.0, float(height - 1)), 8)
-        hits_local: List[Tuple[float, float]] = []
+        hits_world: List[Tuple[float, float]] = []
         for u in xs:
             for v in ys:
                 origin, direction = ray_from_pixel(float(u), float(v), calib.intrinsics, R_wc, C_world)
@@ -344,20 +338,20 @@ class BevRenderer:
                     scale_d = cfg.max_distance_m / dist
                     dx *= scale_d
                     dz *= scale_d
-                lx = dx * cos_yaw - dz * sin_yaw
-                lz = dx * sin_yaw + dz * cos_yaw
-                hits_local.append((lx, lz))
+                wx = float(C_world[0] + dx)
+                wz = float(C_world[2] + dz)
+                hits_world.append((wx, wz))
 
-        if len(hits_local) < 3:
+        if len(hits_world) < 3:
             return (-4.0, 4.0), (0.0, 12.0)
 
-        xs_local = [p[0] for p in hits_local]
-        zs_local = [p[1] for p in hits_local]
+        xs_world = [p[0] for p in hits_world]
+        zs_world = [p[1] for p in hits_world]
         padding = 0.25
-        x_min = min(xs_local) - padding
-        x_max = max(xs_local) + padding
-        z_min = max(0.0, min(zs_local) - padding)
-        z_max = max(zs_local) + padding
+        x_min = min(xs_world) - padding
+        x_max = max(xs_world) + padding
+        z_min = min(zs_world) - padding
+        z_max = max(zs_world) + padding
 
         if (x_max - x_min) < 1.0:
             cx = 0.5 * (x_min + x_max)
@@ -466,7 +460,7 @@ class BevRenderer:
 
             auto_extents = self._auto_extents_by_camera.get(key)
             if auto_extents is None:
-                x_range_auto, z_range_auto = self._compute_auto_extents_local(calib, cfg)
+                x_range_auto, z_range_auto = self._compute_auto_extents_world(calib, cfg)
                 auto_extents = (x_range_auto, z_range_auto)
                 self._auto_extents_by_camera[key] = auto_extents
             x_range, z_range = auto_extents
@@ -506,22 +500,13 @@ class BevRenderer:
             H_img2plane = cached_result
 
         bev_points: List[Dict[str, float]] = []
-        raw_local_points: List[Tuple[int, float, float, str]] = []
-        current_local_by_sid: Dict[int, Tuple[float, float]] = {}
+        raw_world_points: List[Tuple[int, float, float, str]] = []
+        current_world_by_sid: Dict[int, Tuple[float, float]] = {}
 
-        # Calculate Camera Yaw and Position for Local Transformation
-        # We want points relative to the camera (Local Frame), aligned with the camera view.
-        R_wc, C_world = parse_extrinsics(calib.extrinsics_col_major)
+        # Camera position is still needed for distance gating.
+        _R_wc, C_world = parse_extrinsics(calib.extrinsics_col_major)
         scale = float(calib.unit_scale or 1.0)
         C_world = C_world * scale
-        
-        # Camera forward vector in camera frame is [0, 0, 1] (assuming standard CV frame)
-        # In World frame:
-        dir_world = R_wc @ np.array([0.0, 0.0, 1.0])
-        # Yaw is angle in XZ plane. atan2(x, z) gives 0 for +Z (North), pi/2 for +X (East)
-        yaw = math.atan2(dir_world[0], dir_world[2])
-        cos_yaw = math.cos(-yaw)
-        sin_yaw = math.sin(-yaw)
 
         max_distance_m = float(cfg.max_distance_m or 0.0)
 
@@ -536,18 +521,9 @@ class BevRenderer:
             if not math.isfinite(wx) or not math.isfinite(wz):
                 continue
             
-            # Transform World -> Local Camera Frame
-            # 1. Translate
             dx = wx - C_world[0]
             dz = wz - C_world[2]
-            
-            # 2. Rotate by -Yaw
-            lx = dx * cos_yaw - dz * sin_yaw
-            lz = dx * sin_yaw + dz * cos_yaw
-
-            if not math.isfinite(lx) or not math.isfinite(lz):
-                continue
-            if max_distance_m > 0.0 and math.hypot(lx, lz) > max_distance_m:
+            if max_distance_m > 0.0 and math.hypot(dx, dz) > max_distance_m:
                 # Guardrail: discard near-horizon homography outliers so the UI doesn't draw
                 # teleporting streaks outside the floorplan extents.
                 continue
@@ -559,18 +535,18 @@ class BevRenderer:
             if stable_id is None or stable_id <= 0:
                 continue
 
-            raw_local_points.append((int(stable_id), float(lx), float(lz), str(fp.method)))
+            raw_world_points.append((int(stable_id), float(wx), float(wz), str(fp.method)))
 
         with self._lock:
             if self._smoother.enabled:
                 self._smoother.prune(now_s)
-            for stable_id, lx, lz, method in raw_local_points:
+            for stable_id, lx, lz, method in raw_world_points:
                 if self._smoother.enabled:
                     lx, lz = self._smoother.update((camera_id, int(stable_id)), now_s, lx, lz)
                 # The frontend expects 'x' and 'y' in the JSON list.
-                # We map Local X -> JSON x, Local Z -> JSON y
+                # We map World X -> JSON x, World Z -> JSON y
                 bev_points.append({'x': float(lx), 'y': float(lz), 'method': method, 'stableId': int(stable_id)})
-                current_local_by_sid[int(stable_id)] = (float(lx), float(lz))
+                current_world_by_sid[int(stable_id)] = (float(lx), float(lz))
 
         # Update config to reflect the actual extents used
         result_config = BevConfig(
@@ -599,7 +575,7 @@ class BevRenderer:
             window_s = float(self._trail_cfg.window_s)
 
             if trails_enabled:
-                for stable_id, (lx, lz) in current_local_by_sid.items():
+                for stable_id, (lx, lz) in current_world_by_sid.items():
                     state = cam_tracks.get(stable_id)
                     if state is None:
                         state = _BevTrailTrackState(points=deque(maxlen=max_points))
@@ -710,7 +686,7 @@ class BevRenderer:
                         )
                         cv2.line(bev, p1, p2, color, line_width, lineType=cv2.LINE_AA)
 
-            for stable_id, (lx, lz) in current_local_by_sid.items():
+            for stable_id, (lx, lz) in current_world_by_sid.items():
                 p = self._local_to_px(lx, lz, result_config, bev.shape[:2])
                 if p is None:
                     continue

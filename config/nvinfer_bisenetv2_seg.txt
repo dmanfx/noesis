@@ -12,5 +12,5 @@ segmentation-output-order=0
 segmentation-threshold=0.0
 gie-unique-id=1
 output-blob-names=segmentation
-custom-lib-path=/home/mayor/Noesis_Devel/Bidnetpipe/custom/libbidnet_segparser.so
+custom-lib-path=/home/mayor/Noesis_Devel/testpipelines/Bidnetpipe/custom/libbidnet_segparser.so
 parse-segmentation-func-name=NvDsInferParseCustomBiSeNetFloor

@@ -6,7 +6,7 @@ import subprocess
 from pathlib import Path
 
 
-CUSTOM_PARSER_DIR = Path("Bidnetpipe/custom")
+CUSTOM_PARSER_DIR = Path(__file__).resolve().parent / "custom"
 CUSTOM_PARSER_SRC = CUSTOM_PARSER_DIR / "bidnet_segparser.cpp"
 CUSTOM_PARSER_LIB = CUSTOM_PARSER_DIR / "libbidnet_segparser.so"
 

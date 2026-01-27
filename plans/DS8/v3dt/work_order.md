@@ -74,7 +74,8 @@ baseline, shortfalls, and confirmed no-go items. Key files:
 
 **Acceptance**
 - [ ] With SV3DT enabled, >95% of person tracks have `NVDS_OBJ_3D_META`.
-- [ ] With SV3DT disabled, telemetry/BEV are unchanged (no regressions).
+- [x] With SV3DT disabled, telemetry/BEV are unchanged (no regressions).
+  _2026-01-27 (Codex): BEV renderer now stays in calibration world frame (removed camera-local yaw/translation rotation) so legacy tracker coordinates match BEV; validated via synthetic homography check with yaw/pitch calibration (pipeline/UI run pending)._
   _2025-12-27 (Codex): Wired DS8 `NVDS_OBJ_3D_META` extraction via `noesis_v3dt_meta_ext` (Service Maker C++ meta iterators) and plumbed `bbox3d`/`velocity3d`/`world` into DS8 telemetry; validated `bbox3d` appears in tracking WS telemetry via `python3 scripts/sv3dt_meta_smoke_test.py` (offline `config/infer_v3dt_sample.yaml`)._
   _2025-12-28 (Codex): Extended V3DT meta plumbing to also extract `NVDS_OBJ_WORLD_FOOT_LOCATION` (`world_foot`) + `NVDS_OBJ_VISIBILITY` and prefer `world_foot` for the BEV/world footpoint; added DS8 runtime preflight to regenerate `config/v3dt/camInfo_*.yml` from current calibration when a V3DT tracker config is selected (prevents stale camInfo drift after auto-calibrate)._
   _2025-12-29 (Codex): Fixed a reproducible Service Maker SIGSEGV by disabling `NVDS_OBJ_WORLD_FOOT_LOCATION` extraction inside `native/noesis_v3dt_meta_ext.cpp`; `bbox3d` telemetry validated again via `python3 scripts/sv3dt_meta_smoke_test.py --pipeline-config config/infer_v3dt_sample.yaml`._

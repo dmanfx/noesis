@@ -163,6 +163,8 @@ class HomographyCache:
     def _key(
         self,
         calib: CalibrationSnapshot,
+        flip_u: bool = False,
+        flip_v: bool = False,
     ) -> str:
         return "::".join(
             [
@@ -172,14 +174,19 @@ class HomographyCache:
                 f"E={hash(tuple(float(x) for x in calib.extrinsics_col_major))}",
                 f"floor={calib.floor_y:.4f}",
                 f"s={float(getattr(calib, 'unit_scale', 1.0)):.6f}",
+                f"flip_u={int(bool(flip_u))}",
+                f"flip_v={int(bool(flip_v))}",
             ]
         )
 
     def get(
         self,
         calib: CalibrationSnapshot,
+        *,
+        flip_u: bool = False,
+        flip_v: bool = False,
     ) -> np.ndarray:
-        key = self._key(calib)
+        key = self._key(calib, flip_u=flip_u, flip_v=flip_v)
         cached = self._cache.get(key)
         if cached is not None:
             return cached
@@ -191,6 +198,8 @@ class HomographyCache:
             calib.floor_y,
             calib.image_size,
             float(getattr(calib, "unit_scale", 1.0) or 1.0),
+            flip_u=flip_u,
+            flip_v=flip_v,
         )
         self._cache[key] = H
         return H
@@ -202,6 +211,7 @@ class BevRenderer:
         ws_server,
         trails_cfg: Optional[Dict[str, Any]] = None,
         smoothing_cfg: Optional[Dict[str, Any]] = None,
+        frame: str = "camera_local",
         *,
         jpeg_enabled: bool = False,
         jpeg_quality: int = 70,
@@ -210,10 +220,14 @@ class BevRenderer:
         self._lock = threading.Lock()
         self.config_per_cam: Dict[str, BevConfig] = {}
         self.h_cache = HomographyCache()
+        self._frame_mode = self._normalize_frame_mode(frame)
         # Last known good homography per camera for resilience
         self._last_h_by_cam: Dict[str, np.ndarray] = {}
         # Auto-computed extents per camera
         self._auto_extents_by_camera: Dict[str, Tuple[Tuple[float, float], Tuple[float, float]]] = {}
+        # Image axis flip cache (per camera/extrinsics) for BEV homography alignment.
+        self._image_flip_by_key: Dict[str, Tuple[bool, bool]] = {}
+        self._image_flip_logged: set[str] = set()
         # Trail state (rendered into BEV images)
         self._trail_cfg = BevTrailConfig.from_mapping(trails_cfg or {})
         self._trails_enabled = bool(self._trail_cfg.enabled)
@@ -231,6 +245,88 @@ class BevRenderer:
             if not self._trails_enabled:
                 self._trail_tracks_by_cam.clear()
                 self._trail_frame_counts.clear()
+
+    @staticmethod
+    def _normalize_frame_mode(value: Any) -> str:
+        text = str(value or "").strip().lower()
+        if text in ("world", "global", "world_frame"):
+            return "world"
+        if text in ("camera", "camera_local", "local", "cam"):
+            return "camera_local"
+        if not text:
+            return "camera_local"
+        return "camera_local"
+
+    @staticmethod
+    def _apply_image_flip(
+        u: float,
+        v: float,
+        width: int,
+        height: int,
+        flip_u: bool,
+        flip_v: bool,
+    ) -> Tuple[float, float]:
+        if flip_u:
+            u = float(max(0, width - 1)) - float(u)
+        if flip_v:
+            v = float(max(0, height - 1)) - float(v)
+        return float(u), float(v)
+
+    def _infer_image_flips(self, calib: CalibrationSnapshot) -> Tuple[bool, bool]:
+        try:
+            ext_hash = hash(tuple(float(x) for x in calib.extrinsics_col_major))
+        except Exception:
+            ext_hash = 0
+        key = f"{calib.camera_id}::{ext_hash}"
+        cached = self._image_flip_by_key.get(key)
+        if cached is not None:
+            return cached
+
+        flip_u = False
+        flip_v = False
+        try:
+            R_wc, _ = parse_extrinsics(calib.extrinsics_col_major)
+            forward = R_wc @ np.array([0.0, 0.0, 1.0], dtype=np.float64)
+            f_norm = float(np.linalg.norm(forward))
+            if f_norm > 1e-6:
+                forward = forward / f_norm
+            world_up = np.array([0.0, 1.0, 0.0], dtype=np.float64)
+            right_ref = np.cross(world_up, forward)
+            r_norm = float(np.linalg.norm(right_ref))
+            if r_norm <= 1e-6:
+                right_ref = np.array([1.0, 0.0, 0.0], dtype=np.float64)
+            else:
+                right_ref = right_ref / r_norm
+            up_ref = np.cross(forward, right_ref)
+            u_norm = float(np.linalg.norm(up_ref))
+            if u_norm <= 1e-6:
+                up_ref = world_up
+            else:
+                up_ref = up_ref / u_norm
+
+            right = R_wc @ np.array([1.0, 0.0, 0.0], dtype=np.float64)
+            up = R_wc @ np.array([0.0, 1.0, 0.0], dtype=np.float64)
+            r_actual = float(np.dot(right, right_ref))
+            u_actual = float(np.dot(up, up_ref))
+
+            # If camera +X points opposite expected right, flip U.
+            flip_u = r_actual < 0.0
+            # If camera +Y points up (aligned with expected up), flip V (image v is down).
+            flip_v = u_actual > 0.0
+        except Exception:
+            flip_u = False
+            flip_v = False
+
+        self._image_flip_by_key[key] = (bool(flip_u), bool(flip_v))
+        if (flip_u or flip_v) and key not in self._image_flip_logged:
+            logger.info(
+                "BEV image axis flip for %s: flip_u=%s flip_v=%s",
+                calib.camera_id,
+                bool(flip_u),
+                bool(flip_v),
+            )
+            self._image_flip_logged.add(key)
+        return bool(flip_u), bool(flip_v)
 
     def _hsl_to_rgb(self, h: float, s: float, lightness: float) -> Tuple[float, float, float]:
         h = h % 360.0
@@ -310,7 +406,11 @@ class BevRenderer:
         return None
 
     def _compute_auto_extents_world(
-        self, calib: CalibrationSnapshot, cfg: BevConfig
+        self,
+        calib: CalibrationSnapshot,
+        cfg: BevConfig,
+        flip_u: bool,
+        flip_v: bool,
     ) -> Tuple[Tuple[float, float], Tuple[float, float]]:
         """Compute world-frame BEV extents so footpoints and ranges share the same frame."""
         width, height = calib.image_size
@@ -327,7 +427,8 @@ class BevRenderer:
         hits_world: List[Tuple[float, float]] = []
         for u in xs:
             for v in ys:
-                origin, direction = ray_from_pixel(float(u), float(v), calib.intrinsics, R_wc, C_world)
+                u_ray, v_ray = self._apply_image_flip(float(u), float(v), width, height, flip_u, flip_v)
+                origin, direction = ray_from_pixel(u_ray, v_ray, calib.intrinsics, R_wc, C_world)
                 hit = intersect_plane(origin, direction, plane)
                 if hit is None:
                     continue
@@ -352,6 +453,72 @@ class BevRenderer:
         x_max = max(xs_world) + padding
         z_min = min(zs_world) - padding
         z_max = max(zs_world) + padding
+
+        if (x_max - x_min) < 1.0:
+            cx = 0.5 * (x_min + x_max)
+            x_min = cx - 0.5
+            x_max = cx + 0.5
+        if (z_max - z_min) < 1.0:
+            cz = 0.5 * (z_min + z_max)
+            z_min = max(0.0, cz - 0.5)
+            z_max = cz + 0.5
+
+        return (x_min, x_max), (z_min, z_max)
+
+    def _compute_auto_extents_local(
+        self,
+        calib: CalibrationSnapshot,
+        cfg: BevConfig,
+        flip_u: bool,
+        flip_v: bool,
+    ) -> Tuple[Tuple[float, float], Tuple[float, float]]:
+        """Compute camera-local BEV extents so footpoints and ranges share the same frame."""
+        width, height = calib.image_size
+        if width <= 0 or height <= 0:
+            return (-4.0, 4.0), (0.0, 12.0)
+
+        R_wc, C_world = parse_extrinsics(calib.extrinsics_col_major)
+        scale = float(calib.unit_scale or 1.0)
+        C_world = C_world * scale
+        plane = Plane.horizontal(float(calib.floor_y) * scale)
+
+        # Align samples with camera forward axis for local coordinates
+        dir_world = R_wc @ np.array([0.0, 0.0, 1.0])
+        yaw = math.atan2(dir_world[0], dir_world[2])
+        cos_yaw = math.cos(-yaw)
+        sin_yaw = math.sin(-yaw)
+
+        xs = np.linspace(0, max(0.0, float(width - 1)), 8)
+        ys = np.linspace(0, max(0.0, float(height - 1)), 8)
+        hits_local: List[Tuple[float, float]] = []
+        for u in xs:
+            for v in ys:
+                u_ray, v_ray = self._apply_image_flip(float(u), float(v), width, height, flip_u, flip_v)
+                origin, direction = ray_from_pixel(u_ray, v_ray, calib.intrinsics, R_wc, C_world)
+                hit = intersect_plane(origin, direction, plane)
+                if hit is None:
+                    continue
+                dx = float(hit[0] - C_world[0])
+                dz = float(hit[2] - C_world[2])
+                dist = math.hypot(dx, dz)
+                if dist > cfg.max_distance_m and dist > 1e-6:
+                    scale_d = cfg.max_distance_m / dist
+                    dx *= scale_d
+                    dz *= scale_d
+                lx = dx * cos_yaw - dz * sin_yaw
+                lz = dx * sin_yaw + dz * cos_yaw
+                hits_local.append((lx, lz))
+
+        if len(hits_local) < 3:
+            return (-4.0, 4.0), (0.0, 12.0)
+
+        xs_local = [p[0] for p in hits_local]
+        zs_local = [p[1] for p in hits_local]
+        padding = 0.25
+        x_min = min(xs_local) - padding
+        x_max = max(xs_local) + padding
+        z_min = max(0.0, min(zs_local) - padding)
+        z_max = max(zs_local) + padding
 
         if (x_max - x_min) < 1.0:
             cx = 0.5 * (x_min + x_max)
@@ -418,6 +585,10 @@ class BevRenderer:
         cfg = self.config_per_cam.get(camera_id, BevConfig())
         footpoints = footpoints or []
 
+        frame_mode = self._frame_mode
+        use_world_frame = frame_mode == "world"
+        flip_u, flip_v = self._infer_image_flips(calib)
+
         with self._lock:
             # Prune fully expired trails for this camera so we can decide whether it's
             # worth publishing a frame when there are no current footpoints.
@@ -455,12 +626,16 @@ class BevRenderer:
                     f"{calib.image_size[0]}x{calib.image_size[1]}",
                     f"{float(calib.floor_y):.4f}",
                     f"{float(getattr(calib, 'unit_scale', 1.0) or 1.0):.6f}",
+                    str(frame_mode),
                 ]
             )
 
             auto_extents = self._auto_extents_by_camera.get(key)
             if auto_extents is None:
-                x_range_auto, z_range_auto = self._compute_auto_extents_world(calib, cfg)
+                if use_world_frame:
+                    x_range_auto, z_range_auto = self._compute_auto_extents_world(calib, cfg, flip_u, flip_v)
+                else:
+                    x_range_auto, z_range_auto = self._compute_auto_extents_local(calib, cfg, flip_u, flip_v)
                 auto_extents = (x_range_auto, z_range_auto)
                 self._auto_extents_by_camera[key] = auto_extents
             x_range, z_range = auto_extents
@@ -488,7 +663,7 @@ class BevRenderer:
         # Compute or reuse homography; fallback to last good if current fails
         H_img2plane = None
         try:
-            H_img2plane = self.h_cache.get(calib)
+            H_img2plane = self.h_cache.get(calib, flip_u=flip_u, flip_v=flip_v)
             self._last_h_by_cam[camera_id] = H_img2plane
         except Exception as e:
             logger.warning("BEV: homography computation failed for %s: %s", camera_id, e)
@@ -500,13 +675,19 @@ class BevRenderer:
             H_img2plane = cached_result
 
         bev_points: List[Dict[str, float]] = []
-        raw_world_points: List[Tuple[int, float, float, str]] = []
-        current_world_by_sid: Dict[int, Tuple[float, float]] = {}
+        raw_points: List[Tuple[int, float, float, str]] = []
+        current_by_sid: Dict[int, Tuple[float, float]] = {}
 
-        # Camera position is still needed for distance gating.
-        _R_wc, C_world = parse_extrinsics(calib.extrinsics_col_major)
+        R_wc, C_world = parse_extrinsics(calib.extrinsics_col_major)
         scale = float(calib.unit_scale or 1.0)
         C_world = C_world * scale
+
+        cos_yaw = sin_yaw = None
+        if not use_world_frame:
+            dir_world = R_wc @ np.array([0.0, 0.0, 1.0])
+            yaw = math.atan2(dir_world[0], dir_world[2])
+            cos_yaw = math.cos(-yaw)
+            sin_yaw = math.sin(-yaw)
 
         max_distance_m = float(cfg.max_distance_m or 0.0)
 
@@ -520,12 +701,23 @@ class BevRenderer:
             
             if not math.isfinite(wx) or not math.isfinite(wz):
                 continue
-            
+
             dx = wx - C_world[0]
             dz = wz - C_world[2]
             if max_distance_m > 0.0 and math.hypot(dx, dz) > max_distance_m:
                 # Guardrail: discard near-horizon homography outliers so the UI doesn't draw
                 # teleporting streaks outside the floorplan extents.
+                continue
+
+            if use_world_frame:
+                px = float(wx)
+                pz = float(wz)
+            else:
+                if cos_yaw is None or sin_yaw is None:
+                    continue
+                px = float(dx * cos_yaw - dz * sin_yaw)
+                pz = float(dx * sin_yaw + dz * cos_yaw)
+            if not math.isfinite(px) or not math.isfinite(pz):
                 continue
 
             try:
@@ -535,18 +727,18 @@ class BevRenderer:
             if stable_id is None or stable_id <= 0:
                 continue
 
-            raw_world_points.append((int(stable_id), float(wx), float(wz), str(fp.method)))
+            raw_points.append((int(stable_id), float(px), float(pz), str(fp.method)))
 
         with self._lock:
             if self._smoother.enabled:
                 self._smoother.prune(now_s)
-            for stable_id, lx, lz, method in raw_world_points:
+            for stable_id, lx, lz, method in raw_points:
                 if self._smoother.enabled:
                     lx, lz = self._smoother.update((camera_id, int(stable_id)), now_s, lx, lz)
                 # The frontend expects 'x' and 'y' in the JSON list.
-                # We map World X -> JSON x, World Z -> JSON y
+                # We map X -> JSON x, Z -> JSON y (frame depends on configured mode).
                 bev_points.append({'x': float(lx), 'y': float(lz), 'method': method, 'stableId': int(stable_id)})
-                current_world_by_sid[int(stable_id)] = (float(lx), float(lz))
+                current_by_sid[int(stable_id)] = (float(lx), float(lz))
 
         # Update config to reflect the actual extents used
         result_config = BevConfig(
@@ -575,7 +767,7 @@ class BevRenderer:
             window_s = float(self._trail_cfg.window_s)
 
             if trails_enabled:
-                for stable_id, (lx, lz) in current_world_by_sid.items():
+                for stable_id, (lx, lz) in current_by_sid.items():
                     state = cam_tracks.get(stable_id)
                     if state is None:
                         state = _BevTrailTrackState(points=deque(maxlen=max_points))
@@ -686,7 +878,7 @@ class BevRenderer:
                         )
                         cv2.line(bev, p1, p2, color, line_width, lineType=cv2.LINE_AA)
 
-            for stable_id, (lx, lz) in current_world_by_sid.items():
+            for stable_id, (lx, lz) in current_by_sid.items():
                 p = self._local_to_px(lx, lz, result_config, bev.shape[:2])
                 if p is None:
                     continue
@@ -702,7 +894,7 @@ class BevRenderer:
             width_px=width_px,
             height_px=height_px,
         )
-        self._publish(result, calib, H_img2plane)
+        self._publish(result, calib, H_img2plane, flip_u=flip_u, flip_v=flip_v)
 
     def _draw_grid(self, bev: np.ndarray, cfg: BevConfig) -> None:
         if cfg.meters_per_px <= 0:
@@ -715,7 +907,15 @@ class BevRenderer:
         for y in range(0, height, major_step_px):
             cv2.line(bev, (0, y), (width - 1, y), color, 1, lineType=cv2.LINE_AA)
 
-    def _publish(self, result: BevResult, calib: CalibrationSnapshot, H_to_use: np.ndarray) -> None:
+    def _publish(
+        self,
+        result: BevResult,
+        calib: CalibrationSnapshot,
+        H_to_use: np.ndarray,
+        *,
+        flip_u: bool = False,
+        flip_v: bool = False,
+    ) -> None:
         try:
             # Compute a quick sanity sample: image bottom-center ray intersection in meters (XZ)
             sample_xz: Optional[Tuple[float, float]] = None
@@ -727,7 +927,8 @@ class BevRenderer:
                 scale = float(calib.unit_scale or 1.0)
                 C_world = C_world * scale
                 plane = Plane.horizontal(float(calib.floor_y) * scale)
-                origin, direction = ray_from_pixel(u, v, calib.intrinsics, R_wc, C_world)
+                u_ray, v_ray = self._apply_image_flip(u, v, width_src, height_src, flip_u, flip_v)
+                origin, direction = ray_from_pixel(u_ray, v_ray, calib.intrinsics, R_wc, C_world)
                 hit = intersect_plane(origin, direction, plane)
                 if hit is not None:
                     sample_xz = (float(hit[0]), float(hit[2]))

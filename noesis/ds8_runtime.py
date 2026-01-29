@@ -66,7 +66,7 @@ except Exception:
     _PYSERVICEMAKER_MSGS = False
 
 
-_PGIE_PROFILES = ("yolo11_seg", "rfdetr_seg")
+_PGIE_PROFILES = ("yolo11_seg", "rfdetr_seg", "yolo26_seg")
 _ENV_TRUE = ("1", "true", "yes", "y", "on")
 _TRACKING_MODES = ("legacy", "v3dt")
 
@@ -282,72 +282,145 @@ def _validate_dewarper_intrinsics_sync(
     return ok
 
 
+def _resolve_yolo26_assets(size: str) -> Dict[str, Path]:
+    size_norm = str(size or "").strip().lower()
+    if size_norm not in ("n", "s", "m"):
+        raise SystemExit(f"[FATAL] YOLO26 size must be one of n/s/m (got: {size})")
+    return {
+        "template": (REPO_ROOT / "pipelines" / "config_infer_primary_yolo26_seg.template.ini").resolve(),
+        "onnx": (REPO_ROOT / "models" / f"yolo26{size_norm}-seg.onnx").resolve(),
+        "engine": (REPO_ROOT / "models" / "engines" / f"yolo26{size_norm}-seg_b3_fp16.engine").resolve(),
+        "labels": (REPO_ROOT / "models" / "coco_labels.txt").resolve(),
+        "parser": (REPO_ROOT / "pipelines" / "nvdsinfer_yolo26_seg" / "libnvdsinfer_yolo26_seg.so").resolve(),
+        "output": (REPO_ROOT / "build" / f"config_infer_primary_yolo26_seg_{size_norm}.ini").resolve(),
+    }
+
+
+def _materialize_yolo26_pgie_ini(size: str, logger: logging.Logger) -> Path:
+    assets = _resolve_yolo26_assets(size)
+    template_path = assets["template"]
+    if not template_path.exists():
+        raise SystemExit(f"[FATAL] YOLO26 PGIE template missing: {template_path}")
+    out_path = assets["output"]
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    text = template_path.read_text(encoding="utf-8")
+    text = text.replace("@ONNX_PATH@", str(assets["onnx"]))
+    text = text.replace("@ENGINE_PATH@", str(assets["engine"]))
+    text = text.replace("@LABELS_PATH@", str(assets["labels"]))
+    text = text.replace("@CUSTOM_LIB@", str(assets["parser"]))
+    out_path.write_text(text, encoding="utf-8")
+    logger.info("YOLO26 PGIE config materialized: %s", out_path)
+    return out_path
+
+
 def _preflight_pgie_profile(profile: str, pipeline_cfg: Dict[str, Any], yaml_path: Path, logger: logging.Logger) -> None:
-    if profile != "rfdetr_seg":
+    if profile not in ("rfdetr_seg", "yolo26_seg"):
         return
 
-    preprocess_cfg = pipeline_cfg.get("preprocess") if isinstance(pipeline_cfg, dict) else None
-    preprocess_path_raw = (preprocess_cfg or {}).get("config-file") if isinstance(preprocess_cfg, dict) else None
-    preprocess_path = _resolve_pipeline_cfg_path(yaml_path, str(preprocess_path_raw or ""))
-    if not preprocess_path.exists():
-        raise SystemExit(f"[FATAL] RF-DETR profile requires preprocess config-file at: {preprocess_path}")
+    if profile == "rfdetr_seg":
+        preprocess_cfg = pipeline_cfg.get("preprocess") if isinstance(pipeline_cfg, dict) else None
+        preprocess_path_raw = (preprocess_cfg or {}).get("config-file") if isinstance(preprocess_cfg, dict) else None
+        preprocess_path = _resolve_pipeline_cfg_path(yaml_path, str(preprocess_path_raw or ""))
+        if not preprocess_path.exists():
+            raise SystemExit(f"[FATAL] RF-DETR profile requires preprocess config-file at: {preprocess_path}")
 
-    models_cfg = pipeline_cfg.get("models") if isinstance(pipeline_cfg, dict) else None
-    pgie_cfg = (models_cfg or {}).get("pgie") if isinstance(models_cfg, dict) else None
-    pgie_ini_raw = (pgie_cfg or {}).get("config-file-path") if isinstance(pgie_cfg, dict) else None
-    pgie_ini = _resolve_pipeline_cfg_path(yaml_path, str(pgie_ini_raw or ""))
-    if not pgie_ini.exists():
-        raise SystemExit(f"[FATAL] RF-DETR profile requires PGIE config-file-path at: {pgie_ini}")
+        models_cfg = pipeline_cfg.get("models") if isinstance(pipeline_cfg, dict) else None
+        pgie_cfg = (models_cfg or {}).get("pgie") if isinstance(models_cfg, dict) else None
+        pgie_ini_raw = (pgie_cfg or {}).get("config-file-path") if isinstance(pgie_cfg, dict) else None
+        pgie_ini = _resolve_pipeline_cfg_path(yaml_path, str(pgie_ini_raw or ""))
+        if not pgie_ini.exists():
+            raise SystemExit(f"[FATAL] RF-DETR profile requires PGIE config-file-path at: {pgie_ini}")
 
-    engine_raw = (pgie_cfg or {}).get("engine") if isinstance(pgie_cfg, dict) else None
-    engine_path = _resolve_pipeline_cfg_path(yaml_path, str(engine_raw or ""))
-    if not str(engine_raw or "").strip():
-        raise SystemExit("[FATAL] RF-DETR profile requires models.pgie.engine to be set")
+        engine_raw = (pgie_cfg or {}).get("engine") if isinstance(pgie_cfg, dict) else None
+        engine_path = _resolve_pipeline_cfg_path(yaml_path, str(engine_raw or ""))
+        if not str(engine_raw or "").strip():
+            raise SystemExit("[FATAL] RF-DETR profile requires models.pgie.engine to be set")
 
-    parser = configparser.ConfigParser()
-    parser.read(pgie_ini, encoding="utf-8")
-    props = parser["property"] if parser.has_section("property") else {}
+        parser = configparser.ConfigParser()
+        parser.read(pgie_ini, encoding="utf-8")
+        props = parser["property"] if parser.has_section("property") else {}
 
-    lib_raw = str(props.get("custom-lib-path", "") or "").strip()
-    lib_path = _resolve_pipeline_cfg_path(yaml_path, lib_raw)
-    if not lib_raw or not lib_path.exists():
-        raise SystemExit(
-            "[FATAL] RF-DETR PGIE custom parser library missing.\n"
-            f"PGIE INI: {pgie_ini}\n"
-            f"custom-lib-path: {lib_raw or '<unset>'}\n"
-            f"resolved: {lib_path}\n"
-            "Build it with: make -C pipelines/nvdsinfer_rfdetr_seg\n"
+        lib_raw = str(props.get("custom-lib-path", "") or "").strip()
+        lib_path = _resolve_pipeline_cfg_path(yaml_path, lib_raw)
+        if not lib_raw or not lib_path.exists():
+            raise SystemExit(
+                "[FATAL] RF-DETR PGIE custom parser library missing.\n"
+                f"PGIE INI: {pgie_ini}\n"
+                f"custom-lib-path: {lib_raw or '<unset>'}\n"
+                f"resolved: {lib_path}\n"
+                "Build it with: make -C pipelines/nvdsinfer_rfdetr_seg\n"
+            )
+
+        gie_uid = str(props.get("gie-unique-id", "") or "").strip()
+        if gie_uid and gie_uid != "1":
+            raise SystemExit(f"[FATAL] RF-DETR PGIE gie-unique-id must remain 1 (got {gie_uid})")
+
+        if engine_path.exists():
+            logger.info("RF-DETR PGIE engine found: %s", engine_path)
+            return
+
+        onnx_raw = str(props.get("onnx-file", "") or "").strip()
+        onnx_path = _resolve_pipeline_cfg_path(yaml_path, onnx_raw)
+        if not onnx_raw or not onnx_path.exists():
+            raise SystemExit(
+                "[FATAL] RF-DETR PGIE engine is missing and no ONNX is available to rebuild it.\n"
+                f"engine (from YAML models.pgie.engine): {engine_path}\n"
+                f"onnx-file (from PGIE INI): {onnx_raw or '<unset>'}\n"
+                f"resolved: {onnx_path}\n"
+            )
+
+        logger.warning(
+            "RF-DETR PGIE engine missing (%s); nvinfer will attempt to build it from ONNX (%s) on startup.",
+            engine_path,
+            onnx_path,
         )
-
-    gie_uid = str(props.get("gie-unique-id", "") or "").strip()
-    if gie_uid and gie_uid != "1":
-        raise SystemExit(f"[FATAL] RF-DETR PGIE gie-unique-id must remain 1 (got {gie_uid})")
-
-    if engine_path.exists():
-        logger.info("RF-DETR PGIE engine found: %s", engine_path)
         return
 
-    onnx_raw = str(props.get("onnx-file", "") or "").strip()
-    onnx_path = _resolve_pipeline_cfg_path(yaml_path, onnx_raw)
-    if not onnx_raw or not onnx_path.exists():
-        raise SystemExit(
-            "[FATAL] RF-DETR PGIE engine is missing and no ONNX is available to rebuild it.\n"
-            f"engine (from YAML models.pgie.engine): {engine_path}\n"
-            f"onnx-file (from PGIE INI): {onnx_raw or '<unset>'}\n"
-            f"resolved: {onnx_path}\n"
-        )
+    if profile == "yolo26_seg":
+        models_cfg = pipeline_cfg.get("models") if isinstance(pipeline_cfg, dict) else None
+        pgie_cfg = (models_cfg or {}).get("pgie") if isinstance(models_cfg, dict) else None
+        pgie_ini_raw = (pgie_cfg or {}).get("config-file-path") if isinstance(pgie_cfg, dict) else None
+        pgie_ini = _resolve_pipeline_cfg_path(yaml_path, str(pgie_ini_raw or ""))
+        if not pgie_ini.exists():
+            raise SystemExit(f"[FATAL] YOLO26 profile requires PGIE config-file-path at: {pgie_ini}")
 
-    logger.warning(
-        "RF-DETR PGIE engine missing (%s); nvinfer will attempt to build it from ONNX (%s) on startup.",
-        engine_path,
-        onnx_path,
-    )
+        engine_raw = (pgie_cfg or {}).get("engine") if isinstance(pgie_cfg, dict) else None
+        engine_path = _resolve_pipeline_cfg_path(yaml_path, str(engine_raw or ""))
+        if not str(engine_raw or "").strip():
+            raise SystemExit("[FATAL] YOLO26 profile requires models.pgie.engine to be set")
+        if not engine_path.exists():
+            raise SystemExit(f"[FATAL] YOLO26 PGIE engine missing: {engine_path}")
+
+        parser = configparser.ConfigParser()
+        parser.read(pgie_ini, encoding="utf-8")
+        props = parser["property"] if parser.has_section("property") else {}
+
+        lib_raw = str(props.get("custom-lib-path", "") or "").strip()
+        lib_path = _resolve_pipeline_cfg_path(yaml_path, lib_raw)
+        if not lib_raw or not lib_path.exists():
+            raise SystemExit(
+                "[FATAL] YOLO26 PGIE custom parser library missing.\n"
+                f"PGIE INI: {pgie_ini}\n"
+                f"custom-lib-path: {lib_raw or '<unset>'}\n"
+                f"resolved: {lib_path}\n"
+                "Build it with: make -C pipelines/nvdsinfer_yolo26_seg\n"
+            )
+
+        gie_uid = str(props.get("gie-unique-id", "") or "").strip()
+        if gie_uid and gie_uid != "1":
+            raise SystemExit(f"[FATAL] YOLO26 PGIE gie-unique-id must remain 1 (got {gie_uid})")
+
+        batch_size = str(props.get("batch-size", "") or "").strip()
+        if batch_size and batch_size != "3":
+            raise SystemExit(f"[FATAL] YOLO26 PGIE batch-size must be 3 for b3 engines (got {batch_size})")
 
 
 def _materialize_effective_pipeline_yaml(
     base_yaml_path: Path,
     profile: str,
     logger: logging.Logger,
+    *,
+    pgie_size: Optional[str] = None,
 ) -> Path:
     try:
         base_cfg = yaml.safe_load(base_yaml_path.read_text(encoding="utf-8")) or {}
@@ -367,6 +440,22 @@ def _materialize_effective_pipeline_yaml(
                 }
             },
         }
+    if profile == "yolo26_seg":
+        if not pgie_size:
+            raise SystemExit("[FATAL] YOLO26 profile requires --size (n/s/m)")
+        size_norm = str(pgie_size).strip().lower()
+        assets = _resolve_yolo26_assets(size_norm)
+        pgie_ini = _materialize_yolo26_pgie_ini(size_norm, logger)
+        overlay = {
+            "preprocess": {"config-file": "pipelines/config_preproc.ini"},
+            "models": {
+                "pgie": {
+                    "config-file-path": str(pgie_ini),
+                    "engine": str(assets["engine"]),
+                }
+            },
+        }
+        logger.info("YOLO26 PGIE size: %s", size_norm)
 
     effective_cfg = _deep_merge_dict(base_cfg, overlay)
     if not isinstance(effective_cfg, dict):
@@ -477,6 +566,12 @@ def _parse_args() -> argparse.Namespace:
         choices=_PGIE_PROFILES,
         default=default_pgie_profile,
         help="PGIE profile overlay (default: yolo11_seg). Env: NOESIS_PGIE_PROFILE",
+    )
+    parser.add_argument(
+        "--size",
+        choices=("n", "s", "m"),
+        default=None,
+        help="YOLO26 model size (n/s/m). Default: m when --pgie-profile yolo26_seg is used.",
     )
     parser.add_argument(
         "--cameras-config",
@@ -2211,6 +2306,12 @@ def main() -> int:
     )
     logger = logging.getLogger("ds8.runtime")
     runtime_state: Dict[str, Any] = {"pipeline_failed": False}
+    pgie_size: Optional[str] = None
+
+    if args.size is not None and str(args.pgie_profile) != "yolo26_seg":
+        raise SystemExit("[FATAL] --size is only valid with --pgie-profile yolo26_seg")
+    if str(args.pgie_profile) == "yolo26_seg":
+        pgie_size = (args.size or "m").strip().lower()
 
     # Install SIGINT/SIGTERM handling early (before DS/GStreamer init), because
     # some backends install their own handlers/masks which can make `timeout(1)`
@@ -2305,7 +2406,12 @@ def main() -> int:
         _warn_legacy_with_v3dt_tracker(pipeline_path, logger)
 
     base_pipeline_path = pipeline_path
-    pipeline_path = _materialize_effective_pipeline_yaml(base_pipeline_path, str(args.pgie_profile), logger)
+    pipeline_path = _materialize_effective_pipeline_yaml(
+        base_pipeline_path,
+        str(args.pgie_profile),
+        logger,
+        pgie_size=pgie_size,
+    )
     logger.info("Building DS8 pipeline from %s (base: %s)", pipeline_path, base_pipeline_path)
 
     if not _maybe_autogen_v3dt_caminfo(pipeline_path, cameras_path, logger):
@@ -2833,6 +2939,14 @@ def main() -> int:
     bev_smoothing_cfg = bev_cfg.get("smoothing") if isinstance(bev_cfg, dict) else None
     if not isinstance(bev_smoothing_cfg, dict):
         bev_smoothing_cfg = None
+    bev_frame = None
+    if isinstance(bev_cfg, dict):
+        bev_frame = bev_cfg.get("frame") or bev_cfg.get("frame_mode")
+    bev_frame_env = os.environ.get("NOESIS_BEV_FRAME")
+    if bev_frame_env:
+        bev_frame = bev_frame_env
+    if not bev_frame:
+        bev_frame = "camera_local"
     bev_env = os.environ.get("NOESIS_BEV_JPEG_ENABLED")
     if bev_env is not None:
         env_text = str(bev_env).strip().lower()
@@ -2841,6 +2955,7 @@ def main() -> int:
         elif env_text in ("0", "false", "no", "off"):
             bev_jpeg_enabled = False
     logger.info("BEV JPEG output enabled=%s (quality=%s)", bev_jpeg_enabled, bev_jpeg_quality)
+    logger.info("BEV frame mode=%s", bev_frame)
 
     ws_server = WebSocketServer(
         host=args.ws_host,
@@ -3140,6 +3255,7 @@ def main() -> int:
         ws_server,
         trails_cfg=trails_cfg,
         smoothing_cfg=bev_smoothing_cfg,
+        frame=str(bev_frame),
         jpeg_enabled=bev_jpeg_enabled,
         jpeg_quality=bev_jpeg_quality,
     )

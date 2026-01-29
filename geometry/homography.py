@@ -166,6 +166,9 @@ def img_to_plane_homography(
     floor_y: float,
     image_size: Tuple[int, int],
     unit_scale: float = 1.0,
+    *,
+    flip_u: bool = False,
+    flip_v: bool = False,
 ) -> np.ndarray:
     """
     Build a 3x3 homography that maps image pixels to ground plane XZ metres.
@@ -178,11 +181,19 @@ def img_to_plane_homography(
     R_wc, C_world = parse_extrinsics(E_col_major_16)
     C_world = C_world * scale
 
+    def _apply_flip(u: float, v: float) -> Tuple[float, float]:
+        if flip_u:
+            u = float(width - 1) - float(u)
+        if flip_v:
+            v = float(height - 1) - float(v)
+        return float(u), float(v)
+
     def try_build(points: Sequence[Tuple[float, float]]) -> np.ndarray | None:
         img_pts: list[list[float]] = []
         plane_pts: list[list[float]] = []
         for (u, v) in points:
-            origin, direction = ray_from_pixel(u, v, K, R_wc, C_world)
+            u_ray, v_ray = _apply_flip(u, v)
+            origin, direction = ray_from_pixel(u_ray, v_ray, K, R_wc, C_world)
             hit = intersect_plane(origin, direction, plane)
             if hit is None:
                 continue

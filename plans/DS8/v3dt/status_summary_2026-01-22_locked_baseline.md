@@ -83,6 +83,29 @@ Family-room best runs (non-live):
   Depth store access is currently too slow (timeouts), so manual pitch sweeps are
   more reliable for now.
 
+## Recovery invariant (defaults are authoritative)
+
+If `config/v3dt/` is deleted or stale, **rebuild camInfo using the coded defaults**
+in `noesis/ds8_runtime.py` and write to `config/v3dt/caminfo_baseline/`. Do not
+rely on preview/tuned configs unless you explicitly select them on the CLI.
+
+```bash
+python3 scripts/generate_v3dt_caminfo.py \
+  --pipeline-config config/infer_v3dt_baseline.yaml \
+  --cameras-config config/cameras_v3dt_baseline.yaml \
+  --calibration config/camera_calibration.json \
+  --output-dir config/v3dt/caminfo_baseline \
+  --model-height 2.2 \
+  --model-radius 0.35 \
+  --target-width 1920 \
+  --target-height 1080
+
+python3 scripts/sanity_check_v3dt_calibration.py \
+  --pipeline-config config/infer_v3dt_baseline.yaml \
+  --cameras-config config/cameras_v3dt_baseline.yaml \
+  --calibration config/camera_calibration.json
+```
+
 ## Canonical runtime command
 
 ```bash

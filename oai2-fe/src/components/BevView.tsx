@@ -193,6 +193,51 @@ export const BevView: React.FC<BevViewProps> = ({
         zMax = metaNow.zMax;
       }
 
+      if (floorplan?.bounds && metaNow?.footpoints?.length) {
+        let minX = Number.POSITIVE_INFINITY;
+        let maxX = Number.NEGATIVE_INFINITY;
+        let minZ = Number.POSITIVE_INFINITY;
+        let maxZ = Number.NEGATIVE_INFINITY;
+
+        metaNow.footpoints.forEach((pt) => {
+          if (!Number.isFinite(pt.x) || !Number.isFinite(pt.y)) return;
+          minX = Math.min(minX, pt.x);
+          maxX = Math.max(maxX, pt.x);
+          minZ = Math.min(minZ, pt.y);
+          maxZ = Math.max(maxZ, pt.y);
+        });
+
+        if (Number.isFinite(minX) && Number.isFinite(maxX) && Number.isFinite(minZ) && Number.isFinite(maxZ)) {
+          const spanX = Math.max(1e-3, xMax - xMin);
+          const spanZ = Math.max(1e-3, zMax - zMin);
+          const padX = Math.max(0.5, spanX * 0.05);
+          const padZ = Math.max(0.5, spanZ * 0.05);
+          let nextXMin = Math.min(xMin, minX - padX);
+          let nextXMax = Math.max(xMax, maxX + padX);
+          let nextZMin = Math.min(zMin, minZ - padZ);
+          let nextZMax = Math.max(zMax, maxZ + padZ);
+
+          const maxExpand = 2.5;
+          const maxSpanX = spanX * maxExpand;
+          const maxSpanZ = spanZ * maxExpand;
+          if ((nextXMax - nextXMin) > maxSpanX) {
+            const cx = (nextXMax + nextXMin) * 0.5;
+            nextXMin = cx - maxSpanX * 0.5;
+            nextXMax = cx + maxSpanX * 0.5;
+          }
+          if ((nextZMax - nextZMin) > maxSpanZ) {
+            const cz = (nextZMax + nextZMin) * 0.5;
+            nextZMin = cz - maxSpanZ * 0.5;
+            nextZMax = cz + maxSpanZ * 0.5;
+          }
+
+          xMin = nextXMin;
+          xMax = nextXMax;
+          zMin = nextZMin;
+          zMax = nextZMax;
+        }
+      }
+
       const boundsSpanX = Math.max(1e-6, xMax - xMin);
       const boundsSpanZ = Math.max(1e-6, zMax - zMin);
       const boundsAspect = boundsSpanX / boundsSpanZ;
@@ -267,7 +312,6 @@ export const BevView: React.FC<BevViewProps> = ({
       const contentRect = bgContentRectRef.current ?? { x: 0, y: 0, w: width, h: height };
 
       const drawX = (mx: number) => contentRect.x + ((mx - xMin) / (xMax - xMin)) * contentRect.w;
-      const drawXFlipped = (mx: number) => contentRect.x + contentRect.w - ((mx - xMin) / (xMax - xMin)) * contentRect.w;
       const drawY = (mz: number) => contentRect.y + contentRect.h - ((mz - zMin) / (zMax - zMin)) * contentRect.h;
       const inBounds = (mx: number, mz: number) => mx >= xMin && mx <= xMax && mz >= zMin && mz <= zMax;
 
@@ -277,7 +321,7 @@ export const BevView: React.FC<BevViewProps> = ({
         ctx.beginPath();
         const startX = Math.ceil(xMin);
         for (let x = startX; x <= xMax; x++) {
-          const u = drawXFlipped(x);
+          const u = drawX(x);
           ctx.moveTo(u, contentRect.y);
           ctx.lineTo(u, contentRect.y + contentRect.h);
         }
@@ -298,7 +342,7 @@ export const BevView: React.FC<BevViewProps> = ({
           ctx.lineTo(contentRect.x + contentRect.w, v0);
         }
         if (xMin <= 0 && xMax >= 0) {
-          const u0 = drawXFlipped(0);
+          const u0 = drawX(0);
           ctx.moveTo(u0, contentRect.y);
           ctx.lineTo(u0, contentRect.y + contentRect.h);
         }
@@ -387,8 +431,8 @@ export const BevView: React.FC<BevViewProps> = ({
 
             ctx.strokeStyle = hsla(tr.colorId, alpha);
             ctx.beginPath();
-            ctx.moveTo(drawXFlipped(prev.x), drawY(prev.y));
-            ctx.lineTo(drawXFlipped(p.x), drawY(p.y));
+            ctx.moveTo(drawX(prev.x), drawY(prev.y));
+            ctx.lineTo(drawX(p.x), drawY(p.y));
             ctx.stroke();
             prev = p;
           }
@@ -410,7 +454,7 @@ export const BevView: React.FC<BevViewProps> = ({
             const blink = staleMs >= TRAIL_STALE_BLINK_START_MS
               ? (0.35 + 0.65 * (0.5 + 0.5 * Math.sin(blinkPhase)))
               : 1.0;
-            const px = drawXFlipped(lastValid.x);
+            const px = drawX(lastValid.x);
             const py = drawY(lastValid.y);
 
             ctx.fillStyle = hsla(tr.colorId, Math.min(1, (alpha * blink) + 0.25));
@@ -429,7 +473,7 @@ export const BevView: React.FC<BevViewProps> = ({
         if (age > 500) return;
         if (!Number.isFinite(pt.x) || !Number.isFinite(pt.y) || !inBounds(pt.x, pt.y)) return;
 
-        const px = drawXFlipped(pt.x);
+        const px = drawX(pt.x);
         const py = drawY(pt.y);
 
         const alpha = Math.max(0, 1 - age / 500);

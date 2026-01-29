@@ -99,3 +99,34 @@ Baseline expectations:
 Everything else is quarantine material until the baseline works.
 See `plans/DS8/v3dt/status_summary_2026-01-22_locked_baseline.md` for shortfalls
 and confirmed no-go items.
+
+## Recovery checklist (if config/v3dt is missing)
+
+Use the coded defaults in `noesis/ds8_runtime.py`. Regenerate camInfo into the
+baseline directory and validate it before running.
+
+Defaults:
+
+- Pipeline: `config/infer_v3dt_baseline.yaml`
+- Cameras: `config/cameras_v3dt_baseline.yaml`
+- Tracker: `config/v3dt/nvtracker_v3dt_baseline.yml`
+- camInfo dir: `config/v3dt/caminfo_baseline/`
+
+Commands:
+
+```bash
+python3 scripts/generate_v3dt_caminfo.py \
+  --pipeline-config config/infer_v3dt_baseline.yaml \
+  --cameras-config config/cameras_v3dt_baseline.yaml \
+  --calibration config/camera_calibration.json \
+  --output-dir config/v3dt/caminfo_baseline \
+  --model-height 2.2 \
+  --model-radius 0.35 \
+  --target-width 1920 \
+  --target-height 1080
+
+python3 scripts/sanity_check_v3dt_calibration.py \
+  --pipeline-config config/infer_v3dt_baseline.yaml \
+  --cameras-config config/cameras_v3dt_baseline.yaml \
+  --calibration config/camera_calibration.json
+```

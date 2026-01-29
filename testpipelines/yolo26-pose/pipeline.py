@@ -10,6 +10,7 @@ from typing import Dict, Optional
 from pyservicemaker import Pipeline, Probe
 
 from debug_probes import FrameCounter
+from fps_cap import FpsCap
 from pose_overlay import PoseOverlay
 
 
@@ -132,11 +133,27 @@ def build_pipeline(
         "yes",
         "on",
     )
+    if file_sources:
+        cap_value = os.environ.get("YOLO26_POSE_FPS_CAP", "30").strip()
+        if cap_value:
+            cap_fps = float(cap_value)
+            if cap_fps > 0:
+                pipeline.attach("pose_infer", Probe("fps_cap", FpsCap(cap_fps)))
+
     if debug:
         pipeline.attach("pose_infer", Probe("pose_frames", FrameCounter("pose_infer")))
 
     if not os.environ.get("YOLO26_POSE_DISABLE_OVERLAY"):
         overlay = PoseOverlay(gie_id=1, model_size=(640, 640))
         pipeline.attach("pose_infer", Probe("pose_overlay", overlay))
+    else:
+        pipeline["osd"].set(
+            {
+                "process-mode": 0,
+                "display-mask": 0,
+                "display-bbox": 0,
+                "display-text": 0,
+            }
+        )
 
     return PipelineContext(pipeline=pipeline, config_path=nvinfer_config)

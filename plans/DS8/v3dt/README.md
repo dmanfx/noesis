@@ -50,6 +50,38 @@ Confirmed no-go items (see full list in the status summary):
 - Do not change `config/ply_alignment.json` `units.s_obj_to_m` away from `1.0`.
 - Do not use model height >= 2.4m (family-room regression).
 
+## Default-baseline recovery (if config/v3dt is missing)
+
+The coded defaults are the source of truth for v3dt runs. When `config/v3dt/`
+is deleted or stale, regenerate camInfo using the default baseline inputs
+defined in `noesis/ds8_runtime.py`.
+
+**Defaults (coded in `noesis/ds8_runtime.py`):**
+
+- v3dt pipeline: `config/infer_v3dt_baseline.yaml`
+- v3dt cameras: `config/cameras_v3dt_baseline.yaml`
+- v3dt tracker: `config/v3dt/nvtracker_v3dt_baseline.yml`
+- camInfo dir: `config/v3dt/caminfo_baseline/`
+
+**Recovery steps:**
+
+```bash
+python3 scripts/generate_v3dt_caminfo.py \
+  --pipeline-config config/infer_v3dt_baseline.yaml \
+  --cameras-config config/cameras_v3dt_baseline.yaml \
+  --calibration config/camera_calibration.json \
+  --output-dir config/v3dt/caminfo_baseline \
+  --model-height 2.2 \
+  --model-radius 0.35 \
+  --target-width 1920 \
+  --target-height 1080
+
+python3 scripts/sanity_check_v3dt_calibration.py \
+  --pipeline-config config/infer_v3dt_baseline.yaml \
+  --cameras-config config/cameras_v3dt_baseline.yaml \
+  --calibration config/camera_calibration.json
+```
+
 ## Critical dependency (must be solved early)
 
 Your current `config/camera_calibration.json` extrinsics appear to be **camera-local** (camera centers all near x≈0,z≈0). **MV3DT requires a shared global world frame** across cameras. The plan treats “global calibration” as Phase 0.
@@ -74,8 +106,8 @@ To validate that DS8 is extracting `NVDS_OBJ_3D_META` and publishing `bbox3d` in
   - Defaults to `config/infer_v3dt_sample.yaml` (offline Retail02 clip) when present.
   - For live RTSP, run `python3 scripts/sv3dt_meta_smoke_test.py --pipeline-config config/infer_v3dt_sv3dt.yaml` and ensure a person is visible.
     - Note: SV3DT requires a patched DeepStream `nvtracker` plugin to avoid an upstream host-RAM leak; `noesis/ds8_runtime.py` auto-builds/auto-loads it for V3DT tracker configs (see `plans/DS8/v3dt/oom_killed_infer_v3dt_debug.md`).
-- Note: `noesis/ds8_runtime.py` auto-regenerates `config/v3dt/camInfo_*.yml` from `config/cameras.yaml` + `config/camera_calibration.json` for V3DT runs (default `NOESIS_V3DT_AUTOGEN_CAMINFO=1`).
-  - For the locked baseline, use `NOESIS_V3DT_AUTOGEN_CAMINFO=0` with the pre-generated camInfo dir in the tracker config (see summary above).
+- Note: `noesis/ds8_runtime.py` only auto-regenerates `config/v3dt/camInfo_*.yml` when `NOESIS_V3DT_AUTOGEN_CAMINFO=1` (default is `0`).
+  - For the locked baseline, keep `NOESIS_V3DT_AUTOGEN_CAMINFO=0` and use the pre-generated camInfo dir in the tracker config (see summary above).
 
 ## Unit Convention and Calibration
 
@@ -123,7 +155,7 @@ This baseline restores tracking for all three cameras; see `plans/DS8/v3dt/statu
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `NOESIS_V3DT_AUTOGEN_CAMINFO` | `1` | Regenerate `config/v3dt/camInfo_*.yml` at DS8 startup |
+| `NOESIS_V3DT_AUTOGEN_CAMINFO` | `0` | Regenerate `config/v3dt/camInfo_*.yml` at DS8 startup |
 | `NOESIS_V3DT_CAMINFO_WORLD_SCALE` | `1.0` | Unit multiplier for camInfo world units (1.0 = meters, 100.0 = centimeters). If you use `100.0`, you must retune SV3DT world-space noise/thresholds accordingly. |
 | `NOESIS_V3DT_CAMINFO_MATRIX_TYPE` | `w2p` | `w2p` writes `projectionMatrix_3x4_w2p`; `3x4` writes `projectionMatrix_3x4` (DeepStream adds `(w/2,h/2)` internally) |
 | `NOESIS_V3DT_CAMINFO_INVERT_E` | `0` | Invert `E` matrix before computing projection (set to `1` only if your stored `E` is camera→world / `Twc`) |

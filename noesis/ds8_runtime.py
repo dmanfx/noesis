@@ -288,8 +288,8 @@ def _resolve_yolo26_assets(size: str) -> Dict[str, Path]:
         raise SystemExit(f"[FATAL] YOLO26 size must be one of n/s/m (got: {size})")
     return {
         "template": (REPO_ROOT / "pipelines" / "config_infer_primary_yolo26_seg.template.ini").resolve(),
-        "onnx": (REPO_ROOT / "models" / f"yolo26{size_norm}-seg.onnx").resolve(),
-        "engine": (REPO_ROOT / "models" / "engines" / f"yolo26{size_norm}-seg_b3_fp16.engine").resolve(),
+        "onnx": (REPO_ROOT / "models" / f"yolo26{size_norm}-seg_fused.onnx").resolve(),
+        "engine": (REPO_ROOT / "models" / "engines" / f"yolo26{size_norm}-seg_fused_b3_fp16.engine").resolve(),
         "labels": (REPO_ROOT / "models" / "coco_labels.txt").resolve(),
         "parser": (REPO_ROOT / "pipelines" / "nvdsinfer_yolo26_seg" / "libnvdsinfer_yolo26_seg.so").resolve(),
         "output": (REPO_ROOT / "build" / f"config_infer_primary_yolo26_seg_{size_norm}.ini").resolve(),
@@ -909,13 +909,28 @@ def _build_stable_id_manager(logger: logging.Logger):
 class _CalibrationProvider:
     """Provide calibration snapshots and WS bundle for BEV rendering."""
 
-    def __init__(self, cameras_path: Path, pipeline_cfg: Dict[str, object]) -> None:
+    def __init__(
+        self,
+        cameras_path: Path,
+        pipeline_cfg: Dict[str, object],
+        *,
+        tracking_mode: Optional[str] = None,
+        extrinsics_path: Optional[Path] = None,
+    ) -> None:
         self._loader = CameraConfigLoader(cameras_path)
         self._camera_model_res = self._load_camera_model_resolutions(cameras_path)
         self._intrinsics_models = load_intrinsics(str(REPO_ROOT / "intrinsics.json"))
         self._align = load_alignment(str(REPO_ROOT / "config" / "ply_alignment.json"))
-        self._extrinsics_path = REPO_ROOT / "config" / "camera_calibration.json"
+        env_path = os.environ.get("NOESIS_CALIBRATION_EXTRINSICS", "")
+        if not extrinsics_path and env_path.strip():
+            extrinsics_path = Path(env_path.strip())
+        if not extrinsics_path and tracking_mode and str(tracking_mode).strip().lower() != "v3dt":
+            legacy_path = REPO_ROOT / "config" / "camera_calibration_legacy.json"
+            if legacy_path.exists():
+                extrinsics_path = legacy_path
+        self._extrinsics_path = Path(extrinsics_path) if extrinsics_path else (REPO_ROOT / "config" / "camera_calibration.json")
         self._extrinsics = load_extrinsics(str(self._extrinsics_path))
+        logging.getLogger(__name__).info("Calibration extrinsics path=%s", self._extrinsics_path)
         try:
             from config import config as legacy_config  # type: ignore
 
@@ -2905,7 +2920,7 @@ def main() -> int:
         pass
     #endregion
 
-    calibration_provider = _CalibrationProvider(cameras_path, pipeline.config)
+    calibration_provider = _CalibrationProvider(cameras_path, pipeline.config, tracking_mode=tracking_mode)
     calibration_provider.set_camera_labels(camera_labels)
     try:
         storage_manager.calibration_bundle = calibration_provider.calibration_bundle()

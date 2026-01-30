@@ -163,6 +163,8 @@ function Dashboard() {
   const lastCalibrationSignatureRef = useRef<string>('');
   const lastDepthFloorplanTsRef = useRef<Record<string, number>>({});
   const mosaicCameraIdToSlotKeyRef = useRef<Record<string, CameraKey>>({});
+  const floorplanWarmupTimersRef = useRef<number[]>([]);
+  const floorplanWarmupScheduledRef = useRef(false);
 
   // Stream mode is fixed to WebRTC (former JPEG toggle removed)
   const streamMode: StreamMode = 'webrtc';
@@ -622,7 +624,21 @@ function Dashboard() {
     // Normalize key to match UI components (e.g. 'kitchen_camera' -> 'kitchen')
     const key = detectCameraKey(camId) || camId;
 
-    setFloorplanData(prev => ({ ...prev, [key]: payload as FloorplanResponse }));
+    setFloorplanData(prev => {
+      const nextPayload = payload as FloorplanResponse;
+      if (nextPayload?.error) {
+        const existing = prev[key];
+        const hasValidGrid = Boolean(
+          existing?.density?.grid_b64 ||
+          existing?.height?.grid_b64 ||
+          existing?.distance?.grid_b64
+        );
+        if (hasValidGrid) {
+          return prev;
+        }
+      }
+      return { ...prev, [key]: nextPayload };
+    });
 
     const label = labelForCameraId(key);
     const now = Date.now();
@@ -713,6 +729,11 @@ function Dashboard() {
     },
   });
 
+  const requestFloorplanRef = useRef(requestFloorplan);
+  useEffect(() => {
+    requestFloorplanRef.current = requestFloorplan;
+  }, [requestFloorplan]);
+
   // Initialize WebRTC client hook
   const webrtc = useWebRTCClient(
     status === 'open' ? { sendOffer: sendWebRTCOffer, sendIceCandidate: sendWebRTCIceCandidate } : null,
@@ -761,10 +782,19 @@ function Dashboard() {
   }, [requestMapAnythingDepth]);
 
   const handleRequestFloorplan = useCallback((options?: { camera?: string; requestId?: string; maxAgeSec?: number; gridResM?: number; maxExtentM?: number; cacheOnly?: boolean }) => {
-    return requestFloorplan(options);
-  }, [requestFloorplan]);
+    return requestFloorplanRef.current(options);
+  }, []);
 
   useEffect(() => {
+    if (status !== 'open') {
+      floorplanWarmupScheduledRef.current = false;
+      floorplanWarmupTimersRef.current.forEach((id) => window.clearTimeout(id));
+      floorplanWarmupTimersRef.current = [];
+      return;
+    }
+    if (floorplanWarmupScheduledRef.current) return;
+    floorplanWarmupScheduledRef.current = true;
+
     const timers: number[] = [];
     cameraOrder.forEach((cam, idx) => {
       const timer = window.setTimeout(() => {
@@ -779,10 +809,11 @@ function Dashboard() {
       }, idx * 120);
       timers.push(timer);
     });
+    floorplanWarmupTimersRef.current = timers;
     return () => {
       timers.forEach((id) => window.clearTimeout(id));
     };
-  }, [handleRequestFloorplan]);
+  }, [status, handleRequestFloorplan]);
 
   useEffect(() => {
     Object.entries(maDepthMeta || {}).forEach(([camId, meta]) => {

@@ -193,51 +193,6 @@ export const BevView: React.FC<BevViewProps> = ({
         zMax = metaNow.zMax;
       }
 
-      if (floorplan?.bounds && metaNow?.footpoints?.length) {
-        let minX = Number.POSITIVE_INFINITY;
-        let maxX = Number.NEGATIVE_INFINITY;
-        let minZ = Number.POSITIVE_INFINITY;
-        let maxZ = Number.NEGATIVE_INFINITY;
-
-        metaNow.footpoints.forEach((pt) => {
-          if (!Number.isFinite(pt.x) || !Number.isFinite(pt.y)) return;
-          minX = Math.min(minX, pt.x);
-          maxX = Math.max(maxX, pt.x);
-          minZ = Math.min(minZ, pt.y);
-          maxZ = Math.max(maxZ, pt.y);
-        });
-
-        if (Number.isFinite(minX) && Number.isFinite(maxX) && Number.isFinite(minZ) && Number.isFinite(maxZ)) {
-          const spanX = Math.max(1e-3, xMax - xMin);
-          const spanZ = Math.max(1e-3, zMax - zMin);
-          const padX = Math.max(0.5, spanX * 0.05);
-          const padZ = Math.max(0.5, spanZ * 0.05);
-          let nextXMin = Math.min(xMin, minX - padX);
-          let nextXMax = Math.max(xMax, maxX + padX);
-          let nextZMin = Math.min(zMin, minZ - padZ);
-          let nextZMax = Math.max(zMax, maxZ + padZ);
-
-          const maxExpand = 2.5;
-          const maxSpanX = spanX * maxExpand;
-          const maxSpanZ = spanZ * maxExpand;
-          if ((nextXMax - nextXMin) > maxSpanX) {
-            const cx = (nextXMax + nextXMin) * 0.5;
-            nextXMin = cx - maxSpanX * 0.5;
-            nextXMax = cx + maxSpanX * 0.5;
-          }
-          if ((nextZMax - nextZMin) > maxSpanZ) {
-            const cz = (nextZMax + nextZMin) * 0.5;
-            nextZMin = cz - maxSpanZ * 0.5;
-            nextZMax = cz + maxSpanZ * 0.5;
-          }
-
-          xMin = nextXMin;
-          xMax = nextXMax;
-          zMin = nextZMin;
-          zMax = nextZMax;
-        }
-      }
-
       const boundsSpanX = Math.max(1e-6, xMax - xMin);
       const boundsSpanZ = Math.max(1e-6, zMax - zMin);
       const boundsAspect = boundsSpanX / boundsSpanZ;

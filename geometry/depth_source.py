@@ -4,6 +4,7 @@ from __future__ import annotations
 import base64
 import json
 import logging
+import math
 import os
 import queue
 import shutil
@@ -13,7 +14,7 @@ from collections import OrderedDict, deque
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Deque, Dict, Iterable, List, Mapping, Optional, Tuple
+from typing import Any, Deque, Dict, Iterable, List, Mapping, Optional, Tuple, Sequence
 
 from concurrent.futures import Future
 
@@ -24,6 +25,7 @@ import scipy.ndimage as ndi
 import zarr
 
 from adapters.mapanything_adapter import ViewBuildResult, build_mono_view
+from geometry.homography import parse_extrinsics
 from mapanything_config import ServiceConfig, load_service_config
 from utils.rate_limited_logger import RateLimitedLogger
 
@@ -36,6 +38,83 @@ try:
     from numcodecs import Blosc as _NumcodecsBlosc  # type: ignore
 except Exception:
     _NumcodecsBlosc = None  # type: ignore
+
+_FLOORPLAN_FRAME = "camera_local_ground"
+
+
+def _infer_image_flips_from_extrinsics(
+    extrinsics_col_major: Sequence[float],
+) -> Optional[Tuple[bool, bool]]:
+    try:
+        R_wc, _ = parse_extrinsics(extrinsics_col_major)
+        forward = R_wc @ np.array([0.0, 0.0, 1.0], dtype=np.float64)
+        f_norm = float(np.linalg.norm(forward))
+        if f_norm > 1e-6:
+            forward = forward / f_norm
+        world_up = np.array([0.0, 1.0, 0.0], dtype=np.float64)
+        right_ref = np.cross(world_up, forward)
+        r_norm = float(np.linalg.norm(right_ref))
+        if r_norm <= 1e-6:
+            right_ref = np.array([1.0, 0.0, 0.0], dtype=np.float64)
+        else:
+            right_ref = right_ref / r_norm
+        up_ref = np.cross(forward, right_ref)
+        u_norm = float(np.linalg.norm(up_ref))
+        if u_norm <= 1e-6:
+            up_ref = world_up
+        else:
+            up_ref = up_ref / u_norm
+
+        right = R_wc @ np.array([1.0, 0.0, 0.0], dtype=np.float64)
+        up = R_wc @ np.array([0.0, 1.0, 0.0], dtype=np.float64)
+        r_actual = float(np.dot(right, right_ref))
+        u_actual = float(np.dot(up, up_ref))
+
+        flip_u = r_actual < 0.0
+        flip_v = u_actual > 0.0
+        return bool(flip_u), bool(flip_v)
+    except Exception:
+        return None
+
+
+def _expected_floorplan_flip(
+    calib_bundle: Any,
+    camera_id: str,
+) -> Optional[Tuple[bool, bool]]:
+    if not isinstance(calib_bundle, dict):
+        return None
+    cameras_node = calib_bundle.get("cameras")
+    if not isinstance(cameras_node, dict):
+        return None
+    extr = None
+    e_table = cameras_node.get("E") if isinstance(cameras_node, dict) else None
+    if isinstance(e_table, dict):
+        extr = e_table.get(camera_id)
+    if extr is None:
+        legacy_cam = cameras_node.get(camera_id) if isinstance(cameras_node, dict) else None
+        if isinstance(legacy_cam, dict):
+            maybe_extr = legacy_cam.get("extrinsics")
+            if isinstance(maybe_extr, dict):
+                extr = maybe_extr.get("E")
+    if not isinstance(extr, (list, tuple)) or len(extr) != 16:
+        return None
+    return _infer_image_flips_from_extrinsics(extr)
+
+
+def _flip_payload_matches(
+    payload: Any,
+    expected: Optional[Tuple[bool, bool]],
+) -> bool:
+    if expected is None:
+        return True
+    if not isinstance(payload, dict):
+        return False
+    try:
+        flip_u = bool(payload.get("u"))
+        flip_v = bool(payload.get("v"))
+    except Exception:
+        return False
+    return (flip_u, flip_v) == (bool(expected[0]), bool(expected[1]))
 
 
 @dataclass(frozen=True)
@@ -715,6 +794,7 @@ class DepthStorageManager:
         camera_id: str,
         grid_res_m: float,
         max_extent_m: float,
+        expected_flip: Optional[Tuple[bool, bool]] = None,
     ) -> Optional[Dict[str, Any]]:
         path = self._floorplan_path(camera_id, grid_res_m, max_extent_m)
         if not path.exists():
@@ -723,6 +803,12 @@ class DepthStorageManager:
             with path.open('r', encoding='utf-8') as fh:
                 payload = json.load(fh)
             if isinstance(payload, dict):
+                frame = payload.get("frame")
+                if frame != _FLOORPLAN_FRAME:
+                    return None
+                if expected_flip is not None:
+                    if not _flip_payload_matches(payload.get("image_flip"), expected_flip):
+                        return None
                 payload.setdefault('camera_id', camera_id)
                 return payload
         except Exception as exc:
@@ -740,6 +826,7 @@ class DepthStorageManager:
         try:
             path.parent.mkdir(parents=True, exist_ok=True)
             to_store = dict(payload)
+            to_store.setdefault("frame", _FLOORPLAN_FRAME)
             to_store.pop('served_from_cache', None)
             tmp_path = path.with_suffix(path.suffix + '.tmp')
             with tmp_path.open('w', encoding='utf-8') as fh:
@@ -812,10 +899,15 @@ class DepthStorageManager:
             except Exception:
                 pass
 
+        expected_flip = _expected_floorplan_flip(getattr(self, "calibration_bundle", None) or {}, camera_id)
+
         cache_key = (camera_id, float(grid_res_m), float(max_extent_m))
         now_us = int(time.time() * 1_000_000)
         with self._cache_lock:
             cached = self._floorplan_cache.get(cache_key)
+            if cached:
+                if expected_flip is not None and not _flip_payload_matches(cached.get("image_flip"), expected_flip):
+                    cached = None
             if cached:
                 if cache_only:
                     payload = dict(cached)
@@ -827,7 +919,7 @@ class DepthStorageManager:
                     payload['served_from_cache'] = True
                     return payload
 
-        disk_payload = self._load_floorplan_from_disk(camera_id, grid_res_m, max_extent_m)
+        disk_payload = self._load_floorplan_from_disk(camera_id, grid_res_m, max_extent_m, expected_flip=expected_flip)
         if disk_payload:
             snapshot_ts = disk_payload.get('snapshot_ts', disk_payload.get('ts'))
             if isinstance(snapshot_ts, (int, float)):
@@ -903,6 +995,13 @@ class DepthStorageManager:
         if intr is None or extr is None:
             return {'error': 'missing_calibration', 'camera_id': camera_id, 'ts': now_us}
 
+        flip_pair = _infer_image_flips_from_extrinsics(extr)
+        if flip_pair is None:
+            flip_u = False
+            flip_v = False
+        else:
+            flip_u, flip_v = flip_pair
+
         intr_arr = np.asarray(intr, dtype=np.float32).reshape(-1)
         if intr_arr.size == 4:
             fx, fy, cx, cy = [float(v) for v in intr_arr]
@@ -974,6 +1073,7 @@ class DepthStorageManager:
                 'camera_id': camera_id,
                 'ts': now_us,
                 'snapshot_ts': int(path_entry.stem) if path_entry.stem.isdigit() else None,
+                'frame': _FLOORPLAN_FRAME,
                 'bounds': {'min_x': -grid_res_m * 0.5, 'max_x': grid_res_m * 0.5, 'min_z': 0.0, 'max_z': max(grid_res_m, 1.0)},
                 'scale_m_per_px': float(grid_res_m),
                 'point_count': 0,
@@ -999,6 +1099,7 @@ class DepthStorageManager:
                 'grid_res_m': float(grid_res_m),
                 'max_extent_m': float(max_extent_m),
             }
+            payload['image_flip'] = {'u': bool(flip_u), 'v': bool(flip_v)}
             self._persist_floorplan_to_disk(camera_id, grid_res_m, max_extent_m, payload)
             with self._cache_lock:
                 self._floorplan_cache[cache_key] = dict(payload)
@@ -1026,6 +1127,10 @@ class DepthStorageManager:
             np.arange(h_img, dtype=np.float32),
             indexing='xy'
         )
+        if flip_u:
+            grid_u = (float(w_img - 1)) - grid_u
+        if flip_v:
+            grid_v = (float(h_img - 1)) - grid_v
 
         x_cam = (grid_u - cx) * depth / fx
         y_cam = (grid_v - cy) * depth / fy
@@ -1055,8 +1160,17 @@ class DepthStorageManager:
 
         pts_depth = pts_cam[:, 2]
         pts_y = pts_world[:, 1]
-        x_cam_pts = pts_cam[:, 0]
-        z_cam_pts = pts_cam[:, 2]
+        # Align floorplan coordinates with BEV camera-local ground-plane frame.
+        R_wc = twc[:3, :3]
+        C_world = twc[:3, 3]
+        dir_world = R_wc @ np.array([0.0, 0.0, 1.0], dtype=np.float32)
+        yaw = math.atan2(float(dir_world[0]), float(dir_world[2]))
+        cos_yaw = math.cos(-yaw)
+        sin_yaw = math.sin(-yaw)
+        dx = pts_world[:, 0] - float(C_world[0])
+        dz = pts_world[:, 2] - float(C_world[2])
+        x_cam_pts = dx * cos_yaw - dz * sin_yaw
+        z_cam_pts = dx * sin_yaw + dz * cos_yaw
 
         if x_cam_pts.size == 0 or z_cam_pts.size == 0:
             return {'error': 'no_points', 'camera_id': camera_id, 'ts': now_us, 'point_count': 0}
@@ -1211,6 +1325,7 @@ class DepthStorageManager:
             'camera_id': camera_id,
             'ts': now_us,
             'snapshot_ts': int(path_entry.stem) if path_entry.stem.isdigit() else None,
+            'frame': _FLOORPLAN_FRAME,
             'bounds': bounds,
             'scale_m_per_px': float(width_m / w_px if w_px else grid_res_m),
             'point_count': int(pts_cam.shape[0]),
@@ -1242,6 +1357,7 @@ class DepthStorageManager:
         payload['served_from_cache'] = False
         payload['grid_res_m'] = float(grid_res_m)
         payload['max_extent_m'] = float(max_extent_m)
+        payload['image_flip'] = {'u': bool(flip_u), 'v': bool(flip_v)}
 
         self._persist_floorplan_to_disk(camera_id, grid_res_m, max_extent_m, payload)
 
@@ -1723,6 +1839,7 @@ class MapAnythingDepthSource:
         camera_id: str,
         grid_res_m: float,
         max_extent_m: float,
+        expected_flip: Optional[Tuple[bool, bool]] = None,
     ) -> Optional[Dict[str, Any]]:
         path = self._floorplan_path(camera_id, grid_res_m, max_extent_m)
         if not path.exists():
@@ -1731,6 +1848,12 @@ class MapAnythingDepthSource:
             with path.open('r', encoding='utf-8') as fh:
                 payload = json.load(fh)
             if isinstance(payload, dict):
+                frame = payload.get("frame")
+                if frame != _FLOORPLAN_FRAME:
+                    return None
+                if expected_flip is not None:
+                    if not _flip_payload_matches(payload.get("image_flip"), expected_flip):
+                        return None
                 payload.setdefault('camera_id', camera_id)
                 return payload
         except Exception as exc:
@@ -1748,6 +1871,7 @@ class MapAnythingDepthSource:
         try:
             path.parent.mkdir(parents=True, exist_ok=True)
             to_store = dict(payload)
+            to_store.setdefault("frame", _FLOORPLAN_FRAME)
             to_store.pop('served_from_cache', None)
             tmp_path = path.with_suffix(path.suffix + '.tmp')
             with tmp_path.open('w', encoding='utf-8') as fh:
@@ -1823,10 +1947,15 @@ class MapAnythingDepthSource:
             except Exception:
                 pass
 
+        expected_flip = _expected_floorplan_flip(getattr(self.storage, "calibration_bundle", None) or {}, camera_id)
+
         cache_key = (camera_id, float(grid_res_m), float(max_extent_m))
         now_us = int(time.time() * 1_000_000)
         with self._cache_lock:
             cached = self._floorplan_cache.get(cache_key)
+            if cached:
+                if expected_flip is not None and not _flip_payload_matches(cached.get("image_flip"), expected_flip):
+                    cached = None
             if cached:
                 if cache_only:
                     payload = dict(cached)
@@ -1840,7 +1969,7 @@ class MapAnythingDepthSource:
             # Fall through to load from disk or recompute when cache is empty
             # so callers receive a floorplan without additional interaction.
 
-        disk_payload = self._load_floorplan_from_disk(camera_id, grid_res_m, max_extent_m)
+        disk_payload = self._load_floorplan_from_disk(camera_id, grid_res_m, max_extent_m, expected_flip=expected_flip)
         if disk_payload:
             snapshot_ts = disk_payload.get('snapshot_ts', disk_payload.get('ts'))
             if isinstance(snapshot_ts, (int, float)):
@@ -1909,6 +2038,13 @@ class MapAnythingDepthSource:
         if intr is None or extr is None:
             return {'error': 'missing_calibration', 'camera_id': camera_id, 'ts': now_us}
 
+        flip_pair = _infer_image_flips_from_extrinsics(extr)
+        if flip_pair is None:
+            flip_u = False
+            flip_v = False
+        else:
+            flip_u, flip_v = flip_pair
+
         depth = np.asarray(depth, dtype=np.float32)
         conf = np.asarray(conf, dtype=np.float32)
         mask = np.asarray(mask, dtype=np.uint8) > 0
@@ -1958,6 +2094,10 @@ class MapAnythingDepthSource:
             np.arange(h_img, dtype=np.float32),
             indexing='xy'
         )
+        if flip_u:
+            grid_u = (float(w_img - 1)) - grid_u
+        if flip_v:
+            grid_v = (float(h_img - 1)) - grid_v
 
         x_cam = (grid_u - cx) * depth / fx
         y_cam = (grid_v - cy) * depth / fy
@@ -1987,8 +2127,17 @@ class MapAnythingDepthSource:
 
         pts_depth = pts_cam[:, 2]
         pts_y = pts_world[:, 1]
-        x_cam_pts = pts_cam[:, 0]
-        z_cam_pts = pts_cam[:, 2]
+        # Align floorplan coordinates with BEV camera-local ground-plane frame.
+        R_wc = twc[:3, :3]
+        C_world = twc[:3, 3]
+        dir_world = R_wc @ np.array([0.0, 0.0, 1.0], dtype=np.float32)
+        yaw = math.atan2(float(dir_world[0]), float(dir_world[2]))
+        cos_yaw = math.cos(-yaw)
+        sin_yaw = math.sin(-yaw)
+        dx = pts_world[:, 0] - float(C_world[0])
+        dz = pts_world[:, 2] - float(C_world[2])
+        x_cam_pts = dx * cos_yaw - dz * sin_yaw
+        z_cam_pts = dx * sin_yaw + dz * cos_yaw
 
         if x_cam_pts.size == 0 or z_cam_pts.size == 0:
             return {'error': 'no_points', 'camera_id': camera_id, 'ts': now_us, 'point_count': 0}
@@ -2143,6 +2292,7 @@ class MapAnythingDepthSource:
             'camera_id': camera_id,
             'ts': now_us,
             'snapshot_ts': int(path_entry.stem) if path_entry.stem.isdigit() else None,
+            'frame': _FLOORPLAN_FRAME,
             'bounds': bounds,
             'scale_m_per_px': float(width_m / w_px if w_px else grid_res_m),
             'point_count': int(pts_cam.shape[0]),
@@ -2174,6 +2324,7 @@ class MapAnythingDepthSource:
         payload['served_from_cache'] = False
         payload['grid_res_m'] = float(grid_res_m)
         payload['max_extent_m'] = float(max_extent_m)
+        payload['image_flip'] = {'u': bool(flip_u), 'v': bool(flip_v)}
 
         self._persist_floorplan_to_disk(camera_id, grid_res_m, max_extent_m, payload)
 

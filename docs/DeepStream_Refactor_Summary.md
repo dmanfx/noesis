@@ -126,5 +126,8 @@ This refactor summary targets DS6.x/7.x style integration. Under DeepStream 8, t
 
 - Engines / TensorRT
   - Point engine paths from YAML and ensure compatibility with DS8 (TensorRT 10.x). Rebuild only if missing/incompatible.
+  - YOLO26-seg: use fused `output0`-only engines capped to 30 detections to bound ROIAlign cost and improve utilization (reported ~10% GPU on YOLO26n vs ~80–90% when composing 300 masks).
+    - Assets: `models/yolo26{n,s,m}-seg_fused.onnx`, `models/engines/yolo26{n,s,m}-seg_fused_b3_fp16.engine`
+    - PGIE template: `pipelines/config_infer_primary_yolo26_seg.template.ini` (`output-blob-names=output0`, `topk=30`, `disable-output-host-copy=1`)
 
 This is a documentation‑only mapping for DS8; actual implementation is tracked in the DS8 Master Migration Plan and Blueprint.

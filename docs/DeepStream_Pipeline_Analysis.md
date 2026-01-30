@@ -119,6 +119,9 @@ This appendix captures what changes under DeepStream 8 compared to the DS7.1 pat
 - Inference configuration
   - DS7.1: INI with engine paths per stage.
   - DS8: YAML models with explicit `gie_id` and engine path under `models.*`.
+  - **YOLO26-seg performance note (DS8):** prefer fused YOLO26-seg engines that output a single tensor (`output0`) and cap detections to **30** before mask compose. This bounds ROIAlign cost and can drastically reduce GPU utilization (reported ~10% on YOLO26n vs ~80–90% when composing 300 masks).
+    - Assets: `models/yolo26{n,s,m}-seg_fused.onnx`, `models/engines/yolo26{n,s,m}-seg_fused_b3_fp16.engine`
+    - PGIE template: `pipelines/config_infer_primary_yolo26_seg.template.ini` (`output-blob-names=output0`, `topk=30`, `disable-output-host-copy=1`)
 
 - Metadata + operators
   - DS7.1: custom pad‑probes scattered across elements.

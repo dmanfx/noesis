@@ -20,24 +20,24 @@ streammux:
 
 sources:
   - element: nvurisrcbin
-    uri: rtsp://192.168.3.214:7447/jdr9oLlBkjyl3gDm?
-    #uri: file:///home/mayor/Downloads/livingroomclip.mp4
+    #uri: rtsp://192.168.3.214:7447/jdr9oLlBkjyl3gDm?
+    uri: file:///home/mayor/Downloads/livingroomclip.mp4
     gpu-id: 0
     cudadec-memtype: 0
     latency: 100
     select-rtp-protocol: 4
   - element: nvurisrcbin
     #kitchen camera
-    uri: rtsp://192.168.3.214:7447/qt3VqVdZpgG1B4Vk?
-    #uri: file:///home/mayor/Downloads/kitchenclip.mp4
+    #uri: rtsp://192.168.3.214:7447/qt3VqVdZpgG1B4Vk?
+    uri: file:///home/mayor/Downloads/kitchenclip.mp4
     gpu-id: 0
     cudadec-memtype: 0
     latency: 100
     select-rtp-protocol: 4
   - element: nvurisrcbin
     #family room camera
-    uri: rtsp://192.168.3.214:7447/4qWTBhW6b4nLeUFE?
-    #uri: file:///home/mayor/Downloads/familyroomclip.mp4
+    #uri: rtsp://192.168.3.214:7447/4qWTBhW6b4nLeUFE?
+    uri: file:///home/mayor/Downloads/familyroomclip.mp4
     gpu-id: 0
     cudadec-memtype: 0
     latency: 100
@@ -64,6 +64,18 @@ models:
     batch_size: 16
     gie_id: 3
     attach_tensor_meta: true
+  pose:
+    enable: true
+    name: yolo26_pose
+    config-file-path: pipelines/config_infer_secondary_yolo26_pose.ini
+    engine: models/engines/yolo26n-pose_b3_fp16.engine
+    batch_size: 3
+    gie_id: 4
+    attach_tensor_meta: true
+    model_size: [640, 640]
+    score_threshold: 0.25
+    kpt_threshold: 0.35
+    letterbox: true
   mapanything:
     enable: true
     name: mapanything_fullframe
@@ -129,6 +141,7 @@ bev:
     reset_after_s: 1.25   # If dt exceeds this, accept measurement and reset filter
 
 visualization: # Visualization overlays rendered into the mosaic stream (tiler → osd).
+  display_keypoints: true # Render pose keypoints/skeletons from the pose SGIE.
   instance_masks:
     alpha: 0.35 # Mask overlay opacity (stable-id keyed color; matches BEV + Active Tracks hue math).
   trails:

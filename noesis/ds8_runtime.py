@@ -2947,6 +2947,10 @@ def main() -> int:
         hooks.attach_trail_overlay_hook(pipeline, config=trails_cfg)
     except Exception:
         logger.exception("Failed to attach DS8 trail overlay hook")
+    try:
+        hooks.attach_pose_keypoint_overlay_hook(pipeline)
+    except Exception:
+        logger.exception("Failed to attach DS8 pose keypoint overlay hook")
 
     bev_cfg = pipeline.config.get("bev") or {}
     bev_jpeg_enabled = bool(bev_cfg.get("jpeg_enabled", False))
@@ -3303,6 +3307,10 @@ def main() -> int:
             logger.info("SGIE disabled or missing; skipping MapAnything postprocess hook")
     except Exception:
         logger.exception("Error while evaluating MapAnything postprocess attachment")
+    try:
+        hooks.attach_pose_feature_hook(pipeline, camera_labels=camera_labels)
+    except Exception:
+        logger.exception("Error while attaching pose feature hook")
     hooks.attach_analytics_telemetry_hook(
         pipeline,
         tracking_pub=tracking_pub,

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import colorsys
+import json
 import logging
 import math
 import os
@@ -20,6 +21,7 @@ from geometry.depth_source import DepthStorageManager
 from geometry.homography import Plane, parse_extrinsics, ray_from_pixel, intersect_plane
 from noesis.metadata import intrinsics as intrinsics_module
 from noesis.metadata.depth_result import DepthResult
+from noesis.metadata.pose_features import PoseFeatureResult
 from noesis.telemetry.bev import Footpoint
 
 try:  # DeepStream imports are optional during unit tests
@@ -39,6 +41,11 @@ try:  # pragma: no cover - optional native bridge for V3DT meta
 except Exception:  # pragma: no cover - extension unavailable in tests
     noesis_v3dt_meta_ext = None  # type: ignore
 
+try:  # pragma: no cover - optional native bridge for pose meta
+    import noesis_pose_meta_ext  # type: ignore
+except Exception:  # pragma: no cover - extension unavailable in tests
+    noesis_pose_meta_ext = None  # type: ignore
+
 try:  # pragma: no cover - diagnostics optional in tests
     from noesis.diagnostics.telemetry_log import TrackingDiagnosticsLogger
 except Exception:  # pragma: no cover - fallback when diagnostics are absent
@@ -46,6 +53,7 @@ except Exception:  # pragma: no cover - fallback when diagnostics are absent
 
 logger = logging.getLogger(__name__)
 _REID_DLPACK_DEBUG_LOGGED = False
+_POSE_DLPACK_TORCH_LOGGED = False
 
 
 def attach_intrinsics_hook(
@@ -114,6 +122,74 @@ def attach_mapanything_postprocess_hook(
         logger.exception("Failed to attach MapAnything post-process probe")
 
 
+def attach_pose_feature_hook(
+    pipeline: "DS8Pipeline",
+    *,
+    camera_labels: Optional[Mapping[int, str]] = None,
+) -> None:
+    """Attach the YOLO26 pose feature hook to decode SGIE tensor meta."""
+    pose_cfg = (pipeline.config.get("models") or {}).get("pose") or {}
+    if not isinstance(pose_cfg, Mapping):
+        pose_cfg = {}
+    enabled = bool(pose_cfg.get("enable", True)) and any(
+        key in pose_cfg for key in ("config-file-path", "engine", "name")
+    )
+    if not enabled:
+        logger.info("Pose SGIE disabled or missing; skipping pose feature hook")
+        return
+
+    env_flag = os.environ.get("NOESIS_POSE_FEATURES_ENABLED", "1")
+    if str(env_flag).strip().lower() not in ("1", "true", "yes", "on"):
+        logger.info("Pose features disabled (NOESIS_POSE_FEATURES_ENABLED=%s)", env_flag)
+        return
+
+    gie_id = int(pose_cfg.get("gie_id", pose_cfg.get("gie-id", 4) or 4))
+    pose_name = str(pose_cfg.get("name") or "yolo26_pose").strip() or "yolo26_pose"
+    component = pipeline.components.get(pose_name)
+    if component is None:
+        raise KeyError(f"pose component '{pose_name}' missing in pipeline graph")
+
+    model_size = pose_cfg.get("model_size") or pose_cfg.get("input_size")
+    model_w, model_h = 640, 640
+    try:
+        if isinstance(model_size, (list, tuple)) and len(model_size) >= 2:
+            model_w = int(model_size[0])
+            model_h = int(model_size[1])
+        elif isinstance(model_size, str) and "x" in model_size:
+            parts = model_size.lower().split("x")
+            if len(parts) >= 2:
+                model_w = int(parts[0].strip())
+                model_h = int(parts[1].strip())
+    except Exception:
+        model_w, model_h = 640, 640
+
+    score_threshold = float(pose_cfg.get("score_threshold", 0.25) or 0.25)
+    kpt_threshold = float(pose_cfg.get("kpt_threshold", 0.35) or 0.35)
+    letterbox = bool(pose_cfg.get("letterbox", True))
+
+    processor = PoseFeatureProcessor(
+        pipeline=pipeline,
+        gie_id=gie_id,
+        model_size=(model_w, model_h),
+        score_threshold=score_threshold,
+        kpt_threshold=kpt_threshold,
+        letterbox=letterbox,
+        camera_labels=camera_labels or {},
+    )
+    component.config["_pose_feature_processor"] = processor
+
+    if pipeline.ds_pipeline is None or BatchMetadataOperator is None or Probe is None:
+        logger.debug("Stored pose feature processor for lazy execution (pyservicemaker unavailable)")
+        return
+
+    try:
+        probe = Probe("pose_features", _PoseFeatureOperator(processor))
+        pipeline.ds_pipeline.attach(component.name, probe)
+        logger.info("Attached pose feature probe to %s", component.name)
+    except Exception:  # pragma: no cover - depends on DS runtime availability
+        logger.exception("Failed to attach pose feature probe")
+
+
 def attach_analytics_telemetry_hook(
     pipeline: "DS8Pipeline",
     *,
@@ -156,13 +232,18 @@ def attach_analytics_telemetry_hook(
     except Exception:
         logger.exception("Failed to initialize OSD label processor; mosaic labels may be missing")
 
-    # When the ReID SGIE is enabled, attach telemetry downstream of it so tensor meta
-    # is still valid when accessed (Service Maker tensor wrappers can be unsafe later).
+    # Attach telemetry as far downstream as possible so tensor meta is still valid.
     attach_component = analytics_component
     try:
         models_cfg = getattr(pipeline, "config", {}).get("models", {}) or {}
+        pose_cfg = models_cfg.get("pose") or {}
         reid_cfg = models_cfg.get("reid") or {}
-        if isinstance(reid_cfg, dict) and bool(reid_cfg.get("enable", True)):
+        if isinstance(pose_cfg, dict) and bool(pose_cfg.get("enable", True)):
+            pose_name = str(pose_cfg.get("name") or "yolo26_pose").strip() or "yolo26_pose"
+            candidate = pipeline.components.get(pose_name)
+            if candidate is not None:
+                attach_component = candidate
+        if attach_component is analytics_component and isinstance(reid_cfg, dict) and bool(reid_cfg.get("enable", True)):
             reid_name = str(reid_cfg.get("name") or "reid_osnet").strip() or "reid_osnet"
             candidate = pipeline.components.get(reid_name)
             if candidate is not None:
@@ -227,6 +308,74 @@ def attach_trail_overlay_hook(
         logger.info("Attached trail overlay probe to %s", attach_component.name)
     except Exception:  # pragma: no cover - depends on DS runtime availability
         logger.exception("Failed to attach trail overlay probe")
+
+
+def attach_pose_keypoint_overlay_hook(pipeline: "DS8Pipeline") -> None:
+    """Attach a DS8 pose keypoint overlay hook (draws skeletons on the mosaic)."""
+    vis_cfg = pipeline.config.get("visualization") or {}
+    enabled = False
+    if isinstance(vis_cfg, Mapping):
+        enabled = bool(vis_cfg.get("display_keypoints", False))
+    if not enabled:
+        logger.info("Pose keypoint overlay disabled (visualization.display_keypoints=false)")
+        return
+
+    pose_cfg = (pipeline.config.get("models") or {}).get("pose") or {}
+    if not isinstance(pose_cfg, Mapping):
+        pose_cfg = {}
+    pose_enabled = bool(pose_cfg.get("enable", True)) and any(
+        key in pose_cfg for key in ("config-file-path", "engine", "name")
+    )
+    if not pose_enabled:
+        logger.info("Pose SGIE disabled or missing; skipping pose keypoint overlay")
+        return
+
+    osd_component = pipeline.components.get("osd")
+    if osd_component is None:
+        raise KeyError("osd component missing; cannot attach pose keypoint overlay")
+
+    attach_component = pipeline.components.get("tiler") or osd_component
+
+    gie_id = int(pose_cfg.get("gie_id", pose_cfg.get("gie-id", 4) or 4))
+    model_size = pose_cfg.get("model_size") or pose_cfg.get("input_size")
+    model_w, model_h = 640, 640
+    try:
+        if isinstance(model_size, (list, tuple)) and len(model_size) >= 2:
+            model_w = int(model_size[0])
+            model_h = int(model_size[1])
+        elif isinstance(model_size, str) and "x" in model_size:
+            parts = model_size.lower().split("x")
+            if len(parts) >= 2:
+                model_w = int(parts[0].strip())
+                model_h = int(parts[1].strip())
+    except Exception:
+        model_w, model_h = 640, 640
+
+    score_threshold = float(pose_cfg.get("score_threshold", 0.25) or 0.25)
+    kpt_threshold = float(pose_cfg.get("kpt_threshold", 0.35) or 0.35)
+    letterbox = bool(pose_cfg.get("letterbox", True))
+
+    processor = PoseKeypointOverlayProcessor(
+        pipeline=pipeline,
+        gie_id=gie_id,
+        model_size=(model_w, model_h),
+        score_threshold=score_threshold,
+        kpt_threshold=kpt_threshold,
+        letterbox=letterbox,
+    )
+    attach_component.config["_pose_keypoint_overlay_processor"] = processor
+    setattr(pipeline, "pose_keypoint_overlay_processor", processor)
+
+    if pipeline.ds_pipeline is None or BatchMetadataOperator is None or Probe is None:
+        logger.debug("Stored pose keypoint overlay processor for lazy execution (pyservicemaker unavailable)")
+        return
+
+    try:
+        probe = Probe("pose_keypoints", _PoseKeypointOverlayOperator(processor))
+        pipeline.ds_pipeline.attach(attach_component.name, probe)
+        logger.info("Attached pose keypoint overlay probe to %s", attach_component.name)
+    except Exception:  # pragma: no cover - depends on DS runtime availability
+        logger.exception("Failed to attach pose keypoint overlay probe")
 
 
 def attach_osd_label_hook(pipeline: "DS8Pipeline") -> None:
@@ -1806,6 +1955,1047 @@ class TrailOverlayProcessor:
         return lines_used, tracks_seen, tracks_drawn
 
 
+_POSE_KPT_INDEX = {
+    "nose": 0,
+    "left_eye": 1,
+    "right_eye": 2,
+    "left_ear": 3,
+    "right_ear": 4,
+    "left_shoulder": 5,
+    "right_shoulder": 6,
+    "left_elbow": 7,
+    "right_elbow": 8,
+    "left_wrist": 9,
+    "right_wrist": 10,
+    "left_hip": 11,
+    "right_hip": 12,
+    "left_knee": 13,
+    "right_knee": 14,
+    "left_ankle": 15,
+    "right_ankle": 16,
+}
+
+
+def _dlpack_tensor_to_numpy(layer_tensor: Any) -> Optional[np.ndarray]:
+    """Convert a Service Maker Tensor (dlpack) into a numpy array.
+
+    Prefer torch's DLPack bridge when available to ensure the producer's
+    deleter runs and GPU ownership is released safely.
+    """
+    if layer_tensor is None:
+        return None
+    dlpack_fn = getattr(layer_tensor, "__dlpack__", None)
+    if not callable(dlpack_fn):
+        return None
+
+    use_torch = os.environ.get("NOESIS_POSE_DLPACK_TORCH", "1")
+    if str(use_torch).strip().lower() in ("1", "true", "yes", "on"):
+        try:
+            import torch
+            import torch.utils.dlpack as torch_dlpack
+
+            stream = 0
+            try:
+                if torch.cuda.is_available():
+                    stream = int(torch.cuda.current_stream().cuda_stream)
+            except Exception:
+                stream = 0
+            capsule = dlpack_fn(stream)
+            torch_tensor = torch_dlpack.from_dlpack(capsule)
+            return torch_tensor.detach().cpu().numpy()
+        except Exception as exc:
+            global _POSE_DLPACK_TORCH_LOGGED
+            if not _POSE_DLPACK_TORCH_LOGGED:
+                logger.debug(
+                    "Pose torch DLPack conversion failed (device=%s, dtype=%s, shape=%s): %s",
+                    getattr(layer_tensor, "device_type", None),
+                    getattr(layer_tensor, "dtype", None),
+                    getattr(layer_tensor, "shape", None),
+                    exc,
+                )
+                _POSE_DLPACK_TORCH_LOGGED = True
+    try:
+        import ctypes
+        import ctypes.util
+
+        def _get_capsule() -> Any:
+            try:
+                return dlpack_fn(None)
+            except Exception:
+                return dlpack_fn(0)
+
+        class _DLDevice(ctypes.Structure):
+            _fields_ = [("device_type", ctypes.c_int), ("device_id", ctypes.c_int)]
+
+        class _DLDataType(ctypes.Structure):
+            _fields_ = [("code", ctypes.c_uint8), ("bits", ctypes.c_uint8), ("lanes", ctypes.c_uint16)]
+
+        class _DLTensor(ctypes.Structure):
+            _fields_ = [
+                ("data", ctypes.c_void_p),
+                ("device", _DLDevice),
+                ("ndim", ctypes.c_int),
+                ("dtype", _DLDataType),
+                ("shape", ctypes.POINTER(ctypes.c_int64)),
+                ("strides", ctypes.POINTER(ctypes.c_int64)),
+                ("byte_offset", ctypes.c_uint64),
+            ]
+
+        class _DLManagedTensor(ctypes.Structure):
+            _fields_ = [("dl_tensor", _DLTensor), ("manager_ctx", ctypes.c_void_p), ("deleter", ctypes.c_void_p)]
+
+        class _DLPackVersion(ctypes.Structure):
+            _fields_ = [("major", ctypes.c_int32), ("minor", ctypes.c_int32)]
+
+        class _DLManagedTensorVersioned(ctypes.Structure):
+            _fields_ = [
+                ("version", _DLPackVersion),
+                ("dl_tensor", _DLTensor),
+                ("manager_ctx", ctypes.c_void_p),
+                ("deleter", ctypes.c_void_p),
+            ]
+
+        dlpack_capsule = _get_capsule()
+        raw_name = None
+        try:
+            get_name = ctypes.pythonapi.PyCapsule_GetName
+            get_name.restype = ctypes.c_char_p
+            get_name.argtypes = [ctypes.py_object]
+            raw_name = get_name(dlpack_capsule)
+        except Exception:
+            raw_name = None
+
+        get_ptr = ctypes.pythonapi.PyCapsule_GetPointer
+        get_ptr.restype = ctypes.c_void_p
+        get_ptr.argtypes = [ctypes.py_object, ctypes.c_char_p]
+        managed_ptr = get_ptr(dlpack_capsule, raw_name)
+        if not managed_ptr:
+            return None
+
+        dl = None
+        deleter_ptr = None
+        try:
+            managed_v = ctypes.cast(managed_ptr, ctypes.POINTER(_DLManagedTensorVersioned))
+            ver = managed_v.contents.version
+            dl_candidate = managed_v.contents.dl_tensor
+            ndim_candidate = int(dl_candidate.ndim)
+            dtype_bits_candidate = int(dl_candidate.dtype.bits)
+            dtype_code_candidate = int(dl_candidate.dtype.code)
+            dev_type_candidate = int(dl_candidate.device.device_type)
+            plausible = (
+                0 <= int(ver.major) <= 10
+                and 0 <= int(ver.minor) <= 10
+                and 1 <= ndim_candidate <= 8
+                and dtype_bits_candidate in (8, 16, 32, 64)
+                and 0 <= dtype_code_candidate <= 8
+                and 1 <= dev_type_candidate <= 32
+                and int(dl_candidate.data or 0) != 0
+            )
+            if plausible:
+                dl = dl_candidate
+                deleter_ptr = managed_v.contents.deleter
+        except Exception:
+            dl = None
+            deleter_ptr = None
+
+        if dl is None:
+            managed = ctypes.cast(managed_ptr, ctypes.POINTER(_DLManagedTensor))
+            dl = managed.contents.dl_tensor
+            deleter_ptr = managed.contents.deleter
+
+        ndim = int(dl.ndim)
+        if ndim < 1:
+            return None
+        shape = [int(dl.shape[i]) for i in range(ndim)]
+        total = 1
+        for dim in shape:
+            total *= max(1, int(dim))
+        dtype_bits = int(dl.dtype.bits)
+        dtype_code = int(dl.dtype.code)
+        dtype_lanes = int(dl.dtype.lanes)
+        if dtype_code != 2 or dtype_bits != 32 or dtype_lanes != 1:
+            return None
+        nbytes = int(total * (dtype_bits // 8) * dtype_lanes)
+        if nbytes <= 0:
+            return None
+
+        out = np.empty((total,), dtype=np.float32)
+        dst_ptr = ctypes.c_void_p(int(out.ctypes.data))
+        src_ptr = ctypes.c_void_p(int(dl.data) + int(dl.byte_offset))
+        dev_type = int(dl.device.device_type)
+
+        if dev_type in (1, 3):  # kDLCPU / kDLCUDAHost
+            ctypes.memmove(dst_ptr, src_ptr, nbytes)
+        elif dev_type in (2, 13):  # kDLCUDA / kDLCUDAManaged
+            cudart_path = ctypes.util.find_library("cudart")
+            if not cudart_path:
+                return None
+            cudart = ctypes.CDLL(cudart_path)
+            cuda_memcpy = cudart.cudaMemcpy
+            cuda_memcpy.restype = ctypes.c_int
+            cuda_memcpy.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int]
+            err = int(cuda_memcpy(dst_ptr, src_ptr, ctypes.c_size_t(nbytes), ctypes.c_int(2)))
+            if err != 0:
+                return None
+        else:
+            return None
+
+        # Optional deleter call (disabled by default; matches reid handling).
+        call_deleter = str(os.environ.get("NOESIS_POSE_DLPACK_CALL_DELETER", "")).strip().lower() in (
+            "1",
+            "true",
+            "yes",
+            "on",
+        )
+        if call_deleter and deleter_ptr:
+            deleter = ctypes.CFUNCTYPE(None, ctypes.c_void_p)(deleter_ptr)
+            deleter(managed_ptr)
+
+        return out.reshape(shape).astype(np.float32, copy=False)
+    except Exception as exc:
+        logger.debug("Pose DLPack decode failed: %s", exc, exc_info=True)
+        return None
+
+_POSE_SKELETON = [
+    (0, 1),
+    (0, 2),
+    (1, 3),
+    (2, 4),
+    (5, 6),
+    (5, 7),
+    (7, 9),
+    (6, 8),
+    (8, 10),
+    (5, 11),
+    (6, 12),
+    (11, 12),
+    (11, 13),
+    (13, 15),
+    (12, 14),
+    (14, 16),
+]
+
+
+@dataclass
+class PoseFeatureProcessor:
+    pipeline: "DS8Pipeline"
+    gie_id: int
+    model_size: Tuple[int, int] = (640, 640)
+    score_threshold: float = 0.25
+    kpt_threshold: float = 0.35
+    letterbox: bool = True
+    camera_labels: Mapping[int, str] = field(default_factory=dict)
+    _logged_layers: bool = field(default=False, init=False, repr=False)
+    _logged_shape: bool = field(default=False, init=False, repr=False)
+    _missing_tensor_logged: bool = field(default=False, init=False, repr=False)
+    _missing_native_logged: bool = field(default=False, init=False, repr=False)
+    _debug_last_log: float = field(default=0.0, init=False, repr=False)
+    _debug_frames: int = field(default=0, init=False, repr=False)
+    _debug_objects: int = field(default=0, init=False, repr=False)
+    _debug_attached: int = field(default=0, init=False, repr=False)
+    _debug_missing: int = field(default=0, init=False, repr=False)
+
+    def _to_numpy(self, tensor: Any) -> Optional[np.ndarray]:
+        arr = _dlpack_tensor_to_numpy(tensor)
+        if arr is None:
+            logger.debug(
+                "Pose tensor conversion failed (device=%s, dtype=%s, shape=%s)",
+                getattr(tensor, "device_type", None),
+                getattr(tensor, "dtype", None),
+                getattr(tensor, "shape", None),
+            )
+        return arr
+
+    def _frame_source_id(self, frame_meta: Any) -> int:
+        for attr in ("source_id", "pad_index", "camera_id"):
+            value = getattr(frame_meta, attr, None)
+            if value is None:
+                continue
+            try:
+                return int(value)
+            except Exception:
+                continue
+        return 0
+
+    def _frame_id(self, frame_meta: Any) -> int:
+        value = _meta_lookup(frame_meta, "frame_number", "frame_num", default=0)
+        try:
+            return int(value or 0)
+        except Exception:
+            return 0
+
+    def _frame_timestamp_us(self, frame_meta: Any) -> int:
+        pts_ns = int(_meta_lookup(frame_meta, "buf_pts", "buffer_pts", "pts", default=0) or 0)
+        if pts_ns <= 0:
+            pts_ns = int(time.time() * 1_000_000_000)
+        return max(0, pts_ns // 1_000)
+
+    def _extract_pose_output(self, obj_meta: Any) -> Optional[np.ndarray]:
+        tensor_items_iter = getattr(obj_meta, "tensor_items", None)
+        if tensor_items_iter is None:
+            return None
+        try:
+            tensor_items = list(tensor_items_iter)
+        except Exception:
+            tensor_items = tensor_items_iter or []
+        for item in tensor_items:
+            try:
+                tensor_output = item.as_tensor_output()
+            except Exception:
+                continue
+            try:
+                if int(getattr(tensor_output, "unique_id", -1)) != int(self.gie_id):
+                    continue
+            except Exception:
+                continue
+            try:
+                layers = tensor_output.get_layers() or {}
+            except Exception:
+                continue
+            if not layers:
+                continue
+            if not self._logged_layers:
+                self._logged_layers = True
+                logger.info("YOLO26 pose tensor layers: %s", list(layers.keys()))
+            tensor = layers.get("output0")
+            if tensor is None and len(layers) == 1:
+                try:
+                    tensor = next(iter(layers.values()))
+                except Exception:
+                    tensor = None
+            if tensor is None:
+                continue
+            arr = self._to_numpy(tensor)
+            if arr is not None:
+                return arr
+        return None
+
+    def _select_pose_row(self, output: np.ndarray) -> Optional[np.ndarray]:
+        if output.ndim >= 3:
+            try:
+                output = output.reshape(-1, output.shape[-1])
+            except Exception:
+                output = output[0]
+        if output.ndim != 2 or output.shape[1] < 6 + 17 * 3:
+            return None
+        scores = output[:, 4]
+        if scores.size == 0:
+            return None
+        idx = int(np.argmax(scores))
+        score = float(scores[idx])
+        if score < float(self.score_threshold):
+            return None
+        if not self._logged_shape:
+            self._logged_shape = True
+            logger.info("YOLO26 pose output shape: %s", output.shape)
+        return output[idx]
+
+    def _letterbox_params(self, roi_w: float, roi_h: float) -> Tuple[float, float, float]:
+        if roi_w <= 0 or roi_h <= 0:
+            return 1.0, 0.0, 0.0
+        model_w, model_h = float(self.model_size[0]), float(self.model_size[1])
+        gain = min(model_w / roi_w, model_h / roi_h)
+        new_w = roi_w * gain
+        new_h = roi_h * gain
+        pad_x = (model_w - new_w) / 2.0
+        pad_y = (model_h - new_h) / 2.0
+        return gain, pad_x, pad_y
+
+    def _map_keypoints(
+        self,
+        kpts: np.ndarray,
+        *,
+        roi_w: float,
+        roi_h: float,
+        normalized: bool,
+    ) -> np.ndarray:
+        model_w, model_h = float(self.model_size[0]), float(self.model_size[1])
+        x = kpts[:, 0].astype(np.float32, copy=False)
+        y = kpts[:, 1].astype(np.float32, copy=False)
+        c = kpts[:, 2].astype(np.float32, copy=False)
+        if normalized:
+            x = x * model_w
+            y = y * model_h
+        if self.letterbox:
+            gain, pad_x, pad_y = self._letterbox_params(float(roi_w), float(roi_h))
+            if gain > 0:
+                x = (x - pad_x) / gain
+                y = (y - pad_y) / gain
+        else:
+            if model_w > 0:
+                x = x * (float(roi_w) / model_w)
+            if model_h > 0:
+                y = y * (float(roi_h) / model_h)
+        if roi_w > 0:
+            x = np.clip(x, 0.0, float(roi_w))
+        if roi_h > 0:
+            y = np.clip(y, 0.0, float(roi_h))
+        return np.stack([x, y, c], axis=1)
+
+    def _point(self, kpts: np.ndarray, idx: int) -> Optional[Tuple[float, float]]:
+        if idx < 0 or idx >= kpts.shape[0]:
+            return None
+        conf = float(kpts[idx, 2])
+        if conf < float(self.kpt_threshold):
+            return None
+        return float(kpts[idx, 0]), float(kpts[idx, 1])
+
+    @staticmethod
+    def _dist(a: Optional[Tuple[float, float]], b: Optional[Tuple[float, float]]) -> Optional[float]:
+        if a is None or b is None:
+            return None
+        return float(math.hypot(float(a[0]) - float(b[0]), float(a[1]) - float(b[1])))
+
+    @staticmethod
+    def _mid(a: Optional[Tuple[float, float]], b: Optional[Tuple[float, float]]) -> Optional[Tuple[float, float]]:
+        if a is None or b is None:
+            return None
+        return (float(a[0] + b[0]) * 0.5, float(a[1] + b[1]) * 0.5)
+
+    @staticmethod
+    def _ratio(a: Optional[float], b: Optional[float], eps: float = 1e-6) -> Optional[float]:
+        if a is None or b is None:
+            return None
+        if abs(float(b)) < eps:
+            return None
+        return float(a) / float(b)
+
+    @staticmethod
+    def _symmetry(a: Optional[float], b: Optional[float], eps: float = 1e-6) -> Optional[float]:
+        if a is None or b is None:
+            return None
+        denom = max(float(a), float(b), eps)
+        return abs(float(a) - float(b)) / denom
+
+    def _compute_features(
+        self,
+        kpts: np.ndarray,
+        *,
+        roi_w: float,
+        roi_h: float,
+    ) -> Tuple[Dict[str, float], Tuple[float, float, float]]:
+        conf = kpts[:, 2].astype(np.float32, copy=False)
+        mean_conf = float(np.mean(conf)) if conf.size else 0.0
+        min_conf = float(np.min(conf)) if conf.size else 0.0
+        valid_frac = float(np.mean(conf >= float(self.kpt_threshold))) if conf.size else 0.0
+
+        def p(name: str) -> Optional[Tuple[float, float]]:
+            return self._point(kpts, _POSE_KPT_INDEX[name])
+
+        left_shoulder = p("left_shoulder")
+        right_shoulder = p("right_shoulder")
+        left_hip = p("left_hip")
+        right_hip = p("right_hip")
+        left_elbow = p("left_elbow")
+        right_elbow = p("right_elbow")
+        left_wrist = p("left_wrist")
+        right_wrist = p("right_wrist")
+        left_knee = p("left_knee")
+        right_knee = p("right_knee")
+        left_ankle = p("left_ankle")
+        right_ankle = p("right_ankle")
+
+        shoulder_mid = self._mid(left_shoulder, right_shoulder)
+        hip_mid = self._mid(left_hip, right_hip)
+        ankle_mid = self._mid(left_ankle, right_ankle)
+
+        torso_len = self._dist(shoulder_mid, hip_mid)
+        leg_len = self._dist(hip_mid, ankle_mid)
+        shoulder_to_ankle = self._dist(shoulder_mid, ankle_mid)
+        height_proxy = shoulder_to_ankle or leg_len or torso_len
+
+        shoulder_width = self._dist(left_shoulder, right_shoulder)
+        hip_width = self._dist(left_hip, right_hip)
+
+        left_upper_arm = self._dist(left_shoulder, left_elbow)
+        left_lower_arm = self._dist(left_elbow, left_wrist)
+        right_upper_arm = self._dist(right_shoulder, right_elbow)
+        right_lower_arm = self._dist(right_elbow, right_wrist)
+
+        left_upper_leg = self._dist(left_hip, left_knee)
+        left_lower_leg = self._dist(left_knee, left_ankle)
+        right_upper_leg = self._dist(right_hip, right_knee)
+        right_lower_leg = self._dist(right_knee, right_ankle)
+
+        torso_leg_ratio = self._ratio(torso_len, leg_len)
+        leg_height_ratio = self._ratio(leg_len, height_proxy)
+        left_arm_ratio = self._ratio(left_upper_arm, left_lower_arm)
+        right_arm_ratio = self._ratio(right_upper_arm, right_lower_arm)
+        left_leg_ratio = self._ratio(left_upper_leg, left_lower_leg)
+        right_leg_ratio = self._ratio(right_upper_leg, right_lower_leg)
+
+        arm_sym = self._symmetry(left_upper_arm, right_upper_arm)
+        leg_sym = self._symmetry(left_upper_leg, right_upper_leg)
+
+        norm = float(roi_h) if roi_h and roi_h > 0 else 1.0
+
+        features: Dict[str, float] = {}
+
+        def add(name: str, val: Optional[float]) -> None:
+            if val is None:
+                return
+            if not math.isfinite(float(val)):
+                return
+            features[name] = float(val)
+
+        add("height_proxy", height_proxy)
+        add("height_proxy_norm", self._ratio(height_proxy, norm))
+        add("torso_len", torso_len)
+        add("torso_len_norm", self._ratio(torso_len, norm))
+        add("leg_len", leg_len)
+        add("leg_len_norm", self._ratio(leg_len, norm))
+        add("torso_leg_ratio", torso_leg_ratio)
+        add("leg_height_ratio", leg_height_ratio)
+        add("shoulder_width", shoulder_width)
+        add("shoulder_width_norm", self._ratio(shoulder_width, norm))
+        add("hip_width", hip_width)
+        add("hip_width_norm", self._ratio(hip_width, norm))
+        add("chest_width", shoulder_width)
+        add("chest_width_norm", self._ratio(shoulder_width, norm))
+        add("pelvis_width", hip_width)
+        add("pelvis_width_norm", self._ratio(hip_width, norm))
+
+        add("left_upper_arm", left_upper_arm)
+        add("left_upper_arm_norm", self._ratio(left_upper_arm, norm))
+        add("left_lower_arm", left_lower_arm)
+        add("left_lower_arm_norm", self._ratio(left_lower_arm, norm))
+        add("right_upper_arm", right_upper_arm)
+        add("right_upper_arm_norm", self._ratio(right_upper_arm, norm))
+        add("right_lower_arm", right_lower_arm)
+        add("right_lower_arm_norm", self._ratio(right_lower_arm, norm))
+
+        add("left_upper_leg", left_upper_leg)
+        add("left_upper_leg_norm", self._ratio(left_upper_leg, norm))
+        add("left_lower_leg", left_lower_leg)
+        add("left_lower_leg_norm", self._ratio(left_lower_leg, norm))
+        add("right_upper_leg", right_upper_leg)
+        add("right_upper_leg_norm", self._ratio(right_upper_leg, norm))
+        add("right_lower_leg", right_lower_leg)
+        add("right_lower_leg_norm", self._ratio(right_lower_leg, norm))
+
+        add("left_arm_ratio", left_arm_ratio)
+        add("right_arm_ratio", right_arm_ratio)
+        add("left_leg_ratio", left_leg_ratio)
+        add("right_leg_ratio", right_leg_ratio)
+        add("arm_symmetry", arm_sym)
+        add("leg_symmetry", leg_sym)
+
+        return features, (mean_conf, min_conf, valid_frac)
+
+    def handle_frame_ds8(self, frame_meta: Any) -> None:
+        object_items = getattr(frame_meta, "object_items", None) or []
+        source_id = self._frame_source_id(frame_meta)
+        frame_id = self._frame_id(frame_meta)
+        ts_us = self._frame_timestamp_us(frame_meta)
+        debug = str(os.environ.get("NOESIS_POSE_FEATURE_DEBUG", "")).strip().lower() in (
+            "1",
+            "true",
+            "yes",
+            "on",
+        )
+        if debug:
+            self._debug_frames += 1
+
+        attach_obj = None
+        if noesis_pose_meta_ext is not None:
+            attach_obj = getattr(noesis_pose_meta_ext, "attach_pose_features", None)
+        if attach_obj is None or not callable(attach_obj):
+            attach_obj = None
+            if not self._missing_native_logged:
+                logger.warning(
+                    "Pose meta attach skipped; noesis_pose_meta_ext is unavailable or missing attach_pose_features (build scripts/build_noesis_pose_meta_ext.sh)"
+                )
+                self._missing_native_logged = True
+        for obj_meta in object_items:
+            if debug:
+                self._debug_objects += 1
+            try:
+                class_id = int(getattr(obj_meta, "class_id", -1))
+            except Exception:
+                class_id = -1
+            if class_id != 0:
+                continue
+
+            rect = getattr(obj_meta, "rect_params", None)
+            bbox = _rect_to_bbox(rect)
+            if bbox is None:
+                continue
+            try:
+                track_id = int(getattr(obj_meta, "object_id", -1))
+            except Exception:
+                track_id = -1
+
+            output = self._extract_pose_output(obj_meta)
+            if output is None:
+                if not self._missing_tensor_logged:
+                    logger.debug("Pose SGIE missing tensor meta (unique_id=%s)", int(self.gie_id))
+                    self._missing_tensor_logged = True
+                if debug:
+                    self._debug_missing += 1
+                continue
+
+            row = self._select_pose_row(output)
+            if row is None:
+                if debug:
+                    self._debug_missing += 1
+                continue
+
+            try:
+                score = float(row[4])
+            except Exception:
+                score = 0.0
+
+            kpts_raw = np.asarray(row[6:], dtype=np.float32)
+            if kpts_raw.size < 17 * 3:
+                if debug:
+                    self._debug_missing += 1
+                continue
+            kpts = kpts_raw[: 17 * 3].reshape(17, 3)
+            normalized = float(np.max(row[:4])) <= 2.0
+
+            roi_w = float(bbox[2])
+            roi_h = float(bbox[3])
+            kpts = self._map_keypoints(kpts, roi_w=roi_w, roi_h=roi_h, normalized=normalized)
+
+            features, quality = self._compute_features(kpts, roi_w=roi_w, roi_h=roi_h)
+            mean_conf, min_conf, valid_frac = quality
+            if not features:
+                if debug:
+                    self._debug_missing += 1
+                continue
+
+            stable_id = None
+            try:
+                mgr = getattr(self.pipeline, "stable_id_mgr", None)
+                if mgr is not None:
+                    rec = mgr.active_tracks.get((int(source_id), int(track_id)))
+                    if rec and rec.get("stable_id") is not None:
+                        stable_id = int(rec.get("stable_id"))
+            except Exception:
+                stable_id = None
+
+            payload = PoseFeatureResult(
+                source_id=int(source_id),
+                frame_id=int(frame_id),
+                object_id=int(track_id),
+                class_id=int(class_id),
+                bbox=bbox,
+                score=float(score),
+                kpt_mean_conf=float(mean_conf),
+                kpt_min_conf=float(min_conf),
+                kpt_valid_frac=float(valid_frac),
+                features=features,
+                stable_id=stable_id,
+                model="yolo26-pose",
+                ts_us=int(ts_us),
+            ).to_dict()
+            if attach_obj is None:
+                if debug:
+                    self._debug_missing += 1
+            else:
+                try:
+                    ok = bool(
+                        attach_obj(
+                            obj_meta,
+                            json.dumps(payload, separators=(",", ":"), sort_keys=False),
+                            True,
+                        )
+                    )
+                except Exception:
+                    ok = False
+                if ok:
+                    if debug:
+                        self._debug_attached += 1
+                else:
+                    if debug:
+                        self._debug_missing += 1
+
+        if debug:
+            now = time.time()
+            if (now - float(self._debug_last_log)) >= 1.0:
+                logger.info(
+                    "Pose features debug: frames=%d objects=%d attached=%d missing=%d",
+                    int(self._debug_frames),
+                    int(self._debug_objects),
+                    int(self._debug_attached),
+                    int(self._debug_missing),
+                )
+                self._debug_frames = 0
+                self._debug_objects = 0
+                self._debug_attached = 0
+                self._debug_missing = 0
+                self._debug_last_log = float(now)
+
+
+@dataclass
+class PoseKeypointOverlayProcessor:
+    pipeline: "DS8Pipeline"
+    gie_id: int
+    model_size: Tuple[int, int] = (640, 640)
+    score_threshold: float = 0.25
+    kpt_threshold: float = 0.35
+    letterbox: bool = True
+    line_width: int = 2
+    point_radius: int = 3
+    max_display_metas: int = 12
+    _logged_layers: bool = field(default=False, init=False, repr=False)
+    _logged_shape: bool = field(default=False, init=False, repr=False)
+    _missing_tensor_logged: bool = field(default=False, init=False, repr=False)
+    _debug_last_log: float = field(default=0.0, init=False, repr=False)
+    _debug_frames: int = field(default=0, init=False, repr=False)
+    _debug_objects: int = field(default=0, init=False, repr=False)
+    _debug_drawn: int = field(default=0, init=False, repr=False)
+    _debug_missing: int = field(default=0, init=False, repr=False)
+
+    def _to_numpy(self, tensor: Any) -> Optional[np.ndarray]:
+        arr = _dlpack_tensor_to_numpy(tensor)
+        if arr is None:
+            logger.debug(
+                "Pose keypoint tensor conversion failed (device=%s, dtype=%s, shape=%s)",
+                getattr(tensor, "device_type", None),
+                getattr(tensor, "dtype", None),
+                getattr(tensor, "shape", None),
+            )
+        return arr
+
+    def _frame_source_id(self, frame_meta: Any) -> int:
+        for attr in ("source_id", "pad_index", "camera_id"):
+            value = getattr(frame_meta, attr, None)
+            if value is None:
+                continue
+            try:
+                return int(value)
+            except Exception:
+                continue
+        return 0
+
+    def _extract_pose_output(self, obj_meta: Any) -> Optional[np.ndarray]:
+        tensor_items_iter = getattr(obj_meta, "tensor_items", None)
+        if tensor_items_iter is None:
+            return None
+        try:
+            tensor_items = list(tensor_items_iter)
+        except Exception:
+            tensor_items = tensor_items_iter or []
+        for item in tensor_items:
+            try:
+                tensor_output = item.as_tensor_output()
+            except Exception:
+                continue
+            try:
+                if int(getattr(tensor_output, "unique_id", -1)) != int(self.gie_id):
+                    continue
+            except Exception:
+                continue
+            try:
+                layers = tensor_output.get_layers() or {}
+            except Exception:
+                continue
+            if not layers:
+                continue
+            if not self._logged_layers:
+                self._logged_layers = True
+                logger.info("YOLO26 pose tensor layers: %s", list(layers.keys()))
+            tensor = layers.get("output0")
+            if tensor is None and len(layers) == 1:
+                try:
+                    tensor = next(iter(layers.values()))
+                except Exception:
+                    tensor = None
+            if tensor is None:
+                continue
+            arr = self._to_numpy(tensor)
+            if arr is not None:
+                return arr
+        return None
+
+    def _select_pose_row(self, output: np.ndarray) -> Optional[np.ndarray]:
+        if output.ndim >= 3:
+            try:
+                output = output.reshape(-1, output.shape[-1])
+            except Exception:
+                output = output[0]
+        if output.ndim != 2 or output.shape[1] < 6 + 17 * 3:
+            return None
+        scores = output[:, 4]
+        if scores.size == 0:
+            return None
+        idx = int(np.argmax(scores))
+        score = float(scores[idx])
+        if score < float(self.score_threshold):
+            return None
+        if not self._logged_shape:
+            self._logged_shape = True
+            logger.info("YOLO26 pose output shape: %s", output.shape)
+        return output[idx]
+
+    def _letterbox_params(self, roi_w: float, roi_h: float) -> Tuple[float, float, float]:
+        if roi_w <= 0 or roi_h <= 0:
+            return 1.0, 0.0, 0.0
+        model_w, model_h = float(self.model_size[0]), float(self.model_size[1])
+        gain = min(model_w / roi_w, model_h / roi_h)
+        new_w = roi_w * gain
+        new_h = roi_h * gain
+        pad_x = (model_w - new_w) / 2.0
+        pad_y = (model_h - new_h) / 2.0
+        return gain, pad_x, pad_y
+
+    def _map_keypoints(
+        self,
+        kpts: np.ndarray,
+        *,
+        roi_w: float,
+        roi_h: float,
+        normalized: bool,
+    ) -> np.ndarray:
+        model_w, model_h = float(self.model_size[0]), float(self.model_size[1])
+        x = kpts[:, 0].astype(np.float32, copy=False)
+        y = kpts[:, 1].astype(np.float32, copy=False)
+        c = kpts[:, 2].astype(np.float32, copy=False)
+        if normalized:
+            x = x * model_w
+            y = y * model_h
+        if self.letterbox:
+            gain, pad_x, pad_y = self._letterbox_params(float(roi_w), float(roi_h))
+            if gain > 0:
+                x = (x - pad_x) / gain
+                y = (y - pad_y) / gain
+        else:
+            if model_w > 0:
+                x = x * (float(roi_w) / model_w)
+            if model_h > 0:
+                y = y * (float(roi_h) / model_h)
+        if roi_w > 0:
+            x = np.clip(x, 0.0, float(roi_w))
+        if roi_h > 0:
+            y = np.clip(y, 0.0, float(roi_h))
+        return np.stack([x, y, c], axis=1)
+
+    def _lookup_stable_id(self, source_id: int, track_id: int) -> Optional[int]:
+        mgr = getattr(self.pipeline, "stable_id_mgr", None)
+        if mgr is None:
+            return None
+        key = (int(source_id), int(track_id))
+        rec = None
+        lock = getattr(mgr, "_lock", None)
+        if lock is not None:
+            try:
+                with lock:
+                    rec = getattr(mgr, "active_tracks", {}).get(key)
+            except Exception:
+                rec = None
+        else:
+            try:
+                rec = getattr(mgr, "active_tracks", {}).get(key)
+            except Exception:
+                rec = None
+        if not isinstance(rec, dict):
+            return None
+        stable_id = rec.get("stable_id")
+        try:
+            stable_id_int = int(stable_id)
+        except Exception:
+            return None
+        if stable_id_int <= 0:
+            return None
+        return stable_id_int
+
+    @staticmethod
+    def _color_for_key(key: int) -> Tuple[float, float, float]:
+        hue = float((int(key) * 47) % 360)
+        r, g, b = colorsys.hls_to_rgb(hue / 360.0, 0.60, 0.80)
+        return float(r), float(g), float(b)
+
+    def handle_batch_ds8(self, batch_meta: Any) -> None:
+        if ds_osd is None:
+            return
+        frame_items = getattr(batch_meta, "frame_items", None)
+        if frame_items is None:
+            return
+
+        debug = str(os.environ.get("NOESIS_POSE_KEYPOINT_DEBUG", "")).strip().lower() in (
+            "1",
+            "true",
+            "yes",
+            "on",
+        )
+        now = time.time()
+        for frame_meta in frame_items:
+            object_items = getattr(frame_meta, "object_items", None) or []
+            if debug:
+                self._debug_frames += 1
+
+            acquire_display_meta = getattr(batch_meta, "acquire_display_meta", None)
+            append_meta = getattr(frame_meta, "append", None)
+            if not callable(acquire_display_meta) or not callable(append_meta):
+                continue
+
+            display_metas: List[Any] = []
+            appended_ids: set[int] = set()
+            current: Any = None
+            lines_used = 0
+            circles_used = 0
+            max_lines_per_meta = 16
+            max_circles_per_meta = 16
+            max_metas = int(self.max_display_metas)
+
+            def _append_display_meta(dm: Any) -> None:
+                dm_id = id(dm)
+                if dm_id in appended_ids:
+                    return
+                try:
+                    append_meta(dm)
+                except Exception:
+                    return
+                appended_ids.add(dm_id)
+
+            def _alloc_meta() -> Optional[Any]:
+                try:
+                    dm = acquire_display_meta()
+                except Exception:
+                    return None
+                if not dm:
+                    return None
+                display_metas.append(dm)
+                return dm
+
+            def _ensure_meta() -> Optional[Any]:
+                nonlocal current, lines_used, circles_used
+                if current is None or lines_used >= max_lines_per_meta or circles_used >= max_circles_per_meta:
+                    if len(display_metas) >= max_metas:
+                        return None
+                    current = _alloc_meta()
+                    lines_used = 0
+                    circles_used = 0
+                return current
+
+            drawn_this_frame = False
+            for obj_meta in object_items:
+                if debug:
+                    self._debug_objects += 1
+                try:
+                    class_id = int(getattr(obj_meta, "class_id", -1))
+                except Exception:
+                    class_id = -1
+                if class_id != 0:
+                    continue
+                rect = getattr(obj_meta, "rect_params", None)
+                bbox = _rect_to_bbox(rect)
+                if bbox is None:
+                    continue
+                try:
+                    track_id = int(getattr(obj_meta, "object_id", -1))
+                except Exception:
+                    track_id = -1
+
+                output = self._extract_pose_output(obj_meta)
+                if output is None:
+                    if not self._missing_tensor_logged:
+                        logger.debug("Pose SGIE missing tensor meta (unique_id=%s)", int(self.gie_id))
+                        self._missing_tensor_logged = True
+                    if debug:
+                        self._debug_missing += 1
+                    continue
+                row = self._select_pose_row(output)
+                if row is None:
+                    if debug:
+                        self._debug_missing += 1
+                    continue
+
+                kpts_raw = np.asarray(row[6:], dtype=np.float32)
+                if kpts_raw.size < 17 * 3:
+                    if debug:
+                        self._debug_missing += 1
+                    continue
+                kpts = kpts_raw[: 17 * 3].reshape(17, 3)
+                normalized = float(np.max(row[:4])) <= 2.0
+
+                roi_w = float(bbox[2])
+                roi_h = float(bbox[3])
+                if roi_w <= 0 or roi_h <= 0:
+                    continue
+                kpts = self._map_keypoints(kpts, roi_w=roi_w, roi_h=roi_h, normalized=normalized)
+                kpts[:, 0] += float(bbox[0])
+                kpts[:, 1] += float(bbox[1])
+
+                source_id = self._frame_source_id(frame_meta)
+                stable_id = self._lookup_stable_id(source_id, track_id) if track_id >= 0 else None
+                key_id = int(stable_id) if stable_id is not None else int(track_id if track_id >= 0 else class_id + 1)
+                r, g, b = self._color_for_key(key_id)
+
+                for i, j in _POSE_SKELETON:
+                    if i >= kpts.shape[0] or j >= kpts.shape[0]:
+                        continue
+                    c1 = float(kpts[i, 2])
+                    c2 = float(kpts[j, 2])
+                    if c1 < float(self.kpt_threshold) or c2 < float(self.kpt_threshold):
+                        continue
+                    dm = _ensure_meta()
+                    if dm is None:
+                        break
+                    line = ds_osd.Line()
+                    line.x1 = int(kpts[i, 0])
+                    line.y1 = int(kpts[i, 1])
+                    line.x2 = int(kpts[j, 0])
+                    line.y2 = int(kpts[j, 1])
+                    line.width = int(self.line_width)
+                    line.color.r = float(r)
+                    line.color.g = float(g)
+                    line.color.b = float(b)
+                    line.color.a = 1.0
+                    try:
+                        dm.add_line(line)
+                        lines_used += 1
+                        drawn_this_frame = True
+                    except Exception:
+                        current = None
+                        continue
+
+                for xk, yk, ck in kpts:
+                    if float(ck) < float(self.kpt_threshold):
+                        continue
+                    dm = _ensure_meta()
+                    if dm is None:
+                        break
+                    circ = ds_osd.Circle()
+                    circ.xc = int(xk)
+                    circ.yc = int(yk)
+                    circ.radius = int(self.point_radius)
+                    circ.width = max(1, int(self.line_width))
+                    circ.color.r = float(r)
+                    circ.color.g = float(g)
+                    circ.color.b = float(b)
+                    circ.color.a = 1.0
+                    try:
+                        dm.add_circle(circ)
+                        circles_used += 1
+                        drawn_this_frame = True
+                    except Exception:
+                        current = None
+                        continue
+
+            for dm in display_metas:
+                _append_display_meta(dm)
+
+            if debug:
+                if drawn_this_frame:
+                    self._debug_drawn += 1
+                now = time.time()
+                if (now - float(self._debug_last_log)) >= 1.0:
+                    logger.info(
+                        "Pose keypoints debug: frames=%d objects=%d drawn=%d missing=%d",
+                        self._debug_frames,
+                        self._debug_objects,
+                        self._debug_drawn,
+                        self._debug_missing,
+                    )
+                    self._debug_frames = 0
+                    self._debug_objects = 0
+                    self._debug_drawn = 0
+                    self._debug_missing = 0
+                    self._debug_last_log = float(now)
+
+
 @dataclass
 class _AnalyticsTelemetryProcessor:
     pipeline: "DS8Pipeline"
@@ -2342,6 +3532,11 @@ class _AnalyticsTelemetryProcessor:
                     continue
             except Exception:
                 pass
+            try:
+                if int(getattr(tensor_output, "unique_id", -1)) != int(self._reid_unique_id):
+                    continue
+            except Exception:
+                continue
             try:
                 layers = tensor_output.get_layers()
             except Exception:
@@ -4155,8 +5350,11 @@ class _MapAnythingOperator(BatchMetadataOperator):  # pragma: no cover - require
                             )
                             self._warned_no_match = True
                         # Fallback: process the first tensor_meta when no matching gie_id is found.
-                        self._processor.handle_nvds_tensor_ds8(frame_meta, converted_items[0])
-                        self._matched_frames += 1
+                        try:
+                            self._processor.handle_nvds_tensor_ds8(frame_meta, converted_items[0])
+                            self._matched_frames += 1
+                        except Exception:
+                            logger.exception("Failed to process MapAnything tensors from batch metadata (DS8)")
                 except Exception:
                     logger.exception("Failed to process MapAnything tensors from batch metadata (DS8)")
             return
@@ -4186,6 +5384,41 @@ class _MapAnythingOperator(BatchMetadataOperator):  # pragma: no cover - require
                 l_frame = l_frame.next
             except Exception:
                 break
+
+
+class _PoseFeatureOperator(BatchMetadataOperator):  # pragma: no cover - requires DeepStream runtime
+    def __init__(self, processor: PoseFeatureProcessor) -> None:
+        super().__init__()
+        self._processor = processor
+
+    def handle_metadata(self, batch_meta: Any) -> None:
+        if batch_meta is None:
+            return
+        frame_items = getattr(batch_meta, "frame_items", None)
+        if frame_items is None:
+            return
+        for frame_meta in frame_items:
+            try:
+                self._processor.handle_frame_ds8(frame_meta)
+            except Exception:
+                logger.exception("Failed to compute pose features within batch metadata (DS8)")
+
+
+class _PoseKeypointOverlayOperator(BatchMetadataOperator):  # pragma: no cover - requires DeepStream runtime
+    def __init__(self, processor: PoseKeypointOverlayProcessor) -> None:
+        super().__init__()
+        self._processor = processor
+
+    def handle_metadata(self, batch_meta: Any) -> None:
+        if batch_meta is None:
+            return
+        frame_items = getattr(batch_meta, "frame_items", None)
+        if frame_items is None:
+            return
+        try:
+            self._processor.handle_batch_ds8(batch_meta)
+        except Exception:
+            logger.exception("Failed to render pose keypoints within batch metadata (DS8)")
 
 
 def _select_tensor(tensors: Mapping[str, np.ndarray], keys: Sequence[str]) -> Optional[np.ndarray]:

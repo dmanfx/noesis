@@ -405,6 +405,10 @@ def build_pipeline(yaml_path: str | Path) -> DS8Pipeline:
         if attach is not None:
             cfg["output-tensor-meta"] = bool(attach)
         cfg.pop("force_engine_rebuild", None)
+        cfg.pop("model_size", None)
+        cfg.pop("score_threshold", None)
+        cfg.pop("kpt_threshold", None)
+        cfg.pop("letterbox", None)
         cfg.pop("enable", None)
         cfg.pop("name", None)
         return cfg
@@ -522,8 +526,18 @@ def build_pipeline(yaml_path: str | Path) -> DS8Pipeline:
 
     use_dewarper = any(_dewarper_enabled(s) for s in sources)
     streammux_element = str(streammux_cfg.pop("element", "") or "").strip()
+    sources_have_element = any(
+        isinstance(s, dict) and str(s.get("element") or "").strip() for s in sources
+    )
     if not streammux_element:
-        streammux_element = "nvstreammux" if use_dewarper else "nvmultiurisrcbin"
+        # If sources declare explicit elements (e.g., nvurisrcbin), prefer per-source ingest
+        # through nvstreammux even when no dewarper is enabled.
+        if sources_have_element:
+            streammux_element = "nvstreammux"
+        else:
+            streammux_element = "nvstreammux" if use_dewarper else "nvmultiurisrcbin"
+
+    per_source_pipeline = use_dewarper or streammux_element.lower() == "nvstreammux"
 
     # Track source output nodes when linking into nvstreammux.
     source_nodes: List[str] = []
@@ -531,7 +545,7 @@ def build_pipeline(yaml_path: str | Path) -> DS8Pipeline:
     # Precompute URIs for tiler layout / diagnostics.
     uris = [str(s.get("uri") or "").strip() for s in sources if str(s.get("uri") or "").strip()]
 
-    if use_dewarper:
+    if per_source_pipeline:
         # Per-source pipeline: nvurisrcbin → (optional dewarper) → nvstreammux
         streammux = Component(
             name="streammux",
@@ -795,6 +809,26 @@ def build_pipeline(yaml_path: str | Path) -> DS8Pipeline:
         _apply_component_config(ds_pipeline, reid, pipeline.errors)
         tracker.downstream = [reid.name]
 
+    # Optional per-object Pose SGIE (YOLO26 pose) for feature extraction.
+    pose: Optional[Component] = None
+    pose_cfg_raw = models.get("pose")
+    pose_enabled = False
+    if isinstance(pose_cfg_raw, dict):
+        pose_enabled = bool(pose_cfg_raw.get("enable", True)) and bool(pose_cfg_raw)
+    if pose_enabled:
+        raw = dict(pose_cfg_raw) if isinstance(pose_cfg_raw, dict) else {}
+        pose_name = str(raw.get("name") or "yolo26_pose").strip() or "yolo26_pose"
+        pose_cfg = _nvinfer_props(raw)
+        pose = Component(
+            name=pose_name,
+            element="nvinfer",
+            config=pose_cfg,
+            downstream=["analytics"],
+        )
+        pipeline.components[pose.name] = pose
+        _safe_add(ds_pipeline, pose, pipeline.errors)
+        _apply_component_config(ds_pipeline, pose, pipeline.errors)
+
     analytics_cfg_raw = cfg.get("analytics", {"config-file": "pipelines/config_nvdsanalytics_post.ini"})
     analytics_cfg = dict(analytics_cfg_raw) if isinstance(analytics_cfg_raw, dict) else {}
     analytics_enabled = bool(analytics_cfg.get("enable", True))
@@ -1027,17 +1061,23 @@ def build_pipeline(yaml_path: str | Path) -> DS8Pipeline:
 
     if analytics is not None:
         tracker.downstream = [analytics.name]
-        if reid is not None:
-            analytics.downstream = [reid.name]
-            reid.downstream = [tiler.name]
-        else:
-            analytics.downstream = [tiler.name]
+        chain_start = analytics
     else:
-        if reid is not None:
-            tracker.downstream = [reid.name]
-            reid.downstream = [tiler.name]
-        else:
-            tracker.downstream = [tiler.name]
+        chain_start = tracker
+
+    chain: List[Component] = []
+    if reid is not None:
+        chain.append(reid)
+    if pose is not None:
+        chain.append(pose)
+
+    if chain:
+        chain_start.downstream = [chain[0].name]
+        for idx in range(len(chain) - 1):
+            chain[idx].downstream = [chain[idx + 1].name]
+        chain[-1].downstream = [tiler.name]
+    else:
+        chain_start.downstream = [tiler.name]
 
     if mapanything is not None:
         mapanything.downstream = [mapanything_sink.name]
@@ -1252,17 +1292,17 @@ def build_pipeline(yaml_path: str | Path) -> DS8Pipeline:
 
     if analytics is not None:
         _link(tracker.name, analytics.name)
-        if reid is not None:
-            _link(analytics.name, reid.name)
-            _link(reid.name, tiler.name)
-        else:
-            _link(analytics.name, tiler.name)
+        chain_start = analytics
     else:
-        if reid is not None:
-            _link(tracker.name, reid.name)
-            _link(reid.name, tiler.name)
-        else:
-            _link(tracker.name, tiler.name)
+        chain_start = tracker
+
+    if reid is not None:
+        _link(chain_start.name, reid.name)
+        chain_start = reid
+    if pose is not None:
+        _link(chain_start.name, pose.name)
+        chain_start = pose
+    _link(chain_start.name, tiler.name)
 
     _link(tiler.name, osd.name)
     _link(osd.name, sink_tee.name)

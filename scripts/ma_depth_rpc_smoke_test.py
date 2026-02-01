@@ -101,6 +101,34 @@ def _decode_depth(payload: Dict[str, Any]) -> Tuple[Tuple[int, int], np.ndarray]
     return (height, width), depth
 
 
+def _decode_normals(payload: Dict[str, Any]) -> Tuple[Tuple[int, int], np.ndarray]:
+    container = payload.get("payload") if isinstance(payload.get("payload"), dict) else payload
+    shape = container.get("normals_shape")
+    if not (isinstance(shape, list) and len(shape) == 3):
+        raise ValueError(f"Missing/invalid normals_shape: {shape!r}")
+    height = int(shape[0])
+    width = int(shape[1])
+    channels = int(shape[2])
+    if channels != 3:
+        raise ValueError(f"Unexpected normals channels: {channels}")
+    normals_b64 = container.get("normals_b64")
+    if not isinstance(normals_b64, str) or not normals_b64:
+        raise ValueError("Missing normals_b64")
+    dtype = container.get("normals_dtype") or "float16"
+    raw = base64.b64decode(normals_b64)
+    if dtype == "float16":
+        normals = np.frombuffer(raw, dtype=np.float16).astype(np.float32)
+    elif dtype == "float32":
+        normals = np.frombuffer(raw, dtype=np.float32)
+    else:
+        raise ValueError(f"Unsupported normals dtype: {dtype}")
+    needed = height * width * channels
+    if normals.size < needed:
+        raise ValueError(f"Normals buffer too small: {normals.size} < {needed}")
+    normals = normals[:needed].reshape((height, width, channels))
+    return (height, width), normals
+
+
 def _spawn_runtime(args: argparse.Namespace) -> subprocess.Popen:
     cmd = [
         sys.executable,
@@ -134,6 +162,7 @@ def main() -> int:
         default=2,
         help="Depth burst duration for RPC-triggered enables (env NOESIS_DEPTH_RPC_ENABLE_SECONDS).",
     )
+    parser.add_argument("--check-normals", action="store_true", help="Require normals payload in ma_depth_response")
     args = parser.parse_args()
 
     proc = None
@@ -210,6 +239,16 @@ def main() -> int:
         ts1 = int(fresh_resp.get("ts_us") or 0)
         if ts0 and ts1 and ts1 <= ts0:
             raise RuntimeError(f"fresh ts_us did not increase: {ts0} -> {ts1}")
+
+        if args.check_normals:
+            container = fresh_resp.get("payload") if isinstance(fresh_resp.get("payload"), dict) else fresh_resp
+            normals_error = container.get("normals_error")
+            if normals_error:
+                raise RuntimeError(f"normals_error present: {normals_error}")
+            (_, _), normals = _decode_normals(fresh_resp)
+            mag = np.linalg.norm(normals, axis=-1)
+            if not np.any(mag > 0.1):
+                raise RuntimeError("normals payload has no valid samples")
 
         print("[PASS] ma_depth RPC returned depth payload (cache-first + fresh)")
         return 0

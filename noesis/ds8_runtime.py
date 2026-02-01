@@ -2669,6 +2669,21 @@ def main() -> int:
             except Exception:
                 return False
 
+        def _maybe_attach_normals(payload: Dict[str, Any]) -> None:
+            if not isinstance(payload, dict):
+                return
+            flag = os.environ.get("NOESIS_MAPANYTHING_NORMALS_ENABLE", "1")
+            if str(flag).strip().lower() not in ("1", "true", "yes", "on"):
+                return
+            if storage_manager is None:
+                return
+            space = os.environ.get("NOESIS_MAPANYTHING_NORMALS_SPACE", "camera")
+            dtype = os.environ.get("NOESIS_MAPANYTHING_NORMALS_DTYPE", "float16")
+            try:
+                storage_manager.attach_normals_to_payload(canonical_camera, payload, space=space, dtype=dtype)
+            except Exception:
+                logger.debug("Failed to attach depth normals for camera %s", canonical_camera, exc_info=True)
+
         def _response(
             served_from_cache: bool,
             payload: Optional[Dict[str, Any]] = None,
@@ -2690,6 +2705,7 @@ def main() -> int:
             if request_id:
                 resp["request_id"] = request_id
             if payload is not None:
+                _maybe_attach_normals(payload)
                 resp["payload"] = payload
             if error:
                 resp["error"] = error

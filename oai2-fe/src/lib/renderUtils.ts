@@ -76,6 +76,41 @@ export function decodeFloat32(base64?: string): Float32Array | null {
   }
 }
 
+const halfToFloat = (value: number): number => {
+  const sign = (value & 0x8000) ? -1 : 1;
+  const exponent = (value >> 10) & 0x1f;
+  const fraction = value & 0x03ff;
+  if (exponent === 0) {
+    if (fraction === 0) return sign * 0;
+    return sign * Math.pow(2, -14) * (fraction / 1024);
+  }
+  if (exponent === 31) {
+    return fraction === 0 ? sign * Infinity : NaN;
+  }
+  return sign * Math.pow(2, exponent - 15) * (1 + fraction / 1024);
+};
+
+export function decodeFloat16(base64?: string): Float32Array | null {
+  if (!base64) return null;
+  try {
+    const binary = atob(base64);
+    const len = binary.length;
+    const bytes = new Uint8Array(len);
+    for (let i = 0; i < len; i += 1) {
+      bytes[i] = binary.charCodeAt(i);
+    }
+    const view = new Uint16Array(bytes.buffer);
+    const out = new Float32Array(view.length);
+    for (let i = 0; i < view.length; i += 1) {
+      out[i] = halfToFloat(view[i]);
+    }
+    return out;
+  } catch (err) {
+    console.error('Failed to decode float16 payload', err);
+    return null;
+  }
+}
+
 export function decodeUint8(base64?: string): Uint8Array | null {
   if (!base64) return null;
   try {

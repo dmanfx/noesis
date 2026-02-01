@@ -9,6 +9,11 @@ type DepthEntry = {
   conf_b64?: string;
   mask_b64?: string;
   shape: [number, number];
+  normals_b64?: string;
+  normals_shape?: [number, number, number];
+  normals_dtype?: 'float16' | 'float32';
+  normals_space?: 'camera' | 'world';
+  normals_error?: string;
 };
 
 export type DepthMetaEntry = {
@@ -86,6 +91,7 @@ interface DepthDrawerProps {
 import {
   applyCanvasSize,
   decodeFloat32,
+  decodeFloat16,
   decodeUint8,
   grayscaleColor,
   infernoColor,
@@ -143,7 +149,7 @@ const DepthDrawer = memo(function DepthDrawer({
     Object.keys(depthData || {}).forEach((c) => { if (c) set.add(c); });
     return Array.from(set).sort();
   }, [availableCameras, depthData]);
-  const [activeTab, setActiveTab] = useState<'heatmap' | '3d' | 'stats' | 'histogram' | 'metrics'>('heatmap');
+  const [activeTab, setActiveTab] = useState<'heatmap' | 'normals' | '3d' | 'stats' | 'histogram' | 'metrics'>('heatmap');
   const [selectedCamera, setSelectedCamera] = useState<string>('');
   const [drawerWidth, setDrawerWidth] = useState<number>(DEFAULT_WIDTH);
   const drawerRef = useRef<HTMLDivElement | null>(null);
@@ -151,6 +157,7 @@ const DepthDrawer = memo(function DepthDrawer({
   const previousUserSelectRef = useRef('');
   const activePointerIdRef = useRef<number | null>(null);
   const heatmapCanvasRef = useRef<HTMLCanvasElement | null>(null);
+  const normalsCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const histogramCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const densityCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const heightCanvasRef = useRef<HTMLCanvasElement | null>(null);
@@ -273,6 +280,41 @@ const DepthDrawer = memo(function DepthDrawer({
   const depthEntry = selectedCamera ? depthData[selectedCamera] : undefined;
   const depthMetaEntry = selectedCamera && depthMeta ? depthMeta[selectedCamera] : undefined;
   const summaryEntry = selectedCamera ? diagnostics[selectedCamera] : undefined;
+  const normalsInfo = useMemo(() => {
+    if (!depthEntry) {
+      return {
+        available: false,
+        height: 0,
+        width: 0,
+        dtype: '',
+        space: '',
+        error: null as string | null,
+      };
+    }
+    const shape = depthEntry.normals_shape;
+    let height = depthEntry.shape[0];
+    let width = depthEntry.shape[1];
+    if (Array.isArray(shape) && shape.length >= 2) {
+      height = Number(shape[0]) || height;
+      width = Number(shape[1]) || width;
+    }
+    return {
+      available: Boolean(depthEntry.normals_b64),
+      height,
+      width,
+      dtype: depthEntry.normals_dtype || '',
+      space: depthEntry.normals_space || '',
+      error: depthEntry.normals_error ?? null,
+    };
+  }, [depthEntry]);
+  const normalsStatusText = useMemo(() => {
+    if (!depthEntry) return 'Waiting for depth snapshot.';
+    if (normalsInfo.error) return `Normals error: ${normalsInfo.error}`;
+    if (!normalsInfo.available) return 'Normals not attached to this snapshot.';
+    const spaceLabel = normalsInfo.space || 'camera';
+    const dtypeLabel = normalsInfo.dtype || 'float16';
+    return `Normals attached (${spaceLabel}, ${dtypeLabel}).`;
+  }, [depthEntry, normalsInfo]);
 
   useEffect(() => {
     const canvas = heatmapCanvasRef.current;
@@ -373,6 +415,75 @@ const DepthDrawer = memo(function DepthDrawer({
     ctx.drawImage(offscreen, 0, 0, targetWidth, targetHeight);
     ctx.restore();
   }, [depthEntry, activeTab, drawerWidth, clearCanvasElement]);
+
+  useEffect(() => {
+    const canvas = normalsCanvasRef.current;
+    if (!canvas || activeTab !== 'normals') return;
+    if (!depthEntry || !depthEntry.normals_b64 || !normalsInfo.available) {
+      clearCanvasElement(canvas);
+      return;
+    }
+    const height = normalsInfo.height;
+    const width = normalsInfo.width;
+    if (!height || !width) {
+      clearCanvasElement(canvas);
+      return;
+    }
+    const dtype = (normalsInfo.dtype || 'float16').toLowerCase();
+    const normalsArray = dtype === 'float16'
+      ? decodeFloat16(depthEntry.normals_b64)
+      : decodeFloat32(depthEntry.normals_b64);
+    if (!normalsArray || normalsArray.length < width * height * 3) {
+      clearCanvasElement(canvas);
+      return;
+    }
+    const offscreen = document.createElement('canvas');
+    offscreen.width = width;
+    offscreen.height = height;
+    const offCtx = offscreen.getContext('2d');
+    if (!offCtx) return;
+    const imageData = offCtx.createImageData(width, height);
+    const data = imageData.data;
+    const total = width * height;
+    for (let i = 0; i < total; i += 1) {
+      const base = i * 3;
+      const nx = normalsArray[base];
+      const ny = normalsArray[base + 1];
+      const nz = normalsArray[base + 2];
+      const idx = i * 4;
+      if (!Number.isFinite(nx) || !Number.isFinite(ny) || !Number.isFinite(nz)) {
+        data[idx + 3] = 0;
+        continue;
+      }
+      const mag = Math.sqrt(nx * nx + ny * ny + nz * nz);
+      if (!Number.isFinite(mag) || mag <= 0.0001) {
+        data[idx + 3] = 0;
+        continue;
+      }
+      const r = Math.round((Math.min(1, Math.max(-1, nx)) * 0.5 + 0.5) * 255);
+      const g = Math.round((Math.min(1, Math.max(-1, ny)) * 0.5 + 0.5) * 255);
+      const b = Math.round((Math.min(1, Math.max(-1, nz)) * 0.5 + 0.5) * 255);
+      data[idx] = r;
+      data[idx + 1] = g;
+      data[idx + 2] = b;
+      data[idx + 3] = 255;
+    }
+    offCtx.putImageData(imageData, 0, 0);
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return;
+    const rect = canvas.getBoundingClientRect();
+    const targetWidth = rect.width || canvas.clientWidth || width;
+    const targetHeight = targetWidth / WIDE_ASPECT;
+    const dpr = window.devicePixelRatio || 1;
+    canvas.width = Math.max(1, Math.round(targetWidth * dpr));
+    canvas.height = Math.max(1, Math.round(targetHeight * dpr));
+    ctx.save();
+    ctx.scale(dpr, dpr);
+    ctx.clearRect(0, 0, targetWidth, targetHeight);
+    ctx.imageSmoothingEnabled = true;
+    ctx.drawImage(offscreen, 0, 0, targetWidth, targetHeight);
+    ctx.restore();
+  }, [depthEntry, activeTab, normalsInfo, drawerWidth, clearCanvasElement]);
 
   // Avoid showing stale topdown canvases when switching cameras.
   useEffect(() => {
@@ -828,6 +939,7 @@ const DepthDrawer = memo(function DepthDrawer({
         </header>
         <div className="tabs">
           <button className={activeTab === 'heatmap' ? 'active' : ''} onClick={() => setActiveTab('heatmap')}>Heatmap</button>
+          <button className={activeTab === 'normals' ? 'active' : ''} onClick={() => setActiveTab('normals')}>Normals</button>
           <button className={activeTab === '3d' ? 'active' : ''} onClick={() => setActiveTab('3d')}>3D</button>
           <button className={activeTab === 'stats' ? 'active' : ''} onClick={() => setActiveTab('stats')}>Stats</button>
           <button className={activeTab === 'histogram' ? 'active' : ''} onClick={() => setActiveTab('histogram')}>Histogram</button>
@@ -836,7 +948,7 @@ const DepthDrawer = memo(function DepthDrawer({
         <div className="content">
           {!cameras.length && <p>No MapAnything diagnostics received yet.</p>}
           {cameras.length > 0 && (
-            <div className={`drawer-toolbar ${(activeTab === 'heatmap' || activeTab === '3d') ? 'drawer-toolbar--heatmap' : ''}`}>
+            <div className={`drawer-toolbar ${(activeTab === 'heatmap' || activeTab === '3d' || activeTab === 'normals') ? 'drawer-toolbar--heatmap' : ''}`}>
               <label className="drawer-toolbar__camera" htmlFor="ma-depth-select">
                 <span className="drawer-toolbar__label">Camera</span>
                 <select
@@ -851,7 +963,7 @@ const DepthDrawer = memo(function DepthDrawer({
                   })}
                 </select>
               </label>
-              {(activeTab === 'heatmap' || activeTab === '3d') && (
+              {(activeTab === 'heatmap' || activeTab === '3d' || activeTab === 'normals') && (
                 <div className="drawer-toolbar__actions">
                   <button
                     type="button"
@@ -860,11 +972,13 @@ const DepthDrawer = memo(function DepthDrawer({
                       if (!selectedCamera) return;
                       try { console.debug('[UI] refresh depth', selectedCamera); } catch { }
                       onRequestDepthFresh(selectedCamera);
-                      requestFloorplan('regenerate');
+                      if (activeTab !== 'normals') {
+                        requestFloorplan('regenerate');
+                      }
                     }}
-                    disabled={floorplanStatus === 'loading'}
+                    disabled={floorplanStatus === 'loading' && activeTab !== 'normals'}
                     aria-label="Refresh depth frame"
-                    title={floorplanStatus === 'loading' ? 'Refreshing depth view...' : undefined}
+                    title={(floorplanStatus === 'loading' && activeTab !== 'normals') ? 'Refreshing depth view...' : undefined}
                   >
                     <svg viewBox="0 0 16 16" aria-hidden="true">
                       <path
@@ -965,6 +1079,26 @@ const DepthDrawer = memo(function DepthDrawer({
                     : ''}
                 </p>
               )}
+            </>
+          )}
+
+          {activeTab === 'normals' && (
+            <>
+              {normalsInfo.error && <p className="floorplan-error">Normals error: {normalsInfo.error}</p>}
+              {normalsStatusText && !normalsInfo.error && (
+                <p className="floorplan-status">{normalsStatusText}</p>
+              )}
+              <div className="heatmap-single">
+                <div className="heatmap-cell__body">
+                  <div className="heatmap-cell__title">Normals (RGB)</div>
+                  <canvas
+                    ref={normalsCanvasRef}
+                    className="heatmap-canvas"
+                    style={{ aspectRatio: `${WIDE_ASPECT}` }}
+                  />
+                </div>
+              </div>
+              <p className="floorplan-meta">RGB encodes X/Y/Z normals mapped from −1..1.</p>
             </>
           )}
 

@@ -20,24 +20,24 @@ streammux:
 
 sources:
   - element: nvurisrcbin
-    #uri: rtsp://192.168.3.214:7447/jdr9oLlBkjyl3gDm?
-    uri: file:///home/mayor/Downloads/livingroomclip.mp4
+    uri: rtsp://192.168.3.214:7447/jdr9oLlBkjyl3gDm?
+    #uri: file:///home/mayor/Downloads/livingroomclip.mp4
     gpu-id: 0
     cudadec-memtype: 0
     latency: 100
     select-rtp-protocol: 4
   - element: nvurisrcbin
     #kitchen camera
-    #uri: rtsp://192.168.3.214:7447/qt3VqVdZpgG1B4Vk?
-    uri: file:///home/mayor/Downloads/kitchenclip.mp4
+    uri: rtsp://192.168.3.214:7447/qt3VqVdZpgG1B4Vk?
+    #uri: file:///home/mayor/Downloads/kitchenclip.mp4
     gpu-id: 0
     cudadec-memtype: 0
     latency: 100
     select-rtp-protocol: 4
   - element: nvurisrcbin
     #family room camera
-    #uri: rtsp://192.168.3.214:7447/4qWTBhW6b4nLeUFE?
-    uri: file:///home/mayor/Downloads/familyroomclip.mp4
+    uri: rtsp://192.168.3.214:7447/4qWTBhW6b4nLeUFE?
+    #uri: file:///home/mayor/Downloads/familyroomclip.mp4
     gpu-id: 0
     cudadec-memtype: 0
     latency: 100

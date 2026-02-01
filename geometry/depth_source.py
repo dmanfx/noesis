@@ -183,6 +183,7 @@ class DepthStorageManager:
         floorplan_store_dir: Optional[Path] = None,
         max_depth_cache_entries: int = 16,
         max_floorplan_cache_entries: int = 24,
+        max_normals_cache_entries: int = 8,
     ) -> None:
         self.base_path = Path(base_path).resolve()
         self.base_path.mkdir(parents=True, exist_ok=True)
@@ -223,10 +224,12 @@ class DepthStorageManager:
         self._cache_lock = threading.Lock()
         self._depth_payload_cache: "OrderedDict[str, Dict[str, Any]]" = OrderedDict()
         self._floorplan_cache: "OrderedDict[Tuple[str, float, float], Dict[str, Any]]" = OrderedDict()
+        self._normals_cache: "OrderedDict[Tuple[str, int, str, str], Dict[str, Any]]" = OrderedDict()
         self._floorplan_store_dir = Path(floorplan_store_dir).resolve() if floorplan_store_dir else (self.base_path / "floorplans")
         self._floorplan_store_dir.mkdir(parents=True, exist_ok=True)
         self._max_depth_cache_entries = max(1, int(max_depth_cache_entries))
         self._max_floorplan_cache_entries = max(1, int(max_floorplan_cache_entries))
+        self._max_normals_cache_entries = max(1, int(max_normals_cache_entries))
         self.min_conf = float(min_conf)
         # Background enforcement thread
         self._enforce_thread: Optional[threading.Thread] = None
@@ -769,6 +772,285 @@ class DepthStorageManager:
             while len(self._depth_payload_cache) > self._max_depth_cache_entries:
                 self._depth_payload_cache.popitem(last=False)
         return payload
+
+    def _resolve_intrinsics_for_depth(
+        self,
+        camera_id: str,
+        depth_shape: Tuple[int, int],
+    ) -> Tuple[float, float, float, float]:
+        calib_bundle = getattr(self, "calibration_bundle", None) or {}
+        cameras_node = calib_bundle.get("cameras") if isinstance(calib_bundle, dict) else {}
+        k_table = cameras_node.get("K") if isinstance(cameras_node, dict) else {}
+        intr = None
+        if isinstance(k_table, dict):
+            intr = k_table.get(camera_id)
+        if intr is None:
+            legacy_cam = cameras_node.get(camera_id) if isinstance(cameras_node, dict) else None
+            if isinstance(legacy_cam, dict):
+                maybe_intr = legacy_cam.get("intrinsics")
+                if isinstance(maybe_intr, (list, tuple)) and len(maybe_intr) in (4, 9):
+                    intr = maybe_intr
+
+        if intr is None:
+            raise ValueError("missing_calibration")
+
+        intr_arr = np.asarray(intr, dtype=np.float32).reshape(-1)
+        if intr_arr.size == 4:
+            fx, fy, cx, cy = [float(v) for v in intr_arr]
+        elif intr_arr.size == 9:
+            k_mat = intr_arr.reshape(3, 3)
+            fx = float(k_mat[0, 0])
+            fy = float(k_mat[1, 1])
+            cx = float(k_mat[0, 2])
+            cy = float(k_mat[1, 2])
+        else:
+            raise ValueError("bad_intrinsics")
+
+        if not all(np.isfinite([fx, fy, cx, cy])) or fx == 0.0 or fy == 0.0:
+            raise ValueError("invalid_intrinsics")
+
+        target_h, target_w = depth_shape
+        base_w = None
+        base_h = None
+        meta_node = calib_bundle.get("meta") if isinstance(calib_bundle, dict) else None
+        specs_node = meta_node.get("camera_specs") if isinstance(meta_node, dict) else None
+        spec = specs_node.get(camera_id) if isinstance(specs_node, dict) else None
+        if isinstance(spec, dict):
+            res = spec.get("resolution")
+            if isinstance(res, (list, tuple)) and len(res) >= 2:
+                try:
+                    base_w = int(res[0])
+                    base_h = int(res[1])
+                except Exception:
+                    base_w = None
+                    base_h = None
+            if base_w is None or base_h is None:
+                try:
+                    base_w = int(spec.get("width", 0) or 0) or base_w
+                    base_h = int(spec.get("height", 0) or 0) or base_h
+                except Exception:
+                    base_w = base_w
+                    base_h = base_h
+        if base_w is None or base_h is None:
+            try:
+                base_w = int(round(float(cx) * 2.0))
+                base_h = int(round(float(cy) * 2.0))
+            except Exception:
+                base_w = None
+                base_h = None
+        if (
+            base_w and base_h and target_w and target_h
+            and base_w > 0 and base_h > 0
+            and target_w > 0 and target_h > 0
+        ):
+            s = min(float(target_w) / float(base_w), float(target_h) / float(base_h))
+            pad_x = (float(target_w) - float(base_w) * s) * 0.5
+            pad_y = (float(target_h) - float(base_h) * s) * 0.5
+            fx *= s
+            fy *= s
+            cx = cx * s + pad_x
+            cy = cy * s + pad_y
+
+        return fx, fy, cx, cy
+
+    def _resolve_extrinsics(self, camera_id: str) -> Optional[Sequence[float]]:
+        calib_bundle = getattr(self, "calibration_bundle", None) or {}
+        cameras_node = calib_bundle.get("cameras") if isinstance(calib_bundle, dict) else {}
+        e_table = cameras_node.get("E") if isinstance(cameras_node, dict) else {}
+        extr = None
+        if isinstance(e_table, dict):
+            extr = e_table.get(camera_id)
+        if extr is None:
+            legacy_cam = cameras_node.get(camera_id) if isinstance(cameras_node, dict) else None
+            if isinstance(legacy_cam, dict):
+                maybe_extr = legacy_cam.get("extrinsics")
+                if isinstance(maybe_extr, dict):
+                    extr = maybe_extr.get("E")
+        if not isinstance(extr, (list, tuple)) or len(extr) != 16:
+            return None
+        return extr
+
+    @staticmethod
+    def _compute_normals(
+        depth: np.ndarray,
+        valid_mask: np.ndarray,
+        fx: float,
+        fy: float,
+        cx: float,
+        cy: float,
+    ) -> np.ndarray:
+        height, width = depth.shape
+        grid_u, grid_v = np.meshgrid(
+            np.arange(width, dtype=np.float32),
+            np.arange(height, dtype=np.float32),
+            indexing="xy",
+        )
+        x_cam = (grid_u - float(cx)) * depth / float(fx)
+        y_cam = (grid_v - float(cy)) * depth / float(fy)
+        z_cam = depth
+        points = np.stack([x_cam, y_cam, z_cam], axis=-1).astype(np.float32, copy=False)
+        invalid = ~valid_mask
+        if np.any(invalid):
+            points[invalid] = np.nan
+
+        dPdx = np.zeros_like(points)
+        dPdy = np.zeros_like(points)
+        if width > 1:
+            dPdx[:, 1:-1] = points[:, 2:] - points[:, :-2]
+            dPdx[:, 0] = points[:, 1] - points[:, 0]
+            dPdx[:, -1] = points[:, -1] - points[:, -2]
+        if height > 1:
+            dPdy[1:-1] = points[2:] - points[:-2]
+            dPdy[0] = points[1] - points[0]
+            dPdy[-1] = points[-1] - points[-2]
+
+        normals = np.cross(dPdx, dPdy)
+        norm = np.linalg.norm(normals, axis=-1, keepdims=True)
+        with np.errstate(invalid="ignore", divide="ignore"):
+            normals = np.divide(normals, norm, out=np.zeros_like(normals), where=(norm > 1e-6))
+
+        good = np.isfinite(normals).all(axis=-1) & valid_mask
+        normals[~good] = 0.0
+
+        flip = normals[..., 2] > 0
+        normals[flip] *= -1.0
+        return normals
+
+    def attach_normals_to_payload(
+        self,
+        camera_id: str,
+        payload: Dict[str, Any],
+        *,
+        space: str = "camera",
+        dtype: str = "float16",
+    ) -> None:
+        if not isinstance(payload, dict):
+            return
+        if payload.get("normals_b64"):
+            return
+
+        depth_b64 = payload.get("depth_b64") or payload.get("depth_z_b64")
+        shape = payload.get("shape")
+        if not isinstance(depth_b64, str) or not depth_b64:
+            payload["normals_error"] = "missing_depth"
+            return
+        if not (isinstance(shape, (list, tuple)) and len(shape) == 2):
+            payload["normals_error"] = "bad_shape"
+            return
+
+        try:
+            height = int(shape[0])
+            width = int(shape[1])
+        except Exception:
+            payload["normals_error"] = "bad_shape"
+            return
+        if height <= 0 or width <= 0:
+            payload["normals_error"] = "bad_shape"
+            return
+
+        ts_raw = payload.get("ts") or payload.get("ts_us") or 0
+        try:
+            ts_us = int(ts_raw)
+        except Exception:
+            ts_us = 0
+
+        space_norm = str(space or "camera").strip().lower() or "camera"
+        dtype_norm = str(dtype or "float16").strip().lower() or "float16"
+        if space_norm not in ("camera", "world"):
+            payload["normals_error"] = "unsupported_space"
+            return
+        if dtype_norm not in ("float16", "float32"):
+            payload["normals_error"] = "unsupported_dtype"
+            return
+
+        cache_key = (str(camera_id), int(ts_us or 0), space_norm, dtype_norm)
+        with self._cache_lock:
+            cached = self._normals_cache.get(cache_key)
+            if cached:
+                payload.pop("normals_error", None)
+                payload.update(cached)
+                return
+
+        try:
+            raw = base64.b64decode(depth_b64)
+            depth = np.frombuffer(raw, dtype=np.float32)
+            needed = height * width
+            if depth.size < needed:
+                payload["normals_error"] = "depth_too_small"
+                return
+            depth = depth[:needed].reshape((height, width))
+        except Exception:
+            payload["normals_error"] = "depth_decode_failed"
+            return
+
+        mask = None
+        mask_b64 = payload.get("mask_b64")
+        if isinstance(mask_b64, str) and mask_b64:
+            try:
+                raw_mask = base64.b64decode(mask_b64)
+                mask_arr = np.frombuffer(raw_mask, dtype=np.uint8)
+                if mask_arr.size >= height * width:
+                    mask = mask_arr[: height * width].reshape((height, width)) > 0
+            except Exception:
+                mask = None
+
+        valid = np.isfinite(depth)
+        valid &= depth > 0.1
+        valid &= depth < 50.0
+        if mask is not None:
+            valid &= mask
+        if not np.any(valid):
+            payload["normals_error"] = "no_valid_depth"
+            return
+
+        try:
+            fx, fy, cx, cy = self._resolve_intrinsics_for_depth(camera_id, depth.shape)
+        except Exception as exc:
+            payload["normals_error"] = str(exc) or "intrinsics_failed"
+            return
+
+        normals = self._compute_normals(depth.astype(np.float32, copy=False), valid, fx, fy, cx, cy)
+
+        if space_norm == "world":
+            extr = self._resolve_extrinsics(camera_id)
+            if extr is None:
+                payload["normals_error"] = "missing_extrinsics"
+                return
+            try:
+                r_wc, _ = parse_extrinsics(extr)
+                normals = (r_wc @ normals.reshape(-1, 3).T).T.reshape((height, width, 3))
+                norm = np.linalg.norm(normals, axis=-1, keepdims=True)
+                with np.errstate(invalid="ignore", divide="ignore"):
+                    normals = np.divide(normals, norm, out=np.zeros_like(normals), where=(norm > 1e-6))
+            except Exception:
+                payload["normals_error"] = "extrinsics_failed"
+                return
+
+        normals = np.asarray(normals, dtype=np.float32, copy=False)
+        if dtype_norm == "float16":
+            normals_out = normals.astype(np.float16)
+        else:
+            normals_out = normals.astype(np.float32)
+
+        try:
+            normals_b64 = base64.b64encode(normals_out.tobytes()).decode("ascii")
+        except Exception:
+            payload["normals_error"] = "normals_encode_failed"
+            return
+
+        normals_payload = {
+            "normals_b64": normals_b64,
+            "normals_shape": [int(height), int(width), 3],
+            "normals_dtype": dtype_norm,
+            "normals_space": space_norm,
+        }
+        payload.pop("normals_error", None)
+        payload.update(normals_payload)
+        with self._cache_lock:
+            self._normals_cache[cache_key] = dict(normals_payload)
+            self._normals_cache.move_to_end(cache_key, last=True)
+            while len(self._normals_cache) > self._max_normals_cache_entries:
+                self._normals_cache.popitem(last=False)
 
     @staticmethod
     def _sanitize_camera_id(camera_id: str) -> str:

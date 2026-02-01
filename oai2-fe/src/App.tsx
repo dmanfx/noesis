@@ -564,6 +564,22 @@ function Dashboard() {
     if (!depthB64) return;
     const confB64 = candidatePayload.conf_b64 || candidatePayload.conf;
     let maskB64 = candidatePayload.mask_b64 || candidatePayload.mask;
+    const normalsB64 = typeof candidatePayload.normals_b64 === 'string' ? candidatePayload.normals_b64 : undefined;
+    const normalsShapeRaw = candidatePayload.normals_shape;
+    let normalsShape: [number, number, number] | undefined;
+    if (Array.isArray(normalsShapeRaw) && normalsShapeRaw.length >= 3) {
+      const h = Number(normalsShapeRaw[0]) || 0;
+      const w = Number(normalsShapeRaw[1]) || 0;
+      const c = Number(normalsShapeRaw[2]) || 0;
+      if (h > 0 && w > 0 && c > 0) {
+        normalsShape = [h, w, c];
+      }
+    }
+    const normalsDtypeRaw = typeof candidatePayload.normals_dtype === 'string' ? candidatePayload.normals_dtype : undefined;
+    const normalsDtype = normalsDtypeRaw === 'float16' || normalsDtypeRaw === 'float32' ? normalsDtypeRaw : undefined;
+    const normalsSpaceRaw = typeof candidatePayload.normals_space === 'string' ? candidatePayload.normals_space : undefined;
+    const normalsSpace = normalsSpaceRaw === 'camera' || normalsSpaceRaw === 'world' ? normalsSpaceRaw : undefined;
+    const normalsError = typeof candidatePayload.normals_error === 'string' ? candidatePayload.normals_error : undefined;
     if (Array.isArray(maskB64)) {
       const maskArr = Uint8Array.from(maskB64.map((v: any) => (v ? 1 : 0)));
       maskB64 = btoa(String.fromCharCode(...maskArr));
@@ -582,6 +598,11 @@ function Dashboard() {
       mask_b64: maskB64,
       shape: [Number(shape[0]) || 0, Number(shape[1]) || 0]
     };
+    if (normalsB64) entry.normals_b64 = normalsB64;
+    if (normalsShape) entry.normals_shape = normalsShape;
+    if (normalsDtype) entry.normals_dtype = normalsDtype;
+    if (normalsSpace) entry.normals_space = normalsSpace;
+    if (normalsError) entry.normals_error = normalsError;
     if (!entry.shape[0] || !entry.shape[1]) return;
     setMaDepthData(prev => ({ ...prev, [storageKey]: entry }));
 

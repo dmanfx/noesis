@@ -337,6 +337,19 @@
 .list .row { display: flex; align-items: center; gap: 8px; }
 .list .grow { flex: 1; }
 
+.latency-summary {
+  display: grid;
+  gap: 2px;
+}
+.latency-summary-main {
+  font-size: 14px;
+  font-weight: 600;
+}
+.latency-summary-sub {
+  font-size: 12px;
+  color: var(--muted);
+}
+
 .footer {
   border-top: 1px solid var(--border);
   display: flex; align-items: center; gap: 12px; padding: 6px 12px; color: var(--muted);

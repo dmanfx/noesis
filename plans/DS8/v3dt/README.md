@@ -30,6 +30,7 @@ This folder contains DS8-focused planning docs for integrating **SV3DT** (Single
 - Use **SV3DT on all cameras** (per-camera robustness + 3D state estimator).
 - Use **MV3DT only for the true-overlap pair** (**kitchen ↔ family‑room**) at first (vision neighbors must overlap).
 - Keep **`stable_id` (StableIDManager)** as the **only** user-visible identity (per `plans/DS8/ds8_id_contract_v2.md`), and treat MV3DT’s global tracker ID as an **internal hint/constraint**, not the public ID.
+  - Note: StableID can now also consume YOLO26 pose SGIE ratio features as a secondary signal (see `docs/DS8_pose_stable_id_integration.md`); this is distinct from the tracker’s BodyPose3DNet PoseEstimator.
 
 ## Current locked baseline (2026-01-22)
 

@@ -16,6 +16,8 @@ import DepthDrawer, { DepthDiagnosticsEntry, DepthDrawerEntry, DepthMetaEntry, F
 import { BevView, BevMeta } from './components/BevView';
 import RoiEditorDrawer from './components/RoiEditorDrawer';
 import SettingsCorner from './components/SettingsCorner';
+import { LatencyCard } from './components/LatencyCard';
+import { LatencyMetrics } from './types/latency';
 
 const wsHost = import.meta.env.VITE_WS_HOST || window.location.hostname;
 const wsPort = Number(import.meta.env.VITE_WS_PORT || 6008);
@@ -159,6 +161,12 @@ function Dashboard() {
   const [roiDrawerOpen, setRoiDrawerOpen] = useState(false);
   const [mosaicLayout, setMosaicLayout] = useState<MosaicLayout | null>(null);
   const [analyticsReloadCount, setAnalyticsReloadCount] = useState<number>(0);
+  const [pipelineLatency, setPipelineLatency] = useState<LatencyMetrics | null>(null);
+  const [latencyByCamKey, setLatencyByCamKey] = useState<Record<CameraKey, LatencyMetrics | null>>({
+    'living-room': null,
+    'kitchen': null,
+    'family-room': null,
+  });
   const maDiagThrottleRef = useRef<Record<string, number>>({});
   const lastCalibrationSignatureRef = useRef<string>('');
   const lastDepthFloorplanTsRef = useRef<Record<string, number>>({});
@@ -193,6 +201,13 @@ function Dashboard() {
       setAnalyticsReloadCount(reloadCount);
     }
 
+    // Latency metrics (Option A: NVDS built-in latency measurement surfaced in stats)
+    const pipeLat = payload.pipeline?.latency_ms as LatencyMetrics | undefined;
+    setPipelineLatency(pipeLat ?? null);
+    if (pipeLat && pipeLat.enabled && typeof pipeLat.p95 === 'number' && Number.isFinite(pipeLat.p95)) {
+      publish({ group: 'System', key: 'Latency p95 (ms)', value: Number(pipeLat.p95.toFixed(1)), ts: now });
+    }
+
     const cameras = payload.cameras || {};
     setAvailableCameras(Object.keys(cameras));
     const statusUpdates: Partial<Record<CameraKey, string>> = {};
@@ -209,6 +224,12 @@ function Dashboard() {
       'living-room': new Set(), 'kitchen': new Set(), 'family-room': new Set()
     };
 
+    const nextLatencyByKey: Record<CameraKey, LatencyMetrics | null> = {
+      'living-room': null,
+      'kitchen': null,
+      'family-room': null,
+    };
+
     for (const camId in cameras) {
       const c = cameras[camId];
       const track = c?.tracking;
@@ -220,6 +241,15 @@ function Dashboard() {
           : (typeof c?.frame_count === 'number' && c.frame_count > 0 ? 'running' : 'unknown');
         statusUpdates[camKey] = statusText;
       }
+
+      const camLat = c?.latency_ms as LatencyMetrics | undefined;
+      if (camLat) {
+        nextLatencyByKey[camKey] = camLat;
+        if (camLat.enabled && typeof camLat.p95 === 'number' && Number.isFinite(camLat.p95)) {
+          publish({ group: `Camera ${camKey.replace('-', ' ')}`, key: 'Latency p95 (ms)', value: Number(camLat.p95.toFixed(1)), ts: now });
+        }
+      }
+
       if (track?.occupancy) {
         for (const z in track.occupancy) globalOcc[z] = (globalOcc[z] || 0) + (track.occupancy as any)[z];
         perKeyOcc[camKey] = track.occupancy;
@@ -309,6 +339,7 @@ function Dashboard() {
       // Transitions disabled
     }
 
+    setLatencyByCamKey(nextLatencyByKey);
     prevActiveRef.current = seenNow;
 
     if (Object.keys(statusUpdates).length > 0) {
@@ -1059,6 +1090,11 @@ function Dashboard() {
             onClearStats={sendClearStats}
             onSendDetectionConfig={sendDetectionConfig}
             onSendDetectionToggle={sendDetectionToggle}
+          />
+
+          <LatencyCard
+            pipeline={pipelineLatency}
+            perCam={latencyByCamKey}
           />
 
           <div className="panel card">

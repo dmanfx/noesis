@@ -3761,6 +3761,14 @@ class _AnalyticsTelemetryProcessor:
                 if fp is not None:
                     footpoints.append(fp)
 
+            mgr = getattr(self.pipeline, "stable_id_mgr", None)
+            observe_fn = getattr(mgr, "observe_copresence", None)
+            if callable(observe_fn):
+                try:
+                    observe_fn(sorted(present_stable_ids), float(now_ts))
+                except Exception:
+                    logger.debug("StableIDManager observe_copresence failed", exc_info=True)
+
             self._publish_occupancy(sensor_id, occupancy_counts)
             self._cleanup_zone_state(sensor_id, present_stable_ids)
             self._maintain_stable_ids(sensor_id, present_track_ids, now_ts)

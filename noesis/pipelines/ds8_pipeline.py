@@ -12,6 +12,8 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import yaml
 
+from noesis.telemetry.latency_metrics import LatencyCollector
+
 logger = logging.getLogger(__name__)
 
 try:  # DS8 runtime provides this; tests can still run without it.
@@ -52,6 +54,7 @@ class DS8Pipeline:
     depth_last_toggle: float = 0.0
     frame_size: Tuple[int, int] = field(default_factory=lambda: (0, 0))
     analytics_reload_count: int = 0
+    latency_collector: Optional[LatencyCollector] = None
     _timer: Optional[threading.Timer] = field(default=None, init=False, repr=False)
     _prime_timer: Optional[threading.Timer] = field(default=None, init=False, repr=False)
     _depth_lock: threading.Lock = field(default_factory=threading.Lock, init=False, repr=False)
@@ -136,6 +139,79 @@ class DepthGateOperator(BufferOperator):  # pragma: no cover - runtime only
                 self._last_drop_logged = True
             return False
         self._last_drop_logged = False
+        return True
+
+
+class LatencyProbeOperator(BufferOperator):  # pragma: no cover - runtime only
+    """End-of-pipeline latency sampler using NVDS built-in latency measurement."""
+
+    def __init__(self, pipeline: DS8Pipeline) -> None:
+        super().__init__()
+        self.pipeline = pipeline
+        self._warned = False
+        self._warned_unsupported = False
+
+    @staticmethod
+    def _gst_buffer_ptr(buffer: object) -> Optional[int]:
+        """Best-effort extraction of GstBuffer* pointer.
+
+        - PyGObject Gst.Buffer: ``hash(buffer)`` returns the underlying pointer (DS7 path).
+        - pyservicemaker Buffer (DS8 Service Maker): there is no exposed GstBuffer*;
+          returning None avoids calling pyds APIs with an invalid address.
+        """
+        # PyGObject (DS7 / classic DeepStream Python)
+        try:  # pragma: no cover - optional dependency at runtime
+            from gi.repository import Gst  # type: ignore
+
+            if isinstance(buffer, Gst.Buffer):
+                ptr = hash(buffer)
+                return int(ptr) if ptr else None
+        except Exception:
+            pass
+
+        # pyservicemaker Buffer (DS8 Service Maker) does not expose a GstBuffer*
+        mod = getattr(type(buffer), "__module__", "")
+        if mod.startswith("pyservicemaker"):
+            return None
+
+        # Fallback: if the object implements __int__, try that
+        try:
+            return int(buffer)  # type: ignore[arg-type]
+        except Exception:
+            return None
+
+    def handle_buffer(self, buffer) -> bool:  # type: ignore[override]
+        collector = getattr(self.pipeline, "latency_collector", None)
+        if collector is None or not getattr(collector, "enabled", False):
+            return True
+        # DS8 Service Maker buffer path (no GstBuffer* available)
+        mod = getattr(type(buffer), "__module__", "")
+        if mod.startswith("pyservicemaker"):
+            try:
+                collector.record_from_sm_buffer(buffer)
+            except Exception as exc:
+                if not self._warned:
+                    self._warned = True
+                    logger.warning("Latency probe: SM buffer path failed (%s)", exc)
+            return True
+
+        # DS7 / classic DeepStream path (GstBuffer*)
+        gst_ptr = self._gst_buffer_ptr(buffer)
+        if not gst_ptr:
+            if not self._warned_unsupported:
+                self._warned_unsupported = True
+                logger.warning(
+                    "Latency probe: buffer type %s does not expose GstBuffer*; disabling latency stats",
+                    type(buffer).__name__,
+                )
+            collector.disable("gst_buffer_ptr_unavailable")
+            return True
+        try:
+            collector.record_from_gst_buffer_ptr(gst_ptr)
+        except Exception as exc:
+            if not self._warned:
+                self._warned = True
+                logger.warning("Latency probe: record_from_gst_buffer_ptr failed (%s)", exc)
         return True
 
 
@@ -331,6 +407,40 @@ def _attach_fps_probes(pipeline: DS8Pipeline) -> None:
             logger.info("FPS probe attached to '%s' (NOESIS_DS8_FPS_PROBE=1)", node_name)
         except Exception as exc:  # pragma: no cover - runtime dependent
             pipeline.errors.append(f"fps_probe_attach:{node_name}:{exc}")
+
+
+def _attach_latency_probe(pipeline: DS8Pipeline) -> None:
+    """Attach an end-of-pipeline latency probe and initialize the collector."""
+    # Always construct the collector so stats can surface enabled/disabled reasons.
+    if pipeline.latency_collector is None:
+        try:
+            window_sec = float(os.environ.get("NOESIS_DS8_LATENCY_WINDOW_SEC", "10") or "10")
+        except Exception:
+            window_sec = 10.0
+        pipeline.latency_collector = LatencyCollector(window_sec=window_sec)
+
+    flag = os.environ.get("NOESIS_DS8_LATENCY_PROBE")
+    if flag is not None and str(flag).strip().lower() in ("0", "false", "no", "n", "off"):
+        return
+    if BufferOperator is None or Probe is None:
+        return
+    if pipeline.ds_pipeline is None:
+        return
+    # Service Maker buffer probes attach to output pads; the OSD is the last stable
+    # element before the sink tee and optional RTSP branches.
+    if "osd" not in pipeline.components:
+        return
+    try:
+        probe = Probe("latency_probe", LatencyProbeOperator(pipeline))
+        pipeline.ds_pipeline.attach("osd", probe, tips="src")
+        logger.info(
+            "Latency probe attached to osd:src (window_sec=%.1f, env NVDS_ENABLE_LATENCY_MEASUREMENT=%s)",
+            float(pipeline.latency_collector.window_sec),
+            os.environ.get("NVDS_ENABLE_LATENCY_MEASUREMENT"),
+        )
+    except Exception as exc:  # pragma: no cover - runtime dependent
+        # Non-fatal: latency telemetry should never prevent the pipeline from starting.
+        logger.warning("Latency probe attach failed (non-fatal): %s", exc)
 
 
 def build_pipeline(yaml_path: str | Path) -> DS8Pipeline:
@@ -1333,6 +1443,7 @@ def build_pipeline(yaml_path: str | Path) -> DS8Pipeline:
 
     _attach_depth_gate(pipeline)
     _attach_fps_probes(pipeline)
+    _attach_latency_probe(pipeline)
     _PIPELINE_SINGLETON = pipeline
     # Depth is disabled by default; the MapAnything gate is closed shortly after activation
     # (see activate()) to avoid a "stuck-at-PAUSED" preroll issue when the valve is closed

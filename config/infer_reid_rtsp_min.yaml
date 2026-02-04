@@ -22,21 +22,21 @@ sources:
     uri: rtsp://192.168.3.214:7447/jdr9oLlBkjyl3gDm?
     gpu-id: 0
     cudadec-memtype: 0
-    latency: 100
+    latency: 10
     select-rtp-protocol: 4
     disable-audio: true
   - element: nvurisrcbin
     uri: rtsp://192.168.3.214:7447/qt3VqVdZpgG1B4Vk?
     gpu-id: 0
     cudadec-memtype: 0
-    latency: 100
+    latency: 10
     select-rtp-protocol: 4
     disable-audio: true
   - element: nvurisrcbin
     uri: rtsp://192.168.3.214:7447/4qWTBhW6b4nLeUFE?
     gpu-id: 0
     cudadec-memtype: 0
-    latency: 100
+    latency: 10
     select-rtp-protocol: 4
     disable-audio: true
 

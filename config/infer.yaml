@@ -24,7 +24,7 @@ sources:
     #uri: file:///home/mayor/Downloads/livingroomclip.mp4
     gpu-id: 0
     cudadec-memtype: 0
-    latency: 100
+    latency: 10
     select-rtp-protocol: 4
   - element: nvurisrcbin
     #kitchen camera
@@ -32,7 +32,7 @@ sources:
     #uri: file:///home/mayor/Downloads/kitchenclip.mp4
     gpu-id: 0
     cudadec-memtype: 0
-    latency: 100
+    latency: 10
     select-rtp-protocol: 4
   - element: nvurisrcbin
     #family room camera
@@ -40,7 +40,7 @@ sources:
     #uri: file:///home/mayor/Downloads/familyroomclip.mp4
     gpu-id: 0
     cudadec-memtype: 0
-    latency: 100
+    latency: 10
     select-rtp-protocol: 4
 
 

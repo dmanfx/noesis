@@ -140,6 +140,29 @@ bool attach_pose_features_frame(const deepstream::FrameMetadata& frame_meta,
   return true;
 }
 
+py::object extract_pose_features(const deepstream::ObjectMetadata& obj_meta) {
+  NvDsObjectMeta* obj = unwrap_object_meta(obj_meta);
+  if (!obj) {
+    return py::none();
+  }
+  NvDsMetaType meta_type = pose_meta_type();
+  for (GList* node = obj->obj_user_meta_list; node != nullptr; node = node->next) {
+    auto* user_meta = static_cast<NvDsUserMeta*>(node->data);
+    if (!user_meta || user_meta->base_meta.meta_type != meta_type) {
+      continue;
+    }
+    if (!user_meta->user_meta_data) {
+      return py::none();
+    }
+    const char* payload = static_cast<const char*>(user_meta->user_meta_data);
+    if (!payload) {
+      return py::none();
+    }
+    return py::str(payload);
+  }
+  return py::none();
+}
+
 PYBIND11_MODULE(noesis_pose_meta_ext, m) {
   m.doc() = "Noesis DS8 helper bindings for attaching pose feature user meta.";
   m.def(
@@ -156,5 +179,10 @@ PYBIND11_MODULE(noesis_pose_meta_ext, m) {
       py::arg("payload_json"),
       py::arg("replace_existing") = true,
       "Attach NOESIS.POSE_FEATURES user meta (JSON string) to a frame.");
+  m.def(
+      "extract_pose_features",
+      &extract_pose_features,
+      py::arg("obj_meta"),
+      "Extract NOESIS.POSE_FEATURES user meta JSON payload from an object.");
   m.def("pose_meta_type", []() { return static_cast<int>(pose_meta_type()); });
 }

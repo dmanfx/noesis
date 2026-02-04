@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import configparser
+import inspect
 import json
 import logging
 import os
@@ -14,7 +15,7 @@ import sys
 import threading
 import time
 from pathlib import Path
-from typing import Any, Callable, Dict, Optional, Tuple
+from typing import Any, Callable, Dict, Optional, Tuple, Mapping
 
 import yaml
 import numpy as np
@@ -860,7 +861,7 @@ def _build_storage_manager(args: argparse.Namespace) -> DepthStorageManager:
     )
 
 
-def _build_stable_id_manager(logger: logging.Logger):
+def _build_stable_id_manager(logger: logging.Logger, *, pipeline_config: Optional[Mapping[str, Any]] = None):
     """Instantiate StableIDManager if enabled and available."""
     flag = os.environ.get("NOESIS_REID_ENABLED", "1")
     if str(flag).strip().lower() not in ("1", "true", "yes", "on"):
@@ -881,6 +882,116 @@ def _build_stable_id_manager(logger: logging.Logger):
         embed_interval_s = float(os.environ.get("NOESIS_REID_EMBED_INTERVAL_S", "0.0") or 0.0)
         new_id_hysteresis_frames = int(os.environ.get("NOESIS_REID_NEW_ID_HYSTERESIS_FRAMES", "1") or 1)
         new_id_confirm_frames_at_cap = int(os.environ.get("NOESIS_REID_NEW_ID_CONFIRM_FRAMES_AT_CAP", "1") or 1)
+        pose_flag = os.environ.get("NOESIS_REID_POSE_ENABLED", "")
+        if str(pose_flag).strip():
+            pose_enabled = str(pose_flag).strip().lower() in ("1", "true", "yes", "on")
+        else:
+            pose_enabled = False
+            try:
+                pose_cfg = (pipeline_config or {}).get("models", {}).get("pose") or {}
+                if isinstance(pose_cfg, Mapping) and bool(pose_cfg.get("enable", False)):
+                    pose_enabled = True
+            except Exception:
+                pose_enabled = False
+        pose_feature_flag = os.environ.get("NOESIS_POSE_FEATURES_ENABLED", "")
+        if str(pose_feature_flag).strip().lower() in ("0", "false", "no", "off"):
+            pose_enabled = False
+        try:
+            pose_weight = float(os.environ.get("NOESIS_REID_POSE_WEIGHT", "0.15") or 0.15)
+        except Exception:
+            pose_weight = 0.15
+        try:
+            pose_sim_threshold = float(os.environ.get("NOESIS_REID_POSE_SIM_THRESHOLD", "0.55") or 0.55)
+        except Exception:
+            pose_sim_threshold = 0.55
+        try:
+            pose_sim_high_threshold = float(os.environ.get("NOESIS_REID_POSE_SIM_HIGH_THRESHOLD", "0.65") or 0.65)
+        except Exception:
+            pose_sim_high_threshold = 0.65
+        try:
+            pose_only_threshold = float(os.environ.get("NOESIS_REID_POSE_ONLY_THRESHOLD", "0.80") or 0.80)
+        except Exception:
+            pose_only_threshold = 0.80
+        try:
+            pose_min_valid_frac = float(os.environ.get("NOESIS_REID_POSE_MIN_VALID_FRAC", "0.45") or 0.45)
+        except Exception:
+            pose_min_valid_frac = 0.45
+        try:
+            pose_min_mean_conf = float(os.environ.get("NOESIS_REID_POSE_MIN_MEAN_CONF", "0.50") or 0.50)
+        except Exception:
+            pose_min_mean_conf = 0.50
+        try:
+            pose_min_features = int(os.environ.get("NOESIS_REID_POSE_MIN_FEATURES", "6") or 6)
+        except Exception:
+            pose_min_features = 6
+        try:
+            pose_interval_s = float(os.environ.get("NOESIS_REID_POSE_INTERVAL_S", "0.75") or 0.75)
+        except Exception:
+            pose_interval_s = 0.75
+        try:
+            pose_gallery_size = int(os.environ.get("NOESIS_REID_POSE_GALLERY_SIZE", "8") or 8)
+        except Exception:
+            pose_gallery_size = 8
+        try:
+            pose_max_age_s = float(os.environ.get("NOESIS_REID_POSE_MAX_AGE_S", "30.0") or 30.0)
+        except Exception:
+            pose_max_age_s = 30.0
+        try:
+            pose_max_total_entries = int(os.environ.get("NOESIS_REID_POSE_MAX_TOTAL_ENTRIES", "0") or 0)
+        except Exception:
+            pose_max_total_entries = 0
+        aliases_enabled_env = os.environ.get("NOESIS_REID_ALIASES_ENABLED", "1")
+        aliases_enabled = str(aliases_enabled_env).strip().lower() in ("1", "true", "yes", "on")
+        alias_file = os.environ.get("NOESIS_REID_ALIAS_FILE", "~/.noesis/reid_aliases.json")
+        alias_append_env = os.environ.get("NOESIS_REID_ALIAS_APPEND_DEFAULT", "1")
+        alias_append_default = str(alias_append_env).strip().lower() in ("1", "true", "yes", "on")
+        try:
+            copresence_window_s = float(os.environ.get("NOESIS_REID_COPRESENCE_WINDOW_S", "600") or 600.0)
+        except Exception:
+            copresence_window_s = 600.0
+        try:
+            suggest_min_sim = float(os.environ.get("NOESIS_REID_SUGGEST_MIN_SIM", "0.92") or 0.92)
+        except Exception:
+            suggest_min_sim = 0.92
+        try:
+            suggest_mnn_margin = float(os.environ.get("NOESIS_REID_SUGGEST_MNN_MARGIN", "0.02") or 0.02)
+        except Exception:
+            suggest_mnn_margin = 0.02
+        try:
+            suggest_pose_sim_low = float(os.environ.get("NOESIS_REID_SUGGEST_POSE_SIM_LOW", "0.70") or 0.70)
+        except Exception:
+            suggest_pose_sim_low = 0.70
+        try:
+            suggest_pose_sim_high = float(os.environ.get("NOESIS_REID_SUGGEST_POSE_SIM_HIGH", "0.90") or 0.90)
+        except Exception:
+            suggest_pose_sim_high = 0.90
+        try:
+            min_embeddings_for_suggest = int(os.environ.get("NOESIS_REID_MIN_EMBEDDINGS_FOR_SUGGEST", "3") or 3)
+        except Exception:
+            min_embeddings_for_suggest = 3
+        try:
+            alias_history_max = int(os.environ.get("NOESIS_REID_ALIAS_HISTORY_MAX", "1000") or 1000)
+        except Exception:
+            alias_history_max = 1000
+        extra_kwargs = {
+            "aliases_enabled": aliases_enabled,
+            "alias_file": alias_file,
+            "alias_append_default": alias_append_default,
+            "copresence_window_s": copresence_window_s,
+            "suggest_min_sim": suggest_min_sim,
+            "suggest_mnn_margin": suggest_mnn_margin,
+            "suggest_pose_sim_low": suggest_pose_sim_low,
+            "suggest_pose_sim_high": suggest_pose_sim_high,
+            "min_embeddings_for_suggest": min_embeddings_for_suggest,
+            "alias_history_max": alias_history_max,
+        }
+        try:
+            sig = inspect.signature(StableIDManager.__init__)
+            valid_params = set(sig.parameters)
+            valid_params.discard("self")
+            extra_kwargs = {key: val for key, val in extra_kwargs.items() if key in valid_params}
+        except Exception:
+            pass
         mgr = StableIDManager(
             model_path=model_path,
             device=device,
@@ -892,13 +1003,27 @@ def _build_stable_id_manager(logger: logging.Logger):
             embed_interval_s=embed_interval_s,
             new_id_hysteresis_frames=new_id_hysteresis_frames,
             new_id_confirm_frames_at_cap=new_id_confirm_frames_at_cap,
+            pose_enabled=pose_enabled,
+            pose_weight=pose_weight,
+            pose_sim_threshold=pose_sim_threshold,
+            pose_sim_high_threshold=pose_sim_high_threshold,
+            pose_only_threshold=pose_only_threshold,
+            pose_min_valid_frac=pose_min_valid_frac,
+            pose_min_mean_conf=pose_min_mean_conf,
+            pose_min_features=pose_min_features,
+            pose_interval_s=pose_interval_s,
+            pose_gallery_size=pose_gallery_size,
+            pose_max_age_s=pose_max_age_s,
+            pose_max_total_entries=pose_max_total_entries,
+            **extra_kwargs,
         )
         logger.info(
-            "Stable ID manager initialised (SGIE embeddings; allow_multi_zone_active=%s, embed_interval_s=%.3f, new_id_hysteresis_frames=%d, new_id_confirm_frames_at_cap=%d)",
+            "Stable ID manager initialised (SGIE embeddings; allow_multi_zone_active=%s, embed_interval_s=%.3f, new_id_hysteresis_frames=%d, new_id_confirm_frames_at_cap=%d, pose_enabled=%s)",
             True,
             embed_interval_s,
             new_id_hysteresis_frames,
             new_id_confirm_frames_at_cap,
+            pose_enabled,
         )
         return mgr
     except Exception as exc:
@@ -1227,6 +1352,23 @@ def _build_stats_callback(
             depth_fps = 0.0
         reload_count = getattr(pipeline, "analytics_reload_count", 0)
         cameras_stats: Dict[str, object] = {}
+        latency_collector = getattr(pipeline, "latency_collector", None)
+        latency_by_source: Dict[int, Dict[str, object]] = {}
+        latency_aggregate: Optional[Dict[str, object]] = None
+        latency_disabled: Optional[Dict[str, object]] = None
+        if latency_collector is not None:
+            try:
+                latency_aggregate = latency_collector.snapshot_aggregate(now)
+            except Exception:
+                latency_aggregate = None
+            try:
+                latency_by_source = latency_collector.snapshot_by_source(now)
+            except Exception:
+                latency_by_source = {}
+            try:
+                latency_disabled = latency_collector.disabled_snapshot()
+            except Exception:
+                latency_disabled = None
 
         # Access analytics processor if attached to the pipeline components
         analytics_comp = pipeline.components.get("analytics")
@@ -1256,11 +1398,30 @@ def _build_stats_callback(
                 except Exception:
                     pass
 
+            latency_payload: Optional[Dict[str, object]] = None
+            if latency_collector is not None:
+                if getattr(latency_collector, "enabled", False):
+                    latency_payload = latency_by_source.get(
+                        int(sensor_id),
+                        {
+                            "enabled": True,
+                            "window_sec": float(getattr(latency_collector, "window_sec", 10.0)),
+                            "count": 0,
+                            "p50": None,
+                            "p95": None,
+                            "max": None,
+                            "last_sample_age_sec": None,
+                        },
+                    )
+                elif latency_disabled is not None:
+                    latency_payload = dict(latency_disabled)
+
             cameras_stats[cam_key] = {
                 "fps": 0.0,
                 "frames_processed": 0,
                 "status": "running" if pipeline.activated else "unknown",
                 "tracking": tracking,
+                **({"latency_ms": latency_payload} if latency_payload is not None else {}),
             }
         return {
             "timestamp": now,
@@ -1279,11 +1440,21 @@ def _build_stats_callback(
                 "depth_fps": depth_fps,
                 "analytics_reload_count": reload_count,
                 "mosaic_layout": _mosaic_layout(),
+                **({"latency_ms": latency_aggregate} if latency_aggregate is not None else {}),
                 "errors": list(pipeline.errors),
             },
             "cameras": cameras_stats,
         }
 
+    def _clear_stats() -> None:
+        try:
+            collector = getattr(pipeline, "latency_collector", None)
+            if collector is not None:
+                collector.clear()
+        except Exception:
+            pass
+
+    setattr(_stats, "clear_stats", _clear_stats)
     return _stats
 
 
@@ -1703,7 +1874,7 @@ def _stop_websocket_server(
 def _build_rest_app() -> "FastAPI":
     from fastapi import FastAPI
     from fastapi.middleware.cors import CORSMiddleware
-    from noesis.server import analytics_api, depth_api
+    from noesis.server import analytics_api, depth_api, reid_api
 
     app = FastAPI(title="Noesis DS8 Runtime API")
     origins_env = os.environ.get("NOESIS_REST_CORS_ORIGINS", "").strip()
@@ -1721,6 +1892,7 @@ def _build_rest_app() -> "FastAPI":
         )
     app.include_router(depth_api.app.router)
     app.include_router(analytics_api.app.router)
+    app.include_router(reid_api.app.router)
     return app
 
 
@@ -2311,6 +2483,93 @@ def _start_pyservicemaker_wait_loop(
     return thread
 
 
+_ENCODE_LATENCY_FILTER_INSTALLED = False
+_ENCODE_LATENCY_FILTER_LOCK = threading.Lock()
+_ENCODE_LATENCY_FILTER_THREADS: list[threading.Thread] = []
+_ENCODE_LATENCY_FILTER_ORIG_FDS: list[int] = []
+
+
+def _install_fd_line_filter(
+    logger: logging.Logger,
+    *,
+    fd: int,
+    drop_substrings: Tuple[str, ...],
+    label: str,
+) -> None:
+    """Redirect fd to a pipe and forward lines back to the original fd, dropping noise."""
+    orig_fd = os.dup(fd)
+    r_fd, w_fd = os.pipe()
+    os.dup2(w_fd, fd)
+    os.close(w_fd)
+    _ENCODE_LATENCY_FILTER_ORIG_FDS.append(orig_fd)
+
+    def _reader() -> None:
+        buf = b""
+        try:
+            with os.fdopen(r_fd, "rb", buffering=0) as r:
+                while True:
+                    chunk = r.read(4096)
+                    if not chunk:
+                        break
+                    buf += chunk
+                    while b"\n" in buf:
+                        line, buf = buf.split(b"\n", 1)
+                        line += b"\n"
+                        try:
+                            text = line.decode("utf-8", errors="replace")
+                        except Exception:
+                            text = ""
+                        if any(token in text for token in drop_substrings):
+                            continue
+                        try:
+                            os.write(orig_fd, line)
+                        except Exception:
+                            return
+                    # Avoid unbounded buffering if a producer writes without newlines.
+                    if len(buf) > 8192:
+                        try:
+                            os.write(orig_fd, buf)
+                        except Exception:
+                            return
+                        buf = b""
+        except Exception:
+            logger.debug("fd filter reader failed (%s)", label, exc_info=True)
+        finally:
+            if buf:
+                try:
+                    os.write(orig_fd, buf)
+                except Exception:
+                    pass
+
+    t = threading.Thread(target=_reader, name=f"FDFilter-{label}", daemon=True)
+    t.start()
+    _ENCODE_LATENCY_FILTER_THREADS.append(t)
+
+
+def _install_encode_latency_suppression(logger: logging.Logger) -> None:
+    """Suppress gst-nvvideo4linux2 KPI prints (e.g. 'Encode Latency = ...')."""
+    global _ENCODE_LATENCY_FILTER_INSTALLED
+
+    with _ENCODE_LATENCY_FILTER_LOCK:
+        if _ENCODE_LATENCY_FILTER_INSTALLED:
+            return
+
+        flag = os.environ.get("NOESIS_SUPPRESS_ENCODE_LATENCY")
+        if flag is not None and str(flag).strip().lower() not in _ENV_TRUE:
+            return
+
+        # Only wrap stdout/stderr when NVDS latency measurement is enabled; otherwise
+        # this noise does not appear and we avoid redirecting file descriptors.
+        if str(os.environ.get("NVDS_ENABLE_LATENCY_MEASUREMENT", "")).strip().lower() not in _ENV_TRUE:
+            return
+
+        drop = ("Encode Latency =", "KPI: v4l2:")
+        _install_fd_line_filter(logger, fd=1, drop_substrings=drop, label="stdout")
+        _install_fd_line_filter(logger, fd=2, drop_substrings=drop, label="stderr")
+        _ENCODE_LATENCY_FILTER_INSTALLED = True
+        logger.info("Suppressed encoder KPI prints (NOESIS_SUPPRESS_ENCODE_LATENCY=0 to disable)")
+
+
 def main() -> int:
     os.environ.setdefault("NOESIS_MOSAIC_WEBRTC_ENABLED", "1")
     os.environ.setdefault("NOESIS_DEPTH_ENABLE_SECONDS", "0")
@@ -2320,6 +2579,14 @@ def main() -> int:
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
     logger = logging.getLogger("ds8.runtime")
+    # DeepStream's gst-nvvideo4linux2 encoder plugin can emit extremely noisy
+    # "Encode Latency = ..." prints when NVDS latency measurement is enabled.
+    # Suppress those lines by default; opt-out with NOESIS_SUPPRESS_ENCODE_LATENCY=0.
+    try:
+        _install_encode_latency_suppression(logger)
+    except Exception:
+        # Defensive: never break runtime due to log filtering helpers.
+        pass
     runtime_state: Dict[str, Any] = {"pipeline_failed": False}
     pgie_size: Optional[str] = None
 
@@ -2942,11 +3209,17 @@ def main() -> int:
         storage_manager.calibration_bundle = calibration_provider.calibration_bundle()
     except Exception:
         logger.debug("Unable to seed calibration bundle on storage manager", exc_info=True)
-    stable_id_mgr = _build_stable_id_manager(logger)
+    stable_id_mgr = _build_stable_id_manager(logger, pipeline_config=pipeline.config)
     # Ensure occupancy publisher slot exists for telemetry hooks; real publisher can be bound later.
     bind_occupancy_publisher(pipeline, None)
     # Stable ID manager is optional; attach slot so hooks can discover it.
     setattr(pipeline, "stable_id_mgr", stable_id_mgr)
+    try:
+        from noesis.server import reid_api
+
+        reid_api.register_reid_manager_getter(lambda: getattr(pipeline, "stable_id_mgr", None))
+    except Exception:
+        logger.debug("ReID API registration skipped", exc_info=True)
     # Intrinsics are served via the calibration bundle (`_CalibrationProvider`) rather than per-frame user meta.
 
     trails_cfg: Dict[str, Any] = {}

@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from 'react';
 import { setCalibration } from '../lib/calibration';
 import { CameraKey, detectCameraKey } from '../lib/camera';
 import { wsLog } from '../lib/wsLogger';
+import { LatencyMetrics } from '../types/latency';
 
 type Track = {
   stable_id: number;
@@ -15,6 +16,7 @@ type Track = {
 export type CamerasStats = Record<string, {
   status?: string;
   frame_count?: number;
+  latency_ms?: LatencyMetrics;
   tracking?: {
     occupancy?: Record<string, number>;
     active_tracks?: Track[];
@@ -41,6 +43,7 @@ export interface StatsPayload {
   pipeline?: {
     analytics_reload_count?: number;
     mosaic_layout?: MosaicLayout;
+    latency_ms?: LatencyMetrics;
   };
 }
 

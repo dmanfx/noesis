@@ -50,6 +50,7 @@ ma_onnxTRT/
 ./ma_onnx_out.tar.gz
 .git/
 pipelines/*.so
+*.so
 
 
 #external folders/files

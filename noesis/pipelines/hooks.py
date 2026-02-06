@@ -3010,6 +3010,8 @@ class _AnalyticsTelemetryProcessor:
     _analytics_obj_meta_type: Any = field(default=None, init=False, repr=False)
     _zone_state: Dict[int, Dict[int, Dict[str, Any]]] = field(default_factory=dict, init=False, repr=False)
     _occupancy_state: Dict[int, Dict[str, int]] = field(default_factory=dict, init=False, repr=False)
+    _occupancy_last_seen: Dict[int, Dict[str, float]] = field(default_factory=dict, init=False, repr=False)
+    _occupancy_grace_s: float = field(default=0.0, init=False, repr=False)
     _active_tracks: Dict[int, List[Dict[str, Any]]] = field(default_factory=dict, init=False, repr=False)
     _transitions_state: Dict[int, List[Dict[str, Any]]] = field(default_factory=dict, init=False, repr=False)
     _stable_id_enabled: bool = field(default=True, init=False, repr=False)
@@ -3030,7 +3032,7 @@ class _AnalyticsTelemetryProcessor:
     _reid_debug_emb_found: int = field(default=0, init=False, repr=False)
     _reid_debug_emb_missing: int = field(default=0, init=False, repr=False)
     _diag_logged: bool = field(default=False, init=False, repr=False)
-    _tracking_mode: str = field(default="legacy", init=False, repr=False)
+    _tracking_mode: str = field(default="baseline", init=False, repr=False)
     _world_frame: str = field(default="camera_local", init=False, repr=False)
     _v3dt_meta_enabled: bool = field(default=True, init=False, repr=False)
     _v3dt_meta_logged_missing: bool = field(default=False, init=False, repr=False)
@@ -3067,6 +3069,11 @@ class _AnalyticsTelemetryProcessor:
         if self._tracking_mode_is_v3dt():
             self._ensure_v3dt_caminfo_paths()
         self._warn_on_tracking_mode_mismatch()
+        try:
+            grace_raw = os.environ.get("NOESIS_OCCUPANCY_GRACE_S", "0")
+            self._occupancy_grace_s = max(0.0, float(str(grace_raw).strip() or "0"))
+        except Exception:
+            self._occupancy_grace_s = 0.0
 
     def _tracking_mode_is_v3dt(self) -> bool:
         return str(self._tracking_mode or "").strip().lower() == "v3dt"
@@ -3095,19 +3102,19 @@ class _AnalyticsTelemetryProcessor:
                 cfg_path = tracker_cfg.get("config-file")
                 if cfg_path and "config/v3dt/" in str(cfg_path):
                     return "v3dt"
-        return "legacy"
+        return "baseline"
 
     @staticmethod
     def _normalize_tracking_mode(value: Any) -> str:
         mode = str(value or "").strip().lower()
         if mode in ("v3dt", "sv3dt", "mv3dt", "3d"):
             return "v3dt"
-        if mode in ("legacy", "2d", "baseline", "standard", "default"):
-            return "legacy"
+        if mode in ("2d", "baseline", "standard", "default"):
+            return "baseline"
         if not mode or mode == "auto":
-            return "legacy"
-        logger.warning("Unknown tracking_mode '%s'; defaulting to legacy", value)
-        return "legacy"
+            return "baseline"
+        logger.warning("Unknown tracking_mode '%s'; defaulting to baseline", value)
+        return "baseline"
 
     def _warn_on_tracking_mode_mismatch(self) -> None:
         try:
@@ -4498,12 +4505,6 @@ class _AnalyticsTelemetryProcessor:
                 "ocStatus": getattr(payload, "ocStatus", None),
                 "roiStatus": getattr(payload, "roiStatus", None),
             }
-            # Provide snake_case aliases for compatibility with DS7 telemetry consumers.
-            data["direction_status"] = data.get("dirStatus")
-            data["line_crossing_status"] = data.get("lcStatus")
-            data["overcrowding_status"] = data.get("ocStatus")
-            data["roi_status"] = data.get("roiStatus")
-
             return {key: value for key, value in data.items() if value is not None}
 
         return None
@@ -4762,14 +4763,41 @@ class _AnalyticsTelemetryProcessor:
 
     def _publish_occupancy(self, sensor_id: int, occupancy_counts: Mapping[str, int]) -> None:
         publisher = getattr(self.pipeline, "occupancy_publisher", None)
+        now_ts = time.time()
         previous = self._occupancy_state.get(sensor_id, {})
-        self._occupancy_state[sensor_id] = dict(occupancy_counts)
+        merged_counts: Dict[str, int] = dict(occupancy_counts)
+
+        grace_s = float(self._occupancy_grace_s)
+        if grace_s > 0.0:
+            last_seen_by_zone = self._occupancy_last_seen.setdefault(sensor_id, {})
+            for zone, count in merged_counts.items():
+                if int(count) > 0:
+                    last_seen_by_zone[str(zone)] = float(now_ts)
+
+            for zone, count in previous.items():
+                zone_name = str(zone)
+                if zone_name in merged_counts or int(count) <= 0:
+                    continue
+                last_seen = float(last_seen_by_zone.get(zone_name, 0.0) or 0.0)
+                if (now_ts - last_seen) < grace_s:
+                    merged_counts[zone_name] = int(count)
+                else:
+                    last_seen_by_zone.pop(zone_name, None)
+
+            for zone in list(last_seen_by_zone.keys()):
+                if zone in merged_counts:
+                    continue
+                last_seen = float(last_seen_by_zone.get(zone, 0.0) or 0.0)
+                if (now_ts - last_seen) >= grace_s:
+                    last_seen_by_zone.pop(zone, None)
+
+        self._occupancy_state[sensor_id] = dict(merged_counts)
         if publisher is None:
             return
 
         now_ns = time.time_ns()
         try:
-            for zone, count in occupancy_counts.items():
+            for zone, count in merged_counts.items():
                 room_id = str(zone).strip()
                 if not room_id:
                     continue
@@ -4780,7 +4808,7 @@ class _AnalyticsTelemetryProcessor:
                     ts_ns=now_ns,
                 )
             # Emit vacate events for zones no longer present
-            for zone in set(previous.keys()) - set(occupancy_counts.keys()):
+            for zone in set(previous.keys()) - set(merged_counts.keys()):
                 room_id = str(zone).strip()
                 if not room_id:
                     continue
@@ -5036,22 +5064,13 @@ class _OsdLabelOperator(BatchMetadataOperator):  # pragma: no cover - requires D
             return
 
         frame_items = getattr(batch_meta, "frame_items", None)
-        if frame_items is not None:
-            for frame_meta in frame_items:
-                try:
-                    self._processor.handle_frame_ds8(frame_meta)
-                except Exception:
-                    logger.exception("Failed to stamp OSD labels within batch metadata (DS8)")
+        if frame_items is None:
             return
-
-        cast = _resolve_pyds_cast("NvDsFrameMeta")
-        for frame_meta in _iter_meta_entries(getattr(batch_meta, "frame_meta_list", None), cast):
-            if frame_meta is None:
-                continue
+        for frame_meta in frame_items:
             try:
-                self._processor.handle_frame(frame_meta)
+                self._processor.handle_frame_ds8(frame_meta)
             except Exception:
-                logger.exception("Failed to stamp OSD labels within batch metadata")
+                logger.exception("Failed to stamp OSD labels within batch metadata (DS8)")
 
 
 class _AnalyticsTelemetryOperator(BatchMetadataOperator):  # pragma: no cover - requires DeepStream runtime
@@ -5063,25 +5082,14 @@ class _AnalyticsTelemetryOperator(BatchMetadataOperator):  # pragma: no cover - 
         if batch_meta is None:
             return
 
-        # DS8 pyservicemaker API: batch_meta.frame_items is an iterable
         frame_items = getattr(batch_meta, "frame_items", None)
-        if frame_items is not None:
-            for frame_meta in frame_items:
-                try:
-                    self._processor.handle_frame_ds8(frame_meta)
-                except Exception:
-                    logger.exception("Failed to process analytics telemetry within batch metadata (DS8)")
+        if frame_items is None:
             return
-
-        # Fallback to DS7 pyds linked-list iteration
-        cast = _resolve_pyds_cast("NvDsFrameMeta")
-        for frame_meta in _iter_meta_entries(getattr(batch_meta, "frame_meta_list", None), cast):
-            if frame_meta is None:
-                continue
+        for frame_meta in frame_items:
             try:
-                self._processor.handle_frame(frame_meta)
+                self._processor.handle_frame_ds8(frame_meta)
             except Exception:
-                logger.exception("Failed to process analytics telemetry within batch metadata")
+                logger.exception("Failed to process analytics telemetry within batch metadata (DS8)")
 
 
 @dataclass
@@ -5211,25 +5219,14 @@ class _ExcludePruneOperator(BatchMetadataOperator):  # pragma: no cover - requir
         if batch_meta is None:
             return
 
-        # DS8 pyservicemaker API: batch_meta.frame_items is an iterable
         frame_items = getattr(batch_meta, "frame_items", None)
-        if frame_items is not None:
-            for frame_meta in frame_items:
-                try:
-                    self._processor.handle_frame_ds8(frame_meta)
-                except Exception:
-                    logger.exception("Failed to prune exclusion objects within batch metadata (DS8)")
+        if frame_items is None:
             return
-
-        # Fallback to DS7 pyds linked-list iteration
-        cast = _resolve_pyds_cast("NvDsFrameMeta")
-        for frame_meta in _iter_meta_entries(getattr(batch_meta, "frame_meta_list", None), cast):
-            if frame_meta is None:
-                continue
+        for frame_meta in frame_items:
             try:
-                self._processor.handle_frame(frame_meta)
+                self._processor.handle_frame_ds8(frame_meta)
             except Exception:
-                logger.exception("Failed to prune exclusion objects within batch metadata")
+                logger.exception("Failed to prune exclusion objects within batch metadata (DS8)")
 
 
 class _TrailOverlayOperator(BatchMetadataOperator):  # pragma: no cover - requires DeepStream runtime
@@ -5270,29 +5267,14 @@ class _IntrinsicsOperator(BatchMetadataOperator):  # pragma: no cover - requires
         self._processor = processor
 
     def handle_metadata(self, batch_meta: Any) -> None:
-        # DS8 pyservicemaker API: batch_meta.frame_items is an iterable
         frame_items = getattr(batch_meta, "frame_items", None)
-        if frame_items is not None:
-            for frame_meta in frame_items:
-                try:
-                    self._processor.apply(frame_meta)
-                except Exception:
-                    logger.exception("Failed to apply intrinsics within batch metadata probe (DS8)")
+        if frame_items is None:
             return
-        # Fallback to DS7 pyds linked-list iteration
-        if pyds is None:
-            return
-        l_frame = getattr(batch_meta, "frame_meta_list", None)
-        while l_frame is not None:
+        for frame_meta in frame_items:
             try:
-                frame_meta = pyds.NvDsFrameMeta.cast(l_frame.data)
                 self._processor.apply(frame_meta)
             except Exception:
-                logger.exception("Failed to apply intrinsics within batch metadata probe")
-            try:
-                l_frame = l_frame.next
-            except Exception:
-                break
+                logger.exception("Failed to apply intrinsics within batch metadata probe (DS8)")
 
 
 class _MapAnythingOperator(BatchMetadataOperator):  # pragma: no cover - requires DeepStream runtime
@@ -5305,93 +5287,66 @@ class _MapAnythingOperator(BatchMetadataOperator):  # pragma: no cover - require
         self._warned_no_match = False
 
     def handle_metadata(self, batch_meta: Any) -> None:
-        # DS8 pyservicemaker API: batch_meta.frame_items and frame_meta.tensor_items
         frame_items = getattr(batch_meta, "frame_items", None)
-        if frame_items is not None:
-            for frame_meta in frame_items:
-                self._frames_seen += 1
-                try:
-                    tensor_items = getattr(frame_meta, "tensor_items", None)
-                    if tensor_items is None:
-                        if not self._warned_no_tensors:
-                            logger.debug(
-                                "MapAnything frame missing tensor_items (frame_number=%s)",
-                                getattr(frame_meta, "frame_number", None),
-                            )
-                            self._warned_no_tensors = True
-                        continue
-                    items_list = list(tensor_items)
-                    converted_items: List[Any] = []
-                    for item in items_list:
-                        convert_fn = getattr(item, "as_tensor_output", None)
-                        if callable(convert_fn):
-                            try:
-                                item = convert_fn()
-                            except Exception:
-                                logger.debug("Failed to convert tensor metadata via as_tensor_output")
-                                continue
-                        converted_items.append(item)
-                    if not converted_items:
-                        if not self._warned_no_tensors:
-                            logger.debug(
-                                "MapAnything tensor_items present but none convertible to tensor output (frame_number=%s)",
-                                getattr(frame_meta, "frame_number", None),
-                            )
-                            self._warned_no_tensors = True
-                        continue
-                    matched = False
-                    for tensor_meta in converted_items:
-                        unique_id = getattr(tensor_meta, "unique_id", -1)
-                        if int(unique_id) == self._processor.gie_id:
-                            matched = True
-                            self._processor.handle_nvds_tensor_ds8(frame_meta, tensor_meta)
-                    if matched:
-                        self._matched_frames += 1
-                    elif converted_items:
-                        ids = [getattr(item, "unique_id", None) for item in converted_items]
-                        if not self._warned_no_match:
-                            logger.debug(
-                                "MapAnything tensor_items present but no matching gie_id=%s (frame_number=%s, available_ids=%s)",
-                                self._processor.gie_id,
-                                getattr(frame_meta, "frame_number", None),
-                                ids,
-                            )
-                            self._warned_no_match = True
-                        # Fallback: process the first tensor_meta when no matching gie_id is found.
+        if frame_items is None:
+            return
+        for frame_meta in frame_items:
+            self._frames_seen += 1
+            try:
+                tensor_items = getattr(frame_meta, "tensor_items", None)
+                if tensor_items is None:
+                    if not self._warned_no_tensors:
+                        logger.debug(
+                            "MapAnything frame missing tensor_items (frame_number=%s)",
+                            getattr(frame_meta, "frame_number", None),
+                        )
+                        self._warned_no_tensors = True
+                    continue
+                items_list = list(tensor_items)
+                converted_items: List[Any] = []
+                for item in items_list:
+                    convert_fn = getattr(item, "as_tensor_output", None)
+                    if callable(convert_fn):
                         try:
-                            self._processor.handle_nvds_tensor_ds8(frame_meta, converted_items[0])
-                            self._matched_frames += 1
+                            item = convert_fn()
                         except Exception:
-                            logger.exception("Failed to process MapAnything tensors from batch metadata (DS8)")
-                except Exception:
-                    logger.exception("Failed to process MapAnything tensors from batch metadata (DS8)")
-            return
-
-        # Fallback to DS7 pyds linked-list iteration
-        if pyds is None:
-            return
-
-        l_frame = getattr(batch_meta, "frame_meta_list", None)
-        while l_frame is not None:
-            try:
-                frame_meta = pyds.NvDsFrameMeta.cast(l_frame.data)
-                l_user = frame_meta.frame_user_meta_list
-                while l_user is not None:
-                    user_meta = pyds.NvDsUserMeta.cast(l_user.data)
-                    if user_meta.base_meta.meta_type == pyds.NVDSINFER_TENSOR_OUTPUT_META:  # type: ignore[attr-defined]
-                        tensor_meta = pyds.NvDsInferTensorMeta.cast(user_meta.user_meta_data)
-                        if int(getattr(tensor_meta, "unique_id", -1)) == self._processor.gie_id:
-                            self._processor.handle_nvds_tensor(frame_meta, tensor_meta)
+                            logger.debug("Failed to convert tensor metadata via as_tensor_output")
+                            continue
+                    converted_items.append(item)
+                if not converted_items:
+                    if not self._warned_no_tensors:
+                        logger.debug(
+                            "MapAnything tensor_items present but none convertible to tensor output (frame_number=%s)",
+                            getattr(frame_meta, "frame_number", None),
+                        )
+                        self._warned_no_tensors = True
+                    continue
+                matched = False
+                for tensor_meta in converted_items:
+                    unique_id = getattr(tensor_meta, "unique_id", -1)
+                    if int(unique_id) == self._processor.gie_id:
+                        matched = True
+                        self._processor.handle_nvds_tensor_ds8(frame_meta, tensor_meta)
+                if matched:
+                    self._matched_frames += 1
+                elif converted_items:
+                    ids = [getattr(item, "unique_id", None) for item in converted_items]
+                    if not self._warned_no_match:
+                        logger.debug(
+                            "MapAnything tensor_items present but no matching gie_id=%s (frame_number=%s, available_ids=%s)",
+                            self._processor.gie_id,
+                            getattr(frame_meta, "frame_number", None),
+                            ids,
+                        )
+                        self._warned_no_match = True
+                    # Fallback: process the first tensor_meta when no matching gie_id is found.
                     try:
-                        l_user = l_user.next
+                        self._processor.handle_nvds_tensor_ds8(frame_meta, converted_items[0])
+                        self._matched_frames += 1
                     except Exception:
-                        break
+                        logger.exception("Failed to process MapAnything tensors from batch metadata (DS8)")
             except Exception:
-                logger.exception("Failed to process MapAnything tensors from batch metadata")
-            try:
-                l_frame = l_frame.next
-            except Exception:
-                break
+                logger.exception("Failed to process MapAnything tensors from batch metadata (DS8)")
 
 
 class _PoseFeatureOperator(BatchMetadataOperator):  # pragma: no cover - requires DeepStream runtime
@@ -5578,7 +5533,7 @@ def _iter_roi_labels(raw: Any) -> Iterable[str]:
 
 
 def _primary_zone_from_analytics(analytics_meta: Mapping[str, Any]) -> Optional[str]:
-    roi_status = analytics_meta.get("roiStatus", analytics_meta.get("roi_status"))
+    roi_status = analytics_meta.get("roiStatus")
     for label in _iter_roi_labels(roi_status):
         if label:
             return label

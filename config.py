@@ -105,7 +105,6 @@ class AppConfig:
         
                 
         # DeepStream Pipeline Configuration (RECOMMENDED)
-        USE_DS8: bool = True  # Select DS8Adapter pipeline (GI) instead of DS7
         ENABLE_DEEPSTREAM: bool = True  # Enable DeepStream pipeline for video processing
         # Select primary model variant for DeepStream: True = instance segmentation (seg), False = detection-only (det)
         USE_SEGMENTATION_MODEL: bool = True
@@ -114,10 +113,10 @@ class AppConfig:
         DEEPSTREAM_MUX_SCALE_MODE: int = 2  # 0=stretch, 1=crop, 2=letter-box
         DEEPSTREAM_PREPROCESS_CONFIG: str = "pipelines/config_preproc.ini"  # Path to preprocessing config file
         DEEPSTREAM_INFER_CONFIG: str = "pipelines/config_infer_primary_yolo11.ini"  # Primary nvinfer INI
-        DEEPSTREAM_TRACKER_CONFIG: str = "pipelines/config_tracker_nvdcf_batch_lowlevel.yml"  # DS8 NvDCF tracker wrapper config
+        DEEPSTREAM_TRACKER_CONFIG: str = "pipelines/config_tracker_nvdcf_batch_lowlevel.yml"  # NvDCF tracker wrapper config
         DEEPSTREAM_TRACKER_LIB: str = "/opt/nvidia/deepstream/deepstream/lib/libnvds_nvmultiobjecttracker.so"  # DeepStream tracker library
         DEEPSTREAM_ENABLE_OSD: bool = True  # Enable on-screen display for visualization
-        # DeepStream multi-URI source config (required for DS8Adapter)
+        # DeepStream multi-URI source config for multi-camera ingest.
         DS_MULTIURISRC_CONFIG: str = "pipelines/noesis_multiurisrcbin.ini"
         
                 
@@ -429,7 +428,7 @@ class AppConfig:
         MAX_CLIENTS: int = 10
         JPEG_QUALITY: int = 100  # JPEG quality for frame compression (0-100)
         MAX_FPS: int = 30  # Maximum FPS for WebSocket streaming
-        # Mosaic broadcast (DS7 compatibility shim): when True, per-camera WS frames are gated
+        # Mosaic broadcast compatibility shim: when True, per-camera WS frames are gated
         # and a single mosaic image is broadcast under MOSAIC_TARGET_CAMERA id.
         MOSAIC_BROADCAST: bool = True
         MOSAIC_TARGET_CAMERA: str = "living-room"
@@ -557,10 +556,10 @@ def load_config_from_file(config_file: str) -> AppConfig:
                 section = getattr(config, section_name)
                 for key, value in section_data.items():
                     if hasattr(section, key):
-                        # Special handling for RTSP_STREAMS legacy format conversion
+                        # Special handling for older RTSP_STREAMS format conversion
                         if key == "RTSP_STREAMS":
                             if isinstance(value, dict):
-                                # Convert legacy dictionary format to new list format
+                                # Convert older dictionary format to new list format
                                 rtsp_list = []
                                 for stream_name, stream_url in value.items():
                                     rtsp_list.append({
@@ -570,11 +569,11 @@ def load_config_from_file(config_file: str) -> AppConfig:
                                         "height": 1080
                                     })
                                 setattr(section, key, rtsp_list)
-                                logger.info(f"Converted legacy RTSP_STREAMS dict to new format: {len(rtsp_list)} streams")
+                                logger.info(f"Converted older RTSP_STREAMS dict to new format: {len(rtsp_list)} streams")
                             elif isinstance(value, list):
                                 # Check if it's old string list format
                                 if value and isinstance(value[0], str):
-                                    # Convert legacy string list to new dict format
+                                    # Convert older string list to new dict format
                                     rtsp_list = []
                                     for i, stream_url in enumerate(value):
                                         rtsp_list.append({
@@ -584,7 +583,7 @@ def load_config_from_file(config_file: str) -> AppConfig:
                                             "height": 1080
                                         })
                                     setattr(section, key, rtsp_list)
-                                    logger.info(f"Converted legacy RTSP_STREAMS string list to new format: {len(rtsp_list)} streams")
+                                    logger.info(f"Converted older RTSP_STREAMS string list to new format: {len(rtsp_list)} streams")
                                 else:
                                     # Already in new format
                                     setattr(section, key, value)

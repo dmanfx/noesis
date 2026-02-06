@@ -167,16 +167,16 @@ def _intrinsics_for_camera(
 
     if cameras_path is None:
         models, cam_to_model = _load_camera_model_map(cameras_path)
-        legacy_model_key = cam_to_model.get(cam_id, "")
-        K, meta = _intrinsics_from_model(legacy_model_key, shape, cameras_path)
+        fallback_model_key = cam_to_model.get(cam_id, "")
+        K, meta = _intrinsics_from_model(fallback_model_key, shape, cameras_path)
     else:
         K = None
         meta = {}
     if K is not None and cam_id not in _FALLBACK_WARNED:
         logger.warning(
-            "Using legacy intrinsics from config/cameras.yaml for camera '%s' (model=%s)",
+            "Using fallback intrinsics from config/cameras.yaml for camera '%s' (model=%s)",
             cam_id,
-            legacy_model_key or "unknown",
+            fallback_model_key or "unknown",
         )
         _FALLBACK_WARNED.add(cam_id)
     if K is not None:

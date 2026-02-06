@@ -31,10 +31,12 @@ The Noesis pipeline is divided into two main layers:
     - Perform high-level analytics (`nvdsanalytics`).
     - Overlay visualizations on the video per stream (`nvdsosd` in per-branch paths).
 
-2.  **Python Application Layer**: This layer acts as a high-level coordinator. It starts and stops the DeepStream pipeline, extracts metadata and processed frames, and handles application-level logic:
-    - The `DeepStreamVideoPipeline` class encapsulates the DeepStream pipeline, providing a clean interface for the main application.
-    - The `ApplicationManager` coordinates all components, including the pipeline, WebSocket server, and result processing.
-    - A `WebSocketServer` streams video and analytics data to a web frontend and allows for real-time configuration changes.
+2.  **DS8 Runtime Layer**: This layer coordinates startup, configuration, telemetry, and APIs around the DS8 pipeline:
+    - `noesis/ds8_runtime.py` is the canonical runtime entrypoint.
+    - `noesis/pipelines/ds8_pipeline.py` builds the Service Maker graph and core DeepStream components.
+    - `noesis/pipelines/hooks.py` handles metadata extraction, overlays, analytics wiring, and runtime callbacks.
+    - `websocket_server.py` streams telemetry, tracking, BEV, and WebRTC signaling to clients.
+    - `noesis/server/*.py` provides the FastAPI endpoints used by the DS8 runtime REST service.
 
 For a more detailed breakdown of the pipeline, see the `docs/reference/DEEPSTREAM_PIPELINE_MAP.md`.
 
@@ -70,25 +72,28 @@ For a more detailed breakdown of the pipeline, see the `docs/reference/DEEPSTREA
     ```
 
 4.  **Configure the pipeline**:
-    - Edit `config.py` to set up your camera streams, model paths, and other pipeline settings.
-    - Review the DeepStream configuration files (`config_infer_primary_yolo11.txt`, `config_preproc.txt`, etc.) to customize the inference and preprocessing steps.
+    - Set stream + pipeline topology in `config/infer.yaml` (or another runtime YAML passed via `--pipeline-config`).
+    - Set camera metadata/intrinsics in `config/cameras.yaml` (or another YAML passed via `--cameras-config`).
+    - Review DeepStream config files under `pipelines/` for model, tracker, preprocess, and analytics tuning.
 
 ### Running the Application
 
-To run the application with a single RTSP stream:
+Use the DS8 runtime harness as the canonical entrypoint:
 
 ```bash
-python main.py --rtsp "your_rtsp_stream_url"
+python3 noesis/ds8_runtime.py \
+  --pipeline-config config/infer.yaml \
+  --cameras-config config/cameras.yaml
 ```
 
-You can also run with a local video file or a webcam:
+Example with V3DT tracking mode and REST disabled:
 
 ```bash
-# From a video file
-python main.py --video /path/to/your/video.mp4
-
-# From a webcam
-python main.py --webcam
+python3 noesis/ds8_runtime.py \
+  --pipeline-config config/infer_v3dt_baseline.yaml \
+  --cameras-config config/cameras.yaml \
+  --tracking-mode v3dt \
+  --disable-rest
 ```
 
 To start the dashboard UI in development mode run the following inside `electron-frontend`:

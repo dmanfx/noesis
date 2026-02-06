@@ -1,6 +1,6 @@
 # DS8 SV3DT + MV3DT Integration Plan (Noesis)
 
-This plan is tailored to the **DS8 canonical stack** (`noesis/`). It assumes we will **not** touch DS7 (`deepstream_video_pipeline.py`) and we will **not** add CPU/appsink branches to DS8.
+This plan is tailored to the **DS8 canonical stack** (`noesis/`). It assumes we will **not** touch deprecated pre-DS8 runtime code and we will **not** add CPU/appsink branches to DS8.
 
 ## Current baseline addendum (2026-01-22)
 
@@ -132,12 +132,12 @@ What we can do safely before global extrinsics:
    - Create the `config/v3dt/` folder structure and placeholder configs:
      - `config/v3dt/nvtracker_sv3dt.yml`
      - `config/v3dt/nvtracker_mv3dt.yml` (kept off until Phase 0)
-     - `config/v3dt/mqtt_proto_adaptor.txt` (use existing Mosquitto settings from DS7)
+     - `config/v3dt/mqtt_proto_adaptor.txt` (use existing Mosquitto settings from current repo defaults)
      - `config/v3dt/pub_sub_info_config_0.yml` (neighbor graph: kitchen ↔ family-room only)
    - Provision BodyPose3DNet assets/engine and wire `PoseEstimator` into the tracker config (pose helps SV3DT even in single-camera mode).
 2. **Implement DS8 hook plumbing**:
    - Add code in `noesis/pipelines/hooks.py` to extract `NVDS_OBJ_3D_META` (`NvDsObj3DBbox`) *when it exists* and attach additive fields (`bbox3d`, `velocity3d`, and a best-effort `world`).
-     - DS7 path: `pyds` traversal of `obj_user_meta_list`.
+     - Metadata path: `pyds` traversal of `obj_user_meta_list`.
      - DS8 path: Service Maker `ObjectMetadata` does not expose `obj_user_meta_list`, so use the native bridge module `noesis_v3dt_meta_ext` (build: `scripts/build_noesis_v3dt_meta_ext.sh`).
    - Keep existing bbox-ray `world` fallback for when SV3DT is off or meta isn’t present.
 3. **Add explicit “frame-of-reference” guardrails**:

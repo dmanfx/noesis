@@ -62,7 +62,7 @@ baseline, shortfalls, and confirmed no-go items. Key files:
 **Description**
 - In `noesis/pipelines/hooks.py`:
   - When SV3DT is enabled, extract `NVDS_OBJ_3D_META` (`NvDsObj3DBbox`) from per-object user meta:
-    - DS7: `pyds` traversal of `obj_user_meta_list`.
+    - Metadata path: `pyds` traversal of `obj_user_meta_list`.
     - DS8: Service Maker Python `ObjectMetadata` does not expose `obj_user_meta_list`, so use the native bridge module `noesis_v3dt_meta_ext` (built via `scripts/build_noesis_v3dt_meta_ext.sh`).
   - Attach additive fields to the per-track payload:
     - `bbox3d` (use `NvDsObj3DBbox` field names)

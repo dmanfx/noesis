@@ -10,8 +10,8 @@ All new work should start from that baseline and keep its constraints intact.
 
 ## Hard constraints (must follow)
 
-1. **DS8 only**: Do not modify DS7 (`deepstream_video_pipeline.py` and GI/GStreamer legacy code) unless explicitly requested.
-2. **No DS7 fallback**: If DS8 MV3DT/SV3DT cannot be made to work, fail loudly (logs + docs) and stop; do not route through DS7.
+1. **DS8 only**: Do not modify deprecated pre-DS8 pipeline code unless explicitly requested.
+2. **No deprecated-stack fallback**: If DS8 MV3DT/SV3DT cannot be made to work, fail loudly (logs + docs) and stop; do not route through removed runtime paths.
 3. **No guessing of DS8/DeepStream APIs**:
    - Only use DeepStream/Service Maker methods and config keys you can verify in:
      - installed Python modules (`pyservicemaker`, `pyds`)

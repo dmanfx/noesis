@@ -70,7 +70,7 @@ defined in `noesis/ds8_runtime.py`.
 python3 scripts/generate_v3dt_caminfo.py \
   --pipeline-config config/infer_v3dt_baseline.yaml \
   --cameras-config config/cameras_v3dt_baseline.yaml \
-  --calibration config/camera_calibration.json \
+  --calibration config/archive/calibration_v3dt_baseline.json \
   --output-dir config/v3dt/caminfo_baseline \
   --model-height 2.2 \
   --model-radius 0.35 \
@@ -80,8 +80,10 @@ python3 scripts/generate_v3dt_caminfo.py \
 python3 scripts/sanity_check_v3dt_calibration.py \
   --pipeline-config config/infer_v3dt_baseline.yaml \
   --cameras-config config/cameras_v3dt_baseline.yaml \
-  --calibration config/camera_calibration.json
+  --calibration config/archive/calibration_v3dt_baseline.json
 ```
+
+These commands are for locked-baseline recovery. If you intentionally run against live calibration (`config/camera_calibration.json`), treat that run as non-baseline and record it explicitly in notes/checklists.
 
 ## Critical dependency (must be solved early)
 
@@ -311,4 +313,4 @@ See `plans/DS8/v3dt/ds8_v3dt_hardening_work_order.md` for the task breakdown cov
 
 ## Note on legacy docs
 
-There are older, DS7-oriented MV3DT notes under `plans/mv3dt/`. This folder (`plans/DS8/v3dt/`) is the canonical DS8 plan; any useful legacy content has been rewritten and integrated here.
+There are older MV3DT notes under `plans/mv3dt/`. This folder (`plans/DS8/v3dt/`) is the canonical DS8 plan; any useful legacy content has been rewritten and integrated here.

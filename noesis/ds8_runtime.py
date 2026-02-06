@@ -69,7 +69,7 @@ except Exception:
 
 _PGIE_PROFILES = ("yolo11_seg", "rfdetr_seg", "yolo26_seg")
 _ENV_TRUE = ("1", "true", "yes", "y", "on")
-_TRACKING_MODES = ("legacy", "v3dt")
+_TRACKING_MODES = ("baseline", "v3dt")
 
 
 def _deep_merge_dict(base: Any, overlay: Any) -> Any:
@@ -584,7 +584,7 @@ def _parse_args() -> argparse.Namespace:
         "--tracking-mode",
         choices=_TRACKING_MODES,
         default=None,
-        help="Tracking mode selection (legacy or v3dt). Env: NOESIS_TRACKING_MODE",
+        help="Tracking mode selection (baseline or v3dt). Env: NOESIS_TRACKING_MODE",
     )
     parser.add_argument(
         "--v3dt",
@@ -653,12 +653,12 @@ def _normalize_tracking_mode(value: Any) -> str:
     mode = str(value or "").strip().lower()
     if mode in ("v3dt", "sv3dt", "mv3dt", "3d"):
         return "v3dt"
-    if mode in ("legacy", "2d", "baseline", "standard", "default"):
-        return "legacy"
+    if mode in ("2d", "baseline", "standard", "default"):
+        return "baseline"
     if not mode or mode == "auto":
-        return "legacy"
-    logging.getLogger("ds8.runtime").warning("Unknown tracking mode '%s'; defaulting to legacy", value)
-    return "legacy"
+        return "baseline"
+    logging.getLogger("ds8.runtime").warning("Unknown tracking mode '%s'; defaulting to baseline", value)
+    return "baseline"
 
 
 def _resolve_tracking_mode(args: argparse.Namespace) -> str:
@@ -669,7 +669,7 @@ def _resolve_tracking_mode(args: argparse.Namespace) -> str:
     env_mode = os.environ.get("NOESIS_TRACKING_MODE", "")
     if str(env_mode).strip():
         return _normalize_tracking_mode(env_mode)
-    return "legacy"
+    return "baseline"
 
 
 def _mode_default_paths(mode: str) -> Tuple[Path, Path]:
@@ -790,7 +790,7 @@ def _validate_v3dt_tracking_guardrails(pipeline_path: Path, logger: logging.Logg
     return False
 
 
-def _warn_legacy_with_v3dt_tracker(pipeline_path: Path, logger: logging.Logger) -> None:
+def _warn_baseline_with_v3dt_tracker(pipeline_path: Path, logger: logging.Logger) -> None:
     pipeline_cfg = _load_pipeline_config(pipeline_path, logger)
     if pipeline_cfg is None:
         return
@@ -799,7 +799,7 @@ def _warn_legacy_with_v3dt_tracker(pipeline_path: Path, logger: logging.Logger) 
         return
     if _tracker_under_v3dt_dir(tracker_path):
         logger.warning(
-            "Tracking mode 'legacy' with V3DT tracker config %s; V3DT meta/bbox3d will be ignored",
+            "Tracking mode 'baseline' with V3DT tracker config %s; V3DT meta/bbox3d will be ignored",
             tracker_path,
         )
 
@@ -1049,17 +1049,13 @@ class _CalibrationProvider:
         env_path = os.environ.get("NOESIS_CALIBRATION_EXTRINSICS", "")
         if not extrinsics_path and env_path.strip():
             extrinsics_path = Path(env_path.strip())
-        if not extrinsics_path and tracking_mode and str(tracking_mode).strip().lower() != "v3dt":
-            legacy_path = REPO_ROOT / "config" / "camera_calibration_legacy.json"
-            if legacy_path.exists():
-                extrinsics_path = legacy_path
         self._extrinsics_path = Path(extrinsics_path) if extrinsics_path else (REPO_ROOT / "config" / "camera_calibration.json")
         self._extrinsics = load_extrinsics(str(self._extrinsics_path))
         logging.getLogger(__name__).info("Calibration extrinsics path=%s", self._extrinsics_path)
         try:
-            from config import config as legacy_config  # type: ignore
+            from config import config as app_config  # type: ignore
 
-            calib_cfg = getattr(legacy_config, "calibration", None)
+            calib_cfg = getattr(app_config, "calibration", None)
             self._model_map = dict(getattr(calib_cfg, "CAMERA_INTRINSICS_MODEL_MAP", {}) or {})
             self._camera_specs = dict(getattr(calib_cfg, "CAMERA_SPECS", {}) or {})
         except Exception:
@@ -1172,7 +1168,7 @@ class _CalibrationProvider:
         if frame_w <= 0 or frame_h <= 0:
             frame_w, frame_h = 1920, 1080
 
-        # Align intrinsics with the current streammux resolution (mirror DS7 scaling rules).
+        # Align intrinsics with the current streammux resolution.
         base_w = base_h = None
         res = self._camera_model_res.get(camera_id)
         if res:
@@ -2341,16 +2337,15 @@ def _start_glib_mainloop(
 
     Returns (thread, mainloop) tuple. Both may be None if GLib is unavailable.
     
-    NOTE: This function is kept for backwards compatibility but pyservicemaker
-    does not expose the underlying Gst.Pipeline, so we use its native wait() instead.
+    pyservicemaker does not expose the underlying Gst.Pipeline, so runtime control
+    uses its native wait() path instead of a GLib main loop thread.
     """
     if not _GLIB_AVAILABLE or GLib is None or Gst is None:
         logger.warning("GLib unavailable; skipping main loop (may affect stream reconnection)")
         return None, None
 
-    # pyservicemaker doesn't expose the underlying Gst.Pipeline
-    # Instead, we rely on its native event handling via wait()
-    # This function exists for compatibility but returns None - see _start_pyservicemaker_wait_loop
+    # pyservicemaker doesn't expose the underlying Gst.Pipeline.
+    # Rely on native event handling via wait(); see _start_pyservicemaker_wait_loop.
     logger.info("Using pyservicemaker native event handling (GLib main loop not required)")
     return None, None
 
@@ -2662,8 +2657,8 @@ def main() -> int:
     tracking_mode = _resolve_tracking_mode(args)
     os.environ["NOESIS_TRACKING_MODE"] = tracking_mode
     if tracking_mode not in _TRACKING_MODES:
-        logger.warning("Normalized tracking mode '%s' is unknown; defaulting to legacy", tracking_mode)
-        tracking_mode = "legacy"
+        logger.warning("Normalized tracking mode '%s' is unknown; defaulting to baseline", tracking_mode)
+        tracking_mode = "baseline"
 
     pipeline_path, cameras_path = _resolve_pipeline_and_camera_paths(args, tracking_mode, logger)
     pipeline_path = pipeline_path.expanduser().resolve()
@@ -2685,7 +2680,7 @@ def main() -> int:
         if not _validate_v3dt_tracking_guardrails(pipeline_path, logger):
             return 1
     else:
-        _warn_legacy_with_v3dt_tracker(pipeline_path, logger)
+        _warn_baseline_with_v3dt_tracker(pipeline_path, logger)
 
     base_pipeline_path = pipeline_path
     pipeline_path = _materialize_effective_pipeline_yaml(

@@ -35,6 +35,21 @@ docs/*.md
 docs/ma-integration/*.md
 *.md
 
+# Always track agent policy docs and all docs/ content
+!AGENTS.md
+!**/AGENTS.md
+!docs/
+!docs/**
+
+# Archive docs are not tracked
+docs/history/
+docs/completed/
+docs/deprecated/
+docs/fixes/
+docs/implementation/
+docs/plans/
+docs/ma-integration/
+
 #model folders
 data/depth/
 models/
@@ -51,12 +66,9 @@ ma_onnxTRT/
 .git/
 pipelines/*.so
 *.so
-
+*.pt
 
 #external folders/files
 .venv_ds/
 newvisions-redesign-mockup
 Labs/
-
-
-

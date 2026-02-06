@@ -43,7 +43,7 @@ Basic idea:
     - V3DT camInfo regeneration: === writes ===> config/v3dt/camInfo_*.yml
 
   Legacy note:
-    - DS7 (`main.py`) also reads/writes the same calibration files and serves similar WS messages,
+    - The deprecated pre-DS8 runtime (`main.py`) also reads/writes the same calibration files and serves similar WS messages,
       but DS8 is the canonical path for new work.
 
 --------------------------------------------------------------------------------
@@ -160,10 +160,10 @@ Basic idea:
     Menon’s absolute real-world camera positions/orientations (especially X/Z and yaw).
 
 --------------------------------------------------------------------------------
-3) DS7 (legacy) Calibration Path — main.py + websocket_server.py
+3) Deprecated Calibration Path — main.py + websocket_server.py
 --------------------------------------------------------------------------------
 
-  Startup (DS7):
+  Startup (deprecated path):
     {main.py} loads calibration bundle (intrinsics + extrinsics + align)
       --> wires WS handlers:
           - calibration_getter
@@ -172,17 +172,17 @@ Basic idea:
           - pixel_to_world_handler
           - auto_calibrate_handler
 
-  set_extrinsics (DS7):
+  set_extrinsics (deprecated path):
     (WS msg) set_extrinsics --> {main.py:_set_extrinsics_rpc}
       === writes ===> [config/camera_calibration.json]
       --> rebuilds calibration-bundle + broadcasts it
 
-  auto_calibrate_pose (DS7):
+  auto_calibrate_pose (deprecated path):
     (WS msg) auto_calibrate_pose --> {main.py:_auto_calibrate_from_depth}
       --> runs scripts/auto_calibrate_from_depth.py (persist=False)
       --> applies each E via _set_extrinsics_rpc (so it persists + broadcasts)
 
-  pixel_to_world (DS7):
+  pixel_to_world (deprecated path):
     (WS msg) pixel_to_world --> {main.py:_pixel_to_world_rpc}
       --> prefers MapAnything depth pixel sample (if available + confident)
       --> else falls back to floor-plane intersection

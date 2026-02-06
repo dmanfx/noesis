@@ -194,15 +194,15 @@ def _intrinsics_for_camera(cam_id: str, shape: Tuple[int, int]) -> Optional[np.n
                 cy *= sy
         return np.array([[fx, 0.0, cx], [0.0, fy, cy], [0.0, 0.0, 1.0]], dtype=np.float64)
 
-    # Fallback to legacy config/cameras.yaml intrinsics when canonical lookup fails.
+    # Fallback to config/cameras.yaml model-mapped intrinsics when canonical lookup fails.
     models, cam_to_model = _load_camera_model_map()
-    legacy_model_key = cam_to_model.get(cam_id, "")
-    K = _intrinsics_from_model(legacy_model_key, shape)
+    fallback_model_key = cam_to_model.get(cam_id, "")
+    K = _intrinsics_from_model(fallback_model_key, shape)
     if K is not None and cam_id not in _FALLBACK_WARNED:
         logger.warning(
-            "Using legacy intrinsics from config/cameras.yaml for camera '%s' (model=%s)",
+            "Using fallback intrinsics from config/cameras.yaml for camera '%s' (model=%s)",
             cam_id,
-            legacy_model_key or "unknown",
+            fallback_model_key or "unknown",
         )
         _FALLBACK_WARNED.add(cam_id)
     return K

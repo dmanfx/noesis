@@ -143,7 +143,7 @@ def main() -> int:
     parser.add_argument("--ws-port", type=int, default=0, help="WebSocket port (used when spawning)")
     parser.add_argument("--pipeline-config", default=None)
     parser.add_argument("--cameras-config", default=None)
-    parser.add_argument("--tracking-mode", choices=("legacy", "v3dt"), default=None)
+    parser.add_argument("--tracking-mode", choices=("v3dt",), default=None)
     parser.add_argument("--no-spawn", action="store_true", help="Do not spawn runtime")
     parser.add_argument("--duration", type=float, default=12.0)
     args = parser.parse_args()

@@ -86,16 +86,8 @@ def _expected_floorplan_flip(
     cameras_node = calib_bundle.get("cameras")
     if not isinstance(cameras_node, dict):
         return None
-    extr = None
     e_table = cameras_node.get("E") if isinstance(cameras_node, dict) else None
-    if isinstance(e_table, dict):
-        extr = e_table.get(camera_id)
-    if extr is None:
-        legacy_cam = cameras_node.get(camera_id) if isinstance(cameras_node, dict) else None
-        if isinstance(legacy_cam, dict):
-            maybe_extr = legacy_cam.get("extrinsics")
-            if isinstance(maybe_extr, dict):
-                extr = maybe_extr.get("E")
+    extr = e_table.get(camera_id) if isinstance(e_table, dict) else None
     if not isinstance(extr, (list, tuple)) or len(extr) != 16:
         return None
     return _infer_image_flips_from_extrinsics(extr)
@@ -781,15 +773,7 @@ class DepthStorageManager:
         calib_bundle = getattr(self, "calibration_bundle", None) or {}
         cameras_node = calib_bundle.get("cameras") if isinstance(calib_bundle, dict) else {}
         k_table = cameras_node.get("K") if isinstance(cameras_node, dict) else {}
-        intr = None
-        if isinstance(k_table, dict):
-            intr = k_table.get(camera_id)
-        if intr is None:
-            legacy_cam = cameras_node.get(camera_id) if isinstance(cameras_node, dict) else None
-            if isinstance(legacy_cam, dict):
-                maybe_intr = legacy_cam.get("intrinsics")
-                if isinstance(maybe_intr, (list, tuple)) and len(maybe_intr) in (4, 9):
-                    intr = maybe_intr
+        intr = k_table.get(camera_id) if isinstance(k_table, dict) else None
 
         if intr is None:
             raise ValueError("missing_calibration")
@@ -857,15 +841,7 @@ class DepthStorageManager:
         calib_bundle = getattr(self, "calibration_bundle", None) or {}
         cameras_node = calib_bundle.get("cameras") if isinstance(calib_bundle, dict) else {}
         e_table = cameras_node.get("E") if isinstance(cameras_node, dict) else {}
-        extr = None
-        if isinstance(e_table, dict):
-            extr = e_table.get(camera_id)
-        if extr is None:
-            legacy_cam = cameras_node.get(camera_id) if isinstance(cameras_node, dict) else None
-            if isinstance(legacy_cam, dict):
-                maybe_extr = legacy_cam.get("extrinsics")
-                if isinstance(maybe_extr, dict):
-                    extr = maybe_extr.get("E")
+        extr = e_table.get(camera_id) if isinstance(e_table, dict) else None
         if not isinstance(extr, (list, tuple)) or len(extr) != 16:
             return None
         return extr
@@ -1261,18 +1237,6 @@ class DepthStorageManager:
             intr = k_table.get(camera_id)
         if isinstance(e_table, dict):
             extr = e_table.get(camera_id)
-
-        if intr is None or extr is None:
-            legacy_cam = cameras_node.get(camera_id) if isinstance(cameras_node, dict) else None
-            if isinstance(legacy_cam, dict):
-                if intr is None:
-                    maybe_intr = legacy_cam.get('intrinsics')
-                    if isinstance(maybe_intr, (list, tuple)) and len(maybe_intr) == 9:
-                        intr = maybe_intr
-                if extr is None:
-                    maybe_extr = legacy_cam.get('extrinsics')
-                    if isinstance(maybe_extr, dict):
-                        extr = maybe_extr.get('E')
 
         if intr is None or extr is None:
             return {'error': 'missing_calibration', 'camera_id': camera_id, 'ts': now_us}
@@ -2304,18 +2268,6 @@ class MapAnythingDepthSource:
             intr = k_table.get(camera_id)
         if isinstance(e_table, dict):
             extr = e_table.get(camera_id)
-
-        if intr is None or extr is None:
-            legacy_cam = cameras_node.get(camera_id) if isinstance(cameras_node, dict) else None
-            if isinstance(legacy_cam, dict):
-                if intr is None:
-                    maybe_intr = legacy_cam.get('intrinsics')
-                    if isinstance(maybe_intr, (list, tuple)) and len(maybe_intr) == 9:
-                        intr = maybe_intr
-                if extr is None:
-                    maybe_extr = legacy_cam.get('extrinsics')
-                    if isinstance(maybe_extr, dict):
-                        extr = maybe_extr.get('E')
 
         if intr is None or extr is None:
             return {'error': 'missing_calibration', 'camera_id': camera_id, 'ts': now_us}

@@ -1,6 +1,6 @@
 # DeepStream 8 canonical configuration for the DS8 pipeline.
-# Aligns with DS7 behavior (multi-URI sources, NvDCF tracker, analytics ROIs)
-# while using Service Maker Pipeline APIs.
+# Uses a multi-URI ingest path with NvDCF tracker and analytics ROI stages
+# on Service Maker Pipeline APIs.
 
 version: 1
 
@@ -24,7 +24,7 @@ sources:
     #uri: file:///home/mayor/Downloads/livingroomclip.mp4
     gpu-id: 0
     cudadec-memtype: 0
-    latency: 10
+    latency: 100
     select-rtp-protocol: 4
   - element: nvurisrcbin
     #kitchen camera
@@ -32,7 +32,7 @@ sources:
     #uri: file:///home/mayor/Downloads/kitchenclip.mp4
     gpu-id: 0
     cudadec-memtype: 0
-    latency: 10
+    latency: 100
     select-rtp-protocol: 4
   - element: nvurisrcbin
     #family room camera
@@ -40,7 +40,7 @@ sources:
     #uri: file:///home/mayor/Downloads/familyroomclip.mp4
     gpu-id: 0
     cudadec-memtype: 0
-    latency: 10
+    latency: 100
     select-rtp-protocol: 4
 
 

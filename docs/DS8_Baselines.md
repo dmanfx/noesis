@@ -1,0 +1,92 @@
+# DS8 Baselines & Live Defaults
+
+This page condenses the current DS8 defaults and non-negotiable behaviors so
+you don’t have to sift through the historical work orders.
+
+## Identity, Trails, and Telemetry
+- `stable_id` is the only user-visible person ID. `track_id` is internal and
+  must not be emitted to clients.
+- BEV, tracking, and telemetry use `stable_id`; BEV never carries tracker IDs.
+- **Pose-assisted StableID (secondary signal):** when pose SGIE is enabled
+  (`config/infer.yaml` `models.pose.enable: true`), StableIDManager auto-enables
+  pose ratio fusion unless disabled via `NOESIS_REID_POSE_ENABLED=0` or
+  `NOESIS_POSE_FEATURES_ENABLED=0`. Memory is bounded via per‑ID galleries and
+  TTL pruning. See `DS8_pose_stable_id_integration.md` for thresholds/caps.
+- Trail colors are stable-id-first; fallback to camera-namespaced colors to keep
+  cross-camera IDs visually distinct.
+- Negative or provisional IDs stay internal; never send negative IDs to UI.
+- StableIDManager is fed by the ReID SGIE tensors (no torchreid extractor) and
+  is enabled by default (`NOESIS_REID_ENABLED=1`). Default embedding interval is
+  `0.0s` (every frame); device defaults to `cuda:0`. Disable entirely with
+  `NOESIS_REID_ENABLED=0`.
+
+## Output & Delivery
+- Mosaic video is delivered via RTSP → WebRTC gateway; WebSocket is signaling
+  only for mosaic (no JPEG-over-WS in DS8).
+- BEV JPEG binaries are **optional and default off**:
+  - env: `NOESIS_BEV_JPEG_ENABLED=0` (default)
+  - JSON BEV metadata always stays on.
+- BEV frame mode defaults to `camera_local`; override with `NOESIS_BEV_FRAME=world`
+  when global world-frame BEV is required.
+
+## Depth / MapAnything
+- MapAnything is a full-frame SGIE branch (no tensor-from-meta). Gated with a
+  valve:
+  - REST: `GET /api/v1/depth/refresh?seconds=N` opens the gate for N seconds.
+  - Logical gate remains even if BufferOperator attach is unavailable.
+- Depth snapshots land in `data/depth/<camera>/...` and emit `depth_result`
+  telemetry. See `DEPTH_STACK_FLOW_V2.md` for flow details.
+- Depth normals (in `ma_depth_response`) are optional; enable/disable with
+  `NOESIS_MAPANYTHING_NORMALS_ENABLE=1|0` and choose space/dtype via
+  `NOESIS_MAPANYTHING_NORMALS_SPACE` (`camera`|`world`) and
+  `NOESIS_MAPANYTHING_NORMALS_DTYPE` (`float16`|`float32`).
+
+## Detector Profiles (PGIE)
+- **Default:** YOLO11-seg (instance masks), PGIE `unique-id=1`, person is
+  `class_id=0`.
+- **Optional:** RF-DETR-seg preview (validated)
+  - Switch via `--pgie-profile rfdetr_seg` or `NOESIS_PGIE_PROFILE=rfdetr_seg`.
+  - Engine: `models/engines/rfdetr_seg_preview_432_b3_fp16.engine`
+  - Configs: `pipelines/config_infer_primary_rfdetr_seg.ini`,
+    `pipelines/config_preproc_rfdetr_432.ini`
+  - Parser: `pipelines/nvdsinfer_rfdetr_seg/libnvdsinfer_rfdetr_seg.so`
+  - Person remap: parser maps RF-DETR person class to DS `class_id=0`; keep
+    PGIE `unique-id=1` so ReID/SGIE continue to hook correctly.
+- **Optional:** YOLO26-seg (n/s/m). Switch via `--pgie-profile yolo26_seg` plus
+  `--size n|s|m` (default m). Engines must exist under `models/engines/`.
+
+## Trails & ID Refactor Guardrails
+- BEV uses only `stable_id` footpoints; tracker IDs never reach BEV.
+- BEV JPEG output is off by default (see Output section above).
+- Camera-namespaced fallback colors remain enabled to avoid cross-camera color
+  collisions when stable_id is absent.
+
+## V3DT / SV3DT Baseline (2026-01-22 locked)
+- Pipeline: `config/infer_v3dt_baseline.yaml`
+- Tracker: `config/v3dt/nvtracker_v3dt_baseline.yml`
+- CamInfo dir: `config/v3dt/caminfo_baseline/`
+- Calibration: `config/archive/calibration_v3dt_baseline.json`
+- Per-camera pitch (preview extrinsics): family-room **-16°**, kitchen **-21°**,
+  living-room **-15°**
+- Model dimensions: height **2.2 m**, radius **0.35 m**
+- CamInfo conventions (env defaults):
+  - `NOESIS_V3DT_CAMINFO_INVERT_E=0` (E is world→camera)
+  - `NOESIS_V3DT_CAMINFO_Y_FLIP=1`
+  - `NOESIS_V3DT_CAMINFO_WORLD_AXES=xzy`
+  - `NOESIS_V3DT_CAMINFO_WORLD_SCALE=1`
+- Known gaps: living-room still slightly shallow (bottom offset ~160px); BEV
+  validation pending. See `history/ds8/v3dt/` for detailed runs.
+- Optional camInfo regeneration: `NOESIS_V3DT_AUTOGEN_CAMINFO=1` regenerates
+  camInfo using the current streammux resolution before starting the pipeline.
+
+## WebRTC / Mosaic
+- Canonical mosaic path is RTSP (`nvrtspoutsinkbin`) consumed by
+  `noesis/mosaic_webrtc_gateway.py`.
+- Ensure RTSP output is enabled when WebRTC is enabled
+  (`mosaic_output.mosaic_webrtc_enabled: true` auto-enables RTSP).
+
+## Where to Confirm Details
+- Full rationale and history: `DS8_MIGRATION_KNOWLEDGE_BASE.md`,
+  `history/ds8/` (mirrored plans and work orders).
+- Contracts: `DS8_api_contracts_ws.md`, `DS8_api_contracts_rest.md`,
+  `DS8_metadata_contracts.md`.

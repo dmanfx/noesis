@@ -241,7 +241,7 @@ Returned from `get_floorplan` (`DepthStorageManager.generate_topdown_floorplan`)
 
 ### auto_calibrate_result
 
-Unchanged from DS7; DS8 runtime proxies Menon auto-calibration: `{ type: "auto_calibrate_result", ok: <bool>, updated: [<cameraId>], results: [...], error?: <string|null> }`.
+Current DS8 runtime proxies Menon auto-calibration: `{ type: "auto_calibrate_result", ok: <bool>, updated: [<cameraId>], results: [...], error?: <string|null> }`.
 
 ## 8. Calibration Data Conventions
 

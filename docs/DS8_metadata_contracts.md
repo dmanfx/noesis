@@ -131,7 +131,7 @@ Attached as NvDsUserMeta with type `NVIDIA.DSANALYTICSOBJ.USER_META` (or equival
 }
 ```
 
-Snake_case keys are provided for backwards compatibility with DS7 consumers.
+Snake_case keys are provided for backwards compatibility with older consumers.
 
 ### Frame-Level Analytics Meta
 
@@ -150,7 +150,7 @@ This is used to supplement occupancy information when object-level ROI counts ar
 
 ## 4. Tracking & Occupancy Derived Structures
 
-**Producer:** `_AnalyticsTelemetryProcessor` and DS7-compat logic.
+**Producer:** `_AnalyticsTelemetryProcessor` and compatibility logic.
 
 ### Track Dictionary
 

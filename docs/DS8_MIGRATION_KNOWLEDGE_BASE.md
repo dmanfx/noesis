@@ -3,9 +3,9 @@ _Status: current as of 2026-02-02._
 
 This file compresses the key decisions, architecture, and current status of the DS8 migration so new agents can pick up where previous work left off.
 
-## 1. DS7 vs DS8 Split
+## 1. legacy stack vs DS8 Split
 
-- **DS7 (legacy):** `deepstream_video_pipeline.py` + GI/GStreamer, appsinks, pad probes, INI configs.
+- **legacy stack (legacy):** `deepstream_video_pipeline.py` + GI/GStreamer, appsinks, pad probes, INI configs.
 - **DS8 (canonical):** everything under `noesis/`:
   - `noesis/ds8_runtime.py` – runtime harness (CLI, WS, REST).
   - `noesis/pipelines/ds8_pipeline.py` – Service Maker `Pipeline` graph from `config/infer.yaml`.
@@ -14,9 +14,9 @@ This file compresses the key decisions, architecture, and current status of the 
   - `noesis/telemetry/*` – depth, tracking, BEV publishers.
   - `noesis/metadata/*` – intrinsics + depth schemas.
 - Rules:
-  - Do **not** mix DS7-style GI/GStreamer pipeline construction (appsinks, pad probes, ad-hoc Gst graphs) into the DS8 pipeline/hook code under `noesis/pipelines/*` and `noesis/telemetry/*`.
+  - Do **not** mix legacy stack-style GI/GStreamer pipeline construction (appsinks, pad probes, ad-hoc Gst graphs) into the DS8 pipeline/hook code under `noesis/pipelines/*` and `noesis/telemetry/*`.
   - Mosaic delivery is an intentional exception: `noesis/mosaic_webrtc_gateway.py` runs a small, separate GStreamer pipeline to bridge RTSP→WebRTC.
-  - Do **not** silently route DS8 failures through DS7.
+  - Do **not** silently route DS8 failures through legacy stack.
 
 ## 2. DS8 Pipeline Architecture (High-Level)
 
@@ -53,13 +53,13 @@ All linking is done via `ds_pipeline.link(...)` wrapped in `_safe_link`.
       - primary path via `np.from_dlpack(tensor)` when the DS8 tensor exposes CPU-backed DLPack;
       - fallback path via `tensor.__dlpack__()` → `torch.utils.dlpack.from_dlpack(...).detach().cpu().numpy()` for GPU-backed tensors.
       - The resulting arrays are passed into `_emit_from_tensors`.
-    - DS7 path: `handle_nvds_tensor()` uses pyds `NvDsInferTensorMeta` helpers.
+    - legacy stack path: `handle_nvds_tensor()` uses pyds `NvDsInferTensorMeta` helpers.
   - `_emit_from_tensors` selects depth/confidence/mask, stores via `DepthStorageManager`, updates depth FPS, publishes `DepthResult` via `DepthTelemetryPublisher`.
 
 ### Engine situation
 
 - A fused 12-channel engine (`ma_model_fp16_b3_fused.plan`) was temporarily used to get DS8 running; it expects tensor-from-meta and a dedicated fused-preprocess stage, which DS8 does not have.
-- Decision (2025‑11‑30): **Use the existing DS7 full-frame MapAnything engine** (RGB image input) for DS8, and remove tensor-from-meta assumptions from MapAnything configs.
+- Decision (2025‑11‑30): **Use the existing legacy stack full-frame MapAnything engine** (RGB image input) for DS8, and remove tensor-from-meta assumptions from MapAnything configs.
 - Update (2025‑12‑01): Re-exported MapAnything ONNX as images-only (no intrinsics input) and rebuilt the FP16 TensorRT engine with TensorRT 10.13. DS8 config now points to `/home/mayor/Noesis_Devel/models/mapanything_depth/1/model.plan` with `input-tensor-from-meta=0`, `infer-dims=3;518;518`, `output-tensor-meta=1`.
 
 ### Pose-conditioned MapAnything (optional)
@@ -75,7 +75,7 @@ Upstream MapAnything supports providing `camera_poses` (and/or calibration/depth
 - Update behavior:
   - `MapAnythingPoseProvider` auto-reloads when the calibration/alignment files change (mtime-based), keeping pose-conditioned inference in sync with `E` updates.
 
-## 4. Metadata & Telemetry (DS8 + DS7 Compatibility)
+## 4. Metadata & Telemetry (DS8 + legacy stack Compatibility)
 
 - Calibration (single source of truth):
   - **Runtime delivery:** `_CalibrationProvider` inside `noesis/ds8_runtime.py` loads `config/cameras.yaml` + `config/camera_calibration*.json` + `config/ply_alignment.json` and serves `calibration-bundle` over WS; BEV uses `CalibrationSnapshot` from this provider.
@@ -90,11 +90,11 @@ Upstream MapAnything supports providing `camera_poses` (and/or calibration/depth
 - MapAnything tensors:
   - `_MapAnythingOperator`:
     - DS8: iterates `batch_meta.frame_items` and `frame_meta.tensor_items`, calls `handle_nvds_tensor_ds8`.
-    - DS7: uses `frame_meta.frame_user_meta_list` and `NVDSINFER_TENSOR_OUTPUT_META`.
+    - legacy stack: uses `frame_meta.frame_user_meta_list` and `NVDSINFER_TENSOR_OUTPUT_META`.
 - Analytics telemetry:
   - `_AnalyticsTelemetryProcessor` and `_AnalyticsTelemetryOperator`:
     - DS8: use `frame_items` and `frame_meta.object_items` + `nvdsanalytics_obj_items`.
-    - DS7: use `NvDsFrameMeta` → `obj_meta_list` + `NvDsAnalyticsObjInfo` via pyds.
+    - legacy stack: use `NvDsFrameMeta` → `obj_meta_list` + `NvDsAnalyticsObjInfo` via pyds.
   - Produces tracking dictionaries with `track_id`, `camera_id`, `bbox`, `center`, `class_id`, `confidence`, `tracker_confidence`, `zone`, `dwell_time`, `stable_id`, and analytics fields.
   - Pose feature meta: `PoseFeatureProcessor` attaches `NOESIS.POSE_FEATURES` user meta from
     the YOLO26 pose SGIE. DS8 hooks use `noesis_pose_meta_ext.extract_pose_features(...)` to
@@ -104,7 +104,7 @@ Upstream MapAnything supports providing `camera_poses` (and/or calibration/depth
   - Occupancy: derived from zone labels; published via `pipeline.occupancy_publisher.publish_state(...)` including vacate events.
 - Exclusion:
   - DS8: primary removal via the `analytics_exclude` component (`nvdsroiexclude` by default) when `analytics.exclude.enable: true` in `config/infer.yaml`. `_ExcludePruneProcessor.handle_frame_ds8` logs would-be removals as a safety net (DS8 object_items are read-only).
-  - DS7: `_ExcludePruneProcessor.handle_frame` removes objects via `nvds_remove_obj_meta_from_frame` / `obj_meta_list`.
+  - legacy stack: `_ExcludePruneProcessor.handle_frame` removes objects via `nvds_remove_obj_meta_from_frame` / `obj_meta_list`.
 
 ## 5. Depth Gating (BufferOperator)
 
@@ -150,7 +150,7 @@ Upstream MapAnything supports providing `camera_poses` (and/or calibration/depth
 For up-to-date checklists see `plans/DS8/ds8_master_work_orders.md` and individual `ds8_migration_checklist_*.md` files, but in broad strokes:
 
 - Phases 0–2: implemented (stack split, DS8 graph, `infer.yaml`).
-- Phase 3: hooks implemented; DS8 vs DS7 metadata compatibility in place; on-device validation mostly done (tracking/occupancy/BEV telemetry paths use DS8 batch metadata; exclusion pruning is DS8-read-only with ROI filtering handled in analytics).
+- Phase 3: hooks implemented; DS8 vs legacy stack metadata compatibility in place; on-device validation mostly done (tracking/occupancy/BEV telemetry paths use DS8 batch metadata; exclusion pruning is DS8-read-only with ROI filtering handled in analytics).
 - Phase 4: analytics REST aligned and depth REST functional on DS8 host; ROI models map to DS8 analytics YAML. Full live ROI-behavior validation in the running DS8 pipeline is still on the checklist.
 - Phase 5: Flow/gating implemented:
   - Depth gating uses `DepthGateOperator(BufferOperator)` attached at the MapAnything node when supported by the DS8 build, with logical gating always available.
@@ -158,9 +158,9 @@ For up-to-date checklists see `plans/DS8/ds8_master_work_orders.md` and individu
   - Depth tensors from MapAnything flow into `MapAnythingProcessor`, which stores snapshots under `data/depth/...`, updates depth FPS, and publishes `depth_result` WS messages during enabled windows.
 - Phase 6: DS8 runtime + WS/REST run end-to-end on GPU host:
   - `noesis/ds8_runtime.py` builds the DS8 pipeline, attaches hooks, starts WebSocket + REST, and wires depth/analytics APIs.
-  - WebSocketServer emits stats, tracking, depth_result, BEV messages, and WebRTC signaling for mosaic. UI validation still required for full DS7 parity (Phase 7).
-- Phase 7: full DS7 vs DS8 parity runs still to be executed and documented.
-- Phase 8: DS7/adapter decommission decisions not yet made.
+  - WebSocketServer emits stats, tracking, depth_result, BEV messages, and WebRTC signaling for mosaic. UI validation still required for full legacy stack parity (Phase 7).
+- Phase 7: full legacy stack vs DS8 parity runs still to be executed and documented.
+- Phase 8: legacy stack/adapter decommission decisions not yet made.
 
 ## 9. How New Planner/Debugger Agents Should Use This
 

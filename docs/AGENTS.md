@@ -34,8 +34,7 @@ right doc. Read this before touching code.
 - Full migration work orders, checklists, and dated iteration notes are mirrored
   under `docs/history/ds8/` (copied from `plans/DS8/`). Use these for provenance
   and “why was this choice made?” trails.
-- Pre-DS8 material is archived under `docs/history/ds7/` (legacy telemetry,
-  occupancy/depth publishing, and older pipeline docs).
+- Older stack material is archived under `docs/history/`.
 
 ## When Writing New Docs
 - Keep normative guidance in `docs/` (live), push long-form logs to
@@ -48,6 +47,10 @@ right doc. Read this before touching code.
   fixes and purely cosmetic diagram tweaks.
 - Only update per-doc “Status: validated as of …” headers after re-validating the
   doc against live code/configs.
+- Verify that command snippets and referenced local file paths still exist in this
+  workspace before finalizing edits.
+- After AGENTS/docs changes, run `./scripts/check_agents_docs_consistency.py` and
+  resolve any failures before closing the task.
 
 ## If You’re Stuck
 - Confirm you are working on the DS8 canonical stack (not deprecated paths).

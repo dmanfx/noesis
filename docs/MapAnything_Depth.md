@@ -1,7 +1,7 @@
 # MapAnything Depth (DS8)
 _Status: validated against code on 2026-02-02._
 
-DS8 runs MapAnything as a **full-frame SGIE** inside the Service Maker pipeline. The legacy microservice/adapter flow has been archived to `docs/history/ds7/MapAnything_Depth_legacy.md`.
+DS8 runs MapAnything as a **full-frame SGIE** inside the Service Maker pipeline. The older microservice/adapter flow is archived under `docs/history/`.
 
 ## Tooling
 - **Heatmap viewer (3‑stream):** `docs/MapAnything_Heatmap_Viewer.md` (script: `scripts/ma_heatmap_multiuri.py`)

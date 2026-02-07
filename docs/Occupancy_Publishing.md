@@ -1,7 +1,7 @@
 # Occupancy Publishing (DS8)
 _Status: validated against code on 2026-02-02._
 
-DS8 publishes occupancy primarily over WebSocket tracking telemetry. The legacy MQTT/Influx pipeline described for DS7 has been archived to `docs/history/ds7/Occupancy_Publishing_ds7.md`.
+DS8 publishes occupancy primarily over WebSocket tracking telemetry. The earlier MQTT/Influx pipeline is archived under `docs/history/`.
 
 ## What DS8 Emits by Default
 - Source: `_AnalyticsTelemetryProcessor` (`noesis/pipelines/hooks.py`).
@@ -21,4 +21,3 @@ DS8 publishes occupancy primarily over WebSocket tracking telemetry. The legacy 
 ## Related Telemetry
 - WebSocket tracking schema: `docs/DS8_api_contracts_ws.md` (section: Tracking Telemetry)
 - Stats payload occupancy snapshot: `docs/Telemetry_Schema.md`
-

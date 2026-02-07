@@ -13,10 +13,11 @@ This directory tree is the canonical DeepStream 8 / Service Maker / Flow impleme
 - Use this tree for **DS8-only** work:
   - `noesis/ds8_runtime.py` – DS8 runtime harness.
   - `noesis/pipelines/*` – DS8 pipeline graph and metadata hooks.
-  - `noesis/server/*` – DS8 REST APIs (depth, analytics).
+  - `noesis/server/*` – DS8 REST APIs (depth, analytics, ReID aliases).
   - `noesis/telemetry/*` – BEV, depth, tracking publishers.
   - `noesis/metadata/*` – intrinsics and depth schemas.
-  - `noesis/config/*` – DS8 config adapters.
+  - `noesis/diagnostics/*` – DS8 forensics and telemetry diagnostics.
+  - Related adapter modules live at repo root under `adapters/*` (not under `noesis/`).
 
 ## DS8-Specific Rules
 
@@ -46,3 +47,11 @@ This directory tree is the canonical DeepStream 8 / Service Maker / Flow impleme
 6. **Logging and robustness**
    - Favor clear, actionable log messages when DS8 operations fail (e.g., pipeline build errors, hook attachment errors).
    - Handle missing DS8 libs gracefully in tests, but in production paths prefer failing fast over silently degrading into deprecated runtime behavior.
+
+7. **Native metadata extension validation**
+   - If changes affect V3DT or pose metadata extraction paths, rebuild and validate native bridges (`noesis_v3dt_meta_ext`, `noesis_pose_meta_ext`) before considering work complete.
+   - Use focused smoke checks (for example `scripts/sv3dt_meta_smoke_test.py`) after extension-related changes.
+
+8. **Portable paths only**
+   - Do not introduce new hardcoded absolute machine-local paths in DS8 runtime code.
+   - Use repo-relative resolution (`REPO_ROOT`) or explicit config/env inputs.

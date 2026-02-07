@@ -70,4 +70,4 @@ Memory caps:
 
 - Service Maker Python does not expose `obj_user_meta_list`; pose extraction **must**
   go through the native bridge.
-- This integration is DS8-only; do not add DS7 pad probes or CPU branches.
+- This integration is DS8-only; do not add legacy pad-probe or CPU fallback branches.

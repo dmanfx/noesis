@@ -17,6 +17,7 @@ When you (the agent) work in this repo:
    - Do not silently route DS8 failures through removed pre-DS8 runtime paths. If DS8 code cannot be made to work, fail loudly in logs/docs and stop.
    - Only modify deprecated pre-DS8 artifacts if the user explicitly asks for those changes.
    - Prefer implementing new functionality in the DS8 stack under `noesis/`.
+   - Launch and validate runtime behavior through `noesis/ds8_runtime.py` for active work.
 
 2. **Follow the DS8 plan and checklists**
    - Before changing DS8-related code, read:
@@ -44,7 +45,7 @@ When you (the agent) work in this repo:
    - Prefer small, focused validations (e.g., “does analytics ROI reload work?”) rather than only end-to-end tests.
    - For interface/contract changes, also consult:
      - `docs/DS8_api_contracts_ws.md` (WebSocket message contracts).
-     - `docs/DS8_api_contracts_rest.md` (REST contracts).
+     - `docs/DS8_api_contracts_rest.md` (REST contracts, including ReID alias endpoints from `noesis/server/reid_api.py`).
      - `docs/DS8_metadata_contracts.md` (metadata/user-meta schemas).
 
 6. **Progress documentation**
@@ -56,5 +57,16 @@ When you (the agent) work in this repo:
 
 7. **Design decisions**
    - When you make a non-trivial design choice for DS8 (API shape, data schema, etc.), capture it in `plans/DS8/ds8_design_decisions.md` with a short rationale and any doc references you relied on.
+
+8. **Docs and instruction hygiene**
+   - When editing docs, AGENTS files, plans, or prompts, verify any referenced local file paths and commands still exist in this workspace before finalizing.
+   - After changing `AGENTS.md` or files under `docs/`, run `./scripts/check_agents_docs_consistency.py` and fix failures before closing the task.
+
+9. **Native extension discipline**
+   - If you change V3DT/pose metadata plumbing or contracts (`noesis/pipelines/hooks.py`, `noesis/metadata/*`, `native/*`), rebuild the relevant native extension(s) and run focused smoke tests (for example `scripts/sv3dt_meta_smoke_test.py`) to confirm metadata extraction still works.
+
+10. **Portable path requirement**
+   - Do not add new hardcoded machine-local absolute paths (for example `/home/...`) in runtime code, docs, or scripts.
+   - Prefer `REPO_ROOT`, config paths, or environment variables for path resolution.
 
 These rules are meant to make your work predictable and auditable for future Codex runs.

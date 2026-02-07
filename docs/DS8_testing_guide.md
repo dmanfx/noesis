@@ -1,24 +1,9 @@
 # DS8 Testing & Validation Guide
 _Status: current as of 2026-02-02._
 
-This guide describes how to validate DS8 changes and compare DS8 behavior against the existing DS7 pipeline.
+This guide describes how to validate DS8 changes using the current runtime and contracts.
 
 ## 1. Quick Sanity Checks
-
-### DS7 (legacy) sanity
-
-Use the existing entrypoint (as documented elsewhere) to ensure the DS7 baseline works before comparing:
-
-```bash
-python3 main.py  # or project-specific command
-```
-
-Verify:
-
-- Mosaic video appears in the UI.
-- Tracking, BEV, depth, and occupancy behave as expected.
-
-When running DS7, always use the **real RTSP streams already configured** in your INI/YAML files (do not invent URIs or depend on ad-hoc environment variables).
 
 ### DS8 runtime smoke test
 
@@ -59,7 +44,6 @@ Check logs for:
 **Important:** All DS8 tests should also use the real RTSP streams defined in configuration files:
 
 - Prefer `config/infer.yaml` `sources` entries for DS8.
-- If the legacy DS7 multi-URI INI (`DS_MULTIURISRC_CONFIG`) is still in use during migration, keep its URIs in sync with DS8 configs.
 
 Do **not** rely on environment variables to specify URIs when adding or testing DS8 features; instead, update the appropriate config file so behavior is fully driven by configuration.
 
@@ -109,7 +93,7 @@ Check for:
 
 ### Depth drawer RPC gates (no log grepping)
 
-These scripts exercise the DS7-compatible WS RPC contracts used by `DepthDrawer` in `oai2-fe/`:
+These scripts exercise the WS RPC contracts used by `DepthDrawer` in `oai2-fe/`:
 
 ```bash
 python3 scripts/ma_depth_rpc_smoke_test.py
@@ -128,7 +112,8 @@ This checks that `bbox3d` appears in tracking telemetry when SV3DT is enabled:
 ```bash
 python3 scripts/sv3dt_meta_smoke_test.py
 # Live RTSP validation:
-# python3 scripts/sv3dt_meta_smoke_test.py --pipeline-config config/infer_v3dt_sv3dt.yaml
+# python3 scripts/sv3dt_meta_smoke_test.py --pipeline-config config/infer_v3dt_baseline.yaml
+# then run DS8 with --tracking-mode v3dt and live RTSP sources in that config
 ```
 
 Expected:
@@ -136,8 +121,7 @@ Expected:
 - `[PASS]` after 3D tracking is active (BodyPose3DNet assets + SV3DT tracker config required).
   - Tracking mode must be `v3dt` (the smoke test defaults `NOESIS_TRACKING_MODE=v3dt`).
   - The script defaults to `config/infer_v3dt_sample.yaml` (offline Retail02 clip) when present to avoid depending on live camera occupancy.
-  - When testing live RTSP (`config/infer_v3dt_sv3dt.yaml`), ensure a person is visible; otherwise the script may report “no tracking messages observed”.
-  - `config/infer_v3dt.yaml` is currently V3DT-safe (SV3DT disabled) due to an upstream DeepStream 8.0 nvtracker RAM leak; see `plans/DS8/v3dt/oom_killed_infer_v3dt_debug.md`.
+  - When testing live RTSP (`config/infer_v3dt_baseline.yaml` with real sources), ensure a person is visible; otherwise the script may report “no tracking messages observed”.
 
 ### V3DT Forensics Toolkit (Snapshot + Telemetry + Panel)
 
@@ -223,16 +207,16 @@ Default behavior enables `nvmultistreamtiler square-seq-grid=true` to preserve p
 - Disable square tiling: `NOESIS_MOSAIC_TILER_SQUARE_SEQ_GRID=0`
 - Explicit layout: `NOESIS_MOSAIC_TILER_COLUMNS=<N>` and/or `NOESIS_MOSAIC_TILER_ROWS=<N>`
 
-## 4. DS7 vs DS8 Parity Runs
+## 4. Cross-Run Consistency Checks
 
-For a curated set of test streams, run DS7 and DS8 separately and capture telemetry for offline comparison.
+For a curated set of test streams, run repeated DS8 sessions and capture telemetry for offline comparison.
 
 ### Suggested approach
 
-1. Run DS7 for N seconds on a fixed set of streams and record:
+1. Run DS8 session A for N seconds on a fixed set of streams and record:
    - WebSocket telemetry (e.g., via a client that logs `stats`, `tracking`, `depth_result`, `bev-frame`).
    - Any key logs about analytics and occupancy.
-2. Run DS8 on the same streams and record the same data.
+2. Run DS8 session B on the same streams and record the same data.
 3. Compare:
    - Object counts and classes per frame (tolerate small differences if model configs differ, but investigate large discrepancies).
    - Zone occupancy over time.

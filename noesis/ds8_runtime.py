@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import configparser
+import ctypes
 import inspect
 import json
 import logging
@@ -70,6 +71,7 @@ except Exception:
 _PGIE_PROFILES = ("yolo11_seg", "rfdetr_seg", "yolo26_seg")
 _ENV_TRUE = ("1", "true", "yes", "y", "on")
 _TRACKING_MODES = ("baseline", "v3dt")
+_RFDETR_TRT_PLUGIN_LOADED = False
 
 
 def _deep_merge_dict(base: Any, overlay: Any) -> Any:
@@ -283,6 +285,49 @@ def _validate_dewarper_intrinsics_sync(
     return ok
 
 
+def _resolve_rfdetr_assets(size: str) -> Dict[str, Any]:
+    size_norm = str(size or "").strip().lower()
+    if size_norm not in ("n", "s", "m"):
+        raise SystemExit(f"[FATAL] RF-DETR size must be one of n/s/m (got: {size})")
+
+    model_info = {
+        "n": {"model": "rfdetr-seg-nano", "resolution": 312, "max_detections": 30},
+        "s": {"model": "rfdetr-seg-small", "resolution": 384, "max_detections": 50},
+        "m": {"model": "rfdetr-seg-medium", "resolution": 432, "max_detections": 100},
+    }[size_norm]
+    resolution = int(model_info["resolution"])
+    return {
+        "model": model_info["model"],
+        "resolution": resolution,
+        "max_detections": int(model_info["max_detections"]),
+        "template": (REPO_ROOT / "pipelines" / "config_infer_primary_rfdetr_seg.template.ini").resolve(),
+        "preproc": (REPO_ROOT / "pipelines" / f"config_preproc_rfdetr_{resolution}.ini").resolve(),
+        "weights": (REPO_ROOT / "models" / f"rf-detr-seg-{size_norm}.pt").resolve(),
+        "onnx": (REPO_ROOT / "models" / "onnx" / f"rfdetr_seg_{size_norm}_{resolution}.onnx").resolve(),
+        "engine": (REPO_ROOT / "models" / "engines" / f"rfdetr_seg_{size_norm}_{resolution}_b3_fp16.engine").resolve(),
+        "output": (REPO_ROOT / "build" / f"config_infer_primary_rfdetr_seg_{size_norm}.ini").resolve(),
+    }
+
+
+def _materialize_rfdetr_pgie_ini(size: str, logger: logging.Logger) -> Path:
+    assets = _resolve_rfdetr_assets(size)
+    template_path = assets["template"]
+    if not template_path.exists():
+        raise SystemExit(f"[FATAL] RF-DETR PGIE template missing: {template_path}")
+    preproc_path = assets["preproc"]
+    if not preproc_path.exists():
+        raise SystemExit(f"[FATAL] RF-DETR preprocess config missing: {preproc_path}")
+    out_path = assets["output"]
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    text = template_path.read_text(encoding="utf-8")
+    text = text.replace("@ONNX_PATH@", str(assets["onnx"]))
+    text = text.replace("@ENGINE_PATH@", str(assets["engine"]))
+    text = text.replace("@TOPK@", str(assets["max_detections"]))
+    out_path.write_text(text, encoding="utf-8")
+    logger.info("RF-DETR PGIE config materialized: %s", out_path)
+    return out_path
+
+
 def _resolve_yolo26_assets(size: str) -> Dict[str, Path]:
     size_norm = str(size or "").strip().lower()
     if size_norm not in ("n", "s", "m"):
@@ -314,11 +359,50 @@ def _materialize_yolo26_pgie_ini(size: str, logger: logging.Logger) -> Path:
     return out_path
 
 
+def _load_rfdetr_trt_plugin_library(yaml_path: Path, logger: logging.Logger) -> None:
+    global _RFDETR_TRT_PLUGIN_LOADED
+    if _RFDETR_TRT_PLUGIN_LOADED:
+        return
+
+    env_path = str(os.environ.get("NOESIS_RFDETR_TRT_PLUGIN_LIB", "") or "").strip()
+    if env_path:
+        lib_path = _resolve_pipeline_cfg_path(yaml_path, env_path)
+    else:
+        lib_path = (
+            REPO_ROOT
+            / "external"
+            / "DeepStream-Yolo-Seg"
+            / "nvdsinfer_custom_impl_Yolo_seg"
+            / "libnvdsinfer_custom_impl_Yolo_seg.so"
+        ).resolve()
+
+    if not lib_path.exists():
+        raise SystemExit(
+            "[FATAL] RF-DETR TensorRT plugin library missing.\n"
+            f"resolved: {lib_path}\n"
+            "Set NOESIS_RFDETR_TRT_PLUGIN_LIB to override, or build with:\n"
+            "  make -C external/DeepStream-Yolo-Seg/nvdsinfer_custom_impl_Yolo_seg\n"
+        )
+
+    try:
+        ctypes.CDLL(str(lib_path), mode=getattr(ctypes, "RTLD_GLOBAL", 0))
+    except Exception as exc:
+        raise SystemExit(
+            "[FATAL] Failed to load RF-DETR TensorRT plugin library.\n"
+            f"resolved: {lib_path}\n"
+            f"error: {exc}"
+        ) from exc
+
+    _RFDETR_TRT_PLUGIN_LOADED = True
+    logger.info("RF-DETR TensorRT plugin library loaded: %s", lib_path)
+
+
 def _preflight_pgie_profile(profile: str, pipeline_cfg: Dict[str, Any], yaml_path: Path, logger: logging.Logger) -> None:
     if profile not in ("rfdetr_seg", "yolo26_seg"):
         return
 
     if profile == "rfdetr_seg":
+        _load_rfdetr_trt_plugin_library(yaml_path, logger)
         preprocess_cfg = pipeline_cfg.get("preprocess") if isinstance(pipeline_cfg, dict) else None
         preprocess_path_raw = (preprocess_cfg or {}).get("config-file") if isinstance(preprocess_cfg, dict) else None
         preprocess_path = _resolve_pipeline_cfg_path(yaml_path, str(preprocess_path_raw or ""))
@@ -432,15 +516,21 @@ def _materialize_effective_pipeline_yaml(
 
     overlay: Dict[str, Any] = {}
     if profile == "rfdetr_seg":
+        if not pgie_size:
+            raise SystemExit("[FATAL] RF-DETR profile requires --size (n/s/m)")
+        size_norm = str(pgie_size).strip().lower()
+        assets = _resolve_rfdetr_assets(size_norm)
+        pgie_ini = _materialize_rfdetr_pgie_ini(size_norm, logger)
         overlay = {
-            "preprocess": {"config-file": "pipelines/config_preproc_rfdetr_432.ini"},
+            "preprocess": {"config-file": str(assets["preproc"])},
             "models": {
                 "pgie": {
-                    "config-file-path": "pipelines/config_infer_primary_rfdetr_seg.ini",
-                    "engine": str((REPO_ROOT / "models" / "engines" / "rfdetr_seg_preview_432_b3_fp16.engine").resolve()),
+                    "config-file-path": str(pgie_ini),
+                    "engine": str(assets["engine"]),
                 }
             },
         }
+        logger.info("RF-DETR PGIE size: %s", size_norm)
     if profile == "yolo26_seg":
         if not pgie_size:
             raise SystemExit("[FATAL] YOLO26 profile requires --size (n/s/m)")
@@ -572,7 +662,7 @@ def _parse_args() -> argparse.Namespace:
         "--size",
         choices=("n", "s", "m"),
         default=None,
-        help="YOLO26 model size (n/s/m). Default: m when --pgie-profile yolo26_seg is used.",
+        help="Model size (n/s/m). Used by --pgie-profile yolo26_seg or rfdetr_seg. Default: m.",
     )
     parser.add_argument(
         "--cameras-config",
@@ -2585,9 +2675,9 @@ def main() -> int:
     runtime_state: Dict[str, Any] = {"pipeline_failed": False}
     pgie_size: Optional[str] = None
 
-    if args.size is not None and str(args.pgie_profile) != "yolo26_seg":
-        raise SystemExit("[FATAL] --size is only valid with --pgie-profile yolo26_seg")
-    if str(args.pgie_profile) == "yolo26_seg":
+    if args.size is not None and str(args.pgie_profile) not in ("yolo26_seg", "rfdetr_seg"):
+        raise SystemExit("[FATAL] --size is only valid with --pgie-profile yolo26_seg or rfdetr_seg")
+    if str(args.pgie_profile) in ("yolo26_seg", "rfdetr_seg"):
         pgie_size = (args.size or "m").strip().lower()
 
     # Install SIGINT/SIGTERM handling early (before DS/GStreamer init), because

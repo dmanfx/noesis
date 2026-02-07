@@ -15,7 +15,7 @@ Canonical runtime path:
   - `noesis/telemetry/*` – depth, tracking, BEV publishers.
   - `noesis/metadata/*` – intrinsics and depth result schemas.
 
-Deprecated pre-DS8 runtime paths have been decommissioned (the root `main.py` is a fail-fast stub).
+Deprecated pre-DS8 runtime paths have been decommissioned.
 All runtime work should target the DS8 stack unless the user explicitly requests maintenance of deprecated artifacts.
 
 Current defaults/baselines are summarized in `DS8_Baselines.md`.

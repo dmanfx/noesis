@@ -110,10 +110,10 @@ This task list is designed for the coding agent to implement the integration sys
 
 5. **Add run.sh and integrate startup** (dep: 4, 2h)
    - Write run.sh: #!/bin/bash; uvicorn server:app --host $HOST --port $PORT
-   - In main.py: subprocess.Popen(['bash', 'services/mapanything_svc/run.sh']) on start if not running.
-   - Test: Run main.py; ps aux | grep uvicorn; curl endpoints OK.
+   - In `noesis/ds8_runtime.py`: start `services/mapanything_svc/run.sh` on boot if not running.
+   - Test: Run `python noesis/ds8_runtime.py`; `ps aux | grep uvicorn`; curl endpoints OK.
    **As-built:**
-   - Created launch script (now using `python3 -m uvicorn`) and wired auto-spawn in `main.py` with health polling.
+   - Created launch script (now using `python3 -m uvicorn`) and wired auto-spawn in `noesis/ds8_runtime.py` with health polling.
    - Service starts automatically with main application.
 
 6. **Perf tune** (dep: 5, integrated)
@@ -135,7 +135,7 @@ This task list is designed for the coding agent to implement the integration sys
    - Full get_mono_depth with requests post (flatten img.ravel().tolist()).
    - Align shapes with cv2.resize (bilinear for depth/conf, nearest mask).
    - Stub get_multi_depth.
-   - Integrate to track.py or main: in process_frame, if time % (1/mono_freq)==0, depth,conf,mask = get_mono_depth(cam_id, rgb); store.
+   - Integrate to `track.py` or DS8 runtime: in process_frame, if time % (1/mono_freq)==0, depth,conf,mask = get_mono_depth(cam_id, rgb); store.
    - Test: Call with dummy; mock resp; assert returns arrays.
    **As-built:**
    - Implemented FastAPI client with exponential backoff, Zarr persistence, depth summary stats, and optional latest-depth loader for RPCs.

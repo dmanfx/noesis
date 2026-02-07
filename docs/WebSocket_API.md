@@ -1,7 +1,7 @@
 # WebSocket API (DS8)
 _Status: validated against code on 2026-02-02._
 
-The canonical DS8 WebSocket contracts are maintained in `docs/DS8_api_contracts_ws.md`. This page provides the quick operator view and pointers to the code paths that implement each message. The DS7-era reference has been archived to `docs/history/ds7/WebSocket_API_ds7.md`.
+The canonical DS8 WebSocket contracts are maintained in `docs/DS8_api_contracts_ws.md`. This page provides the quick operator view and pointers to the code paths that implement each message. Older references are archived under `docs/history/`.
 
 ## Server Basics
 - Host/port: configurable via `NOESIS_WS_HOST` / `NOESIS_WS_PORT` (defaults `0.0.0.0:6008`).
@@ -24,4 +24,3 @@ For full field-level schemas, see `DS8_api_contracts_ws.md` and `DS8_metadata_co
 - Runtime wiring: `noesis/ds8_runtime.py` (registers stats/depth/floorplan providers and WebRTC gateway)
 - Tracking/depth publishers: `noesis/telemetry/publishers.py`
 - BEV rendering: `noesis/telemetry/bev.py`
-

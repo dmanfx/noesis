@@ -15,5 +15,4 @@ DS8 does **not** attach per-object depth user meta. Depth is produced by the Map
 
 Calibration is distributed via the **calibration-bundle** WebSocket message and cached on the storage manager so depth→world projections stay consistent.
 
-The DS7 per-object `NOESIS.MDE` user-meta format has been archived to `docs/history/ds7/depth_metadata_ds7.md` for reference.
-
+The older per-object `NOESIS.MDE` user-meta format is archived under `docs/history/` for reference.

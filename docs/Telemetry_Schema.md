@@ -1,7 +1,7 @@
 # Telemetry Schema (DS8)
 _Status: validated against code on 2026-02-02._
 
-Canonical WebSocket payloads live in `docs/DS8_api_contracts_ws.md`. This page summarizes **where** telemetry is produced in the DS8 stack and the exact field sets emitted today. The DS7 telemetry description has been archived to `docs/history/ds7/Telemetry_Schema_ds7.md`.
+Canonical WebSocket payloads live in `docs/DS8_api_contracts_ws.md`. This page summarizes **where** telemetry is produced in the DS8 stack and the exact field sets emitted today. Older telemetry descriptions are archived under `docs/history/`.
 
 ## Producers and Message Types
 
@@ -141,4 +141,3 @@ Published per MapAnything inference result via `DepthResult.to_dict()`:
 - Contracts and RPCs: `docs/DS8_api_contracts_ws.md`
 - Metadata shapes: `docs/DS8_metadata_contracts.md`
 - BEV rendering and smoothing: `docs/DS8_Baselines.md` (BEV section)
-

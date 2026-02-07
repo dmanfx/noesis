@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import sys
 from pathlib import Path
+import re
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -50,6 +51,11 @@ V3DT_REQUIRED_CALIBRATION_ARG = "--calibration config/archive/calibration_v3dt_b
 ARCHIVE_AGENTS_FILE = Path("docs/history/ds8/v3dt/AGENTS.md")
 ARCHIVE_MARKER = "## Archive status (read first)"
 
+BANNED_PATTERNS_IN_ACTIVE_DOCS = [
+    re.compile(r"\bds7\b", re.IGNORECASE),
+    re.compile(r"\bmain\.py\b", re.IGNORECASE),
+]
+
 
 def _read_text(path: Path) -> str:
     return (REPO_ROOT / path).read_text(encoding="utf-8")
@@ -94,6 +100,22 @@ def main() -> int:
             failures.append(
                 f"Missing archive marker '{ARCHIVE_MARKER}' in: {ARCHIVE_AGENTS_FILE}"
             )
+
+    docs_root = REPO_ROOT / "docs"
+    if docs_root.exists():
+        for path in sorted(docs_root.rglob("*.md")):
+            try:
+                rel = path.relative_to(REPO_ROOT)
+            except Exception:
+                rel = path
+            if str(rel).startswith("docs/history/"):
+                continue
+            text = path.read_text(encoding="utf-8")
+            for pattern in BANNED_PATTERNS_IN_ACTIVE_DOCS:
+                if pattern.search(text):
+                    failures.append(
+                        f"Banned reference '{pattern.pattern}' found in active doc: {rel}"
+                    )
 
     if failures:
         print("AGENTS/docs consistency check FAILED:")

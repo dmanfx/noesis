@@ -244,7 +244,6 @@ The system follows a **layered architecture** with clear separation between the 
 
 ```
 Noesis_Devel/
-├── main.py                          # Legacy entry point (redirects to ds8_runtime)
 ├── websocket_server.py              # WebSocket server implementation
 ├── config.py                        # Application configuration
 ├── requirements.txt                 # Python dependencies
@@ -318,7 +317,7 @@ Noesis_Devel/
 │   └── ds8_design_decisions.md
 │
 ├── tests/                           # Test files
-└── legacy/                          # Deprecated DS7 code
+└── legacy/                          # Deprecated archived code
 ```
 
 ### Naming Conventions
@@ -464,9 +463,6 @@ python noesis/ds8_runtime.py \
   --cameras-config config/cameras.yaml \
   --ws-port 6008 \
   --rest-port 8080
-
-# Or use the convenience entry point
-python main.py
 ```
 
 ### Frontend Development

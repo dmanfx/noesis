@@ -1,7 +1,7 @@
 # Depth Stack Flow (DS8)
 _Status: validated against code on 2026-02-02._
 
-The DS8 depth path is entirely on-GPU and driven by the MapAnything full-frame SGIE branch. The DS7 flowchart has been archived to `docs/history/ds7/DEPTH_STACK_FLOW_V2_ds7.md`.
+The DS8 depth path is entirely on-GPU and driven by the MapAnything full-frame SGIE branch. Earlier flowcharts are archived under `docs/history/`.
 
 ## High-Level Flow
 

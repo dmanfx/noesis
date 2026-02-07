@@ -44,11 +44,15 @@ you don’t have to sift through the historical work orders.
 ## Detector Profiles (PGIE)
 - **Default:** YOLO11-seg (instance masks), PGIE `unique-id=1`, person is
   `class_id=0`.
-- **Optional:** RF-DETR-seg preview (validated)
-  - Switch via `--pgie-profile rfdetr_seg` or `NOESIS_PGIE_PROFILE=rfdetr_seg`.
-  - Engine: `models/engines/rfdetr_seg_preview_432_b3_fp16.engine`
-  - Configs: `pipelines/config_infer_primary_rfdetr_seg.ini`,
-    `pipelines/config_preproc_rfdetr_432.ini`
+- **Optional:** RF-DETR-seg (n/s/m)
+  - Switch via `--pgie-profile rfdetr_seg` plus `--size n|s|m` (default `m`).
+  - Engines:
+    - `models/engines/rfdetr_seg_n_312_b3_fp16.engine`
+    - `models/engines/rfdetr_seg_s_384_b3_fp16.engine`
+    - `models/engines/rfdetr_seg_m_432_b3_fp16.engine`
+  - Configs: runtime materializes `build/config_infer_primary_rfdetr_seg_<size>.ini`
+    from `pipelines/config_infer_primary_rfdetr_seg.template.ini` and uses
+    `pipelines/config_preproc_rfdetr_{312|384|432}.ini`
   - Parser: `pipelines/nvdsinfer_rfdetr_seg/libnvdsinfer_rfdetr_seg.so`
   - Person remap: parser maps RF-DETR person class to DS `class_id=0`; keep
     PGIE `unique-id=1` so ReID/SGIE continue to hook correctly.

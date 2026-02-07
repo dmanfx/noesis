@@ -40,7 +40,7 @@ Environment/config notes:
 - Pipeline config path: `NOESIS_DS8_PIPELINE_CONFIG` (default `config/infer.yaml`).
 - Stub mode (tests/offline): set `NOESIS_DEPTH_API_FORCE_STUB=1` to bypass DS8 bindings while preserving the contract.
 
-Implementation note: the underlying `enable_depth(seconds)` function in `noesis.pipelines.ds8_pipeline` must control DS8 gating (e.g., a `BufferOperator` gate) and not DS7 valves.
+Implementation note: the underlying `enable_depth(seconds)` function in `noesis.pipelines.ds8_pipeline` must control DS8 gating (e.g., a `BufferOperator` gate) and not deprecated valve paths.
 
 ## 2. Analytics ROI API
 

@@ -14,7 +14,7 @@ and worklogs live in `docs/history/`.
 - **Codebase overview:** `CODEBASE_DESCRIPTION.md`
 - **V3DT forensics & calibration:** `DS8_v3dt_forensics.md`
 - **Depth / MapAnything:** `MapAnything_Depth.md`, `MapAnything_Heatmap_Viewer.md`, `DEPTH_STACK_FLOW_V2.md`, `depth_metadata.md`
-- **Legacy DS7 references:** see `history/ds7/` (archived)
+- **Archived references:** see `history/` (archived)
 
 ## Navigation by Topic
 - **Pipeline & flow:** `flow_diagram_high_level.md`,
@@ -30,7 +30,7 @@ and worklogs live in `docs/history/`.
 - Full DS8 migration work orders, checklists, and iteration logs are mirrored
   under `docs/history/ds8/` (copy of `plans/DS8/`). Use those for provenance;
   the docs here are the canonical current guidance.
-- Legacy DS7 docs live under `docs/history/ds7/`.
+- Additional historical material also lives under `docs/history/`.
 
 ## Maintenance
 - Keep live/reference guidance in `docs/`. Move dated logs or experiment notes to
@@ -47,9 +47,10 @@ and worklogs live in `docs/history/`.
 ## Doc changes (2026-02-06)
 - Standardized AGENTS policy precedence across repo/docs/plans scopes and clarified archive docs as non-normative (`AGENTS.md`, `docs/AGENTS.md`, `plans/AGENTS.md`, `noesis/AGENTS.md`, `docs/history/ds8/v3dt/AGENTS.md`).
 - Reduced V3DT AGENTS duplication by keeping only subtree-specific constraints and locking recovery commands to baseline calibration defaults (`plans/DS8/v3dt/AGENTS.md`, `plans/DS8/v3dt/README.md`).
+- Removed active-doc references to deprecated stack naming and deprecated runtime entrypoint terms; active docs are now DS8-only while historical material remains under `docs/history/`.
 
 ## Doc changes (2026-02-02)
 - Refreshed WebSocket contracts (`DS8_api_contracts_ws.md`) and telemetry summary (`Telemetry_Schema.md`) to match current DS8 runtime output.
-- Archived DS7-only references for WebSocket/telemetry/depth/occupancy and replaced with DS8 summaries (`WebSocket_API.md`, `depth_metadata.md`, `Occupancy_Publishing.md`, `MapAnything_Depth.md`).
+- Archived older references for WebSocket/telemetry/depth/occupancy and replaced with DS8 summaries (`WebSocket_API.md`, `depth_metadata.md`, `Occupancy_Publishing.md`, `MapAnything_Depth.md`).
 - Updated baselines and overview docs for optional NVJPEG mosaic branch, BEV frame defaults, and ReID/pose/MapAnything env toggles (`DS8_Baselines.md`, `DS8_README_FOR_AGENTS.md`, `CODEBASE_DESCRIPTION.md`).
 - Clarified exclusion/ROI handling and MapAnything engine details (`Static_ROI_Exclusion.md`, `DS8_roi_editor.md`, `DS8_MIGRATION_KNOWLEDGE_BASE.md`).

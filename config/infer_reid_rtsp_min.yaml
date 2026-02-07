@@ -79,7 +79,6 @@ sinks:
     sync: false
 
 mosaic_output:
-  jpeg_enabled: false
   rtsp_enabled: false
   rtsp_port: 8554
   rtsp_path: "mosaic"

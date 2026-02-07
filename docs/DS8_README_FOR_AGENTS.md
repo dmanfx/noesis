@@ -31,8 +31,8 @@ Key config files:
     - Models (PGIE, MapAnything SGIE).
     - Analytics (nvdsanalytics-style stages/streams config).
     - Sinks for mosaic and other outputs.
-    - Mosaic output (`mosaic_output`): JPEG branch is disabled by default; RTSP is
-      enabled and drives the WebRTC gateway when `mosaic_webrtc_enabled: true`.
+    - Mosaic output (`mosaic_output`): RTSP output drives the WebRTC gateway when
+      `mosaic_webrtc_enabled: true` (mosaic JPEG/WebSocket path removed in DS8).
       Default bitrate: 4000 kbps (H.264).
     - BEV settings (under `bev`):
       - `frame`: BEV coordinate frame (`camera_local` default; set `world` for world-frame BEV).

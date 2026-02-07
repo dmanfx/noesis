@@ -141,7 +141,6 @@ def _spawn_runtime(args: argparse.Namespace) -> subprocess.Popen:
     if args.enable_rest:
         cmd.append("--enable-rest")
     env = os.environ.copy()
-    env.setdefault("NOESIS_MOSAIC_JPEG_ENABLED", "0")
     env.setdefault("NOESIS_MOSAIC_RTSP_ENABLED", "0")
     env.setdefault("NOESIS_MOSAIC_WEBRTC_ENABLED", "0")
     env.setdefault("NOESIS_DEPTH_RPC_ENABLE_SECONDS", str(args.depth_enable_seconds))

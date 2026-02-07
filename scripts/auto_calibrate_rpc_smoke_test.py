@@ -42,7 +42,6 @@ def _spawn_runtime(args: argparse.Namespace) -> subprocess.Popen:
     else:
         cmd.append("--disable-rest")
     env = os.environ.copy()
-    env.setdefault("NOESIS_MOSAIC_JPEG_ENABLED", "0")
     env.setdefault("NOESIS_MOSAIC_RTSP_ENABLED", "0")
     env.setdefault("NOESIS_MOSAIC_WEBRTC_ENABLED", "0")
     env.setdefault("NOESIS_AUTOCALIB_ENABLE_SECONDS", "1")

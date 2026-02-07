@@ -596,9 +596,8 @@ def build_pipeline(yaml_path: str | Path) -> DS8Pipeline:
     }
     cfg["output"] = sanitised_output_cfg
 
-    # Parse mosaic_output config for JPEG/RTSP/WebRTC toggle support
+    # Parse mosaic_output config for RTSP/WebRTC toggle support
     mosaic_output_raw = cfg.get("mosaic_output") or {}
-    jpeg_enabled = bool(mosaic_output_raw.get("jpeg_enabled", False))
     rtsp_enabled = bool(mosaic_output_raw.get("rtsp_enabled", False))
     rtsp_port = int(mosaic_output_raw.get("rtsp_port", 8554) or 8554)
     rtsp_path = str(mosaic_output_raw.get("rtsp_path", "mosaic")).strip() or "mosaic"
@@ -612,9 +611,6 @@ def build_pipeline(yaml_path: str | Path) -> DS8Pipeline:
     rtsp_profile = int(mosaic_output_raw.get("rtsp_profile", mosaic_output_raw.get("profile", 0)) or 0)
 
     # Environment overrides so toggles actually affect the built graph
-    env_jpeg = os.environ.get("NOESIS_MOSAIC_JPEG_ENABLED")
-    if env_jpeg is not None:
-        jpeg_enabled = str(env_jpeg).strip().lower() in ("1", "true", "yes", "on")
     env_rtsp = os.environ.get("NOESIS_MOSAIC_RTSP_ENABLED")
     if env_rtsp is not None:
         rtsp_enabled = str(env_rtsp).strip().lower() in ("1", "true", "yes", "on")
@@ -630,7 +626,6 @@ def build_pipeline(yaml_path: str | Path) -> DS8Pipeline:
     encoder_name = encoder_cfg
 
     cfg["mosaic_output"] = {
-        "jpeg_enabled": jpeg_enabled,
         "rtsp_enabled": rtsp_enabled,
         "rtsp_port": rtsp_port,
         "rtsp_path": rtsp_path,
@@ -1220,20 +1215,13 @@ def build_pipeline(yaml_path: str | Path) -> DS8Pipeline:
         sinks = [{"name": "mosaic_sink", "type": "fakesink", "sync": False}]
 
     sink_names: List[str] = []
-    mosaic_sink_cfg: Optional[Dict[str, Any]] = None
-    other_sinks: List[Dict[str, Any]] = []
-    for sink_cfg in sinks:
-        cfg_copy = dict(sink_cfg)
-        name = cfg_copy.get("name", "")
-        if str(name) == "mosaic_sink":
-            mosaic_sink_cfg = cfg_copy
-        else:
-            other_sinks.append(cfg_copy)
-
-    # Build non-mosaic sinks directly off the sink tee.
-    for idx, sink_cfg in enumerate(other_sinks):
+    for idx, sink_cfg in enumerate(sinks):
         sink_props = dict(sink_cfg)
         sink_name = sink_props.pop("name", f"sink_{idx}")
+        if str(sink_name) == "mosaic_sink":
+            # Keep mosaic sink as a semantic placeholder; RTSP/WebRTC is the
+            # canonical mosaic output path.
+            continue
         element = sink_props.pop("type", "fakesink")
         sink_names.append(sink_name)
         component = Component(
@@ -1246,85 +1234,6 @@ def build_pipeline(yaml_path: str | Path) -> DS8Pipeline:
         sink_tee.downstream.append(component.name)
         _safe_add(ds_pipeline, component, pipeline.errors)
         _apply_component_config(ds_pipeline, component, pipeline.errors)
-
-    # Build mosaic branch with GPU convert + JPEG encode before the sink.
-    # Only create JPEG branch if jpeg_enabled is True
-    mosaic_branch = {}
-    if mosaic_sink_cfg is not None and jpeg_enabled:
-        sink_props = dict(mosaic_sink_cfg)
-        sink_props.pop("name", None)
-        sink_props.pop("type", None)
-        appsink_props = {
-            "emit-signals": True,
-            "sync": False,
-            "max-buffers": 1,
-            "drop": True,
-        }
-        appsink_props.update(sink_props)
-        mosaic_convert = Component(
-            name="mosaic_convert",
-            element="nvvideoconvert",
-            config={
-                "gpu-id": streammux_cfg.get("gpu-id", 0),
-                # Use default memory type to allow CPU-compatible surfaces for nvjpegenc.
-                "nvbuf-memory-type": 0,
-            },
-            downstream=[],
-        )
-        mosaic_enc = Component(
-            name="mosaic_enc",
-            element="nvjpegenc",
-            config={"quality": jpeg_quality},
-            downstream=[],
-        )
-        mosaic_tee = Component(
-            name="mosaic_tee",
-            element="tee",
-            config={},
-            downstream=[],
-        )
-        mosaic_sink_queue = Component(
-            name="mosaic_sink_queue",
-            element="queue",
-            config={
-                "leaky": 2,  # drop oldest when full
-                "max-size-buffers": 1,
-                "max-size-bytes": 0,
-                "max-size-time": 0,
-            },
-            downstream=[],
-        )
-        mosaic_sink = Component(
-            name="mosaic_sink",
-            element="fakesink",   # keep placeholder but do not use it
-            config={"sync": False},
-            downstream=[],
-        )
-        mosaic_appsink = Component(
-            name="mosaic_appsink",
-            element="appsink",
-            config=appsink_props,
-            downstream=[],
-        )
-
-        mosaic_branch = {
-            "convert": mosaic_convert,
-            "enc": mosaic_enc,
-            "tee": mosaic_tee,
-            "queue": mosaic_sink_queue,
-            "appsink": mosaic_appsink,
-        }
-        for comp in mosaic_branch.values():
-            pipeline.components[comp.name] = comp
-            _safe_add(ds_pipeline, comp, pipeline.errors)
-            _apply_component_config(ds_pipeline, comp, pipeline.errors)
-        pipeline.components[mosaic_sink.name] = mosaic_sink
-        _safe_add(ds_pipeline, mosaic_sink, pipeline.errors)
-        _apply_component_config(ds_pipeline, mosaic_sink, pipeline.errors)
-        sink_tee.downstream.append(mosaic_convert.name)
-        mosaic_tee.downstream = [mosaic_sink_queue.name]
-
-        sink_names.append(mosaic_appsink.name)
 
     # Build RTSP branch if rtsp_enabled is True
     # This branch taps raw video surfaces from sink_tee, encodes to H.264, and outputs via RTSP
@@ -1438,14 +1347,6 @@ def build_pipeline(yaml_path: str | Path) -> DS8Pipeline:
 
     _link(tiler.name, osd.name)
     _link(osd.name, sink_tee.name)
-    if mosaic_branch:
-        _link(sink_tee.name, mosaic_branch["convert"].name)
-        _link(mosaic_branch["convert"].name, mosaic_branch["enc"].name)
-        _link(mosaic_branch["enc"].name, mosaic_branch["tee"].name)
-        _link(mosaic_branch["tee"].name, mosaic_branch["queue"].name)
-
-        # Link queue → mosaic_appsink (dedicated listener branch)
-        _link(mosaic_branch["queue"].name, mosaic_branch["appsink"].name)
 
     # Link RTSP branch: sink_tee → rtsp_queue → rtsp_vconv → rtsp_out
     # (nvrtspoutsinkbin handles encoding and RTP payloading internally)
@@ -1459,8 +1360,6 @@ def build_pipeline(yaml_path: str | Path) -> DS8Pipeline:
         _link(rtsp_branch["vconv"].name, rtsp_branch["out"].name)
 
     for sink_name in sink_names:
-        if mosaic_branch and sink_name == "mosaic_appsink":
-            continue
         _link(sink_tee.name, sink_name)
 
     _attach_depth_gate(pipeline)

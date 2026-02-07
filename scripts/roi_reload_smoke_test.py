@@ -34,7 +34,6 @@ def _spawn_runtime(args: argparse.Namespace) -> subprocess.Popen:
         "0",
     ]
     env = os.environ.copy()
-    env.setdefault("NOESIS_MOSAIC_JPEG_ENABLED", "0")
     env.setdefault("NOESIS_MOSAIC_RTSP_ENABLED", "0")
     env.setdefault("NOESIS_MOSAIC_WEBRTC_ENABLED", "0")
     proc = subprocess.Popen(cmd, env=env)

@@ -100,22 +100,21 @@ analytics:
 
 sinks:
   - name: mosaic_sink
-    type: fakesink  # JPEG mosaic is tapped at mosaic_enc by MosaicForwardOperator; sink is a drop target.
+    type: fakesink  # Placeholder reserved for Flow retrievers (not used for mosaic video; mosaic is RTSP→WebRTC).
     sync: false
   - name: bev_sink
     type: fakesink
     sync: false  # Placeholder for future BEV retrieval; current BEV path uses telemetry hooks, not Flow/appsinks.
 
-# DS8 frame output (GPU JPEG over WebSocket via MosaicForwardOperator)
+# Legacy frame output stanza (not used in tiled DS8 mode; mosaic video is RTSP→WebRTC).
 output:
-  enable_frames: false  # Tiled mode; frames are delivered as a JPEG mosaic from mosaic_enc over WebSocket.
+  enable_frames: false  # No per-camera JPEG-over-WS frame output in DS8 tiled mode.
   codec: jpeg
   jpeg_quality: 85
   overlays: false
 
-# Mosaic output configuration: parallel JPEG, RTSP, and WebRTC paths
+# Mosaic output configuration: RTSP and WebRTC paths
 mosaic_output:
-  jpeg_enabled: false        # NVJPEG/appsink mosaic is deprecated; keep off unless explicitly enabled
   rtsp_enabled: true         # Enable RTSP mosaic output (required for WebRTC gateway)
   rtsp_port: 8554            # RTSP server port (unused when rtsp_enabled is false)
   rtsp_path: "mosaic"        # RTSP stream path (url: rtsp://host:port/path)

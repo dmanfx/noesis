@@ -66,15 +66,12 @@ const buildMosaicCameraIdToSlotKey = (layout: MosaicLayout | null): Record<strin
 function Dashboard() {
   const { publish } = useTelemetry();
 
-  // Stream image blobs
-  const [streams, setStreams] = useState<{ [k: string]: Blob | null }>({ 'living-room': null, 'kitchen': null, 'family-room': null });
   const [bevMeta, setBevMeta] = useState<Record<CameraKey, BevMeta | undefined>>({ 'living-room': undefined, 'kitchen': undefined, 'family-room': undefined });
   const bevMetaRef = useRef<Record<CameraKey, BevMeta | undefined>>({ 'living-room': undefined, 'kitchen': undefined, 'family-room': undefined });
 
   // FPS tracking (exponential over short window)
   const [fps, setFps] = useState<{ [k: string]: string }>({ 'living-room': 'FPS: 0.0', 'kitchen': 'FPS: 0.0', 'family-room': 'FPS: 0.0' });
   const [fpsSeries, setFpsSeries] = useState<{ [k in CameraKey]: number[] }>({ 'living-room': [], 'kitchen': [], 'family-room': [] });
-  const fpsHistory = useRef<{ [k: string]: number[] }>({ 'living-room': [], 'kitchen': [], 'family-room': [] });
 
   const updateFps = useCallback((key: CameraKey, fpsValRaw: number, tsOverride?: number) => {
     const ts = tsOverride ?? Date.now();
@@ -89,20 +86,6 @@ function Dashboard() {
     });
     publish({ group: `Camera ${key.replace('-', ' ')}`, key: 'FPS', value: rounded, ts });
   }, [publish]);
-
-  const computeFps = useCallback((key: CameraKey) => {
-    const hist = fpsHistory.current[key];
-    const now = Date.now();
-    hist.push(now);
-    const maxN = 30; if (hist.length > maxN) hist.shift();
-    if (hist.length >= 2) {
-      const span = (hist[hist.length - 1] - hist[0]) / 1000;
-      if (span > 0) {
-        const fpsVal = (hist.length - 1) / span;
-        updateFps(key, fpsVal, now);
-      }
-    }
-  }, [updateFps]);
 
   const handleWebrtcFps = useCallback((fpsVal: number) => {
     streamDisplayCams.forEach((cam) => updateFps(cam, fpsVal));
@@ -419,11 +402,6 @@ function Dashboard() {
     }
 
     publish({ group: 'Tracking', key: 'Active Tracks', value: allTracks.length, ts: now });
-  };
-
-  const onImage = (cam: CameraKey, blob: Blob) => {
-    setStreams(prev => ({ ...prev, [cam]: blob }));
-    computeFps(cam);
   };
 
   const handleCalibrationBundle = useCallback((bundle: any) => {
@@ -752,7 +730,6 @@ function Dashboard() {
     sendWebRTCOffer,
     sendWebRTCIceCandidate,
   } = useWebSocketClient(WS_URL, {
-    onImage,
     onBevMeta: handleBevMeta,
     onStats,
     onTrailToggle: (en) => setTrailEnabled(en),
@@ -1056,7 +1033,7 @@ function Dashboard() {
               <StreamPanel
                 key={`stream-${cam}`}
                 camera={cam}
-                blob={streams[cam]}
+                blob={null}
                 fpsText={fps[cam]}
                 fpsSeries={fpsSeries[cam]}
                 vacancyText={vacancyText[cam]}

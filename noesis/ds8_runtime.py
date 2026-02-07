@@ -291,9 +291,9 @@ def _resolve_rfdetr_assets(size: str) -> Dict[str, Any]:
         raise SystemExit(f"[FATAL] RF-DETR size must be one of n/s/m (got: {size})")
 
     model_info = {
-        "n": {"model": "rfdetr-seg-nano", "resolution": 312, "max_detections": 30},
-        "s": {"model": "rfdetr-seg-small", "resolution": 384, "max_detections": 50},
-        "m": {"model": "rfdetr-seg-medium", "resolution": 432, "max_detections": 100},
+        "n": {"model": "rfdetr-seg-nano", "resolution": 312, "max_detections": 10},
+        "s": {"model": "rfdetr-seg-small", "resolution": 384, "max_detections": 20},
+        "m": {"model": "rfdetr-seg-medium", "resolution": 432, "max_detections": 30},
     }[size_norm]
     resolution = int(model_info["resolution"])
     return {
@@ -1682,262 +1682,6 @@ def _wait_for_rtsp_ready(host: str, port: int, timeout: float = 15.0, interval: 
     return False
 
 
-def _attach_mosaic_gst_appsink_handler(
-    pipeline: ds8_pipeline.DS8Pipeline,
-    ws_server: WebSocketServer,
-    logger: logging.Logger,
-) -> None:
-    """Attach a GI GstAppSink new-sample handler on mosaic_appsink to forward JPEG bytes over WS."""
-    try:
-        import gi
-
-        gi.require_version("Gst", "1.0")
-        gi.require_version("GstApp", "1.0")
-        from gi.repository import Gst, GstApp
-    except Exception as exc:  # pragma: no cover - runtime dependency
-        msg = f"Gst/GstApp unavailable; mosaic appsink handler not attached: {exc}"
-        logger.error(msg)
-        pipeline.errors.append(msg)
-        return
-
-    if ws_server is None:
-        msg = "WebSocket server missing; mosaic appsink handler not attached"
-        logger.error(msg)
-        pipeline.errors.append(msg)
-        return
-
-    ds_pipeline = getattr(pipeline, "ds_pipeline", None)
-    if ds_pipeline is None:
-        msg = "DS8 pipeline handle unavailable; mosaic appsink handler not attached"
-        logger.error(msg)
-        pipeline.errors.append(msg)
-        return
-
-    # Attempt to locate the underlying Gst.Pipeline or the Gst.AppSink element.
-    appsink: Optional[GstApp.AppSink] = None
-    gst_pipeline = None
-    # Direct attributes that may surface the Gst.Pipeline
-    for attr in ("pipeline", "_pipeline", "handle", "_handle", "gst_pipeline", "_gst_pipeline"):
-        try:
-            candidate = getattr(ds_pipeline, attr, None)
-        except Exception:
-            candidate = None
-        if candidate is None:
-            continue
-        if isinstance(candidate, Gst.Pipeline):
-            gst_pipeline = candidate
-            break
-        if hasattr(candidate, "get_by_name") and not gst_pipeline:
-            gst_pipeline = candidate  # type: ignore[assignment]
-            break
-    # pyservicemaker.Pipeline keeps a _instance handle; inspect it as well.
-    if gst_pipeline is None:
-        try:
-            inner = getattr(ds_pipeline, "_instance", None)
-        except Exception:
-            inner = None
-        if inner is not None:
-            for attr in ("pipeline", "_pipeline", "handle", "_handle", "gst_pipeline", "_gst_pipeline"):
-                try:
-                    candidate = getattr(inner, attr, None)
-                except Exception:
-                    candidate = None
-                if candidate is None:
-                    continue
-                if isinstance(candidate, Gst.Pipeline):
-                    gst_pipeline = candidate
-                    break
-                if hasattr(candidate, "get_by_name") and not gst_pipeline:
-                    gst_pipeline = candidate  # type: ignore[assignment]
-                    break
-            if gst_pipeline is None:
-                for name in dir(inner):
-                    if name.startswith("_"):
-                        continue
-                    try:
-                        candidate = getattr(inner, name)
-                    except Exception:
-                        continue
-                    if isinstance(candidate, Gst.Pipeline):
-                        gst_pipeline = candidate
-                        break
-                    if hasattr(candidate, "get_by_name") and not gst_pipeline:
-                        gst_pipeline = candidate  # type: ignore[assignment]
-                        break
-
-    if gst_pipeline is None:
-        for name in dir(ds_pipeline):
-            if name.startswith("_"):
-                continue
-            try:
-                candidate = getattr(ds_pipeline, name)
-            except Exception:
-                continue
-            if isinstance(candidate, Gst.Pipeline):
-                gst_pipeline = candidate
-                break
-            if hasattr(candidate, "get_by_name") and not gst_pipeline:
-                gst_pipeline = candidate  # type: ignore[assignment]
-                break
-
-    if gst_pipeline is not None:
-        try:
-            elem = gst_pipeline.get_by_name("mosaic_appsink")
-            if elem is not None:
-                if isinstance(elem, GstApp.AppSink):
-                    appsink = elem
-                else:
-                    cast_fn = getattr(GstApp.AppSink, "cast", None)
-                    if callable(cast_fn):
-                        try:
-                            appsink = cast_fn(elem)
-                        except Exception:
-                            appsink = None
-                    if appsink is None and isinstance(elem, Gst.Element):
-                        appsink = elem  # type: ignore[assignment]
-        except Exception:
-            logger.debug("Failed to get mosaic_appsink via Gst.Pipeline", exc_info=True)
-
-    # If pipeline handle lookup failed, try digging into the pyservicemaker node for a Gst element reference.
-    if appsink is None:
-        try:
-            node = ds_pipeline["mosaic_appsink"]
-        except Exception as exc:
-            msg = f"mosaic_appsink component not found; handler not attached: {exc}"
-            logger.error(msg, exc_info=True)
-            pipeline.errors.append(msg)
-            return
-
-        for attr in (
-            "element",
-            "_element",
-            "obj",
-            "_obj",
-            "gst_element",
-            "_gst_element",
-            "_gst",
-            "handle",
-            "_handle",
-            "__gstelement__",
-            "__gst_element__",
-        ):
-            try:
-                candidate = getattr(node, attr, None)
-            except Exception:
-                candidate = None
-            if candidate is None:
-                continue
-            if isinstance(candidate, GstApp.AppSink):
-                appsink = candidate
-                break
-            if isinstance(candidate, Gst.Element):
-                appsink = candidate  # type: ignore[assignment]
-                break
-        if appsink is None:
-            for name in dir(node):
-                if name.startswith("_"):
-                    continue
-                try:
-                    candidate = getattr(node, name)
-                except Exception:
-                    continue
-                if isinstance(candidate, GstApp.AppSink):
-                    appsink = candidate
-                    break
-                if isinstance(candidate, Gst.Element):
-                    appsink = candidate  # type: ignore[assignment]
-                    break
-
-    if appsink is None:
-        msg = "GstApp.AppSink handle not found for mosaic_appsink; handler not attached"
-        logger.error(msg)
-        pipeline.errors.append(msg)
-        return
-
-    try:
-        appsink.set_property("emit-signals", True)
-        appsink.set_property("sync", False)
-        appsink.set_property("max-buffers", 1)
-        appsink.set_property("drop", True)
-    except Exception:  # pragma: no cover - defensive; properties may already be set
-        logger.warning("Failed to set mosaic_appsink properties", exc_info=True)
-
-    state = {"count": 0, "debug_written": False}
-
-    def _on_new_sample(sink: GstApp.AppSink) -> Gst.FlowReturn:
-        sample = sink.emit("pull-sample")
-        if sample is None:
-            logger.warning("mosaic_appsink: pull-sample returned None")
-            return Gst.FlowReturn.ERROR
-
-        buf = sample.get_buffer()
-        if buf is None:
-            logger.warning("mosaic_appsink: sample has no buffer")
-            return Gst.FlowReturn.ERROR
-
-        success, map_info = buf.map(Gst.MapFlags.READ)
-        if not success:
-            logger.warning("mosaic_appsink: GstBuffer.map() failed")
-            return Gst.FlowReturn.ERROR
-
-        try:
-            payload = bytes(map_info.data) if map_info.data else b""
-        finally:
-            buf.unmap(map_info)
-
-        if not payload:
-            logger.warning("mosaic_appsink: empty JPEG payload")
-            return Gst.FlowReturn.OK
-
-        header = b"living-room"
-        if len(header) > 255:
-            header = header[:255]
-        framed = bytes([len(header)]) + header + payload
-
-        if not state["debug_written"]:
-            debug_path = "/tmp/noesis_mosaic_test.jpg"
-            try:
-                with open(debug_path, "wb") as f:
-                    f.write(payload)
-                logger.info(
-                    "mosaic_appsink: wrote first JPEG (%d bytes) to %s",
-                    len(payload),
-                    debug_path,
-                )
-                state["debug_written"] = True
-            except Exception:
-                logger.debug("mosaic_appsink: failed to write debug JPEG", exc_info=True)
-
-        ws_server.broadcast_sync(framed)
-
-        state["count"] += 1
-        if state["count"] <= 3 or state["count"] % 30 == 0:
-            #region agent log
-            try:
-                with open("/home/mayor/Noesis_Devel/.cursor/debug.log", "a", encoding="utf-8") as _f:
-                    _f.write(
-                        json.dumps(
-                            {
-                                "sessionId": "debug-session",
-                                "runId": "run1",
-                                "hypothesisId": "H3",
-                                "location": "ds8_runtime.py:_attach_mosaic_gst_appsink_handler",
-                                "message": "mosaic appsink frame",
-                                "data": {"count": state["count"], "bytes": len(payload)},
-                                "timestamp": int(time.time() * 1000),
-                            }
-                        )
-                        + "\n"
-                    )
-            except Exception:
-                pass
-            #endregion
-        return Gst.FlowReturn.OK
-
-    appsink.connect("new-sample", _on_new_sample)
-    logger.info("Attached GstAppSink new-sample handler on 'mosaic_appsink'")
-
-
 def _stop_websocket_server(
     server: WebSocketServer,
     thread: Optional[threading.Thread],
@@ -3247,18 +2991,14 @@ def main() -> int:
     rtsp_path = str(mosaic_cfg.get("rtsp_path", "mosaic")).strip() or "mosaic"
     mosaic_webrtc_enabled = bool(mosaic_cfg.get("mosaic_webrtc_enabled", False))
 
-    nvjpeg_built = "mosaic_appsink" in getattr(pipeline, "components", {})
     rtsp_built = "rtsp_out" in getattr(pipeline, "components", {})
 
     logger.info(
-        "Mosaic output toggles (effective): JPEG=%s (built=%s), RTSP=%s (built=%s), WebRTC_Gateway=%s",
-        bool(mosaic_cfg.get("jpeg_enabled", False)),
-        nvjpeg_built,
+        "Mosaic output toggles (effective): RTSP=%s (built=%s), WebRTC_Gateway=%s",
         bool(mosaic_cfg.get("rtsp_enabled", False)),
         rtsp_built,
         mosaic_webrtc_enabled,
     )
-    logger.info("NVJPEG mosaic branch %s (appsink_built=%s)", "ENABLED" if nvjpeg_built else "DISABLED", nvjpeg_built)
     #region agent log
     try:
         with open("/home/mayor/Noesis_Devel/.cursor/debug.log", "a", encoding="utf-8") as _f:
@@ -3271,12 +3011,10 @@ def main() -> int:
                         "location": "ds8_runtime.py:main",
                         "message": "mosaic toggles",
                         "data": {
-                            "jpeg_enabled": bool(mosaic_cfg.get("jpeg_enabled", False)),
                             "rtsp_enabled": bool(mosaic_cfg.get("rtsp_enabled", False)),
                             "rtsp_port": rtsp_port,
                             "rtsp_path": rtsp_path,
                             "webrtc_enabled": mosaic_webrtc_enabled,
-                            "nvjpeg_built": nvjpeg_built,
                             "rtsp_built": rtsp_built,
                         },
                         "timestamp": int(time.time() * 1000),
@@ -3714,21 +3452,6 @@ def main() -> int:
     if not ds8_pipeline.prepare(on_message=_psm_message_cb):
         logger.error("DS8 pipeline preparation failed: %s", pipeline.errors)
         return 1
-
-    # Attach mosaic appsink GI handler after prepare and before activation.
-    # Only attach if JPEG mosaic path is enabled (appsink only exists when jpeg_enabled)
-    if nvjpeg_built:
-        _attach_mosaic_gst_appsink_handler(pipeline, ws_server, logger)
-        if pipeline.errors:
-            # Non-fatal if RTSP/WebRTC path is available as alternative
-            if rtsp_built:
-                logger.warning("Mosaic appsink handler failed; RTSP path available as alternative. Errors: %s", pipeline.errors)
-                pipeline.errors.clear()  # Clear errors since RTSP path is available
-            else:
-                logger.error("Mosaic appsink handler failed; errors: %s", pipeline.errors)
-                return 1
-    else:
-        logger.info("JPEG mosaic disabled; skipping appsink handler attachment")
 
     ws_thread, ws_loop = _start_websocket_server(ws_server)
     if getattr(ws_server, "server", None) is None:

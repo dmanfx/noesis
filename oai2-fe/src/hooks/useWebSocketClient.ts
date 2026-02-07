@@ -48,7 +48,6 @@ export interface StatsPayload {
 }
 
 export type FrameHandlers = {
-  onImage: (cam: CameraKey, blob: Blob) => void;
   onBevImage?: (cam: CameraKey, blob: Blob) => void;
   onBevMeta?: (payload: any) => void;
   onStats: (stats: StatsPayload) => void;
@@ -189,10 +188,7 @@ export function useWebSocketClient(url: string, handlers: FrameHandlers) {
             if (id.startsWith('bev:')) {
               const cam = detectCameraKey(id.slice(4));
               if (cam && handlers.onBevImage) handlers.onBevImage(cam, jpgBlob);
-              return;
             }
-            const cam = detectCameraKey(id);
-            if (cam) handlers.onImage(cam, jpgBlob);
             return;
           }
           if (ev.data instanceof Blob) {
@@ -209,10 +205,7 @@ export function useWebSocketClient(url: string, handlers: FrameHandlers) {
             if (id.startsWith('bev:')) {
               const cam = detectCameraKey(id.slice(4));
               if (cam && handlers.onBevImage) handlers.onBevImage(cam, jpgBlob);
-              return;
             }
-            const cam = detectCameraKey(id);
-            if (cam) handlers.onImage(cam, jpgBlob);
             return;
           }
           const data = JSON.parse(ev.data);

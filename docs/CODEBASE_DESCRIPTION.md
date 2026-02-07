@@ -136,7 +136,7 @@ The system follows a **layered architecture** with clear separation between the 
   - **ReID SGIE**: `nvinfer` with OSNet model for cross-camera re-identification
   - **Tiler**: `nvmultistreamtiler` creates mosaic view
   - **OSD**: `nvdsosd` overlays bounding boxes, masks, labels, and trails
-  - **Output Sinks**: RTSP (`nvrtspoutsinkbin`) for mosaic delivery (consumed by the RTSP→WebRTC gateway). An NVJPEG/appsink mosaic branch exists but is **disabled by default** (`mosaic_output.jpeg_enabled: false`).
+  - **Output Sinks**: RTSP (`nvrtspoutsinkbin`) for mosaic delivery (consumed by the RTSP→WebRTC gateway). Mosaic JPEG/WebSocket output is removed in DS8.
 - **Depth Gating**: Valve-based gating for MapAnything branch with automatic priming
 
 #### 2. **Metadata Hooks** (`noesis/pipelines/hooks.py`)
@@ -168,7 +168,7 @@ The system follows a **layered architecture** with clear separation between the 
 #### 4. **WebSocket Server** (`websocket_server.py`)
 - **WebSocketServer**: Async WebSocket server for real-time client communication
 - **Features**:
-  - Binary frame broadcasting (optional BEV JPEG frames; mosaic JPEG over WebSocket only if the NVJPEG/appsink branch is explicitly enabled)
+  - Binary frame broadcasting (optional BEV JPEG frames)
   - JSON metadata streaming (detections, tracks, analytics, BEV points)
   - RPC handlers: calibration, depth requests, floorplan generation, BEV config
   - WebRTC signaling relay for `MosaicWebRTCGateway`
@@ -409,7 +409,7 @@ visualization:
 10. **Output**:
     - **RTSP**: `nvrtspoutsinkbin` → H.264 stream at `rtsp://host:8554/mosaic`
     - **WebRTC**: `MosaicWebRTCGateway` consumes RTSP → WebRTC to browser
-    - **WebSocket**: telemetry JSON + WebRTC signaling; optional BEV JPEG binaries (mosaic JPEG only when `mosaic_output.jpeg_enabled=true`)
+    - **WebSocket**: telemetry JSON + WebRTC signaling; optional BEV JPEG binaries
 11. **Metadata Extraction**: BatchMetadataOperator probes extract `NvDsBatchMeta`
 12. **WebSocket Broadcast**: Tracking telemetry (JSON) → frontend
 13. **BEV Rendering**: Footpoints + calibration → homography → top-down view
@@ -431,7 +431,7 @@ visualization:
 ## Integration Points
 
 1. **DeepStream → Python**: `BatchMetadataOperator` probes extract `NvDsBatchMeta` from pipeline
-2. **Python → Frontend**: WebSocket server streams telemetry (JSON) and optional BEV JPEG binaries; mosaic JPEGs are available only when `mosaic_output.jpeg_enabled=true`.
+2. **Python → Frontend**: WebSocket server streams telemetry (JSON) and optional BEV JPEG binaries.
 3. **Frontend → Backend**: RPC messages for calibration, depth requests, BEV config
 4. **RTSP → WebRTC**: `MosaicWebRTCGateway` passthrough (no transcoding)
 5. **Telemetry**: Publishers send tracking/depth data over WebSocket
@@ -489,7 +489,7 @@ export NOESIS_REID_ENABLED=1           # Enable ReID
 ## Current State
 
 - **Stack**: DeepStream 8.0 Service Maker (`pyservicemaker`)
-- **Video Delivery**: RTSP → WebRTC gateway (mosaic); WebSocket carries signaling only **unless** the optional NVJPEG/appsink path is enabled for JPEG mosaic frames.
+- **Video Delivery**: RTSP → WebRTC gateway (mosaic); WebSocket carries signaling (plus telemetry/optional BEV JPEG binaries).
 - **Tracking**: NvDCF + OSNet ReID for stable cross-camera IDs
 - **Depth**: MapAnything full-frame with valve gating
 - **Trails**: GPU-rendered via NvDsDisplayMeta on mosaic OSD

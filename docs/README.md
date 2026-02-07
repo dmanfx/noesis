@@ -44,6 +44,9 @@ and worklogs live in `docs/history/`.
 - Added ReID alias REST contracts, guardrails, and limitations (`DS8_api_contracts_rest.md`).
 - Logged the soft-merge alias design decision and updated DS8 hooks/runtime checklists (`plans/DS8/ds8_design_decisions.md`, `plans/DS8/ds8_migration_checklist_hooks.md`, `plans/DS8/ds8_migration_checklist_ds8_runtime.md`).
 
+## Doc changes (2026-02-07)
+- Removed remaining references to the deprecated mosaic JPEG/WebSocket path from active docs.
+
 ## Doc changes (2026-02-06)
 - Standardized AGENTS policy precedence across repo/docs/plans scopes and clarified archive docs as non-normative (`AGENTS.md`, `docs/AGENTS.md`, `plans/AGENTS.md`, `noesis/AGENTS.md`, `docs/history/ds8/v3dt/AGENTS.md`).
 - Reduced V3DT AGENTS duplication by keeping only subtree-specific constraints and locking recovery commands to baseline calibration defaults (`plans/DS8/v3dt/AGENTS.md`, `plans/DS8/v3dt/README.md`).
@@ -52,5 +55,5 @@ and worklogs live in `docs/history/`.
 ## Doc changes (2026-02-02)
 - Refreshed WebSocket contracts (`DS8_api_contracts_ws.md`) and telemetry summary (`Telemetry_Schema.md`) to match current DS8 runtime output.
 - Archived older references for WebSocket/telemetry/depth/occupancy and replaced with DS8 summaries (`WebSocket_API.md`, `depth_metadata.md`, `Occupancy_Publishing.md`, `MapAnything_Depth.md`).
-- Updated baselines and overview docs for optional NVJPEG mosaic branch, BEV frame defaults, and ReID/pose/MapAnything env toggles (`DS8_Baselines.md`, `DS8_README_FOR_AGENTS.md`, `CODEBASE_DESCRIPTION.md`).
+- Updated baselines and overview docs for RTSP→WebRTC mosaic delivery, BEV frame defaults, and ReID/pose/MapAnything env toggles (`DS8_Baselines.md`, `DS8_README_FOR_AGENTS.md`, `CODEBASE_DESCRIPTION.md`).
 - Clarified exclusion/ROI handling and MapAnything engine details (`Static_ROI_Exclusion.md`, `DS8_roi_editor.md`, `DS8_MIGRATION_KNOWLEDGE_BASE.md`).

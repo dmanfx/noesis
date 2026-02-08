@@ -9,6 +9,7 @@ from typing import Any, Dict, Optional
 
 from fastapi import FastAPI, HTTPException, Query
 from pydantic import BaseModel
+from noesis.server.boundary_metrics import record_rest_response
 
 FORCE_STUB_ENV = "NOESIS_DEPTH_API_FORCE_STUB"
 _FORCE_PIPELINE_STUB = os.environ.get(FORCE_STUB_ENV, "").strip().lower() in {
@@ -178,12 +179,22 @@ def refresh_depth(seconds: int = Query(20, ge=1, le=300)) -> DepthRefreshRespons
 
     payload = enable_depth(seconds=seconds)
     try:
-        return DepthRefreshResponse(
+        model_start_ns = time.perf_counter_ns()
+        response = DepthRefreshResponse(
             started_at=int(payload["started_at"]),
             will_disable_at=int(payload["will_disable_at"]),
             enabled=bool(payload.get("enabled", True)),
             seconds=int(payload.get("seconds", seconds)),
         )
+        model_ms = (time.perf_counter_ns() - model_start_ns) / 1_000_000.0
+        record_rest_response(
+            "/api/v1/depth/refresh",
+            "DepthRefreshResponse",
+            model_duration_ms=model_ms,
+            payload=response,
+            include_budget=True,
+        )
+        return response
     except Exception as exc:  # pragma: no cover - defensive logging
         logger.exception("Depth refresh payload malformed: %s", exc)
         raise HTTPException(status_code=500, detail="Depth control failed") from exc

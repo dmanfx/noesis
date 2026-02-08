@@ -1153,6 +1153,13 @@ def _build_stable_id_manager(logger: logging.Logger, *, pipeline_config: Optiona
             alias_history_max = int(os.environ.get("NOESIS_REID_ALIAS_HISTORY_MAX", "1000") or 1000)
         except Exception:
             alias_history_max = 1000
+        stableid_gpu_enabled_env = str(os.environ.get("NOESIS_STABLEID_GPU_ENABLED", "1") or "1").strip().lower()
+        compute_backend = "auto" if stableid_gpu_enabled_env in ("1", "true", "yes", "on") else "cpu"
+        gpu_device = str(os.environ.get("NOESIS_STABLEID_GPU_DEVICE", device) or device)
+        try:
+            gpu_min_gallery = int(os.environ.get("NOESIS_STABLEID_GPU_MIN_GALLERY", "32") or 32)
+        except Exception:
+            gpu_min_gallery = 32
         extra_kwargs = {
             "aliases_enabled": aliases_enabled,
             "alias_file": alias_file,
@@ -1164,6 +1171,9 @@ def _build_stable_id_manager(logger: logging.Logger, *, pipeline_config: Optiona
             "suggest_pose_sim_high": suggest_pose_sim_high,
             "min_embeddings_for_suggest": min_embeddings_for_suggest,
             "alias_history_max": alias_history_max,
+            "compute_backend": compute_backend,
+            "gpu_device": gpu_device,
+            "gpu_min_gallery": gpu_min_gallery,
         }
         try:
             sig = inspect.signature(StableIDManager.__init__)
@@ -1529,6 +1539,15 @@ def _build_stats_callback(
         except Exception:
             depth_fps = 0.0
         reload_count = getattr(pipeline, "analytics_reload_count", 0)
+        stableid_metrics: Dict[str, Any] = {}
+        try:
+            sid_mgr = getattr(pipeline, "stable_id_mgr", None)
+            if sid_mgr is not None:
+                get_metrics = getattr(sid_mgr, "get_sid_metrics", None)
+                if callable(get_metrics):
+                    stableid_metrics = dict(get_metrics() or {})
+        except Exception:
+            stableid_metrics = {}
         cameras_stats: Dict[str, object] = {}
         core_instr = hooks.get_core_path_instrumentation_snapshot()
         core_counters = dict(core_instr.get("counters", {}))
@@ -1540,6 +1559,33 @@ def _build_stats_callback(
                 ws_boundary_metrics = ws_metrics_getter() or {}
             except Exception:
                 ws_boundary_metrics = {}
+        rest_boundary_metrics: Dict[str, Any] = {}
+        try:
+            from noesis.server import boundary_metrics as _rest_boundary_metrics
+
+            rest_boundary_metrics = _rest_boundary_metrics.get_boundary_serialization_metrics() or {}
+        except Exception:
+            rest_boundary_metrics = {}
+        ws_p50 = ws_boundary_metrics.get("p50_ms")
+        ws_p95 = ws_boundary_metrics.get("p95_ms")
+        ws_p99 = ws_boundary_metrics.get("p99_ms")
+        rest_p50 = rest_boundary_metrics.get("p50_ms")
+        rest_p95 = rest_boundary_metrics.get("p95_ms")
+        rest_p99 = rest_boundary_metrics.get("p99_ms")
+
+        def _max_nullable(a: Any, b: Any) -> Any:
+            try:
+                if a is None:
+                    return b
+                if b is None:
+                    return a
+                return max(float(a), float(b))
+            except Exception:
+                return a if a is not None else b
+
+        boundary_p50 = _max_nullable(ws_p50, rest_p50)
+        boundary_p95 = _max_nullable(ws_p95, rest_p95)
+        boundary_p99 = _max_nullable(ws_p99, rest_p99)
         latency_collector = getattr(pipeline, "latency_collector", None)
         latency_by_source: Dict[int, Dict[str, object]] = {}
         latency_aggregate: Optional[Dict[str, object]] = None
@@ -1626,19 +1672,42 @@ def _build_stats_callback(
                 "activated": pipeline.activated,
                 "depth_enabled": pipeline.depth_enabled,
                 "depth_fps": depth_fps,
+                "zero_copy_profile": str(os.environ.get("NOESIS_ZERO_COPY_PROFILE", "strict") or "strict"),
+                "pose_gpu_path_mode": str(os.environ.get("NOESIS_POSE_GPU_PATH", "native") or "native"),
+                "pose_cpu_fallback_enabled": str(os.environ.get("NOESIS_POSE_GPU_PATH", "native") or "native")
+                .strip()
+                .lower()
+                in ("cpu_debug", "cpu", "debug", "fallback"),
+                "reid_gpu_path_mode": str(os.environ.get("NOESIS_REID_GPU_PATH", "native") or "native"),
+                "reid_cpu_fallback_enabled": (
+                    str(os.environ.get("NOESIS_REID_GPU_PATH", "native") or "native").strip().lower()
+                    in ("cpu_debug", "cpu", "debug", "fallback")
+                    or not _zero_copy_disable_reid_cpu_enabled()
+                ),
                 "zero_copy_core_enabled": True,
                 "zero_copy_violations": core_violations,
                 "zero_copy_fallback_conversions": fallback_conversions,
-                "boundary_cpu_serialization_p50_ms": ws_boundary_metrics.get("p50_ms"),
-                "boundary_cpu_serialization_p95_ms": ws_boundary_metrics.get("p95_ms"),
-                "boundary_cpu_serialization_p99_ms": ws_boundary_metrics.get("p99_ms"),
+                "stableid_backend_mode": stableid_metrics.get("stableid_backend_mode"),
+                "stableid_gpu_match_p50_ms": stableid_metrics.get("stableid_gpu_match_p50_ms"),
+                "stableid_gpu_match_p95_ms": stableid_metrics.get("stableid_gpu_match_p95_ms"),
+                "stableid_gpu_fallback_count": stableid_metrics.get("stableid_gpu_fallback_count"),
+                "stableid_gallery_size": stableid_metrics.get("stableid_gallery_size"),
+                "boundary_cpu_serialization_p50_ms": boundary_p50,
+                "boundary_cpu_serialization_p95_ms": boundary_p95,
+                "boundary_cpu_serialization_p99_ms": boundary_p99,
+                "boundary_cpu_serialization_ws_p99_ms": ws_p99,
+                "boundary_cpu_serialization_rest_p99_ms": rest_p99,
                 "analytics_reload_count": reload_count,
                 "mosaic_layout": _mosaic_layout(),
                 **({"latency_ms": latency_aggregate} if latency_aggregate is not None else {}),
                 "zero_copy_core": {
                     "counters": core_counters,
-                    "boundary_serialization_metrics": ws_boundary_metrics,
+                    "boundary_serialization_metrics": {
+                        "ws": ws_boundary_metrics,
+                        "rest": rest_boundary_metrics,
+                    },
                 },
+                "stableid_metrics": stableid_metrics,
                 "errors": list(pipeline.errors),
             },
             "cameras": cameras_stats,
@@ -1660,6 +1729,12 @@ def _build_stats_callback(
                 ws_metrics_resetter()
             except Exception:
                 pass
+        try:
+            from noesis.server import boundary_metrics as _rest_boundary_metrics
+
+            _rest_boundary_metrics.reset_boundary_serialization_metrics()
+        except Exception:
+            pass
 
     setattr(_stats, "clear_stats", _clear_stats)
     return _stats
@@ -2520,6 +2595,25 @@ def _install_encode_latency_suppression(logger: logging.Logger) -> None:
         logger.info("Suppressed encoder KPI prints (NOESIS_SUPPRESS_ENCODE_LATENCY=0 to disable)")
 
 
+def _zero_copy_disable_pose_cpu_enabled() -> bool:
+    # Keep pose hooks enabled by default in native mode to avoid functional regressions.
+    # This flag is an emergency kill-switch only.
+    raw = os.environ.get("NOESIS_ZERO_COPY_DISABLE_POSE_CPU")
+    if raw is None:
+        return False
+    return str(raw).strip().lower() in _ENV_TRUE
+
+
+def _zero_copy_disable_reid_cpu_enabled() -> bool:
+    raw = os.environ.get("NOESIS_ZERO_COPY_DISABLE_REID_CPU")
+    if raw is None:
+        profile = str(os.environ.get("NOESIS_ZERO_COPY_PROFILE", "") or "").strip().lower()
+        if profile in ("validate", "full", "debug"):
+            return False
+        raw = "1"
+    return str(raw).strip().lower() in _ENV_TRUE
+
+
 def main() -> int:
     os.environ.setdefault("NOESIS_MOSAIC_WEBRTC_ENABLED", "1")
     os.environ.setdefault("NOESIS_DEPTH_ENABLE_SECONDS", "0")
@@ -3202,10 +3296,28 @@ def main() -> int:
         hooks.attach_trail_overlay_hook(pipeline, config=trails_cfg)
     except Exception:
         logger.exception("Failed to attach DS8 trail overlay hook")
-    try:
-        hooks.attach_pose_keypoint_overlay_hook(pipeline)
-    except Exception:
-        logger.exception("Failed to attach DS8 pose keypoint overlay hook")
+    disable_pose_cpu_hooks = _zero_copy_disable_pose_cpu_enabled()
+    disable_reid_cpu_fallback = _zero_copy_disable_reid_cpu_enabled()
+    logger.info(
+        "Pose path mode=%s (cpu hooks disabled=%s)",
+        str(os.environ.get("NOESIS_POSE_GPU_PATH", "native") or "native"),
+        disable_pose_cpu_hooks,
+    )
+    logger.info(
+        "ReID path mode=%s (cpu fallback disabled=%s)",
+        str(os.environ.get("NOESIS_REID_GPU_PATH", "native") or "native"),
+        disable_reid_cpu_fallback,
+    )
+    if disable_pose_cpu_hooks:
+        logger.info(
+            "Skipping DS8 pose keypoint overlay hook in zero-copy mode "
+            "(unset NOESIS_ZERO_COPY_DISABLE_POSE_CPU or set NOESIS_POSE_GPU_PATH=cpu_debug)"
+        )
+    else:
+        try:
+            hooks.attach_pose_keypoint_overlay_hook(pipeline)
+        except Exception:
+            logger.exception("Failed to attach DS8 pose keypoint overlay hook")
 
     bev_cfg = pipeline.config.get("bev") or {}
     bev_jpeg_enabled = bool(bev_cfg.get("jpeg_enabled", False))
@@ -3568,10 +3680,16 @@ def main() -> int:
             logger.info("SGIE disabled or missing; skipping MapAnything postprocess hook")
     except Exception:
         logger.exception("Error while evaluating MapAnything postprocess attachment")
-    try:
-        hooks.attach_pose_feature_hook(pipeline, camera_labels=camera_labels)
-    except Exception:
-        logger.exception("Error while attaching pose feature hook")
+    if disable_pose_cpu_hooks:
+        logger.info(
+            "Skipping DS8 pose feature hook in zero-copy mode "
+            "(unset NOESIS_ZERO_COPY_DISABLE_POSE_CPU or set NOESIS_POSE_GPU_PATH=cpu_debug)"
+        )
+    else:
+        try:
+            hooks.attach_pose_feature_hook(pipeline, camera_labels=camera_labels)
+        except Exception:
+            logger.exception("Error while attaching pose feature hook")
     hooks.attach_analytics_telemetry_hook(
         pipeline,
         tracking_pub=tracking_pub,

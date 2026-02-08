@@ -46,6 +46,11 @@ try:  # pragma: no cover - optional native bridge for pose meta
 except Exception:  # pragma: no cover - extension unavailable in tests
     noesis_pose_meta_ext = None  # type: ignore
 
+try:  # pragma: no cover - optional native bridge for ReID tensor extraction
+    import noesis_reid_meta_ext  # type: ignore
+except Exception:  # pragma: no cover - extension unavailable in tests
+    noesis_reid_meta_ext = None  # type: ignore
+
 try:  # pragma: no cover - diagnostics optional in tests
     from noesis.diagnostics.telemetry_log import TrackingDiagnosticsLogger
 except Exception:  # pragma: no cover - fallback when diagnostics are absent
@@ -53,7 +58,13 @@ except Exception:  # pragma: no cover - fallback when diagnostics are absent
 
 logger = logging.getLogger(__name__)
 _REID_DLPACK_DEBUG_LOGGED = False
+_REID_CPU_SKIP_LOGGED = False
+_REID_NATIVE_MISSING_LOGGED = False
 _POSE_DLPACK_TORCH_LOGGED = False
+_POSE_GPU_PATH_NATIVE = "native"
+_POSE_GPU_PATH_CPU_DEBUG = "cpu_debug"
+_REID_GPU_PATH_NATIVE = "native"
+_REID_GPU_PATH_CPU_DEBUG = "cpu_debug"
 _CORE_FALLBACK_POLICY_ALLOW = "allow"
 _CORE_FALLBACK_POLICY_GATE = "gate"
 _CORE_FALLBACK_POLICY_FAIL = "fail"
@@ -65,12 +76,40 @@ class _CorePathFallbackConversionError(RuntimeError):
 
 
 def _resolve_core_fallback_policy() -> str:
-    raw = str(os.environ.get("NOESIS_CORE_PATH_FALLBACK_POLICY", _CORE_FALLBACK_POLICY_ALLOW) or "").strip().lower()
+    # Strict fallback is the production zero-copy default unless explicitly overridden.
+    raw = str(os.environ.get("NOESIS_CORE_PATH_FALLBACK_POLICY", _CORE_FALLBACK_POLICY_FAIL) or "").strip().lower()
     if raw in ("fail", "fail-fast", "strict", "error"):
         return _CORE_FALLBACK_POLICY_FAIL
     if raw in ("gate", "block", "drop", "skip"):
         return _CORE_FALLBACK_POLICY_GATE
     return _CORE_FALLBACK_POLICY_ALLOW
+
+
+def _zero_copy_disable_reid_cpu_enabled() -> bool:
+    """Return whether zero-copy mode should skip host-side ReID embedding extraction."""
+    raw_env = os.environ.get("NOESIS_ZERO_COPY_DISABLE_REID_CPU")
+    if raw_env is None:
+        profile = str(os.environ.get("NOESIS_ZERO_COPY_PROFILE", "") or "").strip().lower()
+        if profile in ("validate", "full", "debug"):
+            return False
+        raw = "1"
+    else:
+        raw = str(raw_env or "").strip().lower()
+    return raw not in ("0", "false", "no", "off")
+
+
+def _pose_gpu_path_mode() -> str:
+    raw = str(os.environ.get("NOESIS_POSE_GPU_PATH", _POSE_GPU_PATH_NATIVE) or "").strip().lower()
+    if raw in (_POSE_GPU_PATH_CPU_DEBUG, "cpu", "debug", "fallback"):
+        return _POSE_GPU_PATH_CPU_DEBUG
+    return _POSE_GPU_PATH_NATIVE
+
+
+def _reid_gpu_path_mode() -> str:
+    raw = str(os.environ.get("NOESIS_REID_GPU_PATH", _REID_GPU_PATH_NATIVE) or "").strip().lower()
+    if raw in (_REID_GPU_PATH_CPU_DEBUG, "cpu", "debug", "fallback"):
+        return _REID_GPU_PATH_CPU_DEBUG
+    return _REID_GPU_PATH_NATIVE
 
 
 @dataclass
@@ -198,6 +237,16 @@ def reset_core_path_instrumentation() -> None:
     _CORE_PATH_INSTRUMENTATION.reset()
 
 
+def _increment_core_counter(metric: str, delta: int = 1) -> int:
+    """Increment a custom core instrumentation counter."""
+    key = str(metric)
+    with _CORE_PATH_INSTRUMENTATION._lock:
+        current = int(_CORE_PATH_INSTRUMENTATION.counters.get(key, 0))
+        updated = current + int(delta)
+        _CORE_PATH_INSTRUMENTATION.counters[key] = updated
+        return updated
+
+
 def _serialize_compact_json_with_metrics(payload: Mapping[str, Any], *, metric: str) -> str:
     start_ns = time.perf_counter_ns()
     encoded = ""
@@ -297,7 +346,8 @@ def attach_pose_feature_hook(
     *,
     camera_labels: Optional[Mapping[int, str]] = None,
 ) -> None:
-    """Attach the YOLO26 pose feature hook to decode SGIE tensor meta."""
+    """Attach the YOLO26 pose feature hook."""
+
     pose_cfg = (pipeline.config.get("models") or {}).get("pose") or {}
     if not isinstance(pose_cfg, Mapping):
         pose_cfg = {}
@@ -966,10 +1016,21 @@ class MapAnythingProcessor:
     _async_lock: threading.Lock = field(default_factory=threading.Lock, init=False, repr=False)
     _dropped_jobs: int = field(default=0, init=False, repr=False)
     _last_drop_log: float = field(default=0.0, init=False, repr=False)
+    _sync_debug_allowed: bool = field(default=False, init=False, repr=False)
+    _sync_forced_async_logged: bool = field(default=False, init=False, repr=False)
 
     def __post_init__(self) -> None:
         flag = os.environ.get("NOESIS_MAPANYTHING_POSTPROCESS_ASYNC", "1")
         self._async_enabled = str(flag).strip().lower() in ("1", "true", "yes", "on")
+        sync_flag = os.environ.get("NOESIS_MAPANYTHING_POSTPROCESS_SYNC_DEBUG", "0")
+        self._sync_debug_allowed = str(sync_flag).strip().lower() in ("1", "true", "yes", "on")
+        if not self._async_enabled and not self._sync_debug_allowed:
+            self._async_enabled = True
+            self._sync_forced_async_logged = True
+            logger.warning(
+                "MapAnything sync postprocess is debug-only; forcing async mode "
+                "(set NOESIS_MAPANYTHING_POSTPROCESS_SYNC_DEBUG=1 to allow sync path)"
+            )
 
     def _to_numpy(self, tensor: Any) -> Optional[np.ndarray]:
         """Convert pyservicemaker Tensor to a CPU numpy array via DLPack.
@@ -997,6 +1058,7 @@ class MapAnythingProcessor:
                     capsule = dlpack_fn(stream)
                     torch_tensor = torch_dlpack.from_dlpack(capsule)
                     arr = torch_tensor.detach().cpu().numpy()
+                    _increment_core_counter("tensor_host_copies_total.mapanything")
                     _CORE_PATH_INSTRUMENTATION.record_boundary_serialization_prep(
                         metric="mapanything.tensor_dlpack_to_host",
                         duration_ns=time.perf_counter_ns() - start_ns,
@@ -1102,6 +1164,14 @@ class MapAnythingProcessor:
                 return None
 
             if not self._async_enabled:
+                if not self._sync_debug_allowed and not self._sync_forced_async_logged:
+                    self._sync_forced_async_logged = True
+                    logger.warning(
+                        "MapAnything sync postprocess path blocked in production; forcing async path "
+                        "(set NOESIS_MAPANYTHING_POSTPROCESS_SYNC_DEBUG=1 for debug)"
+                    )
+                    self._async_enabled = True
+                    return None
                 tensors: Dict[str, np.ndarray] = {}
                 layer_names: List[str] = []
                 for name, tensor in layers.items():
@@ -2711,6 +2781,63 @@ class PoseFeatureProcessor:
 
         return features, (mean_conf, min_conf, valid_frac)
 
+    def _extract_pose_native(
+        self,
+        obj_meta: Any,
+    ) -> Optional[Tuple[float, np.ndarray, np.ndarray]]:
+        if noesis_pose_meta_ext is None:
+            return None
+        extract_obj = getattr(noesis_pose_meta_ext, "extract_pose_keypoints", None)
+        if extract_obj is None or not callable(extract_obj):
+            return None
+        try:
+            payload = extract_obj(
+                obj_meta,
+                int(self.gie_id),
+                int(self.model_size[0]),
+                int(self.model_size[1]),
+                float(self.score_threshold),
+                bool(self.letterbox),
+            )
+        except Exception:
+            return None
+        if payload is None:
+            return None
+        try:
+            score = float(payload.get("score", 0.0))
+            raw_roi = payload.get("keypoints_roi")
+            raw_abs = payload.get("keypoints_abs")
+        except Exception:
+            return None
+        if not isinstance(raw_roi, (list, tuple)) or len(raw_roi) < 17:
+            return None
+        if not isinstance(raw_abs, (list, tuple)) or len(raw_abs) < 17:
+            return None
+        rows_roi: List[List[float]] = []
+        rows_abs: List[List[float]] = []
+        for item in raw_roi[:17]:
+            if not isinstance(item, (list, tuple)) or len(item) < 3:
+                return None
+            try:
+                rows_roi.append([float(item[0]), float(item[1]), float(item[2])])
+            except Exception:
+                return None
+        for item in raw_abs[:17]:
+            if not isinstance(item, (list, tuple)) or len(item) < 3:
+                return None
+            try:
+                rows_abs.append([float(item[0]), float(item[1]), float(item[2])])
+            except Exception:
+                return None
+        try:
+            arr_roi = np.asarray(rows_roi, dtype=np.float32)
+            arr_abs = np.asarray(rows_abs, dtype=np.float32)
+        except Exception:
+            return None
+        if arr_roi.shape != (17, 3) or arr_abs.shape != (17, 3):
+            return None
+        return score, arr_roi, arr_abs
+
     def handle_frame_ds8(self, frame_meta: Any) -> None:
         object_items = getattr(frame_meta, "object_items", None) or []
         source_id = self._frame_source_id(frame_meta)
@@ -2724,6 +2851,8 @@ class PoseFeatureProcessor:
         )
         if debug:
             self._debug_frames += 1
+        pose_mode = _pose_gpu_path_mode()
+        use_native = pose_mode == _POSE_GPU_PATH_NATIVE
 
         attach_obj = None
         if noesis_pose_meta_ext is not None:
@@ -2753,40 +2882,64 @@ class PoseFeatureProcessor:
                 track_id = int(getattr(obj_meta, "object_id", -1))
             except Exception:
                 track_id = -1
-
-            output = self._extract_pose_output(obj_meta)
-            if output is None:
-                if not self._missing_tensor_logged:
-                    logger.debug("Pose SGIE missing tensor meta (unique_id=%s)", int(self.gie_id))
-                    self._missing_tensor_logged = True
-                if debug:
-                    self._debug_missing += 1
-                continue
-
-            row = self._select_pose_row(output)
-            if row is None:
-                if debug:
-                    self._debug_missing += 1
-                continue
-
-            try:
-                score = float(row[4])
-            except Exception:
-                score = 0.0
-
-            kpts_raw = np.asarray(row[6:], dtype=np.float32)
-            if kpts_raw.size < 17 * 3:
-                if debug:
-                    self._debug_missing += 1
-                continue
-            kpts = kpts_raw[: 17 * 3].reshape(17, 3)
-            normalized = float(np.max(row[:4])) <= 2.0
-
             roi_w = float(bbox[2])
             roi_h = float(bbox[3])
-            kpts = self._map_keypoints(kpts, roi_w=roi_w, roi_h=roi_h, normalized=normalized)
+            score = 0.0
+            kpts_abs: Optional[np.ndarray] = None
+            kpts_for_features: Optional[np.ndarray] = None
+            kpts_roi: Optional[np.ndarray] = None
+            if use_native:
+                native = self._extract_pose_native(obj_meta)
+                if native is not None:
+                    score, kpts_roi, kpts_abs = native
+                    kpts_for_features = kpts_roi
+                else:
+                    if debug:
+                        self._debug_missing += 1
+                    continue
+            else:
+                output = self._extract_pose_output(obj_meta)
+                if output is None:
+                    if not self._missing_tensor_logged:
+                        logger.debug("Pose SGIE missing tensor meta (unique_id=%s)", int(self.gie_id))
+                        self._missing_tensor_logged = True
+                    if debug:
+                        self._debug_missing += 1
+                    continue
 
-            features, quality = self._compute_features(kpts, roi_w=roi_w, roi_h=roi_h)
+                row = self._select_pose_row(output)
+                if row is None:
+                    if debug:
+                        self._debug_missing += 1
+                    continue
+
+                try:
+                    score = float(row[4])
+                except Exception:
+                    score = 0.0
+
+                kpts_raw = np.asarray(row[6:], dtype=np.float32)
+                if kpts_raw.size < 17 * 3:
+                    if debug:
+                        self._debug_missing += 1
+                    continue
+                kpts = kpts_raw[: 17 * 3].reshape(17, 3)
+                normalized = float(np.max(row[:4])) <= 2.0
+                kpts = self._map_keypoints(kpts, roi_w=roi_w, roi_h=roi_h, normalized=normalized)
+                kpts_roi = np.asarray(kpts, dtype=np.float32, copy=True)
+                kpts_abs = np.asarray(kpts, dtype=np.float32, copy=True)
+                kpts_abs[:, 0] += float(bbox[0])
+                kpts_abs[:, 1] += float(bbox[1])
+                kpts_for_features = kpts
+
+            if kpts_abs is None or kpts_for_features is None:
+                if debug:
+                    self._debug_missing += 1
+                continue
+            if kpts_roi is None:
+                kpts_roi = np.asarray(kpts_for_features, dtype=np.float32, copy=True)
+
+            features, quality = self._compute_features(kpts_for_features, roi_w=roi_w, roi_h=roi_h)
             mean_conf, min_conf, valid_frac = quality
             if not features:
                 if debug:
@@ -2814,6 +2967,8 @@ class PoseFeatureProcessor:
                 kpt_min_conf=float(min_conf),
                 kpt_valid_frac=float(valid_frac),
                 features=features,
+                keypoints_roi=kpts_roi.tolist(),
+                keypoints_abs=kpts_abs.tolist(),
                 stable_id=stable_id,
                 model="yolo26-pose",
                 ts_us=int(ts_us),
@@ -2874,6 +3029,7 @@ class PoseKeypointOverlayProcessor:
     _logged_layers: bool = field(default=False, init=False, repr=False)
     _logged_shape: bool = field(default=False, init=False, repr=False)
     _missing_tensor_logged: bool = field(default=False, init=False, repr=False)
+    _missing_native_logged: bool = field(default=False, init=False, repr=False)
     _debug_last_log: float = field(default=0.0, init=False, repr=False)
     _debug_frames: int = field(default=0, init=False, repr=False)
     _debug_objects: int = field(default=0, init=False, repr=False)
@@ -2945,6 +3101,84 @@ class PoseKeypointOverlayProcessor:
             if arr is not None:
                 return arr
         return None
+
+    def _extract_pose_payload(self, obj_meta: Any) -> Optional[Dict[str, Any]]:
+        if noesis_pose_meta_ext is None:
+            return None
+        extract_obj = getattr(noesis_pose_meta_ext, "extract_pose_features", None)
+        if extract_obj is None or not callable(extract_obj):
+            return None
+        try:
+            raw = extract_obj(obj_meta)
+        except Exception:
+            return None
+        if raw is None:
+            return None
+        try:
+            text = str(raw)
+            if not text:
+                return None
+            payload = json.loads(text)
+        except Exception:
+            return None
+        if not isinstance(payload, dict):
+            return None
+        return payload
+
+    def _keypoints_from_payload(self, payload: Mapping[str, Any], bbox: Tuple[float, float, float, float]) -> Optional[np.ndarray]:
+        src_bbox = payload.get("bbox")
+        src_w = float(bbox[2])
+        src_h = float(bbox[3])
+        if isinstance(src_bbox, (list, tuple)) and len(src_bbox) >= 4:
+            try:
+                src_w = float(src_bbox[2])
+                src_h = float(src_bbox[3])
+            except Exception:
+                src_w = float(bbox[2])
+                src_h = float(bbox[3])
+        dst_w = float(bbox[2])
+        dst_h = float(bbox[3])
+        sx = float(dst_w / src_w) if src_w > 1e-6 else 1.0
+        sy = float(dst_h / src_h) if src_h > 1e-6 else 1.0
+
+        raw_roi = payload.get("keypoints_roi")
+        if isinstance(raw_roi, (list, tuple)) and len(raw_roi) >= 17:
+            rows: List[List[float]] = []
+            for item in raw_roi[:17]:
+                if not isinstance(item, (list, tuple)) or len(item) < 3:
+                    return None
+                try:
+                    x = float(item[0]) * sx + float(bbox[0])
+                    y = float(item[1]) * sy + float(bbox[1])
+                    c = float(item[2])
+                    rows.append([x, y, c])
+                except Exception:
+                    return None
+            try:
+                arr = np.asarray(rows, dtype=np.float32)
+            except Exception:
+                return None
+            if arr.shape == (17, 3):
+                return arr
+
+        raw_abs = payload.get("keypoints_abs")
+        if not isinstance(raw_abs, (list, tuple)) or len(raw_abs) < 17:
+            return None
+        rows_abs: List[List[float]] = []
+        for item in raw_abs[:17]:
+            if not isinstance(item, (list, tuple)) or len(item) < 3:
+                return None
+            try:
+                rows_abs.append([float(item[0]), float(item[1]), float(item[2])])
+            except Exception:
+                return None
+        try:
+            arr_abs = np.asarray(rows_abs, dtype=np.float32)
+        except Exception:
+            return None
+        if arr_abs.shape != (17, 3):
+            return None
+        return arr_abs
 
     def _select_pose_row(self, output: np.ndarray) -> Optional[np.ndarray]:
         if output.ndim >= 3:
@@ -3057,6 +3291,8 @@ class PoseKeypointOverlayProcessor:
             "on",
         )
         now = time.time()
+        pose_mode = _pose_gpu_path_mode()
+        allow_cpu_fallback = pose_mode == _POSE_GPU_PATH_CPU_DEBUG
         for frame_meta in frame_items:
             object_items = getattr(frame_meta, "object_items", None) or []
             if debug:
@@ -3125,35 +3361,44 @@ class PoseKeypointOverlayProcessor:
                 except Exception:
                     track_id = -1
 
-                output = self._extract_pose_output(obj_meta)
-                if output is None:
-                    if not self._missing_tensor_logged:
+                kpts = None
+                payload = self._extract_pose_payload(obj_meta)
+                if payload is not None:
+                    kpts = self._keypoints_from_payload(payload, bbox)
+
+                if kpts is None and allow_cpu_fallback:
+                    output = self._extract_pose_output(obj_meta)
+                    if output is not None:
+                        row = self._select_pose_row(output)
+                    else:
+                        row = None
+                    if row is not None:
+                        kpts_raw = np.asarray(row[6:], dtype=np.float32)
+                        if kpts_raw.size >= 17 * 3:
+                            kpts = kpts_raw[: 17 * 3].reshape(17, 3)
+                            normalized = float(np.max(row[:4])) <= 2.0
+                            roi_w = float(bbox[2])
+                            roi_h = float(bbox[3])
+                            if roi_w > 0 and roi_h > 0:
+                                kpts = self._map_keypoints(kpts, roi_w=roi_w, roi_h=roi_h, normalized=normalized)
+                                kpts[:, 0] += float(bbox[0])
+                                kpts[:, 1] += float(bbox[1])
+                            else:
+                                kpts = None
+
+                if kpts is None:
+                    if payload is None and not self._missing_native_logged:
+                        self._missing_native_logged = True
+                        logger.info(
+                            "Pose keypoint overlay missing native pose meta; "
+                            "set NOESIS_POSE_GPU_PATH=cpu_debug to allow tensor fallback"
+                        )
+                    if not self._missing_tensor_logged and allow_cpu_fallback:
                         logger.debug("Pose SGIE missing tensor meta (unique_id=%s)", int(self.gie_id))
                         self._missing_tensor_logged = True
                     if debug:
                         self._debug_missing += 1
                     continue
-                row = self._select_pose_row(output)
-                if row is None:
-                    if debug:
-                        self._debug_missing += 1
-                    continue
-
-                kpts_raw = np.asarray(row[6:], dtype=np.float32)
-                if kpts_raw.size < 17 * 3:
-                    if debug:
-                        self._debug_missing += 1
-                    continue
-                kpts = kpts_raw[: 17 * 3].reshape(17, 3)
-                normalized = float(np.max(row[:4])) <= 2.0
-
-                roi_w = float(bbox[2])
-                roi_h = float(bbox[3])
-                if roi_w <= 0 or roi_h <= 0:
-                    continue
-                kpts = self._map_keypoints(kpts, roi_w=roi_w, roi_h=roi_h, normalized=normalized)
-                kpts[:, 0] += float(bbox[0])
-                kpts[:, 1] += float(bbox[1])
 
                 source_id = self._frame_source_id(frame_meta)
                 stable_id = self._lookup_stable_id(source_id, track_id) if track_id >= 0 else None
@@ -3814,8 +4059,60 @@ class _AnalyticsTelemetryProcessor:
         # SV3DT uses Z-up; place the footpoint on the ground plane (Z = center - 0.5 * height).
         return [float(x), float(y), float(z - 0.5 * z_len)]
 
+    def _extract_reid_embedding_native(self, obj_meta: Any) -> Optional[np.ndarray]:
+        if noesis_reid_meta_ext is None:
+            return None
+        extract_obj = getattr(noesis_reid_meta_ext, "extract_reid_embedding", None)
+        if extract_obj is None or not callable(extract_obj):
+            return None
+        try:
+            payload = extract_obj(
+                obj_meta,
+                int(self._reid_unique_id),
+                str(self._reid_layer_name),
+                512,
+                True,
+            )
+        except Exception:
+            return None
+        if payload is None:
+            return None
+        try:
+            emb = np.asarray(payload, dtype=np.float32).reshape(-1)
+        except Exception:
+            return None
+        if emb.size < 1:
+            return None
+        if not np.all(np.isfinite(emb)):
+            return None
+        n = float(np.linalg.norm(emb) + 1e-12)
+        if not math.isfinite(n) or n <= 0.0:
+            return None
+        return (emb / n).astype(np.float32, copy=False)
+
     def _extract_reid_embedding_ds8(self, obj_meta: Any) -> Optional[np.ndarray]:
         """Extract OSNet embedding from DS8 object tensor meta (SGIE output)."""
+        reid_mode = _reid_gpu_path_mode()
+        if reid_mode == _REID_GPU_PATH_NATIVE:
+            emb_native = self._extract_reid_embedding_native(obj_meta)
+            if emb_native is not None:
+                return emb_native
+            global _REID_NATIVE_MISSING_LOGGED
+            if not _REID_NATIVE_MISSING_LOGGED and noesis_reid_meta_ext is None:
+                logger.warning(
+                    "ReID native extraction unavailable; build scripts/build_noesis_reid_meta_ext.sh "
+                    "or set NOESIS_REID_GPU_PATH=cpu_debug"
+                )
+                _REID_NATIVE_MISSING_LOGGED = True
+        if _zero_copy_disable_reid_cpu_enabled() and reid_mode != _REID_GPU_PATH_CPU_DEBUG:
+            global _REID_CPU_SKIP_LOGGED
+            if not _REID_CPU_SKIP_LOGGED:
+                logger.info(
+                    "Skipping ReID host embedding extraction in zero-copy mode "
+                    "(set NOESIS_REID_GPU_PATH=cpu_debug or NOESIS_ZERO_COPY_DISABLE_REID_CPU=0 to re-enable)"
+                )
+                _REID_CPU_SKIP_LOGGED = True
+            return None
         tensor_items_iter = getattr(obj_meta, "tensor_items", None)
         if tensor_items_iter is None:
             return None
@@ -5635,6 +5932,7 @@ class _MapAnythingOperator(BatchMetadataOperator):  # pragma: no cover - require
                     self._matched_frames += 1
                 elif converted_items:
                     ids = [getattr(item, "unique_id", None) for item in converted_items]
+                    _increment_core_counter("tensor_gie_mismatch_drops_total.mapanything")
                     if not self._warned_no_match:
                         logger.debug(
                             "MapAnything tensor_items present but no matching gie_id=%s (frame_number=%s, available_ids=%s)",
@@ -5643,12 +5941,6 @@ class _MapAnythingOperator(BatchMetadataOperator):  # pragma: no cover - require
                             ids,
                         )
                         self._warned_no_match = True
-                    # Fallback: process the first tensor_meta when no matching gie_id is found.
-                    try:
-                        self._processor.handle_nvds_tensor_ds8(frame_meta, converted_items[0])
-                        self._matched_frames += 1
-                    except Exception:
-                        logger.exception("Failed to process MapAnything tensors from batch metadata (DS8)")
             except Exception:
                 logger.exception("Failed to process MapAnything tensors from batch metadata (DS8)")
 

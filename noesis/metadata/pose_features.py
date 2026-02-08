@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Dict, Optional, Sequence, Tuple
+from typing import Any, Dict, Optional, Sequence
 
 
 @dataclass
@@ -18,6 +18,8 @@ class PoseFeatureResult:
     kpt_min_conf: float
     kpt_valid_frac: float
     features: Dict[str, float] = field(default_factory=dict)
+    keypoints_roi: Optional[Sequence[Sequence[float]]] = None
+    keypoints_abs: Optional[Sequence[Sequence[float]]] = None
     stable_id: Optional[int] = None
     model: str = "yolo26-pose"
     version: int = 1
@@ -41,6 +43,14 @@ class PoseFeatureResult:
         }
         if self.stable_id is not None:
             payload["stable_id"] = int(self.stable_id)
+        if self.keypoints_roi is not None:
+            payload["keypoints_roi"] = [
+                [float(p[0]), float(p[1]), float(p[2])] for p in self.keypoints_roi
+            ]
+        if self.keypoints_abs is not None:
+            payload["keypoints_abs"] = [
+                [float(p[0]), float(p[1]), float(p[2])] for p in self.keypoints_abs
+            ]
         if self.ts_us is not None:
             payload["ts_us"] = int(self.ts_us)
         return payload

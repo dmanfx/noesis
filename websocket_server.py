@@ -95,18 +95,82 @@ class WebSocketServer:
         self._boundary_last_ms = 0.0
         self._boundary_total_bytes = 0
         self._boundary_last_bytes = 0
+        self._boundary_budget_ms = 3.0
+        self._boundary_violations = 0
+        self._boundary_route_metrics: Dict[str, Dict[str, Any]] = {}
+        self._boundary_stage_metrics: Dict[str, Dict[str, Any]] = {}
 
-    def _record_boundary_serialization(self, duration_ms: float, payload_bytes: int) -> None:
+    def _new_boundary_bucket(self, maxlen: int = 1024) -> Dict[str, Any]:
+        return {
+            "samples": deque(maxlen=maxlen),
+            "count": 0,
+            "total_ms": 0.0,
+            "max_ms": 0.0,
+            "last_ms": 0.0,
+            "total_bytes": 0,
+            "last_bytes": 0,
+        }
+
+    def _update_boundary_bucket(self, bucket: Dict[str, Any], duration_ms: float, payload_bytes: int) -> None:
+        bucket["samples"].append(duration_ms)
+        bucket["count"] = int(bucket.get("count", 0)) + 1
+        bucket["total_ms"] = float(bucket.get("total_ms", 0.0)) + float(duration_ms)
+        bucket["max_ms"] = max(float(bucket.get("max_ms", 0.0)), float(duration_ms))
+        bucket["last_ms"] = float(duration_ms)
+        bucket["total_bytes"] = int(bucket.get("total_bytes", 0)) + int(payload_bytes)
+        bucket["last_bytes"] = int(payload_bytes)
+
+    def _record_boundary_serialization_stage(
+        self,
+        duration_ms: float,
+        payload_bytes: int,
+        *,
+        channel: str = "ws",
+        route: str = "broadcast",
+        message_type: str = "unknown",
+        stage: str = "total",
+        outcome: str = "ok",
+        include_budget: bool = True,
+    ) -> None:
         with self._boundary_lock:
             d = max(0.0, float(duration_ms))
             b = max(0, int(payload_bytes))
-            self._boundary_samples_ms.append(d)
-            self._boundary_count += 1
-            self._boundary_total_ms += d
-            self._boundary_max_ms = max(self._boundary_max_ms, d)
-            self._boundary_last_ms = d
-            self._boundary_total_bytes += b
-            self._boundary_last_bytes = b
+            if include_budget and stage == "total":
+                self._boundary_samples_ms.append(d)
+                self._boundary_count += 1
+                self._boundary_total_ms += d
+                self._boundary_max_ms = max(self._boundary_max_ms, d)
+                self._boundary_last_ms = d
+                self._boundary_total_bytes += b
+                self._boundary_last_bytes = b
+                if d > float(self._boundary_budget_ms):
+                    self._boundary_violations += 1
+
+            route_key = f"{channel}|{route}|{message_type}|{outcome}"
+            route_bucket = self._boundary_route_metrics.get(route_key)
+            if route_bucket is None:
+                route_bucket = self._new_boundary_bucket()
+                self._boundary_route_metrics[route_key] = route_bucket
+            self._update_boundary_bucket(route_bucket, d, b)
+
+            stage_key = f"{channel}|{route}|{message_type}|{stage}|{outcome}"
+            stage_bucket = self._boundary_stage_metrics.get(stage_key)
+            if stage_bucket is None:
+                stage_bucket = self._new_boundary_bucket()
+                self._boundary_stage_metrics[stage_key] = stage_bucket
+            self._update_boundary_bucket(stage_bucket, d, b)
+
+    def _record_boundary_serialization(self, duration_ms: float, payload_bytes: int) -> None:
+        self._record_boundary_serialization_stage(
+            duration_ms,
+            payload_bytes,
+            channel="ws",
+            route="legacy",
+            message_type="legacy",
+            stage="total",
+            outcome="ok",
+            include_budget=True,
+        )
 
     @staticmethod
     def _percentile(values: List[float], q: float) -> Optional[float]:
@@ -129,7 +193,50 @@ class WebSocketServer:
             last_ms = float(self._boundary_last_ms)
             total_bytes = int(self._boundary_total_bytes)
             last_bytes = int(self._boundary_last_bytes)
+            violations = int(self._boundary_violations)
+            route_snapshot = {
+                str(k): {
+                    "samples": list(v.get("samples", [])),
+                    "count": int(v.get("count", 0)),
+                    "total_ms": float(v.get("total_ms", 0.0)),
+                    "max_ms": float(v.get("max_ms", 0.0)),
+                    "last_ms": float(v.get("last_ms", 0.0)),
+                    "total_bytes": int(v.get("total_bytes", 0)),
+                    "last_bytes": int(v.get("last_bytes", 0)),
+                }
+                for k, v in self._boundary_route_metrics.items()
+            }
+            stage_snapshot = {
+                str(k): {
+                    "samples": list(v.get("samples", [])),
+                    "count": int(v.get("count", 0)),
+                    "total_ms": float(v.get("total_ms", 0.0)),
+                    "max_ms": float(v.get("max_ms", 0.0)),
+                    "last_ms": float(v.get("last_ms", 0.0)),
+                    "total_bytes": int(v.get("total_bytes", 0)),
+                    "last_bytes": int(v.get("last_bytes", 0)),
+                }
+                for k, v in self._boundary_stage_metrics.items()
+            }
         avg_ms = (total_ms / float(count)) if count > 0 else None
+        def _summarize(snapshot: Dict[str, Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
+            out: Dict[str, Dict[str, Any]] = {}
+            for key, item in snapshot.items():
+                values = [float(x) for x in item.get("samples", [])]
+                icount = int(item.get("count", 0))
+                itotal = float(item.get("total_ms", 0.0))
+                out[key] = {
+                    "count": icount,
+                    "avg_ms": (itotal / float(icount)) if icount > 0 else None,
+                    "p50_ms": self._percentile(values, 0.50),
+                    "p95_ms": self._percentile(values, 0.95),
+                    "p99_ms": self._percentile(values, 0.99),
+                    "max_ms": float(item.get("max_ms", 0.0)) if icount > 0 else None,
+                    "last_ms": float(item.get("last_ms", 0.0)) if icount > 0 else None,
+                    "total_bytes": int(item.get("total_bytes", 0)),
+                    "last_payload_bytes": int(item.get("last_bytes", 0)),
+                }
+            return out
         return {
             "count": count,
             "avg_ms": avg_ms,
@@ -140,6 +247,10 @@ class WebSocketServer:
             "last_ms": last_ms if count > 0 else None,
             "total_bytes": total_bytes,
             "last_payload_bytes": last_bytes,
+            "budget_ms": float(self._boundary_budget_ms),
+            "violations": violations,
+            "routes": _summarize(route_snapshot),
+            "stages": _summarize(stage_snapshot),
         }
 
     def reset_boundary_serialization_metrics(self) -> None:
@@ -151,6 +262,78 @@ class WebSocketServer:
             self._boundary_last_ms = 0.0
             self._boundary_total_bytes = 0
             self._boundary_last_bytes = 0
+            self._boundary_violations = 0
+            self._boundary_route_metrics.clear()
+            self._boundary_stage_metrics.clear()
+
+    async def _send_json_with_boundary_metrics(
+        self,
+        websocket: Any,
+        payload: Dict[str, Any],
+        *,
+        route: str,
+        message_type: str = "unknown",
+        use_to_thread_json: bool = False,
+    ) -> None:
+        convert_start_ns = time.perf_counter_ns()
+        safe_payload = convert_numpy_types(payload)
+        convert_ms = (time.perf_counter_ns() - convert_start_ns) / 1_000_000.0
+        self._record_boundary_serialization_stage(
+            convert_ms,
+            0,
+            channel="ws",
+            route=route,
+            message_type=message_type,
+            stage="numpy_convert",
+            outcome="ok",
+            include_budget=False,
+        )
+
+        encode_start_ns = time.perf_counter_ns()
+        if use_to_thread_json:
+            message_text = await asyncio.to_thread(json.dumps, safe_payload, separators=(",", ":"))
+        else:
+            message_text = json.dumps(safe_payload, separators=(",", ":"))
+        payload_bytes = len(message_text.encode("utf-8"))
+        encode_ms = (time.perf_counter_ns() - encode_start_ns) / 1_000_000.0
+        self._record_boundary_serialization_stage(
+            encode_ms,
+            payload_bytes,
+            channel="ws",
+            route=route,
+            message_type=message_type,
+            stage="json_encode",
+            outcome="ok",
+            include_budget=False,
+        )
+
+        send_start_ns = time.perf_counter_ns()
+        await websocket.send(message_text)
+        send_ms = (time.perf_counter_ns() - send_start_ns) / 1_000_000.0
+        self._record_boundary_serialization_stage(
+            send_ms,
+            payload_bytes,
+            channel="ws",
+            route=route,
+            message_type=message_type,
+            stage="send_dispatch",
+            outcome="ok",
+            include_budget=False,
+        )
+
+        # Keep gate metric aligned with historical budget semantics:
+        # conversion + JSON encoding only. Send dispatch is reported separately.
+        total_ms = float(convert_ms + encode_ms)
+        self._record_boundary_serialization_stage(
+            total_ms,
+            payload_bytes,
+            channel="ws",
+            route=route,
+            message_type=message_type,
+            stage="total",
+            outcome="ok",
+            include_budget=True,
+        )
 
     def _get_webrtc_owner(self) -> Optional[Any]:
         owner = self._webrtc_owner
@@ -170,18 +353,17 @@ class WebSocketServer:
 
         try:
             if isinstance(message, dict):
-                start_ns = time.perf_counter_ns()
-                message = convert_numpy_types(message)
+                message_type = str(message.get("type", "unknown"))
                 try:
                     self._record_tx(message)
                 except Exception:
                     pass
-                encoded = json.dumps(message)
-                self._record_boundary_serialization(
-                    duration_ms=(time.perf_counter_ns() - start_ns) / 1_000_000.0,
-                    payload_bytes=len(encoded.encode("utf-8")),
+                await self._send_json_with_boundary_metrics(
+                    websocket,
+                    message,
+                    route="send_to_client",
+                    message_type=message_type,
                 )
-                await websocket.send(encoded)
             elif isinstance(message, str):
                 await websocket.send(message)
             elif isinstance(message, bytes):
@@ -1163,7 +1345,12 @@ class WebSocketServer:
                                 'error': 'no_provider',
                                 'ok': False,
                             }
-                            await websocket.send(json.dumps(result))
+                            await self._send_json_with_boundary_metrics(
+                                websocket,
+                                result,
+                                route="get_ma_depth",
+                                message_type="ma_depth_response",
+                            )
                             continue
 
                         rate_key = f"{client_ip}:{camera}"
@@ -1179,9 +1366,21 @@ class WebSocketServer:
                             }
 
                         try:
+                            provider_start_ns = time.perf_counter_ns()
                             payload = await asyncio.wait_for(
                                 asyncio.to_thread(provider, camera, ts_max_us, request_id),
                                 timeout=self._depth_rpc_timeout,
+                            )
+                            provider_ms = (time.perf_counter_ns() - provider_start_ns) / 1_000_000.0
+                            self._record_boundary_serialization_stage(
+                                provider_ms,
+                                0,
+                                channel="ws",
+                                route="get_ma_depth",
+                                message_type="ma_depth_response",
+                                stage="provider_wait",
+                                outcome="ok",
+                                include_budget=False,
                             )
                             if payload:
                                 if 'type' not in payload:
@@ -1192,9 +1391,13 @@ class WebSocketServer:
                                 payload.setdefault('served_from_cache', False)
                                 payload.setdefault('ts_us', 0)
                                 payload.setdefault('ok', 'error' not in payload)
-                                safe_payload = convert_numpy_types(payload)
-                                message_text = await asyncio.to_thread(json.dumps, safe_payload)
-                                await websocket.send(message_text)
+                                await self._send_json_with_boundary_metrics(
+                                    websocket,
+                                    payload,
+                                    route="get_ma_depth",
+                                    message_type="ma_depth_response",
+                                    use_to_thread_json=True,
+                                )
                             else:
                                 result = {
                                     'type': 'ma_depth_response',
@@ -1204,7 +1407,12 @@ class WebSocketServer:
                                     'error': 'not_available',
                                     'ok': False,
                                 }
-                                await websocket.send(json.dumps(result))
+                                await self._send_json_with_boundary_metrics(
+                                    websocket,
+                                    result,
+                                    route="get_ma_depth",
+                                    message_type="ma_depth_response",
+                                )
                         except asyncio.TimeoutError:
                             self.logger.warning(f"Depth RPC timed out for {camera} from {client_ip}")
                             result = {
@@ -1215,7 +1423,12 @@ class WebSocketServer:
                                 'error': 'timeout',
                                 'ok': False,
                             }
-                            await websocket.send(json.dumps(result))
+                            await self._send_json_with_boundary_metrics(
+                                websocket,
+                                result,
+                                route="get_ma_depth",
+                                message_type="ma_depth_response",
+                            )
                         except Exception as exc:
                             result = {
                                 'type': 'ma_depth_response',
@@ -1225,7 +1438,12 @@ class WebSocketServer:
                                 'error': str(exc),
                                 'ok': False,
                             }
-                            await websocket.send(json.dumps(result))
+                            await self._send_json_with_boundary_metrics(
+                                websocket,
+                                result,
+                                route="get_ma_depth",
+                                message_type="ma_depth_response",
+                            )
 
                     elif data.get('type') == 'get_floorplan':
                         request_id = data.get('request_id') or data.get('requestId') or str(uuid.uuid4())
@@ -1247,7 +1465,12 @@ class WebSocketServer:
                         }
                         if not callable(provider):
                             result['error'] = 'no_provider'
-                            await websocket.send(json.dumps(result))
+                            await self._send_json_with_boundary_metrics(
+                                websocket,
+                                result,
+                                route="get_floorplan",
+                                message_type="floorplan_response",
+                            )
                             continue
 
                         rate_key = f"{client_ip}:{camera or 'unknown'}"
@@ -1263,25 +1486,57 @@ class WebSocketServer:
                             }
 
                         try:
+                            provider_start_ns = time.perf_counter_ns()
                             payload = await asyncio.wait_for(
                                 asyncio.to_thread(provider, camera, max_age_sec, grid_res_m, max_extent_m, cache_only=cache_only),
                                 timeout=self._floorplan_rpc_timeout
                             )
+                            provider_ms = (time.perf_counter_ns() - provider_start_ns) / 1_000_000.0
+                            self._record_boundary_serialization_stage(
+                                provider_ms,
+                                0,
+                                channel="ws",
+                                route="get_floorplan",
+                                message_type="floorplan_response",
+                                stage="provider_wait",
+                                outcome="ok",
+                                include_budget=False,
+                            )
                             if payload:
                                 result.update(payload)
-                                message_text = await asyncio.to_thread(json.dumps, result)
-                                await websocket.send(message_text)
+                                await self._send_json_with_boundary_metrics(
+                                    websocket,
+                                    result,
+                                    route="get_floorplan",
+                                    message_type="floorplan_response",
+                                    use_to_thread_json=True,
+                                )
                             else:
                                 result['error'] = 'no_payload'
-                                await websocket.send(json.dumps(result))
+                                await self._send_json_with_boundary_metrics(
+                                    websocket,
+                                    result,
+                                    route="get_floorplan",
+                                    message_type="floorplan_response",
+                                )
                         except asyncio.TimeoutError:
                             self.logger.warning(f"Floorplan RPC timed out for {camera} from {client_ip}")
                             result['error'] = 'timeout'
-                            await websocket.send(json.dumps(result))
+                            await self._send_json_with_boundary_metrics(
+                                websocket,
+                                result,
+                                route="get_floorplan",
+                                message_type="floorplan_response",
+                            )
                         except Exception as exc:
                             result['error'] = str(exc)
                             self.logger.error(f"Floorplan generation error: {exc}")
-                            await websocket.send(json.dumps(result))
+                            await self._send_json_with_boundary_metrics(
+                                websocket,
+                                result,
+                                route="get_floorplan",
+                                message_type="floorplan_response",
+                            )
 
                     # Handle individual detection toggles
                     elif data.get('type') == 'set_detection_toggle':
@@ -1464,22 +1719,46 @@ class WebSocketServer:
         disconnected_clients = []
         # Use a list to preserve order for correct result-to-client mapping
         active_clients = list(self.connected_clients)
+        is_dict_message = isinstance(message, dict)
+        message_type = "unknown"
+        payload_bytes = 0
 
         try:
             # Prepare message based on type
             if isinstance(message, dict):
                 # Convert to JSON string
-                start_ns = time.perf_counter_ns()
+                message_type = str(message.get("type", "unknown"))
+                convert_start_ns = time.perf_counter_ns()
                 message = convert_numpy_types(message)
+                convert_ms = (time.perf_counter_ns() - convert_start_ns) / 1_000_000.0
+                self._record_boundary_serialization_stage(
+                    convert_ms,
+                    0,
+                    channel="ws",
+                    route="broadcast",
+                    message_type=message_type,
+                    stage="numpy_convert",
+                    outcome="ok",
+                    include_budget=False,
+                )
                 # Record TX telemetry for tracked messages (e.g., calibration-bundle)
                 try:
                     self._record_tx(message)
                 except Exception:
                     pass
-                message_str = json.dumps(message)
-                self._record_boundary_serialization(
-                    duration_ms=(time.perf_counter_ns() - start_ns) / 1_000_000.0,
-                    payload_bytes=len(message_str.encode("utf-8")),
+                encode_start_ns = time.perf_counter_ns()
+                message_str = json.dumps(message, separators=(",", ":"))
+                payload_bytes = len(message_str.encode("utf-8"))
+                encode_ms = (time.perf_counter_ns() - encode_start_ns) / 1_000_000.0
+                self._record_boundary_serialization_stage(
+                    encode_ms,
+                    payload_bytes,
+                    channel="ws",
+                    route="broadcast",
+                    message_type=message_type,
+                    stage="json_encode",
+                    outcome="ok",
+                    include_budget=False,
                 )
             elif isinstance(message, bytes):
                 # Route binary frames into coalescer; actual sending is handled elsewhere
@@ -1493,10 +1772,35 @@ class WebSocketServer:
                 return
 
             # Send string message to active clients only
+            send_start_ns = time.perf_counter_ns()
             results = await asyncio.gather(
                 *[client.send(message_str) for client in active_clients],
                 return_exceptions=True
             )
+            if is_dict_message:
+                send_ms = (time.perf_counter_ns() - send_start_ns) / 1_000_000.0
+                self._record_boundary_serialization_stage(
+                    send_ms,
+                    payload_bytes,
+                    channel="ws",
+                    route="broadcast",
+                    message_type=message_type,
+                    stage="send_dispatch",
+                    outcome="ok",
+                    include_budget=False,
+                )
+                # Keep gate metric aligned with conversion+encode budget only.
+                total_ms = float(convert_ms + encode_ms)
+                self._record_boundary_serialization_stage(
+                    total_ms,
+                    payload_bytes,
+                    channel="ws",
+                    route="broadcast",
+                    message_type=message_type,
+                    stage="total",
+                    outcome="ok",
+                    include_budget=True,
+                )
 
             # Check for errors and mark disconnected clients
             for i, result in enumerate(results):

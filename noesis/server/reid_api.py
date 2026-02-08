@@ -6,6 +6,7 @@ from typing import Any, Callable, Dict, List, Optional
 
 from fastapi import FastAPI, HTTPException, Query
 from pydantic import BaseModel, Field
+from noesis.server.boundary_metrics import record_rest_response
 
 logger = logging.getLogger(__name__)
 
@@ -148,13 +149,23 @@ def list_aliases() -> AliasListResponse:
         history_count = int(len(history)) if isinstance(history, list) else 0
     except Exception:
         history_count = 0
-    return AliasListResponse(
+    model_start_ns = time.perf_counter_ns()
+    response = AliasListResponse(
         enabled=bool(getattr(mgr, "aliases_enabled", False)),
         aliases=aliases,
         alias_file=str(alias_file) if alias_file else None,
         copresence_window_s=float(getattr(mgr, "copresence_window_s", 0.0)),
         history_count=history_count,
     )
+    model_ms = (time.perf_counter_ns() - model_start_ns) / 1_000_000.0
+    record_rest_response(
+        "/api/v1/reid/aliases:get",
+        "AliasListResponse",
+        model_duration_ms=model_ms,
+        payload=response,
+        include_budget=True,
+    )
+    return response
 
 
 @app.post(
@@ -173,7 +184,17 @@ def merge_aliases(req: MergeRequest) -> MergeResponse:
         now_ts=time.time(),
     )
     aliases = _list_aliases(mgr)
-    return _merge_payload_to_response(payload, fallback_a=req.a, fallback_b=req.b, aliases=aliases)
+    model_start_ns = time.perf_counter_ns()
+    response = _merge_payload_to_response(payload, fallback_a=req.a, fallback_b=req.b, aliases=aliases)
+    model_ms = (time.perf_counter_ns() - model_start_ns) / 1_000_000.0
+    record_rest_response(
+        "/api/v1/reid/aliases/merge:post",
+        "MergeResponse",
+        model_duration_ms=model_ms,
+        payload=response,
+        include_budget=True,
+    )
+    return response
 
 
 @app.post(
@@ -229,12 +250,22 @@ def merge_batch(req: MergeBatchRequest) -> MergeBatchResponse:
     if failed_count is None:
         failed_count = max(0, len(results) - applied_count)
 
-    return MergeBatchResponse(
+    model_start_ns = time.perf_counter_ns()
+    response = MergeBatchResponse(
         results=results,
         applied_count=applied_count,
         failed_count=failed_count,
         aliases=aliases,
     )
+    model_ms = (time.perf_counter_ns() - model_start_ns) / 1_000_000.0
+    record_rest_response(
+        "/api/v1/reid/aliases/merge-batch:post",
+        "MergeBatchResponse",
+        model_duration_ms=model_ms,
+        payload=response,
+        include_budget=True,
+    )
+    return response
 
 
 @app.post(
@@ -246,12 +277,22 @@ def unset_alias(req: UnsetRequest) -> UnsetResponse:
     mgr = _get_mgr()
     payload = mgr.unset_alias(req.src)
     aliases = _list_aliases(mgr)
-    return UnsetResponse(
+    model_start_ns = time.perf_counter_ns()
+    response = UnsetResponse(
         src=int(payload.get("src", req.src)),
         removed=bool(payload.get("removed", False)),
         reason=payload.get("reason"),
         aliases=aliases,
     )
+    model_ms = (time.perf_counter_ns() - model_start_ns) / 1_000_000.0
+    record_rest_response(
+        "/api/v1/reid/aliases/unset:post",
+        "UnsetResponse",
+        model_duration_ms=model_ms,
+        payload=response,
+        include_budget=True,
+    )
+    return response
 
 
 @app.post(
@@ -270,10 +311,20 @@ def suggest_aliases(req: SuggestRequest) -> SuggestResponse:
         require_inactive=req.require_inactive,
         now_ts=time.time(),
     )
-    return SuggestResponse(
+    model_start_ns = time.perf_counter_ns()
+    response = SuggestResponse(
         candidates=[SuggestCandidate(**candidate) for candidate in candidates],
         default_min_sim=default_min_sim,
     )
+    model_ms = (time.perf_counter_ns() - model_start_ns) / 1_000_000.0
+    record_rest_response(
+        "/api/v1/reid/aliases/suggest:post",
+        "SuggestResponse",
+        model_duration_ms=model_ms,
+        payload=response,
+        include_budget=True,
+    )
+    return response
 
 
 @app.post(
@@ -284,7 +335,15 @@ def clear_aliases() -> Dict[str, Any]:
     mgr = _get_mgr()
     cleared = mgr.clear_aliases()
     aliases = _list_aliases(mgr)
-    return {"cleared": int(cleared), "aliases": aliases}
+    response = {"cleared": int(cleared), "aliases": aliases}
+    record_rest_response(
+        "/api/v1/reid/aliases/clear:post",
+        "DictResponse",
+        model_duration_ms=0.0,
+        payload=response,
+        include_budget=True,
+    )
+    return response
 
 
 @app.get(
@@ -299,4 +358,12 @@ def alias_history(limit: int = Query(100, ge=1, le=5000)) -> Dict[str, Any]:
     if limit > 0:
         history = history[-limit:]
     history = list(reversed(history))
-    return {"history": history}
+    response = {"history": history}
+    record_rest_response(
+        "/api/v1/reid/aliases/history:get",
+        "DictResponse",
+        model_duration_ms=0.0,
+        payload=response,
+        include_budget=True,
+    )
+    return response

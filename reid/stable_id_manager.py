@@ -102,6 +102,10 @@ class StableIDManager:
         # External embedding support (e.g., DeepStream SGIE tensor outputs).
         # When disabled, embeddings are extracted internally from BGR crops.
         use_extractor: bool = True,
+        # StableID similarity compute backend (hybrid CPU/GPU mode).
+        compute_backend: str = "auto",
+        gpu_device: Optional[str] = None,
+        gpu_min_gallery: int = 32,
         # Pose feature support (optional).
         pose_enabled: bool = False,
         pose_weight: float = 0.15,
@@ -130,6 +134,16 @@ class StableIDManager:
     ) -> None:
         self._lock = threading.RLock()
         self._use_extractor = bool(use_extractor)
+        self.compute_backend = str(compute_backend or "auto").strip().lower()
+        self.gpu_device = str(gpu_device or device or "cuda:0")
+        self.gpu_min_gallery = int(max(1, gpu_min_gallery))
+        self._backend_mode = "cpu"
+        self._gpu_fallback_count = 0
+        self._backend_last_error: Optional[str] = None
+        self._match_latency_ms: Deque[float] = deque(maxlen=512)
+        self._torch = None
+        self._torch_device = None
+        self._gpu_enabled = False
         self.extractor: Optional[EmbeddingExtractor]
         if self._use_extractor:
             self.extractor = EmbeddingExtractor(
@@ -260,6 +274,114 @@ class StableIDManager:
             self._free_sids = [sid for sid in self._free_sids if sid not in self.sid_alias_reserved]
             heapq.heapify(self._free_sids)
             self._free_sids_set = set(self._free_sids)
+        self._init_compute_backend()
+
+    def _init_compute_backend(self) -> None:
+        pref = str(self.compute_backend or "auto").strip().lower()
+        if pref in ("cpu", "numpy"):
+            self._backend_mode = "cpu"
+            return
+        try:
+            import torch  # type: ignore
+        except Exception as exc:
+            self._backend_mode = "cpu"
+            self._backend_last_error = f"torch_import:{type(exc).__name__}"
+            if pref in ("gpu", "cuda", "torch"):
+                self._gpu_fallback_count += 1
+            return
+        if not bool(getattr(torch, "cuda", None)) or not bool(torch.cuda.is_available()):
+            self._backend_mode = "cpu"
+            self._backend_last_error = "cuda_unavailable"
+            if pref in ("gpu", "cuda", "torch"):
+                self._gpu_fallback_count += 1
+            return
+        try:
+            dev = torch.device(self.gpu_device)
+            if getattr(dev, "type", "") != "cuda":
+                raise ValueError("non_cuda_device")
+            _ = torch.tensor([1.0], device=dev)
+        except Exception as exc:
+            self._backend_mode = "cpu"
+            self._backend_last_error = f"cuda_device:{type(exc).__name__}"
+            if pref in ("gpu", "cuda", "torch"):
+                self._gpu_fallback_count += 1
+            return
+        self._torch = torch
+        self._torch_device = dev
+        self._backend_mode = "gpu"
+        self._gpu_enabled = True
+
+    def _record_match_latency(self, start_ns: int) -> None:
+        try:
+            elapsed_ms = max(0.0, (time.perf_counter_ns() - int(start_ns)) / 1_000_000.0)
+            self._match_latency_ms.append(float(elapsed_ms))
+        except Exception:
+            pass
+
+    @staticmethod
+    def _percentile(values: List[float], q: float) -> Optional[float]:
+        if not values:
+            return None
+        arr = np.asarray(values, dtype=np.float64)
+        if arr.size < 1:
+            return None
+        return float(np.percentile(arr, q))
+
+    def _similarity_for_candidates(self, emb: np.ndarray, candidates: List[int]) -> Dict[int, float]:
+        sims: Dict[int, float] = {}
+        if emb is None or len(candidates) < 1:
+            return sims
+        emb_vec = np.asarray(emb, dtype=np.float32).reshape(-1)
+        centroid_rows: List[np.ndarray] = []
+        sid_rows: List[int] = []
+        for sid in candidates:
+            sid_int = int(sid)
+            centroid = self.sid_centroid.get(sid_int)
+            if centroid is None:
+                vecs = self.gallery.get(sid_int)
+                if vecs:
+                    embs = [v for (_ts, v) in vecs if v is not None]
+                    if embs:
+                        centroid = np.mean(np.stack(embs, axis=0), axis=0)
+                        centroid = centroid / (np.linalg.norm(centroid) + 1e-12)
+                        centroid = centroid.astype(np.float32)
+                        self.sid_centroid[sid_int] = centroid
+            if centroid is None:
+                continue
+            c = np.asarray(centroid, dtype=np.float32).reshape(-1)
+            if c.shape[0] != emb_vec.shape[0]:
+                continue
+            centroid_rows.append(c)
+            sid_rows.append(sid_int)
+        if not sid_rows:
+            return sims
+
+        use_gpu = bool(self._gpu_enabled and self._backend_mode == "gpu" and len(sid_rows) >= int(self.gpu_min_gallery))
+        if use_gpu:
+            try:
+                torch = self._torch
+                if torch is None or self._torch_device is None:
+                    raise RuntimeError("torch_backend_uninitialized")
+                q = torch.as_tensor(emb_vec, dtype=torch.float32, device=self._torch_device)
+                q = q / (torch.norm(q) + 1e-12)
+                mat = torch.as_tensor(np.stack(centroid_rows, axis=0), dtype=torch.float32, device=self._torch_device)
+                mat = mat / (torch.linalg.norm(mat, dim=1, keepdim=True) + 1e-12)
+                sim_vec = torch.matmul(mat, q)
+                sim_np = sim_vec.detach().cpu().numpy().astype(np.float32, copy=False)
+                for idx, sid_int in enumerate(sid_rows):
+                    sims[int(sid_int)] = float(sim_np[idx])
+                return sims
+            except Exception as exc:
+                self._backend_mode = "cpu"
+                self._gpu_enabled = False
+                self._gpu_fallback_count += 1
+                self._backend_last_error = f"gpu_similarity:{type(exc).__name__}"
+
+        mat_np = np.stack(centroid_rows, axis=0).astype(np.float32, copy=False)
+        sim_np = np.matmul(mat_np, emb_vec.reshape(-1, 1)).reshape(-1)
+        for idx, sid_int in enumerate(sid_rows):
+            sims[int(sid_int)] = float(sim_np[idx])
+        return sims
 
     # --------------- Allocator -----------------
     def _alloc_sid(self) -> int:
@@ -844,6 +966,7 @@ class StableIDManager:
         now_ts: Optional[float] = None,
         min_reid: Optional[float] = None,
     ) -> Tuple[Optional[int], float, float]:
+        start_ns = time.perf_counter_ns()
         best_id, best_score = None, -1.0
         best_reid = -1.0
         best_req = float(self.cos_sim_high_threshold)
@@ -859,20 +982,11 @@ class StableIDManager:
                 continue
             seen.add(sid_can)
             candidates.append(sid_can)
+        sim_by_sid = self._similarity_for_candidates(emb, candidates)
         for sid in candidates:
-            vecs = self.gallery.get(int(sid))
-            if not vecs:
+            sim = sim_by_sid.get(int(sid))
+            if sim is None:
                 continue
-            # Use EMA centroid when available; fallback to mean
-            centroid = self.sid_centroid.get(int(sid))
-            if centroid is None:
-                embs = [v for (_ts, v) in vecs if v is not None]
-                if not embs:
-                    continue
-                centroid = np.mean(np.stack(embs, axis=0), axis=0)
-                norm = np.linalg.norm(centroid) + 1e-12
-                centroid = centroid / norm
-            sim = self._cosine(emb, centroid)
 
             score = sim
             if self.adaptive_penalty and curr_bbox is not None:
@@ -943,6 +1057,7 @@ class StableIDManager:
                 best_score = float(combined)
                 best_reid = float(score)
                 best_req = float(req)
+        self._record_match_latency(start_ns)
         return best_id, float(best_reid), float(best_req)
 
     # --------------- Public API --------------
@@ -2210,12 +2325,21 @@ class StableIDManager:
                 # Free pool size
                 free_pool_size = len(getattr(self, "_free_sids_set", set()))
                 pending_new = len(self._pending_new_counts)
+                latency_vals = list(self._match_latency_ms)
+                p50 = self._percentile(latency_vals, 50.0)
+                p95 = self._percentile(latency_vals, 95.0)
                 return {
                     "active_unique": len(active_sids),
                     "active_by_sensor": active_counts,
                     "ghost_unique": len(ghost_sids),
                     "ghost_entries": total_ghosts,
                     "gallery_ids": len(self.gallery),
+                    "stableid_gallery_size": len(self.gallery),
+                    "stableid_backend_mode": str(self._backend_mode),
+                    "stableid_gpu_match_p50_ms": p50,
+                    "stableid_gpu_match_p95_ms": p95,
+                    "stableid_gpu_fallback_count": int(self._gpu_fallback_count),
+                    "stableid_backend_last_error": self._backend_last_error,
                     "free_sid_pool_size": free_pool_size,
                     "next_sid": int(self.next_stable_id),
                     "pending_new_count": int(pending_new),

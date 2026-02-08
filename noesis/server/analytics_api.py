@@ -7,6 +7,7 @@ import logging
 import configparser
 import os
 import threading
+import time
 from pathlib import Path
 
 import yaml
@@ -14,6 +15,7 @@ from fastapi import FastAPI, HTTPException, Query
 from pydantic import BaseModel, Field, validator
 
 from noesis.server.depth_api import ensure_pipeline_ready  # noqa: F401 - re-export for dependency parity
+from noesis.server.boundary_metrics import record_rest_response
 
 logger = logging.getLogger(__name__)
 
@@ -384,7 +386,17 @@ def list_rois(stage: str = Query("exclude", min_length=1)) -> ROIListResponse:
         except KeyError as exc:
             raise HTTPException(status_code=404, detail=f"Stage '{stage}' not defined") from exc
 
-        return _stage_to_response(stage, stage_cfg)
+        model_start_ns = time.perf_counter_ns()
+        response = _stage_to_response(stage, stage_cfg)
+        model_ms = (time.perf_counter_ns() - model_start_ns) / 1_000_000.0
+        record_rest_response(
+            "/api/v1/analytics/rois:get",
+            "ROIListResponse",
+            model_duration_ms=model_ms,
+            payload=response,
+            include_budget=True,
+        )
+        return response
 
 
 @app.post("/api/v1/analytics/rois", response_model=ROIUpdateResponse)
@@ -401,7 +413,19 @@ def update_rois(request: ROIUpdateRequest) -> ROIUpdateResponse:
         _apply_updates(stage_cfg, request)
         _store_config(config)
 
+        stage_response_start_ns = time.perf_counter_ns()
         response = _stage_to_response(request.stage, stage_cfg)
+        stage_response_ms = (time.perf_counter_ns() - stage_response_start_ns) / 1_000_000.0
 
     reloaded = _trigger_reload(request.stage, stage_cfg)
-    return ROIUpdateResponse(**response.model_dump(), reloaded=reloaded)
+    final_model_start_ns = time.perf_counter_ns()
+    final_response = ROIUpdateResponse(**response.model_dump(), reloaded=reloaded)
+    final_model_ms = (time.perf_counter_ns() - final_model_start_ns) / 1_000_000.0
+    record_rest_response(
+        "/api/v1/analytics/rois:post",
+        "ROIUpdateResponse",
+        model_duration_ms=float(stage_response_ms + final_model_ms),
+        payload=final_response,
+        include_budget=True,
+    )
+    return final_response

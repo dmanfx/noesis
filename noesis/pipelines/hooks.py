@@ -54,6 +54,176 @@ except Exception:  # pragma: no cover - fallback when diagnostics are absent
 logger = logging.getLogger(__name__)
 _REID_DLPACK_DEBUG_LOGGED = False
 _POSE_DLPACK_TORCH_LOGGED = False
+_CORE_FALLBACK_POLICY_ALLOW = "allow"
+_CORE_FALLBACK_POLICY_GATE = "gate"
+_CORE_FALLBACK_POLICY_FAIL = "fail"
+_DLPACK_HOST_READ_LOCK = threading.Lock()
+
+
+class _CorePathFallbackConversionError(RuntimeError):
+    """Raised when fallback conversion policy requests fail-fast behavior."""
+
+
+def _resolve_core_fallback_policy() -> str:
+    raw = str(os.environ.get("NOESIS_CORE_PATH_FALLBACK_POLICY", _CORE_FALLBACK_POLICY_ALLOW) or "").strip().lower()
+    if raw in ("fail", "fail-fast", "strict", "error"):
+        return _CORE_FALLBACK_POLICY_FAIL
+    if raw in ("gate", "block", "drop", "skip"):
+        return _CORE_FALLBACK_POLICY_GATE
+    return _CORE_FALLBACK_POLICY_ALLOW
+
+
+@dataclass
+class _CorePathInstrumentation:
+    _lock: threading.Lock = field(default_factory=threading.Lock, init=False, repr=False)
+    counters: Dict[str, int] = field(default_factory=dict, init=False, repr=False)
+    serialization_prep: Dict[str, Dict[str, int]] = field(default_factory=dict, init=False, repr=False)
+    events: deque[Dict[str, Any]] = field(default_factory=lambda: deque(maxlen=512), init=False, repr=False)
+
+    def _inc_locked(self, key: str, delta: int = 1) -> int:
+        value = int(self.counters.get(key, 0)) + int(delta)
+        self.counters[key] = value
+        return value
+
+    def record_cpu_copy_violation(
+        self,
+        *,
+        location: str,
+        reason: str,
+        fallback: bool = False,
+        details: Mapping[str, Any] | None = None,
+    ) -> str:
+        now_ns = time.time_ns()
+        policy = _CORE_FALLBACK_POLICY_ALLOW
+        with self._lock:
+            total = self._inc_locked("core_path.cpu_copy_violation.total")
+            per_loc = self._inc_locked(f"core_path.cpu_copy_violation.{location}")
+            event: Dict[str, Any] = {
+                "type": "core_path_cpu_copy_violation",
+                "ts_ns": int(now_ns),
+                "location": str(location),
+                "reason": str(reason),
+                "fallback": bool(fallback),
+                "count": int(per_loc),
+                "total": int(total),
+            }
+            if details:
+                event["details"] = dict(details)
+            if fallback or per_loc <= 3 or (per_loc % 250) == 0:
+                self.events.append(event)
+            if fallback:
+                self._inc_locked("core_path.fallback_conversion.total")
+                self._inc_locked(f"core_path.fallback_conversion.{location}")
+                policy = _resolve_core_fallback_policy()
+                if policy != _CORE_FALLBACK_POLICY_ALLOW:
+                    self.events.append(
+                        {
+                            "type": "core_path_fallback_policy",
+                            "ts_ns": int(now_ns),
+                            "location": str(location),
+                            "policy": str(policy),
+                            "reason": str(reason),
+                        }
+                    )
+        return policy
+
+    def record_boundary_serialization_prep(
+        self,
+        *,
+        metric: str,
+        duration_ns: int,
+        payload_bytes: int | None = None,
+    ) -> None:
+        now_ns = time.time_ns()
+        metric_key = str(metric)
+        with self._lock:
+            bucket = self.serialization_prep.get(metric_key)
+            if bucket is None:
+                bucket = {
+                    "count": 0,
+                    "total_ns": 0,
+                    "max_ns": 0,
+                    "last_ns": 0,
+                    "total_bytes": 0,
+                    "last_payload_bytes": 0,
+                }
+                self.serialization_prep[metric_key] = bucket
+            bucket["count"] = int(bucket.get("count", 0)) + 1
+            bucket["total_ns"] = int(bucket.get("total_ns", 0)) + max(0, int(duration_ns))
+            bucket["max_ns"] = max(int(bucket.get("max_ns", 0)), max(0, int(duration_ns)))
+            bucket["last_ns"] = max(0, int(duration_ns))
+            if payload_bytes is not None:
+                bucket["total_bytes"] = int(bucket.get("total_bytes", 0)) + max(0, int(payload_bytes))
+                bucket["last_payload_bytes"] = max(0, int(payload_bytes))
+            count = int(bucket["count"])
+            self._inc_locked("boundary_serialization_prep.total")
+            self._inc_locked(f"boundary_serialization_prep.{metric_key}")
+            if count <= 3 or (count % 250) == 0:
+                event: Dict[str, Any] = {
+                    "type": "boundary_serialization_prep",
+                    "ts_ns": int(now_ns),
+                    "metric": metric_key,
+                    "duration_ns": max(0, int(duration_ns)),
+                    "count": count,
+                }
+                if payload_bytes is not None:
+                    event["payload_bytes"] = max(0, int(payload_bytes))
+                self.events.append(event)
+
+    def snapshot(self) -> Dict[str, Any]:
+        with self._lock:
+            return {
+                "counters": dict(self.counters),
+                "serialization_prep": {k: dict(v) for k, v in self.serialization_prep.items()},
+                "events": list(self.events),
+            }
+
+    def reset(self) -> None:
+        with self._lock:
+            self.counters.clear()
+            self.serialization_prep.clear()
+            self.events.clear()
+
+
+_CORE_PATH_INSTRUMENTATION = _CorePathInstrumentation()
+
+
+def get_core_path_instrumentation_snapshot() -> Dict[str, Any]:
+    """Return a thread-safe snapshot of core-path conversion counters/events."""
+    return _CORE_PATH_INSTRUMENTATION.snapshot()
+
+
+def reset_core_path_instrumentation() -> None:
+    """Reset core-path conversion counters/events."""
+    _CORE_PATH_INSTRUMENTATION.reset()
+
+
+def _serialize_compact_json_with_metrics(payload: Mapping[str, Any], *, metric: str) -> str:
+    start_ns = time.perf_counter_ns()
+    encoded = ""
+    try:
+        encoded = json.dumps(payload, separators=(",", ":"), sort_keys=False)
+        return encoded
+    finally:
+        _CORE_PATH_INSTRUMENTATION.record_boundary_serialization_prep(
+            metric=metric,
+            duration_ns=time.perf_counter_ns() - start_ns,
+            payload_bytes=len(encoded.encode("utf-8")) if encoded else 0,
+        )
+
+
+def _clone_tensor_for_host_read(tensor: Any, *, location: str) -> Any | None:
+    """Best-effort clone before host conversion to avoid shared metadata ownership hazards."""
+    if tensor is None:
+        return None
+    clone_fn = getattr(tensor, "clone", None)
+    if not callable(clone_fn):
+        return tensor
+    try:
+        return clone_fn()
+    except Exception:
+        logger.debug("Tensor clone failed before host read (%s)", location, exc_info=True)
+        return None
 
 
 def attach_intrinsics_hook(
@@ -811,20 +981,28 @@ class MapAnythingProcessor:
         dlpack_fn = getattr(tensor, "__dlpack__", None)
         if callable(dlpack_fn):
             try:
-                import torch.utils.dlpack as torch_dlpack
-                import torch
+                with _DLPACK_HOST_READ_LOCK:
+                    import torch.utils.dlpack as torch_dlpack
+                    import torch
 
-                # DLPack expects the consumer to pass its CUDA stream handle.
-                # Use torch's current stream when available.
-                stream = 0
-                try:
-                    if torch.cuda.is_available():
-                        stream = int(torch.cuda.current_stream().cuda_stream)
-                except Exception:
+                    start_ns = time.perf_counter_ns()
+                    # DLPack expects the consumer to pass its CUDA stream handle.
+                    # Use torch's current stream when available.
                     stream = 0
-                capsule = dlpack_fn(stream)
-                torch_tensor = torch_dlpack.from_dlpack(capsule)
-                return torch_tensor.detach().cpu().numpy()
+                    try:
+                        if torch.cuda.is_available():
+                            stream = int(torch.cuda.current_stream().cuda_stream)
+                    except Exception:
+                        stream = 0
+                    capsule = dlpack_fn(stream)
+                    torch_tensor = torch_dlpack.from_dlpack(capsule)
+                    arr = torch_tensor.detach().cpu().numpy()
+                    _CORE_PATH_INSTRUMENTATION.record_boundary_serialization_prep(
+                        metric="mapanything.tensor_dlpack_to_host",
+                        duration_ns=time.perf_counter_ns() - start_ns,
+                        payload_bytes=int(getattr(arr, "nbytes", 0) or 0),
+                    )
+                    return arr
             except Exception as exc:
                 logger.debug(
                     "Torch DLPack conversion failed for tensor (device=%s, dtype=%s, shape=%s): %s",
@@ -915,6 +1093,9 @@ class MapAnythingProcessor:
     def handle_nvds_tensor_ds8(self, frame_meta: Any, tensor_meta: Any) -> Optional[DepthResult]:
         """Handle DS8 pyservicemaker TensorOutputUserMetadata."""
         try:
+            if not self.pipeline.depth_enabled:
+                logger.debug("Depth disabled; dropping MapAnything tensors before DS8 conversion")
+                return None
             # DS8 API: tensor_meta.get_layers() returns dict[str, Tensor]
             layers = tensor_meta.get_layers() or {}
             if not layers:
@@ -1029,6 +1210,8 @@ class MapAnythingProcessor:
                         time.sleep(0.01)
                         continue
                     try:
+                        if not self.pipeline.depth_enabled:
+                            continue
                         tensors: Dict[str, np.ndarray] = {}
 
                         def _slice_batch(arr: np.ndarray, batch_id: int | None) -> np.ndarray:
@@ -1989,11 +2172,14 @@ def _dlpack_tensor_to_numpy(layer_tensor: Any) -> Optional[np.ndarray]:
         return None
 
     use_torch = os.environ.get("NOESIS_POSE_DLPACK_TORCH", "1")
+    fallback_reason = "torch_disabled"
     if str(use_torch).strip().lower() in ("1", "true", "yes", "on"):
+        fallback_reason = "torch_dlpack_failed"
         try:
             import torch
             import torch.utils.dlpack as torch_dlpack
 
+            start_ns = time.perf_counter_ns()
             stream = 0
             try:
                 if torch.cuda.is_available():
@@ -2002,7 +2188,16 @@ def _dlpack_tensor_to_numpy(layer_tensor: Any) -> Optional[np.ndarray]:
                 stream = 0
             capsule = dlpack_fn(stream)
             torch_tensor = torch_dlpack.from_dlpack(capsule)
-            return torch_tensor.detach().cpu().numpy()
+            arr = torch_tensor.detach().cpu().numpy()
+            _CORE_PATH_INSTRUMENTATION.record_cpu_copy_violation(
+                location="pose.tensor_dlpack_to_numpy",
+                reason="torch_dlpack_to_host",
+                details={
+                    "duration_ns": time.perf_counter_ns() - start_ns,
+                    "shape": tuple(int(x) for x in getattr(arr, "shape", ())),
+                },
+            )
+            return arr
         except Exception as exc:
             global _POSE_DLPACK_TORCH_LOGGED
             if not _POSE_DLPACK_TORCH_LOGGED:
@@ -2014,6 +2209,24 @@ def _dlpack_tensor_to_numpy(layer_tensor: Any) -> Optional[np.ndarray]:
                     exc,
                 )
                 _POSE_DLPACK_TORCH_LOGGED = True
+            fallback_reason = f"torch_dlpack_failed:{type(exc).__name__}"
+    policy = _CORE_PATH_INSTRUMENTATION.record_cpu_copy_violation(
+        location="pose.tensor_dlpack_to_numpy.fallback",
+        reason=fallback_reason,
+        fallback=True,
+        details={
+            "device": getattr(layer_tensor, "device_type", None),
+            "dtype": getattr(layer_tensor, "dtype", None),
+            "shape": getattr(layer_tensor, "shape", None),
+        },
+    )
+    if policy == _CORE_FALLBACK_POLICY_GATE:
+        logger.warning("Blocked pose fallback tensor conversion due to NOESIS_CORE_PATH_FALLBACK_POLICY=gate")
+        return None
+    if policy == _CORE_FALLBACK_POLICY_FAIL:
+        raise _CorePathFallbackConversionError(
+            "Pose fallback tensor conversion blocked by NOESIS_CORE_PATH_FALLBACK_POLICY=fail"
+        )
     try:
         import ctypes
         import ctypes.util
@@ -2120,6 +2333,7 @@ def _dlpack_tensor_to_numpy(layer_tensor: Any) -> Optional[np.ndarray]:
             return None
 
         out = np.empty((total,), dtype=np.float32)
+        start_ns = time.perf_counter_ns()
         dst_ptr = ctypes.c_void_p(int(out.ctypes.data))
         src_ptr = ctypes.c_void_p(int(dl.data) + int(dl.byte_offset))
         dev_type = int(dl.device.device_type)
@@ -2151,8 +2365,19 @@ def _dlpack_tensor_to_numpy(layer_tensor: Any) -> Optional[np.ndarray]:
             deleter = ctypes.CFUNCTYPE(None, ctypes.c_void_p)(deleter_ptr)
             deleter(managed_ptr)
 
+        _CORE_PATH_INSTRUMENTATION.record_cpu_copy_violation(
+            location="pose.tensor_dlpack_to_numpy.fallback_copy",
+            reason="ctypes_host_copy",
+            details={
+                "duration_ns": time.perf_counter_ns() - start_ns,
+                "bytes": int(nbytes),
+                "device_type": int(dev_type),
+            },
+        )
         return out.reshape(shape).astype(np.float32, copy=False)
     except Exception as exc:
+        if isinstance(exc, _CorePathFallbackConversionError):
+            raise
         logger.debug("Pose DLPack decode failed: %s", exc, exc_info=True)
         return None
 
@@ -2196,7 +2421,8 @@ class PoseFeatureProcessor:
     _debug_missing: int = field(default=0, init=False, repr=False)
 
     def _to_numpy(self, tensor: Any) -> Optional[np.ndarray]:
-        arr = _dlpack_tensor_to_numpy(tensor)
+        with _DLPACK_HOST_READ_LOCK:
+            arr = _dlpack_tensor_to_numpy(tensor)
         if arr is None:
             logger.debug(
                 "Pose tensor conversion failed (device=%s, dtype=%s, shape=%s)",
@@ -2265,7 +2491,10 @@ class PoseFeatureProcessor:
                     tensor = None
             if tensor is None:
                 continue
-            arr = self._to_numpy(tensor)
+            tensor_for_read = _clone_tensor_for_host_read(tensor, location="pose.feature.output")
+            if tensor_for_read is None:
+                continue
+            arr = self._to_numpy(tensor_for_read)
             if arr is not None:
                 return arr
         return None
@@ -2594,10 +2823,14 @@ class PoseFeatureProcessor:
                     self._debug_missing += 1
             else:
                 try:
+                    payload_json = _serialize_compact_json_with_metrics(
+                        payload,
+                        metric="pose_features.user_meta_json",
+                    )
                     ok = bool(
                         attach_obj(
                             obj_meta,
-                            json.dumps(payload, separators=(",", ":"), sort_keys=False),
+                            payload_json,
                             True,
                         )
                     )
@@ -2648,7 +2881,8 @@ class PoseKeypointOverlayProcessor:
     _debug_missing: int = field(default=0, init=False, repr=False)
 
     def _to_numpy(self, tensor: Any) -> Optional[np.ndarray]:
-        arr = _dlpack_tensor_to_numpy(tensor)
+        with _DLPACK_HOST_READ_LOCK:
+            arr = _dlpack_tensor_to_numpy(tensor)
         if arr is None:
             logger.debug(
                 "Pose keypoint tensor conversion failed (device=%s, dtype=%s, shape=%s)",
@@ -2704,7 +2938,10 @@ class PoseKeypointOverlayProcessor:
                     tensor = None
             if tensor is None:
                 continue
-            arr = self._to_numpy(tensor)
+            tensor_for_read = _clone_tensor_for_host_read(tensor, location="pose.overlay.output")
+            if tensor_for_read is None:
+                continue
+            arr = self._to_numpy(tensor_for_read)
             if arr is not None:
                 return arr
         return None
@@ -3287,6 +3524,57 @@ class _AnalyticsTelemetryProcessor:
             "yes",
             "on",
         )
+        fallback_reason = "torch_disabled"
+        use_torch = os.environ.get("NOESIS_REID_DLPACK_TORCH", "1")
+        if str(use_torch).strip().lower() in ("1", "true", "yes", "on"):
+            fallback_reason = "torch_dlpack_failed"
+            try:
+                import torch
+                import torch.utils.dlpack as torch_dlpack
+
+                start_ns = time.perf_counter_ns()
+                stream = 0
+                try:
+                    if torch.cuda.is_available():
+                        stream = int(torch.cuda.current_stream().cuda_stream)
+                except Exception:
+                    stream = 0
+                dlpack_capsule = layer_tensor.__dlpack__(stream)
+                torch_tensor = torch_dlpack.from_dlpack(dlpack_capsule)
+                emb = torch_tensor.detach().cpu().numpy().reshape(-1).astype(np.float32, copy=False)
+                _CORE_PATH_INSTRUMENTATION.record_cpu_copy_violation(
+                    location="reid.tensor_dlpack_to_embedding",
+                    reason="torch_dlpack_to_host",
+                    details={
+                        "duration_ns": time.perf_counter_ns() - start_ns,
+                        "length": int(emb.size),
+                    },
+                )
+                if emb.size < 1:
+                    return None
+                n = float(np.linalg.norm(emb) + 1e-12)
+                return (emb / n).astype(np.float32, copy=False)
+            except Exception as exc:
+                fallback_reason = f"torch_dlpack_failed:{type(exc).__name__}"
+                if dlpack_debug_enabled:
+                    logger.debug("ReID torch DLPack decode failed: %s", exc, exc_info=True)
+        policy = _CORE_PATH_INSTRUMENTATION.record_cpu_copy_violation(
+            location="reid.tensor_dlpack_to_embedding.fallback",
+            reason=fallback_reason,
+            fallback=True,
+            details={
+                "device": getattr(layer_tensor, "device_type", None),
+                "dtype": getattr(layer_tensor, "dtype", None),
+                "shape": getattr(layer_tensor, "shape", None),
+            },
+        )
+        if policy == _CORE_FALLBACK_POLICY_GATE:
+            logger.warning("Blocked ReID fallback embedding conversion due to NOESIS_CORE_PATH_FALLBACK_POLICY=gate")
+            return None
+        if policy == _CORE_FALLBACK_POLICY_FAIL:
+            raise _CorePathFallbackConversionError(
+                "ReID fallback embedding conversion blocked by NOESIS_CORE_PATH_FALLBACK_POLICY=fail"
+            )
         try:
             import ctypes
             import ctypes.util
@@ -3420,6 +3708,7 @@ class _AnalyticsTelemetryProcessor:
                 return _fail("nbytes")
 
             out = np.empty((total,), dtype=np.float32)
+            start_ns = time.perf_counter_ns()
             dst_ptr = ctypes.c_void_p(int(out.ctypes.data))
             src_ptr = ctypes.c_void_p(int(dl.data) + int(dl.byte_offset))
             dev_type = int(dl.device.device_type)
@@ -3450,12 +3739,23 @@ class _AnalyticsTelemetryProcessor:
                 deleter = ctypes.CFUNCTYPE(None, ctypes.c_void_p)(deleter_ptr)
                 deleter(managed_ptr)
 
+            _CORE_PATH_INSTRUMENTATION.record_cpu_copy_violation(
+                location="reid.tensor_dlpack_to_embedding.fallback_copy",
+                reason="ctypes_host_copy",
+                details={
+                    "duration_ns": time.perf_counter_ns() - start_ns,
+                    "bytes": int(nbytes),
+                    "device_type": int(dev_type),
+                },
+            )
             emb = out.reshape(-1).astype(np.float32, copy=False)
             if emb.size < 1:
                 return _fail("empty")
             n = float(np.linalg.norm(emb) + 1e-12)
             return (emb / n).astype(np.float32)
         except Exception as exc:
+            if isinstance(exc, _CorePathFallbackConversionError):
+                raise
             global _REID_DLPACK_DEBUG_LOGGED
             if dlpack_debug_enabled and not _REID_DLPACK_DEBUG_LOGGED:
                 logger.info("ReID DLPack decode raised: %s", exc, exc_info=True)
@@ -3570,7 +3870,11 @@ class _AnalyticsTelemetryProcessor:
                                 break
                         except Exception:
                             continue
-            emb = self._tensor_to_embedding(layer_tensor)
+            layer_tensor = _clone_tensor_for_host_read(layer_tensor, location="reid.embedding")
+            if layer_tensor is None:
+                continue
+            with _DLPACK_HOST_READ_LOCK:
+                emb = self._tensor_to_embedding(layer_tensor)
             if emb is None:
                 continue
             if not self._reid_logged_shape:

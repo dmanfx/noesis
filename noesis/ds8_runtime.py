@@ -762,6 +762,96 @@ def _resolve_tracking_mode(args: argparse.Namespace) -> str:
     return "baseline"
 
 
+def _port_bindable(host: str, port: int) -> bool:
+    if int(port) <= 0:
+        return True
+    try:
+        infos = socket.getaddrinfo(
+            host,
+            int(port),
+            type=socket.SOCK_STREAM,
+            proto=socket.IPPROTO_TCP,
+        )
+    except Exception:
+        infos = []
+    for family, socktype, proto, _canon, sockaddr in infos:
+        s = None
+        try:
+            s = socket.socket(family, socktype, proto)
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            s.bind(sockaddr)
+            return True
+        except Exception:
+            continue
+        finally:
+            try:
+                if s is not None:
+                    s.close()
+            except Exception:
+                pass
+    return False
+
+
+def _select_ws_port(host: str, requested_port: int, max_fallback_tries: int, logger: logging.Logger) -> int:
+    port = int(requested_port)
+    if port <= 0:
+        return port
+    if _port_bindable(host, port):
+        return port
+
+    tries = max(0, int(max_fallback_tries))
+    for offset in range(1, tries + 1):
+        candidate = port + offset
+        if candidate > 65535:
+            break
+        if _port_bindable(host, candidate):
+            logger.warning(
+                "Requested WS port %s unavailable on %s; using fallback port %s",
+                port,
+                host,
+                candidate,
+            )
+            return candidate
+    logger.error(
+        "Requested WS port %s unavailable on %s and no fallback port found within %s tries",
+        port,
+        host,
+        tries,
+    )
+    return port
+
+
+def _cuda_runtime_preflight() -> Tuple[bool, str]:
+    try:
+        import ctypes
+        import ctypes.util
+    except Exception as exc:
+        return False, f"ctypes_unavailable:{exc}"
+
+    cudart_path = ctypes.util.find_library("cudart")
+    if not cudart_path:
+        return False, "cudart_not_found"
+
+    try:
+        cudart = ctypes.CDLL(cudart_path)
+    except Exception as exc:
+        return False, f"cudart_load_failed:{exc}"
+
+    try:
+        cuda_get_device_count = cudart.cudaGetDeviceCount
+        cuda_get_device_count.restype = ctypes.c_int
+        cuda_get_device_count.argtypes = [ctypes.POINTER(ctypes.c_int)]
+        count = ctypes.c_int(0)
+        rc = int(cuda_get_device_count(ctypes.byref(count)))
+        if rc != 0:
+            return False, f"cudaGetDeviceCount_error:{rc}"
+        if int(count.value) <= 0:
+            return False, "cuda_device_count_zero"
+        return True, f"cuda_device_count:{int(count.value)}"
+    except Exception as exc:
+        return False, f"cuda_preflight_failed:{exc}"
+
+
 def _mode_default_paths(mode: str) -> Tuple[Path, Path]:
     if mode == "v3dt":
         return (
@@ -1369,6 +1459,8 @@ class _CalibrationProvider:
 def _build_stats_callback(
     pipeline: ds8_pipeline.DS8Pipeline,
     camera_labels: Dict[int, str],
+    ws_metrics_getter: Optional[Callable[[], Dict[str, Any]]] = None,
+    ws_metrics_resetter: Optional[Callable[[], None]] = None,
 ) -> Callable[[], Dict[str, object]]:
     start_time = time.time()
 
@@ -1438,6 +1530,16 @@ def _build_stats_callback(
             depth_fps = 0.0
         reload_count = getattr(pipeline, "analytics_reload_count", 0)
         cameras_stats: Dict[str, object] = {}
+        core_instr = hooks.get_core_path_instrumentation_snapshot()
+        core_counters = dict(core_instr.get("counters", {}))
+        core_violations = int(core_counters.get("core_path.cpu_copy_violation.total", 0))
+        fallback_conversions = int(core_counters.get("core_path.fallback_conversion.total", 0))
+        ws_boundary_metrics: Dict[str, Any] = {}
+        if callable(ws_metrics_getter):
+            try:
+                ws_boundary_metrics = ws_metrics_getter() or {}
+            except Exception:
+                ws_boundary_metrics = {}
         latency_collector = getattr(pipeline, "latency_collector", None)
         latency_by_source: Dict[int, Dict[str, object]] = {}
         latency_aggregate: Optional[Dict[str, object]] = None
@@ -1524,9 +1626,19 @@ def _build_stats_callback(
                 "activated": pipeline.activated,
                 "depth_enabled": pipeline.depth_enabled,
                 "depth_fps": depth_fps,
+                "zero_copy_core_enabled": True,
+                "zero_copy_violations": core_violations,
+                "zero_copy_fallback_conversions": fallback_conversions,
+                "boundary_cpu_serialization_p50_ms": ws_boundary_metrics.get("p50_ms"),
+                "boundary_cpu_serialization_p95_ms": ws_boundary_metrics.get("p95_ms"),
+                "boundary_cpu_serialization_p99_ms": ws_boundary_metrics.get("p99_ms"),
                 "analytics_reload_count": reload_count,
                 "mosaic_layout": _mosaic_layout(),
                 **({"latency_ms": latency_aggregate} if latency_aggregate is not None else {}),
+                "zero_copy_core": {
+                    "counters": core_counters,
+                    "boundary_serialization_metrics": ws_boundary_metrics,
+                },
                 "errors": list(pipeline.errors),
             },
             "cameras": cameras_stats,
@@ -1539,6 +1651,15 @@ def _build_stats_callback(
                 collector.clear()
         except Exception:
             pass
+        try:
+            hooks.reset_core_path_instrumentation()
+        except Exception:
+            pass
+        if callable(ws_metrics_resetter):
+            try:
+                ws_metrics_resetter()
+            except Exception:
+                pass
 
     setattr(_stats, "clear_stats", _clear_stats)
     return _stats
@@ -2408,6 +2529,13 @@ def main() -> int:
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
     logger = logging.getLogger("ds8.runtime")
+    ws_fallback_tries_raw = os.environ.get("NOESIS_WS_PORT_FALLBACK_TRIES", "32")
+    try:
+        ws_fallback_tries = int(str(ws_fallback_tries_raw).strip() or "32")
+    except Exception:
+        ws_fallback_tries = 32
+    args.ws_port = _select_ws_port(args.ws_host, int(args.ws_port), ws_fallback_tries, logger)
+    os.environ["NOESIS_WS_PORT"] = str(int(args.ws_port))
     # DeepStream's gst-nvvideo4linux2 encoder plugin can emit extremely noisy
     # "Encode Latency = ..." prints when NVDS latency measurement is enabled.
     # Suppress those lines by default; opt-out with NOESIS_SUPPRESS_ENCODE_LATENCY=0.
@@ -2515,6 +2643,21 @@ def main() -> int:
             return 1
     else:
         _warn_baseline_with_v3dt_tracker(pipeline_path, logger)
+
+    skip_cuda_preflight = str(os.environ.get("NOESIS_SKIP_CUDA_PREFLIGHT", "")).strip().lower() in _ENV_TRUE
+    stub_pipeline = str(os.environ.get("NOESIS_DS8_STUB_PIPELINE", "")).strip().lower() in _ENV_TRUE
+    if not stub_pipeline and not skip_cuda_preflight:
+        cuda_ok, cuda_msg = _cuda_runtime_preflight()
+        if not cuda_ok:
+            logger.error(
+                "CUDA preflight failed (%s). Aborting before DS8 pipeline startup to avoid unstable runtime crashes.",
+                cuda_msg,
+            )
+            logger.error("Set NOESIS_SKIP_CUDA_PREFLIGHT=1 to bypass this guardrail.")
+            return 1
+        logger.info("CUDA preflight passed (%s)", cuda_msg)
+    elif skip_cuda_preflight:
+        logger.warning("Skipping CUDA preflight because NOESIS_SKIP_CUDA_PREFLIGHT is enabled")
 
     base_pipeline_path = pipeline_path
     pipeline_path = _materialize_effective_pipeline_yaml(
@@ -3091,8 +3234,14 @@ def main() -> int:
     ws_server = WebSocketServer(
         host=args.ws_host,
         port=args.ws_port,
-        stats_callback=_build_stats_callback(pipeline, camera_labels),
+        stats_callback=None,
         initial_trail_state=bool(trail_settings.enabled),
+    )
+    ws_server.stats_callback = _build_stats_callback(
+        pipeline,
+        camera_labels,
+        ws_metrics_getter=ws_server.get_boundary_serialization_metrics,
+        ws_metrics_resetter=ws_server.reset_boundary_serialization_metrics,
     )
     trail_processor = getattr(pipeline, "trail_overlay_processor", None)
     bev_renderer: Optional[BevRenderer] = None
@@ -3455,8 +3604,36 @@ def main() -> int:
 
     ws_thread, ws_loop = _start_websocket_server(ws_server)
     if getattr(ws_server, "server", None) is None:
-        logger.error("WebSocket server failed to start; aborting DS8 runtime")
-        return 1
+        ws_bind_retry_raw = os.environ.get("NOESIS_WS_BIND_RETRY_TRIES", "4")
+        try:
+            ws_bind_retry_tries = max(0, int(str(ws_bind_retry_raw).strip() or "4"))
+        except Exception:
+            ws_bind_retry_tries = 4
+        for retry_idx in range(ws_bind_retry_tries):
+            next_port = _select_ws_port(args.ws_host, int(args.ws_port) + 1, 32, logger)
+            if next_port == int(args.ws_port):
+                break
+            if not _port_bindable(args.ws_host, int(next_port)):
+                logger.error(
+                    "No bindable WebSocket fallback port available starting at %s",
+                    int(args.ws_port) + 1,
+                )
+                break
+            args.ws_port = int(next_port)
+            os.environ["NOESIS_WS_PORT"] = str(int(args.ws_port))
+            ws_server.port = int(args.ws_port)
+            logger.warning(
+                "Retrying WebSocket server start on fallback port %s (attempt %s/%s)",
+                args.ws_port,
+                retry_idx + 1,
+                ws_bind_retry_tries,
+            )
+            ws_thread, ws_loop = _start_websocket_server(ws_server)
+            if getattr(ws_server, "server", None) is not None:
+                break
+        if getattr(ws_server, "server", None) is None:
+            logger.error("WebSocket server failed to start after retries; aborting DS8 runtime")
+            return 1
 
     # Activate the DS8 pipeline after prepare() using activate() not start()
     # NOTE: We use activate() because prepare() was already called above.

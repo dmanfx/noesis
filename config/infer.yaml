@@ -14,7 +14,7 @@ streammux:
   live-source: 1
   batched-push-timeout: 40000
   enable-padding: 1
-  nvbuf-memory-type: 0
+  nvbuf-memory-type: 0  # Canonical NVMM setting used across streammux/dewarper/RTSP vconv in DS8 builder.
   sync-inputs: 0
   gpu-id: 0
 

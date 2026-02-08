@@ -646,6 +646,16 @@ def build_pipeline(yaml_path: str | Path) -> DS8Pipeline:
     streammux_cfg.setdefault("enable-padding", 1)
     first_gpu = sources[0].get("gpu-id") if sources else 0
     streammux_cfg.setdefault("gpu-id", first_gpu if first_gpu is not None else 0)
+    try:
+        zero_copy_gpu_id = int(streammux_cfg.get("gpu-id", 0) or 0)
+    except Exception:
+        zero_copy_gpu_id = 0
+    streammux_cfg["gpu-id"] = zero_copy_gpu_id
+    try:
+        zero_copy_nvbuf_memory_type = int(streammux_cfg.get("nvbuf-memory-type", 0) or 0)
+    except Exception:
+        zero_copy_nvbuf_memory_type = 0
+    streammux_cfg["nvbuf-memory-type"] = zero_copy_nvbuf_memory_type
 
     def _dewarper_enabled(source_cfg: Dict[str, Any]) -> bool:
         raw = source_cfg.get("dewarper")
@@ -693,7 +703,7 @@ def build_pipeline(yaml_path: str | Path) -> DS8Pipeline:
             if uri:
                 props["uri"] = uri
             props.setdefault("source-id", idx)
-            props.setdefault("gpu-id", streammux_cfg.get("gpu-id", 0))
+            props.setdefault("gpu-id", zero_copy_gpu_id)
             if uri.lower().startswith("rtsp"):
                 # Keep conservative RTSP reconnect defaults for live feeds.
                 props.setdefault("rtsp-reconnect-interval", 10)
@@ -720,15 +730,15 @@ def build_pipeline(yaml_path: str | Path) -> DS8Pipeline:
                     dewarp_cfg["config-file"] = _abs_or_same(dewarp_cfg["config-file"])  # type: ignore[index]
                 dewarp_out = _read_dewarper_output_size(dewarp_cfg.get("config-file"))
                 dewarp_cfg.setdefault("source-id", idx)
-                dewarp_cfg.setdefault("gpu-id", streammux_cfg.get("gpu-id", 0))
-                dewarp_cfg.setdefault("nvbuf-memory-type", streammux_cfg.get("nvbuf-memory-type", 0))
+                dewarp_cfg.setdefault("gpu-id", zero_copy_gpu_id)
+                dewarp_cfg.setdefault("nvbuf-memory-type", zero_copy_nvbuf_memory_type)
 
                 conv = Component(
                     name=f"dewarper_conv_{idx}",
                     element="nvvideoconvert",
                     config={
-                        "gpu-id": streammux_cfg.get("gpu-id", 0),
-                        "nvbuf-memory-type": streammux_cfg.get("nvbuf-memory-type", 0),
+                        "gpu-id": zero_copy_gpu_id,
+                        "nvbuf-memory-type": zero_copy_nvbuf_memory_type,
                     },
                     downstream=[],
                 )
@@ -757,8 +767,8 @@ def build_pipeline(yaml_path: str | Path) -> DS8Pipeline:
                     name=f"dewarper_post_conv_{idx}",
                     element="nvvideoconvert",
                     config={
-                        "gpu-id": streammux_cfg.get("gpu-id", 0),
-                        "nvbuf-memory-type": streammux_cfg.get("nvbuf-memory-type", 0),
+                        "gpu-id": zero_copy_gpu_id,
+                        "nvbuf-memory-type": zero_copy_nvbuf_memory_type,
                     },
                     downstream=[],
                 )
@@ -799,9 +809,9 @@ def build_pipeline(yaml_path: str | Path) -> DS8Pipeline:
             "batched-push-timeout": streammux_cfg.get("batched-push-timeout", 40000),
             "live-source": streammux_cfg.get("live-source", 1),
             "enable-padding": streammux_cfg.get("enable-padding", 1),
-            "nvbuf-memory-type": streammux_cfg.get("nvbuf-memory-type", 0),
+            "nvbuf-memory-type": zero_copy_nvbuf_memory_type,
             "sync-inputs": streammux_cfg.get("sync-inputs", 0),
-            "gpu-id": streammux_cfg.get("gpu-id", 0),
+            "gpu-id": zero_copy_gpu_id,
             # Keep behavioral knobs consistent with current deployment INI:
             # - Avoid propagating EOS downstream when all sources hit EOS.
             # - Disable REST control API (port=0) since DS8 drives URIs from YAML.
@@ -1093,7 +1103,7 @@ def build_pipeline(yaml_path: str | Path) -> DS8Pipeline:
         tiler_square_seq_grid = False
 
     tiler_cfg: Dict[str, Any] = {
-        "gpu-id": streammux_cfg.get("gpu-id", 0),
+        "gpu-id": zero_copy_gpu_id,
         "width": streammux_cfg.get("width", 1920),
         "height": streammux_cfg.get("height", 1080),
     }
@@ -1156,12 +1166,13 @@ def build_pipeline(yaml_path: str | Path) -> DS8Pipeline:
     _safe_add(ds_pipeline, tiler, pipeline.errors)
     _apply_component_config(ds_pipeline, tiler, pipeline.errors)
 
+    osd_process_mode = 0
     osd = Component(
         name="osd",
         element="nvdsosd",
         config={
-            # CPU mode for broader compatibility; adjust if you prefer GPU path
-            "process-mode": 1,
+            # Keep OSD on GPU so the tiler -> OSD -> encoder path stays zero-copy/NVMM.
+            "process-mode": osd_process_mode,
             # Show instance segmentation masks from NvDsInferInstanceMaskInfo
             "display-mask": 1,
             # Hide bbox rectangles to emphasize masks; set to 1 if you want both
@@ -1239,6 +1250,7 @@ def build_pipeline(yaml_path: str | Path) -> DS8Pipeline:
     # This branch taps raw video surfaces from sink_tee, encodes to H.264, and outputs via RTSP
     # The RTSP output can be consumed by the WebRTC gateway for browser delivery
     rtsp_branch = {}
+    rtsp_vconv_nvbuf_memory_type = zero_copy_nvbuf_memory_type
     if rtsp_enabled:
         # Always put a queue immediately after the tee so this branch cannot backpressure
         # the main analytics/mosaic path when RTSP clients are slow or absent.
@@ -1257,8 +1269,8 @@ def build_pipeline(yaml_path: str | Path) -> DS8Pipeline:
             name="rtsp_vconv",
             element="nvvideoconvert",
             config={
-                "gpu-id": streammux_cfg.get("gpu-id", 0),
-                "nvbuf-memory-type": 0,
+                "gpu-id": zero_copy_gpu_id,
+                "nvbuf-memory-type": rtsp_vconv_nvbuf_memory_type,
             },
             downstream=[],
         )
@@ -1295,6 +1307,37 @@ def build_pipeline(yaml_path: str | Path) -> DS8Pipeline:
             _safe_add(ds_pipeline, comp, pipeline.errors)
             _apply_component_config(ds_pipeline, comp, pipeline.errors)
         sink_tee.downstream.append(rtsp_queue.name)
+
+    source_decode_memtypes: List[Optional[int]] = []
+    for source_cfg in sources:
+        if not isinstance(source_cfg, dict):
+            source_decode_memtypes.append(None)
+            continue
+        decode_mem = source_cfg.get("cudadec-memtype", source_cfg.get("cudadec_memtype"))
+        try:
+            source_decode_memtypes.append(int(decode_mem) if decode_mem is not None else None)
+        except Exception:
+            source_decode_memtypes.append(None)
+    logger.info(
+        json.dumps(
+            {
+                "event": "ds8_zero_copy_memory_config",
+                "streammux_element": streammux.element,
+                "per_source_pipeline": per_source_pipeline,
+                "source_count": len(sources),
+                "streammux_gpu_id": zero_copy_gpu_id,
+                "streammux_nvbuf_memory_type": zero_copy_nvbuf_memory_type,
+                "source_cudadec_memtype": source_decode_memtypes,
+                "tiler_gpu_id": int(tiler_cfg.get("gpu-id", zero_copy_gpu_id) or zero_copy_gpu_id),
+                "osd_process_mode": osd_process_mode,
+                "rtsp_enabled": rtsp_enabled,
+                "rtsp_vconv_nvbuf_memory_type": (
+                    rtsp_vconv_nvbuf_memory_type if rtsp_enabled else None
+                ),
+            },
+            separators=(",", ":"),
+        )
+    )
 
     # No per-camera frame branches in tiled mode
 

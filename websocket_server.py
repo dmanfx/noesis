@@ -1,10 +1,12 @@
-from typing import Dict, Optional, Any, Callable
+from typing import Dict, Optional, Any, Callable, List
 import asyncio
 import concurrent.futures
 from websockets.legacy.server import serve
 import json
 import logging
 import os
+from collections import deque
+import threading
 import time
 import uuid
 
@@ -84,6 +86,71 @@ class WebSocketServer:
         # webrtc_offer should receive webrtc_answer / server ICE candidates.
         self._webrtc_owner: Optional[Any] = None
         self._webrtc_owner_ip: Optional[str] = None
+        # Boundary serialization metrics (JSON conversion at WS boundary).
+        self._boundary_lock = threading.Lock()
+        self._boundary_samples_ms = deque(maxlen=4096)
+        self._boundary_count = 0
+        self._boundary_total_ms = 0.0
+        self._boundary_max_ms = 0.0
+        self._boundary_last_ms = 0.0
+        self._boundary_total_bytes = 0
+        self._boundary_last_bytes = 0
+
+    def _record_boundary_serialization(self, duration_ms: float, payload_bytes: int) -> None:
+        with self._boundary_lock:
+            d = max(0.0, float(duration_ms))
+            b = max(0, int(payload_bytes))
+            self._boundary_samples_ms.append(d)
+            self._boundary_count += 1
+            self._boundary_total_ms += d
+            self._boundary_max_ms = max(self._boundary_max_ms, d)
+            self._boundary_last_ms = d
+            self._boundary_total_bytes += b
+            self._boundary_last_bytes = b
+
+    @staticmethod
+    def _percentile(values: List[float], q: float) -> Optional[float]:
+        if not values:
+            return None
+        q = max(0.0, min(1.0, float(q)))
+        ordered = sorted(values)
+        if len(ordered) == 1:
+            return float(ordered[0])
+        idx = int(round(q * (len(ordered) - 1)))
+        idx = max(0, min(len(ordered) - 1, idx))
+        return float(ordered[idx])
+
+    def get_boundary_serialization_metrics(self) -> Dict[str, Any]:
+        with self._boundary_lock:
+            samples = list(self._boundary_samples_ms)
+            count = int(self._boundary_count)
+            total_ms = float(self._boundary_total_ms)
+            max_ms = float(self._boundary_max_ms)
+            last_ms = float(self._boundary_last_ms)
+            total_bytes = int(self._boundary_total_bytes)
+            last_bytes = int(self._boundary_last_bytes)
+        avg_ms = (total_ms / float(count)) if count > 0 else None
+        return {
+            "count": count,
+            "avg_ms": avg_ms,
+            "p50_ms": self._percentile(samples, 0.50),
+            "p95_ms": self._percentile(samples, 0.95),
+            "p99_ms": self._percentile(samples, 0.99),
+            "max_ms": max_ms if count > 0 else None,
+            "last_ms": last_ms if count > 0 else None,
+            "total_bytes": total_bytes,
+            "last_payload_bytes": last_bytes,
+        }
+
+    def reset_boundary_serialization_metrics(self) -> None:
+        with self._boundary_lock:
+            self._boundary_samples_ms.clear()
+            self._boundary_count = 0
+            self._boundary_total_ms = 0.0
+            self._boundary_max_ms = 0.0
+            self._boundary_last_ms = 0.0
+            self._boundary_total_bytes = 0
+            self._boundary_last_bytes = 0
 
     def _get_webrtc_owner(self) -> Optional[Any]:
         owner = self._webrtc_owner
@@ -103,12 +170,18 @@ class WebSocketServer:
 
         try:
             if isinstance(message, dict):
+                start_ns = time.perf_counter_ns()
                 message = convert_numpy_types(message)
                 try:
                     self._record_tx(message)
                 except Exception:
                     pass
-                await websocket.send(json.dumps(message))
+                encoded = json.dumps(message)
+                self._record_boundary_serialization(
+                    duration_ms=(time.perf_counter_ns() - start_ns) / 1_000_000.0,
+                    payload_bytes=len(encoded.encode("utf-8")),
+                )
+                await websocket.send(encoded)
             elif isinstance(message, str):
                 await websocket.send(message)
             elif isinstance(message, bytes):
@@ -1396,6 +1469,7 @@ class WebSocketServer:
             # Prepare message based on type
             if isinstance(message, dict):
                 # Convert to JSON string
+                start_ns = time.perf_counter_ns()
                 message = convert_numpy_types(message)
                 # Record TX telemetry for tracked messages (e.g., calibration-bundle)
                 try:
@@ -1403,6 +1477,10 @@ class WebSocketServer:
                 except Exception:
                     pass
                 message_str = json.dumps(message)
+                self._record_boundary_serialization(
+                    duration_ms=(time.perf_counter_ns() - start_ns) / 1_000_000.0,
+                    payload_bytes=len(message_str.encode("utf-8")),
+                )
             elif isinstance(message, bytes):
                 # Route binary frames into coalescer; actual sending is handled elsewhere
                 await self._coalesce_binary_and_maybe_flush(message)

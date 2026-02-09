@@ -40,6 +40,31 @@ except Exception:
     _NumcodecsBlosc = None  # type: ignore
 
 _FLOORPLAN_FRAME = "camera_local_ground"
+_CORE_COUNTER_FN = None
+_CORE_COUNTER_RESOLVED = False
+
+
+def _increment_core_boundary_copy_bytes(path: str, payload_bytes: int) -> None:
+    """Best-effort bridge into DS8 core counters without import-time cycles."""
+    global _CORE_COUNTER_FN, _CORE_COUNTER_RESOLVED
+    delta = max(0, int(payload_bytes))
+    if delta <= 0:
+        return
+    if not _CORE_COUNTER_RESOLVED:
+        _CORE_COUNTER_RESOLVED = True
+        try:
+            from noesis.pipelines import hooks as _hooks  # Local import to avoid circular import at module load.
+
+            fn = getattr(_hooks, "_increment_core_counter", None)
+            _CORE_COUNTER_FN = fn if callable(fn) else None
+        except Exception:
+            _CORE_COUNTER_FN = None
+    if _CORE_COUNTER_FN is None:
+        return
+    try:
+        _CORE_COUNTER_FN(f"tensor_boundary_copy_bytes_total.{str(path)}", delta)
+    except Exception:
+        pass
 
 
 def _infer_image_flips_from_extrinsics(
@@ -416,6 +441,12 @@ class DepthStorageManager:
         depth_c = np.ascontiguousarray(depth, dtype=np.float32).copy()
         conf_c = np.ascontiguousarray(conf, dtype=np.float32).copy()
         mask_c = np.ascontiguousarray(mask, dtype=np.uint8).copy()
+        _increment_core_boundary_copy_bytes(
+            "depth_store",
+            int(getattr(depth_c, "nbytes", 0) or 0)
+            + int(getattr(conf_c, "nbytes", 0) or 0)
+            + int(getattr(mask_c, "nbytes", 0) or 0),
+        )
         return _SnapshotJob(camera_id, ts_us, depth_c, conf_c, mask_c, dest_path)
 
     def _register_snapshot(self, camera_id: str, ts_us: int, dest_path: Path) -> None:

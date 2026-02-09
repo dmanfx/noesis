@@ -2,6 +2,7 @@ from typing import Dict, Optional, Any, Callable, List
 import asyncio
 import concurrent.futures
 from websockets.legacy.server import serve
+import websockets
 import json
 import logging
 import os

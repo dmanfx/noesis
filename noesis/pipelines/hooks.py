@@ -57,59 +57,9 @@ except Exception:  # pragma: no cover - fallback when diagnostics are absent
     TrackingDiagnosticsLogger = None  # type: ignore
 
 logger = logging.getLogger(__name__)
-_REID_DLPACK_DEBUG_LOGGED = False
-_REID_CPU_SKIP_LOGGED = False
 _REID_NATIVE_MISSING_LOGGED = False
-_POSE_DLPACK_TORCH_LOGGED = False
-_POSE_GPU_PATH_NATIVE = "native"
-_POSE_GPU_PATH_CPU_DEBUG = "cpu_debug"
-_REID_GPU_PATH_NATIVE = "native"
-_REID_GPU_PATH_CPU_DEBUG = "cpu_debug"
-_CORE_FALLBACK_POLICY_ALLOW = "allow"
-_CORE_FALLBACK_POLICY_GATE = "gate"
-_CORE_FALLBACK_POLICY_FAIL = "fail"
 _DLPACK_HOST_READ_LOCK = threading.Lock()
-
-
-class _CorePathFallbackConversionError(RuntimeError):
-    """Raised when fallback conversion policy requests fail-fast behavior."""
-
-
-def _resolve_core_fallback_policy() -> str:
-    # Strict fallback is the production zero-copy default unless explicitly overridden.
-    raw = str(os.environ.get("NOESIS_CORE_PATH_FALLBACK_POLICY", _CORE_FALLBACK_POLICY_FAIL) or "").strip().lower()
-    if raw in ("fail", "fail-fast", "strict", "error"):
-        return _CORE_FALLBACK_POLICY_FAIL
-    if raw in ("gate", "block", "drop", "skip"):
-        return _CORE_FALLBACK_POLICY_GATE
-    return _CORE_FALLBACK_POLICY_ALLOW
-
-
-def _zero_copy_disable_reid_cpu_enabled() -> bool:
-    """Return whether zero-copy mode should skip host-side ReID embedding extraction."""
-    raw_env = os.environ.get("NOESIS_ZERO_COPY_DISABLE_REID_CPU")
-    if raw_env is None:
-        profile = str(os.environ.get("NOESIS_ZERO_COPY_PROFILE", "") or "").strip().lower()
-        if profile in ("validate", "full", "debug"):
-            return False
-        raw = "1"
-    else:
-        raw = str(raw_env or "").strip().lower()
-    return raw not in ("0", "false", "no", "off")
-
-
-def _pose_gpu_path_mode() -> str:
-    raw = str(os.environ.get("NOESIS_POSE_GPU_PATH", _POSE_GPU_PATH_NATIVE) or "").strip().lower()
-    if raw in (_POSE_GPU_PATH_CPU_DEBUG, "cpu", "debug", "fallback"):
-        return _POSE_GPU_PATH_CPU_DEBUG
-    return _POSE_GPU_PATH_NATIVE
-
-
-def _reid_gpu_path_mode() -> str:
-    raw = str(os.environ.get("NOESIS_REID_GPU_PATH", _REID_GPU_PATH_NATIVE) or "").strip().lower()
-    if raw in (_REID_GPU_PATH_CPU_DEBUG, "cpu", "debug", "fallback"):
-        return _REID_GPU_PATH_CPU_DEBUG
-    return _REID_GPU_PATH_NATIVE
+_POSE_META_MAX_JSON_BYTES = 65536
 
 
 @dataclass
@@ -129,11 +79,9 @@ class _CorePathInstrumentation:
         *,
         location: str,
         reason: str,
-        fallback: bool = False,
         details: Mapping[str, Any] | None = None,
-    ) -> str:
+    ) -> None:
         now_ns = time.time_ns()
-        policy = _CORE_FALLBACK_POLICY_ALLOW
         with self._lock:
             total = self._inc_locked("core_path.cpu_copy_violation.total")
             per_loc = self._inc_locked(f"core_path.cpu_copy_violation.{location}")
@@ -142,29 +90,13 @@ class _CorePathInstrumentation:
                 "ts_ns": int(now_ns),
                 "location": str(location),
                 "reason": str(reason),
-                "fallback": bool(fallback),
                 "count": int(per_loc),
                 "total": int(total),
             }
             if details:
                 event["details"] = dict(details)
-            if fallback or per_loc <= 3 or (per_loc % 250) == 0:
+            if per_loc <= 3 or (per_loc % 250) == 0:
                 self.events.append(event)
-            if fallback:
-                self._inc_locked("core_path.fallback_conversion.total")
-                self._inc_locked(f"core_path.fallback_conversion.{location}")
-                policy = _resolve_core_fallback_policy()
-                if policy != _CORE_FALLBACK_POLICY_ALLOW:
-                    self.events.append(
-                        {
-                            "type": "core_path_fallback_policy",
-                            "ts_ns": int(now_ns),
-                            "location": str(location),
-                            "policy": str(policy),
-                            "reason": str(reason),
-                        }
-                    )
-        return policy
 
     def record_boundary_serialization_prep(
         self,
@@ -261,18 +193,13 @@ def _serialize_compact_json_with_metrics(payload: Mapping[str, Any], *, metric: 
         )
 
 
-def _clone_tensor_for_host_read(tensor: Any, *, location: str) -> Any | None:
-    """Best-effort clone before host conversion to avoid shared metadata ownership hazards."""
-    if tensor is None:
-        return None
-    clone_fn = getattr(tensor, "clone", None)
-    if not callable(clone_fn):
-        return tensor
+def _pose_meta_payload_limit_bytes() -> int:
+    raw = str(os.environ.get("NOESIS_POSE_META_MAX_JSON_BYTES", _POSE_META_MAX_JSON_BYTES) or _POSE_META_MAX_JSON_BYTES).strip()
     try:
-        return clone_fn()
+        parsed = int(raw)
     except Exception:
-        logger.debug("Tensor clone failed before host read (%s)", location, exc_info=True)
-        return None
+        parsed = int(_POSE_META_MAX_JSON_BYTES)
+    return max(1024, parsed)
 
 
 def attach_intrinsics_hook(
@@ -1016,21 +943,10 @@ class MapAnythingProcessor:
     _async_lock: threading.Lock = field(default_factory=threading.Lock, init=False, repr=False)
     _dropped_jobs: int = field(default=0, init=False, repr=False)
     _last_drop_log: float = field(default=0.0, init=False, repr=False)
-    _sync_debug_allowed: bool = field(default=False, init=False, repr=False)
-    _sync_forced_async_logged: bool = field(default=False, init=False, repr=False)
 
     def __post_init__(self) -> None:
-        flag = os.environ.get("NOESIS_MAPANYTHING_POSTPROCESS_ASYNC", "1")
-        self._async_enabled = str(flag).strip().lower() in ("1", "true", "yes", "on")
-        sync_flag = os.environ.get("NOESIS_MAPANYTHING_POSTPROCESS_SYNC_DEBUG", "0")
-        self._sync_debug_allowed = str(sync_flag).strip().lower() in ("1", "true", "yes", "on")
-        if not self._async_enabled and not self._sync_debug_allowed:
-            self._async_enabled = True
-            self._sync_forced_async_logged = True
-            logger.warning(
-                "MapAnything sync postprocess is debug-only; forcing async mode "
-                "(set NOESIS_MAPANYTHING_POSTPROCESS_SYNC_DEBUG=1 to allow sync path)"
-            )
+        # MapAnything host conversion must stay off the probe thread in DS8 production.
+        self._async_enabled = True
 
     def _to_numpy(self, tensor: Any) -> Optional[np.ndarray]:
         """Convert pyservicemaker Tensor to a CPU numpy array via DLPack.
@@ -1162,46 +1078,6 @@ class MapAnythingProcessor:
             layers = tensor_meta.get_layers() or {}
             if not layers:
                 return None
-
-            if not self._async_enabled:
-                if not self._sync_debug_allowed and not self._sync_forced_async_logged:
-                    self._sync_forced_async_logged = True
-                    logger.warning(
-                        "MapAnything sync postprocess path blocked in production; forcing async path "
-                        "(set NOESIS_MAPANYTHING_POSTPROCESS_SYNC_DEBUG=1 for debug)"
-                    )
-                    self._async_enabled = True
-                    return None
-                tensors: Dict[str, np.ndarray] = {}
-                layer_names: List[str] = []
-                for name, tensor in layers.items():
-                    key = str(name)
-                    layer_names.append(key)
-                    arr = self._to_numpy(tensor)
-                    if arr is not None:
-                        tensors[key] = arr
-                    else:
-                        logger.debug(
-                            "Failed to convert tensor '%s' to numpy (device=%s, dtype=%s, shape=%s)",
-                            key,
-                            getattr(tensor, "device_type", None),
-                            getattr(tensor, "dtype", None),
-                            getattr(tensor, "shape", None),
-                        )
-                if not tensors:
-                    logger.debug(
-                        "MapAnything tensor meta had no convertible layers (unique_id=%s)",
-                        getattr(tensor_meta, "unique_id", None),
-                    )
-                    return None
-                self.tensor_samples += 1
-                if self.tensor_samples <= 5 or (self.tensor_samples % 50) == 0:
-                    logger.debug(
-                        "MapAnything tensors received (unique_id=%s): %s",
-                        getattr(tensor_meta, "unique_id", None),
-                        ", ".join(layer_names) or "none",
-                    )
-                return self._emit_from_tensors(frame_meta, tensors)
 
             depth_tensor = layers.get("depth") or layers.get("depth_z") or layers.get("disp")
             conf_tensor = layers.get("confidence") or layers.get("conf")
@@ -2229,228 +2105,6 @@ _POSE_KPT_INDEX = {
 }
 
 
-def _dlpack_tensor_to_numpy(layer_tensor: Any) -> Optional[np.ndarray]:
-    """Convert a Service Maker Tensor (dlpack) into a numpy array.
-
-    Prefer torch's DLPack bridge when available to ensure the producer's
-    deleter runs and GPU ownership is released safely.
-    """
-    if layer_tensor is None:
-        return None
-    dlpack_fn = getattr(layer_tensor, "__dlpack__", None)
-    if not callable(dlpack_fn):
-        return None
-
-    use_torch = os.environ.get("NOESIS_POSE_DLPACK_TORCH", "1")
-    fallback_reason = "torch_disabled"
-    if str(use_torch).strip().lower() in ("1", "true", "yes", "on"):
-        fallback_reason = "torch_dlpack_failed"
-        try:
-            import torch
-            import torch.utils.dlpack as torch_dlpack
-
-            start_ns = time.perf_counter_ns()
-            stream = 0
-            try:
-                if torch.cuda.is_available():
-                    stream = int(torch.cuda.current_stream().cuda_stream)
-            except Exception:
-                stream = 0
-            capsule = dlpack_fn(stream)
-            torch_tensor = torch_dlpack.from_dlpack(capsule)
-            arr = torch_tensor.detach().cpu().numpy()
-            _CORE_PATH_INSTRUMENTATION.record_cpu_copy_violation(
-                location="pose.tensor_dlpack_to_numpy",
-                reason="torch_dlpack_to_host",
-                details={
-                    "duration_ns": time.perf_counter_ns() - start_ns,
-                    "shape": tuple(int(x) for x in getattr(arr, "shape", ())),
-                },
-            )
-            return arr
-        except Exception as exc:
-            global _POSE_DLPACK_TORCH_LOGGED
-            if not _POSE_DLPACK_TORCH_LOGGED:
-                logger.debug(
-                    "Pose torch DLPack conversion failed (device=%s, dtype=%s, shape=%s): %s",
-                    getattr(layer_tensor, "device_type", None),
-                    getattr(layer_tensor, "dtype", None),
-                    getattr(layer_tensor, "shape", None),
-                    exc,
-                )
-                _POSE_DLPACK_TORCH_LOGGED = True
-            fallback_reason = f"torch_dlpack_failed:{type(exc).__name__}"
-    policy = _CORE_PATH_INSTRUMENTATION.record_cpu_copy_violation(
-        location="pose.tensor_dlpack_to_numpy.fallback",
-        reason=fallback_reason,
-        fallback=True,
-        details={
-            "device": getattr(layer_tensor, "device_type", None),
-            "dtype": getattr(layer_tensor, "dtype", None),
-            "shape": getattr(layer_tensor, "shape", None),
-        },
-    )
-    if policy == _CORE_FALLBACK_POLICY_GATE:
-        logger.warning("Blocked pose fallback tensor conversion due to NOESIS_CORE_PATH_FALLBACK_POLICY=gate")
-        return None
-    if policy == _CORE_FALLBACK_POLICY_FAIL:
-        raise _CorePathFallbackConversionError(
-            "Pose fallback tensor conversion blocked by NOESIS_CORE_PATH_FALLBACK_POLICY=fail"
-        )
-    try:
-        import ctypes
-        import ctypes.util
-
-        def _get_capsule() -> Any:
-            try:
-                return dlpack_fn(None)
-            except Exception:
-                return dlpack_fn(0)
-
-        class _DLDevice(ctypes.Structure):
-            _fields_ = [("device_type", ctypes.c_int), ("device_id", ctypes.c_int)]
-
-        class _DLDataType(ctypes.Structure):
-            _fields_ = [("code", ctypes.c_uint8), ("bits", ctypes.c_uint8), ("lanes", ctypes.c_uint16)]
-
-        class _DLTensor(ctypes.Structure):
-            _fields_ = [
-                ("data", ctypes.c_void_p),
-                ("device", _DLDevice),
-                ("ndim", ctypes.c_int),
-                ("dtype", _DLDataType),
-                ("shape", ctypes.POINTER(ctypes.c_int64)),
-                ("strides", ctypes.POINTER(ctypes.c_int64)),
-                ("byte_offset", ctypes.c_uint64),
-            ]
-
-        class _DLManagedTensor(ctypes.Structure):
-            _fields_ = [("dl_tensor", _DLTensor), ("manager_ctx", ctypes.c_void_p), ("deleter", ctypes.c_void_p)]
-
-        class _DLPackVersion(ctypes.Structure):
-            _fields_ = [("major", ctypes.c_int32), ("minor", ctypes.c_int32)]
-
-        class _DLManagedTensorVersioned(ctypes.Structure):
-            _fields_ = [
-                ("version", _DLPackVersion),
-                ("dl_tensor", _DLTensor),
-                ("manager_ctx", ctypes.c_void_p),
-                ("deleter", ctypes.c_void_p),
-            ]
-
-        dlpack_capsule = _get_capsule()
-        raw_name = None
-        try:
-            get_name = ctypes.pythonapi.PyCapsule_GetName
-            get_name.restype = ctypes.c_char_p
-            get_name.argtypes = [ctypes.py_object]
-            raw_name = get_name(dlpack_capsule)
-        except Exception:
-            raw_name = None
-
-        get_ptr = ctypes.pythonapi.PyCapsule_GetPointer
-        get_ptr.restype = ctypes.c_void_p
-        get_ptr.argtypes = [ctypes.py_object, ctypes.c_char_p]
-        managed_ptr = get_ptr(dlpack_capsule, raw_name)
-        if not managed_ptr:
-            return None
-
-        dl = None
-        deleter_ptr = None
-        try:
-            managed_v = ctypes.cast(managed_ptr, ctypes.POINTER(_DLManagedTensorVersioned))
-            ver = managed_v.contents.version
-            dl_candidate = managed_v.contents.dl_tensor
-            ndim_candidate = int(dl_candidate.ndim)
-            dtype_bits_candidate = int(dl_candidate.dtype.bits)
-            dtype_code_candidate = int(dl_candidate.dtype.code)
-            dev_type_candidate = int(dl_candidate.device.device_type)
-            plausible = (
-                0 <= int(ver.major) <= 10
-                and 0 <= int(ver.minor) <= 10
-                and 1 <= ndim_candidate <= 8
-                and dtype_bits_candidate in (8, 16, 32, 64)
-                and 0 <= dtype_code_candidate <= 8
-                and 1 <= dev_type_candidate <= 32
-                and int(dl_candidate.data or 0) != 0
-            )
-            if plausible:
-                dl = dl_candidate
-                deleter_ptr = managed_v.contents.deleter
-        except Exception:
-            dl = None
-            deleter_ptr = None
-
-        if dl is None:
-            managed = ctypes.cast(managed_ptr, ctypes.POINTER(_DLManagedTensor))
-            dl = managed.contents.dl_tensor
-            deleter_ptr = managed.contents.deleter
-
-        ndim = int(dl.ndim)
-        if ndim < 1:
-            return None
-        shape = [int(dl.shape[i]) for i in range(ndim)]
-        total = 1
-        for dim in shape:
-            total *= max(1, int(dim))
-        dtype_bits = int(dl.dtype.bits)
-        dtype_code = int(dl.dtype.code)
-        dtype_lanes = int(dl.dtype.lanes)
-        if dtype_code != 2 or dtype_bits != 32 or dtype_lanes != 1:
-            return None
-        nbytes = int(total * (dtype_bits // 8) * dtype_lanes)
-        if nbytes <= 0:
-            return None
-
-        out = np.empty((total,), dtype=np.float32)
-        start_ns = time.perf_counter_ns()
-        dst_ptr = ctypes.c_void_p(int(out.ctypes.data))
-        src_ptr = ctypes.c_void_p(int(dl.data) + int(dl.byte_offset))
-        dev_type = int(dl.device.device_type)
-
-        if dev_type in (1, 3):  # kDLCPU / kDLCUDAHost
-            ctypes.memmove(dst_ptr, src_ptr, nbytes)
-        elif dev_type in (2, 13):  # kDLCUDA / kDLCUDAManaged
-            cudart_path = ctypes.util.find_library("cudart")
-            if not cudart_path:
-                return None
-            cudart = ctypes.CDLL(cudart_path)
-            cuda_memcpy = cudart.cudaMemcpy
-            cuda_memcpy.restype = ctypes.c_int
-            cuda_memcpy.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int]
-            err = int(cuda_memcpy(dst_ptr, src_ptr, ctypes.c_size_t(nbytes), ctypes.c_int(2)))
-            if err != 0:
-                return None
-        else:
-            return None
-
-        # Optional deleter call (disabled by default; matches reid handling).
-        call_deleter = str(os.environ.get("NOESIS_POSE_DLPACK_CALL_DELETER", "")).strip().lower() in (
-            "1",
-            "true",
-            "yes",
-            "on",
-        )
-        if call_deleter and deleter_ptr:
-            deleter = ctypes.CFUNCTYPE(None, ctypes.c_void_p)(deleter_ptr)
-            deleter(managed_ptr)
-
-        _CORE_PATH_INSTRUMENTATION.record_cpu_copy_violation(
-            location="pose.tensor_dlpack_to_numpy.fallback_copy",
-            reason="ctypes_host_copy",
-            details={
-                "duration_ns": time.perf_counter_ns() - start_ns,
-                "bytes": int(nbytes),
-                "device_type": int(dev_type),
-            },
-        )
-        return out.reshape(shape).astype(np.float32, copy=False)
-    except Exception as exc:
-        if isinstance(exc, _CorePathFallbackConversionError):
-            raise
-        logger.debug("Pose DLPack decode failed: %s", exc, exc_info=True)
-        return None
-
 _POSE_SKELETON = [
     (0, 1),
     (0, 2),
@@ -2480,27 +2134,12 @@ class PoseFeatureProcessor:
     kpt_threshold: float = 0.35
     letterbox: bool = True
     camera_labels: Mapping[int, str] = field(default_factory=dict)
-    _logged_layers: bool = field(default=False, init=False, repr=False)
-    _logged_shape: bool = field(default=False, init=False, repr=False)
-    _missing_tensor_logged: bool = field(default=False, init=False, repr=False)
     _missing_native_logged: bool = field(default=False, init=False, repr=False)
     _debug_last_log: float = field(default=0.0, init=False, repr=False)
     _debug_frames: int = field(default=0, init=False, repr=False)
     _debug_objects: int = field(default=0, init=False, repr=False)
     _debug_attached: int = field(default=0, init=False, repr=False)
     _debug_missing: int = field(default=0, init=False, repr=False)
-
-    def _to_numpy(self, tensor: Any) -> Optional[np.ndarray]:
-        with _DLPACK_HOST_READ_LOCK:
-            arr = _dlpack_tensor_to_numpy(tensor)
-        if arr is None:
-            logger.debug(
-                "Pose tensor conversion failed (device=%s, dtype=%s, shape=%s)",
-                getattr(tensor, "device_type", None),
-                getattr(tensor, "dtype", None),
-                getattr(tensor, "shape", None),
-            )
-        return arr
 
     def _frame_source_id(self, frame_meta: Any) -> int:
         for attr in ("source_id", "pad_index", "camera_id"):
@@ -2525,111 +2164,6 @@ class PoseFeatureProcessor:
         if pts_ns <= 0:
             pts_ns = int(time.time() * 1_000_000_000)
         return max(0, pts_ns // 1_000)
-
-    def _extract_pose_output(self, obj_meta: Any) -> Optional[np.ndarray]:
-        tensor_items_iter = getattr(obj_meta, "tensor_items", None)
-        if tensor_items_iter is None:
-            return None
-        try:
-            tensor_items = list(tensor_items_iter)
-        except Exception:
-            tensor_items = tensor_items_iter or []
-        for item in tensor_items:
-            try:
-                tensor_output = item.as_tensor_output()
-            except Exception:
-                continue
-            try:
-                if int(getattr(tensor_output, "unique_id", -1)) != int(self.gie_id):
-                    continue
-            except Exception:
-                continue
-            try:
-                layers = tensor_output.get_layers() or {}
-            except Exception:
-                continue
-            if not layers:
-                continue
-            if not self._logged_layers:
-                self._logged_layers = True
-                logger.info("YOLO26 pose tensor layers: %s", list(layers.keys()))
-            tensor = layers.get("output0")
-            if tensor is None and len(layers) == 1:
-                try:
-                    tensor = next(iter(layers.values()))
-                except Exception:
-                    tensor = None
-            if tensor is None:
-                continue
-            tensor_for_read = _clone_tensor_for_host_read(tensor, location="pose.feature.output")
-            if tensor_for_read is None:
-                continue
-            arr = self._to_numpy(tensor_for_read)
-            if arr is not None:
-                return arr
-        return None
-
-    def _select_pose_row(self, output: np.ndarray) -> Optional[np.ndarray]:
-        if output.ndim >= 3:
-            try:
-                output = output.reshape(-1, output.shape[-1])
-            except Exception:
-                output = output[0]
-        if output.ndim != 2 or output.shape[1] < 6 + 17 * 3:
-            return None
-        scores = output[:, 4]
-        if scores.size == 0:
-            return None
-        idx = int(np.argmax(scores))
-        score = float(scores[idx])
-        if score < float(self.score_threshold):
-            return None
-        if not self._logged_shape:
-            self._logged_shape = True
-            logger.info("YOLO26 pose output shape: %s", output.shape)
-        return output[idx]
-
-    def _letterbox_params(self, roi_w: float, roi_h: float) -> Tuple[float, float, float]:
-        if roi_w <= 0 or roi_h <= 0:
-            return 1.0, 0.0, 0.0
-        model_w, model_h = float(self.model_size[0]), float(self.model_size[1])
-        gain = min(model_w / roi_w, model_h / roi_h)
-        new_w = roi_w * gain
-        new_h = roi_h * gain
-        pad_x = (model_w - new_w) / 2.0
-        pad_y = (model_h - new_h) / 2.0
-        return gain, pad_x, pad_y
-
-    def _map_keypoints(
-        self,
-        kpts: np.ndarray,
-        *,
-        roi_w: float,
-        roi_h: float,
-        normalized: bool,
-    ) -> np.ndarray:
-        model_w, model_h = float(self.model_size[0]), float(self.model_size[1])
-        x = kpts[:, 0].astype(np.float32, copy=False)
-        y = kpts[:, 1].astype(np.float32, copy=False)
-        c = kpts[:, 2].astype(np.float32, copy=False)
-        if normalized:
-            x = x * model_w
-            y = y * model_h
-        if self.letterbox:
-            gain, pad_x, pad_y = self._letterbox_params(float(roi_w), float(roi_h))
-            if gain > 0:
-                x = (x - pad_x) / gain
-                y = (y - pad_y) / gain
-        else:
-            if model_w > 0:
-                x = x * (float(roi_w) / model_w)
-            if model_h > 0:
-                y = y * (float(roi_h) / model_h)
-        if roi_w > 0:
-            x = np.clip(x, 0.0, float(roi_w))
-        if roi_h > 0:
-            y = np.clip(y, 0.0, float(roi_h))
-        return np.stack([x, y, c], axis=1)
 
     def _point(self, kpts: np.ndarray, idx: int) -> Optional[Tuple[float, float]]:
         if idx < 0 or idx >= kpts.shape[0]:
@@ -2836,6 +2370,7 @@ class PoseFeatureProcessor:
             return None
         if arr_roi.shape != (17, 3) or arr_abs.shape != (17, 3):
             return None
+        _increment_core_counter("tensor_host_copies_total.pose")
         return score, arr_roi, arr_abs
 
     def handle_frame_ds8(self, frame_meta: Any) -> None:
@@ -2851,9 +2386,6 @@ class PoseFeatureProcessor:
         )
         if debug:
             self._debug_frames += 1
-        pose_mode = _pose_gpu_path_mode()
-        use_native = pose_mode == _POSE_GPU_PATH_NATIVE
-
         attach_obj = None
         if noesis_pose_meta_ext is not None:
             attach_obj = getattr(noesis_pose_meta_ext, "attach_pose_features", None)
@@ -2888,49 +2420,14 @@ class PoseFeatureProcessor:
             kpts_abs: Optional[np.ndarray] = None
             kpts_for_features: Optional[np.ndarray] = None
             kpts_roi: Optional[np.ndarray] = None
-            if use_native:
-                native = self._extract_pose_native(obj_meta)
-                if native is not None:
-                    score, kpts_roi, kpts_abs = native
-                    kpts_for_features = kpts_roi
-                else:
-                    if debug:
-                        self._debug_missing += 1
-                    continue
+            native = self._extract_pose_native(obj_meta)
+            if native is not None:
+                score, kpts_roi, kpts_abs = native
+                kpts_for_features = kpts_roi
             else:
-                output = self._extract_pose_output(obj_meta)
-                if output is None:
-                    if not self._missing_tensor_logged:
-                        logger.debug("Pose SGIE missing tensor meta (unique_id=%s)", int(self.gie_id))
-                        self._missing_tensor_logged = True
-                    if debug:
-                        self._debug_missing += 1
-                    continue
-
-                row = self._select_pose_row(output)
-                if row is None:
-                    if debug:
-                        self._debug_missing += 1
-                    continue
-
-                try:
-                    score = float(row[4])
-                except Exception:
-                    score = 0.0
-
-                kpts_raw = np.asarray(row[6:], dtype=np.float32)
-                if kpts_raw.size < 17 * 3:
-                    if debug:
-                        self._debug_missing += 1
-                    continue
-                kpts = kpts_raw[: 17 * 3].reshape(17, 3)
-                normalized = float(np.max(row[:4])) <= 2.0
-                kpts = self._map_keypoints(kpts, roi_w=roi_w, roi_h=roi_h, normalized=normalized)
-                kpts_roi = np.asarray(kpts, dtype=np.float32, copy=True)
-                kpts_abs = np.asarray(kpts, dtype=np.float32, copy=True)
-                kpts_abs[:, 0] += float(bbox[0])
-                kpts_abs[:, 1] += float(bbox[1])
-                kpts_for_features = kpts
+                if debug:
+                    self._debug_missing += 1
+                continue
 
             if kpts_abs is None or kpts_for_features is None:
                 if debug:
@@ -2982,6 +2479,19 @@ class PoseFeatureProcessor:
                         payload,
                         metric="pose_features.user_meta_json",
                     )
+                    payload_bytes = len(payload_json.encode("utf-8"))
+                    if payload_bytes > _pose_meta_payload_limit_bytes():
+                        if debug:
+                            self._debug_missing += 1
+                        logger.debug(
+                            "Pose meta attach skipped: payload exceeds limit bytes=%d",
+                            int(payload_bytes),
+                        )
+                        continue
+                    _increment_core_counter(
+                        "tensor_boundary_copy_bytes_total.pose_meta",
+                        payload_bytes,
+                    )
                     ok = bool(
                         attach_obj(
                             obj_meta,
@@ -3026,27 +2536,12 @@ class PoseKeypointOverlayProcessor:
     line_width: int = 2
     point_radius: int = 3
     max_display_metas: int = 12
-    _logged_layers: bool = field(default=False, init=False, repr=False)
-    _logged_shape: bool = field(default=False, init=False, repr=False)
-    _missing_tensor_logged: bool = field(default=False, init=False, repr=False)
     _missing_native_logged: bool = field(default=False, init=False, repr=False)
     _debug_last_log: float = field(default=0.0, init=False, repr=False)
     _debug_frames: int = field(default=0, init=False, repr=False)
     _debug_objects: int = field(default=0, init=False, repr=False)
     _debug_drawn: int = field(default=0, init=False, repr=False)
     _debug_missing: int = field(default=0, init=False, repr=False)
-
-    def _to_numpy(self, tensor: Any) -> Optional[np.ndarray]:
-        with _DLPACK_HOST_READ_LOCK:
-            arr = _dlpack_tensor_to_numpy(tensor)
-        if arr is None:
-            logger.debug(
-                "Pose keypoint tensor conversion failed (device=%s, dtype=%s, shape=%s)",
-                getattr(tensor, "device_type", None),
-                getattr(tensor, "dtype", None),
-                getattr(tensor, "shape", None),
-            )
-        return arr
 
     def _frame_source_id(self, frame_meta: Any) -> int:
         for attr in ("source_id", "pad_index", "camera_id"):
@@ -3058,49 +2553,6 @@ class PoseKeypointOverlayProcessor:
             except Exception:
                 continue
         return 0
-
-    def _extract_pose_output(self, obj_meta: Any) -> Optional[np.ndarray]:
-        tensor_items_iter = getattr(obj_meta, "tensor_items", None)
-        if tensor_items_iter is None:
-            return None
-        try:
-            tensor_items = list(tensor_items_iter)
-        except Exception:
-            tensor_items = tensor_items_iter or []
-        for item in tensor_items:
-            try:
-                tensor_output = item.as_tensor_output()
-            except Exception:
-                continue
-            try:
-                if int(getattr(tensor_output, "unique_id", -1)) != int(self.gie_id):
-                    continue
-            except Exception:
-                continue
-            try:
-                layers = tensor_output.get_layers() or {}
-            except Exception:
-                continue
-            if not layers:
-                continue
-            if not self._logged_layers:
-                self._logged_layers = True
-                logger.info("YOLO26 pose tensor layers: %s", list(layers.keys()))
-            tensor = layers.get("output0")
-            if tensor is None and len(layers) == 1:
-                try:
-                    tensor = next(iter(layers.values()))
-                except Exception:
-                    tensor = None
-            if tensor is None:
-                continue
-            tensor_for_read = _clone_tensor_for_host_read(tensor, location="pose.overlay.output")
-            if tensor_for_read is None:
-                continue
-            arr = self._to_numpy(tensor_for_read)
-            if arr is not None:
-                return arr
-        return None
 
     def _extract_pose_payload(self, obj_meta: Any) -> Optional[Dict[str, Any]]:
         if noesis_pose_meta_ext is None:
@@ -3180,67 +2632,6 @@ class PoseKeypointOverlayProcessor:
             return None
         return arr_abs
 
-    def _select_pose_row(self, output: np.ndarray) -> Optional[np.ndarray]:
-        if output.ndim >= 3:
-            try:
-                output = output.reshape(-1, output.shape[-1])
-            except Exception:
-                output = output[0]
-        if output.ndim != 2 or output.shape[1] < 6 + 17 * 3:
-            return None
-        scores = output[:, 4]
-        if scores.size == 0:
-            return None
-        idx = int(np.argmax(scores))
-        score = float(scores[idx])
-        if score < float(self.score_threshold):
-            return None
-        if not self._logged_shape:
-            self._logged_shape = True
-            logger.info("YOLO26 pose output shape: %s", output.shape)
-        return output[idx]
-
-    def _letterbox_params(self, roi_w: float, roi_h: float) -> Tuple[float, float, float]:
-        if roi_w <= 0 or roi_h <= 0:
-            return 1.0, 0.0, 0.0
-        model_w, model_h = float(self.model_size[0]), float(self.model_size[1])
-        gain = min(model_w / roi_w, model_h / roi_h)
-        new_w = roi_w * gain
-        new_h = roi_h * gain
-        pad_x = (model_w - new_w) / 2.0
-        pad_y = (model_h - new_h) / 2.0
-        return gain, pad_x, pad_y
-
-    def _map_keypoints(
-        self,
-        kpts: np.ndarray,
-        *,
-        roi_w: float,
-        roi_h: float,
-        normalized: bool,
-    ) -> np.ndarray:
-        model_w, model_h = float(self.model_size[0]), float(self.model_size[1])
-        x = kpts[:, 0].astype(np.float32, copy=False)
-        y = kpts[:, 1].astype(np.float32, copy=False)
-        c = kpts[:, 2].astype(np.float32, copy=False)
-        if normalized:
-            x = x * model_w
-            y = y * model_h
-        if self.letterbox:
-            gain, pad_x, pad_y = self._letterbox_params(float(roi_w), float(roi_h))
-            if gain > 0:
-                x = (x - pad_x) / gain
-                y = (y - pad_y) / gain
-        else:
-            if model_w > 0:
-                x = x * (float(roi_w) / model_w)
-            if model_h > 0:
-                y = y * (float(roi_h) / model_h)
-        if roi_w > 0:
-            x = np.clip(x, 0.0, float(roi_w))
-        if roi_h > 0:
-            y = np.clip(y, 0.0, float(roi_h))
-        return np.stack([x, y, c], axis=1)
 
     def _lookup_stable_id(self, source_id: int, track_id: int) -> Optional[int]:
         mgr = getattr(self.pipeline, "stable_id_mgr", None)
@@ -3291,8 +2682,6 @@ class PoseKeypointOverlayProcessor:
             "on",
         )
         now = time.time()
-        pose_mode = _pose_gpu_path_mode()
-        allow_cpu_fallback = pose_mode == _POSE_GPU_PATH_CPU_DEBUG
         for frame_meta in frame_items:
             object_items = getattr(frame_meta, "object_items", None) or []
             if debug:
@@ -3366,36 +2755,10 @@ class PoseKeypointOverlayProcessor:
                 if payload is not None:
                     kpts = self._keypoints_from_payload(payload, bbox)
 
-                if kpts is None and allow_cpu_fallback:
-                    output = self._extract_pose_output(obj_meta)
-                    if output is not None:
-                        row = self._select_pose_row(output)
-                    else:
-                        row = None
-                    if row is not None:
-                        kpts_raw = np.asarray(row[6:], dtype=np.float32)
-                        if kpts_raw.size >= 17 * 3:
-                            kpts = kpts_raw[: 17 * 3].reshape(17, 3)
-                            normalized = float(np.max(row[:4])) <= 2.0
-                            roi_w = float(bbox[2])
-                            roi_h = float(bbox[3])
-                            if roi_w > 0 and roi_h > 0:
-                                kpts = self._map_keypoints(kpts, roi_w=roi_w, roi_h=roi_h, normalized=normalized)
-                                kpts[:, 0] += float(bbox[0])
-                                kpts[:, 1] += float(bbox[1])
-                            else:
-                                kpts = None
-
                 if kpts is None:
                     if payload is None and not self._missing_native_logged:
                         self._missing_native_logged = True
-                        logger.info(
-                            "Pose keypoint overlay missing native pose meta; "
-                            "set NOESIS_POSE_GPU_PATH=cpu_debug to allow tensor fallback"
-                        )
-                    if not self._missing_tensor_logged and allow_cpu_fallback:
-                        logger.debug("Pose SGIE missing tensor meta (unique_id=%s)", int(self.gie_id))
-                        self._missing_tensor_logged = True
+                        logger.info("Pose keypoint overlay missing native pose meta")
                     if debug:
                         self._debug_missing += 1
                     continue
@@ -3497,9 +2860,6 @@ class _AnalyticsTelemetryProcessor:
     _active_tracks: Dict[int, List[Dict[str, Any]]] = field(default_factory=dict, init=False, repr=False)
     _transitions_state: Dict[int, List[Dict[str, Any]]] = field(default_factory=dict, init=False, repr=False)
     _stable_id_enabled: bool = field(default=True, init=False, repr=False)
-    _fallback_sid_by_key: Dict[Tuple[int, int], int] = field(default_factory=dict, init=False, repr=False)
-    _fallback_sid_last_seen: Dict[Tuple[int, int], float] = field(default_factory=dict, init=False, repr=False)
-    _fallback_sid_next: int = field(default=1, init=False, repr=False)
     _bev_class_ids: frozenset[int] = field(default_factory=lambda: frozenset({0}), init=False, repr=False)
     _bev_class_ids_ready: bool = field(default=False, init=False, repr=False)
     _reid_unique_id: int = field(default=3, init=False, repr=False)
@@ -3747,266 +3107,6 @@ class _AnalyticsTelemetryProcessor:
                 v += float(frame_h) * 0.5
         return [float(u), float(v)]
 
-    @staticmethod
-    def _tensor_to_embedding(layer_tensor: Any) -> Optional[np.ndarray]:
-        """Convert a Service Maker Tensor (dlpack) into a 1D float32 embedding."""
-        if layer_tensor is None:
-            return None
-
-        flag = str(os.environ.get("NOESIS_REID_NO_DLPACK", "")).strip().lower()
-        if flag in ("1", "true", "yes", "on"):
-            try:
-                shape = getattr(layer_tensor, "shape", None)
-                if shape is not None and hasattr(shape, "__len__") and len(shape) >= 1 and int(shape[-1]) == 512:
-                    emb = np.zeros((512,), dtype=np.float32)
-                    emb[0] = 1.0
-                    return emb
-            except Exception:
-                return None
-        dlpack_debug_enabled = str(os.environ.get("NOESIS_REID_DLPACK_DEBUG", "")).strip().lower() in (
-            "1",
-            "true",
-            "yes",
-            "on",
-        )
-        fallback_reason = "torch_disabled"
-        use_torch = os.environ.get("NOESIS_REID_DLPACK_TORCH", "1")
-        if str(use_torch).strip().lower() in ("1", "true", "yes", "on"):
-            fallback_reason = "torch_dlpack_failed"
-            try:
-                import torch
-                import torch.utils.dlpack as torch_dlpack
-
-                start_ns = time.perf_counter_ns()
-                stream = 0
-                try:
-                    if torch.cuda.is_available():
-                        stream = int(torch.cuda.current_stream().cuda_stream)
-                except Exception:
-                    stream = 0
-                dlpack_capsule = layer_tensor.__dlpack__(stream)
-                torch_tensor = torch_dlpack.from_dlpack(dlpack_capsule)
-                emb = torch_tensor.detach().cpu().numpy().reshape(-1).astype(np.float32, copy=False)
-                _CORE_PATH_INSTRUMENTATION.record_cpu_copy_violation(
-                    location="reid.tensor_dlpack_to_embedding",
-                    reason="torch_dlpack_to_host",
-                    details={
-                        "duration_ns": time.perf_counter_ns() - start_ns,
-                        "length": int(emb.size),
-                    },
-                )
-                if emb.size < 1:
-                    return None
-                n = float(np.linalg.norm(emb) + 1e-12)
-                return (emb / n).astype(np.float32, copy=False)
-            except Exception as exc:
-                fallback_reason = f"torch_dlpack_failed:{type(exc).__name__}"
-                if dlpack_debug_enabled:
-                    logger.debug("ReID torch DLPack decode failed: %s", exc, exc_info=True)
-        policy = _CORE_PATH_INSTRUMENTATION.record_cpu_copy_violation(
-            location="reid.tensor_dlpack_to_embedding.fallback",
-            reason=fallback_reason,
-            fallback=True,
-            details={
-                "device": getattr(layer_tensor, "device_type", None),
-                "dtype": getattr(layer_tensor, "dtype", None),
-                "shape": getattr(layer_tensor, "shape", None),
-            },
-        )
-        if policy == _CORE_FALLBACK_POLICY_GATE:
-            logger.warning("Blocked ReID fallback embedding conversion due to NOESIS_CORE_PATH_FALLBACK_POLICY=gate")
-            return None
-        if policy == _CORE_FALLBACK_POLICY_FAIL:
-            raise _CorePathFallbackConversionError(
-                "ReID fallback embedding conversion blocked by NOESIS_CORE_PATH_FALLBACK_POLICY=fail"
-            )
-        try:
-            import ctypes
-            import ctypes.util
-
-            capsule_name = None
-            used_versioned = False
-            ver_major = None
-            ver_minor = None
-            ndim = None
-            shape = None
-            dtype_bits = None
-            dtype_code = None
-            dtype_lanes = None
-            dev_type = None
-
-            def _fail(reason: str) -> Optional[np.ndarray]:
-                global _REID_DLPACK_DEBUG_LOGGED
-                if dlpack_debug_enabled and not _REID_DLPACK_DEBUG_LOGGED:
-                    logger.info(
-                        "ReID DLPack decode failed: reason=%s capsule=%s versioned=%s ver=%s.%s ndim=%s shape=%s dtype=(code=%s bits=%s lanes=%s) dev_type=%s",
-                        reason,
-                        capsule_name,
-                        used_versioned,
-                        ver_major,
-                        ver_minor,
-                        ndim,
-                        shape,
-                        dtype_code,
-                        dtype_bits,
-                        dtype_lanes,
-                        dev_type,
-                    )
-                    _REID_DLPACK_DEBUG_LOGGED = True
-                return None
-
-            class _DLDevice(ctypes.Structure):
-                _fields_ = [("device_type", ctypes.c_int), ("device_id", ctypes.c_int)]
-
-            class _DLDataType(ctypes.Structure):
-                _fields_ = [("code", ctypes.c_uint8), ("bits", ctypes.c_uint8), ("lanes", ctypes.c_uint16)]
-
-            class _DLTensor(ctypes.Structure):
-                _fields_ = [
-                    ("data", ctypes.c_void_p),
-                    ("device", _DLDevice),
-                    ("ndim", ctypes.c_int),
-                    ("dtype", _DLDataType),
-                    ("shape", ctypes.POINTER(ctypes.c_int64)),
-                    ("strides", ctypes.POINTER(ctypes.c_int64)),
-                    ("byte_offset", ctypes.c_uint64),
-                ]
-
-            class _DLManagedTensor(ctypes.Structure):
-                _fields_ = [("dl_tensor", _DLTensor), ("manager_ctx", ctypes.c_void_p), ("deleter", ctypes.c_void_p)]
-
-            class _DLPackVersion(ctypes.Structure):
-                _fields_ = [("major", ctypes.c_int32), ("minor", ctypes.c_int32)]
-
-            class _DLManagedTensorVersioned(ctypes.Structure):
-                _fields_ = [
-                    ("version", _DLPackVersion),
-                    ("dl_tensor", _DLTensor),
-                    ("manager_ctx", ctypes.c_void_p),
-                    ("deleter", ctypes.c_void_p),
-                ]
-
-            dlpack_capsule = layer_tensor.__dlpack__(None)
-            raw_name = None
-            try:
-                get_name = ctypes.pythonapi.PyCapsule_GetName
-                get_name.restype = ctypes.c_char_p
-                get_name.argtypes = [ctypes.py_object]
-                raw_name = get_name(dlpack_capsule)
-                capsule_name = raw_name.decode("utf-8", "replace") if raw_name else None
-            except Exception:
-                capsule_name = None
-            get_ptr = ctypes.pythonapi.PyCapsule_GetPointer
-            get_ptr.restype = ctypes.c_void_p
-            get_ptr.argtypes = [ctypes.py_object, ctypes.c_char_p]
-            managed_ptr = get_ptr(dlpack_capsule, raw_name)
-            if not managed_ptr:
-                return _fail("capsule_get_pointer")
-
-            dl = None
-            deleter_ptr = None
-            try:
-                managed_v = ctypes.cast(managed_ptr, ctypes.POINTER(_DLManagedTensorVersioned))
-                ver = managed_v.contents.version
-                dl_candidate = managed_v.contents.dl_tensor
-                ver_major = int(ver.major)
-                ver_minor = int(ver.minor)
-                ndim_candidate = int(dl_candidate.ndim)
-                dtype_bits_candidate = int(dl_candidate.dtype.bits)
-                dtype_code_candidate = int(dl_candidate.dtype.code)
-                dev_type_candidate = int(dl_candidate.device.device_type)
-                plausible = (
-                    0 <= ver_major <= 10
-                    and 0 <= ver_minor <= 10
-                    and 1 <= ndim_candidate <= 8
-                    and dtype_bits_candidate in (8, 16, 32, 64)
-                    and 0 <= dtype_code_candidate <= 8
-                    and 1 <= dev_type_candidate <= 32
-                    and int(dl_candidate.data or 0) != 0
-                )
-                if plausible:
-                    dl = dl_candidate
-                    deleter_ptr = managed_v.contents.deleter
-                    used_versioned = True
-            except Exception:
-                dl = None
-                deleter_ptr = None
-            if dl is None:
-                managed = ctypes.cast(managed_ptr, ctypes.POINTER(_DLManagedTensor))
-                dl = managed.contents.dl_tensor
-                deleter_ptr = managed.contents.deleter
-
-            ndim = int(dl.ndim)
-            if ndim < 1:
-                return _fail("ndim")
-            shape = [int(dl.shape[i]) for i in range(ndim)]
-            total = 1
-            for dim in shape:
-                total *= max(1, int(dim))
-            dtype_bits = int(dl.dtype.bits)
-            dtype_code = int(dl.dtype.code)
-            dtype_lanes = int(dl.dtype.lanes)
-            if dtype_code != 2 or dtype_bits != 32 or dtype_lanes != 1:
-                return _fail("dtype")
-            nbytes = int(total * (dtype_bits // 8) * dtype_lanes)
-            if nbytes <= 0:
-                return _fail("nbytes")
-
-            out = np.empty((total,), dtype=np.float32)
-            start_ns = time.perf_counter_ns()
-            dst_ptr = ctypes.c_void_p(int(out.ctypes.data))
-            src_ptr = ctypes.c_void_p(int(dl.data) + int(dl.byte_offset))
-            dev_type = int(dl.device.device_type)
-
-            if dev_type in (1, 3):  # kDLCPU / kDLCUDAHost
-                ctypes.memmove(dst_ptr, src_ptr, nbytes)
-            elif dev_type in (2, 13):  # kDLCUDA / kDLCUDAManaged
-                cudart_path = ctypes.util.find_library("cudart")
-                if not cudart_path:
-                    return _fail("cudart")
-                cudart = ctypes.CDLL(cudart_path)
-                cuda_memcpy = cudart.cudaMemcpy
-                cuda_memcpy.restype = ctypes.c_int
-                cuda_memcpy.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int]
-                err = int(cuda_memcpy(dst_ptr, src_ptr, ctypes.c_size_t(nbytes), ctypes.c_int(2)))
-                if err != 0:
-                    return _fail(f"cudaMemcpy:{err}")
-            else:
-                return _fail("device_type")
-
-            call_deleter = str(os.environ.get("NOESIS_REID_DLPACK_CALL_DELETER", "")).strip().lower() in (
-                "1",
-                "true",
-                "yes",
-                "on",
-            )
-            if call_deleter and deleter_ptr:
-                deleter = ctypes.CFUNCTYPE(None, ctypes.c_void_p)(deleter_ptr)
-                deleter(managed_ptr)
-
-            _CORE_PATH_INSTRUMENTATION.record_cpu_copy_violation(
-                location="reid.tensor_dlpack_to_embedding.fallback_copy",
-                reason="ctypes_host_copy",
-                details={
-                    "duration_ns": time.perf_counter_ns() - start_ns,
-                    "bytes": int(nbytes),
-                    "device_type": int(dev_type),
-                },
-            )
-            emb = out.reshape(-1).astype(np.float32, copy=False)
-            if emb.size < 1:
-                return _fail("empty")
-            n = float(np.linalg.norm(emb) + 1e-12)
-            return (emb / n).astype(np.float32)
-        except Exception as exc:
-            if isinstance(exc, _CorePathFallbackConversionError):
-                raise
-            global _REID_DLPACK_DEBUG_LOGGED
-            if dlpack_debug_enabled and not _REID_DLPACK_DEBUG_LOGGED:
-                logger.info("ReID DLPack decode raised: %s", exc, exc_info=True)
-                _REID_DLPACK_DEBUG_LOGGED = True
-            return None
-
     def _log_diag_session_start(self) -> None:
         if not self.diagnostics_logger or self._diag_logged:
             return
@@ -4088,110 +3188,18 @@ class _AnalyticsTelemetryProcessor:
         n = float(np.linalg.norm(emb) + 1e-12)
         if not math.isfinite(n) or n <= 0.0:
             return None
+        _increment_core_counter("tensor_host_copies_total.reid")
         return (emb / n).astype(np.float32, copy=False)
 
     def _extract_reid_embedding_ds8(self, obj_meta: Any) -> Optional[np.ndarray]:
         """Extract OSNet embedding from DS8 object tensor meta (SGIE output)."""
-        reid_mode = _reid_gpu_path_mode()
-        if reid_mode == _REID_GPU_PATH_NATIVE:
-            emb_native = self._extract_reid_embedding_native(obj_meta)
-            if emb_native is not None:
-                return emb_native
-            global _REID_NATIVE_MISSING_LOGGED
-            if not _REID_NATIVE_MISSING_LOGGED and noesis_reid_meta_ext is None:
-                logger.warning(
-                    "ReID native extraction unavailable; build scripts/build_noesis_reid_meta_ext.sh "
-                    "or set NOESIS_REID_GPU_PATH=cpu_debug"
-                )
-                _REID_NATIVE_MISSING_LOGGED = True
-        if _zero_copy_disable_reid_cpu_enabled() and reid_mode != _REID_GPU_PATH_CPU_DEBUG:
-            global _REID_CPU_SKIP_LOGGED
-            if not _REID_CPU_SKIP_LOGGED:
-                logger.info(
-                    "Skipping ReID host embedding extraction in zero-copy mode "
-                    "(set NOESIS_REID_GPU_PATH=cpu_debug or NOESIS_ZERO_COPY_DISABLE_REID_CPU=0 to re-enable)"
-                )
-                _REID_CPU_SKIP_LOGGED = True
-            return None
-        tensor_items_iter = getattr(obj_meta, "tensor_items", None)
-        if tensor_items_iter is None:
-            return None
-        # Snapshot iterator to avoid lifetime/iteration hazards in some DS builds.
-        try:
-            tensor_items = list(tensor_items_iter)
-        except Exception:
-            tensor_items = tensor_items_iter or []
-        for item in tensor_items:
-            try:
-                if not item:
-                    continue
-            except Exception:
-                pass
-            try:
-                tensor_output = item.as_tensor_output()
-            except Exception:
-                continue
-            try:
-                if not tensor_output:
-                    continue
-            except Exception:
-                pass
-            try:
-                if int(getattr(tensor_output, "unique_id", -1)) != int(self._reid_unique_id):
-                    continue
-            except Exception:
-                continue
-            try:
-                layers = tensor_output.get_layers()
-            except Exception:
-                continue
-            if not isinstance(layers, dict) or not layers:
-                continue
-            layer_tensor = layers.get(self._reid_layer_name)
-            if layer_tensor is None:
-                # If the layer name is unknown, fall back to a likely embedding output.
-                if len(layers) == 1:
-                    try:
-                        layer_tensor = next(iter(layers.values()))
-                    except Exception:
-                        layer_tensor = None
-                else:
-                    # Prefer a layer whose shape looks like a 512-D vector.
-                    for candidate in layers.values():
-                        try:
-                            shape = getattr(candidate, "shape", None)
-                            if shape is None:
-                                continue
-                            if hasattr(shape, "__len__") and len(shape) >= 1 and int(shape[-1]) == 512:
-                                layer_tensor = candidate
-                                break
-                        except Exception:
-                            continue
-            layer_tensor = _clone_tensor_for_host_read(layer_tensor, location="reid.embedding")
-            if layer_tensor is None:
-                continue
-            with _DLPACK_HOST_READ_LOCK:
-                emb = self._tensor_to_embedding(layer_tensor)
-            if emb is None:
-                continue
-            if not self._reid_logged_shape:
-                try:
-                    shape = getattr(layer_tensor, "shape", None)
-                    dtype = getattr(layer_tensor, "dtype", None)
-                    dev = getattr(layer_tensor, "device_type", None)
-                    keys = list(layers.keys())
-                    logger.info(
-                        "ReID SGIE tensor observed: expected_unique_id=%s layers=%s shape=%s dtype=%s device=%s",
-                        int(self._reid_unique_id),
-                        keys,
-                        shape,
-                        dtype,
-                        dev,
-                    )
-                except Exception:
-                    pass
-                self._reid_logged_shape = True
-            return emb
+        emb_native = self._extract_reid_embedding_native(obj_meta)
+        if emb_native is not None:
+            return emb_native
+        global _REID_NATIVE_MISSING_LOGGED
+        if not _REID_NATIVE_MISSING_LOGGED and noesis_reid_meta_ext is None:
+            logger.warning("ReID native extraction unavailable; build scripts/build_noesis_reid_meta_ext.sh")
+            _REID_NATIVE_MISSING_LOGGED = True
         return None
 
     def handle_frame_ds8(self, frame_meta: Any) -> None:
@@ -5123,31 +4131,6 @@ class _AnalyticsTelemetryProcessor:
             self._analytics_obj_meta_type = None
         return self._analytics_obj_meta_type
 
-    def _fallback_stable_id(self, sensor_id: int, track_id: int, ts: float) -> int:
-        """Allocate a stable_id when the real StableIDManager is unavailable/unhealthy.
-
-        This keeps user-facing payloads free of raw tracker IDs while ensuring every
-        visible person always has a numeric stable_id.
-        """
-        key = (int(sensor_id), int(track_id))
-        sid = self._fallback_sid_by_key.get(key)
-        if sid is None:
-            # Try to start after any already-allocated StableIDManager range to reduce
-            # collisions if we fallback mid-run.
-            if self._fallback_sid_next <= 1:
-                mgr = getattr(self.pipeline, "stable_id_mgr", None)
-                next_sid = getattr(mgr, "next_stable_id", None) if mgr is not None else None
-                if next_sid is not None:
-                    try:
-                        self._fallback_sid_next = max(int(self._fallback_sid_next), int(next_sid))
-                    except Exception:
-                        pass
-            sid = int(self._fallback_sid_next)
-            self._fallback_sid_next = int(self._fallback_sid_next) + 1
-            self._fallback_sid_by_key[key] = sid
-        self._fallback_sid_last_seen[key] = float(ts)
-        return int(sid)
-
     def _maybe_assign_stable_id(
         self,
         *,
@@ -5159,11 +4142,7 @@ class _AnalyticsTelemetryProcessor:
         frame_bgr: Optional[np.ndarray],
         embedding: Optional[np.ndarray] = None,
     ) -> Optional[int]:
-        """Return a positive stable_id for a tracked person.
-
-        Prefers StableIDManager (ReID) when healthy; falls back to an internal
-        allocator so user-facing IDs never expose raw tracker IDs.
-        """
+        """Return a positive stable_id for a tracked person from StableIDManager."""
         if track_id < 0:
             return None
         if bbox is None or len(bbox) < 4:
@@ -5199,7 +4178,7 @@ class _AnalyticsTelemetryProcessor:
                 logger.exception("StableIDManager update failed for sensor %s track %s", sensor_id, track_id)
                 self._stable_id_enabled = False
 
-        return self._fallback_stable_id(sensor_id, track_id, float(ts))
+        return None
 
     def _reid_crop_from_track(
         self,
@@ -5249,7 +4228,7 @@ class _AnalyticsTelemetryProcessor:
         present_track_ids: Iterable[int],
         ts: float,
     ) -> None:
-        """Maintain StableIDManager state and prune fallback IDs."""
+        """Maintain StableIDManager state."""
         now_ts = float(ts)
         sensor_id_int = int(sensor_id)
         present_set = {int(tid) for tid in present_track_ids}
@@ -5262,28 +4241,6 @@ class _AnalyticsTelemetryProcessor:
             except Exception:
                 logger.exception("StableIDManager maintenance failed for sensor %s", sensor_id_int)
                 self._stable_id_enabled = False
-
-        # Maintain fallback stable IDs so they don't leak forever when the real ReID manager
-        # is unavailable or returns invalid IDs.
-        try:
-            ttl_s = float(os.environ.get("NOESIS_FALLBACK_STABLE_ID_TTL_S", "15.0") or 15.0)
-        except Exception:
-            ttl_s = 15.0
-        ttl_s = max(0.0, ttl_s)
-
-        if not self._fallback_sid_by_key:
-            return
-
-        for key in list(self._fallback_sid_by_key.keys()):
-            key_sensor, key_track = key
-            if int(key_sensor) != sensor_id_int:
-                continue
-            if int(key_track) in present_set:
-                continue
-            last_seen = float(self._fallback_sid_last_seen.get(key, 0.0) or 0.0)
-            if ttl_s <= 0.0 or (now_ts - last_seen) >= ttl_s:
-                self._fallback_sid_by_key.pop(key, None)
-                self._fallback_sid_last_seen.pop(key, None)
 
     def _update_dwell_time(
         self,

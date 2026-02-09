@@ -138,7 +138,6 @@ class StableIDManager:
         self.gpu_device = str(gpu_device or device or "cuda:0")
         self.gpu_min_gallery = int(max(1, gpu_min_gallery))
         self._backend_mode = "cpu"
-        self._gpu_fallback_count = 0
         self._backend_last_error: Optional[str] = None
         self._match_latency_ms: Deque[float] = deque(maxlen=512)
         self._torch = None
@@ -278,22 +277,23 @@ class StableIDManager:
 
     def _init_compute_backend(self) -> None:
         pref = str(self.compute_backend or "auto").strip().lower()
+        strict_gpu = pref in ("gpu", "cuda", "torch")
         if pref in ("cpu", "numpy"):
             self._backend_mode = "cpu"
             return
         try:
             import torch  # type: ignore
         except Exception as exc:
+            if strict_gpu:
+                raise RuntimeError(f"StableID GPU backend requested but torch import failed: {type(exc).__name__}") from exc
             self._backend_mode = "cpu"
             self._backend_last_error = f"torch_import:{type(exc).__name__}"
-            if pref in ("gpu", "cuda", "torch"):
-                self._gpu_fallback_count += 1
             return
         if not bool(getattr(torch, "cuda", None)) or not bool(torch.cuda.is_available()):
+            if strict_gpu:
+                raise RuntimeError("StableID GPU backend requested but CUDA is unavailable")
             self._backend_mode = "cpu"
             self._backend_last_error = "cuda_unavailable"
-            if pref in ("gpu", "cuda", "torch"):
-                self._gpu_fallback_count += 1
             return
         try:
             dev = torch.device(self.gpu_device)
@@ -301,10 +301,10 @@ class StableIDManager:
                 raise ValueError("non_cuda_device")
             _ = torch.tensor([1.0], device=dev)
         except Exception as exc:
+            if strict_gpu:
+                raise RuntimeError(f"StableID GPU backend requested but device init failed: {type(exc).__name__}") from exc
             self._backend_mode = "cpu"
             self._backend_last_error = f"cuda_device:{type(exc).__name__}"
-            if pref in ("gpu", "cuda", "torch"):
-                self._gpu_fallback_count += 1
             return
         self._torch = torch
         self._torch_device = dev
@@ -372,10 +372,8 @@ class StableIDManager:
                     sims[int(sid_int)] = float(sim_np[idx])
                 return sims
             except Exception as exc:
-                self._backend_mode = "cpu"
-                self._gpu_enabled = False
-                self._gpu_fallback_count += 1
                 self._backend_last_error = f"gpu_similarity:{type(exc).__name__}"
+                raise RuntimeError(f"StableID GPU similarity failed: {type(exc).__name__}") from exc
 
         mat_np = np.stack(centroid_rows, axis=0).astype(np.float32, copy=False)
         sim_np = np.matmul(mat_np, emb_vec.reshape(-1, 1)).reshape(-1)
@@ -2338,7 +2336,6 @@ class StableIDManager:
                     "stableid_backend_mode": str(self._backend_mode),
                     "stableid_gpu_match_p50_ms": p50,
                     "stableid_gpu_match_p95_ms": p95,
-                    "stableid_gpu_fallback_count": int(self._gpu_fallback_count),
                     "stableid_backend_last_error": self._backend_last_error,
                     "free_sid_pool_size": free_pool_size,
                     "next_sid": int(self.next_stable_id),

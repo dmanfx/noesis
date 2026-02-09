@@ -33,6 +33,39 @@ bool pose_meta_ext_debug_enabled() {
   return enabled == 1;
 }
 
+size_t pose_meta_max_payload_bytes() {
+  static bool init = false;
+  static size_t max_bytes = 65536U;
+  if (!init) {
+    init = true;
+    const char* raw = std::getenv("NOESIS_POSE_META_MAX_JSON_BYTES");
+    if (raw && *raw) {
+      try {
+        const unsigned long parsed = std::stoul(std::string(raw));
+        if (parsed >= 1024UL) {
+          max_bytes = static_cast<size_t>(parsed);
+        }
+      } catch (...) {
+      }
+    }
+  }
+  return max_bytes;
+}
+
+bool pose_payload_within_limit(const std::string& payload_json) {
+  const size_t max_bytes = pose_meta_max_payload_bytes();
+  if (payload_json.size() <= max_bytes) {
+    return true;
+  }
+  if (pose_meta_ext_debug_enabled()) {
+    g_printerr(
+        "[noesis_pose_meta_ext] payload too large: size=%zu max=%zu\n",
+        payload_json.size(),
+        max_bytes);
+  }
+  return false;
+}
+
 struct ObjMetaAccessor : public deepstream::ObjectMetadata {
   using deepstream::Metadata::data_;
 };
@@ -353,6 +386,9 @@ bool attach_pose_features(const deepstream::ObjectMetadata& obj_meta,
   if (!batch_meta) {
     return false;
   }
+  if (!pose_payload_within_limit(payload_json)) {
+    return false;
+  }
 
   NvDsMetaType meta_type = pose_meta_type();
   if (replace_existing) {
@@ -391,6 +427,9 @@ bool attach_pose_features_frame(const deepstream::FrameMetadata& frame_meta,
   }
   NvDsBatchMeta* batch_meta = frame->base_meta.batch_meta;
   if (!batch_meta) {
+    return false;
+  }
+  if (!pose_payload_within_limit(payload_json)) {
     return false;
   }
   NvDsMetaType meta_type = pose_meta_type();

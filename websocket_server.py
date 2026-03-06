@@ -59,6 +59,8 @@ class WebSocketServer:
         # Optional BEV control callbacks
         self.bev_config_callback: Optional[Callable[[str, Dict[str, Any]], None]] = None
         self.bev_overlay_callback: Optional[Callable[[str, bool], None]] = None
+        # Optional getter for trail settings sync payloads
+        self.trail_settings_getter: Optional[Callable[[], Dict[str, Any]]] = None
         # Optional MA heatmap ready callback (called with cameraId)
         self.ma_ready_callback: Optional[Callable[[str], None]] = None
         # RPC guardrails
@@ -463,6 +465,18 @@ class WebSocketServer:
                 self._telemetry['tx'][t] = {'t': self._telemetry_now(), 'data': self._short_dict(msg)}
         except Exception:
             pass
+
+    def _resolve_trail_settings(self) -> Dict[str, Any]:
+        cfg: Dict[str, Any] = {}
+        if callable(self.trail_settings_getter):
+            try:
+                raw = self.trail_settings_getter() or {}
+                if isinstance(raw, dict):
+                    cfg = dict(raw)
+            except Exception as exc:
+                self.logger.debug("Trail settings getter failed: %s", exc)
+        cfg["enabled"] = bool(self.initial_trail_state)
+        return cfg
 
     # ---------------- WebRTC signaling helpers ----------------
     def attach_webrtc_endpoint(self, webrtc_elem: Any) -> None:
@@ -1031,6 +1045,17 @@ class WebSocketServer:
             except Exception as e:
                 self.logger.warning(f"Could not send initial trail visualization state to {client_ip}: {e}")
 
+            # Send initial trail settings so UI trail tuning can mirror backend config.
+            try:
+                initial_trail_settings = {
+                    'type': 'trail_settings_update',
+                    'config': self._resolve_trail_settings()
+                }
+                await websocket.send(json.dumps(initial_trail_settings))
+                self.logger.info(f"Sent initial trail settings to {client_ip}")
+            except Exception as e:
+                self.logger.warning(f"Could not send initial trail settings to {client_ip}: {e}")
+
             # Send initial calibration bundle if available
             try:
                 if callable(self.calibration_getter):
@@ -1108,6 +1133,14 @@ class WebSocketServer:
                                 'enabled': enabled
                             }
                             await self.broadcast(broadcast_message)
+                            if toggle_name == 'trail_visualization_enabled':
+                                try:
+                                    await self.broadcast({
+                                        'type': 'trail_settings_update',
+                                        'config': self._resolve_trail_settings(),
+                                    })
+                                except Exception as e:
+                                    self.logger.debug("Failed to broadcast trail settings update: %s", e)
                         else:
                             self.logger.warning(f"Invalid set_vis_toggle message from {client_ip}: {data}")
 

@@ -6,11 +6,16 @@ import { LatencyMetrics } from '../types/latency';
 
 type Track = {
   stable_id: number;
+  tracker_id?: number;
+  id_display?: string;
   camera_id: string;
   zone?: string;
   center?: [number, number];
   dwell_time?: number;
   velocity?: [number, number];
+  world?: [number, number, number];
+  world_valid?: boolean;
+  world_frame?: string;
 };
 
 export type CamerasStats = Record<string, {
@@ -52,6 +57,7 @@ export type FrameHandlers = {
   onBevMeta?: (payload: any) => void;
   onStats: (stats: StatsPayload) => void;
   onTrailToggle?: (enabled: boolean) => void;
+  onTrailSettings?: (config: Record<string, unknown>) => void;
   onCalibration?: (bundle: any) => void;
   onMADiagnostics?: (payload: any) => void;
   onMADepth?: (payload: any) => void;
@@ -247,6 +253,11 @@ export function useWebSocketClient(url: string, handlers: FrameHandlers) {
             handlers.onTrailToggle?.(!!data.enabled);
           } else if (data.type === 'trail_visualization_enabled_update') {
             handlers.onTrailToggle?.(!!data.enabled);
+          } else if (data.type === 'trail_settings_update') {
+            const cfg = (data && typeof data.config === 'object' && data.config !== null)
+              ? data.config as Record<string, unknown>
+              : null;
+            if (cfg) handlers.onTrailSettings?.(cfg);
           } else if (data.type === 'ma_diagnostics') {
             handlers.onMADiagnostics?.(data);
           } else if (data.type === 'ma_depth_response') {

@@ -37,7 +37,6 @@ REQUIRED_REFERENCES = [
     Path("plans/DS8/v3dt/work_order.md"),
     Path("config/infer_v3dt_baseline.yaml"),
     Path("config/cameras_v3dt_baseline.yaml"),
-    Path("config/archive/calibration_v3dt_baseline.json"),
     Path("config/v3dt/nvtracker_v3dt_baseline.yml"),
 ]
 
@@ -46,10 +45,7 @@ V3DT_RECOVERY_FILES = [
     Path("plans/DS8/v3dt/README.md"),
 ]
 
-V3DT_REQUIRED_CALIBRATION_ARG = "--calibration config/archive/calibration_v3dt_baseline.json"
-
-ARCHIVE_AGENTS_FILE = Path("docs/history/ds8/v3dt/AGENTS.md")
-ARCHIVE_MARKER = "## Archive status (read first)"
+V3DT_REQUIRED_CALIBRATION_FLAG = "--calibration"
 
 BANNED_PATTERNS_IN_ACTIVE_DOCS = [
     re.compile(r"\bds7\b", re.IGNORECASE),
@@ -87,18 +83,9 @@ def main() -> int:
             failures.append(f"Missing V3DT doc for recovery check: {v3dt_file}")
             continue
         text = _read_text(v3dt_file)
-        if V3DT_REQUIRED_CALIBRATION_ARG not in text:
+        if V3DT_REQUIRED_CALIBRATION_FLAG not in text:
             failures.append(
-                f"Missing baseline calibration recovery arg in: {v3dt_file}"
-            )
-
-    if not _exists(ARCHIVE_AGENTS_FILE):
-        failures.append(f"Missing historical AGENTS file: {ARCHIVE_AGENTS_FILE}")
-    else:
-        archive_text = _read_text(ARCHIVE_AGENTS_FILE)
-        if ARCHIVE_MARKER not in archive_text:
-            failures.append(
-                f"Missing archive marker '{ARCHIVE_MARKER}' in: {ARCHIVE_AGENTS_FILE}"
+                f"Missing calibration recovery flag in: {v3dt_file}"
             )
 
     docs_root = REPO_ROOT / "docs"

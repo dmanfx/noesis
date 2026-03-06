@@ -40,15 +40,24 @@ class DepthTelemetryPublisher:
 class TrackingTelemetryPublisher:
     """Broadcast tracking metadata (tracks, occupancy, transitions) to clients."""
 
-    def __init__(self, ws_server: Any) -> None:
+    def __init__(self, ws_server: Any, metadata_getter: Optional[Any] = None) -> None:
         self._ws = ws_server
+        self._metadata_getter = metadata_getter
 
     def publish(self, source_id: int, tracks: Iterable[Mapping[str, Any]]) -> None:
+        track_list = list(tracks)
         payload = {
             "type": "tracking",
             "source_id": int(source_id),
-            "tracks": convert_numpy_types(list(tracks)),
+            "tracks": convert_numpy_types(track_list),
         }
+        if callable(self._metadata_getter):
+            try:
+                extra = self._metadata_getter(int(source_id), track_list)
+                if isinstance(extra, Mapping):
+                    payload.update(convert_numpy_types(dict(extra)))
+            except Exception:
+                logger.debug("Tracking telemetry metadata getter failed", exc_info=True)
         try:
             if hasattr(self._ws, "broadcast_sync"):
                 self._ws.broadcast_sync(payload)
@@ -65,4 +74,3 @@ def bind_occupancy_publisher(pipeline: Any, occupancy_publisher: Optional[Any]) 
         "Occupancy publisher %s bound to pipeline",
         type(occupancy_publisher).__name__ if occupancy_publisher else "None",
     )
-

@@ -19,6 +19,6 @@
   ],
   "floor_y": 0.0,
   "units": {
-    "s_obj_to_m": 1.0
+    "s_obj_to_m": 0.01
   }
 }

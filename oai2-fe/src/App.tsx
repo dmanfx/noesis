@@ -8,12 +8,14 @@ import { TelemetryPanel } from './telemetry/TelemetryPanel';
 import { TelemetryProvider, useTelemetry } from './telemetry/TelemetryContext';
 import { TrailStore } from './lib/trails';
 import { cameraOrder, colorForTrack, cameraLabel, detectCameraKey, CameraKey, colorIdForPerson, identityKeyForPerson } from './lib/camera';
-import { getExtrinsics, worldToCamera, getIntrinsics4, extractPoseFromExtrinsics, forwardXZFromExtrinsics } from './lib/calibration';
+import { getExtrinsics, getIntrinsics4, extractPoseFromExtrinsics, forwardXZFromExtrinsics } from './lib/calibration';
+import { isCameraLocalFrame, projectWorldPointToCameraLocal, resolveBevFrameModeFromPayload } from './lib/coordTransforms';
 import { useWebSocketClient, StatsPayload, DepthRequestStrategy, MosaicLayout } from './hooks/useWebSocketClient';
 import { useWebRTCClient } from './hooks/useWebRTCClient';
 import { StreamMode } from './components/StreamPanel';
 import DepthDrawer, { DepthDiagnosticsEntry, DepthDrawerEntry, DepthMetaEntry, FloorplanResponse } from './components/DepthDrawer';
-import { BevView, BevMeta } from './components/BevView';
+import { BevView, BevMeta, type BevFrameMode } from './components/BevView';
+import type { BevTrailConfig } from './lib/bevTrails';
 import RoiEditorDrawer from './components/RoiEditorDrawer';
 import SettingsCorner from './components/SettingsCorner';
 import { LatencyCard } from './components/LatencyCard';
@@ -45,6 +47,14 @@ const labelForCameraId = (camId: string): string => {
 
 const normalizeCameraIdKey = (value: unknown): string => String(value ?? '').toLowerCase().trim();
 
+const floorplanHasRenderableGrid = (floorplan?: FloorplanResponse | null): boolean => Boolean(
+  floorplan?.walkable?.grid_b64 ||
+  floorplan?.obstacle_height?.grid_b64 ||
+  floorplan?.height?.grid_b64 ||
+  floorplan?.density?.grid_b64 ||
+  floorplan?.distance?.grid_b64
+);
+
 const buildMosaicCameraIdToSlotKey = (layout: MosaicLayout | null): Record<string, CameraKey> => {
   const map: Record<string, CameraKey> = {};
   if (!layout || !Array.isArray(layout.sources)) return map;
@@ -68,6 +78,8 @@ function Dashboard() {
 
   const [bevMeta, setBevMeta] = useState<Record<CameraKey, BevMeta | undefined>>({ 'living-room': undefined, 'kitchen': undefined, 'family-room': undefined });
   const bevMetaRef = useRef<Record<CameraKey, BevMeta | undefined>>({ 'living-room': undefined, 'kitchen': undefined, 'family-room': undefined });
+  const [bevMetaRaw, setBevMetaRaw] = useState<Record<CameraKey, BevMeta | undefined>>({ 'living-room': undefined, 'kitchen': undefined, 'family-room': undefined });
+  const bevMetaRawRef = useRef<Record<CameraKey, BevMeta | undefined>>({ 'living-room': undefined, 'kitchen': undefined, 'family-room': undefined });
 
   // FPS tracking (exponential over short window)
   const [fps, setFps] = useState<{ [k: string]: string }>({ 'living-room': 'FPS: 0.0', 'kitchen': 'FPS: 0.0', 'family-room': 'FPS: 0.0' });
@@ -97,6 +109,8 @@ function Dashboard() {
   // Transitions removed from UI
   type ActiveTrack = {
     stable_id: number;
+    tracker_id?: number;
+    id_display?: string;
     camera_id: string;
     zone?: string;
     center?: [number, number];
@@ -106,21 +120,27 @@ function Dashboard() {
     world_valid?: boolean;
   };
   const [tracksByCamera, setTracksByCamera] = useState<Record<string, ActiveTrack[]>>({});
-  const [tracksByCamKey, setTracksByCamKey] = useState<Record<CameraKey, ActiveTrack[]>>({ 'living-room': [], 'kitchen': [], 'family-room': [] });
   const [occByCamKey, setOccByCamKey] = useState<Record<CameraKey, Record<string, number>>>({ 'living-room': {}, 'kitchen': {}, 'family-room': {} });
   // Vacancy timer state
   const [vacancyText, setVacancyText] = useState<Record<CameraKey, string>>({ 'living-room': '', 'kitchen': '', 'family-room': '' });
   const zeroSinceRef = useRef<Record<CameraKey, number | null>>({ 'living-room': null, 'kitchen': null, 'family-room': null });
 
   const [trailEnabled, setTrailEnabled] = useState<boolean>(true);
+  const [bevTrailConfig, setBevTrailConfig] = useState<Partial<BevTrailConfig>>({});
   const trailStoreRef = useRef(new TrailStore());
   const prevActiveRef = useRef<Record<CameraKey, Set<string>>>(
     { 'living-room': new Set(), 'kitchen': new Set(), 'family-room': new Set() }
   );
-  // Switch cams to world-space top-down when available
-  const usingWorldKitchenRef = useRef<boolean>(false);
-  const usingWorldLivingRef = useRef<boolean>(false);
-  const usingWorldFamilyRef = useRef<boolean>(false);
+  const [bevFrameModeByCam, setBevFrameModeByCam] = useState<Record<CameraKey, BevFrameMode>>({
+    'living-room': 'world',
+    'kitchen': 'world',
+    'family-room': 'world',
+  });
+  const bevFrameModeByCamRef = useRef<Record<CameraKey, BevFrameMode>>({
+    'living-room': 'world',
+    'kitchen': 'world',
+    'family-room': 'world',
+  });
 
   const [telemetryOpen, setTelemetryOpen] = useState(false);
   const [depthDrawerOpen, setDepthDrawerOpen] = useState(false);
@@ -129,6 +149,7 @@ function Dashboard() {
   const depthMetaRef = useRef<Record<string, DepthMetaEntry>>({});
   const [maDepthMeta, setMaDepthMeta] = useState<Record<string, DepthMetaEntry>>({});
   const [floorplanData, setFloorplanData] = useState<Record<string, FloorplanResponse>>({});
+  const floorplanDataRef = useRef<Record<string, FloorplanResponse>>({});
   const [cameraStatuses, setCameraStatuses] = useState<Record<CameraKey, string>>({
     'living-room': 'unknown',
     'kitchen': 'unknown',
@@ -152,14 +173,28 @@ function Dashboard() {
   });
   const maDiagThrottleRef = useRef<Record<string, number>>({});
   const lastCalibrationSignatureRef = useRef<string>('');
+  const [calibrationEpoch, setCalibrationEpoch] = useState<number>(0);
   const lastDepthFloorplanTsRef = useRef<Record<string, number>>({});
   const mosaicCameraIdToSlotKeyRef = useRef<Record<string, CameraKey>>({});
   const floorplanWarmupTimersRef = useRef<number[]>([]);
   const floorplanWarmupScheduledRef = useRef(false);
 
+  useEffect(() => {
+    floorplanDataRef.current = floorplanData;
+  }, [floorplanData]);
+
   // Stream mode is fixed to WebRTC (former JPEG toggle removed)
   const streamMode: StreamMode = 'webrtc';
   const [webrtcError, setWebrtcError] = useState<string | null>(null);
+  const queryFlags = useMemo(() => new URLSearchParams(window.location.search), []);
+  const bevDebugEnabled = useMemo(() => {
+    const raw = queryFlags.get('bevDebug') ?? queryFlags.get('debugBev') ?? queryFlags.get('bev_debug') ?? '';
+    return raw === '1' || raw.toLowerCase() === 'true';
+  }, [queryFlags]);
+  const showWorldBevRow = useMemo(() => {
+    const raw = queryFlags.get('worldView') ?? queryFlags.get('world_view') ?? '';
+    return raw === '1' || raw.toLowerCase() === 'true';
+  }, [queryFlags]);
 
   const resolveDisplayCameraKey = useCallback((rawId: unknown): CameraKey | null => {
     const id = normalizeCameraIdKey(rawId);
@@ -168,6 +203,96 @@ function Dashboard() {
     if (mapped) return mapped;
     return detectCameraKey(id);
   }, []);
+
+  const resolveBevFrameMode = (payload: BevMeta, fallbackMode: BevFrameMode): BevFrameMode => (
+    resolveBevFrameModeFromPayload(payload, fallbackMode)
+  );
+
+  const setBevFrameMode = (camKey: CameraKey, nextMode: BevFrameMode) => {
+    const prevMode = bevFrameModeByCamRef.current[camKey] || 'world';
+    if (prevMode === nextMode) return;
+    bevFrameModeByCamRef.current[camKey] = nextMode;
+    setBevFrameModeByCam((prev) => ({ ...prev, [camKey]: nextMode }));
+    const camTrailStore = trailStoreRef.current.trails[camKey];
+    if (camTrailStore && typeof camTrailStore === 'object') {
+      for (const k in camTrailStore) {
+        delete camTrailStore[k];
+      }
+    }
+  };
+
+  const setTrackPointFromWorld = (key: CameraKey, activeKey: string, colorId: number, tw: ActiveTrack): boolean => {
+    if (!Array.isArray(tw.world) || tw.world.length < 3) return false;
+    const w0 = Number(tw.world?.[0]);
+    const w1 = Number(tw.world?.[1]);
+    const w2 = Number(tw.world?.[2]);
+    if ((tw.world_valid === false) || !Number.isFinite(w0) || !Number.isFinite(w1) || !Number.isFinite(w2)) return false;
+
+    const fallbackFrame = floorplanDataRef.current[key]?.frame;
+    const renderCameraLocal = isCameraLocalFrame(fallbackFrame);
+    if (renderCameraLocal) {
+      const projected = projectWorldPointToCameraLocal(key, w0, w1, w2);
+      if (!projected) return false;
+      trailStoreRef.current.push(key, activeKey, projected, colorId);
+      return true;
+    }
+
+    trailStoreRef.current.push(key, activeKey, { x: w0, y: w2 }, colorId);
+    return true;
+  };
+
+  const mergeBevMetaPayload = (prevPayload: BevMeta | undefined, payload: BevMeta): BevMeta => {
+    if (!prevPayload) return payload;
+    const merged: BevMeta = { ...prevPayload, ...payload };
+    if (!Array.isArray(payload.footpoints) && Array.isArray(prevPayload.footpoints)) {
+      merged.footpoints = prevPayload.footpoints;
+    }
+    if (typeof payload.xMin !== 'number' && typeof prevPayload.xMin === 'number') merged.xMin = prevPayload.xMin;
+    if (typeof payload.xMax !== 'number' && typeof prevPayload.xMax === 'number') merged.xMax = prevPayload.xMax;
+    if (typeof payload.zMin !== 'number' && typeof prevPayload.zMin === 'number') merged.zMin = prevPayload.zMin;
+    if (typeof payload.zMax !== 'number' && typeof prevPayload.zMax === 'number') merged.zMax = prevPayload.zMax;
+    if (payload.type === 'bev-frame' && !Object.prototype.hasOwnProperty.call(payload, 'error')) {
+      delete merged.error;
+    }
+    if (payload.type === 'bev-frame' && !Object.prototype.hasOwnProperty.call(payload, 'details')) {
+      delete merged.details;
+    }
+    return merged;
+  };
+
+  const normalizeBevMetaForDisplay = (cam: CameraKey, payload: BevMeta, mode: BevFrameMode): BevMeta => {
+    const isWorldMode = mode === 'world';
+    if (!isWorldMode) return payload;
+
+    const floorplan = floorplanDataRef.current[cam];
+    const fallbackFrame = floorplan?.frame;
+    if (!isCameraLocalFrame(fallbackFrame)) return payload;
+
+    const points = payload.footpoints;
+    if (!Array.isArray(points) || !points.length) return payload;
+
+    let didProject = false;
+    const projectedPoints = points.map((point) => {
+      const wx = Number(point?.x);
+      const wz = Number(point?.y);
+      if (!Number.isFinite(wx) || !Number.isFinite(wz)) return point;
+
+      const projected = projectWorldPointToCameraLocal(
+        cam,
+        wx,
+        0,
+        wz
+      );
+      if (!projected) return point;
+
+      didProject = true;
+      return { ...point, x: projected.x, y: projected.y };
+    });
+
+    if (!didProject) return payload;
+
+    return { ...payload, footpoints: projectedPoints };
+  };
 
   const onStats = (payload: StatsPayload) => {
     // System status/uptime
@@ -196,10 +321,7 @@ function Dashboard() {
     const statusUpdates: Partial<Record<CameraKey, string>> = {};
     const globalOcc: Record<string, number> = {};
     let allTracks: any[] = [];
-    // Transitions disabled; keep placeholder for compatibility
-    let allTrans: any[] = [];
     const perCamTracks: Record<string, any[]> = {};
-    const perKeyTracks: Record<CameraKey, any[]> = { 'living-room': [], 'kitchen': [], 'family-room': [] };
     const perKeyOcc: Record<CameraKey, Record<string, number>> = { 'living-room': {}, 'kitchen': {}, 'family-room': {} };
     // const perKeyTransCount: Record<CameraKey, number> = { 'living-room': 0, 'kitchen': 0, 'family-room': 0 };
 
@@ -252,72 +374,27 @@ function Dashboard() {
             if (!prevActiveRef.current[key]?.has(activeKey)) {
               trailStoreRef.current.pushBreak(key, activeKey, colorId);
             }
-            // Prefer camera-local space for kitchen when provided (x_cam,z_cam → canvas x,y)
-            const tw: any = t as any;
-            const hasWorld = Array.isArray(tw.world) && tw.world.length >= 3 && !!tw.world_valid;
-            if (key === 'kitchen' && hasWorld) {
-              if (!usingWorldKitchenRef.current) {
-                // First time we see valid world for kitchen, clear old pixel trails for that cam
-                try { (trailStoreRef.current.trails as any)['kitchen'] = {}; } catch { }
-                usingWorldKitchenRef.current = true;
+            // Prefer front-end world space when BEV payload indicates world-frame output.
+            const isWorldMode = (bevFrameModeByCamRef.current[key] || 'world') === 'world';
+            if (isWorldMode) {
+              const hadWorld = setTrackPointFromWorld(key, activeKey, colorId, t as ActiveTrack);
+              if (hadWorld) {
+                seenNow[key].add(activeKey);
+                continue;
               }
-              const w = tw.world as [number, number, number];
-              const E = getExtrinsics('kitchen');
-              if (E) {
-                const pc = worldToCamera(E, w);
-                if (pc) {
-                  const xCam = pc[0];
-                  const zCam = pc[2];
-                  const depth = Math.abs(zCam);
-                  trailStoreRef.current.push(key, activeKey, { x: xCam, y: depth }, colorId);
-                }
-              } else {
-                // Fallback to world XZ if extrinsics not loaded
-                trailStoreRef.current.push(key, activeKey, { x: Number(w[0] || 0), y: Number(w[2] || 0) }, colorId);
-              }
-              seenNow[key].add(activeKey);
-            } else if (key === 'living-room' && hasWorld) {
-              if (!usingWorldLivingRef.current) {
-                try { (trailStoreRef.current.trails as any)['living-room'] = {}; } catch { }
-                usingWorldLivingRef.current = true;
-              }
-              const w = tw.world as [number, number, number];
-              const E = getExtrinsics('living-room');
-              if (E) {
-                const pc = worldToCamera(E, w);
-                if (pc) {
-                  const xCam = pc[0];
-                  const zCam = pc[2];
-                  const depth = Math.abs(zCam);
-                  trailStoreRef.current.push(key, activeKey, { x: xCam, y: depth }, colorId);
-                }
-              }
-              seenNow[key].add(activeKey);
-            } else if (key === 'family-room' && hasWorld) {
-              if (!usingWorldFamilyRef.current) {
-                try { (trailStoreRef.current.trails as any)['family-room'] = {}; } catch { }
-                usingWorldFamilyRef.current = true;
-              }
-              const w = tw.world as [number, number, number];
-              const E = getExtrinsics('family-room');
-              if (E) {
-                const pc = worldToCamera(E, w);
-                if (pc) {
-                  const xCam = pc[0];
-                  const zCam = pc[2];
-                  const depth = Math.abs(zCam);
-                  trailStoreRef.current.push(key, activeKey, { x: xCam, y: depth }, colorId);
-                }
-              }
-              seenNow[key].add(activeKey);
-            } else {
-              const center = t.center; if (!Array.isArray(center) || center.length < 2) continue;
-              trailStoreRef.current.push(key, activeKey, { x: center[0]!, y: center[1]! }, colorId);
-              seenNow[key].add(activeKey);
+              // If world frame is active but the track has no valid world point, skip it for consistency.
+              continue;
             }
+
+            const center = t.center;
+            if (!Array.isArray(center) || center.length < 2) continue;
+            const cx = Number(center[0]);
+            const cy = Number(center[1]);
+            if (!Number.isFinite(cx) || !Number.isFinite(cy)) continue;
+            trailStoreRef.current.push(key, activeKey, { x: cx, y: cy }, colorId);
+            seenNow[key].add(activeKey);
           }
         }
-        perKeyTracks[camKey] = track!.active_tracks;
       }
       // Transitions disabled
     }
@@ -376,15 +453,18 @@ function Dashboard() {
           : colorForTrack(Number(t.stable_id || 0));
         const metric = metricForTrack(t);
 
-        const metricText = metric ? `[${metric.x.toFixed(2)} m, ${metric.y.toFixed(2)} m]` : 'N/A';
-        tracksHtml += `<div><strong><span class="dot" style="display:inline-block;width:10px;height:10px;border-radius:50%;background:${dotColor};margin-right:6px;vertical-align:middle;"></span>SID ${t.stable_id ?? 'N/A'}:</strong><br/>Zone: ${t.zone || '-'}, Dwell: <span style="display:inline-block; min-width:4ch; text-align:right;">${dwell}</span>s<br/>Metric (BEV): ${metricText}<br/>Pixel Pos: [${(typeof center[0] === 'number' ? Number(center[0]).toFixed(3) : center[0])}, ${(typeof center[1] === 'number' ? Number(center[1]).toFixed(3) : center[1])}], Speed: <span style="display:inline-block; min-width:4ch; text-align:right;">${speed}</span> px/s</div>`;
+        const metricText = metric ? `[${metric.x.toFixed(2)} scene, ${metric.y.toFixed(2)} scene]` : 'N/A';
+        const idDisplay = (t as any).id_display
+          ?? (typeof (t as any).tracker_id === 'number'
+              ? `[${(t as any).tracker_id}] | [${t.stable_id ?? 'N/A'}]`
+              : String(t.stable_id ?? 'N/A'));
+        tracksHtml += `<div><strong><span class="dot" style="display:inline-block;width:10px;height:10px;border-radius:50%;background:${dotColor};margin-right:6px;vertical-align:middle;"></span>ID ${idDisplay}:</strong><br/>Zone: ${t.zone || '-'}, Dwell: <span style="display:inline-block; min-width:4ch; text-align:right;">${dwell}</span>s<br/>Metric (BEV): ${metricText}<br/>Pixel Pos: [${(typeof center[0] === 'number' ? Number(center[0]).toFixed(3) : center[0])}, ${(typeof center[1] === 'number' ? Number(center[1]).toFixed(3) : center[1])}], Speed: <span style="display:inline-block; min-width:4ch; text-align:right;">${speed}</span> px/s</div>`;
       });
     } else {
       tracksHtml = '<span>No active tracks.</span>';
     }
     setTrackDetailsHtml(tracksHtml);
     setTracksByCamera(perCamTracks);
-    setTracksByCamKey(perKeyTracks);
     setOccByCamKey(perKeyOcc);
     // Update zero-since timestamps when occupancy changes
     try {
@@ -418,6 +498,7 @@ function Dashboard() {
     }
     if (signature) {
       lastCalibrationSignatureRef.current = signature;
+      setCalibrationEpoch((v) => v + 1);
     }
 
     const now = Date.now();
@@ -656,38 +737,43 @@ function Dashboard() {
 
     setFloorplanData(prev => {
       const nextPayload = payload as FloorplanResponse;
-      if (nextPayload?.error) {
-        const existing = prev[key];
-        const hasValidGrid = Boolean(
-          existing?.density?.grid_b64 ||
-          existing?.height?.grid_b64 ||
-          existing?.distance?.grid_b64
-        );
-        if (hasValidGrid) {
-          return prev;
-        }
+      const existing = prev[key];
+      const hasExistingRenderableGrid = floorplanHasRenderableGrid(existing);
+      const nextHasRenderableGrid = floorplanHasRenderableGrid(nextPayload);
+      if (hasExistingRenderableGrid && (nextPayload?.error || !nextHasRenderableGrid)) {
+        return prev;
       }
       return { ...prev, [key]: nextPayload };
     });
 
     const label = labelForCameraId(key);
     const now = Date.now();
-    if (typeof payload.scale_m_per_px === 'number' && Number.isFinite(payload.scale_m_per_px)) {
+    const scaleScene = Number((payload as any).scale_scene_per_px);
+    const scaleMetric = Number(payload.scale_m_per_px);
+    if (Number.isFinite(scaleScene)) {
+      publish({
+        group: 'MapAnything Floorplan',
+        key: `${label} Scale (scene/px)`,
+        value: Number(scaleScene.toFixed(4)),
+        ts: now
+      });
+    } else if (Number.isFinite(scaleMetric)) {
       publish({
         group: 'MapAnything Floorplan',
         key: `${label} Scale (m/px)`,
-        value: Number(payload.scale_m_per_px.toFixed(4)),
+        value: Number(scaleMetric.toFixed(4)),
         ts: now
       });
     }
     const bounds = payload.bounds || {};
+    const boundsUnitLabel = String((payload as any).units || '').toLowerCase() === 'scene' ? 'scene' : 'm';
     if (
       typeof bounds.min_x === 'number' && Number.isFinite(bounds.min_x) &&
       typeof bounds.max_x === 'number' && Number.isFinite(bounds.max_x)
     ) {
       publish({
         group: 'MapAnything Floorplan',
-        key: `${label} X Span (m)`,
+        key: `${label} X Span (${boundsUnitLabel})`,
         value: Number((bounds.max_x - bounds.min_x).toFixed(2)),
         ts: now
       });
@@ -698,7 +784,7 @@ function Dashboard() {
     ) {
       publish({
         group: 'MapAnything Floorplan',
-        key: `${label} Z Span (m)`,
+        key: `${label} Z Span (${boundsUnitLabel})`,
         value: Number((bounds.max_z - bounds.min_z).toFixed(2)),
         ts: now
       });
@@ -709,9 +795,39 @@ function Dashboard() {
     if (!payload) return;
     const cam = resolveDisplayCameraKey((payload.cameraId || payload.camId || '').toString());
     if (!cam) return;
-    bevMetaRef.current = { ...bevMetaRef.current, [cam]: payload };
-    setBevMeta((prev) => ({ ...prev, [cam]: payload }));
-  }, [resolveDisplayCameraKey]);
+    const prevMode = bevFrameModeByCamRef.current[cam] || 'world';
+    const nextMode = resolveBevFrameMode(payload, prevMode);
+    setBevFrameMode(cam, nextMode);
+
+    const prevRaw = bevMetaRawRef.current[cam];
+    const mergedRaw = mergeBevMetaPayload(prevRaw, payload);
+    bevMetaRawRef.current = { ...bevMetaRawRef.current, [cam]: mergedRaw };
+    setBevMetaRaw((prev) => ({ ...prev, [cam]: mergedRaw }));
+
+    const normalizedPayload = normalizeBevMetaForDisplay(cam, mergedRaw, nextMode);
+    bevMetaRef.current = { ...bevMetaRef.current, [cam]: normalizedPayload };
+    setBevMeta((prev) => ({ ...prev, [cam]: normalizedPayload }));
+  }, [mergeBevMetaPayload, normalizeBevMetaForDisplay, resolveBevFrameMode, resolveDisplayCameraKey]);
+
+  useEffect(() => {
+    let changed = false;
+    const next: Record<CameraKey, BevMeta | undefined> = { ...bevMetaRef.current };
+
+    (['living-room', 'kitchen', 'family-room'] as CameraKey[]).forEach((cam) => {
+      const raw = bevMetaRawRef.current[cam];
+      if (!raw) return;
+      const mode = bevFrameModeByCamRef.current[cam] || 'world';
+      const normalized = normalizeBevMetaForDisplay(cam, raw, mode);
+      if (next[cam] !== normalized) {
+        next[cam] = normalized;
+        changed = true;
+      }
+    });
+
+    if (!changed) return;
+    bevMetaRef.current = next;
+    setBevMeta((prev) => ({ ...prev, ...next }));
+  }, [floorplanData, normalizeBevMetaForDisplay]);
 
   // WebRTC handler refs (to break circular dependency with useWebSocketClient)
   const webrtcHandleAnswerRef = useRef<(sdp: string) => Promise<void>>(() => Promise.resolve());
@@ -732,7 +848,18 @@ function Dashboard() {
   } = useWebSocketClient(WS_URL, {
     onBevMeta: handleBevMeta,
     onStats,
-    onTrailToggle: (en) => setTrailEnabled(en),
+    onTrailToggle: (en) => {
+      setTrailEnabled(en);
+      setBevTrailConfig((prev) => ({ ...prev, enabled: en }));
+    },
+    onTrailSettings: (config) => {
+      if (!config || typeof config !== 'object') return;
+      const next = config as Partial<BevTrailConfig>;
+      setBevTrailConfig((prev) => ({ ...prev, ...next }));
+      if (typeof next.enabled === 'boolean') {
+        setTrailEnabled(next.enabled);
+      }
+    },
     onCalibration: handleCalibrationBundle,
     onMADiagnostics: handleMADiagnostics,
     onMADepth: handleMADepth,
@@ -843,6 +970,27 @@ function Dashboard() {
       timers.forEach((id) => window.clearTimeout(id));
     };
   }, [status, handleRequestFloorplan]);
+
+  useEffect(() => {
+    if (status !== 'open' || calibrationEpoch <= 0) return;
+    const timers: number[] = [];
+    cameraOrder.forEach((cam, idx) => {
+      const timer = window.setTimeout(() => {
+        handleRequestFloorplan({
+          camera: cam,
+          requestId: `bev-calib-refresh-${cam}-${Date.now()}`,
+          maxAgeSec: 0,
+          gridResM: 0.15,
+          maxExtentM: 20,
+          cacheOnly: false,
+        });
+      }, idx * 140);
+      timers.push(timer);
+    });
+    return () => {
+      timers.forEach((id) => window.clearTimeout(id));
+    };
+  }, [calibrationEpoch, handleRequestFloorplan, status]);
 
   useEffect(() => {
     Object.entries(maDepthMeta || {}).forEach(([camId, meta]) => {
@@ -1051,12 +1199,30 @@ function Dashboard() {
                 cam={cam}
                 meta={bevMeta[cam]}
                 floorplan={floorplanData[cam]}
-                tracks={tracksByCamKey[cam]}
+                coordMode={bevFrameModeByCam[cam]}
                 trailEnabled={trailEnabled}
+                trailConfig={bevTrailConfig}
+                debug={bevDebugEnabled}
                 variant="inline"
               />
             ))}
           </div>
+          {showWorldBevRow && (
+            <div className="bev-row">
+              {cameraOrder.map((cam) => (
+                <BevView
+                  key={`bev-world-${cam}`}
+                  cam={cam}
+                  meta={bevMetaRaw[cam]}
+                  coordMode={bevFrameModeByCam[cam]}
+                  trailEnabled={trailEnabled}
+                  trailConfig={bevTrailConfig}
+                  debug={bevDebugEnabled}
+                  variant="inline"
+                />
+              ))}
+            </div>
+          )}
         </section>
 
         <section className="side">

@@ -1,5 +1,5 @@
 # Noesis Codebase Description
-_Status: current as of 2026-02-02._
+_Status: current as of 2026-02-22._
 
 ## Project Overview
 
@@ -21,7 +21,7 @@ Real-time multi-camera video analytics pipeline for:
 - **Advanced Tracking**: NVIDIA NvDCF tracker with OSNet-based re-identification for stable cross-camera IDs
 - **Pose-assisted StableID**: YOLO26 pose SGIE ratio features can be fused into StableID as a secondary signal (bounded in RAM; no disk persistence)
 - **Analytics**: ROI filtering, line crossing, direction detection, overcrowding via `nvdsanalytics`
-- **Bird's-Eye View (BEV)**: Real-time top-down visualization with homography-based projection and motion trails
+- **Bird's-Eye View (BEV)**: Real-time top-down visualization in native scene units (`menon_scene` world mode) with frontend-owned trail smoothing/persistence
 - **MapAnything Integration**: Full-frame depth estimation with valve-gated GPU inference branch
 - **Real-time WebRTC Streaming**: H.264 video via RTSP→WebRTC gateway for browser delivery
 - **Motion Trails**: GPU-rendered persistent trails behind tracked objects in the mosaic OSD
@@ -199,7 +199,7 @@ The system follows a **layered architecture** with clear separation between the 
   - `BevRenderer`: Renders top-down view from camera detections
   - `HomographyCache`: Caches homography matrices per calibration
   - `BevTrailConfig`: Configurable trail rendering for BEV canvas
-  - Projects 2D footpoints to 3D world coordinates
+  - World mode (`menon_scene`): publishes ground-plane footpoints in scene units (XZ); backend smoothing is disabled and the dashboard owns smoothing/jitter control
 - **publishers.py**: Telemetry publishers
   - `DepthTelemetryPublisher`: Broadcasts depth results over WebSocket
   - `TrackingTelemetryPublisher`: Broadcasts tracking/occupancy telemetry

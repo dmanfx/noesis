@@ -1,12 +1,30 @@
-import React, { useEffect, useRef, useState } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { CameraKey, cameraLabel, colorIdForPerson, identityKeyForPerson } from '../lib/camera';
 import { FloorplanResponse } from './DepthDrawer';
-import { renderLayerToCanvas, infernoColor } from '../lib/renderUtils';
+import { renderLayerToCanvas, renderCompositeWalkableObstacleToCanvas, infernoColor, bwColor } from '../lib/renderUtils';
+import type { BevFrameMode as CoordFrameMode } from '../lib/coordTransforms';
+import { isCameraLocalFrame, isWorldFrame } from '../lib/coordTransforms';
+import {
+  type BevTrailConfig,
+  type TrailPoint,
+  type TrailTrack,
+  computeSceneUnitsPerPx,
+  normalizeBevTrailConfig,
+  pruneTrailCollection,
+  upsertTrailSample,
+} from '../lib/bevTrails';
 
 export type BevMeta = {
+  type?: string;
   cameraId?: string;
   camId?: string;
-  footpoints?: Array<{ x: number; y: number; method: string; stableId: number }>;
+  ts?: number;
+  frame?: string;
+  world_frame?: string;
+  frame_mode?: string;
+  units?: string;
+  s_obj_to_m?: number;
+  footpoints?: Array<{ x: number; y: number; method: string; stableId?: number | null; trackerId?: number | null }>;
   xMin?: number;
   xMax?: number;
   zMin?: number;
@@ -15,11 +33,18 @@ export type BevMeta = {
   details?: string;
 };
 
+export type BevFrameMode = CoordFrameMode;
+
 type BevViewProps = {
   cam: CameraKey;
   meta?: BevMeta;
   floorplan?: FloorplanResponse;
+  // 'world' means points are in MENON scene/world frame.
+  // 'camera_local_legacy' keeps existing floorplan-local behavior.
+  coordMode?: BevFrameMode;
   trailEnabled?: boolean;
+  trailConfig?: Partial<BevTrailConfig>;
+  debug?: boolean;
   variant?: 'drawer' | 'inline';
 };
 
@@ -28,25 +53,86 @@ const DEFAULT_X_MAX = 4;
 const DEFAULT_Z_MIN = 0;
 const DEFAULT_Z_MAX = 12;
 
-type TrailPoint = { x: number; y: number; t: number };
-type TrailTrack = { points: TrailPoint[]; lastSeen: number; label: string; colorId: number };
 type ContentRect = { x: number; y: number; w: number; h: number };
 
-const TRAIL_WINDOW_MS = 20000;
-const TRAIL_MIN_DT_MS = 80;
-const TRAIL_MIN_STEP_M = 0.05;
-const TRAIL_GAP_MS = 650;
-const TRAIL_MAX_TRACKS = 8;
 const TRAIL_LINE_WIDTH = 2.5;
-const TRAIL_MIN_ALPHA = 0.12;
-const TRAIL_STALE_BLINK_START_MS = 700;
-const TRAIL_STALE_BLINK_PERIOD_MS = 1400;
+
+type TrailClock = {
+  lastSrcMs?: number;
+  lastSampleMs?: number;
+};
+
+// Keep source-clock smoothing from lagging visible motion by multiple seconds.
+const MAX_TRAIL_CLOCK_SKEW_MS = 200;
+
+const floorplanHasRenderableGrid = (floorplan?: FloorplanResponse | null): boolean => Boolean(
+  floorplan?.walkable?.grid_b64 ||
+  floorplan?.obstacle_height?.grid_b64 ||
+  floorplan?.height?.grid_b64 ||
+  floorplan?.density?.grid_b64 ||
+  floorplan?.distance?.grid_b64
+);
+
+const normalizePayloadTsMs = (rawTs: unknown): number | null => {
+  const value = Number(rawTs);
+  if (!Number.isFinite(value) || value <= 0) return null;
+  // 2020+ epoch in nanoseconds.
+  if (value >= 1e17) return value / 1e6;
+  // Typical epoch microseconds.
+  if (value >= 1e14) return value / 1e3;
+  // Typical epoch milliseconds.
+  if (value >= 1e11) return value;
+  // Epoch seconds.
+  if (value >= 1e9) return value * 1e3;
+  // Non-epoch stream PTS domain: keep as milliseconds for delta-only use.
+  return value;
+};
+
+const resolveTrailSampleNowMs = (rawTs: unknown, arrivalNowMs: number, clock: TrailClock): number => {
+  const srcMs = normalizePayloadTsMs(rawTs);
+  if (srcMs === null) {
+    clock.lastSrcMs = undefined;
+    clock.lastSampleMs = arrivalNowMs;
+    return arrivalNowMs;
+  }
+
+  const prevSrcMs = clock.lastSrcMs;
+  const prevSampleMs = clock.lastSampleMs;
+  clock.lastSrcMs = srcMs;
+
+  if (!Number.isFinite(Number(prevSrcMs)) || !Number.isFinite(Number(prevSampleMs))) {
+    clock.lastSampleMs = arrivalNowMs;
+    return arrivalNowMs;
+  }
+
+  let deltaMs = srcMs - Number(prevSrcMs);
+  if (!Number.isFinite(deltaMs) || deltaMs < 0) {
+    clock.lastSampleMs = arrivalNowMs;
+    return arrivalNowMs;
+  }
+  deltaMs = Math.min(deltaMs, 1000);
+
+  const candidate = Number(prevSampleMs) + deltaMs;
+  if (!Number.isFinite(candidate)) {
+    clock.lastSampleMs = arrivalNowMs;
+    return arrivalNowMs;
+  }
+  const clamped = Math.max(
+    arrivalNowMs - MAX_TRAIL_CLOCK_SKEW_MS,
+    Math.min(arrivalNowMs + MAX_TRAIL_CLOCK_SKEW_MS, candidate)
+  );
+  clock.lastSampleMs = clamped;
+  return clamped;
+};
 
 export const BevView: React.FC<BevViewProps> = ({
   cam,
   meta,
   floorplan,
+  coordMode = 'world',
   trailEnabled = true,
+  trailConfig,
+  debug = false,
   variant = 'drawer'
 }) => {
   const label = cameraLabel(cam);
@@ -60,63 +146,123 @@ export const BevView: React.FC<BevViewProps> = ({
   const bgKeyRef = useRef<string>('');
   const bgSizeRef = useRef<{ w: number; h: number }>({ w: 0, h: 0 });
   const bgContentRectRef = useRef<ContentRect | null>(null);
+  const retainedFloorplanRef = useRef<FloorplanResponse | undefined>(floorplan);
+  const trailSceneUnitsPerPxRef = useRef<number>(1.0);
+  const trailFrameCounterRef = useRef<number>(0);
+  const trailSpaceKeyRef = useRef<string>('');
+  const trailClockRef = useRef<TrailClock>({});
   const metaRef = useRef<BevMeta | undefined>(meta);
+  const resolvedTrailConfig = useMemo(
+    () => normalizeBevTrailConfig({ ...trailConfig, enabled: trailEnabled }),
+    [trailConfig, trailEnabled]
+  );
+  const displayFloorplan = (floorplanHasRenderableGrid(floorplan) && !floorplan?.error)
+    ? floorplan
+    : (retainedFloorplanRef.current ?? floorplan);
 
   useEffect(() => {
     metaRef.current = meta;
   }, [meta]);
 
   useEffect(() => {
-    const now = Date.now();
+    if (floorplanHasRenderableGrid(floorplan) && !floorplan?.error) {
+      retainedFloorplanRef.current = floorplan;
+      return;
+    }
+    if (!retainedFloorplanRef.current) {
+      retainedFloorplanRef.current = floorplan;
+    }
+  }, [floorplan]);
+
+  useEffect(() => {
+    const bounds = displayFloorplan?.bounds;
+    const boundsKey = bounds
+      ? [
+          Number(bounds.min_x).toFixed(3),
+          Number(bounds.max_x).toFixed(3),
+          Number(bounds.min_z).toFixed(3),
+          Number(bounds.max_z).toFixed(3),
+        ].join(',')
+      : 'none';
+    const nextSpaceKey = [
+      coordMode,
+      String(displayFloorplan?.frame || '').trim().toLowerCase(),
+      String(displayFloorplan?.units || '').trim().toLowerCase(),
+      boundsKey,
+    ].join('|');
+
+    if (trailSpaceKeyRef.current && trailSpaceKeyRef.current !== nextSpaceKey) {
+      trailsRef.current.clear();
+      smoothState.current.clear();
+      trailFrameCounterRef.current = 0;
+      trailClockRef.current = {};
+    }
+    trailSpaceKeyRef.current = nextSpaceKey;
+  }, [
+    coordMode,
+    displayFloorplan?.frame,
+    displayFloorplan?.units,
+    displayFloorplan?.bounds?.min_x,
+    displayFloorplan?.bounds?.max_x,
+    displayFloorplan?.bounds?.min_z,
+    displayFloorplan?.bounds?.max_z,
+  ]);
+
+  useEffect(() => {
+    const arrivalNow = Date.now();
+    const sampleNow = resolveTrailSampleNowMs(meta?.ts, arrivalNow, trailClockRef.current);
+    const effectiveNow = Math.max(sampleNow, arrivalNow - MAX_TRAIL_CLOCK_SKEW_MS);
     const state = smoothState.current;
     const trails = trailsRef.current;
+    const cfg = resolvedTrailConfig;
 
-    if (meta?.footpoints) {
-      meta.footpoints.forEach(pt => {
+    if (!cfg.enabled) {
+      trails.clear();
+      state.clear();
+      trailFrameCounterRef.current = 0;
+      trailClockRef.current = {};
+      return;
+    }
+
+    const points = Array.isArray(meta?.footpoints) ? meta.footpoints : [];
+    if (points.length) {
+      trailFrameCounterRef.current += 1;
+      const doSample = (trailFrameCounterRef.current % cfg.draw_stride) === 0;
+      const sceneUnitsPerPx = trailSceneUnitsPerPxRef.current;
+
+      points.forEach(pt => {
         const targetX = pt.x;
         const targetY = pt.y;
 
         const stableNum = typeof pt.stableId === 'number' && Number.isFinite(pt.stableId) ? pt.stableId : null;
-        if (stableNum === null || stableNum <= 0) return;
-        const colorId = colorIdForPerson(cam, stableNum);
+        const trackerNum = typeof pt.trackerId === 'number' && Number.isFinite(pt.trackerId) ? pt.trackerId : null;
+        const keyNum = (stableNum && stableNum > 0)
+          ? stableNum
+          : ((trackerNum !== null && trackerNum >= 0) ? trackerNum : null);
+        if (keyNum === null) return;
+        const colorId = colorIdForPerson(cam, keyNum);
 
-        state.set(stableNum, {
-          x: targetX,
-          y: targetY,
-          lastSeen: now,
-          stableId: `${stableNum}`,
-          colorId
-        });
-
-        if (!trailEnabled) return;
-
-        const key = identityKeyForPerson(cam, stableNum);
-        const labelText = `${stableNum}`;
+        const key = identityKeyForPerson(cam, keyNum);
+        const labelText = `${stableNum && stableNum > 0 ? stableNum : keyNum}`;
 
         const entry = trails.get(key) ?? { points: [], lastSeen: 0, label: labelText, colorId };
-        const pts = entry.points;
-        const last = pts.length ? pts[pts.length - 1] : null;
-        const lastValid = last && Number.isFinite(last.x) && Number.isFinite(last.y) ? last : null;
+        const update = upsertTrailSample(entry, {
+          nowMs: effectiveNow,
+          x: targetX,
+          y: targetY,
+          doSample,
+          sceneUnitsPerPx,
+          cfg,
+        });
 
-        // Break polyline if we lost sight long enough to avoid teleport lines.
-        if (entry.lastSeen > 0 && (now - entry.lastSeen) > TRAIL_GAP_MS) {
-          pts.push({ x: Number.NaN, y: Number.NaN, t: now });
-        }
+        state.set(keyNum, {
+          x: update.headX,
+          y: update.headY,
+          lastSeen: arrivalNow,
+          stableId: `${stableNum && stableNum > 0 ? stableNum : keyNum}`,
+          colorId,
+        });
 
-        if (!lastValid) {
-          pts.push({ x: targetX, y: targetY, t: now });
-        } else {
-          const dt = now - lastValid.t;
-          const dist = Math.hypot(targetX - lastValid.x, targetY - lastValid.y);
-          if (dt >= TRAIL_MIN_DT_MS || dist >= TRAIL_MIN_STEP_M) {
-            pts.push({ x: targetX, y: targetY, t: now });
-          } else {
-            // Update head sample in-place so the trail stays responsive without oversampling.
-            pts[pts.length - 1] = { x: targetX, y: targetY, t: now };
-          }
-        }
-
-        entry.lastSeen = now;
         entry.label = labelText;
         entry.colorId = colorId;
         trails.set(key, entry);
@@ -124,38 +270,13 @@ export const BevView: React.FC<BevViewProps> = ({
     }
 
     for (const [id, data] of state.entries()) {
-      if (now - data.lastSeen > 1000) {
+      if (arrivalNow - data.lastSeen > 1000) {
         state.delete(id);
       }
     }
 
-    if (trailEnabled) {
-      // Prune per-track points by time window and evict old/empty tracks.
-      for (const [key, track] of trails.entries()) {
-        const pts = track.points;
-        if (!pts.length) {
-          trails.delete(key);
-          continue;
-        }
-        let cut = 0;
-        while (cut < pts.length && (now - pts[cut].t) > TRAIL_WINDOW_MS) cut += 1;
-        if (cut > 0) track.points = pts.slice(cut);
-        while (track.points.length && (!Number.isFinite(track.points[0].x) || !Number.isFinite(track.points[0].y))) {
-          track.points.shift();
-        }
-        if (track.points.length === 0) trails.delete(key);
-      }
-
-      if (trails.size > TRAIL_MAX_TRACKS) {
-        const ordered = Array.from(trails.entries()).sort((a, b) => a[1].lastSeen - b[1].lastSeen);
-        for (let i = 0; i < ordered.length - TRAIL_MAX_TRACKS; i += 1) {
-          trails.delete(ordered[i][0]);
-        }
-      }
-    } else {
-      trails.clear();
-    }
-  }, [meta, trailEnabled]);
+    pruneTrailCollection(trails, arrivalNow, cfg);
+  }, [cam, meta, resolvedTrailConfig]);
 
   useEffect(() => {
     const render = () => {
@@ -165,16 +286,31 @@ export const BevView: React.FC<BevViewProps> = ({
       if (!ctx) return;
 
       const metaNow = metaRef.current;
+      const floorplanNow = displayFloorplan;
       const aspect = variant === 'inline' ? 2 : (4 / 3);
       const fitMode = 'contain';
+
+      const floorplanFrame = floorplanNow?.frame;
+      const hasFloorplanFrame = typeof floorplanFrame === 'string' && floorplanFrame.trim().length > 0;
+      const isFloorplanWorld = isWorldFrame(floorplanFrame);
+      const isFloorplanCameraLocal = isCameraLocalFrame(floorplanFrame);
+      const floorplanUnits = String(floorplanNow?.units || '').trim().toLowerCase();
+      const hasSceneUnits = floorplanUnits === 'scene';
+      const isFloorplanCompatible =
+        coordMode === 'world'
+          ? ((!hasFloorplanFrame || isFloorplanWorld || isFloorplanCameraLocal) && hasSceneUnits)
+          : !floorplanFrame || isFloorplanCameraLocal;
+      const useBoundsFromFloorplan = coordMode === 'world'
+        ? (hasSceneUnits && (isFloorplanWorld || isFloorplanCameraLocal))
+        : (!hasFloorplanFrame || isFloorplanCameraLocal);
 
       let xMin = DEFAULT_X_MIN;
       let xMax = DEFAULT_X_MAX;
       let zMin = DEFAULT_Z_MIN;
       let zMax = DEFAULT_Z_MAX;
 
-      if (floorplan?.bounds && floorplan.scale_m_per_px) {
-        const b = floorplan.bounds;
+      if (floorplanNow?.bounds && useBoundsFromFloorplan) {
+        const b = floorplanNow.bounds;
         if (typeof b.min_x === 'number' && typeof b.max_x === 'number' &&
           typeof b.min_z === 'number' && typeof b.max_z === 'number') {
           xMin = b.min_x;
@@ -197,8 +333,23 @@ export const BevView: React.FC<BevViewProps> = ({
       const boundsSpanZ = Math.max(1e-6, zMax - zMin);
       const boundsAspect = boundsSpanX / boundsSpanZ;
 
-      const heightLayer = floorplan?.height;
-      const hasFloorplan = !!(heightLayer && heightLayer.grid_b64 && heightLayer.grid_shape);
+      const walkableLayer = floorplanNow?.walkable;
+      const obstacleHeightLayer = floorplanNow?.obstacle_height;
+      const heightLayer = floorplanNow?.height;
+      const hasWalkable = isFloorplanCompatible && !!(walkableLayer && walkableLayer.grid_b64 && walkableLayer.grid_shape);
+      const hasObstacleHeight = isFloorplanCompatible && !!(obstacleHeightLayer && obstacleHeightLayer.grid_b64 && obstacleHeightLayer.grid_shape);
+      const hasHeight = isFloorplanCompatible && !!(heightLayer && heightLayer.grid_b64 && heightLayer.grid_shape);
+      const forceLegacyHeightInline = variant === 'inline' && cam === 'kitchen' && hasHeight;
+
+      const hasComposite = !forceLegacyHeightInline && hasWalkable && hasObstacleHeight;
+      const baseLayer = forceLegacyHeightInline
+        ? heightLayer
+        : (hasWalkable ? walkableLayer : (hasObstacleHeight ? obstacleHeightLayer : heightLayer));
+      const baseKind = forceLegacyHeightInline
+        ? 'height'
+        : (hasComposite ? 'composite' : (hasWalkable ? 'walkable' : (hasObstacleHeight ? 'obstacle_height' : 'height')));
+      const basePalette = baseKind === 'walkable' ? bwColor : infernoColor;
+      const hasFloorplan = !!(baseLayer && baseLayer.grid_b64 && baseLayer.grid_shape);
 
       // Cache the floorplan render so we don't re-decode base64 every animation frame.
       const dpr = window.devicePixelRatio || 1;
@@ -208,8 +359,8 @@ export const BevView: React.FC<BevViewProps> = ({
       const expectedW = Math.max(1, Math.round(canvasWidthCss * dpr));
       const expectedH = Math.max(1, Math.round(canvasHeightCss * dpr));
       let padCss = 0;
-      if (hasFloorplan && Array.isArray(heightLayer?.grid_shape)) {
-        const [rows, cols] = heightLayer.grid_shape;
+      if (hasFloorplan && Array.isArray(baseLayer?.grid_shape)) {
+        const [rows, cols] = baseLayer.grid_shape;
         if (rows && cols) {
           const canvasAspect = canvasWidthCss / canvasHeightCss;
           let contentW = canvasWidthCss;
@@ -227,7 +378,7 @@ export const BevView: React.FC<BevViewProps> = ({
       }
 
       const key = hasFloorplan
-        ? `${floorplan?.snapshot_ts ?? floorplan?.ts ?? ''}:${heightLayer?.grid_shape?.join('x')}:${heightLayer?.value_min ?? ''}:${heightLayer?.value_max ?? ''}:${heightLayer?.grid_b64?.length ?? ''}:${aspect}:${fitMode}:${boundsAspect.toFixed(6)}:${padCss.toFixed(3)}`
+        ? `${baseKind}:${floorplanNow?.snapshot_ts ?? floorplanNow?.ts ?? ''}:${baseLayer?.grid_shape?.join('x')}:${baseLayer?.value_min ?? ''}:${baseLayer?.value_max ?? ''}:${baseLayer?.grid_b64?.length ?? ''}:${hasComposite ? (obstacleHeightLayer?.grid_b64?.length ?? '') : ''}:${aspect}:${fitMode}:${boundsAspect.toFixed(6)}:${padCss.toFixed(3)}`
         : `none:${aspect}:${fitMode}:${boundsAspect.toFixed(6)}:${padCss.toFixed(3)}`;
 
       const bg = bgCanvasRef.current ?? (bgCanvasRef.current = document.createElement('canvas'));
@@ -236,11 +387,17 @@ export const BevView: React.FC<BevViewProps> = ({
 
       if (bgNeedsRedraw) {
         if (hasFloorplan) {
-          const rendered = renderLayerToCanvas(cvs, heightLayer, infernoColor, {
-            fit: fitMode,
-            forceAspect: boundsAspect,
-            contentPaddingPx: padCss
-          });
+          const rendered = hasComposite
+            ? renderCompositeWalkableObstacleToCanvas(cvs, walkableLayer, obstacleHeightLayer, {
+              fit: fitMode,
+              forceAspect: boundsAspect,
+              contentPaddingPx: padCss
+            })
+            : renderLayerToCanvas(cvs, baseLayer, basePalette, {
+              fit: fitMode,
+              forceAspect: boundsAspect,
+              contentPaddingPx: padCss
+            });
           bgContentRectRef.current = rendered?.contentRectPx ?? { x: 0, y: 0, w: cvs.width, h: cvs.height };
         } else {
           cvs.width = expectedW;
@@ -265,10 +422,29 @@ export const BevView: React.FC<BevViewProps> = ({
       const width = cvs.width;
       const height = cvs.height;
       const contentRect = bgContentRectRef.current ?? { x: 0, y: 0, w: width, h: height };
+      trailSceneUnitsPerPxRef.current = computeSceneUnitsPerPx({
+        xMin,
+        xMax,
+        zMin,
+        zMax,
+        widthPx: contentRect.w,
+        heightPx: contentRect.h,
+      });
 
       const drawX = (mx: number) => contentRect.x + ((mx - xMin) / (xMax - xMin)) * contentRect.w;
       const drawY = (mz: number) => contentRect.y + contentRect.h - ((mz - zMin) / (zMax - zMin)) * contentRect.h;
       const inBounds = (mx: number, mz: number) => mx >= xMin && mx <= xMax && mz >= zMin && mz <= zMax;
+
+      const footpoints = Array.isArray(metaNow?.footpoints) ? metaNow.footpoints : [];
+      let finitePointCount = 0;
+      let inBoundsPointCount = 0;
+      for (const p of footpoints) {
+        const px = Number(p?.x);
+        const py = Number(p?.y);
+        if (!Number.isFinite(px) || !Number.isFinite(py)) continue;
+        finitePointCount += 1;
+        if (inBounds(px, py)) inBoundsPointCount += 1;
+      }
 
       if (overlayEnabled) {
         ctx.strokeStyle = 'rgba(255, 255, 255, 0.1)';
@@ -305,6 +481,8 @@ export const BevView: React.FC<BevViewProps> = ({
       }
 
       const now = Date.now();
+      const trailCfg = resolvedTrailConfig;
+      const trailWindowMs = Math.max(100, trailCfg.window_s * 1000.0);
 
       const hueForId = (id: number) => (id * 47) % 360;
       const hsla = (id: number, a: number) => `hsla(${hueForId(id)}, 80%, 60%, ${a})`;
@@ -323,41 +501,16 @@ export const BevView: React.FC<BevViewProps> = ({
       }
       try {
         const trails = trailsRef.current;
-        if (!trailEnabled) {
+        if (!trailCfg.enabled) {
           trails.clear();
         } else {
-          for (const [key, track] of trails.entries()) {
-            const pts = track.points;
-            if (!pts.length) {
-              trails.delete(key);
-              continue;
-            }
-            let cut = 0;
-            while (cut < pts.length && (now - pts[cut].t) > TRAIL_WINDOW_MS) cut += 1;
-            if (cut > 0) track.points = pts.slice(cut);
-            while (track.points.length && (!Number.isFinite(track.points[0].x) || !Number.isFinite(track.points[0].y))) {
-              track.points.shift();
-            }
-            if (track.points.length === 0) {
-              trails.delete(key);
-              continue;
-            }
-            if (now - track.lastSeen > (TRAIL_WINDOW_MS + 2000)) {
-              trails.delete(key);
-            }
-          }
-          if (trails.size > TRAIL_MAX_TRACKS) {
-            const ordered = Array.from(trails.entries()).sort((a, b) => a[1].lastSeen - b[1].lastSeen);
-            for (let i = 0; i < ordered.length - TRAIL_MAX_TRACKS; i += 1) {
-              trails.delete(ordered[i][0]);
-            }
-          }
+          pruneTrailCollection(trails, now, trailCfg);
         }
       } catch {
         // defensive
       }
 
-      if (trailEnabled) {
+      if (trailCfg.enabled) {
         const tracksToDraw = Array.from(trailsRef.current.values());
         for (const tr of tracksToDraw) {
           const pts = tr.points;
@@ -381,8 +534,8 @@ export const BevView: React.FC<BevViewProps> = ({
             }
 
             const ageMs = Math.max(0, now - p.t);
-            const frac = Math.max(0, Math.min(1, 1 - (ageMs / TRAIL_WINDOW_MS)));
-            const alpha = TRAIL_MIN_ALPHA + (1 - TRAIL_MIN_ALPHA) * frac;
+            const frac = Math.max(0, Math.min(1, 1 - (ageMs / trailWindowMs)));
+            const alpha = trailCfg.min_alpha + (1 - trailCfg.min_alpha) * frac;
 
             ctx.strokeStyle = hsla(tr.colorId, alpha);
             ctx.beginPath();
@@ -402,13 +555,14 @@ export const BevView: React.FC<BevViewProps> = ({
           }
           if (lastValid) {
             const ageMs = Math.max(0, now - lastValid.t);
-            const frac = Math.max(0, Math.min(1, 1 - (ageMs / TRAIL_WINDOW_MS)));
-            const alpha = TRAIL_MIN_ALPHA + (1 - TRAIL_MIN_ALPHA) * frac;
+            const frac = Math.max(0, Math.min(1, 1 - (ageMs / trailWindowMs)));
+            const alpha = trailCfg.min_alpha + (1 - trailCfg.min_alpha) * frac;
             const staleMs = Math.max(0, now - (tr.lastSeen || 0));
-            const blinkPhase = (2 * Math.PI * (now % TRAIL_STALE_BLINK_PERIOD_MS)) / TRAIL_STALE_BLINK_PERIOD_MS;
-            const blink = staleMs >= TRAIL_STALE_BLINK_START_MS
-              ? (0.35 + 0.65 * (0.5 + 0.5 * Math.sin(blinkPhase)))
-              : 1.0;
+            let blink = 1.0;
+            if (trailCfg.stale_head_blink_enabled && staleMs >= trailCfg.stale_blink_start_ms) {
+              const blinkPhase = (2 * Math.PI * (now % trailCfg.stale_blink_period_ms)) / trailCfg.stale_blink_period_ms;
+              blink = 0.35 + 0.65 * (0.5 + 0.5 * Math.sin(blinkPhase));
+            }
             const px = drawX(lastValid.x);
             const py = drawY(lastValid.y);
 
@@ -436,7 +590,7 @@ export const BevView: React.FC<BevViewProps> = ({
 
         ctx.globalAlpha = alpha;
         ctx.beginPath();
-        ctx.arc(px, py, 6, 0, 2 * Math.PI);
+        ctx.arc(px, py, 3.8, 0, 2 * Math.PI);
         ctx.fillStyle = `hsl(${hueForId(colorId)}, 80%, 60%)`;
         ctx.fill();
         ctx.strokeStyle = '#000';
@@ -454,6 +608,53 @@ export const BevView: React.FC<BevViewProps> = ({
         ctx.globalAlpha = 1.0;
       });
 
+      // Camera marker at the bottom-center to preserve the BEV forward-view convention.
+      const camPx = drawX((xMin + xMax) * 0.5);
+      const camPy = drawY(zMin);
+      ctx.fillStyle = 'rgba(255, 215, 64, 0.95)';
+      ctx.strokeStyle = 'rgba(0, 0, 0, 0.65)';
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      ctx.moveTo(camPx - 10, camPy);
+      ctx.lineTo(camPx + 10, camPy);
+      ctx.lineTo(camPx, camPy - 16);
+      ctx.closePath();
+      ctx.fill();
+      ctx.stroke();
+      ctx.beginPath();
+      ctx.moveTo(camPx, camPy);
+      ctx.lineTo(camPx, camPy - 26);
+      ctx.stroke();
+
+      if (finitePointCount > 0 && inBoundsPointCount === 0) {
+        ctx.fillStyle = 'rgba(244, 67, 54, 0.9)';
+        ctx.font = 'bold 11px sans-serif';
+        ctx.textAlign = 'center';
+        ctx.fillText('Tracks are outside floorplan bounds', contentRect.x + (contentRect.w / 2), contentRect.y + 16);
+        ctx.textAlign = 'left';
+      }
+
+      if (debug) {
+        const lines = [
+          `mode=${coordMode}`,
+          `frame=${String(floorplanFrame || 'none')}`,
+          `units=${String(metaNow?.units || floorplanNow?.units || 'unknown')}`,
+          `pts=${finitePointCount} in=${inBoundsPointCount}`,
+          `x:[${xMin.toFixed(2)},${xMax.toFixed(2)}] z:[${zMin.toFixed(2)},${zMax.toFixed(2)}]`,
+        ];
+        const panelPad = 6;
+        const lineH = 13;
+        const panelW = 250;
+        const panelH = panelPad * 2 + lines.length * lineH;
+        ctx.fillStyle = 'rgba(0, 0, 0, 0.62)';
+        ctx.fillRect(contentRect.x + 8, contentRect.y + 8, panelW, panelH);
+        ctx.fillStyle = '#d8f5d1';
+        ctx.font = '11px monospace';
+        for (let i = 0; i < lines.length; i += 1) {
+          ctx.fillText(lines[i], contentRect.x + 8 + panelPad, contentRect.y + 8 + panelPad + ((i + 1) * lineH) - 3);
+        }
+      }
+
       animationFrameRef.current = requestAnimationFrame(render);
     };
 
@@ -461,9 +662,30 @@ export const BevView: React.FC<BevViewProps> = ({
     return () => {
       if (animationFrameRef.current) cancelAnimationFrame(animationFrameRef.current);
     };
-  }, [floorplan, overlayEnabled, trailEnabled, variant]);
+  }, [coordMode, debug, floorplan, overlayEnabled, resolvedTrailConfig, variant]);
 
-  const subtitleText = floorplan ? 'Height Map' : 'No Map Data';
+  const floorplanFrame = displayFloorplan?.frame;
+  const hasFloorplanFrame = typeof floorplanFrame === 'string' && floorplanFrame.trim().length > 0;
+  const isFloorplanWorld = isWorldFrame(floorplanFrame);
+  const isFloorplanCameraLocal = isCameraLocalFrame(floorplanFrame);
+  const floorplanUnits = String(displayFloorplan?.units || '').trim().toLowerCase();
+  const hasSceneUnits = floorplanUnits === 'scene';
+  const isFloorplanCompatible =
+    coordMode === 'world'
+      ? ((!hasFloorplanFrame || isFloorplanWorld || isFloorplanCameraLocal) && hasSceneUnits)
+      : !floorplanFrame || isFloorplanCameraLocal;
+
+  const hasWalkableLayer = isFloorplanCompatible && !!(displayFloorplan?.walkable?.grid_b64 && displayFloorplan?.walkable?.grid_shape);
+  const hasObstacleHeightLayer = isFloorplanCompatible && !!(displayFloorplan?.obstacle_height?.grid_b64 && displayFloorplan?.obstacle_height?.grid_shape);
+  const hasHeightLayer = isFloorplanCompatible && !!(displayFloorplan?.height?.grid_b64 && displayFloorplan?.height?.grid_shape);
+  const forceLegacyHeightInline = variant === 'inline' && cam === 'kitchen' && hasHeightLayer;
+  const floorplanHasImage = hasWalkableLayer || hasObstacleHeightLayer || hasHeightLayer;
+
+  const isFrameMismatch = coordMode === 'world' && isFloorplanCameraLocal;
+  const baseLabel = forceLegacyHeightInline
+    ? 'Height Map'
+    : (hasWalkableLayer ? 'Walkable Map' : (hasObstacleHeightLayer ? 'Obstacle Height' : 'Height Map'));
+  const subtitleText = floorplanHasImage ? (isFrameMismatch ? `${baseLabel} (local-floorplan fallback)` : baseLabel) : 'No Map Data';
   const subtitle = ` • ${subtitleText}`;
 
   const toggleLabel = (

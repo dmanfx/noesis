@@ -30,6 +30,7 @@ from calibration_bundle import (
     load_alignment,
     load_extrinsics,
     load_intrinsics,
+    pose_to_E_col_major,
     save_alignment,
     save_extrinsics,
 )
@@ -1059,7 +1060,7 @@ def _build_stable_id_manager(logger: logging.Logger, *, pipeline_config: Optiona
         model_name = os.environ.get("NOESIS_REID_MODEL_NAME", "osnet_x1_0")
         img_h = int(os.environ.get("NOESIS_REID_IMAGE_H", "256") or 256)
         img_w = int(os.environ.get("NOESIS_REID_IMAGE_W", "128") or 128)
-        embed_interval_s = float(os.environ.get("NOESIS_REID_EMBED_INTERVAL_S", "0.0") or 0.0)
+        embed_interval_s = float(os.environ.get("NOESIS_REID_EMBED_INTERVAL_S", "0.5") or 0.5)
         new_id_hysteresis_frames = int(os.environ.get("NOESIS_REID_NEW_ID_HYSTERESIS_FRAMES", "1") or 1)
         new_id_confirm_frames_at_cap = int(os.environ.get("NOESIS_REID_NEW_ID_CONFIRM_FRAMES_AT_CAP", "1") or 1)
         pose_flag = os.environ.get("NOESIS_REID_POSE_ENABLED", "")
@@ -1122,13 +1123,60 @@ def _build_stable_id_manager(logger: logging.Logger, *, pipeline_config: Optiona
             pose_max_total_entries = 0
         aliases_enabled_env = os.environ.get("NOESIS_REID_ALIASES_ENABLED", "1")
         aliases_enabled = str(aliases_enabled_env).strip().lower() in ("1", "true", "yes", "on")
+        reset_sid_pool_env = os.environ.get("NOESIS_REID_RESET_SID_POOL")
+        if reset_sid_pool_env is None:
+            # Backward compatibility for command-line typos observed in the field.
+            reset_sid_pool_env = os.environ.get("NOESIS_REID_RESER_SID_POOL", "0")
+        reset_sid_pool = str(reset_sid_pool_env).strip().lower() in ("1", "true", "yes", "on")
+        try:
+            max_total_ids = int(os.environ.get("NOESIS_REID_MAX_TOTAL_IDS", "12") or 12)
+        except Exception:
+            max_total_ids = 12
+        total_id_reuse_env = os.environ.get("NOESIS_REID_TOTAL_ID_REUSE", "1")
+        total_id_reuse = str(total_id_reuse_env).strip().lower() in ("1", "true", "yes", "on")
+        try:
+            total_id_reuse_min_age_s = float(os.environ.get("NOESIS_REID_TOTAL_ID_REUSE_MIN_AGE_S", "60") or 60.0)
+        except Exception:
+            total_id_reuse_min_age_s = 60.0
+        auto_merge_enabled_env = os.environ.get("NOESIS_REID_AUTO_MERGE_ENABLED", "1")
+        auto_merge_enabled = str(auto_merge_enabled_env).strip().lower() in ("1", "true", "yes", "on")
+        try:
+            auto_merge_interval_s = float(os.environ.get("NOESIS_REID_AUTO_MERGE_INTERVAL_S", "5") or 5.0)
+        except Exception:
+            auto_merge_interval_s = 5.0
+        try:
+            auto_merge_max_attempts = int(os.environ.get("NOESIS_REID_AUTO_MERGE_MAX_ATTEMPTS", "20") or 20)
+        except Exception:
+            auto_merge_max_attempts = 20
+        try:
+            auto_merge_min_sim = float(os.environ.get("NOESIS_REID_AUTO_MERGE_MIN_SIM", "0.92") or 0.92)
+        except Exception:
+            auto_merge_min_sim = 0.92
+        try:
+            auto_merge_min_embeddings_for_suggest = int(
+                os.environ.get("NOESIS_REID_AUTO_MERGE_MIN_EMBEDDINGS_FOR_SUGGEST", "1") or 1
+            )
+        except Exception:
+            auto_merge_min_embeddings_for_suggest = 1
+        auto_merge_respect_inactive_env = os.environ.get("NOESIS_REID_AUTO_MERGE_RESPECT_INACTIVE", "0")
+        auto_merge_respect_inactive = str(auto_merge_respect_inactive_env).strip().lower() in ("1", "true", "yes", "on")
+        auto_merge_force_stuck_env = os.environ.get("NOESIS_REID_AUTO_MERGE_FORCE_STUCK", "0")
+        auto_merge_force_stuck = str(auto_merge_force_stuck_env).strip().lower() in ("1", "true", "yes", "on")
+        auto_merge_allow_both_active_env = os.environ.get("NOESIS_REID_AUTO_MERGE_ALLOW_BOTH_ACTIVE", "1")
+        auto_merge_allow_both_active = str(auto_merge_allow_both_active_env).strip().lower() in ("1", "true", "yes", "on")
+        try:
+            auto_merge_both_active_min_sim = float(
+                os.environ.get("NOESIS_REID_AUTO_MERGE_BOTH_ACTIVE_MIN_SIM", "0.97") or 0.97
+            )
+        except Exception:
+            auto_merge_both_active_min_sim = 0.97
         alias_file = os.environ.get("NOESIS_REID_ALIAS_FILE", "~/.noesis/reid_aliases.json")
         alias_append_env = os.environ.get("NOESIS_REID_ALIAS_APPEND_DEFAULT", "1")
         alias_append_default = str(alias_append_env).strip().lower() in ("1", "true", "yes", "on")
         try:
-            copresence_window_s = float(os.environ.get("NOESIS_REID_COPRESENCE_WINDOW_S", "600") or 600.0)
+            copresence_window_s = float(os.environ.get("NOESIS_REID_COPRESENCE_WINDOW_S", "60") or 60.0)
         except Exception:
-            copresence_window_s = 600.0
+            copresence_window_s = 60.0
         try:
             suggest_min_sim = float(os.environ.get("NOESIS_REID_SUGGEST_MIN_SIM", "0.92") or 0.92)
         except Exception:
@@ -1164,6 +1212,10 @@ def _build_stable_id_manager(logger: logging.Logger, *, pipeline_config: Optiona
         except Exception:
             gpu_min_gallery = 32
         extra_kwargs = {
+            "max_total_ids": max_total_ids,
+            "total_id_reuse": total_id_reuse,
+            "total_id_reuse_min_age_s": total_id_reuse_min_age_s,
+            "reset_sid_pool_on_start": reset_sid_pool,
             "aliases_enabled": aliases_enabled,
             "alias_file": alias_file,
             "alias_append_default": alias_append_default,
@@ -1174,6 +1226,15 @@ def _build_stable_id_manager(logger: logging.Logger, *, pipeline_config: Optiona
             "suggest_pose_sim_high": suggest_pose_sim_high,
             "min_embeddings_for_suggest": min_embeddings_for_suggest,
             "alias_history_max": alias_history_max,
+            "auto_merge_enabled": auto_merge_enabled,
+            "auto_merge_interval_s": auto_merge_interval_s,
+            "auto_merge_max_attempts": auto_merge_max_attempts,
+            "auto_merge_min_sim": auto_merge_min_sim,
+            "auto_merge_min_embeddings_for_suggest": auto_merge_min_embeddings_for_suggest,
+            "auto_merge_respect_inactive": auto_merge_respect_inactive,
+            "auto_merge_force_stuck": auto_merge_force_stuck,
+            "auto_merge_allow_both_active": auto_merge_allow_both_active,
+            "auto_merge_both_active_min_sim": auto_merge_both_active_min_sim,
             "compute_backend": compute_backend,
             "gpu_device": gpu_device,
             "gpu_min_gallery": gpu_min_gallery,
@@ -1250,10 +1311,15 @@ class _CalibrationProvider:
         self._camera_model_res = self._load_camera_model_resolutions(cameras_path)
         self._intrinsics_models = load_intrinsics(str(REPO_ROOT / "intrinsics.json"))
         self._align = load_alignment(str(REPO_ROOT / "config" / "ply_alignment.json"))
+        tracking_mode_norm = str(tracking_mode or "").strip().lower() or "baseline"
+        default_extrinsics_path = REPO_ROOT / "config" / "camera_calibration.json"
+        baseline_obj_extrinsics_path = REPO_ROOT / "config" / "camera_calibration_menon_obj.json"
         env_path = os.environ.get("NOESIS_CALIBRATION_EXTRINSICS", "")
         if not extrinsics_path and env_path.strip():
             extrinsics_path = Path(env_path.strip())
-        self._extrinsics_path = Path(extrinsics_path) if extrinsics_path else (REPO_ROOT / "config" / "camera_calibration.json")
+        if not extrinsics_path and tracking_mode_norm != "v3dt":
+            default_extrinsics_path = baseline_obj_extrinsics_path
+        self._extrinsics_path = Path(extrinsics_path) if extrinsics_path else default_extrinsics_path
         self._extrinsics = load_extrinsics(str(self._extrinsics_path))
         logging.getLogger(__name__).info("Calibration extrinsics path=%s", self._extrinsics_path)
         try:
@@ -1275,6 +1341,8 @@ class _CalibrationProvider:
             self._frame_size = (0, 0)
         self._camera_labels: Dict[int, str] = {}
         self._bundle_cache: Optional[Dict[str, object]] = None
+        pose_only_env = str(os.environ.get("NOESIS_CALIBRATION_POSE_ONLY", "1") or "").strip().lower()
+        self._pose_only = pose_only_env in ("1", "true", "yes", "on", "y")
 
     @staticmethod
     def _resolution_from_entry(entry: Any) -> Optional[Tuple[int, int]]:
@@ -1333,8 +1401,61 @@ class _CalibrationProvider:
         self._camera_labels = dict(labels or {})
         self._bundle_cache = None
 
+    def pose_only_enabled(self) -> bool:
+        return bool(self._pose_only)
+
+    def extrinsics_path(self) -> Path:
+        return Path(self._extrinsics_path)
+
+    def validate_pose_coverage(self) -> Dict[str, str]:
+        errors: Dict[str, str] = {}
+        camera_ids = sorted({name for name in self._camera_labels.values() if isinstance(name, str) and str(name).strip()})
+        if not camera_ids:
+            return errors
+        cams = self._extrinsics.get("cameras", {}) if isinstance(self._extrinsics, dict) else {}
+        align = self._align if isinstance(self._align, dict) else {}
+        try:
+            floor_y = float(align.get("floor_y", 0.0) or 0.0)
+        except Exception:
+            floor_y = 0.0
+        for camera_id in camera_ids:
+            entry = cams.get(camera_id)
+            if not isinstance(entry, dict):
+                errors[camera_id] = "missing_camera_entry"
+                continue
+            pose = entry.get("pose")
+            if not isinstance(pose, dict):
+                errors[camera_id] = "missing_or_invalid_pose"
+                continue
+            E = entry.get("E")
+            if not (isinstance(E, list) and len(E) == 16):
+                errors[camera_id] = "pose_to_extrinsics_failed"
+                continue
+            try:
+                Emat = np.array(E, dtype=np.float64).reshape((4, 4), order="F")
+                Twc = np.linalg.inv(Emat)
+                C_world = Twc[:3, 3].copy()
+                if not np.all(np.isfinite(C_world)):
+                    errors[camera_id] = "non_finite_camera_center"
+                    continue
+                if float(C_world[1]) <= float(floor_y) + 1e-3:
+                    errors[camera_id] = "camera_not_above_floor"
+                    continue
+                R_wc = Twc[:3, :3].copy()
+                forward = R_wc @ np.array([0.0, 0.0, 1.0], dtype=np.float64)
+                denom = float(forward[1])
+                if abs(denom) < 1e-6:
+                    errors[camera_id] = "camera_forward_parallel_to_floor"
+                    continue
+                t_hit = (float(floor_y) - float(C_world[1])) / denom
+                if t_hit <= 0.0:
+                    errors[camera_id] = "camera_forward_misses_floor"
+            except Exception:
+                errors[camera_id] = "invalid_pose_geometry"
+        return errors
+
     def reload_extrinsics(self) -> None:
-        """Reload extrinsics from camera_calibration.json without touching alignment."""
+        """Reload extrinsics from the configured calibration path without touching alignment."""
         self._extrinsics = load_extrinsics(str(self._extrinsics_path))
         self._bundle_cache = None
 
@@ -1364,10 +1485,9 @@ class _CalibrationProvider:
             return None
         align_dict = self._align if isinstance(self._align, dict) else {}
         floor_y = float(align_dict.get("floor_y", 0.0) or 0.0)
-        try:
-            unit_scale = float((align_dict.get("units") or {}).get("s_obj_to_m", 1.0))
-        except Exception:
-            unit_scale = 1.0
+        # Baseline/non-V3DT world path is scene-units native by contract.
+        # Do not inject meter-conversion scale into runtime snapshots.
+        unit_scale = 1.0
         frame_w, frame_h = self._frame_size
         if frame_w <= 0 or frame_h <= 0:
             frame_w, frame_h = 1920, 1080
@@ -1487,6 +1607,39 @@ def _build_stats_callback(
     ws_metrics_resetter: Optional[Callable[[], None]] = None,
 ) -> Callable[[], Dict[str, object]]:
     start_time = time.time()
+    stats_logger = logging.getLogger(__name__)
+    sid_metrics_fetch_warned = False
+
+    def _default_stableid_metrics() -> Dict[str, Any]:
+        return {
+            "status": "unavailable",
+            "stableid_backend_mode": None,
+            "stableid_gpu_match_p50_ms": None,
+            "stableid_gpu_match_p95_ms": None,
+            "stableid_gallery_size": 0,
+            "canonical_gallery_size": 0,
+            "active_unique": 0,
+            "ghost_unique": 0,
+            "pending_new_count": 0,
+            "auto_merge_last_candidate_count": 0,
+            "auto_merge_last_blocked_count": 0,
+            "auto_merge_zero_apply_streak": 0,
+            "auto_merge_last_reason": None,
+            "auto_merge_last_pressure_recycled": 0,
+            "sid_new_alloc_count": 0,
+            "sid_remap_count": 0,
+            "sid_guard_reject_count": 0,
+            "sid_no_embedding_count": 0,
+            "sid_fragmentation_events": 0,
+            "sid_pending_recycled_count": 0,
+            "sid_same_frame_conflict_count": 0,
+            "alias_candidate_pool_size": 0,
+            "alias_candidate_sim_p50": None,
+            "alias_candidate_sim_p95": None,
+            "alias_support_ids_ge_1": 0,
+            "alias_support_ids_ge_2": 0,
+            "alias_support_ids_ge_3": 0,
+        }
 
     def _mosaic_layout() -> Optional[Dict[str, object]]:
         tiler = pipeline.components.get("tiler")
@@ -1547,21 +1700,35 @@ def _build_stats_callback(
             return str(name)
 
     def _stats() -> Dict[str, object]:
+        nonlocal sid_metrics_fetch_warned
         now = time.time()
         try:
             depth_fps = pipeline.depth_fps()
         except Exception:
             depth_fps = 0.0
         reload_count = getattr(pipeline, "analytics_reload_count", 0)
-        stableid_metrics: Dict[str, Any] = {}
+        stableid_metrics: Dict[str, Any] = _default_stableid_metrics()
         try:
             sid_mgr = getattr(pipeline, "stable_id_mgr", None)
             if sid_mgr is not None:
                 get_metrics = getattr(sid_mgr, "get_sid_metrics", None)
                 if callable(get_metrics):
-                    stableid_metrics = dict(get_metrics() or {})
+                    fetched = dict(get_metrics() or {})
+                    if fetched:
+                        stableid_metrics.update(fetched)
+                        stableid_metrics["status"] = "ok"
+                    else:
+                        stableid_metrics["status"] = "empty"
+                else:
+                    stableid_metrics["status"] = "getter_missing"
+            else:
+                stableid_metrics["status"] = "manager_missing"
         except Exception:
-            stableid_metrics = {}
+            stableid_metrics["status"] = "fetch_error"
+            stableid_metrics["fetch_error"] = "exception"
+            if not sid_metrics_fetch_warned:
+                stats_logger.warning("StableID metrics fetch failed in stats callback", exc_info=True)
+                sid_metrics_fetch_warned = True
         cameras_stats: Dict[str, object] = {}
         core_instr = hooks.get_core_path_instrumentation_snapshot()
         core_counters = dict(core_instr.get("counters", {}))
@@ -2867,7 +3034,7 @@ def main() -> int:
             results = res.get("results") if isinstance(res, dict) else []
             updated: list[str] = []
             persist_failed = False
-            calib_path = str(REPO_ROOT / "config" / "camera_calibration.json")
+            calib_path = str(calibration_provider.extrinsics_path())
 
             for entry in results or []:
                 if not isinstance(entry, dict):
@@ -3246,6 +3413,16 @@ def main() -> int:
 
     calibration_provider = _CalibrationProvider(cameras_path, pipeline.config, tracking_mode=tracking_mode)
     calibration_provider.set_camera_labels(camera_labels)
+    setattr(pipeline, "bev_calibration", calibration_provider)
+    if calibration_provider.pose_only_enabled():
+        pose_errors = calibration_provider.validate_pose_coverage()
+        if pose_errors:
+            logger.error("NOESIS_CALIBRATION_POSE_ONLY=1 startup validation failed; missing/invalid pose for cameras:")
+            for camera_id, reason in sorted(pose_errors.items()):
+                logger.error("  camera=%s reason=%s", camera_id, reason)
+            logger.error("Aborting startup due to strict pose-only calibration mode.")
+            return 1
+        logger.warning("Strict pose-only calibration mode enabled (NOESIS_CALIBRATION_POSE_ONLY=1).")
     try:
         storage_manager.calibration_bundle = calibration_provider.calibration_bundle()
     except Exception:
@@ -3298,7 +3475,7 @@ def main() -> int:
     if bev_frame_env:
         bev_frame = bev_frame_env
     if not bev_frame:
-        bev_frame = "camera_local"
+        bev_frame = "menon_scene"
     bev_env = os.environ.get("NOESIS_BEV_JPEG_ENABLED")
     if bev_env is not None:
         env_text = str(bev_env).strip().lower()
@@ -3315,6 +3492,11 @@ def main() -> int:
         stats_callback=None,
         initial_trail_state=bool(trail_settings.enabled),
     )
+    def _ws_trail_settings_getter() -> Dict[str, Any]:
+        cfg = dict(trails_cfg or {})
+        cfg["enabled"] = bool(ws_server.initial_trail_state)
+        return cfg
+    ws_server.trail_settings_getter = _ws_trail_settings_getter
     ws_server.stats_callback = _build_stats_callback(
         pipeline,
         camera_labels,
@@ -3388,39 +3570,60 @@ def main() -> int:
                 return int(sid)
         return None
 
-    def _maybe_coerce_extrinsics_translation_to_meters(E_col_major: list[float]) -> tuple[list[float], Optional[str]]:
-        mode = str(os.environ.get("NOESIS_EXTRINSICS_INPUT_UNITS", "auto") or "").strip().lower()
-        if mode in ("m", "meter", "meters"):
-            return E_col_major, None
-        if mode in ("cm", "centimeter", "centimeters"):
-            note = "cm→m (NOESIS_EXTRINSICS_INPUT_UNITS=cm)"
-            try:
-                Emat = np.array(E_col_major, dtype=np.float64).reshape((4, 4), order="F")
-                Emat[:3, 3] *= 0.01
-                return list(Emat.flatten(order="F")), note
-            except Exception:
-                return E_col_major, note
-
-        # auto: camera height in home scenes should not be tens/hundreds of meters.
+    def _normalize_pose_payload(raw_pose: Any) -> Optional[Dict[str, Any]]:
+        if not isinstance(raw_pose, dict):
+            return None
+        position = raw_pose.get("position")
+        ypr = raw_pose.get("yaw_pitch_roll_deg")
+        rotation_order = str(raw_pose.get("rotation_order") or "").strip().upper()
+        frame = str(raw_pose.get("frame") or "").strip()
+        if not (isinstance(position, list) and len(position) == 3):
+            return None
+        if not (isinstance(ypr, list) and len(ypr) == 3):
+            return None
         try:
-            Emat = np.array(E_col_major, dtype=np.float64).reshape((4, 4), order="F")
-            Twc = np.linalg.inv(Emat)
-            C_y = float(Twc[1, 3])
-            if abs(C_y) > 20.0 and abs(C_y / 100.0) < 20.0:
-                Emat[:3, 3] *= 0.01
-                return list(Emat.flatten(order="F")), f"cm→m (auto; |C_y|={abs(C_y):.3f} too large for meters)"
+            position_f = [float(position[0]), float(position[1]), float(position[2])]
+            ypr_f = [float(ypr[0]), float(ypr[1]), float(ypr[2])]
         except Exception:
-            pass
-        return E_col_major, None
+            return None
+        if not all(np.isfinite(v) for v in (position_f + ypr_f)):
+            return None
+        if rotation_order != "YXZ":
+            return None
+        if frame != "menon_scene":
+            return None
+        normalized: Dict[str, Any] = {
+            "position": position_f,
+            "yaw_pitch_roll_deg": ypr_f,
+            "rotation_order": "YXZ",
+            "frame": "menon_scene",
+        }
+        source = raw_pose.get("source")
+        if isinstance(source, str) and source.strip():
+            normalized["source"] = source.strip()
+        return normalized
 
     def _set_extrinsics_handler(req: Dict[str, Any]) -> Dict[str, Any]:
         cam_id = _resolve_ws_camera_id(req.get("cameraId") or req.get("camera") or req.get("camId") or req.get("id"))
         if not cam_id:
             return {"ok": False, "error": "cameraId_required"}
 
+        strict_pose_only = bool(calibration_provider.pose_only_enabled())
+        raw_pose = req.get("pose")
+        pose = _normalize_pose_payload(raw_pose)
+        if strict_pose_only and raw_pose is not None and pose is None:
+            return {"ok": False, "error": "pose_invalid"}
+        if strict_pose_only and pose is None:
+            return {"ok": False, "error": "pose_required"}
+
         E: Optional[list[float]] = None
         try:
-            if isinstance(req.get("E"), list) and len(req["E"]) == 16:
+            if pose is not None:
+                E_pose = pose_to_E_col_major(pose)
+                if not (isinstance(E_pose, list) and len(E_pose) == 16):
+                    return {"ok": False, "error": "pose_to_extrinsics_failed"}
+                E = [float(x) for x in E_pose]
+            elif isinstance(req.get("E"), list) and len(req["E"]) == 16:
                 E = [float(x) for x in req["E"]]
             elif isinstance(req.get("Twc"), list) and len(req["Twc"]) == 16:
                 Twc = np.array(req["Twc"], dtype=np.float64).reshape((4, 4), order="F")
@@ -3434,7 +3637,16 @@ def main() -> int:
         try:
             sid = _camera_to_source_id(cam_id)
             sid_text = "?" if sid is None else str(sid)
-            logger.warning("WS RX set_extrinsics camera=%s sid=%s E_col_major=%s", cam_id, sid_text, E)
+            logger.warning(
+                "WS RX set_extrinsics camera=%s sid=%s strict_pose_only=%s pose_present=%s legacy_E_present=%s legacy_Twc_present=%s E_col_major=%s",
+                cam_id,
+                sid_text,
+                strict_pose_only,
+                bool(pose),
+                isinstance(req.get("E"), list),
+                isinstance(req.get("Twc"), list),
+                E,
+            )
             try:
                 with np.printoptions(precision=6, suppress=True, linewidth=200):
                     Emat = np.array(E, dtype=np.float64).reshape((4, 4), order="F")
@@ -3444,17 +3656,6 @@ def main() -> int:
         except Exception:
             pass
 
-        E, units_note = _maybe_coerce_extrinsics_translation_to_meters(E)
-        if units_note:
-            logger.warning("set_extrinsics: coerced translation units for %s: %s", cam_id, units_note)
-            try:
-                logger.warning("WS RX set_extrinsics camera=%s E_col_major_coerced=%s", cam_id, E)
-                with np.printoptions(precision=6, suppress=True, linewidth=200):
-                    Emat = np.array(E, dtype=np.float64).reshape((4, 4), order="F")
-                    logger.warning("WS RX set_extrinsics camera=%s E_matrix_coerced=%s", cam_id, str(Emat))
-            except Exception:
-                pass
-
         try:
             E_matrix = np.array(E, dtype=np.float64).reshape((4, 4), order="F")
             if np.allclose(E_matrix, np.eye(4), atol=1e-3):
@@ -3462,8 +3663,8 @@ def main() -> int:
         except Exception:
             return {"ok": False, "error": "bad_extrinsics"}
 
-        calib_path = str(REPO_ROOT / "config" / "camera_calibration.json")
-        if not save_extrinsics(calib_path, cam_id, E):
+        calib_path = str(calibration_provider.extrinsics_path())
+        if not save_extrinsics(calib_path, cam_id, E, pose=pose):
             return {"ok": False, "error": "persist_failed"}
 
         logger.warning("WS set_extrinsics persisted camera=%s path=%s", cam_id, calib_path)
@@ -3608,6 +3809,36 @@ def main() -> int:
     ws_server.set_align_handler = _set_align_handler
     ws_server.pixel_to_world_handler = _pixel_to_world_handler
 
+    def _tracking_contract_metadata(source_id: int, _tracks: list[Mapping[str, Any]]) -> Dict[str, Any]:
+        camera_id = str(camera_labels.get(int(source_id), f"camera_{int(source_id)}"))
+        calibration_version = "unknown"
+        coord_space = "scene_obj"
+        units = "obj_units"
+        try:
+            bundle = calibration_provider.calibration_bundle()
+            meta = bundle.get("meta") if isinstance(bundle, dict) else None
+            if isinstance(meta, Mapping):
+                raw_version = meta.get("calibration_version")
+                if isinstance(raw_version, str) and raw_version.strip():
+                    calibration_version = raw_version.strip()
+                raw_coord = meta.get("coord_space")
+                if isinstance(raw_coord, str) and raw_coord.strip():
+                    coord_space = raw_coord.strip()
+                raw_units = meta.get("units")
+                if isinstance(raw_units, str) and raw_units.strip():
+                    units = raw_units.strip()
+        except Exception:
+            pass
+        return {
+            "camera_id": camera_id,
+            "coord_space": coord_space,
+            "units": units,
+            "world_source": "backend_world",
+            "track_id_strategy": "camera_tracker_fallback",
+            "calibration_version": calibration_version,
+            "tracking_contract_version": 2,
+        }
+
     setattr(pipeline, "ws_server", ws_server)
     bev_renderer = BevRenderer(
         ws_server,
@@ -3620,7 +3851,7 @@ def main() -> int:
     ws_server.bev_config_callback = lambda cam_id, cfg: bev_renderer.update_config(cam_id, cfg)
     ws_server.bev_overlay_callback = lambda cam_id, enabled: bev_renderer.update_config(cam_id, {"overlay": enabled})
     depth_pub = DepthTelemetryPublisher(ws_server)
-    tracking_pub = TrackingTelemetryPublisher(ws_server)
+    tracking_pub = TrackingTelemetryPublisher(ws_server, metadata_getter=_tracking_contract_metadata)
     diagnostics_logger = TrackingDiagnosticsLogger.from_env()
     if diagnostics_logger:
         logger.info("V3DT diagnostics logging enabled: %s", diagnostics_logger.output_path)

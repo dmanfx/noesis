@@ -161,6 +161,68 @@ def _validate_align_matrix(matrix: List[float]) -> None:
         raise CalibrationValidationError(f"align.matrix is singular (det={det:.2e})")
 
 
+def _normalize_pose_v1(raw_pose: Any) -> Optional[Dict[str, Any]]:
+    if not isinstance(raw_pose, dict):
+        return None
+    position = raw_pose.get("position")
+    ypr = raw_pose.get("yaw_pitch_roll_deg")
+    rotation_order = str(raw_pose.get("rotation_order") or "").strip().upper()
+    frame = str(raw_pose.get("frame") or "").strip()
+    if not (isinstance(position, list) and len(position) == 3):
+        return None
+    if not (isinstance(ypr, list) and len(ypr) == 3):
+        return None
+    try:
+        position_f = [float(position[0]), float(position[1]), float(position[2])]
+        ypr_f = [float(ypr[0]), float(ypr[1]), float(ypr[2])]
+    except Exception:
+        return None
+    if not all(math.isfinite(v) for v in (position_f + ypr_f)):
+        return None
+    if rotation_order != "YXZ":
+        return None
+    if frame != "menon_scene":
+        return None
+    out: Dict[str, Any] = {
+        "position": position_f,
+        "yaw_pitch_roll_deg": ypr_f,
+        "rotation_order": "YXZ",
+        "frame": "menon_scene",
+    }
+    source = raw_pose.get("source")
+    if isinstance(source, str) and source.strip():
+        out["source"] = source.strip()
+    return out
+
+
+def _pose_to_E_col_major(pose: Dict[str, Any]) -> Optional[List[float]]:
+    norm = _normalize_pose_v1(pose)
+    if not norm:
+        return None
+    try:
+        yaw_deg, pitch_deg, roll_deg = norm["yaw_pitch_roll_deg"]
+        yaw = math.radians(float(yaw_deg))
+        pitch = math.radians(float(pitch_deg))
+        roll = math.radians(float(roll_deg))
+
+        cy, sy = math.cos(yaw), math.sin(yaw)
+        cx, sx = math.cos(pitch), math.sin(pitch)
+        cz, sz = math.cos(roll), math.sin(roll)
+
+        Ry = np.array([[cy, 0.0, sy], [0.0, 1.0, 0.0], [-sy, 0.0, cy]], dtype=np.float64)
+        Rx = np.array([[1.0, 0.0, 0.0], [0.0, cx, -sx], [0.0, sx, cx]], dtype=np.float64)
+        Rz = np.array([[cz, -sz, 0.0], [sz, cz, 0.0], [0.0, 0.0, 1.0]], dtype=np.float64)
+        R_wc = Ry @ Rx @ Rz
+
+        Twc = np.eye(4, dtype=np.float64)
+        Twc[:3, :3] = R_wc
+        Twc[:3, 3] = np.array(norm["position"], dtype=np.float64)
+        E = np.linalg.inv(Twc)
+        return [float(x) for x in E.flatten(order="F")]
+    except Exception:
+        return None
+
+
 # ---------------------------------------------------------------------------
 # CalibrationManager
 # ---------------------------------------------------------------------------
@@ -316,6 +378,13 @@ class CalibrationManager:
 
             k_table: Dict[str, List[float]] = {}
             e_table: Dict[str, List[float]] = {}
+            pose_table: Dict[str, Dict[str, Any]] = {}
+
+            units = self._align.get("units") or {}
+            s_obj_to_m = float(units.get("s_obj_to_m", 1.0) or 1.0)
+            scene_per_m = 1.0
+            if math.isfinite(s_obj_to_m) and s_obj_to_m > 1e-6:
+                scene_per_m = 1.0 / s_obj_to_m
 
             for src_id, cam_name in self._camera_labels.items():
                 # Intrinsics
@@ -328,7 +397,18 @@ class CalibrationManager:
                 # Extrinsics
                 E = self._get_E(cam_name)
                 if E is not None:
-                    e_table[cam_name] = list(E)
+                    # WS bundle exposes native scene units for client-side rigid transforms.
+                    if abs(scene_per_m - 1.0) > 1e-9 and len(E) == 16:
+                        scaled = list(E)
+                        scaled[12] = float(scaled[12]) * scene_per_m
+                        scaled[13] = float(scaled[13]) * scene_per_m
+                        scaled[14] = float(scaled[14]) * scene_per_m
+                        e_table[cam_name] = scaled
+                    else:
+                        e_table[cam_name] = list(E)
+                pose = self._get_pose(cam_name)
+                if isinstance(pose, dict):
+                    pose_table[cam_name] = dict(pose)
 
             # Alignment
             align_matrix = self._align.get("matrix")
@@ -336,8 +416,6 @@ class CalibrationManager:
                 align_matrix = [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1]
 
             floor_y = float(self._align.get("floor_y", 0.0) or 0.0)
-            units = self._align.get("units") or {}
-            s_obj_to_m = float(units.get("s_obj_to_m", 1.0) or 1.0)
 
             bundle: Dict[str, Any] = {
                 "align": {
@@ -348,11 +426,13 @@ class CalibrationManager:
                 "cameras": {
                     "K": k_table,
                     "E": e_table,
+                    "pose": pose_table,
                     "pose_confidence": {},
                 },
                 "meta": {
                     "version": 2,
                     "conventions": {"E": "world→camera", "handedness": "RH", "up": "Y"},
+                    "units": {"coords": "scene", "scene_per_m": float(scene_per_m)},
                 },
                 "metric_scale": 1.0,
             }
@@ -590,14 +670,29 @@ class CalibrationManager:
         for cam_id, entry in cams.items():
             if not isinstance(entry, dict):
                 continue
-            E = entry.get("E")
-            if isinstance(E, list) and len(E) == 16:
-                # Log validation warnings but don't reject at load time
-                try:
-                    _validate_E(E, cam_id)
-                except CalibrationValidationError as exc:
-                    _LOGGER.warning("Invalid extrinsics at load time: %s", exc)
-                parsed[cam_id] = {"E": [float(x) for x in E]}
+            out_entry: Dict[str, Any] = {}
+            pose = _normalize_pose_v1(entry.get("pose"))
+            if pose is not None:
+                out_entry["pose"] = pose
+                E_from_pose = _pose_to_E_col_major(pose)
+                if isinstance(E_from_pose, list) and len(E_from_pose) == 16:
+                    try:
+                        _validate_E(E_from_pose, cam_id)
+                        out_entry["E"] = [float(x) for x in E_from_pose]
+                    except CalibrationValidationError as exc:
+                        _LOGGER.warning("Invalid pose-derived extrinsics at load time: %s", exc)
+
+            if "E" not in out_entry:
+                E = entry.get("E")
+                if isinstance(E, list) and len(E) == 16:
+                    try:
+                        _validate_E(E, cam_id)
+                    except CalibrationValidationError as exc:
+                        _LOGGER.warning("Invalid extrinsics at load time: %s", exc)
+                    out_entry["E"] = [float(x) for x in E]
+
+            if out_entry:
+                parsed[cam_id] = out_entry
 
         self._extrinsics = {"cameras": parsed}
 
@@ -649,6 +744,16 @@ class CalibrationManager:
         E = entry.get("E")
         if isinstance(E, list) and len(E) == 16:
             return E
+        return None
+
+    def _get_pose(self, camera_id: str) -> Optional[Dict[str, Any]]:
+        cams = self._extrinsics.get("cameras") or {}
+        entry = cams.get(camera_id)
+        if not isinstance(entry, dict):
+            return None
+        pose = entry.get("pose")
+        if isinstance(pose, dict):
+            return dict(pose)
         return None
 
     def _build_scaled_K(self, intr: CameraIntrinsics, camera_id: str) -> Optional[np.ndarray]:

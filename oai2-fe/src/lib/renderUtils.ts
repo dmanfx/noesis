@@ -26,6 +26,12 @@ export function grayscaleColor(t: number): [number, number, number] {
   return [v, v, v];
 }
 
+// Linear grayscale: 0 -> black, 1 -> white. Useful for binary layers like walkable masks.
+export function bwColor(t: number): [number, number, number] {
+  const v = Math.round(255 * Math.min(1, Math.max(0, t)));
+  return [v, v, v];
+}
+
 export function infernoColor(t: number): [number, number, number] {
   const stops: Array<[number, [number, number, number]]> = [
     [0, [0, 0, 4]],
@@ -142,11 +148,165 @@ type RenderLayerOptions = {
   fit?: 'stretch' | 'contain';
   background?: string;
   contentPaddingPx?: number;
+  // Optional overrides for value normalization. Useful for "contrast" views that clamp
+  // to a meaningful physical range (e.g., 0..1.2m for floor vs countertop).
+  valueMin?: number;
+  valueMax?: number;
+  // Apply gamma to the normalized value after clamping to [0,1]. gamma < 1 boosts low values.
+  gamma?: number;
+  // Optional mask layer: if provided, pixels where mask <= threshold render as black.
+  // Intended for hiding unobserved cells (e.g., density == 0).
+  maskLayer?: FloorplanLayer;
+  maskThreshold?: number;
+  maskInvert?: boolean;
 };
 
 type RenderLayerResult = {
   contentRectPx: { x: number; y: number; w: number; h: number };
 };
+
+export function renderCompositeWalkableObstacleToCanvas(
+  canvas: HTMLCanvasElement | null,
+  walkable: FloorplanLayer | undefined,
+  obstacleHeight: FloorplanLayer | undefined,
+  options?: number | RenderLayerOptions
+): RenderLayerResult | null {
+  if (!canvas) return null;
+  const ctx = canvas.getContext('2d');
+  if (!ctx) return null;
+
+  const clear = () => {
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+  };
+
+  const hasWalkable = !!(walkable && walkable.grid_b64 && walkable.grid_shape);
+  const hasObstacle = !!(obstacleHeight && obstacleHeight.grid_b64 && obstacleHeight.grid_shape);
+  if (!hasWalkable || !hasObstacle) {
+    clear();
+    return null;
+  }
+
+  const [rowsW, colsW] = walkable!.grid_shape!;
+  const [rowsO, colsO] = obstacleHeight!.grid_shape!;
+  if (!rowsW || !colsW || rowsW !== rowsO || colsW !== colsO) {
+    clear();
+    return null;
+  }
+
+  const walkValues = decodeFloat32(walkable!.grid_b64!);
+  const obsValues = decodeFloat32(obstacleHeight!.grid_b64!);
+  if (!walkValues || !obsValues || walkValues.length < rowsW * colsW || obsValues.length < rowsW * colsW) {
+    clear();
+    return null;
+  }
+
+  const offscreen = document.createElement('canvas');
+  offscreen.width = colsW;
+  offscreen.height = rowsW;
+  const offCtx = offscreen.getContext('2d');
+  if (!offCtx) return null;
+
+  const imageData = offCtx.createImageData(colsW, rowsW);
+  const data = imageData.data;
+
+  const obsMin = obstacleHeight!.value_min ?? 0;
+  const obsMax = obstacleHeight!.value_max ?? 1;
+  const obsDenom = obsMax - obsMin === 0 ? 1 : (obsMax - obsMin);
+  const obstacleEps = 0.05;
+  const floorColor: [number, number, number] = [230, 228, 222];
+  const outsideColor: [number, number, number] = [0, 0, 0];
+
+  for (let idx = 0; idx < (rowsW * colsW); idx += 1) {
+    const w = walkValues[idx];
+    const oh = obsValues[idx];
+    let r = outsideColor[0];
+    let g = outsideColor[1];
+    let b = outsideColor[2];
+
+    if (Number.isFinite(oh) && oh > obstacleEps) {
+      const t = Math.min(1, Math.max(0, (oh - obsMin) / obsDenom));
+      const [rr, gg, bb] = infernoColor(t);
+      r = rr; g = gg; b = bb;
+    } else if (Number.isFinite(w) && w > 0.5) {
+      r = floorColor[0];
+      g = floorColor[1];
+      b = floorColor[2];
+    }
+
+    const offset = idx * 4;
+    data[offset] = r;
+    data[offset + 1] = g;
+    data[offset + 2] = b;
+    data[offset + 3] = 255;
+  }
+  offCtx.putImageData(imageData, 0, 0);
+
+  const fit = typeof options === 'number' ? 'stretch' : (options?.fit ?? 'stretch');
+  const forceAspect = typeof options === 'number' ? options : options?.forceAspect;
+  const background = (typeof options === 'object' && options?.background) ? options.background : '#000';
+  const paddingCss = (typeof options === 'object' && options?.contentPaddingPx)
+    ? Math.max(0, Number(options.contentPaddingPx) || 0)
+    : 0;
+  const dpr = window.devicePixelRatio || 1;
+
+  let { width, height } = applyCanvasSize(canvas);
+  if (fit === 'stretch') {
+    const aspect = forceAspect || (colsW / rowsW);
+    height = width / aspect;
+  }
+  canvas.width = Math.max(1, Math.round(width * dpr));
+  canvas.height = Math.max(1, Math.round(height * dpr));
+
+  const contentAspect = forceAspect || (colsW / rowsW);
+  let contentW = width;
+  let contentH = height;
+  let contentX = 0;
+  let contentY = 0;
+
+  if (fit === 'contain') {
+    const canvasAspect = width / height;
+    if (canvasAspect > contentAspect) {
+      contentH = height;
+      contentW = height * contentAspect;
+      contentX = (width - contentW) * 0.5;
+    } else {
+      contentW = width;
+      contentH = width / contentAspect;
+      contentY = (height - contentH) * 0.5;
+    }
+  }
+
+  if (paddingCss > 0) {
+    const shrink = paddingCss * 2;
+    if (contentW > shrink && contentH > shrink) {
+      contentX += paddingCss;
+      contentY += paddingCss;
+      contentW -= shrink;
+      contentH -= shrink;
+    }
+  }
+
+  ctx.save();
+  ctx.scale(dpr, dpr);
+  ctx.clearRect(0, 0, width, height);
+  if (fit === 'contain' && background) {
+    ctx.fillStyle = background;
+    ctx.fillRect(0, 0, width, height);
+  }
+  ctx.imageSmoothingEnabled = false;
+  ctx.drawImage(offscreen, contentX, contentY, contentW, contentH);
+  ctx.restore();
+
+  return {
+    contentRectPx: {
+      x: contentX * dpr,
+      y: contentY * dpr,
+      w: contentW * dpr,
+      h: contentH * dpr
+    }
+  };
+}
 
 export function renderLayerToCanvas(
   canvas: HTMLCanvasElement | null,
@@ -186,14 +346,63 @@ export function renderLayerToCanvas(
 
   const imageData = offCtx.createImageData(cols, rows);
   const data = imageData.data;
-  const min = layer.value_min ?? 0;
-  const max = layer.value_max ?? 1;
+  const optObj = (typeof options === 'object') ? options : undefined;
+  const min = (optObj && typeof optObj.valueMin === 'number') ? optObj.valueMin : (layer.value_min ?? 0);
+  const max = (optObj && typeof optObj.valueMax === 'number') ? optObj.valueMax : (layer.value_max ?? 1);
   const denom = max - min === 0 ? 1 : max - min;
+  const gamma = (optObj && typeof optObj.gamma === 'number' && Number.isFinite(optObj.gamma) && optObj.gamma > 0)
+    ? optObj.gamma
+    : 1.0;
 
-  for (let idx = 0; idx < values.length; idx += 1) {
-    const norm = Math.min(1, Math.max(0, (values[idx] - min) / denom));
-    const [r, g, b] = palette(norm);
+  let maskValues: Float32Array | null = null;
+  let maskThreshold = 1e-6;
+  let maskInvert = false;
+  const maskLayer = optObj?.maskLayer;
+  if (maskLayer && maskLayer.grid_b64 && maskLayer.grid_shape) {
+    const [maskRows, maskCols] = maskLayer.grid_shape;
+    if (maskRows === rows && maskCols === cols) {
+      const decoded = decodeFloat32(maskLayer.grid_b64);
+      if (decoded && decoded.length >= rows * cols) {
+        maskValues = decoded;
+        if (typeof optObj?.maskThreshold === 'number' && Number.isFinite(optObj.maskThreshold)) {
+          maskThreshold = optObj.maskThreshold;
+        }
+        maskInvert = !!optObj?.maskInvert;
+      }
+    }
+  }
+
+  const n = rows * cols;
+  for (let idx = 0; idx < n; idx += 1) {
+    const v = values[idx];
     const offset = idx * 4;
+    if (!Number.isFinite(v)) {
+      data[offset] = 0;
+      data[offset + 1] = 0;
+      data[offset + 2] = 0;
+      data[offset + 3] = 255;
+      continue;
+    }
+
+    if (maskValues) {
+      const mv = maskValues[idx];
+      const ok = Number.isFinite(mv) && (mv > maskThreshold);
+      const pass = maskInvert ? !ok : ok;
+      if (!pass) {
+        data[offset] = 0;
+        data[offset + 1] = 0;
+        data[offset + 2] = 0;
+        data[offset + 3] = 255;
+        continue;
+      }
+    }
+
+    let norm = (v - min) / denom;
+    norm = Math.min(1, Math.max(0, norm));
+    if (gamma !== 1.0) {
+      norm = Math.pow(norm, gamma);
+    }
+    const [r, g, b] = palette(norm);
     data[offset] = r;
     data[offset + 1] = g;
     data[offset + 2] = b;

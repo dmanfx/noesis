@@ -2,12 +2,12 @@
 """Smoke test for DS8 calibration RPC wiring over WebSocket.
 
 Validates that DS8 runtime wires handlers for:
-- set_extrinsics (should not return error=no_handler)
+- set_extrinsics in strict pose-only mode (legacy E/Twc-only payloads rejected)
 - set_align (should not return error=no_handler)
 - pixel_to_world (should not return error=no_handler)
 
-This script intentionally avoids persisting extrinsics by sending an invalid
-set_extrinsics request (cameraId present, but no E/Twc payload).
+This script intentionally avoids persisting extrinsics by sending legacy
+set_extrinsics payloads without a valid pose while strict mode is enabled.
 """
 
 from __future__ import annotations
@@ -50,6 +50,7 @@ def _spawn_runtime(args: argparse.Namespace) -> subprocess.Popen:
     env.setdefault("NOESIS_MOSAIC_RTSP_ENABLED", "0")
     env.setdefault("NOESIS_MOSAIC_WEBRTC_ENABLED", "0")
     env.setdefault("NOESIS_MAPANYTHING_POSTPROCESS_ENABLED", "0")
+    env.setdefault("NOESIS_CALIBRATION_POSE_ONLY", "1")
     return subprocess.Popen(cmd, env=env)
 
 
@@ -108,21 +109,31 @@ async def _run(uri: str) -> None:
         if not align_res.get("ok"):
             raise RuntimeError(f"set_align_result ok=false error={align_res.get('error')!r}")
 
-        # 2) set_extrinsics should be wired without persisting. Send identity (expected failure).
-        if camera_id_for_identity_extrinsics:
-            identity = [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0]
-            await ws.send(json.dumps({"type": "set_extrinsics", "cameraId": camera_id_for_identity_extrinsics, "E": identity}))
-            extr_ident = await _wait_for_type(ws, "set_extrinsics_result", timeout_s=10.0)
-            if extr_ident.get("error") == "no_handler":
-                raise RuntimeError("set_extrinsics_result error=no_handler")
-            if extr_ident.get("ok"):
-                raise RuntimeError("set_extrinsics_result unexpectedly ok for identity matrix")
-
-        # 3) set_extrinsics should be wired (avoid persisting by omitting E/Twc).
-        await ws.send(json.dumps({"type": "set_extrinsics", "cameraId": "__smoke_test__"}))
-        extr_res = await _wait_for_type(ws, "set_extrinsics_result", timeout_s=10.0)
-        if extr_res.get("error") == "no_handler":
+        # 2) strict pose-only mode: reject legacy E-only set_extrinsics payloads.
+        identity = [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0]
+        strict_cam = camera_id_for_identity_extrinsics or "__smoke_test__"
+        await ws.send(json.dumps({"type": "set_extrinsics", "cameraId": strict_cam, "E": identity}))
+        extr_e_only = await _wait_for_type(ws, "set_extrinsics_result", timeout_s=10.0)
+        if extr_e_only.get("error") == "no_handler":
             raise RuntimeError("set_extrinsics_result error=no_handler")
+        if extr_e_only.get("ok"):
+            raise RuntimeError("strict pose-only mode unexpectedly accepted legacy E-only set_extrinsics")
+        if extr_e_only.get("error") != "pose_required":
+            raise RuntimeError(
+                f"strict pose-only mode should reject legacy E-only payload with pose_required; got {extr_e_only.get('error')!r}"
+            )
+
+        # 3) strict pose-only mode: reject legacy Twc-only set_extrinsics payloads.
+        await ws.send(json.dumps({"type": "set_extrinsics", "cameraId": strict_cam, "Twc": identity}))
+        extr_twc_only = await _wait_for_type(ws, "set_extrinsics_result", timeout_s=10.0)
+        if extr_twc_only.get("error") == "no_handler":
+            raise RuntimeError("set_extrinsics_result error=no_handler")
+        if extr_twc_only.get("ok"):
+            raise RuntimeError("strict pose-only mode unexpectedly accepted legacy Twc-only set_extrinsics")
+        if extr_twc_only.get("error") != "pose_required":
+            raise RuntimeError(
+                f"strict pose-only mode should reject legacy Twc-only payload with pose_required; got {extr_twc_only.get('error')!r}"
+            )
 
         # 4) pixel_to_world should be wired (likely calibration_missing for dummy cam).
         await ws.send(json.dumps({"type": "pixel_to_world", "camId": "__smoke_test__", "u": 0, "v": 0, "reqId": "smoke"}))
@@ -146,7 +157,7 @@ def main() -> int:
 
     try:
         asyncio.run(_run(str(args.ws)))
-        print("[PASS] DS8 calibration RPC handlers are wired (no_handler not observed)")
+        print("[PASS] DS8 calibration RPC strict pose-only expectations satisfied")
         return 0
     except Exception as exc:
         print(f"[FAIL] {exc}")

@@ -1,5 +1,5 @@
 # Telemetry Schema (DS8)
-_Status: validated against code on 2026-02-02._
+_Status: validated against code on 2026-02-22._
 
 Canonical WebSocket payloads live in `docs/DS8_api_contracts_ws.md`. This page summarizes **where** telemetry is produced in the DS8 stack and the exact field sets emitted today. Older telemetry descriptions are archived under `docs/history/`.
 
@@ -84,8 +84,8 @@ Emitted once per frame per source. Only **people** tracks (class_id=0) are publi
       "image_base": [<float u>, <float v>],
       "world": [<float x>, <float y>, <float z>],
       "world_valid": <bool>,
-      "world_frame": "camera_local"|"world"|null,
-      "world_source": "sv3dt"|"ray"|null
+      "world_frame": "menon_scene"|"camera_local"|null,
+      "world_source": "bbox3d"|"ray_floor"|null
     }
   ]
 }
@@ -127,14 +127,18 @@ Published per MapAnything inference result via `DepthResult.to_dict()`:
   "xMin": <float>, "xMax": <float>,
   "zMin": <float>, "zMax": <float>,
   "overlay": <bool>,
-  "footpoints": [ {"x": <float>, "y": <float>, "method": "bbox"|"sv3dt", "stableId": <int|null>} ],
+  "footpoints": [ {"x": <float>, "y": <float>, "method": "bbox"|"sv3dt", "stableId": <int|null>, "trackerId": <int|null>} ],
   "H": [<9 floats>],
-  "sampleXZ": [<float x>, <float z>] | null
+  "sampleXZ": [<float x>, <float z>] | null,
+  "world_frame": "menon_scene"|"camera_local",
+  "frame_mode": "world"|"camera_local",
+  "units": "scene",
+  "s_obj_to_m": <float>
 }
 ```
 
 - Optional JPEG binary follows the framing `[len(header)] [header="bev:<camera>"] [JPEG bytes]` when `bev.jpeg_enabled=true` or `NOESIS_BEV_JPEG_ENABLED=1`.
-- Footpoints use `stable_id` when available; tracker IDs are never exposed.
+- Footpoints use `stableId` when available; `trackerId` may be present as a debug/fallback identity key (not stable across restarts).
 
 ## Related Docs
 

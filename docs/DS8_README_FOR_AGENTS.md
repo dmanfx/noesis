@@ -35,8 +35,10 @@ Key config files:
       `mosaic_webrtc_enabled: true` (mosaic JPEG/WebSocket path removed in DS8).
       Default bitrate: 4000 kbps (H.264).
     - BEV settings (under `bev`):
-      - `frame`: BEV coordinate frame (`camera_local` default; set `world` for world-frame BEV).
-      - Env override: `NOESIS_BEV_FRAME=world` (takes precedence over config).
+      - `frame`: BEV coordinate frame.
+        - Default: `menon_scene` (world/scene units).
+        - Legacy: `camera_local` (camera-local projection).
+      - Env override: `NOESIS_BEV_FRAME=menon_scene|camera_local` (aliases like `world`/`global` map to world mode).
   - Calibration/extrinsics selection:
     - Default extrinsics: `config/camera_calibration.json`.
     - Env override: `NOESIS_CALIBRATION_EXTRINSICS=/path/to/file.json`.

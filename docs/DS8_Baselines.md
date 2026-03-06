@@ -6,7 +6,9 @@ you don’t have to sift through the historical work orders.
 ## Identity, Trails, and Telemetry
 - `stable_id` is the only user-visible person ID. `track_id` is internal and
   must not be emitted to clients.
-- BEV, tracking, and telemetry use `stable_id`; BEV never carries tracker IDs.
+- BEV/tracking use `stable_id` as the primary user-visible person ID.
+  - BEV `footpoints[]` may additionally include `trackerId` as a debug/fallback
+    identity key. UI must not treat `trackerId` as stable across restarts.
 - **Pose-assisted StableID (secondary signal):** when pose SGIE is enabled
   (`config/infer.yaml` `models.pose.enable: true`), StableIDManager auto-enables
   pose ratio fusion unless disabled via `NOESIS_REID_POSE_ENABLED=0` or
@@ -26,8 +28,10 @@ you don’t have to sift through the historical work orders.
 - BEV JPEG binaries are **optional and default off**:
   - env: `NOESIS_BEV_JPEG_ENABLED=0` (default)
   - JSON BEV metadata always stays on.
-- BEV frame mode defaults to `camera_local`; override with `NOESIS_BEV_FRAME=world`
-  when global world-frame BEV is required.
+- BEV frame mode defaults to `menon_scene` (world/scene units).
+  - Override with `NOESIS_BEV_FRAME=camera_local` to force legacy camera-local BEV.
+  - World-path BEV points and trails are in native scene units; frontend owns
+    smoothing/persistence (do not convert via `s_obj_to_m` in the dashboard).
 
 ## Depth / MapAnything
 - MapAnything is a full-frame SGIE branch (no tensor-from-meta). Gated with a
@@ -60,7 +64,8 @@ you don’t have to sift through the historical work orders.
   `--size n|s|m` (default m). Engines must exist under `models/engines/`.
 
 ## Trails & ID Refactor Guardrails
-- BEV uses only `stable_id` footpoints; tracker IDs never reach BEV.
+- BEV uses `stable_id` for user-visible identity; `trackerId` may be included as
+  debug/fallback identity only.
 - BEV JPEG output is off by default (see Output section above).
 - Camera-namespaced fallback colors remain enabled to avoid cross-camera color
   collisions when stable_id is absent.

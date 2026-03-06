@@ -1,6 +1,7 @@
 import threading
 import time
 import math
+import logging
 from collections import defaultdict, deque
 from typing import Deque, Dict, List, Optional, Tuple, Any, Iterable
 import heapq
@@ -13,6 +14,7 @@ from .embedding_extractor import EmbeddingExtractor
 
 
 BBox = Tuple[float, float, float, float]  # left, top, width, height
+logger = logging.getLogger(__name__)
 
 
 class StableIDManager:
@@ -95,10 +97,21 @@ class StableIDManager:
         max_total_ids: int = 12,
         total_id_reuse: bool = True,
         total_id_reuse_min_age_s: float = 600.0,
+        # Alias-auto merge controls.
+        auto_merge_enabled: bool = False,
+        auto_merge_interval_s: float = 30.0,
+        auto_merge_max_attempts: int = 5,
+        auto_merge_min_sim: float = 0.92,
+        auto_merge_min_embeddings_for_suggest: int = 1,
+        auto_merge_respect_inactive: bool = True,
+        auto_merge_force_stuck: bool = False,
+        auto_merge_allow_both_active: bool = False,
+        auto_merge_both_active_min_sim: float = 0.97,
         # New-ID hysteresis (global, even when not at cap)
         new_id_hysteresis_frames: int = 2,
         # SID allocator persistence (smarter restart)
         sid_pool_file: str = "~/.noesis/sid_pool.json",
+        reset_sid_pool_on_start: bool = False,
         # External embedding support (e.g., DeepStream SGIE tensor outputs).
         # When disabled, embeddings are extracted internally from BGR crops.
         use_extractor: bool = True,
@@ -175,6 +188,13 @@ class StableIDManager:
         self.ema_alpha = float(ema_alpha)
         self.active_id_guard_strict = bool(active_id_guard_strict)
         self.active_id_guard_margin = float(active_id_guard_margin)
+        # Allow limited same-sensor reassociation when geometry strongly supports continuity.
+        self.active_id_guard_relaxed_reid_slack = 0.05
+        self.active_id_guard_relaxed_dist_ratio = 1.25
+        self.active_id_guard_relaxed_scale_ratio = 2.50
+        # Hard uniqueness guard: do not allow duplicate SID claims within one
+        # sensor frame (same timestamp).
+        self.same_frame_sid_epsilon_s = 1e-2
         self.ghost_strict_age_s = float(ghost_strict_age_s)
         self.ghost_extra_margin = float(ghost_extra_margin)
         self.max_active_ids_per_sensor = int(max_active_ids_per_sensor)
@@ -185,6 +205,15 @@ class StableIDManager:
         self.max_total_ids = int(max_total_ids)
         self.total_id_reuse = bool(total_id_reuse)
         self.total_id_reuse_min_age_s = float(total_id_reuse_min_age_s)
+        self.auto_merge_enabled = bool(auto_merge_enabled)
+        self.auto_merge_interval_s = float(auto_merge_interval_s)
+        self.auto_merge_max_attempts = int(max(1, auto_merge_max_attempts))
+        self.auto_merge_min_sim = float(auto_merge_min_sim)
+        self.auto_merge_min_embeddings_for_suggest = int(max(1, auto_merge_min_embeddings_for_suggest))
+        self.auto_merge_respect_inactive = bool(auto_merge_respect_inactive)
+        self.auto_merge_force_stuck = bool(auto_merge_force_stuck)
+        self.auto_merge_allow_both_active = bool(auto_merge_allow_both_active)
+        self.auto_merge_both_active_min_sim = float(auto_merge_both_active_min_sim)
         self.new_id_hysteresis_frames = int(new_id_hysteresis_frames)
         self.sid_pool_file = os.path.expanduser(str(sid_pool_file))
         self.pose_enabled = bool(pose_enabled)
@@ -249,7 +278,8 @@ class StableIDManager:
         self.sid_global_first_seen: Dict[int, float] = {}
         # Alias map: src_sid -> dst_sid (may chain)
         self.sid_alias: Dict[int, int] = {}
-        # All IDs participating in any alias (src or dst)
+        # Alias source IDs are allocator-reserved to avoid recycling IDs that
+        # would immediately canonicalize into another SID.
         self.sid_alias_reserved: set[int] = set()
         # Alias audit trail
         self.alias_history: List[Dict[str, Any]] = []
@@ -260,6 +290,38 @@ class StableIDManager:
         self._pending_new_ts: Dict[Tuple[int, int], float] = {}
         # Pending stable IDs for new tracks (avoid negative provisional IDs).
         self._pending_new_sids: Dict[Tuple[int, int], int] = {}
+        # Track-level diagnostics for telemetry.
+        self._pending_id_diag: Dict[Tuple[int, int], Dict[str, Any]] = {}
+        # Identity churn / decision counters.
+        self._sid_new_alloc_count = 0
+        self._sid_remap_count = 0
+        self._sid_guard_reject_count = 0
+        self._sid_no_embedding_count = 0
+        self._sid_fragmentation_events = 0
+        self._sid_pending_recycled_count = 0
+        self._sid_same_frame_conflict_count = 0
+        self._id_event_counts: Dict[str, int] = defaultdict(int)
+        # Alias auto-merge accounting.
+        self._last_auto_merge_ts: Optional[float] = None
+        self._auto_merge_runs = 0
+        self._auto_merge_triggers = 0
+        self._auto_merge_applied = 0
+        self._auto_merge_suppressed = 0
+        self._auto_merge_last_candidate_count = 0
+        self._auto_merge_last_blocked_count = 0
+        self._auto_merge_last_support_gate = int(self.auto_merge_min_embeddings_for_suggest)
+        self._auto_merge_zero_apply_streak = 0
+        self._auto_merge_last_warn_ts: Optional[float] = None
+        self._auto_merge_last_reason = "idle"
+        self._auto_merge_last_pressure_recycled = 0
+        self._auto_merge_pressure_recycled_total = 0
+        self._alias_candidate_pool_size = 0
+        self._alias_candidate_sim_p50: Optional[float] = None
+        self._alias_candidate_sim_p95: Optional[float] = None
+        self._alias_support_ids_ge_1 = 0
+        self._alias_support_ids_ge_2 = 0
+        self._alias_support_ids_ge_3 = 0
+        self.reset_sid_pool_on_start = bool(reset_sid_pool_on_start)
 
         self.next_stable_id = 1
         # Free-list allocator state
@@ -268,6 +330,10 @@ class StableIDManager:
         if self.aliases_enabled:
             self._load_aliases()
             self._refresh_alias_reserved()
+        if self.reset_sid_pool_on_start:
+            self._free_sids = []
+            self._free_sids_set = set()
+            self._clear_sid_pool_file()
         self._load_sid_pool()
         if self.aliases_enabled and self.sid_alias_reserved:
             self._free_sids = [sid for sid in self._free_sids if sid not in self.sid_alias_reserved]
@@ -382,15 +448,36 @@ class StableIDManager:
         return sims
 
     # --------------- Allocator -----------------
+    def _sid_pool_soft_cap(self) -> int:
+        base = max(1, int(self.max_total_ids))
+        return int(max(16, base * 4))
+
     def _alloc_sid(self) -> int:
+        # Keep allocator compact by preferring the lowest valid SID across
+        # monotonic-next and free-pool candidates.
         while self._free_sids:
-            sid = heapq.heappop(self._free_sids)
-            self._free_sids_set.discard(sid)
-            if not self._is_alias_reserved(int(sid)):
-                self.sid_global_first_seen.pop(int(sid), None)
-                return int(sid)
-        sid = int(self.next_stable_id)
-        self.next_stable_id += 1
+            sid_top = int(self._free_sids[0])
+            if self._is_alias_reserved(int(sid_top)):
+                heapq.heappop(self._free_sids)
+                self._free_sids_set.discard(int(sid_top))
+                continue
+            break
+
+        next_sid = int(self.next_stable_id)
+        while self._is_alias_reserved(int(next_sid)):
+            next_sid += 1
+
+        free_sid: Optional[int] = int(self._free_sids[0]) if self._free_sids else None
+        if free_sid is None or int(next_sid) < int(free_sid):
+            self.next_stable_id = int(next_sid) + 1
+            self.sid_global_first_seen.pop(int(next_sid), None)
+            return int(next_sid)
+
+        sid = int(heapq.heappop(self._free_sids))
+        self._free_sids_set.discard(int(sid))
+        if int(sid) >= int(self.next_stable_id):
+            self.next_stable_id = int(sid) + 1
+        self.sid_global_first_seen.pop(int(sid), None)
         return int(sid)
 
     def _free_sid(self, sid: int) -> None:
@@ -407,6 +494,58 @@ class StableIDManager:
         heapq.heappush(self._free_sids, sid)
         self._free_sids_set.add(sid)
         self._save_sid_pool()
+
+    def _try_recycle_unclaimed_sid(self, sid: Optional[int], *, keep_sid: Optional[int] = None) -> None:
+        try:
+            sid_int = int(sid) if sid is not None else 0
+        except Exception:
+            sid_int = 0
+        if sid_int <= 0:
+            return
+        try:
+            keep_int = int(keep_sid) if keep_sid is not None else None
+        except Exception:
+            keep_int = None
+        if keep_int is not None and sid_int == keep_int:
+            return
+        try:
+            if any(int(rec.get("stable_id", -1)) == sid_int for rec in self.active_tracks.values()):
+                return
+        except Exception:
+            return
+        try:
+            if len(self.gallery.get(int(sid_int), [])) > 0:
+                return
+        except Exception:
+            return
+        try:
+            if len(self.pose_gallery.get(int(sid_int), [])) > 0:
+                return
+        except Exception:
+            return
+        try:
+            for dq in self.ghosts.values():
+                for ghost in dq:
+                    try:
+                        if int(ghost.get("stable_id", -1)) == sid_int:
+                            return
+                    except Exception:
+                        continue
+        except Exception:
+            return
+        self._purge_sid_state(int(sid_int))
+        free_before = int(len(self._free_sids_set))
+        self._free_sid(int(sid_int))
+        free_after = int(len(self._free_sids_set))
+        if free_after > free_before:
+            self._sid_pending_recycled_count += 1
+
+    def _clear_pending_new_state(self, key: Tuple[int, int], *, keep_sid: Optional[int] = None) -> None:
+        pending_sid = self._pending_new_sids.pop(key, None)
+        self._pending_new_counts.pop(key, None)
+        self._pending_new_ts.pop(key, None)
+        self._pending_id_diag.pop(key, None)
+        self._try_recycle_unclaimed_sid(pending_sid, keep_sid=keep_sid)
 
     def _purge_sid_state(self, sid: int) -> None:
         try:
@@ -425,6 +564,36 @@ class StableIDManager:
             self.pose_last_seen.pop(sid, None)
             self.sid_global_last_seen.pop(sid, None)
             self.sid_global_first_seen.pop(sid, None)
+            # Remove any dangling active track records tied to this SID.
+            for key, rec in list(self.active_tracks.items()):
+                try:
+                    rec_sid = int(rec.get("stable_id", -1))
+                except Exception:
+                    rec_sid = -1
+                if rec_sid == sid:
+                    self.active_tracks.pop(key, None)
+                    self._pending_id_diag.pop(key, None)
+            # Drop ghost entries that still reference this SID.
+            for sensor_id, dq in list(self.ghosts.items()):
+                if not dq:
+                    continue
+                filtered = []
+                for ghost in dq:
+                    try:
+                        g_sid = int(ghost.get("stable_id", -1))
+                    except Exception:
+                        g_sid = -1
+                    if g_sid != sid:
+                        filtered.append(ghost)
+                if len(filtered) != len(dq):
+                    self.ghosts[int(sensor_id)] = deque(filtered, maxlen=dq.maxlen)
+            # Prune copresence pairs involving this SID.
+            for pair in list(self.sid_last_copresent.keys()):
+                try:
+                    if int(pair[0]) == sid or int(pair[1]) == sid:
+                        self.sid_last_copresent.pop(pair, None)
+                except Exception:
+                    self.sid_last_copresent.pop(pair, None)
         except Exception:
             pass
 
@@ -436,6 +605,8 @@ class StableIDManager:
                 data = json.load(f)
             pool = data.get('free_sids', []) if isinstance(data, dict) else []
             pool = [int(x) for x in pool if isinstance(x, int) and x > 0]
+            soft_cap = int(self._sid_pool_soft_cap())
+            pool = [int(sid) for sid in pool if int(sid) <= soft_cap]
             pool = sorted(set(pool))[:32]
             for sid in pool:
                 if sid not in self._free_sids_set:
@@ -444,9 +615,17 @@ class StableIDManager:
         except Exception:
             pass
 
+    def _clear_sid_pool_file(self) -> None:
+        try:
+            if os.path.exists(self.sid_pool_file):
+                os.remove(self.sid_pool_file)
+        except Exception:
+            pass
+
     def _save_sid_pool(self) -> None:
         try:
-            pool = sorted(list(self._free_sids_set))[:32]
+            soft_cap = int(self._sid_pool_soft_cap())
+            pool = sorted(int(sid) for sid in self._free_sids_set if int(sid) <= soft_cap)[:32]
             os.makedirs(os.path.dirname(self.sid_pool_file), exist_ok=True)
             with open(self.sid_pool_file, 'w') as f:
                 json.dump(
@@ -553,7 +732,8 @@ class StableIDManager:
         return self.canonical_sid(sid_int) != sid_int
 
     def _refresh_alias_reserved(self) -> None:
-        self.sid_alias_reserved = set(self.sid_alias.keys()) | set(self.sid_alias.values())
+        # Reserve only alias sources; canonical destination IDs stay allocatable.
+        self.sid_alias_reserved = set(self.sid_alias.keys())
 
     def _is_alias_reserved(self, sid: int) -> bool:
         try:
@@ -1058,7 +1238,182 @@ class StableIDManager:
         self._record_match_latency(start_ns)
         return best_id, float(best_reid), float(best_req)
 
+    def _record_id_event(self, event: str) -> None:
+        try:
+            key = str(event).strip()
+        except Exception:
+            return
+        if not key:
+            return
+        self._id_event_counts[key] = int(self._id_event_counts.get(key, 0)) + 1
+
+    def _set_track_diag(
+        self,
+        key: Tuple[int, int],
+        *,
+        event: str,
+        reject_reason: Optional[str],
+        embedding_present: bool,
+        pose_present: bool,
+        sid_candidate: Optional[int],
+        stable_id: Optional[int],
+        ts: float,
+    ) -> Dict[str, Any]:
+        diag: Dict[str, Any] = {
+            "id_event": str(event),
+            "id_reject_reason": str(reject_reason) if reject_reason else None,
+            "embedding_present": bool(embedding_present),
+            "pose_present": bool(pose_present),
+            "sid_candidate": int(sid_candidate) if sid_candidate is not None else None,
+            "stable_id": int(stable_id) if stable_id is not None else None,
+            "ts": float(ts),
+        }
+        self._pending_id_diag[key] = dict(diag)
+        return diag
+
+    def _active_bbox_for_sid_on_sensor(
+        self,
+        sensor_id: int,
+        sid: int,
+        *,
+        exclude_key: Optional[Tuple[int, int]] = None,
+    ) -> Optional[BBox]:
+        best_bbox: Optional[BBox] = None
+        best_ts = float("-inf")
+        sid_int = int(sid)
+        sensor_int = int(sensor_id)
+        for rec_key, rec in self.active_tracks.items():
+            try:
+                if int(rec_key[0]) != sensor_int:
+                    continue
+                if exclude_key is not None and rec_key == exclude_key:
+                    continue
+                if int(rec.get("stable_id", -1)) != sid_int:
+                    continue
+                bbox = rec.get("bbox")
+                if not bbox or len(bbox) < 4:
+                    continue
+                last_ts = float(rec.get("last_seen_ts", 0.0))
+                if last_ts >= best_ts:
+                    best_ts = last_ts
+                    best_bbox = (
+                        float(bbox[0]),
+                        float(bbox[1]),
+                        float(bbox[2]),
+                        float(bbox[3]),
+                    )
+            except Exception:
+                continue
+        return best_bbox
+
+    def _sid_claimed_same_frame(
+        self,
+        *,
+        sensor_id: int,
+        sid: int,
+        ts: Optional[float],
+        exclude_key: Optional[Tuple[int, int]] = None,
+    ) -> bool:
+        if ts is None:
+            return False
+        try:
+            sensor_int = int(sensor_id)
+            sid_int = int(sid)
+            ts_f = float(ts)
+        except Exception:
+            return False
+        if sensor_int < 0 or sid_int <= 0:
+            return False
+        eps = float(self.same_frame_sid_epsilon_s)
+        for rec_key, rec in self.active_tracks.items():
+            try:
+                if int(rec_key[0]) != sensor_int:
+                    continue
+                if exclude_key is not None and rec_key == exclude_key:
+                    continue
+                if int(rec.get("stable_id", -1)) != sid_int:
+                    continue
+                last_ts = float(rec.get("last_seen_ts", -1e18))
+            except Exception:
+                continue
+            if abs(float(last_ts) - ts_f) <= eps:
+                return True
+        return False
+
+    def _allow_active_sid_match(
+        self,
+        *,
+        sensor_id: int,
+        sid: int,
+        score: float,
+        required: float,
+        bbox: BBox,
+        ts: Optional[float] = None,
+        exclude_key: Optional[Tuple[int, int]] = None,
+    ) -> bool:
+        # Strict same-frame uniqueness: never allow two tracks in one camera
+        # frame to claim the same SID.
+        if self._sid_claimed_same_frame(
+            sensor_id=int(sensor_id),
+            sid=int(sid),
+            ts=ts,
+            exclude_key=exclude_key,
+        ):
+            self._sid_same_frame_conflict_count += 1
+            return False
+        if not self.active_id_guard_strict:
+            return True
+        active_pairs = self.active_zones.get(int(sid), set())
+        active_here = any(int(sid_sensor) == int(sensor_id) for (sid_sensor, _zone) in active_pairs)
+        if not active_here:
+            return True
+        score_f = float(score)
+        req_f = float(required)
+        if score_f >= (req_f + float(self.active_id_guard_margin)):
+            return True
+        if score_f < (req_f - float(self.active_id_guard_relaxed_reid_slack)):
+            return False
+
+        ref_bbox = self._active_bbox_for_sid_on_sensor(int(sensor_id), int(sid), exclude_key=exclude_key)
+        if ref_bbox is None:
+            return False
+        try:
+            cx = float(bbox[0]) + float(bbox[2]) / 2.0
+            cy = float(bbox[1]) + float(bbox[3]) / 2.0
+            rx = float(ref_bbox[0]) + float(ref_bbox[2]) / 2.0
+            ry = float(ref_bbox[1]) + float(ref_bbox[3]) / 2.0
+            dist = float(((cx - rx) ** 2 + (cy - ry) ** 2) ** 0.5)
+            diag = max(
+                1.0,
+                float((float(bbox[2]) ** 2 + float(bbox[3]) ** 2) ** 0.5),
+                float((float(ref_bbox[2]) ** 2 + float(ref_bbox[3]) ** 2) ** 0.5),
+            )
+            dist_ratio = float(dist / diag)
+            area_a = max(1.0, float(bbox[2]) * float(bbox[3]))
+            area_b = max(1.0, float(ref_bbox[2]) * float(ref_bbox[3]))
+            scale_ratio = area_a / area_b if area_a >= area_b else area_b / area_a
+        except Exception:
+            return False
+        if dist_ratio > float(self.active_id_guard_relaxed_dist_ratio):
+            return False
+        if scale_ratio > float(self.active_id_guard_relaxed_scale_ratio):
+            return False
+        return True
+
     # --------------- Public API --------------
+    def get_track_diagnostics(self, sensor_id: int, ds_obj_id: int) -> Dict[str, Any]:
+        key = (int(sensor_id), int(ds_obj_id))
+        with self._lock:
+            rec = self.active_tracks.get(key)
+            if rec is not None:
+                diag = rec.get("id_diag")
+                if isinstance(diag, dict):
+                    return dict(diag)
+            diag_pending = self._pending_id_diag.get(key)
+            if isinstance(diag_pending, dict):
+                return dict(diag_pending)
+        return {}
+
     def list_aliases(self) -> Dict[int, int]:
         with self._lock:
             if not self.sid_alias:
@@ -1079,6 +1434,7 @@ class StableIDManager:
         canonical: Optional[int] = None,
         append_embeddings: Optional[bool] = None,
         force: bool = False,
+        ignore_both_active: bool = False,
         now_ts: Optional[float] = None,
     ) -> Dict[str, Any]:
         now_ts = float(now_ts if now_ts is not None else time.time())
@@ -1143,7 +1499,7 @@ class StableIDManager:
             src_root = root_b if dst_root == root_a else root_a
 
             if not force:
-                if self.active_zones.get(root_a) and self.active_zones.get(root_b):
+                if (not ignore_both_active) and self.active_zones.get(root_a) and self.active_zones.get(root_b):
                     return {
                         "src": int(src_root),
                         "dst": int(dst_root),
@@ -1558,6 +1914,279 @@ class StableIDManager:
                 "failed_count": int(failed_count),
             }
 
+    def _canonical_sid_set(self) -> set[int]:
+        """Collect canonical SID set across gallery, active tracks, ghosts, and last-seen state."""
+        sids: set[int] = set()
+        for sid in self.gallery.keys():
+            try:
+                sid_can = self.canonical_sid(int(sid))
+            except Exception:
+                continue
+            if sid_can > 0:
+                sids.add(int(sid_can))
+
+        for rec in self.active_tracks.values():
+            try:
+                sid_can = self.canonical_sid(int(rec.get("stable_id")))
+            except Exception:
+                continue
+            if sid_can > 0:
+                sids.add(int(sid_can))
+
+        for sid in self.sid_global_last_seen.keys():
+            try:
+                sid_can = self.canonical_sid(int(sid))
+            except Exception:
+                continue
+            if sid_can > 0:
+                sids.add(int(sid_can))
+
+        for dq in self.ghosts.values():
+            for ghost in dq:
+                try:
+                    sid_can = self.canonical_sid(int(ghost.get("stable_id")))
+                except Exception:
+                    continue
+                if sid_can > 0:
+                    sids.add(int(sid_can))
+
+        return sids
+
+    def _count_canonical_sids(self) -> int:
+        """Count active/stable IDs after applying alias canonicalization."""
+        return int(len(self._canonical_sid_set()))
+
+    def _pressure_relief_recycle(self, now_ts: float, max_ids: int) -> int:
+        """Force ID-pool relief without risky merges by recycling inactive weak/stale identities."""
+        now = float(now_ts)
+        target = int(max_ids)
+        if target <= 0:
+            return 0
+        current = self._canonical_sid_set()
+        if len(current) <= target:
+            return 0
+
+        active_can: set[int] = set()
+        for rec in self.active_tracks.values():
+            try:
+                sid_can = self.canonical_sid(int(rec.get("stable_id", -1)))
+            except Exception:
+                sid_can = -1
+            if sid_can > 0:
+                active_can.add(int(sid_can))
+
+        ghost_latest: Dict[int, float] = {}
+        for dq in self.ghosts.values():
+            for ghost in dq:
+                try:
+                    sid_can = self.canonical_sid(int(ghost.get("stable_id", -1)))
+                    ts = float(ghost.get("ts", 0.0) or 0.0)
+                except Exception:
+                    continue
+                if sid_can <= 0:
+                    continue
+                prev = ghost_latest.get(int(sid_can))
+                if prev is None or ts > float(prev):
+                    ghost_latest[int(sid_can)] = float(ts)
+
+        age_gate_weak = max(1.0, float(self.active_evict_grace_s) * 0.5)
+        age_gate_base = max(2.0, float(self.active_evict_grace_s))
+        ranked: List[Tuple[int, float, int, int]] = []
+        for sid in sorted(current):
+            sid_int = int(sid)
+            if sid_int in active_can:
+                continue
+            if self._is_alias_reserved(sid_int):
+                continue
+            emb_count = int(len(self.gallery.get(sid_int, [])))
+            last_seen = self.sid_global_last_seen.get(sid_int)
+            if last_seen is None:
+                last_seen = ghost_latest.get(sid_int, 0.0)
+            age = max(0.0, now - float(last_seen or 0.0))
+
+            bucket = 99
+            if emb_count < 1 and age >= age_gate_weak:
+                bucket = 0
+            elif emb_count <= 1 and age >= age_gate_base:
+                bucket = 1
+            elif age >= age_gate_base:
+                bucket = 2
+            if bucket >= 99:
+                continue
+            ranked.append((int(bucket), -float(age), int(emb_count), sid_int))
+
+        ranked.sort()
+        recycled = 0
+        for _bucket, _neg_age, _emb_count, sid in ranked:
+            if len(current) <= target:
+                break
+            self._purge_sid_state(int(sid))
+            self._free_sid(int(sid))
+            current.discard(int(sid))
+            recycled += 1
+            self._record_id_event("pressure_recycle")
+        return int(recycled)
+
+    def _auto_merge_if_needed(self, now_ts: float) -> int:
+        """Apply automatic alias merges when canonical ID count exceeds configured limits."""
+        if not self.auto_merge_enabled or not self.aliases_enabled:
+            self._auto_merge_last_reason = "disabled"
+            return 0
+
+        now = float(now_ts)
+        max_ids = int(self.max_total_ids)
+        if max_ids <= 0:
+            self._auto_merge_last_reason = "invalid_max_ids"
+            return 0
+
+        current_ids = self._count_canonical_sids()
+        if current_ids <= max_ids:
+            self._auto_merge_last_reason = "under_cap"
+            self._auto_merge_last_pressure_recycled = 0
+            return 0
+
+        interval = float(self.auto_merge_interval_s)
+        if interval > 0.0 and self._last_auto_merge_ts is not None and (now - float(self._last_auto_merge_ts)) < interval:
+            self._auto_merge_last_reason = "interval_guard"
+            return 0
+
+        self._last_auto_merge_ts = now
+        self._auto_merge_runs += 1
+        self._auto_merge_triggers += 1
+
+        remaining = int(self.auto_merge_max_attempts)
+        if remaining <= 0:
+            self._auto_merge_last_reason = "max_attempts_zero"
+            return 0
+
+        applied = 0
+        blocked_count = 0
+        candidate_count = 0
+        stall_reason = "none"
+        pressure_recycled = 0
+        support_gate = int(max(1, self.auto_merge_min_embeddings_for_suggest))
+        suggestion_limit = max(1, min(remaining, 25))
+        min_sim_try = float(self.auto_merge_min_sim)
+        relax_attempts = 0
+        while remaining > 0:
+            candidates = self.suggest_aliases(
+                min_sim=min_sim_try,
+                limit=suggestion_limit,
+                require_inactive=self.auto_merge_respect_inactive,
+                now_ts=now,
+                min_embeddings_for_suggest_override=support_gate,
+            )
+            if not candidates:
+                if relax_attempts < 2 and min_sim_try > 0.86:
+                    min_sim_try = max(0.86, float(min_sim_try) - 0.03)
+                    relax_attempts += 1
+                    stall_reason = "no_candidates_relaxed"
+                    continue
+                stall_reason = "no_candidates"
+                break
+            candidate_count += len(candidates)
+            applied_this_round = False
+            for cand in candidates:
+                if remaining <= 0:
+                    break
+                remaining -= 1
+                if not isinstance(cand, dict):
+                    continue
+                src_sid = int(cand.get("a", 0) or 0)
+                dst_sid = int(cand.get("b", 0) or 0)
+                if src_sid <= 0 or dst_sid <= 0:
+                    continue
+                if src_sid == dst_sid:
+                    continue
+
+                ignore_both_active = False
+                if bool(cand.get("blocked")) and not self.auto_merge_force_stuck:
+                    reason = str(cand.get("block_reason") or "")
+                    sim_val = float(cand.get("sim") or 0.0)
+                    if (
+                        reason == "both_active"
+                        and self.auto_merge_allow_both_active
+                        and sim_val >= float(self.auto_merge_both_active_min_sim)
+                    ):
+                        ignore_both_active = True
+                    else:
+                        blocked_count += 1
+                        stall_reason = "blocked"
+                        self._auto_merge_suppressed += 1
+                        continue
+
+                canonical_src = self.canonical_sid(src_sid)
+                canonical_dst = self.canonical_sid(dst_sid)
+                if canonical_src == canonical_dst:
+                    continue
+
+                res = self.set_alias(
+                    canonical_src,
+                    canonical_dst,
+                    force=self.auto_merge_force_stuck,
+                    ignore_both_active=ignore_both_active,
+                    now_ts=now,
+                )
+                if res.get("applied"):
+                    applied += 1
+                    applied_this_round = True
+                    self._auto_merge_applied += 1
+                else:
+                    self._auto_merge_suppressed += 1
+
+                if self._count_canonical_sids() <= max_ids:
+                    break
+
+            if not applied_this_round:
+                if blocked_count >= candidate_count and candidate_count > 0:
+                    stall_reason = "all_blocked"
+                elif stall_reason == "none":
+                    stall_reason = "insufficient_similarity"
+                break
+            if self._count_canonical_sids() <= max_ids:
+                break
+
+        self._auto_merge_last_candidate_count = int(candidate_count)
+        self._auto_merge_last_blocked_count = int(blocked_count)
+        self._auto_merge_last_support_gate = int(support_gate)
+        current_after = self._count_canonical_sids()
+        if applied < 1 and current_after > max_ids and candidate_count < 1:
+            pressure_recycled = int(self._pressure_relief_recycle(now, max_ids))
+            self._auto_merge_last_pressure_recycled = int(pressure_recycled)
+            self._auto_merge_pressure_recycled_total += int(pressure_recycled)
+            if pressure_recycled > 0:
+                stall_reason = "pressure_recycle"
+            current_after = self._count_canonical_sids()
+        else:
+            self._auto_merge_last_pressure_recycled = 0
+
+        self._auto_merge_last_reason = str(stall_reason or "none")
+        applied_effective = int(applied + pressure_recycled)
+        if applied_effective < 1 and current_after > max_ids:
+            self._auto_merge_zero_apply_streak += 1
+            warn_interval_s = 120.0
+            warn_streak = 3
+            last_warn = self._auto_merge_last_warn_ts
+            streak = int(self._auto_merge_zero_apply_streak)
+            milestone = streak in (3, 6, 12) or (streak % 15 == 0)
+            if streak >= warn_streak and (milestone or last_warn is None or (now - float(last_warn)) >= warn_interval_s):
+                logger.warning(
+                    "StableID auto-merge stalled: canonical=%d max=%d candidates=%d blocked=%d support_gate=%d streak=%d reason=%s recycled=%d",
+                    int(current_after),
+                    int(max_ids),
+                    int(candidate_count),
+                    int(blocked_count),
+                    int(support_gate),
+                    int(streak),
+                    str(self._auto_merge_last_reason),
+                    int(self._auto_merge_last_pressure_recycled),
+                )
+                self._auto_merge_last_warn_ts = float(now)
+        else:
+            self._auto_merge_zero_apply_streak = 0
+
+        return int(applied_effective)
+
     def suggest_aliases(
         self,
         *,
@@ -1565,13 +2194,23 @@ class StableIDManager:
         limit: int = 20,
         require_inactive: bool = True,
         now_ts: Optional[float] = None,
+        min_embeddings_for_suggest_override: Optional[int] = None,
     ) -> List[Dict[str, Any]]:
         now_ts = float(now_ts if now_ts is not None else time.time())
         min_sim = float(self.suggest_min_sim if min_sim is None else min_sim)
+        support_gate = int(
+            max(
+                1,
+                self.min_embeddings_for_suggest
+                if min_embeddings_for_suggest_override is None
+                else int(min_embeddings_for_suggest_override),
+            )
+        )
         with self._lock:
             # Build canonical SID set with enough support.
             candidates: List[int] = []
             seen: set[int] = set()
+            support_counts: Dict[int, int] = {}
             for sid in list(self.gallery.keys()):
                 sid_int = int(sid)
                 sid_can = self.canonical_sid(sid_int)
@@ -1580,9 +2219,14 @@ class StableIDManager:
                 if self._is_alias_src(sid_int):
                     continue
                 seen.add(sid_can)
-                if len(self.gallery.get(int(sid_can), [])) < int(self.min_embeddings_for_suggest):
+                emb_count = int(len(self.gallery.get(int(sid_can), [])))
+                support_counts[int(sid_can)] = int(emb_count)
+                if emb_count < int(support_gate):
                     continue
                 candidates.append(int(sid_can))
+            self._alias_support_ids_ge_1 = int(sum(1 for c in support_counts.values() if c >= 1))
+            self._alias_support_ids_ge_2 = int(sum(1 for c in support_counts.values() if c >= 2))
+            self._alias_support_ids_ge_3 = int(sum(1 for c in support_counts.values() if c >= 3))
 
             centroids: Dict[int, np.ndarray] = {}
             for sid in candidates:
@@ -1595,6 +2239,11 @@ class StableIDManager:
                     centroid = centroid / (np.linalg.norm(centroid) + 1e-12)
                 centroids[int(sid)] = centroid
             candidates = [sid for sid in candidates if sid in centroids]
+            if len(candidates) < 2:
+                self._alias_candidate_pool_size = 0
+                self._alias_candidate_sim_p50 = None
+                self._alias_candidate_sim_p95 = None
+                return []
 
             best: Dict[int, Tuple[int, float, float]] = {}
             for sid in candidates:
@@ -1612,71 +2261,101 @@ class StableIDManager:
                 second_sim = float(sims[1][0]) if len(sims) > 1 else -1.0
                 best[int(sid)] = (best_sid, best_sim, second_sim)
 
+            sorted_candidates = sorted(int(sid) for sid in candidates)
+            pair_pool_size = 0
+            pair_sims: List[float] = []
             results: List[Dict[str, Any]] = []
-            for sid, (best_sid, best_sim, second_sim) in best.items():
-                if best_sim - float(second_sim) < float(self.suggest_mnn_margin):
-                    continue
-                if best.get(best_sid, (None, 0.0, 0.0))[0] != sid:
-                    continue
-                if sid > best_sid:
-                    continue
+            for idx, sid in enumerate(sorted_candidates):
+                for best_sid in sorted_candidates[idx + 1 :]:
+                    sim = float(self._cosine(centroids[int(sid)], centroids[int(best_sid)]))
+                    if not math.isfinite(sim):
+                        continue
+                    pair_pool_size += 1
+                    pair_sims.append(float(sim))
 
-                pose_sim = self._pose_similarity_between_sids(sid, best_sid)
-                sim_ok = best_sim >= float(min_sim)
-                if pose_sim is not None and best_sim < 0.94 and float(pose_sim) >= float(self.suggest_pose_sim_high):
-                    sim_ok = True
-                if not sim_ok:
-                    continue
+                    pose_sim = self._pose_similarity_between_sids(int(sid), int(best_sid))
+                    a_best, a_sim, a_second = best.get(int(sid), (None, -1.0, -1.0))
+                    b_best, b_sim, b_second = best.get(int(best_sid), (None, -1.0, -1.0))
+                    mutual_nn = a_best == int(best_sid) and b_best == int(sid)
+                    gap_a = max(0.0, float(a_sim) - float(a_second))
+                    gap_b = max(0.0, float(b_sim) - float(b_second))
+                    mnn_gap = min(gap_a, gap_b)
+                    strong_mnn = bool(mutual_nn and mnn_gap >= float(self.suggest_mnn_margin))
+                    high_reid = bool(sim >= float(min_sim) + 0.03)
+                    near_reid = bool(sim >= max(0.0, float(min_sim) - 0.04))
+                    pose_boost = bool(
+                        pose_sim is not None
+                        and float(pose_sim) >= float(self.suggest_pose_sim_high)
+                        and near_reid
+                    )
+                    sim_ok = bool((strong_mnn and sim >= float(min_sim)) or high_reid or pose_boost)
+                    if not sim_ok:
+                        continue
 
-                blocked = False
-                block_reason: Optional[str] = None
-                if self.active_zones.get(int(sid)) and self.active_zones.get(int(best_sid)):
-                    blocked = True
-                    block_reason = "both_active"
-                elif self.was_copresent_recently(int(sid), int(best_sid), float(now_ts)):
-                    blocked = True
-                    block_reason = "copresent_recently"
-                elif require_inactive:
-                    if self.active_zones.get(int(sid)) or self.active_zones.get(int(best_sid)):
+                    blocked = False
+                    block_reason: Optional[str] = None
+                    if self.active_zones.get(int(sid)) and self.active_zones.get(int(best_sid)):
                         blocked = True
-                        block_reason = "require_inactive"
+                        block_reason = "both_active"
+                    elif self.was_copresent_recently(int(sid), int(best_sid), float(now_ts)):
+                        blocked = True
+                        block_reason = "copresent_recently"
+                    elif require_inactive:
+                        if self.active_zones.get(int(sid)) or self.active_zones.get(int(best_sid)):
+                            blocked = True
+                            block_reason = "require_inactive"
 
-                if pose_sim is not None and best_sim >= 0.94 and float(pose_sim) < float(self.suggest_pose_sim_low):
-                    blocked = True
-                    block_reason = "pose_mismatch"
+                    if pose_sim is not None and sim >= 0.94 and float(pose_sim) < float(self.suggest_pose_sim_low):
+                        blocked = True
+                        block_reason = "pose_mismatch"
 
-                count_a = len(self.gallery.get(int(sid), []))
-                count_b = len(self.gallery.get(int(best_sid), []))
-                if count_a > count_b:
-                    preferred = int(sid)
-                elif count_b > count_a:
-                    preferred = int(best_sid)
-                else:
-                    first_a = float(self.sid_global_first_seen.get(int(sid), float("inf")))
-                    first_b = float(self.sid_global_first_seen.get(int(best_sid), float("inf")))
-                    if first_a < first_b:
+                    count_a = int(len(self.gallery.get(int(sid), [])))
+                    count_b = int(len(self.gallery.get(int(best_sid), [])))
+                    if count_a > count_b:
                         preferred = int(sid)
-                    elif first_b < first_a:
+                    elif count_b > count_a:
                         preferred = int(best_sid)
                     else:
-                        preferred = int(min(sid, best_sid))
+                        first_a = float(self.sid_global_first_seen.get(int(sid), float("inf")))
+                        first_b = float(self.sid_global_first_seen.get(int(best_sid), float("inf")))
+                        if first_a < first_b:
+                            preferred = int(sid)
+                        elif first_b < first_a:
+                            preferred = int(best_sid)
+                        else:
+                            preferred = int(min(sid, best_sid))
 
-                results.append(
-                    {
-                        "a": int(sid),
-                        "b": int(best_sid),
-                        "sim": float(best_sim),
-                        "pose_sim": float(pose_sim) if pose_sim is not None else None,
-                        "canonical": int(min(sid, best_sid)),
-                        "preferred_canonical": int(preferred),
-                        "a_embedding_count": int(count_a),
-                        "b_embedding_count": int(count_b),
-                        "blocked": bool(blocked),
-                        "block_reason": block_reason,
-                    }
-                )
+                    score = float(sim)
+                    if pose_sim is not None:
+                        score += 0.04 * max(0.0, min(1.0, float(pose_sim)) - float(self.suggest_pose_sim_low))
+                    if strong_mnn:
+                        score += 0.01
+                    if high_reid:
+                        score += 0.01
 
-            results.sort(key=lambda item: float(item.get("sim", 0.0)), reverse=True)
+                    results.append(
+                        {
+                            "a": int(sid),
+                            "b": int(best_sid),
+                            "score": float(score),
+                            "sim": float(sim),
+                            "pose_sim": float(pose_sim) if pose_sim is not None else None,
+                            "mnn": bool(strong_mnn),
+                            "mnn_gap": float(mnn_gap),
+                            "canonical": int(min(sid, best_sid)),
+                            "preferred_canonical": int(preferred),
+                            "a_embedding_count": int(count_a),
+                            "b_embedding_count": int(count_b),
+                            "blocked": bool(blocked),
+                            "block_reason": block_reason,
+                        }
+                    )
+
+            self._alias_candidate_pool_size = int(pair_pool_size)
+            self._alias_candidate_sim_p50 = self._percentile(pair_sims, 50.0) if pair_sims else None
+            self._alias_candidate_sim_p95 = self._percentile(pair_sims, 95.0) if pair_sims else None
+
+            results.sort(key=lambda item: float(item.get("score", item.get("sim", 0.0))), reverse=True)
             if limit > 0:
                 results = results[: int(limit)]
             return results
@@ -1702,6 +2381,11 @@ class StableIDManager:
         with self._lock:
             rec = self.active_tracks.get(key)
             is_new = rec is None
+            diag_event = "new_alloc" if is_new else "reuse_active"
+            diag_reject_reason: Optional[str] = None
+            diag_sid_candidate: Optional[int] = None
+            if is_new:
+                self._auto_merge_if_needed(float(ts))
             if rec is not None and self.aliases_enabled:
                 try:
                     old_sid = int(rec.get("stable_id"))
@@ -1723,6 +2407,50 @@ class StableIDManager:
                         pass
                     rec["stable_id"] = int(new_sid)
                     self.active_zones[int(new_sid)].add((int(sensor_id), zone_existing))
+
+            # Hard uniqueness repair: if this existing track would create a
+            # same-frame SID duplicate on this sensor, split it to a fresh SID.
+            if rec is not None:
+                try:
+                    current_sid = int(rec.get("stable_id", -1))
+                except Exception:
+                    current_sid = -1
+                if current_sid > 0 and self._sid_claimed_same_frame(
+                    sensor_id=int(sensor_id),
+                    sid=int(current_sid),
+                    ts=float(ts),
+                    exclude_key=key,
+                ):
+                    self._sid_same_frame_conflict_count += 1
+                    old_sid = int(current_sid)
+                    zone_existing = rec.get("zone", "default")
+                    try:
+                        pairs = self.active_zones.get(int(old_sid), set())
+                        if (int(sensor_id), zone_existing) in pairs:
+                            pairs.remove((int(sensor_id), zone_existing))
+                        if pairs:
+                            self.active_zones[int(old_sid)] = pairs
+                        else:
+                            self.active_zones.pop(int(old_sid), None)
+                    except Exception:
+                        pass
+                    new_sid = int(self._alloc_sid())
+                    self._sid_new_alloc_count += 1
+                    self._sid_fragmentation_events += 1
+                    if self.aliases_enabled:
+                        new_sid = int(self.canonical_sid(int(new_sid)))
+                    rec["stable_id"] = int(new_sid)
+                    rec["emb"] = None
+                    rec["last_emb_ts"] = 0.0
+                    rec["pose_vec"] = None
+                    rec["last_pose_ts"] = 0.0
+                    rec["identity_quality"] = "weak_no_embedding"
+                    rec["first_seen_ts"] = float(ts)
+                    rec["early_emb_reconcile_attempts"] = 0
+                    self.active_zones[int(new_sid)].add((int(sensor_id), zone_existing))
+                    diag_event = "split_same_frame_conflict"
+                    diag_reject_reason = "same_frame_sid_conflict"
+                    diag_sid_candidate = int(old_sid)
 
             emb: Optional[np.ndarray] = None
             curr_brightness: Optional[float] = None
@@ -1760,6 +2488,9 @@ class StableIDManager:
                         curr_brightness = self._crop_brightness(crop)
                     # Compute color hist for additional discrimination
                     curr_color = self._crop_color_hist(crop)
+            if is_new and emb is None:
+                self._sid_no_embedding_count += 1
+                diag_reject_reason = "no_embedding"
 
             pose_vec: Optional[np.ndarray] = None
             pose_valid = False
@@ -1796,6 +2527,9 @@ class StableIDManager:
                         ts,
                         pose_vec=pose_vec if pose_valid else None,
                     )
+                    if sid is not None:
+                        diag_event = "match_ghost"
+                        diag_sid_candidate = int(sid)
                     # Cross-camera active/gallery match if enabled
                     if sid is None and emb is not None:
                         g_id, g_reid, g_req = self._gallery_best(
@@ -1808,30 +2542,64 @@ class StableIDManager:
                             pose_valid=pose_valid,
                             now_ts=float(ts),
                         )
+                        if g_id is not None:
+                            diag_sid_candidate = int(g_id)
                         if g_id is not None and float(g_reid) >= float(g_req):
-                            # If the candidate stable_id is already active on this sensor,
-                            # optionally require a small extra margin to avoid merging co-present people.
-                            can_take = True
-                            if self.active_id_guard_strict:
-                                active_pairs = self.active_zones.get(int(g_id), set())
-                                active_here = any(int(sid_sensor) == int(sensor_id) for (sid_sensor, _zone) in active_pairs)
-                                if active_here and (float(g_reid) < (float(g_req) + self.active_id_guard_margin)):
-                                    can_take = False
+                            can_take = self._allow_active_sid_match(
+                                sensor_id=int(sensor_id),
+                                sid=int(g_id),
+                                score=float(g_reid),
+                                required=float(g_req),
+                                bbox=bbox_ltrbwh,
+                                ts=float(ts),
+                            )
+                            if not can_take:
+                                self._sid_guard_reject_count += 1
+                                if self._sid_claimed_same_frame(
+                                    sensor_id=int(sensor_id),
+                                    sid=int(g_id),
+                                    ts=float(ts),
+                                    exclude_key=None,
+                                ):
+                                    diag_reject_reason = "same_frame_sid_conflict"
+                                else:
+                                    diag_reject_reason = "active_guard"
                             if can_take and (self.allow_multi_zone_active or not self.active_zones.get(g_id)):
                                 sid = g_id
+                                diag_event = "match_gallery"
+                        elif g_id is not None:
+                            diag_reject_reason = "threshold"
                     if sid is None and emb is None and pose_valid and pose_vec is not None:
                         g_id, g_pose, g_req = self._pose_gallery_best(pose_vec, now_ts=float(ts))
                         if g_id is not None and self.aliases_enabled:
                             g_id = self.canonical_sid(int(g_id))
+                        if g_id is not None:
+                            diag_sid_candidate = int(g_id)
                         if g_id is not None and float(g_pose) >= float(g_req):
-                            can_take = True
-                            if self.active_id_guard_strict:
-                                active_pairs = self.active_zones.get(int(g_id), set())
-                                active_here = any(int(sid_sensor) == int(sensor_id) for (sid_sensor, _zone) in active_pairs)
-                                if active_here and (float(g_pose) < (float(g_req) + self.active_id_guard_margin)):
-                                    can_take = False
+                            can_take = self._allow_active_sid_match(
+                                sensor_id=int(sensor_id),
+                                sid=int(g_id),
+                                score=float(g_pose),
+                                required=float(g_req),
+                                bbox=bbox_ltrbwh,
+                                ts=float(ts),
+                            )
+                            if not can_take:
+                                self._sid_guard_reject_count += 1
+                                if self._sid_claimed_same_frame(
+                                    sensor_id=int(sensor_id),
+                                    sid=int(g_id),
+                                    ts=float(ts),
+                                    exclude_key=None,
+                                ):
+                                    diag_reject_reason = "same_frame_sid_conflict"
+                                else:
+                                    diag_reject_reason = "active_guard"
                             if can_take and (self.allow_multi_zone_active or not self.active_zones.get(g_id)):
                                 sid = g_id
+                                diag_event = "match_pose_gallery"
+                        elif g_id is not None:
+                            diag_reject_reason = "threshold"
 
                 if sid is None:
                     # Global new-ID hysteresis + soft-cap handling
@@ -1850,6 +2618,22 @@ class StableIDManager:
                         if pending_sid is None:
                             pending_sid = int(self._alloc_sid())
                             self._pending_new_sids[key] = int(pending_sid)
+                            self._sid_new_alloc_count += 1
+                            if active_ids_here:
+                                self._sid_fragmentation_events += 1
+                        diag_event = "new_alloc"
+                        diag_sid_candidate = int(pending_sid)
+                        self._record_id_event(diag_event)
+                        self._set_track_diag(
+                            key,
+                            event=diag_event,
+                            reject_reason=diag_reject_reason,
+                            embedding_present=emb is not None,
+                            pose_present=pose_valid and pose_vec is not None,
+                            sid_candidate=diag_sid_candidate,
+                            stable_id=int(pending_sid),
+                            ts=float(ts),
+                        )
                         if self.aliases_enabled:
                             return int(self.canonical_sid(int(pending_sid)))
                         return int(pending_sid)
@@ -1923,34 +2707,54 @@ class StableIDManager:
                     # Create new stable ID now if still none
                     if sid is None:
                         sid = self._alloc_sid()
+                        self._sid_new_alloc_count += 1
+                        if active_ids_here:
+                            self._sid_fragmentation_events += 1
+                    diag_event = "new_alloc"
                     # Clear pending counter after minting
                     try:
-                        self._pending_new_counts.pop(key, None)
-                        self._pending_new_ts.pop(key, None)
-                        self._pending_new_sids.pop(key, None)
+                        self._clear_pending_new_state(key, keep_sid=int(sid))
                     except Exception:
                         pass
 
                 # Creating an active record: clear any pending state for this track key.
                 try:
-                    self._pending_new_counts.pop(key, None)
-                    self._pending_new_ts.pop(key, None)
-                    self._pending_new_sids.pop(key, None)
+                    self._clear_pending_new_state(key, keep_sid=int(sid))
                 except Exception:
                     pass
 
                 if self.aliases_enabled:
                     sid = self.canonical_sid(int(sid))
+                diag_sid_candidate = int(sid)
+                diag_payload = self._set_track_diag(
+                    key,
+                    event=diag_event,
+                    reject_reason=diag_reject_reason,
+                    embedding_present=emb is not None,
+                    pose_present=pose_valid and pose_vec is not None,
+                    sid_candidate=diag_sid_candidate,
+                    stable_id=int(sid),
+                    ts=float(ts),
+                )
+                self._record_id_event(diag_event)
 
                 rec = {
                     "stable_id": int(sid),
+                    "first_seen_ts": float(ts),
                     "bbox": bbox_ltrbwh,
                     "last_seen_ts": float(ts),
                     "last_emb_ts": float(ts) if emb is not None else 0.0,
                     "emb": emb,
                     "pose_vec": pose_vec,
                     "last_pose_ts": float(ts) if pose_vec is not None else 0.0,
+                    "early_emb_reconcile_attempts": 0,
                     "zone": zone or "default",
+                    "id_diag": diag_payload,
+                    "identity_quality": (
+                        "strong"
+                        if emb is not None
+                        else ("pose_only" if pose_vec is not None else "weak_no_embedding")
+                    ),
                 }
                 self.active_tracks[key] = rec
                 # Track zones and gallery
@@ -1973,7 +2777,15 @@ class StableIDManager:
                         self.sid_last_color[sid_int] = curr_color.astype(np.float32)
                 if pose_vec is not None:
                     self._update_pose_state(int(sid), pose_vec, float(ts))
-                return int(sid)
+                self._auto_merge_if_needed(float(ts))
+                try:
+                    latest = self.active_tracks.get(key, rec)
+                    sid_out = int(latest.get("stable_id", sid))
+                except Exception:
+                    sid_out = int(sid)
+                if self.aliases_enabled:
+                    sid_out = int(self.canonical_sid(sid_out))
+                return int(sid_out)
 
             # Existing track: update
             rec["bbox"] = bbox_ltrbwh
@@ -1982,15 +2794,33 @@ class StableIDManager:
                 rec["zone"] = zone
                 self.active_zones[int(rec["stable_id"])].add((int(sensor_id), rec["zone"]))
             if emb is not None:
-                # If we minted an allocator-only ID before an embedding arrived (external-embedding mode),
-                # try to reconcile the first embedding against ghosts/gallery and optionally remap to the
-                # matched stable_id. This keeps cross-camera matching viable even when the first frame(s)
-                # lacked tensor meta.
-                if rec.get("emb") is None:
-                    try:
-                        current_sid = int(rec.get("stable_id"))
-                    except Exception:
-                        current_sid = int(rec["stable_id"])
+                # Reconcile weak/provisional IDs when fresh embeddings arrive.
+                # Besides the "no embedding yet" path, allow a short early-reconcile
+                # window for low-support IDs to reduce needless ID fragmentation.
+                rec_emb_missing = rec.get("emb") is None
+                try:
+                    current_sid = int(rec.get("stable_id"))
+                except Exception:
+                    current_sid = int(rec["stable_id"])
+                sid_support = int(len(self.gallery.get(int(current_sid), [])))
+                try:
+                    first_seen_ts = float(rec.get("first_seen_ts", rec.get("last_seen_ts", ts)))
+                except Exception:
+                    first_seen_ts = float(ts)
+                track_age_s = max(0.0, float(ts) - float(first_seen_ts))
+                try:
+                    early_attempts = int(rec.get("early_emb_reconcile_attempts", 0) or 0)
+                except Exception:
+                    early_attempts = 0
+                allow_early_reconcile = (
+                    (not rec_emb_missing)
+                    and sid_support <= 2
+                    and track_age_s <= 2.5
+                    and early_attempts < 2
+                )
+                if rec_emb_missing or allow_early_reconcile:
+                    if allow_early_reconcile:
+                        rec["early_emb_reconcile_attempts"] = int(early_attempts) + 1
                     candidate_sid = None
                     try:
                         candidate_sid = self._match_ghost(
@@ -1999,6 +2829,7 @@ class StableIDManager:
                             bbox_ltrbwh,
                             ts,
                             pose_vec=pose_vec if pose_valid else None,
+                            exclude_key=key,
                         )
                     except Exception:
                         candidate_sid = None
@@ -2016,18 +2847,37 @@ class StableIDManager:
                             )
                         except Exception:
                             g_id, g_reid, g_req = None, -1.0, self.cos_sim_high_threshold
+                        if g_id is not None:
+                            diag_sid_candidate = int(g_id)
                         if g_id is not None and float(g_reid) >= float(g_req):
-                            can_take = True
-                            if self.active_id_guard_strict:
-                                active_pairs = self.active_zones.get(int(g_id), set())
-                                active_here = any(int(sid_sensor) == int(sensor_id) for (sid_sensor, _zone) in active_pairs)
-                                if active_here and (float(g_reid) < (float(g_req) + self.active_id_guard_margin)):
-                                    can_take = False
+                            can_take = self._allow_active_sid_match(
+                                sensor_id=int(sensor_id),
+                                sid=int(g_id),
+                                score=float(g_reid),
+                                required=float(g_req),
+                                bbox=bbox_ltrbwh,
+                                ts=float(ts),
+                                exclude_key=key,
+                            )
+                            if not can_take:
+                                self._sid_guard_reject_count += 1
+                                if self._sid_claimed_same_frame(
+                                    sensor_id=int(sensor_id),
+                                    sid=int(g_id),
+                                    ts=float(ts),
+                                    exclude_key=key,
+                                ):
+                                    diag_reject_reason = "same_frame_sid_conflict"
+                                else:
+                                    diag_reject_reason = "active_guard"
                             if can_take and (self.allow_multi_zone_active or not self.active_zones.get(g_id)):
                                 candidate_sid = int(g_id)
+                        elif g_id is not None:
+                            diag_reject_reason = "threshold"
                     if candidate_sid is not None and self.aliases_enabled:
                         candidate_sid = self.canonical_sid(int(candidate_sid))
                     if candidate_sid is not None and int(candidate_sid) > 0 and int(candidate_sid) != int(current_sid):
+                        diag_event = "remap_on_first_emb" if rec_emb_missing else "remap_on_early_emb"
                         old_sid = int(current_sid)
                         new_sid = int(candidate_sid)
                         try:
@@ -2056,9 +2906,11 @@ class StableIDManager:
                         ):
                             self._purge_sid_state(old_sid)
                             self._free_sid(old_sid)
+                        self._sid_remap_count += 1
 
                 rec["emb"] = emb
                 rec["last_emb_ts"] = float(ts)
+                rec["identity_quality"] = "strong"
                 sid_int = int(rec["stable_id"]) 
                 self.gallery[sid_int].append((float(ts), emb))
                 if sid_int not in self.sid_global_first_seen:
@@ -2093,6 +2945,7 @@ class StableIDManager:
                             bbox_ltrbwh,
                             ts,
                             pose_vec=pose_vec,
+                            exclude_key=key,
                         )
                     except Exception:
                         candidate_sid = None
@@ -2103,18 +2956,37 @@ class StableIDManager:
                             g_id, g_pose, g_req = None, -1.0, self.pose_only_threshold
                         if g_id is not None and self.aliases_enabled:
                             g_id = self.canonical_sid(int(g_id))
+                        if g_id is not None:
+                            diag_sid_candidate = int(g_id)
                         if g_id is not None and float(g_pose) >= float(g_req):
-                            can_take = True
-                            if self.active_id_guard_strict:
-                                active_pairs = self.active_zones.get(int(g_id), set())
-                                active_here = any(int(sid_sensor) == int(sensor_id) for (sid_sensor, _zone) in active_pairs)
-                                if active_here and (float(g_pose) < (float(g_req) + self.active_id_guard_margin)):
-                                    can_take = False
+                            can_take = self._allow_active_sid_match(
+                                sensor_id=int(sensor_id),
+                                sid=int(g_id),
+                                score=float(g_pose),
+                                required=float(g_req),
+                                bbox=bbox_ltrbwh,
+                                ts=float(ts),
+                                exclude_key=key,
+                            )
+                            if not can_take:
+                                self._sid_guard_reject_count += 1
+                                if self._sid_claimed_same_frame(
+                                    sensor_id=int(sensor_id),
+                                    sid=int(g_id),
+                                    ts=float(ts),
+                                    exclude_key=key,
+                                ):
+                                    diag_reject_reason = "same_frame_sid_conflict"
+                                else:
+                                    diag_reject_reason = "active_guard"
                             if can_take and (self.allow_multi_zone_active or not self.active_zones.get(g_id)):
                                 candidate_sid = int(g_id)
+                        elif g_id is not None:
+                            diag_reject_reason = "threshold"
                     if candidate_sid is not None and self.aliases_enabled:
                         candidate_sid = self.canonical_sid(int(candidate_sid))
                     if candidate_sid is not None and int(candidate_sid) > 0 and int(candidate_sid) != int(current_sid):
+                        diag_event = "remap_on_first_pose"
                         old_sid = int(current_sid)
                         new_sid = int(candidate_sid)
                         try:
@@ -2142,10 +3014,25 @@ class StableIDManager:
                         ):
                             self._purge_sid_state(old_sid)
                             self._free_sid(old_sid)
+                        self._sid_remap_count += 1
                 rec["pose_vec"] = pose_vec
                 rec["last_pose_ts"] = float(ts)
+                if rec.get("identity_quality") in (None, "", "weak_no_embedding"):
+                    rec["identity_quality"] = "pose_only"
                 sid_int = int(rec["stable_id"])
                 self._update_pose_state(sid_int, pose_vec, float(ts))
+            diag_payload = self._set_track_diag(
+                key,
+                event=diag_event,
+                reject_reason=diag_reject_reason,
+                embedding_present=emb is not None or rec.get("emb") is not None,
+                pose_present=(pose_valid and pose_vec is not None) or rec.get("pose_vec") is not None,
+                sid_candidate=diag_sid_candidate,
+                stable_id=int(rec.get("stable_id")),
+                ts=float(ts),
+            )
+            self._record_id_event(diag_event)
+            rec["id_diag"] = diag_payload
             self.active_tracks[key] = rec
             try:
                 self.sid_global_last_seen[int(rec["stable_id"])] = float(ts)
@@ -2209,9 +3096,7 @@ class StableIDManager:
                     if int(k[0]) == int(sensor_id) and int(k[1]) not in present_set
                 ]
                 for k in pending_keys:
-                    self._pending_new_counts.pop(k, None)
-                    self._pending_new_ts.pop(k, None)
-                    self._pending_new_sids.pop(k, None)
+                    self._clear_pending_new_state(k)
             except Exception:
                 pass
             to_remove: List[Tuple[int, int]] = []
@@ -2223,6 +3108,7 @@ class StableIDManager:
 
             for key in to_remove:
                 rec = self.active_tracks.pop(key, None)
+                self._pending_id_diag.pop(key, None)
                 if rec is None:
                     continue
                 sid = int(rec["stable_id"])
@@ -2284,8 +3170,7 @@ class StableIDManager:
                 cutoff = t - max(2.0, float(self.active_evict_grace_s))
                 for key, last_ts in list(self._pending_new_ts.items()):
                     if float(last_ts) < cutoff:
-                        self._pending_new_ts.pop(key, None)
-                        self._pending_new_counts.pop(key, None)
+                        self._clear_pending_new_state(key)
             except Exception:
                 pass
             try:
@@ -2340,6 +3225,37 @@ class StableIDManager:
                     "free_sid_pool_size": free_pool_size,
                     "next_sid": int(self.next_stable_id),
                     "pending_new_count": int(pending_new),
+                    "canonical_gallery_size": int(self._count_canonical_sids()),
+                    "auto_merge_enabled": bool(self.auto_merge_enabled),
+                    "auto_merge_interval_s": float(self.auto_merge_interval_s),
+                    "auto_merge_allow_both_active": bool(self.auto_merge_allow_both_active),
+                    "auto_merge_both_active_min_sim": float(self.auto_merge_both_active_min_sim),
+                    "auto_merge_runs": int(self._auto_merge_runs),
+                    "auto_merge_triggers": int(self._auto_merge_triggers),
+                    "auto_merge_applied": int(self._auto_merge_applied),
+                    "auto_merge_suppressed": int(self._auto_merge_suppressed),
+                    "auto_merge_last_candidate_count": int(self._auto_merge_last_candidate_count),
+                    "auto_merge_last_blocked_count": int(self._auto_merge_last_blocked_count),
+                    "auto_merge_last_support_gate": int(self._auto_merge_last_support_gate),
+                    "auto_merge_zero_apply_streak": int(self._auto_merge_zero_apply_streak),
+                    "auto_merge_last_ts": float(self._last_auto_merge_ts) if self._last_auto_merge_ts is not None else None,
+                    "auto_merge_last_reason": str(self._auto_merge_last_reason),
+                    "auto_merge_last_pressure_recycled": int(self._auto_merge_last_pressure_recycled),
+                    "auto_merge_pressure_recycled_total": int(self._auto_merge_pressure_recycled_total),
+                    "sid_new_alloc_count": int(self._sid_new_alloc_count),
+                    "sid_remap_count": int(self._sid_remap_count),
+                    "sid_guard_reject_count": int(self._sid_guard_reject_count),
+                    "sid_no_embedding_count": int(self._sid_no_embedding_count),
+                    "sid_fragmentation_events": int(self._sid_fragmentation_events),
+                    "sid_pending_recycled_count": int(self._sid_pending_recycled_count),
+                    "sid_same_frame_conflict_count": int(self._sid_same_frame_conflict_count),
+                    "sid_event_counts": dict(self._id_event_counts),
+                    "alias_candidate_pool_size": int(self._alias_candidate_pool_size),
+                    "alias_candidate_sim_p50": self._alias_candidate_sim_p50,
+                    "alias_candidate_sim_p95": self._alias_candidate_sim_p95,
+                    "alias_support_ids_ge_1": int(self._alias_support_ids_ge_1),
+                    "alias_support_ids_ge_2": int(self._alias_support_ids_ge_2),
+                    "alias_support_ids_ge_3": int(self._alias_support_ids_ge_3),
                 }
             except Exception:
                 return {}
@@ -2353,6 +3269,7 @@ class StableIDManager:
         ts: float,
         *,
         pose_vec: Optional[np.ndarray] = None,
+        exclude_key: Optional[Tuple[int, int]] = None,
     ) -> Optional[int]:
         dq = self.ghosts.get(int(sensor_id))
         if not dq:
@@ -2367,6 +3284,13 @@ class StableIDManager:
             g_sid = int(ghost.get("stable_id"))
             if self.aliases_enabled:
                 g_sid = self.canonical_sid(g_sid)
+            if self._sid_claimed_same_frame(
+                sensor_id=int(sensor_id),
+                sid=int(g_sid),
+                ts=float(ts),
+                exclude_key=exclude_key,
+            ):
+                continue
             # Exclusivity only if multi-active not allowed
             if not self.allow_multi_zone_active and self.active_zones.get(g_sid):
                 continue

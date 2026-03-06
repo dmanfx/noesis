@@ -1,7 +1,10 @@
 import json
 import math
 import os
+import hashlib
 from typing import Dict, Any, Optional, Tuple
+
+import numpy as np
 
 
 def _read_json(path: str) -> Optional[Dict[str, Any]]:
@@ -60,6 +63,69 @@ def load_alignment(path: str) -> Dict[str, Any]:
     return out
 
 
+def _normalize_pose_v1(raw_pose: Any) -> Optional[Dict[str, Any]]:
+    if not isinstance(raw_pose, dict):
+        return None
+    position = raw_pose.get('position')
+    ypr = raw_pose.get('yaw_pitch_roll_deg')
+    rotation_order = str(raw_pose.get('rotation_order') or '').strip().upper()
+    frame = str(raw_pose.get('frame') or '').strip()
+    if not (isinstance(position, list) and len(position) == 3):
+        return None
+    if not (isinstance(ypr, list) and len(ypr) == 3):
+        return None
+    try:
+        position_f = [float(position[0]), float(position[1]), float(position[2])]
+        ypr_f = [float(ypr[0]), float(ypr[1]), float(ypr[2])]
+    except Exception:
+        return None
+    if not all(math.isfinite(v) for v in position_f + ypr_f):
+        return None
+    if rotation_order != 'YXZ':
+        return None
+    if frame != 'menon_scene':
+        return None
+    out = {
+        'position': position_f,
+        'yaw_pitch_roll_deg': ypr_f,
+        'rotation_order': 'YXZ',
+        'frame': 'menon_scene',
+    }
+    source = raw_pose.get('source')
+    if isinstance(source, str) and source.strip():
+        out['source'] = source.strip()
+    return out
+
+
+def pose_to_E_col_major(pose: Dict[str, Any]) -> Optional[list]:
+    norm = _normalize_pose_v1(pose)
+    if not norm:
+        return None
+    try:
+        yaw_deg, pitch_deg, roll_deg = norm['yaw_pitch_roll_deg']
+        yaw = math.radians(float(yaw_deg))
+        pitch = math.radians(float(pitch_deg))
+        roll = math.radians(float(roll_deg))
+
+        cy = math.cos(yaw); sy = math.sin(yaw)
+        cx = math.cos(pitch); sx = math.sin(pitch)
+        cz = math.cos(roll); sz = math.sin(roll)
+
+        # Fixed Euler order: YXZ
+        Ry = np.array([[cy, 0.0, sy], [0.0, 1.0, 0.0], [-sy, 0.0, cy]], dtype=np.float64)
+        Rx = np.array([[1.0, 0.0, 0.0], [0.0, cx, -sx], [0.0, sx, cx]], dtype=np.float64)
+        Rz = np.array([[cz, -sz, 0.0], [sz, cz, 0.0], [0.0, 0.0, 1.0]], dtype=np.float64)
+        R_wc = Ry @ Rx @ Rz
+
+        Twc = np.eye(4, dtype=np.float64)
+        Twc[:3, :3] = R_wc
+        Twc[:3, 3] = np.array(norm['position'], dtype=np.float64)
+        E = np.linalg.inv(Twc)
+        return [float(x) for x in E.flatten(order='F')]
+    except Exception:
+        return None
+
+
 def load_extrinsics(path: str) -> Dict[str, Any]:
     """Load camera_calibration.json containing per-camera extrinsics and optional align info.
 
@@ -81,20 +147,36 @@ def load_extrinsics(path: str) -> Dict[str, Any]:
         for cam_id, entry in cams.items():
             if not isinstance(entry, dict):
                 continue
-            E = entry.get('E')
-            if isinstance(E, list) and len(E) == 16:
-                out['cameras'][cam_id] = {'E': [float(x) for x in E]}
+            out_entry: Dict[str, Any] = {}
+            pose = _normalize_pose_v1(entry.get('pose'))
+            if pose is not None:
+                out_entry['pose'] = pose
+                E_from_pose = pose_to_E_col_major(pose)
+                if isinstance(E_from_pose, list) and len(E_from_pose) == 16:
+                    out_entry['E'] = [float(x) for x in E_from_pose]
+            if 'E' not in out_entry:
+                E = entry.get('E')
+                if isinstance(E, list) and len(E) == 16:
+                    out_entry['E'] = [float(x) for x in E]
+            if out_entry:
+                out['cameras'][cam_id] = out_entry
     return out
 
 
-def save_extrinsics(path: str, camera_id: str, E_col_major_16: list) -> bool:
+def save_extrinsics(path: str, camera_id: str, E_col_major_16: list, pose: Optional[Dict[str, Any]] = None) -> bool:
     """Persist/update extrinsics for a camera in camera_calibration.json."""
     try:
         os.makedirs(os.path.dirname(path), exist_ok=True)
         current = _read_json(path) or {}
         if 'cameras' not in current or not isinstance(current['cameras'], dict):
             current['cameras'] = {}
-        current['cameras'][camera_id] = {'E': [float(x) for x in list(E_col_major_16)]}
+        existing = current['cameras'].get(camera_id)
+        camera_entry = dict(existing) if isinstance(existing, dict) else {}
+        camera_entry['E'] = [float(x) for x in list(E_col_major_16)]
+        pose_norm = _normalize_pose_v1(pose) if isinstance(pose, dict) else None
+        if pose_norm is not None:
+            camera_entry['pose'] = pose_norm
+        current['cameras'][camera_id] = camera_entry
         with open(path, 'w') as f:
             json.dump(current, f, indent=2)
         return True
@@ -190,6 +272,7 @@ def assemble_calibration_bundle(
     """Assemble a runtime calibration bundle to broadcast to clients."""
     k_table: Dict[str, list] = {}
     e_table: Dict[str, list] = {}
+    pose_table: Dict[str, Dict[str, Any]] = {}
     for cam_id in camera_ids:
         # Prefer canonical intrinsics.json models, using CAMERA_INTRINSICS_MODEL_MAP,
         # and fall back to CAMERA_SPECS FOV-only derivation when needed.
@@ -206,6 +289,10 @@ def assemble_calibration_bundle(
         E = ext_entry.get('E') if isinstance(ext_entry, dict) else None
         if isinstance(E, list) and len(E) == 16:
             e_table[cam_id] = [float(x) for x in E]
+        pose = ext_entry.get('pose') if isinstance(ext_entry, dict) else None
+        pose_norm = _normalize_pose_v1(pose)
+        if pose_norm is not None:
+            pose_table[cam_id] = pose_norm
 
     align_dict = align_data if isinstance(align_data, dict) else {}
     matrix_vals = align_dict.get('matrix') if isinstance(align_dict, dict) else None
@@ -234,6 +321,7 @@ def assemble_calibration_bundle(
         'cameras': {
             'K': k_table,
             'E': e_table,
+            'pose': pose_table,
             'pose_confidence': {},
         },
         'meta': {
@@ -244,7 +332,29 @@ def assemble_calibration_bundle(
     bundle['metric_scale'] = 1.0
     if isinstance(camera_specs, dict) and camera_specs:
         bundle['meta']['camera_specs'] = camera_specs
+    # Stable contract metadata so downstream clients can detect stale calibration state.
+    meta = bundle.setdefault('meta', {})
+    meta['coord_space'] = 'scene_obj'
+    meta['units'] = 'obj_units'
+    meta['world_frame'] = 'menon_scene'
+    meta['track_id_strategy'] = 'camera_tracker_fallback'
+    meta['calibration_version'] = _calibration_version_for_bundle(bundle)
     return bundle
+
+
+def _calibration_version_for_bundle(bundle: Dict[str, Any]) -> str:
+    """Build a deterministic short version token from calibration-defining fields."""
+    try:
+        payload = {
+            'align': bundle.get('align') if isinstance(bundle, dict) else None,
+            'K': ((bundle.get('cameras') or {}).get('K') if isinstance(bundle, dict) else None),
+            'E': ((bundle.get('cameras') or {}).get('E') if isinstance(bundle, dict) else None),
+            'pose': ((bundle.get('cameras') or {}).get('pose') if isinstance(bundle, dict) else None),
+        }
+        blob = json.dumps(payload, sort_keys=True, separators=(',', ':'), ensure_ascii=True).encode('utf-8')
+        return hashlib.sha1(blob).hexdigest()[:16]
+    except Exception:
+        return 'unknown'
 
 
 def save_alignment(path: str, align_data: Dict[str, Any]) -> bool:

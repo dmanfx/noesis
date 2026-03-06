@@ -35,7 +35,7 @@ class BevConfig:
     overlay: bool = True
     max_px: int = 768
     auto_fit_extents: bool = True
-    max_distance_m: float = 20.0
+    max_distance_m: float = 0.0
 
 
 @dataclass
@@ -44,6 +44,9 @@ class Footpoint:
     v: float
     method: str = "bbox"
     stable_id: Optional[int] = None
+    tracker_id: Optional[int] = None
+    world_x: Optional[float] = None
+    world_z: Optional[float] = None
 
 
 @dataclass(frozen=True)
@@ -145,11 +148,12 @@ class _BevTrailTrackState:
 class BevResult:
     camera_id: str
     bev_bgr: Optional[np.ndarray]
-    bev_points: List[Dict[str, float]]
+    bev_points: List[Dict[str, Any]]
     config: BevConfig
     timestamp_us: int
     width_px: int
     height_px: int
+    points_smoothed: bool = False
 
 
 class HomographyCache:
@@ -166,6 +170,13 @@ class HomographyCache:
         flip_u: bool = False,
         flip_v: bool = False,
     ) -> str:
+        scene_per_m = 1.0
+        try:
+            s_obj_to_m = float(getattr(calib, "unit_scale", 1.0) or 1.0)
+            if math.isfinite(s_obj_to_m) and s_obj_to_m > 1e-6:
+                scene_per_m = 1.0 / s_obj_to_m
+        except Exception:
+            scene_per_m = 1.0
         return "::".join(
             [
                 calib.camera_id,
@@ -173,7 +184,7 @@ class HomographyCache:
                 f"K={self._hash_matrix(calib.intrinsics)}",
                 f"E={hash(tuple(float(x) for x in calib.extrinsics_col_major))}",
                 f"floor={calib.floor_y:.4f}",
-                f"s={float(getattr(calib, 'unit_scale', 1.0)):.6f}",
+                f"scene_per_m={float(scene_per_m):.6f}",
                 f"flip_u={int(bool(flip_u))}",
                 f"flip_v={int(bool(flip_v))}",
             ]
@@ -190,14 +201,22 @@ class HomographyCache:
         cached = self._cache.get(key)
         if cached is not None:
             return cached
-        
+
+        scene_per_m = 1.0
+        try:
+            s_obj_to_m = float(getattr(calib, "unit_scale", 1.0) or 1.0)
+            if math.isfinite(s_obj_to_m) and s_obj_to_m > 1e-6:
+                scene_per_m = 1.0 / s_obj_to_m
+        except Exception:
+            scene_per_m = 1.0
+
         from geometry.homography import img_to_plane_homography
         H = img_to_plane_homography(
             calib.intrinsics,
             calib.extrinsics_col_major,
             calib.floor_y,
             calib.image_size,
-            float(getattr(calib, "unit_scale", 1.0) or 1.0),
+            scene_per_m,
             flip_u=flip_u,
             flip_v=flip_v,
         )
@@ -211,7 +230,7 @@ class BevRenderer:
         ws_server,
         trails_cfg: Optional[Dict[str, Any]] = None,
         smoothing_cfg: Optional[Dict[str, Any]] = None,
-        frame: str = "camera_local",
+        frame: str = "menon_scene",
         *,
         jpeg_enabled: bool = False,
         jpeg_quality: int = 70,
@@ -249,13 +268,24 @@ class BevRenderer:
     @staticmethod
     def _normalize_frame_mode(value: Any) -> str:
         text = str(value or "").strip().lower()
-        if text in ("world", "global", "world_frame"):
+        if text in ("world", "global", "world_frame", "menon_scene"):
             return "world"
         if text in ("camera", "camera_local", "local", "cam"):
             return "camera_local"
         if not text:
-            return "camera_local"
+            return "world"
         return "camera_local"
+
+    def _resolve_max_distance_scene(self, cfg: BevConfig, calib: CalibrationSnapshot) -> float:
+        """Resolve distance guardrail in scene units for the current calibration contract."""
+        limit = float(cfg.max_distance_m or 0.0)
+        if not math.isfinite(limit) or limit <= 0.0:
+            return 0.0
+        scale = float(getattr(calib, "unit_scale", 1.0) or 1.0)
+        # Keep cfg in meters and convert once to scene units for this world path.
+        if math.isfinite(scale) and scale > 1e-6 and abs(scale - 1.0) > 1e-6:
+            return float(limit / scale)
+        return limit
 
     @staticmethod
     def _apply_image_flip(
@@ -418,9 +448,15 @@ class BevRenderer:
             return (-4.0, 4.0), (0.0, 12.0)
 
         R_wc, C_world = parse_extrinsics(calib.extrinsics_col_major)
-        scale = float(calib.unit_scale or 1.0)
-        C_world = C_world * scale
-        plane = Plane.horizontal(float(calib.floor_y) * scale)
+        scene_per_m = 1.0
+        try:
+            s_obj_to_m = float(calib.unit_scale or 1.0)
+            if math.isfinite(s_obj_to_m) and s_obj_to_m > 1e-6:
+                scene_per_m = 1.0 / s_obj_to_m
+        except Exception:
+            scene_per_m = 1.0
+        C_world = C_world * scene_per_m
+        plane = Plane.horizontal(float(calib.floor_y))
 
         xs = np.linspace(0, max(0.0, float(width - 1)), 8)
         ys = np.linspace(0, max(0.0, float(height - 1)), 8)
@@ -435,8 +471,9 @@ class BevRenderer:
                 dx = float(hit[0] - C_world[0])
                 dz = float(hit[2] - C_world[2])
                 dist = math.hypot(dx, dz)
-                if dist > cfg.max_distance_m and dist > 1e-6:
-                    scale_d = cfg.max_distance_m / dist
+                max_distance_scene = float(self._resolve_max_distance_scene(cfg, calib))
+                if max_distance_scene > 0.0 and dist > max_distance_scene and dist > 1e-6:
+                    scale_d = max_distance_scene / dist
                     dx *= scale_d
                     dz *= scale_d
                 wx = float(C_world[0] + dx)
@@ -478,9 +515,15 @@ class BevRenderer:
             return (-4.0, 4.0), (0.0, 12.0)
 
         R_wc, C_world = parse_extrinsics(calib.extrinsics_col_major)
-        scale = float(calib.unit_scale or 1.0)
-        C_world = C_world * scale
-        plane = Plane.horizontal(float(calib.floor_y) * scale)
+        scene_per_m = 1.0
+        try:
+            s_obj_to_m = float(calib.unit_scale or 1.0)
+            if math.isfinite(s_obj_to_m) and s_obj_to_m > 1e-6:
+                scene_per_m = 1.0 / s_obj_to_m
+        except Exception:
+            scene_per_m = 1.0
+        C_world = C_world * scene_per_m
+        plane = Plane.horizontal(float(calib.floor_y))
 
         # Align samples with camera forward axis for local coordinates
         dir_world = R_wc @ np.array([0.0, 0.0, 1.0])
@@ -501,8 +544,9 @@ class BevRenderer:
                 dx = float(hit[0] - C_world[0])
                 dz = float(hit[2] - C_world[2])
                 dist = math.hypot(dx, dz)
-                if dist > cfg.max_distance_m and dist > 1e-6:
-                    scale_d = cfg.max_distance_m / dist
+                max_distance_scene = float(self._resolve_max_distance_scene(cfg, calib))
+                if max_distance_scene > 0.0 and dist > max_distance_scene and dist > 1e-6:
+                    scale_d = max_distance_scene / dist
                     dx *= scale_d
                     dz *= scale_d
                 lx = dx * cos_yaw - dz * sin_yaw
@@ -560,7 +604,12 @@ class BevRenderer:
             overlay=bool(cfg.get("overlay", current.overlay)),
             max_px=current.max_px,
             auto_fit_extents=bool(cfg.get("autoFitExtents", current.auto_fit_extents)),
-            max_distance_m=float(cfg.get("maxDistanceM", current.max_distance_m)),
+            max_distance_m=float(
+                cfg.get(
+                    "maxDistanceM",
+                    cfg.get("maxDistanceScene", cfg.get("maxDistance", current.max_distance_m)),
+                )
+            ),
         )
         self.config_per_cam[camera_id] = next_cfg
         return next_cfg
@@ -674,13 +723,19 @@ class BevRenderer:
                 return
             H_img2plane = cached_result
 
-        bev_points: List[Dict[str, float]] = []
-        raw_points: List[Tuple[int, float, float, str]] = []
+        bev_points: List[Dict[str, Any]] = []
+        raw_points: List[Tuple[int, float, float, str, Optional[int], Optional[int]]] = []
         current_by_sid: Dict[int, Tuple[float, float]] = {}
 
         R_wc, C_world = parse_extrinsics(calib.extrinsics_col_major)
-        scale = float(calib.unit_scale or 1.0)
-        C_world = C_world * scale
+        scene_per_m = 1.0
+        try:
+            s_obj_to_m = float(calib.unit_scale or 1.0)
+            if math.isfinite(s_obj_to_m) and s_obj_to_m > 1e-6:
+                scene_per_m = 1.0 / s_obj_to_m
+        except Exception:
+            scene_per_m = 1.0
+        C_world = C_world * scene_per_m
 
         cos_yaw = sin_yaw = None
         if not use_world_frame:
@@ -689,16 +744,34 @@ class BevRenderer:
             cos_yaw = math.cos(-yaw)
             sin_yaw = math.sin(-yaw)
 
-        max_distance_m = float(cfg.max_distance_m or 0.0)
+        max_distance_m = float(self._resolve_max_distance_scene(cfg, calib))
+        apply_backend_smoothing = bool(self._smoother.enabled) and (not use_world_frame)
 
         for fp in footpoints:
-            vec = np.array([fp.u, fp.v, 1.0], dtype=np.float64)
-            # H maps [u, v, 1] -> [x_meters, z_meters, w] (World Coordinates)
-            world_pt = H_img2plane @ vec
-            w = world_pt[2] if world_pt[2] else 1.0
-            wx = float(world_pt[0] / w)
-            wz = float(world_pt[1] / w)
-            
+            wx = wz = None
+            if fp.world_x is not None and fp.world_z is not None:
+                try:
+                    wx_c = float(fp.world_x)
+                    wz_c = float(fp.world_z)
+                    if math.isfinite(wx_c) and math.isfinite(wz_c):
+                        wx = wx_c
+                        wz = wz_c
+                except Exception:
+                    wx = wz = None
+
+            # In world mode, use producer-owned track world coordinates only.
+            # Do not reintroduce a homography fallback path here.
+            if use_world_frame and (wx is None or wz is None):
+                continue
+
+            if wx is None or wz is None:
+                vec = np.array([fp.u, fp.v, 1.0], dtype=np.float64)
+                # H maps [u, v, 1] -> [x,z,w] in world coordinates.
+                world_pt = H_img2plane @ vec
+                w = world_pt[2] if world_pt[2] else 1.0
+                wx = float(world_pt[0] / w)
+                wz = float(world_pt[1] / w)
+
             if not math.isfinite(wx) or not math.isfinite(wz):
                 continue
 
@@ -724,21 +797,39 @@ class BevRenderer:
                 stable_id = int(fp.stable_id) if fp.stable_id is not None else None
             except Exception:
                 stable_id = None
-            if stable_id is None or stable_id <= 0:
+            if stable_id is not None and stable_id <= 0:
+                stable_id = None
+            try:
+                tracker_id = int(fp.tracker_id) if fp.tracker_id is not None else None
+            except Exception:
+                tracker_id = None
+            if tracker_id is not None and tracker_id < 0:
+                tracker_id = None
+
+            key_id: Optional[int] = stable_id if stable_id is not None else tracker_id
+            if key_id is None:
                 continue
 
-            raw_points.append((int(stable_id), float(px), float(pz), str(fp.method)))
+            raw_points.append((int(key_id), float(px), float(pz), str(fp.method), stable_id, tracker_id))
 
         with self._lock:
-            if self._smoother.enabled:
+            if apply_backend_smoothing:
                 self._smoother.prune(now_s)
-            for stable_id, lx, lz, method in raw_points:
-                if self._smoother.enabled:
-                    lx, lz = self._smoother.update((camera_id, int(stable_id)), now_s, lx, lz)
+            for key_id, lx, lz, method, stable_id, tracker_id in raw_points:
+                if apply_backend_smoothing:
+                    lx, lz = self._smoother.update((camera_id, int(key_id)), now_s, lx, lz)
                 # The frontend expects 'x' and 'y' in the JSON list.
                 # We map X -> JSON x, Z -> JSON y (frame depends on configured mode).
-                bev_points.append({'x': float(lx), 'y': float(lz), 'method': method, 'stableId': int(stable_id)})
-                current_by_sid[int(stable_id)] = (float(lx), float(lz))
+                bev_points.append(
+                    {
+                        'x': float(lx),
+                        'y': float(lz),
+                        'method': method,
+                        'stableId': int(stable_id) if stable_id is not None else None,
+                        'trackerId': int(tracker_id) if tracker_id is not None else None,
+                    }
+                )
+                current_by_sid[int(key_id)] = (float(lx), float(lz))
 
         # Update config to reflect the actual extents used
         result_config = BevConfig(
@@ -893,6 +984,7 @@ class BevRenderer:
             timestamp_us=timestamp_us,
             width_px=width_px,
             height_px=height_px,
+            points_smoothed=bool(apply_backend_smoothing),
         )
         self._publish(result, calib, H_img2plane, flip_u=flip_u, flip_v=flip_v)
 
@@ -917,16 +1009,22 @@ class BevRenderer:
         flip_v: bool = False,
     ) -> None:
         try:
-            # Compute a quick sanity sample: image bottom-center ray intersection in meters (XZ)
+            # Compute a quick sanity sample: image bottom-center ray intersection in scene units (XZ)
             sample_xz: Optional[Tuple[float, float]] = None
             try:
                 width_src, height_src = calib.image_size
                 u = float(max(0.0, width_src * 0.5))
                 v = float(max(0.0, height_src - 1))
                 R_wc, C_world = parse_extrinsics(calib.extrinsics_col_major)
-                scale = float(calib.unit_scale or 1.0)
-                C_world = C_world * scale
-                plane = Plane.horizontal(float(calib.floor_y) * scale)
+                scene_per_m = 1.0
+                try:
+                    s_obj_to_m = float(calib.unit_scale or 1.0)
+                    if math.isfinite(s_obj_to_m) and s_obj_to_m > 1e-6:
+                        scene_per_m = 1.0 / s_obj_to_m
+                except Exception:
+                    scene_per_m = 1.0
+                C_world = C_world * scene_per_m
+                plane = Plane.horizontal(float(calib.floor_y))
                 u_ray, v_ray = self._apply_image_flip(u, v, width_src, height_src, flip_u, flip_v)
                 origin, direction = ray_from_pixel(u_ray, v_ray, calib.intrinsics, R_wc, C_world)
                 hit = intersect_plane(origin, direction, plane)
@@ -950,6 +1048,12 @@ class BevRenderer:
                 # Optional: flattened 3x3 homography for client-side debug/overlays
                 "H": [float(x) for x in H_to_use.reshape(-1)],
                 "sampleXZ": list(sample_xz) if sample_xz is not None else None,
+                "world_frame": "menon_scene" if self._frame_mode == "world" else "camera_local",
+                "frame_mode": self._frame_mode,
+                "units": "scene",
+                "s_obj_to_m": float(getattr(calib, "unit_scale", 1.0) or 1.0),
+                "trail_smoothing_owner": "frontend" if self._frame_mode == "world" else ("backend" if bool(result.points_smoothed) else "none"),
+                "bev_world_points_smoothed": bool(result.points_smoothed) if self._frame_mode == "world" else False,
             }
             if hasattr(self.ws, "broadcast_sync"):
                 self.ws.broadcast_sync(status)

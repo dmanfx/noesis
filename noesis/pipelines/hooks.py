@@ -18,7 +18,14 @@ import numpy as np
 import yaml
 
 from geometry.depth_source import DepthStorageManager
-from geometry.homography import Plane, parse_extrinsics, ray_from_pixel, intersect_plane
+from geometry.homography import (
+    Plane,
+    estimate_upright_height_from_top_and_foot,
+    intersect_plane,
+    parse_extrinsics,
+    project_world_to_image,
+    ray_from_pixel,
+)
 from noesis.metadata import intrinsics as intrinsics_module
 from noesis.metadata.depth_result import DepthResult
 from noesis.metadata.pose_features import PoseFeatureResult
@@ -367,6 +374,7 @@ def attach_analytics_telemetry_hook(
         diagnostics_logger=diagnostics_logger,
     )
     analytics_component.config["_analytics_processor"] = processor
+    setattr(pipeline, "analytics_telemetry_processor", processor)
 
     # OSD label stamping is handled inside the telemetry hook so per-source IDs remain intact
     # (tiler can collapse source_id in downstream metadata). This keeps mosaic labels aligned
@@ -1394,12 +1402,19 @@ class _MapAnythingJob:
 class TrailOverlayConfig:
     enabled: bool = True
     class_ids: frozenset[int] = field(default_factory=lambda: frozenset({0}))
+    anchor_mode: str = "bbox_bottom"
     window_s: float = 8.0
     draw_stride: int = 2
     min_step_px: float = 2.0
     min_dt_s: float = 0.08
     smooth_tau_s: float = 0.25
     max_speed_px_per_s: float = 600.0
+    gap_predict_ttl_s: float = 1.0
+    gap_predict_decay_tau_s: float = 0.75
+    predicted_alpha_scale: float = 0.65
+    height_peak_up_alpha: float = 0.35
+    height_peak_down_alpha: float = 0.05
+    height_good_frame_ratio: float = 0.90
     # Maximum history length stored per track (points, not segments).
     # Effective history is bounded by BOTH `window_s` and this point cap.
     max_points_per_track: int = 129
@@ -1422,6 +1437,28 @@ class TrailOverlayConfig:
         object.__setattr__(self, "min_dt_s", max(0.0, float(self.min_dt_s)))
         object.__setattr__(self, "smooth_tau_s", max(0.0, float(self.smooth_tau_s)))
         object.__setattr__(self, "max_speed_px_per_s", max(0.0, float(self.max_speed_px_per_s)))
+        object.__setattr__(self, "gap_predict_ttl_s", max(0.0, float(self.gap_predict_ttl_s)))
+        object.__setattr__(self, "gap_predict_decay_tau_s", max(0.0, float(self.gap_predict_decay_tau_s)))
+        object.__setattr__(
+            self,
+            "predicted_alpha_scale",
+            float(min(1.0, max(0.0, float(self.predicted_alpha_scale)))),
+        )
+        object.__setattr__(
+            self,
+            "height_peak_up_alpha",
+            float(min(1.0, max(0.0, float(self.height_peak_up_alpha)))),
+        )
+        object.__setattr__(
+            self,
+            "height_peak_down_alpha",
+            float(min(1.0, max(0.0, float(self.height_peak_down_alpha)))),
+        )
+        object.__setattr__(
+            self,
+            "height_good_frame_ratio",
+            float(min(1.0, max(0.0, float(self.height_good_frame_ratio)))),
+        )
         object.__setattr__(self, "max_points_per_track", max(2, int(self.max_points_per_track)))
         object.__setattr__(self, "max_segments_per_track", max(1, int(self.max_segments_per_track)))
         object.__setattr__(self, "max_tracks", max(1, int(self.max_tracks)))
@@ -1429,6 +1466,10 @@ class TrailOverlayConfig:
         object.__setattr__(self, "max_display_metas", max(1, int(self.max_display_metas)))
         object.__setattr__(self, "line_width", max(1, int(self.line_width)))
         object.__setattr__(self, "min_alpha", float(min(1.0, max(0.0, float(self.min_alpha)))))
+        anchor_mode = str(self.anchor_mode or "bbox_bottom").strip().lower()
+        if anchor_mode not in ("bbox_bottom", "floor_plane_gravity_drop"):
+            anchor_mode = "bbox_bottom"
+        object.__setattr__(self, "anchor_mode", anchor_mode)
         color_key = str(self.color_key or "stable_id").strip().lower()
         if color_key not in ("stable_id", "track_id"):
             color_key = "stable_id"
@@ -1498,12 +1539,19 @@ class TrailOverlayConfig:
         return cls(
             enabled=_bool(cfg.get("enabled"), True),
             class_ids=frozenset(cls_ids),
+            anchor_mode=str(cfg.get("anchor_mode") or "bbox_bottom"),
             window_s=_float(cfg.get("window_s"), 8.0),
             draw_stride=_int(cfg.get("draw_stride"), 2),
             min_step_px=_float(cfg.get("min_step_px"), 2.0),
             min_dt_s=_float(cfg.get("min_dt_s"), 0.08),
             smooth_tau_s=_float(cfg.get("smooth_tau_s"), 0.25),
             max_speed_px_per_s=_float(cfg.get("max_speed_px_per_s"), 600.0),
+            gap_predict_ttl_s=_float(cfg.get("gap_predict_ttl_s"), 1.0),
+            gap_predict_decay_tau_s=_float(cfg.get("gap_predict_decay_tau_s"), 0.75),
+            predicted_alpha_scale=_float(cfg.get("predicted_alpha_scale"), 0.65),
+            height_peak_up_alpha=_float(cfg.get("height_peak_up_alpha"), 0.35),
+            height_peak_down_alpha=_float(cfg.get("height_peak_down_alpha"), 0.05),
+            height_good_frame_ratio=_float(cfg.get("height_good_frame_ratio"), 0.90),
             max_points_per_track=max_points_value,
             max_segments_per_track=max_segments_value,
             max_tracks=_int(cfg.get("max_tracks"), 8),
@@ -1517,12 +1565,28 @@ class TrailOverlayConfig:
 
 
 @dataclass
+class _TrailPoint:
+    ts: float
+    x: float
+    y: float
+    predicted: bool = False
+
+
+@dataclass
 class _TrailTrackState:
-    points: "deque[Tuple[float, float, float]]" = field(default_factory=deque)
+    points: "deque[_TrailPoint]" = field(default_factory=deque)
     last_seen_ts: float = 0.0
     ema_x: Optional[float] = None
     ema_y: Optional[float] = None
     ema_ts: float = 0.0
+    height_ref_scene: Optional[float] = None
+    height_peak_px: Optional[float] = None
+    last_measure_world_x: Optional[float] = None
+    last_measure_world_z: Optional[float] = None
+    last_measure_ts: float = 0.0
+    vel_world_x: float = 0.0
+    vel_world_z: float = 0.0
+    last_measure_speed: float = 0.0
 
 
 @dataclass
@@ -1632,6 +1696,484 @@ class TrailOverlayProcessor:
                 continue
         return 0
 
+    def _camera_id_for_sensor(self, sensor_id: int) -> str:
+        labels = getattr(self.pipeline, "camera_labels", {}) or {}
+        try:
+            camera_id = labels.get(int(sensor_id))
+        except Exception:
+            camera_id = None
+        return str(camera_id or f"camera_{int(sensor_id)}")
+
+    def _analytics_track_map(self, sensor_id: int) -> Dict[int, Dict[str, Any]]:
+        processor = getattr(self.pipeline, "analytics_telemetry_processor", None)
+        getter = getattr(processor, "get_active_track_map", None)
+        if not callable(getter):
+            return {}
+        try:
+            track_map = getter(int(sensor_id)) or {}
+        except Exception:
+            return {}
+        return dict(track_map) if isinstance(track_map, Mapping) else {}
+
+    def _resolve_calibration(self, sensor_id: int, camera_id: str) -> Any:
+        provider = getattr(self.pipeline, "bev_calibration", None)
+        snapshot = getattr(provider, "snapshot", None)
+        if not callable(snapshot):
+            return None
+        try:
+            return snapshot(int(sensor_id), str(camera_id))
+        except Exception:
+            return None
+
+    def _frame_source_size(self, frame_meta: Any, calib: Any | None = None) -> Tuple[int, int]:
+        try:
+            frame_w = int(_meta_lookup(frame_meta, "source_frame_width", "frame_width", "width", default=0) or 0)
+            frame_h = int(_meta_lookup(frame_meta, "source_frame_height", "frame_height", "height", default=0) or 0)
+        except Exception:
+            frame_w = 0
+            frame_h = 0
+        if (frame_w <= 0 or frame_h <= 0) and calib is not None:
+            try:
+                frame_w, frame_h = calib.image_size
+                frame_w = int(frame_w or 0)
+                frame_h = int(frame_h or 0)
+            except Exception:
+                frame_w = 0
+                frame_h = 0
+        if frame_w <= 0 or frame_h <= 0:
+            try:
+                frame_w, frame_h = getattr(self.pipeline, "frame_size", (0, 0))
+                frame_w = int(frame_w or 0)
+                frame_h = int(frame_h or 0)
+            except Exception:
+                frame_w = 0
+                frame_h = 0
+        return max(0, int(frame_w)), max(0, int(frame_h))
+
+    def _frame_compositor_rect(self, frame_meta: Any) -> Optional[Tuple[float, float, float, float]]:
+        rect = getattr(frame_meta, "compositor_rect", None)
+        if rect is None:
+            return None
+        try:
+            left = float(_meta_lookup(rect, "left", "x", default=0.0) or 0.0)
+            top = float(_meta_lookup(rect, "top", "y", default=0.0) or 0.0)
+            width = float(_meta_lookup(rect, "width", "w", default=0.0) or 0.0)
+            height = float(_meta_lookup(rect, "height", "h", default=0.0) or 0.0)
+        except Exception:
+            return None
+        if width <= 0.0 or height <= 0.0:
+            return None
+        return float(left), float(top), float(width), float(height)
+
+    def _source_to_mosaic(self, frame_meta: Any, u: float, v: float, source_size: Tuple[int, int]) -> Tuple[float, float]:
+        src_w, src_h = source_size
+        comp = self._frame_compositor_rect(frame_meta)
+        if comp is None or src_w <= 0 or src_h <= 0:
+            return float(u), float(v)
+        left, top, width, height = comp
+        x = float(left) + float(u) * (float(width) / float(src_w))
+        y = float(top) + float(v) * (float(height) / float(src_h))
+        return float(x), float(y)
+
+    @staticmethod
+    def _apply_image_flip(
+        u: float,
+        v: float,
+        width: int,
+        height: int,
+        flip_u: bool,
+        flip_v: bool,
+    ) -> Tuple[float, float]:
+        if flip_u:
+            u = float(max(0, int(width) - 1)) - float(u)
+        if flip_v:
+            v = float(max(0, int(height) - 1)) - float(v)
+        return float(u), float(v)
+
+    def _infer_image_flips(self, camera_id: str, calib: Any) -> Tuple[bool, bool]:
+        analytics = getattr(self.pipeline, "analytics_telemetry_processor", None)
+        infer = getattr(analytics, "_infer_image_flips", None)
+        if callable(infer):
+            try:
+                return tuple(bool(x) for x in infer(str(camera_id), calib))
+            except Exception:
+                pass
+
+        flip_u = False
+        flip_v = False
+        try:
+            R_wc, _ = parse_extrinsics(calib.extrinsics_col_major)
+            forward = R_wc @ np.array([0.0, 0.0, 1.0], dtype=np.float64)
+            f_norm = float(np.linalg.norm(forward))
+            if f_norm > 1e-6:
+                forward = forward / f_norm
+            world_up = np.array([0.0, 1.0, 0.0], dtype=np.float64)
+            right_ref = np.cross(world_up, forward)
+            r_norm = float(np.linalg.norm(right_ref))
+            if r_norm <= 1e-6:
+                right_ref = np.array([1.0, 0.0, 0.0], dtype=np.float64)
+            else:
+                right_ref = right_ref / r_norm
+            up_ref = np.cross(forward, right_ref)
+            u_norm = float(np.linalg.norm(up_ref))
+            if u_norm <= 1e-6:
+                up_ref = world_up
+            else:
+                up_ref = up_ref / u_norm
+
+            right = R_wc @ np.array([1.0, 0.0, 0.0], dtype=np.float64)
+            up = R_wc @ np.array([0.0, 1.0, 0.0], dtype=np.float64)
+            flip_u = float(np.dot(right, right_ref)) < 0.0
+            flip_v = float(np.dot(up, up_ref)) > 0.0
+        except Exception:
+            flip_u = False
+            flip_v = False
+        return bool(flip_u), bool(flip_v)
+
+    def _ray_floor_hit(
+        self,
+        calib: Any,
+        u: float,
+        v: float,
+        *,
+        flip_u: bool,
+        flip_v: bool,
+    ) -> Optional[np.ndarray]:
+        try:
+            width_src, height_src = calib.image_size
+            u_ray, v_ray = self._apply_image_flip(u, v, int(width_src), int(height_src), bool(flip_u), bool(flip_v))
+            R_wc, C_world = parse_extrinsics(calib.extrinsics_col_major)
+            scene_per_m = 1.0
+            try:
+                s_obj_to_m = float(calib.unit_scale or 1.0)
+                if math.isfinite(s_obj_to_m) and s_obj_to_m > 1e-6:
+                    scene_per_m = 1.0 / s_obj_to_m
+            except Exception:
+                scene_per_m = 1.0
+            C_world = C_world * scene_per_m
+            plane = Plane.horizontal(float(calib.floor_y))
+            origin, direction = ray_from_pixel(u_ray, v_ray, calib.intrinsics, R_wc, C_world)
+            hit = intersect_plane(origin, direction, plane)
+            if hit is None:
+                return None
+            return np.asarray(hit, dtype=np.float64)
+        except Exception:
+            return None
+
+    def _bbox_bottom_world(
+        self,
+        calib: Any,
+        bbox: Sequence[float],
+        *,
+        flip_u: bool,
+        flip_v: bool,
+    ) -> Optional[np.ndarray]:
+        if len(bbox) < 4:
+            return None
+        try:
+            left, top, width, height = [float(x) for x in bbox[:4]]
+        except Exception:
+            return None
+        if width <= 0.0 or height <= 0.0:
+            return None
+        return self._ray_floor_hit(
+            calib,
+            float(left) + float(width) * 0.5,
+            float(top) + float(height),
+            flip_u=flip_u,
+            flip_v=flip_v,
+        )
+
+    def _update_height_peak(self, state: _TrailTrackState, height_px: float) -> None:
+        height_px = float(max(0.0, height_px))
+        if height_px <= 0.0:
+            return
+        if state.height_peak_px is None:
+            state.height_peak_px = float(height_px)
+            return
+        alpha = float(self.config.height_peak_up_alpha) if height_px >= float(state.height_peak_px) else float(self.config.height_peak_down_alpha)
+        state.height_peak_px = float(state.height_peak_px + alpha * (height_px - float(state.height_peak_px)))
+
+    def _maybe_update_height_reference(
+        self,
+        state: _TrailTrackState,
+        calib: Any,
+        bbox: Sequence[float],
+        foot_world: np.ndarray,
+        *,
+        flip_u: bool,
+        flip_v: bool,
+    ) -> None:
+        if len(bbox) < 4:
+            return
+        try:
+            left, top, width, height = [float(x) for x in bbox[:4]]
+        except Exception:
+            return
+        if width <= 0.0 or height <= 0.0:
+            return
+        self._update_height_peak(state, height)
+        peak = float(state.height_peak_px or 0.0)
+        if peak <= 0.0:
+            return
+        if float(height) < (float(self.config.height_good_frame_ratio) * peak):
+            return
+        u_top = float(left) + float(width) * 0.5
+        v_top = float(top)
+        try:
+            est_height = estimate_upright_height_from_top_and_foot(
+                u_top,
+                v_top,
+                foot_world,
+                calib.intrinsics,
+                calib.extrinsics_col_major,
+                float(calib.floor_y),
+                tuple(int(x) for x in calib.image_size),
+                unit_scale=1.0,
+                flip_u=bool(flip_u),
+                flip_v=bool(flip_v),
+            )
+        except Exception:
+            est_height = None
+        if est_height is None or not math.isfinite(float(est_height)) or float(est_height) <= 0.0:
+            return
+        if state.height_ref_scene is None:
+            state.height_ref_scene = float(est_height)
+            return
+        # Good frames slowly re-lock the detector-height estimate without chasing jitter.
+        state.height_ref_scene = float(state.height_ref_scene + 0.20 * (float(est_height) - float(state.height_ref_scene)))
+
+    def _gravity_drop_world(
+        self,
+        calib: Any,
+        bbox: Sequence[float],
+        height_ref_scene: float,
+        *,
+        flip_u: bool,
+        flip_v: bool,
+    ) -> Optional[np.ndarray]:
+        if len(bbox) < 4:
+            return None
+        try:
+            left, top, width, _height = [float(x) for x in bbox[:4]]
+        except Exception:
+            return None
+        if width <= 0.0 or float(height_ref_scene) <= 0.0:
+            return None
+        try:
+            width_src, height_src = calib.image_size
+            u_top = float(left) + float(width) * 0.5
+            v_top = float(top)
+            u_ray, v_ray = self._apply_image_flip(u_top, v_top, int(width_src), int(height_src), bool(flip_u), bool(flip_v))
+            R_wc, C_world = parse_extrinsics(calib.extrinsics_col_major)
+            scene_per_m = 1.0
+            try:
+                s_obj_to_m = float(calib.unit_scale or 1.0)
+                if math.isfinite(s_obj_to_m) and s_obj_to_m > 1e-6:
+                    scene_per_m = 1.0 / s_obj_to_m
+            except Exception:
+                scene_per_m = 1.0
+            C_world = C_world * scene_per_m
+            origin, direction = ray_from_pixel(u_ray, v_ray, calib.intrinsics, R_wc, C_world)
+            denom = float(direction[1])
+            if abs(denom) < 1e-9:
+                return None
+            plane_y = float(calib.floor_y) + float(height_ref_scene)
+            t = (plane_y - float(origin[1])) / denom
+            if not math.isfinite(t) or t <= 0.0:
+                return None
+            head = origin + (direction * t)
+            return np.array([float(head[0]), float(calib.floor_y), float(head[2])], dtype=np.float64)
+        except Exception:
+            return None
+
+    def _update_world_measurement(self, state: _TrailTrackState, world_x: float, world_z: float, now: float) -> None:
+        prev_ts = float(state.last_measure_ts or 0.0)
+        prev_x = state.last_measure_world_x
+        prev_z = state.last_measure_world_z
+        if prev_x is not None and prev_z is not None and prev_ts > 0.0 and float(now) > prev_ts:
+            dt = float(now) - prev_ts
+            if dt > 1e-6:
+                vx = (float(world_x) - float(prev_x)) / dt
+                vz = (float(world_z) - float(prev_z)) / dt
+                state.vel_world_x = float(vx)
+                state.vel_world_z = float(vz)
+                state.last_measure_speed = float(math.hypot(vx, vz))
+        state.last_measure_world_x = float(world_x)
+        state.last_measure_world_z = float(world_z)
+        state.last_measure_ts = float(now)
+
+    def _predict_gap_anchor(
+        self,
+        sensor_id: int,
+        frame_meta: Any,
+        state: _TrailTrackState,
+        now: float,
+    ) -> Optional[Tuple[float, float]]:
+        if self.config.anchor_mode != "floor_plane_gravity_drop":
+            return None
+        last_ts = float(state.last_measure_ts or 0.0)
+        if last_ts <= 0.0:
+            return None
+        dt = float(now) - last_ts
+        if dt <= 0.0 or dt > float(self.config.gap_predict_ttl_s):
+            return None
+        world_x = state.last_measure_world_x
+        world_z = state.last_measure_world_z
+        if world_x is None or world_z is None:
+            return None
+        camera_id = self._camera_id_for_sensor(sensor_id)
+        calib = self._resolve_calibration(sensor_id, camera_id)
+        if calib is None or getattr(calib, "intrinsics", None) is None or getattr(calib, "extrinsics_col_major", None) is None:
+            return None
+        tau = float(self.config.gap_predict_decay_tau_s)
+        travel_scale = dt
+        if tau > 1e-6:
+            travel_scale = float(tau * (1.0 - math.exp(-dt / tau)))
+        pred_world = np.array(
+            [
+                float(world_x) + float(state.vel_world_x) * travel_scale,
+                float(calib.floor_y),
+                float(world_z) + float(state.vel_world_z) * travel_scale,
+            ],
+            dtype=np.float64,
+        )
+        flip_u, flip_v = self._infer_image_flips(camera_id, calib)
+        uv = project_world_to_image(
+            pred_world,
+            calib.intrinsics,
+            calib.extrinsics_col_major,
+            tuple(int(x) for x in calib.image_size),
+            unit_scale=1.0,
+            flip_u=bool(flip_u),
+            flip_v=bool(flip_v),
+        )
+        if uv is None:
+            return None
+        source_size = self._frame_source_size(frame_meta, calib)
+        return self._source_to_mosaic(frame_meta, float(uv[0]), float(uv[1]), source_size)
+
+    def _resolve_active_anchor(
+        self,
+        sensor_id: int,
+        frame_meta: Any,
+        obj_meta: Any,
+        track_id: int,
+        state: _TrailTrackState,
+        now: float,
+    ) -> Tuple[float, float, bool]:
+        rect = getattr(obj_meta, "rect_params", None)
+        if rect is None:
+            raise ValueError("rect_params required for trail anchor")
+        left = float(getattr(rect, "left", 0.0) or 0.0)
+        top = float(getattr(rect, "top", 0.0) or 0.0)
+        width = float(getattr(rect, "width", 0.0) or 0.0)
+        height = float(getattr(rect, "height", 0.0) or 0.0)
+        x_bbox = float(left) + float(width) * 0.5
+        y_bbox = float(top) + float(height)
+        if self.config.anchor_mode != "floor_plane_gravity_drop":
+            return float(x_bbox), float(y_bbox), False
+
+        track_map = self._analytics_track_map(sensor_id)
+        track = track_map.get(int(track_id))
+        if not isinstance(track, Mapping):
+            return float(x_bbox), float(y_bbox), False
+        bbox = track.get("bbox")
+        if not isinstance(bbox, (list, tuple)) or len(bbox) < 4:
+            return float(x_bbox), float(y_bbox), False
+
+        camera_id = self._camera_id_for_sensor(sensor_id)
+        calib = self._resolve_calibration(sensor_id, camera_id)
+        if calib is None or getattr(calib, "intrinsics", None) is None or getattr(calib, "extrinsics_col_major", None) is None:
+            return float(x_bbox), float(y_bbox), False
+        flip_u, flip_v = self._infer_image_flips(camera_id, calib)
+
+        foot_world = self._bbox_bottom_world(calib, bbox, flip_u=flip_u, flip_v=flip_v)
+        if foot_world is not None:
+            self._maybe_update_height_reference(state, calib, bbox, foot_world, flip_u=flip_u, flip_v=flip_v)
+
+        measured_world = None
+        source_u = None
+        source_v = None
+        if state.height_ref_scene is not None:
+            measured_world = self._gravity_drop_world(
+                calib,
+                bbox,
+                float(state.height_ref_scene),
+                flip_u=flip_u,
+                flip_v=flip_v,
+            )
+            if measured_world is not None:
+                uv = project_world_to_image(
+                    measured_world,
+                    calib.intrinsics,
+                    calib.extrinsics_col_major,
+                    tuple(int(x) for x in calib.image_size),
+                    unit_scale=1.0,
+                    flip_u=bool(flip_u),
+                    flip_v=bool(flip_v),
+                )
+                if uv is not None:
+                    source_u = float(uv[0])
+                    source_v = float(uv[1])
+        if measured_world is None and foot_world is not None:
+            measured_world = np.asarray(foot_world, dtype=np.float64)
+            try:
+                left_s, top_s, width_s, height_s = [float(x) for x in bbox[:4]]
+                source_u = float(left_s) + float(width_s) * 0.5
+                source_v = float(top_s) + float(height_s)
+            except Exception:
+                source_u = None
+                source_v = None
+
+        if measured_world is None or source_u is None or source_v is None:
+            return float(x_bbox), float(y_bbox), False
+
+        self._update_world_measurement(state, float(measured_world[0]), float(measured_world[2]), float(now))
+        source_size = self._frame_source_size(frame_meta, calib)
+        x, y = self._source_to_mosaic(frame_meta, float(source_u), float(source_v), source_size)
+        return float(x), float(y), False
+
+    def _commit_point(self, state: _TrailTrackState, now: float, x: float, y: float, *, predicted: bool) -> None:
+        if state.points:
+            prev = state.points[-1]
+            dt = max(0.0, float(now) - float(prev.ts))
+            if dt > 0.0 and self.config.max_speed_px_per_s > 0.0:
+                dx = float(x) - float(prev.x)
+                dy = float(y) - float(prev.y)
+                dist = math.hypot(dx, dy)
+                max_step = float(self.config.max_speed_px_per_s) * dt
+                if max_step > 0.0 and dist > max_step:
+                    scale = max_step / dist
+                    x = float(prev.x) + dx * scale
+                    y = float(prev.y) + dy * scale
+
+        if self.config.smooth_tau_s > 0.0:
+            if state.ema_x is None or state.ema_y is None:
+                state.ema_x, state.ema_y = float(x), float(y)
+                state.ema_ts = float(now)
+            else:
+                dt_ema = max(0.0, float(now) - float(state.ema_ts))
+                tau = float(self.config.smooth_tau_s)
+                alpha = 1.0 - math.exp(-dt_ema / tau) if (tau > 0.0 and dt_ema > 0.0) else 1.0
+                state.ema_x = float(state.ema_x + alpha * (float(x) - float(state.ema_x)))
+                state.ema_y = float(state.ema_y + alpha * (float(y) - float(state.ema_y)))
+                state.ema_ts = float(now)
+            x, y = float(state.ema_x), float(state.ema_y)
+
+        if state.points:
+            prev = state.points[-1]
+            dt = max(0.0, float(now) - float(prev.ts))
+            dist = math.hypot(float(x) - float(prev.x), float(y) - float(prev.y))
+            if dt < float(self.config.min_dt_s):
+                if dist >= float(self.config.min_step_px):
+                    state.points[-1] = _TrailPoint(ts=float(prev.ts), x=float(x), y=float(y), predicted=bool(predicted))
+                return
+            if dist < float(self.config.min_step_px):
+                return
+
+        state.points.append(_TrailPoint(ts=float(now), x=float(x), y=float(y), predicted=bool(predicted)))
+
     def handle_batch_ds8(self, batch_meta: Any) -> None:
         if ds_osd is None:
             return
@@ -1703,10 +2245,9 @@ class TrailOverlayProcessor:
         mosaic_w, mosaic_h = self._mosaic_size
         max_x = float(mosaic_w) if mosaic_w > 0 else None
         max_y = float(mosaic_h) if mosaic_h > 0 else None
-        min_step_px = float(self.config.min_step_px)
-        min_dt_s = float(self.config.min_dt_s)
         max_points_per_track = max(2, int(self.config.max_points_per_track))
         tracks_seen = 0
+        present_track_ids: set[int] = set()
 
         # Update trail state for all configured objects.
         for obj_meta in object_items:
@@ -1724,6 +2265,7 @@ class TrailOverlayProcessor:
             if track_id < 0:
                 continue
             tracks_seen += 1
+            present_track_ids.add(int(track_id))
 
             rect = getattr(obj_meta, "rect_params", None)
             if rect is None:
@@ -1753,56 +2295,39 @@ class TrailOverlayProcessor:
             state.last_seen_ts = float(now)
 
             # Always prune old samples so disappeared tracks naturally fade out.
-            while state.points and (now - float(state.points[0][0])) > float(self.config.window_s):
+            while state.points and (now - float(state.points[0].ts)) > float(self.config.window_s):
                 state.points.popleft()
 
             if not do_sample:
                 continue
 
-            # Clamp spurious jumps based on max speed.
-            if state.points:
-                prev_ts, prev_x, prev_y = state.points[-1]
-                dt = max(0.0, float(now) - float(prev_ts))
-                if dt > 0.0 and self.config.max_speed_px_per_s > 0.0:
-                    dx = x - float(prev_x)
-                    dy = y - float(prev_y)
-                    dist = math.hypot(dx, dy)
-                    max_step = float(self.config.max_speed_px_per_s) * dt
-                    if max_step > 0.0 and dist > max_step:
-                        scale = max_step / dist
-                        x = float(prev_x) + dx * scale
-                        y = float(prev_y) + dy * scale
+            x, y, predicted = self._resolve_active_anchor(
+                sensor_id,
+                frame_meta,
+                obj_meta,
+                int(track_id),
+                state,
+                float(now),
+            )
+            if max_x is not None:
+                x = float(max(0.0, min(x, max_x)))
+            if max_y is not None:
+                y = float(max(0.0, min(y, max_y)))
+            self._commit_point(state, float(now), float(x), float(y), predicted=bool(predicted))
 
-            # Smooth the footpoint directly (time-constant based EMA).
-            if self.config.smooth_tau_s > 0.0:
-                if state.ema_x is None or state.ema_y is None:
-                    state.ema_x, state.ema_y = x, y
-                    state.ema_ts = float(now)
-                else:
-                    dt_ema = max(0.0, float(now) - float(state.ema_ts))
-                    tau = float(self.config.smooth_tau_s)
-                    alpha = 1.0 - math.exp(-dt_ema / tau) if (tau > 0.0 and dt_ema > 0.0) else 1.0
-                    state.ema_x = float(state.ema_x + alpha * (x - float(state.ema_x)))
-                    state.ema_y = float(state.ema_y + alpha * (y - float(state.ema_y)))
-                    state.ema_ts = float(now)
-                x, y = float(state.ema_x), float(state.ema_y)
-
-            # Decimation: enforce a time-window based sampling budget by updating the
-            # most recent point when frames arrive faster than `min_dt_s`.
-            if state.points:
-                prev_ts, prev_x, prev_y = state.points[-1]
-                dt = max(0.0, float(now) - float(prev_ts))
-                dist = math.hypot(x - float(prev_x), y - float(prev_y))
-                if dt < min_dt_s:
-                    if dist >= min_step_px:
-                        # Update the most recent point in-place without advancing its
-                        # timestamp so `dt` can accumulate until the next commit.
-                        state.points[-1] = (float(prev_ts), float(x), float(y))
+        if do_sample and self.config.anchor_mode == "floor_plane_gravity_drop":
+            for track_id, state in sensor_tracks.items():
+                if int(track_id) in present_track_ids:
                     continue
-                if dist < min_step_px:
+                x_y = self._predict_gap_anchor(sensor_id, frame_meta, state, float(now))
+                if x_y is None:
                     continue
-
-            state.points.append((float(now), float(x), float(y)))
+                x, y = x_y
+                if max_x is not None:
+                    x = float(max(0.0, min(float(x), max_x)))
+                if max_y is not None:
+                    y = float(max(0.0, min(float(y), max_y)))
+                self._commit_point(state, float(now), float(x), float(y), predicted=True)
 
         if os.environ.get("NOESIS_TRAILS_RENDER", "1").strip().lower() in ("0", "false", "no", "off"):
             return 0, tracks_seen, 0
@@ -1818,7 +2343,7 @@ class TrailOverlayProcessor:
         # Remove fully expired tracks to keep memory bounded.
         expired: List[int] = []
         for track_id, state in sensor_tracks.items():
-            while state.points and (now - float(state.points[0][0])) > float(self.config.window_s):
+            while state.points and (now - float(state.points[0].ts)) > float(self.config.window_s):
                 state.points.popleft()
             if not state.points and (now - float(state.last_seen_ts)) > float(self.config.window_s):
                 expired.append(track_id)
@@ -1912,14 +2437,14 @@ class TrailOverlayProcessor:
                 return True
             return after > before
 
-        def _resample_points(points: List[Tuple[float, float, float]], segments_budget: int, *, bias: float = 2.0) -> List[Tuple[float, float, float]]:
+        def _resample_points(points: List[_TrailPoint], segments_budget: int, *, bias: float = 2.0) -> List[_TrailPoint]:
             if segments_budget <= 0:
                 return []
             segments_available = len(points) - 1
             if segments_available <= segments_budget:
                 return points
             # Select (segments_budget + 1) indices, biased towards the newest points.
-            selected: List[Tuple[float, float, float]] = []
+            selected: List[_TrailPoint] = []
             last_idx = -1
             for j in range(segments_budget + 1):
                 t = 0.0 if segments_budget == 0 else (float(j) / float(segments_budget))
@@ -1939,7 +2464,10 @@ class TrailOverlayProcessor:
         # Draw newest→older segments so we never "freeze" the head when we hit
         # display meta capacity; newest motion always wins.
         track_items = list(sensor_tracks.items())
-        track_items.sort(key=lambda item: float(getattr(item[1], "last_seen_ts", 0.0)), reverse=True)
+        track_items.sort(
+            key=lambda item: float(item[1].points[-1].ts if item[1].points else getattr(item[1], "last_seen_ts", 0.0)),
+            reverse=True,
+        )
         max_tracks = max(1, int(self.config.max_tracks))
         track_items = track_items[:max_tracks]
         remaining_tracks = len(track_items)
@@ -1995,14 +2523,16 @@ class TrailOverlayProcessor:
                     metas_exhausted = True
                     break
 
-                ts0, x1, y1 = pts[idx]
-                _ts1, x2, y2 = pts[idx + 1]
-                age = max(0.0, float(now) - float(ts0))
+                pt0 = pts[idx]
+                pt1 = pts[idx + 1]
+                age = max(0.0, float(now) - float(pt0.ts))
                 t = 1.0 - min(1.0, age * inv_window)
                 alpha = min_alpha + (1.0 - min_alpha) * max(0.0, min(1.0, t))
+                if pt0.predicted or pt1.predicted:
+                    alpha *= float(self.config.predicted_alpha_scale)
 
-                line.x1, line.y1 = int(x1), int(y1)
-                line.x2, line.y2 = int(x2), int(y2)
+                line.x1, line.y1 = int(pt0.x), int(pt0.y)
+                line.x2, line.y2 = int(pt1.x), int(pt1.y)
                 line.color.a = float(alpha)
                 ok = _add_line(dm, line)
                 if not ok:
@@ -2036,14 +2566,14 @@ class TrailOverlayProcessor:
                 continue
 
             label_budget -= 1
-            _ts, last_x, last_y = pts[-1]
+            last_pt = pts[-1]
             text = ds_osd.Text()
             if stable_id_int is not None and stable_id_int > 0:
                 text.display_text = f"sid {stable_id_int}"
             else:
                 text.display_text = "sid XX"
-            text.x_offset = int(last_x)
-            text.y_offset = int(last_y)
+            text.x_offset = int(last_pt.x)
+            text.y_offset = int(last_pt.y)
             try:
                 text.font.name = ds_osd.FontFamily.Serif
                 text.font.size = 12
@@ -2864,6 +3394,7 @@ class _AnalyticsTelemetryProcessor:
     _bev_class_ids_ready: bool = field(default=False, init=False, repr=False)
     _reid_unique_id: int = field(default=3, init=False, repr=False)
     _reid_layer_name: str = field(default="features", init=False, repr=False)
+    _reid_diag_use_tracker_id: bool = field(default=False, init=False, repr=False)
     _mask_alpha: float = field(default=0.35, init=False, repr=False)
     _mask_alpha_ready: bool = field(default=False, init=False, repr=False)
     _reid_logged_shape: bool = field(default=False, init=False, repr=False)
@@ -2875,12 +3406,26 @@ class _AnalyticsTelemetryProcessor:
     _reid_debug_emb_missing: int = field(default=0, init=False, repr=False)
     _diag_logged: bool = field(default=False, init=False, repr=False)
     _tracking_mode: str = field(default="baseline", init=False, repr=False)
-    _world_frame: str = field(default="camera_local", init=False, repr=False)
+    _world_frame: str = field(default="menon_scene", init=False, repr=False)
+    _image_flip_by_key: Dict[str, Tuple[bool, bool]] = field(default_factory=dict, init=False, repr=False)
+    _image_flip_logged: set[str] = field(default_factory=set, init=False, repr=False)
     _v3dt_meta_enabled: bool = field(default=True, init=False, repr=False)
     _v3dt_meta_logged_missing: bool = field(default=False, init=False, repr=False)
     _v3dt_caminfo_paths: Dict[int, Path] = field(default_factory=dict, init=False, repr=False)
     _v3dt_caminfo_cache: Dict[int, Tuple[str, List[List[float]]]] = field(default_factory=dict, init=False, repr=False)
     _v3dt_caminfo_logged_missing: bool = field(default=False, init=False, repr=False)
+    _sid_metrics_log_enabled: bool = field(default=True, init=False, repr=False)
+    _sid_metrics_log_interval_s: float = field(default=10.0, init=False, repr=False)
+    _sid_metrics_last_log_by_sensor: Dict[int, float] = field(default_factory=dict, init=False, repr=False)
+    _world_state_by_track: Dict[Tuple[int, int], Dict[str, float]] = field(default_factory=dict, init=False, repr=False)
+    _world_state_ttl_s: float = field(default=3.0, init=False, repr=False)
+    _world_state_prune_interval_s: float = field(default=1.0, init=False, repr=False)
+    _world_state_last_prune_ts: float = field(default=0.0, init=False, repr=False)
+    _world_static_px_threshold: float = field(default=3.0, init=False, repr=False)
+    _world_static_jump_scene: float = field(default=10.0, init=False, repr=False)
+    _world_max_speed_scene_per_s: float = field(default=120.0, init=False, repr=False)
+    _world_smooth_alpha_good: float = field(default=0.45, init=False, repr=False)
+    _world_smooth_alpha_weak: float = field(default=0.20, init=False, repr=False)
 
     def __post_init__(self) -> None:
         # Discover the ReID SGIE unique-id from the built pipeline config when present.
@@ -2902,7 +3447,7 @@ class _AnalyticsTelemetryProcessor:
             if frame:
                 self._world_frame = str(frame)
         except Exception:
-            self._world_frame = "camera_local"
+            self._world_frame = "menon_scene"
 
         flag = str(os.environ.get("NOESIS_V3DT_META_EXTRACT", "1") or "").strip().lower()
         self._v3dt_meta_enabled = flag in ("", "1", "true", "yes", "y", "on")
@@ -2916,6 +3461,117 @@ class _AnalyticsTelemetryProcessor:
             self._occupancy_grace_s = max(0.0, float(str(grace_raw).strip() or "0"))
         except Exception:
             self._occupancy_grace_s = 0.0
+        diag_raw = str(os.environ.get("NOESIS_REID_DIAG_USE_TRACKER_ID", "0") or "").strip().lower()
+        self._reid_diag_use_tracker_id = diag_raw in ("1", "true", "yes", "on", "y")
+        sid_metrics_env = str(os.environ.get("NOESIS_REID_METRICS_LOG_ENABLED", "1") or "").strip().lower()
+        self._sid_metrics_log_enabled = sid_metrics_env in ("1", "true", "yes", "on", "y")
+        try:
+            interval_raw = os.environ.get("NOESIS_REID_METRICS_LOG_INTERVAL_S", "10")
+            self._sid_metrics_log_interval_s = max(1.0, float(str(interval_raw).strip() or "10"))
+        except Exception:
+            self._sid_metrics_log_interval_s = 10.0
+        try:
+            self._world_state_ttl_s = max(0.25, float(str(os.environ.get("NOESIS_WORLD_STATE_TTL_S", "3.0")).strip() or "3.0"))
+        except Exception:
+            self._world_state_ttl_s = 3.0
+        try:
+            self._world_state_prune_interval_s = max(
+                0.10, float(str(os.environ.get("NOESIS_WORLD_STATE_PRUNE_INTERVAL_S", "1.0")).strip() or "1.0")
+            )
+        except Exception:
+            self._world_state_prune_interval_s = 1.0
+        try:
+            self._world_static_px_threshold = max(
+                0.0, float(str(os.environ.get("NOESIS_WORLD_STATIC_PX_THRESHOLD", "3.0")).strip() or "3.0")
+            )
+        except Exception:
+            self._world_static_px_threshold = 3.0
+        try:
+            self._world_static_jump_scene = max(
+                0.0, float(str(os.environ.get("NOESIS_WORLD_STATIC_JUMP_SCENE", "10.0")).strip() or "10.0")
+            )
+        except Exception:
+            self._world_static_jump_scene = 10.0
+        try:
+            self._world_max_speed_scene_per_s = max(
+                0.0, float(str(os.environ.get("NOESIS_WORLD_MAX_SPEED_SCENE_PER_S", "120.0")).strip() or "120.0")
+            )
+        except Exception:
+            self._world_max_speed_scene_per_s = 120.0
+        try:
+            self._world_smooth_alpha_good = float(
+                str(os.environ.get("NOESIS_WORLD_SMOOTH_ALPHA_GOOD", "0.45")).strip() or "0.45"
+            )
+        except Exception:
+            self._world_smooth_alpha_good = 0.45
+        try:
+            self._world_smooth_alpha_weak = float(
+                str(os.environ.get("NOESIS_WORLD_SMOOTH_ALPHA_WEAK", "0.20")).strip() or "0.20"
+            )
+        except Exception:
+            self._world_smooth_alpha_weak = 0.20
+        self._world_smooth_alpha_good = float(max(0.0, min(1.0, self._world_smooth_alpha_good)))
+        self._world_smooth_alpha_weak = float(max(0.0, min(1.0, self._world_smooth_alpha_weak)))
+
+    def get_active_track_map(self, sensor_id: int) -> Dict[int, Dict[str, Any]]:
+        tracks = self._active_tracks.get(int(sensor_id)) or []
+        indexed: Dict[int, Dict[str, Any]] = {}
+        for track in tracks:
+            if not isinstance(track, Mapping):
+                continue
+            tracker_id = track.get("tracker_id", track.get("track_id"))
+            try:
+                tracker_id_int = int(tracker_id)
+            except Exception:
+                continue
+            if tracker_id_int < 0:
+                continue
+            indexed[int(tracker_id_int)] = dict(track)
+        return indexed
+
+    def _maybe_log_stable_id_metrics(self, sensor_id: int, now_ts: float) -> None:
+        if not self._sid_metrics_log_enabled or not self._stable_id_enabled:
+            return
+        sid_int = int(sensor_id)
+        last_ts = float(self._sid_metrics_last_log_by_sensor.get(sid_int, 0.0))
+        interval = float(self._sid_metrics_log_interval_s)
+        if (float(now_ts) - last_ts) < interval:
+            return
+        mgr = getattr(self.pipeline, "stable_id_mgr", None)
+        get_metrics = getattr(mgr, "get_sid_metrics", None)
+        if not callable(get_metrics):
+            return
+        try:
+            metrics = dict(get_metrics() or {})
+        except Exception:
+            logger.debug("StableID metrics fetch failed", exc_info=True)
+            return
+        self._sid_metrics_last_log_by_sensor[sid_int] = float(now_ts)
+        logger.info(
+            "StableID metrics sensor=%d canonical=%s active=%s next=%s merge_applied=%s merge_suppressed=%s candidates=%s blocked=%s support_gate=%s stall_streak=%s stall_reason=%s recycled=%s pool=%s sim_p50=%s sim_p95=%s new_alloc=%s remap=%s guard_reject=%s no_emb=%s fragmentation=%s pending_recycled=%s same_frame_conflicts=%s",
+            sid_int,
+            metrics.get("canonical_gallery_size"),
+            metrics.get("active_unique"),
+            metrics.get("next_sid"),
+            metrics.get("auto_merge_applied"),
+            metrics.get("auto_merge_suppressed"),
+            metrics.get("auto_merge_last_candidate_count"),
+            metrics.get("auto_merge_last_blocked_count"),
+            metrics.get("auto_merge_last_support_gate"),
+            metrics.get("auto_merge_zero_apply_streak"),
+            metrics.get("auto_merge_last_reason"),
+            metrics.get("auto_merge_last_pressure_recycled"),
+            metrics.get("alias_candidate_pool_size"),
+            metrics.get("alias_candidate_sim_p50"),
+            metrics.get("alias_candidate_sim_p95"),
+            metrics.get("sid_new_alloc_count"),
+            metrics.get("sid_remap_count"),
+            metrics.get("sid_guard_reject_count"),
+            metrics.get("sid_no_embedding_count"),
+            metrics.get("sid_fragmentation_events"),
+            metrics.get("sid_pending_recycled_count"),
+            metrics.get("sid_same_frame_conflict_count"),
+        )
 
     def _tracking_mode_is_v3dt(self) -> bool:
         return str(self._tracking_mode or "").strip().lower() == "v3dt"
@@ -3308,6 +3964,23 @@ class _AnalyticsTelemetryProcessor:
 
                 stable_id_int = int(stable_id)
                 present_stable_ids.add(stable_id_int)
+                tracker_id_int = int(track_id)
+                id_diag: Dict[str, Any] = {}
+                mgr = getattr(self.pipeline, "stable_id_mgr", None)
+                get_id_diag = getattr(mgr, "get_track_diagnostics", None)
+                if callable(get_id_diag):
+                    try:
+                        id_diag = dict(get_id_diag(int(sensor_id), int(track_id)) or {})
+                    except Exception:
+                        id_diag = {}
+                id_event = id_diag.get("id_event")
+                id_reject_reason = id_diag.get("id_reject_reason")
+                sid_candidate = id_diag.get("sid_candidate")
+                embedding_present = bool(id_diag.get("embedding_present", emb is not None))
+                pose_present = bool(id_diag.get("pose_present", False))
+                id_display = None
+                if self._reid_diag_use_tracker_id:
+                    id_display = f"[{tracker_id_int}] | [{stable_id_int}]"
 
                 # Stamp OSD label early so mosaic never falls back to tracker IDs.
                 self._stamp_osd_label_ds8(obj_meta, sensor_id=sensor_id, stable_id=stable_id_int)
@@ -3333,6 +4006,7 @@ class _AnalyticsTelemetryProcessor:
 
                 public_track: Dict[str, Any] = {
                     "stable_id": stable_id_int,
+                    "tracker_id": tracker_id_int,
                     "camera_id": camera_id,
                     "bbox": raw.get("bbox"),
                     "center": raw.get("center"),
@@ -3343,7 +4017,14 @@ class _AnalyticsTelemetryProcessor:
                     "zone": zone,
                     "frame_id": frame_id,
                     "dwell_time": dwell,
+                    "id_event": id_event,
+                    "id_reject_reason": id_reject_reason,
+                    "embedding_present": bool(embedding_present),
+                    "pose_present": bool(pose_present),
+                    "sid_candidate": sid_candidate,
                 }
+                if id_display:
+                    public_track["id_display"] = str(id_display)
                 for key in (
                     "bbox3d",
                     "velocity3d",
@@ -3352,6 +4033,8 @@ class _AnalyticsTelemetryProcessor:
                     "image_base",
                     "world",
                     "world_valid",
+                    "world_quality",
+                    "world_quality_reason",
                     "world_frame",
                     "world_source",
                 ):
@@ -3362,12 +4045,21 @@ class _AnalyticsTelemetryProcessor:
                 diag_track.update(
                     {
                         "stable_id": stable_id_int,
+                        "tracker_id": tracker_id_int,
+                        **({"id_display": str(id_display)} if id_display else {}),
                         "zone": zone,
                         "dwell_time": dwell,
                         "world": public_track.get("world"),
                         "world_valid": public_track.get("world_valid"),
+                        "world_quality": public_track.get("world_quality"),
+                        "world_quality_reason": public_track.get("world_quality_reason"),
                         "world_frame": public_track.get("world_frame"),
                         "world_source": public_track.get("world_source"),
+                        "id_event": id_event,
+                        "id_reject_reason": id_reject_reason,
+                        "embedding_present": bool(embedding_present),
+                        "pose_present": bool(pose_present),
+                        "sid_candidate": sid_candidate,
                     }
                 )
                 tracks.append(public_track)
@@ -3389,6 +4081,7 @@ class _AnalyticsTelemetryProcessor:
             self._cleanup_zone_state(sensor_id, present_stable_ids)
             self._maintain_stable_ids(sensor_id, present_track_ids, now_ts)
             self._active_tracks[sensor_id] = tracks
+            self._maybe_log_stable_id_metrics(sensor_id, now_ts)
 
             if self.diagnostics_logger:
                 bbox3d_count = 0
@@ -3530,6 +4223,10 @@ class _AnalyticsTelemetryProcessor:
 
                 stable_id_int = int(stable_id)
                 present_stable_ids.add(stable_id_int)
+                tracker_id_int = int(track_id)
+                id_display = None
+                if self._reid_diag_use_tracker_id:
+                    id_display = f"[{tracker_id_int}] | [{stable_id_int}]"
 
                 self._stamp_osd_label(obj_meta, sensor_id=sensor_id, stable_id=stable_id_int)
                 dwell = self._update_dwell_time(sensor_id, stable_id_int, zone, now_ts)
@@ -3552,6 +4249,7 @@ class _AnalyticsTelemetryProcessor:
 
                 public_track: Dict[str, Any] = {
                     "stable_id": stable_id_int,
+                    "tracker_id": tracker_id_int,
                     "camera_id": camera_id,
                     "bbox": raw.get("bbox"),
                     "center": raw.get("center"),
@@ -3563,6 +4261,8 @@ class _AnalyticsTelemetryProcessor:
                     "frame_id": frame_id,
                     "dwell_time": dwell,
                 }
+                if id_display:
+                    public_track["id_display"] = str(id_display)
                 for key in (
                     "bbox3d",
                     "velocity3d",
@@ -3570,6 +4270,8 @@ class _AnalyticsTelemetryProcessor:
                     "image_foot",
                     "world",
                     "world_valid",
+                    "world_quality",
+                    "world_quality_reason",
                     "world_frame",
                     "world_source",
                 ):
@@ -3580,10 +4282,14 @@ class _AnalyticsTelemetryProcessor:
                 diag_track.update(
                     {
                         "stable_id": stable_id_int,
+                        "tracker_id": tracker_id_int,
+                        **({"id_display": str(id_display)} if id_display else {}),
                         "zone": zone,
                         "dwell_time": dwell,
                         "world": public_track.get("world"),
                         "world_valid": public_track.get("world_valid"),
+                        "world_quality": public_track.get("world_quality"),
+                        "world_quality_reason": public_track.get("world_quality_reason"),
                         "world_frame": public_track.get("world_frame"),
                         "world_source": public_track.get("world_source"),
                     }
@@ -3599,6 +4305,7 @@ class _AnalyticsTelemetryProcessor:
             self._cleanup_zone_state(sensor_id, present_stable_ids)
             self._maintain_stable_ids(sensor_id, present_track_ids, now_ts)
             self._active_tracks[sensor_id] = tracks
+            self._maybe_log_stable_id_metrics(sensor_id, now_ts)
 
             if self.diagnostics_logger:
                 bbox3d_count = 0
@@ -3857,7 +4564,36 @@ class _AnalyticsTelemetryProcessor:
             stable_id_int = None
         if stable_id_int is not None and stable_id_int <= 0:
             stable_id_int = None
-        return Footpoint(u=u, v=v, method=method or "bbox", stable_id=stable_id_int)
+        tracker_id = track.get("tracker_id", track.get("track_id"))
+        try:
+            tracker_id_int = int(tracker_id) if tracker_id not in (None, "", -1) else None
+        except Exception:
+            tracker_id_int = None
+        if tracker_id_int is not None and tracker_id_int < 0:
+            tracker_id_int = None
+        world_x = None
+        world_z = None
+        if track.get("world_valid") is True:
+            world = track.get("world")
+            if isinstance(world, (list, tuple)) and len(world) >= 3:
+                try:
+                    wx = float(world[0])
+                    wz = float(world[2])
+                    if math.isfinite(wx) and math.isfinite(wz):
+                        world_x = float(wx)
+                        world_z = float(wz)
+                except Exception:
+                    world_x = None
+                    world_z = None
+        return Footpoint(
+            u=u,
+            v=v,
+            method=method or "bbox",
+            stable_id=stable_id_int,
+            tracker_id=tracker_id_int,
+            world_x=world_x,
+            world_z=world_z,
+        )
 
     def _frame_timestamp_us(self, frame_meta: Any) -> int:
         pts_ns = int(_meta_lookup(frame_meta, "buf_pts", "buffer_pts", "pts", default=0) or 0)
@@ -3865,15 +4601,117 @@ class _AnalyticsTelemetryProcessor:
             pts_ns = int(time.time() * 1_000_000_000)
         return max(0, pts_ns // 1_000)
 
+    @staticmethod
+    def _apply_image_flip(
+        u: float,
+        v: float,
+        width: int,
+        height: int,
+        flip_u: bool,
+        flip_v: bool,
+    ) -> Tuple[float, float]:
+        if flip_u:
+            u = float(max(0, width - 1)) - float(u)
+        if flip_v:
+            v = float(max(0, height - 1)) - float(v)
+        return float(u), float(v)
+
+    def _infer_image_flips(self, camera_id: str, calib: CalibrationSnapshot) -> Tuple[bool, bool]:
+        try:
+            ext_hash = hash(tuple(float(x) for x in calib.extrinsics_col_major))
+        except Exception:
+            ext_hash = 0
+        key = f"{camera_id}::{ext_hash}"
+        cached = self._image_flip_by_key.get(key)
+        if cached is not None:
+            return cached
+
+        flip_u = False
+        flip_v = False
+        try:
+            R_wc, _ = parse_extrinsics(calib.extrinsics_col_major)
+            forward = R_wc @ np.array([0.0, 0.0, 1.0], dtype=np.float64)
+            f_norm = float(np.linalg.norm(forward))
+            if f_norm > 1e-6:
+                forward = forward / f_norm
+            world_up = np.array([0.0, 1.0, 0.0], dtype=np.float64)
+            right_ref = np.cross(world_up, forward)
+            r_norm = float(np.linalg.norm(right_ref))
+            if r_norm <= 1e-6:
+                right_ref = np.array([1.0, 0.0, 0.0], dtype=np.float64)
+            else:
+                right_ref = right_ref / r_norm
+            up_ref = np.cross(forward, right_ref)
+            u_norm = float(np.linalg.norm(up_ref))
+            if u_norm <= 1e-6:
+                up_ref = world_up
+            else:
+                up_ref = up_ref / u_norm
+
+            right = R_wc @ np.array([1.0, 0.0, 0.0], dtype=np.float64)
+            up = R_wc @ np.array([0.0, 1.0, 0.0], dtype=np.float64)
+            r_actual = float(np.dot(right, right_ref))
+            u_actual = float(np.dot(up, up_ref))
+
+            flip_u = r_actual < 0.0
+            flip_v = u_actual > 0.0
+        except Exception:
+            flip_u = False
+            flip_v = False
+
+        self._image_flip_by_key[key] = (bool(flip_u), bool(flip_v))
+        if (flip_u or flip_v) and key not in self._image_flip_logged:
+            logger.info(
+                "Tracking world image axis flip for %s: flip_u=%s flip_v=%s",
+                camera_id,
+                bool(flip_u),
+                bool(flip_v),
+            )
+            self._image_flip_logged.add(key)
+        return bool(flip_u), bool(flip_v)
+
+    def _world_track_key(self, sensor_id: int, track: Mapping[str, Any]) -> Optional[Tuple[int, int]]:
+        tracker_id = track.get("tracker_id", track.get("track_id"))
+        try:
+            tracker_id_int = int(tracker_id)
+        except Exception:
+            return None
+        if tracker_id_int < 0:
+            return None
+        return int(sensor_id), int(tracker_id_int)
+
+    def _maybe_prune_world_state(self, now_ts: float) -> None:
+        if not self._world_state_by_track:
+            return
+        if (float(now_ts) - float(self._world_state_last_prune_ts)) < float(self._world_state_prune_interval_s):
+            return
+        self._world_state_last_prune_ts = float(now_ts)
+        ttl = float(self._world_state_ttl_s)
+        if ttl <= 0.0:
+            self._world_state_by_track.clear()
+            return
+        expired: List[Tuple[int, int]] = []
+        for key, state in self._world_state_by_track.items():
+            ts = float(state.get("ts", 0.0) or 0.0)
+            if (float(now_ts) - ts) > ttl:
+                expired.append(key)
+        for key in expired:
+            self._world_state_by_track.pop(key, None)
+
     def _augment_track_with_world(self, sensor_id: int, camera_id: str, track: Dict[str, Any]) -> None:
         """Calculate world coordinates for a track if calibration is available."""
         if self.bev_calibration is None:
             return
         if track.get("world_source") == "bbox3d":
+            if track.get("world_valid") is True:
+                track.setdefault("world_quality", "good")
+                track.setdefault("world_frame", self._world_frame)
             return
         if track.get("world") is not None and track.get("world_valid") is True:
+            track.setdefault("world_quality", "good")
+            track.setdefault("world_frame", self._world_frame)
             return
-        
+
         try:
             calib = self.bev_calibration.snapshot(sensor_id, camera_id)
             if calib is None or calib.intrinsics is None or calib.extrinsics_col_major is None:
@@ -3887,22 +4725,54 @@ class _AnalyticsTelemetryProcessor:
             # Use bottom center for footpoint
             u = float(bbox[0]) + float(bbox[2]) / 2.0
             v = float(bbox[1]) + float(bbox[3])
+            width_src, height_src = calib.image_size
+            flip_u, flip_v = self._infer_image_flips(camera_id, calib)
+            u_ray, v_ray = self._apply_image_flip(u, v, int(width_src), int(height_src), flip_u, flip_v)
 
             R_wc, C_world = parse_extrinsics(calib.extrinsics_col_major)
-            scale = float(calib.unit_scale or 1.0)
-            C_world = C_world * scale
-            plane = Plane.horizontal(float(calib.floor_y) * scale)
+            scene_per_m = 1.0
+            try:
+                s_obj_to_m = float(calib.unit_scale or 1.0)
+                if math.isfinite(s_obj_to_m) and s_obj_to_m > 1e-6:
+                    scene_per_m = 1.0 / s_obj_to_m
+            except Exception:
+                scene_per_m = 1.0
+            # Non-V3DT world path publishes/uses native scene units end-to-end.
+            C_world = C_world * scene_per_m
+            plane = Plane.horizontal(float(calib.floor_y))
+            now_ts = float(time.time())
 
-            origin, direction = ray_from_pixel(u, v, calib.intrinsics, R_wc, C_world)
+            origin, direction = ray_from_pixel(u_ray, v_ray, calib.intrinsics, R_wc, C_world)
             hit = intersect_plane(origin, direction, plane)
+            world_key = self._world_track_key(sensor_id, track)
+            self._maybe_prune_world_state(now_ts)
 
             if hit is not None:
-                track["world"] = [float(hit[0]), float(hit[1]), float(hit[2])]
+                wx = float(hit[0])
+                wy = float(hit[1])
+                wz = float(hit[2])
+                quality = "good"
+                quality_reason = None
+
+                if world_key is not None:
+                    # Always clear legacy world-smoothing state; this path publishes raw scene coords only.
+                    self._world_state_by_track.pop(world_key, None)
+
+                track["world"] = [float(wx), float(wy), float(wz)]
                 track["world_valid"] = True
+                track["world_quality"] = str(quality)
+                if quality_reason:
+                    track["world_quality_reason"] = str(quality_reason)
+                else:
+                    track.pop("world_quality_reason", None)
                 track["world_frame"] = self._world_frame
-                track["world_source"] = "ray"
+                track["world_source"] = "ray_floor"
             else:
+                if world_key is not None:
+                    self._world_state_by_track.pop(world_key, None)
                 track["world_valid"] = False
+                track["world_quality"] = "invalid"
+                track["world_quality_reason"] = "no_floor_intersection"
         except Exception:
             # Silently fail; world coordinates are best-effort
             pass
@@ -4415,6 +5285,7 @@ class _OsdLabelProcessor:
     decimals: int = 2
     font_size: Optional[int] = 22
     font_name: Optional[str] = "Sans"
+    show_both_ids: bool = False
     stable_id_mgr: Any = field(default=None, repr=False)
 
     @staticmethod
@@ -4449,11 +5320,14 @@ class _OsdLabelProcessor:
         font_name_env = str(os.environ.get("NOESIS_OSD_LABEL_FONT_NAME", "")).strip()
         font_name_raw = font_name_env if font_name_env else cfg.get("font_name", "Sans")
         font_name = _str(font_name_raw).strip() or "Sans"
+        diag_raw = str(os.environ.get("NOESIS_REID_DIAG_USE_TRACKER_ID", "0") or "").strip().lower()
+        show_both = diag_raw in ("1", "true", "yes", "on", "y")
 
         return _OsdLabelProcessor(
             decimals=decimals,
             font_size=font_size,
             font_name=font_name,
+            show_both_ids=show_both,
         )
 
     def handle_frame_ds8(self, frame_meta: Any) -> None:
@@ -4591,10 +5465,15 @@ class _OsdLabelProcessor:
                 stable_id_int = int(stable_id) if stable_id is not None else None
             except Exception:
                 stable_id_int = None
-            if stable_id_int is not None and stable_id_int > 0:
-                parts.append(f"{stable_id_int}")
+            if self.show_both_ids:
+                tracker_text = str(track_id) if track_id >= 0 else "XX"
+                stable_text = str(stable_id_int) if stable_id_int is not None and stable_id_int > 0 else "XX"
+                parts.append(f"[{tracker_text}] | [{stable_text}]")
             else:
-                parts.append("XX")
+                if stable_id_int is not None and stable_id_int > 0:
+                    parts.append(f"{stable_id_int}")
+                else:
+                    parts.append("XX")
         base_label = " ".join([p for p in parts if p]).strip()
 
         try:

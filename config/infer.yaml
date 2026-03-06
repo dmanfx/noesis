@@ -37,7 +37,7 @@ sources:
   - element: nvurisrcbin
     #family room camera
     uri: rtsp://192.168.3.214:7447/4qWTBhW6b4nLeUFE?
-    #uri: file:///home/mayor/Downloads/familyroomclip.mp4
+    #ri: file:///home/mayor/Downloads/familyroomclip.mp4
     gpu-id: 0
     cudadec-memtype: 0
     latency: 100
@@ -128,10 +128,12 @@ mosaic_output:
   rtsp_profile: 0            # 0=baseline, 1=main, 2=high (H.264)
 
 bev:
+  frame: menon_scene
   jpeg_enabled: false
   jpeg_quality: 70
   smoothing:
-    enabled: true
+    # World-path BEV trails are frontend-owned in scene units; keep backend smoother off.
+    enabled: false
     max_speed_mps: 4.0    # Physical gate (meters/sec): cap per-frame travel by speed * dt
     max_jump_m: 0.75      # Extra slack for homography jitter (meters)
     alpha: 0.45           # Alpha-beta filter position gain (0..1)
@@ -145,13 +147,26 @@ visualization: # Visualization overlays rendered into the mosaic stream (tiler â
     alpha: 0.35 # Mask overlay opacity (stable-id keyed color; matches BEV + Active Tracks hue math).
   trails:
     enabled: true # Enable trails overlay.
+    anchor_mode: floor_plane_gravity_drop # Floor-lock trails while tracked; predict only across short full dropouts.
     class_ids: [0] # Restrict trails to people only (class_id 0).
     window_s: 8.0 # Time-window trail history (seconds).
-    draw_stride: 2 # Downsample point updates (reduce jitter and CPU).
-    min_step_px: 2.0 # Decimate: only add a point if moved enough.
+    draw_stride: 1 # Motion-following: sample each update for tighter trail lock.
+    min_step_px: 1.0 # Motion-following: lower decimation threshold.
     min_dt_s: 0.08 # Decimate: or enough time elapsed (seconds).
-    smooth_tau_s: 0.25 # Footpoint smoothing time constant (seconds).
-    max_speed_px_per_s: 600.0 # Clamp trail jumps (pixels per second).
+    smooth_tau_s: 0.18 # Motion-following: reduce filter lag while still damping jitter.
+    gap_predict_ttl_s: 1.0 # Continue floor-plane trails briefly only after full track loss.
+    gap_predict_decay_tau_s: 0.75 # Exponential slowdown for gap prediction.
+    predicted_alpha_scale: 0.65 # Make inferred gap segments subtler than measured ones.
+    height_peak_up_alpha: 0.35 # Learn full-body pixel height quickly when unobscured.
+    height_peak_down_alpha: 0.05 # Decay pixel-height reference slowly under lower-body occlusion.
+    height_good_frame_ratio: 0.90 # Only refresh scene-height model when box height is near the recent full-body peak.
+    # Frontend BEV-only trail tuning (ignored by backend stream overlay hook).
+    head_smooth_tau_s: 0.06 # Faster head-dot response target (~300 ms class) with light damping.
+    trail_smooth_tau_s: 0.19 # Keep tail smoother than head for readable path history.
+    min_step_scene_floor: 0.0 # Allow near-zero movement segments when needed (prevents trail starvation).
+    min_step_scene_ceil: 0.11 # Cap scene-step decimation to keep trails visible across room scales.
+    stale_head_blink_enabled: false # Stream overlay parity: no stale head blinking by default.
+    max_speed_px_per_s: 1200.0 # Motion-following: relax speed clamp to avoid trail lag/drift.
     max_points_per_track: 257 # Bound trails by BOTH time and points.
     max_segments_per_track: 64 # Max segments rendered per track per frame.
     max_tracks: 8 # Max tracks rendered per frame (across the mosaic).

@@ -88,6 +88,7 @@ def main() -> int:
     parser.add_argument("--ws", default="ws://127.0.0.1:6008", help="WebSocket URL")
     parser.add_argument("--pipeline-config", type=Path, default=Path("config/infer.yaml"))
     parser.add_argument("--cameras-config", type=Path, default=Path("config/cameras.yaml"))
+    parser.add_argument("--camera", default="", help="Camera id override (default: first camera in cameras.yaml)")
     parser.add_argument("--enable-rest", action="store_true", help="Start REST server when spawning runtime")
     parser.add_argument("--no-spawn", action="store_true", help="Do not spawn ds8_runtime; assume external runtime")
     parser.add_argument(
@@ -110,7 +111,7 @@ def main() -> int:
         time.sleep(5.0)  # allow startup
 
     try:
-        camera = _first_camera(args.cameras_config)
+        camera = str(args.camera or "").strip() or _first_camera(args.cameras_config)
         payload = None
         last_err = None
         for _ in range(10):
@@ -142,6 +143,11 @@ def main() -> int:
         if missing:
             print(f"[FAIL] missing fields in response: {missing}")
             return 1
+        if "kitchen" in camera.lower():
+            for key in ("obstacle_height", "walkable"):
+                if key not in payload:
+                    print(f"[FAIL] missing kitchen clean layer: {key}")
+                    return 1
         print("[PASS] floorplan RPC returned payload without error")
         return 0
     finally:

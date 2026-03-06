@@ -70,6 +70,89 @@ def intersect_plane(origin: np.ndarray, direction: np.ndarray, plane: Plane) -> 
     return origin + t * direction
 
 
+def project_world_to_image(
+    point_world: Sequence[float],
+    K: np.ndarray,
+    E_col_major_16: Sequence[float],
+    image_size: Tuple[int, int],
+    unit_scale: float = 1.0,
+    *,
+    flip_u: bool = False,
+    flip_v: bool = False,
+) -> Tuple[float, float] | None:
+    """Project a world-space point into image pixels."""
+    if K.shape != (3, 3):
+        raise ValueError("Intrinsics K must be 3x3")
+    if len(point_world) < 3:
+        raise ValueError("point_world must contain xyz")
+    width, height = image_size
+    scale = float(unit_scale or 1.0)
+    R_wc, C_world = parse_extrinsics(E_col_major_16)
+    C_world = C_world * scale
+    world = np.array([float(point_world[0]), float(point_world[1]), float(point_world[2])], dtype=np.float64)
+    R_cw = R_wc.T
+    point_cam = R_cw @ (world - C_world)
+    z_cam = float(point_cam[2])
+    if not math.isfinite(z_cam) or z_cam <= 1e-9:
+        return None
+    uvw = K @ point_cam
+    if abs(float(uvw[2])) < 1e-9:
+        return None
+    u = float(uvw[0] / uvw[2])
+    v = float(uvw[1] / uvw[2])
+    if flip_u:
+        u = float(max(0, int(width) - 1)) - u
+    if flip_v:
+        v = float(max(0, int(height) - 1)) - v
+    if not (math.isfinite(u) and math.isfinite(v)):
+        return None
+    return float(u), float(v)
+
+
+def estimate_upright_height_from_top_and_foot(
+    u: float,
+    v: float,
+    foot_world: Sequence[float],
+    K: np.ndarray,
+    E_col_major_16: Sequence[float],
+    floor_y: float,
+    image_size: Tuple[int, int],
+    unit_scale: float = 1.0,
+    *,
+    flip_u: bool = False,
+    flip_v: bool = False,
+) -> float | None:
+    """Estimate an upright person's height from a top-of-box pixel and a floor footpoint."""
+    if K.shape != (3, 3):
+        raise ValueError("Intrinsics K must be 3x3")
+    if len(foot_world) < 3:
+        raise ValueError("foot_world must contain xyz")
+    width, height = image_size
+    scale = float(unit_scale or 1.0)
+    floor_y_scaled = float(floor_y) * scale
+    R_wc, C_world = parse_extrinsics(E_col_major_16)
+    C_world = C_world * scale
+    if flip_u:
+        u = float(max(0, int(width) - 1)) - float(u)
+    if flip_v:
+        v = float(max(0, int(height) - 1)) - float(v)
+    origin, direction = ray_from_pixel(float(u), float(v), K, R_wc, C_world)
+    foot = np.array([float(foot_world[0]), float(foot_world[1]), float(foot_world[2])], dtype=np.float64)
+    denom = float(direction[0] * direction[0] + direction[2] * direction[2])
+    if denom <= 1e-9:
+        return None
+    t = (
+        (float(foot[0]) - float(origin[0])) * float(direction[0])
+        + (float(foot[2]) - float(origin[2])) * float(direction[2])
+    ) / denom
+    if not math.isfinite(t) or t <= 0.0:
+        return None
+    height = float(origin[1] + t * float(direction[1]) - floor_y_scaled)
+    if not math.isfinite(height) or height <= 0.0:
+        return None
+    return float(height)
+
+
 def compute_ground_frustum_aabb(
     K: np.ndarray,
     E_col_major_16: Iterable[float],
@@ -290,6 +373,8 @@ __all__ = [
     "parse_extrinsics",
     "ray_from_pixel",
     "intersect_plane",
+    "project_world_to_image",
+    "estimate_upright_height_from_top_and_foot",
     "compute_ground_frustum_aabb",
     "img_to_plane_homography",
     "plane_to_bev_affine",

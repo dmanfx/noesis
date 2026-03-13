@@ -85,10 +85,19 @@ class WebSocketServer:
         self.webrtc_elem: Optional[Any] = None
         # WebRTC gateway reference (new RTSP-based gateway approach)
         self.webrtc_gateway: Optional[Any] = None
+        self.webrtc_gateways: List[Any] = []
+        try:
+            self._webrtc_max_clients = max(1, int(os.environ.get("NOESIS_MOSAIC_WEBRTC_MAX_CLIENTS", "5")))
+        except Exception:
+            self._webrtc_max_clients = 5
         # WebRTC signaling ownership: only the connection that most recently sent a
         # webrtc_offer should receive webrtc_answer / server ICE candidates.
         self._webrtc_owner: Optional[Any] = None
         self._webrtc_owner_ip: Optional[str] = None
+        # Multi-gateway ownership maps (one websocket owner per gateway instance).
+        self._webrtc_gateway_owner: Dict[Any, Any] = {}
+        self._webrtc_gateway_owner_ip: Dict[Any, str] = {}
+        self._webrtc_client_gateway: Dict[Any, Any] = {}
         # Boundary serialization metrics (JSON conversion at WS boundary).
         self._boundary_lock = threading.Lock()
         self._boundary_samples_ms = deque(maxlen=4096)
@@ -349,6 +358,48 @@ class WebSocketServer:
         self._webrtc_owner_ip = None
         return None
 
+    def _get_gateway_owner(self, gateway: Any) -> Optional[Any]:
+        owner = self._webrtc_gateway_owner.get(gateway)
+        if owner is None:
+            return None
+        if owner in self.connected_clients:
+            return owner
+        self._webrtc_gateway_owner.pop(gateway, None)
+        self._webrtc_gateway_owner_ip.pop(gateway, None)
+        for client, assigned_gateway in list(self._webrtc_client_gateway.items()):
+            if assigned_gateway is gateway:
+                self._webrtc_client_gateway.pop(client, None)
+        return None
+
+    def _set_gateway_owner(self, gateway: Any, websocket: Any, client_ip: str) -> None:
+        self._webrtc_gateway_owner[gateway] = websocket
+        self._webrtc_gateway_owner_ip[gateway] = client_ip
+        self._webrtc_client_gateway[websocket] = gateway
+
+    def _clear_gateway_owner_for_client(self, websocket: Any) -> None:
+        gateway = self._webrtc_client_gateway.pop(websocket, None)
+        if gateway is not None and self._webrtc_gateway_owner.get(gateway) is websocket:
+            self._webrtc_gateway_owner.pop(gateway, None)
+            self._webrtc_gateway_owner_ip.pop(gateway, None)
+        for gw, owner in list(self._webrtc_gateway_owner.items()):
+            if owner is websocket:
+                self._webrtc_gateway_owner.pop(gw, None)
+                self._webrtc_gateway_owner_ip.pop(gw, None)
+
+    def _select_gateway_for_client(self, websocket: Any) -> Optional[Any]:
+        assigned_gateway = self._webrtc_client_gateway.get(websocket)
+        if assigned_gateway in self.webrtc_gateways:
+            owner = self._get_gateway_owner(assigned_gateway)
+            if owner is None or owner is websocket:
+                return assigned_gateway
+            self._webrtc_client_gateway.pop(websocket, None)
+
+        for gateway in self.webrtc_gateways:
+            owner = self._get_gateway_owner(gateway)
+            if owner is None:
+                return gateway
+        return None
+
     async def _send_to_client(self, websocket, message) -> None:
         """Send a message to one client, mirroring broadcast() semantics."""
         if not websocket or websocket not in self.connected_clients:
@@ -583,17 +634,33 @@ class WebSocketServer:
 
     def register_webrtc_gateway(self, gateway: Any) -> None:
         """Register the MosaicWebRTCGateway for signaling."""
-        self.webrtc_gateway = gateway
-        self.logger.info("WebRTC gateway registered with WebSocketServer")
+        if gateway not in self.webrtc_gateways:
+            if len(self.webrtc_gateways) >= self._webrtc_max_clients:
+                self.logger.warning(
+                    "Ignoring extra WebRTC gateway registration (max=%d)",
+                    self._webrtc_max_clients,
+                )
+                return
+            self.webrtc_gateways.append(gateway)
+            self.logger.info(
+                "WebRTC gateway registered with WebSocketServer (%d/%d)",
+                len(self.webrtc_gateways),
+                self._webrtc_max_clients,
+            )
+        self.webrtc_gateway = self.webrtc_gateways[0] if self.webrtc_gateways else gateway
 
-    def send_webrtc_answer(self, sdp: str) -> None:
+    def send_webrtc_answer(self, sdp: str, gateway: Optional[Any] = None) -> None:
         """Send WebRTC answer SDP to the owning client (fallback: broadcast)."""
         msg = {"type": "webrtc_answer", "sdp": sdp}
-        owner = self._get_webrtc_owner()
+        owner = self._get_gateway_owner(gateway) if gateway is not None else self._get_webrtc_owner()
+        owner_ip = self._webrtc_gateway_owner_ip.get(gateway) if gateway is not None else self._webrtc_owner_ip
         if owner is not None:
-            self.logger.info("<<< Sending webrtc_answer to WebRTC owner %s", self._webrtc_owner_ip or "unknown")
+            self.logger.info("<<< Sending webrtc_answer to WebRTC owner %s", owner_ip or "unknown")
         else:
-            self.logger.info("<<< Sending webrtc_answer to %d connected clients", len(self.connected_clients))
+            if gateway is not None:
+                self.logger.warning("No gateway owner for webrtc_answer; dropping answer")
+            else:
+                self.logger.info("<<< Sending webrtc_answer to %d connected clients", len(self.connected_clients))
         try:
             import json as _json, time as _time
 
@@ -616,25 +683,29 @@ class WebSocketServer:
             pass
         if owner is not None:
             self.send_to_client_sync(owner, msg)
-        else:
+        elif gateway is None:
             self.broadcast_sync(msg)
 
-    def send_webrtc_ice(self, mline_index: int, candidate: str) -> None:
+    def send_webrtc_ice(self, mline_index: int, candidate: str, gateway: Optional[Any] = None) -> None:
         """Send WebRTC ICE candidate to the owning client (fallback: broadcast)."""
         msg = {
             "type": "webrtc_ice_candidate",
             "candidate": candidate,
             "sdpMLineIndex": mline_index,
         }
-        owner = self._get_webrtc_owner()
+        owner = self._get_gateway_owner(gateway) if gateway is not None else self._get_webrtc_owner()
+        owner_ip = self._webrtc_gateway_owner_ip.get(gateway) if gateway is not None else self._webrtc_owner_ip
         if owner is not None:
             self.logger.info(
                 "<<< Sending webrtc_ice_candidate (mline=%d) to WebRTC owner %s",
                 mline_index,
-                self._webrtc_owner_ip or "unknown",
+                owner_ip or "unknown",
             )
         else:
-            self.logger.info("<<< Sending webrtc_ice_candidate (mline=%d) to %d clients", mline_index, len(self.connected_clients))
+            if gateway is not None:
+                self.logger.warning("No gateway owner for webrtc_ice_candidate; dropping candidate")
+            else:
+                self.logger.info("<<< Sending webrtc_ice_candidate (mline=%d) to %d clients", mline_index, len(self.connected_clients))
         try:
             import json as _json, time as _time
 
@@ -657,19 +728,23 @@ class WebSocketServer:
             pass
         if owner is not None:
             self.send_to_client_sync(owner, msg)
-        else:
+        elif gateway is None:
             self.broadcast_sync(msg)
 
-    def send_webrtc_error(self, error: str) -> None:
+    def send_webrtc_error(self, error: str, gateway: Optional[Any] = None) -> None:
         """Send WebRTC error to the owning client (fallback: broadcast)."""
         msg = {"type": "webrtc_error", "error": error}
-        owner = self._get_webrtc_owner()
+        owner = self._get_gateway_owner(gateway) if gateway is not None else self._get_webrtc_owner()
+        owner_ip = self._webrtc_gateway_owner_ip.get(gateway) if gateway is not None else self._webrtc_owner_ip
         if owner is not None:
             self.send_to_client_sync(owner, msg)
-            self.logger.warning("<<< WebRTC error (owner=%s): %s", self._webrtc_owner_ip or "unknown", error)
+            self.logger.warning("<<< WebRTC error (owner=%s): %s", owner_ip or "unknown", error)
         else:
-            self.broadcast_sync(msg)
-            self.logger.warning("<<< Broadcast WebRTC error: %s", error)
+            if gateway is not None:
+                self.logger.warning("<<< WebRTC error dropped (no owner): %s", error)
+            else:
+                self.broadcast_sync(msg)
+                self.logger.warning("<<< Broadcast WebRTC error: %s", error)
 
     async def _periodic_menon_telemetry_log(self, interval_seconds: float = 1.0) -> None:
         """Emit a concise 1 Hz INFO log with latest Menon calibration/coordinate RX/TX."""
@@ -1600,20 +1675,26 @@ class WebSocketServer:
                     # Handle WebRTC signaling: offer from browser
                     elif data.get('type') == 'webrtc_offer':
                         self.logger.info(">>> Received webrtc_offer from client %s", client_ip)
-                        if self.webrtc_gateway is not None or self.webrtc_elem is not None:
-                            prev_owner = self._get_webrtc_owner()
-                            if prev_owner is not None and prev_owner is not websocket:
-                                try:
-                                    await prev_owner.send(json.dumps({'type': 'webrtc_error', 'error': 'webrtc_taken_over'}))
-                                except Exception:
-                                    pass
-                            self._webrtc_owner = websocket
-                            self._webrtc_owner_ip = client_ip
-                        # Prefer gateway if registered, otherwise fall back to legacy approach
-                        if self.webrtc_gateway is not None:
+                        # Prefer gateway pool if registered, otherwise fall back to legacy approach.
+                        if self.webrtc_gateways:
                             sdp = data.get('sdp', '')
                             sdp_lines = len(sdp.split('\n')) if sdp else 0
-                            self.logger.info("    Gateway registered, forwarding offer (%d SDP lines)", sdp_lines)
+                            gateway = self._select_gateway_for_client(websocket)
+                            if gateway is None:
+                                await websocket.send(json.dumps({'type': 'webrtc_error', 'error': 'webrtc_capacity_reached'}))
+                                self.logger.warning(
+                                    "    No free WebRTC gateway slot for %s (capacity=%d)",
+                                    client_ip,
+                                    len(self.webrtc_gateways),
+                                )
+                                continue
+                            self._set_gateway_owner(gateway, websocket, client_ip)
+                            slot = self.webrtc_gateways.index(gateway)
+                            self.logger.info(
+                                "    Forwarding offer to gateway slot %d (%d SDP lines)",
+                                slot,
+                                sdp_lines,
+                            )
                             try:
                                 import json as _json, time as _time
 
@@ -1664,29 +1745,48 @@ class WebSocketServer:
                                     )
                             except Exception:
                                 pass
-                            self.webrtc_gateway.accept_offer(sdp)
-                        else:
+                            gateway.accept_offer(sdp)
+                        elif self.webrtc_elem is not None:
+                            prev_owner = self._get_webrtc_owner()
+                            if prev_owner is not None and prev_owner is not websocket:
+                                try:
+                                    await prev_owner.send(json.dumps({'type': 'webrtc_error', 'error': 'webrtc_taken_over'}))
+                                except Exception:
+                                    pass
+                            self._webrtc_owner = websocket
+                            self._webrtc_owner_ip = client_ip
                             self.logger.warning("    No gateway registered, using legacy handler")
                             await self._handle_webrtc_offer(websocket, data)
+                        else:
+                            await websocket.send(json.dumps({'type': 'webrtc_error', 'error': 'no_webrtc_gateway'}))
+                            self.logger.warning("    No WebRTC gateway/endpoint available")
 
                     # Handle WebRTC signaling: ICE candidate from browser
                     elif data.get('type') == 'webrtc_ice_candidate':
                         self.logger.info(">>> Received webrtc_ice_candidate from client %s", client_ip)
-                        owner = self._get_webrtc_owner()
-                        if owner is not None and owner is not websocket:
-                            try:
-                                await websocket.send(json.dumps({'type': 'webrtc_error', 'error': 'webrtc_not_owner'}))
-                            except Exception:
-                                pass
-                            continue
-                        if owner is None and (self.webrtc_gateway is not None or self.webrtc_elem is not None):
-                            self._webrtc_owner = websocket
-                            self._webrtc_owner_ip = client_ip
-                        # Prefer gateway if registered
-                        if self.webrtc_gateway is not None:
+                        if self.webrtc_gateways:
+                            gateway = self._webrtc_client_gateway.get(websocket)
+                            if gateway is None or gateway not in self.webrtc_gateways:
+                                try:
+                                    await websocket.send(json.dumps({'type': 'webrtc_error', 'error': 'webrtc_not_owner'}))
+                                except Exception:
+                                    pass
+                                continue
+                            owner = self._get_gateway_owner(gateway)
+                            if owner is not websocket:
+                                try:
+                                    await websocket.send(json.dumps({'type': 'webrtc_error', 'error': 'webrtc_not_owner'}))
+                                except Exception:
+                                    pass
+                                continue
                             candidate = data.get('candidate', '')
                             mline_index = data.get('sdpMLineIndex', 0)
-                            self.logger.info("    Adding ICE candidate (mline=%d): %s...", mline_index, candidate[:50] if candidate else '')
+                            self.logger.info(
+                                "    Adding ICE candidate to gateway slot %d (mline=%d): %s...",
+                                self.webrtc_gateways.index(gateway),
+                                mline_index,
+                                candidate[:50] if candidate else '',
+                            )
                             try:
                                 import json as _json, time as _time
 
@@ -1707,8 +1807,18 @@ class WebSocketServer:
                                     )
                             except Exception:
                                 pass
-                            self.webrtc_gateway.accept_ice(candidate, mline_index)
+                            gateway.accept_ice(candidate, mline_index)
                         else:
+                            owner = self._get_webrtc_owner()
+                            if owner is not None and owner is not websocket:
+                                try:
+                                    await websocket.send(json.dumps({'type': 'webrtc_error', 'error': 'webrtc_not_owner'}))
+                                except Exception:
+                                    pass
+                                continue
+                            if owner is None and self.webrtc_elem is not None:
+                                self._webrtc_owner = websocket
+                                self._webrtc_owner_ip = client_ip
                             await self._handle_webrtc_ice_candidate(websocket, data)
 
                 except json.JSONDecodeError:
@@ -1732,6 +1842,7 @@ class WebSocketServer:
             # Ensure client is removed from set - use discard to avoid KeyError if already removed
             try:
                 self.connected_clients.discard(websocket)
+                self._clear_gateway_owner_for_client(websocket)
                 if self._webrtc_owner is websocket:
                     self._webrtc_owner = None
                     self._webrtc_owner_ip = None

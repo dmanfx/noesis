@@ -1255,7 +1255,7 @@ class MosaicWebRTCGateway:
         else:
             logger.warning("No H264 payload type found in offer")
             try:
-                self.ws.send_webrtc_error("webrtc_gateway_no_h264_in_offer")
+                self.ws.send_webrtc_error("webrtc_gateway_no_h264_in_offer", gateway=self)
             except Exception:
                 pass
             return
@@ -1294,7 +1294,7 @@ class MosaicWebRTCGateway:
             self.webrtc.emit("set-remote-description", offer, promise)
         except Exception as e:
             logger.exception("Error processing WebRTC offer: %s", e)
-            self.ws.send_webrtc_error(str(e))
+            self.ws.send_webrtc_error(str(e), gateway=self)
 
     def _on_set_remote_description_done(self, promise: Gst.Promise) -> None:
         """Callback after setting remote description."""
@@ -1354,7 +1354,7 @@ class MosaicWebRTCGateway:
                         logger.warning("No RTSP frames yet; refusing to answer after 15s")
                         self._pending_create_answer = False
                         try:
-                            self.ws.send_webrtc_error("webrtc_gateway_no_frames")
+                            self.ws.send_webrtc_error("webrtc_gateway_no_frames", gateway=self)
                         except Exception:
                             pass
                         return False
@@ -1523,7 +1523,7 @@ class MosaicWebRTCGateway:
             except Exception:
                 pass
             try:
-                self.ws.send_webrtc_error("webrtc_gateway_inactive_answer")
+                self.ws.send_webrtc_error("webrtc_gateway_inactive_answer", gateway=self)
             except Exception:
                 pass
             try:
@@ -1550,7 +1550,7 @@ class MosaicWebRTCGateway:
             except Exception:
                 pass
             logger.info("    Local description set")
-            self.ws.send_webrtc_answer(sdp_text)
+            self.ws.send_webrtc_answer(sdp_text, gateway=self)
 
         promise2 = Gst.Promise.new_with_change_func(_on_local_description_set)
         self.webrtc.emit("set-local-description", answer, promise2)
@@ -1620,7 +1620,7 @@ class MosaicWebRTCGateway:
         """Called when webrtcbin has a local ICE candidate to send to peer."""
         logger.info("<<< Sending local ICE candidate (mline=%d): %s...", mline_index, candidate[:50] if candidate else '')
         try:
-            self.ws.send_webrtc_ice(mline_index, candidate)
+            self.ws.send_webrtc_ice(mline_index, candidate, gateway=self)
         except Exception as e:
             logger.warning("Failed to send ICE candidate: %s", e)
 

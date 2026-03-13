@@ -3991,8 +3991,8 @@ def main() -> int:
     # This is critical - without wait(), the pipeline may stop after initial buffers
     wait_thread = _start_pyservicemaker_wait_loop(ds, shutdown_event, logger, runtime_state)
 
-    # Start WebRTC gateway if enabled (requires RTSP output)
-    webrtc_gateway = None
+    # Start WebRTC gateway(s) if enabled (requires RTSP output)
+    webrtc_gateways = []
     if mosaic_webrtc_enabled:
         if rtsp_built:
             try:
@@ -4023,16 +4023,34 @@ def main() -> int:
                     from noesis.mosaic_webrtc_gateway import MosaicWebRTCGateway
 
                     rtsp_uri = f"rtsp://127.0.0.1:{rtsp_port}/{rtsp_path}"
+                    try:
+                        max_webrtc_clients = max(1, int(os.environ.get("NOESIS_MOSAIC_WEBRTC_MAX_CLIENTS", "5")))
+                    except Exception:
+                        max_webrtc_clients = 5
                     rtsp_keyframe_requester = _build_rtsp_keyframe_requester(pipeline, logger)
                     if rtsp_keyframe_requester is None:
                         logger.debug("RTSP keyframe requester unavailable; falling back to natural IDR cadence")
-                    webrtc_gateway = MosaicWebRTCGateway(
-                        ws_server=ws_server,
-                        rtsp_uri=rtsp_uri,
-                        request_rtsp_keyframe=rtsp_keyframe_requester,
+                    for slot in range(max_webrtc_clients):
+                        try:
+                            gateway = MosaicWebRTCGateway(
+                                ws_server=ws_server,
+                                rtsp_uri=rtsp_uri,
+                                request_rtsp_keyframe=rtsp_keyframe_requester,
+                            )
+                            gateway.start()
+                            webrtc_gateways.append(gateway)
+                            logger.info(
+                                "WebRTC gateway slot %d/%d started, consuming RTSP at %s",
+                                slot + 1,
+                                max_webrtc_clients,
+                                rtsp_uri,
+                            )
+                        except Exception:
+                            logger.exception("Failed to start WebRTC gateway slot %d", slot + 1)
+                    logger.info(
+                        "WebRTC gateway capacity: %d active slot(s)",
+                        len(webrtc_gateways),
                     )
-                    webrtc_gateway.start()
-                    logger.info("WebRTC gateway started, consuming RTSP at %s", rtsp_uri)
                     #region agent log
                     try:
                         with open("/home/mayor/Noesis_Devel/.cursor/debug.log", "a", encoding="utf-8") as _f:
@@ -4044,7 +4062,7 @@ def main() -> int:
                                         "hypothesisId": "H4",
                                         "location": "ds8_runtime.py:main",
                                         "message": "gateway started",
-                                        "data": {"rtsp_uri": rtsp_uri},
+                                        "data": {"rtsp_uri": rtsp_uri, "slots": len(webrtc_gateways)},
                                         "timestamp": int(time.time() * 1000),
                                     }
                                 )
@@ -4152,13 +4170,14 @@ def main() -> int:
 
     _stop_rest_server(rest_server, rest_thread)
 
-    # Stop WebRTC gateway if running
-    if webrtc_gateway is not None:
-        try:
-            webrtc_gateway.stop()
-            logger.info("WebRTC gateway stopped")
-        except Exception:
-            logger.exception("Error stopping WebRTC gateway")
+    # Stop WebRTC gateways if running
+    if webrtc_gateways:
+        for idx, gateway in enumerate(webrtc_gateways, start=1):
+            try:
+                gateway.stop()
+                logger.info("WebRTC gateway slot %d stopped", idx)
+            except Exception:
+                logger.exception("Error stopping WebRTC gateway slot %d", idx)
 
     # Stop pyservicemaker pipeline and wait thread
     if ds is not None:

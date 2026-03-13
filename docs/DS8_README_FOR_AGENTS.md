@@ -20,6 +20,11 @@ All runtime work should target the DS8 stack unless the user explicitly requests
 
 Current defaults/baselines are summarized in `DS8_Baselines.md`.
 
+## Canonical operating rule
+
+- Do not use fallback paths, degraded modes, substitute algorithms, alternate workflows, or "temporary" DS8 workarounds unless the user explicitly asks for them or agrees after you discuss the blocker.
+- If the canonical DS8 path fails, surface the failure clearly and stop instead of masking it with a fallback.
+
 ## 2. Configuration Map
 
 Key config files:

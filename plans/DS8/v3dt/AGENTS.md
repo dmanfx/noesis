@@ -15,24 +15,28 @@ This folder contains active DS8 V3DT planning docs (SV3DT/MV3DT) for work under 
    - Do not route DS8 failures through deprecated pre-DS8 paths.
    - Only touch deprecated/pre-DS8 code if the user explicitly asks.
 
-2. **V3DT source of truth**
+2. **No fallbacks without explicit user approval**
+   - Do not introduce or rely on fallback paths, degraded modes, substitute algorithms, alternate calibration flows, or "temporary" V3DT workarounds unless the user explicitly asks for them or agrees after you discuss the blocker.
+   - If the primary V3DT path fails, surface the failure clearly and stop instead of masking it with a fallback.
+
+3. **V3DT source of truth**
    - Use `plans/DS8/v3dt/integration_plan.md`, `plans/DS8/v3dt/research_notes.md`, and `plans/DS8/v3dt/work_order.md` as the V3DT implementation spec.
    - Keep planning docs concise; avoid embedding large code blocks where a short pointer is sufficient.
 
-3. **External contract stability**
+4. **External contract stability**
    - Keep `stable_id` as the user-visible identity in WS/BEV/UI payloads.
    - Treat tracker internal IDs (including MV3DT IDs) as internal implementation details.
 
-4. **Doc-backed DS8 API usage**
+5. **Doc-backed DS8 API usage**
    - Use only verified Service Maker / DeepStream APIs and config keys.
    - Verify APIs against `docs/DS8_README_FOR_AGENTS.md`, official DeepStream docs, or installed modules.
 
-5. **DS8 implementation guardrails**
+6. **DS8 implementation guardrails**
    - Keep DS8 GPU-first behavior; do not add new DS8 appsink/CPU branches.
    - Under `noesis/`, prefer Service Maker / Flow APIs and DS8 metadata operators instead of new GStreamer pad-probe patterns.
    - Fail loudly on DS8 errors; do not silently degrade into deprecated runtime behavior.
 
-6. **Progress discipline**
+7. **Progress discipline**
    - Update relevant checklist items (`[ ]` to `[x]`) with dated validation notes as work completes.
    - Record non-trivial design decisions in `plans/DS8/ds8_design_decisions.md`.
 

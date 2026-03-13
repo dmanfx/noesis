@@ -24,13 +24,17 @@ This directory contains planning documents, work orders, and checklists. It is t
    - Update checklists **frequently** (ideally after each small, coherent unit of work), rather than batching changes at the end of a session.
    - Keep these notes concise and focused on what changed and how it was validated.
 
-3. **Do not edit historical archives**
+3. **No fallback workarounds without explicit user approval**
+   - Do not treat a fallback path, degraded mode, alternate workflow, or "temporary" substitute as an acceptable way to complete planned work unless the user explicitly asks for it or agrees after you discuss the blocker.
+   - If the intended path is blocked, record the blocker clearly in the plan docs instead of silently substituting a fallback.
+
+4. **Do not edit historical archives**
    - Files under `plans/archive/` and `plans/DS8/archive/` are historical and should not be edited unless explicitly requested.
    - New planning and progress should go into non-archive files.
 
-4. **No code in planning docs**
+5. **No code in planning docs**
    - Avoid embedding large code blocks in planning documents.
    - If you need to reference code, prefer short snippets or file/line pointers.
 
-5. **Design decisions**
+6. **Design decisions**
    - For non-trivial design choices (new APIs, schema changes, behavioral changes), add an entry to `plans/DS8/ds8_design_decisions.md` instead of burying the rationale in a comment.

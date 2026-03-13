@@ -33,6 +33,7 @@ This file defines the local working contract for Menon world unification executi
 - Add a one-line dated validation note below each completed item.
 - If interface behavior changes, update `contracts.md` in the same session.
 - If a non-trivial technical decision is made, record it in `decisions.md`.
+- Do not switch to fallback paths, degraded modes, or substitute workflows unless the user explicitly asks for that fallback or agrees after you surface the blocker; record the blocker instead of masking it.
 
 ### End of session
 

@@ -12,6 +12,9 @@ right doc. Read this before touching code.
 ## Ground Rules
 - **DS8 is canonical.** Only change deprecated pre-DS8 artifacts if a user
   explicitly asks. Keep GPU-first; no new CPU appsink branches in DS8.
+- **No fallbacks unless the user explicitly approves them.** Do not use fallback
+  paths, degraded modes, substitute workflows, or "temporary" alternates to
+  hide a blocker. Surface the failure and discuss it instead.
 - **Follow the DS8 plans/checklists.** If code and docs disagree, surface the
   discrepancy and update docs rather than guessing.
 - **Stable IDs:** `stable_id` is the only user-visible person ID. `track_id` is

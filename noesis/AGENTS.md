@@ -26,32 +26,36 @@ This directory tree is the canonical DeepStream 8 / Service Maker / Flow impleme
    - Exception: the RTSP→WebRTC mosaic gateway (`noesis/mosaic_webrtc_gateway.py`) is an intentional, separate GStreamer pipeline (GI) used only for mosaic delivery; `noesis/ds8_runtime.py` may also use GI for that gateway and RTSP keyframe requests.
    - All DS8 pipeline construction should use DeepStream 8 Service Maker APIs (`pyservicemaker`) and DeepStream Python bindings (`pyds`) where needed.
 
-2. **Prefer Service Maker / Flow APIs**
+2. **No fallbacks without explicit user approval**
+   - Do not add or activate fallback paths, degraded modes, substitute algorithms, alternate metadata sources, or legacy runtime routes unless the user explicitly asks for that fallback or agrees after you discuss the blocker.
+   - If the canonical DS8 path fails, surface the failure and stop instead of masking it with a fallback.
+
+3. **Prefer Service Maker / Flow APIs**
    - For pipeline construction, use the documented `Pipeline` API.
    - For data retrieval and gating, use documented Service Maker/Flow primitives such as `BufferRetriever`, `BufferOperator`, and batch metadata (`Buffer.batch_meta`).
 
-3. **No deprecated-stack pad probes or appsinks**
+4. **No deprecated-stack pad probes or appsinks**
    - Do not add new pad probes or appsinks in DS8 code.
    - Metadata extraction should be done via DS8 batch metadata operators and Service Maker operators, not via GStreamer pad probes.
 
-4. **Doc-backed API usage only**
+5. **Doc-backed API usage only**
    - Before using or adding any Service Maker / DeepStream calls, verify them against:
      - The official DS8 documentation, or
      - The installed Python module documentation (e.g., `help(pyservicemaker.Pipeline)`, `help(pyds)`).
    - Do not introduce calls to undocumented attributes or methods.
 
-5. **Keep behavior in sync with plans**
+6. **Keep behavior in sync with plans**
    - When modifying code under `noesis/`, always check the relevant DS8 planning documents in `plans/DS8/` and respect the master work orders.
    - If you need to deviate, update the appropriate plan/checklist and log the decision in `plans/DS8/ds8_design_decisions.md`.
 
-6. **Logging and robustness**
+7. **Logging and robustness**
    - Favor clear, actionable log messages when DS8 operations fail (e.g., pipeline build errors, hook attachment errors).
    - Handle missing DS8 libs gracefully in tests, but in production paths prefer failing fast over silently degrading into deprecated runtime behavior.
 
-7. **Native metadata extension validation**
+8. **Native metadata extension validation**
    - If changes affect V3DT or pose metadata extraction paths, rebuild and validate native bridges (`noesis_v3dt_meta_ext`, `noesis_pose_meta_ext`) before considering work complete.
    - Use focused smoke checks (for example `scripts/sv3dt_meta_smoke_test.py`) after extension-related changes.
 
-8. **Portable paths only**
+9. **Portable paths only**
    - Do not introduce new hardcoded absolute machine-local paths in DS8 runtime code.
    - Use repo-relative resolution (`REPO_ROOT`) or explicit config/env inputs.

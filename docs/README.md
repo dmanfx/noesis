@@ -49,6 +49,8 @@ and worklogs live in `docs/history/`.
 
 ## Doc changes (2026-03-07)
 - Updated the DS8 seg+depth rebuild notes to document the deterministic linear depth->seg path, canonical frame-space fusion, internal aligned-depth cache, and the no-bbox-fallback object-depth contract (`DS8_metadata_contracts.md`, `plans/DS8/ds8_design_decisions.md`, `plans/DS8/ds8_migration_checklist_hooks.md`, `docs/README.md`).
+- Standardized agent-facing no-fallback policy language across repo, DS8, planning, and docs quickstart guidance so agents must surface blockers instead of masking them with alternates (`AGENTS.md`, `noesis/AGENTS.md`, `plans/AGENTS.md`, `plans/menon_world_unification/AGENTS.md`, `plans/DS8/v3dt/AGENTS.md`, `docs/AGENTS.md`, `docs/DS8_README_FOR_AGENTS.md`).
+
 ## Doc changes (2026-02-22)
 - Updated BEV/floorplan tracking + trails docs to match world-first `menon_scene` (scene units) behavior and frontend-owned smoothing/persistence (`DS8_Baselines.md`, `DS8_README_FOR_AGENTS.md`, `CODEBASE_DESCRIPTION.md`).
 - Updated WS contracts for tracking world fields and `floorplan_response` payload shape (`DS8_api_contracts_ws.md`).

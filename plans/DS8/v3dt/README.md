@@ -4,6 +4,11 @@ This folder contains DS8-focused planning docs for integrating **SV3DT** (Single
 
 **Audience:** future implementation agent (Codex) + project owner review.
 
+## Primary execution rule
+
+- Do not use fallback paths, degraded modes, substitute algorithms, alternate calibration flows, or "temporary" V3DT workarounds unless the user explicitly asks for them or agrees after you discuss the blocker.
+- If the primary V3DT path fails, surface the failure clearly and stop instead of masking it with a fallback.
+
 ## What you asked for (site context)
 
 - Cameras:

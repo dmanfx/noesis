@@ -44,6 +44,11 @@ and worklogs live in `docs/history/`.
 - Added ReID alias REST contracts, guardrails, and limitations (`DS8_api_contracts_rest.md`).
 - Logged the soft-merge alias design decision and updated DS8 hooks/runtime checklists (`plans/DS8/ds8_design_decisions.md`, `plans/DS8/ds8_migration_checklist_hooks.md`, `plans/DS8/ds8_migration_checklist_ds8_runtime.md`).
 
+## Doc changes (2026-03-06)
+- Documented the canonical `NOESIS.OBJECT_DEPTH` DS8 object user-meta contract and logged the prototype depth-fusion metadata decision/progress (`DS8_metadata_contracts.md`, `plans/DS8/ds8_design_decisions.md`, `plans/DS8/ds8_migration_checklist_hooks.md`).
+
+## Doc changes (2026-03-07)
+- Updated the DS8 seg+depth rebuild notes to document the deterministic linear depth->seg path, canonical frame-space fusion, internal aligned-depth cache, and the no-bbox-fallback object-depth contract (`DS8_metadata_contracts.md`, `plans/DS8/ds8_design_decisions.md`, `plans/DS8/ds8_migration_checklist_hooks.md`, `docs/README.md`).
 ## Doc changes (2026-02-22)
 - Updated BEV/floorplan tracking + trails docs to match world-first `menon_scene` (scene units) behavior and frontend-owned smoothing/persistence (`DS8_Baselines.md`, `DS8_README_FOR_AGENTS.md`, `CODEBASE_DESCRIPTION.md`).
 - Updated WS contracts for tracking world fields and `floorplan_response` payload shape (`DS8_api_contracts_ws.md`).

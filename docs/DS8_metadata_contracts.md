@@ -1,5 +1,5 @@
 # DS8 Metadata Contracts
-_Status: current as of 2026-02-02._
+_Status: current as of 2026-03-07._
 
 This document summarizes the key metadata structures used by the DS8 pipeline, both on-frame (user meta) and in downstream telemetry.
 
@@ -282,7 +282,70 @@ static void pose_meta_release(gpointer data, gpointer) {
 - See `docs/DS8_pose_stable_id_integration.md` for fusion thresholds, env flags, and memory caps.
 - Attached in DS8 via `noesis_pose_meta_ext.attach_pose_features(...)` which calls `nvds_add_user_meta_to_obj` with the lifecycle functions defined above.
 
-## 7. Pose Keypoint Visualization (OSD)
+## 7. Object Depth User Meta (Object-Level)
+
+**Producer:** DS8 seg+depth prototype (YOLO26 seg + DepthAnything V2 metric) running a deterministic linear DS8 path: depth infer -> seg preprocess -> seg infer -> object-depth fusion -> overlay -> OSD.
+
+**Meta type:** `NOESIS.OBJECT_DEPTH` (user meta attached to each `NvDsObjectMeta`).
+
+**Payload:** JSON string attached as user meta data. Shape:
+
+```json
+{
+  "type": "object_depth",
+  "version": 2,
+  "model": "depth-anything-v2-metric-hypersim-vits",
+  "source_id": 0,
+  "frame_id": 123,
+  "object_id": 456,
+  "class_id": 0,
+  "bbox": [left, top, width, height],
+  "score": 0.87,
+  "sampling_mode": "instance_mask",
+  "status": "ok",
+  "unit": "m",
+  "is_metric": true,
+  "sample_count": 512,
+  "valid_fraction": 0.82,
+  "depth_center": 1.2,
+  "depth_median": 1.3,
+  "depth_mean": 1.31,
+  "depth_p10": 0.9,
+  "depth_p90": 1.8,
+  "depth_min": 0.7,
+  "depth_max": 2.0,
+  "mask_area_px": 640,
+  "stable_id": 12,
+  "anchor_uv": [420.5, 541.5],
+  "anchor_source": "lower_body_band",
+  "anchor_depth_m": 1.25,
+  "world_point": [1.0, 0.0, 3.5],
+  "world_point_depth": [1.1, 0.2, 3.6],
+  "world_point_floor": [1.0, 0.0, 3.4],
+  "projection_method": "depth",
+  "spatial_status": "ok",
+  "spatial_class": "person",
+  "depth_map_ref": "memory://depth/family-room/1700000000000",
+  "ts_us": 1700000000000
+}
+```
+
+**Notes:**
+
+- The payload is attached per object only after full-frame depth has been aligned once into canonical post-mux DS8 frame coordinates and sampled strictly over the decoded instance mask.
+- `bbox` and all mask/depth statistics are expressed in that canonical DS8 frame space. Source-native dimensions (`source_frame_width`, `source_frame_height`) are diagnostic-only and must not be used for object-depth sampling.
+- There is no bbox fallback in the current prototype path. If the mask is missing, mask decode fails, the aligned depth frame is not ready, or the geometry is inconsistent, the payload is still attached with a non-`"ok"` `status`.
+- `status` is mandatory and distinguishes usable samples (`"ok"`) from object-local failures such as `"no_valid_depth"`, `"missing_mask"`, `"mask_decode_failed"`, `"depth_not_ready"`, or `"transform_mismatch"`.
+- Version `2` adds optional person-only spatial fields derived from the segmentation mask plus the DS8 calibration bundle. `anchor_uv` is the bottom-of-mask image anchor in canonical frame space, `anchor_depth_m` is the preferred lower-body or torso-core depth sample, and `world_point*` fields are produced by `pixel_to_world(...)` without applying `align.matrix`.
+- `projection_method` is one of `"depth"`, `"floor_guarded"`, `"depth_only"`, or `"floor_only"`. `spatial_status` surfaces whether that world projection is usable (`"ok"`) or why it is absent (`"geometry_unavailable"`, `"anchor_unavailable"`, `"projection_unavailable"`).
+- Non-person classes keep the raw object-depth payload behavior and omit the spatial fields.
+- The runtime uses a bounded internal aligned-depth cache to hand the canonical full-frame depth map from the depth-capture operator to the later object-fusion/overlay operators. That cache is prototype-internal only and is not a public DS8 metadata contract.
+- `sampling_mode` is currently fixed to `"instance_mask"`. Consumers must not infer bbox-based semantics from missing numeric fields.
+- `unit` and `is_metric` travel with the payload so downstream consumers can distinguish metric meters from relative-depth fallbacks without guessing from the model name.
+- `depth_map_ref` is optional and is an opaque pointer to any stored full-frame depth artifact when one exists; consumers must not parse semantics out of the string.
+- Attached in DS8 via `noesis_depth_meta_ext.attach_object_depth(...)`; instance masks are copied out of `NvOSD_MaskParams` via the native helper `noesis_depth_meta_ext.extract_object_mask(...)` before sampling.
+
+## 8. Pose Keypoint Visualization (OSD)
 
 Pose keypoints/skeletons are **rendered in the mosaic** using DS8 display metadata inserted just before `nvdsosd`:
 
@@ -292,7 +355,7 @@ Pose keypoints/skeletons are **rendered in the mosaic** using DS8 display metada
 
 This visualization does **not** add new user meta; it is purely an OSD overlay.
 
-## 6. Calibration & Geometry
+## 9. Calibration & Geometry
 
 **Consumers:** `noesis/telemetry/bev.py`, calibration RPCs in `websocket_server.py`, geometry helpers.
 

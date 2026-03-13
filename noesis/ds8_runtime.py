@@ -41,6 +41,10 @@ from noesis.metadata.intrinsics import CameraConfigLoader
 from noesis.telemetry.publishers import DepthTelemetryPublisher, TrackingTelemetryPublisher, bind_occupancy_publisher
 from noesis.diagnostics.telemetry_log import TrackingDiagnosticsLogger
 from noesis.telemetry.bev import BevRenderer, CalibrationSnapshot
+from noesis.yolo26_seg_materialization import (
+    materialize_yolo26_seg_configs as _shared_materialize_yolo26_seg_configs,
+)
+from noesis.yolo26_seg_materialization import resolve_yolo26_seg_assets as _shared_resolve_yolo26_seg_assets
 from websocket_server import WebSocketServer
 
 # GLib/GObject for GStreamer main loop (required for bus event dispatch)
@@ -330,34 +334,22 @@ def _materialize_rfdetr_pgie_ini(size: str, logger: logging.Logger) -> Path:
 
 
 def _resolve_yolo26_assets(size: str) -> Dict[str, Path]:
-    size_norm = str(size or "").strip().lower()
-    if size_norm not in ("n", "s", "m"):
-        raise SystemExit(f"[FATAL] YOLO26 size must be one of n/s/m (got: {size})")
-    return {
-        "template": (REPO_ROOT / "pipelines" / "config_infer_primary_yolo26_seg.template.ini").resolve(),
-        "onnx": (REPO_ROOT / "models" / f"yolo26{size_norm}-seg_fused.onnx").resolve(),
-        "engine": (REPO_ROOT / "models" / "engines" / f"yolo26{size_norm}-seg_fused_b3_fp16.engine").resolve(),
-        "labels": (REPO_ROOT / "models" / "coco_labels.txt").resolve(),
-        "parser": (REPO_ROOT / "pipelines" / "nvdsinfer_yolo26_seg" / "libnvdsinfer_yolo26_seg.so").resolve(),
-        "output": (REPO_ROOT / "build" / f"config_infer_primary_yolo26_seg_{size_norm}.ini").resolve(),
-    }
+    try:
+        return _shared_resolve_yolo26_assets(size)
+    except ValueError as exc:
+        raise SystemExit(f"[FATAL] {exc}") from exc
 
 
-def _materialize_yolo26_pgie_ini(size: str, logger: logging.Logger) -> Path:
-    assets = _resolve_yolo26_assets(size)
-    template_path = assets["template"]
-    if not template_path.exists():
-        raise SystemExit(f"[FATAL] YOLO26 PGIE template missing: {template_path}")
-    out_path = assets["output"]
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    text = template_path.read_text(encoding="utf-8")
-    text = text.replace("@ONNX_PATH@", str(assets["onnx"]))
-    text = text.replace("@ENGINE_PATH@", str(assets["engine"]))
-    text = text.replace("@LABELS_PATH@", str(assets["labels"]))
-    text = text.replace("@CUSTOM_LIB@", str(assets["parser"]))
-    out_path.write_text(text, encoding="utf-8")
-    logger.info("YOLO26 PGIE config materialized: %s", out_path)
-    return out_path
+def _materialize_yolo26_configs(size: str, src_ids: Tuple[int, ...], logger: logging.Logger) -> Dict[str, Path]:
+    try:
+        return _shared_materialize_yolo26_seg_configs(
+            size=size,
+            batch_size=3,
+            src_ids=src_ids,
+            logger=logger,
+        )
+    except (FileNotFoundError, ValueError) as exc:
+        raise SystemExit(f"[FATAL] {exc}") from exc
 
 
 def _load_rfdetr_trt_plugin_library(yaml_path: Path, logger: logging.Logger) -> None:
@@ -463,6 +455,12 @@ def _preflight_pgie_profile(profile: str, pipeline_cfg: Dict[str, Any], yaml_pat
         return
 
     if profile == "yolo26_seg":
+        preprocess_cfg = pipeline_cfg.get("preprocess") if isinstance(pipeline_cfg, dict) else None
+        preprocess_path_raw = (preprocess_cfg or {}).get("config-file") if isinstance(preprocess_cfg, dict) else None
+        preprocess_path = _resolve_pipeline_cfg_path(yaml_path, str(preprocess_path_raw or ""))
+        if not preprocess_path.exists():
+            raise SystemExit(f"[FATAL] YOLO26 profile requires preprocess config-file at: {preprocess_path}")
+
         models_cfg = pipeline_cfg.get("models") if isinstance(pipeline_cfg, dict) else None
         pgie_cfg = (models_cfg or {}).get("pgie") if isinstance(models_cfg, dict) else None
         pgie_ini_raw = (pgie_cfg or {}).get("config-file-path") if isinstance(pgie_cfg, dict) else None
@@ -536,13 +534,15 @@ def _materialize_effective_pipeline_yaml(
         if not pgie_size:
             raise SystemExit("[FATAL] YOLO26 profile requires --size (n/s/m)")
         size_norm = str(pgie_size).strip().lower()
-        assets = _resolve_yolo26_assets(size_norm)
-        pgie_ini = _materialize_yolo26_pgie_ini(size_norm, logger)
+        sources_cfg = base_cfg.get("sources") if isinstance(base_cfg, dict) else None
+        source_count = len(sources_cfg) if isinstance(sources_cfg, list) else 0
+        src_ids = tuple(range(source_count)) or (0, 1, 2)
+        assets = _materialize_yolo26_configs(size_norm, src_ids, logger)
         overlay = {
-            "preprocess": {"config-file": "pipelines/config_preproc.ini"},
+            "preprocess": {"config-file": str(assets["preprocess_config"])},
             "models": {
                 "pgie": {
-                    "config-file-path": str(pgie_ini),
+                    "config-file-path": str(assets["pgie_config"]),
                     "engine": str(assets["engine"]),
                 }
             },

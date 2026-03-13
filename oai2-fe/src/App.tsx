@@ -247,6 +247,9 @@ function Dashboard() {
     if (!Array.isArray(payload.footpoints) && Array.isArray(prevPayload.footpoints)) {
       merged.footpoints = prevPayload.footpoints;
     }
+    if (!Array.isArray(payload.trails) && Array.isArray(prevPayload.trails)) {
+      merged.trails = prevPayload.trails;
+    }
     if (typeof payload.xMin !== 'number' && typeof prevPayload.xMin === 'number') merged.xMin = prevPayload.xMin;
     if (typeof payload.xMax !== 'number' && typeof prevPayload.xMax === 'number') merged.xMax = prevPayload.xMax;
     if (typeof payload.zMin !== 'number' && typeof prevPayload.zMin === 'number') merged.zMin = prevPayload.zMin;
@@ -256,6 +259,12 @@ function Dashboard() {
     }
     if (payload.type === 'bev-frame' && !Object.prototype.hasOwnProperty.call(payload, 'details')) {
       delete merged.details;
+    }
+    if (payload.type === 'bev-frame' && !Object.prototype.hasOwnProperty.call(payload, 'fallbackActive')) {
+      merged.fallbackActive = false;
+      delete merged.fallbackTrackCount;
+      delete merged.fallbackSources;
+      delete merged.fallbackReasonCounts;
     }
     return merged;
   };
@@ -269,10 +278,11 @@ function Dashboard() {
     if (!isCameraLocalFrame(fallbackFrame)) return payload;
 
     const points = payload.footpoints;
-    if (!Array.isArray(points) || !points.length) return payload;
+    const trails = payload.trails;
+    if ((!Array.isArray(points) || !points.length) && (!Array.isArray(trails) || !trails.length)) return payload;
 
     let didProject = false;
-    const projectedPoints = points.map((point) => {
+    const projectedPoints = Array.isArray(points) ? points.map((point) => {
       const wx = Number(point?.x);
       const wz = Number(point?.y);
       if (!Number.isFinite(wx) || !Number.isFinite(wz)) return point;
@@ -287,11 +297,27 @@ function Dashboard() {
 
       didProject = true;
       return { ...point, x: projected.x, y: projected.y };
-    });
+    }) : points;
+
+    const projectedTrails = Array.isArray(trails) ? trails.map((trail) => {
+      if (!Array.isArray(trail?.points)) return trail;
+      let projectedAny = false;
+      const nextPoints = trail.points.map((point) => {
+        const wx = Number(point?.x);
+        const wz = Number(point?.y);
+        if (!Number.isFinite(wx) || !Number.isFinite(wz)) return point;
+        const projected = projectWorldPointToCameraLocal(cam, wx, 0, wz);
+        if (!projected) return point;
+        projectedAny = true;
+        didProject = true;
+        return { ...point, x: projected.x, y: projected.y };
+      });
+      return projectedAny ? { ...trail, points: nextPoints } : trail;
+    }) : trails;
 
     if (!didProject) return payload;
 
-    return { ...payload, footpoints: projectedPoints };
+    return { ...payload, footpoints: projectedPoints, trails: projectedTrails };
   };
 
   const onStats = (payload: StatsPayload) => {

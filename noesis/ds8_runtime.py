@@ -3809,11 +3809,12 @@ def main() -> int:
     ws_server.set_align_handler = _set_align_handler
     ws_server.pixel_to_world_handler = _pixel_to_world_handler
 
-    def _tracking_contract_metadata(source_id: int, _tracks: list[Mapping[str, Any]]) -> Dict[str, Any]:
+    def _tracking_contract_metadata(source_id: int, tracks: list[Mapping[str, Any]]) -> Dict[str, Any]:
         camera_id = str(camera_labels.get(int(source_id), f"camera_{int(source_id)}"))
         calibration_version = "unknown"
         coord_space = "scene_obj"
         units = "obj_units"
+        image_size = None
         try:
             bundle = calibration_provider.calibration_bundle()
             meta = bundle.get("meta") if isinstance(bundle, dict) else None
@@ -3829,7 +3830,32 @@ def main() -> int:
                     units = raw_units.strip()
         except Exception:
             pass
-        return {
+        for track in tracks or []:
+            if not isinstance(track, Mapping):
+                continue
+            size = track.get("image_size") or track.get("frame_size")
+            if not isinstance(size, (list, tuple)) or len(size) < 2:
+                continue
+            try:
+                width = int(size[0])
+                height = int(size[1])
+            except Exception:
+                continue
+            if width > 8 and height > 8:
+                image_size = [width, height]
+                break
+        if image_size is None:
+            try:
+                snapshot = calibration_provider.snapshot(int(source_id), camera_id)
+                size = getattr(snapshot, "image_size", None)
+                if isinstance(size, (list, tuple)) and len(size) >= 2:
+                    width = int(size[0])
+                    height = int(size[1])
+                    if width > 8 and height > 8:
+                        image_size = [width, height]
+            except Exception:
+                pass
+        payload = {
             "camera_id": camera_id,
             "coord_space": coord_space,
             "units": units,
@@ -3838,6 +3864,10 @@ def main() -> int:
             "calibration_version": calibration_version,
             "tracking_contract_version": 2,
         }
+        if image_size is not None:
+            payload["image_size"] = list(image_size)
+            payload["frame_size"] = list(image_size)
+        return payload
 
     setattr(pipeline, "ws_server", ws_server)
     bev_renderer = BevRenderer(

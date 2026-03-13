@@ -106,6 +106,7 @@ Emitted by `BevRenderer`:
   "zMin": <float>, "zMax": <float>,
   "overlay": <bool>,
   "footpoints": [ {"x": <float>, "y": <float>, "method": "bbox"|"sv3dt", "stableId": <int|null>, "trackerId": <int|null>} ],
+  "trails": [ {"stableId": <int|null>, "trackerId": <int|null>, "points": [ {"x": <float>, "y": <float>, "t": <int ms>} ]} ],
   "H": [<9 floats>],
   "sampleXZ": [<float x>, <float z>] | null,
   "world_frame": "menon_scene"|"camera_local",
@@ -118,7 +119,9 @@ Emitted by `BevRenderer`:
 ```
 
 - Optional JPEG binary: `[len(header)][header="bev:<camera>"][JPEG bytes]` when BEV JPEG output is enabled (`bev.jpeg_enabled` or `NOESIS_BEV_JPEG_ENABLED=1`).
-- In world mode (`frame_mode=world`), BEV footpoints are producer-owned scene coordinates and backend motion smoothing is disabled (`trail_smoothing_owner=frontend`, `bev_world_points_smoothed=false`).
+- In world mode (`frame_mode=world`), BEV footpoints remain producer-owned scene coordinates. Motion smoothing ownership is declared explicitly by `trail_smoothing_owner`; when `bev.smoothing.enabled=true`, the producer publishes already-smoothed world points and sets `trail_smoothing_owner=backend`, `bev_world_points_smoothed=true`.
+- When `trail_smoothing_owner=backend`, `trails` carries the producer trail polylines already used by the BEV renderer, in scene/world coordinates with epoch-millisecond sample times. The dashboard should render those directly instead of reconstructing its own history from `footpoints`.
+- Backend world-BEV smoothing and trail history are keyed by tracker-local identity (`trackerId` when present, otherwise `stableId`) to match the nvOSD trail path; `stableId` remains display metadata and may legitimately span multiple tracker histories over time.
 - Coordinate note: BEV renders on the ground plane (XZ). `footpoints[].x` is scene/world X, and `footpoints[].y` is scene/world Z.
 
 ## 5. Depth Telemetry (`type: depth_result`)
@@ -170,11 +173,13 @@ Produced by `TrackingTelemetryPublisher`; people-only (class_id=0). `track_id` i
       "world": [<float>, <float>, <float>],
       "world_valid": <bool>,
       "world_frame": "menon_scene"|"camera_local"|null,
-      "world_source": "bbox3d"|"ray_floor"|null
+      "world_source": "bbox3d"|"pose_ankle_floor"|"pose_single_ankle_floor"|"pose_leg_floor"|"gravity_drop"|"anchor_hold"|null
     }
   ]
 }
 ```
+
+When pose anchoring, height-lock reuse, and recent-anchor hold all fail, DS8 now leaves `world_valid=false` instead of promoting bbox-bottom floor projection into a synthetic world point.
 
 ## 7. Control & RPC Message Types
 

@@ -1589,6 +1589,24 @@ class _TrailTrackState:
     last_measure_speed: float = 0.0
 
 
+@dataclass(frozen=True)
+class _PoseAnchorCandidate:
+    u: float
+    v: float
+    source: str
+    quality: str = "good"
+    quality_reason: Optional[str] = None
+    height_lock_eligible: bool = False
+
+
+@dataclass
+class _WorldAnchorState:
+    ts: float = 0.0
+    height_ref_scene: Optional[float] = None
+    last_good_world: Optional[Tuple[float, float, float]] = None
+    last_good_ts: float = 0.0
+
+
 @dataclass
 class TrailOverlayProcessor:
     pipeline: "DS8Pipeline"
@@ -3417,7 +3435,7 @@ class _AnalyticsTelemetryProcessor:
     _sid_metrics_log_enabled: bool = field(default=True, init=False, repr=False)
     _sid_metrics_log_interval_s: float = field(default=10.0, init=False, repr=False)
     _sid_metrics_last_log_by_sensor: Dict[int, float] = field(default_factory=dict, init=False, repr=False)
-    _world_state_by_track: Dict[Tuple[int, int], Dict[str, float]] = field(default_factory=dict, init=False, repr=False)
+    _world_state_by_track: Dict[Tuple[int, int], _WorldAnchorState] = field(default_factory=dict, init=False, repr=False)
     _world_state_ttl_s: float = field(default=3.0, init=False, repr=False)
     _world_state_prune_interval_s: float = field(default=1.0, init=False, repr=False)
     _world_state_last_prune_ts: float = field(default=0.0, init=False, repr=False)
@@ -3426,6 +3444,15 @@ class _AnalyticsTelemetryProcessor:
     _world_max_speed_scene_per_s: float = field(default=120.0, init=False, repr=False)
     _world_smooth_alpha_good: float = field(default=0.45, init=False, repr=False)
     _world_smooth_alpha_weak: float = field(default=0.20, init=False, repr=False)
+    _pose_anchor_gie_id: int = field(default=4, init=False, repr=False)
+    _pose_anchor_model_size: Tuple[int, int] = field(default=(640, 640), init=False, repr=False)
+    _pose_anchor_score_threshold: float = field(default=0.25, init=False, repr=False)
+    _pose_anchor_letterbox: bool = field(default=True, init=False, repr=False)
+    _pose_anchor_kpt_threshold: float = field(default=0.35, init=False, repr=False)
+    _world_height_update_alpha: float = field(default=0.20, init=False, repr=False)
+    _world_height_min_m: float = field(default=0.60, init=False, repr=False)
+    _world_height_max_m: float = field(default=2.40, init=False, repr=False)
+    _world_anchor_hold_ttl_s: float = field(default=1.25, init=False, repr=False)
 
     def __post_init__(self) -> None:
         # Discover the ReID SGIE unique-id from the built pipeline config when present.
@@ -3470,6 +3497,30 @@ class _AnalyticsTelemetryProcessor:
             self._sid_metrics_log_interval_s = max(1.0, float(str(interval_raw).strip() or "10"))
         except Exception:
             self._sid_metrics_log_interval_s = 10.0
+        try:
+            models_cfg = getattr(self.pipeline, "config", {}).get("models", {}) or {}
+            pose_cfg = models_cfg.get("pose") or {}
+            if isinstance(pose_cfg, Mapping):
+                self._pose_anchor_gie_id = int(pose_cfg.get("gie_id", pose_cfg.get("gie-id", 4) or 4))
+                model_size = pose_cfg.get("model_size") or pose_cfg.get("input_size")
+                if isinstance(model_size, (list, tuple)) and len(model_size) >= 2:
+                    self._pose_anchor_model_size = (int(model_size[0]), int(model_size[1]))
+                elif isinstance(model_size, str) and "x" in model_size:
+                    parts = model_size.lower().split("x")
+                    if len(parts) >= 2:
+                        self._pose_anchor_model_size = (int(parts[0].strip()), int(parts[1].strip()))
+                self._pose_anchor_score_threshold = float(pose_cfg.get("score_threshold", 0.25) or 0.25)
+                self._pose_anchor_letterbox = bool(pose_cfg.get("letterbox", True))
+                self._pose_anchor_kpt_threshold = max(
+                    0.0,
+                    float(pose_cfg.get("kpt_threshold", 0.35) or 0.35),
+                )
+        except Exception:
+            self._pose_anchor_gie_id = 4
+            self._pose_anchor_model_size = (640, 640)
+            self._pose_anchor_score_threshold = 0.25
+            self._pose_anchor_letterbox = True
+            self._pose_anchor_kpt_threshold = 0.35
         try:
             self._world_state_ttl_s = max(0.25, float(str(os.environ.get("NOESIS_WORLD_STATE_TTL_S", "3.0")).strip() or "3.0"))
         except Exception:
@@ -3874,7 +3925,7 @@ class _AnalyticsTelemetryProcessor:
             present_track_ids: set[int] = set()
             present_stable_ids: set[int] = set()
             footpoints: List[Footpoint] = []
-            frame_dims = self._frame_dims()
+            frame_dims = self._track_image_size(sensor_id, frame_meta)
 
             reid_debug = str(os.environ.get("NOESIS_REID_DEBUG", "")).strip().lower() in ("1", "true", "yes", "on")
             if reid_debug:
@@ -3977,7 +4028,10 @@ class _AnalyticsTelemetryProcessor:
                 id_reject_reason = id_diag.get("id_reject_reason")
                 sid_candidate = id_diag.get("sid_candidate")
                 embedding_present = bool(id_diag.get("embedding_present", emb is not None))
+                pose_kpts_abs = self._extract_pose_keypoints_for_anchor(obj_meta, raw.get("bbox") or [])
                 pose_present = bool(id_diag.get("pose_present", False))
+                if not pose_present:
+                    pose_present = pose_kpts_abs is not None
                 id_display = None
                 if self._reid_diag_use_tracker_id:
                     id_display = f"[{tracker_id_int}] | [{stable_id_int}]"
@@ -4023,6 +4077,9 @@ class _AnalyticsTelemetryProcessor:
                     "pose_present": bool(pose_present),
                     "sid_candidate": sid_candidate,
                 }
+                frame_w, frame_h = frame_dims
+                if frame_w > 8 and frame_h > 8:
+                    public_track["image_size"] = [int(frame_w), int(frame_h)]
                 if id_display:
                     public_track["id_display"] = str(id_display)
                 for key in (
@@ -4041,7 +4098,13 @@ class _AnalyticsTelemetryProcessor:
                     if key in raw:
                         public_track[key] = raw.get(key)
 
-                self._augment_track_with_world(sensor_id, camera_id, public_track)
+                self._augment_track_with_world(
+                    sensor_id,
+                    camera_id,
+                    public_track,
+                    obj_meta=obj_meta,
+                    pose_kpts_abs=pose_kpts_abs,
+                )
                 diag_track.update(
                     {
                         "stable_id": stable_id_int,
@@ -4179,7 +4242,7 @@ class _AnalyticsTelemetryProcessor:
             present_track_ids: set[int] = set()
             present_stable_ids: set[int] = set()
             footpoints: List[Footpoint] = []
-            frame_dims = self._frame_dims()
+            frame_dims = self._track_image_size(sensor_id, frame_meta)
 
             for obj_meta in self._iter_object_meta(frame_meta):
                 raw = self._build_track_dict(obj_meta, camera_id)
@@ -4261,6 +4324,9 @@ class _AnalyticsTelemetryProcessor:
                     "frame_id": frame_id,
                     "dwell_time": dwell,
                 }
+                frame_w, frame_h = frame_dims
+                if frame_w > 8 and frame_h > 8:
+                    public_track["image_size"] = [int(frame_w), int(frame_h)]
                 if id_display:
                     public_track["id_display"] = str(id_display)
                 for key in (
@@ -4268,6 +4334,7 @@ class _AnalyticsTelemetryProcessor:
                     "velocity3d",
                     "visibility",
                     "image_foot",
+                    "image_base",
                     "world",
                     "world_valid",
                     "world_quality",
@@ -4278,7 +4345,14 @@ class _AnalyticsTelemetryProcessor:
                     if key in raw:
                         public_track[key] = raw.get(key)
 
-                self._augment_track_with_world(sensor_id, camera_id, public_track)
+                pose_kpts_abs = self._extract_pose_keypoints_for_anchor(obj_meta, raw.get("bbox") or [])
+                self._augment_track_with_world(
+                    sensor_id,
+                    camera_id,
+                    public_track,
+                    obj_meta=obj_meta,
+                    pose_kpts_abs=pose_kpts_abs,
+                )
                 diag_track.update(
                     {
                         "stable_id": stable_id_int,
@@ -4461,6 +4535,44 @@ class _AnalyticsTelemetryProcessor:
         except Exception:
             return 0, 0
 
+    def _frame_source_size(self, frame_meta: Any) -> Tuple[int, int]:
+        try:
+            frame_w = int(_meta_lookup(frame_meta, "source_frame_width", "frame_width", "width", default=0) or 0)
+            frame_h = int(_meta_lookup(frame_meta, "source_frame_height", "frame_height", "height", default=0) or 0)
+        except Exception:
+            frame_w = 0
+            frame_h = 0
+        if frame_w <= 0 or frame_h <= 0:
+            return self._frame_dims()
+        return max(0, int(frame_w)), max(0, int(frame_h))
+
+    def _intrinsics_base_image_size(self, sensor_id: int) -> Optional[Tuple[int, int]]:
+        provider = getattr(self, "bev_calibration", None)
+        loader = getattr(provider, "_intrinsics_loader", None)
+        getter = getattr(loader, "get", None)
+        if not callable(getter):
+            return None
+        try:
+            intr = getter(int(sensor_id))
+        except Exception:
+            intr = None
+        if intr is None:
+            return None
+        try:
+            width = int(round(float(getattr(intr, "cx", 0.0) or 0.0) * 2.0))
+            height = int(round(float(getattr(intr, "cy", 0.0) or 0.0) * 2.0))
+        except Exception:
+            return None
+        if width > 8 and height > 8:
+            return width, height
+        return None
+
+    def _track_image_size(self, sensor_id: int, frame_meta: Any) -> Tuple[int, int]:
+        intrinsic_size = self._intrinsics_base_image_size(sensor_id)
+        if intrinsic_size is not None:
+            return intrinsic_size
+        return self._frame_source_size(frame_meta)
+
     def _footpoint_from_track(
         self, track: Mapping[str, Any], frame_dims: Tuple[int, int]
     ) -> Optional[Footpoint]:
@@ -4593,6 +4705,9 @@ class _AnalyticsTelemetryProcessor:
             tracker_id=tracker_id_int,
             world_x=world_x,
             world_z=world_z,
+            anchor_source=str(track.get("world_source")) if track.get("world_source") not in (None, "") else None,
+            anchor_quality=str(track.get("world_quality")) if track.get("world_quality") not in (None, "") else None,
+            anchor_reason=str(track.get("world_quality_reason")) if track.get("world_quality_reason") not in (None, "") else None,
         )
 
     def _frame_timestamp_us(self, frame_meta: Any) -> int:
@@ -4692,13 +4807,397 @@ class _AnalyticsTelemetryProcessor:
             return
         expired: List[Tuple[int, int]] = []
         for key, state in self._world_state_by_track.items():
-            ts = float(state.get("ts", 0.0) or 0.0)
+            ts = float(getattr(state, "ts", 0.0) or 0.0)
             if (float(now_ts) - ts) > ttl:
                 expired.append(key)
         for key in expired:
             self._world_state_by_track.pop(key, None)
 
-    def _augment_track_with_world(self, sensor_id: int, camera_id: str, track: Dict[str, Any]) -> None:
+    def _extract_pose_payload_for_anchor(self, obj_meta: Any) -> Optional[Dict[str, Any]]:
+        if obj_meta is None or noesis_pose_meta_ext is None:
+            return None
+        extract_obj = getattr(noesis_pose_meta_ext, "extract_pose_features", None)
+        if extract_obj is None or not callable(extract_obj):
+            return None
+        try:
+            raw = extract_obj(obj_meta)
+        except Exception:
+            return None
+        if raw is None:
+            return None
+        try:
+            payload = json.loads(str(raw))
+        except Exception:
+            return None
+        if not isinstance(payload, dict):
+            return None
+        return payload
+
+    def _extract_pose_keypoints_for_anchor(
+        self,
+        obj_meta: Any,
+        bbox: Sequence[float],
+    ) -> Optional[np.ndarray]:
+        if obj_meta is not None and noesis_pose_meta_ext is not None:
+            extract_obj = getattr(noesis_pose_meta_ext, "extract_pose_keypoints", None)
+            if callable(extract_obj):
+                try:
+                    payload = extract_obj(
+                        obj_meta,
+                        int(self._pose_anchor_gie_id),
+                        int(self._pose_anchor_model_size[0]),
+                        int(self._pose_anchor_model_size[1]),
+                        float(self._pose_anchor_score_threshold),
+                        bool(self._pose_anchor_letterbox),
+                    )
+                except Exception:
+                    payload = None
+                if isinstance(payload, dict):
+                    keypoints_abs = self._keypoints_abs_from_pose_payload(payload, bbox)
+                    if keypoints_abs is not None:
+                        return keypoints_abs
+
+        payload = self._extract_pose_payload_for_anchor(obj_meta)
+        if payload is None:
+            return None
+        return self._keypoints_abs_from_pose_payload(payload, bbox)
+
+    def _keypoints_abs_from_pose_payload(
+        self,
+        payload: Mapping[str, Any],
+        bbox: Sequence[float],
+    ) -> Optional[np.ndarray]:
+        raw_abs = payload.get("keypoints_abs")
+        if isinstance(raw_abs, (list, tuple)) and len(raw_abs) >= 17:
+            rows_abs: List[List[float]] = []
+            for item in raw_abs[:17]:
+                if not isinstance(item, (list, tuple)) or len(item) < 3:
+                    return None
+                try:
+                    rows_abs.append([float(item[0]), float(item[1]), float(item[2])])
+                except Exception:
+                    return None
+            try:
+                arr_abs = np.asarray(rows_abs, dtype=np.float32)
+            except Exception:
+                return None
+            if arr_abs.shape == (17, 3):
+                return arr_abs
+
+        if len(bbox) < 4:
+            return None
+        try:
+            dst_w = float(bbox[2])
+            dst_h = float(bbox[3])
+            dst_x = float(bbox[0])
+            dst_y = float(bbox[1])
+        except Exception:
+            return None
+
+        src_w = dst_w
+        src_h = dst_h
+        src_bbox = payload.get("bbox")
+        if isinstance(src_bbox, (list, tuple)) and len(src_bbox) >= 4:
+            try:
+                src_w = float(src_bbox[2])
+                src_h = float(src_bbox[3])
+            except Exception:
+                src_w = dst_w
+                src_h = dst_h
+        sx = float(dst_w / src_w) if src_w > 1e-6 else 1.0
+        sy = float(dst_h / src_h) if src_h > 1e-6 else 1.0
+
+        raw_roi = payload.get("keypoints_roi")
+        if not isinstance(raw_roi, (list, tuple)) or len(raw_roi) < 17:
+            return None
+        rows_roi: List[List[float]] = []
+        for item in raw_roi[:17]:
+            if not isinstance(item, (list, tuple)) or len(item) < 3:
+                return None
+            try:
+                x = float(item[0]) * sx + dst_x
+                y = float(item[1]) * sy + dst_y
+                c = float(item[2])
+                rows_roi.append([x, y, c])
+            except Exception:
+                return None
+        try:
+            arr_roi = np.asarray(rows_roi, dtype=np.float32)
+        except Exception:
+            return None
+        if arr_roi.shape != (17, 3):
+            return None
+        return arr_roi
+
+    def _pose_point(self, kpts_abs: np.ndarray, name: str) -> Optional[Tuple[float, float]]:
+        idx = _POSE_KPT_INDEX.get(name)
+        if idx is None or idx < 0 or idx >= int(kpts_abs.shape[0]):
+            return None
+        try:
+            x = float(kpts_abs[idx, 0])
+            y = float(kpts_abs[idx, 1])
+            conf = float(kpts_abs[idx, 2])
+        except Exception:
+            return None
+        if conf < float(self._pose_anchor_kpt_threshold):
+            return None
+        if not (math.isfinite(x) and math.isfinite(y)):
+            return None
+        return float(x), float(y)
+
+    def _estimate_ankle_from_leg(self, kpts_abs: np.ndarray, side: str) -> Optional[Tuple[float, float]]:
+        hip = self._pose_point(kpts_abs, f"{side}_hip")
+        knee = self._pose_point(kpts_abs, f"{side}_knee")
+        if hip is None or knee is None:
+            return None
+        ankle_x = (2.0 * float(knee[0])) - float(hip[0])
+        ankle_y = (2.0 * float(knee[1])) - float(hip[1])
+        if not (math.isfinite(ankle_x) and math.isfinite(ankle_y)):
+            return None
+        return float(ankle_x), float(ankle_y)
+
+    def _resolve_pose_floor_anchor(self, kpts_abs: np.ndarray) -> Optional[_PoseAnchorCandidate]:
+        left_ankle = self._pose_point(kpts_abs, "left_ankle")
+        right_ankle = self._pose_point(kpts_abs, "right_ankle")
+        if left_ankle is not None and right_ankle is not None:
+            return _PoseAnchorCandidate(
+                u=float(left_ankle[0] + right_ankle[0]) * 0.5,
+                v=float(left_ankle[1] + right_ankle[1]) * 0.5,
+                source="pose_ankle_floor",
+                quality="good",
+                height_lock_eligible=True,
+            )
+        if left_ankle is not None or right_ankle is not None:
+            ankle = left_ankle if left_ankle is not None else right_ankle
+            if ankle is None:
+                return None
+            return _PoseAnchorCandidate(
+                u=float(ankle[0]),
+                v=float(ankle[1]),
+                source="pose_single_ankle_floor",
+                quality="good",
+                height_lock_eligible=True,
+            )
+
+        estimates: List[Tuple[float, float]] = []
+        for side in ("left", "right"):
+            ankle_est = self._estimate_ankle_from_leg(kpts_abs, side)
+            if ankle_est is not None:
+                estimates.append((float(ankle_est[0]), float(ankle_est[1])))
+        if not estimates:
+            return None
+        if len(estimates) == 1:
+            u, v = estimates[0]
+        else:
+            u = float(sum(point[0] for point in estimates) / len(estimates))
+            v = float(sum(point[1] for point in estimates) / len(estimates))
+        return _PoseAnchorCandidate(
+            u=float(u),
+            v=float(v),
+            source="pose_leg_floor",
+            quality="estimated",
+            quality_reason="pose_leg_extension",
+            height_lock_eligible=False,
+        )
+
+    @staticmethod
+    def _scene_per_meter(calib: Any) -> float:
+        try:
+            s_obj_to_m = float(calib.unit_scale or 1.0)
+            if math.isfinite(s_obj_to_m) and s_obj_to_m > 1e-6:
+                return 1.0 / s_obj_to_m
+        except Exception:
+            pass
+        return 1.0
+
+    def _project_pixel_to_floor_world(
+        self,
+        calib: Any,
+        u: float,
+        v: float,
+        *,
+        flip_u: bool,
+        flip_v: bool,
+    ) -> Optional[np.ndarray]:
+        try:
+            width_src, height_src = calib.image_size
+            u_ray, v_ray = self._apply_image_flip(float(u), float(v), int(width_src), int(height_src), bool(flip_u), bool(flip_v))
+            R_wc, C_world = parse_extrinsics(calib.extrinsics_col_major)
+            C_world = C_world * self._scene_per_meter(calib)
+            plane = Plane.horizontal(float(calib.floor_y))
+            origin, direction = ray_from_pixel(u_ray, v_ray, calib.intrinsics, R_wc, C_world)
+            hit = intersect_plane(origin, direction, plane)
+            if hit is None:
+                return None
+            return np.asarray(hit, dtype=np.float64)
+        except Exception:
+            return None
+
+    def _human_height_scene_bounds(self, calib: Any) -> Tuple[float, float]:
+        scene_per_m = self._scene_per_meter(calib)
+        return (
+            float(self._world_height_min_m) * float(scene_per_m),
+            float(self._world_height_max_m) * float(scene_per_m),
+        )
+
+    @staticmethod
+    def _normalize_image_size(value: Any) -> Optional[Tuple[int, int]]:
+        if not isinstance(value, (list, tuple)) or len(value) < 2:
+            return None
+        try:
+            width = int(value[0])
+            height = int(value[1])
+        except Exception:
+            return None
+        if width <= 8 or height <= 8:
+            return None
+        return width, height
+
+    @staticmethod
+    def _scale_uv_to_image_size(
+        u: float,
+        v: float,
+        source_size: Optional[Tuple[int, int]],
+        dest_size: Optional[Tuple[int, int]],
+    ) -> Tuple[float, float]:
+        if source_size is None or dest_size is None:
+            return float(u), float(v)
+        src_w, src_h = source_size
+        dst_w, dst_h = dest_size
+        if src_w <= 0 or src_h <= 0 or dst_w <= 0 or dst_h <= 0:
+            return float(u), float(v)
+        return float(u) * (float(dst_w) / float(src_w)), float(v) * (float(dst_h) / float(src_h))
+
+    def _scale_bbox_to_image_size(
+        self,
+        bbox: Sequence[float],
+        source_size: Optional[Tuple[int, int]],
+        dest_size: Optional[Tuple[int, int]],
+    ) -> Optional[List[float]]:
+        if len(bbox) < 4:
+            return None
+        try:
+            left, top, width, height = [float(x) for x in bbox[:4]]
+        except Exception:
+            return None
+        if source_size is None or dest_size is None:
+            return [left, top, width, height]
+        src_w, src_h = source_size
+        dst_w, dst_h = dest_size
+        if src_w <= 0 or src_h <= 0 or dst_w <= 0 or dst_h <= 0:
+            return [left, top, width, height]
+        sx = float(dst_w) / float(src_w)
+        sy = float(dst_h) / float(src_h)
+        return [left * sx, top * sy, width * sx, height * sy]
+
+    def _maybe_update_world_height_reference(
+        self,
+        state: _WorldAnchorState,
+        calib: Any,
+        bbox: Sequence[float],
+        foot_world: Sequence[float],
+        *,
+        flip_u: bool,
+        flip_v: bool,
+    ) -> None:
+        if len(bbox) < 4:
+            return
+        try:
+            left, top, width, _height = [float(x) for x in bbox[:4]]
+        except Exception:
+            return
+        if width <= 0.0:
+            return
+        u_top = float(left) + float(width) * 0.5
+        v_top = float(top)
+        try:
+            est_height = estimate_upright_height_from_top_and_foot(
+                u_top,
+                v_top,
+                foot_world,
+                calib.intrinsics,
+                calib.extrinsics_col_major,
+                float(calib.floor_y),
+                tuple(int(x) for x in calib.image_size),
+                unit_scale=1.0,
+                flip_u=bool(flip_u),
+                flip_v=bool(flip_v),
+            )
+        except Exception:
+            est_height = None
+        if est_height is None or not math.isfinite(float(est_height)) or float(est_height) <= 0.0:
+            return
+        min_height, max_height = self._human_height_scene_bounds(calib)
+        if float(est_height) < float(min_height) or float(est_height) > float(max_height):
+            return
+        if state.height_ref_scene is None:
+            state.height_ref_scene = float(est_height)
+            return
+        alpha = float(self._world_height_update_alpha)
+        state.height_ref_scene = float(state.height_ref_scene + alpha * (float(est_height) - float(state.height_ref_scene)))
+
+    def _gravity_drop_world(
+        self,
+        calib: Any,
+        bbox: Sequence[float],
+        height_ref_scene: float,
+        *,
+        flip_u: bool,
+        flip_v: bool,
+    ) -> Optional[np.ndarray]:
+        if len(bbox) < 4:
+            return None
+        try:
+            left, top, width, _height = [float(x) for x in bbox[:4]]
+        except Exception:
+            return None
+        if width <= 0.0 or float(height_ref_scene) <= 0.0:
+            return None
+        try:
+            width_src, height_src = calib.image_size
+            u_top = float(left) + float(width) * 0.5
+            v_top = float(top)
+            u_ray, v_ray = self._apply_image_flip(u_top, v_top, int(width_src), int(height_src), bool(flip_u), bool(flip_v))
+            R_wc, C_world = parse_extrinsics(calib.extrinsics_col_major)
+            C_world = C_world * self._scene_per_meter(calib)
+            origin, direction = ray_from_pixel(u_ray, v_ray, calib.intrinsics, R_wc, C_world)
+            denom = float(direction[1])
+            if abs(denom) < 1e-9:
+                return None
+            plane_y = float(calib.floor_y) + float(height_ref_scene)
+            t = (plane_y - float(origin[1])) / denom
+            if not math.isfinite(t) or t <= 0.0:
+                return None
+            head = origin + (direction * t)
+            return np.array([float(head[0]), float(calib.floor_y), float(head[2])], dtype=np.float64)
+        except Exception:
+            return None
+
+    def _fallback_quality_reason(
+        self,
+        pose_kpts_abs: Optional[np.ndarray],
+        pose_anchor: Optional[_PoseAnchorCandidate],
+        state: Optional[_WorldAnchorState],
+    ) -> str:
+        if noesis_pose_meta_ext is None:
+            return "pose_meta_missing"
+        if pose_kpts_abs is None:
+            return "pose_keypoints_unusable"
+        if pose_anchor is None:
+            if state is None or state.height_ref_scene is None:
+                return "height_lock_missing"
+            return "pose_anchor_unavailable"
+        return "pose_anchor_projection_failed"
+
+    def _augment_track_with_world(
+        self,
+        sensor_id: int,
+        camera_id: str,
+        track: Dict[str, Any],
+        *,
+        obj_meta: Any | None = None,
+        pose_kpts_abs: Optional[np.ndarray] = None,
+    ) -> None:
         """Calculate world coordinates for a track if calibration is available."""
         if self.bev_calibration is None:
             return
@@ -4720,43 +5219,107 @@ class _AnalyticsTelemetryProcessor:
             bbox = track.get("bbox")
             if not bbox or len(bbox) < 4:
                 return
+            track_image_size = self._normalize_image_size(track.get("image_size") or track.get("frame_size"))
+            calib_image_size = self._normalize_image_size(getattr(calib, "image_size", None))
+            bbox_project = self._scale_bbox_to_image_size(bbox, track_image_size, calib_image_size)
+            if not bbox_project or len(bbox_project) < 4:
+                return
 
-            # bbox is [left, top, width, height]
-            # Use bottom center for footpoint
-            u = float(bbox[0]) + float(bbox[2]) / 2.0
-            v = float(bbox[1]) + float(bbox[3])
-            width_src, height_src = calib.image_size
             flip_u, flip_v = self._infer_image_flips(camera_id, calib)
-            u_ray, v_ray = self._apply_image_flip(u, v, int(width_src), int(height_src), flip_u, flip_v)
-
-            R_wc, C_world = parse_extrinsics(calib.extrinsics_col_major)
-            scene_per_m = 1.0
-            try:
-                s_obj_to_m = float(calib.unit_scale or 1.0)
-                if math.isfinite(s_obj_to_m) and s_obj_to_m > 1e-6:
-                    scene_per_m = 1.0 / s_obj_to_m
-            except Exception:
-                scene_per_m = 1.0
-            # Non-V3DT world path publishes/uses native scene units end-to-end.
-            C_world = C_world * scene_per_m
-            plane = Plane.horizontal(float(calib.floor_y))
             now_ts = float(time.time())
-
-            origin, direction = ray_from_pixel(u_ray, v_ray, calib.intrinsics, R_wc, C_world)
-            hit = intersect_plane(origin, direction, plane)
             world_key = self._world_track_key(sensor_id, track)
             self._maybe_prune_world_state(now_ts)
+            state: Optional[_WorldAnchorState] = None
+            if world_key is not None:
+                state = self._world_state_by_track.get(world_key)
+                if state is None:
+                    state = _WorldAnchorState()
+                    self._world_state_by_track[world_key] = state
+                state.ts = float(now_ts)
+
+            if pose_kpts_abs is None:
+                pose_kpts_abs = self._extract_pose_keypoints_for_anchor(obj_meta, bbox)
+            pose_anchor = self._resolve_pose_floor_anchor(pose_kpts_abs) if pose_kpts_abs is not None else None
+
+            hit: Optional[np.ndarray] = None
+            quality = "invalid"
+            quality_reason: Optional[str] = "no_floor_intersection"
+            world_source: Optional[str] = None
+
+            if pose_anchor is not None:
+                track["image_foot"] = [float(pose_anchor.u), float(pose_anchor.v)]
+                pose_u, pose_v = self._scale_uv_to_image_size(
+                    float(pose_anchor.u),
+                    float(pose_anchor.v),
+                    track_image_size,
+                    calib_image_size,
+                )
+                hit = self._project_pixel_to_floor_world(
+                    calib,
+                    float(pose_u),
+                    float(pose_v),
+                    flip_u=flip_u,
+                    flip_v=flip_v,
+                )
+                if hit is not None:
+                    world_source = str(pose_anchor.source)
+                    quality = str(pose_anchor.quality)
+                    quality_reason = pose_anchor.quality_reason
+                    if state is not None and pose_anchor.height_lock_eligible:
+                        self._maybe_update_world_height_reference(
+                            state,
+                            calib,
+                            bbox_project,
+                            hit,
+                            flip_u=flip_u,
+                            flip_v=flip_v,
+                        )
+
+            if hit is None and state is not None and state.height_ref_scene is not None:
+                hit = self._gravity_drop_world(
+                    calib,
+                    bbox_project,
+                    float(state.height_ref_scene),
+                    flip_u=flip_u,
+                    flip_v=flip_v,
+                )
+                if hit is not None:
+                    world_source = "gravity_drop"
+                    quality = "estimated"
+                    quality_reason = "pose_anchor_unavailable" if pose_anchor is None else "pose_anchor_projection_failed"
+
+            fallback_reason = self._fallback_quality_reason(pose_kpts_abs, pose_anchor, state)
+
+            if hit is None and state is not None and state.last_good_world is not None:
+                hold_age = float(now_ts) - float(state.last_good_ts or 0.0)
+                if hold_age <= float(self._world_anchor_hold_ttl_s):
+                    hit = np.asarray(state.last_good_world, dtype=np.float64)
+                    world_source = "anchor_hold"
+                    quality = "estimated"
+                    quality_reason = fallback_reason
 
             if hit is not None:
+                if world_source == "gravity_drop" and track.get("image_base") is None:
+                    try:
+                        uv = project_world_to_image(
+                            hit,
+                            calib.intrinsics,
+                            calib.extrinsics_col_major,
+                            tuple(int(x) for x in calib.image_size),
+                            unit_scale=1.0,
+                            flip_u=bool(flip_u),
+                            flip_v=bool(flip_v),
+                        )
+                    except Exception:
+                        uv = None
+                    if uv is not None:
+                        try:
+                            track["image_base"] = [float(uv[0]), float(uv[1])]
+                        except Exception:
+                            pass
                 wx = float(hit[0])
                 wy = float(hit[1])
                 wz = float(hit[2])
-                quality = "good"
-                quality_reason = None
-
-                if world_key is not None:
-                    # Always clear legacy world-smoothing state; this path publishes raw scene coords only.
-                    self._world_state_by_track.pop(world_key, None)
 
                 track["world"] = [float(wx), float(wy), float(wz)]
                 track["world_valid"] = True
@@ -4766,13 +5329,18 @@ class _AnalyticsTelemetryProcessor:
                 else:
                     track.pop("world_quality_reason", None)
                 track["world_frame"] = self._world_frame
-                track["world_source"] = "ray_floor"
+                if world_source:
+                    track["world_source"] = str(world_source)
+                else:
+                    track.pop("world_source", None)
+                if state is not None and world_source != "anchor_hold":
+                    state.last_good_world = (float(wx), float(wy), float(wz))
+                    state.last_good_ts = float(now_ts)
             else:
-                if world_key is not None:
-                    self._world_state_by_track.pop(world_key, None)
                 track["world_valid"] = False
                 track["world_quality"] = "invalid"
-                track["world_quality_reason"] = "no_floor_intersection"
+                track["world_quality_reason"] = str(fallback_reason or "no_floor_intersection")
+                track.pop("world_source", None)
         except Exception:
             # Silently fail; world coordinates are best-effort
             pass

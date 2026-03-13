@@ -3,7 +3,7 @@ from __future__ import annotations
 import logging
 from collections import deque
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Sequence, Tuple, Any
+from typing import Dict, List, Optional, Sequence, Tuple, Any, Hashable
 
 import cv2
 import numpy as np
@@ -47,6 +47,9 @@ class Footpoint:
     tracker_id: Optional[int] = None
     world_x: Optional[float] = None
     world_z: Optional[float] = None
+    anchor_source: Optional[str] = None
+    anchor_quality: Optional[str] = None
+    anchor_reason: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -139,6 +142,8 @@ class _BevTrailTrackState:
     points: "deque[Tuple[float, float, float]]" = field(default_factory=deque)
     last_seen_ts: float = 0.0
     stable_id: Optional[int] = None
+    tracker_id: Optional[int] = None
+    display_key: Optional[int] = None
     ema_x: Optional[float] = None
     ema_z: Optional[float] = None
     ema_ts: float = 0.0
@@ -149,6 +154,7 @@ class BevResult:
     camera_id: str
     bev_bgr: Optional[np.ndarray]
     bev_points: List[Dict[str, Any]]
+    backend_trails: List[Dict[str, Any]]
     config: BevConfig
     timestamp_us: int
     width_px: int
@@ -250,7 +256,7 @@ class BevRenderer:
         # Trail state (rendered into BEV images)
         self._trail_cfg = BevTrailConfig.from_mapping(trails_cfg or {})
         self._trails_enabled = bool(self._trail_cfg.enabled)
-        self._trail_tracks_by_cam: Dict[str, Dict[int, _BevTrailTrackState]] = {}
+        self._trail_tracks_by_cam: Dict[str, Dict[Hashable, _BevTrailTrackState]] = {}
         self._trail_frame_counts: Dict[str, int] = {}
         self._trail_color_cache: Dict[int, Tuple[int, int, int]] = {}
         self._smoothing_cfg = MotionSmoothingConfig.from_mapping(smoothing_cfg or {})
@@ -391,6 +397,36 @@ class BevRenderer:
         self._trail_color_cache[key] = bgr
         return bgr
 
+    def _history_identity(
+        self,
+        *,
+        stable_id: Optional[int],
+        tracker_id: Optional[int],
+    ) -> Optional[Tuple[str, int]]:
+        if tracker_id is not None and int(tracker_id) >= 0:
+            return ("tracker", int(tracker_id))
+        if stable_id is not None and int(stable_id) > 0:
+            return ("stable", int(stable_id))
+        return None
+
+    def _display_color_key(
+        self,
+        *,
+        stable_id: Optional[int],
+        tracker_id: Optional[int],
+    ) -> Optional[int]:
+        if self._trail_cfg.color_key == "stable_id":
+            if stable_id is not None and int(stable_id) > 0:
+                return int(stable_id)
+            if tracker_id is not None and int(tracker_id) >= 0:
+                return int(tracker_id)
+            return None
+        if tracker_id is not None and int(tracker_id) >= 0:
+            return int(tracker_id)
+        if stable_id is not None and int(stable_id) > 0:
+            return int(stable_id)
+        return None
+
     @staticmethod
     def _resample_points(
         points: List[Tuple[float, float, float]],
@@ -449,12 +485,15 @@ class BevRenderer:
 
         R_wc, C_world = parse_extrinsics(calib.extrinsics_col_major)
         scene_per_m = 1.0
+        meters_per_scene = 1.0
         try:
             s_obj_to_m = float(calib.unit_scale or 1.0)
             if math.isfinite(s_obj_to_m) and s_obj_to_m > 1e-6:
                 scene_per_m = 1.0 / s_obj_to_m
+                meters_per_scene = float(s_obj_to_m)
         except Exception:
             scene_per_m = 1.0
+            meters_per_scene = 1.0
         C_world = C_world * scene_per_m
         plane = Plane.horizontal(float(calib.floor_y))
 
@@ -516,12 +555,15 @@ class BevRenderer:
 
         R_wc, C_world = parse_extrinsics(calib.extrinsics_col_major)
         scene_per_m = 1.0
+        meters_per_scene = 1.0
         try:
             s_obj_to_m = float(calib.unit_scale or 1.0)
             if math.isfinite(s_obj_to_m) and s_obj_to_m > 1e-6:
                 scene_per_m = 1.0 / s_obj_to_m
+                meters_per_scene = float(s_obj_to_m)
         except Exception:
             scene_per_m = 1.0
+            meters_per_scene = 1.0
         C_world = C_world * scene_per_m
         plane = Plane.horizontal(float(calib.floor_y))
 
@@ -724,17 +766,20 @@ class BevRenderer:
             H_img2plane = cached_result
 
         bev_points: List[Dict[str, Any]] = []
-        raw_points: List[Tuple[int, float, float, str, Optional[int], Optional[int]]] = []
-        current_by_sid: Dict[int, Tuple[float, float]] = {}
+        raw_points: List[Dict[str, Any]] = []
+        current_by_history: Dict[Hashable, Dict[str, Any]] = {}
 
         R_wc, C_world = parse_extrinsics(calib.extrinsics_col_major)
         scene_per_m = 1.0
+        meters_per_scene = 1.0
         try:
             s_obj_to_m = float(calib.unit_scale or 1.0)
             if math.isfinite(s_obj_to_m) and s_obj_to_m > 1e-6:
                 scene_per_m = 1.0 / s_obj_to_m
+                meters_per_scene = float(s_obj_to_m)
         except Exception:
             scene_per_m = 1.0
+            meters_per_scene = 1.0
         C_world = C_world * scene_per_m
 
         cos_yaw = sin_yaw = None
@@ -745,7 +790,7 @@ class BevRenderer:
             sin_yaw = math.sin(-yaw)
 
         max_distance_m = float(self._resolve_max_distance_scene(cfg, calib))
-        apply_backend_smoothing = bool(self._smoother.enabled) and (not use_world_frame)
+        apply_backend_smoothing = bool(self._smoother.enabled)
 
         for fp in footpoints:
             wx = wz = None
@@ -806,18 +851,43 @@ class BevRenderer:
             if tracker_id is not None and tracker_id < 0:
                 tracker_id = None
 
-            key_id: Optional[int] = stable_id if stable_id is not None else tracker_id
-            if key_id is None:
+            history_key = self._history_identity(stable_id=stable_id, tracker_id=tracker_id)
+            display_key = self._display_color_key(stable_id=stable_id, tracker_id=tracker_id)
+            if history_key is None or display_key is None:
                 continue
 
-            raw_points.append((int(key_id), float(px), float(pz), str(fp.method), stable_id, tracker_id))
+            raw_points.append(
+                {
+                    "history_key": history_key,
+                    "display_key": int(display_key),
+                    "x": float(px),
+                    "z": float(pz),
+                    "method": str(fp.method),
+                    "stable_id": stable_id,
+                    "tracker_id": tracker_id,
+                    "anchor_source": str(fp.anchor_source) if fp.anchor_source not in (None, "") else None,
+                    "anchor_quality": str(fp.anchor_quality) if fp.anchor_quality not in (None, "") else None,
+                    "anchor_reason": str(fp.anchor_reason) if fp.anchor_reason not in (None, "") else None,
+                }
+            )
 
         with self._lock:
             if apply_backend_smoothing:
                 self._smoother.prune(now_s)
-            for key_id, lx, lz, method, stable_id, tracker_id in raw_points:
+            for item in raw_points:
+                history_key = item["history_key"]
+                display_key = int(item["display_key"])
+                lx = float(item["x"])
+                lz = float(item["z"])
+                method = str(item["method"])
+                stable_id = item.get("stable_id")
+                tracker_id = item.get("tracker_id")
                 if apply_backend_smoothing:
-                    lx, lz = self._smoother.update((camera_id, int(key_id)), now_s, lx, lz)
+                    smooth_x = float(lx) * float(meters_per_scene)
+                    smooth_z = float(lz) * float(meters_per_scene)
+                    smooth_x, smooth_z = self._smoother.update((camera_id, *history_key), now_s, smooth_x, smooth_z)
+                    lx = float(smooth_x) * float(scene_per_m)
+                    lz = float(smooth_z) * float(scene_per_m)
                 # The frontend expects 'x' and 'y' in the JSON list.
                 # We map X -> JSON x, Z -> JSON y (frame depends on configured mode).
                 bev_points.append(
@@ -827,9 +897,18 @@ class BevRenderer:
                         'method': method,
                         'stableId': int(stable_id) if stable_id is not None else None,
                         'trackerId': int(tracker_id) if tracker_id is not None else None,
+                        'anchorSource': item.get("anchor_source"),
+                        'anchorQuality': item.get("anchor_quality"),
+                        'anchorReason': item.get("anchor_reason"),
                     }
                 )
-                current_by_sid[int(key_id)] = (float(lx), float(lz))
+                current_by_history[history_key] = {
+                    "x": float(lx),
+                    "z": float(lz),
+                    "stable_id": int(stable_id) if stable_id is not None else None,
+                    "tracker_id": int(tracker_id) if tracker_id is not None else None,
+                    "display_key": int(display_key),
+                }
 
         # Update config to reflect the actual extents used
         result_config = BevConfig(
@@ -843,6 +922,7 @@ class BevRenderer:
         )
 
         trails_to_draw: List[Tuple[int, List[Tuple[float, float, float]]]] = []
+        backend_trails: List[Dict[str, Any]] = []
         with self._lock:
             trails_enabled = bool(self._trails_enabled) and bool(self._trail_cfg.enabled)
             cam_tracks = self._trail_tracks_by_cam.setdefault(camera_id, {})
@@ -854,17 +934,26 @@ class BevRenderer:
 
             min_dt_s = float(self._trail_cfg.min_dt_s)
             min_step_m = float(self._trail_cfg.min_step_px) * float(effective_mpp)
+            trail_max_speed_px_per_s = 0.0 if apply_backend_smoothing else float(self._trail_cfg.max_speed_px_per_s)
+            trail_smooth_tau_s = 0.0 if apply_backend_smoothing else float(self._trail_cfg.smooth_tau_s)
             max_points = max(2, int(self._trail_cfg.max_points_per_track))
             window_s = float(self._trail_cfg.window_s)
 
             if trails_enabled:
-                for stable_id, (lx, lz) in current_by_sid.items():
-                    state = cam_tracks.get(stable_id)
+                for history_key, point_meta in current_by_history.items():
+                    lx = float(point_meta["x"])
+                    lz = float(point_meta["z"])
+                    stable_id = point_meta.get("stable_id")
+                    tracker_id = point_meta.get("tracker_id")
+                    display_key = int(point_meta["display_key"])
+                    state = cam_tracks.get(history_key)
                     if state is None:
                         state = _BevTrailTrackState(points=deque(maxlen=max_points))
-                        cam_tracks[stable_id] = state
+                        cam_tracks[history_key] = state
                     state.last_seen_ts = float(now_s)
-                    state.stable_id = int(stable_id)
+                    state.stable_id = int(stable_id) if stable_id is not None else None
+                    state.tracker_id = int(tracker_id) if tracker_id is not None else None
+                    state.display_key = int(display_key)
 
                     # Always prune old samples so disappeared tracks naturally fade out.
                     while state.points and (now_s - float(state.points[0][0])) > window_s:
@@ -881,25 +970,29 @@ class BevRenderer:
                         prev_ts, prev_x, prev_z = state.points[-1]
                         dt = max(0.0, float(now_s) - float(prev_ts))
                         dist = math.hypot(x - float(prev_x), z - float(prev_z))
-                        max_step = float(self._trail_cfg.max_speed_px_per_s) * float(effective_mpp) * dt
+                        max_step = float(trail_max_speed_px_per_s) * float(effective_mpp) * dt
                         if max_step > 0.0 and dist > max_step:
                             scale_step = max_step / dist
                             x = float(prev_x) + (x - float(prev_x)) * scale_step
                             z = float(prev_z) + (z - float(prev_z)) * scale_step
 
-                    # Smooth the footpoint directly (time-constant based EMA).
-                    if self._trail_cfg.smooth_tau_s > 0.0:
+                    # Producer-owned point smoothing is already applied above for world-mode BEV.
+                    # Do not add a second trail-stage EMA/speed model on top of that path.
+                    if trail_smooth_tau_s > 0.0:
                         if state.ema_x is None or state.ema_z is None:
                             state.ema_x, state.ema_z = x, z
                             state.ema_ts = float(now_s)
                         else:
                             dt_ema = max(0.0, float(now_s) - float(state.ema_ts))
-                            tau = float(self._trail_cfg.smooth_tau_s)
+                            tau = float(trail_smooth_tau_s)
                             alpha = 1.0 - math.exp(-dt_ema / tau) if (tau > 0.0 and dt_ema > 0.0) else 1.0
                             state.ema_x = float(state.ema_x + alpha * (x - float(state.ema_x)))
                             state.ema_z = float(state.ema_z + alpha * (z - float(state.ema_z)))
                             state.ema_ts = float(now_s)
                         x, z = float(state.ema_x), float(state.ema_z)
+                    else:
+                        state.ema_x, state.ema_z = float(x), float(z)
+                        state.ema_ts = float(now_s)
 
                     # Decimation: enforce a time-window based sampling budget.
                     if state.points:
@@ -916,25 +1009,45 @@ class BevRenderer:
                     state.points.append((float(now_s), float(x), float(z)))
 
             # Remove fully expired tracks to keep memory bounded.
-            expired: List[int] = []
-            for stable_id, state in cam_tracks.items():
+            expired: List[Hashable] = []
+            for history_key, state in cam_tracks.items():
                 while state.points and (now_s - float(state.points[0][0])) > window_s:
                     state.points.popleft()
                 if not state.points and (now_s - float(state.last_seen_ts)) > window_s:
-                    expired.append(stable_id)
-            for stable_id in expired:
-                cam_tracks.pop(stable_id, None)
+                    expired.append(history_key)
+            for history_key in expired:
+                cam_tracks.pop(history_key, None)
 
             if trails_enabled and cam_tracks:
                 # Select a bounded number of tracks to render.
                 track_items = list(cam_tracks.items())
                 track_items.sort(key=lambda item: float(getattr(item[1], "last_seen_ts", 0.0)), reverse=True)
                 max_tracks = max(1, int(self._trail_cfg.max_tracks))
-                for stable_id, state in track_items[:max_tracks]:
+                for history_key, state in track_items[:max_tracks]:
                     pts = list(state.points)
                     if len(pts) < 2:
                         continue
-                    trails_to_draw.append((int(stable_id), pts))
+                    segments_available = len(pts) - 1
+                    segments_budget = min(segments_available, int(self._trail_cfg.max_segments_per_track))
+                    if segments_budget <= 0:
+                        continue
+                    pts = self._resample_points(pts, segments_budget)
+                    display_key = int(state.display_key) if state.display_key is not None else 0
+                    trails_to_draw.append((display_key, pts))
+                    backend_trails.append(
+                        {
+                            "stableId": int(state.stable_id) if state.stable_id is not None else None,
+                            "trackerId": int(state.tracker_id) if state.tracker_id is not None else None,
+                            "points": [
+                                {
+                                    "x": float(x_pt),
+                                    "y": float(z_pt),
+                                    "t": int(round(float(ts_pt) * 1000.0)),
+                                }
+                                for ts_pt, x_pt, z_pt in pts
+                            ],
+                        }
+                    )
 
         # Draw grid + trails + footpoints if overlay is enabled
         if bev is not None and result_config.overlay:
@@ -946,11 +1059,6 @@ class BevRenderer:
                 for stable_id, pts in trails_to_draw:
                     if len(pts) < 2:
                         continue
-                    segments_available = len(pts) - 1
-                    segments_budget = min(segments_available, int(self._trail_cfg.max_segments_per_track))
-                    if segments_budget <= 0:
-                        continue
-                    pts = self._resample_points(pts, segments_budget)
                     base_bgr = self._color_for_key(int(stable_id))
                     for idx in range(len(pts) - 1):
                         ts0, x1, z1 = pts[idx]
@@ -969,17 +1077,20 @@ class BevRenderer:
                         )
                         cv2.line(bev, p1, p2, color, line_width, lineType=cv2.LINE_AA)
 
-            for stable_id, (lx, lz) in current_by_sid.items():
+            for point_meta in current_by_history.values():
+                lx = float(point_meta["x"])
+                lz = float(point_meta["z"])
                 p = self._local_to_px(lx, lz, result_config, bev.shape[:2])
                 if p is None:
                     continue
-                base_bgr = self._color_for_key(int(stable_id))
+                base_bgr = self._color_for_key(int(point_meta["display_key"]))
                 cv2.circle(bev, p, 4, base_bgr, -1, lineType=cv2.LINE_AA)
 
         result = BevResult(
             camera_id=camera_id,
             bev_bgr=bev,
             bev_points=bev_points,
+            backend_trails=backend_trails,
             config=result_config,
             timestamp_us=timestamp_us,
             width_px=width_px,
@@ -1011,6 +1122,14 @@ class BevRenderer:
         try:
             # Compute a quick sanity sample: image bottom-center ray intersection in scene units (XZ)
             sample_xz: Optional[Tuple[float, float]] = None
+            fallback_points = [
+                point for point in result.bev_points
+                if str(point.get("anchorSource") or "").strip().lower() == "ray_floor_fallback"
+            ]
+            fallback_reasons: Dict[str, int] = {}
+            for point in fallback_points:
+                reason = str(point.get("anchorReason") or "legacy_fallback").strip() or "legacy_fallback"
+                fallback_reasons[reason] = int(fallback_reasons.get(reason, 0)) + 1
             try:
                 width_src, height_src = calib.image_size
                 u = float(max(0.0, width_src * 0.5))
@@ -1045,6 +1164,7 @@ class BevRenderer:
                 "zMax": result.config.z_range[1],
                 "overlay": result.config.overlay,
                 "footpoints": result.bev_points,
+                "trails": result.backend_trails,
                 # Optional: flattened 3x3 homography for client-side debug/overlays
                 "H": [float(x) for x in H_to_use.reshape(-1)],
                 "sampleXZ": list(sample_xz) if sample_xz is not None else None,
@@ -1052,8 +1172,12 @@ class BevRenderer:
                 "frame_mode": self._frame_mode,
                 "units": "scene",
                 "s_obj_to_m": float(getattr(calib, "unit_scale", 1.0) or 1.0),
-                "trail_smoothing_owner": "frontend" if self._frame_mode == "world" else ("backend" if bool(result.points_smoothed) else "none"),
+                "trail_smoothing_owner": "backend" if bool(result.points_smoothed) else ("frontend" if self._frame_mode == "world" else "none"),
                 "bev_world_points_smoothed": bool(result.points_smoothed) if self._frame_mode == "world" else False,
+                "fallbackActive": bool(fallback_points),
+                "fallbackTrackCount": int(len(fallback_points)),
+                "fallbackSources": (["ray_floor_fallback"] if fallback_points else []),
+                "fallbackReasonCounts": fallback_reasons,
             }
             if hasattr(self.ws, "broadcast_sync"):
                 self.ws.broadcast_sync(status)

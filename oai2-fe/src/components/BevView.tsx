@@ -1,5 +1,5 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
-import { CameraKey, cameraLabel, colorIdForPerson, identityKeyForPerson } from '../lib/camera';
+import { CameraKey, cameraLabel, colorIdForPerson } from '../lib/camera';
 import { FloorplanResponse } from './DepthDrawer';
 import { renderLayerToCanvas, renderCompositeWalkableObstacleToCanvas, infernoColor, bwColor } from '../lib/renderUtils';
 import type { BevFrameMode as CoordFrameMode } from '../lib/coordTransforms';
@@ -24,13 +24,37 @@ export type BevMeta = {
   frame_mode?: string;
   units?: string;
   s_obj_to_m?: number;
-  footpoints?: Array<{ x: number; y: number; method: string; stableId?: number | null; trackerId?: number | null }>;
+  footpoints?: Array<{
+    x: number;
+    y: number;
+    method: string;
+    stableId?: number | null;
+    trackerId?: number | null;
+    anchorSource?: string | null;
+    anchorQuality?: string | null;
+    anchorReason?: string | null;
+  }>;
+  trails?: Array<{
+    stableId?: number | null;
+    trackerId?: number | null;
+    points?: Array<{
+      x: number;
+      y: number;
+      t: number;
+    }>;
+  }>;
   xMin?: number;
   xMax?: number;
   zMin?: number;
   zMax?: number;
   error?: string;
   details?: string;
+  fallbackActive?: boolean;
+  fallbackTrackCount?: number;
+  fallbackSources?: string[];
+  fallbackReasonCounts?: Record<string, number>;
+  trail_smoothing_owner?: 'frontend' | 'backend' | 'none';
+  bev_world_points_smoothed?: boolean;
 };
 
 export type BevFrameMode = CoordFrameMode;
@@ -125,6 +149,23 @@ const resolveTrailSampleNowMs = (rawTs: unknown, arrivalNowMs: number, clock: Tr
   return clamped;
 };
 
+const formatFallbackReason = (reason: string): string => {
+  switch (reason) {
+    case 'pose_meta_missing':
+      return 'pose metadata missing';
+    case 'pose_keypoints_unusable':
+      return 'pose keypoints unusable';
+    case 'height_lock_missing':
+      return 'height lock missing';
+    case 'pose_anchor_unavailable':
+      return 'pose anchor unavailable';
+    case 'pose_anchor_projection_failed':
+      return 'pose anchor projection failed';
+    default:
+      return reason.replace(/_/g, ' ');
+  }
+};
+
 export const BevView: React.FC<BevViewProps> = ({
   cam,
   meta,
@@ -139,22 +180,54 @@ export const BevView: React.FC<BevViewProps> = ({
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const [overlayEnabled, setOverlayEnabled] = useState(false);
 
-  const smoothState = useRef<Map<number, { x: number; y: number; lastSeen: number; stableId?: string; colorId: number }>>(new Map());
+  const smoothState = useRef<Map<string, { x: number; y: number; lastSeen: number; stableId?: string; colorId: number }>>(new Map());
   const trailsRef = useRef<Map<string, TrailTrack>>(new Map());
   const animationFrameRef = useRef<number>();
   const bgCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const bgKeyRef = useRef<string>('');
   const bgSizeRef = useRef<{ w: number; h: number }>({ w: 0, h: 0 });
   const bgContentRectRef = useRef<ContentRect | null>(null);
+  const historyKeyForPoint = (stableId?: number | null, trackerId?: number | null): string | null => {
+    const trackerNum = typeof trackerId === 'number' && Number.isFinite(trackerId) ? trackerId : null;
+    if (trackerNum !== null && trackerNum >= 0) return `t:${trackerNum}`;
+    const stableNum = typeof stableId === 'number' && Number.isFinite(stableId) ? stableId : null;
+    if (stableNum !== null && stableNum > 0) return `s:${stableNum}`;
+    return null;
+  };
+
+  const displayIdForPoint = (stableId?: number | null, trackerId?: number | null): number | null => {
+    const stableNum = typeof stableId === 'number' && Number.isFinite(stableId) ? stableId : null;
+    if (stableNum !== null && stableNum > 0) return stableNum;
+    const trackerNum = typeof trackerId === 'number' && Number.isFinite(trackerId) ? trackerId : null;
+    if (trackerNum !== null && trackerNum >= 0) return trackerNum;
+    return null;
+  };
+
   const retainedFloorplanRef = useRef<FloorplanResponse | undefined>(floorplan);
   const trailSceneUnitsPerPxRef = useRef<number>(1.0);
   const trailFrameCounterRef = useRef<number>(0);
   const trailSpaceKeyRef = useRef<string>('');
   const trailClockRef = useRef<TrailClock>({});
   const metaRef = useRef<BevMeta | undefined>(meta);
+  const trailSmoothingOwner = useMemo(() => {
+    const owner = meta?.trail_smoothing_owner;
+    if (owner === 'frontend' || owner === 'backend' || owner === 'none') return owner;
+    return meta?.bev_world_points_smoothed ? 'backend' : 'frontend';
+  }, [meta?.trail_smoothing_owner, meta?.bev_world_points_smoothed]);
+  const frontendOwnsTrailSmoothing = trailSmoothingOwner === 'frontend';
   const resolvedTrailConfig = useMemo(
-    () => normalizeBevTrailConfig({ ...trailConfig, enabled: trailEnabled }),
-    [trailConfig, trailEnabled]
+    () => {
+      const normalized = normalizeBevTrailConfig({ ...trailConfig, enabled: trailEnabled });
+      if (frontendOwnsTrailSmoothing) return normalized;
+      return {
+        ...normalized,
+        smooth_tau_s: 0.0,
+        head_smooth_tau_s: 0.0,
+        trail_smooth_tau_s: 0.0,
+        max_speed_px_per_s: 0.0,
+      };
+    },
+    [frontendOwnsTrailSmoothing, trailConfig, trailEnabled]
   );
   const displayFloorplan = (floorplanHasRenderableGrid(floorplan) && !floorplan?.error)
     ? floorplan
@@ -215,6 +288,7 @@ export const BevView: React.FC<BevViewProps> = ({
     const state = smoothState.current;
     const trails = trailsRef.current;
     const cfg = resolvedTrailConfig;
+    const useBackendTrails = !frontendOwnsTrailSmoothing && Array.isArray(meta?.trails);
 
     if (!cfg.enabled) {
       trails.clear();
@@ -225,6 +299,32 @@ export const BevView: React.FC<BevViewProps> = ({
     }
 
     const points = Array.isArray(meta?.footpoints) ? meta.footpoints : [];
+    if (useBackendTrails) {
+      trails.clear();
+      const seenIds = new Set<string>();
+      points.forEach(pt => {
+        const stableNum = typeof pt.stableId === 'number' && Number.isFinite(pt.stableId) ? pt.stableId : null;
+        const trackerNum = typeof pt.trackerId === 'number' && Number.isFinite(pt.trackerId) ? pt.trackerId : null;
+        const historyKey = historyKeyForPoint(stableNum, trackerNum);
+        const displayId = displayIdForPoint(stableNum, trackerNum);
+        if (historyKey === null || displayId === null) return;
+        seenIds.add(historyKey);
+        state.set(historyKey, {
+          x: Number(pt.x),
+          y: Number(pt.y),
+          lastSeen: arrivalNow,
+          stableId: `${displayId}`,
+          colorId: colorIdForPerson(cam, displayId),
+        });
+      });
+      for (const [id, data] of state.entries()) {
+        if (!seenIds.has(id) && (arrivalNow - data.lastSeen > 1000)) {
+          state.delete(id);
+        }
+      }
+      return;
+    }
+
     if (points.length) {
       trailFrameCounterRef.current += 1;
       const doSample = (trailFrameCounterRef.current % cfg.draw_stride) === 0;
@@ -236,16 +336,13 @@ export const BevView: React.FC<BevViewProps> = ({
 
         const stableNum = typeof pt.stableId === 'number' && Number.isFinite(pt.stableId) ? pt.stableId : null;
         const trackerNum = typeof pt.trackerId === 'number' && Number.isFinite(pt.trackerId) ? pt.trackerId : null;
-        const keyNum = (stableNum && stableNum > 0)
-          ? stableNum
-          : ((trackerNum !== null && trackerNum >= 0) ? trackerNum : null);
-        if (keyNum === null) return;
-        const colorId = colorIdForPerson(cam, keyNum);
+        const historyKey = historyKeyForPoint(stableNum, trackerNum);
+        const displayId = displayIdForPoint(stableNum, trackerNum);
+        if (historyKey === null || displayId === null) return;
+        const colorId = colorIdForPerson(cam, displayId);
+        const labelText = `${displayId}`;
 
-        const key = identityKeyForPerson(cam, keyNum);
-        const labelText = `${stableNum && stableNum > 0 ? stableNum : keyNum}`;
-
-        const entry = trails.get(key) ?? { points: [], lastSeen: 0, label: labelText, colorId };
+        const entry = trails.get(historyKey) ?? { points: [], lastSeen: 0, label: labelText, colorId };
         const update = upsertTrailSample(entry, {
           nowMs: effectiveNow,
           x: targetX,
@@ -255,17 +352,17 @@ export const BevView: React.FC<BevViewProps> = ({
           cfg,
         });
 
-        state.set(keyNum, {
+        state.set(historyKey, {
           x: update.headX,
           y: update.headY,
           lastSeen: arrivalNow,
-          stableId: `${stableNum && stableNum > 0 ? stableNum : keyNum}`,
+          stableId: `${displayId}`,
           colorId,
         });
 
         entry.label = labelText;
         entry.colorId = colorId;
-        trails.set(key, entry);
+        trails.set(historyKey, entry);
       });
     }
 
@@ -511,7 +608,31 @@ export const BevView: React.FC<BevViewProps> = ({
       }
 
       if (trailCfg.enabled) {
-        const tracksToDraw = Array.from(trailsRef.current.values());
+        const backendTracks = !frontendOwnsTrailSmoothing && Array.isArray(metaNow?.trails)
+          ? metaNow.trails
+            .map((tr) => {
+              const stableNum = typeof tr?.stableId === 'number' && Number.isFinite(tr.stableId) ? tr.stableId : null;
+              const trackerNum = typeof tr?.trackerId === 'number' && Number.isFinite(tr.trackerId) ? tr.trackerId : null;
+              const displayId = displayIdForPoint(stableNum, trackerNum);
+              if (displayId === null || !Array.isArray(tr?.points)) return null;
+              const points = tr.points
+                .map((p) => ({
+                  x: Number(p?.x),
+                  y: Number(p?.y),
+                  t: Number(p?.t),
+                }))
+                .filter((p) => Number.isFinite(p.x) && Number.isFinite(p.y) && Number.isFinite(p.t));
+              if (points.length < 2) return null;
+              return {
+                points,
+                lastSeen: Number(points[points.length - 1]?.t) || now,
+                label: `${displayId}`,
+                colorId: colorIdForPerson(cam, displayId),
+              } as TrailTrack;
+            })
+            .filter((tr): tr is TrailTrack => tr !== null)
+          : null;
+        const tracksToDraw = backendTracks ?? Array.from(trailsRef.current.values());
         for (const tr of tracksToDraw) {
           const pts = tr.points;
           if (!pts || pts.length < 2) continue;
@@ -687,6 +808,32 @@ export const BevView: React.FC<BevViewProps> = ({
     : (hasWalkableLayer ? 'Walkable Map' : (hasObstacleHeightLayer ? 'Obstacle Height' : 'Height Map'));
   const subtitleText = floorplanHasImage ? (isFrameMismatch ? `${baseLabel} (local-floorplan fallback)` : baseLabel) : 'No Map Data';
   const subtitle = ` • ${subtitleText}`;
+  const fallbackActive = Boolean(meta?.fallbackActive);
+  const fallbackTrackCount = Number.isFinite(Number(meta?.fallbackTrackCount))
+    ? Math.max(0, Number(meta?.fallbackTrackCount))
+    : 0;
+  const fallbackReasonEntries = Object.entries(meta?.fallbackReasonCounts ?? {})
+    .filter(([, count]) => Number.isFinite(Number(count)) && Number(count) > 0)
+    .sort((a, b) => Number(b[1]) - Number(a[1]));
+  const fallbackReasonText = fallbackReasonEntries.length
+    ? fallbackReasonEntries
+        .slice(0, 2)
+        .map(([reason, count]) => {
+          const label = formatFallbackReason(String(reason));
+          const numericCount = Number(count);
+          return numericCount > 1 ? `${label} x${numericCount}` : label;
+        })
+        .join(', ')
+    : 'pose-first anchor unavailable';
+  const fallbackBanner = fallbackActive ? (
+    <div className="bev-anchor-banner" role="status" aria-live="polite">
+      <strong>Legacy fallback</strong>
+      <span>
+        {fallbackTrackCount > 0 ? `${fallbackTrackCount} track${fallbackTrackCount === 1 ? '' : 's'} on bbox-bottom` : 'bbox-bottom anchor'}
+        {fallbackReasonText ? ` • ${fallbackReasonText}` : ''}
+      </span>
+    </div>
+  ) : null;
 
   const toggleLabel = (
     <label
@@ -722,6 +869,7 @@ export const BevView: React.FC<BevViewProps> = ({
           <span className="bev-inline-subtitle">{subtitleText}</span>
         </div>
         <div className="bev-inline-body">
+          {fallbackBanner}
           {canvasContent}
           <div className="bev-grid-toggle-wrap">
             {toggleLabel}
@@ -738,6 +886,7 @@ export const BevView: React.FC<BevViewProps> = ({
         <span className="td-subtitle">{subtitle}</span>
       </div>
       <div className="td-image-wrap" style={{ background: '#000', display: 'flex', justifyContent: 'center', alignItems: 'center', position: 'relative' }}>
+        {fallbackBanner}
         {canvasContent}
         <div style={{ position: 'absolute', bottom: 8, right: 8 }}>
           {toggleLabel}

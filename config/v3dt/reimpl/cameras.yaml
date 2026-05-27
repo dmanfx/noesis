@@ -1,0 +1,135 @@
+version: 1
+
+intrinsics_models:
+  unifi_g3_instant:
+    intrinsics:
+      fx: 656.10
+      fy: 956.39
+      cx: 960.00
+      cy: 540.00
+      k1: 0.0
+      k2: 0.0
+      k3: 0.0
+  unifi_g3_instant_charuco_1080_raw_fisheye:
+    resolution: [1920, 1080]
+    intrinsics:
+      fx: 1055.5160398848277
+      fy: 1053.5226356877163
+      cx: 931.2433649803215
+      cy: 563.146369643397
+      # Current Noesis pinhole consumers should not interpret fisheye D as
+      # Brown-Conrady k1/k2/k3. Preserve fisheye coefficients in calibration.
+      k1: 0.0
+      k2: 0.0
+      k3: 0.0
+    calibration:
+      method: charuco
+      generated_at: "2026-05-08T14:59:01.372964+00:00"
+      source_camera_id: family_room
+      corrected_camera_ids: [living-room, kitchen]
+      model: opencv_fisheye
+      distortion_model: fisheye
+      distortion_coeffs:
+        - -0.041323572296878525
+        - -0.07257812805006623
+        - 0.06665786839070417
+        - -0.02667936264765735
+      reprojection_error_px: 0.466353436311086
+      samples_used: 48
+      coverage_score: 100.0
+      note: "Raw source K/D for nvdewarper and offline OpenCV fisheye rectification."
+  unifi_g3_instant_charuco_1080_rectified:
+    resolution: [1920, 1080]
+    intrinsics:
+      fx: 945.0233503133533
+      fy: 943.2386180670404
+      cx: 890.6912285938838
+      cy: 571.5862849567151
+      k1: 0.0
+      k2: 0.0
+      k3: 0.0
+    rectification:
+      source_model: unifi_g3_instant_charuco_1080_raw_fisheye
+      dewarper_config: config/dewarper_g3_instant_charuco_1080.txt
+      method: opencv_fisheye_estimate_new_camera_matrix
+      balance: 0.0
+      fov_scale: 1.0
+      generated_at: "2026-05-08T14:59:01.372964+00:00"
+  unifi_g4_instant:
+    intrinsics:
+      fx: 514.00
+      fy: 692.50
+      cx: 640.00
+      cy: 360.00
+      k1: 0.0
+      k2: 0.0
+      k3: 0.0
+  unifi_g4_instant_charuco_720_raw_fisheye:
+    resolution: [1280, 720]
+    intrinsics:
+      fx: 761.3634617488246
+      fy: 760.2080592964049
+      cx: 629.3995577556551
+      cy: 349.3188814799779
+      # Current Noesis pinhole consumers should not interpret fisheye D as
+      # Brown-Conrady k1/k2/k3. Preserve fisheye coefficients in calibration.
+      k1: 0.0
+      k2: 0.0
+      k3: 0.0
+    calibration:
+      method: charuco
+      generated_at: "2026-05-11T02:13:28.245453+00:00"
+      source_camera_id: g4_instant
+      corrected_camera_ids: [family-room]
+      model: opencv_fisheye
+      distortion_model: fisheye
+      distortion_coeffs:
+        - -0.07298658837120028
+        - 0.009594087411341021
+        - -0.024832203740135013
+        - 0.010214663281410956
+      reprojection_error_px: 0.261921607889235
+      samples_used: 48
+      coverage_score: 98.15
+      note: "Raw source K/D for nvdewarper and offline OpenCV fisheye rectification."
+  unifi_g4_instant_charuco_1080_rectified:
+    resolution: [1920, 1080]
+    intrinsics:
+      fx: 1034.7855505063135
+      fy: 1033.2152180408388
+      cx: 929.1114387446711
+      cy: 519.4562647913322
+      k1: 0.0
+      k2: 0.0
+      k3: 0.0
+    rectification:
+      source_model: unifi_g4_instant_charuco_720_raw_fisheye
+      dewarper_config: config/dewarper_g4_instant_charuco_720_to_1080.txt
+      method: opencv_fisheye_estimate_new_camera_matrix
+      balance: 0.0
+      fov_scale: 1.0
+      output_resolution: [1920, 1080]
+      generated_at: "2026-05-11T02:13:28.245453+00:00"
+  unifi_g3_bullet:
+    intrinsics:
+      fx: 1321.33
+      fy: 1370.87
+      cx: 960.00
+      cy: 540.00
+      k1: 0.0
+      k2: 0.0
+      k3: 0.0
+
+cameras:
+  0:
+    name: living-room
+    model: unifi_g3_instant_charuco_1080_rectified
+    height_m: 2.6
+  1:
+    name: kitchen
+    model: unifi_g3_instant_charuco_1080_rectified
+    height_m: 2.7
+  2:
+    name: family-room
+    model: unifi_g4_instant_charuco_1080_rectified
+    height_m: 1.5

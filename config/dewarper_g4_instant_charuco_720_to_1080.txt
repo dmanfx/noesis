@@ -1,0 +1,27 @@
+################################################################################
+# Dewarper config for calibrated UniFi G4 Instant 1280x720 RTSP streams.
+# Source K/D come from the 2026-05-11 OpenCV fisheye ChArUco calibration.
+# The dst-* intrinsics are OpenCV fisheye estimateNewCameraMatrixForUndistortRectify
+# with balance=0.0, fov_scale=1.0, and output size 1920x1080.
+################################################################################
+
+[property]
+output-width=1920
+output-height=1080
+num-batch-buffers=1
+dewarp-dump-frames=0
+
+[surface0]
+# 4 = FISH_PERSPECTIVE
+projection-type=4
+surface-index=0
+width=1280
+height=720
+focal-length=761.3634617488246;760.2080592964049
+distortion=-0.07298658837120028;0.009594087411341021;-0.024832203740135013;0.010214663281410956
+src-x0=629.3995577556551
+src-y0=349.3188814799779
+dst-focal-length=1034.7855505063135;1033.2152180408388
+dst-principal-point=929.1114387446711;519.4562647913322
+# 0=cudaAddressModeClamp, 1=cudaAddressModeBorder (avoid edge smearing)
+cuda-address-mode=1

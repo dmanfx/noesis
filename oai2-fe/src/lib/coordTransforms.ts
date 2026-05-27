@@ -56,7 +56,14 @@ export const projectWorldPointToCameraLocal = (
 ): LocalGroundPoint | null => {
   if (!Number.isFinite(worldX) || !Number.isFinite(worldY) || !Number.isFinite(worldZ)) return null;
   const E = getExtrinsics(camera);
-  if (!Array.isArray(E) || E.length !== 16) return null;
+  if (!Array.isArray(E) || E.length !== 16) {
+    // Item 5 guard: missing or late calibration during world-mode projection is a common source of BEV issues.
+    // The dashboard will fall back gracefully; this surfaces the root cause for debugging.
+    if (typeof console !== 'undefined' && console.warn) {
+      console.warn('[BEV] world projection skipped — missing/invalid extrinsics for', camera);
+    }
+    return null;
+  }
   const p = worldToCamera(E, [worldX, worldY, worldZ]);
   if (!p) return null;
   const xLocal = Number(p[0]);

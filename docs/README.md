@@ -41,6 +41,12 @@ and worklogs live in `docs/history/`.
 - When you edit docs, append a one-line entry under “Doc changes” (date + what changed) for any **substantive** update: new features/processes/workflows, contract or baseline changes, behavior-affecting diagrams. Skip trivial typo/style fixes or purely cosmetic diagram tweaks.
 - Status headers (“Status: validated as of …”) should only be updated when the doc has been re-validated against code/configs.
 
+## Doc changes (2026-05-27)
+- Added the Noesis/Menon validation toolbox planning workspace and linked it
+  from the DS8 testing guide for cross-space calibration, BEV, tracking-world,
+  virtual-twin, and Menon-facing validation work (`plans/noesis_menon_validation/`,
+  `DS8_testing_guide.md`).
+
 ## Doc changes (2026-02-04)
 - Added ReID alias REST contracts, guardrails, and limitations (`DS8_api_contracts_rest.md`).
 - Logged the soft-merge alias design decision and updated DS8 hooks/runtime checklists (`plans/DS8/ds8_design_decisions.md`, `plans/DS8/ds8_migration_checklist_hooks.md`, `plans/DS8/ds8_migration_checklist_ds8_runtime.md`).

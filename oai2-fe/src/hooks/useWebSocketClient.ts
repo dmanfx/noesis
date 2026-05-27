@@ -64,7 +64,6 @@ export interface StatsPayload {
 }
 
 export type FrameHandlers = {
-  onBevImage?: (cam: CameraKey, blob: Blob) => void;
   onBevMeta?: (payload: any) => void;
   onStats: (stats: StatsPayload) => void;
   onTrailToggle?: (enabled: boolean) => void;
@@ -193,36 +192,10 @@ export function useWebSocketClient(url: string, handlers: FrameHandlers) {
       };
       ws.onmessage = async (ev: MessageEvent) => {
         try {
-          if (ev.data instanceof ArrayBuffer) {
-            const arrayBuffer = ev.data as ArrayBuffer;
-            const view = new DataView(arrayBuffer);
-            const idLen = view.getUint8(0);
-            if (arrayBuffer.byteLength < 1 + idLen) return;
-            const idBytes = new Uint8Array(arrayBuffer, 1, idLen);
-            const id = new TextDecoder('utf-8').decode(idBytes);
-            const jpeg = arrayBuffer.slice(1 + idLen);
-            const jpgBlob = new Blob([jpeg], { type: 'image/jpeg' });
-            if (id.startsWith('bev:')) {
-              const cam = detectCameraKey(id.slice(4));
-              if (cam && handlers.onBevImage) handlers.onBevImage(cam, jpgBlob);
-            }
-            return;
-          }
-          if (ev.data instanceof Blob) {
-            // Fallback path when proxies force Blob delivery
-            const arrayBuffer = await (ev.data as Blob).arrayBuffer();
-            if (arrayBuffer.byteLength < 1) return;
-            const view = new DataView(arrayBuffer);
-            const idLen = view.getUint8(0);
-            if (arrayBuffer.byteLength < 1 + idLen) return;
-            const idBytes = new Uint8Array(arrayBuffer, 1, idLen);
-            const id = new TextDecoder('utf-8').decode(idBytes);
-            const jpeg = arrayBuffer.slice(1 + idLen);
-            const jpgBlob = new Blob([jpeg], { type: 'image/jpeg' });
-            if (id.startsWith('bev:')) {
-              const cam = detectCameraKey(id.slice(4));
-              if (cam && handlers.onBevImage) handlers.onBevImage(cam, jpgBlob);
-            }
+          if (ev.data instanceof ArrayBuffer || ev.data instanceof Blob) {
+            // BEV JPEG binary delivery retired (meta-only mode). The framed `bev:<cam>` binary path is no longer produced
+            // by the canonical DS8 BevRenderer. Future binary depth (if implemented) would use a different magic/header.
+            // Silently ignore for now (or log at debug if needed).
             return;
           }
           const data = JSON.parse(ev.data);
@@ -305,7 +278,15 @@ export function useWebSocketClient(url: string, handlers: FrameHandlers) {
             handlers.onWebRTCError?.(data.error || 'Unknown WebRTC error');
           }
         } catch (e) {
-          // swallow parsing errors
+          // Previously swallowed silently — major source of "BEV went blank with no signal".
+          // Log the message type (if any) + short preview so BEV feed problems become visible in the console/wsLog.
+          try {
+            const preview = typeof ev.data === 'string' ? ev.data.slice(0, 200) : '[binary]';
+            wsLog.warn('[WS] onmessage handler error (was previously swallowed)', {
+              error: String(e),
+              preview,
+            });
+          } catch {}
         }
       };
     };

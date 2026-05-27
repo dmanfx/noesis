@@ -61,7 +61,19 @@ export const TelemetryPanel: React.FC<TelemetryPanelProps> = ({ onClose, cameraS
       }, {} as Record<CameraKey, TelemetryEntry[]>);
     };
 
+    // Debug-only keys from the calibration bundle / MapAnything that are not meant for the normal dashboard view.
+    // These were appearing as blank boxes (K, E, Pose, pose confidence, etc.) underneath the BEV.
+    const DEBUG_ONLY_KEYS = new Set([
+      'K', 'E', 'Pose', 'pose confidence', 'pose_confidence',
+      'intrinsics', 'extrinsics', 'pose', 'confidence',
+    ]);
+
     for (const entry of filtered) {
+      const keyLower = entry.key.toLowerCase().trim();
+      if (DEBUG_ONLY_KEYS.has(entry.key) || DEBUG_ONLY_KEYS.has(keyLower)) {
+        continue; // hide raw debug calibration fields
+      }
+
       if (!entry.group.startsWith('MapAnything')) {
         others.push(entry);
         continue;

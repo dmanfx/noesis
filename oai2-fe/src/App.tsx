@@ -7,7 +7,7 @@ import { ControlsPanel } from './components/ControlsPanel';
 import { TelemetryPanel } from './telemetry/TelemetryPanel';
 import { TelemetryProvider, useTelemetry } from './telemetry/TelemetryContext';
 import { TrailStore } from './lib/trails';
-import { cameraOrder, colorForTrack, cameraLabel, detectCameraKey, CameraKey, colorIdForPerson, identityKeyForPerson } from './lib/camera';
+import { cameraOrder, colorForTrack, cameraLabel, detectCameraKey, CameraKey, colorIdForPerson, identityKeyForPerson, discoverCamerasFromPayloads } from './lib/camera';
 import { getExtrinsics, getIntrinsics4, extractPoseFromExtrinsics, forwardXZFromExtrinsics } from './lib/calibration';
 import { isCameraLocalFrame, projectWorldPointToCameraLocal, resolveBevFrameModeFromPayload } from './lib/coordTransforms';
 import { useWebSocketClient, StatsPayload, DepthRequestStrategy, MosaicLayout } from './hooks/useWebSocketClient';
@@ -59,17 +59,40 @@ const floorplanHasRenderableGrid = (floorplan?: FloorplanResponse | null): boole
 const buildMosaicCameraIdToSlotKey = (layout: MosaicLayout | null): Record<string, CameraKey> => {
   const map: Record<string, CameraKey> = {};
   if (!layout || !Array.isArray(layout.sources)) return map;
+
   for (const src of layout.sources) {
     const sourceId = Number((src as any).source_id);
-    if (!Number.isFinite(sourceId)) continue;
-    const slotKey = cameraOrder[sourceId as 0 | 1 | 2];
+    const cameraIdRaw = (src as any).camera_id || (src as any).cameraId;
+    const cameraId = normalizeCameraIdKey(cameraIdRaw);
+
+    // Prefer an actual camera identifier from the feed (supports dynamic 4th/5th+ cameras)
+    // Fall back to the legacy fixed-slot key only for the original three source_ids.
+    let slotKey: CameraKey | null = null;
+
+    if (cameraId) {
+      // If we have a real camera_id string, use it directly as the display key for dynamic cameras.
+      // This is the key fix for newly discovered rooms appearing in mosaic_layout.
+      slotKey = cameraId as CameraKey;
+    }
+
+    if (!slotKey && Number.isFinite(sourceId)) {
+      // Legacy fallback for the first three tiler slots (0/1/2) using the old cameraOrder
+      slotKey = cameraOrder[sourceId as 0 | 1 | 2] || null;
+    }
+
     if (!slotKey) continue;
-    const cameraId = normalizeCameraIdKey((src as any).camera_id);
-    if (cameraId) map[cameraId] = slotKey;
-    map[String(sourceId)] = slotKey;
-    map[`rtsp_${sourceId}`] = slotKey;
-    map[`camera_${sourceId}`] = slotKey;
-    map[`source_${sourceId}`] = slotKey;
+
+    // Populate many alias forms so resolveDisplayCameraKey has the best chance
+    if (cameraId) {
+      map[cameraId] = slotKey;
+      map[cameraIdRaw] = slotKey;
+    }
+    if (Number.isFinite(sourceId)) {
+      map[String(sourceId)] = slotKey;
+      map[`rtsp_${sourceId}`] = slotKey;
+      map[`camera_${sourceId}`] = slotKey;
+      map[`source_${sourceId}`] = slotKey;
+    }
   }
   return map;
 };
@@ -77,6 +100,7 @@ const buildMosaicCameraIdToSlotKey = (layout: MosaicLayout | null): Record<strin
 function Dashboard() {
   const { publish } = useTelemetry();
 
+  // Item 4: BEV state now keyed by discovered cameras (seeded with the original three).
   const [bevMeta, setBevMeta] = useState<Record<CameraKey, BevMeta | undefined>>({ 'living-room': undefined, 'kitchen': undefined, 'family-room': undefined });
   const bevMetaRef = useRef<Record<CameraKey, BevMeta | undefined>>({ 'living-room': undefined, 'kitchen': undefined, 'family-room': undefined });
   const [bevMetaRaw, setBevMetaRaw] = useState<Record<CameraKey, BevMeta | undefined>>({ 'living-room': undefined, 'kitchen': undefined, 'family-room': undefined });
@@ -143,6 +167,11 @@ function Dashboard() {
   const prevActiveRef = useRef<Record<CameraKey, Set<string>>>(
     { 'living-room': new Set(), 'kitchen': new Set(), 'family-room': new Set() }
   );
+  // Item 4 (config + discovery): seed with the original three for backward compat,
+  // then grow from real feeds (calibration, mosaic_layout, floorplan, bev meta).
+  const [knownCameras, setKnownCameras] = useState<CameraKey[]>(['living-room', 'kitchen', 'family-room']);
+  const knownCamerasRef = useRef<CameraKey[]>(['living-room', 'kitchen', 'family-room']);
+
   const [bevFrameModeByCam, setBevFrameModeByCam] = useState<Record<CameraKey, BevFrameMode>>({
     'living-room': 'world',
     'kitchen': 'world',
@@ -211,14 +240,69 @@ function Dashboard() {
   const resolveDisplayCameraKey = useCallback((rawId: unknown): CameraKey | null => {
     const id = normalizeCameraIdKey(rawId);
     if (!id) return null;
+
+    // 1. Mosaic layout mapping (primary for source_id / camera_id from stats)
     const mapped = mosaicCameraIdToSlotKeyRef.current[id];
     if (mapped) return mapped;
-    return detectCameraKey(id);
+
+    // 2. Legacy three-camera detector
+    const legacy = detectCameraKey(id);
+    if (legacy) return legacy;
+
+    // 3. Dynamic discovery path (Codex finding fix): if we've already seen this camera via
+    //    knownCameras growth, accept the normalized form as a first-class dynamic key.
+    const known = knownCamerasRef.current;
+    if (known.includes(id as CameraKey)) return id as CameraKey;
+
+    // 4. Last resort: treat any other normalized identifier as a dynamic camera key
+    //    (this is what discoverCamerasFromPayloads already does for new rooms).
+    return id as CameraKey;
   }, []);
 
   const resolveBevFrameMode = (payload: BevMeta, fallbackMode: BevFrameMode): BevFrameMode => (
     resolveBevFrameModeFromPayload(payload, fallbackMode)
   );
+
+  // Item 4 (config + discovery): called whenever we receive calibration, floorplan, stats with layout, or bev meta.
+  // Extends the known camera list so BEV panels can appear for newly discovered rooms without code changes.
+  const updateKnownCamerasFromPayload = (payload: any) => {
+    const next = discoverCamerasFromPayloads([payload]);
+    const current = knownCamerasRef.current;
+    const added = next.filter(c => !current.includes(c));
+    if (added.length > 0) {
+      const updated = [...current, ...added];
+      knownCamerasRef.current = updated;
+      setKnownCameras(updated);
+      // Lazily ensure per-cam state exists for any newly discovered cameras so the dynamic BEV panels render without undefined entries.
+      added.forEach((c) => ensureCameraState(c));
+    }
+  };
+
+  // Lazy initializer for per-camera state when discovery adds a new room. Keeps all the map/ref structures in sync
+  // so <BevView cam={newKey}> and the various per-cam telemetry/floorplan objects never see missing keys.
+  const ensureCameraState = (camKey: CameraKey) => {
+    // Refs (synchronous)
+    if (!bevMetaRef.current[camKey]) bevMetaRef.current[camKey] = undefined;
+    if (!bevMetaRawRef.current[camKey]) bevMetaRawRef.current[camKey] = undefined;
+    if (!bevFrameModeByCamRef.current[camKey]) bevFrameModeByCamRef.current[camKey] = 'world';
+    if (!floorplanDataRef.current[camKey]) floorplanDataRef.current[camKey] = undefined as any;
+    if (!prevActiveRef.current[camKey]) prevActiveRef.current[camKey] = new Set();
+    if (!zeroSinceRef.current[camKey]) zeroSinceRef.current[camKey] = null;
+    if (!lastDepthFloorplanTsRef.current[camKey]) lastDepthFloorplanTsRef.current[camKey] = 0;
+    if (!maDiagThrottleRef.current[camKey]) maDiagThrottleRef.current[camKey] = 0;
+
+    // State updaters (functional so they see latest)
+    setBevMeta((prev) => (prev[camKey] ? prev : { ...prev, [camKey]: undefined }));
+    setBevMetaRaw((prev) => (prev[camKey] ? prev : { ...prev, [camKey]: undefined }));
+    setBevFrameModeByCam((prev) => (prev[camKey] ? prev : { ...prev, [camKey]: 'world' }));
+    setFloorplanData((prev) => (prev[camKey] ? prev : { ...prev, [camKey]: undefined as any }));
+    setCameraStatuses((prev) => (prev[camKey] ? prev : { ...prev, [camKey]: 'unknown' }));
+    setCameraPoses((prev) => (prev[camKey] !== undefined ? prev : { ...prev, [camKey]: null }));
+    setLatencyByCamKey((prev) => (prev[camKey] !== undefined ? prev : { ...prev, [camKey]: null }));
+    setFpsSeries((prev) => (prev[camKey] ? prev : { ...prev, [camKey]: [] }));
+    setOccByCamKey((prev) => (prev[camKey] ? prev : { ...prev, [camKey]: {} }));
+    setVacancyText((prev) => (prev[camKey] ? prev : { ...prev, [camKey]: '' }));
+  };
 
   const setBevFrameMode = (camKey: CameraKey, nextMode: BevFrameMode) => {
     const prevMode = bevFrameModeByCamRef.current[camKey] || 'world';
@@ -345,6 +429,7 @@ function Dashboard() {
 
     const nextLayout = payload.pipeline?.mosaic_layout;
     if (nextLayout) {
+      updateKnownCamerasFromPayload(payload); // Item 4 discovery from layout
       setMosaicLayout(nextLayout);
       mosaicCameraIdToSlotKeyRef.current = buildMosaicCameraIdToSlotKey(nextLayout);
     }
@@ -366,18 +451,14 @@ function Dashboard() {
     const globalOcc: Record<string, number> = {};
     let allTracks: any[] = [];
     const perCamTracks: Record<string, any[]> = {};
-    const perKeyOcc: Record<CameraKey, Record<string, number>> = { 'living-room': {}, 'kitchen': {}, 'family-room': {} };
-    // const perKeyTransCount: Record<CameraKey, number> = { 'living-room': 0, 'kitchen': 0, 'family-room': 0 };
+    // Build per-cam accumulators from the live known set (supports dynamic panels / newly discovered cameras).
+    const currentKnown = knownCamerasRef.current;
+    const perKeyOcc: Record<CameraKey, Record<string, number>> = Object.fromEntries(currentKnown.map(k => [k, {}])) as any;
+    // const perKeyTransCount: Record<CameraKey, number> = Object.fromEntries(currentKnown.map(k => [k, 0])) as any;
 
-    const seenNow: Record<CameraKey, Set<string>> = {
-      'living-room': new Set(), 'kitchen': new Set(), 'family-room': new Set()
-    };
+    const seenNow: Record<CameraKey, Set<string>> = Object.fromEntries(currentKnown.map(k => [k, new Set()])) as any;
 
-    const nextLatencyByKey: Record<CameraKey, LatencyMetrics | null> = {
-      'living-room': null,
-      'kitchen': null,
-      'family-room': null,
-    };
+    const nextLatencyByKey: Record<CameraKey, LatencyMetrics | null> = Object.fromEntries(currentKnown.map(k => [k, null])) as any;
 
     for (const camId in cameras) {
       const c = cameras[camId];
@@ -535,6 +616,8 @@ function Dashboard() {
 
   const handleCalibrationBundle = useCallback((bundle: any) => {
     if (!bundle || typeof bundle !== 'object') return;
+
+    updateKnownCamerasFromPayload(bundle); // Item 4 discovery
 
     let signature = '';
     try {
@@ -776,6 +859,7 @@ function Dashboard() {
   };
 
   const handleFloorplan = (payload: any) => {
+    updateKnownCamerasFromPayload(payload); // Item 4 discovery
     if (!payload || payload.type !== 'floorplan_response') return;
     const camRaw = payload.camera_id || payload.camera || (Array.isArray(payload.cameras) && payload.cameras[0]);
     const camId = camRaw ? String(camRaw) : '';
@@ -842,6 +926,7 @@ function Dashboard() {
 
   const handleBevMeta = useCallback((payload: BevMeta) => {
     if (!payload) return;
+    updateKnownCamerasFromPayload(payload); // Item 4 discovery
     const cam = resolveDisplayCameraKey((payload.cameraId || payload.camId || '').toString());
     if (!cam) return;
     const prevMode = bevFrameModeByCamRef.current[cam] || 'world';
@@ -862,7 +947,8 @@ function Dashboard() {
     let changed = false;
     const next: Record<CameraKey, BevMeta | undefined> = { ...bevMetaRef.current };
 
-    (['living-room', 'kitchen', 'family-room'] as CameraKey[]).forEach((cam) => {
+    // Process all currently known cameras (supports dynamic discovery of new rooms).
+    knownCamerasRef.current.forEach((cam) => {
       const raw = bevMetaRawRef.current[cam];
       if (!raw) return;
       const mode = bevFrameModeByCamRef.current[cam] || 'world';
@@ -1091,7 +1177,8 @@ function Dashboard() {
       setVacancyText(prev => {
         let changed = false;
         const next: Record<CameraKey, string> = { ...prev } as any;
-        (['living-room', 'kitchen', 'family-room'] as CameraKey[]).forEach(k => {
+        // Process the live known set so newly discovered cameras get vacancy text handling.
+        knownCamerasRef.current.forEach(k => {
           const started = zeroSinceRef.current[k];
           if (!started) {
             if (next[k] !== '') { next[k] = ''; changed = true; }
@@ -1242,7 +1329,7 @@ function Dashboard() {
             ))}
           </div>
           <div className="bev-row">
-            {cameraOrder.map((cam) => (
+            {knownCameras.map((cam) => (
               <BevView
                 key={`bev-${cam}`}
                 cam={cam}
@@ -1258,7 +1345,7 @@ function Dashboard() {
           </div>
           {showWorldBevRow && (
             <div className="bev-row">
-              {cameraOrder.map((cam) => (
+              {knownCameras.map((cam) => (
                 <BevView
                   key={`bev-world-${cam}`}
                   cam={cam}

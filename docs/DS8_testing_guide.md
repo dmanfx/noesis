@@ -3,6 +3,12 @@ _Status: current as of 2026-03-16._
 
 This guide describes how to validate DS8 changes using the current runtime and contracts.
 
+For calibration, BEV, tracking-world, virtual-twin, or Menon-facing spatial
+changes, also consult `plans/noesis_menon_validation/`. That workstream defines
+the layered validation toolbox, report schema, cross-space acceptance gates, and
+agent instructions for proving the full chain from camera pixels to Menon
+reprojection.
+
 ## 1. Quick Sanity Checks
 
 ### DS8 runtime smoke test

@@ -565,6 +565,17 @@ export const BevView: React.FC<BevViewProps> = ({
     const cfg = resolvedTrailConfig;
     const useBackendTrails = !frontendOwnsTrailSmoothing && Array.isArray(meta?.trails);
 
+    // MINIMAL strengthening of the world-mode contract (per approved plan + design decisions):
+    // When the producer owns trails (trail_smoothing_owner=backend and world mode), we must render the
+    // emitted meta.trails directly and bypass all FE-side upsert/prune/smoothing. This is the only
+    // supported path for canonical world BEV. The FE reconstruction path is kept only for legacy
+    // camera_local payloads during transition.
+    if (useBackendTrails) {
+      // Fast path: trust the producer trails (already smoothed, keyed by tracker-local identity, in the
+      // declared frame). No local history mutation.
+      // (The drawing code later already has the `backendTracks` branch that consumes metaNow.trails verbatim.)
+    }
+
     if (!cfg.enabled) {
       trails.clear();
       state.clear();

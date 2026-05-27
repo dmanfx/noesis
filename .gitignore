@@ -50,7 +50,14 @@ docs/implementation/
 docs/plans/
 docs/ma-integration/
 
+# Generated/local analysis docs
+docs/UNCOMMITTED_CHANGES_ANALYSIS.md
+docs/chromecastLogicmerm.html
+docs/screenshot-quick-settings-setup.md
+
 #model folders
+data/*
+!data/.gitkeep
 data/depth/
 models/
 */__init__.py
@@ -72,3 +79,22 @@ pipelines/*.so
 .venv_ds/
 newvisions-redesign-mockup
 Labs/
+
+# Local browser/runtime traces and debug captures
+.playwright-mcp/
+bev-debug-*.json
+bev-debug-*.png
+bev-height-restored.png
+bev-live-*.png
+oai2-fe-bev-*.png
+Untitled
+
+# Scratch or external worktrees
+DS9/
+src/mapanything/
+
+# Local prototype work and generated viewer outputs
+testpipelines/sapiens2-human/
+testpipelines/yolo26-seg-depth-3d/
+testpipelines/**/sources.yaml
+testpipelines/**/viewer/dist/

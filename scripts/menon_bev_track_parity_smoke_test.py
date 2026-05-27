@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Smoke test: BEV/track parity in menon_scene world frame.
+"""Smoke test: BEV/track parity in canonical backend world meters.
 
 Runs DS8 runtime, listens to WS telemetry, and validates:
-- tracking world points are valid and labeled menon_scene
-- bev-frame metadata is in world mode / menon_scene
+- tracking world points are valid and labeled backend_world_m
+- bev-frame metadata is in world mode / backend_world_m
 - BEV footpoints (x,y -> world x,z) are close to tracking world coordinates
 """
 
@@ -73,8 +73,11 @@ async def _run(uri: str, duration_s: float) -> Dict[str, object]:
     bev_total = 0
     bev_world_frame_ok = 0
     comparisons: List[float] = []
+    lagged_track_after_bev: List[float] = []
     last_bev_sid: Dict[Tuple[str, int], Tuple[float, float]] = {}
     last_bev_tracker: Dict[Tuple[str, int], Tuple[float, float]] = {}
+    last_track_sid: Dict[Tuple[str, int], Tuple[float, float]] = {}
+    last_track_tracker: Dict[Tuple[str, int], Tuple[float, float]] = {}
 
     async with websockets.connect(uri, max_size=None) as ws:
         end_at = time.time() + max(5.0, float(duration_s))
@@ -85,7 +88,7 @@ async def _run(uri: str, duration_s: float) -> Dict[str, object]:
             msg_type = payload.get("type")
             if msg_type == "bev-frame":
                 bev_total += 1
-                if payload.get("world_frame") == "menon_scene" and payload.get("frame_mode") == "world":
+                if payload.get("world_frame") == "backend_world_m" and payload.get("frame_mode") == "world":
                     bev_world_frame_ok += 1
                 camera_id = payload.get("cameraId")
                 if not isinstance(camera_id, str):
@@ -101,10 +104,12 @@ async def _run(uri: str, duration_s: float) -> Dict[str, object]:
                     except Exception:
                         continue
                     sid = fp.get("stableId")
+                    track_pt = None
                     if sid not in (None, "", -1):
                         try:
                             key_sid = (camera_id, int(sid))
                             last_bev_sid[key_sid] = (x, y)
+                            track_pt = last_track_sid.get(key_sid)
                         except Exception:
                             pass
                     tid = fp.get("trackerId")
@@ -112,8 +117,12 @@ async def _run(uri: str, duration_s: float) -> Dict[str, object]:
                         try:
                             key_tid = (camera_id, int(tid))
                             last_bev_tracker[key_tid] = (x, y)
+                            track_pt = last_track_tracker.get(key_tid) or track_pt
                         except Exception:
                             pass
+                    if track_pt is not None:
+                        tx, tz = track_pt
+                        comparisons.append(math.hypot(x - tx, y - tz))
             elif msg_type == "tracking":
                 tracks = payload.get("tracks")
                 if not isinstance(tracks, list):
@@ -128,38 +137,43 @@ async def _run(uri: str, duration_s: float) -> Dict[str, object]:
                     if not (isinstance(world, list) and len(world) == 3):
                         continue
                     track_world_valid += 1
-                    if tr.get("world_frame") == "menon_scene":
+                    if tr.get("world_frame") == "backend_world_m":
                         track_world_frame_ok += 1
                     camera_id = tr.get("camera_id")
                     sid = tr.get("stable_id")
                     tid = tr.get("tracker_id", tr.get("track_id"))
                     if not isinstance(camera_id, str):
                         continue
+                    wx = float(world[0])
+                    wz = float(world[2])
                     bev_pt = None
                     if tid not in (None, "", -1):
                         try:
-                            bev_pt = last_bev_tracker.get((camera_id, int(tid)))
+                            key_tid = (camera_id, int(tid))
+                            last_track_tracker[key_tid] = (wx, wz)
+                            bev_pt = last_bev_tracker.get(key_tid)
                         except Exception:
                             bev_pt = None
                     if bev_pt is None and sid not in (None, "", -1):
                         try:
-                            bev_pt = last_bev_sid.get((camera_id, int(sid)))
+                            key_sid = (camera_id, int(sid))
+                            last_track_sid[key_sid] = (wx, wz)
+                            bev_pt = last_bev_sid.get(key_sid)
                         except Exception:
                             bev_pt = None
                     if bev_pt is None:
                         continue
                     bx, bz = bev_pt
-                    wx = float(world[0])
-                    wz = float(world[2])
-                    comparisons.append(math.hypot(bx - wx, bz - wz))
+                    lagged_track_after_bev.append(math.hypot(bx - wx, bz - wz))
 
     result: Dict[str, object] = {
         "track_total": track_total,
         "track_world_valid": track_world_valid,
-        "track_world_frame_menon_scene": track_world_frame_ok,
+        "track_world_frame_backend_world_m": track_world_frame_ok,
         "bev_total": bev_total,
-        "bev_world_frame_menon_scene": bev_world_frame_ok,
+        "bev_world_frame_backend_world_m": bev_world_frame_ok,
         "comparisons": len(comparisons),
+        "lagged_track_after_bev_comparisons": len(lagged_track_after_bev),
     }
     if comparisons:
         vals = sorted(comparisons)
@@ -168,11 +182,17 @@ async def _run(uri: str, duration_s: float) -> Dict[str, object]:
     else:
         result["mean_err_m"] = None
         result["p95_err_m"] = None
+    if lagged_track_after_bev:
+        lagged_vals = sorted(lagged_track_after_bev)
+        result["lagged_track_after_bev_mean_err_m"] = float(sum(lagged_vals) / len(lagged_vals))
+        result["lagged_track_after_bev_p95_err_m"] = float(
+            lagged_vals[int(0.95 * (len(lagged_vals) - 1))]
+        )
     return result
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="BEV/track parity smoke test for menon_scene.")
+    parser = argparse.ArgumentParser(description="BEV/track parity smoke test for backend_world_m.")
     parser.add_argument("--ws", default="ws://127.0.0.1:6040", help="WebSocket URL")
     parser.add_argument("--pipeline-config", default="config/infer.yaml")
     parser.add_argument("--cameras-config", default="config/cameras.yaml")
@@ -198,11 +218,11 @@ def main() -> int:
         if int(summary.get("track_world_valid", 0)) <= 0:
             print("[FAIL] no world-valid tracking samples observed")
             return 1
-        if int(summary.get("track_world_frame_menon_scene", 0)) <= 0:
-            print("[FAIL] no tracking samples labeled world_frame=menon_scene")
+        if int(summary.get("track_world_frame_backend_world_m", 0)) <= 0:
+            print("[FAIL] no tracking samples labeled world_frame=backend_world_m")
             return 1
-        if int(summary.get("bev_world_frame_menon_scene", 0)) <= 0:
-            print("[FAIL] no BEV samples labeled world_frame=menon_scene/frame_mode=world")
+        if int(summary.get("bev_world_frame_backend_world_m", 0)) <= 0:
+            print("[FAIL] no BEV samples labeled world_frame=backend_world_m/frame_mode=world")
             return 1
         if int(summary.get("comparisons", 0)) <= 0:
             print("[FAIL] no comparable BEV/track samples (stableId + camera overlap)")

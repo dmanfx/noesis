@@ -35,6 +35,45 @@ else:
 T = TypeVar("T")
 
 WEIGHTS_SHA_PATH = Path(__file__).resolve().parents[2] / 'docs/ma-integration/weights.sha'
+MAPANYTHING_HF_CACHE_ROOT = (
+    Path.home()
+    / ".cache"
+    / "huggingface"
+    / "hub"
+    / "models--facebook--map-anything-apache"
+)
+
+
+def _resolve_cached_weight_path(path: Path) -> Path:
+    if path.exists():
+        return path
+    try:
+        if not path.is_absolute():
+            refs_main = MAPANYTHING_HF_CACHE_ROOT / "refs" / "main"
+            if refs_main.exists():
+                snapshot = refs_main.read_text(encoding="utf-8").strip()
+                candidate = MAPANYTHING_HF_CACHE_ROOT / "snapshots" / snapshot / path.as_posix()
+                if candidate.exists():
+                    return candidate
+                candidate_by_name = MAPANYTHING_HF_CACHE_ROOT / "snapshots" / snapshot / path.name
+                if candidate_by_name.exists():
+                    return candidate_by_name
+        snapshots_dir = path.parent.parent
+        if snapshots_dir.name != "snapshots":
+            return path
+        repo_root = snapshots_dir.parent
+        refs_main = repo_root / "refs" / "main"
+        if refs_main.exists():
+            snapshot = refs_main.read_text(encoding="utf-8").strip()
+            candidate = repo_root / "snapshots" / snapshot / path.name
+            if candidate.exists():
+                return candidate
+        matches = sorted((repo_root / "snapshots").glob(f"*/{path.name}"))
+        if len(matches) == 1 and matches[0].exists():
+            return matches[0]
+    except Exception:  # pragma: no cover - best effort resolution
+        return path
+    return path
 
 
 def verify_weights_checksum() -> None:
@@ -49,7 +88,7 @@ def verify_weights_checksum() -> None:
     for line in lines:
         try:
             expected_hash, path_str = line.split(None, 1)
-            path = Path(path_str).expanduser()
+            path = _resolve_cached_weight_path(Path(path_str).expanduser())
             if not path.exists():
                 raise FileNotFoundError(f"Weights file missing: {path}")
             hasher = hashlib.sha256()

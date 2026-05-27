@@ -17,6 +17,7 @@ from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 
+from noesis.calibration.pose_v1 import E_col_major_to_pose_v1
 from noesis.calibration.tilt_preview import _camera_pose_from_E, _yaw_pitch_roll
 
 
@@ -96,6 +97,10 @@ def main() -> int:
             delta = float(pitch_before) - float(args.target_pitch_deg)
         E_new, pitch_before, pitch_after = _adjust_pitch(E, float(delta))
         cam_entry["E"] = E_new
+        existing_source = (cam_entry.get("pose") or {}).get("source") if isinstance(cam_entry.get("pose"), dict) else None
+        pose = E_col_major_to_pose_v1(E_new, source=existing_source or "derived_from_E")
+        if pose is not None:
+            cam_entry["pose"] = pose
         meta_entries.append({
             "camera": cam_id,
             "pitch_before": float(pitch_before),

@@ -16,6 +16,8 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import numpy as np
+
+from noesis.calibration.pose_v1 import E_col_major_to_pose_v1
 import yaml
 
 from calibration_bundle import (
@@ -387,6 +389,10 @@ def apply_preview_updates(
         else:
             entry = dict(entry)
         entry["E"] = [float(x) for x in E]
+        existing_source = (entry.get("pose") or {}).get("source") if isinstance(entry.get("pose"), dict) else None
+        pose = E_col_major_to_pose_v1(entry["E"], source=existing_source or "derived_from_E")
+        if pose is not None:
+            entry["pose"] = pose
         cameras[cam_id] = entry
     return data
 

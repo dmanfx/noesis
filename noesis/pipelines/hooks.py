@@ -6,9 +6,10 @@ import logging
 import math
 import os
 import queue
+import re
 import time
 import threading
-from collections import deque
+from collections import OrderedDict, deque
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
@@ -26,8 +27,11 @@ from geometry.homography import (
     project_world_to_image,
     ray_from_pixel,
 )
+from noesis.calibration.depth_registration import DepthRegistrationManager
+from noesis.calibration.geometry import pixel_to_world
 from noesis.metadata import intrinsics as intrinsics_module
 from noesis.metadata.depth_result import DepthResult
+from noesis.metadata.object_depth import ObjectDepthResult
 from noesis.metadata.pose_features import PoseFeatureResult
 from noesis.telemetry.bev import Footpoint
 
@@ -58,6 +62,16 @@ try:  # pragma: no cover - optional native bridge for ReID tensor extraction
 except Exception:  # pragma: no cover - extension unavailable in tests
     noesis_reid_meta_ext = None  # type: ignore
 
+try:  # pragma: no cover - optional native bridge for object depth meta
+    import noesis_depth_meta_ext  # type: ignore
+except Exception:  # pragma: no cover - extension unavailable in tests
+    noesis_depth_meta_ext = None  # type: ignore
+
+try:  # pragma: no cover - optional native bridge for baseline depth tensor extraction
+    import noesis_depth_tracking_tensor_ext  # type: ignore
+except Exception:  # pragma: no cover - extension unavailable in tests
+    noesis_depth_tracking_tensor_ext = None  # type: ignore
+
 try:  # pragma: no cover - diagnostics optional in tests
     from noesis.diagnostics.telemetry_log import TrackingDiagnosticsLogger
 except Exception:  # pragma: no cover - fallback when diagnostics are absent
@@ -67,6 +81,9 @@ logger = logging.getLogger(__name__)
 _REID_NATIVE_MISSING_LOGGED = False
 _DLPACK_HOST_READ_LOCK = threading.Lock()
 _POSE_META_MAX_JSON_BYTES = 65536
+_OSD_LABEL_DEPTH_RE = re.compile(r"\s+z=(?:n/a|[-+]?\d+(?:\.\d+)?m)\s*$", re.IGNORECASE)
+_OSD_LABEL_CONF_RE = re.compile(r"\s+[-+]?\d+(?:\.\d+)?\s*$")
+_OSD_LABEL_ID_RE = re.compile(r"\s+(?:\[[^\]]+\]\s*\|\s*\[[^\]]+\]|XX|\d+)\s*$")
 
 
 @dataclass
@@ -209,6 +226,284 @@ def _pose_meta_payload_limit_bytes() -> int:
     return max(1024, parsed)
 
 
+def _frame_pts_key_us(frame_meta: Any) -> int:
+    raw = int(_meta_lookup(frame_meta, "buf_pts", "buffer_pts", default=0) or 0)
+    if raw > 0:
+        return raw // 1000
+    return int(time.time_ns() // 1000)
+
+
+def _depth_frame_key(frame_meta: Any) -> FrameKey:
+    return (
+        int(_meta_lookup(frame_meta, "source_id", "pad_index", default=0) or 0),
+        int(_meta_lookup(frame_meta, "frame_number", "frame_num", default=0) or 0),
+        _frame_pts_key_us(frame_meta),
+    )
+
+
+def _canonical_frame_size(frame_meta: Any, fallback_size: Tuple[int, int]) -> Tuple[int, int]:
+    frame_w = int(_meta_lookup(frame_meta, "frame_width", "width", default=0) or 0)
+    frame_h = int(_meta_lookup(frame_meta, "frame_height", "height", default=0) or 0)
+    if frame_w > 0 and frame_h > 0:
+        return frame_w, frame_h
+    return max(0, int(fallback_size[0] or 0)), max(0, int(fallback_size[1] or 0))
+
+
+def _tensor_to_numpy_cpu(tensor: Any) -> Optional[np.ndarray]:
+    if isinstance(tensor, np.ndarray):
+        return np.asarray(tensor)
+    dlpack_fn = getattr(tensor, "__dlpack__", None)
+    if callable(dlpack_fn):
+        try:
+            with _DLPACK_HOST_READ_LOCK:
+                import torch
+                import torch.utils.dlpack as torch_dlpack
+
+                stream = 0
+                try:
+                    if torch.cuda.is_available():
+                        stream = int(torch.cuda.current_stream().cuda_stream)
+                except Exception:
+                    stream = 0
+                capsule = dlpack_fn(stream)
+                return torch_dlpack.from_dlpack(capsule).detach().cpu().numpy()
+        except Exception:
+            logger.debug("Tensor DLPack conversion failed", exc_info=True)
+    return None
+
+
+def _iter_frame_tensor_meta(frame_meta: Any, *, unique_id: int) -> Iterable[Any]:
+    if pyds is None:
+        return
+    meta_list = getattr(frame_meta, "frame_user_meta_list", None)
+    if meta_list is None:
+        return
+    user_meta_cast = _resolve_pyds_cast("NvDsUserMeta")
+    tensor_meta_cast = _resolve_pyds_cast("NvDsInferTensorMeta")
+    target_meta_type = _resolve_pyds_attr("NVDSINFER_TENSOR_OUTPUT_META")
+    if target_meta_type is None:
+        meta_enum = _resolve_pyds_attr("NvDsMetaType")
+        target_meta_type = getattr(meta_enum, "NVDSINFER_TENSOR_OUTPUT_META", None)
+    for user_meta in _iter_meta_entries(meta_list, user_meta_cast):
+        if user_meta is None:
+            continue
+        base_meta = getattr(user_meta, "base_meta", None)
+        current_type = getattr(base_meta, "meta_type", getattr(user_meta, "meta_type", None))
+        if target_meta_type is not None and current_type != target_meta_type:
+            continue
+        payload = getattr(user_meta, "user_meta_data", None)
+        if payload is None:
+            continue
+        if tensor_meta_cast is not None:
+            try:
+                payload = tensor_meta_cast(payload)
+            except Exception:
+                continue
+        try:
+            current_uid = int(getattr(payload, "unique_id", -1))
+        except Exception:
+            current_uid = -1
+        if current_uid != int(unique_id):
+            continue
+        yield payload
+
+
+def _select_depth_layer(layers: Mapping[str, Any]) -> Any:
+    for name in ("depth", "pred", "output"):
+        if name in layers and layers.get(name) is not None:
+            return layers[name]
+    return next(iter(layers.values()))
+
+
+def _erode_mask(mask: np.ndarray, kernel_size: int = 3) -> np.ndarray:
+    if mask.size <= 0 or not np.any(mask):
+        return np.asarray(mask, dtype=bool)
+    kernel = np.ones((max(1, int(kernel_size)), max(1, int(kernel_size))), dtype=np.uint8)
+    eroded = cv2.erode(mask.astype(np.uint8, copy=False), kernel, iterations=1)
+    return np.asarray(eroded > 0, dtype=bool)
+
+
+def _band_mask(mask: np.ndarray, *, y0_ratio: float, y1_ratio: float, center_width_ratio: float) -> np.ndarray:
+    height, width = mask.shape[:2]
+    if height <= 0 or width <= 0:
+        return np.zeros_like(mask, dtype=bool)
+    y0 = max(0, min(height, int(math.floor(height * float(y0_ratio)))))
+    y1 = max(y0 + 1, min(height, int(math.ceil(height * float(y1_ratio)))))
+    band_width = max(1, min(width, int(round(width * float(center_width_ratio)))))
+    center_x = width * 0.5
+    x0 = max(0, min(width, int(round(center_x - (band_width * 0.5)))))
+    x1 = max(x0 + 1, min(width, int(round(center_x + (band_width * 0.5)))))
+    band = np.zeros_like(mask, dtype=bool)
+    band[y0:y1, x0:x1] = True
+    return np.logical_and(mask, band)
+
+
+def _extract_person_depth_anchor(
+    mask: np.ndarray,
+    depth_crop: np.ndarray,
+    *,
+    frame_origin: Tuple[int, int],
+) -> _DepthAnchorSample:
+    if mask.size <= 0 or depth_crop.size <= 0:
+        return _DepthAnchorSample(
+            foot_uv=None,
+            anchor_source=None,
+            anchor_depth_m=None,
+            anchor_sample_count=0,
+            anchor_valid_fraction=0.0,
+            lower_body_sample_count=0,
+            lower_body_valid_fraction=0.0,
+            torso_sample_count=0,
+            torso_valid_fraction=0.0,
+        )
+
+    origin_x, origin_y = int(frame_origin[0]), int(frame_origin[1])
+    eroded_mask = _erode_mask(mask, kernel_size=3)
+
+    foot_uv: Optional[Point2] = None
+    lower_rows = np.nonzero(mask)[0]
+    if lower_rows.size > 0:
+        max_row = int(np.max(lower_rows))
+        band_top = max(0, max_row - max(1, int(round(mask.shape[0] * 0.12))))
+        foot_band = np.zeros_like(mask, dtype=bool)
+        foot_band[band_top : max_row + 1, :] = True
+        foot_band = np.logical_and(foot_band, _band_mask(mask, y0_ratio=0.0, y1_ratio=1.0, center_width_ratio=0.35))
+        points = np.argwhere(foot_band)
+        if points.size > 0:
+            foot_y = int(np.max(points[:, 0]))
+            foot_x = int(np.median(points[points[:, 0] == foot_y][:, 1]))
+            foot_uv = (float(origin_x + foot_x), float(origin_y + foot_y))
+
+    def _anchor_support_requirements(area_px: int, anchor_source: str) -> Tuple[int, float]:
+        area_px = max(0, int(area_px))
+        if anchor_source == "lower_body_band":
+            base_count = 24
+            floor_count = 16
+            min_valid_fraction = 0.40
+        else:
+            base_count = 32
+            floor_count = 20
+            min_valid_fraction = 0.45
+        adaptive_count = int(math.ceil(float(area_px) * 0.25))
+        min_count = max(floor_count, min(base_count, adaptive_count or base_count))
+        return min_count, min_valid_fraction
+
+    lower_body_mask = _band_mask(eroded_mask, y0_ratio=0.88, y1_ratio=1.0, center_width_ratio=0.35)
+    lower_values = np.asarray(depth_crop[np.logical_and(lower_body_mask, np.isfinite(depth_crop))], dtype=np.float32)
+    lower_count = int(lower_values.size)
+    lower_area = int(np.count_nonzero(lower_body_mask))
+    lower_valid_fraction = float(lower_count) / float(lower_area or 1)
+    lower_min_count, lower_min_valid_fraction = _anchor_support_requirements(lower_area, "lower_body_band")
+    if lower_count >= lower_min_count and lower_valid_fraction >= lower_min_valid_fraction:
+        return _DepthAnchorSample(
+            foot_uv=foot_uv,
+            anchor_source="lower_body_band",
+            anchor_depth_m=float(np.median(lower_values)),
+            anchor_sample_count=lower_count,
+            anchor_valid_fraction=lower_valid_fraction,
+            lower_body_sample_count=lower_count,
+            lower_body_valid_fraction=lower_valid_fraction,
+            torso_sample_count=0,
+            torso_valid_fraction=0.0,
+        )
+
+    torso_mask = _band_mask(eroded_mask, y0_ratio=0.35, y1_ratio=0.70, center_width_ratio=0.50)
+    torso_values = np.asarray(depth_crop[np.logical_and(torso_mask, np.isfinite(depth_crop))], dtype=np.float32)
+    torso_count = int(torso_values.size)
+    torso_area = int(np.count_nonzero(torso_mask))
+    torso_valid_fraction = float(torso_count) / float(torso_area or 1)
+    torso_min_count, torso_min_valid_fraction = _anchor_support_requirements(torso_area, "torso_core")
+    anchor_depth = (
+        float(np.median(torso_values))
+        if torso_count >= torso_min_count and torso_valid_fraction >= torso_min_valid_fraction
+        else None
+    )
+    anchor_source = "torso_core" if anchor_depth is not None else None
+    return _DepthAnchorSample(
+        foot_uv=foot_uv,
+        anchor_source=anchor_source,
+        anchor_depth_m=anchor_depth,
+        anchor_sample_count=torso_count if anchor_depth is not None else 0,
+        anchor_valid_fraction=torso_valid_fraction if anchor_depth is not None else 0.0,
+        lower_body_sample_count=lower_count,
+        lower_body_valid_fraction=lower_valid_fraction,
+        torso_sample_count=torso_count,
+        torso_valid_fraction=torso_valid_fraction,
+    )
+
+
+def _extract_object_depth_result_from_meta(obj_meta: Any) -> Optional[ObjectDepthResult]:
+    if obj_meta is None or noesis_depth_meta_ext is None:
+        return None
+    extract_fn = getattr(noesis_depth_meta_ext, "extract_object_depth", None)
+    if not callable(extract_fn):
+        return None
+    try:
+        raw = extract_fn(obj_meta)
+    except Exception:
+        return None
+    if raw in (None, ""):
+        return None
+    try:
+        if isinstance(raw, Mapping):
+            return ObjectDepthResult.from_dict(raw)
+        return ObjectDepthResult.from_json(str(raw))
+    except Exception:
+        logger.debug("Failed to decode NOESIS.OBJECT_DEPTH payload", exc_info=True)
+        return None
+
+
+def _depth_used_m(depth_result: Optional[ObjectDepthResult]) -> Optional[float]:
+    if depth_result is None:
+        return None
+    if str(depth_result.status) != "ok":
+        return None
+    depth_m = depth_result.anchor_depth_m
+    if depth_m is None:
+        return None
+    try:
+        depth_val = float(depth_m)
+    except Exception:
+        return None
+    if not math.isfinite(depth_val) or depth_val <= 0.0:
+        return None
+    return depth_val
+
+
+def _depth_anchor_uv(depth_result: Optional[ObjectDepthResult]) -> Optional[Tuple[float, float]]:
+    if depth_result is None:
+        return None
+    anchor_uv = depth_result.anchor_uv
+    if not isinstance(anchor_uv, (list, tuple)) or len(anchor_uv) < 2:
+        return None
+    try:
+        u = float(anchor_uv[0])
+        v = float(anchor_uv[1])
+    except Exception:
+        return None
+    if not (math.isfinite(u) and math.isfinite(v)):
+        return None
+    return float(u), float(v)
+
+
+def _format_depth_label_fragment(depth_result: Optional[ObjectDepthResult], *, decimals: int) -> Optional[str]:
+    if depth_result is None:
+        return None
+    depth_used = _depth_used_m(depth_result)
+    if depth_used is not None:
+        return f"z={depth_used:.{max(0, int(decimals))}f}m"
+    return "z=n/a"
+
+
+def _clean_osd_base_label(label: str) -> str:
+    cleaned = str(label or "").strip()
+    if not cleaned:
+        return ""
+    for pattern in (_OSD_LABEL_DEPTH_RE, _OSD_LABEL_CONF_RE, _OSD_LABEL_ID_RE):
+        cleaned = pattern.sub("", cleaned).strip()
+    return cleaned or str(label or "").strip()
+
+
 def attach_intrinsics_hook(
     pipeline: "DS8Pipeline",
     *,
@@ -344,6 +639,78 @@ def attach_pose_feature_hook(
         logger.exception("Failed to attach pose feature probe")
 
 
+def attach_object_depth_fusion_hook(
+    pipeline: "DS8Pipeline",
+    *,
+    camera_labels: Optional[Mapping[int, str]] = None,
+    calibration_resolver: Any | None = None,
+    depth_every_n_frames: int = 2,
+) -> None:
+    """Attach the baseline DS8 object-depth fusion path.
+
+    This is the canonical baseline-only DAv2 lane used to provide concurrent
+    range observations for the pose-first world estimator.
+    """
+    if noesis_depth_meta_ext is None:
+        raise RuntimeError("noesis_depth_meta_ext is required for baseline depth tracking")
+    if noesis_depth_tracking_tensor_ext is None:
+        raise RuntimeError("noesis_depth_tracking_tensor_ext is required for baseline depth tracking")
+
+    models_cfg = (pipeline.config.get("models") or {}) if isinstance(pipeline.config, Mapping) else {}
+    depth_cfg = models_cfg.get("depth_tracking") or {}
+    if not isinstance(depth_cfg, Mapping) or not bool(depth_cfg.get("enable", False)):
+        raise KeyError("models.depth_tracking.enable=true is required for baseline depth tracking")
+
+    depth_name = str(depth_cfg.get("name") or "depth_tracking_fullframe").strip() or "depth_tracking_fullframe"
+    depth_component = pipeline.components.get(depth_name)
+    if depth_component is None:
+        raise KeyError(f"depth tracking component '{depth_name}' missing in pipeline graph")
+    fusion_component = pipeline.components.get("world_observation_stage")
+    if fusion_component is None:
+        raise KeyError("world_observation_stage component missing in pipeline graph")
+
+    depth_store = _AlignedDepthFrameStore(max_entries=24)
+    frame_size = getattr(pipeline, "frame_size", (0, 0))
+    depth_processor = _DepthTrackingFrameProcessor(
+        depth_store=depth_store,
+        depth_gie_id=int(depth_cfg.get("gie_id", depth_cfg.get("gie-id", 5) or 5)),
+        fallback_frame_size=(int(frame_size[0] or 0), int(frame_size[1] or 0)),
+        depth_model_name="depth-anything-v2-metric-hypersim-vits",
+        depth_unit="m",
+        depth_is_metric=True,
+    )
+    fusion_processor = _ObjectDepthFusionProcessor(
+        depth_store=depth_store,
+        fallback_frame_size=(int(frame_size[0] or 0), int(frame_size[1] or 0)),
+        depth_model_name="depth-anything-v2-metric-hypersim-vits",
+        depth_unit="m",
+        depth_is_metric=True,
+        depth_every_n_frames=max(1, int(depth_every_n_frames)),
+        calibration_resolver=calibration_resolver,
+        camera_labels=camera_labels or {},
+    )
+    depth_component.config["_depth_tracking_frame_processor"] = depth_processor
+    fusion_component.config["_object_depth_fusion_processor"] = fusion_processor
+    setattr(pipeline, "depth_tracking_frame_processor", depth_processor)
+    setattr(pipeline, "object_depth_fusion_processor", fusion_processor)
+
+    if pipeline.ds_pipeline is None or BatchMetadataOperator is None or Probe is None:
+        logger.debug("Stored depth tracking processors for lazy execution (pyservicemaker unavailable)")
+        return
+
+    try:
+        pipeline.ds_pipeline.attach(depth_component.name, Probe("depth_tracking_capture", _DepthTrackingFrameOperator(depth_processor)))
+        pipeline.ds_pipeline.attach(fusion_component.name, Probe("object_depth_fusion", _ObjectDepthFusionOperator(fusion_processor)))
+        logger.info(
+            "Attached baseline depth-tracking probes to %s and %s",
+            depth_component.name,
+            fusion_component.name,
+        )
+    except Exception:
+        logger.exception("Failed to attach baseline depth-tracking probes")
+        raise
+
+
 def attach_analytics_telemetry_hook(
     pipeline: "DS8Pipeline",
     *,
@@ -353,6 +720,7 @@ def attach_analytics_telemetry_hook(
     sensor_id_map: Optional[Mapping[int, int]] = None,
     bev_renderer: Any | None = None,
     bev_calibration: Any | None = None,
+    depth_registration: DepthRegistrationManager | None = None,
     diagnostics_logger: "TrackingDiagnosticsLogger" | None = None,
 ) -> None:
     """Attach a BatchMetadataOperator that extracts analytics telemetry."""
@@ -371,6 +739,7 @@ def attach_analytics_telemetry_hook(
         sensor_id_map=sensor_id_map or {},
         bev_renderer=bev_renderer,
         bev_calibration=bev_calibration,
+        depth_registration=depth_registration,
         diagnostics_logger=diagnostics_logger,
     )
     analytics_component.config["_analytics_processor"] = processor
@@ -387,24 +756,7 @@ def attach_analytics_telemetry_hook(
     except Exception:
         logger.exception("Failed to initialize OSD label processor; mosaic labels may be missing")
 
-    # Attach telemetry as far downstream as possible so tensor meta is still valid.
-    attach_component = analytics_component
-    try:
-        models_cfg = getattr(pipeline, "config", {}).get("models", {}) or {}
-        pose_cfg = models_cfg.get("pose") or {}
-        reid_cfg = models_cfg.get("reid") or {}
-        if isinstance(pose_cfg, dict) and bool(pose_cfg.get("enable", True)):
-            pose_name = str(pose_cfg.get("name") or "yolo26_pose").strip() or "yolo26_pose"
-            candidate = pipeline.components.get(pose_name)
-            if candidate is not None:
-                attach_component = candidate
-        if attach_component is analytics_component and isinstance(reid_cfg, dict) and bool(reid_cfg.get("enable", True)):
-            reid_name = str(reid_cfg.get("name") or "reid_osnet").strip() or "reid_osnet"
-            candidate = pipeline.components.get(reid_name)
-            if candidate is not None:
-                attach_component = candidate
-    except Exception:
-        attach_component = analytics_component
+    attach_component = pipeline.components.get("tracking_telemetry_stage") or analytics_component
 
     if pipeline.ds_pipeline is None or BatchMetadataOperator is None or Probe is None:
         logger.debug("Stored analytics telemetry processor for lazy execution (pyservicemaker unavailable)")
@@ -1243,6 +1595,44 @@ class MapAnythingProcessor:
         self.tensor_samples += 1
         return self._emit_from_tensors(frame_meta, tensors)
 
+    def handle_native_frame_ds8(self, frame_meta: Any) -> Optional[DepthResult]:
+        """Read MapAnything tensors from raw DeepStream frame metadata.
+
+        Some DS8 Service Maker builds omit full-frame multi-output tensors from
+        frame_meta.tensor_items even though the underlying NvDsInferTensorMeta is
+        present. The native helper keeps this on the canonical DS8 metadata path.
+        """
+        if not self.pipeline.depth_enabled:
+            return None
+        if noesis_depth_tracking_tensor_ext is None:
+            return None
+        capture_fn = getattr(noesis_depth_tracking_tensor_ext, "capture_tensor_layers", None)
+        if not callable(capture_fn):
+            return None
+        try:
+            layers = capture_fn(frame_meta, int(self.gie_id))
+        except Exception:
+            logger.debug("Native MapAnything tensor capture failed", exc_info=True)
+            return None
+        if not layers:
+            return None
+        try:
+            tensors = {str(key): np.asarray(value) for key, value in dict(layers).items()}
+        except Exception:
+            logger.debug("Native MapAnything tensor payload was not array-like", exc_info=True)
+            return None
+        if not tensors:
+            return None
+        source_id = int(_meta_lookup(frame_meta, "pad_index", "source_id", default=0))
+        frame_id = int(_meta_lookup(frame_meta, "frame_num", "frame_number", default=0))
+        pts_ns = int(_meta_lookup(frame_meta, "buf_pts", "buffer_pts", default=0))
+        return self.handle_numpy_arrays(
+            source_id=source_id,
+            frame_id=frame_id,
+            pts_ns=pts_ns,
+            tensors=tensors,
+        )
+
     def _emit_from_tensors(self, frame_meta: Any, tensors: Mapping[str, np.ndarray]) -> Optional[DepthResult]:
         if not self.pipeline.depth_enabled:
             logger.debug("Depth disabled; dropping MapAnything tensors")
@@ -1289,7 +1679,7 @@ class MapAnythingProcessor:
             mask = confidence >= 0.5
         if mask is None:
             mask = np.ones_like(depth, dtype=bool)
-        mask = np.logical_and(np.asarray(mask, dtype=bool, copy=False), np.isfinite(depth))
+        mask = np.logical_and(np.asarray(mask, dtype=bool), np.isfinite(depth))
 
         target_w, target_h = self._target_frame_shape(frame_meta, depth.shape)
         depth, confidence, mask = self._align_to_frame(depth, confidence, mask, (target_w, target_h))
@@ -1303,13 +1693,13 @@ class MapAnythingProcessor:
                     depth.shape[0],
                 )
 
-        depth = np.asarray(depth, dtype=np.float32, copy=False)
+        depth = np.asarray(depth, dtype=np.float32)
         if confidence is not None:
-            confidence = np.asarray(confidence, dtype=np.float32, copy=False)
+            confidence = np.asarray(confidence, dtype=np.float32)
             if confidence.shape != depth.shape:
                 logger.debug("Confidence tensor shape %s does not match aligned depth %s", confidence.shape, depth.shape)
                 confidence = None
-        mask = np.asarray(mask, dtype=bool, copy=False) if mask is not None else np.ones_like(depth, dtype=bool)
+        mask = np.asarray(mask, dtype=bool) if mask is not None else np.ones_like(depth, dtype=bool)
         mask = np.logical_and(mask, np.isfinite(depth))
 
         conf_array = confidence.astype(np.float32, copy=False) if confidence is not None else np.zeros_like(depth, dtype=np.float32)
@@ -1409,7 +1799,7 @@ class TrailOverlayConfig:
     min_dt_s: float = 0.08
     smooth_tau_s: float = 0.25
     max_speed_px_per_s: float = 600.0
-    gap_predict_ttl_s: float = 1.0
+    gap_predict_ttl_s: float = 0.0
     gap_predict_decay_tau_s: float = 0.75
     predicted_alpha_scale: float = 0.65
     height_peak_up_alpha: float = 0.35
@@ -1546,7 +1936,7 @@ class TrailOverlayConfig:
             min_dt_s=_float(cfg.get("min_dt_s"), 0.08),
             smooth_tau_s=_float(cfg.get("smooth_tau_s"), 0.25),
             max_speed_px_per_s=_float(cfg.get("max_speed_px_per_s"), 600.0),
-            gap_predict_ttl_s=_float(cfg.get("gap_predict_ttl_s"), 1.0),
+            gap_predict_ttl_s=_float(cfg.get("gap_predict_ttl_s"), 0.0),
             gap_predict_decay_tau_s=_float(cfg.get("gap_predict_decay_tau_s"), 0.75),
             predicted_alpha_scale=_float(cfg.get("predicted_alpha_scale"), 0.65),
             height_peak_up_alpha=_float(cfg.get("height_peak_up_alpha"), 0.35),
@@ -1605,6 +1995,94 @@ class _WorldAnchorState:
     height_ref_scene: Optional[float] = None
     last_good_world: Optional[Tuple[float, float, float]] = None
     last_good_ts: float = 0.0
+    world_x: Optional[float] = None
+    world_z: Optional[float] = None
+    vel_world_x: float = 0.0
+    vel_world_z: float = 0.0
+    filtered_ts: float = 0.0
+
+
+FrameKey = Tuple[int, int, int]
+Point2 = Tuple[float, float]
+Point3 = Tuple[float, float, float]
+
+
+@dataclass(frozen=True)
+class _DepthAnchorSample:
+    foot_uv: Optional[Point2]
+    anchor_source: Optional[str]
+    anchor_depth_m: Optional[float]
+    anchor_sample_count: int
+    anchor_valid_fraction: float
+    lower_body_sample_count: int
+    lower_body_valid_fraction: float
+    torso_sample_count: int
+    torso_valid_fraction: float
+
+
+@dataclass(frozen=True)
+class _DepthObservationResult:
+    world_point: Optional[np.ndarray]
+    weight: float
+    reason: str
+    raw_depth_m: Optional[float] = None
+    registered_depth_m: Optional[float] = None
+    registration_status: Optional[str] = None
+    registration_id: Optional[str] = None
+
+
+@dataclass
+class _AlignedDepthFrame:
+    key: FrameKey
+    source_id: int
+    frame_id: int
+    pts_us: int
+    depth_map: Optional[np.ndarray]
+    valid_mask: Optional[np.ndarray]
+    frame_w: int
+    frame_h: int
+    depth_w: int
+    depth_h: int
+    unit: str
+    is_metric: bool
+    model_name: str
+    depth_device_frame: Any | None = None
+
+
+class _AlignedDepthFrameStore:
+    def __init__(self, max_entries: int = 16) -> None:
+        self._max_entries = max(2, int(max_entries))
+        self._entries: "OrderedDict[FrameKey, _AlignedDepthFrame]" = OrderedDict()
+
+    def put(self, frame: _AlignedDepthFrame) -> None:
+        self._entries[frame.key] = frame
+        self._entries.move_to_end(frame.key)
+        while len(self._entries) > self._max_entries:
+            self._entries.popitem(last=False)
+
+    def resolve(
+        self,
+        *,
+        source_id: int,
+        frame_id: int,
+        pts_us: int,
+        max_age_frames: int,
+    ) -> Tuple[Optional[_AlignedDepthFrame], int, float]:
+        exact = self._entries.get((int(source_id), int(frame_id), int(pts_us)))
+        if exact is not None:
+            return exact, 0, 0.0
+        max_age = max(0, int(max_age_frames))
+        if max_age <= 0:
+            return None, 0, 0.0
+        for candidate in reversed(list(self._entries.values())):
+            if int(candidate.source_id) != int(source_id):
+                continue
+            age_frames = int(frame_id) - int(candidate.frame_id)
+            if age_frames < 0 or age_frames > max_age:
+                continue
+            age_ms = max(0.0, float(int(pts_us) - int(candidate.pts_us)) / 1000.0)
+            return candidate, age_frames, age_ms
+        return None, 0, 0.0
 
 
 @dataclass
@@ -1783,9 +2261,39 @@ class TrailOverlayProcessor:
             return None
         return float(left), float(top), float(width), float(height)
 
+    def _configured_tile_rect(self, sensor_id: int) -> Optional[Tuple[float, float, float, float]]:
+        tiler = self.pipeline.components.get("tiler")
+        tiler_cfg = tiler.config if tiler is not None and isinstance(tiler.config, dict) else {}
+        try:
+            mosaic_w = float(tiler_cfg.get("width", 0) or 0)
+            mosaic_h = float(tiler_cfg.get("height", 0) or 0)
+            cols = int(tiler_cfg.get("columns", 0) or 0)
+            rows = int(tiler_cfg.get("rows", 0) or 0)
+        except Exception:
+            return None
+        if mosaic_w <= 0.0 or mosaic_h <= 0.0 or cols <= 0 or rows <= 0:
+            return None
+        try:
+            source_count = max(1, len(getattr(self.pipeline, "camera_labels", {}) or {}))
+        except Exception:
+            source_count = cols * rows
+        source_count = max(1, int(source_count))
+        tile_index = int(sensor_id)
+        if tile_index < 0 or tile_index >= source_count:
+            return None
+        col = tile_index % cols
+        row = tile_index // cols
+        if row >= rows:
+            return None
+        tile_w = mosaic_w / float(cols)
+        tile_h = mosaic_h / float(rows)
+        return float(col) * tile_w, float(row) * tile_h, tile_w, tile_h
+
     def _source_to_mosaic(self, frame_meta: Any, u: float, v: float, source_size: Tuple[int, int]) -> Tuple[float, float]:
         src_w, src_h = source_size
         comp = self._frame_compositor_rect(frame_meta)
+        if comp is None:
+            comp = self._configured_tile_rect(self._frame_source_id(frame_meta))
         if comp is None or src_w <= 0 or src_h <= 0:
             return float(u), float(v)
         left, top, width, height = comp
@@ -1809,44 +2317,7 @@ class TrailOverlayProcessor:
         return float(u), float(v)
 
     def _infer_image_flips(self, camera_id: str, calib: Any) -> Tuple[bool, bool]:
-        analytics = getattr(self.pipeline, "analytics_telemetry_processor", None)
-        infer = getattr(analytics, "_infer_image_flips", None)
-        if callable(infer):
-            try:
-                return tuple(bool(x) for x in infer(str(camera_id), calib))
-            except Exception:
-                pass
-
-        flip_u = False
-        flip_v = False
-        try:
-            R_wc, _ = parse_extrinsics(calib.extrinsics_col_major)
-            forward = R_wc @ np.array([0.0, 0.0, 1.0], dtype=np.float64)
-            f_norm = float(np.linalg.norm(forward))
-            if f_norm > 1e-6:
-                forward = forward / f_norm
-            world_up = np.array([0.0, 1.0, 0.0], dtype=np.float64)
-            right_ref = np.cross(world_up, forward)
-            r_norm = float(np.linalg.norm(right_ref))
-            if r_norm <= 1e-6:
-                right_ref = np.array([1.0, 0.0, 0.0], dtype=np.float64)
-            else:
-                right_ref = right_ref / r_norm
-            up_ref = np.cross(forward, right_ref)
-            u_norm = float(np.linalg.norm(up_ref))
-            if u_norm <= 1e-6:
-                up_ref = world_up
-            else:
-                up_ref = up_ref / u_norm
-
-            right = R_wc @ np.array([1.0, 0.0, 0.0], dtype=np.float64)
-            up = R_wc @ np.array([0.0, 1.0, 0.0], dtype=np.float64)
-            flip_u = float(np.dot(right, right_ref)) < 0.0
-            flip_v = float(np.dot(up, up_ref)) > 0.0
-        except Exception:
-            flip_u = False
-            flip_v = False
-        return bool(flip_u), bool(flip_v)
+        return False, False
 
     def _ray_floor_hit(
         self,
@@ -2096,60 +2567,114 @@ class TrailOverlayProcessor:
         track = track_map.get(int(track_id))
         if not isinstance(track, Mapping):
             return float(x_bbox), float(y_bbox), False
-        bbox = track.get("bbox")
-        if not isinstance(bbox, (list, tuple)) or len(bbox) < 4:
-            return float(x_bbox), float(y_bbox), False
 
         camera_id = self._camera_id_for_sensor(sensor_id)
         calib = self._resolve_calibration(sensor_id, camera_id)
-        if calib is None or getattr(calib, "intrinsics", None) is None or getattr(calib, "extrinsics_col_major", None) is None:
-            return float(x_bbox), float(y_bbox), False
-        flip_u, flip_v = self._infer_image_flips(camera_id, calib)
+        has_calib = calib is not None and getattr(calib, "intrinsics", None) is not None and getattr(calib, "extrinsics_col_major", None) is not None
+        flip_u, flip_v = self._infer_image_flips(camera_id, calib) if has_calib else (False, False)
 
-        foot_world = self._bbox_bottom_world(calib, bbox, flip_u=flip_u, flip_v=flip_v)
-        if foot_world is not None:
-            self._maybe_update_height_reference(state, calib, bbox, foot_world, flip_u=flip_u, flip_v=flip_v)
-
-        measured_world = None
-        source_u = None
-        source_v = None
-        if state.height_ref_scene is not None:
-            measured_world = self._gravity_drop_world(
-                calib,
-                bbox,
-                float(state.height_ref_scene),
-                flip_u=flip_u,
-                flip_v=flip_v,
+        def _world_to_mosaic(world_point: np.ndarray) -> Optional[Tuple[float, float]]:
+            if not has_calib:
+                return None
+            uv = project_world_to_image(
+                world_point,
+                calib.intrinsics,
+                calib.extrinsics_col_major,
+                tuple(int(x) for x in calib.image_size),
+                unit_scale=1.0,
+                flip_u=bool(flip_u),
+                flip_v=bool(flip_v),
             )
-            if measured_world is not None:
-                uv = project_world_to_image(
-                    measured_world,
-                    calib.intrinsics,
-                    calib.extrinsics_col_major,
-                    tuple(int(x) for x in calib.image_size),
-                    unit_scale=1.0,
+            if uv is None:
+                return None
+            return self._source_to_mosaic(
+                frame_meta,
+                float(uv[0]),
+                float(uv[1]),
+                self._frame_source_size(frame_meta, calib),
+            )
+
+        measured_world = track.get("world")
+        if not isinstance(measured_world, (list, tuple)) or len(measured_world) < 3 or track.get("world_valid") is not True:
+            if not has_calib:
+                return float(x_bbox), float(y_bbox), False
+            floor_world = None
+            if state.height_ref_scene is not None:
+                floor_world = self._gravity_drop_world(
+                    calib,
+                    [left, top, width, height],
+                    float(state.height_ref_scene),
                     flip_u=bool(flip_u),
                     flip_v=bool(flip_v),
                 )
-                if uv is not None:
-                    source_u = float(uv[0])
-                    source_v = float(uv[1])
-        if measured_world is None and foot_world is not None:
-            measured_world = np.asarray(foot_world, dtype=np.float64)
-            try:
-                left_s, top_s, width_s, height_s = [float(x) for x in bbox[:4]]
-                source_u = float(left_s) + float(width_s) * 0.5
-                source_v = float(top_s) + float(height_s)
-            except Exception:
-                source_u = None
-                source_v = None
-
-        if measured_world is None or source_u is None or source_v is None:
+            if floor_world is None:
+                floor_world = self._bbox_bottom_world(
+                    calib,
+                    [left, top, width, height],
+                    flip_u=bool(flip_u),
+                    flip_v=bool(flip_v),
+                )
+            if floor_world is None:
+                return float(x_bbox), float(y_bbox), False
+            self._maybe_update_height_reference(
+                state,
+                calib,
+                [left, top, width, height],
+                floor_world,
+                flip_u=bool(flip_u),
+                flip_v=bool(flip_v),
+            )
+            self._update_world_measurement(state, float(floor_world[0]), float(floor_world[2]), float(now))
+            mapped = _world_to_mosaic(floor_world)
+            if mapped is None:
+                return float(x_bbox), float(y_bbox), False
+            return float(mapped[0]), float(mapped[1]), False
+        try:
+            measured_world_arr = np.asarray(
+                [float(measured_world[0]), float(measured_world[1]), float(measured_world[2])],
+                dtype=np.float64,
+            )
+        except Exception:
             return float(x_bbox), float(y_bbox), False
+        if has_calib:
+            self._maybe_update_height_reference(
+                state,
+                calib,
+                [left, top, width, height],
+                measured_world_arr,
+                flip_u=bool(flip_u),
+                flip_v=bool(flip_v),
+            )
 
-        self._update_world_measurement(state, float(measured_world[0]), float(measured_world[2]), float(now))
-        source_size = self._frame_source_size(frame_meta, calib)
-        x, y = self._source_to_mosaic(frame_meta, float(source_u), float(source_v), source_size)
+        source_uv = None
+        # For the mosaic video overlay, keep the trail attached to the observed
+        # person anchor. image_base can be a reprojected world point and may drift
+        # when the floor/world estimate is still settling.
+        for key in ("image_foot", "image_base"):
+            uv = track.get(key)
+            if isinstance(uv, (list, tuple)) and len(uv) >= 2:
+                try:
+                    source_uv = (float(uv[0]), float(uv[1]))
+                except Exception:
+                    source_uv = None
+                if source_uv is not None:
+                    break
+        if source_uv is None:
+            mapped = _world_to_mosaic(measured_world_arr)
+            if mapped is None:
+                return float(x_bbox), float(y_bbox), False
+            source_uv = None
+
+        self._update_world_measurement(state, float(measured_world_arr[0]), float(measured_world_arr[2]), float(now))
+        if source_uv is None:
+            x, y = mapped
+        else:
+            x, y = self._source_to_mosaic(
+                frame_meta,
+                float(source_uv[0]),
+                float(source_uv[1]),
+                self._frame_source_size(frame_meta, calib),
+            )
         return float(x), float(y), False
 
     def _commit_point(self, state: _TrailTrackState, now: float, x: float, y: float, *, predicted: bool) -> None:
@@ -2982,7 +3507,7 @@ class PoseFeatureProcessor:
                     self._debug_missing += 1
                 continue
             if kpts_roi is None:
-                kpts_roi = np.asarray(kpts_for_features, dtype=np.float32, copy=True)
+                kpts_roi = np.array(kpts_for_features, dtype=np.float32, copy=True)
 
             features, quality = self._compute_features(kpts_for_features, roi_w=roi_w, roi_h=roi_h)
             mean_conf, min_conf, valid_frac = quality
@@ -3390,6 +3915,345 @@ class PoseKeypointOverlayProcessor:
 
 
 @dataclass
+class _DepthTrackingFrameProcessor:
+    depth_store: _AlignedDepthFrameStore
+    depth_gie_id: int
+    fallback_frame_size: Tuple[int, int]
+    depth_model_name: str
+    depth_unit: str
+    depth_is_metric: bool
+
+    def _capture_depth_frame(self, frame_meta: Any, frame_w: int, frame_h: int) -> Any | None:
+        if noesis_depth_tracking_tensor_ext is None:
+            raise RuntimeError("noesis_depth_tracking_tensor_ext is required for baseline depth tracking")
+        capture_fn = getattr(noesis_depth_tracking_tensor_ext, "capture_aligned_depth_frame", None)
+        if not callable(capture_fn):
+            raise RuntimeError("capture_aligned_depth_frame is required for baseline depth tracking")
+        try:
+            return capture_fn(frame_meta, int(self.depth_gie_id), int(frame_w), int(frame_h))
+        except Exception:
+            logger.exception("Native DAv2 GPU depth capture failed")
+            return None
+
+    def handle_frame_ds8(self, frame_meta: Any) -> None:
+        frame_w, frame_h = _canonical_frame_size(frame_meta, self.fallback_frame_size)
+        if frame_w <= 0 or frame_h <= 0:
+            return
+        depth_device_frame = self._capture_depth_frame(frame_meta, frame_w, frame_h)
+        if depth_device_frame is None:
+            return
+        depth_w = int(getattr(depth_device_frame, "depth_width", frame_w) or frame_w)
+        depth_h = int(getattr(depth_device_frame, "depth_height", frame_h) or frame_h)
+        frame = _AlignedDepthFrame(
+            key=_depth_frame_key(frame_meta),
+            source_id=int(_meta_lookup(frame_meta, "source_id", "pad_index", default=0) or 0),
+            frame_id=int(_meta_lookup(frame_meta, "frame_number", "frame_num", default=0) or 0),
+            pts_us=_frame_pts_key_us(frame_meta),
+            depth_map=None,
+            valid_mask=None,
+            frame_w=frame_w,
+            frame_h=frame_h,
+            depth_w=depth_w,
+            depth_h=depth_h,
+            unit=self.depth_unit,
+            is_metric=self.depth_is_metric,
+            model_name=self.depth_model_name,
+            depth_device_frame=depth_device_frame,
+        )
+        self.depth_store.put(frame)
+
+
+@dataclass
+class _ObjectDepthFusionProcessor:
+    depth_store: _AlignedDepthFrameStore
+    fallback_frame_size: Tuple[int, int]
+    depth_model_name: str
+    depth_unit: str
+    depth_is_metric: bool
+    depth_every_n_frames: int
+    calibration_resolver: Any | None = None
+    camera_labels: Mapping[int, str] = field(default_factory=dict)
+
+    def _camera_id_for_source(self, source_id: int) -> Optional[str]:
+        camera_id = self.camera_labels.get(int(source_id))
+        if isinstance(camera_id, str) and camera_id.strip():
+            return camera_id.strip()
+        return None
+
+    def _resolve_calibration_snapshot(self, source_id: int) -> Any | None:
+        resolver = self.calibration_resolver
+        if resolver is None:
+            return None
+        snapshot_fn = getattr(resolver, "snapshot", None)
+        if not callable(snapshot_fn):
+            return None
+        camera_id = self._camera_id_for_source(source_id)
+        try:
+            return snapshot_fn(int(source_id), camera_id)
+        except TypeError:
+            try:
+                return snapshot_fn(int(source_id))
+            except Exception:
+                return None
+        except Exception:
+            return None
+
+    def _copy_depth_crop(self, depth_frame: _AlignedDepthFrame, x0: int, y0: int, x1: int, y1: int) -> Optional[np.ndarray]:
+        width = int(x1) - int(x0)
+        height = int(y1) - int(y0)
+        if width <= 0 or height <= 0:
+            return None
+        depth_device_frame = getattr(depth_frame, "depth_device_frame", None)
+        if depth_device_frame is None:
+            logger.warning("Depth device frame is unavailable for object-depth fusion")
+            return None
+        copy_roi = getattr(depth_device_frame, "copy_roi_to_numpy", None)
+        if not callable(copy_roi):
+            logger.warning("Depth device frame is missing copy_roi_to_numpy")
+            return None
+        try:
+            return np.asarray(copy_roi(int(x0), int(y0), int(width), int(height)), dtype=np.float32)
+        except Exception:
+            logger.exception("GPU depth ROI copy failed")
+            return None
+
+    def _decode_instance_mask(self, obj_meta: Any, target_shape: Tuple[int, int]) -> Tuple[Optional[np.ndarray], str]:
+        try:
+            payload = noesis_depth_meta_ext.extract_object_mask(obj_meta)  # type: ignore[union-attr]
+        except Exception:
+            logger.debug("Native object-mask extraction failed", exc_info=True)
+            return None, "mask_decode_failed"
+        if not payload:
+            return None, "missing_mask"
+        try:
+            threshold = float(payload.get("threshold", 0.5) or 0.5)
+            data = np.asarray(payload.get("data"), dtype=np.float32)
+        except Exception:
+            return None, "mask_decode_failed"
+        if data.ndim != 2 or data.size <= 0:
+            return None, "mask_decode_failed"
+        mask = np.asarray(data > threshold, dtype=bool)
+        if mask.shape != target_shape:
+            mask = cv2.resize(
+                mask.astype(np.uint8, copy=False),
+                (target_shape[1], target_shape[0]),
+                interpolation=cv2.INTER_NEAREST,
+            ).astype(bool)
+        return mask, "ok"
+
+    def _build_result(
+        self,
+        frame_meta: Any,
+        obj_meta: Any,
+        *,
+        bbox: Tuple[float, float, float, float],
+        status: str,
+        mask_area_px: int = 0,
+        sample_count: int = 0,
+        valid_fraction: float = 0.0,
+        depth_center: Optional[float] = None,
+        values: Optional[np.ndarray] = None,
+        anchor_fields: Optional[Mapping[str, Any]] = None,
+    ) -> ObjectDepthResult:
+        try:
+            object_id = int(getattr(obj_meta, "object_id", -1))
+        except Exception:
+            object_id = -1
+        try:
+            class_id = int(getattr(obj_meta, "class_id", -1))
+        except Exception:
+            class_id = -1
+        try:
+            score = float(getattr(obj_meta, "confidence", 0.0))
+        except Exception:
+            score = 0.0
+        values_arr = np.asarray(values, dtype=np.float32) if values is not None else np.empty(0, dtype=np.float32)
+        has_values = bool(values_arr.size)
+        payload: Dict[str, Any] = {
+            "source_id": int(_meta_lookup(frame_meta, "source_id", "pad_index", default=0) or 0),
+            "frame_id": int(_meta_lookup(frame_meta, "frame_number", "frame_num", default=0) or 0),
+            "object_id": object_id,
+            "class_id": class_id,
+            "bbox": bbox,
+            "score": score,
+            "sampling_mode": "instance_mask",
+            "status": status,
+            "unit": self.depth_unit,
+            "is_metric": self.depth_is_metric,
+            "sample_count": max(0, int(sample_count)),
+            "valid_fraction": max(0.0, min(1.0, float(valid_fraction))),
+            "depth_center": depth_center,
+            "depth_median": float(np.median(values_arr)) if has_values else None,
+            "depth_mean": float(np.mean(values_arr)) if has_values else None,
+            "depth_p10": float(np.percentile(values_arr, 10.0)) if has_values else None,
+            "depth_p90": float(np.percentile(values_arr, 90.0)) if has_values else None,
+            "depth_min": float(np.min(values_arr)) if has_values else None,
+            "depth_max": float(np.max(values_arr)) if has_values else None,
+            "mask_area_px": max(0, int(mask_area_px)),
+            "model": self.depth_model_name,
+            "ts_us": _frame_pts_key_us(frame_meta),
+        }
+        if anchor_fields:
+            payload.update({str(key): value for key, value in anchor_fields.items() if value is not None})
+        return ObjectDepthResult(**payload)
+
+    def _sample_person_result(
+        self,
+        frame_meta: Any,
+        obj_meta: Any,
+        depth_frame: _AlignedDepthFrame,
+    ) -> Optional[ObjectDepthResult]:
+        bbox = _rect_to_bbox(getattr(obj_meta, "rect_params", None))
+        if bbox is None:
+            return None
+        frame_w = int(depth_frame.frame_w)
+        frame_h = int(depth_frame.frame_h)
+        left, top, width, height = bbox
+        x0_raw = int(math.floor(left))
+        y0_raw = int(math.floor(top))
+        x1_raw = int(math.ceil(left + width))
+        y1_raw = int(math.ceil(top + height))
+        if x1_raw <= 0 or y1_raw <= 0 or x0_raw >= frame_w or y0_raw >= frame_h:
+            return self._build_result(frame_meta, obj_meta, bbox=bbox, status="transform_mismatch")
+        x0 = max(0, min(frame_w, x0_raw))
+        y0 = max(0, min(frame_h, y0_raw))
+        x1 = max(0, min(frame_w, x1_raw))
+        y1 = max(0, min(frame_h, y1_raw))
+        if x1 <= x0 or y1 <= y0:
+            return self._build_result(frame_meta, obj_meta, bbox=bbox, status="transform_mismatch")
+
+        depth_crop = self._copy_depth_crop(depth_frame, x0, y0, x1, y1)
+        if depth_crop is None:
+            return self._build_result(frame_meta, obj_meta, bbox=bbox, status="depth_not_ready")
+        if depth_crop.size <= 0:
+            return self._build_result(frame_meta, obj_meta, bbox=bbox, status="transform_mismatch")
+
+        mask, mask_status = self._decode_instance_mask(obj_meta, depth_crop.shape)
+        if mask is None:
+            return self._build_result(frame_meta, obj_meta, bbox=bbox, status=mask_status)
+
+        mask_area = int(np.count_nonzero(mask))
+        cx = max(0, min(frame_w - 1, int(round(left + (width * 0.5)))))
+        cy = max(0, min(frame_h - 1, int(round(top + (height * 0.5)))))
+        local_cx = max(0, min(int(depth_crop.shape[1]) - 1, cx - x0))
+        local_cy = max(0, min(int(depth_crop.shape[0]) - 1, cy - y0))
+        center_sample = float(depth_crop[local_cy, local_cx])
+        center_value = center_sample if np.isfinite(center_sample) else None
+
+        if mask_area <= 0:
+            return self._build_result(
+                frame_meta,
+                obj_meta,
+                bbox=bbox,
+                status="missing_mask",
+                mask_area_px=0,
+                depth_center=center_value,
+            )
+
+        valid_mask = np.logical_and(mask, np.isfinite(depth_crop))
+        values = np.asarray(depth_crop[valid_mask], dtype=np.float32)
+        anchor = _extract_person_depth_anchor(
+            mask,
+            depth_crop,
+            frame_origin=(int(math.floor(left)), int(math.floor(top))),
+        )
+        anchor_fields: Dict[str, Any] = {
+            "spatial_class": "person",
+            "anchor_uv": list(anchor.foot_uv) if anchor.foot_uv is not None else None,
+            "anchor_source": anchor.anchor_source,
+            "anchor_depth_m": anchor.anchor_depth_m,
+            "anchor_sample_count": int(anchor.anchor_sample_count) if anchor.anchor_sample_count > 0 else None,
+            "anchor_valid_fraction": float(anchor.anchor_valid_fraction) if anchor.anchor_valid_fraction > 0.0 else None,
+        }
+        sample_count = int(values.size)
+        if sample_count <= 0:
+            return self._build_result(
+                frame_meta,
+                obj_meta,
+                bbox=bbox,
+                status="no_valid_depth",
+                mask_area_px=mask_area,
+                depth_center=center_value,
+                anchor_fields=anchor_fields,
+            )
+        return self._build_result(
+            frame_meta,
+            obj_meta,
+            bbox=bbox,
+            status="ok",
+            mask_area_px=mask_area,
+            sample_count=sample_count,
+            valid_fraction=float(sample_count) / float(mask_area),
+            depth_center=center_value,
+            values=values,
+            anchor_fields=anchor_fields,
+        )
+
+    def handle_frame_ds8(self, frame_meta: Any) -> None:
+        source_id = int(_meta_lookup(frame_meta, "source_id", "pad_index", default=0) or 0)
+        frame_id = int(_meta_lookup(frame_meta, "frame_number", "frame_num", default=0) or 0)
+        pts_us = _frame_pts_key_us(frame_meta)
+        depth_frame, _age_frames, _age_ms = self.depth_store.resolve(
+            source_id=source_id,
+            frame_id=frame_id,
+            pts_us=pts_us,
+            max_age_frames=max(0, int(self.depth_every_n_frames) - 1),
+        )
+        for obj_meta in getattr(frame_meta, "object_items", None) or []:
+            try:
+                class_id = int(getattr(obj_meta, "class_id", -1))
+            except Exception:
+                class_id = -1
+            if class_id != 0:
+                continue
+            bbox = _rect_to_bbox(getattr(obj_meta, "rect_params", None))
+            if bbox is None:
+                continue
+            if depth_frame is None:
+                result = self._build_result(frame_meta, obj_meta, bbox=bbox, status="depth_not_ready")
+            else:
+                result = self._sample_person_result(frame_meta, obj_meta, depth_frame)
+            if result is None:
+                continue
+            try:
+                noesis_depth_meta_ext.attach_object_depth(obj_meta, result.to_json(), True)  # type: ignore[union-attr]
+            except Exception:
+                logger.exception("Failed to attach NOESIS.OBJECT_DEPTH to object metadata")
+
+
+class _DepthTrackingFrameOperator(BatchMetadataOperator):  # pragma: no cover - requires DS runtime
+    def __init__(self, processor: _DepthTrackingFrameProcessor) -> None:
+        super().__init__()
+        self.processor = processor
+
+    def handle_metadata(self, batch_meta: Any) -> None:  # type: ignore[override]
+        frame_items = getattr(batch_meta, "frame_items", None)
+        if frame_items is None:
+            return
+        for frame_meta in frame_items:
+            try:
+                self.processor.handle_frame_ds8(frame_meta)
+            except Exception:
+                logger.exception("Failed to capture aligned DAv2 depth frame within batch metadata (DS8)")
+
+
+class _ObjectDepthFusionOperator(BatchMetadataOperator):  # pragma: no cover - requires DS runtime
+    def __init__(self, processor: _ObjectDepthFusionProcessor) -> None:
+        super().__init__()
+        self.processor = processor
+
+    def handle_metadata(self, batch_meta: Any) -> None:  # type: ignore[override]
+        frame_items = getattr(batch_meta, "frame_items", None)
+        if frame_items is None:
+            return
+        for frame_meta in frame_items:
+            try:
+                self.processor.handle_frame_ds8(frame_meta)
+            except Exception:
+                logger.exception("Failed to fuse object depth within batch metadata (DS8)")
+
+
+@dataclass
 class _AnalyticsTelemetryProcessor:
     pipeline: "DS8Pipeline"
     tracking_pub: "TrackingTelemetryPublisher"
@@ -3398,6 +4262,7 @@ class _AnalyticsTelemetryProcessor:
     tracking_mode: Optional[str] = None
     bev_renderer: Any = None
     bev_calibration: Any = None
+    depth_registration: DepthRegistrationManager | None = None
     diagnostics_logger: Any = None
     osd_label_processor: Any = None
     _analytics_obj_meta_type: Any = field(default=None, init=False, repr=False)
@@ -3424,7 +4289,7 @@ class _AnalyticsTelemetryProcessor:
     _reid_debug_emb_missing: int = field(default=0, init=False, repr=False)
     _diag_logged: bool = field(default=False, init=False, repr=False)
     _tracking_mode: str = field(default="baseline", init=False, repr=False)
-    _world_frame: str = field(default="menon_scene", init=False, repr=False)
+    _world_frame: str = field(default="backend_world_m", init=False, repr=False)
     _image_flip_by_key: Dict[str, Tuple[bool, bool]] = field(default_factory=dict, init=False, repr=False)
     _image_flip_logged: set[str] = field(default_factory=set, init=False, repr=False)
     _v3dt_meta_enabled: bool = field(default=True, init=False, repr=False)
@@ -3452,7 +4317,7 @@ class _AnalyticsTelemetryProcessor:
     _world_height_update_alpha: float = field(default=0.20, init=False, repr=False)
     _world_height_min_m: float = field(default=0.60, init=False, repr=False)
     _world_height_max_m: float = field(default=2.40, init=False, repr=False)
-    _world_anchor_hold_ttl_s: float = field(default=1.25, init=False, repr=False)
+    _world_anchor_hold_ttl_s: float = field(default=0.40, init=False, repr=False)
 
     def __post_init__(self) -> None:
         # Discover the ReID SGIE unique-id from the built pipeline config when present.
@@ -3474,7 +4339,7 @@ class _AnalyticsTelemetryProcessor:
             if frame:
                 self._world_frame = str(frame)
         except Exception:
-            self._world_frame = "menon_scene"
+            self._world_frame = "backend_world_m"
 
         flag = str(os.environ.get("NOESIS_V3DT_META_EXTRACT", "1") or "").strip().lower()
         self._v3dt_meta_enabled = flag in ("", "1", "true", "yes", "y", "on")
@@ -3563,6 +4428,12 @@ class _AnalyticsTelemetryProcessor:
             self._world_smooth_alpha_weak = 0.20
         self._world_smooth_alpha_good = float(max(0.0, min(1.0, self._world_smooth_alpha_good)))
         self._world_smooth_alpha_weak = float(max(0.0, min(1.0, self._world_smooth_alpha_weak)))
+        try:
+            self._world_anchor_hold_ttl_s = max(
+                0.0, float(str(os.environ.get("NOESIS_WORLD_ANCHOR_HOLD_TTL_S", "0.40")).strip() or "0.40")
+            )
+        except Exception:
+            self._world_anchor_hold_ttl_s = 0.40
 
     def get_active_track_map(self, sensor_id: int) -> Dict[int, Dict[str, Any]]:
         tracks = self._active_tracks.get(int(sensor_id)) or []
@@ -4029,16 +4900,13 @@ class _AnalyticsTelemetryProcessor:
                 sid_candidate = id_diag.get("sid_candidate")
                 embedding_present = bool(id_diag.get("embedding_present", emb is not None))
                 pose_kpts_abs = self._extract_pose_keypoints_for_anchor(obj_meta, raw.get("bbox") or [])
+                depth_result = self._extract_object_depth_result(obj_meta)
                 pose_present = bool(id_diag.get("pose_present", False))
                 if not pose_present:
                     pose_present = pose_kpts_abs is not None
                 id_display = None
                 if self._reid_diag_use_tracker_id:
                     id_display = f"[{tracker_id_int}] | [{stable_id_int}]"
-
-                # Stamp OSD label early so mosaic never falls back to tracker IDs.
-                self._stamp_osd_label_ds8(obj_meta, sensor_id=sensor_id, stable_id=stable_id_int)
-                self._apply_instance_mask_color_ds8(obj_meta, stable_id=stable_id_int)
 
                 dwell = self._update_dwell_time(sensor_id, stable_id_int, zone, now_ts)
 
@@ -4104,7 +4972,17 @@ class _AnalyticsTelemetryProcessor:
                     public_track,
                     obj_meta=obj_meta,
                     pose_kpts_abs=pose_kpts_abs,
+                    depth_result=depth_result,
                 )
+                self._apply_public_depth_fields(public_track, depth_result)
+                try:
+                    setattr(obj_meta, "_noesis_depth_used_m", public_track.get("depth_used_m"))
+                except Exception:
+                    pass
+                # Stamp OSD label after world/depth augmentation so z= reflects the
+                # registered depth actually used by the estimator.
+                self._stamp_osd_label_ds8(obj_meta, sensor_id=sensor_id, stable_id=stable_id_int)
+                self._apply_instance_mask_color_ds8(obj_meta, stable_id=stable_id_int)
                 diag_track.update(
                     {
                         "stable_id": stable_id_int,
@@ -4118,6 +4996,15 @@ class _AnalyticsTelemetryProcessor:
                         "world_quality_reason": public_track.get("world_quality_reason"),
                         "world_frame": public_track.get("world_frame"),
                         "world_source": public_track.get("world_source"),
+                        "depth_status": depth_result.status if depth_result is not None else None,
+                        "depth_anchor_source": depth_result.anchor_source if depth_result is not None else None,
+                        "depth_anchor_m": depth_result.anchor_depth_m if depth_result is not None else None,
+                        "depth_registered_m": public_track.get("depth_registered_m"),
+                        "depth_used_m": public_track.get("depth_used_m"),
+                        "depth_registration_status": public_track.get("depth_registration_status"),
+                        "depth_registration_id": public_track.get("depth_registration_id"),
+                        "depth_samples": depth_result.sample_count if depth_result is not None else None,
+                        "depth_valid_fraction": depth_result.valid_fraction if depth_result is not None else None,
                         "id_event": id_event,
                         "id_reject_reason": id_reject_reason,
                         "embedding_present": bool(embedding_present),
@@ -4291,7 +5178,6 @@ class _AnalyticsTelemetryProcessor:
                 if self._reid_diag_use_tracker_id:
                     id_display = f"[{tracker_id_int}] | [{stable_id_int}]"
 
-                self._stamp_osd_label(obj_meta, sensor_id=sensor_id, stable_id=stable_id_int)
                 dwell = self._update_dwell_time(sensor_id, stable_id_int, zone, now_ts)
 
                 analytics = raw.get("analytics")
@@ -4346,13 +5232,21 @@ class _AnalyticsTelemetryProcessor:
                         public_track[key] = raw.get(key)
 
                 pose_kpts_abs = self._extract_pose_keypoints_for_anchor(obj_meta, raw.get("bbox") or [])
+                depth_result = self._extract_object_depth_result(obj_meta)
                 self._augment_track_with_world(
                     sensor_id,
                     camera_id,
                     public_track,
                     obj_meta=obj_meta,
                     pose_kpts_abs=pose_kpts_abs,
+                    depth_result=depth_result,
                 )
+                self._apply_public_depth_fields(public_track, depth_result)
+                try:
+                    setattr(obj_meta, "_noesis_depth_used_m", public_track.get("depth_used_m"))
+                except Exception:
+                    pass
+                self._stamp_osd_label(obj_meta, sensor_id=sensor_id, stable_id=stable_id_int)
                 diag_track.update(
                     {
                         "stable_id": stable_id_int,
@@ -4366,6 +5260,15 @@ class _AnalyticsTelemetryProcessor:
                         "world_quality_reason": public_track.get("world_quality_reason"),
                         "world_frame": public_track.get("world_frame"),
                         "world_source": public_track.get("world_source"),
+                        "depth_status": depth_result.status if depth_result is not None else None,
+                        "depth_anchor_source": depth_result.anchor_source if depth_result is not None else None,
+                        "depth_anchor_m": depth_result.anchor_depth_m if depth_result is not None else None,
+                        "depth_registered_m": public_track.get("depth_registered_m"),
+                        "depth_used_m": public_track.get("depth_used_m"),
+                        "depth_registration_status": public_track.get("depth_registration_status"),
+                        "depth_registration_id": public_track.get("depth_registration_id"),
+                        "depth_samples": depth_result.sample_count if depth_result is not None else None,
+                        "depth_valid_fraction": depth_result.valid_fraction if depth_result is not None else None,
                     }
                 )
                 tracks.append(public_track)
@@ -4588,10 +5491,10 @@ class _AnalyticsTelemetryProcessor:
                 return None
             return u, v
 
-        def _clip_uv(u: float, v: float) -> Optional[Tuple[float, float]]:
+        def _clip_uv(u: float, v: float, *, vertical_overshoot_ratio: float = 0.01) -> Optional[Tuple[float, float]]:
             frame_w, frame_h = frame_dims
             if frame_h:
-                margin = max(2.0, 0.01 * float(frame_h))
+                margin = max(2.0, float(vertical_overshoot_ratio) * float(frame_h))
                 if v < -margin or v > (frame_h + margin):
                     return None
                 v = float(np.clip(v, 0.0, float(frame_h)))
@@ -4634,22 +5537,20 @@ class _AnalyticsTelemetryProcessor:
         u = v = None
         method = None
 
-        use_image_meta = self._tracking_mode_is_v3dt()
-        if use_image_meta:
-            if track.get("world_source") != "bbox3d" and not isinstance(track.get("bbox3d"), dict):
-                use_image_meta = False
+        image_anchor_keys = (("image_foot", "image_foot"), ("image_base", "image_base"))
+        if track.get("world_source") == "bbox3d" or isinstance(track.get("bbox3d"), dict):
+            image_anchor_keys = (("image_base", "image_base"), ("image_foot", "image_foot"))
 
-        if use_image_meta:
-            for key, label in (("image_base", "image_base"), ("image_foot", "image_foot")):
-                uv = _parse_uv(track.get(key))
-                if uv is None:
-                    continue
-                clipped = _clip_uv(*uv)
-                if clipped is None:
-                    continue
-                u, v = clipped
-                method = label
-                break
+        for key, label in image_anchor_keys:
+            uv = _parse_uv(track.get(key))
+            if uv is None:
+                continue
+            clipped = _clip_uv(*uv, vertical_overshoot_ratio=0.10)
+            if clipped is None:
+                continue
+            u, v = clipped
+            method = label
+            break
 
         if u is None or v is None:
             bbox = track.get("bbox")
@@ -4697,6 +5598,31 @@ class _AnalyticsTelemetryProcessor:
                 except Exception:
                     world_x = None
                     world_z = None
+        registration_status_raw = track.get("depth_registration_status")
+        registration_status = str(registration_status_raw or "").strip().lower()
+        has_registration_status = registration_status not in ("", "none", "null")
+        if registration_status == "ok":
+            depth_keys = ("depth_registered_m", "depth_used_m")
+        elif has_registration_status:
+            # Raw DAv2/object-depth values are not in the MapAnything floorplan
+            # basis when registration rejected the sample. Keep the BEV overlay
+            # on the image-floor/world path instead of drawing a mismatched range.
+            depth_keys = ()
+        else:
+            depth_keys = ("depth_registered_m", "depth_used_m", "depth_anchor_m")
+
+        depth_m = None
+        depth_source = None
+        for depth_key in depth_keys:
+            raw_depth = track.get(depth_key)
+            try:
+                depth_candidate = float(raw_depth)
+            except Exception:
+                continue
+            if math.isfinite(depth_candidate) and 0.05 < depth_candidate < 50.0:
+                depth_m = float(depth_candidate)
+                depth_source = depth_key
+                break
         return Footpoint(
             u=u,
             v=v,
@@ -4705,6 +5631,8 @@ class _AnalyticsTelemetryProcessor:
             tracker_id=tracker_id_int,
             world_x=world_x,
             world_z=world_z,
+            depth_m=depth_m,
+            depth_source=depth_source,
             anchor_source=str(track.get("world_source")) if track.get("world_source") not in (None, "") else None,
             anchor_quality=str(track.get("world_quality")) if track.get("world_quality") not in (None, "") else None,
             anchor_reason=str(track.get("world_quality_reason")) if track.get("world_quality_reason") not in (None, "") else None,
@@ -4732,58 +5660,7 @@ class _AnalyticsTelemetryProcessor:
         return float(u), float(v)
 
     def _infer_image_flips(self, camera_id: str, calib: CalibrationSnapshot) -> Tuple[bool, bool]:
-        try:
-            ext_hash = hash(tuple(float(x) for x in calib.extrinsics_col_major))
-        except Exception:
-            ext_hash = 0
-        key = f"{camera_id}::{ext_hash}"
-        cached = self._image_flip_by_key.get(key)
-        if cached is not None:
-            return cached
-
-        flip_u = False
-        flip_v = False
-        try:
-            R_wc, _ = parse_extrinsics(calib.extrinsics_col_major)
-            forward = R_wc @ np.array([0.0, 0.0, 1.0], dtype=np.float64)
-            f_norm = float(np.linalg.norm(forward))
-            if f_norm > 1e-6:
-                forward = forward / f_norm
-            world_up = np.array([0.0, 1.0, 0.0], dtype=np.float64)
-            right_ref = np.cross(world_up, forward)
-            r_norm = float(np.linalg.norm(right_ref))
-            if r_norm <= 1e-6:
-                right_ref = np.array([1.0, 0.0, 0.0], dtype=np.float64)
-            else:
-                right_ref = right_ref / r_norm
-            up_ref = np.cross(forward, right_ref)
-            u_norm = float(np.linalg.norm(up_ref))
-            if u_norm <= 1e-6:
-                up_ref = world_up
-            else:
-                up_ref = up_ref / u_norm
-
-            right = R_wc @ np.array([1.0, 0.0, 0.0], dtype=np.float64)
-            up = R_wc @ np.array([0.0, 1.0, 0.0], dtype=np.float64)
-            r_actual = float(np.dot(right, right_ref))
-            u_actual = float(np.dot(up, up_ref))
-
-            flip_u = r_actual < 0.0
-            flip_v = u_actual > 0.0
-        except Exception:
-            flip_u = False
-            flip_v = False
-
-        self._image_flip_by_key[key] = (bool(flip_u), bool(flip_v))
-        if (flip_u or flip_v) and key not in self._image_flip_logged:
-            logger.info(
-                "Tracking world image axis flip for %s: flip_u=%s flip_v=%s",
-                camera_id,
-                bool(flip_u),
-                bool(flip_v),
-            )
-            self._image_flip_logged.add(key)
-        return bool(flip_u), bool(flip_v)
+        return False, False
 
     def _world_track_key(self, sensor_id: int, track: Mapping[str, Any]) -> Optional[Tuple[int, int]]:
         tracker_id = track.get("tracker_id", track.get("track_id"))
@@ -5000,38 +5877,25 @@ class _AnalyticsTelemetryProcessor:
             height_lock_eligible=False,
         )
 
+    def _resolve_person_depth_anchor(self, depth_result: Optional[ObjectDepthResult]) -> Optional[_PoseAnchorCandidate]:
+        anchor_uv = _depth_anchor_uv(depth_result)
+        if anchor_uv is None:
+            return None
+        anchor_band = str(depth_result.anchor_source or "") if depth_result is not None else ""
+        quality = "good" if anchor_band == "lower_body_band" else "estimated"
+        quality_reason = f"mask_anchor={anchor_band or 'foot_uv'}"
+        return _PoseAnchorCandidate(
+            u=float(anchor_uv[0]),
+            v=float(anchor_uv[1]),
+            source="person_mask_floor",
+            quality=quality,
+            quality_reason=quality_reason,
+            height_lock_eligible=False,
+        )
+
     @staticmethod
     def _scene_per_meter(calib: Any) -> float:
-        try:
-            s_obj_to_m = float(calib.unit_scale or 1.0)
-            if math.isfinite(s_obj_to_m) and s_obj_to_m > 1e-6:
-                return 1.0 / s_obj_to_m
-        except Exception:
-            pass
         return 1.0
-
-    def _project_pixel_to_floor_world(
-        self,
-        calib: Any,
-        u: float,
-        v: float,
-        *,
-        flip_u: bool,
-        flip_v: bool,
-    ) -> Optional[np.ndarray]:
-        try:
-            width_src, height_src = calib.image_size
-            u_ray, v_ray = self._apply_image_flip(float(u), float(v), int(width_src), int(height_src), bool(flip_u), bool(flip_v))
-            R_wc, C_world = parse_extrinsics(calib.extrinsics_col_major)
-            C_world = C_world * self._scene_per_meter(calib)
-            plane = Plane.horizontal(float(calib.floor_y))
-            origin, direction = ray_from_pixel(u_ray, v_ray, calib.intrinsics, R_wc, C_world)
-            hit = intersect_plane(origin, direction, plane)
-            if hit is None:
-                return None
-            return np.asarray(hit, dtype=np.float64)
-        except Exception:
-            return None
 
     def _human_height_scene_bounds(self, calib: Any) -> Tuple[float, float]:
         scene_per_m = self._scene_per_meter(calib)
@@ -5177,17 +6041,265 @@ class _AnalyticsTelemetryProcessor:
         self,
         pose_kpts_abs: Optional[np.ndarray],
         pose_anchor: Optional[_PoseAnchorCandidate],
+        person_anchor: Optional[_PoseAnchorCandidate],
+        depth_result: Optional[ObjectDepthResult],
         state: Optional[_WorldAnchorState],
     ) -> str:
+        reasons: List[str] = []
         if noesis_pose_meta_ext is None:
-            return "pose_meta_missing"
-        if pose_kpts_abs is None:
-            return "pose_keypoints_unusable"
-        if pose_anchor is None:
-            if state is None or state.height_ref_scene is None:
-                return "height_lock_missing"
-            return "pose_anchor_unavailable"
-        return "pose_anchor_projection_failed"
+            reasons.append("pose_meta_missing")
+        elif pose_kpts_abs is None:
+            reasons.append("pose_keypoints_unusable")
+        elif pose_anchor is None:
+            reasons.append("pose_anchor_unavailable")
+        if person_anchor is None:
+            if depth_result is None:
+                reasons.append("depth_meta_missing")
+            elif _depth_anchor_uv(depth_result) is None:
+                reasons.append("depth_anchor_unavailable")
+        if state is None or state.height_ref_scene is None:
+            reasons.append("height_lock_missing")
+        if not reasons:
+            return "world_anchor_projection_failed"
+        return ",".join(dict.fromkeys(str(reason) for reason in reasons if reason))
+
+    def _extract_object_depth_result(self, obj_meta: Any) -> Optional[ObjectDepthResult]:
+        return _extract_object_depth_result_from_meta(obj_meta)
+
+    def _project_pixel_to_world_observation(
+        self,
+        calib: Any,
+        u: float,
+        v: float,
+        *,
+        depth_m: Optional[float],
+        flip_u: bool,
+        flip_v: bool,
+    ) -> Optional[np.ndarray]:
+        try:
+            width_src, height_src = calib.image_size
+            u_ray, v_ray = self._apply_image_flip(float(u), float(v), int(width_src), int(height_src), bool(flip_u), bool(flip_v))
+            result = pixel_to_world(
+                calib.intrinsics,
+                calib.extrinsics_col_major,
+                float(calib.floor_y),
+                float(getattr(calib, "unit_scale", 1.0) or 1.0),
+                float(u_ray),
+                float(v_ray),
+                depth_m=float(depth_m) if depth_m is not None else None,
+            )
+            if not bool(getattr(result, "ok", False)):
+                return None
+            point = getattr(result, "world_point", None)
+            if not isinstance(point, Sequence) or len(point) < 3:
+                return None
+            return np.array([float(point[0]), float(point[1]), float(point[2])], dtype=np.float64)
+        except Exception:
+            return None
+
+    def _project_pixel_to_floor_world(
+        self,
+        calib: Any,
+        u: float,
+        v: float,
+        *,
+        flip_u: bool,
+        flip_v: bool,
+    ) -> Optional[np.ndarray]:
+        return self._project_pixel_to_world_observation(
+            calib,
+            u,
+            v,
+            depth_m=None,
+            flip_u=flip_u,
+            flip_v=flip_v,
+        )
+
+    def _depth_observation_from_anchor(
+        self,
+        *,
+        calib: Any,
+        anchor: _PoseAnchorCandidate,
+        depth_result: Optional[ObjectDepthResult],
+        flip_u: bool,
+        flip_v: bool,
+    ) -> _DepthObservationResult:
+        if depth_result is None:
+            return _DepthObservationResult(None, 0.0, "depth_meta_missing")
+        if str(depth_result.status) != "ok":
+            return _DepthObservationResult(None, 0.0, f"depth_status_{depth_result.status}")
+        if not bool(depth_result.is_metric) or str(depth_result.unit) != "m":
+            return _DepthObservationResult(None, 0.0, "depth_not_metric")
+        anchor_source = str(depth_result.anchor_source or "")
+        if anchor_source == "lower_body_band":
+            min_support_count = 16
+            min_support_fraction = 0.40
+            support_scale_denom = 96.0
+            anchor_source_weight = 1.0
+        elif anchor_source == "torso_core":
+            min_support_count = 20
+            min_support_fraction = 0.45
+            support_scale_denom = 128.0
+            anchor_source_weight = 0.50
+        else:
+            return _DepthObservationResult(None, 0.0, "depth_anchor_source_invalid")
+        anchor_depth_m = depth_result.anchor_depth_m
+        if anchor_depth_m is None or not math.isfinite(float(anchor_depth_m)) or float(anchor_depth_m) <= 0.0:
+            return _DepthObservationResult(None, 0.0, "depth_anchor_missing")
+        support_count = int(
+            depth_result.anchor_sample_count
+            if depth_result.anchor_sample_count is not None
+            else depth_result.sample_count
+        )
+        support_fraction = float(
+            depth_result.anchor_valid_fraction
+            if depth_result.anchor_valid_fraction is not None
+            else depth_result.valid_fraction
+        )
+        if support_count < min_support_count or support_fraction < min_support_fraction:
+            return _DepthObservationResult(
+                None,
+                0.0,
+                "depth_support_low",
+                raw_depth_m=float(anchor_depth_m),
+            )
+        raw_depth_value = float(anchor_depth_m)
+        registered_depth_m = raw_depth_value
+        registration_status = "raw_passthrough"
+        registration_id: Optional[str] = None
+        if self.depth_registration is not None:
+            corrected_depth_m, reg_status, reg_id = self.depth_registration.apply(
+                camera_id=str(getattr(calib, "camera_id", "") or ""),
+                raw_depth_m=raw_depth_value,
+            )
+            registration_status = str(reg_status)
+            registration_id = str(reg_id) if reg_id else None
+            if corrected_depth_m is None:
+                return _DepthObservationResult(
+                    None,
+                    0.0,
+                    f"depth_registration_{registration_status}",
+                    raw_depth_m=raw_depth_value,
+                    registered_depth_m=None,
+                    registration_status=registration_status,
+                    registration_id=registration_id,
+                )
+            registered_depth_m = float(corrected_depth_m)
+        depth_obs = self._project_pixel_to_world_observation(
+            calib,
+            float(anchor.u),
+            float(anchor.v),
+            depth_m=float(registered_depth_m),
+            flip_u=flip_u,
+            flip_v=flip_v,
+        )
+        if depth_obs is None:
+            return _DepthObservationResult(
+                None,
+                0.0,
+                "depth_projection_failed",
+                raw_depth_m=raw_depth_value,
+                registered_depth_m=registered_depth_m,
+                registration_status=registration_status,
+                registration_id=registration_id,
+            )
+        depth_weight = min(1.0, support_fraction) * min(1.0, float(support_count) / support_scale_denom)
+        depth_weight *= anchor_source_weight
+        if str(anchor.source) == "pose_leg_floor":
+            depth_weight *= 0.85
+        return _DepthObservationResult(
+            depth_obs,
+            max(0.0, min(1.0, depth_weight)),
+            "ok",
+            raw_depth_m=raw_depth_value,
+            registered_depth_m=registered_depth_m,
+            registration_status=registration_status,
+            registration_id=registration_id,
+        )
+
+    def _predict_world_state(self, state: _WorldAnchorState, now_ts: float) -> Tuple[Optional[float], Optional[float], float]:
+        if state.world_x is None or state.world_z is None or float(state.filtered_ts or 0.0) <= 0.0:
+            return None, None, 0.0
+        dt = max(0.0, float(now_ts) - float(state.filtered_ts))
+        # Motion extrapolation is intentionally disabled in the baseline world estimator.
+        # The state should converge toward the latest fused observation instead of
+        # rebounding around a constant-velocity prediction during occlusion/reacquisition.
+        pred_x = float(state.world_x)
+        pred_z = float(state.world_z)
+        return pred_x, pred_z, dt
+
+    def _update_world_state(
+        self,
+        state: Optional[_WorldAnchorState],
+        *,
+        measurement: np.ndarray,
+        floor_y: float,
+        now_ts: float,
+        alpha: float,
+        beta: float,
+    ) -> np.ndarray:
+        mx = float(measurement[0])
+        mz = float(measurement[2])
+        if state is None:
+            return np.array([mx, float(floor_y), mz], dtype=np.float64)
+
+        pred_x, pred_z, dt = self._predict_world_state(state, float(now_ts))
+        if pred_x is None or pred_z is None or dt <= 1e-6:
+            state.world_x = mx
+            state.world_z = mz
+            state.vel_world_x = 0.0
+            state.vel_world_z = 0.0
+            state.filtered_ts = float(now_ts)
+            return np.array([mx, float(floor_y), mz], dtype=np.float64)
+
+        innovation_x = float(mx) - float(pred_x)
+        innovation_z = float(mz) - float(pred_z)
+        innovation_dist = math.hypot(innovation_x, innovation_z)
+        max_step = float(self._world_max_speed_scene_per_s) * float(dt)
+        if max_step > 0.0 and innovation_dist > max_step and innovation_dist > 1e-6:
+            scale = max_step / innovation_dist
+            innovation_x *= scale
+            innovation_z *= scale
+
+        next_x = float(pred_x) + float(alpha) * innovation_x
+        next_z = float(pred_z) + float(alpha) * innovation_z
+        next_vx = 0.0
+        next_vz = 0.0
+
+        state.world_x = float(next_x)
+        state.world_z = float(next_z)
+        state.vel_world_x = float(next_vx)
+        state.vel_world_z = float(next_vz)
+        state.filtered_ts = float(now_ts)
+        return np.array([float(next_x), float(floor_y), float(next_z)], dtype=np.float64)
+
+    def _set_track_image_base_from_world(
+        self,
+        track: Dict[str, Any],
+        *,
+        calib: Any,
+        world_point: np.ndarray,
+        flip_u: bool,
+        flip_v: bool,
+    ) -> None:
+        try:
+            uv = project_world_to_image(
+                world_point,
+                calib.intrinsics,
+                calib.extrinsics_col_major,
+                tuple(int(x) for x in calib.image_size),
+                unit_scale=1.0,
+                flip_u=bool(flip_u),
+                flip_v=bool(flip_v),
+            )
+        except Exception:
+            uv = None
+        if uv is None:
+            return
+        try:
+            track["image_base"] = [float(uv[0]), float(uv[1])]
+        except Exception:
+            return
 
     def _augment_track_with_world(
         self,
@@ -5197,6 +6309,7 @@ class _AnalyticsTelemetryProcessor:
         *,
         obj_meta: Any | None = None,
         pose_kpts_abs: Optional[np.ndarray] = None,
+        depth_result: Optional[ObjectDepthResult] = None,
     ) -> None:
         """Calculate world coordinates for a track if calibration is available."""
         if self.bev_calibration is None:
@@ -5240,17 +6353,19 @@ class _AnalyticsTelemetryProcessor:
             if pose_kpts_abs is None:
                 pose_kpts_abs = self._extract_pose_keypoints_for_anchor(obj_meta, bbox)
             pose_anchor = self._resolve_pose_floor_anchor(pose_kpts_abs) if pose_kpts_abs is not None else None
+            person_anchor = self._resolve_person_depth_anchor(depth_result) if pose_anchor is None else None
+            anchor_candidate = pose_anchor if pose_anchor is not None else person_anchor
 
             hit: Optional[np.ndarray] = None
             quality = "invalid"
             quality_reason: Optional[str] = "no_floor_intersection"
             world_source: Optional[str] = None
 
-            if pose_anchor is not None:
-                track["image_foot"] = [float(pose_anchor.u), float(pose_anchor.v)]
+            if anchor_candidate is not None:
+                track["image_foot"] = [float(anchor_candidate.u), float(anchor_candidate.v)]
                 pose_u, pose_v = self._scale_uv_to_image_size(
-                    float(pose_anchor.u),
-                    float(pose_anchor.v),
+                    float(anchor_candidate.u),
+                    float(anchor_candidate.v),
                     track_image_size,
                     calib_image_size,
                 )
@@ -5262,10 +6377,7 @@ class _AnalyticsTelemetryProcessor:
                     flip_v=flip_v,
                 )
                 if hit is not None:
-                    world_source = str(pose_anchor.source)
-                    quality = str(pose_anchor.quality)
-                    quality_reason = pose_anchor.quality_reason
-                    if state is not None and pose_anchor.height_lock_eligible:
+                    if state is not None and anchor_candidate.height_lock_eligible:
                         self._maybe_update_world_height_reference(
                             state,
                             calib,
@@ -5274,21 +6386,106 @@ class _AnalyticsTelemetryProcessor:
                             flip_u=flip_u,
                             flip_v=flip_v,
                         )
+                    depth_observation = self._depth_observation_from_anchor(
+                        calib=calib,
+                        anchor=anchor_candidate,
+                        depth_result=depth_result,
+                        flip_u=flip_u,
+                        flip_v=flip_v,
+                    )
+                    depth_obs = depth_observation.world_point
+                    depth_weight = float(depth_observation.weight)
+                    depth_reason = str(depth_observation.reason)
+                    if depth_observation.raw_depth_m is not None:
+                        track["depth_anchor_m"] = float(depth_observation.raw_depth_m)
+                    track["depth_registered_m"] = (
+                        float(depth_observation.registered_depth_m)
+                        if depth_observation.registered_depth_m is not None
+                        else None
+                    )
+                    track["depth_used_m"] = track.get("depth_registered_m")
+                    track["depth_registration_status"] = depth_observation.registration_status
+                    track["depth_registration_id"] = depth_observation.registration_id
+                    floor_weight = 1.0 if anchor_candidate.quality == "good" else 0.75
+                    if depth_obs is not None and depth_weight > 0.0:
+                        meas_x = ((float(hit[0]) * floor_weight) + (float(depth_obs[0]) * depth_weight)) / (floor_weight + depth_weight)
+                        meas_z = ((float(hit[2]) * floor_weight) + (float(depth_obs[2]) * depth_weight)) / (floor_weight + depth_weight)
+                        fused = np.array([meas_x, float(calib.floor_y), meas_z], dtype=np.float64)
+                        depth_anchor_source = str(depth_result.anchor_source or "")
+                        alpha_boost = 0.10 if depth_anchor_source == "lower_body_band" else 0.05
+                        if anchor_candidate.source == "person_mask_floor":
+                            alpha_boost = max(0.0, float(alpha_boost) - 0.02)
+                        alpha = min(1.0, float(self._world_smooth_alpha_good) + float(alpha_boost))
+                        beta = max(0.0, min(1.0, float(alpha) * 0.25))
+                        hit = self._update_world_state(
+                            state,
+                            measurement=fused,
+                            floor_y=float(calib.floor_y),
+                            now_ts=float(now_ts),
+                            alpha=alpha,
+                            beta=beta,
+                        )
+                        world_source = "pose_depth_fused" if pose_anchor is not None else "person_anchor_depth_fused"
+                        quality = "good" if anchor_candidate.quality == "good" else "estimated"
+                        depth_support_count = int(
+                            depth_result.anchor_sample_count
+                            if depth_result.anchor_sample_count is not None
+                            else depth_result.sample_count
+                        )
+                        depth_support_fraction = float(
+                            depth_result.anchor_valid_fraction
+                            if depth_result.anchor_valid_fraction is not None
+                            else depth_result.valid_fraction
+                        )
+                        quality_reason = (
+                            f"anchor={anchor_candidate.source},depth_anchor={depth_anchor_source or 'none'},"
+                            f"depth_samples={depth_support_count},depth_valid={depth_support_fraction:.2f}"
+                        )
+                        registration_status = track.get("depth_registration_status")
+                        if registration_status:
+                            quality_reason = f"{quality_reason},depth_registration={registration_status}"
+                    else:
+                        alpha = float(self._world_smooth_alpha_good if anchor_candidate.quality == "good" else self._world_smooth_alpha_weak)
+                        beta = max(0.0, min(1.0, float(alpha) * 0.20))
+                        hit = self._update_world_state(
+                            state,
+                            measurement=hit,
+                            floor_y=float(calib.floor_y),
+                            now_ts=float(now_ts),
+                            alpha=alpha,
+                            beta=beta,
+                        )
+                        world_source = "pose_floor_only" if pose_anchor is not None else "person_anchor_floor_only"
+                        quality = "good" if anchor_candidate.quality == "good" else "estimated"
+                        quality_reason = f"anchor={anchor_candidate.source},depth={depth_reason}"
+                        registration_status = track.get("depth_registration_status")
+                        if registration_status:
+                            quality_reason = f"{quality_reason},depth_registration={registration_status}"
+                else:
+                    hit = None
 
             if hit is None and state is not None and state.height_ref_scene is not None:
-                hit = self._gravity_drop_world(
+                gravity_hit = self._gravity_drop_world(
                     calib,
                     bbox_project,
                     float(state.height_ref_scene),
                     flip_u=flip_u,
                     flip_v=flip_v,
                 )
-                if hit is not None:
+                if gravity_hit is not None:
+                    hit = self._update_world_state(
+                        state,
+                        measurement=gravity_hit,
+                        floor_y=float(calib.floor_y),
+                        now_ts=float(now_ts),
+                        alpha=float(self._world_smooth_alpha_weak),
+                        beta=max(0.0, min(1.0, float(self._world_smooth_alpha_weak) * 0.15)),
+                    )
                     world_source = "gravity_drop"
                     quality = "estimated"
-                    quality_reason = "pose_anchor_unavailable" if pose_anchor is None else "pose_anchor_projection_failed"
+                    quality_reason = "current_anchor_unavailable" if anchor_candidate is None else "current_anchor_projection_failed"
 
-            fallback_reason = self._fallback_quality_reason(pose_kpts_abs, pose_anchor, state)
+            fallback_reason = self._fallback_quality_reason(pose_kpts_abs, pose_anchor, person_anchor, depth_result, state)
 
             if hit is None and state is not None and state.last_good_world is not None:
                 hold_age = float(now_ts) - float(state.last_good_ts or 0.0)
@@ -5299,24 +6496,7 @@ class _AnalyticsTelemetryProcessor:
                     quality_reason = fallback_reason
 
             if hit is not None:
-                if world_source == "gravity_drop" and track.get("image_base") is None:
-                    try:
-                        uv = project_world_to_image(
-                            hit,
-                            calib.intrinsics,
-                            calib.extrinsics_col_major,
-                            tuple(int(x) for x in calib.image_size),
-                            unit_scale=1.0,
-                            flip_u=bool(flip_u),
-                            flip_v=bool(flip_v),
-                        )
-                    except Exception:
-                        uv = None
-                    if uv is not None:
-                        try:
-                            track["image_base"] = [float(uv[0]), float(uv[1])]
-                        except Exception:
-                            pass
+                self._set_track_image_base_from_world(track, calib=calib, world_point=hit, flip_u=flip_u, flip_v=flip_v)
                 wx = float(hit[0])
                 wy = float(hit[1])
                 wz = float(hit[2])
@@ -5336,6 +6516,7 @@ class _AnalyticsTelemetryProcessor:
                 if state is not None and world_source != "anchor_hold":
                     state.last_good_world = (float(wx), float(wy), float(wz))
                     state.last_good_ts = float(now_ts)
+                    state.ts = float(now_ts)
             else:
                 track["world_valid"] = False
                 track["world_quality"] = "invalid"
@@ -5825,6 +7006,38 @@ class _AnalyticsTelemetryProcessor:
             "transitions": self._transitions_state.get(sensor_id, []),
         }
 
+    def _apply_public_depth_fields(
+        self,
+        track: Dict[str, Any],
+        depth_result: Optional[ObjectDepthResult],
+    ) -> None:
+        if depth_result is None:
+            track["depth_status"] = None
+            track["depth_anchor_source"] = None
+            track["depth_anchor_m"] = None
+            track["depth_used_m"] = None
+            track["depth_registered_m"] = None
+            track["depth_registration_status"] = None
+            track["depth_registration_id"] = None
+            track["depth_center_m"] = None
+            track["depth_median_m"] = None
+            track["depth_sample_count"] = None
+            track["depth_valid_fraction"] = None
+            return
+        track["depth_status"] = str(depth_result.status)
+        track["depth_anchor_source"] = str(depth_result.anchor_source) if depth_result.anchor_source else None
+        if track.get("depth_anchor_m") is None:
+            track["depth_anchor_m"] = float(depth_result.anchor_depth_m) if depth_result.anchor_depth_m is not None else None
+        if track.get("depth_used_m") is None:
+            track["depth_used_m"] = _depth_used_m(depth_result)
+        track["depth_registered_m"] = track.get("depth_registered_m")
+        track["depth_registration_status"] = track.get("depth_registration_status")
+        track["depth_registration_id"] = track.get("depth_registration_id")
+        track["depth_center_m"] = float(depth_result.depth_center) if depth_result.depth_center is not None else None
+        track["depth_median_m"] = float(depth_result.depth_median) if depth_result.depth_median is not None else None
+        track["depth_sample_count"] = int(depth_result.sample_count)
+        track["depth_valid_fraction"] = float(depth_result.valid_fraction)
+
     def _stamp_osd_label_ds8(self, obj_meta: Any, *, sensor_id: int, stable_id: Optional[int]) -> None:
         proc = self.osd_label_processor
         if proc is None:
@@ -5923,6 +7136,10 @@ class _OsdLabelProcessor:
             text_params.display_text = label
         except Exception:
             pass
+        try:
+            setattr(obj_meta, "obj_label", label)
+        except Exception:
+            pass
         self._apply_font(text_params)
 
     def _apply_font(self, text_params: Any) -> None:
@@ -6004,7 +7221,7 @@ class _OsdLabelProcessor:
             except Exception:
                 value = None
             if value:
-                label = str(value).strip()
+                label = _clean_osd_base_label(str(value).strip())
             if label:
                 break
         if not label:
@@ -6043,6 +7260,29 @@ class _OsdLabelProcessor:
                 else:
                     parts.append("XX")
         base_label = " ".join([p for p in parts if p]).strip()
+
+        depth_text = None
+        if class_id == 0:
+            depth_override = getattr(obj_meta, "_noesis_depth_used_m", None)
+            if depth_override is not None:
+                try:
+                    depth_val = float(depth_override)
+                except Exception:
+                    depth_val = float("nan")
+                if math.isfinite(depth_val) and depth_val > 0.0:
+                    depth_text = f"z={depth_val:.{max(0, int(self.decimals))}f}m"
+                else:
+                    depth_text = "z=n/a"
+            else:
+                depth_text = _format_depth_label_fragment(
+                    _extract_object_depth_result_from_meta(obj_meta),
+                    decimals=self.decimals,
+                )
+        if depth_text:
+            if base_label:
+                base_label = f"{base_label} {depth_text}"
+            else:
+                base_label = depth_text
 
         try:
             confidence = float(getattr(obj_meta, "confidence", float("nan")))
@@ -6290,6 +7530,7 @@ class _MapAnythingOperator(BatchMetadataOperator):  # pragma: no cover - require
         self._matched_frames = 0
         self._warned_no_tensors = False
         self._warned_no_match = False
+        self._warned_native_probe = False
 
     def handle_metadata(self, batch_meta: Any) -> None:
         frame_items = getattr(batch_meta, "frame_items", None)
@@ -6335,14 +7576,51 @@ class _MapAnythingOperator(BatchMetadataOperator):  # pragma: no cover - require
                 if matched:
                     self._matched_frames += 1
                 elif converted_items:
+                    native_result = self._processor.handle_native_frame_ds8(frame_meta)
+                    if native_result is not None:
+                        self._matched_frames += 1
+                        continue
                     ids = [getattr(item, "unique_id", None) for item in converted_items]
                     _increment_core_counter("tensor_gie_mismatch_drops_total.mapanything")
                     if not self._warned_no_match:
+                        native_probe = None
+                        if noesis_depth_tracking_tensor_ext is not None and not self._warned_native_probe:
+                            self._warned_native_probe = True
+                            try:
+                                capture_fn = getattr(noesis_depth_tracking_tensor_ext, "capture_aligned_depth_frame", None)
+                                if callable(capture_fn):
+                                    frame_w = int(
+                                        _meta_lookup(frame_meta, "source_frame_width", "frame_width", "width", default=0)
+                                        or 0
+                                    )
+                                    frame_h = int(
+                                        _meta_lookup(frame_meta, "source_frame_height", "frame_height", "height", default=0)
+                                        or 0
+                                    )
+                                    if frame_w <= 0 or frame_h <= 0:
+                                        frame_w, frame_h = getattr(self._processor.pipeline, "frame_size", (0, 0))
+                                    probe_frame = capture_fn(
+                                        frame_meta,
+                                        int(self._processor.gie_id),
+                                        int(frame_w or 0),
+                                        int(frame_h or 0),
+                                    )
+                                    if probe_frame is not None:
+                                        native_probe = {
+                                            "found": True,
+                                            "depth_width": int(getattr(probe_frame, "depth_width", 0) or 0),
+                                            "depth_height": int(getattr(probe_frame, "depth_height", 0) or 0),
+                                        }
+                                    else:
+                                        native_probe = {"found": False}
+                            except Exception as exc:
+                                native_probe = {"error": str(exc)}
                         logger.debug(
-                            "MapAnything tensor_items present but no matching gie_id=%s (frame_number=%s, available_ids=%s)",
+                            "MapAnything tensor_items present but no matching gie_id=%s (frame_number=%s, available_ids=%s, native_probe=%s)",
                             self._processor.gie_id,
                             getattr(frame_meta, "frame_number", None),
                             ids,
+                            native_probe,
                         )
                         self._warned_no_match = True
             except Exception:

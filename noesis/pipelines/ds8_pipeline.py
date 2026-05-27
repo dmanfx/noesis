@@ -405,6 +405,9 @@ def _attach_fps_probes(pipeline: DS8Pipeline) -> None:
         # Core graph stages (sources do not support probes reliably here)
         "streammux",
         "yolo11_pgie",
+        "mapanything_queue",
+        "mapanything_valve",
+        "mapanything_fullframe",
         "tracker",
         "analytics",
         "tiler",
@@ -477,7 +480,7 @@ def build_pipeline(yaml_path: str | Path) -> DS8Pipeline:
             return False
         if not value.lower().startswith("file:"):
             return False
-        return value.lower().endswith(".mp4")
+        return value.lower().endswith((".mp4", ".mkv"))
 
     path = Path(yaml_path)
     if not path.exists():
@@ -677,7 +680,7 @@ def build_pipeline(yaml_path: str | Path) -> DS8Pipeline:
     per_source_pipeline = use_dewarper or streammux_element.lower() == "nvstreammux"
 
     # Track source output nodes when linking into nvstreammux.
-    source_nodes: List[str] = []
+    source_nodes: List[Tuple[str, int]] = []
 
     # Precompute URIs for tiler layout / diagnostics.
     uris = [str(s.get("uri") or "").strip() for s in sources if str(s.get("uri") or "").strip()]
@@ -763,25 +766,7 @@ def build_pipeline(yaml_path: str | Path) -> DS8Pipeline:
                     config={"caps": caps_out_caps},
                     downstream=[],
                 )
-                post_conv = Component(
-                    name=f"dewarper_post_conv_{idx}",
-                    element="nvvideoconvert",
-                    config={
-                        "gpu-id": zero_copy_gpu_id,
-                        "nvbuf-memory-type": zero_copy_nvbuf_memory_type,
-                    },
-                    downstream=[],
-                )
-                post_caps_caps = "video/x-raw(memory:NVMM),format=NV12"
-                if dewarp_out:
-                    post_caps_caps = f"{post_caps_caps},width={dewarp_out[0]},height={dewarp_out[1]}"
-                post_caps = Component(
-                    name=f"dewarper_post_caps_{idx}",
-                    element="capsfilter",
-                    config={"caps": post_caps_caps},
-                    downstream=[],
-                )
-                for comp in (conv, caps_in, dewarper, caps_out, post_conv, post_caps):
+                for comp in (conv, caps_in, dewarper, caps_out):
                     pipeline.components[comp.name] = comp
                     _safe_add(ds_pipeline, comp, pipeline.errors)
                     _apply_component_config(ds_pipeline, comp, pipeline.errors)
@@ -790,11 +775,9 @@ def build_pipeline(yaml_path: str | Path) -> DS8Pipeline:
                 _safe_link(ds_pipeline, pipeline.errors, conv.name, caps_in.name)
                 _safe_link(ds_pipeline, pipeline.errors, caps_in.name, dewarper.name)
                 _safe_link(ds_pipeline, pipeline.errors, dewarper.name, caps_out.name)
-                _safe_link(ds_pipeline, pipeline.errors, caps_out.name, post_conv.name)
-                _safe_link(ds_pipeline, pipeline.errors, post_conv.name, post_caps.name)
-                source_nodes.append(post_caps.name)
+                source_nodes.append((caps_out.name, idx))
             else:
-                source_nodes.append(source.name)
+                source_nodes.append((source.name, idx))
     else:
         # Multi-URI source path: nvmultiurisrcbin performs source ingest + mux.
         uri_list = ",".join(uris)
@@ -1018,6 +1001,51 @@ def build_pipeline(yaml_path: str | Path) -> DS8Pipeline:
         _safe_add(ds_pipeline, analytics, pipeline.errors)
         _apply_component_config(ds_pipeline, analytics, pipeline.errors)
 
+    # Required baseline depth-tracking branch (DAv2 full-frame) plus optional MapAnything branch.
+    depth_tracking: Optional[Component] = None
+    depth_tracking_sink: Optional[Component] = None
+    depth_tracking_queue: Optional[Component] = None
+    depth_tracking_cfg_raw = models.get("depth_tracking")
+    depth_tracking_enabled = False
+    if isinstance(depth_tracking_cfg_raw, dict):
+        depth_tracking_enabled = bool(depth_tracking_cfg_raw.get("enable", False)) and bool(depth_tracking_cfg_raw)
+
+    primary_branch = exclude_component.name if exclude_component is not None else tracker.name
+    tee_downstreams: List[str] = [primary_branch]
+
+    if depth_tracking_enabled:
+        depth_tracking_cfg = _nvinfer_props(dict(depth_tracking_cfg_raw))
+        depth_tracking_name = str(depth_tracking_cfg.get("name", "depth_tracking_fullframe"))
+        depth_tracking = Component(
+            name=depth_tracking_name,
+            element="nvinfer",
+            config=depth_tracking_cfg,
+            downstream=[],
+        )
+        depth_tracking_queue = Component(
+            name="depth_tracking_queue",
+            element="queue",
+            config={"max-size-buffers": 4, "max-size-bytes": 0, "max-size-time": 0},
+            downstream=[depth_tracking.name],
+        )
+        depth_tracking_sink = Component(
+            name=f"{depth_tracking.name}_sink",
+            element="fakesink",
+            config={"sync": False},
+            downstream=[],
+        )
+        pipeline.components[depth_tracking_queue.name] = depth_tracking_queue
+        _safe_add(ds_pipeline, depth_tracking_queue, pipeline.errors)
+        _apply_component_config(ds_pipeline, depth_tracking_queue, pipeline.errors)
+        pipeline.components[depth_tracking.name] = depth_tracking
+        _safe_add(ds_pipeline, depth_tracking, pipeline.errors)
+        _apply_component_config(ds_pipeline, depth_tracking, pipeline.errors)
+        pipeline.components[depth_tracking_sink.name] = depth_tracking_sink
+        _safe_add(ds_pipeline, depth_tracking_sink, pipeline.errors)
+        _apply_component_config(ds_pipeline, depth_tracking_sink, pipeline.errors)
+        depth_tracking.downstream = [depth_tracking_sink.name]
+        tee_downstreams.append(depth_tracking_queue.name)
+
     # Optional full-frame MapAnything branch; allow disabling via YAML (models.mapanything.enable=false)
     mapanything: Optional[Component] = None
     mapanything_sink: Optional[Component] = None
@@ -1025,9 +1053,6 @@ def build_pipeline(yaml_path: str | Path) -> DS8Pipeline:
     sgie_enabled = False
     if isinstance(mapanything_cfg_raw, dict):
         sgie_enabled = bool(mapanything_cfg_raw.get("enable", True)) and bool(mapanything_cfg_raw)
-
-    primary_branch = exclude_component.name if exclude_component is not None else tracker.name
-    tee_downstreams: List[str] = [primary_branch]
 
     if sgie_enabled:
         mapanything_cfg = dict(mapanything_cfg_raw)
@@ -1087,6 +1112,23 @@ def build_pipeline(yaml_path: str | Path) -> DS8Pipeline:
         mapanything_valve.downstream = [mapanything.name]
 
     tee_component.downstream = tee_downstreams
+
+    world_observation_stage = Component(
+        name="world_observation_stage",
+        element="queue",
+        config={"max-size-buffers": 4, "max-size-bytes": 0, "max-size-time": 0},
+        downstream=["tracking_telemetry_stage"],
+    )
+    tracking_telemetry_stage = Component(
+        name="tracking_telemetry_stage",
+        element="queue",
+        config={"max-size-buffers": 4, "max-size-bytes": 0, "max-size-time": 0},
+        downstream=["tiler"],
+    )
+    for stage_component in (world_observation_stage, tracking_telemetry_stage):
+        pipeline.components[stage_component.name] = stage_component
+        _safe_add(ds_pipeline, stage_component, pipeline.errors)
+        _apply_component_config(ds_pipeline, stage_component, pipeline.errors)
 
     # Insert a tiled renderer stage in DS8 path (mosaic). This avoids per-camera branches.
     source_count = len(uris) or 1
@@ -1213,9 +1255,9 @@ def build_pipeline(yaml_path: str | Path) -> DS8Pipeline:
         chain_start.downstream = [chain[0].name]
         for idx in range(len(chain) - 1):
             chain[idx].downstream = [chain[idx + 1].name]
-        chain[-1].downstream = [tiler.name]
+        chain[-1].downstream = [world_observation_stage.name]
     else:
-        chain_start.downstream = [tiler.name]
+        chain_start.downstream = [world_observation_stage.name]
 
     if mapanything is not None:
         mapanything.downstream = [mapanything_sink.name]
@@ -1348,8 +1390,17 @@ def build_pipeline(yaml_path: str | Path) -> DS8Pipeline:
         _safe_link(ds_pipeline, pipeline.errors, src, dst)
 
     if source_nodes:
-        for source_name in source_nodes:
-            _link(source_name, "streammux")
+        for source_name, source_idx in source_nodes:
+            if source_name not in pipeline.components or "streammux" not in pipeline.components:
+                continue
+            _safe_link_with_hints(
+                ds_pipeline,
+                pipeline.errors,
+                source_name,
+                "streammux",
+                "",
+                "sink_%u",
+            )
 
     if preprocess_component is not None:
         _link("streammux", preprocess_component.name)
@@ -1373,6 +1424,14 @@ def build_pipeline(yaml_path: str | Path) -> DS8Pipeline:
             _link(tee_component.name, mapanything.name)
         if mapanything_sink is not None:
             _link(mapanything.name, mapanything_sink.name)
+    if depth_tracking is not None:
+        if depth_tracking_queue is not None:
+            _link(tee_component.name, depth_tracking_queue.name)
+            _link(depth_tracking_queue.name, depth_tracking.name)
+        else:
+            _link(tee_component.name, depth_tracking.name)
+        if depth_tracking_sink is not None:
+            _link(depth_tracking.name, depth_tracking_sink.name)
 
     if analytics is not None:
         _link(tracker.name, analytics.name)
@@ -1386,7 +1445,9 @@ def build_pipeline(yaml_path: str | Path) -> DS8Pipeline:
     if pose is not None:
         _link(chain_start.name, pose.name)
         chain_start = pose
-    _link(chain_start.name, tiler.name)
+    _link(chain_start.name, world_observation_stage.name)
+    _link(world_observation_stage.name, tracking_telemetry_stage.name)
+    _link(tracking_telemetry_stage.name, tiler.name)
 
     _link(tiler.name, osd.name)
     _link(osd.name, sink_tee.name)

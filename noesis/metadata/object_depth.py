@@ -76,6 +76,8 @@ class ObjectDepthResult:
     anchor_uv: Optional[Sequence[float]] = None
     anchor_source: Optional[str] = None
     anchor_depth_m: Optional[float] = None
+    anchor_sample_count: Optional[int] = None
+    anchor_valid_fraction: Optional[float] = None
     world_point: Optional[Sequence[float]] = None
     world_point_depth: Optional[Sequence[float]] = None
     world_point_floor: Optional[Sequence[float]] = None
@@ -117,6 +119,10 @@ class ObjectDepthResult:
         if self.anchor_source is not None:
             object.__setattr__(self, "anchor_source", str(self.anchor_source).strip() or None)
         object.__setattr__(self, "anchor_depth_m", _coerce_optional_float(self.anchor_depth_m))
+        if self.anchor_sample_count is not None:
+            object.__setattr__(self, "anchor_sample_count", max(0, int(self.anchor_sample_count)))
+        if self.anchor_valid_fraction is not None:
+            object.__setattr__(self, "anchor_valid_fraction", max(0.0, min(1.0, float(self.anchor_valid_fraction))))
         object.__setattr__(self, "world_point", _coerce_optional_point3(self.world_point))
         object.__setattr__(self, "world_point_depth", _coerce_optional_point3(self.world_point_depth))
         object.__setattr__(self, "world_point_floor", _coerce_optional_point3(self.world_point_floor))
@@ -163,6 +169,8 @@ class ObjectDepthResult:
             "anchor_uv": list(self.anchor_uv) if self.anchor_uv is not None else None,
             "anchor_source": self.anchor_source,
             "anchor_depth_m": self.anchor_depth_m,
+            "anchor_sample_count": self.anchor_sample_count,
+            "anchor_valid_fraction": self.anchor_valid_fraction,
             "world_point": list(self.world_point) if self.world_point is not None else None,
             "world_point_depth": list(self.world_point_depth) if self.world_point_depth is not None else None,
             "world_point_floor": list(self.world_point_floor) if self.world_point_floor is not None else None,

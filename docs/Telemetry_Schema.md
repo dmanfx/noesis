@@ -1,5 +1,5 @@
 # Telemetry Schema (DS8)
-_Status: validated against code on 2026-02-22._
+_Status: validated against code on 2026-03-16._
 
 Canonical WebSocket payloads live in `docs/DS8_api_contracts_ws.md`. This page summarizes **where** telemetry is produced in the DS8 stack and the exact field sets emitted today. Older telemetry descriptions are archived under `docs/history/`.
 
@@ -42,7 +42,7 @@ Canonical WebSocket payloads live in `docs/DS8_api_contracts_ws.md`. This page s
         "status": "running"|"unknown",
         "tracking": {
           "occupancy": {"<zone>": <int>, ...},
-          "active_tracks": [ /* internal diagnostic only */ ],
+          "active_tracks": [ /* same per-track shape as tracking.tracks[] for the current camera */ ],
           "transitions": [ /* line/zone transitions */ ]
         },
         "latency_ms": { /* present when NVDS latency enabled */ }
@@ -64,6 +64,13 @@ Emitted once per frame per source. Only **people** tracks (class_id=0) are publi
 {
   "type": "tracking",
   "source_id": <int>,
+  "camera_id": "<camera>",
+  "coord_space": "<string>",
+  "units": "<string>",
+  "world_source": "backend_world_fused",
+  "track_id_strategy": "camera_tracker_fallback",
+  "calibration_version": "<string>",
+  "tracking_contract_version": 3,
   "tracks": [
     {
       "stable_id": <int>,
@@ -84,15 +91,36 @@ Emitted once per frame per source. Only **people** tracks (class_id=0) are publi
       "image_base": [<float u>, <float v>],
       "world": [<float x>, <float y>, <float z>],
       "world_valid": <bool>,
+      "world_quality": "good"|"estimated"|"invalid",
+      "world_quality_reason": "<string|null>",
       "world_frame": "menon_scene"|"camera_local"|null,
-      "world_source": "bbox3d"|"ray_floor"|null
+      "world_source": "bbox3d"|"pose_depth_fused"|"pose_floor_only"|"person_anchor_depth_fused"|"person_anchor_floor_only"|"gravity_drop"|"anchor_hold"|null,
+      "depth_status": "<string|null>",
+      "depth_anchor_source": "<string|null>",
+      "depth_anchor_m": <float|null>,
+      "depth_used_m": <float|null>,
+      "depth_registered_m": <float|null>,
+      "depth_registration_status": "<string|null>",
+      "depth_registration_id": "<string|null>",
+      "depth_center_m": <float|null>,
+      "depth_median_m": <float|null>,
+      "depth_sample_count": <int|null>,
+      "depth_valid_fraction": <float|null>,
+      "depth_anchor_sample_count": <int|null>,
+      "depth_anchor_valid_fraction": <float|null>
     }
   ]
 }
 ```
 
 - `stable_id` is always present for people tracks; `track_id` is never exposed.
-- `world`/`bbox3d` fields appear only when V3DT/SV3DT metadata is available (tracker config under `config/v3dt/`).
+- Top-level `world_source="backend_world_fused"` means the backend owns the canonical baseline world estimator; per-track `world_source` records which observation path updated that track on the current frame.
+- In baseline non-`v3dt` mode, `world` is produced by the backend person-anchor+DAv2 fused estimator: pose-derived anchor when available, otherwise the person mask/depth anchor from `NOESIS.OBJECT_DEPTH.anchor_uv`. In `v3dt` mode, `world_source="bbox3d"` continues to come from tracker 3D metadata.
+- `depth_used_m` is the DAv2 anchor depth that actually contributed to the fused baseline world update on that frame; `depth_anchor_m` remains the raw anchor carried by `NOESIS.OBJECT_DEPTH`.
+- `depth_registered_m` is the room-registered DAv2 anchor depth after applying the offline DAv2->MapAnything mapping for that camera; this is the value the estimator projects when registration is active.
+- `depth_registration_status` and `depth_registration_id` make the registration path observable on both tracks and active-tracks without changing the raw `NOESIS.OBJECT_DEPTH` payload semantics.
+- `depth_anchor_sample_count` and `depth_anchor_valid_fraction` describe the support of the specific lower-body / torso anchor band that drove the fused update; they are more authoritative than whole-mask support when diagnosing why a far-camera track fused depth or stayed floor-only.
+- `stats.payload.cameras[*].tracking.active_tracks[]` mirrors the same depth-registration fields for the current camera, and the runtime OSD `z=` label uses `depth_used_m` / registered depth rather than raw `depth_anchor_m`.
 
 ## Depth Payload (type: `depth_result`)
 
@@ -114,6 +142,9 @@ Published per MapAnything inference result via `DepthResult.to_dict()`:
 }
 ```
 
+- This full-frame `depth_result` contract remains MapAnything-specific. The always-on DAv2 tracking lane does not publish a second full-frame depth message; it contributes through `NOESIS.OBJECT_DEPTH` and the fused tracking world update.
+- Baseline non-`v3dt` startup also requires a read-only depth-registration artifact (`config/depth_registration.json` by default, overridable via `depth_registration.path` in `infer.yaml` or `--depth-registration-config`). That artifact is loaded before activation and is not generated automatically by the runtime.
+
 ## BEV Payload (type: `bev-frame`)
 
 ```json
@@ -127,18 +158,27 @@ Published per MapAnything inference result via `DepthResult.to_dict()`:
   "xMin": <float>, "xMax": <float>,
   "zMin": <float>, "zMax": <float>,
   "overlay": <bool>,
-  "footpoints": [ {"x": <float>, "y": <float>, "method": "bbox"|"sv3dt", "stableId": <int|null>, "trackerId": <int|null>} ],
+  "footpoints": [ {"x": <float>, "y": <float>, "method": "bbox"|"image_foot"|"image_base"|"<string>", "stableId": <int|null>, "trackerId": <int|null>, "displaySource": "world"|"world_to_camera_local"|"image_anchor"|"image_depth_anchor"} ],
   "H": [<9 floats>],
   "sampleXZ": [<float x>, <float z>] | null,
-  "world_frame": "menon_scene"|"camera_local",
+  "frame": "backend_world_m"|"camera_local_ground_m",
+  "world_frame": "backend_world_m"|"camera_local_ground_m",
   "frame_mode": "world"|"camera_local",
-  "units": "scene",
-  "s_obj_to_m": <float>
+  "units": "meters",
+  "s_obj_to_m": <float>,
+  "trail_smoothing_owner": "frontend"|"backend"|"none",
+  "bev_points_smoothed": <bool>,
+  "bev_world_points_smoothed": <bool>
 }
 ```
 
 - Optional JPEG binary follows the framing `[len(header)] [header="bev:<camera>"] [JPEG bytes]` when `bev.jpeg_enabled=true` or `NOESIS_BEV_JPEG_ENABLED=1`.
 - Footpoints use `stableId` when available; `trackerId` may be present as a debug/fallback identity key (not stable across restarts).
+- The primary inline floorplan BEV uses `frame=camera_local_ground_m`; `footpoints[].x` is local X and `footpoints[].y` is local Z in meters so tracks are drawn in the same coordinate frame as MapAnything floorplan rasters.
+- `displaySource=image_depth_anchor` indicates a camera-local X/Z point unprojected from the image anchor and MapAnything-registered fused depth, matching the floorplan depth-unprojection basis. When depth registration rejects a sample, BEV display does not use raw object depth for the floorplan overlay.
+- In world mode, BEV head points are the canonical backend `track.world` positions and are not low-pass filtered a second time inside `BevRenderer`.
+- `trail_smoothing_owner="backend"` with `bev_world_points_smoothed=false` is valid and expected in the baseline world-mode path: the backend owns trail history, while the canonical per-track world estimator in `hooks.py` already owns the only track-position smoothing stage.
+- World-mode BEV skips `anchor_hold` head points and trail samples so stale held positions do not render as drifting or out-of-bounds trails during brief occlusions.
 
 ## Related Docs
 

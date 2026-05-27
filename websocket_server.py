@@ -69,7 +69,7 @@ class WebSocketServer:
         self._depth_rate_limit_window = 0.5  # seconds per camera/client
         self._floorplan_rate_limit_window = 2.0
         self._depth_rpc_timeout = 4.0  # seconds
-        self._floorplan_rpc_timeout = 6.0
+        self._floorplan_rpc_timeout = 15.0
         self._tracker_prune_window = 30.0
         # Optional calibration + RPC callbacks
         self.calibration_getter: Optional[Callable[[], Dict[str, Any]]] = None

@@ -18,7 +18,7 @@ type LocalGroundPoint = { x: number; y: number };
 
 export const isWorldFrame = (frame?: string): boolean => {
   const value = String(frame || '').toLowerCase().trim();
-  return value === 'world' || value === 'global' || value === 'menon_scene' || value === 'world_frame';
+  return value === 'world' || value === 'global' || value === 'menon_scene' || value === 'world_frame' || value === 'backend_world_m';
 };
 
 export const isCameraLocalFrame = (frame?: string): boolean => {
@@ -36,10 +36,14 @@ export const resolveBevFrameModeFromPayload = (
   const worldFrame = String(payload.world_frame || '').trim().toLowerCase();
   if (!frameMode && !frame && !worldFrame) return fallback;
   if (frameMode === 'world') return 'world';
-  if (frameMode === 'camera_local_legacy') return 'camera_local_legacy';
+  if (frameMode === 'camera_local_legacy' || frameMode === 'camera_local' || frameMode.includes('camera_local')) {
+    return 'camera_local_legacy';
+  }
   if (frame === 'world') return 'world';
+  if (isCameraLocalFrame(frame)) return 'camera_local_legacy';
   if (worldFrame === 'world') return 'world';
-  if (worldFrame === 'menon_scene' || worldFrame === 'global') return 'world';
+  if (isCameraLocalFrame(worldFrame)) return 'camera_local_legacy';
+  if (worldFrame === 'menon_scene' || worldFrame === 'global' || worldFrame === 'backend_world_m') return 'world';
   return 'camera_local_legacy';
 };
 

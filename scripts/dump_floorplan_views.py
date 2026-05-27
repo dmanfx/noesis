@@ -475,7 +475,12 @@ def main() -> int:
     parser.add_argument("--offline-floorplan", action="store_true", help="Compute floorplan locally from ma_depth_response + config instead of calling get_floorplan over WS")
     parser.add_argument("--floorplan-timeout-s", type=float, default=180.0, help="Timeout per floorplan RPC (seconds)")
     parser.add_argument("--depth-timeout-s", type=float, default=60.0, help="Timeout for MapAnything depth RPC (seconds)")
-    parser.add_argument("--no-flip", action="store_true", help="Do not apply image_flip from the payload")
+    parser.add_argument(
+        "--apply-image-flip",
+        action="store_true",
+        help="Legacy debug option: reapply the diagnostic image_flip hint onto floorplan grids.",
+    )
+    parser.add_argument("--no-flip", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument(
         "--depth-ts-max-us",
         type=int,
@@ -807,7 +812,7 @@ def main() -> int:
                 continue
 
             image_flip = resp.get("image_flip") if isinstance(resp.get("image_flip"), dict) else {}
-            do_flip = not bool(args.no_flip)
+            do_flip = bool(args.apply_image_flip) and not bool(args.no_flip)
 
             def _get_layer(name: str) -> Optional[np.ndarray]:
                 layer = resp.get(name)

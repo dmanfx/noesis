@@ -1,46 +1,136 @@
 # MapAnything Depth (DS8)
-_Status: validated against code on 2026-02-02._
+_Status: validated against code on 2026-03-16._
 
-DS8 runs MapAnything as a **full-frame SGIE** inside the Service Maker pipeline. The older microservice/adapter flow is archived under `docs/history/`.
+MapAnything is still a first-class DS8 depth component, but it is no longer the
+only depth-related path in the runtime.
 
-## Tooling
-- **Heatmap viewer (3‑stream):** `docs/MapAnything_Heatmap_Viewer.md` (script: `scripts/ma_heatmap_multiuri.py`)
+## Roles
 
-## Pipeline Topology
-- Branch: `main_tee → mapanything_queue → mapanything_valve → mapanything_fullframe (nvinfer) → fakesink`.
-- Config source: `config/infer.yaml` (`models.mapanything.*`). Default `gie_id=2`, `attach_tensor_meta=true`, `batch_size=3`.
-- Valve gating: `mapanything_valve.drop` is toggled by `DS8Pipeline.mark_depth_enabled()`.
-  - REST: `GET /api/v1/depth/refresh?seconds=N` (see `noesis/server/depth_api.py`).
-  - WebSocket: `get_ma_depth` RPC triggers a short gate-open burst (`NOESIS_DEPTH_RPC_ENABLE_SECONDS`, default 2s).
-  - Startup: optional prime via `NOESIS_DEPTH_ENABLE_SECONDS` CLI/env (defaults to 0 = closed).
+DS8 currently uses two distinct depth lanes:
 
-## Postprocess & Storage
-- Processor: `MapAnythingProcessor` (`noesis/pipelines/hooks.py`), attached only when `NOESIS_MAPANYTHING_POSTPROCESS_ENABLED` is truthy (default `1`).
-- Tensor decode: expects DS8 `TensorOutputUserMetadata`; converts layers to numpy (DLPack via torch).
-- Alignment: depth/conf/mask are letterboxed to the source frame size.
-- Storage: `geometry/depth_source.DepthStorageManager` (configured via `mapanything_config.load_service_config()`), defaults:
-  - Base path: `data/depth`
-  - Max snapshots per camera: `service.storage.max_snapshots_per_camera`
-  - Retention: `service.storage.snapshot_retention_minutes`
-  - Async writes enabled unless `storage.async_enabled` is false.
-- Telemetry: publishes `DepthResult` (see `docs/DS8_metadata_contracts.md`).
+- `models.mapanything`
+  - Full-frame SGIE branch in the live DS8 pipeline.
+  - On-demand and gate-controlled.
+  - Owns the `depth_result` WebSocket payload and `get_ma_depth` RPC contract.
+  - Persists dense full-frame snapshots under `data/depth/...`.
+- `models.depth_tracking`
+  - Full-frame Depth Anything V2 metric lane used by baseline non-`v3dt`
+    world tracking.
+  - Always on in baseline mode.
+  - Does not publish a second full-frame depth WebSocket stream.
+  - Contributes through `NOESIS.OBJECT_DEPTH` and the fused backend world
+    estimator in `noesis/pipelines/hooks.py`.
 
-## Depth Retrieval (WebSocket RPC)
-- Handler: `noesis/ds8_runtime._ds8_ma_depth_provider` → registered as `WebSocketServer.ma_depth_provider` (`get_ma_depth`).
-- Response: `ma_depth_response` with fields `camera`, `request_id`, `served_from_cache`, `ts_us`, `ok`, optional `error`, and `payload` containing `depth_b64`, `conf_b64`, `mask_b64`, `shape`.
-- Cache behavior:
-  - If `ts_max_us` is provided, the freshest snapshot **at or before** that timestamp is returned.
-  - Otherwise, the latest snapshot is returned; if MapAnything is gated off, a refresh window is opened (`enable_depth`) and the RPC waits up to ~3s for a newer snapshot.
-- Normals: optional attachment when `NOESIS_MAPANYTHING_NORMALS_ENABLE=1` (default). Space and dtype can be set via `NOESIS_MAPANYTHING_NORMALS_SPACE` (`camera`|`world`, default `camera`) and `NOESIS_MAPANYTHING_NORMALS_DTYPE` (`float16` default).
+MapAnything also acts as the offline reference source for the DAv2 room
+registration artifact used by baseline tracking.
 
-## Depth Telemetry (always-on)
-- `DepthResult` telemetry is emitted for every MapAnything inference when the gate is open. Payload fields are `source_id`, `frame_id`, `ts` (epoch seconds), `width`, `height`, `depth_map_ref`, `minmax`, `unit="m"`.
+## Runtime Topology
 
-## Gating Notes
-- If DS8 bindings lack `BufferOperator`, `depth_gate_supported` is false; the logical flag still tracks enable/disable, but SGIE work may continue. A warning is pushed to `pipeline.errors` in this case.
-- Valve priming on activation: when the valve exists and depth is initially disabled, DS8 keeps it open briefly (`NOESIS_MAPANYTHING_GATE_PRIME_SECONDS`, default 1.0) to avoid preroll stalls.
+MapAnything stays on its own DS8 branch:
+
+- `main_tee -> mapanything_queue -> mapanything_valve -> mapanything_fullframe -> mapanything_fullframe_sink`
+
+Config source:
+
+- `config/infer.yaml`
+- `models.mapanything.*`
+- default `gie_id=2`
+
+Gate control:
+
+- REST: `GET /api/v1/depth/refresh?seconds=N`
+- WebSocket RPC: `get_ma_depth` can open a short refresh window
+- Runtime: `DS8Pipeline.mark_depth_enabled()` controls `mapanything_valve.drop`
+
+The gate applies only to MapAnything. It does not control the always-on baseline
+DAv2 tracking lane.
+
+## Postprocess, Storage, and RPC
+
+Live MapAnything processing is owned by `MapAnythingProcessor` in
+`noesis/pipelines/hooks.py`.
+
+Responsibilities:
+
+- decode MapAnything tensor outputs
+- align depth/conf/mask to camera frame geometry
+- store dense snapshots through `geometry.depth_source.DepthStorageManager`
+- publish `DepthResult`
+- serve `get_ma_depth` via the runtime provider path
+
+The full-frame `depth_result` and `ma_depth_response` contracts remain
+MapAnything-specific. They are not reused for the baseline DAv2 tracking lane.
+
+## Offline DAv2 -> MapAnything Registration
+
+Baseline non-`v3dt` world tracking now requires a prebuilt registration artifact
+that maps raw DAv2 anchor range into MapAnything-aligned room range.
+
+Canonical pieces:
+
+- builder: [build_depth_registration.py](/home/mayor/Noesis_Devel/scripts/build_depth_registration.py)
+- artifact: [depth_registration.json](/home/mayor/Noesis_Devel/config/depth_registration.json)
+- schema/loader: [depth_registration.py](/home/mayor/Noesis_Devel/noesis/calibration/depth_registration.py)
+- fitter: [depth_registration_builder.py](/home/mayor/Noesis_Devel/noesis/calibration/depth_registration_builder.py)
+
+Operational rules:
+
+- The artifact is generated offline and loaded read-only by DS8 at startup.
+- DS8 does not auto-generate, auto-refresh, or auto-download this artifact.
+- Missing or stale entries are a fatal startup error in baseline mode.
+- Empty-room RTSP captures are preferred, but the builder now filters samples to
+  temporally stable pixels so minor/static occupancy does not automatically
+  poison the fit.
+
+Typical workflow:
+
+```bash
+bash services/mapanything_svc/run.sh
+env CUDA_VISIBLE_DEVICES='' python3 scripts/build_depth_registration.py \
+  --output config/depth_registration.json
+timeout 25s python3 noesis/ds8_runtime.py --pgie-profile yolo26_seg --size s --disable-rest
+```
+
+The builder uses live RTSP sources from `config/infer.yaml` by default.
+
+## MapAnything Service Notes
+
+The local MapAnything service is still an active tool for offline registration
+work. The deprecated part is the old live-runtime microservice/adapter depth
+path; the canonical runtime depth path is the DS8 SGIE branch.
+
+Current service ownership:
+
+- startup script: `services/mapanything_svc/run.sh`
+- app: `services/mapanything_svc/server.py`
+- weight pin: `docs/ma-integration/weights.sha`
+
+The service is primarily used to produce reference dense depth for registration
+builds, not to replace the DS8 in-pipeline MapAnything branch.
+
+## What MapAnything Does Not Own
+
+MapAnything is not the canonical owner of baseline person world tracking.
+
+It does not:
+
+- own `track.world` in baseline mode
+- emit `NOESIS.OBJECT_DEPTH`
+- replace the pose-first anchor chain
+- act as a runtime fallback for missing DAv2 registration
+
+Baseline room-relative tracking remains:
+
+- pose-first anchor authority
+- DAv2 object depth on the same pose ray
+- optional offline DAv2 -> MapAnything registration correction
+- one fused backend world estimator
 
 ## Quick Validation
-- Ensure `mapanything_valve` exists in the built pipeline (`ds8_pipeline.build_pipeline` should set `pipeline.valve_name`).
-- Run `python3 scripts/ma_depth_rpc_smoke_test.py --no-spawn` with DS8 runtime active; expect `ma_depth_response.ok=true` and `served_from_cache` to flip between true/false depending on recent activity.
-- Confirm depth snapshots written under `data/depth/<camera>/` and `DepthResult` telemetry flowing on the WebSocket stream.
+
+- `python3 scripts/ma_depth_rpc_smoke_test.py --no-spawn`
+  - validates live `ma_depth_response`
+- `python3 scripts/build_depth_registration.py --help`
+  - validates builder surface
+- `timeout 25s python3 noesis/ds8_runtime.py --pgie-profile yolo26_seg --size s --disable-rest`
+  - proves DS8 can start with the current registration artifact

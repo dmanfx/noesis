@@ -23,6 +23,12 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 import numpy as np
 
 from noesis.metadata.intrinsics import CameraConfigLoader, CameraIntrinsics
+from noesis.calibration.pose_v1 import (
+    E_col_major_to_pose_v1,
+    POSE_V1_FRAME_BACKEND_WORLD_M,
+    normalize_pose_v1 as _normalize_pose_v1,
+    pose_to_E_col_major as _pose_to_E_col_major,
+)
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -161,66 +167,112 @@ def _validate_align_matrix(matrix: List[float]) -> None:
         raise CalibrationValidationError(f"align.matrix is singular (det={det:.2e})")
 
 
-def _normalize_pose_v1(raw_pose: Any) -> Optional[Dict[str, Any]]:
-    if not isinstance(raw_pose, dict):
-        return None
-    position = raw_pose.get("position")
-    ypr = raw_pose.get("yaw_pitch_roll_deg")
-    rotation_order = str(raw_pose.get("rotation_order") or "").strip().upper()
-    frame = str(raw_pose.get("frame") or "").strip()
-    if not (isinstance(position, list) and len(position) == 3):
-        return None
-    if not (isinstance(ypr, list) and len(ypr) == 3):
-        return None
-    try:
-        position_f = [float(position[0]), float(position[1]), float(position[2])]
-        ypr_f = [float(ypr[0]), float(ypr[1]), float(ypr[2])]
-    except Exception:
-        return None
-    if not all(math.isfinite(v) for v in (position_f + ypr_f)):
-        return None
-    if rotation_order != "YXZ":
-        return None
-    if frame != "menon_scene":
-        return None
-    out: Dict[str, Any] = {
-        "position": position_f,
-        "yaw_pitch_roll_deg": ypr_f,
-        "rotation_order": "YXZ",
-        "frame": "menon_scene",
-    }
-    source = raw_pose.get("source")
-    if isinstance(source, str) and source.strip():
-        out["source"] = source.strip()
+def _col_major_to_row_major(values: List[float]) -> List[float]:
+    matrix = np.array(values, dtype=np.float64).reshape((4, 4), order="F")
+    return [float(x) for x in matrix.reshape(-1)]
+
+
+def _row_major_to_col_major(values: List[float]) -> List[float]:
+    matrix = np.array(values, dtype=np.float64).reshape((4, 4))
+    return [float(x) for x in matrix.flatten(order="F")]
+
+
+def _extract_similarity_scale(matrix_row_major: List[float]) -> float:
+    mat = np.array(matrix_row_major, dtype=np.float64).reshape((4, 4))
+    basis = mat[:3, :3]
+    det = float(np.linalg.det(basis))
+    if not math.isfinite(det):
+        return 1.0
+    scale = abs(det) ** (1.0 / 3.0)
+    if not math.isfinite(scale) or scale <= 1e-9:
+        return 1.0
+    return float(scale)
+
+
+def _normalize_scene_similarity_payload(payload: Any) -> Dict[str, Any]:
+    if not isinstance(payload, dict):
+        raise CalibrationValidationError("scene_similarity must be a mapping")
+
+    out: Dict[str, Any] = {}
+    col_major = payload.get("world_to_scene_col_major")
+    row_major = payload.get("matrix_row_major") or payload.get("world_to_scene_row_major")
+
+    if isinstance(col_major, list) and len(col_major) == 16:
+        col_values = [float(x) for x in col_major]
+        row_values = _col_major_to_row_major(col_values)
+    elif isinstance(row_major, list) and len(row_major) == 16:
+        row_values = [float(x) for x in row_major]
+        col_values = _row_major_to_col_major(row_values)
+    else:
+        raise CalibrationValidationError("scene_similarity requires a 4x4 transform")
+
+    _validate_align_matrix(row_values)
+    out["world_to_scene_col_major"] = col_values
+    out["matrix_row_major"] = row_values
+
+    for key in ("source", "residual_units"):
+        value = payload.get(key)
+        if isinstance(value, str) and value.strip():
+            out[key] = value.strip()
+
+    for key in ("camera_count", "sample_count"):
+        value = payload.get(key)
+        if value is None:
+            continue
+        try:
+            parsed = int(value)
+        except Exception as exc:
+            raise CalibrationValidationError(f"scene_similarity.{key} must be an integer") from exc
+        out[key] = parsed
+
+    for key in ("mean_residual", "max_residual", "position_rmse_scene_units", "scene_per_m", "s_obj_to_m"):
+        value = payload.get(key)
+        if value is None:
+            continue
+        try:
+            parsed = float(value)
+        except Exception as exc:
+            raise CalibrationValidationError(f"scene_similarity.{key} must be numeric") from exc
+        if not math.isfinite(parsed):
+            raise CalibrationValidationError(f"scene_similarity.{key} must be finite")
+        out[key] = parsed
+
+    if "scene_per_m" not in out:
+        out["scene_per_m"] = _extract_similarity_scale(row_values)
+    if "s_obj_to_m" not in out:
+        scene_per_m = float(out.get("scene_per_m", 1.0) or 1.0)
+        out["s_obj_to_m"] = float(1.0 / scene_per_m) if scene_per_m > 1e-9 else 1.0
+
+    rotation = payload.get("rotation_row_major")
+    if isinstance(rotation, list) and len(rotation) == 9:
+        out["rotation_row_major"] = [float(x) for x in rotation]
+
+    correspondences = payload.get("correspondences")
+    if isinstance(correspondences, list):
+        normalized_corr = []
+        for item in correspondences:
+            if not isinstance(item, dict):
+                continue
+            corr: Dict[str, Any] = {}
+            camera_id = item.get("camera_id")
+            if isinstance(camera_id, str) and camera_id.strip():
+                corr["camera_id"] = camera_id.strip()
+            for coord_key in ("world_position_m", "scene_position"):
+                coord_value = item.get(coord_key)
+                if isinstance(coord_value, list) and len(coord_value) == 3:
+                    corr[coord_key] = [float(x) for x in coord_value]
+            residual = item.get("residual_scene_units", item.get("residual"))
+            if residual is not None:
+                try:
+                    corr["residual_scene_units"] = float(residual)
+                except Exception:
+                    pass
+            if corr:
+                normalized_corr.append(corr)
+        if normalized_corr:
+            out["correspondences"] = normalized_corr
+
     return out
-
-
-def _pose_to_E_col_major(pose: Dict[str, Any]) -> Optional[List[float]]:
-    norm = _normalize_pose_v1(pose)
-    if not norm:
-        return None
-    try:
-        yaw_deg, pitch_deg, roll_deg = norm["yaw_pitch_roll_deg"]
-        yaw = math.radians(float(yaw_deg))
-        pitch = math.radians(float(pitch_deg))
-        roll = math.radians(float(roll_deg))
-
-        cy, sy = math.cos(yaw), math.sin(yaw)
-        cx, sx = math.cos(pitch), math.sin(pitch)
-        cz, sz = math.cos(roll), math.sin(roll)
-
-        Ry = np.array([[cy, 0.0, sy], [0.0, 1.0, 0.0], [-sy, 0.0, cy]], dtype=np.float64)
-        Rx = np.array([[1.0, 0.0, 0.0], [0.0, cx, -sx], [0.0, sx, cx]], dtype=np.float64)
-        Rz = np.array([[cz, -sz, 0.0], [sz, cz, 0.0], [0.0, 0.0, 1.0]], dtype=np.float64)
-        R_wc = Ry @ Rx @ Rz
-
-        Twc = np.eye(4, dtype=np.float64)
-        Twc[:3, :3] = R_wc
-        Twc[:3, 3] = np.array(norm["position"], dtype=np.float64)
-        E = np.linalg.inv(Twc)
-        return [float(x) for x in E.flatten(order="F")]
-    except Exception:
-        return None
 
 
 # ---------------------------------------------------------------------------
@@ -261,10 +313,12 @@ class CalibrationManager:
         self._align: Dict[str, Any] = {}
         self._camera_labels: Dict[int, str] = {}  # source_id -> camera_name
         self._bundle_cache: Optional[Dict[str, Any]] = None
+        pose_only_env = str(os.environ.get("NOESIS_CALIBRATION_POSE_ONLY", "1") or "").strip().lower()
+        self._pose_only = pose_only_env in ("1", "true", "yes", "on", "y")
 
         # Load initial data
-        self._load_extrinsics()
         self._load_alignment()
+        self._load_extrinsics()
 
         # Optional callback for derived artifact regeneration (V3DT camInfo)
         self._on_extrinsics_changed: Optional[Callable[[str], None]] = None
@@ -279,9 +333,76 @@ class CalibrationManager:
             self._camera_labels = dict(labels or {})
             self._bundle_cache = None
 
+    def pose_only_enabled(self) -> bool:
+        return bool(self._pose_only)
+
+    def extrinsics_path(self) -> Path:
+        return Path(self._camera_calibration_path)
+
+    def alignment_path(self) -> Path:
+        return Path(self._ply_alignment_path)
+
+    def alignment_data(self) -> Dict[str, Any]:
+        with self._lock:
+            data = {
+                "matrix": [float(x) for x in list(self._align.get("matrix") or [])],
+                "floor_y": float(self._align.get("floor_y", 0.0) or 0.0),
+                "units": dict(self._align.get("units") or {}),
+            }
+            if isinstance(self._align.get("scene_similarity"), dict):
+                data["scene_similarity"] = dict(self._align["scene_similarity"])
+            return data
+
     def set_on_extrinsics_changed(self, callback: Optional[Callable[[str], None]]) -> None:
         """Set callback to invoke when extrinsics change (for V3DT camInfo regeneration)."""
         self._on_extrinsics_changed = callback
+
+    def validate_pose_coverage(self) -> Dict[str, str]:
+        errors: Dict[str, str] = {}
+        with self._lock:
+            camera_ids = sorted({name for name in self._camera_labels.values() if isinstance(name, str) and str(name).strip()})
+            if not camera_ids:
+                return errors
+            cams = self._extrinsics.get("cameras", {}) if isinstance(self._extrinsics, dict) else {}
+            try:
+                floor_y = float(self._align.get("floor_y", 0.0) or 0.0)
+            except Exception:
+                floor_y = 0.0
+            for camera_id in camera_ids:
+                entry = cams.get(camera_id)
+                if not isinstance(entry, dict):
+                    errors[camera_id] = "missing_camera_entry"
+                    continue
+                pose = entry.get("pose")
+                if not isinstance(pose, dict):
+                    errors[camera_id] = "missing_or_invalid_pose"
+                    continue
+                E = entry.get("E")
+                if not (isinstance(E, list) and len(E) == 16):
+                    errors[camera_id] = "pose_to_extrinsics_failed"
+                    continue
+                try:
+                    Emat = np.array(E, dtype=np.float64).reshape((4, 4), order="F")
+                    Twc = np.linalg.inv(Emat)
+                    C_world = Twc[:3, 3].copy()
+                    if not np.all(np.isfinite(C_world)):
+                        errors[camera_id] = "non_finite_camera_center"
+                        continue
+                    if float(C_world[1]) <= float(floor_y) + 1e-3:
+                        errors[camera_id] = "camera_not_above_floor"
+                        continue
+                    R_wc = Twc[:3, :3].copy()
+                    forward = R_wc @ np.array([0.0, 0.0, 1.0], dtype=np.float64)
+                    denom = float(forward[1])
+                    if abs(denom) < 1e-6:
+                        errors[camera_id] = "camera_forward_parallel_to_floor"
+                        continue
+                    t_hit = (float(floor_y) - float(C_world[1])) / denom
+                    if t_hit <= 0.0:
+                        errors[camera_id] = "camera_forward_misses_floor"
+                except Exception:
+                    errors[camera_id] = "invalid_pose_geometry"
+        return errors
 
     # -----------------------------------------------------------------------
     # Public API: Reload
@@ -297,6 +418,7 @@ class CalibrationManager:
         """Reload alignment from ply_alignment.json."""
         with self._lock:
             self._load_alignment()
+            self._load_extrinsics()
             self._bundle_cache = None
 
     def reload_intrinsics(self) -> None:
@@ -307,9 +429,11 @@ class CalibrationManager:
 
     def reload_all(self) -> None:
         """Reload all calibration data."""
-        self.reload_intrinsics()
-        self.reload_extrinsics()
-        self.reload_alignment()
+        with self._lock:
+            self._intrinsics_loader.invalidate()
+            self._load_alignment()
+            self._load_extrinsics()
+            self._bundle_cache = None
 
     # -----------------------------------------------------------------------
     # Public API: Snapshot
@@ -348,10 +472,7 @@ class CalibrationManager:
                 return None
 
             floor_y = float(self._align.get("floor_y", 0.0) or 0.0)
-            try:
-                unit_scale = float((self._align.get("units") or {}).get("s_obj_to_m", 1.0))
-            except Exception:
-                unit_scale = 1.0
+            unit_scale = 1.0
 
             return CalibrationSnapshot(
                 camera_id=camera_id,
@@ -382,10 +503,6 @@ class CalibrationManager:
 
             units = self._align.get("units") or {}
             s_obj_to_m = float(units.get("s_obj_to_m", 1.0) or 1.0)
-            scene_per_m = 1.0
-            if math.isfinite(s_obj_to_m) and s_obj_to_m > 1e-6:
-                scene_per_m = 1.0 / s_obj_to_m
-
             for src_id, cam_name in self._camera_labels.items():
                 # Intrinsics
                 intr = self._intrinsics_loader.get(src_id)
@@ -397,15 +514,7 @@ class CalibrationManager:
                 # Extrinsics
                 E = self._get_E(cam_name)
                 if E is not None:
-                    # WS bundle exposes native scene units for client-side rigid transforms.
-                    if abs(scene_per_m - 1.0) > 1e-9 and len(E) == 16:
-                        scaled = list(E)
-                        scaled[12] = float(scaled[12]) * scene_per_m
-                        scaled[13] = float(scaled[13]) * scene_per_m
-                        scaled[14] = float(scaled[14]) * scene_per_m
-                        e_table[cam_name] = scaled
-                    else:
-                        e_table[cam_name] = list(E)
+                    e_table[cam_name] = list(E)
                 pose = self._get_pose(cam_name)
                 if isinstance(pose, dict):
                     pose_table[cam_name] = dict(pose)
@@ -430,12 +539,18 @@ class CalibrationManager:
                     "pose_confidence": {},
                 },
                 "meta": {
-                    "version": 2,
+                    "version": 3,
                     "conventions": {"E": "world→camera", "handedness": "RH", "up": "Y"},
-                    "units": {"coords": "scene", "scene_per_m": float(scene_per_m)},
+                    "coord_space": POSE_V1_FRAME_BACKEND_WORLD_M,
+                    "units": "meters",
+                    "world_frame": POSE_V1_FRAME_BACKEND_WORLD_M,
+                    "scene_per_m": float(1.0 / s_obj_to_m) if math.isfinite(s_obj_to_m) and s_obj_to_m > 1e-9 else 1.0,
                 },
                 "metric_scale": 1.0,
             }
+
+            if isinstance(self._align.get("scene_similarity"), dict):
+                bundle["align"]["scene_similarity"] = dict(self._align["scene_similarity"])
 
             self._bundle_cache = bundle
             return dict(bundle)
@@ -554,6 +669,7 @@ class CalibrationManager:
         camera_id: str,
         E: Optional[List[float]] = None,
         Twc: Optional[List[float]] = None,
+        pose: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """Persist extrinsics for a camera. Accepts E (world->camera) or Twc (camera->world).
 
@@ -566,7 +682,18 @@ class CalibrationManager:
         E_to_save: Optional[List[float]] = None
         raw_payload: Dict[str, Any] = {}
         raw_kind = "unknown"
-        if E is not None and isinstance(E, list) and len(E) == 16:
+        preferred_pose: Optional[Dict[str, Any]] = None
+        if pose is not None:
+            preferred_pose = _normalize_pose_v1(pose)
+            if preferred_pose is None:
+                return {"ok": False, "error": "pose_invalid"}
+            E_pose = _pose_to_E_col_major(preferred_pose, align_data=self._align)
+            if not (isinstance(E_pose, list) and len(E_pose) == 16):
+                return {"ok": False, "error": "pose_to_extrinsics_failed"}
+            E_to_save = [float(x) for x in E_pose]
+            raw_payload = {"pose": dict(preferred_pose)}
+            raw_kind = "pose"
+        elif E is not None and isinstance(E, list) and len(E) == 16:
             E_to_save = [float(x) for x in E]
             raw_payload = {"E": list(E)}
             raw_kind = "E"
@@ -597,7 +724,7 @@ class CalibrationManager:
             return {"ok": False, "error": str(exc)}
 
         # Persist
-        if not self._save_extrinsics(camera_id, E_to_save):
+        if not self._save_extrinsics(camera_id, E_to_save, pose=preferred_pose):
             return {"ok": False, "error": "persist_failed"}
 
         # Reload and invalidate cache
@@ -645,6 +772,12 @@ class CalibrationManager:
                 except Exception:
                     return {"ok": False, "error": "invalid_s_obj_to_m"}
 
+        if "scene_similarity" in align_update:
+            try:
+                _normalize_scene_similarity_payload(align_update.get("scene_similarity"))
+            except CalibrationValidationError as exc:
+                return {"ok": False, "error": str(exc)}
+
         # Persist
         if not self._save_alignment(align_update):
             return {"ok": False, "error": "persist_failed"}
@@ -674,7 +807,7 @@ class CalibrationManager:
             pose = _normalize_pose_v1(entry.get("pose"))
             if pose is not None:
                 out_entry["pose"] = pose
-                E_from_pose = _pose_to_E_col_major(pose)
+                E_from_pose = _pose_to_E_col_major(pose, align_data=self._align)
                 if isinstance(E_from_pose, list) and len(E_from_pose) == 16:
                     try:
                         _validate_E(E_from_pose, cam_id)
@@ -729,6 +862,15 @@ class CalibrationManager:
             if isinstance(s, (int, float)) and float(s) > 0:
                 default["units"] = {"s_obj_to_m": float(s)}
 
+        scene_similarity = data.get("scene_similarity")
+        if scene_similarity is None and isinstance(data.get("align"), dict):
+            scene_similarity = data["align"].get("scene_similarity")
+        if scene_similarity is not None:
+            try:
+                default["scene_similarity"] = _normalize_scene_similarity_payload(scene_similarity)
+            except CalibrationValidationError as exc:
+                _LOGGER.warning("Invalid scene similarity at load time: %s", exc)
+
         self._align = default
 
     # -----------------------------------------------------------------------
@@ -774,10 +916,13 @@ class CalibrationManager:
         if frame_w <= 0 or frame_h <= 0:
             frame_w, frame_h = 1920, 1080
 
-        # Determine base resolution from intrinsics principal point
-        # (cx, cy assumed to be at image center)
-        base_w = int(round(float(K[0, 2]) * 2.0))
-        base_h = int(round(float(K[1, 2]) * 2.0))
+        base_w = int(getattr(intr, "width", 0) or 0)
+        base_h = int(getattr(intr, "height", 0) or 0)
+        if base_w <= 0 or base_h <= 0:
+            # Legacy camera models did not carry their native image size, so
+            # keep the old center-principal-point heuristic as a fallback only.
+            base_w = int(round(float(K[0, 2]) * 2.0))
+            base_h = int(round(float(K[1, 2]) * 2.0))
 
         if base_w > 0 and base_h > 0 and (base_w != frame_w or base_h != frame_h):
             sx = float(frame_w) / float(base_w)
@@ -790,13 +935,27 @@ class CalibrationManager:
 
         return K
 
-    def _save_extrinsics(self, camera_id: str, E: List[float]) -> bool:
+    def _save_extrinsics(self, camera_id: str, E: List[float], pose: Optional[Dict[str, Any]] = None) -> bool:
         """Persist extrinsics to camera_calibration.json."""
         try:
             current = _read_json(str(self._camera_calibration_path)) or {}
             if "cameras" not in current or not isinstance(current["cameras"], dict):
                 current["cameras"] = {}
-            current["cameras"][camera_id] = {"E": [float(x) for x in E]}
+            existing = current["cameras"].get(camera_id)
+            entry = dict(existing) if isinstance(existing, dict) else {}
+            entry["E"] = [float(x) for x in E]
+            normalized_pose = _normalize_pose_v1(pose) if isinstance(pose, dict) else None
+            if normalized_pose is None:
+                existing_source = (entry.get("pose") or {}).get("source") if isinstance(entry.get("pose"), dict) else None
+                normalized_pose = E_col_major_to_pose_v1(
+                    entry["E"],
+                    source=existing_source or "derived_from_E",
+                    frame=POSE_V1_FRAME_BACKEND_WORLD_M,
+                    align_data=self._align,
+                )
+            if normalized_pose is not None:
+                entry["pose"] = normalized_pose
+            current["cameras"][camera_id] = entry
             ok = _write_json(str(self._camera_calibration_path), current)
             if ok:
                 _LOGGER.warning(
@@ -830,6 +989,9 @@ class CalibrationManager:
                 s = align_update["units"].get("s_obj_to_m")
                 if isinstance(s, (int, float)) and float(s) > 0:
                     current["units"] = {"s_obj_to_m": float(s)}
+
+            if "scene_similarity" in align_update:
+                current["scene_similarity"] = _normalize_scene_similarity_payload(align_update["scene_similarity"])
 
             return _write_json(str(self._ply_alignment_path), current)
         except Exception:

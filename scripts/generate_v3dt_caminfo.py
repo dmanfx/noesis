@@ -25,6 +25,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import sys
 from pathlib import Path
 from typing import Dict, Tuple, Optional
 
@@ -32,6 +33,10 @@ import numpy as np
 import yaml
 
 REPO_ROOT = Path(__file__).parent.parent
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from noesis.calibration.pose_v1 import normalize_pose_v1, pose_to_E_col_major
 
 
 def _load_yaml(path: Path) -> Dict:
@@ -291,7 +296,10 @@ def main() -> None:
         if not calib:
             print(f"Warning: no calibration for camera '{name}', skipping")
             continue
-        e_col_major = calib.get("E")
+        pose = normalize_pose_v1(calib.get("pose")) if isinstance(calib, dict) else None
+        e_col_major = pose_to_E_col_major(pose) if pose is not None else None
+        if e_col_major is None:
+            e_col_major = calib.get("E")
         if not e_col_major:
             print(f"Warning: calibration for '{name}' missing E, skipping")
             continue

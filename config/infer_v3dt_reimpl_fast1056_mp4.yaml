@@ -17,7 +17,7 @@ streammux:
   batch-size: 3
   live-source: 1
   batched-push-timeout: 40000
-  enable-padding: 1
+  enable-padding: 0
   nvbuf-memory-type: 0  # Canonical NVMM setting used across streammux/dewarper/RTSP vconv in DS8 builder.
   sync-inputs: 0
   gpu-id: 0
@@ -25,7 +25,8 @@ streammux:
 sources:
   - element: nvurisrcbin
     #uri: rtsp://192.168.3.214:7447/jdr9oLlBkjyl3gDm?
-    uri: file:///home/mayor/Documents/livingroomclip.mkv
+    #uri: file:///home/mayor/Downloads/livingroomclip.mp4
+    uri: file:///home/mayor/Videos/Living Room.mp4
     gpu-id: 0
     cudadec-memtype: 0
     latency: 100
@@ -37,7 +38,8 @@ sources:
   - element: nvurisrcbin
     #kitchen camera
     #uri: rtsp://192.168.3.214:7447/qt3VqVdZpgG1B4Vk?
-    uri: file:///home/mayor/Downloads/kitchenclip.mp4
+    #uri: file:///home/mayor/Downloads/kitchenclip.mp4
+    uri: file:///home/mayor/Videos/Kitchen.mp4
     gpu-id: 0
     cudadec-memtype: 0
     latency: 100
@@ -49,7 +51,8 @@ sources:
   - element: nvurisrcbin
     #family room camera
     #uri: rtsp://192.168.3.214:7447/4qWTBhW6b4nLeUFE?
-    uri: file:///home/mayor/Downloads/familyroomclip.mp4
+    #uri: file:///home/mayor/Downloads/familyroomclip.mp4
+    uri: file:///home/mayor/Videos/Family Room.mp4
     gpu-id: 0
     cudadec-memtype: 0
     latency: 100
@@ -57,7 +60,7 @@ sources:
     disable-audio: true
     dewarper:
       enable: true
-      config-file: config/dewarper_g4_instant_charuco_720_to_1080.txt
+      config-file: config/dewarper_g4_instant_charuco_1512_to_1080_v3dt.txt
 
 
 preprocess:
@@ -67,7 +70,7 @@ preprocess:
 models:
   pgie:
     config-file-path: pipelines/config_infer_primary_yolo11_seg.ini
-    engine: /home/mayor/Noesis_Devel/models/engines/yolo11s-seg_cust_fused.engine
+    engine: models/engines/yolo11s-seg_cust_fused.engine
     batch_size: 3
     gie_id: 1
     network_mode: fp16
@@ -81,7 +84,7 @@ models:
     gie_id: 3
     attach_tensor_meta: true
   pose:
-    enable: true
+    enable: false
     name: yolo26_pose
     config-file-path: pipelines/config_infer_secondary_yolo26_pose.ini
     engine: models/engines/yolo26n-pose_b16_fp16.engine
@@ -93,7 +96,7 @@ models:
     kpt_threshold: 0.35
     letterbox: true
   depth_tracking:
-    enable: true
+    enable: false
     name: depth_tracking_fullframe
     config-file-path: build/config_infer_depth_tracking_da2_vits_294x518_b3_i1.ini
     engine: models/engines/depth_anything_v2_metric_hypersim_vits_294x518_b3_fp16.engine
@@ -101,17 +104,19 @@ models:
     gie_id: 5
     attach_tensor_meta: true
   mapanything:
-    enable: true
+    enable: false
     name: mapanything_fullframe
     config-file-path: pipelines/config_infer_secondary_mapanything.ini
-    engine: /home/mayor/Noesis_Devel/models/mapanything_depth/1/model.plan
+    engine: models/mapanything_depth/1/model.plan
     batch_size: 3
     gie_id: 2
     attach_tensor_meta: true
 
 tracker:
-  config-file: config/nvtracker.yaml
+  config-file: config/v3dt/reimpl/nvtracker_sv3dt_yolo26s_fast.yml
   ll-lib-file: /opt/nvidia/deepstream/deepstream/lib/libnvds_nvmultiobjecttracker.so
+  tracker-width: 1920
+  tracker-height: 1056
 
 analytics:
   enable: true
@@ -120,7 +125,7 @@ analytics:
   exclude:
     enable: true
     element: nvdsroiexclude
-    config-file: config/config_nvdsanalytics_exclude.ini
+    config-file: config/config_nvdsanalytics_exclude_v3dt_reimpl.ini
 
 sinks:
   - name: mosaic_sink
@@ -169,9 +174,25 @@ bev:
     reset_after_s: 1.25   # If dt exceeds this, accept measurement and reset filter
 
 visualization: # Visualization overlays rendered into the mosaic stream (tiler â†’ osd).
-  display_keypoints: true # Render pose keypoints/skeletons from the pose SGIE.
+  display_keypoints: false # Render pose keypoints/skeletons from the pose SGIE.
   instance_masks:
     alpha: 0.35 # Mask overlay opacity (stable-id keyed color; matches BEV + Active Tracks hue math).
+  person_bbox_overlay:
+    enabled: true # V3DT-only: mask-aligned cuboid; NVIDIA's raw projected cuboid debug draw is disabled.
+    class_ids: [0]
+    shape: cuboid
+    cuboid_geometry: anchored
+    cuboid_depth_width_ratio: 0.25
+    cuboid_depth_height_ratio: 0.12
+    cuboid_min_depth_px: 24.0
+    cuboid_max_depth_px: 96.0
+    draw_anchor_rect: true
+    require_v3dt_meta: true
+    color: cyan
+    alpha: 1.0
+    line_width: 3
+    max_boxes: 24
+    max_display_metas: 32
   trails:
     enabled: true # Enable trails overlay.
     anchor_mode: floor_plane_gravity_drop # Floor-lock trails while tracked; no predicted-gap trail segments.
@@ -207,3 +228,43 @@ visualization: # Visualization overlays rendered into the mosaic stream (tiler â
     font_size: 18 # Label font size for nvdsosd text overlay.
     font_name: Serif # Font family (must match ds_osd.FontFamily).
     decimals: 2 # Confidence decimals.
+
+stable_id:
+  max_total_ids: 4
+  public_max_id: 4
+  public_reuse_window_s: 30.0
+  public_same_camera_sticky_window_s: 15.0
+  public_cross_camera_sticky_window_s: 240.0
+  public_single_person_mode: true
+  public_primary_min_observations: 1
+  max_active_ids_per_sensor: 4
+  reset_sid_pool_on_start: true
+  sid_pool_file: data/v3dt/reimpl/sid_pool_fast1056.json
+  aliases_enabled: true
+  alias_file: data/v3dt/reimpl/reid_aliases_fast1056.json
+  alias_history_max: 200
+  embed_interval_s: 0.50
+  gallery_size: 24
+  max_ghost_age_s: 240.0
+  active_evict_grace_s: 4.0
+  total_id_reuse: true
+  total_id_reuse_min_age_s: 4.0
+  new_id_hysteresis_frames: 2
+  new_id_confirm_frames_at_cap: 3
+  cos_sim_threshold: 0.58
+  cos_sim_high_threshold: 0.68
+  xcam_handoff_window_s: 90.0
+  xcam_handoff_margin: 0.06
+  auto_merge_enabled: true
+  auto_merge_interval_s: 2.0
+  auto_merge_max_attempts: 12
+  auto_merge_min_sim: 0.92
+  auto_merge_min_embeddings_for_suggest: 1
+  auto_merge_respect_inactive: false
+  auto_merge_allow_both_active: true
+  auto_merge_both_active_min_sim: 0.97
+
+v3dt:
+  tracking_mode: v3dt
+  world_frame: backend_world_m
+  caminfo_world_axes: xzy

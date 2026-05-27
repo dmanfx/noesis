@@ -66,6 +66,7 @@ When you (the agent) work in this repo:
 9. **Docs and instruction hygiene**
    - When editing docs, AGENTS files, plans, or prompts, verify any referenced local file paths and commands still exist in this workspace before finalizing.
    - After changing `AGENTS.md` or files under `docs/`, run `./scripts/check_agents_docs_consistency.py` and fix failures before closing the task.
+   - In user-facing summaries and explanations, prefer plain semantic descriptions of behavior, variables, and outcomes. Do not default to file/line citations unless the user explicitly asks for code references.
 
 10. **Native extension discipline**
    - If you change V3DT/pose metadata plumbing or contracts (`noesis/pipelines/hooks.py`, `noesis/metadata/*`, `native/*`), rebuild the relevant native extension(s) and run focused smoke tests (for example `scripts/sv3dt_meta_smoke_test.py`) to confirm metadata extraction still works.

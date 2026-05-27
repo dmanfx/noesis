@@ -25,9 +25,10 @@ const wsHost = import.meta.env.VITE_WS_HOST || window.location.hostname;
 const wsPort = Number(import.meta.env.VITE_WS_PORT || 6008);
 const wsProto = window.location.protocol === 'https:' ? 'wss' : 'ws';
 const WS_URL = import.meta.env.VITE_WS_URL || `${wsProto}://${wsHost}:${wsPort}`;
-// Prefer same-origin `/api/...` (Vite dev proxy or prod reverse-proxy) to avoid CORS.
-// Override with `VITE_REST_URL` if the REST API is intentionally hosted elsewhere.
-const REST_URL = import.meta.env.VITE_REST_URL || '';
+const restHost = window.location.hostname || '127.0.0.1';
+const restPort = Number(import.meta.env.VITE_REST_PORT || 8082);
+const restProto = window.location.protocol === 'https:' ? 'https' : 'http';
+const REST_URL = import.meta.env.VITE_REST_URL || `${restProto}://${restHost}:${restPort}`;
 const streamDisplayCams: CameraKey[] = ['living-room'];
 
 type CameraPoseSummary = {
@@ -118,6 +119,17 @@ function Dashboard() {
     velocity?: [number, number];
     world?: [number, number, number];
     world_valid?: boolean;
+    world_source?: string;
+    world_quality?: string;
+    world_quality_reason?: string;
+    depth_status?: string | null;
+    depth_anchor_source?: string | null;
+    depth_anchor_m?: number | null;
+    depth_used_m?: number | null;
+    depth_center_m?: number | null;
+    depth_median_m?: number | null;
+    depth_sample_count?: number | null;
+    depth_valid_fraction?: number | null;
   };
   const [tracksByCamera, setTracksByCamera] = useState<Record<string, ActiveTrack[]>>({});
   const [occByCamKey, setOccByCamKey] = useState<Record<CameraKey, Record<string, number>>>({ 'living-room': {}, 'kitchen': {}, 'family-room': {} });
@@ -269,7 +281,7 @@ function Dashboard() {
     return merged;
   };
 
-  const normalizeBevMetaForDisplay = (cam: CameraKey, payload: BevMeta, mode: BevFrameMode): BevMeta => {
+  const normalizeBevMetaForDisplay = useCallback((cam: CameraKey, payload: BevMeta, mode: BevFrameMode): BevMeta => {
     const isWorldMode = mode === 'world';
     if (!isWorldMode) return payload;
 
@@ -317,8 +329,14 @@ function Dashboard() {
 
     if (!didProject) return payload;
 
-    return { ...payload, footpoints: projectedPoints, trails: projectedTrails };
-  };
+    return {
+      ...payload,
+      frame: String(fallbackFrame || '').trim() || payload.frame,
+      units: String(floorplan?.units || '').trim() || payload.units,
+      footpoints: projectedPoints,
+      trails: projectedTrails,
+    };
+  }, []);
 
   const onStats = (payload: StatsPayload) => {
     // System status/uptime
@@ -479,12 +497,17 @@ function Dashboard() {
           : colorForTrack(Number(t.stable_id || 0));
         const metric = metricForTrack(t);
 
-        const metricText = metric ? `[${metric.x.toFixed(2)} scene, ${metric.y.toFixed(2)} scene]` : 'N/A';
+        const metricText = metric ? `[${metric.x.toFixed(2)} m, ${metric.y.toFixed(2)} m]` : 'N/A';
+        const depthUsed = typeof t.depth_used_m === 'number' && Number.isFinite(t.depth_used_m)
+          ? `${t.depth_used_m.toFixed(2)} m`
+          : 'N/A';
+        const depthStatus = t.depth_status || 'missing';
+        const depthAnchor = t.depth_anchor_source ? `, ${t.depth_anchor_source}` : '';
         const idDisplay = (t as any).id_display
           ?? (typeof (t as any).tracker_id === 'number'
               ? `[${(t as any).tracker_id}] | [${t.stable_id ?? 'N/A'}]`
               : String(t.stable_id ?? 'N/A'));
-        tracksHtml += `<div><strong><span class="dot" style="display:inline-block;width:10px;height:10px;border-radius:50%;background:${dotColor};margin-right:6px;vertical-align:middle;"></span>ID ${idDisplay}:</strong><br/>Zone: ${t.zone || '-'}, Dwell: <span style="display:inline-block; min-width:4ch; text-align:right;">${dwell}</span>s<br/>Metric (BEV): ${metricText}<br/>Pixel Pos: [${(typeof center[0] === 'number' ? Number(center[0]).toFixed(3) : center[0])}, ${(typeof center[1] === 'number' ? Number(center[1]).toFixed(3) : center[1])}], Speed: <span style="display:inline-block; min-width:4ch; text-align:right;">${speed}</span> px/s</div>`;
+        tracksHtml += `<div><strong><span class="dot" style="display:inline-block;width:10px;height:10px;border-radius:50%;background:${dotColor};margin-right:6px;vertical-align:middle;"></span>ID ${idDisplay}:</strong><br/>Zone: ${t.zone || '-'}, Dwell: <span style="display:inline-block; min-width:4ch; text-align:right;">${dwell}</span>s<br/>Metric (BEV): ${metricText}<br/>Depth Used: ${depthUsed} (${depthStatus}${depthAnchor})<br/>Pixel Pos: [${(typeof center[0] === 'number' ? Number(center[0]).toFixed(3) : center[0])}, ${(typeof center[1] === 'number' ? Number(center[1]).toFixed(3) : center[1])}], Speed: <span style="display:inline-block; min-width:4ch; text-align:right;">${speed}</span> px/s</div>`;
       });
     } else {
       tracksHtml = '<span>No active tracks.</span>';

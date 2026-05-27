@@ -1,5 +1,5 @@
 # DS8 WebSocket API Contracts
-_Status: validated against code on 2026-02-22._
+_Status: validated against code on 2026-03-16._
 
 The WebSocket server (`websocket_server.WebSocketServer`) is the primary transport for DS8 telemetry, depth retrieval, and WebRTC signaling. All message types are JSON unless noted as binary.
 
@@ -68,7 +68,7 @@ Emitted ~1 Hz when `stats_callback` is registered (`ds8_runtime._build_stats_cal
         "latency_ms": { /* same shape as pipeline.latency_ms, optional */ },
         "tracking": {
           "occupancy": {"<zone>": <int>, ...},
-          "active_tracks": [ /* diagnostic only */ ],
+          "active_tracks": [ /* same per-track shape as tracking.tracks, plus occupancy-scoped subset */ ],
           "transitions": [ /* line/zone transitions */ ]
         }
       }
@@ -78,6 +78,10 @@ Emitted ~1 Hz when `stats_callback` is registered (`ds8_runtime._build_stats_cal
 ```
 
 `latency_ms` fields are populated only when `NVDS_ENABLE_LATENCY_MEASUREMENT` is truthy and the DeepStream latency meta library is available.
+
+`depth_enabled` and `depth_fps` still describe the on-demand MapAnything branch. The baseline DAv2 depth-tracking lane used by non-`v3dt` world estimation is separate and always-on when the baseline runtime starts successfully.
+
+Baseline non-`v3dt` startup also requires a prebuilt room-registration artifact (`depth_registration.path` in `config/infer.yaml`, default `config/depth_registration.json`). DS8 loads that artifact before activation and fails fast if any enabled camera is missing a valid DAv2→MapAnything registration entry.
 
 ## 3. Mosaic Video (WebRTC)
 
@@ -105,24 +109,44 @@ Emitted by `BevRenderer`:
   "xMin": <float>, "xMax": <float>,
   "zMin": <float>, "zMax": <float>,
   "overlay": <bool>,
-  "footpoints": [ {"x": <float>, "y": <float>, "method": "bbox"|"sv3dt", "stableId": <int|null>, "trackerId": <int|null>} ],
+  "footpoints": [
+    {
+      "x": <float>,
+      "y": <float>,
+      "method": "<string>",
+      "stableId": <int|null>,
+      "trackerId": <int|null>,
+      "anchorSource": "<string|null>",
+      "anchorQuality": "<string|null>",
+      "anchorReason": "<string|null>",
+      "displaySource": "world"|"world_to_camera_local"|"image_anchor"|"image_depth_anchor"
+    }
+  ],
   "trails": [ {"stableId": <int|null>, "trackerId": <int|null>, "points": [ {"x": <float>, "y": <float>, "t": <int ms>} ]} ],
   "H": [<9 floats>],
   "sampleXZ": [<float x>, <float z>] | null,
-  "world_frame": "menon_scene"|"camera_local",
+  "frame": "backend_world_m"|"camera_local_ground_m",
+  "world_frame": "backend_world_m"|"camera_local_ground_m",
   "frame_mode": "world"|"camera_local",
-  "units": "scene",
+  "units": "meters",
   "s_obj_to_m": <float>,
   "trail_smoothing_owner": "frontend"|"backend"|"none",
+  "bev_points_smoothed": <bool>,
   "bev_world_points_smoothed": <bool>
 }
 ```
 
+- `footpoints[].method` is an image-anchor/render provenance string emitted by the backend (`image_base`, `image_foot`, `bbox`, etc.), not the canonical track world estimator source.
+- `footpoints[].anchorSource`, `anchorQuality`, and `anchorReason` mirror the backend world estimator diagnostics from tracking telemetry so BEV/Three.js consumers can explain why a point was accepted, guarded, or held.
+- `footpoints[].displaySource` declares which coordinate path produced the displayed BEV point. The primary inline floorplan view uses `frame_mode=camera_local` and `frame=camera_local_ground_m`, so displayed points and producer trails are in the same camera-local ground frame as MapAnything floorplan rasters. `image_depth_anchor` is emitted only when the backend unprojected the image anchor through a MapAnything-registered depth sample; if depth registration rejects the sample, BEV display stays on the image-floor/world path instead of using raw object depth in the wrong basis.
+
 - Optional JPEG binary: `[len(header)][header="bev:<camera>"][JPEG bytes]` when BEV JPEG output is enabled (`bev.jpeg_enabled` or `NOESIS_BEV_JPEG_ENABLED=1`).
-- In world mode (`frame_mode=world`), BEV footpoints remain producer-owned scene coordinates. Motion smoothing ownership is declared explicitly by `trail_smoothing_owner`; when `bev.smoothing.enabled=true`, the producer publishes already-smoothed world points and sets `trail_smoothing_owner=backend`, `bev_world_points_smoothed=true`.
-- When `trail_smoothing_owner=backend`, `trails` carries the producer trail polylines already used by the BEV renderer, in scene/world coordinates with epoch-millisecond sample times. The dashboard should render those directly instead of reconstructing its own history from `footpoints`.
+- In world mode (`frame_mode=world`), BEV footpoints remain producer-owned scene coordinates and should be treated as the canonical `track.world` head points emitted by the backend. The BEV renderer must not apply a second world-space low-pass filter to those points.
+- Motion smoothing ownership is declared explicitly by `trail_smoothing_owner`. In the current baseline world-mode path the backend owns trail history (`trail_smoothing_owner=backend`) while `bev_world_points_smoothed=false`, because the canonical per-track world estimator in `hooks.py` already owns the only track-position smoothing stage.
+- When `trail_smoothing_owner=backend`, `trails` carries the producer trail polylines already used by the BEV renderer, in the declared BEV `frame` with epoch-millisecond sample times. The dashboard should render those directly instead of reconstructing its own history from `footpoints`.
+- World-mode BEV omits `anchor_hold` head points from `footpoints`/`trails` so stale held positions do not render as drifting or out-of-bounds trail segments after temporary occlusion.
 - Backend world-BEV smoothing and trail history are keyed by tracker-local identity (`trackerId` when present, otherwise `stableId`) to match the nvOSD trail path; `stableId` remains display metadata and may legitimately span multiple tracker histories over time.
-- Coordinate note: BEV renders on the ground plane (XZ). `footpoints[].x` is scene/world X, and `footpoints[].y` is scene/world Z.
+- Coordinate note: BEV renders on the ground plane (XZ). `footpoints[].x` is X and `footpoints[].y` is Z in the declared `frame`.
 
 ## 5. Depth Telemetry (`type: depth_result`)
 
@@ -152,6 +176,15 @@ Produced by `TrackingTelemetryPublisher`; people-only (class_id=0). `track_id` i
 {
   "type": "tracking",
   "source_id": <int>,
+  "camera_id": "<string>",
+  "coord_space": "<string>",
+  "units": "<string>",
+  "world_source": "backend_world_fused",
+  "track_id_strategy": "camera_tracker_fallback",
+  "calibration_version": "<string>",
+  "tracking_contract_version": 3,
+  "image_size": [<int width>, <int height>],
+  "frame_size": [<int width>, <int height>],
   "tracks": [
     {
       "stable_id": <int>,
@@ -172,14 +205,55 @@ Produced by `TrackingTelemetryPublisher`; people-only (class_id=0). `track_id` i
       "image_base": [<float>, <float>],
       "world": [<float>, <float>, <float>],
       "world_valid": <bool>,
+      "world_quality": "good"|"estimated"|"invalid",
+      "world_quality_reason": "<string|null>",
       "world_frame": "menon_scene"|"camera_local"|null,
-      "world_source": "bbox3d"|"pose_ankle_floor"|"pose_single_ankle_floor"|"pose_leg_floor"|"gravity_drop"|"anchor_hold"|null
+      "world_source": "bbox3d"|"pose_depth_fused"|"pose_floor_only"|"person_anchor_depth_fused"|"person_anchor_floor_only"|"gravity_drop"|"anchor_hold"|null,
+      "depth_status": "<string|null>",
+      "depth_anchor_source": "<string|null>",
+      "depth_anchor_m": <float|null>,
+      "depth_used_m": <float|null>,
+      "depth_registered_m": <float|null>,
+      "depth_registration_status": "<string|null>",
+      "depth_registration_id": "<string|null>",
+      "depth_center_m": <float|null>,
+      "depth_median_m": <float|null>,
+      "depth_sample_count": <int|null>,
+      "depth_valid_fraction": <float|null>,
+      "depth_anchor_sample_count": <int|null>,
+      "depth_anchor_valid_fraction": <float|null>
     }
   ]
 }
 ```
 
-When pose anchoring, height-lock reuse, and recent-anchor hold all fail, DS8 now leaves `world_valid=false` instead of promoting bbox-bottom floor projection into a synthetic world point.
+Tracking telemetry has two world-source scopes:
+
+- Top-level `world_source="backend_world_fused"` advertises that the baseline DS8 runtime owns the canonical world estimator in the backend.
+- Per-track `world_source` records which observation path updated that specific track on the current frame.
+
+Baseline non-`v3dt` mode uses one canonical person-anchor estimator: pose-derived image anchor when available, otherwise the person mask/depth image anchor from `NOESIS.OBJECT_DEPTH.anchor_uv`. A concurrent DAv2 range observation from `NOESIS.OBJECT_DEPTH` is fused on that same current-anchor ray when valid. The canonical per-track values are:
+
+- `pose_depth_fused`: pose anchor and DAv2 anchor depth both contributed to the world-state update.
+- `pose_floor_only`: pose anchor updated the world-state filter without a usable DAv2 observation on that frame.
+- `person_anchor_depth_fused`: the person mask/depth anchor (`anchor_uv`) plus DAv2 anchor depth both contributed to the world-state update on a frame without usable pose.
+- `person_anchor_floor_only`: the person mask/depth anchor updated the world-state filter without a usable DAv2 observation on that frame.
+- `gravity_drop`: no current admissible person anchor was available, but a stored pose-derived height reference allowed a floor-consistent gravity drop.
+- `anchor_hold`: no current valid observation; the estimator is briefly holding the last reliable world state.
+- `bbox3d`: `v3dt` mode only.
+
+Depth exposure:
+
+- `depth_used_m` is the DAv2 anchor depth that actually qualified for the fused estimator on that track update (`status="ok"` with sufficient support).
+- `depth_anchor_m` is the raw anchor depth carried by `NOESIS.OBJECT_DEPTH`; it may be present even when `depth_used_m` is null.
+- `depth_registered_m` is the room-registered DAv2 anchor depth after applying the offline DAv2→MapAnything mapping for that camera; this is the value projected on the current anchor ray when registration is active.
+- `depth_registration_status` is `ok` when the runtime used a valid registration mapping on that frame. Other values explain why the estimator stayed on floor-only (`out_of_domain_or_invalid`) or why registration was unavailable.
+- `depth_registration_id` identifies the exact per-camera registration artifact entry used by the estimator.
+- `depth_status`, `depth_anchor_source`, `depth_sample_count`, and `depth_valid_fraction` are published on both `tracking.tracks[]` and `stats.payload.cameras[*].tracking.active_tracks[]` so the runtime OSD and dashboard can explain whether baseline depth is contributing on a given frame.
+- `depth_anchor_sample_count` and `depth_anchor_valid_fraction` surface the support of the actual lower-body / torso anchor band that drove the fused update. These fields are the canonical explanation for why a track landed on `pose_depth_fused` / `person_anchor_depth_fused` versus `pose_floor_only` / `person_anchor_floor_only`; whole-mask support can be lower or noisier without disqualifying a good anchor-band sample.
+- The on-screen `z=` label is sourced from the same `depth_used_m` value that the estimator actually projected, not directly from the raw `depth_anchor_m`.
+
+When pose anchoring, gravity-drop, and recent-anchor hold all fail, DS8 leaves `world_valid=false` instead of promoting bbox-bottom floor projection into a synthetic world point.
 
 ## 7. Control & RPC Message Types
 
@@ -224,6 +298,7 @@ Handled in `websocket_server.py`:
 ```
 
 - Normals are attached when `NOESIS_MAPANYTHING_NORMALS_ENABLE` is truthy; errors are reported via `normals_error` while keeping the depth payload.
+- `ma_depth_response` remains the MapAnything full-frame RPC contract. The always-on baseline DAv2 tracking lane does not publish a second full-frame WebSocket depth stream; it influences `track.world` through `NOESIS.OBJECT_DEPTH` and the fused backend estimator instead.
 
 ### floorplan_response
 
@@ -239,7 +314,7 @@ Returned from `get_floorplan` (`DepthStorageManager.generate_topdown_floorplan`)
   "ts": <int>,
   "snapshot_ts": <int|null>,
   "frame": "camera_local_ground",
-  "orientation": "xz",
+  "orientation": "camera_xz_forward",
   "floorplan_contract_version": <int>,
   "units": "scene",
   "s_obj_to_m": <float>,
@@ -263,9 +338,10 @@ Returned from `get_floorplan` (`DepthStorageManager.generate_topdown_floorplan`)
 }
 ```
 
-- `obstacle_height` and `walkable` are optional clean layers (currently kitchen-only):
+- `obstacle_height` and `walkable` are optional clean layers generated for room floorplan responses when clean-surface estimation is available:
   - `obstacle_height`: float32 meters above an estimated floor plane (floor clamped to 0).
   - `walkable`: float32 {0,1} where 1 is walkable floor and 0 is obstacle/furniture.
+- `image_flip` is diagnostic-only for floorplan responses. The serialized floorplan grids are already in their final camera-local X/Z orientation, so clients must not mirror the raster again using this hint.
 
 ### auto_calibrate_result
 
@@ -276,7 +352,8 @@ Current DS8 runtime proxies Menon auto-calibration: `{ type: "auto_calibrate_res
 Same as prior DS8 revisions:
 
 - **Extrinsics (`E`)**: stored in `config/camera_calibration.json`, world→camera, 4×4 column-major, meters.
+- **PoseV1 (`pose`)**: stored scene pose summaries (`position`, `yaw_pitch_roll_deg`, `rotation_order=YXZ`, `frame=menon_scene`) are authoritative scene-camera poses, not raw OpenCV image-camera extrinsics. Converting PoseV1 to `E` applies a fixed local 180 degree roll so the resulting camera basis matches DS8 depth/image math (`+X right`, `+Y down`, `+Z forward`).
 - **Intrinsics (`K`)**: from `config/cameras.yaml` (`intrinsics_models` + `cameras` map). Scaled to streammux resolution in `ds8_runtime._CalibrationProvider`.
-- **Alignment (`align`)**: `config/ply_alignment.json` with `matrix` (row-major), `floor_y`, `units.s_obj_to_m`.
-- **Calibration bundle (`calibration-bundle`)**: for client-side visualization, extrinsic translations are exposed in native scene units via `scene_per_m = 1 / s_obj_to_m` (rotation unchanged).
-- `pixel_to_world_response` returns world-frame meters; Menon applies `align.matrix` client-side.
+- **Alignment (`align`)**: `config/ply_alignment.json` with `matrix` (room-model alignment), `floor_y`, and `units.s_obj_to_m`.
+- **Calibration bundle (`calibration-bundle`)**: carries the canonical backend-world-meters pose/extrinsics plus the room-alignment metadata Menon needs for its own scene conversion.
+- `pixel_to_world_response` returns world-frame meters; Menon applies its room alignment and scene-unit conversion client-side.

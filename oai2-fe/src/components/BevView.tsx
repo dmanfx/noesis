@@ -1,7 +1,7 @@
-import React, { useEffect, useMemo, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { CameraKey, cameraLabel, colorIdForPerson } from '../lib/camera';
 import { FloorplanResponse } from './DepthDrawer';
-import { renderLayerToCanvas, renderCompositeWalkableObstacleToCanvas, infernoColor, bwColor } from '../lib/renderUtils';
+import { renderLayerToCanvas, renderCompositeWalkableObstacleToCanvas, infernoColor, bwColor, decodeFloat32 } from '../lib/renderUtils';
 import type { BevFrameMode as CoordFrameMode } from '../lib/coordTransforms';
 import { isCameraLocalFrame, isWorldFrame } from '../lib/coordTransforms';
 import {
@@ -33,6 +33,7 @@ export type BevMeta = {
     anchorSource?: string | null;
     anchorQuality?: string | null;
     anchorReason?: string | null;
+    displaySource?: string | null;
   }>;
   trails?: Array<{
     stableId?: number | null;
@@ -54,6 +55,7 @@ export type BevMeta = {
   fallbackSources?: string[];
   fallbackReasonCounts?: Record<string, number>;
   trail_smoothing_owner?: 'frontend' | 'backend' | 'none';
+  bev_points_smoothed?: boolean;
   bev_world_points_smoothed?: boolean;
 };
 
@@ -63,7 +65,7 @@ type BevViewProps = {
   cam: CameraKey;
   meta?: BevMeta;
   floorplan?: FloorplanResponse;
-  // 'world' means points are in MENON scene/world frame.
+  // 'world' means producer-owned metric world points, optionally projected to camera-local display.
   // 'camera_local_legacy' keeps existing floorplan-local behavior.
   coordMode?: BevFrameMode;
   trailEnabled?: boolean;
@@ -78,6 +80,27 @@ const DEFAULT_Z_MIN = 0;
 const DEFAULT_Z_MAX = 12;
 
 type ContentRect = { x: number; y: number; w: number; h: number };
+type MetricBounds = { min_x: number; max_x: number; min_z: number; max_z: number };
+type FloorplanSurfaceMap = {
+  rows: number;
+  cols: number;
+  valid: Uint8Array;
+  nearestRow: Int16Array;
+  nearestCol: Int16Array;
+  maxSnapCells: number;
+};
+type ResolvedMetricPoint = { x: number; y: number; mapped: boolean };
+type FloorplanVisualSelection = {
+  walkableLayer?: FloorplanResponse['walkable'];
+  obstacleHeightLayer?: FloorplanResponse['obstacle_height'];
+  heightLayer?: FloorplanResponse['height'];
+  densityLayer?: FloorplanResponse['density'];
+  distanceLayer?: FloorplanResponse['distance'];
+  baseLayer?: FloorplanResponse['height'];
+  baseKind: 'composite' | 'walkable' | 'obstacle_height' | 'height' | 'none';
+  hasComposite: boolean;
+  hasFloorplan: boolean;
+};
 
 const TRAIL_LINE_WIDTH = 2.5;
 
@@ -96,6 +119,186 @@ const floorplanHasRenderableGrid = (floorplan?: FloorplanResponse | null): boole
   floorplan?.density?.grid_b64 ||
   floorplan?.distance?.grid_b64
 );
+
+const isMetricUnits = (units?: string): boolean => {
+  const value = String(units || '').trim().toLowerCase();
+  return value === 'm' || value === 'meter' || value === 'meters';
+};
+
+const isSceneUnits = (units?: string): boolean => String(units || '').trim().toLowerCase() === 'scene';
+
+const hasCompatibleFloorplanUnits = (units?: string): boolean => isSceneUnits(units) || isMetricUnits(units);
+
+const selectFloorplanVisualSelection = (
+  floorplan: FloorplanResponse | undefined,
+  isCompatible = true,
+  preferHeightVisual = false
+): FloorplanVisualSelection => {
+  const walkableLayer = floorplan?.walkable;
+  const obstacleHeightLayer = floorplan?.obstacle_height;
+  const heightLayer = floorplan?.height;
+  const densityLayer = floorplan?.density;
+  const distanceLayer = floorplan?.distance;
+  const hasWalkable = isCompatible && !!(walkableLayer?.grid_b64 && walkableLayer?.grid_shape);
+  const hasObstacleHeight = isCompatible && !!(obstacleHeightLayer?.grid_b64 && obstacleHeightLayer?.grid_shape);
+  const hasHeight = isCompatible && !!(heightLayer?.grid_b64 && heightLayer?.grid_shape);
+  const hasComposite = hasWalkable && hasObstacleHeight;
+  const useHeightVisual = preferHeightVisual && hasHeight;
+  const baseLayer = useHeightVisual
+    ? heightLayer
+    : (hasComposite
+      ? walkableLayer
+      : (hasWalkable ? walkableLayer : (hasObstacleHeight ? obstacleHeightLayer : heightLayer)));
+  const baseKind = useHeightVisual
+    ? 'height'
+    : (hasComposite
+      ? 'composite'
+      : (hasWalkable ? 'walkable' : (hasObstacleHeight ? 'obstacle_height' : (hasHeight ? 'height' : 'none'))));
+  return {
+    walkableLayer,
+    obstacleHeightLayer,
+    heightLayer,
+    densityLayer,
+    distanceLayer,
+    baseLayer,
+    baseKind,
+    hasComposite: useHeightVisual ? false : hasComposite,
+    hasFloorplan: !!(baseLayer?.grid_b64 && baseLayer?.grid_shape),
+  };
+};
+
+const floorplanBoundsForMode = (
+  floorplan: FloorplanResponse | undefined,
+  coordMode: BevFrameMode
+): MetricBounds | null => {
+  const bounds = floorplan?.bounds;
+  if (!bounds) return null;
+  const minX = Number(bounds.min_x);
+  const maxX = Number(bounds.max_x);
+  const minZ = Number(bounds.min_z);
+  const maxZ = Number(bounds.max_z);
+  if (![minX, maxX, minZ, maxZ].every(Number.isFinite)) return null;
+
+  const floorplanFrame = floorplan?.frame;
+  const hasFloorplanFrame = typeof floorplanFrame === 'string' && floorplanFrame.trim().length > 0;
+  const isFloorplanWorld = isWorldFrame(floorplanFrame);
+  const isFloorplanCameraLocal = isCameraLocalFrame(floorplanFrame);
+  const floorplanUnits = String(floorplan?.units || '').trim().toLowerCase();
+  const hasFloorplanCompatibleUnits = hasCompatibleFloorplanUnits(floorplanUnits);
+  const useBounds = coordMode === 'world'
+    ? (hasFloorplanCompatibleUnits && (isFloorplanWorld || isFloorplanCameraLocal))
+    : (!hasFloorplanFrame || isFloorplanCameraLocal);
+  if (!useBounds) return null;
+  return { min_x: minX, max_x: maxX, min_z: minZ, max_z: maxZ };
+};
+
+const buildFloorplanSurfaceMap = (floorplan: FloorplanResponse | undefined): FloorplanSurfaceMap | null => {
+  if (!floorplan) return null;
+  const visual = selectFloorplanVisualSelection(floorplan, true);
+  const candidates = [
+    visual.baseLayer,
+    visual.obstacleHeightLayer,
+    visual.walkableLayer,
+    visual.heightLayer,
+    visual.densityLayer,
+    visual.distanceLayer,
+  ].filter((layer) => layer?.grid_b64 && Array.isArray(layer.grid_shape));
+  const base = candidates[0];
+  if (!base?.grid_shape) return null;
+  const [rowsRaw, colsRaw] = base.grid_shape;
+  const rows = Number(rowsRaw);
+  const cols = Number(colsRaw);
+  if (!Number.isFinite(rows) || !Number.isFinite(cols) || rows <= 0 || cols <= 0) return null;
+  const cellCount = rows * cols;
+  const valid = new Uint8Array(cellCount);
+  let markedCells = 0;
+
+  const markLayer = (layer: typeof base | undefined, accepts: (value: number) => boolean): number => {
+    if (!layer?.grid_b64 || !Array.isArray(layer.grid_shape)) return 0;
+    const [layerRows, layerCols] = layer.grid_shape;
+    if (Number(layerRows) !== rows || Number(layerCols) !== cols) return 0;
+    const values = decodeFloat32(layer.grid_b64);
+    if (!values || values.length < cellCount) return 0;
+    let count = 0;
+    for (let i = 0; i < cellCount; i += 1) {
+      if (!valid[i] && accepts(values[i])) {
+        valid[i] = 1;
+        count += 1;
+      }
+    }
+    return count;
+  };
+
+  if (visual.baseKind === 'composite') {
+    markedCells += markLayer(visual.walkableLayer, (v) => Number.isFinite(v) && v > 0.5) ?? 0;
+    markedCells += markLayer(visual.obstacleHeightLayer, (v) => Number.isFinite(v) && v > 0.05) ?? 0;
+  } else if (visual.baseKind === 'walkable') {
+    markedCells += markLayer(visual.walkableLayer, (v) => Number.isFinite(v) && v > 0.5) ?? 0;
+  } else if (visual.baseKind === 'obstacle_height') {
+    markedCells += markLayer(visual.obstacleHeightLayer, (v) => Number.isFinite(v) && v > 0.05) ?? 0;
+  } else if (visual.baseKind === 'height') {
+    markedCells += markLayer(visual.densityLayer, (v) => Number.isFinite(v) && v > 1e-6) ?? 0;
+    markedCells += markLayer(visual.distanceLayer, (v) => Number.isFinite(v) && v > 0.0) ?? 0;
+    markedCells += markLayer(visual.heightLayer, (v) => Number.isFinite(v) && v > 1e-6) ?? 0;
+  }
+
+  if (markedCells <= 0 || !valid.some((v) => v > 0)) return null;
+
+  const nearestRow = new Int16Array(cellCount);
+  const nearestCol = new Int16Array(cellCount);
+  nearestRow.fill(-1);
+  nearestCol.fill(-1);
+  const queue = new Int32Array(cellCount);
+  let head = 0;
+  let tail = 0;
+  for (let row = 0; row < rows; row += 1) {
+    for (let col = 0; col < cols; col += 1) {
+      const idx = (row * cols) + col;
+      if (!valid[idx]) continue;
+      nearestRow[idx] = row;
+      nearestCol[idx] = col;
+      queue[tail] = idx;
+      tail += 1;
+    }
+  }
+
+  const offsets = [
+    [-1, 0],
+    [1, 0],
+    [0, -1],
+    [0, 1],
+    [-1, -1],
+    [-1, 1],
+    [1, -1],
+    [1, 1],
+  ];
+  while (head < tail) {
+    const idx = queue[head];
+    head += 1;
+    const row = Math.floor(idx / cols);
+    const col = idx % cols;
+    for (const [dr, dc] of offsets) {
+      const rr = row + dr;
+      const cc = col + dc;
+      if (rr < 0 || rr >= rows || cc < 0 || cc >= cols) continue;
+      const nextIdx = (rr * cols) + cc;
+      if (nearestRow[nextIdx] >= 0) continue;
+      nearestRow[nextIdx] = nearestRow[idx];
+      nearestCol[nextIdx] = nearestCol[idx];
+      queue[tail] = nextIdx;
+      tail += 1;
+    }
+  }
+
+  return {
+    rows,
+    cols,
+    valid,
+    nearestRow,
+    nearestCol,
+    maxSnapCells: Math.max(2, Math.round(Math.min(rows, cols) * 0.08)),
+  };
+};
 
 const normalizePayloadTsMs = (rawTs: unknown): number | null => {
   const value = Number(rawTs);
@@ -232,6 +435,69 @@ export const BevView: React.FC<BevViewProps> = ({
   const displayFloorplan = (floorplanHasRenderableGrid(floorplan) && !floorplan?.error)
     ? floorplan
     : (retainedFloorplanRef.current ?? floorplan);
+  const displayBounds = useMemo(
+    () => floorplanBoundsForMode(displayFloorplan, coordMode),
+    [
+      coordMode,
+      displayFloorplan?.frame,
+      displayFloorplan?.units,
+      displayFloorplan?.bounds?.min_x,
+      displayFloorplan?.bounds?.max_x,
+      displayFloorplan?.bounds?.min_z,
+      displayFloorplan?.bounds?.max_z,
+    ]
+  );
+  const displaySurfaceMap = useMemo(
+    () => buildFloorplanSurfaceMap(displayFloorplan),
+    [
+      displayFloorplan?.walkable?.grid_b64,
+      displayFloorplan?.obstacle_height?.grid_b64,
+      displayFloorplan?.height?.grid_b64,
+      displayFloorplan?.density?.grid_b64,
+      displayFloorplan?.distance?.grid_b64,
+    ]
+  );
+  const resolveDisplayPoint = useCallback((x: number, y: number): ResolvedMetricPoint | null => {
+    if (!Number.isFinite(x) || !Number.isFinite(y)) return null;
+    if (!displayBounds) return { x, y, mapped: false };
+
+    const spanX = Math.max(1e-6, displayBounds.max_x - displayBounds.min_x);
+    const spanZ = Math.max(1e-6, displayBounds.max_z - displayBounds.min_z);
+    const colFloat = ((x - displayBounds.min_x) / spanX) * (displaySurfaceMap?.cols ?? 1);
+    const rowFloat = (1.0 - ((y - displayBounds.min_z) / spanZ)) * (displaySurfaceMap?.rows ?? 1);
+
+    if (!displaySurfaceMap) {
+      if (x < displayBounds.min_x || x > displayBounds.max_x || y < displayBounds.min_z || y > displayBounds.max_z) return null;
+      return { x, y, mapped: false };
+    }
+
+    const rawCol = Math.floor(colFloat);
+    const rawRow = Math.floor(rowFloat);
+    const col = Math.max(0, Math.min(displaySurfaceMap.cols - 1, rawCol));
+    const row = Math.max(0, Math.min(displaySurfaceMap.rows - 1, rawRow));
+    const edgeDistanceCells = Math.max(
+      rawCol < 0 ? -rawCol : 0,
+      rawCol >= displaySurfaceMap.cols ? rawCol - displaySurfaceMap.cols + 1 : 0,
+      rawRow < 0 ? -rawRow : 0,
+      rawRow >= displaySurfaceMap.rows ? rawRow - displaySurfaceMap.rows + 1 : 0
+    );
+    const idx = (row * displaySurfaceMap.cols) + col;
+    if (displaySurfaceMap.valid[idx] && edgeDistanceCells === 0) {
+      return { x, y, mapped: false };
+    }
+
+    const nearestRow = displaySurfaceMap.nearestRow[idx];
+    const nearestCol = displaySurfaceMap.nearestCol[idx];
+    if (nearestRow < 0 || nearestCol < 0) return null;
+    const snapDistanceCells = Math.max(Math.abs(nearestRow - row), Math.abs(nearestCol - col), edgeDistanceCells);
+    if (snapDistanceCells > displaySurfaceMap.maxSnapCells) return null;
+
+    return {
+      x: displayBounds.min_x + ((nearestCol + 0.5) / displaySurfaceMap.cols) * spanX,
+      y: displayBounds.max_z - ((nearestRow + 0.5) / displaySurfaceMap.rows) * spanZ,
+      mapped: true,
+    };
+  }, [displayBounds, displaySurfaceMap]);
 
   useEffect(() => {
     metaRef.current = meta;
@@ -262,6 +528,10 @@ export const BevView: React.FC<BevViewProps> = ({
       String(displayFloorplan?.frame || '').trim().toLowerCase(),
       String(displayFloorplan?.units || '').trim().toLowerCase(),
       boundsKey,
+      String(displayFloorplan?.snapshot_ts ?? displayFloorplan?.ts ?? ''),
+      String(displayFloorplan?.walkable?.grid_b64?.length ?? ''),
+      String(displayFloorplan?.obstacle_height?.grid_b64?.length ?? ''),
+      String(displayFloorplan?.height?.grid_b64?.length ?? ''),
     ].join('|');
 
     if (trailSpaceKeyRef.current && trailSpaceKeyRef.current !== nextSpaceKey) {
@@ -279,6 +549,11 @@ export const BevView: React.FC<BevViewProps> = ({
     displayFloorplan?.bounds?.max_x,
     displayFloorplan?.bounds?.min_z,
     displayFloorplan?.bounds?.max_z,
+    displayFloorplan?.snapshot_ts,
+    displayFloorplan?.ts,
+    displayFloorplan?.walkable?.grid_b64,
+    displayFloorplan?.obstacle_height?.grid_b64,
+    displayFloorplan?.height?.grid_b64,
   ]);
 
   useEffect(() => {
@@ -299,10 +574,26 @@ export const BevView: React.FC<BevViewProps> = ({
     }
 
     const points = Array.isArray(meta?.footpoints) ? meta.footpoints : [];
+    const dropUnresolvedPoint = (pt: typeof points[number]) => {
+      const stableNum = typeof pt?.stableId === 'number' && Number.isFinite(pt.stableId) ? pt.stableId : null;
+      const trackerNum = typeof pt?.trackerId === 'number' && Number.isFinite(pt.trackerId) ? pt.trackerId : null;
+      const historyKey = historyKeyForPoint(stableNum, trackerNum);
+      if (historyKey === null) return;
+      state.delete(historyKey);
+      trails.delete(historyKey);
+    };
+
     if (useBackendTrails) {
       trails.clear();
       const seenIds = new Set<string>();
       points.forEach(pt => {
+        const px = Number(pt.x);
+        const py = Number(pt.y);
+        const resolved = resolveDisplayPoint(px, py);
+        if (!resolved) {
+          dropUnresolvedPoint(pt);
+          return;
+        }
         const stableNum = typeof pt.stableId === 'number' && Number.isFinite(pt.stableId) ? pt.stableId : null;
         const trackerNum = typeof pt.trackerId === 'number' && Number.isFinite(pt.trackerId) ? pt.trackerId : null;
         const historyKey = historyKeyForPoint(stableNum, trackerNum);
@@ -310,8 +601,8 @@ export const BevView: React.FC<BevViewProps> = ({
         if (historyKey === null || displayId === null) return;
         seenIds.add(historyKey);
         state.set(historyKey, {
-          x: Number(pt.x),
-          y: Number(pt.y),
+          x: resolved.x,
+          y: resolved.y,
           lastSeen: arrivalNow,
           stableId: `${displayId}`,
           colorId: colorIdForPerson(cam, displayId),
@@ -331,8 +622,13 @@ export const BevView: React.FC<BevViewProps> = ({
       const sceneUnitsPerPx = trailSceneUnitsPerPxRef.current;
 
       points.forEach(pt => {
-        const targetX = pt.x;
-        const targetY = pt.y;
+        const resolved = resolveDisplayPoint(Number(pt.x), Number(pt.y));
+        if (!resolved) {
+          dropUnresolvedPoint(pt);
+          return;
+        }
+        const targetX = resolved.x;
+        const targetY = resolved.y;
 
         const stableNum = typeof pt.stableId === 'number' && Number.isFinite(pt.stableId) ? pt.stableId : null;
         const trackerNum = typeof pt.trackerId === 'number' && Number.isFinite(pt.trackerId) ? pt.trackerId : null;
@@ -373,7 +669,7 @@ export const BevView: React.FC<BevViewProps> = ({
     }
 
     pruneTrailCollection(trails, arrivalNow, cfg);
-  }, [cam, meta, resolvedTrailConfig]);
+  }, [cam, meta, resolveDisplayPoint, resolvedTrailConfig]);
 
   useEffect(() => {
     const render = () => {
@@ -384,7 +680,7 @@ export const BevView: React.FC<BevViewProps> = ({
 
       const metaNow = metaRef.current;
       const floorplanNow = displayFloorplan;
-      const aspect = variant === 'inline' ? 2 : (4 / 3);
+      const aspect = variant === 'inline' ? 1.2 : (4 / 3);
       const fitMode = 'contain';
 
       const floorplanFrame = floorplanNow?.frame;
@@ -392,29 +688,22 @@ export const BevView: React.FC<BevViewProps> = ({
       const isFloorplanWorld = isWorldFrame(floorplanFrame);
       const isFloorplanCameraLocal = isCameraLocalFrame(floorplanFrame);
       const floorplanUnits = String(floorplanNow?.units || '').trim().toLowerCase();
-      const hasSceneUnits = floorplanUnits === 'scene';
+      const hasFloorplanCompatibleUnits = hasCompatibleFloorplanUnits(floorplanUnits);
       const isFloorplanCompatible =
         coordMode === 'world'
-          ? ((!hasFloorplanFrame || isFloorplanWorld || isFloorplanCameraLocal) && hasSceneUnits)
+          ? ((!hasFloorplanFrame || isFloorplanWorld || isFloorplanCameraLocal) && hasFloorplanCompatibleUnits)
           : !floorplanFrame || isFloorplanCameraLocal;
-      const useBoundsFromFloorplan = coordMode === 'world'
-        ? (hasSceneUnits && (isFloorplanWorld || isFloorplanCameraLocal))
-        : (!hasFloorplanFrame || isFloorplanCameraLocal);
 
       let xMin = DEFAULT_X_MIN;
       let xMax = DEFAULT_X_MAX;
       let zMin = DEFAULT_Z_MIN;
       let zMax = DEFAULT_Z_MAX;
 
-      if (floorplanNow?.bounds && useBoundsFromFloorplan) {
-        const b = floorplanNow.bounds;
-        if (typeof b.min_x === 'number' && typeof b.max_x === 'number' &&
-          typeof b.min_z === 'number' && typeof b.max_z === 'number') {
-          xMin = b.min_x;
-          xMax = b.max_x;
-          zMin = b.min_z;
-          zMax = b.max_z;
-        }
+      if (displayBounds) {
+        xMin = displayBounds.min_x;
+        xMax = displayBounds.max_x;
+        zMin = displayBounds.min_z;
+        zMax = displayBounds.max_z;
       } else if (
         metaNow &&
         typeof metaNow.xMin === 'number' && typeof metaNow.xMax === 'number' &&
@@ -430,23 +719,14 @@ export const BevView: React.FC<BevViewProps> = ({
       const boundsSpanZ = Math.max(1e-6, zMax - zMin);
       const boundsAspect = boundsSpanX / boundsSpanZ;
 
-      const walkableLayer = floorplanNow?.walkable;
-      const obstacleHeightLayer = floorplanNow?.obstacle_height;
-      const heightLayer = floorplanNow?.height;
-      const hasWalkable = isFloorplanCompatible && !!(walkableLayer && walkableLayer.grid_b64 && walkableLayer.grid_shape);
-      const hasObstacleHeight = isFloorplanCompatible && !!(obstacleHeightLayer && obstacleHeightLayer.grid_b64 && obstacleHeightLayer.grid_shape);
-      const hasHeight = isFloorplanCompatible && !!(heightLayer && heightLayer.grid_b64 && heightLayer.grid_shape);
-      const forceLegacyHeightInline = variant === 'inline' && cam === 'kitchen' && hasHeight;
-
-      const hasComposite = !forceLegacyHeightInline && hasWalkable && hasObstacleHeight;
-      const baseLayer = forceLegacyHeightInline
-        ? heightLayer
-        : (hasWalkable ? walkableLayer : (hasObstacleHeight ? obstacleHeightLayer : heightLayer));
-      const baseKind = forceLegacyHeightInline
-        ? 'height'
-        : (hasComposite ? 'composite' : (hasWalkable ? 'walkable' : (hasObstacleHeight ? 'obstacle_height' : 'height')));
+      const visual = selectFloorplanVisualSelection(floorplanNow, isFloorplanCompatible, variant === 'inline');
+      const walkableLayer = visual.walkableLayer;
+      const obstacleHeightLayer = visual.obstacleHeightLayer;
+      const baseLayer = visual.baseLayer;
+      const baseKind = visual.baseKind;
+      const hasComposite = visual.hasComposite;
       const basePalette = baseKind === 'walkable' ? bwColor : infernoColor;
-      const hasFloorplan = !!(baseLayer && baseLayer.grid_b64 && baseLayer.grid_shape);
+      const hasFloorplan = visual.hasFloorplan;
 
       // Cache the floorplan render so we don't re-decode base64 every animation frame.
       const dpr = window.devicePixelRatio || 1;
@@ -530,7 +810,8 @@ export const BevView: React.FC<BevViewProps> = ({
 
       const drawX = (mx: number) => contentRect.x + ((mx - xMin) / (xMax - xMin)) * contentRect.w;
       const drawY = (mz: number) => contentRect.y + contentRect.h - ((mz - zMin) / (zMax - zMin)) * contentRect.h;
-      const inBounds = (mx: number, mz: number) => mx >= xMin && mx <= xMax && mz >= zMin && mz <= zMax;
+      const resolveForDraw = (mx: number, mz: number): ResolvedMetricPoint | null => resolveDisplayPoint(mx, mz);
+      const inBounds = (mx: number, mz: number) => resolveForDraw(mx, mz) !== null;
 
       const footpoints = Array.isArray(metaNow?.footpoints) ? metaNow.footpoints : [];
       let finitePointCount = 0;
@@ -540,7 +821,7 @@ export const BevView: React.FC<BevViewProps> = ({
         const py = Number(p?.y);
         if (!Number.isFinite(px) || !Number.isFinite(py)) continue;
         finitePointCount += 1;
-        if (inBounds(px, py)) inBoundsPointCount += 1;
+        if (resolveForDraw(px, py)) inBoundsPointCount += 1;
       }
 
       if (overlayEnabled) {
@@ -621,7 +902,13 @@ export const BevView: React.FC<BevViewProps> = ({
                   y: Number(p?.y),
                   t: Number(p?.t),
                 }))
-                .filter((p) => Number.isFinite(p.x) && Number.isFinite(p.y) && Number.isFinite(p.t));
+                .map((p) => {
+                  if (!Number.isFinite(p.x) || !Number.isFinite(p.y) || !Number.isFinite(p.t)) return null;
+                  const resolved = resolveForDraw(p.x, p.y);
+                  if (!resolved) return { x: Number.NaN, y: Number.NaN, t: p.t };
+                  return { x: resolved.x, y: resolved.y, t: p.t };
+                })
+                .filter((p): p is TrailPoint => p !== null);
               if (points.length < 2) return null;
               return {
                 points,
@@ -644,33 +931,36 @@ export const BevView: React.FC<BevViewProps> = ({
           let prev: TrailPoint | null = null;
           for (let i = 0; i < pts.length; i += 1) {
             const p = pts[i];
-            const isGap = !Number.isFinite(p.x) || !Number.isFinite(p.y) || !inBounds(p.x, p.y);
+            const resolved = Number.isFinite(p.x) && Number.isFinite(p.y) ? resolveForDraw(p.x, p.y) : null;
+            const isGap = !resolved;
             if (isGap) {
               prev = null;
               continue;
             }
+            const drawPoint = { ...p, x: resolved.x, y: resolved.y };
             if (!prev) {
-              prev = p;
+              prev = drawPoint;
               continue;
             }
 
-            const ageMs = Math.max(0, now - p.t);
+            const ageMs = Math.max(0, now - drawPoint.t);
             const frac = Math.max(0, Math.min(1, 1 - (ageMs / trailWindowMs)));
             const alpha = trailCfg.min_alpha + (1 - trailCfg.min_alpha) * frac;
 
             ctx.strokeStyle = hsla(tr.colorId, alpha);
             ctx.beginPath();
             ctx.moveTo(drawX(prev.x), drawY(prev.y));
-            ctx.lineTo(drawX(p.x), drawY(p.y));
+            ctx.lineTo(drawX(drawPoint.x), drawY(drawPoint.y));
             ctx.stroke();
-            prev = p;
+            prev = drawPoint;
           }
 
           let lastValid: TrailPoint | null = null;
           for (let i = pts.length - 1; i >= 0; i -= 1) {
             const p = pts[i];
-            if (Number.isFinite(p.x) && Number.isFinite(p.y) && inBounds(p.x, p.y)) {
-              lastValid = p;
+            const resolved = Number.isFinite(p.x) && Number.isFinite(p.y) ? resolveForDraw(p.x, p.y) : null;
+            if (resolved) {
+              lastValid = { ...p, x: resolved.x, y: resolved.y };
               break;
             }
           }
@@ -701,10 +991,11 @@ export const BevView: React.FC<BevViewProps> = ({
       smoothState.current.forEach((pt) => {
         const age = now - pt.lastSeen;
         if (age > 500) return;
-        if (!Number.isFinite(pt.x) || !Number.isFinite(pt.y) || !inBounds(pt.x, pt.y)) return;
+        const resolved = Number.isFinite(pt.x) && Number.isFinite(pt.y) ? resolveForDraw(pt.x, pt.y) : null;
+        if (!resolved) return;
 
-        const px = drawX(pt.x);
-        const py = drawY(pt.y);
+        const px = drawX(resolved.x);
+        const py = drawY(resolved.y);
 
         const alpha = Math.max(0, 1 - age / 500);
         const colorId = Number.isFinite(pt.colorId) ? pt.colorId : 0;
@@ -747,7 +1038,7 @@ export const BevView: React.FC<BevViewProps> = ({
       ctx.lineTo(camPx, camPy - 26);
       ctx.stroke();
 
-      if (finitePointCount > 0 && inBoundsPointCount === 0) {
+      if (debug && finitePointCount > 0 && inBoundsPointCount === 0) {
         ctx.fillStyle = 'rgba(244, 67, 54, 0.9)';
         ctx.font = 'bold 11px sans-serif';
         ctx.textAlign = 'center';
@@ -783,29 +1074,26 @@ export const BevView: React.FC<BevViewProps> = ({
     return () => {
       if (animationFrameRef.current) cancelAnimationFrame(animationFrameRef.current);
     };
-  }, [coordMode, debug, floorplan, overlayEnabled, resolvedTrailConfig, variant]);
+  }, [coordMode, debug, displayBounds, floorplan, overlayEnabled, resolveDisplayPoint, resolvedTrailConfig, variant]);
 
   const floorplanFrame = displayFloorplan?.frame;
   const hasFloorplanFrame = typeof floorplanFrame === 'string' && floorplanFrame.trim().length > 0;
   const isFloorplanWorld = isWorldFrame(floorplanFrame);
   const isFloorplanCameraLocal = isCameraLocalFrame(floorplanFrame);
   const floorplanUnits = String(displayFloorplan?.units || '').trim().toLowerCase();
-  const hasSceneUnits = floorplanUnits === 'scene';
+  const hasFloorplanCompatibleUnits = hasCompatibleFloorplanUnits(floorplanUnits);
   const isFloorplanCompatible =
     coordMode === 'world'
-      ? ((!hasFloorplanFrame || isFloorplanWorld || isFloorplanCameraLocal) && hasSceneUnits)
+      ? ((!hasFloorplanFrame || isFloorplanWorld || isFloorplanCameraLocal) && hasFloorplanCompatibleUnits)
       : !floorplanFrame || isFloorplanCameraLocal;
 
-  const hasWalkableLayer = isFloorplanCompatible && !!(displayFloorplan?.walkable?.grid_b64 && displayFloorplan?.walkable?.grid_shape);
-  const hasObstacleHeightLayer = isFloorplanCompatible && !!(displayFloorplan?.obstacle_height?.grid_b64 && displayFloorplan?.obstacle_height?.grid_shape);
-  const hasHeightLayer = isFloorplanCompatible && !!(displayFloorplan?.height?.grid_b64 && displayFloorplan?.height?.grid_shape);
-  const forceLegacyHeightInline = variant === 'inline' && cam === 'kitchen' && hasHeightLayer;
-  const floorplanHasImage = hasWalkableLayer || hasObstacleHeightLayer || hasHeightLayer;
+  const visualSelection = selectFloorplanVisualSelection(displayFloorplan, isFloorplanCompatible, variant === 'inline');
+  const hasWalkableLayer = visualSelection.baseKind === 'walkable' || visualSelection.baseKind === 'composite';
+  const hasObstacleHeightLayer = visualSelection.baseKind === 'obstacle_height';
+  const floorplanHasImage = visualSelection.hasFloorplan;
 
   const isFrameMismatch = coordMode === 'world' && isFloorplanCameraLocal;
-  const baseLabel = forceLegacyHeightInline
-    ? 'Height Map'
-    : (hasWalkableLayer ? 'Walkable Map' : (hasObstacleHeightLayer ? 'Obstacle Height' : 'Height Map'));
+  const baseLabel = hasWalkableLayer ? 'Walkable Map' : (hasObstacleHeightLayer ? 'Obstacle Height' : 'Height Map');
   const subtitleText = floorplanHasImage ? (isFrameMismatch ? `${baseLabel} (local-floorplan fallback)` : baseLabel) : 'No Map Data';
   const subtitle = ` • ${subtitleText}`;
   const fallbackActive = Boolean(meta?.fallbackActive);

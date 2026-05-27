@@ -16,6 +16,17 @@ type Track = {
   world?: [number, number, number];
   world_valid?: boolean;
   world_frame?: string;
+  world_source?: string;
+  world_quality?: string;
+  world_quality_reason?: string;
+  depth_status?: string | null;
+  depth_anchor_source?: string | null;
+  depth_anchor_m?: number | null;
+  depth_used_m?: number | null;
+  depth_center_m?: number | null;
+  depth_median_m?: number | null;
+  depth_sample_count?: number | null;
+  depth_valid_fraction?: number | null;
 };
 
 export type CamerasStats = Record<string, {

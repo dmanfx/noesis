@@ -1,35 +1,40 @@
 # Noesis Codebase Description
-_Status: current as of 2026-02-22._
+_Status: current as of 2026-03-16._
 
 ## Project Overview
 
-**Noesis** is a high-performance, GPU-accelerated real-time video analytics application built on **NVIDIA DeepStream 8.0 Service Maker**. The system processes multiple RTSP camera streams end-to-end on the GPU, performing object detection, tracking, re-identification, analytics, depth estimation, and visualization with zero CPU fallbacks in the core pipeline.
+**Noesis** is a high-performance, GPU-first real-time video analytics application built on **NVIDIA DeepStream 8.0 Service Maker**. The system processes multiple RTSP camera streams end-to-end on the GPU for decode, preprocess, inference, tracking, analytics, tiling, and OSD, with CPU used only at the metadata/serialization edge and for the minimal per-object depth-fusion boundary that DeepStream does not expose as a pure GPU contract.
 
 ### Purpose
 Real-time multi-camera video analytics pipeline for:
-- Object detection and instance segmentation (YOLOv11)
+- Runtime-selectable object detection and instance segmentation, with YOLO26 segmentation as the active baseline tracking path
 - Multi-object tracking with cross-camera re-identification
 - Spatial analytics (ROI filtering, line crossing, occupancy)
 - Bird's-eye view (BEV) visualization with trail rendering
-- Monocular depth estimation (MapAnything)
+- Split monocular depth processing:
+  - MapAnything full-frame depth/floorplan/RPC reference lane
+  - Depth Anything V2 baseline tracking-depth lane fused into `track.world`
 - Real-time WebRTC streaming to browser frontends
 
 ### Key Features
-- **End-to-End GPU Processing**: All operations from video decoding (NVDEC) to AI inference (TensorRT) run on GPU via NVMM surfaces
+- **GPU-First Core Pipeline**: Decode, preprocess, inference, tracking, analytics, tiling, and OSD stay on GPU via NVMM surfaces; CPU is used only for metadata extraction, serialization, and the minimal per-object depth fusion boundary
 - **Multi-Stream Support**: Processes multiple RTSP camera streams simultaneously via `nvmultiurisrcbin`
-- **YOLOv11 Object Detection**: Custom-parsed YOLOv11 segmentation model for primary inference with instance masks
+- **Primary Detection Profiles**: Runtime-selectable PGIE path, including YOLO26 segmentation in active baseline tracking work
 - **Advanced Tracking**: NVIDIA NvDCF tracker with OSNet-based re-identification for stable cross-camera IDs
 - **Pose-assisted StableID**: YOLO26 pose SGIE ratio features can be fused into StableID as a secondary signal (bounded in RAM; no disk persistence)
 - **Analytics**: ROI filtering, line crossing, direction detection, overcrowding via `nvdsanalytics`
-- **Bird's-Eye View (BEV)**: Real-time top-down visualization in native scene units (`menon_scene` world mode) with frontend-owned trail smoothing/persistence
-- **MapAnything Integration**: Full-frame depth estimation with valve-gated GPU inference branch
+- **Bird's-Eye View (BEV)**: Real-time top-down visualization from canonical backend `track.world`; world-mode no longer runs a second BEV smoother over already-filtered world positions
+- **Split Depth Architecture**:
+  - MapAnything: gated full-frame GPU depth/RPC/floorplan branch
+  - DAv2: always-on baseline tracking depth fused into world estimation
+  - Offline DAv2->MapAnything registration artifact aligns room-relative range before projection
 - **Real-time WebRTC Streaming**: H.264 video via RTSP→WebRTC gateway for browser delivery
 - **Motion Trails**: GPU-rendered persistent trails behind tracked objects in the mosaic OSD
 
 ### Technology Stack
 - **Backend**: Python 3.10+, NVIDIA DeepStream 8.0 Service Maker (`pyservicemaker`), TensorRT
 - **Frontend**: React + TypeScript, Vite, WebSocket/WebRTC client
-- **ML Models**: YOLOv11-seg (Ultralytics), OSNet ReID (torchreid), MapAnything (Meta Research), OPtional:Yolo26_seg/pose, RF-DETR (--pgie-profile)
+- **ML Models**: Runtime-selectable PGIE profiles (commonly YOLO26-seg in current baseline work), YOLO26 pose SGIE, OSNet ReID (torchreid), Depth Anything V2 metric, MapAnything (Meta Research), optional RF-DETR (`--pgie-profile`)
 - **GPU Libraries**: CUDA, cuDNN, TensorRT, `pyds` DeepStream Python bindings
 - **Communication**: WebSockets (JSON telemetry + optional BEV JPEG binaries), WebRTC (H.264 video)
 
@@ -62,7 +67,7 @@ The system follows a **layered architecture** with clear separation between the 
 │  │ DS8 Runtime Harness (noesis/ds8_runtime.py)                        │ │
 │  │  - Coordinates pipeline lifecycle (build → prepare → activate)     │ │
 │  │  - Manages WebSocket server and REST APIs                          │ │
-│  │  - Attaches metadata hooks (analytics, ReID, depth)                │ │
+│  │  - Attaches metadata hooks (analytics, ReID, depth, fused world)   │ │
 │  └───────────────────┬────────────────────────────────────────────────┘ │
 │                      │                                                  │
 │  ┌───────────────────▼───────────────────┬────────────────────────────┐ │
@@ -78,6 +83,7 @@ The system follows a **layered architecture** with clear separation between the 
 │  │  - pyservicemaker.Pipeline graph construction from YAML            │ │
 │  │  - Component wiring (sources → inference → tracking → output)      │ │
 │  │  - Valve-based MapAnything gating                                  │ │
+│  │  - Always-on DAv2 tracking-depth lane                              │ │
 │  └───────────────────┬────────────────────────────────────────────────┘ │
 │                      │                                                  │
 │  ┌───────────────────▼────────────────────────────────────────────────┐ │
@@ -85,6 +91,7 @@ The system follows a **layered architecture** with clear separation between the 
 │  │  - BatchMetadataOperator probes for telemetry extraction           │ │
 │  │  - Trail overlay rendering via NvDsDisplayMeta                     │ │
 │  │  - MapAnything tensor postprocess                                  │ │
+│  │  - DAv2 object-depth fusion + pose+depth world estimation          │ │
 │  │  - OSNet ReID embedding extraction for StableIDManager             │ │
 │  └────────────────────────────────────────────────────────────────────┘ │
 └─────────────────────────────────────────────────────────────────────────┘
@@ -92,18 +99,30 @@ The system follows a **layered architecture** with clear separation between the 
 ┌───────────────────────────────▼──────────────────────────────────────────┐
 │              DeepStream 8 Service Maker Runtime (GPU)                    │
 │                                                                          │
-│  nvmultiurisrcbin ──► nvstreammux ──► nvdspreprocess ──► nvinfer(PGIE)   │
+│  source nodes ──► nvstreammux ──► [nvdspreprocess] ──► nvinfer(PGIE)     │
 │                                                              │           │
-│                               ┌───────────────────────────── tee         │
-│                               │                               │          │
-│                               ▼                               ▼          │
-│                         nvtracker                    queue → valve       │
-│                               │                               │          │
-│                               ▼                               ▼          │
-│                       nvdsanalytics               nvinfer(MapAnything)   │
-│                               │                               │          │
-│                               ▼                               ▼          │
-│                   nvinfer(ReID SGIE)                      fakesink       │
+│                               ┌───────────────────────────── tee ───────┐│
+│                               │                    │                    ││
+│                               ▼                    ▼                    ▼│
+│                    [nvdsroiexclude]         depth_tracking_queue   mapanything_queue
+│                               │                    │                    ││
+│                               ▼                    ▼                    ▼│
+│                         nvtracker         depth_tracking_fullframe     valve│
+│                               │                    │                    ││
+│                               ▼                    ▼                    ▼│
+│                       [nvdsanalytics]   depth_tracking_fullframe_sink mapanything_fullframe
+│                               │                                         ││
+│                               ▼                                         ▼│
+│                   [nvinfer(ReID SGIE)]                 mapanything_fullframe_sink
+│                               │                                          │
+│                               ▼                                          │
+│                   [nvinfer(Pose SGIE)]                                   │
+│                               │                                          │
+│                               ▼                                          │
+│                 world_observation_stage                                  │
+│                               │                                          │
+│                               ▼                                          │
+│                 tracking_telemetry_stage                                 │
 │                               │                                          │
 │                               ▼                                          │
 │                     nvmultistreamtiler                                   │
@@ -114,8 +133,14 @@ The system follows a **layered architecture** with clear separation between the 
 │                           sink_tee ───────────────────────────────┐      │
 │                               │                                   │      │
 │                               ▼                                   ▼      │
-│                        nvrtspoutsinkbin                      placeholders │
-│                           (H.264 RTSP)                      (Flow-reserved)│
+│                          rtsp_queue                         other sinks   │
+│                               │                              / placeholders│
+│                               ▼                                          │
+│                          rtsp_vconv                                      │
+│                               │                                          │
+│                               ▼                                          │
+│                        nvrtspoutsinkbin                                  │
+│                           (H.264 RTSP)                                   │
 └──────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -129,15 +154,22 @@ The system follows a **layered architecture** with clear separation between the 
   - **Sources**: `nvmultiurisrcbin` (default) for multi-stream ingest with reconnection
   - **Stream Muxer**: `nvstreammux` batches streams (implicit in nvmultiurisrcbin)
   - **Preprocess**: Optional `nvdspreprocess` for ROI/tensor preparation
-  - **Primary Inference**: `nvinfer` with YOLOv11-seg model (instance segmentation)
-  - **Tee**: Splits flow to tracker chain and optional MapAnything branch
+  - **Primary Inference**: `nvinfer` with runtime-materialized PGIE profile (commonly YOLO26-seg in current baseline work)
+  - **Tee**: Splits flow to tracker chain, always-on DAv2 tracking-depth branch, and gated MapAnything branch
+  - **Exclude Stage**: optional `nvdsroiexclude` pruning before tracking
   - **Tracker**: `nvtracker` with NvDCF multi-object tracking
-  - **Analytics**: `nvdsanalytics` for ROI/line crossing events
+  - **Analytics**: optional `nvdsanalytics` for ROI/line crossing events
   - **ReID SGIE**: `nvinfer` with OSNet model for cross-camera re-identification
+  - **Pose SGIE**: `nvinfer` with YOLO26 pose for pose-first anchor authority
+  - **World Observation**: backend fused pose+depth world estimation
+  - **Tracking Telemetry Stage**: canonical `track.world` publishing before BEV/OSD consumers
   - **Tiler**: `nvmultistreamtiler` creates mosaic view
   - **OSD**: `nvdsosd` overlays bounding boxes, masks, labels, and trails
-  - **Output Sinks**: RTSP (`nvrtspoutsinkbin`) for mosaic delivery (consumed by the RTSP→WebRTC gateway). Mosaic JPEG/WebSocket output is removed in DS8.
-- **Depth Gating**: Valve-based gating for MapAnything branch with automatic priming
+  - **Output Sinks**: `sink_tee` fans out to the RTSP branch (`rtsp_queue -> rtsp_vconv -> nvrtspoutsinkbin`) plus placeholder/auxiliary sinks. Mosaic JPEG/WebSocket output is removed in DS8.
+- **Depth Ownership**:
+  - MapAnything remains valve-gated for RPC/full-frame depth work
+  - DAv2 remains always on for baseline tracking
+  - a read-only depth-registration artifact aligns DAv2 range into MapAnything/room space before the fused world update
 
 #### 2. **Metadata Hooks** (`noesis/pipelines/hooks.py`)
 - **BatchMetadataOperator Probes**: Attach to pipeline nodes for per-frame processing
@@ -152,6 +184,7 @@ The system follows a **layered architecture** with clear separation between the 
   - `attach_analytics_reload_bridge`: Hot-reloads analytics config at runtime
 - **TrailOverlayProcessor**: GPU-rendered per-person motion trails with configurable styling
 - **MapAnythingProcessor**: Tensor-to-depth conversion with async storage
+- **Baseline depth/world path**: consumes `NOESIS.OBJECT_DEPTH`, applies the offline DAv2->MapAnything registration artifact inside the pose-ray depth observation, and writes canonical `track.world`
 
 #### 3. **DS8 Runtime Harness** (`noesis/ds8_runtime.py`)
 - **Entry Point**: `main()` function orchestrating the application lifecycle
@@ -164,6 +197,7 @@ The system follows a **layered architecture** with clear separation between the 
   - Manage WebRTC gateway startup (RTSP→WebRTC passthrough)
   - Handle graceful shutdown on SIGINT/SIGTERM
 - **CalibrationProvider**: Provides camera intrinsics/extrinsics for BEV rendering
+- **DepthRegistrationManager**: Loads and validates the per-camera DAv2->MapAnything registration artifact before baseline startup
 
 #### 4. **WebSocket Server** (`websocket_server.py`)
 - **WebSocketServer**: Async WebSocket server for real-time client communication
@@ -250,7 +284,10 @@ Noesis_Devel/
 │
 ├── noesis/                          # Core DS8 application package
 │   ├── ds8_runtime.py              # DS8 runtime harness (main entry point)
+│   ├── depth_tracking_materialization.py # DAv2 depth-tracking asset materialization + native guardrails
 │   ├── mosaic_webrtc_gateway.py    # RTSP→WebRTC passthrough gateway
+│   ├── calibration/
+│   │   └── depth_registration.py   # DAv2->MapAnything registration contracts/loader
 │   ├── pipelines/
 │   │   ├── ds8_pipeline.py         # Service Maker pipeline builder
 │   │   └── hooks.py                # BatchMetadataOperator hooks
@@ -288,12 +325,24 @@ Noesis_Devel/
 │
 ├── pipelines/                       # DeepStream INI configs
 │   ├── config_infer_primary_yolo11_seg.ini
+│   ├── config_infer_secondary_depth_tracking_da2.template.ini
 │   ├── config_infer_secondary_reid_osnet.ini
 │   ├── config_infer_secondary_mapanything.ini
 │   └── config_preproc.ini
 │
 ├── models/                          # ML model files
 │   └── engines/                    # TensorRT engine files
+│
+├── native/                          # Native metadata/tensor extraction bridges
+│   ├── noesis_depth_meta_ext.cpp   # NOESIS.OBJECT_DEPTH bridge
+│   └── noesis_depth_tracking_tensor_ext.cpp # Baseline DAv2 tensor extractor/alignment bridge
+│
+├── scripts/
+│   └── build_depth_registration.py # Offline DAv2->MapAnything registration builder
+│
+├── services/
+│   └── mapanything_svc/
+│       └── server.py               # MapAnything service used for RPC/reference depth and registration builds
 │
 ├── oai2-fe/                         # React frontend
 │   ├── src/
@@ -332,10 +381,12 @@ Noesis_Devel/
 
 ### Pipeline Configuration (`config/infer.yaml`)
 
-The primary DS8 pipeline is defined in `config/infer.yaml`:
+The primary DS8 pipeline is defined in `config/infer.yaml`. The excerpt below is intentionally minimal and shows only the parts that matter to the current baseline topology:
 
 ```yaml
 version: 1
+depth_registration:
+  path: config/depth_registration.json
 batch_size: 3
 
 streammux:
@@ -352,13 +403,21 @@ sources:
 models:
   pgie:
     config-file-path: pipelines/config_infer_primary_yolo11_seg.ini
-    engine: models/engines/yolo11s-seg.engine
-  reid:
+    gie_id: 1
+  pose:
     enable: true
-    config-file-path: pipelines/config_infer_secondary_reid_osnet.ini
+    config-file-path: pipelines/config_infer_secondary_yolo26_pose.ini
+    gie_id: 4
+  depth_tracking:
+    enable: true
+    name: depth_tracking_fullframe
+    config-file-path: build/config_infer_depth_tracking_da2_vits_294x518_b3_i1.ini
+    gie_id: 5
   mapanything:
     enable: true
+    name: mapanything_fullframe
     config-file-path: pipelines/config_infer_secondary_mapanything.ini
+    gie_id: 2
 
 tracker:
   config-file: config/nvtracker.yaml
@@ -375,8 +434,8 @@ mosaic_output:
 visualization:
   trails:
     enabled: true
-    window_s: 8.0
-    color_key: stable_id
+    anchor_mode: floor_plane_gravity_drop
+    gap_predict_ttl_s: 0.0
 ```
 
 ### Environment Variables
@@ -400,19 +459,21 @@ visualization:
 1. **Video Input**: RTSP streams → `nvmultiurisrcbin` → GPU decode (NVDEC)
 2. **Batching**: Multiple streams → `nvstreammux` → batched NVMM tensor
 3. **Preprocess**: Optional `nvdspreprocess` for ROI/tensor preparation
-4. **Primary Inference**: Batched frames → `nvinfer` (YOLOv11-seg) → detections + masks
+4. **Primary Inference**: Batched frames → runtime-selected `nvinfer` PGIE → detections + masks
 5. **Tracking**: Detections → `nvtracker` (NvDCF) → tracked objects with IDs
 6. **Analytics**: Tracks → `nvdsanalytics` → events (ROI, line crossing, occupancy)
 7. **ReID**: Tracked crops → `nvinfer` (OSNet SGIE) → embedding tensors → StableIDManager
-8. **Depth Branch** (parallel): Frames → `valve` → `nvinfer` (MapAnything) → depth tensor
-9. **Visualization**: Frames + metadata → `nvmultistreamtiler` → `nvdsosd` → overlays + trails
-10. **Output**:
-    - **RTSP**: `nvrtspoutsinkbin` → H.264 stream at `rtsp://host:8554/mosaic`
+8. **Pose SGIE**: Tracked persons → `nvinfer` (YOLO26 pose SGIE) → pose keypoints/ratios for pose-first anchoring
+9. **Always-On Tracking Depth Branch**: PGIE tee → `depth_tracking_queue` → `nvinfer` (DAv2) → native tensor extraction/alignment → `NOESIS.OBJECT_DEPTH`
+10. **Gated Reference Depth Branch**: PGIE tee → `mapanything_queue` → `valve` → `nvinfer` (MapAnything) → full-frame depth / floorplan / RPC path
+11. **World Estimation**: Pose anchor + floor observation + registered DAv2 depth observation → fused backend `track.world`
+12. **Visualization**: Frames + canonical tracking telemetry → `nvmultistreamtiler` → `nvdsosd` → overlays + trails
+13. **Output**:
+    - **RTSP**: `sink_tee` → `rtsp_queue` → `rtsp_vconv` → `nvrtspoutsinkbin` → H.264 stream at `rtsp://host:8554/mosaic`
     - **WebRTC**: `MosaicWebRTCGateway` consumes RTSP → WebRTC to browser
     - **WebSocket**: telemetry JSON + WebRTC signaling; optional BEV JPEG binaries
-11. **Metadata Extraction**: BatchMetadataOperator probes extract `NvDsBatchMeta`
-12. **WebSocket Broadcast**: Tracking telemetry (JSON) → frontend
-13. **BEV Rendering**: Footpoints + calibration → homography → top-down view
+14. **Metadata Extraction**: `BatchMetadataOperator` probes extract `NvDsBatchMeta` and publish canonical track/depth telemetry
+15. **BEV Rendering**: Backend-owned `track.world` → BEV/Three.js/world-mode consumers without a second world-space smoother
 
 ---
 
@@ -422,29 +483,30 @@ visualization:
 2. **Factory Pattern**: `build_pipeline()` creates pipeline from YAML configuration
 3. **Probe/Operator Pattern**: `BatchMetadataOperator` + `Probe` for non-invasive metadata extraction
 4. **Observer Pattern**: WebSocket server broadcasts to multiple clients; toggle callbacks
-5. **Strategy Pattern**: Different depth request strategies (fresh vs cache-first)
-6. **Valve Pattern**: GStreamer `valve` element for conditional branch gating
+5. **Registration Pattern**: Offline DAv2->MapAnything artifact aligns room-relative range before runtime world projection
+6. **Valve Pattern**: GStreamer `valve` element for conditional MapAnything branch gating
 7. **Gateway Pattern**: `MosaicWebRTCGateway` bridges RTSP and WebRTC protocols
 
 ---
 
 ## Integration Points
 
-1. **DeepStream → Python**: `BatchMetadataOperator` probes extract `NvDsBatchMeta` from pipeline
-2. **Python → Frontend**: WebSocket server streams telemetry (JSON) and optional BEV JPEG binaries.
-3. **Frontend → Backend**: RPC messages for calibration, depth requests, BEV config
-4. **RTSP → WebRTC**: `MosaicWebRTCGateway` passthrough (no transcoding)
-5. **Telemetry**: Publishers send tracking/depth data over WebSocket
+1. **DeepStream → Python**: `BatchMetadataOperator` probes extract `NvDsBatchMeta` from the canonical DS8 graph
+2. **Native → Python**: `noesis_depth_tracking_tensor_ext` and `noesis_depth_meta_ext` bridge baseline DAv2 tensors and object-depth user meta into Python-visible contracts
+3. **Offline Registration Build**: `scripts/build_depth_registration.py` pairs DAv2 and MapAnything depth on matching frames to produce `config/depth_registration.json`
+4. **Python → Frontend**: WebSocket server streams telemetry (JSON) and optional BEV JPEG binaries
+5. **Frontend → Backend**: RPC messages for calibration, depth requests, floorplan generation, and BEV config
+6. **RTSP → WebRTC**: `MosaicWebRTCGateway` passthrough (no transcoding)
 
 ---
 
 ## Performance Characteristics
 
-- **GPU-Only Processing**: Zero CPU fallbacks in core pipeline; all operations on GPU via NVMM
+- **GPU-First Processing**: Decode, preprocess, inference, tracking, analytics, tiling, and OSD stay on GPU; CPU is limited to metadata extraction, serialization, and the minimal per-object depth-fusion boundary
 - **Multi-Stream**: Supports 3+ simultaneous RTSP streams with batched inference
 - **Real-time**: Sub-100ms latency from frame capture to frontend display
 - **Scalable**: Batch processing via `nvmultiurisrcbin`/`nvstreammux` for efficient GPU utilization
-- **Memory Efficient**: GPU memory pools, frame coalescing, Zarr-based depth storage
+- **Memory Efficient**: GPU memory pools, frame coalescing, and artifact-based registration keep runtime state bounded
 - **WebRTC Passthrough**: No transcode overhead for browser video delivery
 
 ---
@@ -459,10 +521,8 @@ source ./activate_deepstream.sh
 
 # Start DS8 runtime
 python noesis/ds8_runtime.py \
-  --pipeline-config config/infer.yaml \
-  --cameras-config config/cameras.yaml \
-  --ws-port 6008 \
-  --rest-port 8080
+  --pgie-profile yolo26_seg \
+  --size s
 ```
 
 ### Frontend Development
@@ -491,7 +551,10 @@ export NOESIS_REID_ENABLED=1           # Enable ReID
 - **Stack**: DeepStream 8.0 Service Maker (`pyservicemaker`)
 - **Video Delivery**: RTSP → WebRTC gateway (mosaic); WebSocket carries signaling (plus telemetry/optional BEV JPEG binaries).
 - **Tracking**: NvDCF + OSNet ReID for stable cross-camera IDs
-- **Depth**: MapAnything full-frame with valve gating
+- **Depth**:
+  - baseline DAv2 lane is always on and contributes to fused `track.world`
+  - MapAnything stays valve-gated for full-frame RPC/floorplan/reference work
+  - DAv2 depth is room-registered through the offline `config/depth_registration.json` artifact before the pose-ray world update
 - **Trails**: GPU-rendered via NvDsDisplayMeta on mosaic OSD
 - **APIs**: REST (FastAPI) for analytics, WebSocket for telemetry
 

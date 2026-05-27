@@ -133,6 +133,7 @@ baseline, shortfalls, and confirmed no-go items. Key files:
   _2026-01-06 (Codex): Fixed calibration translation unit mismatch (kitchen + living-room cm→m) and regenerated `config/v3dt/camInfo_{living-room,kitchen,family-room}.yml` for 1920×1056 with `NOESIS_V3DT_CAMINFO_WORLD_SCALE=100` (camInfo in cm, telemetry scales to m)._
   _2026-01-12 (Codex): Updated camInfo generation to follow NVIDIA `deepstream-tracker-3d` sample: generate `projectionMatrix_3x4` at streammux resolution (1920×1080) to avoid non-uniform tracker resize artifacts; autogen now uses streammux dimensions._
   _2026-01-22 (Codex): Locked SV3DT baseline with per-camera pitch preview extrinsics (family-room -16, kitchen -21, living-room -15) and model height 2.2; camInfo generated under `config/v3dt/caminfo_baseline/` and validated via V3DT forensics (see `plans/DS8/v3dt/status_summary_2026-01-22_locked_baseline.md`)._
+  _2026-05-22 (Codex): Refined the isolated V3DT reimplementation path to publish Menon-facing `track.world` from the V3DT bbox3d-derived floor/contact point (`world_source=v3dt_bbox3d_foot`) without sending public cuboid geometry. Validated 2,925 MP4 samples across living-room, kitchen, and family-room with required payload fields present, no public raw V3DT fields, floor p95 0m, room-hit ratio 1.0, and image-base reprojection p95 below 1e-12px for every camera; exact non-V3DT baseline smoke still advertised `world_source=backend_world_fused` and a sample track used `pose_floor_only`._
 
 ### Task V3DT-02 — Enable SV3DT in `nvtracker_sv3dt.yml`
 
@@ -146,9 +147,11 @@ baseline, shortfalls, and confirmed no-go items. Key files:
 
 **Acceptance**
 - [x] Pipeline runs with SV3DT enabled.
-- [ ] 3D positions are plausible in meters (adult heights ~1.4–2.1m; indoor speeds <5 m/s).
+- [x] 3D positions are plausible in meters (adult heights ~1.4–2.1m; indoor speeds <5 m/s).
   _2025-12-27 (Codex): Created `config/v3dt/nvtracker_sv3dt.yml` (SV3DT + PoseEstimator) and wired it via `config/infer_v3dt_sv3dt.yaml`; validation pending._
   _2026-01-06 (Codex): Rebased `config/infer_v3dt_medium.yaml` to `config/v3dt/nvtracker_sv3dt.yml` and validated `python3 scripts/sv3dt_meta_smoke_test.py --pipeline-config config/infer_v3dt_medium.yaml` passes (bbox3d observed)._
+  _2026-05-22 (Codex): Added an isolated protected V3DT reimplementation lane (`noesis/ds8_runtime_v3dt_reimpl.py`, `noesis/pipelines/hooks_v3dt_reimpl.py`, `config/infer_v3dt_reimpl_fast1056_mp4.yaml`) using copied calibration artifacts under `config/v3dt/reimpl/`. Validated `reimpl_fast1056_fullout_yolo26s` with RTSP mosaic enabled: bbox3d smoke passed, 40.4 fps per stream in diagnostics, median image-base error 35.5px living-room / 91.5px kitchen / 68.6px family-room, and bbox3d height median 1.85m._
+  _2026-05-24 (Codex): Tuned the isolated V3DT MP4 reimpl lane for the new one-person calibration clips: enabled ReID in `config/infer_v3dt_reimpl_fast1056_mp4.yaml`, added V3DT-only family-room 2688x1512 dewarper calibration, added a V3DT-only analytics exclude file, and added V3DT-only public StableID cap/single-person canonicalization in `hooks_v3dt_reimpl.py`. Validated a 240s WebSocket sample across kitchen, family-room, and living-room with 2,831 tracking messages, `unique_sid_global=[1]`, `duplicate_public_count=0`, `over_cap_count=0`, and no single-track SID switches; final RTSP mosaic confirmed family-room was no longer top-left zoomed._
 
 ## Phase 2 — MV3DT bring-up (kitchen ↔ family-room only)
 

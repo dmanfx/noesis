@@ -9,7 +9,7 @@ Canonical runtime path:
 - **DS8 (canonical, under `noesis/`):**
   - `noesis/ds8_runtime.py` – main runtime harness (CLI, WS, REST).
   - `noesis/pipelines/ds8_pipeline.py` – builds DS8 Service Maker pipeline from `config/infer.yaml`.
-  - `noesis/pipelines/hooks.py` – attaches metadata operators (intrinsics, MapAnything, analytics, exclusion).
+  - `noesis/pipelines/hooks.py` – attaches metadata operators (MapAnything, baseline DAv2 object-depth fusion, analytics, exclusion, BEV/world tracking).
   - `noesis/server/depth_api.py` – REST control for depth bursts.
   - `noesis/server/analytics_api.py` – REST API for analytics ROI management.
   - `noesis/telemetry/*` – depth, tracking, BEV publishers.
@@ -33,9 +33,16 @@ Key config files:
   - DS8 Service Maker / pipeline config:
     - Sources (URIs, per-source settings).
     - Streammux configuration.
-    - Models (PGIE, MapAnything SGIE).
+    - Models:
+      - PGIE (`models.pgie`)
+      - always-on baseline DAv2 tracking lane (`models.depth_tracking`)
+      - gated full-frame MapAnything lane (`models.mapanything`)
     - Analytics (nvdsanalytics-style stages/streams config).
     - Sinks for mosaic and other outputs.
+    - Depth registration:
+      - `depth_registration.path`
+      - required in baseline non-`v3dt` mode
+      - default artifact: `config/depth_registration.json`
     - Mosaic output (`mosaic_output`): RTSP output drives the WebRTC gateway when
       `mosaic_webrtc_enabled: true` (mosaic JPEG/WebSocket path removed in DS8).
       Default bitrate: 4000 kbps (H.264).
@@ -64,6 +71,27 @@ Key config files:
   - `pipelines/config_osd.ini` – OSD behavior config.
 
 When designing DS8 behavior, keep it semantically aligned with current config behavior and DS8 YAML contracts where possible.
+
+## 2b. Baseline Depth Architecture
+
+Baseline non-`v3dt` tracking now uses:
+
+- one canonical person-anchor estimator: pose-derived anchor when available, otherwise `NOESIS.OBJECT_DEPTH.anchor_uv`
+- always-on DAv2 range observations attached through `NOESIS.OBJECT_DEPTH`
+- a prebuilt DAv2->MapAnything room-registration artifact loaded before startup
+- one fused backend world estimator that owns canonical `track.world`
+
+MapAnything remains separate:
+
+- full-frame SGIE branch
+- on-demand RPC/depth/floorplan lane
+- offline reference source for building the registration artifact
+
+The offline builder is:
+
+- [build_depth_registration.py](/home/mayor/Noesis_Devel/scripts/build_depth_registration.py)
+
+Do not confuse the gated MapAnything branch with the always-on DAv2 tracking lane.
 
 ## 3. DS8 Docs to Consult
 
@@ -123,3 +151,8 @@ For migration work, follow this order:
 ## 6. Testing & Validation
 
 See `docs/DS8_testing_guide.md` for concrete test commands and DS8 regression checks.
+
+For baseline pose+depth tracking work, also consult:
+
+- [MapAnything_Depth.md](/home/mayor/Noesis_Devel/docs/MapAnything_Depth.md)
+- [DS8_Baselines.md](/home/mayor/Noesis_Devel/docs/DS8_Baselines.md)

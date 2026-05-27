@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 import logging
 import math
@@ -39,12 +40,13 @@ try:
 except Exception:
     _NumcodecsBlosc = None  # type: ignore
 
-_FLOORPLAN_FRAME = "camera_local_ground"
+_FLOORPLAN_FRAME = "camera_local_ground_m"
 _FLOORPLAN_ORIENTATION = "camera_xz_forward"
-_FLOORPLAN_KITCHEN_TOKEN = "kitchen"
-_FLOORPLAN_CONTRACT_VERSION = 3
-_FLOORPLAN_MIN_HALF_WIDTH_FRACTION = 0.65
-_FLOORPLAN_MIN_FORWARD_FRACTION = 0.85
+# Floorplan grids are camera-local X/Z products. They must not inherit the
+# image-axis flip heuristic used by BEV/world projection consumers.
+_FLOORPLAN_CONTRACT_VERSION = 7
+_FLOORPLAN_MIN_HALF_WIDTH_FRACTION = 0.0
+_FLOORPLAN_MIN_FORWARD_FRACTION = 0.0
 
 
 def _scene_units_per_meter_from_calibration_bundle(calib_bundle: Optional[Mapping[str, Any]]) -> Tuple[float, float]:
@@ -67,25 +69,101 @@ def _expected_floorplan_units_from_calibration_bundle(calib_bundle: Optional[Map
     try:
         meta = calib_bundle.get("meta")
         if isinstance(meta, dict):
+            world_frame = str(meta.get("world_frame") or "").strip().lower()
+            if world_frame == "backend_world_m":
+                return "meters"
             meta_units = meta.get("units")
             if isinstance(meta_units, str):
                 tag = meta_units.strip().lower()
+                if tag in ("m", "meter", "meters"):
+                    return "meters"
                 if tag in ("obj_units", "scene", "scene_units", "scene_obj"):
                     return "scene"
             elif isinstance(meta_units, dict):
                 coords = str(meta_units.get("coords") or "").strip().lower()
+                if coords in ("backend_world_m", "world_m", "meters", "m"):
+                    return "meters"
                 if coords in ("scene", "obj_units", "scene_obj", "obj"):
                     return "scene"
         align = calib_bundle.get("align")
         units = align.get("units") if isinstance(align, dict) else None
         s_obj_to_m = float((units or {}).get("s_obj_to_m", 1.0) or 1.0) if isinstance(units, dict) else 1.0
+        if isinstance(meta, dict):
+            if str(meta.get("coord_space") or "").strip().lower() == "backend_world_m":
+                return "meters"
         if np.isfinite(s_obj_to_m) and s_obj_to_m > 1e-9 and abs(s_obj_to_m - 1.0) > 1e-9:
             return "scene"
     except Exception:
         return None
     return None
 
-# Clean/kitchen floorplan layers (obstacle_height, walkable). Kept kitchen-only initially.
+
+def _floorplan_calibration_fingerprint(
+    calib_bundle: Optional[Mapping[str, Any]],
+    camera_id: str,
+) -> Optional[str]:
+    """Compact cache key for the calibration fields that shape floorplan grids."""
+    if not isinstance(calib_bundle, Mapping) or not camera_id:
+        return None
+    try:
+        cameras = calib_bundle.get("cameras")
+        if not isinstance(cameras, Mapping):
+            return None
+        k_table = cameras.get("K")
+        e_table = cameras.get("E")
+        k_value = k_table.get(camera_id) if isinstance(k_table, Mapping) else None
+        e_value = e_table.get(camera_id) if isinstance(e_table, Mapping) else None
+        if k_value is None and e_value is None:
+            return None
+        align = calib_bundle.get("align")
+        meta = calib_bundle.get("meta")
+        payload = {
+            "contract": "floorplan_calibration_v1",
+            "camera_id": camera_id,
+            "K": k_value,
+            "E": e_value,
+            "align": {
+                "floor_y": align.get("floor_y") if isinstance(align, Mapping) else None,
+                "units": align.get("units") if isinstance(align, Mapping) else None,
+            },
+            "meta": {
+                "world_frame": meta.get("world_frame") if isinstance(meta, Mapping) else None,
+                "coord_space": meta.get("coord_space") if isinstance(meta, Mapping) else None,
+                "units": meta.get("units") if isinstance(meta, Mapping) else None,
+            },
+        }
+        encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str).encode("utf-8")
+        return hashlib.sha256(encoded).hexdigest()
+    except Exception:
+        return None
+
+
+def _floorplan_cache_contract_matches(
+    payload: Mapping[str, Any],
+    *,
+    expected_units: Optional[str] = None,
+    expected_calibration_fingerprint: Optional[str] = None,
+) -> bool:
+    if payload.get("frame") != _FLOORPLAN_FRAME:
+        return False
+    if payload.get("orientation") != _FLOORPLAN_ORIENTATION:
+        return False
+    try:
+        if int(payload.get("floorplan_contract_version", 0)) != int(_FLOORPLAN_CONTRACT_VERSION):
+            return False
+    except Exception:
+        return False
+    if expected_units:
+        units_val = str(payload.get("units") or "").strip().lower()
+        if units_val != str(expected_units).strip().lower():
+            return False
+    if expected_calibration_fingerprint:
+        stored = str(payload.get("calibration_fingerprint") or "").strip()
+        if stored != str(expected_calibration_fingerprint).strip():
+            return False
+    return True
+
+# Clean floorplan layers (obstacle_height, walkable) shared by every camera.
 _FLOORPLAN_CLEAN_FLOOR_SEED_PERCENTILE = 5.0
 _FLOORPLAN_CLEAN_FLOOR_SEED_BAND_M = 0.06
 # In camera coordinates the ground plane is typically *not* close to horizontal because the
@@ -123,13 +201,13 @@ _FLOORPLAN_CLEAN_HEIGHT_SMOOTH = 3
 _FLOORPLAN_CLEAN_OTSU_BINS = 128
 
 # Height-above-ground (AGL) clean floorplan layers.
-# These are kitchen-tuned initially and rely on estimating a floor Y from horizontal surfaces.
+# These rely on estimating a floor Y from horizontal surfaces in each room.
 _FLOORPLAN_AGL_HORIZ_DOT_THRESH = 0.85
 _FLOORPLAN_AGL_HEIGHT_CLIP_M = 2.5
 _FLOORPLAN_AGL_FLOOR_SEED_MAX_M = 0.08
 _FLOORPLAN_AGL_OBSTACLE_THRESH_M = 0.25
 _FLOORPLAN_AGL_FILL_RADIUS_M = 1.5
-# Support-based classification (kitchen-only, AGL).
+# Support-based classification (AGL).
 # We count how many points in each BEV cell land near the floor vs above a threshold.
 # This is materially more robust than using per-cell mean AGL, which gets dominated by
 # vertical surfaces (walls/cabinets) and causes "everything is obstacle" failure modes.
@@ -223,24 +301,18 @@ def _expected_floorplan_flip(
     return _infer_image_flips_from_extrinsics(extr)
 
 
-def _flip_payload_matches(
-    payload: Any,
-    expected: Optional[Tuple[bool, bool]],
-) -> bool:
-    if expected is None:
-        return True
-    if not isinstance(payload, dict):
-        return False
-    try:
-        flip_u = bool(payload.get("u"))
-        flip_v = bool(payload.get("v"))
-    except Exception:
-        return False
-    return (flip_u, flip_v) == (bool(expected[0]), bool(expected[1]))
+def _floorplan_image_flip_payload(
+    expected_flip: Optional[Tuple[bool, bool]],
+) -> Dict[str, bool]:
+    """Expose the inferred image flip as diagnostics only.
 
-
-def _is_kitchen_floorplan_camera(camera_id: str) -> bool:
-    return _FLOORPLAN_KITCHEN_TOKEN in str(camera_id or "").strip().lower()
+    Floorplan grids are already serialized in their final camera-local X/Z
+    orientation, so consumers must not apply this hint back onto the raster.
+    """
+    return {
+        "u": bool(expected_flip[0]) if expected_flip is not None else False,
+        "v": bool(expected_flip[1]) if expected_flip is not None else False,
+    }
 
 
 def _floorplan_world_coordinate_grids(
@@ -1151,7 +1223,7 @@ def _compute_kitchen_clean_floorplan_layers(
         obstacle_side = "positive"
         h = h_pos_raw
 
-    h = np.clip(np.asarray(h, dtype=np.float32, copy=False), 0.0, None)
+    h = np.clip(np.asarray(h, dtype=np.float32), 0.0, None)
 
     # Ignore points that are too tall to matter for walkability to avoid ceiling artifacts.
     relevant = np.isfinite(h) & (h <= max_relevant)
@@ -2162,7 +2234,7 @@ class DepthStorageManager:
                 payload["normals_error"] = "extrinsics_failed"
                 return
 
-        normals = np.asarray(normals, dtype=np.float32, copy=False)
+        normals = np.asarray(normals, dtype=np.float32)
         if dtype_norm == "float16":
             normals_out = normals.astype(np.float16)
         else:
@@ -2212,8 +2284,8 @@ class DepthStorageManager:
         camera_id: str,
         grid_res_m: float,
         max_extent_m: float,
-        expected_flip: Optional[Tuple[bool, bool]] = None,
         expected_units: Optional[str] = None,
+        expected_calibration_fingerprint: Optional[str] = None,
     ) -> Optional[Dict[str, Any]]:
         path = self._floorplan_path(camera_id, grid_res_m, max_extent_m)
         if not path.exists():
@@ -2222,26 +2294,12 @@ class DepthStorageManager:
             with path.open('r', encoding='utf-8') as fh:
                 payload = json.load(fh)
             if isinstance(payload, dict):
-                frame = payload.get("frame")
-                if frame != _FLOORPLAN_FRAME:
+                if not _floorplan_cache_contract_matches(
+                    payload,
+                    expected_units=expected_units,
+                    expected_calibration_fingerprint=expected_calibration_fingerprint,
+                ):
                     return None
-                orientation = payload.get("orientation")
-                if orientation != _FLOORPLAN_ORIENTATION:
-                    return None
-                version_raw = payload.get("floorplan_contract_version", 0)
-                try:
-                    version = int(version_raw)
-                except Exception:
-                    version = 0
-                if version != int(_FLOORPLAN_CONTRACT_VERSION):
-                    return None
-                if expected_units:
-                    units_val = str(payload.get("units") or "").strip().lower()
-                    if units_val != str(expected_units).strip().lower():
-                        return None
-                if expected_flip is not None:
-                    if not _flip_payload_matches(payload.get("image_flip"), expected_flip):
-                        return None
                 payload.setdefault('camera_id', camera_id)
                 return payload
         except Exception as exc:
@@ -2338,24 +2396,16 @@ class DepthStorageManager:
         calib_bundle = getattr(self, 'calibration_bundle', None) or {}
         expected_flip = _expected_floorplan_flip(calib_bundle, camera_id)
         expected_units = _expected_floorplan_units_from_calibration_bundle(calib_bundle)
+        expected_calibration_fingerprint = _floorplan_calibration_fingerprint(calib_bundle, camera_id)
         now_us = int(time.time() * 1_000_000)
         with self._cache_lock:
             cached = self._floorplan_cache.get(cache_key)
             if cached:
-                if cached.get("orientation") != _FLOORPLAN_ORIENTATION:
-                    cached = None
-            if cached:
-                try:
-                    if int(cached.get("floorplan_contract_version", 0)) != int(_FLOORPLAN_CONTRACT_VERSION):
-                        cached = None
-                except Exception:
-                    cached = None
-            if cached and expected_units:
-                cached_units = str(cached.get("units") or "").strip().lower()
-                if cached_units != str(expected_units).strip().lower():
-                    cached = None
-            if cached and expected_flip is not None:
-                if not _flip_payload_matches(cached.get("image_flip"), expected_flip):
+                if not _floorplan_cache_contract_matches(
+                    cached,
+                    expected_units=expected_units,
+                    expected_calibration_fingerprint=expected_calibration_fingerprint,
+                ):
                     cached = None
             if cached:
                 if cache_only:
@@ -2372,8 +2422,8 @@ class DepthStorageManager:
             camera_id,
             grid_res_m,
             max_extent_m,
-            expected_flip=expected_flip,
             expected_units=expected_units,
+            expected_calibration_fingerprint=expected_calibration_fingerprint,
         )
         if disk_payload:
             snapshot_ts = disk_payload.get('snapshot_ts', disk_payload.get('ts'))
@@ -2453,25 +2503,22 @@ class DepthStorageManager:
 
         if not np.any(valid):
             grid = np.zeros((1, 1), dtype=np.float32)
-            bounds_scene = {
-                'min_x': float((-grid_res_m * 0.5) * scene_per_m),
-                'max_x': float((grid_res_m * 0.5) * scene_per_m),
+            bounds_m = {
+                'min_x': float(-grid_res_m * 0.5),
+                'max_x': float(grid_res_m * 0.5),
                 'min_z': 0.0,
-                'max_z': float(max(grid_res_m, 1.0) * scene_per_m),
+                'max_z': float(max(grid_res_m, 1.0)),
             }
-            flip_payload = {
-                'u': bool(expected_flip[0]) if expected_flip is not None else False,
-                'v': bool(expected_flip[1]) if expected_flip is not None else False,
-            }
+            flip_payload = _floorplan_image_flip_payload(expected_flip)
             payload = {
                 'camera_id': camera_id,
                 'ts': now_us,
                 'snapshot_ts': int(path_entry.stem) if path_entry.stem.isdigit() else None,
                 'frame': _FLOORPLAN_FRAME,
-                'bounds': bounds_scene,
+                'bounds': bounds_m,
                 'scale_m_per_px': float(grid_res_m),
                 'scale_scene_per_px': float(grid_res_m * scene_per_m),
-                'units': 'scene',
+                'units': 'meters',
                 's_obj_to_m': float(s_obj_to_m),
                 'point_count': 0,
                 'density': {
@@ -2507,6 +2554,7 @@ class DepthStorageManager:
                 'orientation': _FLOORPLAN_ORIENTATION,
                 'floorplan_contract_version': int(_FLOORPLAN_CONTRACT_VERSION),
                 'image_flip': flip_payload,
+                'calibration_fingerprint': expected_calibration_fingerprint,
             }
             self._persist_floorplan_to_disk(camera_id, grid_res_m, max_extent_m, payload)
             with self._cache_lock:
@@ -2536,16 +2584,10 @@ class DepthStorageManager:
             indexing='xy'
         )
 
-        grid_u_geom = grid_u
-        grid_v_geom = grid_v
-        if expected_flip is not None:
-            if bool(expected_flip[0]):
-                grid_u_geom = (float(max(0, w_img - 1)) - grid_u).astype(np.float32, copy=False)
-            if bool(expected_flip[1]):
-                grid_v_geom = (float(max(0, h_img - 1)) - grid_v).astype(np.float32, copy=False)
-
-        x_cam = (grid_u_geom - cx) * depth / fx
-        y_cam = (grid_v_geom - cy) * depth / fy
+        # Floorplan grids stay anchored to the canonical camera-local X/Z frame.
+        # Do not remap the image axes here using the BEV/world flip heuristic.
+        x_cam = (grid_u - cx) * depth / fx
+        y_cam = (grid_v - cy) * depth / fy
         z_cam = depth
 
         pts_cam = np.stack([x_cam[valid], y_cam[valid], z_cam[valid]], axis=1)
@@ -2601,7 +2643,7 @@ class DepthStorageManager:
                 cy,
             )
             # Convert normals into the same camera coordinate convention used by extrinsics (+Y up).
-            normals_cam = np.asarray(normals_cam, dtype=np.float32, copy=False)
+            normals_cam = np.asarray(normals_cam, dtype=np.float32)
             normals_cam[..., 1] *= -1.0
             normals_cam_flat = normals_cam[valid]
             r_wc = twc[:3, :3].astype(np.float32, copy=False)
@@ -2716,10 +2758,6 @@ class DepthStorageManager:
         agl_weight_sum = np.zeros((h_px, w_px), dtype=np.float64)
         agl_floor_support_grid = np.zeros((h_px, w_px), dtype=np.uint32)
         agl_obstacle_support_grid = np.zeros((h_px, w_px), dtype=np.uint32)
-        weighted_agl_sum = np.zeros((h_px, w_px), dtype=np.float64)
-        agl_weight_sum = np.zeros((h_px, w_px), dtype=np.float64)
-        agl_floor_support_grid = np.zeros((h_px, w_px), dtype=np.uint32)
-        agl_obstacle_support_grid = np.zeros((h_px, w_px), dtype=np.uint32)
 
         indices = (z_idx, x_idx)
         # Density: count of points (unweighted for backward compat)
@@ -2800,30 +2838,30 @@ class DepthStorageManager:
             height_min = 0.0
             height_max = float(np.max(height_grid)) if height_grid.size else 0.0
 
-        # Compute kitchen-only clean layers. For BEV we care about large obstacles vs free space and
-        # we want to extend floor through occlusions (behind the island). Use a camera-frame floor
-        # plane fit so we do not depend on extrinsics/world-frame correctness.
-        if _is_kitchen_floorplan_camera(camera_id):
-            try:
-                y_up_pts = (-pts_cam[:, 1]).astype(np.float32, copy=False)
-                obs_h, walk, clean_meta = _compute_kitchen_clean_floorplan_layers(
-                    camera_id,
-                    x_cam_pts=x_cam_pts,
-                    z_cam_pts=z_cam_pts,
-                    y_world_pts=y_up_pts,
-                    pts_weight=pts_weight,
-                    x_idx=x_idx,
-                    z_idx=z_idx,
-                    support_grid=distance_count,
-                )
-                if isinstance(clean_meta, dict):
-                    clean_meta = dict(clean_meta)
-                else:
-                    clean_meta = {"mode": "kitchen_clean_layers"}
-                clean_meta["floor_estimate"] = floor_est_meta
-                clean_layers = (obs_h, walk, clean_meta)
-            except Exception:
-                clean_layers = None
+        # Compute clean BEV layers for every room. This classifies walkable floor
+        # and obstacle surfaces in camera-local X/Z space so the overlay and the
+        # visible floorplan share the same raster surface.
+        try:
+            y_up_pts = (-pts_cam[:, 1]).astype(np.float32, copy=False)
+            obs_h, walk, clean_meta = _compute_kitchen_clean_floorplan_layers(
+                camera_id,
+                x_cam_pts=x_cam_pts,
+                z_cam_pts=z_cam_pts,
+                y_world_pts=y_up_pts,
+                pts_weight=pts_weight,
+                x_idx=x_idx,
+                z_idx=z_idx,
+                support_grid=distance_count,
+            )
+            if isinstance(clean_meta, dict):
+                clean_meta = dict(clean_meta)
+            else:
+                clean_meta = {"mode": "clean_floorplan_layers"}
+            clean_meta["mode"] = "clean_floorplan_layers"
+            clean_meta["floor_estimate"] = floor_est_meta
+            clean_layers = (obs_h, walk, clean_meta)
+        except Exception:
+            clean_layers = None
 
         # Compute height gradient magnitude for edge detection
         # First, fill empty/NaN cells with floor level so boundaries don't create false edges
@@ -2871,10 +2909,10 @@ class DepthStorageManager:
             max_distance = 0.0
 
         bounds = {
-            'min_x': float(min_x * scene_per_m),
-            'max_x': float(max_x * scene_per_m),
-            'min_z': float(min_z * scene_per_m),
-            'max_z': float(max_z * scene_per_m),
+            'min_x': float(min_x),
+            'max_x': float(max_x),
+            'min_z': float(min_z),
+            'max_z': float(max_z),
         }
 
         agl_max = 0.0
@@ -2899,7 +2937,7 @@ class DepthStorageManager:
             'bounds': bounds,
             'scale_m_per_px': float(width_m / w_px if w_px else grid_res_m),
             'scale_scene_per_px': float((width_m / w_px if w_px else grid_res_m) * scene_per_m),
-            'units': 'scene',
+            'units': 'meters',
             's_obj_to_m': float(s_obj_to_m),
             'point_count': int(pts_cam.shape[0]),
             'density': {
@@ -2938,6 +2976,7 @@ class DepthStorageManager:
                 'floor_offset_m': float(agl_floor_offset_m),
                 'floor_estimate': floor_est_meta,
             },
+            'calibration_fingerprint': expected_calibration_fingerprint,
         }
         if clean_layers is not None:
             obstacle_height_grid, walkable_grid, clean_meta = clean_layers
@@ -2965,10 +3004,7 @@ class DepthStorageManager:
         payload['grid_res_scene'] = float(grid_res_m * scene_per_m)
         payload['max_extent_m'] = float(max_extent_m)
         payload['max_extent_scene'] = float(max_extent_m * scene_per_m)
-        payload['image_flip'] = {
-            'u': bool(expected_flip[0]) if expected_flip is not None else False,
-            'v': bool(expected_flip[1]) if expected_flip is not None else False,
-        }
+        payload['image_flip'] = _floorplan_image_flip_payload(expected_flip)
 
         self._persist_floorplan_to_disk(camera_id, grid_res_m, max_extent_m, payload)
 
@@ -3800,8 +3836,8 @@ class MapAnythingDepthSource:
         camera_id: str,
         grid_res_m: float,
         max_extent_m: float,
-        expected_flip: Optional[Tuple[bool, bool]] = None,
         expected_units: Optional[str] = None,
+        expected_calibration_fingerprint: Optional[str] = None,
     ) -> Optional[Dict[str, Any]]:
         path = self._floorplan_path(camera_id, grid_res_m, max_extent_m)
         if not path.exists():
@@ -3810,26 +3846,12 @@ class MapAnythingDepthSource:
             with path.open('r', encoding='utf-8') as fh:
                 payload = json.load(fh)
             if isinstance(payload, dict):
-                frame = payload.get("frame")
-                if frame != _FLOORPLAN_FRAME:
+                if not _floorplan_cache_contract_matches(
+                    payload,
+                    expected_units=expected_units,
+                    expected_calibration_fingerprint=expected_calibration_fingerprint,
+                ):
                     return None
-                orientation = payload.get("orientation")
-                if orientation != _FLOORPLAN_ORIENTATION:
-                    return None
-                version_raw = payload.get("floorplan_contract_version", 0)
-                try:
-                    version = int(version_raw)
-                except Exception:
-                    version = 0
-                if version != int(_FLOORPLAN_CONTRACT_VERSION):
-                    return None
-                if expected_units:
-                    units_val = str(payload.get("units") or "").strip().lower()
-                    if units_val != str(expected_units).strip().lower():
-                        return None
-                if expected_flip is not None:
-                    if not _flip_payload_matches(payload.get("image_flip"), expected_flip):
-                        return None
                 payload.setdefault('camera_id', camera_id)
                 return payload
         except Exception as exc:
@@ -3929,24 +3951,16 @@ class MapAnythingDepthSource:
         calib_bundle = getattr(self, 'calibration_bundle', None) or {}
         expected_flip = _expected_floorplan_flip(calib_bundle, camera_id)
         expected_units = _expected_floorplan_units_from_calibration_bundle(calib_bundle)
+        expected_calibration_fingerprint = _floorplan_calibration_fingerprint(calib_bundle, camera_id)
         now_us = int(time.time() * 1_000_000)
         with self._cache_lock:
             cached = self._floorplan_cache.get(cache_key)
             if cached:
-                if cached.get("orientation") != _FLOORPLAN_ORIENTATION:
-                    cached = None
-            if cached:
-                try:
-                    if int(cached.get("floorplan_contract_version", 0)) != int(_FLOORPLAN_CONTRACT_VERSION):
-                        cached = None
-                except Exception:
-                    cached = None
-            if cached and expected_units:
-                cached_units = str(cached.get("units") or "").strip().lower()
-                if cached_units != str(expected_units).strip().lower():
-                    cached = None
-            if cached and expected_flip is not None:
-                if not _flip_payload_matches(cached.get("image_flip"), expected_flip):
+                if not _floorplan_cache_contract_matches(
+                    cached,
+                    expected_units=expected_units,
+                    expected_calibration_fingerprint=expected_calibration_fingerprint,
+                ):
                     cached = None
             if cached:
                 if cache_only:
@@ -3965,8 +3979,8 @@ class MapAnythingDepthSource:
             camera_id,
             grid_res_m,
             max_extent_m,
-            expected_flip=expected_flip,
             expected_units=expected_units,
+            expected_calibration_fingerprint=expected_calibration_fingerprint,
         )
         if disk_payload:
             snapshot_ts = disk_payload.get('snapshot_ts', disk_payload.get('ts'))
@@ -4074,16 +4088,10 @@ class MapAnythingDepthSource:
             indexing='xy'
         )
 
-        grid_u_geom = grid_u
-        grid_v_geom = grid_v
-        if expected_flip is not None:
-            if bool(expected_flip[0]):
-                grid_u_geom = (float(max(0, w_img - 1)) - grid_u).astype(np.float32, copy=False)
-            if bool(expected_flip[1]):
-                grid_v_geom = (float(max(0, h_img - 1)) - grid_v).astype(np.float32, copy=False)
-
-        x_cam = (grid_u_geom - cx) * depth / fx
-        y_cam = (grid_v_geom - cy) * depth / fy
+        # Floorplan grids stay anchored to the canonical camera-local X/Z frame.
+        # Do not remap the image axes here using the BEV/world flip heuristic.
+        x_cam = (grid_u - cx) * depth / fx
+        y_cam = (grid_v - cy) * depth / fy
         z_cam = depth
 
         pts_cam = np.stack([x_cam[valid], y_cam[valid], z_cam[valid]], axis=1)
@@ -4135,7 +4143,7 @@ class MapAnythingDepthSource:
                 cx,
                 cy,
             )
-            normals_cam = np.asarray(normals_cam, dtype=np.float32, copy=False)
+            normals_cam = np.asarray(normals_cam, dtype=np.float32)
             normals_cam[..., 1] *= -1.0
             normals_cam_flat = normals_cam[valid]
             r_wc = twc[:3, :3].astype(np.float32, copy=False)
@@ -4211,6 +4219,10 @@ class MapAnythingDepthSource:
         # Confidence-weighted height aggregation
         weighted_height_sum = np.zeros((h_px, w_px), dtype=np.float64)
         weight_sum = np.zeros((h_px, w_px), dtype=np.float64)
+        weighted_agl_sum = np.zeros((h_px, w_px), dtype=np.float64)
+        agl_weight_sum = np.zeros((h_px, w_px), dtype=np.float64)
+        agl_floor_support_grid = np.zeros((h_px, w_px), dtype=np.uint32)
+        agl_obstacle_support_grid = np.zeros((h_px, w_px), dtype=np.uint32)
 
         indices = (z_idx, x_idx)
         # Density: count of points (unweighted for backward compat)
@@ -4292,30 +4304,30 @@ class MapAnythingDepthSource:
             height_min = 0.0
             height_max = float(np.max(height_grid)) if height_grid.size else 0.0
 
-        # Compute kitchen-only clean layers. For BEV we care about large obstacles vs free space and
-        # we want to extend floor through occlusions (behind the island). Use a camera-frame floor
-        # plane fit so we do not depend on extrinsics/world-frame correctness.
-        if _is_kitchen_floorplan_camera(camera_id):
-            try:
-                y_up_pts = (-pts_cam[:, 1]).astype(np.float32, copy=False)
-                obs_h, walk, clean_meta = _compute_kitchen_clean_floorplan_layers(
-                    camera_id,
-                    x_cam_pts=x_cam_pts,
-                    z_cam_pts=z_cam_pts,
-                    y_world_pts=y_up_pts,
-                    pts_weight=pts_weight,
-                    x_idx=x_idx,
-                    z_idx=z_idx,
-                    support_grid=distance_count,
-                )
-                if isinstance(clean_meta, dict):
-                    clean_meta = dict(clean_meta)
-                else:
-                    clean_meta = {"mode": "kitchen_clean_layers"}
-                clean_meta["floor_estimate"] = floor_est_meta
-                clean_layers = (obs_h, walk, clean_meta)
-            except Exception:
-                clean_layers = None
+        # Compute clean BEV layers for every room. This classifies walkable floor
+        # and obstacle surfaces in camera-local X/Z space so the overlay and the
+        # visible floorplan share the same raster surface.
+        try:
+            y_up_pts = (-pts_cam[:, 1]).astype(np.float32, copy=False)
+            obs_h, walk, clean_meta = _compute_kitchen_clean_floorplan_layers(
+                camera_id,
+                x_cam_pts=x_cam_pts,
+                z_cam_pts=z_cam_pts,
+                y_world_pts=y_up_pts,
+                pts_weight=pts_weight,
+                x_idx=x_idx,
+                z_idx=z_idx,
+                support_grid=distance_count,
+            )
+            if isinstance(clean_meta, dict):
+                clean_meta = dict(clean_meta)
+            else:
+                clean_meta = {"mode": "clean_floorplan_layers"}
+            clean_meta["mode"] = "clean_floorplan_layers"
+            clean_meta["floor_estimate"] = floor_est_meta
+            clean_layers = (obs_h, walk, clean_meta)
+        except Exception:
+            clean_layers = None
 
         # Compute height gradient magnitude for edge detection
         # First, fill empty/NaN cells with floor level so boundaries don't create false edges
@@ -4363,10 +4375,10 @@ class MapAnythingDepthSource:
             max_distance = 0.0
 
         bounds = {
-            'min_x': float(min_x * scene_per_m),
-            'max_x': float(max_x * scene_per_m),
-            'min_z': float(min_z * scene_per_m),
-            'max_z': float(max_z * scene_per_m),
+            'min_x': float(min_x),
+            'max_x': float(max_x),
+            'min_z': float(min_z),
+            'max_z': float(max_z),
         }
 
         agl_max = 0.0
@@ -4391,7 +4403,7 @@ class MapAnythingDepthSource:
             'bounds': bounds,
             'scale_m_per_px': float(width_m / w_px if w_px else grid_res_m),
             'scale_scene_per_px': float((width_m / w_px if w_px else grid_res_m) * scene_per_m),
-            'units': 'scene',
+            'units': 'meters',
             's_obj_to_m': float(s_obj_to_m),
             'point_count': int(pts_cam.shape[0]),
             'density': {
@@ -4430,6 +4442,7 @@ class MapAnythingDepthSource:
                 'floor_offset_m': float(agl_floor_offset_m),
                 'floor_estimate': floor_est_meta,
             },
+            'calibration_fingerprint': expected_calibration_fingerprint,
         }
         if clean_layers is not None:
             obstacle_height_grid, walkable_grid, clean_meta = clean_layers
@@ -4457,10 +4470,7 @@ class MapAnythingDepthSource:
         payload['grid_res_scene'] = float(grid_res_m * scene_per_m)
         payload['max_extent_m'] = float(max_extent_m)
         payload['max_extent_scene'] = float(max_extent_m * scene_per_m)
-        payload['image_flip'] = {
-            'u': bool(expected_flip[0]) if expected_flip is not None else False,
-            'v': bool(expected_flip[1]) if expected_flip is not None else False,
-        }
+        payload['image_flip'] = _floorplan_image_flip_payload(expected_flip)
 
         self._persist_floorplan_to_disk(camera_id, grid_res_m, max_extent_m, payload)
 

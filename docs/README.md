@@ -14,6 +14,7 @@ and worklogs live in `docs/history/`.
 - **Codebase overview:** `CODEBASE_DESCRIPTION.md`
 - **V3DT forensics & calibration:** `DS8_v3dt_forensics.md`
 - **Depth / MapAnything:** `MapAnything_Depth.md`, `MapAnything_Heatmap_Viewer.md`, `DEPTH_STACK_FLOW_V2.md`, `depth_metadata.md`
+- **Virtual twin reconstruction:** `Virtual_Twin_Reconstruction.md`
 - **Archived references:** see `history/` (archived)
 
 ## Navigation by Topic
@@ -46,6 +47,12 @@ and worklogs live in `docs/history/`.
 
 ## Doc changes (2026-03-06)
 - Documented the canonical `NOESIS.OBJECT_DEPTH` DS8 object user-meta contract and logged the prototype depth-fusion metadata decision/progress (`DS8_metadata_contracts.md`, `plans/DS8/ds8_design_decisions.md`, `plans/DS8/ds8_migration_checklist_hooks.md`).
+
+## Doc changes (2026-05-03)
+- Added and updated the living-room virtual twin reconstruction note covering DS8 MapAnything evidence, ZeroPlane plane fusion, Menon model-surface GLB output, RGB atlas baking, front-most structural visibility assignment, and surface-aware texture-fit work (`Virtual_Twin_Reconstruction.md`, `DS8_api_contracts_rest.md`).
+
+## Doc changes (2026-05-11)
+- Updated BEV/floorplan telemetry docs and DS8 progress notes for registered-depth-only BEV display, shared clean floorplan layers across rooms, floorplan-surface snap/drop validity, and height-map inline BEV rendering (`DS8_api_contracts_ws.md`, `Telemetry_Schema.md`, `plans/DS8/ds8_design_decisions.md`, `plans/DS8/ds8_migration_checklist_telemetry.md`).
 
 ## Doc changes (2026-03-07)
 - Updated the DS8 seg+depth rebuild notes to document the deterministic linear depth->seg path, canonical frame-space fusion, internal aligned-depth cache, and the no-bbox-fallback object-depth contract (`DS8_metadata_contracts.md`, `plans/DS8/ds8_design_decisions.md`, `plans/DS8/ds8_migration_checklist_hooks.md`, `docs/README.md`).

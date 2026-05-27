@@ -33,13 +33,27 @@ you don’t have to sift through the historical work orders.
   - World-path BEV points and trails are in native scene units; frontend owns
     smoothing/persistence (do not convert via `s_obj_to_m` in the dashboard).
 
-## Depth / MapAnything
-- MapAnything is a full-frame SGIE branch (no tensor-from-meta). Gated with a
-  valve:
-  - REST: `GET /api/v1/depth/refresh?seconds=N` opens the gate for N seconds.
-  - Logical gate remains even if BufferOperator attach is unavailable.
-- Depth snapshots land in `data/depth/<camera>/...` and emit `depth_result`
-  telemetry. See `DEPTH_STACK_FLOW_V2.md` for flow details.
+## Depth / MapAnything / Baseline World Tracking
+- MapAnything is still a full-frame SGIE branch (no tensor-from-meta), but it
+  is no longer the only depth-related path in DS8.
+- MapAnything lane:
+  - gated with `mapanything_valve`
+  - REST: `GET /api/v1/depth/refresh?seconds=N` opens the gate for N seconds
+  - owns `depth_result` and `ma_depth_response`
+  - writes dense snapshots under `data/depth/<camera>/...`
+- Baseline non-`v3dt` tracking lane:
+  - uses an always-on full-frame DAv2 branch (`models.depth_tracking`)
+  - attaches raw per-object depth through `NOESIS.OBJECT_DEPTH`
+  - fuses pose anchor + floor observation + registered DAv2 range inside the
+    backend world estimator
+  - does not publish a second full-frame WebSocket depth stream
+- Baseline startup now requires a valid DAv2->MapAnything registration artifact:
+  - config key: `depth_registration.path`
+  - default artifact: `config/depth_registration.json`
+  - DS8 fails fast if any enabled camera is missing a valid entry
+- `depth_used_m` and the OSD `z=` label represent the registered DAv2 depth
+  that actually participated in the fused world update, not the raw
+  `anchor_depth_m`.
 - Depth normals (in `ma_depth_response`) are optional; enable/disable with
   `NOESIS_MAPANYTHING_NORMALS_ENABLE=1|0` and choose space/dtype via
   `NOESIS_MAPANYTHING_NORMALS_SPACE` (`camera`|`world`) and

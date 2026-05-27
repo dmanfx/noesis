@@ -17,7 +17,7 @@ streammux:
   batch-size: 3
   live-source: 1
   batched-push-timeout: 40000
-  enable-padding: 1
+  enable-padding: 0
   nvbuf-memory-type: 0  # Canonical NVMM setting used across streammux/dewarper/RTSP vconv in DS8 builder.
   sync-inputs: 0
   gpu-id: 0
@@ -25,7 +25,7 @@ streammux:
 sources:
   - element: nvurisrcbin
     #uri: rtsp://192.168.3.214:7447/jdr9oLlBkjyl3gDm?
-    uri: file:///home/mayor/Documents/livingroomclip.mkv
+    uri: file:///home/mayor/Downloads/livingroomclip.mp4
     gpu-id: 0
     cudadec-memtype: 0
     latency: 100
@@ -36,7 +36,7 @@ sources:
       config-file: config/dewarper_g3_instant_charuco_1080.txt
   - element: nvurisrcbin
     #kitchen camera
-    #uri: rtsp://192.168.3.214:7447/qt3VqVdZpgG1B4Vk?
+    #ri: rtsp://192.168.3.214:7447/qt3VqVdZpgG1B4Vk?
     uri: file:///home/mayor/Downloads/kitchenclip.mp4
     gpu-id: 0
     cudadec-memtype: 0
@@ -67,13 +67,13 @@ preprocess:
 models:
   pgie:
     config-file-path: pipelines/config_infer_primary_yolo11_seg.ini
-    engine: /home/mayor/Noesis_Devel/models/engines/yolo11s-seg_cust_fused.engine
+    engine: models/engines/yolo11s-seg_cust_fused.engine
     batch_size: 3
     gie_id: 1
     network_mode: fp16
     attach_tensor_meta: false
   reid:
-    enable: true
+    enable: false
     name: reid_osnet
     config-file-path: pipelines/config_infer_secondary_reid_osnet.ini
     engine: models/engines/reid_osnet_ibn_msmt17_dyn_b16_fp16.engine
@@ -81,7 +81,7 @@ models:
     gie_id: 3
     attach_tensor_meta: true
   pose:
-    enable: true
+    enable: false
     name: yolo26_pose
     config-file-path: pipelines/config_infer_secondary_yolo26_pose.ini
     engine: models/engines/yolo26n-pose_b16_fp16.engine
@@ -93,7 +93,7 @@ models:
     kpt_threshold: 0.35
     letterbox: true
   depth_tracking:
-    enable: true
+    enable: false
     name: depth_tracking_fullframe
     config-file-path: build/config_infer_depth_tracking_da2_vits_294x518_b3_i1.ini
     engine: models/engines/depth_anything_v2_metric_hypersim_vits_294x518_b3_fp16.engine
@@ -101,16 +101,16 @@ models:
     gie_id: 5
     attach_tensor_meta: true
   mapanything:
-    enable: true
+    enable: false
     name: mapanything_fullframe
     config-file-path: pipelines/config_infer_secondary_mapanything.ini
-    engine: /home/mayor/Noesis_Devel/models/mapanything_depth/1/model.plan
+    engine: models/mapanything_depth/1/model.plan
     batch_size: 3
     gie_id: 2
     attach_tensor_meta: true
 
 tracker:
-  config-file: config/nvtracker.yaml
+  config-file: config/v3dt/reimpl/inv1/nvtracker_sv3dt_yolo26s_fast_inv1.yml
   ll-lib-file: /opt/nvidia/deepstream/deepstream/lib/libnvds_nvmultiobjecttracker.so
 
 analytics:
@@ -169,7 +169,7 @@ bev:
     reset_after_s: 1.25   # If dt exceeds this, accept measurement and reset filter
 
 visualization: # Visualization overlays rendered into the mosaic stream (tiler â†’ osd).
-  display_keypoints: true # Render pose keypoints/skeletons from the pose SGIE.
+  display_keypoints: false # Render pose keypoints/skeletons from the pose SGIE.
   instance_masks:
     alpha: 0.35 # Mask overlay opacity (stable-id keyed color; matches BEV + Active Tracks hue math).
   trails:
@@ -207,3 +207,8 @@ visualization: # Visualization overlays rendered into the mosaic stream (tiler â
     font_size: 18 # Label font size for nvdsosd text overlay.
     font_name: Serif # Font family (must match ds_osd.FontFamily).
     decimals: 2 # Confidence decimals.
+
+v3dt:
+  tracking_mode: v3dt
+  world_frame: backend_world_m
+  caminfo_world_axes: xzy

@@ -1,5 +1,5 @@
 # DS8 Testing & Validation Guide
-_Status: current as of 2026-02-02._
+_Status: current as of 2026-03-16._
 
 This guide describes how to validate DS8 changes using the current runtime and contracts.
 
@@ -40,12 +40,51 @@ Check logs for:
 - REST server startup (if enabled).
 - Mosaic WebRTC toggles are consumed **at build time**: set `NOESIS_MOSAIC_WEBRTC_ENABLED` before starting the runtime so the RTSP output and WebRTC gateway are enabled (WebRTC will auto-enable RTSP if requested).
 - If MapAnything SGIE gating is enabled, expect a startup log like `MapAnything gate primed; closed valve after 1.00s` (tunable via `NOESIS_MAPANYTHING_GATE_PRIME_SECONDS`) to confirm the SGIE branch prerolls and then closes when depth is disabled.
+- Baseline non-`v3dt` startup now also requires a valid depth-registration artifact (`depth_registration.path`, default `config/depth_registration.json`). DS8 should fail fast before activation if the artifact is missing or stale for any enabled camera.
 
 **Important:** All DS8 tests should also use the real RTSP streams defined in configuration files:
 
 - Prefer `config/infer.yaml` `sources` entries for DS8.
 
 Do **not** rely on environment variables to specify URIs when adding or testing DS8 features; instead, update the appropriate config file so behavior is fully driven by configuration.
+
+### Build or refresh the depth-registration artifact
+
+Baseline pose+depth world tracking depends on a prebuilt DAv2->MapAnything
+registration artifact. The canonical operational flow is:
+
+```bash
+bash services/mapanything_svc/run.sh
+env CUDA_VISIBLE_DEVICES='' python3 scripts/build_depth_registration.py \
+  --output config/depth_registration.json
+```
+
+Notes:
+
+- The builder uses the live RTSP sources from `config/infer.yaml` by default.
+- Empty-room captures are preferred, but the builder now filters to temporally
+  stable pixels so minor/static occupancy does not automatically invalidate the
+  fit.
+- Rebuild `config/depth_registration.json` when the registration inputs change:
+  camera intrinsics or image size. Pose-only extrinsics edits, floor-height
+  edits, and scene-unit updates do not invalidate the registration mapping
+  because the fit is image-space DAv2 depth vs MapAnything reference depth.
+- The runtime does not generate this artifact automatically.
+
+### Registration-backed runtime smoke
+
+After the artifact is built:
+
+```bash
+timeout 25s python3 noesis/ds8_runtime.py --pgie-profile yolo26_seg --size s --disable-rest
+```
+
+Expected:
+
+- DS8 starts cleanly without a depth-registration startup error.
+- `mapanything_fullframe` and `depth_tracking_fullframe` both load.
+- The runtime enters the main loop and reaches timeout without registration
+  validation failures.
 
 ### StableID pose integration (unit)
 
@@ -65,6 +104,10 @@ With DS8 runtime running:
 ```bash
 curl "http://127.0.0.1:8080/api/v1/depth/refresh?seconds=20"
 ```
+
+If the standalone virtual-twin artifact API is already using `8080`, run DS8
+with `--rest-port 8082` and use
+`http://127.0.0.1:8082/api/v1/depth/refresh?seconds=20` for this check.
 
 Expect a JSON payload matching `DepthRefreshResponse` and see depth bursts (depth telemetry and stored maps) during the enabled window.
 
@@ -104,6 +147,9 @@ Expected:
 
 - `ma_depth_rpc_smoke_test.py` prints `[PASS]` and proves both cache-first and fresh depth retrieval (`served_from_cache=false` on the fresh call, and `ts_us` increases).
 - `floorplan_rpc_smoke_test.py` prints `[PASS]` and returns a non-error `floorplan_response` with required fields (density/height/distance layers).
+- These RPCs validate only the gated MapAnything lane. Baseline DAv2 tracking
+  depth is observed through `tracking`, `stats.payload.cameras[*].tracking.active_tracks[]`,
+  and the on-screen `z=` label.
 
 ### SV3DT/MV3DT 3D meta (tracking payload)
 

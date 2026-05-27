@@ -314,7 +314,83 @@ Notes:
 - Zone-state dwell timers are not remapped on alias; dwell timing effectively
   resets when an ID canonicalizes.
 
-## 4. Future DS8 REST Endpoints
+## 4. Virtual Twin API
+
+Read-only APIs expose Noesis-owned offline virtual-twin revisions built under
+`data/virtual_twin/revisions/<revision_id>/`. These endpoints do not trigger
+reconstruction work and do not fall back to browser-side depth projection.
+Revisions are built by `scripts/build_virtual_twin_reconstruction.py`, which
+triggers the DS8 `/api/v1/depth/refresh` path and consumes the persisted
+MapAnything Zarr snapshots under `data/depth/<camera>/.../*.zarr`. The builder
+also copies RGB keyframes and MapAnything depth/confidence/mask arrays into the
+revision bundle so the reconstruction evidence survives depth-retention pruning.
+
+### Endpoints
+
+- **GET** `/api/v1/virtual-twin/revisions`
+  - Returns revision summaries sorted newest-first.
+- **GET** `/api/v1/virtual-twin/latest`
+  - Returns the latest revision manifest, metrics, tracking alignment, and
+    artifact URLs.
+- **GET** `/api/v1/virtual-twin/revisions/{id}/manifest`
+  - Returns one revision manifest plus artifact URLs.
+- **GET** `/api/v1/virtual-twin/revisions/{id}/metrics`
+  - Returns reconstruction metrics for one revision.
+- **GET** `/api/v1/virtual-twin/revisions/{id}/tracking-alignment`
+  - Returns tracking-alignment readback for one revision.
+- **GET** `/api/v1/virtual-twin/revisions/{id}/artifacts/{path}`
+  - Serves revision-relative GLB, JSON, PLY, or NPZ artifacts.
+
+The DS8 REST app enables CORS for localhost and RFC1918 private-network browser
+origins by default so Menon dev/probe pages can fetch these artifacts from the
+Noesis REST port without special browser flags. Operators can override this with
+`NOESIS_REST_CORS_ORIGINS`, `NOESIS_REST_CORS_ORIGIN_REGEX`, or
+`NOESIS_REST_CORS_ALLOW_ALL`.
+
+### Artifact Contract
+
+Each revision is expected to contain:
+
+- `manifest.json`
+- `planes.json`
+- `surfaces.glb`
+- `points.ply`
+- `points.npz`
+- `tracking_alignment.json`
+- `metrics.json`
+
+`surfaces.glb` is the browser-facing Menon artifact. It is a textured triangle
+mesh in Menon scene units constrained to supported structural model surfaces,
+not a free-floating dense depth point cloud. The embedded texture atlas is baked
+from the saved pipeline RGB keyframes after projecting model-surface texels back
+through the revision registration and applying the MapAnything depth/confidence
+gate. The texture bake also reprojects the sampled MapAnything pixel into Menon
+scene space and requires it to land on the same structural surface that the
+texel is coloring. The bake also uses a camera-view visibility map of the Menon
+structural OBJ, so a pixel can color only the front-most model surface assigned
+to that image location; pixels that belong to another wall/floor block, or to an
+occluded surface behind it, are rejected.
+Dense reconstructed points remain in `points.ply` and `points.npz` for analysis
+and diagnostics. The atlas may also apply an explicit exposure/gamma/contrast
+tone map recorded in `metrics.browser_render_budget.texture`.
+By default the builder rejects effectively grayscale keyframes for RGB texture
+bakes; `--allow-grayscale-texture` is reserved for explicit diagnostic builds.
+
+The manifest also exposes `evidence_dirs.keyframes` and
+`evidence_dirs.mapanything`; per-frame rows list revision-relative RGB PNG and
+MapAnything NPZ evidence paths plus calibration metadata. `metrics.json`
+includes `room_model_leakage_ratio`, `room_model_leakage`, browser render budget,
+model-surface projection counts/distances, texture-atlas coverage metrics, plane
+residuals, registration normal errors, dense surface-refinement diagnostics, and
+gate booleans. Artifact paths are revision-relative and path traversal is
+rejected.
+
+`tracking_alignment.json` remains an explicit artifact input. Menon can keep it
+in readback mode or opt into applying the revision transform through its
+`reprojectionApplyVirtualTwinAlignment` setting after
+`scripts/validate_virtual_twin_tracking.py` passes for the revision camera.
+
+## 5. Future DS8 REST Endpoints
 
 If additional DS8 REST endpoints are introduced (e.g., for calibration, debug, or pipeline control), they should:
 

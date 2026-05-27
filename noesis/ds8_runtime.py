@@ -36,6 +36,23 @@ from calibration_bundle import (
 )
 from geometry.depth_source import DepthStorageManager
 from mapanything_config import load_service_config
+from noesis.calibration.depth_registration import (
+    DepthRegistrationError,
+    DepthRegistrationManager,
+    model_profile_fingerprint as _depth_registration_model_profile_fingerprint,
+)
+from noesis.calibration.manager import CalibrationManager
+from noesis.calibration.pose_v1 import normalize_pose_v1
+from noesis.calibration.pose_v1 import POSE_V1_FRAME_BACKEND_WORLD_M
+from noesis.depth_tracking_materialization import (
+    DEFAULT_BATCH_SIZE as _DEPTH_TRACKING_BATCH_SIZE,
+    DEFAULT_GIE_ID as _DEPTH_TRACKING_GIE_ID,
+    DEFAULT_INPUT_SIZE as _DEPTH_TRACKING_INPUT_SIZE,
+    DEFAULT_INTERVAL as _DEPTH_TRACKING_INTERVAL,
+    ensure_native_depth_tracking_tensor_extension as _ensure_native_depth_tracking_tensor_extension,
+    ensure_native_object_depth_extension as _ensure_native_object_depth_extension,
+    materialize_depth_tracking_assets as _materialize_depth_tracking_assets,
+)
 from noesis.pipelines import ds8_pipeline, hooks
 from noesis.metadata.intrinsics import CameraConfigLoader
 from noesis.telemetry.publishers import DepthTelemetryPublisher, TrackingTelemetryPublisher, bind_occupancy_publisher
@@ -505,6 +522,7 @@ def _materialize_effective_pipeline_yaml(
     logger: logging.Logger,
     *,
     pgie_size: Optional[str] = None,
+    tracking_mode: str = "baseline",
 ) -> Path:
     try:
         base_cfg = yaml.safe_load(base_yaml_path.read_text(encoding="utf-8")) or {}
@@ -548,6 +566,45 @@ def _materialize_effective_pipeline_yaml(
             },
         }
         logger.info("YOLO26 PGIE size: %s", size_norm)
+
+    if str(tracking_mode).strip().lower() == "baseline":
+        try:
+            depth_assets = _materialize_depth_tracking_assets(
+                logger=logger,
+                batch_size=_DEPTH_TRACKING_BATCH_SIZE,
+                interval=_DEPTH_TRACKING_INTERVAL,
+                input_size=_DEPTH_TRACKING_INPUT_SIZE,
+                gie_id=_DEPTH_TRACKING_GIE_ID,
+            )
+        except Exception as exc:
+            raise SystemExit(f"[FATAL] Unable to materialize baseline depth-tracking assets: {exc}") from exc
+        overlay = _deep_merge_dict(
+            overlay,
+            {
+                "models": {
+                    "depth_tracking": {
+                        "enable": True,
+                        "name": "depth_tracking_fullframe",
+                        "config-file-path": str(depth_assets.config_path),
+                        "engine": str(depth_assets.engine_path),
+                        "batch_size": int(depth_assets.batch_size),
+                        "gie_id": int(depth_assets.gie_id),
+                        "attach_tensor_meta": True,
+                    }
+                }
+            },
+        )
+    else:
+        overlay = _deep_merge_dict(
+            overlay,
+            {
+                "models": {
+                    "depth_tracking": {
+                        "enable": False,
+                    }
+                }
+            },
+        )
 
     effective_cfg = _deep_merge_dict(base_cfg, overlay)
     if not isinstance(effective_cfg, dict):
@@ -725,6 +782,12 @@ def _parse_args() -> argparse.Namespace:
         type=Path,
         default=None,
         help="Override MapAnything snapshot base directory.",
+    )
+    parser.add_argument(
+        "--depth-registration-config",
+        type=Path,
+        default=None,
+        help="Path to the DS8 room-registration artifact bundle used by baseline pose+depth tracking.",
     )
     parser.add_argument(
         "--log-level",
@@ -992,6 +1055,142 @@ def _ensure_v3dt_meta_extension(logger: logging.Logger) -> bool:
         logger.error("Tracking mode 'v3dt' requires noesis_v3dt_meta_ext; import failed: %s", exc)
         return False
     return True
+
+
+def _ensure_baseline_depth_tracking_guardrails(pipeline_path: Path, logger: logging.Logger) -> bool:
+    pipeline_cfg = _load_pipeline_config(pipeline_path, logger)
+    if pipeline_cfg is None:
+        return False
+    models_cfg = pipeline_cfg.get("models") if isinstance(pipeline_cfg, dict) else None
+    depth_cfg = (models_cfg or {}).get("depth_tracking") if isinstance(models_cfg, dict) else None
+    if not isinstance(depth_cfg, dict) or not bool(depth_cfg.get("enable", False)):
+        logger.error(
+            "Baseline tracking requires models.depth_tracking.enable=true in %s",
+            pipeline_path,
+        )
+        return False
+    cfg_path_raw = str(depth_cfg.get("config-file-path") or "").strip()
+    if not cfg_path_raw:
+        logger.error("Baseline tracking requires models.depth_tracking.config-file-path in %s", pipeline_path)
+        return False
+    cfg_path = _resolve_pipeline_cfg_path(pipeline_path, cfg_path_raw)
+    if not cfg_path.exists():
+        logger.error(
+            "Baseline tracking depth-tracking config missing: %s (from %s)",
+            cfg_path,
+            cfg_path_raw,
+        )
+        return False
+    try:
+        _ensure_native_object_depth_extension(logger)
+    except Exception as exc:
+        logger.error("Baseline tracking requires noesis_depth_meta_ext; build/import failed: %s", exc)
+        return False
+    try:
+        _ensure_native_depth_tracking_tensor_extension(logger)
+    except Exception as exc:
+        logger.error("Baseline tracking requires noesis_depth_tracking_tensor_ext; build/import failed: %s", exc)
+        return False
+    return True
+
+
+def _resolve_depth_registration_path(args: argparse.Namespace, *, pipeline_path: Path | None = None) -> Path:
+    raw = args.depth_registration_config
+    if raw is not None:
+        return Path(raw).resolve()
+    if pipeline_path is not None and pipeline_path.exists():
+        try:
+            pipeline_cfg = yaml.safe_load(pipeline_path.read_text(encoding="utf-8")) or {}
+        except Exception:
+            pipeline_cfg = {}
+        reg_cfg = pipeline_cfg.get("depth_registration") if isinstance(pipeline_cfg, Mapping) else None
+        if isinstance(reg_cfg, Mapping):
+            reg_path = str(reg_cfg.get("path") or "").strip()
+            if reg_path:
+                return _resolve_pipeline_cfg_path(pipeline_path, reg_path)
+        elif isinstance(reg_cfg, str) and reg_cfg.strip():
+            return _resolve_pipeline_cfg_path(pipeline_path, reg_cfg.strip())
+    return (REPO_ROOT / "config" / "depth_registration.json").resolve()
+
+
+def _build_depth_registration_profile_fingerprints(
+    pipeline_cfg: Mapping[str, Any],
+    *,
+    pipeline_path: Path,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    models_cfg = pipeline_cfg.get("models") if isinstance(pipeline_cfg, Mapping) else {}
+    depth_cfg = (models_cfg or {}).get("depth_tracking") if isinstance(models_cfg, Mapping) else {}
+    ma_cfg = (models_cfg or {}).get("mapanything") if isinstance(models_cfg, Mapping) else {}
+    repo_root = pipeline_path.parent.parent.resolve()
+    depth_profile = _depth_registration_model_profile_fingerprint(
+        depth_cfg if isinstance(depth_cfg, Mapping) else {},
+        repo_root=repo_root,
+        extra={
+            "model_name": "depth-anything-v2-metric-hypersim-vits",
+            "input_size": list(_DEPTH_TRACKING_INPUT_SIZE),
+            "batch_size": int(_DEPTH_TRACKING_BATCH_SIZE),
+            "interval": int(_DEPTH_TRACKING_INTERVAL),
+            "gie_id": int(_DEPTH_TRACKING_GIE_ID),
+        },
+    )
+    mapanything_profile = _depth_registration_model_profile_fingerprint(
+        ma_cfg if isinstance(ma_cfg, Mapping) else {},
+        repo_root=repo_root,
+        extra={"scope": "mapanything_reference_depth"},
+    )
+    return depth_profile, mapanything_profile
+
+
+def _active_baseline_camera_ids(
+    pipeline_cfg: Mapping[str, Any],
+    camera_labels: Mapping[int, str],
+) -> list[tuple[int, str]]:
+    sources = pipeline_cfg.get("sources") if isinstance(pipeline_cfg, Mapping) else None
+    if not isinstance(sources, list):
+        return []
+    active: list[tuple[int, str]] = []
+    for index, _source in enumerate(sources):
+        camera_id = camera_labels.get(int(index))
+        if isinstance(camera_id, str) and camera_id.strip():
+            active.append((int(index), camera_id.strip()))
+    return active
+
+
+def _load_depth_registration_manager(
+    *,
+    path: Path,
+    pipeline_path: Path,
+    pipeline_cfg: Mapping[str, Any],
+    calibration_provider: Any,
+    camera_labels: Mapping[int, str],
+    logger: logging.Logger,
+) -> DepthRegistrationManager:
+    manager = DepthRegistrationManager.load(path)
+    depth_profile, mapanything_profile = _build_depth_registration_profile_fingerprints(
+        pipeline_cfg,
+        pipeline_path=pipeline_path,
+    )
+    missing: list[str] = []
+    for source_id, camera_id in _active_baseline_camera_ids(pipeline_cfg, camera_labels):
+        snapshot = calibration_provider.snapshot(int(source_id), str(camera_id))
+        if snapshot is None:
+            missing.append(f"{camera_id}:calibration_unavailable")
+            continue
+        try:
+            manager.validate_runtime(
+                camera_id=str(camera_id),
+                snapshot=snapshot,
+                dav2_profile=depth_profile,
+                mapanything_profile=mapanything_profile,
+            )
+        except DepthRegistrationError as exc:
+            missing.append(f"{camera_id}:{exc}")
+    if missing:
+        raise DepthRegistrationError(
+            "Baseline tracking depth registration invalid for active cameras: " + ", ".join(missing)
+        )
+    logger.info("Loaded depth registration artifact %s for %d active cameras", path, len(_active_baseline_camera_ids(pipeline_cfg, camera_labels)))
+    return manager
 
 
 def _load_camera_labels(path: Path) -> Dict[int, str]:
@@ -1313,14 +1512,11 @@ class _CalibrationProvider:
         self._align = load_alignment(str(REPO_ROOT / "config" / "ply_alignment.json"))
         tracking_mode_norm = str(tracking_mode or "").strip().lower() or "baseline"
         default_extrinsics_path = REPO_ROOT / "config" / "camera_calibration.json"
-        baseline_obj_extrinsics_path = REPO_ROOT / "config" / "camera_calibration_menon_obj.json"
         env_path = os.environ.get("NOESIS_CALIBRATION_EXTRINSICS", "")
         if not extrinsics_path and env_path.strip():
             extrinsics_path = Path(env_path.strip())
-        if not extrinsics_path and tracking_mode_norm != "v3dt":
-            default_extrinsics_path = baseline_obj_extrinsics_path
         self._extrinsics_path = Path(extrinsics_path) if extrinsics_path else default_extrinsics_path
-        self._extrinsics = load_extrinsics(str(self._extrinsics_path))
+        self._extrinsics = load_extrinsics(str(self._extrinsics_path), align_data=self._align)
         logging.getLogger(__name__).info("Calibration extrinsics path=%s", self._extrinsics_path)
         try:
             from config import config as app_config  # type: ignore
@@ -1456,12 +1652,13 @@ class _CalibrationProvider:
 
     def reload_extrinsics(self) -> None:
         """Reload extrinsics from the configured calibration path without touching alignment."""
-        self._extrinsics = load_extrinsics(str(self._extrinsics_path))
+        self._extrinsics = load_extrinsics(str(self._extrinsics_path), align_data=self._align)
         self._bundle_cache = None
 
     def reload_alignment(self) -> None:
         """Reload alignment from ply_alignment.json."""
         self._align = load_alignment(str(REPO_ROOT / "config" / "ply_alignment.json"))
+        self._extrinsics = load_extrinsics(str(self._extrinsics_path), align_data=self._align)
         self._bundle_cache = None
 
     def snapshot(self, source_id: int, camera_id: str) -> Optional["CalibrationSnapshot"]:
@@ -1485,8 +1682,6 @@ class _CalibrationProvider:
             return None
         align_dict = self._align if isinstance(self._align, dict) else {}
         floor_y = float(align_dict.get("floor_y", 0.0) or 0.0)
-        # Baseline/non-V3DT world path is scene-units native by contract.
-        # Do not inject meter-conversion scale into runtime snapshots.
         unit_scale = 1.0
         frame_w, frame_h = self._frame_size
         if frame_w <= 0 or frame_h <= 0:
@@ -1497,15 +1692,16 @@ class _CalibrationProvider:
         res = self._camera_model_res.get(camera_id)
         if res:
             base_w, base_h = res
-        try:
-            spec = (self._camera_specs or {}).get(camera_id) if isinstance(self._camera_specs, dict) else None
-            if isinstance(spec, dict):
-                res = spec.get("resolution")
-                if isinstance(res, (list, tuple)) and len(res) >= 2:
-                    base_w = int(res[0]) or None
-                    base_h = int(res[1]) or None
-        except Exception:
-            pass
+        if base_w is None or base_h is None:
+            try:
+                spec = (self._camera_specs or {}).get(camera_id) if isinstance(self._camera_specs, dict) else None
+                if isinstance(spec, dict):
+                    res = spec.get("resolution")
+                    if isinstance(res, (list, tuple)) and len(res) >= 2:
+                        base_w = base_w or int(res[0]) or None
+                        base_h = base_h or int(res[1]) or None
+            except Exception:
+                pass
         if (base_w is None or base_h is None) and isinstance(self._model_map, dict):
             model_key = self._model_map.get(camera_id)
             model = (self._intrinsics_models or {}).get(model_key, {}) if model_key else {}
@@ -2067,18 +2263,29 @@ def _stop_websocket_server(
 def _build_rest_app() -> "FastAPI":
     from fastapi import FastAPI
     from fastapi.middleware.cors import CORSMiddleware
-    from noesis.server import analytics_api, depth_api, reid_api
+    from noesis.server import analytics_api, depth_api, reid_api, virtual_twin_api
 
     app = FastAPI(title="Noesis DS8 Runtime API")
     origins_env = os.environ.get("NOESIS_REST_CORS_ORIGINS", "").strip()
     allow_all = os.environ.get("NOESIS_REST_CORS_ALLOW_ALL", "").strip().lower() in {"1", "true", "yes", "on"}
+    origin_regex = os.environ.get("NOESIS_REST_CORS_ORIGIN_REGEX", "").strip()
     origins = [origin.strip() for origin in origins_env.split(",") if origin.strip()] if origins_env else []
     if allow_all and "*" not in origins:
         origins = ["*"]
-    if origins:
+    if not origins and not origin_regex:
+        origin_regex = (
+            r"^https?://("
+            r"localhost|127\.0\.0\.1|"
+            r"10\.\d+\.\d+\.\d+|"
+            r"172\.(1[6-9]|2\d|3[0-1])\.\d+\.\d+|"
+            r"192\.168\.\d+\.\d+"
+            r")(:\d+)?$"
+        )
+    if origins or origin_regex:
         app.add_middleware(
             CORSMiddleware,
             allow_origins=origins,
+            allow_origin_regex=origin_regex or None,
             allow_credentials=True,
             allow_methods=["*"],
             allow_headers=["*"],
@@ -2086,6 +2293,7 @@ def _build_rest_app() -> "FastAPI":
     app.include_router(depth_api.app.router)
     app.include_router(analytics_api.app.router)
     app.include_router(reid_api.app.router)
+    app.include_router(virtual_twin_api.app.router)
     return app
 
 
@@ -2907,8 +3115,19 @@ def main() -> int:
         str(args.pgie_profile),
         logger,
         pgie_size=pgie_size,
+        tracking_mode=tracking_mode,
     )
+    depth_registration_path = _resolve_depth_registration_path(args, pipeline_path=pipeline_path)
     logger.info("Building DS8 pipeline from %s (base: %s)", pipeline_path, base_pipeline_path)
+    if tracking_mode == "baseline":
+        if not _ensure_baseline_depth_tracking_guardrails(pipeline_path, logger):
+            return 1
+        if not depth_registration_path.exists():
+            logger.error(
+                "Baseline tracking requires a prebuilt depth registration artifact: %s",
+                depth_registration_path,
+            )
+            return 1
 
     if not _maybe_autogen_v3dt_caminfo(pipeline_path, cameras_path, logger):
         return 1
@@ -3034,7 +3253,6 @@ def main() -> int:
             results = res.get("results") if isinstance(res, dict) else []
             updated: list[str] = []
             persist_failed = False
-            calib_path = str(calibration_provider.extrinsics_path())
 
             for entry in results or []:
                 if not isinstance(entry, dict):
@@ -3045,9 +3263,15 @@ def main() -> int:
                 e_mat = entry.get("E")
                 if not cam or not e_mat:
                     continue
-                if save_extrinsics(calib_path, cam, e_mat):
+                persist_result = calibration_provider.set_extrinsics(str(cam), E=e_mat)
+                if persist_result.get("ok"):
                     updated.append(cam)
                 else:
+                    logger.warning(
+                        "Auto-calibrate persist failed camera=%s error=%s",
+                        cam,
+                        persist_result.get("error"),
+                    )
                     persist_failed = True
 
             top_error = res.get("error") if isinstance(res, dict) else None
@@ -3055,7 +3279,6 @@ def main() -> int:
                 top_error = "persist_failed"
 
             if updated:
-                calibration_provider.reload_extrinsics()
                 try:
                     storage_manager.calibration_bundle = calibration_provider.calibration_bundle()
                 except Exception:
@@ -3325,26 +3548,48 @@ def main() -> int:
             return {"error": "camera_required", "ts": int(time.time() * 1_000_000)}
         if storage_manager is None:
             return {"error": "depth_source_unavailable", "camera_id": camera_id}
-        try:
+
+        keys_to_check = [camera_id] + [key for key in alt_keys if key and key != camera_id]
+
+        def _generate_for_key(key: str) -> Dict[str, Any]:
             return storage_manager.generate_topdown_floorplan(
-                camera_id,
+                key,
                 max_age_sec=max_age_sec,
                 grid_res_m=grid_res_m,
                 max_extent_m=max_extent_m,
                 cache_only=cache_only,
             )
-        except Exception as exc:
+
+        def _generate_with_alternates() -> Dict[str, Any]:
+            first_exc: Optional[Exception] = None
+            try:
+                return _generate_for_key(camera_id)
+            except Exception as exc:
+                first_exc = exc
             for alt_key in alt_keys:
                 try:
-                    return storage_manager.generate_topdown_floorplan(
-                        alt_key,
-                        max_age_sec=max_age_sec,
-                        grid_res_m=grid_res_m,
-                        max_extent_m=max_extent_m,
-                        cache_only=cache_only,
-                    )
+                    return _generate_for_key(alt_key)
                 except Exception:
                     continue
+            if first_exc is not None:
+                raise first_exc
+            return {"error": "floorplan_failed", "camera_id": camera_id, "ts": int(time.time() * 1_000_000)}
+
+        def _needs_live_depth_burst(payload: Mapping[str, Any]) -> bool:
+            if cache_only:
+                return False
+            try:
+                requested_max_age = float(max_age_sec)
+            except Exception:
+                requested_max_age = 60.0
+            if requested_max_age <= 0.0:
+                return True
+            error = str(payload.get("error") or "").strip().lower()
+            return error in {"no_depth", "stale_depth", "load_failed", "invalid_snapshot"}
+
+        try:
+            payload = _generate_with_alternates()
+        except Exception as exc:
             logger.warning(
                 "DS8 floorplan provider failed (camera=%s, cache_only=%s): %s",
                 camera_id,
@@ -3352,6 +3597,62 @@ def main() -> int:
                 exc,
             )
             return {"error": str(exc) or "floorplan_failed", "camera_id": camera_id}
+        if not _needs_live_depth_burst(payload):
+            return payload
+
+        depth_branch_present = bool(pipeline.depth_gate_attach and pipeline.depth_gate_attach in pipeline.components)
+        if not depth_branch_present:
+            payload = dict(payload)
+            payload.setdefault("camera_id", camera_id)
+            payload["error"] = "depth_branch_unavailable"
+            payload["depth_burst_triggered"] = False
+            return payload
+
+        baseline_ts_by_key = {key: _read_latest_depth_ts(key) for key in keys_to_check}
+        enable_env = os.environ.get(
+            "NOESIS_FLOORPLAN_DEPTH_ENABLE_SECONDS",
+            os.environ.get("NOESIS_DEPTH_RPC_ENABLE_SECONDS", "4"),
+        )
+        try:
+            enable_seconds = int(float(str(enable_env).strip()))
+        except Exception:
+            enable_seconds = 4
+        enable_seconds = max(1, min(20, enable_seconds))
+        try:
+            ds8_pipeline.enable_depth(seconds=enable_seconds)
+        except Exception as exc:
+            payload = dict(payload)
+            payload.setdefault("camera_id", camera_id)
+            payload["error"] = str(exc) or "depth_enable_failed"
+            payload["depth_burst_triggered"] = False
+            return payload
+
+        deadline = time.time() + min(12.0, float(enable_seconds) + 4.0)
+        fresh_depth = False
+        while time.time() < deadline:
+            for key in keys_to_check:
+                latest_ts = _read_latest_depth_ts(key)
+                if latest_ts > baseline_ts_by_key.get(key, 0):
+                    fresh_depth = True
+                    break
+            if fresh_depth:
+                break
+            time.sleep(0.12)
+
+        try:
+            refreshed = dict(_generate_with_alternates())
+        except Exception as exc:
+            logger.warning(
+                "DS8 floorplan provider failed after depth burst (camera=%s): %s",
+                camera_id,
+                exc,
+            )
+            refreshed = {"error": str(exc) or "floorplan_failed", "camera_id": camera_id}
+        refreshed["depth_burst_triggered"] = True
+        refreshed["depth_burst_fresh"] = bool(fresh_depth)
+        if refreshed.get("error") and not fresh_depth:
+            refreshed.setdefault("details", "timeout_waiting_for_depth")
+        return refreshed
 
     pipeline = ds8_pipeline.build_pipeline(pipeline_path)
     setattr(pipeline, "camera_labels", camera_labels)
@@ -3411,7 +3712,23 @@ def main() -> int:
         pass
     #endregion
 
-    calibration_provider = _CalibrationProvider(cameras_path, pipeline.config, tracking_mode=tracking_mode)
+    streammux_cfg = pipeline.config.get("streammux") or {}
+    try:
+        streammux_size = (
+            int((streammux_cfg or {}).get("width", 0) or 0),
+            int((streammux_cfg or {}).get("height", 0) or 0),
+        )
+    except Exception:
+        streammux_size = (0, 0)
+    if streammux_size[0] <= 0 or streammux_size[1] <= 0:
+        streammux_size = (1920, 1080)
+
+    calibration_provider = CalibrationManager(
+        cameras_yaml_path=cameras_path,
+        camera_calibration_json_path=REPO_ROOT / "config" / "camera_calibration.json",
+        ply_alignment_json_path=REPO_ROOT / "config" / "ply_alignment.json",
+        streammux_size=streammux_size,
+    )
     calibration_provider.set_camera_labels(camera_labels)
     setattr(pipeline, "bev_calibration", calibration_provider)
     if calibration_provider.pose_only_enabled():
@@ -3427,6 +3744,20 @@ def main() -> int:
         storage_manager.calibration_bundle = calibration_provider.calibration_bundle()
     except Exception:
         logger.debug("Unable to seed calibration bundle on storage manager", exc_info=True)
+    depth_registration_manager: DepthRegistrationManager | None = None
+    if tracking_mode == "baseline":
+        try:
+            depth_registration_manager = _load_depth_registration_manager(
+                path=depth_registration_path,
+                pipeline_path=pipeline_path,
+                pipeline_cfg=pipeline.config,
+                calibration_provider=calibration_provider,
+                camera_labels=camera_labels,
+                logger=logger,
+            )
+        except DepthRegistrationError as exc:
+            logger.error("Baseline tracking requires a valid depth registration artifact: %s", exc)
+            return 1
     stable_id_mgr = _build_stable_id_manager(logger, pipeline_config=pipeline.config)
     if stable_id_mgr is None:
         logger.error("Stable ID manager is required for zero-copy hard-cutover; aborting startup")
@@ -3475,7 +3806,7 @@ def main() -> int:
     if bev_frame_env:
         bev_frame = bev_frame_env
     if not bev_frame:
-        bev_frame = "menon_scene"
+        bev_frame = POSE_V1_FRAME_BACKEND_WORLD_M
     bev_env = os.environ.get("NOESIS_BEV_JPEG_ENABLED")
     if bev_env is not None:
         env_text = str(bev_env).strip().lower()
@@ -3571,37 +3902,7 @@ def main() -> int:
         return None
 
     def _normalize_pose_payload(raw_pose: Any) -> Optional[Dict[str, Any]]:
-        if not isinstance(raw_pose, dict):
-            return None
-        position = raw_pose.get("position")
-        ypr = raw_pose.get("yaw_pitch_roll_deg")
-        rotation_order = str(raw_pose.get("rotation_order") or "").strip().upper()
-        frame = str(raw_pose.get("frame") or "").strip()
-        if not (isinstance(position, list) and len(position) == 3):
-            return None
-        if not (isinstance(ypr, list) and len(ypr) == 3):
-            return None
-        try:
-            position_f = [float(position[0]), float(position[1]), float(position[2])]
-            ypr_f = [float(ypr[0]), float(ypr[1]), float(ypr[2])]
-        except Exception:
-            return None
-        if not all(np.isfinite(v) for v in (position_f + ypr_f)):
-            return None
-        if rotation_order != "YXZ":
-            return None
-        if frame != "menon_scene":
-            return None
-        normalized: Dict[str, Any] = {
-            "position": position_f,
-            "yaw_pitch_roll_deg": ypr_f,
-            "rotation_order": "YXZ",
-            "frame": "menon_scene",
-        }
-        source = raw_pose.get("source")
-        if isinstance(source, str) and source.strip():
-            normalized["source"] = source.strip()
-        return normalized
+        return normalize_pose_v1(raw_pose)
 
     def _set_extrinsics_handler(req: Dict[str, Any]) -> Dict[str, Any]:
         cam_id = _resolve_ws_camera_id(req.get("cameraId") or req.get("camera") or req.get("camId") or req.get("id"))
@@ -3617,16 +3918,18 @@ def main() -> int:
             return {"ok": False, "error": "pose_required"}
 
         E: Optional[list[float]] = None
+        Twc_payload: Optional[list[float]] = None
         try:
             if pose is not None:
-                E_pose = pose_to_E_col_major(pose)
+                E_pose = pose_to_E_col_major(pose, align_data=calibration_provider.alignment_data())
                 if not (isinstance(E_pose, list) and len(E_pose) == 16):
                     return {"ok": False, "error": "pose_to_extrinsics_failed"}
                 E = [float(x) for x in E_pose]
             elif isinstance(req.get("E"), list) and len(req["E"]) == 16:
                 E = [float(x) for x in req["E"]]
             elif isinstance(req.get("Twc"), list) and len(req["Twc"]) == 16:
-                Twc = np.array(req["Twc"], dtype=np.float64).reshape((4, 4), order="F")
+                Twc_payload = [float(x) for x in req["Twc"]]
+                Twc = np.array(Twc_payload, dtype=np.float64).reshape((4, 4), order="F")
                 Emat = np.linalg.inv(Twc)
                 E = list(Emat.flatten(order="F"))
             else:
@@ -3663,13 +3966,11 @@ def main() -> int:
         except Exception:
             return {"ok": False, "error": "bad_extrinsics"}
 
-        calib_path = str(calibration_provider.extrinsics_path())
-        if not save_extrinsics(calib_path, cam_id, E, pose=pose):
-            return {"ok": False, "error": "persist_failed"}
+        persist_result = calibration_provider.set_extrinsics(cam_id, E=E, Twc=Twc_payload, pose=pose)
+        if not persist_result.get("ok"):
+            return persist_result
 
-        logger.warning("WS set_extrinsics persisted camera=%s path=%s", cam_id, calib_path)
-
-        calibration_provider.reload_extrinsics()
+        logger.warning("WS set_extrinsics persisted camera=%s path=%s", cam_id, calibration_provider.extrinsics_path())
         _broadcast_calibration_bundle()
         return {"ok": True, "cameraId": cam_id}
 
@@ -3691,7 +3992,6 @@ def main() -> int:
                     return {"ok": False, "error": "invalid_s_obj_to_m"}
             except Exception:
                 return {"ok": False, "error": "invalid_s_obj_to_m"}
-
         try:
             floor_y_log = align_update.get("floor_y")
             s_obj_to_m_log = (units or {}).get("s_obj_to_m") if isinstance(units, dict) else None
@@ -3706,13 +4006,11 @@ def main() -> int:
         except Exception:
             pass
 
-        align_path = str(REPO_ROOT / "config" / "ply_alignment.json")
-        if not save_alignment(align_path, align_update):
-            return {"ok": False, "error": "persist_failed"}
+        persist_result = calibration_provider.set_align(align_update)
+        if not persist_result.get("ok"):
+            return persist_result
 
-        logger.warning("WS set_align persisted path=%s", align_path)
-
-        calibration_provider.reload_alignment()
+        logger.warning("WS set_align persisted path=%s", calibration_provider.alignment_path())
         _broadcast_calibration_bundle()
         return {"ok": True}
 
@@ -3812,8 +4110,8 @@ def main() -> int:
     def _tracking_contract_metadata(source_id: int, tracks: list[Mapping[str, Any]]) -> Dict[str, Any]:
         camera_id = str(camera_labels.get(int(source_id), f"camera_{int(source_id)}"))
         calibration_version = "unknown"
-        coord_space = "scene_obj"
-        units = "obj_units"
+        coord_space = POSE_V1_FRAME_BACKEND_WORLD_M
+        units = "meters"
         image_size = None
         try:
             bundle = calibration_provider.calibration_bundle()
@@ -3859,10 +4157,11 @@ def main() -> int:
             "camera_id": camera_id,
             "coord_space": coord_space,
             "units": units,
-            "world_source": "backend_world",
+            "world_source": "backend_world_fused",
             "track_id_strategy": "camera_tracker_fallback",
             "calibration_version": calibration_version,
-            "tracking_contract_version": 2,
+            "tracking_contract_version": 3,
+            "world_frame": POSE_V1_FRAME_BACKEND_WORLD_M,
         }
         if image_size is not None:
             payload["image_size"] = list(image_size)
@@ -3911,6 +4210,17 @@ def main() -> int:
         hooks.attach_pose_feature_hook(pipeline, camera_labels=camera_labels)
     except Exception:
         logger.exception("Error while attaching pose feature hook")
+    if tracking_mode == "baseline":
+        try:
+            hooks.attach_object_depth_fusion_hook(
+                pipeline,
+                camera_labels=camera_labels,
+                calibration_resolver=calibration_provider,
+                depth_every_n_frames=2,
+            )
+        except Exception:
+            logger.exception("Baseline tracking requires the DAv2 object-depth fusion hook")
+            return 1
     hooks.attach_analytics_telemetry_hook(
         pipeline,
         tracking_pub=tracking_pub,
@@ -3918,6 +4228,7 @@ def main() -> int:
         camera_labels=camera_labels,
         bev_renderer=bev_renderer,
         bev_calibration=calibration_provider,
+        depth_registration=depth_registration_manager,
         diagnostics_logger=diagnostics_logger,
     )
     hooks.attach_exclude_prune_hook(pipeline)

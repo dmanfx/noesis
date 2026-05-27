@@ -17,6 +17,9 @@ right doc. Read this before touching code.
   hide a blocker. Surface the failure and discuss it instead.
 - **Follow the DS8 plans/checklists.** If code and docs disagree, surface the
   discrepancy and update docs rather than guessing.
+- **User-facing explanations should be semantic first.** Prefer describing behavior,
+  variables, and outcomes in plain language; only include file/line citations when
+  the user explicitly asks for code references.
 - **Stable IDs:** `stable_id` is the only user-visible person ID. `track_id` is
   internal. BEV uses `stable_id` as the user-visible identity; BEV may also
   carry `trackerId` as a debug/fallback identity key (not stable across restarts).

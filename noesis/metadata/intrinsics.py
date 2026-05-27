@@ -36,6 +36,8 @@ class CameraIntrinsics:
     k2: float = 0.0
     k3: float = 0.0
     height_m: float = 0.0
+    width: int = 0
+    height: int = 0
 
     def as_payload(self) -> Dict[str, float]:
         """Return a dict payload ready for user-meta serialization."""
@@ -308,6 +310,7 @@ def _build_intrinsics(
     source_id: int,
 ) -> CameraIntrinsics:
     intr_section = _resolve_intrinsics_section(entry, models, cfg_path, source_id)
+    width, height = _resolve_intrinsics_resolution(entry, intr_section, models)
 
     fx = _lookup_float(intr_section, ("fx", "f_x"))
     fy = _lookup_float(intr_section, ("fy", "f_y"))
@@ -364,6 +367,8 @@ def _build_intrinsics(
         k2=k2,
         k3=k3,
         height_m=height_m,
+        width=width,
+        height=height,
     )
 
 
@@ -411,6 +416,90 @@ def _load_model_intrinsics(
     if "intrinsics" in candidate and isinstance(candidate["intrinsics"], Mapping):
         return dict(candidate["intrinsics"])
     return dict(candidate)
+
+
+def _resolve_intrinsics_resolution(
+    entry: Mapping[str, Any],
+    intr_section: Mapping[str, Any],
+    models: Mapping[str, Any],
+) -> tuple[int, int]:
+    for candidate in (intr_section, entry):
+        resolution = _extract_resolution(candidate)
+        if resolution is not None:
+            return resolution
+
+    calibration = entry.get("calibration")
+    if isinstance(calibration, Mapping):
+        for candidate in (calibration, calibration.get("intrinsics")):
+            resolution = _extract_resolution(candidate)
+            if resolution is not None:
+                return resolution
+
+    model_keys: list[str] = []
+    direct_intr = entry.get("intrinsics")
+    if isinstance(direct_intr, str):
+        model_keys.append(direct_intr)
+    model_ref = entry.get("intrinsics_model") or entry.get("model") or entry.get(
+        "intrinsics_ref"
+    )
+    if isinstance(model_ref, str) and model_ref not in model_keys:
+        model_keys.append(model_ref)
+
+    for model_key in model_keys:
+        model = models.get(model_key)
+        if not isinstance(model, Mapping):
+            continue
+        for candidate in (model, model.get("intrinsics")):
+            resolution = _extract_resolution(candidate)
+            if resolution is not None:
+                return resolution
+
+    return 0, 0
+
+
+def _extract_resolution(mapping: Any) -> Optional[tuple[int, int]]:
+    if not isinstance(mapping, Mapping):
+        return None
+
+    for width_key, height_key in (
+        ("width", "height"),
+        ("image_width", "image_height"),
+        ("frame_width", "frame_height"),
+    ):
+        if width_key in mapping and height_key in mapping:
+            width = _safe_positive_int(mapping.get(width_key))
+            height = _safe_positive_int(mapping.get(height_key))
+            if width is not None and height is not None:
+                return width, height
+
+    for key in ("resolution", "image_size", "frame_size", "size"):
+        value = mapping.get(key)
+        if value is None:
+            continue
+        if isinstance(value, Mapping):
+            width = _safe_positive_int(
+                value.get("width", value.get("w", value.get("cols")))
+            )
+            height = _safe_positive_int(
+                value.get("height", value.get("h", value.get("rows")))
+            )
+            if width is not None and height is not None:
+                return width, height
+        elif isinstance(value, Iterable) and not isinstance(value, (str, bytes)):
+            seq = list(value)
+            if len(seq) >= 2:
+                width = _safe_positive_int(seq[0])
+                height = _safe_positive_int(seq[1])
+                if width is not None and height is not None:
+                    return width, height
+    return None
+
+
+def _safe_positive_int(value: Any) -> Optional[int]:
+    numeric = _safe_float(value, default=None)
+    if numeric is None or numeric <= 0:
+        return None
+    return int(round(numeric))
 
 
 def _lookup_float(

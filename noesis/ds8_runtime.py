@@ -9,6 +9,7 @@ import inspect
 import json
 import logging
 import os
+import re
 import subprocess
 import signal
 import socket
@@ -90,7 +91,8 @@ except Exception:
     _PYSERVICEMAKER_MSGS = False
 
 
-_PGIE_PROFILES = ("yolo11_seg", "rfdetr_seg", "yolo26_seg")
+_PGIE_PROFILES = ("yolo11_seg", "yolo11", "yolo26_seg", "yolo26", "rfdetr_seg", "rfdetr")
+_SIZED_PGIE_PROFILES = ("yolo26_seg", "yolo26", "rfdetr_seg", "rfdetr")
 _ENV_TRUE = ("1", "true", "yes", "y", "on")
 _TRACKING_MODES = ("baseline", "v3dt")
 _RFDETR_TRT_PLUGIN_LOADED = False
@@ -307,6 +309,190 @@ def _validate_dewarper_intrinsics_sync(
     return ok
 
 
+def _newest_model_artifact(pattern: str, *, excluded_tokens: Tuple[str, ...] = ()) -> Optional[Path]:
+    models_dir = (REPO_ROOT / "models").resolve()
+    if not models_dir.exists():
+        return None
+    candidates = []
+    for path in models_dir.rglob(pattern):
+        name = path.name.lower()
+        if any(token in name for token in excluded_tokens):
+            continue
+        if not path.is_file():
+            continue
+        candidates.append(path.resolve())
+    if not candidates:
+        return None
+    return max(candidates, key=lambda item: (item.stat().st_mtime_ns, str(item)))
+
+
+def _family_artifact_summary(*patterns: str, limit: int = 8) -> str:
+    models_dir = (REPO_ROOT / "models").resolve()
+    if not models_dir.exists():
+        return "<models directory missing>"
+    matches = []
+    seen = set()
+    for pattern in patterns:
+        for path in models_dir.rglob(pattern):
+            if not path.is_file():
+                continue
+            resolved = path.resolve()
+            if resolved in seen:
+                continue
+            seen.add(resolved)
+            matches.append(resolved)
+    if not matches:
+        return "<none>"
+    newest = sorted(matches, key=lambda item: (item.stat().st_mtime_ns, str(item)), reverse=True)
+    return "\n".join(f"  - {path}" for path in newest[:limit])
+
+
+def _resolve_yolo_detect_assets(profile: str, size: Optional[str]) -> Dict[str, Any]:
+    profile_norm = str(profile or "").strip().lower()
+    if profile_norm == "yolo11":
+        label = "YOLO11"
+        family_prefix = "yolo11"
+        size_norm = ""
+        tensor_name = "input"
+    elif profile_norm == "yolo26":
+        size_norm = str(size or "").strip().lower()
+        if size_norm not in ("n", "s", "m"):
+            raise SystemExit(f"[FATAL] YOLO26 detection size must be one of n/s/m (got: {size})")
+        label = f"YOLO26 {size_norm}"
+        family_prefix = f"yolo26{size_norm}"
+        tensor_name = "images"
+    else:
+        raise SystemExit(f"[FATAL] Unsupported YOLO detection profile: {profile}")
+
+    excluded = ("seg", "pose")
+    onnx_path = _newest_model_artifact(f"{family_prefix}*.onnx", excluded_tokens=excluded)
+    if onnx_path is None:
+        observed = _family_artifact_summary(f"{family_prefix}*")
+        raise SystemExit(
+            f"[FATAL] {label} detection ONNX not found under {REPO_ROOT / 'models'}.\n"
+            f"Looked for {family_prefix}*.onnx excluding seg/pose variants.\n"
+            f"Current matching artifacts:\n{observed}\n"
+            f"Use {profile_norm}_seg for the current segmentation assets, or add a detector ONNX/engine pair."
+        )
+
+    engine_path = _newest_model_artifact(f"{family_prefix}*.engine", excluded_tokens=excluded)
+    if engine_path is None:
+        engine_path = (REPO_ROOT / "models" / "engines" / f"{onnx_path.stem}_b3_fp16.engine").resolve()
+
+    size_suffix = f"_{size_norm}" if size_norm else ""
+    return {
+        "label": label,
+        "template": (REPO_ROOT / "pipelines" / "config_infer_primary_yolo11.ini").resolve(),
+        "preprocess_template": (REPO_ROOT / "pipelines" / "config_preproc.ini").resolve(),
+        "preprocess_output": (REPO_ROOT / "build" / f"config_preproc_{profile_norm}{size_suffix}.ini").resolve(),
+        "tensor_name": tensor_name,
+        "onnx": onnx_path,
+        "engine": engine_path,
+        "output": (REPO_ROOT / "build" / f"config_infer_primary_{profile_norm}{size_suffix}.ini").resolve(),
+    }
+
+
+def _materialize_yolo_detect_preproc_ini(assets: Dict[str, Any], logger: logging.Logger) -> Path:
+    template_path = assets["preprocess_template"]
+    if not template_path.exists():
+        raise SystemExit(f"[FATAL] YOLO detection preprocess template missing: {template_path}")
+
+    text = template_path.read_text(encoding="utf-8")
+    replacements = {
+        "network-input-shape": "3;3;640;640",
+        "processing-width": "640",
+        "processing-height": "640",
+        "tensor-name": str(assets["tensor_name"]),
+    }
+    for key, value in replacements.items():
+        text, count = re.subn(rf"(?m)^{re.escape(key)}=.*$", f"{key}={value}", text, count=1)
+        if count != 1:
+            raise SystemExit(f"[FATAL] YOLO detection preprocess template is missing {key}: {template_path}")
+
+    out_path = assets["preprocess_output"]
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text(text, encoding="utf-8")
+    logger.info(
+        "%s detector preprocess config materialized: %s (tensor-name=%s)",
+        assets["label"],
+        out_path,
+        assets["tensor_name"],
+    )
+    return out_path
+
+
+def _materialize_yolo_detect_pgie_ini(profile: str, size: Optional[str], logger: logging.Logger) -> Dict[str, Any]:
+    assets = _resolve_yolo_detect_assets(profile, size)
+    template_path = assets["template"]
+    if not template_path.exists():
+        raise SystemExit(f"[FATAL] YOLO detection PGIE template missing: {template_path}")
+
+    text = template_path.read_text(encoding="utf-8")
+    text, onnx_count = re.subn(
+        r"(?m)^onnx-file=.*$",
+        f"onnx-file={assets['onnx']}",
+        text,
+        count=1,
+    )
+    text, engine_count = re.subn(
+        r"(?m)^model-engine-file=.*$",
+        f"model-engine-file={assets['engine']}",
+        text,
+        count=1,
+    )
+    if onnx_count != 1 or engine_count != 1:
+        raise SystemExit(f"[FATAL] YOLO detection PGIE template is missing onnx-file/model-engine-file: {template_path}")
+
+    out_path = assets["output"]
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text(text, encoding="utf-8")
+    logger.info("%s detector PGIE config materialized: %s", assets["label"], out_path)
+    preproc_path = _materialize_yolo_detect_preproc_ini(assets, logger)
+    return {**assets, "pgie_config": out_path, "preprocess_config": preproc_path}
+
+
+def _resolve_rfdetr_detect_assets(size: str) -> Dict[str, Any]:
+    size_norm = str(size or "").strip().lower()
+    if size_norm not in ("n", "s", "m"):
+        raise SystemExit(f"[FATAL] RF-DETR detection size must be one of n/s/m (got: {size})")
+    model_info = {
+        "n": {"model": "rf-detr-nano", "weights": "rf-detr-nano.pth", "resolution": 384, "max_detections": 30},
+        "s": {"model": "rf-detr-small", "weights": "rf-detr-small.pth", "resolution": 512, "max_detections": 50},
+        "m": {"model": "rf-detr-medium", "weights": "rf-detr-medium.pth", "resolution": 576, "max_detections": 80},
+    }[size_norm]
+    resolution = int(model_info["resolution"])
+    return {
+        "model": model_info["model"],
+        "resolution": resolution,
+        "max_detections": int(model_info["max_detections"]),
+        "template": (REPO_ROOT / "pipelines" / "config_infer_primary_rfdetr.template.ini").resolve(),
+        "preproc": (REPO_ROOT / "pipelines" / f"config_preproc_rfdetr_detect_{resolution}.ini").resolve(),
+        "weights": (REPO_ROOT / "models" / str(model_info["weights"])).resolve(),
+        "onnx": (REPO_ROOT / "models" / "onnx" / f"rfdetr_{size_norm}_{resolution}.onnx").resolve(),
+        "engine": (REPO_ROOT / "models" / "engines" / f"rfdetr_{size_norm}_{resolution}_b3_fp16.engine").resolve(),
+        "output": (REPO_ROOT / "build" / f"config_infer_primary_rfdetr_{size_norm}.ini").resolve(),
+    }
+
+
+def _materialize_rfdetr_detect_pgie_ini(size: str, logger: logging.Logger) -> Path:
+    assets = _resolve_rfdetr_detect_assets(size)
+    template_path = assets["template"]
+    if not template_path.exists():
+        raise SystemExit(f"[FATAL] RF-DETR detection PGIE template missing: {template_path}")
+    preproc_path = assets["preproc"]
+    if not preproc_path.exists():
+        raise SystemExit(f"[FATAL] RF-DETR detection preprocess config missing: {preproc_path}")
+    out_path = assets["output"]
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    text = template_path.read_text(encoding="utf-8")
+    text = text.replace("@ONNX_PATH@", str(assets["onnx"]))
+    text = text.replace("@ENGINE_PATH@", str(assets["engine"]))
+    text = text.replace("@TOPK@", str(assets["max_detections"]))
+    out_path.write_text(text, encoding="utf-8")
+    logger.info("RF-DETR detection PGIE config materialized: %s", out_path)
+    return out_path
+
+
 def _resolve_rfdetr_assets(size: str) -> Dict[str, Any]:
     size_norm = str(size or "").strip().lower()
     if size_norm not in ("n", "s", "m"):
@@ -395,6 +581,13 @@ def _load_rfdetr_trt_plugin_library(yaml_path: Path, logger: logging.Logger) -> 
         )
 
     try:
+        import tensorrt as trt  # type: ignore
+
+        trt.init_libnvinfer_plugins(trt.Logger(trt.Logger.ERROR), "")
+    except Exception as exc:
+        logger.debug("TensorRT standard plugin init skipped: %s", exc)
+
+    try:
         ctypes.CDLL(str(lib_path), mode=getattr(ctypes, "RTLD_GLOBAL", 0))
     except Exception as exc:
         raise SystemExit(
@@ -408,7 +601,146 @@ def _load_rfdetr_trt_plugin_library(yaml_path: Path, logger: logging.Logger) -> 
 
 
 def _preflight_pgie_profile(profile: str, pipeline_cfg: Dict[str, Any], yaml_path: Path, logger: logging.Logger) -> None:
-    if profile not in ("rfdetr_seg", "yolo26_seg"):
+    if profile not in ("yolo11", "yolo26", "rfdetr", "rfdetr_seg", "yolo26_seg"):
+        return
+
+    if profile in ("yolo11", "yolo26"):
+        label = str(profile).upper()
+        preprocess_cfg = pipeline_cfg.get("preprocess") if isinstance(pipeline_cfg, dict) else None
+        preprocess_path_raw = (preprocess_cfg or {}).get("config-file") if isinstance(preprocess_cfg, dict) else None
+        preprocess_path = _resolve_pipeline_cfg_path(yaml_path, str(preprocess_path_raw or ""))
+        if not preprocess_path.exists():
+            raise SystemExit(f"[FATAL] {label} detection profile requires preprocess config-file at: {preprocess_path}")
+
+        preproc_parser = configparser.ConfigParser()
+        preproc_parser.read(preprocess_path, encoding="utf-8")
+        preproc_props = preproc_parser["property"] if preproc_parser.has_section("property") else {}
+        tensor_name = str(preproc_props.get("tensor-name", "") or "").strip()
+        expected_tensor_name = "images" if profile == "yolo26" else "input"
+        if tensor_name != expected_tensor_name:
+            raise SystemExit(
+                f"[FATAL] {label} detection preprocess tensor-name must be {expected_tensor_name!r} "
+                f"for the selected detector engine (got {tensor_name!r} in {preprocess_path})"
+            )
+
+        models_cfg = pipeline_cfg.get("models") if isinstance(pipeline_cfg, dict) else None
+        pgie_cfg = (models_cfg or {}).get("pgie") if isinstance(models_cfg, dict) else None
+        pgie_ini_raw = (pgie_cfg or {}).get("config-file-path") if isinstance(pgie_cfg, dict) else None
+        pgie_ini = _resolve_pipeline_cfg_path(yaml_path, str(pgie_ini_raw or ""))
+        if not pgie_ini.exists():
+            raise SystemExit(f"[FATAL] {label} detection profile requires PGIE config-file-path at: {pgie_ini}")
+
+        engine_raw = (pgie_cfg or {}).get("engine") if isinstance(pgie_cfg, dict) else None
+        engine_path = _resolve_pipeline_cfg_path(yaml_path, str(engine_raw or ""))
+        if not str(engine_raw or "").strip():
+            raise SystemExit(f"[FATAL] {label} detection profile requires models.pgie.engine to be set")
+
+        parser = configparser.ConfigParser()
+        parser.read(pgie_ini, encoding="utf-8")
+        props = parser["property"] if parser.has_section("property") else {}
+
+        lib_raw = str(props.get("custom-lib-path", "") or "").strip()
+        lib_path = _resolve_pipeline_cfg_path(yaml_path, lib_raw)
+        if not lib_raw or not lib_path.exists():
+            raise SystemExit(
+                f"[FATAL] {label} detection PGIE custom parser library missing.\n"
+                f"PGIE INI: {pgie_ini}\n"
+                f"custom-lib-path: {lib_raw or '<unset>'}\n"
+                f"resolved: {lib_path}\n"
+            )
+
+        gie_uid = str(props.get("gie-unique-id", "") or "").strip()
+        if gie_uid and gie_uid != "1":
+            raise SystemExit(f"[FATAL] {label} detection PGIE gie-unique-id must remain 1 (got {gie_uid})")
+
+        network_type = str(props.get("network-type", "") or "").strip()
+        if network_type and network_type != "0":
+            raise SystemExit(f"[FATAL] {label} detection PGIE network-type must be 0 (got {network_type})")
+
+        batch_size = str(props.get("batch-size", "") or "").strip()
+        if batch_size and batch_size != "3":
+            raise SystemExit(f"[FATAL] {label} detection PGIE batch-size must be 3 for DS8 batch (got {batch_size})")
+
+        if engine_path.exists():
+            logger.info("%s detection PGIE engine found: %s", label, engine_path)
+            return
+
+        onnx_raw = str(props.get("onnx-file", "") or "").strip()
+        onnx_path = _resolve_pipeline_cfg_path(yaml_path, onnx_raw)
+        if not onnx_raw or not onnx_path.exists():
+            raise SystemExit(
+                f"[FATAL] {label} detection PGIE engine is missing and no ONNX is available to rebuild it.\n"
+                f"engine (from YAML models.pgie.engine): {engine_path}\n"
+                f"onnx-file (from PGIE INI): {onnx_raw or '<unset>'}\n"
+                f"resolved: {onnx_path}\n"
+            )
+
+        logger.warning(
+            "%s detection PGIE engine missing (%s); nvinfer will attempt to build it from ONNX (%s) on startup.",
+            label,
+            engine_path,
+            onnx_path,
+        )
+        return
+
+    if profile == "rfdetr":
+        _load_rfdetr_trt_plugin_library(yaml_path, logger)
+        preprocess_cfg = pipeline_cfg.get("preprocess") if isinstance(pipeline_cfg, dict) else None
+        preprocess_path_raw = (preprocess_cfg or {}).get("config-file") if isinstance(preprocess_cfg, dict) else None
+        preprocess_path = _resolve_pipeline_cfg_path(yaml_path, str(preprocess_path_raw or ""))
+        if not preprocess_path.exists():
+            raise SystemExit(f"[FATAL] RF-DETR detection profile requires preprocess config-file at: {preprocess_path}")
+
+        models_cfg = pipeline_cfg.get("models") if isinstance(pipeline_cfg, dict) else None
+        pgie_cfg = (models_cfg or {}).get("pgie") if isinstance(models_cfg, dict) else None
+        pgie_ini_raw = (pgie_cfg or {}).get("config-file-path") if isinstance(pgie_cfg, dict) else None
+        pgie_ini = _resolve_pipeline_cfg_path(yaml_path, str(pgie_ini_raw or ""))
+        if not pgie_ini.exists():
+            raise SystemExit(f"[FATAL] RF-DETR detection profile requires PGIE config-file-path at: {pgie_ini}")
+
+        engine_raw = (pgie_cfg or {}).get("engine") if isinstance(pgie_cfg, dict) else None
+        engine_path = _resolve_pipeline_cfg_path(yaml_path, str(engine_raw or ""))
+        if not str(engine_raw or "").strip():
+            raise SystemExit("[FATAL] RF-DETR detection profile requires models.pgie.engine to be set")
+
+        parser = configparser.ConfigParser()
+        parser.read(pgie_ini, encoding="utf-8")
+        props = parser["property"] if parser.has_section("property") else {}
+
+        lib_raw = str(props.get("custom-lib-path", "") or "").strip()
+        lib_path = _resolve_pipeline_cfg_path(yaml_path, lib_raw)
+        if not lib_raw or not lib_path.exists():
+            raise SystemExit(
+                "[FATAL] RF-DETR detection PGIE custom parser library missing.\n"
+                f"PGIE INI: {pgie_ini}\n"
+                f"custom-lib-path: {lib_raw or '<unset>'}\n"
+                f"resolved: {lib_path}\n"
+                "Build it with: make -C pipelines/nvdsinfer_rfdetr\n"
+            )
+
+        gie_uid = str(props.get("gie-unique-id", "") or "").strip()
+        if gie_uid and gie_uid != "1":
+            raise SystemExit(f"[FATAL] RF-DETR detection PGIE gie-unique-id must remain 1 (got {gie_uid})")
+
+        if engine_path.exists():
+            logger.info("RF-DETR detection PGIE engine found: %s", engine_path)
+            return
+
+        onnx_raw = str(props.get("onnx-file", "") or "").strip()
+        onnx_path = _resolve_pipeline_cfg_path(yaml_path, onnx_raw)
+        if not onnx_raw or not onnx_path.exists():
+            raise SystemExit(
+                "[FATAL] RF-DETR detection PGIE engine is missing and no ONNX is available to rebuild it.\n"
+                f"engine (from YAML models.pgie.engine): {engine_path}\n"
+                f"onnx-file (from PGIE INI): {onnx_raw or '<unset>'}\n"
+                f"resolved: {onnx_path}\n"
+            )
+
+        logger.warning(
+            "RF-DETR detection PGIE engine missing (%s); nvinfer will attempt to build it from ONNX (%s) on startup.",
+            engine_path,
+            onnx_path,
+        )
         return
 
     if profile == "rfdetr_seg":
@@ -532,6 +864,37 @@ def _materialize_effective_pipeline_yaml(
         raise SystemExit(f"[FATAL] DS8 pipeline YAML must be a mapping (got {type(base_cfg).__name__}): {base_yaml_path}")
 
     overlay: Dict[str, Any] = {}
+    if profile in ("yolo11", "yolo26"):
+        if profile == "yolo26" and not pgie_size:
+            raise SystemExit("[FATAL] YOLO26 detection profile requires --size (n/s/m)")
+        size_norm = str(pgie_size).strip().lower() if profile == "yolo26" else None
+        assets = _materialize_yolo_detect_pgie_ini(profile, size_norm, logger)
+        overlay = {
+            "preprocess": {"config-file": str(assets["preprocess_config"])},
+            "models": {
+                "pgie": {
+                    "config-file-path": str(assets["pgie_config"]),
+                    "engine": str(assets["engine"]),
+                }
+            },
+        }
+        logger.info("%s detection PGIE selected", str(assets["label"]))
+    if profile == "rfdetr":
+        if not pgie_size:
+            raise SystemExit("[FATAL] RF-DETR detection profile requires --size (n/s/m)")
+        size_norm = str(pgie_size).strip().lower()
+        assets = _resolve_rfdetr_detect_assets(size_norm)
+        pgie_ini = _materialize_rfdetr_detect_pgie_ini(size_norm, logger)
+        overlay = {
+            "preprocess": {"config-file": str(assets["preproc"])},
+            "models": {
+                "pgie": {
+                    "config-file-path": str(pgie_ini),
+                    "engine": str(assets["engine"]),
+                }
+            },
+        }
+        logger.info("RF-DETR detection PGIE size: %s", size_norm)
     if profile == "rfdetr_seg":
         if not pgie_size:
             raise SystemExit("[FATAL] RF-DETR profile requires --size (n/s/m)")
@@ -720,7 +1083,7 @@ def _parse_args() -> argparse.Namespace:
         "--size",
         choices=("n", "s", "m"),
         default=None,
-        help="Model size (n/s/m). Used by --pgie-profile yolo26_seg or rfdetr_seg. Default: m.",
+        help="Model size (n/s/m). Used by yolo26/yolo26_seg or rfdetr/rfdetr_seg profiles. Default: m.",
     )
     parser.add_argument(
         "--cameras-config",
@@ -2997,9 +3360,10 @@ def main() -> int:
     runtime_state: Dict[str, Any] = {"pipeline_failed": False}
     pgie_size: Optional[str] = None
 
-    if args.size is not None and str(args.pgie_profile) not in ("yolo26_seg", "rfdetr_seg"):
-        raise SystemExit("[FATAL] --size is only valid with --pgie-profile yolo26_seg or rfdetr_seg")
-    if str(args.pgie_profile) in ("yolo26_seg", "rfdetr_seg"):
+    if args.size is not None and str(args.pgie_profile) not in _SIZED_PGIE_PROFILES:
+        sized = ", ".join(_SIZED_PGIE_PROFILES)
+        raise SystemExit(f"[FATAL] --size is only valid with --pgie-profile in: {sized}")
+    if str(args.pgie_profile) in _SIZED_PGIE_PROFILES:
         pgie_size = (args.size or "m").strip().lower()
 
     # Install SIGINT/SIGTERM handling early (before DS/GStreamer init), because

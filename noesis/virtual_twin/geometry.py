@@ -34,6 +34,9 @@ class FusedPlane:
     mask_rle: dict[str, Any]
     polygon: list[list[float]]
     semantic_label: str
+    depth_support: dict[str, Any]
+    normal_support: dict[str, Any]
+    fusion_score: float
 
 
 @dataclass(frozen=True)
@@ -119,6 +122,66 @@ def resize_float_map(values: np.ndarray, shape: tuple[int, int]) -> np.ndarray:
     import cv2
 
     return cv2.resize(arr, (int(shape[1]), int(shape[0])), interpolation=cv2.INTER_LINEAR).astype(np.float32)
+
+
+def compute_depth_normals_camera(
+    depth: np.ndarray,
+    valid_mask: np.ndarray,
+    intrinsics: Mapping[str, Any] | Sequence[Sequence[float]] | np.ndarray,
+) -> np.ndarray:
+    """Compute camera-space normals from a dense depth map.
+
+    The orientation matches the MapAnything runtime normals payload: normals
+    are view-facing in camera coordinates, so a fronto-parallel wall has
+    approximately negative Z.
+    """
+
+    z = np.asarray(depth, dtype=np.float32)
+    if z.ndim != 2:
+        raise ValueError(f"depth must be 2D, got {z.shape}")
+    valid = np.asarray(valid_mask, dtype=bool)
+    if valid.shape != z.shape:
+        raise ValueError(f"valid_mask shape {valid.shape} does not match depth shape {z.shape}")
+    valid = valid & np.isfinite(z) & (z > 0.0)
+    k = intrinsics_matrix(intrinsics)
+    fx = float(k[0, 0])
+    fy = float(k[1, 1])
+    cx = float(k[0, 2])
+    cy = float(k[1, 2])
+    if abs(fx) <= 1e-9 or abs(fy) <= 1e-9:
+        raise ValueError("intrinsics focal lengths must be non-zero")
+
+    height, width = z.shape
+    grid_u, grid_v = np.meshgrid(
+        np.arange(width, dtype=np.float32),
+        np.arange(height, dtype=np.float32),
+        indexing="xy",
+    )
+    x_cam = (grid_u - float(cx)) * z / float(fx)
+    y_cam = (grid_v - float(cy)) * z / float(fy)
+    points = np.stack([x_cam, y_cam, z], axis=-1).astype(np.float32, copy=False)
+    points[~valid] = np.nan
+
+    d_pdx = np.zeros_like(points)
+    d_pdy = np.zeros_like(points)
+    if width > 1:
+        d_pdx[:, 1:-1] = points[:, 2:] - points[:, :-2]
+        d_pdx[:, 0] = points[:, 1] - points[:, 0]
+        d_pdx[:, -1] = points[:, -1] - points[:, -2]
+    if height > 1:
+        d_pdy[1:-1] = points[2:] - points[:-2]
+        d_pdy[0] = points[1] - points[0]
+        d_pdy[-1] = points[-1] - points[-2]
+
+    normals = np.cross(d_pdx, d_pdy)
+    norm = np.linalg.norm(normals, axis=-1, keepdims=True)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        normals = np.divide(normals, norm, out=np.zeros_like(normals), where=(norm > 1e-6))
+    good = np.isfinite(normals).all(axis=-1) & valid
+    normals[~good] = 0.0
+    flip = normals[..., 2] > 0.0
+    normals[flip] *= -1.0
+    return normals.astype(np.float32, copy=False)
 
 
 def mask_bbox_polygon(mask: np.ndarray) -> list[list[float]]:
@@ -300,18 +363,143 @@ def classify_plane_from_normal(normal: np.ndarray) -> str:
     return "sloped_plane"
 
 
+def _unit_vector(value: np.ndarray) -> np.ndarray | None:
+    arr = np.asarray(value, dtype=np.float64).reshape(3)
+    norm = float(np.linalg.norm(arr))
+    if not np.isfinite(norm) or norm <= 1e-9:
+        return None
+    return arr / norm
+
+
+def _normal_support_summary(
+    *,
+    plane_normal: np.ndarray,
+    candidate_mask: np.ndarray,
+    map_normals_camera: np.ndarray | None,
+    map_normals_valid: np.ndarray | None,
+    min_fraction: float,
+    min_samples: int,
+) -> dict[str, Any]:
+    support_pixels = int(np.count_nonzero(candidate_mask))
+    base = {
+        "status": "not_provided",
+        "sample_count": 0,
+        "valid_fraction": 0.0,
+        "mapanything_normal_camera": None,
+        "normal_agreement_dot_median": None,
+        "normal_angular_error_deg_median": None,
+        "normal_angular_error_deg_p90": None,
+        "normal_variance": None,
+        "coherent_fraction": None,
+    }
+    if map_normals_camera is None:
+        return base
+    normals = np.asarray(map_normals_camera, dtype=np.float32)
+    if normals.ndim != 3 or normals.shape[:2] != candidate_mask.shape or normals.shape[2] < 3:
+        return {**base, "status": "bad_shape"}
+    normal_mask = np.asarray(candidate_mask, dtype=bool)
+    if map_normals_valid is not None:
+        valid_arr = np.asarray(map_normals_valid, dtype=bool)
+        if valid_arr.shape != candidate_mask.shape:
+            return {**base, "status": "bad_valid_shape"}
+        normal_mask &= valid_arr
+    mags = np.linalg.norm(normals[:, :, :3], axis=-1)
+    normal_mask &= np.isfinite(normals[:, :, :3]).all(axis=-1) & np.isfinite(mags) & (mags > 0.20)
+    sample_count = int(np.count_nonzero(normal_mask))
+    valid_fraction = float(sample_count / max(1, support_pixels))
+    if sample_count <= 0:
+        return {**base, "status": "no_valid_normals", "valid_fraction": valid_fraction}
+    plane_unit = _unit_vector(plane_normal)
+    if plane_unit is None:
+        return {
+            **base,
+            "status": "bad_plane_normal",
+            "sample_count": sample_count,
+            "valid_fraction": valid_fraction,
+        }
+    samples = normals[:, :, :3][normal_mask].astype(np.float64)
+    sample_norms = np.linalg.norm(samples, axis=1, keepdims=True)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        samples = np.divide(samples, sample_norms, out=np.zeros_like(samples), where=(sample_norms > 1e-9))
+    dots = samples @ plane_unit
+    finite = np.isfinite(dots)
+    if not np.any(finite):
+        return {
+            **base,
+            "status": "no_finite_normals",
+            "sample_count": sample_count,
+            "valid_fraction": valid_fraction,
+        }
+    samples = samples[finite]
+    dots = dots[finite]
+    sample_count = int(samples.shape[0])
+    valid_fraction = float(sample_count / max(1, support_pixels))
+    signs = np.where(dots < 0.0, -1.0, 1.0)
+    aligned = samples * signs[:, None]
+    abs_dots = np.clip(np.abs(dots), 0.0, 1.0)
+    angles = np.degrees(np.arccos(abs_dots))
+    median = np.median(aligned, axis=0)
+    median_unit = _unit_vector(median)
+    if median_unit is None:
+        median_unit = _unit_vector(np.mean(aligned, axis=0))
+    if median_unit is not None and float(np.dot(median_unit, plane_unit)) < 0.0:
+        median_unit = -median_unit
+    mean_aligned = np.mean(aligned, axis=0)
+    variance = 1.0 - min(1.0, float(np.linalg.norm(mean_aligned)))
+    coherent_fraction = float(np.count_nonzero(angles <= 35.0) / max(1, angles.size))
+    median_angle = float(np.median(angles))
+    p90_angle = float(np.percentile(angles, 90.0))
+    if sample_count < max(1, int(min_samples)) or valid_fraction < float(min_fraction):
+        status = "insufficient_support"
+    elif median_angle <= 35.0 and coherent_fraction >= 0.45:
+        status = "agree"
+    else:
+        status = "disagree"
+    return {
+        "status": status,
+        "sample_count": sample_count,
+        "valid_fraction": valid_fraction,
+        "mapanything_normal_camera": [float(x) for x in median_unit] if median_unit is not None else None,
+        "normal_agreement_dot_median": float(np.median(abs_dots)),
+        "normal_angular_error_deg_median": median_angle,
+        "normal_angular_error_deg_p90": p90_angle,
+        "normal_variance": float(np.clip(variance, 0.0, 1.0)),
+        "coherent_fraction": coherent_fraction,
+    }
+
+
+def _normal_support_rejects_plane(summary: Mapping[str, Any], *, max_angle_deg: float) -> bool:
+    if str(summary.get("status") or "") != "disagree":
+        return False
+    median_angle = summary.get("normal_angular_error_deg_median")
+    p90_angle = summary.get("normal_angular_error_deg_p90")
+    coherent = summary.get("coherent_fraction")
+    valid_fraction = float(summary.get("valid_fraction") or 0.0)
+    sample_count = int(summary.get("sample_count") or 0)
+    if sample_count < 24 or valid_fraction < 0.08:
+        return False
+    median_bad = median_angle is not None and float(median_angle) >= float(max_angle_deg)
+    p90_bad = p90_angle is not None and float(p90_angle) >= max(82.0, float(max_angle_deg) + 10.0)
+    coherent_bad = coherent is not None and float(coherent) < 0.20
+    return bool(median_bad or (p90_bad and coherent_bad))
+
+
 def fuse_mapanything_with_planes(
     *,
     frame_id: str,
     map_depth: np.ndarray,
     map_confidence: np.ndarray,
     map_mask: np.ndarray,
+    map_normals_camera: np.ndarray | None = None,
+    map_normals_valid: np.ndarray | None = None,
     intrinsics: Mapping[str, Any] | Sequence[Sequence[float]] | np.ndarray,
     plane_candidates: Sequence[PlaneCandidate],
     min_confidence: float = 0.5,
     plane_fit_threshold_m: float = 0.06,
     min_plane_support: int = 96,
     surfel_pixel_step: int = 2,
+    min_normal_support_fraction: float = 0.08,
+    max_normal_angle_deg: float = 70.0,
 ) -> FusionResult:
     depth = np.asarray(map_depth, dtype=np.float32)
     conf = np.asarray(map_confidence, dtype=np.float32)
@@ -323,11 +511,18 @@ def fuse_mapanything_with_planes(
     planes: list[FusedPlane] = []
     raw_residual_values: list[float] = []
     fused_residual_values: list[float] = []
+    normal_angle_values: list[float] = []
+    normal_supported_plane_count = 0
+    normal_disagreement_plane_count = 0
+    normal_rejected_plane_count = 0
+    insufficient_support_rejected_count = 0
 
     for index, candidate in enumerate(plane_candidates):
-        candidate_mask = resize_bool_mask(candidate.mask, depth.shape) & valid
+        candidate_full_mask = resize_bool_mask(candidate.mask, depth.shape)
+        candidate_mask = candidate_full_mask & valid
         support = int(np.count_nonzero(candidate_mask))
         if support < max(3, int(min_plane_support)):
+            insufficient_support_rejected_count += 1
             continue
         points, pixels = backproject_depth(
             depth,
@@ -338,6 +533,7 @@ def fuse_mapanything_with_planes(
             pixel_step=1,
         )
         if points.shape[0] < max(3, int(min_plane_support)):
+            insufficient_support_rejected_count += 1
             continue
         normal, offset, inliers, residuals = fit_robust_plane(
             points,
@@ -356,6 +552,46 @@ def fuse_mapanything_with_planes(
         ok = np.isfinite(plane_z) & (plane_z > 0.0)
         if not np.any(ok):
             continue
+        observed_z = depth[pixels[:, 1], pixels[:, 0]].astype(np.float32, copy=False)
+        depth_abs_error = np.abs(observed_z.astype(np.float64) - plane_z.astype(np.float64))
+        depth_error_ok = np.isfinite(depth_abs_error) & ok
+        depth_inlier_threshold = max(float(plane_fit_threshold_m) * 2.0, 0.08)
+        depth_inlier_fraction = (
+            float(np.count_nonzero(depth_error_ok & (depth_abs_error <= depth_inlier_threshold)))
+            / max(1.0, float(np.count_nonzero(depth_error_ok)))
+        )
+        candidate_pixel_count = int(np.count_nonzero(candidate_full_mask))
+        depth_support = {
+            "support_pixels": support,
+            "candidate_pixels": candidate_pixel_count,
+            "valid_fraction": float(support / max(1, candidate_pixel_count)),
+            "confidence_median": float(np.median(conf[candidate_mask])) if support else None,
+            "depth_inlier_fraction": depth_inlier_fraction,
+            "plane_depth_median_abs_error_m": (
+                float(np.median(depth_abs_error[depth_error_ok])) if np.any(depth_error_ok) else None
+            ),
+            "plane_depth_p90_abs_error_m": (
+                float(np.percentile(depth_abs_error[depth_error_ok], 90.0)) if np.any(depth_error_ok) else None
+            ),
+            "depth_inlier_threshold_m": float(depth_inlier_threshold),
+        }
+        normal_support = _normal_support_summary(
+            plane_normal=normal,
+            candidate_mask=candidate_mask,
+            map_normals_camera=map_normals_camera,
+            map_normals_valid=map_normals_valid,
+            min_fraction=float(min_normal_support_fraction),
+            min_samples=max(24, int(min_plane_support * 0.25)),
+        )
+        if normal_support.get("sample_count"):
+            normal_supported_plane_count += 1
+        if normal_support.get("normal_angular_error_deg_median") is not None:
+            normal_angle_values.append(float(normal_support["normal_angular_error_deg_median"]))
+        if str(normal_support.get("status") or "") == "disagree":
+            normal_disagreement_plane_count += 1
+        if _normal_support_rejects_plane(normal_support, max_angle_deg=float(max_normal_angle_deg)):
+            normal_rejected_plane_count += 1
+            continue
         px_ok = pixels[ok]
         fused_depth[px_ok[:, 1], px_ok[:, 0]] = plane_z[ok]
         replaced_mask[px_ok[:, 1], px_ok[:, 0]] = True
@@ -365,7 +601,18 @@ def fuse_mapanything_with_planes(
         med = float(np.median(fused_residuals)) if fused_residuals.size else 0.0
         p90 = float(np.percentile(fused_residuals, 90.0)) if fused_residuals.size else 0.0
         inlier_ratio = float(np.count_nonzero(inliers)) / max(1.0, float(inliers.size))
-        confidence = float(np.clip(float(candidate.confidence) * inlier_ratio, 0.0, 1.0))
+        normal_status = str(normal_support.get("status") or "")
+        if normal_status == "agree":
+            normal_factor = 1.12
+        elif normal_status == "disagree":
+            normal_factor = 0.55
+        elif normal_status in {"insufficient_support", "no_valid_normals", "bad_shape", "bad_valid_shape"}:
+            normal_factor = 0.90
+        else:
+            normal_factor = 1.0
+        depth_factor = float(np.clip(0.65 + (0.35 * depth_inlier_fraction), 0.2, 1.0))
+        fusion_score = float(np.clip(float(candidate.confidence) * inlier_ratio * normal_factor * depth_factor, 0.0, 1.0))
+        confidence = fusion_score
         centroid = np.mean(points[inliers] if np.any(inliers) else points, axis=0)
         semantic = candidate.semantic_label or classify_plane_from_normal(normal)
         planes.append(
@@ -383,6 +630,9 @@ def fuse_mapanything_with_planes(
                 mask_rle=encode_mask_rle(candidate_mask),
                 polygon=mask_bbox_polygon(candidate_mask),
                 semantic_label=semantic,
+                depth_support=depth_support,
+                normal_support=normal_support,
+                fusion_score=fusion_score,
             )
         )
         raw_residual_values.extend(float(x) for x in np.ravel(residuals))
@@ -403,7 +653,9 @@ def fuse_mapanything_with_planes(
     fused_med = float(np.median(fused_residual_values)) if fused_residual_values else None
     metrics = {
         "mapanything_valid_depth_coverage": coverage,
+        "candidate_plane_count": len(plane_candidates),
         "accepted_plane_count": len(planes),
+        "insufficient_support_rejected_plane_count": insufficient_support_rejected_count,
         "plane_pixel_coverage": plane_coverage,
         "raw_plane_median_residual_m": raw_med,
         "fused_plane_median_residual_m": fused_med,
@@ -411,6 +663,13 @@ def fuse_mapanything_with_planes(
             bool(fused_med <= raw_med) if raw_med is not None and fused_med is not None else None
         ),
         "surfel_count": int(points.shape[0]),
+        "normal_fusion_status": "provided" if map_normals_camera is not None else "not_provided",
+        "normal_supported_plane_count": normal_supported_plane_count,
+        "normal_disagreement_plane_count": normal_disagreement_plane_count,
+        "normal_rejected_plane_count": normal_rejected_plane_count,
+        "normal_median_angular_error_deg": (
+            float(np.median(normal_angle_values)) if normal_angle_values else None
+        ),
     }
     return FusionResult(
         fused_depth=fused_depth.astype(np.float32),
@@ -428,6 +687,7 @@ __all__ = [
     "PlaneCandidate",
     "backproject_depth",
     "classify_plane_from_normal",
+    "compute_depth_normals_camera",
     "decode_mask_rle",
     "encode_mask_rle",
     "fit_plane_svd",

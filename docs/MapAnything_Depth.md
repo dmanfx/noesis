@@ -61,6 +61,13 @@ Responsibilities:
 The full-frame `depth_result` and `ma_depth_response` contracts remain
 MapAnything-specific. They are not reused for the baseline DAv2 tracking lane.
 
+MapAnything normals are derived from dense depth and calibration. Runtime
+`ma_depth_response` payloads can attach them on demand, and the virtual-twin
+builder now computes the same camera-space normal evidence from persisted depth
+snapshots before writing revision artifacts. Those normals are used to validate
+and score generated planes; they do not replace MapAnything depth, ZeroPlane
+masks, or camera-derived plane equations.
+
 ## Offline DAv2 -> MapAnything Registration
 
 Baseline non-`v3dt` world tracking now requires a prebuilt registration artifact

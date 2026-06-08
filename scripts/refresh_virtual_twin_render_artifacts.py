@@ -94,6 +94,11 @@ def _load_frames(revision_dir: Path, manifest: dict[str, Any]) -> list[VirtualTw
         if image is None:
             raise VirtualTwinBuildError(f"failed to read RGB keyframe: {rgb_path}")
         depth_payload = np.load(depth_path)
+        normals_camera = (
+            np.asarray(depth_payload["normals_camera"], dtype=np.float32)
+            if "normals_camera" in depth_payload.files
+            else None
+        )
         frames.append(
             VirtualTwinFrameInput(
                 frame_id=str(row.get("frame_id") or rgb_path.stem),
@@ -105,6 +110,7 @@ def _load_frames(revision_dir: Path, manifest: dict[str, Any]) -> list[VirtualTw
                 calibration=_snapshot(calib_payload),
                 plane_candidates=(),
                 source_ref=str(row.get("source_ref") or rgb_rel),
+                map_normals_camera=normals_camera,
             )
         )
     if not frames:

@@ -15,6 +15,7 @@ from .artifacts import sample_colors_from_image, write_json, write_points_glb, w
 from .geometry import (
     FusedPlane,
     PlaneCandidate,
+    compute_depth_normals_camera,
     fuse_mapanything_with_planes,
     transform_plane,
     transform_points,
@@ -39,6 +40,7 @@ class VirtualTwinFrameInput:
     calibration: CalibrationSnapshot
     plane_candidates: Sequence[PlaneCandidate]
     source_ref: str | None = None
+    map_normals_camera: np.ndarray | None = None
 
 
 @dataclass(frozen=True)
@@ -78,7 +80,42 @@ def _safe_artifact_stem(value: str) -> str:
     return "".join(ch if ch.isalnum() or ch in {"-", "_", "."} else "_" for ch in raw)[:96]
 
 
-def _write_frame_evidence(revision_dir: Path, frame: VirtualTwinFrameInput) -> dict[str, Any]:
+def _normals_valid_mask(normals_camera: np.ndarray | None) -> np.ndarray | None:
+    if normals_camera is None:
+        return None
+    normals = np.asarray(normals_camera, dtype=np.float32)
+    if normals.ndim != 3 or normals.shape[2] < 3:
+        return None
+    mags = np.linalg.norm(normals[:, :, :3], axis=-1)
+    return (np.isfinite(normals[:, :, :3]).all(axis=-1) & np.isfinite(mags) & (mags > 0.20)).astype(bool)
+
+
+def _frame_normals_camera(frame: VirtualTwinFrameInput, *, min_confidence: float = 0.5) -> np.ndarray:
+    depth = np.asarray(frame.map_depth, dtype=np.float32)
+    if depth.ndim != 2:
+        raise VirtualTwinBuildError(f"MapAnything depth for {frame.frame_id} must be 2D, got {depth.shape}")
+    provided = frame.map_normals_camera
+    if provided is not None:
+        arr = np.asarray(provided, dtype=np.float32)
+        if arr.ndim == 3 and arr.shape[:2] == depth.shape and arr.shape[2] >= 3:
+            return arr[:, :, :3].astype(np.float32, copy=False)
+    confidence = np.asarray(frame.map_confidence, dtype=np.float32)
+    mask = np.asarray(frame.map_mask, dtype=bool)
+    if confidence.shape != depth.shape or mask.shape != depth.shape:
+        raise VirtualTwinBuildError(
+            f"MapAnything confidence/mask shape mismatch for {frame.frame_id}: "
+            f"depth={depth.shape} confidence={confidence.shape} mask={mask.shape}"
+        )
+    valid = mask & np.isfinite(depth) & (depth > 0.0) & np.isfinite(confidence) & (confidence >= float(min_confidence))
+    return compute_depth_normals_camera(depth, valid, frame.calibration.intrinsics)
+
+
+def _write_frame_evidence(
+    revision_dir: Path,
+    frame: VirtualTwinFrameInput,
+    *,
+    map_normals_camera: np.ndarray | None = None,
+) -> dict[str, Any]:
     stem = _safe_artifact_stem(frame.frame_id)
     rgb_rel = Path("keyframes") / f"{stem}.png"
     depth_rel = Path("mapanything") / f"{stem}.npz"
@@ -90,12 +127,22 @@ def _write_frame_evidence(revision_dir: Path, frame: VirtualTwinFrameInput) -> d
 
     if not cv2.imwrite(str(rgb_path), np.asarray(frame.image_bgr, dtype=np.uint8)):
         raise VirtualTwinBuildError(f"failed to persist virtual-twin RGB keyframe: {rgb_path}")
-    np.savez_compressed(
-        depth_path,
-        depth=np.asarray(frame.map_depth, dtype=np.float32),
-        confidence=np.asarray(frame.map_confidence, dtype=np.float32),
-        mask=np.asarray(frame.map_mask, dtype=np.uint8),
-    )
+    depth_payload: dict[str, Any] = {
+        "depth": np.asarray(frame.map_depth, dtype=np.float32),
+        "confidence": np.asarray(frame.map_confidence, dtype=np.float32),
+        "mask": np.asarray(frame.map_mask, dtype=np.uint8),
+    }
+    normals = np.asarray(map_normals_camera, dtype=np.float32) if map_normals_camera is not None else None
+    if normals is not None and normals.ndim == 3 and normals.shape[:2] == np.asarray(frame.map_depth).shape and normals.shape[2] >= 3:
+        normals = normals[:, :, :3].astype(np.float32, copy=False)
+        valid_normals = _normals_valid_mask(normals)
+        depth_payload["normals_camera"] = normals.astype(np.float16)
+        depth_payload["normals_valid"] = (
+            np.asarray(valid_normals, dtype=np.uint8)
+            if valid_normals is not None
+            else np.zeros(normals.shape[:2], dtype=np.uint8)
+        )
+    np.savez_compressed(depth_path, **depth_payload)
     return {
         "rgb": str(rgb_rel),
         "mapanything_npz": str(depth_rel),
@@ -2109,12 +2156,16 @@ def build_virtual_twin_revision(
         floor_y_values.append(float(frame.calibration.floor_y))
         frame_colorfulness = rgb_colorfulness(frame.image_bgr)
         colorfulness_values.append(frame_colorfulness)
-        frame_evidence = _write_frame_evidence(revision_dir, frame)
+        frame_normals_camera = _frame_normals_camera(frame)
+        frame_normals_valid = _normals_valid_mask(frame_normals_camera)
+        frame_evidence = _write_frame_evidence(revision_dir, frame, map_normals_camera=frame_normals_camera)
         fusion = fuse_mapanything_with_planes(
             frame_id=frame.frame_id,
             map_depth=frame.map_depth,
             map_confidence=frame.map_confidence,
             map_mask=frame.map_mask,
+            map_normals_camera=frame_normals_camera,
+            map_normals_valid=frame_normals_valid,
             intrinsics=frame.calibration.intrinsics,
             plane_candidates=frame.plane_candidates,
         )
@@ -2150,6 +2201,9 @@ def build_virtual_twin_revision(
                 "revision_artifacts": frame_evidence,
                 "image_size": [int(frame.image_bgr.shape[1]), int(frame.image_bgr.shape[0])],
                 "mapanything_valid_depth_coverage": fusion.metrics["mapanything_valid_depth_coverage"],
+                "normal_fusion_status": fusion.metrics.get("normal_fusion_status"),
+                "normal_supported_plane_count": fusion.metrics.get("normal_supported_plane_count"),
+                "normal_rejected_plane_count": fusion.metrics.get("normal_rejected_plane_count"),
                 "rgb_colorfulness": frame_colorfulness,
                 "accepted_plane_count": len(fusion.planes),
                 "surfel_count": int(points_world.shape[0]),
@@ -2158,6 +2212,18 @@ def build_virtual_twin_revision(
         for plane in fusion.planes:
             world_normal, world_offset = transform_plane(plane.normal, plane.offset, twc)
             world_centroid = transform_points(np.asarray([plane.centroid], dtype=np.float32), twc)[0]
+            normal_support_json = dict(plane.normal_support or {})
+            support_normal_camera = normal_support_json.get("mapanything_normal_camera")
+            if isinstance(support_normal_camera, Sequence) and len(support_normal_camera) >= 3:
+                try:
+                    n_cam = np.asarray([float(x) for x in support_normal_camera[:3]], dtype=np.float64).reshape(3)
+                    n_world = np.asarray(twc[:3, :3], dtype=np.float64) @ n_cam
+                    n_norm = float(np.linalg.norm(n_world))
+                    if np.isfinite(n_norm) and n_norm > 1e-9:
+                        n_world = n_world / n_norm
+                        normal_support_json["mapanything_normal_world"] = [float(x) for x in n_world]
+                except Exception:
+                    normal_support_json["mapanything_normal_world"] = None
             source_surface = _plane_to_source_surface(
                 plane,
                 world_normal,
@@ -2180,9 +2246,12 @@ def build_virtual_twin_revision(
                     "mask_rle": plane.mask_rle,
                     "support_pixels": int(plane.support_pixels),
                     "confidence": float(plane.confidence),
+                    "fusion_score": float(plane.fusion_score),
                     "median_residual_m": float(plane.median_residual_m),
                     "p90_residual_m": float(plane.p90_residual_m),
                     "raw_median_residual_m": float(plane.raw_median_residual_m),
+                    "depth_support": dict(plane.depth_support or {}),
+                    "normal_support": normal_support_json,
                 }
             )
 
@@ -2398,6 +2467,13 @@ def build_virtual_twin_revision(
     median_residuals = [float(p["median_residual_m"]) for p in all_plane_json]
     p90_residuals = [float(p["p90_residual_m"]) for p in all_plane_json]
     coverage_values = [float(row["mapanything_valid_depth_coverage"]) for row in frame_rows]
+    normal_error_values = [
+        float(((p.get("normal_support") or {}).get("normal_angular_error_deg_median")))
+        for p in all_plane_json
+        if ((p.get("normal_support") or {}).get("normal_angular_error_deg_median")) is not None
+    ]
+    normal_rejected_count = int(sum(int(row.get("normal_rejected_plane_count") or 0) for row in fusion_metrics))
+    normal_supported_count = int(sum(int(row.get("normal_supported_plane_count") or 0) for row in fusion_metrics))
     metrics = {
         "revision_id": revision_id,
         "camera": camera_label,
@@ -2409,6 +2485,13 @@ def build_virtual_twin_revision(
         "rgb_colorfulness_median": median_colorfulness,
         "plane_residual_median_m": float(np.median(median_residuals)) if median_residuals else None,
         "plane_residual_p90_m": float(np.percentile(p90_residuals, 90.0)) if p90_residuals else None,
+        "mapanything_normals_fusion": {
+            "status": "computed_from_depth",
+            "supported_plane_count": normal_supported_count,
+            "rejected_plane_count": normal_rejected_count,
+            "median_angular_error_deg": float(np.median(normal_error_values)) if normal_error_values else None,
+            "p90_angular_error_deg": float(np.percentile(normal_error_values, 90.0)) if normal_error_values else None,
+        },
         "room_model_leakage_ratio": float(leakage_metrics["ratio"]),
         "room_model_leakage": leakage_metrics,
         "browser_render_budget": {
@@ -2502,9 +2585,13 @@ def build_virtual_twin_revision(
         "artifacts": artifacts,
     }
     planes_json = {
-        "schema": "noesis.virtual_twin.planes.v1",
+        "schema": "noesis.virtual_twin.planes.v2",
         "revision_id": revision_id,
         "camera": camera_label,
+        "normal_fusion": {
+            "status": "computed_from_mapanything_depth",
+            "support_fields": ["normal_support", "depth_support", "fusion_score"],
+        },
         "planes": all_plane_json,
     }
     write_json(revision_dir / "manifest.json", manifest)

@@ -31,6 +31,15 @@ camera intrinsics, then fused with ZeroPlane plane instances. Pixels that belong
 to a strong plane are replaced by the fitted plane intersection geometry, while
 lower-confidence non-planar samples remain as surfels for diagnostics.
 
+The builder also computes camera-space normals from the same MapAnything depth,
+mask, confidence, and calibration evidence. These normals are supporting
+evidence only: they score, down-rank, or reject ZeroPlane/MapAnything plane
+candidates when dense depth gradients disagree with the fitted plane normal,
+but they do not replace the stream-derived plane equation with Menon model
+geometry. Each revision persists `normals_camera` and `normals_valid` arrays in
+the per-frame `mapanything/*.npz` evidence, and `planes.json` schema v2 adds
+per-plane `normal_support`, `depth_support`, and `fusion_score` fields.
+
 The fused points and planes stay in `backend_world_m` until registration. Plane
 centroids/normals are matched against Menon structural surfaces, using the
 existing Menon scene similarity as the explicit prior. The output correction is

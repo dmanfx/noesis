@@ -49,7 +49,8 @@ class WebSocketServer:
         self.logger = logging.getLogger("WebSocketServer")
         self._stats_task = None # Added reference for the periodic stats task
         self._last_stats_info_log: float = 0.0
-        # Binary frame coalescer state: keep only latest per camera
+        # Binary frame coalescer state: keep only latest per camera.
+        # Currently unused for BEV (JPEG binary retired — meta-only mode). Retained for future binary depth or similar.
         self._latest_binary_by_cam: Dict[str, bytes] = {}
         self._binary_flush_task: Optional[asyncio.Task] = None
         self._binary_sending: bool = False

@@ -36,7 +36,8 @@ Real-time multi-camera video analytics pipeline for:
 - **Frontend**: React + TypeScript, Vite, WebSocket/WebRTC client
 - **ML Models**: Runtime-selectable PGIE profiles (commonly YOLO26-seg in current baseline work), YOLO26 pose SGIE, OSNet ReID (torchreid), Depth Anything V2 metric, MapAnything (Meta Research), optional RF-DETR (`--pgie-profile`)
 - **GPU Libraries**: CUDA, cuDNN, TensorRT, `pyds` DeepStream Python bindings
-- **Communication**: WebSockets (JSON telemetry + optional BEV JPEG binaries), WebRTC (H.264 video)
+- **Communication**: WebSockets (JSON telemetry and WebRTC signaling), WebRTC
+  (H.264 video)
 
 ---
 
@@ -55,7 +56,7 @@ The system follows a **layered architecture** with clear separation between the 
                                 │
         ┌───────────────────────┴────────────────────────┐
         │ WebSocket (ws://host:6008)                     │
-        │ JSON telemetry + optional BEV JPEG binaries    │
+        │ JSON telemetry + WebRTC signaling              │
         │                                                │
         │ WebRTC (via MosaicWebRTCGateway)               │
         │ H.264 video over SRTP                          │
@@ -202,7 +203,6 @@ The system follows a **layered architecture** with clear separation between the 
 #### 4. **WebSocket Server** (`websocket_server.py`)
 - **WebSocketServer**: Async WebSocket server for real-time client communication
 - **Features**:
-  - Binary frame broadcasting (optional BEV JPEG frames)
   - JSON metadata streaming (detections, tracks, analytics, BEV points)
   - RPC handlers: calibration, depth requests, floorplan generation, BEV config
   - WebRTC signaling relay for `MosaicWebRTCGateway`
@@ -449,7 +449,7 @@ visualization:
 | `NOESIS_MOSAIC_RTSP_ENABLED` | Enable RTSP output | `true` |
 | `NOESIS_MOSAIC_WEBRTC_ENABLED` | Enable WebRTC gateway | `true` |
 | `NOESIS_REID_ENABLED` | Enable StableIDManager | `true` |
-| `NOESIS_BEV_JPEG_ENABLED` | Enable BEV JPEG binaries | `false` |
+| `NOESIS_BEV_JPEG_ENABLED` | Ignored; BEV JPEG binaries are retired | n/a |
 | `NOESIS_DS8_FPS_PROBE` | Enable FPS debug probes | `false` |
 
 ---
@@ -471,7 +471,7 @@ visualization:
 13. **Output**:
     - **RTSP**: `sink_tee` → `rtsp_queue` → `rtsp_vconv` → `nvrtspoutsinkbin` → H.264 stream at `rtsp://host:8554/mosaic`
     - **WebRTC**: `MosaicWebRTCGateway` consumes RTSP → WebRTC to browser
-    - **WebSocket**: telemetry JSON + WebRTC signaling; optional BEV JPEG binaries
+    - **WebSocket**: telemetry JSON + WebRTC signaling
 14. **Metadata Extraction**: `BatchMetadataOperator` probes extract `NvDsBatchMeta` and publish canonical track/depth telemetry
 15. **BEV Rendering**: Backend-owned `track.world` → BEV/Three.js/world-mode consumers without a second world-space smoother
 
@@ -494,7 +494,7 @@ visualization:
 1. **DeepStream → Python**: `BatchMetadataOperator` probes extract `NvDsBatchMeta` from the canonical DS8 graph
 2. **Native → Python**: `noesis_depth_tracking_tensor_ext` and `noesis_depth_meta_ext` bridge baseline DAv2 tensors and object-depth user meta into Python-visible contracts
 3. **Offline Registration Build**: `scripts/build_depth_registration.py` pairs DAv2 and MapAnything depth on matching frames to produce `config/depth_registration.json`
-4. **Python → Frontend**: WebSocket server streams telemetry (JSON) and optional BEV JPEG binaries
+4. **Python → Frontend**: WebSocket server streams telemetry JSON and WebRTC signaling
 5. **Frontend → Backend**: RPC messages for calibration, depth requests, floorplan generation, and BEV config
 6. **RTSP → WebRTC**: `MosaicWebRTCGateway` passthrough (no transcoding)
 
@@ -540,7 +540,7 @@ export NOESIS_LOG_LEVEL=DEBUG
 export NOESIS_DS8_FPS_PROBE=1          # Enable FPS probes
 export NOESIS_MOSAIC_RTSP_ENABLED=1    # Enable RTSP output
 export NOESIS_MOSAIC_WEBRTC_ENABLED=1  # Enable WebRTC gateway
-export NOESIS_BEV_JPEG_ENABLED=0       # Optional BEV JPEG binaries over WebSocket
+# NOESIS_BEV_JPEG_ENABLED is ignored; BEV JPEG binaries are retired.
 export NOESIS_REID_ENABLED=1           # Enable ReID
 ```
 
@@ -549,7 +549,8 @@ export NOESIS_REID_ENABLED=1           # Enable ReID
 ## Current State
 
 - **Stack**: DeepStream 8.0 Service Maker (`pyservicemaker`)
-- **Video Delivery**: RTSP → WebRTC gateway (mosaic); WebSocket carries signaling (plus telemetry/optional BEV JPEG binaries).
+- **Video Delivery**: RTSP → WebRTC gateway (mosaic); WebSocket carries
+  telemetry JSON and signaling.
 - **Tracking**: NvDCF + OSNet ReID for stable cross-camera IDs
 - **Depth**:
   - baseline DAv2 lane is always on and contributes to fused `track.world`

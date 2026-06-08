@@ -3954,8 +3954,6 @@ def main() -> int:
         logger.exception("Failed to attach DS8 pose keypoint overlay hook")
 
     bev_cfg = pipeline.config.get("bev") or {}
-    bev_jpeg_enabled = bool(bev_cfg.get("jpeg_enabled", False))
-    bev_jpeg_quality = int(bev_cfg.get("jpeg_quality", 70) or 70)
     bev_smoothing_cfg = bev_cfg.get("smoothing") if isinstance(bev_cfg, dict) else None
     if not isinstance(bev_smoothing_cfg, dict):
         bev_smoothing_cfg = None
@@ -3967,15 +3965,8 @@ def main() -> int:
         bev_frame = bev_frame_env
     if not bev_frame:
         bev_frame = POSE_V1_FRAME_BACKEND_WORLD_M
-    bev_env = os.environ.get("NOESIS_BEV_JPEG_ENABLED")
-    if bev_env is not None:
-        env_text = str(bev_env).strip().lower()
-        if env_text in ("1", "true", "yes", "on"):
-            bev_jpeg_enabled = True
-        elif env_text in ("0", "false", "no", "off"):
-            bev_jpeg_enabled = False
-    logger.info("BEV JPEG output enabled=%s (quality=%s)", bev_jpeg_enabled, bev_jpeg_quality)
-    logger.info("BEV frame mode=%s", bev_frame)
+    # JPEG BEV binary delivery retired (meta-only is the supported baseline).
+    logger.info("BEV JPEG output retired (meta-only mode). frame mode=%s", bev_frame)
 
     ws_server = WebSocketServer(
         host=args.ws_host,
@@ -4335,8 +4326,7 @@ def main() -> int:
         trails_cfg=trails_cfg,
         smoothing_cfg=bev_smoothing_cfg,
         frame=str(bev_frame),
-        jpeg_enabled=bev_jpeg_enabled,
-        jpeg_quality=bev_jpeg_quality,
+        # jpeg_* retired — meta-only mode (parity with canonical DS8)
     )
     ws_server.bev_config_callback = lambda cam_id, cfg: bev_renderer.update_config(cam_id, cfg)
     ws_server.bev_overlay_callback = lambda cam_id, enabled: bev_renderer.update_config(cam_id, {"overlay": enabled})

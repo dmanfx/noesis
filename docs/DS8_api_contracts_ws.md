@@ -1,7 +1,7 @@
 # DS8 WebSocket API Contracts
 _Status: validation-diagnostics addendum current as of 2026-05-27._
 
-The WebSocket server (`websocket_server.WebSocketServer`) is the primary transport for DS8 telemetry, depth retrieval, and WebRTC signaling. All message types are JSON unless noted as binary.
+The WebSocket server (`websocket_server.WebSocketServer`) is the primary transport for DS8 telemetry, depth retrieval, and WebRTC signaling. All active DS8 telemetry message types are JSON unless a future binary payload explicitly documents otherwise.
 
 ## 1. Common Envelope
 
@@ -11,7 +11,8 @@ Most JSON messages have:
 { "type": "<message-type>", ... }
 ```
 
-Binary payloads (BEV JPEG) are framed as `[len(header)][header bytes][JPEG bytes]`.
+BEV JPEG binary payloads are retired. The server still has a generic binary
+coalescer for future payload types, but current BEV delivery is metadata-only.
 
 ## 2. Stats (`type: stats`)
 

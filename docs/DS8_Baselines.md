@@ -25,9 +25,9 @@ you don’t have to sift through the historical work orders.
 ## Output & Delivery
 - Mosaic video is delivered via RTSP → WebRTC gateway; WebSocket is signaling
   only for mosaic (no JPEG-over-WS in DS8).
-- BEV JPEG binaries are **optional and default off**:
-  - env: `NOESIS_BEV_JPEG_ENABLED=0` (default)
-  - JSON BEV metadata always stays on.
+- BEV JPEG binaries are **retired**:
+  - `NOESIS_BEV_JPEG_ENABLED` and `bev.jpeg_enabled` are ignored.
+  - JSON BEV metadata is the supported delivery path.
 - BEV frame mode defaults to `menon_scene` (world/scene units).
   - Override with `NOESIS_BEV_FRAME=camera_local` to force legacy camera-local BEV.
   - World-path BEV points and trails are in native scene units; frontend owns
@@ -80,7 +80,7 @@ you don’t have to sift through the historical work orders.
 ## Trails & ID Refactor Guardrails
 - BEV uses `stable_id` for user-visible identity; `trackerId` may be included as
   debug/fallback identity only.
-- BEV JPEG output is off by default (see Output section above).
+- BEV JPEG output is retired; use BEV JSON metadata.
 - Camera-namespaced fallback colors remain enabled to avoid cross-camera color
   collisions when stable_id is absent.
 

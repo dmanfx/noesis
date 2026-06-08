@@ -172,7 +172,8 @@ Published per MapAnything inference result via `DepthResult.to_dict()`:
 }
 ```
 
-- Optional JPEG binary follows the framing `[len(header)] [header="bev:<camera>"] [JPEG bytes]` when `bev.jpeg_enabled=true` or `NOESIS_BEV_JPEG_ENABLED=1`.
+- BEV JPEG binary delivery is retired. BEV is metadata-only; `bev.jpeg_enabled`
+  and `NOESIS_BEV_JPEG_ENABLED` are ignored by the DS8 runtime.
 - Footpoints use `stableId` when available; `trackerId` may be present as a debug/fallback identity key (not stable across restarts).
 - The primary inline floorplan BEV uses `frame=camera_local_ground_m`; `footpoints[].x` is local X and `footpoints[].y` is local Z in meters so tracks are drawn in the same coordinate frame as MapAnything floorplan rasters.
 - `displaySource=image_depth_anchor` indicates a camera-local X/Z point unprojected from the image anchor and MapAnything-registered fused depth, matching the floorplan depth-unprojection basis. When depth registration rejects a sample, BEV display does not use raw object depth for the floorplan overlay.

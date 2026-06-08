@@ -223,9 +223,6 @@ class BevRenderer:
         trails_cfg: Optional[Dict[str, Any]] = None,
         smoothing_cfg: Optional[Dict[str, Any]] = None,
         frame: str = "menon_scene",
-        *,
-        jpeg_enabled: bool = False,
-        jpeg_quality: int = 70,
     ) -> None:
         self.ws = ws_server
         self._lock = threading.Lock()
@@ -247,8 +244,8 @@ class BevRenderer:
         self._trail_color_cache: Dict[int, Tuple[int, int, int]] = {}
         self._smoothing_cfg = MotionSmoothingConfig.from_mapping(smoothing_cfg or {})
         self._smoother = MotionGatedAlphaBetaSmoother(self._smoothing_cfg)
-        self._jpeg_enabled = bool(jpeg_enabled)
-        self._jpeg_quality = max(1, min(100, int(jpeg_quality)))
+        # JPEG BEV binary delivery retired (meta-only mode is the supported baseline per design decisions + contracts).
+        # The flag/env plumbing remains in the runtime for transition but is ignored here.
 
     def set_trails_enabled(self, enabled: bool) -> None:
         with self._lock:
@@ -291,6 +288,9 @@ class BevRenderer:
         return float(u), float(v)
 
     def _infer_image_flips(self, calib: CalibrationSnapshot) -> Tuple[bool, bool]:
+        # Vestigial after menon_world_unification / DS8 design decisions (flips retired from canonical path).
+        # If this ever returns non-(False, False) in the future, something has gone wrong with the unification.
+        # We keep the machinery for now but force the safe no-flip result.
         return False, False
 
     @staticmethod
@@ -709,9 +709,8 @@ class BevRenderer:
                 height_px = max(1, int(height_px * scale))
                 effective_mpp = base_mpp / max(scale, 1e-6)
 
+        # JPEG BEV image rendering retired (see __init__ comment). We only ever produce the JSON metadata payload now.
         bev: Optional[np.ndarray] = None
-        if self._jpeg_enabled:
-            bev = np.zeros((max(1, height_px), max(1, width_px), 3), dtype=np.uint8)
 
         # Compute or reuse homography; fallback to last good if current fails
         H_img2plane = None
@@ -1171,24 +1170,13 @@ class BevRenderer:
             }
             if hasattr(self.ws, "broadcast_sync"):
                 self.ws.broadcast_sync(status)
-                if self._jpeg_enabled and result.bev_bgr is not None:
-                    ok, jpeg = cv2.imencode(
-                        ".jpg",
-                        result.bev_bgr,
-                        [int(cv2.IMWRITE_JPEG_QUALITY), int(self._jpeg_quality)],
-                    )
-                    if not ok:
-                        self.publish_status(result.camera_id, error="jpeg_encode_failed")
-                        return
-                    payload = jpeg.tobytes()
-                    header = f"bev:{result.camera_id}".encode("utf-8")
-                    framed = bytes([len(header)]) + header + payload
-                    self.ws.broadcast_sync(framed)
+                # JPEG BEV binary retired (meta-only mode). No cv2 render or framed binary is produced.
+                # The general binary coalescer in the WS server remains for future use (e.g., binary depth).
                 try:
                     # Lightweight visibility that a BEV frame was queued for broadcast
                     if hasattr(self.ws, "logger") and self.ws.logger:
                         self.ws.logger.debug(
-                            "BEV publish %s: %sx%s, points=%d, overlay=%s",
+                            "BEV publish %s: %sx%s, points=%d, overlay=%s (meta-only)",
                             result.camera_id,
                             int(result.width_px),
                             int(result.height_px),
@@ -1198,5 +1186,5 @@ class BevRenderer:
                 except Exception:
                     pass
         except Exception as e:
-            print("BEV publish failed:", e)
+            logger.exception("BEV publish failed for %s", getattr(result, "camera_id", "unknown"))
             return

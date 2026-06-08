@@ -30,9 +30,9 @@ def _trtexec() -> str:
 
 def _sizes(raw: str) -> list[str]:
     sizes = [item.strip().lower() for item in str(raw or "").split(",") if item.strip()]
-    invalid = [item for item in sizes if item not in {"n", "s", "m"}]
+    invalid = [item for item in sizes if item not in {"n", "s", "m", "l", "x"}]
     if invalid:
-        raise SystemExit(f"Unsupported size(s): {invalid}. Expected subset of n,s,m")
+        raise SystemExit(f"Unsupported size(s): {invalid}. Expected subset of n,s,m,l,x")
     return sizes
 
 
@@ -91,7 +91,7 @@ def _build_engine(onnx_path: Path, engine_path: Path) -> Path:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--sizes", default="n,s,m", help="Comma-separated YOLO26 sizes to build. Default: n,s,m")
+    parser.add_argument("--sizes", default="n,s,m", help="Comma-separated YOLO26 sizes to build. Supported: n,s,m,l,x. Default: n,s,m")
     parser.add_argument("--batch", type=int, default=3, help="Static export batch size. Default: 3")
     parser.add_argument("--opset", type=int, default=18, help="ONNX opset. Default: 18")
     parser.add_argument("--device", default="cpu", help="Ultralytics export device. Default: cpu")

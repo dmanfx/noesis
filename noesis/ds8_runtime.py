@@ -93,6 +93,12 @@ except Exception:
 
 _PGIE_PROFILES = ("yolo11_seg", "yolo11", "yolo26_seg", "yolo26", "rfdetr_seg", "rfdetr")
 _SIZED_PGIE_PROFILES = ("yolo26_seg", "yolo26", "rfdetr_seg", "rfdetr")
+_YOLO26_DETECT_SIZES = ("n", "s", "m", "l", "x")
+_YOLO26_SEG_SIZES = ("n", "s", "m")
+_RFDETR_SIZES = ("n", "s", "m")
+_YOLO26_DETECT_SIZE_HELP = "/".join(_YOLO26_DETECT_SIZES)
+_YOLO26_SEG_SIZE_HELP = "/".join(_YOLO26_SEG_SIZES)
+_RFDETR_SIZE_HELP = "/".join(_RFDETR_SIZES)
 _ENV_TRUE = ("1", "true", "yes", "y", "on")
 _TRACKING_MODES = ("baseline", "v3dt")
 _RFDETR_TRT_PLUGIN_LOADED = False
@@ -356,8 +362,8 @@ def _resolve_yolo_detect_assets(profile: str, size: Optional[str]) -> Dict[str, 
         tensor_name = "input"
     elif profile_norm == "yolo26":
         size_norm = str(size or "").strip().lower()
-        if size_norm not in ("n", "s", "m"):
-            raise SystemExit(f"[FATAL] YOLO26 detection size must be one of n/s/m (got: {size})")
+        if size_norm not in _YOLO26_DETECT_SIZES:
+            raise SystemExit(f"[FATAL] YOLO26 detection size must be one of {_YOLO26_DETECT_SIZE_HELP} (got: {size})")
         label = f"YOLO26 {size_norm}"
         family_prefix = f"yolo26{size_norm}"
         tensor_name = "images"
@@ -866,7 +872,7 @@ def _materialize_effective_pipeline_yaml(
     overlay: Dict[str, Any] = {}
     if profile in ("yolo11", "yolo26"):
         if profile == "yolo26" and not pgie_size:
-            raise SystemExit("[FATAL] YOLO26 detection profile requires --size (n/s/m)")
+            raise SystemExit(f"[FATAL] YOLO26 detection profile requires --size ({_YOLO26_DETECT_SIZE_HELP})")
         size_norm = str(pgie_size).strip().lower() if profile == "yolo26" else None
         assets = _materialize_yolo_detect_pgie_ini(profile, size_norm, logger)
         overlay = {
@@ -881,7 +887,7 @@ def _materialize_effective_pipeline_yaml(
         logger.info("%s detection PGIE selected", str(assets["label"]))
     if profile == "rfdetr":
         if not pgie_size:
-            raise SystemExit("[FATAL] RF-DETR detection profile requires --size (n/s/m)")
+            raise SystemExit(f"[FATAL] RF-DETR detection profile requires --size ({_RFDETR_SIZE_HELP})")
         size_norm = str(pgie_size).strip().lower()
         assets = _resolve_rfdetr_detect_assets(size_norm)
         pgie_ini = _materialize_rfdetr_detect_pgie_ini(size_norm, logger)
@@ -897,7 +903,7 @@ def _materialize_effective_pipeline_yaml(
         logger.info("RF-DETR detection PGIE size: %s", size_norm)
     if profile == "rfdetr_seg":
         if not pgie_size:
-            raise SystemExit("[FATAL] RF-DETR profile requires --size (n/s/m)")
+            raise SystemExit(f"[FATAL] RF-DETR profile requires --size ({_RFDETR_SIZE_HELP})")
         size_norm = str(pgie_size).strip().lower()
         assets = _resolve_rfdetr_assets(size_norm)
         pgie_ini = _materialize_rfdetr_pgie_ini(size_norm, logger)
@@ -913,7 +919,7 @@ def _materialize_effective_pipeline_yaml(
         logger.info("RF-DETR PGIE size: %s", size_norm)
     if profile == "yolo26_seg":
         if not pgie_size:
-            raise SystemExit("[FATAL] YOLO26 profile requires --size (n/s/m)")
+            raise SystemExit(f"[FATAL] YOLO26 profile requires --size ({_YOLO26_SEG_SIZE_HELP})")
         size_norm = str(pgie_size).strip().lower()
         sources_cfg = base_cfg.get("sources") if isinstance(base_cfg, dict) else None
         source_count = len(sources_cfg) if isinstance(sources_cfg, list) else 0
@@ -1081,9 +1087,12 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--size",
-        choices=("n", "s", "m"),
+        choices=_YOLO26_DETECT_SIZES,
         default=None,
-        help="Model size (n/s/m). Used by yolo26/yolo26_seg or rfdetr/rfdetr_seg profiles. Default: m.",
+        help=(
+            "Model size. YOLO26 detection supports n/s/m/l/x; "
+            "YOLO26 segmentation and RF-DETR profiles currently support n/s/m. Default: m."
+        ),
     )
     parser.add_argument(
         "--cameras-config",

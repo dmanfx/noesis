@@ -168,8 +168,22 @@ Do **not** rely on environment variables to specify URIs when adding or testing 
 
 ### Build or refresh the depth-registration artifact
 
+YOLO26 detection profile with the largest upstream checkpoint:
+
+```bash
+python3 noesis/ds8_runtime.py \
+  --pipeline-config config/infer.yaml \
+  --cameras-config config/cameras.yaml \
+  --pgie-profile yolo26 \
+  --size x
+```
+
 Baseline pose+depth world tracking depends on a prebuilt DAv2->MapAnything
 registration artifact. The canonical operational flow is:
+- YOLO26 detection supports `n`, `s`, `m`, `l`, and `x` checkpoints. The `x`
+  variant uses `models/yolo26x.onnx` and
+  `models/engines/yolo26x_b3_fp16.engine` when materialized through the DS8
+  runtime profile.
 
 ```bash
 bash services/mapanything_svc/run.sh

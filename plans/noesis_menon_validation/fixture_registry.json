@@ -1,0 +1,75 @@
+{
+  "schema_version": 1,
+  "fixtures": [
+    {
+      "id": "minimal_validation_fixture",
+      "path": "minimal_fixture.json",
+      "description": "GPU-free fixture covering report contracts, transforms, six known anchors, dewarped-camera scope declarations, scene coordinate systems, room geometry constraints, mesh/depth/semantic checks, detection-to-world projection confidence, room bounds, tracking motion/occlusion/doorway continuity, BEV path smoothness/agreement, Menon placement/trail/avatar agreement, and camera/BEV overlay generation with confidence annotations.",
+      "tiers": ["unit", "fixture"],
+      "rooms": ["fixture-room"],
+      "cameras": ["fixture-camera"],
+      "expected": {
+        "status": "pass",
+        "min_check_count": 44,
+        "max_failure_count": 0,
+        "max_warning_count": 0,
+        "max_blocked_count": 0,
+        "artifacts": [
+          {
+            "key": "camera_fixture-camera_reprojection_overlay",
+            "min_bytes": 1000
+          },
+          {
+            "key": "bev_diagnostic_overlay",
+            "min_bytes": 1000
+          }
+        ]
+      }
+    },
+    {
+      "id": "minimal_telemetry",
+      "path": "minimal_telemetry.ndjson",
+      "description": "Saved DS8-style WebSocket telemetry for tracking, occlusion bridge, BEV path smoothness, and BEV agreement validation.",
+      "tiers": ["offline", "runtime-contract"],
+      "rooms": ["fixture-room"],
+      "cameras": ["fixture-camera"],
+      "expected": {
+        "status": "pass",
+        "min_check_count": 12,
+        "max_failure_count": 0,
+        "max_warning_count": 0,
+        "max_blocked_count": 0
+      }
+    },
+    {
+      "id": "minimal_menon_trace",
+      "path": "minimal_menon_trace.json",
+      "description": "Saved Menon placement trace for world-to-scene placement, floor contact, BEV/Menon trail agreement, avatar scale/collision/orientation, timestamp, and transform-audit validation.",
+      "tiers": ["offline", "menon-trace"],
+      "rooms": ["fixture-room"],
+      "cameras": ["fixture-camera"],
+      "expected": {
+        "status": "pass",
+        "min_check_count": 10,
+        "max_failure_count": 0,
+        "max_warning_count": 0,
+        "max_blocked_count": 0
+      }
+    },
+    {
+      "id": "minimal_menon_browser_snapshot",
+      "path": "minimal_menon_browser_snapshot.json",
+      "description": "Saved Menon browser debug snapshot converted into the shared Menon placement trace contract.",
+      "tiers": ["offline", "menon-browser", "menon-trace"],
+      "rooms": ["fixture-room"],
+      "cameras": ["fixture-camera"],
+      "expected": {
+        "status": "pass",
+        "min_check_count": 6,
+        "max_failure_count": 0,
+        "max_warning_count": 0,
+        "max_blocked_count": 0
+      }
+    }
+  ]
+}

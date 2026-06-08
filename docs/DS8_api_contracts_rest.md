@@ -1,5 +1,5 @@
 # DS8 REST API Contracts
-_Status: current as of 2026-02-02._
+_Status: validation-toolbox addendum current as of 2026-05-27._
 
 This document describes the REST endpoints used by the DS8 runtime. Implementations must preserve these contracts unless all consumers are updated in lockstep.
 
@@ -390,7 +390,18 @@ in readback mode or opt into applying the revision transform through its
 `reprojectionApplyVirtualTwinAlignment` setting after
 `scripts/validate_virtual_twin_tracking.py` passes for the revision camera.
 
-## 5. Future DS8 REST Endpoints
+## 5. Validation Toolbox API Status
+
+The Noesis/Menon validation toolbox currently exposes CLI/report contracts, not
+DS8 REST endpoints. Its public artifacts are JSON files under
+`diagnostics/validation/<run_id>/`, plus optional visual evidence indexed by
+`visual/index.json`.
+
+If a future change publishes validation reports, Menon camera reprojection
+evidence, or regression summaries over REST, add the endpoint, request, response,
+and failure/status semantics here before treating that surface as public.
+
+## 6. Future DS8 REST Endpoints
 
 If additional DS8 REST endpoints are introduced (e.g., for calibration, debug, or pipeline control), they should:
 

@@ -46,6 +46,73 @@ and worklogs live in `docs/history/`.
   from the DS8 testing guide for cross-space calibration, BEV, tracking-world,
   virtual-twin, and Menon-facing validation work (`plans/noesis_menon_validation/`,
   `DS8_testing_guide.md`).
+- Added the first reusable validation package, fixture runner, fixture registry,
+  minimal fixture, visual artifact index, camera reprojection overlay generation,
+  and focused unit tests for common reports, transforms, anchors, camera
+  sanity/reprojection, room bounds/wall crossing, tracking motion, BEV
+  agreement, and Menon placement agreement (`noesis/validation/`,
+  `scripts/noesis_validation_runner.py`,
+  `plans/noesis_menon_validation/fixture_registry.json`).
+- Added saved/live DS8 WebSocket telemetry validation that feeds tracking and
+  BEV messages into the common report schema and writes a per-track audit
+  artifact (`scripts/noesis_validation_telemetry_report.py`,
+  `plans/noesis_menon_validation/minimal_telemetry.ndjson`).
+- Added Menon placement-trace validation for Noesis-world to Menon-scene
+  agreement, floor contact, trail agreement, timestamp alignment, and transform
+  audit evidence (`scripts/noesis_validation_menon_trace_report.py`,
+  `plans/noesis_menon_validation/minimal_menon_trace.json`).
+- Added Menon browser debug capture and conversion into the shared Menon trace
+  contract for live browser placement validation
+  (`scripts/noesis_validation_capture_menon_trace.py`,
+  `noesis/validation/menon_browser.py`,
+  `plans/noesis_menon_validation/minimal_menon_browser_snapshot.json`).
+- Expanded Menon validation with direct BEV-to-Menon trail agreement and avatar
+  scale, collision, and movement-orientation checks
+  (`noesis/validation/menon.py`,
+  `plans/noesis_menon_validation/minimal_menon_trace.json`).
+- Added scene coordinate-system and room geometry-constraint validators for
+  generated scene fixtures, including units, axes, camera pose convention,
+  handedness, origin/scale anchors, doorway plausibility, wall junctions, and
+  surface continuity (`noesis/validation/scene.py`,
+  `plans/noesis_menon_validation/minimal_fixture.json`).
+- Added tracking temporal validators for occlusion bridges and doorway
+  transitions, and extended saved telemetry/fixtures with occlusion uncertainty
+  evidence (`noesis/validation/tracking.py`,
+  `plans/noesis_menon_validation/minimal_telemetry.ndjson`).
+- Added first scene-validation checks for plane geometry, room dimensions, mesh
+  quality, depth anchors, and semantic object support to the common fixture
+  runner (`noesis/validation/scene.py`,
+  `plans/noesis_menon_validation/minimal_fixture.json`).
+- Added first detection-to-world projection validators for footpoint agreement,
+  floor contact, room bounds, person height, ray-floor validity, and projection
+  confidence (`noesis/validation/tracking.py`).
+- Added a registry-driven regression runner that executes the fixture,
+  telemetry, and Menon-trace cases and writes a suite summary
+  (`scripts/noesis_validation_regression_runner.py`).
+- Expanded visual validation artifacts with camera room-outline/mesh-edge/raw
+  footpoint overlays and BEV diagnostic overlays for room polygons, walls,
+  doorways, frustums, tracks, and raw footpoints
+  (`noesis/validation/visuals.py`).
+- Expanded BEV diagnostic overlays with uncertainty ellipses plus StableID,
+  projection-confidence, and ReID-confidence annotations
+  (`noesis/validation/visuals.py`,
+  `plans/noesis_menon_validation/minimal_fixture.json`).
+- Added BEV zone-consistency and camera-coverage validators against room
+  polygons and camera frustum footprints (`noesis/validation/bev.py`).
+- Added golden/artifact regression comparison helpers with artifact size/hash
+  checks and optional pixel-level image diffs
+  (`noesis/validation/golden.py`,
+  `scripts/noesis_validation_regression_runner.py`).
+- Added registry-level expected thresholds so the regression runner reports
+  expectation misses as regression failures, not just per-case script status
+  (`plans/noesis_menon_validation/fixture_registry.json`).
+- Expanded telemetry track audit artifacts with projection, temporal, and ReID
+  confidence, doorway/occlusion history, impossible-motion events, speed
+  summaries, and warning lists (`noesis/validation/telemetry.py`).
+- Added validation asset inventory and tier guidance for selecting existing
+  smoke tests, pytest coverage, fixture runners, DS8 telemetry checks, and
+  Menon trace checks (`plans/noesis_menon_validation/validation_asset_inventory.md`,
+  `plans/noesis_menon_validation/validation_tiers.md`).
 
 ## Doc changes (2026-02-04)
 - Added ReID alias REST contracts, guardrails, and limitations (`DS8_api_contracts_rest.md`).

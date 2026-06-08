@@ -1,5 +1,5 @@
 # DS8 WebSocket API Contracts
-_Status: validated against code on 2026-03-16._
+_Status: validation-diagnostics addendum current as of 2026-05-27._
 
 The WebSocket server (`websocket_server.WebSocketServer`) is the primary transport for DS8 telemetry, depth retrieval, and WebRTC signaling. All message types are JSON unless noted as binary.
 
@@ -209,6 +209,13 @@ Produced by `TrackingTelemetryPublisher`; people-only (class_id=0). `track_id` i
       "world_quality_reason": "<string|null>",
       "world_frame": "menon_scene"|"camera_local"|null,
       "world_source": "bbox3d"|"pose_depth_fused"|"pose_floor_only"|"person_anchor_depth_fused"|"person_anchor_floor_only"|"gravity_drop"|"anchor_hold"|null,
+      "projection_confidence": <float|null>,
+      "temporal_confidence": <float|null>,
+      "reid_confidence": <float|null>,
+      "reid_identity": "<string|null>",
+      "appearance_id": "<string|null>",
+      "occluded": <bool|null>,
+      "occlusion_uncertainty_m": <float|null>,
       "depth_status": "<string|null>",
       "depth_anchor_source": "<string|null>",
       "depth_anchor_m": <float|null>,
@@ -254,6 +261,22 @@ Depth exposure:
 - The on-screen `z=` label is sourced from the same `depth_used_m` value that the estimator actually projected, not directly from the raw `depth_anchor_m`.
 
 When pose anchoring, gravity-drop, and recent-anchor hold all fail, DS8 leaves `world_valid=false` instead of promoting bbox-bottom floor projection into a synthetic world point.
+
+Validation diagnostics:
+
+- `projection_confidence`, `temporal_confidence`, `reid_confidence`,
+  `reid_identity`, `appearance_id`, `occluded`, and
+  `occlusion_uncertainty_m` are optional diagnostics for validation and UI
+  explanation. Producers may omit them when that evidence is unavailable, but
+  consumers must not reinterpret missing values as a pass.
+- The Noesis/Menon validation toolbox consumes these fields when present for
+  `TRACK.projection_confidence`, `TRACK.occlusion_bridge`,
+  `TRACK.identity_continuity`, `TRACK.reid_geometry_consistency`, and
+  per-track audit artifacts.
+- Cross-space validation traces may refer to this track `world` vector as
+  `backend_world_m` when handing it to Menon. Menon must apply its declared
+  room/scene alignment exactly once and should expose the transform stages in
+  trace/debug evidence for `MENON.transform_audit`.
 
 ## 7. Control & RPC Message Types
 

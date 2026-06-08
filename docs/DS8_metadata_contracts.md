@@ -1,5 +1,5 @@
 # DS8 Metadata Contracts
-_Status: current as of 2026-03-16._
+_Status: validation-diagnostics addendum current as of 2026-05-27._
 
 This document summarizes the key metadata structures used by the DS8 pipeline, both on-frame (user meta) and in downstream telemetry.
 
@@ -239,7 +239,14 @@ Each track emitted via tracking telemetry or internal structures has fields such
   "world_quality": "good"|"estimated"|"invalid",
   "world_quality_reason": "<string|null>",
   "world_frame": "<string|null>",
-  "world_source": "bbox3d"|"pose_depth_fused"|"pose_floor_only"|"person_anchor_depth_fused"|"person_anchor_floor_only"|"gravity_drop"|"anchor_hold"|null
+  "world_source": "bbox3d"|"pose_depth_fused"|"pose_floor_only"|"person_anchor_depth_fused"|"person_anchor_floor_only"|"gravity_drop"|"anchor_hold"|null,
+  "projection_confidence": <float|null>,
+  "temporal_confidence": <float|null>,
+  "reid_confidence": <float|null>,
+  "reid_identity": "<string|null>",
+  "appearance_id": "<string|null>",
+  "occluded": <bool|null>,
+  "occlusion_uncertainty_m": <float|null>
 }
 ```
 
@@ -255,6 +262,16 @@ These structures are not stored as user meta on frames by default but are the ba
 - In `v3dt` mode, `world`/`world_source="bbox3d"` continue to come from `NVDS_OBJ_3D_META`.
 - `world_frame` may be set to `"camera_local"` until shared global calibration is available.
 - `world_quality_reason` is the canonical diagnostic string explaining why the current update was fused, floor-only, guarded, held, or invalid.
+- `projection_confidence`, `temporal_confidence`, `reid_confidence`,
+  `reid_identity`, `appearance_id`, `occluded`, and
+  `occlusion_uncertainty_m` are optional validation diagnostics. They are used
+  by saved/live telemetry validation and track-audit reports when present; their
+  absence means the corresponding validation evidence is incomplete, not
+  implicitly passing.
+- Noesis/Menon validation traces may serialize the track `world` vector as
+  `backend_world_m` when proving world-to-BEV or world-to-Menon agreement. That
+  alias is a validation/debug naming convention for the same backend-owned
+  meter-space track point, not a separate metadata payload.
 
 ### Occupancy State
 

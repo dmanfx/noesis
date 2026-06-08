@@ -1,0 +1,137 @@
+{
+  "schema_version": 1,
+  "capturedAtMs": 10030,
+  "href": "http://127.0.0.1:5173",
+  "trackingProjectionMode": "frontend_reproject",
+  "cameraReprojections": [
+    {
+      "cameraId": "fixture-camera",
+      "room": "fixture-room",
+      "entity_id": "stable-1",
+      "sourceFrame": "visual/source_frame_fixture-camera.png",
+      "menonRender": "visual/menon_camera_fixture-camera.png",
+      "overlayPath": "visual/menon_camera_fixture-camera_overlay.png",
+      "layers": [
+        "source_frame",
+        "menon_render",
+        "detected_bbox",
+        "projected_avatar",
+        "room_mesh_edges",
+        "floor_grid",
+        "anchors"
+      ],
+      "metrics": {
+        "anchorMeanErrorPx": 6.0,
+        "anchorMaxErrorPx": 14.0,
+        "floorGridMeanErrorPx": 7.5,
+        "roomEdgeMeanErrorPx": 8.0,
+        "bboxIoU": 0.68,
+        "avatarIoU": 0.71,
+        "maskIoU": 0.63
+      }
+    }
+  ],
+  "calibrationData": {
+    "align": {
+      "scene_similarity": {
+        "world_to_scene_col_major": [
+          1.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          1.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          1.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          1.0
+        ]
+      }
+    },
+    "floor_y": 0.0
+  },
+  "menonTrackDebug": {
+    "projectionMode": "frontend_reproject",
+    "rawByCamera": {
+      "fixture-camera": {
+        "updatedAtMs": 10030,
+        "source": "tracking",
+        "trackCount": 2,
+        "tracks": [
+          {
+            "cameraId": "fixture-camera",
+            "stableId": 1,
+            "trackerId": 17,
+            "pathKey": "fixture-camera:stable-1:a",
+            "zone": "fixture-room",
+            "backendWorldRaw": [0.0, 0.0, 0.0],
+            "world": [0.0, 0.0, 0.0],
+            "worldValid": true,
+            "noesis_ts_s": 10.0,
+            "menon_ts_s": 10.03,
+            "confidence": 0.92
+          },
+          {
+            "cameraId": "fixture-camera",
+            "stableId": 1,
+            "trackerId": 17,
+            "pathKey": "fixture-camera:stable-1:b",
+            "zone": "fixture-room",
+            "backendWorldRaw": [0.45, 0.0, 0.15],
+            "world": [0.45, 0.0, 0.15],
+            "worldValid": true,
+            "noesis_ts_s": 10.5,
+            "menon_ts_s": 10.53,
+            "confidence": 0.9
+          }
+        ]
+      }
+    },
+    "rawProjectedInfos": [
+      {
+        "cameraId": "fixture-camera",
+        "stableId": 1,
+        "trackerId": 17,
+        "pathKey": "fixture-camera:stable-1:a",
+        "backendWorldRaw": [0.0, 0.0, 0.0],
+        "world": [0.0, 0.0, 0.0],
+        "source": "frontend_reproject"
+      },
+      {
+        "cameraId": "fixture-camera",
+        "stableId": 1,
+        "trackerId": 17,
+        "pathKey": "fixture-camera:stable-1:b",
+        "backendWorldRaw": [0.45, 0.0, 0.15],
+        "world": [0.45, 0.0, 0.15],
+        "source": "frontend_reproject"
+      }
+    ]
+  },
+  "latestRawTrackInfos": [
+    {
+      "cameraId": "fixture-camera",
+      "stableId": 1,
+      "trackerId": 17,
+      "pathKey": "fixture-camera:stable-1:a",
+      "backendWorldRaw": [0.0, 0.0, 0.0],
+      "world": [0.0, 0.0, 0.0],
+      "source": "frontend_reproject"
+    },
+    {
+      "cameraId": "fixture-camera",
+      "stableId": 1,
+      "trackerId": 17,
+      "pathKey": "fixture-camera:stable-1:b",
+      "backendWorldRaw": [0.45, 0.0, 0.15],
+      "world": [0.45, 0.0, 0.15],
+      "source": "frontend_reproject"
+    }
+  ]
+}

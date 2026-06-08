@@ -1,0 +1,278 @@
+{
+  "schema_version": 1,
+  "run_id": "minimal_menon_trace",
+  "source": {
+    "repo": "Noesis_Devel",
+    "pipeline_config": "config/infer.yaml",
+    "cameras_config": "config/cameras.yaml",
+    "menon_available": false
+  },
+  "scope": {
+    "tiers": ["menon_trace"],
+    "rooms": ["fixture-room"],
+    "cameras": ["fixture-camera"]
+  },
+  "world_to_menon_col_major": [
+    1.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    1.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    1.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    1.0
+  ],
+  "world_to_bev_col_major": [
+    1.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    1.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    1.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    1.0
+  ],
+  "floor_y_scene": 0.0,
+  "world_bev_points": [
+    {
+      "entity_id": "stable-1",
+      "stable_id": 1,
+      "camera_id": "fixture-camera",
+      "room": "fixture-room",
+      "world_point": [0.0, 0.0, 0.0],
+      "bev_point_xz": [0.0, 0.0],
+      "evidence": ["menon/trace.json"]
+    },
+    {
+      "entity_id": "stable-1",
+      "stable_id": 1,
+      "camera_id": "fixture-camera",
+      "room": "fixture-room",
+      "world_point": [0.45, 0.0, 0.15],
+      "bev_point_xz": [0.45, 0.15],
+      "evidence": ["menon/trace.json"]
+    }
+  ],
+  "placements": [
+    {
+      "entity_id": "stable-1",
+      "stable_id": 1,
+      "camera_id": "fixture-camera",
+      "room": "fixture-room",
+      "world_point": [0.0, 0.0, 0.0],
+      "menon_point": [0.0, 0.0, 0.0],
+      "noesis_ts_s": 10.0,
+      "menon_ts_s": 10.03,
+      "evidence": ["menon/trace.json"],
+      "transform_audit": [
+        {
+          "stage": "source_payload",
+          "frame": "backend_world_m",
+          "point": [0.0, 0.0, 0.0]
+        },
+        {
+          "stage": "scene_similarity",
+          "from_frame": "backend_world_m",
+          "to_frame": "menon_scene",
+          "matrix_col_major": [
+            1.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            1.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            1.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            1.0
+          ]
+        },
+        {
+          "stage": "render_anchor",
+          "frame": "menon_scene",
+          "point": [0.0, 0.0, 0.0]
+        }
+      ]
+    },
+    {
+      "entity_id": "stable-1",
+      "stable_id": 1,
+      "camera_id": "fixture-camera",
+      "room": "fixture-room",
+      "world_point": [0.45, 0.0, 0.15],
+      "menon_point": [0.45, 0.0, 0.15],
+      "noesis_ts_s": 10.5,
+      "menon_ts_s": 10.53,
+      "evidence": ["menon/trace.json"],
+      "transform_audit": [
+        {
+          "stage": "source_payload",
+          "frame": "backend_world_m",
+          "point": [0.45, 0.0, 0.15]
+        },
+        {
+          "stage": "scene_similarity",
+          "from_frame": "backend_world_m",
+          "to_frame": "menon_scene"
+        },
+        {
+          "stage": "render_anchor",
+          "frame": "menon_scene",
+          "point": [0.45, 0.0, 0.15]
+        }
+      ]
+    }
+  ],
+  "trails": [
+    {
+      "entity_id": "stable-1",
+      "camera_id": "fixture-camera",
+      "room": "fixture-room",
+      "noesis_world_points": [
+        [0.0, 0.0, 0.0],
+        [0.25, 0.0, 0.08],
+        [0.45, 0.0, 0.15]
+      ],
+      "menon_points": [
+        [0.0, 0.0, 0.0],
+        [0.25, 0.0, 0.08],
+        [0.45, 0.0, 0.15]
+      ],
+      "evidence": ["menon/trace.json"]
+    }
+  ],
+  "bev_trails": [
+    {
+      "entity_id": "stable-1",
+      "camera_id": "fixture-camera",
+      "room": "fixture-room",
+      "floor_y_world": 0.0,
+      "bev_points_xz": [
+        [0.0, 0.0],
+        [0.25, 0.08],
+        [0.45, 0.15]
+      ],
+      "menon_points": [
+        [0.0, 0.0, 0.0],
+        [0.25, 0.0, 0.08],
+        [0.45, 0.0, 0.15]
+      ],
+      "evidence": ["menon/trace.json"]
+    }
+  ],
+  "avatars": [
+    {
+      "entity_id": "stable-1",
+      "camera_id": "fixture-camera",
+      "room": "fixture-room",
+      "menon_point": [0.45, 0.0, 0.15],
+      "radius_scene": 0.18,
+      "expected_height_m": 1.72,
+      "observed_height_scene": 1.70,
+      "scene_units_per_m": 1.0,
+      "heading_deg": 18.4,
+      "movement_vector_xz": [0.45, 0.15],
+      "evidence": ["menon/trace.json"]
+    }
+  ],
+  "objects": [
+    {
+      "object_id": "fixture-couch",
+      "category": "couch",
+      "camera_id": "fixture-camera",
+      "room": "fixture-room",
+      "world_point": [0.45, 0.0, 0.15],
+      "menon_point": [0.45, 0.0, 0.15],
+      "bbox_min_scene": [0.25, 0.0, -0.05],
+      "bbox_max_scene": [0.95, 0.8, 0.35],
+      "expected_dimensions_m": [0.70, 0.80, 0.40],
+      "observed_dimensions_scene": [0.70, 0.80, 0.40],
+      "scene_units_per_m": 1.0,
+      "support_y_scene": 0.0,
+      "allowed_rooms": ["fixture-room"],
+      "evidence": ["menon/trace.json"]
+    }
+  ],
+  "collision": {
+    "wall_segments_xz": [
+      [[-1.0, -1.0], [2.0, -1.0]],
+      [[2.0, -1.0], [2.0, 1.0]],
+      [[2.0, 1.0], [-1.0, 1.0]],
+      [[-1.0, 1.0], [-1.0, -1.0]]
+    ],
+    "obstacle_boxes_xz": [
+      {"bbox_min_xz": [1.35, -0.45], "bbox_max_xz": [1.70, -0.15]}
+    ]
+  },
+  "camera_reprojections": [
+    {
+      "camera_id": "fixture-camera",
+      "room": "fixture-room",
+      "entity_id": "stable-1",
+      "source_frame": "visual/source_frame_fixture-camera.png",
+      "menon_render": "visual/menon_camera_fixture-camera.png",
+      "overlay_path": "visual/menon_camera_fixture-camera_overlay.png",
+      "layers": [
+        "source_frame",
+        "menon_render",
+        "detected_bbox",
+        "projected_avatar",
+        "room_mesh_edges",
+        "floor_grid",
+        "anchors"
+      ],
+      "anchor_mean_error_px": 6.0,
+      "anchor_max_error_px": 14.0,
+      "floor_grid_mean_error_px": 7.5,
+      "room_edge_mean_error_px": 8.0,
+      "bbox_iou": 0.68,
+      "avatar_iou": 0.71,
+      "mask_iou": 0.63,
+      "evidence": ["visual/menon_camera_fixture-camera_overlay.png"]
+    }
+  ],
+  "latency_samples": [
+    {
+      "entity_id": "stable-1",
+      "stable_id": 1,
+      "camera_id": "fixture-camera",
+      "room": "fixture-room",
+      "noesis_ts_s": 10.5,
+      "telemetry_ts_s": 10.51,
+      "menon_update_ts_s": 10.53,
+      "menon_render_ts_s": 10.55,
+      "menon_display_ts_s": 10.56,
+      "evidence": ["menon/trace.json"]
+    }
+  ],
+  "screenshots": [
+    {
+      "id": "fixture_top_down",
+      "kind": "menon_top_down",
+      "path": "visual/fixture_top_down.png",
+      "note": "Placeholder path for captured Menon evidence in real runs."
+    }
+  ]
+}

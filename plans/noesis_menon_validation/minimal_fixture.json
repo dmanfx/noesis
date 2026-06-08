@@ -1,0 +1,508 @@
+{
+  "run_id": "minimal_validation_fixture",
+  "source": {
+    "repo": "Noesis_Devel",
+    "pipeline_config": "config/infer.yaml",
+    "cameras_config": "config/cameras.yaml",
+    "menon_available": false
+  },
+  "scope": {
+    "rooms": ["fixture-room"],
+    "cameras": ["fixture-camera"],
+    "tiers": ["unit", "fixture"]
+  },
+  "render_bev_overlay": true,
+  "bev_overlay": {
+    "width": 900,
+    "height": 700,
+    "confidence_ellipses": [
+      {
+        "center": [1.0, 0.0],
+        "radius_x_m": 0.18,
+        "radius_z_m": 0.10,
+        "heading_deg": 0.0
+      }
+    ],
+    "track_annotations": [
+      {
+        "point": [1.0, 0.0],
+        "stable_id": 1,
+        "projection_confidence": 0.85,
+        "reid_confidence": 0.80
+      }
+    ]
+  },
+  "confidence": {
+    "projection": 0.9,
+    "geometry": 0.9,
+    "temporal": 0.9,
+    "end_to_end": 0.86
+  },
+  "transforms": [
+    {
+      "id": "fixture_identity",
+      "matrix_col_major": [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1],
+      "points": [[0, 0, 0], [1, 2, 3]]
+    }
+  ],
+  "anchors": [
+    {
+      "anchor_id": "fixture_floor_corner",
+      "anchor_type": "room",
+      "room": "fixture-room",
+      "expected_world": [0, 0, 0],
+      "observed_world": [0.04, 0, 0.03]
+    },
+    {
+      "anchor_id": "fixture_wall_midpoint",
+      "anchor_type": "room",
+      "room": "fixture-room",
+      "expected_world": [1.0, 0.0, 1.0],
+      "observed_world": [1.04, 0.0, 1.02]
+    },
+    {
+      "anchor_id": "fixture_doorway_left",
+      "anchor_type": "doorway",
+      "room": "fixture-room",
+      "expected_world": [0.2, 0.0, -1.0],
+      "observed_world": [0.22, 0.0, -0.99]
+    },
+    {
+      "anchor_id": "fixture_doorway_right",
+      "anchor_type": "doorway",
+      "room": "fixture-room",
+      "expected_world": [0.8, 0.0, -1.0],
+      "observed_world": [0.78, 0.0, -1.02]
+    },
+    {
+      "anchor_id": "fixture_camera_mount",
+      "anchor_type": "camera",
+      "camera": "fixture-camera",
+      "room": "fixture-room",
+      "expected_world": [0.0, 2.0, 0.0],
+      "observed_world": [0.03, 2.02, 0.04]
+    },
+    {
+      "anchor_id": "fixture_couch_corner",
+      "anchor_type": "object",
+      "room": "fixture-room",
+      "expected_world": [0.2, 0.0, -0.5],
+      "observed_world": [0.24, 0.0, -0.47]
+    }
+  ],
+  "scene": {
+    "coordinate_systems": [
+      {
+        "scene_id": "fixture-room-scene",
+        "units": "m",
+        "axis_convention": "x_right_y_up_z_forward",
+        "expected_axis_convention": "x_right_y_up_z_forward",
+        "camera_pose_convention": "world_to_camera",
+        "expected_camera_pose_convention": "world_to_camera",
+        "origin_delta_m": 0.02,
+        "transform_col_major": [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1],
+        "round_trip_points": [[0, 0, 0], [1, 0, 1], [0.5, 1.2, 0.25]],
+        "scale_anchor_expected_m": 3.0,
+        "scale_anchor_observed_m": 3.02
+      }
+    ],
+    "planes": [
+      {
+        "id": "floor",
+        "type": "floor",
+        "room": "fixture-room",
+        "normal": [0.0, 1.0, 0.0],
+        "rms_deviation_m": 0.01
+      },
+      {
+        "id": "west-wall",
+        "type": "wall",
+        "room": "fixture-room",
+        "normal": [1.0, 0.0, 0.0],
+        "rms_deviation_m": 0.02
+      },
+      {
+        "id": "ceiling",
+        "type": "ceiling",
+        "room": "fixture-room",
+        "normal": [0.0, -1.0, 0.0],
+        "rms_deviation_m": 0.01
+      }
+    ],
+    "room_dimensions": [
+      {
+        "room_id": "fixture-room",
+        "width_m": 3.0,
+        "length_m": 2.0,
+        "height_m": 2.45,
+        "expected_width_m": 3.02,
+        "expected_length_m": 2.01,
+        "expected_height_m": 2.44
+      }
+    ],
+    "room_geometry_constraints": [
+      {
+        "constraint_id": "west-wall-floor",
+        "constraint_type": "orthogonality",
+        "room": "fixture-room",
+        "angle_error_deg": 1.2,
+        "gap_m": 0.01
+      },
+      {
+        "constraint_id": "doorway-main",
+        "constraint_type": "doorway",
+        "room": "fixture-room",
+        "doorway_width_m": 0.86,
+        "doorway_height_m": 2.03,
+        "doorway_bottom_gap_m": 0.0,
+        "surface_gap_m": 0.02
+      },
+      {
+        "constraint_id": "north-window",
+        "constraint_type": "window",
+        "room": "fixture-room",
+        "window_width_m": 1.10,
+        "window_height_m": 0.80,
+        "window_sill_height_m": 0.92,
+        "surface_gap_m": 0.02
+      },
+      {
+        "constraint_id": "north-east-wall-junction",
+        "constraint_type": "wall_intersection",
+        "room": "fixture-room",
+        "gap_m": 0.02,
+        "overlap_m": 0.01,
+        "normal_dot": 0.0
+      }
+    ],
+    "meshes": [
+      {
+        "asset_id": "fixture-room-shell",
+        "room": "fixture-room",
+        "bbox_min": [-1.0, 0.0, -1.0],
+        "bbox_max": [2.0, 2.45, 1.0],
+        "triangle_count": 2400,
+        "vertex_count": 1400,
+        "watertight_expected": false,
+        "watertight": false,
+        "non_manifold_edges": 0,
+        "inverted_faces": 0,
+        "duplicate_faces": 0,
+        "uv_overlap_ratio": 0.0,
+        "lod_max_error_m": 0.02,
+        "texture_alignment_error_px": 2.0,
+        "texture_stretch_ratio": 1.05,
+        "bvh_valid": true,
+        "collision_bvh_error_m": 0.02
+      }
+    ],
+    "menon_assets": [
+      {
+        "asset_id": "fixture-room-shell",
+        "asset_type": "room_mesh",
+        "room": "fixture-room",
+        "scale_error_m": 0.02,
+        "orientation_error_deg": 1.0,
+        "origin_error_m": 0.02,
+        "collision_mesh_error_m": 0.01
+      },
+      {
+        "asset_id": "fixture-floor",
+        "asset_type": "floor_mesh",
+        "room": "fixture-room",
+        "floor_flatness_m": 0.01,
+        "floor_alignment_error_m": 0.02,
+        "walkable": true
+      },
+      {
+        "asset_id": "fixture-wall",
+        "asset_type": "wall_mesh",
+        "room": "fixture-room",
+        "doorway_blocked": false
+      },
+      {
+        "asset_id": "fixture-camera-marker",
+        "asset_type": "camera_marker",
+        "room": "fixture-room",
+        "camera_position_error_m": 0.04,
+        "camera_aim_error_deg": 1.5
+      },
+      {
+        "asset_id": "fixture-debug-overlays",
+        "asset_type": "debug_overlay",
+        "room": "fixture-room",
+        "overlay_rendered_layers": ["anchors", "frustums", "floor_grid", "track_trails"],
+        "required_overlay_layers": ["anchors", "frustums", "floor_grid", "track_trails"]
+      }
+    ],
+    "depth_anchors": [
+      {
+        "anchor_id": "floor-midpoint-depth",
+        "camera_id": "fixture-camera",
+        "room": "fixture-room",
+        "expected_depth_m": 2.0,
+        "observed_depth_m": 2.05,
+        "order_group": "fixture-camera-depth-order",
+        "expected_order": 1,
+        "plane_residual_m": 0.03,
+        "object_depth_error_m": 0.04,
+        "temporal_std_m": 0.02,
+        "static_std_m": 0.02,
+        "edge_alignment_error_px": 3.0,
+        "confidence": 0.82,
+        "fusion_weight": 0.70
+      },
+      {
+        "anchor_id": "far-wall-depth",
+        "camera_id": "fixture-camera",
+        "room": "fixture-room",
+        "expected_depth_m": 3.0,
+        "observed_depth_m": 3.08,
+        "order_group": "fixture-camera-depth-order",
+        "expected_order": 2,
+        "plane_residual_m": 0.04,
+        "object_depth_error_m": 0.05,
+        "temporal_std_m": 0.03,
+        "static_std_m": 0.025,
+        "edge_alignment_error_px": 4.0,
+        "confidence": 0.76,
+        "fusion_weight": 0.60
+      }
+    ],
+    "semantic_objects": [
+      {
+        "object_id": "fixture-couch",
+        "category": "couch",
+        "room": "fixture-room",
+        "bbox_min": [0.2, 0.0, -0.5],
+        "bbox_max": [1.4, 0.8, 0.2],
+        "support_y": 0.0,
+        "max_wall_intersection_m": 0.0,
+        "max_static_shift_m": 0.02,
+        "allowed_rooms": ["fixture-room"],
+        "doorway_clearance_m": 0.86,
+        "free_space_clearance_m": 0.55,
+        "walkable_area_blocked_ratio": 0.02,
+        "known_anchor_error_m": 0.05
+      }
+    ]
+  },
+  "rooms": [
+    {
+      "id": "fixture-room",
+      "polygon_xz": [[-1.0, -1.0], [2.0, -1.0], [2.0, 1.0], [-1.0, 1.0]],
+      "wall_segments_xz": [
+        [[-1.0, -1.0], [2.0, -1.0]],
+        [[2.0, -1.0], [2.0, 1.0]],
+        [[2.0, 1.0], [-1.0, 1.0]],
+        [[-1.0, 1.0], [-1.0, -1.0]]
+      ],
+      "doorways_xz": [
+        [[0.2, -1.0], [0.8, -1.0]]
+      ],
+      "min_inside_ratio": 1.0
+    }
+  ],
+  "cameras": [
+    {
+      "camera_id": "fixture-camera",
+      "image_size": [640, 480],
+      "expected_resolution": [640, 480],
+      "intrinsics": [[200.0, 0.0, 320.0], [0.0, 200.0, 240.0], [0.0, 0.0, 1.0]],
+      "extrinsics_col_major": [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, -1.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 2.0, 1.0],
+      "floor_y": 0.0,
+      "unit_scale": 1.0,
+      "stream_kind": "dewarped",
+      "applies_to_raw": false,
+      "applies_to_dewarped": true,
+      "frustum_xz": [[-0.4, -0.2], [1.4, -0.2], [1.4, 2.0], [-0.4, 2.0], [-0.4, -0.2]],
+      "room_outline_world": [[-1.0, 0.0, 0.0], [2.0, 0.0, 0.0], [2.0, 0.0, 1.0], [-1.0, 0.0, 1.0], [-1.0, 0.0, 0.0]],
+      "detected_footpoints_world": [
+        {"entity_id": "stable-1", "point": [0.5, 0.0, 0.0]}
+      ],
+      "image_bboxes_xyxy": [
+        {"entity_id": "stable-1", "bbox": [300.0, 100.0, 380.0, 420.0]}
+      ],
+      "projected_bboxes_xyxy": [
+        {"entity_id": "stable-1", "bbox": [304.0, 106.0, 376.0, 416.0]}
+      ],
+      "avatar_bboxes_xyxy": [
+        {"entity_id": "stable-1", "bbox": [306.0, 110.0, 374.0, 414.0]}
+      ],
+      "mask_polygons_xy": [
+        {"entity_id": "stable-1", "points": [[318.0, 124.0], [365.0, 132.0], [374.0, 410.0], [310.0, 412.0]]}
+      ],
+      "mesh_edges_world": [
+        [[-1.0, 0.0, 0.0], [2.0, 0.0, 0.0]],
+        [[2.0, 0.0, 0.0], [2.0, 0.0, 1.0]],
+        [[2.0, 0.0, 1.0], [-1.0, 0.0, 1.0]],
+        [[-1.0, 0.0, 1.0], [-1.0, 0.0, 0.0]]
+      ],
+      "reprojection_anchors": [
+        {
+          "anchor_id": "fixture_floor_center",
+          "world_point": [0.0, 0.0, 0.0],
+          "expected_pixel": [320.0, 240.0],
+          "room": "fixture-room"
+        }
+      ],
+      "render_overlay": true
+    }
+  ],
+  "tracks": [
+    {
+      "ts_s": 0.0,
+      "camera_id": "fixture-camera",
+      "room": "fixture-room",
+      "stable_id": 1,
+      "tracker_id": 101,
+      "reid_identity": "person-fixture",
+      "reid_confidence": 0.78,
+      "world": [0.0, 0.0, 0.0]
+    },
+    {
+      "ts_s": 1.0,
+      "camera_id": "fixture-camera",
+      "room": "fixture-room",
+      "stable_id": 1,
+      "tracker_id": 101,
+      "reid_identity": "person-fixture",
+      "world": [0.5, 0.0, 0.0],
+      "occluded": true,
+      "occlusion_uncertainty_m": 0.75,
+      "projection_confidence": 0.72,
+      "reid_confidence": 0.79
+    },
+    {
+      "ts_s": 2.0,
+      "camera_id": "fixture-camera",
+      "room": "fixture-room",
+      "stable_id": 1,
+      "tracker_id": 101,
+      "reid_identity": "person-fixture",
+      "reid_confidence": 0.80,
+      "world": [1.0, 0.0, 0.0]
+    }
+  ],
+  "projection_samples": [
+    {
+      "entity_id": "stable-1",
+      "camera_id": "fixture-camera",
+      "room": "fixture-room",
+      "world_point": [0.5, 0.0, 0.0],
+      "bbox_foot_world": [0.49, 0.0, 0.01],
+      "mask_foot_world": [0.51, 0.0, -0.01],
+      "pose_foot_world": [0.5, 0.0, 0.02],
+      "depth_world": [0.52, 0.0, 0.0],
+      "image_bbox_xyxy": [300.0, 100.0, 380.0, 420.0],
+      "projected_bbox_xyxy": [304.0, 106.0, 376.0, 416.0],
+      "reprojection_score": 0.94,
+      "temporal_smoothness_score": 0.92,
+      "semantic_validity_score": 0.95,
+      "floor_y": 0.0,
+      "person_height_m": 1.72,
+      "ray_floor_valid": true,
+      "room_polygon_xz": [[-1.0, -1.0], [2.0, -1.0], [2.0, 1.0], [-1.0, 1.0]]
+    }
+  ],
+  "bev_points": [
+    {"ts_s": 0.0, "camera_id": "fixture-camera", "stable_id": 1, "x": 0.0, "z": 0.0},
+    {"ts_s": 1.0, "camera_id": "fixture-camera", "stable_id": 1, "x": 0.5, "z": 0.0},
+    {"ts_s": 2.0, "camera_id": "fixture-camera", "stable_id": 1, "x": 1.0, "z": 0.0}
+  ],
+  "menon": {
+    "world_to_menon_col_major": [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1],
+    "world_to_bev_col_major": [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1],
+    "world_bev_points": [
+      {
+        "entity_id": "stable-1",
+        "camera_id": "fixture-camera",
+        "room": "fixture-room",
+        "world_point": [0.0, 0.0, 0.0],
+        "bev_point_xz": [0.0, 0.0]
+      },
+      {
+        "entity_id": "stable-1",
+        "camera_id": "fixture-camera",
+        "room": "fixture-room",
+        "world_point": [0.5, 0.0, 0.0],
+        "bev_point_xz": [0.5, 0.0]
+      }
+    ],
+    "placements": [
+      {
+        "entity_id": "stable-1",
+        "camera_id": "fixture-camera",
+        "room": "fixture-room",
+        "world_point": [1.0, 0.0, 0.0],
+        "menon_point": [1.0, 0.0, 0.0]
+      }
+    ],
+    "bev_trails": [
+      {
+        "entity_id": "stable-1",
+        "camera_id": "fixture-camera",
+        "room": "fixture-room",
+        "floor_y_world": 0.0,
+        "bev_points_xz": [[0.0, 0.0], [0.5, 0.0], [1.0, 0.0]],
+        "menon_points": [[0.0, 0.0, 0.0], [0.5, 0.0, 0.0], [1.0, 0.0, 0.0]]
+      }
+    ],
+    "avatars": [
+      {
+        "entity_id": "stable-1",
+        "camera_id": "fixture-camera",
+        "room": "fixture-room",
+        "menon_point": [1.0, 0.0, 0.0],
+        "radius_scene": 0.18,
+        "expected_height_m": 1.72,
+        "observed_height_scene": 1.70,
+        "scene_units_per_m": 1.0,
+        "heading_deg": 0.0,
+        "movement_vector_xz": [1.0, 0.0]
+      }
+    ],
+    "objects": [
+      {
+        "object_id": "fixture-couch",
+        "category": "couch",
+        "camera_id": "fixture-camera",
+        "room": "fixture-room",
+        "world_point": [0.45, 0.0, 0.15],
+        "menon_point": [0.45, 0.0, 0.15],
+        "bbox_min_scene": [0.25, 0.0, -0.05],
+        "bbox_max_scene": [0.95, 0.8, 0.35],
+        "expected_dimensions_m": [0.70, 0.80, 0.40],
+        "observed_dimensions_scene": [0.70, 0.80, 0.40],
+        "scene_units_per_m": 1.0,
+        "support_y_scene": 0.0,
+        "allowed_rooms": ["fixture-room"]
+      }
+    ],
+    "collision": {
+      "wall_segments_xz": [
+        [[-1.0, -1.0], [2.0, -1.0]],
+        [[2.0, -1.0], [2.0, 1.0]],
+        [[2.0, 1.0], [-1.0, 1.0]],
+        [[-1.0, 1.0], [-1.0, -1.0]]
+      ],
+      "obstacle_boxes_xz": [
+        {"bbox_min_xz": [1.35, -0.45], "bbox_max_xz": [1.70, -0.15]}
+      ]
+    },
+    "noesis_ts_s": [0.0, 1.0, 2.0],
+    "menon_ts_s": [0.02, 1.02, 2.02],
+    "latency_samples": [
+      {
+        "entity_id": "stable-1",
+        "camera_id": "fixture-camera",
+        "room": "fixture-room",
+        "noesis_ts_s": 1.0,
+        "telemetry_ts_s": 1.01,
+        "menon_update_ts_s": 1.03,
+        "menon_render_ts_s": 1.05,
+        "menon_display_ts_s": 1.06
+      }
+    ]
+  }
+}

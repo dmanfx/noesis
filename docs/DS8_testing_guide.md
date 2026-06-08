@@ -9,6 +9,118 @@ the layered validation toolbox, report schema, cross-space acceptance gates, and
 agent instructions for proving the full chain from camera pixels to Menon
 reprojection.
 
+Validation tiers:
+
+- Tier 1: unit, schema, and math checks with no GPU or runtime.
+- Tier 2: offline fixture and regression reports with visual artifacts.
+- Tier 3: DS8 runtime or saved WebSocket telemetry from `noesis/ds8_runtime.py`.
+- Tier 4: DS8 plus Menon cross-space traces or browser evidence.
+
+See `plans/noesis_menon_validation/validation_tiers.md` and
+`plans/noesis_menon_validation/validation_asset_inventory.md` for command
+selection and reusable existing smoke tests.
+
+The first reusable fixture runner is available for GPU-free checks:
+
+```bash
+python3 scripts/noesis_validation_runner.py \
+  --fixture-registry plans/noesis_menon_validation/fixture_registry.json \
+  --fixture-id minimal_validation_fixture
+python3 -m pytest tests/test_validation_toolbox.py -q
+```
+
+The runner writes JSON, Markdown, and visual artifacts under
+`diagnostics/validation/<run_id>/`.
+The fixture report now includes generated-scene coordinate-system checks and
+room geometry-constraint checks when the fixture provides those fields.
+
+For virtual-twin plane reconstruction changes that touch MapAnything normals,
+run the focused unit/bundle checks before live Menon validation:
+
+```bash
+python3 -m pytest \
+  tests/test_mapanything_normals_fusion.py \
+  tests/test_virtual_twin_geometry.py \
+  tests/test_virtual_twin_builder.py \
+  -q
+```
+
+These tests prove that dense MapAnything depth-derived normals are persisted in
+revision evidence, surfaced in `planes.json`, accepted when they agree with the
+fitted stream plane, and rejected when they clearly contradict the plane.
+
+Saved or live WebSocket telemetry can also be validated through the same report
+schema:
+
+```bash
+python3 scripts/noesis_validation_telemetry_report.py \
+  --input plans/noesis_menon_validation/minimal_telemetry.ndjson \
+  --run-id minimal_telemetry
+
+# Against a running DS8 WebSocket server:
+python3 scripts/noesis_validation_telemetry_report.py \
+  --ws ws://127.0.0.1:6008 \
+  --duration 20 \
+  --run-id live_tracking_bev_window
+```
+
+This emits tracking/BEV contract checks, motion checks, BEV/track agreement, a
+copied telemetry NDJSON, and `tracking/track_audit.json` under the run directory.
+The audit includes identity, current room, named world position, projection,
+temporal, and ReID confidence, doorway/occlusion history, impossible-motion
+events, speed summary, and warnings. The telemetry report also validates
+occlusion bridges when `occluded` samples include uncertainty evidence.
+
+Captured Menon placement traces can be validated against the same report schema:
+
+```bash
+python3 scripts/noesis_validation_menon_trace_report.py \
+  --trace plans/noesis_menon_validation/minimal_menon_trace.json \
+  --run-id minimal_menon_trace
+
+# When a live Menon checkout is required for acceptance evidence:
+MENON_ROOT=../Menon python3 scripts/noesis_validation_menon_trace_report.py \
+  --trace plans/noesis_menon_validation/minimal_menon_trace.json \
+  --require-menon-root \
+  --run-id minimal_menon_trace_with_checkout
+```
+
+This emits world-to-Menon transform, placement, floor-contact, trail-agreement,
+BEV-to-Menon trail agreement, avatar scale/collision/orientation, timestamp, and
+transform-audit checks. If Menon is required but no valid checkout is provided,
+the report records blocked Menon evidence instead of treating a Noesis-only run
+as complete.
+
+When Menon is running in a browser, capture its live debug state and validate it
+through the same Menon trace contract:
+
+```bash
+python3 scripts/noesis_validation_capture_menon_trace.py \
+  --url http://127.0.0.1:5173 \
+  --output diagnostics/validation/menon_browser_trace/trace.json \
+  --screenshot \
+  --validate
+```
+
+This writes the raw browser snapshot beside the converted trace, optionally
+captures a screenshot, and runs the Menon trace report. Missing Playwright,
+unreachable Menon, missing browser debug globals, missing declared
+`backend_world_m` evidence, or a missing world-to-scene transform is a failed or
+blocked validation, not a substitute fixture pass.
+
+To run the registered fixtures as a small regression suite:
+
+```bash
+python3 scripts/noesis_validation_regression_runner.py \
+  --fixture-registry plans/noesis_menon_validation/fixture_registry.json \
+  --run-id minimal_regression
+```
+
+This writes `regression_summary.json` plus per-case reports under
+`diagnostics/validation/<run_id>/`. The registry can declare expected status,
+minimum check counts, and maximum failure/warning/blocked counts; expectation
+misses are reported as regression failures.
+
 ## 1. Quick Sanity Checks
 
 ### DS8 runtime smoke test

@@ -98,3 +98,18 @@ testpipelines/sapiens2-human/
 testpipelines/yolo26-seg-depth-3d/
 testpipelines/**/sources.yaml
 testpipelines/**/viewer/dist/
+
+# Track the DEIMv2 Wholebody49 prototype source package.
+!testpipelines/deimv2-wholebody49/README.md
+!testpipelines/deimv2-wholebody49/__init__.py
+!testpipelines/deimv2-wholebody49/tests/
+!testpipelines/deimv2-wholebody49/tests/*.py
+
+# Track Noesis/Menon validation planning docs and focused tests.
+!plans/noesis_menon_validation/*.md
+!tests/
+tests/*
+!tests/test_validation_toolbox.py
+!tests/test_mapanything_normals_fusion.py
+!tests/test_virtual_twin_geometry.py
+!tests/test_virtual_twin_builder.py

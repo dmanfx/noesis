@@ -2,7 +2,7 @@
 # V3DT reimpl dewarper config for high-resolution UniFi G4 Instant exports.
 # Source intrinsics are the calibrated 1280x720 G4 values scaled by 2.1 for
 # 2688x1512 clips. Distortion and output intrinsics remain in the calibrated
-# 1920x1080 dewarped frame used by the V3DT camInfo files.
+# 1920x1080 full-FoV dewarped frame used by the V3DT camInfo files.
 ################################################################################
 
 [property]
@@ -21,7 +21,7 @@ focal-length=1598.8632696725317;1596.4369245224505
 distortion=-0.07298658837120028;0.009594087411341021;-0.024832203740135013;0.010214663281410956
 src-x0=1321.7390712868757
 src-y0=733.5696511079536
-dst-focal-length=1034.7855505063135;1033.2152180408388
-dst-principal-point=929.1114387446711;519.4562647913322
+dst-focal-length=759.8470119659571;758.693910792606
+dst-principal-point=937.3184106054618;524.9146561743939
 # 0=cudaAddressModeClamp, 1=cudaAddressModeBorder (avoid edge smearing)
 cuda-address-mode=1

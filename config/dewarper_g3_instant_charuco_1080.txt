@@ -2,7 +2,8 @@
 # Dewarper config for calibrated UniFi G3 Instant 1920x1080 RTSP streams.
 # Source K/D come from ~/noesis/family_room.json (OpenCV fisheye, 2026-05-08).
 # The dst-* intrinsics are OpenCV fisheye estimateNewCameraMatrixForUndistortRectify
-# with balance=0.0, fov_scale=1.0, and output size 1920x1080.
+# with balance=1.0, fov_scale=1.0, and output size 1920x1080. This preserves
+# the source FoV for inference and leaves invalid dewarped areas as border pixels.
 ################################################################################
 
 [property]
@@ -21,7 +22,7 @@ focal-length=1055.5160398848277;1053.5226356877163
 distortion=-0.041323572296878525;-0.07257812805006623;0.06665786839070417;-0.02667936264765735
 src-x0=931.2433649803215
 src-y0=563.146369643397
-dst-focal-length=945.0233503133533;943.2386180670404
-dst-principal-point=890.6912285938838;571.5862849567151
+dst-focal-length=625.0370802939991;623.8566609615328
+dst-principal-point=914.1592785997523;560.8911232935495
 # 0=cudaAddressModeClamp, 1=cudaAddressModeBorder (avoid edge smearing)
 cuda-address-mode=1

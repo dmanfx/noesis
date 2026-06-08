@@ -24,8 +24,8 @@ streammux:
 
 sources:
   - element: nvurisrcbin
-    #uri: rtsp://192.168.3.214:7447/jdr9oLlBkjyl3gDm?
-    uri: file:///home/mayor/Documents/livingroomclip.mkv
+    uri: rtsp://192.168.3.214:7447/jdr9oLlBkjyl3gDm?
+    #uri: file:///home/mayor/Documents/livingroomclip.mkv
     gpu-id: 0
     cudadec-memtype: 0
     latency: 100
@@ -36,8 +36,8 @@ sources:
       config-file: config/dewarper_g3_instant_charuco_1080.txt
   - element: nvurisrcbin
     #kitchen camera
-    #uri: rtsp://192.168.3.214:7447/qt3VqVdZpgG1B4Vk?
-    uri: file:///home/mayor/Downloads/kitchenclip.mp4
+    uri: rtsp://192.168.3.214:7447/qt3VqVdZpgG1B4Vk?
+    #uri: file:///home/mayor/Downloads/kitchenclip.mp4
     gpu-id: 0
     cudadec-memtype: 0
     latency: 100
@@ -48,8 +48,8 @@ sources:
       config-file: config/dewarper_g3_instant_charuco_1080.txt
   - element: nvurisrcbin
     #family room camera
-    #uri: rtsp://192.168.3.214:7447/4qWTBhW6b4nLeUFE?
-    uri: file:///home/mayor/Downloads/familyroomclip.mp4
+    uri: rtsp://192.168.3.214:7447/4qWTBhW6b4nLeUFE?
+    #uri: file:///home/mayor/Downloads/familyroomclip.mp4
     gpu-id: 0
     cudadec-memtype: 0
     latency: 100

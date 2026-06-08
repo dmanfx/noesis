@@ -4,21 +4,21 @@
       "calibration_fingerprint": {
         "basis": "image_space_intrinsics_v1",
         "camera_id": "family-room",
-        "fingerprint_sha256": "a554af41458d41d4d3c4db22cb8da6c595e6bb6f7f3c68fea178b027da02e53e",
+        "fingerprint_sha256": "ee22aa6b6367aabf31944d53e0a8edc13e8dfe2a06f589b23bc8e522f71d0bc6",
         "image_size": [
           1920,
           1080
         ],
         "intrinsics": [
           [
-            1034.7855505063135,
+            759.8470119659571,
             0.0,
-            929.1114387446711
+            937.3184106054618
           ],
           [
             0.0,
-            1033.2152180408389,
-            519.4562647913322
+            758.693910792606,
+            524.9146561743939
           ],
           [
             0.0,
@@ -28,11 +28,11 @@
         ]
       },
       "camera_id": "family-room",
-      "created_ts_us": 1778467779186369,
+      "created_ts_us": 1780631528409532,
       "dav2_profile": {
         "attach_tensor_meta": true,
         "batch_size": 3,
-        "builder_runtime_device": "cuda",
+        "builder_runtime_device": "cpu",
         "config-file-path": "build/config_infer_depth_tracking_da2_vits_294x518_b3_i1.ini",
         "enable": true,
         "engine": "models/engines/depth_anything_v2_metric_hypersim_vits_294x518_b3_fp16.engine",
@@ -47,32 +47,32 @@
         "name": "depth_tracking_fullframe"
       },
       "fit_metrics": {
-        "mean_abs_error_m": 0.6262975289191126,
-        "median_abs_error_m": 0.5501904681251439,
-        "p90_abs_error_m": 1.1824150800704958,
+        "mean_abs_error_m": 0.7079442695188989,
+        "median_abs_error_m": 0.5850495072051551,
+        "p90_abs_error_m": 1.457994720186761,
         "raw_domain_m": [
-          2.950943946838379,
-          3.8038103580474854
+          2.8722901344299316,
+          3.6712608337402344
         ]
       },
       "generation_tool_version": "depth_registration_builder_v1",
       "knots_raw_m": [
-        2.950943946838379,
-        3.0820348262786865,
-        3.1202585697174072,
-        3.1633291244506836,
-        3.230384588241577,
-        3.295660972595215,
-        3.8038103580474854
+        2.8722901344299316,
+        3.05898380279541,
+        3.1331698894500732,
+        3.227282762527466,
+        3.2628066539764404,
+        3.3942768573760986,
+        3.6712608337402344
       ],
       "knots_registered_m": [
-        3.474380850791931,
-        4.046893358230591,
-        4.046893358230591,
-        4.269594669342041,
-        4.269594669342041,
-        4.290699005126953,
-        4.748340606689453
+        2.379976511001587,
+        2.379976511001587,
+        3.0403672456741333,
+        3.0403672456741333,
+        3.2753841876983643,
+        3.2753841876983643,
+        3.381261944770813
       ],
       "mapanything_profile": {
         "attach_tensor_meta": true,
@@ -87,8 +87,8 @@
       },
       "provenance": {
         "frames_per_camera": 6,
-        "mapanything_depth_base": "data/depth",
-        "mapanything_source": "snapshots",
+        "mapanything_depth_base": null,
+        "mapanything_source": "service",
         "max_depth_delta_m": 0.75,
         "max_luma_mad": 12.0,
         "row_start_frac": 0.35,
@@ -96,15 +96,15 @@
         "source_uri": "rtsp://192.168.3.214:7447/4qWTBhW6b4nLeUFE?"
       },
       "raw_range_domain_m": [
-        2.950943946838379,
-        3.8038103580474854
+        2.8722901344299316,
+        3.6712608337402344
       ],
-      "registration_id": "family-room:310d0a6879fa",
+      "registration_id": "family-room:a6719aba0d4d",
       "sample_counts": {
-        "input_pairs": 224640,
+        "input_pairs": 158625,
         "num_knots": 7,
-        "retained_after_bin_filter": 207936,
-        "retained_pairs": 213760
+        "retained_after_bin_filter": 150378,
+        "retained_pairs": 151070
       },
       "scope": "people_tracking_depth_registration",
       "source_space": "dav2_anchor_range_m_raw",
@@ -115,21 +115,21 @@
       "calibration_fingerprint": {
         "basis": "image_space_intrinsics_v1",
         "camera_id": "kitchen",
-        "fingerprint_sha256": "4e7fbd7e71fc504536204a3b8e56a0f2105a156593ddcce6d6eb59c69b1b99f3",
+        "fingerprint_sha256": "16654dd3b282a3a574bdf9a7299f5671804c4dab97276934627252a86182850e",
         "image_size": [
           1920,
           1080
         ],
         "intrinsics": [
           [
-            945.0233503133533,
+            625.0370802939991,
             0.0,
-            890.6912285938838
+            914.1592785997523
           ],
           [
             0.0,
-            943.2386180670404,
-            571.5862849567151
+            623.8566609615328,
+            560.8911232935495
           ],
           [
             0.0,
@@ -139,7 +139,7 @@
         ]
       },
       "camera_id": "kitchen",
-      "created_ts_us": 1778267330986429,
+      "created_ts_us": 1780631519098541,
       "dav2_profile": {
         "attach_tensor_meta": true,
         "batch_size": 3,
@@ -158,32 +158,32 @@
         "name": "depth_tracking_fullframe"
       },
       "fit_metrics": {
-        "mean_abs_error_m": 1.046430555895304,
-        "median_abs_error_m": 1.0520093441009521,
-        "p90_abs_error_m": 1.8184666156768798,
+        "mean_abs_error_m": 0.3488226214911995,
+        "median_abs_error_m": 0.3036491870880127,
+        "p90_abs_error_m": 0.7018445014953615,
         "raw_domain_m": [
-          1.886857509613037,
-          2.47664475440979
+          2.3451809883117676,
+          3.230600118637085
         ]
       },
       "generation_tool_version": "depth_registration_builder_v1",
       "knots_raw_m": [
-        1.886857509613037,
-        2.1043875217437744,
-        2.1884543895721436,
-        2.25292706489563,
-        2.33978271484375,
-        2.3663814067840576,
-        2.47664475440979
+        2.3451809883117676,
+        2.8715248107910156,
+        2.964273691177368,
+        3.0169410705566406,
+        3.062516450881958,
+        3.105510950088501,
+        3.230600118637085
       ],
       "knots_registered_m": [
-        3.488257884979248,
-        3.488257884979248,
-        3.488257884979248,
-        3.488257884979248,
-        3.488257884979248,
-        3.488257884979248,
-        3.488257884979248
+        1.4775766134262085,
+        1.8647340536117554,
+        2.1503924131393433,
+        2.1503924131393433,
+        2.1503924131393433,
+        2.1503924131393433,
+        2.1503924131393433
       ],
       "mapanything_profile": {
         "attach_tensor_meta": true,
@@ -198,6 +198,8 @@
       },
       "provenance": {
         "frames_per_camera": 6,
+        "mapanything_depth_base": null,
+        "mapanything_source": "service",
         "max_depth_delta_m": 0.75,
         "max_luma_mad": 12.0,
         "row_start_frac": 0.35,
@@ -205,15 +207,15 @@
         "source_uri": "rtsp://192.168.3.214:7447/qt3VqVdZpgG1B4Vk?"
       },
       "raw_range_domain_m": [
-        1.886857509613037,
-        2.47664475440979
+        2.3451809883117676,
+        3.230600118637085
       ],
-      "registration_id": "kitchen:d150cbaecf0b",
+      "registration_id": "kitchen:b2129c94d6a8",
       "sample_counts": {
-        "input_pairs": 156338,
+        "input_pairs": 212192,
         "num_knots": 7,
-        "retained_after_bin_filter": 144668,
-        "retained_pairs": 148657
+        "retained_after_bin_filter": 196173,
+        "retained_pairs": 201744
       },
       "scope": "people_tracking_depth_registration",
       "source_space": "dav2_anchor_range_m_raw",
@@ -224,21 +226,21 @@
       "calibration_fingerprint": {
         "basis": "image_space_intrinsics_v1",
         "camera_id": "living-room",
-        "fingerprint_sha256": "2163b3a18c6842a045f70b3a7fd9d6c5368c0b604d38a8a319d743e359cc67aa",
+        "fingerprint_sha256": "2e6253444412b292a6c41061be530e4db218d2128b6093c1ccbf9bf2886d102c",
         "image_size": [
           1920,
           1080
         ],
         "intrinsics": [
           [
-            945.0233503133533,
+            625.0370802939991,
             0.0,
-            890.6912285938838
+            914.1592785997523
           ],
           [
             0.0,
-            943.2386180670404,
-            571.5862849567151
+            623.8566609615328,
+            560.8911232935495
           ],
           [
             0.0,
@@ -248,7 +250,7 @@
         ]
       },
       "camera_id": "living-room",
-      "created_ts_us": 1778267320578194,
+      "created_ts_us": 1780631509939066,
       "dav2_profile": {
         "attach_tensor_meta": true,
         "batch_size": 3,
@@ -267,32 +269,32 @@
         "name": "depth_tracking_fullframe"
       },
       "fit_metrics": {
-        "mean_abs_error_m": 1.0840332916259978,
-        "median_abs_error_m": 0.9321920871734619,
-        "p90_abs_error_m": 2.195904970169068,
+        "mean_abs_error_m": 0.6993840877089497,
+        "median_abs_error_m": 0.6289093494415283,
+        "p90_abs_error_m": 1.3186386582710719,
         "raw_domain_m": [
-          1.881294846534729,
-          2.2280516624450684
+          3.091216802597046,
+          4.169389247894287
         ]
       },
       "generation_tool_version": "depth_registration_builder_v1",
       "knots_raw_m": [
-        1.881294846534729,
-        1.9790337085723877,
-        2.0084681510925293,
-        2.035151243209839,
-        2.078916311264038,
-        2.145186185836792,
-        2.2280516624450684
+        3.091216802597046,
+        3.2849550247192383,
+        3.5391385555267334,
+        3.7323966026306152,
+        3.843057155609131,
+        3.920571804046631,
+        4.169389247894287
       ],
       "knots_registered_m": [
-        4.012428045272827,
-        4.012428045272827,
-        4.012428045272827,
-        4.012428045272827,
-        4.012428045272827,
-        4.012428045272827,
-        4.012428045272827
+        1.7302324771881104,
+        1.7302324771881104,
+        2.038329839706421,
+        2.3201122283935547,
+        2.7280466556549072,
+        2.926710605621338,
+        3.047590494155884
       ],
       "mapanything_profile": {
         "attach_tensor_meta": true,
@@ -307,6 +309,8 @@
       },
       "provenance": {
         "frames_per_camera": 6,
+        "mapanything_depth_base": null,
+        "mapanything_source": "service",
         "max_depth_delta_m": 0.75,
         "max_luma_mad": 12.0,
         "row_start_frac": 0.35,
@@ -314,15 +318,15 @@
         "source_uri": "rtsp://192.168.3.214:7447/jdr9oLlBkjyl3gDm?"
       },
       "raw_range_domain_m": [
-        1.881294846534729,
-        2.2280516624450684
+        3.091216802597046,
+        4.169389247894287
       ],
-      "registration_id": "living-room:98b68d7e613c",
+      "registration_id": "living-room:d2fd5327ea0d",
       "sample_counts": {
-        "input_pairs": 137098,
+        "input_pairs": 143078,
         "num_knots": 7,
-        "retained_after_bin_filter": 128913,
-        "retained_pairs": 130457
+        "retained_after_bin_filter": 135618,
+        "retained_pairs": 136013
       },
       "scope": "people_tracking_depth_registration",
       "source_space": "dav2_anchor_range_m_raw",

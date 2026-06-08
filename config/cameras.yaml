@@ -41,10 +41,10 @@ intrinsics_models:
   unifi_g3_instant_charuco_1080_rectified:
     resolution: [1920, 1080]
     intrinsics:
-      fx: 945.0233503133533
-      fy: 943.2386180670404
-      cx: 890.6912285938838
-      cy: 571.5862849567151
+      fx: 625.0370802939991
+      fy: 623.8566609615328
+      cx: 914.1592785997523
+      cy: 560.8911232935495
       k1: 0.0
       k2: 0.0
       k3: 0.0
@@ -52,7 +52,7 @@ intrinsics_models:
       source_model: unifi_g3_instant_charuco_1080_raw_fisheye
       dewarper_config: config/dewarper_g3_instant_charuco_1080.txt
       method: opencv_fisheye_estimate_new_camera_matrix
-      balance: 0.0
+      balance: 1.0
       fov_scale: 1.0
       generated_at: "2026-05-08T14:59:01.372964+00:00"
   unifi_g4_instant:
@@ -95,10 +95,10 @@ intrinsics_models:
   unifi_g4_instant_charuco_1080_rectified:
     resolution: [1920, 1080]
     intrinsics:
-      fx: 1034.7855505063135
-      fy: 1033.2152180408388
-      cx: 929.1114387446711
-      cy: 519.4562647913322
+      fx: 759.8470119659571
+      fy: 758.693910792606
+      cx: 937.3184106054618
+      cy: 524.9146561743939
       k1: 0.0
       k2: 0.0
       k3: 0.0
@@ -106,7 +106,7 @@ intrinsics_models:
       source_model: unifi_g4_instant_charuco_720_raw_fisheye
       dewarper_config: config/dewarper_g4_instant_charuco_720_to_1080.txt
       method: opencv_fisheye_estimate_new_camera_matrix
-      balance: 0.0
+      balance: 1.0
       fov_scale: 1.0
       output_resolution: [1920, 1080]
       generated_at: "2026-05-11T02:13:28.245453+00:00"

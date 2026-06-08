@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from typing import Any
 
@@ -18,6 +19,8 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+REPO_ROOT = Path(__file__).resolve().parents[2]
+
 
 def _store() -> VirtualTwinStore:
     return VirtualTwinStore()
@@ -27,6 +30,18 @@ def _http_error(exc: VirtualTwinStoreError) -> HTTPException:
     text = str(exc)
     status = 404 if "missing" in text or "no virtual-twin revision" in text else 400
     return HTTPException(status_code=status, detail=text)
+
+
+def _read_json(path: Path) -> dict[str, Any]:
+    try:
+        data = json.loads(path.read_text())
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=f"missing calibration file: {path.relative_to(REPO_ROOT)}") from exc
+    except json.JSONDecodeError as exc:
+        raise HTTPException(status_code=500, detail=f"invalid calibration json: {path.relative_to(REPO_ROOT)}") from exc
+    if not isinstance(data, dict):
+        raise HTTPException(status_code=500, detail=f"calibration json root must be an object: {path.relative_to(REPO_ROOT)}")
+    return data
 
 
 @app.get("/api/v1/virtual-twin/revisions")
@@ -70,6 +85,23 @@ def get_virtual_twin_tracking_alignment(revision_id: str) -> dict[str, Any]:
         return {"revision_id": revision_id, "tracking_alignment": _store().read_tracking_alignment(revision_id)}
     except VirtualTwinStoreError as exc:
         raise _http_error(exc) from exc
+
+
+@app.get("/api/v1/virtual-twin/calibration/scene-extrinsics")
+def get_scene_extrinsics() -> dict[str, Any]:
+    """Return Menon-scene camera poses used as calibration, not room geometry."""
+    rel_path = Path("config") / "camera_calibration_menon_obj.json"
+    payload = _read_json(REPO_ROOT / rel_path)
+    cameras = payload.get("cameras")
+    if not isinstance(cameras, dict) or not cameras:
+        raise HTTPException(status_code=404, detail=f"no cameras in calibration file: {rel_path}")
+    return {
+        "source": "camera_calibration_menon_obj",
+        "path": str(rel_path),
+        "frame": "menon_scene",
+        "cameras": cameras,
+        "preview_meta": payload.get("preview_meta") if isinstance(payload.get("preview_meta"), dict) else None,
+    }
 
 
 @app.get("/api/v1/virtual-twin/revisions/{revision_id}/artifacts/{artifact_path:path}")

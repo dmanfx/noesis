@@ -338,6 +338,17 @@ revision bundle so the reconstruction evidence survives depth-retention pruning.
   - Returns reconstruction metrics for one revision.
 - **GET** `/api/v1/virtual-twin/revisions/{id}/tracking-alignment`
   - Returns tracking-alignment readback for one revision.
+- **GET** `/api/v1/virtual-twin/calibration/scene-extrinsics`
+  - Returns the Menon-scene camera calibration poses from
+    `config/camera_calibration_menon_obj.json`.
+  - Response fields:
+    - `source`: calibration source identifier.
+    - `path`: repo-relative calibration path.
+    - `frame`: calibration frame; currently `menon_scene`.
+    - `cameras`: mapping of camera IDs to calibration payloads.
+    - `preview_meta`: optional preview metadata from the calibration file.
+  - Missing or malformed calibration data returns a JSON error rather than an
+    empty calibration fallback.
 - **GET** `/api/v1/virtual-twin/revisions/{id}/artifacts/{path}`
   - Serves revision-relative GLB, JSON, PLY, or NPZ artifacts.
 

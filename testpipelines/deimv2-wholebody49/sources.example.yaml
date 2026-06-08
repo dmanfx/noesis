@@ -1,0 +1,14 @@
+width: 1920
+height: 1080
+uris:
+  - rtsp://192.168.3.214:7447/jdr9oLlBkjyl3gDm?
+  - rtsp://192.168.3.214:7447/qt3VqVdZpgG1B4Vk?
+  - rtsp://192.168.3.214:7447/4qWTBhW6b4nLeUFE?
+sensor_ids:
+  - "0"
+  - "1"
+  - "2"
+sensor_names:
+  - Living Room Camera
+  - Kitchen Camera
+  - Family Room Camera

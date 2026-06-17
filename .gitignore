@@ -89,8 +89,56 @@ bev-live-*.png
 oai2-fe-bev-*.png
 Untitled
 
-# Scratch or external worktrees
-DS9/
+# DS9 source tree: keep source-controlled app files visible, but leave generated
+# models, runtime logs, build products, and native/parser/plugin binaries local.
+DS9/*
+!DS9/AGENTS.md
+!DS9/README.md
+!DS9/DS9_PREP_DECISIONS.md
+!DS9/DS9_REBUILD_AND_SMOKE_GATES.md
+!DS9/PIPELINE_GRAPH.md
+!DS9/asset_manifest.yaml
+!DS9/requirements-runtime.txt
+!DS9/archive/
+DS9/archive/*
+!DS9/archive/README.md
+!DS9/archive/nvdsinfer_yolo26_pose/
+DS9/archive/nvdsinfer_yolo26_pose/*
+!DS9/archive/nvdsinfer_yolo26_pose/Makefile
+!DS9/archive/nvdsinfer_yolo26_pose/nvdsinfer_yolo26_pose.cpp
+!DS9/config/
+!DS9/config/**
+!DS9/csrc/
+!DS9/csrc/**
+!DS9/docs/
+!DS9/docs/**
+!DS9/native/
+!DS9/native/**
+!DS9/noesis/
+!DS9/noesis/**
+!DS9/pipelines/
+!DS9/pipelines/**
+DS9/pipelines/**/*.so
+!DS9/reports/
+!DS9/reports/**
+!DS9/scripts/
+!DS9/scripts/**
+!DS9/services/
+!DS9/services/**
+DS9/**/__pycache__/
+DS9/**/*.pyc
+!DS9/build/
+DS9/build/*
+!DS9/build/config_infer_depth_tracking_da2_vits_294x518_b3_i1.ini
+!DS9/models/
+DS9/models/*
+!DS9/models/coco_labels.txt
+DS9/artifacts/
+DS9/data/
+DS9/gst-plugins/
+DS9/logs/
+DS9/native_extensions/
+DS9/plugins/
 src/mapanything/
 
 # Local prototype work and generated viewer outputs

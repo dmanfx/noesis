@@ -1,0 +1,268 @@
+version: 1
+analytics:
+  enable: true
+  stages:
+    exclude:
+      plugin: nvdsanalytics
+      unique_id: 101
+      osd_mode: 0
+      display_font_size: 4
+      config_width: 1920
+      config_height: 1080
+      defaults:
+        class_ids:
+        - -1
+        inverse_roi: false
+      streams:
+        '0':
+          label: living_room
+          roi_filtering:
+            enable: true
+            rois:
+            - id: RF3
+              description: Mirror
+              points_px:
+              - - 48.0
+                - 246.0
+              - - 92.0
+                - 554.0
+              - - 213.0
+                - 470.0
+              - - 169.0
+                - 224.0
+            - id: RF4
+              description: TV
+              points_px:
+              - - 1099.3358778625955
+                - 203.3358778625954
+              - - 1092.3358778625955
+                - 420.3358778625954
+              - - 1366.3358778625955
+                - 431.3358778625954
+              - - 1381.3358778625955
+                - 247.3358778625954
+        '1':
+          label: kitchen
+          roi_filtering:
+            enable: true
+            rois:
+            - id: RF2
+              description: Kitchen wall photos
+              points_px:
+              - - 1270.795451324018
+                - 56.75600927474281
+              - - 1205.488795455562
+                - 340.00675944334
+              - - 1617.795451324018
+                - 372.7560092747428
+              - - 1639.488795455562
+                - 115.00675944334
+        '2':
+          label: family_room
+          roi_filtering:
+            enable: true
+            rois:
+            - id: RF1
+              description: Family room wall art exclusion zone.
+              points_px:
+              - - 847.7022900763358
+                - 196.6106870229008
+              - - 1025.7022900763359
+                - 208.6106870229008
+              - - 1027.7022900763359
+                - 347.61068702290083
+              - - 849.7022900763358
+                - 349.61068702290083
+            - id: RF2
+              description: TV
+              points_px:
+              - - 26.0
+                - 498.0
+              - - 73.0
+                - 44.0
+              - - 205.0
+                - 51.0
+              - - 132.0
+                - 491.0
+            - id: RF3
+              description: window
+              points_px:
+              - - 1576.0
+                - 265.0
+              - - 1568.0
+                - 389.6717557251909
+              - - 1656.0
+                - 392.6717557251909
+              - - 1675.0
+                - 272.0
+    post:
+      plugin: nvdsanalytics
+      unique_id: 201
+      osd_mode: 0
+      display_font_size: 12
+      config_width: 1920
+      config_height: 1080
+      streams:
+        '0':
+          label: living_room
+          direction_detection:
+            enable: true
+            class_ids:
+            - -1
+            vectors:
+            - id: North
+              start_px:
+              - 960
+              - 300
+              end_px:
+              - 960
+              - 150
+            - id: South
+              start_px:
+              - 960
+              - 780
+              end_px:
+              - 960
+              - 930
+            - id: East
+              start_px:
+              - 750
+              - 540
+              end_px:
+              - 900
+              - 540
+            - id: West
+              start_px:
+              - 1170
+              - 540
+              end_px:
+              - 1020
+              - 540
+          overcrowding:
+            enable: true
+            class_ids:
+            - 0
+            object_threshold: 1
+            roi:
+              id: LivingRoom
+              points_px:
+              - - 0
+                - 0
+              - - 1920
+                - 0
+              - - 1920
+                - 1080
+              - - 0
+                - 1080
+        '1':
+          label: kitchen
+          direction_detection:
+            enable: true
+            class_ids:
+            - -1
+            vectors:
+            - id: North
+              start_px:
+              - 960
+              - 300
+              end_px:
+              - 960
+              - 150
+            - id: South
+              start_px:
+              - 960
+              - 780
+              end_px:
+              - 960
+              - 930
+            - id: East
+              start_px:
+              - 750
+              - 540
+              end_px:
+              - 900
+              - 540
+            - id: West
+              start_px:
+              - 1170
+              - 540
+              end_px:
+              - 1020
+              - 540
+          overcrowding:
+            enable: true
+            class_ids:
+            - 0
+            object_threshold: 1
+            roi:
+              id: Kitchen
+              points_px:
+              - - 0
+                - 0
+              - - 1920
+                - 0
+              - - 1920
+                - 1080
+              - - 0
+                - 1080
+        '2':
+          label: family_room
+          direction_detection:
+            enable: true
+            class_ids:
+            - -1
+            vectors:
+            - id: North
+              start_px:
+              - 960
+              - 300
+              end_px:
+              - 960
+              - 150
+            - id: South
+              start_px:
+              - 960
+              - 780
+              end_px:
+              - 960
+              - 930
+            - id: East
+              start_px:
+              - 750
+              - 540
+              end_px:
+              - 900
+              - 540
+            - id: West
+              start_px:
+              - 1170
+              - 540
+              end_px:
+              - 1020
+              - 540
+          overcrowding:
+            enable: true
+            class_ids:
+            - 0
+            object_threshold: 1
+            roi:
+              id: FamilyRoom
+              points_px:
+              - - 0
+                - 0
+              - - 1920
+                - 0
+              - - 1920
+                - 1080
+              - - 0
+                - 1080
+depth_floor_filter:
+  enable: false
+  operator: batch_metadata
+  attach_point: post_mapanything
+  params:
+    object_meta_key: ma_depth_stats
+    min_depth_m: 0.05
+    compare_field: min_depth_m
+    missing_policy: passthrough
+    action: drop_object

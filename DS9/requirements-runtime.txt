@@ -1,0 +1,19 @@
+# Minimal Python dependencies missing from the NVIDIA DeepStream 9 container
+# for the Noesis DS9 runtime and smoke-test control plane.
+PyYAML
+websockets
+requests
+flask
+flask-cors
+fastapi>=0.110
+uvicorn[standard]>=0.30
+numpy==1.26.4
+opencv-python-headless==4.10.0.84
+scipy
+pillow
+psutil
+paho-mqtt
+influxdb-client
+zarr
+numcodecs
+torch

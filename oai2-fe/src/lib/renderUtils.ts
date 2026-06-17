@@ -152,6 +152,8 @@ type RenderLayerOptions = {
   // to a meaningful physical range (e.g., 0..1.2m for floor vs countertop).
   valueMin?: number;
   valueMax?: number;
+  valueMinPercentile?: number;
+  valueMaxPercentile?: number;
   // Apply gamma to the normalized value after clamping to [0,1]. gamma < 1 boosts low values.
   gamma?: number;
   // Optional mask layer: if provided, pixels where mask <= threshold render as black.
@@ -159,11 +161,24 @@ type RenderLayerOptions = {
   maskLayer?: FloorplanLayer;
   maskThreshold?: number;
   maskInvert?: boolean;
+  imageSmoothing?: boolean;
 };
 
 type RenderLayerResult = {
   contentRectPx: { x: number; y: number; w: number; h: number };
 };
+
+function percentileSorted(sorted: number[], pct: number): number {
+  if (!sorted.length) return 0;
+  const p = Math.min(100, Math.max(0, pct));
+  if (sorted.length === 1) return sorted[0];
+  const idx = (p / 100) * (sorted.length - 1);
+  const lo = Math.floor(idx);
+  const hi = Math.ceil(idx);
+  if (lo === hi) return sorted[lo];
+  const frac = idx - lo;
+  return sorted[lo] + (sorted[hi] - sorted[lo]) * frac;
+}
 
 export function renderCompositeWalkableObstacleToCanvas(
   canvas: HTMLCanvasElement | null,
@@ -248,6 +263,7 @@ export function renderCompositeWalkableObstacleToCanvas(
   const paddingCss = (typeof options === 'object' && options?.contentPaddingPx)
     ? Math.max(0, Number(options.contentPaddingPx) || 0)
     : 0;
+  const imageSmoothing = (typeof options === 'object') ? !!options.imageSmoothing : false;
   const dpr = window.devicePixelRatio || 1;
 
   let { width, height } = applyCanvasSize(canvas);
@@ -294,7 +310,10 @@ export function renderCompositeWalkableObstacleToCanvas(
     ctx.fillStyle = background;
     ctx.fillRect(0, 0, width, height);
   }
-  ctx.imageSmoothingEnabled = false;
+  ctx.imageSmoothingEnabled = imageSmoothing;
+  if (imageSmoothing) {
+    ctx.imageSmoothingQuality = 'high';
+  }
   ctx.drawImage(offscreen, contentX, contentY, contentW, contentH);
   ctx.restore();
 
@@ -347,9 +366,6 @@ export function renderLayerToCanvas(
   const imageData = offCtx.createImageData(cols, rows);
   const data = imageData.data;
   const optObj = (typeof options === 'object') ? options : undefined;
-  const min = (optObj && typeof optObj.valueMin === 'number') ? optObj.valueMin : (layer.value_min ?? 0);
-  const max = (optObj && typeof optObj.valueMax === 'number') ? optObj.valueMax : (layer.value_max ?? 1);
-  const denom = max - min === 0 ? 1 : max - min;
   const gamma = (optObj && typeof optObj.gamma === 'number' && Number.isFinite(optObj.gamma) && optObj.gamma > 0)
     ? optObj.gamma
     : 1.0;
@@ -371,6 +387,42 @@ export function renderLayerToCanvas(
       }
     }
   }
+
+  let min = (optObj && typeof optObj.valueMin === 'number') ? optObj.valueMin : (layer.value_min ?? 0);
+  let max = (optObj && typeof optObj.valueMax === 'number') ? optObj.valueMax : (layer.value_max ?? 1);
+  const minPct = optObj?.valueMinPercentile;
+  const maxPct = optObj?.valueMaxPercentile;
+  if (
+    (typeof minPct === 'number' || typeof maxPct === 'number') &&
+    Number.isFinite(Number(minPct ?? maxPct))
+  ) {
+    const samples: number[] = [];
+    const n = rows * cols;
+    for (let idx = 0; idx < n; idx += 1) {
+      const v = values[idx];
+      if (!Number.isFinite(v)) continue;
+      if (maskValues) {
+        const mv = maskValues[idx];
+        const ok = Number.isFinite(mv) && (mv > maskThreshold);
+        const pass = maskInvert ? !ok : ok;
+        if (!pass) continue;
+      }
+      samples.push(v);
+    }
+    if (samples.length >= 16) {
+      samples.sort((a, b) => a - b);
+      if (typeof minPct === 'number' && Number.isFinite(minPct) && !(optObj && typeof optObj.valueMin === 'number')) {
+        min = percentileSorted(samples, minPct);
+      }
+      if (typeof maxPct === 'number' && Number.isFinite(maxPct) && !(optObj && typeof optObj.valueMax === 'number')) {
+        max = percentileSorted(samples, maxPct);
+      }
+    }
+  }
+  if (!Number.isFinite(min)) min = 0;
+  if (!Number.isFinite(max)) max = min + 1;
+  if (max <= min) max = min + 1;
+  const denom = max - min;
 
   const n = rows * cols;
   for (let idx = 0; idx < n; idx += 1) {
@@ -416,6 +468,7 @@ export function renderLayerToCanvas(
   const paddingCss = (typeof options === 'object' && options?.contentPaddingPx)
     ? Math.max(0, Number(options.contentPaddingPx) || 0)
     : 0;
+  const imageSmoothing = (typeof options === 'object') ? !!options.imageSmoothing : false;
   const dpr = window.devicePixelRatio || 1;
 
   let { width, height } = applyCanvasSize(canvas);
@@ -462,7 +515,10 @@ export function renderLayerToCanvas(
     ctx.fillStyle = background;
     ctx.fillRect(0, 0, width, height);
   }
-  ctx.imageSmoothingEnabled = false;
+  ctx.imageSmoothingEnabled = imageSmoothing;
+  if (imageSmoothing) {
+    ctx.imageSmoothingQuality = 'high';
+  }
   ctx.drawImage(offscreen, contentX, contentY, contentW, contentH);
   ctx.restore();
 

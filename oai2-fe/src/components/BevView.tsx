@@ -109,8 +109,25 @@ type TrailClock = {
   lastSampleMs?: number;
 };
 
+type HeightRenderTuning = {
+  lowPct: number;
+  highPct: number;
+  gamma: number;
+  densityCutoff: number;
+  smoothing: boolean;
+};
+
 // Keep source-clock smoothing from lagging visible motion by multiple seconds.
 const MAX_TRAIL_CLOCK_SKEW_MS = 200;
+const DEFAULT_HEIGHT_RENDER_TUNING: HeightRenderTuning = {
+  lowPct: 5,
+  highPct: 95,
+  gamma: 1.0,
+  densityCutoff: 0.0,
+  smoothing: true,
+};
+
+const clampNumber = (value: number, min: number, max: number): number => Math.min(max, Math.max(min, value));
 
 const floorplanHasRenderableGrid = (floorplan?: FloorplanResponse | null): boolean => Boolean(
   floorplan?.walkable?.grid_b64 ||
@@ -382,6 +399,8 @@ export const BevView: React.FC<BevViewProps> = ({
   const label = cameraLabel(cam);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const [overlayEnabled, setOverlayEnabled] = useState(false);
+  const [lookPanelOpen, setLookPanelOpen] = useState(false);
+  const [heightRenderTuning, setHeightRenderTuning] = useState<HeightRenderTuning>(DEFAULT_HEIGHT_RENDER_TUNING);
 
   const smoothState = useRef<Map<string, { x: number; y: number; lastSeen: number; stableId?: string; colorId: number }>>(new Map());
   const trailsRef = useRef<Map<string, TrailTrack>>(new Map());
@@ -733,6 +752,7 @@ export const BevView: React.FC<BevViewProps> = ({
       const visual = selectFloorplanVisualSelection(floorplanNow, isFloorplanCompatible, variant === 'inline');
       const walkableLayer = visual.walkableLayer;
       const obstacleHeightLayer = visual.obstacleHeightLayer;
+      const densityLayer = visual.densityLayer;
       const baseLayer = visual.baseLayer;
       const baseKind = visual.baseKind;
       const hasComposite = visual.hasComposite;
@@ -765,8 +785,14 @@ export const BevView: React.FC<BevViewProps> = ({
         }
       }
 
+      const isHeightVisual = baseKind === 'height';
+      const smoothBaseImage = hasComposite || baseKind === 'walkable' || baseKind === 'obstacle_height' || isHeightVisual;
+      const heightLowPct = clampNumber(heightRenderTuning.lowPct, 0, Math.min(99, heightRenderTuning.highPct - 1));
+      const heightHighPct = clampNumber(heightRenderTuning.highPct, Math.max(1, heightLowPct + 1), 100);
+      const heightGamma = clampNumber(heightRenderTuning.gamma, 0.25, 3.0);
+      const densityCutoff = clampNumber(heightRenderTuning.densityCutoff, 0.0, 0.5);
       const key = hasFloorplan
-        ? `${baseKind}:${floorplanNow?.snapshot_ts ?? floorplanNow?.ts ?? ''}:${baseLayer?.grid_shape?.join('x')}:${baseLayer?.value_min ?? ''}:${baseLayer?.value_max ?? ''}:${baseLayer?.grid_b64?.length ?? ''}:${hasComposite ? (obstacleHeightLayer?.grid_b64?.length ?? '') : ''}:${aspect}:${fitMode}:${boundsAspect.toFixed(6)}:${padCss.toFixed(3)}`
+        ? `${baseKind}:${floorplanNow?.snapshot_ts ?? floorplanNow?.ts ?? ''}:${baseLayer?.grid_shape?.join('x')}:${baseLayer?.value_min ?? ''}:${baseLayer?.value_max ?? ''}:${baseLayer?.grid_b64?.length ?? ''}:${hasComposite ? (obstacleHeightLayer?.grid_b64?.length ?? '') : ''}:${isHeightVisual ? (densityLayer?.grid_b64?.length ?? '') : ''}:${aspect}:${fitMode}:${boundsAspect.toFixed(6)}:${padCss.toFixed(3)}:${smoothBaseImage ? 'smooth' : 'sharp'}:${isHeightVisual ? `${heightLowPct}:${heightHighPct}:${heightGamma.toFixed(3)}:${densityCutoff.toFixed(4)}:${heightRenderTuning.smoothing ? 1 : 0}` : 'layer'}`
         : `none:${aspect}:${fitMode}:${boundsAspect.toFixed(6)}:${padCss.toFixed(3)}`;
 
       const bg = bgCanvasRef.current ?? (bgCanvasRef.current = document.createElement('canvas'));
@@ -779,12 +805,21 @@ export const BevView: React.FC<BevViewProps> = ({
             ? renderCompositeWalkableObstacleToCanvas(cvs, walkableLayer, obstacleHeightLayer, {
               fit: fitMode,
               forceAspect: boundsAspect,
-              contentPaddingPx: padCss
+              contentPaddingPx: padCss,
+              imageSmoothing: true
             })
             : renderLayerToCanvas(cvs, baseLayer, basePalette, {
               fit: fitMode,
               forceAspect: boundsAspect,
-              contentPaddingPx: padCss
+              contentPaddingPx: padCss,
+              imageSmoothing: isHeightVisual ? heightRenderTuning.smoothing : smoothBaseImage,
+              ...(isHeightVisual ? {
+                valueMinPercentile: heightLowPct,
+                valueMaxPercentile: heightHighPct,
+                gamma: heightGamma,
+                maskLayer: densityLayer,
+                maskThreshold: densityCutoff,
+              } : {})
             });
           bgContentRectRef.current = rendered?.contentRectPx ?? { x: 0, y: 0, w: cvs.width, h: cvs.height };
         } else {
@@ -1085,7 +1120,7 @@ export const BevView: React.FC<BevViewProps> = ({
     return () => {
       if (animationFrameRef.current) cancelAnimationFrame(animationFrameRef.current);
     };
-  }, [coordMode, debug, displayBounds, floorplan, overlayEnabled, resolveDisplayPoint, resolvedTrailConfig, variant]);
+  }, [coordMode, debug, displayBounds, floorplan, heightRenderTuning, overlayEnabled, resolveDisplayPoint, resolvedTrailConfig, variant]);
 
   const floorplanFrame = displayFloorplan?.frame;
   const hasFloorplanFrame = typeof floorplanFrame === 'string' && floorplanFrame.trim().length > 0;
@@ -1104,9 +1139,31 @@ export const BevView: React.FC<BevViewProps> = ({
   const floorplanHasImage = visualSelection.hasFloorplan;
 
   const isFrameMismatch = coordMode === 'world' && isFloorplanCameraLocal;
-  const baseLabel = hasWalkableLayer ? 'Walkable Map' : (hasObstacleHeightLayer ? 'Obstacle Height' : 'Height Map');
+  const baseLabel = visualSelection.baseKind === 'composite'
+    ? 'Footprint Map'
+    : (hasWalkableLayer ? 'Walkable Map' : (hasObstacleHeightLayer ? 'Obstacle Height' : 'Height Map'));
   const subtitleText = floorplanHasImage ? (isFrameMismatch ? `${baseLabel} (local-floorplan fallback)` : baseLabel) : 'No Map Data';
   const subtitle = ` • ${subtitleText}`;
+  const hasHeightLookControls = variant === 'inline' && visualSelection.baseKind === 'height';
+  const updateHeightTuning = (patch: Partial<HeightRenderTuning>) => {
+    setHeightRenderTuning((prev) => {
+      const next = { ...prev, ...patch };
+      next.lowPct = clampNumber(Number(next.lowPct), 0, 99);
+      next.highPct = clampNumber(Number(next.highPct), 1, 100);
+      if (next.lowPct >= next.highPct) {
+        if (Object.prototype.hasOwnProperty.call(patch, 'lowPct')) {
+          next.lowPct = Math.max(0, next.highPct - 1);
+        } else {
+          next.highPct = Math.min(100, next.lowPct + 1);
+        }
+      }
+      next.gamma = clampNumber(Number(next.gamma), 0.25, 3.0);
+      next.densityCutoff = clampNumber(Number(next.densityCutoff), 0.0, 0.5);
+      next.smoothing = Boolean(next.smoothing);
+      return next;
+    });
+  };
+  const resetHeightTuning = () => setHeightRenderTuning(DEFAULT_HEIGHT_RENDER_TUNING);
   const fallbackActive = Boolean(meta?.fallbackActive);
   const fallbackTrackCount = Number.isFinite(Number(meta?.fallbackTrackCount))
     ? Math.max(0, Number(meta?.fallbackTrackCount))
@@ -1148,6 +1205,81 @@ export const BevView: React.FC<BevViewProps> = ({
       Grid
     </label>
   );
+  const lookControls = hasHeightLookControls ? (
+    <div className="bev-look-control-wrap">
+      <button
+        type="button"
+        className={`bev-look-button${lookPanelOpen ? ' is-active' : ''}`}
+        onClick={() => setLookPanelOpen((value) => !value)}
+        aria-expanded={lookPanelOpen}
+      >
+        Look
+      </button>
+      {lookPanelOpen && (
+        <div className="bev-look-panel">
+          <label className="bev-look-row">
+            <span>Low</span>
+            <input
+              type="range"
+              min="0"
+              max="30"
+              step="1"
+              value={heightRenderTuning.lowPct}
+              onChange={(event) => updateHeightTuning({ lowPct: Number(event.target.value) })}
+            />
+            <output>{heightRenderTuning.lowPct.toFixed(0)}%</output>
+          </label>
+          <label className="bev-look-row">
+            <span>High</span>
+            <input
+              type="range"
+              min="70"
+              max="100"
+              step="1"
+              value={heightRenderTuning.highPct}
+              onChange={(event) => updateHeightTuning({ highPct: Number(event.target.value) })}
+            />
+            <output>{heightRenderTuning.highPct.toFixed(0)}%</output>
+          </label>
+          <label className="bev-look-row">
+            <span>Gamma</span>
+            <input
+              type="range"
+              min="0.4"
+              max="2.2"
+              step="0.05"
+              value={heightRenderTuning.gamma}
+              onChange={(event) => updateHeightTuning({ gamma: Number(event.target.value) })}
+            />
+            <output>{heightRenderTuning.gamma.toFixed(2)}</output>
+          </label>
+          <label className="bev-look-row">
+            <span>Mask</span>
+            <input
+              type="range"
+              min="0"
+              max="0.2"
+              step="0.005"
+              value={heightRenderTuning.densityCutoff}
+              onChange={(event) => updateHeightTuning({ densityCutoff: Number(event.target.value) })}
+            />
+            <output>{heightRenderTuning.densityCutoff.toFixed(3)}</output>
+          </label>
+          <div className="bev-look-actions">
+            <label>
+              <input
+                type="checkbox"
+                checked={heightRenderTuning.smoothing}
+                onChange={(event) => updateHeightTuning({ smoothing: event.target.checked })}
+              />
+              Smooth
+            </label>
+            <button type="button" onClick={resetHeightTuning}>Reset</button>
+          </div>
+        </div>
+      )}
+    </div>
+  ) : null;
 
   const canvasContent = meta?.error ? (
     <div className={variant === 'drawer' ? 'td-placeholder' : 'bev-inline-placeholder'}>
@@ -1170,6 +1302,7 @@ export const BevView: React.FC<BevViewProps> = ({
         <div className="bev-inline-body">
           {fallbackBanner}
           {canvasContent}
+          {lookControls}
           <div className="bev-grid-toggle-wrap">
             {toggleLabel}
           </div>

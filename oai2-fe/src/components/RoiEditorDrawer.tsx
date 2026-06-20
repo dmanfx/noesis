@@ -111,6 +111,13 @@ const distance = (a: RoiPoint, b: RoiPoint): number => {
   return Math.hypot(dx, dy);
 };
 
+const normalizeCameraToken = (value: unknown): string => (
+  String(value ?? '')
+    .trim()
+    .toLowerCase()
+    .replace(/[\s_]+/g, '-')
+);
+
 const RoiEditorDrawer: React.FC<Props> = ({ open, onClose, restBaseUrl, mosaicLayout, videoRef, analyticsReloadCount }) => {
   const [drawerWidth, setDrawerWidth] = useState<number>(DEFAULT_WIDTH);
   const [loading, setLoading] = useState(false);
@@ -321,14 +328,23 @@ const RoiEditorDrawer: React.FC<Props> = ({ open, onClose, restBaseUrl, mosaicLa
     const cols = layout?.cols ?? null;
     const rows = layout?.rows ?? null;
     if (!cols || !rows) return null;
-    const sourceId = Number(selectedStream.stream_id);
-    let tileIndex = Number.isFinite(sourceId) ? sourceId : 0;
+    const streamSourceId = Number(selectedStream.stream_id);
+    const streamLabel = normalizeCameraToken(selectedStream.label || selectedStream.stream_id);
+    let tileIndex = Number.isFinite(streamSourceId) ? streamSourceId : 0;
     const sources = layout?.sources || [];
     if (sources.length) {
-      const idx = sources.findIndex((source) => source.source_id === sourceId);
+      const idx = sources.findIndex((source) => {
+        const sourceId = Number((source as any).source_id);
+        if (Number.isFinite(streamSourceId) && Number.isFinite(sourceId) && sourceId === streamSourceId) {
+          return true;
+        }
+        const cameraId = normalizeCameraToken((source as any).camera_id || (source as any).cameraId);
+        return !!cameraId && !!streamLabel && cameraId === streamLabel;
+      });
       if (idx >= 0) tileIndex = idx;
     }
-    if (layout?.source_count && tileIndex >= layout.source_count) return null;
+    const sourceCount = layout?.source_count || sources.length || rows * cols;
+    if (sourceCount && tileIndex >= sourceCount) return null;
     const video = videoRef?.current;
     if (!video || !video.videoWidth || !video.videoHeight) return null;
     const vw = video.videoWidth;

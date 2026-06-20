@@ -26,9 +26,9 @@ const wsPort = Number(import.meta.env.VITE_WS_PORT || 6008);
 const wsProto = window.location.protocol === 'https:' ? 'wss' : 'ws';
 const WS_URL = import.meta.env.VITE_WS_URL || `${wsProto}://${wsHost}:${wsPort}`;
 const restHost = window.location.hostname || '127.0.0.1';
-const restPort = Number(import.meta.env.VITE_REST_PORT || 8082);
+const restPort = Number(import.meta.env.VITE_REST_PORT || 8080);
 const restProto = window.location.protocol === 'https:' ? 'https' : 'http';
-const REST_URL = import.meta.env.VITE_REST_URL || `${restProto}://${restHost}:${restPort}`;
+const REST_URL = import.meta.env.VITE_REST_URL || (import.meta.env.DEV ? '' : `${restProto}://${restHost}:${restPort}`);
 const streamDisplayCams: CameraKey[] = ['living-room'];
 
 type CameraPoseSummary = {

@@ -212,9 +212,7 @@ def _dewarper_frame_rectifier(
 
     output_w = int(float(props.get("output-width", surface.get("width", "0"))))
     output_h = int(float(props.get("output-height", surface.get("height", "0"))))
-    calib_w = int(float(surface.get("width", str(output_w))))
-    calib_h = int(float(surface.get("height", str(output_h))))
-    if output_w <= 0 or output_h <= 0 or calib_w <= 0 or calib_h <= 0:
+    if output_w <= 0 or output_h <= 0:
         raise RuntimeError(f"dewarper config has invalid dimensions: {config_path}")
 
     src_focal = _semicolon_floats(surface.get("focal-length", ""), expected=2, key="focal-length")
@@ -251,7 +249,6 @@ def _dewarper_frame_rectifier(
     )
     d = np.asarray(distortion, dtype=np.float64).reshape(4, 1)
     maps_by_shape: dict[tuple[int, int], tuple[np.ndarray, np.ndarray]] = {}
-    warned_shape_mismatch = False
 
     LOGGER.info(
         "Depth-registration builder will mirror dewarper config=%s output=%dx%d",
@@ -261,31 +258,12 @@ def _dewarper_frame_rectifier(
     )
 
     def _rectify(frame_bgr: np.ndarray) -> np.ndarray:
-        nonlocal warned_shape_mismatch
         frame_h, frame_w = int(frame_bgr.shape[0]), int(frame_bgr.shape[1])
         key = (frame_w, frame_h)
         maps = maps_by_shape.get(key)
         if maps is None:
-            k = src_k.copy()
-            if (frame_w, frame_h) != (calib_w, calib_h):
-                if not warned_shape_mismatch:
-                    LOGGER.warning(
-                        "Dewarper config %s calibrated for %dx%d but source frames are %dx%d; scaling source K",
-                        config_path,
-                        calib_w,
-                        calib_h,
-                        frame_w,
-                        frame_h,
-                    )
-                    warned_shape_mismatch = True
-                sx = float(frame_w) / float(calib_w)
-                sy = float(frame_h) / float(calib_h)
-                k[0, 0] *= sx
-                k[0, 2] *= sx
-                k[1, 1] *= sy
-                k[1, 2] *= sy
             maps = cv2.fisheye.initUndistortRectifyMap(
-                k,
+                src_k,
                 d,
                 np.eye(3, dtype=np.float64),
                 dst_k,

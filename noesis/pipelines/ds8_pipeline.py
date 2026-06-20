@@ -972,6 +972,9 @@ def build_pipeline(yaml_path: str | Path) -> DS8Pipeline:
     exclude_component: Optional[Component] = None
     if exclude_enabled:
         exclude_cfg.pop("enable", None)
+        env_exclude_path = os.environ.get("NOESIS_ANALYTICS_EXCLUDE_CONFIG")
+        if env_exclude_path:
+            exclude_cfg["config-file"] = env_exclude_path
         if "config-file" in exclude_cfg:
             exclude_cfg["config-file"] = _abs_or_same(exclude_cfg["config-file"])  # type: ignore[index]
         exclude_component = Component(

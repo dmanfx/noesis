@@ -64,6 +64,31 @@ export function cameraLabel(key: CameraKey): string {
   return key.replace(/[-_]/g, ' ').replace(/\b\w/g, c => c.toUpperCase());
 }
 
+const CALIBRATION_TABLE_KEYS = new Set([
+  'k',
+  'e',
+  'pose',
+  'pose confidence',
+  'pose_confidence',
+  'intrinsics',
+  'extrinsics',
+]);
+
+function isObjectRecord(value: unknown): value is Record<string, unknown> {
+  return !!value && typeof value === 'object' && !Array.isArray(value);
+}
+
+function isCalibrationTableKey(key: string): boolean {
+  return CALIBRATION_TABLE_KEYS.has(key.toLowerCase().trim());
+}
+
+function addCameraKey(discovered: Set<CameraKey>, rawId: unknown): void {
+  const id = String(rawId || '').trim();
+  if (!id) return;
+  const key = detectCameraKey(id) || id.toLowerCase();
+  if (key) discovered.add(key);
+}
+
 /**
  * Discovery helper for Item 4 (config + discovery approach).
  * Collects camera identifiers from the first successful feeds:
@@ -83,28 +108,27 @@ export function discoverCamerasFromPayloads(payloads: any[]): CameraKey[] {
     if (layout && Array.isArray(layout.sources)) {
       for (const src of layout.sources) {
         const id = src?.camera_id || src?.cameraId || src?.source_id;
-        if (id) {
-          const key = detectCameraKey(String(id)) || String(id).toLowerCase();
-          if (key) discovered.add(key);
-        }
+        if (id) addCameraKey(discovered, id);
       }
     }
 
     // From calibration bundle
     if (p.data?.cameras || p.cameras) {
       const cams = p.data?.cameras || p.cameras;
-      Object.keys(cams || {}).forEach(k => {
-        const key = detectCameraKey(k) || k.toLowerCase();
-        if (key) discovered.add(key);
-      });
+      for (const [key, value] of Object.entries(cams || {})) {
+        if (isCalibrationTableKey(key)) {
+          if (isObjectRecord(value)) {
+            Object.keys(value).forEach((cameraId) => addCameraKey(discovered, cameraId));
+          }
+          continue;
+        }
+        addCameraKey(discovered, key);
+      }
     }
 
     // From floorplan or bev meta
     const cam = p.camera || p.cameraId || p.camId;
-    if (cam) {
-      const key = detectCameraKey(String(cam)) || String(cam).toLowerCase();
-      if (key) discovered.add(key);
-    }
+    if (cam) addCameraKey(discovered, cam);
   }
 
   return Array.from(discovered);

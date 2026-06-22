@@ -55,6 +55,9 @@ Responsibilities:
 - decode MapAnything tensor outputs
 - align depth/conf/mask to camera frame geometry
 - store dense snapshots through `geometry.depth_source.DepthStorageManager`
+  with optional `rgb` image layers for fresh dashboard-triggered captures
+- fuse raw snapshots from one refresh burst into a single `capture_event_fused`
+  Zarr before floorplan, normals, and room reconstruction consume the result
 - publish `DepthResult`
 - serve `get_ma_depth` via the runtime provider path
 
@@ -67,6 +70,14 @@ builder now computes the same camera-space normal evidence from persisted depth
 snapshots before writing revision artifacts. Those normals are used to validate
 and score generated planes; they do not replace MapAnything depth, ZeroPlane
 masks, or camera-derived plane equations.
+
+Room reconstruction now uses two explicit fusion levels:
+
+- Intra-capture fusion combines the valid, agreeing pixels from the raw Zarrs
+  emitted during one MapAnything refresh burst. This creates one capture event
+  and stores any captured RGB beside the fused depth.
+- Inter-capture fusion combines the latest capture events, defaulting to four,
+  into the reconstruction mesh/point artifact that Menon displays.
 
 ## Offline DAv2 -> MapAnything Registration
 

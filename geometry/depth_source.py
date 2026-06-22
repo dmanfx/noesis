@@ -1404,6 +1404,7 @@ class _SnapshotJob:
     depth: np.ndarray
     conf: np.ndarray
     mask: np.ndarray
+    rgb: Optional[np.ndarray]
     dest_path: Path
 
 
@@ -1676,18 +1677,21 @@ class DepthStorageManager:
         depth: np.ndarray,
         conf: np.ndarray,
         mask: np.ndarray,
+        rgb: Optional[np.ndarray],
         dest_path: Path,
     ) -> _SnapshotJob:
         depth_c = np.ascontiguousarray(depth, dtype=np.float32).copy()
         conf_c = np.ascontiguousarray(conf, dtype=np.float32).copy()
         mask_c = np.ascontiguousarray(mask, dtype=np.uint8).copy()
+        rgb_c = self._prepare_rgb_snapshot(rgb)
         _increment_core_boundary_copy_bytes(
             "depth_store",
             int(getattr(depth_c, "nbytes", 0) or 0)
             + int(getattr(conf_c, "nbytes", 0) or 0)
-            + int(getattr(mask_c, "nbytes", 0) or 0),
+            + int(getattr(mask_c, "nbytes", 0) or 0)
+            + int(getattr(rgb_c, "nbytes", 0) or 0),
         )
-        return _SnapshotJob(camera_id, ts_us, depth_c, conf_c, mask_c, dest_path)
+        return _SnapshotJob(camera_id, ts_us, depth_c, conf_c, mask_c, rgb_c, dest_path)
 
     def _register_snapshot(self, camera_id: str, ts_us: int, dest_path: Path) -> None:
         # Keep lock ordering consistent with load_latest_depth (cache_lock -> camera_lock)
@@ -1725,7 +1729,7 @@ class DepthStorageManager:
         root: "zarr.hierarchy.Group",
         name: str,
         data: np.ndarray,
-        chunk_shape: Tuple[int, int],
+        chunk_shape: Tuple[int, ...],
         compressor: Optional[Any],
     ) -> None:
         create_kwargs = {
@@ -1752,6 +1756,276 @@ class DepthStorageManager:
                     create_kwargs.pop("compressors", None)
         root.create_dataset(name, **create_kwargs)
 
+    def _prepare_rgb_snapshot(self, rgb: Optional[np.ndarray]) -> Optional[np.ndarray]:
+        if rgb is None:
+            return None
+        arr = np.asarray(rgb)
+        if arr.ndim != 3 or arr.shape[2] < 3:
+            raise ValueError(f"RGB snapshot must have shape HxWx3 or HxWx4, got {arr.shape}")
+        arr = np.asarray(arr[:, :, :3], dtype=np.uint8)
+        if arr.shape[0] <= 0 or arr.shape[1] <= 0:
+            raise ValueError(f"RGB snapshot has invalid shape {arr.shape}")
+        return np.ascontiguousarray(arr).copy()
+
+    def _write_rgb_dataset(self, root: "zarr.hierarchy.Group", rgb: np.ndarray, compressor: Optional[Any]) -> None:
+        rgb_arr = self._prepare_rgb_snapshot(rgb)
+        if rgb_arr is None:
+            return
+        if self._zarr_chunk_px and self._zarr_chunk_px > 0:
+            rgb_chunk_shape = (
+                min(self._zarr_chunk_px, rgb_arr.shape[0]),
+                min(self._zarr_chunk_px, rgb_arr.shape[1]),
+                int(rgb_arr.shape[2]),
+            )
+        else:
+            rgb_chunk_shape = tuple(int(dim) for dim in rgb_arr.shape)
+        self._create_zarr_dataset(root, "rgb", rgb_arr, rgb_chunk_shape, compressor)
+        root.attrs.update(
+            rgb_shape=json.dumps(rgb_arr.shape),
+            rgb_dtype="uint8",
+            rgb_color_space="sRGB",
+            rgb_encoding="uint8_rgb",
+            rgb_stored_at=time.time(),
+        )
+
+    @staticmethod
+    def _snapshot_attr_dict(path: Path) -> Dict[str, Any]:
+        try:
+            group = zarr.open_group(str(path), mode="r")
+            return dict(group.attrs.asdict() if hasattr(group.attrs, "asdict") else dict(group.attrs))
+        except Exception:
+            return {}
+
+    @classmethod
+    def _snapshot_is_derived(cls, path: Path) -> bool:
+        attrs = cls._snapshot_attr_dict(path)
+        role = str(attrs.get("snapshot_role") or "").strip().lower()
+        level = str(attrs.get("fusion_level") or "").strip().lower()
+        return role in {"capture_event_fused", "reconstruction_fused"} or level in {"intra_capture", "inter_capture"}
+
+    def list_snapshot_entries(
+        self,
+        camera_id: str,
+        *,
+        ts_min_exclusive: Optional[int] = None,
+        ts_max_us: Optional[int] = None,
+        include_derived: bool = True,
+        limit: Optional[int] = None,
+    ) -> List[Tuple[int, Path]]:
+        lock = self._get_lock(camera_id)
+        with lock:
+            rows = list(self._get_index(camera_id))
+        out: List[Tuple[int, Path]] = []
+        for ts, path in rows:
+            try:
+                ts_int = int(ts)
+            except Exception:
+                continue
+            if ts_min_exclusive is not None and ts_int <= int(ts_min_exclusive):
+                continue
+            if ts_max_us is not None and ts_int > int(ts_max_us):
+                continue
+            if not path.exists():
+                continue
+            if not include_derived and self._snapshot_is_derived(path):
+                continue
+            out.append((ts_int, path))
+        out.sort(key=lambda item: item[0])
+        if limit is not None and int(limit) > 0:
+            out = out[-int(limit):]
+        return out
+
+    def invalidate_floorplan_cache(self, camera_id: Optional[str] = None) -> None:
+        with self._cache_lock:
+            if camera_id:
+                prefix = str(camera_id)
+                for key in list(self._floorplan_cache.keys()):
+                    if key and str(key[0]) == prefix:
+                        self._floorplan_cache.pop(key, None)
+            else:
+                self._floorplan_cache.clear()
+        if not camera_id:
+            return
+        try:
+            safe_cam = self._sanitize_camera_id(str(camera_id))
+            cache_dir = self._floorplan_store_dir / safe_cam
+            if cache_dir.exists():
+                for path in cache_dir.glob("*.json"):
+                    try:
+                        path.unlink()
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+
+    def _fuse_depth_datasets(
+        self,
+        snapshots: Sequence[Tuple[int, Path, Mapping[str, np.ndarray]]],
+        *,
+        min_confidence: float,
+        min_observations: int,
+        depth_agreement_m: float,
+        rgb: Optional[np.ndarray] = None,
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, Optional[np.ndarray], Dict[str, Any]]:
+        if not snapshots:
+            raise ValueError("no_snapshots_to_fuse")
+        first_depth = np.asarray(snapshots[0][2]["depth"], dtype=np.float32)
+        shape = tuple(int(dim) for dim in first_depth.shape)
+        if len(shape) != 2:
+            raise ValueError(f"bad_depth_shape:{shape}")
+        depth_rows: List[np.ndarray] = []
+        conf_rows: List[np.ndarray] = []
+        mask_rows: List[np.ndarray] = []
+        rgb_rows: List[np.ndarray] = []
+        source_paths: List[str] = []
+        source_timestamps: List[int] = []
+        for ts, path, datasets in snapshots:
+            depth = np.asarray(datasets.get("depth"), dtype=np.float32)
+            conf = np.asarray(datasets.get("conf"), dtype=np.float32)
+            mask = np.asarray(datasets.get("mask"), dtype=np.uint8) > 0
+            if tuple(int(dim) for dim in depth.shape) != shape or conf.shape != depth.shape or mask.shape != depth.shape:
+                continue
+            depth_rows.append(depth)
+            conf_rows.append(conf)
+            mask_rows.append(mask)
+            source_paths.append(str(path))
+            source_timestamps.append(int(ts))
+            rgb_arr = datasets.get("rgb")
+            if rgb_arr is not None:
+                try:
+                    rgb_prepared = self._prepare_rgb_snapshot(np.asarray(rgb_arr))
+                    if rgb_prepared is not None:
+                        if rgb_prepared.shape[:2] != shape:
+                            rgb_prepared = cv2.resize(rgb_prepared, (shape[1], shape[0]), interpolation=cv2.INTER_LINEAR)
+                        rgb_rows.append(np.ascontiguousarray(rgb_prepared[:, :, :3], dtype=np.uint8))
+                except Exception:
+                    pass
+        if not depth_rows:
+            raise ValueError("no_shape_compatible_snapshots_to_fuse")
+
+        depth_stack = np.stack(depth_rows, axis=0).astype(np.float32, copy=False)
+        conf_stack = np.stack(conf_rows, axis=0).astype(np.float32, copy=False)
+        mask_stack = np.stack(mask_rows, axis=0).astype(bool, copy=False)
+        valid = (
+            mask_stack
+            & np.isfinite(depth_stack)
+            & (depth_stack > 0.0)
+            & np.isfinite(conf_stack)
+            & (conf_stack >= float(min_confidence))
+        )
+        masked_depth = np.ma.array(depth_stack, mask=~valid)
+        median_depth = np.ma.median(masked_depth, axis=0).filled(np.nan).astype(np.float32)
+        tolerance = float(depth_agreement_m) + np.nan_to_num(median_depth, nan=0.0, posinf=0.0, neginf=0.0) * 0.025
+        agreeing = valid & np.isfinite(median_depth)[None, :, :] & (np.abs(depth_stack - median_depth[None, :, :]) <= tolerance[None, :, :])
+        support = np.count_nonzero(agreeing, axis=0)
+        required = max(1, min(int(min_observations), len(depth_rows)))
+        fused_mask_bool = support >= required
+
+        weights = np.where(agreeing, np.clip(conf_stack, 0.0, None), 0.0).astype(np.float32, copy=False)
+        weight_sum = np.sum(weights, axis=0)
+        weighted_depth_sum = np.sum(np.where(agreeing, depth_stack, 0.0) * weights, axis=0)
+        fused_depth = np.zeros(shape, dtype=np.float32)
+        np.divide(weighted_depth_sum, weight_sum, out=fused_depth, where=weight_sum > 0.0)
+        fallback = fused_mask_bool & ~(weight_sum > 0.0) & np.isfinite(median_depth)
+        fused_depth[fallback] = median_depth[fallback]
+        fused_depth[~fused_mask_bool] = 0.0
+
+        conf_sum = np.sum(np.where(agreeing, conf_stack, 0.0), axis=0)
+        fused_conf = np.zeros(shape, dtype=np.float32)
+        np.divide(conf_sum, support, out=fused_conf, where=support > 0)
+        fused_conf[~fused_mask_bool] = 0.0
+        fused_mask = fused_mask_bool.astype(np.uint8, copy=False)
+
+        fused_rgb = None
+        if rgb is not None:
+            rgb_prepared = self._prepare_rgb_snapshot(rgb)
+            if rgb_prepared is not None:
+                if rgb_prepared.shape[:2] != shape:
+                    rgb_prepared = cv2.resize(rgb_prepared, (shape[1], shape[0]), interpolation=cv2.INTER_LINEAR)
+                fused_rgb = np.ascontiguousarray(rgb_prepared[:, :, :3], dtype=np.uint8)
+        elif rgb_rows:
+            if len(rgb_rows) == 1:
+                fused_rgb = rgb_rows[0]
+            else:
+                fused_rgb = np.median(np.stack(rgb_rows, axis=0).astype(np.float32), axis=0).astype(np.uint8)
+
+        meta = {
+            "source_snapshot_count": int(len(depth_rows)),
+            "source_snapshot_paths": source_paths,
+            "source_timestamps_us": source_timestamps,
+            "min_observations": int(required),
+            "depth_agreement_m": float(depth_agreement_m),
+            "support_valid_fraction": float(np.count_nonzero(fused_mask_bool) / max(1, fused_mask_bool.size)),
+            "median_support": float(np.median(support[fused_mask_bool])) if np.any(fused_mask_bool) else 0.0,
+            "rgb_source_count": int(len(rgb_rows)),
+            "rgb_override_used": bool(rgb is not None),
+        }
+        return fused_depth, fused_conf, fused_mask, fused_rgb, meta
+
+    def fuse_snapshot_entries(
+        self,
+        camera_id: str,
+        entries: Sequence[Tuple[int, Path]],
+        *,
+        rgb: Optional[np.ndarray] = None,
+        min_confidence: Optional[float] = None,
+        min_observations: int = 2,
+        depth_agreement_m: float = 0.18,
+        snapshot_role: str = "capture_event_fused",
+        fusion_level: str = "intra_capture",
+        event_id: Optional[str] = None,
+        ts_us: Optional[int] = None,
+    ) -> Tuple[Path, Dict[str, Any]]:
+        loaded: List[Tuple[int, Path, Mapping[str, np.ndarray]]] = []
+        for ts, path in entries:
+            if not path.exists():
+                continue
+            if self._snapshot_is_derived(path):
+                continue
+            datasets = self.load_datasets(path)
+            if not datasets:
+                continue
+            loaded.append((int(ts), path, datasets))
+        if not loaded:
+            raise ValueError("no_raw_snapshots_to_fuse")
+        min_conf = float(self.min_conf if min_confidence is None else min_confidence)
+        if not np.isfinite(min_conf):
+            min_conf = 0.0
+        fused_depth, fused_conf, fused_mask, fused_rgb, meta = self._fuse_depth_datasets(
+            loaded,
+            min_confidence=min_conf,
+            min_observations=int(min_observations),
+            depth_agreement_m=float(depth_agreement_m),
+            rgb=rgb,
+        )
+        source_ts = [int(ts) for ts, _path, _datasets in loaded]
+        fused_ts = int(ts_us) if ts_us is not None else max(int(time.time() * 1_000_000), max(source_ts) + 1)
+        dest_path = self.store(camera_id, fused_ts, fused_depth, fused_conf, fused_mask, rgb=fused_rgb)
+        try:
+            self.flush(timeout=5.0)
+        except Exception:
+            pass
+        attrs = {
+            "snapshot_role": str(snapshot_role),
+            "fusion_level": str(fusion_level),
+            "fusion_meta": json.dumps(meta, separators=(",", ":")),
+            "source_snapshot_paths": json.dumps(meta.get("source_snapshot_paths") or [], separators=(",", ":")),
+            "source_timestamps_us": json.dumps(meta.get("source_timestamps_us") or [], separators=(",", ":")),
+            "source_snapshot_count": int(meta.get("source_snapshot_count") or 0),
+            "event_id": str(event_id or f"{camera_id}:{min(source_ts)}:{max(source_ts)}"),
+            "event_start_ts_us": int(min(source_ts)),
+            "event_end_ts_us": int(max(source_ts)),
+        }
+        try:
+            root = zarr.open_group(str(dest_path), mode="a")
+            root.attrs.update(**attrs)
+        except Exception:
+            self._logger.debug("Failed to write fusion attrs for %s", dest_path, exc_info=True)
+        with self._cache_lock:
+            self._depth_payload_cache.pop(camera_id, None)
+        self.invalidate_floorplan_cache(camera_id)
+        return dest_path, {**meta, **attrs, "fused_snapshot_path": str(dest_path), "fused_timestamp_us": int(fused_ts)}
+
     def _write_snapshot(self, job: _SnapshotJob) -> None:
         job.dest_path.parent.mkdir(parents=True, exist_ok=True)
         compressor = self._make_blosc_compressor()
@@ -1764,6 +2038,8 @@ class DepthStorageManager:
         self._create_zarr_dataset(root, "depth_z", job.depth, chunk_shape, compressor)
         self._create_zarr_dataset(root, "conf", job.conf, chunk_shape, compressor)
         self._create_zarr_dataset(root, "mask", job.mask, chunk_shape, compressor)
+        if job.rgb is not None:
+            self._write_rgb_dataset(root, job.rgb, compressor)
         root.attrs.update(
             camera_id=job.camera_id,
             timestamp_us=int(job.ts_us),
@@ -1913,6 +2189,7 @@ class DepthStorageManager:
         depth: np.ndarray,
         conf: np.ndarray,
         mask: np.ndarray,
+        rgb: Optional[np.ndarray] = None,
     ) -> Path:
         timestamp = datetime.utcfromtimestamp(ts_us / 1_000_000.0)
         date_dir = timestamp.strftime("%Y%m%d")
@@ -1920,7 +2197,7 @@ class DepthStorageManager:
         dest_dir = self.base_path / camera_id / date_dir / hour_dir
         dest_path = dest_dir / f"{ts_us}.zarr"
 
-        job = self._create_job(camera_id, ts_us, depth, conf, mask, dest_path)
+        job = self._create_job(camera_id, ts_us, depth, conf, mask, rgb, dest_path)
         if self._async_enabled and self._queue is not None:
             try:
                 self._queue.put(job, timeout=self._queue_put_timeout)
@@ -1941,6 +2218,29 @@ class DepthStorageManager:
                     self._last_queue_full_warning = now
 
         self._write_snapshot(job)
+        return dest_path
+
+    def attach_rgb_to_snapshot(self, camera_id: str, ts_us: int, rgb: np.ndarray) -> Optional[Path]:
+        """Attach or replace the RGB image for an existing depth snapshot."""
+        rgb_c = self._prepare_rgb_snapshot(rgb)
+        if rgb_c is None:
+            return None
+        ts_int = int(ts_us)
+        with self._cache_lock:
+            lock = self._get_lock(camera_id)
+            with lock:
+                index = self._get_index(camera_id)
+                dest_path: Optional[Path] = None
+                for existing_ts, path in reversed(index):
+                    if int(existing_ts) == ts_int and path.exists():
+                        dest_path = path
+                        break
+                if dest_path is None:
+                    return None
+                compressor = self._make_blosc_compressor()
+                root = zarr.open_group(str(dest_path), mode="a")
+                self._write_rgb_dataset(root, rgb_c, compressor)
+            self._depth_payload_cache.pop(camera_id, None)
         return dest_path
 
     def _collect_alive_threads(self) -> List[threading.Thread]:
@@ -1988,7 +2288,10 @@ class DepthStorageManager:
             depth = np.array(group['depth_z'])
             conf = np.array(group['conf'])
             mask = np.array(group['mask'])
-            return {'depth': depth, 'conf': conf, 'mask': mask}
+            datasets = {'depth': depth, 'conf': conf, 'mask': mask}
+            if 'rgb' in group:
+                datasets['rgb'] = np.array(group['rgb'])
+            return datasets
         except Exception:
             return None
 
@@ -2029,6 +2332,18 @@ class DepthStorageManager:
             'mask_b64': base64.b64encode(mask.tobytes()).decode('ascii'),
             'shape': [int(height), int(width)],
         }
+        rgb = datasets.get('rgb')
+        if rgb is not None:
+            rgb_arr = self._prepare_rgb_snapshot(np.asarray(rgb))
+            if rgb_arr is not None:
+                payload.update(
+                    {
+                        'rgb_b64': base64.b64encode(rgb_arr.tobytes()).decode('ascii'),
+                        'rgb_shape': [int(rgb_arr.shape[0]), int(rgb_arr.shape[1]), int(rgb_arr.shape[2])],
+                        'rgb_dtype': 'uint8',
+                        'rgb_color_space': 'sRGB',
+                    }
+                )
         with self._cache_lock:
             self._depth_payload_cache[cache_key] = dict(payload)
             self._depth_payload_cache.move_to_end(cache_key, last=True)
@@ -3805,6 +4120,18 @@ class MapAnythingDepthSource:
             'mask_b64': base64.b64encode(mask.tobytes()).decode('ascii'),
             'shape': [int(height), int(width)],
         }
+        rgb = datasets.get('rgb')
+        if rgb is not None:
+            rgb_arr = self.storage._prepare_rgb_snapshot(np.asarray(rgb))
+            if rgb_arr is not None:
+                payload.update(
+                    {
+                        'rgb_b64': base64.b64encode(rgb_arr.tobytes()).decode('ascii'),
+                        'rgb_shape': [int(rgb_arr.shape[0]), int(rgb_arr.shape[1]), int(rgb_arr.shape[2])],
+                        'rgb_dtype': 'uint8',
+                        'rgb_color_space': 'sRGB',
+                    }
+                )
         with self._cache_lock:
             self._depth_payload_cache[cache_key] = dict(payload)
             self._depth_payload_cache.move_to_end(cache_key, last=True)

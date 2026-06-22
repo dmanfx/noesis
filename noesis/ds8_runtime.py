@@ -186,6 +186,126 @@ def _coerce_positive_int(value: Any) -> Optional[int]:
     return parsed if parsed > 0 else None
 
 
+def _split_dewarper_floats(value: str) -> list[float]:
+    parts = [part.strip() for part in str(value or "").split(";") if part.strip()]
+    return [float(part) for part in parts]
+
+
+def _capture_camera_rgb_for_depth_snapshot(
+    *,
+    pipeline_cfg: Mapping[str, Any],
+    pipeline_path: Path,
+    camera_labels: Mapping[int, str],
+    camera_id: str,
+    logger: logging.Logger,
+) -> np.ndarray:
+    try:
+        import cv2 as _cv2
+    except Exception as exc:
+        raise RuntimeError("cv2_unavailable_for_rgb_capture") from exc
+
+    sources = pipeline_cfg.get("sources") if isinstance(pipeline_cfg, Mapping) else None
+    if not isinstance(sources, list):
+        raise RuntimeError("pipeline_sources_unavailable")
+
+    source_id: Optional[int] = None
+    for idx, label in camera_labels.items():
+        if str(label).strip() == str(camera_id).strip():
+            source_id = int(idx)
+            break
+    if source_id is None or source_id < 0 or source_id >= len(sources):
+        raise RuntimeError(f"camera_source_unavailable:{camera_id}")
+
+    source_cfg = sources[source_id]
+    if not isinstance(source_cfg, Mapping):
+        raise RuntimeError(f"camera_source_invalid:{camera_id}")
+    uri = str(source_cfg.get("uri") or "").strip()
+    if not uri:
+        raise RuntimeError(f"camera_source_uri_missing:{camera_id}")
+
+    capture_uri = uri[7:] if uri.startswith("file://") else uri
+    if uri.startswith("rtsp://"):
+        os.environ.setdefault("OPENCV_FFMPEG_CAPTURE_OPTIONS", "rtsp_transport;tcp")
+    cap = _cv2.VideoCapture(capture_uri)
+    if not cap.isOpened():
+        raise RuntimeError(f"camera_source_open_failed:{camera_id}")
+
+    warmup = 8
+    try:
+        warmup = max(0, min(60, int(float(os.environ.get("NOESIS_DEPTH_RGB_WARMUP_FRAMES", "8")))))
+    except Exception:
+        warmup = 8
+    frame_bgr: Optional[np.ndarray] = None
+    try:
+        for _ in range(max(1, warmup + 1)):
+            ok, frame = cap.read()
+            if ok and frame is not None:
+                frame_bgr = np.asarray(frame, dtype=np.uint8)
+    finally:
+        cap.release()
+    if frame_bgr is None or frame_bgr.ndim != 3 or frame_bgr.shape[2] < 3:
+        raise RuntimeError(f"camera_source_read_failed:{camera_id}")
+
+    dewarper = source_cfg.get("dewarper")
+    if not (isinstance(dewarper, Mapping) and bool(dewarper.get("enable", False))):
+        return np.ascontiguousarray(frame_bgr[:, :, :3], dtype=np.uint8)
+
+    config_raw = str(dewarper.get("config-file") or "").strip()
+    if not config_raw:
+        raise RuntimeError(f"dewarper_config_missing:{camera_id}")
+    config_path = _resolve_pipeline_cfg_path(pipeline_path, config_raw)
+    parser = configparser.ConfigParser(inline_comment_prefixes=("#", ";"))
+    parser.optionxform = str
+    parser.read(config_path, encoding="utf-8")
+    if "property" not in parser or "surface0" not in parser:
+        raise RuntimeError(f"dewarper_config_invalid:{config_path}")
+
+    props = parser["property"]
+    surface = parser["surface0"]
+    output_w = int(float(props.get("output-width", surface.get("width", "0"))))
+    output_h = int(float(props.get("output-height", surface.get("height", "0"))))
+    src_focal = _split_dewarper_floats(surface.get("focal-length", ""))
+    dst_focal = _split_dewarper_floats(surface.get("dst-focal-length", ""))
+    dst_pp = _split_dewarper_floats(surface.get("dst-principal-point", ""))
+    distortion = np.asarray(_split_dewarper_floats(surface.get("distortion", "")), dtype=np.float64)
+    if output_w <= 0 or output_h <= 0 or len(src_focal) < 2 or len(dst_focal) < 2 or len(dst_pp) < 2 or distortion.size < 4:
+        raise RuntimeError(f"dewarper_config_incomplete:{config_path}")
+
+    src_cx = float(surface.get("src-x0", "nan"))
+    src_cy = float(surface.get("src-y0", "nan"))
+    source_k = np.asarray(
+        [[float(src_focal[0]), 0.0, src_cx], [0.0, float(src_focal[1]), src_cy], [0.0, 0.0, 1.0]],
+        dtype=np.float64,
+    )
+    rectified_k = np.asarray(
+        [[float(dst_focal[0]), 0.0, float(dst_pp[0])], [0.0, float(dst_focal[1]), float(dst_pp[1])], [0.0, 0.0, 1.0]],
+        dtype=np.float64,
+    )
+    if not np.all(np.isfinite(source_k)) or not np.all(np.isfinite(rectified_k)):
+        raise RuntimeError(f"dewarper_config_nonfinite:{config_path}")
+
+    image_h, image_w = int(frame_bgr.shape[0]), int(frame_bgr.shape[1])
+    if image_w > 0 and image_h > 0 and (image_w, image_h) != (output_w, output_h):
+        sx = float(image_w) / float(output_w)
+        sy = float(image_h) / float(output_h)
+        source_k[0, 0] *= sx
+        source_k[0, 2] *= sx
+        source_k[1, 1] *= sy
+        source_k[1, 2] *= sy
+
+    map1, map2 = _cv2.fisheye.initUndistortRectifyMap(
+        source_k,
+        distortion.reshape((-1, 1)),
+        np.eye(3, dtype=np.float64),
+        rectified_k,
+        (int(output_w), int(output_h)),
+        _cv2.CV_32FC1,
+    )
+    dewarped = _cv2.remap(frame_bgr[:, :, :3], map1, map2, _cv2.INTER_LINEAR, borderMode=_cv2.BORDER_CONSTANT, borderValue=(0, 0, 0))
+    logger.debug("Captured RGB for %s from source %s with dewarper %s", camera_id, source_id, config_path)
+    return np.ascontiguousarray(dewarped[:, :, :3], dtype=np.uint8)
+
+
 def _validate_dewarper_intrinsics_sync(
     pipeline_path: Path, cameras_path: Path, logger: logging.Logger
 ) -> bool:
@@ -3563,6 +3683,108 @@ def main() -> int:
         except Exception:
             return 0
 
+    def _capture_rgb_for_depth(camera_id: str) -> Tuple[Optional[np.ndarray], Optional[str]]:
+        flag = os.environ.get("NOESIS_MAPANYTHING_ZARR_RGB_CAPTURE", "1")
+        if str(flag).strip().lower() not in _ENV_TRUE:
+            return None, None
+        try:
+            image_bgr = _capture_camera_rgb_for_depth_snapshot(
+                pipeline_cfg=getattr(pipeline, "config", {}) or {},
+                pipeline_path=pipeline_path,
+                camera_labels=camera_labels,
+                camera_id=str(camera_id),
+                logger=logger,
+            )
+            image_rgb = np.ascontiguousarray(image_bgr[:, :, :3][:, :, ::-1], dtype=np.uint8)
+            return image_rgb, None
+        except Exception as exc:
+            logger.warning("MapAnything RGB capture failed for camera %s: %s", camera_id, exc)
+            return None, str(exc) or "rgb_capture_failed"
+
+    def _attach_rgb_to_depth_snapshot(
+        *,
+        storage_key: str,
+        camera_id: str,
+        ts_us: int,
+    ) -> Optional[str]:
+        if storage_manager is None:
+            return "depth_source_unavailable"
+        try:
+            snapshot_ts = int(ts_us)
+        except Exception:
+            return "rgb_snapshot_timestamp_invalid"
+        if snapshot_ts <= 0:
+            return "rgb_snapshot_timestamp_invalid"
+        image_rgb, rgb_error = _capture_rgb_for_depth(camera_id)
+        if rgb_error:
+            return rgb_error
+        if image_rgb is None:
+            return None
+        attached_path = storage_manager.attach_rgb_to_snapshot(str(storage_key), snapshot_ts, image_rgb)
+        if attached_path is None and str(storage_key) != str(camera_id):
+            attached_path = storage_manager.attach_rgb_to_snapshot(str(camera_id), snapshot_ts, image_rgb)
+        if attached_path is None:
+            return "rgb_snapshot_attach_failed"
+        return None
+
+    def _fuse_capture_event_snapshots(
+        *,
+        storage_key: str,
+        camera_id: str,
+        baseline_ts_us: int,
+        rgb: Optional[np.ndarray],
+    ) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+        if storage_manager is None:
+            return None, "depth_source_unavailable"
+        try:
+            raw_limit = max(1, min(64, int(float(os.environ.get("NOESIS_CAPTURE_EVENT_RAW_LIMIT", "24")))))
+        except Exception:
+            raw_limit = 24
+        try:
+            min_obs = max(1, int(float(os.environ.get("NOESIS_CAPTURE_EVENT_MIN_OBSERVATIONS", "2"))))
+        except Exception:
+            min_obs = 2
+        try:
+            depth_agreement_m = float(os.environ.get("NOESIS_CAPTURE_EVENT_DEPTH_AGREEMENT_M", "0.18"))
+        except Exception:
+            depth_agreement_m = 0.18
+
+        candidate_keys = [str(storage_key)]
+        if str(camera_id) not in candidate_keys:
+            candidate_keys.append(str(camera_id))
+        for key in candidate_keys:
+            entries = storage_manager.list_snapshot_entries(
+                key,
+                ts_min_exclusive=int(baseline_ts_us or 0),
+                include_derived=False,
+                limit=raw_limit,
+            )
+            if not entries:
+                continue
+            try:
+                event_id = f"{camera_id}:{entries[0][0]}:{entries[-1][0]}"
+                fused_path, meta = storage_manager.fuse_snapshot_entries(
+                    key,
+                    entries,
+                    rgb=rgb,
+                    min_observations=min_obs,
+                    depth_agreement_m=depth_agreement_m,
+                    snapshot_role="capture_event_fused",
+                    fusion_level="intra_capture",
+                    event_id=event_id,
+                )
+                return {**meta, "storage_key": key, "path": str(fused_path)}, None
+            except Exception as exc:
+                logger.warning(
+                    "MapAnything capture-event fusion failed for camera %s key=%s raw_count=%s: %s",
+                    camera_id,
+                    key,
+                    len(entries),
+                    exc,
+                )
+                return None, str(exc) or "capture_event_fusion_failed"
+        return None, "no_raw_snapshots_for_capture_event"
+
     def _ds8_auto_calibrate_handler(camera_id: Optional[str] = None) -> Dict[str, Any]:
         if not auto_calibrate_lock.acquire(blocking=False):
             return {"ok": False, "results": [], "updated": [], "error": "busy"}
@@ -3675,6 +3897,8 @@ def main() -> int:
         cam_id: str,
         ts_max_us: Optional[object] = None,
         request_id: Optional[str] = None,
+        cache_only: bool = False,
+        **_ignored: object,
     ) -> Dict[str, Any]:
         request_camera = str(cam_id).strip()
         camera_key = request_camera
@@ -3766,6 +3990,7 @@ def main() -> int:
             payload: Optional[Dict[str, Any]] = None,
             ts_us: Optional[int] = None,
             error: Optional[str] = None,
+            rgb_capture_error: Optional[str] = None,
         ) -> Dict[str, Any]:
             ts_val: Any = ts_us
             if ts_val is None and payload is not None:
@@ -3776,6 +4001,7 @@ def main() -> int:
             resp: Dict[str, Any] = {
                 "type": "ma_depth_response",
                 "camera": canonical_camera,
+                "cache_only": bool(cache_only),
                 "served_from_cache": bool(served_from_cache),
                 "ts_us": int(ts_val or 0),
             }
@@ -3786,6 +4012,8 @@ def main() -> int:
                 resp["payload"] = payload
             if error:
                 resp["error"] = error
+            if rgb_capture_error:
+                resp["rgb_capture_error"] = rgb_capture_error
             resp["ok"] = error is None
             return resp
 
@@ -3797,6 +4025,49 @@ def main() -> int:
                 return storage_manager.load_latest_depth(camera_id, ts_cutoff)
             except Exception:
                 return None
+
+        def _maybe_attach_rgb_to_fresh_payload(
+            storage_key: str,
+            payload: Dict[str, Any],
+            payload_ts: int,
+        ) -> tuple[Dict[str, Any], Optional[str]]:
+            image_rgb, rgb_error = _capture_rgb_for_depth(canonical_camera)
+            fusion_meta, fusion_error = _fuse_capture_event_snapshots(
+                storage_key=storage_key,
+                camera_id=canonical_camera,
+                baseline_ts_us=int(baseline_ts_by_key.get(storage_key, 0) or 0),
+                rgb=image_rgb,
+            )
+            if fusion_meta is not None:
+                fused_key = str(fusion_meta.get("storage_key") or storage_key)
+                try:
+                    fused_ts = int(fusion_meta.get("fused_timestamp_us") or 0)
+                except Exception:
+                    fused_ts = 0
+                refreshed = _load_latest(fused_key, fused_ts if fused_ts > 0 else None)
+                if refreshed is not None and (fused_ts <= 0 or int(refreshed.get("ts", 0) or 0) == fused_ts):
+                    refreshed["capture_event_fusion"] = fusion_meta
+                    return refreshed, rgb_error
+                payload["capture_event_fusion"] = fusion_meta
+                return payload, rgb_error or "capture_event_fusion_reload_failed"
+
+            if isinstance(payload.get("rgb_b64"), str) and payload.get("rgb_b64"):
+                return payload, rgb_error or fusion_error
+            rgb_error = _attach_rgb_to_depth_snapshot(
+                storage_key=storage_key,
+                camera_id=canonical_camera,
+                ts_us=payload_ts,
+            )
+            if rgb_error:
+                return payload, rgb_error
+            refreshed = _load_latest(storage_key, payload_ts)
+            if refreshed is not None and int(refreshed.get("ts", 0) or 0) == int(payload_ts):
+                return refreshed, None
+            if storage_key != canonical_camera:
+                refreshed = _load_latest(canonical_camera, payload_ts)
+                if refreshed is not None and int(refreshed.get("ts", 0) or 0) == int(payload_ts):
+                    return refreshed, None
+            return payload, fusion_error or "rgb_snapshot_reload_failed"
 
         keys_to_check = [camera_key] + [k for k in alt_keys if k and k != camera_key]
 
@@ -3829,6 +4100,11 @@ def main() -> int:
             else:
                 cached = None
                 cached_ts = None
+
+        if cache_only:
+            if cached is not None:
+                return _response(True, payload=cached, ts_us=cached_ts)
+            return _response(False, error="no_cached_depth")
 
         depth_branch_present = bool(pipeline.depth_gate_attach and pipeline.depth_gate_attach in pipeline.components)
         if not depth_branch_present:
@@ -3876,7 +4152,8 @@ def main() -> int:
                     payload_ts = 0
                 if payload_ts <= baseline_ts_by_key.get(key, 0):
                     continue
-                return _response(False, payload=payload, ts_us=payload_ts)
+                payload, rgb_error = _maybe_attach_rgb_to_fresh_payload(key, payload, payload_ts)
+                return _response(False, payload=payload, ts_us=payload_ts, rgb_capture_error=rgb_error)
             time.sleep(0.12)
 
         if cached is not None:
@@ -4002,15 +4279,40 @@ def main() -> int:
 
         deadline = time.time() + min(12.0, float(enable_seconds) + 4.0)
         fresh_depth = False
+        fresh_depth_by_key: Dict[str, int] = {}
         while time.time() < deadline:
             for key in keys_to_check:
                 latest_ts = _read_latest_depth_ts(key)
                 if latest_ts > baseline_ts_by_key.get(key, 0):
                     fresh_depth = True
+                    fresh_depth_by_key[str(key)] = int(latest_ts)
                     break
             if fresh_depth:
                 break
             time.sleep(0.12)
+
+        rgb_capture_errors: Dict[str, str] = {}
+        capture_fusion_errors: Dict[str, str] = {}
+        capture_fusions: Dict[str, Dict[str, Any]] = {}
+        if fresh_depth_by_key:
+            image_rgb, rgb_error = _capture_rgb_for_depth(camera_id)
+            if rgb_error:
+                rgb_capture_errors[str(camera_id)] = str(rgb_error)
+            for key, latest_ts in fresh_depth_by_key.items():
+                fusion_meta, fusion_error = _fuse_capture_event_snapshots(
+                    storage_key=str(key),
+                    camera_id=str(camera_id),
+                    baseline_ts_us=int(baseline_ts_by_key.get(key, 0) or 0),
+                    rgb=image_rgb,
+                )
+                if fusion_meta is not None:
+                    capture_fusions[str(key)] = fusion_meta
+                    try:
+                        fresh_depth_by_key[str(key)] = int(fusion_meta.get("fused_timestamp_us") or latest_ts)
+                    except Exception:
+                        pass
+                if fusion_error:
+                    capture_fusion_errors[str(key)] = str(fusion_error)
 
         try:
             refreshed = dict(_generate_with_alternates())
@@ -4023,6 +4325,19 @@ def main() -> int:
             refreshed = {"error": str(exc) or "floorplan_failed", "camera_id": camera_id}
         refreshed["depth_burst_triggered"] = True
         refreshed["depth_burst_fresh"] = bool(fresh_depth)
+        if fresh_depth_by_key:
+            refreshed["capture_event_fusion_attempted"] = True
+            refreshed["capture_event_fusion_ts_us"] = dict(fresh_depth_by_key)
+        if capture_fusions:
+            refreshed["capture_event_fusions"] = dict(capture_fusions)
+        if rgb_capture_errors:
+            refreshed["rgb_capture_errors"] = dict(rgb_capture_errors)
+        elif fresh_depth_by_key and not capture_fusion_errors:
+            refreshed["rgb_capture_ok"] = True
+        if capture_fusion_errors:
+            refreshed["capture_event_fusion_errors"] = dict(capture_fusion_errors)
+        elif capture_fusions:
+            refreshed["capture_event_fusion_ok"] = True
         if refreshed.get("error") and not fresh_depth:
             refreshed.setdefault("details", "timeout_waiting_for_depth")
         return refreshed

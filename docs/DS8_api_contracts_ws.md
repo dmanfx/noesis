@@ -120,7 +120,7 @@ Emitted by `BevRenderer`:
       "anchorSource": "<string|null>",
       "anchorQuality": "<string|null>",
       "anchorReason": "<string|null>",
-      "displaySource": "world"|"world_to_camera_local"|"image_anchor"|"image_depth_anchor"
+      "displaySource": "world"|"world_to_camera_local"|"image_anchor"|"image_depth_anchor"|"floor_contact_ray"
     }
   ],
   "trails": [ {"stableId": <int|null>, "trackerId": <int|null>, "points": [ {"x": <float>, "y": <float>, "t": <int ms>} ]} ],
@@ -139,7 +139,8 @@ Emitted by `BevRenderer`:
 
 - `footpoints[].method` is an image-anchor/render provenance string emitted by the backend (`image_base`, `image_foot`, `bbox`, etc.), not the canonical track world estimator source.
 - `footpoints[].anchorSource`, `anchorQuality`, and `anchorReason` mirror the backend world estimator diagnostics from tracking telemetry so BEV/Three.js consumers can explain why a point was accepted, guarded, or held.
-- `footpoints[].displaySource` declares which coordinate path produced the displayed BEV point. The primary inline floorplan view uses `frame_mode=camera_local` and `frame=camera_local_ground_m`, so displayed points and producer trails are in the same camera-local ground frame as MapAnything floorplan rasters. `image_depth_anchor` is emitted only when the backend unprojected the image anchor through a MapAnything-registered depth sample; if depth registration rejects the sample, BEV display stays on the image-floor/world path instead of using raw object depth in the wrong basis.
+- `footpoints[].displaySource` declares which coordinate path produced the displayed BEV point. The primary inline floorplan view uses `frame_mode=camera_local` and `frame=camera_local_ground_m`, so displayed points and producer trails are in the same camera-local ground frame as MapAnything floorplan rasters. For tracked people, `world_to_camera_local` is preferred whenever the backend fused world estimator produced a current live observation (`pose_depth_fused`, `person_anchor_depth_fused`, floor-only variants, `gravity_drop`, or `bbox3d`). `floor_contact_ray` is the calibrated image-ground fallback when no current live world observation is available. `image_depth_anchor` remains a legacy/non-person direct image-depth path; static MapAnything/floorplan snapshots are not a live person-depth placement source.
+- When `NOESIS_BEV_ALIGNMENT_DEBUG=1` is set, `bev-frame` may include top-level `alignmentDebug`, and each footpoint may include `rawX`, `rawY`, `smoothed`, and `alignmentDebug` with per-candidate image anchors, ray-floor projections, optional static floorplan/MapAnything snapshot samples, snapshot ids, grid cells, and selected-coordinate bounds. These fields are diagnostic-only and are not used to place live tracked people.
 
 - Optional JPEG binary: **Retired**. The framed `bev:<camera>` binary path is no longer produced (meta-only mode is the supported baseline per design decisions and Baselines.md). The general binary coalescer in the WebSocket server is retained for potential future use (e.g., binary depth).
 - In world mode (`frame_mode=world`), BEV footpoints remain producer-owned scene coordinates and should be treated as the canonical `track.world` head points emitted by the backend. The BEV renderer must not apply a second world-space low-pass filter to those points.
@@ -290,17 +291,32 @@ Handled in `websocket_server.py`:
 - `bev-config` / `bev-overlay` → update BEV renderer config; ack via `bev-config-ack` or `bev-overlay-update`.
 - `ma_heatmap_ready` → notification only.
 - Calibration RPCs: `pixel_to_world` → `pixel_to_world_response`; `set_extrinsics`, `set_align`, `solve_pnp` → corresponding `*_result` messages.
-- Depth/MapAnything: `get_ma_depth` → `ma_depth_response`.
+- Depth/MapAnything: `get_ma_depth` / `get_ma_depth_cache` → `ma_depth_response`.
 - Floorplan: `get_floorplan` → `floorplan_response`.
 - Auto-calibration: `auto_calibrate_pose` → `auto_calibrate_result`.
 - Heartbeat: `ping` → `pong`.
 
 ### ma_depth_response
 
+Request:
+
+```json
+{
+  "type": "get_ma_depth",
+  "camera": "<camera-id>",
+  "request_id": "<optional>",
+  "ts_max_us": <optional int>,
+  "cache_only": <optional bool>
+}
+```
+
+- `get_ma_depth_cache` uses the same request shape and response shape, but forces `cache_only=true`.
+
 ```json
 {
   "type": "ma_depth_response",
   "camera": "<camera-id>",
+  "cache_only": <bool>,
   "served_from_cache": <bool>,
   "ts_us": <int>,
   "request_id": "<optional>",
@@ -321,6 +337,8 @@ Handled in `websocket_server.py`:
 }
 ```
 
+- `cache_only=true` and `get_ma_depth_cache` return only an existing valid cached MapAnything payload and must not enable the MapAnything depth gate. If no valid cached payload is available, the response has `ok:false`, `error:"no_cached_depth"`, and no `payload`.
+- Without `cache_only`, a cache miss may enable the on-demand MapAnything branch according to runtime gating.
 - Normals are attached when `NOESIS_MAPANYTHING_NORMALS_ENABLE` is truthy; errors are reported via `normals_error` while keeping the depth payload.
 - `ma_depth_response` remains the MapAnything full-frame RPC contract. The always-on baseline DAv2 tracking lane does not publish a second full-frame WebSocket depth stream; it influences `track.world` through `NOESIS.OBJECT_DEPTH` and the fused backend estimator instead.
 

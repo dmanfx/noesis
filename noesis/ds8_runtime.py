@@ -8,6 +8,7 @@ import ctypes
 import inspect
 import json
 import logging
+import math
 import os
 import re
 import subprocess
@@ -54,6 +55,11 @@ from noesis.depth_tracking_materialization import (
     ensure_native_object_depth_extension as _ensure_native_object_depth_extension,
     materialize_depth_tracking_assets as _materialize_depth_tracking_assets,
 )
+from noesis.deimv2_wholebody49_assets import (
+    WHOLEBODY49_SIZES as _WHOLEBODY49_SIZES,
+    materialize_wholebody49_configs as _shared_materialize_wholebody49_configs,
+    resolve_wholebody49_assets as _shared_resolve_wholebody49_assets,
+)
 from noesis.pipelines import ds8_pipeline, hooks
 from noesis.metadata.intrinsics import CameraConfigLoader
 from noesis.telemetry.publishers import DepthTelemetryPublisher, TrackingTelemetryPublisher, bind_occupancy_publisher
@@ -91,14 +97,15 @@ except Exception:
     _PYSERVICEMAKER_MSGS = False
 
 
-_PGIE_PROFILES = ("yolo11_seg", "yolo11", "yolo26_seg", "yolo26", "rfdetr_seg", "rfdetr")
-_SIZED_PGIE_PROFILES = ("yolo26_seg", "yolo26", "rfdetr_seg", "rfdetr")
+_PGIE_PROFILES = ("yolo11_seg", "yolo11", "yolo26_seg", "yolo26", "rfdetr_seg", "rfdetr", "wholebody49")
+_SIZED_PGIE_PROFILES = ("yolo26_seg", "yolo26", "rfdetr_seg", "rfdetr", "wholebody49")
 _YOLO26_DETECT_SIZES = ("n", "s", "m", "l", "x")
 _YOLO26_SEG_SIZES = ("n", "s", "m")
 _RFDETR_SIZES = ("n", "s", "m")
 _YOLO26_DETECT_SIZE_HELP = "/".join(_YOLO26_DETECT_SIZES)
 _YOLO26_SEG_SIZE_HELP = "/".join(_YOLO26_SEG_SIZES)
 _RFDETR_SIZE_HELP = "/".join(_RFDETR_SIZES)
+_WHOLEBODY49_SIZE_HELP = "/".join(_WHOLEBODY49_SIZES)
 _ENV_TRUE = ("1", "true", "yes", "y", "on")
 _TRACKING_MODES = ("baseline", "v3dt")
 _RFDETR_TRT_PLUGIN_LOADED = False
@@ -491,19 +498,29 @@ def _resolve_yolo_detect_assets(profile: str, size: Optional[str]) -> Dict[str, 
         raise SystemExit(f"[FATAL] Unsupported YOLO detection profile: {profile}")
 
     excluded = ("seg", "pose")
-    onnx_path = _newest_model_artifact(f"{family_prefix}*.onnx", excluded_tokens=excluded)
-    if onnx_path is None:
-        observed = _family_artifact_summary(f"{family_prefix}*")
-        raise SystemExit(
-            f"[FATAL] {label} detection ONNX not found under {REPO_ROOT / 'models'}.\n"
-            f"Looked for {family_prefix}*.onnx excluding seg/pose variants.\n"
-            f"Current matching artifacts:\n{observed}\n"
-            f"Use {profile_norm}_seg for the current segmentation assets, or add a detector ONNX/engine pair."
-        )
+    if profile_norm == "yolo26":
+        onnx_path = (REPO_ROOT / "models" / f"yolo26{size_norm}_dynamic_b1-3.onnx").resolve()
+        engine_path = (REPO_ROOT / "models" / "engines" / f"yolo26{size_norm}_dynamic_b1-3_fp16.engine").resolve()
+        missing = [str(path) for path in (onnx_path, engine_path) if not path.exists()]
+        if missing:
+            raise SystemExit(
+                f"[FATAL] YOLO26 {size_norm} detection requires dynamic-batch-safe assets.\n"
+                f"Missing:\n  - " + "\n  - ".join(missing)
+            )
+    else:
+        onnx_path = _newest_model_artifact(f"{family_prefix}*.onnx", excluded_tokens=excluded)
+        if onnx_path is None:
+            observed = _family_artifact_summary(f"{family_prefix}*")
+            raise SystemExit(
+                f"[FATAL] {label} detection ONNX not found under {REPO_ROOT / 'models'}.\n"
+                f"Looked for {family_prefix}*.onnx excluding seg/pose variants.\n"
+                f"Current matching artifacts:\n{observed}\n"
+                f"Use {profile_norm}_seg for the current segmentation assets, or add a detector ONNX/engine pair."
+            )
 
-    engine_path = _newest_model_artifact(f"{family_prefix}*.engine", excluded_tokens=excluded)
-    if engine_path is None:
-        engine_path = (REPO_ROOT / "models" / "engines" / f"{onnx_path.stem}_b3_fp16.engine").resolve()
+        engine_path = _newest_model_artifact(f"{family_prefix}*.engine", excluded_tokens=excluded)
+        if engine_path is None:
+            engine_path = (REPO_ROOT / "models" / "engines" / f"{onnx_path.stem}_b3_fp16.engine").resolve()
 
     size_suffix = f"_{size_norm}" if size_norm else ""
     return {
@@ -518,7 +535,12 @@ def _resolve_yolo_detect_assets(profile: str, size: Optional[str]) -> Dict[str, 
     }
 
 
-def _materialize_yolo_detect_preproc_ini(assets: Dict[str, Any], logger: logging.Logger) -> Path:
+def _materialize_yolo_detect_preproc_ini(
+    assets: Dict[str, Any],
+    logger: logging.Logger,
+    *,
+    src_ids: Optional[Tuple[int, ...]] = None,
+) -> Path:
     template_path = assets["preprocess_template"]
     if not template_path.exists():
         raise SystemExit(f"[FATAL] YOLO detection preprocess template missing: {template_path}")
@@ -530,6 +552,8 @@ def _materialize_yolo_detect_preproc_ini(assets: Dict[str, Any], logger: logging
         "processing-height": "640",
         "tensor-name": str(assets["tensor_name"]),
     }
+    if src_ids:
+        replacements["src-ids"] = ";".join(str(int(src_id)) for src_id in src_ids)
     for key, value in replacements.items():
         text, count = re.subn(rf"(?m)^{re.escape(key)}=.*$", f"{key}={value}", text, count=1)
         if count != 1:
@@ -547,7 +571,13 @@ def _materialize_yolo_detect_preproc_ini(assets: Dict[str, Any], logger: logging
     return out_path
 
 
-def _materialize_yolo_detect_pgie_ini(profile: str, size: Optional[str], logger: logging.Logger) -> Dict[str, Any]:
+def _materialize_yolo_detect_pgie_ini(
+    profile: str,
+    size: Optional[str],
+    logger: logging.Logger,
+    *,
+    src_ids: Optional[Tuple[int, ...]] = None,
+) -> Dict[str, Any]:
     assets = _resolve_yolo_detect_assets(profile, size)
     template_path = assets["template"]
     if not template_path.exists():
@@ -573,7 +603,7 @@ def _materialize_yolo_detect_pgie_ini(profile: str, size: Optional[str], logger:
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_text(text, encoding="utf-8")
     logger.info("%s detector PGIE config materialized: %s", assets["label"], out_path)
-    preproc_path = _materialize_yolo_detect_preproc_ini(assets, logger)
+    preproc_path = _materialize_yolo_detect_preproc_ini(assets, logger, src_ids=src_ids)
     return {**assets, "pgie_config": out_path, "preprocess_config": preproc_path}
 
 
@@ -681,6 +711,27 @@ def _materialize_yolo26_configs(size: str, src_ids: Tuple[int, ...], logger: log
         raise SystemExit(f"[FATAL] {exc}") from exc
 
 
+def _resolve_wholebody49_assets(size: str) -> Dict[str, Any]:
+    try:
+        return dict(_shared_resolve_wholebody49_assets(size))
+    except ValueError as exc:
+        raise SystemExit(f"[FATAL] {exc}") from exc
+
+
+def _materialize_wholebody49_configs(size: str, src_ids: Tuple[int, ...], logger: logging.Logger) -> Dict[str, Any]:
+    try:
+        return dict(
+            _shared_materialize_wholebody49_configs(
+                size=size,
+                batch_size=3,
+                src_ids=src_ids,
+                logger=logger,
+            )
+        )
+    except (FileNotFoundError, ValueError) as exc:
+        raise SystemExit(f"[FATAL] {exc}") from exc
+
+
 def _load_rfdetr_trt_plugin_library(yaml_path: Path, logger: logging.Logger) -> None:
     global _RFDETR_TRT_PLUGIN_LOADED
     if _RFDETR_TRT_PLUGIN_LOADED:
@@ -727,7 +778,7 @@ def _load_rfdetr_trt_plugin_library(yaml_path: Path, logger: logging.Logger) -> 
 
 
 def _preflight_pgie_profile(profile: str, pipeline_cfg: Dict[str, Any], yaml_path: Path, logger: logging.Logger) -> None:
-    if profile not in ("yolo11", "yolo26", "rfdetr", "rfdetr_seg", "yolo26_seg"):
+    if profile not in ("yolo11", "yolo26", "rfdetr", "rfdetr_seg", "yolo26_seg", "wholebody49"):
         return
 
     if profile in ("yolo11", "yolo26"):
@@ -973,6 +1024,92 @@ def _preflight_pgie_profile(profile: str, pipeline_cfg: Dict[str, Any], yaml_pat
         if batch_size and batch_size != "3":
             raise SystemExit(f"[FATAL] YOLO26 PGIE batch-size must be 3 for b3 engines (got {batch_size})")
 
+    if profile == "wholebody49":
+        preprocess_cfg = pipeline_cfg.get("preprocess") if isinstance(pipeline_cfg, dict) else None
+        preprocess_path_raw = (preprocess_cfg or {}).get("config-file") if isinstance(preprocess_cfg, dict) else None
+        preprocess_path = _resolve_pipeline_cfg_path(yaml_path, str(preprocess_path_raw or ""))
+        if not preprocess_path.exists():
+            raise SystemExit(f"[FATAL] Wholebody49 profile requires preprocess config-file at: {preprocess_path}")
+
+        preproc_parser = configparser.ConfigParser()
+        preproc_parser.read(preprocess_path, encoding="utf-8")
+        preproc_props = preproc_parser["property"] if preproc_parser.has_section("property") else {}
+        tensor_name = str(preproc_props.get("tensor-name", "") or "").strip()
+        if tensor_name != "images":
+            raise SystemExit(
+                f"[FATAL] Wholebody49 preprocess tensor-name must be 'images' "
+                f"(got {tensor_name!r} in {preprocess_path})"
+            )
+
+        models_cfg = pipeline_cfg.get("models") if isinstance(pipeline_cfg, dict) else None
+        pgie_cfg = (models_cfg or {}).get("pgie") if isinstance(models_cfg, dict) else None
+        pgie_ini_raw = (pgie_cfg or {}).get("config-file-path") if isinstance(pgie_cfg, dict) else None
+        pgie_ini = _resolve_pipeline_cfg_path(yaml_path, str(pgie_ini_raw or ""))
+        if not pgie_ini.exists():
+            raise SystemExit(f"[FATAL] Wholebody49 profile requires PGIE config-file-path at: {pgie_ini}")
+
+        engine_raw = (pgie_cfg or {}).get("engine") if isinstance(pgie_cfg, dict) else None
+        engine_path = _resolve_pipeline_cfg_path(yaml_path, str(engine_raw or ""))
+        if not str(engine_raw or "").strip():
+            raise SystemExit("[FATAL] Wholebody49 profile requires models.pgie.engine to be set")
+        if not engine_path.exists():
+            raise SystemExit(f"[FATAL] Wholebody49 PGIE engine missing: {engine_path}")
+
+        parser = configparser.ConfigParser()
+        parser.read(pgie_ini, encoding="utf-8")
+        props = parser["property"] if parser.has_section("property") else {}
+
+        lib_raw = str(props.get("custom-lib-path", "") or "").strip()
+        lib_path = _resolve_pipeline_cfg_path(yaml_path, lib_raw)
+        if not lib_raw or not lib_path.exists():
+            raise SystemExit(
+                "[FATAL] Wholebody49 PGIE custom parser library missing.\n"
+                f"PGIE INI: {pgie_ini}\n"
+                f"custom-lib-path: {lib_raw or '<unset>'}\n"
+                f"resolved: {lib_path}\n"
+                "Build it with: make -C pipelines/nvdsinfer_deimv2_wholebody49\n"
+            )
+
+        labels_raw = str(props.get("labelfile-path", "") or "").strip()
+        labels_path = _resolve_pipeline_cfg_path(yaml_path, labels_raw)
+        if not labels_raw or not labels_path.exists():
+            raise SystemExit(
+                "[FATAL] Wholebody49 label file missing.\n"
+                f"PGIE INI: {pgie_ini}\n"
+                f"labelfile-path: {labels_raw or '<unset>'}\n"
+                f"resolved: {labels_path}\n"
+            )
+
+        gie_uid = str(props.get("gie-unique-id", "") or "").strip()
+        if gie_uid and gie_uid != "1":
+            raise SystemExit(f"[FATAL] Wholebody49 PGIE gie-unique-id must remain 1 (got {gie_uid})")
+
+        batch_size = str(props.get("batch-size", "") or "").strip()
+        if batch_size and batch_size != "3":
+            raise SystemExit(f"[FATAL] Wholebody49 PGIE batch-size must be 3 for b3 engines (got {batch_size})")
+
+        network_type = str(props.get("network-type", "") or "").strip()
+        if network_type not in ("0", "3"):
+            raise SystemExit(f"[FATAL] Wholebody49 PGIE network-type must be 0 or 3 (got {network_type})")
+        if network_type == "3":
+            parse_func = str(props.get("parse-bbox-instance-mask-func-name", "") or "").strip()
+            if parse_func != "NvDsInferParseDeimv2Wholebody49":
+                raise SystemExit(
+                    "[FATAL] Wholebody49 mask PGIE parser must be "
+                    f"NvDsInferParseDeimv2Wholebody49 (got {parse_func or '<unset>'})"
+                )
+            if str(props.get("output-instance-mask", "") or "").strip() != "1":
+                raise SystemExit("[FATAL] Wholebody49 mask PGIE requires output-instance-mask=1")
+        else:
+            parse_func = str(props.get("parse-bbox-func-name", "") or "").strip()
+            if parse_func != "NvDsInferParseDeimv2Wholebody49Boxes":
+                raise SystemExit(
+                    "[FATAL] Wholebody49 boxes PGIE parser must be "
+                    f"NvDsInferParseDeimv2Wholebody49Boxes (got {parse_func or '<unset>'})"
+                )
+
+        logger.info("Wholebody49 PGIE engine found: %s", engine_path)
+
 
 def _materialize_effective_pipeline_yaml(
     base_yaml_path: Path,
@@ -994,7 +1131,10 @@ def _materialize_effective_pipeline_yaml(
         if profile == "yolo26" and not pgie_size:
             raise SystemExit(f"[FATAL] YOLO26 detection profile requires --size ({_YOLO26_DETECT_SIZE_HELP})")
         size_norm = str(pgie_size).strip().lower() if profile == "yolo26" else None
-        assets = _materialize_yolo_detect_pgie_ini(profile, size_norm, logger)
+        sources_cfg = base_cfg.get("sources") if isinstance(base_cfg, dict) else None
+        source_count = len(sources_cfg) if isinstance(sources_cfg, list) else 0
+        src_ids = tuple(range(source_count)) or (0, 1, 2)
+        assets = _materialize_yolo_detect_pgie_ini(profile, size_norm, logger, src_ids=src_ids)
         overlay = {
             "preprocess": {"config-file": str(assets["preprocess_config"])},
             "models": {
@@ -1055,6 +1195,24 @@ def _materialize_effective_pipeline_yaml(
             },
         }
         logger.info("YOLO26 PGIE size: %s", size_norm)
+    if profile == "wholebody49":
+        if not pgie_size:
+            raise SystemExit(f"[FATAL] Wholebody49 profile requires --size ({_WHOLEBODY49_SIZE_HELP})")
+        size_norm = str(pgie_size).strip().lower()
+        sources_cfg = base_cfg.get("sources") if isinstance(base_cfg, dict) else None
+        source_count = len(sources_cfg) if isinstance(sources_cfg, list) else 0
+        src_ids = tuple(range(source_count)) or (0, 1, 2)
+        assets = _materialize_wholebody49_configs(size_norm, src_ids, logger)
+        overlay = {
+            "preprocess": {"config-file": str(assets["preprocess_config"])},
+            "models": {
+                "pgie": {
+                    "config-file-path": str(assets["pgie_config"]),
+                    "engine": str(assets["engine"]),
+                }
+            },
+        }
+        logger.info("Wholebody49 PGIE size: %s (%s)", size_norm, assets.get("mode"))
 
     if str(tracking_mode).strip().lower() == "baseline":
         try:
@@ -1211,7 +1369,8 @@ def _parse_args() -> argparse.Namespace:
         default=None,
         help=(
             "Model size. YOLO26 detection supports n/s/m/l/x; "
-            "YOLO26 segmentation and RF-DETR profiles currently support n/s/m. Default: m."
+            "YOLO26 segmentation and RF-DETR profiles currently support n/s/m; "
+            "Wholebody49 currently supports s/x. Default: m, except Wholebody49 defaults to s."
         ),
     )
     parser.add_argument(
@@ -1613,7 +1772,7 @@ def _build_depth_registration_profile_fingerprints(
     models_cfg = pipeline_cfg.get("models") if isinstance(pipeline_cfg, Mapping) else {}
     depth_cfg = (models_cfg or {}).get("depth_tracking") if isinstance(models_cfg, Mapping) else {}
     ma_cfg = (models_cfg or {}).get("mapanything") if isinstance(models_cfg, Mapping) else {}
-    repo_root = pipeline_path.parent.parent.resolve()
+    repo_root = REPO_ROOT.resolve()
     depth_profile = _depth_registration_model_profile_fingerprint(
         depth_cfg if isinstance(depth_cfg, Mapping) else {},
         repo_root=repo_root,
@@ -3493,7 +3652,8 @@ def main() -> int:
         sized = ", ".join(_SIZED_PGIE_PROFILES)
         raise SystemExit(f"[FATAL] --size is only valid with --pgie-profile in: {sized}")
     if str(args.pgie_profile) in _SIZED_PGIE_PROFILES:
-        pgie_size = (args.size or "m").strip().lower()
+        default_size = "s" if str(args.pgie_profile) == "wholebody49" else "m"
+        pgie_size = (args.size or default_size).strip().lower()
 
     # Install SIGINT/SIGTERM handling early (before DS/GStreamer init), because
     # some backends install their own handlers/masks which can make `timeout(1)`
@@ -4137,7 +4297,7 @@ def main() -> int:
                 return _response(True, payload=cached, ts_us=cached_ts, error=str(exc) or "depth_enable_failed")
             return _response(False, error=str(exc) or "depth_enable_failed")
 
-        wait_timeout_s = min(3.0, float(enable_seconds) + 1.0)
+        wait_timeout_s = min(12.0, max(float(enable_seconds) + 1.0, 10.0))
         deadline = time.time() + wait_timeout_s
         while time.time() < deadline:
             for key in keys_to_check:
@@ -4171,6 +4331,117 @@ def main() -> int:
         except Exception:
             payload_ts = 0
         return _response(True, payload=payload, ts_us=payload_ts, error="timeout_waiting_for_depth")
+
+    _bev_active_floorplan_lock = threading.Lock()
+    _bev_active_floorplan_by_camera: Dict[str, Dict[str, Any]] = {}
+
+    def _record_active_floorplan_payload(camera_key: str, payload: Mapping[str, Any]) -> None:
+        if storage_manager is None or not isinstance(payload, Mapping):
+            return
+        if payload.get("error"):
+            return
+        snapshot_ts_raw = payload.get("snapshot_ts", payload.get("ts"))
+        try:
+            snapshot_ts = int(snapshot_ts_raw)
+        except Exception:
+            return
+        if snapshot_ts <= 0:
+            return
+        payload_camera = str(payload.get("camera_id") or camera_key or "").strip()
+        if not payload_camera:
+            return
+        path = None
+        try:
+            path = storage_manager.latest_entry(payload_camera, snapshot_ts)
+        except Exception:
+            path = None
+        record = {
+            "camera_id": payload_camera,
+            "snapshot_ts_us": int(snapshot_ts),
+            "floorplan_ts_us": int(payload.get("ts", 0) or 0),
+            "served_from_cache": bool(payload.get("served_from_cache", False)),
+            "grid_res_m": float(payload.get("grid_res_m", 0.0) or 0.0),
+            "max_extent_m": float(payload.get("max_extent_m", 0.0) or 0.0),
+            "path": str(path) if path is not None else None,
+        }
+        alignment = payload.get("ray_to_floorplan_alignment")
+        if isinstance(alignment, Mapping):
+            record["ray_to_floorplan_alignment"] = dict(alignment)
+        for layer_name in (
+            "walkable",
+            "height",
+            "height_agl",
+            "obstacle_height",
+            "distance",
+            "density",
+        ):
+            layer = payload.get(layer_name)
+            if not isinstance(layer, Mapping):
+                continue
+            raw_shape = layer.get("grid_shape", layer.get("shape"))
+            if not (isinstance(raw_shape, (list, tuple)) and len(raw_shape) >= 2):
+                continue
+            try:
+                rows = int(raw_shape[0])
+                cols = int(raw_shape[1])
+            except Exception:
+                continue
+            if rows > 0 and cols > 0:
+                record["grid_shape"] = [int(rows), int(cols)]
+                record["grid_shape_source"] = str(layer_name)
+                break
+        bounds = payload.get("bounds")
+        if isinstance(bounds, Mapping):
+            try:
+                min_x = float(bounds.get("min_x"))
+                max_x = float(bounds.get("max_x"))
+                min_z = float(bounds.get("min_z"))
+                max_z = float(bounds.get("max_z"))
+                if (
+                    math.isfinite(min_x)
+                    and math.isfinite(max_x)
+                    and math.isfinite(min_z)
+                    and math.isfinite(max_z)
+                    and max_x > min_x
+                    and max_z > min_z
+                ):
+                    record["bounds"] = {
+                        "min_x": float(min_x),
+                        "max_x": float(max_x),
+                        "min_z": float(min_z),
+                        "max_z": float(max_z),
+                    }
+                    record["frame"] = str(payload.get("frame") or "")
+                    record["units"] = str(payload.get("units") or "")
+            except Exception:
+                pass
+        with _bev_active_floorplan_lock:
+            _bev_active_floorplan_by_camera[payload_camera] = dict(record)
+            if camera_key and camera_key != payload_camera:
+                _bev_active_floorplan_by_camera[str(camera_key)] = dict(record)
+
+    def _bev_active_floorplan_bounds_provider(camera_key: str) -> Optional[Mapping[str, Any]]:
+        key = str(camera_key or "").strip()
+        if not key:
+            return None
+        with _bev_active_floorplan_lock:
+            record = dict(_bev_active_floorplan_by_camera.get(key) or {})
+        bounds = record.get("bounds")
+        if isinstance(bounds, Mapping):
+            return {
+                "bounds": dict(bounds),
+                "frame": record.get("frame"),
+                "units": record.get("units"),
+                "grid_shape": list(record.get("grid_shape") or []),
+                "grid_shape_source": record.get("grid_shape_source"),
+                "grid_res_m": record.get("grid_res_m"),
+                "snapshot_ts_us": record.get("snapshot_ts_us"),
+                "floorplan_ts_us": record.get("floorplan_ts_us"),
+                "path": record.get("path"),
+                "ray_to_floorplan_alignment": record.get("ray_to_floorplan_alignment"),
+                "source": "active_floorplan",
+            }
+        return None
 
     def _ds8_floorplan_provider(
         camera: Optional[str] = None,
@@ -4248,6 +4519,7 @@ def main() -> int:
             )
             return {"error": str(exc) or "floorplan_failed", "camera_id": camera_id}
         if not _needs_live_depth_burst(payload):
+            _record_active_floorplan_payload(camera_id, payload)
             return payload
 
         depth_branch_present = bool(pipeline.depth_gate_attach and pipeline.depth_gate_attach in pipeline.components)
@@ -4340,6 +4612,7 @@ def main() -> int:
             refreshed["capture_event_fusion_ok"] = True
         if refreshed.get("error") and not fresh_depth:
             refreshed.setdefault("details", "timeout_waiting_for_depth")
+        _record_active_floorplan_payload(camera_id, refreshed)
         return refreshed
 
     pipeline = ds8_pipeline.build_pipeline(pipeline_path)
@@ -4849,11 +5122,149 @@ def main() -> int:
         return payload
 
     setattr(pipeline, "ws_server", ws_server)
+    _bev_depth_sample_lock = threading.Lock()
+    _bev_depth_sample_cache: Dict[str, Dict[str, Any]] = {}
+    _camera_id_to_source_id = {str(name): int(idx) for idx, name in camera_labels.items()}
+
+    def _bev_floorplan_depth_sampler(
+        camera_id: str,
+        u: float,
+        v: float,
+        timestamp_us: int,
+    ) -> Optional[Mapping[str, Any]]:
+        if storage_manager is None:
+            return None
+        camera_key = str(camera_id or "").strip()
+        if not camera_key:
+            return None
+        active_floorplan: Dict[str, Any] = {}
+        with _bev_active_floorplan_lock:
+            active_floorplan = dict(_bev_active_floorplan_by_camera.get(camera_key) or {})
+        preferred_ts: Optional[int] = None
+        try:
+            preferred_ts = int(active_floorplan.get("snapshot_ts_us")) if active_floorplan else None
+        except Exception:
+            preferred_ts = None
+        try:
+            path = storage_manager.latest_entry(camera_key, preferred_ts)
+        except Exception:
+            path = None
+        if path is None and active_floorplan.get("camera_id") and active_floorplan.get("camera_id") != camera_key:
+            try:
+                path = storage_manager.latest_entry(str(active_floorplan.get("camera_id")), preferred_ts)
+            except Exception:
+                path = None
+        snapshot_source = "active_floorplan_snapshot"
+        if path is None:
+            try:
+                path = storage_manager.latest_entry(camera_key, None)
+                snapshot_source = "latest_no_active_floorplan_snapshot"
+            except Exception:
+                path = None
+        if path is None:
+            return None
+
+        with _bev_depth_sample_lock:
+            cached = _bev_depth_sample_cache.get(camera_key)
+            if not cached or cached.get("path") != path:
+                datasets = storage_manager.load_datasets(path)
+                if not datasets:
+                    return None
+                depth = np.asarray(datasets.get("depth"), dtype=np.float32)
+                conf = np.asarray(datasets.get("conf"), dtype=np.float32)
+                mask = np.asarray(datasets.get("mask"), dtype=np.uint8)
+                if depth.ndim != 2 or conf.shape != depth.shape or mask.shape != depth.shape:
+                    return None
+                cached = {
+                    "path": path,
+                    "ts_us": int(path.stem) if str(path.stem).isdigit() else 0,
+                    "depth": depth,
+                    "conf": conf,
+                    "mask": mask,
+                }
+                _bev_depth_sample_cache[camera_key] = cached
+                if len(_bev_depth_sample_cache) > max(3, len(camera_labels) + 1):
+                    for stale_key in list(_bev_depth_sample_cache.keys()):
+                        if stale_key != camera_key:
+                            _bev_depth_sample_cache.pop(stale_key, None)
+                            break
+
+            depth = np.asarray(cached.get("depth"), dtype=np.float32)
+            conf = np.asarray(cached.get("conf"), dtype=np.float32)
+            mask = np.asarray(cached.get("mask"), dtype=np.uint8)
+            snapshot_ts_us = int(cached.get("ts_us") or 0)
+
+        h, w = depth.shape
+        if h <= 0 or w <= 0:
+            return None
+        image_w = w
+        image_h = h
+        try:
+            source_id = _camera_id_to_source_id.get(camera_key)
+            if source_id is not None:
+                snap = calibration_provider.snapshot(int(source_id), camera_key)
+                size = getattr(snap, "image_size", None) if snap is not None else None
+                if isinstance(size, (list, tuple)) and len(size) >= 2:
+                    image_w = int(size[0])
+                    image_h = int(size[1])
+        except Exception:
+            image_w = w
+            image_h = h
+        try:
+            sx = float(w - 1) / max(1.0, float(image_w - 1))
+            sy = float(h - 1) / max(1.0, float(image_h - 1))
+            col = int(round(float(u) * sx))
+            row = int(round(float(v) * sy))
+        except Exception:
+            return None
+        col = max(0, min(w - 1, col))
+        row = max(0, min(h - 1, row))
+
+        min_conf = float(getattr(storage_manager, "min_conf", 0.1) or 0.1)
+        for radius in (4, 8, 14):
+            r0 = max(0, row - radius)
+            r1 = min(h, row + radius + 1)
+            c0 = max(0, col - radius)
+            c1 = min(w, col + radius + 1)
+            d_win = depth[r0:r1, c0:c1]
+            c_win = conf[r0:r1, c0:c1]
+            m_win = mask[r0:r1, c0:c1]
+            valid = np.isfinite(d_win) & (d_win > 0.05) & (d_win < 50.0)
+            valid &= np.isfinite(c_win) & (c_win >= min_conf)
+            if not np.any(valid):
+                continue
+            values = np.asarray(d_win[valid], dtype=np.float32)
+            if values.size <= 0:
+                continue
+            masked_support = int(np.count_nonzero(np.asarray(m_win[valid], dtype=np.uint8) > 0))
+            return {
+                "depth_m": float(np.median(values)),
+                "camera_id": camera_key,
+                "snapshot_ts_us": int(snapshot_ts_us),
+                "snapshot_path": str(cached.get("path") or path),
+                "snapshot_source": str(snapshot_source),
+                "active_floorplan_snapshot_ts_us": int(preferred_ts or 0),
+                "active_floorplan_path": str(active_floorplan.get("path") or ""),
+                "snapshot_matches_active_floorplan": bool(preferred_ts and int(snapshot_ts_us) == int(preferred_ts)),
+                "request_ts_us": int(timestamp_us or 0),
+                "pixel": [int(col), int(row)],
+                "radius_px": int(radius),
+                "support_count": int(values.size),
+                "masked_support_count": masked_support,
+                "confidence_min": float(min_conf),
+            }
+        return None
+
+    bev_alignment_debug_enabled = str(
+        os.environ.get("NOESIS_BEV_ALIGNMENT_DEBUG", os.environ.get("NOESIS_BEV_DEBUG", "0"))
+    ).strip().lower() in ("1", "true", "yes", "y", "on")
     bev_renderer = BevRenderer(
         ws_server,
         trails_cfg=trails_cfg,
         smoothing_cfg=bev_smoothing_cfg,
         frame=str(bev_frame),
+        depth_sampler=_bev_floorplan_depth_sampler if bev_alignment_debug_enabled else None,
+        floorplan_bounds_provider=_bev_active_floorplan_bounds_provider,
         # jpeg_* retired — meta-only mode (see BevRenderer and design decisions)
     )
     ws_server.bev_config_callback = lambda cam_id, cfg: bev_renderer.update_config(cam_id, cfg)

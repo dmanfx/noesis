@@ -36,7 +36,7 @@ def _sizes(raw: str) -> list[str]:
     return sizes
 
 
-def _export_onnx(size: str, *, batch: int, opset: int, simplify: bool, device: str) -> Path:
+def _export_onnx(size: str, *, batch: int, opset: int, simplify: bool, device: str, dynamic: bool) -> Path:
     from ultralytics import YOLO
 
     weights = REPO_ROOT / "models" / f"yolo26{size}.pt"
@@ -53,37 +53,54 @@ def _export_onnx(size: str, *, batch: int, opset: int, simplify: bool, device: s
         format="onnx",
         imgsz=640,
         batch=int(batch),
-        dynamic=False,
+        dynamic=bool(dynamic),
         simplify=bool(simplify),
         opset=int(opset),
         nms=False,
         device=device,
     )
     exported_path = Path(exported).resolve()
-    target = (REPO_ROOT / "models" / f"yolo26{size}.onnx").resolve()
+    if dynamic:
+        target = (REPO_ROOT / "models" / f"yolo26{size}_dynamic_b1-{int(batch)}.onnx").resolve()
+    else:
+        target = (REPO_ROOT / "models" / f"yolo26{size}.onnx").resolve()
     if exported_path != target:
         target.parent.mkdir(parents=True, exist_ok=True)
         exported_path.replace(target)
     return target
 
 
-def _build_engine(onnx_path: Path, engine_path: Path) -> Path:
+def _build_engine(
+    onnx_path: Path,
+    engine_path: Path,
+    *,
+    dynamic: bool,
+    batch: int,
+    builder_optimization_level: int,
+) -> Path:
     if engine_path.exists() and engine_path.stat().st_size > 0:
         return engine_path
     engine_path.parent.mkdir(parents=True, exist_ok=True)
     if engine_path.exists():
         engine_path.unlink()
-    _run(
-        [
-            _trtexec(),
-            f"--onnx={onnx_path}",
-            "--fp16",
-            "--memPoolSize=workspace:4096",
-            f"--saveEngine={engine_path}",
-            "--skipInference",
-        ],
-        clean_library_path=True,
-    )
+    cmd = [
+        _trtexec(),
+        f"--onnx={onnx_path}",
+        "--fp16",
+        "--memPoolSize=workspace:4096",
+        f"--saveEngine={engine_path}",
+        "--skipInference",
+    ]
+    if dynamic:
+        cmd.extend(
+            [
+                "--minShapes=images:1x3x640x640",
+                f"--optShapes=images:{int(batch)}x3x640x640",
+                f"--maxShapes=images:{int(batch)}x3x640x640",
+                f"--builderOptimizationLevel={int(builder_optimization_level)}",
+            ]
+        )
+    _run(cmd, clean_library_path=True)
     if not engine_path.exists() or engine_path.stat().st_size <= 0:
         raise RuntimeError(f"TensorRT engine was not created: {engine_path}")
     return engine_path
@@ -91,11 +108,18 @@ def _build_engine(onnx_path: Path, engine_path: Path) -> Path:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--sizes", default="n,s,m", help="Comma-separated YOLO26 sizes to build. Supported: n,s,m,l,x. Default: n,s,m")
-    parser.add_argument("--batch", type=int, default=3, help="Static export batch size. Default: 3")
+    parser.add_argument("--sizes", default="n,s,m,l,x", help="Comma-separated YOLO26 sizes to build. Supported: n,s,m,l,x. Default: n,s,m,l,x")
+    parser.add_argument("--batch", type=int, default=3, help="Export/build max batch size. Default: 3")
     parser.add_argument("--opset", type=int, default=18, help="ONNX opset. Default: 18")
     parser.add_argument("--device", default="cpu", help="Ultralytics export device. Default: cpu")
     parser.add_argument("--simplify", action="store_true", help="Enable ONNX simplification during export.")
+    parser.add_argument("--static", action="store_true", help="Build legacy static-batch ONNX/engine names instead of dynamic-batch-safe assets.")
+    parser.add_argument(
+        "--builder-optimization-level",
+        type=int,
+        default=0,
+        help="TensorRT builder optimization level for dynamic engines. Default: 0.",
+    )
     parser.add_argument("--skip-export", action="store_true", help="Reuse existing ONNX files.")
     parser.add_argument("--skip-engine", action="store_true", help="Do not build TensorRT engines.")
     return parser.parse_args()
@@ -104,9 +128,13 @@ def parse_args() -> argparse.Namespace:
 def main() -> int:
     args = parse_args()
     sizes = _sizes(args.sizes)
+    dynamic = not bool(args.static)
     outputs: list[tuple[str, Path, Path]] = []
     for size in sizes:
-        onnx_path = (REPO_ROOT / "models" / f"yolo26{size}.onnx").resolve()
+        if dynamic:
+            onnx_path = (REPO_ROOT / "models" / f"yolo26{size}_dynamic_b1-{int(args.batch)}.onnx").resolve()
+        else:
+            onnx_path = (REPO_ROOT / "models" / f"yolo26{size}.onnx").resolve()
         if not args.skip_export:
             onnx_path = _export_onnx(
                 size,
@@ -114,13 +142,23 @@ def main() -> int:
                 opset=int(args.opset),
                 simplify=bool(args.simplify),
                 device=str(args.device),
+                dynamic=dynamic,
             )
         elif not onnx_path.exists():
             raise FileNotFoundError(f"Missing ONNX for --skip-export: {onnx_path}")
 
-        engine_path = (REPO_ROOT / "models" / "engines" / f"yolo26{size}_b{int(args.batch)}_fp16.engine").resolve()
+        if dynamic:
+            engine_path = (REPO_ROOT / "models" / "engines" / f"yolo26{size}_dynamic_b1-{int(args.batch)}_fp16.engine").resolve()
+        else:
+            engine_path = (REPO_ROOT / "models" / "engines" / f"yolo26{size}_b{int(args.batch)}_fp16.engine").resolve()
         if not args.skip_engine:
-            engine_path = _build_engine(onnx_path, engine_path)
+            engine_path = _build_engine(
+                onnx_path,
+                engine_path,
+                dynamic=dynamic,
+                batch=int(args.batch),
+                builder_optimization_level=int(args.builder_optimization_level),
+            )
         elif not engine_path.exists():
             raise FileNotFoundError(f"Missing engine for --skip-engine: {engine_path}")
         outputs.append((size, onnx_path, engine_path))

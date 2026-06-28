@@ -10,7 +10,7 @@ import { TrailStore } from './lib/trails';
 import { cameraOrder, colorForTrack, cameraLabel, detectCameraKey, CameraKey, colorIdForPerson, identityKeyForPerson, discoverCamerasFromPayloads } from './lib/camera';
 import { getExtrinsics, getIntrinsics4, extractPoseFromExtrinsics, forwardXZFromExtrinsics } from './lib/calibration';
 import { isCameraLocalFrame, projectWorldPointToCameraLocal, resolveBevFrameModeFromPayload } from './lib/coordTransforms';
-import { useWebSocketClient, StatsPayload, DepthRequestStrategy, MosaicLayout } from './hooks/useWebSocketClient';
+import { useWebSocketClient, StatsPayload, MosaicLayout } from './hooks/useWebSocketClient';
 import { useWebRTCClient } from './hooks/useWebRTCClient';
 import { StreamMode } from './components/StreamPanel';
 import DepthDrawer, { DepthDiagnosticsEntry, DepthDrawerEntry, DepthMetaEntry, FloorplanResponse } from './components/DepthDrawer';
@@ -1069,7 +1069,7 @@ function Dashboard() {
 
   const requestDepthCached = useCallback((camId: string) => {
     if (!camId) return;
-    requestMapAnythingDepth(camId, 'cache-first');
+    requestMapAnythingDepth(camId, 'cache-only');
   }, [requestMapAnythingDepth]);
 
   const handleRequestFloorplan = useCallback((options?: { camera?: string; requestId?: string; maxAgeSec?: number; gridResM?: number; maxExtentM?: number; cacheOnly?: boolean }) => {
@@ -1113,11 +1113,11 @@ function Dashboard() {
       const timer = window.setTimeout(() => {
         handleRequestFloorplan({
           camera: cam,
-          requestId: `bev-calib-refresh-${cam}-${Date.now()}`,
-          maxAgeSec: 0,
+          requestId: `bev-calib-cache-${cam}-${Date.now()}`,
+          maxAgeSec: 600,
           gridResM: 0.15,
           maxExtentM: 20,
-          cacheOnly: false,
+          cacheOnly: true,
         });
       }, idx * 140);
       timers.push(timer);
@@ -1138,12 +1138,11 @@ function Dashboard() {
       lastDepthFloorplanTsRef.current[camId] = meta.tsUs;
       handleRequestFloorplan({
         camera: camId,
-        requestId: `bev-refresh-${camId}-${meta.tsUs}`,
-        // Prefer cache-first behavior to avoid regenerating topdowns while snapshots are being written.
+        requestId: `bev-cache-after-depth-${camId}-${meta.tsUs}`,
         maxAgeSec: 600,
         gridResM: 0.15,
         maxExtentM: 20,
-        cacheOnly: false
+        cacheOnly: true
       });
     });
   }, [maDepthMeta, handleRequestFloorplan]);
@@ -1411,6 +1410,7 @@ function Dashboard() {
         availableCameras={availableCameras}
         mosaicLayout={mosaicLayout}
         videoRef={webrtc.videoRef}
+        calibrationEpoch={calibrationEpoch}
       />
       <RoiEditorDrawer
         open={roiDrawerOpen}

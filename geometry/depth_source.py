@@ -26,7 +26,7 @@ import scipy.ndimage as ndi
 import zarr
 
 from adapters.mapanything_adapter import ViewBuildResult, build_mono_view
-from geometry.homography import parse_extrinsics
+from geometry.homography import img_to_plane_homography, parse_extrinsics
 from mapanything_config import ServiceConfig, load_service_config
 from utils.rate_limited_logger import RateLimitedLogger
 
@@ -332,6 +332,243 @@ def _floorplan_world_coordinate_grids(
     xs = float(min_x) + (np.arange(safe_cols, dtype=np.float32) + 0.5) * x_step
     zs = float(max_z) - (np.arange(safe_rows, dtype=np.float32) + 0.5) * z_step
     return np.meshgrid(xs, zs)
+
+
+def _fit_ray_to_floorplan_alignment(
+    *,
+    camera_id: str,
+    intrinsics: np.ndarray,
+    extrinsics_col_major: Sequence[float],
+    floor_y: float,
+    depth: np.ndarray,
+    conf: np.ndarray,
+    mask: np.ndarray,
+    valid: np.ndarray,
+    x_cam: np.ndarray,
+    z_cam: np.ndarray,
+    bounds: Mapping[str, float],
+    walkable_grid: Optional[np.ndarray],
+    obstacle_height_grid: Optional[np.ndarray],
+) -> Dict[str, Any]:
+    """Fit calibrated ray-floor X/Z into the depth-derived floorplan X/Z frame."""
+
+    def _response(quality: str, reason: str, **extra: Any) -> Dict[str, Any]:
+        payload: Dict[str, Any] = {
+            "version": 1,
+            "quality": str(quality),
+            "reason": str(reason),
+            "source": "floorplan_depth_snapshot",
+            "from": "calibrated_floor_contact_ray_camera_local_xz",
+            "to": "floorplan_depth_camera_local_xz",
+        }
+        payload.update(extra)
+        return payload
+
+    try:
+        k = np.asarray(intrinsics, dtype=np.float64).reshape(3, 3)
+        depth_arr = np.asarray(depth, dtype=np.float32)
+        conf_arr = np.asarray(conf, dtype=np.float32)
+        mask_arr = np.asarray(mask)
+        valid_arr = np.asarray(valid, dtype=bool)
+        x_arr = np.asarray(x_cam, dtype=np.float32)
+        z_arr = np.asarray(z_cam, dtype=np.float32)
+        if depth_arr.ndim != 2 or conf_arr.shape != depth_arr.shape or valid_arr.shape != depth_arr.shape:
+            return _response("unavailable", "shape_mismatch")
+        h_img, w_img = depth_arr.shape
+        if x_arr.shape != depth_arr.shape or z_arr.shape != depth_arr.shape:
+            return _response("unavailable", "camera_point_shape_mismatch")
+        min_x = float(bounds.get("min_x"))
+        max_x = float(bounds.get("max_x"))
+        min_z = float(bounds.get("min_z"))
+        max_z = float(bounds.get("max_z"))
+        if not all(np.isfinite([min_x, max_x, min_z, max_z])) or max_x <= min_x or max_z <= min_z:
+            return _response("unavailable", "bad_bounds")
+    except Exception as exc:
+        return _response("unavailable", f"setup_failed:{exc}")
+
+    finite = (
+        valid_arr
+        & np.isfinite(depth_arr)
+        & np.isfinite(conf_arr)
+        & np.isfinite(x_arr)
+        & np.isfinite(z_arr)
+        & (depth_arr > 0.10)
+        & (depth_arr < 50.0)
+        & (conf_arr >= 0.10)
+        & (x_arr >= min_x)
+        & (x_arr <= max_x)
+        & (z_arr >= min_z)
+        & (z_arr <= max_z)
+    )
+    if mask_arr.shape == depth_arr.shape:
+        finite &= np.asarray(mask_arr, dtype=np.uint8) > 0
+
+    sample_mode = "valid_mask_conf"
+    if walkable_grid is not None:
+        try:
+            walk = np.asarray(walkable_grid, dtype=np.float32)
+            if walk.ndim == 2 and walk.size > 0:
+                rows, cols = walk.shape
+                span_x = max(1e-6, max_x - min_x)
+                span_z = max(1e-6, max_z - min_z)
+                grid_col = np.floor(((x_arr - min_x) / span_x) * float(cols)).astype(np.int32)
+                grid_row = np.floor((1.0 - ((z_arr - min_z) / span_z)) * float(rows)).astype(np.int32)
+                in_grid = (grid_col >= 0) & (grid_col < cols) & (grid_row >= 0) & (grid_row < rows)
+                walk_ok = np.zeros_like(finite, dtype=bool)
+                walk_ok[in_grid] = walk[grid_row[in_grid], grid_col[in_grid]] > 0.5
+                finite &= walk_ok
+                sample_mode = "walkable_valid_mask_conf"
+                if obstacle_height_grid is not None:
+                    obs = np.asarray(obstacle_height_grid, dtype=np.float32)
+                    if obs.shape == walk.shape:
+                        obs_ok = np.ones_like(finite, dtype=bool)
+                        obs_ok[in_grid] = np.nan_to_num(
+                            obs[grid_row[in_grid], grid_col[in_grid]],
+                            nan=0.0,
+                            posinf=999.0,
+                            neginf=999.0,
+                        ) <= 0.35
+                        finite &= obs_ok
+                        sample_mode = "walkable_non_obstacle_valid_mask_conf"
+        except Exception:
+            return _response("unavailable", "surface_filter_failed")
+
+    rows, cols = np.nonzero(finite)
+    candidate_count = int(rows.size)
+    if candidate_count < 64:
+        return _response(
+            "unavailable",
+            "insufficient_surface_samples",
+            sample_count=candidate_count,
+            sample_mode=sample_mode,
+        )
+
+    max_samples = 12000
+    if candidate_count > max_samples:
+        step = max(1, int(math.ceil(candidate_count / float(max_samples))))
+        rows = rows[::step]
+        cols = cols[::step]
+
+    try:
+        H_img2plane = img_to_plane_homography(
+            k,
+            extrinsics_col_major,
+            float(floor_y),
+            (int(w_img), int(h_img)),
+            1.0,
+            flip_u=False,
+            flip_v=False,
+        )
+        R_wc, C_world = parse_extrinsics(extrinsics_col_major)
+        uv1 = np.stack(
+            [
+                cols.astype(np.float64, copy=False),
+                rows.astype(np.float64, copy=False),
+                np.ones_like(rows, dtype=np.float64),
+            ],
+            axis=0,
+        )
+        world_h = H_img2plane @ uv1
+        denom = world_h[2]
+        ok = np.isfinite(denom) & (np.abs(denom) > 1e-9)
+        wx = np.zeros_like(denom, dtype=np.float64)
+        wz = np.zeros_like(denom, dtype=np.float64)
+        wx[ok] = world_h[0, ok] / denom[ok]
+        wz[ok] = world_h[1, ok] / denom[ok]
+        world = np.stack(
+            [
+                wx,
+                np.full_like(wx, float(floor_y), dtype=np.float64),
+                wz,
+            ],
+            axis=0,
+        )
+        local = R_wc.T @ (world - C_world.reshape(3, 1))
+        ray_x = local[0]
+        ray_z = local[2]
+        depth_x = x_arr[rows, cols].astype(np.float64, copy=False)
+        depth_z = z_arr[rows, cols].astype(np.float64, copy=False)
+        finite_pairs = (
+            ok
+            & np.isfinite(ray_x)
+            & np.isfinite(ray_z)
+            & np.isfinite(depth_x)
+            & np.isfinite(depth_z)
+        )
+        ray_x = ray_x[finite_pairs]
+        ray_z = ray_z[finite_pairs]
+        depth_x = depth_x[finite_pairs]
+        depth_z = depth_z[finite_pairs]
+        if ray_x.size < 64:
+            return _response(
+                "unavailable",
+                "insufficient_ray_pairs",
+                sample_count=int(ray_x.size),
+                sample_mode=sample_mode,
+            )
+
+        design = np.column_stack((ray_x, ray_z, np.ones_like(ray_x)))
+        target = np.column_stack((depth_x, depth_z))
+        keep = np.ones(int(design.shape[0]), dtype=bool)
+        matrix = None
+        residual = None
+        for _ in range(4):
+            coeff, *_ = np.linalg.lstsq(design[keep], target[keep], rcond=None)
+            predicted = design @ coeff
+            residual = np.linalg.norm(predicted - target, axis=1)
+            kept_residual = residual[keep]
+            if kept_residual.size < 64:
+                break
+            med = float(np.median(kept_residual))
+            mad = float(np.median(np.abs(kept_residual - med)))
+            threshold = max(0.18, med + (3.0 * 1.4826 * mad))
+            threshold = min(1.50, threshold)
+            next_keep = residual <= threshold
+            if int(np.count_nonzero(next_keep)) < 64:
+                break
+            matrix = coeff.T
+            if np.array_equal(next_keep, keep):
+                keep = next_keep
+                break
+            keep = next_keep
+        if matrix is None or residual is None:
+            return _response("unavailable", "fit_failed", sample_count=int(design.shape[0]), sample_mode=sample_mode)
+
+        accepted = int(np.count_nonzero(keep))
+        accepted_residual = residual[keep]
+        if accepted < 64 or accepted_residual.size < 64:
+            return _response(
+                "unavailable",
+                "insufficient_inliers",
+                sample_count=int(design.shape[0]),
+                inlier_count=accepted,
+                sample_mode=sample_mode,
+            )
+        p50 = float(np.percentile(accepted_residual, 50))
+        p90 = float(np.percentile(accepted_residual, 90))
+        p95 = float(np.percentile(accepted_residual, 95))
+        quality = "ok" if p50 <= 0.35 and p95 <= 1.25 else "high_residual"
+        linear = np.asarray(matrix[:, :2], dtype=np.float64)
+        det = float(np.linalg.det(linear))
+        if not math.isfinite(det) or abs(det) < 0.05 or abs(det) > 20.0:
+            quality = "high_residual"
+        return _response(
+            quality,
+            "fit_ok" if quality == "ok" else "quality_gate_failed",
+            matrix_2x3=np.asarray(matrix, dtype=np.float64).round(8).tolist(),
+            sample_count=int(design.shape[0]),
+            inlier_count=accepted,
+            sample_mode=sample_mode,
+            residual_m={
+                "p50": p50,
+                "p90": p90,
+                "p95": p95,
+                "max": float(np.max(accepted_residual)),
+            },
+            determinant=det,
+        )
+    except Exception as exc:
+        return _response("unavailable", f"fit_exception:{exc}", sample_count=int(rows.size), sample_mode=sample_mode)
 
 
 def _postprocess_floorplan_height_grid(
@@ -3242,6 +3479,38 @@ class DepthStorageManager:
         if not np.isfinite(agl_max) or agl_max <= 1e-6:
             agl_max = float(_FLOORPLAN_AGL_HEIGHT_CLIP_M)
 
+        alignment_walkable = None
+        alignment_obstacle = None
+        if clean_layers is not None:
+            try:
+                alignment_obstacle, alignment_walkable, _alignment_meta = clean_layers
+            except Exception:
+                alignment_walkable = None
+                alignment_obstacle = None
+        k_for_alignment = np.array(
+            [
+                [float(fx), 0.0, float(cx)],
+                [0.0, float(fy), float(cy)],
+                [0.0, 0.0, 1.0],
+            ],
+            dtype=np.float64,
+        )
+        ray_to_floorplan_alignment = _fit_ray_to_floorplan_alignment(
+            camera_id=str(camera_id),
+            intrinsics=k_for_alignment,
+            extrinsics_col_major=list(extr),
+            floor_y=float(floor_y),
+            depth=depth,
+            conf=conf,
+            mask=mask,
+            valid=valid,
+            x_cam=x_cam,
+            z_cam=z_cam,
+            bounds=bounds,
+            walkable_grid=alignment_walkable,
+            obstacle_height_grid=alignment_obstacle,
+        )
+
         payload: Dict[str, Any] = {
             'camera_id': camera_id,
             'ts': now_us,
@@ -3292,6 +3561,7 @@ class DepthStorageManager:
                 'floor_estimate': floor_est_meta,
             },
             'calibration_fingerprint': expected_calibration_fingerprint,
+            'ray_to_floorplan_alignment': ray_to_floorplan_alignment,
         }
         if clean_layers is not None:
             obstacle_height_grid, walkable_grid, clean_meta = clean_layers
@@ -4720,6 +4990,38 @@ class MapAnythingDepthSource:
         if not np.isfinite(agl_max) or agl_max <= 1e-6:
             agl_max = float(_FLOORPLAN_AGL_HEIGHT_CLIP_M)
 
+        alignment_walkable = None
+        alignment_obstacle = None
+        if clean_layers is not None:
+            try:
+                alignment_obstacle, alignment_walkable, _alignment_meta = clean_layers
+            except Exception:
+                alignment_walkable = None
+                alignment_obstacle = None
+        k_for_alignment = np.array(
+            [
+                [float(fx), 0.0, float(cx)],
+                [0.0, float(fy), float(cy)],
+                [0.0, 0.0, 1.0],
+            ],
+            dtype=np.float64,
+        )
+        ray_to_floorplan_alignment = _fit_ray_to_floorplan_alignment(
+            camera_id=str(camera_id),
+            intrinsics=k_for_alignment,
+            extrinsics_col_major=list(extr),
+            floor_y=float(floor_y),
+            depth=depth,
+            conf=conf,
+            mask=mask,
+            valid=valid,
+            x_cam=x_cam,
+            z_cam=z_cam,
+            bounds=bounds,
+            walkable_grid=alignment_walkable,
+            obstacle_height_grid=alignment_obstacle,
+        )
+
         payload: Dict[str, Any] = {
             'camera_id': camera_id,
             'ts': now_us,
@@ -4770,6 +5072,7 @@ class MapAnythingDepthSource:
                 'floor_estimate': floor_est_meta,
             },
             'calibration_fingerprint': expected_calibration_fingerprint,
+            'ray_to_floorplan_alignment': ray_to_floorplan_alignment,
         }
         if clean_layers is not None:
             obstacle_height_grid, walkable_grid, clean_meta = clean_layers

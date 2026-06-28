@@ -96,6 +96,7 @@ interface DepthDrawerProps {
   availableCameras: string[];
   mosaicLayout?: MosaicLayout | null;
   videoRef?: RefObject<HTMLVideoElement>;
+  calibrationEpoch?: number;
 }
 
 import {
@@ -112,6 +113,9 @@ import {
   viridisColor
 } from '../lib/renderUtils';
 import { buildExtrudedFloorplanModel, DEFAULT_OBSTACLE_SETTINGS, renderExtrudedFloorplanToCanvas } from '../lib/extrudedFloorplan';
+import { getExtrinsicsAny, getIntrinsicsAny } from '../lib/calibration';
+import { buildVisibleFloorPlaneModel } from '../lib/visibleFloorPlane';
+import FloorPlane3DView from './FloorPlane3DView';
 
 const DEFAULT_WIDTH = 700;
 const MAX_WIDTH = 960;
@@ -175,6 +179,7 @@ const DepthDrawer = memo(function DepthDrawer({
   availableCameras,
   mosaicLayout,
   videoRef,
+  calibrationEpoch = 0,
 }: DepthDrawerProps) {
   // Show cameras from either available list or present depth data (union)
   const cameras = useMemo(() => {
@@ -204,6 +209,8 @@ const DepthDrawer = memo(function DepthDrawer({
   const floorplanCompositeCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const streamPreviewCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const extrudedCanvasRef = useRef<HTMLCanvasElement | null>(null);
+  const floorPlaneCanvasRef = useRef<HTMLCanvasElement | null>(null);
+  const [primitivesView, setPrimitivesView] = useState<'obstacles' | 'visible-floor'>('obstacles');
   const [primitivesShowPreview, setPrimitivesShowPreview] = useState(true);
   const [primitivesShowBoxes, setPrimitivesShowBoxes] = useState(true);
   const [primitivesSelectedBoxId, setPrimitivesSelectedBoxId] = useState<string | null>(null);
@@ -216,8 +223,6 @@ const DepthDrawer = memo(function DepthDrawer({
   const [floorplanStatus, setFloorplanStatus] = useState<'idle' | 'loading' | 'checking'>('idle');
   const [floorplanRequest, setFloorplanRequest] = useState<string>('');
   const [heatmapRange, setHeatmapRange] = useState<{ min: number; max: number } | null>(null);
-  const warmupScheduledRef = useRef(false);
-  const warmupTimersRef = useRef<number[]>([]);
   const floorplanWarmupTimersRef = useRef<number[]>([]);
   const floorplanPrefetchScheduledRef = useRef<Set<string>>(new Set());
   const floorplanPrefetchedRef = useRef<Set<string>>(new Set());
@@ -351,8 +356,7 @@ const DepthDrawer = memo(function DepthDrawer({
   useEffect(() => {
     if (!open || !selectedCamera) return;
     onRequestDepthCached(selectedCamera);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [open, selectedCamera]);
+  }, [open, selectedCamera, onRequestDepthCached]);
 
   useEffect(() => {
     if (open) {
@@ -582,7 +586,7 @@ const DepthDrawer = memo(function DepthDrawer({
     requestFloorplan('cache-only');
   }, [open, activeTab, selectedCamera, requestFloorplan]);
 
-  // Notify backend once per camera when heatmap is rendered (cache-first or fresh)
+  // Notify backend once per camera when a heatmap already in local state is rendered.
   useEffect(() => {
     if (!open || activeTab !== 'heatmap') return;
     if (!selectedCamera || !depthEntry) return;
@@ -692,6 +696,31 @@ const DepthDrawer = memo(function DepthDrawer({
   }, [cameraFloorplan, primitivesMaxBoxes, primitivesMaxCells, primitivesMinDensity, primitivesMinFootprintM2, primitivesMinHeightM]);
 
   const obstacleBoxes = primitivesModel?.boxes ?? [];
+  const selectedIntrinsics = useMemo(
+    () => (selectedCamera ? getIntrinsicsAny(selectedCamera) : null),
+    [selectedCamera, calibrationEpoch]
+  );
+  const selectedExtrinsics = useMemo(
+    () => (selectedCamera ? getExtrinsicsAny(selectedCamera) : null),
+    [selectedCamera, calibrationEpoch]
+  );
+  const visibleFloorResult = useMemo(() => buildVisibleFloorPlaneModel({
+    cameraId: selectedCamera,
+    depthEntry,
+    intrinsics: selectedIntrinsics,
+    extrinsics: selectedExtrinsics,
+    floorplan: cameraFloorplan,
+  }), [
+    selectedCamera,
+    depthEntry,
+    selectedIntrinsics,
+    selectedExtrinsics,
+    cameraFloorplan,
+  ]);
+  const visibleFloorModel = visibleFloorResult.model;
+  const handleFloorPlaneCanvasReady = useCallback((canvas: HTMLCanvasElement | null) => {
+    floorPlaneCanvasRef.current = canvas;
+  }, []);
 
   useEffect(() => {
     if (primitivesSelectedBoxId && obstacleBoxes.every((b) => b.id !== primitivesSelectedBoxId)) {
@@ -700,7 +729,7 @@ const DepthDrawer = memo(function DepthDrawer({
   }, [obstacleBoxes, primitivesSelectedBoxId]);
 
   useEffect(() => {
-    if (!open || activeTab !== '3d') return;
+    if (!open || activeTab !== '3d' || primitivesView !== 'obstacles') return;
     renderExtrudedFloorplanToCanvas(
       extrudedCanvasRef.current,
       primitivesModel,
@@ -724,6 +753,7 @@ const DepthDrawer = memo(function DepthDrawer({
     primitivesMinDensity,
     primitivesShowBoxes,
     primitivesSelectedBoxId,
+    primitivesView,
     drawerWidth,
   ]);
 
@@ -830,37 +860,12 @@ const DepthDrawer = memo(function DepthDrawer({
 
   useEffect(() => {
     return () => {
-      warmupTimersRef.current.forEach((id) => window.clearTimeout(id));
-      warmupTimersRef.current = [];
-      warmupScheduledRef.current = false;
       floorplanWarmupTimersRef.current.forEach((id) => window.clearTimeout(id));
       floorplanWarmupTimersRef.current = [];
       floorplanPrefetchScheduledRef.current.clear();
       floorplanPrefetchedRef.current.clear();
     };
   }, []);
-
-  const scheduleDepthBatch = useCallback((cameraList: string[], spacingMs = 200) => {
-    const unique = Array.from(new Set(cameraList)).filter(Boolean);
-    if (!unique.length) return;
-    warmupTimersRef.current.forEach((id) => window.clearTimeout(id));
-    warmupTimersRef.current = unique.map((cam, idx) => window.setTimeout(() => onRequestDepthCached(cam), idx * spacingMs));
-  }, [onRequestDepthCached]);
-
-
-  useEffect(() => {
-    if (open && availableCameras.length && !warmupScheduledRef.current) {
-      // Warm up by requesting fresh depth for all available cameras
-      try { console.debug('[UI] warmup depth batch', availableCameras); } catch { }
-      scheduleDepthBatch(availableCameras);
-      warmupScheduledRef.current = true;
-    }
-    if (!open) {
-      warmupScheduledRef.current = false;
-      warmupTimersRef.current.forEach((id) => window.clearTimeout(id));
-      warmupTimersRef.current = [];
-    }
-  }, [open, availableCameras, scheduleDepthBatch]);
 
   useEffect(() => {
     if (!open) {
@@ -1044,6 +1049,96 @@ const DepthDrawer = memo(function DepthDrawer({
     document.body.style.userSelect = 'none';
   };
 
+  const saveBlob = useCallback((blob: Blob, filename: string) => {
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = filename;
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    window.setTimeout(() => URL.revokeObjectURL(url), 1000);
+  }, []);
+
+  const saveCanvas = useCallback((canvas: HTMLCanvasElement | null, filename: string) => {
+    if (!canvas || canvas.width <= 0 || canvas.height <= 0) return;
+    try {
+      canvas.toBlob((blob) => {
+        if (!blob) return;
+        saveBlob(blob, filename);
+      }, 'image/png');
+    } catch (err) {
+      console.warn('Unable to save depth drawer canvas', filename, err);
+    }
+  }, [saveBlob]);
+
+  const handleSaveCurrentImages = useCallback(() => {
+    if (!selectedCamera) return;
+    const safePart = (value: string) => (value || 'unknown')
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/g, '-')
+      .replace(/^-+|-+$/g, '') || 'unknown';
+    const stamp = new Date().toISOString()
+      .replace(/\.\d{3}Z$/, 'Z')
+      .replace(/[:.]/g, '')
+      .replace('T', '_')
+      .replace('Z', '');
+    const prefix = `${stamp}_${safePart(selectedCamera)}_${activeTab}`;
+    const canvases: Array<{ label: string; canvas: HTMLCanvasElement | null }> = [];
+    if (activeTab === 'heatmap') {
+      canvases.push(
+        { label: 'camera-depth-turbo', canvas: heatmapCanvasRef.current },
+        { label: 'density-gray', canvas: densityCanvasRef.current },
+        { label: 'height-inferno', canvas: heightCanvasRef.current },
+        { label: 'height-contrast', canvas: heightContrastCanvasRef.current },
+        { label: 'height-agl-turbo', canvas: heightAglCanvasRef.current },
+        { label: 'distance-viridis', canvas: distanceCanvasRef.current },
+        { label: 'obstacle-height-clean', canvas: obstacleHeightCanvasRef.current },
+        { label: 'walkable-binary', canvas: walkableCanvasRef.current },
+        { label: 'floorplan-composite', canvas: floorplanCompositeCanvasRef.current },
+        { label: 'gradient-edges', canvas: gradientCanvasRef.current },
+      );
+    } else if (activeTab === 'normals') {
+      canvases.push({ label: 'normals-rgb', canvas: normalsCanvasRef.current });
+    } else if (activeTab === '3d') {
+      canvases.push({ label: 'stream-preview', canvas: streamPreviewCanvasRef.current });
+      if (primitivesView === 'visible-floor') {
+        canvases.push({ label: 'visible-floor-plane', canvas: floorPlaneCanvasRef.current });
+      } else {
+        canvases.push({ label: 'extruded-floorplan', canvas: extrudedCanvasRef.current });
+      }
+    } else if (activeTab === 'histogram') {
+      canvases.push({ label: 'histogram', canvas: histogramCanvasRef.current });
+    }
+
+    const imageNames: string[] = [];
+    canvases.forEach(({ label, canvas }) => {
+      if (!canvas || canvas.width <= 0 || canvas.height <= 0) return;
+      const filename = `${prefix}_${safePart(label)}.png`;
+      imageNames.push(filename);
+      saveCanvas(canvas, filename);
+    });
+
+    if (!imageNames.length) return;
+    const manifest = {
+      saved_at: new Date().toISOString(),
+      camera: selectedCamera,
+      tab: activeTab,
+      images: imageNames,
+      depth_ts_us: depthEntry?.ts ?? null,
+      depth_served_from_cache: depthMetaEntry?.servedFromCache ?? null,
+      depth_source_camera_id: depthMetaEntry?.sourceCameraId ?? null,
+      floorplan_ts_us: cameraFloorplan?.ts ?? null,
+      floorplan_snapshot_ts_us: cameraFloorplan?.snapshot_ts ?? null,
+      floorplan_served_from_cache: cameraFloorplan?.served_from_cache ?? null,
+      floor_plane_status: activeTab === '3d' ? visibleFloorResult.status : undefined,
+    };
+    saveBlob(
+      new Blob([JSON.stringify(manifest, null, 2)], { type: 'application/json' }),
+      `${prefix}_manifest.json`,
+    );
+  }, [activeTab, cameraFloorplan, depthEntry, depthMetaEntry, primitivesView, saveBlob, saveCanvas, selectedCamera, visibleFloorResult.status]);
+
   return (
     <>
       <div className={`depth-drawer-overlay ${open ? 'open' : ''}`} onClick={onClose} />
@@ -1092,12 +1187,27 @@ const DepthDrawer = memo(function DepthDrawer({
                   <button
                     type="button"
                     className="btn-icon"
+                    onClick={handleSaveCurrentImages}
+                    disabled={!selectedCamera}
+                    aria-label="Save current depth images"
+                    title="Save current depth images"
+                  >
+                    <svg viewBox="0 0 16 16" aria-hidden="true">
+                      <path
+                        fill="currentColor"
+                        d="M8.75 2.75a.75.75 0 0 0-1.5 0v5.69L5.53 6.72a.75.75 0 0 0-1.06 1.06l3 3a.75.75 0 0 0 1.06 0l3-3a.75.75 0 0 0-1.06-1.06L8.75 8.44V2.75ZM3 11.5a.75.75 0 0 1 .75.75v.75h8.5v-.75a.75.75 0 0 1 1.5 0v1.5a.75.75 0 0 1-.75.75H3a.75.75 0 0 1-.75-.75v-1.5A.75.75 0 0 1 3 11.5Z"
+                      />
+                    </svg>
+                  </button>
+                  <button
+                    type="button"
+                    className="btn-icon"
                     onClick={() => {
                       if (!selectedCamera) return;
                       try { console.debug('[UI] refresh depth', selectedCamera); } catch { }
                       onRequestDepthFresh(selectedCamera);
                       if (activeTab !== 'normals') {
-                        requestFloorplan('regenerate');
+                        requestFloorplan('cache-only');
                       }
                     }}
                     disabled={floorplanStatus === 'loading' && activeTab !== 'normals'}
@@ -1136,7 +1246,7 @@ const DepthDrawer = memo(function DepthDrawer({
                     />
                   </div>
                 </div>
-                <div className="heatmap-cell heatmap-cell--right">
+                <div className="heatmap-cell heatmap-cell--left">
                   <div className="heatmap-cell__body">
                     <div className="heatmap-cell__title">Density (Grayscale)</div>
                     <canvas ref={densityCanvasRef} className="heatmap-canvas" style={{ aspectRatio: `${WIDE_ASPECT}` }} />
@@ -1145,7 +1255,7 @@ const DepthDrawer = memo(function DepthDrawer({
                     {renderScale(densityGradient, 0, 0.5, 1)}
                   </div>
                 </div>
-                <div className="heatmap-cell heatmap-cell--left">
+                <div className="heatmap-cell heatmap-cell--right">
                   <div className="heatmap-cell__scale">
                     {renderScale(
                       infernoGradient,
@@ -1308,6 +1418,23 @@ const DepthDrawer = memo(function DepthDrawer({
                 <p className="floorplan-status">{floorplanStatusText}</p>
               )}
 
+              <div className="primitives-view-toggle" role="tablist" aria-label="3D view">
+                <button
+                  type="button"
+                  className={primitivesView === 'obstacles' ? 'active' : ''}
+                  onClick={() => setPrimitivesView('obstacles')}
+                >
+                  Obstacles
+                </button>
+                <button
+                  type="button"
+                  className={primitivesView === 'visible-floor' ? 'active' : ''}
+                  onClick={() => setPrimitivesView('visible-floor')}
+                >
+                  Visible floor
+                </button>
+              </div>
+
               <div className="primitives-layout">
                 <div className="primitives-panel">
                   <div className="primitives-panel__title">Camera Tile (ROI-style)</div>
@@ -1329,132 +1456,172 @@ const DepthDrawer = memo(function DepthDrawer({
                   </div>
                 </div>
 
-                <div className="primitives-panel">
-                  <div className="primitives-panel__title">Extruded Floorplan Primitives</div>
-                  <canvas
-                    ref={extrudedCanvasRef}
-                    className="primitives-canvas primitives-canvas--extruded"
-                    style={{ aspectRatio: `${EXTRUDED_ASPECT}` }}
-                  />
-                  <div className="primitives-submeta">
-                    {primitivesModel
-                      ? `Grid ${primitivesModel.cols}×${primitivesModel.rows} · max height ${formatNumber(primitivesModel.maxHeightM)} m`
-                      : 'Waiting for floorplan grids…'}
+                {primitivesView === 'obstacles' ? (
+                  <div className="primitives-panel">
+                    <div className="primitives-panel__title">Extruded Floorplan Primitives</div>
+                    <canvas
+                      ref={extrudedCanvasRef}
+                      className="primitives-canvas primitives-canvas--extruded"
+                      style={{ aspectRatio: `${EXTRUDED_ASPECT}` }}
+                    />
+                    <div className="primitives-submeta">
+                      {primitivesModel
+                        ? `Grid ${primitivesModel.cols}×${primitivesModel.rows} · max height ${formatNumber(primitivesModel.maxHeightM)} m`
+                        : 'Waiting for floorplan grids…'}
+                    </div>
                   </div>
-                </div>
+                ) : (
+                  <div className="primitives-panel">
+                    <div className="primitives-panel__title">Visible Floor Plane</div>
+                    <div className="floor-plane-view-wrap">
+                      <FloorPlane3DView
+                        model={visibleFloorModel}
+                        onCanvasReady={handleFloorPlaneCanvasReady}
+                      />
+                      {!visibleFloorModel && (
+                        <div className="floor-plane-empty">{visibleFloorResult.message}</div>
+                      )}
+                    </div>
+                    <div className="primitives-submeta">
+                      {visibleFloorModel
+                        ? `Support ${visibleFloorModel.metrics.estimatedVisibleFloorPixelCount} px · footprint ${visibleFloorModel.footprintMesh.cellCount} cells · ${formatNumber(visibleFloorModel.footprintMesh.areaM2, 1)} m²`
+                        : visibleFloorResult.message}
+                    </div>
+                  </div>
+                )}
               </div>
 
-              <details className="primitives-details">
-                <summary>Obstacle boxes ({obstacleBoxes.length})</summary>
-                <div className="primitives-boxes">
-                  <label className="primitives-toggle primitives-toggle--inline">
-                    <input
-                      type="checkbox"
-                      checked={primitivesShowBoxes}
-                      onChange={(e) => setPrimitivesShowBoxes(e.target.checked)}
-                    />
-                    <span>Draw boxes</span>
-                  </label>
-                  {obstacleBoxes.length === 0 ? (
-                    <div className="primitives-empty">No obstacle clusters detected at current thresholds.</div>
-                  ) : (
-                    <div className="primitives-box-list">
-                      {obstacleBoxes.map((box, idx) => (
-                        <button
-                          key={box.id}
-                          type="button"
-                          className={primitivesSelectedBoxId === box.id ? 'primitives-box active' : 'primitives-box'}
-                          onClick={() => setPrimitivesSelectedBoxId((prev) => (prev === box.id ? null : box.id))}
-                        >
-                          <span className="primitives-box__idx">#{idx + 1}</span>
-                          <span className="primitives-box__dims">
-                            {formatNumber(box.widthM, 2)}×{formatNumber(box.depthM, 2)} m
-                          </span>
-                          <span className="primitives-box__h">h={formatNumber(box.heightM, 2)} m</span>
-                        </button>
-                      ))}
+              {primitivesView === 'obstacles' && (
+                <>
+                  <details className="primitives-details">
+                    <summary>Obstacle boxes ({obstacleBoxes.length})</summary>
+                    <div className="primitives-boxes">
+                      <label className="primitives-toggle primitives-toggle--inline">
+                        <input
+                          type="checkbox"
+                          checked={primitivesShowBoxes}
+                          onChange={(e) => setPrimitivesShowBoxes(e.target.checked)}
+                        />
+                        <span>Draw boxes</span>
+                      </label>
+                      {obstacleBoxes.length === 0 ? (
+                        <div className="primitives-empty">No obstacle clusters detected at current thresholds.</div>
+                      ) : (
+                        <div className="primitives-box-list">
+                          {obstacleBoxes.map((box, idx) => (
+                            <button
+                              key={box.id}
+                              type="button"
+                              className={primitivesSelectedBoxId === box.id ? 'primitives-box active' : 'primitives-box'}
+                              onClick={() => setPrimitivesSelectedBoxId((prev) => (prev === box.id ? null : box.id))}
+                            >
+                              <span className="primitives-box__idx">#{idx + 1}</span>
+                              <span className="primitives-box__dims">
+                                {formatNumber(box.widthM, 2)}×{formatNumber(box.depthM, 2)} m
+                              </span>
+                              <span className="primitives-box__h">h={formatNumber(box.heightM, 2)} m</span>
+                            </button>
+                          ))}
+                        </div>
+                      )}
                     </div>
-                  )}
-                </div>
-              </details>
+                  </details>
 
-              <details className="primitives-details">
-                <summary>3D settings (noise filter)</summary>
-                <div className="primitives-settings">
-                  <div className="primitives-row">
-                    <label>Min height</label>
-                    <input
-                      type="range"
-                      min={0.05}
-                      max={1.2}
-                      step={0.05}
-                      value={primitivesMinHeightM}
-                      onChange={(e) => setPrimitivesMinHeightM(parseFloat(e.target.value))}
-                    />
-                    <span className="primitives-value">{formatNumber(primitivesMinHeightM, 2)} m</span>
+                  <details className="primitives-details">
+                    <summary>3D settings (noise filter)</summary>
+                    <div className="primitives-settings">
+                      <div className="primitives-row">
+                        <label>Min height</label>
+                        <input
+                          type="range"
+                          min={0.05}
+                          max={1.2}
+                          step={0.05}
+                          value={primitivesMinHeightM}
+                          onChange={(e) => setPrimitivesMinHeightM(parseFloat(e.target.value))}
+                        />
+                        <span className="primitives-value">{formatNumber(primitivesMinHeightM, 2)} m</span>
+                      </div>
+                      <div className="primitives-row">
+                        <label>Min footprint</label>
+                        <input
+                          type="range"
+                          min={0.05}
+                          max={2.0}
+                          step={0.05}
+                          value={primitivesMinFootprintM2}
+                          onChange={(e) => setPrimitivesMinFootprintM2(parseFloat(e.target.value))}
+                        />
+                        <span className="primitives-value">{formatNumber(primitivesMinFootprintM2, 2)} m²</span>
+                      </div>
+                      <div className="primitives-row">
+                        <label>Min density</label>
+                        <input
+                          type="range"
+                          min={0}
+                          max={0.3}
+                          step={0.01}
+                          value={primitivesMinDensity}
+                          onChange={(e) => setPrimitivesMinDensity(parseFloat(e.target.value))}
+                        />
+                        <span className="primitives-value">{formatNumber(primitivesMinDensity, 2)}</span>
+                      </div>
+                      <div className="primitives-row">
+                        <label>Height exaggeration</label>
+                        <input
+                          type="range"
+                          min={0.6}
+                          max={3.0}
+                          step={0.1}
+                          value={primitivesHeightExaggeration}
+                          onChange={(e) => setPrimitivesHeightExaggeration(parseFloat(e.target.value))}
+                        />
+                        <span className="primitives-value">{formatNumber(primitivesHeightExaggeration, 1)}×</span>
+                      </div>
+                      <div className="primitives-row">
+                        <label>Quality</label>
+                        <input
+                          type="range"
+                          min={60}
+                          max={220}
+                          step={10}
+                          value={primitivesMaxCells}
+                          onChange={(e) => setPrimitivesMaxCells(parseInt(e.target.value, 10))}
+                        />
+                        <span className="primitives-value">{primitivesMaxCells} max</span>
+                      </div>
+                      <div className="primitives-row">
+                        <label>Max boxes</label>
+                        <input
+                          type="range"
+                          min={3}
+                          max={24}
+                          step={1}
+                          value={primitivesMaxBoxes}
+                          onChange={(e) => setPrimitivesMaxBoxes(parseInt(e.target.value, 10))}
+                        />
+                        <span className="primitives-value">{primitivesMaxBoxes}</span>
+                      </div>
+                    </div>
+                  </details>
+                </>
+              )}
+
+              {primitivesView === 'visible-floor' && visibleFloorModel && (
+                <details className="primitives-details">
+                  <summary>Floor plane fit</summary>
+                  <div className="floor-plane-metrics">
+                    <div><span>Frame</span><strong>{visibleFloorModel.frame}</strong></div>
+                    <div><span>World height</span><strong>{formatNumber(visibleFloorModel.plane.worldHeightM, 3)} m</strong></div>
+                    <div><span>Area</span><strong>{formatNumber(visibleFloorModel.metrics.planeAreaM2, 1)} m²</strong></div>
+                    <div><span>Source</span><strong>{visibleFloorModel.footprint.source.replace(/_/g, ' ')}</strong></div>
+                    <div><span>Cells</span><strong>{visibleFloorModel.footprintMesh.cellCount}</strong></div>
+                    <div><span>Inliers</span><strong>{visibleFloorModel.metrics.visibleFloorPixelCount}</strong></div>
+                    <div><span>Confidence</span><strong>{formatNumber(visibleFloorModel.metrics.meanConfidence, 2)}</strong></div>
+                    <div><span>Normal dot</span><strong>{formatNumber(visibleFloorModel.metrics.meanHorizontalDot, 2)}</strong></div>
                   </div>
-                  <div className="primitives-row">
-                    <label>Min footprint</label>
-                    <input
-                      type="range"
-                      min={0.05}
-                      max={2.0}
-                      step={0.05}
-                      value={primitivesMinFootprintM2}
-                      onChange={(e) => setPrimitivesMinFootprintM2(parseFloat(e.target.value))}
-                    />
-                    <span className="primitives-value">{formatNumber(primitivesMinFootprintM2, 2)} m²</span>
-                  </div>
-                  <div className="primitives-row">
-                    <label>Min density</label>
-                    <input
-                      type="range"
-                      min={0}
-                      max={0.3}
-                      step={0.01}
-                      value={primitivesMinDensity}
-                      onChange={(e) => setPrimitivesMinDensity(parseFloat(e.target.value))}
-                    />
-                    <span className="primitives-value">{formatNumber(primitivesMinDensity, 2)}</span>
-                  </div>
-                  <div className="primitives-row">
-                    <label>Height exaggeration</label>
-                    <input
-                      type="range"
-                      min={0.6}
-                      max={3.0}
-                      step={0.1}
-                      value={primitivesHeightExaggeration}
-                      onChange={(e) => setPrimitivesHeightExaggeration(parseFloat(e.target.value))}
-                    />
-                    <span className="primitives-value">{formatNumber(primitivesHeightExaggeration, 1)}×</span>
-                  </div>
-                  <div className="primitives-row">
-                    <label>Quality</label>
-                    <input
-                      type="range"
-                      min={60}
-                      max={220}
-                      step={10}
-                      value={primitivesMaxCells}
-                      onChange={(e) => setPrimitivesMaxCells(parseInt(e.target.value, 10))}
-                    />
-                    <span className="primitives-value">{primitivesMaxCells} max</span>
-                  </div>
-                  <div className="primitives-row">
-                    <label>Max boxes</label>
-                    <input
-                      type="range"
-                      min={3}
-                      max={24}
-                      step={1}
-                      value={primitivesMaxBoxes}
-                      onChange={(e) => setPrimitivesMaxBoxes(parseInt(e.target.value, 10))}
-                    />
-                    <span className="primitives-value">{primitivesMaxBoxes}</span>
-                  </div>
-                </div>
-              </details>
+                </details>
+              )}
             </>
           )}
 

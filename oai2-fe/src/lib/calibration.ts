@@ -100,6 +100,26 @@ export function getIntrinsics4(cam: CameraKey): number[] | null {
   return null;
 }
 
+export function getIntrinsicsAny(idOrKey: string): number[] | null {
+  try {
+    const key = detectCameraKey(idOrKey) as CameraKey | null;
+    if (key) {
+      const k = getIntrinsics4(key);
+      if (k) return k;
+    }
+  } catch {}
+
+  const cams = bundle.cameras || {};
+  const kTable = asRecord<number[]>(cams.K);
+  if (kTable && Array.isArray(kTable[idOrKey])) return kTable[idOrKey] as number[];
+  if (kTable) {
+    for (const [key, K] of Object.entries(kTable)) {
+      if (detectCameraKey(key) === idOrKey && Array.isArray(K)) return K as number[];
+    }
+  }
+  return null;
+}
+
 // Column-major 4x4 multiply (E world→camera) with homogeneous world point
 export function worldToCamera(EcolMajor: number[], Pw: [number, number, number]): [number, number, number] | null {
   if (!Array.isArray(EcolMajor) || EcolMajor.length !== 16) return null;

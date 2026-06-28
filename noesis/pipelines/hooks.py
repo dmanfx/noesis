@@ -4054,6 +4054,7 @@ class _ObjectDepthFusionProcessor:
         depth_center: Optional[float] = None,
         values: Optional[np.ndarray] = None,
         anchor_fields: Optional[Mapping[str, Any]] = None,
+        sampling_mode: str = "instance_mask",
     ) -> ObjectDepthResult:
         try:
             object_id = int(getattr(obj_meta, "object_id", -1))
@@ -4076,7 +4077,7 @@ class _ObjectDepthFusionProcessor:
             "class_id": class_id,
             "bbox": bbox,
             "score": score,
-            "sampling_mode": "instance_mask",
+            "sampling_mode": str(sampling_mode or "instance_mask"),
             "status": status,
             "unit": self.depth_unit,
             "is_metric": self.depth_is_metric,
@@ -4096,6 +4097,48 @@ class _ObjectDepthFusionProcessor:
         if anchor_fields:
             payload.update({str(key): value for key, value in anchor_fields.items() if value is not None})
         return ObjectDepthResult(**payload)
+
+    def _sample_bbox_band_result(
+        self,
+        frame_meta: Any,
+        obj_meta: Any,
+        *,
+        bbox: Tuple[float, float, float, float],
+        depth_crop: np.ndarray,
+        crop_origin: Tuple[int, int],
+        depth_center: Optional[float],
+    ) -> ObjectDepthResult:
+        mask_area = int(depth_crop.size)
+        synthetic_mask = np.ones(depth_crop.shape, dtype=bool)
+        anchor = _extract_person_depth_anchor(
+            synthetic_mask,
+            depth_crop,
+            frame_origin=(int(crop_origin[0]), int(crop_origin[1])),
+        )
+        anchor_fields: Dict[str, Any] = {
+            "spatial_class": "person",
+            "anchor_uv": list(anchor.foot_uv) if anchor.foot_uv is not None else None,
+            "anchor_source": anchor.anchor_source,
+            "anchor_depth_m": anchor.anchor_depth_m,
+            "anchor_sample_count": int(anchor.anchor_sample_count) if anchor.anchor_sample_count > 0 else None,
+            "anchor_valid_fraction": float(anchor.anchor_valid_fraction) if anchor.anchor_valid_fraction > 0.0 else None,
+        }
+        values = np.asarray(depth_crop[np.isfinite(depth_crop)], dtype=np.float32)
+        sample_count = int(values.size)
+        status = "ok" if sample_count > 0 and anchor.anchor_depth_m is not None else "no_valid_depth"
+        return self._build_result(
+            frame_meta,
+            obj_meta,
+            bbox=bbox,
+            status=status,
+            mask_area_px=mask_area,
+            sample_count=sample_count,
+            valid_fraction=float(sample_count) / float(mask_area or 1),
+            depth_center=depth_center,
+            values=values,
+            anchor_fields=anchor_fields,
+            sampling_mode="bbox_band",
+        )
 
     def _sample_person_result(
         self,
@@ -4128,11 +4171,6 @@ class _ObjectDepthFusionProcessor:
         if depth_crop.size <= 0:
             return self._build_result(frame_meta, obj_meta, bbox=bbox, status="transform_mismatch")
 
-        mask, mask_status = self._decode_instance_mask(obj_meta, depth_crop.shape)
-        if mask is None:
-            return self._build_result(frame_meta, obj_meta, bbox=bbox, status=mask_status)
-
-        mask_area = int(np.count_nonzero(mask))
         cx = max(0, min(frame_w - 1, int(round(left + (width * 0.5)))))
         cy = max(0, min(frame_h - 1, int(round(top + (height * 0.5)))))
         local_cx = max(0, min(int(depth_crop.shape[1]) - 1, cx - x0))
@@ -4140,13 +4178,26 @@ class _ObjectDepthFusionProcessor:
         center_sample = float(depth_crop[local_cy, local_cx])
         center_value = center_sample if np.isfinite(center_sample) else None
 
-        if mask_area <= 0:
-            return self._build_result(
+        mask, _mask_status = self._decode_instance_mask(obj_meta, depth_crop.shape)
+        if mask is None:
+            return self._sample_bbox_band_result(
                 frame_meta,
                 obj_meta,
                 bbox=bbox,
-                status="missing_mask",
-                mask_area_px=0,
+                depth_crop=depth_crop,
+                crop_origin=(x0, y0),
+                depth_center=center_value,
+            )
+
+        mask_area = int(np.count_nonzero(mask))
+
+        if mask_area <= 0:
+            return self._sample_bbox_band_result(
+                frame_meta,
+                obj_meta,
+                bbox=bbox,
+                depth_crop=depth_crop,
+                crop_origin=(x0, y0),
                 depth_center=center_value,
             )
 
@@ -4187,6 +4238,7 @@ class _ObjectDepthFusionProcessor:
             depth_center=center_value,
             values=values,
             anchor_fields=anchor_fields,
+            sampling_mode="instance_mask",
         )
 
     def handle_frame_ds8(self, frame_meta: Any) -> None:
@@ -5015,7 +5067,11 @@ class _AnalyticsTelemetryProcessor:
                 tracks.append(public_track)
                 diagnostics_tracks.append(diag_track)
 
-                fp = self._footpoint_from_track(public_track, frame_dims)
+                fp = self._footpoint_from_track(
+                    public_track,
+                    frame_dims,
+                    target_image_size=self._bev_target_image_size(sensor_id, camera_id),
+                )
                 if fp is not None:
                     footpoints.append(fp)
 
@@ -5274,7 +5330,11 @@ class _AnalyticsTelemetryProcessor:
                 tracks.append(public_track)
                 diagnostics_tracks.append(diag_track)
 
-                fp = self._footpoint_from_track(public_track, frame_dims)
+                fp = self._footpoint_from_track(
+                    public_track,
+                    frame_dims,
+                    target_image_size=self._bev_target_image_size(sensor_id, camera_id),
+                )
                 if fp is not None:
                     footpoints.append(fp)
 
@@ -5476,8 +5536,22 @@ class _AnalyticsTelemetryProcessor:
             return intrinsic_size
         return self._frame_source_size(frame_meta)
 
+    def _bev_target_image_size(self, sensor_id: int, camera_id: str) -> Optional[Tuple[int, int]]:
+        resolver = self.bev_calibration
+        if resolver is None:
+            return None
+        try:
+            calib = resolver.snapshot(sensor_id, camera_id)
+        except Exception:
+            return None
+        return self._normalize_image_size(getattr(calib, "image_size", None))
+
     def _footpoint_from_track(
-        self, track: Mapping[str, Any], frame_dims: Tuple[int, int]
+        self,
+        track: Mapping[str, Any],
+        frame_dims: Tuple[int, int],
+        *,
+        target_image_size: Optional[Tuple[int, int]] = None,
     ) -> Optional[Footpoint]:
         def _parse_uv(value: Any) -> Optional[Tuple[float, float]]:
             if not isinstance(value, (list, tuple)) or len(value) < 2:
@@ -5492,7 +5566,7 @@ class _AnalyticsTelemetryProcessor:
             return u, v
 
         def _clip_uv(u: float, v: float, *, vertical_overshoot_ratio: float = 0.01) -> Optional[Tuple[float, float]]:
-            frame_w, frame_h = frame_dims
+            frame_w, frame_h = source_image_size_tuple or frame_dims
             if frame_h:
                 margin = max(2.0, float(vertical_overshoot_ratio) * float(frame_h))
                 if v < -margin or v > (frame_h + margin):
@@ -5501,6 +5575,32 @@ class _AnalyticsTelemetryProcessor:
             if frame_w:
                 u = float(np.clip(u, 0.0, float(frame_w)))
             return u, v
+
+        source_image_size_tuple = (
+            self._normalize_image_size(track.get("image_size") or track.get("frame_size"))
+            or self._normalize_image_size(frame_dims)
+        )
+        target_image_size_tuple = self._normalize_image_size(target_image_size) or source_image_size_tuple
+        scale_x = 1.0
+        scale_y = 1.0
+        if source_image_size_tuple is not None and target_image_size_tuple is not None:
+            src_w, src_h = source_image_size_tuple
+            dst_w, dst_h = target_image_size_tuple
+            if src_w > 0 and src_h > 0 and dst_w > 0 and dst_h > 0:
+                scale_x = float(dst_w) / float(src_w)
+                scale_y = float(dst_h) / float(src_h)
+
+        def _scale_uv_to_target(u: float, v: float) -> Tuple[float, float]:
+            return float(u) * float(scale_x), float(v) * float(scale_y)
+
+        def _scale_bbox_to_target(bbox: Tuple[float, float, float, float]) -> Tuple[float, float, float, float]:
+            left, top, width, height = bbox
+            return (
+                float(left) * float(scale_x),
+                float(top) * float(scale_y),
+                float(width) * float(scale_x),
+                float(height) * float(scale_y),
+            )
 
         try:
             class_id = int(track.get("class_id", -1))
@@ -5536,6 +5636,15 @@ class _AnalyticsTelemetryProcessor:
             return None
         u = v = None
         method = None
+        bbox_source_tuple: Optional[Tuple[float, float, float, float]] = None
+        bbox = track.get("bbox")
+        if isinstance(bbox, (list, tuple)) and len(bbox) >= 4:
+            try:
+                left_b, top_b, width_b, height_b = [float(x) for x in bbox[:4]]
+                if width_b > 0.0 and height_b > 0.0:
+                    bbox_source_tuple = (float(left_b), float(top_b), float(width_b), float(height_b))
+            except Exception:
+                bbox_source_tuple = None
 
         image_anchor_keys = (("image_foot", "image_foot"), ("image_base", "image_base"))
         if track.get("world_source") == "bbox3d" or isinstance(track.get("bbox3d"), dict):
@@ -5553,11 +5662,10 @@ class _AnalyticsTelemetryProcessor:
             break
 
         if u is None or v is None:
-            bbox = track.get("bbox")
-            if not bbox or len(bbox) < 4:
+            if bbox_source_tuple is None:
                 return None
             try:
-                left, top, width, height = [float(x) for x in bbox[:4]]
+                left, top, width, height = [float(x) for x in bbox_source_tuple]
             except Exception:
                 return None
             if width <= 0.0 or height <= 0.0:
@@ -5569,6 +5677,8 @@ class _AnalyticsTelemetryProcessor:
                 return None
             u, v = clipped
             method = "bbox"
+        u, v = _scale_uv_to_target(float(u), float(v))
+        bbox_tuple = _scale_bbox_to_target(bbox_source_tuple) if bbox_source_tuple is not None else None
 
         stable_id = track.get("stable_id")
         try:
@@ -5623,6 +5733,48 @@ class _AnalyticsTelemetryProcessor:
                 depth_m = float(depth_candidate)
                 depth_source = depth_key
                 break
+        image_candidates: List[Dict[str, Any]] = []
+        for idx, (key, label) in enumerate((("image_foot", "image_foot"), ("image_base", "image_base"))):
+            uv = _parse_uv(track.get(key))
+            if uv is None:
+                continue
+            cand_u, cand_v = _scale_uv_to_target(float(uv[0]), float(uv[1]))
+            image_candidates.append(
+                {
+                    "name": str(label),
+                    "source": str(key),
+                    "priority": int(idx),
+                    "u": float(cand_u),
+                    "v": float(cand_v),
+                }
+            )
+        if bbox_source_tuple is not None:
+            left, top, width, height = bbox_source_tuple
+            bottom_center = _scale_uv_to_target(float(left + width * 0.5), float(top + height))
+            lower_center = _scale_uv_to_target(float(left + width * 0.5), float(top + height * 0.95))
+            image_candidates.extend(
+                [
+                    {
+                        "name": "bbox_bottom_center",
+                        "source": "bbox",
+                        "priority": 10,
+                        "u": float(bottom_center[0]),
+                        "v": float(bottom_center[1]),
+                    },
+                    {
+                        "name": "bbox_lower_center_95",
+                        "source": "bbox",
+                        "priority": 11,
+                        "u": float(lower_center[0]),
+                        "v": float(lower_center[1]),
+                    },
+                ]
+            )
+        frame_id_value = None
+        try:
+            frame_id_value = int(track.get("frame_id")) if track.get("frame_id") is not None else None
+        except Exception:
+            frame_id_value = None
         return Footpoint(
             u=u,
             v=v,
@@ -5636,6 +5788,28 @@ class _AnalyticsTelemetryProcessor:
             anchor_source=str(track.get("world_source")) if track.get("world_source") not in (None, "") else None,
             anchor_quality=str(track.get("world_quality")) if track.get("world_quality") not in (None, "") else None,
             anchor_reason=str(track.get("world_quality_reason")) if track.get("world_quality_reason") not in (None, "") else None,
+            bbox=bbox_tuple,
+            image_size=target_image_size_tuple or source_image_size_tuple,
+            frame_id=frame_id_value,
+            debug={
+                "image_candidates": image_candidates,
+                "track_frame_id": frame_id_value,
+                "track_image_size": list(source_image_size_tuple) if source_image_size_tuple is not None else None,
+                "bev_image_size": list(target_image_size_tuple) if target_image_size_tuple is not None else None,
+                "image_scale": [float(scale_x), float(scale_y)],
+                "world": list(track.get("world")) if isinstance(track.get("world"), (list, tuple)) else None,
+                "world_valid": bool(track.get("world_valid")) if track.get("world_valid") is not None else None,
+                "world_source": str(track.get("world_source")) if track.get("world_source") not in (None, "") else None,
+                "world_quality": str(track.get("world_quality")) if track.get("world_quality") not in (None, "") else None,
+                "world_quality_reason": str(track.get("world_quality_reason")) if track.get("world_quality_reason") not in (None, "") else None,
+                "depth_status": str(track.get("depth_status")) if track.get("depth_status") not in (None, "") else None,
+                "depth_anchor_source": str(track.get("depth_anchor_source")) if track.get("depth_anchor_source") not in (None, "") else None,
+                "depth_anchor_m": track.get("depth_anchor_m"),
+                "depth_used_m": track.get("depth_used_m"),
+                "depth_registered_m": track.get("depth_registered_m"),
+                "depth_registration_status": track.get("depth_registration_status"),
+                "depth_registration_id": track.get("depth_registration_id"),
+            },
         )
 
     def _frame_timestamp_us(self, frame_meta: Any) -> int:

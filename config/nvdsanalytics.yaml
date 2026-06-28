@@ -49,14 +49,14 @@ analytics:
             - id: RF2
               description: Kitchen wall photos
               points_px:
-              - - 1092.0
+              - - 1078.0
                 - 323.0
               - - 1066.0
                 - 499.0
               - - 1352.0
-                - 481.0
-              - - 1389.0
-                - 331.0
+                - 485.0
+              - - 1388.0
+                - 325.0
         '2':
           label: family_room
           roi_filtering:
@@ -76,14 +76,14 @@ analytics:
             - id: RF2
               description: TV
               points_px:
-              - - 8.0
-                - 619.0
+              - - 7.0
+                - 811.0
               - - 0.0
-                - 211.0
-              - - 192.0
-                - 223.0
-              - - 166.0
-                - 505.0
+                - 225.85493230174075
+              - - 195.0
+                - 241.0
+              - - 227.0
+                - 570.0
             - id: RF3
               description: window
               points_px:

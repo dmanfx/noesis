@@ -1,7 +1,7 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { CameraKey, cameraLabel, colorIdForPerson } from '../lib/camera';
 import { FloorplanResponse } from './DepthDrawer';
-import { renderLayerToCanvas, renderCompositeWalkableObstacleToCanvas, infernoColor, bwColor, decodeFloat32 } from '../lib/renderUtils';
+import { renderLayerToCanvas, renderCompositeWalkableObstacleToCanvas, infernoColor, bwColor } from '../lib/renderUtils';
 import type { BevFrameMode as CoordFrameMode } from '../lib/coordTransforms';
 import { isCameraLocalFrame, isWorldFrame } from '../lib/coordTransforms';
 import {
@@ -27,6 +27,15 @@ export type BevMeta = {
   footpoints?: Array<{
     x: number;
     y: number;
+    floorplanX?: number;
+    floorplanZ?: number;
+    normX?: number;
+    normY?: number;
+    normZ?: number;
+    floorplanInside?: boolean;
+    gridCol?: number | null;
+    gridRow?: number | null;
+    gridCell?: number[];
     method: string;
     stableId?: number | null;
     trackerId?: number | null;
@@ -34,6 +43,17 @@ export type BevMeta = {
     anchorQuality?: string | null;
     anchorReason?: string | null;
     displaySource?: string | null;
+    rawX?: number;
+    rawY?: number;
+    alignmentDebug?: {
+      candidates?: Array<{
+        name?: string;
+        rayFloor?: { x?: number; z?: number; normX?: number; normY?: number; insideBounds?: boolean; floorplanInside?: boolean };
+        mapanythingDepth?: { x?: number; z?: number; normX?: number; normY?: number; insideBounds?: boolean; floorplanInside?: boolean };
+        depthVsRayDeltaM?: number;
+      }>;
+      chosen?: { x?: number; z?: number; normX?: number; normY?: number; insideBounds?: boolean; floorplanInside?: boolean; displaySource?: string };
+    };
   }>;
   trails?: Array<{
     stableId?: number | null;
@@ -42,6 +62,14 @@ export type BevMeta = {
       x: number;
       y: number;
       t: number;
+      floorplanX?: number;
+      floorplanZ?: number;
+      normX?: number;
+      normY?: number;
+      normZ?: number;
+      floorplanInside?: boolean;
+      gridCol?: number | null;
+      gridRow?: number | null;
     }>;
   }>;
   xMin?: number;
@@ -54,6 +82,20 @@ export type BevMeta = {
   fallbackTrackCount?: number;
   fallbackSources?: string[];
   fallbackReasonCounts?: Record<string, number>;
+  floorplanCoordinateSpace?: string;
+  floorplanBounds?: MetricBounds;
+  floorplanGridShape?: number[] | null;
+  floorplanGridResM?: number | null;
+  droppedFootpoints?: Array<{
+    x?: number;
+    y?: number;
+    normX?: number;
+    normY?: number;
+    floorplanInside?: boolean;
+    stableId?: number | null;
+    trackerId?: number | null;
+    reason?: string;
+  }>;
   trail_smoothing_owner?: 'frontend' | 'backend' | 'none';
   bev_points_smoothed?: boolean;
   bev_world_points_smoothed?: boolean;
@@ -81,15 +123,15 @@ const DEFAULT_Z_MAX = 12;
 
 type ContentRect = { x: number; y: number; w: number; h: number };
 type MetricBounds = { min_x: number; max_x: number; min_z: number; max_z: number };
-type FloorplanSurfaceMap = {
-  rows: number;
-  cols: number;
-  valid: Uint8Array;
-  nearestRow: Int16Array;
-  nearestCol: Int16Array;
-  maxSnapCells: number;
-};
 type ResolvedMetricPoint = { x: number; y: number; mapped: boolean };
+type ProjectedMetricPoint = { px: number; py: number; clipped: boolean };
+type NormalizedPayloadPoint = {
+  x?: number;
+  y?: number;
+  normX?: number;
+  normY?: number;
+  floorplanInside?: boolean | null;
+};
 type FloorplanVisualSelection = {
   walkableLayer?: FloorplanResponse['walkable'];
   obstacleHeightLayer?: FloorplanResponse['obstacle_height'];
@@ -209,112 +251,36 @@ const floorplanBoundsForMode = (
   return { min_x: minX, max_x: maxX, min_z: minZ, max_z: maxZ };
 };
 
-const buildFloorplanSurfaceMap = (floorplan: FloorplanResponse | undefined): FloorplanSurfaceMap | null => {
-  if (!floorplan) return null;
-  const visual = selectFloorplanVisualSelection(floorplan, true);
-  const candidates = [
-    visual.baseLayer,
-    visual.obstacleHeightLayer,
-    visual.walkableLayer,
-    visual.heightLayer,
-    visual.densityLayer,
-    visual.distanceLayer,
-  ].filter((layer) => layer?.grid_b64 && Array.isArray(layer.grid_shape));
-  const base = candidates[0];
-  if (!base?.grid_shape) return null;
-  const [rowsRaw, colsRaw] = base.grid_shape;
-  const rows = Number(rowsRaw);
-  const cols = Number(colsRaw);
-  if (!Number.isFinite(rows) || !Number.isFinite(cols) || rows <= 0 || cols <= 0) return null;
-  const cellCount = rows * cols;
-  const valid = new Uint8Array(cellCount);
-  let markedCells = 0;
+const rawFloorplanBounds = (floorplan: FloorplanResponse | undefined): MetricBounds | null => {
+  const bounds = floorplan?.bounds;
+  if (!bounds) return null;
+  const minX = Number(bounds.min_x);
+  const maxX = Number(bounds.max_x);
+  const minZ = Number(bounds.min_z);
+  const maxZ = Number(bounds.max_z);
+  if (![minX, maxX, minZ, maxZ].every(Number.isFinite)) return null;
+  if (maxX <= minX || maxZ <= minZ) return null;
+  return { min_x: minX, max_x: maxX, min_z: minZ, max_z: maxZ };
+};
 
-  const markLayer = (layer: typeof base | undefined, accepts: (value: number) => boolean): number => {
-    if (!layer?.grid_b64 || !Array.isArray(layer.grid_shape)) return 0;
-    const [layerRows, layerCols] = layer.grid_shape;
-    if (Number(layerRows) !== rows || Number(layerCols) !== cols) return 0;
-    const values = decodeFloat32(layer.grid_b64);
-    if (!values || values.length < cellCount) return 0;
-    let count = 0;
-    for (let i = 0; i < cellCount; i += 1) {
-      if (!valid[i] && accepts(values[i])) {
-        valid[i] = 1;
-        count += 1;
-      }
-    }
-    return count;
-  };
+const rawPayloadBounds = (meta: BevMeta | undefined): MetricBounds | null => {
+  const minX = Number(meta?.xMin);
+  const maxX = Number(meta?.xMax);
+  const minZ = Number(meta?.zMin);
+  const maxZ = Number(meta?.zMax);
+  if (![minX, maxX, minZ, maxZ].every(Number.isFinite)) return null;
+  if (maxX <= minX || maxZ <= minZ) return null;
+  return { min_x: minX, max_x: maxX, min_z: minZ, max_z: maxZ };
+};
 
-  if (visual.baseKind === 'composite') {
-    markedCells += markLayer(visual.walkableLayer, (v) => Number.isFinite(v) && v > 0.5) ?? 0;
-    markedCells += markLayer(visual.obstacleHeightLayer, (v) => Number.isFinite(v) && v > 0.05) ?? 0;
-  } else if (visual.baseKind === 'walkable') {
-    markedCells += markLayer(visual.walkableLayer, (v) => Number.isFinite(v) && v > 0.5) ?? 0;
-  } else if (visual.baseKind === 'obstacle_height') {
-    markedCells += markLayer(visual.obstacleHeightLayer, (v) => Number.isFinite(v) && v > 0.05) ?? 0;
-  } else if (visual.baseKind === 'height') {
-    markedCells += markLayer(visual.densityLayer, (v) => Number.isFinite(v) && v > 1e-6) ?? 0;
-    markedCells += markLayer(visual.distanceLayer, (v) => Number.isFinite(v) && v > 0.0) ?? 0;
-    markedCells += markLayer(visual.heightLayer, (v) => Number.isFinite(v) && v > 1e-6) ?? 0;
-  }
-
-  if (markedCells <= 0 || !valid.some((v) => v > 0)) return null;
-
-  const nearestRow = new Int16Array(cellCount);
-  const nearestCol = new Int16Array(cellCount);
-  nearestRow.fill(-1);
-  nearestCol.fill(-1);
-  const queue = new Int32Array(cellCount);
-  let head = 0;
-  let tail = 0;
-  for (let row = 0; row < rows; row += 1) {
-    for (let col = 0; col < cols; col += 1) {
-      const idx = (row * cols) + col;
-      if (!valid[idx]) continue;
-      nearestRow[idx] = row;
-      nearestCol[idx] = col;
-      queue[tail] = idx;
-      tail += 1;
-    }
-  }
-
-  const offsets = [
-    [-1, 0],
-    [1, 0],
-    [0, -1],
-    [0, 1],
-    [-1, -1],
-    [-1, 1],
-    [1, -1],
-    [1, 1],
-  ];
-  while (head < tail) {
-    const idx = queue[head];
-    head += 1;
-    const row = Math.floor(idx / cols);
-    const col = idx % cols;
-    for (const [dr, dc] of offsets) {
-      const rr = row + dr;
-      const cc = col + dc;
-      if (rr < 0 || rr >= rows || cc < 0 || cc >= cols) continue;
-      const nextIdx = (rr * cols) + cc;
-      if (nearestRow[nextIdx] >= 0) continue;
-      nearestRow[nextIdx] = nearestRow[idx];
-      nearestCol[nextIdx] = nearestCol[idx];
-      queue[tail] = nextIdx;
-      tail += 1;
-    }
-  }
-
-  return {
-    rows,
-    cols,
-    valid,
-    nearestRow,
-    nearestCol,
-    maxSnapCells: Math.max(2, Math.round(Math.min(rows, cols) * 0.08)),
-  };
+const boundsNearlyEqual = (a: MetricBounds | null, b: MetricBounds | null, eps = 1e-3): boolean => {
+  if (!a || !b) return false;
+  return (
+    Math.abs(a.min_x - b.min_x) <= eps &&
+    Math.abs(a.max_x - b.max_x) <= eps &&
+    Math.abs(a.min_z - b.min_z) <= eps &&
+    Math.abs(a.max_z - b.max_z) <= eps
+  );
 };
 
 const normalizePayloadTsMs = (rawTs: unknown): number | null => {
@@ -466,57 +432,37 @@ export const BevView: React.FC<BevViewProps> = ({
       displayFloorplan?.bounds?.max_z,
     ]
   );
-  const displaySurfaceMap = useMemo(
-    () => buildFloorplanSurfaceMap(displayFloorplan),
-    [
-      displayFloorplan?.walkable?.grid_b64,
-      displayFloorplan?.obstacle_height?.grid_b64,
-      displayFloorplan?.height?.grid_b64,
-      displayFloorplan?.density?.grid_b64,
-      displayFloorplan?.distance?.grid_b64,
-    ]
-  );
   const resolveDisplayPoint = useCallback((x: number, y: number): ResolvedMetricPoint | null => {
     if (!Number.isFinite(x) || !Number.isFinite(y)) return null;
     if (!displayBounds) return { x, y, mapped: false };
 
-    const spanX = Math.max(1e-6, displayBounds.max_x - displayBounds.min_x);
-    const spanZ = Math.max(1e-6, displayBounds.max_z - displayBounds.min_z);
-    const colFloat = ((x - displayBounds.min_x) / spanX) * (displaySurfaceMap?.cols ?? 1);
-    const rowFloat = (1.0 - ((y - displayBounds.min_z) / spanZ)) * (displaySurfaceMap?.rows ?? 1);
-
-    if (!displaySurfaceMap) {
-      if (x < displayBounds.min_x || x > displayBounds.max_x || y < displayBounds.min_z || y > displayBounds.max_z) return null;
-      return { x, y, mapped: false };
+    if (x < displayBounds.min_x || x > displayBounds.max_x || y < displayBounds.min_z || y > displayBounds.max_z) {
+      return null;
     }
+    return { x, y, mapped: false };
+  }, [displayBounds]);
 
-    const rawCol = Math.floor(colFloat);
-    const rawRow = Math.floor(rowFloat);
-    const col = Math.max(0, Math.min(displaySurfaceMap.cols - 1, rawCol));
-    const row = Math.max(0, Math.min(displaySurfaceMap.rows - 1, rawRow));
-    const edgeDistanceCells = Math.max(
-      rawCol < 0 ? -rawCol : 0,
-      rawCol >= displaySurfaceMap.cols ? rawCol - displaySurfaceMap.cols + 1 : 0,
-      rawRow < 0 ? -rawRow : 0,
-      rawRow >= displaySurfaceMap.rows ? rawRow - displaySurfaceMap.rows + 1 : 0
-    );
-    const idx = (row * displaySurfaceMap.cols) + col;
-    if (displaySurfaceMap.valid[idx] && edgeDistanceCells === 0) {
-      return { x, y, mapped: false };
+  const resolvePayloadPoint = useCallback((pt: NormalizedPayloadPoint | null | undefined): ResolvedMetricPoint | null => {
+    if (!pt) return null;
+    const normX = Number(pt.normX);
+    const normY = Number(pt.normY);
+    if (displayBounds && Number.isFinite(normX) && Number.isFinite(normY)) {
+      if (pt.floorplanInside === false || normX < 0 || normX > 1 || normY < 0 || normY > 1) {
+        return null;
+      }
+      const spanX = displayBounds.max_x - displayBounds.min_x;
+      const spanZ = displayBounds.max_z - displayBounds.min_z;
+      if (!Number.isFinite(spanX) || !Number.isFinite(spanZ) || spanX <= 0 || spanZ <= 0) {
+        return null;
+      }
+      return {
+        x: displayBounds.min_x + (normX * spanX),
+        y: displayBounds.max_z - (normY * spanZ),
+        mapped: true,
+      };
     }
-
-    const nearestRow = displaySurfaceMap.nearestRow[idx];
-    const nearestCol = displaySurfaceMap.nearestCol[idx];
-    if (nearestRow < 0 || nearestCol < 0) return null;
-    const snapDistanceCells = Math.max(Math.abs(nearestRow - row), Math.abs(nearestCol - col), edgeDistanceCells);
-    if (snapDistanceCells > displaySurfaceMap.maxSnapCells) return null;
-
-    return {
-      x: displayBounds.min_x + ((nearestCol + 0.5) / displaySurfaceMap.cols) * spanX,
-      y: displayBounds.max_z - ((nearestRow + 0.5) / displaySurfaceMap.rows) * spanZ,
-      mapped: true,
-    };
-  }, [displayBounds, displaySurfaceMap]);
+    return resolveDisplayPoint(Number(pt.x), Number(pt.y));
+  }, [displayBounds, resolveDisplayPoint]);
 
   useEffect(() => {
     metaRef.current = meta;
@@ -617,9 +563,7 @@ export const BevView: React.FC<BevViewProps> = ({
       trails.clear();
       const seenIds = new Set<string>();
       points.forEach(pt => {
-        const px = Number(pt.x);
-        const py = Number(pt.y);
-        const resolved = resolveDisplayPoint(px, py);
+        const resolved = resolvePayloadPoint(pt);
         if (!resolved) {
           dropUnresolvedPoint(pt);
           return;
@@ -652,7 +596,7 @@ export const BevView: React.FC<BevViewProps> = ({
       const sceneUnitsPerPx = trailSceneUnitsPerPxRef.current;
 
       points.forEach(pt => {
-        const resolved = resolveDisplayPoint(Number(pt.x), Number(pt.y));
+        const resolved = resolvePayloadPoint(pt);
         if (!resolved) {
           dropUnresolvedPoint(pt);
           return;
@@ -699,7 +643,7 @@ export const BevView: React.FC<BevViewProps> = ({
     }
 
     pruneTrailCollection(trails, arrivalNow, cfg);
-  }, [cam, meta, resolveDisplayPoint, resolvedTrailConfig]);
+  }, [cam, meta, resolvePayloadPoint, resolvedTrailConfig]);
 
   useEffect(() => {
     const render = () => {
@@ -791,8 +735,11 @@ export const BevView: React.FC<BevViewProps> = ({
       const heightHighPct = clampNumber(heightRenderTuning.highPct, Math.max(1, heightLowPct + 1), 100);
       const heightGamma = clampNumber(heightRenderTuning.gamma, 0.25, 3.0);
       const densityCutoff = clampNumber(heightRenderTuning.densityCutoff, 0.0, 0.5);
+      const layerRenderKey = isHeightVisual
+        ? `${heightLowPct}:${heightHighPct}:${heightGamma.toFixed(3)}:${densityCutoff.toFixed(4)}:${heightRenderTuning.smoothing ? 1 : 0}`
+        : 'layer';
       const key = hasFloorplan
-        ? `${baseKind}:${floorplanNow?.snapshot_ts ?? floorplanNow?.ts ?? ''}:${baseLayer?.grid_shape?.join('x')}:${baseLayer?.value_min ?? ''}:${baseLayer?.value_max ?? ''}:${baseLayer?.grid_b64?.length ?? ''}:${hasComposite ? (obstacleHeightLayer?.grid_b64?.length ?? '') : ''}:${isHeightVisual ? (densityLayer?.grid_b64?.length ?? '') : ''}:${aspect}:${fitMode}:${boundsAspect.toFixed(6)}:${padCss.toFixed(3)}:${smoothBaseImage ? 'smooth' : 'sharp'}:${isHeightVisual ? `${heightLowPct}:${heightHighPct}:${heightGamma.toFixed(3)}:${densityCutoff.toFixed(4)}:${heightRenderTuning.smoothing ? 1 : 0}` : 'layer'}`
+        ? `${baseKind}:${floorplanNow?.snapshot_ts ?? floorplanNow?.ts ?? ''}:${baseLayer?.grid_shape?.join('x')}:${baseLayer?.value_min ?? ''}:${baseLayer?.value_max ?? ''}:${baseLayer?.grid_b64?.length ?? ''}:${hasComposite ? (obstacleHeightLayer?.grid_b64?.length ?? '') : ''}:${isHeightVisual ? (densityLayer?.grid_b64?.length ?? '') : ''}:${aspect}:${fitMode}:${boundsAspect.toFixed(6)}:${padCss.toFixed(3)}:${smoothBaseImage ? 'smooth' : 'sharp'}:${layerRenderKey}`
         : `none:${aspect}:${fitMode}:${boundsAspect.toFixed(6)}:${padCss.toFixed(3)}`;
 
       const bg = bgCanvasRef.current ?? (bgCanvasRef.current = document.createElement('canvas'));
@@ -858,16 +805,157 @@ export const BevView: React.FC<BevViewProps> = ({
       const drawY = (mz: number) => contentRect.y + contentRect.h - ((mz - zMin) / (zMax - zMin)) * contentRect.h;
       const resolveForDraw = (mx: number, mz: number): ResolvedMetricPoint | null => resolveDisplayPoint(mx, mz);
       const inBounds = (mx: number, mz: number) => resolveForDraw(mx, mz) !== null;
+      const activeDrawBounds: MetricBounds = { min_x: xMin, max_x: xMax, min_z: zMin, max_z: zMax };
+      const floorplanLayerBounds = rawFloorplanBounds(floorplanNow);
+      const payloadLayerBounds = rawPayloadBounds(metaNow);
+
+      const projectForBounds = (bounds: MetricBounds, mx: number, mz: number, clamp = false): ProjectedMetricPoint | null => {
+        const spanX = bounds.max_x - bounds.min_x;
+        const spanZ = bounds.max_z - bounds.min_z;
+        if (!Number.isFinite(spanX) || !Number.isFinite(spanZ) || spanX <= 0 || spanZ <= 0) return null;
+        const nxRaw = (mx - bounds.min_x) / spanX;
+        const nzRaw = (mz - bounds.min_z) / spanZ;
+        if (!clamp && (nxRaw < 0 || nxRaw > 1 || nzRaw < 0 || nzRaw > 1)) return null;
+        const nx = clampNumber(nxRaw, 0, 1);
+        const nz = clampNumber(nzRaw, 0, 1);
+        return {
+          px: contentRect.x + nx * contentRect.w,
+          py: contentRect.y + contentRect.h - nz * contentRect.h,
+          clipped: nx !== nxRaw || nz !== nzRaw,
+        };
+      };
+
+      const drawArrow = (x0: number, y0: number, x1: number, y1: number, color: string, labelText: string) => {
+        const angle = Math.atan2(y1 - y0, x1 - x0);
+        const head = 5;
+        ctx.strokeStyle = color;
+        ctx.fillStyle = color;
+        ctx.lineWidth = 1.5;
+        ctx.beginPath();
+        ctx.moveTo(x0, y0);
+        ctx.lineTo(x1, y1);
+        ctx.stroke();
+        ctx.beginPath();
+        ctx.moveTo(x1, y1);
+        ctx.lineTo(x1 - head * Math.cos(angle - Math.PI / 6), y1 - head * Math.sin(angle - Math.PI / 6));
+        ctx.lineTo(x1 - head * Math.cos(angle + Math.PI / 6), y1 - head * Math.sin(angle + Math.PI / 6));
+        ctx.closePath();
+        ctx.fill();
+        ctx.font = 'bold 9px sans-serif';
+        ctx.lineWidth = 3;
+        ctx.strokeStyle = 'rgba(0, 0, 0, 0.72)';
+        ctx.strokeText(labelText, x1 + 3, y1 - 3);
+        ctx.fillStyle = color;
+        ctx.fillText(labelText, x1 + 3, y1 - 3);
+      };
+
+      const drawOriginLayer = (
+        bounds: MetricBounds | null,
+        labelText: string,
+        legendText: string,
+        color: string,
+        labelOffsetY: number,
+        dash: number[]
+      ): boolean => {
+        if (!bounds) return false;
+        const origin = projectForBounds(bounds, 0, 0, true);
+        if (!origin) return false;
+        const xAxis = projectForBounds(bounds, 0, 0, false);
+
+        ctx.save();
+        ctx.lineWidth = 1.5;
+        ctx.strokeStyle = color;
+        ctx.fillStyle = color;
+        ctx.setLineDash(dash);
+        ctx.globalAlpha = 0.78;
+        ctx.beginPath();
+        if (bounds.min_z <= 0 && bounds.max_z >= 0) {
+          const z0 = projectForBounds(bounds, bounds.min_x, 0, false);
+          const z1 = projectForBounds(bounds, bounds.max_x, 0, false);
+          if (z0 && z1) {
+            ctx.moveTo(z0.px, z0.py);
+            ctx.lineTo(z1.px, z1.py);
+          }
+        }
+        if (bounds.min_x <= 0 && bounds.max_x >= 0) {
+          const x0 = projectForBounds(bounds, 0, bounds.min_z, false);
+          const x1 = projectForBounds(bounds, 0, bounds.max_z, false);
+          if (x0 && x1) {
+            ctx.moveTo(x0.px, x0.py);
+            ctx.lineTo(x1.px, x1.py);
+          }
+        }
+        ctx.stroke();
+        ctx.setLineDash([]);
+        ctx.globalAlpha = 1;
+
+        const markerSize = origin.clipped ? 6 : 5;
+        ctx.fillStyle = 'rgba(0, 0, 0, 0.72)';
+        ctx.strokeStyle = color;
+        ctx.lineWidth = 2;
+        ctx.beginPath();
+        ctx.moveTo(origin.px, origin.py - markerSize);
+        ctx.lineTo(origin.px + markerSize, origin.py);
+        ctx.lineTo(origin.px, origin.py + markerSize);
+        ctx.lineTo(origin.px - markerSize, origin.py);
+        ctx.closePath();
+        ctx.fill();
+        ctx.stroke();
+
+        if (xAxis && !origin.clipped) {
+          const arrowLen = 28;
+          const xEnd = Math.min(contentRect.x + contentRect.w - 18, origin.px + arrowLen);
+          const zEnd = Math.max(contentRect.y + 18, origin.py - arrowLen);
+          if (xEnd > origin.px + 8) drawArrow(origin.px, origin.py, xEnd, origin.py, color, '+X');
+          if (zEnd < origin.py - 8) drawArrow(origin.px, origin.py, origin.px, zEnd, color, '+Z');
+        }
+
+        const label = `${labelText}${origin.clipped ? ' off' : ''}`;
+        const labelX = clampNumber(origin.px + 8, contentRect.x + 4, contentRect.x + contentRect.w - 86);
+        const labelY = clampNumber(origin.py + labelOffsetY, contentRect.y + 12, contentRect.y + contentRect.h - 5);
+        ctx.font = 'bold 10px sans-serif';
+        ctx.lineWidth = 3;
+        ctx.strokeStyle = 'rgba(0, 0, 0, 0.78)';
+        ctx.strokeText(label, labelX, labelY);
+        ctx.fillStyle = color;
+        ctx.fillText(label, labelX, labelY);
+
+        ctx.restore();
+        return Boolean(legendText);
+      };
+
+      const drawOriginLegend = (rows: Array<{ text: string; color: string }>) => {
+        if (!rows.length) return;
+        const pad = 5;
+        const lineH = 12;
+        const legendW = 128;
+        const legendH = pad * 2 + rows.length * lineH;
+        const legendX = contentRect.x + 8;
+        const legendY = contentRect.y + contentRect.h - legendH - 8;
+        ctx.save();
+        ctx.fillStyle = 'rgba(0, 0, 0, 0.66)';
+        ctx.fillRect(legendX, legendY, legendW, legendH);
+        ctx.font = '10px monospace';
+        rows.forEach((row, idx) => {
+          const y = legendY + pad + ((idx + 1) * lineH) - 3;
+          ctx.fillStyle = row.color;
+          ctx.fillText(row.text, legendX + pad, y);
+        });
+        ctx.restore();
+      };
 
       const footpoints = Array.isArray(metaNow?.footpoints) ? metaNow.footpoints : [];
+      const droppedFootpoints = Array.isArray(metaNow?.droppedFootpoints) ? metaNow.droppedFootpoints : [];
       let finitePointCount = 0;
       let inBoundsPointCount = 0;
       for (const p of footpoints) {
         const px = Number(p?.x);
         const py = Number(p?.y);
-        if (!Number.isFinite(px) || !Number.isFinite(py)) continue;
+        const nx = Number(p?.normX);
+        const ny = Number(p?.normY);
+        if ((!Number.isFinite(px) || !Number.isFinite(py)) && (!Number.isFinite(nx) || !Number.isFinite(ny))) continue;
         finitePointCount += 1;
-        if (resolveForDraw(px, py)) inBoundsPointCount += 1;
+        if (resolvePayloadPoint(p)) inBoundsPointCount += 1;
       }
 
       if (overlayEnabled) {
@@ -902,6 +990,25 @@ export const BevView: React.FC<BevViewProps> = ({
           ctx.lineTo(u0, contentRect.y + contentRect.h);
         }
         ctx.stroke();
+
+        const originRows: Array<{ text: string; color: string }> = [];
+        const floorColor = 'rgba(124, 255, 147, 0.95)';
+        const drawColor = 'rgba(89, 218, 255, 0.95)';
+        const payloadColor = 'rgba(255, 93, 206, 0.95)';
+        if (drawOriginLayer(floorplanLayerBounds, 'F0 floor', 'F0 floor', floorColor, -24, [5, 4])) {
+          originRows.push({ text: 'F0 floorplan', color: floorColor });
+        }
+        if (drawOriginLayer(activeDrawBounds, 'T0 track', 'T0 track', drawColor, -10, [])) {
+          originRows.push({ text: 'T0 track/trail', color: drawColor });
+        }
+        if (
+          payloadLayerBounds &&
+          !boundsNearlyEqual(payloadLayerBounds, activeDrawBounds) &&
+          drawOriginLayer(payloadLayerBounds, 'P0 payload', 'P0 payload', payloadColor, 6, [2, 3])
+        ) {
+          originRows.push({ text: 'P0 payload', color: payloadColor });
+        }
+        drawOriginLegend(originRows);
       }
 
       const now = Date.now();
@@ -910,6 +1017,77 @@ export const BevView: React.FC<BevViewProps> = ({
 
       const hueForId = (id: number) => (id * 47) % 360;
       const hsla = (id: number, a: number) => `hsla(${hueForId(id)}, 80%, 60%, ${a})`;
+      const drawDebugCross = (mx: number, mz: number, color: string, size = 4) => {
+        const resolved = resolveForDraw(mx, mz);
+        if (!resolved) return;
+        const px = drawX(resolved.x);
+        const py = drawY(resolved.y);
+        ctx.strokeStyle = color;
+        ctx.lineWidth = 1.5;
+        ctx.beginPath();
+        ctx.moveTo(px - size, py);
+        ctx.lineTo(px + size, py);
+        ctx.moveTo(px, py - size);
+        ctx.lineTo(px, py + size);
+        ctx.stroke();
+      };
+
+      const drawDroppedMarker = (pt: NormalizedPayloadPoint, labelText: string) => {
+        const nx = Number(pt?.normX);
+        const ny = Number(pt?.normY);
+        if (!Number.isFinite(nx) || !Number.isFinite(ny)) return;
+        const px = contentRect.x + clampNumber(nx, 0, 1) * contentRect.w;
+        const py = contentRect.y + clampNumber(ny, 0, 1) * contentRect.h;
+        ctx.save();
+        ctx.fillStyle = 'rgba(244, 67, 54, 0.92)';
+        ctx.strokeStyle = 'rgba(0, 0, 0, 0.78)';
+        ctx.lineWidth = 1.5;
+        ctx.beginPath();
+        ctx.arc(px, py, 5, 0, 2 * Math.PI);
+        ctx.fill();
+        ctx.stroke();
+        ctx.font = 'bold 10px sans-serif';
+        ctx.lineWidth = 3;
+        ctx.strokeText(labelText, px + 7, py - 7);
+        ctx.fillStyle = '#ff8f8f';
+        ctx.fillText(labelText, px + 7, py - 7);
+        ctx.restore();
+      };
+
+      if (debug) {
+        droppedFootpoints.slice(0, 8).forEach((pt, idx) => {
+          const stableNum = typeof pt?.stableId === 'number' && Number.isFinite(pt.stableId) ? pt.stableId : null;
+          const trackerNum = typeof pt?.trackerId === 'number' && Number.isFinite(pt.trackerId) ? pt.trackerId : null;
+          const displayId = displayIdForPoint(stableNum, trackerNum);
+          drawDroppedMarker(pt, displayId === null ? `drop${idx + 1}` : `${displayId} off`);
+        });
+        for (const p of footpoints) {
+          const dbg = p?.alignmentDebug;
+          if (!dbg || !Array.isArray(dbg.candidates)) continue;
+          for (const cand of dbg.candidates) {
+            const rayX = Number(cand?.rayFloor?.x);
+            const rayZ = Number(cand?.rayFloor?.z);
+            const depthX = Number(cand?.mapanythingDepth?.x);
+            const depthZ = Number(cand?.mapanythingDepth?.z);
+            const hasRay = Number.isFinite(rayX) && Number.isFinite(rayZ);
+            const hasDepth = Number.isFinite(depthX) && Number.isFinite(depthZ);
+            if (hasRay) drawDebugCross(rayX, rayZ, 'rgba(80, 200, 255, 0.72)', 3.5);
+            if (hasDepth) drawDebugCross(depthX, depthZ, 'rgba(255, 96, 80, 0.74)', 3.5);
+            if (hasRay && hasDepth) {
+              const rr = resolveForDraw(rayX, rayZ);
+              const dr = resolveForDraw(depthX, depthZ);
+              if (rr && dr) {
+                ctx.strokeStyle = 'rgba(255, 255, 255, 0.25)';
+                ctx.lineWidth = 1;
+                ctx.beginPath();
+                ctx.moveTo(drawX(rr.x), drawY(rr.y));
+                ctx.lineTo(drawX(dr.x), drawY(dr.y));
+                ctx.stroke();
+              }
+            }
+          }
+        }
+      }
 
       // Time-based pruning must run even when BEV meta updates stop, otherwise
       // the last-seen trail head can stick around indefinitely.
@@ -947,10 +1125,16 @@ export const BevView: React.FC<BevViewProps> = ({
                   x: Number(p?.x),
                   y: Number(p?.y),
                   t: Number(p?.t),
+                  normX: Number(p?.normX),
+                  normY: Number(p?.normY),
+                  floorplanInside: p?.floorplanInside,
                 }))
                 .map((p) => {
-                  if (!Number.isFinite(p.x) || !Number.isFinite(p.y) || !Number.isFinite(p.t)) return null;
-                  const resolved = resolveForDraw(p.x, p.y);
+                  if (!Number.isFinite(p.t)) return null;
+                  const hasMetric = Number.isFinite(p.x) && Number.isFinite(p.y);
+                  const hasNorm = Number.isFinite(p.normX) && Number.isFinite(p.normY);
+                  if (!hasMetric && !hasNorm) return null;
+                  const resolved = resolvePayloadPoint(p);
                   if (!resolved) return { x: Number.NaN, y: Number.NaN, t: p.t };
                   return { x: resolved.x, y: resolved.y, t: p.t };
                 })
@@ -1097,7 +1281,7 @@ export const BevView: React.FC<BevViewProps> = ({
           `mode=${coordMode}`,
           `frame=${String(floorplanFrame || 'none')}`,
           `units=${String(metaNow?.units || floorplanNow?.units || 'unknown')}`,
-          `pts=${finitePointCount} in=${inBoundsPointCount}`,
+          `pts=${finitePointCount} in=${inBoundsPointCount} drop=${droppedFootpoints.length}`,
           `x:[${xMin.toFixed(2)},${xMax.toFixed(2)}] z:[${zMin.toFixed(2)},${zMax.toFixed(2)}]`,
         ];
         const panelPad = 6;
@@ -1120,7 +1304,7 @@ export const BevView: React.FC<BevViewProps> = ({
     return () => {
       if (animationFrameRef.current) cancelAnimationFrame(animationFrameRef.current);
     };
-  }, [coordMode, debug, displayBounds, floorplan, heightRenderTuning, overlayEnabled, resolveDisplayPoint, resolvedTrailConfig, variant]);
+  }, [coordMode, debug, displayBounds, floorplan, heightRenderTuning, overlayEnabled, resolveDisplayPoint, resolvePayloadPoint, resolvedTrailConfig, variant]);
 
   const floorplanFrame = displayFloorplan?.frame;
   const hasFloorplanFrame = typeof floorplanFrame === 'string' && floorplanFrame.trim().length > 0;

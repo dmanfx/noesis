@@ -37,6 +37,11 @@ def _normalize_path_like(value: Any, *, repo_root: Path) -> Any:
         return raw
     candidate = Path(raw)
     if candidate.is_absolute():
+        # Preserve repo-relative intent before resolving symlinks such as models -> second-drive storage.
+        try:
+            return candidate.absolute().relative_to(repo_root.absolute()).as_posix()
+        except Exception:
+            pass
         try:
             return candidate.resolve().relative_to(repo_root.resolve()).as_posix()
         except Exception:

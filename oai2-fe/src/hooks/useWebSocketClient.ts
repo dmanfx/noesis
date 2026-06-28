@@ -88,7 +88,7 @@ export type FloorplanRequest = {
   cacheOnly?: boolean;
 };
 
-export type DepthRequestStrategy = 'fresh' | 'cache-first';
+export type DepthRequestStrategy = 'fresh' | 'cache-first' | 'cache-only';
 
 export function useWebSocketClient(url: string, handlers: FrameHandlers) {
   const socketRef = useRef<WebSocket | null>(null);
@@ -116,10 +116,11 @@ export function useWebSocketClient(url: string, handlers: FrameHandlers) {
         cache_only: (obj as any).cache_only,
       };
     }
-    if (type === 'get_ma_depth') {
+    if (type === 'get_ma_depth' || type === 'get_ma_depth_cache') {
       return {
         ...base,
         ts_max_us: (obj as any).ts_max_us,
+        cache_only: (obj as any).cache_only,
       };
     }
     return base;
@@ -306,7 +307,7 @@ export function useWebSocketClient(url: string, handlers: FrameHandlers) {
   const sendJson = (obj: any) => {
     const ws = socketRef.current;
     if (!ws || ws.readyState !== WebSocket.OPEN) return false;
-    if (obj && (obj.type === 'get_ma_depth' || obj.type === 'get_floorplan')) {
+    if (obj && (obj.type === 'get_ma_depth' || obj.type === 'get_ma_depth_cache' || obj.type === 'get_floorplan')) {
       const summary = summarizeWsMessage(obj);
       const key = `send:${String(obj.type)}:${String((summary as any).camera ?? '')}`;
       wsLog.debugRateLimited(
@@ -333,7 +334,7 @@ export function useWebSocketClient(url: string, handlers: FrameHandlers) {
     if (typeof normalized === 'number') {
       return normalized;
     }
-    if (strategy === 'cache-first') {
+    if (strategy === 'cache-first' || strategy === 'cache-only') {
       return Math.floor(Date.now() * 1000);
     }
     return undefined;
@@ -356,18 +357,21 @@ export function useWebSocketClient(url: string, handlers: FrameHandlers) {
     requestMapAnythingDepth: (camId: string, strategy: DepthRequestStrategy = 'fresh', tsMaxOverride?: number) => {
       if (!camId) return false;
       const existing = depthInFlightRef.current[camId];
-      if (strategy === 'cache-first' && existing && existing.size > 0) {
+      if ((strategy === 'cache-first' || strategy === 'cache-only') && existing && existing.size > 0) {
         return false;
       }
       const requestId = `${camId}-${Date.now()}-${Math.random().toString(16).slice(2, 8)}`;
       const tsMaxUs = computeTsMaxUs(strategy, tsMaxOverride);
       const payload: Record<string, unknown> = {
-        type: 'get_ma_depth',
+        type: strategy === 'cache-only' ? 'get_ma_depth_cache' : 'get_ma_depth',
         camera: camId,
         request_id: requestId
       };
       if (typeof tsMaxUs === 'number') {
         payload.ts_max_us = tsMaxUs;
+      }
+      if (strategy === 'cache-only') {
+        payload.cache_only = true;
       }
       const ok = sendJson(payload);
       if (ok) {

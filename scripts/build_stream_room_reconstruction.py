@@ -85,6 +85,56 @@ class FrameCloud:
     image_ref: str
 
 
+def _normalize_vec3(value: np.ndarray, *, fallback: Sequence[float] = (0.0, 1.0, 0.0)) -> np.ndarray:
+    vec = np.asarray(value, dtype=np.float64).reshape(3)
+    norm = float(np.linalg.norm(vec))
+    if norm <= 1e-12 or not np.isfinite(norm):
+        return np.asarray(fallback, dtype=np.float64)
+    return vec / norm
+
+
+def _skew_symmetric(vec: np.ndarray) -> np.ndarray:
+    x, y, z = [float(v) for v in np.asarray(vec, dtype=np.float64).reshape(3)]
+    return np.asarray(
+        [
+            [0.0, -z, y],
+            [z, 0.0, -x],
+            [-y, x, 0.0],
+        ],
+        dtype=np.float64,
+    )
+
+
+def _rotation_matrix_between(source: np.ndarray, target: np.ndarray) -> np.ndarray:
+    src = _normalize_vec3(source)
+    dst = _normalize_vec3(target)
+    dot = float(np.clip(np.dot(src, dst), -1.0, 1.0))
+    if dot > 1.0 - 1e-9:
+        return np.eye(3, dtype=np.float64)
+    if dot < -1.0 + 1e-9:
+        axis = np.cross(src, np.asarray([1.0, 0.0, 0.0], dtype=np.float64))
+        if float(np.linalg.norm(axis)) <= 1e-9:
+            axis = np.cross(src, np.asarray([0.0, 0.0, 1.0], dtype=np.float64))
+        axis = _normalize_vec3(axis)
+        k = _skew_symmetric(axis)
+        return np.eye(3, dtype=np.float64) + 2.0 * (k @ k)
+    cross = np.cross(src, dst)
+    k = _skew_symmetric(cross)
+    return np.eye(3, dtype=np.float64) + k + (k @ k) * (1.0 / (1.0 + dot))
+
+
+def _translation_matrix(offset: Sequence[float]) -> np.ndarray:
+    mat = np.eye(4, dtype=np.float64)
+    mat[:3, 3] = np.asarray(offset, dtype=np.float64).reshape(3)
+    return mat
+
+
+def _homogeneous_rotation(rotation: np.ndarray) -> np.ndarray:
+    mat = np.eye(4, dtype=np.float64)
+    mat[:3, :3] = np.asarray(rotation, dtype=np.float64).reshape(3, 3)
+    return mat
+
+
 def _read_yaml(path: Path) -> dict[str, Any]:
     with Path(path).open("r", encoding="utf-8") as handle:
         payload = yaml.safe_load(handle) or {}
@@ -707,6 +757,69 @@ def _relative_path(path: Path) -> str:
         return str(path)
 
 
+def _latest_floorplan_payload(floorplan_base: Path, camera_id: str) -> tuple[dict[str, Any], Path] | None:
+    root = Path(floorplan_base) / str(camera_id)
+    if not root.exists():
+        return None
+    candidates = [path for path in root.glob("*.json") if path.is_file()]
+    if not candidates:
+        return None
+    candidates.sort(key=lambda path: (path.stat().st_mtime_ns, path.name), reverse=True)
+    for path in candidates:
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        if not isinstance(payload, dict):
+            continue
+        payload_camera = str(payload.get("camera_id") or payload.get("camera") or "").strip()
+        if payload_camera and payload_camera != str(camera_id):
+            continue
+        return payload, path
+    return None
+
+
+def _floorplan_layer_summary(layer: Any) -> dict[str, Any] | None:
+    if not isinstance(layer, dict):
+        return None
+    shape = layer.get("grid_shape") or layer.get("shape")
+    if not isinstance(shape, (list, tuple)) or len(shape) < 2:
+        return None
+    return {
+        "grid_shape": [int(shape[0]), int(shape[1])],
+        "value_min": float(layer["value_min"]) if layer.get("value_min") is not None else None,
+        "value_max": float(layer["value_max"]) if layer.get("value_max") is not None else None,
+        "grid_b64_bytes": int(len(str(layer.get("grid_b64") or ""))),
+    }
+
+
+def _floorplan_footprint_summary(payload: dict[str, Any], source_path: Path | None) -> dict[str, Any]:
+    bounds = payload.get("bounds") if isinstance(payload.get("bounds"), dict) else {}
+    shape = None
+    for layer_name in ("walkable", "density", "obstacle_height", "height"):
+        layer = payload.get(layer_name)
+        summary = _floorplan_layer_summary(layer)
+        if summary:
+            shape = summary["grid_shape"]
+            break
+    return {
+        "source": "mapanything_floorplan_cache",
+        "source_path": _relative_path(source_path) if source_path else None,
+        "camera_id": payload.get("camera_id"),
+        "floorplan_ts_us": int(payload.get("ts") or 0),
+        "snapshot_ts_us": int(payload.get("snapshot_ts") or 0) if payload.get("snapshot_ts") is not None else None,
+        "frame": payload.get("frame"),
+        "orientation": payload.get("orientation"),
+        "units": payload.get("units"),
+        "bounds": bounds,
+        "grid_shape": shape,
+        "scale_m_per_px": float(payload["scale_m_per_px"]) if payload.get("scale_m_per_px") is not None else None,
+        "density": _floorplan_layer_summary(payload.get("density")),
+        "walkable": _floorplan_layer_summary(payload.get("walkable")),
+        "obstacle_height": _floorplan_layer_summary(payload.get("obstacle_height")),
+    }
+
+
 def _valid_depth_mask(snapshot: DepthSnapshot, min_confidence: float, depth_clip_m: float | None = None) -> np.ndarray:
     valid = (
         np.asarray(snapshot.mask, dtype=bool)
@@ -831,6 +944,250 @@ def _estimate_observed_floor_y(frames: Sequence[FrameCloud], calibrated_floor_y:
     }
 
 
+def _sample_world_points(frames: Sequence[FrameCloud], *, budget: int) -> np.ndarray:
+    rows: list[np.ndarray] = []
+    for frame in frames:
+        pts = np.asarray(frame.points_world, dtype=np.float64).reshape((-1, 3))
+        pts = pts[np.isfinite(pts).all(axis=1)]
+        if pts.shape[0] <= 0:
+            continue
+        stride = _bounded_stride(pts.shape[0], max(1, int(budget // max(1, len(frames)))))
+        rows.append(pts[::stride])
+    if not rows:
+        return np.zeros((0, 3), dtype=np.float64)
+    sampled = np.concatenate(rows, axis=0)
+    if sampled.shape[0] > int(budget):
+        sampled = sampled[::_bounded_stride(sampled.shape[0], int(budget))]
+    return sampled.astype(np.float64, copy=False)
+
+
+def _floor_envelope_rows(
+    points_world: np.ndarray,
+    *,
+    cell_m: float,
+    low_percentile: float,
+    band_m: float,
+    min_cell_points: int,
+) -> np.ndarray:
+    points = np.asarray(points_world, dtype=np.float64).reshape((-1, 3))
+    points = points[np.isfinite(points).all(axis=1)]
+    if points.shape[0] < max(32, int(min_cell_points) * 3):
+        return np.zeros((0, 4), dtype=np.float64)
+
+    xz = points[:, [0, 2]]
+    origin = np.percentile(xz, 1.0, axis=0)
+    cell_size = max(0.12, float(cell_m))
+    keys = np.floor((xz - origin[None, :]) / cell_size).astype(np.int32)
+    order = np.lexsort((keys[:, 1], keys[:, 0]))
+    points = points[order]
+    keys = keys[order]
+
+    rows: list[list[float]] = []
+    i = 0
+    while i < points.shape[0]:
+        j = i + 1
+        while j < points.shape[0] and int(keys[j, 0]) == int(keys[i, 0]) and int(keys[j, 1]) == int(keys[i, 1]):
+            j += 1
+        cell = points[i:j]
+        if cell.shape[0] >= int(min_cell_points):
+            y_floor = float(np.percentile(cell[:, 1], float(low_percentile)))
+            band = max(0.04, float(band_m))
+            near = cell[np.abs(cell[:, 1] - y_floor) <= band]
+            if near.shape[0] <= 0:
+                near = cell[np.argsort(cell[:, 1])[: max(1, int(math.ceil(cell.shape[0] * 0.08)))]]
+            rows.append(
+                [
+                    float(np.median(near[:, 0])),
+                    float(np.median(near[:, 2])),
+                    float(np.median(near[:, 1])),
+                    float(cell.shape[0]),
+                ]
+            )
+        i = j
+    return np.asarray(rows, dtype=np.float64).reshape((-1, 4)) if rows else np.zeros((0, 4), dtype=np.float64)
+
+
+def _fit_floor_height_plane(
+    rows: np.ndarray,
+    *,
+    residual_threshold_m: float,
+    max_iterations: int,
+    max_candidate_tilt_deg: float,
+    seed: int,
+) -> tuple[np.ndarray, float, np.ndarray, np.ndarray, np.ndarray]:
+    samples = np.asarray(rows, dtype=np.float64).reshape((-1, 4))
+    if samples.shape[0] < 3:
+        raise RuntimeError("too_few_floor_envelope_cells")
+    x = samples[:, 0]
+    z = samples[:, 1]
+    y = samples[:, 2]
+    weights = np.clip(np.sqrt(np.maximum(samples[:, 3], 1.0)), 1.0, 20.0)
+    design = np.stack([x, z, np.ones_like(x)], axis=1)
+    rng = np.random.default_rng(int(seed))
+    threshold = max(0.03, float(residual_threshold_m))
+    min_normal_y = math.cos(math.radians(max(0.0, float(max_candidate_tilt_deg))))
+    best: tuple[tuple[int, float, float], np.ndarray, np.ndarray] | None = None
+    for _ in range(max(1, int(max_iterations))):
+        choice = rng.choice(samples.shape[0], size=3, replace=False)
+        try:
+            coeff = np.linalg.solve(design[choice], y[choice])
+        except np.linalg.LinAlgError:
+            continue
+        normal = np.asarray([-float(coeff[0]), 1.0, -float(coeff[1])], dtype=np.float64)
+        normal = _normalize_vec3(normal)
+        if float(normal[1]) < min_normal_y:
+            continue
+        residuals = np.abs(y - design @ coeff)
+        inliers = residuals <= threshold
+        count = int(np.count_nonzero(inliers))
+        if count <= 0:
+            continue
+        median = float(np.median(residuals[inliers]))
+        tilt = float(math.degrees(math.acos(np.clip(float(normal[1]), -1.0, 1.0))))
+        score = (count, -median, -tilt)
+        if best is None or score > best[0]:
+            best = (score, inliers, coeff)
+
+    if best is None:
+        raise RuntimeError("no_plausible_floor_plane")
+
+    inliers = best[1]
+    if int(np.count_nonzero(inliers)) < 3:
+        raise RuntimeError("too_few_floor_plane_inliers")
+    weighted_design = design[inliers] * weights[inliers, None]
+    weighted_y = y[inliers] * weights[inliers]
+    coeff = np.linalg.lstsq(weighted_design, weighted_y, rcond=None)[0]
+    residuals = np.abs(y - design @ coeff)
+    inliers = residuals <= threshold
+    normal = _normalize_vec3(np.asarray([-float(coeff[0]), 1.0, -float(coeff[1])], dtype=np.float64))
+    offset = -float(coeff[2])
+    if normal[1] < 0.0:
+        normal = -normal
+        offset = -offset
+    return normal, offset, inliers.astype(bool), residuals.astype(np.float64), coeff.astype(np.float64)
+
+
+def _level_frame_clouds_to_floor(
+    frames: Sequence[FrameCloud],
+    *,
+    camera_id: str,
+    target_floor_y: float,
+    reference_camera: str | None,
+    lock_reference: bool,
+    enabled: bool,
+    required: bool,
+    cell_m: float,
+    low_percentile: float,
+    residual_threshold_m: float,
+    max_correction_deg: float,
+    max_candidate_tilt_deg: float,
+) -> tuple[list[FrameCloud], dict[str, Any], np.ndarray]:
+    identity = np.eye(4, dtype=np.float64)
+    if not enabled:
+        return list(frames), {"status": "disabled", "target_floor_y": float(target_floor_y)}, identity
+    if lock_reference and reference_camera and str(camera_id) == str(reference_camera):
+        return (
+            list(frames),
+            {
+                "status": "reference_locked",
+                "method": "floor_level_reference_camera",
+                "target_floor_y": float(target_floor_y),
+                "reference_camera": str(reference_camera),
+                "correction_angle_deg": 0.0,
+                "world_correction_col_major": [float(x) for x in identity.flatten(order="F")],
+            },
+            identity,
+        )
+
+    sampled = _sample_world_points(frames, budget=180_000)
+    rows = _floor_envelope_rows(
+        sampled,
+        cell_m=float(cell_m),
+        low_percentile=float(low_percentile),
+        band_m=max(0.06, float(residual_threshold_m)),
+        min_cell_points=8,
+    )
+    try:
+        normal, offset, inliers, residuals, coeff = _fit_floor_height_plane(
+            rows,
+            residual_threshold_m=float(residual_threshold_m),
+            max_iterations=700,
+            max_candidate_tilt_deg=float(max_candidate_tilt_deg),
+            seed=31 + sum(ord(ch) for ch in str(camera_id)),
+        )
+        correction_angle_deg = float(math.degrees(math.acos(np.clip(float(np.dot(normal, np.asarray([0.0, 1.0, 0.0]))), -1.0, 1.0))))
+        if correction_angle_deg > float(max_correction_deg):
+            raise RuntimeError(f"floor_correction_exceeds_limit:{correction_angle_deg:.2f}>{float(max_correction_deg):.2f}")
+    except Exception as exc:
+        if required:
+            raise RuntimeError(f"{camera_id}: floor leveling failed: {exc}") from exc
+        return (
+            list(frames),
+            {
+                "status": "skipped",
+                "reason": str(exc) or "floor_leveling_failed",
+                "target_floor_y": float(target_floor_y),
+                "sampled_point_count": int(sampled.shape[0]),
+                "envelope_cell_count": int(rows.shape[0]),
+            },
+            identity,
+        )
+
+    inlier_rows = rows[inliers] if rows.shape[0] and inliers.shape[0] == rows.shape[0] else rows
+    pivot_x = float(np.median(inlier_rows[:, 0])) if inlier_rows.shape[0] else 0.0
+    pivot_z = float(np.median(inlier_rows[:, 1])) if inlier_rows.shape[0] else 0.0
+    pivot_y = float(coeff[0] * pivot_x + coeff[1] * pivot_z + coeff[2])
+    pivot = np.asarray([pivot_x, pivot_y, pivot_z], dtype=np.float64)
+    rotation = _rotation_matrix_between(normal, np.asarray([0.0, 1.0, 0.0], dtype=np.float64))
+    correction = (
+        _translation_matrix([0.0, float(target_floor_y) - pivot_y, 0.0])
+        @ _translation_matrix(pivot)
+        @ _homogeneous_rotation(rotation)
+        @ _translation_matrix(-pivot)
+    )
+
+    corrected: list[FrameCloud] = []
+    for frame in frames:
+        corrected.append(
+            FrameCloud(
+                frame_id=frame.frame_id,
+                snapshot=frame.snapshot,
+                depth_clip_m=frame.depth_clip_m,
+                points_camera=frame.points_camera,
+                points_world=transform_points(frame.points_world, correction),
+                pixels=frame.pixels,
+                confidence=frame.confidence,
+                image_bgr=frame.image_bgr,
+                image_ref=frame.image_ref,
+            )
+        )
+
+    residual_in = residuals[inliers] if residuals.shape[0] and np.any(inliers) else np.zeros((0,), dtype=np.float64)
+    alignment = {
+        "status": "applied",
+        "method": "low_envelope_floor_plane_leveling",
+        "target_floor_y": float(target_floor_y),
+        "source_floor_normal": [float(x) for x in normal],
+        "source_floor_offset": float(offset),
+        "source_floor_height_model": {
+            "y_equals_ax_plus_bz_plus_c": [float(coeff[0]), float(coeff[1]), float(coeff[2])],
+            "x_slope": float(coeff[0]),
+            "z_slope": float(coeff[1]),
+        },
+        "pivot_world": [float(x) for x in pivot],
+        "correction_angle_deg": correction_angle_deg,
+        "rotation_row_major": [float(x) for x in rotation.reshape(-1)],
+        "world_correction_col_major": [float(x) for x in correction.flatten(order="F")],
+        "sampled_point_count": int(sampled.shape[0]),
+        "envelope_cell_count": int(rows.shape[0]),
+        "inlier_cell_count": int(np.count_nonzero(inliers)),
+        "inlier_fraction": float(np.count_nonzero(inliers) / max(1, rows.shape[0])),
+        "residual_median_m": float(np.median(residual_in)) if residual_in.size else None,
+        "residual_p90_m": float(np.percentile(residual_in, 90.0)) if residual_in.size else None,
+    }
+    return corrected, alignment, correction
+
+
 def _clip_frame_clouds_to_ceiling(
     frames: Sequence[FrameCloud],
     *,
@@ -944,6 +1301,7 @@ def _frame_mesh_arrays(
     max_edge_m: float,
     max_depth_delta_m: float,
     ceiling_clip_y: float | None,
+    world_correction: np.ndarray | None,
     atlas_cols: int,
     atlas_rows: int,
     atlas_col: int,
@@ -966,6 +1324,8 @@ def _frame_mesh_arrays(
             {"frame_id": frame.frame_id, "vertex_count": 0, "triangle_count": 0, "rejected_triangle_count": 0},
         )
     points_world = transform_points(points_camera, camera.camera_to_world)
+    if world_correction is not None:
+        points_world = transform_points(points_world, world_correction)
     removed_by_ceiling = 0
     if ceiling_clip_y is not None and np.isfinite(float(ceiling_clip_y)):
         keep = np.isfinite(points_world[:, 1]) & (points_world[:, 1] <= float(ceiling_clip_y))
@@ -1086,6 +1446,7 @@ def _build_room_mesh(
     max_edge_m: float,
     max_depth_delta_m: float,
     ceiling_clip_y: float | None,
+    world_correction: np.ndarray | None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, dict[str, Any]]:
     vertices_rows: list[np.ndarray] = []
     texcoord_rows: list[np.ndarray] = []
@@ -1104,6 +1465,7 @@ def _build_room_mesh(
             max_edge_m=max_edge_m,
             max_depth_delta_m=max_depth_delta_m,
             ceiling_clip_y=ceiling_clip_y,
+            world_correction=world_correction,
             atlas_cols=atlas_cols,
             atlas_rows=atlas_rows,
             atlas_col=frame_index % atlas_cols,
@@ -1172,7 +1534,10 @@ def _write_revision(
     ceiling_clip: dict[str, Any],
     observed_floor_y: float,
     floor_estimate: dict[str, Any],
+    floor_alignment: dict[str, Any],
+    world_correction: np.ndarray | None,
     scene_similarity: dict[str, Any],
+    floorplan_footprint: tuple[dict[str, Any], Path] | None,
     update_latest: bool,
 ) -> dict[str, Any]:
     revision_dir = store.revision_dir(revision_id)
@@ -1204,6 +1569,7 @@ def _write_revision(
         max_edge_m=float(mesh_max_edge_m),
         max_depth_delta_m=float(mesh_max_depth_delta_m),
         ceiling_clip_y=ceiling_clip_y,
+        world_correction=world_correction,
     )
     if mesh_vertices.shape[0] > 0 and mesh_indices.shape[0] > 0:
         write_textured_mesh_glb(revision_dir / "room_mesh.glb", mesh_vertices, mesh_indices, mesh_texcoords, mesh_texture)
@@ -1216,6 +1582,7 @@ def _write_revision(
         "color_source": _frame_color_source(frames),
         "color_space": "sRGB",
         "ceiling_clip": ceiling_clip,
+        "floor_alignment": floor_alignment,
     }
     color_source = str(mesh_meta.get("color_source") or _frame_color_source(frames))
     mesh_source = _mesh_source_for_color_source(color_source)
@@ -1230,6 +1597,32 @@ def _write_revision(
         if not cv2.imwrite(str(revision_dir / rel), np.asarray(frame.image_bgr, dtype=np.uint8)):
             raise RuntimeError(f"{camera.camera_id}: failed to write RGB keyframe {rel}")
         keyframe_refs[frame.frame_id] = str(rel)
+
+    floorplan_payload: dict[str, Any] | None = None
+    floorplan_source_path: Path | None = None
+    floorplan_summary: dict[str, Any] | None = None
+    if floorplan_footprint is not None:
+        floorplan_payload, floorplan_source_path = floorplan_footprint
+        floorplan_summary = _floorplan_footprint_summary(floorplan_payload, floorplan_source_path)
+        write_json(
+            revision_dir / "visible_floor_footprint.json",
+            {
+                "schema": "noesis.visible_floor_footprint.v1",
+                "revision_id": revision_id,
+                "camera": camera.camera_id,
+                "source": "mapanything_floorplan_cache",
+                "source_path": _relative_path(floorplan_source_path),
+                "generated_ts_us": int(time.time() * 1_000_000),
+                "projection": {
+                    "source_frame": str(floorplan_payload.get("frame") or "camera_local_ground_m"),
+                    "target_frame": "menon_scene_units_via_revision_camera_calibration",
+                    "floor_y_source": "revision_tracking_alignment_floor_plane",
+                    "floor_y": float(observed_floor_y),
+                },
+                "summary": floorplan_summary,
+                "floorplan": floorplan_payload,
+            },
+        )
 
     bounds_min = np.min(all_points, axis=0)
     bounds_max = np.max(all_points, axis=0)
@@ -1272,6 +1665,7 @@ def _write_revision(
         "floor_y": float(observed_floor_y),
         "calibrated_floor_y": float(camera.floor_y),
         "floor_estimate": floor_estimate,
+        "floor_alignment": floor_alignment,
         "point_count": int(served_points.shape[0]),
         "source_point_count": int(all_points.shape[0]),
         "source_sample_stride": int(stride),
@@ -1322,6 +1716,8 @@ def _write_revision(
         "room_points_npz": "room_points.npz",
         "tracking_alignment": "tracking_alignment.json",
     }
+    if floorplan_summary is not None:
+        artifacts["visible_floor_footprint"] = "visible_floor_footprint.json"
     if mesh_vertices.shape[0] <= 0 or mesh_indices.shape[0] <= 0:
         artifacts.pop("room_mesh_glb", None)
     manifest = {
@@ -1354,6 +1750,7 @@ def _write_revision(
                 "max_edge_m": float(mesh_max_edge_m),
                 "max_depth_delta_m": float(mesh_max_depth_delta_m),
                 "ceiling_clip": ceiling_clip,
+                "floor_alignment": floor_alignment,
                 "texture": mesh_meta.get("texture"),
                 "vertex_count": int(mesh_meta.get("vertex_count") or 0),
                 "triangle_count": int(mesh_meta.get("triangle_count") or 0),
@@ -1362,6 +1759,7 @@ def _write_revision(
                 "source": "calibration_scene_similarity",
                 "scene_similarity": scene_similarity,
             },
+            "visible_floor_footprint": floorplan_summary,
         },
         "source_file_refs": {
             "frames": frame_rows,
@@ -1372,6 +1770,7 @@ def _write_revision(
             "room_points_glb": "backend_world_m_stream_points",
             "room_points_meta": "backend_world_m_stream_points",
             "room_points_npz": "backend_world_m_stream_points",
+            "visible_floor_footprint": "camera_local_ground_m_floorplan_cache",
             "tracking_alignment": "menon_scene_units_from_camera_scene_prior",
         },
         "artifacts": artifacts,
@@ -1392,6 +1791,7 @@ def _write_revision(
             "floor_y": float(observed_floor_y),
             "calibrated_floor_y": float(camera.floor_y),
             "floor_estimate": floor_estimate,
+            "floor_alignment": floor_alignment,
         },
     }
     coverage = [row["mapanything_valid_depth_coverage"] for row in frame_rows]
@@ -1416,8 +1816,10 @@ def _write_revision(
         },
         "room_points": room_meta,
         "room_mesh": mesh_meta,
+        "visible_floor_footprint": floorplan_summary,
         "ceiling_clip": ceiling_clip,
         "floor_estimate": floor_estimate,
+        "floor_alignment": floor_alignment,
         "plane_extraction": {
             "status": "removed",
             "reason": "rgb_depth_cloud_view_no_2d_planes",
@@ -1428,6 +1830,7 @@ def _write_revision(
             "ceiling_clip_conservative": bool(float(ceiling_clip.get("removed_fraction") or 0.0) <= 0.025),
             "texture_color_source_present": bool(all_colors.shape[0] == all_points.shape[0]),
             "model_geometry_used_for_rendering": False,
+            "floor_leveling_applied": bool(str(floor_alignment.get("status") or "") == "applied"),
         },
     }
     write_json(revision_dir / "manifest.json", manifest)
@@ -1448,9 +1851,11 @@ def _write_revision(
         "floor_plane_count": 0,
         "wall_plane_count": 0,
         "floor_estimate": floor_estimate,
+        "floor_alignment": floor_alignment,
         "color_source": mesh_meta.get("color_source") or CACHED_DEPTH_COLOR_SOURCE,
         "mesh_color_source": mesh_meta.get("color_source") or CACHED_DEPTH_COLOR_SOURCE,
         "point_color_source": room_meta.get("color_source") or CACHED_DEPTH_COLOR_SOURCE,
+        "visible_floor_footprint_source": floorplan_summary.get("source_path") if floorplan_summary else None,
         "source_frame_count": int(len(frames)),
         "snapshots": sorted(
             {
@@ -1465,6 +1870,7 @@ def _write_revision(
 def build(args: argparse.Namespace) -> dict[str, Any]:
     service_config = load_service_config()
     depth_base = _resolve_repo_path(args.mapanything_depth_base, service_config.storage.depth_base)
+    floorplan_cache_base = _resolve_repo_path(args.floorplan_cache_base, depth_base / "floorplans")
     cameras_config = _resolve_repo_path(args.cameras_config, REPO_ROOT / "config" / "cameras.yaml")
     pipeline_config = _resolve_repo_path(args.pipeline_config, REPO_ROOT / "config" / "infer.yaml")
     alignment_config = _resolve_repo_path(args.alignment_config, REPO_ROOT / "config" / "ply_alignment.json")
@@ -1542,6 +1948,20 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
             depth_clip_percentile=float(args.depth_clip_percentile),
             max_depth_m=float(args.max_depth_m),
         )
+        frames, floor_alignment, world_correction = _level_frame_clouds_to_floor(
+            frames,
+            camera_id=camera_id,
+            target_floor_y=float(camera.floor_y),
+            reference_camera=str(args.floor_level_reference_camera or "").strip() or None,
+            lock_reference=not bool(args.level_reference_camera_floor),
+            enabled=not bool(args.disable_floor_leveling),
+            required=not bool(args.allow_unleveled_floor),
+            cell_m=float(args.floor_level_cell_m),
+            low_percentile=float(args.floor_level_low_percentile),
+            residual_threshold_m=float(args.floor_level_residual_m),
+            max_correction_deg=float(args.floor_level_max_correction_deg),
+            max_candidate_tilt_deg=float(args.floor_level_max_candidate_tilt_deg),
+        )
         observed_floor_y, floor_estimate = _estimate_observed_floor_y(frames, camera.floor_y)
         frames, ceiling_clip = _clip_frame_clouds_to_ceiling(
             frames,
@@ -1550,6 +1970,9 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
             percentile=float(args.ceiling_clip_percentile),
             min_height_m=float(args.ceiling_clip_min_height_m),
         )
+        floorplan_footprint = None
+        if not bool(args.disable_floorplan_footprint):
+            floorplan_footprint = _latest_floorplan_payload(floorplan_cache_base, camera_id)
         revision_id = args.revision_id
         if len(cameras) > 1 or not revision_id:
             mode_name = "stream_rgbmesh" if rgb_source in {"live", "zarr-rgb"} else "stream_depthmesh"
@@ -1569,13 +1992,17 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
                 ceiling_clip=ceiling_clip,
                 observed_floor_y=observed_floor_y,
                 floor_estimate=floor_estimate,
+                floor_alignment=floor_alignment,
+                world_correction=world_correction,
                 scene_similarity=scene_similarity,
+                floorplan_footprint=floorplan_footprint,
                 update_latest=bool(args.update_latest and camera_id == cameras[-1]),
             )
         )
     return {
         "schema": "noesis.stream_room_reconstruction.build_result.v1",
         "depth_base": str(depth_base),
+        "floorplan_cache_base": str(floorplan_cache_base),
         "rgb_source": str(args.rgb_source),
         "snapshot_count_per_camera": int(capture_count),
         "capture_count_per_camera": int(capture_count),
@@ -1597,6 +2024,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--cameras-config", type=Path, default=REPO_ROOT / "config" / "cameras.yaml")
     parser.add_argument("--alignment-config", type=Path, default=REPO_ROOT / "config" / "ply_alignment.json")
     parser.add_argument("--mapanything-depth-base", type=Path, default=None)
+    parser.add_argument("--floorplan-cache-base", type=Path, default=None, help="Directory containing per-camera cached floorplan JSON artifacts.")
     parser.add_argument("--output-root", type=Path, default=None)
     parser.add_argument("--revision-id", default=None, help="Only valid for a single --camera build.")
     parser.add_argument("--snapshots", type=int, default=4, help="Backward-compatible alias for --capture-count.")
@@ -1627,6 +2055,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--ceiling-clip-percentile", type=float, default=98.8)
     parser.add_argument("--ceiling-clip-min-height-m", type=float, default=2.15)
     parser.add_argument("--disable-ceiling-clip", action="store_true")
+    parser.add_argument("--disable-floorplan-footprint", action="store_true", help="Do not attach cached visible-floor footprint artifacts to generated revisions.")
+    parser.add_argument("--disable-floor-leveling", action="store_true")
+    parser.add_argument("--allow-unleveled-floor", action="store_true", help="Do not fail the build when a camera has insufficient floor evidence.")
+    parser.add_argument("--floor-level-reference-camera", default="kitchen", help="Camera whose existing floor orientation is treated as the shared reference.")
+    parser.add_argument("--level-reference-camera-floor", action="store_true", help="Also fit and correct the reference camera instead of locking it.")
+    parser.add_argument("--floor-level-cell-m", type=float, default=0.45)
+    parser.add_argument("--floor-level-low-percentile", type=float, default=8.0)
+    parser.add_argument("--floor-level-residual-m", type=float, default=0.18)
+    parser.add_argument("--floor-level-max-candidate-tilt-deg", type=float, default=18.0)
+    parser.add_argument("--floor-level-max-correction-deg", type=float, default=16.0)
     parser.add_argument("--rgb-frame-stride", type=int, default=12)
     parser.add_argument("--rgb-max-frames-read", type=int, default=240)
     parser.add_argument("--update-latest", action="store_true")

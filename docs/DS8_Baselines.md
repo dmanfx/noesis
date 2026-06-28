@@ -28,10 +28,18 @@ you don’t have to sift through the historical work orders.
 - BEV JPEG binaries are **retired**:
   - `NOESIS_BEV_JPEG_ENABLED` and `bev.jpeg_enabled` are ignored.
   - JSON BEV metadata is the supported delivery path.
-- BEV frame mode defaults to `menon_scene` (world/scene units).
-  - Override with `NOESIS_BEV_FRAME=camera_local` to force legacy camera-local BEV.
-  - World-path BEV points and trails are in native scene units; frontend owns
-    smoothing/persistence (do not convert via `s_obj_to_m` in the dashboard).
+- Inline dashboard BEV frame mode defaults to `camera_local_ground_m` so
+  footpoints and trails share the same metric X/Z frame as MapAnything
+  floorplan rasters.
+  - Override with `NOESIS_BEV_FRAME=backend_world_m` only for explicit world-BEV
+    validation or Menon-facing traces.
+  - For camera-local BEV, tracked people normally publish
+    `displaySource=world_to_camera_local` from the live fused tracking world
+    state. `displaySource=floor_contact_ray` is the calibrated fallback when no
+    current live world observation is available. Static MapAnything/floorplan
+    snapshots are not used as live person-depth placement inputs.
+  - Producer-owned BEV smoothing is active in the backend; the dashboard should
+    render `footpoints` and backend `trails` directly.
 
 ## Depth / MapAnything / Baseline World Tracking
 - MapAnything is still a full-frame SGIE branch (no tensor-from-meta), but it
@@ -76,6 +84,17 @@ you don’t have to sift through the historical work orders.
     PGIE `unique-id=1` so ReID/SGIE continue to hook correctly.
 - **Optional:** YOLO26-seg (n/s/m). Switch via `--pgie-profile yolo26_seg` plus
   `--size n|s|m` (default m). Engines must exist under `models/engines/`.
+- **Optional:** DEIMv2 Wholebody49. Switch via `--pgie-profile wholebody49`
+  plus `--size s|x` (default `s`).
+  - `s`: DINOv3-S instance-mask model,
+    `models/engines/deimv2_wholebody49_dinov3_s_masks_640_b3_fp16.engine`.
+  - `x`: DINOv3-X label-only model,
+    `models/engines/deimv2_wholebody49_dinov3_x_boxes_640_b3_fp16.engine`.
+  - Runtime materializes `build/config_infer_primary_wholebody49_<size>.ini`
+    plus `build/config_preproc_wholebody49_<size>_b3.ini`.
+  - Parser: `pipelines/nvdsinfer_deimv2_wholebody49/libnvdsinfer_deimv2_wholebody49.so`.
+  - The X instance-mask engine is not a promoted runtime asset until it is
+    explicitly built and validated.
 
 ## Trails & ID Refactor Guardrails
 - BEV uses `stable_id` for user-visible identity; `trackerId` may be included as

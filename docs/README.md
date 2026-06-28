@@ -41,6 +41,11 @@ and worklogs live in `docs/history/`.
 - When you edit docs, append a one-line entry under “Doc changes” (date + what changed) for any **substantive** update: new features/processes/workflows, contract or baseline changes, behavior-affecting diagrams. Skip trivial typo/style fixes or purely cosmetic diagram tweaks.
 - Status headers (“Status: validated as of …”) should only be updated when the doc has been re-validated against code/configs.
 
+## Doc changes (2026-06-24)
+- Added the DS8 Wholebody49 X pose promoter implementation plan for promoting
+  label-only Wholebody keypoint rows into the existing `NOESIS.POSE_FEATURES`
+  object metadata contract (`DS8_wholebody49_pose_promoter_plan.md`).
+
 ## Doc changes (2026-05-27)
 - Added the Noesis/Menon validation toolbox planning workspace and linked it
   from the DS8 testing guide for cross-space calibration, BEV, tracking-world,

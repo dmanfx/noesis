@@ -121,10 +121,28 @@ class _Da2Runner:
         with torch.no_grad():
             depth = self._model(tensor)
         if hasattr(depth, "detach"):
-            depth_np = depth.detach().float().cpu().numpy()[0, 0]
+            depth_np = _first_depth_map(depth.detach().float().cpu().numpy())
         else:
-            depth_np = np.asarray(depth, dtype=np.float32)[0, 0]
+            depth_np = _first_depth_map(np.asarray(depth, dtype=np.float32))
         return cv2.resize(depth_np.astype(np.float32, copy=False), (frame_bgr.shape[1], frame_bgr.shape[0]), interpolation=cv2.INTER_LINEAR)
+
+
+def _first_depth_map(depth: np.ndarray) -> np.ndarray:
+    arr = np.asarray(depth, dtype=np.float32)
+    if arr.ndim == 2:
+        return arr
+    if arr.ndim == 3:
+        if arr.shape[0] <= 0:
+            raise DepthRegistrationBuildError("DAv2 output batch is empty")
+        return np.asarray(arr[0], dtype=np.float32)
+    if arr.ndim == 4:
+        if arr.shape[0] <= 0:
+            raise DepthRegistrationBuildError("DAv2 output batch is empty")
+        if arr.shape[1] == 1:
+            return np.asarray(arr[0, 0], dtype=np.float32)
+        if arr.shape[-1] == 1:
+            return np.asarray(arr[0, :, :, 0], dtype=np.float32)
+    raise DepthRegistrationBuildError(f"Unsupported DAv2 output shape: {arr.shape}")
 
 
 def _video_capture_from_uri(uri: str) -> cv2.VideoCapture:

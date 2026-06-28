@@ -965,7 +965,6 @@ def main() -> int:
                     obstacle_max=float(_safe_float((resp.get("obstacle_height") or {}).get("value_max"), 1.8)),
                 )
                 montage_tiles.append((f"composite (grid={grid_res_m})", out))
-
             # Dump raw grids + lightweight diagnostics for quick iteration.
             grids_to_save: Dict[str, np.ndarray] = {}
             for name, arr in (

@@ -4893,6 +4893,7 @@ class _ObjectDepthFusionProcessor:
         depth_center: Optional[float] = None,
         values: Optional[np.ndarray] = None,
         anchor_fields: Optional[Mapping[str, Any]] = None,
+        sampling_mode: str = "instance_mask",
     ) -> ObjectDepthResult:
         try:
             object_id = int(getattr(obj_meta, "object_id", -1))
@@ -4915,7 +4916,7 @@ class _ObjectDepthFusionProcessor:
             "class_id": class_id,
             "bbox": bbox,
             "score": score,
-            "sampling_mode": "instance_mask",
+            "sampling_mode": str(sampling_mode or "instance_mask"),
             "status": status,
             "unit": self.depth_unit,
             "is_metric": self.depth_is_metric,
@@ -4935,6 +4936,48 @@ class _ObjectDepthFusionProcessor:
         if anchor_fields:
             payload.update({str(key): value for key, value in anchor_fields.items() if value is not None})
         return ObjectDepthResult(**payload)
+
+    def _sample_bbox_band_result(
+        self,
+        frame_meta: Any,
+        obj_meta: Any,
+        *,
+        bbox: Tuple[float, float, float, float],
+        depth_crop: np.ndarray,
+        crop_origin: Tuple[int, int],
+        depth_center: Optional[float],
+    ) -> ObjectDepthResult:
+        mask_area = int(depth_crop.size)
+        synthetic_mask = np.ones(depth_crop.shape, dtype=bool)
+        anchor = _extract_person_depth_anchor(
+            synthetic_mask,
+            depth_crop,
+            frame_origin=(int(crop_origin[0]), int(crop_origin[1])),
+        )
+        anchor_fields: Dict[str, Any] = {
+            "spatial_class": "person",
+            "anchor_uv": list(anchor.foot_uv) if anchor.foot_uv is not None else None,
+            "anchor_source": anchor.anchor_source,
+            "anchor_depth_m": anchor.anchor_depth_m,
+            "anchor_sample_count": int(anchor.anchor_sample_count) if anchor.anchor_sample_count > 0 else None,
+            "anchor_valid_fraction": float(anchor.anchor_valid_fraction) if anchor.anchor_valid_fraction > 0.0 else None,
+        }
+        values = np.asarray(depth_crop[np.isfinite(depth_crop)], dtype=np.float32)
+        sample_count = int(values.size)
+        status = "ok" if sample_count > 0 and anchor.anchor_depth_m is not None else "no_valid_depth"
+        return self._build_result(
+            frame_meta,
+            obj_meta,
+            bbox=bbox,
+            status=status,
+            mask_area_px=mask_area,
+            sample_count=sample_count,
+            valid_fraction=float(sample_count) / float(mask_area or 1),
+            depth_center=depth_center,
+            values=values,
+            anchor_fields=anchor_fields,
+            sampling_mode="bbox_band",
+        )
 
     def _sample_person_result(
         self,
@@ -4967,11 +5010,6 @@ class _ObjectDepthFusionProcessor:
         if depth_crop.size <= 0:
             return self._build_result(frame_meta, obj_meta, bbox=bbox, status="transform_mismatch")
 
-        mask, mask_status = self._decode_instance_mask(obj_meta, depth_crop.shape)
-        if mask is None:
-            return self._build_result(frame_meta, obj_meta, bbox=bbox, status=mask_status)
-
-        mask_area = int(np.count_nonzero(mask))
         cx = max(0, min(frame_w - 1, int(round(left + (width * 0.5)))))
         cy = max(0, min(frame_h - 1, int(round(top + (height * 0.5)))))
         local_cx = max(0, min(int(depth_crop.shape[1]) - 1, cx - x0))
@@ -4979,13 +5017,26 @@ class _ObjectDepthFusionProcessor:
         center_sample = float(depth_crop[local_cy, local_cx])
         center_value = center_sample if np.isfinite(center_sample) else None
 
-        if mask_area <= 0:
-            return self._build_result(
+        mask, _mask_status = self._decode_instance_mask(obj_meta, depth_crop.shape)
+        if mask is None:
+            return self._sample_bbox_band_result(
                 frame_meta,
                 obj_meta,
                 bbox=bbox,
-                status="missing_mask",
-                mask_area_px=0,
+                depth_crop=depth_crop,
+                crop_origin=(x0, y0),
+                depth_center=center_value,
+            )
+
+        mask_area = int(np.count_nonzero(mask))
+
+        if mask_area <= 0:
+            return self._sample_bbox_band_result(
+                frame_meta,
+                obj_meta,
+                bbox=bbox,
+                depth_crop=depth_crop,
+                crop_origin=(x0, y0),
                 depth_center=center_value,
             )
 
@@ -5026,6 +5077,7 @@ class _ObjectDepthFusionProcessor:
             depth_center=center_value,
             values=values,
             anchor_fields=anchor_fields,
+            sampling_mode="instance_mask",
         )
 
     def handle_frame_ds8(self, frame_meta: Any) -> None:

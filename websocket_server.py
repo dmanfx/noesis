@@ -3,6 +3,7 @@ import asyncio
 import concurrent.futures
 from websockets.legacy.server import serve
 import websockets
+import inspect
 import json
 import logging
 import os
@@ -69,8 +70,8 @@ class WebSocketServer:
         self._floorplan_rpc_tracker: Dict[str, float] = {}
         self._depth_rate_limit_window = 0.5  # seconds per camera/client
         self._floorplan_rate_limit_window = 2.0
-        self._depth_rpc_timeout = 4.0  # seconds
-        self._floorplan_rpc_timeout = 15.0
+        self._depth_rpc_timeout = 18.0  # seconds
+        self._floorplan_rpc_timeout = 30.0
         self._tracker_prune_window = 30.0
         # Optional calibration + RPC callbacks
         self.calibration_getter: Optional[Callable[[], Dict[str, Any]]] = None
@@ -78,7 +79,7 @@ class WebSocketServer:
         self.set_extrinsics_handler: Optional[Callable[[Dict[str, Any]], Dict[str, Any]]] = None
         self.solve_pnp_handler: Optional[Callable[[Dict[str, Any]], Dict[str, Any]]] = None
         self.set_align_handler: Optional[Callable[[Dict[str, Any]], Dict[str, Any]]] = None
-        self.ma_depth_provider: Optional[Callable[[str, Optional[Any], Optional[str]], Optional[Dict[str, Any]]]] = None
+        self.ma_depth_provider: Optional[Callable[..., Optional[Dict[str, Any]]]] = None
         self.floorplan_provider: Optional[Callable[[Optional[list], float, float, float, bool], Optional[Dict[str, Any]]]] = None
         # Optional auto-calibration handler (cameraId -> result)
         self.auto_calibrate_handler: Optional[Callable[[Optional[str]], Dict[str, Any]]] = None
@@ -1422,7 +1423,7 @@ class WebSocketServer:
                         except Exception:
                             pass
 
-                    elif data.get('type') == 'get_ma_depth':
+                    elif data.get('type') in ('get_ma_depth', 'get_ma_depth_cache'):
                         camera = (
                             data.get('camera')
                             or data.get('cameraId')
@@ -1444,6 +1445,9 @@ class WebSocketServer:
                         )
                         if ts_max_us is None:
                             ts_max_us = data.get('ts_max') or data.get('tsMax')
+                        cache_only = bool(data.get('cache_only', data.get('cacheOnly', False)))
+                        if data.get('type') == 'get_ma_depth_cache':
+                            cache_only = True
 
                         provider = self.ma_depth_provider if callable(self.ma_depth_provider) else None
                         if not camera or provider is None:
@@ -1451,6 +1455,7 @@ class WebSocketServer:
                                 'type': 'ma_depth_response',
                                 'camera': camera,
                                 'request_id': request_id,
+                                'cache_only': cache_only,
                                 'served_from_cache': False,
                                 'error': 'no_provider',
                                 'ok': False,
@@ -1463,11 +1468,27 @@ class WebSocketServer:
                             )
                             continue
 
-                        rate_key = f"{client_ip}:{camera}"
+                        mode_key = "cache" if cache_only else "fresh"
+                        rate_key = f"{client_ip}:{camera}:{mode_key}"
                         now = time.time()
                         last = self._depth_rpc_tracker.get(rate_key, 0.0)
                         if now - last < self._depth_rate_limit_window:
                             self.logger.debug(f"Depth RPC throttled for {rate_key}")
+                            result = {
+                                'type': 'ma_depth_response',
+                                'camera': camera,
+                                'request_id': request_id,
+                                'cache_only': cache_only,
+                                'served_from_cache': False,
+                                'error': 'rate_limited',
+                                'ok': False,
+                            }
+                            await self._send_json_with_boundary_metrics(
+                                websocket,
+                                result,
+                                route="get_ma_depth",
+                                message_type="ma_depth_response",
+                            )
                             continue
                         self._depth_rpc_tracker[rate_key] = now
                         if len(self._depth_rpc_tracker) > 256:
@@ -1476,9 +1497,19 @@ class WebSocketServer:
                             }
 
                         try:
+                            provider_kwargs: Dict[str, Any] = {}
+                            try:
+                                signature = inspect.signature(provider)
+                                if (
+                                    'cache_only' in signature.parameters
+                                    or any(p.kind == inspect.Parameter.VAR_KEYWORD for p in signature.parameters.values())
+                                ):
+                                    provider_kwargs['cache_only'] = cache_only
+                            except Exception:
+                                provider_kwargs = {}
                             provider_start_ns = time.perf_counter_ns()
                             payload = await asyncio.wait_for(
-                                asyncio.to_thread(provider, camera, ts_max_us, request_id),
+                                asyncio.to_thread(provider, camera, ts_max_us, request_id, **provider_kwargs),
                                 timeout=self._depth_rpc_timeout,
                             )
                             provider_ms = (time.perf_counter_ns() - provider_start_ns) / 1_000_000.0
@@ -1498,6 +1529,7 @@ class WebSocketServer:
                                 payload.setdefault('camera', camera)
                                 if request_id and 'request_id' not in payload:
                                     payload['request_id'] = request_id
+                                payload.setdefault('cache_only', cache_only)
                                 payload.setdefault('served_from_cache', False)
                                 payload.setdefault('ts_us', 0)
                                 payload.setdefault('ok', 'error' not in payload)
@@ -1513,6 +1545,7 @@ class WebSocketServer:
                                     'type': 'ma_depth_response',
                                     'camera': camera,
                                     'request_id': request_id,
+                                    'cache_only': cache_only,
                                     'served_from_cache': False,
                                     'error': 'not_available',
                                     'ok': False,
@@ -1529,6 +1562,7 @@ class WebSocketServer:
                                 'type': 'ma_depth_response',
                                 'camera': camera,
                                 'request_id': request_id,
+                                'cache_only': cache_only,
                                 'served_from_cache': False,
                                 'error': 'timeout',
                                 'ok': False,
@@ -1544,6 +1578,7 @@ class WebSocketServer:
                                 'type': 'ma_depth_response',
                                 'camera': camera,
                                 'request_id': request_id,
+                                'cache_only': cache_only,
                                 'served_from_cache': False,
                                 'error': str(exc),
                                 'ok': False,
@@ -1583,11 +1618,23 @@ class WebSocketServer:
                             )
                             continue
 
-                        rate_key = f"{client_ip}:{camera or 'unknown'}"
+                        mode_key = "cache" if cache_only else "fresh"
+                        rate_key = f"{client_ip}:{camera or 'unknown'}:{mode_key}"
                         now = time.time()
                         last = self._floorplan_rpc_tracker.get(rate_key, 0.0)
                         if now - last < self._floorplan_rate_limit_window:
                             self.logger.debug(f"Floorplan RPC throttled for {rate_key}")
+                            result.update({
+                                'served_from_cache': False,
+                                'error': 'rate_limited',
+                                'ok': False,
+                            })
+                            await self._send_json_with_boundary_metrics(
+                                websocket,
+                                result,
+                                route="get_floorplan",
+                                message_type="floorplan_response",
+                            )
                             continue
                         self._floorplan_rpc_tracker[rate_key] = now
                         if len(self._floorplan_rpc_tracker) > 256:

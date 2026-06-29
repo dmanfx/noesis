@@ -92,6 +92,12 @@ class WebSocketServer:
             self._webrtc_max_clients = max(1, int(os.environ.get("NOESIS_MOSAIC_WEBRTC_MAX_CLIENTS", "5")))
         except Exception:
             self._webrtc_max_clients = 5
+        try:
+            self._webrtc_initial_clients = max(0, int(os.environ.get("NOESIS_MOSAIC_WEBRTC_INITIAL_CLIENTS", "1")))
+        except Exception:
+            self._webrtc_initial_clients = 1
+        self._webrtc_gateway_factory: Optional[Callable[[], Any]] = None
+        self.webrtc_activity_callback: Optional[Callable[[bool], None]] = None
         # WebRTC signaling ownership: only the connection that most recently sent a
         # webrtc_offer should receive webrtc_answer / server ICE candidates.
         self._webrtc_owner: Optional[Any] = None
@@ -113,6 +119,29 @@ class WebSocketServer:
         self._boundary_violations = 0
         self._boundary_route_metrics: Dict[str, Dict[str, Any]] = {}
         self._boundary_stage_metrics: Dict[str, Dict[str, Any]] = {}
+        self._latest_json_by_key: Dict[str, Dict[str, Any]] = {}
+        self._json_flush_task: Optional[asyncio.Task] = None
+        self._json_sending: bool = False
+        self._json_last_sent: Dict[str, float] = {}
+        self._json_coalesce_interval_by_type: Dict[str, float] = self._load_json_coalesce_intervals()
+
+    def _load_json_coalesce_intervals(self) -> Dict[str, float]:
+        def _interval(env_name: str, default_hz: float) -> float:
+            raw = os.environ.get(env_name, "").strip()
+            if raw:
+                try:
+                    hz = float(raw)
+                    if hz <= 0.0:
+                        return 0.0
+                    return 1.0 / hz
+                except Exception:
+                    pass
+            return 1.0 / float(default_hz)
+
+        return {
+            "tracking": _interval("NOESIS_WS_TRACKING_MAX_HZ", 15.0),
+            "bev-frame": _interval("NOESIS_WS_BEV_MAX_HZ", 12.0),
+        }
 
     def _new_boundary_bucket(self, maxlen: int = 1024) -> Dict[str, Any]:
         return {
@@ -377,6 +406,7 @@ class WebSocketServer:
         self._webrtc_gateway_owner[gateway] = websocket
         self._webrtc_gateway_owner_ip[gateway] = client_ip
         self._webrtc_client_gateway[websocket] = gateway
+        self._notify_webrtc_activity()
 
     def _clear_gateway_owner_for_client(self, websocket: Any) -> None:
         gateway = self._webrtc_client_gateway.pop(websocket, None)
@@ -387,6 +417,63 @@ class WebSocketServer:
             if owner is websocket:
                 self._webrtc_gateway_owner.pop(gw, None)
                 self._webrtc_gateway_owner_ip.pop(gw, None)
+        if gateway is not None:
+            self._retire_extra_idle_gateway(gateway)
+        self._notify_webrtc_activity()
+
+    def _has_active_webrtc_owner(self) -> bool:
+        for gateway in list(self.webrtc_gateways):
+            if self._get_gateway_owner(gateway) is not None:
+                return True
+        return self._get_webrtc_owner() is not None
+
+    def _notify_webrtc_activity(self) -> None:
+        callback = self.webrtc_activity_callback
+        if not callable(callback):
+            return
+        try:
+            callback(bool(self._has_active_webrtc_owner()))
+        except Exception:
+            self.logger.debug("WebRTC activity callback failed", exc_info=True)
+
+    def _retire_extra_idle_gateway(self, gateway: Any) -> None:
+        if gateway not in self.webrtc_gateways:
+            return
+        if self._get_gateway_owner(gateway) is not None:
+            return
+        if len(self.webrtc_gateways) <= int(self._webrtc_initial_clients):
+            return
+        try:
+            self.webrtc_gateways.remove(gateway)
+        except ValueError:
+            return
+        if self.webrtc_gateway is gateway:
+            self.webrtc_gateway = self.webrtc_gateways[0] if self.webrtc_gateways else None
+
+        def _stop() -> None:
+            try:
+                stop = getattr(gateway, "stop", None)
+                if callable(stop):
+                    stop()
+            except Exception:
+                self.logger.debug("Failed to stop idle WebRTC gateway", exc_info=True)
+
+        threading.Thread(target=_stop, daemon=True, name="WebRTCIdleStop").start()
+
+    def _create_webrtc_gateway(self) -> Optional[Any]:
+        if len(self.webrtc_gateways) >= int(self._webrtc_max_clients):
+            return None
+        factory = self._webrtc_gateway_factory
+        if not callable(factory):
+            return None
+        try:
+            gateway = factory()
+        except Exception:
+            self.logger.exception("WebRTC gateway factory failed")
+            return None
+        if gateway is not None and gateway not in self.webrtc_gateways:
+            self.register_webrtc_gateway(gateway)
+        return gateway
 
     def _select_gateway_for_client(self, websocket: Any) -> Optional[Any]:
         assigned_gateway = self._webrtc_client_gateway.get(websocket)
@@ -400,7 +487,7 @@ class WebSocketServer:
             owner = self._get_gateway_owner(gateway)
             if owner is None:
                 return gateway
-        return None
+        return self._create_webrtc_gateway()
 
     async def _send_to_client(self, websocket, message) -> None:
         """Send a message to one client, mirroring broadcast() semantics."""
@@ -650,6 +737,20 @@ class WebSocketServer:
                 self._webrtc_max_clients,
             )
         self.webrtc_gateway = self.webrtc_gateways[0] if self.webrtc_gateways else gateway
+
+    def register_webrtc_gateway_factory(
+        self,
+        factory: Callable[[], Any],
+        *,
+        max_clients: Optional[int] = None,
+        initial_clients: Optional[int] = None,
+    ) -> None:
+        """Register a demand-driven gateway factory for extra WebRTC slots."""
+        self._webrtc_gateway_factory = factory
+        if max_clients is not None:
+            self._webrtc_max_clients = max(1, int(max_clients))
+        if initial_clients is not None:
+            self._webrtc_initial_clients = max(0, int(initial_clients))
 
     def send_webrtc_answer(self, sdp: str, gateway: Optional[Any] = None) -> None:
         """Send WebRTC answer SDP to the owning client (fallback: broadcast)."""
@@ -955,6 +1056,10 @@ class WebSocketServer:
         if self._binary_flush_task and not self._binary_flush_task.done():
             self._binary_flush_task.cancel()
             tasks_to_cancel.append(self._binary_flush_task)
+
+        if self._json_flush_task and not self._json_flush_task.done():
+            self._json_flush_task.cancel()
+            tasks_to_cancel.append(self._json_flush_task)
 
         # Cancel the periodic stats task
         if self._stats_task and not self._stats_task.done():
@@ -1724,7 +1829,7 @@ class WebSocketServer:
                     elif data.get('type') == 'webrtc_offer':
                         self.logger.info(">>> Received webrtc_offer from client %s", client_ip)
                         # Prefer gateway pool if registered, otherwise fall back to legacy approach.
-                        if self.webrtc_gateways:
+                        if self.webrtc_gateways or self._webrtc_gateway_factory is not None:
                             sdp = data.get('sdp', '')
                             sdp_lines = len(sdp.split('\n')) if sdp else 0
                             gateway = self._select_gateway_for_client(websocket)
@@ -1812,7 +1917,7 @@ class WebSocketServer:
                     # Handle WebRTC signaling: ICE candidate from browser
                     elif data.get('type') == 'webrtc_ice_candidate':
                         self.logger.info(">>> Received webrtc_ice_candidate from client %s", client_ip)
-                        if self.webrtc_gateways:
+                        if self.webrtc_gateways or self._webrtc_gateway_factory is not None:
                             gateway = self._webrtc_client_gateway.get(websocket)
                             if gateway is None or gateway not in self.webrtc_gateways:
                                 try:
@@ -2040,6 +2145,13 @@ class WebSocketServer:
         except Exception:
             # If the loop object doesn't implement is_closed, proceed defensively
             pass
+
+        if self._should_coalesce_json_message(message):
+            asyncio.run_coroutine_threadsafe(
+                self._coalesce_json_and_maybe_flush(message),
+                self.event_loop,
+            )
+            return
             
         # Create a task in the event loop
         asyncio.run_coroutine_threadsafe(
@@ -2147,6 +2259,80 @@ class WebSocketServer:
             self.logger.error(f"Binary flush error: {e}")
         finally:
             self._binary_sending = False
+
+    def _json_coalesce_key(self, message: Dict[str, Any]) -> Optional[str]:
+        message_type = str(message.get("type", "") or "")
+        if message_type not in self._json_coalesce_interval_by_type:
+            return None
+        if message_type == "tracking":
+            source_id = message.get("source_id", message.get("cameraId", message.get("camera_id", "unknown")))
+            return f"{message_type}:{source_id}"
+        if message_type == "bev-frame":
+            camera_id = message.get("cameraId", message.get("camera_id", message.get("source_id", "unknown")))
+            return f"{message_type}:{camera_id}"
+        return None
+
+    def _should_coalesce_json_message(self, message: Any) -> bool:
+        if not isinstance(message, dict):
+            return False
+        key = self._json_coalesce_key(message)
+        if key is None:
+            return False
+        interval = float(self._json_coalesce_interval_by_type.get(str(message.get("type")), 0.0) or 0.0)
+        return interval > 0.0
+
+    async def _coalesce_json_and_maybe_flush(self, message: Dict[str, Any]) -> None:
+        try:
+            key = self._json_coalesce_key(message)
+            if key is None:
+                await self.broadcast(message)
+                return
+            self._latest_json_by_key[key] = message
+            if self._json_flush_task is None or self._json_flush_task.done():
+                self._json_flush_task = asyncio.create_task(self._flush_json_queue(), name="JsonBroadcastFlush")
+        except Exception as exc:
+            self.logger.debug("JSON coalescer error: %s", exc)
+
+    async def _flush_json_queue(self) -> None:
+        if self._json_sending:
+            return
+        self._json_sending = True
+        try:
+            while self.running and self._latest_json_by_key:
+                if not self.connected_clients:
+                    self._latest_json_by_key.clear()
+                    return
+                now = time.time()
+                ready: List[Dict[str, Any]] = []
+                next_due: Optional[float] = None
+                for key, payload in list(self._latest_json_by_key.items()):
+                    message_type = str(payload.get("type", "") or "")
+                    interval = float(self._json_coalesce_interval_by_type.get(message_type, 0.0) or 0.0)
+                    last_sent = float(self._json_last_sent.get(key, 0.0) or 0.0)
+                    due = last_sent + interval
+                    if now >= due:
+                        ready.append(payload)
+                        self._latest_json_by_key.pop(key, None)
+                        self._json_last_sent[key] = now
+                    else:
+                        next_due = due if next_due is None else min(next_due, due)
+
+                for payload in ready:
+                    await self.broadcast(payload)
+
+                if not ready:
+                    sleep_s = 0.02
+                    if next_due is not None:
+                        sleep_s = max(0.005, min(0.05, float(next_due) - time.time()))
+                    await asyncio.sleep(sleep_s)
+                else:
+                    await asyncio.sleep(0)
+        except asyncio.CancelledError:
+            pass
+        except Exception as exc:
+            self.logger.error("JSON broadcast flush error: %s", exc)
+        finally:
+            self._json_sending = False
 
 
 class WebSocketClient:

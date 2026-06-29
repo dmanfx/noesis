@@ -3213,6 +3213,7 @@ class PoseFeatureProcessor:
     _debug_objects: int = field(default=0, init=False, repr=False)
     _debug_attached: int = field(default=0, init=False, repr=False)
     _debug_missing: int = field(default=0, init=False, repr=False)
+    _pose_cache: Dict[Tuple[int, int], Dict[str, Any]] = field(default_factory=dict, init=False, repr=False)
 
     def _frame_source_id(self, frame_meta: Any) -> int:
         for attr in ("source_id", "pad_index", "camera_id"):
@@ -3237,6 +3238,169 @@ class PoseFeatureProcessor:
         if pts_ns <= 0:
             pts_ns = int(time.time() * 1_000_000_000)
         return max(0, pts_ns // 1_000)
+
+    def _pose_cache_max_age_frames(self) -> int:
+        raw = os.environ.get("NOESIS_POSE_FEATURE_CACHE_MAX_AGE_FRAMES", "6")
+        try:
+            return max(0, int(str(raw).strip()))
+        except Exception:
+            return 6
+
+    def _pose_cache_max_bbox_shift(self) -> float:
+        raw = os.environ.get("NOESIS_POSE_FEATURE_CACHE_MAX_BBOX_SHIFT", "0.35")
+        try:
+            return max(0.0, float(str(raw).strip()))
+        except Exception:
+            return 0.35
+
+    def _pose_cache_key(self, source_id: int, track_id: int) -> Optional[Tuple[int, int]]:
+        if int(track_id) < 0:
+            return None
+        return int(source_id), int(track_id)
+
+    @staticmethod
+    def _bbox_shift_ratio(old_bbox: Sequence[float], new_bbox: Sequence[float]) -> float:
+        try:
+            old_left, old_top, old_w, old_h = [float(x) for x in old_bbox[:4]]
+            new_left, new_top, new_w, new_h = [float(x) for x in new_bbox[:4]]
+        except Exception:
+            return float("inf")
+        diag = math.hypot(max(1.0, old_w), max(1.0, old_h))
+        old_cx = old_left + old_w * 0.5
+        old_cy = old_top + old_h * 0.5
+        new_cx = new_left + new_w * 0.5
+        new_cy = new_top + new_h * 0.5
+        return float(math.hypot(new_cx - old_cx, new_cy - old_cy) / max(1.0, diag))
+
+    def _stable_id_for_track(self, source_id: int, track_id: int) -> Optional[int]:
+        try:
+            mgr = getattr(self.pipeline, "stable_id_mgr", None)
+            if mgr is not None:
+                rec = mgr.active_tracks.get((int(source_id), int(track_id)))
+                if rec and rec.get("stable_id") is not None:
+                    return int(rec.get("stable_id"))
+        except Exception:
+            return None
+        return None
+
+    def _cache_pose_payload(
+        self,
+        source_id: int,
+        track_id: int,
+        bbox: Sequence[float],
+        frame_id: int,
+        payload: Mapping[str, Any],
+    ) -> None:
+        key = self._pose_cache_key(source_id, track_id)
+        if key is None:
+            return
+        self._pose_cache[key] = {
+            "frame_id": int(frame_id),
+            "bbox": [float(x) for x in bbox[:4]],
+            "payload": dict(payload),
+        }
+
+    def _cached_pose_payload(
+        self,
+        source_id: int,
+        track_id: int,
+        bbox: Sequence[float],
+        frame_id: int,
+        ts_us: int,
+        stable_id: Optional[int],
+    ) -> Optional[Dict[str, Any]]:
+        key = self._pose_cache_key(source_id, track_id)
+        if key is None:
+            return None
+        entry = self._pose_cache.get(key)
+        if not isinstance(entry, dict):
+            return None
+        try:
+            cached_frame_id = int(entry.get("frame_id", 0))
+            age_frames = int(frame_id) - cached_frame_id
+        except Exception:
+            age_frames = self._pose_cache_max_age_frames() + 1
+        if age_frames < 0 or age_frames > self._pose_cache_max_age_frames():
+            self._pose_cache.pop(key, None)
+            return None
+
+        old_bbox = entry.get("bbox")
+        if not isinstance(old_bbox, (list, tuple)) or len(old_bbox) < 4:
+            self._pose_cache.pop(key, None)
+            return None
+        if self._bbox_shift_ratio(old_bbox, bbox) > self._pose_cache_max_bbox_shift():
+            self._pose_cache.pop(key, None)
+            return None
+
+        payload = entry.get("payload")
+        if not isinstance(payload, Mapping):
+            self._pose_cache.pop(key, None)
+            return None
+        clone: Dict[str, Any] = dict(payload)
+        old_left, old_top, old_w, old_h = [float(x) for x in old_bbox[:4]]
+        new_left, new_top, new_w, new_h = [float(x) for x in bbox[:4]]
+        sx = float(new_w / old_w) if old_w > 1e-6 else 1.0
+        sy = float(new_h / old_h) if old_h > 1e-6 else 1.0
+
+        raw_roi = clone.get("keypoints_roi")
+        if isinstance(raw_roi, (list, tuple)) and len(raw_roi) >= 17:
+            roi_rows: List[List[float]] = []
+            abs_rows: List[List[float]] = []
+            for item in raw_roi[:17]:
+                if not isinstance(item, (list, tuple)) or len(item) < 3:
+                    return None
+                try:
+                    x = float(item[0]) * sx
+                    y = float(item[1]) * sy
+                    c = float(item[2])
+                except Exception:
+                    return None
+                roi_rows.append([x, y, c])
+                abs_rows.append([new_left + x, new_top + y, c])
+            clone["keypoints_roi"] = roi_rows
+            clone["keypoints_abs"] = abs_rows
+
+        clone["source_id"] = int(source_id)
+        clone["frame_id"] = int(frame_id)
+        clone["object_id"] = int(track_id)
+        clone["bbox"] = [new_left, new_top, new_w, new_h]
+        clone["ts_us"] = int(ts_us)
+        clone["pose_cache_reused"] = True
+        clone["pose_cache_age_frames"] = int(age_frames)
+        if stable_id is not None:
+            clone["stable_id"] = int(stable_id)
+        else:
+            clone.pop("stable_id", None)
+        return clone
+
+    def _attach_pose_payload(self, attach_obj: Any, obj_meta: Any, payload: Mapping[str, Any]) -> bool:
+        if attach_obj is None:
+            return False
+        try:
+            payload_json = _serialize_compact_json_with_metrics(
+                dict(payload),
+                metric="pose_features.user_meta_json",
+            )
+            payload_bytes = len(payload_json.encode("utf-8"))
+            if payload_bytes > _pose_meta_payload_limit_bytes():
+                logger.debug(
+                    "Pose meta attach skipped: payload exceeds limit bytes=%d",
+                    int(payload_bytes),
+                )
+                return False
+            _increment_core_counter(
+                "tensor_boundary_copy_bytes_total.pose_meta",
+                payload_bytes,
+            )
+            return bool(
+                attach_obj(
+                    obj_meta,
+                    payload_json,
+                    True,
+                )
+            )
+        except Exception:
+            return False
 
     def _point(self, kpts: np.ndarray, idx: int) -> Optional[Tuple[float, float]]:
         if idx < 0 or idx >= kpts.shape[0]:
@@ -3489,6 +3653,7 @@ class PoseFeatureProcessor:
                 track_id = -1
             roi_w = float(bbox[2])
             roi_h = float(bbox[3])
+            stable_id = self._stable_id_for_track(source_id, track_id)
             score = 0.0
             kpts_abs: Optional[np.ndarray] = None
             kpts_for_features: Optional[np.ndarray] = None
@@ -3498,6 +3663,18 @@ class PoseFeatureProcessor:
                 score, kpts_roi, kpts_abs = native
                 kpts_for_features = kpts_roi
             else:
+                cached_payload = self._cached_pose_payload(
+                    source_id,
+                    track_id,
+                    bbox,
+                    frame_id,
+                    ts_us,
+                    stable_id,
+                )
+                if cached_payload is not None and self._attach_pose_payload(attach_obj, obj_meta, cached_payload):
+                    if debug:
+                        self._debug_attached += 1
+                    continue
                 if debug:
                     self._debug_missing += 1
                 continue
@@ -3515,16 +3692,6 @@ class PoseFeatureProcessor:
                 if debug:
                     self._debug_missing += 1
                 continue
-
-            stable_id = None
-            try:
-                mgr = getattr(self.pipeline, "stable_id_mgr", None)
-                if mgr is not None:
-                    rec = mgr.active_tracks.get((int(source_id), int(track_id)))
-                    if rec and rec.get("stable_id") is not None:
-                        stable_id = int(rec.get("stable_id"))
-            except Exception:
-                stable_id = None
 
             payload = PoseFeatureResult(
                 source_id=int(source_id),
@@ -3547,34 +3714,9 @@ class PoseFeatureProcessor:
                 if debug:
                     self._debug_missing += 1
             else:
-                try:
-                    payload_json = _serialize_compact_json_with_metrics(
-                        payload,
-                        metric="pose_features.user_meta_json",
-                    )
-                    payload_bytes = len(payload_json.encode("utf-8"))
-                    if payload_bytes > _pose_meta_payload_limit_bytes():
-                        if debug:
-                            self._debug_missing += 1
-                        logger.debug(
-                            "Pose meta attach skipped: payload exceeds limit bytes=%d",
-                            int(payload_bytes),
-                        )
-                        continue
-                    _increment_core_counter(
-                        "tensor_boundary_copy_bytes_total.pose_meta",
-                        payload_bytes,
-                    )
-                    ok = bool(
-                        attach_obj(
-                            obj_meta,
-                            payload_json,
-                            True,
-                        )
-                    )
-                except Exception:
-                    ok = False
+                ok = self._attach_pose_payload(attach_obj, obj_meta, payload)
                 if ok:
+                    self._cache_pose_payload(source_id, track_id, bbox, frame_id, payload)
                     if debug:
                         self._debug_attached += 1
                 else:
@@ -4017,12 +4159,38 @@ class _ObjectDepthFusionProcessor:
             logger.exception("GPU depth ROI copy failed")
             return None
 
-    def _decode_instance_mask(self, obj_meta: Any, target_shape: Tuple[int, int]) -> Tuple[Optional[np.ndarray], str]:
+    def _bbox_fallback_band_fraction(self) -> float:
+        raw = os.environ.get("NOESIS_OBJECT_DEPTH_BBOX_BAND_FRACTION", "0.5")
+        try:
+            value = float(str(raw).strip())
+        except Exception:
+            value = 0.5
+        return max(0.05, min(1.0, value))
+
+    def _bbox_fallback_y0(self, y0: int, y1: int) -> int:
+        height = max(1, int(y1) - int(y0))
+        band_height = max(1, int(math.ceil(float(height) * self._bbox_fallback_band_fraction())))
+        return max(int(y0), int(y1) - int(band_height))
+
+    def _extract_instance_mask_payload(self, obj_meta: Any) -> Optional[Mapping[str, Any]]:
+        if noesis_depth_meta_ext is None:
+            return None
         try:
             payload = noesis_depth_meta_ext.extract_object_mask(obj_meta)  # type: ignore[union-attr]
         except Exception:
             logger.debug("Native object-mask extraction failed", exc_info=True)
-            return None, "mask_decode_failed"
+            return None
+        if not payload:
+            return None
+        if not isinstance(payload, Mapping):
+            return None
+        return payload
+
+    def _decode_instance_mask_payload(
+        self,
+        payload: Optional[Mapping[str, Any]],
+        target_shape: Tuple[int, int],
+    ) -> Tuple[Optional[np.ndarray], str]:
         if not payload:
             return None, "missing_mask"
         try:
@@ -4040,6 +4208,10 @@ class _ObjectDepthFusionProcessor:
                 interpolation=cv2.INTER_NEAREST,
             ).astype(bool)
         return mask, "ok"
+
+    def _decode_instance_mask(self, obj_meta: Any, target_shape: Tuple[int, int]) -> Tuple[Optional[np.ndarray], str]:
+        payload = self._extract_instance_mask_payload(obj_meta)
+        return self._decode_instance_mask_payload(payload, target_shape)
 
     def _build_result(
         self,
@@ -4165,27 +4337,32 @@ class _ObjectDepthFusionProcessor:
         if x1 <= x0 or y1 <= y0:
             return self._build_result(frame_meta, obj_meta, bbox=bbox, status="transform_mismatch")
 
-        depth_crop = self._copy_depth_crop(depth_frame, x0, y0, x1, y1)
+        mask_payload = self._extract_instance_mask_payload(obj_meta)
+        crop_y0 = y0 if mask_payload else self._bbox_fallback_y0(y0, y1)
+        depth_crop = self._copy_depth_crop(depth_frame, x0, crop_y0, x1, y1)
         if depth_crop is None:
             return self._build_result(frame_meta, obj_meta, bbox=bbox, status="depth_not_ready")
         if depth_crop.size <= 0:
             return self._build_result(frame_meta, obj_meta, bbox=bbox, status="transform_mismatch")
 
         cx = max(0, min(frame_w - 1, int(round(left + (width * 0.5)))))
-        cy = max(0, min(frame_h - 1, int(round(top + (height * 0.5)))))
+        if mask_payload:
+            cy = max(0, min(frame_h - 1, int(round(top + (height * 0.5)))))
+        else:
+            cy = max(0, min(frame_h - 1, int(round(crop_y0 + ((y1 - crop_y0) * 0.5)))))
         local_cx = max(0, min(int(depth_crop.shape[1]) - 1, cx - x0))
-        local_cy = max(0, min(int(depth_crop.shape[0]) - 1, cy - y0))
+        local_cy = max(0, min(int(depth_crop.shape[0]) - 1, cy - crop_y0))
         center_sample = float(depth_crop[local_cy, local_cx])
         center_value = center_sample if np.isfinite(center_sample) else None
 
-        mask, _mask_status = self._decode_instance_mask(obj_meta, depth_crop.shape)
+        mask, _mask_status = self._decode_instance_mask_payload(mask_payload, depth_crop.shape)
         if mask is None:
             return self._sample_bbox_band_result(
                 frame_meta,
                 obj_meta,
                 bbox=bbox,
                 depth_crop=depth_crop,
-                crop_origin=(x0, y0),
+                crop_origin=(x0, crop_y0),
                 depth_center=center_value,
             )
 
@@ -4197,7 +4374,7 @@ class _ObjectDepthFusionProcessor:
                 obj_meta,
                 bbox=bbox,
                 depth_crop=depth_crop,
-                crop_origin=(x0, y0),
+                crop_origin=(x0, crop_y0),
                 depth_center=center_value,
             )
 
@@ -4206,7 +4383,7 @@ class _ObjectDepthFusionProcessor:
         anchor = _extract_person_depth_anchor(
             mask,
             depth_crop,
-            frame_origin=(int(math.floor(left)), int(math.floor(top))),
+            frame_origin=(int(x0), int(crop_y0)),
         )
         anchor_fields: Dict[str, Any] = {
             "spatial_class": "person",

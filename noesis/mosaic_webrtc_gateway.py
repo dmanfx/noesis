@@ -467,28 +467,6 @@ class MosaicWebRTCGateway:
         self._frame_count += 1
         if self._frame_count == 1:
             logger.info(">>> First video frame received in gateway!")
-            #region agent log
-            try:
-                import json, time  # local import to avoid module-level impact
-
-                with open("/home/mayor/Noesis_Devel/.cursor/debug.log", "a", encoding="utf-8") as _f:
-                    _f.write(
-                        json.dumps(
-                            {
-                                "sessionId": "debug-session",
-                                "runId": "run1",
-                                "hypothesisId": "H4",
-                                "location": "mosaic_webrtc_gateway.py:_on_frame_probe",
-                                "message": "gateway first frame",
-                                "data": {"count": self._frame_count, "rtsp_uri": self.rtsp_uri},
-                                "timestamp": int(time.time() * 1000),
-                            }
-                        )
-                        + "\n"
-                    )
-            except Exception:
-                pass
-            #endregion
             # If we delayed answering because RTSP hadn't started yet, kick answer creation now.
             if (
                 self._pending_create_answer
@@ -511,77 +489,12 @@ class MosaicWebRTCGateway:
                     _do(None)
         if self._keyframe_count == 1 and is_keyframe:
             logger.info(">>> First keyframe observed in gateway")
-            try:
-                import json, time  # local import to avoid module-level impact
-
-                with open("/home/mayor/Noesis_Devel/.cursor/debug.log", "a", encoding="utf-8") as _f:
-                    _f.write(
-                        json.dumps(
-                            {
-                                "sessionId": "debug-session",
-                                "runId": "run1",
-                                "hypothesisId": "H4",
-                                "location": "mosaic_webrtc_gateway.py:_on_frame_probe",
-                                "message": "gateway first keyframe",
-                                "data": {"frame_count": int(self._frame_count), "rtsp_uri": self.rtsp_uri},
-                                "timestamp": int(time.time() * 1000),
-                            }
-                        )
-                        + "\n"
-                    )
-            except Exception:
-                pass
-        elif self._frame_count % 10 == 0:
-            #region agent log
-            try:
-                import json, time  # local import to avoid module-level impact
-
-                with open("/home/mayor/Noesis_Devel/.cursor/debug.log", "a", encoding="utf-8") as _f:
-                    _f.write(
-                        json.dumps(
-                            {
-                                "sessionId": "debug-session",
-                                "runId": "run1",
-                                "hypothesisId": "H4",
-                                "location": "mosaic_webrtc_gateway.py:_on_frame_probe",
-                                "message": "gateway frame count",
-                                "data": {
-                                    "count": self._frame_count,
-                                    "keyframes": int(self._keyframe_count),
-                                    "rtsp_uri": self.rtsp_uri,
-                                },
-                                "timestamp": int(time.time() * 1000),
-                            }
-                        )
-                        + "\n"
-                    )
-            except Exception:
-                pass
-            #endregion
-        elif self._frame_count % 100 == 0:
-            logger.info(">>> Gateway video frames: %d", self._frame_count)
-            #region agent log
-            try:
-                import json, time  # local import to avoid module-level impact
-
-                with open("/home/mayor/Noesis_Devel/.cursor/debug.log", "a", encoding="utf-8") as _f:
-                    _f.write(
-                        json.dumps(
-                            {
-                                "sessionId": "debug-session",
-                                "runId": "run1",
-                                "hypothesisId": "H4",
-                                "location": "mosaic_webrtc_gateway.py:_on_frame_probe",
-                                "message": "gateway frame milestone",
-                                "data": {"count": self._frame_count, "rtsp_uri": self.rtsp_uri},
-                                "timestamp": int(time.time() * 1000),
-                            }
-                        )
-                        + "\n"
-                    )
-            except Exception:
-                pass
-            #endregion
+        elif self._frame_count % 300 == 0:
+            logger.debug(
+                "Gateway video frames=%d keyframes=%d",
+                int(self._frame_count),
+                int(self._keyframe_count),
+            )
         return Gst.PadProbeReturn.OK
 
     def _queue_payload_matches_offer(self) -> bool:

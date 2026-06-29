@@ -16,7 +16,7 @@ DA2_CHECKPOINT_PATH = REPO_ROOT / "models" / "depth_anything_v2" / "checkpoints"
 
 DEFAULT_GIE_ID = 5
 DEFAULT_BATCH_SIZE = 3
-DEFAULT_INTERVAL = 1
+DEFAULT_INTERVAL = 3
 DEFAULT_INPUT_SIZE = (518, 294)  # width, height
 DEFAULT_MODEL_NAME = "depth-anything-v2-metric-hypersim-vits"
 

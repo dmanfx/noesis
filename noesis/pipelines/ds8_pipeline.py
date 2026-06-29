@@ -102,6 +102,8 @@ class DS8Pipeline:
     errors: List[str] = field(default_factory=list)
     valve_name: Optional[str] = None
     depth_gate_attach: Optional[str] = None
+    rtsp_output_valve_name: Optional[str] = None
+    rtsp_output_enabled: bool = True
     depth_frame_samples: List[float] = field(default_factory=list)
     depth_last_toggle: float = 0.0
     frame_size: Tuple[int, int] = field(default_factory=lambda: (0, 0))
@@ -110,6 +112,7 @@ class DS8Pipeline:
     _timer: Optional[threading.Timer] = field(default=None, init=False, repr=False)
     _prime_timer: Optional[threading.Timer] = field(default=None, init=False, repr=False)
     _depth_lock: threading.Lock = field(default_factory=threading.Lock, init=False, repr=False)
+    _rtsp_output_lock: threading.Lock = field(default_factory=threading.Lock, init=False, repr=False)
 
     def _set_valve_drop(self, drop: bool) -> bool:
         valve = self._resolve_valve()
@@ -148,6 +151,33 @@ class DS8Pipeline:
         if not self.valve_name:
             return None
         return self.components.get(self.valve_name)
+
+    def _set_component_property(self, component_name: str, key: str, value: Any) -> bool:
+        component = self.components.get(component_name)
+        if component is None:
+            return False
+        component.config[str(key)] = value
+        ds = getattr(self, "ds_pipeline", None)
+        if ds is not None:
+            try:
+                node = ds[component.name]  # type: ignore[index]
+                node.set({str(key): value})
+            except Exception:
+                logger.exception("Failed to set %s.%s=%s", component.name, key, value)
+        return True
+
+    def mark_rtsp_output_enabled(self, enabled: bool) -> None:
+        valve_name = self.rtsp_output_valve_name
+        if not valve_name:
+            return
+        enabled_bool = bool(enabled)
+        with self._rtsp_output_lock:
+            if self.rtsp_output_enabled == enabled_bool:
+                return
+            self.rtsp_output_enabled = enabled_bool
+        drop_state = not enabled_bool
+        if self._set_component_property(valve_name, "drop", drop_state):
+            logger.info("Mosaic RTSP output toggled: enabled=%s valve.drop=%s", enabled_bool, drop_state)
 
     def record_depth_frame(self, timestamp: Optional[float] = None) -> None:
         ts = timestamp if timestamp is not None else time.time()
@@ -1297,6 +1327,14 @@ def build_pipeline(yaml_path: str | Path) -> DS8Pipeline:
     rtsp_branch = {}
     rtsp_vconv_nvbuf_memory_type = zero_copy_nvbuf_memory_type
     if rtsp_enabled:
+        rtsp_demand_gated_env = str(os.environ.get("NOESIS_MOSAIC_RTSP_DEMAND_GATED", "1")).strip().lower()
+        rtsp_demand_gated = bool(mosaic_webrtc_enabled) and rtsp_demand_gated_env not in ("0", "false", "no", "off")
+        rtsp_output_valve = Component(
+            name="rtsp_output_valve",
+            element="valve",
+            config={"drop": bool(rtsp_demand_gated), "drop-mode": 1},
+            downstream=[],
+        )
         # Always put a queue immediately after the tee so this branch cannot backpressure
         # the main analytics/mosaic path when RTSP clients are slow or absent.
         rtsp_queue = Component(
@@ -1343,6 +1381,7 @@ def build_pipeline(yaml_path: str | Path) -> DS8Pipeline:
         )
 
         rtsp_branch = {
+            "valve": rtsp_output_valve,
             "queue": rtsp_queue,
             "vconv": rtsp_vconv,
             "out": rtsp_out,
@@ -1351,7 +1390,10 @@ def build_pipeline(yaml_path: str | Path) -> DS8Pipeline:
             pipeline.components[comp.name] = comp
             _safe_add(ds_pipeline, comp, pipeline.errors)
             _apply_component_config(ds_pipeline, comp, pipeline.errors)
-        sink_tee.downstream.append(rtsp_queue.name)
+        sink_tee.downstream.append(rtsp_output_valve.name)
+        rtsp_output_valve.downstream = [rtsp_queue.name]
+        pipeline.rtsp_output_valve_name = rtsp_output_valve.name
+        pipeline.rtsp_output_enabled = not rtsp_demand_gated
 
     source_decode_memtypes: List[Optional[int]] = []
     for source_cfg in sources:
@@ -1455,11 +1497,16 @@ def build_pipeline(yaml_path: str | Path) -> DS8Pipeline:
     _link(tiler.name, osd.name)
     _link(osd.name, sink_tee.name)
 
-    # Link RTSP branch: sink_tee → rtsp_queue → rtsp_vconv → rtsp_out
+    # Link RTSP branch: sink_tee → rtsp_output_valve → rtsp_queue → rtsp_vconv → rtsp_out
     # (nvrtspoutsinkbin handles encoding and RTP payloading internally)
     if rtsp_branch:
+        rtsp_valve = rtsp_branch.get("valve")
         rtsp_queue = rtsp_branch.get("queue")
-        if rtsp_queue is not None:
+        if rtsp_valve is not None and rtsp_queue is not None:
+            _link(sink_tee.name, rtsp_valve.name)
+            _link(rtsp_valve.name, rtsp_queue.name)
+            _link(rtsp_queue.name, rtsp_branch["vconv"].name)
+        elif rtsp_queue is not None:
             _link(sink_tee.name, rtsp_queue.name)
             _link(rtsp_queue.name, rtsp_branch["vconv"].name)
         else:

@@ -18,7 +18,7 @@ import sys
 import threading
 import time
 from pathlib import Path
-from typing import Any, Callable, Dict, Optional, Tuple, Mapping
+from typing import Any, Callable, Dict, List, Optional, Tuple, Mapping
 
 import yaml
 import numpy as np
@@ -70,6 +70,15 @@ from noesis.yolo26_seg_materialization import (
 )
 from noesis.yolo26_seg_materialization import resolve_yolo26_seg_assets as _shared_resolve_yolo26_seg_assets
 from websocket_server import WebSocketServer
+
+
+def _depth_tracking_interval() -> int:
+    raw = os.environ.get("NOESIS_DEPTH_TRACKING_INTERVAL", str(_DEPTH_TRACKING_INTERVAL))
+    try:
+        return max(0, int(str(raw).strip()))
+    except Exception:
+        return int(_DEPTH_TRACKING_INTERVAL)
+
 
 # GLib/GObject for GStreamer main loop (required for bus event dispatch)
 try:
@@ -598,6 +607,30 @@ def _materialize_yolo_detect_pgie_ini(
     )
     if onnx_count != 1 or engine_count != 1:
         raise SystemExit(f"[FATAL] YOLO detection PGIE template is missing onnx-file/model-engine-file: {template_path}")
+
+    if str(profile).strip().lower() == "yolo26":
+        try:
+            person_topk = max(1, int(os.environ.get("NOESIS_YOLO26_PERSON_TOPK", "100")))
+        except Exception:
+            person_topk = 100
+        text, topk_count = re.subn(r"(?m)^topk=.*$", f"topk={person_topk}", text, count=1)
+        if topk_count != 1:
+            raise SystemExit(f"[FATAL] YOLO detection PGIE template is missing topk: {template_path}")
+
+        filter_classes = ";".join(str(idx) for idx in range(1, 80))
+        if re.search(r"(?m)^filter-out-class-ids=", text):
+            text = re.sub(r"(?m)^filter-out-class-ids=.*$", f"filter-out-class-ids={filter_classes}", text, count=1)
+        else:
+            text, filter_count = re.subn(
+                r"(?m)^(operate-on-class-ids=0)$",
+                "\\1\nfilter-out-class-ids=" + filter_classes,
+                text,
+                count=1,
+            )
+            if filter_count != 1:
+                raise SystemExit(
+                    f"[FATAL] YOLO detection PGIE template is missing operate-on-class-ids=0: {template_path}"
+                )
 
     out_path = assets["output"]
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1216,10 +1249,11 @@ def _materialize_effective_pipeline_yaml(
 
     if str(tracking_mode).strip().lower() == "baseline":
         try:
+            depth_tracking_interval = _depth_tracking_interval()
             depth_assets = _materialize_depth_tracking_assets(
                 logger=logger,
                 batch_size=_DEPTH_TRACKING_BATCH_SIZE,
-                interval=_DEPTH_TRACKING_INTERVAL,
+                interval=depth_tracking_interval,
                 input_size=_DEPTH_TRACKING_INPUT_SIZE,
                 gie_id=_DEPTH_TRACKING_GIE_ID,
             )
@@ -1780,7 +1814,7 @@ def _build_depth_registration_profile_fingerprints(
             "model_name": "depth-anything-v2-metric-hypersim-vits",
             "input_size": list(_DEPTH_TRACKING_INPUT_SIZE),
             "batch_size": int(_DEPTH_TRACKING_BATCH_SIZE),
-            "interval": int(_DEPTH_TRACKING_INTERVAL),
+            "interval": int(_depth_tracking_interval()),
             "gie_id": int(_DEPTH_TRACKING_GIE_ID),
         },
     )
@@ -5302,11 +5336,12 @@ def main() -> int:
         logger.exception("Error while attaching pose feature hook")
     if tracking_mode == "baseline":
         try:
+            depth_tracking_interval = _depth_tracking_interval()
             hooks.attach_object_depth_fusion_hook(
                 pipeline,
                 camera_labels=camera_labels,
                 calibration_resolver=calibration_provider,
-                depth_every_n_frames=2,
+                depth_every_n_frames=max(1, int(depth_tracking_interval) + 1),
             )
         except Exception:
             logger.exception("Baseline tracking requires the DAv2 object-depth fusion hook")
@@ -5428,28 +5463,56 @@ def main() -> int:
                         max_webrtc_clients = max(1, int(os.environ.get("NOESIS_MOSAIC_WEBRTC_MAX_CLIENTS", "5")))
                     except Exception:
                         max_webrtc_clients = 5
+                    try:
+                        initial_webrtc_clients = max(0, int(os.environ.get("NOESIS_MOSAIC_WEBRTC_INITIAL_CLIENTS", "1")))
+                    except Exception:
+                        initial_webrtc_clients = 1
+                    initial_webrtc_clients = min(initial_webrtc_clients, max_webrtc_clients)
                     rtsp_keyframe_requester = _build_rtsp_keyframe_requester(pipeline, logger)
                     if rtsp_keyframe_requester is None:
                         logger.debug("RTSP keyframe requester unavailable; falling back to natural IDR cadence")
-                    for slot in range(max_webrtc_clients):
-                        try:
-                            gateway = MosaicWebRTCGateway(
-                                ws_server=ws_server,
-                                rtsp_uri=rtsp_uri,
-                                request_rtsp_keyframe=rtsp_keyframe_requester,
-                            )
-                            gateway.start()
+                    if getattr(pipeline, "rtsp_output_valve_name", None):
+
+                        def _set_webrtc_activity(active: bool) -> None:
+                            try:
+                                pipeline.mark_rtsp_output_enabled(bool(active))
+                            except Exception:
+                                logger.debug("Failed to apply WebRTC-driven RTSP gate", exc_info=True)
+
+                        ws_server.webrtc_activity_callback = _set_webrtc_activity
+                        pipeline.mark_rtsp_output_enabled(False)
+
+                    def _create_mosaic_gateway() -> MosaicWebRTCGateway:
+                        gateway = MosaicWebRTCGateway(
+                            ws_server=ws_server,
+                            rtsp_uri=rtsp_uri,
+                            request_rtsp_keyframe=rtsp_keyframe_requester,
+                        )
+                        gateway.start()
+                        if gateway not in webrtc_gateways:
                             webrtc_gateways.append(gateway)
-                            logger.info(
-                                "WebRTC gateway slot %d/%d started, consuming RTSP at %s",
-                                slot + 1,
-                                max_webrtc_clients,
-                                rtsp_uri,
-                            )
+                        logger.info(
+                            "WebRTC gateway slot %d/%d started, consuming RTSP at %s",
+                            len(webrtc_gateways),
+                            max_webrtc_clients,
+                            rtsp_uri,
+                        )
+                        return gateway
+
+                    ws_server.register_webrtc_gateway_factory(
+                        _create_mosaic_gateway,
+                        max_clients=max_webrtc_clients,
+                        initial_clients=initial_webrtc_clients,
+                    )
+                    for slot in range(initial_webrtc_clients):
+                        try:
+                            gateway = _create_mosaic_gateway()
+                            ws_server.register_webrtc_gateway(gateway)
                         except Exception:
                             logger.exception("Failed to start WebRTC gateway slot %d", slot + 1)
                     logger.info(
-                        "WebRTC gateway capacity: %d active slot(s)",
+                        "WebRTC gateway capacity: %d max, %d warm slot(s)",
+                        max_webrtc_clients,
                         len(webrtc_gateways),
                     )
                     #region agent log
@@ -5463,7 +5526,11 @@ def main() -> int:
                                         "hypothesisId": "H4",
                                         "location": "ds8_runtime.py:main",
                                         "message": "gateway started",
-                                        "data": {"rtsp_uri": rtsp_uri, "slots": len(webrtc_gateways)},
+                                        "data": {
+                                            "rtsp_uri": rtsp_uri,
+                                            "warm_slots": len(webrtc_gateways),
+                                            "max_slots": max_webrtc_clients,
+                                        },
                                         "timestamp": int(time.time() * 1000),
                                     }
                                 )
@@ -5572,8 +5639,12 @@ def main() -> int:
     _stop_rest_server(rest_server, rest_thread)
 
     # Stop WebRTC gateways if running
-    if webrtc_gateways:
-        for idx, gateway in enumerate(webrtc_gateways, start=1):
+    gateways_to_stop: List[Any] = []
+    for gateway in list(webrtc_gateways) + list(getattr(ws_server, "webrtc_gateways", []) or []):
+        if gateway is not None and gateway not in gateways_to_stop:
+            gateways_to_stop.append(gateway)
+    if gateways_to_stop:
+        for idx, gateway in enumerate(gateways_to_stop, start=1):
             try:
                 gateway.stop()
                 logger.info("WebRTC gateway slot %d stopped", idx)

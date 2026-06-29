@@ -144,6 +144,56 @@ def profile_fingerprint(
     return model_profile_fingerprint(model_cfg, repo_root=repo_root, extra=extra)
 
 
+def _profile_payload_without_fingerprint(profile: Mapping[str, Any]) -> dict[str, Any]:
+    return {str(k): v for k, v in dict(profile).items() if str(k) != "fingerprint_sha256"}
+
+
+def _dav2_identity_payload(profile: Mapping[str, Any]) -> dict[str, Any]:
+    payload = _profile_payload_without_fingerprint(profile)
+    identity: dict[str, Any] = {
+        "model_name": str(payload.get("model_name") or ""),
+    }
+    try:
+        identity["input_size"] = [int(v) for v in (payload.get("input_size") or [])]
+    except Exception:
+        identity["input_size"] = payload.get("input_size")
+    for key in ("batch_size", "gie_id"):
+        try:
+            identity[key] = int(payload.get(key))
+        except Exception:
+            identity[key] = payload.get(key)
+    engine = payload.get("model-engine-file", payload.get("engine"))
+    if engine is not None:
+        identity["engine"] = str(engine)
+    onnx = payload.get("onnx-file", payload.get("onnx"))
+    if onnx is not None:
+        identity["onnx"] = str(onnx)
+    return identity
+
+
+def _dav2_profile_matches(
+    artifact_profile: Mapping[str, Any],
+    runtime_profile: Mapping[str, Any],
+) -> bool:
+    if dict(artifact_profile).get("fingerprint_sha256") == dict(runtime_profile).get("fingerprint_sha256"):
+        return True
+
+    # The DAv2 registration maps raw model depth to MapAnything room depth. It
+    # depends on model/input identity, not on how often the same model runs.
+    # Accept cadence-only changes so runtime interval tuning does not force an
+    # unnecessary room-registration rebuild. Older artifacts were generated from
+    # the YAML model stanza (`engine`), while runtime fingerprints are generated
+    # from the materialized nvinfer stanza (`model-engine-file`/`onnx-file`).
+    artifact_core = _dav2_identity_payload(artifact_profile)
+    runtime_core = _dav2_identity_payload(runtime_profile)
+    for key in ("model_name", "input_size", "batch_size", "gie_id", "engine"):
+        if artifact_core.get(key) != runtime_core.get(key):
+            return False
+    if "onnx" in artifact_core and "onnx" in runtime_core and artifact_core.get("onnx") != runtime_core.get("onnx"):
+        return False
+    return True
+
+
 @dataclass(frozen=True, slots=True)
 class DepthRegistrationEntry:
     camera_id: str
@@ -326,7 +376,7 @@ class DepthRegistrationManager:
         actual_cal = _normalize_calibration_fingerprint_payload(dict(entry.calibration_fingerprint))
         if actual_cal.get("fingerprint_sha256") != expected_cal.get("fingerprint_sha256"):
             raise DepthRegistrationError("calibration_fingerprint_mismatch")
-        if dict(entry.dav2_profile).get("fingerprint_sha256") != dict(dav2_profile).get("fingerprint_sha256"):
+        if not _dav2_profile_matches(entry.dav2_profile, dav2_profile):
             raise DepthRegistrationError("dav2_profile_fingerprint_mismatch")
         if dict(entry.mapanything_profile).get("fingerprint_sha256") != dict(mapanything_profile).get("fingerprint_sha256"):
             raise DepthRegistrationError("mapanything_profile_fingerprint_mismatch")

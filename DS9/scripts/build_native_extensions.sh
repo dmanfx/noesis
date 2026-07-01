@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
-DS9_ROOT="${ROOT}/DS9"
+DS9_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+ROOT="$(cd -- "${DS9_ROOT}/.." && pwd)"
 DS_HOME="${NOESIS_DEEPSTREAM_HOME:-/opt/nvidia/deepstream/deepstream-9.0}"
 CUDA_HOME="${CUDA_HOME:-/usr/local/cuda}"
 OUT_DIR="${NOESIS_NATIVE_EXT_DIR:-${DS9_ROOT}/native_extensions}"
@@ -56,12 +56,32 @@ mkdir -p "${OUT_DIR}"
 
 build_ext() {
   local module="$1"
-  local src="${ROOT}/native/${module}.cpp"
+  local src="${DS9_ROOT}/native/${module}.cpp"
   local out="${OUT_DIR}/${module}${EXT_SUFFIX}"
+  local kernel_src="${src%.cpp}_kernels.cu"
+  local kernel_obj=""
+  local extra_objects=()
   shift
   if [[ ! -f "${src}" ]]; then
     echo "[FAIL] Missing source: ${src}" >&2
     exit 1
+  fi
+  if [[ ! -f "${kernel_src}" && "${src}" == *_ext.cpp ]]; then
+    kernel_src="${src%_ext.cpp}_kernels.cu"
+  fi
+  if [[ -f "${kernel_src}" ]]; then
+    if [[ ! -x "${CUDA_HOME}/bin/nvcc" ]]; then
+      echo "[FAIL] CUDA compiler not found: ${CUDA_HOME}/bin/nvcc" >&2
+      exit 1
+    fi
+    mkdir -p "${DS9_ROOT}/build/native"
+    kernel_obj="${DS9_ROOT}/build/native/$(basename "${kernel_src%.cu}").o"
+    echo "[INFO] Compiling CUDA kernel: ${kernel_src}"
+    "${CUDA_HOME}/bin/nvcc" -O3 -std=c++17 -Xcompiler -fPIC \
+      -I"${CUDA_INC}" \
+      -c "${kernel_src}" \
+      -o "${kernel_obj}"
+    extra_objects+=("${kernel_obj}")
   fi
   echo "[INFO] Building ${out}"
   c++ -O3 -shared -std=c++17 -fPIC \
@@ -71,6 +91,7 @@ build_ext() {
     -I"${DS_INC}" \
     -I"${CUDA_INC}" \
     "${src}" \
+    "${extra_objects[@]}" \
     -L"${DS_LIB}" \
     -L"${CUDA_LIB}" \
     -Wl,-rpath,"${DS_LIB}" \

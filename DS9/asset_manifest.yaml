@@ -46,7 +46,7 @@ engines:
     - DS9/models/engines/yolo11s-seg_cust_fused.engine
     - DS9/models/engines/yolo11m_b3_fp16.engine
     - DS9/models/engines/reid_osnet_ibn_msmt17_dyn_b16_fp16.engine
-    - DS9/models/engines/yolo26n-pose_b16_fp16.engine
+    - DS9/models/engines/yolo26n-pose_b3_fp16.engine
     - DS9/models/engines/depth_anything_v2_metric_hypersim_vits_294x518_b3_fp16.engine
     - DS9/models/engines/mapanything_images_294x518_b3_fp16.plan
     - DS9/models/engines/yolo26n-seg_fused_b3_fp16.engine
@@ -81,7 +81,7 @@ shared_app_data:
     - DS9/models/onnx/yolo26x.onnx
     - models/yolo11s-seg_cust_fused.onnx
     - models/engines/reid_osnet_ibn_msmt17_dyn_b16.onnx
-    - models/yolo26n-pose.onnx
+    - DS9/models/onnx/yolo26n-pose_b3.onnx
     - models/onnx/depth_anything_v2_metric_hypersim_vits_294x518_b3.onnx
     - DS9/models/onnx/mapanything_images_294x518_b3.onnx
     - models/yolo26n-seg_fused.onnx

@@ -6,12 +6,12 @@ BaseConfig:
 TargetManagement:
   enableBboxUnClipping: 1
   preserveStreamUpdateOrder: 0
-  maxTargetsPerStream: 150
+  maxTargetsPerStream: 32
   minIouDiff4NewTarget: 0.55
   minTrackerConfidence: 0.2
   probationAge: 2
-  maxShadowTrackingAge: 300
-  earlyTerminationAge: 10
+  maxShadowTrackingAge: 90
+  earlyTerminationAge: 6
 
 TrajectoryManagement:
   useUniqueID: 0
@@ -23,10 +23,10 @@ DataAssociator:
   minMatchingScore4Overall: 0.4
   minMatchingScore4SizeSimilarity: 0.35
   minMatchingScore4Iou: 0.2
-  minMatchingScore4VisualSimilarity: 0.5
-  matchingScoreWeight4VisualSimilarity: 0.33
-  matchingScoreWeight4SizeSimilarity: 0.42
-  matchingScoreWeight4Iou: 0.35
+  minMatchingScore4VisualSimilarity: 0.42
+  matchingScoreWeight4VisualSimilarity: 0.20
+  matchingScoreWeight4SizeSimilarity: 0.35
+  matchingScoreWeight4Iou: 0.45
   tentativeDetectorConfidence: 0.2
   minMatchingScore4TentativeIou: 0.5
 
@@ -41,17 +41,17 @@ StateEstimator:
 VisualTracker:
   visualTrackerType: 1
   useColorNames: 1
-  useHog: 1
-  featureImgSizeLevel: 3
+  useHog: 0
+  featureImgSizeLevel: 2
   featureFocusOffsetFactor_y: -0.1
   filterLr: 0.075
   filterChannelWeightsLr: 0.015
   gaussianSigma: 0.75
 
 AppearanceModel:
-  useReidFeature: 1
+  useReidFeature: 0
   reidFeatureSize: 128
-  reidHistorySize: 400
+  reidHistorySize: 64
 
 ShadowTracker:
   targetVisibilityThreshold: 0.15

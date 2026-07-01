@@ -109,9 +109,9 @@ def _specs(include_mapanything: bool) -> list[EngineSpec]:
         ),
         EngineSpec(
             "yolo26_pose_n",
-            REPO_ROOT / "models" / "yolo26n-pose.onnx",
-            DS9_ONNX / "yolo26n-pose.onnx",
-            DS9_ENGINES / "yolo26n-pose_b16_fp16.engine",
+            DS9_ONNX / "yolo26n-pose_b3.onnx",
+            DS9_ONNX / "yolo26n-pose_b3.onnx",
+            DS9_ENGINES / "yolo26n-pose_b3_fp16.engine",
             (),
         ),
         EngineSpec(

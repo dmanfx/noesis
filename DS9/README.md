@@ -49,6 +49,20 @@ shadow the DeepStream 9 binding. It refuses DS8 installs through
 
 ## Configuration Decisions
 
+- 2026-06-30: Detection-wake performance work was ported to the DS9 runtime
+  without relaxing DS9 compatibility gates. DS9 keeps the raw-`pyds` and native
+  tensor compatibility quarantines, but now uses cache-first pose/object-depth
+  processing, bounded per-frame telemetry budgets, publish gates, and stage
+  timing counters to reduce CPU/GPU spikes when detections appear.
+- 2026-06-30: DS9 depth-tensor native builds now compile DS9-owned native
+  sources from `DS9/native/`, link the sibling CUDA ROI/stat sampler kernels,
+  and stage outputs under `DS9/native_extensions/`. Root DS8 native binaries
+  and root native source paths are not used for DS9 rebuilds.
+- 2026-06-30: DS9 YOLO26 pose SGIE now targets a DS9-scoped batch-3 asset pair,
+  `DS9/models/onnx/yolo26n-pose_b3.onnx` and
+  `DS9/models/engines/yolo26n-pose_b3_fp16.engine`. The repository currently
+  fails fast until that DS9 ONNX/engine is staged; the root DS8 b3 engine is not
+  reused.
 - 2026-06-16: Family-room dewarping preserves the full 1920x1080 rectified
   destination frame, including black border regions. The G4 family-room RTSP
   source is 1280x720, but `nvdewarper` `[surface0] width/height` are

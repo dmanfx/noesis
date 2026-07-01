@@ -1,6 +1,6 @@
 # DS9 Migration State
 
-Last updated: 2026-06-16
+Last updated: 2026-06-30
 
 ## Goal
 
@@ -68,6 +68,44 @@ runtime fallback.
 
 ## Recent Fixes And Follow-up Results
 
+- Ported the detection-wake performance work from DS8 to DS9 while preserving
+  DS9-specific compatibility guards:
+  - `DS9/noesis/pipelines/hooks.py` now exposes stage timing counters and
+    detection-wake counters for pose, ReID, object-depth, tracking, and BEV work.
+  - Pose extraction is cache-first and derives cache age from the configured
+    `secondary-reinfer-interval`; stale entries are bounded by bbox shift and
+    frame age.
+  - Object-depth fusion now uses cache/cadence/budget gates and prefers native
+    CUDA ROI/stat samplers before falling back to bounded CPU ROI sampling.
+    Detector-only profiles use bbox-band sampling when no segmentation mask is
+    available.
+  - Analytics telemetry has bounded ReID/pose-anchor work and publish gates for
+    tracking and BEV payloads, reducing the work triggered by one or a few
+    detections.
+  - `DS9/noesis/ds9_runtime_core.py` reports
+    `zero_copy_core.stage_timings` in stats payloads and defaults ReID embedding
+    refresh to `NOESIS_REID_EMBED_INTERVAL_S=1.0`.
+- Reworked DS9 depth-tensor native rebuilds for the CUDA sampler path:
+  - `DS9/native/noesis_depth_tracking_tensor_ext.cpp` exposes
+    `sample_roi_stats`, `sample_masked_roi_stats`, and
+    `sample_masked_person_roi_stats` from `AlignedDepthFrameDevice`.
+  - `DS9/native/noesis_depth_tracking_tensor_kernels.cu` contains the DS9-local
+    CUDA ROI/stat kernels.
+  - Both `DS9/scripts/build_native_extensions.sh` and the per-module
+    `DS9/scripts/build_native_ext_ds9.sh` build from `DS9/native/`, link sibling
+    CUDA kernel objects when present, and stage outputs under
+    `DS9/native_extensions/`.
+- Updated DS9 SGIE cadence and tracking defaults for detection-wake load:
+  - YOLO26 pose SGIE now uses batch size 3 and `secondary-reinfer-interval=8`.
+  - ReID SGIE now uses `secondary-reinfer-interval=6` and keeps synchronous
+    tensor metadata extraction.
+  - DS9 NvDCF defaults are trimmed for home-scale scenes: lower target cap,
+    shorter shadow age, HOG disabled, smaller feature image size, and internal
+    NvDCF ReID disabled.
+- Updated the DS9 YOLO26 pose asset contract to fail fast on DS9-owned batch-3
+  assets: `DS9/models/onnx/yolo26n-pose_b3.onnx` must be staged before
+  `DS9/models/engines/yolo26n-pose_b3_fp16.engine` can be rebuilt. The root
+  DS8 pose engine is not reused.
 - Implemented the DS9-native pose metadata path:
   - `DS9/noesis/ds9_runtime.py` prepends `DS9/native_extensions` so DS9 imports
     DS9-built native extensions, not root DS8 `.so` artifacts.
@@ -120,6 +158,30 @@ runtime fallback.
     `yolo26_seg n/s/m`, `rfdetr n/s/m`, and `rfdetr_seg n/s/m`.
 
 ## Current Validation State
+
+The 2026-06-30 detection-wake DS9 port passed focused static/native checks on
+the host:
+
+- `python3 -m py_compile DS9/scripts/rebuild_engines.py
+  DS9/noesis/pipelines/hooks.py DS9/noesis/ds9_runtime_core.py
+  DS9/noesis/ds9_runtime.py`
+- `bash -n DS9/scripts/build_native_ext_ds9.sh
+  DS9/scripts/build_native_extensions.sh DS9/scripts/build_all_native_ds9.sh
+  DS9/scripts/build_noesis_depth_tracking_tensor_ext.sh`
+- `DS9/scripts/run_static_prep_checks.sh`
+- `git diff --check`
+- `DS9/scripts/build_noesis_depth_tracking_tensor_ext.sh`
+- DS9-staged import/symbol check proving
+  `sample_roi_stats`, `sample_masked_roi_stats`, and
+  `sample_masked_person_roi_stats` are exposed from
+  `DS9/native_extensions/noesis_depth_tracking_tensor_ext*.so`.
+
+Full `DS9/scripts/ds9_preflight.py` is currently blocked on this host because
+`/usr/local/bin/trtexec` reports TensorRT 10.13.3 instead of DS9-required
+10.14.x, and because DS9 model/parser/plugin artifacts are not staged. The
+native depth-tensor extension was rebuilt into `DS9/native_extensions/`, but the
+full preflight still requires the remaining DS9 artifacts. The DS9 YOLO26 pose
+rebuild correctly stops until `DS9/models/onnx/yolo26n-pose_b3.onnx` exists.
 
 The latest DS9 core parity pass proved these checks in
 `nvcr.io/nvidia/deepstream:9.0-triton-multiarch`:

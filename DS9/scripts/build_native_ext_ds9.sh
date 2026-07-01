@@ -27,7 +27,7 @@ PYBIND_INCLUDES="$(python3 -m pybind11 --includes)"
 EXT_SUFFIX="$(python3-config --extension-suffix)"
 PKG_CFLAGS="$(pkg-config --cflags gstreamer-1.0)"
 
-OUT_DIR="${ROOT}/artifacts/native"
+OUT_DIR="${NOESIS_NATIVE_EXT_DIR:-${ROOT}/native_extensions}"
 mkdir -p "${OUT_DIR}"
 OUT="${OUT_DIR}/${MODULE}${EXT_SUFFIX}"
 
@@ -37,12 +37,31 @@ DS_LIB="${DS_HOME}/lib"
 
 CXXFLAGS=(-O3 -shared -std=c++17 -fPIC)
 LDFLAGS=(-L"${DS_LIB}" -Wl,-rpath,"${DS_LIB}" -lnvds_service_maker -lnvds_meta -lnvdsgst_meta)
+EXTRA_OBJECTS=()
 
 if [[ "${KIND}" == "cuda_npp" ]]; then
   CXXFLAGS+=(-I"${CUDA_HOME}/include")
   LDFLAGS+=(-L"${CUDA_HOME}/targets/x86_64-linux/lib" -L"${CUDA_HOME}/lib64")
   LDFLAGS+=(-Wl,-rpath,"${CUDA_HOME}/targets/x86_64-linux/lib" -Wl,-rpath,"${CUDA_HOME}/lib64")
   LDFLAGS+=(-lcudart -lnppig -lnppidei -lnppc)
+
+  KERNEL_SRC="${SRC%.cpp}_kernels.cu"
+  if [[ ! -f "${KERNEL_SRC}" && "${SRC}" == *_ext.cpp ]]; then
+    KERNEL_SRC="${SRC%_ext.cpp}_kernels.cu"
+  fi
+  if [[ -f "${KERNEL_SRC}" ]]; then
+    NVCC="${CUDA_HOME}/bin/nvcc"
+    [[ -x "${NVCC}" ]] || ds9_fail "CUDA compiler not found: ${NVCC}"
+    BUILD_DIR="${ROOT}/build/native"
+    mkdir -p "${BUILD_DIR}"
+    KERNEL_OBJ="${BUILD_DIR}/$(basename "${KERNEL_SRC%.cu}").o"
+    echo "[INFO] Compiling CUDA kernel: ${KERNEL_SRC}"
+    "${NVCC}" -O3 -std=c++17 -Xcompiler -fPIC \
+      -I"${CUDA_HOME}/include" \
+      -c "${KERNEL_SRC}" \
+      -o "${KERNEL_OBJ}"
+    EXTRA_OBJECTS+=("${KERNEL_OBJ}")
+  fi
 fi
 
 echo "[INFO] Building ${MODULE} for DS9"
@@ -57,6 +76,7 @@ c++ "${CXXFLAGS[@]}" \
   -I"${DS_SM_INC}" \
   -I"${DS_INC}" \
   "${SRC}" \
+  "${EXTRA_OBJECTS[@]}" \
   "${LDFLAGS[@]}" \
   -o "${OUT}"
 

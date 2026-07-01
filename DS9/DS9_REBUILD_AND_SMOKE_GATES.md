@@ -25,9 +25,9 @@ DS9_CUDA_HOME=/usr/local/cuda-13.1 \
 ```
 
 Expected outputs go under `DS9/native_extensions/` when using the launch
-wrapper `DS9/scripts/build_native_extensions.sh`. The older
-`DS9/scripts/build_all_native_ds9.sh` prep wrapper may still write historical
-build products under `DS9/artifacts/native/`.
+wrapper `DS9/scripts/build_native_extensions.sh` or the per-module
+`DS9/scripts/build_native_ext_ds9.sh` helpers. Both paths build from
+`DS9/native/`; do not point DS9 native rebuilds at root `native/`.
 
 Required bridges:
 
@@ -37,6 +37,33 @@ Required bridges:
 - `noesis_reid_meta_ext`
 - `noesis_v3dt_meta_ext`
 - `noesis_latency_ext` only if in-process latency remains required
+
+`noesis_depth_tracking_tensor_ext` also builds the sibling CUDA kernel source
+`DS9/native/noesis_depth_tracking_tensor_kernels.cu` and must expose these
+`AlignedDepthFrameDevice` methods after rebuild:
+
+- `sample_roi_stats`
+- `sample_masked_roi_stats`
+- `sample_masked_person_roi_stats`
+
+Focused import check:
+
+```bash
+python3 - <<'PY'
+from pathlib import Path
+import sys
+sys.path.insert(0, str(Path("DS9/native_extensions").resolve()))
+import noesis_depth_tracking_tensor_ext as ext
+for name in ("sample_roi_stats", "sample_masked_roi_stats", "sample_masked_person_roi_stats"):
+    assert hasattr(ext.AlignedDepthFrameDevice, name), name
+print("DS9 depth tensor CUDA sampler bindings present")
+PY
+```
+
+The YOLO26 pose SGIE now targets the DS9-staged batch-3 asset pair
+`DS9/models/onnx/yolo26n-pose_b3.onnx` and
+`DS9/models/engines/yolo26n-pose_b3_fp16.engine`. Rebuilds must fail fast until
+the DS9 ONNX source exists; do not copy or reuse the root DS8 engine.
 
 ## Parser Rebuilds
 

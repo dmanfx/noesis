@@ -75,8 +75,8 @@ models:
     enable: true
     name: yolo26_pose
     config-file-path: DS9/pipelines/config_infer_secondary_yolo26_pose.ini
-    engine: DS9/models/engines/yolo26n-pose_b16_fp16.engine
-    batch_size: 16
+    engine: DS9/models/engines/yolo26n-pose_b3_fp16.engine
+    batch_size: 3
     gie_id: 4
     attach_tensor_meta: true
     model_size: [640, 640]

@@ -22,7 +22,8 @@ flowchart LR
   MAP --> ZARR[(data/depth/<cam>/<date>/<ts>.zarr)]
   MAP --> DEPTH_RES[depth_result telemetry]
   MAP --> WS_RPC[get_ma_depth RPC]
-  ZARR --> FLOORPLAN[get_floorplan RPC]
+  ZARR --> FLOORPLAN[get_floorplan RPC -> floorplan_response]
+  FLOORPLAN --> FPCACHE[(data/depth/floorplans/<cam>/grid...json)]
 ```
 
 ## Runtime Touchpoints
@@ -30,10 +31,13 @@ flowchart LR
 - **Postprocess:** `MapAnythingProcessor` aligns depth/conf/mask to frame size, records `DepthResult`, and stores snapshots through `DepthStorageManager` (async by default).
 - **Telemetry:** `DepthResult` is broadcast on WebSocket (`type: depth_result`).
 - **RPCs:** `get_ma_depth` returns the latest snapshot (optionally with normals); `get_floorplan` derives top-down grids from stored depth + calibration bundle.
+- **Floorplan:** `get_floorplan` is served by `DepthStorageManager.generate_topdown_floorplan(...)`. It creates a per-camera `camera_local_ground_m` X/Z raster from the latest MapAnything snapshot, caches the result under `<depth_base>/floorplans/<camera>/`, and returns density, distance, height, `height_agl`, gradient, and optional clean `obstacle_height`/`walkable` layers.
 
 ## Storage & Calibration
 - Snapshots: `data/depth/<camera>/<YYYYMMDD>/<HH>/<timestamp_us>.zarr` (Blosc/Zarr, managed by `DepthStorageManager`).
+- Floorplans: `data/depth/floorplans/<camera>/grid<grid_res>__ext<max_extent>.json` by default. The cache is invalidated by floorplan contract, units, and calibration fingerprint.
 - Calibration: `calibration-bundle` (intrinsics/extrinsics/align) is served on connect and cached on the storage manager for world projections and floorplans.
+- Floorplan grid convention: columns increase in camera-local `X`; row 0 is farthest forward `Z`; rows advance toward the camera. The `image_flip` field is diagnostic-only and should not be reapplied by renderers.
 
 ## Related Docs
 - `MapAnything_Depth.md` – pipeline branch, gating, normals, env toggles

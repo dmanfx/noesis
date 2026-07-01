@@ -79,6 +79,73 @@ Room reconstruction now uses two explicit fusion levels:
 - Inter-capture fusion combines the latest capture events, defaulting to four,
   into the reconstruction mesh/point artifact that Menon displays.
 
+## Top-Down Floorplan Artifact
+
+DS8 also creates a per-camera top-down floorplan from the same persisted
+MapAnything snapshots. This is the floor-shaped raster used by the depth drawer,
+inline BEV floorplan mode, floorplan debug dumps, and downstream spatial
+validation/visualization paths.
+
+The floorplan is not a hand-authored room map and it is not the live person-depth
+source for baseline tracking. It is a derived diagnostic/reference artifact built
+from dense full-frame MapAnything depth, confidence, mask, and the current
+calibration bundle.
+
+Creation path:
+
+- WebSocket clients request it with `get_floorplan`; DS8 returns
+  `floorplan_response`.
+- `noesis/ds8_runtime.py` handles the request through its floorplan provider and
+  calls `DepthStorageManager.generate_topdown_floorplan(...)`.
+- The storage manager first checks its in-memory and on-disk floorplan cache.
+  Cache validity is keyed by camera, grid resolution, extent, floorplan contract
+  version, units, and calibration fingerprint.
+- On a cache miss, generation reads the latest valid MapAnything Zarr snapshot
+  from `<depth_base>/<camera>/<YYYYMMDD>/<HH>/<timestamp_us>.zarr`.
+- If the snapshot is missing or stale and the request is not `cache_only`, the
+  DS8 provider may open a short MapAnything depth burst
+  (`NOESIS_FLOORPLAN_DEPTH_ENABLE_SECONDS`, falling back to
+  `NOESIS_DEPTH_RPC_ENABLE_SECONDS`) and then regenerate from the fresh snapshot.
+- The resulting JSON cache is persisted under
+  `<depth_base>/floorplans/<camera>/grid<grid_res>__ext<max_extent>.json`;
+  the default `<depth_base>` is `data/depth` from `config/mapanything.ini`, unless
+  runtime storage is overridden with `--storage-base`.
+
+Generation details:
+
+- Valid depth pixels are back-projected with the camera intrinsics into the
+  canonical camera-local frame: `X` is image-right, `Y` is image-down for raw
+  camera points, and `Z` is forward depth.
+- The floorplan raster is built in camera-local ground `X/Z`, not Menon scene
+  axes and not BEV screen pixels.
+- Grid columns increase from `min_x` to `max_x`; row 0 corresponds to `max_z`,
+  and rows advance toward smaller `Z`. This is the same convention encoded by
+  `frame=camera_local_ground_m` and `orientation=camera_xz_forward`.
+- `image_flip` in `floorplan_response` is diagnostic only. The serialized grids
+  already have the correct `X/Z` orientation, so renderers must not mirror or
+  rotate the raster again using that hint.
+- Confidence and mask are used as soft weights. They do not hard-drop every
+  masked or low-confidence point, which keeps the raster useful in sparse or
+  partially occluded rooms.
+
+Payload layers:
+
+- `density`: normalized support count per cell.
+- `distance`: mean forward depth per cell.
+- `height`: weighted height grid, normalized for visualization.
+- `height_agl`: height above the estimated floor, with floor bias correction.
+- `gradient`: normalized height-edge magnitude.
+- `obstacle_height` and `walkable`: optional clean layers that classify floor
+  versus furniture/obstacles on the same raster surface. These are secondary
+  derived layers; the detailed height/AGL raster remains the base diagnostic map.
+- `ray_to_floorplan_alignment`: diagnostic fit between calibrated floor-contact
+  rays and the depth-derived floorplan frame.
+
+Debug/validation helpers:
+
+- `python3 scripts/floorplan_rpc_smoke_test.py`
+- `python3 scripts/dump_floorplan_views.py --cache-only`
+
 ## Offline DAv2 -> MapAnything Registration
 
 Baseline non-`v3dt` world tracking now requires a prebuilt registration artifact
@@ -148,6 +215,8 @@ Baseline room-relative tracking remains:
 
 - `python3 scripts/ma_depth_rpc_smoke_test.py --no-spawn`
   - validates live `ma_depth_response`
+- `python3 scripts/floorplan_rpc_smoke_test.py --no-spawn`
+  - validates live `floorplan_response`
 - `python3 scripts/build_depth_registration.py --help`
   - validates builder surface
 - `timeout 25s python3 noesis/ds8_runtime.py --pgie-profile yolo26_seg --size s --disable-rest`

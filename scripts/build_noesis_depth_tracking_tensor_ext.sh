@@ -28,14 +28,31 @@ PKG_CFLAGS="$(pkg-config --cflags gstreamer-1.0)"
 
 OUT="$ROOT/noesis_depth_tracking_tensor_ext${EXT_SUFFIX}"
 SRC="$ROOT/native/noesis_depth_tracking_tensor_ext.cpp"
+KERNEL_SRC="$ROOT/native/noesis_depth_tracking_tensor_kernels.cu"
+BUILD_DIR="$ROOT/build/native"
+KERNEL_OBJ="$BUILD_DIR/noesis_depth_tracking_tensor_kernels.o"
 
 DS_SM_INC="/opt/nvidia/deepstream/deepstream/service-maker/includes"
 DS_INC="/opt/nvidia/deepstream/deepstream/sources/includes"
 DS_LIB="/opt/nvidia/deepstream/deepstream/lib"
-CUDA_INC="/usr/local/cuda/include"
-CUDA_LIB="/usr/local/cuda/targets/x86_64-linux/lib"
+CUDA_ROOT="${CUDA_HOME:-/usr/local/cuda}"
+CUDA_INC="${CUDA_ROOT}/include"
+CUDA_LIB="${CUDA_ROOT}/targets/x86_64-linux/lib"
+NVCC="${CUDA_ROOT}/bin/nvcc"
+
+if [[ ! -x "${NVCC}" ]]; then
+  echo "[FAIL] Missing CUDA compiler at ${NVCC}." >&2
+  exit 1
+fi
 
 echo "[INFO] Building ${OUT}"
+
+mkdir -p "${BUILD_DIR}"
+
+"${NVCC}" -O3 -std=c++17 -Xcompiler -fPIC \
+  -I"${CUDA_INC}" \
+  -c "${KERNEL_SRC}" \
+  -o "${KERNEL_OBJ}"
 
 c++ -O3 -shared -std=c++17 -fPIC \
   ${PYBIND_INCLUDES} \
@@ -44,6 +61,7 @@ c++ -O3 -shared -std=c++17 -fPIC \
   -I"${DS_INC}" \
   -I"${CUDA_INC}" \
   "${SRC}" \
+  "${KERNEL_OBJ}" \
   -L"${DS_LIB}" \
   -L"${CUDA_LIB}" \
   -Wl,-rpath,"${DS_LIB}" \

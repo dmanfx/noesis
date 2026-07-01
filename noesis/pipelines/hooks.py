@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import configparser
 import colorsys
 import json
 import logging
@@ -91,6 +92,7 @@ class _CorePathInstrumentation:
     _lock: threading.Lock = field(default_factory=threading.Lock, init=False, repr=False)
     counters: Dict[str, int] = field(default_factory=dict, init=False, repr=False)
     serialization_prep: Dict[str, Dict[str, int]] = field(default_factory=dict, init=False, repr=False)
+    stage_timings: Dict[str, Dict[str, int]] = field(default_factory=dict, init=False, repr=False)
     events: deque[Dict[str, Any]] = field(default_factory=lambda: deque(maxlen=512), init=False, repr=False)
 
     def _inc_locked(self, key: str, delta: int = 1) -> int:
@@ -165,11 +167,57 @@ class _CorePathInstrumentation:
                     event["payload_bytes"] = max(0, int(payload_bytes))
                 self.events.append(event)
 
+    def record_stage_timing(
+        self,
+        *,
+        metric: str,
+        duration_ns: int,
+        item_count: int | None = None,
+    ) -> None:
+        now_ns = time.time_ns()
+        metric_key = str(metric)
+        elapsed_ns = max(0, int(duration_ns))
+        with self._lock:
+            bucket = self.stage_timings.get(metric_key)
+            if bucket is None:
+                bucket = {
+                    "count": 0,
+                    "total_ns": 0,
+                    "max_ns": 0,
+                    "last_ns": 0,
+                    "total_items": 0,
+                    "last_items": 0,
+                }
+                self.stage_timings[metric_key] = bucket
+            bucket["count"] = int(bucket.get("count", 0)) + 1
+            bucket["total_ns"] = int(bucket.get("total_ns", 0)) + elapsed_ns
+            bucket["max_ns"] = max(int(bucket.get("max_ns", 0)), elapsed_ns)
+            bucket["last_ns"] = elapsed_ns
+            if item_count is not None:
+                items = max(0, int(item_count))
+                bucket["total_items"] = int(bucket.get("total_items", 0)) + items
+                bucket["last_items"] = items
+            count = int(bucket["count"])
+            self._inc_locked("detection_wake.stage_timing.total")
+            self._inc_locked(f"detection_wake.stage_timing.{metric_key}")
+            if count <= 3 or (count % 250) == 0:
+                event: Dict[str, Any] = {
+                    "type": "detection_wake_stage_timing",
+                    "ts_ns": int(now_ns),
+                    "metric": metric_key,
+                    "duration_ns": elapsed_ns,
+                    "count": count,
+                }
+                if item_count is not None:
+                    event["item_count"] = max(0, int(item_count))
+                self.events.append(event)
+
     def snapshot(self) -> Dict[str, Any]:
         with self._lock:
             return {
                 "counters": dict(self.counters),
                 "serialization_prep": {k: dict(v) for k, v in self.serialization_prep.items()},
+                "stage_timings": {k: dict(v) for k, v in self.stage_timings.items()},
                 "events": list(self.events),
             }
 
@@ -177,6 +225,7 @@ class _CorePathInstrumentation:
         with self._lock:
             self.counters.clear()
             self.serialization_prep.clear()
+            self.stage_timings.clear()
             self.events.clear()
 
 
@@ -203,6 +252,30 @@ def _increment_core_counter(metric: str, delta: int = 1) -> int:
         return updated
 
 
+def _record_core_stage_timing(metric: str, start_ns: int, *, item_count: int | None = None) -> None:
+    _CORE_PATH_INSTRUMENTATION.record_stage_timing(
+        metric=str(metric),
+        duration_ns=time.perf_counter_ns() - int(start_ns),
+        item_count=item_count,
+    )
+
+
+def _read_env_int(name: str, default: int, *, min_value: int = 0) -> int:
+    try:
+        value = int(str(os.environ.get(name, str(default))).strip() or str(default))
+    except Exception:
+        value = int(default)
+    return max(int(min_value), int(value))
+
+
+def _read_env_float(name: str, default: float, *, min_value: float = 0.0) -> float:
+    try:
+        value = float(str(os.environ.get(name, str(default))).strip() or str(default))
+    except Exception:
+        value = float(default)
+    return max(float(min_value), float(value))
+
+
 def _serialize_compact_json_with_metrics(payload: Mapping[str, Any], *, metric: str) -> str:
     start_ns = time.perf_counter_ns()
     encoded = ""
@@ -224,6 +297,27 @@ def _pose_meta_payload_limit_bytes() -> int:
     except Exception:
         parsed = int(_POSE_META_MAX_JSON_BYTES)
     return max(1024, parsed)
+
+
+def _read_nvinfer_property_int(config_path: Any, key: str) -> Optional[int]:
+    if not config_path:
+        return None
+    try:
+        path = Path(str(config_path))
+        if not path.exists():
+            return None
+        parser = configparser.ConfigParser()
+        parser.optionxform = str
+        if not parser.read(str(path), encoding="utf-8"):
+            return None
+        if not parser.has_section("property"):
+            return None
+        raw = parser.get("property", str(key), fallback=None)
+        if raw is None:
+            return None
+        return int(str(raw).strip())
+    except Exception:
+        return None
 
 
 def _frame_pts_key_us(frame_meta: Any) -> int:
@@ -338,6 +432,17 @@ def _band_mask(mask: np.ndarray, *, y0_ratio: float, y1_ratio: float, center_wid
     return np.logical_and(mask, band)
 
 
+def _bounded_depth_stat_values(values: np.ndarray, *, env_name: str = "NOESIS_OBJECT_DEPTH_MAX_STAT_SAMPLES") -> np.ndarray:
+    arr = np.asarray(values, dtype=np.float32).reshape(-1)
+    if arr.size <= 0:
+        return arr
+    max_samples = _read_env_int(env_name, 4096, min_value=128)
+    if arr.size <= max_samples:
+        return arr
+    stride = max(1, int(math.ceil(float(arr.size) / float(max_samples))))
+    return np.asarray(arr[::stride][:max_samples], dtype=np.float32)
+
+
 def _extract_person_depth_anchor(
     mask: np.ndarray,
     depth_crop: np.ndarray,
@@ -389,8 +494,9 @@ def _extract_person_depth_anchor(
         return min_count, min_valid_fraction
 
     lower_body_mask = _band_mask(eroded_mask, y0_ratio=0.88, y1_ratio=1.0, center_width_ratio=0.35)
-    lower_values = np.asarray(depth_crop[np.logical_and(lower_body_mask, np.isfinite(depth_crop))], dtype=np.float32)
-    lower_count = int(lower_values.size)
+    lower_values_full = np.asarray(depth_crop[np.logical_and(lower_body_mask, np.isfinite(depth_crop))], dtype=np.float32)
+    lower_values = _bounded_depth_stat_values(lower_values_full, env_name="NOESIS_OBJECT_DEPTH_MAX_ANCHOR_SAMPLES")
+    lower_count = int(lower_values_full.size)
     lower_area = int(np.count_nonzero(lower_body_mask))
     lower_valid_fraction = float(lower_count) / float(lower_area or 1)
     lower_min_count, lower_min_valid_fraction = _anchor_support_requirements(lower_area, "lower_body_band")
@@ -408,8 +514,9 @@ def _extract_person_depth_anchor(
         )
 
     torso_mask = _band_mask(eroded_mask, y0_ratio=0.35, y1_ratio=0.70, center_width_ratio=0.50)
-    torso_values = np.asarray(depth_crop[np.logical_and(torso_mask, np.isfinite(depth_crop))], dtype=np.float32)
-    torso_count = int(torso_values.size)
+    torso_values_full = np.asarray(depth_crop[np.logical_and(torso_mask, np.isfinite(depth_crop))], dtype=np.float32)
+    torso_values = _bounded_depth_stat_values(torso_values_full, env_name="NOESIS_OBJECT_DEPTH_MAX_ANCHOR_SAMPLES")
+    torso_count = int(torso_values_full.size)
     torso_area = int(np.count_nonzero(torso_mask))
     torso_valid_fraction = float(torso_count) / float(torso_area or 1)
     torso_min_count, torso_min_valid_fraction = _anchor_support_requirements(torso_area, "torso_core")
@@ -615,6 +722,27 @@ def attach_pose_feature_hook(
     score_threshold = float(pose_cfg.get("score_threshold", 0.25) or 0.25)
     kpt_threshold = float(pose_cfg.get("kpt_threshold", 0.35) or 0.35)
     letterbox = bool(pose_cfg.get("letterbox", True))
+    cache_max_age_frames = 6
+    cache_age_cfg = pose_cfg.get("pose_cache_max_age_frames", pose_cfg.get("cache_max_age_frames"))
+    if cache_age_cfg is None:
+        reinfer_interval = _read_nvinfer_property_int(
+            pose_cfg.get("config-file-path") or pose_cfg.get("config-file"),
+            "secondary-reinfer-interval",
+        )
+        if reinfer_interval is not None:
+            cache_age_cfg = reinfer_interval
+    try:
+        if cache_age_cfg is not None:
+            cache_max_age_frames = max(0, int(cache_age_cfg))
+    except Exception:
+        cache_max_age_frames = 6
+    cache_max_bbox_shift = 0.35
+    cache_shift_cfg = pose_cfg.get("pose_cache_max_bbox_shift", pose_cfg.get("cache_max_bbox_shift"))
+    try:
+        if cache_shift_cfg is not None:
+            cache_max_bbox_shift = max(0.0, float(cache_shift_cfg))
+    except Exception:
+        cache_max_bbox_shift = 0.35
 
     processor = PoseFeatureProcessor(
         pipeline=pipeline,
@@ -624,6 +752,8 @@ def attach_pose_feature_hook(
         kpt_threshold=kpt_threshold,
         letterbox=letterbox,
         camera_labels=camera_labels or {},
+        cache_max_age_frames=cache_max_age_frames,
+        cache_max_bbox_shift=cache_max_bbox_shift,
     )
     component.config["_pose_feature_processor"] = processor
 
@@ -3207,6 +3337,8 @@ class PoseFeatureProcessor:
     kpt_threshold: float = 0.35
     letterbox: bool = True
     camera_labels: Mapping[int, str] = field(default_factory=dict)
+    cache_max_age_frames: int = 6
+    cache_max_bbox_shift: float = 0.35
     _missing_native_logged: bool = field(default=False, init=False, repr=False)
     _debug_last_log: float = field(default=0.0, init=False, repr=False)
     _debug_frames: int = field(default=0, init=False, repr=False)
@@ -3214,6 +3346,9 @@ class PoseFeatureProcessor:
     _debug_attached: int = field(default=0, init=False, repr=False)
     _debug_missing: int = field(default=0, init=False, repr=False)
     _pose_cache: Dict[Tuple[int, int], Dict[str, Any]] = field(default_factory=dict, init=False, repr=False)
+
+    def _features_per_frame_max(self) -> int:
+        return _read_env_int("NOESIS_POSE_FEATURES_PER_FRAME_MAX", 2, min_value=0)
 
     def _frame_source_id(self, frame_meta: Any) -> int:
         for attr in ("source_id", "pad_index", "camera_id"):
@@ -3240,16 +3375,26 @@ class PoseFeatureProcessor:
         return max(0, pts_ns // 1_000)
 
     def _pose_cache_max_age_frames(self) -> int:
-        raw = os.environ.get("NOESIS_POSE_FEATURE_CACHE_MAX_AGE_FRAMES", "6")
+        raw = os.environ.get("NOESIS_POSE_FEATURE_CACHE_MAX_AGE_FRAMES")
         try:
-            return max(0, int(str(raw).strip()))
+            if raw is not None and str(raw).strip():
+                return max(0, int(str(raw).strip()))
+        except Exception:
+            pass
+        try:
+            return max(0, int(self.cache_max_age_frames))
         except Exception:
             return 6
 
     def _pose_cache_max_bbox_shift(self) -> float:
-        raw = os.environ.get("NOESIS_POSE_FEATURE_CACHE_MAX_BBOX_SHIFT", "0.35")
+        raw = os.environ.get("NOESIS_POSE_FEATURE_CACHE_MAX_BBOX_SHIFT")
         try:
-            return max(0.0, float(str(raw).strip()))
+            if raw is not None and str(raw).strip():
+                return max(0.0, float(str(raw).strip()))
+        except Exception:
+            pass
+        try:
+            return max(0.0, float(self.cache_max_bbox_shift))
         except Exception:
             return 0.35
 
@@ -3633,6 +3778,7 @@ class PoseFeatureProcessor:
                     "Pose meta attach skipped; noesis_pose_meta_ext is unavailable or missing attach_pose_features (build scripts/build_noesis_pose_meta_ext.sh)"
                 )
                 self._missing_native_logged = True
+        pose_budget = self._features_per_frame_max()
         for obj_meta in object_items:
             if debug:
                 self._debug_objects += 1
@@ -3654,27 +3800,38 @@ class PoseFeatureProcessor:
             roi_w = float(bbox[2])
             roi_h = float(bbox[3])
             stable_id = self._stable_id_for_track(source_id, track_id)
+            cached_payload = self._cached_pose_payload(
+                source_id,
+                track_id,
+                bbox,
+                frame_id,
+                ts_us,
+                stable_id,
+            )
+            if cached_payload is not None and self._attach_pose_payload(attach_obj, obj_meta, cached_payload):
+                _increment_core_counter("detection_wake.pose_feature_cache_hit")
+                if debug:
+                    self._debug_attached += 1
+                continue
             score = 0.0
             kpts_abs: Optional[np.ndarray] = None
             kpts_for_features: Optional[np.ndarray] = None
             kpts_roi: Optional[np.ndarray] = None
+            native: Optional[Tuple[float, np.ndarray, np.ndarray]] = None
+            if pose_budget <= 0:
+                _increment_core_counter("detection_wake.pose_feature_budget_skipped")
+                if debug:
+                    self._debug_missing += 1
+                continue
+            pose_budget -= 1
+            native_start_ns = time.perf_counter_ns()
             native = self._extract_pose_native(obj_meta)
+            _record_core_stage_timing("pose_feature.native_extract", native_start_ns)
             if native is not None:
+                _increment_core_counter("detection_wake.pose_feature_native_extract")
                 score, kpts_roi, kpts_abs = native
                 kpts_for_features = kpts_roi
             else:
-                cached_payload = self._cached_pose_payload(
-                    source_id,
-                    track_id,
-                    bbox,
-                    frame_id,
-                    ts_us,
-                    stable_id,
-                )
-                if cached_payload is not None and self._attach_pose_payload(attach_obj, obj_meta, cached_payload):
-                    if debug:
-                        self._debug_attached += 1
-                    continue
                 if debug:
                     self._debug_missing += 1
                 continue
@@ -4115,12 +4272,144 @@ class _ObjectDepthFusionProcessor:
     depth_every_n_frames: int
     calibration_resolver: Any | None = None
     camera_labels: Mapping[int, str] = field(default_factory=dict)
+    _result_cache: Dict[Tuple[int, int], Dict[str, Any]] = field(default_factory=dict, init=False, repr=False)
+
+    def _max_objects_per_frame(self) -> int:
+        return _read_env_int("NOESIS_OBJECT_DEPTH_MAX_OBJECTS_PER_FRAME", 2, min_value=0)
+
+    def _max_hz_per_track(self) -> float:
+        return _read_env_float("NOESIS_OBJECT_DEPTH_MAX_HZ_PER_TRACK", 5.0, min_value=0.0)
+
+    def _cache_max_age_us(self) -> int:
+        max_age_ms = _read_env_float("NOESIS_OBJECT_DEPTH_CACHE_MAX_AGE_MS", 500.0, min_value=0.0)
+        return int(max_age_ms * 1000.0)
+
+    def _cache_max_bbox_shift(self) -> float:
+        return _read_env_float("NOESIS_OBJECT_DEPTH_CACHE_MAX_BBOX_SHIFT", 0.25, min_value=0.0)
 
     def _camera_id_for_source(self, source_id: int) -> Optional[str]:
         camera_id = self.camera_labels.get(int(source_id))
         if isinstance(camera_id, str) and camera_id.strip():
             return camera_id.strip()
         return None
+
+    def _track_key(self, source_id: int, obj_meta: Any) -> Optional[Tuple[int, int]]:
+        try:
+            track_id = int(getattr(obj_meta, "object_id", -1))
+        except Exception:
+            track_id = -1
+        if track_id < 0:
+            return None
+        return int(source_id), int(track_id)
+
+    @staticmethod
+    def _bbox_shift_ratio(old_bbox: Sequence[float], new_bbox: Sequence[float]) -> float:
+        try:
+            old_left, old_top, old_w, old_h = [float(x) for x in old_bbox[:4]]
+            new_left, new_top, new_w, new_h = [float(x) for x in new_bbox[:4]]
+        except Exception:
+            return float("inf")
+        diag = math.hypot(max(1.0, old_w), max(1.0, old_h))
+        old_cx = old_left + old_w * 0.5
+        old_cy = old_top + old_h * 0.5
+        new_cx = new_left + new_w * 0.5
+        new_cy = new_top + new_h * 0.5
+        return float(math.hypot(new_cx - old_cx, new_cy - old_cy) / max(1.0, diag))
+
+    def _cached_payload(
+        self,
+        *,
+        source_id: int,
+        frame_id: int,
+        pts_us: int,
+        obj_meta: Any,
+        bbox: Sequence[float],
+    ) -> Optional[Dict[str, Any]]:
+        key = self._track_key(source_id, obj_meta)
+        if key is None:
+            return None
+        entry = self._result_cache.get(key)
+        if not isinstance(entry, dict):
+            return None
+        try:
+            sample_ts_us = int(entry.get("_sample_ts_us", 0) or 0)
+        except Exception:
+            sample_ts_us = 0
+        max_age_us = self._cache_max_age_us()
+        if max_age_us > 0 and sample_ts_us > 0 and (int(pts_us) - sample_ts_us) > max_age_us:
+            self._result_cache.pop(key, None)
+            return None
+        old_bbox = entry.get("bbox")
+        if not isinstance(old_bbox, (list, tuple)) or len(old_bbox) < 4:
+            self._result_cache.pop(key, None)
+            return None
+        if self._bbox_shift_ratio(old_bbox, bbox) > self._cache_max_bbox_shift():
+            self._result_cache.pop(key, None)
+            return None
+        payload = {str(k): v for k, v in entry.items() if not str(k).startswith("_")}
+        try:
+            object_id = int(getattr(obj_meta, "object_id", payload.get("object_id", -1)))
+        except Exception:
+            object_id = int(payload.get("object_id", -1) or -1)
+        try:
+            score = float(getattr(obj_meta, "confidence", payload.get("score", 0.0)))
+        except Exception:
+            score = float(payload.get("score", 0.0) or 0.0)
+        payload.update(
+            {
+                "source_id": int(source_id),
+                "frame_id": int(frame_id),
+                "object_id": int(object_id),
+                "bbox": [float(x) for x in bbox[:4]],
+                "score": float(score),
+                "ts_us": int(pts_us),
+            }
+        )
+        return payload
+
+    def _sample_due(self, *, source_id: int, obj_meta: Any, pts_us: int) -> bool:
+        key = self._track_key(source_id, obj_meta)
+        if key is None:
+            return True
+        entry = self._result_cache.get(key)
+        if not isinstance(entry, dict):
+            return True
+        max_hz = self._max_hz_per_track()
+        if max_hz <= 0.0:
+            return False
+        try:
+            sample_ts_us = int(entry.get("_sample_ts_us", 0) or 0)
+        except Exception:
+            sample_ts_us = 0
+        if sample_ts_us <= 0:
+            return True
+        min_interval_us = int(1_000_000.0 / max(1e-6, float(max_hz)))
+        return (int(pts_us) - sample_ts_us) >= min_interval_us
+
+    def _cache_result(self, *, source_id: int, pts_us: int, obj_meta: Any, result: ObjectDepthResult) -> None:
+        key = self._track_key(source_id, obj_meta)
+        if key is None:
+            return
+        payload = result.to_dict()
+        payload["_sample_ts_us"] = int(pts_us)
+        self._result_cache[key] = payload
+        max_entries = max(8, _read_env_int("NOESIS_OBJECT_DEPTH_CACHE_MAX_TRACKS", 64, min_value=1))
+        if len(self._result_cache) > max_entries:
+            oldest_key = next(iter(self._result_cache.keys()))
+            self._result_cache.pop(oldest_key, None)
+
+    def _attach_object_depth_payload(self, obj_meta: Any, payload: Mapping[str, Any]) -> bool:
+        if noesis_depth_meta_ext is None:
+            return False
+        attach_fn = getattr(noesis_depth_meta_ext, "attach_object_depth", None)
+        if not callable(attach_fn):
+            return False
+        try:
+            payload_json = json.dumps(dict(payload), separators=(",", ":"))
+            return bool(attach_fn(obj_meta, payload_json, True))
+        except Exception:
+            logger.exception("Failed to attach NOESIS.OBJECT_DEPTH to object metadata")
+            return False
 
     def _resolve_calibration_snapshot(self, source_id: int) -> Any | None:
         resolver = self.calibration_resolver
@@ -4154,7 +4443,16 @@ class _ObjectDepthFusionProcessor:
             logger.warning("Depth device frame is missing copy_roi_to_numpy")
             return None
         try:
-            return np.asarray(copy_roi(int(x0), int(y0), int(width), int(height)), dtype=np.float32)
+            start_ns = time.perf_counter_ns()
+            roi = np.asarray(copy_roi(int(x0), int(y0), int(width), int(height)), dtype=np.float32)
+            _record_core_stage_timing(
+                "object_depth.copy_roi_to_numpy",
+                start_ns,
+                item_count=int(width) * int(height),
+            )
+            _increment_core_counter("detection_wake.object_depth_roi_copy")
+            _increment_core_counter("tensor_host_copies_total.object_depth_roi")
+            return roi
         except Exception:
             logger.exception("GPU depth ROI copy failed")
             return None
@@ -4295,8 +4593,9 @@ class _ObjectDepthFusionProcessor:
             "anchor_sample_count": int(anchor.anchor_sample_count) if anchor.anchor_sample_count > 0 else None,
             "anchor_valid_fraction": float(anchor.anchor_valid_fraction) if anchor.anchor_valid_fraction > 0.0 else None,
         }
-        values = np.asarray(depth_crop[np.isfinite(depth_crop)], dtype=np.float32)
-        sample_count = int(values.size)
+        values_full = np.asarray(depth_crop[np.isfinite(depth_crop)], dtype=np.float32)
+        values = _bounded_depth_stat_values(values_full)
+        sample_count = int(values_full.size)
         status = "ok" if sample_count > 0 and anchor.anchor_depth_m is not None else "no_valid_depth"
         return self._build_result(
             frame_meta,
@@ -4311,6 +4610,406 @@ class _ObjectDepthFusionProcessor:
             anchor_fields=anchor_fields,
             sampling_mode="bbox_band",
         )
+
+    def _stats_float(self, stats: Mapping[str, Any], key: str) -> Optional[float]:
+        value = stats.get(key)
+        if value is None:
+            return None
+        try:
+            parsed = float(value)
+        except Exception:
+            return None
+        return parsed if math.isfinite(parsed) else None
+
+    def _sample_bbox_band_result_native(
+        self,
+        frame_meta: Any,
+        obj_meta: Any,
+        *,
+        bbox: Tuple[float, float, float, float],
+        depth_frame: _AlignedDepthFrame,
+        crop_rect: Tuple[int, int, int, int],
+    ) -> Optional[ObjectDepthResult]:
+        depth_device_frame = getattr(depth_frame, "depth_device_frame", None)
+        if depth_device_frame is None:
+            return None
+        sample_stats = getattr(depth_device_frame, "sample_roi_stats", None)
+        if not callable(sample_stats):
+            return None
+        x0, y0, x1, y1 = [int(v) for v in crop_rect]
+        width = max(0, x1 - x0)
+        height = max(0, y1 - y0)
+        if width <= 0 or height <= 0:
+            return None
+        try:
+            start_ns = time.perf_counter_ns()
+            stats_raw = sample_stats(
+                int(x0),
+                int(y0),
+                int(width),
+                int(height),
+                _read_env_int("NOESIS_OBJECT_DEPTH_NATIVE_MAX_STAT_SAMPLES", 4096, min_value=128),
+            )
+            _record_core_stage_timing("object_depth.native_roi_stats", start_ns, item_count=width * height)
+        except Exception:
+            logger.debug("Native object-depth ROI stats failed", exc_info=True)
+            return None
+        if not isinstance(stats_raw, Mapping):
+            return None
+        stats = dict(stats_raw)
+        try:
+            sample_count = int(stats.get("sample_count", 0) or 0)
+        except Exception:
+            sample_count = 0
+        try:
+            mask_area = int(stats.get("roi_area_px", width * height) or (width * height))
+        except Exception:
+            mask_area = int(width * height)
+        valid_fraction = self._stats_float(stats, "valid_fraction") or 0.0
+        depth_median = self._stats_float(stats, "depth_median")
+        status = "ok" if sample_count > 0 and depth_median is not None else "no_valid_depth"
+        try:
+            object_id = int(getattr(obj_meta, "object_id", -1))
+        except Exception:
+            object_id = -1
+        try:
+            class_id = int(getattr(obj_meta, "class_id", -1))
+        except Exception:
+            class_id = -1
+        try:
+            score = float(getattr(obj_meta, "confidence", 0.0))
+        except Exception:
+            score = 0.0
+        payload: Dict[str, Any] = {
+            "source_id": int(_meta_lookup(frame_meta, "source_id", "pad_index", default=0) or 0),
+            "frame_id": int(_meta_lookup(frame_meta, "frame_number", "frame_num", default=0) or 0),
+            "object_id": object_id,
+            "class_id": class_id,
+            "bbox": bbox,
+            "score": score,
+            "sampling_mode": "bbox_band_native",
+            "status": status,
+            "unit": self.depth_unit,
+            "is_metric": self.depth_is_metric,
+            "sample_count": max(0, int(sample_count)),
+            "valid_fraction": max(0.0, min(1.0, float(valid_fraction))),
+            "depth_center": self._stats_float(stats, "depth_center"),
+            "depth_median": depth_median,
+            "depth_mean": self._stats_float(stats, "depth_mean"),
+            "depth_p10": self._stats_float(stats, "depth_p10"),
+            "depth_p90": self._stats_float(stats, "depth_p90"),
+            "depth_min": self._stats_float(stats, "depth_min"),
+            "depth_max": self._stats_float(stats, "depth_max"),
+            "mask_area_px": max(0, int(mask_area)),
+            "model": self.depth_model_name,
+            "ts_us": _frame_pts_key_us(frame_meta),
+            "spatial_class": "person",
+            "anchor_uv": [float(x0) + (float(width) * 0.5), float(y1 - 1)],
+            "anchor_source": "lower_body_band",
+            "anchor_depth_m": depth_median,
+            "anchor_sample_count": int(sample_count) if sample_count > 0 else None,
+            "anchor_valid_fraction": float(valid_fraction) if valid_fraction > 0.0 else None,
+        }
+        _increment_core_counter("detection_wake.object_depth_native_stats")
+        return ObjectDepthResult(**payload)
+
+    def _sample_mask_stats_native(
+        self,
+        depth_device_frame: Any,
+        *,
+        crop_rect: Tuple[int, int, int, int],
+        mask: np.ndarray,
+        max_samples_env: str = "NOESIS_OBJECT_DEPTH_NATIVE_MAX_STAT_SAMPLES",
+        stage_name: str = "object_depth.native_mask_roi_stats",
+    ) -> Optional[Dict[str, Any]]:
+        sample_masked_stats = getattr(depth_device_frame, "sample_masked_roi_stats", None)
+        if not callable(sample_masked_stats):
+            return None
+        x0, y0, x1, y1 = [int(v) for v in crop_rect]
+        width = max(0, x1 - x0)
+        height = max(0, y1 - y0)
+        if width <= 0 or height <= 0:
+            return None
+        mask_arr = np.asarray(mask, dtype=np.float32)
+        if mask_arr.shape != (height, width):
+            return None
+        mask_arr = np.ascontiguousarray(mask_arr)
+        try:
+            start_ns = time.perf_counter_ns()
+            stats_raw = sample_masked_stats(
+                int(x0),
+                int(y0),
+                int(width),
+                int(height),
+                mask_arr,
+                0.5,
+                _read_env_int(max_samples_env, 4096, min_value=128),
+            )
+            _record_core_stage_timing(stage_name, start_ns, item_count=width * height)
+        except Exception:
+            logger.debug("Native masked object-depth ROI stats failed", exc_info=True)
+            return None
+        if not isinstance(stats_raw, Mapping):
+            return None
+        return dict(stats_raw)
+
+    def _sample_person_mask_stats_native(
+        self,
+        depth_device_frame: Any,
+        *,
+        crop_rect: Tuple[int, int, int, int],
+        mask: np.ndarray,
+    ) -> Optional[Dict[str, Any]]:
+        sample_person_stats = getattr(depth_device_frame, "sample_masked_person_roi_stats", None)
+        if not callable(sample_person_stats):
+            return None
+        x0, y0, x1, y1 = [int(v) for v in crop_rect]
+        width = max(0, x1 - x0)
+        height = max(0, y1 - y0)
+        if width <= 0 or height <= 0:
+            return None
+        mask_arr = np.asarray(mask, dtype=np.float32)
+        if mask_arr.shape != (height, width):
+            return None
+        mask_arr = np.ascontiguousarray(mask_arr)
+        try:
+            start_ns = time.perf_counter_ns()
+            stats_raw = sample_person_stats(
+                int(x0),
+                int(y0),
+                int(width),
+                int(height),
+                mask_arr,
+                0.5,
+                _read_env_int("NOESIS_OBJECT_DEPTH_NATIVE_MAX_STAT_SAMPLES", 4096, min_value=128),
+            )
+            _record_core_stage_timing("object_depth.native_mask_person_stats", start_ns, item_count=width * height)
+        except Exception:
+            logger.debug("Native masked person object-depth stats failed", exc_info=True)
+            return None
+        if not isinstance(stats_raw, Mapping):
+            return None
+        return dict(stats_raw)
+
+    def _mask_foot_uv(self, mask: np.ndarray, *, frame_origin: Tuple[int, int]) -> Optional[List[float]]:
+        if mask.size <= 0:
+            return None
+        lower_rows = np.nonzero(mask)[0]
+        if lower_rows.size <= 0:
+            return None
+        max_row = int(np.max(lower_rows))
+        band_top = max(0, max_row - max(1, int(round(mask.shape[0] * 0.12))))
+        foot_band = np.zeros_like(mask, dtype=bool)
+        foot_band[band_top : max_row + 1, :] = True
+        foot_band = np.logical_and(foot_band, _band_mask(mask, y0_ratio=0.0, y1_ratio=1.0, center_width_ratio=0.35))
+        points = np.argwhere(foot_band)
+        if points.size <= 0:
+            return None
+        foot_y = int(np.max(points[:, 0]))
+        foot_x = int(np.median(points[points[:, 0] == foot_y][:, 1]))
+        return [float(int(frame_origin[0]) + foot_x), float(int(frame_origin[1]) + foot_y)]
+
+    def _anchor_support_requirements(self, area_px: int, anchor_source: str) -> Tuple[int, float]:
+        area_px = max(0, int(area_px))
+        if anchor_source == "lower_body_band":
+            base_count = 24
+            floor_count = 16
+            min_valid_fraction = 0.40
+        else:
+            base_count = 32
+            floor_count = 20
+            min_valid_fraction = 0.45
+        adaptive_count = int(math.ceil(float(area_px) * 0.25))
+        min_count = max(floor_count, min(base_count, adaptive_count or base_count))
+        return min_count, min_valid_fraction
+
+    def _sample_instance_mask_result_native(
+        self,
+        frame_meta: Any,
+        obj_meta: Any,
+        *,
+        bbox: Tuple[float, float, float, float],
+        depth_frame: _AlignedDepthFrame,
+        crop_rect: Tuple[int, int, int, int],
+        mask_payload: Mapping[str, Any],
+    ) -> Optional[ObjectDepthResult]:
+        depth_device_frame = getattr(depth_frame, "depth_device_frame", None)
+        if depth_device_frame is None:
+            return None
+        sample_person_stats = getattr(depth_device_frame, "sample_masked_person_roi_stats", None)
+        sample_masked_stats = getattr(depth_device_frame, "sample_masked_roi_stats", None)
+        if not callable(sample_person_stats) and not callable(sample_masked_stats):
+            return None
+        x0, y0, x1, y1 = [int(v) for v in crop_rect]
+        width = max(0, x1 - x0)
+        height = max(0, y1 - y0)
+        if width <= 0 or height <= 0:
+            return None
+        mask, _mask_status = self._decode_instance_mask_payload(mask_payload, (height, width))
+        if mask is None or mask.size <= 0:
+            return None
+        mask = np.asarray(mask, dtype=bool)
+        mask_area = int(np.count_nonzero(mask))
+        if mask_area <= 0:
+            return None
+
+        stats = self._sample_person_mask_stats_native(
+            depth_device_frame,
+            crop_rect=(x0, y0, x1, y1),
+            mask=mask,
+        )
+        used_combined_stats = stats is not None
+        if stats is None:
+            stats = self._sample_mask_stats_native(
+                depth_device_frame,
+                crop_rect=(x0, y0, x1, y1),
+                mask=mask,
+                stage_name="object_depth.native_mask_roi_stats",
+            )
+        if stats is None:
+            return None
+
+        def _int_stat(key: str, default: int = 0) -> int:
+            try:
+                return int(stats.get(key, default) or default)
+            except Exception:
+                return int(default)
+
+        sample_count = _int_stat("sample_count")
+        mask_area_native = _int_stat("mask_area_px", mask_area)
+        valid_fraction = self._stats_float(stats, "valid_fraction") or 0.0
+        depth_median = self._stats_float(stats, "depth_median")
+        status = "ok" if sample_count > 0 and depth_median is not None else "no_valid_depth"
+
+        foot_uv = self._mask_foot_uv(mask, frame_origin=(x0, y0))
+        anchor_source: Optional[str] = None
+        anchor_depth_m: Optional[float] = None
+        anchor_sample_count: Optional[int] = None
+        anchor_valid_fraction: Optional[float] = None
+
+        lower_count = 0
+        lower_valid_fraction = 0.0
+        torso_count = 0
+        torso_valid_fraction = 0.0
+        if used_combined_stats:
+            lower_area = _int_stat("lower_mask_area_px", 0)
+            lower_count = _int_stat("lower_sample_count", 0)
+            lower_valid_fraction = self._stats_float(stats, "lower_valid_fraction") or 0.0
+            lower_depth = self._stats_float(stats, "lower_depth_median")
+            lower_min_count, lower_min_valid_fraction = self._anchor_support_requirements(lower_area, "lower_body_band")
+            if lower_depth is not None and lower_count >= lower_min_count and lower_valid_fraction >= lower_min_valid_fraction:
+                anchor_source = "lower_body_band"
+                anchor_depth_m = lower_depth
+                anchor_sample_count = int(lower_count)
+                anchor_valid_fraction = float(lower_valid_fraction)
+            if anchor_depth_m is None:
+                torso_area = _int_stat("torso_mask_area_px", 0)
+                torso_count = _int_stat("torso_sample_count", 0)
+                torso_valid_fraction = self._stats_float(stats, "torso_valid_fraction") or 0.0
+                torso_depth = self._stats_float(stats, "torso_depth_median")
+                torso_min_count, torso_min_valid_fraction = self._anchor_support_requirements(torso_area, "torso_core")
+                if torso_depth is not None and torso_count >= torso_min_count and torso_valid_fraction >= torso_min_valid_fraction:
+                    anchor_source = "torso_core"
+                    anchor_depth_m = torso_depth
+                    anchor_sample_count = int(torso_count)
+                    anchor_valid_fraction = float(torso_valid_fraction)
+        else:
+            eroded_mask = _erode_mask(mask, kernel_size=3)
+            lower_body_mask = _band_mask(eroded_mask, y0_ratio=0.88, y1_ratio=1.0, center_width_ratio=0.35)
+            lower_area = int(np.count_nonzero(lower_body_mask))
+            lower_stats: Optional[Dict[str, Any]] = None
+            if lower_area > 0:
+                lower_stats = self._sample_mask_stats_native(
+                    depth_device_frame,
+                    crop_rect=(x0, y0, x1, y1),
+                    mask=lower_body_mask,
+                    max_samples_env="NOESIS_OBJECT_DEPTH_MAX_ANCHOR_SAMPLES",
+                    stage_name="object_depth.native_mask_anchor_stats",
+                )
+            if lower_stats is not None:
+                try:
+                    lower_count = int(lower_stats.get("sample_count", 0) or 0)
+                except Exception:
+                    lower_count = 0
+                lower_valid_fraction = self._stats_float(lower_stats, "valid_fraction") or 0.0
+                lower_depth = self._stats_float(lower_stats, "depth_median")
+                lower_min_count, lower_min_valid_fraction = self._anchor_support_requirements(lower_area, "lower_body_band")
+                if lower_depth is not None and lower_count >= lower_min_count and lower_valid_fraction >= lower_min_valid_fraction:
+                    anchor_source = "lower_body_band"
+                    anchor_depth_m = lower_depth
+                    anchor_sample_count = int(lower_count)
+                    anchor_valid_fraction = float(lower_valid_fraction)
+
+            if anchor_depth_m is None:
+                torso_mask = _band_mask(eroded_mask, y0_ratio=0.35, y1_ratio=0.70, center_width_ratio=0.50)
+                torso_area = int(np.count_nonzero(torso_mask))
+                torso_stats: Optional[Dict[str, Any]] = None
+                if torso_area > 0:
+                    torso_stats = self._sample_mask_stats_native(
+                        depth_device_frame,
+                        crop_rect=(x0, y0, x1, y1),
+                        mask=torso_mask,
+                        max_samples_env="NOESIS_OBJECT_DEPTH_MAX_ANCHOR_SAMPLES",
+                        stage_name="object_depth.native_mask_anchor_stats",
+                    )
+                if torso_stats is not None:
+                    try:
+                        torso_count = int(torso_stats.get("sample_count", 0) or 0)
+                    except Exception:
+                        torso_count = 0
+                    torso_valid_fraction = self._stats_float(torso_stats, "valid_fraction") or 0.0
+                    torso_depth = self._stats_float(torso_stats, "depth_median")
+                    torso_min_count, torso_min_valid_fraction = self._anchor_support_requirements(torso_area, "torso_core")
+                    if torso_depth is not None and torso_count >= torso_min_count and torso_valid_fraction >= torso_min_valid_fraction:
+                        anchor_source = "torso_core"
+                        anchor_depth_m = torso_depth
+                        anchor_sample_count = int(torso_count)
+                        anchor_valid_fraction = float(torso_valid_fraction)
+        try:
+            object_id = int(getattr(obj_meta, "object_id", -1))
+        except Exception:
+            object_id = -1
+        try:
+            class_id = int(getattr(obj_meta, "class_id", -1))
+        except Exception:
+            class_id = -1
+        try:
+            score = float(getattr(obj_meta, "confidence", 0.0))
+        except Exception:
+            score = 0.0
+
+        payload: Dict[str, Any] = {
+            "source_id": int(_meta_lookup(frame_meta, "source_id", "pad_index", default=0) or 0),
+            "frame_id": int(_meta_lookup(frame_meta, "frame_number", "frame_num", default=0) or 0),
+            "object_id": object_id,
+            "class_id": class_id,
+            "bbox": bbox,
+            "score": score,
+            "sampling_mode": "instance_mask",
+            "status": status,
+            "unit": self.depth_unit,
+            "is_metric": self.depth_is_metric,
+            "sample_count": max(0, int(sample_count)),
+            "valid_fraction": max(0.0, min(1.0, float(valid_fraction))),
+            "depth_center": self._stats_float(stats, "depth_center"),
+            "depth_median": depth_median,
+            "depth_mean": self._stats_float(stats, "depth_mean"),
+            "depth_p10": self._stats_float(stats, "depth_p10"),
+            "depth_p90": self._stats_float(stats, "depth_p90"),
+            "depth_min": self._stats_float(stats, "depth_min"),
+            "depth_max": self._stats_float(stats, "depth_max"),
+            "mask_area_px": max(0, int(mask_area_native)),
+            "model": self.depth_model_name,
+            "ts_us": _frame_pts_key_us(frame_meta),
+            "spatial_class": "person",
+            "anchor_uv": foot_uv,
+            "anchor_source": anchor_source,
+            "anchor_depth_m": anchor_depth_m,
+            "anchor_sample_count": anchor_sample_count,
+            "anchor_valid_fraction": anchor_valid_fraction,
+        }
+        _increment_core_counter("detection_wake.object_depth_native_mask_stats")
+        return ObjectDepthResult(**payload)
 
     def _sample_person_result(
         self,
@@ -4339,6 +5038,27 @@ class _ObjectDepthFusionProcessor:
 
         mask_payload = self._extract_instance_mask_payload(obj_meta)
         crop_y0 = y0 if mask_payload else self._bbox_fallback_y0(y0, y1)
+        if not mask_payload:
+            native_result = self._sample_bbox_band_result_native(
+                frame_meta,
+                obj_meta,
+                bbox=bbox,
+                depth_frame=depth_frame,
+                crop_rect=(x0, crop_y0, x1, y1),
+            )
+            if native_result is not None:
+                return native_result
+        else:
+            native_mask_result = self._sample_instance_mask_result_native(
+                frame_meta,
+                obj_meta,
+                bbox=bbox,
+                depth_frame=depth_frame,
+                crop_rect=(x0, crop_y0, x1, y1),
+                mask_payload=mask_payload,
+            )
+            if native_mask_result is not None:
+                return native_mask_result
         depth_crop = self._copy_depth_crop(depth_frame, x0, crop_y0, x1, y1)
         if depth_crop is None:
             return self._build_result(frame_meta, obj_meta, bbox=bbox, status="depth_not_ready")
@@ -4379,7 +5099,8 @@ class _ObjectDepthFusionProcessor:
             )
 
         valid_mask = np.logical_and(mask, np.isfinite(depth_crop))
-        values = np.asarray(depth_crop[valid_mask], dtype=np.float32)
+        values_full = np.asarray(depth_crop[valid_mask], dtype=np.float32)
+        values = _bounded_depth_stat_values(values_full)
         anchor = _extract_person_depth_anchor(
             mask,
             depth_crop,
@@ -4393,7 +5114,7 @@ class _ObjectDepthFusionProcessor:
             "anchor_sample_count": int(anchor.anchor_sample_count) if anchor.anchor_sample_count > 0 else None,
             "anchor_valid_fraction": float(anchor.anchor_valid_fraction) if anchor.anchor_valid_fraction > 0.0 else None,
         }
-        sample_count = int(values.size)
+        sample_count = int(values_full.size)
         if sample_count <= 0:
             return self._build_result(
                 frame_meta,
@@ -4428,6 +5149,7 @@ class _ObjectDepthFusionProcessor:
             pts_us=pts_us,
             max_age_frames=max(0, int(self.depth_every_n_frames) - 1),
         )
+        samples_remaining = self._max_objects_per_frame()
         for obj_meta in getattr(frame_meta, "object_items", None) or []:
             try:
                 class_id = int(getattr(obj_meta, "class_id", -1))
@@ -4438,16 +5160,37 @@ class _ObjectDepthFusionProcessor:
             bbox = _rect_to_bbox(getattr(obj_meta, "rect_params", None))
             if bbox is None:
                 continue
+            cached_payload = self._cached_payload(
+                source_id=source_id,
+                frame_id=frame_id,
+                pts_us=pts_us,
+                obj_meta=obj_meta,
+                bbox=bbox,
+            )
+            if not self._sample_due(source_id=source_id, obj_meta=obj_meta, pts_us=pts_us):
+                if cached_payload is not None and self._attach_object_depth_payload(obj_meta, cached_payload):
+                    _increment_core_counter("detection_wake.object_depth_cache_hit")
+                else:
+                    _increment_core_counter("detection_wake.object_depth_cadence_skipped")
+                continue
+            if samples_remaining <= 0:
+                if cached_payload is not None and self._attach_object_depth_payload(obj_meta, cached_payload):
+                    _increment_core_counter("detection_wake.object_depth_budget_cache_hit")
+                else:
+                    _increment_core_counter("detection_wake.object_depth_budget_skipped")
+                continue
+            samples_remaining -= 1
+            sample_start_ns = time.perf_counter_ns()
             if depth_frame is None:
                 result = self._build_result(frame_meta, obj_meta, bbox=bbox, status="depth_not_ready")
             else:
                 result = self._sample_person_result(frame_meta, obj_meta, depth_frame)
             if result is None:
                 continue
-            try:
-                noesis_depth_meta_ext.attach_object_depth(obj_meta, result.to_json(), True)  # type: ignore[union-attr]
-            except Exception:
-                logger.exception("Failed to attach NOESIS.OBJECT_DEPTH to object metadata")
+            _record_core_stage_timing("object_depth.sample_person", sample_start_ns)
+            _increment_core_counter("detection_wake.object_depth_sampled")
+            self._cache_result(source_id=source_id, pts_us=pts_us, obj_meta=obj_meta, result=result)
+            self._attach_object_depth_payload(obj_meta, result.to_dict())
 
 
 class _DepthTrackingFrameOperator(BatchMetadataOperator):  # pragma: no cover - requires DS runtime
@@ -4547,6 +5290,15 @@ class _AnalyticsTelemetryProcessor:
     _world_height_min_m: float = field(default=0.60, init=False, repr=False)
     _world_height_max_m: float = field(default=2.40, init=False, repr=False)
     _world_anchor_hold_ttl_s: float = field(default=0.40, init=False, repr=False)
+    _reid_embeds_per_frame_max: int = field(default=2, init=False, repr=False)
+    _pose_anchor_native_per_frame_max: int = field(default=1, init=False, repr=False)
+    _pose_anchor_native_remaining: int = field(default=1, init=False, repr=False)
+    _tracking_publish_interval_s: float = field(default=0.0, init=False, repr=False)
+    _bev_publish_interval_s: float = field(default=0.0, init=False, repr=False)
+    _last_tracking_publish_ts_by_sensor: Dict[int, float] = field(default_factory=dict, init=False, repr=False)
+    _last_bev_publish_ts_by_sensor: Dict[int, float] = field(default_factory=dict, init=False, repr=False)
+    _last_tracking_count_by_sensor: Dict[int, int] = field(default_factory=dict, init=False, repr=False)
+    _last_bev_count_by_sensor: Dict[int, int] = field(default_factory=dict, init=False, repr=False)
 
     def __post_init__(self) -> None:
         # Discover the ReID SGIE unique-id from the built pipeline config when present.
@@ -4663,6 +5415,51 @@ class _AnalyticsTelemetryProcessor:
             )
         except Exception:
             self._world_anchor_hold_ttl_s = 0.40
+        self._reid_embeds_per_frame_max = _read_env_int("NOESIS_REID_EMBEDS_PER_FRAME_MAX", 2, min_value=0)
+        self._pose_anchor_native_per_frame_max = _read_env_int(
+            "NOESIS_POSE_ANCHOR_NATIVE_EXTRACTS_PER_FRAME_MAX",
+            1,
+            min_value=0,
+        )
+        tracking_max_hz = _read_env_float(
+            "NOESIS_TRACKING_PUBLISH_MAX_HZ",
+            _read_env_float("NOESIS_WS_TRACKING_MAX_HZ", 15.0, min_value=0.0),
+            min_value=0.0,
+        )
+        bev_max_hz = _read_env_float(
+            "NOESIS_BEV_PUBLISH_MAX_HZ",
+            _read_env_float("NOESIS_WS_BEV_MAX_HZ", 12.0, min_value=0.0),
+            min_value=0.0,
+        )
+        self._tracking_publish_interval_s = 0.0 if tracking_max_hz <= 0.0 else 1.0 / float(tracking_max_hz)
+        self._bev_publish_interval_s = 0.0 if bev_max_hz <= 0.0 else 1.0 / float(bev_max_hz)
+
+    def _publish_gate_due(
+        self,
+        last_by_sensor: Dict[int, float],
+        count_by_sensor: Dict[int, int],
+        *,
+        sensor_id: int,
+        now_ts: float,
+        count: int,
+        interval_s: float,
+        counter_prefix: str,
+        update: bool = True,
+    ) -> bool:
+        sid = int(sensor_id)
+        current_count = int(count)
+        previous_count = count_by_sensor.get(sid)
+        last_ts = float(last_by_sensor.get(sid, 0.0))
+        count_changed = previous_count is None or int(previous_count) != current_count
+        due = bool(count_changed or interval_s <= 0.0 or last_ts <= 0.0 or (float(now_ts) - last_ts) >= float(interval_s))
+        if due:
+            if update:
+                last_by_sensor[sid] = float(now_ts)
+                count_by_sensor[sid] = current_count
+            _increment_core_counter(f"detection_wake.{counter_prefix}_publish_due")
+            return True
+        _increment_core_counter(f"detection_wake.{counter_prefix}_publish_skipped")
+        return False
 
     def get_active_track_map(self, sensor_id: int) -> Dict[int, Dict[str, Any]]:
         tracks = self._active_tracks.get(int(sensor_id)) or []
@@ -5011,11 +5808,15 @@ class _AnalyticsTelemetryProcessor:
 
     def handle_frame_ds8(self, frame_meta: Any) -> None:
         """Extract tracking telemetry for a single frame using DS8 pyservicemaker API."""
+        frame_start_ns = time.perf_counter_ns()
         try:
             source_id = self._frame_source_id(frame_meta)
             sensor_id = self.sensor_id_map.get(source_id, source_id)
             camera_id = self.camera_labels.get(sensor_id, f"camera_{sensor_id}")
             now_ts = time.time()
+            self._pose_anchor_native_remaining = int(self._pose_anchor_native_per_frame_max)
+            reid_budget_remaining = int(self._reid_embeds_per_frame_max)
+            _increment_core_counter("detection_wake.frames")
             self._log_diag_session_start()
 
             tracks: List[Dict[str, Any]] = []
@@ -5033,6 +5834,7 @@ class _AnalyticsTelemetryProcessor:
 
             object_items = getattr(frame_meta, "object_items", None) or []
             for obj_meta in object_items:
+                _increment_core_counter("detection_wake.objects_seen")
                 raw = self._build_track_dict_ds8(obj_meta, camera_id)
                 if raw is None:
                     continue
@@ -5066,6 +5868,7 @@ class _AnalyticsTelemetryProcessor:
                     diagnostics_tracks.append(diag_track)
                     continue
 
+                _increment_core_counter("detection_wake.person_tracks")
                 if not zone:
                     zone = _fallback_zone_from_camera(camera_id)
 
@@ -5091,13 +5894,25 @@ class _AnalyticsTelemetryProcessor:
                                 need_emb = True
 
                         if need_emb:
-                            emb = self._extract_reid_embedding_ds8(obj_meta)
+                            _increment_core_counter("detection_wake.reid_emb_due")
+                            if reid_budget_remaining <= 0:
+                                _increment_core_counter("detection_wake.reid_emb_budget_skipped")
+                            else:
+                                reid_budget_remaining -= 1
+                                reid_start_ns = time.perf_counter_ns()
+                                emb = self._extract_reid_embedding_ds8(obj_meta)
+                                _record_core_stage_timing("reid.extract_embedding", reid_start_ns)
+                                if emb is None:
+                                    _increment_core_counter("detection_wake.reid_emb_missing")
+                                else:
+                                    _increment_core_counter("detection_wake.reid_emb_extracted")
                             if reid_debug:
                                 if emb is None:
                                     self._reid_debug_emb_missing += 1
                                 else:
                                     self._reid_debug_emb_found += 1
 
+                sid_start_ns = time.perf_counter_ns()
                 stable_id = self._maybe_assign_stable_id(
                     sensor_id=sensor_id,
                     track_id=track_id,
@@ -5107,6 +5922,7 @@ class _AnalyticsTelemetryProcessor:
                     frame_bgr=None,
                     embedding=emb,
                 )
+                _record_core_stage_timing("stable_id.update_track", sid_start_ns)
                 if stable_id is None:
                     # People should always have a stable_id; if we can't produce one, show placeholder.
                     self._stamp_osd_label_ds8(obj_meta, sensor_id=sensor_id, stable_id=None)
@@ -5128,8 +5944,12 @@ class _AnalyticsTelemetryProcessor:
                 id_reject_reason = id_diag.get("id_reject_reason")
                 sid_candidate = id_diag.get("sid_candidate")
                 embedding_present = bool(id_diag.get("embedding_present", emb is not None))
+                pose_anchor_start_ns = time.perf_counter_ns()
                 pose_kpts_abs = self._extract_pose_keypoints_for_anchor(obj_meta, raw.get("bbox") or [])
+                _record_core_stage_timing("pose_anchor.extract_keypoints", pose_anchor_start_ns)
+                depth_extract_start_ns = time.perf_counter_ns()
                 depth_result = self._extract_object_depth_result(obj_meta)
+                _record_core_stage_timing("object_depth.extract_meta", depth_extract_start_ns)
                 pose_present = bool(id_diag.get("pose_present", False))
                 if not pose_present:
                     pose_present = pose_kpts_abs is not None
@@ -5330,21 +6150,35 @@ class _AnalyticsTelemetryProcessor:
 
             if not tracks:
                 try:
-                    self._publish_bev(sensor_id, camera_id, frame_meta, footpoints)
+                    self._publish_bev(sensor_id, camera_id, frame_meta, footpoints, now_ts=now_ts, track_count=0)
                 except Exception:
                     logger.exception("BEV publish failed for sensor %s", sensor_id)
+                _record_core_stage_timing("analytics.handle_frame_ds8", frame_start_ns, item_count=0)
                 return
 
+            if self._publish_gate_due(
+                self._last_tracking_publish_ts_by_sensor,
+                self._last_tracking_count_by_sensor,
+                sensor_id=sensor_id,
+                now_ts=now_ts,
+                count=len(tracks),
+                interval_s=float(self._tracking_publish_interval_s),
+                counter_prefix="tracking",
+            ):
+                try:
+                    publish_start_ns = time.perf_counter_ns()
+                    self.tracking_pub.publish(sensor_id, tracks)
+                    _record_core_stage_timing("tracking.publish", publish_start_ns, item_count=len(tracks))
+                except Exception:  # pragma: no cover - telemetry should never break pipeline
+                    logger.exception("Tracking telemetry publish failed for sensor %s", sensor_id)
             try:
-                self.tracking_pub.publish(sensor_id, tracks)
-            except Exception:  # pragma: no cover - telemetry should never break pipeline
-                logger.exception("Tracking telemetry publish failed for sensor %s", sensor_id)
-            try:
-                self._publish_bev(sensor_id, camera_id, frame_meta, footpoints)
+                self._publish_bev(sensor_id, camera_id, frame_meta, footpoints, now_ts=now_ts, track_count=len(tracks))
             except Exception:
                 logger.exception("BEV publish failed for sensor %s", sensor_id)
+            _record_core_stage_timing("analytics.handle_frame_ds8", frame_start_ns, item_count=len(tracks))
         except Exception:  # pragma: no cover - defensive guardrail
             logger.exception("Failed to process analytics telemetry for frame (DS8)")
+            _record_core_stage_timing("analytics.handle_frame_ds8", frame_start_ns)
 
     def handle_frame(self, frame_meta: Any) -> None:
         """Extract tracking telemetry for a single frame and publish it."""
@@ -6066,9 +6900,20 @@ class _AnalyticsTelemetryProcessor:
         obj_meta: Any,
         bbox: Sequence[float],
     ) -> Optional[np.ndarray]:
+        payload = self._extract_pose_payload_for_anchor(obj_meta)
+        if payload is not None:
+            keypoints_abs = self._keypoints_abs_from_pose_payload(payload, bbox)
+            if keypoints_abs is not None:
+                _increment_core_counter("detection_wake.pose_anchor_payload_hit")
+                return keypoints_abs
+
         if obj_meta is not None and noesis_pose_meta_ext is not None:
+            if int(self._pose_anchor_native_remaining) <= 0:
+                _increment_core_counter("detection_wake.pose_anchor_native_budget_skipped")
+                return None
             extract_obj = getattr(noesis_pose_meta_ext, "extract_pose_keypoints", None)
             if callable(extract_obj):
+                self._pose_anchor_native_remaining = max(0, int(self._pose_anchor_native_remaining) - 1)
                 try:
                     payload = extract_obj(
                         obj_meta,
@@ -6083,12 +6928,11 @@ class _AnalyticsTelemetryProcessor:
                 if isinstance(payload, dict):
                     keypoints_abs = self._keypoints_abs_from_pose_payload(payload, bbox)
                     if keypoints_abs is not None:
+                        _increment_core_counter("detection_wake.pose_anchor_native_extract")
                         return keypoints_abs
 
-        payload = self._extract_pose_payload_for_anchor(obj_meta)
-        if payload is None:
-            return None
-        return self._keypoints_abs_from_pose_payload(payload, bbox)
+        _increment_core_counter("detection_wake.pose_anchor_missing")
+        return None
 
     def _keypoints_abs_from_pose_payload(
         self,
@@ -6883,8 +7727,23 @@ class _AnalyticsTelemetryProcessor:
         camera_id: str,
         frame_meta: Any,
         footpoints: Sequence[Footpoint],
+        *,
+        now_ts: Optional[float] = None,
+        track_count: Optional[int] = None,
     ) -> None:
         if self.bev_renderer is None or self.bev_calibration is None:
+            return
+        ts_now = float(now_ts) if now_ts is not None else time.time()
+        fp_count = int(track_count) if track_count is not None else len(footpoints)
+        if not self._publish_gate_due(
+            self._last_bev_publish_ts_by_sensor,
+            self._last_bev_count_by_sensor,
+            sensor_id=sensor_id,
+            now_ts=ts_now,
+            count=fp_count,
+            interval_s=float(self._bev_publish_interval_s),
+            counter_prefix="bev",
+        ):
             return
         try:
             calib = self.bev_calibration.snapshot(sensor_id, camera_id)
@@ -6894,12 +7753,14 @@ class _AnalyticsTelemetryProcessor:
             return
         ts_us = self._frame_timestamp_us(frame_meta)
         try:
+            publish_start_ns = time.perf_counter_ns()
             self.bev_renderer.render_and_publish(
                 camera_id=camera_id,
                 calib=calib,
                 footpoints=list(footpoints),
                 timestamp_us=ts_us,
             )
+            _record_core_stage_timing("bev.render_and_publish", publish_start_ns, item_count=len(footpoints))
         except Exception:
             logger.exception("BEV render failed for %s", camera_id)
 
@@ -6913,11 +7774,6 @@ class _AnalyticsTelemetryProcessor:
 
     def _build_track_dict_ds8(self, obj_meta: Any, camera_id: str) -> Optional[Dict[str, Any]]:
         """Build track dictionary from DS8 pyservicemaker ObjectMetadata."""
-        rect = getattr(obj_meta, "rect_params", None)
-        bbox = _rect_to_bbox(rect)
-        if bbox is None:
-            return None
-
         try:
             track_id = int(getattr(obj_meta, "object_id", -1))
         except Exception:
@@ -6926,6 +7782,12 @@ class _AnalyticsTelemetryProcessor:
             class_id = int(getattr(obj_meta, "class_id", -1))
         except Exception:
             class_id = -1
+        if class_id != 0:
+            return None
+        rect = getattr(obj_meta, "rect_params", None)
+        bbox = _rect_to_bbox(rect)
+        if bbox is None:
+            return None
         try:
             confidence = float(getattr(obj_meta, "confidence", 0.0))
         except Exception:
@@ -8119,12 +8981,34 @@ def _iter_meta_entries(meta_list: Any, cast_fn: Optional[Callable[[Any], Any]] =
 def _rect_to_bbox(rect: Any) -> Optional[List[float]]:
     if rect is None:
         return None
+
+    def _rect_attr(*names: str) -> Optional[float]:
+        for name in names:
+            try:
+                value = getattr(rect, name)
+            except AttributeError:
+                continue
+            except Exception:
+                return None
+            try:
+                parsed = float(value)
+            except Exception:
+                return None
+            if math.isfinite(parsed):
+                return parsed
+            return None
+        return None
+
     try:
-        left = float(getattr(rect, "left", getattr(rect, "x", 0.0)))
-        top = float(getattr(rect, "top", getattr(rect, "y", 0.0)))
-        width = float(getattr(rect, "width", getattr(rect, "w", 0.0)))
-        height = float(getattr(rect, "height", getattr(rect, "h", 0.0)))
+        left = _rect_attr("left", "x")
+        top = _rect_attr("top", "y")
+        width = _rect_attr("width", "w")
+        height = _rect_attr("height", "h")
     except Exception:
+        return None
+    if left is None or top is None or width is None or height is None:
+        return None
+    if width <= 0.0 or height <= 0.0:
         return None
     return [left, top, width, height]
 

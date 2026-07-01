@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <cstring>
 #include <memory>
+#include <limits>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -24,6 +25,61 @@
 #include "nvdsmeta.h"
 
 namespace py = pybind11;
+
+extern "C" cudaError_t noesis_sample_roi_values_cuda(
+    const float* depth,
+    int frame_w,
+    int frame_h,
+    int x0,
+    int y0,
+    int roi_w,
+    int roi_h,
+    int stride,
+    int sampled_cols,
+    int sampled_area,
+    float* out_values,
+    float* out_center,
+    cudaStream_t stream);
+
+extern "C" cudaError_t noesis_sample_masked_roi_values_cuda(
+    const float* depth,
+    const float* mask,
+    int frame_w,
+    int frame_h,
+    int mask_w,
+    int mask_h,
+    int x0,
+    int y0,
+    int roi_w,
+    int roi_h,
+    int stride,
+    int sampled_cols,
+    int sampled_area,
+    float threshold,
+    float* out_values,
+    float* out_center,
+    cudaStream_t stream);
+
+extern "C" cudaError_t noesis_sample_masked_person_roi_values_cuda(
+    const float* depth,
+    const float* mask,
+    int frame_w,
+    int frame_h,
+    int mask_w,
+    int mask_h,
+    int x0,
+    int y0,
+    int roi_w,
+    int roi_h,
+    int stride,
+    int sampled_cols,
+    int sampled_area,
+    float threshold,
+    float* out_all,
+    float* out_lower,
+    float* out_torso,
+    float* out_center,
+    cudaStream_t stream);
 
 namespace {
 
@@ -232,6 +288,11 @@ class CudaBuffer {
     count_ = count;
   }
 
+  void ensure_capacity(size_t count) {
+    if (count_ >= count) return;
+    allocate(count);
+  }
+
   void reset() noexcept {
     if (ptr_ != nullptr) {
       cudaFree(ptr_);
@@ -301,6 +362,521 @@ class AlignedDepthFrameDevice {
             static_cast<size_t>(roi_h),
             cudaMemcpyDeviceToHost),
         "cudaMemcpy2D depth ROI copy failed");
+    return out;
+  }
+
+  py::dict sample_roi_stats(int left, int top, int width, int height, int max_samples) const {
+    if (device_ptr_ == nullptr) {
+      throw std::runtime_error("Aligned depth frame device buffer is unavailable");
+    }
+    if (width <= 0 || height <= 0) {
+      throw std::runtime_error("sample_roi_stats requires a positive ROI size");
+    }
+
+    const int x0 = std::max(0, std::min(left, frame_w_));
+    const int y0 = std::max(0, std::min(top, frame_h_));
+    const int x1 = std::max(x0, std::min(left + width, frame_w_));
+    const int y1 = std::max(y0, std::min(top + height, frame_h_));
+    const int roi_w = x1 - x0;
+    const int roi_h = y1 - y0;
+    if (roi_w <= 0 || roi_h <= 0) {
+      throw std::runtime_error("sample_roi_stats resolved an empty ROI");
+    }
+
+    const int sample_cap = std::max(128, max_samples);
+    const double total_px = static_cast<double>(roi_w) * static_cast<double>(roi_h);
+    const int stride = std::max(1, static_cast<int>(std::ceil(std::sqrt(total_px / static_cast<double>(sample_cap)))));
+    const int sampled_rows = static_cast<int>((roi_h + stride - 1) / stride);
+    const int sampled_cols = static_cast<int>((roi_w + stride - 1) / stride);
+    const int sampled_area = std::max(1, sampled_rows * sampled_cols);
+
+    const size_t sampled_count = static_cast<size_t>(sampled_area) + 1U;
+    thread_local CudaBuffer<float> sampled_device;
+    sampled_device.ensure_capacity(sampled_count);
+    throw_on_cuda(
+        noesis_sample_roi_values_cuda(
+            device_ptr_,
+            frame_w_,
+            frame_h_,
+            x0,
+            y0,
+            roi_w,
+            roi_h,
+            stride,
+            sampled_cols,
+            sampled_area,
+            sampled_device.get(),
+            sampled_device.get() + static_cast<size_t>(sampled_area),
+            nullptr),
+        "CUDA depth ROI compact sampler launch failed");
+
+    thread_local std::vector<float> sampled_host;
+    sampled_host.resize(sampled_count);
+    throw_on_cuda(
+        cudaMemcpy(
+            sampled_host.data(),
+            sampled_device.get(),
+            sampled_count * sizeof(float),
+            cudaMemcpyDeviceToHost),
+        "cudaMemcpy depth ROI compact samples failed");
+
+    thread_local std::vector<float> values;
+    values.clear();
+    values.reserve(static_cast<size_t>(sampled_area));
+    for (int idx = 0; idx < sampled_area; ++idx) {
+      const float value = sampled_host[static_cast<size_t>(idx)];
+      if (std::isfinite(value)) {
+        values.push_back(value);
+      }
+    }
+
+    const float center_value = sampled_host[static_cast<size_t>(sampled_area)];
+
+    py::dict out;
+    out["roi_area_px"] = roi_w * roi_h;
+    out["sampled_area_px"] = sampled_area;
+    out["sample_count"] = static_cast<int>(values.size());
+    out["valid_fraction"] = static_cast<double>(values.size()) / static_cast<double>(sampled_area);
+    if (std::isfinite(center_value)) {
+      out["depth_center"] = static_cast<double>(center_value);
+    } else {
+      out["depth_center"] = py::none();
+    }
+    if (values.empty()) {
+      out["depth_median"] = py::none();
+      out["depth_mean"] = py::none();
+      out["depth_p10"] = py::none();
+      out["depth_p90"] = py::none();
+      out["depth_min"] = py::none();
+      out["depth_max"] = py::none();
+      return out;
+    }
+
+    std::sort(values.begin(), values.end());
+    double sum = 0.0;
+    for (float value : values) {
+      sum += static_cast<double>(value);
+    }
+    auto percentile = [](const std::vector<float>& sorted_values, double p) -> double {
+      if (sorted_values.empty()) return std::numeric_limits<double>::quiet_NaN();
+      const double clamped = std::max(0.0, std::min(100.0, p));
+      const double pos = (clamped / 100.0) * static_cast<double>(sorted_values.size() - 1U);
+      const size_t lo = static_cast<size_t>(std::floor(pos));
+      const size_t hi = static_cast<size_t>(std::ceil(pos));
+      if (lo == hi) return static_cast<double>(sorted_values[lo]);
+      const double frac = pos - static_cast<double>(lo);
+      return (static_cast<double>(sorted_values[lo]) * (1.0 - frac)) + (static_cast<double>(sorted_values[hi]) * frac);
+    };
+
+    out["depth_median"] = percentile(values, 50.0);
+    out["depth_mean"] = sum / static_cast<double>(values.size());
+    out["depth_p10"] = percentile(values, 10.0);
+    out["depth_p90"] = percentile(values, 90.0);
+    out["depth_min"] = static_cast<double>(values.front());
+    out["depth_max"] = static_cast<double>(values.back());
+    return out;
+  }
+
+  py::dict sample_masked_roi_stats(
+      int left,
+      int top,
+      int width,
+      int height,
+      py::array_t<float, py::array::c_style | py::array::forcecast> mask_array,
+      float threshold,
+      int max_samples) const {
+    if (device_ptr_ == nullptr) {
+      throw std::runtime_error("Aligned depth frame device buffer is unavailable");
+    }
+    if (width <= 0 || height <= 0) {
+      throw std::runtime_error("sample_masked_roi_stats requires a positive ROI size");
+    }
+
+    const int x0 = std::max(0, std::min(left, frame_w_));
+    const int y0 = std::max(0, std::min(top, frame_h_));
+    const int x1 = std::max(x0, std::min(left + width, frame_w_));
+    const int y1 = std::max(y0, std::min(top + height, frame_h_));
+    const int roi_w = x1 - x0;
+    const int roi_h = y1 - y0;
+    if (roi_w <= 0 || roi_h <= 0) {
+      throw std::runtime_error("sample_masked_roi_stats resolved an empty ROI");
+    }
+
+    py::buffer_info mask_info = mask_array.request();
+    if (mask_info.ndim != 2) {
+      throw std::runtime_error("sample_masked_roi_stats mask must be 2D");
+    }
+    const int mask_h = static_cast<int>(mask_info.shape[0]);
+    const int mask_w = static_cast<int>(mask_info.shape[1]);
+    if (mask_w != roi_w || mask_h != roi_h) {
+      throw std::runtime_error("sample_masked_roi_stats mask shape must match ROI size");
+    }
+    const float* mask_host = static_cast<const float*>(mask_info.ptr);
+    if (mask_host == nullptr) {
+      throw std::runtime_error("sample_masked_roi_stats mask buffer is unavailable");
+    }
+
+    const int sample_cap = std::max(128, max_samples);
+    int mask_area = 0;
+    for (int idx = 0; idx < mask_w * mask_h; ++idx) {
+      if (mask_host[idx] > threshold) {
+        ++mask_area;
+      }
+    }
+    const double sampling_area = static_cast<double>(std::max(1, mask_area));
+    const int stride = std::max(1, static_cast<int>(std::ceil(std::sqrt(sampling_area / static_cast<double>(sample_cap)))));
+    const int sampled_rows = static_cast<int>((roi_h + stride - 1) / stride);
+    const int sampled_cols = static_cast<int>((roi_w + stride - 1) / stride);
+    const int sampled_area = std::max(1, sampled_rows * sampled_cols);
+
+    int sampled_mask_area = 0;
+    for (int yy = 0; yy < roi_h; yy += stride) {
+      for (int xx = 0; xx < roi_w; xx += stride) {
+        if (mask_host[(static_cast<size_t>(yy) * static_cast<size_t>(mask_w)) + static_cast<size_t>(xx)] > threshold) {
+          ++sampled_mask_area;
+        }
+      }
+    }
+
+    const size_t mask_count = static_cast<size_t>(mask_w) * static_cast<size_t>(mask_h);
+    thread_local CudaBuffer<float> mask_device;
+    mask_device.ensure_capacity(mask_count);
+    throw_on_cuda(
+        cudaMemcpy(
+            mask_device.get(),
+            mask_host,
+            mask_count * sizeof(float),
+            cudaMemcpyHostToDevice),
+        "cudaMemcpy object-depth mask to device failed");
+
+    const size_t sampled_count = static_cast<size_t>(sampled_area) + 1U;
+    thread_local CudaBuffer<float> sampled_device;
+    sampled_device.ensure_capacity(sampled_count);
+    throw_on_cuda(
+        noesis_sample_masked_roi_values_cuda(
+            device_ptr_,
+            mask_device.get(),
+            frame_w_,
+            frame_h_,
+            mask_w,
+            mask_h,
+            x0,
+            y0,
+            roi_w,
+            roi_h,
+            stride,
+            sampled_cols,
+            sampled_area,
+            threshold,
+            sampled_device.get(),
+            sampled_device.get() + static_cast<size_t>(sampled_area),
+            nullptr),
+        "CUDA masked depth ROI compact sampler launch failed");
+
+    thread_local std::vector<float> sampled_host;
+    sampled_host.resize(sampled_count);
+    throw_on_cuda(
+        cudaMemcpy(
+            sampled_host.data(),
+            sampled_device.get(),
+            sampled_count * sizeof(float),
+            cudaMemcpyDeviceToHost),
+        "cudaMemcpy masked depth ROI compact samples failed");
+
+    thread_local std::vector<float> values;
+    values.clear();
+    values.reserve(static_cast<size_t>(std::max(0, sampled_mask_area)));
+    for (int idx = 0; idx < sampled_area; ++idx) {
+      const float value = sampled_host[static_cast<size_t>(idx)];
+      if (std::isfinite(value)) {
+        values.push_back(value);
+      }
+    }
+
+    const float center_value = sampled_host[static_cast<size_t>(sampled_area)];
+
+    py::dict out;
+    out["roi_area_px"] = roi_w * roi_h;
+    out["mask_area_px"] = mask_area;
+    out["sampled_area_px"] = sampled_area;
+    out["sampled_mask_area_px"] = sampled_mask_area;
+    out["sample_count"] = static_cast<int>(values.size());
+    out["valid_fraction"] = sampled_mask_area > 0
+        ? static_cast<double>(values.size()) / static_cast<double>(sampled_mask_area)
+        : 0.0;
+    if (std::isfinite(center_value)) {
+      out["depth_center"] = static_cast<double>(center_value);
+    } else {
+      out["depth_center"] = py::none();
+    }
+    if (values.empty()) {
+      out["depth_median"] = py::none();
+      out["depth_mean"] = py::none();
+      out["depth_p10"] = py::none();
+      out["depth_p90"] = py::none();
+      out["depth_min"] = py::none();
+      out["depth_max"] = py::none();
+      return out;
+    }
+
+    std::sort(values.begin(), values.end());
+    double sum = 0.0;
+    for (float value : values) {
+      sum += static_cast<double>(value);
+    }
+    auto percentile = [](const std::vector<float>& sorted_values, double p) -> double {
+      if (sorted_values.empty()) return std::numeric_limits<double>::quiet_NaN();
+      const double clamped = std::max(0.0, std::min(100.0, p));
+      const double pos = (clamped / 100.0) * static_cast<double>(sorted_values.size() - 1U);
+      const size_t lo = static_cast<size_t>(std::floor(pos));
+      const size_t hi = static_cast<size_t>(std::ceil(pos));
+      if (lo == hi) return static_cast<double>(sorted_values[lo]);
+      const double frac = pos - static_cast<double>(lo);
+      return (static_cast<double>(sorted_values[lo]) * (1.0 - frac)) + (static_cast<double>(sorted_values[hi]) * frac);
+    };
+
+    out["depth_median"] = percentile(values, 50.0);
+    out["depth_mean"] = sum / static_cast<double>(values.size());
+    out["depth_p10"] = percentile(values, 10.0);
+    out["depth_p90"] = percentile(values, 90.0);
+    out["depth_min"] = static_cast<double>(values.front());
+    out["depth_max"] = static_cast<double>(values.back());
+    return out;
+  }
+
+  py::dict sample_masked_person_roi_stats(
+      int left,
+      int top,
+      int width,
+      int height,
+      py::array_t<float, py::array::c_style | py::array::forcecast> mask_array,
+      float threshold,
+      int max_samples) const {
+    if (device_ptr_ == nullptr) {
+      throw std::runtime_error("Aligned depth frame device buffer is unavailable");
+    }
+    if (width <= 0 || height <= 0) {
+      throw std::runtime_error("sample_masked_person_roi_stats requires a positive ROI size");
+    }
+
+    const int x0 = std::max(0, std::min(left, frame_w_));
+    const int y0 = std::max(0, std::min(top, frame_h_));
+    const int x1 = std::max(x0, std::min(left + width, frame_w_));
+    const int y1 = std::max(y0, std::min(top + height, frame_h_));
+    const int roi_w = x1 - x0;
+    const int roi_h = y1 - y0;
+    if (roi_w <= 0 || roi_h <= 0) {
+      throw std::runtime_error("sample_masked_person_roi_stats resolved an empty ROI");
+    }
+
+    py::buffer_info mask_info = mask_array.request();
+    if (mask_info.ndim != 2) {
+      throw std::runtime_error("sample_masked_person_roi_stats mask must be 2D");
+    }
+    const int mask_h = static_cast<int>(mask_info.shape[0]);
+    const int mask_w = static_cast<int>(mask_info.shape[1]);
+    if (mask_w != roi_w || mask_h != roi_h) {
+      throw std::runtime_error("sample_masked_person_roi_stats mask shape must match ROI size");
+    }
+    const float* mask_host = static_cast<const float*>(mask_info.ptr);
+    if (mask_host == nullptr) {
+      throw std::runtime_error("sample_masked_person_roi_stats mask buffer is unavailable");
+    }
+
+    auto in_center_band_host = [](int x, int y, int roi_w_value, int roi_h_value, double y0_ratio, double y1_ratio, double center_width_ratio) -> bool {
+      int band_y0 = static_cast<int>(std::floor(static_cast<double>(roi_h_value) * y0_ratio));
+      int band_y1 = static_cast<int>(std::ceil(static_cast<double>(roi_h_value) * y1_ratio));
+      band_y0 = std::max(0, std::min(roi_h_value, band_y0));
+      band_y1 = std::max(band_y0 + 1, std::min(roi_h_value, band_y1));
+      int band_w = static_cast<int>(std::round(static_cast<double>(roi_w_value) * center_width_ratio));
+      band_w = std::max(1, std::min(roi_w_value, band_w));
+      const double center_x = static_cast<double>(roi_w_value) * 0.5;
+      int band_x0 = static_cast<int>(std::round(center_x - (static_cast<double>(band_w) * 0.5)));
+      int band_x1 = static_cast<int>(std::round(center_x + (static_cast<double>(band_w) * 0.5)));
+      band_x0 = std::max(0, std::min(roi_w_value, band_x0));
+      band_x1 = std::max(band_x0 + 1, std::min(roi_w_value, band_x1));
+      return y >= band_y0 && y < band_y1 && x >= band_x0 && x < band_x1;
+    };
+    auto eroded_host = [mask_host, mask_w, mask_h, threshold](int x, int y) -> bool {
+      for (int dy = -1; dy <= 1; ++dy) {
+        const int yy = y + dy;
+        if (yy < 0 || yy >= mask_h) return false;
+        for (int dx = -1; dx <= 1; ++dx) {
+          const int xx = x + dx;
+          if (xx < 0 || xx >= mask_w) return false;
+          if (mask_host[(static_cast<size_t>(yy) * static_cast<size_t>(mask_w)) + static_cast<size_t>(xx)] <= threshold) {
+            return false;
+          }
+        }
+      }
+      return true;
+    };
+
+    int mask_area = 0;
+    int lower_mask_area = 0;
+    int torso_mask_area = 0;
+    for (int yy = 0; yy < roi_h; ++yy) {
+      for (int xx = 0; xx < roi_w; ++xx) {
+        const bool active = mask_host[(static_cast<size_t>(yy) * static_cast<size_t>(mask_w)) + static_cast<size_t>(xx)] > threshold;
+        if (!active) continue;
+        ++mask_area;
+        const bool eroded = eroded_host(xx, yy);
+        if (eroded && in_center_band_host(xx, yy, roi_w, roi_h, 0.88, 1.0, 0.35)) {
+          ++lower_mask_area;
+        }
+        if (eroded && in_center_band_host(xx, yy, roi_w, roi_h, 0.35, 0.70, 0.50)) {
+          ++torso_mask_area;
+        }
+      }
+    }
+
+    const int sample_cap = std::max(128, max_samples);
+    const double sampling_area = static_cast<double>(std::max(1, mask_area));
+    const int stride = std::max(1, static_cast<int>(std::ceil(std::sqrt(sampling_area / static_cast<double>(sample_cap)))));
+    const int sampled_rows = static_cast<int>((roi_h + stride - 1) / stride);
+    const int sampled_cols = static_cast<int>((roi_w + stride - 1) / stride);
+    const int sampled_area = std::max(1, sampled_rows * sampled_cols);
+
+    int sampled_mask_area = 0;
+    int sampled_lower_area = 0;
+    int sampled_torso_area = 0;
+    for (int yy = 0; yy < roi_h; yy += stride) {
+      for (int xx = 0; xx < roi_w; xx += stride) {
+        const bool active = mask_host[(static_cast<size_t>(yy) * static_cast<size_t>(mask_w)) + static_cast<size_t>(xx)] > threshold;
+        if (!active) continue;
+        ++sampled_mask_area;
+        const bool eroded = eroded_host(xx, yy);
+        if (eroded && in_center_band_host(xx, yy, roi_w, roi_h, 0.88, 1.0, 0.35)) {
+          ++sampled_lower_area;
+        }
+        if (eroded && in_center_band_host(xx, yy, roi_w, roi_h, 0.35, 0.70, 0.50)) {
+          ++sampled_torso_area;
+        }
+      }
+    }
+
+    const size_t mask_count = static_cast<size_t>(mask_w) * static_cast<size_t>(mask_h);
+    thread_local CudaBuffer<float> mask_device;
+    mask_device.ensure_capacity(mask_count);
+    throw_on_cuda(
+        cudaMemcpy(
+            mask_device.get(),
+            mask_host,
+            mask_count * sizeof(float),
+            cudaMemcpyHostToDevice),
+        "cudaMemcpy person object-depth mask to device failed");
+
+    const size_t sampled_area_size = static_cast<size_t>(sampled_area);
+    const size_t sampled_count = (sampled_area_size * 3U) + 1U;
+    thread_local CudaBuffer<float> sampled_device;
+    sampled_device.ensure_capacity(sampled_count);
+    float* all_device = sampled_device.get();
+    float* lower_device = all_device + sampled_area_size;
+    float* torso_device = lower_device + sampled_area_size;
+    float* center_device = torso_device + sampled_area_size;
+    throw_on_cuda(
+        noesis_sample_masked_person_roi_values_cuda(
+            device_ptr_,
+            mask_device.get(),
+            frame_w_,
+            frame_h_,
+            mask_w,
+            mask_h,
+            x0,
+            y0,
+            roi_w,
+            roi_h,
+            stride,
+            sampled_cols,
+            sampled_area,
+            threshold,
+            all_device,
+            lower_device,
+            torso_device,
+            center_device,
+            nullptr),
+        "CUDA person masked depth ROI sampler launch failed");
+
+    thread_local std::vector<float> sampled_host;
+    sampled_host.resize(sampled_count);
+    throw_on_cuda(
+        cudaMemcpy(
+            sampled_host.data(),
+            sampled_device.get(),
+            sampled_count * sizeof(float),
+            cudaMemcpyDeviceToHost),
+        "cudaMemcpy person masked depth ROI compact samples failed");
+
+    auto collect_values = [sampled_area_size](const std::vector<float>& samples, size_t offset, int reserve_count) -> std::vector<float> {
+      std::vector<float> values;
+      values.reserve(static_cast<size_t>(std::max(0, reserve_count)));
+      for (size_t idx = 0; idx < sampled_area_size; ++idx) {
+        const float value = samples[offset + idx];
+        if (std::isfinite(value)) {
+          values.push_back(value);
+        }
+      }
+      return values;
+    };
+    auto add_stats = [](py::dict& out, const char* prefix, std::vector<float>& values, int sampled_denominator) {
+      const std::string key_prefix(prefix ? prefix : "");
+      out[py::str(key_prefix + "sample_count")] = static_cast<int>(values.size());
+      out[py::str(key_prefix + "valid_fraction")] = sampled_denominator > 0
+          ? static_cast<double>(values.size()) / static_cast<double>(sampled_denominator)
+          : 0.0;
+      if (values.empty()) {
+        out[py::str(key_prefix + "depth_median")] = py::none();
+        out[py::str(key_prefix + "depth_mean")] = py::none();
+        out[py::str(key_prefix + "depth_p10")] = py::none();
+        out[py::str(key_prefix + "depth_p90")] = py::none();
+        out[py::str(key_prefix + "depth_min")] = py::none();
+        out[py::str(key_prefix + "depth_max")] = py::none();
+        return;
+      }
+      std::sort(values.begin(), values.end());
+      double sum = 0.0;
+      for (float value : values) {
+        sum += static_cast<double>(value);
+      }
+      auto percentile = [&values](double p) -> double {
+        const double clamped = std::max(0.0, std::min(100.0, p));
+        const double pos = (clamped / 100.0) * static_cast<double>(values.size() - 1U);
+        const size_t lo = static_cast<size_t>(std::floor(pos));
+        const size_t hi = static_cast<size_t>(std::ceil(pos));
+        if (lo == hi) return static_cast<double>(values[lo]);
+        const double frac = pos - static_cast<double>(lo);
+        return (static_cast<double>(values[lo]) * (1.0 - frac)) + (static_cast<double>(values[hi]) * frac);
+      };
+      out[py::str(key_prefix + "depth_median")] = percentile(50.0);
+      out[py::str(key_prefix + "depth_mean")] = sum / static_cast<double>(values.size());
+      out[py::str(key_prefix + "depth_p10")] = percentile(10.0);
+      out[py::str(key_prefix + "depth_p90")] = percentile(90.0);
+      out[py::str(key_prefix + "depth_min")] = static_cast<double>(values.front());
+      out[py::str(key_prefix + "depth_max")] = static_cast<double>(values.back());
+    };
+
+    std::vector<float> all_values = collect_values(sampled_host, 0U, sampled_mask_area);
+    std::vector<float> lower_values = collect_values(sampled_host, sampled_area_size, sampled_lower_area);
+    std::vector<float> torso_values = collect_values(sampled_host, sampled_area_size * 2U, sampled_torso_area);
+    const float center_value = sampled_host[sampled_area_size * 3U];
+
+    py::dict out;
+    out["roi_area_px"] = roi_w * roi_h;
+    out["mask_area_px"] = mask_area;
+    out["lower_mask_area_px"] = lower_mask_area;
+    out["torso_mask_area_px"] = torso_mask_area;
+    out["sampled_area_px"] = sampled_area;
+    out["sampled_mask_area_px"] = sampled_mask_area;
+    out["sampled_lower_mask_area_px"] = sampled_lower_area;
+    out["sampled_torso_mask_area_px"] = sampled_torso_area;
+    if (std::isfinite(center_value)) {
+      out["depth_center"] = static_cast<double>(center_value);
+    } else {
+      out["depth_center"] = py::none();
+    }
+    add_stats(out, "", all_values, sampled_mask_area);
+    add_stats(out, "lower_", lower_values, sampled_lower_area);
+    add_stats(out, "torso_", torso_values, sampled_torso_area);
     return out;
   }
 
@@ -455,6 +1031,34 @@ PYBIND11_MODULE(noesis_depth_tracking_tensor_ext, m) {
   m.doc() = "Noesis DS8 helper bindings for extracting and aligning baseline DAv2 tensors on-device.";
   py::class_<AlignedDepthFrameDevice, std::shared_ptr<AlignedDepthFrameDevice>>(m, "AlignedDepthFrameDevice")
       .def("copy_roi_to_numpy", &AlignedDepthFrameDevice::copy_roi_to_numpy, py::arg("left"), py::arg("top"), py::arg("width"), py::arg("height"))
+      .def(
+          "sample_roi_stats",
+          &AlignedDepthFrameDevice::sample_roi_stats,
+          py::arg("left"),
+          py::arg("top"),
+          py::arg("width"),
+          py::arg("height"),
+          py::arg("max_samples") = 4096)
+      .def(
+          "sample_masked_roi_stats",
+          &AlignedDepthFrameDevice::sample_masked_roi_stats,
+          py::arg("left"),
+          py::arg("top"),
+          py::arg("width"),
+          py::arg("height"),
+          py::arg("mask"),
+          py::arg("threshold") = 0.5F,
+          py::arg("max_samples") = 4096)
+      .def(
+          "sample_masked_person_roi_stats",
+          &AlignedDepthFrameDevice::sample_masked_person_roi_stats,
+          py::arg("left"),
+          py::arg("top"),
+          py::arg("width"),
+          py::arg("height"),
+          py::arg("mask"),
+          py::arg("threshold") = 0.5F,
+          py::arg("max_samples") = 4096)
       .def_property_readonly("frame_width", &AlignedDepthFrameDevice::frame_width)
       .def_property_readonly("frame_height", &AlignedDepthFrameDevice::frame_height)
       .def_property_readonly("depth_width", &AlignedDepthFrameDevice::depth_width)

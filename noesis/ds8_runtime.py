@@ -1944,7 +1944,7 @@ def _build_stable_id_manager(logger: logging.Logger, *, pipeline_config: Optiona
         model_name = os.environ.get("NOESIS_REID_MODEL_NAME", "osnet_x1_0")
         img_h = int(os.environ.get("NOESIS_REID_IMAGE_H", "256") or 256)
         img_w = int(os.environ.get("NOESIS_REID_IMAGE_W", "128") or 128)
-        embed_interval_s = float(os.environ.get("NOESIS_REID_EMBED_INTERVAL_S", "0.5") or 0.5)
+        embed_interval_s = float(os.environ.get("NOESIS_REID_EMBED_INTERVAL_S", "1.0") or 1.0)
         new_id_hysteresis_frames = int(os.environ.get("NOESIS_REID_NEW_ID_HYSTERESIS_FRAMES", "1") or 1)
         new_id_confirm_frames_at_cap = int(os.environ.get("NOESIS_REID_NEW_ID_CONFIRM_FRAMES_AT_CAP", "1") or 1)
         pose_flag = os.environ.get("NOESIS_REID_POSE_ENABLED", "")
@@ -2613,6 +2613,7 @@ def _build_stats_callback(
         cameras_stats: Dict[str, object] = {}
         core_instr = hooks.get_core_path_instrumentation_snapshot()
         core_counters = dict(core_instr.get("counters", {}))
+        core_stage_timings = dict(core_instr.get("stage_timings", {}))
         core_violations = int(core_counters.get("core_path.cpu_copy_violation.total", 0))
         ws_boundary_metrics: Dict[str, Any] = {}
         if callable(ws_metrics_getter):
@@ -2750,6 +2751,7 @@ def _build_stats_callback(
                 **({"latency_ms": latency_aggregate} if latency_aggregate is not None else {}),
                 "zero_copy_core": {
                     "counters": core_counters,
+                    "stage_timings": core_stage_timings,
                     "boundary_serialization_metrics": {
                         "ws": ws_boundary_metrics,
                         "rest": rest_boundary_metrics,

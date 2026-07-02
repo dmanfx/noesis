@@ -275,7 +275,13 @@ def _summarize_message_window(messages: list[Mapping[str, Any]]) -> dict[str, An
     registered_depth_anchor_inside = 0
     candidate_deltas: list[float] = []
     speeds: list[float] = []
-    last_point: dict[tuple[str, str], tuple[int, float, float]] = {}
+    raw_speeds: list[float] = []
+    speed_by_source_transition: dict[str, list[float]] = {}
+    raw_speed_by_source_transition: dict[str, list[float]] = {}
+    trail_segment_speeds: list[float] = []
+    top_trail_segments: list[dict[str, Any]] = []
+    top_jumps: list[dict[str, Any]] = []
+    last_point: dict[tuple[str, str], dict[str, Any]] = {}
 
     for msg in messages:
         msg_type = msg.get("type")
@@ -319,6 +325,44 @@ def _summarize_message_window(messages: list[Mapping[str, Any]]) -> dict[str, An
             dropped = msg.get("droppedFootpoints")
             if isinstance(dropped, list):
                 dropped_footpoints += len(dropped)
+            trails = msg.get("trails")
+            if isinstance(trails, list):
+                for trail in trails:
+                    if not isinstance(trail, Mapping):
+                        continue
+                    points = trail.get("points")
+                    if not isinstance(points, list):
+                        continue
+                    for prev_point, next_point in zip(points, points[1:]):
+                        if not isinstance(prev_point, Mapping) or not isinstance(next_point, Mapping):
+                            continue
+                        try:
+                            t0 = float(prev_point.get("t"))
+                            t1 = float(next_point.get("t"))
+                            dt = (t1 - t0) / 1000.0
+                            if dt <= 1e-3:
+                                continue
+                            x0 = float(prev_point.get("x"))
+                            z0 = float(prev_point.get("y"))
+                            x1 = float(next_point.get("x"))
+                            z1 = float(next_point.get("y"))
+                            speed = math.hypot(x1 - x0, z1 - z0) / dt
+                        except Exception:
+                            continue
+                        trail_segment_speeds.append(float(speed))
+                        top_trail_segments.append(
+                            {
+                                "camera": cam,
+                                "stableId": trail.get("stableId"),
+                                "trackerId": trail.get("trackerId"),
+                                "from_t_ms": int(t0),
+                                "to_t_ms": int(t1),
+                                "dt_s": float(dt),
+                                "speed_mps": float(speed),
+                                "from": {"x": float(x0), "y": float(z0)},
+                                "to": {"x": float(x1), "y": float(z1)},
+                            }
+                        )
             x_min = float(msg.get("xMin", float("nan")))
             x_max = float(msg.get("xMax", float("nan")))
             z_min = float(msg.get("zMin", float("nan")))
@@ -339,26 +383,65 @@ def _summarize_message_window(messages: list[Mapping[str, Any]]) -> dict[str, An
                     z = float(fp.get("y"))
                 except Exception:
                     continue
+                try:
+                    raw_x = float(fp.get("rawX", x))
+                    raw_z = float(fp.get("rawY", z))
+                except Exception:
+                    raw_x, raw_z = x, z
+                selection_reason = None
+                debug = fp.get("alignmentDebug")
+                selection = None
+                if isinstance(debug, Mapping):
+                    selection = debug.get("displaySelection")
+                    if isinstance(selection, Mapping):
+                        selection_reason = str(selection.get("reason") or selection.get("selected") or "unknown")
                 if not (x_min <= x <= x_max and z_min <= z <= z_max):
                     footpoint_out_of_bounds += 1
                 key_id = fp.get("trackerId", fp.get("stableId"))
                 if key_id is not None:
                     key = (cam, str(key_id))
                     prev = last_point.get(key)
-                    if prev is not None and ts > prev[0]:
-                        dt = (ts - prev[0]) / 1_000_000.0
+                    if prev is not None and ts > int(prev["ts"]):
+                        dt = (ts - int(prev["ts"])) / 1_000_000.0
                         if dt > 1e-3:
-                            speeds.append(math.hypot(x - prev[1], z - prev[2]) / dt)
-                    last_point[key] = (ts, x, z)
-                debug = fp.get("alignmentDebug")
+                            speed = math.hypot(x - float(prev["x"]), z - float(prev["z"])) / dt
+                            raw_speed = math.hypot(raw_x - float(prev["raw_x"]), raw_z - float(prev["raw_z"])) / dt
+                            speeds.append(speed)
+                            raw_speeds.append(raw_speed)
+                            transition = f"{prev.get('source', 'unknown')}->{src}"
+                            speed_by_source_transition.setdefault(transition, []).append(speed)
+                            raw_speed_by_source_transition.setdefault(transition, []).append(raw_speed)
+                            top_jumps.append(
+                                {
+                                    "camera": cam,
+                                    "track": str(key_id),
+                                    "dt_s": float(dt),
+                                    "speed_mps": float(speed),
+                                    "raw_speed_mps": float(raw_speed),
+                                    "from_source": str(prev.get("source", "unknown")),
+                                    "to_source": str(src),
+                                    "from_reason": prev.get("reason"),
+                                    "to_reason": selection_reason,
+                                    "from_ts": int(prev["ts"]),
+                                    "to_ts": int(ts),
+                                }
+                            )
+                    last_point[key] = {
+                        "ts": int(ts),
+                        "x": float(x),
+                        "z": float(z),
+                        "raw_x": float(raw_x),
+                        "raw_z": float(raw_z),
+                        "source": str(src),
+                        "reason": selection_reason,
+                    }
                 if not isinstance(debug, Mapping):
                     continue
                 chosen = debug.get("chosen")
                 if isinstance(chosen, Mapping) and chosen.get("insideBounds") is False:
                     chosen_out_of_bounds += 1
-                selection = debug.get("displaySelection")
                 if isinstance(selection, Mapping):
-                    reason = str(selection.get("reason") or selection.get("selected") or "unknown")
+                    reason = selection_reason or "unknown"
                     selected_reason_by_camera.setdefault(cam, collections.Counter())[reason] += 1
                 registered_depth = debug.get("registeredDepthAnchor")
                 if isinstance(registered_depth, Mapping):
@@ -453,6 +536,34 @@ def _summarize_message_window(messages: list[Mapping[str, Any]]) -> dict[str, An
             "p95": _percentile(speeds, 0.95),
             "max": max(speeds) if speeds else None,
         },
+        "raw_speed_mps": {
+            "count": len(raw_speeds),
+            "p50": _percentile(raw_speeds, 0.50),
+            "p95": _percentile(raw_speeds, 0.95),
+            "max": max(raw_speeds) if raw_speeds else None,
+        },
+        "speed_by_source_transition_mps": {
+            key: _stats(values) for key, values in sorted(speed_by_source_transition.items())
+        },
+        "raw_speed_by_source_transition_mps": {
+            key: _stats(values) for key, values in sorted(raw_speed_by_source_transition.items())
+        },
+        "trail_segment_speed_mps": {
+            "count": len(trail_segment_speeds),
+            "p50": _percentile(trail_segment_speeds, 0.50),
+            "p95": _percentile(trail_segment_speeds, 0.95),
+            "max": max(trail_segment_speeds) if trail_segment_speeds else None,
+        },
+        "top_trail_segments": sorted(
+            top_trail_segments,
+            key=lambda item: float(item.get("speed_mps") or 0.0),
+            reverse=True,
+        )[:12],
+        "top_jumps": sorted(
+            top_jumps,
+            key=lambda item: float(item.get("raw_speed_mps") or item.get("speed_mps") or 0.0),
+            reverse=True,
+        )[:12],
     }
 
 

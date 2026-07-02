@@ -269,6 +269,7 @@ class BevRenderer:
         self._smoothing_cfg = MotionSmoothingConfig.from_mapping(smoothing_cfg or {})
         self._smoother = MotionGatedAlphaBetaSmoother(self._smoothing_cfg)
         self._smoother_source_by_key: Dict[Hashable, str] = {}
+        self._floorplan_space_signature_by_camera: Dict[str, Tuple[Any, ...]] = {}
         self._alignment_debug_enabled = str(
             os.environ.get("NOESIS_BEV_ALIGNMENT_DEBUG", os.environ.get("NOESIS_BEV_DEBUG", "0"))
         ).strip().lower() in ("1", "true", "yes", "y", "on")
@@ -294,6 +295,46 @@ class BevRenderer:
                 self._trail_tracks_by_cam.clear()
                 self._trail_frame_counts.clear()
                 self._smoother_source_by_key.clear()
+
+    @staticmethod
+    def _floorplan_space_signature(
+        *,
+        bounds_source: str,
+        x_range: Tuple[float, float],
+        z_range: Tuple[float, float],
+        floorplan_space: Optional[FloorplanSpace],
+    ) -> Tuple[Any, ...]:
+        if floorplan_space is None:
+            return (
+                str(bounds_source or "auto"),
+                round(float(x_range[0]), 6),
+                round(float(x_range[1]), 6),
+                round(float(z_range[0]), 6),
+                round(float(z_range[1]), 6),
+                None,
+                None,
+                None,
+                None,
+            )
+        return (
+            str(bounds_source or floorplan_space.source or "active_floorplan"),
+            round(float(floorplan_space.x_range[0]), 6),
+            round(float(floorplan_space.x_range[1]), 6),
+            round(float(floorplan_space.z_range[0]), 6),
+            round(float(floorplan_space.z_range[1]), 6),
+            tuple(int(v) for v in floorplan_space.grid_shape) if floorplan_space.grid_shape else None,
+            str(floorplan_space.frame or ""),
+            int(floorplan_space.snapshot_ts_us) if floorplan_space.snapshot_ts_us is not None else None,
+            int(floorplan_space.floorplan_ts_us) if floorplan_space.floorplan_ts_us is not None else None,
+        )
+
+    def _reset_camera_motion_state_locked(self, camera_id: str) -> None:
+        self._trail_tracks_by_cam.pop(camera_id, None)
+        self._trail_frame_counts.pop(camera_id, None)
+        for key in list(self._smoother_source_by_key.keys()):
+            if isinstance(key, tuple) and key and key[0] == camera_id:
+                self._smoother.reset(key)
+                self._smoother_source_by_key.pop(key, None)
 
     @staticmethod
     def _normalize_frame_mode(value: Any) -> str:
@@ -1340,6 +1381,18 @@ class BevRenderer:
                 x_range, z_range = active_floorplan_space.x_range, active_floorplan_space.z_range
                 bounds_source = str(active_floorplan_space.source or "active_floorplan")
         floorplan_alignment = self._floorplan_alignment_matrix(active_floorplan_space)
+        if not use_world_frame:
+            space_signature = self._floorplan_space_signature(
+                bounds_source=bounds_source,
+                x_range=x_range,
+                z_range=z_range,
+                floorplan_space=active_floorplan_space,
+            )
+            with self._lock:
+                previous_signature = self._floorplan_space_signature_by_camera.get(camera_id)
+                if previous_signature is not None and previous_signature != space_signature:
+                    self._reset_camera_motion_state_locked(camera_id)
+                self._floorplan_space_signature_by_camera[camera_id] = space_signature
 
         # Determine canvas size in pixels based on extents and meters-per-pixel.
         # Respect max_px by scaling mpp upward if needed.
@@ -1466,6 +1519,42 @@ class BevRenderer:
                             "insideBounds": True,
                         }
 
+                world_candidate: Optional[Dict[str, Any]] = None
+                if (
+                    wx is not None
+                    and wz is not None
+                    and self._world_source_is_live_tracking(fp.anchor_source)
+                ):
+                    candidate_x, candidate_z = self._world_to_camera_local_ground(
+                        float(wx),
+                        float(calib.floor_y),
+                        float(wz),
+                        R_wc,
+                        C_world,
+                    )
+                    world_inside = self._point_in_metric_bounds(candidate_x, candidate_z, x_range, z_range)
+                    world_candidate = {
+                        "x": float(candidate_x),
+                        "z": float(candidate_z),
+                        "anchorSource": str(fp.anchor_source or ""),
+                        "insideBounds": bool(world_inside),
+                        "depthFused": bool(self._world_source_is_depth_fused(fp.anchor_source)),
+                    }
+                    if registered_depth_candidate is not None:
+                        world_candidate["deltaToRegisteredDepthM"] = float(
+                            math.hypot(
+                                float(candidate_x) - float(registered_depth_candidate["x"]),
+                                float(candidate_z) - float(registered_depth_candidate["z"]),
+                            )
+                        )
+                    if floor_contact_candidate is not None:
+                        world_candidate["deltaToFloorContactM"] = float(
+                            math.hypot(
+                                float(candidate_x) - float(floor_contact_candidate["x"]),
+                                float(candidate_z) - float(floor_contact_candidate["z"]),
+                            )
+                        )
+
                 registered_depth_usable = False
                 if (
                     registered_depth_candidate is not None
@@ -1526,42 +1615,13 @@ class BevRenderer:
                         "floorContactCandidate": floor_contact_candidate,
                     }
 
-                world_candidate: Optional[Dict[str, Any]] = None
                 if (
                     (px is None or pz is None)
-                    and wx is not None
-                    and wz is not None
-                    and self._world_source_is_live_tracking(fp.anchor_source)
+                    and world_candidate is not None
                 ):
-                    candidate_x, candidate_z = self._world_to_camera_local_ground(
-                        float(wx),
-                        float(calib.floor_y),
-                        float(wz),
-                        R_wc,
-                        C_world,
-                    )
-                    world_inside = self._point_in_metric_bounds(candidate_x, candidate_z, x_range, z_range)
-                    world_candidate = {
-                        "x": float(candidate_x),
-                        "z": float(candidate_z),
-                        "anchorSource": str(fp.anchor_source or ""),
-                        "insideBounds": bool(world_inside),
-                        "depthFused": bool(self._world_source_is_depth_fused(fp.anchor_source)),
-                    }
-                    if registered_depth_candidate is not None:
-                        world_candidate["deltaToRegisteredDepthM"] = float(
-                            math.hypot(
-                                float(candidate_x) - float(registered_depth_candidate["x"]),
-                                float(candidate_z) - float(registered_depth_candidate["z"]),
-                            )
-                        )
-                    if floor_contact_candidate is not None:
-                        world_candidate["deltaToFloorContactM"] = float(
-                            math.hypot(
-                                float(candidate_x) - float(floor_contact_candidate["x"]),
-                                float(candidate_z) - float(floor_contact_candidate["z"]),
-                            )
-                        )
+                    candidate_x = float(world_candidate["x"])
+                    candidate_z = float(world_candidate["z"])
+                    world_inside = bool(world_candidate.get("insideBounds", False))
 
                     if self._world_source_is_depth_fused(fp.anchor_source):
                         if world_inside:
@@ -1624,6 +1684,8 @@ class BevRenderer:
 
                 if selection_debug is not None and registered_depth_candidate is not None:
                     selection_debug.setdefault("registeredDepthCandidate", dict(registered_depth_candidate))
+                if selection_debug is not None and world_candidate is not None:
+                    selection_debug.setdefault("worldCandidate", dict(world_candidate))
 
                 if px is None or pz is None:
                     depth_local = None

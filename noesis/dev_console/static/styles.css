@@ -124,6 +124,11 @@ label,
   color: var(--green);
 }
 
+.status-pill.external {
+  border-color: rgba(90, 200, 240, 0.75);
+  color: var(--cyan);
+}
+
 .status-pill.stopped {
   border-color: rgba(240, 184, 90, 0.7);
   color: var(--amber);

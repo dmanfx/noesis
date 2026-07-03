@@ -491,13 +491,33 @@ function renderProfiles(items) {
   $("profileCount").textContent = `${state.profiles.length} saved`;
 }
 
+function externalDs8Runtimes() {
+  const diagnostics = state.diagnostics || {};
+  const runtimes = diagnostics.ds8_runtimes || (diagnostics.processes || []).filter((item) => item.looks_like_ds8);
+  return runtimes.filter((item) => !item.managed_by_console);
+}
+
+function updateRuntimePill() {
+  const runtime = state.runtime || {};
+  const running = Boolean(runtime.running);
+  const external = externalDs8Runtimes();
+  const pill = $("runtimePill");
+  if (running) {
+    pill.textContent = "Console: running";
+  } else if (external.length) {
+    pill.textContent = `External DS8: running (${external.length})`;
+  } else {
+    pill.textContent = "Console: stopped";
+  }
+  pill.classList.toggle("running", running);
+  pill.classList.toggle("external", !running && external.length > 0);
+  pill.classList.toggle("stopped", !running && external.length === 0);
+}
+
 function renderRuntime(runtime) {
   state.runtime = runtime || {};
   const running = Boolean(runtime?.running);
-  const pill = $("runtimePill");
-  pill.textContent = running ? "Runtime: running" : "Runtime: stopped";
-  pill.classList.toggle("running", running);
-  pill.classList.toggle("stopped", !running);
+  updateRuntimePill();
   $("pidLabel").textContent = runtime?.pid ? `pid ${runtime.pid}` : "pid -";
   $("stateMetric").textContent = running ? "running" : "stopped";
   $("uptimeMetric").textContent = running && runtime.uptime_s ? `${Math.round(runtime.uptime_s)}s` : "0s";
@@ -841,6 +861,7 @@ function renderLogInsights(payload) {
 
 function renderDiagnostics(payload) {
   state.diagnostics = payload;
+  updateRuntimePill();
   const grid = $("readinessGrid");
   grid.innerHTML = "";
   const ports = payload?.ports || [];
@@ -2224,6 +2245,7 @@ setupCommandCenter();
 bindEvents();
 init().catch((err) => toast(err.message));
 setInterval(() => refreshRuntime().catch(() => {}), 4000);
+setInterval(() => loadDiagnostics().catch(() => {}), 12000);
 setInterval(() => {
   if ($("wsPortInput")?.value === "6008") loadLiveHealth().catch(() => {});
 }, 10000);

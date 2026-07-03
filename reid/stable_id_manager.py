@@ -112,6 +112,11 @@ class StableIDManager:
         # SID allocator persistence (smarter restart)
         sid_pool_file: str = "~/.noesis/sid_pool.json",
         reset_sid_pool_on_start: bool = False,
+        # Long-term identity memory: persist gallery embeddings across restarts
+        # so people can be re-identified after long absences. Disabled when None.
+        gallery_persist_file: Optional[str] = None,
+        gallery_persist_max_age_s: float = 604800.0,
+        gallery_autosave_interval_s: float = 30.0,
         # External embedding support (e.g., DeepStream SGIE tensor outputs).
         # When disabled, embeddings are extracted internally from BGR crops.
         use_extractor: bool = True,
@@ -216,6 +221,13 @@ class StableIDManager:
         self.auto_merge_both_active_min_sim = float(auto_merge_both_active_min_sim)
         self.new_id_hysteresis_frames = int(new_id_hysteresis_frames)
         self.sid_pool_file = os.path.expanduser(str(sid_pool_file))
+        self.gallery_persist_file = (
+            os.path.expanduser(str(gallery_persist_file)) if gallery_persist_file else None
+        )
+        self.gallery_persist_max_age_s = float(gallery_persist_max_age_s)
+        self.gallery_autosave_interval_s = float(gallery_autosave_interval_s)
+        self._gallery_last_save_ts = 0.0
+        self._gallery_loaded_sids = 0
         self.pose_enabled = bool(pose_enabled)
         self.pose_weight = float(pose_weight)
         self.pose_sim_threshold = float(pose_sim_threshold)
@@ -339,6 +351,7 @@ class StableIDManager:
             self._free_sids = [sid for sid in self._free_sids if sid not in self.sid_alias_reserved]
             heapq.heapify(self._free_sids)
             self._free_sids_set = set(self._free_sids)
+        self._load_gallery()
         self._init_compute_backend()
 
     def _init_compute_backend(self) -> None:
@@ -394,12 +407,19 @@ class StableIDManager:
         return float(np.percentile(arr, q))
 
     def _similarity_for_candidates(self, emb: np.ndarray, candidates: List[int]) -> Dict[int, float]:
+        """Per-SID similarity as max over the EMA centroid and gallery exemplars.
+
+        Matching against stored exemplars (not just the recency-weighted
+        centroid) lets an identity be recalled from any previously seen
+        appearance (pose, lighting, partial view), which is what makes
+        long-absence re-identification work.
+        """
         sims: Dict[int, float] = {}
         if emb is None or len(candidates) < 1:
             return sims
         emb_vec = np.asarray(emb, dtype=np.float32).reshape(-1)
-        centroid_rows: List[np.ndarray] = []
-        sid_rows: List[int] = []
+        rows: List[np.ndarray] = []
+        row_sids: List[int] = []
         for sid in candidates:
             sid_int = int(sid)
             centroid = self.sid_centroid.get(sid_int)
@@ -412,17 +432,28 @@ class StableIDManager:
                         centroid = centroid / (np.linalg.norm(centroid) + 1e-12)
                         centroid = centroid.astype(np.float32)
                         self.sid_centroid[sid_int] = centroid
-            if centroid is None:
+            added = False
+            if centroid is not None:
+                c = np.asarray(centroid, dtype=np.float32).reshape(-1)
+                if c.shape[0] == emb_vec.shape[0]:
+                    rows.append(c)
+                    row_sids.append(sid_int)
+                    added = True
+            for _ts, v in self.gallery.get(sid_int, ()):  # exemplars
+                if v is None:
+                    continue
+                vv = np.asarray(v, dtype=np.float32).reshape(-1)
+                if vv.shape[0] != emb_vec.shape[0]:
+                    continue
+                rows.append(vv)
+                row_sids.append(sid_int)
+                added = True
+            if not added:
                 continue
-            c = np.asarray(centroid, dtype=np.float32).reshape(-1)
-            if c.shape[0] != emb_vec.shape[0]:
-                continue
-            centroid_rows.append(c)
-            sid_rows.append(sid_int)
-        if not sid_rows:
+        if not rows:
             return sims
 
-        use_gpu = bool(self._gpu_enabled and self._backend_mode == "gpu" and len(sid_rows) >= int(self.gpu_min_gallery))
+        use_gpu = bool(self._gpu_enabled and self._backend_mode == "gpu" and len(rows) >= int(self.gpu_min_gallery))
         if use_gpu:
             try:
                 torch = self._torch
@@ -430,21 +461,22 @@ class StableIDManager:
                     raise RuntimeError("torch_backend_uninitialized")
                 q = torch.as_tensor(emb_vec, dtype=torch.float32, device=self._torch_device)
                 q = q / (torch.norm(q) + 1e-12)
-                mat = torch.as_tensor(np.stack(centroid_rows, axis=0), dtype=torch.float32, device=self._torch_device)
+                mat = torch.as_tensor(np.stack(rows, axis=0), dtype=torch.float32, device=self._torch_device)
                 mat = mat / (torch.linalg.norm(mat, dim=1, keepdim=True) + 1e-12)
                 sim_vec = torch.matmul(mat, q)
                 sim_np = sim_vec.detach().cpu().numpy().astype(np.float32, copy=False)
-                for idx, sid_int in enumerate(sid_rows):
-                    sims[int(sid_int)] = float(sim_np[idx])
-                return sims
             except Exception as exc:
                 self._backend_last_error = f"gpu_similarity:{type(exc).__name__}"
                 raise RuntimeError(f"StableID GPU similarity failed: {type(exc).__name__}") from exc
+        else:
+            mat_np = np.stack(rows, axis=0).astype(np.float32, copy=False)
+            sim_np = np.matmul(mat_np, emb_vec.reshape(-1, 1)).reshape(-1)
 
-        mat_np = np.stack(centroid_rows, axis=0).astype(np.float32, copy=False)
-        sim_np = np.matmul(mat_np, emb_vec.reshape(-1, 1)).reshape(-1)
-        for idx, sid_int in enumerate(sid_rows):
-            sims[int(sid_int)] = float(sim_np[idx])
+        for idx, sid_int in enumerate(row_sids):
+            val = float(sim_np[idx])
+            prev = sims.get(int(sid_int))
+            if prev is None or val > prev:
+                sims[int(sid_int)] = val
         return sims
 
     # --------------- Allocator -----------------
@@ -636,6 +668,135 @@ class StableIDManager:
                 )
         except Exception:
             pass
+
+    # --------------- Long-term gallery persistence -----------------
+    def _load_gallery(self) -> None:
+        """Restore persisted identity gallery (long-term ReID memory)."""
+        path = self.gallery_persist_file
+        if not path or not os.path.exists(path):
+            return
+        try:
+            with np.load(path, allow_pickle=False) as data:
+                sids = [int(s) for s in np.asarray(data.get("sids", []), dtype=np.int64).reshape(-1)]
+                now = time.time()
+                loaded = 0
+                for sid in sids:
+                    if sid <= 0:
+                        continue
+                    emb_key = f"emb_{sid}"
+                    ts_key = f"ts_{sid}"
+                    if emb_key not in data or ts_key not in data:
+                        continue
+                    embs = np.asarray(data[emb_key], dtype=np.float32)
+                    tss = np.asarray(data[ts_key], dtype=np.float64).reshape(-1)
+                    if embs.ndim != 2 or embs.shape[0] != tss.shape[0] or embs.shape[0] < 1:
+                        continue
+                    last_seen = float(np.max(tss))
+                    if self.gallery_persist_max_age_s > 0.0 and (now - last_seen) > self.gallery_persist_max_age_s:
+                        continue
+                    dq = self.gallery[sid]
+                    for i in range(embs.shape[0]):
+                        vec = embs[i].reshape(-1)
+                        n = float(np.linalg.norm(vec) + 1e-12)
+                        dq.append((float(tss[i]), (vec / n).astype(np.float32)))
+                    cen_key = f"centroid_{sid}"
+                    if cen_key in data:
+                        cen = np.asarray(data[cen_key], dtype=np.float32).reshape(-1)
+                        n = float(np.linalg.norm(cen) + 1e-12)
+                        self.sid_centroid[sid] = (cen / n).astype(np.float32)
+                    else:
+                        self._recompute_sid_centroid(sid)
+                    fs_key = f"first_seen_{sid}"
+                    if fs_key in data:
+                        self.sid_global_first_seen[sid] = float(np.asarray(data[fs_key]).reshape(-1)[0])
+                    self.sid_global_last_seen[sid] = last_seen
+                    # Loaded SIDs must never be handed out by the allocator.
+                    if sid in self._free_sids_set:
+                        self._free_sids_set.discard(sid)
+                        self._free_sids = [s for s in self._free_sids if int(s) != sid]
+                        heapq.heapify(self._free_sids)
+                    if sid >= self.next_stable_id:
+                        self.next_stable_id = sid + 1
+                    loaded += 1
+                self._gallery_loaded_sids = int(loaded)
+        except Exception:
+            logger.warning("StableID gallery load failed (%s); starting with empty memory", path, exc_info=True)
+
+    def save_gallery(self) -> bool:
+        """Persist the identity gallery for long-term ReID memory. Thread-safe."""
+        path = self.gallery_persist_file
+        if not path:
+            return False
+        try:
+            with self._lock:
+                now = time.time()
+                arrays: Dict[str, np.ndarray] = {}
+                sids_out: List[int] = []
+                for sid in list(self.gallery.keys()):
+                    sid_int = int(sid)
+                    if sid_int <= 0:
+                        continue
+                    if self.aliases_enabled and self.canonical_sid(sid_int) != sid_int:
+                        continue
+                    entries = [(float(t), e) for (t, e) in self.gallery.get(sid_int, []) if e is not None]
+                    if not entries:
+                        continue
+                    last_seen = float(self.sid_global_last_seen.get(sid_int, entries[-1][0]))
+                    if self.gallery_persist_max_age_s > 0.0 and (now - last_seen) > self.gallery_persist_max_age_s:
+                        continue
+                    arrays[f"emb_{sid_int}"] = np.stack([e for (_t, e) in entries], axis=0).astype(np.float32)
+                    arrays[f"ts_{sid_int}"] = np.asarray([t for (t, _e) in entries], dtype=np.float64)
+                    cen = self.sid_centroid.get(sid_int)
+                    if cen is not None:
+                        arrays[f"centroid_{sid_int}"] = np.asarray(cen, dtype=np.float32)
+                    fs = self.sid_global_first_seen.get(sid_int)
+                    if fs is not None:
+                        arrays[f"first_seen_{sid_int}"] = np.asarray([float(fs)], dtype=np.float64)
+                    sids_out.append(sid_int)
+                arrays["sids"] = np.asarray(sids_out, dtype=np.int64)
+                arrays["saved_ts"] = np.asarray([now], dtype=np.float64)
+            dir_path = os.path.dirname(path)
+            if dir_path:
+                os.makedirs(dir_path, exist_ok=True)
+            tmp_path = f"{path}.tmp"
+            with open(tmp_path, "wb") as f:
+                np.savez_compressed(f, **arrays)
+            os.replace(tmp_path, path)
+            return True
+        except Exception:
+            logger.warning("StableID gallery save failed (%s)", path, exc_info=True)
+            return False
+
+    def _maybe_autosave_gallery(self, now_ts: float) -> None:
+        if not self.gallery_persist_file or self.gallery_autosave_interval_s <= 0.0:
+            return
+        if (float(now_ts) - float(self._gallery_last_save_ts)) < self.gallery_autosave_interval_s:
+            return
+        self._gallery_last_save_ts = float(now_ts)
+        self.save_gallery()
+
+    def _gallery_add(self, sid: int, ts: float, emb: np.ndarray) -> None:
+        """Add an embedding to a SID's gallery, preserving exemplar diversity.
+
+        When the gallery is full, replace the stored exemplar most similar to
+        the incoming embedding instead of evicting the oldest entry. This keeps
+        appearance variety (poses, lighting, partial views) for long-term
+        re-identification rather than only the most recent frames.
+        """
+        dq = self.gallery[int(sid)]
+        if dq.maxlen is None or len(dq) < dq.maxlen:
+            dq.append((float(ts), emb))
+            return
+        try:
+            entries = list(dq)
+            mat = np.stack([e for (_t, e) in entries], axis=0).astype(np.float32)
+            sims = mat @ np.asarray(emb, dtype=np.float32).reshape(-1)
+            idx = int(np.argmax(sims))
+            entries[idx] = (float(ts), emb)
+            dq.clear()
+            dq.extend(entries)
+        except Exception:
+            dq.append((float(ts), emb))
 
     def _load_aliases(self) -> None:
         if not self.aliases_enabled:
@@ -2761,7 +2922,7 @@ class StableIDManager:
                 self.active_zones[int(sid)].add((int(sensor_id), rec["zone"]))
                 if emb is not None:
                     sid_int = int(sid)
-                    self.gallery[sid_int].append((float(ts), emb))
+                    self._gallery_add(sid_int, float(ts), emb)
                     if sid_int not in self.sid_global_first_seen:
                         self.sid_global_first_seen[sid_int] = float(ts)
                     # Initialize EMA centroid with first embedding
@@ -2912,7 +3073,7 @@ class StableIDManager:
                 rec["last_emb_ts"] = float(ts)
                 rec["identity_quality"] = "strong"
                 sid_int = int(rec["stable_id"]) 
-                self.gallery[sid_int].append((float(ts), emb))
+                self._gallery_add(sid_int, float(ts), emb)
                 if sid_int not in self.sid_global_first_seen:
                     self.sid_global_first_seen[sid_int] = float(ts)
                 # EMA centroid update
@@ -3038,6 +3199,7 @@ class StableIDManager:
                 self.sid_global_last_seen[int(rec["stable_id"])] = float(ts)
             except Exception:
                 pass
+            self._maybe_autosave_gallery(float(ts))
             if self.aliases_enabled:
                 return int(self.canonical_sid(int(rec["stable_id"])))
             return int(rec["stable_id"])

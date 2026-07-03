@@ -2270,9 +2270,48 @@ def _build_stable_id_manager(logger: logging.Logger, *, pipeline_config: Optiona
         total_id_reuse_env = os.environ.get("NOESIS_REID_TOTAL_ID_REUSE", "1")
         total_id_reuse = str(total_id_reuse_env).strip().lower() in ("1", "true", "yes", "on")
         try:
-            total_id_reuse_min_age_s = float(os.environ.get("NOESIS_REID_TOTAL_ID_REUSE_MIN_AGE_S", "60") or 60.0)
+            # Keep inactive identities eligible for recall for a long time before
+            # their SID can be recycled (long-term ReID memory).
+            total_id_reuse_min_age_s = float(os.environ.get("NOESIS_REID_TOTAL_ID_REUSE_MIN_AGE_S", "900") or 900.0)
         except Exception:
-            total_id_reuse_min_age_s = 60.0
+            total_id_reuse_min_age_s = 900.0
+        try:
+            cos_sim_threshold = float(os.environ.get("NOESIS_REID_COS_SIM_THRESHOLD", "0.62") or 0.62)
+        except Exception:
+            cos_sim_threshold = 0.62
+        try:
+            cos_sim_high_threshold = float(os.environ.get("NOESIS_REID_COS_SIM_HIGH_THRESHOLD", "0.70") or 0.70)
+        except Exception:
+            cos_sim_high_threshold = 0.70
+        try:
+            xcam_handoff_window_s = float(os.environ.get("NOESIS_REID_XCAM_WINDOW_S", "12") or 12.0)
+        except Exception:
+            xcam_handoff_window_s = 12.0
+        try:
+            xcam_handoff_margin = float(os.environ.get("NOESIS_REID_XCAM_MARGIN", "0.06") or 0.06)
+        except Exception:
+            xcam_handoff_margin = 0.06
+        try:
+            ghost_max_age_s = float(os.environ.get("NOESIS_REID_GHOST_MAX_AGE_S", "120") or 120.0)
+        except Exception:
+            ghost_max_age_s = 120.0
+        try:
+            gallery_size = int(os.environ.get("NOESIS_REID_GALLERY_SIZE", "40") or 40)
+        except Exception:
+            gallery_size = 40
+        gallery_persist_env = os.environ.get("NOESIS_REID_GALLERY_PERSIST", "1")
+        gallery_persist_enabled = str(gallery_persist_env).strip().lower() in ("1", "true", "yes", "on")
+        gallery_persist_file = (
+            os.environ.get("NOESIS_REID_GALLERY_FILE", "~/.noesis/reid_gallery.npz") if gallery_persist_enabled else None
+        )
+        try:
+            gallery_persist_max_age_s = float(os.environ.get("NOESIS_REID_GALLERY_MAX_AGE_S", "604800") or 604800.0)
+        except Exception:
+            gallery_persist_max_age_s = 604800.0
+        try:
+            gallery_autosave_interval_s = float(os.environ.get("NOESIS_REID_GALLERY_AUTOSAVE_S", "30") or 30.0)
+        except Exception:
+            gallery_autosave_interval_s = 30.0
         auto_merge_enabled_env = os.environ.get("NOESIS_REID_AUTO_MERGE_ENABLED", "1")
         auto_merge_enabled = str(auto_merge_enabled_env).strip().lower() in ("1", "true", "yes", "on")
         try:
@@ -2350,6 +2389,15 @@ def _build_stable_id_manager(logger: logging.Logger, *, pipeline_config: Optiona
             "max_total_ids": max_total_ids,
             "total_id_reuse": total_id_reuse,
             "total_id_reuse_min_age_s": total_id_reuse_min_age_s,
+            "cos_sim_threshold": cos_sim_threshold,
+            "cos_sim_high_threshold": cos_sim_high_threshold,
+            "xcam_handoff_window_s": xcam_handoff_window_s,
+            "xcam_handoff_margin": xcam_handoff_margin,
+            "max_ghost_age_s": ghost_max_age_s,
+            "gallery_size": gallery_size,
+            "gallery_persist_file": gallery_persist_file,
+            "gallery_persist_max_age_s": gallery_persist_max_age_s,
+            "gallery_autosave_interval_s": gallery_autosave_interval_s,
             "reset_sid_pool_on_start": reset_sid_pool,
             "aliases_enabled": aliases_enabled,
             "alias_file": alias_file,
@@ -5874,6 +5922,15 @@ def main() -> int:
         pipeline.mark_depth_enabled(False)
     except Exception:
         pass
+
+    # Persist long-term ReID identity gallery before teardown.
+    try:
+        mgr = getattr(pipeline, "stable_id_mgr", None)
+        if mgr is not None and getattr(mgr, "gallery_persist_file", None):
+            if mgr.save_gallery():
+                logger.info("StableID gallery persisted to %s", mgr.gallery_persist_file)
+    except Exception:
+        logger.exception("Error persisting StableID gallery")
 
     try:
         storage_manager.flush(timeout=5.0)

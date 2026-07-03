@@ -1,0 +1,470 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Noesis DS8 Console</title>
+    <link rel="icon" href="data:," />
+    <link rel="stylesheet" href="/static/styles.css" />
+  </head>
+  <body>
+    <main class="shell">
+      <header class="topbar">
+        <div class="brand">
+          <div class="mark" aria-hidden="true"></div>
+          <div>
+            <h1>Noesis DS8 Console</h1>
+            <p id="repoRoot">Loading workspace...</p>
+          </div>
+        </div>
+        <div class="runtime-strip">
+          <div class="status-pill" id="runtimePill">Runtime: unknown</div>
+          <button class="button subtle" id="refreshButton" title="Refresh console state">Refresh</button>
+        </div>
+      </header>
+
+      <section class="command-center" aria-label="Command Center">
+        <div class="command-bar">
+          <strong>Command Center</strong>
+          <input id="commandFilter" class="command-filter" placeholder="Jump to panel" />
+        </div>
+        <div id="commandRail" class="command-rail"></div>
+      </section>
+
+      <section class="workspace">
+        <aside class="launch-panel">
+          <div class="panel-head">
+            <h2>Launch</h2>
+            <span id="launchIdLabel">draft</span>
+          </div>
+          <label>
+            Preset
+            <select id="presetSelect"></select>
+          </label>
+          <div class="two-col">
+            <label>
+              PGIE
+              <select id="profileSelect">
+                <option value="yolo11_seg">yolo11_seg</option>
+                <option value="yolo11">yolo11</option>
+                <option value="yolo26_seg">yolo26_seg</option>
+                <option value="yolo26">yolo26</option>
+                <option value="rfdetr_seg">rfdetr_seg</option>
+                <option value="rfdetr">rfdetr</option>
+                <option value="wholebody49">wholebody49</option>
+              </select>
+            </label>
+            <label>
+              Size
+              <select id="sizeSelect">
+                <option value="">auto</option>
+                <option value="n">n</option>
+                <option value="s">s</option>
+                <option value="m">m</option>
+                <option value="l">l</option>
+                <option value="x">x</option>
+              </select>
+            </label>
+          </div>
+          <div class="two-col">
+            <label>
+              Tracking
+              <select id="trackingSelect">
+                <option value="baseline">baseline</option>
+                <option value="v3dt">v3dt</option>
+              </select>
+            </label>
+            <label>
+              Log Level
+              <select id="logLevelSelect">
+                <option>WARNING</option>
+                <option>INFO</option>
+                <option>DEBUG</option>
+                <option>ERROR</option>
+              </select>
+            </label>
+          </div>
+          <label>
+            Pipeline YAML
+            <input id="pipelineInput" value="config/infer.yaml" />
+          </label>
+          <label>
+            Cameras YAML
+            <input id="camerasInput" value="config/cameras.yaml" />
+          </label>
+          <div class="two-col">
+            <label>
+              WS Port
+              <input id="wsPortInput" type="number" value="6008" />
+            </label>
+            <label>
+              REST Port
+              <input id="restPortInput" type="number" value="8080" />
+            </label>
+          </div>
+          <label>
+            RTSP Port
+            <input id="rtspPortInput" type="number" value="8554" />
+          </label>
+          <label>
+            Depth Gate Seconds
+            <input id="depthSecondsInput" type="number" min="0" max="300" value="0" />
+          </label>
+          <button class="button subtle wide" id="freePortsButton" title="Fill WS/REST/RTSP fields with currently free local ports">Find Free Ports</button>
+          <label class="check-line">
+            <input id="strictInput" type="checkbox" />
+            Strict baseline depth anchors
+          </label>
+          <label>
+            Env Overlay
+            <textarea id="envInput" spellcheck="false" placeholder="NOESIS_MOSAIC_WEBRTC_ENABLED=1"></textarea>
+          </label>
+          <div class="profile-box">
+            <div class="mini-head">
+              <strong>Profiles</strong>
+              <span id="profileCount">0 saved</span>
+            </div>
+            <label>
+              Saved
+              <select id="savedProfileSelect"></select>
+            </label>
+            <label>
+              Name
+              <input id="profileNameInput" placeholder="YOLO26 free ports" />
+            </label>
+            <label>
+              Note
+              <input id="profileNoteInput" placeholder="optional" />
+            </label>
+            <div class="button-row">
+              <button class="button subtle" id="saveProfileButton">Save</button>
+              <button class="button subtle" id="applyProfileButton">Apply</button>
+            </div>
+            <button class="button subtle wide" id="deleteProfileButton">Remove Profile</button>
+          </div>
+          <div class="button-row">
+            <button class="button primary" id="previewButton">Preview</button>
+            <button class="button" id="validateButton">Validate</button>
+          </div>
+          <div class="button-row">
+            <button class="button success" id="startButton">Start</button>
+            <button class="button" id="restartButton">Restart</button>
+            <button class="button danger" id="stopButton">Stop</button>
+          </div>
+          <div class="action-board" id="actionBoard" data-status="idle">
+            <div class="action-board-head">
+              <span>Action Board</span>
+              <strong id="actionBoardStatus">pending</strong>
+            </div>
+            <div class="action-meter" aria-hidden="true">
+              <span id="actionBoardMeter"></span>
+            </div>
+            <div class="action-board-copy">
+              <strong id="actionBoardTitle">Launch evidence pending</strong>
+              <p id="actionBoardCopy">No launch decision has been evaluated.</p>
+            </div>
+            <div id="actionBoardEvidence" class="action-evidence"></div>
+            <div id="actionBoardActions" class="action-jumps"></div>
+          </div>
+        </aside>
+
+        <section class="main-grid">
+          <section class="hero-panel">
+            <div>
+              <p class="eyebrow">Operator Surface</p>
+              <h2 id="heroTitle">Pipeline ready for inspection</h2>
+              <p id="heroCopy">Choose a preset, validate the launch, then start DS8 from an isolated console artifact.</p>
+            </div>
+            <div class="quick-actions">
+              <button class="button subtle" id="depthButton">Depth Burst</button>
+              <button class="button subtle" id="runtimeHealthButton">Runtime Health</button>
+              <button class="button subtle" id="logsButton">Tail Logs</button>
+            </div>
+          </section>
+
+          <section class="panel decision-panel">
+            <div class="panel-head">
+              <h2>Launch Decision</h2>
+              <span id="decisionSummary">not evaluated</span>
+            </div>
+            <div class="decision-layout">
+              <div class="decision-score" data-status="unknown">
+                <strong id="decisionScore">--</strong>
+                <span id="decisionStatus">unknown</span>
+              </div>
+              <div class="decision-body">
+                <div id="decisionPrimary" class="decision-primary">
+                  <strong>No decision yet</strong>
+                  <p>Evaluate the current launch selection to see the go/no-go verdict.</p>
+                </div>
+                <div id="decisionComponents" class="decision-components"></div>
+                <div id="decisionActions" class="decision-actions"></div>
+              </div>
+              <div class="decision-tools">
+                <button class="button primary" id="decisionButton">Evaluate Launch</button>
+                <button class="button subtle" id="decisionValidateButton">Evaluate + Validate</button>
+              </div>
+            </div>
+          </section>
+
+          <section class="panel candidates-panel">
+            <div class="panel-head">
+              <h2>Launch Candidates</h2>
+              <span id="candidateSummary">not compared</span>
+            </div>
+            <div class="candidate-toolbar">
+              <button class="button subtle" id="candidateButton">Compare Candidates</button>
+            </div>
+            <div id="candidateDeck" class="candidate-deck"></div>
+          </section>
+
+          <section class="panel gate-panel">
+            <div class="panel-head">
+              <h2>Gate Deck</h2>
+              <span id="gateSummary">not loaded</span>
+            </div>
+            <div class="gate-toolbar">
+              <button class="button subtle" id="gateButton">Refresh Gates</button>
+              <button class="button primary" id="gateApplyButton">Apply Gates</button>
+              <button class="button subtle" id="gateValidateButton">Apply + Validate</button>
+            </div>
+            <div id="gateDeck" class="gate-deck"></div>
+          </section>
+
+          <section class="split">
+            <div class="panel">
+              <div class="panel-head">
+                <h2>Preflight</h2>
+                <span id="preflightCounts">0 / 0 / 0</span>
+              </div>
+              <div id="validationList" class="validation-list"></div>
+            </div>
+            <div class="panel">
+              <div class="panel-head">
+                <h2>Runtime</h2>
+                <span id="pidLabel">pid -</span>
+              </div>
+              <div class="metric-grid">
+                <div><span>State</span><strong id="stateMetric">unknown</strong></div>
+                <div><span>Uptime</span><strong id="uptimeMetric">0s</strong></div>
+                <div><span>Launch</span><strong id="launchMetric">none</strong></div>
+                <div><span>Knobs</span><strong id="knobMetric">0</strong></div>
+              </div>
+            </div>
+          </section>
+
+          <section class="panel">
+            <div class="panel-head">
+              <h2>Runbook</h2>
+              <span id="runbookSummary">not evaluated</span>
+            </div>
+            <div id="runbookList" class="runbook-list"></div>
+          </section>
+
+          <section class="panel">
+            <div class="panel-head">
+              <h2>Launch Plan</h2>
+              <span id="planSummary">not materialized</span>
+            </div>
+            <div class="plan-layout">
+              <div id="planOverview" class="plan-overview"></div>
+              <div class="plan-side">
+                <button class="button subtle" id="planButton">Refresh Plan</button>
+                <div id="planGates" class="plan-gates"></div>
+              </div>
+            </div>
+            <div id="planChanges" class="plan-changes"></div>
+          </section>
+
+          <section class="panel">
+            <div class="panel-head">
+              <h2>Launch Diff</h2>
+              <span id="diffSummary">not compared</span>
+            </div>
+            <div class="diff-toolbar">
+              <button class="button subtle" id="diffButton">Refresh Diff</button>
+              <label class="check-line diff-filter">
+                <input id="diffHighOnly" type="checkbox" checked />
+                High impact
+              </label>
+            </div>
+            <div id="diffStats" class="diff-stats"></div>
+            <div id="diffLaunchFields" class="diff-launch-fields"></div>
+            <div id="launchDiff" class="launch-diff"></div>
+          </section>
+
+          <section class="panel">
+            <div class="panel-head">
+              <h2>Model Matrix</h2>
+              <span id="matrixSummary">not scanned</span>
+            </div>
+            <div class="matrix-toolbar">
+              <button class="button subtle" id="matrixButton">Refresh Matrix</button>
+              <label class="check-line matrix-filter">
+                <input id="matrixReadyOnly" type="checkbox" />
+                Ready only
+              </label>
+            </div>
+            <div id="modelMatrix" class="model-matrix"></div>
+          </section>
+
+          <section class="panel">
+            <div class="panel-head">
+              <h2>Sources</h2>
+              <span id="sourceSummary">not scanned</span>
+            </div>
+            <div class="source-toolbar">
+              <button class="button subtle" id="sourceButton">Refresh Sources</button>
+              <label class="check-line source-probe-toggle">
+                <input id="sourceProbeInput" type="checkbox" checked />
+                Probe RTSP TCP
+              </label>
+            </div>
+            <div id="sourceAlignment" class="source-alignment"></div>
+            <div id="sourceGrid" class="source-grid"></div>
+          </section>
+
+          <section class="panel flow-panel">
+            <div class="panel-head">
+              <h2>Pipeline Flow</h2>
+              <span id="flowHighlight">-</span>
+            </div>
+            <div id="flowMap" class="flow-map"></div>
+          </section>
+
+          <section class="split tall">
+            <div class="panel">
+              <div class="panel-head">
+                <h2>Readiness</h2>
+                <span id="readinessSummary">pending</span>
+              </div>
+              <div id="readinessGrid" class="readiness-grid"></div>
+            </div>
+            <div class="panel">
+              <div class="panel-head">
+                <h2>Inspector</h2>
+                <span id="inspectorKind">select a node</span>
+              </div>
+              <div id="nodeInspector" class="node-inspector">
+                <strong>No stage selected</strong>
+                <p>Click any pipeline block to inspect its DS8 role, status, and referenced artifacts.</p>
+              </div>
+            </div>
+          </section>
+
+          <section class="panel">
+            <div class="panel-head">
+              <h2>Observed Processes</h2>
+              <span id="processSummary">not scanned</span>
+            </div>
+            <div id="processList" class="process-list"></div>
+          </section>
+
+          <section class="panel">
+            <div class="panel-head">
+              <h2>Live Runtime</h2>
+              <span id="liveSummary">not probed</span>
+            </div>
+            <div class="live-grid">
+              <div id="liveStats" class="live-stats">
+                <strong>No live sample yet</strong>
+                <p>Probe the runtime WebSocket to read DS8 stats and safe control state.</p>
+              </div>
+              <div class="live-actions">
+                <button class="button subtle" id="probeLiveButton">Probe WS</button>
+                <button class="button subtle" id="pingLiveButton">Ping</button>
+                <button class="button subtle" id="clearStatsButton">Clear Stats</button>
+                <button class="button subtle" id="toggleTrailsButton">Toggle Trails</button>
+                <button class="button subtle" id="bundleButton">Save Bundle</button>
+              </div>
+            </div>
+            <div id="bundleResult" class="bundle-result"></div>
+          </section>
+
+          <section class="panel">
+            <div class="panel-head">
+              <h2>Bundle Library</h2>
+              <span id="bundleLibrarySummary">not loaded</span>
+            </div>
+            <div class="bundle-library-layout">
+              <div>
+                <div class="bundle-library-tools">
+                  <button class="button subtle" id="bundleLibraryButton">Refresh Bundles</button>
+                  <span id="bundleLibraryRoot">diagnostics/dev_console/bundles</span>
+                </div>
+                <div id="bundleLibraryList" class="bundle-library-list"></div>
+              </div>
+              <div id="bundleDetail" class="bundle-detail">
+                <strong>No bundle selected</strong>
+                <p>Select a support bundle to inspect its validation, process, live, and artifact snapshot.</p>
+              </div>
+            </div>
+          </section>
+
+          <section class="panel">
+            <div class="panel-head">
+              <h2>Live Health</h2>
+              <span id="healthSummary">not sampled</span>
+            </div>
+            <div class="health-layout">
+              <div class="health-score">
+                <strong id="healthScore">--</strong>
+                <span id="healthStatus">unknown</span>
+              </div>
+              <div id="healthIndicators" class="health-indicators"></div>
+            </div>
+            <div id="cameraList" class="camera-list"></div>
+            <div id="healthHistory" class="health-history"></div>
+          </section>
+
+          <section class="panel">
+            <div class="panel-head">
+              <h2>Activity</h2>
+              <span id="activitySummary">not loaded</span>
+            </div>
+            <div class="activity-tools">
+              <button class="button subtle" id="activityRefreshButton">Refresh Activity</button>
+              <span id="activityPath">generated audit log</span>
+            </div>
+            <div id="activityList" class="activity-list">
+              <div class="activity-item info">
+                <strong>No activity loaded</strong>
+                <p>Operator actions appear here after the console records them.</p>
+              </div>
+            </div>
+          </section>
+
+          <section class="split tall">
+            <div class="panel">
+              <div class="panel-head">
+                <h2>Knobs</h2>
+                <input id="knobFilter" class="filter" placeholder="Filter NOESIS_*" />
+              </div>
+              <div id="knobTable" class="knob-table"></div>
+            </div>
+            <div class="panel">
+              <div class="panel-head">
+                <h2>Log Intelligence</h2>
+                <span id="logInsightSummary">not analyzed</span>
+              </div>
+              <div class="log-tools">
+                <button class="button subtle" id="logInsightButton">Analyze Logs</button>
+                <button class="button subtle" id="logTailButton">Tail Logs</button>
+              </div>
+              <div id="logInsightCards" class="log-insight-cards"></div>
+              <div id="logRecommendations" class="log-recommendations"></div>
+              <div id="logEvents" class="log-events"></div>
+              <div class="panel-head log-tail-head">
+                <h2>Raw Tail</h2>
+                <span id="logPath">runtime.log</span>
+              </div>
+              <pre id="logOutput" class="log-output">No console runtime logs yet.</pre>
+            </div>
+          </section>
+        </section>
+      </section>
+    </main>
+    <div id="toast" class="toast" role="status" aria-live="polite"></div>
+    <script src="/static/app.js"></script>
+  </body>
+</html>

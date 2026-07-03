@@ -66,8 +66,8 @@ preprocess:
 
 models:
   pgie:
-    config-file-path: pipelines/config_infer_primary_yolo11_seg.ini
-    engine: /home/mayor/Noesis_Devel/models/engines/yolo11s-seg_cust_fused.engine
+    config-file-path: pipelines/config_infer_primary_yolo11.ini
+    engine: models/engines/yolo11m_b3_fp16.engine
     batch_size: 3
     gie_id: 1
     network_mode: fp16

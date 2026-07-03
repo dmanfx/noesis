@@ -107,10 +107,12 @@ except Exception:
 
 
 _PGIE_PROFILES = ("yolo11_seg", "yolo11", "yolo26_seg", "yolo26", "rfdetr_seg", "rfdetr", "wholebody49")
-_SIZED_PGIE_PROFILES = ("yolo26_seg", "yolo26", "rfdetr_seg", "rfdetr", "wholebody49")
+_SIZED_PGIE_PROFILES = ("yolo11_seg", "yolo11", "yolo26_seg", "yolo26", "rfdetr_seg", "rfdetr", "wholebody49")
+_YOLO11_SIZES = ("s", "m", "l")
 _YOLO26_DETECT_SIZES = ("n", "s", "m", "l", "x")
 _YOLO26_SEG_SIZES = ("n", "s", "m")
 _RFDETR_SIZES = ("n", "s", "m")
+_YOLO11_SIZE_HELP = "/".join(_YOLO11_SIZES)
 _YOLO26_DETECT_SIZE_HELP = "/".join(_YOLO26_DETECT_SIZES)
 _YOLO26_SEG_SIZE_HELP = "/".join(_YOLO26_SEG_SIZES)
 _RFDETR_SIZE_HELP = "/".join(_RFDETR_SIZES)
@@ -118,6 +120,7 @@ _WHOLEBODY49_SIZE_HELP = "/".join(_WHOLEBODY49_SIZES)
 _ENV_TRUE = ("1", "true", "yes", "y", "on")
 _TRACKING_MODES = ("baseline", "v3dt")
 _RFDETR_TRT_PLUGIN_LOADED = False
+_YOLO11_SEG_TRT_PLUGIN_LOADED = False
 
 
 def _deep_merge_dict(base: Any, overlay: Any) -> Any:
@@ -492,9 +495,11 @@ def _family_artifact_summary(*patterns: str, limit: int = 8) -> str:
 def _resolve_yolo_detect_assets(profile: str, size: Optional[str]) -> Dict[str, Any]:
     profile_norm = str(profile or "").strip().lower()
     if profile_norm == "yolo11":
-        label = "YOLO11"
+        size_norm = str(size or "m").strip().lower()
+        if size_norm not in _YOLO11_SIZES:
+            raise SystemExit(f"[FATAL] YOLO11 detection size must be one of {_YOLO11_SIZE_HELP} (got: {size})")
+        label = f"YOLO11 {size_norm}"
         family_prefix = "yolo11"
-        size_norm = ""
         tensor_name = "input"
     elif profile_norm == "yolo26":
         size_norm = str(size or "").strip().lower()
@@ -507,7 +512,18 @@ def _resolve_yolo_detect_assets(profile: str, size: Optional[str]) -> Dict[str, 
         raise SystemExit(f"[FATAL] Unsupported YOLO detection profile: {profile}")
 
     excluded = ("seg", "pose")
-    if profile_norm == "yolo26":
+    if profile_norm == "yolo11":
+        onnx_path = (REPO_ROOT / "models" / f"yolo11{size_norm}.onnx").resolve()
+        engine_path = (REPO_ROOT / "models" / "engines" / f"yolo11{size_norm}_b3_fp16.engine").resolve()
+        missing = [str(path) for path in (onnx_path, engine_path) if not path.exists()]
+        if missing:
+            observed = _family_artifact_summary("yolo11*")
+            raise SystemExit(
+                f"[FATAL] YOLO11 {size_norm} detection requires a canonical YOLO11 ONNX/engine pair.\n"
+                f"Missing:\n  - " + "\n  - ".join(missing) + "\n"
+                f"Current YOLO11 artifacts:\n{observed}"
+            )
+    elif profile_norm == "yolo26":
         onnx_path = (REPO_ROOT / "models" / f"yolo26{size_norm}_dynamic_b1-3.onnx").resolve()
         engine_path = (REPO_ROOT / "models" / "engines" / f"yolo26{size_norm}_dynamic_b1-3_fp16.engine").resolve()
         missing = [str(path) for path in (onnx_path, engine_path) if not path.exists()]
@@ -540,6 +556,7 @@ def _resolve_yolo_detect_assets(profile: str, size: Optional[str]) -> Dict[str, 
         "tensor_name": tensor_name,
         "onnx": onnx_path,
         "engine": engine_path,
+        "labels": (REPO_ROOT / "models" / "coco_labels.txt").resolve(),
         "output": (REPO_ROOT / "build" / f"config_infer_primary_{profile_norm}{size_suffix}.ini").resolve(),
     }
 
@@ -605,8 +622,19 @@ def _materialize_yolo_detect_pgie_ini(
         text,
         count=1,
     )
-    if onnx_count != 1 or engine_count != 1:
-        raise SystemExit(f"[FATAL] YOLO detection PGIE template is missing onnx-file/model-engine-file: {template_path}")
+    labels_path = Path(assets["labels"])
+    if not labels_path.exists():
+        raise SystemExit(f"[FATAL] YOLO detection labels file missing: {labels_path}")
+    text, labels_count = re.subn(
+        r"(?m)^labelfile-path=.*$",
+        f"labelfile-path={labels_path}",
+        text,
+        count=1,
+    )
+    if onnx_count != 1 or engine_count != 1 or labels_count != 1:
+        raise SystemExit(
+            f"[FATAL] YOLO detection PGIE template is missing onnx-file/model-engine-file/labelfile-path: {template_path}"
+        )
 
     if str(profile).strip().lower() == "yolo26":
         try:
@@ -636,6 +664,65 @@ def _materialize_yolo_detect_pgie_ini(
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_text(text, encoding="utf-8")
     logger.info("%s detector PGIE config materialized: %s", assets["label"], out_path)
+    preproc_path = _materialize_yolo_detect_preproc_ini(assets, logger, src_ids=src_ids)
+    return {**assets, "pgie_config": out_path, "preprocess_config": preproc_path}
+
+
+def _resolve_yolo11_seg_assets(size: str) -> Dict[str, Any]:
+    size_norm = str(size or "").strip().lower()
+    if size_norm not in _YOLO11_SIZES:
+        raise SystemExit(f"[FATAL] YOLO11 segmentation size must be one of {_YOLO11_SIZE_HELP} (got: {size})")
+
+    if size_norm == "s":
+        onnx_name = "yolo11s-seg_cust_fused.onnx"
+        engine_name = "yolo11s-seg_cust_fused.engine"
+    else:
+        onnx_name = f"yolo11{size_norm}-seg_cust.onnx"
+        engine_name = f"yolo11{size_norm}-seg_cust.engine"
+
+    return {
+        "label": f"YOLO11-seg {size_norm}",
+        "size": size_norm,
+        "template": (REPO_ROOT / "pipelines" / "config_infer_primary_yolo11_seg.ini").resolve(),
+        "preprocess_template": (REPO_ROOT / "pipelines" / "config_preproc.ini").resolve(),
+        "preprocess_output": (REPO_ROOT / "build" / f"config_preproc_yolo11_seg_{size_norm}.ini").resolve(),
+        "tensor_name": "images",
+        "onnx": (REPO_ROOT / "models" / onnx_name).resolve(),
+        "engine": (REPO_ROOT / "models" / "engines" / engine_name).resolve(),
+        "labels": (REPO_ROOT / "models" / "coco_labels.txt").resolve(),
+        "parser_lib": (REPO_ROOT / "pipelines" / "nvdsinfer_yolo11_seg" / "libnvdsinfer_yolo11_seg.so").resolve(),
+        "output": (REPO_ROOT / "build" / f"config_infer_primary_yolo11_seg_{size_norm}.ini").resolve(),
+    }
+
+
+def _materialize_yolo11_seg_pgie_ini(
+    size: str,
+    logger: logging.Logger,
+    *,
+    src_ids: Optional[Tuple[int, ...]] = None,
+) -> Dict[str, Any]:
+    assets = _resolve_yolo11_seg_assets(size)
+    for key in ("template", "onnx", "engine", "labels", "parser_lib"):
+        path = Path(assets[key])
+        if not path.exists():
+            raise SystemExit(f"[FATAL] {assets['label']} required asset missing: {path}")
+
+    text = Path(assets["template"]).read_text(encoding="utf-8")
+    replacements = {
+        "onnx-file": str(assets["onnx"]),
+        "model-engine-file": str(assets["engine"]),
+        "labelfile-path": str(assets["labels"]),
+        "custom-lib-path": str(assets["parser_lib"]),
+    }
+    for key, value in replacements.items():
+        text, count = re.subn(rf"(?m)^{re.escape(key)}=.*$", f"{key}={value}", text, count=1)
+        if count != 1:
+            raise SystemExit(f"[FATAL] YOLO11-seg PGIE template is missing {key}: {assets['template']}")
+
+    out_path = Path(assets["output"])
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text(text, encoding="utf-8")
+    logger.info("%s PGIE config materialized: %s", assets["label"], out_path)
     preproc_path = _materialize_yolo_detect_preproc_ini(assets, logger, src_ids=src_ids)
     return {**assets, "pgie_config": out_path, "preprocess_config": preproc_path}
 
@@ -810,8 +897,61 @@ def _load_rfdetr_trt_plugin_library(yaml_path: Path, logger: logging.Logger) -> 
     logger.info("RF-DETR TensorRT plugin library loaded: %s", lib_path)
 
 
+def _yolo11_seg_onnx_requires_trt_plugin(onnx_path: Path) -> bool:
+    try:
+        data = onnx_path.read_bytes()
+    except Exception:
+        return False
+    return b"EfficientNMSX_TRT" in data or b"ROIAlignX_TRT" in data
+
+
+def _load_yolo11_seg_trt_plugin_library(yaml_path: Path, logger: logging.Logger) -> None:
+    global _YOLO11_SEG_TRT_PLUGIN_LOADED
+    if _YOLO11_SEG_TRT_PLUGIN_LOADED:
+        return
+
+    env_path = str(os.environ.get("NOESIS_YOLO11_SEG_TRT_PLUGIN_LIB", "") or "").strip()
+    if env_path:
+        lib_path = _resolve_pipeline_cfg_path(yaml_path, env_path)
+    else:
+        lib_path = (
+            REPO_ROOT
+            / "external"
+            / "DeepStream-Yolo-Seg"
+            / "nvdsinfer_custom_impl_Yolo_seg"
+            / "libnvdsinfer_custom_impl_Yolo_seg.so"
+        ).resolve()
+
+    if not lib_path.exists():
+        raise SystemExit(
+            "[FATAL] YOLO11-seg TensorRT plugin library missing for this ONNX/engine.\n"
+            f"resolved: {lib_path}\n"
+            "Set NOESIS_YOLO11_SEG_TRT_PLUGIN_LIB to override, or build with:\n"
+            "  make -C external/DeepStream-Yolo-Seg/nvdsinfer_custom_impl_Yolo_seg\n"
+        )
+
+    try:
+        import tensorrt as trt  # type: ignore
+
+        trt.init_libnvinfer_plugins(trt.Logger(trt.Logger.ERROR), "")
+    except Exception as exc:
+        logger.debug("TensorRT standard plugin init skipped: %s", exc)
+
+    try:
+        ctypes.CDLL(str(lib_path), mode=getattr(ctypes, "RTLD_GLOBAL", 0))
+    except Exception as exc:
+        raise SystemExit(
+            "[FATAL] Failed to load YOLO11-seg TensorRT plugin library.\n"
+            f"resolved: {lib_path}\n"
+            f"error: {exc}"
+        ) from exc
+
+    _YOLO11_SEG_TRT_PLUGIN_LOADED = True
+    logger.info("YOLO11-seg TensorRT plugin library loaded: %s", lib_path)
+
+
 def _preflight_pgie_profile(profile: str, pipeline_cfg: Dict[str, Any], yaml_path: Path, logger: logging.Logger) -> None:
-    if profile not in ("yolo11", "yolo26", "rfdetr", "rfdetr_seg", "yolo26_seg", "wholebody49"):
+    if profile not in ("yolo11", "yolo11_seg", "yolo26", "rfdetr", "rfdetr_seg", "yolo26_seg", "wholebody49"):
         return
 
     if profile in ("yolo11", "yolo26"):
@@ -891,6 +1031,98 @@ def _preflight_pgie_profile(profile: str, pipeline_cfg: Dict[str, Any], yaml_pat
             engine_path,
             onnx_path,
         )
+        return
+
+    if profile == "yolo11_seg":
+        preprocess_cfg = pipeline_cfg.get("preprocess") if isinstance(pipeline_cfg, dict) else None
+        preprocess_path_raw = (preprocess_cfg or {}).get("config-file") if isinstance(preprocess_cfg, dict) else None
+        preprocess_path = _resolve_pipeline_cfg_path(yaml_path, str(preprocess_path_raw or ""))
+        if not preprocess_path.exists():
+            raise SystemExit(f"[FATAL] YOLO11-seg profile requires preprocess config-file at: {preprocess_path}")
+
+        preproc_parser = configparser.ConfigParser()
+        preproc_parser.read(preprocess_path, encoding="utf-8")
+        preproc_props = preproc_parser["property"] if preproc_parser.has_section("property") else {}
+        tensor_name = str(preproc_props.get("tensor-name", "") or "").strip()
+        if tensor_name != "images":
+            raise SystemExit(
+                f"[FATAL] YOLO11-seg preprocess tensor-name must be 'images' "
+                f"(got {tensor_name!r} in {preprocess_path})"
+            )
+
+        models_cfg = pipeline_cfg.get("models") if isinstance(pipeline_cfg, dict) else None
+        pgie_cfg = (models_cfg or {}).get("pgie") if isinstance(models_cfg, dict) else None
+        pgie_ini_raw = (pgie_cfg or {}).get("config-file-path") if isinstance(pgie_cfg, dict) else None
+        pgie_ini = _resolve_pipeline_cfg_path(yaml_path, str(pgie_ini_raw or ""))
+        if not pgie_ini.exists():
+            raise SystemExit(f"[FATAL] YOLO11-seg profile requires PGIE config-file-path at: {pgie_ini}")
+
+        engine_raw = (pgie_cfg or {}).get("engine") if isinstance(pgie_cfg, dict) else None
+        engine_path = _resolve_pipeline_cfg_path(yaml_path, str(engine_raw or ""))
+        if not str(engine_raw or "").strip():
+            raise SystemExit("[FATAL] YOLO11-seg profile requires models.pgie.engine to be set")
+        if not engine_path.exists():
+            raise SystemExit(f"[FATAL] YOLO11-seg PGIE engine missing: {engine_path}")
+
+        parser = configparser.ConfigParser()
+        parser.read(pgie_ini, encoding="utf-8")
+        props = parser["property"] if parser.has_section("property") else {}
+
+        lib_raw = str(props.get("custom-lib-path", "") or "").strip()
+        lib_path = _resolve_pipeline_cfg_path(yaml_path, lib_raw)
+        if not lib_raw or not lib_path.exists():
+            raise SystemExit(
+                "[FATAL] YOLO11-seg PGIE custom parser library missing.\n"
+                f"PGIE INI: {pgie_ini}\n"
+                f"custom-lib-path: {lib_raw or '<unset>'}\n"
+                f"resolved: {lib_path}\n"
+                "Build it with: make -C pipelines/nvdsinfer_yolo11_seg\n"
+            )
+
+        labels_raw = str(props.get("labelfile-path", "") or "").strip()
+        labels_path = _resolve_pipeline_cfg_path(yaml_path, labels_raw)
+        if not labels_raw or not labels_path.exists():
+            raise SystemExit(
+                "[FATAL] YOLO11-seg label file missing.\n"
+                f"PGIE INI: {pgie_ini}\n"
+                f"labelfile-path: {labels_raw or '<unset>'}\n"
+                f"resolved: {labels_path}\n"
+            )
+
+        onnx_raw = str(props.get("onnx-file", "") or "").strip()
+        onnx_path = _resolve_pipeline_cfg_path(yaml_path, onnx_raw)
+        if not onnx_raw or not onnx_path.exists():
+            raise SystemExit(
+                "[FATAL] YOLO11-seg ONNX file missing.\n"
+                f"PGIE INI: {pgie_ini}\n"
+                f"onnx-file: {onnx_raw or '<unset>'}\n"
+                f"resolved: {onnx_path}\n"
+            )
+        if _yolo11_seg_onnx_requires_trt_plugin(onnx_path):
+            _load_yolo11_seg_trt_plugin_library(yaml_path, logger)
+
+        gie_uid = str(props.get("gie-unique-id", "") or "").strip()
+        if gie_uid and gie_uid != "1":
+            raise SystemExit(f"[FATAL] YOLO11-seg PGIE gie-unique-id must remain 1 (got {gie_uid})")
+
+        batch_size = str(props.get("batch-size", "") or "").strip()
+        if batch_size and batch_size != "3":
+            raise SystemExit(f"[FATAL] YOLO11-seg PGIE batch-size must be 3 for b3 engines (got {batch_size})")
+
+        network_type = str(props.get("network-type", "") or "").strip()
+        if network_type and network_type != "3":
+            raise SystemExit(f"[FATAL] YOLO11-seg PGIE network-type must be 3 (got {network_type})")
+
+        parse_func = str(props.get("parse-bbox-instance-mask-func-name", "") or "").strip()
+        if parse_func != "NvDsInferParseYoloSeg":
+            raise SystemExit(
+                "[FATAL] YOLO11-seg PGIE parser must be NvDsInferParseYoloSeg "
+                f"(got {parse_func or '<unset>'})"
+            )
+        if str(props.get("output-instance-mask", "") or "").strip() != "1":
+            raise SystemExit("[FATAL] YOLO11-seg PGIE requires output-instance-mask=1")
+
+        logger.info("YOLO11-seg PGIE engine found: %s", engine_path)
         return
 
     if profile == "rfdetr":
@@ -1163,7 +1395,7 @@ def _materialize_effective_pipeline_yaml(
     if profile in ("yolo11", "yolo26"):
         if profile == "yolo26" and not pgie_size:
             raise SystemExit(f"[FATAL] YOLO26 detection profile requires --size ({_YOLO26_DETECT_SIZE_HELP})")
-        size_norm = str(pgie_size).strip().lower() if profile == "yolo26" else None
+        size_norm = str(pgie_size or "m").strip().lower() if profile == "yolo11" else str(pgie_size).strip().lower()
         sources_cfg = base_cfg.get("sources") if isinstance(base_cfg, dict) else None
         source_count = len(sources_cfg) if isinstance(sources_cfg, list) else 0
         src_ids = tuple(range(source_count)) or (0, 1, 2)
@@ -1178,6 +1410,22 @@ def _materialize_effective_pipeline_yaml(
             },
         }
         logger.info("%s detection PGIE selected", str(assets["label"]))
+    if profile == "yolo11_seg":
+        size_norm = str(pgie_size or "m").strip().lower()
+        sources_cfg = base_cfg.get("sources") if isinstance(base_cfg, dict) else None
+        source_count = len(sources_cfg) if isinstance(sources_cfg, list) else 0
+        src_ids = tuple(range(source_count)) or (0, 1, 2)
+        assets = _materialize_yolo11_seg_pgie_ini(size_norm, logger, src_ids=src_ids)
+        overlay = {
+            "preprocess": {"config-file": str(assets["preprocess_config"])},
+            "models": {
+                "pgie": {
+                    "config-file-path": str(assets["pgie_config"]),
+                    "engine": str(assets["engine"]),
+                }
+            },
+        }
+        logger.info("YOLO11-seg PGIE size: %s", size_norm)
     if profile == "rfdetr":
         if not pgie_size:
             raise SystemExit(f"[FATAL] RF-DETR detection profile requires --size ({_RFDETR_SIZE_HELP})")
@@ -1383,7 +1631,7 @@ def _maybe_autogen_v3dt_caminfo(pipeline_path: Path, cameras_path: Path, logger:
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Noesis DS8 runtime harness")
 
-    default_pgie_profile = str(os.environ.get("NOESIS_PGIE_PROFILE", "yolo11_seg") or "").strip() or "yolo11_seg"
+    default_pgie_profile = str(os.environ.get("NOESIS_PGIE_PROFILE", "yolo11") or "").strip() or "yolo11"
 
     parser.add_argument(
         "--pipeline-config",
@@ -1393,17 +1641,20 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--pgie-profile",
+        "--pgie_profile",
+        "-pgie-profile",
+        "-pgie_profile",
         choices=_PGIE_PROFILES,
         default=default_pgie_profile,
-        help="PGIE profile overlay (default: yolo11_seg). Env: NOESIS_PGIE_PROFILE",
+        help="PGIE profile overlay (default: yolo11). Env: NOESIS_PGIE_PROFILE",
     )
     parser.add_argument(
         "--size",
         choices=_YOLO26_DETECT_SIZES,
         default=None,
         help=(
-            "Model size. YOLO26 detection supports n/s/m/l/x; "
-            "YOLO26 segmentation and RF-DETR profiles currently support n/s/m; "
+            "Model size. YOLO11 detect/seg supports s/m/l; YOLO26 detection supports n/s/m/l/x; "
+            "YOLO26 segmentation and RF-DETR profiles support n/s/m; "
             "Wholebody49 currently supports s/x. Default: m, except Wholebody49 defaults to s."
         ),
     )

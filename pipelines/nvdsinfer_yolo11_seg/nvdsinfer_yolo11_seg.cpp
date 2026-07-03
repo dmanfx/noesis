@@ -18,6 +18,7 @@
 #include <cassert>
 #include <cmath>
 #include <cstddef>
+#include <cstdlib>
 #include <cstring>
 #include <iostream>
 #include <vector>
@@ -28,6 +29,17 @@ namespace {
 
 template <typename T>
 inline T clamp(T v, T lo, T hi) { return std::min(hi, std::max(lo, v)); }
+
+static std::size_t parserTopK(std::size_t available) {
+  const char* raw = std::getenv("NOESIS_YOLO11_SEG_PARSER_TOPK");
+  long parsed = 30;
+  if (raw && *raw) {
+    char* end = nullptr;
+    const long value = std::strtol(raw, &end, 10);
+    if (end && *end == '\0' && value > 0) parsed = value;
+  }
+  return std::min(available, static_cast<std::size_t>(parsed));
+}
 
 static void addBBoxProposal(float x1, float y1, float x2, float y2,
                             unsigned netW, unsigned netH,
@@ -112,8 +124,9 @@ static bool parseFused(
   const std::size_t maskLen = channels - 6; // [x1,y1,x2,y2,score,class] + mask
   const float* buf = static_cast<const float*>(out0.buffer);
 
+  std::vector<NvDsInferInstanceMaskInfo> candidates;
+  candidates.reserve(num);
   out.clear();
-  out.reserve(num);
 
   for (std::size_t i = 0; i < num; ++i) {
     const std::size_t base = i * channels;
@@ -130,7 +143,24 @@ static bool parseFused(
     if (b.width < 1.f || b.height < 1.f) continue;
 
     addSegProposal(buf + base + 6, maskLen, net.width, net.height, b);
-    out.emplace_back(b);
+    candidates.emplace_back(b);
+  }
+
+  std::stable_sort(
+      candidates.begin(),
+      candidates.end(),
+      [](const NvDsInferInstanceMaskInfo& a, const NvDsInferInstanceMaskInfo& b) {
+        return a.detectionConfidence > b.detectionConfidence;
+      });
+
+  const std::size_t keep = parserTopK(candidates.size());
+  out.reserve(keep);
+  for (std::size_t i = 0; i < keep; ++i) {
+    out.emplace_back(candidates[i]);
+  }
+  for (std::size_t i = keep; i < candidates.size(); ++i) {
+    delete[] candidates[i].mask;
+    candidates[i].mask = nullptr;
   }
 
   return true;
@@ -147,4 +177,3 @@ NvDsInferParseYoloSeg(std::vector<NvDsInferLayerInfo> const& outputLayersInfo,
 }
 
 CHECK_CUSTOM_INSTANCE_MASK_PARSE_FUNC_PROTOTYPE(NvDsInferParseYoloSeg);
-

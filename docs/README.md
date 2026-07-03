@@ -41,6 +41,10 @@ and worklogs live in `docs/history/`.
 - When you edit docs, append a one-line entry under “Doc changes” (date + what changed) for any **substantive** update: new features/processes/workflows, contract or baseline changes, behavior-affecting diagrams. Skip trivial typo/style fixes or purely cosmetic diagram tweaks.
 - Status headers (“Status: validated as of …”) should only be updated when the doc has been re-validated against code/configs.
 
+## Doc changes (2026-06-30)
+- Updated the DS8 detector baseline to make YOLO11 detect the default PGIE and
+  document YOLO11 / YOLO11-seg `s|m|l` profile assets (`DS8_Baselines.md`).
+
 ## Doc changes (2026-06-24)
 - Added the DS8 Wholebody49 X pose promoter implementation plan for promoting
   label-only Wholebody keypoint rows into the existing `NOESIS.POSE_FEATURES`

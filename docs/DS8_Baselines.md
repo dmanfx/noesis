@@ -68,8 +68,35 @@ you don’t have to sift through the historical work orders.
   `NOESIS_MAPANYTHING_NORMALS_DTYPE` (`float16`|`float32`).
 
 ## Detector Profiles (PGIE)
-- **Default:** YOLO11-seg (instance masks), PGIE `unique-id=1`, person is
+- **Default:** YOLO11 detect, PGIE `unique-id=1`, person is `class_id=0`.
+  - Runtime switch: omit `--pgie-profile`, set `NOESIS_PGIE_PROFILE=yolo11`,
+    or pass `--pgie-profile yolo11`.
+  - Size switch: `--size s|m|l` (default `m`).
+  - Assets:
+    - `models/yolo11s.onnx`,
+      `models/engines/yolo11s_b3_fp16.engine`
+    - `models/yolo11m.onnx`,
+      `models/engines/yolo11m_b3_fp16.engine`
+    - `models/yolo11l.onnx`,
+      `models/engines/yolo11l_b3_fp16.engine`
+  - Runtime materializes size-specific PGIE/preprocess configs from
+    `pipelines/config_infer_primary_yolo11.ini` and `pipelines/config_preproc.ini`.
+- **Optional:** YOLO11-seg (instance masks), PGIE `unique-id=1`, person is
   `class_id=0`.
+  - Switch via `--pgie-profile yolo11_seg --size s|m|l` (default `m`).
+  - Assets:
+    - `models/yolo11s-seg_cust_fused.onnx`,
+      `models/engines/yolo11s-seg_cust_fused.engine`
+    - `models/yolo11m-seg_cust.onnx`,
+      `models/engines/yolo11m-seg_cust.engine`
+    - `models/yolo11l-seg_cust.onnx`,
+      `models/engines/yolo11l-seg_cust.engine`
+  - Runtime materializes size-specific PGIE/preprocess configs from
+    `pipelines/config_infer_primary_yolo11_seg.ini` and `pipelines/config_preproc.ini`.
+  - Some YOLO11-seg assets, including the current `l` ONNX/engine, require the
+    TensorRT plugin library from `external/DeepStream-Yolo-Seg`; DS8 preflight
+    loads it when the selected ONNX contains `EfficientNMSX_TRT` or
+    `ROIAlignX_TRT`.
 - **Optional:** RF-DETR-seg (n/s/m)
   - Switch via `--pgie-profile rfdetr_seg` plus `--size n|s|m` (default `m`).
   - Engines:

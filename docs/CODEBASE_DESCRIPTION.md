@@ -20,7 +20,7 @@ Real-time multi-camera video analytics pipeline for:
 - **GPU-First Core Pipeline**: Decode, preprocess, inference, tracking, analytics, tiling, and OSD stay on GPU via NVMM surfaces; CPU is used only for metadata extraction, serialization, and the minimal per-object depth fusion boundary
 - **Multi-Stream Support**: Processes multiple RTSP camera streams simultaneously via `nvmultiurisrcbin`
 - **Primary Detection Profiles**: Runtime-selectable PGIE path, including YOLO26 segmentation in active baseline tracking work
-- **Advanced Tracking**: NVIDIA NvDCF tracker with OSNet-based re-identification for stable cross-camera IDs
+- **Advanced Tracking**: NVIDIA NvDCF tracker with ReID-based re-association (occlusion recovery) plus Swin-Tiny ReID (TAO ReIdentificationNet Transformer) for stable cross-camera IDs
 - **Pose-assisted StableID**: YOLO26 pose SGIE ratio features can be fused into StableID as a secondary signal (bounded in RAM; no disk persistence)
 - **Analytics**: ROI filtering, line crossing, direction detection, overcrowding via `nvdsanalytics`
 - **Bird's-Eye View (BEV)**: Real-time top-down visualization from canonical backend `track.world`; world-mode no longer runs a second BEV smoother over already-filtered world positions
@@ -34,7 +34,7 @@ Real-time multi-camera video analytics pipeline for:
 ### Technology Stack
 - **Backend**: Python 3.10+, NVIDIA DeepStream 8.0 Service Maker (`pyservicemaker`), TensorRT
 - **Frontend**: React + TypeScript, Vite, WebSocket/WebRTC client
-- **ML Models**: Runtime-selectable PGIE profiles (commonly YOLO26-seg in current baseline work), YOLO26 pose SGIE, OSNet ReID (torchreid), Depth Anything V2 metric, MapAnything (Meta Research), optional RF-DETR (`--pgie-profile`)
+- **ML Models**: Runtime-selectable PGIE profiles (commonly YOLO26-seg in current baseline work), YOLO26 pose SGIE, Swin-Tiny ReID (TAO ReIdentificationNet Transformer), Depth Anything V2 metric, MapAnything (Meta Research), optional RF-DETR (`--pgie-profile`)
 - **GPU Libraries**: CUDA, cuDNN, TensorRT, `pyds` DeepStream Python bindings
 - **Communication**: WebSockets (JSON telemetry and WebRTC signaling), WebRTC
   (H.264 video)
@@ -93,7 +93,7 @@ The system follows a **layered architecture** with clear separation between the 
 │  │  - Trail overlay rendering via NvDsDisplayMeta                     │ │
 │  │  - MapAnything tensor postprocess                                  │ │
 │  │  - DAv2 object-depth fusion + pose+depth world estimation          │ │
-│  │  - OSNet ReID embedding extraction for StableIDManager             │ │
+│  │  - Swin ReID embedding extraction for StableIDManager             │ │
 │  └────────────────────────────────────────────────────────────────────┘ │
 └─────────────────────────────────────────────────────────────────────────┘
                                 │
@@ -160,7 +160,7 @@ The system follows a **layered architecture** with clear separation between the 
   - **Exclude Stage**: optional `nvdsroiexclude` pruning before tracking
   - **Tracker**: `nvtracker` with NvDCF multi-object tracking
   - **Analytics**: optional `nvdsanalytics` for ROI/line crossing events
-  - **ReID SGIE**: `nvinfer` with OSNet model for cross-camera re-identification
+  - **ReID SGIE**: `nvinfer` with Swin-Tiny ReID model for cross-camera re-identification
   - **Pose SGIE**: `nvinfer` with YOLO26 pose for pose-first anchor authority
   - **World Observation**: backend fused pose+depth world estimation
   - **Tracking Telemetry Stage**: canonical `track.world` publishing before BEV/OSD consumers
@@ -226,7 +226,7 @@ The system follows a **layered architecture** with clear separation between the 
   - Configurable cosine similarity thresholds for matching
   - Multi-zone active support for overlapping camera fields of view
   - EMA smoothing and adaptive penalties for robustness
-- **EmbeddingExtractor**: OSNet-based feature extraction (optional; DS8 uses SGIE tensors)
+- **EmbeddingExtractor**: torchreid-based feature extraction (optional; DS8 uses SGIE tensors)
 
 #### 7. **Telemetry & BEV** (`noesis/telemetry/`)
 - **bev.py**: Bird's-eye view rendering using homography transforms
@@ -305,7 +305,7 @@ Noesis_Devel/
 │
 ├── reid/                            # Re-identification module
 │   ├── stable_id_manager.py        # Cross-camera stable ID assignment
-│   └── embedding_extractor.py      # OSNet feature extraction
+│   └── embedding_extractor.py      # torchreid feature extraction (unused in DS8)
 │
 ├── geometry/                        # Geometry and depth processing
 │   ├── homography.py               # Homography calculations
@@ -326,7 +326,7 @@ Noesis_Devel/
 ├── pipelines/                       # DeepStream INI configs
 │   ├── config_infer_primary_yolo11_seg.ini
 │   ├── config_infer_secondary_depth_tracking_da2.template.ini
-│   ├── config_infer_secondary_reid_osnet.ini
+│   ├── config_infer_secondary_reid_swin.ini
 │   ├── config_infer_secondary_mapanything.ini
 │   └── config_preproc.ini
 │
@@ -462,7 +462,7 @@ visualization:
 4. **Primary Inference**: Batched frames → runtime-selected `nvinfer` PGIE → detections + masks
 5. **Tracking**: Detections → `nvtracker` (NvDCF) → tracked objects with IDs
 6. **Analytics**: Tracks → `nvdsanalytics` → events (ROI, line crossing, occupancy)
-7. **ReID**: Tracked crops → `nvinfer` (OSNet SGIE) → embedding tensors → StableIDManager
+7. **ReID**: Tracked crops → `nvinfer` (Swin ReID SGIE) → embedding tensors → StableIDManager
 8. **Pose SGIE**: Tracked persons → `nvinfer` (YOLO26 pose SGIE) → pose keypoints/ratios for pose-first anchoring
 9. **Always-On Tracking Depth Branch**: PGIE tee → `depth_tracking_queue` → `nvinfer` (DAv2) → native tensor extraction/alignment → `NOESIS.OBJECT_DEPTH`
 10. **Gated Reference Depth Branch**: PGIE tee → `mapanything_queue` → `valve` → `nvinfer` (MapAnything) → full-frame depth / floorplan / RPC path
@@ -551,7 +551,7 @@ export NOESIS_REID_ENABLED=1           # Enable ReID
 - **Stack**: DeepStream 8.0 Service Maker (`pyservicemaker`)
 - **Video Delivery**: RTSP → WebRTC gateway (mosaic); WebSocket carries
   telemetry JSON and signaling.
-- **Tracking**: NvDCF + OSNet ReID for stable cross-camera IDs
+- **Tracking**: NvDCF (ReID re-association) + Swin ReID for stable cross-camera IDs
 - **Depth**:
   - baseline DAv2 lane is always on and contributes to fused `track.world`
   - MapAnything stays valve-gated for full-frame RPC/floorplan/reference work

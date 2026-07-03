@@ -41,6 +41,12 @@ and worklogs live in `docs/history/`.
 - When you edit docs, append a one-line entry under “Doc changes” (date + what changed) for any **substantive** update: new features/processes/workflows, contract or baseline changes, behavior-affecting diagrams. Skip trivial typo/style fixes or purely cosmetic diagram tweaks.
 - Status headers (“Status: validated as of …”) should only be updated when the doc has been re-validated against code/configs.
 
+## Doc changes (2026-07-03)
+- Updated the codebase overview and DS8 decision ledger for the Swin-Tiny ReID
+  SGIE baseline, NvDCF tracker re-association profile, and long-term StableID
+  gallery memory (`CODEBASE_DESCRIPTION.md`,
+  `plans/DS8/ds8_design_decisions.md`).
+
 ## Doc changes (2026-06-30)
 - Updated the DS8 detector baseline to make YOLO11 detect the default PGIE and
   document YOLO11 / YOLO11-seg `s|m|l` profile assets (`DS8_Baselines.md`).

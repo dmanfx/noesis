@@ -561,6 +561,8 @@ def build_pipeline(yaml_path: str | Path) -> DS8Pipeline:
         if attach is not None:
             cfg["output-tensor-meta"] = bool(attach)
         cfg.pop("force_engine_rebuild", None)
+        # Tensor-meta output layer name consumed by telemetry hooks, not nvinfer.
+        cfg.pop("layer", None)
         cfg.pop("model_size", None)
         cfg.pop("score_threshold", None)
         cfg.pop("kpt_threshold", None)

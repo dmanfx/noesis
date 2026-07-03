@@ -5309,6 +5309,9 @@ class _AnalyticsTelemetryProcessor:
                 gie_id = reid_cfg.get("gie_id", reid_cfg.get("gie-id", None))
                 if gie_id is not None:
                     self._reid_unique_id = int(gie_id)
+                layer_name = reid_cfg.get("layer")
+                if layer_name:
+                    self._reid_layer_name = str(layer_name)
         except Exception:
             self._reid_unique_id = 3
 

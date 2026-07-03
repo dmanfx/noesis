@@ -74,11 +74,12 @@ models:
     attach_tensor_meta: false
   reid:
     enable: true
-    name: reid_osnet
-    config-file-path: pipelines/config_infer_secondary_reid_osnet.ini
-    engine: models/engines/reid_osnet_ibn_msmt17_dyn_b16_fp16.engine
+    name: reid_sgie
+    config-file-path: pipelines/config_infer_secondary_reid_swin.ini
+    engine: models/engines/reid_swin_tiny_aicity156_dyn_b16_fp16.engine
     batch_size: 16
     gie_id: 3
+    layer: fc_pred
     attach_tensor_meta: true
   pose:
     enable: true

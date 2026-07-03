@@ -90,9 +90,10 @@ class StableIDManager:
         max_active_ids_per_sensor: int = 6,
         new_id_confirm_frames_at_cap: int = 2,
         active_evict_grace_s: float = 10.0,
-        # Cross-camera handoff
-        xcam_handoff_window_s: float = 4.0,
-        xcam_handoff_margin: float = 0.02,
+        # Cross-camera handoff: relax the gallery-match requirement for
+        # identities seen recently on any camera (walking between rooms).
+        xcam_handoff_window_s: float = 12.0,
+        xcam_handoff_margin: float = 0.06,
         # Global ID pool soft-cap
         max_total_ids: int = 12,
         total_id_reuse: bool = True,
@@ -282,6 +283,10 @@ class StableIDManager:
 
         # Last known bbox/appearance per stable_id (for adaptive penalties)
         self.sid_last_bbox: Dict[int, BBox] = {}
+        # Sensor that produced sid_last_bbox; scale/spatial penalties only make
+        # sense within the same camera view (cross-camera size differences are
+        # expected geometry, not identity evidence).
+        self.sid_last_bbox_sensor: Dict[int, int] = {}
         self.sid_last_brightness: Dict[int, float] = {}
         self.sid_last_color: Dict[int, np.ndarray] = {}
         # Global last seen timestamp per stable_id (any sensor)
@@ -588,6 +593,7 @@ class StableIDManager:
             self.gallery.pop(sid, None)
             self.sid_centroid.pop(sid, None)
             self.sid_last_bbox.pop(sid, None)
+            self.sid_last_bbox_sensor.pop(sid, None)
             self.sid_last_brightness.pop(sid, None)
             self.sid_last_color.pop(sid, None)
             self.active_zones.pop(sid, None)
@@ -1328,7 +1334,15 @@ class StableIDManager:
                 continue
 
             score = sim
-            if self.adaptive_penalty and curr_bbox is not None:
+            # Scale/brightness/spatial penalties are same-camera signals only;
+            # applying them across cameras (different geometry/lighting) was
+            # suppressing legitimate cross-camera handoffs.
+            same_sensor_ref = (
+                sensor_id is not None
+                and self.sid_last_bbox_sensor.get(int(sid)) is not None
+                and int(self.sid_last_bbox_sensor[int(sid)]) == int(sensor_id)
+            )
+            if self.adaptive_penalty and curr_bbox is not None and same_sensor_ref:
                 # Penalize large scale/brightness shifts relative to last seen for this sid
                 last_bbox = self.sid_last_bbox.get(int(sid))
                 if last_bbox is not None:
@@ -1345,7 +1359,7 @@ class StableIDManager:
                         score -= self.brightness_penalty_beta * abs(float(curr_brightness) - float(b0))
 
             # Spatial penalty when candidate ID already active on this sensor and far away
-            if self.spatial_penalty and sensor_id is not None and curr_bbox is not None:
+            if self.spatial_penalty and sensor_id is not None and curr_bbox is not None and same_sensor_ref:
                 active_pairs = self.active_zones.get(int(sid), set())
                 active_here = any(int(s) == int(sensor_id) for (s, _z) in active_pairs)
                 if active_here:
@@ -1727,6 +1741,8 @@ class StableIDManager:
                 if last_dst is None or (last_src is not None and float(last_src) > float(last_dst)):
                     if int(src_root) in self.sid_last_bbox:
                         self.sid_last_bbox[int(dst_root)] = self.sid_last_bbox[int(src_root)]
+                    if int(src_root) in self.sid_last_bbox_sensor:
+                        self.sid_last_bbox_sensor[int(dst_root)] = self.sid_last_bbox_sensor[int(src_root)]
                     if int(src_root) in self.sid_last_brightness:
                         self.sid_last_brightness[int(dst_root)] = self.sid_last_brightness[int(src_root)]
                     if int(src_root) in self.sid_last_color:
@@ -2932,6 +2948,7 @@ class StableIDManager:
                     except Exception:
                         pass
                     self.sid_last_bbox[sid_int] = bbox_ltrbwh
+                    self.sid_last_bbox_sensor[sid_int] = int(sensor_id)
                     if curr_brightness is not None:
                         self.sid_last_brightness[sid_int] = curr_brightness
                     if curr_color is not None:
@@ -3088,6 +3105,7 @@ class StableIDManager:
                 except Exception:
                     pass
                 self.sid_last_bbox[sid_int] = bbox_ltrbwh
+                self.sid_last_bbox_sensor[sid_int] = int(sensor_id)
                 if curr_brightness is not None:
                     self.sid_last_brightness[sid_int] = curr_brightness
                 if curr_color is not None:

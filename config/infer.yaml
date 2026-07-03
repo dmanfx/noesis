@@ -66,8 +66,8 @@ preprocess:
 
 models:
   pgie:
-    config-file-path: pipelines/config_infer_primary_yolo11.ini
-    engine: models/engines/yolo11m_b3_fp16.engine
+    config-file-path: pipelines/config_infer_primary_yolo11_seg.ini
+    engine: models/engines/yolo11s-seg_cust_fused.engine
     batch_size: 3
     gie_id: 1
     network_mode: fp16
@@ -163,11 +163,17 @@ bev:
     # Producer owns BEV world-path stabilization so FE consumes one already-physical track path.
     enabled: true
     max_speed_mps: 4.0    # Physical gate (meters/sec): cap per-frame travel by speed * dt
-    max_jump_m: 0.12      # Extra slack for one-frame image-anchor jitter (meters)
-    alpha: 0.32           # Alpha-beta filter position gain (0..1)
-    beta: 0.04            # Alpha-beta filter velocity gain (0..1)
+    max_jump_m: 0.75      # Extra slack for homography jitter (meters)
+    alpha: 0.45           # Alpha-beta filter position gain (0..1)
+    beta: 0.10            # Alpha-beta filter velocity gain (0..1)
     ttl_s: 2.5            # Forget track state after not seen for this long
     reset_after_s: 1.25   # If dt exceeds this, accept measurement and reset filter
+
+osd:
+  process-mode: 0
+  display-mask: 1
+  display-bbox: 0
+  display-text: 1
 
 visualization: # Visualization overlays rendered into the mosaic stream (tiler → osd).
   display_keypoints: true # Render pose keypoints/skeletons from the pose SGIE.

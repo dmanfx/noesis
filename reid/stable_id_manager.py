@@ -94,6 +94,12 @@ class StableIDManager:
         # identities seen recently on any camera (walking between rooms).
         xcam_handoff_window_s: float = 12.0,
         xcam_handoff_margin: float = 0.06,
+        # Early reconcile: a fresh low-support track keeps re-testing ghost and
+        # gallery matches as better embeddings arrive, so an ID minted from a
+        # weak far-away first crop can still converge to the person's real SID.
+        early_reconcile_window_s: float = 6.0,
+        early_reconcile_max_attempts: int = 4,
+        early_reconcile_max_support: int = 4,
         # Global ID pool soft-cap
         max_total_ids: int = 12,
         total_id_reuse: bool = True,
@@ -208,6 +214,9 @@ class StableIDManager:
         self.active_evict_grace_s = float(active_evict_grace_s)
         self.xcam_handoff_window_s = float(xcam_handoff_window_s)
         self.xcam_handoff_margin = float(xcam_handoff_margin)
+        self.early_reconcile_window_s = float(early_reconcile_window_s)
+        self.early_reconcile_max_attempts = int(max(0, early_reconcile_max_attempts))
+        self.early_reconcile_max_support = int(max(1, early_reconcile_max_support))
         self.max_total_ids = int(max_total_ids)
         self.total_id_reuse = bool(total_id_reuse)
         self.total_id_reuse_min_age_s = float(total_id_reuse_min_age_s)
@@ -2364,6 +2373,35 @@ class StableIDManager:
 
         return int(applied_effective)
 
+    def _sid_pair_similarity(self, sid_a: int, sid_b: int, centroids: Dict[int, np.ndarray]) -> float:
+        """Similarity between two identities for duplicate detection.
+
+        Uses the max of centroid similarity and a robust top-k mean of
+        cross-exemplar similarities. Centroids blur multiple viewpoints
+        together, which suppresses legitimate same-person merges across
+        cameras; exemplar pairs recover them while the top-k mean damps
+        single-outlier false matches.
+        """
+        cen_sim = -1.0
+        ca = centroids.get(int(sid_a))
+        cb = centroids.get(int(sid_b))
+        if ca is not None and cb is not None:
+            cen_sim = float(self._cosine(ca, cb))
+        try:
+            vecs_a = [v for (_ts, v) in self.gallery.get(int(sid_a), []) if v is not None]
+            vecs_b = [v for (_ts, v) in self.gallery.get(int(sid_b), []) if v is not None]
+            if vecs_a and vecs_b:
+                mat_a = np.stack(vecs_a, axis=0).astype(np.float32)
+                mat_b = np.stack(vecs_b, axis=0).astype(np.float32)
+                if mat_a.shape[1] == mat_b.shape[1]:
+                    cross = (mat_a @ mat_b.T).reshape(-1)
+                    k = min(3, cross.size)
+                    topk = np.partition(cross, cross.size - k)[cross.size - k :]
+                    cen_sim = max(cen_sim, float(np.mean(topk)))
+        except Exception:
+            pass
+        return float(cen_sim)
+
     def suggest_aliases(
         self,
         *,
@@ -2428,7 +2466,7 @@ class StableIDManager:
                 for other in candidates:
                     if other == sid:
                         continue
-                    sim = self._cosine(centroids[sid], centroids[other])
+                    sim = self._sid_pair_similarity(int(sid), int(other), centroids)
                     sims.append((float(sim), int(other)))
                 if not sims:
                     continue
@@ -2444,7 +2482,7 @@ class StableIDManager:
             results: List[Dict[str, Any]] = []
             for idx, sid in enumerate(sorted_candidates):
                 for best_sid in sorted_candidates[idx + 1 :]:
-                    sim = float(self._cosine(centroids[int(sid)], centroids[int(best_sid)]))
+                    sim = float(self._sid_pair_similarity(int(sid), int(best_sid), centroids))
                     if not math.isfinite(sim):
                         continue
                     pair_pool_size += 1
@@ -2992,9 +3030,9 @@ class StableIDManager:
                     early_attempts = 0
                 allow_early_reconcile = (
                     (not rec_emb_missing)
-                    and sid_support <= 2
-                    and track_age_s <= 2.5
-                    and early_attempts < 2
+                    and sid_support <= int(self.early_reconcile_max_support)
+                    and track_age_s <= float(self.early_reconcile_window_s)
+                    and early_attempts < int(self.early_reconcile_max_attempts)
                 )
                 if rec_emb_missing or allow_early_reconcile:
                     if allow_early_reconcile:

@@ -233,8 +233,8 @@ Date: 2026-06-28
 - **Expected resource effect:** Bounds JSON conversion, serialization, and per-client sends while leaving inference/tracking cadence unchanged.
 - **Item 6, object-depth ROI host copies:** Missing-mask person depth fallback now copies only a lower bbox band by default (`NOESIS_OBJECT_DEPTH_BBOX_BAND_FRACTION=0.5`) instead of the full person bbox. Instance-mask objects keep full-mask behavior.
 - **Expected resource effect:** Halves host ROI pixels copied for missing-mask person detections before the future native/CUDA reduction step.
-- **Item 7, demand-driven RTSP output:** RTSP mosaic branch now includes `rtsp_output_valve`. When WebRTC is enabled, the valve defaults closed and opens only while a gateway has an active owner. `NOESIS_MOSAIC_RTSP_DEMAND_GATED=0` restores always-open RTSP output.
-- **Expected resource effect:** Reduces mosaic RTSP/encode work with zero WebRTC viewers while retaining the canonical RTSP/WebRTC path on demand.
+- **Item 7, demand-driven RTSP output:** RTSP mosaic branch includes `rtsp_output_valve`, but the default is always-open RTSP output because `nvrtspoutsinkbin` can return 503 and leave WebRTC gateways frame-starved when the media is gated closed at startup. `NOESIS_MOSAIC_RTSP_DEMAND_GATED=1` re-enables owner-driven gating for experiments.
+- **Expected resource effect:** Keeps the canonical RTSP/WebRTC path continuously available by default; optional demand gating can reduce idle mosaic RTSP/encode work only when explicitly enabled.
 - **Item 8, person-only PGIE postprocess:** YOLO26 materialized detector INI lowers `topk` to `NOESIS_YOLO26_PERSON_TOPK=100` and adds `filter-out-class-ids=1;...;79` while leaving the engine and tensor shape unchanged.
 - **Expected resource effect:** Reduces parser/metadata/tracker downstream object budget for non-person classes with limited TensorRT GPU impact.
 

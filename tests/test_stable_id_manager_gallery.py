@@ -165,6 +165,59 @@ def test_same_camera_scale_penalty_still_applies(tmp_path):
     assert reid_xcam == pytest.approx(1.0, abs=1e-5)
 
 
+def test_early_reconcile_recovers_from_weak_first_embedding(tmp_path):
+    """A track that minted a fresh SID from a poor first crop (far away, soft
+    upscaled camera) must converge to the person's real SID once a good
+    embedding arrives within the reconcile window."""
+    mgr = _make_manager(tmp_path)
+    dim = 32
+    person = _unit(np.linspace(0.1, 1.0, dim))
+    # Weak first observation: mostly noise, low similarity to the person.
+    rng = np.random.default_rng(7)
+    weak = _unit(0.2 * person + rng.normal(size=dim).astype(np.float32))
+    assert float(weak @ person) < 0.6
+    bbox = (100.0, 100.0, 60.0, 160.0)
+
+    t0 = 5000.0
+    sid_real = mgr.update(0, 1, bbox, t0, None, embedding=person)
+    mgr.update(0, 1, bbox, t0 + 1.0, None, embedding=person)
+
+    # New camera picks the person up with a weak embedding -> wrong fresh SID.
+    sid_weak = mgr.update(2, 50, bbox, t0 + 3.0, None, embedding=weak)
+    assert sid_weak != sid_real
+
+    # 4 s into the track (outside the old 2.5 s window) a clean embedding
+    # arrives; early reconcile must remap the track to the real SID.
+    sid_fixed = mgr.update(2, 50, bbox, t0 + 7.0, None, embedding=person)
+    assert sid_fixed == sid_real
+
+
+def test_suggest_aliases_uses_exemplar_similarity(tmp_path):
+    """Duplicate identities whose centroids diverge (different camera views)
+    are still suggested for merge when exemplars overlap strongly."""
+    mgr = _make_manager(tmp_path, gallery_size=4, aliases_enabled=True)
+    dim = 16
+    shared = _unit(_basis_vec(dim, 0))
+    view_a = _unit(_basis_vec(dim, 1))
+    view_b = _unit(_basis_vec(dim, 2))
+
+    now = 100.0
+    # SID 1: view A plus shared appearances; SID 2: view B plus shared.
+    for i, e in enumerate([view_a, view_a, shared, shared]):
+        mgr.gallery[1].append((now + i, e))
+    for i, e in enumerate([view_b, view_b, shared, shared]):
+        mgr.gallery[2].append((now + i, e))
+    mgr._recompute_sid_centroid(1)
+    mgr._recompute_sid_centroid(2)
+    # Centroids are diluted by disjoint views -> centroid similarity alone
+    # would not clear the merge bar.
+    assert float(mgr._cosine(mgr.sid_centroid[1], mgr.sid_centroid[2])) < 0.6
+
+    suggestions = mgr.suggest_aliases(min_sim=0.60, require_inactive=False, now_ts=now + 10.0)
+    pairs = {(s["a"], s["b"]) for s in suggestions} | {(s["b"], s["a"]) for s in suggestions}
+    assert (1, 2) in pairs
+
+
 def test_update_assigns_same_sid_after_long_absence(tmp_path):
     """A person leaving and returning much later must get the same stable ID."""
     mgr = _make_manager(tmp_path, cos_sim_threshold=0.62, cos_sim_high_threshold=0.72)

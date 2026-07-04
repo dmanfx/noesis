@@ -168,6 +168,35 @@ class MosaicWebRTCGateway:
         best = sorted(h264_pts, key=_score_h264, reverse=True)[0]
         return int(best)
 
+    @staticmethod
+    def _find_video_direction(sdp_text: str) -> Optional[str]:
+        in_video = False
+        for line in (sdp_text or "").splitlines():
+            line = line.strip()
+            if line.startswith("m="):
+                in_video = line.startswith("m=video ")
+                continue
+            if not in_video:
+                continue
+            if line in ("a=sendonly", "a=recvonly", "a=sendrecv", "a=inactive"):
+                return line.split("=", 1)[1]
+        return None
+
+    @staticmethod
+    def _find_h264_payload_type(sdp_text: str) -> Optional[int]:
+        for line in (sdp_text or "").splitlines():
+            line = line.strip()
+            if not line.lower().startswith("a=rtpmap:"):
+                continue
+            try:
+                prefix, mapping = line.split(None, 1)
+                pt = int(prefix.split(":", 1)[1])
+            except Exception:
+                continue
+            if mapping.lower().startswith("h264/"):
+                return int(pt)
+        return None
+
     def build(self) -> None:
         """Construct the GStreamer pipeline with proper dynamic pad handling."""
         # rtspsrc creates pads dynamically, so we need to build the pipeline manually
@@ -730,28 +759,6 @@ class MosaicWebRTCGateway:
     def _on_rtp_in_probe(self, pad: Gst.Pad, info: Gst.PadProbeInfo, user_data: object) -> Gst.PadProbeReturn:
         self._rtp_in_packets += 1
         if self._rtp_in_packets == 1:
-            #region agent log
-            try:
-                import json, time  # local import to avoid module-level impact
-
-                with open("/home/mayor/Noesis_Devel/.cursor/debug.log", "a", encoding="utf-8") as _f:
-                    _f.write(
-                        json.dumps(
-                            {
-                                "sessionId": "debug-session",
-                                "runId": "run1",
-                                "hypothesisId": "H4",
-                                "location": "mosaic_webrtc_gateway.py:_on_rtp_in_probe",
-                                "message": "gateway first rtp in",
-                                "data": {"count": int(self._rtp_in_packets), "rtsp_uri": self.rtsp_uri},
-                                "timestamp": int(time.time() * 1000),
-                            }
-                        )
-                        + "\n"
-                    )
-            except Exception:
-                pass
-            #endregion
             # If we delayed answering until RTP is present, kick answer creation now.
             if self._pending_create_answer and self._remote_description_set and not self._answer_create_started:
                 ctx = GLib.MainContext.default()
@@ -889,28 +896,6 @@ class MosaicWebRTCGateway:
                     logger.error("Failed to set WebRTC gateway pipeline to PLAYING")
                     return
                 logger.info("MosaicWebRTCGateway pipeline started")
-                #region agent log
-                try:
-                    import json, time  # local import to avoid module-level impact
-
-                    with open("/home/mayor/Noesis_Devel/.cursor/debug.log", "a", encoding="utf-8") as _f:
-                        _f.write(
-                            json.dumps(
-                                {
-                                    "sessionId": "debug-session",
-                                    "runId": "run1",
-                                    "hypothesisId": "H4",
-                                    "location": "mosaic_webrtc_gateway.py:start",
-                                    "message": "gateway started",
-                                    "data": {"rtsp_uri": self.rtsp_uri},
-                                    "timestamp": int(time.time() * 1000),
-                                }
-                            )
-                            + "\n"
-                        )
-                except Exception:
-                    pass
-                #endregion
                 # Drive the default GLib main context without monopolizing the GIL.
                 # A blocking GLib.MainLoop.run() in a Python thread can starve other Python
                 # threads (WebSocket server, signal handlers), causing "stuck" behavior.
@@ -1302,113 +1287,30 @@ class MosaicWebRTCGateway:
         # Log SDP summary to debug video inclusion
         has_video = "m=video" in sdp_text
         has_audio = "m=audio" in sdp_text
-        direction: Optional[str] = None
-        pt: Optional[int] = None
+        direction = self._find_video_direction(sdp_text)
+        pt = self._find_h264_payload_type(sdp_text)
         logger.info("<<< Answer SDP: %d lines, video=%s, audio=%s", sdp_lines, has_video, has_audio)
+        logger.info(
+            "    Answer video_direction=%s h264_pt=%s packetization_mode_1=%s",
+            direction,
+            pt,
+            "packetization-mode=1" in (sdp_text or ""),
+        )
         # Always log full SDP for debugging
         logger.info("    Full SDP:\n%s", sdp_text)
 
-        #region agent log
-        try:
-            import json, time
-            import re
-
-            def _find_video_direction(text: str) -> Optional[str]:
-                in_video = False
-                for line in (text or "").splitlines():
-                    line = line.strip()
-                    if line.startswith("m="):
-                        in_video = line.startswith("m=video ")
-                        continue
-                    if not in_video:
-                        continue
-                    if line in ("a=sendonly", "a=recvonly", "a=sendrecv", "a=inactive"):
-                        return line.split("=", 1)[1]
-                return None
-
-            def _find_h264_pt(text: str) -> Optional[int]:
-                for line in (text or "").splitlines():
-                    m = re.match(r"^a=rtpmap:(\d+)\s+H264/", line.strip(), flags=re.IGNORECASE)
-                    if m:
-                        try:
-                            return int(m.group(1))
-                        except Exception:
-                            return None
-                return None
-
-            direction = _find_video_direction(sdp_text)
-            pt = _find_h264_pt(sdp_text)
-            has_msid = "a=msid:" in (sdp_text or "")
-            has_packetization_mode_1 = "packetization-mode=1" in (sdp_text or "")
-
-            # Ensure the RTP payload type we emit matches the negotiated SDP answer.
-            # Setting this based on the offer can break negotiation if webrtcbin chooses a different PT.
-            if pt is not None and self.pay is not None:
-                try:
-                    self.pay.set_property("pt", int(pt))
-                    logger.info("Configured rtph264pay payload type from answer: pt=%d", int(pt))
-                except Exception as exc:
-                    logger.warning("Failed to set rtph264pay pt=%d from answer: %s", int(pt), exc)
-
-            with open("/home/mayor/Noesis_Devel/.cursor/debug.log", "a", encoding="utf-8") as _f:
-                _f.write(
-                    json.dumps(
-                        {
-                            "sessionId": "debug-session",
-                            "runId": "run1",
-                            "hypothesisId": "H4",
-                            "location": "mosaic_webrtc_gateway.py:_on_answer_created",
-                            "message": "answer sdp summary",
-                            "data": {
-                                "lines": sdp_lines,
-                                "has_video": bool(has_video),
-                                "video_direction": direction,
-                                "h264_pt": pt,
-                                "has_msid": bool(has_msid),
-                                "packetization_mode_1": bool(has_packetization_mode_1),
-                            },
-                            "timestamp": int(time.time() * 1000),
-                        }
-                    )
-                    + "\n"
-                )
-
-            if pt is not None:
-                with open("/home/mayor/Noesis_Devel/.cursor/debug.log", "a", encoding="utf-8") as _f:
-                    _f.write(
-                        json.dumps(
-                            {
-                                "sessionId": "debug-session",
-                                "runId": "run1",
-                                "hypothesisId": "H4",
-                                "location": "mosaic_webrtc_gateway.py:_on_answer_created",
-                                "message": "configured pay pt from answer",
-                                "data": {"pt": int(pt)},
-                                "timestamp": int(time.time() * 1000),
-                            }
-                        )
-                        + "\n"
-                    )
-
-            # Also record the full SDP (20-ish lines) for postmortem.
-            with open("/home/mayor/Noesis_Devel/.cursor/debug.log", "a", encoding="utf-8") as _f:
-                _f.write(
-                    json.dumps(
-                        {
-                            "sessionId": "debug-session",
-                            "runId": "run1",
-                            "hypothesisId": "H4",
-                            "location": "mosaic_webrtc_gateway.py:_on_answer_created",
-                            "message": "answer sdp",
-                            "data": {"sdp": sdp_text},
-                            "timestamp": int(time.time() * 1000),
-                        }
-                    )
-                    + "\n"
-                )
-        except Exception:
-            pass
-        #endregion
+        # Keep RTP caps aligned with the answer we are about to send. Offer-side
+        # alignment usually wins, but this catches webrtcbin choosing a different
+        # H264 PT during answer creation.
+        if pt is not None and self.pay is not None:
+            try:
+                self.pay.set_property("pt", int(pt))
+                pay_src = self.pay.get_static_pad("src")
+                if pay_src is not None:
+                    pay_src.send_event(Gst.Event.new_reconfigure())
+                logger.info("Configured rtph264pay payload type from answer: pt=%d", int(pt))
+            except Exception as exc:
+                logger.warning("Failed to set rtph264pay pt=%d from answer: %s", int(pt), exc)
 
         # Hard guardrail: never send an answer that disables the video m= section.
         # This is the "ICE connected but no video" failure mode in browsers.
@@ -1500,28 +1402,6 @@ class MosaicWebRTCGateway:
         try:
             self.webrtc.emit("add-ice-candidate", int(sdp_mline_index), candidate)
             logger.info("    ICE candidate added successfully")
-            #region agent log
-            try:
-                import json, time  # local import to avoid module-level impact
-
-                with open("/home/mayor/Noesis_Devel/.cursor/debug.log", "a", encoding="utf-8") as _f:
-                    _f.write(
-                        json.dumps(
-                            {
-                                "sessionId": "debug-session",
-                                "runId": "run1",
-                                "hypothesisId": "H4",
-                                "location": "mosaic_webrtc_gateway.py:accept_ice",
-                                "message": "accept ice",
-                                "data": {"mline": int(sdp_mline_index)},
-                                "timestamp": int(time.time() * 1000),
-                            }
-                        )
-                        + "\n"
-                    )
-            except Exception:
-                pass
-            #endregion
         except Exception as e:
             logger.warning("Error adding ICE candidate: %s", e)
 
@@ -1549,54 +1429,10 @@ class MosaicWebRTCGateway:
         err, debug = message.parse_error()
         logger.error("!!! WebRTC gateway pipeline ERROR: %s", err)
         logger.error("    Debug info: %s", debug)
-        #region agent log
-        try:
-            import json, time  # local import to avoid module-level impact
-
-            with open("/home/mayor/Noesis_Devel/.cursor/debug.log", "a", encoding="utf-8") as _f:
-                _f.write(
-                    json.dumps(
-                        {
-                            "sessionId": "debug-session",
-                            "runId": "run1",
-                            "hypothesisId": "H4",
-                            "location": "mosaic_webrtc_gateway.py:_on_bus_error",
-                            "message": "gateway bus error",
-                            "data": {"error": str(err), "debug": debug},
-                            "timestamp": int(time.time() * 1000),
-                        }
-                    )
-                    + "\n"
-                )
-        except Exception:
-            pass
-        #endregion
 
     def _on_bus_eos(self, bus: Gst.Bus, message: Gst.Message) -> None:
         """Handle end-of-stream."""
         logger.warning("WebRTC gateway pipeline received EOS")
-        #region agent log
-        try:
-            import json, time  # local import to avoid module-level impact
-
-            with open("/home/mayor/Noesis_Devel/.cursor/debug.log", "a", encoding="utf-8") as _f:
-                _f.write(
-                    json.dumps(
-                        {
-                            "sessionId": "debug-session",
-                            "runId": "run1",
-                            "hypothesisId": "H4",
-                            "location": "mosaic_webrtc_gateway.py:_on_bus_eos",
-                            "message": "gateway eos",
-                            "data": {},
-                            "timestamp": int(time.time() * 1000),
-                        }
-                    )
-                    + "\n"
-                )
-        except Exception:
-            pass
-        #endregion
 
     def _on_bus_state_changed(self, bus: Gst.Bus, message: Gst.Message) -> None:
         """Handle state changes."""

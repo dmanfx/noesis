@@ -764,26 +764,6 @@ class WebSocketServer:
                 self.logger.warning("No gateway owner for webrtc_answer; dropping answer")
             else:
                 self.logger.info("<<< Sending webrtc_answer to %d connected clients", len(self.connected_clients))
-        try:
-            import json as _json, time as _time
-
-            with open("/home/mayor/Noesis_Devel/.cursor/debug.log", "a", encoding="utf-8") as _f:
-                _f.write(
-                    _json.dumps(
-                        {
-                            "sessionId": "debug-session",
-                            "runId": "run1",
-                            "hypothesisId": "H4",
-                            "location": "websocket_server.py:send_webrtc_answer",
-                            "message": "send webrtc_answer",
-                            "data": {"clients": len(self.connected_clients), "sdp_lines": len((sdp or '').splitlines())},
-                            "timestamp": int(_time.time() * 1000),
-                        }
-                    )
-                    + "\n"
-                )
-        except Exception:
-            pass
         if owner is not None:
             self.send_to_client_sync(owner, msg)
         elif gateway is None:
@@ -809,26 +789,6 @@ class WebSocketServer:
                 self.logger.warning("No gateway owner for webrtc_ice_candidate; dropping candidate")
             else:
                 self.logger.info("<<< Sending webrtc_ice_candidate (mline=%d) to %d clients", mline_index, len(self.connected_clients))
-        try:
-            import json as _json, time as _time
-
-            with open("/home/mayor/Noesis_Devel/.cursor/debug.log", "a", encoding="utf-8") as _f:
-                _f.write(
-                    _json.dumps(
-                        {
-                            "sessionId": "debug-session",
-                            "runId": "run1",
-                            "hypothesisId": "H4",
-                            "location": "websocket_server.py:send_webrtc_ice",
-                            "message": "send webrtc_ice_candidate",
-                            "data": {"clients": len(self.connected_clients), "mline": int(mline_index)},
-                            "timestamp": int(_time.time() * 1000),
-                        }
-                    )
-                    + "\n"
-                )
-        except Exception:
-            pass
         if owner is not None:
             self.send_to_client_sync(owner, msg)
         elif gateway is None:
@@ -1848,56 +1808,6 @@ class WebSocketServer:
                                 slot,
                                 sdp_lines,
                             )
-                            try:
-                                import json as _json, time as _time
-
-                                with open("/home/mayor/Noesis_Devel/.cursor/debug.log", "a", encoding="utf-8") as _f:
-                                    _f.write(
-                                        _json.dumps(
-                                            {
-                                                "sessionId": "debug-session",
-                                                "runId": "run1",
-                                                "hypothesisId": "H4",
-                                                "location": "websocket_server.py:handle_client",
-                                                "message": "rx webrtc_offer",
-                                                "data": {"client": client_ip, "sdp_lines": sdp_lines},
-                                                "timestamp": int(_time.time() * 1000),
-                                            }
-                                        )
-                                        + "\n"
-                                    )
-                            except Exception:
-                                pass
-                            try:
-                                from pathlib import Path
-
-                                offer_dir = Path("/home/mayor/Noesis_Devel/.cursor/webrtc_offers")
-                                offer_dir.mkdir(parents=True, exist_ok=True)
-                                ts_ms = int(_time.time() * 1000)
-                                safe_client = str(client_ip).replace(":", "_")
-                                offer_path = offer_dir / f"offer_{ts_ms}_{safe_client}.sdp"
-                                offer_path.write_text(sdp or "", encoding="utf-8")
-                                with open("/home/mayor/Noesis_Devel/.cursor/debug.log", "a", encoding="utf-8") as _f:
-                                    _f.write(
-                                        _json.dumps(
-                                            {
-                                                "sessionId": "debug-session",
-                                                "runId": "run1",
-                                                "hypothesisId": "H4",
-                                                "location": "websocket_server.py:handle_client",
-                                                "message": "saved webrtc_offer",
-                                                "data": {
-                                                    "client": client_ip,
-                                                    "path": str(offer_path),
-                                                    "sdp_lines": sdp_lines,
-                                                },
-                                                "timestamp": ts_ms,
-                                            }
-                                        )
-                                        + "\n"
-                                    )
-                            except Exception:
-                                pass
                             gateway.accept_offer(sdp)
                         elif self.webrtc_elem is not None:
                             prev_owner = self._get_webrtc_owner()
@@ -1940,26 +1850,6 @@ class WebSocketServer:
                                 mline_index,
                                 candidate[:50] if candidate else '',
                             )
-                            try:
-                                import json as _json, time as _time
-
-                                with open("/home/mayor/Noesis_Devel/.cursor/debug.log", "a", encoding="utf-8") as _f:
-                                    _f.write(
-                                        _json.dumps(
-                                            {
-                                                "sessionId": "debug-session",
-                                                "runId": "run1",
-                                                "hypothesisId": "H4",
-                                                "location": "websocket_server.py:handle_client",
-                                                "message": "rx webrtc_ice_candidate",
-                                                "data": {"client": client_ip, "mline": int(mline_index)},
-                                                "timestamp": int(_time.time() * 1000),
-                                            }
-                                        )
-                                        + "\n"
-                                    )
-                            except Exception:
-                                pass
                             gateway.accept_ice(candidate, mline_index)
                         else:
                             owner = self._get_webrtc_owner()

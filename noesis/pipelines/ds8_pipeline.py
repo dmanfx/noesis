@@ -104,6 +104,7 @@ class DS8Pipeline:
     depth_gate_attach: Optional[str] = None
     rtsp_output_valve_name: Optional[str] = None
     rtsp_output_enabled: bool = True
+    rtsp_output_demand_gated: bool = False
     depth_frame_samples: List[float] = field(default_factory=list)
     depth_last_toggle: float = 0.0
     frame_size: Tuple[int, int] = field(default_factory=lambda: (0, 0))
@@ -1329,8 +1330,14 @@ def build_pipeline(yaml_path: str | Path) -> DS8Pipeline:
     rtsp_branch = {}
     rtsp_vconv_nvbuf_memory_type = zero_copy_nvbuf_memory_type
     if rtsp_enabled:
-        rtsp_demand_gated_env = str(os.environ.get("NOESIS_MOSAIC_RTSP_DEMAND_GATED", "1")).strip().lower()
-        rtsp_demand_gated = bool(mosaic_webrtc_enabled) and rtsp_demand_gated_env not in ("0", "false", "no", "off")
+        # Demand-gating defaults OFF: when the valve stays closed past startup,
+        # nvrtspoutsinkbin's RTSP media cannot prepare (DESCRIBE -> 503) and a
+        # late valve-open does not recover it, so viewers that connect long
+        # after boot get no video. Mosaic H.264 encoding runs on NVENC, so the
+        # always-on cost is negligible; set NOESIS_MOSAIC_RTSP_DEMAND_GATED=1
+        # to re-enable gating for experiments.
+        rtsp_demand_gated_env = str(os.environ.get("NOESIS_MOSAIC_RTSP_DEMAND_GATED", "0")).strip().lower()
+        rtsp_demand_gated = bool(mosaic_webrtc_enabled) and rtsp_demand_gated_env in ("1", "true", "yes", "on")
         rtsp_output_valve = Component(
             name="rtsp_output_valve",
             element="valve",
@@ -1396,6 +1403,7 @@ def build_pipeline(yaml_path: str | Path) -> DS8Pipeline:
         rtsp_output_valve.downstream = [rtsp_queue.name]
         pipeline.rtsp_output_valve_name = rtsp_output_valve.name
         pipeline.rtsp_output_enabled = not rtsp_demand_gated
+        pipeline.rtsp_output_demand_gated = bool(rtsp_demand_gated)
 
     source_decode_memtypes: List[Optional[int]] = []
     for source_cfg in sources:

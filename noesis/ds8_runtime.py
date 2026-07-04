@@ -2292,6 +2292,18 @@ def _build_stable_id_manager(logger: logging.Logger, *, pipeline_config: Optiona
         except Exception:
             xcam_handoff_margin = 0.06
         try:
+            early_reconcile_window_s = float(os.environ.get("NOESIS_REID_EARLY_RECONCILE_WINDOW_S", "6") or 6.0)
+        except Exception:
+            early_reconcile_window_s = 6.0
+        try:
+            early_reconcile_max_attempts = int(os.environ.get("NOESIS_REID_EARLY_RECONCILE_MAX_ATTEMPTS", "4") or 4)
+        except Exception:
+            early_reconcile_max_attempts = 4
+        try:
+            early_reconcile_max_support = int(os.environ.get("NOESIS_REID_EARLY_RECONCILE_MAX_SUPPORT", "4") or 4)
+        except Exception:
+            early_reconcile_max_support = 4
+        try:
             ghost_max_age_s = float(os.environ.get("NOESIS_REID_GHOST_MAX_AGE_S", "120") or 120.0)
         except Exception:
             ghost_max_age_s = 120.0
@@ -2393,6 +2405,9 @@ def _build_stable_id_manager(logger: logging.Logger, *, pipeline_config: Optiona
             "cos_sim_high_threshold": cos_sim_high_threshold,
             "xcam_handoff_window_s": xcam_handoff_window_s,
             "xcam_handoff_margin": xcam_handoff_margin,
+            "early_reconcile_window_s": early_reconcile_window_s,
+            "early_reconcile_max_attempts": early_reconcile_max_attempts,
+            "early_reconcile_max_support": early_reconcile_max_support,
             "max_ghost_age_s": ghost_max_age_s,
             "gallery_size": gallery_size,
             "gallery_persist_file": gallery_persist_file,
@@ -3122,108 +3137,98 @@ def _start_websocket_server(server: WebSocketServer) -> tuple[threading.Thread, 
     return thread, loop_holder.get("loop")
 
 
-def _wait_for_rtsp_ready(host: str, port: int, timeout: float = 15.0, interval: float = 0.2) -> bool:
-    """Wait for RTSP port to accept TCP connections before starting the gateway."""
+def _normalise_rtsp_mount(path: str) -> str:
+    mount = str(path or "mosaic").strip() or "mosaic"
+    return mount if mount.startswith("/") else f"/{mount}"
+
+
+def _probe_rtsp_describe(host: str, port: int, path: str, timeout: float = 0.8) -> tuple[bool, str]:
+    mount = _normalise_rtsp_mount(path)
+    uri = f"rtsp://{host}:{port}{mount}"
+    request = (
+        f"DESCRIBE {uri} RTSP/1.0\r\n"
+        "CSeq: 1\r\n"
+        "Accept: application/sdp\r\n"
+        "User-Agent: NoesisRTSPReady/1.0\r\n"
+        "Connection: close\r\n"
+        "\r\n"
+    )
+    try:
+        with socket.create_connection((host, port), timeout=timeout) as sock:
+            sock.settimeout(timeout)
+            sock.sendall(request.encode("ascii"))
+            data = b""
+            deadline = time.time() + timeout
+            while time.time() < deadline and b"\r\n\r\n" not in data:
+                chunk = sock.recv(4096)
+                if not chunk:
+                    break
+                data += chunk
+    except Exception as exc:
+        return False, str(exc)
+    text = data.decode("iso-8859-1", errors="replace")
+    status_line = text.splitlines()[0].strip() if text.splitlines() else "empty RTSP response"
+    parts = status_line.split()
+    status_code = 0
+    if len(parts) >= 2:
+        try:
+            status_code = int(parts[1])
+        except Exception:
+            status_code = 0
+    return 200 <= status_code < 300, status_line
+
+
+def _wait_for_rtsp_ready(
+    host: str,
+    port: int,
+    *,
+    path: Optional[str] = None,
+    timeout: float = 15.0,
+    interval: float = 0.2,
+) -> bool:
+    """Wait until the RTSP endpoint is accepting usable media requests."""
     deadline = time.time() + timeout
     addr = (host, port)
     attempt = 0
     start_ts = time.time()
     last_log = 0.0
-    #region agent log
-    try:
-        with open("/home/mayor/Noesis_Devel/.cursor/debug.log", "a", encoding="utf-8") as _f:
-            _f.write(
-                json.dumps(
-                    {
-                        "sessionId": "debug-session",
-                        "runId": "run1",
-                        "hypothesisId": "H2",
-                        "location": "ds8_runtime.py:_wait_for_rtsp_ready",
-                        "message": "rtsp wait start",
-                        "data": {"host": host, "port": port, "timeout_s": timeout},
-                        "timestamp": int(time.time() * 1000),
-                    }
-                )
-                + "\n"
-            )
-    except Exception:
-        pass
-    #endregion
+    last_status = ""
+    logger = logging.getLogger(__name__)
     while time.time() < deadline:
         attempt += 1
         try:
-            with socket.create_connection(addr, timeout=0.3):
-                #region agent log
-                try:
-                    with open("/home/mayor/Noesis_Devel/.cursor/debug.log", "a", encoding="utf-8") as _f:
-                        _f.write(
-                            json.dumps(
-                                {
-                                    "sessionId": "debug-session",
-                                    "runId": "run1",
-                                    "hypothesisId": "H2",
-                                    "location": "ds8_runtime.py:_wait_for_rtsp_ready",
-                                    "message": "rtsp port ready",
-                                    "data": {"host": host, "port": port, "attempt": attempt, "elapsed_ms": int((time.time() - (deadline - timeout)) * 1000)},
-                                    "timestamp": int(time.time() * 1000),
-                                }
-                            )
-                            + "\n"
-                        )
-                except Exception:
-                    pass
-                #endregion
-                return True
-        except Exception:
-            now = time.time()
-            if now - last_log >= 1.0:
-                last_log = now
-                #region agent log
-                try:
-                    with open("/home/mayor/Noesis_Devel/.cursor/debug.log", "a", encoding="utf-8") as _f:
-                        _f.write(
-                            json.dumps(
-                                {
-                                    "sessionId": "debug-session",
-                                    "runId": "run1",
-                                    "hypothesisId": "H2",
-                                    "location": "ds8_runtime.py:_wait_for_rtsp_ready",
-                                    "message": "rtsp wait attempt",
-                                    "data": {
-                                        "host": host,
-                                        "port": port,
-                                        "attempt": attempt,
-                                        "elapsed_ms": int((now - start_ts) * 1000),
-                                    },
-                                    "timestamp": int(time.time() * 1000),
-                                }
-                            )
-                            + "\n"
-                        )
-                except Exception:
-                    pass
-                #endregion
-            time.sleep(interval)
-    #region agent log
-    try:
-        with open("/home/mayor/Noesis_Devel/.cursor/debug.log", "a", encoding="utf-8") as _f:
-            _f.write(
-                json.dumps(
-                    {
-                        "sessionId": "debug-session",
-                        "runId": "run1",
-                        "hypothesisId": "H2",
-                        "location": "ds8_runtime.py:_wait_for_rtsp_ready",
-                        "message": "rtsp port not ready",
-                        "data": {"host": host, "port": port, "timeout_s": timeout},
-                        "timestamp": int(time.time() * 1000),
-                    }
+            if path is not None:
+                ready, last_status = _probe_rtsp_describe(host, port, path, timeout=min(0.8, max(0.2, interval)))
+                if ready:
+                    return True
+            else:
+                with socket.create_connection(addr, timeout=0.3):
+                    return True
+        except Exception as exc:
+            last_status = str(exc)
+        now = time.time()
+        if now - last_log >= 1.0:
+            last_log = now
+            if path is not None:
+                logger.debug(
+                    "Waiting for RTSP media at rtsp://%s:%s%s (%s, attempt=%d, elapsed=%.1fs)",
+                    host,
+                    port,
+                    _normalise_rtsp_mount(path),
+                    last_status or "no response",
+                    attempt,
+                    now - start_ts,
                 )
-                + "\n"
-            )
-    except Exception:
-        pass
-    #endregion
+            else:
+                logger.debug(
+                    "Waiting for RTSP port %s:%s (%s, attempt=%d, elapsed=%.1fs)",
+                    host,
+                    port,
+                    last_status or "not connected",
+                    attempt,
+                    now - start_ts,
+                )
+        time.sleep(interval)
     return False
 
 
@@ -3609,74 +3614,14 @@ def _on_bus_message(
         src_name = message.src.get_name() if message.src else "unknown"
         logger.error("🚨 Pipeline ERROR from '%s': %s", src_name, err.message)
         logger.error("🚨 Debug: %s", debug)
-        #region agent log
-        try:
-            with open("/home/mayor/Noesis_Devel/.cursor/debug.log", "a", encoding="utf-8") as _f:
-                _f.write(
-                    json.dumps(
-                        {
-                            "sessionId": "debug-session",
-                            "runId": "run1",
-                            "hypothesisId": "H2",
-                            "location": "ds8_runtime.py:_on_bus_message",
-                            "message": "bus error",
-                            "data": {"src": src_name, "error": err.message, "debug": debug},
-                            "timestamp": int(time.time() * 1000),
-                        }
-                    )
-                    + "\n"
-                )
-        except Exception:
-            pass
-        #endregion
         # Check if this is a source-related error suggesting stream issues
         if any(k in src_name.lower() for k in ("source", "urisrc", "rtspsrc", "decodebin")):
             logger.error("    → Source/decoder error; check RTSP stream connectivity.")
     elif msg_type == Gst.MessageType.EOS:
         logger.warning("⚠️ EOS received on pipeline (unexpected for live sources)")
-        #region agent log
-        try:
-            with open("/home/mayor/Noesis_Devel/.cursor/debug.log", "a", encoding="utf-8") as _f:
-                _f.write(
-                    json.dumps(
-                        {
-                            "sessionId": "debug-session",
-                            "runId": "run1",
-                            "hypothesisId": "H2",
-                            "location": "ds8_runtime.py:_on_bus_message",
-                            "message": "bus eos",
-                            "data": {},
-                            "timestamp": int(time.time() * 1000),
-                        }
-                    )
-                    + "\n"
-                )
-        except Exception:
-            pass
-        #endregion
     elif msg_type == Gst.MessageType.WARNING:
         warn, debug = message.parse_warning()
         logger.warning("⚠️ Pipeline warning: %s", warn.message)
-        #region agent log
-        try:
-            with open("/home/mayor/Noesis_Devel/.cursor/debug.log", "a", encoding="utf-8") as _f:
-                _f.write(
-                    json.dumps(
-                        {
-                            "sessionId": "debug-session",
-                            "runId": "run1",
-                            "hypothesisId": "H2",
-                            "location": "ds8_runtime.py:_on_bus_message",
-                            "message": "bus warning",
-                            "data": {"warning": warn.message, "debug": debug},
-                            "timestamp": int(time.time() * 1000),
-                        }
-                    )
-                    + "\n"
-                )
-        except Exception:
-            pass
-        #endregion
     elif msg_type == Gst.MessageType.STATE_CHANGED:
         if message.src and hasattr(message.src, "get_name"):
             name = message.src.get_name()
@@ -3690,31 +3635,6 @@ def _on_bus_message(
                     new.value_nick if new else "?",
                     pending.value_nick if pending else "none",
                 )
-                #region agent log
-                try:
-                    with open("/home/mayor/Noesis_Devel/.cursor/debug.log", "a", encoding="utf-8") as _f:
-                        _f.write(
-                            json.dumps(
-                                {
-                                    "sessionId": "debug-session",
-                                    "runId": "run1",
-                                    "hypothesisId": "H2",
-                                    "location": "ds8_runtime.py:_on_bus_message",
-                                    "message": "state change",
-                                    "data": {
-                                        "src": name,
-                                        "old": old.value_nick if old else "?",
-                                        "new": new.value_nick if new else "?",
-                                        "pending": pending.value_nick if pending else "none",
-                                    },
-                                    "timestamp": int(time.time() * 1000),
-                                }
-                            )
-                            + "\n"
-                        )
-                except Exception:
-                    pass
-                #endregion
 
     return True  # Keep receiving messages
 
@@ -3791,77 +3711,17 @@ def _start_pyservicemaker_wait_loop(
 
     def _wait_loop() -> None:
         try:
-            #region agent log
-            try:
-                with open("/home/mayor/Noesis_Devel/.cursor/debug.log", "a", encoding="utf-8") as _f:
-                    _f.write(
-                        json.dumps(
-                            {
-                                "sessionId": "debug-session",
-                                "runId": "run1",
-                                "hypothesisId": "H1",
-                                "location": "ds8_runtime.py:_start_pyservicemaker_wait_loop",
-                                "message": "wait() entered",
-                                "data": {},
-                                "timestamp": int(time.time() * 1000),
-                            }
-                        )
-                        + "\n"
-                    )
-            except Exception:
-                pass
-            #endregion
             logger.debug("pyservicemaker wait loop started")
             ds_pipeline.wait()
             logger.info("pyservicemaker wait() returned (pipeline stopped)")
         except Exception:
             logger.exception("pyservicemaker wait loop error")
-            #region agent log
-            try:
-                with open("/home/mayor/Noesis_Devel/.cursor/debug.log", "a", encoding="utf-8") as _f:
-                    _f.write(
-                        json.dumps(
-                            {
-                                "sessionId": "debug-session",
-                                "runId": "run1",
-                                "hypothesisId": "H1",
-                                "location": "ds8_runtime.py:_start_pyservicemaker_wait_loop",
-                                "message": "wait() exception",
-                                "data": {},
-                                "timestamp": int(time.time() * 1000),
-                            }
-                        )
-                        + "\n"
-                    )
-            except Exception:
-                pass
-            #endregion
         finally:
             was_signalled = shutdown_event.is_set()
             # Signal shutdown when pipeline stops
             shutdown_event.set()
             if state is not None and not was_signalled:
                 state["pipeline_failed"] = True
-            #region agent log
-            try:
-                with open("/home/mayor/Noesis_Devel/.cursor/debug.log", "a", encoding="utf-8") as _f:
-                    _f.write(
-                        json.dumps(
-                            {
-                                "sessionId": "debug-session",
-                                "runId": "run1",
-                                "hypothesisId": "H1",
-                                "location": "ds8_runtime.py:_start_pyservicemaker_wait_loop",
-                                "message": "wait() exited",
-                                "data": {},
-                                "timestamp": int(time.time() * 1000),
-                            }
-                        )
-                        + "\n"
-                    )
-            except Exception:
-                pass
-            #endregion
 
     thread = threading.Thread(target=_wait_loop, name="DS8-WaitLoop", daemon=True)
     thread.start()
@@ -4981,32 +4841,6 @@ def main() -> int:
         rtsp_built,
         mosaic_webrtc_enabled,
     )
-    #region agent log
-    try:
-        with open("/home/mayor/Noesis_Devel/.cursor/debug.log", "a", encoding="utf-8") as _f:
-            _f.write(
-                json.dumps(
-                    {
-                        "sessionId": "debug-session",
-                        "runId": "run1",
-                        "hypothesisId": "H2",
-                        "location": "ds8_runtime.py:main",
-                        "message": "mosaic toggles",
-                        "data": {
-                            "rtsp_enabled": bool(mosaic_cfg.get("rtsp_enabled", False)),
-                            "rtsp_port": rtsp_port,
-                            "rtsp_path": rtsp_path,
-                            "webrtc_enabled": mosaic_webrtc_enabled,
-                            "rtsp_built": rtsp_built,
-                        },
-                        "timestamp": int(time.time() * 1000),
-                    }
-                )
-                + "\n"
-            )
-    except Exception:
-        pass
-    #endregion
 
     streammux_cfg = pipeline.config.get("streammux") or {}
     try:
@@ -5733,33 +5567,23 @@ def main() -> int:
     if mosaic_webrtc_enabled:
         if rtsp_built:
             try:
-                ready = _wait_for_rtsp_ready("127.0.0.1", rtsp_port, timeout=15.0, interval=0.2)
+                ready = _wait_for_rtsp_ready(
+                    "127.0.0.1",
+                    rtsp_port,
+                    path=rtsp_path,
+                    timeout=30.0,
+                    interval=0.5,
+                )
                 if not ready:
-                    logger.error("RTSP sink not ready on 127.0.0.1:%s; skipping WebRTC gateway start", rtsp_port)
-                    #region agent log
-                    try:
-                        with open("/home/mayor/Noesis_Devel/.cursor/debug.log", "a", encoding="utf-8") as _f:
-                            _f.write(
-                                json.dumps(
-                                    {
-                                        "sessionId": "debug-session",
-                                        "runId": "run1",
-                                        "hypothesisId": "H2",
-                                        "location": "ds8_runtime.py:main",
-                                        "message": "gateway skipped - rtsp not ready",
-                                        "data": {"host": "127.0.0.1", "port": rtsp_port},
-                                        "timestamp": int(time.time() * 1000),
-                                    }
-                                )
-                                + "\n"
-                            )
-                    except Exception:
-                        pass
-                    #endregion
+                    logger.error(
+                        "RTSP sink not ready at rtsp://127.0.0.1:%s%s; skipping WebRTC gateway start",
+                        rtsp_port,
+                        _normalise_rtsp_mount(rtsp_path),
+                    )
                 else:
                     from noesis.mosaic_webrtc_gateway import MosaicWebRTCGateway
 
-                    rtsp_uri = f"rtsp://127.0.0.1:{rtsp_port}/{rtsp_path}"
+                    rtsp_uri = f"rtsp://127.0.0.1:{rtsp_port}{_normalise_rtsp_mount(rtsp_path)}"
                     try:
                         max_webrtc_clients = max(1, int(os.environ.get("NOESIS_MOSAIC_WEBRTC_MAX_CLIENTS", "5")))
                     except Exception:
@@ -5772,7 +5596,8 @@ def main() -> int:
                     rtsp_keyframe_requester = _build_rtsp_keyframe_requester(pipeline, logger)
                     if rtsp_keyframe_requester is None:
                         logger.debug("RTSP keyframe requester unavailable; falling back to natural IDR cadence")
-                    if getattr(pipeline, "rtsp_output_valve_name", None):
+                    rtsp_demand_gated = bool(getattr(pipeline, "rtsp_output_demand_gated", False))
+                    if getattr(pipeline, "rtsp_output_valve_name", None) and rtsp_demand_gated:
 
                         def _set_webrtc_activity(active: bool) -> None:
                             try:
@@ -5816,30 +5641,6 @@ def main() -> int:
                         max_webrtc_clients,
                         len(webrtc_gateways),
                     )
-                    #region agent log
-                    try:
-                        with open("/home/mayor/Noesis_Devel/.cursor/debug.log", "a", encoding="utf-8") as _f:
-                            _f.write(
-                                json.dumps(
-                                    {
-                                        "sessionId": "debug-session",
-                                        "runId": "run1",
-                                        "hypothesisId": "H4",
-                                        "location": "ds8_runtime.py:main",
-                                        "message": "gateway started",
-                                        "data": {
-                                            "rtsp_uri": rtsp_uri,
-                                            "warm_slots": len(webrtc_gateways),
-                                            "max_slots": max_webrtc_clients,
-                                        },
-                                        "timestamp": int(time.time() * 1000),
-                                    }
-                                )
-                                + "\n"
-                            )
-                    except Exception:
-                        pass
-                    #endregion
             except Exception:
                 logger.exception("Failed to start WebRTC gateway")
         else:

@@ -532,6 +532,129 @@ def process_inventory(
     return sorted(processes, key=lambda item: (not item.get("looks_like_ds8", False), int(item["pid"])))
 
 
+def noesis_port_ownership(diagnostics: Mapping[str, Any]) -> Dict[int, Dict[str, Any]]:
+    """Map busy DS8-owned port numbers to the runtime that owns them."""
+    processes = [
+        item
+        for item in (diagnostics.get("processes") or [])
+        if isinstance(item, Mapping) and item.get("looks_like_ds8")
+    ]
+    ds8_pids = {int(item.get("pid") or 0) for item in processes if item.get("pid")}
+    ownership: Dict[int, Dict[str, Any]] = {}
+
+    for process in processes:
+        pid = int(process.get("pid") or 0)
+        if not pid:
+            continue
+        for port in process.get("ports") or []:
+            if not isinstance(port, Mapping) or port.get("label") == "Console":
+                continue
+            try:
+                port_num = int(port.get("port") or 0)
+            except (TypeError, ValueError):
+                continue
+            if port_num <= 0:
+                continue
+            ownership[port_num] = {
+                "pid": pid,
+                "managed_by_console": bool(process.get("managed_by_console")),
+                "label": str(port.get("label") or port_num),
+            }
+
+    for item in diagnostics.get("ports") or []:
+        if not isinstance(item, Mapping) or not item.get("busy") or item.get("label") == "Console":
+            continue
+        try:
+            port_num = int(item.get("port") or 0)
+        except (TypeError, ValueError):
+            continue
+        if port_num <= 0 or port_num in ownership:
+            continue
+        owner = item.get("owner") if isinstance(item.get("owner"), Mapping) else {}
+        owner_pids = set(_pids_from_owner(owner))
+        if not owner_pids or not owner_pids.issubset(ds8_pids):
+            continue
+        pid = next(iter(owner_pids))
+        process = next((entry for entry in processes if int(entry.get("pid") or 0) == pid), {})
+        ownership[port_num] = {
+            "pid": pid,
+            "managed_by_console": bool(process.get("managed_by_console")),
+            "label": str(item.get("label") or port_num),
+        }
+    return ownership
+
+
+def _process_port_number(process: Mapping[str, Any], label: str) -> Optional[int]:
+    for port in process.get("ports") or []:
+        if not isinstance(port, Mapping) or port.get("label") != label:
+            continue
+        try:
+            return int(port.get("port"))
+        except (TypeError, ValueError):
+            return None
+    return None
+
+
+def _coerce_port(value: Any) -> Optional[int]:
+    if value in (None, ""):
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def runtime_target_from_process(process: Mapping[str, Any]) -> Dict[str, Any]:
+    launch = process.get("launch") if isinstance(process.get("launch"), Mapping) else {}
+    ws_port = _coerce_port(launch.get("ws_port")) or _process_port_number(process, "WebSocket")
+    rest_port = _coerce_port(launch.get("rest_port")) or _process_port_number(process, "REST")
+    rtsp_port = _coerce_port(launch.get("rtsp_port")) or _process_port_number(process, "RTSP mosaic")
+    return {
+        "pid": process.get("pid"),
+        "managed_by_console": bool(process.get("managed_by_console")),
+        "looks_like_ds8": bool(process.get("looks_like_ds8")),
+        "launch": dict(launch),
+        "ports": list(process.get("ports") or []),
+        "stats": dict(process.get("stats") or {}),
+        "command": str(process.get("command") or ""),
+        "ws_host": str(launch.get("ws_host") or "127.0.0.1"),
+        "ws_port": ws_port,
+        "rest_host": str(launch.get("rest_host") or "127.0.0.1"),
+        "rest_port": rest_port,
+        "rtsp_port": rtsp_port,
+    }
+
+
+def observed_runtime_target(
+    processes: Iterable[Mapping[str, Any]],
+    *,
+    managed_pid: Optional[int] = None,
+    spec: Optional[LaunchSpec] = None,
+) -> Optional[Dict[str, Any]]:
+    ds8 = [item for item in processes if item.get("looks_like_ds8")]
+    if managed_pid is not None:
+        managed = next((item for item in ds8 if int(item.get("pid") or 0) == int(managed_pid)), None)
+        if managed is not None:
+            return runtime_target_from_process(managed)
+    external = [item for item in ds8 if not item.get("managed_by_console")]
+    if not external:
+        return None
+    if spec is not None and len(external) > 1:
+        for item in external:
+            target = runtime_target_from_process(item)
+            if target.get("ws_port") == int(spec.ws_port):
+                return target
+    ranked = sorted(
+        external,
+        key=lambda item: (
+            -len(item.get("ports") or []),
+            -int((item.get("stats") or {}).get("elapsed_s") or 0),
+            int(item.get("pid") or 0),
+        ),
+    )
+    return runtime_target_from_process(ranked[0])
+
+
 def diagnostics_snapshot(spec: LaunchSpec, *, managed_pid: Optional[int] = None) -> Dict[str, Any]:
     ports = [
         port_status(spec.ws_host, int(spec.ws_port), label="WebSocket"),
@@ -545,12 +668,14 @@ def diagnostics_snapshot(spec: LaunchSpec, *, managed_pid: Optional[int] = None)
         "rtsp_port": find_free_port("127.0.0.1", int(spec.rtsp_port)),
     }
     processes = process_inventory(ports, managed_pid=managed_pid)
+    observed_runtime = observed_runtime_target(processes, managed_pid=managed_pid, spec=spec)
     return {
         "ports": ports,
         "suggested_ports": suggestions,
         "artifacts": artifact_audit(spec),
         "gpu": gpu_snapshot(),
         "processes": processes,
+        "observed_runtime": observed_runtime,
         "ds8_runtimes": [
             {
                 "pid": item.get("pid"),

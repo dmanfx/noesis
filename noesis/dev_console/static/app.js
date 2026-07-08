@@ -26,7 +26,24 @@ const state = {
   selectedStageId: null,
   validationReady: false,
   validationBlocking: false,
+  activePhase: "configure",
+  simpleMode: false,
+  lastUpdated: {},
+  observedRuntime: null,
+  portsPinned: false,
+  runtimeMirroredKey: null,
+  launchDetached: false,
 };
+
+const CONSOLE_PHASES = [
+  { id: "configure", label: "Configure" },
+  { id: "preflight", label: "Preflight" },
+  { id: "operate", label: "Operate" },
+  { id: "debug", label: "Debug" },
+];
+
+const SIMPLE_SECTIONS = new Set(["decision", "preflight", "live", "logs"]);
+const SIMPLE_MODE_KEY = "noesis_dev_console_simple";
 
 const $ = (id) => document.getElementById(id);
 const FORM_TARGETS = {
@@ -38,25 +55,25 @@ const FORM_TARGETS = {
   strict_baseline: "strictInput",
 };
 const COMMAND_SECTIONS = [
-  { id: "launch", label: "Launch", statusId: "launchIdLabel" },
-  { id: "decision", label: "Decision", statusId: "decisionSummary" },
-  { id: "candidates", label: "Candidates", statusId: "candidateSummary" },
-  { id: "gates", label: "Gates", statusId: "gateSummary" },
-  { id: "preflight", label: "Preflight", statusId: "preflightCounts" },
-  { id: "runtime", label: "Runtime", statusId: "pidLabel" },
-  { id: "runbook", label: "Runbook", statusId: "runbookSummary" },
-  { id: "plan", label: "Plan", statusId: "planSummary" },
-  { id: "diff", label: "Diff", statusId: "diffSummary" },
-  { id: "models", label: "Models", statusId: "matrixSummary" },
-  { id: "sources", label: "Sources", statusId: "sourceSummary" },
-  { id: "flow", label: "Flow", statusId: "flowHighlight" },
-  { id: "readiness", label: "Readiness", statusId: "readinessSummary" },
-  { id: "processes", label: "Processes", statusId: "processSummary" },
-  { id: "live", label: "Live", statusId: "liveSummary" },
-  { id: "bundles", label: "Bundles", statusId: "bundleLibrarySummary" },
-  { id: "health", label: "Health", statusId: "healthSummary" },
-  { id: "activity", label: "Activity", statusId: "activitySummary" },
-  { id: "logs", label: "Logs", statusId: "logInsightSummary" },
+  { id: "launch", label: "Launch", statusId: "launchIdLabel", phase: "configure" },
+  { id: "decision", label: "Decision", statusId: "decisionSummary", phase: "preflight" },
+  { id: "candidates", label: "Candidates", statusId: "candidateSummary", phase: "preflight" },
+  { id: "gates", label: "Gates", statusId: "gateSummary", phase: "configure" },
+  { id: "preflight", label: "Preflight", statusId: "preflightCounts", phase: "preflight" },
+  { id: "runtime", label: "Runtime", statusId: "pidLabel", phase: "preflight" },
+  { id: "runbook", label: "Runbook", statusId: "runbookSummary", phase: "preflight" },
+  { id: "plan", label: "Plan", statusId: "planSummary", phase: "preflight" },
+  { id: "diff", label: "Diff", statusId: "diffSummary", phase: "preflight" },
+  { id: "models", label: "Models", statusId: "matrixSummary", phase: "configure" },
+  { id: "sources", label: "Sources", statusId: "sourceSummary", phase: "configure" },
+  { id: "flow", label: "Flow", statusId: "flowHighlight", phase: "operate" },
+  { id: "readiness", label: "Readiness", statusId: "readinessSummary", phase: "operate" },
+  { id: "processes", label: "Processes", statusId: "processSummary", phase: "operate" },
+  { id: "live", label: "Live", statusId: "liveSummary", phase: "operate" },
+  { id: "bundles", label: "Bundles", statusId: "bundleLibrarySummary", phase: "debug" },
+  { id: "health", label: "Health", statusId: "healthSummary", phase: "operate" },
+  { id: "activity", label: "Activity", statusId: "activitySummary", phase: "debug" },
+  { id: "logs", label: "Logs", statusId: "logInsightSummary", phase: "debug" },
 ];
 let commandObserver = null;
 const ACTION_STATUS_RANK = { blocked: 0, block: 0, attention: 1, warn: 1, running: 2, ready: 3, ok: 3, info: 4 };
@@ -76,6 +93,311 @@ const ACTION_TARGETS = {
   strict_baseline: { action: "gates", label: "Gates" },
   validation: { action: "validate", label: "Validate" },
 };
+
+function touchFreshness(key) {
+  state.lastUpdated[key] = Date.now();
+  updateStatusStrip();
+}
+
+function freshnessLabel(key) {
+  const ts = state.lastUpdated[key];
+  if (!ts) return null;
+  const ageSec = Math.max(0, Math.round((Date.now() - ts) / 1000));
+  if (ageSec < 5) return "just now";
+  if (ageSec < 60) return `${ageSec}s ago`;
+  return `${Math.round(ageSec / 60)}m ago`;
+}
+
+function updateStatusStrip() {
+  syncRuntimeIdentity();
+  const runtime = state.runtime || {};
+  const running = Boolean(runtime.running);
+  const external = externalDs8Runtimes();
+  const observed = activeObservedRuntime();
+  const activePid = activeRuntimePid();
+  const runtimeChip = $("statusChipRuntime");
+  const runtimeText = $("statusRuntimeText");
+  if (runtimeText) {
+    if (running) {
+      runtimeText.textContent = "running";
+    } else if (external.length) {
+      const ws = observed?.ws_port ? ` · ws ${observed.ws_port}` : "";
+      runtimeText.textContent = `external (${external.length})${ws}`;
+    } else {
+      runtimeText.textContent = "stopped";
+    }
+  }
+  if (runtimeChip) {
+    runtimeChip.dataset.status = running ? "running" : (external.length ? "warn" : "idle");
+  }
+
+  const health = state.liveHealth || {};
+  const healthText = $("statusHealthText");
+  const healthChip = $("statusChipHealth");
+  if (healthText) {
+    healthText.textContent = health.status ? `health ${health.score ?? "--"}` : "health --";
+  }
+  if (healthChip) {
+    healthChip.dataset.status = health.status === "healthy" ? "ok" : (health.status === "down" ? "block" : (health.status ? "warn" : "idle"));
+  }
+
+  const pidText = $("statusPidText");
+  const pidChip = $("statusChipPid");
+  if (pidText) pidText.textContent = activePid ? `pid ${activePid}` : "pid -";
+  if (pidChip) {
+    if (!activePid) {
+      pidChip.dataset.status = "idle";
+    } else if (running || observed?.managed_by_console) {
+      pidChip.dataset.status = "running";
+    } else {
+      pidChip.dataset.status = "warn";
+    }
+  }
+
+  const live = state.live || {};
+  const wsText = $("statusWsText");
+  const wsChip = $("statusChipWs");
+  if (wsText) {
+    wsText.textContent = live.connected ? (live.pong ? "ws pong" : "ws live") : "ws idle";
+  }
+  if (wsChip) {
+    wsChip.dataset.status = live.connected ? "ok" : (live.error ? "block" : "idle");
+  }
+
+  const freshText = $("statusFreshText");
+  if (freshText) {
+    const runtimeAge = freshnessLabel("runtime");
+    const diagAge = freshnessLabel("diagnostics");
+    freshText.textContent = runtimeAge ? `runtime ${runtimeAge}` : (diagAge ? `diag ${diagAge}` : "sync pending");
+  }
+}
+
+function setActivePhase(phaseId, { scroll = true } = {}) {
+  if (state.simpleMode) return;
+  if (!CONSOLE_PHASES.some((phase) => phase.id === phaseId)) return;
+  state.activePhase = phaseId;
+  document.querySelectorAll(".phase-tab").forEach((tab) => {
+    tab.classList.toggle("active", tab.dataset.phase === phaseId);
+    tab.setAttribute("aria-selected", tab.dataset.phase === phaseId ? "true" : "false");
+  });
+  applyPhaseVisibility();
+  filterCommandCenter();
+  if (scroll) {
+    $("mainGrid")?.scrollIntoView({ behavior: "smooth", block: "start" });
+  }
+}
+
+function applyPhaseVisibility() {
+  document.body.classList.toggle("simple-mode", state.simpleMode);
+
+  if (state.simpleMode) {
+    document.querySelectorAll("#mainGrid [data-section]").forEach((panel) => {
+      const section = panel.dataset.section || "";
+      panel.classList.toggle("phase-hidden", !SIMPLE_SECTIONS.has(section));
+    });
+    document.querySelectorAll(".launch-section").forEach((section) => {
+      section.open = true;
+    });
+    return;
+  }
+
+  const phase = state.activePhase;
+  document.querySelectorAll("#mainGrid [data-phase]").forEach((panel) => {
+    const phases = (panel.dataset.phase || "").split(/\s+/);
+    const section = panel.dataset.section || "";
+    const phaseOk = !phase || phases.includes(phase);
+    panel.classList.toggle("phase-hidden", !phaseOk);
+  });
+  document.querySelectorAll("#mainGrid [data-section]").forEach((panel) => {
+    if (!panel.dataset.phase) {
+      panel.classList.remove("phase-hidden");
+    }
+  });
+}
+
+function relocateLaunchActions(simple) {
+  const actions = $("launchActions");
+  const mission = $("simpleMissionActions");
+  const home = $("launchActionsHome");
+  if (!actions || !mission || !home) return;
+  if (simple) {
+    mission.removeAttribute("hidden");
+    mission.appendChild(actions);
+  } else {
+    home.appendChild(actions);
+    mission.setAttribute("hidden", "");
+  }
+}
+
+function updateSimpleRecipeLine() {
+  const line = $("simpleRecipeLine");
+  if (!line) return;
+  if (!state.simpleMode) {
+    line.hidden = true;
+    return;
+  }
+  const preset = $("presetSelect")?.selectedOptions?.[0]?.textContent?.trim() || "custom";
+  const model = $("profileSelect")?.value || "-";
+  const size = $("sizeSelect")?.value || "auto";
+  const track = $("trackingSelect")?.value || "baseline";
+  const ws = $("wsPortInput")?.value || "-";
+  const rest = $("restPortInput")?.value || "-";
+  const rtsp = $("rtspPortInput")?.value || "-";
+  line.textContent = `${preset} · ${model}:${size} · ${track} · ${ws}/${rest}/${rtsp}`;
+  line.hidden = false;
+}
+
+function updateSimplePreflightState() {
+  const split = document.querySelector('.split[data-section="preflight"]');
+  if (!split) return;
+  if (!state.simpleMode) {
+    split.classList.remove("simple-clean", "simple-issues", "simple-hidden");
+    return;
+  }
+  const counts = state.validation?.counts || state.validation?.validation?.counts || {};
+  const blocks = counts.block || 0;
+  const warns = counts.warn || 0;
+  split.classList.toggle("simple-hidden", !state.validationReady);
+  split.classList.toggle("simple-clean", Boolean(state.validationReady) && blocks === 0 && warns === 0);
+  split.classList.toggle("simple-issues", Boolean(state.validationReady) && (blocks > 0 || warns > 0));
+}
+
+function updateSimpleLayout() {
+  if (!state.simpleMode) return;
+  updateSimpleRecipeLine();
+  updateSimplePreflightState();
+}
+
+function setSimpleMode(enabled, { persist = true } = {}) {
+  state.simpleMode = Boolean(enabled);
+  const input = $("simpleModeInput");
+  if (input) input.checked = state.simpleMode;
+  if (persist) {
+    try {
+      localStorage.setItem(SIMPLE_MODE_KEY, state.simpleMode ? "1" : "0");
+    } catch (_err) {
+      /* ignore storage failures */
+    }
+  }
+  relocateLaunchActions(state.simpleMode);
+  applyPhaseVisibility();
+  filterCommandCenter();
+  updateSimpleLayout();
+  if (state.simpleMode) {
+    window.scrollTo({ top: 0, behavior: "instant" in window ? "instant" : "auto" });
+  }
+}
+
+function phaseBadgeCount(phaseId) {
+  let blocks = 0;
+  let warns = 0;
+  for (const section of COMMAND_SECTIONS.filter((item) => item.phase === phaseId)) {
+    const status = $(section.statusId);
+    const kind = classifyCommandStatus((status?.textContent || "").trim());
+    if (kind === "block") blocks += 1;
+    if (kind === "warn") warns += 1;
+  }
+  if (blocks) return { text: String(blocks), kind: "block" };
+  if (warns) return { text: String(warns), kind: "warn" };
+  return null;
+}
+
+function updatePhaseBadges() {
+  for (const phase of CONSOLE_PHASES) {
+    const tab = document.querySelector(`.phase-tab[data-phase="${phase.id}"]`);
+    if (!tab) continue;
+    const badge = phaseBadgeCount(phase.id);
+    const existing = tab.querySelector(".phase-badge");
+    if (existing) existing.remove();
+    if (badge) {
+      const node = document.createElement("span");
+      node.className = `phase-badge ${badge.kind}`;
+      node.textContent = badge.text;
+      tab.appendChild(node);
+    }
+  }
+}
+
+function setupPhaseTabs() {
+  const tabs = $("phaseTabs");
+  if (!tabs) return;
+  tabs.innerHTML = "";
+  for (const phase of CONSOLE_PHASES) {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = `phase-tab ${phase.id === state.activePhase ? "active" : ""}`;
+    button.dataset.phase = phase.id;
+    button.setAttribute("role", "tab");
+    button.setAttribute("aria-selected", phase.id === state.activePhase ? "true" : "false");
+    button.textContent = phase.label;
+    button.addEventListener("click", () => setActivePhase(phase.id));
+    tabs.appendChild(button);
+  }
+  applyPhaseVisibility();
+}
+
+function openInspectorDrawer() {
+  const drawer = $("inspectorDrawer");
+  const backdrop = $("inspectorBackdrop");
+  if (!drawer) return;
+  drawer.classList.add("open");
+  drawer.setAttribute("aria-hidden", "false");
+  if (backdrop) backdrop.hidden = false;
+  state.inspectorOpen = true;
+}
+
+function closeInspectorDrawer() {
+  const drawer = $("inspectorDrawer");
+  const backdrop = $("inspectorBackdrop");
+  if (!drawer) return;
+  drawer.classList.remove("open");
+  drawer.setAttribute("aria-hidden", "true");
+  if (backdrop) backdrop.hidden = true;
+  state.inspectorOpen = false;
+}
+
+function openLogDrawer() {
+  const drawer = $("logDrawer");
+  if (!drawer) return;
+  drawer.classList.add("open");
+  drawer.setAttribute("aria-hidden", "false");
+  state.logDrawerOpen = true;
+  tailLogs().catch(() => {});
+}
+
+function closeLogDrawer() {
+  const drawer = $("logDrawer");
+  if (!drawer) return;
+  drawer.classList.remove("open");
+  drawer.setAttribute("aria-hidden", "true");
+  state.logDrawerOpen = false;
+}
+
+function openShortcutsDialog() {
+  const dialog = $("shortcutsDialog");
+  if (!dialog) return;
+  if (typeof dialog.showModal === "function") dialog.showModal();
+}
+
+function closeShortcutsDialog() {
+  const dialog = $("shortcutsDialog");
+  if (!dialog) return;
+  if (typeof dialog.close === "function") dialog.close();
+}
+
+function isTypingTarget(target) {
+  return Boolean(target?.closest("input, textarea, select, [contenteditable='true']"));
+}
+
+function highlightLogLine(line) {
+  const text = String(line || "");
+  const lower = text.toLowerCase();
+  let cls = "";
+  if (/\berror\b|traceback|exception|failed/.test(lower)) cls = "log-line-error";
+  else if (/\bwarn(ing)?\b/.test(lower)) cls = "log-line-warn";
+  else if (/\binfo\b/.test(lower)) cls = "log-line-info";
+  return `<span class="${cls}">${escapeHtml(text)}</span>`;
+}
 
 async function api(path, options = {}) {
   const response = await fetch(path, {
@@ -140,10 +462,13 @@ function updateCommandCenter() {
     button.title = `${button.dataset.label}: ${text || "unknown"}`;
   }
   filterCommandCenter();
+  updatePhaseBadges();
+  updateStatusStrip();
 }
 
 function jumpToCommandSection(sectionId) {
   const section = COMMAND_SECTIONS.find((item) => item.id === sectionId);
+  if (section?.phase) setActivePhase(section.phase, { scroll: false });
   const target = section && commandTarget(section);
   if (!target) return;
   document.querySelectorAll(".command-item").forEach((item) => item.classList.toggle("active", item.dataset.sectionId === sectionId));
@@ -154,10 +479,18 @@ function filterCommandCenter() {
   const input = $("commandFilter");
   const rail = $("commandRail");
   if (!input || !rail) return;
+  if (state.simpleMode) {
+    rail.hidden = true;
+    return;
+  }
+  rail.hidden = false;
   const query = input.value.trim().toLowerCase();
   for (const button of rail.querySelectorAll(".command-item")) {
+    const section = COMMAND_SECTIONS.find((item) => item.id === button.dataset.sectionId);
+    const phaseMatch = !state.activePhase || section?.phase === state.activePhase;
     const haystack = `${button.dataset.label || ""} ${button.querySelector("strong")?.textContent || ""}`.toLowerCase();
-    button.hidden = Boolean(query && !haystack.includes(query));
+    const textMatch = !query || haystack.includes(query);
+    button.hidden = !(phaseMatch && textMatch);
   }
 }
 
@@ -172,6 +505,7 @@ function setupCommandCenter() {
     button.dataset.sectionId = section.id;
     button.dataset.statusId = section.statusId;
     button.dataset.label = section.label;
+    button.dataset.phase = section.phase || "";
     button.innerHTML = `<span>${escapeHtml(section.label)}</span><strong>unknown</strong>`;
     button.addEventListener("click", () => jumpToCommandSection(section.id));
     rail.appendChild(button);
@@ -180,8 +514,19 @@ function setupCommandCenter() {
   const input = $("commandFilter");
   input?.addEventListener("input", filterCommandCenter);
   input?.addEventListener("keydown", (event) => {
-    if (event.key === "Enter") {
-      const firstVisible = rail.querySelector(".command-item:not([hidden])");
+    const visible = [...rail.querySelectorAll(".command-item:not([hidden])")];
+    if (event.key === "ArrowDown" || event.key === "ArrowRight") {
+      event.preventDefault();
+      const idx = visible.findIndex((item) => item.classList.contains("active"));
+      const next = visible[(idx + 1 + visible.length) % visible.length];
+      next?.focus();
+    } else if (event.key === "ArrowUp" || event.key === "ArrowLeft") {
+      event.preventDefault();
+      const idx = visible.findIndex((item) => item.classList.contains("active"));
+      const next = visible[(idx - 1 + visible.length) % visible.length];
+      next?.focus();
+    } else if (event.key === "Enter") {
+      const firstVisible = visible[0];
       firstVisible?.click();
     } else if (event.key === "Escape") {
       input.value = "";
@@ -194,6 +539,46 @@ function setupCommandCenter() {
       event.preventDefault();
       input?.focus();
       input?.select();
+      return;
+    }
+    if (isTypingTarget(event.target)) return;
+    if (event.key === "?") {
+      event.preventDefault();
+      openShortcutsDialog();
+      return;
+    }
+    if (event.key >= "1" && event.key <= "4" && !event.ctrlKey && !event.metaKey && !event.altKey) {
+      const phase = CONSOLE_PHASES[Number(event.key) - 1];
+      if (phase) {
+        event.preventDefault();
+        setActivePhase(phase.id);
+      }
+      return;
+    }
+    if (event.key.toLowerCase() === "v" && !event.shiftKey) {
+      event.preventDefault();
+      validateLaunch().catch((err) => toast(err.message));
+      return;
+    }
+    if (event.key.toLowerCase() === "s" && event.shiftKey) {
+      event.preventDefault();
+      stopRuntime().catch((err) => toast(err.message));
+      return;
+    }
+    if (event.key.toLowerCase() === "s" && !event.shiftKey) {
+      event.preventDefault();
+      startRuntime();
+      return;
+    }
+    if (event.key.toLowerCase() === "l") {
+      event.preventDefault();
+      openLogDrawer();
+      return;
+    }
+    if (event.key === "Escape") {
+      if (state.inspectorOpen) closeInspectorDrawer();
+      if (state.logDrawerOpen) closeLogDrawer();
+      closeShortcutsDialog();
     }
   });
 
@@ -421,33 +806,105 @@ function envLinesFromObject(env) {
     .join("\n");
 }
 
-async function applySpecToForm(spec) {
-  $("presetSelect").value = "";
-  $("pipelineInput").value = spec.pipeline_config || "config/infer.yaml";
-  $("camerasInput").value = spec.cameras_config || "config/cameras.yaml";
-  $("profileSelect").value = spec.pgie_profile || "yolo11_seg";
-  $("sizeSelect").value = spec.size || "";
-  $("trackingSelect").value = spec.tracking_mode || "baseline";
-  $("wsPortInput").value = spec.ws_port || 6008;
-  $("restPortInput").value = spec.rest_port || 8080;
-  $("rtspPortInput").value = spec.rtsp_port || 8554;
-  $("logLevelSelect").value = spec.log_level || "WARNING";
-  $("depthSecondsInput").value = spec.depth_enable_seconds || 0;
-  $("strictInput").checked = Boolean(spec.strict_baseline);
-  $("envInput").value = envLinesFromObject(spec.env || {});
-  markValidationStale();
+async function refreshDependentLaunchPanels({ includeDecision = true } = {}) {
   await renderFlow();
-  await loadDiagnostics();
   await loadLaunchPlan().catch(() => {});
   await loadLaunchDiff().catch(() => {});
   await loadRemediation().catch(() => {});
   await loadGates().catch(() => {});
   await loadModelMatrix().catch(() => {});
   await loadSources().catch(() => {});
-  await loadLaunchDecision().catch(() => {});
+  if (includeDecision) await loadLaunchDecision().catch(() => {});
+}
+
+function applyLaunchSpecToFormFields(spec, { coreOnly = false } = {}) {
+  if (!spec) return false;
+  let changed = false;
+  const apply = (id, value, { checkbox = false } = {}) => {
+    if (value === undefined || value === null) return;
+    const input = $(id);
+    if (!input) return;
+    const next = checkbox ? Boolean(value) : String(value);
+    const current = checkbox ? input.checked : input.value;
+    if (current === next || (!checkbox && String(current) === String(next))) return;
+    if (checkbox) input.checked = next;
+    else input.value = next;
+    changed = true;
+  };
+
+  if ($("presetSelect") && $("presetSelect").value !== "") {
+    $("presetSelect").value = "";
+    changed = true;
+  }
+
+  apply("pipelineInput", spec.pipeline_config || "config/infer.yaml");
+  apply("camerasInput", spec.cameras_config || "config/cameras.yaml");
+  apply("profileSelect", spec.pgie_profile || "yolo11_seg");
+  apply("sizeSelect", spec.size ?? "");
+  apply("trackingSelect", spec.tracking_mode || "baseline");
+  apply("wsPortInput", spec.ws_port ?? 6008);
+  apply("restPortInput", spec.rest_port ?? 8080);
+  apply("rtspPortInput", spec.rtsp_port ?? 8554);
+
+  if (coreOnly) return changed;
+
+  apply("logLevelSelect", spec.log_level || "WARNING");
+  apply("depthSecondsInput", spec.depth_enable_seconds ?? 0);
+  apply("strictInput", Boolean(spec.strict_baseline), { checkbox: true });
+  if (spec.env && $("envInput")) {
+    const nextEnv = envLinesFromObject(spec.env);
+    if ($("envInput").value !== nextEnv) {
+      $("envInput").value = nextEnv;
+      changed = true;
+    }
+  }
+  return changed;
+}
+
+function specFromObservedRuntime(observed = activeObservedRuntime()) {
+  const runtime = state.runtime || {};
+  if (runtime.running && runtime.spec) {
+    return { ...runtime.spec, preset_id: "" };
+  }
+  if (!observed) return null;
+
+  const process = findProcessByPid(observed.pid) || {};
+  const launch = observed.launch || {};
+  const env = process.env || {};
+  return {
+    preset_id: "",
+    pipeline_config: launch.pipeline_config || env.NOESIS_DS8_PIPELINE_CONFIG || "config/infer.yaml",
+    cameras_config: launch.cameras_config || env.NOESIS_CAMERAS_CONFIG || "config/cameras.yaml",
+    pgie_profile: launch.pgie_profile || env.NOESIS_PGIE_PROFILE || "yolo11_seg",
+    size: launch.size ?? env.NOESIS_PGIE_SIZE ?? "",
+    tracking_mode: launch.tracking_mode || env.NOESIS_TRACKING_MODE || "baseline",
+    ws_host: observed.ws_host || launch.ws_host || "127.0.0.1",
+    ws_port: Number(observed.ws_port || launch.ws_port || 6008),
+    rest_host: observed.rest_host || launch.rest_host || "127.0.0.1",
+    rest_port: Number(observed.rest_port || launch.rest_port || 8080),
+    rtsp_port: Number(observed.rtsp_port || launch.rtsp_port || 8554),
+    enable_rest: launch.enable_rest !== false,
+    log_level: launch.log_level || env.NOESIS_LOG_LEVEL || "WARNING",
+    depth_enable_seconds: Number(launch.depth_enable_seconds || env.NOESIS_DEPTH_ENABLE_SECONDS || 0),
+    strict_baseline: env.NOESIS_STRICT_BASELINE === "1",
+    env: Object.fromEntries(
+      Object.entries(env).filter(([key]) => key.startsWith("NOESIS_") || key === "CUDA_VISIBLE_DEVICES" || key === "NVIDIA_VISIBLE_DEVICES")
+    ),
+  };
+}
+
+async function applySpecToForm(spec) {
+  state.launchDetached = true;
+  state.runtimeMirroredKey = null;
+  applyLaunchSpecToFormFields(spec);
+  markValidationStale();
+  await loadDiagnostics({ syncRuntime: false });
+  await refreshDependentLaunchPanels();
 }
 
 function applyPreset(presetId) {
+  state.launchDetached = true;
+  state.runtimeMirroredKey = null;
   const preset = state.presets.find((item) => item.id === presetId);
   if (!preset) return;
   $("pipelineInput").value = preset.pipeline_config || "config/infer.yaml";
@@ -470,6 +927,7 @@ function applyPreset(presetId) {
   loadSources();
   loadLaunchDecision();
   $("decisionSummary").textContent = "stale";
+  updateSimpleLayout();
 }
 
 function renderProfiles(items) {
@@ -491,10 +949,179 @@ function renderProfiles(items) {
   $("profileCount").textContent = `${state.profiles.length} saved`;
 }
 
+function coercePid(value) {
+  if (value === undefined || value === null || value === "") return null;
+  const parsed = Number(value);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : null;
+}
+
+function findProcessByPid(pid) {
+  const needle = coercePid(pid);
+  if (!needle) return null;
+  return (state.diagnostics?.processes || []).find((item) => coercePid(item?.pid) === needle) || null;
+}
+
+function pickBestDs8Runtime(candidates) {
+  const items = (candidates || []).filter(Boolean);
+  if (!items.length) return null;
+  const wsPort = Number($("wsPortInput")?.value || 0);
+  if (wsPort) {
+    const matched = items.find((process) => {
+      const launch = process.launch || {};
+      if (Number(launch.ws_port) === wsPort) return true;
+      return (process.ports || []).some((port) => {
+        const label = String(port.label || "").toLowerCase();
+        return Number(port.port) === wsPort && label.includes("websocket");
+      });
+    });
+    if (matched) return matched;
+  }
+  return [...items].sort((left, right) => {
+    const portDelta = (right.ports || []).length - (left.ports || []).length;
+    if (portDelta) return portDelta;
+    return Number((right.stats || {}).elapsed_s || 0) - Number((left.stats || {}).elapsed_s || 0);
+  })[0];
+}
+
 function externalDs8Runtimes() {
   const diagnostics = state.diagnostics || {};
   const runtimes = diagnostics.ds8_runtimes || (diagnostics.processes || []).filter((item) => item.looks_like_ds8);
   return runtimes.filter((item) => !item.managed_by_console);
+}
+
+function resolveObservedRuntime() {
+  if (state.runtime?.running) {
+    const managedPid = coercePid(state.runtime.pid);
+    const managedProcess = findProcessByPid(managedPid);
+    if (managedProcess) return runtimeTargetFromProcess(managedProcess);
+    return runtimeTargetFromProcess({
+      pid: managedPid,
+      managed_by_console: true,
+      looks_like_ds8: true,
+      launch: {},
+      ports: [],
+      stats: { elapsed_s: state.runtime.uptime_s },
+    });
+  }
+
+  const observed = state.diagnostics?.observed_runtime;
+  if (observed) {
+    const process = findProcessByPid(observed.pid);
+    return runtimeTargetFromProcess(process || observed);
+  }
+
+  const external = pickBestDs8Runtime(externalDs8Runtimes());
+  if (external) return runtimeTargetFromProcess(external);
+
+  const ds8Processes = pickBestDs8Runtime((state.diagnostics?.processes || []).filter((item) => item.looks_like_ds8));
+  if (ds8Processes) return runtimeTargetFromProcess(ds8Processes);
+
+  return null;
+}
+
+function activeObservedRuntime() {
+  return state.observedRuntime || resolveObservedRuntime();
+}
+
+function activeRuntimePid() {
+  return coercePid(activeObservedRuntime()?.pid) ?? coercePid(state.runtime?.pid);
+}
+
+function syncRuntimeIdentity() {
+  const observed = resolveObservedRuntime();
+  if (observed) state.observedRuntime = observed;
+  return observed;
+}
+
+function runtimeTargetFromProcess(process) {
+  const launch = process?.launch || {};
+  const port = (label) => (process?.ports || []).find((item) => item.label === label)?.port;
+  return {
+    pid: coercePid(process?.pid),
+    managed_by_console: Boolean(process?.managed_by_console),
+    looks_like_ds8: Boolean(process?.looks_like_ds8),
+    launch,
+    ports: process?.ports || [],
+    stats: process?.stats || {},
+    command: process?.command || "",
+    ws_host: launch.ws_host || "127.0.0.1",
+    ws_port: launch.ws_port || port("WebSocket"),
+    rest_host: launch.rest_host || "127.0.0.1",
+    rest_port: launch.rest_port || port("REST"),
+    rtsp_port: launch.rtsp_port || port("RTSP mosaic"),
+  };
+}
+
+function adoptObservedRuntime(observed, { silent = false } = {}) {
+  if (!observed) return false;
+  const changed = applyLaunchSpecToFormFields(specFromObservedRuntime(observed));
+  state.observedRuntime = observed;
+  if (changed && !silent) {
+    toast(`Targeting ${observed.managed_by_console ? "console" : "external"} runtime pid ${observed.pid}`);
+  }
+  return changed;
+}
+
+async function syncFormWithActiveRuntime({ silent = true, force = false } = {}) {
+  const observed = syncRuntimeIdentity();
+  const activePid = activeRuntimePid();
+  if (!activePid || !observed) {
+    state.runtimeMirroredKey = null;
+    return false;
+  }
+
+  if (state.launchDetached && !force) return false;
+
+  const mirrorKey = String(activePid);
+  const alreadyMirrored = state.runtimeMirroredKey === mirrorKey && !force;
+
+  if (state.simpleMode) {
+    if (state.runtime?.running) return false;
+    if (state.portsPinned && !force) return false;
+    if (observed.managed_by_console) return false;
+    const changed = adoptObservedRuntime(observed, { silent });
+    if (changed) {
+      state.runtimeMirroredKey = mirrorKey;
+      markValidationStale();
+      updateSimpleLayout();
+      await renderFlow();
+    }
+    return changed;
+  }
+
+  if (state.portsPinned && !force) return false;
+
+  const spec = specFromObservedRuntime(observed);
+  const changed = applyLaunchSpecToFormFields(spec) || force || !alreadyMirrored;
+  state.observedRuntime = observed;
+  state.runtimeMirroredKey = mirrorKey;
+
+  if (!changed && alreadyMirrored) return false;
+
+  if (!silent) {
+    toast(`Mirroring ${observed.managed_by_console ? "console" : "external"} runtime pid ${activePid} in launch controls`);
+  }
+  $("launchIdLabel").textContent = observed.managed_by_console
+    ? (state.runtime?.launch_id || spec?.launch_id || "running")
+    : `ext:${activePid}`;
+  markValidationStale();
+  await refreshDependentLaunchPanels();
+  return true;
+}
+
+function maybeSyncObservedRuntime(options = {}) {
+  return syncFormWithActiveRuntime(options);
+}
+
+function hasLiveTarget() {
+  const observed = activeObservedRuntime();
+  if (observed?.ws_port) return true;
+  return Boolean($("wsPortInput")?.value);
+}
+
+function shouldAutoProbeLive() {
+  if (state.runtime?.running) return true;
+  return Boolean(state.diagnostics?.observed_runtime?.ws_port);
 }
 
 function updateRuntimePill() {
@@ -516,18 +1143,32 @@ function updateRuntimePill() {
 
 function renderRuntime(runtime) {
   state.runtime = runtime || {};
+  syncRuntimeIdentity();
   const running = Boolean(runtime?.running);
+  const observed = activeObservedRuntime();
+  const activePid = activeRuntimePid();
+  const external = !running && observed && !observed.managed_by_console;
   updateRuntimePill();
-  $("pidLabel").textContent = runtime?.pid ? `pid ${runtime.pid}` : "pid -";
-  $("stateMetric").textContent = running ? "running" : "stopped";
-  $("uptimeMetric").textContent = running && runtime.uptime_s ? `${Math.round(runtime.uptime_s)}s` : "0s";
-  $("launchMetric").textContent = runtime?.launch_id || "none";
-  $("launchIdLabel").textContent = runtime?.launch_id || "draft";
+  if (external) {
+    $("pidLabel").textContent = activePid ? `pid ${activePid}` : "pid -";
+    $("stateMetric").textContent = "external";
+    $("uptimeMetric").textContent = observed.stats?.elapsed_s ? `${Math.round(observed.stats.elapsed_s)}s` : "0s";
+    $("launchMetric").textContent = observed.launch?.pgie_profile || observed.launch?.launch_id || "external";
+    $("launchIdLabel").textContent = `ext:${activePid || "-"}`;
+  } else {
+    $("pidLabel").textContent = activePid ? `pid ${activePid}` : "pid -";
+    $("stateMetric").textContent = running ? "running" : "stopped";
+    $("uptimeMetric").textContent = running && runtime.uptime_s ? `${Math.round(runtime.uptime_s)}s` : "0s";
+    $("launchMetric").textContent = runtime?.launch_id || "none";
+    $("launchIdLabel").textContent = runtime?.launch_id || "draft";
+  }
   const decisionBlocksStart = state.launchDecision ? !state.launchDecision.start_allowed : state.launchDecisionStale;
   $("startButton").disabled = running || state.validationBlocking || !state.validationReady || decisionBlocksStart;
   $("restartButton").disabled = !running || state.validationBlocking || !state.validationReady;
   $("stopButton").disabled = !running;
   renderActionBoard(state.launchDecision);
+  touchFreshness("runtime");
+  updateSimpleLayout();
 }
 
 function renderPresets(items) {
@@ -557,11 +1198,18 @@ function renderValidation(validation) {
   state.validationReady = Boolean(validation);
   state.validationBlocking = Boolean(validation?.blocking || validation?.validation?.blocking);
   renderRuntime(state.runtime);
+  updateSimpleLayout();
   list.innerHTML = "";
   const counts = validation?.counts || validation?.validation?.counts || { block: 0, warn: 0, info: 0 };
   $("preflightCounts").textContent = `${counts.block || 0} block / ${counts.warn || 0} warn / ${counts.info || 0} info`;
   if (!results.length) {
-    list.innerHTML = '<div class="validation-item info"><strong>No validation run yet</strong><p>Preview or validate a launch.</p></div>';
+    list.innerHTML = `
+      <div class="panel-empty-cta">
+        <strong>No validation run yet</strong>
+        <p>Preview materializes the launch artifact. Validate runs full preflight checks.</p>
+        <button type="button" class="button primary" id="validationEmptyValidate">Validate Launch</button>
+      </div>`;
+    list.querySelector("#validationEmptyValidate")?.addEventListener("click", () => validateLaunch().catch((err) => toast(err.message)));
     return;
   }
   for (const item of results) {
@@ -599,6 +1247,7 @@ function selectStage(stageId) {
     node.classList.toggle("selected", node.dataset.stageId === stageId);
   });
   renderInspector();
+  openInspectorDrawer();
 }
 
 function renderInspector() {
@@ -792,7 +1441,14 @@ function renderKnobs() {
 function renderLogs(payload) {
   $("logPath").textContent = payload?.path || "runtime.log";
   const lines = payload?.lines || [];
-  $("logOutput").textContent = lines.length ? lines.join("\n") : "No console runtime logs yet.";
+  const output = $("logOutput");
+  if (!output) return;
+  if (!lines.length) {
+    output.textContent = "No console runtime logs yet.";
+    return;
+  }
+  output.innerHTML = lines.map((line) => highlightLogLine(line)).join("\n");
+  touchFreshness("logs");
 }
 
 function renderLogInsights(payload) {
@@ -861,6 +1517,7 @@ function renderLogInsights(payload) {
 
 function renderDiagnostics(payload) {
   state.diagnostics = payload;
+  syncRuntimeIdentity();
   updateRuntimePill();
   const grid = $("readinessGrid");
   grid.innerHTML = "";
@@ -909,6 +1566,11 @@ function renderDiagnostics(payload) {
     grid.appendChild(tile);
   }
   renderProcesses(payload?.processes || []);
+  if (shouldAutoProbeLive() && hasLiveTarget()) {
+    probeLive().catch(() => {});
+  }
+  renderRuntime(state.runtime);
+  touchFreshness("diagnostics");
 }
 
 function renderProcesses(processes) {
@@ -947,6 +1609,9 @@ function renderProcesses(processes) {
       .join("");
     const role = process.managed_by_console ? "console-managed" : "external";
     const kind = process.looks_like_ds8 ? "DS8 runtime" : "port owner";
+    const adopt = process.looks_like_ds8
+      ? `<div class="process-actions"><button type="button" class="button subtle" data-adopt-runtime="${escapeHtml(process.pid)}">Target this runtime</button></div>`
+      : "";
     card.innerHTML = `
       <div class="process-title">
         <strong>PID ${escapeHtml(process.pid)} · ${escapeHtml(kind)}</strong>
@@ -962,6 +1627,7 @@ function renderProcesses(processes) {
       </div>
       ${launchRows ? `<div class="process-launch">${launchRows}</div>` : ""}
       ${envRows ? `<div class="process-env">${envRows}</div>` : ""}
+      ${adopt}
     `;
     box.appendChild(card);
   }
@@ -1227,7 +1893,13 @@ function renderLaunchDecision(payload) {
     $("decisionScore").textContent = "--";
     $("decisionStatus").textContent = "unknown";
     document.querySelector(".decision-score")?.setAttribute("data-status", "unknown");
-    $("decisionPrimary").innerHTML = "<strong>No decision yet</strong><p>Evaluate the current launch selection to see the go/no-go verdict.</p>";
+    $("decisionPrimary").innerHTML = `
+      <strong>No decision yet</strong>
+      <p>Evaluate the current launch selection to see the go/no-go verdict.</p>
+      <div class="panel-empty-cta" style="margin-top:10px">
+        <button type="button" class="button primary" id="decisionEmptyEvaluate">Evaluate Launch</button>
+      </div>`;
+    $("decisionPrimary").querySelector("#decisionEmptyEvaluate")?.addEventListener("click", () => loadLaunchDecision(true).catch((err) => toast(err.message)));
     $("decisionComponents").innerHTML = "";
     $("decisionActions").innerHTML = "";
     renderActionBoard(null);
@@ -1273,6 +1945,7 @@ function renderLaunchDecision(payload) {
     actions.appendChild(row);
   }
   renderActionBoard(payload);
+  updateSimpleLayout();
 }
 
 function selectedSegmentValue(segment) {
@@ -1296,7 +1969,13 @@ function renderGateDeck(payload) {
     ? `${summary.active || 0} active / ${summary.explicit_overrides || 0} override`
     : "not loaded";
   if (!payload || !(payload.groups || []).length) {
-    deck.innerHTML = '<div class="gate-group empty"><strong>No gates loaded</strong><p>Refresh the deck after selecting a launch profile.</p></div>';
+    deck.innerHTML = `
+      <div class="gate-group empty panel-empty-cta">
+        <strong>No gates loaded</strong>
+        <p>Refresh the deck after selecting a launch profile and ports.</p>
+        <button type="button" class="button primary" id="gateEmptyRefresh">Refresh Gates</button>
+      </div>`;
+    deck.querySelector("#gateEmptyRefresh")?.addEventListener("click", () => loadGates(true).catch((err) => toast(err.message)));
     return;
   }
 
@@ -1600,7 +2279,9 @@ function renderLive(payload) {
   const stats = payload.stats || {};
   const app = stats.application || {};
   const pipe = stats.pipeline || {};
-  $("liveSummary").textContent = payload.pong ? "connected / pong" : "connected";
+  const stack = stats.stack || "ds8";
+  const cameras = app.cameras_active ?? stats.camera_count ?? "-";
+  $("liveSummary").textContent = `${stack} · ${cameras} cam${payload.pong ? " · pong" : ""}`;
   const types = Object.entries(payload.message_types || {}).map(([key, value]) => `${key}:${value}`).join(" ");
   box.innerHTML = `
     <div class="live-stat-grid">
@@ -1616,6 +2297,7 @@ function renderLive(payload) {
     <p class="live-types">${escapeHtml(types || "No message types recorded")}</p>
   `;
   $("toggleTrailsButton").textContent = payload.trail_enabled === false ? "Enable Trails" : "Disable Trails";
+  touchFreshness("live");
 }
 
 function renderLiveHealth(payload) {
@@ -1663,6 +2345,7 @@ function renderLiveHealth(payload) {
   });
   state.healthHistory = state.healthHistory.slice(0, 8);
   renderHealthHistory();
+  touchFreshness("health");
 }
 
 function renderHealthHistory() {
@@ -1948,10 +2631,11 @@ async function loadRemediation() {
   return payload;
 }
 
-async function loadDiagnostics() {
+async function loadDiagnostics({ syncRuntime = true } = {}) {
   try {
     const payload = await api("/api/diagnostics", { method: "POST", body: JSON.stringify(specFromForm()) });
     renderDiagnostics(payload);
+    if (syncRuntime) await syncFormWithActiveRuntime({ silent: true });
     return payload;
   } catch (err) {
     toast(`Diagnostics unavailable: ${err.message}`);
@@ -1959,9 +2643,24 @@ async function loadDiagnostics() {
   }
 }
 
+async function adoptRuntimeByPid(pid) {
+  const process = (state.diagnostics?.processes || []).find((item) => String(item.pid) === String(pid));
+  if (!process) {
+    toast("Runtime no longer observed");
+    return;
+  }
+  state.portsPinned = false;
+  state.launchDetached = false;
+  state.runtimeMirroredKey = null;
+  state.observedRuntime = runtimeTargetFromProcess(process);
+  await syncFormWithActiveRuntime({ silent: false, force: true });
+  await probeLive(true).catch((err) => toast(err.message));
+}
+
 async function validateLaunch() {
   const payload = await api("/api/launch/validate", { method: "POST", body: JSON.stringify(specFromForm()) });
   renderValidation(payload);
+  touchFreshness("validation");
   await loadDiagnostics();
   await loadLaunchPlan();
   await loadLaunchDiff();
@@ -1996,6 +2695,7 @@ async function startRuntime() {
   try {
     const payload = await api("/api/runtime/start", { method: "POST", body: JSON.stringify(specFromForm()) });
     renderRuntime(payload);
+    if (!state.simpleMode) await syncFormWithActiveRuntime({ silent: true, force: true });
     toast("DS8 launch requested");
     await tailLogs();
     await loadActivity().catch(() => {});
@@ -2013,6 +2713,7 @@ async function restartRuntime() {
   try {
     const payload = await api("/api/runtime/restart", { method: "POST", body: JSON.stringify(specFromForm()) });
     renderRuntime(payload);
+    if (!state.simpleMode) await syncFormWithActiveRuntime({ silent: true, force: true });
     toast("DS8 restart requested");
     await tailLogs();
     await loadActivity().catch(() => {});
@@ -2028,6 +2729,7 @@ async function restartRuntime() {
 
 async function stopRuntime() {
   const payload = await api("/api/runtime/stop", { method: "POST", body: "{}" });
+  state.runtimeMirroredKey = null;
   renderRuntime(payload);
   toast("Stop signal sent");
   await tailLogs();
@@ -2038,6 +2740,9 @@ async function stopRuntime() {
 async function refreshRuntime() {
   const payload = await api("/api/runtime/status");
   renderRuntime(payload);
+  if (!state.simpleMode && activeRuntimePid()) {
+    await syncFormWithActiveRuntime({ silent: true });
+  }
 }
 
 async function tailLogs() {
@@ -2078,7 +2783,9 @@ async function probeLive(recordActivity = false) {
   renderLive(payload);
   await loadLiveHealth(recordActivity);
   if (recordActivity) await loadActivity().catch(() => {});
-  toast(payload.connected ? "Live WS probe complete" : `Live WS unavailable: ${payload.error || "unknown"}`);
+  if (recordActivity) {
+    toast(payload.connected ? "Live WS probe complete" : `Live WS unavailable: ${payload.error || "unknown"}`);
+  }
   return payload;
 }
 
@@ -2134,13 +2841,26 @@ async function useFreePorts() {
 
 function bindEvents() {
   $("presetSelect").addEventListener("change", (event) => applyPreset(event.target.value));
-  $("profileSelect").addEventListener("change", () => { markValidationStale(); renderFlow(); loadDiagnostics(); loadGates(); loadModelMatrix(); loadSources(); });
-  $("sizeSelect").addEventListener("change", () => { markValidationStale(); renderFlow(); loadDiagnostics(); loadGates(); loadModelMatrix(); loadSources(); });
-  $("trackingSelect").addEventListener("change", () => { markValidationStale(); renderFlow(); loadDiagnostics(); loadGates(); loadModelMatrix(); loadSources(); });
+  $("simpleModeInput")?.addEventListener("change", (event) => {
+    setSimpleMode(Boolean(event.target.checked));
+  });
+  $("refreshAllButton")?.addEventListener("click", () => refreshAll().catch((err) => toast(err.message)));
+  $("shortcutsButton")?.addEventListener("click", () => openShortcutsDialog());
+  $("shortcutsClose")?.addEventListener("click", () => closeShortcutsDialog());
+  $("inspectorDrawerClose")?.addEventListener("click", () => closeInspectorDrawer());
+  $("inspectorBackdrop")?.addEventListener("click", () => closeInspectorDrawer());
+  $("openLogDrawerButton")?.addEventListener("click", () => openLogDrawer());
+  $("openLogDrawerButton2")?.addEventListener("click", () => openLogDrawer());
+  $("logDrawerClose")?.addEventListener("click", () => closeLogDrawer());
+  $("logDrawerRefresh")?.addEventListener("click", () => tailLogs().then(() => toast("Log tail refreshed")).catch((err) => toast(err.message)));
+  $("profileSelect").addEventListener("change", () => { markValidationStale(); updateSimpleLayout(); renderFlow(); loadDiagnostics(); loadGates(); loadModelMatrix(); loadSources(); });
+  $("sizeSelect").addEventListener("change", () => { markValidationStale(); updateSimpleLayout(); renderFlow(); loadDiagnostics(); loadGates(); loadModelMatrix(); loadSources(); });
+  $("trackingSelect").addEventListener("change", () => { markValidationStale(); updateSimpleLayout(); renderFlow(); loadDiagnostics(); loadGates(); loadModelMatrix(); loadSources(); });
   ["pipelineInput", "camerasInput", "wsPortInput", "restPortInput", "rtspPortInput", "depthSecondsInput", "logLevelSelect", "strictInput", "envInput"].forEach((id) => {
     const eventName = id === "envInput" || id.endsWith("Input") ? "input" : "change";
     $(id).addEventListener(eventName, () => {
       markValidationStale();
+      updateSimpleLayout();
       if (id === "wsPortInput" || id === "restPortInput" || id === "rtspPortInput" || id === "pipelineInput" || id === "camerasInput") {
         loadDiagnostics();
       }
@@ -2195,7 +2915,7 @@ function bindEvents() {
   $("freePortsButton").addEventListener("click", () => useFreePorts().catch((err) => toast(err.message)));
   $("depthButton").addEventListener("click", () => depthBurst().catch((err) => toast(err.message)));
   $("runtimeHealthButton").addEventListener("click", () => runtimeHealth().catch((err) => toast(err.message)));
-  $("logsButton").addEventListener("click", () => tailLogs().catch((err) => toast(err.message)));
+  $("logsButton").addEventListener("click", () => tailLogs().then(() => openLogDrawer()).catch((err) => toast(err.message)));
   $("logTailButton").addEventListener("click", () => tailLogs().then(() => toast("Log tail refreshed")).catch((err) => toast(err.message)));
   $("logInsightButton").addEventListener("click", () => loadLogInsights().then(() => toast("Log analysis refreshed")).catch((err) => toast(err.message)));
   $("probeLiveButton").addEventListener("click", () => probeLive(true).catch((err) => toast(err.message)));
@@ -2214,6 +2934,30 @@ function bindEvents() {
     loadBundleDetail(card.dataset.bundleId).catch((err) => toast(err.message));
   });
   $("knobFilter").addEventListener("input", renderKnobs);
+  $("processList").addEventListener("click", (event) => {
+    const button = event.target.closest("[data-adopt-runtime]");
+    if (!button) return;
+    adoptRuntimeByPid(button.dataset.adoptRuntime).catch((err) => toast(err.message));
+  });
+  for (const id of ["profileSelect", "sizeSelect", "trackingSelect", "pipelineInput", "camerasInput", "logLevelSelect", "depthSecondsInput", "strictInput", "envInput", "presetSelect"]) {
+    $(id)?.addEventListener("input", () => {
+      if (!state.simpleMode) state.launchDetached = true;
+    });
+    $(id)?.addEventListener("change", () => {
+      if (!state.simpleMode) state.launchDetached = true;
+    });
+  }
+  for (const id of ["wsPortInput", "restPortInput", "rtspPortInput"]) {
+    $(id)?.addEventListener("input", () => {
+      state.portsPinned = true;
+      if (!state.simpleMode) state.launchDetached = true;
+    });
+  }
+}
+
+async function refreshAll() {
+  await init();
+  toast("Console refreshed");
 }
 
 async function init() {
@@ -2233,19 +2977,29 @@ async function init() {
   await loadModelMatrix().catch(() => {});
   await loadSources().catch(() => {});
   await loadLaunchDecision().catch(() => {});
-  if ($("wsPortInput").value === "6008") {
+  if (shouldAutoProbeLive() && hasLiveTarget()) {
     probeLive().catch(() => {});
     loadLiveHealth().catch(() => {});
   }
   await refreshRuntime();
   await tailLogs();
+  updateStatusStrip();
 }
 
+setupPhaseTabs();
 setupCommandCenter();
 bindEvents();
+try {
+  if (localStorage.getItem(SIMPLE_MODE_KEY) === "1") setSimpleMode(true, { persist: false });
+} catch (_err) {
+  /* ignore storage failures */
+}
 init().catch((err) => toast(err.message));
-setInterval(() => refreshRuntime().catch(() => {}), 4000);
+setInterval(() => {
+  refreshRuntime().catch(() => {});
+  updateStatusStrip();
+}, 4000);
 setInterval(() => loadDiagnostics().catch(() => {}), 12000);
 setInterval(() => {
-  if ($("wsPortInput")?.value === "6008") loadLiveHealth().catch(() => {});
+  if (hasLiveTarget()) loadLiveHealth().catch(() => {});
 }, 10000);

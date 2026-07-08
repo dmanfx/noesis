@@ -1,9 +1,8 @@
 from __future__ import annotations
 
-import re
-from typing import Any, Dict, List, Mapping, Optional, Set
+from typing import Any, Dict, List, Mapping, Optional
 
-from noesis.dev_console.diagnostics import diagnostics_snapshot
+from noesis.dev_console.diagnostics import diagnostics_snapshot, noesis_port_ownership
 from noesis.dev_console.launch_plan import build_launch_plan
 from noesis.dev_console.launch_spec import LaunchSpec
 from noesis.dev_console.model_matrix import build_model_matrix
@@ -44,46 +43,9 @@ def _worst_status(components: List[Mapping[str, Any]]) -> str:
     return worst
 
 
-def _owner_pids(owner: Mapping[str, Any]) -> Set[int]:
-    pids: Set[int] = set()
-    raw_pids = owner.get("pids")
-    if isinstance(raw_pids, list):
-        for pid in raw_pids:
-            try:
-                pids.add(int(pid))
-            except (TypeError, ValueError):
-                continue
-    text = f"{owner.get('users', '')} {owner.get('raw', '')}"
-    for match in re.finditer(r"\bpid=(\d+)\b", text):
-        pids.add(int(match.group(1)))
-    return pids
-
-
-def _managed_port_numbers(diagnostics: Mapping[str, Any], managed_pid: Optional[int]) -> Set[int]:
-    if managed_pid is None:
-        return set()
+def _busy_non_console_ports(diagnostics: Mapping[str, Any]) -> List[Mapping[str, Any]]:
     ports = diagnostics.get("ports") if isinstance(diagnostics.get("ports"), list) else []
-    managed_ports: Set[int] = set()
-    for item in ports:
-        if not isinstance(item, Mapping) or not item.get("busy") or item.get("label") == "Console":
-            continue
-        owner = item.get("owner") if isinstance(item.get("owner"), Mapping) else {}
-        pids = _owner_pids(owner)
-        if pids and pids == {int(managed_pid)}:
-            try:
-                managed_ports.add(int(item.get("port")))
-            except (TypeError, ValueError):
-                continue
-    return managed_ports
-
-
-def _busy_non_console_ports(
-    diagnostics: Mapping[str, Any],
-    *,
-    ignore_managed_pid: Optional[int] = None,
-) -> List[Mapping[str, Any]]:
-    ports = diagnostics.get("ports") if isinstance(diagnostics.get("ports"), list) else []
-    managed_ports = _managed_port_numbers(diagnostics, ignore_managed_pid)
+    noesis_ports = set(noesis_port_ownership(diagnostics))
     return [
         item
         for item in ports
@@ -91,54 +53,9 @@ def _busy_non_console_ports(
             isinstance(item, Mapping)
             and item.get("busy")
             and item.get("label") != "Console"
-            and int(item.get("port") or 0) not in managed_ports
+            and int(item.get("port") or 0) not in noesis_ports
         )
     ]
-
-
-def _port_from_validation_code(code: str) -> Optional[int]:
-    match = re.match(r"^port\.(\d+)\.busy$", code)
-    if not match:
-        return None
-    return int(match.group(1))
-
-
-def _normalize_managed_port_validation(validation: Mapping[str, Any], managed_ports: Set[int]) -> Mapping[str, Any]:
-    if not managed_ports:
-        return validation
-    results = validation.get("results") if isinstance(validation.get("results"), list) else []
-    normalized: List[Any] = []
-    changed = False
-    for item in results:
-        if not isinstance(item, Mapping):
-            normalized.append(item)
-            continue
-        next_item = dict(item)
-        port = _port_from_validation_code(str(next_item.get("code") or ""))
-        if port in managed_ports and next_item.get("severity") == "block":
-            next_item.update(
-                {
-                    "severity": "info",
-                    "code": f"port.{port}.managed",
-                    "message": f"Port {port} is owned by the console-managed runtime and can be released during restart.",
-                    "fix_hint": "Restart will stop the supervised runtime before relaunching the selected spec.",
-                }
-            )
-            changed = True
-        normalized.append(next_item)
-    if not changed:
-        return validation
-
-    counts = {
-        "block": sum(1 for item in normalized if isinstance(item, Mapping) and item.get("severity") == "block"),
-        "warn": sum(1 for item in normalized if isinstance(item, Mapping) and item.get("severity") == "warn"),
-        "info": sum(1 for item in normalized if isinstance(item, Mapping) and item.get("severity") == "info"),
-    }
-    payload = dict(validation)
-    payload["results"] = normalized
-    payload["counts"] = counts
-    payload["blocking"] = counts["block"] > 0
-    return payload
 
 
 def _active_model_row(matrix: Mapping[str, Any], active_id: str) -> Mapping[str, Any]:
@@ -217,14 +134,12 @@ def build_launch_decision(
     *,
     runtime_status: Optional[Mapping[str, Any]] = None,
     managed_pid: Optional[int] = None,
-    ignore_managed_runtime_ports: bool = False,
     probe_network: bool = True,
     timeout_s: float = 0.35,
 ) -> Dict[str, Any]:
     runtime = dict(runtime_status or {})
     diagnostics = diagnostics_snapshot(spec, managed_pid=managed_pid)
-    managed_ports = _managed_port_numbers(diagnostics, managed_pid) if ignore_managed_runtime_ports else set()
-    validation = _normalize_managed_port_validation(validate_launch(spec), managed_ports)
+    validation = validate_launch(spec, managed_pid=managed_pid)
     launch_plan = build_launch_plan(spec)
     matrix = build_model_matrix(spec)
     sources = build_source_readiness(spec, probe_network=probe_network, timeout_s=timeout_s)
@@ -235,10 +150,7 @@ def build_launch_decision(
     source_summary = sources.get("summary") if isinstance(sources.get("summary"), Mapping) else {}
     matrix_summary = matrix.get("summary") if isinstance(matrix.get("summary"), Mapping) else {}
     active_model = _active_model_row(matrix, str(matrix.get("active_id") or f"{spec.pgie_profile}:{spec.size or ''}"))
-    busy_ports = _busy_non_console_ports(
-        diagnostics,
-        ignore_managed_pid=managed_pid if ignore_managed_runtime_ports else None,
-    )
+    busy_ports = _busy_non_console_ports(diagnostics)
     external_ds8 = _external_ds8_processes(diagnostics)
     gpu = diagnostics.get("gpu") if isinstance(diagnostics.get("gpu"), Mapping) else {}
 

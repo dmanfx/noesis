@@ -1699,3 +1699,321 @@ def test_launch_candidates_endpoint_records_activity(monkeypatch, tmp_path):
     timeline = client.get("/api/activity?limit=5").json()["items"]
     assert timeline[0]["type"] == "launch.candidates"
     assert timeline[0]["payload"]["summary"]["ready"] == 1
+
+
+def test_dev_console_static_ui_shell():
+    from fastapi.testclient import TestClient
+
+    from noesis.dev_console.server import create_app
+
+    client = TestClient(create_app())
+    index = client.get("/")
+    assert index.status_code == 200
+    html = index.text
+    assert "phase-tabs" in html
+    assert 'id="inspectorDrawer"' in html
+    assert 'class="panel-head operate-runtime-head"' in html
+    assert 'id="logDrawer"' in html
+    assert 'data-phase="configure"' in html
+    assert 'data-phase="operate"' in html
+
+    app_js = client.get("/static/app.js")
+    styles = client.get("/static/styles.css")
+    assert app_js.status_code == 200
+    assert styles.status_code == 200
+    assert "CONSOLE_PHASES" in app_js.text
+    assert "openInspectorDrawer" in app_js.text
+    assert "maybeSyncObservedRuntime" in app_js.text
+    assert "adoptObservedRuntime" in app_js.text
+    assert "activeRuntimePid" in app_js.text
+    assert "resolveObservedRuntime" in app_js.text
+    assert "syncFormWithActiveRuntime" in app_js.text
+    assert "refreshDependentLaunchPanels" in app_js.text
+    assert "status-strip" in styles.text
+    assert "inspector-drawer" in styles.text
+
+
+_UI_BASE_SPEC = {
+    "pipeline_config": "config/infer.yaml",
+    "cameras_config": "config/cameras.yaml",
+    "pgie_profile": "yolo11_seg",
+    "size": "m",
+    "tracking_mode": "baseline",
+    "ws_port": 6108,
+    "rest_port": 8180,
+    "rtsp_port": 8654,
+    "probe_network": False,
+}
+
+
+def test_ui_api_surface_endpoints():
+    from fastapi.testclient import TestClient
+
+    from noesis.dev_console.server import create_app
+
+    client = TestClient(create_app())
+
+    summary = client.get("/api/summary")
+    assert summary.status_code == 200
+    assert "presets" in summary.json()
+    assert "runtime" in summary.json()
+
+    knobs = client.get("/api/knobs")
+    assert knobs.status_code == 200
+    assert len(knobs.json().get("items", [])) > 0
+
+    profiles = client.get("/api/profiles")
+    assert profiles.status_code == 200
+
+    activity = client.get("/api/activity?limit=5")
+    assert activity.status_code == 200
+
+    bundles = client.get("/api/support/bundles?limit=5")
+    assert bundles.status_code == 200
+
+    runtime = client.get("/api/runtime/status")
+    assert runtime.status_code == 200
+
+    logs = client.get("/api/runtime/logs?lines=10")
+    assert logs.status_code == 200
+    assert "lines" in logs.json()
+
+    log_insights = client.get("/api/runtime/log-insights?lines=20")
+    assert log_insights.status_code == 200
+
+
+def test_ui_workflow_post_endpoints():
+    from fastapi.testclient import TestClient
+
+    from noesis.dev_console.server import create_app
+
+    client = TestClient(create_app())
+    spec = dict(_UI_BASE_SPEC)
+
+    flow = client.post("/api/pipeline/flow", json=spec)
+    assert flow.status_code == 200
+    assert flow.json().get("stages")
+
+    diagnostics = client.post("/api/diagnostics", json=spec)
+    assert diagnostics.status_code == 200
+    diag_payload = diagnostics.json()
+    assert diag_payload.get("ports")
+    assert "observed_runtime" in diag_payload
+
+    gates = client.post("/api/gates", json=spec)
+    assert gates.status_code == 200
+    assert gates.json().get("groups")
+
+    plan = client.post("/api/launch/plan", json=spec)
+    assert plan.status_code == 200
+    assert plan.json().get("command")
+
+    diff = client.post("/api/launch/diff", json=spec)
+    assert diff.status_code == 200
+    assert "summary" in diff.json()
+
+    matrix = client.post("/api/model-matrix", json=spec)
+    assert matrix.status_code == 200
+    assert matrix.json().get("rows")
+
+    sources = client.post("/api/sources", json=spec)
+    assert sources.status_code == 200
+    assert sources.json().get("rows")
+
+    remediation = client.post("/api/remediation", json=spec)
+    assert remediation.status_code == 200
+    assert "actions" in remediation.json()
+
+    preview = client.post("/api/launch/preview", json=spec)
+    assert preview.status_code == 200
+    assert preview.json().get("validation")
+
+    validate = client.post("/api/launch/validate", json=spec)
+    assert validate.status_code == 200
+    assert "results" in validate.json()
+
+    decision = client.post("/api/launch/decision", json=spec)
+    assert decision.status_code == 200
+    assert "status" in decision.json()
+
+    candidates = client.post("/api/launch/candidates", json=spec)
+    assert candidates.status_code == 200
+    assert "items" in candidates.json()
+
+
+def test_ui_live_health_payload_shape():
+    from fastapi.testclient import TestClient
+
+    from noesis.dev_console.server import create_app
+
+    client = TestClient(create_app())
+    health = client.post("/api/live/health", json=_UI_BASE_SPEC)
+    assert health.status_code == 200
+    payload = health.json()
+    assert "status" in payload
+    assert "score" in payload
+    assert "indicators" in payload
+
+
+def _sample_ds8_process(
+    *,
+    pid: int,
+    managed: bool = False,
+    ws_port: int = 6010,
+    rest_port: int = 8180,
+    elapsed_s: int = 120,
+) -> dict:
+    return {
+        "pid": pid,
+        "looks_like_ds8": True,
+        "managed_by_console": managed,
+        "launch": {"ws_port": str(ws_port), "rest_port": str(rest_port)},
+        "ports": [
+            {"label": "WebSocket", "port": ws_port, "host": "127.0.0.1"},
+            {"label": "REST", "port": rest_port, "host": "127.0.0.1"},
+        ],
+        "stats": {"elapsed_s": elapsed_s},
+        "command": "python -m noesis.ds8_runtime",
+    }
+
+
+def test_runtime_target_from_process_uses_listening_ports():
+    from noesis.dev_console.diagnostics import runtime_target_from_process
+
+    target = runtime_target_from_process(
+        {
+            "pid": 4242,
+            "looks_like_ds8": True,
+            "managed_by_console": False,
+            "launch": {},
+            "ports": [{"label": "WebSocket", "port": 6010}, {"label": "REST", "port": 8180}],
+            "stats": {},
+            "command": "python -m noesis.ds8_runtime",
+        }
+    )
+    assert target["pid"] == 4242
+    assert target["ws_port"] == 6010
+    assert target["rest_port"] == 8180
+
+
+def test_observed_runtime_target_prefers_managed_pid():
+    from noesis.dev_console.diagnostics import observed_runtime_target
+
+    processes = [
+        _sample_ds8_process(pid=100, managed=False, ws_port=6010),
+        _sample_ds8_process(pid=200, managed=True, ws_port=6008, rest_port=8080),
+    ]
+    target = observed_runtime_target(processes, managed_pid=200)
+    assert target is not None
+    assert target["pid"] == 200
+    assert target["managed_by_console"] is True
+    assert target["ws_port"] == 6008
+
+
+def test_observed_runtime_target_picks_matching_external_ws_port():
+    from noesis.dev_console.diagnostics import observed_runtime_target
+    from noesis.dev_console.launch_spec import LaunchSpec
+
+    processes = [
+        _sample_ds8_process(pid=100, managed=False, ws_port=6010, elapsed_s=300),
+        _sample_ds8_process(pid=101, managed=False, ws_port=6020, elapsed_s=30),
+    ]
+    spec = LaunchSpec(ws_port=6020)
+    target = observed_runtime_target(processes, managed_pid=None, spec=spec)
+    assert target is not None
+    assert target["pid"] == 101
+    assert target["ws_port"] == 6020
+
+
+def test_observed_runtime_target_returns_none_without_ds8():
+    from noesis.dev_console.diagnostics import observed_runtime_target
+
+    processes = [{"pid": 1, "looks_like_ds8": False, "managed_by_console": False, "ports": []}]
+    assert observed_runtime_target(processes, managed_pid=None) is None
+
+
+def test_noesis_port_ownership_maps_external_ds8_ports():
+    from noesis.dev_console.diagnostics import noesis_port_ownership
+
+    diagnostics = {
+        "ports": [
+            {"label": "WebSocket", "port": 6008, "busy": True, "owner": {"pids": [4242]}},
+            {"label": "REST", "port": 8080, "busy": True, "owner": {"pids": [4242]}},
+            {"label": "RTSP mosaic", "port": 8554, "busy": True, "owner": {"pids": [4242]}},
+        ],
+        "processes": [
+            {
+                "pid": 4242,
+                "looks_like_ds8": True,
+                "managed_by_console": False,
+                "ports": [
+                    {"label": "WebSocket", "port": 6008, "selected": True},
+                    {"label": "REST", "port": 8080, "selected": True},
+                    {"label": "RTSP mosaic", "port": 8554, "selected": True},
+                ],
+            }
+        ],
+    }
+    ownership = noesis_port_ownership(diagnostics)
+    assert ownership[6008]["pid"] == 4242
+    assert ownership[6008]["managed_by_console"] is False
+    assert set(ownership) == {6008, 8080, 8554}
+
+
+def test_normalize_port_validation_downgrades_ds8_runtime_blocks():
+    from noesis.dev_console.validator import normalize_port_validation_results
+
+    validation = {
+        "blocking": True,
+        "results": [
+            {"severity": "block", "code": "port.6008.busy", "message": "busy", "fix_hint": "stop"},
+            {"severity": "block", "code": "port.8080.busy", "message": "busy", "fix_hint": "stop"},
+            {"severity": "info", "code": "pipeline_config.ok", "message": "ok", "fix_hint": ""},
+        ],
+        "counts": {"block": 2, "warn": 0, "info": 1},
+    }
+    diagnostics = {
+        "ports": [
+            {"label": "WebSocket", "port": 6008, "busy": True, "owner": {"pids": [4242]}},
+            {"label": "REST", "port": 8080, "busy": True, "owner": {"pids": [4242]}},
+        ],
+        "processes": [
+            {
+                "pid": 4242,
+                "looks_like_ds8": True,
+                "managed_by_console": False,
+                "ports": [
+                    {"label": "WebSocket", "port": 6008, "selected": True},
+                    {"label": "REST", "port": 8080, "selected": True},
+                ],
+            }
+        ],
+    }
+    normalized = normalize_port_validation_results(validation, diagnostics)
+    assert normalized["blocking"] is False
+    assert normalized["counts"]["block"] == 0
+    assert normalized["counts"]["info"] == 3
+    codes = {item["code"] for item in normalized["results"]}
+    assert "port.6008.ds8_runtime" in codes
+    assert "port.8080.ds8_runtime" in codes
+
+
+def test_busy_non_console_ports_ignores_noesis_runtime():
+    from noesis.dev_console.launch_decision import _busy_non_console_ports
+
+    diagnostics = {
+        "ports": [
+            {"label": "WebSocket", "port": 6008, "busy": True, "owner": {"pids": [4242]}},
+            {"label": "REST", "port": 8080, "busy": True, "owner": {"pids": [9999]}},
+        ],
+        "processes": [
+            {
+                "pid": 4242,
+                "looks_like_ds8": True,
+                "managed_by_console": False,
+                "ports": [{"label": "WebSocket", "port": 6008, "selected": True}],
+            }
+        ],
+    }
+    busy = _busy_non_console_ports(diagnostics)
+    assert [item["port"] for item in busy] == [8080]

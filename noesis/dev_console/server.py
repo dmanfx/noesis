@@ -268,7 +268,9 @@ def create_app(supervisor: Optional[RuntimeSupervisor] = None) -> FastAPI:
     def launch_preview(payload: Dict[str, Any]) -> Dict[str, Any]:
         spec = _spec_from_payload(payload)
         materialized = materialize_launch_pipeline(spec, dry_run=True)
-        validation = validate_launch(spec)
+        runtime_status = runtime.status()
+        managed_pid = runtime_status.get("pid") if isinstance(runtime_status.get("pid"), int) else None
+        validation = validate_launch(spec, managed_pid=managed_pid)
         _record_activity(
             "launch.preview",
             f"Previewed {spec.pgie_profile} {spec.tracking_mode}",
@@ -333,7 +335,9 @@ def create_app(supervisor: Optional[RuntimeSupervisor] = None) -> FastAPI:
     @app.post("/api/launch/validate")
     def launch_validate(payload: Dict[str, Any]) -> Dict[str, Any]:
         spec = _spec_from_payload(payload)
-        validation = validate_launch(spec)
+        runtime_status = runtime.status()
+        managed_pid = runtime_status.get("pid") if isinstance(runtime_status.get("pid"), int) else None
+        validation = validate_launch(spec, managed_pid=managed_pid)
         _record_activity(
             "launch.validate",
             f"Validated {spec.pgie_profile} {spec.tracking_mode}",
@@ -394,12 +398,10 @@ def create_app(supervisor: Optional[RuntimeSupervisor] = None) -> FastAPI:
         spec = _spec_from_payload(payload)
         runtime_status = runtime.status()
         managed_pid = runtime_status.get("pid") if isinstance(runtime_status.get("pid"), int) else None
-        ignore_managed_ports = bool(runtime_status.get("running") and managed_pid is not None)
         decision = build_launch_decision(
             spec,
             runtime_status=runtime_status,
             managed_pid=managed_pid,
-            ignore_managed_runtime_ports=ignore_managed_ports,
             probe_network=bool(payload.get("probe_network", True)),
             timeout_s=float(payload.get("timeout_s", 0.35)),
         )
@@ -450,12 +452,10 @@ def create_app(supervisor: Optional[RuntimeSupervisor] = None) -> FastAPI:
         spec = _spec_from_payload(payload)
         runtime_status = runtime.status()
         managed_pid = runtime_status.get("pid") if isinstance(runtime_status.get("pid"), int) else None
-        ignore_managed_ports = bool(runtime_status.get("running") and managed_pid is not None)
         decision = build_launch_decision(
             spec,
             runtime_status=runtime_status,
             managed_pid=managed_pid,
-            ignore_managed_runtime_ports=ignore_managed_ports,
             probe_network=bool(payload.get("probe_network", True)),
             timeout_s=float(payload.get("timeout_s", 0.35)),
         )
@@ -512,14 +512,12 @@ def create_app(supervisor: Optional[RuntimeSupervisor] = None) -> FastAPI:
         runtime_status = runtime.status()
         managed_pid = runtime_status.get("pid") if isinstance(runtime_status.get("pid"), int) else None
         decision_runtime_status = dict(runtime_status)
-        ignore_managed_ports = bool(runtime_status.get("running") and managed_pid is not None)
-        if ignore_managed_ports:
+        if runtime_status.get("running") and managed_pid is not None:
             decision_runtime_status["running"] = False
         decision = build_launch_decision(
             spec,
             runtime_status=decision_runtime_status,
             managed_pid=managed_pid,
-            ignore_managed_runtime_ports=ignore_managed_ports,
             probe_network=bool(payload.get("probe_network", True)),
             timeout_s=float(payload.get("timeout_s", 0.35)),
         )

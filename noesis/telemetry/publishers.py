@@ -13,6 +13,29 @@ except Exception:  # pragma: no cover - fallback when frontend utilities absent
 
 logger = logging.getLogger(__name__)
 
+_JSON_PRIMITIVES = (str, int, float, bool, type(None))
+
+
+def _contains_non_json_native(value: Any) -> bool:
+    if isinstance(value, _JSON_PRIMITIVES):
+        return False
+    if isinstance(value, Mapping):
+        for key, item in value.items():
+            if not isinstance(key, _JSON_PRIMITIVES):
+                return True
+            if _contains_non_json_native(item):
+                return True
+        return False
+    if isinstance(value, (list, tuple)):
+        return any(_contains_non_json_native(item) for item in value)
+    return True
+
+
+def _json_native_or_convert(value: Any) -> Any:
+    if _contains_non_json_native(value):
+        return convert_numpy_types(value)
+    return value
+
 
 class DepthTelemetryPublisher:
     """Bridge depth bursts to websocket clients."""
@@ -45,17 +68,17 @@ class TrackingTelemetryPublisher:
         self._metadata_getter = metadata_getter
 
     def publish(self, source_id: int, tracks: Iterable[Mapping[str, Any]]) -> None:
-        track_list = list(tracks)
+        track_list = tracks if isinstance(tracks, list) else list(tracks)
         payload = {
             "type": "tracking",
             "source_id": int(source_id),
-            "tracks": convert_numpy_types(track_list),
+            "tracks": _json_native_or_convert(track_list),
         }
         if callable(self._metadata_getter):
             try:
                 extra = self._metadata_getter(int(source_id), track_list)
                 if isinstance(extra, Mapping):
-                    payload.update(convert_numpy_types(dict(extra)))
+                    payload.update(_json_native_or_convert(dict(extra)))
             except Exception:
                 logger.debug("Tracking telemetry metadata getter failed", exc_info=True)
         try:

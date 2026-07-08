@@ -1,11 +1,37 @@
 from __future__ import annotations
 
+import os
+
+
+_CPU_MATH_THREAD_ENV_VARS = (
+    "OPENBLAS_NUM_THREADS",
+    "OMP_NUM_THREADS",
+    "MKL_NUM_THREADS",
+    "NUMEXPR_NUM_THREADS",
+    "VECLIB_MAXIMUM_THREADS",
+    "BLIS_NUM_THREADS",
+)
+
+
+def _configure_cpu_math_threads() -> None:
+    raw_default = str(os.environ.get("NOESIS_CPU_MATH_THREADS", "1") or "1").strip()
+    if raw_default.lower() in ("0", "off", "false", "no"):
+        return
+    try:
+        default_threads = str(max(1, int(raw_default)))
+    except Exception:
+        default_threads = "1"
+    for name in _CPU_MATH_THREAD_ENV_VARS:
+        os.environ.setdefault(name, default_threads)
+
+
+_configure_cpu_math_threads()
+
 import configparser
 import colorsys
 import json
 import logging
 import math
-import os
 import queue
 import re
 import time
@@ -5879,6 +5905,7 @@ class _AnalyticsTelemetryProcessor:
             self._log_diag_session_start()
 
             tracks: List[Dict[str, Any]] = []
+            diagnostics_enabled = self.diagnostics_logger is not None
             diagnostics_tracks: List[Dict[str, Any]] = []
             frame_id = int(getattr(frame_meta, "frame_number", -1))
             occupancy_counts: Dict[str, int] = {}
@@ -5903,9 +5930,11 @@ class _AnalyticsTelemetryProcessor:
                         image_base = self._image_base_from_bbox3d(int(source_id), bbox3d, frame_dims)
                         if image_base is not None:
                             raw["image_base"] = image_base
-                diag_track = dict(raw)
-                diag_track["frame_id"] = frame_id
-                diag_track["source_id"] = int(source_id)
+                diag_track: Optional[Dict[str, Any]] = None
+                if diagnostics_enabled:
+                    diag_track = dict(raw)
+                    diag_track["frame_id"] = frame_id
+                    diag_track["source_id"] = int(source_id)
                 if reid_debug:
                     self._reid_debug_objects += 1
 
@@ -5924,7 +5953,8 @@ class _AnalyticsTelemetryProcessor:
                 # People-only public identity. Do not show raw tracker IDs.
                 if class_id != 0:
                     self._stamp_osd_label_ds8(obj_meta, sensor_id=sensor_id, stable_id=None)
-                    diagnostics_tracks.append(diag_track)
+                    if diag_track is not None:
+                        diagnostics_tracks.append(diag_track)
                     continue
 
                 _increment_core_counter("detection_wake.person_tracks")
@@ -5985,7 +6015,8 @@ class _AnalyticsTelemetryProcessor:
                 if stable_id is None:
                     # People should always have a stable_id; if we can't produce one, show placeholder.
                     self._stamp_osd_label_ds8(obj_meta, sensor_id=sensor_id, stable_id=None)
-                    diagnostics_tracks.append(diag_track)
+                    if diag_track is not None:
+                        diagnostics_tracks.append(diag_track)
                     continue
 
                 stable_id_int = int(stable_id)
@@ -6091,37 +6122,39 @@ class _AnalyticsTelemetryProcessor:
                 # registered depth actually used by the estimator.
                 self._stamp_osd_label_ds8(obj_meta, sensor_id=sensor_id, stable_id=stable_id_int)
                 self._apply_instance_mask_color_ds8(obj_meta, stable_id=stable_id_int)
-                diag_track.update(
-                    {
-                        "stable_id": stable_id_int,
-                        "tracker_id": tracker_id_int,
-                        **({"id_display": str(id_display)} if id_display else {}),
-                        "zone": zone,
-                        "dwell_time": dwell,
-                        "world": public_track.get("world"),
-                        "world_valid": public_track.get("world_valid"),
-                        "world_quality": public_track.get("world_quality"),
-                        "world_quality_reason": public_track.get("world_quality_reason"),
-                        "world_frame": public_track.get("world_frame"),
-                        "world_source": public_track.get("world_source"),
-                        "depth_status": depth_result.status if depth_result is not None else None,
-                        "depth_anchor_source": depth_result.anchor_source if depth_result is not None else None,
-                        "depth_anchor_m": depth_result.anchor_depth_m if depth_result is not None else None,
-                        "depth_registered_m": public_track.get("depth_registered_m"),
-                        "depth_used_m": public_track.get("depth_used_m"),
-                        "depth_registration_status": public_track.get("depth_registration_status"),
-                        "depth_registration_id": public_track.get("depth_registration_id"),
-                        "depth_samples": depth_result.sample_count if depth_result is not None else None,
-                        "depth_valid_fraction": depth_result.valid_fraction if depth_result is not None else None,
-                        "id_event": id_event,
-                        "id_reject_reason": id_reject_reason,
-                        "embedding_present": bool(embedding_present),
-                        "pose_present": bool(pose_present),
-                        "sid_candidate": sid_candidate,
-                    }
-                )
+                if diag_track is not None:
+                    diag_track.update(
+                        {
+                            "stable_id": stable_id_int,
+                            "tracker_id": tracker_id_int,
+                            **({"id_display": str(id_display)} if id_display else {}),
+                            "zone": zone,
+                            "dwell_time": dwell,
+                            "world": public_track.get("world"),
+                            "world_valid": public_track.get("world_valid"),
+                            "world_quality": public_track.get("world_quality"),
+                            "world_quality_reason": public_track.get("world_quality_reason"),
+                            "world_frame": public_track.get("world_frame"),
+                            "world_source": public_track.get("world_source"),
+                            "depth_status": depth_result.status if depth_result is not None else None,
+                            "depth_anchor_source": depth_result.anchor_source if depth_result is not None else None,
+                            "depth_anchor_m": depth_result.anchor_depth_m if depth_result is not None else None,
+                            "depth_registered_m": public_track.get("depth_registered_m"),
+                            "depth_used_m": public_track.get("depth_used_m"),
+                            "depth_registration_status": public_track.get("depth_registration_status"),
+                            "depth_registration_id": public_track.get("depth_registration_id"),
+                            "depth_samples": depth_result.sample_count if depth_result is not None else None,
+                            "depth_valid_fraction": depth_result.valid_fraction if depth_result is not None else None,
+                            "id_event": id_event,
+                            "id_reject_reason": id_reject_reason,
+                            "embedding_present": bool(embedding_present),
+                            "pose_present": bool(pose_present),
+                            "sid_candidate": sid_candidate,
+                        }
+                    )
                 tracks.append(public_track)
-                diagnostics_tracks.append(diag_track)
+                if diag_track is not None:
+                    diagnostics_tracks.append(diag_track)
 
                 fp = self._footpoint_from_track(
                     public_track,
@@ -6145,7 +6178,7 @@ class _AnalyticsTelemetryProcessor:
             self._active_tracks[sensor_id] = tracks
             self._maybe_log_stable_id_metrics(sensor_id, now_ts)
 
-            if self.diagnostics_logger:
+            if diagnostics_enabled:
                 bbox3d_count = 0
                 world_count = 0
                 people_count = 0
@@ -6249,6 +6282,7 @@ class _AnalyticsTelemetryProcessor:
             self._log_diag_session_start()
 
             tracks: List[Dict[str, Any]] = []
+            diagnostics_enabled = self.diagnostics_logger is not None
             diagnostics_tracks: List[Dict[str, Any]] = []
             frame_id = int(getattr(frame_meta, "frame_num", -1))
             occupancy_counts: Dict[str, int] = {}
@@ -6261,9 +6295,11 @@ class _AnalyticsTelemetryProcessor:
                 raw = self._build_track_dict(obj_meta, camera_id)
                 if raw is None:
                     continue
-                diag_track = dict(raw)
-                diag_track["frame_id"] = frame_id
-                diag_track["source_id"] = int(source_id)
+                diag_track: Optional[Dict[str, Any]] = None
+                if diagnostics_enabled:
+                    diag_track = dict(raw)
+                    diag_track["frame_id"] = frame_id
+                    diag_track["source_id"] = int(source_id)
 
                 track_id = int(raw.get("track_id", -1))
                 if track_id < 0:
@@ -6277,7 +6313,8 @@ class _AnalyticsTelemetryProcessor:
                 zone = raw.get("zone")
                 if class_id != 0:
                     self._stamp_osd_label(obj_meta, sensor_id=sensor_id, stable_id=None)
-                    diagnostics_tracks.append(diag_track)
+                    if diag_track is not None:
+                        diagnostics_tracks.append(diag_track)
                     continue
 
                 if not zone:
@@ -6294,7 +6331,8 @@ class _AnalyticsTelemetryProcessor:
                 )
                 if stable_id is None:
                     self._stamp_osd_label(obj_meta, sensor_id=sensor_id, stable_id=None)
-                    diagnostics_tracks.append(diag_track)
+                    if diag_track is not None:
+                        diagnostics_tracks.append(diag_track)
                     continue
 
                 stable_id_int = int(stable_id)
@@ -6373,32 +6411,34 @@ class _AnalyticsTelemetryProcessor:
                 except Exception:
                     pass
                 self._stamp_osd_label(obj_meta, sensor_id=sensor_id, stable_id=stable_id_int)
-                diag_track.update(
-                    {
-                        "stable_id": stable_id_int,
-                        "tracker_id": tracker_id_int,
-                        **({"id_display": str(id_display)} if id_display else {}),
-                        "zone": zone,
-                        "dwell_time": dwell,
-                        "world": public_track.get("world"),
-                        "world_valid": public_track.get("world_valid"),
-                        "world_quality": public_track.get("world_quality"),
-                        "world_quality_reason": public_track.get("world_quality_reason"),
-                        "world_frame": public_track.get("world_frame"),
-                        "world_source": public_track.get("world_source"),
-                        "depth_status": depth_result.status if depth_result is not None else None,
-                        "depth_anchor_source": depth_result.anchor_source if depth_result is not None else None,
-                        "depth_anchor_m": depth_result.anchor_depth_m if depth_result is not None else None,
-                        "depth_registered_m": public_track.get("depth_registered_m"),
-                        "depth_used_m": public_track.get("depth_used_m"),
-                        "depth_registration_status": public_track.get("depth_registration_status"),
-                        "depth_registration_id": public_track.get("depth_registration_id"),
-                        "depth_samples": depth_result.sample_count if depth_result is not None else None,
-                        "depth_valid_fraction": depth_result.valid_fraction if depth_result is not None else None,
-                    }
-                )
+                if diag_track is not None:
+                    diag_track.update(
+                        {
+                            "stable_id": stable_id_int,
+                            "tracker_id": tracker_id_int,
+                            **({"id_display": str(id_display)} if id_display else {}),
+                            "zone": zone,
+                            "dwell_time": dwell,
+                            "world": public_track.get("world"),
+                            "world_valid": public_track.get("world_valid"),
+                            "world_quality": public_track.get("world_quality"),
+                            "world_quality_reason": public_track.get("world_quality_reason"),
+                            "world_frame": public_track.get("world_frame"),
+                            "world_source": public_track.get("world_source"),
+                            "depth_status": depth_result.status if depth_result is not None else None,
+                            "depth_anchor_source": depth_result.anchor_source if depth_result is not None else None,
+                            "depth_anchor_m": depth_result.anchor_depth_m if depth_result is not None else None,
+                            "depth_registered_m": public_track.get("depth_registered_m"),
+                            "depth_used_m": public_track.get("depth_used_m"),
+                            "depth_registration_status": public_track.get("depth_registration_status"),
+                            "depth_registration_id": public_track.get("depth_registration_id"),
+                            "depth_samples": depth_result.sample_count if depth_result is not None else None,
+                            "depth_valid_fraction": depth_result.valid_fraction if depth_result is not None else None,
+                        }
+                    )
                 tracks.append(public_track)
-                diagnostics_tracks.append(diag_track)
+                if diag_track is not None:
+                    diagnostics_tracks.append(diag_track)
 
                 fp = self._footpoint_from_track(
                     public_track,
@@ -6414,7 +6454,7 @@ class _AnalyticsTelemetryProcessor:
             self._active_tracks[sensor_id] = tracks
             self._maybe_log_stable_id_metrics(sensor_id, now_ts)
 
-            if self.diagnostics_logger:
+            if diagnostics_enabled:
                 bbox3d_count = 0
                 world_count = 0
                 people_count = 0

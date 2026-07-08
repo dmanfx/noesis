@@ -1777,6 +1777,13 @@ Use this file to record non-trivial design choices made during the DS8 migration
 - **Rationale:** Live testing showed kitchen/living-room handoffs working but the family-room camera (720p dewarped/upscaled, soft crops) minting separate IDs. The first clean embedding there often arrives seconds after track creation, outside the old reconcile window; centroid-only merge scoring also blurred multi-view identities below the merge bar precisely when views differ, which is the cross-camera duplicate case. Both fixes are appearance-quality-driven and deployment-portable rather than camera-specific tuning.
 - **References:** `reid/stable_id_manager.py`, `noesis/ds8_runtime.py`, `tests/test_stable_id_manager_gallery.py`
 
+- **Date:** 2026-07-07
+- **Author:** Codex
+- **Area:** DS8 runtime / CPU utilization / tracking telemetry
+- **Decision:** Cap CPU math-library worker pools before NumPy/OpenCV/Torch-backed imports in the canonical DS8 runtime and hooks (`NOESIS_CPU_MATH_THREADS`, default `1`, preserving explicit pool env vars), and trim the `tracking_telemetry_stage` Python hot path by lazy-materializing diagnostics-only track copies and skipping recursive NumPy conversion for JSON-native tracking payloads.
+- **Rationale:** Live YOLO26-L profiling showed the largest CPU spike came from uncapped BLAS/OpenMP-style worker pools, not from a DeepStream copy path. Import-time caps remove that runaway host scheduling without changing detector/tracker cadence, adding appsinks, or introducing CPU video branches. The telemetry changes remove per-object allocations and recursive payload walks that do not affect published contracts, while retaining conversion for true NumPy payloads and preserving diagnostics when explicitly enabled.
+- **References:** `noesis/ds8_runtime.py`, `noesis/pipelines/hooks.py`, `noesis/telemetry/publishers.py`, `tests/test_zero_copy_invariants.py`, `plans/DS8/ds8_yolo26_performance_optimization_plan.md`
+
 - **Date:** 2026-07-08
 - **Author:** Codex
 - **Area:** DS8 object-depth fusion / zero-copy CPU reduction

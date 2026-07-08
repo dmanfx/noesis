@@ -361,6 +361,23 @@ Date: 2026-06-28
 - **Live profile after the batch-3 pose swap:** YOLO26 medium with the batch-3 pose SGIE captured a busier window ending with three active tracks: `detection_wake.frames=5314`, `objects_seen=3747`, `pose_feature_cache_hit=3106`, `pose_feature_native_extract=404`, `tensor_host_copies_total.pose=404`, `object_depth_native_stats=651`, and `object_depth_cache_hit=3091`. GPU SM avg/p95/max fell to `68.07%/80%/92%`, power avg fell to `111.04 W`, process CPU avg fell to `347.42%`, and RSS averaged about `1.94 GB`.
 - **Result:** With roughly double the person/object load in the post-change window, average GPU dropped by about 16.7 absolute points, p95 GPU dropped by 16 points, average power dropped by about 34 W, and RSS dropped by about 1.18 GB. CPU improved modestly despite the heavier detection window. The current live runtime is still `python3 noesis/ds8_runtime.py --pgie-profile yolo26 --size m` and has the batch-3 pose engine loaded.
 
+### 2026-07-07: YOLO26-L CPU Math Thread Cap And Tracking Telemetry Fast Path
+
+- **Scope:** Investigated the user's live `ds8_runtime` high CPU report on the active YOLO26-L runtime (`python3 ./ds8_runtime.py --pgie-profile yolo26 --size l`) with the DS8 zero-copy goal in mind.
+- **Finding:** The live pre-change process (`pid=656129`) was around `415%` CPU. Thread sampling showed the old anonymous BLAS/OpenMP-style Python worker spike was the largest culprit, with `tracking_telemetry` the remaining named hot thread after capping math pools.
+- **Change:** `noesis/ds8_runtime.py` and directly imported telemetry hooks now set math-pool env defaults (`OPENBLAS_NUM_THREADS`, `OMP_NUM_THREADS`, `MKL_NUM_THREADS`, `NUMEXPR_NUM_THREADS`, `VECLIB_MAXIMUM_THREADS`, `BLIS_NUM_THREADS`) before NumPy/OpenCV/Torch-backed imports. `NOESIS_CPU_MATH_THREADS` overrides the default (`1`), and explicit per-library env vars are preserved for profiling.
+- **Change:** The DS8 tracking telemetry path now avoids diagnostic track dict copies unless diagnostics logging is enabled, and `TrackingTelemetryPublisher` skips recursive NumPy conversion when the already-built DS8 tracking payload is JSON-native.
+- **Validation:**
+  - `python3 -m pytest tests/test_zero_copy_invariants.py tests/test_analytics_telemetry_hook.py tests/test_zero_copy_stats_contract.py -q`
+    - Passed: 27 tests.
+  - `python3 -m py_compile noesis/ds8_runtime.py noesis/pipelines/hooks.py noesis/telemetry/publishers.py tests/test_zero_copy_invariants.py`
+    - Passed.
+  - `git diff --check`
+    - Passed.
+- **Live result:** Restarted the live runtime through the canonical path (`pid=768969`, `python3 noesis/ds8_runtime.py --pgie-profile yolo26 --size l`). Post-change process CPU sampled around `129-147%`; the old anonymous math-worker spike was absent. The dominant remaining named thread was `tracking_teleme` around `65%` under a busier five-active-track window.
+- **Live stats sample:** `zero_copy_violations=0`, `stableid_backend_mode=gpu`, `detection_wake.frames=2189`, `objects_seen=4302`, `person_tracks=4302`, `tracking_publish_due=1290`, `bev_publish_due=1266`, `tensor_host_copies_total.pose=219`, and `tensor_host_copies_total.reid=245`. Stage averages in that window: `tracking.publish=0.590 ms`, `bev.render_and_publish=2.004 ms`, `object_depth.sample_person=0.967 ms`, `stable_id.update_track=0.246 ms`, and `analytics.handle_frame_ds8=9.302 ms`.
+- **Result:** The first fix removes the runaway CPU utilization without adding CPU video branches or extra copies. The remaining CPU is real per-track telemetry/object-depth/BEV work on `tracking_telemetry`, now bounded by existing publish gates and trimmed of avoidable diagnostics/publisher allocation overhead.
+
 ### 2026-07-08: Object-Depth Zero-Copy Tightening
 
 - **Scope:** Implemented the follow-up object-depth CPU/zero-copy optimizations requested after the YOLO26-L CPU investigation.

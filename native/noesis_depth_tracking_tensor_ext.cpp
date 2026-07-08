@@ -43,7 +43,7 @@ extern "C" cudaError_t noesis_sample_roi_values_cuda(
 
 extern "C" cudaError_t noesis_sample_masked_roi_values_cuda(
     const float* depth,
-    const float* mask,
+    const uint8_t* mask,
     int frame_w,
     int frame_h,
     int mask_w,
@@ -55,14 +55,13 @@ extern "C" cudaError_t noesis_sample_masked_roi_values_cuda(
     int stride,
     int sampled_cols,
     int sampled_area,
-    float threshold,
     float* out_values,
     float* out_center,
     cudaStream_t stream);
 
 extern "C" cudaError_t noesis_sample_masked_person_roi_values_cuda(
     const float* depth,
-    const float* mask,
+    const uint8_t* mask,
     int frame_w,
     int frame_h,
     int mask_w,
@@ -74,7 +73,6 @@ extern "C" cudaError_t noesis_sample_masked_person_roi_values_cuda(
     int stride,
     int sampled_cols,
     int sampled_area,
-    float threshold,
     float* out_all,
     float* out_lower,
     float* out_torso,
@@ -254,6 +252,60 @@ NppStreamContext default_npp_stream_context() {
   ctx.nStreamFlags = stream_flags;
   ctx.nReserved0 = 0;
   return ctx;
+}
+
+const uint8_t* binary_mask_data(
+    const py::array& mask_array,
+    int expected_h,
+    int expected_w,
+    float threshold,
+    std::vector<uint8_t>& storage,
+    const char* label) {
+  py::buffer_info mask_info = mask_array.request();
+  if (mask_info.ndim != 2) {
+    throw std::runtime_error(std::string(label) + " mask must be 2D");
+  }
+  const int mask_h = static_cast<int>(mask_info.shape[0]);
+  const int mask_w = static_cast<int>(mask_info.shape[1]);
+  if (mask_w != expected_w || mask_h != expected_h) {
+    throw std::runtime_error(std::string(label) + " mask shape must match ROI size");
+  }
+  if (mask_info.ptr == nullptr) {
+    throw std::runtime_error(std::string(label) + " mask buffer is unavailable");
+  }
+
+  const size_t item_size = static_cast<size_t>(std::max<py::ssize_t>(1, mask_info.itemsize));
+  const bool c_contiguous =
+      mask_info.strides.size() >= 2U &&
+      static_cast<size_t>(mask_info.strides[1]) == item_size &&
+      static_cast<size_t>(mask_info.strides[0]) == item_size * static_cast<size_t>(mask_w);
+  const std::string format = mask_info.format;
+  const bool byte_mask =
+      item_size == 1U &&
+      (format == py::format_descriptor<uint8_t>::format() || format == py::format_descriptor<bool>::format());
+  if (c_contiguous && byte_mask) {
+    return static_cast<const uint8_t*>(mask_info.ptr);
+  }
+
+  py::array_t<float, py::array::c_style | py::array::forcecast> mask_float =
+      py::array_t<float, py::array::c_style | py::array::forcecast>::ensure(mask_array);
+  if (!mask_float) {
+    throw std::runtime_error(std::string(label) + " mask could not be converted to float for thresholding");
+  }
+  py::buffer_info float_info = mask_float.request();
+  if (float_info.ndim != 2 ||
+      static_cast<int>(float_info.shape[0]) != expected_h ||
+      static_cast<int>(float_info.shape[1]) != expected_w ||
+      float_info.ptr == nullptr) {
+    throw std::runtime_error(std::string(label) + " mask could not be converted to a contiguous 2D buffer");
+  }
+  const float* src = static_cast<const float*>(float_info.ptr);
+  const size_t count = static_cast<size_t>(expected_w) * static_cast<size_t>(expected_h);
+  storage.resize(count);
+  for (size_t idx = 0; idx < count; ++idx) {
+    storage[idx] = src[idx] > threshold ? static_cast<uint8_t>(1U) : static_cast<uint8_t>(0U);
+  }
+  return storage.data();
 }
 
 template <typename T>
@@ -482,7 +534,7 @@ class AlignedDepthFrameDevice {
       int top,
       int width,
       int height,
-      py::array_t<float, py::array::c_style | py::array::forcecast> mask_array,
+      py::array mask_array,
       float threshold,
       int max_samples) const {
     if (device_ptr_ == nullptr) {
@@ -502,24 +554,21 @@ class AlignedDepthFrameDevice {
       throw std::runtime_error("sample_masked_roi_stats resolved an empty ROI");
     }
 
-    py::buffer_info mask_info = mask_array.request();
-    if (mask_info.ndim != 2) {
-      throw std::runtime_error("sample_masked_roi_stats mask must be 2D");
-    }
-    const int mask_h = static_cast<int>(mask_info.shape[0]);
-    const int mask_w = static_cast<int>(mask_info.shape[1]);
-    if (mask_w != roi_w || mask_h != roi_h) {
-      throw std::runtime_error("sample_masked_roi_stats mask shape must match ROI size");
-    }
-    const float* mask_host = static_cast<const float*>(mask_info.ptr);
-    if (mask_host == nullptr) {
-      throw std::runtime_error("sample_masked_roi_stats mask buffer is unavailable");
-    }
+    const int mask_h = roi_h;
+    const int mask_w = roi_w;
+    thread_local std::vector<uint8_t> mask_binary;
+    const uint8_t* mask_host = binary_mask_data(
+        mask_array,
+        mask_h,
+        mask_w,
+        threshold,
+        mask_binary,
+        "sample_masked_roi_stats");
 
     const int sample_cap = std::max(128, max_samples);
     int mask_area = 0;
     for (int idx = 0; idx < mask_w * mask_h; ++idx) {
-      if (mask_host[idx] > threshold) {
+      if (mask_host[idx] != 0U) {
         ++mask_area;
       }
     }
@@ -532,20 +581,20 @@ class AlignedDepthFrameDevice {
     int sampled_mask_area = 0;
     for (int yy = 0; yy < roi_h; yy += stride) {
       for (int xx = 0; xx < roi_w; xx += stride) {
-        if (mask_host[(static_cast<size_t>(yy) * static_cast<size_t>(mask_w)) + static_cast<size_t>(xx)] > threshold) {
+        if (mask_host[(static_cast<size_t>(yy) * static_cast<size_t>(mask_w)) + static_cast<size_t>(xx)] != 0U) {
           ++sampled_mask_area;
         }
       }
     }
 
     const size_t mask_count = static_cast<size_t>(mask_w) * static_cast<size_t>(mask_h);
-    thread_local CudaBuffer<float> mask_device;
+    thread_local CudaBuffer<uint8_t> mask_device;
     mask_device.ensure_capacity(mask_count);
     throw_on_cuda(
         cudaMemcpy(
             mask_device.get(),
             mask_host,
-            mask_count * sizeof(float),
+            mask_count * sizeof(uint8_t),
             cudaMemcpyHostToDevice),
         "cudaMemcpy object-depth mask to device failed");
 
@@ -567,7 +616,6 @@ class AlignedDepthFrameDevice {
             stride,
             sampled_cols,
             sampled_area,
-            threshold,
             sampled_device.get(),
             sampled_device.get() + static_cast<size_t>(sampled_area),
             nullptr),
@@ -649,7 +697,7 @@ class AlignedDepthFrameDevice {
       int top,
       int width,
       int height,
-      py::array_t<float, py::array::c_style | py::array::forcecast> mask_array,
+      py::array mask_array,
       float threshold,
       int max_samples) const {
     if (device_ptr_ == nullptr) {
@@ -669,19 +717,16 @@ class AlignedDepthFrameDevice {
       throw std::runtime_error("sample_masked_person_roi_stats resolved an empty ROI");
     }
 
-    py::buffer_info mask_info = mask_array.request();
-    if (mask_info.ndim != 2) {
-      throw std::runtime_error("sample_masked_person_roi_stats mask must be 2D");
-    }
-    const int mask_h = static_cast<int>(mask_info.shape[0]);
-    const int mask_w = static_cast<int>(mask_info.shape[1]);
-    if (mask_w != roi_w || mask_h != roi_h) {
-      throw std::runtime_error("sample_masked_person_roi_stats mask shape must match ROI size");
-    }
-    const float* mask_host = static_cast<const float*>(mask_info.ptr);
-    if (mask_host == nullptr) {
-      throw std::runtime_error("sample_masked_person_roi_stats mask buffer is unavailable");
-    }
+    const int mask_h = roi_h;
+    const int mask_w = roi_w;
+    thread_local std::vector<uint8_t> mask_binary;
+    const uint8_t* mask_host = binary_mask_data(
+        mask_array,
+        mask_h,
+        mask_w,
+        threshold,
+        mask_binary,
+        "sample_masked_person_roi_stats");
 
     auto in_center_band_host = [](int x, int y, int roi_w_value, int roi_h_value, double y0_ratio, double y1_ratio, double center_width_ratio) -> bool {
       int band_y0 = static_cast<int>(std::floor(static_cast<double>(roi_h_value) * y0_ratio));
@@ -697,14 +742,14 @@ class AlignedDepthFrameDevice {
       band_x1 = std::max(band_x0 + 1, std::min(roi_w_value, band_x1));
       return y >= band_y0 && y < band_y1 && x >= band_x0 && x < band_x1;
     };
-    auto eroded_host = [mask_host, mask_w, mask_h, threshold](int x, int y) -> bool {
+    auto eroded_host = [mask_host, mask_w, mask_h](int x, int y) -> bool {
       for (int dy = -1; dy <= 1; ++dy) {
         const int yy = y + dy;
         if (yy < 0 || yy >= mask_h) return false;
         for (int dx = -1; dx <= 1; ++dx) {
           const int xx = x + dx;
           if (xx < 0 || xx >= mask_w) return false;
-          if (mask_host[(static_cast<size_t>(yy) * static_cast<size_t>(mask_w)) + static_cast<size_t>(xx)] <= threshold) {
+          if (mask_host[(static_cast<size_t>(yy) * static_cast<size_t>(mask_w)) + static_cast<size_t>(xx)] == 0U) {
             return false;
           }
         }
@@ -715,17 +760,60 @@ class AlignedDepthFrameDevice {
     int mask_area = 0;
     int lower_mask_area = 0;
     int torso_mask_area = 0;
+    int max_mask_y = -1;
     for (int yy = 0; yy < roi_h; ++yy) {
       for (int xx = 0; xx < roi_w; ++xx) {
-        const bool active = mask_host[(static_cast<size_t>(yy) * static_cast<size_t>(mask_w)) + static_cast<size_t>(xx)] > threshold;
+        const bool active = mask_host[(static_cast<size_t>(yy) * static_cast<size_t>(mask_w)) + static_cast<size_t>(xx)] != 0U;
         if (!active) continue;
         ++mask_area;
+        max_mask_y = std::max(max_mask_y, yy);
         const bool eroded = eroded_host(xx, yy);
         if (eroded && in_center_band_host(xx, yy, roi_w, roi_h, 0.88, 1.0, 0.35)) {
           ++lower_mask_area;
         }
         if (eroded && in_center_band_host(xx, yy, roi_w, roi_h, 0.35, 0.70, 0.50)) {
           ++torso_mask_area;
+        }
+      }
+    }
+
+    int foot_x = -1;
+    int foot_y = -1;
+    if (max_mask_y >= 0) {
+      const int foot_band_top = std::max(0, max_mask_y - std::max(1, static_cast<int>(std::round(static_cast<double>(roi_h) * 0.12))));
+      for (int yy = max_mask_y; yy >= foot_band_top && foot_y < 0; --yy) {
+        int active_center_count = 0;
+        for (int xx = 0; xx < roi_w; ++xx) {
+          const bool active = mask_host[(static_cast<size_t>(yy) * static_cast<size_t>(mask_w)) + static_cast<size_t>(xx)] != 0U;
+          if (active && in_center_band_host(xx, yy, roi_w, roi_h, 0.0, 1.0, 0.35)) {
+            ++active_center_count;
+          }
+        }
+        if (active_center_count <= 0) {
+          continue;
+        }
+        const int target_lo = (active_center_count - 1) / 2;
+        const int target_hi = active_center_count / 2;
+        int seen = 0;
+        int median_lo = -1;
+        int median_hi = -1;
+        for (int xx = 0; xx < roi_w; ++xx) {
+          const bool active = mask_host[(static_cast<size_t>(yy) * static_cast<size_t>(mask_w)) + static_cast<size_t>(xx)] != 0U;
+          if (!active || !in_center_band_host(xx, yy, roi_w, roi_h, 0.0, 1.0, 0.35)) {
+            continue;
+          }
+          if (seen == target_lo) {
+            median_lo = xx;
+          }
+          if (seen == target_hi) {
+            median_hi = xx;
+            break;
+          }
+          ++seen;
+        }
+        if (median_lo >= 0 && median_hi >= 0) {
+          foot_x = (median_lo + median_hi) / 2;
+          foot_y = yy;
         }
       }
     }
@@ -742,7 +830,7 @@ class AlignedDepthFrameDevice {
     int sampled_torso_area = 0;
     for (int yy = 0; yy < roi_h; yy += stride) {
       for (int xx = 0; xx < roi_w; xx += stride) {
-        const bool active = mask_host[(static_cast<size_t>(yy) * static_cast<size_t>(mask_w)) + static_cast<size_t>(xx)] > threshold;
+        const bool active = mask_host[(static_cast<size_t>(yy) * static_cast<size_t>(mask_w)) + static_cast<size_t>(xx)] != 0U;
         if (!active) continue;
         ++sampled_mask_area;
         const bool eroded = eroded_host(xx, yy);
@@ -756,13 +844,13 @@ class AlignedDepthFrameDevice {
     }
 
     const size_t mask_count = static_cast<size_t>(mask_w) * static_cast<size_t>(mask_h);
-    thread_local CudaBuffer<float> mask_device;
+    thread_local CudaBuffer<uint8_t> mask_device;
     mask_device.ensure_capacity(mask_count);
     throw_on_cuda(
         cudaMemcpy(
             mask_device.get(),
             mask_host,
-            mask_count * sizeof(float),
+            mask_count * sizeof(uint8_t),
             cudaMemcpyHostToDevice),
         "cudaMemcpy person object-depth mask to device failed");
 
@@ -789,7 +877,6 @@ class AlignedDepthFrameDevice {
             stride,
             sampled_cols,
             sampled_area,
-            threshold,
             all_device,
             lower_device,
             torso_device,
@@ -869,6 +956,13 @@ class AlignedDepthFrameDevice {
     out["sampled_mask_area_px"] = sampled_mask_area;
     out["sampled_lower_mask_area_px"] = sampled_lower_area;
     out["sampled_torso_mask_area_px"] = sampled_torso_area;
+    if (foot_x >= 0 && foot_y >= 0) {
+      out["foot_u"] = static_cast<double>(x0 + foot_x);
+      out["foot_v"] = static_cast<double>(y0 + foot_y);
+    } else {
+      out["foot_u"] = py::none();
+      out["foot_v"] = py::none();
+    }
     if (std::isfinite(center_value)) {
       out["depth_center"] = static_cast<double>(center_value);
     } else {

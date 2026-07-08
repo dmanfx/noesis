@@ -1,6 +1,8 @@
 #include <cuda_runtime.h>
 #include <math_constants.h>
 
+#include <cstdint>
+
 namespace {
 
 __global__ void sample_roi_values_kernel(
@@ -43,7 +45,7 @@ __global__ void sample_roi_center_kernel(
 
 __global__ void sample_masked_roi_values_kernel(
     const float* __restrict__ depth,
-    const float* __restrict__ mask,
+    const uint8_t* __restrict__ mask,
     int frame_w,
     int mask_w,
     int x0,
@@ -53,7 +55,6 @@ __global__ void sample_masked_roi_values_kernel(
     int stride,
     int sampled_cols,
     int sampled_area,
-    float threshold,
     float* __restrict__ out_values) {
   const int idx = (blockIdx.x * blockDim.x) + threadIdx.x;
   if (idx >= sampled_area) {
@@ -65,7 +66,7 @@ __global__ void sample_masked_roi_values_kernel(
   const int local_x = min(sample_x * stride, roi_w - 1);
   const int local_y = min(sample_y * stride, roi_h - 1);
   const int mask_idx = (local_y * mask_w) + local_x;
-  if (mask[mask_idx] <= threshold) {
+  if (mask[mask_idx] == 0U) {
     out_values[idx] = CUDART_NAN_F;
     return;
   }
@@ -76,12 +77,11 @@ __global__ void sample_masked_roi_values_kernel(
 }
 
 __device__ bool mask_eroded3x3(
-    const float* __restrict__ mask,
+    const uint8_t* __restrict__ mask,
     int mask_w,
     int mask_h,
     int x,
-    int y,
-    float threshold) {
+    int y) {
   for (int dy = -1; dy <= 1; ++dy) {
     const int yy = y + dy;
     if (yy < 0 || yy >= mask_h) {
@@ -92,7 +92,7 @@ __device__ bool mask_eroded3x3(
       if (xx < 0 || xx >= mask_w) {
         return false;
       }
-      if (mask[(yy * mask_w) + xx] <= threshold) {
+      if (mask[(yy * mask_w) + xx] == 0U) {
         return false;
       }
     }
@@ -124,7 +124,7 @@ __device__ bool in_center_band(
 
 __global__ void sample_masked_person_roi_values_kernel(
     const float* __restrict__ depth,
-    const float* __restrict__ mask,
+    const uint8_t* __restrict__ mask,
     int frame_w,
     int mask_w,
     int mask_h,
@@ -135,7 +135,6 @@ __global__ void sample_masked_person_roi_values_kernel(
     int stride,
     int sampled_cols,
     int sampled_area,
-    float threshold,
     float* __restrict__ out_all,
     float* __restrict__ out_lower,
     float* __restrict__ out_torso) {
@@ -149,7 +148,7 @@ __global__ void sample_masked_person_roi_values_kernel(
   const int local_x = min(sample_x * stride, roi_w - 1);
   const int local_y = min(sample_y * stride, roi_h - 1);
   const int mask_idx = (local_y * mask_w) + local_x;
-  const bool active = mask[mask_idx] > threshold;
+  const bool active = mask[mask_idx] != 0U;
   const int frame_x = x0 + local_x;
   const int frame_y = y0 + local_y;
   const float value = active
@@ -157,7 +156,7 @@ __global__ void sample_masked_person_roi_values_kernel(
       : CUDART_NAN_F;
   out_all[idx] = value;
 
-  const bool eroded = active && mask_eroded3x3(mask, mask_w, mask_h, local_x, local_y, threshold);
+  const bool eroded = active && mask_eroded3x3(mask, mask_w, mask_h, local_x, local_y);
   out_lower[idx] = eroded && in_center_band(local_x, local_y, roi_w, roi_h, 0.88F, 1.0F, 0.35F)
       ? value
       : CUDART_NAN_F;
@@ -212,7 +211,7 @@ extern "C" cudaError_t noesis_sample_roi_values_cuda(
 
 extern "C" cudaError_t noesis_sample_masked_roi_values_cuda(
     const float* depth,
-    const float* mask,
+    const uint8_t* mask,
     int frame_w,
     int frame_h,
     int mask_w,
@@ -224,7 +223,6 @@ extern "C" cudaError_t noesis_sample_masked_roi_values_cuda(
     int stride,
     int sampled_cols,
     int sampled_area,
-    float threshold,
     float* out_values,
     float* out_center,
     cudaStream_t stream) {
@@ -256,7 +254,6 @@ extern "C" cudaError_t noesis_sample_masked_roi_values_cuda(
       stride,
       sampled_cols,
       sampled_area,
-      threshold,
       out_values);
   sample_roi_center_kernel<<<1, 1, 0, stream>>>(depth, frame_w, x0, y0, roi_w, roi_h, out_center);
   return cudaGetLastError();
@@ -264,7 +261,7 @@ extern "C" cudaError_t noesis_sample_masked_roi_values_cuda(
 
 extern "C" cudaError_t noesis_sample_masked_person_roi_values_cuda(
     const float* depth,
-    const float* mask,
+    const uint8_t* mask,
     int frame_w,
     int frame_h,
     int mask_w,
@@ -276,7 +273,6 @@ extern "C" cudaError_t noesis_sample_masked_person_roi_values_cuda(
     int stride,
     int sampled_cols,
     int sampled_area,
-    float threshold,
     float* out_all,
     float* out_lower,
     float* out_torso,
@@ -311,7 +307,6 @@ extern "C" cudaError_t noesis_sample_masked_person_roi_values_cuda(
       stride,
       sampled_cols,
       sampled_area,
-      threshold,
       out_all,
       out_lower,
       out_torso);

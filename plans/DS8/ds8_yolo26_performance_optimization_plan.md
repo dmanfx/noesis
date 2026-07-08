@@ -360,3 +360,22 @@ Date: 2026-06-28
 - **Live profile before the batch-3 pose swap:** YOLO26 medium with the cache-first pose path but batch-16 pose SGIE captured `detection_wake.frames=5290`, `objects_seen=1929`, `pose_feature_cache_hit=1271`, `pose_feature_native_extract=167`, `tensor_host_copies_total.pose=167`, `object_depth_native_stats=314`, and `object_depth_cache_hit=1592`. GPU SM avg/p95/max was `84.78%/96%/99%`, power avg was `145.1 W`, process CPU avg was `369.2%`, and RSS averaged about `3.12 GB`.
 - **Live profile after the batch-3 pose swap:** YOLO26 medium with the batch-3 pose SGIE captured a busier window ending with three active tracks: `detection_wake.frames=5314`, `objects_seen=3747`, `pose_feature_cache_hit=3106`, `pose_feature_native_extract=404`, `tensor_host_copies_total.pose=404`, `object_depth_native_stats=651`, and `object_depth_cache_hit=3091`. GPU SM avg/p95/max fell to `68.07%/80%/92%`, power avg fell to `111.04 W`, process CPU avg fell to `347.42%`, and RSS averaged about `1.94 GB`.
 - **Result:** With roughly double the person/object load in the post-change window, average GPU dropped by about 16.7 absolute points, p95 GPU dropped by 16 points, average power dropped by about 34 W, and RSS dropped by about 1.18 GB. CPU improved modestly despite the heavier detection window. The current live runtime is still `python3 noesis/ds8_runtime.py --pgie-profile yolo26 --size m` and has the batch-3 pose engine loaded.
+
+### 2026-07-08: Object-Depth Zero-Copy Tightening
+
+- **Scope:** Implemented the follow-up object-depth CPU/zero-copy optimizations requested after the YOLO26-L CPU investigation.
+- **Change:** `_ObjectDepthFusionProcessor` now caches compact `NOESIS.OBJECT_DEPTH` JSON strings for native user-meta attach and for cache reuse, avoiding an extra `dict(...)`/`json.dumps(...)` step at the attach boundary.
+- **Change:** The production object-depth path no longer falls back to `copy_roi_to_numpy` when native stats are missing. Host depth ROI copies require `NOESIS_OBJECT_DEPTH_ALLOW_HOST_ROI_COPY=1`; otherwise the attached object-depth result reports `native_stats_unavailable` and keeps the full-frame depth tensor/device frame on the native path.
+- **Change:** Masked object-depth now pre-thresholds masks to contiguous `uint8` arrays before native calls. The native extension accepts byte masks directly, falls back to threshold-packing only for older float callers, uploads 1 byte/pixel masks to CUDA, and treats nonzero bytes as active pixels.
+- **Change:** `AlignedDepthFrameDevice.sample_masked_person_roi_stats(...)` now returns `foot_u`/`foot_v`, allowing the common combined-native person path to avoid the previous Python `_mask_foot_uv` scan.
+- **Validation:**
+  - `python3 -m pytest tests/test_depth_tracking_frame_processor.py -q`
+    - Passed: 9 tests.
+  - `bash scripts/build_noesis_depth_tracking_tensor_ext.sh`
+    - Passed; rebuilt `noesis_depth_tracking_tensor_ext`.
+  - Native import/API check for `sample_masked_roi_stats` and `sample_masked_person_roi_stats`
+    - Passed.
+  - `python3 -m pytest tests/test_depth_tracking_frame_processor.py tests/test_object_depth_result.py tests/test_object_depth_meta_native_contracts.py tests/test_analytics_telemetry_hook.py tests/test_zero_copy_stats_contract.py tests/test_zero_copy_invariants.py -q`
+    - Passed: 40 tests.
+  - Live restart smoke: stopped the old YOLO26-L runtime, started `python3 noesis/ds8_runtime.py --pgie-profile yolo26 --size l`, confirmed DS8 loaded the rebuilt runtime path and relaunches cleanly on `6008`, `8080`, and `8554` as pid `2250683`.
+- **Live-profile note:** The short WebSocket stats smoke had no active tracks, so it did not exercise object-depth counters. Focused tests cover the counter/contract behavior; a detection-present live window is still needed for before/after timing on `object_depth.native_mask_person_stats` or `object_depth.native_roi_stats`.

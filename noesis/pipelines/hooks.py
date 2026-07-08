@@ -276,6 +276,13 @@ def _read_env_float(name: str, default: float, *, min_value: float = 0.0) -> flo
     return max(float(min_value), float(value))
 
 
+def _read_env_bool(name: str, default: bool = False) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return bool(default)
+    return str(raw).strip().lower() in ("1", "true", "yes", "on")
+
+
 def _serialize_compact_json_with_metrics(payload: Mapping[str, Any], *, metric: str) -> str:
     start_ns = time.perf_counter_ns()
     encoded = ""
@@ -4273,6 +4280,7 @@ class _ObjectDepthFusionProcessor:
     calibration_resolver: Any | None = None
     camera_labels: Mapping[int, str] = field(default_factory=dict)
     _result_cache: Dict[Tuple[int, int], Dict[str, Any]] = field(default_factory=dict, init=False, repr=False)
+    _PAYLOAD_JSON_KEY = "_payload_json"
 
     def _max_objects_per_frame(self) -> int:
         return _read_env_int("NOESIS_OBJECT_DEPTH_MAX_OBJECTS_PER_FRAME", 2, min_value=0)
@@ -4286,6 +4294,9 @@ class _ObjectDepthFusionProcessor:
 
     def _cache_max_bbox_shift(self) -> float:
         return _read_env_float("NOESIS_OBJECT_DEPTH_CACHE_MAX_BBOX_SHIFT", 0.25, min_value=0.0)
+
+    def _allow_host_roi_copy(self) -> bool:
+        return _read_env_bool("NOESIS_OBJECT_DEPTH_ALLOW_HOST_ROI_COPY", False)
 
     def _camera_id_for_source(self, source_id: int) -> Optional[str]:
         camera_id = self.camera_labels.get(int(source_id))
@@ -4365,6 +4376,10 @@ class _ObjectDepthFusionProcessor:
                 "ts_us": int(pts_us),
             }
         )
+        payload[self._PAYLOAD_JSON_KEY] = _serialize_compact_json_with_metrics(
+            payload,
+            metric="object_depth.user_meta_json",
+        )
         return payload
 
     def _sample_due(self, *, source_id: int, obj_meta: Any, pts_us: int) -> bool:
@@ -4386,26 +4401,45 @@ class _ObjectDepthFusionProcessor:
         min_interval_us = int(1_000_000.0 / max(1e-6, float(max_hz)))
         return (int(pts_us) - sample_ts_us) >= min_interval_us
 
-    def _cache_result(self, *, source_id: int, pts_us: int, obj_meta: Any, result: ObjectDepthResult) -> None:
+    def _cache_payload(
+        self,
+        *,
+        source_id: int,
+        pts_us: int,
+        obj_meta: Any,
+        payload: Mapping[str, Any],
+        payload_json: str,
+    ) -> None:
         key = self._track_key(source_id, obj_meta)
         if key is None:
             return
-        payload = result.to_dict()
-        payload["_sample_ts_us"] = int(pts_us)
-        self._result_cache[key] = payload
+        cached_payload = dict(payload)
+        cached_payload["_sample_ts_us"] = int(pts_us)
+        cached_payload[self._PAYLOAD_JSON_KEY] = str(payload_json)
+        self._result_cache[key] = cached_payload
         max_entries = max(8, _read_env_int("NOESIS_OBJECT_DEPTH_CACHE_MAX_TRACKS", 64, min_value=1))
         if len(self._result_cache) > max_entries:
             oldest_key = next(iter(self._result_cache.keys()))
             self._result_cache.pop(oldest_key, None)
 
-    def _attach_object_depth_payload(self, obj_meta: Any, payload: Mapping[str, Any]) -> bool:
+    def _payload_json(self, payload: Mapping[str, Any]) -> str:
+        cached = payload.get(self._PAYLOAD_JSON_KEY)
+        if isinstance(cached, str) and cached:
+            return cached
+        json_payload = {str(k): v for k, v in payload.items() if not str(k).startswith("_")}
+        return _serialize_compact_json_with_metrics(
+            json_payload,
+            metric="object_depth.user_meta_json",
+        )
+
+    def _attach_object_depth_payload(self, obj_meta: Any, payload: Mapping[str, Any] | str) -> bool:
         if noesis_depth_meta_ext is None:
             return False
         attach_fn = getattr(noesis_depth_meta_ext, "attach_object_depth", None)
         if not callable(attach_fn):
             return False
         try:
-            payload_json = json.dumps(dict(payload), separators=(",", ":"))
+            payload_json = payload if isinstance(payload, str) else self._payload_json(payload)
             return bool(attach_fn(obj_meta, payload_json, True))
         except Exception:
             logger.exception("Failed to attach NOESIS.OBJECT_DEPTH to object metadata")
@@ -4430,6 +4464,9 @@ class _ObjectDepthFusionProcessor:
             return None
 
     def _copy_depth_crop(self, depth_frame: _AlignedDepthFrame, x0: int, y0: int, x1: int, y1: int) -> Optional[np.ndarray]:
+        if not self._allow_host_roi_copy():
+            _increment_core_counter("detection_wake.object_depth_host_roi_copy_skipped")
+            return None
         width = int(x1) - int(x0)
         height = int(y1) - int(y0)
         if width <= 0 or height <= 0:
@@ -4493,18 +4530,25 @@ class _ObjectDepthFusionProcessor:
             return None, "missing_mask"
         try:
             threshold = float(payload.get("threshold", 0.5) or 0.5)
-            data = np.asarray(payload.get("data"), dtype=np.float32)
+            data = np.asarray(payload.get("data"))
         except Exception:
             return None, "mask_decode_failed"
         if data.ndim != 2 or data.size <= 0:
             return None, "mask_decode_failed"
-        mask = np.asarray(data > threshold, dtype=bool)
+        try:
+            mask = np.asarray(data > threshold, dtype=np.uint8)
+        except Exception:
+            try:
+                data = np.asarray(data, dtype=np.float32)
+                mask = np.asarray(data > threshold, dtype=np.uint8)
+            except Exception:
+                return None, "mask_decode_failed"
         if mask.shape != target_shape:
             mask = cv2.resize(
-                mask.astype(np.uint8, copy=False),
+                mask,
                 (target_shape[1], target_shape[0]),
                 interpolation=cv2.INTER_NEAREST,
-            ).astype(bool)
+            ).astype(np.uint8, copy=False)
         return mask, "ok"
 
     def _decode_instance_mask(self, obj_meta: Any, target_shape: Tuple[int, int]) -> Tuple[Optional[np.ndarray], str]:
@@ -4730,10 +4774,9 @@ class _ObjectDepthFusionProcessor:
         height = max(0, y1 - y0)
         if width <= 0 or height <= 0:
             return None
-        mask_arr = np.asarray(mask, dtype=np.float32)
+        mask_arr = np.ascontiguousarray(mask, dtype=np.uint8)
         if mask_arr.shape != (height, width):
             return None
-        mask_arr = np.ascontiguousarray(mask_arr)
         try:
             start_ns = time.perf_counter_ns()
             stats_raw = sample_masked_stats(
@@ -4768,10 +4811,9 @@ class _ObjectDepthFusionProcessor:
         height = max(0, y1 - y0)
         if width <= 0 or height <= 0:
             return None
-        mask_arr = np.asarray(mask, dtype=np.float32)
+        mask_arr = np.ascontiguousarray(mask, dtype=np.uint8)
         if mask_arr.shape != (height, width):
             return None
-        mask_arr = np.ascontiguousarray(mask_arr)
         try:
             start_ns = time.perf_counter_ns()
             stats_raw = sample_person_stats(
@@ -4848,10 +4890,7 @@ class _ObjectDepthFusionProcessor:
         mask, _mask_status = self._decode_instance_mask_payload(mask_payload, (height, width))
         if mask is None or mask.size <= 0:
             return None
-        mask = np.asarray(mask, dtype=bool)
-        mask_area = int(np.count_nonzero(mask))
-        if mask_area <= 0:
-            return None
+        mask = np.ascontiguousarray(mask, dtype=np.uint8)
 
         stats = self._sample_person_mask_stats_native(
             depth_device_frame,
@@ -4876,12 +4915,14 @@ class _ObjectDepthFusionProcessor:
                 return int(default)
 
         sample_count = _int_stat("sample_count")
-        mask_area_native = _int_stat("mask_area_px", mask_area)
+        mask_area_native = _int_stat("mask_area_px", 0)
         valid_fraction = self._stats_float(stats, "valid_fraction") or 0.0
         depth_median = self._stats_float(stats, "depth_median")
         status = "ok" if sample_count > 0 and depth_median is not None else "no_valid_depth"
 
-        foot_uv = self._mask_foot_uv(mask, frame_origin=(x0, y0))
+        foot_u = self._stats_float(stats, "foot_u")
+        foot_v = self._stats_float(stats, "foot_v")
+        foot_uv = [float(foot_u), float(foot_v)] if foot_u is not None and foot_v is not None else self._mask_foot_uv(mask, frame_origin=(x0, y0))
         anchor_source: Optional[str] = None
         anchor_depth_m: Optional[float] = None
         anchor_sample_count: Optional[int] = None
@@ -5061,7 +5102,13 @@ class _ObjectDepthFusionProcessor:
                 return native_mask_result
         depth_crop = self._copy_depth_crop(depth_frame, x0, crop_y0, x1, y1)
         if depth_crop is None:
-            return self._build_result(frame_meta, obj_meta, bbox=bbox, status="depth_not_ready")
+            return self._build_result(
+                frame_meta,
+                obj_meta,
+                bbox=bbox,
+                status="native_stats_unavailable",
+                sampling_mode="instance_mask" if mask_payload else "bbox_band",
+            )
         if depth_crop.size <= 0:
             return self._build_result(frame_meta, obj_meta, bbox=bbox, status="transform_mismatch")
 
@@ -5086,6 +5133,7 @@ class _ObjectDepthFusionProcessor:
                 depth_center=center_value,
             )
 
+        mask = np.asarray(mask, dtype=bool)
         mask_area = int(np.count_nonzero(mask))
 
         if mask_area <= 0:
@@ -5189,8 +5237,16 @@ class _ObjectDepthFusionProcessor:
                 continue
             _record_core_stage_timing("object_depth.sample_person", sample_start_ns)
             _increment_core_counter("detection_wake.object_depth_sampled")
-            self._cache_result(source_id=source_id, pts_us=pts_us, obj_meta=obj_meta, result=result)
-            self._attach_object_depth_payload(obj_meta, result.to_dict())
+            payload = result.to_dict()
+            payload_json = self._payload_json(payload)
+            self._cache_payload(
+                source_id=source_id,
+                pts_us=pts_us,
+                obj_meta=obj_meta,
+                payload=payload,
+                payload_json=payload_json,
+            )
+            self._attach_object_depth_payload(obj_meta, payload_json)
 
 
 class _DepthTrackingFrameOperator(BatchMetadataOperator):  # pragma: no cover - requires DS runtime

@@ -40,6 +40,18 @@ you don’t have to sift through the historical work orders.
     snapshots are not used as live person-depth placement inputs.
   - Producer-owned BEV smoothing is active in the backend; the dashboard should
     render `footpoints` and backend `trails` directly.
+  - Human pathing realism is producer-owned via
+    `noesis/telemetry/person_ground_state.py` (shared by baseline + V3DT hooks,
+    BEV trails, and mosaic OSD trails):
+    - stationary/idle lock freezes world when a person stops; trails do **not**
+      append while `motion_mode` is `idle` / `sit` / `lie`
+    - posture-aware floor contact (ankles standing, hip/body sitting/lying)
+    - sticky `world_source` hysteresis; bent-leg `pose_leg_floor` is rejected
+    - human constant-velocity filter with adaptive noise, ~4 m/s speed gate,
+      idle deadzone (not a second BEV world smoother)
+    - path history uses min-step + RDP simplification; head stays responsive
+    - public fields: `motion_mode`, `posture`, `trail_append_allowed`,
+      `idle_jitter_m` (BEV JSON uses camelCase mirrors)
 
 ## Depth / MapAnything / Baseline World Tracking
 - MapAnything is still a full-frame SGIE branch (no tensor-from-meta), but it
@@ -53,7 +65,7 @@ you don’t have to sift through the historical work orders.
   - uses an always-on full-frame DAv2 branch (`models.depth_tracking`)
   - attaches raw per-object depth through `NOESIS.OBJECT_DEPTH`
   - fuses pose anchor + floor observation + registered DAv2 range inside the
-    backend world estimator
+    backend world estimator (`PersonGroundState` / human CV filter)
   - does not publish a second full-frame WebSocket depth stream
 - Baseline startup now requires a valid DAv2->MapAnything registration artifact:
   - config key: `depth_registration.path`

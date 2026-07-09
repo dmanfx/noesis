@@ -61,6 +61,18 @@ from noesis.metadata.depth_result import DepthResult
 from noesis.metadata.object_depth import ObjectDepthResult
 from noesis.metadata.pose_features import PoseFeatureResult
 from noesis.telemetry.bev import Footpoint
+from noesis.telemetry.person_ground_state import (
+    HumanGroundConfig,
+    PersonGroundState,
+    PoseAnchorCandidate,
+    apply_source_hysteresis,
+    classify_posture,
+    commit_image_path_point,
+    resolve_pose_floor_anchor,
+    source_score,
+    update_human_cv_filter,
+    update_motion_mode,
+)
 
 try:  # DeepStream imports are optional during unit tests
     from pyservicemaker import BatchMetadataOperator, Probe, osd as ds_osd  # type: ignore
@@ -2142,27 +2154,9 @@ class _TrailTrackState:
     last_measure_speed: float = 0.0
 
 
-@dataclass(frozen=True)
-class _PoseAnchorCandidate:
-    u: float
-    v: float
-    source: str
-    quality: str = "good"
-    quality_reason: Optional[str] = None
-    height_lock_eligible: bool = False
-
-
-@dataclass
-class _WorldAnchorState:
-    ts: float = 0.0
-    height_ref_scene: Optional[float] = None
-    last_good_world: Optional[Tuple[float, float, float]] = None
-    last_good_ts: float = 0.0
-    world_x: Optional[float] = None
-    world_z: Optional[float] = None
-    vel_world_x: float = 0.0
-    vel_world_z: float = 0.0
-    filtered_ts: float = 0.0
+# Shared person-ground types (Phases 1–6). Historical names retained for tests/call sites.
+_PoseAnchorCandidate = PoseAnchorCandidate
+_WorldAnchorState = PersonGroundState
 
 
 FrameKey = Tuple[int, int, int]
@@ -2840,7 +2834,16 @@ class TrailOverlayProcessor:
             )
         return float(x), float(y), False
 
-    def _commit_point(self, state: _TrailTrackState, now: float, x: float, y: float, *, predicted: bool) -> None:
+    def _commit_point(
+        self,
+        state: _TrailTrackState,
+        now: float,
+        x: float,
+        y: float,
+        *,
+        predicted: bool,
+        append_allowed: bool = True,
+    ) -> None:
         if state.points:
             prev = state.points[-1]
             dt = max(0.0, float(now) - float(prev.ts))
@@ -2867,18 +2870,50 @@ class TrailOverlayProcessor:
                 state.ema_ts = float(now)
             x, y = float(state.ema_x), float(state.ema_y)
 
+        # Phase 1: stationary people do not grow OSD trail history.
+        if not append_allowed:
+            if state.points:
+                prev = state.points[-1]
+                state.points[-1] = _TrailPoint(
+                    ts=float(prev.ts),
+                    x=float(x),
+                    y=float(y),
+                    predicted=bool(predicted),
+                )
+            return
+
+        # Phase 6: image-space path commit with min-step + optional RDP.
+        def _factory(*, ts: float, x: float, y: float) -> _TrailPoint:
+            return _TrailPoint(ts=float(ts), x=float(x), y=float(y), predicted=bool(predicted))
+
         if state.points:
             prev = state.points[-1]
             dt = max(0.0, float(now) - float(prev.ts))
-            dist = math.hypot(float(x) - float(prev.x), float(y) - float(prev.y))
             if dt < float(self.config.min_dt_s):
-                if dist >= float(self.config.min_step_px):
-                    state.points[-1] = _TrailPoint(ts=float(prev.ts), x=float(x), y=float(y), predicted=bool(predicted))
-                return
-            if dist < float(self.config.min_step_px):
+                commit_image_path_point(
+                    state.points,
+                    ts=float(prev.ts),
+                    x=float(x),
+                    y=float(y),
+                    min_step_px=float(self.config.min_step_px),
+                    simplify_epsilon_px=max(1.0, float(self.config.min_step_px) * 1.5),
+                    max_points=max(2, int(self.config.max_points_per_track)),
+                    append_allowed=True,
+                    point_factory=_factory,
+                )
                 return
 
-        state.points.append(_TrailPoint(ts=float(now), x=float(x), y=float(y), predicted=bool(predicted)))
+        commit_image_path_point(
+            state.points,
+            ts=float(now),
+            x=float(x),
+            y=float(y),
+            min_step_px=float(self.config.min_step_px),
+            simplify_epsilon_px=max(1.0, float(self.config.min_step_px) * 1.5),
+            max_points=max(2, int(self.config.max_points_per_track)),
+            append_allowed=True,
+            point_factory=_factory,
+        )
 
     def handle_batch_ds8(self, batch_meta: Any) -> None:
         if ds_osd is None:
@@ -3019,7 +3054,23 @@ class TrailOverlayProcessor:
                 x = float(max(0.0, min(x, max_x)))
             if max_y is not None:
                 y = float(max(0.0, min(y, max_y)))
-            self._commit_point(state, float(now), float(x), float(y), predicted=bool(predicted))
+            track_map = self._analytics_track_map(sensor_id)
+            track_info = track_map.get(int(track_id)) if isinstance(track_map, Mapping) else None
+            append_allowed = True
+            if isinstance(track_info, Mapping):
+                if "trail_append_allowed" in track_info:
+                    append_allowed = bool(track_info.get("trail_append_allowed"))
+                motion_mode = str(track_info.get("motion_mode") or "").strip().lower()
+                if motion_mode in ("idle", "sit", "lie"):
+                    append_allowed = False
+            self._commit_point(
+                state,
+                float(now),
+                float(x),
+                float(y),
+                predicted=bool(predicted),
+                append_allowed=bool(append_allowed),
+            )
 
         if do_sample and self.config.anchor_mode == "floor_plane_gravity_drop":
             for track_id, state in sensor_tracks.items():
@@ -5360,9 +5411,10 @@ class _AnalyticsTelemetryProcessor:
     _world_state_last_prune_ts: float = field(default=0.0, init=False, repr=False)
     _world_static_px_threshold: float = field(default=3.0, init=False, repr=False)
     _world_static_jump_scene: float = field(default=10.0, init=False, repr=False)
-    _world_max_speed_scene_per_s: float = field(default=120.0, init=False, repr=False)
+    _world_max_speed_scene_per_s: float = field(default=4.0, init=False, repr=False)
     _world_smooth_alpha_good: float = field(default=0.45, init=False, repr=False)
     _world_smooth_alpha_weak: float = field(default=0.20, init=False, repr=False)
+    _human_ground_cfg: HumanGroundConfig = field(default_factory=HumanGroundConfig, init=False, repr=False)
     _pose_anchor_gie_id: int = field(default=4, init=False, repr=False)
     _pose_anchor_model_size: Tuple[int, int] = field(default=(640, 640), init=False, repr=False)
     _pose_anchor_score_threshold: float = field(default=0.25, init=False, repr=False)
@@ -5476,10 +5528,10 @@ class _AnalyticsTelemetryProcessor:
             self._world_static_jump_scene = 10.0
         try:
             self._world_max_speed_scene_per_s = max(
-                0.0, float(str(os.environ.get("NOESIS_WORLD_MAX_SPEED_SCENE_PER_S", "120.0")).strip() or "120.0")
+                0.0, float(str(os.environ.get("NOESIS_WORLD_MAX_SPEED_SCENE_PER_S", "4.0")).strip() or "4.0")
             )
         except Exception:
-            self._world_max_speed_scene_per_s = 120.0
+            self._world_max_speed_scene_per_s = 4.0
         try:
             self._world_smooth_alpha_good = float(
                 str(os.environ.get("NOESIS_WORLD_SMOOTH_ALPHA_GOOD", "0.45")).strip() or "0.45"
@@ -5500,6 +5552,14 @@ class _AnalyticsTelemetryProcessor:
             )
         except Exception:
             self._world_anchor_hold_ttl_s = 0.40
+        self._human_ground_cfg = HumanGroundConfig(
+            static_px_threshold=float(self._world_static_px_threshold),
+            max_speed_mps=float(self._world_max_speed_scene_per_s),
+            max_jump_m=0.75,
+            alpha_good=float(self._world_smooth_alpha_good),
+            alpha_weak=float(self._world_smooth_alpha_weak),
+            kpt_conf_threshold=float(self._pose_anchor_kpt_threshold),
+        )
         self._reid_embeds_per_frame_max = _read_env_int("NOESIS_REID_EMBEDS_PER_FRAME_MAX", 2, min_value=0)
         self._pose_anchor_native_per_frame_max = _read_env_int(
             "NOESIS_POSE_ANCHOR_NATIVE_EXTRACTS_PER_FRAME_MAX",
@@ -6240,14 +6300,9 @@ class _AnalyticsTelemetryProcessor:
                 present_stable_ids.add(1)
                 present_track_ids.add(1)
 
-            if not tracks:
-                try:
-                    self._publish_bev(sensor_id, camera_id, frame_meta, footpoints, now_ts=now_ts, track_count=0)
-                except Exception:
-                    logger.exception("BEV publish failed for sensor %s", sensor_id)
-                _record_core_stage_timing("analytics.handle_frame_ds8", frame_start_ns, item_count=0)
-                return
-
+            # Always evaluate the tracking publish gate, including zero-track
+            # frames. Count transitions to 0 must reach Menon so clients can
+            # drop presence immediately instead of waiting on local TTLs.
             if self._publish_gate_due(
                 self._last_tracking_publish_ts_by_sensor,
                 self._last_tracking_count_by_sensor,
@@ -6264,7 +6319,14 @@ class _AnalyticsTelemetryProcessor:
                 except Exception:  # pragma: no cover - telemetry should never break pipeline
                     logger.exception("Tracking telemetry publish failed for sensor %s", sensor_id)
             try:
-                self._publish_bev(sensor_id, camera_id, frame_meta, footpoints, now_ts=now_ts, track_count=len(tracks))
+                self._publish_bev(
+                    sensor_id,
+                    camera_id,
+                    frame_meta,
+                    footpoints,
+                    now_ts=now_ts,
+                    track_count=len(tracks),
+                )
             except Exception:
                 logger.exception("BEV publish failed for sensor %s", sensor_id)
             _record_core_stage_timing("analytics.handle_frame_ds8", frame_start_ns, item_count=len(tracks))
@@ -6498,13 +6560,8 @@ class _AnalyticsTelemetryProcessor:
                 present_stable_ids.add(1)
                 present_track_ids.add(1)
 
-            if not tracks:
-                try:
-                    self._publish_bev(sensor_id, camera_id, frame_meta, footpoints)
-                except Exception:
-                    logger.exception("BEV publish failed for sensor %s", sensor_id)
-                return
-
+            # Publish tracking even when the frame has zero people so downstream
+            # clients (Menon) can clear presence without waiting on TTLs.
             try:
                 self.tracking_pub.publish(sensor_id, tracks)
             except Exception:  # pragma: no cover - telemetry should never break pipeline
@@ -6885,6 +6942,17 @@ class _AnalyticsTelemetryProcessor:
             frame_id_value = int(track.get("frame_id")) if track.get("frame_id") is not None else None
         except Exception:
             frame_id_value = None
+        trail_append = track.get("trail_append_allowed")
+        trail_append_bool: Optional[bool]
+        if trail_append is None:
+            trail_append_bool = None
+        else:
+            trail_append_bool = bool(trail_append)
+        idle_jitter = track.get("idle_jitter_m")
+        try:
+            idle_jitter_f = float(idle_jitter) if idle_jitter is not None else None
+        except Exception:
+            idle_jitter_f = None
         return Footpoint(
             u=u,
             v=v,
@@ -6901,6 +6969,10 @@ class _AnalyticsTelemetryProcessor:
             bbox=bbox_tuple,
             image_size=target_image_size_tuple or source_image_size_tuple,
             frame_id=frame_id_value,
+            motion_mode=str(track.get("motion_mode")) if track.get("motion_mode") not in (None, "") else None,
+            posture=str(track.get("posture")) if track.get("posture") not in (None, "") else None,
+            trail_append_allowed=trail_append_bool,
+            idle_jitter_m=idle_jitter_f,
             debug={
                 "image_candidates": image_candidates,
                 "track_frame_id": frame_id_value,
@@ -6911,6 +6983,9 @@ class _AnalyticsTelemetryProcessor:
                 "world_valid": bool(track.get("world_valid")) if track.get("world_valid") is not None else None,
                 "world_source": str(track.get("world_source")) if track.get("world_source") not in (None, "") else None,
                 "world_quality": str(track.get("world_quality")) if track.get("world_quality") not in (None, "") else None,
+                "motion_mode": str(track.get("motion_mode")) if track.get("motion_mode") not in (None, "") else None,
+                "posture": str(track.get("posture")) if track.get("posture") not in (None, "") else None,
+                "trail_append_allowed": trail_append_bool,
                 "world_quality_reason": str(track.get("world_quality_reason")) if track.get("world_quality_reason") not in (None, "") else None,
                 "depth_status": str(track.get("depth_status")) if track.get("depth_status") not in (None, "") else None,
                 "depth_anchor_source": str(track.get("depth_anchor_source")) if track.get("depth_anchor_source") not in (None, "") else None,
@@ -7127,48 +7202,16 @@ class _AnalyticsTelemetryProcessor:
             return None
         return float(ankle_x), float(ankle_y)
 
-    def _resolve_pose_floor_anchor(self, kpts_abs: np.ndarray) -> Optional[_PoseAnchorCandidate]:
-        left_ankle = self._pose_point(kpts_abs, "left_ankle")
-        right_ankle = self._pose_point(kpts_abs, "right_ankle")
-        if left_ankle is not None and right_ankle is not None:
-            return _PoseAnchorCandidate(
-                u=float(left_ankle[0] + right_ankle[0]) * 0.5,
-                v=float(left_ankle[1] + right_ankle[1]) * 0.5,
-                source="pose_ankle_floor",
-                quality="good",
-                height_lock_eligible=True,
-            )
-        if left_ankle is not None or right_ankle is not None:
-            ankle = left_ankle if left_ankle is not None else right_ankle
-            if ankle is None:
-                return None
-            return _PoseAnchorCandidate(
-                u=float(ankle[0]),
-                v=float(ankle[1]),
-                source="pose_single_ankle_floor",
-                quality="good",
-                height_lock_eligible=True,
-            )
-
-        estimates: List[Tuple[float, float]] = []
-        for side in ("left", "right"):
-            ankle_est = self._estimate_ankle_from_leg(kpts_abs, side)
-            if ankle_est is not None:
-                estimates.append((float(ankle_est[0]), float(ankle_est[1])))
-        if not estimates:
-            return None
-        if len(estimates) == 1:
-            u, v = estimates[0]
-        else:
-            u = float(sum(point[0] for point in estimates) / len(estimates))
-            v = float(sum(point[1] for point in estimates) / len(estimates))
-        return _PoseAnchorCandidate(
-            u=float(u),
-            v=float(v),
-            source="pose_leg_floor",
-            quality="estimated",
-            quality_reason="pose_leg_extension",
-            height_lock_eligible=False,
+    def _resolve_pose_floor_anchor(
+        self,
+        kpts_abs: np.ndarray,
+        *,
+        posture: str = "unknown",
+    ) -> Optional[_PoseAnchorCandidate]:
+        return resolve_pose_floor_anchor(
+            kpts_abs,
+            posture=str(posture or "unknown"),
+            config=self._human_ground_cfg,
         )
 
     def _resolve_person_depth_anchor(self, depth_result: Optional[ObjectDepthResult]) -> Optional[_PoseAnchorCandidate]:
@@ -7512,14 +7555,14 @@ class _AnalyticsTelemetryProcessor:
         )
 
     def _predict_world_state(self, state: _WorldAnchorState, now_ts: float) -> Tuple[Optional[float], Optional[float], float]:
-        if state.world_x is None or state.world_z is None or float(state.filtered_ts or 0.0) <= 0.0:
+        if state.world_x is None or state.world_z is None or float(state.filtered_ts) < 0.0:
             return None, None, 0.0
         dt = max(0.0, float(now_ts) - float(state.filtered_ts))
-        # Motion extrapolation is intentionally disabled in the baseline world estimator.
-        # The state should converge toward the latest fused observation instead of
-        # rebounding around a constant-velocity prediction during occlusion/reacquisition.
-        pred_x = float(state.world_x)
-        pred_z = float(state.world_z)
+        # Constant-velocity prediction for the human CV filter (Phase 4).
+        # Occlusion gaps still do not invent trail segments; this only predicts
+        # the filter prior between valid measurements.
+        pred_x = float(state.world_x) + float(state.vel_world_x) * dt
+        pred_z = float(state.world_z) + float(state.vel_world_z) * dt
         return pred_x, pred_z, dt
 
     def _update_world_state(
@@ -7531,41 +7574,25 @@ class _AnalyticsTelemetryProcessor:
         now_ts: float,
         alpha: float,
         beta: float,
+        quality: str = "good",
+        force_accept: bool = False,
     ) -> np.ndarray:
         mx = float(measurement[0])
         mz = float(measurement[2])
         if state is None:
             return np.array([mx, float(floor_y), mz], dtype=np.float64)
-
-        pred_x, pred_z, dt = self._predict_world_state(state, float(now_ts))
-        if pred_x is None or pred_z is None or dt <= 1e-6:
-            state.world_x = mx
-            state.world_z = mz
-            state.vel_world_x = 0.0
-            state.vel_world_z = 0.0
-            state.filtered_ts = float(now_ts)
-            return np.array([mx, float(floor_y), mz], dtype=np.float64)
-
-        innovation_x = float(mx) - float(pred_x)
-        innovation_z = float(mz) - float(pred_z)
-        innovation_dist = math.hypot(innovation_x, innovation_z)
-        max_step = float(self._world_max_speed_scene_per_s) * float(dt)
-        if max_step > 0.0 and innovation_dist > max_step and innovation_dist > 1e-6:
-            scale = max_step / innovation_dist
-            innovation_x *= scale
-            innovation_z *= scale
-
-        next_x = float(pred_x) + float(alpha) * innovation_x
-        next_z = float(pred_z) + float(alpha) * innovation_z
-        next_vx = 0.0
-        next_vz = 0.0
-
-        state.world_x = float(next_x)
-        state.world_z = float(next_z)
-        state.vel_world_x = float(next_vx)
-        state.vel_world_z = float(next_vz)
-        state.filtered_ts = float(now_ts)
-        return np.array([float(next_x), float(floor_y), float(next_z)], dtype=np.float64)
+        # alpha/beta remain in the signature for call-site compatibility; the
+        # adaptive human CV filter owns the actual gains via HumanGroundConfig.
+        _ = (alpha, beta)
+        return update_human_cv_filter(
+            state,
+            measurement=measurement,
+            floor_y=float(floor_y),
+            now_ts=float(now_ts),
+            quality=str(quality or "good"),
+            config=self._human_ground_cfg,
+            force_accept=bool(force_accept),
+        )
 
     def _set_track_image_base_from_world(
         self,
@@ -7646,14 +7673,36 @@ class _AnalyticsTelemetryProcessor:
 
             if pose_kpts_abs is None:
                 pose_kpts_abs = self._extract_pose_keypoints_for_anchor(obj_meta, bbox)
-            pose_anchor = self._resolve_pose_floor_anchor(pose_kpts_abs) if pose_kpts_abs is not None else None
-            person_anchor = self._resolve_person_depth_anchor(depth_result) if pose_anchor is None else None
-            anchor_candidate = pose_anchor if pose_anchor is not None else person_anchor
+
+            posture = classify_posture(
+                kpts_abs=pose_kpts_abs,
+                bbox=bbox_project,
+                height_ref_scene=state.height_ref_scene if state is not None else None,
+                config=self._human_ground_cfg,
+            )
+            if state is not None:
+                state.posture = str(posture)
+
+            pose_anchor = (
+                self._resolve_pose_floor_anchor(pose_kpts_abs, posture=posture)
+                if pose_kpts_abs is not None
+                else None
+            )
+            # Prefer person-mask foot when pose is weak/bent and posture is non-upright.
+            person_anchor = self._resolve_person_depth_anchor(depth_result)
+            if pose_anchor is not None and person_anchor is not None and posture in ("sitting", "lying"):
+                if str(pose_anchor.source) in ("pose_leg_floor", "pose_single_ankle_floor"):
+                    pose_anchor = None
+            if pose_anchor is None:
+                anchor_candidate = person_anchor
+            else:
+                anchor_candidate = pose_anchor
 
             hit: Optional[np.ndarray] = None
             quality = "invalid"
             quality_reason: Optional[str] = "no_floor_intersection"
             world_source: Optional[str] = None
+            depth_weight_for_score = 0.0
 
             if anchor_candidate is not None:
                 track["image_foot"] = [float(anchor_candidate.u), float(anchor_candidate.v)]
@@ -7671,7 +7720,11 @@ class _AnalyticsTelemetryProcessor:
                     flip_v=flip_v,
                 )
                 if hit is not None:
-                    if state is not None and anchor_candidate.height_lock_eligible:
+                    if (
+                        state is not None
+                        and anchor_candidate.height_lock_eligible
+                        and posture in ("standing", "unknown")
+                    ):
                         self._maybe_update_world_height_reference(
                             state,
                             calib,
@@ -7689,6 +7742,7 @@ class _AnalyticsTelemetryProcessor:
                     )
                     depth_obs = depth_observation.world_point
                     depth_weight = float(depth_observation.weight)
+                    depth_weight_for_score = depth_weight
                     depth_reason = str(depth_observation.reason)
                     if depth_observation.raw_depth_m is not None:
                         track["depth_anchor_m"] = float(depth_observation.raw_depth_m)
@@ -7705,12 +7759,13 @@ class _AnalyticsTelemetryProcessor:
                         meas_x = ((float(hit[0]) * floor_weight) + (float(depth_obs[0]) * depth_weight)) / (floor_weight + depth_weight)
                         meas_z = ((float(hit[2]) * floor_weight) + (float(depth_obs[2]) * depth_weight)) / (floor_weight + depth_weight)
                         fused = np.array([meas_x, float(calib.floor_y), meas_z], dtype=np.float64)
-                        depth_anchor_source = str(depth_result.anchor_source or "")
+                        depth_anchor_source = str(depth_result.anchor_source or "") if depth_result is not None else ""
                         alpha_boost = 0.10 if depth_anchor_source == "lower_body_band" else 0.05
-                        if anchor_candidate.source == "person_mask_floor":
+                        if str(anchor_candidate.source) == "person_mask_floor":
                             alpha_boost = max(0.0, float(alpha_boost) - 0.02)
                         alpha = min(1.0, float(self._world_smooth_alpha_good) + float(alpha_boost))
                         beta = max(0.0, min(1.0, float(alpha) * 0.25))
+                        quality = "good" if anchor_candidate.quality == "good" else "estimated"
                         hit = self._update_world_state(
                             state,
                             measurement=fused,
@@ -7718,18 +7773,18 @@ class _AnalyticsTelemetryProcessor:
                             now_ts=float(now_ts),
                             alpha=alpha,
                             beta=beta,
+                            quality=quality,
                         )
                         world_source = "pose_depth_fused" if pose_anchor is not None else "person_anchor_depth_fused"
-                        quality = "good" if anchor_candidate.quality == "good" else "estimated"
                         depth_support_count = int(
                             depth_result.anchor_sample_count
-                            if depth_result.anchor_sample_count is not None
-                            else depth_result.sample_count
+                            if depth_result is not None and depth_result.anchor_sample_count is not None
+                            else (depth_result.sample_count if depth_result is not None else 0)
                         )
                         depth_support_fraction = float(
                             depth_result.anchor_valid_fraction
-                            if depth_result.anchor_valid_fraction is not None
-                            else depth_result.valid_fraction
+                            if depth_result is not None and depth_result.anchor_valid_fraction is not None
+                            else (depth_result.valid_fraction if depth_result is not None else 0.0)
                         )
                         quality_reason = (
                             f"anchor={anchor_candidate.source},depth_anchor={depth_anchor_source or 'none'},"
@@ -7741,6 +7796,7 @@ class _AnalyticsTelemetryProcessor:
                     else:
                         alpha = float(self._world_smooth_alpha_good if anchor_candidate.quality == "good" else self._world_smooth_alpha_weak)
                         beta = max(0.0, min(1.0, float(alpha) * 0.20))
+                        quality = "good" if anchor_candidate.quality == "good" else "estimated"
                         hit = self._update_world_state(
                             state,
                             measurement=hit,
@@ -7748,9 +7804,9 @@ class _AnalyticsTelemetryProcessor:
                             now_ts=float(now_ts),
                             alpha=alpha,
                             beta=beta,
+                            quality=quality,
                         )
                         world_source = "pose_floor_only" if pose_anchor is not None else "person_anchor_floor_only"
-                        quality = "good" if anchor_candidate.quality == "good" else "estimated"
                         quality_reason = f"anchor={anchor_candidate.source},depth={depth_reason}"
                         registration_status = track.get("depth_registration_status")
                         if registration_status:
@@ -7758,7 +7814,15 @@ class _AnalyticsTelemetryProcessor:
                 else:
                     hit = None
 
-            if hit is None and state is not None and state.height_ref_scene is not None:
+            # Gravity-drop assumes upright height. Skip only for confirmed non-upright
+            # motion modes (or clear lying boxes). A short box alone can be lower-body
+            # occlusion of a standing person — height lock is exactly for that case.
+            allow_gravity = True
+            if posture == "lying":
+                allow_gravity = False
+            if state is not None and str(state.motion_mode) in ("sit", "lie"):
+                allow_gravity = False
+            if hit is None and allow_gravity and state is not None and state.height_ref_scene is not None:
                 gravity_hit = self._gravity_drop_world(
                     calib,
                     bbox_project,
@@ -7774,6 +7838,7 @@ class _AnalyticsTelemetryProcessor:
                         now_ts=float(now_ts),
                         alpha=float(self._world_smooth_alpha_weak),
                         beta=max(0.0, min(1.0, float(self._world_smooth_alpha_weak) * 0.15)),
+                        quality="estimated",
                     )
                     world_source = "gravity_drop"
                     quality = "estimated"
@@ -7789,7 +7854,70 @@ class _AnalyticsTelemetryProcessor:
                     quality = "estimated"
                     quality_reason = fallback_reason
 
+            # Phase 2: sticky source hysteresis among live observations.
+            # Degraded modes (anchor_hold / gravity_drop) always win when they are the
+            # only current evidence — do not keep a stale sticky live source label.
+            if state is not None and world_source is not None:
+                if world_source in ("anchor_hold", "gravity_drop"):
+                    state.sticky_source = str(world_source)
+                    state.sticky_source_frames = 1
+                    state.sticky_source_score = source_score(
+                        world_source,
+                        quality=str(quality),
+                        depth_weight=0.0,
+                        posture=str(posture),
+                    )
+                else:
+                    cand_score = source_score(
+                        world_source,
+                        quality=str(quality),
+                        depth_weight=float(depth_weight_for_score),
+                        posture=str(posture),
+                    )
+                    accepted_source, _switched = apply_source_hysteresis(
+                        state,
+                        candidate_source=str(world_source),
+                        candidate_score=float(cand_score),
+                        config=self._human_ground_cfg,
+                    )
+                    if accepted_source != world_source and accepted_source not in ("anchor_hold", "gravity_drop"):
+                        # Keep sticky live source; reuse filtered state rather than the
+                        # rejected weak candidate measurement when available.
+                        world_source = str(accepted_source)
+                        if state.world_x is not None and state.world_z is not None:
+                            hit = np.array(
+                                [float(state.world_x), float(calib.floor_y), float(state.world_z)],
+                                dtype=np.float64,
+                            )
+                    else:
+                        world_source = str(accepted_source)
+
             if hit is not None:
+                # Phase 1: motion mode / stationary lock using image foot + speed.
+                image_uv = None
+                raw_foot = track.get("image_foot")
+                if isinstance(raw_foot, (list, tuple)) and len(raw_foot) >= 2:
+                    try:
+                        image_uv = (float(raw_foot[0]), float(raw_foot[1]))
+                    except Exception:
+                        image_uv = None
+                if state is not None:
+                    update_motion_mode(
+                        state,
+                        now_ts=float(now_ts),
+                        image_foot_uv=image_uv,
+                        config=self._human_ground_cfg,
+                    )
+                    if state.motion_mode in ("idle", "sit", "lie") and state.locked_world is not None:
+                        hit = np.array(
+                            [float(state.locked_world[0]), float(calib.floor_y), float(state.locked_world[1])],
+                            dtype=np.float64,
+                        )
+                        state.world_x = float(state.locked_world[0])
+                        state.world_z = float(state.locked_world[1])
+                        state.vel_world_x = 0.0
+                        state.vel_world_z = 0.0
+
                 self._set_track_image_base_from_world(track, calib=calib, world_point=hit, flip_u=flip_u, flip_v=flip_v)
                 wx = float(hit[0])
                 wy = float(hit[1])
@@ -7807,15 +7935,23 @@ class _AnalyticsTelemetryProcessor:
                     track["world_source"] = str(world_source)
                 else:
                     track.pop("world_source", None)
-                if state is not None and world_source != "anchor_hold":
-                    state.last_good_world = (float(wx), float(wy), float(wz))
-                    state.last_good_ts = float(now_ts)
-                    state.ts = float(now_ts)
+                if state is not None:
+                    for key, value in state.as_public_fields().items():
+                        if value is not None:
+                            track[key] = value
+                    if world_source != "anchor_hold":
+                        state.last_good_world = (float(wx), float(wy), float(wz))
+                        state.last_good_ts = float(now_ts)
+                        state.ts = float(now_ts)
             else:
                 track["world_valid"] = False
                 track["world_quality"] = "invalid"
                 track["world_quality_reason"] = str(fallback_reason or "no_floor_intersection")
                 track.pop("world_source", None)
+                if state is not None:
+                    for key, value in state.as_public_fields().items():
+                        if value is not None:
+                            track[key] = value
         except Exception:
             # Silently fail; world coordinates are best-effort
             pass

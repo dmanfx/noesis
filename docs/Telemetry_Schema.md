@@ -115,7 +115,7 @@ Emitted once per frame per source. Only **people** tracks (class_id=0) are publi
 
 - `stable_id` is always present for people tracks; `track_id` is never exposed.
 - Top-level `world_source="backend_world_fused"` means the backend owns the canonical baseline world estimator; per-track `world_source` records which observation path updated that track on the current frame.
-- In baseline non-`v3dt` mode, `world` is produced by the backend person-anchor+DAv2 fused estimator: pose-derived anchor when available, otherwise the person mask/depth anchor from `NOESIS.OBJECT_DEPTH.anchor_uv`. In `v3dt` mode, `world_source="bbox3d"` continues to come from tracker 3D metadata.
+- In baseline non-`v3dt` mode, `world` is produced by the shared `PersonGroundState` estimator (`noesis/telemetry/person_ground_state.py`): posture-aware pose contact when available, otherwise the person mask/depth anchor from `NOESIS.OBJECT_DEPTH.anchor_uv`, with human CV filtering and stationary lock. Tracks may also carry `motion_mode`, `posture`, `trail_append_allowed`, and `idle_jitter_m`. In `v3dt` mode, `world_source="bbox3d"` continues to come from tracker 3D metadata.
 - `depth_used_m` is the DAv2 anchor depth that actually contributed to the fused baseline world update on that frame; `depth_anchor_m` remains the raw anchor carried by `NOESIS.OBJECT_DEPTH`.
 - `depth_registered_m` is the room-registered DAv2 anchor depth after applying the offline DAv2->MapAnything mapping for that camera; this is the value the estimator projects when registration is active.
 - `depth_registration_status` and `depth_registration_id` make the registration path observable on both tracks and active-tracks without changing the raw `NOESIS.OBJECT_DEPTH` payload semantics.
@@ -158,7 +158,7 @@ Published per MapAnything inference result via `DepthResult.to_dict()`:
   "xMin": <float>, "xMax": <float>,
   "zMin": <float>, "zMax": <float>,
   "overlay": <bool>,
-  "footpoints": [ {"x": <float>, "y": <float>, "method": "bbox"|"image_foot"|"image_base"|"<string>", "stableId": <int|null>, "trackerId": <int|null>, "displaySource": "world"|"world_to_camera_local"|"image_anchor"|"image_depth_anchor"} ],
+  "footpoints": [ {"x": <float>, "y": <float>, "method": "bbox"|"image_foot"|"image_base"|"<string>", "stableId": <int|null>, "trackerId": <int|null>, "displaySource": "world"|"world_to_camera_local"|"image_anchor"|"image_depth_anchor"|"registered_depth_anchor"|"floor_contact_ray", "motionMode": "walk"|"idle"|"sit"|"lie"|"unknown"|null, "posture": "standing"|"sitting"|"lying"|"unknown"|null, "trailAppendAllowed": <bool|null>, "idleJitterM": <float|null>} ],
   "H": [<9 floats>],
   "sampleXZ": [<float x>, <float z>] | null,
   "frame": "backend_world_m"|"camera_local_ground_m",
@@ -178,7 +178,8 @@ Published per MapAnything inference result via `DepthResult.to_dict()`:
 - The primary inline floorplan BEV uses `frame=camera_local_ground_m`; `footpoints[].x` is local X and `footpoints[].y` is local Z in meters so tracks are drawn in the same coordinate frame as MapAnything floorplan rasters.
 - `displaySource=image_depth_anchor` indicates a camera-local X/Z point unprojected from the image anchor and MapAnything-registered fused depth, matching the floorplan depth-unprojection basis. When depth registration rejects a sample, BEV display does not use raw object depth for the floorplan overlay.
 - In world mode, BEV head points are the canonical backend `track.world` positions and are not low-pass filtered a second time inside `BevRenderer`.
-- `trail_smoothing_owner="backend"` with `bev_world_points_smoothed=false` is valid and expected in the baseline world-mode path: the backend owns trail history, while the canonical per-track world estimator in `hooks.py` already owns the only track-position smoothing stage.
+- `trail_smoothing_owner="backend"` with `bev_world_points_smoothed=false` is valid and expected in the baseline world-mode path: the backend owns trail history, while `PersonGroundState` (human CV filter + stationary lock) owns the only track-position filtering stage.
+- When `trailAppendAllowed` is false, producer trails do not grow new path samples (person is idle/sit/lie locked).
 - World-mode BEV skips `anchor_hold` head points and trail samples so stale held positions do not render as drifting or out-of-bounds trails during brief occlusions.
 
 ## Related Docs

@@ -142,6 +142,9 @@ and worklogs live in `docs/history/`.
 ## Doc changes (2026-05-11)
 - Updated BEV/floorplan telemetry docs and DS8 progress notes for registered-depth-only BEV display, shared clean floorplan layers across rooms, floorplan-surface snap/drop validity, and height-map inline BEV rendering (`DS8_api_contracts_ws.md`, `Telemetry_Schema.md`, `plans/DS8/ds8_design_decisions.md`, `plans/DS8/ds8_migration_checklist_telemetry.md`).
 
+## Doc changes (2026-07-08)
+- Documented producer-owned human pathing realism (`PersonGroundState`): stationary/idle lock, posture-aware floor contact, source hysteresis, human CV filter, trail non-append while locked, and public `motion_mode` / `posture` / `trail_append_allowed` / `idle_jitter_m` fields on tracking + BEV payloads (`DS8_Baselines.md`, `DS8_api_contracts_ws.md`, `DS8_metadata_contracts.md`, `Telemetry_Schema.md`, `DS8_MIGRATION_KNOWLEDGE_BASE.md`, `DS8_README_FOR_AGENTS.md`, `plans/DS8/ds8_design_decisions.md`).
+
 ## Doc changes (2026-06-28)
 - Documented the DS8 MapAnything-derived top-down floorplan artifact, including its cache location, `get_floorplan` creation path, X/Z raster convention, payload layers, and validation helpers (`MapAnything_Depth.md`, `DEPTH_STACK_FLOW_V2.md`).
 

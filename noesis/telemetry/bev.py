@@ -14,6 +14,7 @@ import threading
 
 from geometry.homography import Plane, parse_extrinsics, ray_from_pixel, intersect_plane
 from noesis.telemetry.motion_smoothing import MotionGatedAlphaBetaSmoother, MotionSmoothingConfig
+from noesis.telemetry.person_ground_state import HumanGroundConfig, commit_path_point
 
 logger = logging.getLogger(__name__)
 
@@ -70,6 +71,10 @@ class Footpoint:
     bbox: Optional[Tuple[float, float, float, float]] = None
     image_size: Optional[Tuple[int, int]] = None
     frame_id: Optional[int] = None
+    motion_mode: Optional[str] = None
+    posture: Optional[str] = None
+    trail_append_allowed: Optional[bool] = None
+    idle_jitter_m: Optional[float] = None
     debug: Dict[str, Any] = field(default_factory=dict)
 
 
@@ -269,6 +274,13 @@ class BevRenderer:
         self._smoothing_cfg = MotionSmoothingConfig.from_mapping(smoothing_cfg or {})
         self._smoother = MotionGatedAlphaBetaSmoother(self._smoothing_cfg)
         self._smoother_source_by_key: Dict[Hashable, str] = {}
+        self._path_cfg = HumanGroundConfig(
+            max_speed_mps=float(self._smoothing_cfg.max_speed_mps),
+            max_jump_m=float(self._smoothing_cfg.max_jump_m),
+            path_min_step_m=max(0.03, float(self._trail_cfg.min_step_px) * 0.05),
+            path_simplify_epsilon_m=0.06,
+            path_max_points=max(2, int(self._trail_cfg.max_points_per_track)),
+        )
         self._floorplan_space_signature_by_camera: Dict[str, Tuple[Any, ...]] = {}
         self._alignment_debug_enabled = str(
             os.environ.get("NOESIS_BEV_ALIGNMENT_DEBUG", os.environ.get("NOESIS_BEV_DEBUG", "0"))
@@ -1830,6 +1842,12 @@ class BevRenderer:
                     "anchor_reason": str(fp.anchor_reason) if fp.anchor_reason not in (None, "") else None,
                     "display_source": display_source,
                     "alignment_debug": alignment_debug,
+                    "motion_mode": str(fp.motion_mode) if fp.motion_mode not in (None, "") else None,
+                    "posture": str(fp.posture) if fp.posture not in (None, "") else None,
+                    "trail_append_allowed": (
+                        bool(fp.trail_append_allowed) if fp.trail_append_allowed is not None else True
+                    ),
+                    "idle_jitter_m": float(fp.idle_jitter_m) if fp.idle_jitter_m is not None else None,
                 }
             )
 
@@ -1878,6 +1896,10 @@ class BevRenderer:
                     'anchorQuality': item.get("anchor_quality"),
                     'anchorReason': item.get("anchor_reason"),
                     'displaySource': item.get("display_source"),
+                    'motionMode': item.get("motion_mode"),
+                    'posture': item.get("posture"),
+                    'trailAppendAllowed': item.get("trail_append_allowed"),
+                    'idleJitterM': item.get("idle_jitter_m"),
                 }
                 point_payload.update(
                     self._floorplan_point_fields(
@@ -1903,6 +1925,8 @@ class BevRenderer:
                     "stable_id": int(stable_id) if stable_id is not None else None,
                     "tracker_id": int(tracker_id) if tracker_id is not None else None,
                     "display_key": int(display_key),
+                    "trail_append_allowed": bool(item.get("trail_append_allowed", True)),
+                    "motion_mode": item.get("motion_mode"),
                 }
 
         # Update config to reflect the actual extents used
@@ -1960,6 +1984,7 @@ class BevRenderer:
 
                     x = float(lx)
                     z = float(lz)
+                    append_allowed = bool(point_meta.get("trail_append_allowed", True))
 
                     # Clamp spurious jumps based on max speed in BEV pixels/sec scaled by effective mpp.
                     if state.points:
@@ -1990,19 +2015,42 @@ class BevRenderer:
                         state.ema_x, state.ema_z = float(x), float(z)
                         state.ema_ts = float(now_s)
 
-                    # Decimation: enforce a time-window based sampling budget.
-                    if state.points:
+                    # Phase 1: stationary tracks do not grow path history.
+                    # Phase 6: min-step + RDP simplification on committed history.
+                    # Use the trail decimation min-step (already scaled by mpp) as the
+                    # primary spatial gate so short walks still form multi-point paths.
+                    path_cfg = HumanGroundConfig(
+                        path_min_step_m=max(0.0, float(min_step_m)),
+                        path_simplify_epsilon_m=max(0.02, float(min_step_m) * 1.25),
+                        path_max_points=int(max_points),
+                    )
+                    if not append_allowed:
+                        if state.points:
+                            prev_ts, _px, _pz = state.points[-1]
+                            state.points[-1] = (float(prev_ts), float(x), float(z))
+                        continue
+                    if min_dt_s > 0.0 and state.points:
                         prev_ts, prev_x, prev_z = state.points[-1]
                         dt = max(0.0, float(now_s) - float(prev_ts))
-                        dist = math.hypot(x - float(prev_x), z - float(prev_z))
-                        if dt < min_dt_s:
-                            if dist >= min_step_m:
+                        dist = math.hypot(float(x) - float(prev_x), float(z) - float(prev_z))
+                        if dt < float(min_dt_s):
+                            if dist >= float(min_step_m):
                                 state.points[-1] = (float(prev_ts), float(x), float(z))
                             continue
-                        if dist < min_step_m:
+                        if dist < float(min_step_m):
                             continue
-
-                    state.points.append((float(now_s), float(x), float(z)))
+                    # Always seed the first point even when min_step would block.
+                    if not state.points:
+                        state.points.append((float(now_s), float(x), float(z)))
+                    else:
+                        commit_path_point(
+                            state.points,
+                            ts=float(now_s),
+                            x=float(x),
+                            z=float(z),
+                            config=path_cfg,
+                            append_allowed=True,
+                        )
 
             # Remove fully expired tracks to keep memory bounded.
             expired: List[Hashable] = []

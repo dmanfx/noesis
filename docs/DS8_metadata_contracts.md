@@ -240,6 +240,10 @@ Each track emitted via tracking telemetry or internal structures has fields such
   "world_quality_reason": "<string|null>",
   "world_frame": "<string|null>",
   "world_source": "bbox3d"|"pose_depth_fused"|"pose_floor_only"|"person_anchor_depth_fused"|"person_anchor_floor_only"|"gravity_drop"|"anchor_hold"|null,
+  "motion_mode": "walk"|"idle"|"sit"|"lie"|"unknown"|null,
+  "posture": "standing"|"sitting"|"lying"|"unknown"|null,
+  "trail_append_allowed": <bool|null>,
+  "idle_jitter_m": <float|null>,
   "projection_confidence": <float|null>,
   "temporal_confidence": <float|null>,
   "reid_confidence": <float|null>,
@@ -257,8 +261,8 @@ These structures are not stored as user meta on frames by default but are the ba
 - Negative/provisional stable IDs are internal-only and must not be emitted to clients.
 - `dwell_time` is derived per track by `_AnalyticsTelemetryProcessor` using zone entry timestamps; it is null when no zone is available.
 - `bbox3d` and `velocity3d` are attached when `NVDS_OBJ_3D_META` (SV3DT/MV3DT) is present.
-- `image_foot` is the active current-frame image anchor chosen by the backend estimator: pose-derived when available, otherwise the person mask/depth anchor from `NOESIS.OBJECT_DEPTH.anchor_uv`. `image_base` is the canonical image reprojection of the filtered world state.
-- In baseline (non-`v3dt`) DS8 mode, `world` is produced by the backend fused world estimator in `hooks.py`: the canonical person anchor is pose-derived when available and otherwise comes from `NOESIS.OBJECT_DEPTH.anchor_uv` for class-0 tracks. A concurrent DAv2 range observation from `NOESIS.OBJECT_DEPTH.anchor_depth_m` can refine either current-anchor path as `pose_depth_fused` or `person_anchor_depth_fused`. When DAv2 is unavailable for a frame, the same estimator continues as `pose_floor_only`, `person_anchor_floor_only`, `gravity_drop`, or `anchor_hold`.
+- `image_foot` is the active current-frame image anchor chosen by the backend estimator: posture-aware pose contact when available (ankles standing, hip/body sitting/lying), otherwise the person mask/depth anchor from `NOESIS.OBJECT_DEPTH.anchor_uv`. `image_base` is the canonical image reprojection of the filtered world state.
+- In baseline (non-`v3dt`) DS8 mode, `world` is produced by the shared `PersonGroundState` estimator (`noesis/telemetry/person_ground_state.py`, wired from `hooks.py`): posture-aware pose contact when available, otherwise `NOESIS.OBJECT_DEPTH.anchor_uv` for class-0 tracks. A concurrent DAv2 range observation from `NOESIS.OBJECT_DEPTH.anchor_depth_m` can refine either current-anchor path as `pose_depth_fused` or `person_anchor_depth_fused`. When DAv2 is unavailable for a frame, the same estimator continues as `pose_floor_only`, `person_anchor_floor_only`, `gravity_drop` (upright height-lock only), or `anchor_hold`. Stationary lock publishes `motion_mode` / `trail_append_allowed` so trails freeze when people stop moving.
 - In `v3dt` mode, `world`/`world_source="bbox3d"` continue to come from `NVDS_OBJ_3D_META`.
 - `world_frame` may be set to `"camera_local"` until shared global calibration is available.
 - `world_quality_reason` is the canonical diagnostic string explaining why the current update was fused, floor-only, guarded, held, or invalid.

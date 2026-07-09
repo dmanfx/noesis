@@ -120,7 +120,11 @@ Emitted by `BevRenderer`:
       "anchorSource": "<string|null>",
       "anchorQuality": "<string|null>",
       "anchorReason": "<string|null>",
-      "displaySource": "world"|"world_to_camera_local"|"image_anchor"|"image_depth_anchor"|"floor_contact_ray"
+      "displaySource": "world"|"world_to_camera_local"|"image_anchor"|"image_depth_anchor"|"floor_contact_ray"|"registered_depth_anchor",
+      "motionMode": "walk"|"idle"|"sit"|"lie"|"unknown"|null,
+      "posture": "standing"|"sitting"|"lying"|"unknown"|null,
+      "trailAppendAllowed": <bool|null>,
+      "idleJitterM": <float|null>
     }
   ],
   "trails": [ {"stableId": <int|null>, "trackerId": <int|null>, "points": [ {"x": <float>, "y": <float>, "t": <int ms>} ]} ],
@@ -140,11 +144,12 @@ Emitted by `BevRenderer`:
 - `footpoints[].method` is an image-anchor/render provenance string emitted by the backend (`image_base`, `image_foot`, `bbox`, etc.), not the canonical track world estimator source.
 - `footpoints[].anchorSource`, `anchorQuality`, and `anchorReason` mirror the backend world estimator diagnostics from tracking telemetry so BEV/Three.js consumers can explain why a point was accepted, guarded, or held.
 - `footpoints[].displaySource` declares which coordinate path produced the displayed BEV point. The primary inline floorplan view uses `frame_mode=camera_local` and `frame=camera_local_ground_m`, so displayed points and producer trails are in the same camera-local ground frame as MapAnything floorplan rasters. For tracked people, a valid in-bounds registered-depth anchor is the stable active-floorplan display source when available. `world_to_camera_local` is used when live backend world evidence is available and the registered-depth display point is not usable. `floor_contact_ray` is the calibrated image-ground fallback when no current registered-depth or live world display point is available. `image_depth_anchor` remains a legacy/non-person direct image-depth path; static MapAnything/floorplan snapshots are not a live person-depth placement source.
+- `footpoints[].motionMode`, `posture`, `trailAppendAllowed`, and `idleJitterM` are producer-owned human-pathing diagnostics from `PersonGroundState` (`noesis/telemetry/person_ground_state.py`). When `trailAppendAllowed` is false (stationary / sit / lie lock), backend trails must not grow new path samples for that track; the head may still update in place.
 - When `NOESIS_BEV_ALIGNMENT_DEBUG=1` is set, `bev-frame` may include top-level `alignmentDebug`, and each footpoint may include `rawX`, `rawY`, `smoothed`, and `alignmentDebug` with per-candidate image anchors, ray-floor projections, optional static floorplan/MapAnything snapshot samples, live-world candidate diagnostics, snapshot ids, grid cells, and selected-coordinate bounds. These fields are diagnostic-only and are not used to place live tracked people.
 
 - Optional JPEG binary: **Retired**. The framed `bev:<camera>` binary path is no longer produced (meta-only mode is the supported baseline per design decisions and Baselines.md). The general binary coalescer in the WebSocket server is retained for potential future use (e.g., binary depth).
 - In world mode (`frame_mode=world`), BEV footpoints remain producer-owned scene coordinates and should be treated as the canonical `track.world` head points emitted by the backend. The BEV renderer must not apply a second world-space low-pass filter to those points.
-- Motion smoothing ownership is declared explicitly by `trail_smoothing_owner`. In the current baseline world-mode path the backend owns trail history (`trail_smoothing_owner=backend`) while `bev_world_points_smoothed=false`, because the canonical per-track world estimator in `hooks.py` already owns the only track-position smoothing stage.
+- Motion smoothing ownership is declared explicitly by `trail_smoothing_owner`. In the current baseline world-mode path the backend owns trail history (`trail_smoothing_owner=backend`) while `bev_world_points_smoothed=false`, because the canonical per-track world estimator in `hooks.py` / `person_ground_state.py` already owns the only track-position filtering stage (human CV filter + stationary lock).
 - When `trail_smoothing_owner=backend`, `trails` carries the producer trail polylines already used by the BEV renderer, in the declared BEV `frame` with epoch-millisecond sample times. The dashboard should render those directly instead of reconstructing its own history from `footpoints`.
 - World-mode BEV omits `anchor_hold` head points from `footpoints`/`trails` so stale held positions do not render as drifting or out-of-bounds trail segments after temporary occlusion.
 - Backend world-BEV smoothing and trail history are keyed by tracker-local identity (`trackerId` when present, otherwise `stableId`) to match the nvOSD trail path; `stableId` remains display metadata and may legitimately span multiple tracker histories over time.
@@ -154,7 +159,9 @@ Emitted by `BevRenderer`:
 
 When a camera-local floorplan trail looks jumpy or twitchy, first check whether the producer is mixing coordinate spaces or switching display sources before adding smoothing. `BevRenderer` must reset that camera's smoother and trail history when the active floorplan coordinate-space signature changes; otherwise pre-floorplan points can be spliced into the ready floorplan trail and look like a teleport even when individual footpoints are valid. Once the active floorplan is ready, a valid in-bounds registered-depth anchor is the stable display source, while live fused-world candidates remain diagnostic unless registered depth is unusable.
 
-Use `scripts/bev_alignment_diagnostics.py` against the same DS8/RTSP path that reproduces the issue and inspect `trail_segment_speed_mps`, `top_trail_segments`, `speed_by_source_transition_mps`, `raw_speed_by_source_transition_mps`, `top_jumps`, and `display_selection_reason_by_camera`. A cosmetic smoother may hide the symptom, but a durable fix should explain whether the jump came from a floorplan-space reset miss, an identity/tracker transition, a source-policy flip such as `registered_depth_anchor->world_to_camera_local`, or bad raw anchor geometry. The 2026-07-02 retained fix is documented in `plans/DS8/ds8_design_decisions.md` under "BEV floorplan / trail source stability"; the rejected experiment that globally preferred live world points over registered depth increased source flips and trail p95, so avoid reintroducing that policy as a jitter fix.
+Also inspect producer pathing health: `motionMode` / `posture` thrash, `trailAppendAllowed=false` while still growing path history, elevated `idleJitterM` while a person is clearly stationary, and `world_source` flip rate (sticky hysteresis should keep sources stable across brief pose dropouts). Sitting/lying vibration is primarily a contact-geometry + idle-lock problem, not something to “fix” with heavier global EMA.
+
+Use `scripts/bev_alignment_diagnostics.py` against the same DS8/RTSP path that reproduces the issue and inspect `trail_segment_speed_mps`, `top_trail_segments`, `speed_by_source_transition_mps`, `raw_speed_by_source_transition_mps`, `top_jumps`, and `display_selection_reason_by_camera`. A cosmetic smoother may hide the symptom, but a durable fix should explain whether the jump came from a floorplan-space reset miss, an identity/tracker transition, a source-policy flip such as `registered_depth_anchor->world_to_camera_local`, or bad raw anchor geometry. The 2026-07-02 retained fix is documented in `plans/DS8/ds8_design_decisions.md` under "BEV floorplan / trail source stability"; the rejected experiment that globally preferred live world points over registered depth increased source flips and trail p95, so avoid reintroducing that policy as a jitter fix. The 2026-07-08 human pathing work (`person_ground_state.py`) is the retained fix for sit/stand/lie stability and idle trail scribble.
 
 ## 5. Depth Telemetry (`type: depth_result`)
 
@@ -179,6 +186,8 @@ Produced by `DepthTelemetryPublisher`:
 ## 6. Tracking Telemetry (`type: tracking`)
 
 Produced by `TrackingTelemetryPublisher`; people-only (class_id=0). `track_id` is internal and never exposed.
+
+Empty frames are first-class: when a camera's active person count is zero, Noesis still publishes `type:"tracking"` with `tracks: []` (at least on count transitions to zero, and on the normal tracking publish gate thereafter). Downstream clients such as Menon use empty lists to drop presence immediately instead of waiting on local TTLs.
 
 ```json
 {
@@ -217,6 +226,12 @@ Produced by `TrackingTelemetryPublisher`; people-only (class_id=0). `track_id` i
       "world_quality_reason": "<string|null>",
       "world_frame": "menon_scene"|"camera_local"|null,
       "world_source": "bbox3d"|"pose_depth_fused"|"pose_floor_only"|"person_anchor_depth_fused"|"person_anchor_floor_only"|"gravity_drop"|"anchor_hold"|null,
+      "motion_mode": "walk"|"idle"|"sit"|"lie"|"unknown"|null,
+      "posture": "standing"|"sitting"|"lying"|"unknown"|null,
+      "trail_append_allowed": <bool|null>,
+      "idle_jitter_m": <float|null>,
+      "sticky_world_source": "<string|null>",
+      "source_switch_count": <int|null>,
       "projection_confidence": <float|null>,
       "temporal_confidence": <float|null>,
       "reid_confidence": <float|null>,
@@ -247,15 +262,23 @@ Tracking telemetry has two world-source scopes:
 - Top-level `world_source="backend_world_fused"` advertises that the baseline DS8 runtime owns the canonical world estimator in the backend.
 - Per-track `world_source` records which observation path updated that specific track on the current frame.
 
-Baseline non-`v3dt` mode uses one canonical person-anchor estimator: pose-derived image anchor when available, otherwise the person mask/depth image anchor from `NOESIS.OBJECT_DEPTH.anchor_uv`. A concurrent DAv2 range observation from `NOESIS.OBJECT_DEPTH` is fused on that same current-anchor ray when valid. The canonical per-track values are:
+Baseline non-`v3dt` mode uses one canonical person-anchor estimator in `noesis/telemetry/person_ground_state.py` (via analytics hooks): pose-derived image anchor when available (posture-aware: ankles for standing, hip/body for sitting/lying), otherwise the person mask/depth image anchor from `NOESIS.OBJECT_DEPTH.anchor_uv`. Bent-leg ankle extrapolation (`pose_leg_floor`) is rejected. A concurrent DAv2 range observation from `NOESIS.OBJECT_DEPTH` is fused on that same current-anchor ray when valid. The canonical per-track values are:
 
 - `pose_depth_fused`: pose anchor and DAv2 anchor depth both contributed to the world-state update.
 - `pose_floor_only`: pose anchor updated the world-state filter without a usable DAv2 observation on that frame.
 - `person_anchor_depth_fused`: the person mask/depth anchor (`anchor_uv`) plus DAv2 anchor depth both contributed to the world-state update on a frame without usable pose.
 - `person_anchor_floor_only`: the person mask/depth anchor updated the world-state filter without a usable DAv2 observation on that frame.
-- `gravity_drop`: no current admissible person anchor was available, but a stored pose-derived height reference allowed a floor-consistent gravity drop.
+- `gravity_drop`: no current admissible person anchor was available, but a stored upright height reference allowed a floor-consistent gravity drop (not used while `motion_mode` is sit/lie or for clear lying boxes).
 - `anchor_hold`: no current valid observation; the estimator is briefly holding the last reliable world state.
 - `bbox3d`: `v3dt` mode only.
+
+Human pathing fields (producer-owned):
+
+- `motion_mode`: locomotion class from the stationary lock (`walk` / `idle` / `sit` / `lie` / `unknown`).
+- `posture`: geometric posture guess (`standing` / `sitting` / `lying` / `unknown`).
+- `trail_append_allowed`: when false, BEV and OSD trail history must not grow (person is locked stationary).
+- `idle_jitter_m`: residual magnitude while locked; useful for tuning deadzones.
+- `sticky_world_source` / `source_switch_count`: hysteresis diagnostics for source thrash.
 
 Depth exposure:
 

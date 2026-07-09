@@ -109,8 +109,9 @@ Current baseline world tracking is a single fused estimator.
 
 Current-frame anchor authority:
 
-- pose-derived image anchor when available
+- pose-derived image anchor when available (posture-aware: ankles standing, hip/body sitting/lying)
 - otherwise the person mask/depth image anchor from `NOESIS.OBJECT_DEPTH.anchor_uv`
+- bent-leg `pose_leg_floor` extrapolation is rejected; sticky source hysteresis reduces thrash
 
 Concurrent observations:
 
@@ -123,15 +124,25 @@ Per-track world update states:
 - `pose_floor_only`
 - `person_anchor_depth_fused`
 - `person_anchor_floor_only`
-- `gravity_drop`
+- `gravity_drop` (upright height-lock / lower-body occlusion only; not sit/lie)
 - `anchor_hold`
+
+Human pathing (2026-07-08):
+
+- Shared module: `noesis/telemetry/person_ground_state.py`
+- Stationary lock (`motion_mode=idle|sit|lie`) freezes world and sets
+  `trail_append_allowed=false` so BEV + OSD trails stop scribbling in place
+- Human CV filter owns track-position filtering once (adaptive Q/R, ~4 m/s gate,
+  idle deadzone); default world max speed is human-scale, not the old 120 m/s open gate
+- Path history: min-step + RDP on committed samples only
 
 Current downstream ownership:
 
 - backend owns canonical `track.world`
 - BEV world mode consumes canonical `track.world`
-- BEV does not run a second world-space smoother
+- BEV does not run a second world-space smoother on world-mode head points
 - world-mode BEV skips `anchor_hold` heads/trails to avoid stale drift
+- BEV + OSD trails honor `trail_append_allowed` from the shared ground state
 
 ## 5. Offline Registration Build
 

@@ -161,3 +161,4 @@ tests/*
 !tests/test_mapanything_normals_fusion.py
 !tests/test_virtual_twin_geometry.py
 !tests/test_virtual_twin_builder.py
+!tests/test_person_ground_state.py

@@ -12,7 +12,8 @@ Canonical runtime path:
   - `noesis/pipelines/hooks.py` – attaches metadata operators (MapAnything, baseline DAv2 object-depth fusion, analytics, exclusion, BEV/world tracking).
   - `noesis/server/depth_api.py` – REST control for depth bursts.
   - `noesis/server/analytics_api.py` – REST API for analytics ROI management.
-  - `noesis/telemetry/*` – depth, tracking, BEV publishers.
+  - `noesis/telemetry/*` – depth, tracking, BEV publishers; `person_ground_state.py`
+    owns human-realistic world pathing (stationary lock, posture contact, CV filter).
   - `noesis/metadata/*` – intrinsics and depth result schemas.
 
 Deprecated pre-DS8 runtime paths have been decommissioned.
@@ -76,10 +77,12 @@ When designing DS8 behavior, keep it semantically aligned with current config be
 
 Baseline non-`v3dt` tracking now uses:
 
-- one canonical person-anchor estimator: pose-derived anchor when available, otherwise `NOESIS.OBJECT_DEPTH.anchor_uv`
+- one canonical person-anchor estimator: posture-aware pose contact when available
+  (ankles standing, hip/body sitting/lying), otherwise `NOESIS.OBJECT_DEPTH.anchor_uv`
 - always-on DAv2 range observations attached through `NOESIS.OBJECT_DEPTH`
 - a prebuilt DAv2->MapAnything room-registration artifact loaded before startup
-- one fused backend world estimator that owns canonical `track.world`
+- one fused backend world estimator (`noesis/telemetry/person_ground_state.py`) that owns
+  canonical `track.world`, stationary lock, and trail-append gating for BEV + OSD
 
 MapAnything remains separate:
 

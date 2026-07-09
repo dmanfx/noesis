@@ -13,6 +13,13 @@ Use this file to record non-trivial design choices made during the DS8 migration
 
 ## Entries
 
+- **Date:** 2026-07-08
+- **Author:** Codex
+- **Area:** Telemetry / BEV + OSD human pathing realism
+- **Decision:** Introduce a shared producer-side `PersonGroundState` pipeline (`noesis/telemetry/person_ground_state.py`) consumed by baseline and V3DT analytics hooks, BEV trails, and mosaic OSD trails. Implement six coordinated phases: (1) stationary/idle lock with trail non-append and wired static thresholds, (2) sticky world-source hysteresis and bent-leg rejection of `pose_leg_floor`, (3) posture-aware contact (ankles standing, hip/body sitting/lying), (4) human constant-velocity filter with adaptive process/measurement noise, speed/accel gates, and idle deadzones, (5) shared public fields (`motion_mode`, `posture`, `trail_append_allowed`, `idle_jitter_m`) on tracks/footpoints, (6) path min-step + RDP simplification on committed trail history only. Default world max speed is human-scale (4 m/s). Gravity-drop remains for upright lower-body occlusion when a height lock exists; confirmed sit/lie motion modes and clear lying boxes skip gravity-drop in favor of hold/hip contact.
+- **Rationale:** BEV/OSD jitter for sitting/lying people was dominated by posture-blind floor rays, pose-cascade thrash, unused static gates, an effectively open 120 m/s world speed limit, and trail sampling of sensor noise while idle. Cosmetic EMA would lag walking without fixing root causes. Freezing when humans are stationary, selecting contact geometry by posture, and filtering once at the producer matches the OSD trail “smooth when walking, still when still” goal without reopening the camera-local/world frame contracts.
+- **References:** `noesis/telemetry/person_ground_state.py`, `noesis/pipelines/hooks.py`, `noesis/pipelines/hooks_v3dt_reimpl.py`, `noesis/telemetry/bev.py`, `tests/test_person_ground_state.py`, `tests/test_analytics_telemetry_hook.py`
+
 - **Date:** 2026-06-30
 - **Author:** Codex
 - **Area:** DS8 / CUDA object-depth ROI stats

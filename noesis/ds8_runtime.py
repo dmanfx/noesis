@@ -2305,10 +2305,21 @@ def _build_stable_id_manager(logger: logging.Logger, *, pipeline_config: Optiona
             cos_sim_threshold = float(os.environ.get("NOESIS_REID_COS_SIM_THRESHOLD", "0.62") or 0.62)
         except Exception:
             cos_sim_threshold = 0.62
+        cos_sim_high_env_set = os.environ.get("NOESIS_REID_COS_SIM_HIGH_THRESHOLD") is not None
         try:
             cos_sim_high_threshold = float(os.environ.get("NOESIS_REID_COS_SIM_HIGH_THRESHOLD", "0.70") or 0.70)
         except Exception:
             cos_sim_high_threshold = 0.70
+        household_identity_enabled = False
+        try:
+            from reid.household_state import (  # type: ignore
+                is_household_identity_enabled,
+                prepare_household_stable_id_overrides,
+            )
+
+            household_identity_enabled = is_household_identity_enabled()
+        except Exception as exc:
+            logger.warning("Household identity helpers unavailable: %s", exc)
         try:
             xcam_handoff_window_s = float(os.environ.get("NOESIS_REID_XCAM_WINDOW_S", "12") or 12.0)
         except Exception:
@@ -2383,6 +2394,7 @@ def _build_stable_id_manager(logger: logging.Logger, *, pipeline_config: Optiona
         except Exception:
             auto_merge_both_active_min_sim = 0.97
         alias_file = os.environ.get("NOESIS_REID_ALIAS_FILE", "~/.noesis/reid_aliases.json")
+        sid_pool_file = os.environ.get("NOESIS_REID_SID_POOL_FILE", "~/.noesis/sid_pool.json")
         alias_append_env = os.environ.get("NOESIS_REID_ALIAS_APPEND_DEFAULT", "1")
         alias_append_default = str(alias_append_env).strip().lower() in ("1", "true", "yes", "on")
         try:
@@ -2423,6 +2435,27 @@ def _build_stable_id_manager(logger: logging.Logger, *, pipeline_config: Optiona
             gpu_min_gallery = int(os.environ.get("NOESIS_STABLEID_GPU_MIN_GALLERY", "32") or 32)
         except Exception:
             gpu_min_gallery = 32
+        allow_multi_zone_active = True
+        household_overrides: Dict[str, Any] = {}
+        if household_identity_enabled:
+            household_overrides = prepare_household_stable_id_overrides(
+                logger,
+                repo_root=REPO_ROOT,
+                cos_sim_high_threshold=cos_sim_high_threshold,
+                cos_sim_high_env_set=cos_sim_high_env_set,
+            )
+            allow_multi_zone_active = bool(household_overrides.pop("allow_multi_zone_active", False))
+            cos_sim_high_threshold = float(
+                household_overrides.pop("cos_sim_high_threshold", cos_sim_high_threshold)
+            )
+            auto_merge_enabled = bool(household_overrides.pop("auto_merge_enabled", False))
+            gallery_persist_file = household_overrides.pop(
+                "gallery_persist_file", gallery_persist_file
+            )
+            alias_file = household_overrides.pop("alias_file", alias_file)
+            sid_pool_file = str(household_overrides.pop("sid_pool_file", "~/.noesis/sid_pool.json"))
+            if "NOESIS_REID_POSE_ENABLED" not in os.environ and str(pose_flag).strip() == "":
+                pose_enabled = True
         extra_kwargs = {
             "max_total_ids": max_total_ids,
             "total_id_reuse": total_id_reuse,
@@ -2440,6 +2473,7 @@ def _build_stable_id_manager(logger: logging.Logger, *, pipeline_config: Optiona
             "gallery_persist_max_age_s": gallery_persist_max_age_s,
             "gallery_autosave_interval_s": gallery_autosave_interval_s,
             "reset_sid_pool_on_start": reset_sid_pool,
+            "sid_pool_file": sid_pool_file,
             "aliases_enabled": aliases_enabled,
             "alias_file": alias_file,
             "alias_append_default": alias_append_default,
@@ -2463,6 +2497,8 @@ def _build_stable_id_manager(logger: logging.Logger, *, pipeline_config: Optiona
             "gpu_device": gpu_device,
             "gpu_min_gallery": gpu_min_gallery,
         }
+        if household_identity_enabled:
+            extra_kwargs.update(household_overrides)
         try:
             sig = inspect.signature(StableIDManager.__init__)
             valid_params = set(sig.parameters)
@@ -2475,7 +2511,7 @@ def _build_stable_id_manager(logger: logging.Logger, *, pipeline_config: Optiona
             device=device,
             model_name=model_name,
             image_size=(img_h, img_w),
-            allow_multi_zone_active=True,
+            allow_multi_zone_active=allow_multi_zone_active,
             # DS8 stable IDs source embeddings from an explicit OSNet SGIE; do not load torchreid.
             use_extractor=False,
             embed_interval_s=embed_interval_s,
@@ -2496,8 +2532,9 @@ def _build_stable_id_manager(logger: logging.Logger, *, pipeline_config: Optiona
             **extra_kwargs,
         )
         logger.info(
-            "Stable ID manager initialised (SGIE embeddings; allow_multi_zone_active=%s, embed_interval_s=%.3f, new_id_hysteresis_frames=%d, new_id_confirm_frames_at_cap=%d, pose_enabled=%s)",
-            True,
+            "Stable ID manager initialised (SGIE embeddings; household_mode=%s, allow_multi_zone_active=%s, embed_interval_s=%.3f, new_id_hysteresis_frames=%d, new_id_confirm_frames_at_cap=%d, pose_enabled=%s)",
+            household_identity_enabled,
+            allow_multi_zone_active,
             embed_interval_s,
             new_id_hysteresis_frames,
             new_id_confirm_frames_at_cap,
@@ -2505,9 +2542,14 @@ def _build_stable_id_manager(logger: logging.Logger, *, pipeline_config: Optiona
         )
         try:
             sid_metrics = dict(mgr.get_sid_metrics() or {})
-        except Exception:
+        except Exception as metrics_exc:
+            logger.warning("Stable ID metrics probe failed after init: %s", metrics_exc)
             sid_metrics = {}
         backend_mode = str(sid_metrics.get("stableid_backend_mode") or "").strip().lower()
+        if not backend_mode:
+            # get_sid_metrics() swallows internal errors and can return {}. Prefer the
+            # live backend attribute over aborting a healthy GPU manager.
+            backend_mode = str(getattr(mgr, "_backend_mode", "") or "").strip().lower()
         if backend_mode != "gpu":
             logger.error(
                 "Stable ID manager backend is '%s' (expected gpu); refusing CPU fallback in hard-cutover",

@@ -13,6 +13,20 @@ Use this file to record non-trivial design choices made during the DS8 migration
 
 ## Entries
 
+- **Date:** 2026-07-09
+- **Author:** Codex
+- **Area:** Identity / Household mode default-on cutover
+- **Decision:** Default `NOESIS_HOUSEHOLD_IDENTITY=1` (opt out with `=0`). Production identity is closed-world residents/visitors with geometry-aware exclusivity. Audit blockers cleared: provisional active records, enroll/delete `_remap_sid`, world-before-StableID, pose path through `_gallery_match_ok`. First start still archives legacy `~/.noesis` gallery/aliases into `~/.noesis/household/backups/`.
+- **Rationale:** Household mode was the point of the ReID refactor; leaving it off hid the product path. Open correctness bugs from the composer pass are fixed and covered by unit tests.
+- **References:** `reid/household_state.py`, `plans/household_identity/composer_audit_2026-07-09.md`, `plans/household_identity/work_order.md`
+
+- **Date:** 2026-07-08
+- **Author:** Codex
+- **Area:** Identity / StableID–ReID (Household Identity program)
+- **Decision:** Rework StableID from open-world soft-capped mint+auto-merge into a closed-world household identity system: enrolled residents + ephemeral visitors; global exclusivity with explicit FoV-overlap permits (kitchen↔family-room); provisional IDs are not permanent; pressure auto-merge disabled; pose+world wired into matching; default ReID backbone remains TAO Swin-Tiny SGIE (zero-copy tensor meta) with optional SOLIDER upgrade only if needed; human names bind to resident UUID. Full plan under `plans/household_identity/`.
+- **Rationale:** Live state showed SID ~4132 and 504 alias merges (identity fragmentation). Blind multi-zone active caused false same-ID shares, while kitchen/family FoV overlap requires legitimate dual-camera same-ID. Soft `max_total_ids` cannot meet the “~4 residents / ≤15 people ⇒ small ID space” validation goal.
+- **References:** `plans/household_identity/`, `reid/stable_id_manager.py`, `pipelines/config_infer_secondary_reid_swin.ini`, `docs/DS8_api_contracts_ws.md`
+
 - **Date:** 2026-07-08
 - **Author:** Codex
 - **Area:** Telemetry / BEV + OSD human pathing realism

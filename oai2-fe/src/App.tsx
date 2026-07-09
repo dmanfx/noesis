@@ -15,6 +15,7 @@ import { useWebRTCClient } from './hooks/useWebRTCClient';
 import { StreamMode } from './components/StreamPanel';
 import DepthDrawer, { DepthDiagnosticsEntry, DepthDrawerEntry, DepthMetaEntry, FloorplanResponse } from './components/DepthDrawer';
 import { BevView, BevMeta, type BevFrameMode } from './components/BevView';
+import { MosaicCropCanvas } from './components/MosaicCropCanvas';
 import type { BevTrailConfig } from './lib/bevTrails';
 import RoiEditorDrawer from './components/RoiEditorDrawer';
 import SettingsCorner from './components/SettingsCorner';
@@ -30,6 +31,8 @@ const restPort = Number(import.meta.env.VITE_REST_PORT || 8080);
 const restProto = window.location.protocol === 'https:' ? 'https' : 'http';
 const REST_URL = import.meta.env.VITE_REST_URL || (import.meta.env.DEV ? '' : `${restProto}://${restHost}:${restPort}`);
 const streamDisplayCams: CameraKey[] = ['living-room'];
+
+type ExpandedView = { kind: 'mosaic' } | { kind: 'camera'; camera: CameraKey };
 
 type CameraPoseSummary = {
   x: number;
@@ -202,7 +205,7 @@ function Dashboard() {
     'family-room': null
   });
   const [availableCameras, setAvailableCameras] = useState<string[]>([]);
-  const [expandedCamera, setExpandedCamera] = useState<CameraKey | null>(null);
+  const [expandedView, setExpandedView] = useState<ExpandedView | null>(null);
   const [roiDrawerOpen, setRoiDrawerOpen] = useState(false);
   const [mosaicLayout, setMosaicLayout] = useState<MosaicLayout | null>(null);
   const [analyticsReloadCount, setAnalyticsReloadCount] = useState<number>(0);
@@ -584,11 +587,12 @@ function Dashboard() {
           : 'N/A';
         const depthStatus = t.depth_status || 'missing';
         const depthAnchor = t.depth_anchor_source ? `, ${t.depth_anchor_source}` : '';
-        const idDisplay = (t as any).id_display
-          ?? (typeof (t as any).tracker_id === 'number'
+        const idDisplay = (t as any).display_name
+          || (t as any).id_display
+          || (typeof (t as any).tracker_id === 'number'
               ? `[${(t as any).tracker_id}] | [${t.stable_id ?? 'N/A'}]`
               : String(t.stable_id ?? 'N/A'));
-        tracksHtml += `<div><strong><span class="dot" style="display:inline-block;width:10px;height:10px;border-radius:50%;background:${dotColor};margin-right:6px;vertical-align:middle;"></span>ID ${idDisplay}:</strong><br/>Zone: ${t.zone || '-'}, Dwell: <span style="display:inline-block; min-width:4ch; text-align:right;">${dwell}</span>s<br/>Metric (BEV): ${metricText}<br/>Depth Used: ${depthUsed} (${depthStatus}${depthAnchor})<br/>Pixel Pos: [${(typeof center[0] === 'number' ? Number(center[0]).toFixed(3) : center[0])}, ${(typeof center[1] === 'number' ? Number(center[1]).toFixed(3) : center[1])}], Speed: <span style="display:inline-block; min-width:4ch; text-align:right;">${speed}</span> px/s</div>`;
+        tracksHtml += `<div><strong><span class="dot" style="display:inline-block;width:10px;height:10px;border-radius:50%;background:${dotColor};margin-right:6px;vertical-align:middle;"></span>${(t as any).display_name ? String((t as any).display_name) : `ID ${idDisplay}`}:</strong><br/>Zone: ${t.zone || '-'}, Dwell: <span style="display:inline-block; min-width:4ch; text-align:right;">${dwell}</span>s<br/>Metric (BEV): ${metricText}<br/>Depth Used: ${depthUsed} (${depthStatus}${depthAnchor})<br/>Pixel Pos: [${(typeof center[0] === 'number' ? Number(center[0]).toFixed(3) : center[0])}, ${(typeof center[1] === 'number' ? Number(center[1]).toFixed(3) : center[1])}], Speed: <span style="display:inline-block; min-width:4ch; text-align:right;">${speed}</span> px/s</div>`;
       });
     } else {
       tracksHtml = '<span>No active tracks.</span>';
@@ -1221,7 +1225,9 @@ function Dashboard() {
     estTime ? <span className="chip mono" title="Current time (US Eastern)">{estTime}</span> : null
   ), [estTime]);
 
-  const streamsExpanded = Boolean(expandedCamera);
+  const expandedCamera = expandedView?.kind === 'camera' ? expandedView.camera : null;
+  const mosaicExpanded = expandedView?.kind === 'mosaic';
+  const anyExpanded = expandedView !== null;
   const requestAppFullscreen = useCallback(() => {
     const root = document.documentElement;
     if (!document.fullscreenElement && root?.requestFullscreen) {
@@ -1234,12 +1240,22 @@ function Dashboard() {
     }
   }, []);
   const collapseStreams = useCallback(() => {
-    setExpandedCamera(null);
+    setExpandedView(null);
     exitAppFullscreen();
   }, [exitAppFullscreen]);
-  const handleToggleExpand = useCallback((cameraKey: CameraKey) => {
-    const next = expandedCamera === cameraKey ? null : cameraKey;
-    setExpandedCamera(next);
+  const handleToggleMosaicExpand = useCallback(() => {
+    const next: ExpandedView | null = mosaicExpanded ? null : { kind: 'mosaic' };
+    setExpandedView(next);
+    if (next) {
+      requestAppFullscreen();
+    } else {
+      exitAppFullscreen();
+    }
+  }, [exitAppFullscreen, mosaicExpanded, requestAppFullscreen]);
+  const handleToggleCameraExpand = useCallback((cameraKey: CameraKey) => {
+    const isCurrent = expandedCamera === cameraKey;
+    const next: ExpandedView | null = isCurrent ? null : { kind: 'camera', camera: cameraKey };
+    setExpandedView(next);
     if (next) {
       requestAppFullscreen();
     } else {
@@ -1262,16 +1278,16 @@ function Dashboard() {
   }, [isCalibrating, sendAutoCalibrate, status]);
 
   useEffect(() => {
-    if (!expandedCamera) return;
+    if (!anyExpanded) return;
     const onKey = (e: KeyboardEvent) => {
       if (e.key === 'Escape') collapseStreams();
     };
     window.addEventListener('keydown', onKey);
     return () => window.removeEventListener('keydown', onKey);
-  }, [collapseStreams, expandedCamera]);
+  }, [anyExpanded, collapseStreams]);
 
   useEffect(() => {
-    if (streamsExpanded) {
+    if (anyExpanded) {
       document.body.style.overflow = 'hidden';
     } else {
       document.body.style.overflow = '';
@@ -1280,20 +1296,20 @@ function Dashboard() {
     return () => {
       document.body.style.overflow = '';
     };
-  }, [exitAppFullscreen, streamsExpanded]);
+  }, [anyExpanded, exitAppFullscreen]);
 
   useEffect(() => {
     const onFullscreenChange = () => {
-      if (!document.fullscreenElement && streamsExpanded) {
-        setExpandedCamera(null);
+      if (!document.fullscreenElement && anyExpanded) {
+        setExpandedView(null);
       }
     };
     document.addEventListener('fullscreenchange', onFullscreenChange);
     return () => document.removeEventListener('fullscreenchange', onFullscreenChange);
-  }, [streamsExpanded]);
+  }, [anyExpanded]);
 
   return (
-    <div className={`shell${streamsExpanded ? ' shell--streams-expanded' : ''}`}>
+    <div className={`shell${mosaicExpanded ? ' shell--streams-expanded' : ''}`}>
       <header className="topbar">
         <div className="brand">
           <div className="logo" />
@@ -1310,18 +1326,23 @@ function Dashboard() {
         <button className="btn ghost" onClick={() => setRoiDrawerOpen(v => !v)}>ROIs</button>
       </header>
       <main className="main">
-        <section className={`streams${streamsExpanded ? ' streams--expanded' : ''}`}>
+        <section className={`streams${mosaicExpanded ? ' streams--expanded' : ''}`}>
           <div className={`stream-tiler${streamDisplayCams.length === 1 ? ' stream-tiler--single' : ''}`}>
             {streamDisplayCams.map((cam) => (
               <StreamPanel
                 key={`stream-${cam}`}
                 camera={cam}
+                title="Mosaic"
                 blob={null}
                 fpsText={fps[cam]}
                 fpsSeries={fpsSeries[cam]}
                 vacancyText={vacancyText[cam]}
-                isExpanded={expandedCamera === cam}
-                onToggleExpand={handleToggleExpand}
+                isExpanded={mosaicExpanded}
+                onToggleExpand={handleToggleMosaicExpand}
+                tileCameras={knownCameras}
+                expandedTileCamera={expandedCamera}
+                onToggleTileExpand={handleToggleCameraExpand}
+                mosaicLayout={mosaicLayout}
                 streamMode={streamMode}
                 videoRef={streamMode === 'webrtc' ? webrtc.videoRef : undefined}
               />
@@ -1393,7 +1414,7 @@ function Dashboard() {
       <footer className="footer">
         <span>WebSocket: {status}</span>
         <span className="spacer" />
-        <span className="subtitle">Use the Fullscreen button on any stream</span>
+        <span className="subtitle">RTSP to WebRTC mosaic</span>
       </footer>
 
       <DepthDrawer
@@ -1433,6 +1454,44 @@ function Dashboard() {
         calibrating={isCalibrating}
         onCalibrate={handleAutoCalibrateAll}
       />
+      {expandedCamera && (
+        <div className="individual-fullscreen" role="dialog" aria-modal="true" aria-label={`${cameraLabel(expandedCamera)} fullscreen`}>
+          <div className="individual-fullscreen__toolbar">
+            <div className="individual-fullscreen__title">{cameraLabel(expandedCamera)}</div>
+            <button
+              type="button"
+              className="individual-fullscreen__close"
+              onClick={collapseStreams}
+              title="Close fullscreen"
+              aria-label="Close fullscreen"
+            >
+              <span aria-hidden="true">X</span>
+            </button>
+          </div>
+          <div className="individual-fullscreen__content">
+            <div className="individual-fullscreen__video-panel">
+              <MosaicCropCanvas
+                camera={expandedCamera}
+                mosaicLayout={mosaicLayout}
+                videoRef={webrtc.videoRef}
+                className="individual-fullscreen__video"
+              />
+            </div>
+            <div className="individual-fullscreen__bev-panel">
+              <BevView
+                cam={expandedCamera}
+                meta={bevMeta[expandedCamera]}
+                floorplan={floorplanData[expandedCamera]}
+                coordMode={bevFrameModeByCam[expandedCamera]}
+                trailEnabled={trailEnabled}
+                trailConfig={bevTrailConfig}
+                debug={bevDebugEnabled}
+                variant="inline"
+              />
+            </div>
+          </div>
+        </div>
+      )}
       {calibrateToast && (
         <div
           className={`toast toast--${calibrateToast.kind}`}

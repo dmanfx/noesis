@@ -8,6 +8,10 @@ type Track = {
   stable_id: number;
   tracker_id?: number;
   id_display?: string;
+  display_name?: string;
+  identity_kind?: string;
+  identity_state?: string;
+  resident_uuid?: string;
   camera_id: string;
   zone?: string;
   center?: [number, number];

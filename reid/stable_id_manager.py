@@ -10,7 +10,26 @@ import json
 
 import numpy as np
 
+from .assignment import (
+    FrameAssignmentState,
+    active_embeddings_same_frame,
+    is_mutual_nearest_match,
+)
+from .camera_topology import CameraTopology, load_camera_topology
 from .embedding_extractor import EmbeddingExtractor
+from .gallery_quality import add_clustered_exemplar, should_accept_gallery_embedding
+from .household_identity import (
+    PROVISIONAL_ID_MIN,
+    VISITOR_ID_MAX,
+    VISITOR_ID_MIN,
+    ProvisionalPool,
+    ResidentRegistry,
+    VisitorPool,
+    copy_gallery_embeddings,
+    default_household_paths,
+    identity_kind_for_sid,
+    identity_state_for_kind,
+)
 
 
 BBox = Tuple[float, float, float, float]  # left, top, width, height
@@ -63,6 +82,18 @@ class StableIDManager:
         cos_sim_threshold: float = 0.62,
         cos_sim_high_threshold: float = 0.72,
         allow_multi_zone_active: bool = True,
+        # Household identity mode (Phase 0): exclusivity + overlap permits.
+        household_mode: bool = False,
+        camera_topology_file: Optional[str] = None,
+        overlap_allow_appearance_only: bool = False,
+        # Household closed-world identity (Phase 1)
+        residents_file: Optional[str] = None,
+        visitor_pool_file: Optional[str] = None,
+        visitor_id_min: int = VISITOR_ID_MIN,
+        visitor_id_max: int = VISITOR_ID_MAX,
+        visitor_ttl_s: float = 3600.0,
+        household_confirm_embeddings: int = 3,
+        resident_match_margin: float = 0.06,
         # Robustness/appearance tuning
         crop_expand: float = 0.12,
         tta_flip: bool = True,
@@ -183,7 +214,17 @@ class StableIDManager:
         self.max_ghost_age_s = float(max_ghost_age_s)
         self.cos_sim_threshold = float(cos_sim_threshold)
         self.cos_sim_high_threshold = float(cos_sim_high_threshold)
+        self.household_mode = bool(household_mode)
+        self.overlap_allow_appearance_only = bool(overlap_allow_appearance_only)
+        if self.household_mode:
+            allow_multi_zone_active = False
+            auto_merge_enabled = False
+            total_id_reuse = False
+            gallery_size = min(int(gallery_size), 8)
         self.allow_multi_zone_active = bool(allow_multi_zone_active)
+        self._camera_topology: CameraTopology = load_camera_topology(camera_topology_file)
+        if self.household_mode and self._camera_topology.overlap_allow_appearance_only:
+            self.overlap_allow_appearance_only = True
         self.crop_expand = float(crop_expand)
         self.tta_flip = bool(tta_flip)
         self.min_crop_h = int(min_crop_h)
@@ -254,6 +295,9 @@ class StableIDManager:
             base = max(1, int(self.max_total_ids))
             self.pose_max_total_entries = max(self.pose_gallery_size, int(base * self.pose_gallery_size))
         self.gallery_size = int(max(1, gallery_size))
+        if self.household_mode:
+            self.gallery_size = int(min(self.gallery_size, 8))
+            self.gpu_min_gallery = int(min(self.gpu_min_gallery, 8))
         self.aliases_enabled = bool(aliases_enabled)
         self.alias_file = os.path.expanduser(str(alias_file))
         self.alias_autosave = bool(alias_autosave)
@@ -326,6 +370,41 @@ class StableIDManager:
         self._sid_fragmentation_events = 0
         self._sid_pending_recycled_count = 0
         self._sid_same_frame_conflict_count = 0
+        self._false_share_blocked_count = 0
+        self._overlap_permit_grant_count = 0
+        self._overlap_permit_deny_count = 0
+        self._overlap_permit_degraded_count = 0
+        self._gallery_quality_reject_count = 0
+        self._mnn_reject_count = 0
+        self._frame_assignment = FrameAssignmentState(epsilon_s=self.same_frame_sid_epsilon_s)
+        # Household closed-world state (Phase 1)
+        self._resident_registry: Optional[ResidentRegistry] = None
+        self._visitor_pool: Optional[VisitorPool] = None
+        self._provisional_pool: Optional[ProvisionalPool] = None
+        self.visitor_id_min = int(visitor_id_min)
+        self.visitor_id_max = int(visitor_id_max)
+        self.visitor_ttl_s = float(visitor_ttl_s)
+        self.household_confirm_embeddings = int(max(1, household_confirm_embeddings))
+        self.resident_match_margin = float(resident_match_margin)
+        self._household_emb_counts: Dict[Tuple[int, int], int] = {}
+        self._mint_visitor_count = 0
+        self._promote_resident_count = 0
+        # Cumulative provisional mint events (first alloc per track lifecycle).
+        self._provisional_event_count = 0
+        if self.household_mode:
+            hh_paths = default_household_paths()
+            residents_path = residents_file or hh_paths["residents_file"]
+            visitor_pool_path = visitor_pool_file or hh_paths["visitor_pool_file"]
+            self._resident_registry = ResidentRegistry(str(residents_path))
+            self._visitor_pool = VisitorPool(
+                pool_file=str(visitor_pool_path),
+                id_min=self.visitor_id_min,
+                id_max=self.visitor_id_max,
+                ttl_s=self.visitor_ttl_s,
+            )
+            self._provisional_pool = ProvisionalPool()
+        # Last world/footpoint per (stable_id, sensor_id) for overlap geometry.
+        self._sid_sensor_world: Dict[Tuple[int, int], Dict[str, Any]] = {}
         self._id_event_counts: Dict[str, int] = defaultdict(int)
         # Alias auto-merge accounting.
         self._last_auto_merge_ts: Optional[float] = None
@@ -350,6 +429,8 @@ class StableIDManager:
         self.reset_sid_pool_on_start = bool(reset_sid_pool_on_start)
 
         self.next_stable_id = 1
+        if self.household_mode:
+            self.next_stable_id = int(self.visitor_id_min)
         # Free-list allocator state
         self._free_sids: List[int] = []
         self._free_sids_set: set[int] = set()
@@ -493,6 +574,495 @@ class StableIDManager:
                 sims[int(sid_int)] = val
         return sims
 
+    # --------------- Household closed-world (Phase 1) -----------------
+    def _household_resident_ids(self) -> set:
+        if self._resident_registry is None:
+            return set()
+        return self._resident_registry.resident_ids()
+
+    def _household_identity_kind(self, sid: int) -> str:
+        return identity_kind_for_sid(int(sid), resident_ids=self._household_resident_ids())
+
+    def _household_identity_state(self, rec: Optional[Dict[str, Any]]) -> str:
+        if rec is None:
+            return "provisional"
+        kind = str(rec.get("identity_kind") or self._household_identity_kind(int(rec.get("stable_id", 0))))
+        return identity_state_for_kind(kind)
+
+    def _household_is_provisional_sid(self, sid: int) -> bool:
+        if self._provisional_pool is not None and self._provisional_pool.is_provisional(int(sid)):
+            return True
+        return int(sid) >= PROVISIONAL_ID_MIN
+
+    def _household_should_persist_gallery(self, rec: Dict[str, Any]) -> bool:
+        kind = str(rec.get("identity_kind") or self._household_identity_kind(int(rec.get("stable_id", 0))))
+        return kind in ("resident", "visitor")
+
+    def _household_alloc_provisional(self) -> int:
+        if self._provisional_pool is None:
+            return int(self._alloc_sid())
+        return int(self._provisional_pool.alloc())
+
+    def _household_release_provisional(self, sid: Optional[int]) -> None:
+        if sid is None or self._provisional_pool is None:
+            return
+        if self._household_is_provisional_sid(int(sid)):
+            self._provisional_pool.release(int(sid))
+
+    def _household_mint_visitor(self, ts: float) -> int:
+        if self._visitor_pool is None:
+            raise RuntimeError("visitor pool unavailable in household mode")
+        sid = int(self._visitor_pool.alloc(float(ts)))
+        self._mint_visitor_count += 1
+        self.next_stable_id = max(int(self.next_stable_id), int(sid) + 1)
+        return sid
+
+    def _household_touch_visitor(self, sid: int, ts: float) -> None:
+        if self._visitor_pool is not None and self.visitor_id_min <= int(sid) <= self.visitor_id_max:
+            self._visitor_pool.touch(int(sid), float(ts))
+
+    def _household_record_embedding_confirm(self, key: Tuple[int, int], emb: Optional[np.ndarray]) -> int:
+        if emb is None:
+            return int(self._household_emb_counts.get(key, 0))
+        count = int(self._household_emb_counts.get(key, 0)) + 1
+        self._household_emb_counts[key] = count
+        return count
+
+    def _household_confirmed(self, key: Tuple[int, int], emb: Optional[np.ndarray]) -> bool:
+        emb_count = self._household_record_embedding_confirm(key, emb)
+        pending_frames = int(self._pending_new_counts.get(key, 0))
+        frame_ok = pending_frames >= max(1, int(self.new_id_hysteresis_frames))
+        emb_ok = emb is not None and emb_count >= int(self.household_confirm_embeddings)
+        return bool(frame_ok and emb_ok)
+
+    def _household_gallery_best(
+        self,
+        emb: np.ndarray,
+        sensor_id: Optional[int] = None,
+        curr_bbox: Optional[BBox] = None,
+        curr_brightness: Optional[float] = None,
+        curr_color: Optional[np.ndarray] = None,
+        *,
+        pose_vec: Optional[np.ndarray] = None,
+        pose_valid: bool = False,
+        now_ts: Optional[float] = None,
+        min_reid: Optional[float] = None,
+    ) -> Tuple[Optional[int], float, float, str]:
+        """Resident-first gallery match with stricter resident threshold."""
+        resident_ids = sorted(self._household_resident_ids())
+        visitor_ids = sorted(
+            sid
+            for sid in self.gallery.keys()
+            if self.visitor_id_min <= int(sid) <= self.visitor_id_max
+        )
+        resident_req = float(self.cos_sim_high_threshold) + float(self.resident_match_margin)
+        if min_reid is not None:
+            resident_req = max(float(min_reid), resident_req)
+
+        best: Tuple[Optional[int], float, float, str] = (None, -1.0, resident_req, "visitor")
+        if resident_ids:
+            sims = self._similarity_for_candidates(emb, resident_ids)
+            for sid in resident_ids:
+                sim = sims.get(int(sid))
+                if sim is None or float(sim) < resident_req:
+                    continue
+                if float(sim) > best[1]:
+                    best = (int(sid), float(sim), float(resident_req), "resident")
+
+        if best[0] is not None:
+            return best
+
+        g_id, g_reid, g_req = self._gallery_best(
+            emb,
+            sensor_id=sensor_id,
+            curr_bbox=curr_bbox,
+            curr_brightness=curr_brightness,
+            curr_color=curr_color,
+            pose_vec=pose_vec,
+            pose_valid=pose_valid,
+            now_ts=now_ts,
+            min_reid=min_reid,
+        )
+        kind = "visitor"
+        if g_id is not None and int(g_id) in self._household_resident_ids():
+            kind = "resident"
+        elif g_id is not None and not (self.visitor_id_min <= int(g_id) <= self.visitor_id_max):
+            kind = "visitor"
+        return g_id, float(g_reid), float(g_req), kind
+
+    def _household_apply_identity_meta(
+        self,
+        rec: Dict[str, Any],
+        *,
+        sid: int,
+        kind: Optional[str] = None,
+    ) -> None:
+        sid_int = int(sid)
+        identity_kind = str(kind or self._household_identity_kind(sid_int))
+        rec["stable_id"] = sid_int
+        rec["identity_kind"] = identity_kind
+        rec["identity_state"] = identity_state_for_kind(identity_kind)
+        if self._resident_registry is not None and identity_kind == "resident":
+            rec["resident_uuid"] = self._resident_registry.uuid_for(sid_int)
+            rec["display_name"] = self._resident_registry.display_name_for(sid_int)
+        else:
+            rec["resident_uuid"] = None
+            rec["display_name"] = None
+
+    def _count_active_provisional(self) -> int:
+        count = 0
+        for rec in self.active_tracks.values():
+            try:
+                kind = str(rec.get("identity_kind") or "")
+                sid = int(rec.get("stable_id", -1))
+            except Exception:
+                continue
+            if kind == "provisional" or self._household_is_provisional_sid(sid):
+                count += 1
+        return int(count)
+
+    def _remap_sid(
+        self,
+        old_sid: int,
+        new_sid: int,
+        *,
+        kind: Optional[str] = None,
+        purge_old: bool = False,
+        move_gallery: bool = True,
+    ) -> None:
+        """Remap active tracks/zones/ghosts (and optionally gallery) from old→new SID."""
+        old_int = int(old_sid)
+        new_int = int(new_sid)
+        identity_kind = str(kind) if kind is not None else None
+
+        if old_int == new_int:
+            if identity_kind is not None:
+                for track in self.active_tracks.values():
+                    try:
+                        if int(track.get("stable_id", -1)) == new_int:
+                            self._household_apply_identity_meta(track, sid=new_int, kind=identity_kind)
+                    except Exception:
+                        continue
+            return
+
+        for track in self.active_tracks.values():
+            try:
+                if int(track.get("stable_id", -1)) != old_int:
+                    continue
+            except Exception:
+                continue
+            if identity_kind is not None:
+                self._household_apply_identity_meta(track, sid=new_int, kind=identity_kind)
+            else:
+                track["stable_id"] = new_int
+                if self.household_mode:
+                    self._household_apply_identity_meta(track, sid=new_int)
+
+        old_pairs = self.active_zones.pop(old_int, set())
+        if old_pairs:
+            self.active_zones[new_int].update(old_pairs)
+
+        for dq in self.ghosts.values():
+            for ghost in dq:
+                try:
+                    if int(ghost.get("stable_id", -1)) == old_int:
+                        ghost["stable_id"] = new_int
+                except Exception:
+                    continue
+
+        if move_gallery:
+            copy_gallery_embeddings(self.gallery, old_int, new_int)
+            src_pose = list(self.pose_gallery.get(old_int, []))
+            if src_pose:
+                dst_pose = list(self.pose_gallery.get(new_int, []))
+                maxlen = self.pose_gallery[new_int].maxlen or self.pose_gallery_size
+                combined_pose = dst_pose + src_pose
+                combined_pose.sort(key=lambda item: float(item[0]), reverse=True)
+                self.pose_gallery[new_int] = deque(combined_pose[:maxlen], maxlen=maxlen)
+                pose_vecs = [v for (_ts, v) in self.pose_gallery[new_int] if v is not None]
+                if pose_vecs:
+                    centroid = np.mean(np.stack(pose_vecs, axis=0), axis=0)
+                    centroid = centroid / (np.linalg.norm(centroid) + 1e-12)
+                    self.pose_centroid[new_int] = centroid.astype(np.float32)
+            if old_int in self.pose_last_seen or new_int in self.pose_last_seen:
+                self.pose_last_seen[new_int] = max(
+                    float(self.pose_last_seen.get(old_int, 0.0)),
+                    float(self.pose_last_seen.get(new_int, 0.0)),
+                )
+            if old_int in self.sid_centroid:
+                if new_int not in self.sid_centroid:
+                    self.sid_centroid[new_int] = self.sid_centroid[old_int]
+                else:
+                    self._recompute_sid_centroid(new_int)
+            for attr in (
+                "sid_last_bbox",
+                "sid_last_bbox_sensor",
+                "sid_last_brightness",
+                "sid_last_color",
+            ):
+                store = getattr(self, attr, None)
+                if not isinstance(store, dict):
+                    continue
+                if old_int in store and new_int not in store:
+                    store[new_int] = store[old_int]
+            last_old = self.sid_global_last_seen.get(old_int)
+            last_new = self.sid_global_last_seen.get(new_int)
+            if last_old is not None or last_new is not None:
+                if last_old is None:
+                    self.sid_global_last_seen[new_int] = float(last_new)  # type: ignore[arg-type]
+                elif last_new is None:
+                    self.sid_global_last_seen[new_int] = float(last_old)
+                else:
+                    self.sid_global_last_seen[new_int] = float(max(last_old, last_new))
+            first_old = self.sid_global_first_seen.get(old_int)
+            first_new = self.sid_global_first_seen.get(new_int)
+            if first_old is not None or first_new is not None:
+                candidates = [float(x) for x in (first_old, first_new) if x is not None]
+                if candidates:
+                    self.sid_global_first_seen[new_int] = float(min(candidates))
+            for key in list(self._sid_sensor_world.keys()):
+                try:
+                    sid_k, sensor_k = key
+                except Exception:
+                    continue
+                if int(sid_k) != old_int:
+                    continue
+                payload = self._sid_sensor_world.pop(key, None)
+                if payload is not None:
+                    self._sid_sensor_world[(new_int, int(sensor_k))] = payload
+
+        if purge_old:
+            self.gallery.pop(old_int, None)
+            self.sid_centroid.pop(old_int, None)
+            self.sid_last_bbox.pop(old_int, None)
+            self.sid_last_bbox_sensor.pop(old_int, None)
+            self.sid_last_brightness.pop(old_int, None)
+            self.sid_last_color.pop(old_int, None)
+            self.active_zones.pop(old_int, None)
+            self.pose_gallery.pop(old_int, None)
+            self.pose_centroid.pop(old_int, None)
+            self.pose_last_seen.pop(old_int, None)
+            self.sid_global_last_seen.pop(old_int, None)
+            self.sid_global_first_seen.pop(old_int, None)
+            for key in list(self._sid_sensor_world.keys()):
+                try:
+                    if int(key[0]) == old_int:
+                        self._sid_sensor_world.pop(key, None)
+                except Exception:
+                    continue
+            for pair in list(self.sid_last_copresent.keys()):
+                try:
+                    if int(pair[0]) == old_int or int(pair[1]) == old_int:
+                        self.sid_last_copresent.pop(pair, None)
+                except Exception:
+                    self.sid_last_copresent.pop(pair, None)
+            if self._household_is_provisional_sid(old_int):
+                self._household_release_provisional(old_int)
+            elif self._visitor_pool is not None and self.visitor_id_min <= old_int <= self.visitor_id_max:
+                self._visitor_pool.release(old_int)
+
+        self._sid_remap_count += 1
+
+    def _household_finalize_new_sid(
+        self,
+        key: Tuple[int, int],
+        *,
+        emb: Optional[np.ndarray],
+        sensor_id: int,
+        bbox_ltrbwh: BBox,
+        ts: float,
+        curr_brightness: Optional[float],
+        curr_color: Optional[np.ndarray],
+        pose_vec: Optional[np.ndarray],
+        pose_valid: bool,
+        world_xy: Optional[Tuple[float, float]],
+        world_valid: bool,
+        pending_sid: Optional[int],
+    ) -> Tuple[int, str, str]:
+        """Match resident/visitor or mint visitor after confirmation gates."""
+        diag_event = "new_alloc"
+        sid: Optional[int] = None
+        identity_kind = "visitor"
+
+        if emb is not None:
+            g_id, g_reid, g_req, kind = self._household_gallery_best(
+                emb,
+                sensor_id=int(sensor_id),
+                curr_bbox=bbox_ltrbwh,
+                curr_brightness=curr_brightness,
+                curr_color=curr_color,
+                pose_vec=pose_vec if pose_valid else None,
+                pose_valid=pose_valid,
+                now_ts=float(ts),
+            )
+            if g_id is not None and float(g_reid) >= float(g_req):
+                ok, _reason = self._gallery_match_ok(
+                    track_key=key,
+                    emb=emb,
+                    g_id=int(g_id),
+                    g_reid=float(g_reid),
+                    g_req=float(g_req),
+                    sensor_id=int(sensor_id),
+                    bbox=bbox_ltrbwh,
+                    ts=float(ts),
+                    world_xy=world_xy,
+                    world_valid=bool(world_valid),
+                )
+                if ok:
+                    sid = int(g_id)
+                    identity_kind = str(kind)
+                    diag_event = "match_gallery"
+
+        if sid is None:
+            sid = int(self._household_mint_visitor(float(ts)))
+            identity_kind = "visitor"
+            diag_event = "mint_visitor"
+
+        return int(sid), str(identity_kind), str(diag_event)
+
+    def list_residents(self) -> List[Dict[str, Any]]:
+        with self._lock:
+            if self._resident_registry is None:
+                return []
+            out: List[Dict[str, Any]] = []
+            for row in self._resident_registry.list_residents():
+                sid = int(row.get("stable_id", 0))
+                emb_count = int(len(self.gallery.get(sid, [])))
+                payload = dict(row)
+                payload["gallery_embeddings"] = emb_count
+                out.append(payload)
+            return out
+
+    def enroll_resident(
+        self,
+        *,
+        display_name: str,
+        stable_id: Optional[int] = None,
+        visitor_id: Optional[int] = None,
+        now_ts: Optional[float] = None,
+    ) -> Dict[str, Any]:
+        now = float(now_ts if now_ts is not None else time.time())
+        with self._lock:
+            if self._resident_registry is None:
+                raise RuntimeError("household mode not enabled")
+            bind_sid = stable_id if stable_id is not None else visitor_id
+            source_sid: Optional[int] = None
+            if visitor_id is not None:
+                source_sid = int(visitor_id)
+            elif bind_sid is not None:
+                source_sid = int(bind_sid)
+            emb_count = 0
+            if source_sid is not None:
+                emb_count = int(len(self.gallery.get(int(source_sid), [])))
+            rec = self._resident_registry.enroll(
+                display_name=str(display_name),
+                stable_id=stable_id,
+                visitor_id=visitor_id,
+                embedding_count=emb_count,
+                now_ts=now,
+            )
+            new_sid = int(rec.stable_id)
+            if source_sid is not None and int(source_sid) != new_sid:
+                self._remap_sid(
+                    int(source_sid),
+                    new_sid,
+                    kind="resident",
+                    purge_old=True,
+                    move_gallery=True,
+                )
+            else:
+                for track in self.active_tracks.values():
+                    if int(track.get("stable_id", -1)) == new_sid:
+                        self._household_apply_identity_meta(track, sid=new_sid, kind="resident")
+                self._recompute_sid_centroid(new_sid)
+            self._promote_resident_count += 1
+            self._resident_registry.save()
+            return rec.to_dict()
+
+    def patch_resident(
+        self,
+        resident_uuid: str,
+        *,
+        display_name: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        with self._lock:
+            if self._resident_registry is None:
+                raise RuntimeError("household mode not enabled")
+            rec = self._resident_registry.patch(str(resident_uuid), display_name=display_name)
+            sid = int(rec.stable_id)
+            for track in self.active_tracks.values():
+                if int(track.get("stable_id", -1)) == sid:
+                    self._household_apply_identity_meta(track, sid=sid, kind="resident")
+            return rec.to_dict()
+
+    def delete_resident(self, resident_uuid: str) -> Dict[str, Any]:
+        with self._lock:
+            if self._resident_registry is None:
+                raise RuntimeError("household mode not enabled")
+            rec = self._resident_registry.delete(str(resident_uuid))
+            old_sid = int(rec.stable_id)
+            now = float(time.time())
+            has_live_ref = False
+            for track in self.active_tracks.values():
+                try:
+                    if int(track.get("stable_id", -1)) == old_sid:
+                        has_live_ref = True
+                        break
+                except Exception:
+                    continue
+            if not has_live_ref:
+                for dq in self.ghosts.values():
+                    for ghost in dq:
+                        try:
+                            if int(ghost.get("stable_id", -1)) == old_sid:
+                                has_live_ref = True
+                                break
+                        except Exception:
+                            continue
+                    if has_live_ref:
+                        break
+            if has_live_ref:
+                new_sid = int(self._household_mint_visitor(now))
+                self._remap_sid(
+                    old_sid,
+                    new_sid,
+                    kind="visitor",
+                    purge_old=True,
+                    move_gallery=True,
+                )
+            else:
+                self.gallery.pop(old_sid, None)
+                self.sid_centroid.pop(old_sid, None)
+                self.pose_gallery.pop(old_sid, None)
+                self.pose_centroid.pop(old_sid, None)
+                self.pose_last_seen.pop(old_sid, None)
+                self.active_zones.pop(old_sid, None)
+            return rec.to_dict()
+
+    def get_identity_health(self) -> Dict[str, Any]:
+        metrics = self.get_sid_metrics()
+        with self._lock:
+            residents = self.list_residents() if self._resident_registry is not None else []
+        return {
+            "household_mode": bool(metrics.get("household_mode")),
+            "resident_count": int(metrics.get("resident_count", 0) or 0),
+            "visitor_count": int(metrics.get("visitor_count", 0) or 0),
+            "provisional_count": int(metrics.get("provisional_count", 0) or 0),
+            "provisional_event_count": int(metrics.get("provisional_event_count", 0) or 0),
+            "provisional_active_count": int(metrics.get("provisional_active_count", 0) or 0),
+            "mint_visitor_count": int(metrics.get("mint_visitor_count", 0) or 0),
+            "promote_resident_count": int(metrics.get("promote_resident_count", 0) or 0),
+            "false_share_blocked_count": int(metrics.get("false_share_blocked_count", 0) or 0),
+            "overlap_permit_grant_count": int(metrics.get("overlap_permit_grant_count", 0) or 0),
+            "overlap_permit_deny_count": int(metrics.get("overlap_permit_deny_count", 0) or 0),
+            "gallery_ids": int(metrics.get("gallery_ids", 0) or 0),
+            "gallery_quality_reject_count": int(metrics.get("gallery_quality_reject_count", 0) or 0),
+            "mnn_reject_count": int(metrics.get("mnn_reject_count", 0) or 0),
+            "active_unique": int(metrics.get("active_unique", 0) or 0),
+            "residents": residents,
+            "metrics": metrics,
+        }
+
     # --------------- Allocator -----------------
     def _sid_pool_soft_cap(self) -> int:
         base = max(1, int(self.max_total_ids))
@@ -591,6 +1161,15 @@ class StableIDManager:
         self._pending_new_counts.pop(key, None)
         self._pending_new_ts.pop(key, None)
         self._pending_id_diag.pop(key, None)
+        self._household_emb_counts.pop(key, None)
+        if self.household_mode and pending_sid is not None:
+            try:
+                pending_int = int(pending_sid)
+            except Exception:
+                pending_int = 0
+            if pending_int > 0 and self._household_is_provisional_sid(pending_int):
+                if keep_sid is None or int(keep_sid) != pending_int:
+                    self._household_release_provisional(pending_int)
         self._try_recycle_unclaimed_sid(pending_sid, keep_sid=keep_sid)
 
     def _purge_sid_state(self, sid: int) -> None:
@@ -791,14 +1370,11 @@ class StableIDManager:
         self.save_gallery()
 
     def _gallery_add(self, sid: int, ts: float, emb: np.ndarray) -> None:
-        """Add an embedding to a SID's gallery, preserving exemplar diversity.
-
-        When the gallery is full, replace the stored exemplar most similar to
-        the incoming embedding instead of evicting the oldest entry. This keeps
-        appearance variety (poses, lighting, partial views) for long-term
-        re-identification rather than only the most recent frames.
-        """
+        """Add an embedding to a SID's gallery, preserving exemplar diversity."""
         dq = self.gallery[int(sid)]
+        if self.household_mode:
+            add_clustered_exemplar(dq, float(ts), emb)
+            return
         if dq.maxlen is None or len(dq) < dq.maxlen:
             dq.append((float(ts), emb))
             return
@@ -812,6 +1388,241 @@ class StableIDManager:
             dq.extend(entries)
         except Exception:
             dq.append((float(ts), emb))
+
+    def _maybe_gallery_add(
+        self,
+        sid: int,
+        ts: float,
+        emb: np.ndarray,
+        *,
+        bbox: Optional[BBox] = None,
+        blur_var: Optional[float] = None,
+        pose_quality: Optional[Dict[str, float]] = None,
+        identity_state: Optional[str] = None,
+        identity_quality: Optional[str] = None,
+    ) -> bool:
+        sid_int = int(sid)
+        accept, _reason = should_accept_gallery_embedding(
+            household_mode=bool(self.household_mode),
+            bbox=bbox,
+            blur_var=blur_var,
+            pose_quality=pose_quality,
+            identity_state=identity_state,
+            identity_quality=identity_quality,
+            sid_has_gallery=bool(len(self.gallery.get(sid_int, []))),
+            min_crop_h=int(self.min_crop_h),
+            min_laplacian_var=float(self.min_laplacian_var),
+        )
+        if not accept:
+            self._gallery_quality_reject_count += 1
+            return False
+        self._gallery_add(sid_int, float(ts), emb)
+        return True
+
+    def _persist_track_embedding(
+        self,
+        sid: int,
+        ts: float,
+        emb: np.ndarray,
+        *,
+        rec: Optional[Dict[str, Any]],
+        bbox: BBox,
+        pose_quality: Optional[Dict[str, float]] = None,
+        blur_var: Optional[float] = None,
+    ) -> bool:
+        if self.household_mode and rec is not None and not self._household_should_persist_gallery(rec):
+            return False
+        identity_state: Optional[str] = None
+        identity_quality: Optional[str] = None
+        if rec is not None:
+            if rec.get("identity_state"):
+                identity_state = str(rec.get("identity_state"))
+            if rec.get("identity_quality"):
+                identity_quality = str(rec.get("identity_quality"))
+            if self.household_mode and not identity_state:
+                identity_state = self._household_identity_state(rec)
+        return self._maybe_gallery_add(
+            int(sid),
+            float(ts),
+            emb,
+            bbox=bbox,
+            blur_var=blur_var,
+            pose_quality=pose_quality,
+            identity_state=identity_state,
+            identity_quality=identity_quality,
+        )
+
+    def _topology_handoff_allows_relax(
+        self,
+        sid: int,
+        sensor_id: Optional[int],
+    ) -> bool:
+        if sensor_id is None:
+            return True
+        last_sensor = self.sid_last_bbox_sensor.get(int(sid))
+        if last_sensor is None:
+            return True
+        if int(last_sensor) == int(sensor_id):
+            return True
+        return bool(self._camera_topology.is_overlap_pair(int(last_sensor), int(sensor_id)))
+
+    def _gallery_match_candidates(self) -> List[int]:
+        candidates: List[int] = []
+        seen: set[int] = set()
+        for sid in list(self.gallery.keys()):
+            try:
+                sid_int = int(sid)
+            except Exception:
+                continue
+            sid_can = self.canonical_sid(sid_int) if self.aliases_enabled else sid_int
+            if sid_can in seen:
+                continue
+            seen.add(sid_can)
+            candidates.append(sid_can)
+        return candidates
+
+    def _reject_household_gallery_match(
+        self,
+        *,
+        track_key: Tuple[int, int],
+        emb: np.ndarray,
+        best_sid: int,
+        ts: float,
+        sensor_id: int,
+        world_xy: Optional[Tuple[float, float]],
+        world_valid: bool,
+        appearance_sim: float,
+    ) -> Tuple[bool, Optional[str]]:
+        if not self.household_mode:
+            return False, None
+
+        self._frame_assignment.reset_if_new_frame(float(ts))
+        if self._frame_assignment.is_claimed(int(best_sid), exclude_key=track_key):
+            other_key = self._frame_assignment.claimed_by(int(best_sid))
+            if other_key is not None and int(other_key[0]) != int(sensor_id):
+                dual_ok = self._allow_cross_camera_sid_active(
+                    int(best_sid),
+                    int(sensor_id),
+                    world_xy=world_xy,
+                    world_valid=bool(world_valid),
+                    ts=float(ts),
+                    appearance_sim=float(appearance_sim),
+                )
+                if not dual_ok:
+                    self._mnn_reject_count += 1
+                    return True, "frame_sid_claimed"
+
+        peers = active_embeddings_same_frame(
+            self.active_tracks,
+            float(ts),
+            epsilon_s=float(self.same_frame_sid_epsilon_s),
+        )
+        if track_key not in peers:
+            peers[track_key] = np.asarray(emb, dtype=np.float32).reshape(-1)
+        if len(peers) > 1:
+            candidates = self._gallery_match_candidates()
+            if not is_mutual_nearest_match(
+                track_key,
+                emb,
+                int(best_sid),
+                peers,
+                candidates,
+                self._similarity_for_candidates,
+            ):
+                self._mnn_reject_count += 1
+                return True, "mnn_conflict"
+        return False, None
+
+    def _register_gallery_match_claim(
+        self,
+        *,
+        track_key: Tuple[int, int],
+        sid: int,
+        ts: float,
+    ) -> None:
+        if not self.household_mode:
+            return
+        self._frame_assignment.reset_if_new_frame(float(ts))
+        self._frame_assignment.claim(int(sid), track_key, float(ts))
+
+    def _gallery_match_ok(
+        self,
+        *,
+        track_key: Tuple[int, int],
+        emb: Optional[np.ndarray],
+        g_id: int,
+        g_reid: float,
+        g_req: float,
+        sensor_id: int,
+        bbox: BBox,
+        ts: float,
+        world_xy: Optional[Tuple[float, float]],
+        world_valid: bool,
+        exclude_key: Optional[Tuple[int, int]] = None,
+        require_mnn_emb: bool = True,
+    ) -> Tuple[bool, Optional[str]]:
+        can_take = self._allow_active_sid_match(
+            sensor_id=int(sensor_id),
+            sid=int(g_id),
+            score=float(g_reid),
+            required=float(g_req),
+            bbox=bbox,
+            ts=float(ts),
+            exclude_key=exclude_key,
+        )
+        if not can_take:
+            self._sid_guard_reject_count += 1
+            if self._sid_claimed_same_frame(
+                sensor_id=int(sensor_id),
+                sid=int(g_id),
+                ts=float(ts),
+                exclude_key=exclude_key,
+            ):
+                return False, "same_frame_sid_conflict"
+            return False, "active_guard"
+        dual_ok = self._allow_cross_camera_sid_active(
+            int(g_id),
+            int(sensor_id),
+            world_xy=world_xy,
+            world_valid=bool(world_valid),
+            ts=float(ts),
+            appearance_sim=float(g_reid),
+        )
+        if not dual_ok:
+            return False, "exclusivity_blocked"
+        if self.household_mode:
+            if require_mnn_emb and emb is not None:
+                reject, reason = self._reject_household_gallery_match(
+                    track_key=track_key,
+                    emb=emb,
+                    best_sid=int(g_id),
+                    ts=float(ts),
+                    sensor_id=int(sensor_id),
+                    world_xy=world_xy,
+                    world_valid=bool(world_valid),
+                    appearance_sim=float(g_reid),
+                )
+                if reject:
+                    return False, reason
+            else:
+                # Pose-only / no-emb path: still enforce frame SID claims.
+                self._frame_assignment.reset_if_new_frame(float(ts))
+                if self._frame_assignment.is_claimed(int(g_id), exclude_key=track_key):
+                    other_key = self._frame_assignment.claimed_by(int(g_id))
+                    if other_key is not None and int(other_key[0]) != int(sensor_id):
+                        dual_claim_ok = self._allow_cross_camera_sid_active(
+                            int(g_id),
+                            int(sensor_id),
+                            world_xy=world_xy,
+                            world_valid=bool(world_valid),
+                            ts=float(ts),
+                            appearance_sim=float(g_reid),
+                        )
+                        if not dual_claim_ok:
+                            self._mnn_reject_count += 1
+                            return False, "frame_sid_claimed"
+            self._register_gallery_match_claim(track_key=track_key, sid=int(g_id), ts=float(ts))
+        return True, None
 
     def _load_aliases(self) -> None:
         if not self.aliases_enabled:
@@ -1402,7 +2213,10 @@ class StableIDManager:
                 if now_ts is not None:
                     last_glob = self.sid_global_last_seen.get(int(sid))
                     if last_glob is not None and (float(now_ts) - float(last_glob)) <= self.xcam_handoff_window_s:
-                        req = max(0.0, req - self.xcam_handoff_margin)
+                        if (not self.household_mode) or self._topology_handoff_allows_relax(
+                            int(sid), sensor_id
+                        ):
+                            req = max(0.0, req - self.xcam_handoff_margin)
             else:
                 req = float(min_reid)
             if score < req:
@@ -1442,6 +2256,13 @@ class StableIDManager:
         sid_candidate: Optional[int],
         stable_id: Optional[int],
         ts: float,
+        reid_confidence: Optional[float] = None,
+        reid_required: Optional[float] = None,
+        overlap_permit: Optional[bool] = None,
+        identity_kind: Optional[str] = None,
+        identity_state: Optional[str] = None,
+        resident_uuid: Optional[str] = None,
+        display_name: Optional[str] = None,
     ) -> Dict[str, Any]:
         diag: Dict[str, Any] = {
             "id_event": str(event),
@@ -1451,9 +2272,166 @@ class StableIDManager:
             "sid_candidate": int(sid_candidate) if sid_candidate is not None else None,
             "stable_id": int(stable_id) if stable_id is not None else None,
             "ts": float(ts),
+            "reid_confidence": float(reid_confidence) if reid_confidence is not None else None,
+            "reid_required": float(reid_required) if reid_required is not None else None,
+            "overlap_permit": bool(overlap_permit) if overlap_permit is not None else None,
         }
+        if self.household_mode and stable_id is not None:
+            kind = identity_kind or self._household_identity_kind(int(stable_id))
+            diag["identity_kind"] = str(kind)
+            diag["identity_state"] = str(identity_state or identity_state_for_kind(kind))
+            if resident_uuid is not None:
+                diag["resident_uuid"] = resident_uuid
+            elif self._resident_registry is not None and kind == "resident":
+                diag["resident_uuid"] = self._resident_registry.uuid_for(int(stable_id))
+            else:
+                diag["resident_uuid"] = None
+            if display_name is not None:
+                diag["display_name"] = display_name
+            elif self._resident_registry is not None and kind == "resident":
+                diag["display_name"] = self._resident_registry.display_name_for(int(stable_id))
+            else:
+                diag["display_name"] = None
         self._pending_id_diag[key] = dict(diag)
         return diag
+
+    def _record_sid_sensor_world(
+        self,
+        sid: int,
+        sensor_id: int,
+        *,
+        world_xy: Optional[Tuple[float, float]],
+        world_valid: bool,
+        ts: float,
+    ) -> None:
+        if world_xy is None:
+            return
+        try:
+            wx = float(world_xy[0])
+            wy = float(world_xy[1])
+        except Exception:
+            return
+        self._sid_sensor_world[(int(sid), int(sensor_id))] = {
+            "world_xy": (wx, wy),
+            "world_valid": bool(world_valid),
+            "ts": float(ts),
+        }
+
+    def _other_active_sensors_for_sid(self, sid: int, sensor_id: int) -> List[int]:
+        pairs = self.active_zones.get(int(sid), set())
+        out: List[int] = []
+        for sid_sensor, _zone in pairs:
+            if int(sid_sensor) != int(sensor_id):
+                out.append(int(sid_sensor))
+        return out
+
+    def overlap_permit(
+        self,
+        sid: int,
+        sensor_id: int,
+        world_xy: Optional[Tuple[float, float]],
+        ts: float,
+        *,
+        world_valid: bool = False,
+        appearance_sim: Optional[float] = None,
+    ) -> Tuple[bool, Optional[str]]:
+        """Return whether sid may be active on sensor_id while active elsewhere.
+
+        Implements the algorithm in plans/household_identity/camera_topology.md.
+        """
+        sid_int = int(sid)
+        sensor_int = int(sensor_id)
+        other_sensors = self._other_active_sensors_for_sid(sid_int, sensor_int)
+        if not other_sensors:
+            return True, None
+
+        try:
+            ts_f = float(ts)
+        except Exception:
+            ts_f = 0.0
+
+        curr_world: Optional[Tuple[float, float]] = None
+        if world_xy is not None:
+            try:
+                curr_world = (float(world_xy[0]), float(world_xy[1]))
+            except Exception:
+                curr_world = None
+
+        for other_sensor in other_sensors:
+            params = self._camera_topology.overlap_params(other_sensor, sensor_int)
+            if params is None:
+                return False, "no_overlap_pair"
+
+            other_state = self._sid_sensor_world.get((sid_int, int(other_sensor)), {})
+            other_world = other_state.get("world_xy")
+            other_valid = bool(other_state.get("world_valid", False))
+            other_ts = float(other_state.get("ts", ts_f))
+
+            geometry_ok = (
+                curr_world is not None
+                and other_world is not None
+                and bool(world_valid)
+                and other_valid
+            )
+
+            if not geometry_ok:
+                if not self.overlap_allow_appearance_only:
+                    return False, "missing_world"
+                if appearance_sim is None or float(appearance_sim) < 0.85:
+                    return False, "appearance_only_insufficient"
+                return True, "appearance_only"
+
+            if abs(ts_f - other_ts) > float(params.max_time_delta_s):
+                return False, "time_delta"
+
+            try:
+                ox, oy = float(other_world[0]), float(other_world[1])
+                dist = math.hypot(float(curr_world[0]) - ox, float(curr_world[1]) - oy)
+            except Exception:
+                return False, "world_parse"
+
+            if dist > float(params.max_world_dist_m):
+                return False, "world_dist"
+
+            if appearance_sim is not None and float(appearance_sim) < float(params.require_appearance_sim):
+                return False, "appearance_sim"
+
+        return True, None
+
+    def _allow_cross_camera_sid_active(
+        self,
+        sid: int,
+        sensor_id: int,
+        *,
+        world_xy: Optional[Tuple[float, float]] = None,
+        world_valid: bool = False,
+        ts: float = 0.0,
+        appearance_sim: Optional[float] = None,
+    ) -> bool:
+        """Enforce global exclusivity with optional FoV-overlap exception."""
+        sid_int = int(sid)
+        if not self._other_active_sensors_for_sid(sid_int, int(sensor_id)):
+            return True
+        if self.allow_multi_zone_active and not self.household_mode:
+            return True
+
+        granted, reason = self.overlap_permit(
+            sid_int,
+            int(sensor_id),
+            world_xy,
+            float(ts),
+            world_valid=bool(world_valid),
+            appearance_sim=appearance_sim,
+        )
+        if granted:
+            if reason == "appearance_only":
+                self._overlap_permit_degraded_count += 1
+            self._overlap_permit_grant_count += 1
+            return True
+
+        self._false_share_blocked_count += 1
+        self._overlap_permit_deny_count += 1
+        return False
 
     def _active_bbox_for_sid_on_sensor(
         self,
@@ -2215,6 +3193,9 @@ class StableIDManager:
 
     def _auto_merge_if_needed(self, now_ts: float) -> int:
         """Apply automatic alias merges when canonical ID count exceeds configured limits."""
+        if self.household_mode:
+            self._auto_merge_last_reason = "household_mode_disabled"
+            return 0
         if not self.auto_merge_enabled or not self.aliases_enabled:
             self._auto_merge_last_reason = "disabled"
             return 0
@@ -2586,6 +3567,8 @@ class StableIDManager:
         embedding: Optional[np.ndarray] = None,
         pose_features: Optional[Dict[str, float]] = None,
         pose_quality: Optional[Dict[str, float]] = None,
+        world_xy: Optional[Tuple[float, float]] = None,
+        world_valid: bool = False,
     ) -> int:
         """Update or create stable_id for a DS track.
 
@@ -2599,6 +3582,9 @@ class StableIDManager:
             diag_event = "new_alloc" if is_new else "reuse_active"
             diag_reject_reason: Optional[str] = None
             diag_sid_candidate: Optional[int] = None
+            diag_reid_confidence: Optional[float] = None
+            diag_reid_required: Optional[float] = None
+            diag_overlap_permit: Optional[bool] = None
             if is_new:
                 self._auto_merge_if_needed(float(ts))
             if rec is not None and self.aliases_enabled:
@@ -2649,7 +3635,7 @@ class StableIDManager:
                             self.active_zones.pop(int(old_sid), None)
                     except Exception:
                         pass
-                    new_sid = int(self._alloc_sid())
+                    new_sid = int(self._household_alloc_provisional() if self.household_mode else self._alloc_sid())
                     self._sid_new_alloc_count += 1
                     self._sid_fragmentation_events += 1
                     if self.aliases_enabled:
@@ -2733,6 +3719,7 @@ class StableIDManager:
             # New track: try to match
             if is_new:
                 sid = None
+                identity_kind: Optional[str] = None
                 # Prefer ghost match (same camera, recent disappearance)
                 if emb is not None or pose_valid:
                     sid = self._match_ghost(
@@ -2741,47 +3728,62 @@ class StableIDManager:
                         bbox_ltrbwh,
                         ts,
                         pose_vec=pose_vec if pose_valid else None,
+                        world_xy=world_xy,
+                        world_valid=bool(world_valid),
                     )
                     if sid is not None:
                         diag_event = "match_ghost"
                         diag_sid_candidate = int(sid)
                     # Cross-camera active/gallery match if enabled
                     if sid is None and emb is not None:
-                        g_id, g_reid, g_req = self._gallery_best(
-                            emb,
-                            sensor_id=int(sensor_id),
-                            curr_bbox=bbox_ltrbwh,
-                            curr_brightness=curr_brightness,
-                            curr_color=curr_color,
-                            pose_vec=pose_vec if pose_valid else None,
-                            pose_valid=pose_valid,
-                            now_ts=float(ts),
-                        )
+                        g_kind = "visitor"
+                        if self.household_mode:
+                            g_id, g_reid, g_req, g_kind = self._household_gallery_best(
+                                emb,
+                                sensor_id=int(sensor_id),
+                                curr_bbox=bbox_ltrbwh,
+                                curr_brightness=curr_brightness,
+                                curr_color=curr_color,
+                                pose_vec=pose_vec if pose_valid else None,
+                                pose_valid=pose_valid,
+                                now_ts=float(ts),
+                            )
+                        else:
+                            g_id, g_reid, g_req = self._gallery_best(
+                                emb,
+                                sensor_id=int(sensor_id),
+                                curr_bbox=bbox_ltrbwh,
+                                curr_brightness=curr_brightness,
+                                curr_color=curr_color,
+                                pose_vec=pose_vec if pose_valid else None,
+                                pose_valid=pose_valid,
+                                now_ts=float(ts),
+                            )
                         if g_id is not None:
                             diag_sid_candidate = int(g_id)
                         if g_id is not None and float(g_reid) >= float(g_req):
-                            can_take = self._allow_active_sid_match(
+                            diag_reid_confidence = float(g_reid)
+                            diag_reid_required = float(g_req)
+                            ok, reason = self._gallery_match_ok(
+                                track_key=key,
+                                emb=emb,
+                                g_id=int(g_id),
+                                g_reid=float(g_reid),
+                                g_req=float(g_req),
                                 sensor_id=int(sensor_id),
-                                sid=int(g_id),
-                                score=float(g_reid),
-                                required=float(g_req),
                                 bbox=bbox_ltrbwh,
                                 ts=float(ts),
+                                world_xy=world_xy,
+                                world_valid=bool(world_valid),
                             )
-                            if not can_take:
-                                self._sid_guard_reject_count += 1
-                                if self._sid_claimed_same_frame(
-                                    sensor_id=int(sensor_id),
-                                    sid=int(g_id),
-                                    ts=float(ts),
-                                    exclude_key=None,
-                                ):
-                                    diag_reject_reason = "same_frame_sid_conflict"
-                                else:
-                                    diag_reject_reason = "active_guard"
-                            if can_take and (self.allow_multi_zone_active or not self.active_zones.get(g_id)):
+                            if self._other_active_sensors_for_sid(int(g_id), int(sensor_id)):
+                                diag_overlap_permit = bool(reason != "exclusivity_blocked")
+                            if ok:
                                 sid = g_id
                                 diag_event = "match_gallery"
+                                identity_kind = str(g_kind)
+                            else:
+                                diag_reject_reason = reason
                         elif g_id is not None:
                             diag_reject_reason = "threshold"
                     if sid is None and emb is None and pose_valid and pose_vec is not None:
@@ -2791,28 +3793,28 @@ class StableIDManager:
                         if g_id is not None:
                             diag_sid_candidate = int(g_id)
                         if g_id is not None and float(g_pose) >= float(g_req):
-                            can_take = self._allow_active_sid_match(
+                            diag_reid_confidence = float(g_pose)
+                            diag_reid_required = float(g_req)
+                            ok, reason = self._gallery_match_ok(
+                                track_key=key,
+                                emb=None,
+                                g_id=int(g_id),
+                                g_reid=float(g_pose),
+                                g_req=float(g_req),
                                 sensor_id=int(sensor_id),
-                                sid=int(g_id),
-                                score=float(g_pose),
-                                required=float(g_req),
                                 bbox=bbox_ltrbwh,
                                 ts=float(ts),
+                                world_xy=world_xy,
+                                world_valid=bool(world_valid),
+                                require_mnn_emb=False,
                             )
-                            if not can_take:
-                                self._sid_guard_reject_count += 1
-                                if self._sid_claimed_same_frame(
-                                    sensor_id=int(sensor_id),
-                                    sid=int(g_id),
-                                    ts=float(ts),
-                                    exclude_key=None,
-                                ):
-                                    diag_reject_reason = "same_frame_sid_conflict"
-                                else:
-                                    diag_reject_reason = "active_guard"
-                            if can_take and (self.allow_multi_zone_active or not self.active_zones.get(g_id)):
+                            if self._other_active_sensors_for_sid(int(g_id), int(sensor_id)):
+                                diag_overlap_permit = bool(reason != "exclusivity_blocked")
+                            if ok:
                                 sid = g_id
                                 diag_event = "match_pose_gallery"
+                            else:
+                                diag_reject_reason = reason
                         elif g_id is not None:
                             diag_reject_reason = "threshold"
 
@@ -2826,19 +3828,83 @@ class StableIDManager:
                     cnt = self._pending_new_counts.get(key, 0) + 1
                     self._pending_new_counts[key] = cnt
                     self._pending_new_ts[key] = float(ts)
-                    if cnt < required:
-                        # Defer *finalizing* the ID, but still return a positive stable_id so
-                        # user-facing telemetry never needs to fall back to raw tracker IDs.
+                    household_confirmed = (
+                        self._household_confirmed(key, emb) if self.household_mode else (cnt >= required)
+                    )
+                    if cnt < required or (self.household_mode and not household_confirmed):
+                        # Defer finalizing permanent ID; return provisional/ephemeral ID for OSD continuity.
                         pending_sid = self._pending_new_sids.get(key)
+                        first_mint = pending_sid is None
                         if pending_sid is None:
-                            pending_sid = int(self._alloc_sid())
+                            if self.household_mode:
+                                pending_sid = int(self._household_alloc_provisional())
+                                self._provisional_event_count += 1
+                            else:
+                                pending_sid = int(self._alloc_sid())
                             self._pending_new_sids[key] = int(pending_sid)
                             self._sid_new_alloc_count += 1
                             if active_ids_here:
                                 self._sid_fragmentation_events += 1
+                        if self.household_mode:
+                            diag_event = "provisional"
+                            diag_sid_candidate = int(pending_sid)
+                            if first_mint:
+                                self._record_id_event(diag_event)
+                            id_kind = "provisional"
+                            diag_payload = self._set_track_diag(
+                                key,
+                                event=diag_event,
+                                reject_reason=diag_reject_reason,
+                                embedding_present=emb is not None,
+                                pose_present=pose_valid and pose_vec is not None,
+                                sid_candidate=diag_sid_candidate,
+                                stable_id=int(pending_sid),
+                                ts=float(ts),
+                                reid_confidence=diag_reid_confidence,
+                                reid_required=diag_reid_required,
+                                overlap_permit=diag_overlap_permit,
+                                identity_kind=id_kind,
+                                identity_state=identity_state_for_kind(id_kind),
+                            )
+                            # Create a full active provisional record so subsequent frames
+                            # hit is_new=False, exclusivity sees the claim, and SID stays stable.
+                            rec = {
+                                "stable_id": int(pending_sid),
+                                "first_seen_ts": float(ts),
+                                "bbox": bbox_ltrbwh,
+                                "last_seen_ts": float(ts),
+                                "last_emb_ts": float(ts) if emb is not None else 0.0,
+                                "emb": emb,
+                                "pose_vec": pose_vec,
+                                "last_pose_ts": float(ts) if pose_vec is not None else 0.0,
+                                "early_emb_reconcile_attempts": 0,
+                                "zone": zone or "default",
+                                "id_diag": diag_payload,
+                                "identity_quality": (
+                                    "strong"
+                                    if emb is not None
+                                    else ("pose_only" if pose_vec is not None else "weak_no_embedding")
+                                ),
+                            }
+                            self._household_apply_identity_meta(rec, sid=int(pending_sid), kind="provisional")
+                            self.active_tracks[key] = rec
+                            self.active_zones[int(pending_sid)].add((int(sensor_id), rec["zone"]))
+                            # Ownership moves to active_tracks; keep confirm counters, drop pending SID map.
+                            self._pending_new_sids.pop(key, None)
+                            self._record_sid_sensor_world(
+                                int(pending_sid),
+                                int(sensor_id),
+                                world_xy=world_xy,
+                                world_valid=bool(world_valid),
+                                ts=float(ts),
+                            )
+                            if self.aliases_enabled:
+                                return int(self.canonical_sid(int(pending_sid)))
+                            return int(pending_sid)
                         diag_event = "new_alloc"
                         diag_sid_candidate = int(pending_sid)
                         self._record_id_event(diag_event)
+                        id_kind = self._household_identity_kind(int(pending_sid))
                         self._set_track_diag(
                             key,
                             event=diag_event,
@@ -2848,84 +3914,117 @@ class StableIDManager:
                             sid_candidate=diag_sid_candidate,
                             stable_id=int(pending_sid),
                             ts=float(ts),
+                            reid_confidence=diag_reid_confidence,
+                            reid_required=diag_reid_required,
+                            overlap_permit=diag_overlap_permit,
+                            identity_kind=id_kind,
+                            identity_state=identity_state_for_kind(id_kind),
                         )
                         if self.aliases_enabled:
                             return int(self.canonical_sid(int(pending_sid)))
                         return int(pending_sid)
-                    # Confirmation reached: use the pending stable_id if one was allocated.
+                    # Confirmation reached
                     pending_sid = self._pending_new_sids.get(key)
-                    if pending_sid is not None:
-                        sid = int(pending_sid)
-                    if at_cap and self.new_id_confirm_frames_at_cap > 0:
-                        # Evict stale locals to free a slot
-                        now = float(ts)
-                        oldest_sid = None
-                        oldest_age = -1.0
-                        for sid_cand in list(active_ids_here):
-                            ages = [now - rec2.get("last_seen_ts", now) for (s_id2, _ds2), rec2 in self.active_tracks.items() if int(s_id2) == int(sensor_id) and int(rec2.get("stable_id", -1)) == int(sid_cand)]
-                            age = max(ages) if ages else 0.0
-                            if age >= self.active_evict_grace_s and age > oldest_age:
-                                oldest_age = age
-                                oldest_sid = sid_cand
-                        if oldest_sid is not None:
-                            try:
-                                pairs = self.active_zones.get(int(oldest_sid), set())
-                                pairs = {p for p in pairs if int(p[0]) != int(sensor_id)}
-                                if pairs:
-                                    self.active_zones[int(oldest_sid)] = pairs
-                                else:
-                                    self.active_zones.pop(int(oldest_sid), None)
-                            except Exception:
-                                pass
-                        # fall through to create new ID
-                    # Try global reuse before creating when total exceeds soft-cap
-                    total_ids = len(self.gallery)
-                    if self.total_id_reuse and total_ids >= self.max_total_ids:
-                        # Attempt to map into an existing identity with a slightly relaxed threshold
-                        if emb is not None:
-                            req2 = max(0.0, self.cos_sim_high_threshold - 0.04)
-                            g_id2, g_reid2, _g_req2 = self._gallery_best(
-                                emb,
-                                sensor_id=int(sensor_id),
-                                curr_bbox=bbox_ltrbwh,
-                                curr_brightness=curr_brightness,
-                                curr_color=curr_color,
-                                pose_vec=pose_vec if pose_valid else None,
-                                pose_valid=pose_valid,
-                                now_ts=float(ts),
-                                min_reid=req2,
-                            )
-                            if g_id2 is not None and float(g_reid2) >= float(req2):
-                                sid = int(g_id2)
-                        if sid is None:
-                            # Recycle the least recently seen, fully inactive ID if old enough
-                            candidates = [
-                                int(s)
-                                for s in self.gallery.keys()
-                                if not self.active_zones.get(int(s)) and not self._is_alias_reserved(int(s))
-                            ]
-                            oldest_sid = None
-                            oldest_age = -1.0
-                            now = float(ts)
-                            for s in candidates:
-                                age = now - float(self.sid_global_last_seen.get(int(s), 0.0))
-                                if age >= self.total_id_reuse_min_age_s and age > oldest_age:
-                                    oldest_age = age
-                                    oldest_sid = int(s)
-                            if oldest_sid is not None:
-                                # Clear per-id appearance except numeric id
-                                try:
-                                    self._purge_sid_state(int(oldest_sid))
-                                except Exception:
-                                    pass
-                                sid = int(oldest_sid)
-                    # Create new stable ID now if still none
-                    if sid is None:
-                        sid = self._alloc_sid()
+                    identity_kind = "visitor"
+                    if self.household_mode:
+                        sid, identity_kind, diag_event = self._household_finalize_new_sid(
+                            key,
+                            emb=emb,
+                            sensor_id=int(sensor_id),
+                            bbox_ltrbwh=bbox_ltrbwh,
+                            ts=float(ts),
+                            curr_brightness=curr_brightness,
+                            curr_color=curr_color,
+                            pose_vec=pose_vec,
+                            pose_valid=pose_valid,
+                            world_xy=world_xy,
+                            world_valid=bool(world_valid),
+                            pending_sid=int(pending_sid) if pending_sid is not None else None,
+                        )
                         self._sid_new_alloc_count += 1
                         if active_ids_here:
                             self._sid_fragmentation_events += 1
-                    diag_event = "new_alloc"
+                    else:
+                        if pending_sid is not None:
+                            sid = int(pending_sid)
+                        if at_cap and self.new_id_confirm_frames_at_cap > 0:
+                            # Evict stale locals to free a slot
+                            now = float(ts)
+                            oldest_sid = None
+                            oldest_age = -1.0
+                            for sid_cand in list(active_ids_here):
+                                ages = [now - rec2.get("last_seen_ts", now) for (s_id2, _ds2), rec2 in self.active_tracks.items() if int(s_id2) == int(sensor_id) and int(rec2.get("stable_id", -1)) == int(sid_cand)]
+                                age = max(ages) if ages else 0.0
+                                if age >= self.active_evict_grace_s and age > oldest_age:
+                                    oldest_age = age
+                                    oldest_sid = sid_cand
+                            if oldest_sid is not None:
+                                try:
+                                    pairs = self.active_zones.get(int(oldest_sid), set())
+                                    pairs = {p for p in pairs if int(p[0]) != int(sensor_id)}
+                                    if pairs:
+                                        self.active_zones[int(oldest_sid)] = pairs
+                                    else:
+                                        self.active_zones.pop(int(oldest_sid), None)
+                                except Exception:
+                                    pass
+                            # fall through to create new ID
+                        # Try global reuse before creating when total exceeds soft-cap
+                        total_ids = len(self.gallery)
+                        if self.total_id_reuse and total_ids >= self.max_total_ids:
+                            # Attempt to map into an existing identity with a slightly relaxed threshold
+                            if emb is not None:
+                                req2 = max(0.0, self.cos_sim_high_threshold - 0.04)
+                                g_id2, g_reid2, _g_req2 = self._gallery_best(
+                                    emb,
+                                    sensor_id=int(sensor_id),
+                                    curr_bbox=bbox_ltrbwh,
+                                    curr_brightness=curr_brightness,
+                                    curr_color=curr_color,
+                                    pose_vec=pose_vec if pose_valid else None,
+                                    pose_valid=pose_valid,
+                                    now_ts=float(ts),
+                                    min_reid=req2,
+                                )
+                                if g_id2 is not None and float(g_reid2) >= float(req2):
+                                    if self._allow_cross_camera_sid_active(
+                                        int(g_id2),
+                                        int(sensor_id),
+                                        world_xy=world_xy,
+                                        world_valid=bool(world_valid),
+                                        ts=float(ts),
+                                        appearance_sim=float(g_reid2),
+                                    ):
+                                        sid = int(g_id2)
+                            if sid is None:
+                                # Recycle the least recently seen, fully inactive ID if old enough
+                                candidates = [
+                                    int(s)
+                                    for s in self.gallery.keys()
+                                    if not self.active_zones.get(int(s)) and not self._is_alias_reserved(int(s))
+                                ]
+                                oldest_sid = None
+                                oldest_age = -1.0
+                                now = float(ts)
+                                for s in candidates:
+                                    age = now - float(self.sid_global_last_seen.get(int(s), 0.0))
+                                    if age >= self.total_id_reuse_min_age_s and age > oldest_age:
+                                        oldest_age = age
+                                        oldest_sid = int(s)
+                                if oldest_sid is not None:
+                                    # Clear per-id appearance except numeric id
+                                    try:
+                                        self._purge_sid_state(int(oldest_sid))
+                                    except Exception:
+                                        pass
+                                    sid = int(oldest_sid)
+                        # Create new stable ID now if still none
+                        if sid is None:
+                            sid = self._alloc_sid()
+                            self._sid_new_alloc_count += 1
+                            if active_ids_here:
+                                self._sid_fragmentation_events += 1
+                        diag_event = "new_alloc"
                     # Clear pending counter after minting
                     try:
                         self._clear_pending_new_state(key, keep_sid=int(sid))
@@ -2950,6 +4049,9 @@ class StableIDManager:
                     sid_candidate=diag_sid_candidate,
                     stable_id=int(sid),
                     ts=float(ts),
+                    reid_confidence=diag_reid_confidence,
+                    reid_required=diag_reid_required,
+                    overlap_permit=diag_overlap_permit,
                 )
                 self._record_id_event(diag_event)
 
@@ -2971,12 +4073,23 @@ class StableIDManager:
                         else ("pose_only" if pose_vec is not None else "weak_no_embedding")
                     ),
                 }
+                if self.household_mode:
+                    kind = identity_kind if identity_kind is not None else self._household_identity_kind(int(sid))
+                    self._household_apply_identity_meta(rec, sid=int(sid), kind=str(kind))
+                    self._household_touch_visitor(int(sid), float(ts))
                 self.active_tracks[key] = rec
                 # Track zones and gallery
                 self.active_zones[int(sid)].add((int(sensor_id), rec["zone"]))
                 if emb is not None:
                     sid_int = int(sid)
-                    self._gallery_add(sid_int, float(ts), emb)
+                    self._persist_track_embedding(
+                        sid_int,
+                        float(ts),
+                        emb,
+                        rec=rec,
+                        bbox=bbox_ltrbwh,
+                        pose_quality=pose_quality,
+                    )
                     if sid_int not in self.sid_global_first_seen:
                         self.sid_global_first_seen[sid_int] = float(ts)
                     # Initialize EMA centroid with first embedding
@@ -2993,6 +4106,13 @@ class StableIDManager:
                         self.sid_last_color[sid_int] = curr_color.astype(np.float32)
                 if pose_vec is not None:
                     self._update_pose_state(int(sid), pose_vec, float(ts))
+                self._record_sid_sensor_world(
+                    int(sid),
+                    int(sensor_id),
+                    world_xy=world_xy,
+                    world_valid=bool(world_valid),
+                    ts=float(ts),
+                )
                 self._auto_merge_if_needed(float(ts))
                 try:
                     latest = self.active_tracks.get(key, rec)
@@ -3009,6 +4129,125 @@ class StableIDManager:
             if zone:
                 rec["zone"] = zone
                 self.active_zones[int(rec["stable_id"])].add((int(sensor_id), rec["zone"]))
+
+            # Household provisional: accumulate confirm evidence and promote in place.
+            if self.household_mode and str(rec.get("identity_kind") or "") == "provisional":
+                cnt = int(self._pending_new_counts.get(key, 0)) + 1
+                self._pending_new_counts[key] = cnt
+                self._pending_new_ts[key] = float(ts)
+                if emb is not None:
+                    rec["emb"] = emb
+                    rec["last_emb_ts"] = float(ts)
+                    rec["identity_quality"] = "strong"
+                if pose_vec is not None and pose_valid:
+                    rec["pose_vec"] = pose_vec
+                    rec["last_pose_ts"] = float(ts)
+                    if rec.get("identity_quality") in (None, "", "weak_no_embedding"):
+                        rec["identity_quality"] = "pose_only"
+                if self._household_confirmed(key, emb):
+                    old_sid = int(rec.get("stable_id"))
+                    new_sid, identity_kind, diag_event = self._household_finalize_new_sid(
+                        key,
+                        emb=emb if emb is not None else rec.get("emb"),
+                        sensor_id=int(sensor_id),
+                        bbox_ltrbwh=bbox_ltrbwh,
+                        ts=float(ts),
+                        curr_brightness=curr_brightness,
+                        curr_color=curr_color,
+                        pose_vec=pose_vec if pose_valid else rec.get("pose_vec"),
+                        pose_valid=bool(pose_valid or rec.get("pose_vec") is not None),
+                        world_xy=world_xy,
+                        world_valid=bool(world_valid),
+                        pending_sid=int(old_sid),
+                    )
+                    if int(new_sid) != int(old_sid):
+                        self._remap_sid(
+                            int(old_sid),
+                            int(new_sid),
+                            kind=str(identity_kind),
+                            purge_old=True,
+                            move_gallery=False,
+                        )
+                    else:
+                        self._household_apply_identity_meta(rec, sid=int(new_sid), kind=str(identity_kind))
+                    self._household_touch_visitor(int(new_sid), float(ts))
+                    self._clear_pending_new_state(key, keep_sid=int(new_sid))
+                    emb_for_persist = emb if emb is not None else rec.get("emb")
+                    if emb_for_persist is not None:
+                        self._persist_track_embedding(
+                            int(new_sid),
+                            float(ts),
+                            emb_for_persist,
+                            rec=rec,
+                            bbox=bbox_ltrbwh,
+                            pose_quality=pose_quality,
+                        )
+                        try:
+                            newc = emb_for_persist / (np.linalg.norm(emb_for_persist) + 1e-12)
+                            self.sid_centroid[int(new_sid)] = newc.astype(np.float32)
+                        except Exception:
+                            pass
+                        self.sid_last_bbox[int(new_sid)] = bbox_ltrbwh
+                        self.sid_last_bbox_sensor[int(new_sid)] = int(sensor_id)
+                    if pose_vec is not None and pose_valid:
+                        self._update_pose_state(int(new_sid), pose_vec, float(ts))
+                    diag_payload = self._set_track_diag(
+                        key,
+                        event=str(diag_event),
+                        reject_reason=diag_reject_reason,
+                        embedding_present=emb_for_persist is not None,
+                        pose_present=(pose_valid and pose_vec is not None) or rec.get("pose_vec") is not None,
+                        sid_candidate=int(new_sid),
+                        stable_id=int(new_sid),
+                        ts=float(ts),
+                        reid_confidence=diag_reid_confidence,
+                        reid_required=diag_reid_required,
+                        overlap_permit=diag_overlap_permit,
+                        identity_kind=str(identity_kind),
+                        identity_state=identity_state_for_kind(str(identity_kind)),
+                    )
+                    self._record_id_event(str(diag_event))
+                    rec["id_diag"] = diag_payload
+                    self.active_tracks[key] = rec
+                    self._record_sid_sensor_world(
+                        int(new_sid),
+                        int(sensor_id),
+                        world_xy=world_xy,
+                        world_valid=bool(world_valid),
+                        ts=float(ts),
+                    )
+                    if self.aliases_enabled:
+                        return int(self.canonical_sid(int(new_sid)))
+                    return int(new_sid)
+                # Still provisional: refresh diag and return same SID (no gallery write).
+                diag_payload = self._set_track_diag(
+                    key,
+                    event="provisional",
+                    reject_reason=diag_reject_reason,
+                    embedding_present=rec.get("emb") is not None,
+                    pose_present=rec.get("pose_vec") is not None,
+                    sid_candidate=int(rec.get("stable_id")),
+                    stable_id=int(rec.get("stable_id")),
+                    ts=float(ts),
+                    reid_confidence=diag_reid_confidence,
+                    reid_required=diag_reid_required,
+                    overlap_permit=diag_overlap_permit,
+                    identity_kind="provisional",
+                    identity_state="provisional",
+                )
+                rec["id_diag"] = diag_payload
+                self.active_tracks[key] = rec
+                self._record_sid_sensor_world(
+                    int(rec["stable_id"]),
+                    int(sensor_id),
+                    world_xy=world_xy,
+                    world_valid=bool(world_valid),
+                    ts=float(ts),
+                )
+                if self.aliases_enabled:
+                    return int(self.canonical_sid(int(rec["stable_id"])))
+                return int(rec["stable_id"])
+
             if emb is not None:
                 # Reconcile weak/provisional IDs when fresh embeddings arrive.
                 # Besides the "no embedding yet" path, allow a short early-reconcile
@@ -3046,6 +4285,8 @@ class StableIDManager:
                             ts,
                             pose_vec=pose_vec if pose_valid else None,
                             exclude_key=key,
+                            world_xy=world_xy,
+                            world_valid=bool(world_valid),
                         )
                     except Exception:
                         candidate_sid = None
@@ -3066,28 +4307,27 @@ class StableIDManager:
                         if g_id is not None:
                             diag_sid_candidate = int(g_id)
                         if g_id is not None and float(g_reid) >= float(g_req):
-                            can_take = self._allow_active_sid_match(
+                            diag_reid_confidence = float(g_reid)
+                            diag_reid_required = float(g_req)
+                            ok, reason = self._gallery_match_ok(
+                                track_key=key,
+                                emb=emb,
+                                g_id=int(g_id),
+                                g_reid=float(g_reid),
+                                g_req=float(g_req),
                                 sensor_id=int(sensor_id),
-                                sid=int(g_id),
-                                score=float(g_reid),
-                                required=float(g_req),
                                 bbox=bbox_ltrbwh,
                                 ts=float(ts),
+                                world_xy=world_xy,
+                                world_valid=bool(world_valid),
                                 exclude_key=key,
                             )
-                            if not can_take:
-                                self._sid_guard_reject_count += 1
-                                if self._sid_claimed_same_frame(
-                                    sensor_id=int(sensor_id),
-                                    sid=int(g_id),
-                                    ts=float(ts),
-                                    exclude_key=key,
-                                ):
-                                    diag_reject_reason = "same_frame_sid_conflict"
-                                else:
-                                    diag_reject_reason = "active_guard"
-                            if can_take and (self.allow_multi_zone_active or not self.active_zones.get(g_id)):
+                            if self._other_active_sensors_for_sid(int(g_id), int(sensor_id)):
+                                diag_overlap_permit = bool(reason != "exclusivity_blocked")
+                            if ok:
                                 candidate_sid = int(g_id)
+                            else:
+                                diag_reject_reason = reason
                         elif g_id is not None:
                             diag_reject_reason = "threshold"
                     if candidate_sid is not None and self.aliases_enabled:
@@ -3128,7 +4368,14 @@ class StableIDManager:
                 rec["last_emb_ts"] = float(ts)
                 rec["identity_quality"] = "strong"
                 sid_int = int(rec["stable_id"]) 
-                self._gallery_add(sid_int, float(ts), emb)
+                self._persist_track_embedding(
+                    sid_int,
+                    float(ts),
+                    emb,
+                    rec=rec,
+                    bbox=bbox_ltrbwh,
+                    pose_quality=pose_quality,
+                )
                 if sid_int not in self.sid_global_first_seen:
                     self.sid_global_first_seen[sid_int] = float(ts)
                 # EMA centroid update
@@ -3163,6 +4410,8 @@ class StableIDManager:
                             ts,
                             pose_vec=pose_vec,
                             exclude_key=key,
+                            world_xy=world_xy,
+                            world_valid=bool(world_valid),
                         )
                     except Exception:
                         candidate_sid = None
@@ -3176,28 +4425,28 @@ class StableIDManager:
                         if g_id is not None:
                             diag_sid_candidate = int(g_id)
                         if g_id is not None and float(g_pose) >= float(g_req):
-                            can_take = self._allow_active_sid_match(
+                            diag_reid_confidence = float(g_pose)
+                            diag_reid_required = float(g_req)
+                            ok, reason = self._gallery_match_ok(
+                                track_key=key,
+                                emb=None,
+                                g_id=int(g_id),
+                                g_reid=float(g_pose),
+                                g_req=float(g_req),
                                 sensor_id=int(sensor_id),
-                                sid=int(g_id),
-                                score=float(g_pose),
-                                required=float(g_req),
                                 bbox=bbox_ltrbwh,
                                 ts=float(ts),
+                                world_xy=world_xy,
+                                world_valid=bool(world_valid),
                                 exclude_key=key,
+                                require_mnn_emb=False,
                             )
-                            if not can_take:
-                                self._sid_guard_reject_count += 1
-                                if self._sid_claimed_same_frame(
-                                    sensor_id=int(sensor_id),
-                                    sid=int(g_id),
-                                    ts=float(ts),
-                                    exclude_key=key,
-                                ):
-                                    diag_reject_reason = "same_frame_sid_conflict"
-                                else:
-                                    diag_reject_reason = "active_guard"
-                            if can_take and (self.allow_multi_zone_active or not self.active_zones.get(g_id)):
+                            if self._other_active_sensors_for_sid(int(g_id), int(sensor_id)):
+                                diag_overlap_permit = bool(reason != "exclusivity_blocked")
+                            if ok:
                                 candidate_sid = int(g_id)
+                            else:
+                                diag_reject_reason = reason
                         elif g_id is not None:
                             diag_reject_reason = "threshold"
                     if candidate_sid is not None and self.aliases_enabled:
@@ -3247,6 +4496,9 @@ class StableIDManager:
                 sid_candidate=diag_sid_candidate,
                 stable_id=int(rec.get("stable_id")),
                 ts=float(ts),
+                reid_confidence=diag_reid_confidence,
+                reid_required=diag_reid_required,
+                overlap_permit=diag_overlap_permit,
             )
             self._record_id_event(diag_event)
             rec["id_diag"] = diag_payload
@@ -3255,6 +4507,13 @@ class StableIDManager:
                 self.sid_global_last_seen[int(rec["stable_id"])] = float(ts)
             except Exception:
                 pass
+            self._record_sid_sensor_world(
+                int(rec["stable_id"]),
+                int(sensor_id),
+                world_xy=world_xy,
+                world_valid=bool(world_valid),
+                ts=float(ts),
+            )
             self._maybe_autosave_gallery(float(ts))
             if self.aliases_enabled:
                 return int(self.canonical_sid(int(rec["stable_id"])))
@@ -3327,6 +4586,9 @@ class StableIDManager:
             for key in to_remove:
                 rec = self.active_tracks.pop(key, None)
                 self._pending_id_diag.pop(key, None)
+                self._pending_new_counts.pop(key, None)
+                self._pending_new_ts.pop(key, None)
+                self._household_emb_counts.pop(key, None)
                 if rec is None:
                     continue
                 sid = int(rec["stable_id"])
@@ -3343,7 +4605,9 @@ class StableIDManager:
                 # Push to ghost list for this camera if we have appearance cues
                 emb_val = rec.get("emb", None)
                 pose_val = rec.get("pose_vec", None)
-                if emb_val is not None or pose_val is not None:
+                kind = str(rec.get("identity_kind") or "")
+                is_provisional = kind == "provisional" or self._household_is_provisional_sid(sid)
+                if (emb_val is not None or pose_val is not None) and not is_provisional:
                     ghost_sid = self.canonical_sid(sid) if self.aliases_enabled else sid
                     ghost_rec = {
                         "stable_id": ghost_sid,
@@ -3356,6 +4620,12 @@ class StableIDManager:
                         ghost_rec["pose"] = pose_val
                         ghost_rec["pose_ts"] = rec.get("last_pose_ts", float(ts))
                     self.ghosts[int(sensor_id)].append(ghost_rec)
+                elif is_provisional:
+                    still_used = any(
+                        int(r.get("stable_id", -1)) == sid for r in self.active_tracks.values()
+                    )
+                    if not still_used:
+                        self._household_release_provisional(sid)
 
     def prune_ghosts(self, now_ts: Optional[float] = None) -> None:
         with self._lock:
@@ -3395,6 +4665,28 @@ class StableIDManager:
                 self._prune_pose_gallery(t)
             except Exception:
                 pass
+            if self.household_mode and self._visitor_pool is not None:
+                try:
+                    active_sids = {int(rec.get("stable_id")) for rec in self.active_tracks.values()}
+                    ghost_sids = set()
+                    for dq in self.ghosts.values():
+                        for g in dq:
+                            try:
+                                ghost_sids.add(int(g.get("stable_id")))
+                            except Exception:
+                                pass
+                    recycled = self._visitor_pool.recycle_inactive(
+                        float(t),
+                        active_sids=active_sids,
+                        ghost_sids=ghost_sids,
+                    )
+                    if recycled:
+                        for sid in recycled:
+                            if sid not in active_sids and sid not in ghost_sids:
+                                self._purge_sid_state(int(sid))
+                        self._visitor_pool.save()
+                except Exception:
+                    pass
 
     # --------------- Telemetry ----------------
     def get_sid_metrics(self) -> Dict[str, Any]:
@@ -3467,6 +4759,31 @@ class StableIDManager:
                     "sid_fragmentation_events": int(self._sid_fragmentation_events),
                     "sid_pending_recycled_count": int(self._sid_pending_recycled_count),
                     "sid_same_frame_conflict_count": int(self._sid_same_frame_conflict_count),
+                    "false_share_blocked_count": int(self._false_share_blocked_count),
+                    "overlap_permit_grant_count": int(self._overlap_permit_grant_count),
+                    "overlap_permit_deny_count": int(self._overlap_permit_deny_count),
+                    "overlap_permit_degraded_count": int(self._overlap_permit_degraded_count),
+                    "gallery_quality_reject_count": int(self._gallery_quality_reject_count),
+                    "mnn_reject_count": int(self._mnn_reject_count),
+                    "household_mode": bool(self.household_mode),
+                    # provisional_count = currently active provisional tracks
+                    "provisional_count": int(self._count_active_provisional()) if self.household_mode else 0,
+                    # provisional_event_count = cumulative first-mint provisional events
+                    "provisional_event_count": int(self._provisional_event_count),
+                    "provisional_active_count": int(self._count_active_provisional()) if self.household_mode else 0,
+                    "resident_count": int(len(self._household_resident_ids())) if self.household_mode else 0,
+                    "visitor_count": int(
+                        sum(
+                            1
+                            for sid in self.gallery.keys()
+                            if self.visitor_id_min <= int(sid) <= self.visitor_id_max
+                        )
+                    )
+                    if self.household_mode
+                    else 0,
+                    "mint_visitor_count": int(self._mint_visitor_count),
+                    "promote_resident_count": int(self._promote_resident_count),
+                    "camera_topology_file": self._camera_topology.source_path,
                     "sid_event_counts": dict(self._id_event_counts),
                     "alias_candidate_pool_size": int(self._alias_candidate_pool_size),
                     "alias_candidate_sim_p50": self._alias_candidate_sim_p50,
@@ -3488,6 +4805,8 @@ class StableIDManager:
         *,
         pose_vec: Optional[np.ndarray] = None,
         exclude_key: Optional[Tuple[int, int]] = None,
+        world_xy: Optional[Tuple[float, float]] = None,
+        world_valid: bool = False,
     ) -> Optional[int]:
         dq = self.ghosts.get(int(sensor_id))
         if not dq:
@@ -3509,9 +4828,6 @@ class StableIDManager:
                 exclude_key=exclude_key,
             ):
                 continue
-            # Exclusivity only if multi-active not allowed
-            if not self.allow_multi_zone_active and self.active_zones.get(g_sid):
-                continue
             gx, gy, gw, gh = ghost.get("bbox", (0, 0, 0, 0))
             dist = float(((x - gx) ** 2 + (y - gy) ** 2) ** 0.5)
             if dist > 1.5 * diag:
@@ -3525,6 +4841,15 @@ class StableIDManager:
                 sim = self._cosine(emb, g_emb)
                 thr = self.cos_sim_threshold + (self.ghost_extra_margin if age >= self.ghost_strict_age_s else 0.0)
                 if sim < thr:
+                    continue
+                if not self._allow_cross_camera_sid_active(
+                    int(g_sid),
+                    int(sensor_id),
+                    world_xy=world_xy,
+                    world_valid=bool(world_valid),
+                    ts=float(ts),
+                    appearance_sim=float(sim),
+                ):
                     continue
                 score = float(sim)
                 if pose_vec is not None:
@@ -3551,6 +4876,15 @@ class StableIDManager:
                 if age >= self.ghost_strict_age_s:
                     req = float(req + self.ghost_extra_margin)
                 if pose_sim < req:
+                    continue
+                if not self._allow_cross_camera_sid_active(
+                    int(g_sid),
+                    int(sensor_id),
+                    world_xy=world_xy,
+                    world_valid=bool(world_valid),
+                    ts=float(ts),
+                    appearance_sim=float(pose_sim),
+                ):
                     continue
                 score = float(pose_sim)
                 if score > best_score:

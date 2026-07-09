@@ -5425,6 +5425,9 @@ class _AnalyticsTelemetryProcessor:
     _world_height_max_m: float = field(default=2.40, init=False, repr=False)
     _world_anchor_hold_ttl_s: float = field(default=0.40, init=False, repr=False)
     _reid_embeds_per_frame_max: int = field(default=2, init=False, repr=False)
+    _stable_id_world_cache: Dict[Tuple[int, int], Tuple[float, float, bool, float]] = field(
+        default_factory=dict, init=False, repr=False
+    )
     _pose_anchor_native_per_frame_max: int = field(default=1, init=False, repr=False)
     _pose_anchor_native_remaining: int = field(default=1, init=False, repr=False)
     _tracking_publish_interval_s: float = field(default=0.0, init=False, repr=False)
@@ -5963,6 +5966,9 @@ class _AnalyticsTelemetryProcessor:
             reid_budget_remaining = int(self._reid_embeds_per_frame_max)
             _increment_core_counter("detection_wake.frames")
             self._log_diag_session_start()
+            reid_debug = str(os.environ.get("NOESIS_REID_DEBUG", "")).strip().lower() in ("1", "true", "yes", "on")
+            if reid_debug:
+                self._reid_debug_frames += 1
 
             tracks: List[Dict[str, Any]] = []
             diagnostics_enabled = self.diagnostics_logger is not None
@@ -5974,10 +5980,10 @@ class _AnalyticsTelemetryProcessor:
             footpoints: List[Footpoint] = []
             frame_dims = self._track_image_size(sensor_id, frame_meta)
 
-            reid_debug = str(os.environ.get("NOESIS_REID_DEBUG", "")).strip().lower() in ("1", "true", "yes", "on")
-            if reid_debug:
-                self._reid_debug_frames += 1
-
+            # Service Maker object_items is a one-shot iterator of transient
+            # ObjectMetadata views. Do NOT list()/store wrappers for a second
+            # pass — prior items become dangling and class_id access segfaults.
+            # Iterate once and extract ReID embeddings inline.
             object_items = getattr(frame_meta, "object_items", None) or []
             for obj_meta in object_items:
                 _increment_core_counter("detection_wake.objects_seen")
@@ -6025,41 +6031,53 @@ class _AnalyticsTelemetryProcessor:
                     self._reid_debug_people += 1
 
                 emb = None
-                if self._stable_id_enabled:
-                    mgr = getattr(self.pipeline, "stable_id_mgr", None)
-                    if mgr is not None:
-                        need_emb = True
-                        needs_fn = getattr(mgr, "needs_embedding", None)
-                        if callable(needs_fn):
-                            try:
-                                need_emb = bool(needs_fn(int(sensor_id), int(track_id), float(now_ts)))
-                            except Exception:
-                                need_emb = True
+                mgr = getattr(self.pipeline, "stable_id_mgr", None)
+                if self._stable_id_enabled and mgr is not None:
+                    need_emb = True
+                    needs_fn = getattr(mgr, "needs_embedding", None)
+                    if callable(needs_fn):
+                        try:
+                            need_emb = bool(needs_fn(int(sensor_id), int(track_id), float(now_ts)))
+                        except Exception:
+                            need_emb = True
+                    else:
+                        try:
+                            rec = mgr.active_tracks.get((int(sensor_id), int(track_id)))
+                            need_emb = rec is None or rec.get("emb") is None
+                        except Exception:
+                            need_emb = True
+                    if need_emb:
+                        _increment_core_counter("detection_wake.reid_emb_due")
+                        if reid_budget_remaining <= 0:
+                            _increment_core_counter("detection_wake.reid_emb_budget_skipped")
                         else:
-                            try:
-                                rec = mgr.active_tracks.get((int(sensor_id), int(track_id)))
-                                need_emb = rec is None or rec.get("emb") is None
-                            except Exception:
-                                need_emb = True
-
-                        if need_emb:
-                            _increment_core_counter("detection_wake.reid_emb_due")
-                            if reid_budget_remaining <= 0:
-                                _increment_core_counter("detection_wake.reid_emb_budget_skipped")
+                            reid_budget_remaining -= 1
+                            reid_start_ns = time.perf_counter_ns()
+                            emb = self._extract_reid_embedding_ds8(obj_meta)
+                            _record_core_stage_timing("reid.extract_embedding", reid_start_ns)
+                            if emb is None:
+                                _increment_core_counter("detection_wake.reid_emb_missing")
                             else:
-                                reid_budget_remaining -= 1
-                                reid_start_ns = time.perf_counter_ns()
-                                emb = self._extract_reid_embedding_ds8(obj_meta)
-                                _record_core_stage_timing("reid.extract_embedding", reid_start_ns)
-                                if emb is None:
-                                    _increment_core_counter("detection_wake.reid_emb_missing")
-                                else:
-                                    _increment_core_counter("detection_wake.reid_emb_extracted")
-                            if reid_debug:
-                                if emb is None:
-                                    self._reid_debug_emb_missing += 1
-                                else:
-                                    self._reid_debug_emb_found += 1
+                                _increment_core_counter("detection_wake.reid_emb_extracted")
+                        if reid_debug:
+                            if emb is None:
+                                self._reid_debug_emb_missing += 1
+                            else:
+                                self._reid_debug_emb_found += 1
+
+                pose_features, pose_quality = self._extract_stable_id_pose_inputs(obj_meta, mgr)
+                # World must be available BEFORE StableID so same-frame overlap
+                # permits are not denied as missing_world on first sightings.
+                world_xy, world_valid, pose_kpts_abs, depth_result = (
+                    self._ensure_world_before_stable_id(
+                        sensor_id,
+                        camera_id,
+                        track_id,
+                        raw,
+                        obj_meta=obj_meta,
+                        frame_dims=frame_dims,
+                    )
+                )
 
                 sid_start_ns = time.perf_counter_ns()
                 stable_id = self._maybe_assign_stable_id(
@@ -6070,6 +6088,10 @@ class _AnalyticsTelemetryProcessor:
                     ts=now_ts,
                     frame_bgr=None,
                     embedding=emb,
+                    pose_features=pose_features,
+                    pose_quality=pose_quality,
+                    world_xy=world_xy,
+                    world_valid=world_valid,
                 )
                 _record_core_stage_timing("stable_id.update_track", sid_start_ns)
                 if stable_id is None:
@@ -6083,7 +6105,6 @@ class _AnalyticsTelemetryProcessor:
                 present_stable_ids.add(stable_id_int)
                 tracker_id_int = int(track_id)
                 id_diag: Dict[str, Any] = {}
-                mgr = getattr(self.pipeline, "stable_id_mgr", None)
                 get_id_diag = getattr(mgr, "get_track_diagnostics", None)
                 if callable(get_id_diag):
                     try:
@@ -6094,15 +6115,6 @@ class _AnalyticsTelemetryProcessor:
                 id_reject_reason = id_diag.get("id_reject_reason")
                 sid_candidate = id_diag.get("sid_candidate")
                 embedding_present = bool(id_diag.get("embedding_present", emb is not None))
-                pose_anchor_start_ns = time.perf_counter_ns()
-                pose_kpts_abs = self._extract_pose_keypoints_for_anchor(obj_meta, raw.get("bbox") or [])
-                _record_core_stage_timing("pose_anchor.extract_keypoints", pose_anchor_start_ns)
-                depth_extract_start_ns = time.perf_counter_ns()
-                depth_result = self._extract_object_depth_result(obj_meta)
-                _record_core_stage_timing("object_depth.extract_meta", depth_extract_start_ns)
-                pose_present = bool(id_diag.get("pose_present", False))
-                if not pose_present:
-                    pose_present = pose_kpts_abs is not None
                 id_display = None
                 if self._reid_diag_use_tracker_id:
                     id_display = f"[{tracker_id_int}] | [{stable_id_int}]"
@@ -6125,6 +6137,22 @@ class _AnalyticsTelemetryProcessor:
                 if zone:
                     occupancy_counts[zone] = occupancy_counts.get(zone, 0) + 1
 
+                # When world was already valid pre-StableID, pose/depth were skipped;
+                # extract now for public_track / OSD depth fields.
+                if pose_kpts_abs is None:
+                    pose_anchor_start_ns = time.perf_counter_ns()
+                    pose_kpts_abs = self._extract_pose_keypoints_for_anchor(
+                        obj_meta, raw.get("bbox") or []
+                    )
+                    _record_core_stage_timing("pose_anchor.extract_keypoints", pose_anchor_start_ns)
+                if depth_result is None:
+                    depth_extract_start_ns = time.perf_counter_ns()
+                    depth_result = self._extract_object_depth_result(obj_meta)
+                    _record_core_stage_timing("object_depth.extract_meta", depth_extract_start_ns)
+                pose_present = bool(id_diag.get("pose_present", False))
+                if not pose_present:
+                    pose_present = pose_kpts_abs is not None
+
                 public_track: Dict[str, Any] = {
                     "stable_id": stable_id_int,
                     "tracker_id": tracker_id_int,
@@ -6144,6 +6172,7 @@ class _AnalyticsTelemetryProcessor:
                     "pose_present": bool(pose_present),
                     "sid_candidate": sid_candidate,
                 }
+                self._apply_household_id_diag_fields(public_track, id_diag)
                 frame_w, frame_h = frame_dims
                 if frame_w > 8 and frame_h > 8:
                     public_track["image_size"] = [int(frame_w), int(frame_h)]
@@ -6165,6 +6194,7 @@ class _AnalyticsTelemetryProcessor:
                     if key in raw:
                         public_track[key] = raw.get(key)
 
+                # Idempotent when world was already filled pre-StableID.
                 self._augment_track_with_world(
                     sensor_id,
                     camera_id,
@@ -6173,6 +6203,7 @@ class _AnalyticsTelemetryProcessor:
                     pose_kpts_abs=pose_kpts_abs,
                     depth_result=depth_result,
                 )
+                self._record_stable_id_world_cache(sensor_id, track_id, public_track, now_ts)
                 self._apply_public_depth_fields(public_track, depth_result)
                 try:
                     setattr(obj_meta, "_noesis_depth_used_m", public_track.get("depth_used_m"))
@@ -6212,6 +6243,7 @@ class _AnalyticsTelemetryProcessor:
                             "sid_candidate": sid_candidate,
                         }
                     )
+                    self._apply_household_id_diag_fields(diag_track, id_diag)
                 tracks.append(public_track)
                 if diag_track is not None:
                     diagnostics_tracks.append(diag_track)
@@ -6382,6 +6414,18 @@ class _AnalyticsTelemetryProcessor:
                 if not zone:
                     zone = _fallback_zone_from_camera(camera_id)
 
+                mgr = getattr(self.pipeline, "stable_id_mgr", None)
+                pose_features, pose_quality = self._extract_stable_id_pose_inputs(obj_meta, mgr)
+                world_xy, world_valid, pose_kpts_abs, depth_result = (
+                    self._ensure_world_before_stable_id(
+                        sensor_id,
+                        camera_id,
+                        track_id,
+                        raw,
+                        obj_meta=obj_meta,
+                        frame_dims=frame_dims,
+                    )
+                )
                 stable_id = self._maybe_assign_stable_id(
                     sensor_id=sensor_id,
                     track_id=track_id,
@@ -6390,6 +6434,10 @@ class _AnalyticsTelemetryProcessor:
                     ts=now_ts,
                     frame_bgr=None,
                     embedding=None,
+                    pose_features=pose_features,
+                    pose_quality=pose_quality,
+                    world_xy=world_xy,
+                    world_valid=world_valid,
                 )
                 if stable_id is None:
                     self._stamp_osd_label(obj_meta, sensor_id=sensor_id, stable_id=None)
@@ -6457,8 +6505,12 @@ class _AnalyticsTelemetryProcessor:
                     if key in raw:
                         public_track[key] = raw.get(key)
 
-                pose_kpts_abs = self._extract_pose_keypoints_for_anchor(obj_meta, raw.get("bbox") or [])
-                depth_result = self._extract_object_depth_result(obj_meta)
+                if pose_kpts_abs is None:
+                    pose_kpts_abs = self._extract_pose_keypoints_for_anchor(
+                        obj_meta, raw.get("bbox") or []
+                    )
+                if depth_result is None:
+                    depth_result = self._extract_object_depth_result(obj_meta)
                 self._augment_track_with_world(
                     sensor_id,
                     camera_id,
@@ -6467,6 +6519,7 @@ class _AnalyticsTelemetryProcessor:
                     pose_kpts_abs=pose_kpts_abs,
                     depth_result=depth_result,
                 )
+                self._record_stable_id_world_cache(sensor_id, track_id, public_track, now_ts)
                 self._apply_public_depth_fields(public_track, depth_result)
                 try:
                     setattr(obj_meta, "_noesis_depth_used_m", public_track.get("depth_used_m"))
@@ -8198,6 +8251,190 @@ class _AnalyticsTelemetryProcessor:
             self._analytics_obj_meta_type = None
         return self._analytics_obj_meta_type
 
+    def _ensure_world_before_stable_id(
+        self,
+        sensor_id: int,
+        camera_id: str,
+        track_id: int,
+        raw: Dict[str, Any],
+        *,
+        obj_meta: Any | None = None,
+        frame_dims: Optional[Tuple[int, int]] = None,
+    ) -> Tuple[
+        Optional[Tuple[float, float]],
+        bool,
+        Optional[np.ndarray],
+        Optional[ObjectDepthResult],
+    ]:
+        """Fill world on ``raw`` before StableID so overlap permits can use it.
+
+        Reuses ``_augment_track_with_world`` (no appsink / full-frame copy).
+        Pose/depth extracts are returned for reuse on the public_track path.
+        """
+        world_xy, world_valid = self._world_xy_for_stable_id(sensor_id, track_id, raw)
+        if world_valid:
+            return world_xy, True, None, None
+
+        pose_anchor_start_ns = time.perf_counter_ns()
+        pose_kpts_abs = self._extract_pose_keypoints_for_anchor(obj_meta, raw.get("bbox") or [])
+        _record_core_stage_timing("pose_anchor.extract_keypoints", pose_anchor_start_ns)
+        depth_extract_start_ns = time.perf_counter_ns()
+        depth_result = self._extract_object_depth_result(obj_meta)
+        _record_core_stage_timing("object_depth.extract_meta", depth_extract_start_ns)
+
+        world_track: Dict[str, Any] = {
+            "tracker_id": int(track_id),
+            "track_id": int(track_id),
+            "bbox": raw.get("bbox"),
+            "center": raw.get("center"),
+            "camera_id": camera_id,
+        }
+        for key in (
+            "bbox3d",
+            "velocity3d",
+            "visibility",
+            "image_foot",
+            "image_base",
+            "world",
+            "world_valid",
+            "world_quality",
+            "world_quality_reason",
+            "world_frame",
+            "world_source",
+            "image_size",
+            "frame_size",
+        ):
+            if key in raw:
+                world_track[key] = raw.get(key)
+        if frame_dims is not None:
+            frame_w, frame_h = frame_dims
+            if frame_w > 8 and frame_h > 8 and "image_size" not in world_track:
+                world_track["image_size"] = [int(frame_w), int(frame_h)]
+
+        self._augment_track_with_world(
+            sensor_id,
+            camera_id,
+            world_track,
+            obj_meta=obj_meta,
+            pose_kpts_abs=pose_kpts_abs,
+            depth_result=depth_result,
+        )
+        for key in (
+            "image_foot",
+            "image_base",
+            "world",
+            "world_valid",
+            "world_quality",
+            "world_quality_reason",
+            "world_frame",
+            "world_source",
+        ):
+            if key in world_track:
+                raw[key] = world_track.get(key)
+
+        world_xy, world_valid = self._world_xy_for_stable_id(sensor_id, track_id, raw)
+        return world_xy, world_valid, pose_kpts_abs, depth_result
+
+    def _world_xy_for_stable_id(
+        self,
+        sensor_id: int,
+        track_id: int,
+        raw: Mapping[str, Any],
+    ) -> Tuple[Optional[Tuple[float, float]], bool]:
+        if raw.get("world_valid") is True:
+            world = raw.get("world")
+            if isinstance(world, (list, tuple)) and len(world) >= 3:
+                try:
+                    wx = float(world[0])
+                    wz = float(world[2])
+                    if math.isfinite(wx) and math.isfinite(wz):
+                        return (wx, wz), True
+                except Exception:
+                    pass
+        cached = self._stable_id_world_cache.get((int(sensor_id), int(track_id)))
+        if cached is not None:
+            try:
+                wx, wz, valid, _ts = cached
+                if bool(valid) and math.isfinite(float(wx)) and math.isfinite(float(wz)):
+                    return (float(wx), float(wz)), True
+            except Exception:
+                pass
+        return None, False
+
+    def _record_stable_id_world_cache(
+        self,
+        sensor_id: int,
+        track_id: int,
+        track: Mapping[str, Any],
+        ts: float,
+    ) -> None:
+        if track.get("world_valid") is not True:
+            return
+        world = track.get("world")
+        if not isinstance(world, (list, tuple)) or len(world) < 3:
+            return
+        try:
+            wx = float(world[0])
+            wz = float(world[2])
+            if not math.isfinite(wx) or not math.isfinite(wz):
+                return
+            self._stable_id_world_cache[(int(sensor_id), int(track_id))] = (
+                float(wx),
+                float(wz),
+                True,
+                float(ts),
+            )
+        except Exception:
+            return
+
+    def _extract_stable_id_pose_inputs(
+        self,
+        obj_meta: Any,
+        mgr: Any,
+    ) -> Tuple[Optional[Dict[str, float]], Optional[Dict[str, float]]]:
+        if mgr is None or not bool(getattr(mgr, "pose_enabled", False)):
+            return None, None
+        payload = self._extract_pose_payload(obj_meta)
+        if payload is None:
+            return None, None
+        raw_features = payload.get("features")
+        if not isinstance(raw_features, Mapping) or not raw_features:
+            return None, None
+        pose_features: Dict[str, float] = {}
+        for key, value in raw_features.items():
+            try:
+                pose_features[str(key)] = float(value)
+            except Exception:
+                continue
+        if not pose_features:
+            return None, None
+        pose_quality: Dict[str, float] = {}
+        for key in ("kpt_mean_conf", "kpt_min_conf", "kpt_valid_frac"):
+            if key not in payload:
+                continue
+            try:
+                pose_quality[key] = float(payload[key])
+            except Exception:
+                continue
+        return pose_features, (pose_quality or None)
+
+    def _apply_household_id_diag_fields(
+        self,
+        target: Dict[str, Any],
+        id_diag: Mapping[str, Any],
+    ) -> None:
+        for key in (
+            "reid_confidence",
+            "reid_required",
+            "overlap_permit",
+            "identity_state",
+            "identity_kind",
+            "resident_uuid",
+            "display_name",
+        ):
+            if key in id_diag and id_diag.get(key) is not None:
+                target[key] = id_diag.get(key)
+
     def _maybe_assign_stable_id(
         self,
         *,
@@ -8208,6 +8445,10 @@ class _AnalyticsTelemetryProcessor:
         ts: float,
         frame_bgr: Optional[np.ndarray],
         embedding: Optional[np.ndarray] = None,
+        pose_features: Optional[Dict[str, float]] = None,
+        pose_quality: Optional[Dict[str, float]] = None,
+        world_xy: Optional[Tuple[float, float]] = None,
+        world_valid: bool = False,
     ) -> Optional[int]:
         """Return a positive stable_id for a tracked person from StableIDManager."""
         if track_id < 0:
@@ -8237,13 +8478,18 @@ class _AnalyticsTelemetryProcessor:
                     zone=str(zone) if zone else None,
                     frame_bgr=frame_bgr,
                     embedding=embedding,
+                    pose_features=pose_features,
+                    pose_quality=pose_quality,
+                    world_xy=world_xy,
+                    world_valid=bool(world_valid),
                 )
                 stable_id_int = int(stable_id)
                 if stable_id_int > 0:
                     return stable_id_int
             except Exception:
+                # Do not permanently disable StableID on a single-frame failure;
+                # that blanks tracking/BEV for the rest of the session.
                 logger.exception("StableIDManager update failed for sensor %s track %s", sensor_id, track_id)
-                self._stable_id_enabled = False
 
         return None
 
@@ -8306,8 +8552,8 @@ class _AnalyticsTelemetryProcessor:
                 mgr.remove_missing_tracks(sensor_id_int, list(present_set), now_ts)
                 mgr.prune_ghosts(now_ts)
             except Exception:
+                # Do not permanently disable StableID on maintenance failure.
                 logger.exception("StableIDManager maintenance failed for sensor %s", sensor_id_int)
-                self._stable_id_enabled = False
 
     def _update_dwell_time(
         self,

@@ -1,5 +1,6 @@
-import React, { useEffect, useMemo, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { CameraKey, cameraLabel } from '../lib/camera';
+import { containRect, resolveMosaicTileCrop, type MosaicLayoutLike } from '../lib/mosaic';
 
 export type StreamMode = 'jpeg' | 'webrtc';
 
@@ -13,6 +14,10 @@ export const StreamPanel: React.FC<{
   // Expand and Lock are controlled by parent
   isExpanded?: boolean;
   onToggleExpand?: (camera: CameraKey) => void;
+  tileCameras?: CameraKey[];
+  expandedTileCamera?: CameraKey | null;
+  onToggleTileExpand?: (camera: CameraKey) => void;
+  mosaicLayout?: MosaicLayoutLike | null;
   // Stream mode: 'jpeg' uses blob/img, 'webrtc' uses videoRef
   streamMode?: StreamMode;
   // Video ref for WebRTC mode (from useWebRTCClient)
@@ -26,6 +31,10 @@ export const StreamPanel: React.FC<{
   vacancyText,
   isExpanded = false,
   onToggleExpand,
+  tileCameras = [],
+  expandedTileCamera = null,
+  onToggleTileExpand,
+  mosaicLayout,
   streamMode = 'jpeg',
   videoRef: externalVideoRef,
 }) => {
@@ -35,9 +44,31 @@ export const StreamPanel: React.FC<{
     const internalVideoRef = useRef<HTMLVideoElement>(null);
     const viewRef = useRef<HTMLDivElement>(null);
     const sparkRef = useRef<HTMLCanvasElement>(null);
+    const [viewMetrics, setViewMetrics] = useState({ viewW: 0, viewH: 0, videoW: 0, videoH: 0 });
 
     // Use external video ref if provided, otherwise use internal
     const videoRef = externalVideoRef || internalVideoRef;
+
+    const updateViewMetrics = useCallback(() => {
+      const view = viewRef.current;
+      if (!view) return;
+      const rect = view.getBoundingClientRect();
+      const v = videoRef.current;
+      const next = {
+        viewW: Math.max(0, Math.round(rect.width)),
+        viewH: Math.max(0, Math.round(rect.height)),
+        videoW: Math.max(0, Math.round(v?.videoWidth || 0)),
+        videoH: Math.max(0, Math.round(v?.videoHeight || 0)),
+      };
+      setViewMetrics((prev) => (
+        prev.viewW === next.viewW &&
+        prev.viewH === next.viewH &&
+        prev.videoW === next.videoW &&
+        prev.videoH === next.videoH
+          ? prev
+          : next
+      ));
+    }, [videoRef]);
 
     useEffect(() => {
       if (streamMode !== 'jpeg' || !blob) return;
@@ -77,14 +108,61 @@ export const StreamPanel: React.FC<{
       };
       v.addEventListener('loadedmetadata', update);
       v.addEventListener('resize', update);
+      v.addEventListener('loadeddata', updateViewMetrics);
+      v.addEventListener('loadedmetadata', updateViewMetrics);
+      v.addEventListener('resize', updateViewMetrics);
       update();
+      updateViewMetrics();
       return () => {
         v.removeEventListener('loadedmetadata', update);
         v.removeEventListener('resize', update);
+        v.removeEventListener('loadeddata', updateViewMetrics);
+        v.removeEventListener('loadedmetadata', updateViewMetrics);
+        v.removeEventListener('resize', updateViewMetrics);
       };
-    }, [streamMode, videoRef]);
+    }, [streamMode, updateViewMetrics, videoRef]);
+
+    useEffect(() => {
+      const view = viewRef.current;
+      if (!view) return;
+      updateViewMetrics();
+      const resizeObserver = typeof ResizeObserver !== 'undefined'
+        ? new ResizeObserver(updateViewMetrics)
+        : null;
+      resizeObserver?.observe(view);
+      window.addEventListener('resize', updateViewMetrics);
+      return () => {
+        resizeObserver?.disconnect();
+        window.removeEventListener('resize', updateViewMetrics);
+      };
+    }, [updateViewMetrics]);
 
     const label = useMemo(() => title ?? cameraLabel(camera), [camera, title]);
+
+    const tileButtons = useMemo(() => {
+      if (streamMode !== 'webrtc' || !mosaicLayout || !tileCameras.length) return [];
+      const { viewW, viewH, videoW, videoH } = viewMetrics;
+      if (viewW <= 0 || viewH <= 0 || videoW <= 0 || videoH <= 0) return [];
+      const mediaRect = containRect(viewW, viewH, videoW, videoH);
+      const size = 34;
+      return tileCameras.flatMap((cam) => {
+        const crop = resolveMosaicTileCrop(mosaicLayout, cam, videoW, videoH);
+        if (!crop) return [];
+        const right = mediaRect.x + ((crop.sx + crop.sw) / videoW) * mediaRect.w;
+        const top = mediaRect.y + (crop.sy / videoH) * mediaRect.h;
+        const minLeft = mediaRect.x + 8;
+        const maxLeft = mediaRect.x + mediaRect.w - size - 8;
+        const minTop = mediaRect.y + 8;
+        const maxTop = mediaRect.y + mediaRect.h - size - 8;
+        return [{
+          camera: cam,
+          label: cameraLabel(cam),
+          left: Math.min(maxLeft, Math.max(minLeft, right - size - 10)),
+          top: Math.min(maxTop, Math.max(minTop, top + 10)),
+          size,
+        }];
+      });
+    }, [mosaicLayout, streamMode, tileCameras, viewMetrics]);
 
     // Draw FPS sparkline in dedicated bar below the video
     useEffect(() => {
@@ -116,7 +194,7 @@ export const StreamPanel: React.FC<{
     return (
       <div className="panel stream-card">
         <div className="stream-head">
-          <div className="chip" title={camera}>{label}</div>
+          <div className="chip" title={title ?? camera}>{label}</div>
           <div className="chip mono" style={{ color: '#9db1c8' }}>{fpsText ?? 'FPS: 0.0'}</div>
           {vacancyText ? (
             <div
@@ -132,13 +210,17 @@ export const StreamPanel: React.FC<{
             {streamMode === 'webrtc' && (
               <span className="chip" style={{ color: '#4caf50', fontSize: '0.7em' }}>WebRTC</span>
             )}
-            <button
-              className="btn ghost"
-              onClick={() => onToggleExpand?.(camera)}
-              title="Toggle expand"
-            >
-              {isExpanded ? 'Collapse' : 'Expand'}
-            </button>
+            {onToggleExpand ? (
+              <button
+                type="button"
+                className={`icon-btn mosaic-fullscreen-toggle${isExpanded ? ' is-active' : ''}`}
+                onClick={() => onToggleExpand(camera)}
+                title={isExpanded ? 'Exit mosaic fullscreen' : 'Fullscreen mosaic'}
+                aria-label={isExpanded ? 'Exit mosaic fullscreen' : 'Fullscreen mosaic'}
+              >
+                <span className="fullscreen-corners" aria-hidden="true" />
+              </button>
+            ) : null}
           </div>
         </div>
         <div
@@ -155,6 +237,23 @@ export const StreamPanel: React.FC<{
               playsInline
               muted
             />
+          )}
+          {tileButtons.length > 0 && (
+            <div className="mosaic-tile-actions" aria-hidden={false}>
+              {tileButtons.map((button) => (
+                <button
+                  key={`tile-expand-${button.camera}`}
+                  type="button"
+                  className={`mosaic-tile-expand${expandedTileCamera === button.camera ? ' is-active' : ''}`}
+                  style={{ left: button.left, top: button.top, width: button.size, height: button.size }}
+                  onClick={() => onToggleTileExpand?.(button.camera)}
+                  title={`Fullscreen ${button.label}`}
+                  aria-label={`Fullscreen ${button.label}`}
+                >
+                  <span className="fullscreen-corners" aria-hidden="true" />
+                </button>
+              ))}
+            </div>
           )}
         </div>
         <div className="sparkbar"><canvas ref={sparkRef} /></div>

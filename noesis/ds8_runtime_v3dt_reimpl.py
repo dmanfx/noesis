@@ -1427,10 +1427,21 @@ def _build_stable_id_manager(logger: logging.Logger, *, pipeline_config: Optiona
         max_ghost_age_s = _as_float(_env_or_cfg("NOESIS_REID_MAX_GHOST_AGE_S", "max_ghost_age_s", default=60.0), 60.0)
         gallery_size = _as_int(_env_or_cfg("NOESIS_REID_GALLERY_SIZE", "gallery_size", default=20), 20)
         cos_sim_threshold = _as_float(_env_or_cfg("NOESIS_REID_COS_SIM_THRESHOLD", "cos_sim_threshold", default=0.62), 0.62)
+        cos_sim_high_env_set = os.environ.get("NOESIS_REID_COS_SIM_HIGH_THRESHOLD") is not None
         cos_sim_high_threshold = _as_float(
             _env_or_cfg("NOESIS_REID_COS_SIM_HIGH_THRESHOLD", "cos_sim_high_threshold", default=0.72),
             0.72,
         )
+        household_identity_enabled = False
+        try:
+            from reid.household_state import (  # type: ignore
+                is_household_identity_enabled,
+                prepare_household_stable_id_overrides,
+            )
+
+            household_identity_enabled = is_household_identity_enabled()
+        except Exception as exc:
+            logger.warning("Household identity helpers unavailable: %s", exc)
         max_active_ids_per_sensor = _as_int(
             _env_or_cfg("NOESIS_REID_MAX_ACTIVE_IDS_PER_SENSOR", "max_active_ids_per_sensor", default=6),
             6,
@@ -1550,6 +1561,25 @@ def _build_stable_id_manager(logger: logging.Logger, *, pipeline_config: Optiona
             gpu_min_gallery = int(os.environ.get("NOESIS_STABLEID_GPU_MIN_GALLERY", "32") or 32)
         except Exception:
             gpu_min_gallery = 32
+        household_overrides: Dict[str, Any] = {}
+        gallery_persist_file: Optional[str] = None
+        if household_identity_enabled:
+            household_overrides = prepare_household_stable_id_overrides(
+                logger,
+                repo_root=REPO_ROOT,
+                cos_sim_high_threshold=cos_sim_high_threshold,
+                cos_sim_high_env_set=cos_sim_high_env_set,
+            )
+            allow_multi_zone_active = bool(household_overrides.pop("allow_multi_zone_active", False))
+            cos_sim_high_threshold = float(
+                household_overrides.pop("cos_sim_high_threshold", cos_sim_high_threshold)
+            )
+            auto_merge_enabled = bool(household_overrides.pop("auto_merge_enabled", False))
+            alias_file = str(household_overrides.pop("alias_file", alias_file))
+            sid_pool_file = str(household_overrides.pop("sid_pool_file", sid_pool_file))
+            gallery_persist_file = household_overrides.pop("gallery_persist_file", None)
+            if "NOESIS_REID_POSE_ENABLED" not in os.environ and str(pose_flag).strip() == "":
+                pose_enabled = True
         extra_kwargs = {
             "max_ghost_age_s": max_ghost_age_s,
             "gallery_size": gallery_size,
@@ -1587,6 +1617,10 @@ def _build_stable_id_manager(logger: logging.Logger, *, pipeline_config: Optiona
             "gpu_device": gpu_device,
             "gpu_min_gallery": gpu_min_gallery,
         }
+        if gallery_persist_file:
+            extra_kwargs["gallery_persist_file"] = gallery_persist_file
+        if household_identity_enabled:
+            extra_kwargs.update(household_overrides)
         try:
             sig = inspect.signature(StableIDManager.__init__)
             valid_params = set(sig.parameters)
@@ -1620,7 +1654,8 @@ def _build_stable_id_manager(logger: logging.Logger, *, pipeline_config: Optiona
             **extra_kwargs,
         )
         logger.info(
-            "Stable ID manager initialised (SGIE embeddings; allow_multi_zone_active=%s, embed_interval_s=%.3f, new_id_hysteresis_frames=%d, new_id_confirm_frames_at_cap=%d, max_total_ids=%d, aliases=%s, alias_file=%s, sid_pool_file=%s, pose_enabled=%s)",
+            "Stable ID manager initialised (SGIE embeddings; household_mode=%s, allow_multi_zone_active=%s, embed_interval_s=%.3f, new_id_hysteresis_frames=%d, new_id_confirm_frames_at_cap=%d, max_total_ids=%d, aliases=%s, alias_file=%s, sid_pool_file=%s, pose_enabled=%s)",
+            household_identity_enabled,
             allow_multi_zone_active,
             embed_interval_s,
             new_id_hysteresis_frames,

@@ -314,6 +314,46 @@ Notes:
 - Zone-state dwell timers are not remapped on alias; dwell timing effectively
   resets when an ID canonicalizes.
 
+## 3.1 Household Identity REST (planned)
+
+**Module:** `noesis/server/reid_api.py` (extensions; Phase 1–3)
+
+Household mode keeps the alias endpoints above but defaults suggest-only merge
+behavior. Resident list/enroll endpoints are available when household mode is on
+(`NOESIS_HOUSEHOLD_IDENTITY=1`):
+
+Environment:
+- `NOESIS_HOUSEHOLD_IDENTITY=1` enables household identity runtime behavior.
+- `NOESIS_HOUSEHOLD_ARCHIVE_STATE=1` (default when household on) archives legacy
+  `~/.noesis/reid_gallery.npz`, `reid_aliases.json`, and `sid_pool.json` into
+  `~/.noesis/household/backups/<UTC>/` on first cutover.
+- `NOESIS_CAMERA_TOPOLOGY_FILE` (default `config/camera_topology.yaml` via repo root).
+
+### Resident endpoints (Phase 1 stub)
+
+- **GET** `/api/v1/reid/residents`
+  - Returns enrolled household residents (UUID, display name, gallery stats).
+  - Requires household mode; returns 400 otherwise.
+- **POST** `/api/v1/reid/residents/enroll`
+  - Body: `{ "display_name": string, "stable_id"?: int, "visitor_id"?: int }`
+  - Binds a visitor or stable ID into the resident enrollment table (sticky ID 1..N).
+  - Copies gallery embeddings when `visitor_id` is supplied.
+
+### Planned endpoints
+- **PATCH** `/api/v1/reid/residents/{uuid}`
+  - Update `display_name`, trigger gallery refresh.
+- **DELETE** `/api/v1/reid/residents/{uuid}`
+  - Soft-delete / archive resident enrollment.
+- **GET** `/api/v1/reid/identity_health`
+  - Mint rate, false-share counters, gallery sizes, overlap permit stats.
+
+Persistence (household mode):
+- `~/.noesis/household/residents.json`
+- `~/.noesis/household/resident_gallery.npz`
+- `~/.noesis/household/visitor_gallery.npz`
+- `~/.noesis/household/sid_pool.json`
+- `~/.noesis/household/backups/` (archived pre-cutover state)
+
 ## 4. Virtual Twin API
 
 Read-only APIs expose Noesis-owned offline virtual-twin revisions built under

@@ -155,6 +155,7 @@ testpipelines/**/viewer/dist/
 
 # Track Noesis/Menon validation planning docs and focused tests.
 !plans/noesis_menon_validation/*.md
+!plans/household_identity/*.md
 !tests/
 tests/*
 !tests/test_validation_toolbox.py
@@ -162,3 +163,12 @@ tests/*
 !tests/test_virtual_twin_geometry.py
 !tests/test_virtual_twin_builder.py
 !tests/test_person_ground_state.py
+!tests/test_household_state_archive.py
+!tests/test_object_items_oneshot_regression.py
+!tests/test_stable_id_assignment.py
+!tests/test_stable_id_exclusivity.py
+!tests/test_stable_id_gallery_quality.py
+!tests/test_stable_id_overlap_permit.py
+!tests/test_stable_id_provisional.py
+!tests/test_stable_id_resident_visitor.py
+!tests/test_world_before_stable_id_ordering.py

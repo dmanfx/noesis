@@ -235,8 +235,19 @@ Empty frames are first-class: when a camera's active person count is zero, Noesi
       "projection_confidence": <float|null>,
       "temporal_confidence": <float|null>,
       "reid_confidence": <float|null>,
+      "reid_required": <float|null>,
       "reid_identity": "<string|null>",
       "appearance_id": "<string|null>",
+      "identity_state": "provisional"|"visitor"|"resident"|"handoff"|null,
+      "identity_kind": "resident"|"visitor"|"provisional"|null,
+      "overlap_permit": <bool|null>,
+      "resident_uuid": "<string|null>",
+      "display_name": "<string|null>",
+      "id_event": "<string|null>",
+      "id_reject_reason": "<string|null>",
+      "embedding_present": <bool|null>,
+      "pose_present": <bool|null>,
+      "sid_candidate": <int|null>,
       "occluded": <bool|null>,
       "occlusion_uncertainty_m": <float|null>,
       "depth_status": "<string|null>",
@@ -296,10 +307,23 @@ When pose anchoring, gravity-drop, and recent-anchor hold all fail, DS8 leaves `
 Validation diagnostics:
 
 - `projection_confidence`, `temporal_confidence`, `reid_confidence`,
-  `reid_identity`, `appearance_id`, `occluded`, and
+  `reid_required`, `reid_identity`, `appearance_id`, `identity_state`,
+  `identity_kind`, `overlap_permit`, `resident_uuid`, `display_name`,
+  `id_event`, `id_reject_reason`, `embedding_present`, `pose_present`,
+  `sid_candidate`, `occluded`, and
   `occlusion_uncertainty_m` are optional diagnostics for validation and UI
   explanation. Producers may omit them when that evidence is unavailable, but
   consumers must not reinterpret missing values as a pass.
+- Household identity fields (additive, backward compatible):
+  - `identity_state`: lifecycle state (`provisional`, `visitor`, `resident`, `handoff`).
+  - `identity_kind`: public kind exposed on the wire (`resident`, `visitor`, `provisional`).
+  - `reid_confidence`: best match score used for the current assignment decision.
+  - `reid_required`: threshold applied for that decision (when known).
+  - `overlap_permit`: `true` when topology grants dual-camera activity for the same SID.
+  - `resident_uuid` / `display_name`: enrollment metadata (Phase 3; may be null in Phase 0).
+  - `id_event` / `id_reject_reason`: assignment lifecycle and reject diagnostics.
+  - `embedding_present` / `pose_present`: whether ReID/pose evidence was available on the frame.
+  - `sid_candidate`: provisional candidate SID before confirmation (when applicable).
 - The Noesis/Menon validation toolbox consumes these fields when present for
   `TRACK.projection_confidence`, `TRACK.occlusion_bridge`,
   `TRACK.identity_continuity`, `TRACK.reid_geometry_consistency`, and

@@ -1,0 +1,23 @@
+# Camera topology for household identity overlap permits.
+# source_id values match config/v3dt/reimpl/cameras.yaml and typical infer.yaml order:
+#   0 = living-room, 1 = kitchen, 2 = family-room
+# Verify against the active sources list before production use.
+version: 1
+
+cameras:
+  living-room:
+    source_id: 0
+  kitchen:
+    source_id: 1
+  family-room:
+    source_id: 2
+
+overlaps:
+  - cameras: [kitchen, family-room]
+    max_world_dist_m: 1.25
+    max_time_delta_s: 0.35
+    require_appearance_sim: 0.60
+    enabled: true
+
+# When world points are missing, do not grant overlap permits unless explicitly enabled.
+overlap_allow_appearance_only: false

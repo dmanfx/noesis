@@ -58,7 +58,9 @@ Notes:
 
 ## Tracking Payload (type: `tracking`)
 
-Emitted once per frame per source. Only **people** tracks (class_id=0) are published; raw tracker IDs remain internal.
+Emitted per source on the tracking publish gate (typically every frame, rate-limited by `NOESIS_TRACKING_PUBLISH_MAX_HZ` / `NOESIS_WS_TRACKING_MAX_HZ`). Only **people** tracks (class_id=0) are published; raw tracker IDs remain internal.
+
+**Empty frames are first-class:** when a camera has zero people, Noesis still publishes `tracks: []` (count transitions to zero always force a publish). Downstream clients such as Menon use empty lists to clear presence immediately instead of waiting on local TTLs.
 
 ```json
 {

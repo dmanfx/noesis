@@ -33,6 +33,7 @@ class LaunchSpec:
     preset_id: Optional[str] = None
     launch_id: str = field(default_factory=_launch_id)
     env: Dict[str, str] = field(default_factory=dict)
+    source_overrides: List[Dict[str, Any]] = field(default_factory=list)
     materialized_pipeline: Optional[str] = None
 
     @property
@@ -130,6 +131,17 @@ class LaunchSpec:
             values["env"] = parse_env_lines(env)
         else:
             values["env"] = {str(key): str(value) for key, value in dict(env).items()}
+        raw_sources = values.get("source_overrides")
+        if raw_sources is None:
+            values["source_overrides"] = []
+        elif isinstance(raw_sources, list):
+            values["source_overrides"] = [
+                dict(item)
+                for item in raw_sources
+                if isinstance(item, Mapping)
+            ]
+        else:
+            values["source_overrides"] = []
         return cls(**values)
 
 

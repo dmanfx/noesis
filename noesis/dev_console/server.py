@@ -29,6 +29,7 @@ from noesis.dev_console.presets import Preset, get_preset, list_presets
 from noesis.dev_console.profiles import delete_profile, list_profiles, load_profile, save_profile
 from noesis.dev_console.remediation import build_remediation
 from noesis.dev_console.runtime_proxy import depth_refresh, runtime_health
+from noesis.dev_console.source_catalog import browse_mp4_media, build_source_catalog
 from noesis.dev_console.source_probe import build_source_readiness
 from noesis.dev_console.supervisor import RuntimeSupervisor
 from noesis.dev_console.support_bundle import list_support_bundles, read_support_bundle, write_support_bundle
@@ -83,6 +84,7 @@ def _activity_spec(spec: LaunchSpec) -> Dict[str, Any]:
         "strict_baseline": spec.strict_baseline,
         "ports": {"ws": spec.ws_port, "rest": spec.rest_port, "rtsp": spec.rtsp_port},
         "env_count": len(spec.env or {}),
+        "source_override_count": len(spec.source_overrides or []),
     }
 
 
@@ -393,6 +395,22 @@ def create_app(supervisor: Optional[RuntimeSupervisor] = None) -> FastAPI:
             )
         return source_payload
 
+    @app.post("/api/sources/catalog")
+    def source_catalog(payload: Dict[str, Any]) -> Dict[str, Any]:
+        spec = _spec_from_payload(payload)
+        return build_source_catalog(spec)
+
+    @app.post("/api/sources/media")
+    def source_media(payload: Dict[str, Any]) -> Dict[str, Any]:
+        try:
+            return browse_mp4_media(
+                root_id=str(payload.get("root_id") or ""),
+                relative_path=str(payload.get("relative_path") or ""),
+                max_entries=int(payload.get("max_entries", 240) or 240),
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
     @app.post("/api/launch/decision")
     def launch_decision(payload: Dict[str, Any]) -> Dict[str, Any]:
         spec = _spec_from_payload(payload)
@@ -404,6 +422,7 @@ def create_app(supervisor: Optional[RuntimeSupervisor] = None) -> FastAPI:
             managed_pid=managed_pid,
             probe_network=bool(payload.get("probe_network", True)),
             timeout_s=float(payload.get("timeout_s", 0.35)),
+            ignore_managed_runtime_ports=bool(runtime_status.get("running") and managed_pid is not None),
         )
         if payload.get("record_activity"):
             _record_activity(
@@ -458,6 +477,7 @@ def create_app(supervisor: Optional[RuntimeSupervisor] = None) -> FastAPI:
             managed_pid=managed_pid,
             probe_network=bool(payload.get("probe_network", True)),
             timeout_s=float(payload.get("timeout_s", 0.35)),
+            ignore_managed_runtime_ports=bool(managed_pid is not None),
         )
         if not decision.get("start_allowed"):
             validation = decision.get("validation") if isinstance(decision.get("validation"), Mapping) else None
@@ -520,6 +540,7 @@ def create_app(supervisor: Optional[RuntimeSupervisor] = None) -> FastAPI:
             managed_pid=managed_pid,
             probe_network=bool(payload.get("probe_network", True)),
             timeout_s=float(payload.get("timeout_s", 0.35)),
+            ignore_managed_runtime_ports=bool(managed_pid is not None),
         )
         if not decision.get("start_allowed"):
             validation = decision.get("validation") if isinstance(decision.get("validation"), Mapping) else None
@@ -618,6 +639,7 @@ def create_app(supervisor: Optional[RuntimeSupervisor] = None) -> FastAPI:
             rtsp_port=spec.rtsp_port,
             depth_enable_seconds=spec.depth_enable_seconds,
             env=spec.env,
+            source_overrides=spec.source_overrides,
         )
 
     @app.post("/api/config/model-patch")

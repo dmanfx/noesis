@@ -375,6 +375,47 @@
                 Probe RTSP TCP
               </label>
             </div>
+            <div class="source-studio">
+              <div class="source-studio-head">
+                <div>
+                  <h3>Source Set</h3>
+                  <span id="sourceSetSummary">Using pipeline config</span>
+                </div>
+                <button class="button subtle" id="sourceResetButton" type="button">Reset</button>
+              </div>
+              <div id="sourceSelectionList" class="source-selection-list"></div>
+              <div class="source-form">
+                <label>
+                  Type
+                  <select id="sourceKindInput">
+                    <option value="rtsp">RTSP</option>
+                    <option value="mp4">MP4</option>
+                    <option value="file">File URI</option>
+                    <option value="uri">URI</option>
+                  </select>
+                </label>
+                <label>
+                  Label
+                  <input id="sourceLabelInput" type="text" placeholder="living-room clip" />
+                </label>
+                <label class="source-uri-field">
+                  URI or path
+                  <input id="sourceUriInput" type="text" placeholder="rtsp://... or file:///..." />
+                </label>
+                <div class="source-form-actions">
+                  <button class="button" id="sourceAddButton" type="button">Add</button>
+                  <button class="button subtle" id="sourceBrowseButton" type="button">Browse MP4</button>
+                </div>
+              </div>
+              <div id="mediaBrowser" class="media-browser hidden">
+                <div class="media-browser-head">
+                  <select id="mediaRootSelect"></select>
+                  <button class="button subtle" id="mediaUpButton" type="button">Up</button>
+                  <span id="mediaPathLabel"></span>
+                </div>
+                <div id="mediaBrowserList" class="media-browser-list"></div>
+              </div>
+            </div>
             <div id="sourceAlignment" class="source-alignment"></div>
             <div id="sourceGrid" class="source-grid"></div>
           </section>

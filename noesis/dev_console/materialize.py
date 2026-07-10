@@ -20,6 +20,17 @@ from noesis.dev_console.launch_spec import LaunchSpec
 LOGGER = logging.getLogger(__name__)
 
 
+SOURCE_UI_KEYS = {
+    "camera_id",
+    "enabled",
+    "id",
+    "kind",
+    "label",
+    "selected",
+    "source_id",
+    "uri_display",
+}
+
 PROFILE_DEFAULT_SIZE = {
     "yolo11": "m",
     "yolo11_seg": "m",
@@ -152,6 +163,53 @@ def _apply_tracking_overlay(cfg: Dict[str, Any], tracking_mode: str) -> Dict[str
     )
 
 
+def _source_enabled(raw: Mapping[str, Any]) -> bool:
+    value = raw.get("enabled", True)
+    if isinstance(value, str):
+        return value.strip().lower() not in {"0", "false", "no", "off"}
+    return bool(value)
+
+
+def _runtime_source(raw: Mapping[str, Any]) -> Dict[str, Any]:
+    nested = raw.get("source")
+    source = deepcopy(nested) if isinstance(nested, Mapping) else deepcopy(raw)
+    for key in SOURCE_UI_KEYS:
+        source.pop(key, None)
+    source.pop("source", None)
+    uri = str(raw.get("uri") or source.get("uri") or "").strip()
+    if uri:
+        source["uri"] = uri
+    source.setdefault("element", "nvurisrcbin")
+    source.setdefault("gpu-id", 0)
+    source.setdefault("cudadec-memtype", 0)
+    source.setdefault("disable-audio", True)
+    if str(source.get("uri", "")).lower().startswith("rtsp://"):
+        source.setdefault("latency", 100)
+        source.setdefault("select-rtp-protocol", 4)
+    return source
+
+
+def _apply_source_overrides(cfg: Dict[str, Any], spec: LaunchSpec) -> Dict[str, Any]:
+    if not spec.source_overrides:
+        return cfg
+
+    selected = [
+        _runtime_source(raw)
+        for raw in spec.source_overrides
+        if isinstance(raw, Mapping) and _source_enabled(raw)
+    ]
+    effective = deepcopy(cfg)
+    effective["sources"] = selected
+
+    if selected:
+        source_count = len(selected)
+        effective["batch_size"] = source_count
+        streammux = effective.setdefault("streammux", {})
+        if isinstance(streammux, dict):
+            streammux["batch-size"] = source_count
+    return effective
+
+
 def _canonical_path(base_yaml_path: Path, raw: Any) -> str:
     if raw in (None, ""):
         return str(raw or "")
@@ -214,6 +272,7 @@ def build_effective_config(spec: LaunchSpec) -> Dict[str, Any]:
         raise ValueError(f"pipeline YAML must be a mapping: {base_path}")
     effective = deep_merge(base_cfg, profile_overlay(spec.pgie_profile, spec.size))
     effective = _apply_tracking_overlay(effective, spec.tracking_mode)
+    effective = _apply_source_overrides(effective, spec)
     effective = deep_merge(effective, {"mosaic_output": {"rtsp_port": int(spec.rtsp_port)}})
 
     pgie = ((effective.get("models") or {}).get("pgie") or {}) if isinstance(effective.get("models"), dict) else {}

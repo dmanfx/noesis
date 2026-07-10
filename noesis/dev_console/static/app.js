@@ -12,6 +12,9 @@ const state = {
   activity: [],
   modelMatrix: null,
   sources: null,
+  sourceCatalog: null,
+  sourceOverrides: [],
+  mediaBrowser: null,
   bundle: null,
   bundleLibrary: null,
   bundleDetail: null,
@@ -780,7 +783,7 @@ async function runActionBoardAction(action) {
 }
 
 function specFromForm() {
-  return {
+  const spec = {
     preset_id: $("presetSelect").value,
     pipeline_config: $("pipelineInput").value.trim() || "config/infer.yaml",
     cameras_config: $("camerasInput").value.trim() || "config/cameras.yaml",
@@ -798,6 +801,9 @@ function specFromForm() {
     strict_baseline: $("strictInput").checked,
     env_lines: $("envInput").value,
   };
+  const sourceOverrides = sourceOverridesForSpec();
+  if (sourceOverrides.length) spec.source_overrides = sourceOverrides;
+  return spec;
 }
 
 function envLinesFromObject(env) {
@@ -858,6 +864,13 @@ function applyLaunchSpecToFormFields(spec, { coreOnly = false } = {}) {
       changed = true;
     }
   }
+  const nextSources = Array.isArray(spec.source_overrides)
+    ? spec.source_overrides.map((row, index) => normalizeSourceOverride(row, index))
+    : [];
+  if (JSON.stringify(state.sourceOverrides) !== JSON.stringify(nextSources)) {
+    state.sourceOverrides = nextSources;
+    changed = true;
+  }
   return changed;
 }
 
@@ -905,6 +918,7 @@ async function applySpecToForm(spec) {
 function applyPreset(presetId) {
   state.launchDetached = true;
   state.runtimeMirroredKey = null;
+  state.sourceOverrides = [];
   const preset = state.presets.find((item) => item.id === presetId);
   if (!preset) return;
   $("pipelineInput").value = preset.pipeline_config || "config/infer.yaml";
@@ -2167,8 +2181,271 @@ function renderModelMatrix(payload) {
   }
 }
 
+function clonePlain(value) {
+  try {
+    return JSON.parse(JSON.stringify(value || {}));
+  } catch (_err) {
+    return {};
+  }
+}
+
+function sourceKindFromUri(uri) {
+  const value = String(uri || "").trim().toLowerCase();
+  if (value.startsWith("rtsp://")) return "rtsp";
+  if (value.startsWith("file://") && value.endsWith(".mp4")) return "mp4";
+  if (value.startsWith("file://")) return "file";
+  if (value.endsWith(".mp4")) return "mp4";
+  const scheme = value.includes("://") ? value.split("://", 1)[0] : "";
+  return scheme || "uri";
+}
+
+function fileLabelFromUri(uri) {
+  const clean = String(uri || "").split("?")[0].replace(/\/+$/, "");
+  const name = clean.split("/").pop() || "";
+  return decodeURIComponent(name.replace(/\.[^.]+$/, "")) || "source";
+}
+
+function formatBytes(value) {
+  const bytes = Number(value || 0);
+  if (!bytes) return "0 B";
+  const units = ["B", "KB", "MB", "GB", "TB"];
+  let next = bytes;
+  let index = 0;
+  while (next >= 1024 && index < units.length - 1) {
+    next /= 1024;
+    index += 1;
+  }
+  return `${next >= 10 || index === 0 ? next.toFixed(0) : next.toFixed(1)} ${units[index]}`;
+}
+
+function defaultSourceForUri(uri, kind) {
+  const source = {
+    element: "nvurisrcbin",
+    uri,
+    "gpu-id": 0,
+    "cudadec-memtype": 0,
+    "disable-audio": true,
+  };
+  if (kind === "rtsp") {
+    source.latency = 100;
+    source["select-rtp-protocol"] = 4;
+  }
+  return source;
+}
+
+function normalizeSourceUri(uri, kind) {
+  const value = String(uri || "").trim();
+  if ((kind === "mp4" || kind === "file") && value.startsWith("/")) {
+    return `file://${value}`;
+  }
+  return value;
+}
+
+function normalizeSourceOverride(row, index = 0) {
+  const source = clonePlain(row.source || {});
+  const uri = String(row.uri || source.uri || "").trim();
+  if (uri) source.uri = uri;
+  if (!source.element) source.element = "nvurisrcbin";
+  const kind = String(row.kind || sourceKindFromUri(uri));
+  return {
+    id: String(row.id || `source-${index}`),
+    source_id: Number(row.source_id ?? index),
+    camera_id: String(row.camera_id || row.label || `camera_${index}`),
+    label: String(row.label || row.camera_id || `Source ${index + 1}`),
+    kind,
+    enabled: row.enabled !== false,
+    uri,
+    uri_display: row.uri_display || uri,
+    source,
+  };
+}
+
+function sourceRowToOverride(row, index = 0) {
+  return normalizeSourceOverride(
+    {
+      id: row.id || `source-${index}`,
+      source_id: row.source_id ?? index,
+      camera_id: row.camera_id,
+      label: row.label || row.camera_id,
+      kind: row.kind,
+      enabled: row.enabled !== false,
+      uri: row.uri,
+      uri_display: row.uri_display,
+      source: row.source || defaultSourceForUri(row.uri || "", row.kind || sourceKindFromUri(row.uri || "")),
+    },
+    index
+  );
+}
+
+function sourceRowsForStudio() {
+  if (state.sourceOverrides.length) {
+    return state.sourceOverrides.map((row, index) => normalizeSourceOverride(row, index));
+  }
+  return (state.sourceCatalog?.rows || []).map((row, index) => sourceRowToOverride(row, index));
+}
+
+function sourceOverridesForSpec() {
+  if (!state.sourceOverrides.length) return [];
+  return state.sourceOverrides
+    .map((row, index) => normalizeSourceOverride(row, index))
+    .filter((row) => row.uri || row.enabled === false);
+}
+
+function ensureSourceOverridesFromCatalog() {
+  if (state.sourceOverrides.length) return;
+  state.sourceOverrides = (state.sourceCatalog?.rows || []).map((row, index) => sourceRowToOverride(row, index));
+}
+
+async function commitSourceOverrides(nextRows, message) {
+  state.sourceOverrides = nextRows.map((row, index) => normalizeSourceOverride(row, index));
+  state.launchDetached = true;
+  markValidationStale();
+  renderSourceStudio();
+  await renderFlow().catch(() => {});
+  await loadLaunchPlan().catch(() => {});
+  await loadLaunchDiff().catch(() => {});
+  await loadRemediation().catch(() => {});
+  await loadSources().catch(() => {});
+  await loadLaunchDecision().catch(() => {});
+  if (message) toast(message);
+}
+
+function renderSourceStudio() {
+  const rows = sourceRowsForStudio();
+  const selected = rows.filter((row) => row.enabled !== false).length;
+  const custom = state.sourceOverrides.length > 0;
+  const summary = $("sourceSetSummary");
+  if (summary) {
+    summary.textContent = rows.length
+      ? `${selected}/${rows.length} selected · ${custom ? "custom source set" : "pipeline config"}`
+      : "No sources";
+  }
+
+  const list = $("sourceSelectionList");
+  if (!list) return;
+  list.innerHTML = "";
+  if (!rows.length) {
+    list.innerHTML = '<div class="source-select-card inactive"><strong>No sources configured</strong><em>Add an RTSP stream or browse for an MP4.</em></div>';
+    return;
+  }
+
+  rows.forEach((row, index) => {
+    const card = document.createElement("div");
+    card.className = `source-select-card ${row.enabled === false ? "inactive" : "active"}`;
+    card.innerHTML = `
+      <div class="source-select-title">
+        <div>
+          <strong>${escapeHtml(row.label || row.camera_id || `Source ${index + 1}`)}</strong>
+          <span>${escapeHtml(row.camera_id || `camera_${index}`)} · ${escapeHtml(row.kind || "uri")}</span>
+        </div>
+        <label class="source-toggle">
+          <input type="checkbox" data-source-toggle="${index}" ${row.enabled === false ? "" : "checked"} />
+          Active
+        </label>
+      </div>
+      <code>${escapeHtml(row.uri_display || row.uri || "-")}</code>
+      <div class="source-select-actions">
+        <em>${custom ? "Launch override" : "From pipeline YAML"}</em>
+        <div class="button-row compact">
+          <button class="button subtle" type="button" data-source-edit="${index}">Load</button>
+          <button class="button subtle" type="button" data-source-remove="${index}">Remove</button>
+        </div>
+      </div>
+    `;
+    list.appendChild(card);
+  });
+}
+
+function renderMediaBrowser(payload) {
+  state.mediaBrowser = payload;
+  const browser = $("mediaBrowser");
+  const rootSelect = $("mediaRootSelect");
+  const pathLabel = $("mediaPathLabel");
+  const list = $("mediaBrowserList");
+  if (!browser || !rootSelect || !pathLabel || !list) return;
+  browser.classList.remove("hidden");
+
+  rootSelect.innerHTML = "";
+  for (const root of payload.roots || []) {
+    const option = document.createElement("option");
+    option.value = root.id;
+    option.textContent = root.label;
+    option.selected = root.id === payload.root_id;
+    rootSelect.appendChild(option);
+  }
+  pathLabel.textContent = payload.relative_path ? `/${payload.relative_path}` : "/";
+  list.innerHTML = "";
+
+  const entries = payload.entries || [];
+  if (!entries.length) {
+    list.innerHTML = '<div class="media-entry"><div><strong>No MP4 files here</strong><span>Choose another folder.</span></div></div>';
+    return;
+  }
+
+  entries.forEach((entry, index) => {
+    const row = document.createElement("div");
+    row.className = `media-entry ${entry.kind || ""}`;
+    if (entry.kind === "dir") {
+      row.innerHTML = `
+        <div><strong>${escapeHtml(entry.name)}</strong><span>Folder</span></div>
+        <button class="button subtle" type="button" data-media-open="${index}">Open</button>
+      `;
+    } else {
+      row.innerHTML = `
+        <div><strong>${escapeHtml(entry.name)}</strong><span>${escapeHtml(formatBytes(entry.size_bytes))}</span></div>
+        <button class="button" type="button" data-media-use="${index}">Use</button>
+      `;
+    }
+    list.appendChild(row);
+  });
+}
+
+async function loadMediaBrowser(rootId, relativePath) {
+  const payload = await api("/api/sources/media", {
+    method: "POST",
+    body: JSON.stringify({
+      root_id: rootId ?? state.mediaBrowser?.root_id ?? "",
+      relative_path: relativePath ?? state.mediaBrowser?.relative_path ?? "",
+    }),
+  });
+  renderMediaBrowser(payload);
+  return payload;
+}
+
+async function addSourceFromForm() {
+  const kind = $("sourceKindInput").value || "rtsp";
+  const uri = normalizeSourceUri($("sourceUriInput").value, kind);
+  if (!uri) {
+    toast("Add a URI or choose an MP4");
+    return;
+  }
+  ensureSourceOverridesFromCatalog();
+  const label = $("sourceLabelInput").value.trim() || fileLabelFromUri(uri);
+  const next = state.sourceOverrides.slice();
+  next.push(
+    normalizeSourceOverride(
+      {
+        id: `custom-${Date.now()}`,
+        source_id: next.length,
+        camera_id: label,
+        label,
+        kind: kind || sourceKindFromUri(uri),
+        enabled: true,
+        uri,
+        source: defaultSourceForUri(uri, kind || sourceKindFromUri(uri)),
+      },
+      next.length
+    )
+  );
+  $("sourceLabelInput").value = "";
+  $("sourceUriInput").value = "";
+  await commitSourceOverrides(next, "Source added");
+}
+
 function renderSources(payload) {
   state.sources = payload;
+  if (payload?.catalog) state.sourceCatalog = payload.catalog;
+  renderSourceStudio();
   const summary = payload?.summary || { ready: 0, warn: 0, blocked: 0, total: 0, source_count: 0, camera_count: 0 };
   $("sourceSummary").textContent = `${summary.ready || 0} ready / ${summary.warn || 0} warn / ${summary.blocked || 0} blocked`;
 
@@ -2493,7 +2770,11 @@ async function loadSources(recordActivity = false) {
   const spec = specFromForm();
   spec.probe_network = Boolean($("sourceProbeInput")?.checked);
   if (recordActivity) spec.record_activity = true;
-  const payload = await api("/api/sources", { method: "POST", body: JSON.stringify(spec) });
+  const [catalog, payload] = await Promise.all([
+    api("/api/sources/catalog", { method: "POST", body: JSON.stringify(spec) }),
+    api("/api/sources", { method: "POST", body: JSON.stringify(spec) }),
+  ]);
+  payload.catalog = catalog;
   renderSources(payload);
   if (recordActivity) await loadActivity().catch(() => {});
   return payload;
@@ -2865,6 +3146,7 @@ function bindEvents() {
         loadDiagnostics();
       }
       if (id === "pipelineInput" || id === "camerasInput") {
+        state.sourceOverrides = [];
         loadSources();
       }
       if (id === "depthSecondsInput" || id === "envInput") {
@@ -2905,6 +3187,62 @@ function bindEvents() {
   $("matrixReadyOnly").addEventListener("change", () => renderModelMatrix(state.modelMatrix));
   $("sourceButton").addEventListener("click", () => loadSources(true).then(() => toast("Sources refreshed")).catch((err) => toast(err.message)));
   $("sourceProbeInput").addEventListener("change", () => loadSources().then(() => loadLaunchDecision()).catch((err) => toast(err.message)));
+  $("sourceAddButton").addEventListener("click", () => addSourceFromForm().catch((err) => toast(err.message)));
+  $("sourceBrowseButton").addEventListener("click", () => loadMediaBrowser().catch((err) => toast(err.message)));
+  $("sourceResetButton").addEventListener("click", () => {
+    commitSourceOverrides([], "Source set reset").catch((err) => toast(err.message));
+  });
+  $("sourceSelectionList").addEventListener("change", (event) => {
+    const input = event.target.closest("[data-source-toggle]");
+    if (!input) return;
+    ensureSourceOverridesFromCatalog();
+    const index = Number(input.dataset.sourceToggle);
+    const next = state.sourceOverrides.slice();
+    if (!next[index]) return;
+    next[index] = { ...next[index], enabled: Boolean(input.checked) };
+    commitSourceOverrides(next, "Source selection updated").catch((err) => toast(err.message));
+  });
+  $("sourceSelectionList").addEventListener("click", (event) => {
+    const editButton = event.target.closest("[data-source-edit]");
+    const removeButton = event.target.closest("[data-source-remove]");
+    if (editButton) {
+      const row = sourceRowsForStudio()[Number(editButton.dataset.sourceEdit)];
+      if (!row) return;
+      $("sourceKindInput").value = row.kind || sourceKindFromUri(row.uri);
+      $("sourceLabelInput").value = row.label || row.camera_id || "";
+      $("sourceUriInput").value = row.uri || "";
+      return;
+    }
+    if (removeButton) {
+      ensureSourceOverridesFromCatalog();
+      const index = Number(removeButton.dataset.sourceRemove);
+      const next = state.sourceOverrides.filter((_row, rowIndex) => rowIndex !== index);
+      commitSourceOverrides(next, "Source removed").catch((err) => toast(err.message));
+    }
+  });
+  $("mediaRootSelect").addEventListener("change", (event) => loadMediaBrowser(event.target.value, "").catch((err) => toast(err.message)));
+  $("mediaUpButton").addEventListener("click", () => {
+    if (!state.mediaBrowser) return;
+    loadMediaBrowser(state.mediaBrowser.root_id, state.mediaBrowser.parent_path || "").catch((err) => toast(err.message));
+  });
+  $("mediaBrowserList").addEventListener("click", (event) => {
+    const openButton = event.target.closest("[data-media-open]");
+    const useButton = event.target.closest("[data-media-use]");
+    const entries = state.mediaBrowser?.entries || [];
+    if (openButton) {
+      const entry = entries[Number(openButton.dataset.mediaOpen)];
+      if (entry) loadMediaBrowser(state.mediaBrowser.root_id, entry.relative_path || "").catch((err) => toast(err.message));
+      return;
+    }
+    if (useButton) {
+      const entry = entries[Number(useButton.dataset.mediaUse)];
+      if (!entry) return;
+      $("sourceKindInput").value = "mp4";
+      $("sourceUriInput").value = entry.uri || "";
+      if (!$("sourceLabelInput").value.trim()) $("sourceLabelInput").value = fileLabelFromUri(entry.uri || entry.name);
+      toast("MP4 selected");
+    }
+  });
   $("gateButton").addEventListener("click", () => loadGates(true).then(() => toast("Gate deck refreshed")).catch((err) => toast(err.message)));
   $("gateApplyButton").addEventListener("click", () => applyGateControls(false).catch((err) => toast(err.message)));
   $("gateValidateButton").addEventListener("click", () => applyGateControls(true).catch((err) => toast(err.message)));

@@ -46,5 +46,5 @@ def model_patch(
         spec.pipeline_config = str(Path(pipeline_path))
     effective = build_effective_config(spec) if pgie_profile else merged
     if "osd" not in effective:
-        effective["osd"] = {"process-mode": 0, "display-mask": 1, "display-bbox": 0, "display-text": 1}
+        effective["osd"] = {"process-mode": 0, "display-mask": 1, "display-bbox": 1, "display-text": 1}
     return effective

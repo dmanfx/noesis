@@ -48,6 +48,7 @@ def describe_flow(
     rtsp_port: int = 8554,
     depth_enable_seconds: int = 0,
     env: Optional[Mapping[str, str]] = None,
+    source_overrides: Optional[List[Mapping[str, Any]]] = None,
 ) -> Dict[str, Any]:
     env_map = {str(key): str(value) for key, value in dict(env or {}).items()}
     spec = LaunchSpec(
@@ -58,6 +59,7 @@ def describe_flow(
         rtsp_port=int(rtsp_port),
         depth_enable_seconds=int(depth_enable_seconds),
         env=env_map,
+        source_overrides=[dict(item) for item in source_overrides or [] if isinstance(item, Mapping)],
     )
     cfg = build_effective_config(spec)
     sources = cfg.get("sources") if isinstance(cfg.get("sources"), list) else []

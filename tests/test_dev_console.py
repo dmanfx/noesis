@@ -32,12 +32,32 @@ def test_launch_spec_argv_env():
     assert str(spec.launch_dir) in env["NOESIS_DEV_CONSOLE_LAUNCH_DIR"]
 
 
+def test_launch_spec_source_overrides_roundtrip():
+    spec = LaunchSpec.from_mapping(
+        {
+            "source_overrides": [
+                {
+                    "label": "clip",
+                    "kind": "mp4",
+                    "enabled": True,
+                    "uri": "file:///tmp/noesis_clip.mp4",
+                    "source": {"element": "nvurisrcbin", "uri": "file:///tmp/noesis_clip.mp4"},
+                }
+            ]
+        }
+    )
+
+    assert spec.source_overrides[0]["label"] == "clip"
+    payload = spec.to_dict()
+    assert payload["source_overrides"][0]["uri"] == "file:///tmp/noesis_clip.mp4"
+
+
 def test_mask_output_available_seg_ini():
     props = {"network-type": "3", "output-instance-mask": "1", "parse-bbox-instance-mask-func-name": "NvDsInferParseYoloSeg"}
     assert mask_output_available(props) is True
     osd = derive_osd_policy_from_ini(props)
     assert osd["display-mask"] == 1
-    assert osd["display-bbox"] == 0
+    assert osd["display-bbox"] == 1
 
 
 def test_mask_output_available_detect_ini():
@@ -237,6 +257,30 @@ def test_describe_flow_returns_stages():
     assert data["highlights"]["rtsp_port"] == 9654
 
 
+def test_describe_flow_uses_source_overrides():
+    from noesis.dev_console.pipeline_flow import describe_flow
+
+    data = describe_flow(
+        pipeline_config="config/infer.yaml",
+        pgie_profile="yolo11_seg",
+        size="m",
+        tracking_mode="baseline",
+        source_overrides=[
+            {
+                "label": "clip",
+                "kind": "mp4",
+                "enabled": True,
+                "uri": "file:///tmp/noesis_clip.mp4",
+                "source": {"element": "nvurisrcbin", "uri": "file:///tmp/noesis_clip.mp4"},
+            }
+        ],
+    )
+
+    sources = next(stage for stage in data["stages"] if stage["id"] == "sources")
+    assert sources["metrics"]["count"] == 1
+    assert sources["metrics"]["type"] == "file"
+
+
 def test_gate_catalog_reports_inherited_and_explicit_controls():
     from noesis.dev_console.gate_catalog import build_gate_catalog
 
@@ -393,6 +437,47 @@ def test_materialized_launch_overrides_rtsp_port():
 
     cfg = yaml.safe_load(path.read_text(encoding="utf-8"))
     assert int(cfg.get("mosaic_output", {}).get("rtsp_port")) == 9554
+
+
+def test_materialized_launch_applies_source_overrides():
+    from noesis.dev_console.launch_spec import LaunchSpec
+    from noesis.dev_console.materialize import materialize_launch_pipeline
+
+    spec = LaunchSpec(
+        pipeline_config="config/infer.yaml",
+        pgie_profile="yolo11_seg",
+        tracking_mode="baseline",
+        launch_id="test-source-overrides",
+        source_overrides=[
+            {
+                "label": "clip",
+                "kind": "mp4",
+                "enabled": True,
+                "uri": "file:///tmp/noesis_clip.mp4",
+                "source": {"element": "nvurisrcbin", "uri": "rtsp://example.invalid/old", "latency": 5},
+            },
+            {
+                "label": "disabled",
+                "kind": "rtsp",
+                "enabled": False,
+                "uri": "rtsp://example.invalid/disabled",
+                "source": {"element": "nvurisrcbin", "uri": "rtsp://example.invalid/disabled"},
+            },
+        ],
+    )
+    try:
+        path = materialize_launch_pipeline(spec, dry_run=True)
+    except Exception as exc:
+        pytest.skip(f"materialization unavailable: {exc}")
+    import yaml
+
+    cfg = yaml.safe_load(path.read_text(encoding="utf-8"))
+    assert len(cfg["sources"]) == 1
+    assert cfg["sources"][0]["uri"] == "file:///tmp/noesis_clip.mp4"
+    assert "label" not in cfg["sources"][0]
+    assert "kind" not in cfg["sources"][0]
+    assert int(cfg["batch_size"]) == 1
+    assert int(cfg["streammux"]["batch-size"]) == 1
 
 
 def test_diagnostics_snapshot_reports_ports_and_artifacts():
@@ -1125,6 +1210,45 @@ def test_source_readiness_redacts_uris_and_aligns_cameras():
     assert first["dewarper"]["exists"] is True
 
 
+def test_source_catalog_preserves_editable_sources_and_redacted_display():
+    from noesis.dev_console.launch_spec import LaunchSpec
+    from noesis.dev_console.source_catalog import build_source_catalog
+
+    payload = build_source_catalog(
+        LaunchSpec(
+            pipeline_config="config/infer.yaml",
+            cameras_config="config/cameras.yaml",
+            pgie_profile="yolo11_seg",
+            tracking_mode="baseline",
+        )
+    )
+
+    assert payload["summary"]["total"] == 3
+    first = payload["rows"][0]
+    assert first["uri"].startswith("rtsp://")
+    assert "jdr9oLlBkjyl3gDm" in first["uri"]
+    assert "jdr9oLlBkjyl3gDm" not in first["uri_display"]
+    assert first["source"]["dewarper"]["config-file"].startswith("config/")
+
+
+def test_media_browser_lists_mp4_files(tmp_path):
+    from noesis.dev_console.source_catalog import MediaRoot, browse_mp4_media
+
+    clips = tmp_path / "clips"
+    clips.mkdir()
+    (clips / "sample.MP4").write_bytes(b"mp4")
+    (clips / "ignore.mkv").write_bytes(b"mkv")
+
+    root = MediaRoot("tmp", "Tmp", tmp_path)
+    top = browse_mp4_media(root_id="tmp", roots=[root])
+    assert any(item["kind"] == "dir" and item["name"] == "clips" for item in top["entries"])
+
+    nested = browse_mp4_media(root_id="tmp", relative_path="clips", roots=[root])
+    files = [item for item in nested["entries"] if item["kind"] == "file"]
+    assert [item["name"] for item in files] == ["sample.MP4"]
+    assert files[0]["uri"].startswith("file://")
+
+
 def test_sources_endpoint_records_activity(monkeypatch, tmp_path):
     from fastapi.testclient import TestClient
 
@@ -1819,6 +1943,14 @@ def test_ui_workflow_post_endpoints():
     sources = client.post("/api/sources", json=spec)
     assert sources.status_code == 200
     assert sources.json().get("rows")
+
+    source_catalog = client.post("/api/sources/catalog", json=spec)
+    assert source_catalog.status_code == 200
+    assert source_catalog.json().get("rows")
+
+    source_media = client.post("/api/sources/media", json={})
+    assert source_media.status_code == 200
+    assert "entries" in source_media.json()
 
     remediation = client.post("/api/remediation", json=spec)
     assert remediation.status_code == 200

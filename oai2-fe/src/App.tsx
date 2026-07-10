@@ -18,6 +18,7 @@ import { BevView, BevMeta, type BevFrameMode } from './components/BevView';
 import { MosaicCropCanvas } from './components/MosaicCropCanvas';
 import type { BevTrailConfig } from './lib/bevTrails';
 import RoiEditorDrawer from './components/RoiEditorDrawer';
+import { HouseholdIdentityDrawer } from './components/HouseholdIdentityDrawer';
 import SettingsCorner from './components/SettingsCorner';
 import { LatencyCard } from './components/LatencyCard';
 import { LatencyMetrics } from './types/latency';
@@ -139,6 +140,13 @@ function Dashboard() {
     stable_id: number;
     tracker_id?: number;
     id_display?: string;
+    display_name?: string | null;
+    resident_uuid?: string | null;
+    identity_kind?: string | null;
+    identity_state?: string | null;
+    reid_confidence?: number | null;
+    embedding_present?: boolean | null;
+    overlap_permit?: boolean | null;
     camera_id: string;
     zone?: string;
     center?: [number, number];
@@ -164,6 +172,15 @@ function Dashboard() {
   const [vacancyText, setVacancyText] = useState<Record<CameraKey, string>>({ 'living-room': '', 'kitchen': '', 'family-room': '' });
   const zeroSinceRef = useRef<Record<CameraKey, number | null>>({ 'living-room': null, 'kitchen': null, 'family-room': null });
 
+  const householdLiveTracks = useMemo(() => {
+    const out: ActiveTrack[] = [];
+    for (const tracks of Object.values(tracksByCamera)) {
+      if (!Array.isArray(tracks)) continue;
+      for (const t of tracks) out.push(t);
+    }
+    return out;
+  }, [tracksByCamera]);
+
   const [trailEnabled, setTrailEnabled] = useState<boolean>(true);
   const [bevTrailConfig, setBevTrailConfig] = useState<Partial<BevTrailConfig>>({});
   const trailStoreRef = useRef(new TrailStore());
@@ -188,6 +205,7 @@ function Dashboard() {
 
   const [telemetryOpen, setTelemetryOpen] = useState(false);
   const [depthDrawerOpen, setDepthDrawerOpen] = useState(false);
+  const [peopleDrawerOpen, setPeopleDrawerOpen] = useState(false);
   const [maDiagnostics, setMaDiagnostics] = useState<Record<string, DepthDiagnosticsEntry>>({});
   const [maDepthData, setMaDepthData] = useState<Record<string, DepthDrawerEntry>>({});
   const depthMetaRef = useRef<Record<string, DepthMetaEntry>>({});
@@ -587,12 +605,14 @@ function Dashboard() {
           : 'N/A';
         const depthStatus = t.depth_status || 'missing';
         const depthAnchor = t.depth_anchor_source ? `, ${t.depth_anchor_source}` : '';
-        const idDisplay = (t as any).display_name
-          || (t as any).id_display
-          || (typeof (t as any).tracker_id === 'number'
-              ? `[${(t as any).tracker_id}] | [${t.stable_id ?? 'N/A'}]`
+        const idDisplay = t.display_name
+          || t.id_display
+          || (typeof t.tracker_id === 'number'
+              ? `[${t.tracker_id}] | [${t.stable_id ?? 'N/A'}]`
               : String(t.stable_id ?? 'N/A'));
-        tracksHtml += `<div><strong><span class="dot" style="display:inline-block;width:10px;height:10px;border-radius:50%;background:${dotColor};margin-right:6px;vertical-align:middle;"></span>${(t as any).display_name ? String((t as any).display_name) : `ID ${idDisplay}`}:</strong><br/>Zone: ${t.zone || '-'}, Dwell: <span style="display:inline-block; min-width:4ch; text-align:right;">${dwell}</span>s<br/>Metric (BEV): ${metricText}<br/>Depth Used: ${depthUsed} (${depthStatus}${depthAnchor})<br/>Pixel Pos: [${(typeof center[0] === 'number' ? Number(center[0]).toFixed(3) : center[0])}, ${(typeof center[1] === 'number' ? Number(center[1]).toFixed(3) : center[1])}], Speed: <span style="display:inline-block; min-width:4ch; text-align:right;">${speed}</span> px/s</div>`;
+        const kindLabel = t.identity_kind || t.identity_state || '';
+        const kindBit = kindLabel ? ` · ${kindLabel}` : '';
+        tracksHtml += `<div><strong><span class="dot" style="display:inline-block;width:10px;height:10px;border-radius:50%;background:${dotColor};margin-right:6px;vertical-align:middle;"></span>${t.display_name ? String(t.display_name) : `ID ${idDisplay}`}${kindBit}:</strong><br/>Zone: ${t.zone || '-'}, Dwell: <span style="display:inline-block; min-width:4ch; text-align:right;">${dwell}</span>s<br/>Metric (BEV): ${metricText}<br/>Depth Used: ${depthUsed} (${depthStatus}${depthAnchor})<br/>Pixel Pos: [${(typeof center[0] === 'number' ? Number(center[0]).toFixed(3) : center[0])}, ${(typeof center[1] === 'number' ? Number(center[1]).toFixed(3) : center[1])}], Speed: <span style="display:inline-block; min-width:4ch; text-align:right;">${speed}</span> px/s</div>`;
       });
     } else {
       tracksHtml = '<span>No active tracks.</span>';
@@ -1322,8 +1342,15 @@ function Dashboard() {
         {timeChip}
         {connectionChip}
         <button className="btn ghost" onClick={() => setTelemetryOpen(v => !v)}>Telemetry</button>
-        <button className="btn ghost" onClick={() => setDepthDrawerOpen(v => !v)}>Depth</button>
-        <button className="btn ghost" onClick={() => setRoiDrawerOpen(v => !v)}>ROIs</button>
+        <button className="btn ghost" onClick={() => { setDepthDrawerOpen(v => !v); setRoiDrawerOpen(false); setPeopleDrawerOpen(false); }}>Depth</button>
+        <button className="btn ghost" onClick={() => { setRoiDrawerOpen(v => !v); setDepthDrawerOpen(false); setPeopleDrawerOpen(false); }}>ROIs</button>
+        <button
+          className="btn ghost"
+          onClick={() => { setPeopleDrawerOpen((v) => !v); setDepthDrawerOpen(false); setRoiDrawerOpen(false); }}
+          title="Enroll and manage household residents"
+        >
+          People
+        </button>
       </header>
       <main className="main">
         <section className={`streams${mosaicExpanded ? ' streams--expanded' : ''}`}>
@@ -1440,6 +1467,12 @@ function Dashboard() {
         mosaicLayout={mosaicLayout}
         videoRef={webrtc.videoRef}
         analyticsReloadCount={analyticsReloadCount}
+      />
+      <HouseholdIdentityDrawer
+        open={peopleDrawerOpen}
+        onClose={() => setPeopleDrawerOpen(false)}
+        restBaseUrl={REST_URL}
+        liveTracks={householdLiveTracks}
       />
 
       {telemetryOpen && (

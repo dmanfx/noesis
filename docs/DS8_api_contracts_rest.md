@@ -320,16 +320,17 @@ Notes:
 
 Household mode keeps the alias endpoints above but defaults suggest-only merge
 behavior. Resident list/enroll endpoints are available when household mode is on
-(`NOESIS_HOUSEHOLD_IDENTITY=1`):
+(default; unset `NOESIS_HOUSEHOLD_IDENTITY` or set `=1`):
 
 Environment:
-- `NOESIS_HOUSEHOLD_IDENTITY=1` enables household identity runtime behavior.
+- `NOESIS_HOUSEHOLD_IDENTITY` defaults to on (`1` when unset). Opt out with `=0`
+  for legacy open-world StableID debugging.
 - `NOESIS_HOUSEHOLD_ARCHIVE_STATE=1` (default when household on) archives legacy
   `~/.noesis/reid_gallery.npz`, `reid_aliases.json`, and `sid_pool.json` into
   `~/.noesis/household/backups/<UTC>/` on first cutover.
 - `NOESIS_CAMERA_TOPOLOGY_FILE` (default `config/camera_topology.yaml` via repo root).
 
-### Resident endpoints (Phase 1 stub)
+### Resident endpoints
 
 - **GET** `/api/v1/reid/residents`
   - Returns enrolled household residents (UUID, display name, gallery stats).
@@ -337,15 +338,15 @@ Environment:
 - **POST** `/api/v1/reid/residents/enroll`
   - Body: `{ "display_name": string, "stable_id"?: int, "visitor_id"?: int }`
   - Binds a visitor or stable ID into the resident enrollment table (sticky ID 1..N).
-  - Copies gallery embeddings when `visitor_id` is supplied.
-
-### Planned endpoints
+  - Remaps live tracks/zones/ghosts/gallery when the visitor SID differs from the new resident SID.
 - **PATCH** `/api/v1/reid/residents/{uuid}`
-  - Update `display_name`, trigger gallery refresh.
+  - Update `display_name` (propagates to live tracks).
 - **DELETE** `/api/v1/reid/residents/{uuid}`
-  - Soft-delete / archive resident enrollment.
+  - Removes enrollment; remaps any live/ghost references to a fresh visitor SID.
 - **GET** `/api/v1/reid/identity_health`
-  - Mint rate, false-share counters, gallery sizes, overlap permit stats.
+  - Mint / false-share / overlap / gallery counters plus resident list.
+
+Frontend: oai2-fe topbar **People** drawer consumes these endpoints (plus suggest-only alias merge).
 
 Persistence (household mode):
 - `~/.noesis/household/residents.json`

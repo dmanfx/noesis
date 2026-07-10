@@ -61,11 +61,16 @@ Minimal changes in `oai2-fe`:
 
 ## Action checklist
 
-- [ ] Complete enroll/list/patch/delete REST
-- [ ] Wire display_name/uuid into tracking payloads
-- [ ] Minimal FE name display + enroll hook
-- [ ] Health endpoint + report script
-- [ ] Update docs; mark soft-merge plan superseded for household mode
+- [x] Complete enroll/list/patch/delete REST
+  - _2026-07-09: `reid_api.py` list/enroll/patch/delete + identity_health._
+- [x] Wire display_name/uuid into tracking payloads
+  - _2026-07-09: hooks apply household diag fields on public tracks._
+- [x] Minimal FE name display + enroll hook
+  - _2026-07-09: oai2-fe **People** drawer (`HouseholdIdentityDrawer`) — live visitor enroll, rename/remove residents, health + suggest merges._
+- [x] Health endpoint + report script
+  - _2026-07-09: `GET /identity_health` + `scripts/household_identity_health_report.py`._
+- [x] Update docs; mark soft-merge plan superseded for household mode
+  - _2026-07-09: REST/WS contracts + design decisions note household default-on._
 - [ ] G3 validation
 
 ## Risks

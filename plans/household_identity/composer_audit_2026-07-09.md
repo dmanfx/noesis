@@ -38,6 +38,9 @@ yolo26m+v3dt smoke reached Main Loop + REST without core dump._
 | Opt-out (`NOESIS_HOUSEHOLD_IDENTITY=0`) | Legacy open-world StableID |
 | V3DT gallery persist | Pre-existing: V3DT builder never set `gallery_persist_file` before this work (not a new regression) |
 
+Household is the production identity path. Do not describe it as gated-off /
+opt-in; that was pre-cutover planning language only.
+
 ## Composer findings (severity)
 
 ### Critical / high (household mode)
@@ -51,17 +54,20 @@ yolo26m+v3dt smoke reached Main Loop + REST without core dump._
 - `_maintain_stable_ids` used to permanently disable StableID — **fixed** (log only).
 - `stable_id is None` still skips person from BEV/tracks (pre-existing pattern).
 - Dead helpers: `assign_tracklets_mnn` batch path unused; `filter_kwargs_for_init` unused by runtime.
-- Thin FE: display_name only; no enroll UI.
+- Thin FE: display_name only; no enroll UI. **Fixed 2026-07-09** — oai2-fe People drawer.
 
 ### What looks solid
-- Household gated off by default
+- Household **ON by default** (cutover 2026-07-09); opt out with `NOESIS_HOUSEHOLD_IDENTITY=0`
 - `use_extractor=False` preserved (no torchreid on DS8)
 - Overlap permit structure + topology loader
 - Gallery quality gates legacy-permissive when household off
 - REST shape for residents/health
 - Unit tests for exclusivity/overlap/provisional/visitor (with confirm fixtures)
 
-## Do not enable household mode in production until
+## Pre-cutover blockers (cleared 2026-07-09)
+
+These were required before default-on cutover; all done:
+
 - [x] Provisional lifecycle creates active records or withholds public SID
   - _2026-07-09 (Grok): Provisional mint inserts `active_tracks` + `active_zones`; same track keeps SID across frames; promote via `_household_finalize_new_sid` + `_remap_sid`. Metrics: `provisional_count`/`provisional_active_count` = live population; `provisional_event_count` = cumulative first mints._
 - [x] enroll/delete fully remaps zones/ghosts/gallery
@@ -73,7 +79,15 @@ yolo26m+v3dt smoke reached Main Loop + REST without core dump._
 
 ## Cutover (completed 2026-07-09)
 
-1. [x] Default `NOESIS_HOUSEHOLD_IDENTITY=1` in `is_household_identity_enabled()`.
+1. [x] Default `NOESIS_HOUSEHOLD_IDENTITY=1` in `is_household_identity_enabled()` (unset env → on).
 2. [x] Opt-out via `NOESIS_HOUSEHOLD_IDENTITY=0` for legacy debugging.
 3. [x] First start archives poisoned legacy gallery/aliases (D8).
 4. [x] Recorded in `work_order.md` + `ds8_design_decisions.md`.
+
+## Follow-up: provisional pool exhaustion (FIXED 2026-07-09)
+
+Live run hit `RuntimeError: SID pool exhausted (9000..9099)` when tracker churn /
+false detections minted >100 simultaneous provisionals. Fix: reclaim orphans on
+alloc, evict oldest provisional under pressure, release abandoned SIDs after
+same-frame splits, and pressure-recycle inactive visitors (ignore TTL/ghosts)
+when minting. Tests: `tests/test_stable_id_provisional_pool_pressure.py`.

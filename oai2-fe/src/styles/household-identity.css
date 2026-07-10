@@ -1,0 +1,353 @@
+.hh-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.35);
+  z-index: 875;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 0.2s ease;
+}
+.hh-overlay.open {
+  opacity: 1;
+  pointer-events: auto;
+}
+
+.hh-drawer {
+  position: fixed;
+  top: 0;
+  right: 0;
+  height: 100vh;
+  width: min(480px, 100vw);
+  background: #0f1622;
+  color: #f2f5f9;
+  z-index: 876;
+  box-shadow: -4px 0 18px rgba(0, 0, 0, 0.45);
+  display: flex;
+  flex-direction: column;
+  transform: translateX(100%);
+  transition: transform 0.25s ease;
+}
+.hh-drawer.open {
+  transform: translateX(0);
+}
+
+.hh-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 16px 18px 14px;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+}
+.hh-header h2 {
+  margin: 0;
+  font-size: 18px;
+  font-weight: 600;
+  letter-spacing: 0.2px;
+}
+.hh-subtitle {
+  margin-top: 4px;
+  font-size: 12px;
+  opacity: 0.7;
+  line-height: 1.35;
+}
+.hh-header-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-shrink: 0;
+}
+.hh-header button.hh-icon {
+  background: none;
+  border: none;
+  color: inherit;
+  font-size: 20px;
+  line-height: 1;
+  cursor: pointer;
+  padding: 4px 6px;
+  opacity: 0.85;
+}
+.hh-header button.hh-icon:hover {
+  opacity: 1;
+}
+
+.hh-content {
+  flex: 1;
+  overflow-y: auto;
+  padding: 14px 16px 24px;
+  display: grid;
+  gap: 14px;
+}
+
+.hh-banner {
+  border-radius: 10px;
+  padding: 10px 12px;
+  font-size: 13px;
+  line-height: 1.4;
+  border: 1px solid rgba(255, 255, 255, 0.1);
+}
+.hh-banner.warn {
+  background: rgba(255, 217, 94, 0.08);
+  border-color: rgba(255, 217, 94, 0.35);
+  color: #ffe9a8;
+}
+.hh-banner.error {
+  background: rgba(255, 107, 107, 0.1);
+  border-color: rgba(255, 107, 107, 0.4);
+  color: #ffc9c9;
+}
+.hh-banner.ok {
+  background: rgba(67, 209, 123, 0.08);
+  border-color: rgba(67, 209, 123, 0.35);
+  color: #b8f0cd;
+}
+.hh-banner.info {
+  background: rgba(103, 182, 255, 0.08);
+  border-color: rgba(103, 182, 255, 0.3);
+  color: #cfe0ff;
+}
+
+.hh-stats {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 8px;
+}
+.hh-stat {
+  background: rgba(255, 255, 255, 0.03);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 10px;
+  padding: 8px 10px;
+  min-width: 0;
+}
+.hh-stat-label {
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  opacity: 0.65;
+}
+.hh-stat-value {
+  margin-top: 2px;
+  font-size: 18px;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+}
+
+.hh-section {
+  background: rgba(255, 255, 255, 0.03);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 10px;
+  padding: 12px 14px;
+  display: grid;
+  gap: 10px;
+}
+.hh-section-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+}
+.hh-section-title {
+  font-weight: 600;
+  font-size: 14px;
+}
+.hh-section-meta {
+  font-size: 11px;
+  opacity: 0.65;
+}
+
+.hh-track-list,
+.hh-resident-list,
+.hh-suggest-list {
+  display: grid;
+  gap: 8px;
+}
+
+.hh-track,
+.hh-resident,
+.hh-suggest {
+  display: grid;
+  gap: 6px;
+  padding: 10px 10px;
+  border-radius: 8px;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  background: rgba(0, 0, 0, 0.18);
+  cursor: pointer;
+  text-align: left;
+  color: inherit;
+  width: 100%;
+}
+.hh-track:hover,
+.hh-resident:hover {
+  border-color: rgba(103, 182, 255, 0.35);
+}
+.hh-track.selected {
+  border-color: rgba(103, 182, 255, 0.7);
+  background: rgba(103, 182, 255, 0.1);
+}
+.hh-track.disabled {
+  opacity: 0.55;
+  cursor: default;
+}
+
+.hh-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+.hh-dot {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+.hh-name {
+  font-weight: 600;
+  font-size: 13px;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.hh-mono {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: 11px;
+  opacity: 0.8;
+}
+.hh-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+.hh-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 7px;
+  border-radius: 999px;
+  font-size: 11px;
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  background: rgba(15, 21, 29, 0.8);
+}
+.hh-chip.resident {
+  border-color: rgba(67, 209, 123, 0.45);
+  color: #b8f0cd;
+}
+.hh-chip.visitor {
+  border-color: rgba(103, 182, 255, 0.45);
+  color: #cfe0ff;
+}
+.hh-chip.provisional {
+  border-color: rgba(255, 217, 94, 0.45);
+  color: #ffe9a8;
+}
+.hh-chip.warn {
+  border-color: rgba(255, 107, 107, 0.4);
+  color: #ffc9c9;
+}
+
+.hh-form {
+  display: grid;
+  gap: 8px;
+  padding-top: 4px;
+  border-top: 1px solid rgba(255, 255, 255, 0.06);
+}
+.hh-label {
+  font-size: 11px;
+  opacity: 0.7;
+}
+.hh-input {
+  width: 100%;
+  background: #0b1018;
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  color: inherit;
+  border-radius: 8px;
+  padding: 8px 10px;
+  font-size: 14px;
+}
+.hh-input:focus {
+  outline: none;
+  border-color: rgba(103, 182, 255, 0.65);
+}
+.hh-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: center;
+}
+.hh-hint {
+  font-size: 11px;
+  opacity: 0.65;
+  line-height: 1.35;
+}
+
+.hh-resident-actions {
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+.hh-resident-actions .btn {
+  padding: 5px 9px;
+  font-size: 12px;
+}
+
+.hh-health-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 6px 12px;
+  font-size: 12px;
+}
+.hh-health-grid dt {
+  opacity: 0.65;
+}
+.hh-health-grid dd {
+  margin: 0;
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+}
+
+.hh-suggest {
+  cursor: default;
+}
+.hh-suggest.blocked {
+  opacity: 0.7;
+}
+
+.hh-empty {
+  font-size: 12px;
+  opacity: 0.65;
+  padding: 4px 0;
+}
+
+.hh-details > summary {
+  cursor: pointer;
+  font-size: 13px;
+  font-weight: 600;
+  list-style: none;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+.hh-details > summary::-webkit-details-marker {
+  display: none;
+}
+.hh-details > summary::after {
+  content: '▸';
+  opacity: 0.55;
+  font-size: 12px;
+}
+.hh-details[open] > summary::after {
+  content: '▾';
+}
+.hh-details-body {
+  margin-top: 10px;
+  display: grid;
+  gap: 10px;
+}
+
+.hh-footer-note {
+  font-size: 11px;
+  opacity: 0.55;
+  line-height: 1.4;
+}

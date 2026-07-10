@@ -29,8 +29,9 @@ yet fully splitting resident/visitor spaces.
 ### Household mode activation
 
 Env (preferred for DS8 runtime parity):
-- `NOESIS_HOUSEHOLD_IDENTITY=1` enables household behavior
-- `NOESIS_HOUSEHOLD_ARCHIVE_STATE=1` (default on) archives legacy files once
+- Household is **ON by default** (`NOESIS_HOUSEHOLD_IDENTITY` unset or `1`).
+  Opt out with `NOESIS_HOUSEHOLD_IDENTITY=0` for legacy open-world debugging.
+- `NOESIS_HOUSEHOLD_ARCHIVE_STATE=1` (default on when household on) archives legacy files once
 - `NOESIS_CAMERA_TOPOLOGY_FILE=config/camera_topology.yaml`
 
 When enabled, `_build_stable_id_manager` sets:

@@ -142,6 +142,9 @@ and worklogs live in `docs/history/`.
 ## Doc changes (2026-05-11)
 - Updated BEV/floorplan telemetry docs and DS8 progress notes for registered-depth-only BEV display, shared clean floorplan layers across rooms, floorplan-surface snap/drop validity, and height-map inline BEV rendering (`DS8_api_contracts_ws.md`, `Telemetry_Schema.md`, `plans/DS8/ds8_design_decisions.md`, `plans/DS8/ds8_migration_checklist_telemetry.md`).
 
+## Doc changes (2026-07-09)
+- Clarified household identity is ON by default (`NOESIS_HOUSEHOLD_IDENTITY` unset/`1`; opt out with `=0`) in REST contracts and household plan docs (`DS8_api_contracts_rest.md`, `plans/household_identity/*`).
+
 ## Doc changes (2026-07-08)
 - Documented producer-owned human pathing realism (`PersonGroundState`): stationary/idle lock, posture-aware floor contact, source hysteresis, human CV filter, trail non-append while locked, and public `motion_mode` / `posture` / `trail_append_allowed` / `idle_jitter_m` fields on tracking + BEV payloads (`DS8_Baselines.md`, `DS8_api_contracts_ws.md`, `DS8_metadata_contracts.md`, `Telemetry_Schema.md`, `DS8_MIGRATION_KNOWLEDGE_BASE.md`, `DS8_README_FOR_AGENTS.md`, `plans/DS8/ds8_design_decisions.md`).
 

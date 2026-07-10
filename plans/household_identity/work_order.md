@@ -19,6 +19,7 @@ Master execution checklist. Update checkboxes with dated notes as work lands.
   _2026-07-08: Swin default, quality gallery, MNN; live perf spot-check still open; SOLIDER deferred._
 - [x] **G3** Phase 3 complete (MVP)
   _2026-07-08: residents CRUD + health + FE name display._
+  _2026-07-09: oai2-fe People drawer for enroll/rename/remove + health/suggest._
 
 ---
 
@@ -113,4 +114,4 @@ Reference: `phase3_enrollment_product.md`
 ## Validation log
 
 - _2026-07-08: 21 household identity unit tests passed; docs consistency PASSED._
-- _2026-07-08: Enable with `NOESIS_HOUSEHOLD_IDENTITY=1` (archives legacy `~/.noesis` identity files on first start)._
+- _2026-07-09: Household default-on cutover; unset env enables closed-world path; opt out with `NOESIS_HOUSEHOLD_IDENTITY=0`. First start archives legacy `~/.noesis` identity files._

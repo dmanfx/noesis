@@ -172,3 +172,4 @@ tests/*
 !tests/test_stable_id_provisional.py
 !tests/test_stable_id_resident_visitor.py
 !tests/test_world_before_stable_id_ordering.py
+!tests/test_v3dt_world_ground_state.py

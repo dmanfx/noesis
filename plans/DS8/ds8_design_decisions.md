@@ -15,6 +15,13 @@ Use this file to record non-trivial design choices made during the DS8 migration
 
 - **Date:** 2026-07-09
 - **Author:** Codex
+- **Area:** V3DT performance + BEV/world usefulness
+- **Decision:** (1) Gate StableID pose JSON extraction with `needs_pose_update` in baseline + V3DT hooks. (2) Treat `v3dt_bbox3d_foot` as live tracking in BEV. (3) Refine bbox3d/V3DT seeded world through `PersonGroundState` (smooth + idle lock + `trail_append_allowed`) instead of early-returning raw measurements. (4) Key world smoother by `stable_id` when present. (5) Raise baseline tracker `poseInferenceInterval` 2→4 to cut BodyPose3DNet GPU load.
+- **Rationale:** Default V3DT path was CPU-heavy on every-frame pose feature parse and produced jumpy BEV trails because bbox3d world bypassed ground-state and BEV ignored `v3dt_bbox3d_foot`. Tracker-internal BodyPose3DNet remains the largest GPU cost; interval 4 matches reimpl defaults without dropping pose usefulness for household identity.
+- **References:** `noesis/pipelines/hooks_v3dt_reimpl.py`, `noesis/pipelines/hooks.py`, `noesis/telemetry/bev.py`, `config/v3dt/nvtracker_v3dt_baseline.yml`, `tests/test_v3dt_world_ground_state.py`
+
+- **Date:** 2026-07-09
+- **Author:** Codex
 - **Area:** Identity / Household mode default-on cutover
 - **Decision:** Default `NOESIS_HOUSEHOLD_IDENTITY=1` (opt out with `=0`). Production identity is closed-world residents/visitors with geometry-aware exclusivity. Audit blockers cleared: provisional active records, enroll/delete `_remap_sid`, world-before-StableID, pose path through `_gallery_match_ok`. First start still archives legacy `~/.noesis` gallery/aliases into `~/.noesis/household/backups/`.
 - **Rationale:** Household mode was the point of the ReID refactor; leaving it off hid the product path. Open correctness bugs from the composer pass are fixed and covered by unit tests.

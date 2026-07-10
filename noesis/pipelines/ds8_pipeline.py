@@ -1253,8 +1253,8 @@ def build_pipeline(yaml_path: str | Path) -> DS8Pipeline:
             "process-mode": osd_process_mode,
             # Show instance segmentation masks from NvDsInferInstanceMaskInfo
             "display-mask": 1,
-            # Hide bbox rectangles to emphasize masks; set to 1 if you want both
-            "display-bbox": 0,
+            # Draw bbox rectangles alongside masks
+            "display-bbox": 1,
             # Keep labels visible (class name + confidence)
             "display-text": 1,
         },

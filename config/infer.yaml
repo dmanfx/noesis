@@ -172,7 +172,7 @@ bev:
 osd:
   process-mode: 0
   display-mask: 1
-  display-bbox: 0
+  display-bbox: 1
   display-text: 1
 
 visualization: # Visualization overlays rendered into the mosaic stream (tiler â†’ osd).
@@ -211,6 +211,6 @@ visualization: # Visualization overlays rendered into the mosaic stream (tiler â
     show_labels: false # Show ID labels along trails.
     color_key: stable_id # Use StableIDManager stable_id when available.
   osd_labels:
-    font_size: 18 # Label font size for nvdsosd text overlay.
+    font_size: 9 # Label font size for nvdsosd text overlay.
     font_name: Serif # Font family (must match ds_osd.FontFamily).
     decimals: 2 # Confidence decimals.

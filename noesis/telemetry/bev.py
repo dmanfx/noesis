@@ -1028,6 +1028,7 @@ class BevRenderer:
         source = str(anchor_source or "").strip().lower()
         return source in {
             "bbox3d",
+            "v3dt_bbox3d_foot",
             "pose_depth_fused",
             "person_anchor_depth_fused",
             "pose_floor_only",
@@ -1040,6 +1041,7 @@ class BevRenderer:
         source = str(anchor_source or "").strip().lower()
         return source in {
             "bbox3d",
+            "v3dt_bbox3d_foot",
             "pose_depth_fused",
             "person_anchor_depth_fused",
         }
@@ -1979,9 +1981,6 @@ class BevRenderer:
                     while state.points and (now_s - float(state.points[0][0])) > window_s:
                         state.points.popleft()
 
-                    if not do_sample:
-                        continue
-
                     x = float(lx)
                     z = float(lz)
                     append_allowed = bool(point_meta.get("trail_append_allowed", True))
@@ -2028,6 +2027,8 @@ class BevRenderer:
                         if state.points:
                             prev_ts, _px, _pz = state.points[-1]
                             state.points[-1] = (float(prev_ts), float(x), float(z))
+                        continue
+                    if not do_sample:
                         continue
                     if min_dt_s > 0.0 and state.points:
                         prev_ts, prev_x, prev_z = state.points[-1]

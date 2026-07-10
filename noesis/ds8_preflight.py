@@ -135,7 +135,7 @@ def mask_output_available(props: Mapping[str, Any]) -> bool:
 
 def derive_osd_policy_from_ini(props: Mapping[str, Any]) -> Dict[str, int]:
     if mask_output_available(props):
-        return {"process-mode": 0, "display-mask": 1, "display-bbox": 0, "display-text": 1}
+        return {"process-mode": 0, "display-mask": 1, "display-bbox": 1, "display-text": 1}
     return {"process-mode": 0, "display-mask": 0, "display-bbox": 1, "display-text": 1}
 
 
@@ -289,7 +289,7 @@ def validate_metadata_compatibility(
                     Severity.WARN,
                     "metadata.osd.policy_mismatch",
                     "Configured OSD display policy does not match the PGIE metadata contract.",
-                    "Let the console materialize the launch YAML so detect uses bbox and seg uses masks.",
+                    "Let the console materialize the launch YAML so detect uses bbox and seg uses masks+bbox.",
                     json.dumps({"configured": dict(current_osd), "expected": osd_policy}, sort_keys=True),
                 )
             )

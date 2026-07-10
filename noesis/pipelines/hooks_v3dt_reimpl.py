@@ -6384,7 +6384,13 @@ class _AnalyticsTelemetryProcessor:
                             else:
                                 self._reid_debug_emb_found += 1
 
-                pose_features, pose_quality = self._extract_stable_id_pose_inputs(obj_meta, mgr)
+                pose_features, pose_quality = self._extract_stable_id_pose_inputs(
+                    obj_meta,
+                    mgr,
+                    sensor_id=int(sensor_id),
+                    track_id=int(track_id),
+                    now_ts=float(now_ts),
+                )
                 # bbox3d often seeds world above; still augment before StableID
                 # when missing so overlap permits are not denied as missing_world.
                 world_xy, world_valid, pose_kpts_abs, depth_result = (
@@ -6699,7 +6705,13 @@ class _AnalyticsTelemetryProcessor:
                     zone = _fallback_zone_from_camera(camera_id)
 
                 mgr = getattr(self.pipeline, "stable_id_mgr", None)
-                pose_features, pose_quality = self._extract_stable_id_pose_inputs(obj_meta, mgr)
+                pose_features, pose_quality = self._extract_stable_id_pose_inputs(
+                    obj_meta,
+                    mgr,
+                    sensor_id=int(sensor_id),
+                    track_id=int(track_id),
+                    now_ts=float(now_ts),
+                )
                 world_xy, world_valid, pose_kpts_abs, depth_result = (
                     self._ensure_world_before_stable_id(
                         sensor_id,
@@ -7347,14 +7359,19 @@ class _AnalyticsTelemetryProcessor:
         return False, False
 
     def _world_track_key(self, sensor_id: int, track: Mapping[str, Any]) -> Optional[Tuple[int, int]]:
-        tracker_id = track.get("tracker_id", track.get("track_id"))
-        try:
-            tracker_id_int = int(tracker_id)
-        except Exception:
-            return None
-        if tracker_id_int < 0:
-            return None
-        return int(sensor_id), int(tracker_id_int)
+        # Prefer stable_id so PersonGroundState survives SV3DT tracker reassignments.
+        for key_name in ("stable_id", "tracker_id", "track_id"):
+            raw = track.get(key_name)
+            if raw is None:
+                continue
+            try:
+                id_int = int(raw)
+            except Exception:
+                continue
+            if id_int < 0:
+                continue
+            return int(sensor_id), int(id_int)
+        return None
 
     def _maybe_prune_world_state(self, now_ts: float) -> None:
         if not self._world_state_by_track:
@@ -7932,6 +7949,121 @@ class _AnalyticsTelemetryProcessor:
         except Exception:
             return
 
+    def _refine_seeded_world_with_ground_state(
+        self,
+        sensor_id: int,
+        camera_id: str,
+        track: Dict[str, Any],
+        *,
+        world_source_label: str,
+    ) -> None:
+        """Smooth + idle-lock a pre-seeded world measurement (bbox3d / V3DT foot).
+
+        Keeps the producer world_source label so BEV/overlap treat it as live
+        tracking, while restoring PersonGroundState continuity that the early
+        return previously skipped.
+        """
+        if self.bev_calibration is None:
+            track.setdefault("world_quality", "good")
+            track.setdefault("world_frame", self._world_frame)
+            return
+        if track.get("world_valid") is not True:
+            return
+        world = track.get("world")
+        if not isinstance(world, (list, tuple)) or len(world) < 3:
+            return
+        try:
+            mx = float(world[0])
+            my = float(world[1])
+            mz = float(world[2])
+        except Exception:
+            return
+        if not (math.isfinite(mx) and math.isfinite(my) and math.isfinite(mz)):
+            return
+
+        try:
+            calib = self.bev_calibration.snapshot(sensor_id, camera_id)
+            if calib is None or calib.intrinsics is None or calib.extrinsics_col_major is None:
+                track.setdefault("world_quality", "good")
+                track.setdefault("world_frame", self._world_frame)
+                return
+
+            now_ts = float(time.time())
+            world_key = self._world_track_key(sensor_id, track)
+            self._maybe_prune_world_state(now_ts)
+            state: Optional[_WorldAnchorState] = None
+            if world_key is not None:
+                state = self._world_state_by_track.get(world_key)
+                if state is None:
+                    state = _WorldAnchorState()
+                    self._world_state_by_track[world_key] = state
+                state.ts = float(now_ts)
+
+            measurement = np.array([mx, float(calib.floor_y), mz], dtype=np.float64)
+            hit = self._update_world_state(
+                state,
+                measurement=measurement,
+                floor_y=float(calib.floor_y),
+                now_ts=float(now_ts),
+                alpha=float(self._world_smooth_alpha_good),
+                beta=max(0.0, min(1.0, float(self._world_smooth_alpha_good) * 0.25)),
+                quality="good",
+            )
+
+            image_uv = None
+            for key in ("image_base", "image_foot"):
+                raw_uv = track.get(key)
+                if isinstance(raw_uv, (list, tuple)) and len(raw_uv) >= 2:
+                    try:
+                        image_uv = (float(raw_uv[0]), float(raw_uv[1]))
+                        break
+                    except Exception:
+                        image_uv = None
+            if state is not None:
+                update_motion_mode(
+                    state,
+                    now_ts=float(now_ts),
+                    image_foot_uv=image_uv,
+                    config=self._human_ground_cfg,
+                )
+                if state.motion_mode in ("idle", "sit", "lie") and state.locked_world is not None:
+                    hit = np.array(
+                        [float(state.locked_world[0]), float(calib.floor_y), float(state.locked_world[1])],
+                        dtype=np.float64,
+                    )
+                    state.world_x = float(state.locked_world[0])
+                    state.world_z = float(state.locked_world[1])
+                    state.vel_world_x = 0.0
+                    state.vel_world_z = 0.0
+
+            flip_u, flip_v = self._infer_image_flips(camera_id, calib)
+            self._set_track_image_base_from_world(
+                track,
+                calib=calib,
+                world_point=hit,
+                flip_u=flip_u,
+                flip_v=flip_v,
+            )
+            wx = float(hit[0])
+            wy = float(hit[1])
+            wz = float(hit[2])
+            track["world"] = [float(wx), float(wy), float(wz)]
+            track["world_valid"] = True
+            track.setdefault("world_quality", "good")
+            track["world_frame"] = self._world_frame
+            track["world_source"] = str(world_source_label)
+            if state is not None:
+                state.sticky_source = str(world_source_label)
+                for key, value in state.as_public_fields().items():
+                    if value is not None:
+                        track[key] = value
+                state.last_good_world = (float(wx), float(wy), float(wz))
+                state.last_good_ts = float(now_ts)
+                state.ts = float(now_ts)
+        except Exception:
+            track.setdefault("world_quality", "good")
+            track.setdefault("world_frame", self._world_frame)
+
     def _augment_track_with_world(
         self,
         sensor_id: int,
@@ -7947,13 +8079,21 @@ class _AnalyticsTelemetryProcessor:
             return
         if getattr(self, "_is_v3dt_world_source", None) is not None and callable(self._is_v3dt_world_source) and self._is_v3dt_world_source(track.get("world_source")):
             if track.get("world_valid") is True:
-                track.setdefault("world_quality", "good")
-                track.setdefault("world_frame", self._world_frame)
+                self._refine_seeded_world_with_ground_state(
+                    sensor_id,
+                    camera_id,
+                    track,
+                    world_source_label=str(track.get("world_source") or V3DT_WORLD_SOURCE_BBOX3D_FOOT),
+                )
             return
         if track.get("world_source") == "bbox3d":
             if track.get("world_valid") is True:
-                track.setdefault("world_quality", "good")
-                track.setdefault("world_frame", self._world_frame)
+                self._refine_seeded_world_with_ground_state(
+                    sensor_id,
+                    camera_id,
+                    track,
+                    world_source_label="bbox3d",
+                )
             return
         if track.get("world") is not None and track.get("world_valid") is True:
             track.setdefault("world_quality", "good")
@@ -8629,14 +8769,33 @@ class _AnalyticsTelemetryProcessor:
         except Exception:
             return
 
+    def _extract_pose_payload(self, obj_meta: Any) -> Optional[Dict[str, Any]]:
+        """Pose feature JSON for StableID (same source as floor-anchor payload)."""
+        return self._extract_pose_payload_for_anchor(obj_meta)
+
     def _extract_stable_id_pose_inputs(
         self,
         obj_meta: Any,
         mgr: Any,
+        *,
+        sensor_id: Optional[int] = None,
+        track_id: Optional[int] = None,
+        now_ts: Optional[float] = None,
     ) -> Tuple[Optional[Dict[str, float]], Optional[Dict[str, float]]]:
         if mgr is None or not bool(getattr(mgr, "pose_enabled", False)):
             return None, None
-        payload = self._extract_pose_payload(obj_meta)
+        needs_fn = getattr(mgr, "needs_pose_update", None)
+        if callable(needs_fn) and sensor_id is not None and track_id is not None:
+            try:
+                ts = float(now_ts if now_ts is not None else time.time())
+                if not bool(needs_fn(int(sensor_id), int(track_id), ts)):
+                    return None, None
+            except Exception:
+                pass
+        try:
+            payload = self._extract_pose_payload(obj_meta)
+        except Exception:
+            return None, None
         if payload is None:
             return None, None
         raw_features = payload.get("features")
@@ -9000,7 +9159,7 @@ class _AnalyticsTelemetryProcessor:
 @dataclass
 class _OsdLabelProcessor:
     decimals: int = 2
-    font_size: Optional[int] = 22
+    font_size: Optional[int] = 11
     font_name: Optional[str] = "Sans"
     show_both_ids: bool = False
     stable_id_mgr: Any = field(default=None, repr=False)
@@ -9030,8 +9189,8 @@ class _OsdLabelProcessor:
         decimals = max(0, decimals)
 
         font_size_env = str(os.environ.get("NOESIS_OSD_LABEL_FONT_SIZE", "")).strip()
-        font_size_raw = font_size_env if font_size_env else cfg.get("font_size", 22)
-        font_size = _int(font_size_raw, 22)
+        font_size_raw = font_size_env if font_size_env else cfg.get("font_size", 11)
+        font_size = _int(font_size_raw, 11)
         font_size = max(1, font_size)
 
         font_name_env = str(os.environ.get("NOESIS_OSD_LABEL_FONT_NAME", "")).strip()
@@ -9150,23 +9309,6 @@ class _OsdLabelProcessor:
         sensor_id: int,
         stable_id_override: Optional[int] = None,
     ) -> str:
-        label = ""
-        for attr in ("label", "obj_label"):
-            try:
-                value = getattr(obj_meta, attr, None)
-            except Exception:
-                value = None
-            if value:
-                label = _clean_osd_base_label(str(value).strip())
-            if label:
-                break
-        if not label:
-            try:
-                class_id = int(getattr(obj_meta, "class_id", -1))
-            except Exception:
-                class_id = -1
-            label = f"class {class_id}" if class_id >= 0 else "class"
-
         try:
             class_id = int(getattr(obj_meta, "class_id", -1))
         except Exception:
@@ -9176,8 +9318,7 @@ class _OsdLabelProcessor:
         except Exception:
             track_id = -1
 
-        parts: List[str] = [label]
-        # Stable IDs are people-only; avoid showing raw tracker IDs for other classes.
+        # People: compact "#id confidence" (no class name / depth).
         if class_id == 0 and track_id >= 0:
             stable_id = stable_id_override
             if stable_id is None:
@@ -9189,36 +9330,26 @@ class _OsdLabelProcessor:
             if self.show_both_ids:
                 tracker_text = str(track_id) if track_id >= 0 else "XX"
                 stable_text = str(stable_id_int) if stable_id_int is not None and stable_id_int > 0 else "XX"
-                parts.append(f"[{tracker_text}] | [{stable_text}]")
+                id_text = f"[{tracker_text}]|[{stable_text}]"
+            elif stable_id_int is not None and stable_id_int > 0:
+                id_text = f"#{stable_id_int}"
             else:
-                if stable_id_int is not None and stable_id_int > 0:
-                    parts.append(f"{stable_id_int}")
-                else:
-                    parts.append("XX")
-        base_label = " ".join([p for p in parts if p]).strip()
-
-        depth_text = None
-        if class_id == 0:
-            depth_override = getattr(obj_meta, "_noesis_depth_used_m", None)
-            if depth_override is not None:
+                id_text = "#XX"
+            base_label = id_text
+        else:
+            label = ""
+            for attr in ("label", "obj_label"):
                 try:
-                    depth_val = float(depth_override)
+                    value = getattr(obj_meta, attr, None)
                 except Exception:
-                    depth_val = float("nan")
-                if math.isfinite(depth_val) and depth_val > 0.0:
-                    depth_text = f"z={depth_val:.{max(0, int(self.decimals))}f}m"
-                else:
-                    depth_text = "z=n/a"
-            else:
-                depth_text = _format_depth_label_fragment(
-                    _extract_object_depth_result_from_meta(obj_meta),
-                    decimals=self.decimals,
-                )
-        if depth_text:
-            if base_label:
-                base_label = f"{base_label} {depth_text}"
-            else:
-                base_label = depth_text
+                    value = None
+                if value:
+                    label = _clean_osd_base_label(str(value).strip())
+                if label:
+                    break
+            if not label:
+                label = f"class {class_id}" if class_id >= 0 else "class"
+            base_label = label
 
         try:
             confidence = float(getattr(obj_meta, "confidence", float("nan")))

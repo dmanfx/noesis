@@ -118,4 +118,6 @@ PoseEstimator:
   netScaleFactor: 0.00392156
   onnxFile: models/bodypose3dnet/bodypose3dnet_accuracy.onnx
   modelEngineFile: models/engines/bodypose3dnet_accuracy_b1_fp16.engine
-  poseInferenceInterval: 2
+  # Interval 4 cuts BodyPose3DNet GPU load ~2x vs every-other-frame while
+  # keeping usable pose for StableID / floor anchors (household default).
+  poseInferenceInterval: 4

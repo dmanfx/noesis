@@ -14,36 +14,40 @@ streammux:
 sources:
 - element: nvurisrcbin
   #living room camera
-  #uri: rtsp://192.168.3.214:7447/jdr9oLlBkjyl3gDm?
-  uri: file:///home/mayor/Downloads/livingroomclip.mp4
+  uri: rtsp://192.168.3.214:7447/jdr9oLlBkjyl3gDm?
+  #uri: file:///home/mayor/Downloads/livingroomclip.mp4
   gpu-id: 0
   cudadec-memtype: 0
   latency: 10
   select-rtp-protocol: 4
-- element: nvurisrcbin
-  #kitchen camera
-  #uri: rtsp://192.168.3.214:7447/qt3VqVdZpgG1B4Vk?
-  uri: file:///home/mayor/Downloads/kitchenclip.mp4
-  gpu-id: 0
-  cudadec-memtype: 0
-  latency: 10
-  select-rtp-protocol: 4
-- element: nvurisrcbin
-  #family room camera
-  #uri: rtsp://192.168.3.214:7447/4qWTBhW6b4nLeUFE?
-  uri: file:///home/mayor/Downloads/familyroomclip.mp4
-  gpu-id: 0
-  cudadec-memtype: 0
-  latency: 10
-  select-rtp-protocol: 4
+  disable-audio: true
   dewarper:
     enable: true
-    config-file: config/dewarper_v3dt_baseline.txt
-    source-id: 2
-    num-output-buffers: 1
-    num-batch-buffers: 1
-    gpu-id: 0
-    nvbuf-memory-type: 0
+    config-file: config/dewarper_g3_instant_charuco_1080.txt
+- element: nvurisrcbin
+  #kitchen camera
+  uri: rtsp://192.168.3.214:7447/qt3VqVdZpgG1B4Vk?
+  #uri: file:///home/mayor/Downloads/kitchenclip.mp4
+  gpu-id: 0
+  cudadec-memtype: 0
+  latency: 10
+  select-rtp-protocol: 4
+  disable-audio: true
+  dewarper:
+    enable: true
+    config-file: config/dewarper_g3_instant_charuco_1080.txt
+- element: nvurisrcbin
+  #family room camera
+  uri: rtsp://192.168.3.214:7447/4qWTBhW6b4nLeUFE?
+  #uri: file:///home/mayor/Downloads/familyroomclip.mp4
+  gpu-id: 0
+  cudadec-memtype: 0
+  latency: 10
+  select-rtp-protocol: 4
+  disable-audio: true
+  dewarper:
+    enable: true
+    config-file: config/dewarper_g4_instant_charuco_720_to_1080.txt
 preprocess:
   enable: true
   config-file: pipelines/config_preproc.ini
@@ -136,7 +140,7 @@ visualization:
     show_labels: false
     color_key: stable_id
   osd_labels:
-    font_size: 18
+    font_size: 9
     font_name: Serif
     decimals: 2
 v3dt:

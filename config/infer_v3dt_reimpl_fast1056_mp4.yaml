@@ -25,8 +25,9 @@ streammux:
 sources:
   - element: nvurisrcbin
     #uri: rtsp://192.168.3.214:7447/jdr9oLlBkjyl3gDm?
+    uri: rtsp://192.168.3.214:7447/jdr9oLlBkjyl3gDm?
     #uri: file:///home/mayor/Downloads/livingroomclip.mp4
-    uri: file:///home/mayor/Videos/Living Room.mp4
+    #uri: file:///home/mayor/Videos/Living Room.mp4
     gpu-id: 0
     cudadec-memtype: 0
     latency: 100
@@ -39,7 +40,8 @@ sources:
     #kitchen camera
     #uri: rtsp://192.168.3.214:7447/qt3VqVdZpgG1B4Vk?
     #uri: file:///home/mayor/Downloads/kitchenclip.mp4
-    uri: file:///home/mayor/Videos/Kitchen.mp4
+    uri: rtsp://192.168.3.214:7447/qt3VqVdZpgG1B4Vk?
+    #uri: file:///home/mayor/Videos/Kitchen.mp4
     gpu-id: 0
     cudadec-memtype: 0
     latency: 100
@@ -52,7 +54,8 @@ sources:
     #family room camera
     #uri: rtsp://192.168.3.214:7447/4qWTBhW6b4nLeUFE?
     #uri: file:///home/mayor/Downloads/familyroomclip.mp4
-    uri: file:///home/mayor/Videos/Family Room.mp4
+    uri: rtsp://192.168.3.214:7447/4qWTBhW6b4nLeUFE?
+    #uri: file:///home/mayor/Videos/Family Room.mp4
     gpu-id: 0
     cudadec-memtype: 0
     latency: 100
@@ -225,7 +228,7 @@ visualization: # Visualization overlays rendered into the mosaic stream (tiler â
     show_labels: false # Show ID labels along trails.
     color_key: stable_id # Use StableIDManager stable_id when available.
   osd_labels:
-    font_size: 18 # Label font size for nvdsosd text overlay.
+    font_size: 9 # Label font size for nvdsosd text overlay.
     font_name: Serif # Font family (must match ds_osd.FontFamily).
     decimals: 2 # Confidence decimals.
 

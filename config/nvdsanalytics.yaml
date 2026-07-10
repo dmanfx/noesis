@@ -17,7 +17,7 @@ analytics:
         '0':
           label: living_room
           roi_filtering:
-            enable: true
+            enable: false
             rois:
             - id: RF3
               description: Mirror
@@ -28,8 +28,8 @@ analytics:
                 - 651.0
               - - 286.0
                 - 596.0
-              - - 161.0
-                - 358.0
+              - - 180.0
+                - 342.0
             - id: RF4
               description: TV
               points_px:
@@ -76,14 +76,14 @@ analytics:
             - id: RF2
               description: TV
               points_px:
-              - - 7.0
-                - 811.0
               - - 0.0
-                - 225.85493230174075
-              - - 195.0
-                - 241.0
-              - - 227.0
-                - 570.0
+                - 885.0
+              - - 0.0
+                - 178.0
+              - - 188.0
+                - 207.0
+              - - 253.0
+                - 577.0
             - id: RF3
               description: window
               points_px:

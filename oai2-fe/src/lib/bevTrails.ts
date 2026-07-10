@@ -55,7 +55,7 @@ export const DEFAULT_BEV_TRAIL_CONFIG: BevTrailConfig = {
   max_speed_px_per_s: 1800.0,
   max_points_per_track: 257,
   max_tracks: 8,
-  min_alpha: 0.15,
+  min_alpha: 0.12,
   gap_ms: 650,
   stale_blink_start_ms: 700,
   stale_blink_period_ms: 1400,
@@ -175,6 +175,25 @@ export const normalizeBevTrailConfig = (raw?: Partial<BevTrailConfig>): BevTrail
     teleport_break_ratio: Math.max(1.0, clampNumber(cfg.teleport_break_ratio, DEFAULT_BEV_TRAIL_CONFIG.teleport_break_ratio)),
   };
 };
+
+export const computeTrailAgeAlpha = (
+  nowMs: number,
+  sampleMs: number,
+  windowMs: number,
+  minAlpha: number,
+): number => {
+  const ageMs = Math.max(0, nowMs - sampleMs);
+  const frac = Math.max(0, Math.min(1, 1 - (ageMs / windowMs)));
+  return minAlpha + (1 - minAlpha) * frac;
+};
+
+export const computeSegmentAlpha = (
+  nowMs: number,
+  t0: number,
+  t1: number,
+  windowMs: number,
+  minAlpha: number,
+): number => computeTrailAgeAlpha(nowMs, (t0 + t1) * 0.5, windowMs, minAlpha);
 
 export const computeSceneUnitsPerPx = (bounds: BoundsLike): number => {
   const spanX = Math.max(1e-6, Number(bounds.xMax) - Number(bounds.xMin));

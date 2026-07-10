@@ -9,6 +9,8 @@ import {
   type TrailPoint,
   type TrailTrack,
   computeSceneUnitsPerPx,
+  computeSegmentAlpha,
+  computeTrailAgeAlpha,
   normalizeBevTrailConfig,
   pruneTrailCollection,
   upsertTrailSample,
@@ -145,6 +147,8 @@ type FloorplanVisualSelection = {
 };
 
 const TRAIL_LINE_WIDTH = 2.5;
+const TRAIL_HEAD_RADIUS = 4.5;
+const TRAIL_CONNECTOR_MIN_PX = 2.0;
 
 type TrailClock = {
   lastSrcMs?: number;
@@ -1150,71 +1154,101 @@ export const BevView: React.FC<BevViewProps> = ({
             .filter((tr): tr is TrailTrack => tr !== null)
           : null;
         const tracksToDraw = backendTracks ?? Array.from(trailsRef.current.values());
+        const headByLabel = new Map<string, { x: number; y: number; colorId: number; lastSeen: number }>();
+        for (const [, data] of smoothState.current.entries()) {
+          if (!data.stableId) continue;
+          headByLabel.set(String(data.stableId), {
+            x: data.x,
+            y: data.y,
+            colorId: data.colorId,
+            lastSeen: data.lastSeen,
+          });
+        }
+        const drawnHeadLabels = new Set<string>();
+
+        const drawTrailHead = (label: string, colorId: number, head: { x: number; y: number; lastSeen: number }, lastDrawn: TrailPoint | null) => {
+          const headResolved = resolveForDraw(head.x, head.y);
+          if (!headResolved) return;
+          const headAlpha = computeTrailAgeAlpha(now, head.lastSeen, trailWindowMs, trailCfg.min_alpha);
+          const staleMs = Math.max(0, now - head.lastSeen);
+          let blink = 1.0;
+          if (trailCfg.stale_head_blink_enabled && staleMs >= trailCfg.stale_blink_start_ms) {
+            const blinkPhase = (2 * Math.PI * (now % trailCfg.stale_blink_period_ms)) / trailCfg.stale_blink_period_ms;
+            blink = 0.35 + 0.65 * (0.5 + 0.5 * Math.sin(blinkPhase));
+          }
+          const px = drawX(headResolved.x);
+          const py = drawY(headResolved.y);
+
+          if (lastDrawn) {
+            const tailPx = drawX(lastDrawn.x);
+            const tailPy = drawY(lastDrawn.y);
+            const gapPx = Math.hypot(px - tailPx, py - tailPy);
+            if (gapPx >= TRAIL_CONNECTOR_MIN_PX) {
+              ctx.strokeStyle = hsla(colorId, Math.min(1, headAlpha * 0.85));
+              ctx.lineWidth = TRAIL_LINE_WIDTH * 0.9;
+              ctx.beginPath();
+              ctx.moveTo(tailPx, tailPy);
+              ctx.lineTo(px, py);
+              ctx.stroke();
+            }
+          }
+
+          ctx.fillStyle = hsla(colorId, Math.min(1, (headAlpha * blink) + 0.25));
+          ctx.strokeStyle = 'rgba(0, 0, 0, 0.65)';
+          ctx.lineWidth = 1.5;
+          ctx.beginPath();
+          ctx.arc(px, py, TRAIL_HEAD_RADIUS, 0, 2 * Math.PI);
+          ctx.fill();
+          ctx.stroke();
+          drawnHeadLabels.add(label);
+        };
+
         for (const tr of tracksToDraw) {
           const pts = tr.points;
-          if (!pts || pts.length < 2) continue;
+          if (!pts || pts.length < 1) continue;
 
           ctx.lineCap = 'round';
           ctx.lineJoin = 'round';
-          ctx.lineWidth = TRAIL_LINE_WIDTH;
 
           let prev: TrailPoint | null = null;
+          let lastDrawn: TrailPoint | null = null;
           for (let i = 0; i < pts.length; i += 1) {
             const p = pts[i];
             const resolved = Number.isFinite(p.x) && Number.isFinite(p.y) ? resolveForDraw(p.x, p.y) : null;
-            const isGap = !resolved;
-            if (isGap) {
+            if (!resolved) {
               prev = null;
               continue;
             }
             const drawPoint = { ...p, x: resolved.x, y: resolved.y };
             if (!prev) {
               prev = drawPoint;
+              lastDrawn = drawPoint;
               continue;
             }
 
-            const ageMs = Math.max(0, now - drawPoint.t);
-            const frac = Math.max(0, Math.min(1, 1 - (ageMs / trailWindowMs)));
-            const alpha = trailCfg.min_alpha + (1 - trailCfg.min_alpha) * frac;
+            const alpha = computeSegmentAlpha(now, prev.t, drawPoint.t, trailWindowMs, trailCfg.min_alpha);
+            const frac = Math.max(0, Math.min(1, alpha));
+            const lineWidth = TRAIL_LINE_WIDTH * (0.55 + 0.45 * frac);
 
             ctx.strokeStyle = hsla(tr.colorId, alpha);
+            ctx.lineWidth = lineWidth;
             ctx.beginPath();
             ctx.moveTo(drawX(prev.x), drawY(prev.y));
             ctx.lineTo(drawX(drawPoint.x), drawY(drawPoint.y));
             ctx.stroke();
             prev = drawPoint;
+            lastDrawn = drawPoint;
           }
 
-          let lastValid: TrailPoint | null = null;
-          for (let i = pts.length - 1; i >= 0; i -= 1) {
-            const p = pts[i];
-            const resolved = Number.isFinite(p.x) && Number.isFinite(p.y) ? resolveForDraw(p.x, p.y) : null;
-            if (resolved) {
-              lastValid = { ...p, x: resolved.x, y: resolved.y };
-              break;
-            }
+          const head = headByLabel.get(tr.label);
+          if (head) {
+            drawTrailHead(tr.label, tr.colorId, head, lastDrawn);
           }
-          if (lastValid) {
-            const ageMs = Math.max(0, now - lastValid.t);
-            const frac = Math.max(0, Math.min(1, 1 - (ageMs / trailWindowMs)));
-            const alpha = trailCfg.min_alpha + (1 - trailCfg.min_alpha) * frac;
-            const staleMs = Math.max(0, now - (tr.lastSeen || 0));
-            let blink = 1.0;
-            if (trailCfg.stale_head_blink_enabled && staleMs >= trailCfg.stale_blink_start_ms) {
-              const blinkPhase = (2 * Math.PI * (now % trailCfg.stale_blink_period_ms)) / trailCfg.stale_blink_period_ms;
-              blink = 0.35 + 0.65 * (0.5 + 0.5 * Math.sin(blinkPhase));
-            }
-            const px = drawX(lastValid.x);
-            const py = drawY(lastValid.y);
+        }
 
-            ctx.fillStyle = hsla(tr.colorId, Math.min(1, (alpha * blink) + 0.25));
-            ctx.strokeStyle = 'rgba(0, 0, 0, 0.65)';
-            ctx.lineWidth = 1.5;
-            ctx.beginPath();
-            ctx.arc(px, py, 4.5, 0, 2 * Math.PI);
-            ctx.fill();
-            ctx.stroke();
-          }
+        for (const [label, head] of headByLabel.entries()) {
+          if (drawnHeadLabels.has(label)) continue;
+          drawTrailHead(label, head.colorId, head, null);
         }
       }
 
@@ -1224,22 +1258,9 @@ export const BevView: React.FC<BevViewProps> = ({
         const resolved = Number.isFinite(pt.x) && Number.isFinite(pt.y) ? resolveForDraw(pt.x, pt.y) : null;
         if (!resolved) return;
 
-        const px = drawX(resolved.x);
-        const py = drawY(resolved.y);
-
-        const alpha = Math.max(0, 1 - age / 500);
-        const colorId = Number.isFinite(pt.colorId) ? pt.colorId : 0;
-
-        ctx.globalAlpha = alpha;
-        ctx.beginPath();
-        ctx.arc(px, py, 3.8, 0, 2 * Math.PI);
-        ctx.fillStyle = `hsl(${hueForId(colorId)}, 80%, 60%)`;
-        ctx.fill();
-        ctx.strokeStyle = '#000';
-        ctx.lineWidth = 1.5;
-        ctx.stroke();
-
         if (pt.stableId) {
+          const px = drawX(resolved.x);
+          const py = drawY(resolved.y);
           ctx.fillStyle = '#fff';
           ctx.font = 'bold 12px sans-serif';
           ctx.shadowColor = 'black';
@@ -1247,7 +1268,6 @@ export const BevView: React.FC<BevViewProps> = ({
           ctx.fillText(pt.stableId, px + 8, py - 8);
           ctx.shadowBlur = 0;
         }
-        ctx.globalAlpha = 1.0;
       });
 
       // Camera marker at the bottom-center to preserve the BEV forward-view convention.

@@ -3,7 +3,7 @@ import time
 import math
 import logging
 from collections import defaultdict, deque
-from typing import Deque, Dict, List, Optional, Tuple, Any, Iterable
+from typing import Deque, Dict, List, Optional, Set, Tuple, Any, Iterable
 import heapq
 import os
 import json
@@ -598,10 +598,98 @@ class StableIDManager:
         kind = str(rec.get("identity_kind") or self._household_identity_kind(int(rec.get("stable_id", 0))))
         return kind in ("resident", "visitor")
 
-    def _household_alloc_provisional(self) -> int:
+    def _household_live_provisional_sids(self) -> Set[int]:
+        live: Set[int] = set()
+        for rec in self.active_tracks.values():
+            try:
+                sid = int(rec.get("stable_id", -1))
+            except Exception:
+                continue
+            if self._household_is_provisional_sid(sid):
+                live.add(sid)
+        for pending in self._pending_new_sids.values():
+            try:
+                sid = int(pending)
+            except Exception:
+                continue
+            if self._household_is_provisional_sid(sid):
+                live.add(sid)
+        return live
+
+    def _household_reclaim_orphan_provisionals(self) -> int:
+        if self._provisional_pool is None:
+            return 0
+        recycled = self._provisional_pool.reclaim_orphans(self._household_live_provisional_sids())
+        return int(len(recycled))
+
+    def _household_evict_oldest_provisional(self, *, exclude_key: Optional[Tuple[int, int]] = None) -> Optional[int]:
+        """Drop the oldest provisional active track and free its SID for reuse."""
+        oldest_key: Optional[Tuple[int, int]] = None
+        oldest_ts = float("inf")
+        oldest_sid: Optional[int] = None
+        for key, rec in self.active_tracks.items():
+            if exclude_key is not None and key == exclude_key:
+                continue
+            kind = str(rec.get("identity_kind") or "")
+            try:
+                sid = int(rec.get("stable_id", -1))
+            except Exception:
+                continue
+            if kind != "provisional" and not self._household_is_provisional_sid(sid):
+                continue
+            try:
+                last_ts = float(rec.get("last_seen_ts", rec.get("first_seen_ts", 0.0)))
+            except Exception:
+                last_ts = 0.0
+            if last_ts < oldest_ts:
+                oldest_ts = last_ts
+                oldest_key = key
+                oldest_sid = sid
+        if oldest_key is None or oldest_sid is None:
+            return None
+        self.active_tracks.pop(oldest_key, None)
+        self._pending_id_diag.pop(oldest_key, None)
+        self._pending_new_counts.pop(oldest_key, None)
+        self._pending_new_ts.pop(oldest_key, None)
+        self._pending_new_sids.pop(oldest_key, None)
+        self._household_emb_counts.pop(oldest_key, None)
+        zone_pairs = self.active_zones.get(int(oldest_sid), set())
+        if zone_pairs:
+            try:
+                sensor_int = int(oldest_key[0])
+                zone_pairs = {pair for pair in zone_pairs if int(pair[0]) != sensor_int}
+            except Exception:
+                zone_pairs = set()
+            if zone_pairs:
+                self.active_zones[int(oldest_sid)] = zone_pairs
+            else:
+                self.active_zones.pop(int(oldest_sid), None)
+        still_used = any(
+            int(r.get("stable_id", -1)) == int(oldest_sid) for r in self.active_tracks.values()
+        )
+        if not still_used:
+            self._household_release_provisional(int(oldest_sid))
+        return int(oldest_sid)
+
+    def _household_alloc_provisional(self, *, exclude_key: Optional[Tuple[int, int]] = None) -> int:
         if self._provisional_pool is None:
             return int(self._alloc_sid())
-        return int(self._provisional_pool.alloc())
+        # Safety net: release provisionals that are no longer live.
+        self._household_reclaim_orphan_provisionals()
+        try:
+            return int(self._provisional_pool.alloc())
+        except RuntimeError:
+            # Under tracker churn / false detections, evict oldest provisional and retry.
+            for _ in range(3):
+                freed = self._household_evict_oldest_provisional(exclude_key=exclude_key)
+                if freed is None:
+                    break
+                try:
+                    return int(self._provisional_pool.alloc())
+                except RuntimeError:
+                    continue
+            self._household_reclaim_orphan_provisionals()
+            return int(self._provisional_pool.alloc())
 
     def _household_release_provisional(self, sid: Optional[int]) -> None:
         if sid is None or self._provisional_pool is None:
@@ -609,10 +697,56 @@ class StableIDManager:
         if self._household_is_provisional_sid(int(sid)):
             self._provisional_pool.release(int(sid))
 
+    def _household_pressure_recycle_visitors(self, ts: float) -> int:
+        """Recycle inactive visitors immediately when the free pool is empty.
+
+        Under pressure, ghost entries for inactive visitors are dropped so the
+        closed visitor range can rotate instead of blocking forever.
+        """
+        if self._visitor_pool is None:
+            return 0
+        active_sids = {int(rec.get("stable_id")) for rec in self.active_tracks.values()}
+        recycled = 0
+        # Drop ghost claims for visitors that are not currently active.
+        for sensor_id, dq in list(self.ghosts.items()):
+            if not dq:
+                continue
+            kept = []
+            for ghost in dq:
+                try:
+                    g_sid = int(ghost.get("stable_id"))
+                except Exception:
+                    continue
+                if (
+                    self.visitor_id_min <= g_sid <= self.visitor_id_max
+                    and g_sid not in active_sids
+                ):
+                    continue
+                kept.append(ghost)
+            self.ghosts[int(sensor_id)].clear()
+            self.ghosts[int(sensor_id)].extend(kept)
+        for sid, _last in list(self._visitor_pool._last_seen.items()):
+            sid_int = int(sid)
+            if sid_int in active_sids:
+                continue
+            self._visitor_pool.release(sid_int)
+            self._purge_sid_state(sid_int)
+            recycled += 1
+        if recycled:
+            try:
+                self._visitor_pool.save()
+            except Exception:
+                pass
+        return int(recycled)
+
     def _household_mint_visitor(self, ts: float) -> int:
         if self._visitor_pool is None:
             raise RuntimeError("visitor pool unavailable in household mode")
-        sid = int(self._visitor_pool.alloc(float(ts)))
+        try:
+            sid = int(self._visitor_pool.alloc(float(ts)))
+        except RuntimeError:
+            self._household_pressure_recycle_visitors(float(ts))
+            sid = int(self._visitor_pool.alloc(float(ts)))
         self._mint_visitor_count += 1
         self.next_stable_id = max(int(self.next_stable_id), int(sid) + 1)
         return sid
@@ -3635,7 +3769,11 @@ class StableIDManager:
                             self.active_zones.pop(int(old_sid), None)
                     except Exception:
                         pass
-                    new_sid = int(self._household_alloc_provisional() if self.household_mode else self._alloc_sid())
+                    if self.household_mode:
+                        new_sid = int(self._household_alloc_provisional(exclude_key=key))
+                        self._household_apply_identity_meta(rec, sid=int(new_sid), kind="provisional")
+                    else:
+                        new_sid = int(self._alloc_sid())
                     self._sid_new_alloc_count += 1
                     self._sid_fragmentation_events += 1
                     if self.aliases_enabled:
@@ -3648,7 +3786,19 @@ class StableIDManager:
                     rec["identity_quality"] = "weak_no_embedding"
                     rec["first_seen_ts"] = float(ts)
                     rec["early_emb_reconcile_attempts"] = 0
+                    # Reset confirm counters so the split track must re-confirm.
+                    self._pending_new_counts[key] = 0
+                    self._pending_new_ts[key] = float(ts)
+                    self._household_emb_counts[key] = 0
                     self.active_zones[int(new_sid)].add((int(sensor_id), zone_existing))
+                    # If the abandoned SID was provisional and nobody holds it, free it.
+                    if self.household_mode and self._household_is_provisional_sid(int(old_sid)):
+                        still_used = any(
+                            int(r.get("stable_id", -1)) == int(old_sid)
+                            for r in self.active_tracks.values()
+                        )
+                        if not still_used:
+                            self._household_release_provisional(int(old_sid))
                     diag_event = "split_same_frame_conflict"
                     diag_reject_reason = "same_frame_sid_conflict"
                     diag_sid_candidate = int(old_sid)
@@ -3837,7 +3987,7 @@ class StableIDManager:
                         first_mint = pending_sid is None
                         if pending_sid is None:
                             if self.household_mode:
-                                pending_sid = int(self._household_alloc_provisional())
+                                pending_sid = int(self._household_alloc_provisional(exclude_key=key))
                                 self._provisional_event_count += 1
                             else:
                                 pending_sid = int(self._alloc_sid())
@@ -4771,6 +4921,16 @@ class StableIDManager:
                     # provisional_event_count = cumulative first-mint provisional events
                     "provisional_event_count": int(self._provisional_event_count),
                     "provisional_active_count": int(self._count_active_provisional()) if self.household_mode else 0,
+                    "provisional_pool_used": (
+                        int(self._provisional_pool.used_count())
+                        if self.household_mode and self._provisional_pool is not None
+                        else 0
+                    ),
+                    "provisional_pool_free": (
+                        int(self._provisional_pool.free_count())
+                        if self.household_mode and self._provisional_pool is not None
+                        else 0
+                    ),
                     "resident_count": int(len(self._household_resident_ids())) if self.household_mode else 0,
                     "visitor_count": int(
                         sum(

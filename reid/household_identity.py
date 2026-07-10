@@ -430,7 +430,9 @@ class ProvisionalPool:
         id_min: int = PROVISIONAL_ID_MIN,
         id_max: int = PROVISIONAL_ID_MAX,
     ) -> None:
-        self._pool = _SidPool(int(id_min), int(id_max))
+        self.id_min = int(id_min)
+        self.id_max = int(id_max)
+        self._pool = _SidPool(self.id_min, self.id_max)
 
     def alloc(self) -> int:
         return int(self._pool.alloc())
@@ -439,7 +441,29 @@ class ProvisionalPool:
         self._pool.release(int(sid))
 
     def is_provisional(self, sid: int) -> bool:
-        return PROVISIONAL_ID_MIN <= int(sid) <= PROVISIONAL_ID_MAX
+        return self.id_min <= int(sid) <= self.id_max
+
+    def used_sids(self) -> Set[int]:
+        return set(int(s) for s in self._pool._used)
+
+    def free_count(self) -> int:
+        used = len(self._pool._used)
+        span = int(self.id_max) - int(self.id_min) + 1
+        return max(0, span - used)
+
+    def used_count(self) -> int:
+        return int(len(self._pool._used))
+
+    def reclaim_orphans(self, live_sids: Set[int]) -> List[int]:
+        """Release provisionals that are marked used but not in live_sids."""
+        live = {int(s) for s in live_sids}
+        recycled: List[int] = []
+        for sid in list(self._pool._used):
+            if int(sid) in live:
+                continue
+            self.release(int(sid))
+            recycled.append(int(sid))
+        return recycled
 
 
 def default_household_paths(root: Optional[Path] = None) -> Dict[str, str]:

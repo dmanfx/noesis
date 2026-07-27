@@ -1346,7 +1346,14 @@ export const BevView: React.FC<BevViewProps> = ({
   const baseLabel = visualSelection.baseKind === 'composite'
     ? 'Footprint Map'
     : (hasWalkableLayer ? 'Walkable Map' : (hasObstacleHeightLayer ? 'Obstacle Height' : 'Height Map'));
-  const subtitleText = floorplanHasImage ? (isFrameMismatch ? `${baseLabel} (local-floorplan fallback)` : baseLabel) : 'No Map Data';
+  const floorplanError = String(floorplan?.error || '').trim();
+  const floorplanPending = ['no_cached_floorplan', 'capture_event_busy', 'rate_limited'].includes(floorplanError);
+  const floorplanErrorLabel = floorplanError.replaceAll('_', ' ');
+  const subtitleText = floorplanHasImage
+    ? (isFrameMismatch ? `${baseLabel} (local-floorplan fallback)` : baseLabel)
+    : (floorplanPending
+        ? 'Preparing Map...'
+        : (floorplanError ? `Map Error: ${floorplanErrorLabel}` : 'No Map Data'));
   const subtitle = ` • ${subtitleText}`;
   const hasHeightLookControls = variant === 'inline' && visualSelection.baseKind === 'height';
   const updateHeightTuning = (patch: Partial<HeightRenderTuning>) => {

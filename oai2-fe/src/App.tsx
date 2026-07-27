@@ -8,12 +8,19 @@ import { TelemetryPanel } from './telemetry/TelemetryPanel';
 import { TelemetryProvider, useTelemetry } from './telemetry/TelemetryContext';
 import { TrailStore } from './lib/trails';
 import { cameraOrder, colorForTrack, cameraLabel, detectCameraKey, CameraKey, colorIdForPerson, identityKeyForPerson, discoverCamerasFromPayloads } from './lib/camera';
-import { getExtrinsics, getIntrinsics4, extractPoseFromExtrinsics, forwardXZFromExtrinsics } from './lib/calibration';
+import { getExtrinsics, getIntrinsics4, getIntrinsicsAny, extractPoseFromExtrinsics, forwardXZFromExtrinsics } from './lib/calibration';
 import { isCameraLocalFrame, projectWorldPointToCameraLocal, resolveBevFrameModeFromPayload } from './lib/coordTransforms';
-import { useWebSocketClient, StatsPayload, MosaicLayout } from './hooks/useWebSocketClient';
+import { useWebSocketClient, StatsPayload, MosaicLayout, type FloorplanRequest } from './hooks/useWebSocketClient';
 import { useWebRTCClient } from './hooks/useWebRTCClient';
 import { StreamMode } from './components/StreamPanel';
-import DepthDrawer, { DepthDiagnosticsEntry, DepthDrawerEntry, DepthMetaEntry, FloorplanResponse } from './components/DepthDrawer';
+import DepthDrawer, {
+  DepthDiagnosticsEntry,
+  DepthDrawerEntry,
+  DepthMetaEntry,
+  type DepthCachePairEntry,
+  type DepthRefreshEntry,
+  FloorplanResponse,
+} from './components/DepthDrawer';
 import { BevView, BevMeta, type BevFrameMode } from './components/BevView';
 import { MosaicCropCanvas } from './components/MosaicCropCanvas';
 import type { BevTrailConfig } from './lib/bevTrails';
@@ -22,6 +29,17 @@ import { HouseholdIdentityDrawer } from './components/HouseholdIdentityDrawer';
 import SettingsCorner from './components/SettingsCorner';
 import { LatencyCard } from './components/LatencyCard';
 import { LatencyMetrics } from './types/latency';
+import {
+  FloorplanBootstrapCoordinator,
+  type FloorplanBootstrapAction,
+} from './lib/floorplanBootstrap.js';
+import {
+  cachedSnapshotPairOutcome,
+  exactFloorplanContinuation,
+  exactFloorplanResponseOutcome,
+  floorplanMatchesActiveDepth,
+} from './lib/depthRefreshSequence.js';
+import { loadDepthBulkSnapshot } from './lib/depthBulkClient';
 
 const wsHost = import.meta.env.VITE_WS_HOST || window.location.hostname;
 const wsPort = Number(import.meta.env.VITE_WS_PORT || 6008);
@@ -32,6 +50,7 @@ const restPort = Number(import.meta.env.VITE_REST_PORT || 8080);
 const restProto = window.location.protocol === 'https:' ? 'https' : 'http';
 const REST_URL = import.meta.env.VITE_REST_URL || (import.meta.env.DEV ? '' : `${restProto}://${restHost}:${restPort}`);
 const streamDisplayCams: CameraKey[] = ['living-room'];
+const DEPTH_REFRESH_PHASE_TIMEOUT_MS = 155_000;
 
 type ExpandedView = { kind: 'mosaic' } | { kind: 'camera'; camera: CameraKey };
 
@@ -42,6 +61,29 @@ type CameraPoseSummary = {
   heightAboveFloor?: number | null;
   forwardFx?: number | null;
   forwardFz?: number | null;
+};
+
+type PendingDepthFloorplanPair = {
+  cameraKey: string;
+  entry: DepthDrawerEntry;
+  meta: DepthMetaEntry;
+  diagnostics: DepthDiagnosticsEntry;
+  identityKey: string;
+  requestId: string;
+  snapshotRef: string;
+  snapshotId: string;
+  snapshotContentSha256: string;
+};
+
+type PendingCachedDepth = {
+  entry: DepthDrawerEntry;
+  meta: DepthMetaEntry;
+  diagnostics: DepthDiagnosticsEntry;
+};
+
+type PendingCachedPair = {
+  depth?: PendingCachedDepth;
+  floorplan?: FloorplanResponse;
 };
 
 const labelForCameraId = (camId: string): string => {
@@ -56,8 +98,10 @@ const floorplanHasRenderableGrid = (floorplan?: FloorplanResponse | null): boole
   floorplan?.walkable?.grid_b64 ||
   floorplan?.obstacle_height?.grid_b64 ||
   floorplan?.height?.grid_b64 ||
+  floorplan?.height_agl?.grid_b64 ||
   floorplan?.density?.grid_b64 ||
-  floorplan?.distance?.grid_b64
+  floorplan?.distance?.grid_b64 ||
+  floorplan?.observed?.grid_b64
 );
 
 const buildMosaicCameraIdToSlotKey = (layout: MosaicLayout | null): Record<string, CameraKey> => {
@@ -209,9 +253,17 @@ function Dashboard() {
   const [maDiagnostics, setMaDiagnostics] = useState<Record<string, DepthDiagnosticsEntry>>({});
   const [maDepthData, setMaDepthData] = useState<Record<string, DepthDrawerEntry>>({});
   const depthMetaRef = useRef<Record<string, DepthMetaEntry>>({});
+  const depthResponseSerialRef = useRef(0);
+  const latestDepthResponseRef = useRef<Record<string, number>>({});
   const [maDepthMeta, setMaDepthMeta] = useState<Record<string, DepthMetaEntry>>({});
   const [floorplanData, setFloorplanData] = useState<Record<string, FloorplanResponse>>({});
   const floorplanDataRef = useRef<Record<string, FloorplanResponse>>({});
+  const [depthRefreshState, setDepthRefreshState] = useState<Record<string, DepthRefreshEntry>>({});
+  const depthRefreshStateRef = useRef<Record<string, DepthRefreshEntry>>({});
+  const pendingDepthFloorplanRef = useRef<Record<string, PendingDepthFloorplanPair>>({});
+  const [depthCachePairState, setDepthCachePairState] = useState<Record<string, DepthCachePairEntry>>({});
+  const depthCachePairStateRef = useRef<Record<string, DepthCachePairEntry>>({});
+  const pendingCachedPairRef = useRef<Record<string, PendingCachedPair>>({});
   const [cameraStatuses, setCameraStatuses] = useState<Record<CameraKey, string>>({
     'living-room': 'unknown',
     'kitchen': 'unknown',
@@ -236,14 +288,158 @@ function Dashboard() {
   const maDiagThrottleRef = useRef<Record<string, number>>({});
   const lastCalibrationSignatureRef = useRef<string>('');
   const [calibrationEpoch, setCalibrationEpoch] = useState<number>(0);
-  const lastDepthFloorplanTsRef = useRef<Record<string, number>>({});
+  const requestedExactFloorplansRef = useRef<Set<string>>(new Set());
+  const depthRefreshDeadlineTimersRef = useRef<Map<string, number>>(new Map());
+  const requestFloorplanRef = useRef<(options?: FloorplanRequest) => string>(() => '');
   const mosaicCameraIdToSlotKeyRef = useRef<Record<string, CameraKey>>({});
-  const floorplanWarmupTimersRef = useRef<number[]>([]);
-  const floorplanWarmupScheduledRef = useRef(false);
+  const floorplanBootstrapRef = useRef(new FloorplanBootstrapCoordinator());
+  const floorplanBootstrapStartTimerRef = useRef<number | null>(null);
+  const floorplanBootstrapActionTimerRef = useRef<number | null>(null);
+  const handleFloorplanBootstrapResponseRef = useRef<(payload: any, renderable: boolean) => void>(() => {});
+
+  const updateDepthRefreshState = useCallback((cameraKey: string, next?: DepthRefreshEntry) => {
+    if (!cameraKey) return;
+    const current = depthRefreshStateRef.current;
+    const updated = { ...current };
+    if (next) {
+      updated[cameraKey] = next;
+    } else {
+      delete updated[cameraKey];
+    }
+    depthRefreshStateRef.current = updated;
+    setDepthRefreshState(updated);
+  }, []);
+
+  const updateDepthCachePairState = useCallback((cameraKey: string, next?: DepthCachePairEntry) => {
+    if (!cameraKey) return;
+    const updated = { ...depthCachePairStateRef.current };
+    if (next) {
+      updated[cameraKey] = next;
+    } else {
+      delete updated[cameraKey];
+    }
+    depthCachePairStateRef.current = updated;
+    setDepthCachePairState(updated);
+  }, []);
+
+  const clearDepthRefreshDeadline = useCallback((cameraKey: string) => {
+    const timer = depthRefreshDeadlineTimersRef.current.get(cameraKey);
+    if (timer !== undefined) window.clearTimeout(timer);
+    depthRefreshDeadlineTimersRef.current.delete(cameraKey);
+  }, []);
+
+  const failDepthRefresh = useCallback((cameraKey: string, error: string) => {
+    clearDepthRefreshDeadline(cameraKey);
+    const pending = pendingDepthFloorplanRef.current[cameraKey];
+    if (pending) {
+      requestedExactFloorplansRef.current.delete(pending.identityKey);
+      delete pendingDepthFloorplanRef.current[cameraKey];
+    }
+    updateDepthRefreshState(cameraKey, {
+      phase: 'error',
+      error: String(error || 'depth_refresh_failed'),
+    });
+  }, [clearDepthRefreshDeadline, updateDepthRefreshState]);
+
+  const armDepthRefreshDeadline = useCallback((cameraKey: string, timeoutError: string) => {
+    clearDepthRefreshDeadline(cameraKey);
+    const timer = window.setTimeout(() => {
+      depthRefreshDeadlineTimersRef.current.delete(cameraKey);
+      const active = depthRefreshStateRef.current[cameraKey];
+      if (!active || active.phase === 'error') return;
+      failDepthRefresh(cameraKey, timeoutError);
+    }, DEPTH_REFRESH_PHASE_TIMEOUT_MS);
+    depthRefreshDeadlineTimersRef.current.set(cameraKey, timer);
+  }, [clearDepthRefreshDeadline, failDepthRefresh]);
 
   useEffect(() => {
     floorplanDataRef.current = floorplanData;
   }, [floorplanData]);
+
+  const tryCommitCachedPair = useCallback((cameraKey: string): boolean => {
+    const pending = pendingCachedPairRef.current[cameraKey];
+    if (!pending) return false;
+
+    const commitPair = (
+      depth: PendingCachedDepth,
+      floorplan: FloorplanResponse,
+    ) => {
+      depthMetaRef.current[cameraKey] = depth.meta;
+      floorplanDataRef.current = {
+        ...floorplanDataRef.current,
+        [cameraKey]: floorplan,
+      };
+      setMaDepthData(prev => ({ ...prev, [cameraKey]: depth.entry }));
+      setMaDepthMeta(prev => ({ ...prev, [cameraKey]: depth.meta }));
+      setMaDiagnostics(prev => ({ ...prev, [cameraKey]: depth.diagnostics }));
+      setFloorplanData(prev => ({ ...prev, [cameraKey]: floorplan }));
+      delete pendingCachedPairRef.current[cameraKey];
+      updateDepthCachePairState(cameraKey);
+    };
+
+    if (pending.depth && pending.floorplan) {
+      const stagedOutcome = cachedSnapshotPairOutcome(
+        pending.depth.entry,
+        pending.floorplan,
+        { renderable: floorplanHasRenderableGrid(pending.floorplan) },
+      );
+      if (stagedOutcome.kind === 'commit') {
+        commitPair(pending.depth, pending.floorplan);
+        return true;
+      }
+    }
+
+    const activeFloorplan = floorplanDataRef.current[cameraKey];
+    if (pending.depth && activeFloorplan) {
+      const activeFloorplanOutcome = cachedSnapshotPairOutcome(
+        pending.depth.entry,
+        activeFloorplan,
+        { renderable: floorplanHasRenderableGrid(activeFloorplan) },
+      );
+      if (activeFloorplanOutcome.kind === 'commit') {
+        commitPair(pending.depth, activeFloorplan);
+        return true;
+      }
+    }
+
+    const activeDepthMeta = depthMetaRef.current[cameraKey];
+    if (pending.floorplan && activeDepthMeta) {
+      const activeDepthOutcome = cachedSnapshotPairOutcome(
+        activeDepthMeta,
+        pending.floorplan,
+        { renderable: floorplanHasRenderableGrid(pending.floorplan) },
+      );
+      if (activeDepthOutcome.kind === 'commit') {
+        floorplanDataRef.current = {
+          ...floorplanDataRef.current,
+          [cameraKey]: pending.floorplan,
+        };
+        setFloorplanData(prev => ({ ...prev, [cameraKey]: pending.floorplan as FloorplanResponse }));
+        delete pendingCachedPairRef.current[cameraKey];
+        updateDepthCachePairState(cameraKey);
+        return true;
+      }
+    }
+
+    if (pending.depth && pending.floorplan) {
+      const mismatch = cachedSnapshotPairOutcome(
+        pending.depth.entry,
+        pending.floorplan,
+        { renderable: floorplanHasRenderableGrid(pending.floorplan) },
+      );
+      updateDepthCachePairState(cameraKey, {
+        phase: 'error',
+        error: mismatch.kind === 'error'
+          ? mismatch.error
+          : 'cached_snapshot_identity_mismatch',
+      });
+    } else if (pending.depth) {
+      updateDepthCachePairState(cameraKey, { phase: 'waiting-floorplan' });
+    } else if (pending.floorplan) {
+      updateDepthCachePairState(cameraKey, { phase: 'waiting-depth' });
+    }
+    return false;
+  }, [updateDepthCachePairState]);
 
   // Stream mode is fixed to WebRTC (former JPEG toggle removed)
   const streamMode: StreamMode = 'webrtc';
@@ -309,7 +505,6 @@ function Dashboard() {
     if (!floorplanDataRef.current[camKey]) floorplanDataRef.current[camKey] = undefined as any;
     if (!prevActiveRef.current[camKey]) prevActiveRef.current[camKey] = new Set();
     if (!zeroSinceRef.current[camKey]) zeroSinceRef.current[camKey] = null;
-    if (!lastDepthFloorplanTsRef.current[camKey]) lastDepthFloorplanTsRef.current[camKey] = 0;
     if (!maDiagThrottleRef.current[camKey]) maDiagThrottleRef.current[camKey] = 0;
 
     // State updaters (functional so they see latest)
@@ -468,7 +663,7 @@ function Dashboard() {
 
     const cameras = payload.cameras || {};
     setAvailableCameras(Object.keys(cameras));
-    const statusUpdates: Partial<Record<CameraKey, string>> = {};
+    const statusUpdates: Record<CameraKey, string> = {};
     const globalOcc: Record<string, number> = {};
     let allTracks: any[] = [];
     const perCamTracks: Record<string, any[]> = {};
@@ -788,79 +983,206 @@ function Dashboard() {
     }
   };
 
-  const handleMADepth = (message: any) => {
+  const handleMADepth = async (
+    message: any,
+    requestContext?: {
+      requestId: string;
+      deadlineAtMs: number;
+      expectedCameraId: string;
+    },
+  ): Promise<void> => {
     if (!message) return;
-    const parseTimestampUs = (value: any): number | undefined => {
-      if (typeof value === 'number' && Number.isFinite(value)) return Number(value);
-      if (typeof value === 'string') {
-        const parsed = Number(value);
-        if (Number.isFinite(parsed)) return parsed;
-      }
-      return undefined;
-    };
-    const candidatePayload = (message.payload && typeof message.payload === 'object') ? message.payload : message;
+    const candidatePayload = (message.payload && typeof message.payload === 'object')
+      ? message.payload
+      : message;
     const camSource = message.camera || message.cam_id || message.cameraId || message.camera_id || message.camId;
     const payloadCamera = candidatePayload?.camera || candidatePayload?.cam_id || candidatePayload?.cameraId || candidatePayload?.camera_id;
-    const rawCamId = String(camSource || payloadCamera || '')
-      .trim();
-    if (!rawCamId || (message?.ok === false && !candidatePayload?.depth_b64)) return;
-    const shape = candidatePayload?.shape || candidatePayload?.depth_shape;
-    if (!Array.isArray(shape) || shape.length !== 2) return;
-    const depthB64 = candidatePayload.depth_b64 || candidatePayload.depth_z_b64;
-    if (!depthB64) return;
-    const confB64 = candidatePayload.conf_b64 || candidatePayload.conf;
-    let maskB64 = candidatePayload.mask_b64 || candidatePayload.mask;
-    const normalsB64 = typeof candidatePayload.normals_b64 === 'string' ? candidatePayload.normals_b64 : undefined;
-    const normalsShapeRaw = candidatePayload.normals_shape;
-    let normalsShape: [number, number, number] | undefined;
-    if (Array.isArray(normalsShapeRaw) && normalsShapeRaw.length >= 3) {
-      const h = Number(normalsShapeRaw[0]) || 0;
-      const w = Number(normalsShapeRaw[1]) || 0;
-      const c = Number(normalsShapeRaw[2]) || 0;
-      if (h > 0 && w > 0 && c > 0) {
-        normalsShape = [h, w, c];
-      }
-    }
-    const normalsDtypeRaw = typeof candidatePayload.normals_dtype === 'string' ? candidatePayload.normals_dtype : undefined;
-    const normalsDtype = normalsDtypeRaw === 'float16' || normalsDtypeRaw === 'float32' ? normalsDtypeRaw : undefined;
-    const normalsSpaceRaw = typeof candidatePayload.normals_space === 'string' ? candidatePayload.normals_space : undefined;
-    const normalsSpace = normalsSpaceRaw === 'camera' || normalsSpaceRaw === 'world' ? normalsSpaceRaw : undefined;
-    const normalsError = typeof candidatePayload.normals_error === 'string' ? candidatePayload.normals_error : undefined;
-    if (Array.isArray(maskB64)) {
-      const maskArr = Uint8Array.from(maskB64.map((v: any) => (v ? 1 : 0)));
-      maskB64 = btoa(String.fromCharCode(...maskArr));
-    }
-    const tsFromResponse = parseTimestampUs(message.ts_us);
-    const tsFromPayload = parseTimestampUs(candidatePayload?.ts);
-    const tsUs = tsFromResponse ?? tsFromPayload ?? Math.floor(Date.now() * 1000);
-    const resolvedCamKey = resolveDisplayCameraKey(rawCamId);
-    const storageKey = resolvedCamKey ?? rawCamId;
-    const prevTs = depthMetaRef.current[storageKey]?.tsUs ?? 0;
-    if (prevTs && tsUs < prevTs) return;
-    const entry: DepthDrawerEntry = {
-      ts: tsUs,
-      depth_b64: depthB64,
-      conf_b64: confB64,
-      mask_b64: maskB64,
-      shape: [Number(shape[0]) || 0, Number(shape[1]) || 0]
-    };
-    if (normalsB64) entry.normals_b64 = normalsB64;
-    if (normalsShape) entry.normals_shape = normalsShape;
-    if (normalsDtype) entry.normals_dtype = normalsDtype;
-    if (normalsSpace) entry.normals_space = normalsSpace;
-    if (normalsError) entry.normals_error = normalsError;
-    if (!entry.shape[0] || !entry.shape[1]) return;
-    setMaDepthData(prev => ({ ...prev, [storageKey]: entry }));
+    const rawCamId = String(camSource || payloadCamera || '').trim();
+    if (!rawCamId) return;
 
-    const meta: DepthMetaEntry = {
-      tsUs,
-      servedFromCache: typeof message.served_from_cache === 'boolean' ? message.served_from_cache : undefined,
-      requestId: message.request_id || message.requestId || undefined,
-      error: typeof message.error === 'string' ? message.error : undefined,
-      sourceCameraId: rawCamId,
+    const responseStorageKey = resolveDisplayCameraKey(rawCamId) ?? rawCamId;
+    const expectedRawCamId = String(requestContext?.expectedCameraId || '').trim();
+    const expectedStorageKey = expectedRawCamId
+      ? (resolveDisplayCameraKey(expectedRawCamId) ?? expectedRawCamId)
+      : null;
+    // Bind the response payload to the camera registered for this request ID.
+    // Alias-equivalent IDs are accepted; a valid response for another camera
+    // must not overwrite that camera or complete this camera's refresh state.
+    const responseCameraMismatch = expectedStorageKey !== null
+      && expectedStorageKey !== responseStorageKey;
+    const storageKey = expectedStorageKey ?? responseStorageKey;
+    const freshRequest = message.cache_only === false;
+    const cacheOnlyRequest = message.cache_only === true;
+    const failFreshRefresh = (error: string) => {
+      if (freshRequest) failDepthRefresh(storageKey, error.slice(0, 240));
     };
-    depthMetaRef.current[storageKey] = meta;
-    setMaDepthMeta(prev => ({ ...prev, [storageKey]: meta }));
+    const failCachedPair = (error: string) => {
+      if (!cacheOnlyRequest) return;
+      const pending = pendingCachedPairRef.current[storageKey];
+      if (pending?.depth) {
+        const next = { ...pending };
+        delete next.depth;
+        pendingCachedPairRef.current[storageKey] = next;
+      }
+      updateDepthCachePairState(storageKey, {
+        phase: 'error',
+        error: String(error || 'cached_depth_unavailable').slice(0, 240),
+      });
+    };
+    if (responseCameraMismatch) {
+      failFreshRefresh('depth_response_camera_mismatch');
+      failCachedPair('depth_response_camera_mismatch');
+      return;
+    }
+    const activeRefresh = depthRefreshStateRef.current[storageKey];
+    if (
+      cacheOnlyRequest
+      && (
+        activeRefresh?.phase === 'requesting-depth'
+        || activeRefresh?.phase === 'requesting-floorplan'
+      )
+    ) {
+      return;
+    }
+    if (message.ok !== true) {
+      const error = String(message.error || 'depth_request_failed');
+      failFreshRefresh(error);
+      failCachedPair(error);
+      return;
+    }
+    if (cacheOnlyRequest && message.served_from_cache !== true) {
+      failCachedPair('cache_depth_not_served');
+      return;
+    }
+
+    const responseSerial = ++depthResponseSerialRef.current;
+    latestDepthResponseRef.current[storageKey] = responseSerial;
+    let loaded;
+    try {
+      loaded = await loadDepthBulkSnapshot(candidatePayload, rawCamId, {
+        // The optional RGB component is content-addressed under the same exact
+        // snapshot identity. Fetching it adds no inference request and enables
+        // same-frame 2D/3D quality inspection.
+        includeRgb: true,
+        deadlineAtMs: requestContext?.deadlineAtMs,
+        intrinsics: getIntrinsicsAny(rawCamId) ?? getIntrinsicsAny(storageKey),
+      });
+    } catch (error) {
+      const reason = error instanceof Error ? error.message : String(error);
+      failFreshRefresh(`bulk_transfer_failed:${reason}`);
+      failCachedPair(`bulk_transfer_failed:${reason}`);
+      return;
+    }
+    if (latestDepthResponseRef.current[storageKey] !== responseSerial) return;
+
+    const previousTs = depthMetaRef.current[storageKey]?.tsUs ?? 0;
+    if (previousTs && loaded.ts < previousTs) {
+      failFreshRefresh('stale_depth_response');
+      failCachedPair('stale_cached_depth_response');
+      return;
+    }
+    const activeMeta = depthMetaRef.current[storageKey];
+    if (
+      cacheOnlyRequest
+      && loaded.ts === previousTs
+      && activeMeta?.snapshotId
+      && activeMeta.snapshotId !== loaded.snapshotId
+    ) {
+      failCachedPair('cached_depth_identity_conflict');
+      return;
+    }
+
+    const entry: DepthDrawerEntry = {
+      ts: loaded.ts,
+      depth: loaded.depth,
+      conf: loaded.conf,
+      mask: loaded.mask,
+      rgb: loaded.rgb,
+      rgb_shape: loaded.rgbShape,
+      shape: loaded.shape,
+      normals: loaded.normals,
+      normals_shape: loaded.normalsShape,
+      normals_dtype: 'float32',
+      normals_space: 'camera',
+      snapshotId: loaded.snapshotId,
+      snapshotRef: loaded.snapshotRef,
+      snapshotContentSha256: loaded.snapshotContentSha256,
+    };
+    const meta: DepthMetaEntry = {
+      tsUs: loaded.ts,
+      servedFromCache: typeof message.served_from_cache === 'boolean'
+        ? message.served_from_cache
+        : undefined,
+      requestId: message.request_id || message.requestId || undefined,
+      snapshotRef: loaded.snapshotRef,
+      snapshotId: loaded.snapshotId,
+      snapshotContentSha256: loaded.snapshotContentSha256,
+      rgbComponentSha256: loaded.rgbComponentSha256,
+      sourceCameraId: rawCamId,
+      transferBytes: loaded.transferBytes,
+      transferDurationMs: loaded.transferDurationMs,
+    };
+    const diagnostics: DepthDiagnosticsEntry = {
+      summary: loaded.diagnostics,
+      ts: loaded.ts,
+    };
+
+    const continuation = exactFloorplanContinuation(message);
+    if (freshRequest) {
+      delete pendingCachedPairRef.current[storageKey];
+      updateDepthCachePairState(storageKey);
+      if (!continuation) {
+        failFreshRefresh('incomplete_snapshot_identity');
+        return;
+      }
+      if (
+        loaded.snapshotRef !== continuation.request.snapshotRef
+        || loaded.snapshotId !== continuation.request.snapshotId
+        || loaded.snapshotContentSha256 !== continuation.request.snapshotContentSha256
+      ) {
+        failFreshRefresh('depth_snapshot_identity_mismatch');
+        return;
+      }
+      const existingPending = pendingDepthFloorplanRef.current[storageKey];
+      if (
+        requestedExactFloorplansRef.current.has(continuation.identityKey)
+        && existingPending?.identityKey === continuation.identityKey
+      ) {
+        return;
+      }
+      if (requestedExactFloorplansRef.current.has(continuation.identityKey)) return;
+
+      const pending: PendingDepthFloorplanPair = {
+        cameraKey: storageKey,
+        entry,
+        meta,
+        diagnostics,
+        identityKey: continuation.identityKey,
+        requestId: continuation.request.requestId,
+        snapshotRef: continuation.request.snapshotRef,
+        snapshotId: continuation.request.snapshotId,
+        snapshotContentSha256: continuation.request.snapshotContentSha256,
+      };
+      pendingDepthFloorplanRef.current[storageKey] = pending;
+      requestedExactFloorplansRef.current.add(continuation.identityKey);
+      updateDepthRefreshState(storageKey, { phase: 'requesting-floorplan' });
+      armDepthRefreshDeadline(storageKey, 'floorplan_refresh_timeout');
+      if (!requestFloorplanRef.current(continuation.request)) {
+        failDepthRefresh(storageKey, 'floorplan_request_not_sent');
+      }
+    } else if (cacheOnlyRequest) {
+      const pending = pendingCachedPairRef.current[storageKey] ?? {};
+      pendingCachedPairRef.current[storageKey] = {
+        ...pending,
+        depth: { entry, meta, diagnostics },
+      };
+      tryCommitCachedPair(storageKey);
+    } else {
+      depthMetaRef.current[storageKey] = meta;
+      setMaDepthData(prev => ({ ...prev, [storageKey]: entry }));
+      setMaDepthMeta(prev => ({ ...prev, [storageKey]: meta }));
+      setMaDiagnostics(prev => ({ ...prev, [storageKey]: diagnostics }));
+    }
 
     const label = labelForCameraId(storageKey);
     const now = Date.now();
@@ -868,40 +1190,136 @@ function Dashboard() {
       group: 'MapAnything Depth',
       key: `${label} Resolution`,
       value: `${entry.shape[0]}x${entry.shape[1]}`,
-      ts: now
+      ts: now,
     });
-    const tsForAge = tsFromPayload ?? tsUs;
-    if (typeof tsForAge === 'number' && Number.isFinite(tsForAge)) {
-      const ageMs = Math.max(0, now - Math.floor(tsForAge / 1000));
-      publish({
-        group: 'MapAnything Depth',
-        key: `${label} Snapshot Age (s)`,
-        value: Number((ageMs / 1000).toFixed(1)),
-        ts: now
-      });
-    }
+    publish({
+      group: 'MapAnything Depth',
+      key: `${label} Bulk Transfer (ms)`,
+      value: Number(loaded.transferDurationMs.toFixed(1)),
+      ts: now,
+    });
+    const ageMs = Math.max(0, now - Math.floor(loaded.ts / 1000));
+    publish({
+      group: 'MapAnything Depth',
+      key: `${label} Snapshot Age (s)`,
+      value: Number((ageMs / 1000).toFixed(1)),
+      ts: now,
+    });
   };
 
   const handleFloorplan = (payload: any) => {
     updateKnownCamerasFromPayload(payload); // Item 4 discovery
     if (!payload || payload.type !== 'floorplan_response') return;
-    const camRaw = payload.camera_id || payload.camera || (Array.isArray(payload.cameras) && payload.cameras[0]);
+    const responseRequestId = String(payload.request_id ?? payload.requestId ?? '').trim();
+    const bootstrapActive = floorplanBootstrapRef.current.snapshot().active;
+    const isBootstrapCacheResponse = Boolean(
+      responseRequestId
+      && bootstrapActive?.requestId === responseRequestId,
+    );
+    const pendingCameraKey = Object.entries(pendingDepthFloorplanRef.current)
+      .find(([, pending]) => pending.requestId === responseRequestId)?.[0];
+    const camRaw = payload.camera_id
+      || payload.camera
+      || (Array.isArray(payload.cameras) && payload.cameras[0])
+      || (isBootstrapCacheResponse ? bootstrapActive?.camera : '');
     const camId = camRaw ? String(camRaw) : '';
-    if (!camId) return;
+    if (!camId) {
+      if (pendingCameraKey) failDepthRefresh(pendingCameraKey, 'floorplan_camera_missing');
+      return;
+    }
 
-    // Normalize key to match UI components (e.g. 'kitchen_camera' -> 'kitchen')
-    const key = detectCameraKey(camId) || camId;
-
-    setFloorplanData(prev => {
-      const nextPayload = payload as FloorplanResponse;
-      const existing = prev[key];
-      const hasExistingRenderableGrid = floorplanHasRenderableGrid(existing);
-      const nextHasRenderableGrid = floorplanHasRenderableGrid(nextPayload);
-      if (hasExistingRenderableGrid && (nextPayload?.error || !nextHasRenderableGrid)) {
-        return prev;
-      }
-      return { ...prev, [key]: nextPayload };
+    // Normalize key to match the depth store and dynamic camera mappings.
+    const key = pendingCameraKey || resolveDisplayCameraKey(camId) || camId;
+    const nextPayload = payload as FloorplanResponse;
+    const nextHasRenderableGrid = floorplanHasRenderableGrid(nextPayload);
+    const pendingPair = pendingDepthFloorplanRef.current[key];
+    const pendingOutcome = exactFloorplanResponseOutcome(pendingPair, payload, {
+      renderable: nextHasRenderableGrid,
     });
+
+    // The bootstrap coordinator owns cache probes. Let it advance even when a
+    // manual exact refresh is staged, but never allow those unrelated responses
+    // to replace either side of the currently visible coherent pair.
+    handleFloorplanBootstrapResponseRef.current(payload, nextHasRenderableGrid);
+    if (pendingPair && pendingOutcome.kind === 'unrelated') {
+      return;
+    }
+    if (pendingPair && pendingOutcome.kind === 'error') {
+      failDepthRefresh(key, pendingOutcome.error);
+      return;
+    }
+    if (isBootstrapCacheResponse) {
+      const activeRefresh = depthRefreshStateRef.current[key];
+      if (
+        activeRefresh?.phase === 'requesting-depth'
+        || activeRefresh?.phase === 'requesting-floorplan'
+      ) {
+        return;
+      }
+      if (nextPayload.error || !nextHasRenderableGrid) {
+        const pending = pendingCachedPairRef.current[key];
+        if (pending?.floorplan) {
+          const next = { ...pending };
+          delete next.floorplan;
+          pendingCachedPairRef.current[key] = next;
+        }
+        updateDepthCachePairState(key, {
+          phase: 'error',
+          error: String(nextPayload.error || 'invalid_cached_floorplan_response').slice(0, 240),
+        });
+        return;
+      }
+      const pending = pendingCachedPairRef.current[key] ?? {};
+      pendingCachedPairRef.current[key] = {
+        ...pending,
+        floorplan: nextPayload,
+      };
+      tryCommitCachedPair(key);
+      return;
+    }
+    if (pendingPair && pendingOutcome.kind === 'commit') {
+      depthMetaRef.current[key] = pendingPair.meta;
+      floorplanDataRef.current = {
+        ...floorplanDataRef.current,
+        [key]: nextPayload,
+      };
+      setMaDepthData(prev => ({ ...prev, [key]: pendingPair.entry }));
+      setMaDepthMeta(prev => ({ ...prev, [key]: pendingPair.meta }));
+      setMaDiagnostics(prev => ({ ...prev, [key]: pendingPair.diagnostics }));
+      setFloorplanData(prev => ({ ...prev, [key]: nextPayload }));
+      requestedExactFloorplansRef.current.delete(pendingPair.identityKey);
+      delete pendingDepthFloorplanRef.current[key];
+      delete pendingCachedPairRef.current[key];
+      clearDepthRefreshDeadline(key);
+      updateDepthRefreshState(key);
+      updateDepthCachePairState(key);
+    } else {
+      setFloorplanData(prev => {
+        const existing = prev[key];
+        const hasExistingRenderableGrid = floorplanHasRenderableGrid(existing);
+        if (hasExistingRenderableGrid && (nextPayload?.error || !nextHasRenderableGrid)) {
+          return prev;
+        }
+        if (nextHasRenderableGrid) {
+          const activeDepthSnapshotId = depthMetaRef.current[key]?.snapshotId;
+          if (!floorplanMatchesActiveDepth(activeDepthSnapshotId, nextPayload)) {
+            return prev;
+          }
+        }
+        if (hasExistingRenderableGrid && nextHasRenderableGrid) {
+          const existingTs = Number(existing?.snapshot_ts ?? existing?.ts);
+          const nextTs = Number(nextPayload.snapshot_ts ?? nextPayload.ts);
+          if (
+            Number.isFinite(existingTs)
+            && Number.isFinite(nextTs)
+            && nextTs < existingTs
+          ) {
+            return prev;
+          }
+        }
+        return { ...prev, [key]: nextPayload };
+      });
+    }
 
     const label = labelForCameraId(key);
     const now = Date.now();
@@ -996,11 +1414,8 @@ function Dashboard() {
     status,
     sendClearStats,
     sendTrailToggle,
-    sendDetectionConfig,
-    sendDetectionToggle,
     requestMapAnythingDepth,
     requestFloorplan,
-    notifyMaHeatmapReady,
     sendAutoCalibrate,
     sendWebRTCOffer,
     sendWebRTCIceCandidate,
@@ -1044,10 +1459,7 @@ function Dashboard() {
     },
   });
 
-  const requestFloorplanRef = useRef(requestFloorplan);
-  useEffect(() => {
-    requestFloorplanRef.current = requestFloorplan;
-  }, [requestFloorplan]);
+  requestFloorplanRef.current = requestFloorplan;
 
   // Initialize WebRTC client hook
   const webrtc = useWebRTCClient(
@@ -1088,88 +1500,163 @@ function Dashboard() {
 
   const requestDepthFresh = useCallback((camId: string) => {
     if (!camId) return;
-    requestMapAnythingDepth(camId, 'fresh');
-  }, [requestMapAnythingDepth]);
+    const cameraKey = resolveDisplayCameraKey(camId) || camId;
+    const sent = requestMapAnythingDepth(camId, 'fresh');
+    if (!sent) {
+      const active = depthRefreshStateRef.current[cameraKey];
+      if (active?.phase === 'requesting-depth' || active?.phase === 'requesting-floorplan') {
+        return;
+      }
+      clearDepthRefreshDeadline(cameraKey);
+      updateDepthRefreshState(cameraKey, {
+        phase: 'error',
+        error: status === 'open' ? 'depth_request_in_flight' : 'depth_transport_closed',
+      });
+      return;
+    }
+    delete pendingCachedPairRef.current[cameraKey];
+    updateDepthCachePairState(cameraKey);
+    updateDepthRefreshState(cameraKey, { phase: 'requesting-depth' });
+    armDepthRefreshDeadline(cameraKey, 'depth_refresh_timeout');
+  }, [
+    armDepthRefreshDeadline,
+    clearDepthRefreshDeadline,
+    requestMapAnythingDepth,
+    resolveDisplayCameraKey,
+    status,
+    updateDepthCachePairState,
+    updateDepthRefreshState,
+  ]);
 
   const requestDepthCached = useCallback((camId: string) => {
     if (!camId) return;
-    requestMapAnythingDepth(camId, 'cache-only');
-  }, [requestMapAnythingDepth]);
+    const cameraKey = resolveDisplayCameraKey(camId) || camId;
+    const sent = requestMapAnythingDepth(camId, 'cache-only');
+    if (sent) {
+      updateDepthCachePairState(cameraKey, { phase: 'requesting-depth' });
+      return;
+    }
+    const activeRefresh = depthRefreshStateRef.current[cameraKey];
+    if (
+      activeRefresh?.phase === 'requesting-depth'
+      || activeRefresh?.phase === 'requesting-floorplan'
+    ) {
+      return;
+    }
+    updateDepthCachePairState(cameraKey, {
+      phase: 'error',
+      error: status === 'open'
+        ? 'cached_depth_request_in_flight'
+        : 'cache_transport_closed',
+    });
+  }, [
+    requestMapAnythingDepth,
+    resolveDisplayCameraKey,
+    status,
+    updateDepthCachePairState,
+  ]);
 
-  const handleRequestFloorplan = useCallback((options?: { camera?: string; requestId?: string; maxAgeSec?: number; gridResM?: number; maxExtentM?: number; cacheOnly?: boolean }) => {
+  useEffect(() => {
+    if (status === 'open') return;
+    pendingCachedPairRef.current = {};
+    depthCachePairStateRef.current = {};
+    setDepthCachePairState({});
+    const activeKeys = Object.entries(depthRefreshStateRef.current)
+      .filter(([, value]) => value.phase !== 'error')
+      .map(([cameraKey]) => cameraKey);
+    if (!activeKeys.length) return;
+    for (const cameraKey of activeKeys) {
+      clearDepthRefreshDeadline(cameraKey);
+      const pending = pendingDepthFloorplanRef.current[cameraKey];
+      if (pending) requestedExactFloorplansRef.current.delete(pending.identityKey);
+      delete pendingDepthFloorplanRef.current[cameraKey];
+    }
+    const next = { ...depthRefreshStateRef.current };
+    for (const cameraKey of activeKeys) {
+      next[cameraKey] = { phase: 'error', error: 'websocket_disconnected' };
+    }
+    depthRefreshStateRef.current = next;
+    setDepthRefreshState(next);
+  }, [clearDepthRefreshDeadline, status]);
+
+  const handleRequestFloorplan = useCallback((options?: FloorplanRequest) => {
     return requestFloorplanRef.current(options);
   }, []);
 
+  const scheduleFloorplanBootstrapAction = useCallback((action: FloorplanBootstrapAction | null) => {
+    if (!action) return;
+    if (floorplanBootstrapActionTimerRef.current !== null) {
+      window.clearTimeout(floorplanBootstrapActionTimerRef.current);
+      floorplanBootstrapActionTimerRef.current = null;
+    }
+    const send = () => {
+      floorplanBootstrapActionTimerRef.current = null;
+      if (!floorplanBootstrapRef.current.isCurrentRequest(action.request.requestId)) return;
+      handleRequestFloorplan(action.request);
+    };
+    if (action.delayMs > 0) {
+      floorplanBootstrapActionTimerRef.current = window.setTimeout(send, action.delayMs);
+    } else {
+      send();
+    }
+  }, [handleRequestFloorplan]);
+
+  handleFloorplanBootstrapResponseRef.current = (payload, renderable) => {
+    const result = floorplanBootstrapRef.current.handleResponse(payload, { renderable });
+    if (!result.handled) return;
+    if (result.failedCamera && result.error !== 'no_cached_floorplan') {
+      console.warn('[BEV] Floorplan bootstrap failed', {
+        camera: result.failedCamera,
+        error: result.error,
+      });
+    }
+    scheduleFloorplanBootstrapAction(result.action);
+  };
+
   useEffect(() => {
+    if (floorplanBootstrapStartTimerRef.current !== null) {
+      window.clearTimeout(floorplanBootstrapStartTimerRef.current);
+      floorplanBootstrapStartTimerRef.current = null;
+    }
     if (status !== 'open') {
-      floorplanWarmupScheduledRef.current = false;
-      floorplanWarmupTimersRef.current.forEach((id) => window.clearTimeout(id));
-      floorplanWarmupTimersRef.current = [];
+      if (floorplanBootstrapActionTimerRef.current !== null) {
+        window.clearTimeout(floorplanBootstrapActionTimerRef.current);
+        floorplanBootstrapActionTimerRef.current = null;
+      }
+      floorplanBootstrapRef.current.cancel();
       return;
     }
-    if (floorplanWarmupScheduledRef.current) return;
-    floorplanWarmupScheduledRef.current = true;
 
-    const timers: number[] = [];
-    cameraOrder.forEach((cam, idx) => {
-      const timer = window.setTimeout(() => {
-        handleRequestFloorplan({
-          camera: cam,
-          requestId: `bev-cache-${cam}-${Date.now()}`,
-          maxAgeSec: 600,
-          gridResM: 0.15,
-          maxExtentM: 20,
-          cacheOnly: true
-        });
-      }, idx * 120);
-      timers.push(timer);
-    });
-    floorplanWarmupTimersRef.current = timers;
+    // The initial calibration bundle normally arrives immediately after the
+    // socket opens. Debounce that pair into one run, and let the coordinator
+    // coalesce any later calibration update behind an in-flight cache request.
+    floorplanBootstrapStartTimerRef.current = window.setTimeout(() => {
+      floorplanBootstrapStartTimerRef.current = null;
+      const action = floorplanBootstrapRef.current.restart(knownCameras);
+      scheduleFloorplanBootstrapAction(action);
+    }, 250);
+
     return () => {
-      timers.forEach((id) => window.clearTimeout(id));
+      if (floorplanBootstrapStartTimerRef.current !== null) {
+        window.clearTimeout(floorplanBootstrapStartTimerRef.current);
+        floorplanBootstrapStartTimerRef.current = null;
+      }
     };
-  }, [status, handleRequestFloorplan]);
+  }, [calibrationEpoch, knownCameras, scheduleFloorplanBootstrapAction, status]);
 
-  useEffect(() => {
-    if (status !== 'open' || calibrationEpoch <= 0) return;
-    const timers: number[] = [];
-    cameraOrder.forEach((cam, idx) => {
-      const timer = window.setTimeout(() => {
-        handleRequestFloorplan({
-          camera: cam,
-          requestId: `bev-calib-cache-${cam}-${Date.now()}`,
-          maxAgeSec: 600,
-          gridResM: 0.15,
-          maxExtentM: 20,
-          cacheOnly: true,
-        });
-      }, idx * 140);
-      timers.push(timer);
-    });
-    return () => {
-      timers.forEach((id) => window.clearTimeout(id));
-    };
-  }, [calibrationEpoch, handleRequestFloorplan, status]);
-
-  useEffect(() => {
-    Object.entries(maDepthMeta || {}).forEach(([camId, meta]) => {
-      if (!meta || typeof meta.tsUs !== 'number') return;
-      // If the depth payload was remapped to a different UI camera key, do not auto-regenerate
-      // floorplans off that signal; it can overwrite a good cached floorplan with a mismatched one.
-      if (meta.sourceCameraId && meta.sourceCameraId !== camId) return;
-      const prev = lastDepthFloorplanTsRef.current[camId] || 0;
-      if (meta.tsUs <= prev) return;
-      lastDepthFloorplanTsRef.current[camId] = meta.tsUs;
-      handleRequestFloorplan({
-        camera: camId,
-        requestId: `bev-cache-after-depth-${camId}-${meta.tsUs}`,
-        maxAgeSec: 600,
-        gridResM: 0.15,
-        maxExtentM: 20,
-        cacheOnly: true
-      });
-    });
-  }, [maDepthMeta, handleRequestFloorplan]);
+  useEffect(() => () => {
+    if (floorplanBootstrapStartTimerRef.current !== null) {
+      window.clearTimeout(floorplanBootstrapStartTimerRef.current);
+    }
+    if (floorplanBootstrapActionTimerRef.current !== null) {
+      window.clearTimeout(floorplanBootstrapActionTimerRef.current);
+    }
+    for (const timer of depthRefreshDeadlineTimersRef.current.values()) {
+      window.clearTimeout(timer);
+    }
+    depthRefreshDeadlineTimersRef.current.clear();
+    floorplanBootstrapRef.current.cancel();
+  }, []);
 
   // Live EST/EDT clock for top bar
   const [estTime, setEstTime] = useState<string>("");
@@ -1414,8 +1901,6 @@ function Dashboard() {
             setTrailEnabled={setTrailEnabled}
             onSendTrail={sendTrailToggle}
             onClearStats={sendClearStats}
-            onSendDetectionConfig={sendDetectionConfig}
-            onSendDetectionToggle={sendDetectionToggle}
           />
 
           <LatencyCard
@@ -1452,9 +1937,9 @@ function Dashboard() {
         depthMeta={maDepthMeta}
         onRequestDepthFresh={requestDepthFresh}
         onRequestDepthCached={requestDepthCached}
-        onHeatmapReady={notifyMaHeatmapReady}
         floorplans={floorplanData}
-        onRequestFloorplan={handleRequestFloorplan}
+        refreshState={depthRefreshState}
+        cachePairState={depthCachePairState}
         availableCameras={availableCameras}
         mosaicLayout={mosaicLayout}
         videoRef={webrtc.videoRef}

@@ -66,6 +66,49 @@ export function turboColor(t: number): [number, number, number] {
   return [clamp(r), clamp(g), clamp(b)];
 }
 
+const STRUCTURAL_HEIGHT_STOPS: ReadonlyArray<{
+  heightM: number;
+  color: readonly [number, number, number];
+}> = [
+  { heightM: 0.00, color: [238, 239, 234] },
+  { heightM: 0.12, color: [184, 216, 207] },
+  { heightM: 0.30, color: [76, 170, 181] },
+  { heightM: 0.50, color: [35, 125, 169] },
+  { heightM: 0.75, color: [68, 83, 157] },
+  { heightM: 1.00, color: [122, 60, 142] },
+  { heightM: 1.30, color: [187, 61, 104] },
+  { heightM: 1.65, color: [242, 142, 56] },
+];
+
+const structuralHeightColor = (
+  heightMValue: number,
+): [number, number, number] => {
+  const heightM = Math.min(
+    STRUCTURAL_HEIGHT_STOPS[STRUCTURAL_HEIGHT_STOPS.length - 1].heightM,
+    Math.max(0, Number.isFinite(heightMValue) ? heightMValue : 0),
+  );
+  for (let index = 0; index < STRUCTURAL_HEIGHT_STOPS.length - 1; index += 1) {
+    const lower = STRUCTURAL_HEIGHT_STOPS[index];
+    const upper = STRUCTURAL_HEIGHT_STOPS[index + 1];
+    if (heightM > upper.heightM) continue;
+    const span = upper.heightM - lower.heightM;
+    const mix = span > 0 ? (heightM - lower.heightM) / span : 0;
+    return [
+      Math.round(lower.color[0] + ((upper.color[0] - lower.color[0]) * mix)),
+      Math.round(lower.color[1] + ((upper.color[1] - lower.color[1]) * mix)),
+      Math.round(lower.color[2] + ((upper.color[2] - lower.color[2]) * mix)),
+    ];
+  }
+  const last = STRUCTURAL_HEIGHT_STOPS[STRUCTURAL_HEIGHT_STOPS.length - 1];
+  return [last.color[0], last.color[1], last.color[2]];
+};
+
+export type FloorplanRgbLayer = {
+  rgb_b64?: string;
+  rgb_shape?: [number, number, number];
+  observed_b64?: string;
+};
+
 export function decodeFloat32(base64?: string): Float32Array | null {
   if (!base64) return null;
   try {
@@ -156,16 +199,94 @@ type RenderLayerOptions = {
   valueMaxPercentile?: number;
   // Apply gamma to the normalized value after clamping to [0,1]. gamma < 1 boosts low values.
   gamma?: number;
-  // Optional mask layer: if provided, pixels where mask <= threshold render as black.
-  // Intended for hiding unobserved cells (e.g., density == 0).
+  // Optional validity mask. Failed pixels use the explicit unknown checker
+  // instead of a valid-looking semantic zero. maskInvert supports an `unknown`
+  // layer whose positive cells are invalid.
   maskLayer?: FloorplanLayer;
   maskThreshold?: number;
   maskInvert?: boolean;
   imageSmoothing?: boolean;
+  // Unknown cells use a checker pair so they cannot be mistaken for a valid
+  // zero-valued semantic cell (for example, obstacle vs unobserved).
+  unknownColor?: [number, number, number, number?];
+  unknownAltColor?: [number, number, number, number?];
+  inferredWalkableLayer?: FloorplanLayer;
+  inferredWalkableColor?: [number, number, number, number?];
+  inferredWalkableAltColor?: [number, number, number, number?];
+  // Display-only repair for an isolated raster sampling hole. A masked cell
+  // is rendered from the median of at least five valid 8-neighbours; larger
+  // unknown regions and room edges remain explicitly unknown.
+  repairIsolatedMaskHoles?: boolean;
+  // Deterministic output sizing is used by source-quality PNG exports.
+  targetWidthPx?: number;
+  targetHeightPx?: number;
+  pixelRatio?: number;
+  // Display-only crop in source-grid coordinates. The renderer samples the
+  // original grid through this rectangle; it never rewrites metric bounds or
+  // semantic values.
+  sourceRect?: { x: number; y: number; width: number; height: number };
+  bounds?: { min_x: number; max_x: number; min_z: number; max_z: number };
+  metricGridM?: number;
 };
 
 type RenderLayerResult = {
   contentRectPx: { x: number; y: number; w: number; h: number };
+  sourceRectGrid: { x: number; y: number; width: number; height: number };
+  valueRange?: { min: number; max: number };
+};
+
+const writeRgba = (
+  target: Uint8ClampedArray,
+  offset: number,
+  color: [number, number, number, number?],
+) => {
+  target[offset] = color[0];
+  target[offset + 1] = color[1];
+  target[offset + 2] = color[2];
+  target[offset + 3] = color[3] ?? 255;
+};
+
+const unknownColorForCell = (
+  options: RenderLayerOptions | undefined,
+  row: number,
+  col: number,
+): [number, number, number, number?] => {
+  const primary = options?.unknownColor ?? [16, 22, 32, 255];
+  const alternate = options?.unknownAltColor ?? [26, 34, 47, 255];
+  return ((Math.floor(row / 4) + Math.floor(col / 4)) % 2 === 0)
+    ? primary
+    : alternate;
+};
+
+const inferredWalkableColorForCell = (
+  options: RenderLayerOptions | undefined,
+  row: number,
+  col: number,
+): [number, number, number, number?] => {
+  const primary = options?.inferredWalkableColor ?? [52, 102, 140, 255];
+  const alternate = options?.inferredWalkableAltColor ?? [72, 126, 164, 255];
+  return ((Math.floor(row / 4) + Math.floor(col / 4)) % 2 === 0)
+    ? primary
+    : alternate;
+};
+
+const normalizeSourceRect = (
+  options: RenderLayerOptions | undefined,
+  rows: number,
+  cols: number,
+) => {
+  const requested = options?.sourceRect;
+  if (!requested) return { x: 0, y: 0, width: cols, height: rows };
+  const x = Math.max(0, Math.min(cols - 1, Math.floor(Number(requested.x) || 0)));
+  const y = Math.max(0, Math.min(rows - 1, Math.floor(Number(requested.y) || 0)));
+  const requestedWidth = Math.max(1, Math.floor(Number(requested.width) || cols));
+  const requestedHeight = Math.max(1, Math.floor(Number(requested.height) || rows));
+  return {
+    x,
+    y,
+    width: Math.max(1, Math.min(cols - x, requestedWidth)),
+    height: Math.max(1, Math.min(rows - y, requestedHeight)),
+  };
 };
 
 function percentileSorted(sorted: number[], pct: number): number {
@@ -230,14 +351,65 @@ export function renderCompositeWalkableObstacleToCanvas(
   const obsDenom = obsMax - obsMin === 0 ? 1 : (obsMax - obsMin);
   const obstacleEps = 0.05;
   const floorColor: [number, number, number] = [230, 228, 222];
-  const outsideColor: [number, number, number] = [0, 0, 0];
+  const optObj = (typeof options === 'object') ? options : undefined;
+  let maskValues: Float32Array | null = null;
+  let inferredWalkableValues: Float32Array | null = null;
+  let maskThreshold = 1e-6;
+  let maskInvert = false;
+  const maskLayer = optObj?.maskLayer;
+  if (maskLayer?.grid_b64 && maskLayer.grid_shape) {
+    const [maskRows, maskCols] = maskLayer.grid_shape;
+    if (maskRows === rowsW && maskCols === colsW) {
+      const decoded = decodeFloat32(maskLayer.grid_b64);
+      if (decoded && decoded.length >= rowsW * colsW) {
+        maskValues = decoded;
+        if (typeof optObj?.maskThreshold === 'number' && Number.isFinite(optObj.maskThreshold)) {
+          maskThreshold = optObj.maskThreshold;
+        }
+        maskInvert = !!optObj?.maskInvert;
+      }
+    }
+  }
+  const inferredWalkableLayer = optObj?.inferredWalkableLayer;
+  if (inferredWalkableLayer?.grid_b64 && inferredWalkableLayer.grid_shape) {
+    const [inferredRows, inferredCols] = inferredWalkableLayer.grid_shape;
+    if (inferredRows === rowsW && inferredCols === colsW) {
+      const decoded = decodeFloat32(inferredWalkableLayer.grid_b64);
+      if (decoded && decoded.length >= rowsW * colsW) {
+        inferredWalkableValues = decoded;
+      }
+    }
+  }
 
   for (let idx = 0; idx < (rowsW * colsW); idx += 1) {
+    const row = Math.floor(idx / colsW);
+    const col = idx % colsW;
+    const offset = idx * 4;
+    if (maskValues) {
+      const mv = maskValues[idx];
+      const finiteMask = Number.isFinite(mv);
+      const positive = finiteMask && mv > maskThreshold;
+      const pass = finiteMask && (maskInvert ? !positive : positive);
+      if (!pass) {
+        const inferredWalkable = inferredWalkableValues
+          && Number.isFinite(inferredWalkableValues[idx])
+          && inferredWalkableValues[idx] > 0.5;
+        writeRgba(
+          data,
+          offset,
+          inferredWalkable
+            ? inferredWalkableColorForCell(optObj, row, col)
+            : unknownColorForCell(optObj, row, col),
+        );
+        continue;
+      }
+    }
+
     const w = walkValues[idx];
     const oh = obsValues[idx];
-    let r = outsideColor[0];
-    let g = outsideColor[1];
-    let b = outsideColor[2];
+    let r = 0;
+    let g = 0;
+    let b = 0;
 
     if (Number.isFinite(oh) && oh > obstacleEps) {
       const t = Math.min(1, Math.max(0, (oh - obsMin) / obsDenom));
@@ -249,7 +421,6 @@ export function renderCompositeWalkableObstacleToCanvas(
       b = floorColor[2];
     }
 
-    const offset = idx * 4;
     data[offset] = r;
     data[offset + 1] = g;
     data[offset + 2] = b;
@@ -264,17 +435,24 @@ export function renderCompositeWalkableObstacleToCanvas(
     ? Math.max(0, Number(options.contentPaddingPx) || 0)
     : 0;
   const imageSmoothing = (typeof options === 'object') ? !!options.imageSmoothing : false;
-  const dpr = window.devicePixelRatio || 1;
+  const dpr = (typeof optObj?.pixelRatio === 'number' && Number.isFinite(optObj.pixelRatio))
+    ? Math.max(0.1, optObj.pixelRatio)
+    : (window.devicePixelRatio || 1);
+  const sourceRect = normalizeSourceRect(optObj, rowsW, colsW);
 
-  let { width, height } = applyCanvasSize(canvas);
+  let { width, height } = applyCanvasSize(
+    canvas,
+    optObj?.targetWidthPx,
+    optObj?.targetHeightPx,
+  );
   if (fit === 'stretch') {
-    const aspect = forceAspect || (colsW / rowsW);
+    const aspect = forceAspect || (sourceRect.width / sourceRect.height);
     height = width / aspect;
   }
   canvas.width = Math.max(1, Math.round(width * dpr));
   canvas.height = Math.max(1, Math.round(height * dpr));
 
-  const contentAspect = forceAspect || (colsW / rowsW);
+  const contentAspect = forceAspect || (sourceRect.width / sourceRect.height);
   let contentW = width;
   let contentH = height;
   let contentX = 0;
@@ -314,7 +492,17 @@ export function renderCompositeWalkableObstacleToCanvas(
   if (imageSmoothing) {
     ctx.imageSmoothingQuality = 'high';
   }
-  ctx.drawImage(offscreen, contentX, contentY, contentW, contentH);
+  ctx.drawImage(
+    offscreen,
+    sourceRect.x,
+    sourceRect.y,
+    sourceRect.width,
+    sourceRect.height,
+    contentX,
+    contentY,
+    contentW,
+    contentH,
+  );
   ctx.restore();
 
   return {
@@ -323,7 +511,8 @@ export function renderCompositeWalkableObstacleToCanvas(
       y: contentY * dpr,
       w: contentW * dpr,
       h: contentH * dpr
-    }
+    },
+    sourceRectGrid: sourceRect,
   };
 }
 
@@ -371,6 +560,7 @@ export function renderLayerToCanvas(
     : 1.0;
 
   let maskValues: Float32Array | null = null;
+  let inferredWalkableValues: Float32Array | null = null;
   let maskThreshold = 1e-6;
   let maskInvert = false;
   const maskLayer = optObj?.maskLayer;
@@ -384,6 +574,16 @@ export function renderLayerToCanvas(
           maskThreshold = optObj.maskThreshold;
         }
         maskInvert = !!optObj?.maskInvert;
+      }
+    }
+  }
+  const inferredWalkableLayer = optObj?.inferredWalkableLayer;
+  if (inferredWalkableLayer?.grid_b64 && inferredWalkableLayer.grid_shape) {
+    const [inferredRows, inferredCols] = inferredWalkableLayer.grid_shape;
+    if (inferredRows === rows && inferredCols === cols) {
+      const decoded = decodeFloat32(inferredWalkableLayer.grid_b64);
+      if (decoded && decoded.length >= rows * cols) {
+        inferredWalkableValues = decoded;
       }
     }
   }
@@ -403,8 +603,9 @@ export function renderLayerToCanvas(
       if (!Number.isFinite(v)) continue;
       if (maskValues) {
         const mv = maskValues[idx];
-        const ok = Number.isFinite(mv) && (mv > maskThreshold);
-        const pass = maskInvert ? !ok : ok;
+        const finiteMask = Number.isFinite(mv);
+        const positive = finiteMask && mv > maskThreshold;
+        const pass = finiteMask && (maskInvert ? !positive : positive);
         if (!pass) continue;
       }
       samples.push(v);
@@ -424,29 +625,79 @@ export function renderLayerToCanvas(
   if (max <= min) max = min + 1;
   const denom = max - min;
 
+  const maskPasses = (idx: number): boolean => {
+    if (!maskValues || idx < 0 || idx >= rows * cols) return true;
+    const mv = maskValues[idx];
+    const finiteMask = Number.isFinite(mv);
+    const positive = finiteMask && mv > maskThreshold;
+    return finiteMask && (maskInvert ? !positive : positive);
+  };
+  const isolatedHoleValue = (idx: number): number | null => {
+    if (!optObj?.repairIsolatedMaskHoles || !maskValues) return null;
+    const row = Math.floor(idx / cols);
+    const col = idx % cols;
+    const neighbours: number[] = [];
+    for (let rowOffset = -1; rowOffset <= 1; rowOffset += 1) {
+      for (let colOffset = -1; colOffset <= 1; colOffset += 1) {
+        if (rowOffset === 0 && colOffset === 0) continue;
+        const neighbourRow = row + rowOffset;
+        const neighbourCol = col + colOffset;
+        if (
+          neighbourRow < 0
+          || neighbourRow >= rows
+          || neighbourCol < 0
+          || neighbourCol >= cols
+        ) {
+          continue;
+        }
+        const neighbourIdx = (neighbourRow * cols) + neighbourCol;
+        const neighbourValue = values[neighbourIdx];
+        if (maskPasses(neighbourIdx) && Number.isFinite(neighbourValue)) {
+          neighbours.push(neighbourValue);
+        }
+      }
+    }
+    if (neighbours.length < 5) return null;
+    neighbours.sort((a, b) => a - b);
+    const middle = Math.floor(neighbours.length / 2);
+    return neighbours.length % 2
+      ? neighbours[middle]
+      : (neighbours[middle - 1] + neighbours[middle]) / 2;
+  };
+
   const n = rows * cols;
   for (let idx = 0; idx < n; idx += 1) {
-    const v = values[idx];
+    let v = values[idx];
     const offset = idx * 4;
-    if (!Number.isFinite(v)) {
-      data[offset] = 0;
-      data[offset + 1] = 0;
-      data[offset + 2] = 0;
-      data[offset + 3] = 255;
-      continue;
-    }
 
     if (maskValues) {
-      const mv = maskValues[idx];
-      const ok = Number.isFinite(mv) && (mv > maskThreshold);
-      const pass = maskInvert ? !ok : ok;
-      if (!pass) {
-        data[offset] = 0;
-        data[offset + 1] = 0;
-        data[offset + 2] = 0;
-        data[offset + 3] = 255;
-        continue;
+      if (!maskPasses(idx)) {
+        const repairedValue = isolatedHoleValue(idx);
+        if (repairedValue !== null) {
+          v = repairedValue;
+        } else {
+          const inferredWalkable = inferredWalkableValues
+            && Number.isFinite(inferredWalkableValues[idx])
+            && inferredWalkableValues[idx] > 0.5;
+          writeRgba(
+            data,
+            offset,
+            inferredWalkable
+              ? inferredWalkableColorForCell(optObj, Math.floor(idx / cols), idx % cols)
+              : unknownColorForCell(optObj, Math.floor(idx / cols), idx % cols),
+          );
+          continue;
+        }
       }
+    }
+
+    if (!Number.isFinite(v)) {
+      writeRgba(
+        data,
+        offset,
+        unknownColorForCell(optObj, Math.floor(idx / cols), idx % cols),
+      );
+      continue;
     }
 
     let norm = (v - min) / denom;
@@ -469,17 +720,24 @@ export function renderLayerToCanvas(
     ? Math.max(0, Number(options.contentPaddingPx) || 0)
     : 0;
   const imageSmoothing = (typeof options === 'object') ? !!options.imageSmoothing : false;
-  const dpr = window.devicePixelRatio || 1;
+  const dpr = (typeof optObj?.pixelRatio === 'number' && Number.isFinite(optObj.pixelRatio))
+    ? Math.max(0.1, optObj.pixelRatio)
+    : (window.devicePixelRatio || 1);
+  const sourceRect = normalizeSourceRect(optObj, rows, cols);
 
-  let { width, height } = applyCanvasSize(canvas);
+  let { width, height } = applyCanvasSize(
+    canvas,
+    optObj?.targetWidthPx,
+    optObj?.targetHeightPx,
+  );
   if (fit === 'stretch') {
-    const aspect = forceAspect || (cols / rows);
+    const aspect = forceAspect || (sourceRect.width / sourceRect.height);
     height = width / aspect;
   }
   canvas.width = Math.max(1, Math.round(width * dpr));
   canvas.height = Math.max(1, Math.round(height * dpr));
 
-  const contentAspect = forceAspect || (cols / rows);
+  const contentAspect = forceAspect || (sourceRect.width / sourceRect.height);
   let contentW = width;
   let contentH = height;
   let contentX = 0;
@@ -519,7 +777,17 @@ export function renderLayerToCanvas(
   if (imageSmoothing) {
     ctx.imageSmoothingQuality = 'high';
   }
-  ctx.drawImage(offscreen, contentX, contentY, contentW, contentH);
+  ctx.drawImage(
+    offscreen,
+    sourceRect.x,
+    sourceRect.y,
+    sourceRect.width,
+    sourceRect.height,
+    contentX,
+    contentY,
+    contentW,
+    contentH,
+  );
   ctx.restore();
 
   return {
@@ -528,6 +796,262 @@ export function renderLayerToCanvas(
       y: contentY * dpr,
       w: contentW * dpr,
       h: contentH * dpr
+    },
+    sourceRectGrid: sourceRect,
+    valueRange: { min, max },
+  };
+}
+
+/**
+ * Render the v9 structural floorplan without mixing walls or ceilings into
+ * furniture height. Inferred interior floor remains visibly distinct, while
+ * learned RGB supplies only a restrained texture cue and never changes the
+ * metric height color.
+ */
+export function renderStructuralFloorplanToCanvas(
+  canvas: HTMLCanvasElement | null,
+  structuralHeight: FloorplanLayer | undefined,
+  roomFootprint: FloorplanLayer | undefined,
+  surfaceObserved: FloorplanLayer | undefined,
+  wallSupport: FloorplanLayer | undefined,
+  roomBoundary: FloorplanLayer | undefined,
+  surfaceRgb: FloorplanRgbLayer | undefined,
+  options?: RenderLayerOptions,
+): RenderLayerResult | null {
+  if (
+    !canvas
+    || !structuralHeight?.grid_b64
+    || !structuralHeight.grid_shape
+    || !roomFootprint?.grid_b64
+    || !roomFootprint.grid_shape
+  ) {
+    if (canvas) {
+      const context = canvas.getContext('2d');
+      context?.clearRect(0, 0, canvas.width, canvas.height);
     }
+    return null;
+  }
+  const [rows, cols] = structuralHeight.grid_shape;
+  if (
+    rows <= 0
+    || cols <= 0
+    || roomFootprint.grid_shape[0] !== rows
+    || roomFootprint.grid_shape[1] !== cols
+  ) {
+    return null;
+  }
+  const count = rows * cols;
+  const heightValues = decodeFloat32(structuralHeight.grid_b64);
+  const footprintValues = decodeFloat32(roomFootprint.grid_b64);
+  if (
+    !heightValues
+    || heightValues.length < count
+    || !footprintValues
+    || footprintValues.length < count
+  ) {
+    return null;
+  }
+
+  const decodeMatchingLayer = (
+    layer: FloorplanLayer | undefined,
+  ): Float32Array | null => {
+    if (
+      !layer?.grid_b64
+      || layer.grid_shape?.[0] !== rows
+      || layer.grid_shape?.[1] !== cols
+    ) {
+      return null;
+    }
+    const decoded = decodeFloat32(layer.grid_b64);
+    return decoded && decoded.length >= count ? decoded : null;
+  };
+  const surfaceObservedValues = decodeMatchingLayer(surfaceObserved);
+  const wallValues = decodeMatchingLayer(wallSupport);
+  const boundaryValues = decodeMatchingLayer(roomBoundary);
+  const rgbValues = (
+    surfaceRgb?.rgb_b64
+    && surfaceRgb.rgb_shape?.[0] === rows
+    && surfaceRgb.rgb_shape?.[1] === cols
+    && surfaceRgb.rgb_shape?.[2] === 3
+  )
+    ? decodeUint8(surfaceRgb.rgb_b64)
+    : null;
+  const rgbObservedValues = (
+    surfaceRgb?.observed_b64
+    ? decodeFloat32(surfaceRgb.observed_b64)
+    : null
+  );
+
+  const result = renderLayerToCanvas(
+    canvas,
+    structuralHeight,
+    (normalized) => structuralHeightColor(normalized * 1.65),
+    {
+      ...options,
+      valueMin: 0,
+      valueMax: 1.65,
+      gamma: 1,
+      maskLayer: roomFootprint,
+      maskThreshold: 0.5,
+      maskInvert: false,
+      imageSmoothing: false,
+    },
+  );
+  if (!result) return null;
+
+  const context = canvas.getContext('2d');
+  if (!context) return result;
+  const sourceRect = result.sourceRectGrid;
+  const content = result.contentRectPx;
+  const cellWidthPx = content.w / sourceRect.width;
+  const cellHeightPx = content.h / sourceRect.height;
+  const indexAt = (row: number, col: number): number => (row * cols) + col;
+
+  context.save();
+  context.setTransform(1, 0, 0, 1, 0, 0);
+  for (let row = sourceRect.y; row < sourceRect.y + sourceRect.height; row += 1) {
+    for (let col = sourceRect.x; col < sourceRect.x + sourceRect.width; col += 1) {
+      const index = indexAt(row, col);
+      if (
+        !Number.isFinite(footprintValues[index])
+        || footprintValues[index] <= 0.5
+      ) {
+        continue;
+      }
+      const x = content.x + ((col - sourceRect.x) * cellWidthPx);
+      const y = content.y + ((row - sourceRect.y) * cellHeightPx);
+      const width = cellWidthPx + 0.35;
+      const height = cellHeightPx + 0.35;
+      const heightM = Number.isFinite(heightValues[index])
+        ? heightValues[index]
+        : 0;
+      const observedSurface = !surfaceObservedValues
+        || (
+          Number.isFinite(surfaceObservedValues[index])
+          && surfaceObservedValues[index] > 0.5
+        );
+
+      if (!observedSurface) {
+        const alternate = (
+          Math.floor(row / 3) + Math.floor(col / 3)
+        ) % 2 === 0;
+        context.fillStyle = alternate
+          ? 'rgba(39, 111, 119, 0.055)'
+          : 'rgba(25, 77, 88, 0.025)';
+        context.fillRect(x, y, width, height);
+      }
+
+      const rgbObserved = (
+        rgbValues
+        && rgbValues.length >= count * 3
+        && rgbObservedValues
+        && rgbObservedValues.length >= count
+        && Number.isFinite(rgbObservedValues[index])
+        && rgbObservedValues[index] > 0.5
+      );
+      if (rgbObserved && heightM >= 0.12) {
+        const rgbOffset = index * 3;
+        context.fillStyle = `rgba(${rgbValues![rgbOffset]}, ${rgbValues![rgbOffset + 1]}, ${rgbValues![rgbOffset + 2]}, 0.22)`;
+        context.fillRect(x, y, width, height);
+      }
+
+      if (heightM >= 0.12) {
+        let edge = false;
+        for (const [rowOffset, colOffset] of [[-1, 0], [1, 0], [0, -1], [0, 1]]) {
+          const neighborRow = row + rowOffset;
+          const neighborCol = col + colOffset;
+          if (
+            neighborRow < 0
+            || neighborRow >= rows
+            || neighborCol < 0
+            || neighborCol >= cols
+          ) {
+            edge = true;
+            break;
+          }
+          const neighborIndex = indexAt(neighborRow, neighborCol);
+          const neighborHeight = (
+            Number.isFinite(heightValues[neighborIndex])
+            && footprintValues[neighborIndex] > 0.5
+          )
+            ? heightValues[neighborIndex]
+            : 0;
+          if (
+            neighborHeight < 0.12
+            || Math.abs(neighborHeight - heightM) > 0.12
+          ) {
+            edge = true;
+            break;
+          }
+        }
+        if (edge) {
+          context.fillStyle = 'rgba(7, 11, 18, 0.24)';
+          context.fillRect(x, y, width, height);
+        }
+      }
+
+      const wall = wallValues && Number.isFinite(wallValues[index])
+        ? Math.min(1, Math.max(0, wallValues[index]))
+        : 0;
+      if (wall > 0.04) {
+        context.fillStyle = `rgba(8, 13, 18, ${0.14 + (wall * 0.48)})`;
+        context.fillRect(x, y, width, height);
+      } else {
+        const boundary = boundaryValues && Number.isFinite(boundaryValues[index])
+          ? Math.min(1, Math.max(0, boundaryValues[index]))
+          : 0;
+        if (boundary > 0.20) {
+          context.fillStyle = `rgba(22, 32, 38, ${boundary * 0.42})`;
+          context.fillRect(x, y, width, height);
+        }
+      }
+    }
+  }
+
+  const bounds = options?.bounds;
+  const metricStep = Number(options?.metricGridM ?? 1);
+  if (
+    bounds
+    && Number.isFinite(metricStep)
+    && metricStep > 0
+    && bounds.max_x > bounds.min_x
+    && bounds.max_z > bounds.min_z
+  ) {
+    const cellWidthM = (bounds.max_x - bounds.min_x) / cols;
+    const cellDepthM = (bounds.max_z - bounds.min_z) / rows;
+    const sourceMinX = bounds.min_x + (sourceRect.x * cellWidthM);
+    const sourceMaxX = sourceMinX + (sourceRect.width * cellWidthM);
+    const sourceMaxZ = bounds.max_z - (sourceRect.y * cellDepthM);
+    const sourceMinZ = sourceMaxZ - (sourceRect.height * cellDepthM);
+    context.beginPath();
+    context.strokeStyle = 'rgba(255, 255, 255, 0.12)';
+    context.lineWidth = 1;
+    for (
+      let xM = Math.ceil((sourceMinX - 1e-9) / metricStep) * metricStep;
+      xM <= sourceMaxX + 1e-9;
+      xM += metricStep
+    ) {
+      const gridX = ((xM - bounds.min_x) / cellWidthM) - sourceRect.x;
+      const pixelX = content.x + (gridX * cellWidthPx);
+      context.moveTo(pixelX, content.y);
+      context.lineTo(pixelX, content.y + content.h);
+    }
+    for (
+      let zM = Math.ceil((sourceMinZ - 1e-9) / metricStep) * metricStep;
+      zM <= sourceMaxZ + 1e-9;
+      zM += metricStep
+    ) {
+      const gridY = ((bounds.max_z - zM) / cellDepthM) - sourceRect.y;
+      const pixelY = content.y + (gridY * cellHeightPx);
+      context.moveTo(content.x, pixelY);
+      context.lineTo(content.x + content.w, pixelY);
+    }
+    context.stroke();
+  }
+  context.restore();
+
+  return {
+    ...result,
+    valueRange: { min: 0, max: 1.65 },
   };
 }

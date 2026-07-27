@@ -1,20 +1,22 @@
-import { decodeFloat16, decodeFloat32, decodeUint8 } from './renderUtils';
+import { decodeFloat32 } from './renderUtils';
 import { extractPoseFromExtrinsics } from './calibration';
 
 export type FloorPlaneDepthEntry = {
   ts: number;
-  depth_b64: string;
-  conf_b64?: string;
-  mask_b64?: string;
+  depth: Float32Array;
+  conf: Float32Array;
+  mask: Uint8Array;
   shape: [number, number];
-  normals_b64?: string;
-  normals_shape?: [number, number, number];
-  normals_dtype?: 'float16' | 'float32';
-  normals_space?: 'camera' | 'world';
-  normals_error?: string;
+  snapshotId?: string;
+  snapshotRef?: string;
+  snapshotContentSha256?: string;
 };
 
 export type FloorPlaneFloorplan = {
+  snapshot_ts?: number | null;
+  snapshot_id?: string;
+  snapshot_ref?: string;
+  snapshot_content_sha256?: string;
   bounds?: { min_x?: number; max_x?: number; min_z?: number; max_z?: number };
   units?: string;
   s_obj_to_m?: number;
@@ -85,7 +87,6 @@ export type VisibleFloorPlaneResult = {
     | 'ready'
     | 'missing_depth'
     | 'missing_confidence'
-    | 'missing_normals'
     | 'missing_intrinsics'
     | 'missing_extrinsics'
     | 'bad_payload'
@@ -133,6 +134,30 @@ const fail = (status: VisibleFloorPlaneResult['status'], message: string): Visib
 
 const finite = (value: unknown): value is number => typeof value === 'number' && Number.isFinite(value);
 
+export function floorplanMatchesDepthSnapshot(
+  depthEntry?: FloorPlaneDepthEntry | null,
+  floorplan?: FloorPlaneFloorplan | null,
+): boolean {
+  if (!depthEntry || !floorplan) return false;
+  const depthTs = depthEntry.ts;
+  const floorplanTs = floorplan.snapshot_ts;
+  return Boolean(
+    Number.isSafeInteger(depthTs)
+    && Number(depthTs) > 0
+    && Number.isSafeInteger(floorplanTs)
+    && Number(floorplanTs) === Number(depthTs)
+    && typeof depthEntry.snapshotId === 'string'
+    && depthEntry.snapshotId.length > 0
+    && floorplan.snapshot_id === depthEntry.snapshotId
+    && typeof depthEntry.snapshotRef === 'string'
+    && depthEntry.snapshotRef.length > 0
+    && floorplan.snapshot_ref === depthEntry.snapshotRef
+    && typeof depthEntry.snapshotContentSha256 === 'string'
+    && /^[0-9a-f]{64}$/.test(depthEntry.snapshotContentSha256)
+    && floorplan.snapshot_content_sha256 === depthEntry.snapshotContentSha256
+  );
+}
+
 const clamp01 = (value: number) => Math.min(1, Math.max(0, value));
 
 function normalizeIntrinsics(values?: number[] | null): [number, number, number, number] | null {
@@ -159,6 +184,99 @@ function normalizeVec3(v: [number, number, number]): [number, number, number] | 
   const mag = Math.hypot(v[0], v[1], v[2]);
   if (!Number.isFinite(mag) || mag <= 1e-6) return null;
   return [v[0] / mag, v[1] / mag, v[2] / mag];
+}
+
+export type DepthNormalSample = {
+  depth: Float32Array;
+  mask: Uint8Array;
+  width: number;
+  height: number;
+  u: number;
+  v: number;
+  fx: number;
+  fy: number;
+  cx: number;
+  cy: number;
+};
+
+/**
+ * Derive a metric camera-space normal from four neighboring depth samples.
+ *
+ * This deliberately does not consume the display-normal tensor. Each depth
+ * neighbor is unprojected with the exact camera intrinsics, then the horizontal
+ * and vertical camera-space tangents are crossed. Invalid center/neighbors fail
+ * closed so they cannot manufacture horizontal floor support.
+ */
+export function deriveCameraDepthNormal(sample: DepthNormalSample): [number, number, number] | null {
+  const {
+    depth,
+    mask,
+    width,
+    height,
+    u,
+    v,
+    fx,
+    fy,
+    cx,
+    cy,
+  } = sample;
+  if (
+    !Number.isSafeInteger(width)
+    || !Number.isSafeInteger(height)
+    || width <= 2
+    || height <= 2
+    || !Number.isSafeInteger(u)
+    || !Number.isSafeInteger(v)
+    || u <= 0
+    || v <= 0
+    || u >= width - 1
+    || v >= height - 1
+    || !Number.isFinite(fx)
+    || !Number.isFinite(fy)
+    || !Number.isFinite(cx)
+    || !Number.isFinite(cy)
+    || Math.abs(fx) <= 1e-6
+    || Math.abs(fy) <= 1e-6
+    || !Number.isSafeInteger(width * height)
+    || !(depth instanceof Float32Array)
+    || !(mask instanceof Uint8Array)
+    || depth.length !== width * height
+    || mask.length !== width * height
+  ) return null;
+
+  const pointAt = (pixelU: number, pixelV: number): [number, number, number] | null => {
+    const index = pixelV * width + pixelU;
+    const z = depth[index];
+    if (mask[index] <= 0 || !Number.isFinite(z) || z <= 0.1 || z >= 50) return null;
+    return [
+      ((pixelU - cx) * z) / fx,
+      -((pixelV - cy) * z) / fy,
+      z,
+    ];
+  };
+
+  if (!pointAt(u, v)) return null;
+  const left = pointAt(u - 1, v);
+  const right = pointAt(u + 1, v);
+  const above = pointAt(u, v - 1);
+  const below = pointAt(u, v + 1);
+  if (!left || !right || !above || !below) return null;
+
+  const tangentU: [number, number, number] = [
+    right[0] - left[0],
+    right[1] - left[1],
+    right[2] - left[2],
+  ];
+  const tangentV: [number, number, number] = [
+    below[0] - above[0],
+    below[1] - above[1],
+    below[2] - above[2],
+  ];
+  return normalizeVec3([
+    tangentU[1] * tangentV[2] - tangentU[2] * tangentV[1],
+    tangentU[2] * tangentV[0] - tangentU[0] * tangentV[2],
+    tangentU[0] * tangentV[1] - tangentU[1] * tangentV[0],
+  ]);
 }
 
 function mat3Vec(m: number[][], v: [number, number, number]): [number, number, number] {
@@ -591,16 +709,21 @@ export function buildVisibleFloorPlaneModel(options: BuildOptions): VisibleFloor
     horizontalThreshold = DEFAULT_HORIZONTAL_THRESHOLD,
   } = options;
 
+  const floorplanIdentityMatches = floorplanMatchesDepthSnapshot(
+    depthEntry,
+    floorplan,
+  );
+  const exactFloorplan = floorplanIdentityMatches ? floorplan : null;
+
   if (!depthEntry) return fail('missing_depth', 'Waiting for a depth snapshot.');
-  if (!depthEntry.depth_b64 || !Array.isArray(depthEntry.shape)) {
+  if (!(depthEntry.depth instanceof Float32Array) || !Array.isArray(depthEntry.shape)) {
     return fail('bad_payload', 'Depth payload is incomplete.');
   }
-  if (!depthEntry.conf_b64) {
+  if (!(depthEntry.conf instanceof Float32Array)) {
     return fail('missing_confidence', 'Depth confidence data is required for visible-floor extraction.');
   }
-  if (!depthEntry.normals_b64) {
-    const suffix = depthEntry.normals_error ? ` (${depthEntry.normals_error})` : '';
-    return fail('missing_normals', `Surface normals are required for visible-floor extraction${suffix}.`);
+  if (!(depthEntry.mask instanceof Uint8Array)) {
+    return fail('bad_payload', 'Depth validity-mask data is required for visible-floor extraction.');
   }
 
   const intr = normalizeIntrinsics(options.intrinsics);
@@ -613,31 +736,16 @@ export function buildVisibleFloorPlaneModel(options: BuildOptions): VisibleFloor
   const width = Math.floor(Number(widthRaw) || 0);
   if (height <= 0 || width <= 0) return fail('bad_payload', 'Depth payload has an invalid shape.');
 
-  const depth = decodeFloat32(depthEntry.depth_b64);
-  const conf = decodeFloat32(depthEntry.conf_b64);
-  const mask = decodeUint8(depthEntry.mask_b64);
-  if (!depth || depth.length < width * height || !conf || conf.length < width * height) {
-    return fail('bad_payload', 'Depth or confidence tensor could not be decoded.');
-  }
-
-  const normalsShape = depthEntry.normals_shape || [height, width, 3];
-  const normalHeight = Math.floor(Number(normalsShape[0]) || 0);
-  const normalWidth = Math.floor(Number(normalsShape[1]) || 0);
-  const normalChannels = Math.floor(Number(normalsShape[2]) || 0);
-  if (normalHeight <= 0 || normalWidth <= 0 || normalChannels < 3) {
-    return fail('bad_payload', 'Normals payload has an invalid shape.');
-  }
-  const normals = (depthEntry.normals_dtype || 'float16') === 'float32'
-    ? decodeFloat32(depthEntry.normals_b64)
-    : decodeFloat16(depthEntry.normals_b64);
-  if (!normals || normals.length < normalHeight * normalWidth * 3) {
-    return fail('bad_payload', 'Normals tensor could not be decoded.');
+  const total = width * height;
+  const depth = depthEntry.depth;
+  const conf = depthEntry.conf;
+  const mask = depthEntry.mask;
+  if (depth.length !== total || conf.length !== total || mask.length !== total) {
+    return fail('bad_payload', 'Depth, confidence, or mask tensor length does not match its shape.');
   }
 
   const [fx, fy, cx, cy] = intr;
-  const total = width * height;
   const scanStride = Math.max(1, Math.ceil(Math.sqrt(total / Math.max(1, maxScanPixels))));
-  const normalSpace = depthEntry.normals_space === 'world' ? 'world' : 'camera';
   const candidates: Candidate[] = [];
   let scannedPixelCount = 0;
 
@@ -651,21 +759,21 @@ export function buildVisibleFloorPlaneModel(options: BuildOptions): VisibleFloor
       const confidence = conf[idx];
       if (!Number.isFinite(confidence) || confidence < confidenceThreshold) continue;
 
-      const nu = Math.min(normalWidth - 1, Math.max(0, Math.floor((u / width) * normalWidth)));
-      const nv = Math.min(normalHeight - 1, Math.max(0, Math.floor((v / height) * normalHeight)));
-      const nBase = (nv * normalWidth + nu) * 3;
-      const nx = normals[nBase];
-      const ny = normals[nBase + 1];
-      const nz = normals[nBase + 2];
-      if (![nx, ny, nz].every(Number.isFinite)) continue;
-
-      let normalWorld: [number, number, number] | null;
-      if (normalSpace === 'world') {
-        normalWorld = normalizeVec3([nx, ny, nz]);
-      } else {
-        const normalLocal = normalizeVec3([nx, -ny, nz]);
-        normalWorld = normalLocal ? normalizeVec3(mat3Vec(pose.Rwc, normalLocal)) : null;
-      }
+      const normalLocal = deriveCameraDepthNormal({
+        depth,
+        mask,
+        width,
+        height,
+        u,
+        v,
+        fx,
+        fy,
+        cx,
+        cy,
+      });
+      const normalWorld = normalLocal
+        ? normalizeVec3(mat3Vec(pose.Rwc, normalLocal))
+        : null;
       if (!normalWorld) continue;
       const horizontalDot = Math.abs(
         normalWorld[0] * WORLD_UP[0] +
@@ -721,7 +829,7 @@ export function buildVisibleFloorPlaneModel(options: BuildOptions): VisibleFloor
     if (refinedInliers.length < minClusterCount) continue;
 
     const support = sampleSupport(refinedInliers, maxSupportPoints);
-    const { footprint, corners, mesh: footprintMesh } = resolveFootprint(floorplan, refinedInliers, refinedFit);
+    const { footprint, corners, mesh: footprintMesh } = resolveFootprint(exactFloorplan, refinedInliers, refinedFit);
     if (footprint.widthM <= 0 || footprint.depthM <= 0 || footprintMesh.indices.length < 3) {
       return fail('plane_fit_failed', 'Visible floor support was found, but the plane footprint is invalid.');
     }
@@ -735,7 +843,7 @@ export function buildVisibleFloorPlaneModel(options: BuildOptions): VisibleFloor
       cameraId,
       frame: 'camera_local_ground_m',
       depthTsUs: depthEntry.ts,
-      normalSpace,
+      normalSpace: 'camera',
       horizontalThreshold,
       confidenceThreshold,
       plane: {
@@ -767,7 +875,9 @@ export function buildVisibleFloorPlaneModel(options: BuildOptions): VisibleFloor
 
     return {
       status: 'ready',
-      message: 'Visible floor plane extracted from high-confidence horizontal depth pixels.',
+      message: floorplan && !floorplanIdentityMatches
+        ? 'Visible floor plane extracted from metric depth; floorplan footprint withheld because its snapshot identity does not match.'
+        : 'Visible floor plane extracted from high-confidence metric depth geometry.',
       model,
     };
   }

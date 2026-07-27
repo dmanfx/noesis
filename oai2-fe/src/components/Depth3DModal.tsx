@@ -229,7 +229,7 @@ const Depth3DModal: React.FC<Depth3DModalProps> = ({
               />
               Show mesh edges
             </label>
-            {process.env.NODE_ENV === 'development' && (
+            {import.meta.env.DEV && (
               <div className="depth3d-control">
                 <div className="depth3d-meta__label">Geometry source</div>
                 <select

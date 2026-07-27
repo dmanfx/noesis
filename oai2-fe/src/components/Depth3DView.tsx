@@ -112,7 +112,7 @@ const Depth3DView = forwardRef<Depth3DViewHandle, Depth3DViewProps>(({
   const lastPayloadLogRef = useRef<string>('');
   const statsLogRef = useRef<string>('');
   const [debugInfo, setDebugInfo] = useState<DebugInfo | null>(null);
-  const showDebugOverlay = process.env.NODE_ENV === 'development';
+  const showDebugOverlay = import.meta.env.DEV;
 
   const disposeEdges = useCallback(() => {
     const edges = edgesRef.current;
@@ -235,7 +235,7 @@ const Depth3DView = forwardRef<Depth3DViewHandle, Depth3DViewProps>(({
       dataMin,
       dataMax,
     });
-    if (process.env.NODE_ENV === 'development') {
+    if (import.meta.env.DEV) {
       try {
         // eslint-disable-next-line no-console
         console.debug('Depth3DView: map meta', { served_from_cache: heightMap.served_from_cache, meta: heightMap.meta });
@@ -408,7 +408,7 @@ const Depth3DView = forwardRef<Depth3DViewHandle, Depth3DViewProps>(({
     }
 
     const statsKey = String(heightMap.request_id || heightMap.ts || heightMap.meta?.generated_at || `${heightMap.camera_id || heightMap.camera || ''}-${heightMap.width}x${heightMap.height}`);
-    if (process.env.NODE_ENV === 'development' && statsLogRef.current !== statsKey) {
+    if (import.meta.env.DEV && statsLogRef.current !== statsKey) {
       // eslint-disable-next-line no-console
       console.log('Height map stats', {
         cols: targetCols,

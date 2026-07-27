@@ -1,0 +1,5 @@
+{
+  "max_pixels": 8388608,
+  "max_component_bytes": 67108864,
+  "max_snapshot_bytes": 134217728
+}

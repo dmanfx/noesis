@@ -539,7 +539,9 @@ const loadSnapshot = async (
   if (!littleEndian) {
     throw new Error('depth_bulk_little_endian_runtime_required');
   }
+  const filteredDepthBytes = components.depth.byte_count;
   const normalBytes = descriptor.shape[0] * descriptor.shape[1] * 3 * 4;
+  const normalSmoothingScratchBytes = descriptor.shape[1] * 3 * 4 * 3;
   const diagnosticsScratchBytes = descriptor.shape[0] * descriptor.shape[1] * 4;
   const requestedTransferBytes = (
     components.depth.byte_count
@@ -549,7 +551,11 @@ const loadSnapshot = async (
   );
   reserveRequestAllocation(
     requestId,
-    requestedTransferBytes + normalBytes + diagnosticsScratchBytes,
+    requestedTransferBytes
+      + filteredDepthBytes
+      + normalBytes
+      + normalSmoothingScratchBytes
+      + diagnosticsScratchBytes,
   );
   const depthBytes = await fetchComponent(
     components.depth,
@@ -604,6 +610,12 @@ const loadSnapshot = async (
     descriptor.shape[0],
     descriptor.shape[1],
     intrinsics,
+    {
+      confidence: conf,
+      bilateralRadius: 2,
+      sampleRadius: 4,
+      normalSmoothingRadius: 1,
+    },
   );
   const diagnostics = deriveDepthDiagnostics(depth, conf, mask, descriptor.shape);
   assertBeforeDeadline(deadlineMs);

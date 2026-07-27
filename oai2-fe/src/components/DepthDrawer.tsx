@@ -2053,7 +2053,7 @@ const DepthDrawer = memo(function DepthDrawer({
               )}
               <div className="heatmap-single">
                 <div className="heatmap-cell__body">
-                  <div className="heatmap-cell__title">Calibrated Camera-Space Normals (RGB)</div>
+                  <div className="heatmap-cell__title">Edge-Aware Calibrated Camera-Space Normals (RGB)</div>
                   <canvas
                     ref={normalsCanvasRef}
                     className="heatmap-canvas"

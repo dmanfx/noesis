@@ -17,6 +17,7 @@ import {
 import { deriveDepthDiagnostics } from '../lib/depthDiagnostics';
 import {
   deriveCalibratedDepthNormals,
+  derivePlaneAwareSurfaceNormals,
   normalizeCameraIntrinsics,
 } from '../lib/depthNormals';
 import { sha256Hex } from '../lib/sha256';
@@ -541,7 +542,13 @@ const loadSnapshot = async (
   }
   const filteredDepthBytes = components.depth.byte_count;
   const normalBytes = descriptor.shape[0] * descriptor.shape[1] * 3 * 4;
+  const surfaceNormalBytes = descriptor.shape[0] * descriptor.shape[1] * 3;
   const normalSmoothingScratchBytes = descriptor.shape[1] * 3 * 4 * 3;
+  const planeBlockCount = (
+    Math.ceil(descriptor.shape[0] / 8)
+    * Math.ceil(descriptor.shape[1] / 8)
+  );
+  const planeBlockScratchBytes = planeBlockCount * 128;
   const diagnosticsScratchBytes = descriptor.shape[0] * descriptor.shape[1] * 4;
   const requestedTransferBytes = (
     components.depth.byte_count
@@ -549,13 +556,29 @@ const loadSnapshot = async (
     + components.mask.byte_count
     + (includeRgb ? components.rgb?.byte_count || 0 : 0)
   );
+  const retainedNormalBytes = requestedTransferBytes + normalBytes;
+  const detailDerivationPeakBytes = (
+    retainedNormalBytes
+    + filteredDepthBytes
+    + normalSmoothingScratchBytes
+  );
+  const surfaceDerivationPeakBytes = (
+    retainedNormalBytes
+    + surfaceNormalBytes
+    + planeBlockScratchBytes
+  );
+  const diagnosticsPeakBytes = (
+    retainedNormalBytes
+    + surfaceNormalBytes
+    + diagnosticsScratchBytes
+  );
   reserveRequestAllocation(
     requestId,
-    requestedTransferBytes
-      + filteredDepthBytes
-      + normalBytes
-      + normalSmoothingScratchBytes
-      + diagnosticsScratchBytes,
+    Math.max(
+      detailDerivationPeakBytes,
+      surfaceDerivationPeakBytes,
+      diagnosticsPeakBytes,
+    ),
   );
   const depthBytes = await fetchComponent(
     components.depth,
@@ -617,6 +640,14 @@ const loadSnapshot = async (
       normalSmoothingRadius: 1,
     },
   );
+  const surfaceNormals = derivePlaneAwareSurfaceNormals(
+    normals,
+    depth,
+    conf,
+    mask,
+    descriptor.shape[0],
+    descriptor.shape[1],
+  );
   const diagnostics = deriveDepthDiagnostics(depth, conf, mask, descriptor.shape);
   assertBeforeDeadline(deadlineMs);
   const transferBytes = depth.byteLength + conf.byteLength + mask.byteLength + (rgbBytes?.byteLength || 0);
@@ -633,6 +664,8 @@ const loadSnapshot = async (
     rgbComponentSha256: rgbBytes ? components.rgb?.sha256 : undefined,
     normals,
     normalsShape: [descriptor.shape[0], descriptor.shape[1], 3],
+    surfaceNormals,
+    surfaceNormalsShape: [descriptor.shape[0], descriptor.shape[1], 3],
     snapshotId: descriptor.snapshot_id,
     snapshotRef: descriptor.snapshot_ref,
     snapshotContentSha256: descriptor.content_sha256,
@@ -705,6 +738,7 @@ self.onmessage = (event: MessageEvent): void => {
         snapshot.mask.buffer,
         snapshot.normals.buffer,
       ];
+      if (snapshot.surfaceNormals) transfer.push(snapshot.surfaceNormals.buffer);
       if (snapshot.rgb) transfer.push(snapshot.rgb.buffer);
       self.postMessage({ type: 'loaded', requestId, snapshot }, transfer);
     })

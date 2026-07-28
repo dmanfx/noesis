@@ -7,6 +7,14 @@ export type DepthNormalOptions = {
   normalSmoothingRadius?: number;
 };
 
+export type PlaneAwareSurfaceNormalOptions = {
+  blockSize?: number;
+  minimumBlockCoherence?: number;
+  minimumComponentCoherence?: number;
+  maximumMergeAngleDeg?: number;
+  minimumConfidence?: number;
+};
+
 export const normalizeCameraIntrinsics = (
   values?: number[] | null,
 ): CameraIntrinsics | null => {
@@ -420,4 +428,352 @@ export const deriveCalibratedDepthNormals = (
     );
   }
   return normals;
+};
+
+/**
+ * Regularize a calibrated detail-normal field into piecewise-planar surfaces.
+ *
+ * Small image blocks vote for a dominant normal. Adjacent coherent blocks are
+ * joined only when their orientations agree and their shared depth boundary is
+ * continuous. Large, globally coherent components receive one robust normal;
+ * uncertain pixels, curved regions, and structural boundaries retain the
+ * detail normal instead of being forced onto a plane.
+ */
+export const derivePlaneAwareSurfaceNormals = (
+  detailNormals: Float32Array,
+  depth: Float32Array,
+  confidence: Float32Array,
+  mask: Uint8Array,
+  height: number,
+  width: number,
+  options: PlaneAwareSurfaceNormalOptions = {},
+): Int8Array => {
+  const pixelCount = height * width;
+  if (
+    !Number.isSafeInteger(height)
+    || !Number.isSafeInteger(width)
+    || height <= 0
+    || width <= 0
+    || !Number.isSafeInteger(pixelCount)
+    || detailNormals.length !== pixelCount * 3
+    || depth.length !== pixelCount
+    || confidence.length !== pixelCount
+    || mask.length !== pixelCount
+  ) {
+    throw new Error('surface_normals_shape_invalid');
+  }
+
+  const blockSize = Math.min(
+    24,
+    Math.max(4, Math.floor(Number(options.blockSize ?? 8) || 8)),
+  );
+  const minimumBlockCoherence = Math.max(
+    0.8,
+    Math.min(0.9999, Number(options.minimumBlockCoherence ?? 0.94)),
+  );
+  const minimumComponentCoherence = Math.max(
+    0.8,
+    Math.min(0.9999, Number(options.minimumComponentCoherence ?? 0.97)),
+  );
+  const maximumMergeAngleDeg = Math.max(
+    3,
+    Math.min(35, Number(options.maximumMergeAngleDeg ?? 18)),
+  );
+  const mergeDotThreshold = Math.cos(maximumMergeAngleDeg * Math.PI / 180);
+  const blockAssignmentDotThreshold = Math.cos(
+    Math.min(35, maximumMergeAngleDeg + 8) * Math.PI / 180,
+  );
+  const pixelAssignmentDotThreshold = Math.cos(35 * Math.PI / 180);
+  const minimumConfidence = Math.max(
+    0,
+    Math.min(1, Number(options.minimumConfidence ?? 0.2)),
+  );
+
+  const blockColumns = Math.ceil(width / blockSize);
+  const blockRows = Math.ceil(height / blockSize);
+  const blockCount = blockRows * blockColumns;
+  const blockNormals = new Float32Array(blockCount * 3);
+  const blockCoherence = new Float32Array(blockCount);
+  const blockSupport = new Uint32Array(blockCount);
+  const planarBlock = new Uint8Array(blockCount);
+
+  for (let blockY = 0; blockY < blockRows; blockY += 1) {
+    const yStart = blockY * blockSize;
+    const yEnd = Math.min(height, yStart + blockSize);
+    for (let blockX = 0; blockX < blockColumns; blockX += 1) {
+      const xStart = blockX * blockSize;
+      const xEnd = Math.min(width, xStart + blockSize);
+      const blockIndex = blockY * blockColumns + blockX;
+      let sumX = 0;
+      let sumY = 0;
+      let sumZ = 0;
+      let totalWeight = 0;
+      let support = 0;
+      for (let y = yStart; y < yEnd; y += 1) {
+        for (let x = xStart; x < xEnd; x += 1) {
+          const pixelIndex = y * width + x;
+          if (mask[pixelIndex] === 0 || !validDepth(depth[pixelIndex])) continue;
+          const normalIndex = pixelIndex * 3;
+          const nx = detailNormals[normalIndex];
+          const ny = detailNormals[normalIndex + 1];
+          const nz = detailNormals[normalIndex + 2];
+          const magnitude = Math.hypot(nx, ny, nz);
+          if (!Number.isFinite(magnitude) || magnitude < 0.5) continue;
+          const weight = confidenceWeight(confidence, pixelIndex);
+          sumX += (nx / magnitude) * weight;
+          sumY += (ny / magnitude) * weight;
+          sumZ += (nz / magnitude) * weight;
+          totalWeight += weight;
+          support += 1;
+        }
+      }
+      if (support < Math.max(6, Math.floor((xEnd - xStart) * (yEnd - yStart) * 0.2))) {
+        continue;
+      }
+      const magnitude = Math.hypot(sumX, sumY, sumZ);
+      if (!Number.isFinite(magnitude) || magnitude <= 1e-10 || totalWeight <= 1e-8) {
+        continue;
+      }
+      const normalIndex = blockIndex * 3;
+      blockNormals[normalIndex] = sumX / magnitude;
+      blockNormals[normalIndex + 1] = sumY / magnitude;
+      blockNormals[normalIndex + 2] = sumZ / magnitude;
+      blockCoherence[blockIndex] = magnitude / totalWeight;
+      blockSupport[blockIndex] = support;
+      if (blockCoherence[blockIndex] >= minimumBlockCoherence) {
+        planarBlock[blockIndex] = 1;
+      }
+    }
+  }
+
+  const parents = new Int32Array(blockCount);
+  for (let index = 0; index < blockCount; index += 1) parents[index] = index;
+  const regionSums = new Float64Array(blockCount * 3);
+  const regionSupport = new Float64Array(blockCount);
+  for (let blockIndex = 0; blockIndex < blockCount; blockIndex += 1) {
+    if (planarBlock[blockIndex] === 0) continue;
+    const normalIndex = blockIndex * 3;
+    const weight = blockSupport[blockIndex];
+    regionSums[normalIndex] = blockNormals[normalIndex] * weight;
+    regionSums[normalIndex + 1] = blockNormals[normalIndex + 1] * weight;
+    regionSums[normalIndex + 2] = blockNormals[normalIndex + 2] * weight;
+    regionSupport[blockIndex] = weight;
+  }
+  const findRoot = (value: number): number => {
+    let root = value;
+    while (parents[root] !== root) root = parents[root];
+    let current = value;
+    while (parents[current] !== current) {
+      const next = parents[current];
+      parents[current] = root;
+      current = next;
+    }
+    return root;
+  };
+  const join = (left: number, right: number): boolean => {
+    const leftRoot = findRoot(left);
+    const rightRoot = findRoot(right);
+    if (leftRoot === rightRoot) return true;
+    const leftIndex = leftRoot * 3;
+    const rightIndex = rightRoot * 3;
+    const sumX = regionSums[leftIndex] + regionSums[rightIndex];
+    const sumY = regionSums[leftIndex + 1] + regionSums[rightIndex + 1];
+    const sumZ = regionSums[leftIndex + 2] + regionSums[rightIndex + 2];
+    const support = regionSupport[leftRoot] + regionSupport[rightRoot];
+    if (
+      support <= 0
+      || Math.hypot(sumX, sumY, sumZ) / support < minimumComponentCoherence
+    ) return false;
+    parents[rightRoot] = leftRoot;
+    regionSums[leftIndex] = sumX;
+    regionSums[leftIndex + 1] = sumY;
+    regionSums[leftIndex + 2] = sumZ;
+    regionSupport[leftRoot] = support;
+    return true;
+  };
+  const orientationAgrees = (left: number, right: number): boolean => {
+    const leftIndex = left * 3;
+    const rightIndex = right * 3;
+    return (
+      blockNormals[leftIndex] * blockNormals[rightIndex]
+      + blockNormals[leftIndex + 1] * blockNormals[rightIndex + 1]
+      + blockNormals[leftIndex + 2] * blockNormals[rightIndex + 2]
+    ) >= mergeDotThreshold;
+  };
+  const sharedBoundaryIsContinuous = (
+    blockY: number,
+    blockX: number,
+    horizontal: boolean,
+  ): boolean => {
+    let comparable = 0;
+    let continuous = 0;
+    if (horizontal) {
+      const leftX = Math.min(width - 1, (blockX + 1) * blockSize - 1);
+      const rightX = leftX + 1;
+      if (rightX >= width) return false;
+      const yStart = blockY * blockSize;
+      const yEnd = Math.min(height, yStart + blockSize);
+      for (let y = yStart; y < yEnd; y += 1) {
+        const leftPixel = y * width + leftX;
+        const rightPixel = y * width + rightX;
+        const leftDepth = depth[leftPixel];
+        const rightDepth = depth[rightPixel];
+        if (
+          mask[leftPixel] === 0
+          || mask[rightPixel] === 0
+          || !validDepth(leftDepth)
+          || !validDepth(rightDepth)
+        ) continue;
+        comparable += 1;
+        if (
+          Math.abs(leftDepth - rightDepth)
+          <= Math.max(0.1, Math.min(leftDepth, rightDepth) * 0.04)
+        ) continuous += 1;
+      }
+    } else {
+      const aboveY = Math.min(height - 1, (blockY + 1) * blockSize - 1);
+      const belowY = aboveY + 1;
+      if (belowY >= height) return false;
+      const xStart = blockX * blockSize;
+      const xEnd = Math.min(width, xStart + blockSize);
+      for (let x = xStart; x < xEnd; x += 1) {
+        const abovePixel = aboveY * width + x;
+        const belowPixel = belowY * width + x;
+        const aboveDepth = depth[abovePixel];
+        const belowDepth = depth[belowPixel];
+        if (
+          mask[abovePixel] === 0
+          || mask[belowPixel] === 0
+          || !validDepth(aboveDepth)
+          || !validDepth(belowDepth)
+        ) continue;
+        comparable += 1;
+        if (
+          Math.abs(aboveDepth - belowDepth)
+          <= Math.max(0.1, Math.min(aboveDepth, belowDepth) * 0.04)
+        ) continuous += 1;
+      }
+    }
+    return comparable >= 2 && continuous / comparable >= 0.6;
+  };
+
+  for (let blockY = 0; blockY < blockRows; blockY += 1) {
+    for (let blockX = 0; blockX < blockColumns; blockX += 1) {
+      const blockIndex = blockY * blockColumns + blockX;
+      if (planarBlock[blockIndex] === 0) continue;
+      if (blockX + 1 < blockColumns) {
+        const rightBlock = blockIndex + 1;
+        if (
+          planarBlock[rightBlock] !== 0
+          && orientationAgrees(blockIndex, rightBlock)
+          && sharedBoundaryIsContinuous(blockY, blockX, true)
+        ) join(blockIndex, rightBlock);
+      }
+      if (blockY + 1 < blockRows) {
+        const belowBlock = blockIndex + blockColumns;
+        if (
+          planarBlock[belowBlock] !== 0
+          && orientationAgrees(blockIndex, belowBlock)
+          && sharedBoundaryIsContinuous(blockY, blockX, false)
+        ) join(blockIndex, belowBlock);
+      }
+    }
+  }
+
+  const componentSums = new Float64Array(blockCount * 3);
+  const componentSupport = new Float64Array(blockCount);
+  const componentBlockCount = new Uint32Array(blockCount);
+  for (let blockIndex = 0; blockIndex < blockCount; blockIndex += 1) {
+    if (planarBlock[blockIndex] === 0) continue;
+    const root = findRoot(blockIndex);
+    const blockNormalIndex = blockIndex * 3;
+    const componentNormalIndex = root * 3;
+    const weight = blockSupport[blockIndex];
+    componentSums[componentNormalIndex] += blockNormals[blockNormalIndex] * weight;
+    componentSums[componentNormalIndex + 1] += blockNormals[blockNormalIndex + 1] * weight;
+    componentSums[componentNormalIndex + 2] += blockNormals[blockNormalIndex + 2] * weight;
+    componentSupport[root] += weight;
+    componentBlockCount[root] += 1;
+  }
+
+  const componentNormals = new Float32Array(blockCount * 3);
+  const componentAccepted = new Uint8Array(blockCount);
+  for (let root = 0; root < blockCount; root += 1) {
+    if (componentBlockCount[root] < 2 || componentSupport[root] <= 0) continue;
+    const normalIndex = root * 3;
+    const sumX = componentSums[normalIndex];
+    const sumY = componentSums[normalIndex + 1];
+    const sumZ = componentSums[normalIndex + 2];
+    const magnitude = Math.hypot(sumX, sumY, sumZ);
+    const coherence = magnitude / componentSupport[root];
+    if (
+      !Number.isFinite(magnitude)
+      || magnitude <= 1e-10
+      || coherence < minimumComponentCoherence
+    ) continue;
+    componentNormals[normalIndex] = sumX / magnitude;
+    componentNormals[normalIndex + 1] = sumY / magnitude;
+    componentNormals[normalIndex + 2] = sumZ / magnitude;
+    componentAccepted[root] = 1;
+  }
+
+  // Surface normals are a display derivative, not the metric geometry source.
+  // Signed normalized bytes preserve the RGB visualization while keeping both
+  // Surface and Float32 Detail fields resident within the worker memory budget.
+  const surfaceNormals = new Int8Array(detailNormals.length);
+  for (let index = 0; index < detailNormals.length; index += 1) {
+    const value = detailNormals[index];
+    surfaceNormals[index] = Number.isFinite(value)
+      ? Math.round(Math.max(-1, Math.min(1, value)) * 127)
+      : 0;
+  }
+  for (let blockY = 0; blockY < blockRows; blockY += 1) {
+    const yStart = blockY * blockSize;
+    const yEnd = Math.min(height, yStart + blockSize);
+    for (let blockX = 0; blockX < blockColumns; blockX += 1) {
+      const blockIndex = blockY * blockColumns + blockX;
+      if (planarBlock[blockIndex] === 0) continue;
+      const root = findRoot(blockIndex);
+      if (componentAccepted[root] === 0) continue;
+      const componentNormalIndex = root * 3;
+      const surfaceNx = componentNormals[componentNormalIndex];
+      const surfaceNy = componentNormals[componentNormalIndex + 1];
+      const surfaceNz = componentNormals[componentNormalIndex + 2];
+      const blockNormalIndex = blockIndex * 3;
+      const blockDot = (
+        blockNormals[blockNormalIndex] * surfaceNx
+        + blockNormals[blockNormalIndex + 1] * surfaceNy
+        + blockNormals[blockNormalIndex + 2] * surfaceNz
+      );
+      if (blockDot < blockAssignmentDotThreshold) continue;
+      const xStart = blockX * blockSize;
+      const xEnd = Math.min(width, xStart + blockSize);
+      for (let y = yStart; y < yEnd; y += 1) {
+        for (let x = xStart; x < xEnd; x += 1) {
+          const pixelIndex = y * width + x;
+          if (
+            mask[pixelIndex] === 0
+            || !Number.isFinite(confidence[pixelIndex])
+            || confidence[pixelIndex] < minimumConfidence
+          ) continue;
+          const normalIndex = pixelIndex * 3;
+          const nx = detailNormals[normalIndex];
+          const ny = detailNormals[normalIndex + 1];
+          const nz = detailNormals[normalIndex + 2];
+          const magnitude = Math.hypot(nx, ny, nz);
+          if (!Number.isFinite(magnitude) || magnitude < 0.5) continue;
+          const pixelDot = (
+            (nx / magnitude) * surfaceNx
+            + (ny / magnitude) * surfaceNy
+            + (nz / magnitude) * surfaceNz
+          );
+          if (pixelDot < pixelAssignmentDotThreshold) continue;
+          surfaceNormals[normalIndex] = Math.round(surfaceNx * 127);
+          surfaceNormals[normalIndex + 1] = Math.round(surfaceNy * 127);
+          surfaceNormals[normalIndex + 2] = Math.round(surfaceNz * 127);
+        }
+      }
+    }
+  }
+  return surfaceNormals;
 };

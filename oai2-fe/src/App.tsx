@@ -1102,6 +1102,8 @@ function Dashboard() {
       shape: loaded.shape,
       normals: loaded.normals,
       normals_shape: loaded.normalsShape,
+      surface_normals: loaded.surfaceNormals,
+      surface_normals_shape: loaded.surfaceNormalsShape,
       normals_dtype: 'float32',
       normals_space: 'camera',
       snapshotId: loaded.snapshotId,

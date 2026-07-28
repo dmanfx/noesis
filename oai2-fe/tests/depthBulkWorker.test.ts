@@ -12,6 +12,7 @@ type WorkerReply = {
     rgb?: Uint8Array;
     rgbComponentSha256?: string;
     normals: Float32Array;
+    surfaceNormals: Int8Array;
     diagnostics: {
       median: number;
       p10: number;
@@ -215,6 +216,8 @@ test('worker streams and verifies an exact same-origin typed-array snapshot', as
   assert.equal(reply.snapshot?.transferBytes, 81);
   assert.equal(reply.snapshot?.rgb, undefined);
   assert.equal(reply.snapshot?.normals.length, 27);
+  assert.equal(reply.snapshot?.surfaceNormals.length, 27);
+  assert.ok(reply.snapshot?.surfaceNormals instanceof Int8Array);
   assert.deepEqual(
     {
       median: reply.snapshot?.diagnostics.median,
@@ -254,6 +257,7 @@ test('worker verifies and loads snapshots on the LAN HTTP dashboard without WebC
     assert.equal(fetchCount, 3);
     assert.deepEqual(Array.from(reply.snapshot?.depth || []), Array.from(depth));
     assert.equal(reply.snapshot?.normals.length, 27);
+    assert.equal(reply.snapshot?.surfaceNormals.length, 27);
   } finally {
     workerScope.location.origin = originalOrigin;
     workerScope.crypto = originalCrypto;

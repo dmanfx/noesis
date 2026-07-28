@@ -11,8 +11,10 @@ type DepthEntry = {
   rgb?: Uint8Array;
   rgb_shape?: [number, number, number];
   normals?: Float32Array;
+  surface_normals?: Int8Array;
   shape: [number, number];
   normals_shape?: [number, number, number];
+  surface_normals_shape?: [number, number, number];
   normals_dtype?: 'float32';
   normals_space?: 'camera' | 'world';
   normals_error?: string;
@@ -254,6 +256,7 @@ const DepthDrawer = memo(function DepthDrawer({
     return Array.from(set).sort();
   }, [availableCameras, depthData]);
   const [activeTab, setActiveTab] = useState<'heatmap' | 'normals' | '3d' | 'stats' | 'histogram' | 'metrics'>('heatmap');
+  const [normalsView, setNormalsView] = useState<'surface' | 'detail'>('surface');
   const [selectedCamera, setSelectedCamera] = useState<string>('');
   const [drawerWidth, setDrawerWidth] = useState<number>(DEFAULT_WIDTH);
   const onRequestDepthCachedRef = useRef(onRequestDepthCached);
@@ -681,6 +684,9 @@ const DepthDrawer = memo(function DepthDrawer({
       setPointCloudColorMode('depth');
     }
   }, [decodedDepth, pointCloudColorMode]);
+  const selectedNormals = normalsView === 'surface'
+    ? depthEntry?.surface_normals
+    : depthEntry?.normals;
   const normalsInfo = useMemo(() => {
     if (!depthEntry) {
       return {
@@ -692,7 +698,9 @@ const DepthDrawer = memo(function DepthDrawer({
         error: null as string | null,
       };
     }
-    const shape = depthEntry.normals_shape;
+    const shape = normalsView === 'surface'
+      ? depthEntry.surface_normals_shape
+      : depthEntry.normals_shape;
     let height = depthEntry.shape[0];
     let width = depthEntry.shape[1];
     if (Array.isArray(shape) && shape.length >= 2) {
@@ -700,22 +708,27 @@ const DepthDrawer = memo(function DepthDrawer({
       width = Number(shape[1]) || width;
     }
     return {
-      available: Boolean(depthEntry.normals),
+      available: Boolean(selectedNormals),
       height,
       width,
       dtype: depthEntry.normals_dtype || '',
       space: depthEntry.normals_space || '',
       error: depthEntry.normals_error ?? null,
     };
-  }, [depthEntry]);
+  }, [depthEntry, normalsView, selectedNormals]);
   const normalsStatusText = useMemo(() => {
     if (!depthEntry) return 'Waiting for depth snapshot.';
     if (normalsInfo.error) return `Normals error: ${normalsInfo.error}`;
-    if (!normalsInfo.available) return 'Normals not attached to this snapshot.';
+    if (!normalsInfo.available) {
+      return normalsView === 'surface'
+        ? 'Plane-aware surface normals are unavailable for this snapshot.'
+        : 'Detail normals are unavailable for this snapshot.';
+    }
     const spaceLabel = normalsInfo.space || 'camera';
     const dtypeLabel = normalsInfo.dtype || 'float32';
-    return `Normals attached (${spaceLabel}, ${dtypeLabel}).`;
-  }, [depthEntry, normalsInfo]);
+    const viewLabel = normalsView === 'surface' ? 'Plane-aware surface' : 'Edge-aware detail';
+    return `${viewLabel} normals attached (${spaceLabel}, ${dtypeLabel}).`;
+  }, [depthEntry, normalsInfo, normalsView]);
 
   useEffect(() => {
     const canvas = heatmapCanvasRef.current;
@@ -842,7 +855,7 @@ const DepthDrawer = memo(function DepthDrawer({
   useEffect(() => {
     const canvas = normalsCanvasRef.current;
     if (!canvas || activeTab !== 'normals') return;
-    if (!depthEntry?.normals || !normalsInfo.available) {
+    if (!selectedNormals || !normalsInfo.available) {
       normalsSourceCanvasRef.current = null;
       clearCanvasElement(canvas);
       return;
@@ -854,7 +867,7 @@ const DepthDrawer = memo(function DepthDrawer({
       clearCanvasElement(canvas);
       return;
     }
-    const normalsArray = depthEntry.normals;
+    const normalsArray = selectedNormals;
     if (!normalsArray || normalsArray.length < width * height * 3) {
       normalsSourceCanvasRef.current = null;
       clearCanvasElement(canvas);
@@ -868,11 +881,12 @@ const DepthDrawer = memo(function DepthDrawer({
     const imageData = offCtx.createImageData(width, height);
     const data = imageData.data;
     const total = width * height;
+    const componentScale = normalsView === 'surface' ? 1 / 127 : 1;
     for (let i = 0; i < total; i += 1) {
       const base = i * 3;
-      const nx = normalsArray[base];
-      const ny = normalsArray[base + 1];
-      const nz = normalsArray[base + 2];
+      const nx = normalsArray[base] * componentScale;
+      const ny = normalsArray[base + 1] * componentScale;
+      const nz = normalsArray[base + 2] * componentScale;
       const idx = i * 4;
       if (!Number.isFinite(nx) || !Number.isFinite(ny) || !Number.isFinite(nz)) {
         data[idx + 3] = 0;
@@ -908,7 +922,14 @@ const DepthDrawer = memo(function DepthDrawer({
     ctx.imageSmoothingQuality = 'high';
     ctx.drawImage(offscreen, 0, 0, targetWidth, targetHeight);
     ctx.restore();
-  }, [depthEntry, activeTab, normalsInfo, drawerWidth, clearCanvasElement]);
+  }, [
+    activeTab,
+    clearCanvasElement,
+    drawerWidth,
+    normalsInfo,
+    normalsView,
+    selectedNormals,
+  ]);
 
   // Avoid showing stale topdown canvases when switching cameras.
   useEffect(() => {
@@ -1525,7 +1546,9 @@ const DepthDrawer = memo(function DepthDrawer({
       }
     } else if (activeTab === 'normals') {
       canvases.push({
-        label: 'normals-rgb',
+        label: normalsView === 'surface'
+          ? 'surface-normals-rgb'
+          : 'detail-normals-rgb',
         canvas: normalsSourceCanvasRef.current,
         source: 'payload',
       });
@@ -1587,6 +1610,7 @@ const DepthDrawer = memo(function DepthDrawer({
         : null,
       depth_range_mode: activeTab === 'heatmap' ? heatmapRangeMode : null,
       depth_range: activeTab === 'heatmap' ? heatmapRange : null,
+      normals_view: activeTab === 'normals' ? normalsView : null,
       agl_range_mode: activeTab === 'heatmap' ? aglRangeMode : null,
       agl_range: activeTab === 'heatmap' ? heightAglRange : null,
       floorplan_ts_us: cameraFloorplan?.ts ?? null,
@@ -1632,6 +1656,7 @@ const DepthDrawer = memo(function DepthDrawer({
     heightLayer,
     obstacleHeightLayer,
     observationMaskLayer,
+    normalsView,
     renderObservationMaskLayer,
     renderObservationMaskInvert,
     inferredWalkableLayer,
@@ -2044,6 +2069,26 @@ const DepthDrawer = memo(function DepthDrawer({
 
           {activeTab === 'normals' && (
             <>
+              <div className="primitives-view-toggle" role="tablist" aria-label="Normals view">
+                <button
+                  type="button"
+                  role="tab"
+                  aria-selected={normalsView === 'surface'}
+                  className={normalsView === 'surface' ? 'active' : ''}
+                  onClick={() => setNormalsView('surface')}
+                >
+                  Surface
+                </button>
+                <button
+                  type="button"
+                  role="tab"
+                  aria-selected={normalsView === 'detail'}
+                  className={normalsView === 'detail' ? 'active' : ''}
+                  onClick={() => setNormalsView('detail')}
+                >
+                  Detail
+                </button>
+              </div>
               {panelErrorText && <p className="floorplan-error">{panelErrorText}</p>}
               {normalsInfo.error && !panelErrorText && (
                 <p className="floorplan-error">Normals error: {normalsInfo.error}</p>
@@ -2053,7 +2098,11 @@ const DepthDrawer = memo(function DepthDrawer({
               )}
               <div className="heatmap-single">
                 <div className="heatmap-cell__body">
-                  <div className="heatmap-cell__title">Edge-Aware Calibrated Camera-Space Normals (RGB)</div>
+                  <div className="heatmap-cell__title">
+                    {normalsView === 'surface'
+                      ? 'Plane-Aware Surface Normals (RGB)'
+                      : 'Edge-Aware Detail Normals (RGB)'}
+                  </div>
                   <canvas
                     ref={normalsCanvasRef}
                     className="heatmap-canvas"
@@ -2062,8 +2111,10 @@ const DepthDrawer = memo(function DepthDrawer({
                 </div>
               </div>
               <p className="floorplan-meta">
-                Metric depth neighbors are unprojected with this camera&apos;s calibration.
-                RGB encodes X/Y/Z orientation from −1..1; transparent pixels lack valid local support.
+                {normalsView === 'surface'
+                  ? 'Regularized from coherent calibrated depth surfaces. Planes share one robust orientation; uncertain, curved, and boundary regions retain detail normals.'
+                  : 'Variance-preserving metric depth normals for inspecting local model behavior and fine structure.'}
+                {' '}RGB encodes X/Y/Z orientation from −1..1; transparent pixels lack valid local support.
               </p>
             </>
           )}

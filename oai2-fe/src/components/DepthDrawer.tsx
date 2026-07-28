@@ -1,6 +1,7 @@
 import { PointerEvent as ReactPointerEvent, memo, useCallback, useEffect, useMemo, useRef, useState, RefObject } from 'react';
 import { CameraKey, cameraIndex, cameraLabel, detectCameraKey } from '../lib/camera';
 import type { MosaicLayout } from '../hooks/useWebSocketClient';
+import { closeThinSurfaceNormalGapsInPlace } from '../lib/normalDisplay';
 import '../styles/depth-drawer.css';
 
 type DepthEntry = {
@@ -904,6 +905,9 @@ const DepthDrawer = memo(function DepthDrawer({
       data[idx + 1] = g;
       data[idx + 2] = b;
       data[idx + 3] = 255;
+    }
+    if (normalsView === 'surface') {
+      closeThinSurfaceNormalGapsInPlace(data, width, height);
     }
     offCtx.putImageData(imageData, 0, 0);
     normalsSourceCanvasRef.current = offscreen;

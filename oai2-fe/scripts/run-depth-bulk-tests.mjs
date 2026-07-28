@@ -14,6 +14,7 @@ const entryPoints = [
   join(projectRoot, 'tests/depthBulkLimits.test.ts'),
   join(projectRoot, 'tests/depthDiagnostics.test.ts'),
   join(projectRoot, 'tests/depthNormals.test.ts'),
+  join(projectRoot, 'tests/normalDisplay.test.ts'),
   join(projectRoot, 'tests/visibleFloorPlane.test.ts'),
 ];
 

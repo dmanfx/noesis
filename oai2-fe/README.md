@@ -26,7 +26,10 @@ A reimagined, minimal‑friction console for your spatial perception system. It 
   - Requires household mode on the runtime (`NOESIS_HOUSEHOLD_IDENTITY=1`, default on).
 - Depth Drawer (MapAnything):
   - The Depth drawer is fed by `ma_depth_response` payloads.
-  - The **Normals** tab (when present) visualizes per-pixel normals `(nx, ny, nz)` by mapping each component from `[-1,+1]` → `[0,255]` as RGB (R=X, G=Y, B=Z).
-  - Invalid/near-zero normals are rendered transparent (typically because depth was invalid/masked there).
+  - The **Normals** tab visualizes per-pixel normals `(nx, ny, nz)` by mapping each component from `[-1,+1]` → `[0,255]` as RGB (R=X, G=Y, B=Z).
+  - **Surface** is the plane-aware presentation view. Coherent calibrated-depth regions share a robust orientation, and narrow transparent derivative bands are closed only in the rendered image so they do not appear as artificial dark outlines.
+  - **Detail** preserves local normal variance and the invalid bands created where edge-aware derivative support would cross a depth discontinuity.
+  - Surface gap closure is display-only and single-pass. Keep it bracketed-support-only: do not use filled pixels as new support, do not grow into broad missing areas, and do not apply it to stored normals, depth, confidence, masks, or the Detail view.
+  - Invalid/near-zero normals outside a narrow bracketed Surface gap remain transparent.
 
 No changes are made to `./electron-frontend/`. This app lives in `./oai2-fe/`.

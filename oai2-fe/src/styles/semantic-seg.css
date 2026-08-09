@@ -1,0 +1,318 @@
+.semseg-view {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.semseg-view__heading,
+.semseg-view__legend-heading,
+.semseg-view__readout {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.semseg-view__heading > div,
+.semseg-view__legend-heading > div {
+  display: grid;
+  gap: 3px;
+}
+
+.semseg-view__heading span,
+.semseg-view__legend-heading span,
+.semseg-view__readout {
+  color: rgba(255, 255, 255, 0.62);
+  font-size: 11px;
+}
+
+.semseg-view__heading strong,
+.semseg-view__legend-heading strong {
+  font-size: 14px;
+}
+
+.semseg-view__display-only {
+  flex: 0 0 auto;
+  padding: 4px 7px;
+  border: 1px solid rgba(88, 214, 141, 0.3);
+  border-radius: 999px;
+  color: #75dea0 !important;
+  font-size: 9px !important;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+}
+
+.semseg-view__controls {
+  display: flex;
+  align-items: flex-end;
+  gap: 14px;
+  padding: 10px 12px;
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.035);
+  flex-wrap: wrap;
+}
+
+.semseg-view__controls label {
+  display: grid;
+  gap: 5px;
+  color: rgba(255, 255, 255, 0.62);
+  font-size: 10px;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+}
+
+.semseg-view__controls select {
+  min-width: 116px;
+  min-height: 31px;
+  padding: 5px 8px;
+  border: 1px solid rgba(255, 255, 255, 0.15);
+  border-radius: 6px;
+  background: #0d1320;
+  color: rgba(255, 255, 255, 0.9);
+}
+
+.semseg-view__controls select:disabled {
+  opacity: 0.55;
+}
+
+.semseg-view__refresh {
+  min-height: 31px;
+  padding: 5px 11px;
+  border: 1px solid rgba(88, 214, 141, 0.55);
+  border-radius: 6px;
+  background: rgba(88, 214, 141, 0.12);
+  color: #9ce9b9;
+  cursor: pointer;
+  font-size: 11px;
+  font-weight: 650;
+}
+
+.semseg-view__refresh:hover:not(:disabled),
+.semseg-view__refresh:focus-visible:not(:disabled) {
+  background: rgba(88, 214, 141, 0.2);
+}
+
+.semseg-view__refresh:disabled {
+  cursor: wait;
+  opacity: 0.55;
+}
+
+.semseg-view__capture-error {
+  padding: 8px 10px;
+  border: 1px solid rgba(255, 110, 110, 0.35);
+  border-radius: 6px;
+  background: rgba(255, 80, 80, 0.08);
+  color: #ff9c9c;
+  font-size: 11px;
+}
+
+.semseg-view__opacity {
+  min-width: 170px;
+  flex: 1 1 170px;
+}
+
+.semseg-view__opacity > span {
+  display: flex;
+  justify-content: space-between;
+}
+
+.semseg-view__opacity input {
+  width: 100%;
+  accent-color: #58d68d;
+}
+
+.semseg-view__toggle {
+  display: flex !important;
+  align-items: center;
+  min-height: 31px;
+  grid-auto-flow: column;
+  color: rgba(255, 255, 255, 0.86) !important;
+  font-size: 11px !important;
+}
+
+.semseg-view__toggle input {
+  accent-color: #58d68d;
+}
+
+.semseg-view__stage {
+  position: relative;
+  width: 100%;
+  overflow: hidden;
+  aspect-ratio: 16 / 9;
+  border: 1px solid rgba(255, 255, 255, 0.13);
+  border-radius: 8px;
+  background: #080d14;
+}
+
+.semseg-view__stage canvas {
+  display: block;
+  width: 100%;
+  height: 100%;
+  cursor: crosshair;
+}
+
+.semseg-view__tooltip {
+  position: absolute;
+  z-index: 2;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 180px;
+  padding: 8px 10px;
+  border: 1px solid rgba(255, 255, 255, 0.2);
+  border-radius: 7px;
+  background: rgba(8, 13, 20, 0.94);
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.35);
+  pointer-events: none;
+}
+
+.semseg-view__tooltip > span,
+.semseg-view__legend-swatch {
+  flex: 0 0 auto;
+  border: 1px solid rgba(255, 255, 255, 0.5);
+  border-radius: 4px;
+}
+
+.semseg-view__tooltip > span {
+  width: 20px;
+  height: 20px;
+}
+
+.semseg-view__tooltip strong,
+.semseg-view__tooltip small {
+  display: block;
+}
+
+.semseg-view__tooltip strong {
+  font-size: 13px;
+}
+
+.semseg-view__tooltip small {
+  margin-top: 2px;
+  color: rgba(255, 255, 255, 0.62);
+  font-size: 10px;
+}
+
+.semseg-view__loading {
+  position: absolute;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  padding: 20px;
+  color: rgba(255, 255, 255, 0.68);
+  background: rgba(8, 13, 20, 0.78);
+  font-size: 12px;
+  text-align: center;
+}
+
+.semseg-view__loading--error {
+  color: #ff8e8e;
+}
+
+.semseg-view__readout {
+  min-height: 28px;
+  padding: 6px 9px;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 6px;
+  background: rgba(255, 255, 255, 0.025);
+}
+
+.semseg-view__readout span:last-child {
+  flex: 0 0 auto;
+  white-space: nowrap;
+}
+
+.semseg-view__legend {
+  display: grid;
+  gap: 10px;
+  padding-top: 4px;
+}
+
+.semseg-view__legend-heading button {
+  padding: 6px 10px;
+  border: 1px solid rgba(255, 255, 255, 0.16);
+  border-radius: 6px;
+  background: #0d1320;
+  color: rgba(255, 255, 255, 0.86);
+  cursor: pointer;
+  font-size: 11px;
+}
+
+.semseg-view__legend-heading button:disabled {
+  opacity: 0.38;
+  cursor: default;
+}
+
+.semseg-view__legend-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+  gap: 7px;
+}
+
+.semseg-view__legend-grid > button {
+  min-width: 0;
+  display: grid;
+  grid-template-columns: 18px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 8px;
+  padding: 7px 8px;
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  border-radius: 6px;
+  background: rgba(255, 255, 255, 0.035);
+  color: rgba(255, 255, 255, 0.86);
+  cursor: pointer;
+  text-align: left;
+}
+
+.semseg-view__legend-grid > button:hover,
+.semseg-view__legend-grid > button:focus-visible {
+  border-color: rgba(88, 214, 141, 0.5);
+  background: rgba(88, 214, 141, 0.07);
+}
+
+.semseg-view__legend-grid > button.active {
+  border-color: #58d68d;
+  background: rgba(88, 214, 141, 0.12);
+  box-shadow: inset 0 0 0 1px rgba(88, 214, 141, 0.18);
+}
+
+.semseg-view__legend-swatch {
+  width: 18px;
+  height: 18px;
+}
+
+.semseg-view__legend-label {
+  min-width: 0;
+  display: grid;
+  gap: 1px;
+}
+
+.semseg-view__legend-label strong {
+  overflow: hidden;
+  font-size: 11px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.semseg-view__legend-label small,
+.semseg-view__legend-share {
+  color: rgba(255, 255, 255, 0.54);
+  font-size: 9px;
+}
+
+.semseg-view__legend-share {
+  font-variant-numeric: tabular-nums;
+}
+
+@media (max-width: 600px) {
+  .semseg-view__heading,
+  .semseg-view__readout {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+
+  .semseg-view__readout span:last-child {
+    white-space: normal;
+  }
+}

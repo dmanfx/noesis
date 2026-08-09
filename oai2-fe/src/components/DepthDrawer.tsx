@@ -2,6 +2,7 @@ import { PointerEvent as ReactPointerEvent, memo, useCallback, useEffect, useMem
 import { CameraKey, cameraIndex, cameraLabel, detectCameraKey } from '../lib/camera';
 import type { MosaicLayout } from '../hooks/useWebSocketClient';
 import { closeThinSurfaceNormalGapsInPlace } from '../lib/normalDisplay';
+import SemanticSegView from './SemanticSegView';
 import '../styles/depth-drawer.css';
 
 type DepthEntry = {
@@ -256,7 +257,7 @@ const DepthDrawer = memo(function DepthDrawer({
     Object.keys(depthData || {}).forEach((c) => { if (c) set.add(c); });
     return Array.from(set).sort();
   }, [availableCameras, depthData]);
-  const [activeTab, setActiveTab] = useState<'heatmap' | 'normals' | '3d' | 'stats' | 'histogram' | 'metrics'>('heatmap');
+  const [activeTab, setActiveTab] = useState<'heatmap' | 'normals' | '3d' | 'semantic' | 'histogram' | 'metrics'>('heatmap');
   const [normalsView, setNormalsView] = useState<'surface' | 'detail'>('surface');
   const [selectedCamera, setSelectedCamera] = useState<string>('');
   const [drawerWidth, setDrawerWidth] = useState<number>(DEFAULT_WIDTH);
@@ -1704,13 +1705,13 @@ const DepthDrawer = memo(function DepthDrawer({
           <button className={activeTab === 'heatmap' ? 'active' : ''} onClick={() => setActiveTab('heatmap')}>Heatmap</button>
           <button className={activeTab === 'normals' ? 'active' : ''} onClick={() => setActiveTab('normals')}>Normals</button>
           <button className={activeTab === '3d' ? 'active' : ''} onClick={() => setActiveTab('3d')}>3D</button>
-          <button className={activeTab === 'stats' ? 'active' : ''} onClick={() => setActiveTab('stats')}>Stats</button>
+          <button className={activeTab === 'semantic' ? 'active' : ''} onClick={() => setActiveTab('semantic')}>Sem-seg</button>
           <button className={activeTab === 'histogram' ? 'active' : ''} onClick={() => setActiveTab('histogram')}>Histogram</button>
           <button className={activeTab === 'metrics' ? 'active' : ''} onClick={() => setActiveTab('metrics')}>Metrics</button>
         </div>
         <div className="content">
-          {!cameras.length && <p>No MapAnything diagnostics received yet.</p>}
-          {cameras.length > 0 && (
+          {!cameras.length && activeTab !== 'semantic' && <p>No MapAnything diagnostics received yet.</p>}
+          {cameras.length > 0 && activeTab !== 'semantic' && (
             <div className={`drawer-toolbar ${(activeTab === 'heatmap' || activeTab === '3d' || activeTab === 'normals') ? 'drawer-toolbar--heatmap' : ''}`}>
               <label className="drawer-toolbar__camera" htmlFor="ma-depth-select">
                 <span className="drawer-toolbar__label">Camera</span>
@@ -2447,38 +2448,7 @@ const DepthDrawer = memo(function DepthDrawer({
             </>
           )}
 
-          {activeTab === 'stats' && summary && (
-            <div className="stat-grid">
-              <div className="stat-card">
-                <h4>Median Depth</h4>
-                <strong>{summary.median !== undefined ? summary.median.toFixed(2) + ' m' : 'n/a'}</strong>
-              </div>
-              <div className="stat-card">
-                <h4>10–90% Range</h4>
-                <strong>
-                  {summary.p10 !== undefined && summary.p90 !== undefined
-                    ? `${summary.p10.toFixed(2)}–${summary.p90.toFixed(2)} m`
-                    : 'n/a'}
-                </strong>
-              </div>
-              <div className="stat-card">
-                <h4>Confidence</h4>
-                <strong>{summary.conf_mean !== undefined ? `${Math.round(summary.conf_mean * 100)}%` : 'n/a'}</strong>
-              </div>
-              <div className="stat-card">
-                <h4>Valid Coverage</h4>
-                <strong>{summary.valid_ratio !== undefined ? `${Math.round(summary.valid_ratio * 100)}%` : 'n/a'}</strong>
-              </div>
-              <div className="stat-card">
-                <h4>Samples</h4>
-                <strong>{summary.sample_count !== undefined ? summary.sample_count : 'n/a'}</strong>
-              </div>
-              <div className="stat-card">
-                <h4>Method</h4>
-                <strong>{summary.method ? summary.method.toUpperCase() : 'AUTO'}</strong>
-              </div>
-            </div>
-          )}
+          {activeTab === 'semantic' && <SemanticSegView />}
 
           {activeTab === 'histogram' && (
             <canvas ref={histogramCanvasRef} className="histogram" />

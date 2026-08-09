@@ -442,7 +442,36 @@ in readback mode or opt into applying the revision transform through its
 `reprojectionApplyVirtualTwinAlignment` setting after
 `scripts/validate_virtual_twin_tracking.py` passes for the revision camera.
 
-## 5. Validation Toolbox API Status
+## 5. Manual semantic-capture API
+
+DS8 and DS9 expose the same owner-private batch capture contract for the OAI2
+Sem-seg diagnostic. A browser starts capture only through Menon's coordinated
+`POST /api/diagnostics/semantic-seg/captures` action; Menon supplies internal
+authentication, idempotency, audit, and exact latest-result readback.
+
+- **POST** `/api/v1/semantic-seg/captures`
+  - Accepts exactly `{ "model": "s" | "l" }`.
+  - Starts one serialized TensorRT/DeepStream run over the three canonical room
+    streams. Model or camera selection in the browser never calls this route.
+  - Returns `noesis.semantic_seg.capture` v1 only after aligned RGB, class-map,
+    and masked JPEG/PNG artifacts exist for Living Room, Kitchen, and Family
+    Room. A busy capture returns `409`; timeout or unavailable runtime assets
+    return an explicit error without changing the last completed result.
+- **GET** `/api/v1/semantic-seg/captures/latest/{model}`
+  - Returns the most recently completed manifest for the exact model. This is
+    the readback boundary for Menon's coordinated action, not an inference
+    trigger.
+- **GET** `/api/v1/semantic-seg/captures/{capture_id}/{camera_id}/{artifact}`
+  - Serves exact `raw`, `class-map`, or `masked` image bytes. The same-origin
+    gateway permits these reads to operator and owner roles; capture creation
+    remains owner-only through the coordinated route.
+
+Runtime capture files live in the writable Noesis state boundary. The Small and
+Large fixed batch-3 engines, ADE20K labels, and semantic parser are immutable release
+assets. Partial capture directories are removed and are never published as
+latest.
+
+## 6. Validation Toolbox API Status
 
 The Noesis/Menon validation toolbox currently exposes CLI/report contracts, not
 DS8 REST endpoints. Its public artifacts are JSON files under
@@ -453,7 +482,7 @@ If a future change publishes validation reports, Menon camera reprojection
 evidence, or regression summaries over REST, add the endpoint, request, response,
 and failure/status semantics here before treating that surface as public.
 
-## 6. Future DS8 REST Endpoints
+## 7. Future DS8 REST Endpoints
 
 If additional DS8 REST endpoints are introduced (e.g., for calibration, debug, or pipeline control), they should:
 

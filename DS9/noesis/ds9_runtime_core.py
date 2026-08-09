@@ -2855,7 +2855,7 @@ def _stop_websocket_server(
 def _build_rest_app() -> "FastAPI":
     from fastapi import FastAPI
     from fastapi.middleware.cors import CORSMiddleware
-    from noesis.server import analytics_api, depth_api, reid_api, virtual_twin_api
+    from noesis.server import analytics_api, depth_api, reid_api, semantic_seg_api, virtual_twin_api
 
     app = FastAPI(title="Noesis DS9 Runtime API")
     origins_env = os.environ.get("NOESIS_REST_CORS_ORIGINS", "").strip()
@@ -2886,6 +2886,7 @@ def _build_rest_app() -> "FastAPI":
     app.include_router(analytics_api.app.router)
     app.include_router(reid_api.app.router)
     app.include_router(virtual_twin_api.app.router)
+    app.include_router(semantic_seg_api.router)
     return app
 
 

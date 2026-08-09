@@ -1818,3 +1818,94 @@ Use this file to record non-trivial design choices made during the DS8 migration
 - **Decision:** The canonical object-depth fusion path now treats host ROI depth copies as an explicit debug-only path (`NOESIS_OBJECT_DEPTH_ALLOW_HOST_ROI_COPY=1`). Production object-depth relies on native scalar/stat samplers; when those are unavailable it attaches `native_stats_unavailable` instead of copying a depth crop to NumPy. Object-depth metadata attachment caches compact JSON strings, and masked object-depth passes pre-thresholded `uint8` masks to the native extension. The combined native person-mask stats call now also returns `foot_u`/`foot_v`, so the common path no longer rescans masks in Python to compute the person foot anchor.
 - **Rationale:** This keeps the always-on DAv2 tracking lane aligned with the zero-copy goal: full-frame depth stays device-owned, object-depth uses compact native stats, and the remaining host-resident mask metadata is represented as a byte mask rather than a float mask. Failing closed when native stats are missing is preferable to silently reintroducing per-object depth ROI D2H copies.
 - **References:** `noesis/pipelines/hooks.py`, `native/noesis_depth_tracking_tensor_ext.cpp`, `native/noesis_depth_tracking_tensor_kernels.cu`, `tests/test_depth_tracking_frame_processor.py`
+
+# 2026-08-07 — YOLO26 ADE20K remains a semantic utility lane
+
+- **Area:** DS8 three-room scene parsing and YOLO26 semantic model comparison.
+- **Decision:** Keep the official YOLO26 ADE20K Nano, Small, Medium, and Large
+  models in a separate `testpipelines/yolo26-sem-ade20k/` utility. Do not treat
+  their dense class maps as detector PGIE objects or replace the active PGIE.
+- **Decision:** Build TensorRT engines for the exact three-room contract as
+  static FP16 `FLOAT [3,3,640,640] -> UINT8 [3,640,640]` graphs. Preserve the
+  exported class IDs through a custom DeepStream semantic parser and copy only
+  selected RGB evidence frames and masks at the final snapshot edge. Resolve
+  canonical camera locators in memory through the existing owner-private
+  source registry.
+- **Decision:** Do not fabricate confidence or probability tensors. The
+  exported graph provides one class ID per pixel, so this lane can produce
+  dense scene labels and masks but cannot satisfy consumers that require
+  per-class probabilities, instance identity, boxes, tracking, or ReID.
+- **Rationale:** A static batch exactly matches the three live rooms and avoids
+  carrying unused dynamic profiles. Keeping semantic metadata separate from
+  detector objects prevents the category error that made the model look like a
+  replacement PGIE while still making its ADE20K scene structure available for
+  downstream evaluation.
+- **Validation:** All four FP16 engines deserialize with the exact input/output
+  binding contract and pass short TensorRT runs on the RTX 3060. Each engine
+  loaded through DS8 `nvinfer`, captured Living Room, Kitchen, and Family Room
+  masks, handled EOS for all three sources, and exited successfully. The
+  focused utility tests pass (3 tests), Python compilation and scoped
+  whitespace checks pass, and the four mosaics were visually inspected.
+- **Follow-up validation (2026-08-08):** The saved raw Living Room fixed-camera
+  anchor from MapAnything phone scan `20260802-162254-8bcc7dd7` was verified by
+  its manifest SHA-256 and processed through every exact engine. The same frame
+  filled all three static-batch positions, and each engine produced three
+  identical class maps. Full-resolution overlays preserve the source aspect
+  ratio; no phone-walk frame or derived rectified image entered inference.
+- **UI integration (2026-08-08):** Replace the unused `oai2-fe` depth-panel
+  Stats tab with a **Sem-seg** tab that reads only a copied, checksummed set of
+  the saved well-lit Living Room source and Nano/Small/Medium/Large class maps.
+  Model switching, opacity, hover inspection, and legend filtering are browser
+  display operations; they must not launch semantic inference, request depth,
+  or change a class map. The legend uses a stable unique color for all 150
+  ADE20K IDs, lists only IDs present in the selected map, and clears an active
+  filter either by selecting the same ID again or by an explicit clear action.
+- **Rationale:** This preserves the semantic utility lane's separation from the
+  detector PGIE while placing its derived view with the other operator-facing
+  inference products. Shipping exact saved evidence makes the tab usable when
+  the camera/depth runtime is disconnected and prevents a seemingly harmless
+  UI interaction from hiding new inference or capture work.
+- **Validation:** The frontend contract suite passes 49 tests, the Vite
+  production build includes all five saved assets, and a live Chromium smoke
+  activated the tab without camera diagnostics, rendered the 1920x1080 source
+  and 22-class Large legend, isolated wall class 0, exercised both clear paths,
+  and reported no browser exceptions.
+
+# 2026-08-09 — Sem-seg refresh is an explicit serialized diagnostic action
+
+- **Area:** OAI2 Sem-seg viewer, DS8/DS9 runtime utility inference, and Menon
+  same-origin diagnostics.
+- **Decision:** Preserve saved semantic evidence as the initial viewer state,
+  but add one explicit Refresh capture action as the sole inference trigger.
+  The selected model always runs as its fixed batch-3 TensorRT engine across
+  Living Room, Kitchen, and Family Room; camera/model selection and tab load
+  remain display-only.
+- **Decision:** Keep engine, parser, and label bytes immutable in the Noesis
+  release. Serialize capture requests process-wide, write results under the
+  writable runtime-state boundary, validate all three RGB/class-map/masked
+  artifacts, and atomically publish latest only after the batch completes.
+- **Decision:** Browser writes go through an owner-authenticated Menon action
+  with CSRF, idempotency, audit, and exact latest-manifest readback. Noesis
+  serves the resulting images through bounded operator-readable GET routes;
+  the internal token and filesystem paths never enter browser payloads.
+- **Rationale:** The operator needs a fresh view without making ordinary pane
+  interactions unexpectedly expensive or hiding inference behind a reload.
+  Batch publication keeps the retained fixed engines honest and prevents a failed
+  room stream from mixing new and old camera evidence.
+- **Validation:** Focused capture-manager, REST boundary, gateway policy/action,
+  manual-only frontend invariant, TypeScript, and production build checks pass.
+  Promotion additionally requires one live button-triggered three-camera
+  capture and browser inspection of the returned class maps.
+
+# 2026-08-09 — Retain only Small and Large semantic flavors
+
+- **Area:** YOLO26 ADE20K utility assets, manual capture API, and Sem-seg UI.
+- **Decision:** Retain only the Small and Large fixed batch-3 engines and saved
+  evidence. Nano and Medium are removed from runtime assets, model setup, API
+  schemas, viewer choices, and writable capture state.
+- **Rationale:** Small and Large are the only useful operating points from the
+  four-model comparison; retaining the other two adds storage and operator
+  choice without useful project value.
+- **Validation:** The focused Python and frontend contracts enforce the two-size
+  set, both retained engines deserialize under the DS9 TensorRT runtime, and a
+  live Small three-camera refresh is the promotion smoke.

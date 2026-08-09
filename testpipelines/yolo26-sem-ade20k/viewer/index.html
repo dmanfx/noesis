@@ -1,0 +1,72 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>YOLO26 ADE20K Pixel Inspector</title>
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+  <body>
+    <main class="shell">
+      <header>
+        <div>
+          <p class="eyebrow">Living Room · saved well-lit anchor</p>
+          <h1>Semantic pixel inspector</h1>
+        </div>
+        <div class="controls">
+          <label>
+            Model
+            <select id="modelSelect">
+              <option value="s">Small</option>
+              <option value="l" selected>Large</option>
+            </select>
+          </label>
+          <label class="opacity-control">
+            Overlay <output id="opacityValue">55%</output>
+            <input id="opacitySlider" type="range" min="0" max="100" value="55" />
+          </label>
+          <label class="check-control">
+            <input id="overlayToggle" type="checkbox" checked />
+            Show mask
+          </label>
+        </div>
+      </header>
+
+      <div class="workspace">
+        <section class="viewer-panel">
+          <div class="stage" id="stage">
+            <canvas id="semanticCanvas" aria-label="Living Room semantic segmentation"></canvas>
+            <div class="tooltip" id="tooltip" role="status" aria-live="polite">
+              <span class="swatch" id="tooltipSwatch"></span>
+              <span>
+                <strong id="tooltipLabel">wall</strong>
+                <small id="tooltipMeta">class 0</small>
+              </span>
+            </div>
+            <div class="loading" id="loading">Loading semantic map…</div>
+          </div>
+        </section>
+
+        <section class="legend-panel" aria-label="Classes present in this segmentation">
+          <div class="legend-heading">
+            <div>
+              <strong>Segments present</strong>
+              <span id="legendSummary">Loading class coverage…</span>
+            </div>
+            <button id="clearFilter" type="button" disabled>Clear filter</button>
+          </div>
+          <div class="legend-grid" id="legendGrid"></div>
+        </section>
+      </div>
+
+      <footer>
+        <div class="readout">
+          <span class="readout-swatch" id="readoutSwatch"></span>
+          <span id="readoutLabel">Move over the image to inspect a pixel</span>
+        </div>
+        <span id="status">Initializing</span>
+      </footer>
+    </main>
+    <script src="viewer.js"></script>
+  </body>
+</html>

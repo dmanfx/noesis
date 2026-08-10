@@ -5234,6 +5234,10 @@ class _AnalyticsTelemetryProcessor:
     _active_tracks: Dict[int, List[Dict[str, Any]]] = field(default_factory=dict, init=False, repr=False)
     _transitions_state: Dict[int, List[Dict[str, Any]]] = field(default_factory=dict, init=False, repr=False)
     _stable_id_enabled: bool = field(default=True, init=False, repr=False)
+    _v3dt_reid_track_grace_s: float = field(default=0.0, init=False, repr=False)
+    _v3dt_reid_last_seen_by_track: Dict[Tuple[int, int], float] = field(
+        default_factory=dict, init=False, repr=False
+    )
     _bev_class_ids: frozenset[int] = field(default_factory=lambda: frozenset({0}), init=False, repr=False)
     _bev_class_ids_ready: bool = field(default=False, init=False, repr=False)
     _reid_unique_id: int = field(default=3, init=False, repr=False)
@@ -5310,6 +5314,25 @@ class _AnalyticsTelemetryProcessor:
                 self._world_frame = str(frame)
         except Exception:
             self._world_frame = "backend_world_m"
+
+        if self._tracking_mode_is_v3dt():
+            try:
+                grace_v3dt_cfg = getattr(self.pipeline, "config", {}).get("v3dt", {}) or {}
+                configured_grace_s = (
+                    grace_v3dt_cfg.get("reid_track_grace_s", 0.0)
+                    if isinstance(grace_v3dt_cfg, Mapping)
+                    else 0.0
+                )
+                grace_raw = os.environ.get(
+                    "NOESIS_V3DT_REID_TRACK_GRACE_S",
+                    configured_grace_s,
+                )
+                grace_s = float(str(grace_raw).strip() or "0")
+                if not math.isfinite(grace_s):
+                    raise ValueError("grace must be finite")
+                self._v3dt_reid_track_grace_s = min(5.0, max(0.0, grace_s))
+            except (TypeError, ValueError):
+                self._v3dt_reid_track_grace_s = 0.0
 
         flag = str(os.environ.get("NOESIS_V3DT_META_EXTRACT", "1") or "").strip().lower()
         self._v3dt_meta_enabled = flag in ("", "1", "true", "yes", "y", "on")
@@ -7919,6 +7942,18 @@ class _AnalyticsTelemetryProcessor:
         mgr = getattr(self.pipeline, "stable_id_mgr", None)
         if self._stable_id_enabled and mgr is not None:
             try:
+                if self._tracking_mode_is_v3dt() and self._v3dt_reid_track_grace_s > 0.0:
+                    for track_id in present_set:
+                        self._v3dt_reid_last_seen_by_track[(sensor_id_int, track_id)] = now_ts
+                    for key, last_seen_ts in list(self._v3dt_reid_last_seen_by_track.items()):
+                        cached_sensor_id, cached_track_id = key
+                        if cached_sensor_id != sensor_id_int or cached_track_id in present_set:
+                            continue
+                        age_s = now_ts - last_seen_ts
+                        if 0.0 <= age_s <= self._v3dt_reid_track_grace_s:
+                            present_set.add(cached_track_id)
+                        else:
+                            self._v3dt_reid_last_seen_by_track.pop(key, None)
                 mgr.remove_missing_tracks(sensor_id_int, list(present_set), now_ts)
                 mgr.prune_ghosts(now_ts)
             except Exception:

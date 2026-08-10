@@ -1,0 +1,75 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <meta name="theme-color" content="#101312" />
+    <title>Noesis · Phone Room Scan</title>
+    <link rel="stylesheet" href="/static/style.css" />
+    <script type="importmap">
+      {
+        "imports": {
+          "three": "/three/build/three.module.js"
+        }
+      }
+    </script>
+  </head>
+  <body>
+    <header class="topbar">
+      <a class="brand" href="#" aria-label="Phone scan home">
+        <span class="brand-mark">N</span>
+        <span><b>Noesis</b><small>Multi-view phone scan</small></span>
+      </a>
+      <span id="health-pill" class="health-pill">Connecting…</span>
+    </header>
+
+    <main>
+      <section class="capture-card">
+        <div class="capture-copy">
+          <span class="eyebrow">New room walk</span>
+          <h1>Capture the room, then choose the reconstruction model.</h1>
+          <p>
+            Walk slowly with the rear camera. Keep one lens selected, overlap each view,
+            and avoid people moving through the scene.
+          </p>
+        </div>
+        <div class="capture-actions">
+          <label class="field-label" for="scan-name">Scan name</label>
+          <input id="scan-name" class="text-input" maxlength="80" value="Phone room walk" />
+          <label class="primary-button capture-button" for="camera-video">
+            <span class="button-icon">●</span> Record phone walk
+          </label>
+          <input id="camera-video" class="visually-hidden" type="file" accept="video/*" capture="environment" />
+          <label class="secondary-button capture-button" for="existing-video">Use an existing video</label>
+          <input id="existing-video" class="visually-hidden" type="file" accept="video/*" />
+          <p class="microcopy">The original video and every generated asset stay on this Noesis machine.</p>
+        </div>
+        <div id="upload-panel" class="upload-panel hidden" aria-live="polite">
+          <div class="progress-header"><span id="upload-label">Uploading…</span><b id="upload-percent">0%</b></div>
+          <div class="progress-track"><span id="upload-bar"></span></div>
+        </div>
+      </section>
+
+      <section class="workspace">
+        <aside class="scan-sidebar">
+          <div class="section-heading">
+            <div><span class="eyebrow">Saved locally</span><h2>Scans</h2></div>
+            <button id="refresh-button" class="icon-button" type="button" aria-label="Refresh scans">↻</button>
+          </div>
+          <div id="scan-list" class="scan-list"></div>
+        </aside>
+
+        <section id="scan-detail" class="scan-detail">
+          <div class="empty-state">
+            <div class="empty-orbit"><span></span></div>
+            <h2>No scan selected</h2>
+            <p>Record a room walk above or select a saved scan.</p>
+          </div>
+        </section>
+      </section>
+    </main>
+
+    <div id="toast" class="toast hidden" role="status"></div>
+    <script type="module" src="/static/app.js"></script>
+  </body>
+</html>

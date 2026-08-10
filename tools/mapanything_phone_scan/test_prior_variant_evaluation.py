@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import sys
+
 import numpy as np
 
 from tools.mapanything_phone_scan.evaluate_mapanything_prior_variants import (
     _bounded_source,
     _camera_oriented_bev,
+    _parse_args,
     _pose_metrics,
 )
 
@@ -35,3 +38,41 @@ def test_camera_oriented_bev_rotates_hallway_convention_180_degrees() -> None:
         _camera_oriented_bev(image),
         np.asarray([[11, 10, 9, 8], [7, 6, 5, 4], [3, 2, 1, 0]]),
     )
+
+
+def test_parse_args_accepts_room_specific_inputs_and_selected_variant(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "evaluate_mapanything_prior_variants.py",
+            "scan",
+            "--suite-root",
+            "suite",
+            "--da3-raw",
+            "da3/raw",
+            "--prior-consensus-raw",
+            "consensus/raw",
+            "--variants",
+            "da3_pose_sparse_depth",
+            "--world-from-da3",
+            "alignment.json",
+            "--target-revision",
+            "revision",
+            "--calibration",
+            "calibration.json",
+            "--camera",
+            "foyer",
+            "--output-dir",
+            "evaluation",
+        ],
+    )
+
+    args = _parse_args()
+
+    assert str(args.da3_raw) == "da3/raw"
+    assert str(args.prior_consensus_raw) == "consensus/raw"
+    assert args.variants == ["da3_pose_sparse_depth"]
+    assert args.camera == "foyer"

@@ -50,6 +50,7 @@ from tools.mapanything_phone_scan.render_phone_heatmap_diagnostics import (  # n
     _save_panel,
 )
 from tools.mapanything_phone_scan.run_mapanything_prior_variants import (  # noqa: E402
+    VARIANT_SPECS,
     _load_static_reference,
     _load_world_from_da3,
     _rotation_error_deg,
@@ -402,6 +403,35 @@ def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("scan_dir", type=Path)
     parser.add_argument("--suite-root", type=Path, required=True)
+    parser.add_argument(
+        "--da3-raw",
+        type=Path,
+        required=True,
+        help="Raw DA3 output used to construct the sparse depth and pose priors.",
+    )
+    parser.add_argument(
+        "--prior-consensus-raw",
+        type=Path,
+        required=True,
+        help="Raw prior-conditioned MapAnything plus DA3 consensus output.",
+    )
+    parser.add_argument(
+        "--image-only-raw",
+        type=Path,
+        help="Optional image-only MapAnything control from the same prepared views.",
+    )
+    parser.add_argument(
+        "--comparison-consensus-raw",
+        type=Path,
+        help="Optional earlier image-only MapAnything plus DA3 consensus control.",
+    )
+    parser.add_argument(
+        "--variants",
+        nargs="+",
+        choices=tuple(VARIANT_SPECS),
+        default=list(VARIANT_SPECS),
+        help="Conditioned MapAnything variants present under --suite-root.",
+    )
     parser.add_argument("--world-from-da3", type=Path, required=True)
     parser.add_argument("--target-revision", type=Path, required=True)
     parser.add_argument("--calibration", type=Path, required=True)
@@ -421,6 +451,9 @@ def _parse_args() -> argparse.Namespace:
 def main() -> int:
     args = _parse_args()
     scan_dir = args.scan_dir.resolve()
+    prepared_manifest = scan_dir / "prepared_frames_manifest.json"
+    if not prepared_manifest.is_file():
+        raise ValueError(f"prepared frame manifest is missing: {prepared_manifest}")
     suite_root = args.suite_root.resolve()
     output_dir = args.output_dir.resolve()
     if output_dir.exists():
@@ -434,65 +467,86 @@ def main() -> int:
         args.camera,
     )
     world_from_da3 = _load_world_from_da3(args.world_from_da3.resolve())
-    da3_raw = scan_dir / "da3_outputs" / "raw"
+    da3_raw = args.da3_raw.resolve()
     da3_sequence = _load_sequence(da3_raw, "DA3")
     backend_da3_poses = _transform_poses(world_from_da3, da3_sequence.poses)
 
-    candidates = [
-        _trajectory_sim3_candidate(
-            "mapanything_image_only",
-            "MA image-only baseline",
-            scan_dir / "outputs" / "raw",
-            backend_da3_poses,
-            args.point_budget,
-        ),
+    candidates: list[Candidate] = []
+    if args.image_only_raw is not None:
+        candidates.append(
+            _trajectory_sim3_candidate(
+                "mapanything_image_only",
+                "MA image-only baseline",
+                args.image_only_raw.resolve(),
+                backend_da3_poses,
+                args.point_budget,
+            )
+        )
+    candidates.append(
         _rigid_candidate(
             "da3",
             "DA3 baseline",
             da3_raw,
             world_from_da3,
             args.point_budget,
-        ),
-        _trajectory_sim3_candidate(
-            "consensus_da3_carrier",
-            "MA+DA3 prior consensus",
-            scan_dir / "consensus_da3_carrier_20260809" / "raw",
-            backend_da3_poses,
-            args.point_budget,
-        ),
+        )
+    )
+    if args.comparison_consensus_raw is not None:
+        candidates.append(
+            _trajectory_sim3_candidate(
+                "consensus_da3_carrier",
+                "MA+DA3 image-only consensus control",
+                args.comparison_consensus_raw.resolve(),
+                backend_da3_poses,
+                args.point_budget,
+            )
+        )
+    candidates.append(
         _trajectory_sim3_candidate(
             "prior_conditioned_consensus",
             "Prior-conditioned MA+DA3 fusion",
-            suite_root / "prior_conditioned_consensus_da3_carrier" / "raw",
+            args.prior_consensus_raw.resolve(),
             backend_da3_poses,
             args.point_budget,
-        ),
-        _identity_candidate(
-            "ma_da3_pose",
-            "MA + DA3 pose",
-            suite_root / "mapanything_da3_pose" / "raw",
-            args.point_budget,
-        ),
-        _trajectory_sim3_candidate(
-            "ma_da3_sparse_depth",
-            "MA + sparse DA3 depth",
-            suite_root / "mapanything_da3_sparse_depth" / "raw",
-            backend_da3_poses,
-            args.point_budget,
-        ),
-        _identity_candidate(
-            "ma_da3_pose_depth",
-            "MA + DA3 pose/depth",
-            suite_root / "mapanything_da3_pose_sparse_depth" / "raw",
-            args.point_budget,
-        ),
-        _identity_candidate(
-            "ma_da3_pose_depth_static",
-            "MA + DA3 pose/depth + static",
-            suite_root / "mapanything_da3_pose_sparse_depth_static" / "phone_raw",
-            args.point_budget,
-        ),
-    ]
+        )
+    )
+    if "da3_pose" in args.variants:
+        candidates.append(
+            _identity_candidate(
+                "ma_da3_pose",
+                "MA + DA3 pose",
+                suite_root / "mapanything_da3_pose" / "raw",
+                args.point_budget,
+            )
+        )
+    if "da3_sparse_depth" in args.variants:
+        candidates.append(
+            _trajectory_sim3_candidate(
+                "ma_da3_sparse_depth",
+                "MA + sparse DA3 depth",
+                suite_root / "mapanything_da3_sparse_depth" / "raw",
+                backend_da3_poses,
+                args.point_budget,
+            )
+        )
+    if "da3_pose_sparse_depth" in args.variants:
+        candidates.append(
+            _identity_candidate(
+                "ma_da3_pose_depth",
+                "MA + DA3 pose/depth",
+                suite_root / "mapanything_da3_pose_sparse_depth" / "raw",
+                args.point_budget,
+            )
+        )
+    if "da3_pose_sparse_depth_static" in args.variants:
+        candidates.append(
+            _identity_candidate(
+                "ma_da3_pose_depth_static",
+                "MA + DA3 pose/depth + static",
+                suite_root / "mapanything_da3_pose_sparse_depth_static" / "phone_raw",
+                args.point_budget,
+            )
+        )
 
     low = np.min(target_points[:, [0, 2]], axis=0) - 0.35
     high = np.max(target_points[:, [0, 2]], axis=0) + 0.35
@@ -513,6 +567,7 @@ def main() -> int:
             raise ValueError("reused metrics used a different point-splat resolution")
         metrics = copy.deepcopy(reused_metrics)
         metrics["generated_at"] = datetime.now(timezone.utc).isoformat()
+        metrics["scan_dir"] = str(scan_dir)
         metrics["metrics_reused_from"] = str(reuse_path)
         metrics["presentation"] = {
             "bev_rotation_deg": 180,
@@ -523,6 +578,7 @@ def main() -> int:
         metrics = {
             "schema": "noesis.mapanything.prior_variant_evaluation.v1",
             "generated_at": datetime.now(timezone.utc).isoformat(),
+            "scan_dir": str(scan_dir),
             "coordinate_frame": "backend_world_m_stream_points",
             "alignment_reference": "validated DA3 phone trajectory mapped into static-camera backend world",
             "static_target_revision": str(target_revision),

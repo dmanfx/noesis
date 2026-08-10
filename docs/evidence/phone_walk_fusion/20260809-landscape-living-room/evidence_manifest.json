@@ -1,0 +1,83 @@
+{
+  "schema": "noesis.phone_walk_fusion.evidence.v1",
+  "captured_at": "2026-08-09",
+  "scan_id": "20260802-162254-8bcc7dd7",
+  "prepared_view_count": 48,
+  "prepared_frame_size": [
+    1920,
+    1080
+  ],
+  "suite_id": "da3_prior_suite_20260809",
+  "selected_candidate": "prior_conditioned_consensus_da3_carrier",
+  "final_evaluation": "evaluation_static_world_v5_final",
+  "coordinate_frame": "backend_world_m_stream_points",
+  "selected_metrics": {
+    "surfel_count_4cm": 150901,
+    "fused_valid_fraction": 0.8867707152305366,
+    "agreement_fraction_of_both": 0.8927136552004086,
+    "large_disagreement_fraction_of_both": 0.03232922473411114,
+    "absolute_depth_disagreement_median_m": 0.025869131088256836,
+    "internal_reprojection_median_m": 0.04310193692575348,
+    "heldout_reprojection_median_m": 0.06581878662109375,
+    "static_target_median_m": 0.13778610871736774,
+    "static_target_within_0p30m_fraction": 0.6277201123458298,
+    "fixed_camera_depth_delta_median_m": 0.23732813253359275
+  },
+  "review_mesh": {
+    "voxel_length_m": 0.025,
+    "vertex_count": 363652,
+    "triangle_count": 693035,
+    "static_reference_points_included": false
+  },
+  "files": [
+    {
+      "path": "variant_comparison.png",
+      "size_bytes": 2858217,
+      "width_px": 2550,
+      "height_px": 4260,
+      "sha256": "791a51237c1b312218a01ad12b58e3893482d6affb4254ccc4f69496233ca6b7"
+    },
+    {
+      "path": "selected_diagnostic_layers.png",
+      "size_bytes": 857631,
+      "width_px": 2250,
+      "height_px": 2700,
+      "sha256": "3418fdae4e8031e36b1319ea3f2404a2e42085d8e91576651fe76e81e4c81625"
+    },
+    {
+      "path": "selected_point_layers_2p5cm.png",
+      "size_bytes": 402652,
+      "width_px": 2250,
+      "height_px": 1500,
+      "sha256": "a8a6333ac522be208a7b011a65695b9e444b5c7b909d34bc2bb9e9189afcdc44"
+    },
+    {
+      "path": "selected_point_cloud.png",
+      "size_bytes": 1942449,
+      "width_px": 2532,
+      "height_px": 1751,
+      "sha256": "2e4db47769b158bf63247e9a5bfe9cbdf468b9e8ce6d1d17ccf8926d64555ff0"
+    },
+    {
+      "path": "selected_mesh_2p5cm.png",
+      "size_bytes": 1776834,
+      "width_px": 2405,
+      "height_px": 1482,
+      "sha256": "a236f34f8393518dac911ae630d68a653544fb70f28939a3987a059362518b1e"
+    },
+    {
+      "path": "consensus_collaboration_diagnostics.png",
+      "size_bytes": 1714239,
+      "width_px": 2700,
+      "height_px": 2100,
+      "sha256": "03e589951a3060b7f1cc47219bb416380a6d261819e3da98280eecddbde2ea74"
+    },
+    {
+      "path": "selected_fixed_camera_reprojection.jpg",
+      "size_bytes": 698625,
+      "width_px": 1920,
+      "height_px": 1080,
+      "sha256": "e8a8270833b3a02a19ee7db73e162cc1666335b6104c2cea5ecb46c6667a8992"
+    }
+  ]
+}

@@ -15,6 +15,7 @@ and worklogs live in `docs/history/`.
 - **V3DT forensics & calibration:** `DS8_v3dt_forensics.md`
 - **Depth / MapAnything:** `MapAnything_Depth.md`, `MapAnything_Heatmap_Viewer.md`, `DEPTH_STACK_FLOW_V2.md`, `depth_metadata.md`
 - **Virtual twin reconstruction:** `Virtual_Twin_Reconstruction.md`
+- **Phone-walk fusion reconstruction:** `Phone_Walk_Fusion_Reconstruction.md`
 - **Archived references:** see `history/` (archived)
 
 ## Navigation by Topic
@@ -40,6 +41,11 @@ and worklogs live in `docs/history/`.
   active stack.
 - When you edit docs, append a one-line entry under “Doc changes” (date + what changed) for any **substantive** update: new features/processes/workflows, contract or baseline changes, behavior-affecting diagrams. Skip trivial typo/style fixes or purely cosmetic diagram tweaks.
 - Status headers (“Status: validated as of …”) should only be updated when the doc has been re-validated against code/configs.
+
+## Doc changes (2026-08-10)
+- Documented the validated DA3-conditioned MapAnything phone-walk fusion,
+  static-camera authority boundary, retained evidence, and repeatable workflow
+  for reconstructing additional rooms (`Phone_Walk_Fusion_Reconstruction.md`).
 
 ## Doc changes (2026-07-03)
 - Updated the codebase overview and DS8 decision ledger for the Swin-Tiny ReID

@@ -21,6 +21,10 @@ silently mixed into phone-only inference or fusion.
 This tool saves review candidates. It does not automatically publish them into
 the live DS8/DS9 depth, tracking, floorplan, or virtual-twin contracts.
 
+The canonical fusion decision, validation basis, authority boundaries, and
+repeat-for-another-room procedure are in
+`docs/Phone_Walk_Fusion_Reconstruction.md`.
+
 ## Validated reference capture
 
 The consensus result reviewed on 2026-08-09 used this scan:
@@ -351,16 +355,21 @@ surface and floorplan, not a replacement for calibrated track projection.
 
 ### Reusable commands
 
-Run all four prior variants on matching prepared phone views and DA3 raw data:
+For the routine path, run the selected pose-plus-depth variant on matching
+prepared phone views and DA3 raw data. Omit `--variants` when qualifying all
+four variants:
 
 ```bash
-data/mapanything_phone_scan_runtime/venv/bin/python \
+  data/mapanything_phone_scan_runtime/venv/bin/python \
   tools/mapanything_phone_scan/run_mapanything_prior_variants.py \
   data/mapanything_phone_scans/<scan-id> \
-  --da3-raw data/mapanything_phone_scans/<scan-id>/da3_outputs/raw \
-  --world-from-da3 <alignment-root>/phone_ma_to_noesis_world.json \
+  --da3-raw data/mapanything_phone_scans/<scan-id>/outputs/raw \
+  --world-from-da3 \
+    data/mapanything_phone_scans/<scan-id>/alignment/phone_ma_to_noesis_world.json \
   --target-revision data/virtual_twin/revisions/<approved-room-revision> \
   --calibration config/camera_calibration.json \
+  --camera <camera-id> \
+  --variants da3_pose_sparse_depth \
   --output-root <large-storage-root>/<scan-id>/da3_prior_suite
 ```
 
@@ -371,9 +380,27 @@ carrier:
 python3 tools/mapanything_phone_scan/build_consensus_fusion.py \
   data/mapanything_phone_scans/<scan-id> \
   --mapanything-raw <suite-root>/mapanything_da3_pose_sparse_depth/raw \
-  --da3-raw data/mapanything_phone_scans/<scan-id>/da3_outputs/raw \
+  --da3-raw data/mapanything_phone_scans/<scan-id>/outputs/raw \
   --pose-carrier da3 \
   --output-dir <suite-root>/prior_conditioned_consensus_da3_carrier
+```
+
+Evaluate the selected result and regenerate the common diagnostic layouts:
+
+```bash
+python3 tools/mapanything_phone_scan/evaluate_mapanything_prior_variants.py \
+  data/mapanything_phone_scans/<scan-id> \
+  --suite-root <suite-root> \
+  --da3-raw data/mapanything_phone_scans/<scan-id>/outputs/raw \
+  --prior-consensus-raw \
+    <suite-root>/prior_conditioned_consensus_da3_carrier/raw \
+  --variants da3_pose_sparse_depth \
+  --world-from-da3 \
+    data/mapanything_phone_scans/<scan-id>/alignment/phone_ma_to_noesis_world.json \
+  --target-revision data/virtual_twin/revisions/<approved-room-revision> \
+  --calibration config/camera_calibration.json \
+  --camera <camera-id> \
+  --output-dir <suite-root>/evaluation_static_world
 ```
 
 The suite manifest records model/package identity, prior thresholds and seed,
@@ -400,6 +427,12 @@ room revision, and transform provenance must match. A visually plausible but
 unvalidated transform is not sufficient for live tracking.
 
 ## Important artifacts
+
+The curated selected landscape evidence is retained at:
+
+```text
+docs/evidence/phone_walk_fusion/20260809-landscape-living-room/
+```
 
 For the validated portrait run:
 

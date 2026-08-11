@@ -6,6 +6,7 @@ import base64
 import hashlib
 import logging
 import os
+import secrets
 import threading
 import time
 from dataclasses import dataclass
@@ -629,7 +630,7 @@ logging.getLogger("uvicorn.access").addFilter(_AccessLogOnceFilter("POST /infer_
 
 async def verify_api_key(x_api_key: Optional[str] = Header(None)) -> None:
     expected = state.config.service.api_key
-    if expected and x_api_key != expected:
+    if x_api_key is None or not secrets.compare_digest(x_api_key, expected):
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Invalid API key")
 
 

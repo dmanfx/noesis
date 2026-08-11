@@ -1,10 +1,17 @@
 """Shared configuration utilities for MapAnything integration."""
 from __future__ import annotations
 
-from dataclasses import dataclass
+import configparser
+import os
+from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Dict, Optional
 
-from config import load_ma_config
+from noesis_core.runtime_secrets import (
+    MAPANYTHING_API_KEY_FILE_ENV,
+    RuntimeSecretError,
+    load_mapanything_api_key,
+)
 
 
 def _strip_comment(raw: str) -> str:
@@ -66,7 +73,7 @@ def _normalize_amp(raw: str) -> str:
 class ServiceSettings:
     host: str
     port: int
-    api_key: str
+    api_key: str = field(repr=False)
 
     @property
     def base_url(self) -> str:
@@ -121,8 +128,17 @@ class ServiceConfig:
     storage: StorageSettings
 
     @classmethod
-    def from_ini(cls, ini_dict: Dict[str, Dict[str, str]]) -> "ServiceConfig":
+    def from_ini(
+        cls,
+        ini_dict: Dict[str, Dict[str, str]],
+        *,
+        api_key: str,
+    ) -> "ServiceConfig":
         service_section = ini_dict.get("service", {})
+        if "api_key" in service_section:
+            raise RuntimeSecretError(
+                "MapAnything service config must not contain an inline api_key"
+            )
         inference_section = ini_dict.get("inference", {})
         performance_section = ini_dict.get("performance", {})
         storage_section = ini_dict.get("storage", {})
@@ -130,7 +146,7 @@ class ServiceConfig:
         service = ServiceSettings(
             host=service_section.get("host", "127.0.0.1"),
             port=_to_int(service_section.get("port", "8001")),
-            api_key=service_section.get("api_key", "noesis_secret"),
+            api_key=api_key,
         )
         inference = InferenceSettings(
             model_id=inference_section.get("model_id", "facebook/map-anything-apache"),
@@ -168,10 +184,27 @@ class ServiceConfig:
         return cls(service=service, inference=inference, performance=performance, storage=storage)
 
 
-def load_service_config() -> ServiceConfig:
-    """Load MapAnything service configuration."""
-    ini_dict = load_ma_config()
-    return ServiceConfig.from_ini(ini_dict)
+def load_service_config(path: str | Path = "config/mapanything.ini") -> ServiceConfig:
+    """Load public service settings plus the required owner-only RPC key."""
+
+    candidate = Path(path)
+    parser = configparser.ConfigParser(interpolation=None, strict=True)
+    try:
+        loaded = parser.read(candidate, encoding="utf-8")
+    except configparser.Error as exc:
+        raise RuntimeError(f"Invalid MapAnything configuration: {candidate}") from exc
+    if not loaded:
+        raise RuntimeError(f"MapAnything configuration is missing: {candidate}")
+    ini_dict = {section: dict(parser.items(section)) for section in parser.sections()}
+    service_section = ini_dict.get("service", {})
+    if "api_key" in service_section:
+        raise RuntimeSecretError(
+            "MapAnything service config must not contain an inline api_key"
+        )
+    configured_key_file = str(service_section.get("api_key_file") or "").strip()
+    key_path = os.environ.get(MAPANYTHING_API_KEY_FILE_ENV) or configured_key_file or None
+    api_key = load_mapanything_api_key(key_path)
+    return ServiceConfig.from_ini(ini_dict, api_key=api_key)
 
 
 __all__ = [

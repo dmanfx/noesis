@@ -1,8 +1,8 @@
-#!/bin/bash
-# Fixed run script for MapAnything service
+#!/usr/bin/env bash
+set -euo pipefail
 
-cd /home/mayor/Noesis_Devel  # Project root
-export PYTHONPATH="${PYTHONPATH}:."
+REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../../.." && pwd)"
+cd "${REPO_ROOT}"
+export PYTHONPATH="${REPO_ROOT}${PYTHONPATH:+:${PYTHONPATH}}"
 
-# Run uvicorn via python module (avoids PATH issues)
-python3 -m uvicorn services.mapanything_svc.server:app --host 127.0.0.1 --port 8001
+exec python3 -m uvicorn DS9.services.mapanything_svc.server:app --host 127.0.0.1 --port 8001

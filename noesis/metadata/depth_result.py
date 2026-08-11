@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Dict, Mapping, Sequence, Tuple
@@ -57,6 +58,14 @@ class DepthResult:
             "minmax": [self.minmax[0], self.minmax[1]],
             "unit": self.unit,
         }
+
+    def to_public_dict(self) -> JsonDict:
+        """Return telemetry without exposing storage paths or backend URIs."""
+
+        payload = self.to_dict()
+        digest = hashlib.sha256(self.depth_map_ref.encode("utf-8")).hexdigest()
+        payload["depth_map_ref"] = f"noesis-depth://artifact/{digest}"
+        return payload
 
     def to_json(self, *, indent: int | None = None) -> str:
         """Serialize to JSON string."""

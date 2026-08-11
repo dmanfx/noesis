@@ -1,0 +1,282 @@
+{
+  "schema_version": 1,
+  "contracts": {
+    "yolo26_m": {
+      "staged": "models/onnx/yolo26m.onnx",
+      "raw_sha256": "d7e03c7844506586218cd336370c398022bccd9ec510292fa04e4fe96c3c24cb",
+      "bundle_sha256": "6c3df4a829ccf0542804175ed967a6da17a037293da749d27f4f5ebbfc33c34d",
+      "onnx": {
+        "opsets": [{"domain": "ai.onnx", "version": 18}],
+        "inputs": [{"name": "images", "dtype": "FLOAT", "shape": [3, 3, 640, 640]}],
+        "outputs": [{"name": "output0", "dtype": "FLOAT", "shape": [3, 300, 6]}],
+        "external_initializer_count": 0
+      },
+      "maintenance_build": {"precision_arg": "--fp16", "trtexec_args": [], "plugin_args": []}
+    },
+    "yolo26_seg_s": {
+      "staged": "models/onnx/yolo26s-seg_fused.onnx",
+      "raw_sha256": "fe3fba3623b3cdde374f7c34ec4d453b9fa4875ffcf0b1b2567e166bebff5b23",
+      "bundle_sha256": "1bf90a668d0e772e79e32e4ad1132e7936515b9ec659a88e891861e25258ed34",
+      "onnx": {
+        "opsets": [{"domain": "ai.onnx", "version": 18}],
+        "inputs": [{"name": "images", "dtype": "FLOAT", "shape": [3, 3, 640, 640]}],
+        "outputs": [{"name": "output0", "dtype": "FLOAT", "shape": [3, 30, 4102]}],
+        "external_initializer_count": 0
+      },
+      "maintenance_build": {"precision_arg": "--fp16", "trtexec_args": [], "plugin_args": []}
+    },
+    "reid_swin": {
+      "staged": "models/onnx/reid_swin_tiny_market1501_aicity156_featuredim256.onnx",
+      "raw_sha256": "37b008d887495d5fbad31c72aadbf381c5456cb619e0e2a9c246a6d48a2932ff",
+      "bundle_sha256": "f0b0eaaacd9a5f53c5a205c3518c2ba86e4007567d7e9dbe8cdfd8ef59847aac",
+      "onnx": {
+        "opsets": [{"domain": "ai.onnx", "version": 14}],
+        "inputs": [{"name": "input", "dtype": "FLOAT", "shape": ["batch", 3, 256, 128]}],
+        "outputs": [{"name": "fc_pred", "dtype": "FLOAT", "shape": ["batch", "embedding_size"]}],
+        "external_initializer_count": 0
+      },
+      "maintenance_build": {
+        "precision_arg": "--fp16",
+        "trtexec_args": ["--minShapes=input:1x3x256x128", "--optShapes=input:16x3x256x128", "--maxShapes=input:16x3x256x128"],
+        "plugin_args": []
+      }
+    },
+    "yolo26_pose_n": {
+      "staged": "models/onnx/yolo26n-pose_b3.onnx",
+      "raw_sha256": "be40dd6e2e3bedf3fd5eed289881a607486a4ce2f0f1d72f57bd806a8908ce61",
+      "bundle_sha256": "7401ba2c8ac7d5f17158ce7cdeb93bc3dfe2f6092adad226e911b0454924fab6",
+      "onnx": {
+        "opsets": [{"domain": "ai.onnx", "version": 18}],
+        "inputs": [{"name": "images", "dtype": "FLOAT", "shape": [3, 3, 640, 640]}],
+        "outputs": [{"name": "output0", "dtype": "FLOAT", "shape": [3, 300, 57]}],
+        "external_initializer_count": 0
+      },
+      "maintenance_build": {"precision_arg": "--fp16", "trtexec_args": [], "plugin_args": []}
+    },
+    "depth_anything_v2_tracking": {
+      "staged": "models/onnx/depth_anything_v2_metric_hypersim_vits_294x518_b3.onnx",
+      "raw_sha256": "93c7f1c0d550d137ebed0041804d938c00dd5dc0cb71ecddd7e98bd363872294",
+      "bundle_sha256": "e30f4de9643e137258586ea2d14e8db779436cbff70cb65d7e30cb16a3d897ce",
+      "onnx": {
+        "opsets": [{"domain": "ai.onnx", "version": 17}],
+        "inputs": [{"name": "input", "dtype": "FLOAT", "shape": [3, 3, 294, 518]}],
+        "outputs": [{"name": "depth", "dtype": "FLOAT", "shape": [3, 294, 518]}],
+        "external_initializer_count": 0
+      },
+      "maintenance_build": {"precision_arg": "--fp16", "trtexec_args": [], "plugin_args": []}
+    },
+    "mapanything": {
+      "staged": "models/onnx/mapanything_images_294x518_b3.onnx",
+      "raw_sha256": "0a27dca24238d8103b83df67ce8f71d11c6a79574d83d6e9bab237f3d9c222c7",
+      "bundle_sha256": "b009197926d49c32238f41e7406f2035f368225c4814bec77548ad5b118e0229",
+      "onnx": {
+        "opsets": [{"domain": "ai.onnx", "version": 17}],
+        "inputs": [{"name": "images", "dtype": "FLOAT", "shape": ["batch", 3, 294, 518]}],
+        "outputs": [
+          {"name": "depth", "dtype": "FLOAT", "shape": ["batch", 1, "Castdepth_dim_2", "Castdepth_dim_3"]},
+          {"name": "conf", "dtype": "FLOAT", "shape": ["batch", 1, "Castconf_dim_2", "Castconf_dim_3"]},
+          {"name": "mask", "dtype": "FLOAT", "shape": ["batch", 1, "Castconf_dim_2", "Castconf_dim_3"]}
+        ],
+        "external_initializer_count": 632
+      },
+      "maintenance_build": {
+        "precision": "fp32",
+        "trtexec_args": ["--minShapes=images:3x3x294x518", "--optShapes=images:3x3x294x518", "--maxShapes=images:3x3x294x518", "--builderOptimizationLevel=0", "--maxAuxStreams=0", "--memPoolSize=workspace:1024"],
+        "plugin_args": []
+      },
+      "quality_gate": {
+        "contract": "noesis.ds9.mapanything_functional_quality.v1",
+        "fixture": {
+          "artifact_relative_path": "models/engine_validation/mapanything/images-b3.raw",
+          "sha256": "dbe62bc2ca22077d17070bb61babb817de7f22208547372e58a0153a54bd9fc0",
+          "size_bytes": 5482512,
+          "tensor": {"name": "images", "dtype": "float32", "shape": [3, 3, 294, 518]},
+          "identical_batch_members": true
+        },
+        "trtexec_args": ["--iterations=1", "--duration=0", "--warmUp=0", "--avgRuns=1"],
+        "outputs": {
+          "depth": {
+            "dtype": "float32",
+            "shape": [3, 1, 294, 518],
+            "finite_fraction": {"min": 1.0, "max": 1.0},
+            "positive_fraction": {"min": 1.0, "max": 1.0},
+            "distribution": {
+              "min": {"min": 0.20, "max": 0.40},
+              "max": {"min": 7.0, "max": 8.0},
+              "mean": {"min": 2.7, "max": 3.3},
+              "p01": {"min": 1.0, "max": 1.3},
+              "p50": {"min": 2.5, "max": 3.2},
+              "p99": {"min": 5.7, "max": 6.5}
+            },
+            "batch_max_abs_delta": 0.0001
+          },
+          "conf": {
+            "dtype": "float32",
+            "shape": [3, 1, 294, 518],
+            "finite_fraction": {"min": 1.0, "max": 1.0},
+            "positive_fraction": {"min": 1.0, "max": 1.0},
+            "forbidden_values": [-65504.0, -3.4028235e38, 3.4028235e38],
+            "distribution": {
+              "min": {"min": 0.99, "max": 1.001},
+              "max": {"min": 1.0, "max": 1.01},
+              "mean": {"min": 0.99, "max": 1.01},
+              "p50": {"min": 0.99, "max": 1.01}
+            },
+            "batch_max_abs_delta": 0.0001
+          },
+          "mask": {
+            "dtype": "float32",
+            "shape": [3, 1, 294, 518],
+            "finite_fraction": {"min": 1.0, "max": 1.0},
+            "positive_fraction": {"min": 0.999, "max": 1.0},
+            "mask_threshold": 0.5,
+            "mask_coverage": {"min": 0.999, "max": 1.0},
+            "distribution": {
+              "min": {"min": 0.0, "max": 0.1},
+              "max": {"min": 0.99, "max": 1.0},
+              "mean": {"min": 0.999, "max": 1.0},
+              "p50": {"min": 0.99, "max": 1.0}
+            },
+            "batch_max_abs_delta": 0.0001
+          }
+        }
+      }
+    },
+    "bodypose3dnet": {
+      "staged": "models/onnx/bodypose3dnet_accuracy.onnx",
+      "raw_sha256": "0452b785a70fcd6bc5bd4069249bdfd85eb139c9e9216bcf81f89df33945d028",
+      "bundle_sha256": "789a147dae1c3d5f5e8e0866e4dab0c86ffe864c41f2dbee6d2e508b85c2a6a8",
+      "onnx": {
+        "opsets": [{"domain": "ai.onnx", "version": 11}],
+        "inputs": [
+          {"name": "input0", "dtype": "FLOAT", "shape": [-1, 3, 256, 192]},
+          {"name": "k_inv", "dtype": "FLOAT", "shape": [-1, 3, 3]},
+          {"name": "t_form_inv", "dtype": "FLOAT", "shape": [-1, 3, 3]},
+          {"name": "scale_normalized_mean_limb_lengths", "dtype": "FLOAT", "shape": [-1, 36]},
+          {"name": "mean_limb_lengths", "dtype": "FLOAT", "shape": [-1, 36]}
+        ],
+        "outputs": [
+          {"name": "pose2d", "dtype": "FLOAT", "shape": [-1, 34, 3]},
+          {"name": "pose2d_org_img", "dtype": "FLOAT", "shape": [-1, 34, 3]},
+          {"name": "pose25d", "dtype": "FLOAT", "shape": [-1, 34, 4]},
+          {"name": "pose3d", "dtype": "FLOAT", "shape": [-1, 34, 3]}
+        ],
+        "external_initializer_count": 0
+      },
+      "maintenance_build": {
+        "precision_arg": "--fp16",
+        "trtexec_args": [
+          "--minShapes=input0:1x3x256x192,k_inv:1x3x3,t_form_inv:1x3x3,scale_normalized_mean_limb_lengths:1x36,mean_limb_lengths:1x36",
+          "--optShapes=input0:1x3x256x192,k_inv:1x3x3,t_form_inv:1x3x3,scale_normalized_mean_limb_lengths:1x36,mean_limb_lengths:1x36",
+          "--maxShapes=input0:1x3x256x192,k_inv:1x3x3,t_form_inv:1x3x3,scale_normalized_mean_limb_lengths:1x36,mean_limb_lengths:1x36",
+          "--memPoolSize=workspace:4096"
+        ],
+        "plugin_args": []
+      }
+    },
+    "v3dt_tracker_reid": {
+      "staged": "models/tracker_reid/resnet50_market1501.etlt",
+      "raw_sha256": "0e5b7f702ce7e3734e45f27b819866f15f6b083048481d1afae2089136e20201",
+      "bundle_sha256": "81b16d4dbf060e67573b96c92956ad503b90a57e755213d06ddee1c5d2cc2018",
+      "tensor_contract": {
+        "input": {"layout": "NCHW", "shape": [32, 3, 256, 128], "dtype": "FLOAT", "color_format": "RGB"},
+        "output": {"embedding_dimension": 256, "dtype": "FLOAT"}
+      },
+      "maintenance_build": {"builder": "NvMOT", "precision": "fp16", "streams": 3, "width": 1920, "height": 1080, "gpu_id": 0}
+    },
+    "yolo11_seg": {
+      "staged": "models/onnx/yolo11s-seg_cust_fused.onnx",
+      "raw_sha256": "383182fb64ba1a7c01158785f0f96d7e3beaf5c3bfff78f68f0a67a4cf82f039",
+      "bundle_sha256": "5b6a2f63d961dcb2ad170549b40f2a94bcd37944c324e3a75e4a86dc6e61a0b8",
+      "onnx": {
+        "opsets": [{"domain": "ai.onnx", "version": 18}, {"domain": "TRT", "version": 1}],
+        "inputs": [{"name": "images", "dtype": "FLOAT", "shape": ["batch", 3, 640, 640]}],
+        "outputs": [
+          {"name": "output0", "dtype": "FLOAT", "shape": ["batch", "Concatoutput0_dim_1", "Concatoutput0_dim_2"]},
+          {"name": "output1", "dtype": "FLOAT", "shape": ["batch", 32, 160, 160]}
+        ],
+        "external_initializer_count": 0
+      },
+      "maintenance_build": {
+        "precision_arg": "--fp16",
+        "trtexec_args": ["--minShapes=images:3x3x640x640", "--optShapes=images:3x3x640x640", "--maxShapes=images:3x3x640x640"],
+        "plugin_args": []
+      }
+    },
+    "wholebody49_s_masks": {
+      "staged": "models/onnx/deimv2_wholebody49_dinov3_s_masks_640_ds8norm.onnx",
+      "raw_sha256": "c61aa36de92d676918c99ef7cd9f569d55ad5e171040a0ac6b394362da19846d",
+      "bundle_sha256": "f89e237912967b9b5312949ccf14676afb487592fa114af05af0072e7375e1c2",
+      "onnx": {
+        "opsets": [{"domain": "ai.onnx", "version": 17}],
+        "inputs": [{"name": "images", "dtype": "FLOAT", "shape": ["N", 3, 640, 640]}],
+        "outputs": [
+          {"name": "label_xyxy_score", "dtype": "FLOAT", "shape": ["N", 1240, 6]},
+          {"name": "masks", "dtype": "FLOAT", "shape": ["N", 1240, 80, 80]}
+        ],
+        "external_initializer_count": 0
+      },
+      "maintenance_build": {
+        "builder": "noesis.ds9.wholebody49_builder.v1",
+        "builder_source_sha256": "2d751f52fc095bd90e418e048fad8296653875d43b8a18871d5b0a7c7938dc67",
+        "precision": "fp16",
+        "network_mode": "explicit_batch_trt10_default",
+        "builder_optimization_level": 0,
+        "logger_policy": {
+          "minimum_severity": "info",
+          "verbose": "ignored_before_copy",
+          "captured_message_truncation": "fatal",
+          "error_state": "sticky_fatal"
+        },
+        "profile": {
+          "input": "images",
+          "min": [3, 3, 640, 640],
+          "opt": [3, 3, 640, 640],
+          "max": [3, 3, 640, 640]
+        },
+        "memory_pool_limits_bytes": {
+          "workspace": 6442450944,
+          "tactic_dram": 2147483648
+        },
+        "variant": "s_masks",
+        "plugin_args": []
+      }
+    },
+    "wholebody49_x_boxes": {
+      "staged": "models/onnx/deimv2_wholebody49_dinov3_x_boxes_640_ds8norm.onnx",
+      "raw_sha256": "1b2e3b5341dffd84ec4d295b26af1ec32051efc0deb0e99abd65521fb354a285",
+      "bundle_sha256": "f5cca192e8e73c359a7d40346c428dd0f9433d8bd0c6b6a54945acae6425a6ea",
+      "onnx": {
+        "opsets": [{"domain": "ai.onnx", "version": 17}],
+        "inputs": [{"name": "images", "dtype": "FLOAT", "shape": ["N", 3, 640, 640]}],
+        "outputs": [{"name": "label_xyxy_score", "dtype": "FLOAT", "shape": ["N", 1240, 6]}],
+        "external_initializer_count": 0
+      },
+      "maintenance_build": {
+        "builder": "noesis.ds9.wholebody49_builder.v1",
+        "builder_source_sha256": "2d751f52fc095bd90e418e048fad8296653875d43b8a18871d5b0a7c7938dc67",
+        "precision": "fp16",
+        "network_mode": "explicit_batch_trt10_default",
+        "builder_optimization_level": 3,
+        "logger_policy": {
+          "minimum_severity": "info",
+          "verbose": "ignored_before_copy",
+          "captured_message_truncation": "fatal",
+          "error_state": "sticky_fatal"
+        },
+        "profile": {
+          "input": "images",
+          "min": [3, 3, 640, 640],
+          "opt": [3, 3, 640, 640],
+          "max": [3, 3, 640, 640]
+        },
+        "memory_pool_limits_bytes": {
+          "workspace": 4294967296,
+          "tactic_dram": 2147483648
+        },
+        "variant": "x_boxes",
+        "plugin_args": []
+      }
+    }
+  }
+}

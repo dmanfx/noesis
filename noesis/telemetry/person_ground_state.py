@@ -15,7 +15,7 @@ from __future__ import annotations
 import math
 from collections import deque
 from dataclasses import dataclass, field
-from typing import Any, Deque, Dict, Hashable, Iterable, List, Mapping, Optional, Sequence, Tuple
+from typing import Any, Deque, Dict, Hashable, List, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -62,6 +62,7 @@ class HumanGroundConfig:
 
     # Phase 2 — source hysteresis
     source_hold_frames: int = 10
+    source_replacement_frames: int = 3
     source_switch_min_score_gain: float = 0.20
 
     # Phase 3 — posture
@@ -69,6 +70,11 @@ class HumanGroundConfig:
     lie_bbox_aspect: float = 1.35
     bent_leg_vertical_ratio: float = 0.58
     kpt_conf_threshold: float = 0.35
+    occlusion_exit_frames: int = 3
+    occlusion_upright_memory_s: float = 15.0
+    occlusion_bbox_height_ratio: float = 0.76
+    occlusion_bbox_shoulder_ratio: float = 0.78
+    upright_reference_alpha: float = 0.18
 
     # Phase 4 — human CV filter
     max_speed_mps: float = 4.0
@@ -86,6 +92,8 @@ class HumanGroundConfig:
     alpha_good: float = 0.45
     alpha_weak: float = 0.20
     beta_scale: float = 0.22
+    reacquire_samples: int = 3
+    reacquire_max_gap_s: float = 0.75
 
     # Phase 6 — path simplification
     path_min_step_m: float = 0.05
@@ -102,11 +110,33 @@ class HumanGroundConfig:
         object.__setattr__(self, "idle_deadzone_sit_m", max(0.0, float(self.idle_deadzone_sit_m)))
         object.__setattr__(self, "residual_window", max(3, int(self.residual_window)))
         object.__setattr__(self, "source_hold_frames", max(1, int(self.source_hold_frames)))
+        object.__setattr__(self, "source_replacement_frames", max(1, int(self.source_replacement_frames)))
         object.__setattr__(self, "source_switch_min_score_gain", max(0.0, float(self.source_switch_min_score_gain)))
         object.__setattr__(self, "sit_bbox_height_ratio", float(min(1.0, max(0.05, float(self.sit_bbox_height_ratio)))))
         object.__setattr__(self, "lie_bbox_aspect", max(0.5, float(self.lie_bbox_aspect)))
         object.__setattr__(self, "bent_leg_vertical_ratio", float(min(1.0, max(0.05, float(self.bent_leg_vertical_ratio)))))
         object.__setattr__(self, "kpt_conf_threshold", float(min(1.0, max(0.0, float(self.kpt_conf_threshold)))))
+        object.__setattr__(self, "occlusion_exit_frames", max(1, int(self.occlusion_exit_frames)))
+        object.__setattr__(
+            self,
+            "occlusion_upright_memory_s",
+            max(0.0, float(self.occlusion_upright_memory_s)),
+        )
+        object.__setattr__(
+            self,
+            "occlusion_bbox_height_ratio",
+            float(min(1.0, max(0.05, float(self.occlusion_bbox_height_ratio)))),
+        )
+        object.__setattr__(
+            self,
+            "occlusion_bbox_shoulder_ratio",
+            float(min(1.0, max(0.05, float(self.occlusion_bbox_shoulder_ratio)))),
+        )
+        object.__setattr__(
+            self,
+            "upright_reference_alpha",
+            float(min(1.0, max(0.0, float(self.upright_reference_alpha)))),
+        )
         object.__setattr__(self, "max_speed_mps", max(0.0, float(self.max_speed_mps)))
         object.__setattr__(self, "max_accel_mps2", max(0.0, float(self.max_accel_mps2)))
         object.__setattr__(self, "max_jump_m", max(0.0, float(self.max_jump_m)))
@@ -122,6 +152,8 @@ class HumanGroundConfig:
         object.__setattr__(self, "alpha_good", float(min(1.0, max(0.0, float(self.alpha_good)))))
         object.__setattr__(self, "alpha_weak", float(min(1.0, max(0.0, float(self.alpha_weak)))))
         object.__setattr__(self, "beta_scale", float(min(1.0, max(0.0, float(self.beta_scale)))))
+        object.__setattr__(self, "reacquire_samples", max(2, int(self.reacquire_samples)))
+        object.__setattr__(self, "reacquire_max_gap_s", max(0.0, float(self.reacquire_max_gap_s)))
         object.__setattr__(self, "path_min_step_m", max(0.0, float(self.path_min_step_m)))
         object.__setattr__(self, "path_simplify_epsilon_m", max(0.0, float(self.path_simplify_epsilon_m)))
         object.__setattr__(self, "path_max_points", max(2, int(self.path_max_points)))
@@ -157,6 +189,22 @@ class PoseAnchorCandidate:
     score: float = 1.0
 
 
+@dataclass(frozen=True)
+class LowerBodyOcclusionAssessment:
+    """Current lower-body visibility state for one tracked person."""
+
+    active: bool
+    level: str = "none"
+    confidence: float = 0.0
+    reason: Optional[str] = None
+    visible_ankles: int = 0
+    visible_knees: int = 0
+    visible_hips: int = 0
+    visible_shoulders: int = 0
+    bbox_height_ratio: Optional[float] = None
+    bbox_shoulder_ratio: Optional[float] = None
+
+
 @dataclass
 class PersonGroundState:
     """Per-track ground state shared by world estimation, BEV, and OSD trails."""
@@ -180,18 +228,58 @@ class PersonGroundState:
     locked_world: Optional[Tuple[float, float]] = None
     residual_m: Deque[float] = field(default_factory=lambda: deque(maxlen=12))
     image_foot_history: Deque[Tuple[float, float, float]] = field(default_factory=lambda: deque(maxlen=12))
+    last_full_body_ts: float = -1.0
+    last_non_upright_ts: float = -1.0
+    upright_bbox_height_px: Optional[float] = None
+    upright_bbox_shoulder_ratio: Optional[float] = None
+    last_bbox_height_px: Optional[float] = None
+    last_bbox_ts: float = -1.0
+    lower_body_occluded: bool = False
+    lower_body_occlusion_level: str = "none"
+    lower_body_occlusion_confidence: float = 0.0
+    lower_body_occlusion_reason: Optional[str] = None
+    lower_body_clear_frames: int = 0
+    # Learned calibrated heights for visible upper-body reference points.
+    # Values are fractions of the track's standing height and stay process-local.
+    body_plane_height_fractions: Dict[str, float] = field(default_factory=dict)
 
     # Phase 2
     sticky_source: Optional[str] = None
     sticky_source_frames: int = 0
     sticky_source_score: float = 0.0
     source_switch_count: int = 0
+    # A lower-scoring source must still be able to take over when the current
+    # sticky source has disappeared.  Track a *consecutive* replacement streak
+    # instead of treating rejected candidates as more observations of the old
+    # source (which could otherwise pin a vanished pose source forever).
+    source_candidate: Optional[str] = None
+    source_candidate_frames: int = 0
 
     # Phase 5 public mirrors
     image_foot_u: Optional[float] = None
     image_foot_v: Optional[float] = None
     trail_append_allowed: bool = True
     idle_jitter_m: float = 0.0
+
+    # Physical-admission diagnostics.  These describe the current measurement,
+    # not the filtered output, and are intentionally shared by DS8 and DS9.
+    measurement_accepted: bool = True
+    measurement_rejection_reason: Optional[str] = None
+    measurement_innovation_m: float = 0.0
+    measurement_allowed_m: float = 0.0
+    reacquire_candidate_x: Optional[float] = None
+    reacquire_candidate_z: Optional[float] = None
+    reacquire_candidate_ts: float = -1.0
+    reacquire_count: int = 0
+    reacquired: bool = False
+    trail_break_required: bool = False
+    trail_segment_id: int = 0
+
+    # A live-source change is provisional until the physical measurement gate
+    # accepts the corresponding point.  These fields never leave the process.
+    pending_source_previous: Optional[
+        Tuple[Optional[str], int, float, int, Optional[str], int]
+    ] = None
 
     def as_public_fields(self) -> Dict[str, Any]:
         return {
@@ -201,7 +289,55 @@ class PersonGroundState:
             "idle_jitter_m": float(self.idle_jitter_m) if math.isfinite(float(self.idle_jitter_m)) else None,
             "source_switch_count": int(self.source_switch_count),
             "sticky_world_source": str(self.sticky_source) if self.sticky_source else None,
+            "lower_body_occluded": bool(self.lower_body_occluded),
+            "lower_body_occlusion_level": str(self.lower_body_occlusion_level),
+            "lower_body_occlusion_confidence": (
+                float(self.lower_body_occlusion_confidence)
+                if math.isfinite(float(self.lower_body_occlusion_confidence))
+                else None
+            ),
+            "lower_body_occlusion_reason": (
+                str(self.lower_body_occlusion_reason)
+                if self.lower_body_occlusion_reason
+                else None
+            ),
+            "world_measurement_accepted": bool(self.measurement_accepted),
+            "world_rejection_reason": (
+                str(self.measurement_rejection_reason)
+                if self.measurement_rejection_reason
+                else None
+            ),
+            "world_innovation_m": (
+                float(self.measurement_innovation_m)
+                if math.isfinite(float(self.measurement_innovation_m))
+                else None
+            ),
+            "world_innovation_limit_m": (
+                float(self.measurement_allowed_m)
+                if math.isfinite(float(self.measurement_allowed_m))
+                else None
+            ),
+            "world_reacquire_count": int(self.reacquire_count),
+            "world_reacquired": bool(self.reacquired),
+            "trail_break_required": bool(self.trail_break_required),
+            "trail_segment_id": int(self.trail_segment_id),
         }
+
+
+def _clear_reacquire_candidate(state: PersonGroundState) -> None:
+    state.reacquire_candidate_x = None
+    state.reacquire_candidate_z = None
+    state.reacquire_candidate_ts = -1.0
+    state.reacquire_count = 0
+
+
+def _begin_filter_measurement(state: PersonGroundState) -> None:
+    state.measurement_accepted = True
+    state.measurement_rejection_reason = None
+    state.measurement_innovation_m = 0.0
+    state.measurement_allowed_m = 0.0
+    state.reacquired = False
+    state.trail_break_required = False
 
 
 def _finite(value: Any) -> Optional[float]:
@@ -249,6 +385,295 @@ def _mid_xy(
     return (float(a[0]) + float(b[0])) * 0.5, (float(a[1]) + float(b[1])) * 0.5
 
 
+def _bbox_dimensions(
+    bbox: Optional[Sequence[float]],
+) -> Tuple[Optional[float], Optional[float]]:
+    if bbox is None or len(bbox) < 4:
+        return None, None
+    try:
+        width = float(bbox[2])
+        height = float(bbox[3])
+    except Exception:
+        return None, None
+    if not (math.isfinite(width) and math.isfinite(height)):
+        return None, None
+    if width <= 1.0 or height <= 1.0:
+        return None, None
+    return float(width), float(height)
+
+
+def _visible_pose_count(
+    kpts_abs: Optional[np.ndarray],
+    names: Sequence[str],
+    *,
+    conf_threshold: float,
+) -> int:
+    if (
+        kpts_abs is None
+        or not isinstance(kpts_abs, np.ndarray)
+        or kpts_abs.shape[0] < 17
+    ):
+        return 0
+    return sum(
+        pose_point(kpts_abs, name, conf_threshold=conf_threshold) is not None
+        for name in names
+    )
+
+
+def _ema_reference(
+    current: Optional[float],
+    measurement: Optional[float],
+    *,
+    alpha: float,
+) -> Optional[float]:
+    if measurement is None or not math.isfinite(float(measurement)):
+        return current
+    value = float(measurement)
+    if value <= 0.0:
+        return current
+    if current is None or not math.isfinite(float(current)) or float(current) <= 0.0:
+        return value
+    return float(current) + float(alpha) * (value - float(current))
+
+
+def assess_lower_body_occlusion(
+    state: PersonGroundState,
+    *,
+    kpts_abs: Optional[np.ndarray],
+    bbox: Optional[Sequence[float]],
+    posture: Posture,
+    now_ts: float,
+    config: HumanGroundConfig,
+) -> LowerBodyOcclusionAssessment:
+    """Classify standing-person occlusion from feet through waist/hips.
+
+    The state is intentionally anchored to previously observed upright anatomy.
+    A short detector box or missing lower keypoints can therefore demote a
+    syntactically valid waist/counter-edge anchor before it reaches world fusion.
+    Clear lower-body evidence is required for several frames before direct
+    ankle/depth authority resumes, which prevents one-frame pose hallucinations
+    from snapping a path back and forth.
+    """
+
+    now_ts = float(now_ts)
+    threshold = float(config.kpt_conf_threshold)
+    visible_shoulders = _visible_pose_count(
+        kpts_abs,
+        ("left_shoulder", "right_shoulder"),
+        conf_threshold=threshold,
+    )
+    visible_hips = _visible_pose_count(
+        kpts_abs,
+        ("left_hip", "right_hip"),
+        conf_threshold=threshold,
+    )
+    visible_knees = _visible_pose_count(
+        kpts_abs,
+        ("left_knee", "right_knee"),
+        conf_threshold=threshold,
+    )
+    visible_ankles = _visible_pose_count(
+        kpts_abs,
+        ("left_ankle", "right_ankle"),
+        conf_threshold=threshold,
+    )
+
+    _bbox_width, bbox_height = _bbox_dimensions(bbox)
+    previous_bbox_height = state.last_bbox_height_px
+    bbox_height_ratio: Optional[float] = None
+    if (
+        bbox_height is not None
+        and state.upright_bbox_height_px is not None
+        and float(state.upright_bbox_height_px) > 1e-6
+    ):
+        bbox_height_ratio = float(bbox_height) / float(state.upright_bbox_height_px)
+
+    shoulder_width: Optional[float] = None
+    if (
+        kpts_abs is not None
+        and isinstance(kpts_abs, np.ndarray)
+        and kpts_abs.shape[0] >= 17
+    ):
+        left_shoulder = pose_point(
+            kpts_abs,
+            "left_shoulder",
+            conf_threshold=threshold,
+        )
+        right_shoulder = pose_point(
+            kpts_abs,
+            "right_shoulder",
+            conf_threshold=threshold,
+        )
+        if left_shoulder is not None and right_shoulder is not None:
+            shoulder_width = math.hypot(
+                float(right_shoulder[0]) - float(left_shoulder[0]),
+                float(right_shoulder[1]) - float(left_shoulder[1]),
+            )
+            if not math.isfinite(shoulder_width) or shoulder_width <= 3.0:
+                shoulder_width = None
+
+    bbox_shoulder_ratio: Optional[float] = None
+    current_bbox_shoulder_ratio: Optional[float] = None
+    if bbox_height is not None and shoulder_width is not None:
+        current_bbox_shoulder_ratio = float(bbox_height) / float(shoulder_width)
+        if (
+            state.upright_bbox_shoulder_ratio is not None
+            and float(state.upright_bbox_shoulder_ratio) > 1e-6
+        ):
+            bbox_shoulder_ratio = (
+                float(current_bbox_shoulder_ratio)
+                / float(state.upright_bbox_shoulder_ratio)
+            )
+
+    explicit_non_upright = bool(
+        str(posture or "unknown") in ("sitting", "lying")
+        or legs_are_bent(kpts_abs, config=config)
+    )
+    if explicit_non_upright:
+        state.last_non_upright_ts = now_ts
+
+    full_body_visible = bool(
+        visible_shoulders >= 1
+        and visible_hips >= 1
+        and visible_knees >= 1
+        and visible_ankles >= 1
+        and not explicit_non_upright
+        and str(posture or "unknown") not in ("sitting", "lying")
+    )
+    if full_body_visible:
+        state.last_full_body_ts = now_ts
+        alpha = float(config.upright_reference_alpha)
+        state.upright_bbox_height_px = _ema_reference(
+            state.upright_bbox_height_px,
+            bbox_height,
+            alpha=alpha,
+        )
+        state.upright_bbox_shoulder_ratio = _ema_reference(
+            state.upright_bbox_shoulder_ratio,
+            current_bbox_shoulder_ratio,
+            alpha=alpha,
+        )
+
+    recent_upright = bool(
+        state.height_ref_scene is not None
+        and (
+            state.lower_body_occluded
+            or (
+                state.last_full_body_ts >= 0.0
+                and (
+                    float(config.occlusion_upright_memory_s) <= 0.0
+                    or (now_ts - float(state.last_full_body_ts))
+                    <= float(config.occlusion_upright_memory_s)
+                )
+            )
+        )
+        and float(state.last_full_body_ts) >= float(state.last_non_upright_ts)
+    )
+
+    collapsed_by_scale = bool(
+        bbox_shoulder_ratio is not None
+        and bbox_shoulder_ratio < float(config.occlusion_bbox_shoulder_ratio)
+    )
+    collapsed_by_height = bool(
+        bbox_height_ratio is not None
+        and bbox_height_ratio < float(config.occlusion_bbox_height_ratio)
+    )
+    sudden_height_collapse = bool(
+        bbox_height is not None
+        and previous_bbox_height is not None
+        and float(previous_bbox_height) > 1e-6
+        and (float(bbox_height) / float(previous_bbox_height))
+        < float(config.occlusion_bbox_height_ratio)
+    )
+    collapsed_bbox = bool(
+        collapsed_by_scale or collapsed_by_height or sudden_height_collapse
+    )
+
+    detected_level = "none"
+    confidence = 0.0
+    reasons: List[str] = []
+    upper_body_visible = visible_shoulders >= 1
+    if recent_upright and not explicit_non_upright:
+        if upper_body_visible and visible_hips == 0 and visible_knees == 0:
+            detected_level = "waist_hips"
+            confidence = 0.96 if visible_ankles == 0 else 0.88
+            reasons.append("hips_knees_missing")
+        elif (
+            upper_body_visible
+            and visible_hips == 1
+            and visible_knees == 0
+            and visible_ankles == 0
+        ):
+            detected_level = "waist_hips"
+            confidence = 0.92
+            reasons.append("partial_hips_only")
+        elif visible_hips >= 1 and visible_knees == 0 and visible_ankles == 0:
+            detected_level = "knees"
+            confidence = 0.89
+            reasons.append("knees_ankles_missing")
+        elif visible_hips >= 1 and visible_knees >= 1 and visible_ankles == 0:
+            detected_level = "feet_ankles"
+            confidence = 0.82
+            reasons.append("ankles_missing")
+        elif kpts_abs is None and collapsed_bbox:
+            detected_level = "waist_hips"
+            confidence = 0.84
+            reasons.append("pose_missing_bbox_collapsed")
+        elif collapsed_bbox:
+            # Covers pose hallucinations on the counter edge: lower keypoints may
+            # exist numerically even though the tracked silhouette has collapsed.
+            detected_level = "waist_hips"
+            confidence = 0.88
+            reasons.append("upright_bbox_collapsed")
+
+    if collapsed_by_scale:
+        reasons.append("shoulder_scaled_bbox_collapse")
+    if collapsed_by_height:
+        reasons.append("upright_bbox_height_collapse")
+    if sudden_height_collapse:
+        reasons.append("sudden_bbox_height_collapse")
+
+    detected = detected_level != "none"
+    if detected:
+        state.lower_body_occluded = True
+        state.lower_body_occlusion_level = str(detected_level)
+        state.lower_body_occlusion_confidence = float(confidence)
+        state.lower_body_occlusion_reason = ",".join(dict.fromkeys(reasons))
+        state.lower_body_clear_frames = 0
+    elif state.lower_body_occluded and explicit_non_upright:
+        state.lower_body_occluded = False
+        state.lower_body_occlusion_level = "none"
+        state.lower_body_occlusion_confidence = 0.0
+        state.lower_body_occlusion_reason = None
+        state.lower_body_clear_frames = 0
+    elif state.lower_body_occluded:
+        state.lower_body_clear_frames = int(state.lower_body_clear_frames) + 1
+        if int(state.lower_body_clear_frames) >= int(config.occlusion_exit_frames):
+            state.lower_body_occluded = False
+            state.lower_body_occlusion_level = "none"
+            state.lower_body_occlusion_confidence = 0.0
+            state.lower_body_occlusion_reason = None
+            state.lower_body_clear_frames = 0
+    else:
+        state.lower_body_clear_frames = 0
+
+    state.last_bbox_height_px = bbox_height
+    state.last_bbox_ts = now_ts
+
+    return LowerBodyOcclusionAssessment(
+        active=bool(state.lower_body_occluded),
+        level=str(state.lower_body_occlusion_level),
+        confidence=float(state.lower_body_occlusion_confidence),
+        reason=state.lower_body_occlusion_reason,
+        visible_ankles=int(visible_ankles),
+        visible_knees=int(visible_knees),
+        visible_hips=int(visible_hips),
+        visible_shoulders=int(visible_shoulders),
+        bbox_height_ratio=bbox_height_ratio,
+        bbox_shoulder_ratio=bbox_shoulder_ratio,
+    )
+
+
 def classify_posture(
     *,
     kpts_abs: Optional[np.ndarray],
@@ -292,14 +717,9 @@ def classify_posture(
         right_shoulder = pose_point(kpts_abs, "right_shoulder", conf_threshold=thr)
         left_ankle = pose_point(kpts_abs, "left_ankle", conf_threshold=thr)
         right_ankle = pose_point(kpts_abs, "right_ankle", conf_threshold=thr)
-        left_knee = pose_point(kpts_abs, "left_knee", conf_threshold=thr)
-        right_knee = pose_point(kpts_abs, "right_knee", conf_threshold=thr)
-
         hip = _mid_xy(left_hip, right_hip)
         shoulder = _mid_xy(left_shoulder, right_shoulder)
         ankle = _mid_xy(left_ankle, right_ankle)
-        knee = _mid_xy(left_knee, right_knee)
-
         if shoulder is not None and hip is not None and ankle is not None:
             torso_v = abs(float(hip[1]) - float(shoulder[1]))
             body_v = abs(float(ankle[1]) - float(shoulder[1]))
@@ -313,16 +733,30 @@ def classify_posture(
             if legs_are_bent(kpts_abs, config=config):
                 return "sitting"
 
-        if bbox_w is not None and bbox_h is not None and bbox_h > 1.0:
-            if float(bbox_w) / float(bbox_h) >= float(config.lie_bbox_aspect) * 0.92:
+        if (
+            height_ref_scene is None
+            and bbox_w is not None
+            and bbox_h is not None
+            and bbox_h > 1.0
+        ):
+            if (
+                float(bbox_w) / float(bbox_h)
+                >= float(config.lie_bbox_aspect) * 0.92
+            ):
                 return "lying"
 
     if bbox_w is not None and bbox_h is not None and bbox_h > 1.0:
         aspect = float(bbox_w) / float(bbox_h)
-        # Tall thin boxes are standing; short boxes without pose → sitting guess.
+        # Tall thin boxes are standing. Once an upright height lock exists, a
+        # short detector box is ambiguous with lower-body occlusion and must not
+        # become a bbox-only sitting decision.
         if aspect < 0.55 and bbox_h >= 90.0:
             return "standing"
-        if aspect >= 0.85 and aspect < float(config.lie_bbox_aspect):
+        if (
+            height_ref_scene is None
+            and aspect >= 0.85
+            and aspect < float(config.lie_bbox_aspect)
+        ):
             return "sitting"
 
     return "unknown"
@@ -524,8 +958,10 @@ def source_score(
         "pose_hip_floor": 0.88,
         "pose_body_floor": 0.84,
         "pose_depth_fused": 1.05,
+        "pose_depth_only": 1.05,
         "pose_floor_only": 0.95,
         "person_anchor_depth_fused": 0.92,
+        "person_anchor_depth_only": 0.92,
         "person_anchor_floor_only": 0.78,
         "person_mask_floor": 0.80,
         "pose_leg_floor": 0.55,
@@ -556,40 +992,118 @@ def apply_source_hysteresis(
     candidate_score: float,
     config: HumanGroundConfig,
 ) -> Tuple[str, bool]:
-    """Return (accepted_source, switched). Sticky unless score gain is large."""
+    """Return ``(accepted_source, switched)`` with bounded source failover.
+
+    A stronger source may replace the current source immediately.  A weaker
+    source must be observed for ``source_replacement_frames`` consecutive
+    updates.  Replacement confirmation is intentionally shorter than the
+    normal sticky-source hold: at the 15 Hz publication cadence the default
+    completes inside the producer's 0.40 second anchor-hold window, preventing
+    a valid replacement from becoming a visible track dropout.
+    This keeps single-frame pose/person-anchor churn out of the published path
+    without allowing a source that is no longer present to suppress valid
+    geometry indefinitely.
+    """
     candidate_source = str(candidate_source)
     candidate_score = float(candidate_score)
     if state.sticky_source is None:
         state.sticky_source = candidate_source
         state.sticky_source_frames = 1
         state.sticky_source_score = candidate_score
+        state.source_candidate = None
+        state.source_candidate_frames = 0
         return candidate_source, False
 
     if candidate_source == state.sticky_source:
         state.sticky_source_frames = int(state.sticky_source_frames) + 1
         state.sticky_source_score = max(float(state.sticky_source_score), candidate_score)
+        state.source_candidate = None
+        state.source_candidate_frames = 0
         return candidate_source, False
 
-    hold = int(config.source_hold_frames)
+    replacement_frames = int(config.source_replacement_frames)
     gain = candidate_score - float(state.sticky_source_score)
-    allow_switch = (
-        int(state.sticky_source_frames) >= hold
-        and gain >= float(config.source_switch_min_score_gain)
-    ) or gain >= (float(config.source_switch_min_score_gain) + 0.35)
+    if state.source_candidate == candidate_source:
+        state.source_candidate_frames = int(state.source_candidate_frames) + 1
+    else:
+        state.source_candidate = candidate_source
+        state.source_candidate_frames = 1
+
+    sustained_replacement = int(state.source_candidate_frames) >= replacement_frames
+    urgent_score_gain = gain >= (float(config.source_switch_min_score_gain) + 0.35)
+    allow_switch = bool(sustained_replacement or urgent_score_gain)
 
     # Always allow recovery from hold/gravity when a real observation appears.
     if state.sticky_source in ("anchor_hold", "gravity_drop") and candidate_score >= 0.70:
         allow_switch = True
 
     if not allow_switch:
-        state.sticky_source_frames = int(state.sticky_source_frames) + 1
         return str(state.sticky_source), False
 
     state.sticky_source = candidate_source
     state.sticky_source_frames = 1
     state.sticky_source_score = candidate_score
     state.source_switch_count = int(state.source_switch_count) + 1
+    state.source_candidate = None
+    state.source_candidate_frames = 0
     return candidate_source, True
+
+
+def begin_source_admission(
+    state: PersonGroundState,
+    *,
+    candidate_source: str,
+    candidate_score: float,
+    config: HumanGroundConfig,
+    authoritative: bool = False,
+) -> bool:
+    """Evaluate source hysteresis while deferring a source switch until physics accepts."""
+    previous = (
+        state.sticky_source,
+        int(state.sticky_source_frames),
+        float(state.sticky_source_score),
+        int(state.source_switch_count),
+        state.source_candidate,
+        int(state.source_candidate_frames),
+    )
+    if authoritative:
+        source_changed = str(state.sticky_source) != str(candidate_source)
+        state.sticky_source = str(candidate_source)
+        state.sticky_source_frames = 1
+        state.sticky_source_score = float(candidate_score)
+        state.source_candidate = None
+        state.source_candidate_frames = 0
+        if source_changed and previous[0] is not None:
+            state.source_switch_count = int(state.source_switch_count) + 1
+        accepted_source = str(candidate_source)
+    else:
+        accepted_source, _switched = apply_source_hysteresis(
+            state,
+            candidate_source=str(candidate_source),
+            candidate_score=float(candidate_score),
+            config=config,
+        )
+    if str(accepted_source) != str(candidate_source):
+        state.pending_source_previous = None
+        return False
+    state.pending_source_previous = previous
+    return True
+
+
+def complete_source_admission(state: PersonGroundState, *, measurement_accepted: bool) -> None:
+    """Commit an admitted source, or roll it back when the physical gate rejects."""
+    previous = state.pending_source_previous
+    state.pending_source_previous = None
+    if measurement_accepted or previous is None:
+        return
+    (
+        state.sticky_source,
+        state.sticky_source_frames,
+        state.sticky_source_score,
+        state.source_switch_count,
+        state.source_candidate,
+        state.source_candidate_frames,
+    ) = previous
 
 
 def _clamp_speed(vx: float, vz: float, max_speed: float) -> Tuple[float, float]:
@@ -610,11 +1124,18 @@ def update_human_cv_filter(
     config: HumanGroundConfig,
     force_accept: bool = False,
 ) -> np.ndarray:
-    """Constant-velocity XZ filter with adaptive noise and idle deadzone."""
+    """Constant-velocity XZ filter with explicit physical admission.
+
+    Impossible observations are quarantined instead of clipped into plausible-
+    looking motion.  An existing tracker lifecycle may relocate only after a
+    bounded run of mutually consistent observations, at which point callers are
+    told to start a new trail segment.
+    """
     mx = float(measurement[0])
     mz = float(measurement[2])
     now_ts = float(now_ts)
     floor_y = float(floor_y)
+    _begin_filter_measurement(state)
 
     if state.world_x is None or state.world_z is None or float(state.filtered_ts) < 0.0:
         state.world_x = mx
@@ -622,40 +1143,83 @@ def update_human_cv_filter(
         state.vel_world_x = 0.0
         state.vel_world_z = 0.0
         state.filtered_ts = now_ts
+        _clear_reacquire_candidate(state)
         return np.array([mx, floor_y, mz], dtype=np.float64)
 
     dt = now_ts - float(state.filtered_ts)
     if dt <= 0.0:
+        state.measurement_accepted = False
+        state.measurement_rejection_reason = "non_monotonic_timestamp"
+        state.trail_append_allowed = False
         return np.array([float(state.world_x), floor_y, float(state.world_z)], dtype=np.float64)
 
-    if float(config.reset_after_s) > 0.0 and dt > float(config.reset_after_s):
-        state.world_x = mx
-        state.world_z = mz
-        state.vel_world_x = 0.0
-        state.vel_world_z = 0.0
-        state.filtered_ts = now_ts
-        state.motion_mode = "unknown"
-        state.locked_world = None
-        state.exit_motion_frames = 0
-        return np.array([mx, floor_y, mz], dtype=np.float64)
-
     # Predict with constant velocity.
-    pred_x = float(state.world_x) + float(state.vel_world_x) * dt
-    pred_z = float(state.world_z) + float(state.vel_world_z) * dt
+    gate_dt = float(dt)
+    if float(config.reset_after_s) > 0.0:
+        gate_dt = min(gate_dt, float(config.reset_after_s))
+    pred_x = float(state.world_x) + float(state.vel_world_x) * gate_dt
+    pred_z = float(state.world_z) + float(state.vel_world_z) * gate_dt
 
     innov_x = mx - pred_x
     innov_z = mz - pred_z
     innov_dist = math.hypot(innov_x, innov_z)
 
     # Physical gate (speed * dt + jump slack).
-    allowed = float(config.max_jump_m) + float(config.max_speed_mps) * dt
+    allowed = float(config.max_jump_m) + float(config.max_speed_mps) * gate_dt
+    state.measurement_innovation_m = float(innov_dist)
+    state.measurement_allowed_m = float(allowed)
     if (not force_accept) and allowed > 0.0 and innov_dist > allowed and innov_dist > 1e-9:
-        scale = allowed / innov_dist
-        innov_x *= scale
-        innov_z *= scale
-        innov_dist = allowed
-        mx = pred_x + innov_x
-        mz = pred_z + innov_z
+        candidate_consistent = False
+        candidate_dt = now_ts - float(state.reacquire_candidate_ts)
+        if (
+            state.reacquire_candidate_x is not None
+            and state.reacquire_candidate_z is not None
+            and candidate_dt > 0.0
+            and candidate_dt <= float(config.reacquire_max_gap_s)
+        ):
+            candidate_step = math.hypot(
+                mx - float(state.reacquire_candidate_x),
+                mz - float(state.reacquire_candidate_z),
+            )
+            candidate_allowed = (
+                float(config.max_jump_m)
+                + float(config.max_speed_mps) * candidate_dt
+            )
+            candidate_consistent = candidate_step <= candidate_allowed
+        state.reacquire_count = (
+            int(state.reacquire_count) + 1 if candidate_consistent else 1
+        )
+        state.reacquire_candidate_x = float(mx)
+        state.reacquire_candidate_z = float(mz)
+        state.reacquire_candidate_ts = float(now_ts)
+
+        if int(state.reacquire_count) >= int(config.reacquire_samples):
+            state.world_x = float(mx)
+            state.world_z = float(mz)
+            state.vel_world_x = 0.0
+            state.vel_world_z = 0.0
+            state.filtered_ts = float(now_ts)
+            state.motion_mode = "unknown"
+            state.locked_world = None
+            state.exit_motion_frames = 0
+            state.reacquired = True
+            state.trail_break_required = True
+            state.trail_segment_id = int(state.trail_segment_id) + 1
+            _clear_reacquire_candidate(state)
+            return np.array([mx, floor_y, mz], dtype=np.float64)
+
+        state.measurement_accepted = False
+        state.measurement_rejection_reason = "physical_innovation_exceeded"
+        state.vel_world_x = 0.0
+        state.vel_world_z = 0.0
+        state.filtered_ts = float(now_ts)
+        state.trail_append_allowed = False
+        return np.array(
+            [float(state.world_x), floor_y, float(state.world_z)],
+            dtype=np.float64,
+        )
+
+    _clear_reacquire_candidate(state)
 
     posture = str(state.posture or "unknown")
     mode = str(state.motion_mode or "unknown")
@@ -1018,13 +1582,17 @@ class PersonGroundStateStore:
 __all__ = [
     "POSE_KPT_INDEX",
     "HumanGroundConfig",
+    "LowerBodyOcclusionAssessment",
     "PoseAnchorCandidate",
     "PersonGroundState",
     "PersonGroundStateStore",
     "apply_source_hysteresis",
+    "assess_lower_body_occlusion",
+    "begin_source_admission",
     "classify_posture",
     "commit_image_path_point",
     "commit_path_point",
+    "complete_source_admission",
     "estimate_ankle_from_leg",
     "legs_are_bent",
     "pose_point",

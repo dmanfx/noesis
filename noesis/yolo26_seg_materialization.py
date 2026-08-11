@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from pathlib import Path
 from typing import Dict, Iterable
 
@@ -19,7 +20,8 @@ def resolve_yolo26_seg_assets(size: str) -> Dict[str, Path]:
 
 def _default_preproc_output_path(size: str, batch_size: int) -> Path:
     size_norm = str(size or "").strip().lower()
-    return (REPO_ROOT / "build" / f"config_preproc_yolo26_seg_{size_norm}_b{int(batch_size)}.ini").resolve()
+    build_dir = Path(os.environ.get("NOESIS_BUILD_DIR", REPO_ROOT / "build")).expanduser().resolve()
+    return (build_dir / f"config_preproc_yolo26_seg_{size_norm}_b{int(batch_size)}.ini").resolve()
 
 
 def materialize_yolo26_seg_configs(
@@ -32,6 +34,7 @@ def materialize_yolo26_seg_configs(
     engine_path: Path | None = None,
     pgie_output_path: Path | None = None,
     preprocess_output_path: Path | None = None,
+    include_model_source: bool = True,
 ) -> Dict[str, Path]:
     if int(batch_size) <= 0:
         raise ValueError(f"YOLO26 batch_size must be positive (got: {batch_size})")
@@ -52,6 +55,7 @@ def materialize_yolo26_seg_configs(
         batch_size=int(batch_size),
         onnx_path=resolved_onnx,
         engine_path=resolved_engine,
+        include_model_source=include_model_source,
         logger=logger,
     ).resolve()
     preprocess_config_path = _materialize_yolo26_preproc_config(

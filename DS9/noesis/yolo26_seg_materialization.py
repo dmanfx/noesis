@@ -34,6 +34,7 @@ def materialize_yolo26_seg_configs(
     engine_path: Path | None = None,
     pgie_output_path: Path | None = None,
     preprocess_output_path: Path | None = None,
+    include_model_source: bool = True,
 ) -> Dict[str, Path]:
     if int(batch_size) <= 0:
         raise ValueError(f"YOLO26 batch_size must be positive (got: {batch_size})")
@@ -54,6 +55,7 @@ def materialize_yolo26_seg_configs(
         batch_size=int(batch_size),
         onnx_path=resolved_onnx,
         engine_path=resolved_engine,
+        include_model_source=include_model_source,
         logger=logger,
     ).resolve()
     preprocess_config_path = _materialize_yolo26_preproc_config(

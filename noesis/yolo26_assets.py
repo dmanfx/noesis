@@ -2,10 +2,15 @@ from __future__ import annotations
 
 import re
 from pathlib import Path
+import os
 from typing import Dict, Iterable
 import logging
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
+
+
+def _build_dir() -> Path:
+    return Path(os.environ.get("NOESIS_BUILD_DIR", REPO_ROOT / "build")).expanduser().resolve()
 
 
 def resolve_yolo26_assets(size: str) -> Dict[str, Path]:
@@ -19,8 +24,8 @@ def resolve_yolo26_assets(size: str) -> Dict[str, Path]:
         "engine": (REPO_ROOT / "models" / "engines" / f"yolo26{size_norm}-seg_fused_b3_fp16.engine").resolve(),
         "labels": (REPO_ROOT / "models" / "coco_labels.txt").resolve(),
         "parser": (REPO_ROOT / "pipelines" / "nvdsinfer_yolo26_seg" / "libnvdsinfer_yolo26_seg.so").resolve(),
-        "output": (REPO_ROOT / "build" / f"config_infer_primary_yolo26_seg_{size_norm}.ini").resolve(),
-        "default_output": (REPO_ROOT / "build" / f"config_infer_primary_yolo26_seg_{size_norm}.ini").resolve(),
+        "output": (_build_dir() / f"config_infer_primary_yolo26_seg_{size_norm}.ini").resolve(),
+        "default_output": (_build_dir() / f"config_infer_primary_yolo26_seg_{size_norm}.ini").resolve(),
     }
 
 
@@ -31,6 +36,7 @@ def materialize_yolo26_pgie_ini(
     batch_size: int = 3,
     onnx_path: Path | None = None,
     engine_path: Path | None = None,
+    include_model_source: bool = True,
     logger: logging.Logger | None = None,
 ) -> Path:
     assets = resolve_yolo26_assets(size)
@@ -39,7 +45,10 @@ def materialize_yolo26_pgie_ini(
         raise FileNotFoundError(f"YOLO26 PGIE template missing: {template_path}")
 
     text = template_path.read_text(encoding="utf-8")
-    text = text.replace("@ONNX_PATH@", str((onnx_path or assets["onnx"]).resolve()))
+    if include_model_source:
+        text = text.replace("@ONNX_PATH@", str((onnx_path or assets["onnx"]).resolve()))
+    else:
+        text = re.sub(r"(?m)^\s*onnx-file\s*=.*(?:\n|$)", "", text)
     text = text.replace("@ENGINE_PATH@", str((engine_path or assets["engine"]).resolve()))
     text = text.replace("@LABELS_PATH@", str(assets["labels"]))
     text = text.replace("@CUSTOM_LIB@", str(assets["parser"]))
@@ -71,6 +80,14 @@ def materialize_yolo26_preproc_config(
         text,
         count=1,
     )
+    text, tensor_name_count = re.subn(
+        r"(?m)^tensor-name=.*$",
+        "tensor-name=images",
+        text,
+        count=1,
+    )
+    if tensor_name_count != 1:
+        raise ValueError(f"YOLO26 preprocess template is missing tensor-name: {template_path}")
     text = re.sub(r"(?m)^src-ids=.*$", f"src-ids={src_ids_text}", text, count=1)
 
     output_path.parent.mkdir(parents=True, exist_ok=True)

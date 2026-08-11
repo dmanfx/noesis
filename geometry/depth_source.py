@@ -2,6 +2,10 @@
 from __future__ import annotations
 
 import base64
+import bisect
+import copy
+import ctypes
+import errno
 import hashlib
 import json
 import logging
@@ -11,11 +15,15 @@ import queue
 import shutil
 import threading
 import time
+import uuid
 from collections import OrderedDict, deque
+from contextlib import ExitStack
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
+from enum import Enum
 from pathlib import Path
-from typing import Any, Deque, Dict, Iterable, List, Mapping, Optional, Tuple, Sequence
+from typing import Any, Callable, Deque, Dict, Iterable, Iterator, List, Mapping, Optional, Tuple, Sequence
+from urllib.parse import quote, urlencode
 
 from concurrent.futures import Future
 
@@ -28,6 +36,11 @@ import zarr
 from adapters.mapanything_adapter import ViewBuildResult, build_mono_view
 from geometry.homography import img_to_plane_homography, parse_extrinsics
 from mapanything_config import ServiceConfig, load_service_config
+from noesis_core.depth_bulk import (
+    DEPTH_BULK_MAX_COMPONENT_BYTES,
+    DEPTH_BULK_MAX_PIXELS,
+    DEPTH_BULK_MAX_SNAPSHOT_BYTES,
+)
 from utils.rate_limited_logger import RateLimitedLogger
 
 try:  # zarr v3 codec shim
@@ -41,10 +54,11 @@ except Exception:
     _NumcodecsBlosc = None  # type: ignore
 
 _FLOORPLAN_FRAME = "camera_local_ground_m"
-_FLOORPLAN_ORIENTATION = "camera_xz_forward"
-# Floorplan grids are camera-local X/Z products. They must not inherit the
-# image-axis flip heuristic used by BEV/world projection consumers.
-_FLOORPLAN_CONTRACT_VERSION = 7
+_FLOORPLAN_ORIENTATION = "camera_ground_right_forward"
+# Floorplan grids use the horizontal projection of the calibrated camera
+# right/forward axes. They must not inherit the image-axis flip heuristic used
+# by BEV/world projection consumers.
+_FLOORPLAN_CONTRACT_VERSION = 10
 _FLOORPLAN_MIN_HALF_WIDTH_FRACTION = 0.0
 _FLOORPLAN_MIN_FORWARD_FRACTION = 0.0
 
@@ -161,7 +175,47 @@ def _floorplan_cache_contract_matches(
         stored = str(payload.get("calibration_fingerprint") or "").strip()
         if stored != str(expected_calibration_fingerprint).strip():
             return False
+    snapshot_ref = str(payload.get("snapshot_ref") or "").strip()
+    snapshot_id = str(payload.get("snapshot_id") or "").strip()
+    snapshot_digest = str(payload.get("snapshot_content_sha256") or "").strip()
+    if (
+        not snapshot_ref
+        or not snapshot_id
+        or len(snapshot_digest) != 64
+        or any(ch not in "0123456789abcdef" for ch in snapshot_digest)
+    ):
+        return False
     return True
+
+
+def _floorplan_snapshot_identity_matches(
+    payload: Mapping[str, Any],
+    descriptor: "SnapshotDescriptor",
+) -> bool:
+    try:
+        return bool(
+            str(payload.get("camera_id") or "") == descriptor.camera_id
+            and int(payload.get("snapshot_ts") or 0) == descriptor.ts_us
+            and str(payload.get("snapshot_ref") or "") == descriptor.storage_ref
+            and str(payload.get("snapshot_id") or "") == descriptor.write_id
+            and str(payload.get("snapshot_content_sha256") or "")
+            == descriptor.content_sha256
+        )
+    except Exception:
+        return False
+
+
+def _floorplan_snapshot_timestamp(payload: Mapping[str, Any]) -> Optional[int]:
+    """Return the immutable source timestamp used to order cache aliases."""
+    raw = payload.get("snapshot_ts", payload.get("ts"))
+    if type(raw) is bool:  # noqa: E721
+        return None
+    try:
+        value = int(raw)
+    except Exception:
+        return None
+    return value if value >= 0 else None
+
 
 # Clean floorplan layers (obstacle_height, walkable) shared by every camera.
 _FLOORPLAN_CLEAN_FLOOR_SEED_PERCENTILE = 5.0
@@ -220,11 +274,684 @@ _FLOORPLAN_AGL_MIN_SUPPORT_POINTS = 3
 _FLOORPLAN_AGL_FLOOR_SUPPORT_MIN_POINTS = 2
 _FLOORPLAN_AGL_OBSTACLE_SUPPORT_MIN_POINTS = 2
 _FLOORPLAN_AGL_FLOOR_HIST_BINS = 256
-_FLOORPLAN_AGL_FLOOR_SEGMENT_MIN_MASS_FRAC = 0.0005
-_FLOORPLAN_AGL_FLOOR_SEGMENT_BIN_THRESH_FRAC = 0.0005
+_FLOORPLAN_AGL_FLOOR_SEGMENT_MIN_MASS_FRAC = 0.02
+_FLOORPLAN_AGL_FLOOR_SEGMENT_BIN_THRESH_FRAC = 0.05
 _FLOORPLAN_AGL_FLOOR_SEGMENT_TOTAL_THRESH_FRAC = 0.0003
+_FLOORPLAN_AGL_OFFSET_PERCENTILE = 2.0
+_FLOORPLAN_AGL_OFFSET_MIN_M = 1e-3
+_CAPTURE_EVENT_MIN_FULL_FRAME_SUPPORT = 0.40
+_FUSION_FRAME_SCALE_MIN_RELATIVE_CHANGE = 0.05
+_FUSION_FRAME_SCALE_FACTOR_MIN = 0.50
+_FUSION_FRAME_SCALE_FACTOR_MAX = 2.00
+_FUSION_CONFIDENCE_CAP_PERCENTILE = 98.0
+_FUSION_CONFIDENCE_WEIGHT_FLOOR = 0.05
+_FUSION_CONTINUITY_CONFIDENCE_SCALE = 0.20
+_FUSION_DEFAULT_MIN_OBSERVATION_RATIO = 0.50
+_FUSION_MIN_COHORT_OBSERVATIONS = 3
+_FUSION_MEDOID_MIN_RELATIVE_COVERAGE = 0.90
+_FLOORPLAN_BOUNDS_OBSERVED_PERCENTILE = 99.5
+_FLOORPLAN_BOUNDS_FALLBACK_QUANTUM_M = 0.5
+_FLOORPLAN_CLEAN_MORPH_RADIUS_M = 0.15
+_FLOORPLAN_ALIGNMENT_FLOOR_BAND_M = 0.06
+_FLOORPLAN_DETAIL_HEIGHT_MAX_M = 1.80
+_FLOORPLAN_DETAIL_HEIGHT_BIN_M = 0.05
+_FLOORPLAN_DETAIL_HORIZONTAL_DOT_MIN = 0.45
+_FLOORPLAN_DETAIL_VERTICAL_DOT_MAX = 0.35
+_FLOORPLAN_DETAIL_FURNITURE_MIN_M = 0.12
+_FLOORPLAN_DETAIL_FURNITURE_MAX_M = 1.65
 _CORE_COUNTER_FN = None
 _CORE_COUNTER_RESOLVED = False
+_DEPTH_STORE_COMMIT_TIMEOUT_ENV = "NOESIS_DEPTH_STORE_COMMIT_TIMEOUT_S"
+_DEPTH_STORE_COMMIT_TIMEOUT_DEFAULT_S = 30.0
+_DEPTH_STORE_COMMIT_TIMEOUT_MIN_S = 0.1
+_DEPTH_STORE_COMMIT_TIMEOUT_MAX_S = 60.0
+
+
+def _normalize_floorplan_agl_heights(
+    height_agl_pts: np.ndarray,
+    quality_mask: np.ndarray,
+) -> Tuple[np.ndarray, float]:
+    """Apply the bounded low-percentile AGL correction exactly once."""
+    heights = np.clip(
+        np.asarray(height_agl_pts, dtype=np.float32),
+        0.0,
+        float(_FLOORPLAN_AGL_HEIGHT_CLIP_M),
+    ).astype(np.float32, copy=False)
+    try:
+        trusted = np.asarray(quality_mask, dtype=bool)
+        if trusted.shape == heights.shape and np.any(trusted):
+            candidates = heights[trusted]
+        else:
+            candidates = heights
+        candidates = candidates[np.isfinite(candidates)]
+        offset_m = (
+            float(np.percentile(candidates, _FLOORPLAN_AGL_OFFSET_PERCENTILE))
+            if candidates.size
+            else 0.0
+        )
+    except Exception:
+        offset_m = 0.0
+
+    if not np.isfinite(offset_m) or offset_m <= _FLOORPLAN_AGL_OFFSET_MIN_M:
+        return heights, 0.0
+
+    offset_m = float(np.clip(offset_m, 0.0, _FLOORPLAN_AGL_HEIGHT_CLIP_M))
+    normalized = np.clip(
+        heights - offset_m,
+        0.0,
+        float(_FLOORPLAN_AGL_HEIGHT_CLIP_M),
+    ).astype(np.float32, copy=False)
+    return normalized, offset_m
+
+
+def _world_y_from_camera_points(
+    points_camera: np.ndarray,
+    camera_to_world: np.ndarray,
+) -> np.ndarray:
+    """Transform OpenCV camera points (+Y image-down) into world-frame Y-up."""
+    points = np.asarray(points_camera, dtype=np.float32)
+    transform = np.asarray(camera_to_world, dtype=np.float32)
+    if points.ndim != 2 or points.shape[1] != 3:
+        raise ValueError("points_camera must be Nx3")
+    if transform.shape != (4, 4):
+        raise ValueError("camera_to_world must be 4x4")
+    row_y = transform[1]
+    return (
+        (points[:, 0] * row_y[0])
+        + (points[:, 1] * row_y[1])
+        + (points[:, 2] * row_y[2])
+        + row_y[3]
+    ).astype(np.float32, copy=False)
+
+
+def _camera_points_to_ground_frame(
+    points_camera: np.ndarray,
+    camera_to_world: np.ndarray,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, Dict[str, Any]]:
+    """Map camera points into a gravity-aligned, camera-heading ground frame.
+
+    X is camera-right projected onto the world ground plane, Z is the
+    horizontal projection of camera-forward, and Y remains canonical world Y.
+    Unlike raw optical X/Z, these coordinates do not smear vertical objects
+    when the camera is pitched.
+    """
+    points = np.asarray(points_camera, dtype=np.float32)
+    transform = np.asarray(camera_to_world, dtype=np.float64)
+    if points.ndim != 2 or points.shape[1] != 3:
+        raise ValueError("points_camera must be Nx3")
+    if transform.shape != (4, 4) or not np.all(np.isfinite(transform)):
+        raise ValueError("camera_to_world must be a finite 4x4 matrix")
+
+    rotation = transform[:3, :3]
+    forward = np.asarray(
+        [rotation[0, 2], 0.0, rotation[2, 2]],
+        dtype=np.float64,
+    )
+    forward_norm = float(np.linalg.norm(forward))
+    if not np.isfinite(forward_norm) or forward_norm <= 1e-6:
+        raise ValueError("camera forward axis has no stable ground projection")
+    forward /= forward_norm
+
+    up = np.asarray([0.0, 1.0, 0.0], dtype=np.float64)
+    right = np.cross(up, forward)
+    right_norm = float(np.linalg.norm(right))
+    if not np.isfinite(right_norm) or right_norm <= 1e-6:
+        raise ValueError("camera right axis has no stable ground projection")
+    right /= right_norm
+    if float(np.dot(right, rotation[:, 0])) < 0.0:
+        right *= -1.0
+
+    delta_world = np.asarray(points, dtype=np.float64) @ rotation.T
+    x_ground = (delta_world @ right).astype(np.float32, copy=False)
+    z_ground = (delta_world @ forward).astype(np.float32, copy=False)
+    y_world = (
+        delta_world[:, 1] + float(transform[1, 3])
+    ).astype(np.float32, copy=False)
+    camera_forward = rotation[:, 2]
+    pitch_deg = math.degrees(
+        math.atan2(
+            -float(camera_forward[1]),
+            max(
+                1e-12,
+                float(
+                    np.linalg.norm(
+                        [camera_forward[0], camera_forward[2]]
+                    )
+                ),
+            ),
+        )
+    )
+    return (
+        x_ground,
+        z_ground,
+        y_world,
+        {
+            "contract": "noesis.floorplan.ground_frame.v1",
+            "x_axis": "camera_right_projected_to_world_ground",
+            "z_axis": "camera_forward_projected_to_world_ground",
+            "up_axis": "canonical_world_positive_y",
+            "camera_pitch_deg": float(pitch_deg),
+            "right_world": right.round(8).tolist(),
+            "forward_world": forward.round(8).tolist(),
+        },
+    )
+
+
+def _floor_estimate_is_coherent(meta: Mapping[str, Any]) -> bool:
+    return (
+        isinstance(meta, Mapping)
+        and str(meta.get("quality") or "") == "ok"
+        and str(meta.get("mode") or "") == "histogram_lowest_coherent_peak"
+    )
+
+
+def _condition_floorplan_metric_scale(
+    points_camera: np.ndarray,
+    camera_to_world: np.ndarray,
+    *,
+    observed_floor_y: float,
+    calibrated_floor_y: Optional[float],
+    floor_estimate_meta: Mapping[str, Any],
+) -> Tuple[np.ndarray, float, Dict[str, Any]]:
+    """Condition monocular metric scale from calibrated camera-to-floor height."""
+    points = np.asarray(points_camera, dtype=np.float32)
+    transform = np.asarray(camera_to_world, dtype=np.float64)
+    observed = float(observed_floor_y)
+    authored = (
+        float(calibrated_floor_y)
+        if calibrated_floor_y is not None
+        else float("nan")
+    )
+    meta: Dict[str, Any] = {
+        "contract": "noesis.floorplan.metric_scale.v1",
+        "applied": False,
+        "scale_factor": 1.0,
+        "observed_floor_y": observed,
+        "calibrated_floor_y": (
+            authored if np.isfinite(authored) else None
+        ),
+    }
+    if not _floor_estimate_is_coherent(floor_estimate_meta):
+        meta["reason"] = "floor_mode_not_coherent"
+        return points, observed, meta
+    if (
+        transform.shape != (4, 4)
+        or not np.all(np.isfinite(transform))
+        or not np.isfinite(observed)
+        or not np.isfinite(authored)
+    ):
+        meta["reason"] = "invalid_calibration_or_floor"
+        return points, observed, meta
+
+    camera_y = float(transform[1, 3])
+    calibrated_height = camera_y - authored
+    observed_height = camera_y - observed
+    meta["camera_y"] = camera_y
+    meta["calibrated_camera_height_m"] = calibrated_height
+    meta["observed_camera_height_m"] = observed_height
+    if (
+        calibrated_height < 1.0
+        or calibrated_height > 4.0
+        or observed_height <= 0.25
+    ):
+        meta["reason"] = "camera_height_out_of_range"
+        return points, observed, meta
+
+    scale = calibrated_height / observed_height
+    if not np.isfinite(scale) or scale < 0.5 or scale > 2.0:
+        meta["reason"] = "scale_factor_out_of_range"
+        meta["candidate_scale_factor"] = (
+            float(scale) if np.isfinite(scale) else None
+        )
+        return points, observed, meta
+
+    conditioned = (points * float(scale)).astype(np.float32, copy=False)
+    corrected_floor = camera_y + (float(scale) * (observed - camera_y))
+    meta.update(
+        {
+            "applied": True,
+            "reason": "calibrated_camera_height",
+            "scale_factor": float(scale),
+            "corrected_floor_y": float(corrected_floor),
+            "floor_residual_m": float(corrected_floor - authored),
+        }
+    )
+    return conditioned, float(authored), meta
+
+
+def _metric_morphology_size(radius_m: float, grid_res_m: float) -> int:
+    """Return an odd morphology kernel whose radius is expressed in metres."""
+    radius = float(radius_m)
+    resolution = float(grid_res_m)
+    if (
+        not np.isfinite(radius)
+        or radius <= 0.0
+        or not np.isfinite(resolution)
+        or resolution <= 0.0
+    ):
+        return 1
+    radius_cells = max(0, int(math.floor((radius / resolution) + 0.5)))
+    return (radius_cells * 2) + 1
+
+
+def _quantize_floorplan_extent(
+    value_m: float,
+    *,
+    grid_res_m: float,
+    max_extent_m: float,
+) -> float:
+    """Round an observed extent outward in stable physical-size buckets."""
+    value = max(float(value_m), float(grid_res_m))
+    maximum = max(float(max_extent_m), float(grid_res_m))
+    quantum = min(
+        maximum,
+        max(
+            float(grid_res_m),
+            min(float(_FLOORPLAN_BOUNDS_FALLBACK_QUANTUM_M), maximum),
+        ),
+    )
+    quantized = math.ceil((value / quantum) - 1e-9) * quantum
+    return float(np.clip(quantized, float(grid_res_m), maximum))
+
+
+def _calibrated_ground_projection_extents(
+    *,
+    image_shape: Tuple[int, int],
+    intrinsics: Tuple[float, float, float, float],
+    camera_to_world: np.ndarray,
+    floor_y: float,
+    max_extent_m: float,
+    pad_m: float,
+) -> Optional[Tuple[float, float, Dict[str, Any]]]:
+    """Project a fixed image grid onto the authored ground plane.
+
+    The returned camera-local half-width and forward extent depend only on
+    calibration and the requested maximum extent, so repeated captures do not
+    resize the floorplan around transient depth outliers.
+    """
+    height, width = int(image_shape[0]), int(image_shape[1])
+    fx, fy, cx, cy = (float(value) for value in intrinsics)
+    transform = np.asarray(camera_to_world, dtype=np.float64)
+    floor = float(floor_y)
+    maximum = float(max_extent_m)
+    if (
+        height <= 1
+        or width <= 1
+        or transform.shape != (4, 4)
+        or not np.all(np.isfinite(transform))
+        or not all(np.isfinite(value) for value in (fx, fy, cx, cy, floor, maximum))
+        or abs(fx) <= 1e-9
+        or abs(fy) <= 1e-9
+        or maximum <= 0.0
+    ):
+        return None
+
+    camera_center = transform[:3, 3]
+    rotation = transform[:3, :3]
+    forward_ground = np.asarray(
+        [rotation[0, 2], 0.0, rotation[2, 2]],
+        dtype=np.float64,
+    )
+    forward_norm = float(np.linalg.norm(forward_ground))
+    if not np.isfinite(forward_norm) or forward_norm <= 1e-6:
+        return None
+    forward_ground /= forward_norm
+    right_ground = np.cross(
+        np.asarray([0.0, 1.0, 0.0], dtype=np.float64),
+        forward_ground,
+    )
+    right_norm = float(np.linalg.norm(right_ground))
+    if not np.isfinite(right_norm) or right_norm <= 1e-6:
+        return None
+    right_ground /= right_norm
+    if float(np.dot(right_ground, rotation[:, 0])) < 0.0:
+        right_ground *= -1.0
+    xs = np.linspace(0.0, float(width - 1), num=9, dtype=np.float64)
+    ys = np.linspace(0.0, float(height - 1), num=9, dtype=np.float64)
+    hit_x: List[float] = []
+    hit_z: List[float] = []
+    for v in ys:
+        for u in xs:
+            direction_camera = np.array(
+                [(u - cx) / fx, (v - cy) / fy, 1.0],
+                dtype=np.float64,
+            )
+            direction_world = rotation @ direction_camera
+            denom = float(direction_world[1])
+            if abs(denom) <= 1e-9:
+                continue
+            distance = (floor - float(camera_center[1])) / denom
+            if not np.isfinite(distance) or distance <= 1e-6:
+                continue
+            delta_world = direction_world * distance
+            x_value = float(np.dot(delta_world, right_ground))
+            z_value = float(np.dot(delta_world, forward_ground))
+            if (
+                not np.isfinite(x_value)
+                or not np.isfinite(z_value)
+                or z_value <= 0.0
+                or abs(x_value) > maximum
+                or z_value > maximum
+            ):
+                continue
+            hit_x.append(x_value)
+            hit_z.append(z_value)
+
+    if len(hit_x) < 4:
+        return None
+    half_width = min(maximum, max(abs(value) for value in hit_x) + float(pad_m))
+    forward_extent = min(maximum, max(hit_z) + float(pad_m))
+    if half_width <= 0.0 or forward_extent <= 0.0:
+        return None
+    return (
+        float(half_width),
+        float(forward_extent),
+        {
+            "source": "calibrated_ground_projection",
+            "sample_count": int(len(hit_x)),
+            "floor_y": floor,
+        },
+    )
+
+
+def _resolve_floorplan_extents(
+    *,
+    x_camera: np.ndarray,
+    z_camera: np.ndarray,
+    image_shape: Tuple[int, int],
+    intrinsics: Tuple[float, float, float, float],
+    camera_to_world: np.ndarray,
+    calibration_bundle: Mapping[str, Any],
+    grid_res_m: float,
+    max_extent_m: float,
+    pad_x_m: float,
+    pad_z_m: float,
+) -> Tuple[float, float, Dict[str, Any]]:
+    """Resolve compact camera-local floorplan extents from observed geometry.
+
+    Near-horizon calibration rays can intersect the authored floor plane tens
+    of metres away and must not enlarge a single-view reconstruction. The
+    calibrated projection remains diagnostic evidence, while robust observed
+    depth determines the serialized raster bounds.
+    """
+    x_values = np.asarray(x_camera, dtype=np.float64).ravel()
+    z_values = np.asarray(z_camera, dtype=np.float64).ravel()
+    finite_x = np.abs(x_values[np.isfinite(x_values)])
+    finite_z = z_values[np.isfinite(z_values) & (z_values > 0.0)]
+
+    def _robust_max(values: np.ndarray) -> float:
+        if values.size <= 0:
+            return 0.0
+        if values.size < 20:
+            return float(np.max(values))
+        return float(
+            np.percentile(values, _FLOORPLAN_BOUNDS_OBSERVED_PERCENTILE)
+        )
+
+    observed_half_width = _quantize_floorplan_extent(
+        _robust_max(finite_x) + float(pad_x_m),
+        grid_res_m=grid_res_m,
+        max_extent_m=max_extent_m,
+    )
+    observed_forward = _quantize_floorplan_extent(
+        _robust_max(finite_z) + float(pad_z_m),
+        grid_res_m=grid_res_m,
+        max_extent_m=max_extent_m,
+    )
+
+    projection = None
+    align = (
+        calibration_bundle.get("align")
+        if isinstance(calibration_bundle, Mapping)
+        else None
+    )
+    floor_y_raw = align.get("floor_y") if isinstance(align, Mapping) else None
+    if (
+        not isinstance(floor_y_raw, bool)
+        and isinstance(floor_y_raw, (int, float))
+        and np.isfinite(float(floor_y_raw))
+    ):
+        projection = _calibrated_ground_projection_extents(
+            image_shape=image_shape,
+            intrinsics=intrinsics,
+            camera_to_world=camera_to_world,
+            floor_y=float(floor_y_raw),
+            max_extent_m=max_extent_m,
+            pad_m=max(float(pad_x_m), float(pad_z_m)),
+        )
+
+    bounds_meta: Dict[str, Any] = {
+        "contract": "noesis.floorplan.bounds.v2",
+        "source": "observed_depth_quantized",
+        "observed_percentile": float(
+            _FLOORPLAN_BOUNDS_OBSERVED_PERCENTILE
+        ),
+        "quantum_m": float(
+            min(
+                max_extent_m,
+                max(grid_res_m, _FLOORPLAN_BOUNDS_FALLBACK_QUANTUM_M),
+            )
+        ),
+        "observed_half_width_m": float(observed_half_width),
+        "observed_forward_extent_m": float(observed_forward),
+        "calibrated_ground_projection_policy": (
+            "diagnostic_only_never_expands_observed_depth"
+        ),
+    }
+    if projection is not None:
+        projected_half_width, projected_forward, projection_meta = projection
+        bounds_meta["calibrated_ground_projection"] = {
+            **projection_meta,
+            "projected_half_width_m": float(
+                _quantize_floorplan_extent(
+                    projected_half_width,
+                    grid_res_m=grid_res_m,
+                    max_extent_m=max_extent_m,
+                )
+            ),
+            "projected_forward_extent_m": float(
+                _quantize_floorplan_extent(
+                    projected_forward,
+                    grid_res_m=grid_res_m,
+                    max_extent_m=max_extent_m,
+                )
+            ),
+        }
+    return observed_half_width, observed_forward, bounds_meta
+
+
+def _resolve_floorplan_bounds(
+    *,
+    x_ground: np.ndarray,
+    z_ground: np.ndarray,
+    authoritative_mask: Optional[np.ndarray],
+    image_shape: Tuple[int, int],
+    intrinsics: Tuple[float, float, float, float],
+    camera_to_world: np.ndarray,
+    calibration_bundle: Mapping[str, Any],
+    grid_res_m: float,
+    max_extent_m: float,
+    pad_x_m: float,
+    pad_z_m: float,
+) -> Tuple[float, float, float, Dict[str, Any]]:
+    """Resolve asymmetric bounds from strict ground-frame observations."""
+    x_values = np.asarray(x_ground, dtype=np.float64).ravel()
+    z_values = np.asarray(z_ground, dtype=np.float64).ravel()
+    n = min(x_values.size, z_values.size)
+    x_values = x_values[:n]
+    z_values = z_values[:n]
+    finite = (
+        np.isfinite(x_values)
+        & np.isfinite(z_values)
+        & (z_values > 0.0)
+    )
+    strict = np.zeros((n,), dtype=bool)
+    if authoritative_mask is not None:
+        supplied = np.asarray(authoritative_mask, dtype=bool).ravel()
+        if supplied.size == n:
+            strict = finite & supplied
+    strict_count = int(np.count_nonzero(strict))
+    if strict_count >= 20:
+        selected = strict
+        source = "strict_observed_ground_depth_quantized"
+    else:
+        selected = finite
+        source = "all_observed_ground_depth_quantized"
+
+    selected_x = x_values[selected]
+    selected_z = z_values[selected]
+    if selected_x.size <= 0 or selected_z.size <= 0:
+        selected_x = np.asarray([0.0], dtype=np.float64)
+        selected_z = np.asarray([float(grid_res_m)], dtype=np.float64)
+
+    if selected_x.size < 20:
+        x_low = float(np.min(selected_x))
+        x_high = float(np.max(selected_x))
+    else:
+        x_low, x_high = (
+            float(value)
+            for value in np.percentile(selected_x, [0.25, 99.75])
+        )
+    if selected_z.size < 20:
+        z_high = float(np.max(selected_z))
+    else:
+        z_high = float(
+            np.percentile(
+                selected_z,
+                _FLOORPLAN_BOUNDS_OBSERVED_PERCENTILE,
+            )
+        )
+
+    maximum = max(float(max_extent_m), float(grid_res_m))
+    quantum = min(
+        maximum,
+        max(
+            float(grid_res_m),
+            min(float(_FLOORPLAN_BOUNDS_FALLBACK_QUANTUM_M), maximum),
+        ),
+    )
+    min_x = math.floor(
+        ((min(0.0, x_low - float(pad_x_m))) / quantum) + 1e-9
+    ) * quantum
+    max_x = math.ceil(
+        ((max(0.0, x_high + float(pad_x_m))) / quantum) - 1e-9
+    ) * quantum
+    min_x = float(np.clip(min_x, -maximum, 0.0))
+    max_x = float(np.clip(max_x, 0.0, maximum))
+    if (max_x - min_x) < float(grid_res_m):
+        max_x = min(maximum, min_x + float(grid_res_m))
+    forward_extent = _quantize_floorplan_extent(
+        z_high + float(pad_z_m),
+        grid_res_m=grid_res_m,
+        max_extent_m=max_extent_m,
+    )
+
+    bounds_meta: Dict[str, Any] = {
+        "contract": "noesis.floorplan.bounds.v3",
+        "source": source,
+        "coordinate_frame": "camera_heading_ground_plane",
+        "observed_percentile_x": [0.25, 99.75],
+        "observed_percentile_z_high": float(
+            _FLOORPLAN_BOUNDS_OBSERVED_PERCENTILE
+        ),
+        "quantum_m": float(quantum),
+        "strict_input_point_count": strict_count,
+        "selected_point_count": int(np.count_nonzero(selected)),
+        "observed_x_low_m": x_low,
+        "observed_x_high_m": x_high,
+        "observed_forward_extent_m": z_high,
+        "calibrated_ground_projection_policy": (
+            "diagnostic_only_never_expands_observed_depth"
+        ),
+    }
+    floor_y = _calibrated_floor_y_from_bundle(calibration_bundle)
+    if floor_y is not None:
+        projection = _calibrated_ground_projection_extents(
+            image_shape=image_shape,
+            intrinsics=intrinsics,
+            camera_to_world=camera_to_world,
+            floor_y=float(floor_y),
+            max_extent_m=max_extent_m,
+            pad_m=max(float(pad_x_m), float(pad_z_m)),
+        )
+        if projection is not None:
+            projected_half_width, projected_forward, projection_meta = projection
+            bounds_meta["calibrated_ground_projection"] = {
+                **projection_meta,
+                "projected_half_width_m": float(
+                    _quantize_floorplan_extent(
+                        projected_half_width,
+                        grid_res_m=grid_res_m,
+                        max_extent_m=max_extent_m,
+                    )
+                ),
+                "projected_forward_extent_m": float(
+                    _quantize_floorplan_extent(
+                        projected_forward,
+                        grid_res_m=grid_res_m,
+                        max_extent_m=max_extent_m,
+                    )
+                ),
+            }
+    return min_x, max_x, float(forward_extent), bounds_meta
+
+
+def _binary_mask_component_evidence(mask: np.ndarray) -> Dict[str, Any]:
+    """Return compact 8-connected component and enclosed-hole evidence."""
+    binary = np.asarray(mask, dtype=bool)
+    pixels = int(np.count_nonzero(binary))
+    if pixels <= 0:
+        return {
+            "connectivity": 8,
+            "component_count": 0,
+            "largest_component_pixels": 0,
+            "largest_component_fraction": 0.0,
+            "fragment_pixels": 0,
+            "fragment_fraction": 0.0,
+            "hole_count": 0,
+            "hole_pixels": 0,
+        }
+
+    structure = np.ones((3, 3), dtype=np.uint8)
+    labels, component_count = ndi.label(binary, structure=structure)
+    counts = np.bincount(labels.ravel())
+    component_sizes = counts[1:] if counts.size > 1 else np.empty(0, dtype=np.int64)
+    largest = int(component_sizes.max()) if component_sizes.size else 0
+    fragments = max(0, pixels - largest)
+
+    filled = ndi.binary_fill_holes(binary)
+    holes = np.asarray(filled, dtype=bool) & ~binary
+    _hole_labels, hole_count = ndi.label(holes, structure=structure)
+    hole_pixels = int(np.count_nonzero(holes))
+    return {
+        "connectivity": 8,
+        "component_count": int(component_count),
+        "largest_component_pixels": largest,
+        "largest_component_fraction": float(largest / pixels),
+        "fragment_pixels": int(fragments),
+        "fragment_fraction": float(fragments / pixels),
+        "hole_count": int(hole_count),
+        "hole_pixels": hole_pixels,
+    }
+
+
+def resolve_depth_store_commit_timeout_s(value: Optional[Any] = None) -> float:
+    """Resolve the one bounded wait used before publishing a durable depth ref."""
+    raw = (
+        os.environ.get(
+            _DEPTH_STORE_COMMIT_TIMEOUT_ENV,
+            str(_DEPTH_STORE_COMMIT_TIMEOUT_DEFAULT_S),
+        )
+        if value is None
+        else value
+    )
+    try:
+        parsed = float(raw)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{_DEPTH_STORE_COMMIT_TIMEOUT_ENV} must be a finite number") from exc
+    if not math.isfinite(parsed):
+        raise ValueError(f"{_DEPTH_STORE_COMMIT_TIMEOUT_ENV} must be a finite number")
+    return min(_DEPTH_STORE_COMMIT_TIMEOUT_MAX_S, max(_DEPTH_STORE_COMMIT_TIMEOUT_MIN_S, parsed))
 
 
 def _increment_core_boundary_copy_bytes(path: str, payload_bytes: int) -> None:
@@ -315,6 +1042,21 @@ def _floorplan_image_flip_payload(
     }
 
 
+def _calibrated_floor_y_from_bundle(
+    calibration_bundle: Any,
+) -> Optional[float]:
+    if not isinstance(calibration_bundle, Mapping):
+        return None
+    align = calibration_bundle.get("align")
+    if not isinstance(align, Mapping):
+        return None
+    raw = align.get("floor_y")
+    if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+        return None
+    value = float(raw)
+    return value if np.isfinite(value) else None
+
+
 def _floorplan_world_coordinate_grids(
     min_x: float,
     max_x: float,
@@ -339,7 +1081,8 @@ def _fit_ray_to_floorplan_alignment(
     camera_id: str,
     intrinsics: np.ndarray,
     extrinsics_col_major: Sequence[float],
-    floor_y: float,
+    calibrated_floor_y: Optional[float],
+    depth_floor_y: float,
     depth: np.ndarray,
     conf: np.ndarray,
     mask: np.ndarray,
@@ -349,8 +1092,10 @@ def _fit_ray_to_floorplan_alignment(
     bounds: Mapping[str, float],
     walkable_grid: Optional[np.ndarray],
     obstacle_height_grid: Optional[np.ndarray],
+    floorplan_x: Optional[np.ndarray] = None,
+    floorplan_z: Optional[np.ndarray] = None,
 ) -> Dict[str, Any]:
-    """Fit calibrated ray-floor X/Z into the depth-derived floorplan X/Z frame."""
+    """Fit calibrated floor-contact rays into the depth-derived floorplan frame."""
 
     def _response(quality: str, reason: str, **extra: Any) -> Dict[str, Any]:
         payload: Dict[str, Any] = {
@@ -359,24 +1104,69 @@ def _fit_ray_to_floorplan_alignment(
             "reason": str(reason),
             "source": "floorplan_depth_snapshot",
             "from": "calibrated_floor_contact_ray_camera_local_xz",
-            "to": "floorplan_depth_camera_local_xz",
+            "to": (
+                "floorplan_depth_camera_heading_ground"
+                if floorplan_x is not None and floorplan_z is not None
+                else "floorplan_depth_camera_local_xz"
+            ),
         }
         payload.update(extra)
         return payload
 
     try:
         k = np.asarray(intrinsics, dtype=np.float64).reshape(3, 3)
+        if calibrated_floor_y is None or isinstance(calibrated_floor_y, bool):
+            return _response("unavailable", "invalid_calibrated_floor_y")
+        if isinstance(depth_floor_y, bool):
+            return _response("unavailable", "invalid_depth_floor_y")
+        calibrated_floor = float(calibrated_floor_y)
+        observed_floor = float(depth_floor_y)
+        if not np.isfinite(calibrated_floor):
+            return _response("unavailable", "invalid_calibrated_floor_y")
+        if not np.isfinite(observed_floor):
+            return _response("unavailable", "invalid_depth_floor_y")
+        R_wc, C_world = parse_extrinsics(extrinsics_col_major)
         depth_arr = np.asarray(depth, dtype=np.float32)
         conf_arr = np.asarray(conf, dtype=np.float32)
         mask_arr = np.asarray(mask)
         valid_arr = np.asarray(valid, dtype=bool)
         x_arr = np.asarray(x_cam, dtype=np.float32)
         z_arr = np.asarray(z_cam, dtype=np.float32)
+        target_x_arr = (
+            np.asarray(floorplan_x, dtype=np.float32)
+            if floorplan_x is not None
+            else x_arr
+        )
+        target_z_arr = (
+            np.asarray(floorplan_z, dtype=np.float32)
+            if floorplan_z is not None
+            else z_arr
+        )
         if depth_arr.ndim != 2 or conf_arr.shape != depth_arr.shape or valid_arr.shape != depth_arr.shape:
             return _response("unavailable", "shape_mismatch")
         h_img, w_img = depth_arr.shape
         if x_arr.shape != depth_arr.shape or z_arr.shape != depth_arr.shape:
             return _response("unavailable", "camera_point_shape_mismatch")
+        if (
+            target_x_arr.shape != depth_arr.shape
+            or target_z_arr.shape != depth_arr.shape
+        ):
+            return _response("unavailable", "floorplan_point_shape_mismatch")
+        fy = float(k[1, 1])
+        cy = float(k[1, 2])
+        if not np.isfinite(fy) or abs(fy) <= 1e-9 or not np.isfinite(cy):
+            return _response("unavailable", "bad_intrinsics")
+        image_rows = np.arange(h_img, dtype=np.float64).reshape(-1, 1)
+        y_arr = (
+            ((image_rows - cy) / fy)
+            * depth_arr.astype(np.float64, copy=False)
+        )
+        world_y = (
+            (float(R_wc[1, 0]) * x_arr)
+            + (float(R_wc[1, 1]) * y_arr)
+            + (float(R_wc[1, 2]) * z_arr)
+            + float(C_world[1])
+        )
         min_x = float(bounds.get("min_x"))
         max_x = float(bounds.get("max_x"))
         min_z = float(bounds.get("min_z"))
@@ -392,18 +1182,25 @@ def _fit_ray_to_floorplan_alignment(
         & np.isfinite(conf_arr)
         & np.isfinite(x_arr)
         & np.isfinite(z_arr)
+        & np.isfinite(target_x_arr)
+        & np.isfinite(target_z_arr)
+        & np.isfinite(world_y)
         & (depth_arr > 0.10)
         & (depth_arr < 50.0)
         & (conf_arr >= 0.10)
-        & (x_arr >= min_x)
-        & (x_arr <= max_x)
-        & (z_arr >= min_z)
-        & (z_arr <= max_z)
+        & (target_x_arr >= min_x)
+        & (target_x_arr <= max_x)
+        & (target_z_arr >= min_z)
+        & (target_z_arr <= max_z)
+        & (
+            np.abs(world_y - observed_floor)
+            <= float(_FLOORPLAN_ALIGNMENT_FLOOR_BAND_M)
+        )
     )
     if mask_arr.shape == depth_arr.shape:
         finite &= np.asarray(mask_arr, dtype=np.uint8) > 0
 
-    sample_mode = "valid_mask_conf"
+    sample_mode = "depth_floor_contact_valid_mask_conf"
     if walkable_grid is not None:
         try:
             walk = np.asarray(walkable_grid, dtype=np.float32)
@@ -411,13 +1208,21 @@ def _fit_ray_to_floorplan_alignment(
                 rows, cols = walk.shape
                 span_x = max(1e-6, max_x - min_x)
                 span_z = max(1e-6, max_z - min_z)
-                grid_col = np.floor(((x_arr - min_x) / span_x) * float(cols)).astype(np.int32)
-                grid_row = np.floor((1.0 - ((z_arr - min_z) / span_z)) * float(rows)).astype(np.int32)
+                grid_col = np.floor(
+                    ((target_x_arr - min_x) / span_x) * float(cols)
+                ).astype(np.int32)
+                grid_row = np.floor(
+                    (
+                        1.0
+                        - ((target_z_arr - min_z) / span_z)
+                    )
+                    * float(rows)
+                ).astype(np.int32)
                 in_grid = (grid_col >= 0) & (grid_col < cols) & (grid_row >= 0) & (grid_row < rows)
                 walk_ok = np.zeros_like(finite, dtype=bool)
                 walk_ok[in_grid] = walk[grid_row[in_grid], grid_col[in_grid]] > 0.5
                 finite &= walk_ok
-                sample_mode = "walkable_valid_mask_conf"
+                sample_mode = "depth_floor_contact_walkable_valid_mask_conf"
                 if obstacle_height_grid is not None:
                     obs = np.asarray(obstacle_height_grid, dtype=np.float32)
                     if obs.shape == walk.shape:
@@ -429,7 +1234,9 @@ def _fit_ray_to_floorplan_alignment(
                             neginf=999.0,
                         ) <= 0.35
                         finite &= obs_ok
-                        sample_mode = "walkable_non_obstacle_valid_mask_conf"
+                        sample_mode = (
+                            "depth_floor_contact_walkable_non_obstacle_valid_mask_conf"
+                        )
         except Exception:
             return _response("unavailable", "surface_filter_failed")
 
@@ -453,13 +1260,12 @@ def _fit_ray_to_floorplan_alignment(
         H_img2plane = img_to_plane_homography(
             k,
             extrinsics_col_major,
-            float(floor_y),
+            calibrated_floor,
             (int(w_img), int(h_img)),
             1.0,
             flip_u=False,
             flip_v=False,
         )
-        R_wc, C_world = parse_extrinsics(extrinsics_col_major)
         uv1 = np.stack(
             [
                 cols.astype(np.float64, copy=False),
@@ -478,7 +1284,7 @@ def _fit_ray_to_floorplan_alignment(
         world = np.stack(
             [
                 wx,
-                np.full_like(wx, float(floor_y), dtype=np.float64),
+                np.full_like(wx, calibrated_floor, dtype=np.float64),
                 wz,
             ],
             axis=0,
@@ -486,14 +1292,22 @@ def _fit_ray_to_floorplan_alignment(
         local = R_wc.T @ (world - C_world.reshape(3, 1))
         ray_x = local[0]
         ray_z = local[2]
-        depth_x = x_arr[rows, cols].astype(np.float64, copy=False)
-        depth_z = z_arr[rows, cols].astype(np.float64, copy=False)
+        depth_x = target_x_arr[rows, cols].astype(
+            np.float64,
+            copy=False,
+        )
+        depth_z = target_z_arr[rows, cols].astype(
+            np.float64,
+            copy=False,
+        )
         finite_pairs = (
             ok
             & np.isfinite(ray_x)
             & np.isfinite(ray_z)
             & np.isfinite(depth_x)
             & np.isfinite(depth_z)
+            & (ray_z > 0.0)
+            & (depth_z > 0.0)
         )
         ray_x = ray_x[finite_pairs]
         ray_z = ray_z[finite_pairs]
@@ -795,9 +1609,20 @@ def _estimate_floor_y_from_horizontal_points(
         if w.size != n:
             w = np.ones((n,), dtype=np.float32)
 
-    finite = np.isfinite(y) & np.isfinite(w) & np.isfinite(nrm).all(axis=1)
+    finite = (
+        np.isfinite(y)
+        & np.isfinite(w)
+        & (w > 0.0)
+        & np.isfinite(nrm).all(axis=1)
+    )
     if not np.any(finite):
-        return 0.0, {"mode": "no_finite", "candidate_count": 0, "point_count": int(n)}
+        return 0.0, {
+            "mode": "unavailable_no_finite_authoritative_points",
+            "quality": "unavailable",
+            "candidate_count": 0,
+            "point_count": int(n),
+            "floor_y": 0.0,
+        }
 
     # |dot(up, normal)| near 1 means a horizontal surface (floor/countertop/table/ceiling).
     dot_up = np.abs(nrm[:, 1]).astype(np.float32, copy=False)
@@ -805,18 +1630,20 @@ def _estimate_floor_y_from_horizontal_points(
     cand_count = int(np.count_nonzero(cand))
     meta: Dict[str, Any] = {
         "mode": "histogram",
+        "quality": "unavailable",
         "point_count": int(n),
         "candidate_count": cand_count,
         "horiz_dot_thresh": float(horiz_dot_thresh),
     }
     if cand_count < 64:
-        # Too few horizontal points; fall back to a low percentile of all points.
+        # Preserve a numeric diagnostic, but do not authorize it as a floor
+        # anchor or metric scale estimate.
         y0 = y[finite]
         try:
             floor_y = float(np.percentile(y0, 2.0))
         except Exception:
             floor_y = float(np.min(y0)) if y0.size else 0.0
-        meta["mode"] = "fallback_percentile"
+        meta["mode"] = "unavailable_insufficient_horizontal_support"
         meta["floor_y"] = float(floor_y)
         return float(floor_y), meta
 
@@ -833,7 +1660,7 @@ def _estimate_floor_y_from_horizontal_points(
         y_hi = float(np.max(y_cand)) if y_cand.size else y_lo + 1.0
     if not np.isfinite(y_hi) or y_hi <= y_lo + 1e-6:
         floor_y = float(y_lo)
-        meta["mode"] = "degenerate_range"
+        meta["mode"] = "unavailable_degenerate_range"
         meta["floor_y"] = float(floor_y)
         return float(floor_y), meta
 
@@ -846,7 +1673,7 @@ def _estimate_floor_y_from_horizontal_points(
     peak = float(np.max(hist_s)) if hist_s.size else 0.0
     if not np.isfinite(total) or total <= 0.0 or not np.isfinite(peak) or peak <= 0.0:
         floor_y = float(np.min(y_cand)) if y_cand.size else 0.0
-        meta["mode"] = "empty_hist"
+        meta["mode"] = "unavailable_empty_histogram"
         meta["floor_y"] = float(floor_y)
         return float(floor_y), meta
 
@@ -878,8 +1705,12 @@ def _estimate_floor_y_from_horizontal_points(
 
     peaks_sorted = sorted(set(int(p) for p in peaks), key=lambda i: float(centers[i]) if 0 <= i < centers.size else 0.0)
 
-    peak_thr = float(peak) * float(_FLOORPLAN_AGL_FLOOR_SEGMENT_BIN_THRESH_FRAC)
-    min_mass = float(total) * float(_FLOORPLAN_AGL_FLOOR_SEGMENT_MIN_MASS_FRAC)
+    peak_thr = float(peak) * float(
+        _FLOORPLAN_AGL_FLOOR_SEGMENT_BIN_THRESH_FRAC
+    )
+    min_mass = float(total) * float(
+        _FLOORPLAN_AGL_FLOOR_SEGMENT_MIN_MASS_FRAC
+    )
     radius = 2
 
     chosen = None
@@ -903,10 +1734,16 @@ def _estimate_floor_y_from_horizontal_points(
             floor_y = float(np.percentile(y_cand, 2.0))
         except Exception:
             floor_y = float(np.min(y_cand)) if y_cand.size else 0.0
-        meta["mode"] = "fallback_low_percentile"
+        meta["mode"] = "unavailable_no_coherent_floor_mode"
         meta["floor_y"] = float(floor_y)
         meta["peak_threshold"] = float(peak_thr)
         meta["window_min_mass"] = float(min_mass)
+        meta["required_peak_fraction"] = float(
+            _FLOORPLAN_AGL_FLOOR_SEGMENT_BIN_THRESH_FRAC
+        )
+        meta["required_window_mass_fraction"] = float(
+            _FLOORPLAN_AGL_FLOOR_SEGMENT_MIN_MASS_FRAC
+        )
         return float(floor_y), meta
 
     i0, i1, win_mass = chosen_window
@@ -923,14 +1760,23 @@ def _estimate_floor_y_from_horizontal_points(
 
     meta.update(
         {
-            "mode": "histogram_lowest_peak",
+            "mode": "histogram_lowest_coherent_peak",
+            "quality": "ok",
             "peak_threshold": float(peak_thr),
             "window_min_mass": float(min_mass),
+            "required_peak_fraction": float(
+                _FLOORPLAN_AGL_FLOOR_SEGMENT_BIN_THRESH_FRAC
+            ),
+            "required_window_mass_fraction": float(
+                _FLOORPLAN_AGL_FLOOR_SEGMENT_MIN_MASS_FRAC
+            ),
             "peak_bin": int(chosen),
             "peak_center": float(centers[chosen]) if centers.size else float(y0),
             "peak_height": float(hist_s[chosen]),
+            "peak_fraction_of_global": float(hist_s[chosen] / peak),
             "window_bins": [int(i0), int(i1)],
             "window_mass": float(win_mass),
+            "window_mass_fraction": float(win_mass / total),
             "window_range": [float(y0), float(y1)],
             "floor_y": float(floor_y),
         }
@@ -976,11 +1822,11 @@ def _compute_inside_mask_from_observed(observed: np.ndarray) -> np.ndarray:
         left_s = np.clip(left_s, 0, w_px - 1)
         right_s = np.clip(right_s, 0, w_px - 1)
         for idx, r in enumerate(range(int(start), int(end) + 1)):
-            l = int(left_s[idx])
+            left_col = int(left_s[idx])
             rr = int(right_s[idx])
-            if rr < l:
+            if rr < left_col:
                 continue
-            inside[r, l: rr + 1] = True
+            inside[r, left_col: rr + 1] = True
 
         # Add convex hull to reduce concavity.
         try:
@@ -1018,11 +1864,351 @@ def _compute_inside_mask_from_observed(observed: np.ndarray) -> np.ndarray:
     return inside
 
 
+def _compute_floorplan_detail_layers(
+    *,
+    height_agl_pts: np.ndarray,
+    normals_world_pts: np.ndarray,
+    pts_weight: np.ndarray,
+    x_idx: np.ndarray,
+    z_idx: np.ndarray,
+    support_grid: np.ndarray,
+    rgb_pts: Optional[np.ndarray] = None,
+) -> Dict[str, Any]:
+    """Separate floor, furniture surfaces, and walls in a top-down raster.
+
+    A mean over every point in one X/Z cell mixes floor, a table top, a wall,
+    and sometimes the ceiling. This helper instead finds a dominant
+    horizontal-surface height per cell, infers only the unobserved floor inside
+    the observed footprint, and publishes vertical-normal support separately.
+    """
+    support = np.asarray(support_grid, dtype=np.uint32)
+    if support.ndim != 2 or support.size <= 0:
+        raise ValueError("support_grid must be a non-empty 2D array")
+    rows, cols = support.shape
+
+    heights = np.asarray(height_agl_pts, dtype=np.float32).ravel()
+    normals = np.asarray(normals_world_pts, dtype=np.float32)
+    weights = np.asarray(pts_weight, dtype=np.float32).ravel()
+    xi = np.asarray(x_idx, dtype=np.int32).ravel()
+    zi = np.asarray(z_idx, dtype=np.int32).ravel()
+    if normals.ndim != 2 or normals.shape[1] != 3:
+        normals = np.zeros((heights.size, 3), dtype=np.float32)
+    count = min(
+        heights.size,
+        normals.shape[0],
+        weights.size,
+        xi.size,
+        zi.size,
+    )
+    if count <= 0:
+        raise ValueError("no detail-layer points")
+    heights = heights[:count]
+    normals = normals[:count]
+    weights = weights[:count]
+    xi = xi[:count]
+    zi = zi[:count]
+
+    normal_norm = np.linalg.norm(normals, axis=1)
+    dot_up = np.divide(
+        np.abs(normals[:, 1]),
+        normal_norm,
+        out=np.zeros_like(normal_norm, dtype=np.float32),
+        where=normal_norm > 1e-6,
+    )
+    finite = (
+        np.isfinite(heights)
+        & np.isfinite(weights)
+        & np.isfinite(dot_up)
+        & (weights > 0.0)
+        & (xi >= 0)
+        & (xi < cols)
+        & (zi >= 0)
+        & (zi < rows)
+    )
+    horizontal = (
+        finite
+        & (normal_norm > 1e-6)
+        & (dot_up >= float(_FLOORPLAN_DETAIL_HORIZONTAL_DOT_MIN))
+        & (heights >= 0.0)
+        & (heights <= float(_FLOORPLAN_DETAIL_HEIGHT_MAX_M))
+    )
+    vertical = (
+        finite
+        & (normal_norm > 1e-6)
+        & (dot_up <= float(_FLOORPLAN_DETAIL_VERTICAL_DOT_MAX))
+        & (heights >= float(_FLOORPLAN_DETAIL_FURNITURE_MIN_M))
+    )
+
+    cell_count = int(rows * cols)
+    height_bin_m = float(_FLOORPLAN_DETAIL_HEIGHT_BIN_M)
+    bin_count = max(
+        1,
+        int(math.ceil(float(_FLOORPLAN_DETAIL_HEIGHT_MAX_M) / height_bin_m)),
+    )
+    histogram = np.zeros((cell_count, bin_count), dtype=np.float32)
+    horizontal_count = np.zeros(cell_count, dtype=np.uint32)
+    flat_cell = (zi * cols) + xi
+    if np.any(horizontal):
+        horizontal_height = heights[horizontal]
+        horizontal_bin = np.clip(
+            np.floor(horizontal_height / height_bin_m).astype(np.int32),
+            0,
+            bin_count - 1,
+        )
+        horizontal_strength = np.clip(
+            (
+                dot_up[horizontal]
+                - float(_FLOORPLAN_DETAIL_HORIZONTAL_DOT_MIN)
+            )
+            / max(
+                1e-6,
+                1.0 - float(_FLOORPLAN_DETAIL_HORIZONTAL_DOT_MIN),
+            ),
+            0.10,
+            1.0,
+        )
+        horizontal_weight = (
+            weights[horizontal] * horizontal_strength
+        ).astype(np.float32, copy=False)
+        np.add.at(
+            histogram,
+            (flat_cell[horizontal], horizontal_bin),
+            horizontal_weight,
+        )
+        np.add.at(horizontal_count, flat_cell[horizontal], 1)
+
+    # Lightly join neighbouring 5 cm bins without allowing tall, sparse modes
+    # to overwhelm a coherent tabletop or floor surface.
+    smoothed = histogram.copy()
+    if bin_count > 1:
+        smoothed[:, 1:] += histogram[:, :-1] * 0.25
+        smoothed[:, :-1] += histogram[:, 1:] * 0.25
+    peak_bin = np.argmax(smoothed, axis=1)
+    peak_weight = smoothed[np.arange(cell_count), peak_bin]
+    surface_observed = (horizontal_count > 0) & (peak_weight > 0.0)
+    surface_height_flat = (
+        (peak_bin.astype(np.float32) + 0.5) * height_bin_m
+    )
+    surface_height_flat = np.clip(
+        surface_height_flat,
+        0.0,
+        float(_FLOORPLAN_DETAIL_HEIGHT_MAX_M),
+    )
+
+    observed = support > 0
+    footprint = _compute_inside_mask_from_observed(observed)
+    structural_height = np.full((rows, cols), np.nan, dtype=np.float32)
+    structural_height[footprint] = 0.0
+    surface_observed_grid = surface_observed.reshape(rows, cols)
+    surface_height_grid = surface_height_flat.reshape(rows, cols)
+    furniture_mask = (
+        surface_observed_grid
+        & (surface_height_grid >= float(_FLOORPLAN_DETAIL_FURNITURE_MIN_M))
+        & (surface_height_grid <= float(_FLOORPLAN_DETAIL_FURNITURE_MAX_M))
+    )
+    structural_height[furniture_mask] = surface_height_grid[furniture_mask]
+    # Join sub-cell sampling gaps on coherent surfaces and suppress 5 cm bin
+    # flicker without expanding furniture by more than one 10 cm raster cell.
+    local_kernel = np.ones((3, 3), dtype=np.float32)
+    local_furniture_count = ndi.convolve(
+        furniture_mask.astype(np.float32),
+        local_kernel,
+        mode="constant",
+        cval=0.0,
+    )
+    local_furniture_sum = ndi.convolve(
+        np.where(furniture_mask, surface_height_grid, 0.0).astype(
+            np.float32,
+            copy=False,
+        ),
+        local_kernel,
+        mode="constant",
+        cval=0.0,
+    )
+    local_furniture_height = np.divide(
+        local_furniture_sum,
+        local_furniture_count,
+        out=np.zeros_like(local_furniture_sum, dtype=np.float32),
+        where=local_furniture_count > 0.0,
+    )
+    coherent_furniture = ndi.binary_closing(
+        furniture_mask,
+        structure=np.ones((3, 3), dtype=bool),
+        border_value=0,
+    )
+    furniture_fill = (
+        footprint
+        & coherent_furniture
+        & ~furniture_mask
+        & (local_furniture_count >= 3.0)
+    )
+    furniture_smooth = furniture_mask & (local_furniture_count >= 3.0)
+    structural_height[furniture_smooth] = (
+        (structural_height[furniture_smooth] * 0.65)
+        + (local_furniture_height[furniture_smooth] * 0.35)
+    )
+    structural_height[furniture_fill] = local_furniture_height[
+        furniture_fill
+    ]
+
+    total_normal_weight = np.zeros(cell_count, dtype=np.float32)
+    vertical_weight = np.zeros(cell_count, dtype=np.float32)
+    normal_valid = finite & (normal_norm > 1e-6)
+    if np.any(normal_valid):
+        np.add.at(
+            total_normal_weight,
+            flat_cell[normal_valid],
+            weights[normal_valid],
+        )
+    if np.any(vertical):
+        vertical_strength = np.clip(
+            1.0
+            - (
+                dot_up[vertical]
+                / max(1e-6, float(_FLOORPLAN_DETAIL_VERTICAL_DOT_MAX))
+            ),
+            0.10,
+            1.0,
+        )
+        np.add.at(
+            vertical_weight,
+            flat_cell[vertical],
+            (weights[vertical] * vertical_strength).astype(
+                np.float32,
+                copy=False,
+            ),
+        )
+    wall_ratio = np.divide(
+        vertical_weight,
+        total_normal_weight,
+        out=np.zeros_like(vertical_weight),
+        where=total_normal_weight > 1e-9,
+    )
+    positive_wall_weight = vertical_weight[vertical_weight > 0.0]
+    wall_scale = (
+        float(np.percentile(positive_wall_weight, 95.0))
+        if positive_wall_weight.size
+        else 1.0
+    )
+    if not np.isfinite(wall_scale) or wall_scale <= 1e-9:
+        wall_scale = 1.0
+    wall_support = (
+        np.clip(vertical_weight / wall_scale, 0.0, 1.0)
+        * np.clip(wall_ratio, 0.0, 1.0)
+    ).reshape(rows, cols).astype(np.float32, copy=False)
+
+    if np.any(footprint):
+        perimeter = footprint & ~ndi.binary_erosion(
+            footprint,
+            structure=np.ones((3, 3), dtype=bool),
+            border_value=0,
+        )
+    else:
+        perimeter = np.zeros_like(footprint)
+    room_boundary = np.maximum(
+        wall_support,
+        perimeter.astype(np.float32) * 0.35,
+    ).astype(np.float32, copy=False)
+
+    surface_rgb = None
+    rgb_observed = None
+    if rgb_pts is not None:
+        rgb = np.asarray(rgb_pts)
+        if rgb.ndim == 2 and rgb.shape[1] >= 3 and rgb.shape[0] >= count:
+            rgb = rgb[:count, :3].astype(np.float32, copy=False)
+            modal_height_for_point = surface_height_flat[
+                np.clip(flat_cell, 0, cell_count - 1)
+            ]
+            rgb_valid = (
+                horizontal
+                & surface_observed[
+                    np.clip(flat_cell, 0, cell_count - 1)
+                ]
+                & (
+                    np.abs(heights - modal_height_for_point)
+                    <= (height_bin_m * 1.5)
+                )
+                & np.isfinite(rgb).all(axis=1)
+            )
+            rgb_sum = np.zeros((cell_count, 3), dtype=np.float64)
+            rgb_weight = np.zeros(cell_count, dtype=np.float64)
+            if np.any(rgb_valid):
+                selected_weight = weights[rgb_valid].astype(
+                    np.float64,
+                    copy=False,
+                )
+                selected_cells = flat_cell[rgb_valid]
+                np.add.at(rgb_weight, selected_cells, selected_weight)
+                for channel in range(3):
+                    np.add.at(
+                        rgb_sum[:, channel],
+                        selected_cells,
+                        rgb[rgb_valid, channel] * selected_weight,
+                    )
+                rgb_float = np.zeros((cell_count, 3), dtype=np.float64)
+                np.divide(
+                    rgb_sum,
+                    rgb_weight[:, None],
+                    out=rgb_float,
+                    where=rgb_weight[:, None] > 1e-9,
+                )
+                surface_rgb = np.clip(
+                    np.rint(rgb_float),
+                    0,
+                    255,
+                ).astype(np.uint8).reshape(rows, cols, 3)
+                rgb_observed = (rgb_weight > 1e-9).reshape(
+                    rows,
+                    cols,
+                ).astype(np.float32)
+
+    return {
+        "structural_height": structural_height,
+        "surface_observed": surface_observed_grid.astype(
+            np.float32,
+            copy=False,
+        ),
+        "room_footprint": footprint.astype(np.float32, copy=False),
+        "wall_support": wall_support,
+        "room_boundary": room_boundary,
+        "surface_rgb": surface_rgb,
+        "surface_rgb_observed": rgb_observed,
+        "meta": {
+            "contract": "noesis.floorplan.detail_layers.v1",
+            "algorithm": "dominant_horizontal_surface_plus_vertical_support",
+            "height_bin_m": height_bin_m,
+            "height_max_m": float(_FLOORPLAN_DETAIL_HEIGHT_MAX_M),
+            "horizontal_dot_min": float(
+                _FLOORPLAN_DETAIL_HORIZONTAL_DOT_MIN
+            ),
+            "vertical_dot_max": float(
+                _FLOORPLAN_DETAIL_VERTICAL_DOT_MAX
+            ),
+            "cells": {
+                "observed": int(np.count_nonzero(observed)),
+                "footprint": int(np.count_nonzero(footprint)),
+                "horizontal_surface": int(
+                    np.count_nonzero(surface_observed_grid)
+                ),
+                "furniture_surface": int(np.count_nonzero(furniture_mask)),
+                "furniture_gap_fill": int(np.count_nonzero(furniture_fill)),
+                "wall_support": int(np.count_nonzero(wall_support > 0.0)),
+                "surface_rgb": int(
+                    np.count_nonzero(rgb_observed > 0.0)
+                    if rgb_observed is not None
+                    else 0
+                ),
+            },
+        },
+    }
+
+
 def _compute_kitchen_clean_floorplan_layers_from_grids(
     camera_id: str,
     *,
     height_grid: np.ndarray,
     support_grid: np.ndarray,
+    grid_res_m: float = 0.15,
 ) -> Tuple[np.ndarray, np.ndarray, Dict[str, Any]]:
     """Return (obstacle_height_grid, walkable_grid, meta) using only rasterized grids.
 
@@ -1094,8 +2280,12 @@ def _compute_kitchen_clean_floorplan_layers_from_grids(
     min_support = int(_FLOORPLAN_CLEAN_MIN_SUPPORT)
     obstacle_mask = inside & observed & (support >= min_support) & (height_above > float(thr))
     obstacle_mask = _remove_small_components(obstacle_mask, int(_FLOORPLAN_CLEAN_MIN_COMPONENT_CELLS))
-    structure = np.ones((_FLOORPLAN_CLEAN_MORPH_SIZE, _FLOORPLAN_CLEAN_MORPH_SIZE), dtype=bool)
-    pad = max(0, int(_FLOORPLAN_CLEAN_MORPH_SIZE) // 2)
+    morph_size = _metric_morphology_size(
+        _FLOORPLAN_CLEAN_MORPH_RADIUS_M,
+        grid_res_m,
+    )
+    structure = np.ones((morph_size, morph_size), dtype=bool)
+    pad = max(0, int(morph_size) // 2)
     if pad > 0:
         padded = np.pad(obstacle_mask, pad_width=pad, mode="constant", constant_values=False)
         padded = ndi.binary_closing(padded, structure=structure, border_value=0)
@@ -1144,7 +2334,9 @@ def _compute_kitchen_clean_floorplan_layers_from_grids(
         "thresholds": {
             "min_support": int(min_support),
             "min_component_cells": int(_FLOORPLAN_CLEAN_MIN_COMPONENT_CELLS),
-            "morph_size": int(_FLOORPLAN_CLEAN_MORPH_SIZE),
+            "morph_radius_m": float(_FLOORPLAN_CLEAN_MORPH_RADIUS_M),
+            "morph_size_cells": int(morph_size),
+            "grid_res_m": float(grid_res_m),
         },
         "camera_id": str(camera_id),
     }
@@ -1207,14 +2399,6 @@ def _compute_kitchen_clean_floorplan_layers_from_agl_grids(
     obs_min_pts = int(_FLOORPLAN_AGL_OBSTACLE_SUPPORT_MIN_POINTS)
     floor_ratio_min = float(_FLOORPLAN_AGL_FLOOR_SUPPORT_RATIO_MIN)
     obs_ratio_min = float(_FLOORPLAN_AGL_OBSTACLE_SUPPORT_RATIO_MIN)
-    range_thresh = float(_FLOORPLAN_AGL_OBSTACLE_RANGE_MIN_M)
-
-    # Ratios are more robust than per-cell mean AGL because vertical surfaces dump many points
-    # into a single (x,z) cell, inflating the mean and destroying floor separation.
-    denom = np.maximum(1.0, support.astype(np.float32))
-    floor_ratio = floor_support.astype(np.float32) / denom
-    obs_ratio = obstacle_support.astype(np.float32) / denom
-
     floor_seed = (
         inside
         & observed
@@ -1244,8 +2428,12 @@ def _compute_kitchen_clean_floorplan_layers_from_agl_grids(
         & (h_range <= flat_obs_max_delta)
     )
     obstacle_mask = _remove_small_components(obstacle_mask, int(_FLOORPLAN_CLEAN_MIN_COMPONENT_CELLS))
-    structure = np.ones((_FLOORPLAN_CLEAN_MORPH_SIZE, _FLOORPLAN_CLEAN_MORPH_SIZE), dtype=bool)
-    pad = max(0, int(_FLOORPLAN_CLEAN_MORPH_SIZE) // 2)
+    morph_size = _metric_morphology_size(
+        _FLOORPLAN_CLEAN_MORPH_RADIUS_M,
+        grid_res_m,
+    )
+    structure = np.ones((morph_size, morph_size), dtype=bool)
+    pad = max(0, int(morph_size) // 2)
     if pad > 0:
         padded = np.pad(obstacle_mask, pad_width=pad, mode="constant", constant_values=False)
         # Opening reduces thin spurious bridges between nearby obstacles (island vs counter)
@@ -1284,7 +2472,8 @@ def _compute_kitchen_clean_floorplan_layers_from_agl_grids(
             "floor_support_ratio_min": float(floor_ratio_min),
             "obstacle_support_ratio_min": float(obs_ratio_min),
             "min_component_cells": int(_FLOORPLAN_CLEAN_MIN_COMPONENT_CELLS),
-            "morph_size": int(_FLOORPLAN_CLEAN_MORPH_SIZE),
+            "morph_radius_m": float(_FLOORPLAN_CLEAN_MORPH_RADIUS_M),
+            "morph_size_cells": int(morph_size),
         },
         "cells": {
             "observed": int(np.count_nonzero(observed)),
@@ -1310,6 +2499,7 @@ def _compute_kitchen_clean_floorplan_layers(
     x_idx: np.ndarray,
     z_idx: np.ndarray,
     support_grid: np.ndarray,
+    grid_res_m: float = 0.15,
 ) -> Tuple[np.ndarray, np.ndarray, Dict[str, Any]]:
     """Return (obstacle_height_grid, walkable_grid, meta) for kitchen cameras."""
     h_px, w_px = support_grid.shape if hasattr(support_grid, "shape") else (0, 0)
@@ -1387,11 +2577,11 @@ def _compute_kitchen_clean_floorplan_layers(
             left_s = np.clip(left_s, 0, w_px - 1)
             right_s = np.clip(right_s, 0, w_px - 1)
             for idx, r in enumerate(range(int(start), int(end) + 1)):
-                l = int(left_s[idx])
+                left_col = int(left_s[idx])
                 rr = int(right_s[idx])
-                if rr < l:
+                if rr < left_col:
                     continue
-                inside[r, l: rr + 1] = True
+                inside[r, left_col: rr + 1] = True
 
             # Also add the convex hull of observed cells to reduce concavity in the footprint.
             # This makes the final BEV look more like a room floorplan instead of a thin strip.
@@ -1432,8 +2622,6 @@ def _compute_kitchen_clean_floorplan_layers(
     max_relevant = float(_FLOORPLAN_CLEAN_MAX_RELEVANT_H_M)
     thresh = float(_FLOORPLAN_CLEAN_OBSTACLE_THRESH_M)
     floor_band = float(_FLOORPLAN_CLEAN_FLOOR_SEED_BAND_M)
-    min_cells = int(_FLOORPLAN_CLEAN_MIN_COMPONENT_CELLS)
-
     def _side_counts(h_raw: np.ndarray) -> Tuple[int, int, float, float]:
         h_raw = np.asarray(h_raw, dtype=np.float32)
         finite_h = np.isfinite(h_raw)
@@ -1494,8 +2682,6 @@ def _compute_kitchen_clean_floorplan_layers(
         np.maximum.at(h_max, (rel_zi, rel_xi), rel_h_clip)
     h_min[~np.isfinite(h_min)] = np.nan
     h_max[~np.isfinite(h_max)] = 0.0
-    h_delta = np.nan_to_num(h_max - h_min, nan=np.inf, posinf=np.inf, neginf=np.inf).astype(np.float32, copy=False)
-
     # Obstacle classification: prefer cells that exhibit a strong, tight "top surface" mode.
     # This targets countertops/tabletops and avoids walls/cabinet-front clutter that tends to
     # blanket the grid when using per-cell mean/max alone.
@@ -1548,10 +2734,14 @@ def _compute_kitchen_clean_floorplan_layers(
     )
 
     obstacle_mask = inside & flat_top
-    structure = np.ones((_FLOORPLAN_CLEAN_MORPH_SIZE, _FLOORPLAN_CLEAN_MORPH_SIZE), dtype=bool)
+    morph_size = _metric_morphology_size(
+        _FLOORPLAN_CLEAN_MORPH_RADIUS_M,
+        grid_res_m,
+    )
+    structure = np.ones((morph_size, morph_size), dtype=bool)
     obstacle_mask = _remove_small_components(obstacle_mask, int(_FLOORPLAN_CLEAN_MIN_COMPONENT_CELLS))
     # Run closing on a padded grid so we don't accidentally erode real obstacles that touch the array edge.
-    pad = max(0, int(_FLOORPLAN_CLEAN_MORPH_SIZE) // 2)
+    pad = max(0, int(morph_size) // 2)
     if pad > 0:
         padded = np.pad(obstacle_mask, pad_width=pad, mode="constant", constant_values=False)
         padded = ndi.binary_closing(padded, structure=structure, border_value=0)
@@ -1565,7 +2755,7 @@ def _compute_kitchen_clean_floorplan_layers(
 
     # For visualization, fill tiny holes inside obstacle regions by propagating local maxima.
     if np.any(obstacle_mask):
-        local_max = ndi.maximum_filter(obstacle_height, size=_FLOORPLAN_CLEAN_MORPH_SIZE)
+        local_max = ndi.maximum_filter(obstacle_height, size=morph_size)
         hole_mask = obstacle_mask & (obstacle_height < float(_FLOORPLAN_CLEAN_OBSTACLE_THRESH_M))
         if np.any(hole_mask):
             obstacle_height[hole_mask] = np.maximum(local_max[hole_mask], float(_FLOORPLAN_CLEAN_OBSTACLE_THRESH_M)).astype(np.float32, copy=False)
@@ -1589,7 +2779,9 @@ def _compute_kitchen_clean_floorplan_layers(
             "max_obstacle_m": float(_FLOORPLAN_CLEAN_MAX_OBSTACLE_H_M),
             "min_support": int(_FLOORPLAN_CLEAN_MIN_SUPPORT),
             "min_component_cells": int(_FLOORPLAN_CLEAN_MIN_COMPONENT_CELLS),
-            "morph_size": int(_FLOORPLAN_CLEAN_MORPH_SIZE),
+            "morph_radius_m": float(_FLOORPLAN_CLEAN_MORPH_RADIUS_M),
+            "morph_size_cells": int(morph_size),
+            "grid_res_m": float(grid_res_m),
             "floor_band_m": float(_FLOORPLAN_CLEAN_FLOOR_SEED_BAND_M),
             "floor_support_band_m": float(_FLOORPLAN_CLEAN_FLOOR_SUPPORT_BAND_M),
             "obstacle_support_min_m": float(_FLOORPLAN_CLEAN_OBSTACLE_SUPPORT_MIN_M),

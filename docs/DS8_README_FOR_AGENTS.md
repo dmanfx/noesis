@@ -32,7 +32,7 @@ Key config files:
 
 - `config/infer.yaml`
   - DS8 Service Maker / pipeline config:
-    - Sources (URIs, per-source settings).
+    - Sources (`uri_secret` references plus non-secret per-source settings).
     - Streammux configuration.
     - Models:
       - PGIE (`models.pgie`)
@@ -52,6 +52,8 @@ Key config files:
         - Default: `menon_scene` (world/scene units).
         - Legacy: `camera_local` (camera-local projection).
       - Env override: `NOESIS_BEV_FRAME=menon_scene|camera_local` (aliases like `world`/`global` map to world mode).
+  - Camera locators are resolved only in memory from the owner-only registry
+    documented in `Runtime_Secrets.md`. Inline RTSP values are invalid.
   - Calibration/extrinsics selection:
     - Default extrinsics: `config/camera_calibration.json`.
     - Env override: `NOESIS_CALIBRATION_EXTRINSICS=/path/to/file.json`.
@@ -67,9 +69,22 @@ Key config files:
   - `config/analytics_exclude_baseline.ini` (exclusion ROIs)
 - Runtime config files still consumed by DS8 components:
   - `pipelines/config_infer_primary_yolo11*.ini` – nvinfer model config.
+  - `pipelines/config_infer_secondary_depth_tracking_da2.ini` – reviewed
+    canonical DAv2 source contract; runtime derives its engine-only copy under
+    `NOESIS_BUILD_DIR`.
   - `pipelines/config_nvdsanalytics_post.ini` – analytics stage config.
-  - `pipelines/config_nvdsanalytics_exclude.ini` – exclusion ROI config.
+  - `config/nvdsanalytics.yaml` – durable exclusion-stage source of truth.
+  - `config/config_nvdsanalytics_exclude.ini` – derived native exclusion ROI
+    config (or the exact `NOESIS_ANALYTICS_EXCLUDE_CONFIG` runtime path).
   - `pipelines/config_osd.ini` – OSD behavior config.
+
+  Committed model/tracker configs may retain source paths for explicit offline
+  engine maintenance. The production graph never passes those files directly
+  to nvinfer or NvMOT: it requires each active model engine to be nonempty and
+  derives an engine-only copy under `NOESIS_BUILD_DIR/runtime_inference/`.
+  Runtime startup must fail if an engine or native extension is missing, empty,
+  stale, or incompatible; it must not export ONNX, compile native code, invoke
+  `trtexec`, or request an SDK rebuild.
 
 When designing DS8 behavior, keep it semantically aligned with current config behavior and DS8 YAML contracts where possible.
 

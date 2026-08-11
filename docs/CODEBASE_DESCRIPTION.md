@@ -1,5 +1,5 @@
 # Noesis Codebase Description
-_Status: current as of 2026-03-16._
+_Status: current as of 2026-08-08._
 
 ## Project Overview
 
@@ -28,7 +28,7 @@ Real-time multi-camera video analytics pipeline for:
   - MapAnything: gated full-frame GPU depth/RPC/floorplan branch
   - DAv2: always-on baseline tracking depth fused into world estimation
   - Offline DAv2->MapAnything registration artifact aligns room-relative range before projection
-- **Real-time WebRTC Streaming**: H.264 video via RTSP→WebRTC gateway for browser delivery
+- **Real-time WebRTC Streaming**: one GPU H.264 encode, AU-aligned SHM fanout, and one RTP packetization per browser peer
 - **Motion Trails**: GPU-rendered persistent trails behind tracked objects in the mosaic OSD
 
 ### Technology Stack
@@ -74,7 +74,7 @@ The system follows a **layered architecture** with clear separation between the 
 │  ┌───────────────────▼───────────────────┬────────────────────────────┐ │
 │  │ WebSocketServer                       │ MosaicWebRTCGateway        │ │
 │  │ (websocket_server.py)                 │ (mosaic_webrtc_gateway.py) │ │
-│  │  - Client management                  │  - RTSP→WebRTC passthrough │ │
+│  │  - Client management                  │  - H.264 AU→WebRTC delivery│ │
 │  │  - Metadata broadcast                 │  - Browser signaling       │ │
 │  │  - RPC handlers                       │  - No transcode            │ │
 │  └───────────────────────────────────────┴────────────────────────────┘ │
@@ -134,14 +134,16 @@ The system follows a **layered architecture** with clear separation between the 
 │                           sink_tee ───────────────────────────────┐      │
 │                               │                                   │      │
 │                               ▼                                   ▼      │
-│                          rtsp_queue                         other sinks   │
+│                    mosaic_encode_queue                    other sinks   │
 │                               │                              / placeholders│
 │                               ▼                                          │
-│                          rtsp_vconv                                      │
+│                   nvvideoconvert (NVMM)                                 │
 │                               │                                          │
 │                               ▼                                          │
-│                        nvrtspoutsinkbin                                  │
-│                           (H.264 RTSP)                                   │
+│                  noesisforceidr → NVENC                                 │
+│                               │                                          │
+│                               ▼                                          │
+│                 h264parse → shmsink (AUs)                               │
 └──────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -157,7 +159,9 @@ The system follows a **layered architecture** with clear separation between the 
   - **Preprocess**: Optional `nvdspreprocess` for ROI/tensor preparation
   - **Primary Inference**: `nvinfer` with runtime-materialized PGIE profile (commonly YOLO26-seg in current baseline work)
   - **Tee**: Splits flow to tracker chain, always-on DAv2 tracking-depth branch, and gated MapAnything branch
-  - **Exclude Stage**: optional `nvdsroiexclude` pruning before tracking
+  - **Exclude Stage**: repo-owned `nvdsroiexclude` pruning before tracking;
+    durable YAML is rendered to a bounded native INI and exact source coverage
+    is required
   - **Tracker**: `nvtracker` with NvDCF multi-object tracking
   - **Analytics**: optional `nvdsanalytics` for ROI/line crossing events
   - **ReID SGIE**: `nvinfer` with Swin-Tiny ReID model for cross-camera re-identification
@@ -166,7 +170,7 @@ The system follows a **layered architecture** with clear separation between the 
   - **Tracking Telemetry Stage**: canonical `track.world` publishing before BEV/OSD consumers
   - **Tiler**: `nvmultistreamtiler` creates mosaic view
   - **OSD**: `nvdsosd` overlays bounding boxes, masks, labels, and trails
-  - **Output Sinks**: `sink_tee` fans out to the RTSP branch (`rtsp_queue -> rtsp_vconv -> nvrtspoutsinkbin`) plus placeholder/auxiliary sinks. Mosaic JPEG/WebSocket output is removed in DS8.
+  - **Output Sinks**: `sink_tee` feeds the GPU mosaic encoder and AU-aligned `shmsink`; optional RTSP tooling can tee the already encoded AUs. Mosaic JPEG/WebSocket output is removed in DS8.
 - **Depth Ownership**:
   - MapAnything remains valve-gated for RPC/full-frame depth work
   - DAv2 remains always on for baseline tracking
@@ -181,8 +185,10 @@ The system follows a **layered architecture** with clear separation between the 
   - `attach_analytics_telemetry_hook`: Extracts tracks, events, and occupancy data
   - `attach_trail_overlay_hook`: Renders motion trails via NvDsDisplayMeta lines
   - `attach_osd_label_hook`: Customizes OSD text labels (stable ID, confidence)
-  - `attach_exclude_prune_hook`: Removes objects outside ROI exclusion zones
-  - `attach_analytics_reload_bridge`: Hot-reloads analytics config at runtime
+  - `attach_analytics_reload_bridge`: Commits analytics updates to the native
+    pre-tracker element and requires its exact hash/sequence receipt
+- **Exclusion ownership**: `nvdsroiexclude` is the sole pruning path; no Python
+  metadata hook or fallback removes exclusion objects
 - **TrailOverlayProcessor**: GPU-rendered per-person motion trails with configurable styling
 - **MapAnythingProcessor**: Tensor-to-depth conversion with async storage
 - **Baseline depth/world path**: consumes `NOESIS.OBJECT_DEPTH`, applies the offline DAv2->MapAnything registration artifact inside the pose-ray depth observation, and writes canonical `track.world`
@@ -195,7 +201,7 @@ The system follows a **layered architecture** with clear separation between the 
   - Attach all metadata hooks (intrinsics, analytics, depth, trails, ReID)
   - Start WebSocket server and REST API
   - Activate pipeline via `pyservicemaker.Pipeline.activate()`
-  - Manage WebRTC gateway startup (RTSP→WebRTC passthrough)
+  - Manage SHM feeder readiness and bounded WebRTC gateway startup
   - Handle graceful shutdown on SIGINT/SIGTERM
 - **CalibrationProvider**: Provides camera intrinsics/extrinsics for BEV rendering
 - **DepthRegistrationManager**: Loads and validates the per-camera DAv2->MapAnything registration artifact before baseline startup
@@ -210,9 +216,12 @@ The system follows a **layered architecture** with clear separation between the 
   - Rate limiting and telemetry tracking
 
 #### 5. **WebRTC Gateway** (`noesis/mosaic_webrtc_gateway.py`)
+- **MosaicH264ShmFeeder** (`noesis/mosaic_h264_bridge.py`): one
+  `shmsrc → h264parse → appsink` reader that fans complete encoded AUs to peers
 - **MosaicWebRTCGateway**: Ultra-light GStreamer WebRTC gateway
-- **Pipeline**: `rtspsrc → rtph264depay → h264parse → rtph264pay → webrtcbin`
-- **Zero Transcode**: Passthrough H.264 from RTSP to WebRTC (no GPU load)
+- **Per-peer pipeline**: `appsrc → rtph264pay → bounded queue → webrtcbin`
+- **Zero Transcode**: H.264 remains encoded after NVENC; the SHM, RTP, and
+  WebRTC bitstream edge is CPU transport rather than GPU video processing
 - **Signaling**: Uses WebSocketServer for SDP offer/answer and ICE candidate exchange
 - **IDR Requests**: Forces keyframes on peer connection for fast startup
 
@@ -253,7 +262,9 @@ The system follows a **layered architecture** with clear separation between the 
 - **depth_source.py**: `DepthStorageManager` for async depth snapshot storage
   - Zarr-based storage with LRU eviction
   - Floorplan generation from depth maps
-- **depth_publisher.py**: Depth diagnostics publishing
+- **depth_publisher.py**: Dormant, explicitly enabled MQTT/Influx depth
+  diagnostics publisher with owner-only credential-file loading; no active
+  DS8/DS9 constructor call
 
 #### 10. **Frontend** (`oai2-fe/src/`)
 - **App.tsx**: Main React component orchestrating UI panels
@@ -285,7 +296,9 @@ Noesis_Devel/
 ├── noesis/                          # Core DS8 application package
 │   ├── ds8_runtime.py              # DS8 runtime harness (main entry point)
 │   ├── depth_tracking_materialization.py # DAv2 depth-tracking asset materialization + native guardrails
-│   ├── mosaic_webrtc_gateway.py    # RTSP→WebRTC passthrough gateway
+│   ├── mosaic_h264_bridge.py       # Single SHM H.264 AU reader/fanout
+│   ├── mosaic_glib_context.py      # Shared GLib default-context driver
+│   ├── mosaic_webrtc_gateway.py    # Per-peer AU→RTP→WebRTC gateway
 │   ├── calibration/
 │   │   └── depth_registration.py   # DAv2->MapAnything registration contracts/loader
 │   ├── pipelines/
@@ -310,7 +323,7 @@ Noesis_Devel/
 ├── geometry/                        # Geometry and depth processing
 │   ├── homography.py               # Homography calculations
 │   ├── depth_source.py             # Depth storage manager
-│   ├── depth_publisher.py          # Depth diagnostics
+│   ├── depth_publisher.py          # Dormant secure depth diagnostics publisher
 │   ├── floor.py                    # Floor plane estimation
 │   └── transform.py                # Coordinate transforms
 │
@@ -427,9 +440,14 @@ analytics:
   config-file: config/config_nvdsanalytics_post.ini
 
 mosaic_output:
-  rtsp_enabled: true
+  rtsp_enabled: false
   rtsp_port: 8554
   mosaic_webrtc_enabled: true
+  mosaic_h264_shm_socket: /tmp/noesis-mosaic-h264
+  video_bitrate_kbps: 12000
+  h264_iframeinterval: 10
+  h264_idrinterval: 10
+  encoder: nvv4l2h264enc
 
 visualization:
   trails:
@@ -446,8 +464,9 @@ visualization:
 | `NOESIS_CAMERAS_CONFIG` | Cameras YAML path | `config/cameras.yaml` |
 | `NOESIS_WS_HOST` / `NOESIS_WS_PORT` | WebSocket bind | `0.0.0.0:6008` |
 | `NOESIS_REST_HOST` / `NOESIS_REST_PORT` | REST API bind | `0.0.0.0:8080` |
-| `NOESIS_MOSAIC_RTSP_ENABLED` | Enable RTSP output | `true` |
-| `NOESIS_MOSAIC_WEBRTC_ENABLED` | Enable WebRTC gateway | `true` |
+| `NOESIS_MOSAIC_RTSP_ENABLED` | Enable optional RTSP tooling output | config (`false`) |
+| `NOESIS_MOSAIC_WEBRTC_ENABLED` | Enable H.264 SHM output and WebRTC gateways | config (`true`) |
+| `NOESIS_MOSAIC_H264_SHM` | Override the H.264 SHM socket path | config (`/tmp/noesis-mosaic-h264`) |
 | `NOESIS_REID_ENABLED` | Enable StableIDManager | `true` |
 | `NOESIS_BEV_JPEG_ENABLED` | Ignored; BEV JPEG binaries are retired | n/a |
 | `NOESIS_DS8_FPS_PROBE` | Enable FPS debug probes | `false` |
@@ -469,8 +488,9 @@ visualization:
 11. **World Estimation**: Pose anchor + floor observation + registered DAv2 depth observation → fused backend `track.world`
 12. **Visualization**: Frames + canonical tracking telemetry → `nvmultistreamtiler` → `nvdsosd` → overlays + trails
 13. **Output**:
-    - **RTSP**: `sink_tee` → `rtsp_queue` → `rtsp_vconv` → `nvrtspoutsinkbin` → H.264 stream at `rtsp://host:8554/mosaic`
-    - **WebRTC**: `MosaicWebRTCGateway` consumes RTSP → WebRTC to browser
+    - **Encode**: `sink_tee` → leaky raw queue → NVMM conversion → `noesisforceidr` → `nvv4l2h264enc` → `h264parse`
+    - **WebRTC**: non-leaky AU queue → `shmsink` → one `MosaicH264ShmFeeder` → bounded per-peer `appsrc` → `rtph264pay` → `webrtcbin`
+    - **Optional RTSP tooling**: a non-leaky post-encode queue may tee the same H.264 AUs to `nvrtspoutsinkbin`; it is off by default and is not consumed by WebRTC
     - **WebSocket**: telemetry JSON + WebRTC signaling
 14. **Metadata Extraction**: `BatchMetadataOperator` probes extract `NvDsBatchMeta` and publish canonical track/depth telemetry
 15. **BEV Rendering**: Backend-owned `track.world` → BEV/Three.js/world-mode consumers without a second world-space smoother
@@ -485,7 +505,7 @@ visualization:
 4. **Observer Pattern**: WebSocket server broadcasts to multiple clients; toggle callbacks
 5. **Registration Pattern**: Offline DAv2->MapAnything artifact aligns room-relative range before runtime world projection
 6. **Valve Pattern**: GStreamer `valve` element for conditional MapAnything branch gating
-7. **Gateway Pattern**: `MosaicWebRTCGateway` bridges RTSP and WebRTC protocols
+7. **Gateway Pattern**: one SHM AU feeder isolates the Service Maker graph from bounded per-peer `MosaicWebRTCGateway` lifecycles
 
 ---
 
@@ -496,7 +516,7 @@ visualization:
 3. **Offline Registration Build**: `scripts/build_depth_registration.py` pairs DAv2 and MapAnything depth on matching frames to produce `config/depth_registration.json`
 4. **Python → Frontend**: WebSocket server streams telemetry JSON and WebRTC signaling
 5. **Frontend → Backend**: RPC messages for calibration, depth requests, floorplan generation, and BEV config
-6. **RTSP → WebRTC**: `MosaicWebRTCGateway` passthrough (no transcoding)
+6. **Encoded Mosaic → WebRTC**: SHM AU fanout plus per-peer RTP packetization (no transcoding)
 
 ---
 
@@ -538,7 +558,7 @@ npm run dev  # Development server at http://localhost:5173
 ```bash
 export NOESIS_LOG_LEVEL=DEBUG
 export NOESIS_DS8_FPS_PROBE=1          # Enable FPS probes
-export NOESIS_MOSAIC_RTSP_ENABLED=1    # Enable RTSP output
+export NOESIS_MOSAIC_RTSP_ENABLED=0    # Keep optional RTSP tooling off
 export NOESIS_MOSAIC_WEBRTC_ENABLED=1  # Enable WebRTC gateway
 # NOESIS_BEV_JPEG_ENABLED is ignored; BEV JPEG binaries are retired.
 export NOESIS_REID_ENABLED=1           # Enable ReID
@@ -549,7 +569,7 @@ export NOESIS_REID_ENABLED=1           # Enable ReID
 ## Current State
 
 - **Stack**: DeepStream 8.0 Service Maker (`pyservicemaker`)
-- **Video Delivery**: RTSP → WebRTC gateway (mosaic); WebSocket carries
+- **Video Delivery**: H.264 AU SHM → WebRTC gateways (mosaic); WebSocket carries
   telemetry JSON and signaling.
 - **Tracking**: NvDCF (ReID re-association) + Swin ReID for stable cross-camera IDs
 - **Depth**:

@@ -1,0 +1,78 @@
+{
+  "schema_version": 1,
+  "default_profile": "canonical_294x518_b3_fp32",
+  "profiles": {
+    "canonical_294x518_b3_fp32": {
+      "status": "canonical",
+      "batch_size": 3,
+      "input_height": 294,
+      "input_width": 518,
+      "patch_size": 14,
+      "opset": 17,
+      "precision": "fp32",
+      "interval": 89,
+      "onnx": "DS9/models/onnx/mapanything_images_294x518_b3.onnx",
+      "engine": "DS9/models/engines/mapanything_images_294x518_b3_fp32.plan",
+      "infer_config": "DS9/pipelines/config_infer_secondary_mapanything.ini",
+      "functional_fixture": "DS9/models/engine_validation/mapanything/images-b3.raw",
+      "output_layers": [
+        "depth",
+        "conf",
+        "mask"
+      ],
+      "builder": {
+        "builder_optimization_level": 0,
+        "max_aux_streams": 0,
+        "workspace_mib": 1024
+      }
+    },
+    "v11_control_294x518_b3_fp32": {
+      "status": "candidate",
+      "batch_size": 3,
+      "input_height": 294,
+      "input_width": 518,
+      "patch_size": 14,
+      "opset": 17,
+      "precision": "fp32",
+      "interval": 89,
+      "onnx": "DS9/models/onnx/candidates/v11_control_294x518_b3_fp32/mapanything_images_v11_294x518_b3.onnx",
+      "engine": "DS9/models/engines/candidates/mapanything_images_v11_294x518_b3_fp32.plan",
+      "infer_config": "DS9/pipelines/config_infer_secondary_mapanything_v11_control.ini",
+      "functional_fixture": "DS9/models/engine_validation/mapanything/v11_control_294x518/images-b3.raw",
+      "output_layers": [
+        "depth",
+        "conf",
+        "mask"
+      ],
+      "builder": {
+        "builder_optimization_level": 0,
+        "max_aux_streams": 0,
+        "workspace_mib": 1024
+      }
+    },
+    "hr0_378x672_b3_fp32": {
+      "status": "candidate",
+      "batch_size": 3,
+      "input_height": 378,
+      "input_width": 672,
+      "patch_size": 14,
+      "opset": 17,
+      "precision": "fp32",
+      "interval": 89,
+      "onnx": "DS9/models/onnx/candidates/hr0_378x672_b3_fp32/mapanything_images_378x672_b3.onnx",
+      "engine": "DS9/models/engines/candidates/mapanything_images_378x672_b3_fp32.plan",
+      "infer_config": "DS9/pipelines/config_infer_secondary_mapanything_hr0.ini",
+      "functional_fixture": "DS9/models/engine_validation/mapanything/hr0_378x672/images-b3.raw",
+      "output_layers": [
+        "depth",
+        "conf",
+        "mask"
+      ],
+      "builder": {
+        "builder_optimization_level": 0,
+        "max_aux_streams": 0,
+        "workspace_mib": 1024
+      }
+    }
+  }
+}

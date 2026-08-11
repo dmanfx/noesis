@@ -32,6 +32,7 @@ from noesis.calibration.depth_registration_builder import (
     DepthRegistrationBuildError,
     build_registration_entry,
 )
+from noesis.calibration.manager import create_calibration_manager, load_camera_labels
 from noesis.depth_tracking_materialization import (
     DA2_CHECKPOINT_PATH,
     DA2_REPO_DIR,
@@ -39,9 +40,12 @@ from noesis.depth_tracking_materialization import (
     DEFAULT_MODEL_NAME,
 )
 from noesis.ds9_runtime_core import (
-    _CalibrationProvider,
     _build_depth_registration_profile_fingerprints,
-    _load_camera_labels,
+)
+from noesis_core.runtime_secrets import (
+    load_pipeline_config,
+    public_pipeline_config,
+    source_provenance_ref,
 )
 
 
@@ -135,7 +139,7 @@ def _iter_source_frames(
 ) -> Iterable[tuple[int, np.ndarray]]:
     cap = _video_capture_from_uri(uri)
     if not cap.isOpened():
-        raise RuntimeError(f"Unable to open source URI: {uri}")
+        raise RuntimeError("Unable to open configured camera source URI")
     try:
         idx = 0
         yielded = 0
@@ -422,28 +426,28 @@ def main() -> int:
     args = parser.parse_args()
 
     logging.basicConfig(level=getattr(logging, str(args.log_level).upper(), logging.INFO))
-    pipeline_cfg = json.loads(Path(args.pipeline_config).read_text(encoding="utf-8")) if args.pipeline_config.suffix == ".json" else None
-    if pipeline_cfg is None:
-        import yaml
+    pipeline_cfg = load_pipeline_config(args.pipeline_config, materialize_secrets=True)
+    public_pipeline_cfg = public_pipeline_config(pipeline_cfg)
 
-        pipeline_cfg = yaml.safe_load(Path(args.pipeline_config).read_text(encoding="utf-8")) or {}
-    if not isinstance(pipeline_cfg, dict):
-        raise RuntimeError(f"Pipeline config must decode to a mapping: {args.pipeline_config}")
-
-    camera_labels = _load_camera_labels(Path(args.cameras_config))
-    calibration_provider = _CalibrationProvider(Path(args.cameras_config), pipeline_cfg, tracking_mode="baseline")
-    calibration_provider.set_camera_labels(camera_labels)
+    camera_labels = load_camera_labels(Path(args.cameras_config))
+    calibration_provider = create_calibration_manager(
+        cameras_yaml_path=Path(args.cameras_config),
+        pipeline_config=pipeline_cfg,
+        camera_calibration_json_path=REPO_ROOT / "config" / "camera_calibration.json",
+        ply_alignment_json_path=REPO_ROOT / "config" / "ply_alignment.json",
+        camera_labels=camera_labels,
+    )
     calib_bundle = calibration_provider.calibration_bundle()
     map_source = MapAnythingDepthSource(load_service_config())
     da2_runner = _Da2Runner()
     depth_profile, mapanything_profile = _build_depth_registration_profile_fingerprints(
-        pipeline_cfg,
+        public_pipeline_cfg,
         pipeline_path=Path(args.pipeline_config).resolve(),
     )
     entries: dict[str, Any] = {}
     try:
         for source_id, camera_id, uri, source_cfg in _selected_cameras(pipeline_cfg, camera_labels, args.camera):
-            LOGGER.info("Building depth registration for camera=%s uri=%s", camera_id, uri)
+            LOGGER.info("Building depth registration for camera=%s", camera_id)
             snapshot = calibration_provider.snapshot(int(source_id), camera_id)
             if snapshot is None:
                 raise RuntimeError(f"Calibration unavailable for camera {camera_id}")
@@ -497,7 +501,7 @@ def main() -> int:
                 dav2_profile=depth_profile | {"builder_runtime_device": da2_runner.profile["runtime_device"]},
                 mapanything_profile=mapanything_profile,
                 provenance={
-                    "source_uri": uri,
+                    "source_uri": source_provenance_ref(source_cfg, source_id=source_id),
                     "frames_per_camera": int(len(frame_pairs)),
                     "sample_pixel_step": int(args.sample_pixel_step),
                     "row_start_frac": float(args.row_start_frac),

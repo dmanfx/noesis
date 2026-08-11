@@ -1,6 +1,6 @@
 [property]
-onnx-file=/home/mayor/Noesis_Devel/models/bisenetv2_ade20k/onnx/bisenetv2_ade20k.onnx
-model-engine-file=/home/mayor/Noesis_Devel/models/bisenetv2_ade20k/engines/bisenetv2_ade20k_b3_fp16.engine
+onnx-file=models/bisenetv2_ade20k/onnx/bisenetv2_ade20k.onnx
+model-engine-file=models/bisenetv2_ade20k/engines/bisenetv2_ade20k_b3_fp16.engine
 batch-size=3
 network-type=2
 num-detected-classes=150
@@ -12,5 +12,5 @@ segmentation-output-order=0
 segmentation-threshold=0.0
 gie-unique-id=1
 output-blob-names=segmentation
-custom-lib-path=/home/mayor/Noesis_Devel/testpipelines/Bidnetpipe/custom/libbidnet_segparser.so
+custom-lib-path=testpipelines/Bidnetpipe/custom/libbidnet_segparser.so
 parse-segmentation-func-name=NvDsInferParseCustomBiSeNetFloor

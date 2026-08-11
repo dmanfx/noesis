@@ -1,0 +1,107 @@
+from .actions import ActionApproval, ActionIntent, AuditEntry, ExecutionReceipt
+from .appliance import (
+    DeploymentHealth,
+    DeploymentSelector,
+    RuntimeDeploymentContext,
+    StateBaseline,
+    StateRelease,
+    WebSocketDeploymentHealth,
+)
+from .health import CapabilityHealth
+from .identity import IdentityDecision
+from .identity_calibration import (
+    IdentityAuthorityCutoverArtifact,
+    IdentityCalibrationDataset,
+    IdentityEvidenceChainCheckpoint,
+    IdentityEvidenceLabelSet,
+    IdentityOpenSetCalibrationArtifact,
+    ShadowIdentityEvidenceRecord,
+)
+from .observation import ObservationEnvelope
+from .scene import SceneRelease
+from .scene_prior import ScenePriorCatalog, ScenePriorRevision
+from .world import WorldEvent, WorldSnapshot
+
+CONTRACT_MODELS = {
+    "action_approval": ActionApproval,
+    "action_intent": ActionIntent,
+    "audit_entry": AuditEntry,
+    "capability_health": CapabilityHealth,
+    "deployment_health": DeploymentHealth,
+    "deployment_selector": DeploymentSelector,
+    "runtime_deployment_context": RuntimeDeploymentContext,
+    "execution_receipt": ExecutionReceipt,
+    "identity_decision": IdentityDecision,
+    "identity_authority_cutover": IdentityAuthorityCutoverArtifact,
+    "identity_calibration_artifact": IdentityOpenSetCalibrationArtifact,
+    "identity_calibration_dataset": IdentityCalibrationDataset,
+    "identity_evidence_chain_checkpoint": IdentityEvidenceChainCheckpoint,
+    "identity_evidence_labels": IdentityEvidenceLabelSet,
+    "identity_shadow_evidence": ShadowIdentityEvidenceRecord,
+    "observation_envelope": ObservationEnvelope,
+    "scene_release": SceneRelease,
+    "scene_prior_catalog": ScenePriorCatalog,
+    "scene_prior_revision": ScenePriorRevision,
+    "state_baseline": StateBaseline,
+    "state_release": StateRelease,
+    "websocket_deployment_health": WebSocketDeploymentHealth,
+    "world_snapshot": WorldSnapshot,
+    "world_event": WorldEvent,
+}
+
+CONTRACT_MODELS_BY_NAME = {
+    "noesis.action.approval": ActionApproval,
+    "noesis.action.intent": ActionIntent,
+    "noesis.audit.entry": AuditEntry,
+    "noesis.capability.health": CapabilityHealth,
+    "noesis.appliance.deployment_health": DeploymentHealth,
+    "noesis.appliance.deployment_selector": DeploymentSelector,
+    "noesis.appliance.runtime_context": RuntimeDeploymentContext,
+    "noesis.action.receipt": ExecutionReceipt,
+    "noesis.identity.decision": IdentityDecision,
+    "noesis.identity.authority_cutover": IdentityAuthorityCutoverArtifact,
+    "noesis.identity.open_set_calibration": IdentityOpenSetCalibrationArtifact,
+    "noesis.identity.calibration_dataset": IdentityCalibrationDataset,
+    "noesis.identity.shadow_score_evidence_chain": IdentityEvidenceChainCheckpoint,
+    "noesis.identity.evidence_labels": IdentityEvidenceLabelSet,
+    "noesis.identity.shadow_score_evidence": ShadowIdentityEvidenceRecord,
+    "noesis.observation.person": ObservationEnvelope,
+    "noesis.scene.release": SceneRelease,
+    "noesis.scene_prior.catalog": ScenePriorCatalog,
+    "noesis.scene_prior.revision": ScenePriorRevision,
+    "noesis.appliance.state_baseline": StateBaseline,
+    "noesis.appliance.state_release": StateRelease,
+    "noesis.ws.health": WebSocketDeploymentHealth,
+    "noesis.world.snapshot": WorldSnapshot,
+    "noesis.world.event": WorldEvent,
+}
+
+
+__all__ = [
+    "ActionApproval",
+    "ActionIntent",
+    "AuditEntry",
+    "CapabilityHealth",
+    "DeploymentHealth",
+    "DeploymentSelector",
+    "RuntimeDeploymentContext",
+    "CONTRACT_MODELS",
+    "CONTRACT_MODELS_BY_NAME",
+    "ExecutionReceipt",
+    "IdentityDecision",
+    "IdentityAuthorityCutoverArtifact",
+    "IdentityCalibrationDataset",
+    "IdentityEvidenceLabelSet",
+    "IdentityEvidenceChainCheckpoint",
+    "IdentityOpenSetCalibrationArtifact",
+    "ObservationEnvelope",
+    "SceneRelease",
+    "ScenePriorCatalog",
+    "ScenePriorRevision",
+    "StateBaseline",
+    "StateRelease",
+    "ShadowIdentityEvidenceRecord",
+    "WorldSnapshot",
+    "WorldEvent",
+    "WebSocketDeploymentHealth",
+]

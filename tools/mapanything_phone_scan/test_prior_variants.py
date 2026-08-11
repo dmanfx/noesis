@@ -4,10 +4,46 @@ import numpy as np
 
 from tools.mapanything_phone_scan.run_mapanything_prior_variants import (
     _backproject_depth,
+    _resolve_carrier_frame,
     _rotation_error_deg,
+    _top_up_reliable_samples,
     _transform_poses,
     _zbuffer_depth,
 )
+
+
+def test_missing_world_alignment_selects_explicit_da3_native_carrier() -> None:
+    transform, frame, source = _resolve_carrier_frame(None)
+    np.testing.assert_array_equal(transform, np.eye(4, dtype=np.float64))
+    assert frame == "da3_metric_world_unaligned_to_noesis"
+    assert source is None
+
+
+def test_sparse_prior_top_up_uses_only_reliable_samples_deterministically() -> None:
+    reliable = np.asarray(
+        [
+            [[True, True, True], [False, False, False]],
+            [[True, False, True], [True, False, True]],
+        ]
+    )
+    sampled = np.zeros_like(reliable)
+    first, views, added = _top_up_reliable_samples(
+        reliable,
+        sampled,
+        rng=np.random.default_rng(42),
+        minimum_per_view=2,
+    )
+    second, _, _ = _top_up_reliable_samples(
+        reliable,
+        sampled,
+        rng=np.random.default_rng(42),
+        minimum_per_view=2,
+    )
+    np.testing.assert_array_equal(first, second)
+    assert views == [0, 1]
+    assert added == 4
+    assert np.all(~first | reliable)
+    np.testing.assert_array_equal(np.count_nonzero(first, axis=(1, 2)), [2, 2])
 
 
 def test_backproject_depth_uses_opencv_z_depth_and_cam2world() -> None:
@@ -64,3 +100,15 @@ def test_zbuffer_keeps_nearest_point_per_pixel() -> None:
     assert count == 2
     assert depth[2, 2] == 1.5
     assert depth[2, 3] == 2.0
+
+
+def test_zbuffer_returns_empty_depth_when_all_points_are_behind_camera() -> None:
+    depth, count = _zbuffer_depth(
+        np.asarray([[0.0, 0.0, -1.0]], dtype=np.float64),
+        np.eye(4, dtype=np.float64),
+        np.eye(3, dtype=np.float64),
+        (5, 5),
+    )
+
+    assert count == 0
+    assert not np.any(depth)

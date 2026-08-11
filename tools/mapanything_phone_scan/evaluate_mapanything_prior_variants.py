@@ -26,6 +26,7 @@ if str(REPO_ROOT) not in sys.path:
 
 from tools.mapanything_phone_scan.alignment import (  # noqa: E402
     _full_cloud_metrics,
+    _resolve_target_cloud_for_calibrated_camera,
     _write_reprojection,
     _write_topdown,
 )
@@ -130,6 +131,43 @@ def _rigid_candidate(
         alignment_rotation=transform[:3, :3].copy(),
         alignment_translation=transform[:3, 3].copy(),
         alignment_method="validated_da3_to_backend_rigid_transform",
+    )
+
+
+def _pose_carrier_alignment_mode(variant_root: Path) -> str:
+    manifest_path = variant_root / "variant_manifest.json"
+    if not manifest_path.is_file():
+        raise ValueError(f"conditioned variant manifest is missing: {manifest_path}")
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    coordinate_frame = str(manifest.get("coordinate_frame") or "")
+    if coordinate_frame == "backend_world_m_stream_points":
+        return "identity"
+    if coordinate_frame == "da3_metric_world_unaligned_to_noesis":
+        return "world_from_da3"
+    raise ValueError(
+        f"conditioned variant has unsupported coordinate frame {coordinate_frame!r}: "
+        f"{manifest_path}"
+    )
+
+
+def _pose_carrier_candidate(
+    slug: str,
+    label: str,
+    variant_root: Path,
+    raw_relative: str,
+    world_from_da3: np.ndarray,
+    point_budget: int,
+) -> Candidate:
+    raw_root = variant_root / raw_relative
+    alignment_mode = _pose_carrier_alignment_mode(variant_root)
+    if alignment_mode == "identity":
+        return _identity_candidate(slug, label, raw_root, point_budget)
+    return _rigid_candidate(
+        slug,
+        label,
+        raw_root,
+        world_from_da3,
+        point_budget,
     )
 
 
@@ -466,6 +504,10 @@ def main() -> int:
         args.calibration.resolve(),
         args.camera,
     )
+    target_points, _, _ = _resolve_target_cloud_for_calibrated_camera(
+        target_points,
+        static.camera_to_world,
+    )
     world_from_da3 = _load_world_from_da3(args.world_from_da3.resolve())
     da3_raw = args.da3_raw.resolve()
     da3_sequence = _load_sequence(da3_raw, "DA3")
@@ -512,10 +554,12 @@ def main() -> int:
     )
     if "da3_pose" in args.variants:
         candidates.append(
-            _identity_candidate(
+            _pose_carrier_candidate(
                 "ma_da3_pose",
                 "MA + DA3 pose",
-                suite_root / "mapanything_da3_pose" / "raw",
+                suite_root / "mapanything_da3_pose",
+                "raw",
+                world_from_da3,
                 args.point_budget,
             )
         )
@@ -531,19 +575,23 @@ def main() -> int:
         )
     if "da3_pose_sparse_depth" in args.variants:
         candidates.append(
-            _identity_candidate(
+            _pose_carrier_candidate(
                 "ma_da3_pose_depth",
                 "MA + DA3 pose/depth",
-                suite_root / "mapanything_da3_pose_sparse_depth" / "raw",
+                suite_root / "mapanything_da3_pose_sparse_depth",
+                "raw",
+                world_from_da3,
                 args.point_budget,
             )
         )
     if "da3_pose_sparse_depth_static" in args.variants:
         candidates.append(
-            _identity_candidate(
+            _pose_carrier_candidate(
                 "ma_da3_pose_depth_static",
                 "MA + DA3 pose/depth + static",
-                suite_root / "mapanything_da3_pose_sparse_depth_static" / "phone_raw",
+                suite_root / "mapanything_da3_pose_sparse_depth_static",
+                "phone_raw",
+                world_from_da3,
                 args.point_budget,
             )
         )
@@ -631,6 +679,7 @@ def main() -> int:
                 target_points,
                 static.camera_from_world,
                 static.intrinsics,
+                args.camera.replace("-", " "),
             )
             _write_topdown(
                 topdown_path,

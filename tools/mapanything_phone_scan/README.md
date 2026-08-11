@@ -115,7 +115,11 @@ present.
    select **Align to selected camera**. The target is saved with the walk before
    alignment starts. The tool estimates the phone floor, preserves gravity and
    metric scale, and registers room structure to that camera's validated room
-   reconstruction.
+   reconstruction. It also verifies that the selected camera faces its own
+   target cloud. If an imported pose has the common local-X/Z half-turn
+   convention, alignment stops with a calibration error. Correct the camera
+   pose before retrying; the workflow never rotates the authoritative target
+   cloud or silently rewrites the global Noesis calibration.
 9. A weak or ambiguous registration fails its quality gate. A passing result
    remains a review candidate until explicitly promoted by a separate workflow.
 

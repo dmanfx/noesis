@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sys
+from pathlib import Path
 
 import numpy as np
 
@@ -8,6 +9,7 @@ from tools.mapanything_phone_scan.evaluate_mapanything_prior_variants import (
     _bounded_source,
     _camera_oriented_bev,
     _parse_args,
+    _pose_carrier_alignment_mode,
     _pose_metrics,
 )
 
@@ -76,3 +78,27 @@ def test_parse_args_accepts_room_specific_inputs_and_selected_variant(
     assert str(args.prior_consensus_raw) == "consensus/raw"
     assert args.variants == ["da3_pose_sparse_depth"]
     assert args.camera == "foyer"
+
+
+def test_pose_carrier_alignment_mode_accepts_backend_world(tmp_path: Path) -> None:
+    variant = tmp_path / "variant"
+    variant.mkdir()
+    (variant / "variant_manifest.json").write_text(
+        '{"coordinate_frame":"backend_world_m_stream_points"}',
+        encoding="utf-8",
+    )
+
+    assert _pose_carrier_alignment_mode(variant) == "identity"
+
+
+def test_pose_carrier_alignment_mode_applies_late_da3_alignment(
+    tmp_path: Path,
+) -> None:
+    variant = tmp_path / "variant"
+    variant.mkdir()
+    (variant / "variant_manifest.json").write_text(
+        '{"coordinate_frame":"da3_metric_world_unaligned_to_noesis"}',
+        encoding="utf-8",
+    )
+
+    assert _pose_carrier_alignment_mode(variant) == "world_from_da3"

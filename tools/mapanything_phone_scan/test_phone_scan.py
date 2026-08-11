@@ -6,9 +6,15 @@ from typing import Any, Callable
 
 import cv2
 import numpy as np
+import pytest
 from fastapi.testclient import TestClient
 
-from tools.mapanything_phone_scan.alignment import NoesisAlignmentSettings
+from tools.mapanything_phone_scan.alignment import (
+    NoesisAlignmentError,
+    NoesisAlignmentSettings,
+    _resolve_target_camera_orientation,
+    _resolve_target_cloud_for_calibrated_camera,
+)
 from tools.mapanything_phone_scan.app import APP_ROOT, REPO_ROOT, PhoneScanSettings, create_app
 from tools.mapanything_phone_scan.da3_inference import DA3PhoneScanSettings
 from tools.mapanything_phone_scan.inference import MapAnythingScanSettings
@@ -80,6 +86,58 @@ def _wait_for_alignment(client: TestClient, scan_id: str, expected: str) -> dict
             return payload
         time.sleep(0.02)
     raise AssertionError(f"scan {scan_id} alignment did not reach {expected}")
+
+
+def test_target_camera_orientation_preserves_forward_facing_pose() -> None:
+    target_points = np.asarray(
+        [[-1.0, 0.0, 2.0], [0.0, 1.0, 3.0], [1.0, 0.5, 4.0]],
+        dtype=np.float64,
+    )
+
+    camera_to_world, metrics = _resolve_target_camera_orientation(
+        target_points,
+        np.eye(4, dtype=np.float64),
+    )
+
+    np.testing.assert_allclose(camera_to_world, np.eye(4))
+    assert metrics["local_yaw_correction_deg"] == 0.0
+    assert metrics["selected_forward_fraction"] == 1.0
+
+
+def test_target_camera_orientation_rejects_decisive_half_turn() -> None:
+    target_points = np.asarray(
+        [[-1.0, 0.0, 2.0], [0.0, 1.0, 3.0], [1.0, 0.5, 4.0]],
+        dtype=np.float64,
+    )
+    reversed_camera_to_world = np.eye(4, dtype=np.float64)
+    reversed_camera_to_world[:3, :3] = np.asarray(
+        [[-1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, -1.0]],
+        dtype=np.float64,
+    )
+
+    with pytest.raises(NoesisAlignmentError, match="correct the camera calibration"):
+        _resolve_target_camera_orientation(
+            target_points,
+            reversed_camera_to_world,
+        )
+
+
+def test_target_cloud_rejects_half_turn_instead_of_rotating_geometry() -> None:
+    target_points = np.asarray(
+        [[-1.0, 0.2, 2.0], [0.0, 1.0, 3.0], [1.0, 0.5, 4.0]],
+        dtype=np.float64,
+    )
+    reversed_camera_to_world = np.eye(4, dtype=np.float64)
+    reversed_camera_to_world[:3, :3] = np.asarray(
+        [[-1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, -1.0]],
+        dtype=np.float64,
+    )
+
+    with pytest.raises(NoesisAlignmentError, match="correct the camera calibration"):
+        _resolve_target_cloud_for_calibrated_camera(
+            target_points,
+            reversed_camera_to_world,
+        )
 
 
 def test_prepare_video_frames_preserves_full_walk_coverage(tmp_path: Path) -> None:

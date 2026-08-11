@@ -91,6 +91,102 @@ def _transform_points(points: np.ndarray, transform: np.ndarray) -> np.ndarray:
     return (transform[:3, :3] @ np.asarray(points, dtype=np.float64).T).T + transform[:3, 3]
 
 
+def _resolve_target_camera_orientation(
+    target_points: np.ndarray,
+    calibrated_camera_to_world: np.ndarray,
+) -> tuple[np.ndarray, dict[str, Any]]:
+    """Validate camera-forward convention without changing authoritative geometry."""
+
+    target_points = np.asarray(target_points, dtype=np.float64)
+    calibrated_camera_to_world = np.asarray(
+        calibrated_camera_to_world,
+        dtype=np.float64,
+    )
+    if calibrated_camera_to_world.shape != (4, 4) or not np.isfinite(
+        calibrated_camera_to_world
+    ).all():
+        raise NoesisAlignmentError("target camera pose is malformed")
+
+    local_half_turn = np.eye(4, dtype=np.float64)
+    local_half_turn[:3, :3] = np.asarray(
+        [[-1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, -1.0]],
+        dtype=np.float64,
+    )
+    half_turn_camera_to_world = calibrated_camera_to_world @ local_half_turn
+
+    def forward_fraction(camera_to_world: np.ndarray) -> float:
+        camera_points = _transform_points(target_points, np.linalg.inv(camera_to_world))
+        finite = np.isfinite(camera_points).all(axis=1)
+        if not np.any(finite):
+            return 0.0
+        return float(np.mean(camera_points[finite, 2] > 0.05))
+
+    calibrated_fraction = forward_fraction(calibrated_camera_to_world)
+    half_turn_fraction = forward_fraction(half_turn_camera_to_world)
+    minimum_forward_fraction = 0.75
+    minimum_half_turn_improvement = 0.50
+
+    if calibrated_fraction < minimum_forward_fraction and (
+        half_turn_fraction >= minimum_forward_fraction
+        and half_turn_fraction - calibrated_fraction >= minimum_half_turn_improvement
+    ):
+        raise NoesisAlignmentError(
+            "target camera calibration faces away from its authoritative room point "
+            "cloud; correct the camera calibration rather than rotating target "
+            "geometry: "
+            f"calibrated_forward_fraction={calibrated_fraction:.3f}, "
+            f"half_turn_forward_fraction={half_turn_fraction:.3f}"
+        )
+    if calibrated_fraction < minimum_forward_fraction:
+        raise NoesisAlignmentError(
+            "target camera forward direction is inconsistent with its room point cloud: "
+            f"calibrated_forward_fraction={calibrated_fraction:.3f}, "
+            f"half_turn_forward_fraction={half_turn_fraction:.3f}"
+        )
+
+    return calibrated_camera_to_world, {
+        "method": "target_cloud_forward_visibility_validation",
+        "local_yaw_correction_deg": 0.0,
+        "calibrated_forward_fraction": calibrated_fraction,
+        "half_turn_forward_fraction": half_turn_fraction,
+        "selected_forward_fraction": calibrated_fraction,
+        "minimum_forward_fraction": minimum_forward_fraction,
+        "minimum_half_turn_improvement": minimum_half_turn_improvement,
+    }
+
+
+def _resolve_target_cloud_for_calibrated_camera(
+    target_points: np.ndarray,
+    calibrated_camera_to_world: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, dict[str, Any]]:
+    """Validate calibration and preserve the authoritative target cloud unchanged."""
+
+    points = np.asarray(target_points, dtype=np.float64)
+    camera_to_world = np.asarray(calibrated_camera_to_world, dtype=np.float64)
+    _, orientation = _resolve_target_camera_orientation(points, camera_to_world)
+    correction = np.eye(4, dtype=np.float64)
+    camera_points = _transform_points(points, np.linalg.inv(camera_to_world))
+    finite = np.isfinite(camera_points).all(axis=1)
+    corrected_forward_fraction = (
+        float(np.mean(camera_points[finite, 2] > 0.05)) if np.any(finite) else 0.0
+    )
+    result = dict(orientation)
+    result.update(
+        {
+            "resolution_action": "preserve_target_cloud",
+            "calibrated_camera_pose_preserved": True,
+            "target_cloud_world_yaw_correction_deg": 0.0,
+            "target_cloud_correction_row_major": correction.tolist(),
+            "corrected_target_forward_fraction": corrected_forward_fraction,
+        }
+    )
+    if corrected_forward_fraction < float(orientation["minimum_forward_fraction"]):
+        raise NoesisAlignmentError(
+            "corrected target cloud is not visible through the calibrated camera"
+        )
+    return points, correction, result
+
+
 def _load_phone_clouds(
     scan_dir: Path,
     outputs: dict[str, Any],
@@ -580,6 +676,7 @@ def _write_reprojection(
     target_points: np.ndarray,
     camera_from_world: np.ndarray,
     intrinsics: np.ndarray,
+    camera_label: str,
 ) -> dict[str, float]:
     image = cv2.imread(str(source_frame_path), cv2.IMREAD_COLOR)
     if image is None:
@@ -621,7 +718,7 @@ def _write_reprojection(
     ).astype(np.uint8)
     cv2.putText(
         overlay,
-        "Aligned phone reconstruction through fixed living-room camera",
+        f"Aligned phone reconstruction through fixed {camera_label} camera",
         (24, 40),
         cv2.FONT_HERSHEY_SIMPLEX,
         0.72,
@@ -673,7 +770,8 @@ def run_noesis_alignment(
     settings: NoesisAlignmentSettings,
     progress: ProgressCallback,
 ) -> dict[str, Any]:
-    progress(0.02, "Loading saved phone and living-room reconstruction points")
+    camera_label = settings.camera_id.replace("-", " ").title()
+    progress(0.02, f"Loading saved phone and {camera_label} reconstruction points")
     target_revision = settings.target_revision.resolve()
     target_npz = target_revision / "room_points.npz"
     target_meta_path = target_revision / "room_points_meta.json"
@@ -728,8 +826,16 @@ def run_noesis_alignment(
     target_world_correction = np.asarray(
         floor_alignment["world_correction_col_major"], dtype=np.float64
     ).reshape((4, 4), order="F")
-    target_camera_to_world = target_world_correction @ np.linalg.inv(camera_from_backend)
-    target_camera_from_world = camera_from_backend @ np.linalg.inv(target_world_correction)
+    calibrated_target_camera_to_world = (
+        target_world_correction @ np.linalg.inv(camera_from_backend)
+    )
+    target_points, _, target_camera_orientation = (
+        _resolve_target_cloud_for_calibrated_camera(
+            target_points, calibrated_target_camera_to_world
+        )
+    )
+    target_camera_to_world = calibrated_target_camera_to_world
+    target_camera_from_world = np.linalg.inv(target_camera_to_world)
     intrinsics = np.asarray(target_meta.get("intrinsics"), dtype=np.float64)
     if intrinsics.shape != (3, 3) or not np.isfinite(intrinsics).all():
         raise NoesisAlignmentError("target revision intrinsics are malformed")
@@ -878,6 +984,9 @@ def run_noesis_alignment(
             abs(float(np.linalg.det(world_from_phone[:3, :3])) - 1.0) <= 1e-5
         ),
         "round_trip": bool(identity_error <= 1e-6),
+        "target_camera_forward_visibility": bool(
+            target_camera_orientation["selected_forward_fraction"] >= 0.75
+        ),
         "candidate_separation": bool(explicit_anchor or candidate_margin >= 0.05),
         "fixed_camera_anchor_position": bool(
             anchor_metrics is None or anchor_metrics["position_error_m"] <= 0.30
@@ -942,6 +1051,7 @@ def run_noesis_alignment(
         target_points,
         target_camera_from_world,
         intrinsics,
+        camera_label,
     )
     trajectory_path = output_dir / "aligned_camera_trajectory.json"
     trajectory_path.write_text(
@@ -991,6 +1101,7 @@ def run_noesis_alignment(
             "coordinate_frame": coordinate_frame,
             "revision_locator": f"data/virtual_twin/revisions/{target_revision.name}",
             "point_count": int(target_points.shape[0]),
+            "camera_orientation": target_camera_orientation,
         },
         "method": {
             "name": (
@@ -1057,13 +1168,14 @@ def run_noesis_alignment(
         for path in sorted(output_dir.iterdir())
         if path.is_file()
     ]
-    progress(1.0, "Phone reconstruction is aligned to the living-room Noesis world")
+    progress(1.0, f"Phone reconstruction is aligned to the {camera_label} Noesis world")
     return {
         "schema": "noesis.phone_scan.alignment_outputs.v2",
         "generated_at": generated_at,
         "coordinate_frame": coordinate_frame,
         "target_camera_id": settings.camera_id,
         "target_revision_id": target_meta.get("revision_id"),
+        "target_camera_orientation": target_camera_orientation,
         "admission": "saved_review_candidate_not_promoted_to_live_noesis",
         "quality_gate": report["quality_gate"],
         "vertical_structure": best["metrics"],

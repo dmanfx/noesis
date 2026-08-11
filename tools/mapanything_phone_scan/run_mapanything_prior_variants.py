@@ -10,9 +10,11 @@ produces four review variants:
 * the same combined priors with a calibrated static-camera view as view zero.
 
 For pose-conditioned variants, MapAnything is allowed to predict its own pose
-solution, but saved world points are back-projected through the supplied poses.
-This makes the DA3/static pose graph the explicit world-coordinate carrier and
-preserves MapAnything's predicted poses separately for disagreement diagnostics.
+solution, but saved points are back-projected through the supplied DA3 poses.
+Those poses may remain in DA3's native metric frame for phone-only fusion, or
+may be transformed into the Noesis backend world after an independent static
+alignment has passed. MapAnything's predicted poses remain separate for
+disagreement diagnostics.
 """
 
 from __future__ import annotations
@@ -56,6 +58,10 @@ from tools.mapanything_phone_scan.inference import (  # noqa: E402
     _write_reconstruction_glb,
     _write_rgb,
     _write_trajectory_preview,
+)
+from tools.mapanything_phone_scan.alignment import (  # noqa: E402
+    NoesisAlignmentError,
+    _resolve_target_cloud_for_calibrated_camera,
 )
 
 
@@ -159,6 +165,19 @@ def _load_world_from_da3(path: Path) -> np.ndarray:
     return _validate_rigid(np.asarray(matrix, dtype=np.float64), name="world_from_da3")
 
 
+def _resolve_carrier_frame(
+    world_from_da3_path: Path | None,
+) -> tuple[np.ndarray, str, Path | None]:
+    if world_from_da3_path is None:
+        return (
+            np.eye(4, dtype=np.float64),
+            "da3_metric_world_unaligned_to_noesis",
+            None,
+        )
+    resolved = world_from_da3_path.resolve()
+    return _load_world_from_da3(resolved), "backend_world_m_stream_points", resolved
+
+
 def _transform_poses(transform: np.ndarray, poses: np.ndarray) -> np.ndarray:
     transform = _validate_rigid(transform, name="pose transform")
     poses = np.asarray(poses, dtype=np.float64)
@@ -215,6 +234,40 @@ def _backproject_depth(
     return world.reshape((height, width, 3)).astype(np.float32)
 
 
+def _top_up_reliable_samples(
+    reliable: np.ndarray,
+    sampled: np.ndarray,
+    *,
+    rng: np.random.Generator,
+    minimum_per_view: int,
+) -> tuple[np.ndarray, list[int], int]:
+    reliable = np.asarray(reliable, dtype=bool)
+    result = np.asarray(sampled, dtype=bool).copy()
+    if reliable.shape != result.shape or reliable.ndim != 3:
+        raise MapAnythingScanError("reliable and sampled masks must be matching NxHxW arrays")
+    topped_up_views: list[int] = []
+    added_total = 0
+    for index in range(reliable.shape[0]):
+        sampled_flat = result[index].reshape(-1)
+        count = int(np.count_nonzero(sampled_flat))
+        if count >= minimum_per_view:
+            continue
+        candidates = np.flatnonzero(
+            reliable[index].reshape(-1) & ~sampled_flat
+        )
+        needed = minimum_per_view - count
+        if candidates.size < needed:
+            raise MapAnythingScanError(
+                "reliable sparse DA3 depth has fewer than "
+                f"{minimum_per_view} reliable samples in view {index}"
+            )
+        selected = rng.choice(candidates, size=needed, replace=False)
+        sampled_flat[selected] = True
+        topped_up_views.append(index)
+        added_total += needed
+    return result, topped_up_views, added_total
+
+
 def _build_sparse_depth_priors(
     da3: Sequence,
     *,
@@ -242,18 +295,26 @@ def _build_sparse_depth_priors(
     )
     rng = np.random.default_rng(random_seed)
     sampled = reliable & (rng.random(reliable.shape) < sample_fraction)
+    sampled, topped_up_views, top_up_sample_count = _top_up_reliable_samples(
+        reliable,
+        sampled,
+        rng=rng,
+        minimum_per_view=500,
+    )
     per_view_count = np.count_nonzero(sampled, axis=(1, 2))
-    if int(np.min(per_view_count)) < 500:
-        raise MapAnythingScanError(
-            "reliable sparse DA3 depth left fewer than 500 samples in at least one view"
-        )
     sparse_depth = np.where(sampled, da3.depth, 0.0).astype(np.float32)
     metrics = {
-        "method": "da3_only_temporal_reprojection_plus_depth_boundary_then_seeded_sampling",
+        "method": (
+            "da3_only_temporal_reprojection_plus_depth_boundary_then_seeded_sampling_"
+            "with_reliable_per_view_minimum"
+        ),
         "consistency_threshold": float(consistency_threshold),
         "boundary_threshold": float(boundary_threshold),
         "sample_fraction_of_reliable_pixels": float(sample_fraction),
         "random_seed": int(random_seed),
+        "minimum_samples_per_view": 500,
+        "minimum_top_up_views": topped_up_views,
+        "minimum_top_up_sample_count": int(top_up_sample_count),
         "multiview_reprojection_error_median_m": float(consistency.median_error_m),
         "multiview_reprojection_error_p80_m": float(consistency.p80_error_m),
         "reliable_fraction_of_all_pixels": float(np.mean(reliable)),
@@ -301,6 +362,8 @@ def _zbuffer_depth(
         & (uv[:, 1] >= 0.0)
         & (uv[:, 1] < height)
     )
+    if not np.any(valid):
+        return np.zeros((height, width), dtype=np.float32), 0
     pixels = np.rint(uv[valid]).astype(np.int64)
     pixels[:, 0] = np.clip(pixels[:, 0], 0, width - 1)
     pixels[:, 1] = np.clip(pixels[:, 1], 0, height - 1)
@@ -365,18 +428,29 @@ def _load_static_reference(
     world_correction = np.asarray(
         floor_alignment["world_correction_col_major"], dtype=np.float64
     ).reshape((4, 4), order="F")
-    camera_to_world = _validate_rigid(
+    calibrated_camera_to_world = _validate_rigid(
         world_correction @ np.linalg.inv(camera_from_backend),
-        name="static camera_to_world",
-    )
-    camera_from_world = _validate_rigid(
-        camera_from_backend @ np.linalg.inv(world_correction),
-        name="static camera_from_world",
+        name="calibrated static camera_to_world",
     )
     with np.load(points_path) as row:
         points = np.asarray(row["points"], dtype=np.float64)
     if points.ndim != 2 or points.shape[1] != 3 or not np.isfinite(points).all():
         raise MapAnythingScanError("static room point cloud is malformed")
+    try:
+        points, _, _ = _resolve_target_cloud_for_calibrated_camera(
+            points,
+            calibrated_camera_to_world,
+        )
+    except NoesisAlignmentError as exc:
+        raise MapAnythingScanError(str(exc)) from exc
+    camera_to_world = _validate_rigid(
+        calibrated_camera_to_world,
+        name="resolved static camera_to_world",
+    )
+    camera_from_world = _validate_rigid(
+        np.linalg.inv(camera_to_world),
+        name="resolved static camera_from_world",
+    )
     depth, projected = _zbuffer_depth(
         points,
         camera_from_world,
@@ -425,7 +499,7 @@ def _build_input_views(
     da3: Sequence,
     backend_poses: np.ndarray,
     sparse: SparseDepthPriors,
-    static: StaticReference,
+    static: StaticReference | None,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], np.ndarray | None]:
     spec = VARIANT_SPECS[variant_name]
     use_pose = bool(spec["use_pose"])
@@ -435,6 +509,10 @@ def _build_input_views(
     source_rows: list[dict[str, Any]] = []
     carrier_poses: list[np.ndarray] = []
     if use_static:
+        if static is None:
+            raise MapAnythingScanError(
+                f"{variant_name} requires a calibrated static-camera reference"
+            )
         views.append(
             {
                 "img": static.image,
@@ -532,9 +610,10 @@ def _save_variant_outputs(
     carrier_poses: np.ndarray | None,
     sparse: SparseDepthPriors,
     da3: Sequence,
-    static: StaticReference,
+    static: StaticReference | None,
     frame_rows: list[dict[str, Any]],
-    world_from_da3: np.ndarray,
+    carrier_from_da3: np.ndarray,
+    coordinate_frame: str,
     model_metadata: dict[str, Any],
     point_budget: int,
 ) -> dict[str, Any]:
@@ -717,25 +796,30 @@ def _save_variant_outputs(
         points,
         poses[:, :3, 3],
     )
-    np.savez_compressed(
-        output_dir / "camera_solution.npz",
-        camera_poses=poses,
-        model_camera_poses_world=model_poses,
-        intrinsics=intrinsics_array,
-        metric_scaling_factors=scales_array,
-        world_from_da3=world_from_da3.astype(np.float64),
-        backend_from_predicted_reference=(
+    camera_solution = {
+        "camera_poses": poses,
+        "model_camera_poses_world": model_poses,
+        "intrinsics": intrinsics_array,
+        "metric_scaling_factors": scales_array,
+        "carrier_from_da3": carrier_from_da3.astype(np.float64),
+        "carrier_from_predicted_reference": (
             reference_transform.astype(np.float64)
             if reference_transform is not None
             else np.eye(4, dtype=np.float64)
         ),
-    )
+    }
+    if coordinate_frame == "backend_world_m_stream_points":
+        camera_solution["world_from_da3"] = carrier_from_da3.astype(np.float64)
+        camera_solution["backend_from_predicted_reference"] = camera_solution[
+            "carrier_from_predicted_reference"
+        ]
+    np.savez_compressed(output_dir / "camera_solution.npz", **camera_solution)
     (output_dir / "camera_trajectory.json").write_text(
         json.dumps(
             {
                 "schema": "noesis.mapanything.prior_variant.camera_trajectory.v1",
                 "coordinate_frame": (
-                    "backend_world_m_stream_points"
+                    coordinate_frame
                     if carrier_poses is not None
                     else "mapanything_metric_world_unaligned_to_noesis"
                 ),
@@ -776,6 +860,21 @@ def _save_variant_outputs(
                 "max": float(np.max(rotation_errors)),
             },
         }
+    reference_transforms = {
+        "carrier_from_da3_row_major": carrier_from_da3.tolist(),
+        "carrier_from_predicted_reference_row_major": (
+            reference_transform.tolist()
+            if reference_transform is not None
+            else None
+        ),
+    }
+    if coordinate_frame == "backend_world_m_stream_points":
+        reference_transforms["world_from_da3_row_major"] = carrier_from_da3.tolist()
+        reference_transforms["backend_from_predicted_reference_row_major"] = (
+            reference_transform.tolist()
+            if reference_transform is not None
+            else None
+        )
     summary: dict[str, Any] = {
         "schema": "noesis.mapanything.prior_variant.outputs.v1",
         "generated_at": _utc_now(),
@@ -787,20 +886,22 @@ def _save_variant_outputs(
             "uses_static_reference": bool(spec["use_static"]),
             "phone_view_count": len(frame_rows),
             "total_view_count": len(outputs),
-            "static_revision": str(static.revision),
-            "static_keyframe": str(static.source_image),
-            "static_point_count": static.point_count,
-            "static_projected_depth_sample_count": static.projected_point_count,
+            "static_revision": str(static.revision) if static is not None else None,
+            "static_keyframe": str(static.source_image) if static is not None else None,
+            "static_point_count": static.point_count if static is not None else None,
+            "static_projected_depth_sample_count": (
+                static.projected_point_count if static is not None else None
+            ),
             "sparse_da3_depth": sparse.metrics,
         },
         "model": model_metadata,
         "world_output_policy": (
-            "mapanything_depth_and_intrinsics_backprojected_through_supplied_pose_carrier"
+            "mapanything_depth_and_intrinsics_backprojected_through_da3_pose_carrier"
             if carrier_poses is not None
             else "mapanything_predicted_world_points"
         ),
         "coordinate_frame": (
-            "backend_world_m_stream_points"
+            coordinate_frame
             if carrier_poses is not None
             else "mapanything_metric_world_unaligned_to_noesis"
         ),
@@ -814,14 +915,7 @@ def _save_variant_outputs(
             "median": float(np.median(scales_array)),
             "max": float(np.max(scales_array)),
         },
-        "reference_transforms": {
-            "world_from_da3_row_major": world_from_da3.tolist(),
-            "backend_from_predicted_reference_row_major": (
-                reference_transform.tolist()
-                if reference_transform is not None
-                else None
-            ),
-        },
+        "reference_transforms": reference_transforms,
         "artifacts": {
             "raw": "raw",
             "phone_raw": phone_raw_relative,
@@ -855,9 +949,24 @@ def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("scan_dir", type=Path)
     parser.add_argument("--da3-raw", type=Path, required=True)
-    parser.add_argument("--world-from-da3", type=Path, required=True)
-    parser.add_argument("--target-revision", type=Path, required=True)
-    parser.add_argument("--calibration", type=Path, required=True)
+    parser.add_argument(
+        "--world-from-da3",
+        type=Path,
+        help=(
+            "Passed Noesis alignment transform. Omit for an explicitly unaligned "
+            "DA3-native phone-only carrier frame."
+        ),
+    )
+    parser.add_argument(
+        "--target-revision",
+        type=Path,
+        help="Static-camera revision; required only by a *_static variant.",
+    )
+    parser.add_argument(
+        "--calibration",
+        type=Path,
+        help="Camera calibration; required only by a *_static variant.",
+    )
     parser.add_argument("--camera", default="living-room")
     parser.add_argument("--output-root", type=Path, required=True)
     parser.add_argument(
@@ -895,8 +1004,10 @@ def main() -> int:
         raise MapAnythingScanError(
             f"DA3 has {da3.depth.shape[0]} views, prepared scan has {len(frame_rows)}"
         )
-    world_from_da3 = _load_world_from_da3(args.world_from_da3.resolve())
-    backend_poses = _transform_poses(world_from_da3, da3.poses)
+    carrier_from_da3, coordinate_frame, carrier_transform_source = _resolve_carrier_frame(
+        args.world_from_da3
+    )
+    carrier_poses = _transform_poses(carrier_from_da3, da3.poses)
     print("Computing DA3-only temporal reliability for sparse depth priors", flush=True)
     sparse = _build_sparse_depth_priors(
         da3,
@@ -906,15 +1017,28 @@ def main() -> int:
         random_seed=args.random_seed,
     )
     print(json.dumps(sparse.metrics, indent=2), flush=True)
-    static = _load_static_reference(
-        args.target_revision,
-        args.calibration.resolve(),
-        args.camera,
-    )
-    print(
-        f"Static reference: {static.projected_point_count}/{static.point_count} points project into {static.source_image.name}",
-        flush=True,
-    )
+    needs_static = any(bool(VARIANT_SPECS[name]["use_static"]) for name in args.variants)
+    static: StaticReference | None = None
+    if needs_static:
+        if (
+            args.world_from_da3 is None
+            or args.target_revision is None
+            or args.calibration is None
+        ):
+            raise MapAnythingScanError(
+                "a *_static variant requires --world-from-da3, --target-revision, and --calibration"
+            )
+        static = _load_static_reference(
+            args.target_revision,
+            args.calibration.resolve(),
+            args.camera,
+        )
+        print(
+            f"Static reference: {static.projected_point_count}/{static.point_count} points project into {static.source_image.name}",
+            flush=True,
+        )
+    else:
+        print(f"Pose carrier frame: {coordinate_frame}", flush=True)
 
     existing = [
         output_root / _variant_output_name(variant)
@@ -968,7 +1092,7 @@ def main() -> int:
                 scan_dir,
                 frame_rows,
                 da3,
-                backend_poses,
+                carrier_poses,
                 sparse,
                 static,
             )
@@ -1023,7 +1147,8 @@ def main() -> int:
                     da3,
                     static,
                     frame_rows,
-                    world_from_da3,
+                    carrier_from_da3,
+                    coordinate_frame,
                     model_metadata,
                     args.point_budget,
                 )
@@ -1057,10 +1182,34 @@ def main() -> int:
             "prepared_frames_manifest_sha256": _sha256(
                 scan_dir / "prepared_frames_manifest.json"
             ),
-            "world_from_da3_source": str(args.world_from_da3.resolve()),
-            "world_from_da3_source_sha256": _sha256(args.world_from_da3.resolve()),
-            "static_revision": str(static.revision),
-            "calibration": str(args.calibration.resolve()),
+            "carrier": {
+                "coordinate_frame": coordinate_frame,
+                "transform_source": (
+                    str(carrier_transform_source)
+                    if carrier_transform_source is not None
+                    else None
+                ),
+                "transform_source_sha256": (
+                    _sha256(carrier_transform_source)
+                    if carrier_transform_source is not None
+                    else None
+                ),
+                "aligned_to_noesis": carrier_transform_source is not None,
+            },
+            "world_from_da3_source": (
+                str(carrier_transform_source)
+                if carrier_transform_source is not None
+                else None
+            ),
+            "world_from_da3_source_sha256": (
+                _sha256(carrier_transform_source)
+                if carrier_transform_source is not None
+                else None
+            ),
+            "static_revision": str(static.revision) if static is not None else None,
+            "calibration": (
+                str(args.calibration.resolve()) if args.calibration is not None else None
+            ),
             "model": model_metadata,
             "sparse_depth_prior": sparse.metrics,
             "variants": suite_rows,

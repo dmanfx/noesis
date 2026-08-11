@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 import os
 from dataclasses import dataclass
-from typing import Dict, Optional, Tuple
+from typing import Dict, List, Mapping, Optional, Tuple
 
 import yaml
 
@@ -58,6 +58,45 @@ class CameraTopology:
 
     def is_overlap_pair(self, source_a: int, source_b: int) -> bool:
         return self.overlap_params(source_a, source_b) is not None
+
+    def validate_runtime_map(self, camera_labels: Mapping[int, str]) -> List[str]:
+        """Return deterministic errors when configured IDs differ from runtime IDs."""
+        runtime_by_source: Dict[int, str] = {}
+        runtime_by_name: Dict[str, int] = {}
+        errors: List[str] = []
+        for source_raw, name_raw in camera_labels.items():
+            try:
+                source_id = int(source_raw)
+            except Exception:
+                errors.append(f"runtime source_id is not an integer: {source_raw!r}")
+                continue
+            name = str(name_raw).strip()
+            if not name:
+                errors.append(f"runtime camera name is empty for source_id={source_id}")
+                continue
+            prior = runtime_by_name.get(name)
+            if prior is not None and prior != source_id:
+                errors.append(f"runtime camera {name!r} maps to multiple source IDs: {prior}, {source_id}")
+            runtime_by_source[source_id] = name
+            runtime_by_name[name] = source_id
+
+        for name, configured_source in sorted(self._name_to_source.items()):
+            runtime_source = runtime_by_name.get(name)
+            if runtime_source is None:
+                errors.append(f"configured camera {name!r} is absent from runtime camera map")
+                continue
+            if int(runtime_source) != int(configured_source):
+                errors.append(
+                    f"configured camera {name!r} source_id={configured_source} "
+                    f"but runtime source_id={runtime_source}"
+                )
+            runtime_name = runtime_by_source.get(int(configured_source))
+            if runtime_name is not None and runtime_name != name:
+                errors.append(
+                    f"configured source_id={configured_source} names {name!r} "
+                    f"but runtime names {runtime_name!r}"
+                )
+        return sorted(set(errors))
 
 
 def _pair_key(a: int, b: int) -> Tuple[int, int]:

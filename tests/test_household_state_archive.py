@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import stat
 from pathlib import Path
 
 from reid.household_state import archive_legacy_identity_state, default_household_backup_dir
@@ -22,6 +23,9 @@ def test_archive_legacy_identity_state_moves_files(tmp_path) -> None:
     assert not legacy_b.exists()
     assert (backup_dir / "reid_gallery.npz").exists()
     assert (backup_dir / "reid_aliases.json").exists()
+    assert stat.S_IMODE(backup_dir.stat().st_mode) == 0o700
+    assert stat.S_IMODE((backup_dir / "reid_gallery.npz").stat().st_mode) == 0o600
+    assert stat.S_IMODE((backup_dir / "reid_aliases.json").stat().st_mode) == 0o600
 
 
 def test_default_household_backup_dir_is_timestamped(tmp_path, monkeypatch) -> None:

@@ -3,12 +3,14 @@ import time
 import math
 import logging
 from collections import defaultdict, deque
-from typing import Deque, Dict, List, Optional, Set, Tuple, Any, Iterable
+from typing import Deque, Dict, List, Mapping, Optional, Set, Tuple, Any, Iterable
 import heapq
 import os
 import json
 
 import numpy as np
+
+from noesis_core.strict_json import strict_json_loads
 
 from .assignment import (
     FrameAssignmentState,
@@ -25,6 +27,10 @@ from .household_identity import (
     ProvisionalPool,
     ResidentRegistry,
     VisitorPool,
+    PRIVATE_FILE_MODE,
+    ensure_private_directory,
+    secure_private_file,
+    atomic_write_json_private,
     copy_gallery_embeddings,
     default_household_paths,
     identity_kind_for_sid,
@@ -85,6 +91,7 @@ class StableIDManager:
         # Household identity mode (Phase 0): exclusivity + overlap permits.
         household_mode: bool = False,
         camera_topology_file: Optional[str] = None,
+        camera_labels: Optional[Mapping[int, str]] = None,
         overlap_allow_appearance_only: bool = False,
         # Household closed-world identity (Phase 1)
         residents_file: Optional[str] = None,
@@ -223,6 +230,16 @@ class StableIDManager:
             gallery_size = min(int(gallery_size), 8)
         self.allow_multi_zone_active = bool(allow_multi_zone_active)
         self._camera_topology: CameraTopology = load_camera_topology(camera_topology_file)
+        self._camera_topology_validation_status = "not_validated"
+        self._camera_topology_validation_errors: List[str] = []
+        if camera_labels is not None:
+            errors = self._camera_topology.validate_runtime_map(camera_labels)
+            if self._camera_topology.source_path is None:
+                errors.append("camera topology file is not loaded")
+            self._camera_topology_validation_errors = list(errors)
+            self._camera_topology_validation_status = "invalid" if errors else "valid"
+            if self.household_mode and errors:
+                raise ValueError("camera topology/runtime map mismatch: " + "; ".join(errors))
         if self.household_mode and self._camera_topology.overlap_allow_appearance_only:
             self.overlap_allow_appearance_only = True
         self.crop_expand = float(crop_expand)
@@ -395,6 +412,18 @@ class StableIDManager:
             hh_paths = default_household_paths()
             residents_path = residents_file or hh_paths["residents_file"]
             visitor_pool_path = visitor_pool_file or hh_paths["visitor_pool_file"]
+            for state_path in (
+                residents_path,
+                visitor_pool_path,
+                self.gallery_persist_file,
+                self.alias_file,
+                self.sid_pool_file,
+            ):
+                if not state_path:
+                    continue
+                parent = os.path.dirname(os.path.expanduser(str(state_path)))
+                if parent:
+                    ensure_private_directory(parent)
             self._resident_registry = ResidentRegistry(str(residents_path))
             self._visitor_pool = VisitorPool(
                 pool_file=str(visitor_pool_path),
@@ -447,6 +476,8 @@ class StableIDManager:
             heapq.heapify(self._free_sids)
             self._free_sids_set = set(self._free_sids)
         self._load_gallery()
+        if self.household_mode:
+            self._reconcile_household_pool_state_after_load()
         self._init_compute_backend()
 
     def _init_compute_backend(self) -> None:
@@ -579,6 +610,25 @@ class StableIDManager:
         if self._resident_registry is None:
             return set()
         return self._resident_registry.resident_ids()
+
+    def _reconcile_household_pool_state_after_load(self) -> None:
+        """Reserve persisted visitor-gallery slots after a restart.
+
+        Older visitor-pool files can be absent or incomplete even though the
+        gallery still contains a visitor. Reserving those slots prevents a new
+        visitor from being assigned the same numeric SID in the same process.
+        """
+        if self._visitor_pool is None:
+            return
+        before = self._visitor_pool.used_sids()
+        for sid in list(self.gallery.keys()):
+            sid_int = int(sid)
+            if not (self.visitor_id_min <= sid_int <= self.visitor_id_max):
+                continue
+            last_seen = float(self.sid_global_last_seen.get(sid_int, time.time()))
+            self._visitor_pool.touch(sid_int, last_seen)
+        if self._visitor_pool.used_sids() != before:
+            self._visitor_pool.save()
 
     def _household_identity_kind(self, sid: int) -> str:
         return identity_kind_for_sid(int(sid), resident_ids=self._household_resident_ids())
@@ -842,6 +892,10 @@ class StableIDManager:
         else:
             rec["resident_uuid"] = None
             rec["display_name"] = None
+        if self._visitor_pool is not None and identity_kind == "visitor":
+            rec["visitor_generation"] = self._visitor_pool.generation_for(sid_int)
+        else:
+            rec.pop("visitor_generation", None)
 
     def _count_active_provisional(self) -> int:
         count = 0
@@ -1063,6 +1117,9 @@ class StableIDManager:
                 sid = int(row.get("stable_id", 0))
                 emb_count = int(len(self.gallery.get(sid, [])))
                 payload = dict(row)
+                # The registry's count is a cached persistence hint. The live
+                # gallery is authoritative and can shrink/grow after enrollment.
+                payload["embedding_count"] = emb_count
                 payload["gallery_embeddings"] = emb_count
                 out.append(payload)
             return out
@@ -1109,8 +1166,15 @@ class StableIDManager:
                     if int(track.get("stable_id", -1)) == new_sid:
                         self._household_apply_identity_meta(track, sid=new_sid, kind="resident")
                 self._recompute_sid_centroid(new_sid)
+            actual_count = int(len(self.gallery.get(new_sid, [])))
+            if int(rec.embedding_count) != actual_count:
+                rec = self._resident_registry.patch(
+                    str(rec.uuid),
+                    embedding_count=actual_count,
+                )
             self._promote_resident_count += 1
             self._resident_registry.save()
+            self.save_gallery()
             return rec.to_dict()
 
     def patch_resident(
@@ -1162,7 +1226,10 @@ class StableIDManager:
                     new_sid,
                     kind="visitor",
                     purge_old=True,
-                    move_gallery=True,
+                    # Removing an enrollment deletes its biometric gallery.
+                    # The live visitor may accumulate fresh visitor exemplars
+                    # later, but resident anchors are not copied across delete.
+                    move_gallery=False,
                 )
             else:
                 self.gallery.pop(old_sid, None)
@@ -1171,6 +1238,7 @@ class StableIDManager:
                 self.pose_centroid.pop(old_sid, None)
                 self.pose_last_seen.pop(old_sid, None)
                 self.active_zones.pop(old_sid, None)
+            self.save_gallery()
             return rec.to_dict()
 
     def get_identity_health(self) -> Dict[str, Any]:
@@ -1202,19 +1270,42 @@ class StableIDManager:
         base = max(1, int(self.max_total_ids))
         return int(max(16, base * 4))
 
+    def _sid_owned_or_reserved(self, sid: int) -> bool:
+        """Return whether the generic allocator must not hand out ``sid``."""
+        sid_int = int(sid)
+        if sid_int <= 0:
+            return True
+        if self._is_alias_reserved(sid_int) or sid_int in {int(v) for v in self.sid_alias.values()}:
+            return True
+        if self._resident_registry is not None and sid_int in self._household_resident_ids():
+            return True
+        if self._visitor_pool is not None and sid_int in self._visitor_pool.used_sids():
+            return True
+        if self._provisional_pool is not None and sid_int in self._provisional_pool.used_sids():
+            return True
+        if sid_int in self.gallery or sid_int in self.pose_gallery or sid_int in self.active_zones:
+            return True
+        for rec in self.active_tracks.values():
+            try:
+                if int(rec.get("stable_id", -1)) == sid_int:
+                    return True
+            except Exception:
+                continue
+        return False
+
     def _alloc_sid(self) -> int:
         # Keep allocator compact by preferring the lowest valid SID across
         # monotonic-next and free-pool candidates.
         while self._free_sids:
             sid_top = int(self._free_sids[0])
-            if self._is_alias_reserved(int(sid_top)):
+            if self._sid_owned_or_reserved(int(sid_top)):
                 heapq.heappop(self._free_sids)
                 self._free_sids_set.discard(int(sid_top))
                 continue
             break
 
         next_sid = int(self.next_stable_id)
-        while self._is_alias_reserved(int(next_sid)):
+        while self._sid_owned_or_reserved(int(next_sid)):
             next_sid += 1
 
         free_sid: Optional[int] = int(self._free_sids[0]) if self._free_sids else None
@@ -1236,6 +1327,10 @@ class StableIDManager:
         except Exception:
             return
         if sid <= 0:
+            return
+        # Household ID spaces have dedicated lifecycle managers. Feeding them
+        # into the legacy free heap enables resident/visitor/provisional reuse.
+        if self.household_mode:
             return
         if self._is_alias_reserved(int(sid)):
             return
@@ -1361,8 +1456,10 @@ class StableIDManager:
         try:
             if not os.path.exists(self.sid_pool_file):
                 return
-            with open(self.sid_pool_file, 'r') as f:
-                data = json.load(f)
+            if self.household_mode:
+                secure_private_file(self.sid_pool_file)
+            with open(self.sid_pool_file, "rb") as f:
+                data = strict_json_loads(f.read(), label="stable-ID free SID pool")
             pool = data.get('free_sids', []) if isinstance(data, dict) else []
             pool = [int(x) for x in pool if isinstance(x, int) and x > 0]
             soft_cap = int(self._sid_pool_soft_cap())
@@ -1386,14 +1483,14 @@ class StableIDManager:
         try:
             soft_cap = int(self._sid_pool_soft_cap())
             pool = sorted(int(sid) for sid in self._free_sids_set if int(sid) <= soft_cap)[:32]
-            os.makedirs(os.path.dirname(self.sid_pool_file), exist_ok=True)
-            with open(self.sid_pool_file, 'w') as f:
-                json.dump(
-                    {
-                        'free_sids': pool,
-                    },
-                    f,
-                )
+            if self.household_mode:
+                atomic_write_json_private(self.sid_pool_file, {'free_sids': pool})
+            else:
+                parent = os.path.dirname(self.sid_pool_file)
+                if parent:
+                    os.makedirs(parent, exist_ok=True)
+                with open(self.sid_pool_file, 'w') as f:
+                    json.dump({'free_sids': pool}, f)
         except Exception:
             pass
 
@@ -1404,6 +1501,8 @@ class StableIDManager:
         if not path or not os.path.exists(path):
             return
         try:
+            if self.household_mode:
+                secure_private_file(path)
             with np.load(path, allow_pickle=False) as data:
                 sids = [int(s) for s in np.asarray(data.get("sids", []), dtype=np.int64).reshape(-1)]
                 now = time.time()
@@ -1483,13 +1582,33 @@ class StableIDManager:
                     sids_out.append(sid_int)
                 arrays["sids"] = np.asarray(sids_out, dtype=np.int64)
                 arrays["saved_ts"] = np.asarray([now], dtype=np.float64)
+                if self.household_mode and self._resident_registry is not None:
+                    registry_changed = False
+                    for sid, resident in self._resident_registry.residents_by_sid.items():
+                        actual_count = int(len(self.gallery.get(int(sid), [])))
+                        if int(resident.embedding_count) != actual_count:
+                            resident.embedding_count = actual_count
+                            registry_changed = True
+                    if registry_changed:
+                        self._resident_registry.save()
             dir_path = os.path.dirname(path)
             if dir_path:
-                os.makedirs(dir_path, exist_ok=True)
+                if self.household_mode:
+                    ensure_private_directory(dir_path)
+                else:
+                    os.makedirs(dir_path, exist_ok=True)
             tmp_path = f"{path}.tmp"
-            with open(tmp_path, "wb") as f:
-                np.savez_compressed(f, **arrays)
+            if self.household_mode:
+                fd = os.open(tmp_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, PRIVATE_FILE_MODE)
+                with os.fdopen(fd, "wb") as f:
+                    np.savez_compressed(f, **arrays)
+                os.chmod(tmp_path, PRIVATE_FILE_MODE)
+            else:
+                with open(tmp_path, "wb") as f:
+                    np.savez_compressed(f, **arrays)
             os.replace(tmp_path, path)
+            if self.household_mode:
+                os.chmod(path, PRIVATE_FILE_MODE)
             return True
         except Exception:
             logger.warning("StableID gallery save failed (%s)", path, exc_info=True)
@@ -1764,8 +1883,10 @@ class StableIDManager:
         try:
             if not self.alias_file or not os.path.exists(self.alias_file):
                 return
-            with open(self.alias_file, "r") as f:
-                data = json.load(f)
+            if self.household_mode:
+                secure_private_file(self.alias_file)
+            with open(self.alias_file, "rb") as f:
+                data = strict_json_loads(f.read(), label="stable-ID alias registry")
             if not isinstance(data, dict):
                 return
             raw_aliases = data.get("aliases", {})
@@ -1808,13 +1929,16 @@ class StableIDManager:
                 "aliases": {str(k): int(v) for k, v in self.sid_alias.items()},
                 "history": list(self.alias_history),
             }
-            dir_path = os.path.dirname(self.alias_file)
-            if dir_path:
-                os.makedirs(dir_path, exist_ok=True)
-            tmp_path = f"{self.alias_file}.tmp"
-            with open(tmp_path, "w") as f:
-                json.dump(payload, f)
-            os.replace(tmp_path, self.alias_file)
+            if self.household_mode:
+                atomic_write_json_private(self.alias_file, payload)
+            else:
+                dir_path = os.path.dirname(self.alias_file)
+                if dir_path:
+                    os.makedirs(dir_path, exist_ok=True)
+                tmp_path = f"{self.alias_file}.tmp"
+                with open(tmp_path, "w") as f:
+                    json.dump(payload, f)
+                os.replace(tmp_path, self.alias_file)
         except Exception:
             pass
 
@@ -2426,6 +2550,8 @@ class StableIDManager:
                 diag["display_name"] = self._resident_registry.display_name_for(int(stable_id))
             else:
                 diag["display_name"] = None
+            if self._visitor_pool is not None and kind == "visitor":
+                diag["visitor_generation"] = self._visitor_pool.generation_for(int(stable_id))
         self._pending_id_diag[key] = dict(diag)
         return diag
 
@@ -2458,6 +2584,30 @@ class StableIDManager:
             if int(sid_sensor) != int(sensor_id):
                 out.append(int(sid_sensor))
         return out
+
+    def validate_camera_topology(
+        self,
+        camera_labels: Mapping[int, str],
+        *,
+        strict: bool = True,
+    ) -> Dict[str, Any]:
+        """Validate configured camera IDs against the runtime's active map."""
+        with self._lock:
+            errors = self._camera_topology.validate_runtime_map(camera_labels)
+            if self._camera_topology.source_path is None:
+                errors.append("camera topology file is not loaded")
+            errors = sorted(set(str(error) for error in errors))
+            self._camera_topology_validation_errors = errors
+            self._camera_topology_validation_status = "invalid" if errors else "valid"
+            result = {
+                "valid": not bool(errors),
+                "status": self._camera_topology_validation_status,
+                "errors": list(errors),
+                "camera_topology_file": self._camera_topology.source_path,
+            }
+            if strict and errors:
+                raise ValueError("camera topology/runtime map mismatch: " + "; ".join(errors))
+            return result
 
     def overlap_permit(
         self,
@@ -2704,7 +2854,17 @@ class StableIDManager:
             if rec is not None:
                 diag = rec.get("id_diag")
                 if isinstance(diag, dict):
-                    return dict(diag)
+                    result = dict(diag)
+                    for name in (
+                        "identity_kind",
+                        "identity_state",
+                        "resident_uuid",
+                        "display_name",
+                        "visitor_generation",
+                    ):
+                        if rec.get(name) is not None:
+                            result[name] = rec.get(name)
+                    return result
             diag_pending = self._pending_id_diag.get(key)
             if isinstance(diag_pending, dict):
                 return dict(diag_pending)
@@ -3369,6 +3529,7 @@ class StableIDManager:
         suggestion_limit = max(1, min(remaining, 25))
         min_sim_try = float(self.auto_merge_min_sim)
         relax_attempts = 0
+        hard_guard_blocked = False
         while remaining > 0:
             candidates = self.suggest_aliases(
                 min_sim=min_sim_try,
@@ -3434,10 +3595,21 @@ class StableIDManager:
                     self._auto_merge_applied += 1
                 else:
                     self._auto_merge_suppressed += 1
+                    if str(res.get("reason") or "") == "copresent_recently":
+                        # The highest-ranked candidate was proven to be two
+                        # distinct people. Continuing down an ambiguous list can
+                        # merge a fresh fragment into either person and conceal
+                        # the conflict, so stop this pressure-relief round.
+                        blocked_count += 1
+                        stall_reason = "copresent_recently"
+                        hard_guard_blocked = True
+                        break
 
                 if self._count_canonical_sids() <= max_ids:
                     break
 
+            if hard_guard_blocked:
+                break
             if not applied_this_round:
                 if blocked_count >= candidate_count and candidate_count > 0:
                     stall_reason = "all_blocked"
@@ -4783,26 +4955,30 @@ class StableIDManager:
             for sensor_id, dq in self.ghosts.items():
                 while dq and (t - float(dq[0].get("ts", 0.0))) > self.max_ghost_age_s:
                     dq.popleft()
-            # Return fully inactive SIDs to free-list after a cooldown (smarter reuse)
-            try:
-                active_sids = {int(rec.get("stable_id")) for rec in self.active_tracks.values()}
-                ghost_sids = set()
-                for dq in self.ghosts.values():
-                    for g in dq:
-                        try:
-                            ghost_sids.add(int(g.get("stable_id")))
-                        except Exception:
-                            pass
-                for sid, last_seen in list(self.sid_global_last_seen.items()):
-                    if sid in active_sids or sid in ghost_sids:
-                        continue
-                    if self._is_alias_reserved(int(sid)):
-                        continue
-                    if (t - float(last_seen)) >= max(2.0, self.active_evict_grace_s):
-                        self._purge_sid_state(sid)
-                        self._free_sid(sid)
-            except Exception:
-                pass
+            # Legacy mode may recycle fully inactive SIDs after a cooldown.
+            # Household residents are durable enrollments and visitors have a
+            # separate TTL pool below, so the generic purge must never run for
+            # household state.
+            if not self.household_mode:
+                try:
+                    active_sids = {int(rec.get("stable_id")) for rec in self.active_tracks.values()}
+                    ghost_sids = set()
+                    for dq in self.ghosts.values():
+                        for g in dq:
+                            try:
+                                ghost_sids.add(int(g.get("stable_id")))
+                            except Exception:
+                                pass
+                    for sid, last_seen in list(self.sid_global_last_seen.items()):
+                        if sid in active_sids or sid in ghost_sids:
+                            continue
+                        if self._is_alias_reserved(int(sid)):
+                            continue
+                        if (t - float(last_seen)) >= max(2.0, self.active_evict_grace_s):
+                            self._purge_sid_state(sid)
+                            self._free_sid(sid)
+                except Exception:
+                    pass
             # Prune pending new-track counters that haven't been seen recently.
             try:
                 cutoff = t - max(2.0, float(self.active_evict_grace_s))
@@ -4944,6 +5120,13 @@ class StableIDManager:
                     "mint_visitor_count": int(self._mint_visitor_count),
                     "promote_resident_count": int(self._promote_resident_count),
                     "camera_topology_file": self._camera_topology.source_path,
+                    "camera_topology_validation_status": str(self._camera_topology_validation_status),
+                    "camera_topology_validation_errors": list(self._camera_topology_validation_errors),
+                    "visitor_pool_used": (
+                        len(self._visitor_pool.used_sids())
+                        if self.household_mode and self._visitor_pool is not None
+                        else 0
+                    ),
                     "sid_event_counts": dict(self._id_event_counts),
                     "alias_candidate_pool_size": int(self._alias_candidate_pool_size),
                     "alias_candidate_sim_p50": self._alias_candidate_sim_p50,

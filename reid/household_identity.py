@@ -19,6 +19,8 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 
 import numpy as np
 
+from noesis_core.strict_json import strict_json_loads
+
 logger = logging.getLogger(__name__)
 
 VISITOR_ID_MIN = 1000
@@ -26,6 +28,50 @@ VISITOR_ID_MAX = 1031
 PROVISIONAL_ID_MIN = 9000
 PROVISIONAL_ID_MAX = 9099
 RESIDENT_ID_MIN = 1
+PRIVATE_DIR_MODE = 0o700
+PRIVATE_FILE_MODE = 0o600
+
+
+def ensure_private_directory(path: str) -> None:
+    """Create a household-state directory and restrict it to its owner."""
+    directory = os.path.expanduser(str(path))
+    if not directory:
+        return
+    os.makedirs(directory, mode=PRIVATE_DIR_MODE, exist_ok=True)
+    os.chmod(directory, PRIVATE_DIR_MODE)
+
+
+def secure_private_file(path: str) -> None:
+    """Restrict an existing household-state file to its owner."""
+    expanded = os.path.expanduser(str(path))
+    if expanded and os.path.isfile(expanded):
+        os.chmod(expanded, PRIVATE_FILE_MODE)
+
+
+def atomic_write_json_private(path: str, payload: Dict[str, Any]) -> None:
+    """Atomically write JSON using owner-only directory and file modes."""
+    expanded = os.path.expanduser(str(path))
+    parent = os.path.dirname(expanded)
+    if parent:
+        ensure_private_directory(parent)
+    tmp = f"{expanded}.tmp"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, PRIVATE_FILE_MODE)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, indent=2, sort_keys=True)
+    except Exception:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+    os.chmod(tmp, PRIVATE_FILE_MODE)
+    os.replace(tmp, expanded)
+    os.chmod(expanded, PRIVATE_FILE_MODE)
 
 
 @dataclass
@@ -67,9 +113,11 @@ def identity_kind_for_sid(
     sid_int = int(sid)
     if sid_int >= PROVISIONAL_ID_MIN:
         return "provisional"
-    if resident_ids and sid_int in resident_ids:
-        return "resident"
-    if RESIDENT_ID_MIN <= sid_int < VISITOR_ID_MIN:
+    if resident_ids is not None:
+        if sid_int in resident_ids:
+            return "resident"
+    elif RESIDENT_ID_MIN <= sid_int < VISITOR_ID_MIN:
+        # Legacy callers without an enrollment registry retain range semantics.
         return "resident"
     if VISITOR_ID_MIN <= sid_int <= VISITOR_ID_MAX:
         return "visitor"
@@ -88,6 +136,9 @@ class ResidentRegistry:
 
     def __init__(self, path: str) -> None:
         self.path = os.path.expanduser(str(path))
+        parent = os.path.dirname(self.path)
+        if parent:
+            ensure_private_directory(parent)
         self.residents_by_sid: Dict[int, ResidentRecord] = {}
         self.uuid_by_sid: Dict[int, str] = {}
         self.sid_by_uuid: Dict[str, int] = {}
@@ -102,8 +153,9 @@ class ResidentRegistry:
         if not os.path.isfile(self.path):
             return
         try:
-            with open(self.path, "r", encoding="utf-8") as f:
-                data = json.load(f)
+            secure_private_file(self.path)
+            with open(self.path, "rb") as f:
+                data = strict_json_loads(f.read(), label="household resident registry")
         except Exception:
             logger.warning("failed to load residents from %s", self.path, exc_info=True)
             return
@@ -130,18 +182,12 @@ class ResidentRegistry:
 
     def save(self) -> None:
         try:
-            parent = os.path.dirname(self.path)
-            if parent:
-                os.makedirs(parent, exist_ok=True)
             payload = {
                 "version": 1,
                 "next_resident_id": int(self._next_resident_id),
                 "residents": [rec.to_dict() for rec in sorted(self.residents_by_sid.values(), key=lambda r: r.stable_id)],
             }
-            tmp = f"{self.path}.tmp"
-            with open(tmp, "w", encoding="utf-8") as f:
-                json.dump(payload, f, indent=2, sort_keys=True)
-            os.replace(tmp, self.path)
+            atomic_write_json_private(self.path, payload)
         except Exception:
             logger.warning("failed to save residents to %s", self.path, exc_info=True)
 
@@ -333,11 +379,18 @@ class VisitorPool:
         ttl_s: float = 3600.0,
     ) -> None:
         self.pool_file = os.path.expanduser(str(pool_file))
+        parent = os.path.dirname(self.pool_file)
+        if parent:
+            ensure_private_directory(parent)
         self.id_min = int(id_min)
         self.id_max = int(id_max)
         self.ttl_s = float(ttl_s)
         self._pool = _SidPool(self.id_min, self.id_max)
         self._last_seen: Dict[int, float] = {}
+        # Incremented every time a recyclable numeric slot begins a new visitor
+        # lifetime. This is a backward-compatible precursor to durable visitor
+        # UUIDs; callers can at least distinguish slot incarnations internally.
+        self._generation: Dict[int, int] = {}
         self._mint_count = 0
         self._recycle_count = 0
         self.load()
@@ -346,8 +399,9 @@ class VisitorPool:
         if not os.path.isfile(self.pool_file):
             return
         try:
-            with open(self.pool_file, "r", encoding="utf-8") as f:
-                data = json.load(f)
+            secure_private_file(self.pool_file)
+            with open(self.pool_file, "rb") as f:
+                data = strict_json_loads(f.read(), label="household visitor pool")
         except Exception:
             return
         if not isinstance(data, dict):
@@ -359,23 +413,36 @@ class VisitorPool:
         if isinstance(last_seen, dict):
             for k, v in last_seen.items():
                 try:
-                    self._last_seen[int(k)] = float(v)
+                    sid = int(k)
+                    if not (self.id_min <= sid <= self.id_max):
+                        continue
+                    self._last_seen[sid] = float(v)
+                    # Persisted last-seen entries represent allocated visitor
+                    # slots. Failing to restore this bit allowed immediate SID
+                    # reuse after a process restart.
+                    self._pool.mark_used(sid)
                 except Exception:
                     continue
+        generations = data.get("visitor_generations", {})
+        if isinstance(generations, dict):
+            for k, v in generations.items():
+                try:
+                    sid = int(k)
+                    generation = max(0, int(v))
+                except Exception:
+                    continue
+                if self.id_min <= sid <= self.id_max:
+                    self._generation[sid] = generation
 
     def save(self) -> None:
         try:
-            parent = os.path.dirname(self.pool_file)
-            if parent:
-                os.makedirs(parent, exist_ok=True)
             payload = {
+                "version": 1,
                 "free_visitor_sids": self._pool.free_list(),
                 "visitor_last_seen": {str(k): float(v) for k, v in self._last_seen.items()},
+                "visitor_generations": {str(k): int(v) for k, v in self._generation.items()},
             }
-            tmp = f"{self.pool_file}.tmp"
-            with open(tmp, "w", encoding="utf-8") as f:
-                json.dump(payload, f, indent=2, sort_keys=True)
-            os.replace(tmp, self.pool_file)
+            atomic_write_json_private(self.pool_file, payload)
         except Exception:
             logger.warning("failed to save visitor pool %s", self.pool_file, exc_info=True)
 
@@ -387,6 +454,7 @@ class VisitorPool:
     def alloc(self, ts: float) -> int:
         sid = int(self._pool.alloc())
         self._last_seen[sid] = float(ts)
+        self._generation[sid] = int(self._generation.get(sid, 0)) + 1
         self._mint_count += 1
         return sid
 
@@ -422,6 +490,12 @@ class VisitorPool:
     @property
     def recycle_count(self) -> int:
         return int(self._recycle_count)
+
+    def generation_for(self, sid: int) -> int:
+        return int(self._generation.get(int(sid), 0))
+
+    def used_sids(self) -> Set[int]:
+        return set(int(sid) for sid in self._pool._used)
 
 
 class ProvisionalPool:
@@ -470,7 +544,7 @@ def default_household_paths(root: Optional[Path] = None) -> Dict[str, str]:
     base = root or Path(os.path.expanduser("~/.noesis/household"))
     return {
         "residents_file": str(base / "residents.json"),
-        "visitor_pool_file": str(base / "sid_pool.json"),
+        "visitor_pool_file": str(base / "visitor_pool.json"),
     }
 
 

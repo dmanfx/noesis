@@ -9,6 +9,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Optional
 
+from .household_identity import ensure_private_directory, secure_private_file
+
 logger = logging.getLogger(__name__)
 
 _LEGACY_STATE_FILES = (
@@ -112,7 +114,7 @@ def archive_legacy_identity_state(
         return None
 
     dest_root = os.path.expanduser(str(backup_dir_or_logger))
-    os.makedirs(dest_root, exist_ok=True)
+    ensure_private_directory(dest_root)
     archived: List[str] = []
     paths = list(legacy_paths or ())
 
@@ -147,6 +149,7 @@ def archive_legacy_identity_state(
                 )
                 continue
         archived.append(dest)
+        secure_private_file(dest)
         (logger or logging.getLogger(__name__)).info(
             "archived legacy identity state: %s -> %s",
             src,
@@ -176,7 +179,7 @@ def prepare_household_stable_id_overrides(
             )
 
     paths = resolve_household_paths()
-    household_root().mkdir(parents=True, exist_ok=True)
+    ensure_private_directory(str(household_root()))
     topology_file = resolve_camera_topology_file(repo_root)
 
     overrides: Dict[str, Any] = {

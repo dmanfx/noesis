@@ -2,10 +2,20 @@
 
 from __future__ import annotations
 
+import json
+import stat
+import time
+
 import numpy as np
 import pytest
 
-from reid.household_identity import PROVISIONAL_ID_MIN, VISITOR_ID_MAX, VISITOR_ID_MIN
+from reid.household_identity import (
+    PROVISIONAL_ID_MIN,
+    ResidentRegistry,
+    VISITOR_ID_MAX,
+    VISITOR_ID_MIN,
+    VisitorPool,
+)
 from reid.stable_id_manager import StableIDManager
 
 
@@ -81,6 +91,9 @@ def test_resident_match_preferred_over_visitor_mint(tmp_path):
         embedding=visitor_emb,
     )
     assert VISITOR_ID_MIN <= visitor_sid <= VISITOR_ID_MAX
+    visitor_diag = mgr.get_track_diagnostics(0, 1)
+    assert visitor_diag.get("identity_kind") == "visitor"
+    assert visitor_diag.get("visitor_generation") == 1
 
     enrolled = mgr.enroll_resident(display_name="Alex", visitor_id=visitor_sid)
     resident_sid = int(enrolled["stable_id"])
@@ -150,6 +163,11 @@ def test_delete_resident_remaps_to_new_visitor(tmp_path):
     assert track.get("display_name") is None
     assert resident_sid not in mgr.active_zones
     assert new_sid in mgr.active_zones
+    assert len(mgr.gallery.get(resident_sid, [])) == 0
+    assert len(mgr.gallery.get(new_sid, [])) == 0
+
+    with np.load(tmp_path / "household" / "gallery.npz", allow_pickle=False) as persisted:
+        assert resident_sid not in set(int(s) for s in persisted["sids"].tolist())
 
 
 def test_exclusivity_blocks_false_share_without_overlap(tmp_path):
@@ -178,6 +196,150 @@ def test_visitor_pool_recycles_after_ttl(tmp_path):
     metrics = mgr.get_sid_metrics()
     assert sid >= VISITOR_ID_MIN
     assert metrics.get("visitor_count", 0) >= 0
+
+
+def test_visitor_pool_restart_does_not_reallocate_used_slot(tmp_path):
+    pool_path = tmp_path / "visitor_pool.json"
+    first = VisitorPool(pool_file=str(pool_path), id_min=1000, id_max=1001)
+    sid_a = first.alloc(1.0)
+    generation_a = first.generation_for(sid_a)
+    first.save()
+
+    restarted = VisitorPool(pool_file=str(pool_path), id_min=1000, id_max=1001)
+    sid_b = restarted.alloc(2.0)
+    assert sid_b != sid_a
+    assert sid_a in restarted.used_sids()
+    assert restarted.generation_for(sid_a) == generation_a
+
+    restarted.release(sid_a)
+    sid_c = restarted.alloc(3.0)
+    assert sid_c == sid_a
+    assert restarted.generation_for(sid_c) == generation_a + 1
+
+
+def test_resident_registry_rejects_duplicate_resident_inventory(tmp_path):
+    root = tmp_path / "household"
+    root.mkdir(mode=0o700)
+    path = root / "residents.json"
+    path.write_text(
+        '{"next_resident_id":2,"residents":[],"residents":['
+        '{"uuid":"resident-a","stable_id":1,"display_name":"Alice",'
+        '"created_ts":1.0,"embedding_count":1}]}',
+        encoding="utf-8",
+    )
+    path.chmod(0o600)
+
+    registry = ResidentRegistry(str(path))
+
+    assert registry.list_residents() == []
+
+
+def test_visitor_pool_rejects_duplicate_persisted_state(tmp_path):
+    path = tmp_path / "visitor_pool.json"
+    path.write_text(
+        '{"version":1,"free_visitor_sids":[1001],'
+        '"visitor_last_seen":{},"visitor_last_seen":{"1000":1.0},'
+        '"visitor_generations":{"1000":4}}',
+        encoding="utf-8",
+    )
+    path.chmod(0o600)
+
+    pool = VisitorPool(pool_file=str(path), id_min=1000, id_max=1001)
+
+    assert pool.alloc(2.0) == 1000
+    assert pool.generation_for(1000) == 1
+
+
+def test_resident_gallery_survives_ghost_expiry_and_restart(tmp_path):
+    now = time.time()
+    mgr = _make_household_mgr(
+        tmp_path,
+        max_ghost_age_s=0.1,
+        active_evict_grace_s=0.1,
+        gallery_persist_max_age_s=3600.0,
+    )
+    emb = _unit_emb(505)
+    visitor_sid = mgr.update(0, 1, _bbox(), now, "default", embedding=emb)
+    enrolled = mgr.enroll_resident(display_name="Resident", visitor_id=visitor_sid)
+    resident_sid = int(enrolled["stable_id"])
+    # A later update populates global last-seen, which previously made the
+    # generic ghost pruner delete the durable resident gallery.
+    mgr.update(0, 1, _bbox(), now + 0.01, "default", embedding=emb)
+    mgr.remove_missing_tracks(0, [], now + 0.02)
+    mgr.prune_ghosts(now + 10.0)
+
+    assert len(mgr.gallery.get(resident_sid, [])) >= 1
+    assert mgr.list_residents()[0]["embedding_count"] == len(mgr.gallery[resident_sid])
+    assert mgr.save_gallery()
+
+    restarted = _make_household_mgr(
+        tmp_path,
+        max_ghost_age_s=0.1,
+        active_evict_grace_s=0.1,
+        gallery_persist_max_age_s=3600.0,
+    )
+    assert len(restarted.gallery.get(resident_sid, [])) >= 1
+    assert restarted.list_residents()[0]["gallery_embeddings"] >= 1
+
+
+def test_resident_embedding_count_uses_live_gallery_truth(tmp_path):
+    mgr = _make_household_mgr(tmp_path)
+    emb = _unit_emb(606)
+    visitor_sid = mgr.update(0, 1, _bbox(), time.time(), "default", embedding=emb)
+    enrolled = mgr.enroll_resident(display_name="Resident", visitor_id=visitor_sid)
+    resident_sid = int(enrolled["stable_id"])
+    resident_uuid = str(enrolled["uuid"])
+
+    registry_rec = mgr._resident_registry.get_by_uuid(resident_uuid)
+    assert registry_rec is not None
+    registry_rec.embedding_count = 999
+    mgr._resident_registry.save()
+    live_count = len(mgr.gallery.get(resident_sid, []))
+    assert mgr.list_residents()[0]["embedding_count"] == live_count
+
+    assert mgr.save_gallery()
+    persisted = json.loads((tmp_path / "household" / "residents.json").read_text())
+    assert persisted["residents"][0]["embedding_count"] == live_count
+
+
+def test_household_state_permissions_are_owner_only(tmp_path):
+    mgr = _make_household_mgr(tmp_path, aliases_enabled=True, alias_file=str(tmp_path / "household" / "aliases.json"))
+    visitor_sid = mgr.update(0, 1, _bbox(), time.time(), "default", embedding=_unit_emb(707))
+    mgr.enroll_resident(display_name="Resident", visitor_id=visitor_sid)
+    assert mgr._visitor_pool is not None
+    mgr._visitor_pool.save()
+    mgr._save_aliases()
+    assert mgr.save_gallery()
+
+    household_dir = tmp_path / "household"
+    assert stat.S_IMODE(household_dir.stat().st_mode) == 0o700
+    for name in ("residents.json", "visitor_pool.json", "gallery.npz", "aliases.json"):
+        path = household_dir / name
+        assert path.exists(), name
+        assert stat.S_IMODE(path.stat().st_mode) == 0o600
+
+
+def test_camera_topology_runtime_map_validation(tmp_path):
+    mgr = _make_household_mgr(tmp_path)
+    valid = mgr.validate_camera_topology(
+        {0: "living-room", 1: "kitchen", 2: "family-room"}
+    )
+    assert valid["valid"] is True
+    assert mgr.get_sid_metrics()["camera_topology_validation_status"] == "valid"
+
+    with pytest.raises(ValueError, match="camera topology/runtime map mismatch"):
+        mgr.validate_camera_topology(
+            {0: "kitchen", 1: "living-room", 2: "family-room"}
+        )
+    metrics = mgr.get_sid_metrics()
+    assert metrics["camera_topology_validation_status"] == "invalid"
+    assert metrics["camera_topology_validation_errors"]
+
+    with pytest.raises(ValueError, match="camera topology/runtime map mismatch"):
+        _make_household_mgr(
+            tmp_path / "constructor-mismatch",
+            camera_labels={0: "kitchen", 1: "living-room", 2: "family-room"},
+        )
 
 
 def test_pose_only_gallery_match_uses_household_claims(tmp_path):

@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Smoke test to ensure stable IDs are present and persistent."""
+
 from __future__ import annotations
 
 import argparse
@@ -10,19 +11,28 @@ import signal
 import subprocess
 import sys
 import time
+from pathlib import Path
 
-try:
-    import websockets  # type: ignore
-except Exception as exc:  # pragma: no cover
-    print(f"[FAIL] websockets package required: {exc}")
-    sys.exit(1)
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from scripts.internal_auth_client import (  # noqa: E402
+    RequiredInternalAuth,
+    add_auth_token_file_argument,
+    configure_required_auth_environment,
+    connect_required_websocket,
+    load_required_internal_auth,
+)
 
 
-async def _collect_tracking(uri: str, duration: float = 10.0) -> dict:
+async def _collect_tracking(
+    uri: str, auth: RequiredInternalAuth, duration: float = 10.0
+) -> dict:
     seen = {}
     non_null = set()
     start = time.time()
-    async with websockets.connect(uri) as ws:
+    async with connect_required_websocket(uri, auth) as ws:
         while time.time() - start < duration:
             try:
                 msg = await asyncio.wait_for(ws.recv(), timeout=2.0)
@@ -54,7 +64,9 @@ async def _collect_tracking(uri: str, duration: float = 10.0) -> dict:
         return {"seen": seen, "non_null": non_null}
 
 
-def _spawn_runtime(args: argparse.Namespace) -> subprocess.Popen:
+def _spawn_runtime(
+    args: argparse.Namespace, auth: RequiredInternalAuth
+) -> subprocess.Popen:
     cmd = [
         sys.executable,
         "noesis/ds8_runtime.py",
@@ -67,6 +79,7 @@ def _spawn_runtime(args: argparse.Namespace) -> subprocess.Popen:
     if args.depth_seconds is not None:
         cmd.extend(["--depth-enable-seconds", str(args.depth_seconds)])
     env = os.environ.copy()
+    configure_required_auth_environment(env, auth)
     env.setdefault("NOESIS_REID_ENABLED", "1")
     env.setdefault("NOESIS_MOSAIC_RTSP_ENABLED", "0")
     env.setdefault("NOESIS_MOSAIC_WEBRTC_ENABLED", "0")
@@ -83,6 +96,7 @@ def main() -> int:
     parser.add_argument("--cameras-config", default="config/cameras.yaml")
     parser.add_argument("--no-spawn", action="store_true", help="Do not spawn runtime")
     parser.add_argument("--duration", type=float, default=12.0)
+    add_auth_token_file_argument(parser)
     parser.add_argument(
         "--synthetic",
         action="store_true",
@@ -96,9 +110,15 @@ def main() -> int:
     )
     args = parser.parse_args()
 
+    try:
+        auth = load_required_internal_auth(args.auth_token_file)
+    except Exception as exc:
+        print(f"[FAIL] required internal auth unavailable: {exc}")
+        return 1
+
     proc = None
     if not args.no_spawn:
-        proc = _spawn_runtime(args)
+        proc = _spawn_runtime(args, auth)
         time.sleep(5.0)
 
     try:
@@ -106,7 +126,9 @@ def main() -> int:
         last_err = None
         for _ in range(10):
             try:
-                result = asyncio.run(_collect_tracking(args.ws, duration=args.duration))
+                result = asyncio.run(
+                    _collect_tracking(args.ws, auth, duration=args.duration)
+                )
                 break
             except Exception as exc:
                 last_err = exc

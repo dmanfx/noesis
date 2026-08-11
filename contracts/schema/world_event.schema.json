@@ -1,0 +1,252 @@
+{
+  "$defs": {
+    "IdentityKind": {
+      "enum": [
+        "resident",
+        "visitor",
+        "unknown",
+        "provisional"
+      ],
+      "title": "IdentityKind",
+      "type": "string"
+    },
+    "ProducerRef": {
+      "additionalProperties": false,
+      "properties": {
+        "instance_id": {
+          "maxLength": 160,
+          "minLength": 1,
+          "title": "Instance Id",
+          "type": "string"
+        },
+        "run_id": {
+          "maxLength": 160,
+          "minLength": 1,
+          "title": "Run Id",
+          "type": "string"
+        },
+        "runtime": {
+          "enum": [
+            "ds8",
+            "ds9",
+            "replay",
+            "test"
+          ],
+          "title": "Runtime",
+          "type": "string"
+        },
+        "software_revision": {
+          "maxLength": 160,
+          "minLength": 1,
+          "title": "Software Revision",
+          "type": "string"
+        }
+      },
+      "required": [
+        "runtime",
+        "instance_id",
+        "run_id",
+        "software_revision"
+      ],
+      "title": "ProducerRef",
+      "type": "object"
+    },
+    "SubjectRef": {
+      "additionalProperties": false,
+      "properties": {
+        "display_name": {
+          "anyOf": [
+            {
+              "maxLength": 160,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Display Name"
+        },
+        "generation": {
+          "default": 0,
+          "minimum": 0,
+          "title": "Generation",
+          "type": "integer"
+        },
+        "kind": {
+          "$ref": "#/$defs/IdentityKind"
+        },
+        "resident_uuid": {
+          "anyOf": [
+            {
+              "maxLength": 160,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Resident Uuid"
+        },
+        "stable_id": {
+          "anyOf": [
+            {
+              "minimum": 1,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Stable Id"
+        },
+        "subject_id": {
+          "maxLength": 200,
+          "minLength": 1,
+          "title": "Subject Id",
+          "type": "string"
+        }
+      },
+      "required": [
+        "subject_id",
+        "kind"
+      ],
+      "title": "SubjectRef",
+      "type": "object"
+    },
+    "Vector3": {
+      "additionalProperties": false,
+      "properties": {
+        "x": {
+          "title": "X",
+          "type": "number"
+        },
+        "y": {
+          "title": "Y",
+          "type": "number"
+        },
+        "z": {
+          "title": "Z",
+          "type": "number"
+        }
+      },
+      "required": [
+        "x",
+        "y",
+        "z"
+      ],
+      "title": "Vector3",
+      "type": "object"
+    }
+  },
+  "additionalProperties": false,
+  "properties": {
+    "contract": {
+      "const": "noesis.world.event",
+      "title": "Contract",
+      "type": "string"
+    },
+    "contract_version": {
+      "const": 1,
+      "title": "Contract Version",
+      "type": "integer"
+    },
+    "entity_id": {
+      "maxLength": 200,
+      "minLength": 1,
+      "title": "Entity Id",
+      "type": "string"
+    },
+    "event_id": {
+      "maxLength": 200,
+      "minLength": 1,
+      "title": "Event Id",
+      "type": "string"
+    },
+    "event_type": {
+      "enum": [
+        "appeared",
+        "held",
+        "resumed",
+        "lost",
+        "conflict_started",
+        "conflict_cleared"
+      ],
+      "title": "Event Type",
+      "type": "string"
+    },
+    "frame": {
+      "const": "backend_world_m",
+      "title": "Frame",
+      "type": "string"
+    },
+    "observed_at_us": {
+      "minimum": 1,
+      "title": "Observed At Us",
+      "type": "integer"
+    },
+    "position": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/Vector3"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null
+    },
+    "producer": {
+      "$ref": "#/$defs/ProducerRef"
+    },
+    "published_at_us": {
+      "minimum": 1,
+      "title": "Published At Us",
+      "type": "integer"
+    },
+    "reason": {
+      "anyOf": [
+        {
+          "maxLength": 240,
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Reason"
+    },
+    "sequence": {
+      "minimum": 0,
+      "title": "Sequence",
+      "type": "integer"
+    },
+    "subject": {
+      "$ref": "#/$defs/SubjectRef"
+    },
+    "units": {
+      "const": "meters",
+      "title": "Units",
+      "type": "string"
+    }
+  },
+  "required": [
+    "contract",
+    "contract_version",
+    "event_id",
+    "producer",
+    "sequence",
+    "event_type",
+    "entity_id",
+    "subject",
+    "observed_at_us",
+    "published_at_us",
+    "frame",
+    "units"
+  ],
+  "title": "WorldEvent",
+  "type": "object"
+}

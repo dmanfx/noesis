@@ -1,0 +1,473 @@
+{
+  "$defs": {
+    "EntityLifecycle": {
+      "enum": [
+        "present",
+        "held",
+        "lost"
+      ],
+      "title": "EntityLifecycle",
+      "type": "string"
+    },
+    "IdentityKind": {
+      "enum": [
+        "resident",
+        "visitor",
+        "unknown",
+        "provisional"
+      ],
+      "title": "IdentityKind",
+      "type": "string"
+    },
+    "Matrix3": {
+      "additionalProperties": false,
+      "description": "Row-major 3x3 matrix used for covariance and transform evidence.",
+      "properties": {
+        "values": {
+          "maxItems": 9,
+          "minItems": 9,
+          "prefixItems": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "number"
+            },
+            {
+              "type": "number"
+            },
+            {
+              "type": "number"
+            },
+            {
+              "type": "number"
+            },
+            {
+              "type": "number"
+            },
+            {
+              "type": "number"
+            },
+            {
+              "type": "number"
+            },
+            {
+              "type": "number"
+            }
+          ],
+          "title": "Values",
+          "type": "array"
+        }
+      },
+      "required": [
+        "values"
+      ],
+      "title": "Matrix3",
+      "type": "object"
+    },
+    "ProducerRef": {
+      "additionalProperties": false,
+      "properties": {
+        "instance_id": {
+          "maxLength": 160,
+          "minLength": 1,
+          "title": "Instance Id",
+          "type": "string"
+        },
+        "run_id": {
+          "maxLength": 160,
+          "minLength": 1,
+          "title": "Run Id",
+          "type": "string"
+        },
+        "runtime": {
+          "enum": [
+            "ds8",
+            "ds9",
+            "replay",
+            "test"
+          ],
+          "title": "Runtime",
+          "type": "string"
+        },
+        "software_revision": {
+          "maxLength": 160,
+          "minLength": 1,
+          "title": "Software Revision",
+          "type": "string"
+        }
+      },
+      "required": [
+        "runtime",
+        "instance_id",
+        "run_id",
+        "software_revision"
+      ],
+      "title": "ProducerRef",
+      "type": "object"
+    },
+    "SubjectRef": {
+      "additionalProperties": false,
+      "properties": {
+        "display_name": {
+          "anyOf": [
+            {
+              "maxLength": 160,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Display Name"
+        },
+        "generation": {
+          "default": 0,
+          "minimum": 0,
+          "title": "Generation",
+          "type": "integer"
+        },
+        "kind": {
+          "$ref": "#/$defs/IdentityKind"
+        },
+        "resident_uuid": {
+          "anyOf": [
+            {
+              "maxLength": 160,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Resident Uuid"
+        },
+        "stable_id": {
+          "anyOf": [
+            {
+              "minimum": 1,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Stable Id"
+        },
+        "subject_id": {
+          "maxLength": 200,
+          "minLength": 1,
+          "title": "Subject Id",
+          "type": "string"
+        }
+      },
+      "required": [
+        "subject_id",
+        "kind"
+      ],
+      "title": "SubjectRef",
+      "type": "object"
+    },
+    "Vector3": {
+      "additionalProperties": false,
+      "properties": {
+        "x": {
+          "title": "X",
+          "type": "number"
+        },
+        "y": {
+          "title": "Y",
+          "type": "number"
+        },
+        "z": {
+          "title": "Z",
+          "type": "number"
+        }
+      },
+      "required": [
+        "x",
+        "y",
+        "z"
+      ],
+      "title": "Vector3",
+      "type": "object"
+    },
+    "WorldEntity": {
+      "additionalProperties": false,
+      "properties": {
+        "conflict": {
+          "default": false,
+          "title": "Conflict",
+          "type": "boolean"
+        },
+        "conflict_reason": {
+          "anyOf": [
+            {
+              "maxLength": 240,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Conflict Reason"
+        },
+        "covariance": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Matrix3"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "entity_id": {
+          "maxLength": 200,
+          "minLength": 1,
+          "title": "Entity Id",
+          "type": "string"
+        },
+        "lifecycle": {
+          "$ref": "#/$defs/EntityLifecycle"
+        },
+        "observed_at_us": {
+          "minimum": 1,
+          "title": "Observed At Us",
+          "type": "integer"
+        },
+        "position": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Vector3"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "room_id": {
+          "anyOf": [
+            {
+              "maxLength": 160,
+              "minLength": 1,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Room Id"
+        },
+        "sources": {
+          "items": {
+            "$ref": "#/$defs/WorldSourceEvidence"
+          },
+          "minItems": 1,
+          "title": "Sources",
+          "type": "array"
+        },
+        "stale_after_us": {
+          "minimum": 1,
+          "title": "Stale After Us",
+          "type": "integer"
+        },
+        "subject": {
+          "$ref": "#/$defs/SubjectRef"
+        },
+        "velocity_mps": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Vector3"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        }
+      },
+      "required": [
+        "entity_id",
+        "subject",
+        "lifecycle",
+        "observed_at_us",
+        "stale_after_us",
+        "sources"
+      ],
+      "title": "WorldEntity",
+      "type": "object"
+    },
+    "WorldSourceEvidence": {
+      "additionalProperties": false,
+      "properties": {
+        "accepted": {
+          "title": "Accepted",
+          "type": "boolean"
+        },
+        "camera_id": {
+          "maxLength": 160,
+          "minLength": 1,
+          "title": "Camera Id",
+          "type": "string"
+        },
+        "covariance": {
+          "$ref": "#/$defs/Matrix3"
+        },
+        "observation_id": {
+          "maxLength": 200,
+          "minLength": 1,
+          "title": "Observation Id",
+          "type": "string"
+        },
+        "observed_at_us": {
+          "minimum": 1,
+          "title": "Observed At Us",
+          "type": "integer"
+        },
+        "position": {
+          "$ref": "#/$defs/Vector3"
+        },
+        "rejection_reason": {
+          "anyOf": [
+            {
+              "maxLength": 200,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Rejection Reason"
+        },
+        "zone": {
+          "anyOf": [
+            {
+              "maxLength": 160,
+              "minLength": 1,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Zone"
+        },
+        "zone_authoritative": {
+          "default": false,
+          "title": "Zone Authoritative",
+          "type": "boolean"
+        },
+        "zone_source": {
+          "anyOf": [
+            {
+              "enum": [
+                "nvdsanalytics_roi",
+                "camera_default"
+              ],
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Zone Source"
+        }
+      },
+      "required": [
+        "observation_id",
+        "camera_id",
+        "observed_at_us",
+        "position",
+        "covariance",
+        "accepted"
+      ],
+      "title": "WorldSourceEvidence",
+      "type": "object"
+    }
+  },
+  "additionalProperties": false,
+  "properties": {
+    "contract": {
+      "const": "noesis.world.snapshot",
+      "title": "Contract",
+      "type": "string"
+    },
+    "contract_version": {
+      "const": 1,
+      "title": "Contract Version",
+      "type": "integer"
+    },
+    "entities": {
+      "items": {
+        "$ref": "#/$defs/WorldEntity"
+      },
+      "title": "Entities",
+      "type": "array"
+    },
+    "frame": {
+      "const": "backend_world_m",
+      "title": "Frame",
+      "type": "string"
+    },
+    "observed_end_us": {
+      "minimum": 1,
+      "title": "Observed End Us",
+      "type": "integer"
+    },
+    "observed_start_us": {
+      "minimum": 1,
+      "title": "Observed Start Us",
+      "type": "integer"
+    },
+    "producer": {
+      "$ref": "#/$defs/ProducerRef"
+    },
+    "published_at_us": {
+      "minimum": 1,
+      "title": "Published At Us",
+      "type": "integer"
+    },
+    "sequence": {
+      "minimum": 0,
+      "title": "Sequence",
+      "type": "integer"
+    },
+    "snapshot_id": {
+      "maxLength": 200,
+      "minLength": 1,
+      "title": "Snapshot Id",
+      "type": "string"
+    },
+    "units": {
+      "const": "meters",
+      "title": "Units",
+      "type": "string"
+    }
+  },
+  "required": [
+    "contract",
+    "contract_version",
+    "snapshot_id",
+    "producer",
+    "sequence",
+    "observed_start_us",
+    "observed_end_us",
+    "published_at_us",
+    "frame",
+    "units",
+    "entities"
+  ],
+  "title": "WorldSnapshot",
+  "type": "object"
+}

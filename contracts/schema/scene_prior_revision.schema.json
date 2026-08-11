@@ -1,0 +1,622 @@
+{
+  "$defs": {
+    "ArtifactFingerprint": {
+      "additionalProperties": false,
+      "description": "Content identity for an input that can change product semantics.",
+      "properties": {
+        "producer": {
+          "anyOf": [
+            {
+              "maxLength": 160,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Producer"
+        },
+        "role": {
+          "maxLength": 96,
+          "minLength": 1,
+          "title": "Role",
+          "type": "string"
+        },
+        "sha256": {
+          "title": "Sha256",
+          "type": "string"
+        },
+        "version": {
+          "anyOf": [
+            {
+              "maxLength": 160,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Version"
+        }
+      },
+      "required": [
+        "role",
+        "sha256"
+      ],
+      "title": "ArtifactFingerprint",
+      "type": "object"
+    },
+    "ScenePriorArtifact": {
+      "additionalProperties": false,
+      "properties": {
+        "relative_path": {
+          "maxLength": 500,
+          "minLength": 1,
+          "title": "Relative Path",
+          "type": "string"
+        },
+        "role": {
+          "maxLength": 160,
+          "minLength": 1,
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]{0,159}$",
+          "title": "Role",
+          "type": "string"
+        },
+        "sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Sha256",
+          "type": "string"
+        },
+        "size_bytes": {
+          "maximum": 67108864,
+          "minimum": 1,
+          "title": "Size Bytes",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "role",
+        "relative_path",
+        "sha256",
+        "size_bytes"
+      ],
+      "title": "ScenePriorArtifact",
+      "type": "object"
+    },
+    "ScenePriorBounds": {
+      "additionalProperties": false,
+      "properties": {
+        "max_x": {
+          "title": "Max X",
+          "type": "number"
+        },
+        "max_z": {
+          "title": "Max Z",
+          "type": "number"
+        },
+        "min_x": {
+          "title": "Min X",
+          "type": "number"
+        },
+        "min_z": {
+          "title": "Min Z",
+          "type": "number"
+        }
+      },
+      "required": [
+        "min_x",
+        "max_x",
+        "min_z",
+        "max_z"
+      ],
+      "title": "ScenePriorBounds",
+      "type": "object"
+    },
+    "ScenePriorDerivation": {
+      "additionalProperties": false,
+      "properties": {
+        "algorithm": {
+          "const": "noesis_scene_prior_2_5d_v1",
+          "title": "Algorithm",
+          "type": "string"
+        },
+        "floor_support_band_m": {
+          "exclusiveMinimum": 0.0,
+          "maximum": 1.0,
+          "title": "Floor Support Band M",
+          "type": "number"
+        },
+        "floor_y_m": {
+          "title": "Floor Y M",
+          "type": "number"
+        },
+        "max_source_height_m": {
+          "exclusiveMinimum": 0.0,
+          "maximum": 20.0,
+          "title": "Max Source Height M",
+          "type": "number"
+        },
+        "obstacle_max_height_m": {
+          "exclusiveMinimum": 0.0,
+          "maximum": 10.0,
+          "title": "Obstacle Max Height M",
+          "type": "number"
+        },
+        "obstacle_min_height_m": {
+          "exclusiveMinimum": 0.0,
+          "maximum": 2.0,
+          "title": "Obstacle Min Height M",
+          "type": "number"
+        },
+        "obstacle_min_support": {
+          "maximum": 1000000,
+          "minimum": 1,
+          "title": "Obstacle Min Support",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "algorithm",
+        "floor_y_m",
+        "floor_support_band_m",
+        "obstacle_min_height_m",
+        "obstacle_max_height_m",
+        "obstacle_min_support",
+        "max_source_height_m"
+      ],
+      "title": "ScenePriorDerivation",
+      "type": "object"
+    },
+    "ScenePriorGrid": {
+      "additionalProperties": false,
+      "properties": {
+        "bounds": {
+          "$ref": "#/$defs/ScenePriorBounds"
+        },
+        "columns": {
+          "maximum": 16384,
+          "minimum": 1,
+          "title": "Columns",
+          "type": "integer"
+        },
+        "coordinate_frame": {
+          "const": "backend_world_m",
+          "title": "Coordinate Frame",
+          "type": "string"
+        },
+        "orientation": {
+          "const": "row_increases_positive_z_column_increases_positive_x",
+          "title": "Orientation",
+          "type": "string"
+        },
+        "resolution_m": {
+          "exclusiveMinimum": 0.0,
+          "maximum": 2.0,
+          "title": "Resolution M",
+          "type": "number"
+        },
+        "rows": {
+          "maximum": 16384,
+          "minimum": 1,
+          "title": "Rows",
+          "type": "integer"
+        },
+        "units": {
+          "const": "meters",
+          "title": "Units",
+          "type": "string"
+        }
+      },
+      "required": [
+        "coordinate_frame",
+        "units",
+        "orientation",
+        "bounds",
+        "resolution_m",
+        "rows",
+        "columns"
+      ],
+      "title": "ScenePriorGrid",
+      "type": "object"
+    },
+    "ScenePriorPreview": {
+      "additionalProperties": false,
+      "properties": {
+        "bounds": {
+          "$ref": "#/$defs/ScenePriorBounds"
+        },
+        "camera_calibration": {
+          "$ref": "#/$defs/ArtifactFingerprint"
+        },
+        "camera_forward_world_xz": {
+          "maxItems": 2,
+          "minItems": 2,
+          "prefixItems": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "number"
+            }
+          ],
+          "title": "Camera Forward World Xz",
+          "type": "array"
+        },
+        "camera_position_world_m": {
+          "maxItems": 3,
+          "minItems": 3,
+          "prefixItems": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "number"
+            },
+            {
+              "type": "number"
+            }
+          ],
+          "title": "Camera Position World M",
+          "type": "array"
+        },
+        "camera_right_world_xz": {
+          "maxItems": 2,
+          "minItems": 2,
+          "prefixItems": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "number"
+            }
+          ],
+          "title": "Camera Right World Xz",
+          "type": "array"
+        },
+        "columns": {
+          "maximum": 16384,
+          "minimum": 1,
+          "title": "Columns",
+          "type": "integer"
+        },
+        "coordinate_frame": {
+          "const": "camera_local_ground_m",
+          "title": "Coordinate Frame",
+          "type": "string"
+        },
+        "orientation": {
+          "const": "row_increases_camera_forward_column_increases_camera_right",
+          "title": "Orientation",
+          "type": "string"
+        },
+        "reference_camera_id": {
+          "maxLength": 160,
+          "minLength": 1,
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]{0,159}$",
+          "title": "Reference Camera Id",
+          "type": "string"
+        },
+        "resolution_m": {
+          "exclusiveMinimum": 0.0,
+          "maximum": 2.0,
+          "title": "Resolution M",
+          "type": "number"
+        },
+        "rows": {
+          "maximum": 16384,
+          "minimum": 1,
+          "title": "Rows",
+          "type": "integer"
+        },
+        "target_revision_metadata": {
+          "$ref": "#/$defs/ArtifactFingerprint"
+        },
+        "units": {
+          "const": "meters",
+          "title": "Units",
+          "type": "string"
+        }
+      },
+      "required": [
+        "coordinate_frame",
+        "units",
+        "orientation",
+        "reference_camera_id",
+        "camera_calibration",
+        "target_revision_metadata",
+        "camera_position_world_m",
+        "camera_right_world_xz",
+        "camera_forward_world_xz",
+        "bounds",
+        "resolution_m",
+        "rows",
+        "columns"
+      ],
+      "title": "ScenePriorPreview",
+      "type": "object"
+    },
+    "ScenePriorQuality": {
+      "additionalProperties": false,
+      "properties": {
+        "alignment_status": {
+          "maxLength": 80,
+          "minLength": 1,
+          "title": "Alignment Status",
+          "type": "string"
+        },
+        "authored_cell_count": {
+          "minimum": 1,
+          "title": "Authored Cell Count",
+          "type": "integer"
+        },
+        "authored_floor_supported_fraction": {
+          "maximum": 1.0,
+          "minimum": 0.0,
+          "title": "Authored Floor Supported Fraction",
+          "type": "number"
+        },
+        "authored_observed_fraction": {
+          "maximum": 1.0,
+          "minimum": 0.0,
+          "title": "Authored Observed Fraction",
+          "type": "number"
+        },
+        "floor_supported_cell_count": {
+          "minimum": 0,
+          "title": "Floor Supported Cell Count",
+          "type": "integer"
+        },
+        "observed_cell_count": {
+          "minimum": 0,
+          "title": "Observed Cell Count",
+          "type": "integer"
+        },
+        "obstacle_cell_count": {
+          "minimum": 0,
+          "title": "Obstacle Cell Count",
+          "type": "integer"
+        },
+        "passed": {
+          "title": "Passed",
+          "type": "boolean"
+        },
+        "selected_point_count": {
+          "minimum": 0,
+          "title": "Selected Point Count",
+          "type": "integer"
+        },
+        "source_point_count": {
+          "minimum": 0,
+          "title": "Source Point Count",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "passed",
+        "source_point_count",
+        "selected_point_count",
+        "authored_cell_count",
+        "observed_cell_count",
+        "floor_supported_cell_count",
+        "obstacle_cell_count",
+        "authored_observed_fraction",
+        "authored_floor_supported_fraction",
+        "alignment_status"
+      ],
+      "title": "ScenePriorQuality",
+      "type": "object"
+    },
+    "ScenePriorSemanticBinding": {
+      "additionalProperties": false,
+      "properties": {
+        "authored_groups": {
+          "items": {
+            "type": "string"
+          },
+          "maxItems": 256,
+          "minItems": 1,
+          "title": "Authored Groups",
+          "type": "array"
+        },
+        "room_group_map": {
+          "$ref": "#/$defs/ArtifactFingerprint"
+        },
+        "room_labels": {
+          "items": {
+            "type": "string"
+          },
+          "maxItems": 64,
+          "minItems": 1,
+          "title": "Room Labels",
+          "type": "array"
+        }
+      },
+      "required": [
+        "room_labels",
+        "authored_groups",
+        "room_group_map"
+      ],
+      "title": "ScenePriorSemanticBinding",
+      "type": "object"
+    },
+    "ScenePriorSource": {
+      "additionalProperties": false,
+      "properties": {
+        "bundle_id": {
+          "maxLength": 200,
+          "minLength": 1,
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]{0,199}$",
+          "title": "Bundle Id",
+          "type": "string"
+        },
+        "bundle_manifest_sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Bundle Manifest Sha256",
+          "type": "string"
+        },
+        "bundle_schema": {
+          "maxLength": 160,
+          "minLength": 1,
+          "title": "Bundle Schema",
+          "type": "string"
+        },
+        "capture_id": {
+          "maxLength": 200,
+          "minLength": 1,
+          "title": "Capture Id",
+          "type": "string"
+        },
+        "captured_at_us": {
+          "minimum": 1,
+          "title": "Captured At Us",
+          "type": "integer"
+        },
+        "model": {
+          "maxLength": 200,
+          "minLength": 1,
+          "title": "Model",
+          "type": "string"
+        },
+        "reference_sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Reference Sha256",
+          "type": "string"
+        },
+        "source_type": {
+          "const": "mapanything_multiview_room_walk",
+          "title": "Source Type",
+          "type": "string"
+        }
+      },
+      "required": [
+        "source_type",
+        "bundle_id",
+        "bundle_schema",
+        "bundle_manifest_sha256",
+        "reference_sha256",
+        "capture_id",
+        "captured_at_us",
+        "model"
+      ],
+      "title": "ScenePriorSource",
+      "type": "object"
+    }
+  },
+  "additionalProperties": false,
+  "properties": {
+    "alignment": {
+      "$ref": "#/$defs/ArtifactFingerprint"
+    },
+    "artifacts": {
+      "items": {
+        "$ref": "#/$defs/ScenePriorArtifact"
+      },
+      "maxItems": 16,
+      "minItems": 1,
+      "title": "Artifacts",
+      "type": "array"
+    },
+    "authored_scene": {
+      "$ref": "#/$defs/ArtifactFingerprint"
+    },
+    "contract": {
+      "const": "noesis.scene_prior.revision",
+      "title": "Contract",
+      "type": "string"
+    },
+    "contract_version": {
+      "const": 1,
+      "title": "Contract Version",
+      "type": "integer"
+    },
+    "created_at_us": {
+      "minimum": 1,
+      "title": "Created At Us",
+      "type": "integer"
+    },
+    "created_by": {
+      "maxLength": 160,
+      "minLength": 1,
+      "title": "Created By",
+      "type": "string"
+    },
+    "derivation": {
+      "$ref": "#/$defs/ScenePriorDerivation"
+    },
+    "grid": {
+      "$ref": "#/$defs/ScenePriorGrid"
+    },
+    "intended_use": {
+      "const": "shadow",
+      "title": "Intended Use",
+      "type": "string"
+    },
+    "preview": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/ScenePriorPreview"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null
+    },
+    "prior_id": {
+      "maxLength": 200,
+      "minLength": 1,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]{0,199}$",
+      "title": "Prior Id",
+      "type": "string"
+    },
+    "quality": {
+      "$ref": "#/$defs/ScenePriorQuality"
+    },
+    "semantic_binding": {
+      "$ref": "#/$defs/ScenePriorSemanticBinding"
+    },
+    "site_id": {
+      "maxLength": 160,
+      "minLength": 1,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]{0,159}$",
+      "title": "Site Id",
+      "type": "string"
+    },
+    "source": {
+      "$ref": "#/$defs/ScenePriorSource"
+    },
+    "space_id": {
+      "maxLength": 160,
+      "minLength": 1,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]{0,159}$",
+      "title": "Space Id",
+      "type": "string"
+    },
+    "world_to_scene": {
+      "$ref": "#/$defs/ArtifactFingerprint"
+    }
+  },
+  "required": [
+    "contract",
+    "contract_version",
+    "prior_id",
+    "site_id",
+    "space_id",
+    "created_at_us",
+    "created_by",
+    "intended_use",
+    "source",
+    "alignment",
+    "authored_scene",
+    "world_to_scene",
+    "semantic_binding",
+    "grid",
+    "derivation",
+    "quality",
+    "artifacts"
+  ],
+  "title": "ScenePriorRevision",
+  "type": "object"
+}

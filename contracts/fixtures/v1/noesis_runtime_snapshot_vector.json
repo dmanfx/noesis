@@ -1,0 +1,45 @@
+{
+  "contract": "noesis.appliance.runtime_identity_fixture",
+  "contract_version": 1,
+  "payloads": {
+    "config/infer.yaml": "fixture-config\n",
+    "models/engines/yolo11s_b3_fp16.engine": "fixture-engine\n"
+  },
+  "inventory_rows": [
+    {
+      "path": "config",
+      "type": "directory",
+      "mode": 448
+    },
+    {
+      "path": "config/infer.yaml",
+      "type": "file",
+      "mode": 384,
+      "bytes": 15,
+      "sha256": "ffbc4cdc0410b3e6909ebc8063ec3bd97f0cee0ea737e6af9c140e35a60b218c"
+    },
+    {
+      "path": "models",
+      "type": "external-directory-symlink",
+      "mode": 511,
+      "target": "../external-model-store"
+    },
+    {
+      "path": "models/engines/yolo11s_b3_fp16.engine",
+      "type": "file",
+      "mode": 384,
+      "bytes": 15,
+      "sha256": "8c1fc5c1304e8f448db253caabe3fdd48ddc3e419bbd1cd611e90dc9523daf5c"
+    }
+  ],
+  "descriptor": {
+    "algorithm": "noesis-runtime-v1",
+    "revision": "1111111111111111111111111111111111111111",
+    "tree": "2222222222222222222222222222222222222222",
+    "submodules": [],
+    "runtime_inventory_sha256": "94abfb0d2bde090291e72edaa6c7088d8e5692d6161b52ac97f31cc12f3b02b0",
+    "runtime_file_count": 2,
+    "runtime_byte_count": 30
+  },
+  "snapshot_sha256": "f763d03a2387d781d38bfb93cc7c95b26d6c3fa9c846d6046436a756e8eec9cc"
+}

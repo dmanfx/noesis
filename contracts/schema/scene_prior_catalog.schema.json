@@ -1,0 +1,139 @@
+{
+  "$defs": {
+    "ScenePriorCameraBinding": {
+      "additionalProperties": false,
+      "properties": {
+        "camera_id": {
+          "maxLength": 160,
+          "minLength": 1,
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]{0,159}$",
+          "title": "Camera Id",
+          "type": "string"
+        },
+        "include_floorplan_layers": {
+          "default": true,
+          "title": "Include Floorplan Layers",
+          "type": "boolean"
+        },
+        "mode": {
+          "const": "shadow",
+          "title": "Mode",
+          "type": "string"
+        },
+        "prior_id": {
+          "maxLength": 200,
+          "minLength": 1,
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]{0,199}$",
+          "title": "Prior Id",
+          "type": "string"
+        },
+        "space_id": {
+          "maxLength": 160,
+          "minLength": 1,
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]{0,159}$",
+          "title": "Space Id",
+          "type": "string"
+        }
+      },
+      "required": [
+        "camera_id",
+        "space_id",
+        "prior_id",
+        "mode"
+      ],
+      "title": "ScenePriorCameraBinding",
+      "type": "object"
+    },
+    "ScenePriorCatalogEntry": {
+      "additionalProperties": false,
+      "properties": {
+        "manifest_path": {
+          "maxLength": 500,
+          "minLength": 1,
+          "title": "Manifest Path",
+          "type": "string"
+        },
+        "manifest_sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Manifest Sha256",
+          "type": "string"
+        },
+        "manifest_size_bytes": {
+          "maximum": 4194304,
+          "minimum": 1,
+          "title": "Manifest Size Bytes",
+          "type": "integer"
+        },
+        "prior_id": {
+          "maxLength": 200,
+          "minLength": 1,
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]{0,199}$",
+          "title": "Prior Id",
+          "type": "string"
+        },
+        "space_id": {
+          "maxLength": 160,
+          "minLength": 1,
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]{0,159}$",
+          "title": "Space Id",
+          "type": "string"
+        }
+      },
+      "required": [
+        "prior_id",
+        "space_id",
+        "manifest_path",
+        "manifest_sha256",
+        "manifest_size_bytes"
+      ],
+      "title": "ScenePriorCatalogEntry",
+      "type": "object"
+    }
+  },
+  "additionalProperties": false,
+  "properties": {
+    "camera_bindings": {
+      "items": {
+        "$ref": "#/$defs/ScenePriorCameraBinding"
+      },
+      "maxItems": 256,
+      "title": "Camera Bindings",
+      "type": "array"
+    },
+    "contract": {
+      "const": "noesis.scene_prior.catalog",
+      "title": "Contract",
+      "type": "string"
+    },
+    "contract_version": {
+      "const": 1,
+      "title": "Contract Version",
+      "type": "integer"
+    },
+    "revisions": {
+      "items": {
+        "$ref": "#/$defs/ScenePriorCatalogEntry"
+      },
+      "maxItems": 256,
+      "minItems": 1,
+      "title": "Revisions",
+      "type": "array"
+    },
+    "site_id": {
+      "maxLength": 160,
+      "minLength": 1,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]{0,159}$",
+      "title": "Site Id",
+      "type": "string"
+    }
+  },
+  "required": [
+    "contract",
+    "contract_version",
+    "site_id",
+    "revisions",
+    "camera_bindings"
+  ],
+  "title": "ScenePriorCatalog",
+  "type": "object"
+}

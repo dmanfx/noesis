@@ -1,0 +1,912 @@
+{
+  "$defs": {
+    "ArtifactFingerprint": {
+      "additionalProperties": false,
+      "description": "Content identity for an input that can change product semantics.",
+      "properties": {
+        "producer": {
+          "anyOf": [
+            {
+              "maxLength": 160,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Producer"
+        },
+        "role": {
+          "maxLength": 96,
+          "minLength": 1,
+          "title": "Role",
+          "type": "string"
+        },
+        "sha256": {
+          "title": "Sha256",
+          "type": "string"
+        },
+        "version": {
+          "anyOf": [
+            {
+              "maxLength": 160,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Version"
+        }
+      },
+      "required": [
+        "role",
+        "sha256"
+      ],
+      "title": "ArtifactFingerprint",
+      "type": "object"
+    },
+    "Matrix3": {
+      "additionalProperties": false,
+      "description": "Row-major 3x3 matrix used for covariance and transform evidence.",
+      "properties": {
+        "values": {
+          "maxItems": 9,
+          "minItems": 9,
+          "prefixItems": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "number"
+            },
+            {
+              "type": "number"
+            },
+            {
+              "type": "number"
+            },
+            {
+              "type": "number"
+            },
+            {
+              "type": "number"
+            },
+            {
+              "type": "number"
+            },
+            {
+              "type": "number"
+            },
+            {
+              "type": "number"
+            }
+          ],
+          "title": "Values",
+          "type": "array"
+        }
+      },
+      "required": [
+        "values"
+      ],
+      "title": "Matrix3",
+      "type": "object"
+    },
+    "PersonObservation": {
+      "additionalProperties": false,
+      "properties": {
+        "bbox_xywh": {
+          "maxItems": 4,
+          "minItems": 4,
+          "prefixItems": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "number"
+            },
+            {
+              "type": "number"
+            },
+            {
+              "type": "number"
+            }
+          ],
+          "title": "Bbox Xywh",
+          "type": "array"
+        },
+        "class_id": {
+          "const": 0,
+          "default": 0,
+          "title": "Class Id",
+          "type": "integer"
+        },
+        "depth_present": {
+          "default": false,
+          "title": "Depth Present",
+          "type": "boolean"
+        },
+        "detection_confidence": {
+          "anyOf": [
+            {
+              "maximum": 1.0,
+              "minimum": 0.0,
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Detection Confidence"
+        },
+        "embedding_dimension": {
+          "anyOf": [
+            {
+              "minimum": 1,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Embedding Dimension"
+        },
+        "embedding_model_sha256": {
+          "anyOf": [
+            {
+              "pattern": "^[0-9a-f]{64}$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Embedding Model Sha256"
+        },
+        "embedding_sequence": {
+          "anyOf": [
+            {
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Embedding Sequence"
+        },
+        "image_size": {
+          "maxItems": 2,
+          "minItems": 2,
+          "prefixItems": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "integer"
+            }
+          ],
+          "title": "Image Size",
+          "type": "array"
+        },
+        "occluded": {
+          "default": false,
+          "title": "Occluded",
+          "type": "boolean"
+        },
+        "pose_present": {
+          "default": false,
+          "title": "Pose Present",
+          "type": "boolean"
+        },
+        "tracker_confidence": {
+          "anyOf": [
+            {
+              "maximum": 1.0,
+              "minimum": 0.0,
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Tracker Confidence"
+        },
+        "tracklet": {
+          "$ref": "#/$defs/TrackletRef"
+        },
+        "world": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/WorldPositionObservation"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "world_diagnostics": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/WorldObservationDiagnostics"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "zone": {
+          "anyOf": [
+            {
+              "maxLength": 160,
+              "minLength": 1,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Zone"
+        },
+        "zone_authoritative": {
+          "default": false,
+          "title": "Zone Authoritative",
+          "type": "boolean"
+        },
+        "zone_source": {
+          "anyOf": [
+            {
+              "enum": [
+                "nvdsanalytics_roi",
+                "camera_default"
+              ],
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Zone Source"
+        }
+      },
+      "required": [
+        "tracklet",
+        "bbox_xywh",
+        "image_size"
+      ],
+      "title": "PersonObservation",
+      "type": "object"
+    },
+    "ProducerRef": {
+      "additionalProperties": false,
+      "properties": {
+        "instance_id": {
+          "maxLength": 160,
+          "minLength": 1,
+          "title": "Instance Id",
+          "type": "string"
+        },
+        "run_id": {
+          "maxLength": 160,
+          "minLength": 1,
+          "title": "Run Id",
+          "type": "string"
+        },
+        "runtime": {
+          "enum": [
+            "ds8",
+            "ds9",
+            "replay",
+            "test"
+          ],
+          "title": "Runtime",
+          "type": "string"
+        },
+        "software_revision": {
+          "maxLength": 160,
+          "minLength": 1,
+          "title": "Software Revision",
+          "type": "string"
+        }
+      },
+      "required": [
+        "runtime",
+        "instance_id",
+        "run_id",
+        "software_revision"
+      ],
+      "title": "ProducerRef",
+      "type": "object"
+    },
+    "TrackletRef": {
+      "additionalProperties": false,
+      "properties": {
+        "camera_id": {
+          "maxLength": 160,
+          "minLength": 1,
+          "title": "Camera Id",
+          "type": "string"
+        },
+        "frame_id": {
+          "minimum": 0,
+          "title": "Frame Id",
+          "type": "integer"
+        },
+        "observed_at_us": {
+          "minimum": 1,
+          "title": "Observed At Us",
+          "type": "integer"
+        },
+        "run_id": {
+          "maxLength": 160,
+          "minLength": 1,
+          "title": "Run Id",
+          "type": "string"
+        },
+        "source_id": {
+          "minimum": 0,
+          "title": "Source Id",
+          "type": "integer"
+        },
+        "tracker_id": {
+          "minimum": 0,
+          "title": "Tracker Id",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "run_id",
+        "camera_id",
+        "source_id",
+        "tracker_id",
+        "frame_id",
+        "observed_at_us"
+      ],
+      "title": "TrackletRef",
+      "type": "object"
+    },
+    "Vector3": {
+      "additionalProperties": false,
+      "properties": {
+        "x": {
+          "title": "X",
+          "type": "number"
+        },
+        "y": {
+          "title": "Y",
+          "type": "number"
+        },
+        "z": {
+          "title": "Z",
+          "type": "number"
+        }
+      },
+      "required": [
+        "x",
+        "y",
+        "z"
+      ],
+      "title": "Vector3",
+      "type": "object"
+    },
+    "WorldObservationDiagnostics": {
+      "additionalProperties": false,
+      "description": "Bounded non-biometric evidence for one world-placement decision.",
+      "properties": {
+        "depth_anchor_m": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Depth Anchor M"
+        },
+        "depth_candidate_m": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Vector3"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "depth_registered_m": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Depth Registered M"
+        },
+        "depth_registration_id": {
+          "anyOf": [
+            {
+              "maxLength": 200,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Depth Registration Id"
+        },
+        "depth_registration_status": {
+          "anyOf": [
+            {
+              "maxLength": 120,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Depth Registration Status"
+        },
+        "depth_status": {
+          "anyOf": [
+            {
+              "maxLength": 120,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Depth Status"
+        },
+        "depth_used_m": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Depth Used M"
+        },
+        "depth_weight_effective": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Depth Weight Effective"
+        },
+        "depth_weight_scale": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Depth Weight Scale"
+        },
+        "estimator_evaluated": {
+          "anyOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Estimator Evaluated"
+        },
+        "filter_prediction_m": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Vector3"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "first_divergence_reason": {
+          "anyOf": [
+            {
+              "maxLength": 240,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "First Divergence Reason"
+        },
+        "floor_admitted": {
+          "anyOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Floor Admitted"
+        },
+        "floor_candidate_m": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Vector3"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "floor_incidence_sin": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Floor Incidence Sin"
+        },
+        "floor_range_limit_m": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Floor Range Limit M"
+        },
+        "floor_range_m": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Floor Range M"
+        },
+        "floor_rejection_reason": {
+          "anyOf": [
+            {
+              "maxLength": 200,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Floor Rejection Reason"
+        },
+        "floor_weight_effective": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Floor Weight Effective"
+        },
+        "floor_weight_scale": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Floor Weight Scale"
+        },
+        "fusion_policy_id": {
+          "anyOf": [
+            {
+              "maxLength": 200,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Fusion Policy Id"
+        },
+        "innovation_limit_m": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Innovation Limit M"
+        },
+        "innovation_m": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Innovation M"
+        },
+        "measurement_accepted": {
+          "anyOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Measurement Accepted"
+        },
+        "measurement_rejection_reason": {
+          "anyOf": [
+            {
+              "maxLength": 200,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Measurement Rejection Reason"
+        },
+        "prefilter_measurement_m": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Vector3"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        }
+      },
+      "title": "WorldObservationDiagnostics",
+      "type": "object"
+    },
+    "WorldPositionObservation": {
+      "additionalProperties": false,
+      "properties": {
+        "confidence": {
+          "maximum": 1.0,
+          "minimum": 0.0,
+          "title": "Confidence",
+          "type": "number"
+        },
+        "covariance": {
+          "$ref": "#/$defs/Matrix3"
+        },
+        "frame": {
+          "const": "backend_world_m",
+          "title": "Frame",
+          "type": "string"
+        },
+        "position": {
+          "$ref": "#/$defs/Vector3"
+        },
+        "quality": {
+          "enum": [
+            "good",
+            "estimated",
+            "held"
+          ],
+          "title": "Quality",
+          "type": "string"
+        },
+        "reason": {
+          "anyOf": [
+            {
+              "maxLength": 200,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Reason"
+        },
+        "source": {
+          "maxLength": 120,
+          "minLength": 1,
+          "title": "Source",
+          "type": "string"
+        },
+        "units": {
+          "const": "meters",
+          "title": "Units",
+          "type": "string"
+        }
+      },
+      "required": [
+        "position",
+        "covariance",
+        "frame",
+        "units",
+        "source",
+        "quality",
+        "confidence"
+      ],
+      "title": "WorldPositionObservation",
+      "type": "object"
+    }
+  },
+  "additionalProperties": false,
+  "properties": {
+    "calibration": {
+      "$ref": "#/$defs/ArtifactFingerprint"
+    },
+    "capture_time_status": {
+      "enum": [
+        "synced",
+        "estimated",
+        "unavailable"
+      ],
+      "title": "Capture Time Status",
+      "type": "string"
+    },
+    "captured_at_us": {
+      "anyOf": [
+        {
+          "minimum": 1,
+          "type": "integer"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Captured At Us"
+    },
+    "config": {
+      "$ref": "#/$defs/ArtifactFingerprint"
+    },
+    "contract": {
+      "const": "noesis.observation.person",
+      "title": "Contract",
+      "type": "string"
+    },
+    "contract_version": {
+      "const": 1,
+      "title": "Contract Version",
+      "type": "integer"
+    },
+    "coordinate_frame": {
+      "enum": [
+        "backend_world_m",
+        "camera_local_ground_m",
+        "image_px"
+      ],
+      "title": "Coordinate Frame",
+      "type": "string"
+    },
+    "media_pts_ns": {
+      "anyOf": [
+        {
+          "minimum": 0,
+          "type": "integer"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Media Pts Ns"
+    },
+    "model": {
+      "$ref": "#/$defs/ArtifactFingerprint"
+    },
+    "observation_id": {
+      "maxLength": 200,
+      "minLength": 1,
+      "title": "Observation Id",
+      "type": "string"
+    },
+    "observed_at_us": {
+      "minimum": 1,
+      "title": "Observed At Us",
+      "type": "integer"
+    },
+    "payload": {
+      "$ref": "#/$defs/PersonObservation"
+    },
+    "producer": {
+      "$ref": "#/$defs/ProducerRef"
+    },
+    "published_at_us": {
+      "minimum": 1,
+      "title": "Published At Us",
+      "type": "integer"
+    },
+    "sequence": {
+      "minimum": 0,
+      "title": "Sequence",
+      "type": "integer"
+    },
+    "units": {
+      "enum": [
+        "meters",
+        "pixels"
+      ],
+      "title": "Units",
+      "type": "string"
+    }
+  },
+  "required": [
+    "contract",
+    "contract_version",
+    "observation_id",
+    "producer",
+    "sequence",
+    "observed_at_us",
+    "published_at_us",
+    "capture_time_status",
+    "coordinate_frame",
+    "units",
+    "calibration",
+    "model",
+    "config",
+    "payload"
+  ],
+  "title": "ObservationEnvelope",
+  "type": "object"
+}

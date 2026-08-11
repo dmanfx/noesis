@@ -1,0 +1,288 @@
+{
+  "$defs": {
+    "ArtifactFingerprint": {
+      "additionalProperties": false,
+      "description": "Content identity for an input that can change product semantics.",
+      "properties": {
+        "producer": {
+          "anyOf": [
+            {
+              "maxLength": 160,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Producer"
+        },
+        "role": {
+          "maxLength": 96,
+          "minLength": 1,
+          "title": "Role",
+          "type": "string"
+        },
+        "sha256": {
+          "title": "Sha256",
+          "type": "string"
+        },
+        "version": {
+          "anyOf": [
+            {
+              "maxLength": 160,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Version"
+        }
+      },
+      "required": [
+        "role",
+        "sha256"
+      ],
+      "title": "ArtifactFingerprint",
+      "type": "object"
+    },
+    "SceneArtifact": {
+      "additionalProperties": false,
+      "properties": {
+        "relative_path": {
+          "maxLength": 500,
+          "minLength": 1,
+          "title": "Relative Path",
+          "type": "string"
+        },
+        "role": {
+          "maxLength": 160,
+          "minLength": 1,
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]{0,159}$",
+          "title": "Role",
+          "type": "string"
+        },
+        "sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Sha256",
+          "type": "string"
+        },
+        "size_bytes": {
+          "maximum": 268435456,
+          "minimum": 1,
+          "title": "Size Bytes",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "role",
+        "relative_path",
+        "sha256",
+        "size_bytes"
+      ],
+      "title": "SceneArtifact",
+      "type": "object"
+    },
+    "SceneCameraRevision": {
+      "additionalProperties": false,
+      "properties": {
+        "artifact_path": {
+          "maxLength": 500,
+          "minLength": 1,
+          "title": "Artifact Path",
+          "type": "string"
+        },
+        "artifacts": {
+          "items": {
+            "$ref": "#/$defs/SceneArtifact"
+          },
+          "maxItems": 128,
+          "minItems": 1,
+          "title": "Artifacts",
+          "type": "array"
+        },
+        "calibration_bundle_sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Calibration Bundle Sha256",
+          "type": "string"
+        },
+        "calibration_sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Calibration Sha256",
+          "type": "string"
+        },
+        "camera_id": {
+          "maxLength": 160,
+          "minLength": 1,
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]{0,159}$",
+          "title": "Camera Id",
+          "type": "string"
+        },
+        "captured_at_us": {
+          "minimum": 1,
+          "title": "Captured At Us",
+          "type": "integer"
+        },
+        "manifest_sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Manifest Sha256",
+          "type": "string"
+        },
+        "model_bundle_sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Model Bundle Sha256",
+          "type": "string"
+        },
+        "model_sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Model Sha256",
+          "type": "string"
+        },
+        "revision_id": {
+          "maxLength": 200,
+          "minLength": 1,
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]{0,199}$",
+          "title": "Revision Id",
+          "type": "string"
+        }
+      },
+      "required": [
+        "camera_id",
+        "revision_id",
+        "captured_at_us",
+        "calibration_bundle_sha256",
+        "calibration_sha256",
+        "model_bundle_sha256",
+        "model_sha256",
+        "manifest_sha256",
+        "artifact_path",
+        "artifacts"
+      ],
+      "title": "SceneCameraRevision",
+      "type": "object"
+    }
+  },
+  "additionalProperties": false,
+  "properties": {
+    "authored_scene": {
+      "$ref": "#/$defs/ArtifactFingerprint"
+    },
+    "authored_scene_dependencies": {
+      "items": {
+        "$ref": "#/$defs/SceneArtifact"
+      },
+      "maxItems": 64,
+      "title": "Authored Scene Dependencies",
+      "type": "array"
+    },
+    "authored_scene_path": {
+      "maxLength": 500,
+      "minLength": 1,
+      "title": "Authored Scene Path",
+      "type": "string"
+    },
+    "authored_scene_size_bytes": {
+      "maximum": 67108864,
+      "minimum": 1,
+      "title": "Authored Scene Size Bytes",
+      "type": "integer"
+    },
+    "calibration": {
+      "$ref": "#/$defs/ArtifactFingerprint"
+    },
+    "cameras": {
+      "items": {
+        "$ref": "#/$defs/SceneCameraRevision"
+      },
+      "maxItems": 16,
+      "minItems": 1,
+      "title": "Cameras",
+      "type": "array"
+    },
+    "cohort_max_delta_us": {
+      "minimum": 0,
+      "title": "Cohort Max Delta Us",
+      "type": "integer"
+    },
+    "config": {
+      "$ref": "#/$defs/ArtifactFingerprint"
+    },
+    "contract": {
+      "const": "noesis.scene.release",
+      "title": "Contract",
+      "type": "string"
+    },
+    "contract_version": {
+      "const": 1,
+      "title": "Contract Version",
+      "type": "integer"
+    },
+    "created_at_us": {
+      "minimum": 1,
+      "title": "Created At Us",
+      "type": "integer"
+    },
+    "created_by": {
+      "maxLength": 160,
+      "minLength": 1,
+      "title": "Created By",
+      "type": "string"
+    },
+    "model": {
+      "$ref": "#/$defs/ArtifactFingerprint"
+    },
+    "release_id": {
+      "maxLength": 200,
+      "minLength": 1,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]{0,199}$",
+      "title": "Release Id",
+      "type": "string"
+    },
+    "release_version": {
+      "const": 1,
+      "title": "Release Version",
+      "type": "integer"
+    },
+    "validation_report_path": {
+      "maxLength": 500,
+      "minLength": 1,
+      "title": "Validation Report Path",
+      "type": "string"
+    },
+    "validation_report_sha256": {
+      "pattern": "^[0-9a-f]{64}$",
+      "title": "Validation Report Sha256",
+      "type": "string"
+    },
+    "validation_report_size_bytes": {
+      "maximum": 5242880,
+      "minimum": 1,
+      "title": "Validation Report Size Bytes",
+      "type": "integer"
+    }
+  },
+  "required": [
+    "contract",
+    "contract_version",
+    "release_id",
+    "release_version",
+    "created_at_us",
+    "created_by",
+    "calibration",
+    "model",
+    "config",
+    "authored_scene",
+    "authored_scene_path",
+    "authored_scene_size_bytes",
+    "authored_scene_dependencies",
+    "cohort_max_delta_us",
+    "cameras",
+    "validation_report_sha256",
+    "validation_report_path",
+    "validation_report_size_bytes"
+  ],
+  "title": "SceneRelease",
+  "type": "object"
+}

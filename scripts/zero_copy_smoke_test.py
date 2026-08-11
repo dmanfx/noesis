@@ -21,6 +21,19 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+from scripts.internal_auth_client import (  # noqa: E402
+    RequiredInternalAuth,
+    add_auth_token_file_argument,
+    build_required_auth_request,
+    configure_required_auth_environment,
+    connect_required_websocket,
+    load_required_internal_auth,
+)
+from scripts.zero_copy_boundary_diagnostics import (  # noqa: E402
+    BoundaryGateTracker,
+    extract_boundary_diagnostics,
+)
+
 
 def _json_print(payload: Dict[str, Any]) -> None:
     print(json.dumps(payload, separators=(",", ":"), sort_keys=False))
@@ -59,7 +72,12 @@ def _reserve_local_port() -> tuple[int, socket.socket]:
     return int(sock.getsockname()[1]), sock
 
 
-def _request_depth_refresh(rest_url: str, seconds: int, timeout_s: float = 2.0) -> Dict[str, Any]:
+def _request_depth_refresh(
+    rest_url: str,
+    seconds: int,
+    auth: RequiredInternalAuth,
+    timeout_s: float = 2.0,
+) -> Dict[str, Any]:
     parsed = urllib.parse.urlparse(rest_url)
     query = dict(urllib.parse.parse_qsl(parsed.query, keep_blank_values=True))
     query["seconds"] = str(max(1, int(seconds)))
@@ -74,7 +92,7 @@ def _request_depth_refresh(rest_url: str, seconds: int, timeout_s: float = 2.0) 
         )
     )
     try:
-        req = urllib.request.Request(final_url, method="GET")
+        req = build_required_auth_request(final_url, auth, method="POST")
         with urllib.request.urlopen(req, timeout=max(0.1, float(timeout_s))) as resp:
             data = resp.read().decode("utf-8", errors="replace")
         payload = json.loads(data)
@@ -90,8 +108,21 @@ def _request_depth_refresh(rest_url: str, seconds: int, timeout_s: float = 2.0) 
         return {"ok": False, "status": f"error:{type(exc).__name__}", "url": final_url}
 
 
+def _rest_refresh_contract_error(
+    *, attempts: int, successes: int, last_status: str
+) -> Optional[str]:
+    if int(attempts) < 1:
+        return "no_rest_refresh_attempts"
+    if int(successes) < 1:
+        return "no_successful_rest_refresh"
+    if str(last_status) != "ok":
+        return "rest_refresh_final_status_not_ok"
+    return None
+
+
 async def _collect_stats_and_drive(
     ws_url: str,
+    auth: RequiredInternalAuth,
     duration_s: float,
     startup_timeout_s: float,
     max_p99_ms: float,
@@ -103,14 +134,12 @@ async def _collect_stats_and_drive(
     allow_network_denied: bool,
     proc: Optional[subprocess.Popen[str]],
 ) -> Dict[str, Any]:
-    import websockets
-
     connect_deadline = time.time() + max(1.0, float(startup_timeout_s))
     ws = None
     last_err: Optional[str] = None
     while time.time() < connect_deadline:
         try:
-            ws = await websockets.connect(ws_url, max_size=None)
+            ws = await connect_required_websocket(ws_url, auth, max_size=None)
             break
         except Exception as exc:
             last_err = str(exc)
@@ -141,7 +170,10 @@ async def _collect_stats_and_drive(
 
     zero_copy_core_enabled_seen = False
     max_seen_violations = 0
-    max_seen_boundary_p99 = None
+    boundary_gate = BoundaryGateTracker()
+    max_seen_ws_p99 = None
+    max_seen_rest_p99 = None
+    boundary_diagnostics: Dict[str, Any] | None = None
     errors_seen: list[str] = []
     camera_hint: Optional[str] = None
     process_exited = False
@@ -163,6 +195,7 @@ async def _collect_stats_and_drive(
                     _request_depth_refresh,
                     rest_url,
                     int(rest_refresh_seconds),
+                    auth,
                     2.0,
                 )
                 rest_refresh_last_status = str(refresh_result.get("status", "unknown"))
@@ -171,7 +204,9 @@ async def _collect_stats_and_drive(
                 next_rest_refresh = now + max(0.5, float(rest_refresh_interval_s))
 
             if now >= next_ws_req:
-                request_camera = str(depth_camera or "").strip() or camera_hint or "camera_0"
+                request_camera = (
+                    str(depth_camera or "").strip() or camera_hint or "camera_0"
+                )
                 request_payload = {
                     "type": "get_ma_depth",
                     "camera": request_camera,
@@ -196,7 +231,9 @@ async def _collect_stats_and_drive(
                     except Exception:
                         pass
                     try:
-                        ws = await websockets.connect(ws_url, max_size=None)
+                        ws = await connect_required_websocket(
+                            ws_url, auth, max_size=None
+                        )
                         continue
                     except Exception as reconnect_exc:
                         return {
@@ -242,19 +279,39 @@ async def _collect_stats_and_drive(
             if bool(pipe.get("zero_copy_core_enabled", False)):
                 zero_copy_core_enabled_seen = True
 
+            boundary_max_changed = boundary_gate.observe(pipe)
+
             try:
-                max_seen_violations = max(max_seen_violations, int(pipe.get("zero_copy_violations", 0) or 0))
+                max_seen_violations = max(
+                    max_seen_violations, int(pipe.get("zero_copy_violations", 0) or 0)
+                )
             except Exception:
                 pass
 
-            try:
-                p99 = pipe.get("boundary_cpu_serialization_p99_ms")
-                if p99 is not None:
-                    p99_val = float(p99)
-                    if max_seen_boundary_p99 is None or p99_val > float(max_seen_boundary_p99):
-                        max_seen_boundary_p99 = p99_val
-            except Exception:
-                pass
+            if boundary_max_changed:
+                boundary_diagnostics = extract_boundary_diagnostics(
+                    pipe,
+                    allowed_p99_ms=float(max_p99_ms),
+                )
+            for channel, field in (
+                ("ws", "boundary_cpu_serialization_ws_p99_ms"),
+                ("rest", "boundary_cpu_serialization_rest_p99_ms"),
+            ):
+                try:
+                    value = pipe.get(field)
+                    if value is None:
+                        continue
+                    numeric = float(value)
+                    if channel == "ws" and (
+                        max_seen_ws_p99 is None or numeric > max_seen_ws_p99
+                    ):
+                        max_seen_ws_p99 = numeric
+                    if channel == "rest" and (
+                        max_seen_rest_p99 is None or numeric > max_seen_rest_p99
+                    ):
+                        max_seen_rest_p99 = numeric
+                except Exception:
+                    pass
 
             for err in list(pipe.get("errors") or []):
                 text = str(err).strip()
@@ -266,6 +323,17 @@ async def _collect_stats_and_drive(
             await ws.close()
         except Exception:
             pass
+
+    boundary_evidence = {
+        **boundary_gate.evidence(),
+        "max_boundary_ws_p99_ms": (
+            float(max_seen_ws_p99) if max_seen_ws_p99 is not None else None
+        ),
+        "max_boundary_rest_p99_ms": (
+            float(max_seen_rest_p99) if max_seen_rest_p99 is not None else None
+        ),
+        "boundary_diagnostics": boundary_diagnostics,
+    }
 
     if process_exited:
         return {
@@ -279,6 +347,7 @@ async def _collect_stats_and_drive(
             "rest_refresh_attempts": rest_refresh_attempts,
             "rest_refresh_success": rest_refresh_success,
             "rest_refresh_last_status": rest_refresh_last_status,
+            **boundary_evidence,
         }
 
     if samples < 1:
@@ -291,6 +360,7 @@ async def _collect_stats_and_drive(
             "rest_refresh_attempts": rest_refresh_attempts,
             "rest_refresh_success": rest_refresh_success,
             "rest_refresh_last_status": rest_refresh_last_status,
+            **boundary_evidence,
         }
 
     if not zero_copy_core_enabled_seen:
@@ -303,6 +373,7 @@ async def _collect_stats_and_drive(
             "rest_refresh_attempts": rest_refresh_attempts,
             "rest_refresh_success": rest_refresh_success,
             "rest_refresh_last_status": rest_refresh_last_status,
+            **boundary_evidence,
         }
 
     if errors_seen:
@@ -316,6 +387,25 @@ async def _collect_stats_and_drive(
             "rest_refresh_attempts": rest_refresh_attempts,
             "rest_refresh_success": rest_refresh_success,
             "rest_refresh_last_status": rest_refresh_last_status,
+            **boundary_evidence,
+        }
+
+    rest_refresh_error = _rest_refresh_contract_error(
+        attempts=rest_refresh_attempts,
+        successes=rest_refresh_success,
+        last_status=rest_refresh_last_status,
+    )
+    if rest_refresh_error is not None:
+        return {
+            "ok": False,
+            "error": rest_refresh_error,
+            "samples": samples,
+            "ws_depth_requests": ws_depth_requests,
+            "ws_depth_responses": ws_depth_responses,
+            "rest_refresh_attempts": rest_refresh_attempts,
+            "rest_refresh_success": rest_refresh_success,
+            "rest_refresh_last_status": rest_refresh_last_status,
+            **boundary_evidence,
         }
 
     if max_seen_violations > int(max_violations):
@@ -330,27 +420,29 @@ async def _collect_stats_and_drive(
             "rest_refresh_attempts": rest_refresh_attempts,
             "rest_refresh_success": rest_refresh_success,
             "rest_refresh_last_status": rest_refresh_last_status,
+            **boundary_evidence,
         }
 
-    if max_seen_boundary_p99 is not None and float(max_seen_boundary_p99) > float(max_p99_ms):
+    boundary_failure = boundary_gate.failure(allowed_p99_ms=float(max_p99_ms))
+    if boundary_failure is not None:
         return {
             "ok": False,
-            "error": "boundary_p99_exceeded",
+            "error": boundary_failure,
             "samples": samples,
-            "max_boundary_p99_ms": float(max_seen_boundary_p99),
             "allowed_boundary_p99_ms": float(max_p99_ms),
             "ws_depth_requests": ws_depth_requests,
             "ws_depth_responses": ws_depth_responses,
             "rest_refresh_attempts": rest_refresh_attempts,
             "rest_refresh_success": rest_refresh_success,
             "rest_refresh_last_status": rest_refresh_last_status,
+            **boundary_evidence,
         }
 
     return {
         "ok": True,
         "samples": samples,
         "max_zero_copy_violations": int(max_seen_violations),
-        "max_boundary_p99_ms": float(max_seen_boundary_p99) if max_seen_boundary_p99 is not None else None,
+        **boundary_evidence,
         "ws_depth_requests": ws_depth_requests,
         "ws_depth_responses": ws_depth_responses,
         "rest_refresh_attempts": rest_refresh_attempts,
@@ -365,6 +457,7 @@ def _spawn_runtime(
     pipeline_config: Path,
     cameras_config: Path,
     *,
+    auth: RequiredInternalAuth,
     stub: bool,
     skip_cuda_preflight: bool,
     log_path: Path,
@@ -385,6 +478,7 @@ def _spawn_runtime(
         "INFO",
     ]
     env = dict(os.environ)
+    configure_required_auth_environment(env, auth)
     if stub:
         env["NOESIS_DS8_STUB_PIPELINE"] = "1"
     if skip_cuda_preflight:
@@ -435,16 +529,24 @@ def _tail(path: Path, lines: int) -> str:
     except Exception:
         return ""
     arr = text.splitlines()
-    return "\n".join(arr[-max(1, int(lines)):])
+    return "\n".join(arr[-max(1, int(lines)) :])
 
 
 def _parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Zero-copy smoke gate (runtime + WS stats + boundary traffic)")
-    parser.add_argument("--pipeline-config", type=Path, default=REPO_ROOT / "config" / "infer.yaml")
-    parser.add_argument("--cameras-config", type=Path, default=REPO_ROOT / "config" / "cameras.yaml")
+    parser = argparse.ArgumentParser(
+        description="Zero-copy smoke gate (runtime + WS stats + boundary traffic)"
+    )
+    parser.add_argument(
+        "--pipeline-config", type=Path, default=REPO_ROOT / "config" / "infer.yaml"
+    )
+    parser.add_argument(
+        "--cameras-config", type=Path, default=REPO_ROOT / "config" / "cameras.yaml"
+    )
     parser.add_argument("--duration-s", type=float, default=90.0)
     parser.add_argument("--stats-ws", default="ws://127.0.0.1:6008")
-    parser.add_argument("--rest-url", default="http://127.0.0.1:8080/api/v1/depth/refresh")
+    parser.add_argument(
+        "--rest-url", default="http://127.0.0.1:8080/api/v1/depth/refresh"
+    )
     parser.add_argument(
         "--depth-camera",
         default="__zero_copy_probe__",
@@ -461,18 +563,26 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--allow-network-denied", action="store_true")
     parser.add_argument("--log-path", type=Path, default=None)
     parser.add_argument("--tail-lines", type=int, default=40)
+    add_auth_token_file_argument(parser)
     return parser.parse_args()
 
 
 def main() -> int:
     args = _parse_args()
+    try:
+        auth = load_required_internal_auth(args.auth_token_file)
+    except Exception as exc:
+        _json_print({"ok": False, "error": f"internal_auth_unavailable:{exc}"})
+        return 1
     ws_url = str(args.stats_ws)
     rest_url = str(args.rest_url)
 
     if args.log_path is not None:
         log_path = Path(args.log_path)
     else:
-        tmp = tempfile.NamedTemporaryFile(prefix="zero_copy_smoke_", suffix=".log", delete=False)
+        tmp = tempfile.NamedTemporaryFile(
+            prefix="zero_copy_smoke_", suffix=".log", delete=False
+        )
         log_path = Path(tmp.name)
         tmp.close()
 
@@ -509,6 +619,7 @@ def main() -> int:
             rest_port=rest_port,
             pipeline_config=Path(args.pipeline_config),
             cameras_config=Path(args.cameras_config),
+            auth=auth,
             stub=bool(args.stub),
             skip_cuda_preflight=bool(args.skip_cuda_preflight),
             log_path=log_path,
@@ -523,6 +634,7 @@ def main() -> int:
         result = asyncio.run(
             _collect_stats_and_drive(
                 ws_url=ws_url,
+                auth=auth,
                 duration_s=float(args.duration_s),
                 startup_timeout_s=float(args.startup_timeout),
                 max_p99_ms=float(args.max_p99_ms),

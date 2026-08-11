@@ -5,6 +5,7 @@ import argparse
 import asyncio
 import json
 import os
+import shutil
 import signal
 import socket
 import subprocess
@@ -23,9 +24,37 @@ for _path in (str(DS9_ROOT), str(REPO_ROOT)):
 sys.path.insert(0, str(REPO_ROOT))
 sys.path.insert(0, str(DS9_ROOT))
 
+from noesis_core.servicemaker_shutdown import (  # noqa: E402
+    synthetic_stub_lifecycle_evidence,
+)
+from scripts.internal_auth_client import (  # noqa: E402
+    RequiredInternalAuth,
+    add_auth_token_file_argument,
+    configure_required_auth_environment,
+    connect_required_websocket,
+    load_required_internal_auth,
+)
+from scripts.zero_copy_boundary_diagnostics import (  # noqa: E402
+    BoundaryGateTracker,
+    extract_boundary_diagnostics,
+)
+
+_SYNTHETIC_BACKEND_LOG_MARKER = (
+    '{"event":"pipeline_backend_selected","backend":"synthetic_stub",'
+    '"native_runtime":false,"promotable":false}'
+)
+_SYNTHETIC_LIFECYCLE_LOG_MARKERS = (
+    _SYNTHETIC_BACKEND_LOG_MARKER,
+    "Orderly pipeline EOS accepted:",
+    "EOS received on pipeline (reason=shutdown_requested)",
+    "pyservicemaker wait() returned (pipeline stopped)",
+    "Shutdown complete",
+)
+
 
 async def _collect_stats(
     ws_url: str,
+    auth: RequiredInternalAuth,
     duration_s: float,
     startup_timeout_s: float,
     max_p99_ms: float,
@@ -33,14 +62,12 @@ async def _collect_stats(
     depth_camera: str,
     proc: Optional[subprocess.Popen[str]],
 ) -> Dict[str, Any]:
-    import websockets
-
     connect_deadline = time.time() + max(1.0, float(startup_timeout_s))
     ws = None
     last_err: Optional[str] = None
     while time.time() < connect_deadline:
         try:
-            ws = await websockets.connect(ws_url, max_size=None)
+            ws = await connect_required_websocket(ws_url, auth, max_size=None)
             break
         except Exception as exc:
             last_err = str(exc)
@@ -51,7 +78,10 @@ async def _collect_stats(
 
     samples = 0
     max_seen_violations = 0
-    max_seen_p99 = None
+    boundary_gate = BoundaryGateTracker()
+    max_seen_ws_p99 = None
+    max_seen_rest_p99 = None
+    boundary_diagnostics: Dict[str, Any] | None = None
     errors_seen: list[str] = []
     depth_req_sent = 0
     depth_resp_seen = 0
@@ -100,7 +130,9 @@ async def _collect_stats(
                     except Exception:
                         pass
                     try:
-                        ws = await websockets.connect(ws_url, max_size=None)
+                        ws = await connect_required_websocket(
+                            ws_url, auth, max_size=None
+                        )
                         continue
                     except Exception as reconnect_exc:
                         return {
@@ -131,18 +163,35 @@ async def _collect_stats(
                 camera_hint = str(next(iter(cameras.keys())))
 
             samples += 1
+            boundary_max_changed = boundary_gate.observe(pipe)
             try:
                 max_seen_violations = max(max_seen_violations, int(pipe.get("zero_copy_violations", 0) or 0))
             except Exception:
                 pass
-            try:
-                p99 = pipe.get("boundary_cpu_serialization_p99_ms")
-                if p99 is not None:
-                    p99_val = float(p99)
-                    if max_seen_p99 is None or p99_val > float(max_seen_p99):
-                        max_seen_p99 = p99_val
-            except Exception:
-                pass
+            if boundary_max_changed:
+                boundary_diagnostics = extract_boundary_diagnostics(
+                    pipe,
+                    allowed_p99_ms=float(max_p99_ms),
+                )
+            for channel, field in (
+                ("ws", "boundary_cpu_serialization_ws_p99_ms"),
+                ("rest", "boundary_cpu_serialization_rest_p99_ms"),
+            ):
+                try:
+                    value = pipe.get(field)
+                    if value is None:
+                        continue
+                    numeric = float(value)
+                    if channel == "ws" and (
+                        max_seen_ws_p99 is None or numeric > max_seen_ws_p99
+                    ):
+                        max_seen_ws_p99 = numeric
+                    if channel == "rest" and (
+                        max_seen_rest_p99 is None or numeric > max_seen_rest_p99
+                    ):
+                        max_seen_rest_p99 = numeric
+                except Exception:
+                    pass
             for err in list(pipe.get("errors") or []):
                 s = str(err).strip()
                 if s:
@@ -154,10 +203,26 @@ async def _collect_stats(
         except Exception:
             pass
 
+    boundary_evidence = {
+        **boundary_gate.evidence(),
+        "max_boundary_ws_p99_ms": (
+            float(max_seen_ws_p99) if max_seen_ws_p99 is not None else None
+        ),
+        "max_boundary_rest_p99_ms": (
+            float(max_seen_rest_p99) if max_seen_rest_p99 is not None else None
+        ),
+        "boundary_diagnostics": boundary_diagnostics,
+    }
     if samples < 1:
         return {"ok": False, "error": "no_stats_samples", "samples": 0}
     if errors_seen:
-        return {"ok": False, "error": "pipeline_errors_present", "samples": samples, "pipeline_errors": errors_seen[:16]}
+        return {
+            "ok": False,
+            "error": "pipeline_errors_present",
+            "samples": samples,
+            "pipeline_errors": errors_seen[:16],
+            **boundary_evidence,
+        }
     if max_seen_violations > int(max_violations):
         return {
             "ok": False,
@@ -165,21 +230,23 @@ async def _collect_stats(
             "samples": samples,
             "max_zero_copy_violations": int(max_seen_violations),
             "allowed_max_violations": int(max_violations),
+            **boundary_evidence,
         }
-    if max_seen_p99 is not None and float(max_seen_p99) > float(max_p99_ms):
+    boundary_failure = boundary_gate.failure(allowed_p99_ms=float(max_p99_ms))
+    if boundary_failure is not None:
         return {
             "ok": False,
-            "error": "boundary_p99_exceeded",
+            "error": boundary_failure,
             "samples": samples,
-            "max_boundary_p99_ms": float(max_seen_p99),
             "allowed_max_p99_ms": float(max_p99_ms),
+            **boundary_evidence,
         }
 
     return {
         "ok": True,
         "samples": samples,
         "max_zero_copy_violations": int(max_seen_violations),
-        "max_boundary_p99_ms": float(max_seen_p99) if max_seen_p99 is not None else None,
+        **boundary_evidence,
         "ws_depth_requests": depth_req_sent,
         "ws_depth_responses": depth_resp_seen,
     }
@@ -191,6 +258,7 @@ def _spawn_runtime(
     cameras_config: Path,
     log_path: Path,
     *,
+    auth: RequiredInternalAuth,
     stub: bool,
     skip_cuda_preflight: bool,
 ) -> subprocess.Popen[str]:
@@ -208,8 +276,14 @@ def _spawn_runtime(
         "INFO",
     ]
     env = dict(os.environ)
+    configure_required_auth_environment(env, auth)
+    synthetic_state_dir: Optional[Path] = None
     if stub:
+        synthetic_state_dir = _configure_synthetic_runtime_environment(env)
         env["NOESIS_DS9_STUB_PIPELINE"] = "1"
+        env["NOESIS_MOSAIC_RTSP_ENABLED"] = "0"
+        env["NOESIS_MOSAIC_WEBRTC_ENABLED"] = "0"
+        cmd.extend(["--storage-base", str(synthetic_state_dir / "depth")])
     if skip_cuda_preflight:
         env["NOESIS_SKIP_CUDA_PREFLIGHT"] = "1"
     env.setdefault("NOESIS_WS_PORT_FALLBACK_TRIES", "32")
@@ -225,7 +299,43 @@ def _spawn_runtime(
         text=True,
         start_new_session=True,
     )
+    if synthetic_state_dir is not None:
+        setattr(proc, "_noesis_synthetic_state_dir", synthetic_state_dir)
     return proc
+
+
+def _configure_synthetic_runtime_environment(env: Dict[str, str]) -> Path:
+    """Isolate every mutable stub-runtime state path from the operator home."""
+
+    original_home = Path(env.get("HOME") or str(Path.home())).expanduser()
+    camera_secrets = Path(
+        env.get("NOESIS_CAMERA_SECRETS_FILE")
+        or original_home / ".local/state/noesis/secrets/camera_sources.json"
+    ).expanduser().resolve(strict=False)
+    mapanything_key = Path(
+        env.get("NOESIS_MAPANYTHING_API_KEY_FILE")
+        or original_home / ".local/state/noesis/secrets/mapanything_rpc.key"
+    ).expanduser().resolve(strict=False)
+    python_user_base = Path(
+        env.get("PYTHONUSERBASE") or original_home / ".local"
+    ).expanduser().resolve(strict=False)
+    state_dir = Path(tempfile.mkdtemp(prefix="noesis-ds9-synthetic-stub-"))
+    state_dir.chmod(0o700)
+    env.update(
+        {
+            "HOME": str(state_dir),
+            "PYTHONUSERBASE": str(python_user_base),
+            "XDG_STATE_HOME": str(state_dir / "xdg-state"),
+            "NOESIS_CAMERA_SECRETS_FILE": str(camera_secrets),
+            "NOESIS_MAPANYTHING_API_KEY_FILE": str(mapanything_key),
+            "NOESIS_ANALYTICS_EXCLUDE_CONFIG": str(state_dir / "analytics-exclude.ini"),
+            "NOESIS_IDENTITY_V2_STORE": str(state_dir / "identity-v2.sqlite3"),
+            "NOESIS_WORLD_JOURNAL_PATH": str(state_dir / "world.jsonl"),
+            "NOESIS_BUILD_DIR": str(state_dir / "build"),
+            "NOESIS_HOUSEHOLD_ARCHIVE_STATE": "0",
+        }
+    )
+    return state_dir
 
 
 def _reserve_local_port() -> tuple[int, socket.socket]:
@@ -236,28 +346,77 @@ def _reserve_local_port() -> tuple[int, socket.socket]:
     return int(sock.getsockname()[1]), sock
 
 
-def _terminate_process(proc: subprocess.Popen[str], timeout_s: float = 8.0) -> None:
+def _terminate_process(
+    proc: subprocess.Popen[str], timeout_s: float = 8.0
+) -> Dict[str, Any]:
     if proc.poll() is not None:
-        return
+        exit_code = proc.poll()
+        return {
+            "signal_requested": False,
+            "forced_kill": False,
+            "exit_code": exit_code,
+            "graceful": exit_code == 0,
+        }
+    signal_requested = False
     try:
         os.killpg(proc.pid, signal.SIGTERM)
+        signal_requested = True
     except Exception:
         try:
             proc.terminate()
+            signal_requested = True
         except Exception:
             pass
     t0 = time.time()
     while (time.time() - t0) < timeout_s:
         if proc.poll() is not None:
-            return
+            exit_code = proc.poll()
+            return {
+                "signal_requested": signal_requested,
+                "forced_kill": False,
+                "exit_code": exit_code,
+                "graceful": exit_code == 0,
+            }
         time.sleep(0.1)
+    forced_kill = False
     try:
         os.killpg(proc.pid, signal.SIGKILL)
+        forced_kill = True
     except Exception:
         try:
             proc.kill()
+            forced_kill = True
         except Exception:
             pass
+    try:
+        proc.wait(timeout=2.0)
+    except Exception:
+        pass
+    return {
+        "signal_requested": signal_requested,
+        "forced_kill": forced_kill,
+        "exit_code": proc.poll(),
+        "graceful": False,
+    }
+
+
+def _synthetic_lifecycle_receipt(
+    log_path: Path,
+    termination: Optional[Dict[str, Any]],
+) -> Dict[str, Any]:
+    try:
+        log_text = log_path.read_text(encoding="utf-8", errors="replace")
+    except Exception:
+        log_text = ""
+    missing_markers = [
+        marker for marker in _SYNTHETIC_LIFECYCLE_LOG_MARKERS if marker not in log_text
+    ]
+    termination_payload = dict(termination or {})
+    return {
+        "ok": bool(termination_payload.get("graceful")) and not missing_markers,
+        "termination": termination_payload,
+        "missing_markers": missing_markers,
+    }
 
 
 def _tail(path: Path, lines: int = 40) -> str:
@@ -287,11 +446,35 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--stub", action="store_true")
     p.add_argument("--skip-cuda-preflight", action="store_true")
     p.add_argument("--log-path", type=Path, default=None)
+    add_auth_token_file_argument(p)
     return p.parse_args()
 
 
 def main() -> int:
     args = _parse_args()
+    try:
+        auth = load_required_internal_auth(args.auth_token_file)
+    except Exception as exc:
+        print(
+            json.dumps(
+                {"ok": False, "error": f"internal_auth_unavailable:{exc}"},
+                separators=(",", ":"),
+            )
+        )
+        return 1
+    if bool(args.stub) and bool(args.no_spawn):
+        print(
+            json.dumps(
+                {
+                    "ok": False,
+                    "error": "synthetic_stub_requires_spawn",
+                    "lifecycle_evidence": synthetic_stub_lifecycle_evidence(),
+                    "test_backend_only": True,
+                },
+                separators=(",", ":"),
+            )
+        )
+        return 1
     ws_url = str(args.stats_ws)
     parsed = urlparse(ws_url)
     ws_port = int(parsed.port or (443 if parsed.scheme == "wss" else 6008))
@@ -330,6 +513,7 @@ def main() -> int:
             pipeline_config=Path(args.pipeline_config),
             cameras_config=Path(args.cameras_config),
             log_path=log_path,
+            auth=auth,
             stub=bool(args.stub),
             skip_cuda_preflight=bool(args.skip_cuda_preflight),
         )
@@ -337,10 +521,12 @@ def main() -> int:
             ws_lock.close()
 
     started = time.monotonic()
+    termination: Optional[Dict[str, Any]] = None
     try:
         result = asyncio.run(
             _collect_stats(
                 ws_url=ws_url,
+                auth=auth,
                 duration_s=float(args.duration_s),
                 startup_timeout_s=float(args.startup_timeout),
                 max_p99_ms=float(args.max_p99_ms),
@@ -351,7 +537,18 @@ def main() -> int:
         )
     finally:
         if proc is not None:
-            _terminate_process(proc)
+            termination = _terminate_process(proc)
+            state_dir = getattr(proc, "_noesis_synthetic_state_dir", None)
+            if state_dir is not None:
+                shutil.rmtree(Path(state_dir), ignore_errors=True)
+
+    synthetic_receipt: Optional[Dict[str, Any]] = None
+    if bool(args.stub):
+        synthetic_receipt = _synthetic_lifecycle_receipt(log_path, termination)
+        if not bool(synthetic_receipt.get("ok")):
+            result = dict(result)
+            result["ok"] = False
+            result.setdefault("error", "synthetic_stub_lifecycle_unproven")
 
     elapsed_s = max(0.0, time.monotonic() - started)
     payload = {
@@ -359,6 +556,15 @@ def main() -> int:
         "duration_s": round(elapsed_s, 3),
         "stats_ws": ws_url,
         "log_path": str(log_path),
+        **(
+            {
+                "lifecycle_evidence": synthetic_stub_lifecycle_evidence(),
+                "synthetic_lifecycle": synthetic_receipt,
+                "test_backend_only": True,
+            }
+            if bool(args.stub)
+            else {}
+        ),
         **result,
     }
     if not bool(result.get("ok", False)):

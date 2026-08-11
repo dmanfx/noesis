@@ -18,6 +18,10 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+from noesis_core.servicemaker_shutdown import (  # noqa: E402
+    synthetic_stub_lifecycle_evidence,
+)
+
 
 async def _collect_stats(ws_url: str, duration_s: float, startup_timeout_s: float) -> Dict[str, Any]:
     import websockets
@@ -118,6 +122,8 @@ def _spawn_runtime(
     env = dict(os.environ)
     if stub:
         env["NOESIS_DS8_STUB_PIPELINE"] = "1"
+        env["NOESIS_MOSAIC_RTSP_ENABLED"] = "0"
+        env["NOESIS_MOSAIC_WEBRTC_ENABLED"] = "0"
     if skip_cuda_preflight:
         env["NOESIS_SKIP_CUDA_PREFLIGHT"] = "1"
     env.setdefault("NOESIS_WS_PORT_FALLBACK_TRIES", "32")
@@ -200,6 +206,17 @@ def _parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = _parse_args()
+    if bool(args.stub):
+        print(
+            json.dumps(
+                {
+                    "event": "synthetic_test_backend",
+                    "lifecycle_evidence": synthetic_stub_lifecycle_evidence(),
+                    "test_backend_only": True,
+                },
+                separators=(",", ":"),
+            )
+        )
     ws_url = str(args.ws)
     parsed = urlparse(ws_url)
     ws_port = int(parsed.port or 6008)

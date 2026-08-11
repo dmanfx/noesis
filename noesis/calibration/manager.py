@@ -10,18 +10,25 @@ See plans/DS8/ds8_calibration_workflow_unification_work_order.md for conventions
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import math
 import os
 import threading
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Mapping, Optional, Tuple
 
 import numpy as np
+import yaml
 
+from noesis_core.private_paths import (
+    atomic_write_private_file,
+    ensure_private_directory,
+    validate_private_file,
+)
 from noesis.metadata.intrinsics import CameraConfigLoader, CameraIntrinsics
 from noesis.calibration.pose_v1 import (
     E_col_major_to_pose_v1,
@@ -29,8 +36,11 @@ from noesis.calibration.pose_v1 import (
     normalize_pose_v1 as _normalize_pose_v1,
     pose_to_E_col_major as _pose_to_E_col_major,
 )
+from noesis.calibration.scene_registration import camera_anchor_state_sha256
 
 _LOGGER = logging.getLogger(__name__)
+_DEFAULT_RAW_AUDIT_DIR = Path("~/.local/state/noesis/calibration/raw")
+_DEFAULT_RAW_AUDIT_MAX_FILES = 64
 
 # ---------------------------------------------------------------------------
 # Exceptions
@@ -189,6 +199,25 @@ def _extract_similarity_scale(matrix_row_major: List[float]) -> float:
     return float(scale)
 
 
+def _world_to_scene_sha256(
+    world_to_scene_col_major: List[float], s_obj_to_m: float
+) -> str:
+    payload = {
+        "world_to_scene_col_major": [
+            float(value) for value in world_to_scene_col_major
+        ],
+        "s_obj_to_m": float(s_obj_to_m),
+    }
+    encoded = json.dumps(
+        payload,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+        allow_nan=False,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
 def _normalize_scene_similarity_payload(payload: Any) -> Dict[str, Any]:
     if not isinstance(payload, dict):
         raise CalibrationValidationError("scene_similarity must be a mapping")
@@ -225,7 +254,16 @@ def _normalize_scene_similarity_payload(payload: Any) -> Dict[str, Any]:
             raise CalibrationValidationError(f"scene_similarity.{key} must be an integer") from exc
         out[key] = parsed
 
-    for key in ("mean_residual", "max_residual", "position_rmse_scene_units", "scene_per_m", "s_obj_to_m"):
+    for key in (
+        "mean_residual",
+        "max_residual",
+        "position_rmse_scene_units",
+        "position_rmse_m",
+        "max_residual_m",
+        "anchor_residual_limit_m",
+        "scene_per_m",
+        "s_obj_to_m",
+    ):
         value = payload.get(key)
         if value is None:
             continue
@@ -237,11 +275,29 @@ def _normalize_scene_similarity_payload(payload: Any) -> Dict[str, Any]:
             raise CalibrationValidationError(f"scene_similarity.{key} must be finite")
         out[key] = parsed
 
+    for key in ("anchor_state_sha256", "camera_calibration_sha256"):
+        value = str(payload.get(key) or "").strip().lower()
+        if value:
+            if len(value) != 64 or any(char not in "0123456789abcdef" for char in value):
+                raise CalibrationValidationError(f"scene_similarity.{key} must be a lowercase SHA-256 digest")
+            out[key] = value
+
     if "scene_per_m" not in out:
         out["scene_per_m"] = _extract_similarity_scale(row_values)
     if "s_obj_to_m" not in out:
         scene_per_m = float(out.get("scene_per_m", 1.0) or 1.0)
         out["s_obj_to_m"] = float(1.0 / scene_per_m) if scene_per_m > 1e-9 else 1.0
+    computed_world_digest = _world_to_scene_sha256(
+        out["world_to_scene_col_major"], out["s_obj_to_m"]
+    )
+    supplied_world_digest = str(
+        payload.get("world_to_scene_sha256") or ""
+    ).strip().lower()
+    if supplied_world_digest and supplied_world_digest != computed_world_digest:
+        raise CalibrationValidationError(
+            "scene_similarity.world_to_scene_sha256 does not match its transform and scale"
+        )
+    out["world_to_scene_sha256"] = computed_world_digest
 
     rotation = payload.get("rotation_row_major")
     if isinstance(rotation, list) and len(rotation) == 9:
@@ -257,6 +313,9 @@ def _normalize_scene_similarity_payload(payload: Any) -> Dict[str, Any]:
             camera_id = item.get("camera_id")
             if isinstance(camera_id, str) and camera_id.strip():
                 corr["camera_id"] = camera_id.strip()
+            anchor_id = item.get("anchor_id")
+            if isinstance(anchor_id, str) and anchor_id.strip():
+                corr["anchor_id"] = anchor_id.strip()
             for coord_key in ("world_position_m", "scene_position"):
                 coord_value = item.get(coord_key)
                 if isinstance(coord_value, list) and len(coord_value) == 3:
@@ -271,6 +330,45 @@ def _normalize_scene_similarity_payload(payload: Any) -> Dict[str, Any]:
                 normalized_corr.append(corr)
         if normalized_corr:
             out["correspondences"] = normalized_corr
+
+    if out.get("source") == "menon_virtual_device_camera_similarity_v1":
+        required = {
+            "anchor_state_sha256",
+            "camera_calibration_sha256",
+            "position_rmse_m",
+            "max_residual_m",
+            "anchor_residual_limit_m",
+            "correspondences",
+        }
+        missing = sorted(required - set(out))
+        if missing:
+            raise CalibrationValidationError(
+                f"scene_similarity anchor fit is missing required fields: {missing}"
+            )
+        correspondences = out["correspondences"]
+        if len(correspondences) < 3 or any(not item.get("anchor_id") for item in correspondences):
+            raise CalibrationValidationError(
+                "scene_similarity anchor fit requires at least three identified camera anchors"
+            )
+        try:
+            actual_anchor_sha256 = camera_anchor_state_sha256(correspondences)
+        except ValueError as exc:
+            raise CalibrationValidationError(
+                f"scene_similarity camera-anchor state is invalid: {exc}"
+            ) from exc
+        if actual_anchor_sha256 != out["anchor_state_sha256"]:
+            raise CalibrationValidationError(
+                "scene_similarity camera-anchor state does not match anchor_state_sha256"
+            )
+        limit_m = float(out["anchor_residual_limit_m"])
+        if limit_m <= 0.0 or limit_m > 0.25:
+            raise CalibrationValidationError(
+                "scene_similarity.anchor_residual_limit_m must be within (0, 0.25]"
+            )
+        if float(out["position_rmse_m"]) > limit_m or float(out["max_residual_m"]) > limit_m:
+            raise CalibrationValidationError(
+                "scene_similarity camera-anchor registration exceeds its residual limit"
+            )
 
     return out
 
@@ -299,11 +397,20 @@ class CalibrationManager:
         camera_calibration_json_path: Path,
         ply_alignment_json_path: Path,
         streammux_size: Tuple[int, int] = (1920, 1080),
+        raw_audit_dir: Path | None = None,
     ) -> None:
         self._cameras_yaml_path = Path(cameras_yaml_path)
         self._camera_calibration_path = Path(camera_calibration_json_path)
         self._ply_alignment_path = Path(ply_alignment_json_path)
         self._streammux_size = streammux_size
+        configured_audit_dir = str(
+            os.environ.get("NOESIS_CALIBRATION_AUDIT_DIR", "") or ""
+        ).strip()
+        self._raw_audit_dir = Path(
+            raw_audit_dir
+            if raw_audit_dir is not None
+            else configured_audit_dir or _DEFAULT_RAW_AUDIT_DIR
+        ).expanduser()
 
         self._lock = threading.RLock()
         self._intrinsics_loader = CameraConfigLoader(self._cameras_yaml_path)
@@ -646,11 +753,15 @@ class CalibrationManager:
         if not camera_id:
             return
         ts = time.strftime("%Y%m%d_%H%M%S", time.localtime())
-        repo_root = self._camera_calibration_path.parent.parent
-        out_dir = repo_root / "logs" / "calibration_raw"
-        out_dir.mkdir(parents=True, exist_ok=True)
-        safe_name = "".join(ch if ch.isalnum() or ch in ("-", "_") else "_" for ch in str(camera_id))
-        out_path = out_dir / f"{ts}_{safe_name}.json"
+        out_dir = ensure_private_directory(
+            self._raw_audit_dir,
+            label="calibration audit",
+        )
+        safe_name = "".join(
+            ch if ch.isalnum() or ch in ("-", "_") else "_"
+            for ch in str(camera_id)
+        )[:64] or "camera"
+        out_path = out_dir / f"calibration_{ts}_{time.time_ns()}_{safe_name}.json"
         payload = {
             "timestamp": ts,
             "camera_id": camera_id,
@@ -662,7 +773,32 @@ class CalibrationManager:
                 "NOESIS_EXTRINSICS_INPUT_UNITS": os.environ.get("NOESIS_EXTRINSICS_INPUT_UNITS"),
             },
         }
-        out_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        atomic_write_private_file(
+            out_path,
+            (json.dumps(payload, indent=2, ensure_ascii=True) + "\n").encode("utf-8"),
+            label="calibration audit record",
+        )
+
+        raw_max_files = str(
+            os.environ.get(
+                "NOESIS_CALIBRATION_AUDIT_MAX_FILES",
+                _DEFAULT_RAW_AUDIT_MAX_FILES,
+            )
+            or _DEFAULT_RAW_AUDIT_MAX_FILES
+        ).strip()
+        try:
+            max_files = int(raw_max_files)
+        except ValueError as exc:
+            raise ValueError("NOESIS_CALIBRATION_AUDIT_MAX_FILES must be an integer") from exc
+        if not 1 <= max_files <= 256:
+            raise ValueError("NOESIS_CALIBRATION_AUDIT_MAX_FILES must be between 1 and 256")
+        records = [
+            validate_private_file(path, label="calibration audit record")
+            for path in out_dir.glob("calibration_*.json")
+        ]
+        records.sort(key=lambda path: path.lstat().st_mtime_ns)
+        for expired in records[: max(0, len(records) - max_files)]:
+            expired.unlink()
 
     def set_extrinsics(
         self,
@@ -715,7 +851,12 @@ class CalibrationManager:
         try:
             self._log_raw_extrinsics_payload(camera_id, raw_kind, raw_payload, E_to_save, units_note)
         except Exception:
-            _LOGGER.debug("Failed to log raw extrinsics payload", exc_info=True)
+            _LOGGER.error(
+                "Calibration audit failed for camera=%s; refusing the mutation",
+                camera_id,
+                exc_info=True,
+            )
+            return {"ok": False, "error": "calibration_audit_failed"}
 
         # Validate before persisting
         try:
@@ -997,3 +1138,131 @@ class CalibrationManager:
         except Exception:
             _LOGGER.exception("Failed to save alignment")
             return False
+
+
+def load_camera_labels(
+    cameras_yaml_path: str | Path,
+    *,
+    strict: bool = True,
+) -> Dict[int, str]:
+    """Load the canonical source-id to camera-id mapping once for all consumers."""
+
+    path = Path(cameras_yaml_path)
+    if not path.is_file():
+        if strict:
+            raise CalibrationValidationError(f"cameras config is missing: {path}")
+        return {}
+    try:
+        payload = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    except Exception as exc:
+        if strict:
+            raise CalibrationValidationError(
+                f"cameras config cannot be decoded: {path}"
+            ) from exc
+        _LOGGER.warning("Unable to read cameras config at %s", path)
+        return {}
+    cameras = payload.get("cameras") if isinstance(payload, Mapping) else None
+    if not isinstance(cameras, Mapping):
+        if strict:
+            raise CalibrationValidationError(
+                f"cameras config must contain a cameras mapping: {path}"
+            )
+        return {}
+
+    labels: Dict[int, str] = {}
+    for raw_source_id, raw_entry in cameras.items():
+        try:
+            source_id = int(raw_source_id)
+        except (TypeError, ValueError) as exc:
+            if strict:
+                raise CalibrationValidationError(
+                    f"camera source id must be an integer: {raw_source_id!r}"
+                ) from exc
+            continue
+        if source_id < 0:
+            if strict:
+                raise CalibrationValidationError(
+                    f"camera source id must be non-negative: {source_id}"
+                )
+            continue
+        name = raw_entry.get("name") if isinstance(raw_entry, Mapping) else None
+        camera_id = str(name or "").strip()
+        if not camera_id:
+            if strict:
+                raise CalibrationValidationError(
+                    f"camera source {source_id} is missing a non-empty name"
+                )
+            camera_id = f"camera_{source_id}"
+        labels[source_id] = camera_id
+
+    if strict and not labels:
+        raise CalibrationValidationError(f"cameras config has no usable cameras: {path}")
+    if strict and len(set(labels.values())) != len(labels):
+        raise CalibrationValidationError("camera names must be unique")
+    return labels
+
+
+def streammux_size_from_pipeline_config(
+    pipeline_config: Mapping[str, Any],
+    *,
+    default: Tuple[int, int] = (1920, 1080),
+) -> Tuple[int, int]:
+    """Resolve the exact image space used by live and offline calibration."""
+
+    raw = pipeline_config.get("streammux")
+    if raw is None:
+        return int(default[0]), int(default[1])
+    if not isinstance(raw, Mapping):
+        raise CalibrationValidationError("pipeline streammux config must be a mapping")
+    try:
+        width = int(raw.get("width", 0) or 0)
+        height = int(raw.get("height", 0) or 0)
+    except (TypeError, ValueError) as exc:
+        raise CalibrationValidationError(
+            "pipeline streammux width and height must be integers"
+        ) from exc
+    if width <= 0 or height <= 0:
+        raise CalibrationValidationError(
+            "pipeline streammux width and height must both be positive"
+        )
+    return width, height
+
+
+def create_calibration_manager(
+    *,
+    cameras_yaml_path: str | Path,
+    pipeline_config: Mapping[str, Any],
+    camera_calibration_json_path: str | Path,
+    ply_alignment_json_path: str | Path,
+    camera_labels: Mapping[int, str] | None = None,
+) -> CalibrationManager:
+    """Construct the one calibration authority used by live and offline paths."""
+
+    cameras_path = Path(cameras_yaml_path)
+    extrinsics_path = Path(camera_calibration_json_path)
+    alignment_path = Path(ply_alignment_json_path)
+    for label, path in (
+        ("cameras config", cameras_path),
+        ("camera calibration", extrinsics_path),
+        ("scene alignment", alignment_path),
+    ):
+        if not path.is_file():
+            raise CalibrationValidationError(f"{label} is missing: {path}")
+    labels = (
+        {int(source_id): str(camera_id).strip() for source_id, camera_id in camera_labels.items()}
+        if camera_labels is not None
+        else load_camera_labels(cameras_path, strict=True)
+    )
+    if not labels or any(not camera_id for camera_id in labels.values()):
+        raise CalibrationValidationError("calibration authority requires named cameras")
+    if len(set(labels.values())) != len(labels):
+        raise CalibrationValidationError("calibration authority camera names must be unique")
+
+    manager = CalibrationManager(
+        cameras_yaml_path=cameras_path,
+        camera_calibration_json_path=extrinsics_path,
+        ply_alignment_json_path=alignment_path,
+        streammux_size=streammux_size_from_pipeline_config(pipeline_config),
+    )
+    manager.set_camera_labels(labels)
+    return manager

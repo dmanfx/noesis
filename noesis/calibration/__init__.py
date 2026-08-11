@@ -4,6 +4,9 @@ from noesis.calibration.manager import (
     CalibrationManager,
     CalibrationSnapshot,
     CalibrationValidationError,
+    create_calibration_manager,
+    load_camera_labels,
+    streammux_size_from_pipeline_config,
 )
 from noesis.calibration.geometry import (
     PixelToWorldResult,
@@ -32,6 +35,7 @@ __all__ = [
     "CalibrationManager",
     "CalibrationSnapshot",
     "CalibrationValidationError",
+    "create_calibration_manager",
     "DepthRegistrationBundle",
     "DepthRegistrationEntry",
     "DepthRegistrationError",
@@ -42,10 +46,12 @@ __all__ = [
     "calibration_fingerprint_from_snapshot",
     "fit_piecewise_registration",
     "load_depth_registration",
+    "load_camera_labels",
     "model_profile_fingerprint",
     "normalize_pose_v1",
     "pixel_to_world",
     "pose_to_E_col_major",
     "profile_fingerprint",
+    "streammux_size_from_pipeline_config",
     "write_depth_registration_bundle",
 ]

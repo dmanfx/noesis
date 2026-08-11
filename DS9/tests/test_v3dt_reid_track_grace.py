@@ -48,6 +48,25 @@ def test_living_room_profile_enables_bounded_v3dt_reid_grace() -> None:
     assert config["v3dt"]["reid_track_grace_s"] == 0.5
 
 
+def test_room_profiles_keep_bounded_grace_and_resolvable_camera_models() -> None:
+    for pipeline_name in (
+        "infer_v3dt_living_family_phone_optimized.yaml",
+        "infer_v3dt_living_kitchen_tracking_candidate.yaml",
+    ):
+        config = yaml.safe_load(
+            (REPO_ROOT / "DS9/config" / pipeline_name).read_text(encoding="utf-8")
+        )
+        tracker_path = REPO_ROOT / config["tracker"]["config-file"]
+        tracker = yaml.safe_load(tracker_path.read_text(encoding="utf-8"))
+
+        assert config["v3dt"]["reid_track_grace_s"] == 0.5
+        assert len(tracker["ObjectModelProjection"]["cameraModelFilepath"]) == 3
+        for relative_path in tracker["ObjectModelProjection"][
+            "cameraModelFilepath"
+        ]:
+            assert (REPO_ROOT / relative_path).is_file()
+
+
 def test_v3dt_grace_retains_a_raw_track_only_for_the_configured_gap() -> None:
     processor, manager = _processor(tracking_mode="v3dt", grace_s=0.5)
 

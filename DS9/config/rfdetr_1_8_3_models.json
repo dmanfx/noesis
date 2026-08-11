@@ -1,0 +1,423 @@
+{
+  "schema": "noesis.ds9.rfdetr-model-matrix.v1",
+  "release": {
+    "package": "rfdetr",
+    "version": "1.8.3",
+    "git_tag": "1.8.3",
+    "git_commit": "3bd6bffbcb13cac3a5b1c37da5a0fd5453b50c86",
+    "source": "https://github.com/roboflow/rf-detr",
+    "onnx_opset": 17,
+    "batch_size": 3,
+    "dynamic_batch": false
+  },
+  "models": [
+    {
+      "id": "detect_nano",
+      "family": "detection",
+      "variant": "nano",
+      "class_name": "RFDETRNano",
+      "package": "rfdetr",
+      "resolution": 384,
+      "checkpoint_filename": "rf-detr-nano.pth",
+      "checkpoint_url": "https://storage.googleapis.com/rfdetr/nano_coco/checkpoint_best_regular.pth",
+      "checkpoint_size_bytes": 366287238,
+      "checkpoint_md5": "fb6504cce7fbdc783f7a46991f07639f",
+      "onnx_filename": "rfdetr-nano_b3.onnx",
+      "runtime": {
+        "input_contract": "rgb01_imagenet",
+        "adapter_revision": "sub_div_float32_v1",
+        "onnx_filename": "rfdetr-nano_b3_rgb01_imagenet_divstd.onnx",
+        "onnx_sha256": "d337c7115c8495a6963b19991c3f225b697873576e798ce1eedaeec899524081",
+        "onnx_receipt_sha256": "9f16e49d63b062b9f776599e650e1e8a3deaa8286e59cb0a61dc314e3eb10aa2",
+        "engine_profile": "fp16_tf32",
+        "engine_filename": "rfdetr-nano_b3_rgb01_imagenet_divstd_fp16_tf32.engine",
+        "engine_sha256": "2d17b85ad8f8500ef1d0d1401c4fdaedee045ea185d6e23d9d24e5b5f7138803",
+        "engine_receipt_sha256": "cbc03bd4389a19d4318620c4b1886adc311882252bf4a7b9bc9a85b5137eb94b"
+      },
+      "engine_filename": "rfdetr-nano_b3_fp16.engine",
+      "outputs": {
+        "dets": [3, 300, 4],
+        "labels": [3, 300, 91]
+      },
+      "license": "Apache-2.0",
+      "enabled": true
+    },
+    {
+      "id": "detect_small",
+      "family": "detection",
+      "variant": "small",
+      "class_name": "RFDETRSmall",
+      "package": "rfdetr",
+      "resolution": 512,
+      "checkpoint_filename": "rf-detr-small.pth",
+      "checkpoint_url": "https://storage.googleapis.com/rfdetr/small_coco/checkpoint_best_regular.pth",
+      "checkpoint_size_bytes": 386045550,
+      "checkpoint_md5": "fb37061c1af7bace359c91b723a8d5c1",
+      "onnx_filename": "rfdetr-small_b3.onnx",
+      "runtime": {
+        "input_contract": "rgb01_imagenet",
+        "adapter_revision": "sub_div_float32_v1",
+        "onnx_filename": "rfdetr-small_b3_rgb01_imagenet_divstd.onnx",
+        "onnx_sha256": "79a636d6e038a16c7e30dc8411e657d06932f0670cfe5c96488398aeaf06dc3c",
+        "onnx_receipt_sha256": "d0aa6e8c3a96b9395da8fbb08943dbf66b6281c156a679049893fd4bc0270969",
+        "engine_profile": "fp16_tf32",
+        "engine_filename": "rfdetr-small_b3_rgb01_imagenet_divstd_fp16_tf32.engine",
+        "engine_sha256": "e3d96a09083ba824db62375ca8a4bc65da3a2173517a8ac9c33035c9d2204bbf",
+        "engine_receipt_sha256": "31ff673eea4e66fbc619cc79b31565411181b03e6495ef3453cd2372c6edd477"
+      },
+      "engine_filename": "rfdetr-small_b3_fp16.engine",
+      "outputs": {
+        "dets": [3, 300, 4],
+        "labels": [3, 300, 91]
+      },
+      "license": "Apache-2.0",
+      "enabled": true
+    },
+    {
+      "id": "detect_medium",
+      "family": "detection",
+      "variant": "medium",
+      "class_name": "RFDETRMedium",
+      "package": "rfdetr",
+      "resolution": 576,
+      "checkpoint_filename": "rf-detr-medium.pth",
+      "checkpoint_url": "https://storage.googleapis.com/rfdetr/medium_coco/checkpoint_best_regular.pth",
+      "checkpoint_size_bytes": 404992918,
+      "checkpoint_md5": "7223f764a87b863f02eb8d52bf0ce2ee",
+      "onnx_filename": "rfdetr-medium_b3.onnx",
+      "runtime": {
+        "input_contract": "rgb01_imagenet",
+        "adapter_revision": "sub_div_float32_v1",
+        "onnx_filename": "rfdetr-medium_b3_rgb01_imagenet_divstd.onnx",
+        "onnx_sha256": "7dba2bd743270ecae8a938cee02949becc5d0df5f216b108f6170aaf6b225d3d",
+        "onnx_receipt_sha256": "170d99092c8fbb5b1f482bb9410984680309aef31422255c9d4e456ce0cf8607",
+        "engine_profile": "fp16_tf32",
+        "engine_filename": "rfdetr-medium_b3_rgb01_imagenet_divstd_fp16_tf32.engine",
+        "engine_sha256": "6cefbe07d98ffa733d8abdd3f937d3433a914217dd0e8afc253460926b0591ab",
+        "engine_receipt_sha256": "f61f0541d335f3d653bd9058f74e7ca2761976a6fc5934ef6c8727efdff43d92"
+      },
+      "engine_filename": "rfdetr-medium_b3_fp16.engine",
+      "outputs": {
+        "dets": [3, 300, 4],
+        "labels": [3, 300, 91]
+      },
+      "license": "Apache-2.0",
+      "enabled": true
+    },
+    {
+      "id": "detect_large",
+      "family": "detection",
+      "variant": "large",
+      "class_name": "RFDETRLarge",
+      "package": "rfdetr",
+      "resolution": 704,
+      "checkpoint_filename": "rf-detr-large-2026.pth",
+      "checkpoint_url": "https://storage.googleapis.com/rfdetr/rf-detr-large-2026.pth",
+      "checkpoint_size_bytes": 135954129,
+      "checkpoint_md5": "5cb72153541cbcb9aa6efa26222acc75",
+      "onnx_filename": "rfdetr-large_b3.onnx",
+      "runtime": {
+        "input_contract": "rgb01_imagenet",
+        "adapter_revision": "sub_div_float32_v1",
+        "onnx_filename": "rfdetr-large_b3_rgb01_imagenet_divstd.onnx",
+        "onnx_sha256": "3dda8e6570b7511fcd6522d76e9b7cef696415d8e24160fdb88a4ffadd107407",
+        "onnx_receipt_sha256": "2d48760dab367b208b0b47bcb750b730b2880d7d3e6d67aa3eb615295cb9df85",
+        "engine_profile": "fp16_tf32",
+        "engine_filename": "rfdetr-large_b3_rgb01_imagenet_divstd_fp16_tf32.engine",
+        "engine_sha256": "7b0a9e1a93dc6719d0466e76197de24f7832bb87567313ab6cbde5b8a2b65c7f",
+        "engine_receipt_sha256": "e990969e7272eeea45529011f043d694cae041dcd56cc487adf7ef8cc33bd59f"
+      },
+      "engine_filename": "rfdetr-large_b3_fp16.engine",
+      "outputs": {
+        "dets": [3, 300, 4],
+        "labels": [3, 300, 91]
+      },
+      "license": "Apache-2.0",
+      "enabled": true
+    },
+    {
+      "id": "detect_xlarge",
+      "family": "detection",
+      "variant": "xlarge",
+      "class_name": "RFDETRXLarge",
+      "package": "rfdetr_plus",
+      "package_version": "1.0.2",
+      "package_git_tag": "1.0.2",
+      "package_git_commit": "5ac42d618b8f1d10aada9adf1a0a73c83cf5acf9",
+      "package_source": "https://github.com/roboflow/rf-detr_plus",
+      "resolution": 700,
+      "checkpoint_filename": "rf-detr-xlarge.pth",
+      "checkpoint_url": "https://storage.googleapis.com/rfdetr/platform-licensed/rf-detr-xlarge.pth",
+      "checkpoint_size_bytes": 505646472,
+      "checkpoint_md5": "6ddf834f2bc5bed3214a82f9b0aaeed7",
+      "onnx_filename": "rfdetr-xlarge_b3.onnx",
+      "runtime": {
+        "input_contract": "rgb01_imagenet",
+        "adapter_revision": "sub_div_float32_v1",
+        "onnx_filename": "rfdetr-xlarge_b3_rgb01_imagenet_divstd.onnx"
+      },
+      "engine_filename": "rfdetr-xlarge_b3_fp16.engine",
+      "outputs": {
+        "dets": [3, 300, 4],
+        "labels": [3, 300, 366]
+      },
+      "license": "PML-1.0",
+      "enabled": false,
+      "blocked_reason": "Requires explicit Platform Model License acceptance and Roboflow account access."
+    },
+    {
+      "id": "detect_2xlarge",
+      "family": "detection",
+      "variant": "2xlarge",
+      "class_name": "RFDETR2XLarge",
+      "package": "rfdetr_plus",
+      "package_version": "1.0.2",
+      "package_git_tag": "1.0.2",
+      "package_git_commit": "5ac42d618b8f1d10aada9adf1a0a73c83cf5acf9",
+      "package_source": "https://github.com/roboflow/rf-detr_plus",
+      "resolution": 880,
+      "checkpoint_filename": "rf-detr-xxlarge.pth",
+      "checkpoint_url": "https://storage.googleapis.com/rfdetr/platform-licensed/rf-detr-xxlarge.pth",
+      "checkpoint_size_bytes": 507831201,
+      "checkpoint_md5": "e3204689c1f0280427e4c33e6a2ac6cd",
+      "onnx_filename": "rfdetr-2xlarge_b3.onnx",
+      "runtime": {
+        "input_contract": "rgb01_imagenet",
+        "adapter_revision": "sub_div_float32_v1",
+        "onnx_filename": "rfdetr-2xlarge_b3_rgb01_imagenet_divstd.onnx"
+      },
+      "engine_filename": "rfdetr-2xlarge_b3_fp16.engine",
+      "outputs": {
+        "dets": [3, 300, 4],
+        "labels": [3, 300, 366]
+      },
+      "license": "PML-1.0",
+      "enabled": false,
+      "blocked_reason": "Requires explicit Platform Model License acceptance and Roboflow account access."
+    },
+    {
+      "id": "seg_nano",
+      "family": "segmentation",
+      "variant": "nano",
+      "class_name": "RFDETRSegNano",
+      "package": "rfdetr",
+      "resolution": 312,
+      "checkpoint_filename": "rf-detr-seg-nano.pt",
+      "checkpoint_url": "https://storage.googleapis.com/rfdetr/rf-detr-seg-n-ft.pth",
+      "checkpoint_size_bytes": 134545398,
+      "checkpoint_md5": "9995497791d0ff1664a1d9ddee9cfd20",
+      "onnx_filename": "rfdetr-seg-nano_b3.onnx",
+      "runtime": {
+        "input_contract": "rgb01_imagenet",
+        "adapter_revision": "sub_div_float32_v1",
+        "onnx_filename": "rfdetr-seg-nano_b3_rgb01_imagenet_divstd.onnx",
+        "onnx_sha256": "0eb400f10cbd8a8d81091cb0090b51716eb8344db4e3138a5a11245ba7564315",
+        "onnx_receipt_sha256": "84323a49e80bd1fcc65b60c64ea8398b05091c8c5664e001a07f0f8bee07e721",
+        "engine_profile": "fp16_tf32",
+        "engine_filename": "rfdetr-seg-nano_b3_rgb01_imagenet_divstd_fp16_tf32.engine",
+        "engine_sha256": "4b2061cf7c7ff09fd1eca2a79b17bbb28f289448e9fc889f3b292d33e00ca657",
+        "engine_receipt_sha256": "cd05e2d72fff6ea70a84bdfe71c2fb326996bec871168622a3b0a2de0bc8acd5"
+      },
+      "engine_filename": "rfdetr-seg-nano_b3_fp16.engine",
+      "outputs": {
+        "dets": [3, 100, 4],
+        "labels": [3, 100, 91],
+        "masks": [3, 100, 78, 78]
+      },
+      "license": "Apache-2.0",
+      "enabled": true
+    },
+    {
+      "id": "seg_small",
+      "family": "segmentation",
+      "variant": "small",
+      "class_name": "RFDETRSegSmall",
+      "package": "rfdetr",
+      "resolution": 384,
+      "checkpoint_filename": "rf-detr-seg-small.pt",
+      "checkpoint_url": "https://storage.googleapis.com/rfdetr/rf-detr-seg-s-ft.pth",
+      "checkpoint_size_bytes": 135042342,
+      "checkpoint_md5": "0a2a3006381d0c42853907e700eadd08",
+      "onnx_filename": "rfdetr-seg-small_b3.onnx",
+      "runtime": {
+        "input_contract": "rgb01_imagenet",
+        "adapter_revision": "sub_div_float32_v1",
+        "onnx_filename": "rfdetr-seg-small_b3_rgb01_imagenet_divstd.onnx",
+        "onnx_sha256": "13a0bf3a32dc545505cbf862a15ee5223ffda40d357e0c27d4cfadf73993e810",
+        "onnx_receipt_sha256": "4870af05620269aa0938cbc041dcaed5ad40bd4c16a94c22152dc6db3e67adfa",
+        "engine_profile": "fp16_tf32",
+        "engine_filename": "rfdetr-seg-small_b3_rgb01_imagenet_divstd_fp16_tf32.engine",
+        "engine_sha256": "0025d62be68614a18fb9c6feec1f6cc6f183dd68d016534f0c3a0c9e15b66a99",
+        "engine_receipt_sha256": "9e367e3b2d274ee13f7bfa3480c7423e5b65c7cbdac8929edc0e7ba77d07c886"
+      },
+      "engine_filename": "rfdetr-seg-small_b3_fp16.engine",
+      "outputs": {
+        "dets": [3, 100, 4],
+        "labels": [3, 100, 91],
+        "masks": [3, 100, 96, 96]
+      },
+      "license": "Apache-2.0",
+      "enabled": true
+    },
+    {
+      "id": "seg_medium",
+      "family": "segmentation",
+      "variant": "medium",
+      "class_name": "RFDETRSegMedium",
+      "package": "rfdetr",
+      "resolution": 432,
+      "checkpoint_filename": "rf-detr-seg-medium.pt",
+      "checkpoint_url": "https://storage.googleapis.com/rfdetr/rf-detr-seg-m-ft.pth",
+      "checkpoint_size_bytes": 143024058,
+      "checkpoint_md5": "a49af1562c3719227ad43d0ca53b4c7a",
+      "onnx_filename": "rfdetr-seg-medium_b3.onnx",
+      "runtime": {
+        "input_contract": "rgb01_imagenet",
+        "adapter_revision": "sub_div_float32_v1",
+        "onnx_filename": "rfdetr-seg-medium_b3_rgb01_imagenet_divstd.onnx",
+        "onnx_sha256": "ad8e175baa96d0dbc44d4cab52e2643a50a4fe0d5f606b6bb92d3cd532f5ab65",
+        "onnx_receipt_sha256": "b23880c6445d5920b49948098a74072cc8eeaa2ffa3b1b48f64f204680eea819",
+        "engine_profile": "fp16_tf32",
+        "engine_filename": "rfdetr-seg-medium_b3_rgb01_imagenet_divstd_fp16_tf32.engine",
+        "engine_sha256": "3b3c332ac1e18bd08f651e25d8dde99c403275cefe9382e5f6825a6383d05aa8",
+        "engine_receipt_sha256": "467ab6c6144d210813c0b47b45440ac685d939ac9249355108d2f8f5b6cfde48"
+      },
+      "engine_filename": "rfdetr-seg-medium_b3_fp16.engine",
+      "outputs": {
+        "dets": [3, 200, 4],
+        "labels": [3, 200, 91],
+        "masks": [3, 200, 108, 108]
+      },
+      "license": "Apache-2.0",
+      "enabled": true
+    },
+    {
+      "id": "seg_large",
+      "family": "segmentation",
+      "variant": "large",
+      "class_name": "RFDETRSegLarge",
+      "package": "rfdetr",
+      "resolution": 504,
+      "checkpoint_filename": "rf-detr-seg-large.pt",
+      "checkpoint_url": "https://storage.googleapis.com/rfdetr/rf-detr-seg-l-ft.pth",
+      "checkpoint_size_bytes": 145055866,
+      "checkpoint_md5": "275f7b094909544ed2841c94a677d07e",
+      "onnx_filename": "rfdetr-seg-large_b3.onnx",
+      "runtime": {
+        "input_contract": "rgb01_imagenet",
+        "adapter_revision": "sub_div_float32_v1",
+        "onnx_filename": "rfdetr-seg-large_b3_rgb01_imagenet_divstd.onnx",
+        "onnx_sha256": "3681c271b20cee496939e7a087d14149d7c4bb9d543260ad5f482150555413e5",
+        "onnx_receipt_sha256": "8a198bea714bdb62dee8627c51c1ea817e150a6fbc585b4f76604c57c70564e5",
+        "engine_profile": "fp16_tf32",
+        "engine_filename": "rfdetr-seg-large_b3_rgb01_imagenet_divstd_fp16_tf32.engine",
+        "engine_sha256": "bdd7e71e19309edef2b763627024938e6c11d074a4989cdb13f6134fb282345f",
+        "engine_receipt_sha256": "519030669b30bfd161afde84aa735841576190d1ecd1907c34c4961fb6071683"
+      },
+      "engine_filename": "rfdetr-seg-large_b3_fp16.engine",
+      "outputs": {
+        "dets": [3, 200, 4],
+        "labels": [3, 200, 91],
+        "masks": [3, 200, 126, 126]
+      },
+      "license": "Apache-2.0",
+      "enabled": true
+    },
+    {
+      "id": "seg_xlarge",
+      "family": "segmentation",
+      "variant": "xlarge",
+      "class_name": "RFDETRSegXLarge",
+      "package": "rfdetr",
+      "resolution": 624,
+      "checkpoint_filename": "rf-detr-seg-xlarge.pt",
+      "checkpoint_url": "https://storage.googleapis.com/rfdetr/rf-detr-seg-xl-ft.pth",
+      "checkpoint_size_bytes": 152713150,
+      "checkpoint_md5": "3693b35d0eea86ebb3e0444f4a611fba",
+      "onnx_filename": "rfdetr-seg-xlarge_b3.onnx",
+      "runtime": {
+        "input_contract": "rgb01_imagenet",
+        "adapter_revision": "sub_div_float32_v1",
+        "onnx_filename": "rfdetr-seg-xlarge_b3_rgb01_imagenet_divstd.onnx",
+        "onnx_sha256": "cdee013e569715727c02d608bd6e47a7453207d314fe86480873cc6ec0ee1714",
+        "onnx_receipt_sha256": "f655dfd66e5793c1ae39ee4a282a5d55fb17e2a69606c1fa632da19a1c212ded",
+        "engine_profile": "fp16_tf32",
+        "engine_filename": "rfdetr-seg-xlarge_b3_rgb01_imagenet_divstd_fp16_tf32.engine",
+        "engine_sha256": "e1a208ddc0689ba93da1f3154ec8bbabd7667d4bebceb29c50e6fc6a00a1b824",
+        "engine_receipt_sha256": "e8199e7ca34af66fda77b6bdaae5ae4d096e2349cbcca941f02140464ee79af2"
+      },
+      "engine_filename": "rfdetr-seg-xlarge_b3_fp16.engine",
+      "outputs": {
+        "dets": [3, 300, 4],
+        "labels": [3, 300, 91],
+        "masks": [3, 300, 156, 156]
+      },
+      "license": "Apache-2.0",
+      "enabled": true
+    },
+    {
+      "id": "seg_2xlarge",
+      "family": "segmentation",
+      "variant": "2xlarge",
+      "class_name": "RFDETRSeg2XLarge",
+      "package": "rfdetr",
+      "resolution": 768,
+      "checkpoint_filename": "rf-detr-seg-xxlarge.pt",
+      "checkpoint_url": "https://storage.googleapis.com/rfdetr/rf-detr-seg-2xl-ft.pth",
+      "checkpoint_size_bytes": 154851262,
+      "checkpoint_md5": "040bc3412af840fa8a47e0ff69b552ba",
+      "onnx_filename": "rfdetr-seg-2xlarge_b3.onnx",
+      "runtime": {
+        "input_contract": "rgb01_imagenet",
+        "adapter_revision": "sub_div_float32_v1",
+        "onnx_filename": "rfdetr-seg-2xlarge_b3_rgb01_imagenet_divstd.onnx",
+        "onnx_sha256": "355cce87037917a1e6161eacf10606b5237d0454c3c2c97126c4ee1711acd5cf",
+        "onnx_receipt_sha256": "aeba634a1498501b7b96344959cd576f90c22f60683ca71f48eeda3a78f358ee",
+        "engine_profile": "fp16_tf32",
+        "engine_filename": "rfdetr-seg-2xlarge_b3_rgb01_imagenet_divstd_fp16_tf32.engine",
+        "engine_sha256": "a5ca40f7fe9807b1c7eebea0e276ded2158cd3bd4fce87c552f2ebfd19968efe",
+        "engine_receipt_sha256": "ce65227f90bb9d5b07ef635741ffdf9abc7187804f4f994dafca9a655008478c"
+      },
+      "engine_filename": "rfdetr-seg-2xlarge_b3_fp16.engine",
+      "outputs": {
+        "dets": [3, 300, 4],
+        "labels": [3, 300, 91],
+        "masks": [3, 300, 192, 192]
+      },
+      "license": "Apache-2.0",
+      "enabled": true
+    },
+    {
+      "id": "keypoint_preview",
+      "family": "keypoint",
+      "variant": "preview",
+      "class_name": "RFDETRKeypointPreview",
+      "package": "rfdetr",
+      "resolution": 576,
+      "checkpoint_filename": "rf-detr-keypoint-preview-xlarge.pth",
+      "checkpoint_url": "https://storage.googleapis.com/rfdetr/rf-detr-keypoint-preview-xlarge.pth",
+      "checkpoint_size_bytes": 163696618,
+      "checkpoint_md5": "6de511943ee85a547d4c5cb527daf0eb",
+      "onnx_filename": "rfdetr-keypoint-preview_b3.onnx",
+      "runtime": {
+        "input_contract": "rgb01_imagenet",
+        "adapter_revision": "sub_div_float32_v1",
+        "onnx_filename": "rfdetr-keypoint-preview_b3_rgb01_imagenet_divstd.onnx",
+        "onnx_sha256": "f9ee89ca845cf779264a4af53b07e42ba8b64a93550fb09632bad89093d22450",
+        "onnx_receipt_sha256": "0d99ac1c13c0889e41c12f3d23e4f6e280c4aeea287ff7f05830d507f88b99e8",
+        "engine_profile": "fp16_tf32",
+        "engine_filename": "rfdetr-keypoint-preview_b3_rgb01_imagenet_divstd_fp16_tf32.engine",
+        "engine_sha256": "d38660301d4d5e45c2b56a0eea1c2f99a65c5a30473fc203ec65087e6c9f4d2c",
+        "engine_receipt_sha256": "07b0dd920835682e969757b9445c3796e8fa417946cf5886483fc3d089418d30"
+      },
+      "engine_filename": "rfdetr-keypoint-preview_b3_fp16.engine",
+      "outputs": {
+        "dets": [3, 100, 4],
+        "labels": [3, 100, 2],
+        "keypoints": [3, 100, 34, 8]
+      },
+      "license": "Apache-2.0",
+      "enabled": true
+    }
+  ]
+}

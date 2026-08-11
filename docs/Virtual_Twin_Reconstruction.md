@@ -15,7 +15,7 @@ The living-room builder combines four evidence sources:
 - ZeroPlane plane masks/normals/depth estimates for the same keyframes.
 - Menon structural surfaces parsed from the SweetHome3D OBJ.
 
-The builder triggers `GET /api/v1/depth/refresh?seconds=N` on the DS8 runtime
+The builder triggers `POST /api/v1/depth/refresh?seconds=N` on the DS8 runtime
 REST API before each keyframe unless `--no-mapanything-refresh` is explicitly
 passed. In the split dev setup, the standalone virtual-twin artifact API uses
 port `8080` and the DS8 runtime depth API uses port `8082`; override the
@@ -117,6 +117,31 @@ python3 scripts/build_virtual_twin_reconstruction.py \
   --min-texture-coverage 0.02
 ```
 
-The Noesis REST API serves the latest bundle through
-`/api/v1/virtual-twin/latest`, and Menon reads the selected revision from those
-artifact URLs when `Virtual Twin Surface` is enabled.
+The revision catalog remains available through
+`/api/v1/virtual-twin/latest` for operator diagnostics. Production rendering is
+owned by one promoted `noesis.scene.release` from
+`/api/v1/scenes/current/payload`; it never assembles a home from independently
+newest camera revisions. Each promoted release closes over the exact manifest,
+all declared camera artifacts, the authored OBJ, all referenced MTL and texture
+dependencies, and its validation report by release-owned path, byte length, and
+SHA-256. `current/payload` exposes role-addressed same-origin URLs for that
+complete set. Current-release reads revalidate every byte and fail with conflict
+status if an on-disk artifact has changed. Promotion, current metadata, and the
+current payload validate the complete cohort. A role-addressed binary request
+then verifies only its selected file and serves the verified in-memory snapshot,
+so a path replacement cannot change bytes after validation and a 34-request
+consumer does not rehash the full scene 34 times.
+
+The release boundary rejects symlinked, hardlinked, non-regular, oversized,
+zero-byte, or replaced-during-read inputs. OBJ/MTL parsing is UTF-8 strict and
+bounded by file, line, and dependency counts; unknown MTL map options fail
+instead of being guessed. A new release-owned directory is assembled off-path
+and published with an atomic no-replace rename. Existing directories must match
+the exact declared tree and are never overwritten or permission-repaired.
+
+The current unpromoted migration candidate
+`home_rgbmesh_20260623T2158_v1` selects the family-room, kitchen, and
+living-room revisions captured on 2026-06-23. Its validation report proves 27
+camera artifacts plus the authored OBJ, one MTL, and four JPEG textures. It is
+intentionally a candidate until the Menon atomic-load consumer and browser
+readback gates pass; building a candidate never implies promotion.

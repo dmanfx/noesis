@@ -42,7 +42,7 @@ preprocess:
 models:
   pgie:
     config-file-path: pipelines/config_infer_primary_yolo11_seg_smoke.ini
-    engine: /home/mayor/Noesis_Devel/models/engines/yolo11s-seg_cust_fused.engine
+    engine: models/engines/yolo11s-seg_cust_fused.engine
     batch_size: 3
     gie_id: 1
     network_mode: fp16
@@ -55,6 +55,7 @@ models:
     batch_size: 16
     gie_id: 3
     layer: fc_pred
+    embedding_dim: 256
     attach_tensor_meta: true
   mapanything:
     enable: false
@@ -80,8 +81,13 @@ mosaic_output:
   rtsp_port: 8554
   rtsp_path: "mosaic"
   mosaic_webrtc_enabled: false
-  video_bitrate_kbps: 4000
-  encoder: "nvh264enc"
+  mosaic_h264_shm_socket: "/tmp/noesis-mosaic-h264"
+  video_bitrate_kbps: 12000
+  encoder: "nvv4l2h264enc"
+  h264_iframeinterval: 10
+  h264_idrinterval: 10
+  h264_profile: 0
+  h264_preset_id: 4
 
 visualization:
   trails:

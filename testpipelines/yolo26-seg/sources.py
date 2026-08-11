@@ -7,7 +7,10 @@ from typing import Dict, List, Optional
 
 import yaml
 
+from noesis_core.runtime_secrets import materialize_pipeline_config
+
 DEFAULT_SOURCES_PATH = Path(__file__).resolve().parent / "sources.yaml"
+_CAMERA_SECRET_PREFIX = "camera-secret:"
 
 
 def _normalize_name(name: str) -> str:
@@ -21,13 +24,25 @@ def load_sources_yaml(path: Path = DEFAULT_SOURCES_PATH) -> Dict[str, object]:
     return payload
 
 
+def _resolve_uris(uris: List[str]) -> List[str]:
+    sources = []
+    for value in uris:
+        uri = str(value or "").strip()
+        if uri.startswith(_CAMERA_SECRET_PREFIX):
+            sources.append({"uri_secret": uri.removeprefix(_CAMERA_SECRET_PREFIX)})
+        else:
+            sources.append({"uri": uri})
+    materialized = materialize_pipeline_config({"sources": sources})
+    return [str(source["uri"]) for source in materialized["sources"]]
+
+
 def select_sources(
     payload: Dict[str, object],
     *,
     camera: Optional[str] = None,
     required_count: int = 3,
 ) -> Dict[str, object]:
-    uris: List[str] = list(payload.get("uris", []) or [])
+    uris = _resolve_uris([str(value) for value in (payload.get("uris", []) or [])])
     sensor_ids: List[str] = [str(x) for x in (payload.get("sensor_ids", []) or [])]
     sensor_names: List[str] = [str(x) for x in (payload.get("sensor_names", []) or [])]
     if not uris:

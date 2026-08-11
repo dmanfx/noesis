@@ -3,8 +3,13 @@
 from __future__ import annotations
 
 import argparse
+import sys
 import threading
 from pathlib import Path
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 
 import pipeline
 import parser_setup
@@ -55,7 +60,7 @@ def _parse_args() -> argparse.Namespace:
 
 
 def _repo_root() -> Path:
-    return Path(__file__).resolve().parents[2]
+    return REPO_ROOT
 
 
 def _build_nvinfer_config(msize: str, parser_lib: Path) -> Path:

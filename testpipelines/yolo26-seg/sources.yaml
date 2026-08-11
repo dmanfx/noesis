@@ -1,7 +1,7 @@
 uris:
-  - rtsp://192.168.3.214:7447/jdr9oLlBkjyl3gDm?
-  - rtsp://192.168.3.214:7447/qt3VqVdZpgG1B4Vk?
-  - rtsp://192.168.3.214:7447/4qWTBhW6b4nLeUFE?
+  - camera-secret:living-room
+  - camera-secret:kitchen
+  - camera-secret:family-room
 sensor_ids:
   - "0"
   - "1"

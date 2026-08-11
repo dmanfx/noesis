@@ -24,8 +24,12 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from mapanything_config import load_service_config
+from noesis.calibration.manager import (
+    CalibrationManager,
+    create_calibration_manager,
+    load_camera_labels,
+)
 from noesis.calibration.scene_registration import solve_scene_similarity
-from noesis.ds8_runtime import _CalibrationProvider, _load_camera_labels
 from noesis.virtual_twin.builder import (
     VirtualTwinBuildError,
     VirtualTwinFrameInput,
@@ -39,6 +43,7 @@ from noesis.virtual_twin.zeroplane_adapter import (
     ZeroPlaneAdapterError,
     ZeroPlaneCommandAdapter,
 )
+from noesis_core.runtime_secrets import load_pipeline_config
 
 
 LOGGER = logging.getLogger("virtual_twin_builder")
@@ -90,7 +95,7 @@ def _video_capture_from_uri(uri: str) -> cv2.VideoCapture:
 def _iter_source_frames(*, uri: str, frame_stride: int, max_frames_read: int) -> Iterable[tuple[int, np.ndarray]]:
     cap = _video_capture_from_uri(uri)
     if not cap.isOpened():
-        raise VirtualTwinBuildError(f"unable to open camera source URI for virtual-twin keyframes: {uri}")
+        raise VirtualTwinBuildError("unable to open configured camera source for virtual-twin keyframes")
     try:
         idx = 0
         yielded = 0
@@ -526,7 +531,7 @@ def _load_menon_device_camera_positions(path: Path, camera_ids: Iterable[str]) -
 
 def _scene_prior_from_menon_devices(
     *,
-    calibration_provider: _CalibrationProvider,
+    calibration_provider: CalibrationManager,
     camera_labels: dict[int, str],
     devices_config: Path,
 ) -> dict[str, Any]:
@@ -565,8 +570,8 @@ def _scene_prior_from_menon_devices(
 def build(args: argparse.Namespace) -> dict[str, Any]:
     pipeline_path = Path(args.pipeline_config)
     cameras_path = Path(args.cameras_config)
-    pipeline_cfg = _load_yaml(pipeline_path)
-    camera_labels = _load_camera_labels(cameras_path)
+    pipeline_cfg = load_pipeline_config(pipeline_path, materialize_secrets=True)
+    camera_labels = load_camera_labels(cameras_path)
     source_id, uri, source_cfg = _camera_source(pipeline_cfg, camera_labels, args.camera)
     dewarper_transform = _dewarper_transform_for_source(source_cfg)
     model_obj_raw = str(args.model_obj or os.environ.get("NOESIS_MENON_STRUCTURAL_OBJ", "")).strip()
@@ -583,8 +588,13 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
     frames_dir = staging_dir / "frames"
     frames_dir.mkdir(parents=True, exist_ok=True)
 
-    calibration_provider = _CalibrationProvider(cameras_path, pipeline_cfg)
-    calibration_provider.set_camera_labels(camera_labels)
+    calibration_provider = create_calibration_manager(
+        cameras_yaml_path=cameras_path,
+        pipeline_config=pipeline_cfg,
+        camera_calibration_json_path=REPO_ROOT / "config" / "camera_calibration.json",
+        ply_alignment_json_path=Path(args.alignment_config),
+        camera_labels=camera_labels,
+    )
     snapshot = calibration_provider.snapshot(source_id, args.camera)
     if snapshot is None:
         raise VirtualTwinBuildError(f"calibration snapshot unavailable for {args.camera}")

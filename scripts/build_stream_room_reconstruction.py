@@ -21,7 +21,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from mapanything_config import load_service_config
-from noesis.ds8_runtime import _CalibrationProvider, _load_camera_labels
+from noesis.calibration.manager import create_calibration_manager, load_camera_labels
 from noesis.virtual_twin.artifacts import write_json, write_points_glb, write_points_npz, write_textured_mesh_glb
 from noesis.virtual_twin.builder import calibration_fingerprint, revision_id_from_clock
 from noesis.virtual_twin.geometry import (
@@ -29,6 +29,7 @@ from noesis.virtual_twin.geometry import (
     transform_points,
 )
 from noesis.virtual_twin.store import VirtualTwinStore
+from noesis_core.runtime_secrets import load_pipeline_config, source_provenance_ref
 
 
 DEFAULT_CAMERAS = ("living-room", "kitchen", "family-room")
@@ -136,11 +137,7 @@ def _homogeneous_rotation(rotation: np.ndarray) -> np.ndarray:
 
 
 def _read_yaml(path: Path) -> dict[str, Any]:
-    with Path(path).open("r", encoding="utf-8") as handle:
-        payload = yaml.safe_load(handle) or {}
-    if not isinstance(payload, dict):
-        raise RuntimeError(f"expected mapping at {path}")
-    return payload
+    return load_pipeline_config(path, materialize_secrets=True)
 
 
 def _resolve_repo_path(path: Path | str | None, fallback: Path | str) -> Path:
@@ -271,11 +268,12 @@ def _capture_rgb_frames(
     frame_stride: int,
     max_frames_read: int,
 ) -> list[RgbFrame]:
-    _source_id, uri, source_cfg = _camera_source(pipeline_cfg, camera_labels, camera_id)
+    source_id, uri, source_cfg = _camera_source(pipeline_cfg, camera_labels, camera_id)
+    source_ref = source_provenance_ref(source_cfg, source_id=source_id)
     transform = _dewarper_transform_for_source(source_cfg)
     cap = cv2.VideoCapture(uri[7:] if uri.startswith("file://") else uri)
     if not cap.isOpened():
-        raise RuntimeError(f"unable to open camera source URI for RGB depth cloud: {uri}")
+        raise RuntimeError(f"unable to open configured camera source for {camera_id}")
     frames: list[RgbFrame] = []
     try:
         idx = 0
@@ -289,7 +287,7 @@ def _capture_rgb_frames(
                     RgbFrame(
                         source_index=int(idx),
                         image_bgr=np.asarray(image, dtype=np.uint8),
-                        source_uri=uri,
+                        source_uri=source_ref,
                         dewarper_config=str(transform.config_path) if transform is not None else None,
                         transformed=transform is not None,
                     )
@@ -298,7 +296,9 @@ def _capture_rgb_frames(
     finally:
         cap.release()
     if len(frames) < int(count):
-        raise RuntimeError(f"captured {len(frames)} RGB frames for {camera_id}, expected {count} from {uri}")
+        raise RuntimeError(
+            f"captured {len(frames)} RGB frames for {camera_id}, expected {count}"
+        )
     return frames
 
 
@@ -707,11 +707,20 @@ def _latest_capture_snapshots(
     return capture_events[-int(count):]
 
 
-def _camera_calibrations(pipeline_config: Path, cameras_config: Path) -> dict[str, CameraCalibration]:
+def _camera_calibrations(
+    pipeline_config: Path,
+    cameras_config: Path,
+    alignment_config: Path,
+) -> dict[str, CameraCalibration]:
     pipeline = _read_yaml(pipeline_config)
-    labels = _load_camera_labels(cameras_config)
-    provider = _CalibrationProvider(cameras_config, pipeline)
-    provider.set_camera_labels(labels)
+    labels = load_camera_labels(cameras_config)
+    provider = create_calibration_manager(
+        cameras_yaml_path=cameras_config,
+        pipeline_config=pipeline,
+        camera_calibration_json_path=REPO_ROOT / "config" / "camera_calibration.json",
+        ply_alignment_json_path=alignment_config,
+        camera_labels=labels,
+    )
     out: dict[str, CameraCalibration] = {}
     for source_id, camera_id in labels.items():
         snapshot = provider.snapshot(int(source_id), str(camera_id))
@@ -733,7 +742,14 @@ def _camera_calibrations(pipeline_config: Path, cameras_config: Path) -> dict[st
 
 def _load_scene_similarity(pipeline_config: Path, cameras_config: Path, alignment_config: Path) -> dict[str, Any]:
     try:
-        provider = _CalibrationProvider(cameras_config, _read_yaml(pipeline_config))
+        labels = load_camera_labels(cameras_config)
+        provider = create_calibration_manager(
+            cameras_yaml_path=cameras_config,
+            pipeline_config=_read_yaml(pipeline_config),
+            camera_calibration_json_path=REPO_ROOT / "config" / "camera_calibration.json",
+            ply_alignment_json_path=alignment_config,
+            camera_labels=labels,
+        )
         bundle = provider.calibration_bundle()
         sim = ((bundle.get("align") or {}).get("scene_similarity") or {})
         if isinstance(sim, dict) and isinstance(sim.get("world_to_scene_col_major"), list):
@@ -1676,7 +1692,7 @@ def _write_revision(
         },
         "color_source": color_source,
         "color_space": "sRGB",
-        "calibration_source": "config/cameras.yaml + config/camera_calibration.json via _CalibrationProvider",
+        "calibration_source": "CalibrationManager:cameras+extrinsics+alignment",
     }
     write_json(revision_dir / "room_points_meta.json", room_meta)
 
@@ -1875,8 +1891,12 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
     pipeline_config = _resolve_repo_path(args.pipeline_config, REPO_ROOT / "config" / "infer.yaml")
     alignment_config = _resolve_repo_path(args.alignment_config, REPO_ROOT / "config" / "ply_alignment.json")
     pipeline = _read_yaml(pipeline_config)
-    camera_labels = _load_camera_labels(cameras_config)
-    calibrations = _camera_calibrations(pipeline_config, cameras_config)
+    camera_labels = load_camera_labels(cameras_config)
+    calibrations = _camera_calibrations(
+        pipeline_config,
+        cameras_config,
+        alignment_config,
+    )
     scene_similarity = _load_scene_similarity(pipeline_config, cameras_config, alignment_config)
     store = VirtualTwinStore(Path(args.output_root) if args.output_root else None)
     store.ensure_root()

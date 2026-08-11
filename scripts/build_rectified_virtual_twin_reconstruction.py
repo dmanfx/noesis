@@ -20,7 +20,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from mapanything_config import load_service_config
-from noesis.ds8_runtime import _CalibrationProvider, _load_camera_labels
+from noesis.calibration.manager import create_calibration_manager, load_camera_labels
 from noesis.virtual_twin.builder import (
     VirtualTwinBuildError,
     VirtualTwinFrameInput,
@@ -29,6 +29,7 @@ from noesis.virtual_twin.builder import (
 )
 from noesis.virtual_twin.store import VirtualTwinStore
 from noesis.virtual_twin.zeroplane_adapter import ZeroPlaneAdapterError, ZeroPlaneCommandAdapter
+from noesis_core.runtime_secrets import load_pipeline_config, source_provenance_ref
 from scripts.build_virtual_twin_reconstruction import (
     _camera_source,
     _initial_world_to_scene_from_alignment,
@@ -241,10 +242,10 @@ def _rectified_snapshot(snapshot: Any, intrinsics: np.ndarray, image_size: tuple
 
 
 def build(args: argparse.Namespace) -> dict[str, Any]:
-    pipeline_cfg = _load_yaml(Path(args.pipeline_config))
+    pipeline_cfg = load_pipeline_config(Path(args.pipeline_config), materialize_secrets=True)
     cameras_cfg = _load_camera_yaml(Path(args.cameras_config))
-    camera_labels = _load_camera_labels(Path(args.cameras_config))
-    source_id, uri = _camera_source(pipeline_cfg, camera_labels, args.camera)
+    camera_labels = load_camera_labels(Path(args.cameras_config))
+    source_id, uri, source_cfg = _camera_source(pipeline_cfg, camera_labels, args.camera)
 
     model_obj_raw = str(args.model_obj or os.environ.get("NOESIS_MENON_STRUCTURAL_OBJ", "")).strip()
     if not model_obj_raw:
@@ -253,8 +254,13 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
     if not model_obj.exists():
         raise VirtualTwinBuildError(f"Menon structural OBJ does not exist: {model_obj}")
 
-    calibration_provider = _CalibrationProvider(Path(args.cameras_config), pipeline_cfg)
-    calibration_provider.set_camera_labels(camera_labels)
+    calibration_provider = create_calibration_manager(
+        cameras_yaml_path=Path(args.cameras_config),
+        pipeline_config=pipeline_cfg,
+        camera_calibration_json_path=REPO_ROOT / "config" / "camera_calibration.json",
+        ply_alignment_json_path=Path(args.alignment_config),
+        camera_labels=camera_labels,
+    )
     snapshot = calibration_provider.snapshot(source_id, args.camera)
     if snapshot is None:
         raise VirtualTwinBuildError(f"calibration snapshot unavailable for {args.camera}")
@@ -288,7 +294,7 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
             max_frames_read=int(args.max_frames_read),
             keyframes=int(args.keyframes),
         )
-        source_description = uri
+        source_description = source_provenance_ref(source_cfg, source_id=source_id)
 
     map_config = load_service_config()
     mapanything = DirectMapAnythingRunner(

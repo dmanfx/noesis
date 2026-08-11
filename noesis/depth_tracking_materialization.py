@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import logging
+import os
+import re
 import shutil
 import subprocess
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Tuple
@@ -165,7 +168,8 @@ def _build_engine(
 
 
 def _config_output_path(*, width: int, height: int, batch_size: int, interval: int) -> Path:
-    return (BUILD_DIR / f"config_infer_depth_tracking_da2_vits_{height}x{width}_b{batch_size}_i{interval}.ini").resolve()
+    build_dir = Path(os.environ.get("NOESIS_BUILD_DIR", BUILD_DIR)).expanduser().resolve()
+    return (build_dir / f"config_infer_depth_tracking_da2_vits_{height}x{width}_b{batch_size}_i{interval}.ini").resolve()
 
 
 def _batch_onnx_path(*, width: int, height: int, batch_size: int) -> Path:
@@ -176,14 +180,13 @@ def _engine_path(*, width: int, height: int, batch_size: int) -> Path:
     return (ENGINE_DIR / f"depth_anything_v2_metric_hypersim_vits_{height}x{width}_b{batch_size}_fp16.engine").resolve()
 
 
-def materialize_depth_tracking_assets(
+def _validated_asset_paths(
     *,
-    logger: logging.Logger | None = None,
-    batch_size: int = DEFAULT_BATCH_SIZE,
-    interval: int = DEFAULT_INTERVAL,
-    input_size: Tuple[int, int] = DEFAULT_INPUT_SIZE,
-    gie_id: int = DEFAULT_GIE_ID,
-) -> DepthTrackingAssets:
+    batch_size: int,
+    interval: int,
+    input_size: Tuple[int, int],
+    gie_id: int,
+) -> tuple[int, int, int, int, int, Path, Path, Path]:
     width = int(input_size[0])
     height = int(input_size[1])
     batch_size = int(batch_size)
@@ -200,39 +203,107 @@ def materialize_depth_tracking_assets(
         raise ValueError(
             f"Depth tracking input_size must be multiples of 14 for DAv2 (got {width}x{height})"
         )
-
     if (width, height) != DEFAULT_INPUT_SIZE:
         raise ValueError(
             "Only the approved DS8 depth-tracking operating point is currently supported: "
             f"{DEFAULT_INPUT_SIZE[0]}x{DEFAULT_INPUT_SIZE[1]}"
         )
 
-    batch_onnx = _B3_ONNX_TEMPLATE if batch_size == 3 else _batch_onnx_path(width=width, height=height, batch_size=batch_size)
-    engine_path = _B3_ENGINE_TEMPLATE if batch_size == 3 else _engine_path(width=width, height=height, batch_size=batch_size)
-    config_path = _config_output_path(width=width, height=height, batch_size=batch_size, interval=interval)
-    engine_ready = engine_path.exists() and engine_path.stat().st_size > 0
-
-    batch_onnx = _export_batch_onnx(
-        output_onnx=batch_onnx,
-        batch_size=batch_size,
+    onnx_path = (
+        _B3_ONNX_TEMPLATE
+        if batch_size == 3
+        else _batch_onnx_path(width=width, height=height, batch_size=batch_size)
+    )
+    engine_path = (
+        _B3_ENGINE_TEMPLATE
+        if batch_size == 3
+        else _engine_path(width=width, height=height, batch_size=batch_size)
+    )
+    config_path = _config_output_path(
         width=width,
         height=height,
-        force_rebuild=not engine_ready,
+        batch_size=batch_size,
+        interval=interval,
     )
-    engine_path = _build_engine(onnx_path=batch_onnx, engine_path=engine_path, logger=logger)
+    return width, height, batch_size, interval, gie_id, onnx_path, engine_path, config_path
 
+
+def _write_engine_only_config(
+    *,
+    config_path: Path,
+    engine_path: Path,
+    batch_size: int,
+    interval: int,
+    gie_id: int,
+    width: int,
+    height: int,
+) -> None:
     _ensure_nonempty(_CONFIG_TEMPLATE, label="Depth tracking config template")
     text = _CONFIG_TEMPLATE.read_text(encoding="utf-8")
-    text = _replace_token(text, "@ONNX_PATH@", batch_onnx.resolve())
+    text = re.sub(r"(?m)^\s*onnx-file\s*=.*(?:\n|$)", "", text)
     text = _replace_token(text, "@ENGINE_PATH@", engine_path.resolve())
     text = _replace_token(text, "@BATCH_SIZE@", batch_size)
     text = _replace_token(text, "@INTERVAL@", interval)
     text = _replace_token(text, "@GIE_ID@", gie_id)
     text = _replace_token(text, "@HEIGHT@", height)
     text = _replace_token(text, "@WIDTH@", width)
+    if re.search(r"(?mi)^\s*onnx-file\s*=", text):
+        raise RuntimeError("Depth tracking runtime config retained an ONNX build input")
+
     config_path.parent.mkdir(parents=True, exist_ok=True)
-    if not config_path.exists() or config_path.read_text(encoding="utf-8") != text:
-        config_path.write_text(text, encoding="utf-8")
+    if config_path.exists() and config_path.read_text(encoding="utf-8") == text:
+        return
+    with tempfile.NamedTemporaryFile(
+        mode="w",
+        encoding="utf-8",
+        dir=config_path.parent,
+        prefix=f".{config_path.name}.partial-",
+        delete=False,
+    ) as handle:
+        temporary = Path(handle.name)
+        handle.write(text)
+        handle.flush()
+        os.fsync(handle.fileno())
+    try:
+        temporary.replace(config_path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def materialize_depth_tracking_assets(
+    *,
+    logger: logging.Logger | None = None,
+    batch_size: int = DEFAULT_BATCH_SIZE,
+    interval: int = DEFAULT_INTERVAL,
+    input_size: Tuple[int, int] = DEFAULT_INPUT_SIZE,
+    gie_id: int = DEFAULT_GIE_ID,
+) -> DepthTrackingAssets:
+    del logger  # Runtime materialization is intentionally build-tool free.
+    (
+        width,
+        height,
+        batch_size,
+        interval,
+        gie_id,
+        batch_onnx,
+        engine_path,
+        config_path,
+    ) = _validated_asset_paths(
+        batch_size=batch_size,
+        interval=interval,
+        input_size=input_size,
+        gie_id=gie_id,
+    )
+    _ensure_nonempty(engine_path, label="Depth tracking TensorRT engine")
+    _write_engine_only_config(
+        config_path=config_path,
+        engine_path=engine_path,
+        batch_size=batch_size,
+        interval=interval,
+        gie_id=gie_id,
+        width=width,
+        height=height,
+    )
 
     return DepthTrackingAssets(
         config_path=config_path,
@@ -248,28 +319,89 @@ def materialize_depth_tracking_assets(
     )
 
 
+def build_depth_tracking_assets(
+    *,
+    logger: logging.Logger | None = None,
+    batch_size: int = DEFAULT_BATCH_SIZE,
+    interval: int = DEFAULT_INTERVAL,
+    input_size: Tuple[int, int] = DEFAULT_INPUT_SIZE,
+    gie_id: int = DEFAULT_GIE_ID,
+) -> DepthTrackingAssets:
+    """Explicit offline export/build entrypoint; never called by runtime startup."""
+
+    (
+        width,
+        height,
+        batch_size,
+        interval,
+        gie_id,
+        batch_onnx,
+        engine_path,
+        _config_path,
+    ) = _validated_asset_paths(
+        batch_size=batch_size,
+        interval=interval,
+        input_size=input_size,
+        gie_id=gie_id,
+    )
+    engine_ready = engine_path.exists() and engine_path.stat().st_size > 0
+    batch_onnx = _export_batch_onnx(
+        output_onnx=batch_onnx,
+        batch_size=batch_size,
+        width=width,
+        height=height,
+        force_rebuild=not engine_ready,
+    )
+    _build_engine(onnx_path=batch_onnx, engine_path=engine_path, logger=logger)
+    return materialize_depth_tracking_assets(
+        logger=logger,
+        batch_size=batch_size,
+        interval=interval,
+        input_size=(width, height),
+        gie_id=gie_id,
+    )
+
+
 def ensure_native_object_depth_extension(logger: logging.Logger | None = None) -> None:
+    del logger
     import sysconfig
 
     ext_suffix = str(sysconfig.get_config_var("EXT_SUFFIX") or ".so")
     ext_path = REPO_ROOT / f"noesis_depth_meta_ext{ext_suffix}"
     source_path = REPO_ROOT / "native" / "noesis_depth_meta_ext.cpp"
-    if ext_path.exists() and ext_path.stat().st_size > 0 and ext_path.stat().st_mtime >= source_path.stat().st_mtime:
-        return
-    _run([str(REPO_ROOT / "scripts" / "build_noesis_depth_meta_ext.sh")], logger=logger)
-    _ensure_nonempty(ext_path, label="Object depth extension")
+    build_script = REPO_ROOT / "scripts" / "build_noesis_depth_meta_ext.sh"
+    _ensure_nonempty(source_path, label="Object depth extension source")
+    if not ext_path.exists() or ext_path.stat().st_size <= 0:
+        raise RuntimeError(
+            f"Object depth extension is missing or empty: {ext_path}. "
+            f"Run {build_script} before runtime startup."
+        )
+    if ext_path.stat().st_mtime < source_path.stat().st_mtime:
+        raise RuntimeError(
+            f"Object depth extension is stale: {ext_path}. "
+            f"Run {build_script} before runtime startup."
+        )
 
 
 def ensure_native_depth_tracking_tensor_extension(logger: logging.Logger | None = None) -> None:
+    del logger
     import sysconfig
 
     ext_suffix = str(sysconfig.get_config_var("EXT_SUFFIX") or ".so")
     ext_path = REPO_ROOT / f"noesis_depth_tracking_tensor_ext{ext_suffix}"
     source_path = REPO_ROOT / "native" / "noesis_depth_tracking_tensor_ext.cpp"
-    if ext_path.exists() and ext_path.stat().st_size > 0 and ext_path.stat().st_mtime >= source_path.stat().st_mtime:
-        return
-    _run([str(REPO_ROOT / "scripts" / "build_noesis_depth_tracking_tensor_ext.sh")], logger=logger)
-    _ensure_nonempty(ext_path, label="Depth tracking tensor extension")
+    build_script = REPO_ROOT / "scripts" / "build_noesis_depth_tracking_tensor_ext.sh"
+    _ensure_nonempty(source_path, label="Depth tracking tensor extension source")
+    if not ext_path.exists() or ext_path.stat().st_size <= 0:
+        raise RuntimeError(
+            f"Depth tracking tensor extension is missing or empty: {ext_path}. "
+            f"Run {build_script} before runtime startup."
+        )
+    if ext_path.stat().st_mtime < source_path.stat().st_mtime:
+        raise RuntimeError(
+            f"Depth tracking tensor extension is stale: {ext_path}. "
+            f"Run {build_script} before runtime startup."
+        )
 
 
 __all__ = [
@@ -279,6 +411,7 @@ __all__ = [
     "DEFAULT_INTERVAL",
     "DEFAULT_MODEL_NAME",
     "DepthTrackingAssets",
+    "build_depth_tracking_assets",
     "ensure_native_depth_tracking_tensor_extension",
     "ensure_native_object_depth_extension",
     "materialize_depth_tracking_assets",

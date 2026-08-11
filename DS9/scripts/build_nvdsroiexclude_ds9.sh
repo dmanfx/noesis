@@ -10,11 +10,14 @@ ds9_require_python_build_tools
 
 BUILD_DIR="${ROOT}/build/nvdsroiexclude"
 SRC_DIR="${ROOT}/csrc/nvdsroiexclude"
+OUT_DIR="${ROOT}/gst-plugins"
 
-cmake -S "${SRC_DIR}" -B "${BUILD_DIR}" \
+mkdir -p "${BUILD_DIR}" "${OUT_DIR}"
+cmake --fresh -S "${SRC_DIR}" -B "${BUILD_DIR}" \
   -DCMAKE_BUILD_TYPE=Release \
-  -DDEEPSTREAM_ROOT="${DS_HOME}"
+  -DDEEPSTREAM_HOME="${DS_HOME}" \
+  -DCMAKE_LIBRARY_OUTPUT_DIRECTORY="${OUT_DIR}"
 cmake --build "${BUILD_DIR}" --parallel
 
-echo "[OK] Built ${BUILD_DIR}/libgstnvdsroiexclude.so"
+echo "[OK] Built ${OUT_DIR}/libgstnvdsroiexclude.so"
 echo "[INFO] DS9 build complete. Do not install over a non-DS9 runtime tree."

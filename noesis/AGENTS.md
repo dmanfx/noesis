@@ -23,7 +23,7 @@ This directory tree is the canonical DeepStream 8 / Service Maker / Flow impleme
 
 1. **Do not use GI/GStreamer directly here**
    - Do not use GI/GStreamer to construct or introspect the DS8 Service Maker pipeline graph under `noesis/pipelines/*` or to implement metadata extraction hooks.
-   - Exception: the RTSP→WebRTC mosaic gateway (`noesis/mosaic_webrtc_gateway.py`) is an intentional, separate GStreamer pipeline (GI) used only for mosaic delivery; `noesis/ds8_runtime.py` may also use GI for that gateway and RTSP keyframe requests.
+   - Exception: the encoded-mosaic delivery edge is intentionally outside the Service Maker analytics graph. `noesis/mosaic_h264_bridge.py` owns the single GI `shmsrc → h264parse → appsink` AU reader, and `noesis/mosaic_webrtc_gateway.py` owns each GI `appsrc → rtph264pay → webrtcbin` peer pipeline. `noesis/ds8_runtime.py` may wire those edge pipelines and the repo-owned mosaic force-IDR control. Do not extend this exception into analytics or raw-frame CPU branches.
    - All DS8 pipeline construction should use DeepStream 8 Service Maker APIs (`pyservicemaker`) and DeepStream Python bindings (`pyds`) where needed.
 
 2. **No fallbacks without explicit user approval**
@@ -34,9 +34,9 @@ This directory tree is the canonical DeepStream 8 / Service Maker / Flow impleme
    - For pipeline construction, use the documented `Pipeline` API.
    - For data retrieval and gating, use documented Service Maker/Flow primitives such as `BufferRetriever`, `BufferOperator`, and batch metadata (`Buffer.batch_meta`).
 
-4. **No deprecated-stack pad probes or appsinks**
+4. **No deprecated-stack pad probes or analytics appsinks**
    - Do not add new pad probes or appsinks in DS8 code.
-   - Metadata extraction should be done via DS8 batch metadata operators and Service Maker operators, not via GStreamer pad probes.
+   - Metadata extraction should be done via DS8 batch metadata operators and Service Maker operators, not via GStreamer pad probes. The encoded-AU edge exception above is transport-only and must not inspect raw frames or analytics metadata.
 
 5. **Doc-backed API usage only**
    - Before using or adding any Service Maker / DeepStream calls, verify them against:

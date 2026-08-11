@@ -1,46 +1,86 @@
 // SPDX-FileCopyrightText: 2026 Noesis
 // SPDX-License-Identifier: MIT
 //
-// DeepStream 8 custom parser for DEIMv2 Wholebody49 outputs.
+// Strict DeepStream parser for the promoted DEIMv2 Wholebody49 outputs.
 //
-// label_xyxy_score layout per query:
-//   [class_id, x1, y1, x2, y2, score]
-// masks layout:
-//   [query, 80, 80] probability masks, or [B, query, 80, 80] with the
-//   DeepStream parser receiving the current batch pointer.
-//
-// The production DS8 profile supports two promoted prototype variants:
-//   - DINOv3-S masks: label_xyxy_score + masks -> instance mask metadata.
-//   - DINOv3-X boxes: label_xyxy_score only -> bbox metadata.
+// label_xyxy_score is exactly [1240, 6] per callback:
+//   [class_id, normalized_x1, normalized_y1, normalized_x2, normalized_y2, score]
+// masks is exactly [1240, 80, 80] per callback. DeepStream strips the fixed
+// batch dimension before invoking a custom parser, so batch-bearing output
+// dimensions are deliberately rejected here.
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstddef>
 #include <cstring>
 #include <iostream>
+#include <limits>
+#include <memory>
 #include <vector>
 
 #include "nvdsinfer_custom_impl.h"
 
 namespace {
 
+constexpr char kLabelLayerName[] = "label_xyxy_score";
+constexpr char kMaskLayerName[] = "masks";
+constexpr std::size_t kQueryCount = 1240;
+constexpr std::size_t kLabelChannels = 6;
+constexpr std::size_t kMaskHeight = 80;
+constexpr std::size_t kMaskWidth = 80;
+constexpr int kBodyClassId = 0;
+
 template <typename T>
 inline T clamp(T value, T low, T high) {
   return std::min(high, std::max(low, value));
 }
 
-const NvDsInferLayerInfo* find_layer_by_name(const std::vector<NvDsInferLayerInfo>& layers,
-                                             const char* name) {
-  for (const auto& layer : layers) {
-    if (layer.layerName && std::strcmp(layer.layerName, name) == 0) {
-      return &layer;
-    }
+bool reject(const char* message) {
+  std::cerr << "[deimv2-wholebody49] " << message << std::endl;
+  return false;
+}
+
+bool resolve_exact_layers(const std::vector<NvDsInferLayerInfo>& layers,
+                          bool require_masks,
+                          const NvDsInferLayerInfo*& label_layer,
+                          const NvDsInferLayerInfo*& mask_layer) {
+  const std::size_t expected_count = require_masks ? 2U : 1U;
+  if (layers.size() != expected_count) {
+    return reject("unexpected output-layer count");
   }
-  return nullptr;
+
+  label_layer = nullptr;
+  mask_layer = nullptr;
+  for (const auto& layer : layers) {
+    if (layer.layerName == nullptr) {
+      return reject("output layer has no name");
+    }
+    if (std::strcmp(layer.layerName, kLabelLayerName) == 0) {
+      if (label_layer != nullptr) {
+        return reject("duplicate label_xyxy_score layer");
+      }
+      label_layer = &layer;
+      continue;
+    }
+    if (require_masks && std::strcmp(layer.layerName, kMaskLayerName) == 0) {
+      if (mask_layer != nullptr) {
+        return reject("duplicate masks layer");
+      }
+      mask_layer = &layer;
+      continue;
+    }
+    return reject("unexpected output layer name");
+  }
+
+  if (label_layer == nullptr || (require_masks && mask_layer == nullptr)) {
+    return reject("required named output layer is missing");
+  }
+  return true;
 }
 
 bool validate_float_layer(const NvDsInferLayerInfo& layer, const char* label) {
-  if (!layer.buffer) {
+  if (layer.buffer == nullptr) {
     std::cerr << "[deimv2-wholebody49] missing " << label << " buffer" << std::endl;
     return false;
   }
@@ -51,335 +91,323 @@ bool validate_float_layer(const NvDsInferLayerInfo& layer, const char* label) {
   return true;
 }
 
-struct LabelDims {
-  std::size_t queries = 0;
-  std::size_t channels = 0;
-};
-
-struct MaskDims {
-  std::size_t queries = 0;
-  std::size_t height = 0;
-  std::size_t width = 0;
-};
-
-bool parse_label_dims(const NvDsInferLayerInfo& layer, LabelDims& out) {
-  const int nd = layer.inferDims.numDims;
-  if (nd == 2) {
-    out.queries = static_cast<std::size_t>(layer.inferDims.d[0]);
-    out.channels = static_cast<std::size_t>(layer.inferDims.d[1]);
-    return out.queries > 0 && out.channels >= 6;
-  }
-  if (nd == 3) {
-    if (layer.inferDims.d[2] >= 6) {
-      out.queries = static_cast<std::size_t>(layer.inferDims.d[1]);
-      out.channels = static_cast<std::size_t>(layer.inferDims.d[2]);
-      return out.queries > 0;
-    }
-    if (layer.inferDims.d[1] >= 6) {
-      out.queries = static_cast<std::size_t>(layer.inferDims.d[0]);
-      out.channels = static_cast<std::size_t>(layer.inferDims.d[1]);
-      return out.queries > 0;
-    }
-  }
-  return false;
+bool validate_label_dims(const NvDsInferLayerInfo& layer) {
+  constexpr std::size_t kElements = kQueryCount * kLabelChannels;
+  return layer.inferDims.numDims == 2U &&
+         layer.inferDims.d[0] == kQueryCount &&
+         layer.inferDims.d[1] == kLabelChannels &&
+         layer.inferDims.numElements == kElements;
 }
 
-bool parse_mask_dims(const NvDsInferLayerInfo& layer, MaskDims& out) {
-  const int nd = layer.inferDims.numDims;
-  if (nd == 3) {
-    out.queries = static_cast<std::size_t>(layer.inferDims.d[0]);
-    out.height = static_cast<std::size_t>(layer.inferDims.d[1]);
-    out.width = static_cast<std::size_t>(layer.inferDims.d[2]);
-    return out.queries > 0 && out.height > 0 && out.width > 0;
-  }
-  if (nd == 4) {
-    out.queries = static_cast<std::size_t>(layer.inferDims.d[1]);
-    out.height = static_cast<std::size_t>(layer.inferDims.d[2]);
-    out.width = static_cast<std::size_t>(layer.inferDims.d[3]);
-    return out.queries > 0 && out.height > 0 && out.width > 0;
-  }
-  return false;
+bool validate_mask_dims(const NvDsInferLayerInfo& layer) {
+  constexpr std::size_t kElements = kQueryCount * kMaskHeight * kMaskWidth;
+  return layer.inferDims.numDims == 3U &&
+         layer.inferDims.d[0] == kQueryCount &&
+         layer.inferDims.d[1] == kMaskHeight &&
+         layer.inferDims.d[2] == kMaskWidth &&
+         layer.inferDims.numElements == kElements;
 }
 
-float threshold_for_class(const NvDsInferParseDetectionParams& params, int class_id) {
+bool validate_network_info(const NvDsInferNetworkInfo& network_info) {
+  return network_info.width > 0U && network_info.height > 0U;
+}
+
+float threshold_for_class(const NvDsInferParseDetectionParams& params,
+                          int class_id) {
   if (params.perClassPreclusterThreshold.empty()) {
-    return 0.0f;
+    return 0.0F;
   }
-  const std::size_t idx = static_cast<std::size_t>(std::max(0, class_id));
-  if (idx < params.perClassPreclusterThreshold.size()) {
-    return params.perClassPreclusterThreshold[idx];
+  const std::size_t index = static_cast<std::size_t>(std::max(0, class_id));
+  if (index < params.perClassPreclusterThreshold.size()) {
+    return params.perClassPreclusterThreshold[index];
   }
   return params.perClassPreclusterThreshold[0];
-}
-
-bool set_bbox(float x1, float y1, float x2, float y2, bool normalized,
-              const NvDsInferNetworkInfo& network_info,
-              NvDsInferInstanceMaskInfo& obj) {
-  const float net_w = static_cast<float>(network_info.width);
-  const float net_h = static_cast<float>(network_info.height);
-  if (normalized) {
-    x1 *= net_w;
-    x2 *= net_w;
-    y1 *= net_h;
-    y2 *= net_h;
-  }
-
-  x1 = clamp(x1, 0.0f, net_w);
-  y1 = clamp(y1, 0.0f, net_h);
-  x2 = clamp(x2, 0.0f, net_w);
-  y2 = clamp(y2, 0.0f, net_h);
-  obj.left = x1;
-  obj.top = y1;
-  obj.width = clamp(x2 - x1, 0.0f, net_w);
-  obj.height = clamp(y2 - y1, 0.0f, net_h);
-  return obj.width >= 1.0f && obj.height >= 1.0f;
-}
-
-bool set_detection_bbox(float x1, float y1, float x2, float y2, bool normalized,
-                        const NvDsInferNetworkInfo& network_info,
-                        NvDsInferObjectDetectionInfo& obj) {
-  const float net_w = static_cast<float>(network_info.width);
-  const float net_h = static_cast<float>(network_info.height);
-  if (normalized) {
-    x1 *= net_w;
-    x2 *= net_w;
-    y1 *= net_h;
-    y2 *= net_h;
-  }
-
-  x1 = clamp(x1, 0.0f, net_w);
-  y1 = clamp(y1, 0.0f, net_h);
-  x2 = clamp(x2, 0.0f, net_w);
-  y2 = clamp(y2, 0.0f, net_h);
-  obj.left = x1;
-  obj.top = y1;
-  obj.width = clamp(x2 - x1, 0.0f, net_w);
-  obj.height = clamp(y2 - y1, 0.0f, net_h);
-  return obj.width >= 1.0f && obj.height >= 1.0f;
-}
-
-bool copy_mask_roi(const float* mask_src, const MaskDims& mask_dims,
-                   float x1, float y1, float x2, float y2, bool normalized,
-                   const NvDsInferNetworkInfo& network_info,
-                   NvDsInferInstanceMaskInfo& obj) {
-  if (!mask_src || mask_dims.height == 0 || mask_dims.width == 0) {
-    return false;
-  }
-  const float net_w = static_cast<float>(network_info.width);
-  const float net_h = static_cast<float>(network_info.height);
-  if (!normalized) {
-    x1 /= net_w;
-    x2 /= net_w;
-    y1 /= net_h;
-    y2 /= net_h;
-  }
-
-  const float fx1 = clamp(x1, 0.0f, 1.0f) * static_cast<float>(mask_dims.width);
-  const float fy1 = clamp(y1, 0.0f, 1.0f) * static_cast<float>(mask_dims.height);
-  const float fx2 = clamp(x2, 0.0f, 1.0f) * static_cast<float>(mask_dims.width);
-  const float fy2 = clamp(y2, 0.0f, 1.0f) * static_cast<float>(mask_dims.height);
-
-  const int ix1 = clamp(static_cast<int>(std::floor(fx1)), 0, static_cast<int>(mask_dims.width) - 1);
-  const int iy1 = clamp(static_cast<int>(std::floor(fy1)), 0, static_cast<int>(mask_dims.height) - 1);
-  const int ix2 = clamp(static_cast<int>(std::ceil(fx2)), ix1 + 1, static_cast<int>(mask_dims.width));
-  const int iy2 = clamp(static_cast<int>(std::ceil(fy2)), iy1 + 1, static_cast<int>(mask_dims.height));
-  const std::size_t roi_w = static_cast<std::size_t>(ix2 - ix1);
-  const std::size_t roi_h = static_cast<std::size_t>(iy2 - iy1);
-  if (roi_w == 0 || roi_h == 0) {
-    return false;
-  }
-
-  obj.mask_width = static_cast<unsigned int>(roi_w);
-  obj.mask_height = static_cast<unsigned int>(roi_h);
-  obj.mask_size = static_cast<unsigned int>(roi_w * roi_h * sizeof(float));
-  obj.mask = new float[roi_w * roi_h];
-
-  for (std::size_t y = 0; y < roi_h; ++y) {
-    const float* src_row =
-        mask_src + (static_cast<std::size_t>(iy1) + y) * mask_dims.width + static_cast<std::size_t>(ix1);
-    float* dst_row = obj.mask + y * roi_w;
-    for (std::size_t x = 0; x < roi_w; ++x) {
-      dst_row[x] = clamp(src_row[x], 0.0f, 1.0f);
-    }
-  }
-  return true;
 }
 
 struct Candidate {
   std::size_t query = 0;
   int class_id = -1;
-  float score = 0.0f;
-  float x1 = 0.0f;
-  float y1 = 0.0f;
-  float x2 = 0.0f;
-  float y2 = 0.0f;
+  float score = 0.0F;
+  float x1 = 0.0F;
+  float y1 = 0.0F;
+  float x2 = 0.0F;
+  float y2 = 0.0F;
 };
 
-constexpr int kBodyClassId = 0;
+bool exact_class_id(float raw, int& class_id) {
+  if (!std::isfinite(raw)) {
+    return false;
+  }
+  const float integral = std::round(raw);
+  const double exact_integral = static_cast<double>(integral);
+  if (raw != integral ||
+      exact_integral < static_cast<double>(std::numeric_limits<int>::min()) ||
+      exact_integral > static_cast<double>(std::numeric_limits<int>::max())) {
+    return false;
+  }
+  class_id = static_cast<int>(integral);
+  return true;
+}
+
+bool collect_candidates(const float* labels,
+                        const NvDsInferParseDetectionParams& detection_params,
+                        std::array<Candidate, kQueryCount>& candidates,
+                        std::size_t& candidate_count) {
+  candidate_count = 0;
+  for (std::size_t query = 0; query < kQueryCount; ++query) {
+    const std::size_t base = query * kLabelChannels;
+    for (std::size_t channel = 0; channel < kLabelChannels; ++channel) {
+      if (!std::isfinite(labels[base + channel])) {
+        return reject("label_xyxy_score contains a non-finite value");
+      }
+    }
+
+    int class_id = -1;
+    if (!exact_class_id(labels[base], class_id)) {
+      return reject("label_xyxy_score contains a non-integral class ID");
+    }
+    const float score = labels[base + 5];
+    if (class_id < 0) {
+      continue;
+    }
+    if (detection_params.numClassesConfigured > 0 &&
+        static_cast<unsigned int>(class_id) >=
+            detection_params.numClassesConfigured) {
+      continue;
+    }
+    if (score < threshold_for_class(detection_params, class_id)) {
+      continue;
+    }
+    candidates[candidate_count++] = {
+        query,       class_id,          score,          labels[base + 1],
+        labels[base + 2], labels[base + 3], labels[base + 4]};
+  }
+
+  std::sort(candidates.begin(), candidates.begin() + candidate_count,
+            [](const Candidate& left, const Candidate& right) {
+              return left.score > right.score;
+            });
+  return true;
+}
+
+template <typename Object>
+bool set_normalized_bbox(const Candidate& candidate,
+                         const NvDsInferNetworkInfo& network_info,
+                         Object& object) {
+  if (network_info.width == 0U || network_info.height == 0U) {
+    return false;
+  }
+  const float network_width = static_cast<float>(network_info.width);
+  const float network_height = static_cast<float>(network_info.height);
+  const float x1 = clamp(candidate.x1, 0.0F, 1.0F) * network_width;
+  const float y1 = clamp(candidate.y1, 0.0F, 1.0F) * network_height;
+  const float x2 = clamp(candidate.x2, 0.0F, 1.0F) * network_width;
+  const float y2 = clamp(candidate.y2, 0.0F, 1.0F) * network_height;
+
+  object.left = x1;
+  object.top = y1;
+  object.width = clamp(x2 - x1, 0.0F, network_width);
+  object.height = clamp(y2 - y1, 0.0F, network_height);
+  return object.width >= 1.0F && object.height >= 1.0F;
+}
+
+struct MaskRoi {
+  std::unique_ptr<float[]> values;
+  unsigned int width = 0;
+  unsigned int height = 0;
+  unsigned int size_bytes = 0;
+};
+
+bool build_mask_roi(const float* mask_source,
+                    const Candidate& candidate,
+                    MaskRoi& result) {
+  const float x1 = clamp(candidate.x1, 0.0F, 1.0F) *
+                   static_cast<float>(kMaskWidth);
+  const float y1 = clamp(candidate.y1, 0.0F, 1.0F) *
+                   static_cast<float>(kMaskHeight);
+  const float x2 = clamp(candidate.x2, 0.0F, 1.0F) *
+                   static_cast<float>(kMaskWidth);
+  const float y2 = clamp(candidate.y2, 0.0F, 1.0F) *
+                   static_cast<float>(kMaskHeight);
+
+  const int ix1 = clamp(static_cast<int>(std::floor(x1)), 0,
+                        static_cast<int>(kMaskWidth) - 1);
+  const int iy1 = clamp(static_cast<int>(std::floor(y1)), 0,
+                        static_cast<int>(kMaskHeight) - 1);
+  const int ix2 = clamp(static_cast<int>(std::ceil(x2)), ix1 + 1,
+                        static_cast<int>(kMaskWidth));
+  const int iy2 = clamp(static_cast<int>(std::ceil(y2)), iy1 + 1,
+                        static_cast<int>(kMaskHeight));
+  const std::size_t roi_width = static_cast<std::size_t>(ix2 - ix1);
+  const std::size_t roi_height = static_cast<std::size_t>(iy2 - iy1);
+  const std::size_t mask_plane_size = kMaskHeight * kMaskWidth;
+  const float* query_mask = mask_source + candidate.query * mask_plane_size;
+
+  for (std::size_t row = 0; row < roi_height; ++row) {
+    const float* source_row =
+        query_mask + (static_cast<std::size_t>(iy1) + row) * kMaskWidth +
+        static_cast<std::size_t>(ix1);
+    for (std::size_t column = 0; column < roi_width; ++column) {
+      if (!std::isfinite(source_row[column])) {
+        return reject("masks contains a non-finite ROI value");
+      }
+    }
+  }
+
+  try {
+    result.values = std::make_unique<float[]>(roi_width * roi_height);
+  } catch (...) {
+    return reject("unable to allocate instance-mask ROI");
+  }
+  for (std::size_t row = 0; row < roi_height; ++row) {
+    const float* source_row =
+        query_mask + (static_cast<std::size_t>(iy1) + row) * kMaskWidth +
+        static_cast<std::size_t>(ix1);
+    float* destination_row = result.values.get() + row * roi_width;
+    for (std::size_t column = 0; column < roi_width; ++column) {
+      destination_row[column] = clamp(source_row[column], 0.0F, 1.0F);
+    }
+  }
+  result.width = static_cast<unsigned int>(roi_width);
+  result.height = static_cast<unsigned int>(roi_height);
+  result.size_bytes =
+      static_cast<unsigned int>(roi_width * roi_height * sizeof(float));
+  return true;
+}
+
+void release_mask_objects(std::vector<NvDsInferInstanceMaskInfo>& objects) {
+  for (auto& object : objects) {
+    delete[] object.mask;
+    object.mask = nullptr;
+  }
+  objects.clear();
+}
 
 }  // namespace
 
 extern "C" bool NvDsInferParseDeimv2Wholebody49(
-    std::vector<NvDsInferLayerInfo> const& outputLayersInfo,
-    NvDsInferNetworkInfo const& networkInfo,
-    NvDsInferParseDetectionParams const& detectionParams,
-    std::vector<NvDsInferInstanceMaskInfo>& objectList) {
-  const NvDsInferLayerInfo* label_layer = find_layer_by_name(outputLayersInfo, "label_xyxy_score");
-  const NvDsInferLayerInfo* mask_layer = find_layer_by_name(outputLayersInfo, "masks");
-  if (!label_layer || !mask_layer) {
-    if (outputLayersInfo.size() >= 2) {
-      label_layer = &outputLayersInfo[0];
-      mask_layer = &outputLayersInfo[1];
-    } else {
-      std::cerr << "[deimv2-wholebody49] expected label and mask outputs, got "
-                << outputLayersInfo.size() << std::endl;
-      return false;
-    }
-  }
-  if (!validate_float_layer(*label_layer, "label_xyxy_score")) return false;
-  if (!validate_float_layer(*mask_layer, "masks")) return false;
-
-  LabelDims label_dims{};
-  MaskDims mask_dims{};
-  if (!parse_label_dims(*label_layer, label_dims)) {
-    std::cerr << "[deimv2-wholebody49] unexpected label_xyxy_score dims" << std::endl;
+    std::vector<NvDsInferLayerInfo> const& output_layers,
+    NvDsInferNetworkInfo const& network_info,
+    NvDsInferParseDetectionParams const& detection_params,
+    std::vector<NvDsInferInstanceMaskInfo>& object_list) {
+  const NvDsInferLayerInfo* label_layer = nullptr;
+  const NvDsInferLayerInfo* mask_layer = nullptr;
+  if (!resolve_exact_layers(output_layers, true, label_layer, mask_layer) ||
+      !validate_float_layer(*label_layer, kLabelLayerName) ||
+      !validate_float_layer(*mask_layer, kMaskLayerName)) {
     return false;
   }
-  if (!parse_mask_dims(*mask_layer, mask_dims)) {
-    std::cerr << "[deimv2-wholebody49] unexpected masks dims" << std::endl;
-    return false;
+  if (!validate_label_dims(*label_layer)) {
+    return reject("label_xyxy_score must have exact callback shape [1240,6]");
+  }
+  if (!validate_mask_dims(*mask_layer)) {
+    return reject("masks must have exact callback shape [1240,80,80]");
+  }
+  if (!validate_network_info(network_info)) {
+    return reject("network dimensions must be positive");
   }
 
   const float* labels = static_cast<const float*>(label_layer->buffer);
   const float* masks = static_cast<const float*>(mask_layer->buffer);
-  const bool normalized_boxes = [&]() {
-    float max_coord = 0.0f;
-    const std::size_t sample_count = std::min<std::size_t>(label_dims.queries, 32);
-    for (std::size_t i = 0; i < sample_count; ++i) {
-      const std::size_t base = i * label_dims.channels;
-      max_coord = std::max(max_coord, std::fabs(labels[base + 1]));
-      max_coord = std::max(max_coord, std::fabs(labels[base + 2]));
-      max_coord = std::max(max_coord, std::fabs(labels[base + 3]));
-      max_coord = std::max(max_coord, std::fabs(labels[base + 4]));
-    }
-    return max_coord <= 2.0f;
-  }();
-
-  std::vector<Candidate> candidates;
-  candidates.reserve(label_dims.queries);
-  for (std::size_t i = 0; i < label_dims.queries; ++i) {
-    const std::size_t base = i * label_dims.channels;
-    const int class_id = static_cast<int>(std::round(labels[base + 0]));
-    const float score = labels[base + 5];
-    if (class_id < 0) continue;
-    if (detectionParams.numClassesConfigured > 0 &&
-        static_cast<unsigned int>(class_id) >= detectionParams.numClassesConfigured) {
-      continue;
-    }
-    if (score < threshold_for_class(detectionParams, class_id)) continue;
-    candidates.push_back({i, class_id, score, labels[base + 1], labels[base + 2], labels[base + 3], labels[base + 4]});
-  }
-
-  std::stable_sort(candidates.begin(), candidates.end(), [](const Candidate& a, const Candidate& b) {
-    return a.score > b.score;
-  });
-
-  objectList.clear();
-  objectList.reserve(candidates.size());
-  const std::size_t mask_plane_size = mask_dims.height * mask_dims.width;
-  for (const Candidate& candidate : candidates) {
-    if (candidate.class_id != kBodyClassId) {
-      continue;
-    }
-    if (candidate.query >= mask_dims.queries) {
-      continue;
-    }
-    NvDsInferInstanceMaskInfo obj{};
-    if (!set_bbox(candidate.x1, candidate.y1, candidate.x2, candidate.y2,
-                  normalized_boxes, networkInfo, obj)) {
-      continue;
-    }
-    const float* mask_src = masks + candidate.query * mask_plane_size;
-    if (!copy_mask_roi(mask_src, mask_dims, candidate.x1, candidate.y1, candidate.x2, candidate.y2,
-                       normalized_boxes, networkInfo, obj)) {
-      continue;
-    }
-    obj.classId = static_cast<unsigned int>(candidate.class_id);
-    obj.detectionConfidence = clamp(candidate.score, 0.0f, 1.0f);
-    objectList.emplace_back(obj);
-  }
-  return true;
-}
-
-CHECK_CUSTOM_INSTANCE_MASK_PARSE_FUNC_PROTOTYPE(NvDsInferParseDeimv2Wholebody49);
-
-extern "C" bool NvDsInferParseDeimv2Wholebody49Boxes(
-    std::vector<NvDsInferLayerInfo> const& outputLayersInfo,
-    NvDsInferNetworkInfo const& networkInfo,
-    NvDsInferParseDetectionParams const& detectionParams,
-    std::vector<NvDsInferObjectDetectionInfo>& objectList) {
-  const NvDsInferLayerInfo* label_layer = find_layer_by_name(outputLayersInfo, "label_xyxy_score");
-  if (!label_layer) {
-    if (!outputLayersInfo.empty()) {
-      label_layer = &outputLayersInfo[0];
-    } else {
-      std::cerr << "[deimv2-wholebody49] expected label output, got 0 layers" << std::endl;
-      return false;
-    }
-  }
-  if (!validate_float_layer(*label_layer, "label_xyxy_score")) return false;
-
-  LabelDims label_dims{};
-  if (!parse_label_dims(*label_layer, label_dims)) {
-    std::cerr << "[deimv2-wholebody49] unexpected label_xyxy_score dims" << std::endl;
+  std::array<Candidate, kQueryCount> candidates{};
+  std::size_t candidate_count = 0;
+  if (!collect_candidates(labels, detection_params, candidates,
+                          candidate_count)) {
     return false;
   }
 
+  std::vector<NvDsInferInstanceMaskInfo> parsed;
+  try {
+    parsed.reserve(candidate_count);
+  } catch (...) {
+    return reject("unable to reserve instance-mask results");
+  }
+  for (std::size_t index = 0; index < candidate_count; ++index) {
+    const Candidate& candidate = candidates[index];
+    if (candidate.class_id != kBodyClassId) {
+      continue;
+    }
+    NvDsInferInstanceMaskInfo object{};
+    if (!set_normalized_bbox(candidate, network_info, object)) {
+      continue;
+    }
+    MaskRoi mask;
+    if (!build_mask_roi(masks, candidate, mask)) {
+      release_mask_objects(parsed);
+      return false;
+    }
+    object.classId = static_cast<unsigned int>(kBodyClassId);
+    object.detectionConfidence = clamp(candidate.score, 0.0F, 1.0F);
+    object.mask = mask.values.get();
+    object.mask_width = mask.width;
+    object.mask_height = mask.height;
+    object.mask_size = mask.size_bytes;
+    try {
+      parsed.emplace_back(object);
+    } catch (...) {
+      release_mask_objects(parsed);
+      return reject("unable to append instance-mask result");
+    }
+    mask.values.release();
+  }
+  object_list = std::move(parsed);
+  return true;
+}
+
+CHECK_CUSTOM_INSTANCE_MASK_PARSE_FUNC_PROTOTYPE(
+    NvDsInferParseDeimv2Wholebody49);
+
+extern "C" bool NvDsInferParseDeimv2Wholebody49Boxes(
+    std::vector<NvDsInferLayerInfo> const& output_layers,
+    NvDsInferNetworkInfo const& network_info,
+    NvDsInferParseDetectionParams const& detection_params,
+    std::vector<NvDsInferObjectDetectionInfo>& object_list) {
+  const NvDsInferLayerInfo* label_layer = nullptr;
+  const NvDsInferLayerInfo* unused_mask_layer = nullptr;
+  if (!resolve_exact_layers(output_layers, false, label_layer,
+                            unused_mask_layer) ||
+      !validate_float_layer(*label_layer, kLabelLayerName)) {
+    return false;
+  }
+  if (!validate_label_dims(*label_layer)) {
+    return reject("label_xyxy_score must have exact callback shape [1240,6]");
+  }
+  if (!validate_network_info(network_info)) {
+    return reject("network dimensions must be positive");
+  }
+
   const float* labels = static_cast<const float*>(label_layer->buffer);
-  const bool normalized_boxes = [&]() {
-    float max_coord = 0.0f;
-    const std::size_t sample_count = std::min<std::size_t>(label_dims.queries, 32);
-    for (std::size_t i = 0; i < sample_count; ++i) {
-      const std::size_t base = i * label_dims.channels;
-      max_coord = std::max(max_coord, std::fabs(labels[base + 1]));
-      max_coord = std::max(max_coord, std::fabs(labels[base + 2]));
-      max_coord = std::max(max_coord, std::fabs(labels[base + 3]));
-      max_coord = std::max(max_coord, std::fabs(labels[base + 4]));
-    }
-    return max_coord <= 2.0f;
-  }();
-
-  std::vector<Candidate> candidates;
-  candidates.reserve(label_dims.queries);
-  for (std::size_t i = 0; i < label_dims.queries; ++i) {
-    const std::size_t base = i * label_dims.channels;
-    const int class_id = static_cast<int>(std::round(labels[base + 0]));
-    const float score = labels[base + 5];
-    if (class_id != kBodyClassId) continue;
-    if (detectionParams.numClassesConfigured > 0 &&
-        static_cast<unsigned int>(class_id) >= detectionParams.numClassesConfigured) {
-      continue;
-    }
-    if (score < threshold_for_class(detectionParams, class_id)) continue;
-    candidates.push_back({i, class_id, score, labels[base + 1], labels[base + 2], labels[base + 3], labels[base + 4]});
+  std::array<Candidate, kQueryCount> candidates{};
+  std::size_t candidate_count = 0;
+  if (!collect_candidates(labels, detection_params, candidates,
+                          candidate_count)) {
+    return false;
   }
 
-  std::stable_sort(candidates.begin(), candidates.end(), [](const Candidate& a, const Candidate& b) {
-    return a.score > b.score;
-  });
-
-  objectList.clear();
-  objectList.reserve(candidates.size());
-  for (const Candidate& candidate : candidates) {
-    NvDsInferObjectDetectionInfo obj{};
-    if (!set_detection_bbox(candidate.x1, candidate.y1, candidate.x2, candidate.y2,
-                            normalized_boxes, networkInfo, obj)) {
+  std::vector<NvDsInferObjectDetectionInfo> parsed;
+  try {
+    parsed.reserve(candidate_count);
+  } catch (...) {
+    return reject("unable to reserve bbox results");
+  }
+  for (std::size_t index = 0; index < candidate_count; ++index) {
+    const Candidate& candidate = candidates[index];
+    if (candidate.class_id != kBodyClassId) {
       continue;
     }
-    obj.classId = static_cast<unsigned int>(candidate.class_id);
-    obj.detectionConfidence = clamp(candidate.score, 0.0f, 1.0f);
-    objectList.emplace_back(obj);
+    NvDsInferObjectDetectionInfo object{};
+    if (!set_normalized_bbox(candidate, network_info, object)) {
+      continue;
+    }
+    object.classId = static_cast<unsigned int>(kBodyClassId);
+    object.detectionConfidence = clamp(candidate.score, 0.0F, 1.0F);
+    try {
+      parsed.emplace_back(object);
+    } catch (...) {
+      return reject("unable to append bbox result");
+    }
   }
+  object_list = std::move(parsed);
   return true;
 }
 

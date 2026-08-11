@@ -19,6 +19,30 @@ from noesis.telemetry.person_ground_state import HumanGroundConfig, commit_path_
 logger = logging.getLogger(__name__)
 
 
+def _broadcast_json_with_response_timing(
+    ws_server: Any,
+    payload: Dict[str, Any],
+    started_ns: int,
+) -> Any:
+    broadcast = getattr(ws_server, "broadcast_bev_sync", None)
+    if not callable(broadcast):
+        raise RuntimeError("dedicated BEV websocket broadcaster is unavailable")
+    timer = getattr(ws_server, "response_model_timing_since", None)
+    if not callable(timer):
+        raise RuntimeError("BEV response-model boundary timer is unavailable")
+    receipt = broadcast(payload, response_model_timing=timer(started_ns))
+    submission_id = getattr(receipt, "submission_id", None)
+    message_count = getattr(receipt, "message_count", None)
+    if (
+        isinstance(submission_id, bool)
+        or not isinstance(submission_id, int)
+        or submission_id <= 0
+        or message_count != 1
+    ):
+        raise RuntimeError("BEV boundary returned an invalid admission receipt")
+    return receipt
+
+
 @dataclass(frozen=True)
 class CalibrationSnapshot:
     camera_id: str
@@ -50,8 +74,122 @@ class FloorplanSpace:
     units: Optional[str] = None
     snapshot_ts_us: Optional[int] = None
     floorplan_ts_us: Optional[int] = None
+    snapshot_id: Optional[str] = None
+    snapshot_content_sha256: Optional[str] = None
+    calibration_fingerprint: Optional[str] = None
     ray_to_floorplan_alignment: Optional[Mapping[str, Any]] = None
     source: str = "active_floorplan"
+
+
+@dataclass(frozen=True)
+class CoverageRegion:
+    region_id: str
+    polygon_xz_m: Tuple[Tuple[float, float], ...]
+    x_range: Tuple[float, float]
+    z_range: Tuple[float, float]
+
+
+@dataclass(frozen=True)
+class CoverageEnvelope:
+    camera_id: str
+    boundary_tolerance_m: float
+    regions: Tuple[CoverageRegion, ...]
+    x_range: Tuple[float, float]
+    z_range: Tuple[float, float]
+    contract: str = "noesis.bev.coverage_envelopes"
+    contract_version: int = 1
+    frame: str = "camera_local_ground_m"
+    units: str = "meters"
+
+
+class BevRenderFailure(RuntimeError):
+    """Structured BEV failure forwarded into runtime capability health."""
+
+    def __init__(
+        self,
+        *,
+        camera_id: str,
+        stage: str,
+        timestamp_us: int,
+        cause: BaseException,
+    ) -> None:
+        self.camera_id = str(camera_id)
+        self.stage = str(stage)
+        self.timestamp_us = int(timestamp_us)
+        self.cause_type = type(cause).__name__
+        super().__init__(
+            f"BEV {self.stage} failed for {self.camera_id}: "
+            f"{self.cause_type}: {cause}"
+        )
+
+
+@dataclass(frozen=True)
+class BevPublicationReceipt:
+    """Truthful result of one BEV publication attempt."""
+
+    status: str
+    camera_id: str
+    source_id: Optional[int]
+    frame_id: Optional[int]
+    observed_at_us: Optional[int]
+    tracking_publication_sequence: Optional[int]
+    tracking_outbound_submission_id: Optional[int]
+    outbound_submission_id: Optional[int] = None
+    failure: Optional[BevRenderFailure] = None
+
+    def __post_init__(self) -> None:
+        if self.status not in {"admitted", "startup_pending", "failed"}:
+            raise ValueError("invalid BEV publication status")
+        if self.status == "admitted":
+            if (
+                isinstance(self.outbound_submission_id, bool)
+                or not isinstance(self.outbound_submission_id, int)
+                or self.outbound_submission_id <= 0
+                or self.failure is not None
+            ):
+                raise ValueError("admitted BEV receipt is incomplete")
+        elif self.outbound_submission_id is not None:
+            raise ValueError("non-admitted BEV receipt has a submission id")
+        if self.status == "failed" and self.failure is None:
+            raise ValueError("failed BEV receipt requires a failure")
+        if self.status != "failed" and self.failure is not None:
+            raise ValueError("non-failed BEV receipt cannot carry a failure")
+        for name, value, minimum in (
+            ("source_id", self.source_id, 0),
+            ("frame_id", self.frame_id, 0),
+            ("observed_at_us", self.observed_at_us, 1),
+            (
+                "tracking_publication_sequence",
+                self.tracking_publication_sequence,
+                0,
+            ),
+            (
+                "tracking_outbound_submission_id",
+                self.tracking_outbound_submission_id,
+                1,
+            ),
+        ):
+            if value is not None and (
+                isinstance(value, bool)
+                or not isinstance(value, int)
+                or value < minimum
+            ):
+                raise ValueError(f"invalid BEV receipt {name}")
+        paired_values = (
+            self.tracking_publication_sequence,
+            self.tracking_outbound_submission_id,
+        )
+        if any(value is None for value in paired_values) and any(
+            value is not None for value in paired_values
+        ):
+            raise ValueError("BEV receipt tracking admission evidence is partial")
+        if (
+            self.status == "admitted"
+            and self.tracking_outbound_submission_id is not None
+            and int(self.outbound_submission_id or 0)
+            <= int(self.tracking_outbound_submission_id)
+        ):
+            raise ValueError("BEV admission must follow tracking admission")
 
 
 @dataclass
@@ -74,6 +212,8 @@ class Footpoint:
     motion_mode: Optional[str] = None
     posture: Optional[str] = None
     trail_append_allowed: Optional[bool] = None
+    trail_break_required: Optional[bool] = None
+    trail_segment_id: Optional[int] = None
     idle_jitter_m: Optional[float] = None
     debug: Dict[str, Any] = field(default_factory=dict)
 
@@ -173,6 +313,7 @@ class _BevTrailTrackState:
     ema_x: Optional[float] = None
     ema_z: Optional[float] = None
     ema_ts: float = 0.0
+    trail_segment_id: Optional[int] = None
 
 
 @dataclass
@@ -183,11 +324,15 @@ class BevResult:
     backend_trails: List[Dict[str, Any]]
     config: BevConfig
     timestamp_us: int
+    source_id: Optional[int]
+    frame_id: Optional[int]
+    observed_at_us: Optional[int]
     width_px: int
     height_px: int
     points_smoothed: bool = False
     bounds_source: str = "config"
     floorplan_space: Optional[FloorplanSpace] = None
+    coverage_envelope: Optional[CoverageEnvelope] = None
     dropped_footpoints: List[Dict[str, Any]] = field(default_factory=list)
 
 
@@ -252,14 +397,21 @@ class BevRenderer:
         frame: str = "menon_scene",
         depth_sampler: Optional[Callable[[str, float, float, int], Optional[Mapping[str, Any]]]] = None,
         floorplan_bounds_provider: Optional[Callable[[str], Optional[Mapping[str, Any]]]] = None,
+        coverage_envelopes_cfg: Optional[Mapping[str, Any]] = None,
+        failure_callback: Optional[Callable[[BaseException], None]] = None,
     ) -> None:
         self.ws = ws_server
         self._lock = threading.Lock()
         self.config_per_cam: Dict[str, BevConfig] = {}
         self.h_cache = HomographyCache()
         self._frame_mode = self._normalize_frame_mode(frame)
-        # Last known good homography per camera for resilience
-        self._last_h_by_cam: Dict[str, np.ndarray] = {}
+        self._coverage_envelopes = self._parse_coverage_envelopes(
+            coverage_envelopes_cfg
+        )
+        if self._coverage_envelopes and self._frame_mode != "camera_local":
+            raise ValueError(
+                "BEV coverage envelopes require camera_local_ground_m"
+            )
         # Auto-computed extents per camera
         self._auto_extents_by_camera: Dict[str, Tuple[Tuple[float, float], Tuple[float, float]]] = {}
         # Image axis flip cache (per camera/extrinsics) for BEV homography alignment.
@@ -297,8 +449,50 @@ class BevRenderer:
         # Keep this sampler available only for explicit alignment diagnostics.
         self._depth_sampler = depth_sampler if self._alignment_debug_enabled else None
         self._floorplan_bounds_provider = floorplan_bounds_provider
+        self._failure_callback = failure_callback
+        self._health_by_camera: Dict[str, Dict[str, Any]] = {}
+        self._floorplan_authority_ready_cameras: set[str] = set()
         # JPEG BEV binary delivery retired (meta-only mode is the supported baseline per design decisions + contracts).
         # The flag/env plumbing remains in the runtime for transition but is ignored here.
+
+    @staticmethod
+    def _publication_receipt(
+        *,
+        status: str,
+        camera_id: str,
+        source_id: Optional[int],
+        frame_id: Optional[int],
+        observed_at_us: Optional[int],
+        tracking_publication_sequence: Optional[int],
+        tracking_outbound_submission_id: Optional[int],
+        outbound_submission_id: Optional[int] = None,
+        failure: Optional[BevRenderFailure] = None,
+    ) -> BevPublicationReceipt:
+        return BevPublicationReceipt(
+            status=status,
+            camera_id=str(camera_id),
+            source_id=(int(source_id) if source_id is not None else None),
+            frame_id=(int(frame_id) if frame_id is not None else None),
+            observed_at_us=(
+                int(observed_at_us) if observed_at_us is not None else None
+            ),
+            tracking_publication_sequence=(
+                int(tracking_publication_sequence)
+                if tracking_publication_sequence is not None
+                else None
+            ),
+            tracking_outbound_submission_id=(
+                int(tracking_outbound_submission_id)
+                if tracking_outbound_submission_id is not None
+                else None
+            ),
+            outbound_submission_id=(
+                int(outbound_submission_id)
+                if outbound_submission_id is not None
+                else None
+            ),
+            failure=failure,
+        )
 
     def set_trails_enabled(self, enabled: bool) -> None:
         with self._lock:
@@ -315,6 +509,7 @@ class BevRenderer:
         x_range: Tuple[float, float],
         z_range: Tuple[float, float],
         floorplan_space: Optional[FloorplanSpace],
+        coverage_envelope: Optional[CoverageEnvelope],
     ) -> Tuple[Any, ...]:
         if floorplan_space is None:
             return (
@@ -327,17 +522,38 @@ class BevRenderer:
                 None,
                 None,
                 None,
+                None,
             )
         return (
             str(bounds_source or floorplan_space.source or "active_floorplan"),
-            round(float(floorplan_space.x_range[0]), 6),
-            round(float(floorplan_space.x_range[1]), 6),
-            round(float(floorplan_space.z_range[0]), 6),
-            round(float(floorplan_space.z_range[1]), 6),
+            round(float(x_range[0]), 6),
+            round(float(x_range[1]), 6),
+            round(float(z_range[0]), 6),
+            round(float(z_range[1]), 6),
             tuple(int(v) for v in floorplan_space.grid_shape) if floorplan_space.grid_shape else None,
             str(floorplan_space.frame or ""),
             int(floorplan_space.snapshot_ts_us) if floorplan_space.snapshot_ts_us is not None else None,
             int(floorplan_space.floorplan_ts_us) if floorplan_space.floorplan_ts_us is not None else None,
+            (
+                (
+                    round(float(coverage_envelope.boundary_tolerance_m), 6),
+                    tuple(
+                        (
+                            region.region_id,
+                            tuple(
+                                (
+                                    round(float(point[0]), 6),
+                                    round(float(point[1]), 6),
+                                )
+                                for point in region.polygon_xz_m
+                            ),
+                        )
+                        for region in coverage_envelope.regions
+                    ),
+                )
+                if coverage_envelope is not None
+                else None
+            ),
         )
 
     def _reset_camera_motion_state_locked(self, camera_id: str) -> None:
@@ -347,6 +563,415 @@ class BevRenderer:
             if isinstance(key, tuple) and key and key[0] == camera_id:
                 self._smoother.reset(key)
                 self._smoother_source_by_key.pop(key, None)
+
+    def _record_failure(
+        self,
+        camera_id: str,
+        *,
+        stage: str,
+        timestamp_us: int,
+        cause: BaseException,
+    ) -> BevRenderFailure:
+        failure = BevRenderFailure(
+            camera_id=str(camera_id),
+            stage=str(stage),
+            timestamp_us=int(timestamp_us),
+            cause=cause,
+        )
+        with self._lock:
+            previous = self._health_by_camera.get(str(camera_id), {})
+            authority_was_ready = (
+                str(camera_id) in self._floorplan_authority_ready_cameras
+            )
+            authority_required = bool(
+                self._frame_mode != "world"
+                and self._floorplan_bounds_provider is not None
+            )
+            previous_authority_state = previous.get(
+                "floorplan_authority_state"
+            )
+            if not authority_required:
+                authority_state = "not_required"
+            elif str(stage) == "active_floorplan":
+                authority_state = "lost" if authority_was_ready else "failed"
+            elif authority_was_ready:
+                authority_state = "ready"
+            elif isinstance(previous_authority_state, str):
+                authority_state = previous_authority_state
+            else:
+                authority_state = "not_established"
+            self._health_by_camera[str(camera_id)] = {
+                "healthy": False,
+                "success_count": int(previous.get("success_count", 0) or 0),
+                "failure_count": int(previous.get("failure_count", 0) or 0) + 1,
+                "last_success_ts_us": previous.get("last_success_ts_us"),
+                "last_failure_ts_us": int(timestamp_us),
+                "last_failure_stage": str(stage),
+                "last_failure_type": failure.cause_type,
+                "floorplan_authority_state": authority_state,
+            }
+        callback = self._failure_callback
+        if callback is not None:
+            try:
+                callback(failure)
+            except Exception:
+                logger.exception("BEV failure callback failed for %s", camera_id)
+        return failure
+
+    def _record_floorplan_authority_pending(
+        self,
+        camera_id: str,
+        *,
+        timestamp_us: int,
+    ) -> bool:
+        """Record the pre-authority startup state without inventing BEV output."""
+
+        camera_key = str(camera_id)
+        with self._lock:
+            previous = self._health_by_camera.get(camera_key, {})
+            if (
+                camera_key in self._floorplan_authority_ready_cameras
+                or bool(previous.get("failure_count", 0))
+                or previous.get("healthy") is False
+            ):
+                return False
+            pending_since = previous.get("floorplan_authority_pending_since_ts_us")
+            if not isinstance(pending_since, int) or pending_since <= 0:
+                pending_since = int(timestamp_us)
+            self._health_by_camera[camera_key] = {
+                "healthy": True,
+                "success_count": 0,
+                "failure_count": 0,
+                "last_success_ts_us": None,
+                "last_failure_ts_us": None,
+                "last_failure_stage": None,
+                "last_failure_type": None,
+                "floorplan_authority_state": "startup_pending",
+                "floorplan_authority_pending_since_ts_us": pending_since,
+                "last_floorplan_authority_pending_ts_us": int(timestamp_us),
+            }
+            return True
+
+    def _record_floorplan_authority_ready(
+        self,
+        camera_id: str,
+        *,
+        timestamp_us: int,
+    ) -> None:
+        camera_key = str(camera_id)
+        with self._lock:
+            self._floorplan_authority_ready_cameras.add(camera_key)
+            previous = self._health_by_camera.get(camera_key)
+            if previous is not None:
+                row = dict(previous)
+                row["floorplan_authority_state"] = "ready"
+                row["last_floorplan_authority_ready_ts_us"] = int(timestamp_us)
+                self._health_by_camera[camera_key] = row
+
+    def record_input_failure(
+        self,
+        camera_id: str,
+        *,
+        stage: str,
+        timestamp_us: int,
+        cause: BaseException,
+    ) -> BevRenderFailure:
+        """Record a producer-side failure before rendering can begin.
+
+        Runtime hooks use this public boundary for calibration/configuration
+        failures that occur before :meth:`render_and_publish` owns the frame.
+        This keeps an attempted-but-failed camera distinguishable from a camera
+        that has not produced an input frame yet.
+        """
+
+        camera_key = str(camera_id or "").strip()
+        stage_key = str(stage or "").strip()
+        if not camera_key:
+            raise ValueError("BEV input failure camera_id must be non-empty")
+        if not stage_key:
+            raise ValueError("BEV input failure stage must be non-empty")
+        if not isinstance(cause, BaseException):
+            raise TypeError("BEV input failure cause must be an exception")
+        return self._record_failure(
+            camera_key,
+            stage=stage_key,
+            timestamp_us=max(1, int(timestamp_us)),
+            cause=cause,
+        )
+
+    def _record_success(self, camera_id: str, *, timestamp_us: int) -> None:
+        with self._lock:
+            previous = self._health_by_camera.get(str(camera_id), {})
+            authority_state = (
+                "ready"
+                if str(camera_id) in self._floorplan_authority_ready_cameras
+                else "not_required"
+            )
+            self._health_by_camera[str(camera_id)] = {
+                "healthy": True,
+                "success_count": int(previous.get("success_count", 0) or 0) + 1,
+                "failure_count": int(previous.get("failure_count", 0) or 0),
+                "last_success_ts_us": int(timestamp_us),
+                "last_failure_ts_us": previous.get("last_failure_ts_us"),
+                "last_failure_stage": previous.get("last_failure_stage"),
+                "last_failure_type": previous.get("last_failure_type"),
+                "floorplan_authority_state": authority_state,
+            }
+
+    def health_snapshot(self, camera_id: Optional[str] = None) -> Dict[str, Any]:
+        """Return renderer readiness separately from occupied render activity."""
+        with self._lock:
+            if camera_id is None:
+                cameras = {
+                    key: dict(value)
+                    for key, value in sorted(self._health_by_camera.items())
+                }
+            else:
+                key = str(camera_id)
+                cameras = (
+                    {key: dict(self._health_by_camera[key])}
+                    if key in self._health_by_camera
+                    else {}
+                )
+            authority_ready = sorted(
+                key
+                for key in cameras
+                if key in self._floorplan_authority_ready_cameras
+            )
+        failed = sorted(
+            key for key, value in cameras.items() if not bool(value.get("healthy"))
+        )
+        active = sorted(
+            key
+            for key, value in cameras.items()
+            if bool(value.get("healthy"))
+            and int(value.get("success_count", 0) or 0) > 0
+        )
+        authority_pending = sorted(
+            key
+            for key, value in cameras.items()
+            if value.get("floorplan_authority_state") == "startup_pending"
+        )
+        return {
+            "contract": "noesis.bev.health",
+            "contract_version": 2,
+            "healthy": not failed,
+            "renderer_ready": not failed,
+            "rendering_active": bool(active),
+            "active_camera_count": len(active),
+            "failed_camera_count": len(failed),
+            "failed_cameras": failed,
+            "floorplan_authority_ready_camera_count": len(authority_ready),
+            "floorplan_authority_ready_cameras": authority_ready,
+            "floorplan_authority_pending_camera_count": len(authority_pending),
+            "floorplan_authority_pending_cameras": authority_pending,
+            "cameras": cameras,
+        }
+
+    @staticmethod
+    def _parse_coverage_envelopes(
+        payload: Optional[Mapping[str, Any]],
+    ) -> Dict[str, CoverageEnvelope]:
+        if payload is None:
+            return {}
+        if not isinstance(payload, Mapping):
+            raise ValueError("BEV coverage_envelopes must be an object")
+        if not payload:
+            return {}
+
+        expected_keys = {
+            "contract",
+            "contract_version",
+            "frame",
+            "units",
+            "cameras",
+        }
+        unexpected = set(payload) - expected_keys
+        missing = expected_keys - set(payload)
+        if unexpected or missing:
+            raise ValueError(
+                "BEV coverage_envelopes keys are invalid "
+                f"(missing={sorted(missing)}, unexpected={sorted(unexpected)})"
+            )
+        if payload.get("contract") != "noesis.bev.coverage_envelopes":
+            raise ValueError("BEV coverage_envelopes contract is invalid")
+        contract_version = payload.get("contract_version")
+        if (
+            isinstance(contract_version, bool)
+            or not isinstance(contract_version, int)
+            or contract_version != 1
+        ):
+            raise ValueError("BEV coverage_envelopes contract_version must be 1")
+        if payload.get("frame") != "camera_local_ground_m":
+            raise ValueError(
+                "BEV coverage_envelopes frame must be camera_local_ground_m"
+            )
+        if payload.get("units") != "meters":
+            raise ValueError("BEV coverage_envelopes units must be meters")
+
+        raw_cameras = payload.get("cameras")
+        if not isinstance(raw_cameras, Mapping) or not raw_cameras:
+            raise ValueError("BEV coverage_envelopes cameras must be non-empty")
+        if len(raw_cameras) > 32:
+            raise ValueError("BEV coverage_envelopes has too many cameras")
+
+        parsed: Dict[str, CoverageEnvelope] = {}
+        for raw_camera_id, raw_camera in raw_cameras.items():
+            if not isinstance(raw_camera_id, str):
+                raise ValueError("BEV coverage envelope camera id must be text")
+            camera_id = raw_camera_id.strip()
+            if not camera_id or camera_id != raw_camera_id or len(camera_id) > 128:
+                raise ValueError("BEV coverage envelope camera id is invalid")
+            if not isinstance(raw_camera, Mapping):
+                raise ValueError(
+                    f"BEV coverage envelope for {camera_id} must be an object"
+                )
+            camera_expected_keys = {"boundary_tolerance_m", "regions"}
+            camera_unexpected = set(raw_camera) - camera_expected_keys
+            camera_missing = camera_expected_keys - set(raw_camera)
+            if camera_unexpected or camera_missing:
+                raise ValueError(
+                    f"BEV coverage envelope keys for {camera_id} are invalid "
+                    f"(missing={sorted(camera_missing)}, "
+                    f"unexpected={sorted(camera_unexpected)})"
+                )
+            raw_tolerance = raw_camera.get("boundary_tolerance_m")
+            if isinstance(raw_tolerance, bool):
+                raise ValueError(
+                    f"BEV coverage envelope tolerance for {camera_id} is invalid"
+                )
+            try:
+                boundary_tolerance_m = float(raw_tolerance)
+            except Exception as exc:
+                raise ValueError(
+                    f"BEV coverage envelope tolerance for {camera_id} is invalid"
+                ) from exc
+            if (
+                not math.isfinite(boundary_tolerance_m)
+                or boundary_tolerance_m < 0.0
+                or boundary_tolerance_m > 2.0
+            ):
+                raise ValueError(
+                    f"BEV coverage envelope tolerance for {camera_id} "
+                    "must be within 0..2 meters"
+                )
+
+            raw_regions = raw_camera.get("regions")
+            if (
+                not isinstance(raw_regions, (list, tuple))
+                or not raw_regions
+                or len(raw_regions) > 16
+            ):
+                raise ValueError(
+                    f"BEV coverage envelope regions for {camera_id} are invalid"
+                )
+            regions: List[CoverageRegion] = []
+            region_ids: set[str] = set()
+            for raw_region in raw_regions:
+                if not isinstance(raw_region, Mapping):
+                    raise ValueError(
+                        f"BEV coverage region for {camera_id} must be an object"
+                    )
+                if set(raw_region) != {"id", "polygon_xz_m"}:
+                    raise ValueError(
+                        f"BEV coverage region keys for {camera_id} are invalid"
+                    )
+                raw_region_id = raw_region.get("id")
+                if not isinstance(raw_region_id, str):
+                    raise ValueError(
+                        f"BEV coverage region id for {camera_id} must be text"
+                    )
+                region_id = raw_region_id.strip()
+                if (
+                    not region_id
+                    or region_id != raw_region_id
+                    or len(region_id) > 64
+                    or region_id in region_ids
+                ):
+                    raise ValueError(
+                        f"BEV coverage region id for {camera_id} is invalid"
+                    )
+                raw_polygon = raw_region.get("polygon_xz_m")
+                if (
+                    not isinstance(raw_polygon, (list, tuple))
+                    or not 3 <= len(raw_polygon) <= 64
+                ):
+                    raise ValueError(
+                        f"BEV coverage polygon {camera_id}/{region_id} is invalid"
+                    )
+                polygon: List[Tuple[float, float]] = []
+                for raw_point in raw_polygon:
+                    if (
+                        not isinstance(raw_point, (list, tuple))
+                        or len(raw_point) != 2
+                        or isinstance(raw_point[0], bool)
+                        or isinstance(raw_point[1], bool)
+                    ):
+                        raise ValueError(
+                            f"BEV coverage point {camera_id}/{region_id} is invalid"
+                        )
+                    try:
+                        x = float(raw_point[0])
+                        z = float(raw_point[1])
+                    except Exception as exc:
+                        raise ValueError(
+                            f"BEV coverage point {camera_id}/{region_id} is invalid"
+                        ) from exc
+                    if (
+                        not math.isfinite(x)
+                        or not math.isfinite(z)
+                        or abs(x) > 1000.0
+                        or abs(z) > 1000.0
+                    ):
+                        raise ValueError(
+                            f"BEV coverage point {camera_id}/{region_id} is invalid"
+                        )
+                    polygon.append((x, z))
+                if len(set(polygon)) < 3:
+                    raise ValueError(
+                        f"BEV coverage polygon {camera_id}/{region_id} "
+                        "must have three distinct points"
+                    )
+                signed_area_twice = sum(
+                    polygon[index][0] * polygon[(index + 1) % len(polygon)][1]
+                    - polygon[(index + 1) % len(polygon)][0] * polygon[index][1]
+                    for index in range(len(polygon))
+                )
+                if abs(float(signed_area_twice)) <= 1e-6:
+                    raise ValueError(
+                        f"BEV coverage polygon {camera_id}/{region_id} "
+                        "must have non-zero area"
+                    )
+                region_ids.add(region_id)
+                regions.append(
+                    CoverageRegion(
+                        region_id=region_id,
+                        polygon_xz_m=tuple(polygon),
+                        x_range=(
+                            min(point[0] for point in polygon),
+                            max(point[0] for point in polygon),
+                        ),
+                        z_range=(
+                            min(point[1] for point in polygon),
+                            max(point[1] for point in polygon),
+                        ),
+                    )
+                )
+
+            parsed[camera_id] = CoverageEnvelope(
+                camera_id=camera_id,
+                boundary_tolerance_m=float(boundary_tolerance_m),
+                regions=tuple(regions),
+                x_range=(
+                    min(region.x_range[0] for region in regions),
+                    max(region.x_range[1] for region in regions),
+                ),
+                z_range=(
+                    min(region.z_range[0] for region in regions),
+                    max(region.z_range[1] for region in regions),
+                ),
+            )
+        return parsed
 
     @staticmethod
     def _normalize_frame_mode(value: Any) -> str:
@@ -408,60 +1033,93 @@ class BevRenderer:
             return None
         try:
             bounds_payload = provider(str(camera_id))
-        except Exception:
-            logger.debug("BEV: active floorplan bounds provider failed for %s", camera_id, exc_info=True)
+        except Exception as exc:
+            raise RuntimeError(
+                f"active floorplan provider failed for {camera_id}"
+            ) from exc
+        if bounds_payload is None:
             return None
         if not isinstance(bounds_payload, Mapping):
-            return None
-        raw_bounds = bounds_payload.get("bounds") if isinstance(bounds_payload.get("bounds"), Mapping) else bounds_payload
+            raise ValueError("active floorplan provider result must be an object")
+        raw_bounds = bounds_payload.get("bounds")
         if not isinstance(raw_bounds, Mapping):
-            return None
+            raise ValueError("active floorplan bounds are missing")
         try:
             x_min = float(raw_bounds.get("min_x"))
             x_max = float(raw_bounds.get("max_x"))
             z_min = float(raw_bounds.get("min_z"))
             z_max = float(raw_bounds.get("max_z"))
-        except Exception:
-            return None
+        except Exception as exc:
+            raise ValueError("active floorplan bounds are invalid") from exc
         if not all(math.isfinite(v) for v in (x_min, x_max, z_min, z_max)):
-            return None
+            raise ValueError("active floorplan bounds must be finite")
         if x_max <= x_min or z_max <= z_min:
-            return None
+            raise ValueError("active floorplan bounds must have positive extents")
         grid_shape = self._parse_grid_shape(bounds_payload)
-        grid_res_m: Optional[float] = None
+        if grid_shape is None:
+            raise ValueError("active floorplan grid shape is invalid")
         try:
             raw_grid_res = bounds_payload.get("grid_res_m", bounds_payload.get("gridResM"))
             parsed_grid_res = float(raw_grid_res)
-            if math.isfinite(parsed_grid_res) and parsed_grid_res > 0.0:
-                grid_res_m = float(parsed_grid_res)
-        except Exception:
-            grid_res_m = None
+        except Exception as exc:
+            raise ValueError("active floorplan grid resolution is invalid") from exc
+        if not math.isfinite(parsed_grid_res) or parsed_grid_res <= 0.0:
+            raise ValueError("active floorplan grid resolution must be finite and positive")
+        grid_res_m = float(parsed_grid_res)
 
-        def _optional_int(name: str) -> Optional[int]:
-            try:
-                value = bounds_payload.get(name)
-                if value is None:
-                    return None
-                parsed = int(value)
-                return parsed if parsed > 0 else None
-            except Exception:
-                return None
+        def _required_positive_int(name: str) -> int:
+            value = bounds_payload.get(name)
+            if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+                raise ValueError(f"active floorplan {name} must be a positive integer")
+            return int(value)
+
+        def _required_text(name: str) -> str:
+            value = bounds_payload.get(name)
+            if not isinstance(value, str) or not value.strip():
+                raise ValueError(f"active floorplan {name} is required")
+            return value.strip()
+
+        def _required_sha256(name: str) -> str:
+            value = _required_text(name)
+            if len(value) != 64 or any(char not in "0123456789abcdef" for char in value):
+                raise ValueError(f"active floorplan {name} must be lowercase SHA-256")
+            return value
+
+        if _required_text("camera_id") != str(camera_id):
+            raise ValueError("active floorplan camera identity does not match request")
+        frame = _required_text("frame")
+        units = _required_text("units")
+        if frame != "camera_local_ground_m" or units != "meters":
+            raise ValueError("active floorplan frame/units contract is invalid")
+        snapshot_ts_us = _required_positive_int("snapshot_ts_us")
+        floorplan_ts_us = _required_positive_int("floorplan_ts_us")
+        if floorplan_ts_us < snapshot_ts_us:
+            raise ValueError("active floorplan predates its source snapshot")
+        snapshot_id = _required_text("snapshot_id")
+        snapshot_content_sha256 = _required_sha256("snapshot_content_sha256")
+        calibration_fingerprint = _required_sha256("calibration_fingerprint")
+        source = str(bounds_payload.get("source") or "").strip()
+        if source != "active_floorplan":
+            raise ValueError("active floorplan source identity is invalid")
 
         return FloorplanSpace(
             x_range=(float(x_min), float(x_max)),
             z_range=(float(z_min), float(z_max)),
             grid_shape=grid_shape,
             grid_res_m=grid_res_m,
-            frame=str(bounds_payload.get("frame") or "") or None,
-            units=str(bounds_payload.get("units") or "") or None,
-            snapshot_ts_us=_optional_int("snapshot_ts_us"),
-            floorplan_ts_us=_optional_int("floorplan_ts_us"),
+            frame=frame,
+            units=units,
+            snapshot_ts_us=snapshot_ts_us,
+            floorplan_ts_us=floorplan_ts_us,
+            snapshot_id=snapshot_id,
+            snapshot_content_sha256=snapshot_content_sha256,
+            calibration_fingerprint=calibration_fingerprint,
             ray_to_floorplan_alignment=(
                 dict(bounds_payload.get("ray_to_floorplan_alignment"))
                 if isinstance(bounds_payload.get("ray_to_floorplan_alignment"), Mapping)
                 else None
             ),
-            source=str(bounds_payload.get("source") or "active_floorplan"),
+            source=source,
         )
 
     @staticmethod
@@ -573,6 +1231,177 @@ class BevRenderer:
         return float(local[0]), float(local[1]), sample
 
     @staticmethod
+    def _point_segment_distance_m(
+        x: float,
+        z: float,
+        ax: float,
+        az: float,
+        bx: float,
+        bz: float,
+    ) -> float:
+        dx = float(bx) - float(ax)
+        dz = float(bz) - float(az)
+        denom = dx * dx + dz * dz
+        if denom <= 1e-18:
+            return float(math.hypot(float(x) - float(ax), float(z) - float(az)))
+        t = (
+            (float(x) - float(ax)) * dx
+            + (float(z) - float(az)) * dz
+        ) / denom
+        t = min(1.0, max(0.0, t))
+        nearest_x = float(ax) + t * dx
+        nearest_z = float(az) + t * dz
+        return float(math.hypot(float(x) - nearest_x, float(z) - nearest_z))
+
+    @classmethod
+    def _point_in_coverage_region(
+        cls,
+        x: float,
+        z: float,
+        region: CoverageRegion,
+        *,
+        boundary_tolerance_m: float,
+    ) -> bool:
+        if not math.isfinite(float(x)) or not math.isfinite(float(z)):
+            return False
+        tolerance = max(0.0, float(boundary_tolerance_m))
+        if (
+            float(x) < float(region.x_range[0]) - tolerance
+            or float(x) > float(region.x_range[1]) + tolerance
+            or float(z) < float(region.z_range[0]) - tolerance
+            or float(z) > float(region.z_range[1]) + tolerance
+        ):
+            return False
+
+        polygon = region.polygon_xz_m
+        edge_tolerance = max(1e-9, tolerance)
+        for index, (ax, az) in enumerate(polygon):
+            bx, bz = polygon[(index + 1) % len(polygon)]
+            if (
+                cls._point_segment_distance_m(
+                    float(x),
+                    float(z),
+                    float(ax),
+                    float(az),
+                    float(bx),
+                    float(bz),
+                )
+                <= edge_tolerance
+            ):
+                return True
+
+        inside = False
+        previous_x, previous_z = polygon[-1]
+        for current_x, current_z in polygon:
+            crosses = (float(current_z) > float(z)) != (
+                float(previous_z) > float(z)
+            )
+            if crosses:
+                intersection_x = float(current_x) + (
+                    (float(z) - float(current_z))
+                    * (float(previous_x) - float(current_x))
+                    / (float(previous_z) - float(current_z))
+                )
+                if float(x) < intersection_x:
+                    inside = not inside
+            previous_x, previous_z = current_x, current_z
+        return bool(inside)
+
+    @classmethod
+    def _coverage_region_for_point(
+        cls,
+        envelope: Optional[CoverageEnvelope],
+        x: float,
+        z: float,
+    ) -> Optional[str]:
+        if envelope is None:
+            return None
+        for region in envelope.regions:
+            if cls._point_in_coverage_region(
+                float(x),
+                float(z),
+                region,
+                boundary_tolerance_m=envelope.boundary_tolerance_m,
+            ):
+                return region.region_id
+        return None
+
+    @classmethod
+    def _point_in_admission_surface(
+        cls,
+        x: float,
+        z: float,
+        x_range: Tuple[float, float],
+        z_range: Tuple[float, float],
+        coverage_envelope: Optional[CoverageEnvelope],
+    ) -> bool:
+        if coverage_envelope is not None:
+            return (
+                cls._coverage_region_for_point(
+                    coverage_envelope,
+                    float(x),
+                    float(z),
+                )
+                is not None
+            )
+        return cls._point_in_metric_bounds(
+            float(x),
+            float(z),
+            x_range,
+            z_range,
+        )
+
+    @classmethod
+    def _coverage_point_fields(
+        cls,
+        envelope: Optional[CoverageEnvelope],
+        x: float,
+        z: float,
+    ) -> Dict[str, Any]:
+        if envelope is None:
+            return {}
+        region_id = cls._coverage_region_for_point(
+            envelope,
+            float(x),
+            float(z),
+        )
+        return {
+            "coverageInside": region_id is not None,
+            "coverageRegion": region_id,
+        }
+
+    @staticmethod
+    def _coverage_envelope_payload(
+        envelope: Optional[CoverageEnvelope],
+    ) -> Optional[Dict[str, Any]]:
+        if envelope is None:
+            return None
+        return {
+            "contract": envelope.contract,
+            "contractVersion": int(envelope.contract_version),
+            "frame": envelope.frame,
+            "units": envelope.units,
+            "cameraId": envelope.camera_id,
+            "boundaryToleranceM": float(envelope.boundary_tolerance_m),
+            "bounds": {
+                "min_x": float(envelope.x_range[0]),
+                "max_x": float(envelope.x_range[1]),
+                "min_z": float(envelope.z_range[0]),
+                "max_z": float(envelope.z_range[1]),
+            },
+            "regions": [
+                {
+                    "id": region.region_id,
+                    "polygonXZ": [
+                        [float(x), float(z)]
+                        for x, z in region.polygon_xz_m
+                    ],
+                }
+                for region in envelope.regions
+            ],
+        }
+
+    @staticmethod
     def _point_in_metric_bounds(
         x: float,
         z: float,
@@ -615,6 +1444,9 @@ class BevRenderer:
         height_px: int,
         floorplan_space: Optional[FloorplanSpace] = None,
     ) -> Dict[str, Any]:
+        if floorplan_space is not None:
+            x_range = floorplan_space.x_range
+            z_range = floorplan_space.z_range
         span_x = max(1e-6, float(x_range[1]) - float(x_range[0]))
         span_z = max(1e-6, float(z_range[1]) - float(z_range[0]))
         norm_x = (float(x) - float(x_range[0])) / span_x
@@ -806,6 +1638,7 @@ class BevRenderer:
         width_px: int,
         height_px: int,
         floorplan_space: Optional[FloorplanSpace],
+        coverage_envelope: Optional[CoverageEnvelope],
         floorplan_alignment: Optional[np.ndarray],
         timestamp_us: int,
         chosen_x: Optional[float],
@@ -858,6 +1691,13 @@ class BevRenderer:
                         floorplan_space,
                     )
                 )
+                item["rayFloor"].update(
+                    self._coverage_point_fields(
+                        coverage_envelope,
+                        aligned_x,
+                        aligned_z,
+                    )
+                )
             floorplan_depth = self._sample_debug_floorplan_depth_to_camera_local(
                 camera_id,
                 calib,
@@ -886,6 +1726,13 @@ class BevRenderer:
                         width_px,
                         height_px,
                         floorplan_space,
+                    )
+                )
+                item["mapanythingDepth"].update(
+                    self._coverage_point_fields(
+                        coverage_envelope,
+                        depth_x,
+                        depth_z,
                     )
                 )
                 ray = item.get("rayFloor")
@@ -921,6 +1768,13 @@ class BevRenderer:
                         floorplan_space,
                     )
                 )
+                registered_depth_anchor.update(
+                    self._coverage_point_fields(
+                        coverage_envelope,
+                        depth_x,
+                        depth_z,
+                    )
+                )
 
         chosen: Dict[str, Any] = {
             "displaySource": str(display_source),
@@ -938,6 +1792,13 @@ class BevRenderer:
                     width_px,
                     height_px,
                     floorplan_space,
+                )
+            )
+            chosen.update(
+                self._coverage_point_fields(
+                    coverage_envelope,
+                    float(chosen["x"]),
+                    float(chosen["z"]),
                 )
             )
 
@@ -983,6 +1844,7 @@ class BevRenderer:
         C_world: np.ndarray,
         x_range: Tuple[float, float],
         z_range: Tuple[float, float],
+        coverage_envelope: Optional[CoverageEnvelope],
         floorplan_alignment: Optional[np.ndarray],
     ) -> Optional[Tuple[float, float, str, float, float, bool]]:
         for anchor in self._candidate_anchors_for_footpoint(fp, calib):
@@ -1019,7 +1881,13 @@ class BevRenderer:
                 float(pz),
                 bool(alignment_applied),
             )
-            if self._point_in_metric_bounds(float(aligned_x), float(aligned_z), x_range, z_range):
+            if self._point_in_admission_surface(
+                float(aligned_x),
+                float(aligned_z),
+                x_range,
+                z_range,
+                coverage_envelope,
+            ):
                 return selected
         return None
 
@@ -1030,7 +1898,9 @@ class BevRenderer:
             "bbox3d",
             "v3dt_bbox3d_foot",
             "pose_depth_fused",
+            "pose_depth_only",
             "person_anchor_depth_fused",
+            "person_anchor_depth_only",
             "pose_floor_only",
             "person_anchor_floor_only",
             "gravity_drop",
@@ -1043,7 +1913,9 @@ class BevRenderer:
             "bbox3d",
             "v3dt_bbox3d_foot",
             "pose_depth_fused",
+            "pose_depth_only",
             "person_anchor_depth_fused",
+            "person_anchor_depth_only",
         }
 
     def _hsl_to_rgb(self, h: float, s: float, lightness: float) -> Tuple[float, float, float]:
@@ -1166,7 +2038,6 @@ class BevRenderer:
             return (-4.0, 4.0), (0.0, 12.0)
 
         R_wc, C_world = parse_extrinsics(calib.extrinsics_col_major)
-        meters_per_scene = 1.0
         plane = Plane.horizontal(float(calib.floor_y))
 
         xs = np.linspace(0, max(0.0, float(width - 1)), 8)
@@ -1225,7 +2096,6 @@ class BevRenderer:
             return (-4.0, 4.0), (0.0, 12.0)
 
         R_wc, C_world = parse_extrinsics(calib.extrinsics_col_major)
-        meters_per_scene = 1.0
         plane = Plane.horizontal(float(calib.floor_y))
 
         xs = np.linspace(0, max(0.0, float(width - 1)), 8)
@@ -1274,6 +2144,7 @@ class BevRenderer:
 
     def publish_status(self, camera_id: str, **fields: Any) -> None:
         """Publish a lightweight BEV status/error message to clients."""
+        response_model_started_ns = time.perf_counter_ns()
         try:
             payload: Dict[str, Any] = {
                 "type": "bev-status",
@@ -1281,10 +2152,13 @@ class BevRenderer:
                 "ts": int(time.time() * 1_000_000),
             }
             payload.update({k: v for k, v in fields.items() if k is not None})
-            if hasattr(self.ws, "broadcast_sync"):
-                self.ws.broadcast_sync(payload)
+            _broadcast_json_with_response_timing(
+                self.ws,
+                payload,
+                response_model_started_ns,
+            )
         except Exception:
-            pass
+            logger.exception("BEV status publish failed for %s", camera_id)
 
     def update_config(self, camera_id: str, cfg: Dict[str, float]) -> BevConfig:
         current = self.config_per_cam.get(camera_id, BevConfig())
@@ -1324,7 +2198,12 @@ class BevRenderer:
         frame_bgr: Optional[np.ndarray] = None,
         footpoints: Optional[List[Footpoint]] = None,
         timestamp_us: int = 0,
-    ) -> None:
+        source_id: Optional[int] = None,
+        frame_id: Optional[int] = None,
+        observed_at_us: Optional[int] = None,
+        tracking_publication_sequence: Optional[int] = None,
+        tracking_outbound_submission_id: Optional[int] = None,
+    ) -> BevPublicationReceipt:
         if timestamp_us <= 0:
             timestamp_us = int(time.time() * 1_000_000)
         now_s = float(timestamp_us) / 1_000_000.0
@@ -1352,18 +2231,123 @@ class BevRenderer:
                 if not cam_tracks:
                     self._trail_tracks_by_cam.pop(camera_id, None)
 
-            has_trails = bool(self._trail_tracks_by_cam.get(camera_id))
-
-        if not footpoints and not has_trails:
-            return
-
         # Compute or fetch extents for this camera
         x_range = cfg.x_range
         z_range = cfg.z_range
         bounds_source = "config"
         active_floorplan_space: Optional[FloorplanSpace] = None
+        coverage_envelope: Optional[CoverageEnvelope] = None
 
-        if cfg.auto_fit_extents:
+        if not use_world_frame and self._floorplan_bounds_provider is not None:
+            try:
+                active_floorplan_space = self._active_floorplan_space(camera_id)
+            except Exception as exc:
+                logger.warning(
+                    "BEV: active floorplan unavailable for %s: %s",
+                    camera_id,
+                    exc,
+                )
+                failure = self._record_failure(
+                    camera_id,
+                    stage="active_floorplan",
+                    timestamp_us=int(timestamp_us),
+                    cause=exc,
+                )
+                self.publish_status(
+                    camera_id,
+                    error="active_floorplan_failed",
+                    details=str(exc),
+                )
+                return self._publication_receipt(
+                    status="failed",
+                    camera_id=camera_id,
+                    source_id=source_id,
+                    frame_id=frame_id,
+                    observed_at_us=observed_at_us,
+                    tracking_publication_sequence=(
+                        tracking_publication_sequence
+                    ),
+                    tracking_outbound_submission_id=(
+                        tracking_outbound_submission_id
+                    ),
+                    failure=failure,
+                )
+            if active_floorplan_space is None:
+                exc = LookupError(f"active floorplan is unavailable for {camera_id}")
+                if self._record_floorplan_authority_pending(
+                    camera_id,
+                    timestamp_us=int(timestamp_us),
+                ):
+                    return self._publication_receipt(
+                        status="startup_pending",
+                        camera_id=camera_id,
+                        source_id=source_id,
+                        frame_id=frame_id,
+                        observed_at_us=observed_at_us,
+                        tracking_publication_sequence=(
+                            tracking_publication_sequence
+                        ),
+                        tracking_outbound_submission_id=(
+                            tracking_outbound_submission_id
+                        ),
+                    )
+                failure = self._record_failure(
+                    camera_id,
+                    stage="active_floorplan",
+                    timestamp_us=int(timestamp_us),
+                    cause=exc,
+                )
+                self.publish_status(
+                    camera_id,
+                    error="active_floorplan_failed",
+                    details=str(exc),
+                )
+                return self._publication_receipt(
+                    status="failed",
+                    camera_id=camera_id,
+                    source_id=source_id,
+                    frame_id=frame_id,
+                    observed_at_us=observed_at_us,
+                    tracking_publication_sequence=(
+                        tracking_publication_sequence
+                    ),
+                    tracking_outbound_submission_id=(
+                        tracking_outbound_submission_id
+                    ),
+                    failure=failure,
+                )
+            self._record_floorplan_authority_ready(
+                camera_id,
+                timestamp_us=int(timestamp_us),
+            )
+            x_range = active_floorplan_space.x_range
+            z_range = active_floorplan_space.z_range
+            bounds_source = active_floorplan_space.source
+            coverage_envelope = self._coverage_envelopes.get(str(camera_id))
+            if coverage_envelope is not None:
+                tolerance = float(coverage_envelope.boundary_tolerance_m)
+                x_range = (
+                    min(
+                        float(active_floorplan_space.x_range[0]),
+                        float(coverage_envelope.x_range[0]) - tolerance,
+                    ),
+                    max(
+                        float(active_floorplan_space.x_range[1]),
+                        float(coverage_envelope.x_range[1]) + tolerance,
+                    ),
+                )
+                z_range = (
+                    min(
+                        float(active_floorplan_space.z_range[0]),
+                        float(coverage_envelope.z_range[0]) - tolerance,
+                    ),
+                    max(
+                        float(active_floorplan_space.z_range[1]),
+                        float(coverage_envelope.z_range[1]) + tolerance,
+                    ),
+                )
+                bounds_source = "active_floorplan_plus_coverage_envelope"
+        elif cfg.auto_fit_extents:
             bounds_source = "auto_extents"
             ext_hash = hash(tuple(float(x) for x in calib.extrinsics_col_major))
             intr_hash = HomographyCache._hash_matrix(calib.intrinsics)
@@ -1389,11 +2373,6 @@ class BevRenderer:
                 self._auto_extents_by_camera[key] = auto_extents
             x_range, z_range = auto_extents
 
-        if not use_world_frame:
-            active_floorplan_space = self._active_floorplan_space(camera_id)
-            if active_floorplan_space is not None:
-                x_range, z_range = active_floorplan_space.x_range, active_floorplan_space.z_range
-                bounds_source = str(active_floorplan_space.source or "active_floorplan")
         floorplan_alignment = self._floorplan_alignment_matrix(active_floorplan_space)
         if not use_world_frame:
             space_signature = self._floorplan_space_signature(
@@ -1401,6 +2380,7 @@ class BevRenderer:
                 x_range=x_range,
                 z_range=z_range,
                 floorplan_space=active_floorplan_space,
+                coverage_envelope=coverage_envelope,
             )
             with self._lock:
                 previous_signature = self._floorplan_space_signature_by_camera.get(camera_id)
@@ -1427,19 +2407,32 @@ class BevRenderer:
         # JPEG BEV image rendering retired (see __init__ comment). We only ever produce the JSON metadata payload now.
         bev: Optional[np.ndarray] = None
 
-        # Compute or reuse homography; fallback to last good if current fails
+        # A current calibration failure invalidates the current frame. Reusing an
+        # old transform would hide calibration drift and publish false geometry.
         H_img2plane = None
         try:
             H_img2plane = self.h_cache.get(calib, flip_u=flip_u, flip_v=flip_v)
-            self._last_h_by_cam[camera_id] = H_img2plane
         except Exception as e:
             logger.warning("BEV: homography computation failed for %s: %s", camera_id, e)
-            cached_result = self._last_h_by_cam.get(camera_id)
-            if cached_result is None:
-                # No homography at all yet; notify clients of failure once per attempt window.
-                self.publish_status(camera_id, error="homography_failed", details=str(e))
-                return
-            H_img2plane = cached_result
+            failure = self._record_failure(
+                camera_id,
+                stage="homography",
+                timestamp_us=int(timestamp_us),
+                cause=e,
+            )
+            self.publish_status(camera_id, error="homography_failed", details=str(e))
+            return self._publication_receipt(
+                status="failed",
+                camera_id=camera_id,
+                source_id=source_id,
+                frame_id=frame_id,
+                observed_at_us=observed_at_us,
+                tracking_publication_sequence=tracking_publication_sequence,
+                tracking_outbound_submission_id=(
+                    tracking_outbound_submission_id
+                ),
+                failure=failure,
+            )
 
         bev_points: List[Dict[str, Any]] = []
         raw_points: List[Dict[str, Any]] = []
@@ -1447,8 +2440,6 @@ class BevRenderer:
         dropped_footpoints: List[Dict[str, Any]] = []
 
         R_wc, C_world = parse_extrinsics(calib.extrinsics_col_major)
-        meters_per_scene = 1.0
-
         max_distance_m = float(self._resolve_max_distance_scene(cfg, calib))
         # In world mode the producer already owns the canonical filtered track.world state.
         # Do not low-pass filter those points again in the BEV renderer.
@@ -1459,6 +2450,7 @@ class BevRenderer:
             if anchor_source == "anchor_hold":
                 continue
             selection_debug: Optional[Dict[str, Any]] = None
+            prefer_floor_contact = False
             wx = wz = None
             if fp.world_x is not None and fp.world_z is not None:
                 try:
@@ -1507,8 +2499,21 @@ class BevRenderer:
                             "z": float(depth_z),
                             "depthM": float(fp.depth_m),
                             "depthSource": str(fp.depth_source or ""),
-                            "insideBounds": self._point_in_metric_bounds(depth_x, depth_z, x_range, z_range),
+                            "insideBounds": self._point_in_admission_surface(
+                                depth_x,
+                                depth_z,
+                                x_range,
+                                z_range,
+                                coverage_envelope,
+                            ),
                         }
+                        registered_depth_candidate.update(
+                            self._coverage_point_fields(
+                                coverage_envelope,
+                                depth_x,
+                                depth_z,
+                            )
+                        )
                 floor_contact: Optional[Tuple[float, float, str, float, float, bool]] = None
                 floor_contact_candidate: Optional[Dict[str, Any]] = None
                 if prefer_floor_contact:
@@ -1520,6 +2525,7 @@ class BevRenderer:
                         C_world=C_world,
                         x_range=x_range,
                         z_range=z_range,
+                        coverage_envelope=coverage_envelope,
                         floorplan_alignment=floorplan_alignment,
                     )
                     if floor_contact is not None:
@@ -1546,7 +2552,13 @@ class BevRenderer:
                         R_wc,
                         C_world,
                     )
-                    world_inside = self._point_in_metric_bounds(candidate_x, candidate_z, x_range, z_range)
+                    world_inside = self._point_in_admission_surface(
+                        candidate_x,
+                        candidate_z,
+                        x_range,
+                        z_range,
+                        coverage_envelope,
+                    )
                     world_candidate = {
                         "x": float(candidate_x),
                         "z": float(candidate_z),
@@ -1554,6 +2566,13 @@ class BevRenderer:
                         "insideBounds": bool(world_inside),
                         "depthFused": bool(self._world_source_is_depth_fused(fp.anchor_source)),
                     }
+                    world_candidate.update(
+                        self._coverage_point_fields(
+                            coverage_envelope,
+                            candidate_x,
+                            candidate_z,
+                        )
+                    )
                     if registered_depth_candidate is not None:
                         world_candidate["deltaToRegisteredDepthM"] = float(
                             math.hypot(
@@ -1756,12 +2775,22 @@ class BevRenderer:
 
                 if max_distance_m > 0.0 and math.hypot(float(px), float(pz)) > max_distance_m:
                     continue
-                if prefer_floor_contact and not self._point_in_metric_bounds(float(px), float(pz), x_range, z_range):
+                if prefer_floor_contact and not self._point_in_admission_surface(
+                    float(px),
+                    float(pz),
+                    x_range,
+                    z_range,
+                    coverage_envelope,
+                ):
                     if self._alignment_debug_enabled:
                         dropped_payload: Dict[str, Any] = {
                             "x": float(px),
                             "y": float(pz),
-                            "reason": "floor_contact_outside_floorplan",
+                            "reason": (
+                                "floor_contact_outside_coverage_envelope"
+                                if coverage_envelope is not None
+                                else "floor_contact_outside_floorplan"
+                            ),
                             "displaySource": str(display_source),
                             "method": str(fp.method),
                             "anchorSource": str(fp.anchor_source) if fp.anchor_source not in (None, "") else None,
@@ -1785,6 +2814,13 @@ class BevRenderer:
                                 active_floorplan_space,
                             )
                         )
+                        dropped_payload.update(
+                            self._coverage_point_fields(
+                                coverage_envelope,
+                                float(px),
+                                float(pz),
+                            )
+                        )
                         dropped_footpoints.append(dropped_payload)
                     continue
             if not math.isfinite(px) or not math.isfinite(pz):
@@ -1804,6 +2840,7 @@ class BevRenderer:
                     width_px=width_px,
                     height_px=height_px,
                     floorplan_space=active_floorplan_space,
+                    coverage_envelope=coverage_envelope,
                     floorplan_alignment=floorplan_alignment,
                     timestamp_us=int(timestamp_us),
                     chosen_x=float(px),
@@ -1839,6 +2876,7 @@ class BevRenderer:
                     "method": str(fp.method),
                     "stable_id": stable_id,
                     "tracker_id": tracker_id,
+                    "frame_id": int(fp.frame_id) if fp.frame_id is not None else None,
                     "anchor_source": str(fp.anchor_source) if fp.anchor_source not in (None, "") else None,
                     "anchor_quality": str(fp.anchor_quality) if fp.anchor_quality not in (None, "") else None,
                     "anchor_reason": str(fp.anchor_reason) if fp.anchor_reason not in (None, "") else None,
@@ -1849,7 +2887,12 @@ class BevRenderer:
                     "trail_append_allowed": (
                         bool(fp.trail_append_allowed) if fp.trail_append_allowed is not None else True
                     ),
+                    "trail_break_required": bool(fp.trail_break_required),
+                    "trail_segment_id": (
+                        int(fp.trail_segment_id) if fp.trail_segment_id is not None else None
+                    ),
                     "idle_jitter_m": float(fp.idle_jitter_m) if fp.idle_jitter_m is not None else None,
+                    "requires_admission_gate": bool(prefer_floor_contact),
                 }
             )
 
@@ -1869,19 +2912,37 @@ class BevRenderer:
                     smooth_z = float(lz)
                     smoother_key = (camera_id, *history_key)
                     display_source_key = str(item.get("display_source") or "")
-                    # Source labels can alternate between floor ray and registered depth.
-                    # Both are already projected into the same floorplan metric space, so
-                    # let the motion gate absorb residual deltas instead of teleporting
-                    # through a source-change reset.
+                    previous_source_key = self._smoother_source_by_key.get(smoother_key)
+                    if (
+                        previous_source_key is not None
+                        and previous_source_key != display_source_key
+                    ):
+                        self._smoother.reset(smoother_key)
+                        camera_trails = self._trail_tracks_by_cam.get(camera_id)
+                        if camera_trails is not None:
+                            camera_trails.pop(history_key, None)
                     self._smoother_source_by_key[smoother_key] = display_source_key
                     smooth_x, smooth_z = self._smoother.update(smoother_key, now_s, smooth_x, smooth_z)
                     lx = float(smooth_x)
                     lz = float(smooth_z)
                     if (
-                        not self._point_in_metric_bounds(lx, lz, x_range, z_range)
-                        and self._point_in_metric_bounds(float(item["x"]), float(item["z"]), x_range, z_range)
+                        bool(item.get("requires_admission_gate"))
+                        and not self._point_in_admission_surface(
+                            lx,
+                            lz,
+                            x_range,
+                            z_range,
+                            coverage_envelope,
+                        )
+                        and self._point_in_admission_surface(
+                            float(item["x"]),
+                            float(item["z"]),
+                            x_range,
+                            z_range,
+                            coverage_envelope,
+                        )
                     ):
-                        # Keep the displayed state on the same visible footprint as the floorplan.
+                        # Keep smoothing inside the same admitted semantic surface.
                         self._smoother.reset(smoother_key)
                         self._smoother.update(smoother_key, now_s, float(item["x"]), float(item["z"]))
                         lx = float(item["x"])
@@ -1894,6 +2955,7 @@ class BevRenderer:
                     'method': method,
                     'stableId': int(stable_id) if stable_id is not None else None,
                     'trackerId': int(tracker_id) if tracker_id is not None else None,
+                    'frameId': item.get("frame_id"),
                     'anchorSource': item.get("anchor_source"),
                     'anchorQuality': item.get("anchor_quality"),
                     'anchorReason': item.get("anchor_reason"),
@@ -1901,6 +2963,8 @@ class BevRenderer:
                     'motionMode': item.get("motion_mode"),
                     'posture': item.get("posture"),
                     'trailAppendAllowed': item.get("trail_append_allowed"),
+                    'trailBreakRequired': item.get("trail_break_required"),
+                    'trailSegmentId': item.get("trail_segment_id"),
                     'idleJitterM': item.get("idle_jitter_m"),
                 }
                 point_payload.update(
@@ -1912,6 +2976,13 @@ class BevRenderer:
                         width_px,
                         height_px,
                         active_floorplan_space,
+                    )
+                )
+                point_payload.update(
+                    self._coverage_point_fields(
+                        coverage_envelope,
+                        float(lx),
+                        float(lz),
                     )
                 )
                 if self._alignment_debug_enabled:
@@ -1928,6 +2999,8 @@ class BevRenderer:
                     "tracker_id": int(tracker_id) if tracker_id is not None else None,
                     "display_key": int(display_key),
                     "trail_append_allowed": bool(item.get("trail_append_allowed", True)),
+                    "trail_break_required": bool(item.get("trail_break_required", False)),
+                    "trail_segment_id": item.get("trail_segment_id"),
                     "motion_mode": item.get("motion_mode"),
                 }
 
@@ -1976,6 +3049,20 @@ class BevRenderer:
                     state.stable_id = int(stable_id) if stable_id is not None else None
                     state.tracker_id = int(tracker_id) if tracker_id is not None else None
                     state.display_key = int(display_key)
+
+                    segment_id = point_meta.get("trail_segment_id")
+                    segment_changed = (
+                        segment_id is not None
+                        and state.trail_segment_id is not None
+                        and int(segment_id) != int(state.trail_segment_id)
+                    )
+                    if bool(point_meta.get("trail_break_required", False)) or segment_changed:
+                        state.points.clear()
+                        state.ema_x = None
+                        state.ema_z = None
+                        state.ema_ts = 0.0
+                    if segment_id is not None:
+                        state.trail_segment_id = int(segment_id)
 
                     # Always prune old samples so disappeared tracks naturally fade out.
                     while state.points and (now_s - float(state.points[0][0])) > window_s:
@@ -2097,6 +3184,13 @@ class BevRenderer:
                                 active_floorplan_space,
                             )
                         )
+                        point_out.update(
+                            self._coverage_point_fields(
+                                coverage_envelope,
+                                float(x_pt),
+                                float(z_pt),
+                            )
+                        )
                         trail_points.append(point_out)
                     backend_trails.append(
                         {
@@ -2150,14 +3244,30 @@ class BevRenderer:
             backend_trails=backend_trails,
             config=result_config,
             timestamp_us=timestamp_us,
+            source_id=int(source_id) if source_id is not None else None,
+            frame_id=int(frame_id) if frame_id is not None else None,
+            observed_at_us=(
+                int(observed_at_us) if observed_at_us is not None else None
+            ),
             width_px=width_px,
             height_px=height_px,
             points_smoothed=bool(apply_backend_smoothing),
             bounds_source=str(bounds_source),
             floorplan_space=active_floorplan_space,
+            coverage_envelope=coverage_envelope,
             dropped_footpoints=dropped_footpoints,
         )
-        self._publish(result, calib, H_img2plane, flip_u=flip_u, flip_v=flip_v)
+        return self._publish(
+            result,
+            calib,
+            H_img2plane,
+            flip_u=flip_u,
+            flip_v=flip_v,
+            tracking_publication_sequence=tracking_publication_sequence,
+            tracking_outbound_submission_id=(
+                tracking_outbound_submission_id
+            ),
+        )
 
     def _draw_grid(self, bev: np.ndarray, cfg: BevConfig) -> None:
         if cfg.meters_per_px <= 0:
@@ -2178,7 +3288,10 @@ class BevRenderer:
         *,
         flip_u: bool = False,
         flip_v: bool = False,
-    ) -> None:
+        tracking_publication_sequence: Optional[int] = None,
+        tracking_outbound_submission_id: Optional[int] = None,
+    ) -> BevPublicationReceipt:
+        response_model_started_ns = time.perf_counter_ns()
         try:
             # Compute a quick sanity sample: image bottom-center ray intersection in scene units (XZ)
             sample_xz: Optional[Tuple[float, float]] = None
@@ -2204,12 +3317,25 @@ class BevRenderer:
                 sample_xz = None
             frame_name = "backend_world_m" if self._frame_mode == "world" else "camera_local_ground_m"
             floorplan_space = result.floorplan_space
-            floorplan_bounds = {
+            display_bounds = {
                 "min_x": float(result.config.x_range[0]),
                 "max_x": float(result.config.x_range[1]),
                 "min_z": float(result.config.z_range[0]),
                 "max_z": float(result.config.z_range[1]),
             }
+            floorplan_bounds = (
+                {
+                    "min_x": float(floorplan_space.x_range[0]),
+                    "max_x": float(floorplan_space.x_range[1]),
+                    "min_z": float(floorplan_space.z_range[0]),
+                    "max_z": float(floorplan_space.z_range[1]),
+                }
+                if floorplan_space is not None
+                else dict(display_bounds)
+            )
+            coverage_envelope_payload = self._coverage_envelope_payload(
+                result.coverage_envelope
+            )
             floorplan_grid_shape = (
                 list(floorplan_space.grid_shape)
                 if floorplan_space is not None and floorplan_space.grid_shape is not None
@@ -2219,6 +3345,29 @@ class BevRenderer:
                 "type": "bev-frame",
                 "cameraId": result.camera_id,
                 "ts": result.timestamp_us,
+                "sourceId": result.source_id,
+                "frameId": result.frame_id,
+                "observedAtUs": result.observed_at_us,
+                "trackingPublicationSequence": (
+                    int(tracking_publication_sequence)
+                    if tracking_publication_sequence is not None
+                    else None
+                ),
+                "trackingOutboundSubmissionId": (
+                    int(tracking_outbound_submission_id)
+                    if tracking_outbound_submission_id is not None
+                    else None
+                ),
+                "cohort": {
+                    "source_id": result.source_id,
+                    "frame_id": result.frame_id,
+                    "observed_at_us": result.observed_at_us,
+                    "tracking_publication_sequence": (
+                        int(tracking_publication_sequence)
+                        if tracking_publication_sequence is not None
+                        else None
+                    ),
+                },
                 "w": int(result.width_px),
                 "h": int(result.height_px),
                 "mpp": result.config.meters_per_px,
@@ -2227,6 +3376,7 @@ class BevRenderer:
                 "zMin": result.config.z_range[0],
                 "zMax": result.config.z_range[1],
                 "boundsSource": str(result.bounds_source or "config"),
+                "displayBounds": display_bounds,
                 "floorplanCoordinateSpace": "floorplan_normalized_v1",
                 "floorplanBounds": floorplan_bounds,
                 "floorplanGridShape": floorplan_grid_shape,
@@ -2243,6 +3393,24 @@ class BevRenderer:
                 "floorplanTsUs": (
                     int(floorplan_space.floorplan_ts_us)
                     if floorplan_space is not None and floorplan_space.floorplan_ts_us is not None
+                    else None
+                ),
+                "floorplanSnapshotId": (
+                    str(floorplan_space.snapshot_id)
+                    if floorplan_space is not None
+                    and floorplan_space.snapshot_id is not None
+                    else None
+                ),
+                "floorplanSnapshotContentSha256": (
+                    str(floorplan_space.snapshot_content_sha256)
+                    if floorplan_space is not None
+                    and floorplan_space.snapshot_content_sha256 is not None
+                    else None
+                ),
+                "floorplanCalibrationFingerprint": (
+                    str(floorplan_space.calibration_fingerprint)
+                    if floorplan_space is not None
+                    and floorplan_space.calibration_fingerprint is not None
                     else None
                 ),
                 "overlay": result.config.overlay,
@@ -2264,6 +3432,8 @@ class BevRenderer:
                 "fallbackSources": (["ray_floor_fallback"] if fallback_points else []),
                 "fallbackReasonCounts": fallback_reasons,
             }
+            if coverage_envelope_payload is not None:
+                status["coverageEnvelope"] = coverage_envelope_payload
             if floorplan_space is not None and isinstance(floorplan_space.ray_to_floorplan_alignment, Mapping):
                 alignment_payload = floorplan_space.ray_to_floorplan_alignment
                 status["floorplanAlignment"] = {
@@ -2312,23 +3482,86 @@ class BevRenderer:
                 }
                 if result.dropped_footpoints:
                     status["droppedFootpoints"] = result.dropped_footpoints
-            if hasattr(self.ws, "broadcast_sync"):
-                self.ws.broadcast_sync(status)
-                # JPEG BEV binary retired (meta-only mode). No cv2 render or framed binary is produced.
-                # The general binary coalescer in the WS server remains for future use (e.g., binary depth).
-                try:
-                    # Lightweight visibility that a BEV frame was queued for broadcast
-                    if hasattr(self.ws, "logger") and self.ws.logger:
-                        self.ws.logger.debug(
-                            "BEV publish %s: %sx%s, points=%d, overlay=%s (meta-only)",
-                            result.camera_id,
-                            int(result.width_px),
-                            int(result.height_px),
-                            len(result.bev_points),
-                            result.config.overlay,
-                        )
-                except Exception:
-                    pass
+            outbound = _broadcast_json_with_response_timing(
+                self.ws,
+                status,
+                response_model_started_ns,
+            )
+            outbound_submission_id = int(outbound.submission_id)
+            if (
+                tracking_outbound_submission_id is not None
+                and outbound_submission_id
+                <= int(tracking_outbound_submission_id)
+            ):
+                raise RuntimeError(
+                    "BEV admission did not follow its tracking batch"
+                )
+            # JPEG BEV binary retired (meta-only mode). No cv2 render or framed binary is produced.
+            # The general binary coalescer in the WS server remains for future use (e.g., binary depth).
+            try:
+                # Lightweight visibility that a BEV frame was queued for broadcast
+                if hasattr(self.ws, "logger") and self.ws.logger:
+                    self.ws.logger.debug(
+                        "BEV publish %s: %sx%s, points=%d, overlay=%s (meta-only)",
+                        result.camera_id,
+                        int(result.width_px),
+                        int(result.height_px),
+                        len(result.bev_points),
+                        result.config.overlay,
+                    )
+            except Exception:
+                pass
+            self._record_success(
+                result.camera_id,
+                timestamp_us=int(result.timestamp_us),
+            )
+            return self._publication_receipt(
+                status="admitted",
+                camera_id=result.camera_id,
+                source_id=result.source_id,
+                frame_id=result.frame_id,
+                observed_at_us=result.observed_at_us,
+                tracking_publication_sequence=(
+                    tracking_publication_sequence
+                ),
+                tracking_outbound_submission_id=(
+                    tracking_outbound_submission_id
+                ),
+                outbound_submission_id=outbound_submission_id,
+            )
         except Exception as e:
             logger.exception("BEV publish failed for %s", getattr(result, "camera_id", "unknown"))
-            return
+            failure = self._record_failure(
+                str(getattr(result, "camera_id", "unknown")),
+                stage="publish",
+                timestamp_us=int(getattr(result, "timestamp_us", 0) or time.time() * 1_000_000),
+                cause=e,
+            )
+            return self._publication_receipt(
+                status="failed",
+                camera_id=str(getattr(result, "camera_id", "unknown")),
+                source_id=getattr(result, "source_id", None),
+                frame_id=getattr(result, "frame_id", None),
+                observed_at_us=getattr(result, "observed_at_us", None),
+                tracking_publication_sequence=(
+                    tracking_publication_sequence
+                ),
+                tracking_outbound_submission_id=(
+                    tracking_outbound_submission_id
+                ),
+                failure=failure,
+            )
+
+
+__all__ = [
+    "BevConfig",
+    "BevPublicationReceipt",
+    "BevRenderFailure",
+    "BevRenderer",
+    "BevResult",
+    "BevTrailConfig",
+    "CalibrationSnapshot",
+    "FloorplanSpace",
+    "Footpoint",
+    "HomographyCache",
+]

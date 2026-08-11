@@ -567,10 +567,14 @@ const RoiEditorDrawer: React.FC<Props> = ({ open, onClose, restBaseUrl, mosaicLa
   const handleDeleteRoi = useCallback((roiId: string) => {
     if (!selectedStream) return;
     pushHistory(selectedStream.stream_id);
-    updateStream(selectedStream.stream_id, (stream) => ({
-      ...stream,
-      rois: stream.rois.filter((roi) => roi.id !== roiId),
-    }));
+    updateStream(selectedStream.stream_id, (stream) => {
+      const nextRois = stream.rois.filter((roi) => roi.id !== roiId);
+      return {
+        ...stream,
+        rois: nextRois,
+        enable: nextRois.length > 0 ? stream.enable : false,
+      };
+    });
     if (activeRoiId === roiId) setActiveRoiId(null);
     markDirty(selectedStream.stream_id);
   }, [activeRoiId, markDirty, pushHistory, selectedStream, updateStream]);
@@ -713,7 +717,7 @@ const RoiEditorDrawer: React.FC<Props> = ({ open, onClose, restBaseUrl, mosaicLa
         streams: [{
           stream_id: selectedStream.stream_id,
           label: selectedStream.label || null,
-          enable: selectedStream.enable,
+          enable: selectedStream.enable && completeRois.length > 0,
           rois: completeRois.map((roi) => ({
             id: roi.id,
             description: roi.description || null,

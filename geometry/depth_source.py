@@ -2828,13 +2828,318 @@ class DepthResult:
 
 @dataclass(frozen=True)
 class _SnapshotJob:
+    write_id: str
+    sequence: int
     camera_id: str
     ts_us: int
     depth: np.ndarray
     conf: np.ndarray
     mask: np.ndarray
     rgb: Optional[np.ndarray]
+    attrs: Mapping[str, Any]
     dest_path: Path
+    future: Future
+
+
+class StorageLifecycle(str, Enum):
+    OPEN = "open"
+    CLOSING = "closing"
+    CLOSED = "closed"
+
+
+class DepthStorageError(RuntimeError):
+    """Base class for fail-closed depth storage errors."""
+
+
+class DepthFusionQualityError(DepthStorageError):
+    """A coherent capture completed, but its fused support is not publishable."""
+
+    code = "capture_event_fusion_quality_rejected"
+
+    def __init__(
+        self,
+        *,
+        observed: float,
+        required: float,
+        metric: str = "consensus_full_frame_fraction",
+        evidence: Optional[Mapping[str, Any]] = None,
+    ) -> None:
+        self.observed = float(observed)
+        self.required = float(required)
+        self.metric = str(metric)
+        self.evidence = dict(evidence or {})
+        super().__init__(
+            f"{self.code}:metric={self.metric}:"
+            f"observed={self.observed:.6f}:required={self.required:.6f}"
+        )
+
+
+class DepthStorageClosedError(DepthStorageError):
+    pass
+
+
+class DepthStorageQueueFullError(DepthStorageError):
+    pass
+
+
+class DuplicateSnapshotError(DepthStorageError):
+    pass
+
+
+class DepthStoragePoisonedError(DepthStorageError):
+    pass
+
+
+class DepthBulkTransportError(DepthStorageError):
+    """Stable, client-visible failure at the dense-depth bulk boundary."""
+
+    def __init__(self, code: str) -> None:
+        self.code = str(code)
+        super().__init__(self.code)
+
+
+@dataclass(frozen=True)
+class StorageFailure:
+    write_id: str
+    sequence: int
+    camera_id: str
+    ts_us: int
+    error_type: str
+    message: str
+    failed_at_ns: int
+
+
+@dataclass(frozen=True)
+class CommitReceipt:
+    write_id: str
+    sequence: int
+    camera_id: str
+    ts_us: int
+    path: Path
+    manifest_sha256: str
+    committed_at_ns: int
+
+
+@dataclass(frozen=True)
+class SnapshotDescriptor:
+    camera_id: str
+    ts_us: int
+    write_id: str
+    sequence: int
+    path: Path
+    storage_ref: str
+    manifest_sha256: str
+    content_sha256: str
+    snapshot_role: str
+    fusion_level: str
+    source_id: Optional[int] = None
+    source_frame_number: Optional[int] = None
+    source_media_pts_ns: Optional[int] = None
+
+
+@dataclass(frozen=True)
+class SnapshotComponentDescriptor:
+    component: str
+    dtype: str
+    shape: Tuple[int, ...]
+    byte_count: int
+    sha256: str
+
+    def to_wire(self) -> Dict[str, Any]:
+        return {
+            "component": self.component,
+            "dtype": self.dtype,
+            "shape": [int(dim) for dim in self.shape],
+            "byte_count": int(self.byte_count),
+            "sha256": self.sha256,
+        }
+
+
+@dataclass(frozen=True)
+class _ValidatedManifestCacheEntry:
+    manifest_identity: Tuple[int, int, int, int, int]
+    snapshot_metadata_identity: Tuple[Tuple[Any, ...], ...]
+    payload: Mapping[str, Any]
+
+
+@dataclass
+class _BulkTransferSession:
+    key: Tuple[str, str, str, str]
+    path: Path
+    components: frozenset[str]
+    completed_components: set[str]
+    lease: "SnapshotReadLease"
+    idle_deadline: float
+    absolute_deadline: float
+
+
+@dataclass(frozen=True)
+class FlushReceipt:
+    frontier_sequence: int
+    completed: bool
+    timed_out: bool
+    pending_sequences: Tuple[int, ...]
+    failed_sequences: Tuple[int, ...]
+    poison: Optional[StorageFailure]
+
+
+@dataclass(frozen=True)
+class ShutdownReceipt:
+    state: StorageLifecycle
+    completed: bool
+    timed_out: bool
+    flush: FlushReceipt
+    alive_writer_names: Tuple[str, ...]
+    enforcer_alive: bool
+
+
+class WriteHandle:
+    """Identity-bearing handle for one admitted snapshot write."""
+
+    __slots__ = ("write_id", "sequence", "camera_id", "ts_us", "path", "_future")
+
+    def __init__(
+        self,
+        *,
+        write_id: str,
+        sequence: int,
+        camera_id: str,
+        ts_us: int,
+        path: Path,
+        future: Future,
+    ) -> None:
+        self.write_id = str(write_id)
+        self.sequence = int(sequence)
+        self.camera_id = str(camera_id)
+        self.ts_us = int(ts_us)
+        self.path = Path(path)
+        self._future = future
+
+    def wait(self, timeout: Optional[float] = None) -> CommitReceipt:
+        receipt = self._future.result(timeout=timeout)
+        if not isinstance(receipt, CommitReceipt):
+            raise DepthStorageError("snapshot write returned an invalid commit receipt")
+        return receipt
+
+    def done(self) -> bool:
+        return bool(self._future.done())
+
+    def exception(self, timeout: Optional[float] = 0.0) -> Optional[BaseException]:
+        return self._future.exception(timeout=timeout)
+
+    def __fspath__(self) -> str:
+        return os.fspath(self.path)
+
+    def __str__(self) -> str:
+        return str(self.path)
+
+
+class SnapshotReadLease:
+    """Pin one committed snapshot against retention pruning."""
+
+    __slots__ = ("path", "_manager", "_released")
+
+    def __init__(self, manager: "DepthStorageManager", path: Path) -> None:
+        self.path = Path(path)
+        self._manager = manager
+        self._released = False
+
+    def release(self) -> None:
+        if self._released:
+            return
+        self._released = True
+        self._manager._release_read_lease(self.path)
+
+    def __enter__(self) -> "SnapshotReadLease":
+        return self
+
+    def __exit__(self, _exc_type: Any, _exc: Any, _tb: Any) -> None:
+        self.release()
+
+
+class SnapshotComponentStream:
+    """One exact raw component with a lease held until iteration completes."""
+
+    __slots__ = (
+        "descriptor",
+        "snapshot",
+        "_array",
+        "_lease",
+        "_closed",
+        "_iterated",
+        "_max_chunk_bytes",
+        "_on_close",
+    )
+
+    def __init__(
+        self,
+        *,
+        descriptor: SnapshotComponentDescriptor,
+        snapshot: SnapshotDescriptor,
+        array: Any,
+        lease: SnapshotReadLease,
+        max_chunk_bytes: int,
+        on_close: Optional[Callable[[str, bool], None]] = None,
+    ) -> None:
+        self.descriptor = descriptor
+        self.snapshot = snapshot
+        self._array = array
+        self._lease = lease
+        self._closed = False
+        self._iterated = False
+        self._max_chunk_bytes = max(
+            64 * 1024,
+            min(int(max_chunk_bytes), 4 * 1024 * 1024),
+        )
+        self._on_close = on_close
+
+    def close(self, *, _completed: bool = False) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        self._lease.release()
+        callback = self._on_close
+        self._on_close = None
+        if callback is not None:
+            callback(self.descriptor.component, bool(_completed))
+
+    def iter_bytes(self) -> Iterator[bytes]:
+        if self._iterated:
+            raise DepthBulkTransportError("bulk_component_stream_already_consumed")
+        self._iterated = True
+        digest = hashlib.sha256()
+        emitted = 0
+        completed = False
+        try:
+            shape = self.descriptor.shape
+            if not shape:
+                raise DepthBulkTransportError("bulk_component_manifest_invalid")
+            row_bytes = int(np.prod(shape[1:], dtype=np.int64)) * np.dtype(
+                self.descriptor.dtype
+            ).itemsize
+            rows_per_chunk = max(
+                1,
+                self._max_chunk_bytes // max(1, row_bytes),
+            )
+            for row_start in range(0, int(shape[0]), rows_per_chunk):
+                row_stop = min(int(shape[0]), row_start + rows_per_chunk)
+                chunk = np.asarray(
+                    self._array[row_start:row_stop],
+                    dtype=np.dtype(self.descriptor.dtype),
+                )
+                encoded = np.ascontiguousarray(chunk).tobytes(order="C")
+                emitted += len(encoded)
+                digest.update(encoded)
+                yield encoded
+            if emitted != self.descriptor.byte_count:
+                raise DepthBulkTransportError(
+                    "bulk_component_byte_count_mismatch"
+                )
+            if digest.hexdigest() != self.descriptor.sha256:
+                raise DepthBulkTransportError("bulk_component_digest_mismatch")
+            completed = True
+        finally:
+            self.close(_completed=completed)
 
 
 @dataclass(frozen=True)
@@ -2847,7 +3152,11 @@ class _BatchItem:
 
 
 class DepthStorageManager:
-    """Persist depth outputs to Zarr for later consumption with retention enforcement."""
+    """Persist immutable depth commits with bounded admission and retention.
+
+    ``on_failure`` is invoked exactly once while failure publication is locked;
+    callbacks must be non-blocking and must not perform storage lifecycle work.
+    """
 
     def __init__(
         self,
@@ -2871,36 +3180,103 @@ class DepthStorageManager:
         max_depth_cache_entries: int = 16,
         max_floorplan_cache_entries: int = 24,
         max_normals_cache_entries: int = 8,
+        queue_put_timeout_s: float = 1.0,
+        commit_timeout_s: Optional[float] = None,
+        on_failure: Optional[Callable[[StorageFailure], None]] = None,
+        legacy_policy: str = "ignore",
+        max_manifest_validation_cache_entries: int = 128,
+        max_bulk_transfer_sessions: int = 32,
+        bulk_transfer_idle_grace_s: float = 30.0,
+        bulk_transfer_max_lifetime_s: float = 180.0,
     ) -> None:
         self.base_path = Path(base_path).resolve()
         self.base_path.mkdir(parents=True, exist_ok=True)
         self._locks: Dict[str, threading.Lock] = {}
-        self._indices: Dict[str, Deque[Tuple[int, Path]]] = {}
+        self._indices: Dict[str, List[Tuple[int, Path]]] = {}
         self._logger = logging.getLogger(__name__)
+        self.public_commit_timeout_s = resolve_depth_store_commit_timeout_s(commit_timeout_s)
+        self._state_lock = threading.RLock()
+        self._completion_cv = threading.Condition(self._state_lock)
+        self._state = StorageLifecycle.OPEN
+        self._sequence = 0
+        self._reserved_keys: set[Tuple[str, int]] = set()
+        self._unfinished_sequences: set[int] = set()
+        self._failed_sequences: set[int] = set()
+        self._poison: Optional[StorageFailure] = None
+        self._failure_callback = on_failure
+        self._read_pins: Dict[Path, int] = {}
+        self._committed_paths: set[Path] = set()
+        self._deleting_paths: set[Path] = set()
+        manifest_cache_entries = int(max_manifest_validation_cache_entries)
+        transfer_session_limit = int(max_bulk_transfer_sessions)
+        transfer_idle_grace = float(bulk_transfer_idle_grace_s)
+        transfer_max_lifetime = float(bulk_transfer_max_lifetime_s)
+        if not 1 <= manifest_cache_entries <= 1024:
+            raise ValueError(
+                "max_manifest_validation_cache_entries must be in [1, 1024]"
+            )
+        if not 1 <= transfer_session_limit <= 256:
+            raise ValueError("max_bulk_transfer_sessions must be in [1, 256]")
+        if (
+            not math.isfinite(transfer_idle_grace)
+            or not 1.0 <= transfer_idle_grace <= 60.0
+        ):
+            raise ValueError("bulk_transfer_idle_grace_s must be in [1, 60]")
+        if (
+            not math.isfinite(transfer_max_lifetime)
+            or transfer_max_lifetime < transfer_idle_grace
+            or transfer_max_lifetime > 300.0
+        ):
+            raise ValueError(
+                "bulk_transfer_max_lifetime_s must cover idle grace and be <= 300"
+            )
+        self._manifest_validation_cache_lock = threading.Lock()
+        self._manifest_validation_cache: "OrderedDict[Path, _ValidatedManifestCacheEntry]" = (
+            OrderedDict()
+        )
+        self._max_manifest_validation_cache_entries = manifest_cache_entries
+        self._bulk_transfer_sessions: Dict[
+            Tuple[str, str, str, str], _BulkTransferSession
+        ] = {}
+        self._max_bulk_transfer_sessions = transfer_session_limit
+        self._bulk_transfer_idle_grace_s = transfer_idle_grace
+        self._bulk_transfer_max_lifetime_s = transfer_max_lifetime
+        # The enforcement thread is also the unconditional bulk-session
+        # reaper. Its wake event lets descriptor admission or deadline
+        # extension reschedule the next monotonic expiry without polling.
+        self._enforce_wake = threading.Event()
+        self._legacy_entries: List[Dict[str, Any]] = []
+        self._invalid_entries: List[Dict[str, Any]] = []
+        normalized_legacy_policy = str(legacy_policy or "ignore").strip().lower()
+        if normalized_legacy_policy not in {"ignore", "reject"}:
+            raise ValueError("legacy_policy must be 'ignore' or 'reject'")
+        self._legacy_policy = normalized_legacy_policy
         self._max_snapshots = max(max_snapshots_per_camera, 0)
         self._retention_us = max(0, int(retention_minutes * 60.0 * 1_000_000))
         self._max_total_bytes = max_total_bytes if (max_total_bytes is not None and max_total_bytes > 0) else None
-        self._async_enabled = bool(enable_async)
-        self._max_queue_size = max(1, int(max_queue_size)) if self._async_enabled else 0
-        self._initial_workers = 0
-        self._max_worker_count = 0
-        if self._async_enabled:
-            requested_workers = int(worker_count)
-            default_workers = self._default_worker_target()
-            if requested_workers <= 0:
-                requested_workers = default_workers
-            self._initial_workers = max(1, requested_workers)
-            requested_max = int(max_worker_count)
-            if requested_max <= 0:
-                requested_max = max(self._initial_workers, default_workers)
-            self._max_worker_count = max(self._initial_workers, requested_max)
-            self._max_queue_size = max(self._max_queue_size, self._initial_workers * 4)
-        self._queue: Optional["queue.Queue[_SnapshotJob]"] = None
-        self._stop_event: Optional[threading.Event] = None
+        # All writes use the same bounded queue.  ``enable_async=False`` is a
+        # compatibility mode that waits for the admitted handle; it is not a
+        # direct-write fallback.
+        self._async_enabled = True
+        self._wait_on_store = not bool(enable_async)
+        self._max_queue_size = max(1, int(max_queue_size))
+        requested_workers = int(worker_count)
+        default_workers = self._default_worker_target()
+        if requested_workers <= 0:
+            requested_workers = default_workers
+        self._initial_workers = max(1, requested_workers)
+        requested_max = int(max_worker_count)
+        if requested_max <= 0:
+            requested_max = max(self._initial_workers, default_workers)
+        self._max_worker_count = max(self._initial_workers, requested_max)
+        self._queue: Optional["queue.Queue[object]"] = None
+        self._writer_sentinel = object()
+        self._shutdown_sentinel_target = 0
+        self._shutdown_sentinels_enqueued = 0
         self._writer_threads: List[threading.Thread] = []
         self._worker_lock = threading.Lock()
         self._worker_name_counter = 0
-        self._queue_put_timeout = 1.0
+        self._queue_put_timeout = max(0.0, float(queue_put_timeout_s))
         self._last_queue_full_warning: float = 0.0
         # Retention/size enforcement tuning
         self._enforce_async = bool(enforce_async)
@@ -2910,12 +3286,15 @@ class DepthStorageManager:
         self._zarr_chunk_px = int(zarr_chunk_px)
         self._cache_lock = threading.Lock()
         self._depth_payload_cache: "OrderedDict[str, Dict[str, Any]]" = OrderedDict()
-        self._floorplan_cache: "OrderedDict[Tuple[str, float, float], Dict[str, Any]]" = OrderedDict()
+        self._floorplan_cache: "OrderedDict[Tuple[Any, ...], Dict[str, Any]]" = OrderedDict()
         self._normals_cache: "OrderedDict[Tuple[str, int, str, str], Dict[str, Any]]" = OrderedDict()
         self._floorplan_store_dir = Path(floorplan_store_dir).resolve() if floorplan_store_dir else (self.base_path / "floorplans")
         self._floorplan_store_dir.mkdir(parents=True, exist_ok=True)
         self._max_depth_cache_entries = max(1, int(max_depth_cache_entries))
-        self._max_floorplan_cache_entries = max(1, int(max_floorplan_cache_entries))
+        # Exact capture results publish both their write-id key and the explicit
+        # cache-only "latest" alias atomically.  Retain room for both even when
+        # an operator requests an unusually small cache.
+        self._max_floorplan_cache_entries = max(2, int(max_floorplan_cache_entries))
         self._max_normals_cache_entries = max(1, int(max_normals_cache_entries))
         self.min_conf = float(min_conf)
         # Background enforcement thread
@@ -2928,34 +3307,574 @@ class DepthStorageManager:
             )
             self._max_total_bytes = 10 * 1024 * 1024
         self._seed_existing_entries()
-        if self._async_enabled:
-            self._start_writer()
-        # Start async enforcement if enabled
-        if self._enforce_async:
-            self._start_enforcer()
+        self._start_writer()
+        # Bulk descriptor grace must expire autonomously even when optional
+        # retention/size enforcement is disabled.
+        self._start_enforcer()
 
     def _default_worker_target(self) -> int:
         cpu_count = os.cpu_count() or 1
         return max(2, min(8, cpu_count))
 
-    def _seed_existing_entries(self) -> None:
-        """Populate in-memory indices from disk on startup and prune if needed."""
-        for camera_dir in sorted(self.base_path.glob("*")):
-            if not camera_dir.is_dir():
+    # Keep the established filename so existing committed trees remain
+    # discoverable. The payload version, not the filename, owns the contract.
+    _COMMIT_MANIFEST_NAME = ".noesis-depth-commit-v1.json"
+    _COMMIT_MANIFEST_VERSION = 2
+    _COMMIT_MANIFEST_READ_VERSIONS = frozenset({1, 2})
+    _BULK_COMPONENT_DATASETS = {
+        "depth": ("depth_z", "<f4"),
+        "conf": ("conf", "<f4"),
+        "mask": ("mask", "|u1"),
+        "rgb": ("rgb", "|u1"),
+    }
+
+    @staticmethod
+    def _canonical_json_bytes(payload: Mapping[str, Any]) -> bytes:
+        return json.dumps(
+            payload,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=True,
+            allow_nan=False,
+        ).encode("utf-8")
+
+    @staticmethod
+    def _hash_file(path: Path) -> str:
+        digest = hashlib.sha256()
+        with path.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+        return digest.hexdigest()
+
+    @classmethod
+    def _snapshot_file_records(cls, root: Path) -> List[Dict[str, Any]]:
+        records: List[Dict[str, Any]] = []
+        for path in sorted(root.rglob("*"), key=lambda item: item.as_posix()):
+            if path.is_symlink():
+                raise DepthStorageError(f"snapshot contains symlink: {path}")
+            if not path.is_file() or path.name == cls._COMMIT_MANIFEST_NAME:
                 continue
-            camera_id = camera_dir.name
-            index = self._indices.setdefault(camera_id, deque())
-            zarr_paths = []
-            for path in camera_dir.rglob("*.zarr"):
+            relative = path.relative_to(root).as_posix()
+            records.append(
+                {
+                    "path": relative,
+                    "size": int(path.stat().st_size),
+                    "sha256": cls._hash_file(path),
+                }
+            )
+        return records
+
+    @classmethod
+    def _raw_component_records(
+        cls,
+        *,
+        depth: np.ndarray,
+        conf: np.ndarray,
+        mask: np.ndarray,
+        rgb: Optional[np.ndarray],
+    ) -> Dict[str, Dict[str, Any]]:
+        arrays: Dict[str, np.ndarray] = {
+            "depth": np.ascontiguousarray(depth, dtype=np.dtype("<f4")),
+            "conf": np.ascontiguousarray(conf, dtype=np.dtype("<f4")),
+            "mask": np.ascontiguousarray(mask, dtype=np.dtype("|u1")),
+        }
+        if rgb is not None:
+            arrays["rgb"] = np.ascontiguousarray(
+                rgb,
+                dtype=np.dtype("|u1"),
+            )
+        records: Dict[str, Dict[str, Any]] = {}
+        for component, array in arrays.items():
+            _dataset, dtype = cls._BULK_COMPONENT_DATASETS[component]
+            digest = hashlib.sha256()
+            digest.update(memoryview(array).cast("B"))
+            records[component] = {
+                "component": component,
+                "dtype": dtype,
+                "shape": [int(dim) for dim in array.shape],
+                "byte_count": int(array.nbytes),
+                "sha256": digest.hexdigest(),
+            }
+        return records
+
+    @classmethod
+    def _validated_component_records(
+        cls,
+        payload: Mapping[str, Any],
+        *,
+        group: Any,
+        manifest_version: int,
+    ) -> Dict[str, Dict[str, Any]]:
+        if manifest_version < 2:
+            return {}
+        raw_records = payload.get("components")
+        if not isinstance(raw_records, Mapping):
+            raise DepthStorageError("bulk_component_manifest_missing")
+        expected_components = {"depth", "conf", "mask"}
+        if "rgb" in group:
+            expected_components.add("rgb")
+        if set(raw_records) != expected_components:
+            raise DepthStorageError("bulk_component_manifest_set_mismatch")
+        validated: Dict[str, Dict[str, Any]] = {}
+        for component in sorted(expected_components):
+            raw = raw_records.get(component)
+            if not isinstance(raw, Mapping):
+                raise DepthStorageError("bulk_component_manifest_invalid")
+            dataset_name, expected_dtype = cls._BULK_COMPONENT_DATASETS[
+                component
+            ]
+            array = group[dataset_name]
+            shape = tuple(int(dim) for dim in array.shape)
+            expected_bytes = int(np.prod(shape, dtype=np.int64)) * np.dtype(
+                expected_dtype
+            ).itemsize
+            digest = str(raw.get("sha256") or "")
+            try:
+                declared_shape = tuple(int(dim) for dim in raw.get("shape", ()))
+                byte_count = int(raw.get("byte_count"))
+            except Exception as exc:
+                raise DepthStorageError(
+                    "bulk_component_manifest_invalid"
+                ) from exc
+            if (
+                set(raw)
+                != {"component", "dtype", "shape", "byte_count", "sha256"}
+                or str(raw.get("component") or "") != component
+                or str(raw.get("dtype") or "") != expected_dtype
+                or declared_shape != shape
+                or byte_count != expected_bytes
+                or len(digest) != 64
+                or any(ch not in "0123456789abcdef" for ch in digest)
+            ):
+                raise DepthStorageError("bulk_component_manifest_invalid")
+            validated[component] = {
+                "component": component,
+                "dtype": expected_dtype,
+                "shape": [int(dim) for dim in shape],
+                "byte_count": byte_count,
+                "sha256": digest,
+            }
+        return validated
+
+    @staticmethod
+    def _fsync_directory(path: Path) -> None:
+        descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+        try:
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+
+    def _ensure_parent_chain_durable(self, directory: Path) -> None:
+        target = Path(directory)
+        try:
+            relative = target.relative_to(self.base_path)
+        except ValueError as exc:
+            raise DepthStorageError("snapshot parent escapes the storage root") from exc
+        current = self.base_path
+        if current.is_symlink() or not current.is_dir():
+            raise DepthStorageError("depth storage root is not a real directory")
+        for part in relative.parts:
+            candidate = current / part
+            try:
+                candidate.mkdir()
+            except FileExistsError:
+                pass
+            if candidate.is_symlink() or not candidate.is_dir():
+                raise DepthStorageError(f"snapshot parent is not a real directory: {candidate}")
+            # Persist the directory inode and its name in the parent. Repeating
+            # fsync for an existing component also closes concurrent-creator races.
+            self._fsync_directory(candidate)
+            self._fsync_directory(current)
+            current = candidate
+
+    @classmethod
+    def _write_manifest(cls, staging_path: Path, payload: Mapping[str, Any]) -> str:
+        encoded = cls._canonical_json_bytes(payload)
+        temporary = staging_path / f".{cls._COMMIT_MANIFEST_NAME}.{uuid.uuid4().hex}.tmp"
+        manifest = staging_path / cls._COMMIT_MANIFEST_NAME
+        descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        try:
+            with os.fdopen(descriptor, "wb", closefd=False) as handle:
+                handle.write(encoded)
+                handle.flush()
+                os.fsync(handle.fileno())
+        finally:
+            os.close(descriptor)
+        os.replace(temporary, manifest)
+        cls._fsync_directory(staging_path)
+        return hashlib.sha256(encoded).hexdigest()
+
+    @staticmethod
+    def _rename_noreplace(source: Path, destination: Path) -> None:
+        """Linux renameat2(RENAME_NOREPLACE), with no overwrite fallback."""
+        libc = ctypes.CDLL(None, use_errno=True)
+        renameat2 = getattr(libc, "renameat2", None)
+        if renameat2 is None:
+            raise DepthStorageError("renameat2(RENAME_NOREPLACE) is unavailable")
+        renameat2.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint]
+        renameat2.restype = ctypes.c_int
+        result = renameat2(
+            -100,
+            os.fsencode(source),
+            -100,
+            os.fsencode(destination),
+            1,
+        )
+        if result != 0:
+            error_number = ctypes.get_errno()
+            if error_number == errno.EEXIST:
+                raise DuplicateSnapshotError(f"snapshot destination already exists: {destination}")
+            raise OSError(error_number, os.strerror(error_number), os.fspath(destination))
+
+    @classmethod
+    def _read_and_validate_commit_manifest(
+        cls,
+        path: Path,
+        *,
+        require_final_name: bool = True,
+    ) -> Dict[str, Any]:
+        snapshot_path = Path(path)
+        manifest_path = snapshot_path / cls._COMMIT_MANIFEST_NAME
+        if not manifest_path.is_file() or manifest_path.is_symlink():
+            raise DepthStorageError("missing_commit_manifest")
+        if manifest_path.stat().st_size > 4 * 1024 * 1024:
+            raise DepthStorageError("commit_manifest_too_large")
+        encoded = manifest_path.read_bytes()
+        try:
+            payload = json.loads(encoded.decode("utf-8"))
+        except Exception as exc:
+            raise DepthStorageError("invalid_commit_manifest_json") from exc
+        if not isinstance(payload, dict):
+            raise DepthStorageError("invalid_commit_manifest_type")
+        try:
+            manifest_version = int(payload.get("version", 0))
+        except Exception as exc:
+            raise DepthStorageError(
+                "unsupported_commit_manifest_version"
+            ) from exc
+        if manifest_version not in cls._COMMIT_MANIFEST_READ_VERSIONS:
+            raise DepthStorageError("unsupported_commit_manifest_version")
+        if payload.get("state") != "committed":
+            raise DepthStorageError("snapshot_not_committed")
+        camera_id = str(payload.get("camera_id") or "")
+        write_id = str(payload.get("write_id") or "")
+        ts_us = int(payload.get("timestamp_us"))
+        sequence = int(payload.get("sequence"))
+        if not camera_id or not write_id or sequence <= 0:
+            raise DepthStorageError("invalid_commit_identity")
+        if require_final_name and snapshot_path.name != f"{ts_us}.zarr":
+            raise DepthStorageError("commit_path_timestamp_mismatch")
+
+        expected_records = payload.get("files")
+        if not isinstance(expected_records, list):
+            raise DepthStorageError("commit_file_manifest_missing")
+        actual_records = cls._snapshot_file_records(snapshot_path)
+        if actual_records != expected_records:
+            raise DepthStorageError("commit_file_manifest_mismatch")
+
+        try:
+            group = zarr.open_group(str(snapshot_path), mode="r")
+            depth = group["depth_z"]
+            conf = group["conf"]
+            mask = group["mask"]
+            depth_shape = tuple(int(dim) for dim in depth.shape)
+            if len(depth_shape) != 2 or tuple(conf.shape) != depth_shape or tuple(mask.shape) != depth_shape:
+                raise DepthStorageError("committed_dataset_shape_mismatch")
+            if np.dtype(depth.dtype) != np.dtype(np.float32):
+                raise DepthStorageError("committed_depth_dtype_mismatch")
+            if np.dtype(conf.dtype) != np.dtype(np.float32):
+                raise DepthStorageError("committed_conf_dtype_mismatch")
+            if np.dtype(mask.dtype) != np.dtype(np.uint8):
+                raise DepthStorageError("committed_mask_dtype_mismatch")
+            if "rgb" in group:
+                rgb = group["rgb"]
+                if tuple(int(dim) for dim in rgb.shape) != (*depth_shape, 3):
+                    raise DepthStorageError("committed_rgb_shape_mismatch")
+                if np.dtype(rgb.dtype) != np.dtype(np.uint8):
+                    raise DepthStorageError("committed_rgb_dtype_mismatch")
+            components = cls._validated_component_records(
+                payload,
+                group=group,
+                manifest_version=manifest_version,
+            )
+            attrs = dict(group.attrs.asdict() if hasattr(group.attrs, "asdict") else dict(group.attrs))
+            if str(attrs.get("camera_id") or "") != camera_id:
+                raise DepthStorageError("committed_camera_attr_mismatch")
+            if int(attrs.get("timestamp_us")) != ts_us:
+                raise DepthStorageError("committed_timestamp_attr_mismatch")
+            if str(attrs.get("write_id") or "") != write_id:
+                raise DepthStorageError("committed_write_id_attr_mismatch")
+            if int(attrs.get("sequence")) != sequence:
+                raise DepthStorageError("committed_sequence_attr_mismatch")
+        except DepthStorageError:
+            raise
+        except Exception as exc:
+            raise DepthStorageError("committed_zarr_validation_failed") from exc
+        if manifest_version >= 2:
+            payload["components"] = components
+        payload["manifest_sha256"] = hashlib.sha256(encoded).hexdigest()
+        return payload
+
+    @classmethod
+    def _commit_manifest_identity(
+        cls,
+        snapshot_path: Path,
+    ) -> Tuple[int, int, int, int, int]:
+        manifest_path = Path(snapshot_path) / cls._COMMIT_MANIFEST_NAME
+        if manifest_path.is_symlink() or not manifest_path.is_file():
+            raise DepthStorageError("missing_commit_manifest")
+        stat_result = manifest_path.stat()
+        return (
+            int(stat_result.st_dev),
+            int(stat_result.st_ino),
+            int(stat_result.st_size),
+            int(stat_result.st_mtime_ns),
+            int(stat_result.st_ctime_ns),
+        )
+
+    def _invalidate_manifest_validation_cache(
+        self,
+        path: Any | None = None,
+    ) -> None:
+        with self._manifest_validation_cache_lock:
+            if path is None:
+                self._manifest_validation_cache.clear()
+                return
+            self._manifest_validation_cache.pop(
+                self._coerce_snapshot_path(path),
+                None,
+            )
+
+    @staticmethod
+    def _snapshot_metadata_identity(
+        snapshot_path: Path,
+        payload: Mapping[str, Any],
+    ) -> Tuple[Tuple[Any, ...], ...]:
+        """Cheap mutation seal for an already hash-validated immutable tree."""
+
+        root = Path(snapshot_path)
+        records = payload.get("files")
+        if not isinstance(records, list):
+            raise DepthStorageError("commit_file_manifest_missing")
+        identities: List[Tuple[Any, ...]] = []
+        directories: set[Path] = {root}
+        for record in records:
+            if not isinstance(record, Mapping):
+                raise DepthStorageError("commit_file_manifest_mismatch")
+            relative = str(record.get("path") or "")
+            relative_path = Path(relative)
+            if (
+                not relative
+                or relative_path.is_absolute()
+                or ".." in relative_path.parts
+            ):
+                raise DepthStorageError("commit_file_manifest_mismatch")
+            candidate = root / relative_path
+            if candidate.is_symlink() or not candidate.is_file():
+                raise DepthStorageError("commit_file_manifest_mismatch")
+            stat_result = candidate.stat()
+            identities.append(
+                (
+                    "file",
+                    relative_path.as_posix(),
+                    int(stat_result.st_dev),
+                    int(stat_result.st_ino),
+                    int(stat_result.st_size),
+                    int(stat_result.st_mtime_ns),
+                    int(stat_result.st_ctime_ns),
+                )
+            )
+            parent = candidate.parent
+            while True:
+                directories.add(parent)
+                if parent == root:
+                    break
+                if root not in parent.parents:
+                    raise DepthStorageError("commit_file_manifest_mismatch")
+                parent = parent.parent
+        for directory in sorted(
+            directories,
+            key=lambda item: item.as_posix(),
+        ):
+            if directory.is_symlink() or not directory.is_dir():
+                raise DepthStorageError("commit_file_manifest_mismatch")
+            stat_result = directory.stat()
+            identities.append(
+                (
+                    "directory",
+                    directory.relative_to(root).as_posix(),
+                    int(stat_result.st_dev),
+                    int(stat_result.st_ino),
+                    int(stat_result.st_mtime_ns),
+                    int(stat_result.st_ctime_ns),
+                )
+            )
+        return tuple(identities)
+
+    def _cache_validated_commit_manifest(
+        self,
+        path: Any,
+        payload: Mapping[str, Any],
+    ) -> None:
+        snapshot_path = self._coerce_snapshot_path(path)
+        with self._state_lock:
+            if snapshot_path not in self._committed_paths:
+                return
+        identity = self._commit_manifest_identity(snapshot_path)
+        entry = _ValidatedManifestCacheEntry(
+            manifest_identity=identity,
+            snapshot_metadata_identity=self._snapshot_metadata_identity(
+                snapshot_path,
+                payload,
+            ),
+            payload=copy.deepcopy(dict(payload)),
+        )
+        with self._manifest_validation_cache_lock:
+            self._manifest_validation_cache[snapshot_path] = entry
+            self._manifest_validation_cache.move_to_end(snapshot_path)
+            while (
+                len(self._manifest_validation_cache)
+                > self._max_manifest_validation_cache_entries
+            ):
+                self._manifest_validation_cache.popitem(last=False)
+
+    def _validated_commit_manifest(self, path: Any) -> Dict[str, Any]:
+        """Reuse one fully validated immutable commit until invalidation."""
+
+        snapshot_path = self._coerce_snapshot_path(path)
+        with self._state_lock:
+            cacheable = snapshot_path in self._committed_paths
+            now = time.monotonic()
+            transfer_pinned = any(
+                session.path == snapshot_path
+                and now < session.idle_deadline
+                and now < session.absolute_deadline
+                for session in self._bulk_transfer_sessions.values()
+            )
+        if cacheable:
+            try:
+                identity = self._commit_manifest_identity(snapshot_path)
+            except DepthStorageError:
+                self._invalidate_manifest_validation_cache(snapshot_path)
+                raise
+            with self._manifest_validation_cache_lock:
+                cached = self._manifest_validation_cache.get(snapshot_path)
+            if (
+                cached is not None
+                and cached.manifest_identity == identity
+                and transfer_pinned
+            ):
+                return copy.deepcopy(dict(cached.payload))
+            if cached is not None and cached.manifest_identity == identity:
                 try:
-                    ts = int(path.stem)
-                except ValueError:
-                    continue
-                zarr_paths.append((ts, path))
-            if not zarr_paths:
+                    metadata_identity = self._snapshot_metadata_identity(
+                        snapshot_path,
+                        cached.payload,
+                    )
+                except DepthStorageError:
+                    metadata_identity = ()
+                if metadata_identity == cached.snapshot_metadata_identity:
+                    with self._manifest_validation_cache_lock:
+                        if (
+                            self._manifest_validation_cache.get(snapshot_path)
+                            is cached
+                        ):
+                            self._manifest_validation_cache.move_to_end(
+                                snapshot_path
+                            )
+                    return copy.deepcopy(dict(cached.payload))
+            with self._manifest_validation_cache_lock:
+                self._manifest_validation_cache.pop(snapshot_path, None)
+        payload = self._read_and_validate_commit_manifest(snapshot_path)
+        if cacheable:
+            self._cache_validated_commit_manifest(snapshot_path, payload)
+        return payload
+
+    def _validated_manifest_for_descriptor(
+        self,
+        descriptor: SnapshotDescriptor,
+    ) -> Dict[str, Any]:
+        """Use the cache sealed by the immediately preceding descriptor read."""
+
+        snapshot_path = descriptor.path
+        identity = self._commit_manifest_identity(snapshot_path)
+        with self._manifest_validation_cache_lock:
+            cached = self._manifest_validation_cache.get(snapshot_path)
+        if cached is not None and cached.manifest_identity == identity:
+            payload = copy.deepcopy(dict(cached.payload))
+        else:
+            payload = self._validated_commit_manifest(snapshot_path)
+        if (
+            str(payload.get("camera_id") or "") != descriptor.camera_id
+            or int(payload.get("timestamp_us", -1)) != descriptor.ts_us
+            or str(payload.get("write_id") or "") != descriptor.write_id
+            or int(payload.get("sequence", -1)) != descriptor.sequence
+            or str(payload.get("manifest_sha256") or "")
+            != descriptor.manifest_sha256
+        ):
+            raise DepthStorageError("bulk_snapshot_identity_mismatch")
+        files = payload.get("files")
+        if not isinstance(files, list):
+            raise DepthStorageError("commit_file_manifest_missing")
+        identity_payload: Dict[str, Any] = {"files": files}
+        if int(payload.get("version", 0)) >= 2:
+            components = payload.get("components")
+            if not isinstance(components, Mapping):
+                raise DepthStorageError("bulk_component_manifest_missing")
+            identity_payload["components"] = dict(components)
+        if (
+            hashlib.sha256(
+                self._canonical_json_bytes(identity_payload)
+            ).hexdigest()
+            != descriptor.content_sha256
+        ):
+            raise DepthStorageError("bulk_snapshot_identity_mismatch")
+        return payload
+
+    def _seed_existing_entries(self) -> None:
+        """Seed only snapshots carrying a fully validated commit manifest."""
+        candidates = sorted(self.base_path.rglob("*.zarr"), key=lambda item: item.as_posix())
+        for path in candidates:
+            if not path.is_dir() or path.is_symlink():
                 continue
-            zarr_paths.sort(key=lambda item: item[0])
-            index.extend(zarr_paths)
+            manifest_path = path / self._COMMIT_MANIFEST_NAME
+            if not manifest_path.exists():
+                diagnostic = {"path": str(path), "reason": "legacy_missing_commit_manifest"}
+                self._legacy_entries.append(diagnostic)
+                continue
+            try:
+                manifest = self._read_and_validate_commit_manifest(path)
+                camera_id = str(manifest["camera_id"])
+                ts_us = int(manifest["timestamp_us"])
+                sequence = int(manifest["sequence"])
+                key = (camera_id, ts_us)
+                if key in self._reserved_keys:
+                    raise DuplicateSnapshotError("duplicate_committed_snapshot_key")
+                self._reserved_keys.add(key)
+                self._committed_paths.add(path)
+                self._cache_validated_commit_manifest(path, manifest)
+                self._sequence = max(self._sequence, sequence)
+                index = self._indices.setdefault(camera_id, [])
+                bisect.insort(index, (ts_us, path), key=lambda item: item[0])
+            except Exception as exc:
+                self._invalid_entries.append(
+                    {"path": str(path), "reason": f"{type(exc).__name__}:{exc}"}
+                )
+
+        if self._legacy_entries:
+            message = (
+                f"Ignored {len(self._legacy_entries)} legacy depth snapshots without atomic commit manifests; "
+                "they are not readable or retention-managed"
+            )
+            if self._legacy_policy == "reject":
+                raise DepthStorageError(message)
+            self._logger.warning(message)
+        if self._invalid_entries:
+            raise DepthStorageError(
+                "invalid committed depth snapshots prevent startup: "
+                + json.dumps(self._invalid_entries, sort_keys=True, separators=(",", ":"))
+            )
+        for camera_id, index in list(self._indices.items()):
             self._enforce_limits(camera_id, index, now_ts=self._current_time_us())
 
     def _current_time_us(self) -> int:
@@ -2964,20 +3883,127 @@ class DepthStorageManager:
     def _get_lock(self, camera_id: str) -> threading.Lock:
         return self._locks.setdefault(camera_id, threading.Lock())
 
-    def _get_index(self, camera_id: str) -> Deque[Tuple[int, Path]]:
-        return self._indices.setdefault(camera_id, deque())
+    def _get_index(self, camera_id: str) -> List[Tuple[int, Path]]:
+        return self._indices.setdefault(camera_id, [])
+
+    @property
+    def lifecycle_state(self) -> StorageLifecycle:
+        with self._state_lock:
+            return self._state
+
+    @property
+    def poison(self) -> Optional[StorageFailure]:
+        with self._state_lock:
+            return self._poison
+
+    def startup_report(self) -> Dict[str, Any]:
+        return {
+            "committed_snapshot_count": int(sum(len(rows) for rows in self._indices.values())),
+            "legacy_entries": [dict(row) for row in self._legacy_entries],
+            "invalid_entries": [dict(row) for row in self._invalid_entries],
+            "legacy_policy": self._legacy_policy,
+        }
+
+    def migrate_legacy_snapshot(
+        self,
+        path: Path,
+        *,
+        camera_id: Optional[str] = None,
+    ) -> CommitReceipt:
+        """Explicitly republish one validated legacy tree through the atomic writer."""
+        legacy_path = Path(path).resolve()
+        try:
+            legacy_path.relative_to(self.base_path)
+        except ValueError as exc:
+            raise DepthStorageError("legacy snapshot is outside the storage root") from exc
+        if not legacy_path.is_dir() or legacy_path.is_symlink():
+            raise DepthStorageError("legacy snapshot must be a real directory")
+        if (legacy_path / self._COMMIT_MANIFEST_NAME).exists():
+            raise DepthStorageError("snapshot already has a commit manifest")
+        try:
+            ts_us = int(legacy_path.stem)
+            group = zarr.open_group(str(legacy_path), mode="r")
+            depth = np.array(group["depth_z"])
+            conf = np.array(group["conf"])
+            mask = np.array(group["mask"])
+            rgb = np.array(group["rgb"]) if "rgb" in group else None
+            if depth.ndim != 2 or conf.shape != depth.shape or mask.shape != depth.shape:
+                raise DepthStorageError("legacy snapshot dataset shape mismatch")
+            if depth.dtype != np.dtype(np.float32) or conf.dtype != np.dtype(np.float32):
+                raise DepthStorageError("legacy depth/conf dtype must be float32")
+            if mask.dtype != np.dtype(np.uint8):
+                raise DepthStorageError("legacy mask dtype must be uint8")
+            if rgb is not None and (
+                rgb.shape != (*depth.shape, 3) or rgb.dtype != np.dtype(np.uint8)
+            ):
+                raise DepthStorageError("legacy RGB must be same-shape HxWx3 uint8")
+            old_attrs = dict(group.attrs.asdict() if hasattr(group.attrs, "asdict") else dict(group.attrs))
+        except Exception as exc:
+            raise DepthStorageError("legacy snapshot datasets failed validation") from exc
+        resolved_camera = str(camera_id or old_attrs.get("camera_id") or "").strip()
+        if not resolved_camera:
+            raise DepthStorageError("legacy migration requires a truthful camera_id")
+        if old_attrs.get("timestamp_us") is not None and int(old_attrs["timestamp_us"]) != ts_us:
+            raise DepthStorageError("legacy timestamp attribute does not match its path")
+        expected_path = self._snapshot_destination(resolved_camera, ts_us)
+        if expected_path != legacy_path:
+            raise DepthStorageError(
+                f"legacy snapshot is not at its canonical destination: expected {expected_path}"
+            )
+        custom_attrs = {
+            key: value
+            for key, value in old_attrs.items()
+            if key
+            not in {
+                "camera_id",
+                "timestamp_us",
+                "stored_at",
+                "shape",
+                "write_id",
+                "sequence",
+                "commit_contract",
+            }
+        }
+        quarantine = legacy_path.parent / f".{legacy_path.name}.{uuid.uuid4().hex}.legacy-quarantine"
+        self._rename_noreplace(legacy_path, quarantine)
+        self._fsync_directory(legacy_path.parent)
+        try:
+            receipt = self.store(
+                resolved_camera,
+                ts_us,
+                depth,
+                conf,
+                mask,
+                rgb=rgb,
+                attrs=custom_attrs,
+            ).wait()
+        except Exception:
+            if not legacy_path.exists() and quarantine.exists():
+                self._rename_noreplace(quarantine, legacy_path)
+                self._fsync_directory(legacy_path.parent)
+            raise
+        try:
+            shutil.rmtree(quarantine)
+            self._fsync_directory(legacy_path.parent)
+        except Exception:
+            self._logger.warning(
+                "Committed legacy migration but could not remove quarantine %s",
+                quarantine,
+                exc_info=True,
+            )
+        self._legacy_entries = [row for row in self._legacy_entries if row.get("path") != str(legacy_path)]
+        return receipt
 
     def _start_writer(self) -> None:
         if self._queue is not None or self._initial_workers <= 0:
             return
         self._queue = queue.Queue(maxsize=self._max_queue_size)
-        self._stop_event = threading.Event()
         with self._worker_lock:
             for _ in range(self._initial_workers):
                 self._spawn_worker_locked()
 
     def _spawn_worker_locked(self) -> None:
-        if self._queue is None or self._stop_event is None:
+        if self._queue is None:
             return
         self._worker_name_counter += 1
         thread = threading.Thread(
@@ -2989,130 +4015,299 @@ class DepthStorageManager:
         thread.start()
 
     def _writer_loop(self) -> None:
-        # Defensive loop that tolerates shutdown races and empty queue timeouts.
-        # This is intentionally conservative to avoid noisy thread exceptions
-        # while retaining async snapshot functionality.
-        try:
-            q = self._queue
-            stop = self._stop_event
-        except Exception:
-            q = None
-            stop = None
+        q = self._queue
+        if q is None:
+            return
         while True:
+            item = q.get()
             try:
-                # Refresh local refs each iteration in case shutdown mutated them
-                if q is None or stop is None:
-                    q = self._queue
-                    stop = self._stop_event
-                if q is None:
-                    # Queue no longer available; exit quietly
+                if item is self._writer_sentinel:
                     break
+                if not isinstance(item, _SnapshotJob):
+                    raise DepthStorageError("writer received an invalid queue item")
+                job = item
                 try:
-                    job = q.get(timeout=0.2)
-                except queue.Empty:
-                    try:
-                        if stop is None:
-                            stop = self._stop_event
-                        if stop is not None and stop.is_set():
-                            break
-                    except Exception:
-                        # If stop flag is unavailable, exit defensively
-                        break
-                    continue
-                try:
-                    self._write_snapshot(job)
+                    with self._state_lock:
+                        poison = self._poison
+                    if poison is not None:
+                        raise DepthStoragePoisonedError(
+                            f"depth storage poisoned by write {poison.write_id}: "
+                            f"{poison.error_type}: {poison.message}"
+                        )
+                    receipt = self._write_snapshot(job)
+                    if not job.future.done():
+                        job.future.set_result(receipt)
                 except Exception as exc:
-                    # Keep processing other jobs; log at error level
-                    self._logger.error(
-                        "Depth snapshot write failed for %s to %s: %s",
-                        getattr(job, "camera_id", "unknown"),
-                        getattr(job, "dest_path", None),
-                        exc,
-                    )
-                finally:
+                    self._record_write_failure(job, exc)
+            finally:
+                if isinstance(item, _SnapshotJob):
+                    with self._completion_cv:
+                        self._unfinished_sequences.discard(item.sequence)
+                        self._completion_cv.notify_all()
+                q.task_done()
+
+    def _record_write_failure(self, job: _SnapshotJob, exc: BaseException) -> None:
+        with self._completion_cv:
+            failure = self._poison
+            if failure is None:
+                failure = StorageFailure(
+                    write_id=job.write_id,
+                    sequence=job.sequence,
+                    camera_id=job.camera_id,
+                    ts_us=job.ts_us,
+                    error_type=type(exc).__name__,
+                    message=str(exc),
+                    failed_at_ns=time.time_ns(),
+                )
+                self._poison = failure
+                if self._failure_callback is not None:
                     try:
-                        q.task_done()
+                        self._failure_callback(failure)
                     except Exception:
-                        pass
-            except Exception:
-                # Any unexpected error should not tear down the thread noisily.
-                # Re-check shutdown and either continue or exit quietly.
-                try:
-                    stop = self._stop_event
-                    if stop is not None and stop.is_set():
-                        break
-                except Exception:
-                    break
-                time.sleep(0.05)
+                        self._logger.exception("Depth storage failure callback failed")
+            self._failed_sequences.add(job.sequence)
+        # Poison closes write and descriptor admission, but the manager-owned
+        # bulk-session reaper must remain alive until lifecycle shutdown so an
+        # already-published bounded grace lease cannot pin storage forever.
+        self._enforce_wake.set()
+        error = DepthStoragePoisonedError(
+            f"depth snapshot write {job.write_id} failed; storage poisoned by "
+            f"{failure.write_id}: {failure.error_type}: {failure.message}"
+        )
+        if not job.future.done():
+            job.future.set_exception(error)
+        self._logger.error("%s", error, exc_info=exc)
+
+    def _record_system_failure(
+        self,
+        operation: str,
+        exc: BaseException,
+        *,
+        camera_id: str = "",
+        ts_us: int = 0,
+    ) -> StorageFailure:
+        with self._completion_cv:
+            failure = self._poison
+            if failure is None:
+                failure = StorageFailure(
+                    write_id=f"system-{operation}-{uuid.uuid4().hex}",
+                    sequence=int(self._sequence),
+                    camera_id=str(camera_id),
+                    ts_us=int(ts_us),
+                    error_type=type(exc).__name__,
+                    message=str(exc),
+                    failed_at_ns=time.time_ns(),
+                )
+                self._poison = failure
+                if self._failure_callback is not None:
+                    try:
+                        self._failure_callback(failure)
+                    except Exception:
+                        self._logger.exception("Depth storage failure callback failed")
+        self._enforce_wake.set()
+        self._logger.error(
+            "Depth storage system operation %s failed; storage poisoned: %s",
+            operation,
+            exc,
+            exc_info=exc,
+        )
+        return failure
 
     def _start_enforcer(self) -> None:
         if self._enforce_thread is not None:
             return
+
         def _loop() -> None:
+            next_retention_at = time.monotonic()
             while not self._enforce_stop.is_set():
+                self._enforce_wake.clear()
                 try:
-                    # Prune all cameras; uses per-camera locks internally
-                    self.prune()
-                except Exception:
-                    pass
-                # Sleep a bit to batch work and avoid thrash
-                self._enforce_stop.wait(self._enforce_interval_s)
-        self._enforce_thread = threading.Thread(target=_loop, name="DepthRetentionEnforcer", daemon=True)
+                    now = time.monotonic()
+                    self._expire_bulk_transfer_sessions(now=now)
+                    with self._state_lock:
+                        retention_available = self._poison is None
+                    if (
+                        self._enforce_async
+                        and retention_available
+                        and now >= next_retention_at
+                    ):
+                        # Prune all cameras; uses per-camera locks internally.
+                        self.prune()
+                        next_retention_at = (
+                            time.monotonic() + self._enforce_interval_s
+                        )
+                except Exception as exc:
+                    self._record_system_failure("retention_enforcer", exc)
+
+                with self._state_lock:
+                    session_deadline = min(
+                        (
+                            min(
+                                session.idle_deadline,
+                                session.absolute_deadline,
+                            )
+                            for session in self._bulk_transfer_sessions.values()
+                        ),
+                        default=None,
+                    )
+                    retention_available = self._poison is None
+                deadlines = []
+                if session_deadline is not None:
+                    deadlines.append(float(session_deadline))
+                if self._enforce_async and retention_available:
+                    deadlines.append(float(next_retention_at))
+                timeout = (
+                    max(0.0, min(deadlines) - time.monotonic())
+                    if deadlines
+                    else None
+                )
+                # Admission and deadline extension wake this thread so a newly
+                # earlier expiry is never hidden by a long retention interval.
+                self._enforce_wake.wait(timeout=timeout)
+
+        self._enforce_thread = threading.Thread(
+            target=_loop,
+            name="DepthStorageEnforcer",
+            daemon=True,
+        )
         self._enforce_thread.start()
 
-    def shutdown(self, *, wait: bool = True) -> None:
-        # Stop background enforcer
-        try:
-            self._enforce_stop.set()
-            if self._enforce_thread and wait:
-                self._enforce_thread.join(timeout=2.0)
-        except Exception:
-            pass
-        self._enforce_thread = None
-        # Stop async writers
-        if not self._async_enabled or self._stop_event is None:
-            return
-        self._stop_event.set()
-        # Always give workers a small window to exit to avoid races
-        join_timeout = 2.0 if wait else 0.5
-        threads = self._collect_alive_threads()
-        for thread in threads:
-            try:
-                thread.join(timeout=join_timeout)
-            except Exception:
-                pass
-        with self._worker_lock:
-            self._writer_threads.clear()
-        # Only clear references after attempting joins to prevent attr races
-        self._queue = None
-        self._stop_event = None
+    @staticmethod
+    def _remaining(deadline: Optional[float]) -> Optional[float]:
+        if deadline is None:
+            return None
+        return max(0.0, deadline - time.monotonic())
 
-    def flush(self, timeout: Optional[float] = None) -> None:
-        if not self._async_enabled or self._queue is None:
-            return
-        if timeout is None:
-            self._queue.join()
-            return
-        deadline = time.time() + max(0.0, timeout)
-        while getattr(self._queue, "unfinished_tasks", 0) > 0:
-            if time.time() >= deadline:
-                break
-            time.sleep(0.01)
+    def flush(self, timeout: Optional[float] = None) -> FlushReceipt:
+        """Wait for the exact admission frontier visible at call time."""
+        deadline = None if timeout is None else time.monotonic() + max(0.0, float(timeout))
+        with self._completion_cv:
+            frontier = int(self._sequence)
+            while True:
+                pending = tuple(sorted(seq for seq in self._unfinished_sequences if seq <= frontier))
+                if not pending:
+                    break
+                remaining = self._remaining(deadline)
+                if remaining is not None and remaining <= 0.0:
+                    failed = tuple(sorted(seq for seq in self._failed_sequences if seq <= frontier))
+                    return FlushReceipt(
+                        frontier_sequence=frontier,
+                        completed=False,
+                        timed_out=True,
+                        pending_sequences=pending,
+                        failed_sequences=failed,
+                        poison=self._poison,
+                    )
+                self._completion_cv.wait(timeout=remaining)
+            failed = tuple(sorted(seq for seq in self._failed_sequences if seq <= frontier))
+            return FlushReceipt(
+                frontier_sequence=frontier,
+                completed=True,
+                timed_out=False,
+                pending_sequences=(),
+                failed_sequences=failed,
+                poison=self._poison,
+            )
+
+    def shutdown(self, *, wait: bool = True, timeout: Optional[float] = None) -> ShutdownReceipt:
+        """Close admission and drain writers without discarding live references."""
+        effective_timeout = timeout
+        if not wait:
+            effective_timeout = 0.0
+        deadline = None if effective_timeout is None else time.monotonic() + max(0.0, float(effective_timeout))
+        with self._state_lock:
+            if self._state is StorageLifecycle.OPEN:
+                self._state = StorageLifecycle.CLOSING
+            if self._state is StorageLifecycle.CLOSED:
+                flush_receipt = self.flush(timeout=0.0)
+                return ShutdownReceipt(
+                    state=self._state,
+                    completed=True,
+                    timed_out=False,
+                    flush=flush_receipt,
+                    alive_writer_names=(),
+                    enforcer_alive=False,
+                )
+
+        # Descriptor grace is public read admission, not writer ownership.
+        # Shutdown releases grace pins; an already-open stream retains its own.
+        self._close_all_bulk_transfer_sessions()
+        self._invalidate_manifest_validation_cache()
+        self._enforce_stop.set()
+        self._enforce_wake.set()
+        enforcer = self._enforce_thread
+        if enforcer is not None and wait:
+            enforcer.join(timeout=self._remaining(deadline))
+
+        flush_receipt = self.flush(timeout=self._remaining(deadline))
+        q = self._queue
+        if flush_receipt.completed and q is not None:
+            with self._worker_lock:
+                if self._shutdown_sentinel_target <= 0:
+                    self._shutdown_sentinel_target = len(self._writer_threads)
+            while self._shutdown_sentinels_enqueued < self._shutdown_sentinel_target:
+                remaining = self._remaining(deadline)
+                if remaining is not None and remaining <= 0.0:
+                    break
+                try:
+                    q.put(self._writer_sentinel, timeout=remaining)
+                except queue.Full:
+                    break
+                self._shutdown_sentinels_enqueued += 1
+
+        if wait:
+            for thread in list(self._writer_threads):
+                remaining = self._remaining(deadline)
+                if remaining is not None and remaining <= 0.0:
+                    break
+                thread.join(timeout=remaining)
+
+        alive = tuple(thread.name for thread in self._writer_threads if thread.is_alive())
+        enforcer_alive = bool(enforcer is not None and enforcer.is_alive())
+        completed = bool(flush_receipt.completed and not alive and not enforcer_alive)
+        if completed:
+            with self._state_lock:
+                self._state = StorageLifecycle.CLOSED
+            # Clear only after every referenced thread has terminated.
+            with self._worker_lock:
+                self._writer_threads.clear()
+            self._queue = None
+            self._enforce_thread = None
+        with self._state_lock:
+            state = self._state
+        return ShutdownReceipt(
+            state=state,
+            completed=completed,
+            timed_out=not completed,
+            flush=flush_receipt,
+            alive_writer_names=alive,
+            enforcer_alive=enforcer_alive,
+        )
 
     def _create_job(
         self,
+        write_id: str,
+        sequence: int,
         camera_id: str,
         ts_us: int,
         depth: np.ndarray,
         conf: np.ndarray,
         mask: np.ndarray,
         rgb: Optional[np.ndarray],
+        attrs: Optional[Mapping[str, Any]],
         dest_path: Path,
+        future: Future,
     ) -> _SnapshotJob:
         depth_c = np.ascontiguousarray(depth, dtype=np.float32).copy()
         conf_c = np.ascontiguousarray(conf, dtype=np.float32).copy()
         mask_c = np.ascontiguousarray(mask, dtype=np.uint8).copy()
+        if depth_c.ndim != 2 or conf_c.shape != depth_c.shape or mask_c.shape != depth_c.shape:
+            raise ValueError(
+                f"depth/conf/mask must be same-shape 2D arrays, got "
+                f"{depth_c.shape}/{conf_c.shape}/{mask_c.shape}"
+            )
         rgb_c = self._prepare_rgb_snapshot(rgb)
+        attrs_c = json.loads(self._canonical_json_bytes(dict(attrs or {})).decode("utf-8"))
         _increment_core_boundary_copy_bytes(
             "depth_store",
             int(getattr(depth_c, "nbytes", 0) or 0)
@@ -3120,7 +4315,19 @@ class DepthStorageManager:
             + int(getattr(mask_c, "nbytes", 0) or 0)
             + int(getattr(rgb_c, "nbytes", 0) or 0),
         )
-        return _SnapshotJob(camera_id, ts_us, depth_c, conf_c, mask_c, rgb_c, dest_path)
+        return _SnapshotJob(
+            write_id,
+            sequence,
+            camera_id,
+            ts_us,
+            depth_c,
+            conf_c,
+            mask_c,
+            rgb_c,
+            attrs_c,
+            dest_path,
+            future,
+        )
 
     def _register_snapshot(self, camera_id: str, ts_us: int, dest_path: Path) -> None:
         # Keep lock ordering consistent with load_latest_depth (cache_lock -> camera_lock)
@@ -3130,12 +4337,14 @@ class DepthStorageManager:
             lock = self._get_lock(camera_id)
             with lock:
                 index = self._get_index(camera_id)
-                index.append((ts_us, dest_path))
+                bisect.insort(index, (ts_us, dest_path), key=lambda item: item[0])
                 # Defer enforcement to background thread if enabled
                 if not self._enforce_async:
                     self._enforce_limits(camera_id, index)
             # Invalidate cached WS payload so subsequent RPCs see the newest snapshot.
             self._depth_payload_cache.pop(camera_id, None)
+        with self._state_lock:
+            self._committed_paths.add(dest_path)
 
     def _make_blosc_compressor(self) -> Optional[Any]:
         if self._zarr_clevel <= 0:
@@ -3225,12 +4434,593 @@ class DepthStorageManager:
         except Exception:
             return {}
 
+    @staticmethod
+    def _snapshot_has_public_bulk_role(path: Path) -> bool:
+        """Read the exact public bulk role without hiding metadata failures."""
+        try:
+            group = zarr.open_group(str(path), mode="r")
+            attrs = dict(
+                group.attrs.asdict()
+                if hasattr(group.attrs, "asdict")
+                else dict(group.attrs)
+            )
+        except Exception as exc:
+            raise DepthStorageError(
+                f"snapshot role attribute read failed: {path}"
+            ) from exc
+        return bool(
+            str(attrs.get("snapshot_role") or "") == "capture_event_fused"
+            and str(attrs.get("fusion_level") or "") == "intra_capture"
+        )
+
+    @staticmethod
+    def _descriptor_has_public_bulk_role(
+        descriptor: SnapshotDescriptor,
+    ) -> bool:
+        return bool(
+            descriptor.snapshot_role == "capture_event_fused"
+            and descriptor.fusion_level == "intra_capture"
+        )
+
     @classmethod
     def _snapshot_is_derived(cls, path: Path) -> bool:
         attrs = cls._snapshot_attr_dict(path)
         role = str(attrs.get("snapshot_role") or "").strip().lower()
         level = str(attrs.get("fusion_level") or "").strip().lower()
         return role in {"capture_event_fused", "reconstruction_fused"} or level in {"intra_capture", "inter_capture"}
+
+    @staticmethod
+    def _coerce_snapshot_path(path: Any) -> Path:
+        return Path(os.fspath(path)).resolve()
+
+    def acquire_read_lease(self, path: Any) -> SnapshotReadLease:
+        snapshot_path = self._coerce_snapshot_path(path)
+        with self._state_lock:
+            if snapshot_path not in self._committed_paths or snapshot_path in self._deleting_paths:
+                raise DepthStorageError(f"snapshot is not a committed readable entry: {snapshot_path}")
+            if not snapshot_path.exists():
+                raise DepthStorageError(f"committed snapshot is missing: {snapshot_path}")
+            self._read_pins[snapshot_path] = self._read_pins.get(snapshot_path, 0) + 1
+        return SnapshotReadLease(self, snapshot_path)
+
+    def _release_read_lease(self, path: Path) -> None:
+        snapshot_path = self._coerce_snapshot_path(path)
+        with self._state_lock:
+            count = self._read_pins.get(snapshot_path, 0)
+            if count <= 1:
+                self._read_pins.pop(snapshot_path, None)
+            else:
+                self._read_pins[snapshot_path] = count - 1
+
+    def read_pin_count(self, path: Any) -> int:
+        snapshot_path = self._coerce_snapshot_path(path)
+        with self._state_lock:
+            return int(self._read_pins.get(snapshot_path, 0))
+
+    @staticmethod
+    def _bulk_transfer_key(
+        descriptor: SnapshotDescriptor,
+    ) -> Tuple[str, str, str, str]:
+        return (
+            descriptor.camera_id,
+            descriptor.storage_ref,
+            descriptor.write_id,
+            descriptor.content_sha256,
+        )
+
+    def _expire_bulk_transfer_sessions(
+        self,
+        *,
+        now: Optional[float] = None,
+    ) -> int:
+        current = time.monotonic() if now is None else float(now)
+        expired: List[_BulkTransferSession] = []
+        with self._state_lock:
+            for key, session in tuple(self._bulk_transfer_sessions.items()):
+                if (
+                    current >= session.idle_deadline
+                    or current >= session.absolute_deadline
+                ):
+                    expired.append(self._bulk_transfer_sessions.pop(key))
+        for session in expired:
+            session.lease.release()
+        return len(expired)
+
+    def _close_all_bulk_transfer_sessions(self) -> int:
+        with self._state_lock:
+            sessions = tuple(self._bulk_transfer_sessions.values())
+            self._bulk_transfer_sessions.clear()
+        for session in sessions:
+            session.lease.release()
+        self._enforce_wake.set()
+        return len(sessions)
+
+    @property
+    def bulk_transfer_session_count(self) -> int:
+        self._expire_bulk_transfer_sessions()
+        with self._state_lock:
+            return len(self._bulk_transfer_sessions)
+
+    def _begin_bulk_transfer_session(
+        self,
+        descriptor: SnapshotDescriptor,
+        components: Iterable[str],
+    ) -> None:
+        component_set = frozenset(str(value) for value in components)
+        if not {"depth", "conf", "mask"}.issubset(component_set):
+            raise DepthBulkTransportError("bulk_component_manifest_missing")
+        self._expire_bulk_transfer_sessions()
+        now = time.monotonic()
+        key = self._bulk_transfer_key(descriptor)
+        with self._state_lock:
+            if (
+                self._state is not StorageLifecycle.OPEN
+                or self._poison is not None
+            ):
+                raise DepthBulkTransportError("bulk_snapshot_unavailable")
+            existing = self._bulk_transfer_sessions.get(key)
+            if existing is not None:
+                existing.components = component_set
+                existing.completed_components.clear()
+                # Repeated reads may start a fresh component pass, but cannot
+                # renew the identity's absolute transfer lifetime.
+                existing.idle_deadline = min(
+                    existing.absolute_deadline,
+                    now + self._bulk_transfer_idle_grace_s,
+                )
+                self._enforce_wake.set()
+                return
+            if len(self._bulk_transfer_sessions) >= self._max_bulk_transfer_sessions:
+                raise DepthBulkTransportError("bulk_snapshot_unavailable")
+            lease = self.acquire_read_lease(descriptor.path)
+            self._bulk_transfer_sessions[key] = _BulkTransferSession(
+                key=key,
+                path=descriptor.path,
+                components=component_set,
+                completed_components=set(),
+                lease=lease,
+                idle_deadline=now + self._bulk_transfer_idle_grace_s,
+                absolute_deadline=now + self._bulk_transfer_max_lifetime_s,
+            )
+            self._enforce_wake.set()
+
+    def _require_bulk_transfer_session(
+        self,
+        descriptor: SnapshotDescriptor,
+        component: str,
+    ) -> None:
+        self._expire_bulk_transfer_sessions()
+        now = time.monotonic()
+        key = self._bulk_transfer_key(descriptor)
+        with self._state_lock:
+            session = self._bulk_transfer_sessions.get(key)
+            if (
+                session is None
+                or session.path != descriptor.path
+                or component not in session.components
+                or now >= session.idle_deadline
+                or now >= session.absolute_deadline
+            ):
+                raise DepthBulkTransportError("bulk_snapshot_unavailable")
+            session.idle_deadline = min(
+                session.absolute_deadline,
+                now + self._bulk_transfer_idle_grace_s,
+            )
+            self._enforce_wake.set()
+
+    def _finish_bulk_transfer_component(
+        self,
+        descriptor: SnapshotDescriptor,
+        component: str,
+        completed: bool,
+    ) -> None:
+        try:
+            self._expire_bulk_transfer_sessions()
+            now = time.monotonic()
+            key = self._bulk_transfer_key(descriptor)
+            with self._state_lock:
+                session = self._bulk_transfer_sessions.get(key)
+                if session is None:
+                    return
+                if completed:
+                    session.completed_components.add(component)
+                session.idle_deadline = min(
+                    session.absolute_deadline,
+                    now + self._bulk_transfer_idle_grace_s,
+                )
+                self._enforce_wake.set()
+        except Exception:
+            self._logger.exception(
+                "Dense-depth transfer session close failed for %s/%s",
+                descriptor.camera_id,
+                descriptor.write_id,
+            )
+
+    def describe_snapshot(
+        self,
+        path: Any,
+        *,
+        lease: Optional[SnapshotReadLease] = None,
+    ) -> SnapshotDescriptor:
+        """Return validated immutable identity for one committed snapshot."""
+        snapshot_path = self._coerce_snapshot_path(path)
+        owned_lease: Optional[SnapshotReadLease] = None
+        if lease is None:
+            owned_lease = self.acquire_read_lease(snapshot_path)
+            active_lease = owned_lease
+        else:
+            active_lease = lease
+            if active_lease.path != snapshot_path or self.read_pin_count(snapshot_path) <= 0:
+                raise DepthStorageError("read lease does not pin the requested snapshot")
+        try:
+            manifest = self._validated_commit_manifest(snapshot_path)
+            try:
+                group = zarr.open_group(str(snapshot_path), mode="r")
+                attrs = dict(
+                    group.attrs.asdict()
+                    if hasattr(group.attrs, "asdict")
+                    else dict(group.attrs)
+                )
+            except Exception as exc:
+                raise DepthStorageError("snapshot descriptor attribute read failed") from exc
+            files = manifest.get("files")
+            if not isinstance(files, list):
+                raise DepthStorageError("snapshot descriptor has no file manifest")
+            identity_payload: Dict[str, Any] = {"files": files}
+            if int(manifest.get("version", 0)) >= 2:
+                components = manifest.get("components")
+                if not isinstance(components, Mapping):
+                    raise DepthStorageError("bulk_component_manifest_missing")
+                identity_payload["components"] = dict(components)
+            content_sha256 = hashlib.sha256(
+                self._canonical_json_bytes(identity_payload)
+            ).hexdigest()
+
+            def optional_source_identity_int(
+                key: str,
+                *,
+                gst_timestamp: bool = False,
+            ) -> Optional[int]:
+                raw = attrs.get(key)
+                if raw is None:
+                    return None
+                try:
+                    value = int(raw)
+                except Exception as exc:
+                    raise DepthStorageError(
+                        f"snapshot descriptor {key} is not an integer"
+                    ) from exc
+                if value < 0 or (gst_timestamp and value == (1 << 64) - 1):
+                    raise DepthStorageError(
+                        f"snapshot descriptor {key} is invalid"
+                    )
+                return value
+
+            return SnapshotDescriptor(
+                camera_id=str(manifest["camera_id"]),
+                ts_us=int(manifest["timestamp_us"]),
+                write_id=str(manifest["write_id"]),
+                sequence=int(manifest["sequence"]),
+                path=snapshot_path,
+                storage_ref=snapshot_path.relative_to(self.base_path).as_posix(),
+                manifest_sha256=str(manifest["manifest_sha256"]),
+                content_sha256=content_sha256,
+                snapshot_role=str(attrs.get("snapshot_role") or ""),
+                fusion_level=str(attrs.get("fusion_level") or ""),
+                source_id=optional_source_identity_int("source_id"),
+                source_frame_number=optional_source_identity_int(
+                    "source_frame_number"
+                ),
+                source_media_pts_ns=optional_source_identity_int(
+                    "source_media_pts_ns",
+                    gst_timestamp=True,
+                ),
+            )
+        finally:
+            if owned_lease is not None:
+                owned_lease.release()
+
+    def resolve_snapshot_ref(
+        self,
+        *,
+        camera_id: str,
+        storage_ref: str,
+        snapshot_id: str,
+        content_sha256: str,
+    ) -> SnapshotDescriptor:
+        """Resolve and revalidate one portable committed snapshot identity."""
+        camera = str(camera_id or "").strip()
+        ref = str(storage_ref or "").strip()
+        write_id = str(snapshot_id or "").strip()
+        digest = str(content_sha256 or "").strip()
+        if not camera or not ref or not write_id:
+            raise DepthStorageError("exact snapshot identity is incomplete")
+        if len(ref) > 512 or Path(ref).is_absolute() or ".." in Path(ref).parts:
+            raise DepthStorageError("snapshot storage reference is not portable")
+        if len(digest) != 64 or any(ch not in "0123456789abcdef" for ch in digest):
+            raise DepthStorageError("snapshot content digest is invalid")
+        path = (self.base_path / ref).resolve()
+        try:
+            path.relative_to(self.base_path)
+        except ValueError as exc:
+            raise DepthStorageError("snapshot storage reference escapes the store") from exc
+        descriptor = self.describe_snapshot(path)
+        if (
+            descriptor.camera_id != camera
+            or descriptor.storage_ref != ref
+            or descriptor.write_id != write_id
+            or descriptor.content_sha256 != digest
+        ):
+            raise DepthStorageError("exact snapshot identity does not match committed storage")
+        return descriptor
+
+    @classmethod
+    def _component_descriptor_from_manifest(
+        cls,
+        manifest: Mapping[str, Any],
+        component: str,
+    ) -> SnapshotComponentDescriptor:
+        if int(manifest.get("version", 0)) < 2:
+            raise DepthBulkTransportError("bulk_component_manifest_missing")
+        components = manifest.get("components")
+        if not isinstance(components, Mapping):
+            raise DepthBulkTransportError("bulk_component_manifest_missing")
+        raw = components.get(component)
+        if raw is None:
+            raise DepthBulkTransportError("bulk_component_not_found")
+        if not isinstance(raw, Mapping):
+            raise DepthBulkTransportError("bulk_component_manifest_invalid")
+        try:
+            return SnapshotComponentDescriptor(
+                component=str(raw["component"]),
+                dtype=str(raw["dtype"]),
+                shape=tuple(int(dim) for dim in raw["shape"]),
+                byte_count=int(raw["byte_count"]),
+                sha256=str(raw["sha256"]),
+            )
+        except Exception as exc:
+            raise DepthBulkTransportError(
+                "bulk_component_manifest_invalid"
+            ) from exc
+
+    @classmethod
+    def _bulk_component_url(
+        cls,
+        snapshot: SnapshotDescriptor,
+        component: str,
+    ) -> str:
+        query = urlencode(
+            {
+                "snapshot_ref": snapshot.storage_ref,
+                "content_sha256": snapshot.content_sha256,
+            },
+            quote_via=quote,
+            safe="",
+        )
+        return (
+            f"/api/v1/depth/snapshots/{quote(snapshot.camera_id, safe='')}"
+            f"/{quote(snapshot.write_id, safe='')}/components/"
+            f"{quote(component, safe='')}?{query}"
+        )
+
+    def _bulk_snapshot_payload(
+        self,
+        descriptor: SnapshotDescriptor,
+    ) -> Dict[str, Any]:
+        if not self._descriptor_has_public_bulk_role(descriptor):
+            raise DepthBulkTransportError("bulk_snapshot_role_invalid")
+        with self.acquire_read_lease(descriptor.path):
+            try:
+                manifest = self._validated_manifest_for_descriptor(descriptor)
+            except DepthStorageError as exc:
+                if str(exc) == "bulk_component_manifest_missing":
+                    raise DepthBulkTransportError(
+                        "bulk_component_manifest_missing"
+                    ) from exc
+                raise DepthBulkTransportError(
+                    "bulk_snapshot_integrity_failed"
+                ) from exc
+            if int(manifest.get("version", 0)) < 2:
+                raise DepthBulkTransportError(
+                    "bulk_component_manifest_missing"
+                )
+            raw_components = manifest.get("components")
+            if not isinstance(raw_components, Mapping):
+                raise DepthBulkTransportError(
+                    "bulk_component_manifest_missing"
+                )
+            components: Dict[str, Dict[str, Any]] = {}
+            for component in ("depth", "conf", "mask", "rgb"):
+                if component not in raw_components:
+                    continue
+                component_descriptor = (
+                    self._component_descriptor_from_manifest(
+                        manifest,
+                        component,
+                    )
+                )
+                row = component_descriptor.to_wire()
+                row["url"] = self._bulk_component_url(
+                    descriptor,
+                    component,
+                )
+                components[component] = row
+            depth_component = components.get("depth")
+            if not isinstance(depth_component, Mapping):
+                raise DepthBulkTransportError(
+                    "bulk_component_manifest_missing"
+                )
+            shape = [int(dim) for dim in depth_component["shape"]]
+            if len(shape) != 2:
+                raise DepthBulkTransportError(
+                    "bulk_component_manifest_invalid"
+                )
+            pixel_count = int(shape[0]) * int(shape[1])
+            component_bytes = [
+                int(row["byte_count"]) for row in components.values()
+            ]
+            if (
+                pixel_count <= 0
+                or pixel_count > DEPTH_BULK_MAX_PIXELS
+                or any(
+                    byte_count <= 0
+                    or byte_count > DEPTH_BULK_MAX_COMPONENT_BYTES
+                    for byte_count in component_bytes
+                )
+                or sum(component_bytes) > DEPTH_BULK_MAX_SNAPSHOT_BYTES
+            ):
+                raise DepthBulkTransportError(
+                    "bulk_snapshot_resource_limit_exceeded"
+                )
+            payload = {
+                "contract": "noesis.depth.bulk_snapshot",
+                "contract_version": 1,
+                "ts": int(descriptor.ts_us),
+                "shape": shape,
+                "snapshot_id": descriptor.write_id,
+                "snapshot_ref": descriptor.storage_ref,
+                "content_sha256": descriptor.content_sha256,
+                "role": descriptor.snapshot_role,
+                "fusion_level": descriptor.fusion_level,
+                "components": components,
+                "normals": {
+                    "mode": "client_derived_depth_gradient_v1",
+                    "space": "camera",
+                    "dtype": "float32",
+                },
+            }
+            # Exact URLs are bridged by one bounded identity-keyed grace pin.
+            self._begin_bulk_transfer_session(descriptor, components)
+            return payload
+
+    def describe_latest_depth_bulk(
+        self,
+        camera_id: str,
+        ts_max_us: Optional[int] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """Return the newest exact public fused snapshot, never a raw commit."""
+        try:
+            rows = self.list_snapshot_entries(
+                str(camera_id),
+                ts_max_us=ts_max_us,
+                include_derived=True,
+            )
+            for _timestamp_us, path in reversed(rows):
+                if not self._snapshot_has_public_bulk_role(path):
+                    continue
+                descriptor = self.describe_snapshot(path)
+                return self._bulk_snapshot_payload(descriptor)
+            return None
+        except DepthBulkTransportError:
+            raise
+        except DepthStorageError as exc:
+            raise DepthBulkTransportError(
+                "bulk_snapshot_integrity_failed"
+            ) from exc
+
+    def describe_depth_snapshot_bulk_exact(
+        self,
+        *,
+        camera_id: str,
+        storage_ref: str,
+        snapshot_id: str,
+        content_sha256: str,
+    ) -> Dict[str, Any]:
+        """Return only the compact descriptor for one exact committed snapshot."""
+        try:
+            descriptor = self.resolve_snapshot_ref(
+                camera_id=camera_id,
+                storage_ref=storage_ref,
+                snapshot_id=snapshot_id,
+                content_sha256=content_sha256,
+            )
+        except DepthStorageError as exc:
+            raise DepthBulkTransportError(
+                "bulk_snapshot_identity_mismatch"
+            ) from exc
+        return self._bulk_snapshot_payload(descriptor)
+
+    def open_depth_snapshot_component(
+        self,
+        *,
+        camera_id: str,
+        storage_ref: str,
+        snapshot_id: str,
+        content_sha256: str,
+        component: str,
+        max_chunk_bytes: int = 1024 * 1024,
+    ) -> SnapshotComponentStream:
+        """Open an allowlisted raw component while pinning its exact snapshot."""
+        component_name = str(component or "").strip()
+        if component_name not in self._BULK_COMPONENT_DATASETS:
+            raise DepthBulkTransportError("bulk_component_not_found")
+        try:
+            descriptor = self.resolve_snapshot_ref(
+                camera_id=camera_id,
+                storage_ref=storage_ref,
+                snapshot_id=snapshot_id,
+                content_sha256=content_sha256,
+            )
+        except DepthStorageError as exc:
+            raise DepthBulkTransportError(
+                "bulk_snapshot_identity_mismatch"
+            ) from exc
+        if not self._descriptor_has_public_bulk_role(descriptor):
+            raise DepthBulkTransportError("bulk_snapshot_role_invalid")
+        self._require_bulk_transfer_session(descriptor, component_name)
+        try:
+            lease = self.acquire_read_lease(descriptor.path)
+        except DepthStorageError as exc:
+            raise DepthBulkTransportError("bulk_snapshot_unavailable") from exc
+        try:
+            verified = self.describe_snapshot(descriptor.path, lease=lease)
+            if verified != descriptor:
+                raise DepthBulkTransportError(
+                    "bulk_snapshot_identity_mismatch"
+                )
+            manifest = self._validated_commit_manifest(descriptor.path)
+            component_descriptor = self._component_descriptor_from_manifest(
+                manifest,
+                component_name,
+            )
+            if (
+                component_descriptor.byte_count <= 0
+                or component_descriptor.byte_count
+                > DEPTH_BULK_MAX_COMPONENT_BYTES
+            ):
+                raise DepthBulkTransportError(
+                    "bulk_snapshot_resource_limit_exceeded"
+                )
+            dataset_name, _dtype = self._BULK_COMPONENT_DATASETS[
+                component_name
+            ]
+            group = zarr.open_group(str(descriptor.path), mode="r")
+            array = group[dataset_name]
+            return SnapshotComponentStream(
+                descriptor=component_descriptor,
+                snapshot=descriptor,
+                array=array,
+                lease=lease,
+                max_chunk_bytes=max_chunk_bytes,
+                on_close=lambda name, completed: (
+                    self._finish_bulk_transfer_component(
+                        descriptor,
+                        name,
+                        completed,
+                    )
+                ),
+            )
+        except DepthBulkTransportError:
+            lease.release()
+            raise
+        except (DepthStorageError, KeyError) as exc:
+            lease.release()
+            raise DepthBulkTransportError(
+                "bulk_snapshot_integrity_failed"
+            ) from exc
+        except Exception as exc:
+            lease.release()
+            raise DepthBulkTransportError("bulk_component_open_failed") from exc
 
     def list_snapshot_entries(
         self,
@@ -3293,7 +5083,9 @@ class DepthStorageManager:
         *,
         min_confidence: float,
         min_observations: int,
+        min_observation_ratio: float,
         depth_agreement_m: float,
+        normalize_frame_scale: bool,
         rgb: Optional[np.ndarray] = None,
     ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, Optional[np.ndarray], Dict[str, Any]]:
         if not snapshots:
@@ -3309,11 +5101,13 @@ class DepthStorageManager:
         source_paths: List[str] = []
         source_timestamps: List[int] = []
         for ts, path, datasets in snapshots:
-            depth = np.asarray(datasets.get("depth"), dtype=np.float32)
-            conf = np.asarray(datasets.get("conf"), dtype=np.float32)
-            mask = np.asarray(datasets.get("mask"), dtype=np.uint8) > 0
+            if not {"depth", "conf", "mask"}.issubset(datasets):
+                raise DepthStorageError(f"fusion source has missing datasets: {path}")
+            depth = np.asarray(datasets["depth"], dtype=np.float32)
+            conf = np.asarray(datasets["conf"], dtype=np.float32)
+            mask = np.asarray(datasets["mask"], dtype=np.uint8) > 0
             if tuple(int(dim) for dim in depth.shape) != shape or conf.shape != depth.shape or mask.shape != depth.shape:
-                continue
+                raise DepthStorageError(f"fusion source shape mismatch: {path}")
             depth_rows.append(depth)
             conf_rows.append(conf)
             mask_rows.append(mask)
@@ -3321,16 +5115,21 @@ class DepthStorageManager:
             source_timestamps.append(int(ts))
             rgb_arr = datasets.get("rgb")
             if rgb_arr is not None:
-                try:
-                    rgb_prepared = self._prepare_rgb_snapshot(np.asarray(rgb_arr))
-                    if rgb_prepared is not None:
-                        if rgb_prepared.shape[:2] != shape:
-                            rgb_prepared = cv2.resize(rgb_prepared, (shape[1], shape[0]), interpolation=cv2.INTER_LINEAR)
-                        rgb_rows.append(np.ascontiguousarray(rgb_prepared[:, :, :3], dtype=np.uint8))
-                except Exception:
-                    pass
-        if not depth_rows:
-            raise ValueError("no_shape_compatible_snapshots_to_fuse")
+                rgb_prepared = self._prepare_rgb_snapshot(np.asarray(rgb_arr))
+                if rgb_prepared is None or rgb_prepared.shape[:2] != shape:
+                    raise DepthStorageError(f"fusion source RGB shape mismatch: {path}")
+                rgb_rows.append(np.ascontiguousarray(rgb_prepared[:, :, :3], dtype=np.uint8))
+        if len(depth_rows) != len(snapshots):
+            raise DepthStorageError("fusion source cohort changed during preparation")
+
+        def _newest_source_index(indices: Iterable[int]) -> int:
+            candidates = [int(index) for index in indices]
+            if not candidates:
+                raise ValueError("newest source selection requires a candidate")
+            return max(
+                candidates,
+                key=lambda index: (source_timestamps[index], index),
+            )
 
         depth_stack = np.stack(depth_rows, axis=0).astype(np.float32, copy=False)
         conf_stack = np.stack(conf_rows, axis=0).astype(np.float32, copy=False)
@@ -3342,28 +5141,311 @@ class DepthStorageManager:
             & np.isfinite(conf_stack)
             & (conf_stack >= float(min_confidence))
         )
-        masked_depth = np.ma.array(depth_stack, mask=~valid)
+
+        # MapAnything is monocular and its metric scale can move coherently
+        # between adjacent frames even when fixed-camera geometry is otherwise
+        # stable. Align each materially shifted frame to the cohort-median
+        # valid-depth scale before applying the local per-pixel consensus gate.
+        frame_scale_medians = np.full(len(depth_rows), np.nan, dtype=np.float64)
+        for index in range(len(depth_rows)):
+            values = depth_stack[index][valid[index]]
+            if values.size:
+                frame_scale_medians[index] = float(np.median(values))
+        finite_scales = np.isfinite(frame_scale_medians) & (frame_scale_medians > 0.0)
+        scale_baseline = (
+            float(np.median(frame_scale_medians[finite_scales]))
+            if np.any(finite_scales)
+            else 1.0
+        )
+        reference_index = _newest_source_index(range(len(depth_rows)))
+        reference_selection_fallback = "newest_admitted_frame"
+        if np.any(finite_scales):
+            finite_indices = np.flatnonzero(finite_scales)
+            # Keep a deterministic fallback for a one-frame cohort or a cohort
+            # with no pairwise overlap. The normal path below replaces this
+            # with a geometry medoid after frame-scale normalization.
+            scale_distance = np.abs(
+                np.log(frame_scale_medians[finite_indices] / scale_baseline)
+            )
+            best_distance = float(np.min(scale_distance))
+            tied = finite_indices[
+                np.isclose(scale_distance, best_distance, rtol=0.0, atol=1e-12)
+            ]
+            reference_index = _newest_source_index(tied)
+            reference_selection_fallback = "nearest_cohort_median_scale"
+        scale_factors = np.ones(len(depth_rows), dtype=np.float32)
+        proposed_scale_factors = np.ones(len(depth_rows), dtype=np.float64)
+        scale_normalization_applied = np.zeros(len(depth_rows), dtype=bool)
+        scale_normalization_rejected = np.zeros(len(depth_rows), dtype=bool)
+        if bool(normalize_frame_scale) and np.isfinite(scale_baseline) and scale_baseline > 0.0:
+            relative_change = np.zeros(len(depth_rows), dtype=np.float64)
+            relative_change[finite_scales] = np.abs(
+                frame_scale_medians[finite_scales] - scale_baseline
+            ) / scale_baseline
+            scale_candidates = finite_scales & (
+                relative_change >= _FUSION_FRAME_SCALE_MIN_RELATIVE_CHANGE
+            )
+            proposed_scale_factors[scale_candidates] = (
+                scale_baseline / frame_scale_medians[scale_candidates]
+            )
+            scale_normalization_rejected = scale_candidates & (
+                (proposed_scale_factors < _FUSION_FRAME_SCALE_FACTOR_MIN)
+                | (proposed_scale_factors > _FUSION_FRAME_SCALE_FACTOR_MAX)
+            )
+            scale_normalization_applied = scale_candidates & (
+                ~scale_normalization_rejected
+            )
+            scale_factors[scale_normalization_applied] = (
+                proposed_scale_factors[scale_normalization_applied]
+            ).astype(np.float32)
+            # An unreasonable whole-frame scale is evidence that the frame is
+            # not part of the same geometric cohort. Quarantine that frame
+            # instead of clipping its factor into a plausible-looking result.
+            if np.any(scale_normalization_rejected):
+                valid[scale_normalization_rejected, :, :] = False
+        normalized_depth_stack = depth_stack * scale_factors[:, None, None]
+
+        # Select one coherent frame for the output surface. MapAnything's
+        # monocular prediction moves slightly between observations even for a
+        # fixed camera. Per-pixel temporal selection turned those differences
+        # into hundreds of thousands of source-switch edges. A pairwise medoid
+        # retains one internally consistent room reconstruction while still
+        # using the whole burst to choose it. Coverage eligibility prevents a
+        # tiny, accidentally perfect overlap from beating a room-scale frame.
+        frame_valid_pixels = np.count_nonzero(valid, axis=(1, 2)).astype(
+            np.int64,
+            copy=False,
+        )
+        maximum_frame_valid_pixels = int(
+            np.max(frame_valid_pixels)
+        )
+        minimum_reference_pixels = max(
+            1,
+            int(
+                math.ceil(
+                    maximum_frame_valid_pixels
+                    * float(_FUSION_MEDOID_MIN_RELATIVE_COVERAGE)
+                )
+            ),
+        )
+        reference_coverage_eligible = (
+            (frame_valid_pixels >= minimum_reference_pixels)
+            & (~scale_normalization_rejected)
+        )
+        eligible_indices = np.flatnonzero(reference_coverage_eligible)
+        if eligible_indices.size:
+            finite_eligible = eligible_indices[
+                finite_scales[eligible_indices]
+            ]
+            if finite_eligible.size:
+                eligible_scale_distance = np.abs(
+                    np.log(
+                        frame_scale_medians[finite_eligible]
+                        / scale_baseline
+                    )
+                )
+                best_eligible_distance = float(
+                    np.min(eligible_scale_distance)
+                )
+                tied_eligible = finite_eligible[
+                    np.isclose(
+                        eligible_scale_distance,
+                        best_eligible_distance,
+                        rtol=0.0,
+                        atol=1e-12,
+                    )
+                ]
+                reference_index = _newest_source_index(tied_eligible)
+                reference_selection_fallback = (
+                    "coverage_eligible_nearest_cohort_median_scale"
+                )
+            else:
+                reference_index = _newest_source_index(eligible_indices)
+                reference_selection_fallback = (
+                    "coverage_eligible_newest_admitted_frame"
+                )
+
+        pairwise_cost = np.full(
+            (len(depth_rows), len(depth_rows)),
+            np.nan,
+            dtype=np.float64,
+        )
+        pairwise_overlap = np.zeros(
+            (len(depth_rows), len(depth_rows)),
+            dtype=np.int64,
+        )
+        for left in range(len(depth_rows)):
+            if not np.any(valid[left]):
+                continue
+            pairwise_cost[left, left] = 0.0
+            pairwise_overlap[left, left] = int(np.count_nonzero(valid[left]))
+            for right in range(left + 1, len(depth_rows)):
+                overlap = valid[left] & valid[right]
+                overlap_count = int(np.count_nonzero(overlap))
+                if overlap_count <= 0:
+                    continue
+                residual = np.abs(
+                    normalized_depth_stack[left][overlap]
+                    - normalized_depth_stack[right][overlap]
+                )
+                residual = residual[np.isfinite(residual)]
+                if residual.size <= 0:
+                    continue
+                p50 = float(np.percentile(residual, 50.0))
+                p90 = float(np.percentile(residual, 90.0))
+                cost = p50 + (0.25 * p90)
+                pairwise_cost[left, right] = cost
+                pairwise_cost[right, left] = cost
+                pairwise_overlap[left, right] = overlap_count
+                pairwise_overlap[right, left] = overlap_count
+
+        medoid_scores = np.full(len(depth_rows), np.inf, dtype=np.float64)
+        medoid_peer_counts = np.zeros(len(depth_rows), dtype=np.int64)
+        effective_medoid_frame_count = int(
+            np.count_nonzero(
+                (frame_valid_pixels > 0)
+                & (~scale_normalization_rejected)
+            )
+        )
+        minimum_medoid_peer_count = (
+            max(1, effective_medoid_frame_count // 2)
+            if effective_medoid_frame_count > 1
+            else 0
+        )
+        for index in range(len(depth_rows)):
+            if not reference_coverage_eligible[index]:
+                continue
+            peers = (
+                np.isfinite(pairwise_cost[index])
+                & (frame_valid_pixels > 0)
+                & (~scale_normalization_rejected)
+            )
+            peers[index] = False
+            medoid_peer_counts[index] = int(np.count_nonzero(peers))
+            if medoid_peer_counts[index] >= minimum_medoid_peer_count:
+                overlap_weights = pairwise_overlap[index][peers].astype(
+                    np.float64,
+                    copy=False,
+                )
+                positive_overlap = overlap_weights > 0.0
+                if not np.any(positive_overlap):
+                    continue
+                medoid_scores[index] = float(
+                    np.average(
+                        pairwise_cost[index][peers][positive_overlap],
+                        weights=overlap_weights[positive_overlap],
+                    )
+                )
+        finite_medoid = np.isfinite(medoid_scores)
+        reference_selection = reference_selection_fallback
+        if np.any(finite_medoid):
+            best_score = float(np.min(medoid_scores[finite_medoid]))
+            tied = np.flatnonzero(
+                finite_medoid
+                & np.isclose(
+                    medoid_scores,
+                    best_score,
+                    rtol=0.0,
+                    atol=1e-12,
+                )
+            )
+            reference_index = _newest_source_index(tied)
+            reference_selection = "pairwise_residual_medoid"
+
+        masked_depth = np.ma.array(normalized_depth_stack, mask=~valid)
         median_depth = np.ma.median(masked_depth, axis=0).filled(np.nan).astype(np.float32)
         tolerance = float(depth_agreement_m) + np.nan_to_num(median_depth, nan=0.0, posinf=0.0, neginf=0.0) * 0.025
-        agreeing = valid & np.isfinite(median_depth)[None, :, :] & (np.abs(depth_stack - median_depth[None, :, :]) <= tolerance[None, :, :])
+        absolute_residual = np.abs(
+            normalized_depth_stack - median_depth[None, :, :]
+        )
+        agreeing = (
+            valid
+            & np.isfinite(median_depth)[None, :, :]
+            & (absolute_residual <= tolerance[None, :, :])
+        )
         support = np.count_nonzero(agreeing, axis=0)
-        required = max(1, min(int(min_observations), len(depth_rows)))
+        valid_observations = np.count_nonzero(valid, axis=0)
+        quarantined_frame_count = int(
+            np.count_nonzero(scale_normalization_rejected)
+        )
+        effective_cohort_size = max(
+            0,
+            int(len(depth_rows)) - quarantined_frame_count,
+        )
+        minimum_effective_cohort_size = min(
+            len(depth_rows),
+            max(
+                int(min_observations),
+                min(
+                    int(_FUSION_MIN_COHORT_OBSERVATIONS),
+                    len(depth_rows),
+                ),
+            ),
+        )
+        effective_cohort_sufficient = bool(
+            effective_cohort_size >= minimum_effective_cohort_size
+        )
+        ratio_required = int(
+            math.ceil(
+                effective_cohort_size * float(min_observation_ratio)
+            )
+        )
+        cohort_floor_required = min(
+            int(_FUSION_MIN_COHORT_OBSERVATIONS),
+            effective_cohort_size,
+        )
+        strict_majority_required = (
+            (effective_cohort_size // 2) + 1
+            if effective_cohort_size > 1
+            else 1
+        )
+        required = max(
+            1,
+            min(
+                max(1, effective_cohort_size),
+                max(
+                    int(min_observations),
+                    cohort_floor_required,
+                    strict_majority_required,
+                    ratio_required,
+                ),
+            ),
+        )
+        eligible_mask = valid_observations >= required
         fused_mask_bool = support >= required
 
-        weights = np.where(agreeing, np.clip(conf_stack, 0.0, None), 0.0).astype(np.float32, copy=False)
-        weight_sum = np.sum(weights, axis=0)
-        weighted_depth_sum = np.sum(np.where(agreeing, depth_stack, 0.0) * weights, axis=0)
-        fused_depth = np.zeros(shape, dtype=np.float32)
-        np.divide(weighted_depth_sum, weight_sum, out=fused_depth, where=weight_sum > 0.0)
-        fallback = fused_mask_bool & ~(weight_sum > 0.0) & np.isfinite(median_depth)
-        fused_depth[fallback] = median_depth[fallback]
-        fused_depth[~fused_mask_bool] = 0.0
-
-        conf_sum = np.sum(np.where(agreeing, conf_stack, 0.0), axis=0)
-        fused_conf = np.zeros(shape, dtype=np.float32)
-        np.divide(conf_sum, support, out=fused_conf, where=support > 0)
-        fused_conf[~fused_mask_bool] = 0.0
-        fused_mask = fused_mask_bool.astype(np.uint8, copy=False)
+        # MapAnything confidence is not bounded to [0, 1] and its scale can
+        # shift between frames. Retain robust per-frame caps as diagnostics;
+        # confidence never mixes geometry between frames in the coherent
+        # medoid output policy.
+        confidence_caps = np.ones(len(depth_rows), dtype=np.float64)
+        for index in range(len(depth_rows)):
+            values = conf_stack[index][valid[index]]
+            if values.size:
+                cap = float(
+                    np.percentile(
+                        values,
+                        _FUSION_CONFIDENCE_CAP_PERCENTILE,
+                    )
+                )
+                if np.isfinite(cap) and cap > 0.0:
+                    confidence_caps[index] = cap
+        # Preserve the selected frame as one coherent surface. Other frames
+        # remain temporal support and quality evidence only; they never donate
+        # isolated pixels to the output geometry.
+        output_mask_bool = valid[reference_index].copy()
+        continuity_mask = np.zeros(shape, dtype=bool)
+        fused_depth = np.where(
+            output_mask_bool,
+            normalized_depth_stack[reference_index],
+            0.0,
+        ).astype(np.float32, copy=False)
+        fused_conf = np.where(
+            output_mask_bool,
+            conf_stack[reference_index],
+            0.0,
+        ).astype(np.float32, copy=False)
+        fused_mask = output_mask_bool.astype(np.uint8, copy=False)
 
         fused_rgb = None
         if rgb is not None:
@@ -3373,19 +5455,191 @@ class DepthStorageManager:
                     rgb_prepared = cv2.resize(rgb_prepared, (shape[1], shape[0]), interpolation=cv2.INTER_LINEAR)
                 fused_rgb = np.ascontiguousarray(rgb_prepared[:, :, :3], dtype=np.uint8)
         elif rgb_rows:
-            if len(rgb_rows) == 1:
+            if len(rgb_rows) == len(depth_rows):
+                fused_rgb = rgb_rows[reference_index]
+            elif len(rgb_rows) == 1:
                 fused_rgb = rgb_rows[0]
             else:
                 fused_rgb = np.median(np.stack(rgb_rows, axis=0).astype(np.float32), axis=0).astype(np.uint8)
 
+        full_frame_pixels = int(fused_mask_bool.size)
+        eligible_pixels = int(np.count_nonzero(eligible_mask))
+        consensus_pixels = int(np.count_nonzero(fused_mask_bool))
+        continuity_pixels = int(np.count_nonzero(continuity_mask))
+        output_pixels = int(np.count_nonzero(output_mask_bool))
+        support_histogram = np.bincount(
+            support.ravel().astype(np.int64, copy=False),
+            minlength=len(depth_rows) + 1,
+        )
+        residual_values = absolute_residual[
+            valid & np.isfinite(median_depth)[None, :, :]
+        ]
+        support_evidence = {
+            "contract": "noesis.depth.fusion.support.v1",
+            "cohort_size": int(len(depth_rows)),
+            "effective_cohort_size": effective_cohort_size,
+            "minimum_effective_cohort_size": int(
+                minimum_effective_cohort_size
+            ),
+            "effective_cohort_sufficient": effective_cohort_sufficient,
+            "required_observations_basis": "non_quarantined_frames",
+            "full_frame_pixels": full_frame_pixels,
+            "required_observations": int(required),
+            "fixed_min_observations": int(min_observations),
+            "cohort_floor_observations": int(cohort_floor_required),
+            "strict_majority_observations": int(
+                strict_majority_required
+            ),
+            "tie_policy": "reject_exact_half_support",
+            "min_observation_ratio": float(min_observation_ratio),
+            "ratio_required_observations": int(ratio_required),
+            "quarantined_frame_count": quarantined_frame_count,
+            "quarantined_frame_indices": [
+                int(index)
+                for index, rejected in enumerate(scale_normalization_rejected)
+                if rejected
+            ],
+            "eligible_pixels": eligible_pixels,
+            "eligible_full_frame_fraction": float(
+                eligible_pixels / max(1, full_frame_pixels)
+            ),
+            "consensus_pixels": consensus_pixels,
+            "consensus_full_frame_fraction": float(
+                consensus_pixels / max(1, full_frame_pixels)
+            ),
+            "consensus_retained_eligible_fraction": float(
+                consensus_pixels / max(1, eligible_pixels)
+            ),
+            "continuity_pixels": continuity_pixels,
+            "continuity_full_frame_fraction": float(
+                continuity_pixels / max(1, full_frame_pixels)
+            ),
+            "output_pixels": output_pixels,
+            "output_full_frame_fraction": float(
+                output_pixels / max(1, full_frame_pixels)
+            ),
+            "support_count_histogram": {
+                str(index): int(value)
+                for index, value in enumerate(support_histogram.tolist())
+            },
+            "component_evidence": _binary_mask_component_evidence(fused_mask_bool),
+            "output_component_evidence": _binary_mask_component_evidence(
+                output_mask_bool
+            ),
+            "temporal_absolute_residual_median_m": (
+                float(np.median(residual_values)) if residual_values.size else 0.0
+            ),
+            "temporal_absolute_residual_p95_m": (
+                float(np.percentile(residual_values, 95.0))
+                if residual_values.size
+                else 0.0
+            ),
+        }
         meta = {
             "source_snapshot_count": int(len(depth_rows)),
             "source_snapshot_paths": source_paths,
             "source_timestamps_us": source_timestamps,
             "min_observations": int(required),
+            "min_observations_requested": int(min_observations),
+            "min_observation_ratio": float(min_observation_ratio),
             "depth_agreement_m": float(depth_agreement_m),
-            "support_valid_fraction": float(np.count_nonzero(fused_mask_bool) / max(1, fused_mask_bool.size)),
+            "support_valid_fraction": float(
+                consensus_pixels / max(1, full_frame_pixels)
+            ),
+            "output_valid_fraction": float(
+                output_pixels / max(1, full_frame_pixels)
+            ),
             "median_support": float(np.median(support[fused_mask_bool])) if np.any(fused_mask_bool) else 0.0,
+            "support_evidence": support_evidence,
+            "fusion_output": {
+                "contract": "noesis.depth.fusion.output.v3",
+                "algorithm": "coherent_pairwise_medoid_reference_surface",
+                "selection": reference_selection,
+                "reference_frame_index": int(reference_index),
+                "reference_timestamp_us": int(
+                    source_timestamps[reference_index]
+                ),
+                "reference_medoid_score_m": (
+                    float(medoid_scores[reference_index])
+                    if np.isfinite(medoid_scores[reference_index])
+                    else None
+                ),
+                "medoid_scores_m": [
+                    float(value) if np.isfinite(value) else None
+                    for value in medoid_scores
+                ],
+                "pairwise_overlap_pixels": [
+                    [int(value) for value in row]
+                    for row in pairwise_overlap.tolist()
+                ],
+                "frame_valid_pixels": [
+                    int(value) for value in frame_valid_pixels
+                ],
+                "minimum_reference_pixels": int(
+                    minimum_reference_pixels
+                ),
+                "minimum_relative_reference_coverage": float(
+                    _FUSION_MEDOID_MIN_RELATIVE_COVERAGE
+                ),
+                "reference_coverage_eligible": [
+                    bool(value)
+                    for value in reference_coverage_eligible
+                ],
+                "medoid_peer_counts": [
+                    int(value) for value in medoid_peer_counts
+                ],
+                "minimum_medoid_peer_count": int(
+                    minimum_medoid_peer_count
+                ),
+                "consensus_pixels": consensus_pixels,
+                "continuity_pixels": 0,
+                "depth_source_policy": "selected_reference_frame_only",
+            },
+            "frame_scale_normalization": {
+                "contract": "noesis.depth.fusion.frame_scale_normalization.v1",
+                "enabled": bool(normalize_frame_scale),
+                "algorithm": "depth_times_cohort_median_over_frame_median",
+                "statistic": "median_valid_depth",
+                "baseline": float(scale_baseline),
+                "reference_frame_index": int(reference_index),
+                "reference_timestamp_us": int(
+                    source_timestamps[reference_index]
+                ),
+                "minimum_relative_change": float(
+                    _FUSION_FRAME_SCALE_MIN_RELATIVE_CHANGE
+                ),
+                "accepted_factor_bounds": [
+                    float(_FUSION_FRAME_SCALE_FACTOR_MIN),
+                    float(_FUSION_FRAME_SCALE_FACTOR_MAX),
+                ],
+                "frame_medians": [
+                    float(value) if np.isfinite(value) else None
+                    for value in frame_scale_medians
+                ],
+                "proposed_factors": [
+                    float(value) if np.isfinite(value) else None
+                    for value in proposed_scale_factors
+                ],
+                "factors": [float(value) for value in scale_factors],
+                "applied": [
+                    bool(value) for value in scale_normalization_applied
+                ],
+                "rejected": [
+                    bool(value) for value in scale_normalization_rejected
+                ],
+                "rejection_policy": "quarantine_entire_frame",
+            },
+            "confidence_weighting": {
+                "contract": "noesis.depth.fusion.confidence_weighting.v1",
+                "algorithm": "per_frame_percentile_cap_diagnostic_only",
+                "cap_percentile": float(
+                    _FUSION_CONFIDENCE_CAP_PERCENTILE
+                ),
+                "weight_floor": float(_FUSION_CONFIDENCE_WEIGHT_FLOOR),
+                "frame_caps": [float(value) for value in confidence_caps],
+                "weight_min": 0.0,
+                "weight_max": 1.0,
+            },
             "rgb_source_count": int(len(rgb_rows)),
             "rgb_override_used": bool(rgb is not None),
         }
@@ -3399,90 +5653,307 @@ class DepthStorageManager:
         rgb: Optional[np.ndarray] = None,
         min_confidence: Optional[float] = None,
         min_observations: int = 2,
+        min_observation_ratio: float = _FUSION_DEFAULT_MIN_OBSERVATION_RATIO,
         depth_agreement_m: float = 0.18,
+        normalize_frame_scale: bool = True,
         snapshot_role: str = "capture_event_fused",
         fusion_level: str = "intra_capture",
         event_id: Optional[str] = None,
         ts_us: Optional[int] = None,
     ) -> Tuple[Path, Dict[str, Any]]:
+        if not entries:
+            raise DepthStorageError("fusion requires at least one exact source snapshot")
         loaded: List[Tuple[int, Path, Mapping[str, np.ndarray]]] = []
-        for ts, path in entries:
-            if not path.exists():
-                continue
-            if self._snapshot_is_derived(path):
-                continue
-            datasets = self.load_datasets(path)
-            if not datasets:
-                continue
-            loaded.append((int(ts), path, datasets))
-        if not loaded:
-            raise ValueError("no_raw_snapshots_to_fuse")
-        min_conf = float(self.min_conf if min_confidence is None else min_confidence)
-        if not np.isfinite(min_conf):
-            min_conf = 0.0
-        fused_depth, fused_conf, fused_mask, fused_rgb, meta = self._fuse_depth_datasets(
-            loaded,
-            min_confidence=min_conf,
-            min_observations=int(min_observations),
-            depth_agreement_m=float(depth_agreement_m),
-            rgb=rgb,
-        )
-        source_ts = [int(ts) for ts, _path, _datasets in loaded]
-        fused_ts = int(ts_us) if ts_us is not None else max(int(time.time() * 1_000_000), max(source_ts) + 1)
-        dest_path = self.store(camera_id, fused_ts, fused_depth, fused_conf, fused_mask, rgb=fused_rgb)
-        try:
-            self.flush(timeout=5.0)
-        except Exception:
-            pass
-        attrs = {
-            "snapshot_role": str(snapshot_role),
-            "fusion_level": str(fusion_level),
-            "fusion_meta": json.dumps(meta, separators=(",", ":")),
-            "source_snapshot_paths": json.dumps(meta.get("source_snapshot_paths") or [], separators=(",", ":")),
-            "source_timestamps_us": json.dumps(meta.get("source_timestamps_us") or [], separators=(",", ":")),
-            "source_snapshot_count": int(meta.get("source_snapshot_count") or 0),
-            "event_id": str(event_id or f"{camera_id}:{min(source_ts)}:{max(source_ts)}"),
-            "event_start_ts_us": int(min(source_ts)),
-            "event_end_ts_us": int(max(source_ts)),
-        }
-        try:
-            root = zarr.open_group(str(dest_path), mode="a")
-            root.attrs.update(**attrs)
-        except Exception:
-            self._logger.debug("Failed to write fusion attrs for %s", dest_path, exc_info=True)
+        source_descriptors: List[SnapshotDescriptor] = []
+        seen_sources: set[Tuple[int, Path]] = set()
+        with ExitStack() as leases:
+            for ts, raw_path in entries:
+                path = self._coerce_snapshot_path(raw_path)
+                requested_ts = int(ts)
+                source_key = (requested_ts, path)
+                if source_key in seen_sources:
+                    raise DepthStorageError(f"duplicate fusion source: {path}")
+                seen_sources.add(source_key)
+                lease = leases.enter_context(self.acquire_read_lease(path))
+                descriptor = self.describe_snapshot(lease.path, lease=lease)
+                if descriptor.camera_id != str(camera_id):
+                    raise DepthStorageError(
+                        f"fusion source camera mismatch: expected {camera_id}, got {descriptor.camera_id}"
+                    )
+                if descriptor.ts_us != requested_ts:
+                    raise DepthStorageError(
+                        f"fusion source timestamp mismatch: requested {requested_ts}, "
+                        f"committed {descriptor.ts_us}"
+                    )
+                descriptor_role = descriptor.snapshot_role.strip().lower()
+                descriptor_level = descriptor.fusion_level.strip().lower()
+                if descriptor_role in {"capture_event_fused", "reconstruction_fused"} or descriptor_level in {
+                    "intra_capture",
+                    "inter_capture",
+                }:
+                    raise DepthStorageError(f"derived snapshot cannot be a fusion source: {path}")
+                datasets = self.load_datasets(lease.path, lease=lease)
+                loaded.append((requested_ts, lease.path, datasets))
+                source_descriptors.append(descriptor)
+            min_conf = float(self.min_conf if min_confidence is None else min_confidence)
+            if not np.isfinite(min_conf):
+                min_conf = 0.0
+            support_ratio = float(min_observation_ratio)
+            if not np.isfinite(support_ratio) or not 0.0 <= support_ratio <= 1.0:
+                raise ValueError("min_observation_ratio must be finite and in [0, 1]")
+            if type(normalize_frame_scale) is not bool:  # noqa: E721
+                raise ValueError("normalize_frame_scale must be a boolean")
+            fused_depth, fused_conf, fused_mask, fused_rgb, meta = self._fuse_depth_datasets(
+                loaded,
+                min_confidence=min_conf,
+                min_observations=int(min_observations),
+                min_observation_ratio=support_ratio,
+                depth_agreement_m=float(depth_agreement_m),
+                normalize_frame_scale=normalize_frame_scale,
+                rgb=rgb,
+            )
+            requested_paths = [str(descriptor.path) for descriptor in source_descriptors]
+            requested_timestamps = [descriptor.ts_us for descriptor in source_descriptors]
+            if meta.get("source_snapshot_paths") != requested_paths or meta.get(
+                "source_timestamps_us"
+            ) != requested_timestamps:
+                raise DepthStorageError("fusion implementation changed the sealed source cohort")
+            support_evidence = meta.get("support_evidence")
+            if not isinstance(support_evidence, Mapping):
+                raise DepthStorageError("fusion implementation omitted support evidence")
+            minimum_capture_support = float(_CAPTURE_EVENT_MIN_FULL_FRAME_SUPPORT)
+            observed_capture_support = float(
+                support_evidence.get("consensus_full_frame_fraction") or 0.0
+            )
+            observed_output_support = float(
+                support_evidence.get("output_full_frame_fraction") or 0.0
+            )
+            effective_cohort_sufficient = bool(
+                support_evidence.get("effective_cohort_sufficient")
+            )
+            meta["support_quality_gate"] = {
+                "contract": "noesis.depth.fusion.quality_gate.v1",
+                "metric": "consensus_full_frame_fraction",
+                "observed": observed_capture_support,
+                "required": minimum_capture_support,
+                "passed": bool(
+                    observed_capture_support >= minimum_capture_support
+                    and observed_output_support >= minimum_capture_support
+                    and effective_cohort_sufficient
+                ),
+            }
+            if (
+                str(snapshot_role).strip().lower() == "capture_event_fused"
+                and str(fusion_level).strip().lower() == "intra_capture"
+                and (
+                    observed_capture_support < minimum_capture_support
+                    or observed_output_support < minimum_capture_support
+                    or not effective_cohort_sufficient
+                )
+            ):
+                if not effective_cohort_sufficient:
+                    raise DepthFusionQualityError(
+                        observed=float(
+                            support_evidence.get("effective_cohort_size") or 0
+                        ),
+                        required=float(
+                            support_evidence.get(
+                                "minimum_effective_cohort_size"
+                            )
+                            or 0
+                        ),
+                        metric="effective_cohort_size",
+                        evidence=support_evidence,
+                    )
+                if observed_output_support < minimum_capture_support:
+                    raise DepthFusionQualityError(
+                        observed=observed_output_support,
+                        required=minimum_capture_support,
+                        metric="output_full_frame_fraction",
+                        evidence=support_evidence,
+                    )
+                raise DepthFusionQualityError(
+                    observed=observed_capture_support,
+                    required=minimum_capture_support,
+                    evidence=support_evidence,
+                )
+            source_evidence = [
+                {
+                    "camera_id": descriptor.camera_id,
+                    "timestamp_us": descriptor.ts_us,
+                    "write_id": descriptor.write_id,
+                    "sequence": descriptor.sequence,
+                    "path": str(descriptor.path),
+                    "storage_ref": descriptor.storage_ref,
+                    "manifest_sha256": descriptor.manifest_sha256,
+                    "content_sha256": descriptor.content_sha256,
+                    "snapshot_role": descriptor.snapshot_role,
+                    "fusion_level": descriptor.fusion_level,
+                }
+                for descriptor in source_descriptors
+            ]
+            meta["source_snapshots"] = source_evidence
+            source_ts = [int(ts) for ts, _path, _datasets in loaded]
+            fused_ts = int(ts_us) if ts_us is not None else max(
+                int(time.time() * 1_000_000),
+                max(source_ts) + 1,
+            )
+            attrs = {
+                "snapshot_role": str(snapshot_role),
+                "fusion_level": str(fusion_level),
+                "fusion_meta": json.dumps(meta, separators=(",", ":")),
+                "source_snapshot_paths": json.dumps(
+                    meta.get("source_snapshot_paths") or [], separators=(",", ":")
+                ),
+                "source_timestamps_us": json.dumps(
+                    meta.get("source_timestamps_us") or [], separators=(",", ":")
+                ),
+                "source_snapshot_count": int(meta.get("source_snapshot_count") or 0),
+                "source_snapshots": json.dumps(source_evidence, separators=(",", ":")),
+                "event_id": str(event_id or f"{camera_id}:{min(source_ts)}:{max(source_ts)}"),
+                "event_start_ts_us": int(min(source_ts)),
+                "event_end_ts_us": int(max(source_ts)),
+            }
+            handle = self.store(
+                camera_id,
+                fused_ts,
+                fused_depth,
+                fused_conf,
+                fused_mask,
+                rgb=fused_rgb,
+                attrs=attrs,
+            )
+            receipt = handle.wait(timeout=self.public_commit_timeout_s)
+            dest_path = receipt.path
+            fused_descriptor = self.describe_snapshot(dest_path)
         with self._cache_lock:
             self._depth_payload_cache.pop(camera_id, None)
         self.invalidate_floorplan_cache(camera_id)
-        return dest_path, {**meta, **attrs, "fused_snapshot_path": str(dest_path), "fused_timestamp_us": int(fused_ts)}
+        return dest_path, {
+            **attrs,
+            **meta,
+            "fused_snapshot_path": str(dest_path),
+            "fused_storage_ref": fused_descriptor.storage_ref,
+            "fused_timestamp_us": int(fused_ts),
+            "fused_write_id": fused_descriptor.write_id,
+            "fused_sequence": fused_descriptor.sequence,
+            "fused_manifest_sha256": fused_descriptor.manifest_sha256,
+            "fused_content_sha256": fused_descriptor.content_sha256,
+        }
 
-    def _write_snapshot(self, job: _SnapshotJob) -> None:
-        job.dest_path.parent.mkdir(parents=True, exist_ok=True)
+    @classmethod
+    def _fsync_snapshot_tree(cls, root: Path) -> None:
+        directories: List[Path] = []
+        for path in sorted(root.rglob("*"), key=lambda item: item.as_posix()):
+            if path.is_symlink():
+                raise DepthStorageError(f"snapshot contains symlink: {path}")
+            if path.is_file():
+                descriptor = os.open(path, os.O_RDONLY)
+                try:
+                    os.fsync(descriptor)
+                finally:
+                    os.close(descriptor)
+            elif path.is_dir():
+                directories.append(path)
+        for directory in reversed(directories):
+            cls._fsync_directory(directory)
+        cls._fsync_directory(root)
+
+    def _write_snapshot(self, job: _SnapshotJob) -> CommitReceipt:
+        self._ensure_parent_chain_durable(job.dest_path.parent)
+        staging_path = job.dest_path.parent / f".{job.ts_us}.{job.write_id}.staging"
+        if staging_path.exists() or staging_path.is_symlink():
+            raise DepthStorageError(f"staging path already exists: {staging_path}")
         compressor = self._make_blosc_compressor()
-        root = zarr.open_group(str(job.dest_path), mode="w")
-        if self._zarr_chunk_px and self._zarr_chunk_px > 0:
-            chunk_shape = (min(self._zarr_chunk_px, job.depth.shape[0]), min(self._zarr_chunk_px, job.depth.shape[1]))
-        else:
-            # Single-chunk per array to minimize file count
-            chunk_shape = job.depth.shape
-        self._create_zarr_dataset(root, "depth_z", job.depth, chunk_shape, compressor)
-        self._create_zarr_dataset(root, "conf", job.conf, chunk_shape, compressor)
-        self._create_zarr_dataset(root, "mask", job.mask, chunk_shape, compressor)
-        if job.rgb is not None:
-            self._write_rgb_dataset(root, job.rgb, compressor)
-        root.attrs.update(
-            camera_id=job.camera_id,
-            timestamp_us=int(job.ts_us),
-            stored_at=time.time(),
-            shape=json.dumps(job.depth.shape),
-        )
-        self._register_snapshot(job.camera_id, job.ts_us, job.dest_path)
-
-    def _remove_snapshot(self, path: Path) -> None:
+        published = False
         try:
-            if path.exists():
-                shutil.rmtree(path, ignore_errors=True)
+            root = zarr.open_group(str(staging_path), mode="w")
+            if self._zarr_chunk_px and self._zarr_chunk_px > 0:
+                chunk_shape = (
+                    min(self._zarr_chunk_px, job.depth.shape[0]),
+                    min(self._zarr_chunk_px, job.depth.shape[1]),
+                )
+            else:
+                chunk_shape = job.depth.shape
+            self._create_zarr_dataset(root, "depth_z", job.depth, chunk_shape, compressor)
+            self._create_zarr_dataset(root, "conf", job.conf, chunk_shape, compressor)
+            self._create_zarr_dataset(root, "mask", job.mask, chunk_shape, compressor)
+            if job.rgb is not None:
+                self._write_rgb_dataset(root, job.rgb, compressor)
+            root.attrs.update(**dict(job.attrs))
+            root.attrs.update(
+                camera_id=job.camera_id,
+                timestamp_us=int(job.ts_us),
+                stored_at=time.time(),
+                shape=json.dumps(job.depth.shape),
+                write_id=job.write_id,
+                sequence=int(job.sequence),
+                commit_contract="noesis_depth_snapshot_v2",
+            )
+            self._fsync_snapshot_tree(staging_path)
+            committed_at_ns = time.time_ns()
+            components = self._raw_component_records(
+                depth=job.depth,
+                conf=job.conf,
+                mask=job.mask,
+                rgb=job.rgb,
+            )
+            manifest = {
+                "version": self._COMMIT_MANIFEST_VERSION,
+                "state": "committed",
+                "write_id": job.write_id,
+                "sequence": int(job.sequence),
+                "camera_id": job.camera_id,
+                "timestamp_us": int(job.ts_us),
+                "committed_at_ns": int(committed_at_ns),
+                "components": components,
+                "files": self._snapshot_file_records(staging_path),
+            }
+            manifest_sha256 = self._write_manifest(staging_path, manifest)
+            validated = self._read_and_validate_commit_manifest(
+                staging_path,
+                require_final_name=False,
+            )
+            if validated.get("manifest_sha256") != manifest_sha256:
+                raise DepthStorageError("staged_manifest_digest_mismatch")
+            self._rename_noreplace(staging_path, job.dest_path)
+            published = True
+            self._fsync_directory(job.dest_path.parent)
+            final_manifest = self._read_and_validate_commit_manifest(
+                job.dest_path
+            )
+            self._register_snapshot(job.camera_id, job.ts_us, job.dest_path)
+            self._cache_validated_commit_manifest(
+                job.dest_path,
+                final_manifest,
+            )
+            return CommitReceipt(
+                write_id=job.write_id,
+                sequence=job.sequence,
+                camera_id=job.camera_id,
+                ts_us=job.ts_us,
+                path=job.dest_path,
+                manifest_sha256=manifest_sha256,
+                committed_at_ns=committed_at_ns,
+            )
+        finally:
+            if not published and staging_path.exists():
+                shutil.rmtree(staging_path, ignore_errors=True)
+
+    def _remove_snapshot(self, path: Path) -> bool:
+        snapshot_path = self._coerce_snapshot_path(path)
+        with self._state_lock:
+            if self._read_pins.get(snapshot_path, 0) > 0 or snapshot_path in self._deleting_paths:
+                return False
+            self._deleting_paths.add(snapshot_path)
+        self._invalidate_manifest_validation_cache(snapshot_path)
+        removed = False
+        try:
+            if snapshot_path.exists():
+                shutil.rmtree(snapshot_path)
+                self._fsync_directory(snapshot_path.parent)
                 # Clean up empty parent directories up to camera root
-                parent = path.parent
+                parent = snapshot_path.parent
                 for _ in range(2):
                     if parent == self.base_path or not parent.exists():
                         break
@@ -3491,13 +5962,24 @@ class DepthStorageManager:
                     except StopIteration:
                         parent.rmdir()
                     parent = parent.parent
+            removed = True
         except Exception as exc:
-            self._logger.debug("Failed to remove snapshot %s: %s", path, exc)
+            self._logger.error("Failed to remove committed snapshot %s: %s", snapshot_path, exc)
+            failure = self._record_system_failure("retention_delete", exc)
+            raise DepthStoragePoisonedError(
+                f"retention delete failed; storage poisoned by {failure.write_id}: {failure.message}"
+            ) from exc
+        finally:
+            with self._state_lock:
+                self._deleting_paths.discard(snapshot_path)
+                if removed:
+                    self._committed_paths.discard(snapshot_path)
+        return removed
 
     def _enforce_limits(
         self,
         camera_id: str,
-        index: Deque[Tuple[int, Path]],
+        index: List[Tuple[int, Path]],
         now_ts: Optional[int] = None,
     ) -> None:
         if not index:
@@ -3507,25 +5989,59 @@ class DepthStorageManager:
         if self._retention_us > 0:
             retention_cutoff = now_ts - self._retention_us
 
+        # Raw captures are rolling; retain exactly the newest public fused
+        # artifact until a newer one supersedes it.
+        protected_public_path = next(
+            (
+                path
+                for _timestamp_us, path in reversed(index)
+                if self._snapshot_has_public_bulk_role(path)
+            ),
+            None,
+        )
+
         removed = 0
         # Enforce retention duration first so age limit always wins
         if retention_cutoff is not None:
-            while index and index[0][0] < retention_cutoff:
-                _, path = index.popleft()
-                self._remove_snapshot(path)
-                removed += 1
+            candidate = 0
+            while candidate < len(index):
+                ts_us, path = index[candidate]
+                if ts_us >= retention_cutoff:
+                    break
+                if path == protected_public_path:
+                    candidate += 1
+                    continue
+                if self._remove_snapshot(path):
+                    index.pop(candidate)
+                    removed += 1
+                else:
+                    candidate += 1
 
         # Enforce max snapshot count with hysteresis to prevent thrash
         if self._max_snapshots > 0 and len(index) > self._max_snapshots:
             # determine floor based on 90% of max (at least 1)
             target_len = max(1, int(self._max_snapshots * 0.9))
             while len(index) > target_len:
-                _, path = index.popleft()
-                self._remove_snapshot(path)
+                removable_index = next(
+                    (
+                        position
+                        for position, (_ts, path) in enumerate(index)
+                        if path != protected_public_path
+                        and self._remove_snapshot(path)
+                    ),
+                    None,
+                )
+                if removable_index is None:
+                    break
+                index.pop(removable_index)
                 removed += 1
 
         if self._max_total_bytes is not None:
-            removed += self._enforce_total_size(camera_id, index)
+            removed += self._enforce_total_size(
+                camera_id,
+                index,
+                protected_path=protected_public_path,
+            )
 
         if removed:
             self._logger.info(
@@ -3536,7 +6052,13 @@ class DepthStorageManager:
                 self._retention_us,
             )
 
-    def _enforce_total_size(self, camera_id: str, index: Deque[Tuple[int, Path]]) -> int:
+    def _enforce_total_size(
+        self,
+        camera_id: str,
+        index: List[Tuple[int, Path]],
+        *,
+        protected_path: Optional[Path] = None,
+    ) -> int:
         if not index:
             return 0
         total_bytes = 0
@@ -3553,10 +6075,18 @@ class DepthStorageManager:
         # Hysteresis: prune down to a target below the hard cap to avoid frequent rescans
         target_bytes = int(self._max_total_bytes * self._size_hysteresis_ratio)
         while total_bytes > target_bytes and index:
-            ts, path = index.popleft()
-            size = sizes.pop(0)
-            total_bytes -= size
-            self._remove_snapshot(path)
+            removable_index = next(
+                (
+                    position
+                    for position, (_ts, path) in enumerate(index)
+                    if path != protected_path and self._remove_snapshot(path)
+                ),
+                None,
+            )
+            if removable_index is None:
+                break
+            total_bytes -= sizes.pop(removable_index)
+            index.pop(removable_index)
             removed += 1
 
         if removed and total_bytes > self._max_total_bytes:
@@ -3570,6 +6100,7 @@ class DepthStorageManager:
 
     def prune(self, camera_id: Optional[str] = None) -> int:
         """Manual pruning entrypoint; returns number of snapshots removed."""
+        self._expire_bulk_transfer_sessions()
         total_removed = 0
         if camera_id:
             lock = self._get_lock(camera_id)
@@ -3599,17 +6130,33 @@ class DepthStorageManager:
         lock = self._get_lock(camera_id)
         with lock:
             index = self._get_index(camera_id)
-            while index:
-                _, path = index.popleft()
-                self._remove_snapshot(path)
-                removed += 1
-        cam_dir = self.base_path / camera_id
+            candidate = 0
+            while candidate < len(index):
+                _, path = index[candidate]
+                if self._remove_snapshot(path):
+                    index.pop(candidate)
+                    removed += 1
+                else:
+                    candidate += 1
+        cam_dir = self.base_path / self._camera_directory_name(camera_id)
         if cam_dir.exists():
             try:
                 next(cam_dir.iterdir())
             except StopIteration:
                 cam_dir.rmdir()
         return removed
+
+    def _snapshot_destination(self, camera_id: str, ts_us: int) -> Path:
+        timestamp = datetime.fromtimestamp(int(ts_us) / 1_000_000.0, tz=timezone.utc)
+        date_dir = timestamp.strftime("%Y%m%d")
+        hour_dir = timestamp.strftime("%H")
+        return (
+            self.base_path
+            / self._camera_directory_name(camera_id)
+            / date_dir
+            / hour_dir
+            / f"{int(ts_us)}.zarr"
+        )
 
     def store(
         self,
@@ -3619,58 +6166,95 @@ class DepthStorageManager:
         conf: np.ndarray,
         mask: np.ndarray,
         rgb: Optional[np.ndarray] = None,
-    ) -> Path:
-        timestamp = datetime.utcfromtimestamp(ts_us / 1_000_000.0)
-        date_dir = timestamp.strftime("%Y%m%d")
-        hour_dir = timestamp.strftime("%H")
-        dest_dir = self.base_path / camera_id / date_dir / hour_dir
-        dest_path = dest_dir / f"{ts_us}.zarr"
-
-        job = self._create_job(camera_id, ts_us, depth, conf, mask, rgb, dest_path)
-        if self._async_enabled and self._queue is not None:
+        *,
+        attrs: Optional[Mapping[str, Any]] = None,
+    ) -> WriteHandle:
+        camera = str(camera_id or "").strip()
+        if not camera:
+            raise ValueError("camera_id is required")
+        timestamp_us = int(ts_us)
+        dest_path = self._snapshot_destination(camera, timestamp_us)
+        write_id = uuid.uuid4().hex
+        future: Future = Future()
+        key = (camera, timestamp_us)
+        with self._completion_cv:
+            if self._state is not StorageLifecycle.OPEN:
+                raise DepthStorageClosedError(f"depth storage admission is {self._state.value}")
+            if self._poison is not None:
+                failure = self._poison
+                raise DepthStoragePoisonedError(
+                    f"depth storage poisoned by write {failure.write_id}: "
+                    f"{failure.error_type}: {failure.message}"
+                )
+            if key in self._reserved_keys:
+                raise DuplicateSnapshotError(f"snapshot key already reserved: {camera}:{timestamp_us}")
+            q = self._queue
+            if q is None:
+                raise DepthStorageClosedError("depth storage writer queue is unavailable")
+            self._sequence += 1
+            sequence = int(self._sequence)
+            self._reserved_keys.add(key)
+            self._unfinished_sequences.add(sequence)
             try:
-                self._queue.put(job, timeout=self._queue_put_timeout)
-                return dest_path
-            except queue.Full:
-                if self._maybe_scale_workers():
-                    try:
-                        self._queue.put(job, timeout=self._queue_put_timeout)
-                        return dest_path
-                    except queue.Full:
-                        pass
-                now = time.time()
-                if now - self._last_queue_full_warning >= 5.0:
-                    self._logger.warning(
-                        "Depth snapshot queue full; writing synchronously (size=%s)",
-                        self._max_queue_size,
-                    )
-                    self._last_queue_full_warning = now
+                job = self._create_job(
+                    write_id,
+                    sequence,
+                    camera,
+                    timestamp_us,
+                    depth,
+                    conf,
+                    mask,
+                    rgb,
+                    attrs,
+                    dest_path,
+                    future,
+                )
+                try:
+                    q.put(job, timeout=self._queue_put_timeout)
+                except queue.Full:
+                    if self._maybe_scale_workers():
+                        q.put(job, timeout=self._queue_put_timeout)
+                    else:
+                        raise
+            except queue.Full as exc:
+                self._reserved_keys.discard(key)
+                self._unfinished_sequences.discard(sequence)
+                self._completion_cv.notify_all()
+                raise DepthStorageQueueFullError(
+                    f"depth snapshot queue is full (capacity={self._max_queue_size})"
+                ) from exc
+            except Exception:
+                self._reserved_keys.discard(key)
+                self._unfinished_sequences.discard(sequence)
+                self._completion_cv.notify_all()
+                raise
 
-        self._write_snapshot(job)
-        return dest_path
+        handle = WriteHandle(
+            write_id=write_id,
+            sequence=sequence,
+            camera_id=camera,
+            ts_us=timestamp_us,
+            path=dest_path,
+            future=future,
+        )
+        if self._wait_on_store:
+            handle.wait()
+        return handle
+
+    @classmethod
+    def _camera_directory_name(cls, camera_id: str) -> str:
+        safe = cls._sanitize_camera_id(camera_id)
+        if safe == camera_id and safe not in {".", ".."}:
+            return safe
+        suffix = hashlib.sha256(camera_id.encode("utf-8")).hexdigest()[:12]
+        return f"{safe.strip('.') or 'camera'}--{suffix}"
 
     def attach_rgb_to_snapshot(self, camera_id: str, ts_us: int, rgb: np.ndarray) -> Optional[Path]:
-        """Attach or replace the RGB image for an existing depth snapshot."""
-        rgb_c = self._prepare_rgb_snapshot(rgb)
-        if rgb_c is None:
-            return None
-        ts_int = int(ts_us)
-        with self._cache_lock:
-            lock = self._get_lock(camera_id)
-            with lock:
-                index = self._get_index(camera_id)
-                dest_path: Optional[Path] = None
-                for existing_ts, path in reversed(index):
-                    if int(existing_ts) == ts_int and path.exists():
-                        dest_path = path
-                        break
-                if dest_path is None:
-                    return None
-                compressor = self._make_blosc_compressor()
-                root = zarr.open_group(str(dest_path), mode="a")
-                self._write_rgb_dataset(root, rgb_c, compressor)
-            self._depth_payload_cache.pop(camera_id, None)
-        return dest_path
+        """Reject post-commit mutation; RGB must be part of the atomic write job."""
+        del camera_id, ts_us, rgb
+        raise DepthStorageError(
+            "committed depth snapshots are immutable; submit RGB with store(..., rgb=...)"
+        )
 
     def _collect_alive_threads(self) -> List[threading.Thread]:
         with self._worker_lock:
@@ -3697,7 +6281,9 @@ class DepthStorageManager:
                 return None
             # Drop missing files from the tail
             while index and not index[-1][1].exists():
-                index.pop()
+                _missing_ts, missing_path = index.pop()
+                with self._state_lock:
+                    self._committed_paths.discard(missing_path)
             if not index:
                 return None
             if ts_max is None:
@@ -3711,9 +6297,22 @@ class DepthStorageManager:
     def all_cameras(self) -> Iterable[str]:
         return list(self._indices.keys())
 
-    def load_datasets(self, path: Path) -> Optional[Dict[str, np.ndarray]]:
+    def load_datasets(
+        self,
+        path: Any,
+        *,
+        lease: Optional[SnapshotReadLease] = None,
+    ) -> Optional[Dict[str, np.ndarray]]:
+        snapshot_path = self._coerce_snapshot_path(path)
+        owned_lease: Optional[SnapshotReadLease] = None
         try:
-            group = zarr.open_group(str(path), mode='r')
+            if lease is None:
+                owned_lease = self.acquire_read_lease(snapshot_path)
+            else:
+                if lease.path != snapshot_path or self.read_pin_count(snapshot_path) <= 0:
+                    raise DepthStorageError("read lease does not pin the requested snapshot")
+            self._validated_commit_manifest(snapshot_path)
+            group = zarr.open_group(str(snapshot_path), mode='r')
             depth = np.array(group['depth_z'])
             conf = np.array(group['conf'])
             mask = np.array(group['mask'])
@@ -3721,8 +6320,14 @@ class DepthStorageManager:
             if 'rgb' in group:
                 datasets['rgb'] = np.array(group['rgb'])
             return datasets
-        except Exception:
-            return None
+        except DepthStorageError:
+            raise
+        except Exception as exc:
+            self._record_system_failure("snapshot_read", exc)
+            raise DepthStorageError(f"committed snapshot read failed: {snapshot_path}") from exc
+        finally:
+            if owned_lease is not None:
+                owned_lease.release()
 
     def load_latest_depth(self, camera_id: str, ts_max_us: Optional[int] = None) -> Optional[Dict[str, Any]]:
         """Return the newest cached payload up to ts_max_us (microseconds)."""
@@ -3778,6 +6383,63 @@ class DepthStorageManager:
             self._depth_payload_cache.move_to_end(cache_key, last=True)
             while len(self._depth_payload_cache) > self._max_depth_cache_entries:
                 self._depth_payload_cache.popitem(last=False)
+        return payload
+
+    def load_depth_snapshot_exact(
+        self,
+        *,
+        camera_id: str,
+        storage_ref: str,
+        snapshot_id: str,
+        content_sha256: str,
+    ) -> Dict[str, Any]:
+        """Load one exact committed snapshot without consulting latest caches."""
+        descriptor = self.resolve_snapshot_ref(
+            camera_id=camera_id,
+            storage_ref=storage_ref,
+            snapshot_id=snapshot_id,
+            content_sha256=content_sha256,
+        )
+        with self.acquire_read_lease(descriptor.path) as lease:
+            verified = self.describe_snapshot(descriptor.path, lease=lease)
+            if verified != descriptor:
+                raise DepthStorageError("exact snapshot identity changed before read")
+            datasets = self.load_datasets(descriptor.path, lease=lease)
+        if not datasets:
+            raise DepthStorageError("exact committed snapshot has no datasets")
+        depth = np.asarray(datasets.get("depth"), dtype=np.float32)
+        conf = np.asarray(datasets.get("conf"), dtype=np.float32)
+        mask = np.asarray(datasets.get("mask"), dtype=np.uint8)
+        if depth.ndim != 2 or conf.shape != depth.shape or mask.shape != depth.shape:
+            raise DepthStorageError("exact committed snapshot datasets are invalid")
+        payload: Dict[str, Any] = {
+            "ts": int(descriptor.ts_us),
+            "depth_b64": base64.b64encode(depth.tobytes()).decode("ascii"),
+            "conf_b64": base64.b64encode(conf.tobytes()).decode("ascii"),
+            "mask_b64": base64.b64encode(mask.tobytes()).decode("ascii"),
+            "shape": [int(depth.shape[0]), int(depth.shape[1])],
+            "snapshot_id": descriptor.write_id,
+            "snapshot_ref": descriptor.storage_ref,
+            "snapshot_content_sha256": descriptor.content_sha256,
+            "snapshot_role": descriptor.snapshot_role,
+            "fusion_level": descriptor.fusion_level,
+        }
+        rgb = datasets.get("rgb")
+        if rgb is not None:
+            rgb_arr = self._prepare_rgb_snapshot(np.asarray(rgb))
+            if rgb_arr is not None:
+                payload.update(
+                    {
+                        "rgb_b64": base64.b64encode(rgb_arr.tobytes()).decode("ascii"),
+                        "rgb_shape": [
+                            int(rgb_arr.shape[0]),
+                            int(rgb_arr.shape[1]),
+                            int(rgb_arr.shape[2]),
+                        ],
+                        "rgb_dtype": "uint8",
+                        "rgb_color_space": "sRGB",
+                    }
+                )
         return payload
 
     def _resolve_intrinsics_for_depth(
@@ -4050,7 +6712,81 @@ class DepthStorageManager:
             self._logger.debug(f"Failed to load cached floorplan for {camera_id}: {exc}")
         return None
 
-    def _persist_floorplan_to_disk(
+    def _trim_floorplan_cache_locked(self) -> None:
+        while len(self._floorplan_cache) > self._max_floorplan_cache_entries:
+            self._floorplan_cache.popitem(last=False)
+
+    def _valid_floorplan_alias_payload(
+        self,
+        payload: Any,
+        *,
+        expected_units: Optional[str],
+        expected_calibration_fingerprint: Optional[str],
+    ) -> Optional[Dict[str, Any]]:
+        if not isinstance(payload, Mapping):
+            return None
+        if not _floorplan_cache_contract_matches(
+            payload,
+            expected_units=expected_units,
+            expected_calibration_fingerprint=expected_calibration_fingerprint,
+        ):
+            return None
+        if _floorplan_snapshot_timestamp(payload) is None:
+            return None
+        return copy.deepcopy(dict(payload))
+
+    def _load_floorplan_latest_alias(
+        self,
+        camera_id: str,
+        grid_res_m: float,
+        max_extent_m: float,
+        *,
+        expected_units: Optional[str],
+        expected_calibration_fingerprint: Optional[str],
+    ) -> Optional[Dict[str, Any]]:
+        """Read memory and disk as one monotonic latest-alias transaction."""
+
+        latest_key = (
+            camera_id,
+            float(grid_res_m),
+            float(max_extent_m),
+            "latest",
+        )
+        with self._cache_lock:
+            memory_payload = self._valid_floorplan_alias_payload(
+                self._floorplan_cache.get(latest_key),
+                expected_units=expected_units,
+                expected_calibration_fingerprint=expected_calibration_fingerprint,
+            )
+            disk_payload = self._valid_floorplan_alias_payload(
+                self._load_floorplan_from_disk(
+                    camera_id,
+                    grid_res_m,
+                    max_extent_m,
+                    expected_units=expected_units,
+                    expected_calibration_fingerprint=expected_calibration_fingerprint,
+                ),
+                expected_units=expected_units,
+                expected_calibration_fingerprint=expected_calibration_fingerprint,
+            )
+            candidates = [
+                payload
+                for payload in (memory_payload, disk_payload)
+                if payload is not None
+            ]
+            if not candidates:
+                self._floorplan_cache.pop(latest_key, None)
+                return None
+            latest = max(
+                candidates,
+                key=lambda payload: int(_floorplan_snapshot_timestamp(payload) or 0),
+            )
+            self._floorplan_cache[latest_key] = copy.deepcopy(latest)
+            self._floorplan_cache.move_to_end(latest_key, last=True)
+            self._trim_floorplan_cache_locked()
+            return copy.deepcopy(latest)
+
+    def _write_floorplan_alias_locked(
         self,
         camera_id: str,
         grid_res_m: float,
@@ -4058,19 +6794,132 @@ class DepthStorageManager:
         payload: Mapping[str, Any],
     ) -> None:
         path = self._floorplan_path(camera_id, grid_res_m, max_extent_m)
+        tmp_path = path.with_suffix(path.suffix + '.tmp')
         try:
-            path.parent.mkdir(parents=True, exist_ok=True)
             to_store = dict(payload)
             to_store.setdefault("frame", _FLOORPLAN_FRAME)
             to_store.setdefault("orientation", _FLOORPLAN_ORIENTATION)
             to_store.setdefault("floorplan_contract_version", int(_FLOORPLAN_CONTRACT_VERSION))
             to_store.pop('served_from_cache', None)
-            tmp_path = path.with_suffix(path.suffix + '.tmp')
+            path.parent.mkdir(parents=True, exist_ok=True)
             with tmp_path.open('w', encoding='utf-8') as fh:
                 json.dump(to_store, fh, separators=(',', ':'))
+                fh.flush()
+                os.fsync(fh.fileno())
             tmp_path.replace(path)
+            self._fsync_directory(path.parent)
         except Exception as exc:
-            self._logger.debug(f"Failed to persist floorplan for {camera_id}: {exc}")
+            try:
+                tmp_path.unlink(missing_ok=True)
+            except Exception:
+                pass
+            raise DepthStorageError("floorplan_persistence_failed") from exc
+
+    def _publish_floorplan_alias_transaction(
+        self,
+        camera_id: str,
+        grid_res_m: float,
+        max_extent_m: float,
+        payload: Mapping[str, Any],
+        *,
+        exact_cache_key: Optional[Tuple[Any, ...]],
+    ) -> Tuple[bool, Dict[str, Any]]:
+        """Persist before publishing memory and never downgrade either alias.
+
+        The returned boolean is false only when ``payload`` is an older exact
+        response. That response remains addressable by its immutable write-ID
+        key, while the latest disk and memory aliases retain the newer payload.
+        Persistence failures raise instead of reporting durable success.
+        """
+
+        incoming = copy.deepcopy(dict(payload))
+        incoming_ts = _floorplan_snapshot_timestamp(incoming)
+        if incoming_ts is None:
+            raise DepthStorageError("floorplan_publication_timestamp_invalid")
+        expected_units = str(incoming.get("units") or "").strip() or None
+        expected_calibration_fingerprint = (
+            str(incoming.get("calibration_fingerprint") or "").strip() or None
+        )
+        latest_key = (
+            camera_id,
+            float(grid_res_m),
+            float(max_extent_m),
+            "latest",
+        )
+        with self._cache_lock:
+            memory_payload = self._valid_floorplan_alias_payload(
+                self._floorplan_cache.get(latest_key),
+                expected_units=expected_units,
+                expected_calibration_fingerprint=expected_calibration_fingerprint,
+            )
+            disk_payload = self._valid_floorplan_alias_payload(
+                self._load_floorplan_from_disk(
+                    camera_id,
+                    grid_res_m,
+                    max_extent_m,
+                    expected_units=expected_units,
+                    expected_calibration_fingerprint=expected_calibration_fingerprint,
+                ),
+                expected_units=expected_units,
+                expected_calibration_fingerprint=expected_calibration_fingerprint,
+            )
+            current_candidates = [
+                candidate
+                for candidate in (memory_payload, disk_payload)
+                if candidate is not None
+            ]
+            current = (
+                max(
+                    current_candidates,
+                    key=lambda candidate: int(
+                        _floorplan_snapshot_timestamp(candidate) or 0
+                    ),
+                )
+                if current_candidates
+                else None
+            )
+            current_ts = (
+                _floorplan_snapshot_timestamp(current)
+                if current is not None
+                else None
+            )
+            stale = current_ts is not None and current_ts > incoming_ts
+            latest = copy.deepcopy(current if stale and current is not None else incoming)
+
+            # Disk is the durable half of the alias transaction. Write it
+            # before making the corresponding memory value visible. A stale
+            # exact response may also repair a legacy memory-newer-than-disk
+            # state, but it never becomes the latest alias itself.
+            disk_ts = (
+                _floorplan_snapshot_timestamp(disk_payload)
+                if disk_payload is not None
+                else None
+            )
+            latest_ts = int(_floorplan_snapshot_timestamp(latest) or 0)
+            if disk_ts is None or int(disk_ts) < latest_ts:
+                self._write_floorplan_alias_locked(
+                    camera_id,
+                    grid_res_m,
+                    max_extent_m,
+                    latest,
+                )
+            elif not stale:
+                # Equal-timestamp publication refreshes the exact serialized
+                # payload and still preserves disk-before-memory ordering.
+                self._write_floorplan_alias_locked(
+                    camera_id,
+                    grid_res_m,
+                    max_extent_m,
+                    latest,
+                )
+
+            if exact_cache_key is not None:
+                self._floorplan_cache[exact_cache_key] = copy.deepcopy(incoming)
+                self._floorplan_cache.move_to_end(exact_cache_key, last=True)
+            self._floorplan_cache[latest_key] = copy.deepcopy(latest)
+            self._floorplan_cache.move_to_end(latest_key, last=True)
+            self._trim_floorplan_cache_locked()
+            return not stale, copy.deepcopy(latest)
 
     def update_depth_cache(self, result: DepthResult) -> None:
         try:
@@ -4125,10 +6974,39 @@ class DepthStorageManager:
         grid_res_m: float = 0.15,
         max_extent_m: float = 20.0,
         cache_only: bool = False,
+        *,
+        snapshot_ref: Optional[str] = None,
+        snapshot_id: Optional[str] = None,
+        snapshot_content_sha256: Optional[str] = None,
     ) -> Dict[str, Any]:
-        """Generate a per-camera top-down (XZ) blueprint view from the latest depth snapshot."""
+        """Generate a top-down view from latest or one exact committed snapshot."""
         if not camera_id:
             return {'error': 'camera_required', 'ts': int(time.time() * 1_000_000)}
+
+        exact_values = (snapshot_ref, snapshot_id, snapshot_content_sha256)
+        if any(value is not None for value in exact_values) and not all(
+            isinstance(value, str) and value.strip() for value in exact_values
+        ):
+            return {
+                'error': 'invalid_snapshot_identity',
+                'camera_id': camera_id,
+                'ts': int(time.time() * 1_000_000),
+            }
+        exact_descriptor: Optional[SnapshotDescriptor] = None
+        if snapshot_ref is not None:
+            try:
+                exact_descriptor = self.resolve_snapshot_ref(
+                    camera_id=str(camera_id),
+                    storage_ref=str(snapshot_ref),
+                    snapshot_id=str(snapshot_id),
+                    content_sha256=str(snapshot_content_sha256),
+                )
+            except DepthStorageError:
+                return {
+                    'error': 'snapshot_identity_mismatch',
+                    'camera_id': camera_id,
+                    'ts': int(time.time() * 1_000_000),
+                }
 
         if not cache_only:
             try:
@@ -4136,59 +7014,81 @@ class DepthStorageManager:
             except Exception:
                 pass
 
-        cache_key = (camera_id, float(grid_res_m), float(max_extent_m))
+        cache_key = (
+            camera_id,
+            float(grid_res_m),
+            float(max_extent_m),
+            exact_descriptor.write_id if exact_descriptor is not None else "latest",
+        )
+
+        def _publish_generated_floorplan(
+            generated: Mapping[str, Any],
+        ) -> Dict[str, Any]:
+            published, latest = self._publish_floorplan_alias_transaction(
+                camera_id,
+                grid_res_m,
+                max_extent_m,
+                generated,
+                exact_cache_key=(cache_key if exact_descriptor is not None else None),
+            )
+            if exact_descriptor is not None or published:
+                return copy.deepcopy(dict(generated))
+            # A generic generation that lost a race must return the newer
+            # authoritative alias. Exact callers still receive their exact
+            # stale response through the branch above.
+            latest["served_from_cache"] = True
+            return latest
+
         calib_bundle = getattr(self, 'calibration_bundle', None) or {}
         expected_flip = _expected_floorplan_flip(calib_bundle, camera_id)
         expected_units = _expected_floorplan_units_from_calibration_bundle(calib_bundle)
         expected_calibration_fingerprint = _floorplan_calibration_fingerprint(calib_bundle, camera_id)
         now_us = int(time.time() * 1_000_000)
-        with self._cache_lock:
-            cached = self._floorplan_cache.get(cache_key)
-            if cached:
-                if not _floorplan_cache_contract_matches(
-                    cached,
+        cached = None
+        if exact_descriptor is not None:
+            with self._cache_lock:
+                candidate = self._floorplan_cache.get(cache_key)
+                if candidate and _floorplan_cache_contract_matches(
+                    candidate,
                     expected_units=expected_units,
                     expected_calibration_fingerprint=expected_calibration_fingerprint,
+                ) and _floorplan_snapshot_identity_matches(
+                    candidate,
+                    exact_descriptor,
                 ):
-                    cached = None
-            if cached:
-                if cache_only:
-                    payload = dict(cached)
-                    payload['served_from_cache'] = True
-                    return payload
-                age_us = now_us - cached.get('snapshot_ts', cached.get('ts', 0))
-                if age_us <= int(max(0.0, max_age_sec) * 1_000_000):
-                    payload = dict(cached)
-                    payload['served_from_cache'] = True
-                    return payload
+                    cached = copy.deepcopy(candidate)
+        else:
+            cached = self._load_floorplan_latest_alias(
+                camera_id,
+                grid_res_m,
+                max_extent_m,
+                expected_units=expected_units,
+                expected_calibration_fingerprint=expected_calibration_fingerprint,
+            )
 
-        disk_payload = self._load_floorplan_from_disk(
-            camera_id,
-            grid_res_m,
-            max_extent_m,
-            expected_units=expected_units,
-            expected_calibration_fingerprint=expected_calibration_fingerprint,
-        )
-        if disk_payload:
-            snapshot_ts = disk_payload.get('snapshot_ts', disk_payload.get('ts'))
-            if isinstance(snapshot_ts, (int, float)):
-                age_us = now_us - int(snapshot_ts)
-            else:
-                age_us = None
-            if cache_only or age_us is None or age_us <= int(max(0.0, max_age_sec) * 1_000_000):
-                with self._cache_lock:
-                    self._floorplan_cache[cache_key] = dict(disk_payload)
-                    self._floorplan_cache.move_to_end(cache_key, last=True)
-                    while len(self._floorplan_cache) > self._max_floorplan_cache_entries:
-                        self._floorplan_cache.popitem(last=False)
-                payload = dict(disk_payload)
+        if cached:
+            if cache_only:
+                payload = copy.deepcopy(cached)
                 payload['served_from_cache'] = True
                 return payload
+            snapshot_ts = _floorplan_snapshot_timestamp(cached)
+            age_us = now_us - int(snapshot_ts) if snapshot_ts is not None else None
+            if age_us is None or age_us <= int(max(0.0, max_age_sec) * 1_000_000):
+                payload = copy.deepcopy(cached)
+                payload['served_from_cache'] = True
+                return payload
+
+        if cache_only:
+            return {'error': 'no_cached_floorplan', 'camera_id': camera_id, 'ts': now_us}
 
         max_age_us = int(max(0.0, max_age_sec) * 1_000_000)
         ts_cutoff = now_us - max_age_us if max_age_us > 0 else None
 
-        path_entry = self.latest_entry(camera_id, now_us)
+        path_entry = (
+            exact_descriptor.path
+            if exact_descriptor is not None
+            else self.latest_entry(camera_id, now_us)
+        )
         if not path_entry:
             return {'error': 'no_depth', 'camera_id': camera_id, 'ts': now_us}
 
@@ -4200,7 +7100,21 @@ class DepthStorageManager:
             if snapshot_ts is None or snapshot_ts < ts_cutoff:
                 return {'error': 'stale_depth', 'camera_id': camera_id, 'ts': now_us}
 
-        datasets = self.load_datasets(path_entry)
+        try:
+            with self.acquire_read_lease(path_entry) as snapshot_lease:
+                selected_descriptor = self.describe_snapshot(
+                    path_entry,
+                    lease=snapshot_lease,
+                )
+                if exact_descriptor is not None and selected_descriptor != exact_descriptor:
+                    return {
+                        'error': 'snapshot_identity_mismatch',
+                        'camera_id': camera_id,
+                        'ts': now_us,
+                    }
+                datasets = self.load_datasets(path_entry, lease=snapshot_lease)
+        except DepthStorageError:
+            return {'error': 'load_failed', 'camera_id': camera_id, 'ts': now_us}
         if not datasets:
             return {'error': 'load_failed', 'camera_id': camera_id, 'ts': now_us}
 
@@ -4238,12 +7152,15 @@ class DepthStorageManager:
             }
             return {'error': err_map.get(err, 'invalid_intrinsics'), 'camera_id': camera_id, 'ts': now_us}
 
-        # PERMISSIVE validity: only reject truly invalid depth values
-        # Do NOT hard-filter by mask or confidence - use them as soft weights instead
+        # The mask is the calibrated/fused observation contract. In particular,
+        # it removes invalid full-FoV dewarper borders where monocular inference
+        # still emits finite hallucinated depth. Confidence remains a soft
+        # weight inside that valid support.
         valid = np.isfinite(depth)
         valid &= depth > 0.1
         valid &= depth < 50.0
-        # Note: mask and conf are used as weights below, not hard filters
+        valid &= mask
+        valid &= np.isfinite(conf)
 
         if not np.any(valid):
             grid = np.zeros((1, 1), dtype=np.float32)
@@ -4257,7 +7174,10 @@ class DepthStorageManager:
             payload = {
                 'camera_id': camera_id,
                 'ts': now_us,
-                'snapshot_ts': int(path_entry.stem) if path_entry.stem.isdigit() else None,
+                'snapshot_ts': int(selected_descriptor.ts_us),
+                'snapshot_ref': selected_descriptor.storage_ref,
+                'snapshot_id': selected_descriptor.write_id,
+                'snapshot_content_sha256': selected_descriptor.content_sha256,
                 'frame': _FLOORPLAN_FRAME,
                 'bounds': bounds_m,
                 'scale_m_per_px': float(grid_res_m),
@@ -4270,6 +7190,20 @@ class DepthStorageManager:
                     'grid_shape': [1, 1],
                     'value_min': 0.0,
                     'value_max': 0.0,
+                },
+                'observed': {
+                    'grid_b64': base64.b64encode(grid.tobytes()).decode('ascii'),
+                    'grid_shape': [1, 1],
+                    'value_min': 0.0,
+                    'value_max': 1.0,
+                },
+                'unknown': {
+                    'grid_b64': base64.b64encode(
+                        np.ones((1, 1), dtype=np.float32).tobytes()
+                    ).decode('ascii'),
+                    'grid_shape': [1, 1],
+                    'value_min': 0.0,
+                    'value_max': 1.0,
                 },
                 'height': {
                     'grid_b64': base64.b64encode(grid.tobytes()).decode('ascii'),
@@ -4290,6 +7224,14 @@ class DepthStorageManager:
                     'value_max': 0.0,
                 },
                 'height_agl_meta': {'floor_y': 0.0, 'floor_offset_m': 0.0, 'floor_estimate': {'mode': 'no_valid_depth'}},
+                'observation_meta': {
+                    'contract': 'noesis.floorplan.observation.v1',
+                    'observed_definition': 'one_or_more_valid_projected_depth_points',
+                    'unknown_definition': 'zero_valid_projected_depth_points_within_grid_bounds',
+                    'observed_cells': 0,
+                    'unknown_cells': 1,
+                    'total_cells': 1,
+                },
                 'served_from_cache': False,
                 'grid_res_m': float(grid_res_m),
                 'grid_res_scene': float(grid_res_m * scene_per_m),
@@ -4300,26 +7242,28 @@ class DepthStorageManager:
                 'image_flip': flip_payload,
                 'calibration_fingerprint': expected_calibration_fingerprint,
             }
-            self._persist_floorplan_to_disk(camera_id, grid_res_m, max_extent_m, payload)
-            with self._cache_lock:
-                self._floorplan_cache[cache_key] = dict(payload)
-                self._floorplan_cache.move_to_end(cache_key, last=True)
-                while len(self._floorplan_cache) > self._max_floorplan_cache_entries:
-                    self._floorplan_cache.popitem(last=False)
-            return payload
+            return _publish_generated_floorplan(payload)
 
-        # Extract confidence values for valid points - use as weights, not filter
-        # Combine mask (as 0/1) and conf into a single weight
-        # Points inside mask with high conf get weight ~1.0
-        # Points outside mask or low conf get lower weights but still contribute
-        # Soften the mask: give masked-out points a small weight (0.15) instead of 0
-        soft_mask = np.where(mask, 1.0, 0.15).astype(np.float32)
-        # Clamp confidence to [0.05, 1.0] to avoid zero weights
+        # Confidence stays soft within valid calibrated/fused support.
         conf_clamped = np.clip(conf, 0.05, 1.0)
-        # Combined weight = soft_mask * confidence
-        combined_weight = soft_mask * conf_clamped
-        # Extract weights for valid points
-        pts_weight = combined_weight[valid].astype(np.float32)
+        pts_weight = conf_clamped[valid].astype(np.float32)
+        rgb_pts: Optional[np.ndarray] = None
+        rgb_dataset = datasets.get('rgb')
+        if rgb_dataset is not None:
+            try:
+                rgb_prepared = self._prepare_rgb_snapshot(
+                    np.asarray(rgb_dataset)
+                )
+                if (
+                    rgb_prepared is not None
+                    and rgb_prepared.shape[:2] == depth.shape
+                ):
+                    rgb_pts = np.ascontiguousarray(
+                        rgb_prepared[valid, :3],
+                        dtype=np.uint8,
+                    )
+            except Exception:
+                rgb_pts = None
 
         h_img, w_img = depth.shape
         grid_u, grid_v = np.meshgrid(
@@ -4328,8 +7272,8 @@ class DepthStorageManager:
             indexing='xy'
         )
 
-        # Floorplan grids stay anchored to the canonical camera-local X/Z frame.
-        # Do not remap the image axes here using the BEV/world flip heuristic.
+        # Unproject in OpenCV camera coordinates. The raster coordinates are
+        # resolved below from the calibrated, gravity-aligned ground basis.
         x_cam = (grid_u - cx) * depth / fx
         y_cam = (grid_v - cy) * depth / fy
         z_cam = depth
@@ -4352,31 +7296,35 @@ class DepthStorageManager:
         except np.linalg.LinAlgError:
             return {'error': 'extrinsics_singular', 'camera_id': camera_id, 'ts': now_us}
 
-        pts_cam_h = np.concatenate([pts_cam, np.ones((pts_cam.shape[0], 1), dtype=np.float32)], axis=1)
-        pts_world_h = pts_cam_h @ twc.T
-        pts_world = pts_world_h[:, :3]
-
         pts_depth = pts_cam[:, 2]
-        pts_y = pts_world[:, 1]
-        x_cam_pts = pts_cam[:, 0]
-        z_cam_pts = pts_cam[:, 2]
+        # K/unprojection and E use the same OpenCV camera axes: +X right,
+        # +Y image-down, +Z forward. Twc supplies both canonical world Y and a
+        # camera-heading ground basis that is invariant to camera pitch/roll.
+        try:
+            x_floor_pts, z_floor_pts, pts_y, ground_frame_meta = (
+                _camera_points_to_ground_frame(pts_cam, twc)
+            )
+        except ValueError:
+            return {
+                'error': 'invalid_ground_frame',
+                'camera_id': camera_id,
+                'ts': now_us,
+            }
 
         # Estimate floor Y from horizontal surfaces and compute per-point height above floor (AGL).
-        # This is intentionally global (single Y) for now; kitchen floors are close enough to planar.
+        # Only strict observations may authorize the floor or metric scale.
         floor_y = 0.0
         floor_est_meta: Dict[str, Any] = {"mode": "uninitialized"}
-        pts_y_agl = pts_y
+        normals_world_flat = np.zeros_like(pts_cam, dtype=np.float32)
+        authoritative_point = (
+            mask[valid]
+            & np.isfinite(conf[valid])
+            & (
+                conf[valid]
+                > float(_FUSION_CONTINUITY_CONFIDENCE_SCALE + 1e-3)
+            )
+        )
         try:
-            # Extrinsics assume camera +Y is up. Our depth unprojection uses +Y down (image V),
-            # so for any world-frame height computation we flip the camera Y axis.
-            twc_row_y = twc[1].astype(np.float32, copy=False)
-            pts_y_agl = (
-                (pts_cam[:, 0] * twc_row_y[0])
-                + ((-pts_cam[:, 1]) * twc_row_y[1])
-                + (pts_cam[:, 2] * twc_row_y[2])
-                + twc_row_y[3]
-            ).astype(np.float32, copy=False)
-
             valid_normals = valid & mask
             normals_cam = self._compute_normals(
                 depth.astype(np.float32, copy=False),
@@ -4386,110 +7334,143 @@ class DepthStorageManager:
                 cx,
                 cy,
             )
-            # Convert normals into the same camera coordinate convention used by extrinsics (+Y up).
             normals_cam = np.asarray(normals_cam, dtype=np.float32)
-            normals_cam[..., 1] *= -1.0
             normals_cam_flat = normals_cam[valid]
             r_wc = twc[:3, :3].astype(np.float32, copy=False)
             normals_world_flat = (r_wc @ normals_cam_flat.T).T
-            good_point = mask[valid] & (conf_clamped[valid] >= 0.2)
-            floor_w = np.where(good_point, pts_weight, 0.0).astype(np.float32, copy=False)
+            floor_w = np.where(
+                authoritative_point,
+                pts_weight,
+                0.0,
+            ).astype(np.float32, copy=False)
             floor_y, floor_est_meta = _estimate_floor_y_from_horizontal_points(
-                pts_y_agl,
+                pts_y,
                 normals_world_flat,
                 floor_w,
                 horiz_dot_thresh=float(_FLOORPLAN_AGL_HORIZ_DOT_THRESH),
             )
         except Exception as exc:
             try:
-                floor_y = float(np.nanpercentile(pts_y_agl, 1.0)) if pts_y_agl.size else 0.0
+                floor_y = float(np.nanpercentile(pts_y, 1.0)) if pts_y.size else 0.0
             except Exception:
-                floor_y = float(np.nanmin(pts_y_agl)) if pts_y_agl.size else 0.0
-            floor_est_meta = {"mode": "error", "error": str(exc), "floor_y": float(floor_y)}
+                floor_y = float(np.nanmin(pts_y)) if pts_y.size else 0.0
+            floor_est_meta = {
+                "mode": "unavailable_error",
+                "quality": "unavailable",
+                "error": str(exc),
+                "floor_y": float(floor_y),
+            }
 
-        height_agl_pts = (pts_y_agl - float(floor_y)).astype(np.float32, copy=False)
+        observed_floor_y = float(floor_y)
+        pts_cam, floor_y, metric_scale_meta = (
+            _condition_floorplan_metric_scale(
+                pts_cam,
+                twc,
+                observed_floor_y=observed_floor_y,
+                calibrated_floor_y=_calibrated_floor_y_from_bundle(
+                    calib_bundle
+                ),
+                floor_estimate_meta=floor_est_meta,
+            )
+        )
+        metric_scale_factor = float(
+            metric_scale_meta.get("scale_factor", 1.0) or 1.0
+        )
+        if bool(metric_scale_meta.get("applied")):
+            pts_depth = pts_cam[:, 2]
+            x_floor_pts, z_floor_pts, pts_y, ground_frame_meta = (
+                _camera_points_to_ground_frame(pts_cam, twc)
+            )
+        floor_est_meta = dict(floor_est_meta)
+        floor_est_meta["observed_floor_y"] = observed_floor_y
+        floor_est_meta["conditioned_floor_y"] = float(floor_y)
+        floor_est_meta["metric_scale"] = metric_scale_meta
+
+        height_agl_pts = (pts_y - float(floor_y)).astype(np.float32, copy=False)
         height_agl_pts = np.clip(height_agl_pts, 0.0, float(_FLOORPLAN_AGL_HEIGHT_CLIP_M)).astype(np.float32, copy=False)
 
-        # Normalize AGL by subtracting a low-percentile offset so the lowest observed surface
-        # lands near 0m even when the floor estimator is biased low (heavy occlusions).
-        agl_floor_offset_m = 0.0
-        try:
-            good_offset = mask[valid] & (conf_clamped[valid] >= 0.2)
-            cand = height_agl_pts[good_offset] if np.any(good_offset) else height_agl_pts
-            if cand.size:
-                agl_floor_offset_m = float(np.percentile(cand, 2.0))
-        except Exception:
+        # A coherent horizontal mode is already the floor authority; applying a
+        # second low-percentile shift would move that valid floor. Retain the
+        # bounded diagnostic normalization only when no coherent mode exists.
+        if _floor_estimate_is_coherent(floor_est_meta):
             agl_floor_offset_m = 0.0
-        if not np.isfinite(agl_floor_offset_m) or agl_floor_offset_m <= 1e-3:
-            agl_floor_offset_m = 0.0
-        if agl_floor_offset_m > 0.0:
-            height_agl_pts = np.clip(
-                height_agl_pts - float(agl_floor_offset_m), 0.0, float(_FLOORPLAN_AGL_HEIGHT_CLIP_M)
-            ).astype(np.float32, copy=False)
+        else:
+            height_agl_pts, agl_floor_offset_m = (
+                _normalize_floorplan_agl_heights(
+                    height_agl_pts,
+                    authoritative_point,
+                )
+            )
 
-        # If the floor estimator drifts low (common when the floor is heavily occluded),
-        # all AGL values get offset upward and saturate the visualization. Normalize by
-        # subtracting a low-percentile offset so the lowest observed surface is ~0.
-        agl_floor_offset_m = 0.0
-        try:
-            good_offset = mask[valid] & (conf_clamped[valid] >= 0.2)
-            cand = height_agl_pts[good_offset] if np.any(good_offset) else height_agl_pts
-            if cand.size:
-                agl_floor_offset_m = float(np.percentile(cand, 2.0))
-        except Exception:
-            agl_floor_offset_m = 0.0
-        if not np.isfinite(agl_floor_offset_m) or agl_floor_offset_m <= 1e-3:
-            agl_floor_offset_m = 0.0
-        if agl_floor_offset_m > 0.0:
-            height_agl_pts = np.clip(
-                height_agl_pts - float(agl_floor_offset_m), 0.0, float(_FLOORPLAN_AGL_HEIGHT_CLIP_M)
-            ).astype(np.float32, copy=False)
-
-        if x_cam_pts.size == 0 or z_cam_pts.size == 0:
+        if x_floor_pts.size == 0 or z_floor_pts.size == 0:
             return {'error': 'no_points', 'camera_id': camera_id, 'ts': now_us, 'point_count': 0}
 
         pad_x = max(0.5, grid_res_m * 2.0)
         pad_z = max(0.5, grid_res_m * 2.0)
 
-        max_x_abs = float(np.max(np.abs(x_cam_pts))) if x_cam_pts.size else 0.0
-        if not np.isfinite(max_x_abs):
-            max_x_abs = 0.0
-        forward_max = float(np.max(z_cam_pts)) if z_cam_pts.size else 0.0
-        if not np.isfinite(forward_max):
-            forward_max = 0.0
+        min_x, max_x, forward_extent, bounds_meta = (
+            _resolve_floorplan_bounds(
+            x_ground=x_floor_pts,
+            z_ground=z_floor_pts,
+            authoritative_mask=authoritative_point,
+            image_shape=depth.shape,
+            intrinsics=(fx, fy, cx, cy),
+            camera_to_world=twc,
+            calibration_bundle=calib_bundle,
+            grid_res_m=grid_res_m,
+            max_extent_m=max_extent_m,
+            pad_x_m=pad_x,
+            pad_z_m=pad_z,
+            )
+        )
 
-        half_width = max_x_abs + pad_x
-        forward_extent = max(0.0, forward_max) + pad_z
-        if max_extent_m > 0:
-            max_extent = float(max_extent_m)
-            min_half_width = max_extent * float(_FLOORPLAN_MIN_HALF_WIDTH_FRACTION)
-            min_forward = max_extent * float(_FLOORPLAN_MIN_FORWARD_FRACTION)
-            half_width = max(half_width, min_half_width)
-            forward_extent = max(forward_extent, min_forward)
-            half_width = min(half_width, max_extent)
-            forward_extent = min(forward_extent, max_extent)
-
-        half_width = max(half_width, grid_res_m * 0.5)
         forward_extent = max(forward_extent, grid_res_m)
-
-        min_x = -half_width
-        max_x = half_width
         min_z = 0.0
         max_z = forward_extent
 
         width_m = max_x - min_x
         height_m = max_z - min_z
 
+        in_bounds = (
+            (x_floor_pts >= min_x)
+            & (x_floor_pts <= max_x)
+            & (z_floor_pts >= min_z)
+            & (z_floor_pts <= max_z)
+        )
+        bounds_meta["input_point_count"] = int(x_floor_pts.size)
+        omitted_point_count = int(np.count_nonzero(~in_bounds))
+        if omitted_point_count:
+            x_floor_pts = x_floor_pts[in_bounds]
+            z_floor_pts = z_floor_pts[in_bounds]
+            pts_cam = pts_cam[in_bounds]
+            pts_depth = pts_depth[in_bounds]
+            pts_y = pts_y[in_bounds]
+            height_agl_pts = height_agl_pts[in_bounds]
+            pts_weight = pts_weight[in_bounds]
+            normals_world_flat = normals_world_flat[in_bounds]
+            authoritative_point = authoritative_point[in_bounds]
+            if rgb_pts is not None:
+                rgb_pts = rgb_pts[in_bounds]
+        if x_floor_pts.size == 0:
+            return {
+                'error': 'no_points_in_stable_bounds',
+                'camera_id': camera_id,
+                'ts': now_us,
+                'point_count': 0,
+            }
+        bounds_meta["omitted_outlier_point_count"] = omitted_point_count
+
         w_px = max(1, int(np.ceil(width_m / grid_res_m)))
         h_px = max(1, int(np.ceil(height_m / grid_res_m)))
 
-        x_norm = np.clip((x_cam_pts - min_x) / width_m, 0.0, 0.999999)
-        z_norm = np.clip((z_cam_pts - min_z) / height_m, 0.0, 0.999999)
+        x_norm = np.clip((x_floor_pts - min_x) / width_m, 0.0, 0.999999)
+        z_norm = np.clip((z_floor_pts - min_z) / height_m, 0.0, 0.999999)
         x_idx = np.clip(np.floor(x_norm * w_px).astype(np.int32), 0, w_px - 1)
         z_idx = np.clip(np.floor((1.0 - z_norm) * h_px).astype(np.int32), 0, h_px - 1)
 
         density_grid = np.zeros((h_px, w_px), dtype=np.float32)
-        distance_sum = np.zeros((h_px, w_px), dtype=np.float32)
+        distance_sum = np.zeros((h_px, w_px), dtype=np.float64)
+        distance_weight_sum = np.zeros((h_px, w_px), dtype=np.float64)
         distance_count = np.zeros((h_px, w_px), dtype=np.uint32)
         height_grid = np.full((h_px, w_px), -np.inf, dtype=np.float32)
         height_agl_max_grid = np.full((h_px, w_px), -np.inf, dtype=np.float32)
@@ -4507,7 +7488,16 @@ class DepthStorageManager:
         # Density: count of points (unweighted for backward compat)
         np.add.at(density_grid, indices, 1.0)
         # Distance: weighted by confidence
-        np.add.at(distance_sum, indices, (pts_depth * pts_weight).astype(np.float32, copy=False))
+        np.add.at(
+            distance_sum,
+            indices,
+            (pts_depth * pts_weight).astype(np.float64, copy=False),
+        )
+        np.add.at(
+            distance_weight_sum,
+            indices,
+            pts_weight.astype(np.float64, copy=False),
+        )
         np.add.at(distance_count, indices, 1)
         # Height: accumulate weighted sum and weights for weighted mean
         np.add.at(weighted_height_sum, indices, (pts_y * pts_weight).astype(np.float64))
@@ -4560,7 +7550,23 @@ class DepthStorageManager:
 
         # Use weighted mean as the primary height grid (preserves detail better than max)
         height_grid = weighted_mean_height
+        observed_grid = (distance_count > 0).astype(np.float32, copy=False)
+        unknown_grid = (1.0 - observed_grid).astype(np.float32, copy=False)
         clean_layers = None
+        detail_layers = None
+
+        try:
+            detail_layers = _compute_floorplan_detail_layers(
+                height_agl_pts=height_agl_pts,
+                normals_world_pts=normals_world_flat,
+                pts_weight=pts_weight,
+                x_idx=x_idx,
+                z_idx=z_idx,
+                support_grid=distance_count,
+                rgb_pts=rgb_pts,
+            )
+        except Exception:
+            detail_layers = None
 
         density_max = float(np.max(density_grid)) if density_grid.size else 0.0
         if density_max > 0.0:
@@ -4586,22 +7592,21 @@ class DepthStorageManager:
         # and obstacle surfaces in camera-local X/Z space so the overlay and the
         # visible floorplan share the same raster surface.
         try:
-            y_up_pts = (-pts_cam[:, 1]).astype(np.float32, copy=False)
-            obs_h, walk, clean_meta = _compute_kitchen_clean_floorplan_layers(
+            obs_h, walk, clean_meta = (
+                _compute_kitchen_clean_floorplan_layers_from_agl_grids(
                 camera_id,
-                x_cam_pts=x_cam_pts,
-                z_cam_pts=z_cam_pts,
-                y_world_pts=y_up_pts,
-                pts_weight=pts_weight,
-                x_idx=x_idx,
-                z_idx=z_idx,
+                height_agl_min_grid=height_agl_min_grid,
+                height_agl_max_grid=height_agl_max_grid,
                 support_grid=distance_count,
+                floor_support_grid=agl_floor_support_grid,
+                obstacle_support_grid=agl_obstacle_support_grid,
+                grid_res_m=grid_res_m,
+                )
             )
             if isinstance(clean_meta, dict):
                 clean_meta = dict(clean_meta)
             else:
-                clean_meta = {"mode": "clean_floorplan_layers"}
-            clean_meta["mode"] = "clean_floorplan_layers"
+                clean_meta = {"mode": "clean_floorplan_agl_layers"}
             clean_meta["floor_estimate"] = floor_est_meta
             clean_layers = (obs_h, walk, clean_meta)
         except Exception:
@@ -4643,9 +7648,14 @@ class DepthStorageManager:
         gradient_grid = np.nan_to_num(gradient_grid, nan=0.0, posinf=0.0, neginf=0.0)
 
         distance_grid = np.zeros((h_px, w_px), dtype=np.float32)
-        nonzero_mask = distance_count > 0
+        nonzero_mask = distance_weight_sum > 1e-9
         if np.any(nonzero_mask):
-            distance_grid[nonzero_mask] = distance_sum[nonzero_mask] / distance_count[nonzero_mask]
+            np.divide(
+                distance_sum,
+                distance_weight_sum,
+                out=distance_grid,
+                where=nonzero_mask,
+            )
             min_distance = float(np.min(distance_grid[nonzero_mask]))
             max_distance = float(np.max(distance_grid[nonzero_mask]))
         else:
@@ -4687,30 +7697,72 @@ class DepthStorageManager:
             ],
             dtype=np.float64,
         )
+        alignment_depth = (
+            depth.astype(np.float32, copy=False) * metric_scale_factor
+        )
+        alignment_x_cam = (
+            x_cam.astype(np.float32, copy=False) * metric_scale_factor
+        )
+        alignment_y_cam = (
+            y_cam.astype(np.float32, copy=False) * metric_scale_factor
+        )
+        alignment_z_cam = (
+            z_cam.astype(np.float32, copy=False) * metric_scale_factor
+        )
+        rotation_wc = np.asarray(twc[:3, :3], dtype=np.float64)
+        right_world = np.asarray(
+            ground_frame_meta["right_world"],
+            dtype=np.float64,
+        )
+        forward_world = np.asarray(
+            ground_frame_meta["forward_world"],
+            dtype=np.float64,
+        )
+        camera_to_ground_x = rotation_wc.T @ right_world
+        camera_to_ground_z = rotation_wc.T @ forward_world
+        alignment_floorplan_x = (
+            (alignment_x_cam * float(camera_to_ground_x[0]))
+            + (alignment_y_cam * float(camera_to_ground_x[1]))
+            + (alignment_z_cam * float(camera_to_ground_x[2]))
+        ).astype(np.float32, copy=False)
+        alignment_floorplan_z = (
+            (alignment_x_cam * float(camera_to_ground_z[0]))
+            + (alignment_y_cam * float(camera_to_ground_z[1]))
+            + (alignment_z_cam * float(camera_to_ground_z[2]))
+        ).astype(np.float32, copy=False)
         ray_to_floorplan_alignment = _fit_ray_to_floorplan_alignment(
             camera_id=str(camera_id),
             intrinsics=k_for_alignment,
             extrinsics_col_major=list(extr),
-            floor_y=float(floor_y),
-            depth=depth,
+            calibrated_floor_y=_calibrated_floor_y_from_bundle(calib_bundle),
+            depth_floor_y=float(floor_y) + float(agl_floor_offset_m),
+            depth=alignment_depth,
             conf=conf,
             mask=mask,
             valid=valid,
-            x_cam=x_cam,
-            z_cam=z_cam,
+            x_cam=alignment_x_cam,
+            z_cam=alignment_z_cam,
             bounds=bounds,
             walkable_grid=alignment_walkable,
             obstacle_height_grid=alignment_obstacle,
+            floorplan_x=alignment_floorplan_x,
+            floorplan_z=alignment_floorplan_z,
         )
 
         payload: Dict[str, Any] = {
             'camera_id': camera_id,
             'ts': now_us,
-            'snapshot_ts': int(path_entry.stem) if path_entry.stem.isdigit() else None,
+            'snapshot_ts': int(selected_descriptor.ts_us),
+            'snapshot_ref': selected_descriptor.storage_ref,
+            'snapshot_id': selected_descriptor.write_id,
+            'snapshot_content_sha256': selected_descriptor.content_sha256,
             'frame': _FLOORPLAN_FRAME,
             'orientation': _FLOORPLAN_ORIENTATION,
             'floorplan_contract_version': int(_FLOORPLAN_CONTRACT_VERSION),
             'bounds': bounds,
+            'bounds_meta': bounds_meta,
+            'ground_frame_meta': ground_frame_meta,
+            'metric_scale_meta': metric_scale_meta,
             'scale_m_per_px': float(width_m / w_px if w_px else grid_res_m),
             'scale_scene_per_px': float((width_m / w_px if w_px else grid_res_m) * scene_per_m),
             'units': 'meters',
@@ -4718,6 +7770,18 @@ class DepthStorageManager:
             'point_count': int(pts_cam.shape[0]),
             'density': {
                 'grid_b64': base64.b64encode(density_grid.astype(np.float32, copy=False).ravel().tobytes()).decode('ascii'),
+                'grid_shape': [int(h_px), int(w_px)],
+                'value_min': 0.0,
+                'value_max': 1.0,
+            },
+            'observed': {
+                'grid_b64': base64.b64encode(observed_grid.ravel().tobytes()).decode('ascii'),
+                'grid_shape': [int(h_px), int(w_px)],
+                'value_min': 0.0,
+                'value_max': 1.0,
+            },
+            'unknown': {
+                'grid_b64': base64.b64encode(unknown_grid.ravel().tobytes()).decode('ascii'),
                 'grid_shape': [int(h_px), int(w_px)],
                 'value_min': 0.0,
                 'value_max': 1.0,
@@ -4752,9 +7816,104 @@ class DepthStorageManager:
                 'floor_offset_m': float(agl_floor_offset_m),
                 'floor_estimate': floor_est_meta,
             },
+            'observation_meta': {
+                'contract': 'noesis.floorplan.observation.v1',
+                'observed_definition': 'one_or_more_valid_projected_depth_points',
+                'unknown_definition': 'zero_valid_projected_depth_points_within_grid_bounds',
+                'observed_cells': int(np.count_nonzero(observed_grid)),
+                'unknown_cells': int(np.count_nonzero(unknown_grid)),
+                'total_cells': int(observed_grid.size),
+            },
             'calibration_fingerprint': expected_calibration_fingerprint,
             'ray_to_floorplan_alignment': ray_to_floorplan_alignment,
         }
+        if detail_layers is not None:
+            structural_height_grid = np.asarray(
+                detail_layers["structural_height"],
+                dtype=np.float32,
+            )
+            surface_observed_grid = np.asarray(
+                detail_layers["surface_observed"],
+                dtype=np.float32,
+            )
+            room_footprint_grid = np.asarray(
+                detail_layers["room_footprint"],
+                dtype=np.float32,
+            )
+            wall_support_grid = np.asarray(
+                detail_layers["wall_support"],
+                dtype=np.float32,
+            )
+            room_boundary_grid = np.asarray(
+                detail_layers["room_boundary"],
+                dtype=np.float32,
+            )
+            payload['structural_height'] = {
+                'grid_b64': base64.b64encode(
+                    structural_height_grid.ravel().tobytes()
+                ).decode('ascii'),
+                'grid_shape': [int(h_px), int(w_px)],
+                'value_min': 0.0,
+                'value_max': float(_FLOORPLAN_DETAIL_FURNITURE_MAX_M),
+            }
+            payload['surface_observed'] = {
+                'grid_b64': base64.b64encode(
+                    surface_observed_grid.ravel().tobytes()
+                ).decode('ascii'),
+                'grid_shape': [int(h_px), int(w_px)],
+                'value_min': 0.0,
+                'value_max': 1.0,
+            }
+            payload['room_footprint'] = {
+                'grid_b64': base64.b64encode(
+                    room_footprint_grid.ravel().tobytes()
+                ).decode('ascii'),
+                'grid_shape': [int(h_px), int(w_px)],
+                'value_min': 0.0,
+                'value_max': 1.0,
+            }
+            payload['wall_support'] = {
+                'grid_b64': base64.b64encode(
+                    wall_support_grid.ravel().tobytes()
+                ).decode('ascii'),
+                'grid_shape': [int(h_px), int(w_px)],
+                'value_min': 0.0,
+                'value_max': 1.0,
+            }
+            payload['room_boundary'] = {
+                'grid_b64': base64.b64encode(
+                    room_boundary_grid.ravel().tobytes()
+                ).decode('ascii'),
+                'grid_shape': [int(h_px), int(w_px)],
+                'value_min': 0.0,
+                'value_max': 1.0,
+            }
+            surface_rgb = detail_layers.get("surface_rgb")
+            surface_rgb_observed = detail_layers.get(
+                "surface_rgb_observed"
+            )
+            if (
+                isinstance(surface_rgb, np.ndarray)
+                and surface_rgb.shape == (h_px, w_px, 3)
+                and isinstance(surface_rgb_observed, np.ndarray)
+                and surface_rgb_observed.shape == (h_px, w_px)
+            ):
+                payload['surface_rgb'] = {
+                    'rgb_b64': base64.b64encode(
+                        np.ascontiguousarray(
+                            surface_rgb,
+                            dtype=np.uint8,
+                        ).tobytes()
+                    ).decode('ascii'),
+                    'rgb_shape': [int(h_px), int(w_px), 3],
+                    'observed_b64': base64.b64encode(
+                        np.asarray(
+                            surface_rgb_observed,
+                            dtype=np.float32,
+                        ).ravel().tobytes()
+                    ).decode('ascii'),
+                }
+            payload['detail_layers_meta'] = detail_layers.get("meta")
         if clean_layers is not None:
             obstacle_height_grid, walkable_grid, clean_meta = clean_layers
             try:
@@ -4775,6 +7934,17 @@ class DepthStorageManager:
                 'value_min': 0.0,
                 'value_max': 1.0,
             }
+            inferred_walkable_grid = (
+                (walkable_grid > 0.5) & (observed_grid < 0.5)
+            ).astype(np.float32, copy=False)
+            payload['inferred_walkable'] = {
+                'grid_b64': base64.b64encode(
+                    inferred_walkable_grid.ravel().tobytes()
+                ).decode('ascii'),
+                'grid_shape': [int(h_px), int(w_px)],
+                'value_min': 0.0,
+                'value_max': 1.0,
+            }
             payload['clean_floorplan_meta'] = clean_meta
         payload['served_from_cache'] = False
         payload['grid_res_m'] = float(grid_res_m)
@@ -4783,15 +7953,9 @@ class DepthStorageManager:
         payload['max_extent_scene'] = float(max_extent_m * scene_per_m)
         payload['image_flip'] = _floorplan_image_flip_payload(expected_flip)
 
-        self._persist_floorplan_to_disk(camera_id, grid_res_m, max_extent_m, payload)
-
-        with self._cache_lock:
-            self._floorplan_cache[cache_key] = dict(payload)
-            self._floorplan_cache.move_to_end(cache_key, last=True)
-            while len(self._floorplan_cache) > self._max_floorplan_cache_entries:
-                self._floorplan_cache.popitem(last=False)
-
-        return payload
+        # Exact capture-event floorplans are durable accepted artifacts. Publish
+        # disk before memory and never let delayed older work downgrade latest.
+        return _publish_generated_floorplan(payload)
 
     def generate_clean_topdown_floorplan(
         self,
@@ -4859,9 +8023,8 @@ class DepthStorageManager:
         rows, cols = np.nonzero(valid)
         d = depth[valid].astype(np.float32, copy=False)
         x_cam = (cols.astype(np.float32, copy=False) - float(cx)) * d / float(fx)
-        # Depth unprojection uses +Y down (image V axis), but our extrinsics convention expects
-        # camera +Y up. Flip Y so world-frame heights are meaningful.
-        y_cam = -(rows.astype(np.float32, copy=False) - float(cy)) * d / float(fy)
+        # OpenCV camera coordinates use +Y image-down; E consumes that same convention.
+        y_cam = (rows.astype(np.float32, copy=False) - float(cy)) * d / float(fy)
         z_cam = d
         pts_cam = np.stack([x_cam, y_cam, z_cam], axis=1).astype(np.float32, copy=False)
 
@@ -5034,8 +8197,8 @@ class DepthStorageManager:
         rows, cols = np.nonzero(valid)
         d = depth[valid].astype(np.float32, copy=False)
         x_cam = (cols.astype(np.float32, copy=False) - float(cx)) * d / float(fx)
-        # Depth unprojection uses +Y down (image V axis), but extrinsics convention expects +Y up.
-        y_cam = -(rows.astype(np.float32, copy=False) - float(cy)) * d / float(fy)
+        # OpenCV camera coordinates use +Y image-down; E consumes that same convention.
+        y_cam = (rows.astype(np.float32, copy=False) - float(cy)) * d / float(fy)
         z_cam = d
         pts_cam = np.stack([x_cam, y_cam, z_cam], axis=1).astype(np.float32, copy=False)
 

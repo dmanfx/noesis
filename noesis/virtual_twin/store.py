@@ -52,7 +52,13 @@ class VirtualTwinStore:
 
     def __post_init__(self) -> None:
         chosen = Path(self.root) if self.root is not None else _root_from_env()
-        object.__setattr__(self, "root", chosen.resolve())
+        # Preserve path components so security-sensitive scene readers can
+        # reject symlinked roots instead of having resolve() hide them.
+        object.__setattr__(
+            self,
+            "root",
+            Path(os.path.abspath(os.fspath(chosen.expanduser()))),
+        )
 
     @property
     def revisions_root(self) -> Path:

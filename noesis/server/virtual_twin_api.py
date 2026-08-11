@@ -4,14 +4,21 @@ import json
 from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 
+from noesis.server.boundary_metrics import (
+    BoundaryMetricsRoute,
+    mark_rest_response,
+    mark_rest_response_exempt,
+    measure_rest_response_model,
+)
 from noesis.virtual_twin.store import VirtualTwinStore, VirtualTwinStoreError
 
 
 app = FastAPI(title="Noesis Virtual Twin API")
+app.router.route_class = BoundaryMetricsRoute
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -45,73 +52,164 @@ def _read_json(path: Path) -> dict[str, Any]:
 
 
 @app.get("/api/v1/virtual-twin/revisions")
-def list_virtual_twin_revisions() -> dict[str, Any]:
-    return {"revisions": _store().list_revisions()}
+def list_virtual_twin_revisions(request: Request) -> dict[str, Any]:
+    revisions = _store().list_revisions()
+    with measure_rest_response_model(
+        "/api/v1/virtual-twin/revisions:get", "VirtualTwinRevisionList"
+    ) as model_measurement:
+        response = {"revisions": revisions}
+    mark_rest_response(
+        request,
+        "/api/v1/virtual-twin/revisions:get",
+        "VirtualTwinRevisionList",
+        model_duration_ms=model_measurement.elapsed_ms,
+    )
+    return response
 
 
 @app.get("/api/v1/virtual-twin/latest")
-def get_latest_virtual_twin() -> dict[str, Any]:
+def get_latest_virtual_twin(request: Request) -> dict[str, Any]:
     try:
-        return _store().latest_payload()
+        payload = _store().latest_payload()
     except VirtualTwinStoreError as exc:
         raise _http_error(exc) from exc
+    with measure_rest_response_model(
+        "/api/v1/virtual-twin/latest:get", "VirtualTwinLatestPayload"
+    ) as model_measurement:
+        response = payload
+    mark_rest_response(
+        request,
+        "/api/v1/virtual-twin/latest:get",
+        "VirtualTwinLatestPayload",
+        model_duration_ms=model_measurement.elapsed_ms,
+    )
+    return response
 
 
 @app.get("/api/v1/virtual-twin/revisions/{revision_id}/manifest")
-def get_virtual_twin_manifest(revision_id: str) -> dict[str, Any]:
+def get_virtual_twin_manifest(
+    revision_id: str,
+    request: Request,
+) -> dict[str, Any]:
     try:
         store = _store()
         manifest = store.read_manifest(revision_id)
-        return {
-            "revision_id": revision_id,
-            "manifest": manifest,
-            "artifact_urls": store.artifact_urls(revision_id, manifest),
-        }
+        artifact_urls = store.artifact_urls(revision_id, manifest)
     except VirtualTwinStoreError as exc:
         raise _http_error(exc) from exc
+    with measure_rest_response_model(
+        "/api/v1/virtual-twin/revisions/{revision_id}/manifest:get",
+        "VirtualTwinManifestResponse",
+    ) as model_measurement:
+        response = {
+            "revision_id": revision_id,
+            "manifest": manifest,
+            "artifact_urls": artifact_urls,
+        }
+    mark_rest_response(
+        request,
+        "/api/v1/virtual-twin/revisions/{revision_id}/manifest:get",
+        "VirtualTwinManifestResponse",
+        model_duration_ms=model_measurement.elapsed_ms,
+    )
+    return response
 
 
 @app.get("/api/v1/virtual-twin/revisions/{revision_id}/metrics")
-def get_virtual_twin_metrics(revision_id: str) -> dict[str, Any]:
+def get_virtual_twin_metrics(
+    revision_id: str,
+    request: Request,
+) -> dict[str, Any]:
     try:
-        return {"revision_id": revision_id, "metrics": _store().read_metrics(revision_id)}
+        metrics = _store().read_metrics(revision_id)
     except VirtualTwinStoreError as exc:
         raise _http_error(exc) from exc
+    with measure_rest_response_model(
+        "/api/v1/virtual-twin/revisions/{revision_id}/metrics:get",
+        "VirtualTwinMetricsResponse",
+    ) as model_measurement:
+        response = {"revision_id": revision_id, "metrics": metrics}
+    mark_rest_response(
+        request,
+        "/api/v1/virtual-twin/revisions/{revision_id}/metrics:get",
+        "VirtualTwinMetricsResponse",
+        model_duration_ms=model_measurement.elapsed_ms,
+    )
+    return response
 
 
 @app.get("/api/v1/virtual-twin/revisions/{revision_id}/tracking-alignment")
-def get_virtual_twin_tracking_alignment(revision_id: str) -> dict[str, Any]:
+def get_virtual_twin_tracking_alignment(
+    revision_id: str,
+    request: Request,
+) -> dict[str, Any]:
     try:
-        return {"revision_id": revision_id, "tracking_alignment": _store().read_tracking_alignment(revision_id)}
+        tracking_alignment = _store().read_tracking_alignment(revision_id)
     except VirtualTwinStoreError as exc:
         raise _http_error(exc) from exc
+    with measure_rest_response_model(
+        "/api/v1/virtual-twin/revisions/{revision_id}/tracking-alignment:get",
+        "VirtualTwinTrackingAlignmentResponse",
+    ) as model_measurement:
+        response = {
+            "revision_id": revision_id,
+            "tracking_alignment": tracking_alignment,
+        }
+    mark_rest_response(
+        request,
+        "/api/v1/virtual-twin/revisions/{revision_id}/tracking-alignment:get",
+        "VirtualTwinTrackingAlignmentResponse",
+        model_duration_ms=model_measurement.elapsed_ms,
+    )
+    return response
 
 
 @app.get("/api/v1/virtual-twin/calibration/scene-extrinsics")
-def get_scene_extrinsics() -> dict[str, Any]:
+def get_scene_extrinsics(request: Request) -> dict[str, Any]:
     """Return Menon-scene camera poses used as calibration, not room geometry."""
     rel_path = Path("config") / "camera_calibration_menon_obj.json"
     payload = _read_json(REPO_ROOT / rel_path)
     cameras = payload.get("cameras")
     if not isinstance(cameras, dict) or not cameras:
         raise HTTPException(status_code=404, detail=f"no cameras in calibration file: {rel_path}")
-    return {
-        "source": "camera_calibration_menon_obj",
-        "path": str(rel_path),
-        "frame": "menon_scene",
-        "cameras": cameras,
-        "preview_meta": payload.get("preview_meta") if isinstance(payload.get("preview_meta"), dict) else None,
-    }
+    with measure_rest_response_model(
+        "/api/v1/virtual-twin/calibration/scene-extrinsics:get",
+        "SceneExtrinsicsResponse",
+    ) as model_measurement:
+        response = {
+            "source": "camera_calibration_menon_obj",
+            "path": str(rel_path),
+            "frame": "menon_scene",
+            "cameras": cameras,
+            "preview_meta": (
+                payload.get("preview_meta")
+                if isinstance(payload.get("preview_meta"), dict)
+                else None
+            ),
+        }
+    mark_rest_response(
+        request,
+        "/api/v1/virtual-twin/calibration/scene-extrinsics:get",
+        "SceneExtrinsicsResponse",
+        model_duration_ms=model_measurement.elapsed_ms,
+    )
+    return response
 
 
 @app.get("/api/v1/virtual-twin/revisions/{revision_id}/artifacts/{artifact_path:path}")
-def get_virtual_twin_artifact(revision_id: str, artifact_path: str) -> FileResponse:
+def get_virtual_twin_artifact(
+    revision_id: str,
+    artifact_path: str,
+    request: Request,
+) -> FileResponse:
     try:
         path = _store().artifact_path(revision_id, artifact_path)
     except VirtualTwinStoreError as exc:
         raise _http_error(exc) from exc
     media_type = _media_type(path)
-    return FileResponse(path, media_type=media_type, filename=path.name)
+    response = FileResponse(path, media_type=media_type, filename=path.name)
+    mark_rest_response_exempt(request, reason="file_response")
+    return response
 
 
 def _media_type(path: Path) -> str:

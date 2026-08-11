@@ -19,9 +19,30 @@ streammux:
   sync-inputs: 0
   gpu-id: 0
 
+# Explicit calibrated validity regions for full-FoV fisheye dewarping. These
+# masks prevent border pixels outside the source lens circle from entering
+# MapAnything depth/reconstruction evidence.
+dewarper_validity_masks:
+  sources:
+    "0":
+      source-valid-region: circle
+      source-width: 1920
+      source-height: 1080
+      erode-px: 1
+    "1":
+      source-valid-region: circle
+      source-width: 1920
+      source-height: 1080
+      erode-px: 1
+    "2":
+      source-valid-region: circle
+      source-width: 1280
+      source-height: 720
+      erode-px: 1
+
 sources:
   - element: nvurisrcbin
-    uri: rtsp://192.168.3.214:7447/jdr9oLlBkjyl3gDm?
+    uri_secret: living-room
     gpu-id: 0
     cudadec-memtype: 0
     latency: 100
@@ -29,9 +50,9 @@ sources:
     disable-audio: true
     dewarper:
       enable: true
-      config-file: config/dewarper_g3_instant_charuco_1080.txt
+      config-file: DS9/config/dewarper_g3_instant_charuco_1080.txt
   - element: nvurisrcbin
-    uri: rtsp://192.168.3.214:7447/qt3VqVdZpgG1B4Vk?
+    uri_secret: kitchen
     gpu-id: 0
     cudadec-memtype: 0
     latency: 100
@@ -39,9 +60,9 @@ sources:
     disable-audio: true
     dewarper:
       enable: true
-      config-file: config/dewarper_g3_instant_charuco_1080.txt
+      config-file: DS9/config/dewarper_g3_instant_charuco_1080.txt
   - element: nvurisrcbin
-    uri: rtsp://192.168.3.214:7447/4qWTBhW6b4nLeUFE?
+    uri_secret: family-room
     gpu-id: 0
     cudadec-memtype: 0
     latency: 100
@@ -49,27 +70,29 @@ sources:
     disable-audio: true
     dewarper:
       enable: true
-      config-file: config/dewarper_g4_instant_charuco_720_to_1080.txt
+      config-file: DS9/config/dewarper_g4_instant_charuco_720_to_1080.txt
 
 preprocess:
   enable: true
-  config-file: DS9/pipelines/config_preproc.ini
+  config-file: DS9/pipelines/config_preproc_yolo26_m.ini
 
 models:
   pgie:
-    config-file-path: DS9/pipelines/config_infer_primary_yolo11_seg.ini
-    engine: DS9/models/engines/yolo11s-seg_cust_fused.engine
+    config-file-path: DS9/pipelines/config_infer_primary_yolo26_m.ini
+    engine: DS9/models/engines/yolo26m_b3_fp16.engine
     batch_size: 3
     gie_id: 1
     network_mode: fp16
     attach_tensor_meta: false
   reid:
     enable: true
-    name: reid_osnet
-    config-file-path: DS9/pipelines/config_infer_secondary_reid_osnet.ini
-    engine: DS9/models/engines/reid_osnet_ibn_msmt17_dyn_b16_fp16.engine
+    name: reid_sgie
+    config-file-path: DS9/pipelines/config_infer_secondary_reid_swin.ini
+    engine: DS9/models/engines/reid_swin_tiny_aicity156_dyn_b16_fp16.engine
     batch_size: 16
     gie_id: 3
+    layer: fc_pred
+    embedding_dim: 256
     attach_tensor_meta: true
   pose:
     enable: true
@@ -86,7 +109,7 @@ models:
   depth_tracking:
     enable: true
     name: depth_tracking_fullframe
-    config-file-path: DS9/build/config_infer_depth_tracking_da2_vits_294x518_b3_i1.ini
+    config-file-path: DS9/pipelines/config_infer_secondary_depth_tracking_da2.ini
     engine: DS9/models/engines/depth_anything_v2_metric_hypersim_vits_294x518_b3_fp16.engine
     batch_size: 3
     gie_id: 5
@@ -95,7 +118,7 @@ models:
     enable: true
     name: mapanything_fullframe
     config-file-path: DS9/pipelines/config_infer_secondary_mapanything.ini
-    engine: DS9/models/engines/mapanything_images_294x518_b3_fp16.plan
+    engine: DS9/models/engines/mapanything_images_294x518_b3_fp32.plan
     batch_size: 3
     gie_id: 2
     attach_tensor_meta: true
@@ -122,20 +145,43 @@ sinks:
     sync: false
 
 mosaic_output:
-  rtsp_enabled: true
+  rtsp_enabled: false
   rtsp_port: 8554
   rtsp_path: mosaic
   mosaic_webrtc_enabled: true
-  video_bitrate_kbps: 4000
-  encoder: nvh264enc
-  rtsp_iframeinterval: 30
-  rtsp_idrinterval: 30
-  rtsp_profile: 0
+  mosaic_h264_shm_socket: /tmp/noesis-mosaic-h264
+  video_bitrate_kbps: 12000  # Quality floor for the 3840x720, 30 fps, short-GOP mosaic
+  encoder: nvv4l2h264enc
+  h264_iframeinterval: 10
+  h264_idrinterval: 10
+  h264_preset_id: 4
+  h264_profile: 0
 
 bev:
-  frame: backend_world_m
+  frame: camera_local_ground_m
   jpeg_enabled: false
   jpeg_quality: 70
+  coverage_envelopes:
+    contract: noesis.bev.coverage_envelopes
+    contract_version: 1
+    frame: camera_local_ground_m
+    units: meters
+    cameras:
+      living-room:
+        boundary_tolerance_m: 0.35
+        regions:
+          - id: living-room
+            polygon_xz_m:
+              - [6.485358, 1.927884]
+              - [-1.583682, 0.127085]
+              - [-2.694162, 4.769288]
+              - [5.374878, 6.570087]
+          - id: foyer
+            polygon_xz_m:
+              - [0.494046, 5.416398]
+              - [-4.741911, 4.247869]
+              - [-5.825244, 8.776586]
+              - [-0.589286, 9.945115]
   smoothing:
     enabled: true
     max_speed_mps: 4.0

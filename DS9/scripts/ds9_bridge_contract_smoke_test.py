@@ -8,19 +8,27 @@ instead of only end-to-end track presence:
 - object-depth bridge copied object ROIs and attached NOESIS.OBJECT_DEPTH
 - ReID native extraction produced host embeddings for StableID
 """
+
 from __future__ import annotations
 
 import argparse
 import asyncio
 import json
+import sys
 import time
+from pathlib import Path
 from typing import Any, Dict
 
-try:
-    import websockets  # type: ignore
-except Exception as exc:  # pragma: no cover
-    print(json.dumps({"ok": False, "error": f"websockets_unavailable:{exc}"}))
-    raise SystemExit(1)
+REPO_ROOT = Path(__file__).resolve().parents[2]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from scripts.internal_auth_client import (  # noqa: E402
+    RequiredInternalAuth,
+    add_auth_token_file_argument,
+    connect_required_websocket,
+    load_required_internal_auth,
+)
 
 
 def _counter(counters: Dict[str, Any], key: str) -> int:
@@ -30,19 +38,106 @@ def _counter(counters: Dict[str, Any], key: str) -> int:
         return 0
 
 
-async def _collect(args: argparse.Namespace) -> Dict[str, Any]:
+def _merge_pipeline_errors(existing: list[str], observed: Any) -> list[str]:
+    """Return cumulative, ordered, nonblank pipeline errors without duplicates."""
+
+    merged: list[str] = []
+    seen: set[str] = set()
+    if observed is None:
+        observed_values: tuple[Any, ...] = ()
+    elif isinstance(observed, (list, tuple)):
+        observed_values = tuple(observed)
+    else:
+        observed_values = (observed,)
+
+    for value in (*existing, *observed_values):
+        text = str(value).strip()
+        if text and text not in seen:
+            seen.add(text)
+            merged.append(text)
+    return merged
+
+
+def _evaluate_bridge_evidence(
+    args: argparse.Namespace,
+    *,
+    max_counters: Dict[str, int],
+    stats_samples: int,
+    tracking_messages: int,
+    tracks_seen: int,
+    depth_ok_tracks: int,
+    embedding_tracks: int,
+    pipeline_errors: list[str],
+) -> Dict[str, Any]:
+    depth_tensor_frames = _counter(max_counters, "depth_tracking_device_frames_total")
+    object_depth_roi_copies = _counter(
+        max_counters, "object_depth_gpu_roi_copies_total"
+    )
+    object_depth_attaches = _counter(max_counters, "object_depth_attach_total")
+    object_depth_ok = _counter(max_counters, "object_depth_status_total.ok")
+    reid_host_copies = _counter(max_counters, "tensor_host_copies_total.reid")
+    zero_copy_violations = _counter(
+        max_counters, "core_path.cpu_copy_violation.total"
+    )
+
+    checks = {
+        "depth_tensor_frames": depth_tensor_frames
+        >= int(args.min_depth_tensor_frames),
+        "object_depth_roi_copies": object_depth_roi_copies
+        >= int(args.min_object_depth_roi_copies),
+        "object_depth_attaches": object_depth_attaches
+        >= int(args.min_object_depth_attaches),
+        "object_depth_ok": object_depth_ok >= int(args.min_object_depth_ok)
+        or depth_ok_tracks >= int(args.min_object_depth_ok),
+        "reid_native_extractions": reid_host_copies >= int(args.min_reid_extractions),
+        "zero_copy_violations": zero_copy_violations
+        <= int(args.max_zero_copy_violations),
+        "stats_samples": stats_samples > 0,
+        "pipeline_errors_absent": not pipeline_errors,
+    }
+    if args.require_embedding_track:
+        checks["embedding_tracks"] = embedding_tracks > 0
+
+    ok = all(bool(value) for value in checks.values())
+    return {
+        "ok": ok,
+        "ws": args.ws,
+        "duration_s": float(args.duration),
+        "checks": checks,
+        "stats_samples": stats_samples,
+        "tracking_messages": tracking_messages,
+        "tracks_seen": tracks_seen,
+        "depth_ok_tracks": depth_ok_tracks,
+        "embedding_tracks": embedding_tracks,
+        "max_counters": {
+            "depth_tracking_device_frames_total": depth_tensor_frames,
+            "object_depth_gpu_roi_copies_total": object_depth_roi_copies,
+            "object_depth_attach_total": object_depth_attaches,
+            "object_depth_status_total.ok": object_depth_ok,
+            "tensor_host_copies_total.reid": reid_host_copies,
+            "core_path.cpu_copy_violation.total": zero_copy_violations,
+        },
+        "pipeline_errors": list(pipeline_errors),
+    }
+
+
+async def _collect(
+    args: argparse.Namespace, auth: RequiredInternalAuth
+) -> Dict[str, Any]:
     max_counters: Dict[str, int] = {}
     stats_samples = 0
     tracking_messages = 0
     tracks_seen = 0
     depth_ok_tracks = 0
     embedding_tracks = 0
-    last_errors: list[str] = []
+    pipeline_errors: list[str] = []
 
-    async with websockets.connect(args.ws, max_size=None) as ws:
+    async with connect_required_websocket(args.ws, auth, max_size=None) as ws:
         if not args.no_clear:
             try:
-                await ws.send(json.dumps({"type": "clear_stats"}, separators=(",", ":")))
+                await ws.send(
+                    json.dumps({"type": "clear_stats"}, separators=(",", ":"))
+                )
             except Exception:
                 pass
 
@@ -68,9 +163,9 @@ async def _collect(args: argparse.Namespace) -> Dict[str, Any]:
                 stats = payload.get("payload") or {}
                 pipe = stats.get("pipeline") if isinstance(stats, dict) else {}
                 if isinstance(pipe, dict):
-                    errors = pipe.get("errors") or []
-                    if isinstance(errors, list):
-                        last_errors = [str(x) for x in errors[-8:]]
+                    pipeline_errors = _merge_pipeline_errors(
+                        pipeline_errors, pipe.get("errors")
+                    )
                     zero = pipe.get("zero_copy_core") or {}
                     counters = zero.get("counters") if isinstance(zero, dict) else {}
                     if isinstance(counters, dict):
@@ -97,58 +192,37 @@ async def _collect(args: argparse.Namespace) -> Dict[str, Any]:
                         sample_count = int(track.get("depth_sample_count") or 0)
                     except Exception:
                         sample_count = 0
-                    if str(track.get("depth_status") or "") == "ok" and sample_count > 0:
+                    if (
+                        str(track.get("depth_status") or "") == "ok"
+                        and sample_count > 0
+                    ):
                         depth_ok_tracks += 1
                     if track.get("embedding_present") is True:
                         embedding_tracks += 1
 
-    depth_tensor_frames = _counter(max_counters, "depth_tracking_device_frames_total")
-    object_depth_roi_copies = _counter(max_counters, "object_depth_gpu_roi_copies_total")
-    object_depth_attaches = _counter(max_counters, "object_depth_attach_total")
-    object_depth_ok = _counter(max_counters, "object_depth_status_total.ok")
-    reid_host_copies = _counter(max_counters, "tensor_host_copies_total.reid")
-    zero_copy_violations = _counter(max_counters, "core_path.cpu_copy_violation.total")
-
-    checks = {
-        "depth_tensor_frames": depth_tensor_frames >= int(args.min_depth_tensor_frames),
-        "object_depth_roi_copies": object_depth_roi_copies >= int(args.min_object_depth_roi_copies),
-        "object_depth_attaches": object_depth_attaches >= int(args.min_object_depth_attaches),
-        "object_depth_ok": object_depth_ok >= int(args.min_object_depth_ok) or depth_ok_tracks >= int(args.min_object_depth_ok),
-        "reid_native_extractions": reid_host_copies >= int(args.min_reid_extractions),
-        "zero_copy_violations": zero_copy_violations <= int(args.max_zero_copy_violations),
-        "stats_samples": stats_samples > 0,
-    }
-    if args.require_embedding_track:
-        checks["embedding_tracks"] = embedding_tracks > 0
-
-    ok = all(bool(v) for v in checks.values())
-    return {
-        "ok": ok,
-        "ws": args.ws,
-        "duration_s": float(args.duration),
-        "checks": checks,
-        "stats_samples": stats_samples,
-        "tracking_messages": tracking_messages,
-        "tracks_seen": tracks_seen,
-        "depth_ok_tracks": depth_ok_tracks,
-        "embedding_tracks": embedding_tracks,
-        "max_counters": {
-            "depth_tracking_device_frames_total": depth_tensor_frames,
-            "object_depth_gpu_roi_copies_total": object_depth_roi_copies,
-            "object_depth_attach_total": object_depth_attaches,
-            "object_depth_status_total.ok": object_depth_ok,
-            "tensor_host_copies_total.reid": reid_host_copies,
-            "core_path.cpu_copy_violation.total": zero_copy_violations,
-        },
-        "pipeline_errors": last_errors,
-    }
+    return _evaluate_bridge_evidence(
+        args,
+        max_counters=max_counters,
+        stats_samples=stats_samples,
+        tracking_messages=tracking_messages,
+        tracks_seen=tracks_seen,
+        depth_ok_tracks=depth_ok_tracks,
+        embedding_tracks=embedding_tracks,
+        pipeline_errors=pipeline_errors,
+    )
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="DS9 object-depth/depth-tensor/ReID native bridge smoke")
+    parser = argparse.ArgumentParser(
+        description="DS9 object-depth/depth-tensor/ReID native bridge smoke"
+    )
     parser.add_argument("--ws", default="ws://127.0.0.1:6008")
     parser.add_argument("--duration", type=float, default=60.0)
-    parser.add_argument("--no-clear", action="store_true", help="Do not send clear_stats before collection.")
+    parser.add_argument(
+        "--no-clear",
+        action="store_true",
+        help="Do not send clear_stats before collection.",
+    )
     parser.add_argument("--min-depth-tensor-frames", type=int, default=1)
     parser.add_argument("--min-object-depth-roi-copies", type=int, default=1)
     parser.add_argument("--min-object-depth-attaches", type=int, default=1)
@@ -160,9 +234,21 @@ def main() -> int:
         action="store_true",
         help="Also require at least one tracking payload with embedding_present=true.",
     )
+    add_auth_token_file_argument(parser)
     args = parser.parse_args()
 
-    result = asyncio.run(_collect(args))
+    try:
+        auth = load_required_internal_auth(args.auth_token_file)
+    except Exception as exc:
+        print(
+            json.dumps(
+                {"ok": False, "error": f"internal_auth_unavailable:{exc}"},
+                sort_keys=True,
+            )
+        )
+        return 1
+
+    result = asyncio.run(_collect(args, auth))
     print(json.dumps(result, indent=2, sort_keys=True))
     return 0 if bool(result.get("ok")) else 1
 

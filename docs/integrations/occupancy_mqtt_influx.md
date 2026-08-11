@@ -1,69 +1,93 @@
-Noesis Occupancy → MQTT + InfluxDB + HomeSeer
+# MQTT and Influx integration security
+_Status: validated against the active DS8, V3DT, and DS9 code on 2026-07-10._
 
-Overview
-- Publishes retained MQTT topics for room occupancy for HomeSeer (mcsMQTT) automations.
-- Writes the same state changes to InfluxDB v2 for history (bucket `noesis_raw`).
-- Heartbeat refreshes retained MQTT state; Influx writes only on change.
+## Current runtime truth
 
-See Also
-- For a step-by-step playbook and a reusable pattern to add future integrations or stats, refer to `docs/reference/Integrations_Playbook.md`.
+- No active runtime publishes occupancy to MQTT or InfluxDB. DS8, V3DT, and DS9
+  explicitly bind the occupancy publisher slot to `None`.
+- The active tree has no occupancy MQTT/Influx publisher implementation.
+- `geometry/depth_publisher.py` contains an optional MapAnything depth-summary
+  publisher, but no active module imports or constructs it.
+- Canonical occupancy remains the authenticated Noesis tracking/world telemetry
+  consumed through the appliance gateway.
 
-MQTT Topics
-- Base: `noesis/occupancy/<room>` where `<room>` is a slug from ROI/zone name.
-- `noesis/occupancy/<room>/occupied`: "0" or "1" (retained, QoS 1)
-- `noesis/occupancy/<room>/count`: "0..N" (retained, QoS 1)
-- `noesis/occupancy/<room>`: JSON `{ts, occupied, count}` (retained, QoS 1)
-- Status: `noesis/status`: "online"/"offline" (retained)
+Setting an integration flag does not wire a publisher into a runtime. Wiring is
+an explicit future product change and must be validated in both DS8 and DS9.
 
-InfluxDB
-- Measurement: `occupancy`
-- Tags: `room_id=<room>`
-- Fields: `occupied` (int), `count` (int)
-- Writes to bucket: `noesis_raw`
+## Credential contract
 
-Config (config.py → AppConfig.integrations)
-- `ENABLE_OCCUPANCY_PUBLISH` (bool)
-- `HEARTBEAT_SEC` (int)
-- MQTT: `BASE_TOPIC`, `STATUS_TOPIC`, `MQTT_HOST`, `MQTT_PORT`, `MQTT_USERNAME`, `MQTT_PASSWORD`, `MQTT_QOS`, `MQTT_RETAIN`
-- Influx: `INFLUX_URL`, `INFLUX_ORG`, `INFLUX_TOKEN`, `INFLUX_BUCKET_RAW`
+Secrets must never be stored in `config.py`, JSON config, command-line arguments,
+or plaintext environment variables. `AppConfig.integrations` contains only
+non-secret connection metadata, disabled sink flags, and optional secret-file
+paths:
 
-Setup Steps
-1) Mosquitto
-- `sudo apt install -y mosquitto mosquitto-clients`
-- `/etc/mosquitto/conf.d/noesis.conf`:
-  listener 1883
-  allow_anonymous false
-  password_file /etc/mosquitto/passwd
-  persistence true
-  persistence_location /var/lib/mosquitto/
-  autosave_interval 30
-- `sudo mosquitto_passwd -c /etc/mosquitto/passwd noesis && sudo systemctl restart mosquitto`
+- MQTT enable: `ENABLE_DEPTH_DIAGNOSTICS_MQTT`
+- MQTT metadata: `BASE_TOPIC`, `MQTT_HOST`, `MQTT_PORT`, `MQTT_USERNAME`,
+  `MQTT_QOS`, `MQTT_RETAIN`
+- MQTT credential path: `MQTT_PASSWORD_FILE`
+- Influx enable: `ENABLE_DEPTH_DIAGNOSTICS_INFLUX`
+- Influx metadata: `INFLUX_URL`, `INFLUX_ORG`, `INFLUX_BUCKET_RAW`
+- Influx credential path: `INFLUX_TOKEN_FILE`
 
-2) InfluxDB v2
-- Create buckets and a 1-minute rollup task (optional):
-  influx bucket create -n noesis_raw -r 90d || true
-  influx bucket create -n noesis_1m -r 730d || true
-  influx task create -n "noesis_occupancy_1m" -d '
-  option task = {name: "noesis_occupancy_1m", every: 1m}
-  from(bucket: "noesis_raw")
-    |> range(start: -task.every)
-    |> filter(fn: (r) => r._measurement == "occupancy")
-    |> aggregateWindow(every: 1m, fn: last, createEmpty: false)
-    |> to(bucket: "noesis_1m")
-  ' || true
+Deployment tooling may override only the paths with
+`NOESIS_MQTT_PASSWORD_FILE` and `NOESIS_INFLUX_TOKEN_FILE`. Raw
+`NOESIS_MQTT_PASSWORD` and `NOESIS_INFLUX_TOKEN` values are rejected.
 
-3) HomeSeer (mcsMQTT)
-- Broker: Mosquitto with `noesis` user/pass
-- Subscribe: `noesis/#`
-- Devices auto-create on first retained publish:
-  - occupied: status pairs 0=Vacant, 1=Occupied
-  - count: numeric
-- Exclude these from HS→Influx export to avoid duplicate points.
+The credential reader does not create a secret or repair its permissions. It
+accepts only an existing UTF-8, single-line regular file that:
 
-Verification
-- MQTT: `mosquitto_sub -h 127.0.0.1 -t 'noesis/occupancy/#' -u noesis -P 'PASS' -v`
-- Influx: `influx query 'from(bucket:"noesis_raw") |> range(start:-15m) |> filter(fn:(r)=> r._measurement=="occupancy") |> last()'`
+- is owned by the effective service user;
+- has exactly mode `0400` or `0600`;
+- is not a symlink and has exactly one hard link;
+- contains a non-blank secret of at least 16 characters;
+- is no larger than 16 KiB.
 
-Notes
-- Occupancy is emitted from the DeepStream analytics probe; ROI/zone names are sluggified to form `<room>`.
-- When a zone disappears, a "vacant" (count=0) event is published to ensure state transitions are captured.
+The open uses no-follow semantics and verifies the opened inode against the
+inspected inode. Missing, insecure, ambiguous, or swapped files fail closed.
+No parent directory or secret-file permission is changed at read time.
+
+## Provisioning and rotation
+
+Create the parent directory and credential files with an owner-controlled
+provisioning tool or editor. Verify metadata without displaying contents:
+
+```bash
+install -d -m 700 "$HOME/.config/noesis/secrets"
+stat -c '%a %U %F' "$HOME/.config/noesis/secrets/influx-token"
+stat -c '%a %U %F' "$HOME/.config/noesis/secrets/mqtt-password"
+```
+
+The two files must report mode `400` or `600`, the runtime user as owner, and
+`regular file`. Never place a real credential directly in a shell command,
+source file, URL, log, or test fixture.
+
+Removing an embedded source default does not revoke an already-issued
+credential. Rotate deployed MQTT and Influx credentials out of band, update the
+private files, and restart only during an approved cutover window. This code
+change does not rotate credentials or restart live services.
+
+The hardening audit also found the two retired defaults in a stale ignored
+`crash.log`, produced in 2025 when the deprecated runtime logged the complete
+configuration object. Only the exact credential byte sequences were redacted;
+the remaining forensic log and its timestamp were preserved, and its mode was
+tightened to `0600`. Current code must never log a complete configuration object
+that could contain credential material.
+
+## Explicit future activation
+
+`DepthDiagnosticsPublisher.from_settings(...)` is the supported construction
+boundary. When both sink flags are false, it returns without reading either
+credential file. If a sink is true, its private credential, Python dependency,
+and client initialization are mandatory. Multi-sink startup is transactional:
+if either enabled sink fails, any client already initialized by that attempt is
+closed and startup raises an error.
+
+Transient publish calls currently report only the exception class, never raw
+client exception text that might contain authentication material.
+
+## Related references
+
+- `docs/Occupancy_Publishing.md` describes the current DS8 telemetry contract.
+- `docs/Integrations_Playbook.md` records the deliberate non-wiring boundary.
+- `tests/test_depth_diagnostics_credentials.py` covers secure-file and
+  fail-closed behavior.

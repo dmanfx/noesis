@@ -391,9 +391,11 @@ class AppConfig:
 
     @dataclass
     class IntegrationsSettings:
-        """Integration settings for MQTT + Influx occupancy publishing"""
+        """Dormant MQTT/Influx integration settings (disabled until explicitly wired)."""
         ENABLE_MAPANYTHING: bool = True
-        ENABLE_OCCUPANCY_PUBLISH: bool = True
+        ENABLE_OCCUPANCY_PUBLISH: bool = False
+        ENABLE_DEPTH_DIAGNOSTICS_MQTT: bool = False
+        ENABLE_DEPTH_DIAGNOSTICS_INFLUX: bool = False
         HEARTBEAT_SEC: int = 60
 
         # MQTT
@@ -402,14 +404,14 @@ class AppConfig:
         MQTT_HOST: str = "127.0.0.1"
         MQTT_PORT: int = 1883
         MQTT_USERNAME: str = "noesis"
-        MQTT_PASSWORD: str = "damosquittopass"
+        MQTT_PASSWORD_FILE: Optional[str] = None
         MQTT_QOS: int = 1
         MQTT_RETAIN: bool = True
 
         # InfluxDB v2
         INFLUX_URL: str = "http://127.0.0.1:8086"
         INFLUX_ORG: str = "Lambda"
-        INFLUX_TOKEN: str = "mfVNLy3JpTXwuX-_ZN9r5dbXzLaXCW9F6isbA10i4r-tNE3aigcF1UqmMdDtPKskDhKk7-6iKtoIOEphpB14wA=="
+        INFLUX_TOKEN_FILE: Optional[str] = None
         INFLUX_BUCKET_RAW: str = "noesis_raw"
     
     @dataclass

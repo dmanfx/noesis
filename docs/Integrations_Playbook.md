@@ -1,19 +1,36 @@
 # Integrations Playbook (DS8)
-_Status: validated against code on 2026-02-02._
+_Status: validated against code on 2026-07-10._
 
-DS8 does not ship MQTT/Influx publishing in the default runtime. The older integrations playbook is archived under `docs/history/`. This page explains how to hook the existing publishers into DS8 if you need external automations.
+DS8, V3DT, and DS9 do not wire MQTT/Influx publishing. The older integrations
+playbook is archived under `docs/history/`; it is not an activation runbook for
+the current appliance.
 
 ## What Exists
-- `occupancy_publisher.py`: MQTT + Influx publisher with `publish_state(room_id, occupied, count, ts_ns)`.
-- `geometry/depth_publisher.py`: depth summary publisher (median/p10/p90/conf/valid_ratio/sample_count) for MapAnything snapshots.
-- Config helpers: `config.py` `IntegrationsSettings` (see archived playbooks for extended key examples).
+- `noesis.telemetry.publishers.bind_occupancy_publisher(...)` exposes an adapter
+  slot, but every active runtime binds it to `None` and no active occupancy
+  publisher implementation exists.
+- `geometry/depth_publisher.py` is a dormant depth-summary publisher
+  (median/p10/p90/conf/valid ratio/sample count). No active code imports or
+  constructs it.
+- `config.py` contains disabled integration flags and non-secret connection
+  metadata. It contains no MQTT password or Influx token.
 
 ## How to Wire in DS8
-1) Instantiate publishers alongside the DS8 runtime bootstrap (e.g., wrap `DepthStorageManager` and `occupancy_publisher` creation before calling `ds8_pipeline.build_pipeline`).
-2) Bind to the pipeline:
-   - Occupancy: `bind_occupancy_publisher(pipeline, publisher_instance)` (`noesis.telemetry.publishers`).
-   - Depth summaries: subscribe to `DepthStorageManager.store(...)` or poll `DepthStorageManager.load_latest_depth(...)` and call `DepthDiagnosticsPublisher` on change.
-3) Keep MQTT/Influx failures isolated (publishers already catch exceptions); do **not** introduce appsink/CPU branches in DS8 to feed integrations.
+Treat activation as a product change, not a configuration-only operation:
+
+1. Define and test the typed publisher adapter in the shared product boundary.
+2. Use `DepthDiagnosticsPublisher.from_settings(...)` so disabled sinks read no
+   credentials and enabled sinks fail closed.
+3. Bind occupancy through
+   `noesis.telemetry.publishers.bind_occupancy_publisher(...)` only after an
+   active implementation exists.
+4. Apply equivalent product behavior to DS8 and DS9 without adding appsink/CPU
+   branches.
+5. Validate credentials and client startup before runtime activation; do not
+   continue with an enabled sink silently disabled.
+
+The owner-only file contract and rotation procedure are documented in
+`docs/integrations/occupancy_mqtt_influx.md`.
 
 ## Recommended Contracts
 - Occupancy topics/measurements: reuse the schema from `docs/Occupancy_Publishing.md` (room slugs + retained MQTT scalars; nanosecond Influx points on change).
@@ -21,4 +38,7 @@ DS8 does not ship MQTT/Influx publishing in the default runtime. The older integ
 
 ## Notes
 - DS8 tracking telemetry already carries occupancy counts (`stats.payload.cameras[*].tracking.occupancy`). Use WebSocket when possible to avoid duplicate plumbing.
-- Keep integration config in version-controlled files (no ad-hoc env overrides) so DS8 regression tests remain reproducible.
+- Keep non-secret integration behavior in version-controlled config. Deployment
+  tooling may supply only the private credential-file paths through the
+  documented `*_FILE` environment variables; raw secret environment variables
+  are rejected.

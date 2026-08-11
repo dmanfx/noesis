@@ -17,6 +17,8 @@ from gi.repository import Gst, GLib
 
 import pyds
 
+from noesis_core.runtime_secrets import load_camera_uri_registry
+
 
 DEFAULT_MULTIURI_CONFIG = Path("pipelines/noesis_multiurisrcbin.ini")
 DEFAULT_NVINFER_CONFIG = Path("pipelines/config_infer_secondary_mapanything.ini")
@@ -31,7 +33,16 @@ def _read_multiuri_list(path: Path) -> List[str]:
         raise RuntimeError(f"Missing source-list.list in {path}")
     raw = parser.get("source-list", "list")
     items = [item.strip() for item in raw.split(";")]
-    return [item for item in items if item]
+    refs = [item.removeprefix("camera-secret:") for item in items if item]
+    if not refs or any(item == ref for item, ref in zip([item for item in items if item], refs)):
+        raise RuntimeError(
+            f"source-list.list in {path} must contain only camera-secret references"
+        )
+    registry = load_camera_uri_registry()
+    missing = [ref for ref in refs if ref not in registry]
+    if missing:
+        raise RuntimeError(f"source-list.list references missing camera secret: {missing[0]}")
+    return [registry[ref] for ref in refs]
 
 
 def _read_multiuri_settings(path: Path) -> Dict[str, str]:
@@ -374,7 +385,7 @@ def main() -> None:
     parser.add_argument(
         "--multiuri-config",
         default=str(DEFAULT_MULTIURI_CONFIG),
-        help="Path to nvmultiurisrcbin INI (source-list.list provides RTSP URIs).",
+        help="Path to nvmultiurisrcbin INI (source-list.list provides camera-secret references).",
     )
     parser.add_argument(
         "--nvinfer-config",

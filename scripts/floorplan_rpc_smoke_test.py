@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Smoke test for DS8 floorplan RPC over WebSocket."""
+
 from __future__ import annotations
 
 import argparse
@@ -15,11 +16,17 @@ from typing import Any, Dict
 
 import yaml
 
-try:
-    import websockets  # type: ignore
-except Exception as exc:  # pragma: no cover - import guard
-    print(f"[FAIL] websockets package required: {exc}")
-    sys.exit(1)
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from scripts.internal_auth_client import (  # noqa: E402
+    RequiredInternalAuth,
+    add_auth_token_file_argument,
+    configure_required_auth_environment,
+    connect_required_websocket,
+    load_required_internal_auth,
+)
 
 
 def _first_camera(cameras_path: Path) -> str:
@@ -37,8 +44,14 @@ def _first_camera(cameras_path: Path) -> str:
         return "living-room"
 
 
-async def _wait_for_floorplan(uri: str, camera: str, max_age_sec: float, timeout_s: float = 20.0) -> Dict[str, Any]:
-    async with websockets.connect(uri) as ws:
+async def _wait_for_floorplan(
+    uri: str,
+    camera: str,
+    max_age_sec: float,
+    auth: RequiredInternalAuth,
+    timeout_s: float = 20.0,
+) -> Dict[str, Any]:
+    async with connect_required_websocket(uri, auth) as ws:
         req = {
             "type": "get_floorplan",
             "camera": camera,
@@ -58,12 +71,17 @@ async def _wait_for_floorplan(uri: str, camera: str, max_age_sec: float, timeout
                 continue
             if not isinstance(payload, dict):
                 continue
-            if payload.get("type") == "floorplan_response" and payload.get("request_id") == req["request_id"]:
+            if (
+                payload.get("type") == "floorplan_response"
+                and payload.get("request_id") == req["request_id"]
+            ):
                 return payload
         raise TimeoutError("No floorplan_response received within timeout")
 
 
-def _spawn_runtime(args: argparse.Namespace) -> subprocess.Popen:
+def _spawn_runtime(
+    args: argparse.Namespace, auth: RequiredInternalAuth
+) -> subprocess.Popen:
     cmd = [
         sys.executable,
         "noesis/ds8_runtime.py",
@@ -75,6 +93,7 @@ def _spawn_runtime(args: argparse.Namespace) -> subprocess.Popen:
     if args.depth_seconds is not None:
         cmd.extend(["--depth-enable-seconds", str(args.depth_seconds)])
     env = os.environ.copy()
+    configure_required_auth_environment(env, auth)
     env.setdefault("NOESIS_MOSAIC_RTSP_ENABLED", "0")
     env.setdefault("NOESIS_MOSAIC_WEBRTC_ENABLED", "0")
     if args.enable_rest:
@@ -86,11 +105,27 @@ def _spawn_runtime(args: argparse.Namespace) -> subprocess.Popen:
 def main() -> int:
     parser = argparse.ArgumentParser(description="Floorplan RPC smoke test")
     parser.add_argument("--ws", default="ws://127.0.0.1:6008", help="WebSocket URL")
-    parser.add_argument("--pipeline-config", type=Path, default=Path("config/infer.yaml"))
-    parser.add_argument("--cameras-config", type=Path, default=Path("config/cameras.yaml"))
-    parser.add_argument("--camera", default="", help="Camera id override (default: first camera in cameras.yaml)")
-    parser.add_argument("--enable-rest", action="store_true", help="Start REST server when spawning runtime")
-    parser.add_argument("--no-spawn", action="store_true", help="Do not spawn ds8_runtime; assume external runtime")
+    parser.add_argument(
+        "--pipeline-config", type=Path, default=Path("config/infer.yaml")
+    )
+    parser.add_argument(
+        "--cameras-config", type=Path, default=Path("config/cameras.yaml")
+    )
+    parser.add_argument(
+        "--camera",
+        default="",
+        help="Camera id override (default: first camera in cameras.yaml)",
+    )
+    parser.add_argument(
+        "--enable-rest",
+        action="store_true",
+        help="Start REST server when spawning runtime",
+    )
+    parser.add_argument(
+        "--no-spawn",
+        action="store_true",
+        help="Do not spawn ds8_runtime; assume external runtime",
+    )
     parser.add_argument(
         "--depth-seconds",
         type=int,
@@ -103,11 +138,18 @@ def main() -> int:
         default=1200.0,
         help="Accept floorplans computed from snapshots up to this age (seconds).",
     )
+    add_auth_token_file_argument(parser)
     args = parser.parse_args()
+
+    try:
+        auth = load_required_internal_auth(args.auth_token_file)
+    except Exception as exc:
+        print(f"[FAIL] required internal auth unavailable: {exc}")
+        return 1
 
     proc = None
     if not args.no_spawn:
-        proc = _spawn_runtime(args)
+        proc = _spawn_runtime(args, auth)
         time.sleep(5.0)  # allow startup
 
     try:
@@ -116,7 +158,9 @@ def main() -> int:
         last_err = None
         for _ in range(10):
             try:
-                payload = asyncio.run(_wait_for_floorplan(args.ws, camera, args.max_age_sec))
+                payload = asyncio.run(
+                    _wait_for_floorplan(args.ws, camera, args.max_age_sec, auth)
+                )
                 break
             except Exception as exc:
                 last_err = exc
@@ -128,7 +172,9 @@ def main() -> int:
         while payload.get("error") in retriable and retries < 5:
             time.sleep(2.0)
             try:
-                payload = asyncio.run(_wait_for_floorplan(args.ws, camera, args.max_age_sec))
+                payload = asyncio.run(
+                    _wait_for_floorplan(args.ws, camera, args.max_age_sec, auth)
+                )
             except Exception as exc:
                 last_err = exc
                 payload = None
@@ -136,7 +182,9 @@ def main() -> int:
             if payload is None:
                 continue
         if payload is None or payload.get("error"):
-            print(f"[FAIL] floorplan_response error: {payload.get('error') if payload else last_err}")
+            print(
+                f"[FAIL] floorplan_response error: {payload.get('error') if payload else last_err}"
+            )
             return 1
         required = ("camera_id", "bounds", "density", "height", "distance")
         missing = [k for k in required if k not in payload]

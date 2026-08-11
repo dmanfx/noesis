@@ -462,6 +462,12 @@ def main() -> int:
     parser.add_argument("--depth-base", type=Path, default=Path("data/depth"), help="Depth snapshot base path for --from-disk")
     parser.add_argument("--cameras-config", type=Path, default=Path("config/cameras.yaml"))
     parser.add_argument("--calibration-json", type=Path, default=Path("config/camera_calibration.json"))
+    parser.add_argument(
+        "--alignment-json",
+        type=Path,
+        default=Path("config/ply_alignment.json"),
+        help="Authored floor/alignment metadata used by local floorplan generation",
+    )
     parser.add_argument("--camera", default="", help="Camera id (default: first kitchen-like in cameras.yaml)")
     parser.add_argument("--out-dir", type=Path, default=Path("output/floorplan_debug"), help="Output directory root")
     parser.add_argument(
@@ -517,6 +523,7 @@ def main() -> int:
         depth: Optional[np.ndarray] = None
         conf: Optional[np.ndarray] = None
         mask: Optional[np.ndarray] = None
+        rgb: Optional[np.ndarray] = None
         disk_mgr = None
 
         if args.ma_depth_json:
@@ -575,6 +582,8 @@ def main() -> int:
                             depth = np.asarray(datasets.get("depth"), dtype=np.float32)
                             conf = np.asarray(datasets.get("conf"), dtype=np.float32)
                             mask = np.asarray(datasets.get("mask"), dtype=np.uint8)
+                            if datasets.get("rgb") is not None:
+                                rgb = np.asarray(datasets.get("rgb"), dtype=np.uint8)
                             if depth.ndim != 2:
                                 raise ValueError(f"unexpected depth shape: {depth.shape}")
                             h, w = int(depth.shape[0]), int(depth.shape[1])
@@ -649,6 +658,16 @@ def main() -> int:
             )
             if mask is not None:
                 Image.fromarray((np.asarray(mask).astype(np.uint8) * 255), mode="L").save(out_root / "camera_mask.png")
+            if (
+                rgb is not None
+                and rgb.ndim == 3
+                and rgb.shape[:2] == depth.shape
+                and rgb.shape[2] >= 3
+            ):
+                Image.fromarray(
+                    np.ascontiguousarray(rgb[:, :, :3], dtype=np.uint8),
+                    mode="RGB",
+                ).save(out_root / "camera_rgb.png")
         else:
             (out_root / "camera_depth_error.txt").write_text(depth_error or "unknown", encoding="utf-8")
 
@@ -662,7 +681,18 @@ def main() -> int:
                     depth_shape=(h, w),
                 )
                 E = _load_extrinsics_E(args.calibration_json, camera)
-                calib_bundle = {"cameras": {"K": {camera: [fx, fy, cx, cy]}, "E": {camera: E}}}
+                align = json.loads(
+                    Path(args.alignment_json).read_text(encoding="utf-8")
+                )
+                if not isinstance(align, dict):
+                    raise ValueError("alignment JSON must contain an object")
+                calib_bundle = {
+                    "align": align,
+                    "cameras": {
+                        "K": {camera: [fx, fy, cx, cy]},
+                        "E": {camera: E},
+                    },
+                }
                 if disk_mgr is not None:
                     setattr(disk_mgr, "calibration_bundle", calib_bundle)
             except Exception as exc:

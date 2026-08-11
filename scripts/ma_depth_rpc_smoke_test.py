@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Smoke test for MapAnything depth RPC over WebSocket (DS8 runtime)."""
+
 from __future__ import annotations
 
 import argparse
@@ -16,16 +17,22 @@ from typing import Any, Dict, Optional, Tuple
 
 import yaml
 
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from scripts.internal_auth_client import (  # noqa: E402
+    RequiredInternalAuth,
+    add_auth_token_file_argument,
+    configure_required_auth_environment,
+    connect_required_websocket,
+    load_required_internal_auth,
+)
+
 try:
     import numpy as np
 except Exception as exc:  # pragma: no cover - import guard
     print(f"[FAIL] numpy package required: {exc}")
-    sys.exit(1)
-
-try:
-    import websockets  # type: ignore
-except Exception as exc:  # pragma: no cover - import guard
-    print(f"[FAIL] websockets package required: {exc}")
     sys.exit(1)
 
 
@@ -47,12 +54,13 @@ def _first_camera(cameras_path: Path) -> str:
 async def _wait_for_ma_depth(
     uri: str,
     *,
+    auth: RequiredInternalAuth,
     camera: str,
     request_id: str,
     ts_max_us: Optional[int] = None,
     timeout_s: float = 8.0,
 ) -> Dict[str, Any]:
-    async with websockets.connect(uri, max_size=None) as ws:
+    async with connect_required_websocket(uri, auth, max_size=None) as ws:
         req: Dict[str, Any] = {
             "type": "get_ma_depth",
             "camera": camera,
@@ -84,7 +92,9 @@ async def _wait_for_ma_depth(
 
 
 def _decode_depth(payload: Dict[str, Any]) -> Tuple[Tuple[int, int], np.ndarray]:
-    container = payload.get("payload") if isinstance(payload.get("payload"), dict) else payload
+    container = (
+        payload.get("payload") if isinstance(payload.get("payload"), dict) else payload
+    )
     shape = container.get("shape")
     if not (isinstance(shape, list) and len(shape) == 2):
         raise ValueError(f"Missing/invalid shape: {shape!r}")
@@ -102,7 +112,9 @@ def _decode_depth(payload: Dict[str, Any]) -> Tuple[Tuple[int, int], np.ndarray]
 
 
 def _decode_normals(payload: Dict[str, Any]) -> Tuple[Tuple[int, int], np.ndarray]:
-    container = payload.get("payload") if isinstance(payload.get("payload"), dict) else payload
+    container = (
+        payload.get("payload") if isinstance(payload.get("payload"), dict) else payload
+    )
     shape = container.get("normals_shape")
     if not (isinstance(shape, list) and len(shape) == 3):
         raise ValueError(f"Missing/invalid normals_shape: {shape!r}")
@@ -129,7 +141,9 @@ def _decode_normals(payload: Dict[str, Any]) -> Tuple[Tuple[int, int], np.ndarra
     return (height, width), normals
 
 
-def _spawn_runtime(args: argparse.Namespace) -> subprocess.Popen:
+def _spawn_runtime(
+    args: argparse.Namespace, auth: RequiredInternalAuth
+) -> subprocess.Popen:
     cmd = [
         sys.executable,
         "noesis/ds8_runtime.py",
@@ -141,6 +155,7 @@ def _spawn_runtime(args: argparse.Namespace) -> subprocess.Popen:
     if args.enable_rest:
         cmd.append("--enable-rest")
     env = os.environ.copy()
+    configure_required_auth_environment(env, auth)
     env.setdefault("NOESIS_MOSAIC_RTSP_ENABLED", "0")
     env.setdefault("NOESIS_MOSAIC_WEBRTC_ENABLED", "0")
     env.setdefault("NOESIS_DEPTH_RPC_ENABLE_SECONDS", str(args.depth_enable_seconds))
@@ -150,23 +165,50 @@ def _spawn_runtime(args: argparse.Namespace) -> subprocess.Popen:
 def main() -> int:
     parser = argparse.ArgumentParser(description="MapAnything depth RPC smoke test")
     parser.add_argument("--ws", default="ws://127.0.0.1:6008", help="WebSocket URL")
-    parser.add_argument("--pipeline-config", type=Path, default=Path("config/infer.yaml"))
-    parser.add_argument("--cameras-config", type=Path, default=Path("config/cameras.yaml"))
-    parser.add_argument("--enable-rest", action="store_true", help="Start REST server when spawning runtime")
-    parser.add_argument("--no-spawn", action="store_true", help="Do not spawn ds8_runtime; assume external runtime")
-    parser.add_argument("--camera", default="", help="Camera id to request (default: first in cameras.yaml)")
+    parser.add_argument(
+        "--pipeline-config", type=Path, default=Path("config/infer.yaml")
+    )
+    parser.add_argument(
+        "--cameras-config", type=Path, default=Path("config/cameras.yaml")
+    )
+    parser.add_argument(
+        "--enable-rest",
+        action="store_true",
+        help="Start REST server when spawning runtime",
+    )
+    parser.add_argument(
+        "--no-spawn",
+        action="store_true",
+        help="Do not spawn ds8_runtime; assume external runtime",
+    )
+    parser.add_argument(
+        "--camera",
+        default="",
+        help="Camera id to request (default: first in cameras.yaml)",
+    )
     parser.add_argument(
         "--depth-enable-seconds",
         type=int,
         default=2,
         help="Depth burst duration for RPC-triggered enables (env NOESIS_DEPTH_RPC_ENABLE_SECONDS).",
     )
-    parser.add_argument("--check-normals", action="store_true", help="Require normals payload in ma_depth_response")
+    parser.add_argument(
+        "--check-normals",
+        action="store_true",
+        help="Require normals payload in ma_depth_response",
+    )
+    add_auth_token_file_argument(parser)
     args = parser.parse_args()
+
+    try:
+        auth = load_required_internal_auth(args.auth_token_file)
+    except Exception as exc:
+        print(f"[FAIL] required internal auth unavailable: {exc}")
+        return 1
 
     proc = None
     if not args.no_spawn:
-        proc = _spawn_runtime(args)
+        proc = _spawn_runtime(args, auth)
         time.sleep(10.0)  # allow pipeline + WS to come up
 
     try:
@@ -181,6 +223,7 @@ def main() -> int:
                 cache_resp = asyncio.run(
                     _wait_for_ma_depth(
                         args.ws,
+                        auth=auth,
                         camera=camera,
                         request_id=f"ma-depth-cache-{attempt}",
                         ts_max_us=now_us,
@@ -191,15 +234,21 @@ def main() -> int:
                 last_err = exc
                 time.sleep(1.0)
         if cache_resp is None:
-            raise RuntimeError(f"Unable to retrieve cache-first ma_depth_response: {last_err}")
+            raise RuntimeError(
+                f"Unable to retrieve cache-first ma_depth_response: {last_err}"
+            )
         if cache_resp.get("ok") is False:
-            raise RuntimeError(f"cache-first ma_depth_response error: {cache_resp.get('error')}")
+            raise RuntimeError(
+                f"cache-first ma_depth_response error: {cache_resp.get('error')}"
+            )
 
         (h0, w0), depth0 = _decode_depth(cache_resp)
         finite0 = np.isfinite(depth0)
         pos0 = finite0 & (depth0 > 0)
         if not pos0.any():
-            raise RuntimeError(f"cache-first depth has no positive finite samples (shape={h0}x{w0})")
+            raise RuntimeError(
+                f"cache-first depth has no positive finite samples (shape={h0}x{w0})"
+            )
         ts0 = int(cache_resp.get("ts_us") or 0)
 
         time.sleep(0.7)  # avoid per-camera RPC throttle window
@@ -212,6 +261,7 @@ def main() -> int:
                 fresh_resp = asyncio.run(
                     _wait_for_ma_depth(
                         args.ws,
+                        auth=auth,
                         camera=camera,
                         request_id=f"ma-depth-fresh-{attempt}",
                         ts_max_us=None,
@@ -222,11 +272,17 @@ def main() -> int:
                 last_err = exc
                 time.sleep(1.0)
         if fresh_resp is None:
-            raise RuntimeError(f"Unable to retrieve fresh ma_depth_response: {last_err}")
+            raise RuntimeError(
+                f"Unable to retrieve fresh ma_depth_response: {last_err}"
+            )
         if fresh_resp.get("ok") is False:
-            raise RuntimeError(f"fresh ma_depth_response error: {fresh_resp.get('error')}")
+            raise RuntimeError(
+                f"fresh ma_depth_response error: {fresh_resp.get('error')}"
+            )
         if fresh_resp.get("served_from_cache") is True:
-            raise RuntimeError("fresh ma_depth_response unexpectedly served_from_cache=true")
+            raise RuntimeError(
+                "fresh ma_depth_response unexpectedly served_from_cache=true"
+            )
 
         (h1, w1), depth1 = _decode_depth(fresh_resp)
         if (h1, w1) != (h0, w0):
@@ -234,13 +290,19 @@ def main() -> int:
         finite1 = np.isfinite(depth1)
         pos1 = finite1 & (depth1 > 0)
         if not pos1.any():
-            raise RuntimeError(f"fresh depth has no positive finite samples (shape={h1}x{w1})")
+            raise RuntimeError(
+                f"fresh depth has no positive finite samples (shape={h1}x{w1})"
+            )
         ts1 = int(fresh_resp.get("ts_us") or 0)
         if ts0 and ts1 and ts1 <= ts0:
             raise RuntimeError(f"fresh ts_us did not increase: {ts0} -> {ts1}")
 
         if args.check_normals:
-            container = fresh_resp.get("payload") if isinstance(fresh_resp.get("payload"), dict) else fresh_resp
+            container = (
+                fresh_resp.get("payload")
+                if isinstance(fresh_resp.get("payload"), dict)
+                else fresh_resp
+            )
             normals_error = container.get("normals_error")
             if normals_error:
                 raise RuntimeError(f"normals_error present: {normals_error}")

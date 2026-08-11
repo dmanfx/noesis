@@ -6,7 +6,7 @@ ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 source "${ROOT}/scripts/ds9_build_env.sh"
 
 if [[ $# -lt 2 || $# -gt 3 ]]; then
-  echo "usage: $0 <module_name> <source.cpp> [plain|cuda_npp]" >&2
+  echo "usage: $0 <module_name> <source.cpp> [plain|cuda_runtime|cuda_npp]" >&2
   exit 2
 fi
 
@@ -19,9 +19,11 @@ KIND="${3:-plain}"
 ds9_require_python_build_tools
 DS_HOME="$(ds9_require_deepstream_home)"
 CUDA_HOME=""
-if [[ "${KIND}" == "cuda_npp" ]]; then
-  CUDA_HOME="$(ds9_require_cuda_home)"
-fi
+case "${KIND}" in
+  plain) ;;
+  cuda_runtime|cuda_npp) CUDA_HOME="$(ds9_require_cuda_home)" ;;
+  *) ds9_fail "Unsupported native extension kind: ${KIND}" ;;
+esac
 
 PYBIND_INCLUDES="$(python3 -m pybind11 --includes)"
 EXT_SUFFIX="$(python3-config --extension-suffix)"
@@ -39,11 +41,15 @@ CXXFLAGS=(-O3 -shared -std=c++17 -fPIC)
 LDFLAGS=(-L"${DS_LIB}" -Wl,-rpath,"${DS_LIB}" -lnvds_service_maker -lnvds_meta -lnvdsgst_meta)
 EXTRA_OBJECTS=()
 
-if [[ "${KIND}" == "cuda_npp" ]]; then
+if [[ "${KIND}" == "cuda_runtime" || "${KIND}" == "cuda_npp" ]]; then
   CXXFLAGS+=(-I"${CUDA_HOME}/include")
   LDFLAGS+=(-L"${CUDA_HOME}/targets/x86_64-linux/lib" -L"${CUDA_HOME}/lib64")
   LDFLAGS+=(-Wl,-rpath,"${CUDA_HOME}/targets/x86_64-linux/lib" -Wl,-rpath,"${CUDA_HOME}/lib64")
-  LDFLAGS+=(-lcudart -lnppig -lnppidei -lnppc)
+  LDFLAGS+=(-lcudart)
+
+  if [[ "${KIND}" == "cuda_npp" ]]; then
+    LDFLAGS+=(-lnppig -lnppidei -lnppc)
+  fi
 
   KERNEL_SRC="${SRC%.cpp}_kernels.cu"
   if [[ ! -f "${KERNEL_SRC}" && "${SRC}" == *_ext.cpp ]]; then

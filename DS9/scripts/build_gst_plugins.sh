@@ -21,9 +21,15 @@ if [[ ! -f "${DS_HOME}/sources/includes/gstnvdsmeta.h" ]]; then
 fi
 
 mkdir -p "${BUILD_DIR}" "${OUT_DIR}"
-cmake -S "${DS9_ROOT}/csrc/nvdsroiexclude" -B "${BUILD_DIR}" \
+cmake --fresh -S "${DS9_ROOT}/csrc/nvdsroiexclude" -B "${BUILD_DIR}" \
   -DCMAKE_BUILD_TYPE=Release \
+  -DDEEPSTREAM_HOME="${DS_HOME}" \
   -DCMAKE_LIBRARY_OUTPUT_DIRECTORY="${OUT_DIR}"
 cmake --build "${BUILD_DIR}" --parallel
+
+NOESIS_DEEPSTREAM_HOME="${DS_HOME}" \
+  "${DS9_ROOT}/gst-plugins/build_noesisforceidr.sh"
+NOESIS_DEEPSTREAM_HOME="${DS_HOME}" \
+  "${DS9_ROOT}/gst-plugins/build_noesiseos.sh"
 
 echo "[OK] Built DS9 GStreamer plugins in ${OUT_DIR}"

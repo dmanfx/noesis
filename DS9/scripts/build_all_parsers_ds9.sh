@@ -13,3 +13,5 @@ make -C "${ROOT}/pipelines/nvdsinfer_yolo11_seg" DS_HOME="${DS_HOME}" CUDA_HOME=
 make -C "${ROOT}/pipelines/nvdsinfer_yolo_detect" DS_HOME="${DS_HOME}" CUDA_HOME="${CUDA_HOME}" OUT_DIR="${ROOT}/pipelines/nvdsinfer_yolo_detect"
 make -C "${ROOT}/pipelines/nvdsinfer_rfdetr" DS_HOME="${DS_HOME}" CUDA_HOME="${CUDA_HOME}" OUT_DIR="${ROOT}/pipelines/nvdsinfer_rfdetr"
 make -C "${ROOT}/pipelines/nvdsinfer_rfdetr_seg" DS_HOME="${DS_HOME}" CUDA_HOME="${CUDA_HOME}" OUT_DIR="${ROOT}/pipelines/nvdsinfer_rfdetr_seg"
+make -C "${ROOT}/pipelines/nvdsinfer_rfdetr_keypoint" DS_HOME="${DS_HOME}" CUDA_HOME="${CUDA_HOME}" OUT_DIR="${ROOT}/pipelines/nvdsinfer_rfdetr_keypoint"
+make -C "${ROOT}/pipelines/nvdsinfer_deimv2_wholebody49" DS_HOME="${DS_HOME}" CUDA_HOME="${CUDA_HOME}" OUT_DIR="${ROOT}/pipelines/nvdsinfer_deimv2_wholebody49"

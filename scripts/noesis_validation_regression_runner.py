@@ -15,7 +15,11 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from noesis.validation.artifacts import ArtifactIndex  # noqa: E402
+from noesis.validation.artifacts import (  # noqa: E402
+    ArtifactIndex,
+    ensure_private_artifact_tree,
+    private_artifact_writer,
+)
 from noesis.validation.core import CheckStatus  # noqa: E402
 from noesis.validation.fixtures import FixtureRegistry, FixtureRegistryEntry  # noqa: E402
 from noesis.validation.golden import compare_artifact_expectations  # noqa: E402
@@ -160,6 +164,7 @@ def _write_menon_browser_case(entry: FixtureRegistryEntry, *, output_dir: Path) 
     return payload
 
 
+@private_artifact_writer
 def run_regression_suite(
     registry_path: str | Path,
     *,
@@ -172,9 +177,14 @@ def run_regression_suite(
     registry = FixtureRegistry.load(registry_path)
     selected_ids = fixture_ids or list(registry.entries)
     suite_id = str(run_id or f"regression_{int(time.time())}")
-    suite_dir = Path(output_dir) / suite_id
-    case_dir = suite_dir / "cases"
-    case_dir.mkdir(parents=True, exist_ok=True)
+    suite_dir = ensure_private_artifact_tree(
+        Path(output_dir) / suite_id,
+        label="validation regression artifacts",
+    )
+    case_dir = ensure_private_artifact_tree(
+        suite_dir / "cases",
+        label="validation regression cases",
+    )
     cases: list[dict[str, Any]] = []
     for fixture_id in selected_ids:
         entry = registry.entries[fixture_id]
@@ -261,6 +271,7 @@ def run_regression_suite(
     }
     summary_path = suite_dir / "regression_summary.json"
     summary_path.write_text(json.dumps(summary_payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    ensure_private_artifact_tree(suite_dir, label="validation regression artifacts")
     return summary_path, summary_payload
 
 

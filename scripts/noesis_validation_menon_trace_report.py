@@ -16,7 +16,11 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from noesis.validation.artifacts import ArtifactIndex  # noqa: E402
+from noesis.validation.artifacts import (  # noqa: E402
+    ArtifactIndex,
+    ensure_private_artifact_tree,
+    private_artifact_writer,
+)
 from noesis.validation.menon_trace import (  # noqa: E402
     build_menon_trace_report,
     load_menon_trace,
@@ -89,6 +93,7 @@ def _index_external_artifacts(index: ArtifactIndex, payload: Mapping[str, Any]) 
             index.artifacts[f"trace_screenshot_{idx:03d}"] = item
 
 
+@private_artifact_writer
 def run_trace_report(
     trace_path: str | Path,
     *,
@@ -100,7 +105,10 @@ def run_trace_report(
     payload = load_menon_trace(trace_path)
     resolved_menon_root = resolve_menon_root(menon_root)
     run_name = str(run_id or payload.get("run_id") or f"menon_trace_{int(time.time())}")
-    run_dir = Path(output_dir) / run_name
+    run_dir = ensure_private_artifact_tree(
+        Path(output_dir) / run_name,
+        label="Menon trace validation artifacts",
+    )
     artifacts = ArtifactIndex(run_dir)
 
     trace_copy = artifacts.path("menon/trace.json")
@@ -134,6 +142,7 @@ def run_trace_report(
     report.artifacts = artifacts.artifacts
     json_path = report.write_json(run_dir / "validation_report.json")
     md_path = write_markdown(report, run_dir / "validation_report.md")
+    ensure_private_artifact_tree(run_dir, label="Menon trace validation artifacts")
     return json_path, md_path, report.to_dict()
 
 

@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import json
+import copy
+import os
 from pathlib import Path
 
 import numpy as np
+import pytest
 
 from noesis.validation.camera import (
     CameraCalibration,
@@ -79,7 +82,11 @@ from noesis.validation.tracking import (
 from noesis.validation.transforms import matrix_to_col_major, validate_round_trip, validate_transform_matrix
 from scripts.noesis_validation_runner import _run_fixture
 from scripts.noesis_validation_menon_trace_report import run_trace_report
-from scripts.noesis_validation_capture_menon_trace import write_trace_from_snapshot
+from scripts.noesis_validation_capture_menon_trace import (
+    validate_browser_auth_proof,
+    validate_storage_state_path,
+    write_trace_from_snapshot,
+)
 from scripts.noesis_validation_regression_runner import _failure_categories, run_regression_suite
 from scripts.noesis_validation_telemetry_report import _load_messages
 
@@ -860,14 +867,26 @@ def test_menon_trace_fixture_report_passes() -> None:
 
 
 def test_menon_browser_snapshot_converts_to_trace(tmp_path: Path) -> None:
-    snapshot = json.loads(Path("plans/noesis_menon_validation/minimal_menon_browser_snapshot.json").read_text(encoding="utf-8"))
+    fixture_path = Path("plans/noesis_menon_validation/minimal_menon_browser_snapshot.json")
+    fixture_text = fixture_path.read_text(encoding="utf-8")
+    snapshot = json.loads(fixture_text)
     trace = browser_snapshot_to_menon_trace(
         snapshot,
         run_id="menon_browser_fixture",
-        page_url="http://127.0.0.1:5173",
+        page_url="http://127.0.0.1:5175",
         raw_snapshot_path="browser/browser_snapshot.json",
     )
-    assert len(trace["placements"]) == 2
+    assert len(trace["placements"]) == 1
+    assert {item["entity_id"] for item in trace["placements"]} == {"resident:resident-a"}
+    assert all(item["transform_audit"][0]["frame"] == "backend_world_m" for item in trace["placements"])
+    assert trace["browser"]["projection_mode"] == "canonical_world_snapshot"
+    assert trace["browser"]["canonical_admission"] == "accepted"
+    assert trace["browser"]["authenticated_role"] == "owner"
+    assert trace["source"]["runtime"] == "ds9"
+    assert trace["source"]["pipeline_config"] == "DS9/config/infer.yaml"
+    assert "backendWorldPosition" in fixture_text
+    assert "backendWorldRaw" not in fixture_text
+    assert "frontend_reproject" not in fixture_text
     assert trace["world_to_menon_col_major"] == matrix_to_col_major(np.eye(4, dtype=np.float64))
     assert len(trace["camera_reprojections"]) == 1
     assert trace["camera_reprojections"][0]["bbox_iou"] == 0.68
@@ -877,11 +896,198 @@ def test_menon_browser_snapshot_converts_to_trace(tmp_path: Path) -> None:
     assert summary["blocked_count"] == 0
     assert any(check["id"] == "MENON.camera_reprojection" for check in report.to_dict()["checks"])
 
+    tmp_path.chmod(0o700)
     output = tmp_path / "trace.json"
     written = write_trace_from_snapshot(snapshot, output_path=output, run_id="menon_browser_written")
     assert output.is_file()
     assert (tmp_path / "browser_snapshot.json").is_file()
-    assert len(written["placements"]) == 2
+    assert len(written["placements"]) == 1
+    assert output.stat().st_mode & 0o777 == 0o600
+    assert (tmp_path / "browser_snapshot.json").stat().st_mode & 0o777 == 0o600
+
+
+def test_menon_browser_storage_state_must_be_private_regular_json(tmp_path: Path) -> None:
+    state = tmp_path / "storage-state.json"
+    state.write_text('{"cookies": [], "origins": []}\n', encoding="utf-8")
+    state.chmod(0o600)
+    assert validate_storage_state_path(state) == state.resolve()
+
+    state.chmod(0o644)
+    with pytest.raises(RuntimeError, match="mode must be 0600"):
+        validate_storage_state_path(state)
+
+    state.chmod(0o600)
+    symlink = tmp_path / "storage-state-link.json"
+    symlink.symlink_to(state)
+    with pytest.raises(RuntimeError, match="symlink"):
+        validate_storage_state_path(symlink)
+
+    symlink.unlink()
+    hardlink = tmp_path / "storage-state-hardlink.json"
+    hardlink.hardlink_to(state)
+    with pytest.raises(RuntimeError, match="exactly one hard link"):
+        validate_storage_state_path(state)
+
+
+def test_menon_browser_auth_proof_binds_live_session_and_final_origin() -> None:
+    snapshot = {
+        "href": "http://127.0.0.1:5175/",
+        "authState": {"authenticated": True, "role": "owner"},
+    }
+    session = {
+        "authenticated": True,
+        "session": {
+            "id": "session-1",
+            "user": {"role": "owner"},
+            "expiresAt": "2026-07-11T12:00:00.000Z",
+        },
+    }
+    proof = validate_browser_auth_proof(
+        snapshot,
+        session,
+        requested_url="http://127.0.0.1:5175/",
+        final_url="http://127.0.0.1:5175/",
+        checked_at_ms=10_031,
+    )
+    assert proof["sessionId"] == "session-1"
+    assert proof["origin"] == "http://127.0.0.1:5175"
+
+    ipv6_snapshot = copy.deepcopy(snapshot)
+    ipv6_snapshot["href"] = "http://[::1]:5175/"
+    ipv6_proof = validate_browser_auth_proof(
+        ipv6_snapshot,
+        session,
+        requested_url="http://[::1]:5175/",
+        final_url="http://[::1]:5175/",
+        checked_at_ms=10_031,
+    )
+    assert ipv6_proof["origin"] == "http://[::1]:5175"
+
+    with pytest.raises(RuntimeError, match="changed origin"):
+        validate_browser_auth_proof(
+            snapshot,
+            session,
+            requested_url="http://127.0.0.1:5175/",
+            final_url="http://127.0.0.1:5176/",
+            checked_at_ms=10_031,
+        )
+    expired = copy.deepcopy(session)
+    expired["session"]["expiresAt"] = "1970-01-01T00:00:01.000Z"
+    with pytest.raises(RuntimeError, match="current authenticated"):
+        validate_browser_auth_proof(
+            snapshot,
+            expired,
+            requested_url="http://127.0.0.1:5175/",
+            final_url="http://127.0.0.1:5175/",
+            checked_at_ms=10_031,
+        )
+
+
+def _mutate_every_canonical_path(snapshot: dict, field: str, value) -> None:
+    for path in snapshot["menonTrackDebug"]["canonicalPaths"]:
+        path[field] = copy.deepcopy(value)
+    for path in snapshot["menonTrackDebug"]["canonicalInfos"]:
+        path[field] = copy.deepcopy(value)
+    for path in snapshot["latestTrackingPaths"]:
+        path[field] = copy.deepcopy(value)
+    for path in snapshot["latestTrackInfos"]:
+        path[field] = copy.deepcopy(value)
+
+
+@pytest.mark.parametrize(
+    ("mutation", "reason"),
+    [
+        (lambda payload: payload.pop("authSessionProof"), "fresh_auth_session_proof_required"),
+        (lambda payload: payload.pop("canonicalWorldState"), "canonical_world_state_shape_invalid"),
+        (
+            lambda payload: payload["canonicalWorldPresentation"].__setitem__("sequence", 11),
+            "canonical_presentation_coherence_invalid",
+        ),
+        (
+            lambda payload: payload["menonTrackDebug"].__setitem__("canonicalPathCount", 2),
+            "canonical_debug_paths_incoherent",
+        ),
+        (
+            lambda payload: payload["promotedSceneCohort"].__setitem__("loading", True),
+            "scene_cohort_not_current",
+        ),
+        (
+            lambda payload: payload["canonicalWorldState"]["entities"][0].__setitem__("stale_after_us", 10_020_000),
+            "canonical_entity_contract_invalid",
+        ),
+        (
+            lambda payload: payload["menonTrackDebug"]["canonicalPaths"][0].__setitem__(
+                "sceneTransformCount", "1"
+            ),
+            "canonical_debug_paths_incoherent",
+        ),
+        (
+            lambda payload: payload["menonTrackDebug"]["canonicalPaths"][0].__setitem__(
+                "backendWorldPosition", [99.0, 0.0, 0.0]
+            ),
+            "canonical_debug_paths_incoherent",
+        ),
+    ],
+)
+def test_menon_browser_adapter_rejects_spoofed_or_incoherent_canonical_evidence(
+    mutation,
+    reason: str,
+) -> None:
+    snapshot = json.loads(
+        Path("plans/noesis_menon_validation/minimal_menon_browser_snapshot.json").read_text(encoding="utf-8")
+    )
+    mutation(snapshot)
+    trace = browser_snapshot_to_menon_trace(snapshot)
+    assert trace["placements"] == []
+    assert trace["browser"]["canonical_admission"] == reason
+    assert "camera_reprojections" not in trace
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("backendWorldPosition", [99.0, 0.0, 0.0]),
+        ("position", [99.0, 0.0, 0.0]),
+        ("sceneTransformCount", "1"),
+        ("lifecycle", "invented"),
+        ("subjectId", "resident:other"),
+    ],
+)
+def test_menon_browser_adapter_binds_each_current_path_to_the_canonical_entity(
+    field: str,
+    value,
+) -> None:
+    snapshot = json.loads(
+        Path("plans/noesis_menon_validation/minimal_menon_browser_snapshot.json").read_text(encoding="utf-8")
+    )
+    _mutate_every_canonical_path(snapshot, field, value)
+    trace = browser_snapshot_to_menon_trace(snapshot)
+    assert trace["placements"] == []
+    assert trace["browser"]["canonical_admission"] == "canonical_render_entity_mismatch"
+
+
+def test_menon_browser_adapter_does_not_promote_legacy_per_camera_projection() -> None:
+    snapshot = {
+        "trackingProjectionMode": "frontend_reproject",
+        "calibrationData": {
+            "align": {"scene_similarity": {"world_to_scene_col_major": matrix_to_col_major(np.eye(4))}}
+        },
+        "menonTrackDebug": {
+            "rawByCamera": {
+                "camera-a": {
+                    "tracks": [{
+                        "stableId": 1,
+                        "trackerId": 2,
+                        "backendWorldRaw": [0.0, 0.0, 0.0],
+                        "world": [0.0, 0.0, 0.0],
+                    }]
+                }
+            }
+        },
+    }
+    trace = browser_snapshot_to_menon_trace(snapshot)
+    assert trace["placements"] == []
+    assert trace["browser"]["projection_mode"] == "frontend_reproject"
 
 
 def test_menon_trace_cli_writes_report_and_artifacts(tmp_path: Path) -> None:
@@ -896,6 +1102,12 @@ def test_menon_trace_cli_writes_report_and_artifacts(tmp_path: Path) -> None:
     assert (tmp_path / "menon_trace_cli" / "menon" / "trace.json").is_file()
     assert (tmp_path / "menon_trace_cli" / "menon" / "trace_audit.json").is_file()
     assert (tmp_path / "menon_trace_cli" / "visual" / "index.json").is_file()
+    run_dir = tmp_path / "menon_trace_cli"
+    assert run_dir.stat().st_mode & 0o777 == 0o700
+    assert all(
+        path.stat().st_mode & 0o777 == (0o700 if path.is_dir() else 0o600)
+        for path in run_dir.rglob("*")
+    )
 
 
 def test_menon_trace_required_checkout_reports_blocked(tmp_path: Path) -> None:
@@ -910,11 +1122,17 @@ def test_menon_trace_required_checkout_reports_blocked(tmp_path: Path) -> None:
 
 
 def test_regression_runner_executes_registered_fixtures(tmp_path: Path) -> None:
-    summary_path, payload = run_regression_suite(
-        "plans/noesis_menon_validation/fixture_registry.json",
-        output_dir=tmp_path,
-        run_id="regression_fixture",
-    )
+    previous_umask = os.umask(0o027)
+    try:
+        summary_path, payload = run_regression_suite(
+            "plans/noesis_menon_validation/fixture_registry.json",
+            output_dir=tmp_path,
+            run_id="regression_fixture",
+        )
+        restored_umask = os.umask(0o027)
+        assert restored_umask == 0o027
+    finally:
+        os.umask(previous_umask)
     assert summary_path.is_file()
     assert payload["status"] == "pass"
     assert payload["case_count"] == 4
@@ -927,6 +1145,47 @@ def test_regression_runner_executes_registered_fixtures(tmp_path: Path) -> None:
     assert all(item["status"] == "pass" for item in fixture_case["artifact_comparisons"])
     menon_case = next(case for case in payload["cases"] if case["fixture_id"] == "minimal_menon_trace")
     assert menon_case["check_count"] >= 10
+    suite_dir = summary_path.parent
+    assert suite_dir.stat().st_mode & 0o777 == 0o700
+    assert all(
+        path.stat().st_mode & 0o777 == (0o700 if path.is_dir() else 0o600)
+        for path in suite_dir.rglob("*")
+    )
+
+    unsafe_dir = tmp_path / "unsafe_regression"
+    unsafe_dir.mkdir()
+    unsafe_dir.chmod(0o755)
+    with pytest.raises(RuntimeError, match="mode must be 0700"):
+        run_regression_suite(
+            "plans/noesis_menon_validation/fixture_registry.json",
+            output_dir=tmp_path,
+            run_id="unsafe_regression",
+            fixture_ids=["minimal_menon_browser_snapshot"],
+        )
+
+    symlink_dir = tmp_path / "symlink_regression"
+    symlink_dir.symlink_to(suite_dir, target_is_directory=True)
+    with pytest.raises(RuntimeError, match="symlink"):
+        run_regression_suite(
+            "plans/noesis_menon_validation/fixture_registry.json",
+            output_dir=tmp_path,
+            run_id="symlink_regression",
+            fixture_ids=["minimal_menon_browser_snapshot"],
+        )
+
+    hardlink_dir = tmp_path / "hardlink_regression"
+    hardlink_dir.mkdir(mode=0o700)
+    linked_file = hardlink_dir / "artifact.json"
+    linked_file.write_text("{}\n", encoding="utf-8")
+    linked_file.chmod(0o600)
+    (hardlink_dir / "artifact-copy.json").hardlink_to(linked_file)
+    with pytest.raises(RuntimeError, match="exactly one hard link"):
+        run_regression_suite(
+            "plans/noesis_menon_validation/fixture_registry.json",
+            output_dir=tmp_path,
+            run_id="hardlink_regression",
+            fixture_ids=["minimal_menon_browser_snapshot"],
+        )
 
 
 def test_regression_failure_categories_include_check_and_expectation_failures() -> None:

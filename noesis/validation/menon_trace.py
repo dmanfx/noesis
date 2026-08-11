@@ -30,6 +30,7 @@ from .menon import (
     validate_world_menon_placement_agreement,
     validate_world_menon_round_trip,
 )
+from .menon_production_geometry import validate_menon_production_geometry
 
 
 def load_menon_trace(path: str | Path) -> dict[str, Any]:
@@ -388,6 +389,12 @@ def build_menon_trace_report(
         return report
     report.add_check(validate_world_menon_round_trip(world_to_menon, placements))
     report.add_check(validate_world_menon_placement_agreement(world_to_menon, placements))
+    if "production_geometry" in payload:
+        for check in validate_menon_production_geometry(
+            payload.get("production_geometry"),
+            expected_world_to_scene=world_to_menon,
+        ):
+            report.add_check(check)
     if world_to_bev is not None or world_bev_samples:
         report.add_check(validate_world_bev_round_trip(world_to_bev or [], world_bev_samples))
     report.add_check(

@@ -1,13 +1,107 @@
 {
   "schema_version": 1,
   "capturedAtMs": 10030,
-  "href": "http://127.0.0.1:5173",
-  "trackingProjectionMode": "frontend_reproject",
+  "href": "http://127.0.0.1:5175/",
+  "trackingProjectionMode": "canonical_world_snapshot",
+  "authState": {
+    "authenticated": true,
+    "role": "owner"
+  },
+  "authSessionProof": {
+    "authenticated": true,
+    "role": "owner",
+    "sessionId": "fixture-session",
+    "expiresAt": "2026-07-11T12:00:00.000Z",
+    "checkedAtMs": 10031,
+    "origin": "http://127.0.0.1:5175"
+  },
+  "canonicalWorldState": {
+    "contract": "noesis.world.snapshot",
+    "contractVersion": 1,
+    "snapshotId": "fixture-run:10",
+    "producer": {
+      "runtime": "ds9",
+      "instance_id": "fixture-appliance",
+      "run_id": "fixture-run",
+      "software_revision": "fixture-revision"
+    },
+    "runId": "fixture-run",
+    "sequence": 10,
+    "observedStartUs": 10000000,
+    "observedEndUs": 10000000,
+    "publishedAtUs": 10010000,
+    "frame": "backend_world_m",
+    "units": "meters",
+    "entities": [
+      {
+        "entity_id": "resident:resident-a",
+        "subject": {
+          "subject_id": "resident:resident-a",
+          "kind": "resident",
+          "generation": 0,
+          "resident_uuid": "resident-a",
+          "display_name": "Resident A",
+          "stable_id": 1
+        },
+        "lifecycle": "present",
+        "position": {"x": 0.45, "y": 0.0, "z": 0.15},
+        "covariance": {"values": [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]},
+        "velocity_mps": null,
+        "room_id": "fixture-room",
+        "observed_at_us": 10000000,
+        "stale_after_us": 11000000,
+        "sources": [
+          {
+            "observation_id": "fixture-observation",
+            "camera_id": "fixture-camera",
+            "zone": "fixture-room",
+            "zone_source": "nvdsanalytics_roi",
+            "zone_authoritative": true,
+            "observed_at_us": 10000000,
+            "position": {"x": 0.45, "y": 0.0, "z": 0.15},
+            "covariance": {"values": [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]},
+            "accepted": true,
+            "rejection_reason": null
+          }
+        ],
+        "conflict": false,
+        "conflict_reason": null
+      }
+    ],
+    "reason": "snapshot"
+  },
+  "canonicalWorldPresentation": {
+    "contract": "noesis.world.snapshot",
+    "contractVersion": 1,
+    "snapshotId": "fixture-run:10",
+    "runId": "fixture-run",
+    "sequence": 10,
+    "entityCount": 1,
+    "sourceFrame": "backend_world_m",
+    "renderFrame": "menon_scene",
+    "sceneTransformCount": 1,
+    "reason": "snapshot",
+    "lastError": null,
+    "atMs": 10020
+  },
+  "promotedSceneCohort": {
+    "loading": false,
+    "activeReleaseId": "fixture-release",
+    "activeParticipantIds": [
+      "authored-environment",
+      "virtual-twin-surface",
+      "noesis-room-reconstruction"
+    ],
+    "lastCommittedAtMs": 9000,
+    "lastAttemptAtMs": 9000,
+    "lastError": null,
+    "generation": 1
+  },
   "cameraReprojections": [
     {
       "cameraId": "fixture-camera",
       "room": "fixture-room",
-      "entity_id": "stable-1",
+      "entity_id": "resident:resident-a",
       "sourceFrame": "visual/source_frame_fixture-camera.png",
       "menonRender": "visual/menon_camera_fixture-camera.png",
       "overlayPath": "visual/menon_camera_fixture-camera_overlay.png",
@@ -31,107 +125,175 @@
       }
     }
   ],
+  "trails": [
+    {
+      "entity_id": "resident:resident-a",
+      "camera_id": "fixture-camera",
+      "room": "fixture-room",
+      "noesis_world_points": [[0.0, 0.0, 0.0], [0.45, 0.0, 0.15]],
+      "menon_points": [[0.0, 0.0, 0.0], [0.45, 0.0, 0.15]],
+      "evidence": ["browser/canonical-world-samples.json"]
+    }
+  ],
   "calibrationData": {
     "align": {
       "scene_similarity": {
         "world_to_scene_col_major": [
-          1.0,
-          0.0,
-          0.0,
-          0.0,
-          0.0,
-          1.0,
-          0.0,
-          0.0,
-          0.0,
-          0.0,
-          1.0,
-          0.0,
-          0.0,
-          0.0,
-          0.0,
-          1.0
+          1.0, 0.0, 0.0, 0.0,
+          0.0, 1.0, 0.0, 0.0,
+          0.0, 0.0, 1.0, 0.0,
+          0.0, 0.0, 0.0, 1.0
         ]
-      }
-    },
-    "floor_y": 0.0
+      },
+      "floor_y": 0.0
+    }
   },
   "menonTrackDebug": {
-    "projectionMode": "frontend_reproject",
-    "rawByCamera": {
-      "fixture-camera": {
-        "updatedAtMs": 10030,
-        "source": "tracking",
-        "trackCount": 2,
-        "tracks": [
-          {
-            "cameraId": "fixture-camera",
-            "stableId": 1,
-            "trackerId": 17,
-            "pathKey": "fixture-camera:stable-1:a",
-            "zone": "fixture-room",
-            "backendWorldRaw": [0.0, 0.0, 0.0],
-            "world": [0.0, 0.0, 0.0],
-            "worldValid": true,
-            "noesis_ts_s": 10.0,
-            "menon_ts_s": 10.03,
-            "confidence": 0.92
-          },
-          {
-            "cameraId": "fixture-camera",
-            "stableId": 1,
-            "trackerId": 17,
-            "pathKey": "fixture-camera:stable-1:b",
-            "zone": "fixture-room",
-            "backendWorldRaw": [0.45, 0.0, 0.15],
-            "world": [0.45, 0.0, 0.15],
-            "worldValid": true,
-            "noesis_ts_s": 10.5,
-            "menon_ts_s": 10.53,
-            "confidence": 0.9
-          }
-        ]
-      }
+    "projectionMode": "canonical_world_snapshot",
+    "pipeline": "noesis_world_snapshot_v1_exact_scene_transform",
+    "canonicalPathCount": 1,
+    "canonicalInfoCount": 1,
+    "canonicalWorld": {
+      "contract": "noesis.world.snapshot",
+      "contractVersion": 1,
+      "snapshotId": "fixture-run:10",
+      "runId": "fixture-run",
+      "sequence": 10,
+      "entityCount": 1,
+      "sourceFrame": "backend_world_m",
+      "renderFrame": "menon_scene",
+      "sceneTransformCount": 1,
+      "reason": "snapshot",
+      "lastError": null,
+      "atMs": 10020
     },
-    "rawProjectedInfos": [
+    "canonicalPaths": [
       {
-        "cameraId": "fixture-camera",
+        "pathKey": "entity:resident:resident-a",
+        "trackKey": "entity:resident:resident-a",
+        "trackId": "resident:resident-a",
+        "entityId": "resident:resident-a",
+        "colorKey": "resident:resident-a",
+        "position": [0.45, 0.0, 0.15],
+        "backendWorldPosition": [0.45, 0.0, 0.15],
+        "sourceFrame": "backend_world_m",
+        "coordinateFrame": "menon_scene",
+        "sceneTransformCount": 1,
+        "presenceActive": true,
+        "trailOnly": false,
+        "lifecycle": "present",
+        "observedAtUs": 10000000,
+        "staleAfterUs": 11000000,
+        "roomId": "fixture-room",
+        "conflict": false,
+        "conflictReason": null,
+        "subjectId": "resident:resident-a",
+        "identityKind": "resident",
+        "identityLabel": "Resident A",
+        "displayName": "Resident A",
+        "residentUuid": "resident-a",
+        "visitorGeneration": 0,
         "stableId": 1,
-        "trackerId": 17,
-        "pathKey": "fixture-camera:stable-1:a",
-        "backendWorldRaw": [0.0, 0.0, 0.0],
-        "world": [0.0, 0.0, 0.0],
-        "source": "frontend_reproject"
-      },
+        "stable_id": 1,
+        "worldSource": "canonical_world_snapshot",
+        "worldQuality": "observed"
+      }
+    ],
+    "canonicalInfos": [
       {
-        "cameraId": "fixture-camera",
+        "pathKey": "entity:resident:resident-a",
+        "trackKey": "entity:resident:resident-a",
+        "trackId": "resident:resident-a",
+        "entityId": "resident:resident-a",
+        "colorKey": "resident:resident-a",
+        "position": [0.45, 0.0, 0.15],
+        "backendWorldPosition": [0.45, 0.0, 0.15],
+        "sourceFrame": "backend_world_m",
+        "coordinateFrame": "menon_scene",
+        "sceneTransformCount": 1,
+        "presenceActive": true,
+        "trailOnly": false,
+        "lifecycle": "present",
+        "observedAtUs": 10000000,
+        "staleAfterUs": 11000000,
+        "roomId": "fixture-room",
+        "conflict": false,
+        "conflictReason": null,
+        "subjectId": "resident:resident-a",
+        "identityKind": "resident",
+        "identityLabel": "Resident A",
+        "displayName": "Resident A",
+        "residentUuid": "resident-a",
+        "visitorGeneration": 0,
         "stableId": 1,
-        "trackerId": 17,
-        "pathKey": "fixture-camera:stable-1:b",
-        "backendWorldRaw": [0.45, 0.0, 0.15],
-        "world": [0.45, 0.0, 0.15],
-        "source": "frontend_reproject"
+        "stable_id": 1,
+        "worldSource": "canonical_world_snapshot",
+        "worldQuality": "observed"
       }
     ]
   },
-  "latestRawTrackInfos": [
+  "latestTrackingPaths": [
     {
-      "cameraId": "fixture-camera",
+      "pathKey": "entity:resident:resident-a",
+      "trackKey": "entity:resident:resident-a",
+      "trackId": "resident:resident-a",
+      "entityId": "resident:resident-a",
+      "colorKey": "resident:resident-a",
+      "position": [0.45, 0.0, 0.15],
+      "backendWorldPosition": [0.45, 0.0, 0.15],
+      "sourceFrame": "backend_world_m",
+      "coordinateFrame": "menon_scene",
+      "sceneTransformCount": 1,
+      "presenceActive": true,
+      "trailOnly": false,
+      "lifecycle": "present",
+      "observedAtUs": 10000000,
+      "staleAfterUs": 11000000,
+      "roomId": "fixture-room",
+      "conflict": false,
+      "conflictReason": null,
+      "subjectId": "resident:resident-a",
+      "identityKind": "resident",
+      "identityLabel": "Resident A",
+      "displayName": "Resident A",
+      "residentUuid": "resident-a",
+      "visitorGeneration": 0,
       "stableId": 1,
-      "trackerId": 17,
-      "pathKey": "fixture-camera:stable-1:a",
-      "backendWorldRaw": [0.0, 0.0, 0.0],
-      "world": [0.0, 0.0, 0.0],
-      "source": "frontend_reproject"
-    },
+      "stable_id": 1,
+      "worldSource": "canonical_world_snapshot",
+      "worldQuality": "observed"
+    }
+  ],
+  "latestTrackInfos": [
     {
-      "cameraId": "fixture-camera",
+      "pathKey": "entity:resident:resident-a",
+      "trackKey": "entity:resident:resident-a",
+      "trackId": "resident:resident-a",
+      "entityId": "resident:resident-a",
+      "colorKey": "resident:resident-a",
+      "position": [0.45, 0.0, 0.15],
+      "backendWorldPosition": [0.45, 0.0, 0.15],
+      "sourceFrame": "backend_world_m",
+      "coordinateFrame": "menon_scene",
+      "sceneTransformCount": 1,
+      "presenceActive": true,
+      "trailOnly": false,
+      "lifecycle": "present",
+      "observedAtUs": 10000000,
+      "staleAfterUs": 11000000,
+      "roomId": "fixture-room",
+      "conflict": false,
+      "conflictReason": null,
+      "subjectId": "resident:resident-a",
+      "identityKind": "resident",
+      "identityLabel": "Resident A",
+      "displayName": "Resident A",
+      "residentUuid": "resident-a",
+      "visitorGeneration": 0,
       "stableId": 1,
-      "trackerId": 17,
-      "pathKey": "fixture-camera:stable-1:b",
-      "backendWorldRaw": [0.45, 0.0, 0.15],
-      "world": [0.45, 0.0, 0.15],
-      "source": "frontend_reproject"
+      "stable_id": 1,
+      "worldSource": "canonical_world_snapshot",
+      "worldQuality": "observed"
     }
   ]
 }

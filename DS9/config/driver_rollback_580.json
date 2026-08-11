@@ -1,0 +1,291 @@
+{
+  "schema_version": 1,
+  "checkpoint_manifest_sha256": "1b7b431c70459b1bed5ab45b1f076a378755f17a3f720fdac5ff3069713da839",
+  "driver_version": "580.167.08",
+  "package_directory": "host/packages/rollback-580",
+  "checkpoint_inventory": "host/state/package-cache-inventory.tsv",
+  "relationship_fields": [
+    "Pre-Depends",
+    "Depends",
+    "Recommends",
+    "Suggests",
+    "Breaks",
+    "Conflicts",
+    "Replaces",
+    "Provides",
+    "Multi-Arch"
+  ],
+  "architecture_counts": {
+    "all": 1,
+    "amd64": 23,
+    "i386": 9
+  },
+  "packages": [
+    {
+      "package": "libnvidia-cfg1-580",
+      "version": "580.167.08-1ubuntu1",
+      "architecture": "amd64",
+      "sha256": "8d8be75ceb56a35f2b3099647ed835977f216d2fb02026d5ddcae9278cb1186a",
+      "relationships_sha256": "f7c81d4efd8d6b14a3adfef6e3dc3ba51d1788dd2d1065b7630121530c0ad077"
+    },
+    {
+      "package": "libnvidia-common-580",
+      "version": "580.167.08-1ubuntu1",
+      "architecture": "all",
+      "sha256": "e72ae962110c8a87357f352286174d0a689d078785748241617ed13a0e31f0a2",
+      "relationships_sha256": "7fbc6ccc01234441c3a4b999aa4213529dae9bda3e954cdbc1f909dd4308ee1e"
+    },
+    {
+      "package": "libnvidia-compute-580",
+      "version": "580.167.08-1ubuntu1",
+      "architecture": "amd64",
+      "sha256": "dd1c836fb033f86419ace3331f195e23cfc30403ff6bfb5b46d691a8d3a814a2",
+      "relationships_sha256": "2b9131304de89746b81583ea6ffc59e563bc5e2a5f76faba2aebe8e3f2e01125"
+    },
+    {
+      "package": "libnvidia-compute-580",
+      "version": "580.167.08-1ubuntu1",
+      "architecture": "i386",
+      "sha256": "e1921d8612f3b14ac7bd89e2f9d66026b5b83540ea989aed63dd1cf9ecfd533d",
+      "relationships_sha256": "7775bbfe96c405a00ec940c261e098c658fd22a3cc193af7162b3a74462c5547"
+    },
+    {
+      "package": "libnvidia-decode-580",
+      "version": "580.167.08-1ubuntu1",
+      "architecture": "amd64",
+      "sha256": "2d037ae3ad3cd675c21638e87a0fa82ef64cffb5e9c2be18b2e25c340c8eda13",
+      "relationships_sha256": "84fa34f76d51667c047d19a5178a862d405464f30ced6eb5d830048059c4de35"
+    },
+    {
+      "package": "libnvidia-decode-580",
+      "version": "580.167.08-1ubuntu1",
+      "architecture": "i386",
+      "sha256": "6e20724a4e4c656266e55509bda2398fa3126d2df57b4b15709c28fb6b398baf",
+      "relationships_sha256": "84fa34f76d51667c047d19a5178a862d405464f30ced6eb5d830048059c4de35"
+    },
+    {
+      "package": "libnvidia-egl-gbm1",
+      "version": "1.1.3-1ubuntu1",
+      "architecture": "amd64",
+      "sha256": "2b5d4173e55cf113cfc76e4c6c1b05b49039ffdba3f6da039d8ee0c1ad7ca41a",
+      "relationships_sha256": "fec7ffe8e1baaab20f2876fe373a5d466b80e6a10bc479084b74a1ca3530af66"
+    },
+    {
+      "package": "libnvidia-egl-gbm1",
+      "version": "1.1.3-1ubuntu1",
+      "architecture": "i386",
+      "sha256": "772fab9e14de0bda0165e4199838b3a71357ae9274bf7592c3c93cdfe5a2a935",
+      "relationships_sha256": "fec7ffe8e1baaab20f2876fe373a5d466b80e6a10bc479084b74a1ca3530af66"
+    },
+    {
+      "package": "libnvidia-egl-xcb1",
+      "version": "1.0.5-1ubuntu1",
+      "architecture": "amd64",
+      "sha256": "e039eba79f9aa30eec8f6bc7125cec09326ac164efe4ce430d1e28e638240155",
+      "relationships_sha256": "9f6408a93115e71b396417e0ba802fcaac67e4c5407666f3095dbf3328bfb198"
+    },
+    {
+      "package": "libnvidia-egl-xcb1",
+      "version": "1.0.5-1ubuntu1",
+      "architecture": "i386",
+      "sha256": "1fc2a4286453b16ec9c60c03efe159aef2e85cb30c01596587512d81d67adb5c",
+      "relationships_sha256": "9f6408a93115e71b396417e0ba802fcaac67e4c5407666f3095dbf3328bfb198"
+    },
+    {
+      "package": "libnvidia-egl-xlib1",
+      "version": "1.0.5-1ubuntu1",
+      "architecture": "amd64",
+      "sha256": "c65f2c68474fc302bb8fdc5cf1048ca0713c266b1a151d15101d0d544eb7457a",
+      "relationships_sha256": "1146cafe2e5a6d6623d7bc01240e78daa732a3621627680163dc2b244ac3feec"
+    },
+    {
+      "package": "libnvidia-egl-xlib1",
+      "version": "1.0.5-1ubuntu1",
+      "architecture": "i386",
+      "sha256": "e4ff28d965086fa57efcad8b7d838fcfd63e614e82544c70e8cb8e2e480a1344",
+      "relationships_sha256": "1146cafe2e5a6d6623d7bc01240e78daa732a3621627680163dc2b244ac3feec"
+    },
+    {
+      "package": "libnvidia-encode-580",
+      "version": "580.167.08-1ubuntu1",
+      "architecture": "amd64",
+      "sha256": "e4e802cf520d498ba72db318e576b4847a2181522d116b0d365726eddb368669",
+      "relationships_sha256": "d37ad554910771fea59168187c7bb1908dbd2743fd4c56016aac40b9a4373796"
+    },
+    {
+      "package": "libnvidia-encode-580",
+      "version": "580.167.08-1ubuntu1",
+      "architecture": "i386",
+      "sha256": "83c0bf16f036b0f805dccf8236e2551e1d122b29b68c8929303a71080ad79610",
+      "relationships_sha256": "fb28e1add11fb10e69629d2975f2048bd79fb9acb93d7d258a95fce1b862244b"
+    },
+    {
+      "package": "libnvidia-extra-580",
+      "version": "580.167.08-1ubuntu1",
+      "architecture": "amd64",
+      "sha256": "6c3b00f7ed7a3c9a50dfd4368275a224b53898057b464d36fad746c86d7c7db6",
+      "relationships_sha256": "d6b5698537c772fac8c16815f62f1cf2ec278bc9e78ea14fa80132d897eb18ea"
+    },
+    {
+      "package": "libnvidia-fbc1-580",
+      "version": "580.167.08-1ubuntu1",
+      "architecture": "amd64",
+      "sha256": "65e52d4c717ce1854efc5716824c8de75534a68863729142fce61fa38f169ddb",
+      "relationships_sha256": "52deb17b0b7ddb2b2b3501ea4bb82b988ad8330a6b012a228bb4eb3582cf62f9"
+    },
+    {
+      "package": "libnvidia-fbc1-580",
+      "version": "580.167.08-1ubuntu1",
+      "architecture": "i386",
+      "sha256": "ed97eef66ccc0a4ab9c1fbb9d5d3b44bb2ab948d53f0bb26116adc1dab969f52",
+      "relationships_sha256": "52deb17b0b7ddb2b2b3501ea4bb82b988ad8330a6b012a228bb4eb3582cf62f9"
+    },
+    {
+      "package": "libnvidia-gl-580",
+      "version": "580.167.08-1ubuntu1",
+      "architecture": "amd64",
+      "sha256": "79429bfb5df56578473ce9fb949138921c2bd2c1bf257542abaeda05bd606209",
+      "relationships_sha256": "ccc5b6d8e49ef866680013d8df8eb751e35dd7e8ea158e6d1a9fc525fc69863e"
+    },
+    {
+      "package": "libnvidia-gl-580",
+      "version": "580.167.08-1ubuntu1",
+      "architecture": "i386",
+      "sha256": "e567faa68073c7f78305664fcc3f9ca9d94fb45bdc8bf4044e5e2bcc3ff9d2ab",
+      "relationships_sha256": "374bfa3ade641acaad195850882e19c515806fcc8583bd6fd064fcc2f0bda45f"
+    },
+    {
+      "package": "libnvidia-gpucomp-580",
+      "version": "580.167.08-1ubuntu1",
+      "architecture": "amd64",
+      "sha256": "d8a58ec8f91110aeeb3b85ee8068871504e3893110df1ab91b6d7b91f9474ed2",
+      "relationships_sha256": "ec133723b1ad06cc4e8ff490b2c43dbf2f7197a910b5051a7ab33fa220189b62"
+    },
+    {
+      "package": "libnvidia-gpucomp-580",
+      "version": "580.167.08-1ubuntu1",
+      "architecture": "i386",
+      "sha256": "2d23c717d44a9749f7b0d2dba00e77fca918675dd24404735c700357afd5a0dd",
+      "relationships_sha256": "ec133723b1ad06cc4e8ff490b2c43dbf2f7197a910b5051a7ab33fa220189b62"
+    },
+    {
+      "package": "libxnvctrl0",
+      "version": "580.167.08-1ubuntu1",
+      "architecture": "amd64",
+      "sha256": "7fe0563ce776038a3457724a3698768700c03381a7d746e3ca1c9aa4413d5024",
+      "relationships_sha256": "aa23280a7a42e039d08116a830a865ffb6a5d37f5fdbd284856da6c968b85493"
+    },
+    {
+      "package": "nvidia-compute-utils-580",
+      "version": "580.167.08-1ubuntu1",
+      "architecture": "amd64",
+      "sha256": "886173326f896499277d29e4e035d6dc6b031f1a4534f7972f633ee6a54d51f3",
+      "relationships_sha256": "68b4b6de78bd5d900312f0968ba10b75455a511feb07ed63e918f332201ffed7"
+    },
+    {
+      "package": "nvidia-dkms-580-open",
+      "version": "580.167.08-1ubuntu1",
+      "architecture": "amd64",
+      "sha256": "4130917962db43afc731a9d0ff8e0ded2e5613c8bee3b9d253f847e21d0a5a99",
+      "relationships_sha256": "9edb0ad6fe60a3fd5fc8295a964a64f2c23cdcebabbe42c562ea6e8c7d8f15ae"
+    },
+    {
+      "package": "nvidia-driver-580-open",
+      "version": "580.167.08-1ubuntu1",
+      "architecture": "amd64",
+      "sha256": "3bf7ee4bad4851693b7042b092610fc7b596b9c933467da7cd528125415a96fe",
+      "relationships_sha256": "4f982ca6dead89caa27bb8b90ad971a15873b775e7d10d3aab3c7cefdede1f2e"
+    },
+    {
+      "package": "nvidia-firmware-580",
+      "version": "580.167.08-1ubuntu1",
+      "architecture": "amd64",
+      "sha256": "076b49d46df6543970392134769ad95d24a5498fa833cae9d8e610ed409dca50",
+      "relationships_sha256": "5977983a96476b8f6aee0a3019b374cd7a1ae20390afa03cab86391d4c2b73e4"
+    },
+    {
+      "package": "nvidia-kernel-common-580",
+      "version": "580.167.08-1ubuntu1",
+      "architecture": "amd64",
+      "sha256": "ecb56dab852bcfcd9222287eee659c88125ff199af013933ece2cfbec55cc656",
+      "relationships_sha256": "50a27c85f3819abd71048b5eac2cfa08737dfe6bd257232fd1a8886c52d4e8bb"
+    },
+    {
+      "package": "nvidia-kernel-source-580-open",
+      "version": "580.167.08-1ubuntu1",
+      "architecture": "amd64",
+      "sha256": "0cec3bef3c39a4c4691c9a674be252e13ee74a3dd82109aad9cd7d6a7bd802d4",
+      "relationships_sha256": "312a1f1f1d25da11f9dc434288cb33becfa4e0be0c0a7df62403c57de69d5c31"
+    },
+    {
+      "package": "nvidia-modprobe",
+      "version": "580.167.08-1ubuntu1",
+      "architecture": "amd64",
+      "sha256": "8a72562d2e1436a67259dff1bcf570e3817370c92632e2249922c1d5c625ccf8",
+      "relationships_sha256": "29c3ec7f6b593033f501bdd5cb684c5009c5346aba4b2eb1bd4a3c5097aa9c5a"
+    },
+    {
+      "package": "nvidia-persistenced",
+      "version": "580.167.08-1ubuntu1",
+      "architecture": "amd64",
+      "sha256": "5fff552dfd0d9b66351358e5cf8592b689d2c65d4c56a0d385166e027ba00c73",
+      "relationships_sha256": "3bfff755311c401d841d1816fbb65f6aae738bdeff60b9496ad956dbc83e6567"
+    },
+    {
+      "package": "nvidia-settings",
+      "version": "580.167.08-1ubuntu1",
+      "architecture": "amd64",
+      "sha256": "1bf399ffd120bac5cb243f709a13cb66aad369b2f0e7e4e82b8adb28d444ebef",
+      "relationships_sha256": "33135a3ea661498a9fc5ca7d16a911b811046d9e258e4f3626f5797660b38025"
+    },
+    {
+      "package": "nvidia-utils-580",
+      "version": "580.167.08-1ubuntu1",
+      "architecture": "amd64",
+      "sha256": "3be2f75cd00b918892aebcc40a119328ff6014f3df641bede57551a397cb73ad",
+      "relationships_sha256": "68b4b6de78bd5d900312f0968ba10b75455a511feb07ed63e918f332201ffed7"
+    },
+    {
+      "package": "xserver-xorg-video-nvidia-580",
+      "version": "580.167.08-1ubuntu1",
+      "architecture": "amd64",
+      "sha256": "75cb46a745bfddc7eaddc6fd29669b5e2db81321bb72c7eab52be7beb2417701",
+      "relationships_sha256": "b5e8c1ad89b23aa3daf9cb8b11998605f9e9cd626827598b486f0c4351b56f45"
+    }
+  ],
+  "explicit_removals": [
+    "libnvidia-cfg1-595",
+    "libnvidia-common-595",
+    "libnvidia-compute-595:amd64",
+    "libnvidia-compute-595:i386",
+    "libnvidia-decode-595:amd64",
+    "libnvidia-decode-595:i386",
+    "libnvidia-encode-595:amd64",
+    "libnvidia-encode-595:i386",
+    "libnvidia-extra-595",
+    "libnvidia-fbc1-595:amd64",
+    "libnvidia-fbc1-595:i386",
+    "libnvidia-gl-595:amd64",
+    "libnvidia-gl-595:i386",
+    "nvidia-compute-utils-595",
+    "nvidia-dkms-595-open",
+    "nvidia-driver-595-open",
+    "nvidia-kernel-common-595",
+    "nvidia-kernel-source-595-open",
+    "nvidia-prime",
+    "nvidia-utils-595",
+    "xserver-xorg-video-nvidia-595"
+  ],
+  "solver_required_non_595_removals": {
+    "nvidia-prime": {
+      "required_by": "nvidia-driver-580-open",
+      "relationship": "Conflicts",
+      "evidence": "The exact 580 driver metapackage declares Conflicts/Replaces on nvidia-prime; an otherwise identical simulation without nvidia-prime- still removes it. The verified pre-driver baseline records nvidia-prime as rc, not installed."
+    }
+  },
+  "simulation": {
+    "upgraded": 0,
+    "newly_installed": 25,
+    "removed": 21
+  }
+}

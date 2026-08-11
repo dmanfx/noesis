@@ -5,11 +5,17 @@ import os
 from pathlib import Path
 import threading
 import time
-from typing import Any, Dict, Optional
+from typing import Any, Callable, Dict, Optional
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
-from noesis.server.boundary_metrics import record_rest_response
+from noesis.server.boundary_metrics import (
+    BoundaryMetricsRoute,
+    mark_rest_response,
+    mark_rest_response_exempt,
+    measure_rest_response_model,
+)
 
 FORCE_STUB_ENV = "NOESIS_DEPTH_API_FORCE_STUB"
 _FORCE_PIPELINE_STUB = os.environ.get(FORCE_STUB_ENV, "").strip().lower() in {
@@ -25,12 +31,13 @@ try:
     from noesis.pipelines.ds8_pipeline import (
         activate,
         build_pipeline,
-        enable_depth,
         get_pipeline,
         prepare,
     )
     USING_PIPELINE_STUB = False
-except Exception:  # pragma: no cover — import-safe fallback for analysis
+except Exception:  # pragma: no cover - explicit test-only stub path
+    if not _FORCE_PIPELINE_STUB:
+        raise
     USING_PIPELINE_STUB = True
 
     class _StubPipeline:
@@ -107,6 +114,7 @@ except Exception:  # pragma: no cover — import-safe fallback for analysis
 
 
 app = FastAPI(title="Noesis DS8 Depth API")
+app.router.route_class = BoundaryMetricsRoute
 logger = logging.getLogger(__name__)
 
 PIPELINE_CONFIG_ENV = "NOESIS_DS8_PIPELINE_CONFIG"
@@ -119,6 +127,44 @@ class DepthRefreshResponse(BaseModel):
     will_disable_at: int
     enabled: bool
     seconds: int
+
+
+class _LeaseClosingStreamingResponse(StreamingResponse):
+    """Close a storage-backed stream on every ASGI terminal path."""
+
+    def __init__(
+        self,
+        content: Any,
+        *,
+        media_type: str,
+        headers: Dict[str, str],
+        close_stream: Callable[[], None],
+    ) -> None:
+        super().__init__(content, media_type=media_type, headers=headers)
+        self._close_stream = close_stream
+
+    async def __call__(self, scope: Any, receive: Any, send: Any) -> None:
+        try:
+            await super().__call__(scope, receive, send)
+        finally:
+            # Starlette skips a response BackgroundTask when an ASGI 2.4 send
+            # raises OSError. Close on disconnect, cancellation, and success.
+            self._close_stream()
+
+
+def _bulk_http_error(exc: BaseException) -> HTTPException:
+    code = str(getattr(exc, "code", "") or "bulk_component_open_failed")
+    status_code = {
+        "bulk_component_not_found": 404,
+        "bulk_snapshot_identity_mismatch": 404,
+        "bulk_snapshot_role_invalid": 404,
+        "bulk_snapshot_unavailable": 404,
+        "bulk_component_manifest_missing": 409,
+        "bulk_component_manifest_invalid": 409,
+        "bulk_snapshot_integrity_failed": 409,
+        "bulk_snapshot_resource_limit_exceeded": 413,
+    }.get(code, 500)
+    return HTTPException(status_code=status_code, detail=code)
 
 
 def _resolve_pipeline_config() -> Optional[Path]:
@@ -168,33 +214,140 @@ def _bootstrap_pipeline() -> None:  # pragma: no cover - exercised in tests
     ensure_pipeline_ready()
 
 
-@app.get(
+@app.post(
     "/api/v1/depth/refresh",
     response_model=DepthRefreshResponse,
     response_model_exclude_none=True,
 )
-def refresh_depth(seconds: int = Query(20, ge=1, le=300)) -> DepthRefreshResponse:
+def refresh_depth(
+    request: Request,
+    seconds: int = Query(20, ge=1, le=300),
+) -> DepthRefreshResponse:
     if not ensure_pipeline_ready():
         raise HTTPException(status_code=503, detail="Depth pipeline not ready")
 
-    payload = enable_depth(seconds=seconds)
-    try:
-        model_start_ns = time.perf_counter_ns()
-        response = DepthRefreshResponse(
-            started_at=int(payload["started_at"]),
-            will_disable_at=int(payload["will_disable_at"]),
-            enabled=bool(payload.get("enabled", True)),
-            seconds=int(payload.get("seconds", seconds)),
+    provider = getattr(request.app.state, "depth_refresh_provider", None)
+    if callable(provider):
+        try:
+            payload = provider(seconds)
+        except Exception as exc:
+            code = str(getattr(exc, "code", "") or "")
+            if code == "capture_event_busy":
+                raise HTTPException(status_code=409, detail=code) from exc
+            if code in {
+                "capture_event_cancelled",
+                "capture_event_controller_unavailable",
+            }:
+                raise HTTPException(status_code=503, detail=code) from exc
+            logger.exception("Depth refresh controller failed")
+            raise HTTPException(
+                status_code=500,
+                detail="Depth control failed",
+            ) from exc
+    elif USING_PIPELINE_STUB:
+        payload = enable_depth(seconds=seconds)
+    else:
+        raise HTTPException(
+            status_code=503,
+            detail="Capture-event depth controller not ready",
         )
-        model_ms = (time.perf_counter_ns() - model_start_ns) / 1_000_000.0
-        record_rest_response(
+    try:
+        with measure_rest_response_model(
+            "/api/v1/depth/refresh", "DepthRefreshResponse"
+        ) as model_measurement:
+            response = DepthRefreshResponse(
+                started_at=int(payload["started_at"]),
+                will_disable_at=int(payload["will_disable_at"]),
+                enabled=bool(payload.get("enabled", True)),
+                seconds=int(payload.get("seconds", seconds)),
+            )
+        mark_rest_response(
+            request,
             "/api/v1/depth/refresh",
             "DepthRefreshResponse",
-            model_duration_ms=model_ms,
-            payload=response,
+            model_duration_ms=model_measurement.elapsed_ms,
             include_budget=True,
         )
         return response
     except Exception as exc:  # pragma: no cover - defensive logging
         logger.exception("Depth refresh payload malformed: %s", exc)
         raise HTTPException(status_code=500, detail="Depth control failed") from exc
+
+
+@app.get(
+    "/api/v1/depth/snapshots/{camera_id}/{snapshot_id}/components/{component}",
+    response_class=StreamingResponse,
+)
+def stream_depth_snapshot_component(
+    request: Request,
+    camera_id: str,
+    snapshot_id: str,
+    component: str,
+    snapshot_ref: str = Query(..., min_length=1, max_length=512),
+    content_sha256: str = Query(
+        ...,
+        min_length=64,
+        max_length=64,
+        pattern="^[0-9a-f]{64}$",
+    ),
+) -> StreamingResponse:
+    query_items = list(request.query_params.multi_items())
+    query_keys = [str(key) for key, _value in query_items]
+    if (
+        len(query_items) != 2
+        or query_keys.count("snapshot_ref") != 1
+        or query_keys.count("content_sha256") != 1
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail="bulk_snapshot_identity_invalid",
+        )
+    storage = getattr(request.app.state, "depth_storage", None)
+    opener = getattr(storage, "open_depth_snapshot_component", None)
+    if not callable(opener):
+        raise HTTPException(
+            status_code=503,
+            detail="depth_bulk_storage_unavailable",
+        )
+    if (
+        not camera_id
+        or len(camera_id) > 160
+        or not snapshot_id
+        or len(snapshot_id) > 160
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail="bulk_snapshot_identity_invalid",
+        )
+    try:
+        stream = opener(
+            camera_id=camera_id,
+            storage_ref=snapshot_ref,
+            snapshot_id=snapshot_id,
+            content_sha256=content_sha256,
+            component=component,
+        )
+    except Exception as exc:
+        raise _bulk_http_error(exc) from exc
+    try:
+        descriptor = stream.descriptor
+        snapshot = stream.snapshot
+        response = _LeaseClosingStreamingResponse(
+            stream.iter_bytes(),
+            media_type="application/octet-stream",
+            close_stream=stream.close,
+            headers={
+                "Content-Length": str(int(descriptor.byte_count)),
+                "X-Noesis-Component-Sha256": str(descriptor.sha256),
+                "X-Noesis-Snapshot-Id": str(snapshot.write_id),
+                "Cache-Control": "no-store",
+            },
+        )
+        mark_rest_response_exempt(
+            request,
+            reason="dense_depth_bulk_stream",
+        )
+        return response
+    except Exception:
+        stream.close()
+        raise

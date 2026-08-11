@@ -1,0 +1,11 @@
+{
+  "format": "NVIDIA TAO ETLT",
+  "output": "DS9/models/tracker_reid/resnet50_market1501.etlt",
+  "output_bytes": 96377716,
+  "output_sha256": "0e5b7f702ce7e3734e45f27b819866f15f6b083048481d1afae2089136e20201",
+  "schema_version": 1,
+  "source": "models/tracker_reid/resnet50_market1501.etlt",
+  "source_sha256": "0e5b7f702ce7e3734e45f27b819866f15f6b083048481d1afae2089136e20201",
+  "staged_at_utc": "2026-07-10T18:02:31Z",
+  "tlt_model_key": "nvidia_tao"
+}

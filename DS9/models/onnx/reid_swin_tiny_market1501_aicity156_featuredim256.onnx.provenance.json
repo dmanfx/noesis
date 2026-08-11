@@ -1,0 +1,28 @@
+{
+  "external_tensor_count": 0,
+  "input_tensors": {
+    "input": [
+      "batch",
+      3,
+      256,
+      128
+    ]
+  },
+  "onnx_ir_version": 9,
+  "onnx_opset": 14,
+  "output": "DS9/models/onnx/reid_swin_tiny_market1501_aicity156_featuredim256.onnx",
+  "output_bytes": 113893579,
+  "output_sha256": "37b008d887495d5fbad31c72aadbf381c5456cb619e0e2a9c246a6d48a2932ff",
+  "output_tensors": {
+    "fc_pred": [
+      "batch",
+      256
+    ]
+  },
+  "schema_version": 1,
+  "source": "models/onnx/reid_swin_tiny_market1501_aicity156_featuredim256.onnx",
+  "source_sha256": "37b008d887495d5fbad31c72aadbf381c5456cb619e0e2a9c246a6d48a2932ff",
+  "source_url": "https://api.ngc.nvidia.com/v2/models/nvidia/tao/reidentificationnet_transformer/versions/deployable_v1.0/files/swin_tiny_market1501_aicity156_featuredim256.onnx",
+  "staged_at_utc": "2026-07-10T17:28:58Z",
+  "staging_aggregate_sha256": "ddcac1498c68ad4d27065ffe0ecd3e1ba034fb9aa747bc3119d42cbc0c5cde99"
+}

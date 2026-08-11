@@ -40,15 +40,10 @@ import {
   floorplanMatchesActiveDepth,
 } from './lib/depthRefreshSequence.js';
 import { loadDepthBulkSnapshot } from './lib/depthBulkClient';
+import { NOESIS_REST_BASE, noesisWebSocketUrl } from './lib/gatewayEndpoints';
 
-const wsHost = import.meta.env.VITE_WS_HOST || window.location.hostname;
-const wsPort = Number(import.meta.env.VITE_WS_PORT || 6008);
-const wsProto = window.location.protocol === 'https:' ? 'wss' : 'ws';
-const WS_URL = import.meta.env.VITE_WS_URL || `${wsProto}://${wsHost}:${wsPort}`;
-const restHost = window.location.hostname || '127.0.0.1';
-const restPort = Number(import.meta.env.VITE_REST_PORT || 8080);
-const restProto = window.location.protocol === 'https:' ? 'https' : 'http';
-const REST_URL = import.meta.env.VITE_REST_URL || (import.meta.env.DEV ? '' : `${restProto}://${restHost}:${restPort}`);
+const WS_URL = noesisWebSocketUrl();
+const REST_URL = NOESIS_REST_BASE;
 const streamDisplayCams: CameraKey[] = ['living-room'];
 const DEPTH_REFRESH_PHASE_TIMEOUT_MS = 155_000;
 

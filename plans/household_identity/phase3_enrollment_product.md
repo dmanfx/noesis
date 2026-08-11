@@ -5,6 +5,12 @@ identities; expose identity health; keep merges suggest-only.
 
 **Depends on:** Phase 2 gate G2 (Phase 1 stub may exist earlier)
 
+The original v1 flow below remains a compatibility surface. The near-term
+product successor is identity v2: browser clients submit only a short-lived
+server observation key, review a proposal, and confirm it with an action-bound
+owner confirmation. They never submit embeddings or enroll an unbound SID. See
+`calibration_and_enrollment.md`.
+
 ## Scope
 
 ### In
@@ -72,6 +78,10 @@ Minimal changes in `oai2-fe`:
 - [x] Update docs; mark soft-merge plan superseded for household mode
   - _2026-07-09: REST/WS contracts + design decisions note household default-on._
 - [ ] G3 validation
+  - _2026-07-10: identity-v2 proposal/confirmation, stale/conflict handling,
+    score-capture status, and migration review have offline/unit coverage. Keep
+    this gate open until the Menon owner flow and real household shadow evidence
+    are validated end to end._
 
 ## Risks
 

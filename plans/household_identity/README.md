@@ -1,6 +1,7 @@
 # Household Identity Rework
 
-Status: planning complete 2026-07-08; implementation in progress.
+Status: runtime/product implementation complete at offline gates; authoritative
+identity remains blocked on qualifying benchmark and household evidence.
 
 Transform Noesis StableID from an open-world ReID minting engine into a
 **closed-world household identity system** with geometry-aware multi-camera
@@ -58,6 +59,7 @@ tracklet (sensor, tracker_id)
 | `phase1_closed_world.md` | Resident/visitor spaces + mutex |
 | `phase2_sota_matching.md` | Backbone, quality gallery, assignment |
 | `phase3_enrollment_product.md` | Names, enrollment UX, health reports |
+| `calibration_and_enrollment.md` | Correlation-aware artifact v2, two-stratum authority, owner enrollment, migration review |
 
 ## Phase summary
 

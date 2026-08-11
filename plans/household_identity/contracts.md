@@ -97,3 +97,41 @@ Add counters:
 - `resident_count` / `visitor_count`
 - `mint_visitor_count` / `promote_resident_count`
 - `assignment_conflict_count`
+
+## Identity-v2 calibration authority
+
+The generated product schemas are authoritative for exact fields:
+
+- `noesis.identity.evidence_labels` v2 declares `benchmark` or `household`,
+  immutable source/labeling provenance, a private `truth_person_key`, and one
+  physical `encounter_id` for every score event. Version 1 labels reject.
+- `noesis.identity.calibration_dataset` v2 embeds the exact chained score
+  evidence plus deterministic evidence units keyed by session, run, source,
+  camera, tracker, and five-second bucket. Units are capped at 300 observations;
+  train fitting records one center representative for at most eight temporally
+  spread units per encounter.
+- `noesis.identity.open_set_calibration` v2 binds one benchmark dataset and one
+  household dataset for the same engine/layer/dimension and runtime-derived
+  semantic profile. It carries scorer-only authority scope, a conservative
+  gallery envelope, the benchmark and household-tightened policies,
+  person/encounter-balanced fit, four metric blocks, and acceptance gates.
+  Version 1 artifacts reject rather than being interpreted under v2 semantics.
+
+Each block reports raw observation/unit/encounter/person counts and
+encounter-worst-case outcomes. Benchmark confidence is truth-person-worst-case
+over subject-disjoint, challenge-covered resident and unknown people; repeated
+encounters never increase its exact one-sided 95% denominator. Household gates
+remain physical-encounter checks and do not claim the generic 1% result.
+Household evidence can only retain or raise rejection gates; resident
+prevalence remains bounded post-gate ranking utility and cannot rescue a
+rejection.
+
+`noesis.identity.authority_cutover` v1 is a separate public-runtime contract.
+It binds one exact scorer artifact to the active DS8/DS9 model semantic profile,
+executable authority-runtime profile, camera topology, and camera set. Its
+`coordinator_replay` and `occupied_scene` members are distinct literal-pass
+evidence records with owner-private report path, byte size, SHA-256, revision,
+and completion time. The cutover artifact itself requires an independent exact-
+byte environment pin, and runtime startup re-reads both report files. A scorer
+artifact never satisfies this contract and cannot by itself enable public
+authoritative identity.

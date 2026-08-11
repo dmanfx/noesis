@@ -1,0 +1,25 @@
+{
+  "contract": "noesis.authored_scene.room_group_map",
+  "contract_version": 1,
+  "release_id": "home_rgbmesh_20260623T2158_v1",
+  "authored_scene_sha256": "78189d2619cf61f9470fd1245bf1db55678cdbb7c02fc947e53cf36127712bae",
+  "review_basis": "Human-labeled Menon room zones matched to the exact promoted OBJ floor-group footprints.",
+  "rooms": {
+    "Living Room": [
+      "room_73_447"
+    ],
+    "Kitchen": [
+      "room_63_437"
+    ],
+    "Family Room": [
+      "room_70_444"
+    ],
+    "Foyer": [
+      "room_65_439"
+    ],
+    "Kitchen2": [
+      "room_68_442",
+      "room_69_443"
+    ]
+  }
+}

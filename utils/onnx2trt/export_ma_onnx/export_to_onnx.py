@@ -4,6 +4,9 @@
 from __future__ import annotations
 
 import argparse
+import importlib.metadata
+import inspect
+import json
 import logging
 import subprocess
 import shutil
@@ -11,24 +14,61 @@ import sys
 import contextlib
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Optional
 
 import onnx
 import onnxruntime as ort
 import torch
 import torch.nn as nn
 import numpy as np
+from huggingface_hub import hf_hub_download
 from onnx import numpy_helper
+from packaging.version import InvalidVersion, Version
 
 try:  # Optional dependency used for graph simplification
     import onnxsim  # type: ignore
 except Exception:  # pragma: no cover - best effort dependency
     onnxsim = None  # type: ignore
 
-from mapanything.utils.inference import preprocess_input_views_for_inference
-
-
 LOGGER = logging.getLogger("export_ma_onnx")
+MIN_UNICEPTION_VERSION = Version("0.1.7")
+
+
+class ModelCompatibilityError(RuntimeError):
+    """Raised before weights load when model source and checkpoint APIs differ."""
+
+
+def _safe_output_name(value: str) -> str:
+    raw = str(value or "").strip()
+    candidate = Path(raw)
+    if (
+        not raw
+        or candidate.name != raw
+        or candidate.suffix.lower() != ".onnx"
+        or candidate.is_absolute()
+        or ".." in candidate.parts
+    ):
+        raise ValueError(
+            "--output-name must be one relative .onnx filename without directories"
+        )
+    return raw
+
+
+def _safe_report_name(value: str) -> str:
+    raw = str(value or "").strip()
+    candidate = Path(raw)
+    if (
+        not raw
+        or candidate.name != raw
+        or candidate.suffix.lower() != ".txt"
+        or candidate.is_absolute()
+        or ".." in candidate.parts
+    ):
+        raise ValueError(
+            "--report-name must be one relative .txt filename without directories"
+        )
+    return raw
+
 
 class MapAnythingDepthWrapper(nn.Module):
     def __init__(
@@ -39,6 +79,8 @@ class MapAnythingDepthWrapper(nn.Module):
         std_tensor: torch.Tensor,
         use_fused_input: bool,
         *,
+        output_height: int,
+        output_width: int,
         return_conf_mask: bool = False,
         include_intrinsics: bool = False,
         fx_default: float = 1000.0,
@@ -48,6 +90,8 @@ class MapAnythingDepthWrapper(nn.Module):
         self.model = base_model
         self.norm_type = normalization_type
         self.use_fused_input = use_fused_input
+        self.output_height = int(output_height)
+        self.output_width = int(output_width)
         self.return_conf_mask = bool(return_conf_mask)
         self.include_intrinsics = bool(include_intrinsics)
         self.fx_default = float(fx_default)
@@ -141,7 +185,13 @@ class MapAnythingDepthWrapper(nn.Module):
         else:
             raise KeyError("MapAnything.forward output missing pts3d_cam/depth_along_ray")
 
-        depth_out = depth_z.unsqueeze(1).to(torch.float32)  # (N, 1, H, W)
+        output_shape = (
+            images.shape[0],
+            1,
+            self.output_height,
+            self.output_width,
+        )
+        depth_out = depth_z.to(torch.float32).reshape(output_shape)
         if not self.return_conf_mask:
             return depth_out
 
@@ -149,13 +199,13 @@ class MapAnythingDepthWrapper(nn.Module):
         if conf is None:
             conf_out = torch.zeros_like(depth_out)
         else:
-            conf_out = conf.unsqueeze(1).to(torch.float32)
+            conf_out = conf.to(torch.float32).reshape(output_shape)
 
         non_ambiguous_mask = out.get("non_ambiguous_mask")
         if non_ambiguous_mask is None:
             mask_out = torch.ones_like(depth_out)
         else:
-            mask_out = non_ambiguous_mask.to(torch.float32).unsqueeze(1)
+            mask_out = non_ambiguous_mask.to(torch.float32).reshape(output_shape)
 
         return depth_out, conf_out, mask_out
 
@@ -165,6 +215,9 @@ class ExportConfig:
 
     repo_path: Path
     outdir: Path
+    output_name: Optional[str]
+    report_name: Optional[str]
+    fail_if_output_exists: bool
     height: int
     width: int
     opset: int
@@ -173,8 +226,11 @@ class ExportConfig:
     repo_branch: Optional[str]
     fused_input: bool
     hf_model_id: Optional[str]
+    hf_revision: Optional[str]
     include_intrinsics: bool
     return_conf_mask: bool
+    export_device: str
+    skip_eager_smoke: bool
     skip_ort: bool
     skip_simplify: bool
     skip_shape_inference: bool
@@ -184,6 +240,27 @@ def parse_args() -> ExportConfig:
     parser = argparse.ArgumentParser(description="Export MapAnything monocular depth model to ONNX")
     parser.add_argument("--repo", required=True, help="Path to the MapAnything repository")
     parser.add_argument("--outdir", default="ma_onnx_out_clean", help="Directory where ONNX files will be written")
+    parser.add_argument(
+        "--output-name",
+        default="",
+        help=(
+            "Optional exact ONNX filename inside --outdir. The default remains "
+            "model.onnx (or model_fused.onnx)."
+        ),
+    )
+    parser.add_argument(
+        "--report-name",
+        default="",
+        help=(
+            "Optional export-report filename inside --outdir. With an explicit "
+            "--output-name, the default is <output-stem>.export_report.txt."
+        ),
+    )
+    parser.add_argument(
+        "--fail-if-output-exists",
+        action="store_true",
+        help="Refuse to replace any ONNX, sidecar, derived graph, or report output.",
+    )
     # For 1920x1080 sources, MapAnything preprocess uses max side=518 and rounds to patch-size (14):
     # 518x294 (W×H). Keep these as the default export dims for DS8 full-frame inference.
     parser.add_argument("--h", type=int, default=294, help="Input image height (default: 294 for 16:9 sources)")
@@ -195,8 +272,33 @@ def parse_args() -> ExportConfig:
         default="facebook/map-anything-apache",
         help="HuggingFace model id to load via MapAnything.from_pretrained (recommended; pass '' to disable).",
     )
+    parser.add_argument(
+        "--hf-revision",
+        default="",
+        help=(
+            "Optional immutable Hugging Face model revision. Candidate/release "
+            "work should always pass a full commit SHA."
+        ),
+    )
     parser.add_argument("--repo-url", default=None, help="Repository URL for reporting")
     parser.add_argument("--repo-branch", default=None, help="Repository branch for reporting")
+    parser.add_argument(
+        "--device",
+        choices=("cpu", "cuda"),
+        default="cuda",
+        help=(
+            "Exact device used to load and export the model. The exporter fails "
+            "if the requested device is unavailable; it never falls back."
+        ),
+    )
+    parser.add_argument(
+        "--skip-eager-smoke",
+        action="store_true",
+        help=(
+            "Skip the redundant eager wrapper forward before ONNX tracing. "
+            "The ONNX export and downstream engine functional test still run."
+        ),
+    )
     parser.add_argument("--skip-ort", action="store_true", help="Skip ONNX Runtime smoke test (saves RAM/time).")
     parser.add_argument("--skip-simplify", action="store_true", help="Skip onnxsim simplification (saves RAM/time).")
     parser.add_argument("--skip-shape-inference", action="store_true", help="Skip ONNX shape inference step.")
@@ -246,6 +348,9 @@ def parse_args() -> ExportConfig:
     return ExportConfig(
         repo_path=repo_path,
         outdir=outdir,
+        output_name=_safe_output_name(args.output_name) if args.output_name else None,
+        report_name=_safe_report_name(args.report_name) if args.report_name else None,
+        fail_if_output_exists=bool(args.fail_if_output_exists),
         height=args.h,
         width=args.w,
         opset=args.opset,
@@ -254,8 +359,11 @@ def parse_args() -> ExportConfig:
         repo_branch=args.repo_branch,
         fused_input=bool(args.fused_input),
         hf_model_id=str(args.hf_model_id).strip() or None,
+        hf_revision=str(args.hf_revision).strip() or None,
         include_intrinsics=bool(getattr(args, "include_intrinsics", False)),
         return_conf_mask=bool(getattr(args, "return_conf_mask", True)),
+        export_device=str(args.device),
+        skip_eager_smoke=bool(getattr(args, "skip_eager_smoke", False)),
         skip_ort=bool(getattr(args, "skip_ort", False)),
         skip_simplify=bool(getattr(args, "skip_simplify", False)),
         skip_shape_inference=bool(getattr(args, "skip_shape_inference", False)),
@@ -264,6 +372,37 @@ def parse_args() -> ExportConfig:
 
 def setup_logging() -> None:
     logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(message)s")
+
+
+def _model_filename(cfg: ExportConfig) -> str:
+    return cfg.output_name or ("model_fused.onnx" if cfg.fused_input else "model.onnx")
+
+
+def _report_filename(cfg: ExportConfig) -> str:
+    if cfg.report_name:
+        return cfg.report_name
+    if cfg.output_name:
+        return f"{Path(cfg.output_name).stem}.export_report.txt"
+    return "export_report.txt"
+
+
+def _guard_export_outputs(cfg: ExportConfig) -> None:
+    if not cfg.fail_if_output_exists:
+        return
+    model_path = cfg.outdir / _model_filename(cfg)
+    candidates = (
+        model_path,
+        model_path.with_suffix(model_path.suffix + ".data"),
+        model_path.with_name(f"{model_path.stem}-inferred.onnx"),
+        model_path.with_name(f"{model_path.stem}-sim.onnx"),
+        cfg.outdir / _report_filename(cfg),
+    )
+    existing = [path for path in candidates if path.exists() or path.is_symlink()]
+    if existing:
+        raise FileExistsError(
+            "refusing to replace existing export output(s): "
+            + ", ".join(str(path) for path in existing)
+        )
 
 
 def get_git_commit(repo_path: Path) -> str:
@@ -283,6 +422,122 @@ def get_git_commit(repo_path: Path) -> str:
         return "unknown"
 
 
+def _explicit_keyword_parameters(callable_obj: Any) -> set[str]:
+    return {
+        parameter.name
+        for parameter in inspect.signature(callable_obj).parameters.values()
+        if parameter.name != "self"
+        and parameter.kind
+        in (
+            inspect.Parameter.POSITIONAL_OR_KEYWORD,
+            inspect.Parameter.KEYWORD_ONLY,
+        )
+    }
+
+
+def _validate_hf_config_compatibility(
+    *,
+    model_class: type,
+    encoder_class: type,
+    model_config: Dict[str, Any],
+    uniception_version: str,
+) -> None:
+    """Require the source APIs that give every checkpoint option its semantics."""
+
+    try:
+        installed_uniception = Version(uniception_version)
+    except InvalidVersion as exc:
+        raise ModelCompatibilityError(
+            f"unable to interpret UniCeption version {uniception_version!r}"
+        ) from exc
+    if installed_uniception < MIN_UNICEPTION_VERSION:
+        raise ModelCompatibilityError(
+            "Hugging Face MapAnything v1.1 checkpoints require UniCeption "
+            f">={MIN_UNICEPTION_VERSION}; found {installed_uniception}. "
+            "Use a task-isolated environment with the matching official "
+            "MapAnything dependencies; do not strip checkpoint options."
+        )
+
+    model_parameters = _explicit_keyword_parameters(model_class.__init__)
+    unsupported_model_options = sorted(set(model_config) - model_parameters)
+    if unsupported_model_options:
+        raise ModelCompatibilityError(
+            "MapAnything source does not implement checkpoint option(s): "
+            + ", ".join(unsupported_model_options)
+        )
+
+    encoder_config = model_config.get("encoder_config")
+    if not isinstance(encoder_config, dict):
+        raise ModelCompatibilityError(
+            "Hugging Face MapAnything config is missing encoder_config"
+        )
+    encoder_parameters = _explicit_keyword_parameters(encoder_class.__init__)
+    factory_only_options = {"encoder_str", "uses_torch_hub"}
+    unsupported_encoder_options = sorted(
+        set(encoder_config) - encoder_parameters - factory_only_options
+    )
+    if unsupported_encoder_options:
+        raise ModelCompatibilityError(
+            "UniCeption DINOv2 source does not implement checkpoint option(s): "
+            + ", ".join(unsupported_encoder_options)
+        )
+
+
+def _load_and_validate_hf_config(
+    cfg: ExportConfig,
+    *,
+    model_class: type,
+    encoder_class: type,
+) -> Dict[str, Any]:
+    if not cfg.hf_model_id:
+        raise ModelCompatibilityError("Hugging Face model id is required")
+    config_path = hf_hub_download(
+        repo_id=cfg.hf_model_id,
+        filename="config.json",
+        revision=cfg.hf_revision,
+    )
+    with Path(config_path).open("r", encoding="utf-8") as handle:
+        model_config = json.load(handle)
+    if not isinstance(model_config, dict):
+        raise ModelCompatibilityError(
+            "Hugging Face MapAnything config must be a JSON object"
+        )
+    try:
+        uniception_version = importlib.metadata.version("uniception")
+    except importlib.metadata.PackageNotFoundError as exc:
+        raise ModelCompatibilityError(
+            "UniCeption is not installed in the exporter environment"
+        ) from exc
+    _validate_hf_config_compatibility(
+        model_class=model_class,
+        encoder_class=encoder_class,
+        model_config=model_config,
+        uniception_version=uniception_version,
+    )
+    return model_config
+
+
+def _load_hf_pretrained_model(cfg: ExportConfig, model_class: type) -> Any:
+    if not cfg.hf_model_id:
+        raise ModelCompatibilityError("Hugging Face model id is required")
+    return model_class.from_pretrained(
+        cfg.hf_model_id,
+        revision=cfg.hf_revision,
+        strict=True,
+    )
+
+
+def _resolve_export_device(requested: str) -> torch.device:
+    """Resolve one explicit export device without an implicit fallback."""
+
+    device = torch.device(requested)
+    if device.type == "cuda" and not torch.cuda.is_available():
+        raise RuntimeError(
+            "CUDA export was requested, but torch.cuda.is_available() is false"
+        )
+    return device
+
+
 def load_model(cfg: ExportConfig) -> Dict[str, Any]:
     """Load the MapAnything model using Hydra configuration."""
     sys.path.insert(0, str(cfg.repo_path))
@@ -290,6 +545,7 @@ def load_model(cfg: ExportConfig) -> Dict[str, Any]:
     from hydra import compose, initialize_config_dir  # type: ignore
     from mapanything.models import init_model  # type: ignore
     from mapanything.models import MapAnything  # type: ignore
+    from uniception.models.encoders.dinov2 import DINOv2Encoder  # type: ignore
     from uniception.models.encoders.image_normalizations import (  # type: ignore
         IMAGE_NORMALIZATION_DICT,
     )
@@ -302,10 +558,20 @@ def load_model(cfg: ExportConfig) -> Dict[str, Any]:
     checkpoint_error: Optional[str] = None
 
     if cfg.hf_model_id:
-        LOGGER.info("Loading MapAnything via HuggingFace: %s", cfg.hf_model_id)
-        model = MapAnything.from_pretrained(cfg.hf_model_id)
+        _load_and_validate_hf_config(
+            cfg,
+            model_class=MapAnything,
+            encoder_class=DINOv2Encoder,
+        )
+        revision_label = cfg.hf_revision or "main"
+        LOGGER.info(
+            "Loading MapAnything via HuggingFace: %s@%s",
+            cfg.hf_model_id,
+            revision_label,
+        )
+        model = _load_hf_pretrained_model(cfg, MapAnything)
         model.eval()
-        checkpoint_status = f"hf:{cfg.hf_model_id}"
+        checkpoint_status = f"hf:{cfg.hf_model_id}@{revision_label} (strict)"
     else:
         LOGGER.info("Composing Hydra config for MapAnything model")
         with initialize_config_dir(config_dir=str(configs_dir), job_name="ma_export", version_base=None):
@@ -378,18 +644,14 @@ def load_model(cfg: ExportConfig) -> Dict[str, Any]:
         mean,
         std,
         use_fused_input=cfg.fused_input,
+        output_height=cfg.height,
+        output_width=cfg.width,
         include_intrinsics=cfg.include_intrinsics,
         return_conf_mask=cfg.return_conf_mask,
     )
-    # Prefer exporting on CUDA when available (MapAnything forward can be very slow on CPU).
-    try:
-        target_device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        wrapper.to(target_device)
-        LOGGER.info("Moved export wrapper to device: %s", target_device)
-    except Exception as exc:  # pragma: no cover - best effort
-        LOGGER.warning("Failed to move wrapper to CUDA; exporting on CPU: %s", exc)
-
-    import inspect
+    target_device = _resolve_export_device(cfg.export_device)
+    wrapper.to(target_device)
+    LOGGER.info("Moved export wrapper to explicit device: %s", target_device)
 
     model_class_name = model.__class__.__name__
     model_module_path = inspect.getfile(model.__class__)
@@ -403,6 +665,7 @@ def load_model(cfg: ExportConfig) -> Dict[str, Any]:
         "checkpoint_status": checkpoint_status,
         "checkpoint_error": checkpoint_error,
         "img_norm": img_norm,
+        "export_device": str(target_device),
     }
 
 
@@ -454,29 +717,30 @@ def export_onnx(wrapper: nn.Module, cfg: ExportConfig, artifacts: Dict[str, Any]
         export_inputs = (dummy_fused,)
         input_names = ["mapanything_fused"]
         dynamic_axes_inputs = {"mapanything_fused": {0: "batch"}}
-        model_path = cfg.outdir / "model_fused.onnx"
+        model_path = cfg.outdir / _model_filename(cfg)
     else:
         export_inputs = (dummy_images,)
         input_names = ["images"]
         dynamic_axes_inputs = {"images": {0: "batch"}}
-        model_path = cfg.outdir / "model.onnx"
+        model_path = cfg.outdir / _model_filename(cfg)
 
     print(f"[INFO] Exporting static ONNX model to {model_path}")
-    torch.onnx.export(
-        wrapper,
-        export_inputs,
-        model_path.as_posix(),
-        export_params=True,
-        dynamo=False,
-        opset_version=cfg.opset,
-        do_constant_folding=True,
-        input_names=input_names,
-        output_names=output_names,
-        dynamic_axes={
-            **dynamic_axes_inputs,
-            **{name: {0: "batch"} for name in output_names},
-        },
-    )
+    with torch.inference_mode():
+        torch.onnx.export(
+            wrapper,
+            export_inputs,
+            model_path.as_posix(),
+            export_params=True,
+            dynamo=False,
+            opset_version=cfg.opset,
+            do_constant_folding=True,
+            input_names=input_names,
+            output_names=output_names,
+            dynamic_axes={
+                **dynamic_axes_inputs,
+                **{name: {0: "batch"} for name in output_names},
+            },
+        )
 
     static_external = False
     # Avoid loading massive external tensor blobs into memory unless needed.
@@ -532,7 +796,7 @@ def export_onnx(wrapper: nn.Module, cfg: ExportConfig, artifacts: Dict[str, Any]
         LOGGER.info("Skipping shape inference (--skip-shape-inference)")
     else:
         LOGGER.info("Running shape inference")
-        inferred_path = cfg.outdir / ("model_fused-inferred.onnx" if cfg.fused_input else "model-inferred.onnx")
+        inferred_path = model_path.with_name(f"{model_path.stem}-inferred.onnx")
         onnx.shape_inference.infer_shapes_path(model_path.as_posix(), inferred_path.as_posix())
 
     simplified_model_path: Optional[Path] = None
@@ -541,7 +805,7 @@ def export_onnx(wrapper: nn.Module, cfg: ExportConfig, artifacts: Dict[str, Any]
     elif onnxsim is None:
         simplifier_status = "onnxsim not installed"
     else:
-        simplifier_target = cfg.outdir / ("model_fused_sim.onnx" if cfg.fused_input else "model_sim.onnx")
+        simplifier_target = model_path.with_name(f"{model_path.stem}-sim.onnx")
         try:
             LOGGER.info("Running onnxsim simplification")
             input_shapes = {"mapanything_fused": [1, 12, height, width]} if cfg.fused_input else {
@@ -582,14 +846,13 @@ def export_onnx(wrapper: nn.Module, cfg: ExportConfig, artifacts: Dict[str, Any]
 
     dynamic_status = "not attempted"
     dynamic_error: Optional[str] = None
-    dynamic_path = cfg.outdir / "model-dyn.onnx"
     LOGGER.info("Skipping dynamic H/W export to preserve static weights")
     dynamic_status = "skipped"
     dynamic_external = False
     dynamic_error = None
 
     if simplified_model_path is None:
-        fallback_target = cfg.outdir / ("model_fused_sim.onnx" if cfg.fused_input else "model_sim.onnx")
+        fallback_target = model_path.with_name(f"{model_path.stem}-sim.onnx")
         if not fallback_target.exists():
             shutil.copyfile(model_path, fallback_target)
         simplifier_status = f"{simplifier_status}; fallback copy created"
@@ -605,6 +868,7 @@ def export_onnx(wrapper: nn.Module, cfg: ExportConfig, artifacts: Dict[str, Any]
         "dynamic_error": dynamic_error,
         "height": height,
         "width": width,
+        "external_data_path": external_data_path if static_external else None,
         "patch_size": getattr(getattr(artifacts["model"], "encoder", None), "patch_size", None),
         "static_external_data": static_external,
         "dynamic_external_data": dynamic_external,
@@ -617,7 +881,7 @@ def write_report(
     export_info: Dict[str, Any],
     git_sha: str,
 ) -> None:
-    report_path = cfg.outdir / "export_report.txt"
+    report_path = cfg.outdir / _report_filename(cfg)
     ort_info = export_info["ort_result"]
     unique_ops = export_info["unique_ops"]
 
@@ -635,7 +899,10 @@ def write_report(
         f"Fused input enabled: {cfg.fused_input}",
         f"Include intrinsics: {cfg.include_intrinsics}",
         f"Return conf/mask: {cfg.return_conf_mask}",
+        f"Export device: {artifacts['export_device']}",
         f"HuggingFace model id: {cfg.hf_model_id or 'none'}",
+        f"HuggingFace revision: {cfg.hf_revision or 'main'}",
+        f"ONNX filename: {Path(export_info['model_path']).name}",
         "",
         "Input specification:",
     ]
@@ -688,7 +955,10 @@ def write_report(
             f"Note: Input resolution aligned to encoder patch size {export_info['patch_size']}"
         )
     if export_info.get("static_external_data"):
-        lines.append("Static export saved tensors to external data files (model.onnx.data)")
+        lines.append(
+            "Static export saved tensors to external data files "
+            f"({Path(export_info['external_data_path']).name})"
+        )
     if export_info.get("simplified_model_path"):
         lines.append(f"Simplified graph saved to {export_info['simplified_model_path'].name}")
 
@@ -701,6 +971,7 @@ def write_report(
 def main() -> None:
     setup_logging()
     cfg = parse_args()
+    _guard_export_outputs(cfg)
     print(f"[INFO] Starting export with configuration: {cfg}")
 
     # Load model and artifacts
@@ -717,39 +988,59 @@ def main() -> None:
 
     wrapper: MapAnythingDepthWrapper = artifacts["wrapper"]
 
-    # Test wrapper
-    try:
-        export_device = next(wrapper.parameters()).device
-    except StopIteration:
-        export_device = getattr(getattr(wrapper, "mean", None), "device", torch.device("cpu"))
-    dummy_images = torch.rand(1, 3, height, width, dtype=torch.float32, device=export_device)
-    if cfg.fused_input:
-        intr_template = torch.tensor(
-            [
-                1000.0,
-                0.0,
-                width / 2.0,
-                0.0,
-                1000.0,
-                height / 2.0,
-                0.0,
-                0.0,
-                1.0,
-            ],
+    wrapper.eval()
+    if cfg.skip_eager_smoke:
+        LOGGER.info("Skipping redundant eager wrapper smoke (--skip-eager-smoke)")
+    else:
+        try:
+            export_device = next(wrapper.parameters()).device
+        except StopIteration:
+            export_device = getattr(
+                getattr(wrapper, "mean", None),
+                "device",
+                torch.device("cpu"),
+            )
+        dummy_images = torch.rand(
+            1,
+            3,
+            height,
+            width,
             dtype=torch.float32,
             device=export_device,
-        ).view(1, 9, 1, 1)
-        dummy_intr_map = intr_template.expand(-1, -1, height, width)
-        dummy_fused = torch.cat([dummy_images, dummy_intr_map], dim=1)
-        test_outputs = wrapper(dummy_fused)
-    else:
-        test_outputs = wrapper(dummy_images)
-    if isinstance(test_outputs, (tuple, list)):
-        print("Test output shapes:", [tuple(getattr(x, "shape", ())) for x in test_outputs])
-    else:
-        print("Test output shape:", tuple(getattr(test_outputs, "shape", ())))
-
-    wrapper.eval()
+        )
+        with torch.inference_mode():
+            if cfg.fused_input:
+                intr_template = torch.tensor(
+                    [
+                        1000.0,
+                        0.0,
+                        width / 2.0,
+                        0.0,
+                        1000.0,
+                        height / 2.0,
+                        0.0,
+                        0.0,
+                        1.0,
+                    ],
+                    dtype=torch.float32,
+                    device=export_device,
+                ).view(1, 9, 1, 1)
+                dummy_intr_map = intr_template.expand(-1, -1, height, width)
+                dummy_fused = torch.cat([dummy_images, dummy_intr_map], dim=1)
+                test_outputs = wrapper(dummy_fused)
+            else:
+                test_outputs = wrapper(dummy_images)
+        if isinstance(test_outputs, (tuple, list)):
+            print(
+                "Test output shapes:",
+                [tuple(getattr(x, "shape", ())) for x in test_outputs],
+            )
+        else:
+            print("Test output shape:", tuple(getattr(test_outputs, "shape", ())))
+        del test_outputs
+        del dummy_images
+        if export_device.type == "cuda":
+            torch.cuda.empty_cache()
 
     # Export ONNX models
     export_info = export_onnx(wrapper, cfg, artifacts)
@@ -757,7 +1048,7 @@ def main() -> None:
     git_sha = get_git_commit(cfg.repo_path)
     write_report(cfg, artifacts, export_info, git_sha)
 
-    print(f"[INFO] Export pipeline completed successfully!")
+    print("[INFO] Export pipeline completed successfully!")
     print(f"[INFO] Output directory: {cfg.outdir}")
     return export_info
 

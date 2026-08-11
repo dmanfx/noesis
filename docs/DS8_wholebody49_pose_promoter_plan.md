@@ -1,6 +1,13 @@
 # DS8 Wholebody49 X Pose Promoter Plan
 _Status: implementation plan drafted 2026-06-24._
 
+Successor boundary note (2026-07-10): Wholebody49 variant/config/tensor/parser
+semantics are now shared between DS8 and DS9, while each runtime owns its parser
+binary and TensorRT engines. Any promoter implementation must preserve that
+single semantic owner and add the corresponding DS9 adapter/config work. The
+current DS9 profile port does not implement this future pose promoter and does
+not change `output-tensor-meta=0`.
+
 This plan describes how to promote DEIMv2 Wholebody49 X label-only keypoint detections into the existing DS8 `NOESIS.POSE_FEATURES` object metadata contract when Wholebody49 is selected as the PGIE. The goal is to remove the redundant YOLO26 pose SGIE later, while preserving keypoint overlay, pose-derived world anchors, and pose feature payloads for identity work. This plan intentionally stays boxes-only and does not depend on Wholebody masks.
 
 ## Scope

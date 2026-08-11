@@ -1,9 +1,15 @@
 from __future__ import annotations
 
+import hashlib
+import json
 import math
 from typing import Any, Mapping, Sequence
 
 import numpy as np
+
+
+CAMERA_ANCHOR_STATE_CONTRACT = "noesis.menon.camera_anchor_state"
+CAMERA_ANCHOR_STATE_CONTRACT_VERSION = 1
 
 
 def _as_point3(values: Sequence[Any], *, name: str) -> np.ndarray:
@@ -70,6 +76,11 @@ def solve_scene_similarity(
         normalized.append(
             {
                 "camera_id": camera_id,
+                **(
+                    {"anchor_id": str(item.get("anchor_id")).strip()}
+                    if str(item.get("anchor_id") or "").strip()
+                    else {}
+                ),
                 "world_position_m": [float(x) for x in world_point],
                 "scene_position": [float(x) for x in scene_point],
             }
@@ -113,6 +124,8 @@ def solve_scene_similarity(
         "mean_residual": mean_residual,
         "max_residual": max_residual,
         "position_rmse_scene_units": float(rmse),
+        "position_rmse_m": float(rmse / scale) if scale > 1e-9 else math.inf,
+        "max_residual_m": float(max_residual / scale) if scale > 1e-9 else math.inf,
         "world_to_scene_col_major": [float(x) for x in matrix.flatten(order="F")],
         "matrix_row_major": [float(x) for x in matrix.reshape(-1)],
         "rotation_row_major": [float(x) for x in rotation.reshape(-1)],
@@ -120,4 +133,59 @@ def solve_scene_similarity(
     }
 
 
-__all__ = ["solve_scene_similarity", "solve_similarity_transform"]
+def camera_anchor_state_payload(
+    correspondences: Sequence[Mapping[str, Any]],
+) -> dict[str, Any]:
+    """Return the exact, portable Menon camera-anchor state used by a fit."""
+
+    anchors: list[dict[str, Any]] = []
+    for item in correspondences or []:
+        if not isinstance(item, Mapping):
+            continue
+        camera_id = str(item.get("camera_id") or "").strip()
+        anchor_id = str(item.get("anchor_id") or "").strip()
+        if not camera_id or not anchor_id:
+            raise ValueError("camera anchor state requires camera_id and anchor_id")
+        scene_point = _as_point3(item.get("scene_position") or (), name="scene_position")
+        anchors.append(
+            {
+                "anchor_id": anchor_id,
+                "camera_id": camera_id,
+                "scene_position": [float(value) for value in scene_point],
+            }
+        )
+    if not anchors:
+        raise ValueError("camera anchor state requires at least one anchor")
+    anchors.sort(key=lambda item: (item["camera_id"], item["anchor_id"]))
+    camera_ids = [item["camera_id"] for item in anchors]
+    if len(camera_ids) != len(set(camera_ids)):
+        raise ValueError("camera anchor state contains duplicate camera IDs")
+    return {
+        "contract": CAMERA_ANCHOR_STATE_CONTRACT,
+        "contract_version": CAMERA_ANCHOR_STATE_CONTRACT_VERSION,
+        "anchors": anchors,
+    }
+
+
+def camera_anchor_state_sha256(
+    correspondences: Sequence[Mapping[str, Any]],
+) -> str:
+    payload = camera_anchor_state_payload(correspondences)
+    encoded = json.dumps(
+        payload,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+        allow_nan=False,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+__all__ = [
+    "CAMERA_ANCHOR_STATE_CONTRACT",
+    "CAMERA_ANCHOR_STATE_CONTRACT_VERSION",
+    "camera_anchor_state_payload",
+    "camera_anchor_state_sha256",
+    "solve_scene_similarity",
+    "solve_similarity_transform",
+]

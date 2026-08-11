@@ -61,7 +61,14 @@ data/*
 data/depth/
 models/
 */__init__.py
+!noesis_core/__init__.py
+!reid/__init__.py
 external/
+!external/
+external/*
+!external/ds_preprocess_shim/
+!external/ds_preprocess_shim/Makefile
+!external/ds_preprocess_shim/*.cpp
 .env
 tests/
 ma_onnx_out/
@@ -74,6 +81,10 @@ ma_onnxTRT/
 pipelines/*.so
 *.so
 *.pt
+!gst-plugins/noesisforceidr/README.md
+!gst-plugins/noesiseos/README.md
+!gst-plugins/nvdsroiexclude/README.md
+!pipelines/mapanything_preprocess_fused/README.md
 
 #external folders/files
 .venv_ds/
@@ -112,6 +123,8 @@ DS9/archive/nvdsinfer_yolo26_pose/*
 !DS9/csrc/**
 !DS9/docs/
 !DS9/docs/**
+!DS9/docker/
+!DS9/docker/**
 !DS9/native/
 !DS9/native/**
 !DS9/noesis/
@@ -133,9 +146,25 @@ DS9/build/*
 !DS9/models/
 DS9/models/*
 !DS9/models/coco_labels.txt
+!DS9/models/deimv2_wholebody49/
+!DS9/models/deimv2_wholebody49/classes.txt
+!DS9/models/onnx/
+DS9/models/onnx/*
+!DS9/models/onnx/*.provenance.json
+!DS9/models/tracker_reid/
+DS9/models/tracker_reid/*
+!DS9/models/tracker_reid/*.provenance.json
 DS9/artifacts/
 DS9/data/
 DS9/gst-plugins/
+!DS9/gst-plugins/
+DS9/gst-plugins/*
+!DS9/gst-plugins/build_noesisforceidr.sh
+!DS9/gst-plugins/noesisforceidr/
+!DS9/gst-plugins/noesisforceidr/**
+!DS9/gst-plugins/build_noesiseos.sh
+!DS9/gst-plugins/noesiseos/
+!DS9/gst-plugins/noesiseos/**
 DS9/logs/
 DS9/native_extensions/
 DS9/plugins/
@@ -156,6 +185,8 @@ testpipelines/**/viewer/dist/
 # Track Noesis/Menon validation planning docs and focused tests.
 !plans/noesis_menon_validation/*.md
 !plans/household_identity/*.md
+!plans/spatial_os/*.md
+!plans/menon_world_unification/*.md
 !tests/
 tests/*
 !tests/test_validation_toolbox.py
@@ -173,3 +204,11 @@ tests/*
 !tests/test_stable_id_resident_visitor.py
 !tests/test_world_before_stable_id_ordering.py
 !tests/test_v3dt_world_ground_state.py
+
+# The test suite is product source, not a local artifact. Keep Python/shell
+# tests discoverable while continuing to ignore bytecode caches.
+!tests/**/
+!tests/**/*.py
+!tests/**/*.sh
+tests/**/__pycache__/
+tests/**/*.pyc

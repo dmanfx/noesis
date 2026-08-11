@@ -6,6 +6,7 @@ requests
 flask
 flask-cors
 fastapi>=0.110
+pydantic>=2.10,<3
 uvicorn[standard]>=0.30
 numpy==1.26.4
 opencv-python-headless==4.10.0.84

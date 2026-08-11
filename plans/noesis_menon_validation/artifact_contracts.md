@@ -468,6 +468,47 @@ When a required check cannot run, the report must say why. Examples:
 
 A blocked check is not a pass. It is evidence that acceptance is incomplete.
 
+## Guided waypoint calibration evidence
+
+`scripts/noesis_alignment_walk.py waypoint-calibration` writes owner-private
+`noesis.alignment.waypoint_evidence` v1 rows. A complete row binds one marked
+waypoint to one deterministic nearest-marker sample and preserves:
+
+- the fit or untouched-holdout role and known Menon scene XYZ;
+- exact camera, run-local tracklet, frame, media PTS, image foot, and image size;
+- the captured calibration bundle, K, world-to-camera E, and active similarity
+  digest;
+- camera center and the observed unit ray in camera and backend-world frames;
+- raw, registered, and used depth plus the raw-depth-to-physical-optical-depth
+  fit pair;
+- raw floor/depth candidates, prefilter measurement, filter prediction, and
+  final world position with active and advisory-candidate metric errors.
+
+`noesis.alignment.waypoint_metrics` v1 reports binding and per-stage coverage
+plus error distributions separately for fit and holdout. The candidate
+similarity is fit only from complete non-collinear fit rows and is advisory;
+the report writer never mutates active calibration.
+
+`noesis.alignment.waypoint_camera_calibration_candidates` v1 groups evidence by
+camera. It uses only complete FIT waypoint rows to solve a proper
+camera-to-backend-world rotation while holding the captured optical center
+fixed, then emits the equivalent candidate world-to-camera E. Parallel or
+otherwise degenerate directions block the solve. An unconstrained reflective
+solution is corrected to a determinant-+1 diagnostic matrix but is explicitly
+rejected for admission so mirrored evidence cannot be hidden by the correction.
+With an admissible rotation, at least 32 coherent post-marker FIT samples feed
+the repository's verified monotonic piecewise fitter from raw DAv2 range to
+physical candidate-camera optical Z; values outside the learned raw domain are
+not extrapolated. HOLDOUT waypoints and samples enter neither solver.
+
+Per-camera FIT/HOLDOUT output reports coverage plus median, p95, and maximum
+angular-ray, image-reprojection, registered/mapped optical-depth, reconstructed
+floor/depth position, and producer-stage position errors. Source capture,
+calibration bundle, active and candidate similarity, K/E, rotation candidate,
+and exact fit-input digests bind the advisory outputs. A derived artifact index
+hashes every report output and binds them to the original capture artifact
+index.
+
 ## Depth anchor evidence
 
 Generated-scene and monocular-depth fixtures can declare depth evidence under

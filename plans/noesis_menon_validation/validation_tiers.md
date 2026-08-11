@@ -89,9 +89,13 @@ Typical commands:
 python3 scripts/noesis_validation_menon_trace_report.py \
   --trace plans/noesis_menon_validation/minimal_menon_trace.json \
   --run-id minimal_menon_trace
+umask 077
+MENON_VALIDATION_RUN_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/noesis/menon-tier4/$(date -u +%Y%m%dT%H%M%SZ)"
+mkdir -p "$MENON_VALIDATION_RUN_DIR"
 python3 scripts/noesis_validation_capture_menon_trace.py \
-  --url http://127.0.0.1:5173 \
-  --output diagnostics/validation/menon_browser_trace/trace.json \
+  --url http://127.0.0.1:5175 \
+  --storage-state "$MENON_PLAYWRIGHT_STORAGE_STATE" \
+  --output "$MENON_VALIDATION_RUN_DIR/trace.json" \
   --screenshot \
   --validate
 MENON_ROOT=../Menon python3 scripts/noesis_validation_menon_trace_report.py \
@@ -99,6 +103,12 @@ MENON_ROOT=../Menon python3 scripts/noesis_validation_menon_trace_report.py \
   --require-menon-root \
   --run-id minimal_menon_trace_with_checkout
 ```
+
+Tier 4 live evidence is accepted only after a fresh same-origin auth-session
+proof and exact coherence across the real canonical world state entities,
+presentation/debug snapshot, current render paths, active promoted scene
+cohort, and one authored world-to-scene transform. The evidence directory is
+`0700` and every capture/report artifact is `0600`.
 
 ## Adoption Gate
 

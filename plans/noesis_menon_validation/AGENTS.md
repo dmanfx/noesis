@@ -96,17 +96,25 @@ declares, or when camera-view reprojection evidence is exposed by Menon debug
 state:
 
 ```bash
+umask 077
+MENON_VALIDATION_RUN_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/noesis/menon-tier4/$(date -u +%Y%m%dT%H%M%SZ)"
+mkdir -p "$MENON_VALIDATION_RUN_DIR"
 python3 scripts/noesis_validation_capture_menon_trace.py \
-  --url http://127.0.0.1:5173 \
-  --output diagnostics/validation/menon_browser_trace/trace.json \
+  --url http://127.0.0.1:5175 \
+  --storage-state "$MENON_PLAYWRIGHT_STORAGE_STATE" \
+  --output "$MENON_VALIDATION_RUN_DIR/trace.json" \
   --screenshot \
   --validate
 ```
 
-If Playwright, the page, the browser debug globals, the declared
-`backend_world_m` source point, the Menon scene transform, or required
-camera-reprojection source/render layers are unavailable, the capture/report
-must fail or block rather than substituting fixture evidence.
+The output leaf must be an owner-owned `0700` directory. Trace, raw snapshot,
+screenshot, and generated report files remain `0600`; the tool refuses unsafe
+existing paths. Capture performs a fresh same-origin `/api/auth/session` proof
+after navigation and binds the requested origin, final page URL, canonical
+world state/entities, presentation/debug cursor, current paths, active scene
+cohort, and one authored transform. If any of that evidence or required camera
+reprojection source/render layers is unavailable or incoherent, the
+capture/report must fail or block rather than substituting fixture evidence.
 
 For Menon-facing acceptance work, pass `--require-menon-root` with either
 `--menon-root` or `MENON_ROOT` so missing Menon evidence is reported as blocked.

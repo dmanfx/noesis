@@ -52,12 +52,29 @@ python3 scripts/noesis_validation_menon_trace_report.py \
 Use browser capture when Menon is running and exposes debug evidence:
 
 ```bash
+umask 077
+MENON_VALIDATION_RUN_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/noesis/menon-tier4/$(date -u +%Y%m%dT%H%M%SZ)"
+mkdir -p "$MENON_VALIDATION_RUN_DIR"
 python3 scripts/noesis_validation_capture_menon_trace.py \
-  --url http://127.0.0.1:5173 \
-  --output diagnostics/validation/menon_browser_trace/trace.json \
+  --url http://127.0.0.1:5175 \
+  --storage-state "$MENON_PLAYWRIGHT_STORAGE_STATE" \
+  --output "$MENON_VALIDATION_RUN_DIR/trace.json" \
   --screenshot \
   --validate
 ```
+
+`MENON_PLAYWRIGHT_STORAGE_STATE` must name a regular, owner-owned, unlinked
+Playwright storage-state JSON file with mode `0600`, captured after signing in
+to Menon. The capture rejects an unauthenticated page instead of falling back
+to a direct Noesis socket or login-shell evidence.
+
+The run directory must be a new owner-owned mode `0700` leaf. Raw browser
+state, trace, screenshot, and reports remain `0600`. The live gate rechecks the
+same-origin auth session and final URL, then requires the actual current
+canonical world entities, presentation/debug cursor and paths, active promoted
+scene cohort, and exact one-transform render metadata to agree. Self-labeled,
+stale, mismatched, legacy, replay/test-runtime, or cross-origin evidence is not
+admitted.
 
 For Menon-required acceptance, run the saved-trace validator with
 `--require-menon-root` and pass `--menon-root` or set `MENON_ROOT`. If the

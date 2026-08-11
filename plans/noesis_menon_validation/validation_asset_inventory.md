@@ -1,6 +1,6 @@
 # Validation Asset Inventory
 
-Status: current as of 2026-05-27.
+Status: current as of 2026-07-11.
 
 This inventory maps existing validation assets into the layered Noesis/Menon
 toolbox so future agents can reuse what is already present instead of inventing
@@ -14,7 +14,7 @@ parallel checks.
 | `scripts/noesis_validation_runner.py` | Tier 2 | Fixture/offline report generation for transforms, anchors, camera checks, tracking, BEV, scene, Menon placement, and visual overlays. |
 | `scripts/noesis_validation_telemetry_report.py` | Tier 3 | Saved/live DS8 WebSocket telemetry validation and track-audit generation. |
 | `scripts/noesis_validation_menon_trace_report.py` | Tier 4 | Saved Menon placement-trace validation for Noesis-world to Menon-scene agreement. |
-| `scripts/noesis_validation_capture_menon_trace.py` | Tier 4 | Playwright-based Menon browser debug capture converted into the shared Menon trace contract. |
+| `scripts/noesis_validation_capture_menon_trace.py` | Tier 4 | Private Playwright capture with fresh auth/origin proof and exact canonical state, presentation, path, and scene-cohort admission into the shared Menon trace contract. |
 | `scripts/noesis_validation_regression_runner.py` | Tier 2-4 | Registry-driven regression suite with expected-threshold checks. |
 | `tests/test_validation_toolbox.py` | Tier 1-2 | Focused tests for common reports, validators, fixtures, telemetry, Menon traces, browser snapshot conversion, and regression runner behavior. |
 

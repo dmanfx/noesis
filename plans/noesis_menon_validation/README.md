@@ -124,6 +124,10 @@ The initial GPU-free toolkit slice now includes:
 - a saved/live DS8 telemetry runner: `scripts/noesis_validation_telemetry_report.py`;
 - a saved Menon placement-trace runner:
   `scripts/noesis_validation_menon_trace_report.py`;
+- a unified offline track-geometry acceptance runner:
+  `scripts/noesis_validation_track_geometry_acceptance.py`, which keeps
+  producer coverage, authored/production physical placement, and Menon
+  production-renderer geometry as separate fail-closed gates;
 - a registry regression runner:
   `scripts/noesis_validation_regression_runner.py`;
   - regression entries can check expected status/counts, artifact size/hash, and
@@ -153,13 +157,36 @@ python3 scripts/noesis_validation_telemetry_report.py \
 python3 scripts/noesis_validation_menon_trace_report.py \
   --trace plans/noesis_menon_validation/minimal_menon_trace.json \
   --run-id minimal_menon_trace
+umask 077
+MENON_VALIDATION_RUN_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/noesis/menon-tier4/$(date -u +%Y%m%dT%H%M%SZ)"
+mkdir -p "$MENON_VALIDATION_RUN_DIR"
 python3 scripts/noesis_validation_capture_menon_trace.py \
-  --url http://127.0.0.1:5173 \
-  --output diagnostics/validation/menon_browser_trace/trace.json \
+  --url http://127.0.0.1:5175 \
+  --storage-state "$MENON_PLAYWRIGHT_STORAGE_STATE" \
+  --output "$MENON_VALIDATION_RUN_DIR/trace.json" \
   --screenshot \
   --validate
+python3 scripts/noesis_validation_track_geometry_acceptance.py \
+  --journal "$NOESIS_WORLD_JOURNAL" \
+  --obj "$MENON_AUTHORED_SCENE_OBJ" \
+  --similarity "$NOESIS_WORLD_TO_SCENE_JSON" \
+  --room-group-map config/authored_scene_room_groups.json \
+  --menon-trace "$MENON_VALIDATION_RUN_DIR/trace.json" \
+  --run-id "track_geometry_$(date -u +%Y%m%dT%H%M%SZ)"
 python3 scripts/noesis_validation_regression_runner.py \
   --fixture-registry plans/noesis_menon_validation/fixture_registry.json \
   --run-id minimal_regression
 python3 -m pytest tests/test_validation_toolbox.py -q
 ```
+
+Live browser evidence is private household state. Its parent directory must be
+owner-owned mode `0700`; the capture writes mode `0600` artifacts and refuses
+unsafe existing paths. A page-global login flag is insufficient: the capture
+rechecks `/api/auth/session`, binds the final same-origin URL, and admits only
+current DS8/DS9 canonical entities whose state, presentation, debug cursor,
+render paths, scene cohort, lifecycle, identity, timestamps, and positions are
+mutually coherent.
+
+Saved Menon trace reports and registry regression suites enforce the same
+boundary: all run directories are `0700`, all artifacts are `0600`, and an
+unsafe pre-existing tree fails closed.

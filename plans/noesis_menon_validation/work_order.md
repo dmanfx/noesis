@@ -114,6 +114,7 @@ schema.
   - A dewarped stream must explicitly say whether calibration applies to raw
     stream, dewarped stream, and inference resolution.
   - _2026-05-27 (Codex): Minimal fixture declares `stream_kind=dewarped`, `applies_to_raw=false`, `applies_to_dewarped=true`, and `expected_resolution`; focused tests now assert ambiguous raw/dewarped ownership fails._
+  - _2026-07-19 (Codex): Promoted tracking geometry now requires the explicit calibrated dewarped frame size end-to-end. DS8, DS9, protected V3DT, and Menon diagnostic rays reject principal-point-derived dimensions; focused parity and frontend source-contract tests pass._
 
 ## Phase 3 - Tracking, temporal, and BEV validators
 
@@ -140,6 +141,11 @@ schema.
 - [x] Add saved/live telemetry ingestion for tracking and BEV report generation.
   - _2026-05-27 (Codex): Added `noesis/validation/telemetry.py` and `scripts/noesis_validation_telemetry_report.py` to parse NDJSON or live WebSocket messages, validate tracking/BEV contracts, run motion and BEV/track agreement checks, and write `tracking/track_audit.json`; validated with `plans/noesis_menon_validation/minimal_telemetry.ndjson`._
   - _2026-05-27 (Codex): Extended telemetry parsing and `tracking/track_audit.json` with optional ReID/appearance identity fields used by the identity continuity checks._
+  - _2026-07-19 (Codex): Added an owner-private guided alignment-walk capture/report path with calibration-cohort binding, explicit waypoint markers, raw floor/depth/fused/filter evidence, physical-rejection and trail-segment diagnostics, and fail-closed empty/pre-calibration handling. The July 18 three-camera walk became the evidence source for the strict per-camera fusion policy; focused recorder tests passed._
+  - _2026-07-19 (Codex): Final DS9 v18 acceptance ran for 600 seconds through the oai2-fe/Menon proxy and recorded 11,184 advancing tracking frames, 11,184 world snapshots, 10,745 valid backend-world observations, and zero parse errors. The report preserves remaining family-room spatial outliers for the next comprehensive walk rather than hiding them with display smoothing or clamps._
+  - _2026-07-19 (Codex): Preserved two bounded canonical-journal tails from live reverse-order room walks. The first (`alignment-walk-20260719T1733Z-recovered`, SHA-256 `ca159511400019400037045aedd04951ed342866bf2b6693b56f46f4b7a7cf07`) separated plausible floor-ray ranges from the near-horizon failure cluster; the second (`alignment-walk-20260719T1745Z-recovered`, SHA-256 `fcaf84d6529db8d2f14fb9fdeb22e2796756e2a074a69c1deb257645ab35a133`) independently reproduced the family-room failure at roughly 26–27 m. Added producer diagnostics and policy-v2 range admission so future guided captures record range, incidence, limit, admission, and exact rejection reason without Menon-side clamping._
+  - _2026-07-19 (Codex): DS9 v19 live acceptance (`floor-ray-admission-v19/live-acceptance.json`, SHA-256 `b1c033d59bb9d9f860c8f5b28d5bc9378c8c0d6ca940fc8fa468f331c4a7ece4`) ran for 600 seconds through the oai2/Menon proxy with 10,870 advancing tracking frames, 19,694 policy-bound observations, and zero parse errors. All 1,723 over-range floor rays failed closed, and the sealed journal-tail model audit found zero off-floor placements among 3,055 accepted source samples. Browser and RTSP probes confirmed the visible live dashboard and progressing H.264 mosaic._
+  - _2026-07-19 (Codex): Extended guided walks with exact nearest-marker camera/tracklet/frame/media/image binding, measured Menon XYZ, fit-versus-untouched-holdout roles, full calibration/depth/world-stage provenance, advisory similarity fitting, and per-stage metric error/coverage reports. Added per-camera FIT-only fixed-center proper-rotation candidates and verified monotonic raw-DAv2-to-physical-optical-Z candidates, with reflection/degeneracy rejection, exact source digests, and independent FIT/HOLDOUT angular, reprojection, depth, and position metrics. Candidate output remains advisory; 14 focused recorder/tooling tests passed._
 - [x] Add BEV validators.
   - Check track-inside-room, no wall crossing, doorway transitions, speed,
     acceleration, stationary jitter, path smoothness, camera coverage,
@@ -168,6 +174,7 @@ schema.
   - _2026-05-27 (Codex): Added first reusable Menon placement and round-trip validators plus fixture schema support._
   - _2026-05-27 (Codex): Added `noesis/validation/menon_trace.py` and `scripts/noesis_validation_menon_trace_report.py` to validate saved Menon traces with explicit `backend_world_m` to `menon_scene` transform audit stages._
   - _2026-05-27 (Codex): Added `noesis/validation/menon_browser.py` and `scripts/noesis_validation_capture_menon_trace.py` to capture Menon browser debug globals and convert declared `backend_world_m` plus Menon scene placement evidence into the same transform-audit trace schema._
+  - _2026-07-19 (Codex): Menon now exports a bounded production-geometry envelope from the actual canonical marker/trail objects. The independent validator recomputes exact world-to-scene and rendered endpoint errors, stage visibility, authored-floor/room status, camera anchors, and lifecycle state without trusting browser-declared pass labels._
 - [x] Add world/BEV/Menon agreement checks.
   - Verify world-to-BEV-to-world and world-to-Menon-to-world round trips and path
     shape agreement between BEV trails and Menon trails.
@@ -198,6 +205,11 @@ schema.
   - _2026-05-27 (Codex): Added fixture-mode Menon placement/timestamp checks through the common runner._
   - _2026-05-27 (Codex): Added saved Menon trace mode with `--menon-root`, `MENON_ROOT`, and `--require-menon-root`._
   - _2026-05-27 (Codex): Added Playwright browser snapshot capture with `--validate`; browser snapshots now promote exposed camera-view reprojection debug evidence into `camera_reprojections` so live and fixture modes share `MENON.camera_reprojection`._
+  - _2026-07-11 (Codex): Hardened live capture to the authenticated Menon gateway on port 5175 with an owner-only Playwright storage state, rejected unauthenticated and legacy frontend/per-camera placement evidence, and promoted only canonical `entityId` + `backendWorldPosition` records that crossed the authored world-to-scene transform exactly once. Replaced the browser fixture with canonical-world evidence and validated with `python3 -m pytest tests/test_validation_toolbox.py -q` (38 passed)._
+  - _2026-07-11 (Codex): Closed the remaining Tier-4 evidence-admission gap: capture now proves a fresh same-origin `/api/auth/session`, binds the final URL, and requires the real canonical state entities, DS8/DS9 producer/run/sequence, presentation/debug cursor, current paths, identity/lifecycle/timestamps/positions, active scene cohort, and one authored transform to agree. Rebuilt the fixture from those real public shapes, made evidence output `0700`/`0600`, and added spoof, stale, wrong-transform, wrong-identity, auth, origin, symlink, and hardlink adversarial coverage. Validated with `pytest -q tests/test_validation_toolbox.py` (52 passed) and focused Ruff/compile checks._
+  - _2026-07-11 (Codex): Extended the private evidence boundary through saved Menon trace reports and the registry regression runner. Their complete run trees now require `0700` directories and `0600` files, preserve the caller's umask after writing, and reject unsafe pre-existing output instead of repairing it._
+- [x] Add one offline authored-scene plus production-renderer acceptance gate.
+  - _2026-07-19 (Codex): Added `noesis_validation_track_geometry_acceptance.py`, which binds the reviewed room map to the exact OBJ SHA-256, joins the persisted-journal oracle with a captured Menon `production_geometry` trace, verifies shared world-to-scene authority, and reports producer coverage, physical placement, and production renderer status separately. Focused tests cover pass, transform mismatch, missing renderer evidence, private artifacts, and fail-closed room-map mismatch._
 
 ## Phase 5 - Scene, mesh, depth, and semantic validators
 
@@ -296,9 +308,13 @@ python3 scripts/noesis_validation_telemetry_report.py \
 python3 scripts/noesis_validation_menon_trace_report.py \
   --trace plans/noesis_menon_validation/minimal_menon_trace.json \
   --run-id minimal_menon_trace
+umask 077
+MENON_VALIDATION_RUN_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/noesis/menon-tier4/$(date -u +%Y%m%dT%H%M%SZ)"
+mkdir -p "$MENON_VALIDATION_RUN_DIR"
 python3 scripts/noesis_validation_capture_menon_trace.py \
-  --url http://127.0.0.1:5173 \
-  --output diagnostics/validation/menon_browser_trace/trace.json \
+  --url http://127.0.0.1:5175 \
+  --storage-state "$MENON_PLAYWRIGHT_STORAGE_STATE" \
+  --output "$MENON_VALIDATION_RUN_DIR/trace.json" \
   --screenshot \
   --validate
 python3 scripts/noesis_validation_regression_runner.py \

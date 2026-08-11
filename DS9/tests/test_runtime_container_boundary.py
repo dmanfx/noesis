@@ -787,6 +787,21 @@ def test_analytics_state_seeds_private_files_with_production_render_bytes(
         ) == before
 
 
+def test_checkout_analytics_yaml_matches_checked_in_exclusion_ini() -> None:
+    """Keep runtime reloads from moving exclusion ROIs into another image space."""
+    from DS9.noesis.server import analytics_api
+
+    config_path = runtime.REPO_ROOT / runtime.ANALYTICS_SEED_RELATIVE
+    exclude_path = runtime.REPO_ROOT / "config/config_nvdsanalytics_exclude.ini"
+    config = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    analytics_api._normalize_stream_keys(config)
+    rendered = analytics_api._render_exclude_ini(
+        config["analytics"]["stages"]["exclude"]
+    )
+
+    assert rendered.strip() == exclude_path.read_text(encoding="utf-8").strip()
+
+
 def test_analytics_seed_second_write_failure_leaves_no_partial_pair(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

@@ -77,12 +77,12 @@ bool parse_boxes_dims(const NvDsInferLayerInfo& boxes, ParsedLayerDims& out) {
   if (nd == 2) {
     if (boxes.inferDims.d[1] != 4) return false;
     out.q = static_cast<std::size_t>(boxes.inferDims.d[0]);
-    return true;
+    return out.q == 300;
   }
   if (nd == 3) {
-    if (boxes.inferDims.d[2] != 4) return false;
+    if (boxes.inferDims.d[0] != 1 || boxes.inferDims.d[2] != 4) return false;
     out.q = static_cast<std::size_t>(boxes.inferDims.d[1]);
-    return true;
+    return out.q == 300;
   }
   return false;
 }
@@ -92,12 +92,13 @@ bool parse_logits_dims(const NvDsInferLayerInfo& logits, ParsedLayerDims& out) {
   if (nd == 2) {
     out.q = static_cast<std::size_t>(logits.inferDims.d[0]);
     out.c = static_cast<std::size_t>(logits.inferDims.d[1]);
-    return out.c > 0;
+    return out.c == 91;
   }
   if (nd == 3) {
+    if (logits.inferDims.d[0] != 1) return false;
     out.q = static_cast<std::size_t>(logits.inferDims.d[1]);
     out.c = static_cast<std::size_t>(logits.inferDims.d[2]);
-    return out.c > 0;
+    return out.c == 91;
   }
   return false;
 }
@@ -125,34 +126,28 @@ void set_bbox(float x1, float y1, float x2, float y2, unsigned net_w, unsigned n
   obj.height = clamp(y2 - y1, 0.0f, static_cast<float>(net_h));
 }
 
-void decode_box_to_xyxy(const float* box4, unsigned net_w, unsigned net_h,
+bool decode_box_to_xyxy(const float* box4, unsigned net_w, unsigned net_h,
                         float& x1, float& y1, float& x2, float& y2) {
-  const float a = box4[0];
-  const float b = box4[1];
-  const float c = box4[2];
-  const float d = box4[3];
-
-  if (c > a && d > b) {
-    const bool looks_normalized =
-        (a >= -0.5f && b >= -0.5f && c <= 1.5f && d <= 1.5f);
-    if (looks_normalized) {
-      x1 = a * static_cast<float>(net_w);
-      y1 = b * static_cast<float>(net_h);
-      x2 = c * static_cast<float>(net_w);
-      y2 = d * static_cast<float>(net_h);
-    } else {
-      x1 = a;
-      y1 = b;
-      x2 = c;
-      y2 = d;
-    }
-    return;
+  if (!box4 || net_w == 0 || net_h == 0) return false;
+  const float cx = box4[0];
+  const float cy = box4[1];
+  const float width = box4[2];
+  const float height = box4[3];
+  if (!std::isfinite(cx) || !std::isfinite(cy) ||
+      !std::isfinite(width) || !std::isfinite(height) ||
+      width <= 0.0f || height <= 0.0f) {
+    return false;
   }
 
-  x1 = (a - c * 0.5f) * static_cast<float>(net_w);
-  y1 = (b - d * 0.5f) * static_cast<float>(net_h);
-  x2 = (a + c * 0.5f) * static_cast<float>(net_w);
-  y2 = (b + d * 0.5f) * static_cast<float>(net_h);
+  // RF-DETR 1.8.3 exports raw pred_boxes in normalized cx,cy,w,h format.
+  // Do not guess xyxy from coordinate ordering: valid cxcywh rows frequently
+  // satisfy width > cx and height > cy.
+  x1 = (cx - width * 0.5f) * static_cast<float>(net_w);
+  y1 = (cy - height * 0.5f) * static_cast<float>(net_h);
+  x2 = (cx + width * 0.5f) * static_cast<float>(net_w);
+  y2 = (cy + height * 0.5f) * static_cast<float>(net_h);
+  return std::isfinite(x1) && std::isfinite(y1) &&
+         std::isfinite(x2) && std::isfinite(y2);
 }
 
 }  // namespace
@@ -162,9 +157,13 @@ extern "C" bool NvDsInferParseRFDETR(
     NvDsInferNetworkInfo const& networkInfo,
     NvDsInferParseDetectionParams const& detectionParams,
     std::vector<NvDsInferObjectDetectionInfo>& objectList) {
-  if (outputLayersInfo.size() < 2) {
-    std::cerr << "[rfdetr] expected >=2 output layers (dets, labels), got "
+  if (outputLayersInfo.size() != 2) {
+    std::cerr << "[rfdetr] expected exactly 2 output layers (dets, labels), got "
               << outputLayersInfo.size() << std::endl;
+    return false;
+  }
+  if (networkInfo.width == 0 || networkInfo.height == 0) {
+    std::cerr << "[rfdetr] network dimensions must be positive" << std::endl;
     return false;
   }
 
@@ -189,7 +188,7 @@ extern "C" bool NvDsInferParseRFDETR(
     return false;
   }
   if (!parse_logits_dims(*logits_layer, logits_dims) || logits_dims.q == 0 || logits_dims.c == 0) {
-    std::cerr << "[rfdetr] unexpected logits dims (expected [Q,C] or [B,Q,C])" << std::endl;
+    std::cerr << "[rfdetr] unexpected logits dims (expected [300,91] or [1,300,91])" << std::endl;
     return false;
   }
   if (boxes_dims.q != logits_dims.q) {
@@ -200,11 +199,11 @@ extern "C" bool NvDsInferParseRFDETR(
 
   const std::size_t q = logits_dims.q;
   const std::size_t c = logits_dims.c;
-  const int person_class_idx = getenv_int("NOESIS_RFDETR_PERSON_CLASS_IDX", 1);
+  constexpr std::size_t kPersonClassIndex = 1;
   const int debug_every = getenv_int("NOESIS_RFDETR_DEBUG_EVERY", 0);
-  if (person_class_idx < 0 || static_cast<std::size_t>(person_class_idx) >= c) {
-    std::cerr << "[rfdetr] invalid NOESIS_RFDETR_PERSON_CLASS_IDX=" << person_class_idx
-              << " (C=" << c << ")" << std::endl;
+  if (kPersonClassIndex >= c) {
+    std::cerr << "[rfdetr] COCO person class index " << kPersonClassIndex
+              << " is unavailable (C=" << c << ")" << std::endl;
     return false;
   }
 
@@ -241,7 +240,7 @@ extern "C" bool NvDsInferParseRFDETR(
     const cudaError_t person_err = cudaMemcpy2D(
         person_logits_host.data(),
         sizeof(float),
-        logits_dev + static_cast<std::size_t>(person_class_idx),
+        logits_dev + kPersonClassIndex,
         logit_stride * sizeof(float),
         sizeof(float),
         q,
@@ -294,7 +293,11 @@ extern "C" bool NvDsInferParseRFDETR(
 
     const float person_logit = device_buf
         ? person_logits_host[i]
-        : logits_dev[i * logit_stride + static_cast<std::size_t>(person_class_idx)];
+        : logits_dev[i * logit_stride + kPersonClassIndex];
+    if (!std::isfinite(person_logit)) {
+      std::cerr << "[rfdetr] non-finite person logit at query " << i << std::endl;
+      return false;
+    }
     const float score = sigmoid(person_logit);
     if (score > max_person_score) max_person_score = score;
     if (score < threshold) continue;
@@ -305,7 +308,11 @@ extern "C" bool NvDsInferParseRFDETR(
     float x2 = 0.0f;
     float y2 = 0.0f;
     const float* box_ptr = device_buf ? (boxes_host.data() + i * box_stride) : (boxes_dev + i * box_stride);
-    decode_box_to_xyxy(box_ptr, networkInfo.width, networkInfo.height, x1, y1, x2, y2);
+    if (!decode_box_to_xyxy(
+            box_ptr, networkInfo.width, networkInfo.height, x1, y1, x2, y2)) {
+      std::cerr << "[rfdetr] invalid normalized cxcywh box at query " << i << std::endl;
+      return false;
+    }
 
     NvDsInferObjectDetectionInfo obj{};
     set_bbox(x1, y1, x2, y2, networkInfo.width, networkInfo.height, obj);
@@ -314,6 +321,7 @@ extern "C" bool NvDsInferParseRFDETR(
 
     obj.classId = 0;
     obj.detectionConfidence = score;
+    obj.rotation_angle = 0.0f;
     objectList.emplace_back(obj);
     ++kept;
   }
@@ -323,7 +331,7 @@ extern "C" bool NvDsInferParseRFDETR(
     const unsigned long long den = static_cast<unsigned long long>(debug_every);
     if (den > 0 && (n % den) == 0ULL) {
       std::cerr << "[rfdetr] frame=" << n << " q=" << q << " kept=" << kept
-                << " person_idx=" << person_class_idx << " threshold=" << threshold
+                << " person_idx=" << kPersonClassIndex << " threshold=" << threshold
                 << " device_buf=" << (device_buf ? 1 : 0)
                 << " score_pass=" << score_pass << " bbox_pass=" << bbox_pass
                 << " max_person_score=" << max_person_score

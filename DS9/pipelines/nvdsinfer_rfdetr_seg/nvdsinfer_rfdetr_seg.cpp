@@ -5,6 +5,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
+#include <limits>
 #include <string>
 #include <vector>
 
@@ -81,13 +82,13 @@ bool parse_boxes_dims(const NvDsInferLayerInfo& boxes, ParsedLayerDims& out) {
     // [Q, 4]
     if (boxes.inferDims.d[1] != 4) return false;
     out.q = static_cast<std::size_t>(boxes.inferDims.d[0]);
-    return true;
+    return out.q == 100 || out.q == 200 || out.q == 300;
   }
   if (nd == 3) {
-    // [B, Q, 4] (B should be 1 for per-batch parsing)
-    if (boxes.inferDims.d[2] != 4) return false;
+    // [1, Q, 4] for a per-frame parser invocation.
+    if (boxes.inferDims.d[0] != 1 || boxes.inferDims.d[2] != 4) return false;
     out.q = static_cast<std::size_t>(boxes.inferDims.d[1]);
-    return true;
+    return out.q == 100 || out.q == 200 || out.q == 300;
   }
   return false;
 }
@@ -98,13 +99,14 @@ bool parse_logits_dims(const NvDsInferLayerInfo& logits, ParsedLayerDims& out) {
     // [Q, C]
     out.q = static_cast<std::size_t>(logits.inferDims.d[0]);
     out.c = static_cast<std::size_t>(logits.inferDims.d[1]);
-    return out.c > 0;
+    return out.c == 91;
   }
   if (nd == 3) {
-    // [B, Q, C] (B should be 1)
+    // [1, Q, C] for a per-frame parser invocation.
+    if (logits.inferDims.d[0] != 1) return false;
     out.q = static_cast<std::size_t>(logits.inferDims.d[1]);
     out.c = static_cast<std::size_t>(logits.inferDims.d[2]);
-    return out.c > 0;
+    return out.c == 91;
   }
   return false;
 }
@@ -119,7 +121,8 @@ bool parse_masks_dims(const NvDsInferLayerInfo& masks, ParsedLayerDims& out) {
     return out.h > 0 && out.w > 0;
   }
   if (nd == 4) {
-    // [B, Q, Hm, Wm] (B should be 1)
+    // [1, Q, Hm, Wm] for a per-frame parser invocation.
+    if (masks.inferDims.d[0] != 1) return false;
     out.q = static_cast<std::size_t>(masks.inferDims.d[1]);
     out.h = static_cast<std::size_t>(masks.inferDims.d[2]);
     out.w = static_cast<std::size_t>(masks.inferDims.d[3]);
@@ -151,61 +154,75 @@ void set_bbox(float x1, float y1, float x2, float y2, unsigned net_w, unsigned n
   obj.height = clamp(y2 - y1, 0.0f, static_cast<float>(net_h));
 }
 
-void decode_box_to_xyxy(const float* box4, unsigned net_w, unsigned net_h,
+bool decode_box_to_xyxy(const float* box4, unsigned net_w, unsigned net_h,
                         float& x1, float& y1, float& x2, float& y2) {
-  const float a = box4[0];
-  const float b = box4[1];
-  const float c = box4[2];
-  const float d = box4[3];
-
-  // Preferred path for current export graph:
-  // dets are x1,y1,x2,y2 either normalized [0..1] or absolute pixels.
-  if (c > a && d > b) {
-    const bool looks_normalized =
-        (a >= -0.5f && b >= -0.5f && c <= 1.5f && d <= 1.5f);
-    if (looks_normalized) {
-      x1 = a * static_cast<float>(net_w);
-      y1 = b * static_cast<float>(net_h);
-      x2 = c * static_cast<float>(net_w);
-      y2 = d * static_cast<float>(net_h);
-    } else {
-      x1 = a;
-      y1 = b;
-      x2 = c;
-      y2 = d;
-    }
-    return;
+  if (!box4 || net_w == 0 || net_h == 0) return false;
+  const float cx = box4[0];
+  const float cy = box4[1];
+  const float width = box4[2];
+  const float height = box4[3];
+  if (!std::isfinite(cx) || !std::isfinite(cy) ||
+      !std::isfinite(width) || !std::isfinite(height) ||
+      width <= 0.0f || height <= 0.0f) {
+    return false;
   }
-
-  // Backward-compatible fallback: cx,cy,w,h normalized.
-  const float cx = a;
-  const float cy = b;
-  const float bw = c;
-  const float bh = d;
-  x1 = (cx - bw * 0.5f) * static_cast<float>(net_w);
-  y1 = (cy - bh * 0.5f) * static_cast<float>(net_h);
-  x2 = (cx + bw * 0.5f) * static_cast<float>(net_w);
-  y2 = (cy + bh * 0.5f) * static_cast<float>(net_h);
+  x1 = (cx - width * 0.5f) * static_cast<float>(net_w);
+  y1 = (cy - height * 0.5f) * static_cast<float>(net_h);
+  x2 = (cx + width * 0.5f) * static_cast<float>(net_w);
+  y2 = (cy + height * 0.5f) * static_cast<float>(net_h);
+  return std::isfinite(x1) && std::isfinite(y1) &&
+         std::isfinite(x2) && std::isfinite(y2);
 }
 
-bool copy_mask_roi(const float* mask_src, std::size_t mask_h, std::size_t mask_w,
-                   float x1, float y1, float x2, float y2, unsigned net_w, unsigned net_h,
-                   NvDsInferInstanceMaskInfo& obj) {
+float bilinear_mask_value(const float* mask_src, std::size_t mask_h,
+                          std::size_t mask_w, float source_x, float source_y) {
+  const float clamped_x = clamp(
+      source_x, 0.0f, static_cast<float>(mask_w - 1));
+  const float clamped_y = clamp(
+      source_y, 0.0f, static_cast<float>(mask_h - 1));
+  const std::size_t x0 = static_cast<std::size_t>(std::floor(clamped_x));
+  const std::size_t y0 = static_cast<std::size_t>(std::floor(clamped_y));
+  const std::size_t x1 = std::min(x0 + 1, mask_w - 1);
+  const std::size_t y1 = std::min(y0 + 1, mask_h - 1);
+  const float wx = clamped_x - static_cast<float>(x0);
+  const float wy = clamped_y - static_cast<float>(y0);
+  const float top =
+      mask_src[y0 * mask_w + x0] * (1.0f - wx) +
+      mask_src[y0 * mask_w + x1] * wx;
+  const float bottom =
+      mask_src[y1 * mask_w + x0] * (1.0f - wx) +
+      mask_src[y1 * mask_w + x1] * wx;
+  return top * (1.0f - wy) + bottom * wy;
+}
+
+bool copy_mask_roi_bilinear(const float* mask_src, std::size_t mask_h,
+                            std::size_t mask_w, unsigned net_w, unsigned net_h,
+                            NvDsInferInstanceMaskInfo& obj) {
   if (!mask_src || mask_h == 0 || mask_w == 0 || net_w == 0 || net_h == 0) return false;
+  if (!std::isfinite(obj.left) || !std::isfinite(obj.top) ||
+      !std::isfinite(obj.width) || !std::isfinite(obj.height) ||
+      obj.width <= 0.0f || obj.height <= 0.0f) {
+    return false;
+  }
 
-  const float fx1 = (x1 / static_cast<float>(net_w)) * static_cast<float>(mask_w);
-  const float fy1 = (y1 / static_cast<float>(net_h)) * static_cast<float>(mask_h);
-  const float fx2 = (x2 / static_cast<float>(net_w)) * static_cast<float>(mask_w);
-  const float fy2 = (y2 / static_cast<float>(net_h)) * static_cast<float>(mask_h);
-
-  const int ix1 = clamp(static_cast<int>(std::floor(fx1)), 0, static_cast<int>(mask_w) - 1);
-  const int iy1 = clamp(static_cast<int>(std::floor(fy1)), 0, static_cast<int>(mask_h) - 1);
-  const int ix2 = clamp(static_cast<int>(std::ceil(fx2)), ix1 + 1, static_cast<int>(mask_w));
-  const int iy2 = clamp(static_cast<int>(std::ceil(fy2)), iy1 + 1, static_cast<int>(mask_h));
-
-  const std::size_t roi_w = static_cast<std::size_t>(ix2 - ix1);
-  const std::size_t roi_h = static_cast<std::size_t>(iy2 - iy1);
+  // NvDsInferInstanceMaskInfo stores a bbox-relative mask. Sample that ROI
+  // from the full RF-DETR mask-logit plane with align_corners=False geometry,
+  // rather than copying an integer low-resolution crop and changing its scale.
+  const std::size_t roi_w = std::max<std::size_t>(
+      1, static_cast<std::size_t>(std::ceil(
+             obj.width * static_cast<float>(mask_w) /
+             static_cast<float>(net_w))));
+  const std::size_t roi_h = std::max<std::size_t>(
+      1, static_cast<std::size_t>(std::ceil(
+             obj.height * static_cast<float>(mask_h) /
+             static_cast<float>(net_h))));
   if (roi_w == 0 || roi_h == 0) return false;
+  if (roi_h > std::numeric_limits<std::size_t>::max() / roi_w ||
+      roi_w * roi_h >
+          static_cast<std::size_t>(std::numeric_limits<unsigned>::max()) /
+              sizeof(float)) {
+    return false;
+  }
 
   obj.mask_width = static_cast<unsigned>(roi_w);
   obj.mask_height = static_cast<unsigned>(roi_h);
@@ -213,11 +230,31 @@ bool copy_mask_roi(const float* mask_src, std::size_t mask_h, std::size_t mask_w
   obj.mask = new float[roi_w * roi_h];
 
   for (std::size_t y = 0; y < roi_h; ++y) {
-    const float* src_row =
-        mask_src + (static_cast<std::size_t>(iy1) + y) * mask_w + static_cast<std::size_t>(ix1);
-    float* dst_row = obj.mask + y * roi_w;
+    const float network_y =
+        obj.top + (static_cast<float>(y) + 0.5f) * obj.height /
+                      static_cast<float>(roi_h);
+    const float source_y =
+        network_y * static_cast<float>(mask_h) / static_cast<float>(net_h) -
+        0.5f;
     for (std::size_t x = 0; x < roi_w; ++x) {
-      dst_row[x] = sigmoid(src_row[x]);
+      const float network_x =
+          obj.left + (static_cast<float>(x) + 0.5f) * obj.width /
+                         static_cast<float>(roi_w);
+      const float source_x =
+          network_x * static_cast<float>(mask_w) /
+              static_cast<float>(net_w) -
+          0.5f;
+      const float logit =
+          bilinear_mask_value(mask_src, mask_h, mask_w, source_x, source_y);
+      if (!std::isfinite(logit)) {
+        delete[] obj.mask;
+        obj.mask = nullptr;
+        obj.mask_width = 0;
+        obj.mask_height = 0;
+        obj.mask_size = 0;
+        return false;
+      }
+      obj.mask[y * roi_w + x] = sigmoid(logit);
     }
   }
 
@@ -231,9 +268,13 @@ extern "C" bool NvDsInferParseRFDETRSeg(
     NvDsInferNetworkInfo const& networkInfo,
     NvDsInferParseDetectionParams const& detectionParams,
     std::vector<NvDsInferInstanceMaskInfo>& objectList) {
-  if (outputLayersInfo.size() < 3) {
-    std::cerr << "[rfdetr-seg] expected >=3 output layers (boxes, logits, masks), got "
+  if (outputLayersInfo.size() != 3) {
+    std::cerr << "[rfdetr-seg] expected exactly 3 output layers (dets, labels, masks), got "
               << outputLayersInfo.size() << std::endl;
+    return false;
+  }
+  if (networkInfo.width == 0 || networkInfo.height == 0) {
+    std::cerr << "[rfdetr-seg] network dimensions must be positive" << std::endl;
     return false;
   }
 
@@ -281,14 +322,20 @@ extern "C" bool NvDsInferParseRFDETRSeg(
               << " masks.q=" << masks_dims.q << std::endl;
     return false;
   }
+  if (masks_dims.h * 4 != networkInfo.height ||
+      masks_dims.w * 4 != networkInfo.width) {
+    std::cerr << "[rfdetr-seg] mask plane must be exactly network resolution / 4"
+              << std::endl;
+    return false;
+  }
 
-  // RF-DETR (coco) uses COCO category IDs as class indices (max_obj_id=90),
-  // so "person" is typically class index 1 (COCO category id 1).
-  const int person_class_idx = getenv_int("NOESIS_RFDETR_PERSON_CLASS_IDX", 1);
+  // RF-DETR 1.8.3 COCO uses category IDs as class indices (max_obj_id=90);
+  // person is fixed at COCO category/index 1.
+  constexpr std::size_t kPersonClassIndex = 1;
   const int debug_every = getenv_int("NOESIS_RFDETR_DEBUG_EVERY", 0);
-  if (person_class_idx < 0 || static_cast<std::size_t>(person_class_idx) >= c) {
-    std::cerr << "[rfdetr-seg] invalid NOESIS_RFDETR_PERSON_CLASS_IDX=" << person_class_idx
-              << " (C=" << c << ")" << std::endl;
+  if (kPersonClassIndex >= c) {
+    std::cerr << "[rfdetr-seg] COCO person class index " << kPersonClassIndex
+              << " is unavailable (C=" << c << ")" << std::endl;
     return false;
   }
 
@@ -330,7 +377,7 @@ extern "C" bool NvDsInferParseRFDETRSeg(
     const cudaError_t person_err = cudaMemcpy2D(
         person_logits_host.data(),
         sizeof(float),
-        logits_dev + static_cast<std::size_t>(person_class_idx),
+        logits_dev + kPersonClassIndex,
         logit_stride * sizeof(float),
         sizeof(float),
         q,
@@ -387,7 +434,11 @@ extern "C" bool NvDsInferParseRFDETRSeg(
     // parity we only emit "person" detections as DeepStream classId 0.
     const float person_logit = device_buf
         ? person_logits_host[i]
-        : logits_dev[i * logit_stride + static_cast<std::size_t>(person_class_idx)];
+        : logits_dev[i * logit_stride + kPersonClassIndex];
+    if (!std::isfinite(person_logit)) {
+      std::cerr << "[rfdetr-seg] non-finite person logit at query " << i << std::endl;
+      return false;
+    }
     const float score = sigmoid(person_logit);
     if (score > max_person_score) max_person_score = score;
     if (score < threshold) continue;
@@ -398,7 +449,12 @@ extern "C" bool NvDsInferParseRFDETRSeg(
     float x2 = 0.0f;
     float y2 = 0.0f;
     const float* box_ptr = device_buf ? (boxes_host.data() + i * box_stride) : (boxes_dev + i * box_stride);
-    decode_box_to_xyxy(box_ptr, networkInfo.width, networkInfo.height, x1, y1, x2, y2);
+    if (!decode_box_to_xyxy(
+            box_ptr, networkInfo.width, networkInfo.height, x1, y1, x2, y2)) {
+      std::cerr << "[rfdetr-seg] invalid normalized cxcywh box at query " << i
+                << std::endl;
+      return false;
+    }
 
     NvDsInferInstanceMaskInfo obj{};
     set_bbox(x1, y1, x2, y2, networkInfo.width, networkInfo.height, obj);
@@ -420,9 +476,9 @@ extern "C" bool NvDsInferParseRFDETRSeg(
     } else {
       mask_src = masks_dev + i * mask_stride;
     }
-    if (!copy_mask_roi(mask_src, masks_dims.h, masks_dims.w, obj.left, obj.top,
-                       obj.left + obj.width, obj.top + obj.height, networkInfo.width,
-                       networkInfo.height, obj)) {
+    if (!copy_mask_roi_bilinear(
+            mask_src, masks_dims.h, masks_dims.w, networkInfo.width,
+            networkInfo.height, obj)) {
       continue;
     }
     ++mask_pass;
@@ -436,7 +492,7 @@ extern "C" bool NvDsInferParseRFDETRSeg(
     const unsigned long long den = static_cast<unsigned long long>(debug_every);
     if (den > 0 && (n % den) == 0ULL) {
       std::cerr << "[rfdetr-seg] frame=" << n << " q=" << q << " kept=" << kept
-                << " person_idx=" << person_class_idx << " threshold=" << threshold
+                << " person_idx=" << kPersonClassIndex << " threshold=" << threshold
                 << " device_buf=" << (device_buf ? 1 : 0)
                 << " score_pass=" << score_pass << " bbox_pass=" << bbox_pass
                 << " mask_pass=" << mask_pass

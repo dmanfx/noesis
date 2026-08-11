@@ -1,0 +1,945 @@
+{
+  "$defs": {
+    "CalibrationAcceptance": {
+      "additionalProperties": false,
+      "properties": {
+        "confidence_level": {
+          "const": 0.95,
+          "title": "Confidence Level",
+          "type": "number"
+        },
+        "confidence_method": {
+          "const": "clopper_pearson_one_sided",
+          "title": "Confidence Method",
+          "type": "string"
+        },
+        "max_benchmark_holdout_far_upper_confidence_bound": {
+          "maximum": 0.01,
+          "minimum": 0.0,
+          "title": "Max Benchmark Holdout Far Upper Confidence Bound",
+          "type": "number"
+        },
+        "max_benchmark_holdout_frr": {
+          "maximum": 0.35,
+          "minimum": 0.0,
+          "title": "Max Benchmark Holdout Frr",
+          "type": "number"
+        },
+        "max_benchmark_holdout_misidentification_upper_confidence_bound": {
+          "maximum": 0.01,
+          "minimum": 0.0,
+          "title": "Max Benchmark Holdout Misidentification Upper Confidence Bound",
+          "type": "number"
+        },
+        "max_harmful_prior_encounters": {
+          "const": 0,
+          "title": "Max Harmful Prior Encounters",
+          "type": "integer"
+        },
+        "max_household_false_accept_encounters": {
+          "const": 0,
+          "title": "Max Household False Accept Encounters",
+          "type": "integer"
+        },
+        "max_household_holdout_frr": {
+          "maximum": 0.35,
+          "minimum": 0.0,
+          "title": "Max Household Holdout Frr",
+          "type": "number"
+        },
+        "max_household_misidentification_encounters": {
+          "const": 0,
+          "title": "Max Household Misidentification Encounters",
+          "type": "integer"
+        },
+        "max_prior_rejection_rescue_encounters": {
+          "const": 0,
+          "title": "Max Prior Rejection Rescue Encounters",
+          "type": "integer"
+        },
+        "minimum_benchmark_holdout_known_persons": {
+          "minimum": 300,
+          "title": "Minimum Benchmark Holdout Known Persons",
+          "type": "integer"
+        },
+        "minimum_benchmark_holdout_unknown_persons": {
+          "minimum": 300,
+          "title": "Minimum Benchmark Holdout Unknown Persons",
+          "type": "integer"
+        },
+        "minimum_benchmark_train_known_persons": {
+          "minimum": 50,
+          "title": "Minimum Benchmark Train Known Persons",
+          "type": "integer"
+        },
+        "minimum_benchmark_train_unknown_persons": {
+          "minimum": 50,
+          "title": "Minimum Benchmark Train Unknown Persons",
+          "type": "integer"
+        },
+        "minimum_household_holdout_known_encounters": {
+          "minimum": 20,
+          "title": "Minimum Household Holdout Known Encounters",
+          "type": "integer"
+        },
+        "minimum_household_holdout_unknown_encounters": {
+          "minimum": 20,
+          "title": "Minimum Household Holdout Unknown Encounters",
+          "type": "integer"
+        },
+        "minimum_household_train_known_encounters": {
+          "minimum": 10,
+          "title": "Minimum Household Train Known Encounters",
+          "type": "integer"
+        },
+        "minimum_household_train_unknown_encounters": {
+          "minimum": 10,
+          "title": "Minimum Household Train Unknown Encounters",
+          "type": "integer"
+        },
+        "passed": {
+          "const": true,
+          "title": "Passed",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "passed",
+        "confidence_level",
+        "confidence_method",
+        "max_benchmark_holdout_far_upper_confidence_bound",
+        "max_benchmark_holdout_frr",
+        "max_benchmark_holdout_misidentification_upper_confidence_bound",
+        "max_household_false_accept_encounters",
+        "max_household_misidentification_encounters",
+        "max_household_holdout_frr",
+        "max_harmful_prior_encounters",
+        "max_prior_rejection_rescue_encounters",
+        "minimum_benchmark_train_known_persons",
+        "minimum_benchmark_train_unknown_persons",
+        "minimum_benchmark_holdout_known_persons",
+        "minimum_benchmark_holdout_unknown_persons",
+        "minimum_household_train_known_encounters",
+        "minimum_household_train_unknown_encounters",
+        "minimum_household_holdout_known_encounters",
+        "minimum_household_holdout_unknown_encounters"
+      ],
+      "title": "CalibrationAcceptance",
+      "type": "object"
+    },
+    "CalibrationDatasetBinding": {
+      "additionalProperties": false,
+      "properties": {
+        "dataset_sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Dataset Sha256",
+          "type": "string"
+        },
+        "encounter_count": {
+          "minimum": 1,
+          "title": "Encounter Count",
+          "type": "integer"
+        },
+        "evidence_sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Evidence Sha256",
+          "type": "string"
+        },
+        "evidence_sources": {
+          "items": {
+            "$ref": "#/$defs/CalibrationEvidenceSource"
+          },
+          "maxItems": 2,
+          "minItems": 1,
+          "title": "Evidence Sources",
+          "type": "array"
+        },
+        "evidence_stratum": {
+          "$ref": "#/$defs/CalibrationEvidenceStratum"
+        },
+        "evidence_unit_count": {
+          "minimum": 1,
+          "title": "Evidence Unit Count",
+          "type": "integer"
+        },
+        "labels_sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Labels Sha256",
+          "type": "string"
+        },
+        "observation_count": {
+          "minimum": 1,
+          "title": "Observation Count",
+          "type": "integer"
+        },
+        "provenance": {
+          "$ref": "#/$defs/CalibrationDatasetProvenance"
+        },
+        "runtime_modes": {
+          "items": {
+            "type": "string"
+          },
+          "maxItems": 4,
+          "minItems": 1,
+          "title": "Runtime Modes",
+          "type": "array"
+        },
+        "runtimes": {
+          "items": {
+            "type": "string"
+          },
+          "maxItems": 4,
+          "minItems": 1,
+          "title": "Runtimes",
+          "type": "array"
+        },
+        "split_strategy": {
+          "$ref": "#/$defs/CalibrationSplitStrategy"
+        },
+        "truth_kinds": {
+          "items": {
+            "$ref": "#/$defs/CalibrationTruthKind"
+          },
+          "maxItems": 3,
+          "minItems": 2,
+          "title": "Truth Kinds",
+          "type": "array"
+        }
+      },
+      "required": [
+        "evidence_stratum",
+        "dataset_sha256",
+        "evidence_sha256",
+        "labels_sha256",
+        "split_strategy",
+        "evidence_sources",
+        "runtimes",
+        "runtime_modes",
+        "truth_kinds",
+        "provenance",
+        "observation_count",
+        "evidence_unit_count",
+        "encounter_count"
+      ],
+      "title": "CalibrationDatasetBinding",
+      "type": "object"
+    },
+    "CalibrationDatasetProvenance": {
+      "additionalProperties": false,
+      "description": "Immutable provenance for one benchmark or household capture corpus.",
+      "properties": {
+        "labeling_protocol_revision": {
+          "maxLength": 200,
+          "minLength": 1,
+          "title": "Labeling Protocol Revision",
+          "type": "string"
+        },
+        "model_semantic_profile_sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Model Semantic Profile Sha256",
+          "type": "string"
+        },
+        "population_basis": {
+          "enum": [
+            "licensed_real_people",
+            "owner_consented_household_people"
+          ],
+          "title": "Population Basis",
+          "type": "string"
+        },
+        "source_manifest_sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Source Manifest Sha256",
+          "type": "string"
+        },
+        "source_name": {
+          "maxLength": 200,
+          "minLength": 1,
+          "title": "Source Name",
+          "type": "string"
+        },
+        "source_revision": {
+          "maxLength": 200,
+          "minLength": 1,
+          "title": "Source Revision",
+          "type": "string"
+        }
+      },
+      "required": [
+        "source_name",
+        "source_revision",
+        "source_manifest_sha256",
+        "model_semantic_profile_sha256",
+        "labeling_protocol_revision",
+        "population_basis"
+      ],
+      "title": "CalibrationDatasetProvenance",
+      "type": "object"
+    },
+    "CalibrationEvidenceSource": {
+      "enum": [
+        "shadow",
+        "replay"
+      ],
+      "title": "CalibrationEvidenceSource",
+      "type": "string"
+    },
+    "CalibrationEvidenceStratum": {
+      "enum": [
+        "benchmark",
+        "household"
+      ],
+      "title": "CalibrationEvidenceStratum",
+      "type": "string"
+    },
+    "CalibrationEvidenceUnitPolicy": {
+      "additionalProperties": false,
+      "properties": {
+        "algorithm": {
+          "const": "session_tracklet_time_bucket_v1",
+          "title": "Algorithm",
+          "type": "string"
+        },
+        "authority_aggregation": {
+          "const": "encounter_worst_case_v1",
+          "title": "Authority Aggregation",
+          "type": "string"
+        },
+        "bucket_duration_us": {
+          "const": 5000000,
+          "title": "Bucket Duration Us",
+          "type": "integer"
+        },
+        "fit_representatives_per_unit": {
+          "const": 1,
+          "title": "Fit Representatives Per Unit",
+          "type": "integer"
+        },
+        "fit_thinning": {
+          "const": "temporal_cover_center_representative_v1",
+          "title": "Fit Thinning",
+          "type": "string"
+        },
+        "maximum_fit_units_per_encounter": {
+          "const": 8,
+          "title": "Maximum Fit Units Per Encounter",
+          "type": "integer"
+        },
+        "maximum_observations_per_unit": {
+          "const": 300,
+          "title": "Maximum Observations Per Unit",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "algorithm",
+        "bucket_duration_us",
+        "maximum_observations_per_unit",
+        "fit_thinning",
+        "maximum_fit_units_per_encounter",
+        "fit_representatives_per_unit",
+        "authority_aggregation"
+      ],
+      "title": "CalibrationEvidenceUnitPolicy",
+      "type": "object"
+    },
+    "CalibrationFitSummary": {
+      "additionalProperties": false,
+      "properties": {
+        "balanced_brier_score": {
+          "maximum": 1.0,
+          "minimum": 0.0,
+          "title": "Balanced Brier Score",
+          "type": "number"
+        },
+        "balanced_log_loss": {
+          "minimum": 0.0,
+          "title": "Balanced Log Loss",
+          "type": "number"
+        },
+        "iterations": {
+          "minimum": 1,
+          "title": "Iterations",
+          "type": "integer"
+        },
+        "negative_pair_count": {
+          "minimum": 1,
+          "title": "Negative Pair Count",
+          "type": "integer"
+        },
+        "positive_pair_count": {
+          "minimum": 1,
+          "title": "Positive Pair Count",
+          "type": "integer"
+        },
+        "score_semantics": {
+          "const": "balanced_monotonic_match_score_not_posterior",
+          "title": "Score Semantics",
+          "type": "string"
+        },
+        "selected_encounter_count": {
+          "minimum": 1,
+          "title": "Selected Encounter Count",
+          "type": "integer"
+        },
+        "selected_evidence_unit_count": {
+          "minimum": 1,
+          "title": "Selected Evidence Unit Count",
+          "type": "integer"
+        },
+        "selected_person_count": {
+          "minimum": 1,
+          "title": "Selected Person Count",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "score_semantics",
+        "selected_evidence_unit_count",
+        "selected_encounter_count",
+        "selected_person_count",
+        "positive_pair_count",
+        "negative_pair_count",
+        "balanced_log_loss",
+        "balanced_brier_score",
+        "iterations"
+      ],
+      "title": "CalibrationFitSummary",
+      "type": "object"
+    },
+    "CalibrationGalleryLimits": {
+      "additionalProperties": false,
+      "properties": {
+        "maximum_exemplars_per_candidate": {
+          "maximum": 4096,
+          "minimum": 1,
+          "title": "Maximum Exemplars Per Candidate",
+          "type": "integer"
+        },
+        "maximum_resident_candidate_count": {
+          "maximum": 1024,
+          "minimum": 1,
+          "title": "Maximum Resident Candidate Count",
+          "type": "integer"
+        },
+        "maximum_total_candidate_count": {
+          "maximum": 2048,
+          "minimum": 2,
+          "title": "Maximum Total Candidate Count",
+          "type": "integer"
+        },
+        "maximum_visitor_candidate_count": {
+          "maximum": 1024,
+          "minimum": 1,
+          "title": "Maximum Visitor Candidate Count",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "maximum_resident_candidate_count",
+        "maximum_visitor_candidate_count",
+        "maximum_total_candidate_count",
+        "maximum_exemplars_per_candidate"
+      ],
+      "title": "CalibrationGalleryLimits",
+      "type": "object"
+    },
+    "CalibrationMetrics": {
+      "additionalProperties": false,
+      "properties": {
+        "challenge_eligible_encounter_count": {
+          "minimum": 1,
+          "title": "Challenge Eligible Encounter Count",
+          "type": "integer"
+        },
+        "challenge_eligible_observation_count": {
+          "minimum": 1,
+          "title": "Challenge Eligible Observation Count",
+          "type": "integer"
+        },
+        "confidence_level": {
+          "const": 0.95,
+          "title": "Confidence Level",
+          "type": "number"
+        },
+        "confidence_method": {
+          "const": "clopper_pearson_one_sided",
+          "title": "Confidence Method",
+          "type": "string"
+        },
+        "confidence_unit": {
+          "const": "truth_person_worst_case",
+          "title": "Confidence Unit",
+          "type": "string"
+        },
+        "correct_accept_encounter_count": {
+          "minimum": 0,
+          "title": "Correct Accept Encounter Count",
+          "type": "integer"
+        },
+        "correct_accept_person_count": {
+          "minimum": 0,
+          "title": "Correct Accept Person Count",
+          "type": "integer"
+        },
+        "encounter_count": {
+          "minimum": 1,
+          "title": "Encounter Count",
+          "type": "integer"
+        },
+        "evidence_unit_count": {
+          "minimum": 1,
+          "title": "Evidence Unit Count",
+          "type": "integer"
+        },
+        "false_accept_challenge_person_count": {
+          "minimum": 0,
+          "title": "False Accept Challenge Person Count",
+          "type": "integer"
+        },
+        "false_accept_encounter_count": {
+          "minimum": 0,
+          "title": "False Accept Encounter Count",
+          "type": "integer"
+        },
+        "false_accept_person_count": {
+          "minimum": 0,
+          "title": "False Accept Person Count",
+          "type": "integer"
+        },
+        "false_reject_encounter_count": {
+          "minimum": 0,
+          "title": "False Reject Encounter Count",
+          "type": "integer"
+        },
+        "false_reject_person_count": {
+          "minimum": 0,
+          "title": "False Reject Person Count",
+          "type": "integer"
+        },
+        "far": {
+          "maximum": 1.0,
+          "minimum": 0.0,
+          "title": "Far",
+          "type": "number"
+        },
+        "far_upper_confidence_bound": {
+          "maximum": 1.0,
+          "minimum": 0.0,
+          "title": "Far Upper Confidence Bound",
+          "type": "number"
+        },
+        "frr": {
+          "maximum": 1.0,
+          "minimum": 0.0,
+          "title": "Frr",
+          "type": "number"
+        },
+        "frr_upper_confidence_bound": {
+          "maximum": 1.0,
+          "minimum": 0.0,
+          "title": "Frr Upper Confidence Bound",
+          "type": "number"
+        },
+        "identification_accuracy": {
+          "maximum": 1.0,
+          "minimum": 0.0,
+          "title": "Identification Accuracy",
+          "type": "number"
+        },
+        "known_challenge_person_count": {
+          "minimum": 1,
+          "title": "Known Challenge Person Count",
+          "type": "integer"
+        },
+        "known_encounter_count": {
+          "minimum": 1,
+          "title": "Known Encounter Count",
+          "type": "integer"
+        },
+        "known_evidence_unit_count": {
+          "minimum": 1,
+          "title": "Known Evidence Unit Count",
+          "type": "integer"
+        },
+        "known_observation_count": {
+          "minimum": 1,
+          "title": "Known Observation Count",
+          "type": "integer"
+        },
+        "known_person_count": {
+          "minimum": 1,
+          "title": "Known Person Count",
+          "type": "integer"
+        },
+        "misidentification_challenge_person_count": {
+          "minimum": 0,
+          "title": "Misidentification Challenge Person Count",
+          "type": "integer"
+        },
+        "misidentification_encounter_count": {
+          "minimum": 0,
+          "title": "Misidentification Encounter Count",
+          "type": "integer"
+        },
+        "misidentification_person_count": {
+          "minimum": 0,
+          "title": "Misidentification Person Count",
+          "type": "integer"
+        },
+        "misidentification_rate": {
+          "maximum": 1.0,
+          "minimum": 0.0,
+          "title": "Misidentification Rate",
+          "type": "number"
+        },
+        "misidentification_upper_confidence_bound": {
+          "maximum": 1.0,
+          "minimum": 0.0,
+          "title": "Misidentification Upper Confidence Bound",
+          "type": "number"
+        },
+        "observation_count": {
+          "minimum": 1,
+          "title": "Observation Count",
+          "type": "integer"
+        },
+        "person_count": {
+          "minimum": 1,
+          "title": "Person Count",
+          "type": "integer"
+        },
+        "person_far": {
+          "maximum": 1.0,
+          "minimum": 0.0,
+          "title": "Person Far",
+          "type": "number"
+        },
+        "person_frr": {
+          "maximum": 1.0,
+          "minimum": 0.0,
+          "title": "Person Frr",
+          "type": "number"
+        },
+        "person_identification_accuracy": {
+          "maximum": 1.0,
+          "minimum": 0.0,
+          "title": "Person Identification Accuracy",
+          "type": "number"
+        },
+        "person_misidentification_rate": {
+          "maximum": 1.0,
+          "minimum": 0.0,
+          "title": "Person Misidentification Rate",
+          "type": "number"
+        },
+        "resident_prior_beneficial_encounter_count": {
+          "minimum": 0,
+          "title": "Resident Prior Beneficial Encounter Count",
+          "type": "integer"
+        },
+        "resident_prior_changed_encounter_count": {
+          "minimum": 0,
+          "title": "Resident Prior Changed Encounter Count",
+          "type": "integer"
+        },
+        "resident_prior_harmful_encounter_count": {
+          "minimum": 0,
+          "title": "Resident Prior Harmful Encounter Count",
+          "type": "integer"
+        },
+        "resident_prior_rejection_rescue_encounter_count": {
+          "minimum": 0,
+          "title": "Resident Prior Rejection Rescue Encounter Count",
+          "type": "integer"
+        },
+        "unknown_challenge_person_count": {
+          "minimum": 1,
+          "title": "Unknown Challenge Person Count",
+          "type": "integer"
+        },
+        "unknown_encounter_count": {
+          "minimum": 1,
+          "title": "Unknown Encounter Count",
+          "type": "integer"
+        },
+        "unknown_evidence_unit_count": {
+          "minimum": 1,
+          "title": "Unknown Evidence Unit Count",
+          "type": "integer"
+        },
+        "unknown_observation_count": {
+          "minimum": 1,
+          "title": "Unknown Observation Count",
+          "type": "integer"
+        },
+        "unknown_person_count": {
+          "minimum": 1,
+          "title": "Unknown Person Count",
+          "type": "integer"
+        },
+        "unknown_rejection_rate": {
+          "maximum": 1.0,
+          "minimum": 0.0,
+          "title": "Unknown Rejection Rate",
+          "type": "number"
+        }
+      },
+      "required": [
+        "confidence_level",
+        "confidence_method",
+        "confidence_unit",
+        "observation_count",
+        "known_observation_count",
+        "unknown_observation_count",
+        "challenge_eligible_observation_count",
+        "evidence_unit_count",
+        "known_evidence_unit_count",
+        "unknown_evidence_unit_count",
+        "encounter_count",
+        "known_encounter_count",
+        "unknown_encounter_count",
+        "challenge_eligible_encounter_count",
+        "correct_accept_encounter_count",
+        "false_reject_encounter_count",
+        "misidentification_encounter_count",
+        "false_accept_encounter_count",
+        "person_count",
+        "known_person_count",
+        "unknown_person_count",
+        "known_challenge_person_count",
+        "unknown_challenge_person_count",
+        "correct_accept_person_count",
+        "false_reject_person_count",
+        "misidentification_person_count",
+        "false_accept_person_count",
+        "misidentification_challenge_person_count",
+        "false_accept_challenge_person_count",
+        "person_far",
+        "person_frr",
+        "person_misidentification_rate",
+        "person_identification_accuracy",
+        "far",
+        "far_upper_confidence_bound",
+        "frr",
+        "frr_upper_confidence_bound",
+        "misidentification_rate",
+        "misidentification_upper_confidence_bound",
+        "unknown_rejection_rate",
+        "identification_accuracy",
+        "resident_prior_changed_encounter_count",
+        "resident_prior_beneficial_encounter_count",
+        "resident_prior_harmful_encounter_count",
+        "resident_prior_rejection_rescue_encounter_count"
+      ],
+      "title": "CalibrationMetrics",
+      "type": "object"
+    },
+    "CalibrationSplitStrategy": {
+      "enum": [
+        "subject_disjoint",
+        "session_disjoint"
+      ],
+      "title": "CalibrationSplitStrategy",
+      "type": "string"
+    },
+    "CalibrationTruthKind": {
+      "enum": [
+        "resident",
+        "visitor",
+        "unknown"
+      ],
+      "title": "CalibrationTruthKind",
+      "type": "string"
+    },
+    "IdentityOpenSetPolicyContract": {
+      "additionalProperties": false,
+      "properties": {
+        "ambiguity_margin_floor": {
+          "maximum": 1.0,
+          "minimum": 0.0,
+          "title": "Ambiguity Margin Floor",
+          "type": "number"
+        },
+        "appearance_floor": {
+          "maximum": 1.0,
+          "minimum": -1.0,
+          "title": "Appearance Floor",
+          "type": "number"
+        },
+        "calibrated_confidence_floor": {
+          "maximum": 1.0,
+          "minimum": 0.0,
+          "title": "Calibrated Confidence Floor",
+          "type": "number"
+        },
+        "calibration_midpoint": {
+          "maximum": 1.0,
+          "minimum": -1.0,
+          "title": "Calibration Midpoint",
+          "type": "number"
+        },
+        "calibration_slope": {
+          "exclusiveMinimum": 0.0,
+          "maximum": 200.0,
+          "title": "Calibration Slope",
+          "type": "number"
+        },
+        "quality_floor": {
+          "maximum": 1.0,
+          "minimum": 0.0,
+          "title": "Quality Floor",
+          "type": "number"
+        },
+        "resident_prior_bonus": {
+          "maximum": 0.05,
+          "minimum": 0.0,
+          "title": "Resident Prior Bonus",
+          "type": "number"
+        },
+        "resident_prior_cap": {
+          "maximum": 0.05,
+          "minimum": 0.0,
+          "title": "Resident Prior Cap",
+          "type": "number"
+        },
+        "unknown_utility": {
+          "maximum": 1.0,
+          "minimum": 0.0,
+          "title": "Unknown Utility",
+          "type": "number"
+        }
+      },
+      "required": [
+        "appearance_floor",
+        "quality_floor",
+        "calibrated_confidence_floor",
+        "ambiguity_margin_floor",
+        "calibration_slope",
+        "calibration_midpoint",
+        "resident_prior_bonus",
+        "resident_prior_cap",
+        "unknown_utility"
+      ],
+      "title": "IdentityOpenSetPolicyContract",
+      "type": "object"
+    }
+  },
+  "additionalProperties": false,
+  "properties": {
+    "acceptance": {
+      "$ref": "#/$defs/CalibrationAcceptance"
+    },
+    "authority_scope": {
+      "const": "open_set_scorer_policy_only",
+      "title": "Authority Scope",
+      "type": "string"
+    },
+    "benchmark_dataset": {
+      "$ref": "#/$defs/CalibrationDatasetBinding"
+    },
+    "benchmark_holdout_metrics": {
+      "$ref": "#/$defs/CalibrationMetrics"
+    },
+    "benchmark_policy": {
+      "$ref": "#/$defs/IdentityOpenSetPolicyContract"
+    },
+    "benchmark_training_metrics": {
+      "$ref": "#/$defs/CalibrationMetrics"
+    },
+    "contract": {
+      "const": "noesis.identity.open_set_calibration",
+      "title": "Contract",
+      "type": "string"
+    },
+    "contract_version": {
+      "const": 2,
+      "title": "Contract Version",
+      "type": "integer"
+    },
+    "embedding_dim": {
+      "minimum": 1,
+      "title": "Embedding Dim",
+      "type": "integer"
+    },
+    "evidence_unit_policy": {
+      "$ref": "#/$defs/CalibrationEvidenceUnitPolicy"
+    },
+    "fit": {
+      "$ref": "#/$defs/CalibrationFitSummary"
+    },
+    "gallery_limits": {
+      "$ref": "#/$defs/CalibrationGalleryLimits"
+    },
+    "generated_at_us": {
+      "minimum": 1,
+      "title": "Generated At Us",
+      "type": "integer"
+    },
+    "generator": {
+      "const": "scripts/identity_v2_calibrate.py",
+      "title": "Generator",
+      "type": "string"
+    },
+    "generator_revision": {
+      "maxLength": 200,
+      "minLength": 1,
+      "title": "Generator Revision",
+      "type": "string"
+    },
+    "household_dataset": {
+      "$ref": "#/$defs/CalibrationDatasetBinding"
+    },
+    "household_holdout_metrics": {
+      "$ref": "#/$defs/CalibrationMetrics"
+    },
+    "household_training_metrics": {
+      "$ref": "#/$defs/CalibrationMetrics"
+    },
+    "model_layer": {
+      "maxLength": 200,
+      "minLength": 1,
+      "title": "Model Layer",
+      "type": "string"
+    },
+    "model_semantic_profile_sha256": {
+      "pattern": "^[0-9a-f]{64}$",
+      "title": "Model Semantic Profile Sha256",
+      "type": "string"
+    },
+    "model_sha256": {
+      "pattern": "^[0-9a-f]{64}$",
+      "title": "Model Sha256",
+      "type": "string"
+    },
+    "policy": {
+      "$ref": "#/$defs/IdentityOpenSetPolicyContract"
+    }
+  },
+  "required": [
+    "contract",
+    "contract_version",
+    "generated_at_us",
+    "generator",
+    "generator_revision",
+    "model_sha256",
+    "model_layer",
+    "embedding_dim",
+    "model_semantic_profile_sha256",
+    "authority_scope",
+    "gallery_limits",
+    "evidence_unit_policy",
+    "benchmark_dataset",
+    "household_dataset",
+    "benchmark_policy",
+    "policy",
+    "fit",
+    "benchmark_training_metrics",
+    "benchmark_holdout_metrics",
+    "household_training_metrics",
+    "household_holdout_metrics",
+    "acceptance"
+  ],
+  "title": "IdentityOpenSetCalibrationArtifact",
+  "type": "object"
+}

@@ -1,0 +1,199 @@
+{
+  "$defs": {
+    "CalibrationDatasetProvenance": {
+      "additionalProperties": false,
+      "description": "Immutable provenance for one benchmark or household capture corpus.",
+      "properties": {
+        "labeling_protocol_revision": {
+          "maxLength": 200,
+          "minLength": 1,
+          "title": "Labeling Protocol Revision",
+          "type": "string"
+        },
+        "model_semantic_profile_sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Model Semantic Profile Sha256",
+          "type": "string"
+        },
+        "population_basis": {
+          "enum": [
+            "licensed_real_people",
+            "owner_consented_household_people"
+          ],
+          "title": "Population Basis",
+          "type": "string"
+        },
+        "source_manifest_sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Source Manifest Sha256",
+          "type": "string"
+        },
+        "source_name": {
+          "maxLength": 200,
+          "minLength": 1,
+          "title": "Source Name",
+          "type": "string"
+        },
+        "source_revision": {
+          "maxLength": 200,
+          "minLength": 1,
+          "title": "Source Revision",
+          "type": "string"
+        }
+      },
+      "required": [
+        "source_name",
+        "source_revision",
+        "source_manifest_sha256",
+        "model_semantic_profile_sha256",
+        "labeling_protocol_revision",
+        "population_basis"
+      ],
+      "title": "CalibrationDatasetProvenance",
+      "type": "object"
+    },
+    "CalibrationEvidenceStratum": {
+      "enum": [
+        "benchmark",
+        "household"
+      ],
+      "title": "CalibrationEvidenceStratum",
+      "type": "string"
+    },
+    "CalibrationPartition": {
+      "enum": [
+        "train",
+        "holdout"
+      ],
+      "title": "CalibrationPartition",
+      "type": "string"
+    },
+    "CalibrationSplitStrategy": {
+      "enum": [
+        "subject_disjoint",
+        "session_disjoint"
+      ],
+      "title": "CalibrationSplitStrategy",
+      "type": "string"
+    },
+    "CalibrationTruthKind": {
+      "enum": [
+        "resident",
+        "visitor",
+        "unknown"
+      ],
+      "title": "CalibrationTruthKind",
+      "type": "string"
+    },
+    "CalibrationTruthLabel": {
+      "additionalProperties": false,
+      "properties": {
+        "encounter_id": {
+          "maxLength": 240,
+          "minLength": 1,
+          "title": "Encounter Id",
+          "type": "string"
+        },
+        "event_id": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Event Id",
+          "type": "string"
+        },
+        "partition": {
+          "$ref": "#/$defs/CalibrationPartition"
+        },
+        "truth_kind": {
+          "$ref": "#/$defs/CalibrationTruthKind"
+        },
+        "truth_person_key": {
+          "maxLength": 240,
+          "minLength": 1,
+          "title": "Truth Person Key",
+          "type": "string"
+        },
+        "truth_subject_id": {
+          "anyOf": [
+            {
+              "maxLength": 240,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Truth Subject Id"
+        }
+      },
+      "required": [
+        "event_id",
+        "partition",
+        "truth_kind",
+        "truth_person_key",
+        "encounter_id"
+      ],
+      "title": "CalibrationTruthLabel",
+      "type": "object"
+    }
+  },
+  "additionalProperties": false,
+  "properties": {
+    "contract": {
+      "const": "noesis.identity.evidence_labels",
+      "title": "Contract",
+      "type": "string"
+    },
+    "contract_version": {
+      "const": 2,
+      "title": "Contract Version",
+      "type": "integer"
+    },
+    "evidence_sha256": {
+      "pattern": "^[0-9a-f]{64}$",
+      "title": "Evidence Sha256",
+      "type": "string"
+    },
+    "evidence_stratum": {
+      "$ref": "#/$defs/CalibrationEvidenceStratum"
+    },
+    "labeled_by": {
+      "maxLength": 200,
+      "minLength": 1,
+      "title": "Labeled By",
+      "type": "string"
+    },
+    "labeling_revision": {
+      "maxLength": 200,
+      "minLength": 1,
+      "title": "Labeling Revision",
+      "type": "string"
+    },
+    "labels": {
+      "items": {
+        "$ref": "#/$defs/CalibrationTruthLabel"
+      },
+      "minItems": 1,
+      "title": "Labels",
+      "type": "array"
+    },
+    "provenance": {
+      "$ref": "#/$defs/CalibrationDatasetProvenance"
+    },
+    "split_strategy": {
+      "$ref": "#/$defs/CalibrationSplitStrategy"
+    }
+  },
+  "required": [
+    "contract",
+    "contract_version",
+    "evidence_sha256",
+    "evidence_stratum",
+    "split_strategy",
+    "provenance",
+    "labeled_by",
+    "labeling_revision",
+    "labels"
+  ],
+  "title": "IdentityEvidenceLabelSet",
+  "type": "object"
+}

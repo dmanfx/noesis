@@ -1,0 +1,366 @@
+{
+  "$defs": {
+    "IdentityEvidenceSummary": {
+      "additionalProperties": false,
+      "properties": {
+        "ambiguity_margin": {
+          "anyOf": [
+            {
+              "minimum": 0.0,
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Ambiguity Margin"
+        },
+        "appearance_similarity": {
+          "anyOf": [
+            {
+              "maximum": 1.0,
+              "minimum": -1.0,
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Appearance Similarity"
+        },
+        "calibrated_confidence": {
+          "anyOf": [
+            {
+              "maximum": 1.0,
+              "minimum": 0.0,
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Calibrated Confidence"
+        },
+        "embedding_dimension": {
+          "anyOf": [
+            {
+              "minimum": 1,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Embedding Dimension"
+        },
+        "embedding_model_sha256": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Embedding Model Sha256"
+        },
+        "embedding_present": {
+          "title": "Embedding Present",
+          "type": "boolean"
+        },
+        "embedding_sequence": {
+          "anyOf": [
+            {
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Embedding Sequence"
+        },
+        "independent_observation_count": {
+          "default": 0,
+          "minimum": 0,
+          "title": "Independent Observation Count",
+          "type": "integer"
+        },
+        "pose_present": {
+          "default": false,
+          "title": "Pose Present",
+          "type": "boolean"
+        },
+        "prior_contribution": {
+          "default": 0.0,
+          "minimum": 0.0,
+          "title": "Prior Contribution",
+          "type": "number"
+        },
+        "quality_accepted": {
+          "default": false,
+          "title": "Quality Accepted",
+          "type": "boolean"
+        },
+        "world_present": {
+          "default": false,
+          "title": "World Present",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "embedding_present"
+      ],
+      "title": "IdentityEvidenceSummary",
+      "type": "object"
+    },
+    "IdentityKind": {
+      "enum": [
+        "resident",
+        "visitor",
+        "unknown",
+        "provisional"
+      ],
+      "title": "IdentityKind",
+      "type": "string"
+    },
+    "IdentityOutcome": {
+      "enum": [
+        "resident",
+        "visitor",
+        "unknown"
+      ],
+      "title": "IdentityOutcome",
+      "type": "string"
+    },
+    "SubjectRef": {
+      "additionalProperties": false,
+      "properties": {
+        "display_name": {
+          "anyOf": [
+            {
+              "maxLength": 160,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Display Name"
+        },
+        "generation": {
+          "default": 0,
+          "minimum": 0,
+          "title": "Generation",
+          "type": "integer"
+        },
+        "kind": {
+          "$ref": "#/$defs/IdentityKind"
+        },
+        "resident_uuid": {
+          "anyOf": [
+            {
+              "maxLength": 160,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Resident Uuid"
+        },
+        "stable_id": {
+          "anyOf": [
+            {
+              "minimum": 1,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Stable Id"
+        },
+        "subject_id": {
+          "maxLength": 200,
+          "minLength": 1,
+          "title": "Subject Id",
+          "type": "string"
+        }
+      },
+      "required": [
+        "subject_id",
+        "kind"
+      ],
+      "title": "SubjectRef",
+      "type": "object"
+    },
+    "TrackletRef": {
+      "additionalProperties": false,
+      "properties": {
+        "camera_id": {
+          "maxLength": 160,
+          "minLength": 1,
+          "title": "Camera Id",
+          "type": "string"
+        },
+        "frame_id": {
+          "minimum": 0,
+          "title": "Frame Id",
+          "type": "integer"
+        },
+        "observed_at_us": {
+          "minimum": 1,
+          "title": "Observed At Us",
+          "type": "integer"
+        },
+        "run_id": {
+          "maxLength": 160,
+          "minLength": 1,
+          "title": "Run Id",
+          "type": "string"
+        },
+        "source_id": {
+          "minimum": 0,
+          "title": "Source Id",
+          "type": "integer"
+        },
+        "tracker_id": {
+          "minimum": 0,
+          "title": "Tracker Id",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "run_id",
+        "camera_id",
+        "source_id",
+        "tracker_id",
+        "frame_id",
+        "observed_at_us"
+      ],
+      "title": "TrackletRef",
+      "type": "object"
+    }
+  },
+  "additionalProperties": false,
+  "properties": {
+    "absolute_open_set_floor": {
+      "anyOf": [
+        {
+          "maximum": 1.0,
+          "minimum": -1.0,
+          "type": "number"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Absolute Open Set Floor"
+    },
+    "contract": {
+      "const": "noesis.identity.decision",
+      "title": "Contract",
+      "type": "string"
+    },
+    "contract_version": {
+      "const": 1,
+      "title": "Contract Version",
+      "type": "integer"
+    },
+    "decided_at_us": {
+      "minimum": 1,
+      "title": "Decided At Us",
+      "type": "integer"
+    },
+    "decision_id": {
+      "maxLength": 200,
+      "minLength": 1,
+      "title": "Decision Id",
+      "type": "string"
+    },
+    "evidence": {
+      "$ref": "#/$defs/IdentityEvidenceSummary"
+    },
+    "outcome": {
+      "$ref": "#/$defs/IdentityOutcome"
+    },
+    "overlap_permit": {
+      "default": false,
+      "title": "Overlap Permit",
+      "type": "boolean"
+    },
+    "prior_changed_winner": {
+      "default": false,
+      "title": "Prior Changed Winner",
+      "type": "boolean"
+    },
+    "reject_reason": {
+      "anyOf": [
+        {
+          "maxLength": 200,
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Reject Reason"
+    },
+    "required_similarity": {
+      "anyOf": [
+        {
+          "maximum": 1.0,
+          "minimum": -1.0,
+          "type": "number"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Required Similarity"
+    },
+    "subject": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/SubjectRef"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null
+    },
+    "tracklets": {
+      "items": {
+        "$ref": "#/$defs/TrackletRef"
+      },
+      "minItems": 1,
+      "title": "Tracklets",
+      "type": "array"
+    }
+  },
+  "required": [
+    "contract",
+    "contract_version",
+    "decision_id",
+    "tracklets",
+    "outcome",
+    "decided_at_us",
+    "evidence"
+  ],
+  "title": "IdentityDecision",
+  "type": "object"
+}

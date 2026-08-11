@@ -1,0 +1,285 @@
+{
+  "$defs": {
+    "CalibrationCandidateScore": {
+      "additionalProperties": false,
+      "properties": {
+        "gallery_exemplar_count": {
+          "default": 0,
+          "minimum": 0,
+          "title": "Gallery Exemplar Count",
+          "type": "integer"
+        },
+        "hard_allowed": {
+          "default": true,
+          "title": "Hard Allowed",
+          "type": "boolean"
+        },
+        "hard_constraint_reason": {
+          "anyOf": [
+            {
+              "maxLength": 200,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Hard Constraint Reason"
+        },
+        "identity_kind": {
+          "enum": [
+            "resident",
+            "visitor"
+          ],
+          "title": "Identity Kind",
+          "type": "string"
+        },
+        "raw_similarity": {
+          "maximum": 1.0,
+          "minimum": -1.0,
+          "title": "Raw Similarity",
+          "type": "number"
+        },
+        "subject_id": {
+          "maxLength": 240,
+          "minLength": 1,
+          "title": "Subject Id",
+          "type": "string"
+        }
+      },
+      "required": [
+        "subject_id",
+        "identity_kind",
+        "raw_similarity"
+      ],
+      "title": "CalibrationCandidateScore",
+      "type": "object"
+    },
+    "CalibrationEvidenceSource": {
+      "enum": [
+        "shadow",
+        "replay"
+      ],
+      "title": "CalibrationEvidenceSource",
+      "type": "string"
+    }
+  },
+  "additionalProperties": false,
+  "description": "Score-only shadow/replay evidence; biometric vectors are never serialized.",
+  "properties": {
+    "calibrated_confidence": {
+      "maximum": 1.0,
+      "minimum": 0.0,
+      "title": "Calibrated Confidence",
+      "type": "number"
+    },
+    "camera_id": {
+      "maxLength": 200,
+      "minLength": 1,
+      "title": "Camera Id",
+      "type": "string"
+    },
+    "candidates": {
+      "items": {
+        "$ref": "#/$defs/CalibrationCandidateScore"
+      },
+      "title": "Candidates",
+      "type": "array"
+    },
+    "contract": {
+      "const": "noesis.identity.shadow_score_evidence",
+      "title": "Contract",
+      "type": "string"
+    },
+    "contract_version": {
+      "const": 2,
+      "title": "Contract Version",
+      "type": "integer"
+    },
+    "embedding_dim": {
+      "minimum": 1,
+      "title": "Embedding Dim",
+      "type": "integer"
+    },
+    "event_id": {
+      "pattern": "^[0-9a-f]{64}$",
+      "title": "Event Id",
+      "type": "string"
+    },
+    "final_outcome": {
+      "enum": [
+        "resident",
+        "visitor",
+        "unknown"
+      ],
+      "title": "Final Outcome",
+      "type": "string"
+    },
+    "final_winner_id": {
+      "anyOf": [
+        {
+          "maxLength": 240,
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Final Winner Id"
+    },
+    "frame_id": {
+      "minimum": 0,
+      "title": "Frame Id",
+      "type": "integer"
+    },
+    "model_layer": {
+      "maxLength": 200,
+      "minLength": 1,
+      "title": "Model Layer",
+      "type": "string"
+    },
+    "model_semantic_profile_sha256": {
+      "pattern": "^[0-9a-f]{64}$",
+      "title": "Model Semantic Profile Sha256",
+      "type": "string"
+    },
+    "model_sha256": {
+      "pattern": "^[0-9a-f]{64}$",
+      "title": "Model Sha256",
+      "type": "string"
+    },
+    "observation_id": {
+      "maxLength": 200,
+      "minLength": 1,
+      "title": "Observation Id",
+      "type": "string"
+    },
+    "observed_at_us": {
+      "minimum": 1,
+      "title": "Observed At Us",
+      "type": "integer"
+    },
+    "pre_prior_winner_id": {
+      "anyOf": [
+        {
+          "maxLength": 240,
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Pre Prior Winner Id"
+    },
+    "previous_event_id": {
+      "anyOf": [
+        {
+          "pattern": "^[0-9a-f]{64}$",
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Previous Event Id"
+    },
+    "prior_changed_winner": {
+      "default": false,
+      "title": "Prior Changed Winner",
+      "type": "boolean"
+    },
+    "quality": {
+      "maximum": 1.0,
+      "minimum": 0.0,
+      "title": "Quality",
+      "type": "number"
+    },
+    "reject_reason": {
+      "anyOf": [
+        {
+          "maxLength": 200,
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Reject Reason"
+    },
+    "run_id": {
+      "maxLength": 200,
+      "minLength": 1,
+      "title": "Run Id",
+      "type": "string"
+    },
+    "runtime": {
+      "enum": [
+        "ds8",
+        "ds9",
+        "replay",
+        "test"
+      ],
+      "title": "Runtime",
+      "type": "string"
+    },
+    "runtime_mode": {
+      "enum": [
+        "shadow",
+        "authoritative"
+      ],
+      "title": "Runtime Mode",
+      "type": "string"
+    },
+    "sequence": {
+      "minimum": 0,
+      "title": "Sequence",
+      "type": "integer"
+    },
+    "session_id": {
+      "maxLength": 200,
+      "minLength": 1,
+      "title": "Session Id",
+      "type": "string"
+    },
+    "source": {
+      "$ref": "#/$defs/CalibrationEvidenceSource"
+    },
+    "tracker_id": {
+      "maxLength": 200,
+      "minLength": 1,
+      "title": "Tracker Id",
+      "type": "string"
+    }
+  },
+  "required": [
+    "contract",
+    "contract_version",
+    "event_id",
+    "sequence",
+    "observed_at_us",
+    "source",
+    "session_id",
+    "runtime",
+    "runtime_mode",
+    "run_id",
+    "camera_id",
+    "tracker_id",
+    "frame_id",
+    "observation_id",
+    "model_sha256",
+    "model_semantic_profile_sha256",
+    "model_layer",
+    "embedding_dim",
+    "quality",
+    "candidates",
+    "final_outcome",
+    "calibrated_confidence"
+  ],
+  "title": "ShadowIdentityEvidenceRecord",
+  "type": "object"
+}

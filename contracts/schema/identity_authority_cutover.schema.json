@@ -1,0 +1,171 @@
+{
+  "$defs": {
+    "IdentityAuthorityGateEvidence": {
+      "additionalProperties": false,
+      "description": "One immutable, owner-reviewed prerequisite for public identity cutover.",
+      "properties": {
+        "completed_at_us": {
+          "minimum": 1,
+          "title": "Completed At Us",
+          "type": "integer"
+        },
+        "evidence_kind": {
+          "enum": [
+            "whole_frame_coordinator_replay",
+            "occupied_scene_runtime"
+          ],
+          "title": "Evidence Kind",
+          "type": "string"
+        },
+        "evidence_path": {
+          "maxLength": 1024,
+          "minLength": 1,
+          "title": "Evidence Path",
+          "type": "string"
+        },
+        "evidence_revision": {
+          "maxLength": 200,
+          "minLength": 1,
+          "title": "Evidence Revision",
+          "type": "string"
+        },
+        "evidence_sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Evidence Sha256",
+          "type": "string"
+        },
+        "evidence_size_bytes": {
+          "maximum": 67108864,
+          "minimum": 1,
+          "title": "Evidence Size Bytes",
+          "type": "integer"
+        },
+        "passed": {
+          "const": true,
+          "title": "Passed",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "evidence_kind",
+        "evidence_path",
+        "evidence_sha256",
+        "evidence_size_bytes",
+        "evidence_revision",
+        "completed_at_us",
+        "passed"
+      ],
+      "title": "IdentityAuthorityGateEvidence",
+      "type": "object"
+    }
+  },
+  "additionalProperties": false,
+  "description": "Pinned evidence that may promote scorer output to public authority.\n\nThe calibration artifact deliberately authorizes only scorer policy.  This\nseparate artifact binds the exact runtime/code/topology surface to both a\ncoordinator replay and an occupied-scene validation report.",
+  "properties": {
+    "approved_at_us": {
+      "minimum": 1,
+      "title": "Approved At Us",
+      "type": "integer"
+    },
+    "approved_by": {
+      "maxLength": 200,
+      "minLength": 1,
+      "title": "Approved By",
+      "type": "string"
+    },
+    "authority_runtime_profile_sha256": {
+      "pattern": "^[0-9a-f]{64}$",
+      "title": "Authority Runtime Profile Sha256",
+      "type": "string"
+    },
+    "authority_scope": {
+      "const": "full_identity_runtime_public_cutover",
+      "title": "Authority Scope",
+      "type": "string"
+    },
+    "camera_ids": {
+      "items": {
+        "type": "string"
+      },
+      "maxItems": 64,
+      "minItems": 1,
+      "title": "Camera Ids",
+      "type": "array"
+    },
+    "camera_topology_sha256": {
+      "pattern": "^[0-9a-f]{64}$",
+      "title": "Camera Topology Sha256",
+      "type": "string"
+    },
+    "contract": {
+      "const": "noesis.identity.authority_cutover",
+      "title": "Contract",
+      "type": "string"
+    },
+    "contract_version": {
+      "const": 1,
+      "title": "Contract Version",
+      "type": "integer"
+    },
+    "coordinator_replay": {
+      "$ref": "#/$defs/IdentityAuthorityGateEvidence"
+    },
+    "embedding_dim": {
+      "minimum": 1,
+      "title": "Embedding Dim",
+      "type": "integer"
+    },
+    "model_layer": {
+      "maxLength": 200,
+      "minLength": 1,
+      "title": "Model Layer",
+      "type": "string"
+    },
+    "model_semantic_profile_sha256": {
+      "pattern": "^[0-9a-f]{64}$",
+      "title": "Model Semantic Profile Sha256",
+      "type": "string"
+    },
+    "model_sha256": {
+      "pattern": "^[0-9a-f]{64}$",
+      "title": "Model Sha256",
+      "type": "string"
+    },
+    "occupied_scene": {
+      "$ref": "#/$defs/IdentityAuthorityGateEvidence"
+    },
+    "runtime": {
+      "enum": [
+        "ds8",
+        "ds9"
+      ],
+      "title": "Runtime",
+      "type": "string"
+    },
+    "scoring_artifact_sha256": {
+      "pattern": "^[0-9a-f]{64}$",
+      "title": "Scoring Artifact Sha256",
+      "type": "string"
+    }
+  },
+  "required": [
+    "contract",
+    "contract_version",
+    "approved_at_us",
+    "approved_by",
+    "runtime",
+    "model_sha256",
+    "model_layer",
+    "embedding_dim",
+    "model_semantic_profile_sha256",
+    "scoring_artifact_sha256",
+    "authority_runtime_profile_sha256",
+    "camera_topology_sha256",
+    "camera_ids",
+    "authority_scope",
+    "coordinator_replay",
+    "occupied_scene"
+  ],
+  "title": "IdentityAuthorityCutoverArtifact",
+  "type": "object"
+}

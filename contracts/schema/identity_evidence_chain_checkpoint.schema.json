@@ -1,0 +1,91 @@
+{
+  "additionalProperties": false,
+  "description": "Tail/head checkpoint for one bounded score-evidence JSONL chain.",
+  "properties": {
+    "checkpoint_sha256": {
+      "pattern": "^[0-9a-f]{64}$",
+      "title": "Checkpoint Sha256",
+      "type": "string"
+    },
+    "contract": {
+      "const": "noesis.identity.shadow_score_evidence_chain",
+      "title": "Contract",
+      "type": "string"
+    },
+    "contract_version": {
+      "const": 1,
+      "title": "Contract Version",
+      "type": "integer"
+    },
+    "first_sequence": {
+      "anyOf": [
+        {
+          "minimum": 0,
+          "type": "integer"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "First Sequence"
+    },
+    "next_sequence": {
+      "minimum": 0,
+      "title": "Next Sequence",
+      "type": "integer"
+    },
+    "previous_event_id": {
+      "anyOf": [
+        {
+          "pattern": "^[0-9a-f]{64}$",
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Previous Event Id"
+    },
+    "retained_bytes": {
+      "minimum": 0,
+      "title": "Retained Bytes",
+      "type": "integer"
+    },
+    "retained_count": {
+      "minimum": 0,
+      "title": "Retained Count",
+      "type": "integer"
+    },
+    "tail_event_id": {
+      "anyOf": [
+        {
+          "pattern": "^[0-9a-f]{64}$",
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Tail Event Id"
+    },
+    "updated_at_us": {
+      "minimum": 1,
+      "title": "Updated At Us",
+      "type": "integer"
+    }
+  },
+  "required": [
+    "contract",
+    "contract_version",
+    "next_sequence",
+    "retained_count",
+    "retained_bytes",
+    "updated_at_us",
+    "checkpoint_sha256"
+  ],
+  "title": "IdentityEvidenceChainCheckpoint",
+  "type": "object"
+}

@@ -1,0 +1,114 @@
+{
+  "$defs": {
+    "CapabilityState": {
+      "additionalProperties": false,
+      "properties": {
+        "blockers": {
+          "default": [],
+          "items": {
+            "type": "string"
+          },
+          "title": "Blockers",
+          "type": "array"
+        },
+        "capability": {
+          "maxLength": 160,
+          "minLength": 1,
+          "title": "Capability",
+          "type": "string"
+        },
+        "checked_at_us": {
+          "minimum": 1,
+          "title": "Checked At Us",
+          "type": "integer"
+        },
+        "evidence": {
+          "title": "Evidence",
+          "type": "object"
+        },
+        "last_success_at_us": {
+          "anyOf": [
+            {
+              "minimum": 1,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Last Success At Us"
+        },
+        "status": {
+          "$ref": "#/$defs/CapabilityStatus"
+        }
+      },
+      "required": [
+        "capability",
+        "status",
+        "checked_at_us",
+        "evidence"
+      ],
+      "title": "CapabilityState",
+      "type": "object"
+    },
+    "CapabilityStatus": {
+      "enum": [
+        "healthy",
+        "degraded",
+        "failed",
+        "blocked",
+        "unknown"
+      ],
+      "title": "CapabilityStatus",
+      "type": "string"
+    }
+  },
+  "additionalProperties": false,
+  "properties": {
+    "capabilities": {
+      "items": {
+        "$ref": "#/$defs/CapabilityState"
+      },
+      "title": "Capabilities",
+      "type": "array"
+    },
+    "contract": {
+      "const": "noesis.capability.health",
+      "title": "Contract",
+      "type": "string"
+    },
+    "contract_version": {
+      "const": 1,
+      "title": "Contract Version",
+      "type": "integer"
+    },
+    "generated_at_us": {
+      "minimum": 1,
+      "title": "Generated At Us",
+      "type": "integer"
+    },
+    "instance_id": {
+      "maxLength": 160,
+      "minLength": 1,
+      "title": "Instance Id",
+      "type": "string"
+    },
+    "run_id": {
+      "maxLength": 160,
+      "minLength": 1,
+      "title": "Run Id",
+      "type": "string"
+    }
+  },
+  "required": [
+    "contract",
+    "contract_version",
+    "instance_id",
+    "run_id",
+    "generated_at_us",
+    "capabilities"
+  ],
+  "title": "CapabilityHealth",
+  "type": "object"
+}

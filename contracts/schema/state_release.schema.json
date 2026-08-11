@@ -1,0 +1,136 @@
+{
+  "$defs": {
+    "StateBaselineBinding": {
+      "additionalProperties": false,
+      "properties": {
+        "byte_count": {
+          "maximum": 9007199254740991,
+          "minimum": 0,
+          "title": "Byte Count",
+          "type": "integer"
+        },
+        "file_count": {
+          "maximum": 10000000,
+          "minimum": 1,
+          "title": "File Count",
+          "type": "integer"
+        },
+        "inventory_path": {
+          "title": "Inventory Path",
+          "type": "string"
+        },
+        "inventory_sha256": {
+          "pattern": "^[a-f0-9]{64}$",
+          "title": "Inventory Sha256",
+          "type": "string"
+        }
+      },
+      "required": [
+        "inventory_path",
+        "inventory_sha256",
+        "file_count",
+        "byte_count"
+      ],
+      "title": "StateBaselineBinding",
+      "type": "object"
+    },
+    "StateMigration": {
+      "additionalProperties": false,
+      "properties": {
+        "mode": {
+          "enum": [
+            "fresh",
+            "clone",
+            "migrate",
+            "import_ds8"
+          ],
+          "title": "Mode",
+          "type": "string"
+        },
+        "report_sha256": {
+          "pattern": "^[a-f0-9]{64}$",
+          "title": "Report Sha256",
+          "type": "string"
+        },
+        "tool_sha256": {
+          "pattern": "^[a-f0-9]{64}$",
+          "title": "Tool Sha256",
+          "type": "string"
+        }
+      },
+      "required": [
+        "mode",
+        "tool_sha256",
+        "report_sha256"
+      ],
+      "title": "StateMigration",
+      "type": "object"
+    }
+  },
+  "additionalProperties": false,
+  "properties": {
+    "baseline": {
+      "$ref": "#/$defs/StateBaselineBinding"
+    },
+    "contract": {
+      "const": "noesis.appliance.state_release",
+      "title": "Contract",
+      "type": "string"
+    },
+    "contract_version": {
+      "const": 1,
+      "title": "Contract Version",
+      "type": "integer"
+    },
+    "created_at": {
+      "title": "Created At",
+      "type": "string"
+    },
+    "migration": {
+      "$ref": "#/$defs/StateMigration"
+    },
+    "parent_release_id": {
+      "anyOf": [
+        {
+          "pattern": "^[a-z0-9][a-z0-9-]{5,63}$",
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "title": "Parent Release Id"
+    },
+    "release_id": {
+      "pattern": "^[a-z0-9][a-z0-9-]{5,63}$",
+      "title": "Release Id",
+      "type": "string"
+    },
+    "root": {
+      "title": "Root",
+      "type": "string"
+    },
+    "schemas": {
+      "additionalProperties": {
+        "maximum": 1000000,
+        "minimum": 1,
+        "type": "integer"
+      },
+      "title": "Schemas",
+      "type": "object"
+    }
+  },
+  "required": [
+    "contract",
+    "contract_version",
+    "release_id",
+    "parent_release_id",
+    "created_at",
+    "root",
+    "schemas",
+    "migration",
+    "baseline"
+  ],
+  "title": "StateRelease",
+  "type": "object"
+}

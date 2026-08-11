@@ -1,0 +1,64 @@
+{
+  "$defs": {
+    "StateBaselineFile": {
+      "additionalProperties": false,
+      "properties": {
+        "bytes": {
+          "maximum": 134217728,
+          "minimum": 0,
+          "title": "Bytes",
+          "type": "integer"
+        },
+        "sha256": {
+          "pattern": "^[a-f0-9]{64}$",
+          "title": "Sha256",
+          "type": "string"
+        }
+      },
+      "required": [
+        "sha256",
+        "bytes"
+      ],
+      "title": "StateBaselineFile",
+      "type": "object"
+    }
+  },
+  "additionalProperties": false,
+  "properties": {
+    "contract": {
+      "const": "noesis.appliance.state_baseline",
+      "title": "Contract",
+      "type": "string"
+    },
+    "contract_version": {
+      "const": 1,
+      "title": "Contract Version",
+      "type": "integer"
+    },
+    "created_at": {
+      "title": "Created At",
+      "type": "string"
+    },
+    "files": {
+      "additionalProperties": {
+        "$ref": "#/$defs/StateBaselineFile"
+      },
+      "title": "Files",
+      "type": "object"
+    },
+    "release_id": {
+      "pattern": "^[a-z0-9][a-z0-9-]{5,63}$",
+      "title": "Release Id",
+      "type": "string"
+    }
+  },
+  "required": [
+    "contract",
+    "contract_version",
+    "release_id",
+    "created_at",
+    "files"
+  ],
+  "title": "StateBaseline",
+  "type": "object"
+}

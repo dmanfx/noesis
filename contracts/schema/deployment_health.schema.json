@@ -1,0 +1,94 @@
+{
+  "additionalProperties": false,
+  "properties": {
+    "boot_id": {
+      "pattern": "^[a-z0-9][a-z0-9-]{5,63}$",
+      "title": "Boot Id",
+      "type": "string"
+    },
+    "contract": {
+      "const": "noesis.appliance.deployment_health",
+      "title": "Contract",
+      "type": "string"
+    },
+    "contract_version": {
+      "const": 1,
+      "title": "Contract Version",
+      "type": "integer"
+    },
+    "deployment_id": {
+      "pattern": "^[a-z0-9][a-z0-9-]{5,63}$",
+      "title": "Deployment Id",
+      "type": "string"
+    },
+    "generated_at_us": {
+      "maximum": 9007199254740991,
+      "minimum": 1,
+      "title": "Generated At Us",
+      "type": "integer"
+    },
+    "instance_id": {
+      "maxLength": 160,
+      "minLength": 1,
+      "title": "Instance Id",
+      "type": "string"
+    },
+    "ready": {
+      "const": true,
+      "title": "Ready",
+      "type": "boolean"
+    },
+    "run_id": {
+      "maxLength": 160,
+      "minLength": 1,
+      "title": "Run Id",
+      "type": "string"
+    },
+    "runtime_family": {
+      "enum": [
+        "ds8",
+        "ds9"
+      ],
+      "title": "Runtime Family",
+      "type": "string"
+    },
+    "runtime_variant": {
+      "maxLength": 128,
+      "minLength": 1,
+      "title": "Runtime Variant",
+      "type": "string"
+    },
+    "selector_sha256": {
+      "pattern": "^[a-f0-9]{64}$",
+      "title": "Selector Sha256",
+      "type": "string"
+    },
+    "software_revision": {
+      "pattern": "^(?:[a-f0-9]{40}|[a-f0-9]{64})$",
+      "title": "Software Revision",
+      "type": "string"
+    },
+    "state_release_id": {
+      "pattern": "^[a-z0-9][a-z0-9-]{5,63}$",
+      "title": "State Release Id",
+      "type": "string"
+    }
+  },
+  "required": [
+    "contract",
+    "contract_version",
+    "deployment_id",
+    "selector_sha256",
+    "state_release_id",
+    "runtime_family",
+    "runtime_variant",
+    "instance_id",
+    "run_id",
+    "boot_id",
+    "software_revision",
+    "generated_at_us",
+    "ready"
+  ],
+  "title": "DeploymentHealth",
+  "type": "object"
+}

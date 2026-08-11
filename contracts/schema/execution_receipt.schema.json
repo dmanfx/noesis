@@ -1,0 +1,110 @@
+{
+  "$defs": {
+    "ActionStatus": {
+      "enum": [
+        "proposed",
+        "awaiting_approval",
+        "executing",
+        "succeeded",
+        "failed",
+        "uncertain",
+        "rejected"
+      ],
+      "title": "ActionStatus",
+      "type": "string"
+    }
+  },
+  "additionalProperties": false,
+  "properties": {
+    "action_id": {
+      "maxLength": 200,
+      "minLength": 1,
+      "title": "Action Id",
+      "type": "string"
+    },
+    "completed_at_us": {
+      "minimum": 1,
+      "title": "Completed At Us",
+      "type": "integer"
+    },
+    "contract": {
+      "const": "noesis.action.receipt",
+      "title": "Contract",
+      "type": "string"
+    },
+    "contract_version": {
+      "const": 1,
+      "title": "Contract Version",
+      "type": "integer"
+    },
+    "error": {
+      "anyOf": [
+        {
+          "maxLength": 500,
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Error"
+    },
+    "provider": {
+      "maxLength": 160,
+      "minLength": 1,
+      "title": "Provider",
+      "type": "string"
+    },
+    "provider_result": {
+      "anyOf": [
+        {
+          "type": "object"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Provider Result"
+    },
+    "readback": {
+      "anyOf": [
+        {
+          "type": "object"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Readback"
+    },
+    "receipt_id": {
+      "maxLength": 200,
+      "minLength": 1,
+      "title": "Receipt Id",
+      "type": "string"
+    },
+    "started_at_us": {
+      "minimum": 1,
+      "title": "Started At Us",
+      "type": "integer"
+    },
+    "status": {
+      "$ref": "#/$defs/ActionStatus"
+    }
+  },
+  "required": [
+    "contract",
+    "contract_version",
+    "receipt_id",
+    "action_id",
+    "status",
+    "started_at_us",
+    "completed_at_us",
+    "provider"
+  ],
+  "title": "ExecutionReceipt",
+  "type": "object"
+}

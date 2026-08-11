@@ -1,0 +1,314 @@
+{
+  "$defs": {
+    "ApplianceEndpoints": {
+      "additionalProperties": false,
+      "properties": {
+        "rest": {
+          "const": "http://127.0.0.1:8080",
+          "title": "Rest",
+          "type": "string"
+        },
+        "rtsp": {
+          "const": "rtsp://127.0.0.1:8554/mosaic",
+          "title": "Rtsp",
+          "type": "string"
+        },
+        "websocket": {
+          "const": "ws://127.0.0.1:6008",
+          "title": "Websocket",
+          "type": "string"
+        }
+      },
+      "required": [
+        "websocket",
+        "rest",
+        "rtsp"
+      ],
+      "title": "ApplianceEndpoints",
+      "type": "object"
+    },
+    "ApplianceReadinessVersions": {
+      "additionalProperties": false,
+      "properties": {
+        "capability_contract_version": {
+          "const": 1,
+          "title": "Capability Contract Version",
+          "type": "integer"
+        },
+        "deployment_health_contract_version": {
+          "const": 1,
+          "title": "Deployment Health Contract Version",
+          "type": "integer"
+        },
+        "websocket_health_contract_version": {
+          "const": 2,
+          "title": "Websocket Health Contract Version",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "capability_contract_version",
+        "deployment_health_contract_version",
+        "websocket_health_contract_version"
+      ],
+      "title": "ApplianceReadinessVersions",
+      "type": "object"
+    },
+    "CheckoutBinding": {
+      "additionalProperties": false,
+      "properties": {
+        "root": {
+          "title": "Root",
+          "type": "string"
+        },
+        "snapshot_kind": {
+          "enum": [
+            "menon-runtime-v1",
+            "noesis-runtime-v1"
+          ],
+          "title": "Snapshot Kind",
+          "type": "string"
+        },
+        "snapshot_sha256": {
+          "pattern": "^[a-f0-9]{64}$",
+          "title": "Snapshot Sha256",
+          "type": "string"
+        },
+        "software_revision": {
+          "pattern": "^(?:[a-f0-9]{40}|[a-f0-9]{64})$",
+          "title": "Software Revision",
+          "type": "string"
+        }
+      },
+      "required": [
+        "root",
+        "snapshot_kind",
+        "snapshot_sha256",
+        "software_revision"
+      ],
+      "title": "CheckoutBinding",
+      "type": "object"
+    },
+    "DS8RuntimeSelector": {
+      "additionalProperties": false,
+      "properties": {
+        "family": {
+          "const": "ds8",
+          "title": "Family",
+          "type": "string"
+        },
+        "model_size": {
+          "enum": [
+            "n",
+            "s",
+            "m",
+            "l",
+            "x"
+          ],
+          "title": "Model Size",
+          "type": "string"
+        },
+        "pgie_profile": {
+          "enum": [
+            "yolo11",
+            "yolo11_seg",
+            "yolo26",
+            "yolo26_seg",
+            "rfdetr",
+            "rfdetr_seg",
+            "wholebody49"
+          ],
+          "title": "Pgie Profile",
+          "type": "string"
+        },
+        "tracking_mode": {
+          "enum": [
+            "baseline",
+            "v3dt"
+          ],
+          "title": "Tracking Mode",
+          "type": "string"
+        }
+      },
+      "required": [
+        "family",
+        "pgie_profile",
+        "model_size",
+        "tracking_mode"
+      ],
+      "title": "DS8RuntimeSelector",
+      "type": "object"
+    },
+    "DS9RuntimeSelector": {
+      "additionalProperties": false,
+      "properties": {
+        "artifact_root": {
+          "title": "Artifact Root",
+          "type": "string"
+        },
+        "asset_realization_sha256": {
+          "pattern": "^[a-f0-9]{64}$",
+          "title": "Asset Realization Sha256",
+          "type": "string"
+        },
+        "build_image_id": {
+          "pattern": "^sha256:[a-f0-9]{64}$",
+          "title": "Build Image Id",
+          "type": "string"
+        },
+        "docker_root": {
+          "title": "Docker Root",
+          "type": "string"
+        },
+        "family": {
+          "const": "ds9",
+          "title": "Family",
+          "type": "string"
+        },
+        "lane": {
+          "enum": [
+            "baseline",
+            "v3dt",
+            "wholebody49-s",
+            "wholebody49-x"
+          ],
+          "title": "Lane",
+          "type": "string"
+        },
+        "ownership_matrix_sha256": {
+          "pattern": "^[a-f0-9]{64}$",
+          "title": "Ownership Matrix Sha256",
+          "type": "string"
+        },
+        "runtime_image_id": {
+          "pattern": "^sha256:[a-f0-9]{64}$",
+          "title": "Runtime Image Id",
+          "type": "string"
+        },
+        "runtime_root": {
+          "title": "Runtime Root",
+          "type": "string"
+        },
+        "supervisor_path": {
+          "title": "Supervisor Path",
+          "type": "string"
+        }
+      },
+      "required": [
+        "family",
+        "lane",
+        "supervisor_path",
+        "runtime_image_id",
+        "build_image_id",
+        "docker_root",
+        "artifact_root",
+        "runtime_root",
+        "asset_realization_sha256",
+        "ownership_matrix_sha256"
+      ],
+      "title": "DS9RuntimeSelector",
+      "type": "object"
+    },
+    "StateReleaseBinding": {
+      "additionalProperties": false,
+      "properties": {
+        "manifest_path": {
+          "title": "Manifest Path",
+          "type": "string"
+        },
+        "manifest_sha256": {
+          "pattern": "^[a-f0-9]{64}$",
+          "title": "Manifest Sha256",
+          "type": "string"
+        },
+        "release_id": {
+          "pattern": "^[a-z0-9][a-z0-9-]{5,63}$",
+          "title": "Release Id",
+          "type": "string"
+        }
+      },
+      "required": [
+        "release_id",
+        "manifest_path",
+        "manifest_sha256"
+      ],
+      "title": "StateReleaseBinding",
+      "type": "object"
+    }
+  },
+  "additionalProperties": false,
+  "properties": {
+    "bundle_sha256": {
+      "pattern": "^[a-f0-9]{64}$",
+      "title": "Bundle Sha256",
+      "type": "string"
+    },
+    "contract": {
+      "const": "noesis.appliance.deployment_selector",
+      "title": "Contract",
+      "type": "string"
+    },
+    "contract_version": {
+      "const": 1,
+      "title": "Contract Version",
+      "type": "integer"
+    },
+    "created_at": {
+      "title": "Created At",
+      "type": "string"
+    },
+    "deployment_id": {
+      "pattern": "^[a-z0-9][a-z0-9-]{5,63}$",
+      "title": "Deployment Id",
+      "type": "string"
+    },
+    "endpoints": {
+      "$ref": "#/$defs/ApplianceEndpoints"
+    },
+    "menon_checkout": {
+      "$ref": "#/$defs/CheckoutBinding"
+    },
+    "noesis_checkout": {
+      "$ref": "#/$defs/CheckoutBinding"
+    },
+    "readiness": {
+      "$ref": "#/$defs/ApplianceReadinessVersions"
+    },
+    "runtime": {
+      "discriminator": {
+        "mapping": {
+          "ds8": "#/$defs/DS8RuntimeSelector",
+          "ds9": "#/$defs/DS9RuntimeSelector"
+        },
+        "propertyName": "family"
+      },
+      "oneOf": [
+        {
+          "$ref": "#/$defs/DS8RuntimeSelector"
+        },
+        {
+          "$ref": "#/$defs/DS9RuntimeSelector"
+        }
+      ],
+      "title": "Runtime"
+    },
+    "state_release": {
+      "$ref": "#/$defs/StateReleaseBinding"
+    }
+  },
+  "required": [
+    "contract",
+    "contract_version",
+    "deployment_id",
+    "created_at",
+    "bundle_sha256",
+    "menon_checkout",
+    "noesis_checkout",
+    "state_release",
+    "endpoints",
+    "runtime",
+    "readiness"
+  ],
+  "title": "DeploymentSelector",
+  "type": "object"
+}

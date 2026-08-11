@@ -62,4 +62,5 @@ huggingface_hub>=0.20
 zarr>=2.16
 numcodecs>=0.11
 fastapi>=0.110
+pydantic>=2.10,<3
 uvicorn[standard]>=0.30 

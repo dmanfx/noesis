@@ -1,0 +1,19 @@
+{
+  "capabilities": [
+    {
+      "blockers": [],
+      "capability": "tracking",
+      "checked_at_us": 1000010,
+      "evidence": {
+        "sequence": 4
+      },
+      "last_success_at_us": 1000009,
+      "status": "healthy"
+    }
+  ],
+  "contract": "noesis.capability.health",
+  "contract_version": 1,
+  "generated_at_us": 1000010,
+  "instance_id": "appliance",
+  "run_id": "fixture-run-1"
+}

@@ -1,0 +1,112 @@
+{
+  "$defs": {
+    "ActorRef": {
+      "additionalProperties": false,
+      "properties": {
+        "actor_id": {
+          "maxLength": 160,
+          "minLength": 1,
+          "title": "Actor Id",
+          "type": "string"
+        },
+        "role": {
+          "$ref": "#/$defs/ActorRole"
+        },
+        "session_id": {
+          "anyOf": [
+            {
+              "maxLength": 200,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Session Id"
+        }
+      },
+      "required": [
+        "actor_id",
+        "role"
+      ],
+      "title": "ActorRef",
+      "type": "object"
+    },
+    "ActorRole": {
+      "enum": [
+        "viewer",
+        "operator",
+        "owner",
+        "agent",
+        "automation"
+      ],
+      "title": "ActorRole",
+      "type": "string"
+    }
+  },
+  "additionalProperties": false,
+  "properties": {
+    "action_id": {
+      "maxLength": 200,
+      "minLength": 1,
+      "title": "Action Id",
+      "type": "string"
+    },
+    "approval_id": {
+      "maxLength": 200,
+      "minLength": 1,
+      "title": "Approval Id",
+      "type": "string"
+    },
+    "approver": {
+      "$ref": "#/$defs/ActorRef"
+    },
+    "contract": {
+      "const": "noesis.action.approval",
+      "title": "Contract",
+      "type": "string"
+    },
+    "contract_version": {
+      "const": 1,
+      "title": "Contract Version",
+      "type": "integer"
+    },
+    "decision": {
+      "enum": [
+        "approve",
+        "reject"
+      ],
+      "title": "Decision",
+      "type": "string"
+    },
+    "expires_at_us": {
+      "minimum": 1,
+      "title": "Expires At Us",
+      "type": "integer"
+    },
+    "issued_at_us": {
+      "minimum": 1,
+      "title": "Issued At Us",
+      "type": "integer"
+    },
+    "one_use": {
+      "const": true,
+      "default": true,
+      "title": "One Use",
+      "type": "boolean"
+    }
+  },
+  "required": [
+    "contract",
+    "contract_version",
+    "approval_id",
+    "action_id",
+    "approver",
+    "issued_at_us",
+    "expires_at_us",
+    "decision"
+  ],
+  "title": "ActionApproval",
+  "type": "object"
+}

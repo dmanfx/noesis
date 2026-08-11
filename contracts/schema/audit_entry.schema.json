@@ -1,0 +1,139 @@
+{
+  "$defs": {
+    "ActorRef": {
+      "additionalProperties": false,
+      "properties": {
+        "actor_id": {
+          "maxLength": 160,
+          "minLength": 1,
+          "title": "Actor Id",
+          "type": "string"
+        },
+        "role": {
+          "$ref": "#/$defs/ActorRole"
+        },
+        "session_id": {
+          "anyOf": [
+            {
+              "maxLength": 200,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Session Id"
+        }
+      },
+      "required": [
+        "actor_id",
+        "role"
+      ],
+      "title": "ActorRef",
+      "type": "object"
+    },
+    "ActorRole": {
+      "enum": [
+        "viewer",
+        "operator",
+        "owner",
+        "agent",
+        "automation"
+      ],
+      "title": "ActorRole",
+      "type": "string"
+    }
+  },
+  "additionalProperties": false,
+  "properties": {
+    "action_id": {
+      "anyOf": [
+        {
+          "maxLength": 200,
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Action Id"
+    },
+    "actor": {
+      "$ref": "#/$defs/ActorRef"
+    },
+    "audit_id": {
+      "maxLength": 200,
+      "minLength": 1,
+      "title": "Audit Id",
+      "type": "string"
+    },
+    "contract": {
+      "const": "noesis.audit.entry",
+      "title": "Contract",
+      "type": "string"
+    },
+    "contract_version": {
+      "const": 1,
+      "title": "Contract Version",
+      "type": "integer"
+    },
+    "entry_sha256": {
+      "title": "Entry Sha256",
+      "type": "string"
+    },
+    "event": {
+      "maxLength": 200,
+      "minLength": 1,
+      "title": "Event",
+      "type": "string"
+    },
+    "occurred_at_us": {
+      "minimum": 1,
+      "title": "Occurred At Us",
+      "type": "integer"
+    },
+    "previous_entry_sha256": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Previous Entry Sha256"
+    },
+    "receipt_id": {
+      "anyOf": [
+        {
+          "maxLength": 200,
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Receipt Id"
+    },
+    "redacted_details": {
+      "title": "Redacted Details",
+      "type": "object"
+    }
+  },
+  "required": [
+    "contract",
+    "contract_version",
+    "audit_id",
+    "occurred_at_us",
+    "actor",
+    "event",
+    "redacted_details",
+    "entry_sha256"
+  ],
+  "title": "AuditEntry",
+  "type": "object"
+}

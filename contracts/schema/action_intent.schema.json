@@ -1,0 +1,135 @@
+{
+  "$defs": {
+    "ActionRisk": {
+      "enum": [
+        "routine",
+        "sensitive",
+        "destructive"
+      ],
+      "title": "ActionRisk",
+      "type": "string"
+    },
+    "ActorRef": {
+      "additionalProperties": false,
+      "properties": {
+        "actor_id": {
+          "maxLength": 160,
+          "minLength": 1,
+          "title": "Actor Id",
+          "type": "string"
+        },
+        "role": {
+          "$ref": "#/$defs/ActorRole"
+        },
+        "session_id": {
+          "anyOf": [
+            {
+              "maxLength": 200,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Session Id"
+        }
+      },
+      "required": [
+        "actor_id",
+        "role"
+      ],
+      "title": "ActorRef",
+      "type": "object"
+    },
+    "ActorRole": {
+      "enum": [
+        "viewer",
+        "operator",
+        "owner",
+        "agent",
+        "automation"
+      ],
+      "title": "ActorRole",
+      "type": "string"
+    }
+  },
+  "additionalProperties": false,
+  "properties": {
+    "action_id": {
+      "maxLength": 200,
+      "minLength": 1,
+      "title": "Action Id",
+      "type": "string"
+    },
+    "actor": {
+      "$ref": "#/$defs/ActorRef"
+    },
+    "capability": {
+      "maxLength": 160,
+      "minLength": 1,
+      "title": "Capability",
+      "type": "string"
+    },
+    "contract": {
+      "const": "noesis.action.intent",
+      "title": "Contract",
+      "type": "string"
+    },
+    "contract_version": {
+      "const": 1,
+      "title": "Contract Version",
+      "type": "integer"
+    },
+    "idempotency_key": {
+      "maxLength": 240,
+      "minLength": 16,
+      "title": "Idempotency Key",
+      "type": "string"
+    },
+    "parameters": {
+      "title": "Parameters",
+      "type": "object"
+    },
+    "precondition": {
+      "anyOf": [
+        {
+          "type": "object"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Precondition"
+    },
+    "requested_at_us": {
+      "minimum": 1,
+      "title": "Requested At Us",
+      "type": "integer"
+    },
+    "risk": {
+      "$ref": "#/$defs/ActionRisk"
+    },
+    "target": {
+      "maxLength": 240,
+      "minLength": 1,
+      "title": "Target",
+      "type": "string"
+    }
+  },
+  "required": [
+    "contract",
+    "contract_version",
+    "action_id",
+    "idempotency_key",
+    "actor",
+    "capability",
+    "target",
+    "parameters",
+    "requested_at_us",
+    "risk"
+  ],
+  "title": "ActionIntent",
+  "type": "object"
+}

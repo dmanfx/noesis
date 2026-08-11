@@ -1,0 +1,68 @@
+{
+  "additionalProperties": false,
+  "description": "Supervisor-to-runtime identity handoff after host-side selector proof.",
+  "properties": {
+    "boot_id": {
+      "pattern": "^[a-z0-9][a-z0-9-]{5,63}$",
+      "title": "Boot Id",
+      "type": "string"
+    },
+    "contract": {
+      "const": "noesis.appliance.runtime_context",
+      "title": "Contract",
+      "type": "string"
+    },
+    "contract_version": {
+      "const": 1,
+      "title": "Contract Version",
+      "type": "integer"
+    },
+    "deployment_id": {
+      "pattern": "^[a-z0-9][a-z0-9-]{5,63}$",
+      "title": "Deployment Id",
+      "type": "string"
+    },
+    "runtime_family": {
+      "enum": [
+        "ds8",
+        "ds9"
+      ],
+      "title": "Runtime Family",
+      "type": "string"
+    },
+    "runtime_variant": {
+      "maxLength": 128,
+      "minLength": 1,
+      "title": "Runtime Variant",
+      "type": "string"
+    },
+    "selector_sha256": {
+      "pattern": "^[a-f0-9]{64}$",
+      "title": "Selector Sha256",
+      "type": "string"
+    },
+    "software_revision": {
+      "pattern": "^(?:[a-f0-9]{40}|[a-f0-9]{64})$",
+      "title": "Software Revision",
+      "type": "string"
+    },
+    "state_release_id": {
+      "pattern": "^[a-z0-9][a-z0-9-]{5,63}$",
+      "title": "State Release Id",
+      "type": "string"
+    }
+  },
+  "required": [
+    "contract",
+    "contract_version",
+    "deployment_id",
+    "selector_sha256",
+    "state_release_id",
+    "runtime_family",
+    "runtime_variant",
+    "boot_id",
+    "software_revision"
+  ],
+  "title": "RuntimeDeploymentContext",
+  "type": "object"
+}

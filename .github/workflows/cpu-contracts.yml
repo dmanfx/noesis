@@ -1,0 +1,36 @@
+name: CPU contracts
+
+on:
+  pull_request:
+  push:
+    branches: [Devel, main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: cpu-contracts-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  contracts:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements-ci.txt
+      - name: Install static-analysis tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes ripgrep
+      - name: Install CPU contract dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install --index-url https://download.pytorch.org/whl/cpu torch==2.7.1
+          python -m pip install -r requirements-ci.txt
+      - name: Run schema, static, unit, and documentation gates
+        run: bash scripts/run_cpu_contract_gates.sh

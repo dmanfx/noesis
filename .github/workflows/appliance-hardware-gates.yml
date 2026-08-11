@@ -1,0 +1,51 @@
+name: Appliance hardware gate
+
+on:
+  workflow_dispatch:
+    inputs:
+      gate:
+        description: Hardware validation to execute on the dedicated appliance runner
+        required: true
+        type: choice
+        options:
+          - ds8-runtime-30s
+          - zero-copy-runtime
+      confirmation:
+        description: Type RUN-DISRUPTIVE-GATE after reserving the canonical ports
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  hardware:
+    if: ${{ inputs.confirmation == 'RUN-DISRUPTIVE-GATE' }}
+    runs-on: [self-hosted, linux, x64, noesis-gpu]
+    timeout-minutes: 30
+    concurrency:
+      group: noesis-appliance-canonical-runtime
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+      - name: Verify appliance SDK and GPU contract
+        run: |
+          test -x /opt/nvidia/deepstream/deepstream-8.0/bin/deepstream-app
+          nvidia-smi --query-gpu=uuid,driver_version --format=csv,noheader
+          /opt/nvidia/deepstream/deepstream-8.0/bin/deepstream-app --version-all
+      - name: Run selected real-hardware gate
+        env:
+          SELECTED_GATE: ${{ inputs.gate }}
+        run: |
+          case "${SELECTED_GATE}" in
+            ds8-runtime-30s)
+              python3 scripts/ds8_runtime_30s_gate.py --duration-s 30
+              ;;
+            zero-copy-runtime)
+              python3 scripts/zero_copy_runtime_gate.py --duration-s 60
+              ;;
+            *)
+              echo "Unsupported hardware gate: ${SELECTED_GATE}" >&2
+              exit 2
+              ;;
+          esac

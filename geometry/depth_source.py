@@ -8315,6 +8315,7 @@ class MapAnythingDepthSource:
         self.session = requests.Session()
         self.logger = RateLimitedLogger(logging.getLogger(__name__), rate_limit_seconds=2.0)
         self.min_conf = float(self.config.performance.min_conf)
+        self._storage_commit_timeout_s = resolve_depth_store_commit_timeout_s()
         self.storage = DepthStorageManager(
             Path(self.config.storage.depth_base),
             max_snapshots_per_camera=self.config.storage.max_snapshots_per_camera,
@@ -8357,15 +8358,13 @@ class MapAnythingDepthSource:
         self._multi_scene_counter = 0
 
     def close(self) -> None:
-        try:
-            self._stop_batch_worker()
-        except Exception:
-            pass
-        try:
-            self.storage.flush(timeout=2.0)
-            self.storage.shutdown(wait=False)
-        except Exception:
-            pass
+        self._stop_batch_worker()
+        flush_receipt = self.storage.flush(timeout=2.0)
+        if not flush_receipt.completed or flush_receipt.poison is not None:
+            raise DepthStorageError(f"depth storage flush failed during close: {flush_receipt}")
+        shutdown_receipt = self.storage.shutdown(wait=True, timeout=2.0)
+        if not shutdown_receipt.completed:
+            raise DepthStorageError(f"depth storage shutdown timed out: {shutdown_receipt}")
 
     def should_infer(self, camera_id: str, timestamp_s: float) -> bool:
         last = self.last_request_per_camera.get(camera_id)
@@ -8558,7 +8557,8 @@ class MapAnythingDepthSource:
     ) -> DepthResult:
         depth_aligned, conf_aligned, mask_aligned = self._align_to_original_shape(depth, conf, mask, view_result)
         ts_us = int(timestamp_s * 1_000_000)
-        storage_path = self.storage.store(camera_id, ts_us, depth_aligned, conf_aligned, mask_aligned)
+        storage_handle = self.storage.store(camera_id, ts_us, depth_aligned, conf_aligned, mask_aligned)
+        storage_path = storage_handle.wait(timeout=self._storage_commit_timeout_s).path
         summary = self._compute_summary(depth_aligned, conf_aligned, mask_aligned)
         return DepthResult(
             camera_id=camera_id,
@@ -8886,7 +8886,20 @@ class MapAnythingDepthSource:
         max_extent_m: float = 20.0,
         cache_only: bool = False,
     ) -> Dict[str, Any]:
-        """Generate a per-camera top-down (XZ) blueprint view from the latest depth snapshot."""
+        """Generate a floorplan through the canonical storage implementation."""
+        calibration_bundle = getattr(self, "calibration_bundle", None)
+        if isinstance(calibration_bundle, Mapping):
+            self.storage.calibration_bundle = calibration_bundle
+        return self.storage.generate_topdown_floorplan(
+            camera_id,
+            max_age_sec=max_age_sec,
+            grid_res_m=grid_res_m,
+            max_extent_m=max_extent_m,
+            cache_only=cache_only,
+        )
+
+        # Historical inline implementation retained temporarily below for
+        # source compatibility; all calls return through the canonical path.
         if not camera_id:
             return {'error': 'camera_required', 'ts': int(time.time() * 1_000_000)}
 
@@ -8950,6 +8963,13 @@ class MapAnythingDepthSource:
                 payload['served_from_cache'] = True
                 return payload
 
+        if cache_only:
+            return {
+                'error': 'no_cached_floorplan',
+                'camera_id': camera_id,
+                'ts': now_us,
+            }
+
         max_age_us = int(max(0.0, max_age_sec) * 1_000_000)
         ts_cutoff = now_us - max_age_us if max_age_us > 0 else None
 
@@ -8965,7 +8985,18 @@ class MapAnythingDepthSource:
             if snapshot_ts is None or snapshot_ts < ts_cutoff:
                 return {'error': 'stale_depth', 'camera_id': camera_id, 'ts': now_us}
 
-        datasets = self.storage.load_datasets(path_entry)
+        try:
+            with self.storage.acquire_read_lease(path_entry) as snapshot_lease:
+                selected_descriptor = self.storage.describe_snapshot(
+                    path_entry,
+                    lease=snapshot_lease,
+                )
+                datasets = self.storage.load_datasets(
+                    path_entry,
+                    lease=snapshot_lease,
+                )
+        except DepthStorageError:
+            return {'error': 'load_failed', 'camera_id': camera_id, 'ts': now_us}
         if not datasets:
             return {'error': 'load_failed', 'camera_id': camera_id, 'ts': now_us}
 
@@ -9064,12 +9095,10 @@ class MapAnythingDepthSource:
         except np.linalg.LinAlgError:
             return {'error': 'extrinsics_singular', 'camera_id': camera_id, 'ts': now_us}
 
-        pts_cam_h = np.concatenate([pts_cam, np.ones((pts_cam.shape[0], 1), dtype=np.float32)], axis=1)
-        pts_world_h = pts_cam_h @ twc.T
-        pts_world = pts_world_h[:, :3]
-
         pts_depth = pts_cam[:, 2]
-        pts_y = pts_world[:, 1]
+        # K/unprojection and E use the same OpenCV camera axes: +X right,
+        # +Y image-down, +Z forward. Twc maps that convention into world Y-up.
+        pts_y = _world_y_from_camera_points(pts_cam, twc)
         x_cam_pts = pts_cam[:, 0]
         z_cam_pts = pts_cam[:, 2]
 
@@ -9078,14 +9107,6 @@ class MapAnythingDepthSource:
         floor_est_meta: Dict[str, Any] = {"mode": "uninitialized"}
         pts_y_agl = pts_y
         try:
-            twc_row_y = twc[1].astype(np.float32, copy=False)
-            pts_y_agl = (
-                (pts_cam[:, 0] * twc_row_y[0])
-                + ((-pts_cam[:, 1]) * twc_row_y[1])
-                + (pts_cam[:, 2] * twc_row_y[2])
-                + twc_row_y[3]
-            ).astype(np.float32, copy=False)
-
             valid_normals = valid & mask
             normals_cam = DepthStorageManager._compute_normals(
                 depth.astype(np.float32, copy=False),
@@ -9096,7 +9117,6 @@ class MapAnythingDepthSource:
                 cy,
             )
             normals_cam = np.asarray(normals_cam, dtype=np.float32)
-            normals_cam[..., 1] *= -1.0
             normals_cam_flat = normals_cam[valid]
             r_wc = twc[:3, :3].astype(np.float32, copy=False)
             normals_world_flat = (r_wc @ normals_cam_flat.T).T
@@ -9118,29 +9138,31 @@ class MapAnythingDepthSource:
         height_agl_pts = (pts_y_agl - float(floor_y)).astype(np.float32, copy=False)
         height_agl_pts = np.clip(height_agl_pts, 0.0, float(_FLOORPLAN_AGL_HEIGHT_CLIP_M)).astype(np.float32, copy=False)
 
+        # Match the storage-owned floorplan path: record and apply one bounded
+        # low-percentile correction before any grid aggregation or payload assembly.
+        height_agl_pts, agl_floor_offset_m = _normalize_floorplan_agl_heights(
+            height_agl_pts,
+            mask[valid] & (conf_clamped[valid] >= 0.2),
+        )
+
         if x_cam_pts.size == 0 or z_cam_pts.size == 0:
             return {'error': 'no_points', 'camera_id': camera_id, 'ts': now_us, 'point_count': 0}
 
         pad_x = max(0.5, grid_res_m * 2.0)
         pad_z = max(0.5, grid_res_m * 2.0)
 
-        max_x_abs = float(np.max(np.abs(x_cam_pts))) if x_cam_pts.size else 0.0
-        if not np.isfinite(max_x_abs):
-            max_x_abs = 0.0
-        forward_max = float(np.max(z_cam_pts)) if z_cam_pts.size else 0.0
-        if not np.isfinite(forward_max):
-            forward_max = 0.0
-
-        half_width = max_x_abs + pad_x
-        forward_extent = max(0.0, forward_max) + pad_z
-        if max_extent_m > 0:
-            max_extent = float(max_extent_m)
-            min_half_width = max_extent * float(_FLOORPLAN_MIN_HALF_WIDTH_FRACTION)
-            min_forward = max_extent * float(_FLOORPLAN_MIN_FORWARD_FRACTION)
-            half_width = max(half_width, min_half_width)
-            forward_extent = max(forward_extent, min_forward)
-            half_width = min(half_width, max_extent)
-            forward_extent = min(forward_extent, max_extent)
+        half_width, forward_extent, bounds_meta = _resolve_floorplan_extents(
+            x_camera=x_cam_pts,
+            z_camera=z_cam_pts,
+            image_shape=depth.shape,
+            intrinsics=(fx, fy, cx, cy),
+            camera_to_world=twc,
+            calibration_bundle=calib_bundle,
+            grid_res_m=grid_res_m,
+            max_extent_m=max_extent_m,
+            pad_x_m=pad_x,
+            pad_z_m=pad_z,
+        )
 
         half_width = max(half_width, grid_res_m * 0.5)
         forward_extent = max(forward_extent, grid_res_m)
@@ -9153,6 +9175,32 @@ class MapAnythingDepthSource:
         width_m = max_x - min_x
         height_m = max_z - min_z
 
+        in_bounds = (
+            (x_cam_pts >= min_x)
+            & (x_cam_pts <= max_x)
+            & (z_cam_pts >= min_z)
+            & (z_cam_pts <= max_z)
+        )
+        bounds_meta["input_point_count"] = int(x_cam_pts.size)
+        omitted_point_count = int(np.count_nonzero(~in_bounds))
+        if omitted_point_count:
+            x_cam_pts = x_cam_pts[in_bounds]
+            z_cam_pts = z_cam_pts[in_bounds]
+            pts_cam = pts_cam[in_bounds]
+            pts_depth = pts_depth[in_bounds]
+            pts_y = pts_y[in_bounds]
+            pts_y_agl = pts_y_agl[in_bounds]
+            height_agl_pts = height_agl_pts[in_bounds]
+            pts_weight = pts_weight[in_bounds]
+        if x_cam_pts.size == 0:
+            return {
+                'error': 'no_points_in_stable_bounds',
+                'camera_id': camera_id,
+                'ts': now_us,
+                'point_count': 0,
+            }
+        bounds_meta["omitted_outlier_point_count"] = omitted_point_count
+
         w_px = max(1, int(np.ceil(width_m / grid_res_m)))
         h_px = max(1, int(np.ceil(height_m / grid_res_m)))
 
@@ -9162,7 +9210,8 @@ class MapAnythingDepthSource:
         z_idx = np.clip(np.floor((1.0 - z_norm) * h_px).astype(np.int32), 0, h_px - 1)
 
         density_grid = np.zeros((h_px, w_px), dtype=np.float32)
-        distance_sum = np.zeros((h_px, w_px), dtype=np.float32)
+        distance_sum = np.zeros((h_px, w_px), dtype=np.float64)
+        distance_weight_sum = np.zeros((h_px, w_px), dtype=np.float64)
         distance_count = np.zeros((h_px, w_px), dtype=np.uint32)
         height_grid = np.full((h_px, w_px), -np.inf, dtype=np.float32)
         height_agl_max_grid = np.full((h_px, w_px), -np.inf, dtype=np.float32)
@@ -9180,7 +9229,16 @@ class MapAnythingDepthSource:
         # Density: count of points (unweighted for backward compat)
         np.add.at(density_grid, indices, 1.0)
         # Distance: weighted by confidence
-        np.add.at(distance_sum, indices, (pts_depth * pts_weight).astype(np.float32, copy=False))
+        np.add.at(
+            distance_sum,
+            indices,
+            (pts_depth * pts_weight).astype(np.float64, copy=False),
+        )
+        np.add.at(
+            distance_weight_sum,
+            indices,
+            pts_weight.astype(np.float64, copy=False),
+        )
         np.add.at(distance_count, indices, 1)
         # Height: accumulate weighted sum and weights for weighted mean
         np.add.at(weighted_height_sum, indices, (pts_y * pts_weight).astype(np.float64))
@@ -9233,6 +9291,8 @@ class MapAnythingDepthSource:
 
         # Use weighted mean as the primary height grid (preserves detail better than max)
         height_grid = weighted_mean_height
+        observed_grid = (distance_count > 0).astype(np.float32, copy=False)
+        unknown_grid = (1.0 - observed_grid).astype(np.float32, copy=False)
 
         clean_layers = None
 
@@ -9270,6 +9330,7 @@ class MapAnythingDepthSource:
                 x_idx=x_idx,
                 z_idx=z_idx,
                 support_grid=distance_count,
+                grid_res_m=grid_res_m,
             )
             if isinstance(clean_meta, dict):
                 clean_meta = dict(clean_meta)
@@ -9317,9 +9378,14 @@ class MapAnythingDepthSource:
         gradient_grid = np.nan_to_num(gradient_grid, nan=0.0, posinf=0.0, neginf=0.0)
 
         distance_grid = np.zeros((h_px, w_px), dtype=np.float32)
-        nonzero_mask = distance_count > 0
+        nonzero_mask = distance_weight_sum > 1e-9
         if np.any(nonzero_mask):
-            distance_grid[nonzero_mask] = distance_sum[nonzero_mask] / distance_count[nonzero_mask]
+            np.divide(
+                distance_sum,
+                distance_weight_sum,
+                out=distance_grid,
+                where=nonzero_mask,
+            )
             min_distance = float(np.min(distance_grid[nonzero_mask]))
             max_distance = float(np.max(distance_grid[nonzero_mask]))
         else:
@@ -9365,7 +9431,8 @@ class MapAnythingDepthSource:
             camera_id=str(camera_id),
             intrinsics=k_for_alignment,
             extrinsics_col_major=list(extr),
-            floor_y=float(floor_y),
+            calibrated_floor_y=_calibrated_floor_y_from_bundle(calib_bundle),
+            depth_floor_y=float(floor_y) + float(agl_floor_offset_m),
             depth=depth,
             conf=conf,
             mask=mask,
@@ -9380,11 +9447,15 @@ class MapAnythingDepthSource:
         payload: Dict[str, Any] = {
             'camera_id': camera_id,
             'ts': now_us,
-            'snapshot_ts': int(path_entry.stem) if path_entry.stem.isdigit() else None,
+            'snapshot_ts': int(selected_descriptor.ts_us),
+            'snapshot_ref': selected_descriptor.storage_ref,
+            'snapshot_id': selected_descriptor.write_id,
+            'snapshot_content_sha256': selected_descriptor.content_sha256,
             'frame': _FLOORPLAN_FRAME,
             'orientation': _FLOORPLAN_ORIENTATION,
             'floorplan_contract_version': int(_FLOORPLAN_CONTRACT_VERSION),
             'bounds': bounds,
+            'bounds_meta': bounds_meta,
             'scale_m_per_px': float(width_m / w_px if w_px else grid_res_m),
             'scale_scene_per_px': float((width_m / w_px if w_px else grid_res_m) * scene_per_m),
             'units': 'meters',
@@ -9392,6 +9463,18 @@ class MapAnythingDepthSource:
             'point_count': int(pts_cam.shape[0]),
             'density': {
                 'grid_b64': base64.b64encode(density_grid.astype(np.float32, copy=False).ravel().tobytes()).decode('ascii'),
+                'grid_shape': [int(h_px), int(w_px)],
+                'value_min': 0.0,
+                'value_max': 1.0,
+            },
+            'observed': {
+                'grid_b64': base64.b64encode(observed_grid.ravel().tobytes()).decode('ascii'),
+                'grid_shape': [int(h_px), int(w_px)],
+                'value_min': 0.0,
+                'value_max': 1.0,
+            },
+            'unknown': {
+                'grid_b64': base64.b64encode(unknown_grid.ravel().tobytes()).decode('ascii'),
                 'grid_shape': [int(h_px), int(w_px)],
                 'value_min': 0.0,
                 'value_max': 1.0,
@@ -9426,6 +9509,14 @@ class MapAnythingDepthSource:
                 'floor_offset_m': float(agl_floor_offset_m),
                 'floor_estimate': floor_est_meta,
             },
+            'observation_meta': {
+                'contract': 'noesis.floorplan.observation.v1',
+                'observed_definition': 'one_or_more_valid_projected_depth_points',
+                'unknown_definition': 'zero_valid_projected_depth_points_within_grid_bounds',
+                'observed_cells': int(np.count_nonzero(observed_grid)),
+                'unknown_cells': int(np.count_nonzero(unknown_grid)),
+                'total_cells': int(observed_grid.size),
+            },
             'calibration_fingerprint': expected_calibration_fingerprint,
             'ray_to_floorplan_alignment': ray_to_floorplan_alignment,
         }
@@ -9445,6 +9536,17 @@ class MapAnythingDepthSource:
             }
             payload['walkable'] = {
                 'grid_b64': base64.b64encode(walkable_grid.astype(np.float32, copy=False).ravel().tobytes()).decode('ascii'),
+                'grid_shape': [int(h_px), int(w_px)],
+                'value_min': 0.0,
+                'value_max': 1.0,
+            }
+            inferred_walkable_grid = (
+                (walkable_grid > 0.5) & (observed_grid < 0.5)
+            ).astype(np.float32, copy=False)
+            payload['inferred_walkable'] = {
+                'grid_b64': base64.b64encode(
+                    inferred_walkable_grid.ravel().tobytes()
+                ).decode('ascii'),
                 'grid_shape': [int(h_px), int(w_px)],
                 'value_min': 0.0,
                 'value_max': 1.0,
@@ -9469,8 +9571,23 @@ class MapAnythingDepthSource:
 
 
 __all__ = [
+    "CommitReceipt",
+    "DepthFusionQualityError",
+    "DepthStorageClosedError",
+    "DepthStorageError",
     "DepthStorageManager",
+    "DepthStoragePoisonedError",
+    "DepthStorageQueueFullError",
+    "DuplicateSnapshotError",
+    "FlushReceipt",
     "MapAnythingDepthSource",
     "DepthResult",
     "DepthSummary",
+    "ShutdownReceipt",
+    "SnapshotDescriptor",
+    "SnapshotReadLease",
+    "StorageFailure",
+    "StorageLifecycle",
+    "WriteHandle",
+    "resolve_depth_store_commit_timeout_s",
 ]

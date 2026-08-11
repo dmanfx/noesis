@@ -1,13 +1,14 @@
 """
 Mosaic WebRTC Gateway
 
-Ultra-light GStreamer WebRTC gateway that consumes DS8's RTSP mosaic output
-and exposes it as a WebRTC video track using the existing WebSocketServer
-for signaling.
+Ultra-light GStreamer WebRTC gateway that consumes already-encoded mosaic H.264
+access units from the shared-memory feeder and exposes them as a WebRTC video
+track via the existing WebSocketServer signaling path.
 
-Pipeline: rtspsrc → rtph264depay → h264parse → rtph264pay → webrtcbin
+Pipeline: appsrc (H.264 AU) → rtph264pay → webrtcbin
 
-No transcoding. No decode. No GPU load. Passthrough only.
+No RTSP hop. No depay/re-pay cycle. No transcoding. No decode. No GPU load.
+The only RTP packetization happens here, once, for the browser peer.
 """
 
 from __future__ import annotations
@@ -16,6 +17,7 @@ import logging
 import os
 import threading
 import time
+from functools import wraps
 from typing import TYPE_CHECKING, Any, Callable, Optional
 
 import gi
@@ -24,59 +26,274 @@ gi.require_version("Gst", "1.0")
 gi.require_version("GstSdp", "1.0")
 gi.require_version("GstWebRTC", "1.0")
 
-from gi.repository import GLib, Gst, GstSdp, GstWebRTC
+from gi.repository import GLib, Gst, GstSdp, GstWebRTC  # noqa: E402
+
+from noesis.mosaic_glib_context import shared_default_glib_context
 
 if TYPE_CHECKING:
+    from noesis.mosaic_h264_bridge import MosaicH264ShmFeeder
     from websocket_server import WebSocketServer
 
 Gst.init(None)
 
 logger = logging.getLogger(__name__)
 
+APPSRC_MAX_AUS = 8
+RTP_QUEUE_MAX_BUFFERS = 512
+RTP_QUEUE_MAX_BYTES = 4 * 1024 * 1024
+RTP_QUEUE_MAX_TIME_NS = 250 * Gst.MSECOND
+
+
+def _guard_gateway_callback(
+    default_factory: Optional[Callable[[], Any]] = None,
+) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
+    """Lease an SDK/GLib callback against gateway shutdown."""
+
+    def _decorate(callback: Callable[..., Any]) -> Callable[..., Any]:
+        @wraps(callback)
+        def _wrapped(self: "MosaicWebRTCGateway", *args: Any, **kwargs: Any) -> Any:
+            if not self._begin_lifecycle_callback():
+                return default_factory() if default_factory is not None else None
+            try:
+                return callback(self, *args, **kwargs)
+            finally:
+                self._end_lifecycle_callback()
+
+        return _wrapped
+
+    return _decorate
+
 
 class MosaicWebRTCGateway:
     """
-    Ultra-light GStreamer WebRTC gateway that consumes the DS8 RTSP mosaic output
-    and exposes it as a WebRTC video track using the existing WebSocketServer
-    for signaling.
+    Ultra-light GStreamer WebRTC gateway that consumes mosaic H.264 access units
+    from :class:`MosaicH264ShmFeeder` and exposes them as a WebRTC video track.
     """
 
     def __init__(
         self,
         ws_server: "WebSocketServer",
-        rtsp_uri: str,
-        request_rtsp_keyframe: Optional[Callable[[str], None]] = None,
+        *,
+        h264_feeder: Optional["MosaicH264ShmFeeder"] = None,
+        request_keyframe: Optional[Callable[[str], None]] = None,
     ) -> None:
         self.ws = ws_server
-        self.rtsp_uri = rtsp_uri
-        self._request_rtsp_keyframe = request_rtsp_keyframe
+        self._h264_feeder = h264_feeder
+        self._request_keyframe = request_keyframe
         self.pipeline: Optional[Gst.Pipeline] = None
         self.webrtc: Optional[Gst.Element] = None
-        self.rtspsrc: Optional[Gst.Element] = None
-        self.depay: Optional[Gst.Element] = None
-        self.parse: Optional[Gst.Element] = None
-        self.h264_queue: Optional[Gst.Element] = None
+        self.appsrc: Optional[Gst.Element] = None
         self.pay: Optional[Gst.Element] = None
         self.queue: Optional[Gst.Element] = None
         self.drain: Optional[Gst.Element] = None
         self.webrtc_sink_pad: Optional[Gst.Pad] = None
         self.webrtc_transceiver: Optional[Any] = None
-        self.loop: Optional[GLib.MainLoop] = None
-        self.thread: Optional[threading.Thread] = None
         self._started = False
         self._peer_count = 0
         self._frame_count = 0
         self._keyframe_count = 0
+        self._push_drop_count = 0
         self._offer_h264_pt: Optional[int] = None
         self._remote_description_set = False
         self._pending_create_answer = False
         self._answer_create_started = False
         self._pending_answer_started_at: Optional[float] = None
-        self._stop_event = threading.Event()
+        self._context_acquired = False
         self._rtp_in_packets = 0
         self._sender_linked = False
         self._sender_link_in_progress = False
         self._pending_ice: list[tuple[str, int]] = []
+        self._lifecycle_condition = threading.Condition(threading.RLock())
+        self._lifecycle_generation = 0
+        self._stopping = False
+        self._active_callbacks = 0
+        self._glib_source_ids: set[int] = set()
+        # Pipeline rebuilds and terminal NULL transition are mutually exclusive.
+        # Callback admission is closed and drained before stop acquires this lock,
+        # so a peer reset can never publish a replacement PLAYING pipeline after
+        # shutdown has already nulled the previous instance.
+        self._pipeline_mutation_lock = threading.RLock()
+        self._relink_probe_pad: Optional[Gst.Pad] = None
+        self._relink_probe_id: Optional[int] = None
+        self._appsrc_lock = threading.RLock()
+        self._terminal_failure_reported = False
+
+    def _current_generation(self) -> int:
+        with self._lifecycle_condition:
+            return int(self._lifecycle_generation)
+
+    def _begin_lifecycle_callback(self, generation: Optional[int] = None) -> bool:
+        with self._lifecycle_condition:
+            if self._stopping or not self._started:
+                return False
+            if (
+                generation is not None
+                and int(generation) != int(self._lifecycle_generation)
+            ):
+                return False
+            self._active_callbacks += 1
+            return True
+
+    def _end_lifecycle_callback(self) -> None:
+        with self._lifecycle_condition:
+            self._active_callbacks -= 1
+            self._lifecycle_condition.notify_all()
+
+    def _accepts_async_work(self) -> bool:
+        with self._lifecycle_condition:
+            return bool(self._started and not self._stopping)
+
+    def _invoke_glib(self, callback: Callable[[object], bool]) -> bool:
+        with self._lifecycle_condition:
+            if self._stopping or not self._started:
+                return False
+            generation = int(self._lifecycle_generation)
+
+        def _guarded(data: object) -> bool:
+            if not self._begin_lifecycle_callback(generation):
+                return False
+            try:
+                return bool(callback(data))
+            finally:
+                self._end_lifecycle_callback()
+
+        try:
+            GLib.MainContext.default().invoke_full(
+                GLib.PRIORITY_DEFAULT,
+                _guarded,
+                None,
+            )
+            return True
+        except Exception:
+            logger.exception("Failed to schedule work on the mosaic GLib context")
+            return False
+
+    def _schedule_glib_timeout(
+        self,
+        interval_ms: int,
+        callback: Callable[[], bool],
+    ) -> Optional[int]:
+        source_id_holder: list[int] = []
+        with self._lifecycle_condition:
+            if self._stopping or not self._started:
+                return None
+            generation = int(self._lifecycle_generation)
+
+            def _guarded() -> bool:
+                if not self._begin_lifecycle_callback(generation):
+                    keep = False
+                else:
+                    try:
+                        keep = bool(callback())
+                    finally:
+                        self._end_lifecycle_callback()
+                with self._lifecycle_condition:
+                    if self._stopping or generation != self._lifecycle_generation:
+                        keep = False
+                    if not keep and source_id_holder:
+                        self._glib_source_ids.discard(source_id_holder[0])
+                return keep
+
+            source_id = int(GLib.timeout_add(int(interval_ms), _guarded))
+            source_id_holder.append(source_id)
+            self._glib_source_ids.add(source_id)
+            return source_id
+
+    def _new_guarded_promise(
+        self,
+        callback: Callable[[Gst.Promise], None],
+    ) -> Gst.Promise:
+        generation = self._current_generation()
+
+        def _guarded(promise: Gst.Promise) -> None:
+            if not self._begin_lifecycle_callback(generation):
+                return
+            try:
+                callback(promise)
+            finally:
+                self._end_lifecycle_callback()
+
+        return Gst.Promise.new_with_change_func(_guarded)
+
+    def _cancel_glib_sources(self) -> None:
+        with self._lifecycle_condition:
+            source_ids = list(self._glib_source_ids)
+            self._glib_source_ids.clear()
+        for source_id in source_ids:
+            try:
+                GLib.source_remove(source_id)
+            except Exception:
+                logger.debug(
+                    "Failed to remove WebRTC GLib source %d",
+                    source_id,
+                    exc_info=True,
+                )
+
+    def _cancel_relink_probe(self) -> None:
+        """Remove the one-shot blocking relink probe before pipeline teardown."""
+
+        with self._lifecycle_condition:
+            pad = self._relink_probe_pad
+            probe_id = self._relink_probe_id
+            self._relink_probe_pad = None
+            self._relink_probe_id = None
+            self._sender_link_in_progress = False
+        if pad is None or probe_id is None:
+            return
+        try:
+            pad.remove_probe(probe_id)
+        except Exception:
+            logger.debug(
+                "Failed to remove WebRTC sender relink probe %d",
+                probe_id,
+                exc_info=True,
+            )
+
+    def _wait_for_callbacks(self, *, timeout_s: float, phase: str) -> None:
+        deadline = time.monotonic() + max(0.0, float(timeout_s))
+        with self._lifecycle_condition:
+            while self._active_callbacks > 0:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0.0:
+                    raise RuntimeError(
+                        "MosaicWebRTCGateway callbacks remained active "
+                        f"during {phase}"
+                    )
+                self._lifecycle_condition.wait(timeout=remaining)
+
+    def _set_pipeline_null_and_wait(self, pipeline: Gst.Pipeline) -> None:
+        """Require a bounded, observed transition to the terminal NULL state."""
+
+        result = pipeline.set_state(Gst.State.NULL)
+        if result == Gst.StateChangeReturn.FAILURE:
+            raise RuntimeError("GStreamer rejected WebRTC gateway NULL state")
+        state_result, current, pending = pipeline.get_state(3 * Gst.SECOND)
+        if (
+            state_result == Gst.StateChangeReturn.FAILURE
+            or current != Gst.State.NULL
+            or pending != Gst.State.VOID_PENDING
+        ):
+            raise RuntimeError(
+                "WebRTC gateway did not prove terminal NULL state "
+                f"(result={state_result}, current={current}, pending={pending})"
+            )
+
+    @staticmethod
+    def _set_pipeline_playing_and_wait(pipeline: Gst.Pipeline) -> None:
+        """Require a bounded, observed transition to PLAYING."""
+
+        result = pipeline.set_state(Gst.State.PLAYING)
+        if result == Gst.StateChangeReturn.FAILURE:
+            raise RuntimeError("GStreamer rejected WebRTC gateway PLAYING state")
+        state_result, current, _pending = pipeline.get_state(3 * Gst.SECOND)
+        if (
+            state_result == Gst.StateChangeReturn.FAILURE
+            or current != Gst.State.PLAYING
+        ):
+            raise RuntimeError(
+                "WebRTC gateway did not reach PLAYING "
+                f"(result={state_result}, current={current})"
+            )
 
     @staticmethod
     def _extract_h264_payload_type(sdp_offer: str) -> Optional[int]:
@@ -198,100 +415,76 @@ class MosaicWebRTCGateway:
         return None
 
     def build(self) -> None:
-        """Construct the GStreamer pipeline with proper dynamic pad handling."""
-        # rtspsrc creates pads dynamically, so we need to build the pipeline manually
-        # and connect pads via signals
-        
+        """Construct the GStreamer pipeline: appsrc AUs → single RTP pay → webrtcbin."""
         self.pipeline = Gst.Pipeline.new("webrtc-gateway")
-        
-        # Create elements
-        self.rtspsrc = Gst.ElementFactory.make("rtspsrc", "rtspsrc")
-        if self.rtspsrc is None:
-            raise RuntimeError("Failed to create rtspsrc element")
-        self.rtspsrc.set_property("location", self.rtsp_uri)
-        self.rtspsrc.set_property("latency", 200)
-        self.rtspsrc.set_property("buffer-mode", 0)  # auto
-        try:
-            # Prefer TCP for local RTSP to avoid UDP quirks.
-            # GstRTSPLowerTrans bitmask: tcp=0x4.
-            self.rtspsrc.set_property("protocols", 4)
-        except Exception as exc:
-            logger.debug("Failed to set rtspsrc protocols=tcp: %s", exc)
-        
-        self.depay = Gst.ElementFactory.make("rtph264depay", "depay")
-        self.parse = Gst.ElementFactory.make("h264parse", "parse")
-        if self.parse:
-            # Ensure SPS/PPS are re-inserted periodically downstream (helps WebRTC peers
-            # that join after the RTSP stream has already started).
-            try:
-                # -1 = send SPS/PPS with every IDR frame (best for late-join WebRTC peers).
-                self.parse.set_property("config-interval", -1)
-            except Exception as exc:
-                logger.debug("Failed to set h264parse config-interval: %s", exc)
+
+        self.appsrc = Gst.ElementFactory.make("appsrc", "h264_appsrc")
         self.pay = Gst.ElementFactory.make("rtph264pay", "pay")
-        if self.pay:
-            # Do not hardcode payload type; answer must match the browser offer PT.
-            #
-            # Important for late-joining peers: repeat SPS/PPS periodically so the
-            # browser can start decoding even if it missed the initial IDR/config.
-            # -1 = send SPS/PPS with every IDR frame (best for late-join WebRTC peers).
-            self.pay.set_property("config-interval", -1)
-        # Frame-level queue (H264 access units). This protects RTSP ingest from downstream
-        # stalls without dropping individual RTP packets (dropping RTP packets can corrupt
-        # keyframes and lead to "bytesReceived but framesDecoded=0" in browsers).
-        self.h264_queue = Gst.ElementFactory.make("queue", "h264_queue")
-        if self.h264_queue:
-            self.h264_queue.set_property("leaky", 2)  # drop oldest when full
-            self.h264_queue.set_property("max-size-buffers", 30)
-            self.h264_queue.set_property("max-size-bytes", 0)
-            self.h264_queue.set_property("max-size-time", 0)
-
-        # RTP-level queue used as the re-link point (drain → webrtcbin). Keep it non-leaky
-        # so we don't drop RTP packets mid-frame.
+        # RTP-level queue used as the re-link point (drain → webrtcbin). Keep it
+        # non-leaky so we never drop individual RTP packets mid-frame.
         self.queue = Gst.ElementFactory.make("queue", "webrtc_queue")
-        if self.queue:
-            self.queue.set_property("leaky", 0)
-        
         self.webrtc = Gst.ElementFactory.make("webrtcbin", "webrtc")
-        if self.webrtc:
-            self.webrtc.set_property("bundle-policy", 3)  # max-bundle
-
-        # Drain sink: keep RTSP ingest running even before a peer offers WebRTC.
+        # Drain sink: keep AU ingest flowing before a peer offers WebRTC.
         self.drain = Gst.ElementFactory.make("fakesink", "webrtc_drain")
-        if self.drain:
-            self.drain.set_property("sync", False)
-        
-        # Verify all elements created
-        for name, elem in [
-            ("rtspsrc", self.rtspsrc),
-            ("depay", self.depay),
-            ("parse", self.parse),
-            ("h264_queue", self.h264_queue),
+
+        for name, elem in (
+            ("appsrc", self.appsrc),
             ("pay", self.pay),
             ("queue", self.queue),
             ("webrtc", self.webrtc),
             ("drain", self.drain),
-        ]:
+        ):
             if elem is None:
                 raise RuntimeError(f"Failed to create {name} element")
-        
-        # Add elements to pipeline
-        self.pipeline.add(self.rtspsrc)
-        self.pipeline.add(self.depay)
-        self.pipeline.add(self.parse)
-        self.pipeline.add(self.h264_queue)
+
+        # Live AU source. The upstream leaky policy drops a newly arriving whole
+        # AU when this peer's bounded queue is full. push_h264_au checks the
+        # current level first so every such drop is counted and reported.
+        self.appsrc.set_property("is-live", True)
+        self.appsrc.set_property("format", Gst.Format.TIME)
+        self.appsrc.set_property("stream-type", 0)  # GST_APP_STREAM_TYPE_STREAM
+        self.appsrc.set_property("do-timestamp", True)
+        self.appsrc.set_property("block", False)
+        self.appsrc.set_property("max-buffers", APPSRC_MAX_AUS)
+        self.appsrc.set_property("max-bytes", 0)
+        self.appsrc.set_property("max-time", 0)
+        self.appsrc.set_property("leaky-type", 1)  # upstream: drop incoming AU
+        if self.appsrc.find_property("current-level-buffers") is None:
+            raise RuntimeError(
+                "GStreamer appsrc lacks required current-level-buffers accounting"
+            )
+        self.appsrc.set_property(
+            "caps",
+            Gst.Caps.from_string(
+                "video/x-h264,stream-format=byte-stream,alignment=au"
+            ),
+        )
+
+        # Single packetization point for WebRTC. Repeat SPS/PPS with every IDR
+        # so late-joining browsers can start decoding immediately.
+        self.pay.set_property("config-interval", -1)
+        try:
+            self.pay.set_property("aggregate-mode", 1)  # zero-latency
+        except Exception:
+            pass
+
+        self.queue.set_property("leaky", 0)
+        self.queue.set_property("max-size-buffers", RTP_QUEUE_MAX_BUFFERS)
+        self.queue.set_property("max-size-bytes", RTP_QUEUE_MAX_BYTES)
+        self.queue.set_property("max-size-time", RTP_QUEUE_MAX_TIME_NS)
+
+        self.webrtc.set_property("bundle-policy", 3)  # max-bundle
+        self.drain.set_property("sync", False)
+        self.drain.set_property("async", False)
+
+        self.pipeline.add(self.appsrc)
         self.pipeline.add(self.pay)
         self.pipeline.add(self.queue)
         self.pipeline.add(self.webrtc)
         self.pipeline.add(self.drain)
-        
-        # Link static elements: depay → parse → h264_queue → pay → webrtc_queue
-        if not self.depay.link(self.parse):
-            raise RuntimeError("Failed to link depay → parse")
-        if not self.parse.link(self.h264_queue):
-            raise RuntimeError("Failed to link parse → h264_queue")
-        if not self.h264_queue.link(self.pay):
-            raise RuntimeError("Failed to link h264_queue → pay")
+
+        if not self.appsrc.link(self.pay):
+            raise RuntimeError("Failed to link appsrc → pay")
         if not self.pay.link(self.queue):
             raise RuntimeError("Failed to link pay → webrtc_queue")
 
@@ -309,23 +502,20 @@ class MosaicWebRTCGateway:
                 queue_src_pad.add_probe(Gst.PadProbeType.BUFFER, self._on_rtp_in_probe, None)
         except Exception:
             pass
-        
-        # Add probe to count encoded frames (pre-RTP-payload) to avoid per-RTP-packet overhead
-        # which can starve other Python threads (WS server, signal handlers).
-        parse_src_pad = self.parse.get_static_pad("src")
-        if parse_src_pad is not None:
-            parse_src_pad.add_probe(Gst.PadProbeType.BUFFER, self._on_frame_probe, None)
-            logger.info("Added frame probe on parse src pad")
-        
-        # rtspsrc has dynamic pads - connect via pad-added signal
-        self.rtspsrc.connect("pad-added", self._on_rtspsrc_pad_added)
-        
-        # Configure ICE servers (env override).
+
+        # Count AUs pre-payload (not per-RTP-packet) to avoid GIL starvation.
+        try:
+            appsrc_src = self.appsrc.get_static_pad("src")
+            if appsrc_src is not None:
+                appsrc_src.add_probe(Gst.PadProbeType.BUFFER, self._on_frame_probe, None)
+                logger.info("Added frame probe on appsrc src pad")
+        except Exception:
+            pass
+
+        # A single-home LAN does not need an external ICE discovery service.
+        # Supplying an explicit server is the opt-in for deployments that do.
         stun_server = os.environ.get("NOESIS_MOSAIC_WEBRTC_STUN_SERVER", "").strip()
-        if not stun_server:
-            stun_server = "stun://stun.l.google.com:19302"
-        else:
-            # Allow comma-separated list; webrtcbin accepts a single stun-server string.
+        if stun_server:
             stun_server = stun_server.split(",", 1)[0].strip()
         if stun_server:
             self.webrtc.set_property("stun-server", stun_server)
@@ -338,146 +528,92 @@ class MosaicWebRTCGateway:
                 logger.info("WebRTC TURN server configured")
             except Exception as exc:
                 logger.warning("Failed to set webrtcbin turn-server: %s", exc)
-        
-        # Connect webrtcbin signals
+
         self.webrtc.connect("on-ice-candidate", self._on_ice_candidate)
         self.webrtc.connect("on-negotiation-needed", self._on_negotiation_needed)
         self.webrtc.connect("notify::ice-connection-state", self._on_ice_connection_state)
         self.webrtc.connect("notify::connection-state", self._on_connection_state)
-        
-        # Connect to bus for error/state handling
+
         bus = self.pipeline.get_bus()
         bus.add_signal_watch()
         bus.connect("message::error", self._on_bus_error)
         bus.connect("message::eos", self._on_bus_eos)
         bus.connect("message::state-changed", self._on_bus_state_changed)
-        
-        # Register gateway with WebSocket server
-        self.ws.register_webrtc_gateway(self)
-        logger.info("MosaicWebRTCGateway built: %s", self.rtsp_uri)
 
+        logger.info(
+            "MosaicWebRTCGateway built: source=h264_shm_au feeder=%s",
+            "yes" if self._h264_feeder is not None else "no",
+        )
+
+    def push_h264_au(self, buffer: Gst.Buffer) -> bool:
+        """Push one encoded H.264 access unit into this gateway's appsrc."""
+        try:
+            with self._appsrc_lock:
+                if not self._started or self._stopping:
+                    return False
+                appsrc = self.appsrc
+                if appsrc is None:
+                    return False
+                queued_aus = int(appsrc.get_property("current-level-buffers"))
+                if queued_aus >= APPSRC_MAX_AUS:
+                    self._push_drop_count += 1
+                    if self._push_drop_count == 1 or self._push_drop_count % 30 == 0:
+                        logger.warning(
+                            "Dropping whole H.264 AU for slow WebRTC peer: "
+                            "queued_aus=%d limit=%d drops=%d",
+                            queued_aus,
+                            APPSRC_MAX_AUS,
+                            self._push_drop_count,
+                        )
+                    return False
+
+                # SHM timestamps belong to the feeder pipeline's clock domain.
+                # Let this live appsrc stamp the AU in the peer pipeline's own
+                # running-time domain; duration and keyframe flags are retained.
+                buffer.pts = Gst.CLOCK_TIME_NONE
+                buffer.dts = Gst.CLOCK_TIME_NONE
+                ret = appsrc.emit("push-buffer", buffer)
+        except Exception:
+            self._push_drop_count += 1
+            logger.exception("Failed to enqueue H.264 AU for WebRTC peer")
+            return False
+        if ret == Gst.FlowReturn.OK:
+            return True
+        self._push_drop_count += 1
+        if self._push_drop_count == 1 or self._push_drop_count % 30 == 0:
+            logger.warning(
+                "WebRTC appsrc rejected whole H.264 AU: flow=%s drops=%d",
+                ret,
+                self._push_drop_count,
+            )
+        return False
+
+    @_guard_gateway_callback()
     def _on_ice_connection_state(self, webrtc: Gst.Element, pspec: object) -> None:
         """Log ICE connection state changes."""
+        if webrtc is not self.webrtc:
+            return
         state = webrtc.get_property("ice-connection-state")
         state_name = GstWebRTC.WebRTCICEConnectionState(state).value_nick if state else "unknown"
         logger.info("!!! ICE connection state: %s", state_name)
-        try:
-            import json, time
 
-            with open("/home/mayor/Noesis_Devel/.cursor/debug.log", "a", encoding="utf-8") as _f:
-                _f.write(
-                    json.dumps(
-                        {
-                            "sessionId": "debug-session",
-                            "runId": "run1",
-                            "hypothesisId": "H4",
-                            "location": "mosaic_webrtc_gateway.py:_on_ice_connection_state",
-                            "message": "ice state",
-                            "data": {"state": state_name},
-                            "timestamp": int(time.time() * 1000),
-                        }
-                    )
-                    + "\n"
-                )
-        except Exception:
-            pass
-
+    @_guard_gateway_callback()
     def _on_connection_state(self, webrtc: Gst.Element, pspec: object) -> None:
         """Log peer connection state changes."""
+        if webrtc is not self.webrtc:
+            return
         state = webrtc.get_property("connection-state")
         state_name = GstWebRTC.WebRTCPeerConnectionState(state).value_nick if state else "unknown"
         logger.info("!!! Peer connection state: %s", state_name)
-        if state_name == "connected" and self._request_rtsp_keyframe is not None:
+        if state_name == "connected" and self._request_keyframe is not None:
             try:
-                self._request_rtsp_keyframe("webrtc_connected")
+                self._request_keyframe("webrtc_connected")
             except Exception:
-                logger.debug("RTSP keyframe request failed on connected", exc_info=True)
-        try:
-            import json, time
+                logger.debug("Mosaic keyframe request failed on connected", exc_info=True)
 
-            with open("/home/mayor/Noesis_Devel/.cursor/debug.log", "a", encoding="utf-8") as _f:
-                _f.write(
-                    json.dumps(
-                        {
-                            "sessionId": "debug-session",
-                            "runId": "run1",
-                            "hypothesisId": "H4",
-                            "location": "mosaic_webrtc_gateway.py:_on_connection_state",
-                            "message": "peer state",
-                            "data": {"state": state_name},
-                            "timestamp": int(time.time() * 1000),
-                        }
-                    )
-                    + "\n"
-                )
-        except Exception:
-            pass
-
-    def _on_rtspsrc_pad_added(self, src: Gst.Element, pad: Gst.Pad) -> None:
-        """Handle dynamic pad from rtspsrc."""
-        caps = pad.get_current_caps()
-        if caps is None:
-            caps = pad.query_caps(None)
-        
-        caps_str = caps.to_string() if caps else "unknown"
-        logger.info(">>> rtspsrc pad added: %s (caps: %s...)", pad.get_name(), caps_str[:60])
-        
-        # rtspsrc can expose multiple pads and caps may be generic early (e.g., only "application/x-rtp").
-        # Link the first RTP pad and let depay/parser enforce H264 later.
-        media = ""
-        encoding = ""
-        try:
-            if caps is not None and caps.get_size() > 0:
-                s = caps.get_structure(0)
-                media = (s.get_string("media") or "") if s is not None else ""
-                encoding = (s.get_string("encoding-name") or "") if s is not None else ""
-        except Exception:
-            media = ""
-            encoding = ""
-
-        is_rtp = caps_str.startswith("application/x-rtp")
-        is_rtp_src = pad.get_name().startswith("recv_rtp_src")
-
-        if is_rtp and is_rtp_src:
-            sink_pad = self.depay.get_static_pad("sink")
-            if sink_pad and not sink_pad.is_linked():
-                ret = pad.link(sink_pad)
-                if ret == Gst.PadLinkReturn.OK:
-                    logger.info("    Linked rtspsrc pad to depay successfully")
-                    try:
-                        import json, time
-
-                        with open("/home/mayor/Noesis_Devel/.cursor/debug.log", "a", encoding="utf-8") as _f:
-                            _f.write(
-                                json.dumps(
-                                    {
-                                        "sessionId": "debug-session",
-                                        "runId": "run1",
-                                        "hypothesisId": "H4",
-                                        "location": "mosaic_webrtc_gateway.py:_on_rtspsrc_pad_added",
-                                        "message": "rtspsrc pad linked",
-                                        "data": {"pad": pad.get_name(), "caps": caps_str},
-                                        "timestamp": int(time.time() * 1000),
-                                    }
-                                )
-                                + "\n"
-                            )
-                    except Exception:
-                        pass
-                else:
-                    logger.error("    Failed to link rtspsrc pad to depay: %s", ret)
-            else:
-                logger.warning("    depay sink pad already linked or not found")
-        else:
-            logger.info(
-                "    Ignoring pad (name=%s, media=%s, encoding=%s)",
-                pad.get_name(),
-                media or "?",
-                encoding or "?",
-            )
-
+    @_guard_gateway_callback(lambda: Gst.PadProbeReturn.OK)
     def _on_frame_probe(self, pad: Gst.Pad, info: Gst.PadProbeInfo, user_data: object) -> Gst.PadProbeReturn:
-        """Count frames flowing through gateway pipeline."""
+        """Count H.264 access units flowing into the single RTP payloader."""
         try:
             buf = info.get_buffer()
         except Exception:
@@ -496,15 +632,13 @@ class MosaicWebRTCGateway:
         self._frame_count += 1
         if self._frame_count == 1:
             logger.info(">>> First video frame received in gateway!")
-            # If we delayed answering because RTSP hadn't started yet, kick answer creation now.
+            # If we delayed answering because AUs hadn't started yet, kick answer creation now.
             if (
                 self._pending_create_answer
                 and self._remote_description_set
                 and not self._answer_create_started
                 and self._sender_linked
             ):
-                ctx = GLib.MainContext.default()
-
                 def _do(_: object) -> bool:
                     try:
                         self._maybe_start_create_answer(force=False)
@@ -512,17 +646,15 @@ class MosaicWebRTCGateway:
                         logger.debug("Failed to start answer after first frame", exc_info=True)
                     return False
 
-                try:
-                    ctx.invoke_full(GLib.PRIORITY_DEFAULT, _do, None)
-                except Exception:
-                    _do(None)
+                self._invoke_glib(_do)
         if self._keyframe_count == 1 and is_keyframe:
             logger.info(">>> First keyframe observed in gateway")
         elif self._frame_count % 300 == 0:
             logger.debug(
-                "Gateway video frames=%d keyframes=%d",
+                "Gateway video frames=%d keyframes=%d appsrc_drops=%d",
                 int(self._frame_count),
                 int(self._keyframe_count),
+                int(self._push_drop_count),
             )
         return Gst.PadProbeReturn.OK
 
@@ -549,12 +681,10 @@ class MosaicWebRTCGateway:
             return False
 
     def _record_transceivers(self, *, stage: str, location: str) -> None:
-        """Persist a concise webrtcbin transceiver inventory snapshot to debug.log."""
+        """Log a concise, non-secret webrtcbin transceiver inventory at DEBUG."""
         if self.webrtc is None:
             return
         try:
-            import json, time
-
             transceivers_summary: list[dict[str, Any]] = []
             arr = self.webrtc.emit("get-transceivers")
             n = int(arr.len) if arr is not None else 0
@@ -593,32 +723,22 @@ class MosaicWebRTCGateway:
                 except Exception:
                     sink_tr_info = None
 
-            with open("/home/mayor/Noesis_Devel/.cursor/debug.log", "a", encoding="utf-8") as _f:
-                _f.write(
-                    json.dumps(
-                        {
-                            "sessionId": "debug-session",
-                            "runId": "run1",
-                            "hypothesisId": "H4",
-                            "location": location,
-                            "message": "webrtc transceivers",
-                            "data": {
-                                "stage": stage,
-                                "count": n,
-                                "transceivers": transceivers_summary,
-                                "sink_transceiver": sink_tr_info,
-                                "sender_linked": bool(self._sender_linked),
-                                "rtp_in_packets": int(self._rtp_in_packets),
-                                "frame_count": int(self._frame_count),
-                                "offer_h264_pt": int(self._offer_h264_pt) if self._offer_h264_pt is not None else None,
-                            },
-                            "timestamp": int(time.time() * 1000),
-                        }
-                    )
-                    + "\n"
-                )
+            logger.debug(
+                "WebRTC transceivers location=%s stage=%s count=%d "
+                "transceivers=%s sink_transceiver=%s sender_linked=%s "
+                "rtp_in_packets=%d frame_count=%d offer_h264_pt=%s",
+                location,
+                stage,
+                n,
+                transceivers_summary,
+                sink_tr_info,
+                self._sender_linked,
+                self._rtp_in_packets,
+                self._frame_count,
+                self._offer_h264_pt,
+            )
         except Exception:
-            logger.debug("Failed to record transceivers (%s)", stage, exc_info=True)
+            logger.debug("Failed to inspect transceivers (%s)", stage, exc_info=True)
 
     def _ensure_webrtc_sender_pad(self) -> None:
         """Ensure a webrtcbin sink pad (and its transceiver) exists for video sending."""
@@ -704,9 +824,8 @@ class MosaicWebRTCGateway:
         # later answering with a=inactive due to transceiver mismatch.
         try:
             self._ensure_webrtc_sender_pad()
-        except Exception:
-            logger.debug("Failed to ensure webrtc sender pad", exc_info=True)
-            return
+        except Exception as exc:
+            raise RuntimeError("Failed to ensure WebRTC sender pad") from exc
 
         queue_src = self.queue.get_static_pad("src")
         if queue_src is None:
@@ -717,10 +836,27 @@ class MosaicWebRTCGateway:
             raise RuntimeError("webrtcbin sink pad missing after ensure")
 
         # Relink while the src pad is blocked to avoid transient "not-linked" stream errors.
-        self._sender_link_in_progress = True
+        with self._lifecycle_condition:
+            if self._stopping or not self._started:
+                return
+            generation = int(self._lifecycle_generation)
+            self._sender_link_in_progress = True
+
+        probe_id_holder: list[int] = []
+        probe_finished = False
 
         def _do_relink(pad: Gst.Pad, info: Gst.PadProbeInfo, user_data: object) -> Gst.PadProbeReturn:
+            nonlocal probe_finished
+            if not self._begin_lifecycle_callback(generation):
+                with self._lifecycle_condition:
+                    probe_finished = True
+                    self._sender_link_in_progress = False
+                return Gst.PadProbeReturn.REMOVE
             try:
+                if pad is not queue_src:
+                    return Gst.PadProbeReturn.REMOVE
+                if sink_pad is not self.webrtc_sink_pad:
+                    return Gst.PadProbeReturn.REMOVE
                 peer = pad.get_peer()
                 if peer is not None:
                     try:
@@ -735,34 +871,63 @@ class MosaicWebRTCGateway:
 
                 self._sender_linked = True
                 logger.info("Linked pay → webrtc_queue → webrtcbin sink pad: %s", sink_pad.get_name())
+                if self._request_keyframe is not None:
+                    try:
+                        self._request_keyframe("webrtc_sender_linked")
+                    except Exception:
+                        logger.debug(
+                            "Mosaic keyframe request failed after sender link",
+                            exc_info=True,
+                        )
                 return Gst.PadProbeReturn.REMOVE
             finally:
-                self._sender_link_in_progress = False
+                with self._lifecycle_condition:
+                    probe_finished = True
+                    if (
+                        probe_id_holder
+                        and self._relink_probe_id == probe_id_holder[0]
+                    ):
+                        self._relink_probe_pad = None
+                        self._relink_probe_id = None
+                    self._sender_link_in_progress = False
+                self._end_lifecycle_callback()
 
         try:
-            queue_src.add_probe(Gst.PadProbeType.BLOCK | Gst.PadProbeType.BUFFER, _do_relink, None)
-        except Exception:
-            self._sender_link_in_progress = False
-            # Fall back to direct relink (best-effort).
-            peer = queue_src.get_peer()
-            if peer is not None:
-                try:
-                    queue_src.unlink(peer)
-                except Exception:
-                    pass
-            ret = queue_src.link(sink_pad)
-            if ret != Gst.PadLinkReturn.OK:
-                raise RuntimeError(f"Failed to link webrtc_queue → webrtcbin: {ret}")
-            self._sender_linked = True
-            logger.info("Linked pay → webrtc_queue → webrtcbin sink pad: %s", sink_pad.get_name())
+            probe_id = int(
+                queue_src.add_probe(
+                    Gst.PadProbeType.BLOCK | Gst.PadProbeType.BUFFER,
+                    _do_relink,
+                    None,
+                )
+            )
+            probe_id_holder.append(probe_id)
+            remove_immediately = False
+            with self._lifecycle_condition:
+                if (
+                    probe_finished
+                    or self._stopping
+                    or generation != self._lifecycle_generation
+                ):
+                    remove_immediately = not probe_finished
+                    self._sender_link_in_progress = False
+                else:
+                    self._relink_probe_pad = queue_src
+                    self._relink_probe_id = probe_id
+            if remove_immediately:
+                queue_src.remove_probe(probe_id)
+        except Exception as exc:
+            with self._lifecycle_condition:
+                self._sender_link_in_progress = False
+            raise RuntimeError(
+                "Failed to install the required blocking WebRTC relink probe"
+            ) from exc
 
+    @_guard_gateway_callback(lambda: Gst.PadProbeReturn.OK)
     def _on_rtp_in_probe(self, pad: Gst.Pad, info: Gst.PadProbeInfo, user_data: object) -> Gst.PadProbeReturn:
         self._rtp_in_packets += 1
         if self._rtp_in_packets == 1:
             # If we delayed answering until RTP is present, kick answer creation now.
             if self._pending_create_answer and self._remote_description_set and not self._answer_create_started:
-                ctx = GLib.MainContext.default()
-
                 def _do(_: object) -> bool:
                     try:
                         self._maybe_start_create_answer(force=False)
@@ -770,10 +935,7 @@ class MosaicWebRTCGateway:
                         logger.debug("Failed to start answer after first RTP packet", exc_info=True)
                     return False
 
-                try:
-                    ctx.invoke_full(GLib.PRIORITY_DEFAULT, _do, None)
-                except Exception:
-                    _do(None)
+                self._invoke_glib(_do)
         elif self._rtp_in_packets % 200 == 0:
             logger.info(">>> Gateway RTP packets into webrtcbin: %d", self._rtp_in_packets)
         return Gst.PadProbeReturn.OK
@@ -784,6 +946,8 @@ class MosaicWebRTCGateway:
 
         Must be called from the GLib main context (we use invoke_full for entrypoints).
         """
+        if not self._accepts_async_work():
+            return
         if self._sender_linked:
             return
         if self.pipeline is None or self.webrtc is None or self.queue is None:
@@ -806,7 +970,10 @@ class MosaicWebRTCGateway:
         try:
             self._link_sender_into_webrtc()
         except Exception:
-            logger.debug("Failed to link sender into webrtcbin", exc_info=True)
+            logger.exception("Failed to link sender into webrtcbin")
+            self._report_terminal_pipeline_failure(
+                "webrtc_gateway_sender_link_failed"
+            )
             return
 
         if not self._sender_linked:
@@ -818,36 +985,15 @@ class MosaicWebRTCGateway:
                     logger.debug("Sender link retry failed", exc_info=True)
                 return not self._sender_linked
 
-            try:
-                GLib.timeout_add(50, _retry)
-            except Exception:
-                pass
+            self._schedule_glib_timeout(50, _retry)
             return
 
-        # Linked successfully; record for debugging.
-        try:
-            import json, time
-
-            with open("/home/mayor/Noesis_Devel/.cursor/debug.log", "a", encoding="utf-8") as _f:
-                _f.write(
-                    json.dumps(
-                        {
-                            "sessionId": "debug-session",
-                            "runId": "run1",
-                            "hypothesisId": "H4",
-                            "location": "mosaic_webrtc_gateway.py:_switch_to_webrtc_sender",
-                            "message": "sender linked",
-                            "data": {"pt": int(self._offer_h264_pt) if self._offer_h264_pt is not None else None},
-                            "timestamp": int(time.time() * 1000),
-                        }
-                    )
-                    + "\n"
-                )
-        except Exception:
-            pass
+        logger.debug("WebRTC sender linked with H264 payload type %s", self._offer_h264_pt)
 
     def _maybe_start_create_answer(self, *, force: bool) -> None:
         """Start create-answer if we're ready (or forced). Must run in GLib context."""
+        if not self._accepts_async_work():
+            return
         if self.webrtc is None:
             return
         if self._answer_create_started:
@@ -860,10 +1006,12 @@ class MosaicWebRTCGateway:
                 self._switch_to_webrtc_sender()
             except Exception:
                 logger.debug("Failed to switch gateway output to webrtcbin", exc_info=True)
+            if self._terminal_failure_reported:
+                return
             if not self._sender_linked:
                 self._pending_create_answer = True
                 return
-        # Wait until we have at least one encoded H264 frame (via h264parse probe).
+        # Wait until we have at least one encoded H264 AU (via appsrc probe).
         # This avoids webrtcbin answering with a=inactive when no sender stream is observed yet.
         if not force and self._frame_count <= 0:
             self._pending_create_answer = True
@@ -875,123 +1023,239 @@ class MosaicWebRTCGateway:
 
         logger.info("    Creating WebRTC answer...")
         self._record_transceivers(stage="before create-answer", location="mosaic_webrtc_gateway.py:_maybe_start_create_answer")
-        promise = Gst.Promise.new_with_change_func(self._on_answer_created)
+        promise = self._new_guarded_promise(self._on_answer_created)
         self.webrtc.emit("create-answer", None, promise)
 
     def start(self) -> None:
-        """Start the gateway pipeline in a background thread."""
+        """Start the gateway and join the process-wide GLib context driver."""
         if self._started:
             logger.warning("WebRTC gateway already started")
             return
 
-        if self.pipeline is None:
-            # Start in drain mode (keep RTSP ingest negotiated even before any peer offers WebRTC).
-            self.build()
-        self._stop_event.clear()
+        with self._lifecycle_condition:
+            self._stopping = False
+            self._lifecycle_generation += 1
+            self._active_callbacks = 0
 
-        def _run() -> None:
-            try:
-                ret = self.pipeline.set_state(Gst.State.PLAYING)
-                if ret == Gst.StateChangeReturn.FAILURE:
-                    logger.error("Failed to set WebRTC gateway pipeline to PLAYING")
-                    return
-                logger.info("MosaicWebRTCGateway pipeline started")
-                # Drive the default GLib main context without monopolizing the GIL.
-                # A blocking GLib.MainLoop.run() in a Python thread can starve other Python
-                # threads (WebSocket server, signal handlers), causing "stuck" behavior.
-                context = GLib.MainContext.default()
-                while not self._stop_event.is_set():
-                    try:
-                        while context.pending():
-                            context.iteration(False)
-                    except Exception:
-                        # Never crash the gateway thread due to main-context issues.
-                        pass
-                    time.sleep(0.01)
-            except Exception as e:
-                logger.exception("WebRTC gateway thread error: %s", e)
-            finally:
-                logger.info("MosaicWebRTCGateway main loop exited")
-
-        self.thread = threading.Thread(target=_run, daemon=True, name="WebRTCGateway")
-        self.thread.start()
-        self._started = True
+        try:
+            if self.pipeline is None:
+                # Start in drain mode so AU ingest remains live before an offer.
+                self.build()
+            assert self.pipeline is not None
+            shared_default_glib_context.acquire()
+            self._context_acquired = True
+            with self._lifecycle_condition:
+                self._started = True
+            self._set_pipeline_playing_and_wait(self.pipeline)
+            if self._h264_feeder is not None:
+                self._h264_feeder.register_consumer(self)
+        except Exception:
+            with self._lifecycle_condition:
+                self._stopping = True
+            self._cancel_glib_sources()
+            self._cancel_relink_probe()
+            if self.pipeline is not None:
+                try:
+                    self.pipeline.set_state(Gst.State.NULL)
+                    self.pipeline.get_state(3 * Gst.SECOND)
+                except Exception:
+                    logger.debug("Failed to null partially started gateway", exc_info=True)
+                try:
+                    bus = self.pipeline.get_bus()
+                    if bus is not None:
+                        bus.remove_signal_watch()
+                except Exception:
+                    logger.debug(
+                        "Failed to remove partially started gateway bus watch",
+                        exc_info=True,
+                    )
+            if self._context_acquired:
+                try:
+                    shared_default_glib_context.release()
+                finally:
+                    self._context_acquired = False
+            self.pipeline = None
+            self.webrtc = None
+            self.appsrc = None
+            self.pay = None
+            self.queue = None
+            self.drain = None
+            self.webrtc_sink_pad = None
+            self.webrtc_transceiver = None
+            with self._lifecycle_condition:
+                self._started = False
+                self._stopping = False
+            raise
         logger.info("MosaicWebRTCGateway started")
 
     def stop(self) -> None:
-        """Stop the gateway pipeline."""
-        if not self._started:
-            return
+        """Stop and prove quiescence of every gateway-owned async resource."""
+        with self._lifecycle_condition:
+            if not self._started:
+                return
+            self._stopping = True
+            self._lifecycle_generation += 1
 
         logger.info("Stopping MosaicWebRTCGateway...")
-        self._stop_event.set()
+        if self._h264_feeder is not None:
+            try:
+                self._h264_feeder.unregister_consumer(self)
+            except Exception:
+                logger.debug("Failed to unregister H.264 feeder consumer", exc_info=True)
+        self._cancel_glib_sources()
+        self._cancel_relink_probe()
+
+        # Let callbacks admitted before the barrier finish while the GLib
+        # context and current pipeline are still intact. No callback admitted
+        # after `_stopping` may enter.
+        self._wait_for_callbacks(timeout_s=1.0, phase="pre-NULL drain")
+
+        pipeline_error: Optional[BaseException] = None
+        try:
+            with self._pipeline_mutation_lock, self._appsrc_lock:
+                if self.pipeline:
+                    self._set_pipeline_null_and_wait(self.pipeline)
+        except Exception as e:
+            pipeline_error = e
+            logger.exception("Error stopping WebRTC gateway pipeline")
+
+        self._wait_for_callbacks(timeout_s=1.0, phase="post-NULL drain")
+
+        if pipeline_error is not None:
+            raise RuntimeError(
+                "MosaicWebRTCGateway pipeline failed to enter NULL state"
+            ) from pipeline_error
 
         try:
-            if self.pipeline:
-                self.pipeline.set_state(Gst.State.NULL)
-        except Exception as e:
-            logger.warning("Error stopping pipeline: %s", e)
+            if self.pipeline is not None:
+                bus = self.pipeline.get_bus()
+                if bus is not None:
+                    bus.remove_signal_watch()
+        except Exception:
+            logger.debug("Failed to remove WebRTC bus signal watch", exc_info=True)
 
-        if self.thread and self.thread.is_alive():
-            self.thread.join(timeout=3)
+        if self._context_acquired:
+            shared_default_glib_context.release()
+            self._context_acquired = False
 
-        self._started = False
+        self._pending_create_answer = False
+        self._answer_create_started = False
+        self._pending_answer_started_at = None
+        self._remote_description_set = False
+        self._pending_ice.clear()
+        self._sender_linked = False
+        self._sender_link_in_progress = False
+        self.webrtc_sink_pad = None
+        self.webrtc_transceiver = None
+        self.pipeline = None
+        self.webrtc = None
+        self.appsrc = None
+        self.pay = None
+        self.queue = None
+        self.drain = None
+
+        with self._lifecycle_condition:
+            self._started = False
         logger.info("MosaicWebRTCGateway stopped")
 
     def _rebuild_pipeline_for_new_peer(self) -> None:
         """Tear down and rebuild the gateway pipeline to handle a new PeerConnection cleanly."""
-        # Stop the old pipeline (keep the gateway thread alive).
-        if self.pipeline is not None:
-            try:
-                bus = self.pipeline.get_bus()
-                if bus is not None:
-                    try:
+        with self._pipeline_mutation_lock, self._appsrc_lock:
+            if not self._accepts_async_work():
+                raise RuntimeError("WebRTC gateway is not accepting peer rebuilds")
+            with self._lifecycle_condition:
+                self._lifecycle_generation += 1
+            self._cancel_glib_sources()
+            self._cancel_relink_probe()
+            # Stop the old pipeline (keep the gateway thread alive).
+            if self.pipeline is not None:
+                try:
+                    bus = self.pipeline.get_bus()
+                    if bus is not None:
                         bus.remove_signal_watch()
-                    except Exception:
-                        pass
-            except Exception:
-                pass
-            try:
-                self.pipeline.set_state(Gst.State.NULL)
-            except Exception:
-                pass
+                except Exception:
+                    logger.debug("Failed to remove old WebRTC bus watch", exc_info=True)
+                self._set_pipeline_null_and_wait(self.pipeline)
 
-        self.pipeline = None
-        self.webrtc = None
-        self.rtspsrc = None
-        self.depay = None
-        self.parse = None
-        self.h264_queue = None
-        self.pay = None
-        self.queue = None
-        self.drain = None
-        self.webrtc_sink_pad = None
-        self.webrtc_transceiver = None
-        self._sender_linked = False
-        self._sender_link_in_progress = False
-        self._remote_description_set = False
-        self._pending_create_answer = False
-        self._answer_create_started = False
-        self._pending_answer_started_at = None
-        self._pending_ice.clear()
-        self._rtp_in_packets = 0
-        self._frame_count = 0
-        self._offer_h264_pt = None
+            self.pipeline = None
+            self.webrtc = None
+            self.appsrc = None
+            self.pay = None
+            self.queue = None
+            self.drain = None
+            self.webrtc_sink_pad = None
+            self.webrtc_transceiver = None
+            self._sender_linked = False
+            self._sender_link_in_progress = False
+            self._remote_description_set = False
+            self._pending_create_answer = False
+            self._answer_create_started = False
+            self._pending_answer_started_at = None
+            self._pending_ice.clear()
+            self._rtp_in_packets = 0
+            self._frame_count = 0
+            self._offer_h264_pt = None
+            self._terminal_failure_reported = False
 
-        # Rebuild and start playing.
-        self.build()
-        if self.pipeline is not None:
+            # Rebuild and start playing only while admission remains open. Stop
+            # closes admission before waiting on this mutation lock.
+            if not self._accepts_async_work():
+                raise RuntimeError("WebRTC gateway shutdown interrupted peer rebuild")
+            self.build()
+            if self.pipeline is not None:
+                self._set_pipeline_playing_and_wait(self.pipeline)
+
+    def reset_peer(
+        self,
+        reason: str = "owner_disconnected",
+        on_complete: Optional[Callable[[bool], None]] = None,
+    ) -> None:
+        """Revoke the current peer while keeping this bounded gateway slot warm.
+
+        A WebRTC media path remains viable after its signaling socket disappears,
+        so clearing WebSocket ownership alone is not revocation. Rebuilding the
+        peer pipeline tears down ICE/DTLS/RTP state and returns the same gateway
+        object to drain mode for the next authenticated owner.
+        """
+
+        if not self._accepts_async_work():
+            if callable(on_complete):
+                on_complete(False)
+            return
+
+        def _complete(ok: bool) -> None:
+            if not callable(on_complete):
+                return
             try:
-                ret = self.pipeline.set_state(Gst.State.PLAYING)
-                if ret == Gst.StateChangeReturn.FAILURE:
-                    logger.error("Failed to set rebuilt WebRTC gateway pipeline to PLAYING")
+                on_complete(ok)
             except Exception:
-                logger.exception("Failed to start rebuilt WebRTC gateway pipeline")
+                logger.debug("WebRTC peer-reset completion callback failed", exc_info=True)
+
+        def _reset(_: object) -> bool:
+            ok = False
+            try:
+                if not self._accepts_async_work():
+                    return False
+                logger.info("Resetting WebRTC peer after %s", str(reason or "owner_disconnected"))
+                self._peer_count = 0
+                self._rebuild_pipeline_for_new_peer()
+                ok = self.pipeline is not None and self.webrtc is not None
+            except Exception:
+                logger.exception("Failed to reset revoked WebRTC peer")
+            finally:
+                _complete(ok)
+            return False
+
+        if not self._invoke_glib(_reset):
+            _complete(False)
 
     # ========== WebSocket signaling methods (called by WebSocketServer) ==========
 
     def accept_offer(self, sdp_offer: str) -> None:
         """Handle incoming WebRTC offer from browser client."""
+        if not self._accepts_async_work():
+            logger.warning("Ignoring WebRTC offer during gateway shutdown")
+            return
         logger.info(">>> Gateway accept_offer called (offer length=%d)", len(sdp_offer) if sdp_offer else 0)
         if self.webrtc is None:
             logger.error("Cannot accept offer: webrtcbin not initialized")
@@ -999,8 +1263,6 @@ class MosaicWebRTCGateway:
 
         # Marshal into the GLib context driving the gateway to avoid cross-thread
         # interaction with GStreamer/webrtcbin.
-        ctx = GLib.MainContext.default()
-
         def _do_offer(_: object) -> bool:
             try:
                 self._accept_offer_impl(sdp_offer)
@@ -1008,22 +1270,20 @@ class MosaicWebRTCGateway:
                 logger.exception("Error processing WebRTC offer")
             return False
 
-        try:
-            ctx.invoke_full(GLib.PRIORITY_DEFAULT, _do_offer, None)
-        except Exception:
-            # Fallback to direct call (best-effort).
-            _do_offer(None)
+        self._invoke_glib(_do_offer)
 
     def _accept_offer_impl(self, sdp_offer: str) -> None:
+        if not self._accepts_async_work():
+            return
         if self.webrtc is None:
             logger.error("Cannot accept offer: webrtcbin not initialized")
             return
 
-        if self._request_rtsp_keyframe is not None:
+        if self._request_keyframe is not None:
             try:
-                self._request_rtsp_keyframe("webrtc_offer")
+                self._request_keyframe("webrtc_offer")
             except Exception:
-                logger.debug("RTSP keyframe request failed on offer", exc_info=True)
+                logger.debug("Mosaic keyframe request failed on offer", exc_info=True)
 
         # webrtcbin represents a single PeerConnection. If a client reconnects (new offer),
         # rebuild the gateway pipeline so ICE/DTLS state is clean.
@@ -1050,104 +1310,13 @@ class MosaicWebRTCGateway:
         except Exception:
             pass
 
-        # Log offer direction + H264 fmtp summary for diagnosis.
-        try:
-            import json, time
-
-            offer_dir = None
-            in_video = False
-            for line in (sdp_offer or "").splitlines():
-                line = line.strip()
-                if line.startswith("m="):
-                    in_video = line.startswith("m=video ")
-                    continue
-                if not in_video:
-                    continue
-                if line in ("a=sendonly", "a=recvonly", "a=sendrecv", "a=inactive"):
-                    offer_dir = line.split("=", 1)[1]
-                    break
-
-            offer_pts: list[dict[str, Any]] = []
-            if sdp_offer:
-                lines = [ln.strip() for ln in sdp_offer.splitlines() if ln.strip()]
-                video_mline = next((ln for ln in lines if ln.startswith("m=video ")), None)
-                if video_mline:
-                    parts = video_mline.split()
-                    pts: list[int] = []
-                    for token in parts[3:]:
-                        try:
-                            pts.append(int(token))
-                        except Exception:
-                            continue
-
-                    rtpmap: dict[int, str] = {}
-                    fmtp: dict[int, str] = {}
-                    for ln in lines:
-                        if ln.lower().startswith("a=rtpmap:"):
-                            try:
-                                prefix, mapping = ln.split(None, 1)
-                                pt = int(prefix.split(":", 1)[1])
-                                rtpmap[pt] = mapping.strip()
-                            except Exception:
-                                pass
-                        if ln.lower().startswith("a=fmtp:"):
-                            try:
-                                body = ln.split(":", 1)[1]
-                                pt_str, params = body.split(None, 1)
-                                pt = int(pt_str)
-                                fmtp[pt] = params.strip()
-                            except Exception:
-                                pass
-
-                    for pt in pts:
-                        m = rtpmap.get(pt, "")
-                        if m.lower().startswith("h264/"):
-                            offer_pts.append({"pt": pt, "rtpmap": m, "fmtp": fmtp.get(pt, "")})
-
-            with open("/home/mayor/Noesis_Devel/.cursor/debug.log", "a", encoding="utf-8") as _f:
-                _f.write(
-                    json.dumps(
-                        {
-                            "sessionId": "debug-session",
-                            "runId": "run1",
-                            "hypothesisId": "H4",
-                            "location": "mosaic_webrtc_gateway.py:accept_offer",
-                            "message": "offer summary",
-                            "data": {
-                                "video_direction": offer_dir,
-                                "h264_pts": offer_pts,
-                            },
-                            "timestamp": int(time.time() * 1000),
-                        }
-                    )
-                    + "\n"
-                )
-        except Exception:
-            logger.debug("Failed to record offer summary", exc_info=True)
-
-        # Persist full offer SDP for postmortem analysis (browser offers can be large).
-        try:
-            import json, time
-
-            with open("/home/mayor/Noesis_Devel/.cursor/debug.log", "a", encoding="utf-8") as _f:
-                _f.write(
-                    json.dumps(
-                        {
-                            "sessionId": "debug-session",
-                            "runId": "run1",
-                            "hypothesisId": "H4",
-                            "location": "mosaic_webrtc_gateway.py:accept_offer",
-                            "message": "offer sdp",
-                            "data": {"sdp": sdp_offer},
-                            "timestamp": int(time.time() * 1000),
-                        }
-                    )
-                    + "\n"
-                )
-        except Exception:
-            logger.debug("Failed to record offer sdp", exc_info=True)
-
         offer_pt = self._extract_h264_payload_type(sdp_offer)
+        logger.debug(
+            "WebRTC offer summary lines=%d video_direction=%s h264_pt=%s",
+            len((sdp_offer or "").splitlines()),
+            self._find_video_direction(sdp_offer),
+            offer_pt,
+        )
         if offer_pt is not None:
             self._offer_h264_pt = offer_pt
         else:
@@ -1188,12 +1357,15 @@ class MosaicWebRTCGateway:
             offer = GstWebRTC.WebRTCSessionDescription.new(GstWebRTC.WebRTCSDPType.OFFER, sdpmsg)
 
             # Set remote description
-            promise = Gst.Promise.new_with_change_func(self._on_set_remote_description_done)
+            promise = self._new_guarded_promise(
+                self._on_set_remote_description_done
+            )
             self.webrtc.emit("set-remote-description", offer, promise)
         except Exception as e:
             logger.exception("Error processing WebRTC offer: %s", e)
             self.ws.send_webrtc_error(str(e), gateway=self)
 
+    @_guard_gateway_callback()
     def _on_set_remote_description_done(self, promise: Gst.Promise) -> None:
         """Callback after setting remote description."""
         logger.info("    _on_set_remote_description_done callback fired")
@@ -1236,6 +1408,8 @@ class MosaicWebRTCGateway:
 
             def _poll_start_answer() -> bool:
                 try:
+                    if not self._accepts_async_work():
+                        return False
                     if not self._pending_create_answer or self._answer_create_started:
                         return False
 
@@ -1246,10 +1420,9 @@ class MosaicWebRTCGateway:
                         return False
 
                     started_at = self._pending_answer_started_at or time.monotonic()
-                    # RTSP startup can be slow on cold start (DESCRIBE/SETUP/PLAY + first keyframe).
-                    # Keep waiting long enough to avoid spurious "no frames" errors on the dashboard.
+                    # Cold SHM/AU startup can lag the signaling connection.
                     if time.monotonic() - started_at > 15.0:
-                        logger.warning("No RTSP frames yet; refusing to answer after 15s")
+                        logger.warning("No H.264 access units yet; refusing to answer after 15s")
                         self._pending_create_answer = False
                         try:
                             self.ws.send_webrtc_error("webrtc_gateway_no_frames", gateway=self)
@@ -1262,11 +1435,9 @@ class MosaicWebRTCGateway:
                     logger.debug("Error while waiting for first frame before answering", exc_info=True)
                     return False
 
-            try:
-                GLib.timeout_add(100, _poll_start_answer)
-            except Exception:
-                pass
+            self._schedule_glib_timeout(100, _poll_start_answer)
 
+    @_guard_gateway_callback()
     def _on_answer_created(self, promise: Gst.Promise) -> None:
         """Callback when answer is created."""
         logger.info("    _on_answer_created callback fired")
@@ -1296,9 +1467,6 @@ class MosaicWebRTCGateway:
             pt,
             "packetization-mode=1" in (sdp_text or ""),
         )
-        # Always log full SDP for debugging
-        logger.info("    Full SDP:\n%s", sdp_text)
-
         # Keep RTP caps aligned with the answer we are about to send. Offer-side
         # alignment usually wins, but this catches webrtcbin choosing a different
         # H264 PT during answer creation.
@@ -1318,32 +1486,10 @@ class MosaicWebRTCGateway:
             logger.error("Refusing to send SDP answer with video_direction=inactive")
             self._record_transceivers(stage="inactive-answer", location="mosaic_webrtc_gateway.py:_on_answer_created")
             try:
-                import json, time
-
-                with open("/home/mayor/Noesis_Devel/.cursor/debug.log", "a", encoding="utf-8") as _f:
-                    _f.write(
-                        json.dumps(
-                            {
-                                "sessionId": "debug-session",
-                                "runId": "run1",
-                                "hypothesisId": "H4",
-                                "location": "mosaic_webrtc_gateway.py:_on_answer_created",
-                                "message": "refused inactive answer",
-                                "data": {"video_direction": direction, "h264_pt": pt, "lines": sdp_lines},
-                                "timestamp": int(time.time() * 1000),
-                            }
-                        )
-                        + "\n"
-                    )
-            except Exception:
-                pass
-            try:
                 self.ws.send_webrtc_error("webrtc_gateway_inactive_answer", gateway=self)
             except Exception:
                 pass
             try:
-                ctx = GLib.MainContext.default()
-
                 def _rebuild(_: object) -> bool:
                     try:
                         self._peer_count = 0
@@ -1352,7 +1498,7 @@ class MosaicWebRTCGateway:
                         logger.debug("Failed to rebuild pipeline after inactive answer", exc_info=True)
                     return False
 
-                ctx.invoke_full(GLib.PRIORITY_DEFAULT, _rebuild, None)
+                self._invoke_glib(_rebuild)
             except Exception:
                 pass
             return
@@ -1364,20 +1510,23 @@ class MosaicWebRTCGateway:
                 p.wait()
             except Exception:
                 pass
+            if not self._accepts_async_work():
+                return
             logger.info("    Local description set")
             self.ws.send_webrtc_answer(sdp_text, gateway=self)
 
-        promise2 = Gst.Promise.new_with_change_func(_on_local_description_set)
+        promise2 = self._new_guarded_promise(_on_local_description_set)
         self.webrtc.emit("set-local-description", answer, promise2)
 
     def accept_ice(self, candidate: str, sdp_mline_index: int) -> None:
         """Handle incoming ICE candidate from browser client."""
+        if not self._accepts_async_work():
+            logger.debug("Ignoring ICE candidate during gateway shutdown")
+            return
         logger.info(">>> Gateway accept_ice called (mline=%d)", sdp_mline_index)
         if self.webrtc is None:
             logger.warning("Cannot accept ICE: webrtcbin not initialized")
             return
-
-        ctx = GLib.MainContext.default()
 
         def _do_ice(_: object) -> bool:
             try:
@@ -1386,12 +1535,11 @@ class MosaicWebRTCGateway:
                 logger.exception("Error adding ICE candidate")
             return False
 
-        try:
-            ctx.invoke_full(GLib.PRIORITY_DEFAULT, _do_ice, None)
-        except Exception:
-            _do_ice(None)
+        self._invoke_glib(_do_ice)
 
     def _accept_ice_impl(self, candidate: str, sdp_mline_index: int) -> None:
+        if not self._accepts_async_work():
+            return
         if self.webrtc is None or not self._remote_description_set:
             # Queue until we have a webrtcbin and remote description.
             try:
@@ -1407,16 +1555,24 @@ class MosaicWebRTCGateway:
 
     # ========== GStreamer signal handlers ==========
 
+    @_guard_gateway_callback()
     def _on_ice_candidate(
         self, element: Gst.Element, mline_index: int, candidate: str
     ) -> None:
         """Called when webrtcbin has a local ICE candidate to send to peer."""
-        logger.info("<<< Sending local ICE candidate (mline=%d): %s...", mline_index, candidate[:50] if candidate else '')
+        if element is not self.webrtc:
+            return
+        logger.info(
+            "<<< Sending local ICE candidate (mline=%d bytes=%d)",
+            mline_index,
+            len(candidate) if candidate else 0,
+        )
         try:
             self.ws.send_webrtc_ice(mline_index, candidate, gateway=self)
         except Exception as e:
             logger.warning("Failed to send ICE candidate: %s", e)
 
+    @_guard_gateway_callback()
     def _on_negotiation_needed(self, element: Gst.Element) -> None:
         """Called when webrtcbin needs negotiation."""
         # In our use case, the browser sends the offer, so we wait for that
@@ -1424,16 +1580,32 @@ class MosaicWebRTCGateway:
 
     # ========== Bus message handlers ==========
 
+    @_guard_gateway_callback()
     def _on_bus_error(self, bus: Gst.Bus, message: Gst.Message) -> None:
         """Handle pipeline errors."""
         err, debug = message.parse_error()
         logger.error("!!! WebRTC gateway pipeline ERROR: %s", err)
         logger.error("    Debug info: %s", debug)
+        self._report_terminal_pipeline_failure("webrtc_gateway_pipeline_error")
 
+    @_guard_gateway_callback()
     def _on_bus_eos(self, bus: Gst.Bus, message: Gst.Message) -> None:
         """Handle end-of-stream."""
         logger.warning("WebRTC gateway pipeline received EOS")
+        self._report_terminal_pipeline_failure("webrtc_gateway_unexpected_eos")
 
+    def _report_terminal_pipeline_failure(self, reason: str) -> None:
+        with self._lifecycle_condition:
+            if self._stopping or self._terminal_failure_reported:
+                return
+            self._terminal_failure_reported = True
+        try:
+            self.ws.send_webrtc_error(reason, gateway=self)
+        except Exception:
+            logger.debug("Failed to notify WebRTC owner of pipeline failure", exc_info=True)
+        self.ws.report_webrtc_gateway_failure(self, reason)
+
+    @_guard_gateway_callback()
     def _on_bus_state_changed(self, bus: Gst.Bus, message: Gst.Message) -> None:
         """Handle state changes."""
         if message.src != self.pipeline:

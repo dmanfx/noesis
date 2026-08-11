@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Replay a captured browser WebRTC SDP offer against the Noesis RTSP→WebRTC gateway.
+Replay a captured browser WebRTC SDP offer against the Noesis H.264-AU WebRTC gateway.
 
 This is an SDP-level regression gate to ensure the gateway never replies with
 `a=inactive` for the video m= section on browser-style offers.
@@ -16,12 +16,23 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import os
 import sys
 import time
 from pathlib import Path
 from typing import Optional
 
 import websockets
+
+from noesis_core.private_paths import (
+    PrivatePathError,
+    ensure_private_directory,
+    read_private_file,
+    validate_private_file,
+)
+
+
+MAX_OFFER_BYTES = 1024 * 1024
 
 
 def _sdp_video_direction(sdp: str) -> Optional[str]:
@@ -39,10 +50,20 @@ def _sdp_video_direction(sdp: str) -> Optional[str]:
 
 
 def _default_offer_path() -> Optional[Path]:
-    offer_dir = Path("/home/mayor/Noesis_Devel/.cursor/webrtc_offers")
+    configured = os.environ.get("NOESIS_WEBRTC_OFFER_DIR", "").strip()
+    offer_dir = (
+        Path(configured).expanduser()
+        if configured
+        else Path.home() / ".local" / "state" / "noesis" / "webrtc_offers"
+    )
     if not offer_dir.exists():
         return None
-    offers = sorted(offer_dir.glob("offer_*.sdp"), key=lambda p: p.stat().st_mtime, reverse=True)
+    private_dir = ensure_private_directory(offer_dir, label="WebRTC offer directory")
+    offers = [
+        validate_private_file(path, label="WebRTC offer")
+        for path in private_dir.glob("offer_*.sdp")
+    ]
+    offers.sort(key=lambda path: path.lstat().st_mtime_ns, reverse=True)
     return offers[0] if offers else None
 
 
@@ -91,15 +112,30 @@ def main() -> int:
     ap.add_argument("--timeout", type=float, default=5.0, help="Timeout seconds")
     args = ap.parse_args()
 
-    offer_path = Path(args.offer) if args.offer else _default_offer_path()
+    try:
+        offer_path = (
+            validate_private_file(Path(args.offer), label="WebRTC offer")
+            if args.offer
+            else _default_offer_path()
+        )
+    except PrivatePathError as exc:
+        print(f"FAIL: unsafe WebRTC offer path: {exc}", file=sys.stderr)
+        return 1
     if offer_path is None:
-        print("FAIL: no offer provided and no captured offers found in .cursor/webrtc_offers", file=sys.stderr)
+        print(
+            "FAIL: no offer provided and no owner-protected captured offers found",
+            file=sys.stderr,
+        )
         return 1
-    if not offer_path.exists():
-        print(f"FAIL: offer file not found: {offer_path}", file=sys.stderr)
+    try:
+        offer_sdp = read_private_file(
+            offer_path,
+            label="WebRTC offer",
+            max_bytes=MAX_OFFER_BYTES,
+        ).decode("utf-8")
+    except (PrivatePathError, UnicodeDecodeError) as exc:
+        print(f"FAIL: unable to read WebRTC offer safely: {exc}", file=sys.stderr)
         return 1
-
-    offer_sdp = offer_path.read_text(encoding="utf-8")
     if not offer_sdp.strip():
         print(f"FAIL: offer file is empty: {offer_path}", file=sys.stderr)
         return 1
@@ -110,4 +146,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

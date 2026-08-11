@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Headless WebRTC smoke test for the Noesis RTSP→WebRTC gateway.
+Headless WebRTC smoke test for the Noesis H.264-SHM→WebRTC gateway.
 
 This connects to the existing WebSocket signaling server, acts as a WebRTC
 offerer (recvonly video), and validates that we receive RTP and decoded frames.
@@ -14,12 +14,25 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import sys
 import threading
 import time
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Optional
 
-import gi
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from scripts.internal_auth_client import (  # noqa: E402
+    RequiredInternalAuth,
+    add_auth_token_file_argument,
+    connect_required_websocket,
+    load_required_internal_auth,
+)
+
+import gi  # noqa: E402
 
 gi.require_version("Gst", "1.0")
 gi.require_version("GstSdp", "1.0")
@@ -28,7 +41,6 @@ gi.require_version("GstWebRTC", "1.0")
 from gi.repository import GLib, Gst, GstSdp, GstWebRTC  # noqa: E402
 
 import websockets  # noqa: E402
-
 
 Gst.init(None)
 
@@ -141,7 +153,9 @@ class GstWebRTCRecvClient:
                     pass
                 time.sleep(0.01)
 
-        self._thread = threading.Thread(target=_run, name="NoesisWebRTCSmokeClient", daemon=True)
+        self._thread = threading.Thread(
+            target=_run, name="NoesisWebRTCSmokeClient", daemon=True
+        )
         self._thread.start()
         self._started = True
 
@@ -157,7 +171,7 @@ class GstWebRTCRecvClient:
 
     def stats(self) -> WebRTCStats:
         return self._stats
-    
+
     def saw_src_pad(self) -> bool:
         return self._saw_src_pad
 
@@ -169,7 +183,9 @@ class GstWebRTCRecvClient:
             res, sdpmsg = GstSdp.SDPMessage.new_from_text(sdp or "")
             if res != GstSdp.SDPResult.OK:
                 raise RuntimeError(f"Failed to parse SDP answer: {res}")
-            answer = GstWebRTC.WebRTCSessionDescription.new(GstWebRTC.WebRTCSDPType.ANSWER, sdpmsg)
+            answer = GstWebRTC.WebRTCSessionDescription.new(
+                GstWebRTC.WebRTCSDPType.ANSWER, sdpmsg
+            )
             self.webrtc.emit("set-remote-description", answer, Gst.Promise.new())
             return False
 
@@ -195,7 +211,9 @@ class GstWebRTCRecvClient:
         reply = promise.get_reply()
         offer = reply.get_value("offer") if reply is not None else None
         if offer is None:
-            self._push_outgoing({"type": "webrtc_error", "error": "client_create_offer_failed"})
+            self._push_outgoing(
+                {"type": "webrtc_error", "error": "client_create_offer_failed"}
+            )
             return
 
         sdp_text = offer.sdp.as_text()
@@ -207,9 +225,15 @@ class GstWebRTCRecvClient:
                 pass
             self._push_outgoing({"type": "webrtc_offer", "sdp": sdp_text})
 
-        self.webrtc.emit("set-local-description", offer, Gst.Promise.new_with_change_func(_on_local_set))
+        self.webrtc.emit(
+            "set-local-description",
+            offer,
+            Gst.Promise.new_with_change_func(_on_local_set),
+        )
 
-    def _on_ice_candidate(self, element: Gst.Element, mline_index: int, candidate: str) -> None:
+    def _on_ice_candidate(
+        self, element: Gst.Element, mline_index: int, candidate: str
+    ) -> None:
         self._push_outgoing(
             {
                 "type": "webrtc_ice_candidate",
@@ -228,7 +252,9 @@ class GstWebRTCRecvClient:
     def _on_peer_state(self, webrtc: Gst.Element, pspec: object) -> None:
         state = webrtc.get_property("connection-state")
         try:
-            self._stats.peer_state = GstWebRTC.WebRTCPeerConnectionState(state).value_nick
+            self._stats.peer_state = GstWebRTC.WebRTCPeerConnectionState(
+                state
+            ).value_nick
         except Exception:
             self._stats.peer_state = str(state)
 
@@ -252,7 +278,9 @@ class GstWebRTCRecvClient:
         dec = Gst.ElementFactory.make("avdec_h264", None)
         sink = Gst.ElementFactory.make("fakesink", None)
         if depay is None or parse is None or dec is None or sink is None:
-            raise RuntimeError("Missing GStreamer elements for decode chain (rtph264depay/h264parse/avdec_h264/fakesink)")
+            raise RuntimeError(
+                "Missing GStreamer elements for decode chain (rtph264depay/h264parse/avdec_h264/fakesink)"
+            )
 
         sink.set_property("sync", False)
         sink.set_property("signal-handoffs", True)
@@ -276,21 +304,32 @@ class GstWebRTCRecvClient:
         if ret != Gst.PadLinkReturn.OK:
             raise RuntimeError(f"Failed to link webrtc src pad -> depay: {ret}")
 
-    def _on_rtp_probe(self, pad: Gst.Pad, info: Gst.PadProbeInfo, user_data: object) -> Gst.PadProbeReturn:
+    def _on_rtp_probe(
+        self, pad: Gst.Pad, info: Gst.PadProbeInfo, user_data: object
+    ) -> Gst.PadProbeReturn:
         self._stats.rtp_packets += 1
         return Gst.PadProbeReturn.OK
 
-    def _on_decoded_handoff(self, sink: Gst.Element, buffer: Gst.Buffer, pad: Gst.Pad) -> None:
+    def _on_decoded_handoff(
+        self, sink: Gst.Element, buffer: Gst.Buffer, pad: Gst.Pad
+    ) -> None:
         self._stats.decoded_frames += 1
 
     def _on_bus_error(self, bus: Gst.Bus, message: Gst.Message) -> None:
         err, debug = message.parse_error()
-        self._push_outgoing({"type": "webrtc_error", "error": f"client_bus_error: {err}", "debug": debug})
+        self._push_outgoing(
+            {
+                "type": "webrtc_error",
+                "error": f"client_bus_error: {err}",
+                "debug": debug,
+            }
+        )
 
 
 async def run_smoke_test(
     *,
     ws_url: str,
+    auth: RequiredInternalAuth,
     duration_s: float,
     min_rtp: int,
     min_decoded: int,
@@ -299,14 +338,16 @@ async def run_smoke_test(
 ) -> int:
     outgoing: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
     loop = asyncio.get_running_loop()
-    client = GstWebRTCRecvClient(loop=loop, outgoing=outgoing, stun_server=stun_server, h264_pt=h264_pt)
+    client = GstWebRTCRecvClient(
+        loop=loop, outgoing=outgoing, stun_server=stun_server, h264_pt=h264_pt
+    )
 
     ws: Optional[websockets.WebSocketClientProtocol] = None
     connect_deadline = time.monotonic() + 15.0
     last_exc: Optional[BaseException] = None
     while ws is None and time.monotonic() < connect_deadline:
         try:
-            ws = await websockets.connect(ws_url, max_size=None)
+            ws = await connect_required_websocket(ws_url, auth, max_size=None)
         except Exception as exc:
             last_exc = exc
             await asyncio.sleep(0.25)
@@ -333,14 +374,18 @@ async def run_smoke_test(
             while not answer_seen.is_set():
                 remaining = answer_deadline - time.monotonic()
                 if remaining <= 0:
-                    raise RuntimeError("Timed out waiting for webrtc_answer from server")
+                    raise RuntimeError(
+                        "Timed out waiting for webrtc_answer from server"
+                    )
 
                 try:
                     raw = await asyncio.wait_for(ws.recv(), timeout=min(0.5, remaining))
                 except asyncio.TimeoutError:
                     continue
                 except websockets.exceptions.ConnectionClosed as exc:
-                    raise RuntimeError(f"WebSocket closed while waiting for answer: {exc}") from exc
+                    raise RuntimeError(
+                        f"WebSocket closed while waiting for answer: {exc}"
+                    ) from exc
 
                 if isinstance(raw, (bytes, bytearray)):
                     continue
@@ -352,7 +397,9 @@ async def run_smoke_test(
                     client.set_remote_answer(sdp)
                     answer_seen.set()
                 elif t == "webrtc_ice_candidate":
-                    client.add_ice_candidate(msg.get("candidate", ""), int(msg.get("sdpMLineIndex", 0)))
+                    client.add_ice_candidate(
+                        msg.get("candidate", ""), int(msg.get("sdpMLineIndex", 0))
+                    )
                 elif t == "webrtc_error":
                     raise RuntimeError(f"Server webrtc_error: {msg.get('error')}")
 
@@ -363,13 +410,17 @@ async def run_smoke_test(
                 except asyncio.TimeoutError:
                     continue
                 except websockets.exceptions.ConnectionClosed as exc:
-                    raise RuntimeError(f"WebSocket closed during media loop: {exc}") from exc
+                    raise RuntimeError(
+                        f"WebSocket closed during media loop: {exc}"
+                    ) from exc
                 if isinstance(raw, (bytes, bytearray)):
                     continue
                 msg = json.loads(raw)
                 t = msg.get("type")
                 if t == "webrtc_ice_candidate":
-                    client.add_ice_candidate(msg.get("candidate", ""), int(msg.get("sdpMLineIndex", 0)))
+                    client.add_ice_candidate(
+                        msg.get("candidate", ""), int(msg.get("sdpMLineIndex", 0))
+                    )
                 elif t == "webrtc_error":
                     raise RuntimeError(f"Server webrtc_error: {msg.get('error')}")
 
@@ -377,7 +428,8 @@ async def run_smoke_test(
             print(
                 json.dumps(
                     {
-                        "ok": st.rtp_packets >= min_rtp and st.decoded_frames >= min_decoded,
+                        "ok": st.rtp_packets >= min_rtp
+                        and st.decoded_frames >= min_decoded,
                         "answer_video_direction": answer_dir,
                         "ice_state": st.ice_state,
                         "peer_state": st.peer_state,
@@ -418,11 +470,24 @@ def main() -> int:
     ap.add_argument("--min-rtp", dest="min_rtp", type=int, default=10)
     ap.add_argument("--min-decoded", dest="min_decoded", type=int, default=1)
     ap.add_argument("--stun", dest="stun_server", default=None)
-    ap.add_argument("--pt", dest="h264_pt", type=int, default=96, help="H264 RTP payload type to advertise in offer")
+    ap.add_argument(
+        "--pt",
+        dest="h264_pt",
+        type=int,
+        default=96,
+        help="H264 RTP payload type to advertise in offer",
+    )
+    add_auth_token_file_argument(ap)
     args = ap.parse_args()
+    try:
+        auth = load_required_internal_auth(args.auth_token_file)
+    except Exception as exc:
+        print(f"[FAIL] required internal auth unavailable: {exc}")
+        return 1
     return asyncio.run(
         run_smoke_test(
             ws_url=args.ws_url,
+            auth=auth,
             duration_s=args.duration_s,
             min_rtp=args.min_rtp,
             min_decoded=args.min_decoded,

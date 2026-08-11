@@ -1,105 +1,678 @@
-version: 1
-deepstream:
-  required_major: 9
-  required_home: /opt/nvidia/deepstream/deepstream-9.0
-  required_tensorrt: 10.14.1.48
+schema_version: 2
+manifest_id: noesis-ds9-artifacts
+schema: DS9/docs/asset_manifest.schema.json
+updated_at: "2026-07-11"
+
+target:
+  platform: linux-x86_64-dgpu
   python: "3.12"
+  deepstream:
+    major: 9
+    version: "9.0"
+    home: /opt/nvidia/deepstream/deepstream-9.0
+  cuda: "13.1"
+  tensorrt: "10.14.1.48"
+  build_image:
+    reference: noesis-ds9-dev:9.0-20260710
+    image_id: sha256:7476b1021376cd67793c95d949cdc7d46eef7704ab98a5a76feed461e4f907a4
+    base_digest: sha256:2e45070ad134b9ab2caa4a97ba4d52fa8744a4f0db30900bd92828d51425a69a
+    tensorrt_version: 10.14.1.48+cuda13.0
+    cuda_version: 13.1.1.006
+    dockerfile: DS9/docker/Dockerfile
+    dockerfile_sha256: c1df566ec73759a5bef0275dc5e9edcdc41be3f6b3f3a102a19d89a5f9860c9e
+    requirements: DS9/docker/requirements.lock.txt
+    requirements_sha256: de35fb439f5c9bfd05d7fbc23436122aee033bd7b584b2eb139358e50211be48
 
 runtime:
+  image:
+    reference: noesis-ds9-runtime:9.0-20260710
+    image_id: sha256:ca33b4c6a84fc56b86b71feee2a444299cb2ce7f33ab018cae43ac730aaef5fc
+    parent_reference: noesis-ds9-dev:9.0-20260710
+    parent_image_id: sha256:7476b1021376cd67793c95d949cdc7d46eef7704ab98a5a76feed461e4f907a4
+    base_digest: sha256:2e45070ad134b9ab2caa4a97ba4d52fa8744a4f0db30900bd92828d51425a69a
+    tensorrt_version: 10.14.1.48+cuda13.0
+    cuda_version: 13.1.1.006
+    dockerfile: DS9/docker/Dockerfile.runtime
+    dockerfile_sha256: f3345a4c87483a70dc48a7185330880805d38dbc97d18d57c4b08ab1e415d51e
   entrypoint: DS9/noesis/ds9_runtime.py
+  implementation: DS9/noesis/ds9_runtime_core.py
   pipeline_config: DS9/config/infer.yaml
+  v3dt_pipeline_config: DS9/config/infer_v3dt.yaml
+  v3dt_cameras_config: DS9/config/cameras_v3dt.yaml
+  v3dt_tracker_config: DS9/config/v3dt/nvtracker_v3dt.yaml
   preflight: DS9/scripts/ds9_preflight.py
+  canonical_world_factory: noesis_core/runtime_world.py
+  capability_health_api: noesis/server/health_api.py
+  scene_release_api: noesis/server/scene_api.py
 
-native_extensions:
-  output_dir: DS9/native_extensions
-  build_script: DS9/scripts/build_native_extensions.sh
-  modules:
-    - noesis_pose_meta_ext
-    - noesis_v3dt_meta_ext
-    - noesis_reid_meta_ext
-    - noesis_latency_ext
-    - noesis_depth_meta_ext
-    - noesis_depth_tracking_tensor_ext
+policy:
+  ds8_binary_reuse: forbidden
+  root_engine_reuse: forbidden
+  root_native_extension_reuse: forbidden
+  require_ds9_owned_outputs: true
+  require_provenance_for_validated: true
+  virtual_model_root: DS9/models
+  physical_model_root_env: NOESIS_DS9_ARTIFACT_ROOT
+  minimum_residual_artifact_bytes: 10737418240
+  output_roots:
+    - DS9/models/engines
+    - DS9/native_extensions
+    - DS9/pipelines
+    - DS9/gst-plugins
+    - DS9/plugins
+    - DS9/build
+  source_roots:
+    - DS9/models/onnx
+    - DS9/models/tracker_reid
+    - DS9/native
+    - DS9/pipelines
+    - DS9/csrc
+    - DS9/gst-plugins
+    - external/DeepStream-Yolo-Seg/nvdsinfer_custom_impl_Yolo_seg
+  allowed_states: [missing, staged_unverified, validated]
+  canonical_profile: canonical
+  profile_inheritance:
+    canonical: [runtime_common]
+    v3dt: [runtime_common]
+    yolo11_seg: [runtime_common]
 
-custom_parsers:
-  build_script: DS9/scripts/build_custom_parsers.sh
-  outputs:
-    - DS9/pipelines/nvdsinfer_yolo11_seg/libnvdsinfer_yolo11_seg.so
-    - DS9/pipelines/nvdsinfer_yolo26_seg/libnvdsinfer_yolo26_seg.so
-    - DS9/pipelines/nvdsinfer_yolo_detect/libnvdsparsebbox_yolo.so
-    - DS9/pipelines/nvdsinfer_rfdetr/libnvdsinfer_rfdetr.so
-    - DS9/pipelines/nvdsinfer_rfdetr_seg/libnvdsinfer_rfdetr_seg.so
+artifacts:
+  - id: native.pose_meta
+    kind: native_extension
+    role: DS9 Service Maker pose user-meta attachment
+    output: DS9/native_extensions/noesis_pose_meta_ext*.so
+    sources: [DS9/native/noesis_pose_meta_ext.cpp]
+    builder: DS9/scripts/build_noesis_pose_meta_ext.sh
+    required_profiles: [runtime_common, full]
+    state: staged_unverified
+    compatibility: {deepstream_major: 9, cuda: "13.1", tensorrt: null}
+    provenance:
+      source_sha256: c50a971f9095f9af3c4420d8efcb7675ce1fccdeae4615c6263db8e46e96f5e4
+      output_sha256: 35cf613eb8cc2f8172ffb5a8e4c4146c1056f465eed2a85ae7cbd72a6080e6a0
+      built_at_utc: "2026-07-25T01:45:06Z"
+      build_host: "TauntonMainframe local DS9 9.0 install"
+      command: bash DS9/scripts/build_noesis_pose_meta_ext.sh
+  - id: native.depth_meta
+    kind: native_extension
+    role: Object-depth user-meta attachment and extraction
+    output: DS9/native_extensions/noesis_depth_meta_ext*.so
+    sources: [DS9/native/noesis_depth_meta_ext.cpp]
+    builder: DS9/scripts/build_noesis_depth_meta_ext.sh
+    required_profiles: [runtime_common, full]
+    state: staged_unverified
+    compatibility: {deepstream_major: 9, cuda: "13.1", tensorrt: null}
+    provenance:
+      source_sha256: 5aea5cdee15d6a152109defacdb4794f2ad1a8f0ea1701772e5724aa0fc76192
+      output_sha256: bb4f7a9a29ad6b92c682d9ec1a5cf541070348083fa569911624df0a1ae60b09
+      built_at_utc: "2026-07-11T05:48:11Z"
+      build_host: "noesis-ds9-dev@sha256:7476b1021376cd67793c95d949cdc7d46eef7704ab98a5a76feed461e4f907a4"
+      command: bash DS9/scripts/build_native_extensions.sh
+  - id: native.depth_tracking_tensor
+    kind: native_extension
+    role: DAv2 device-frame capture, CUDA ROI statistics, and exact MapAnything tensor capture
+    output: DS9/native_extensions/noesis_depth_tracking_tensor_ext*.so
+    sources:
+      - DS9/native/noesis_depth_tracking_tensor_ext.cpp
+      - DS9/native/noesis_depth_tracking_tensor_kernels.cu
+    builder: DS9/scripts/build_noesis_depth_tracking_tensor_ext.sh
+    required_profiles: [runtime_common, full]
+    state: staged_unverified
+    compatibility: {deepstream_major: 9, cuda: "13.1", tensorrt: null}
+    provenance:
+      source_sha256: 6c6254bcb36693b6a5732bd045cfa9efea5558ba10864a47ffe099949929e7c4
+      output_sha256: fcd38dceadcbc62c14e257efc5c997d1bb1cc924490541cf452061be09065423
+      built_at_utc: "2026-07-11T19:29:18Z"
+      build_host: "noesis-ds9-dev@sha256:7476b1021376cd67793c95d949cdc7d46eef7704ab98a5a76feed461e4f907a4"
+      command: bash DS9/scripts/build_noesis_depth_tracking_tensor_ext.sh
+  - id: native.reid_meta
+    kind: native_extension
+    role: ReID embedding extraction
+    output: DS9/native_extensions/noesis_reid_meta_ext*.so
+    sources: [DS9/native/noesis_reid_meta_ext.cpp]
+    builder: DS9/scripts/build_noesis_reid_meta_ext.sh
+    required_profiles: [runtime_common, full]
+    state: staged_unverified
+    compatibility: {deepstream_major: 9, cuda: "13.1", tensorrt: null}
+    provenance:
+      source_sha256: 6b44475041e782b428312931414275f6144e5dd120c1d8894640d0cc89afc9d6
+      output_sha256: 4923d8b521131551ea31d9978add8d519b8ec5943a44cf3ea19c664e7276c123
+      built_at_utc: "2026-07-11T05:48:11Z"
+      build_host: "noesis-ds9-dev@sha256:7476b1021376cd67793c95d949cdc7d46eef7704ab98a5a76feed461e4f907a4"
+      command: bash DS9/scripts/build_native_extensions.sh
+  - id: native.v3dt_meta
+    kind: native_extension
+    role: V3DT visibility, image-foot, and 3D bbox metadata
+    output: DS9/native_extensions/noesis_v3dt_meta_ext*.so
+    sources: [DS9/native/noesis_v3dt_meta_ext.cpp]
+    builder: DS9/scripts/build_noesis_v3dt_meta_ext.sh
+    required_profiles: [v3dt, full]
+    state: staged_unverified
+    compatibility: {deepstream_major: 9, cuda: "13.1", tensorrt: null}
+    provenance:
+      source_sha256: 146d39598199374aea430d5f54e0cc54a22199d25177435880bc26d1ecb7beb2
+      output_sha256: d4787c52501dfc5dea245e15ec6388694eaee12e6ad831e0837950d9234001b5
+      built_at_utc: "2026-07-11T17:42:41Z"
+      build_host: "noesis-ds9-dev@sha256:7476b1021376cd67793c95d949cdc7d46eef7704ab98a5a76feed461e4f907a4"
+      command: bash DS9/scripts/build_native_ext_ds9.sh noesis_v3dt_meta_ext DS9/native/noesis_v3dt_meta_ext.cpp plain
+  - id: native.latency
+    kind: native_extension
+    role: In-process latency metadata
+    output: DS9/native_extensions/noesis_latency_ext*.so
+    sources: [DS9/native/noesis_latency_ext.cpp]
+    builder: DS9/scripts/build_noesis_latency_ext.sh
+    required_profiles: [runtime_common, full]
+    state: staged_unverified
+    compatibility: {deepstream_major: 9, cuda: "13.1", tensorrt: null}
+    provenance:
+      source_sha256: 766d137e6d00a8b3a1e2d87142843405212e5fa6407a04cde12a63f9df1e4bd8
+      output_sha256: 621801bb731a213ab194533db5fa5f23e095f85f4fb0f1b2853c900241bb18c7
+      built_at_utc: "2026-07-11T05:48:11Z"
+      build_host: "noesis-ds9-dev@sha256:7476b1021376cd67793c95d949cdc7d46eef7704ab98a5a76feed461e4f907a4"
+      command: bash DS9/scripts/build_native_extensions.sh
 
-custom_gstreamer_plugins:
-  build_script: DS9/scripts/build_gst_plugins.sh
-  outputs:
-    - DS9/gst-plugins/libgstnvdsroiexclude.so
+  - id: plugin.roi_exclude
+    kind: gstreamer_plugin
+    role: Pre-tracker analytics exclusion
+    output: DS9/gst-plugins/libgstnvdsroiexclude.so
+    sources:
+      - DS9/csrc/nvdsroiexclude/gstnvdsroiexclude.cpp
+      - DS9/csrc/nvdsroiexclude/CMakeLists.txt
+    builder: DS9/scripts/build_nvdsroiexclude_ds9.sh
+    required_profiles: [runtime_common, full]
+    state: staged_unverified
+    compatibility: {deepstream_major: 9, cuda: "13.1", tensorrt: null}
+    provenance:
+      source_sha256: 353d747295fa94eaaa956238e2010440a09cdcb9f818254d99a4de08402bb1ef
+      output_sha256: 448029cdb418493f41f7feac9668e08739109e8a9622c5608783aef532815629
+      built_at_utc: "2026-07-11T03:36:21Z"
+      build_host: "noesis-ds9-dev@sha256:7476b1021376cd67793c95d949cdc7d46eef7704ab98a5a76feed461e4f907a4 (driver 595.71.05)"
+      command: NOESIS_DEEPSTREAM_HOME=/opt/nvidia/deepstream/deepstream-9.0 bash DS9/scripts/build_nvdsroiexclude_ds9.sh
+  - id: plugin.force_idr
+    kind: gstreamer_plugin
+    role: Strict downstream NVIDIA encoder force-IDR control
+    output: DS9/gst-plugins/libgstnoesisforceidr.so
+    sources:
+      - DS9/gst-plugins/noesisforceidr/gstnoesisforceidr.cpp
+      - DS9/gst-plugins/noesisforceidr/CMakeLists.txt
+      - DS9/gst-plugins/build_noesisforceidr.sh
+    builder: DS9/scripts/build_gst_plugins.sh
+    required_profiles: [runtime_common, full]
+    state: staged_unverified
+    compatibility: {deepstream_major: 9, cuda: "13.1", tensorrt: null}
+    provenance:
+      source_sha256: 498678a0e1dd2c58e391610385cacccb004aaa998d909b15a4547f133fda10f4
+      output_sha256: c5cd20e612ec9dfcb9550f4628c586b72e7f54c3c17154e931e08c1875afc94e
+      built_at_utc: "2026-07-10T20:58:55Z"
+      build_host: "TauntonMainframe (driver 595.71.05)"
+      command: NOESIS_DEEPSTREAM_HOME=/opt/nvidia/deepstream/deepstream-9.0 ./DS9/gst-plugins/build_noesisforceidr.sh
+  - id: plugin.orderly_eos
+    kind: gstreamer_plugin
+    role: Strict downstream orderly pipeline EOS control
+    output: DS9/gst-plugins/libgstnoesiseos.so
+    sources:
+      - DS9/gst-plugins/noesiseos/gstnoesiseos.cpp
+      - DS9/gst-plugins/noesiseos/CMakeLists.txt
+      - DS9/gst-plugins/build_noesiseos.sh
+    builder: DS9/scripts/build_gst_plugins.sh
+    required_profiles: [runtime_common, full]
+    state: staged_unverified
+    compatibility: {deepstream_major: 9, cuda: "13.1", tensorrt: null}
+    provenance:
+      source_sha256: 3f7d4c7f47ce293bead35b8ba473f3f4d77e4ae106ac24650c2c8abad802d56c
+      output_sha256: 8fed3ca89b103cb8e3c2ece7df057c9d6c78da56d7d46e6d63f929445aa0156a
+      built_at_utc: "2026-07-10T21:40:42Z"
+      build_host: "TauntonMainframe (driver 595.71.05)"
+      command: NOESIS_DEEPSTREAM_HOME=/opt/nvidia/deepstream/deepstream-9.0 ./DS9/gst-plugins/build_noesiseos.sh
+  - id: plugin.yolo_seg_tensorrt
+    kind: tensorrt_plugin
+    role: YOLO segmentation TensorRT plugin
+    output: DS9/plugins/libnvdsinfer_custom_impl_Yolo_seg.so
+    sources:
+      - external/DeepStream-Yolo-Seg/nvdsinfer_custom_impl_Yolo_seg/Makefile
+      - external/DeepStream-Yolo-Seg/nvdsinfer_custom_impl_Yolo_seg/nvdsparseseg_Yolo.cpp
+      - external/DeepStream-Yolo-Seg/nvdsinfer_custom_impl_Yolo_seg/nvdsparseseg_Yolo11.cpp
+      - external/DeepStream-Yolo-Seg/nvdsinfer_custom_impl_Yolo_seg/trt_plugins/common.cpp
+      - external/DeepStream-Yolo-Seg/nvdsinfer_custom_impl_Yolo_seg/trt_plugins/common.h
+      - external/DeepStream-Yolo-Seg/nvdsinfer_custom_impl_Yolo_seg/trt_plugins/efficientNMSPlugin/efficientNMSInference.cu
+      - external/DeepStream-Yolo-Seg/nvdsinfer_custom_impl_Yolo_seg/trt_plugins/efficientNMSPlugin/efficientNMSInference.h
+      - external/DeepStream-Yolo-Seg/nvdsinfer_custom_impl_Yolo_seg/trt_plugins/efficientNMSPlugin/efficientNMSParameters.h
+      - external/DeepStream-Yolo-Seg/nvdsinfer_custom_impl_Yolo_seg/trt_plugins/efficientNMSPlugin/efficientNMSPlugin.cpp
+      - external/DeepStream-Yolo-Seg/nvdsinfer_custom_impl_Yolo_seg/trt_plugins/efficientNMSPlugin/efficientNMSPlugin.h
+      - external/DeepStream-Yolo-Seg/nvdsinfer_custom_impl_Yolo_seg/trt_plugins/roiAlignPlugin/roiAlignKernel.cu
+      - external/DeepStream-Yolo-Seg/nvdsinfer_custom_impl_Yolo_seg/trt_plugins/roiAlignPlugin/roiAlignKernel.h
+      - external/DeepStream-Yolo-Seg/nvdsinfer_custom_impl_Yolo_seg/trt_plugins/roiAlignPlugin/roiAlignPlugin.cpp
+      - external/DeepStream-Yolo-Seg/nvdsinfer_custom_impl_Yolo_seg/trt_plugins/roiAlignPlugin/roiAlignPlugin.h
+    builder: DS9/scripts/build_trt_plugins.sh
+    required_profiles: [v3dt, yolo11_seg, yolo26_seg, full]
+    state: staged_unverified
+    compatibility: {deepstream_major: 9, cuda: "13.1", tensorrt: "10.14.1.48"}
+    provenance:
+      source_sha256: d504790aef87b9091a0c92def174956b214c8daab618799ae99561c1386463d3
+      output_sha256: 5e6dadfa5b141d38809c54a9ecd996c521275992a54117d049568d981e220253
+      built_at_utc: "2026-07-10T14:40:49Z"
+      build_host: "noesis-ds9-dev@sha256:7476b1021376cd67793c95d949cdc7d46eef7704ab98a5a76feed461e4f907a4"
+      command: bash DS9/scripts/build_trt_plugins.sh
 
-custom_tensorrt_plugins:
-  build_script: DS9/scripts/build_trt_plugins.sh
-  outputs:
-    - DS9/plugins/libnvdsinfer_custom_impl_Yolo_seg.so
+  - id: parser.yolo11_seg
+    kind: nvinfer_parser
+    role: YOLO11 instance segmentation output parser
+    output: DS9/pipelines/nvdsinfer_yolo11_seg/libnvdsinfer_yolo11_seg.so
+    sources: [DS9/pipelines/nvdsinfer_yolo11_seg/nvdsinfer_yolo11_seg.cpp]
+    builder: DS9/scripts/build_custom_parsers.sh
+    required_profiles: [yolo11_seg, full]
+    state: staged_unverified
+    compatibility: {deepstream_major: 9, cuda: "13.1", tensorrt: "10.14.1.48"}
+    provenance:
+      source_sha256: c1a508d1f2f0ba313063a31049fadf995f6a577e7d548ed07051a47e5cdb9416
+      output_sha256: ac05e6d76cc98b6b946cede96cfd646bc142ddc7a78bc52ac288875b419555a0
+      built_at_utc: "2026-07-10T14:40:49Z"
+      build_host: "noesis-ds9-dev@sha256:7476b1021376cd67793c95d949cdc7d46eef7704ab98a5a76feed461e4f907a4"
+      command: bash DS9/scripts/build_custom_parsers.sh
+  - id: parser.yolo26_seg
+    kind: nvinfer_parser
+    role: YOLO26 instance segmentation output parser
+    output: DS9/pipelines/nvdsinfer_yolo26_seg/libnvdsinfer_yolo26_seg.so
+    sources: [DS9/pipelines/nvdsinfer_yolo26_seg/nvdsinfer_yolo26_seg.cpp]
+    builder: DS9/scripts/build_custom_parsers.sh
+    required_profiles: [v3dt, yolo26_seg, full]
+    state: staged_unverified
+    compatibility: {deepstream_major: 9, cuda: "13.1", tensorrt: "10.14.1.48"}
+    provenance:
+      source_sha256: 9b98dfedf8bda7c41ebcde62fb1ebc6d661434b0f9008d0b4ea88d66251cbb71
+      output_sha256: 7be211c559c2885b8ad76ca537f5aa3dd95c2cc91324c99e378fb591de891079
+      built_at_utc: "2026-07-10T14:40:49Z"
+      build_host: "noesis-ds9-dev@sha256:7476b1021376cd67793c95d949cdc7d46eef7704ab98a5a76feed461e4f907a4"
+      command: bash DS9/scripts/build_custom_parsers.sh
+  - id: parser.yolo_detect
+    kind: nvinfer_parser
+    role: YOLO11 and YOLO26 detect-only bbox parser
+    output: DS9/pipelines/nvdsinfer_yolo_detect/libnvdsparsebbox_yolo.so
+    sources: [DS9/pipelines/nvdsinfer_yolo_detect/nvdsinfer_yolo_detect.cpp]
+    builder: DS9/scripts/build_custom_parsers.sh
+    required_profiles: [canonical, yolo11, yolo26, full]
+    state: staged_unverified
+    compatibility: {deepstream_major: 9, cuda: "13.1", tensorrt: "10.14.1.48"}
+    provenance:
+      source_sha256: d3c570684e0eda98f31cc15b0dba17b0195d51d2ad14f6660958ae321aa35bd5
+      output_sha256: e7ed437f2cc49acabcd9a33c07e7faef4758f901c18555fd403ad0544e30168d
+      built_at_utc: "2026-07-10T14:40:49Z"
+      build_host: "noesis-ds9-dev@sha256:7476b1021376cd67793c95d949cdc7d46eef7704ab98a5a76feed461e4f907a4"
+      command: bash DS9/scripts/build_custom_parsers.sh
+  - id: parser.rfdetr_detect
+    kind: nvinfer_parser
+    role: RF-DETR detect-only output parser
+    output: DS9/pipelines/nvdsinfer_rfdetr/libnvdsinfer_rfdetr.so
+    sources: [DS9/pipelines/nvdsinfer_rfdetr/nvdsinfer_rfdetr.cpp]
+    builder: DS9/scripts/build_custom_parsers.sh
+    required_profiles: [rfdetr, full]
+    state: staged_unverified
+    compatibility: {deepstream_major: 9, cuda: "13.1", tensorrt: "10.14.1.48"}
+    provenance:
+      source_sha256: 40cfe286fa5ba0b8811253910802ced5de14d73e4a47b6df02fa022ba9511dfe
+      output_sha256: aa91b1ba457a452599dee0ca7b63894e6a68616475e00171ae8550c81fa4a112
+      built_at_utc: "2026-07-25T02:15:19Z"
+      build_host: "TauntonMainframe local DS9 9.0 install"
+      command: >-
+        make -B -C DS9/pipelines/nvdsinfer_rfdetr
+        DS_HOME=/opt/nvidia/deepstream/deepstream-9.0
+        CUDA_HOME=/usr/local/cuda OUT_DIR=.
+  - id: parser.rfdetr_seg
+    kind: nvinfer_parser
+    role: RF-DETR segmentation output parser
+    output: DS9/pipelines/nvdsinfer_rfdetr_seg/libnvdsinfer_rfdetr_seg.so
+    sources: [DS9/pipelines/nvdsinfer_rfdetr_seg/nvdsinfer_rfdetr_seg.cpp]
+    builder: DS9/scripts/build_custom_parsers.sh
+    required_profiles: [rfdetr_seg, full]
+    state: staged_unverified
+    compatibility: {deepstream_major: 9, cuda: "13.1", tensorrt: "10.14.1.48"}
+    provenance:
+      source_sha256: 4da1532698f8236ee67aff637cf1bd0cea9b3be825982396535915b70cbcf8a5
+      output_sha256: de9ad9b42799eccc1716c1032128092773c7400b826cd54aaec80515a7f32ec3
+      built_at_utc: "2026-07-25T02:15:19Z"
+      build_host: "TauntonMainframe local DS9 9.0 install"
+      command: >-
+        make -B -C DS9/pipelines/nvdsinfer_rfdetr_seg
+        DS_HOME=/opt/nvidia/deepstream/deepstream-9.0
+        CUDA_HOME=/usr/local/cuda OUT_DIR=.
+  - id: parser.rfdetr_keypoint
+    kind: nvinfer_parser
+    role: RF-DETR 1.8.3 keypoint-preview person bbox output parser
+    output: DS9/pipelines/nvdsinfer_rfdetr_keypoint/libnvdsinfer_rfdetr_keypoint.so
+    sources: [DS9/pipelines/nvdsinfer_rfdetr_keypoint/nvdsinfer_rfdetr_keypoint.cpp]
+    builder: DS9/scripts/build_all_parsers_ds9.sh
+    required_profiles: [rfdetr_keypoint, full]
+    state: staged_unverified
+    compatibility: {deepstream_major: 9, cuda: "13.1", tensorrt: "10.14.1.48"}
+    provenance:
+      source_sha256: 45752cd76644d161268ef6017c854e6ae4473d772edcfc2915d10583492208ae
+      output_sha256: 3d248d070077709d9f44548f26fd94dbd434a3599d38604818d8d30cc3792cb2
+      built_at_utc: "2026-07-25T01:45:06Z"
+      build_host: "TauntonMainframe local DS9 9.0 install"
+      command: >-
+        make -B -C DS9/pipelines/nvdsinfer_rfdetr_keypoint
+        DS_HOME=/opt/nvidia/deepstream/deepstream-9.0
+        CUDA_HOME=/usr/local/cuda
+        OUT_DIR=DS9/pipelines/nvdsinfer_rfdetr_keypoint
+  - id: parser.wholebody49
+    kind: nvinfer_parser
+    role: DEIMv2 Wholebody49 instance-mask and bbox output parser
+    output: DS9/pipelines/nvdsinfer_deimv2_wholebody49/libnvdsinfer_deimv2_wholebody49.so
+    sources: [DS9/pipelines/nvdsinfer_deimv2_wholebody49/nvdsinfer_deimv2_wholebody49.cpp]
+    builder: DS9/scripts/build_custom_parsers.sh
+    required_profiles: [wholebody49, full]
+    state: staged_unverified
+    compatibility: {deepstream_major: 9, cuda: "13.1", tensorrt: "10.14.1.48"}
+    provenance:
+      source_sha256: 3a651979a55752074790e3794563b97ea7e23078b9781f0ff228c2258f8e73f6
+      output_sha256: b6480bbc437db9e8863c819b87e3f9102bea4c122ab3969dcd1280baad747e3c
+      built_at_utc: "2026-07-11T06:51:48Z"
+      build_host: "noesis-ds9-dev@sha256:7476b1021376cd67793c95d949cdc7d46eef7704ab98a5a76feed461e4f907a4"
+      command: >-
+        docker --host unix://$NOESIS_DS9_DOCKER_ROOT/run/docker.sock run --rm
+        --runtime=runc --network=none --read-only --cap-drop=ALL
+        --security-opt=no-new-privileges --user 1000:1000 --env HOME=/tmp/noesis-home
+        --env NVIDIA_VISIBLE_DEVICES=void --tmpfs /tmp:rw,exec,nosuid,nodev,size=268435456
+        --mount type=bind,src=$PWD/DS9/pipelines/nvdsinfer_deimv2_wholebody49,dst=/workspace/parser,readonly
+        --mount type=bind,src=$NOESIS_DS9_ARTIFACT_ROOT/parser_rebuild/20260711T064934Z-wholebody49-strict/ds9,dst=/workspace/output
+        --workdir /workspace/parser --entrypoint /usr/bin/make
+        sha256:7476b1021376cd67793c95d949cdc7d46eef7704ab98a5a76feed461e4f907a4
+        DS_HOME=/opt/nvidia/deepstream/deepstream-9.0 CUDA_HOME=/usr/local/cuda-13.1
+        OUT_DIR=/workspace/output
+        CXXFLAGS='-std=c++17 -O2 -Wall -Wextra -Werror -Wno-missing-field-initializers
+        -Wno-unused-parameter -fPIC -I/opt/nvidia/deepstream/deepstream-9.0/sources/includes
+        -I/usr/local/cuda-13.1/include'
 
-engines:
-  rebuild_script: DS9/scripts/rebuild_engines.py
-  outputs:
-    - DS9/models/engines/yolo11s-seg_cust_fused.engine
-    - DS9/models/engines/yolo11m_b3_fp16.engine
-    - DS9/models/engines/reid_osnet_ibn_msmt17_dyn_b16_fp16.engine
-    - DS9/models/engines/yolo26n-pose_b3_fp16.engine
-    - DS9/models/engines/depth_anything_v2_metric_hypersim_vits_294x518_b3_fp16.engine
-    - DS9/models/engines/mapanything_images_294x518_b3_fp16.plan
-    - DS9/models/engines/yolo26n-seg_fused_b3_fp16.engine
-    - DS9/models/engines/yolo26s-seg_fused_b3_fp16.engine
-    - DS9/models/engines/yolo26m-seg_fused_b3_fp16.engine
-    - DS9/models/engines/yolo26n_b3_fp16.engine
-    - DS9/models/engines/yolo26s_b3_fp16.engine
-    - DS9/models/engines/yolo26m_b3_fp16.engine
-    - DS9/models/engines/yolo26l_b3_fp16.engine
-    - DS9/models/engines/yolo26x_b3_fp16.engine
-    - DS9/models/engines/rfdetr_n_384_b3_fp16.engine
-    - DS9/models/engines/rfdetr_s_512_b3_fp16.engine
-    - DS9/models/engines/rfdetr_m_576_b3_fp16.engine
-    - DS9/models/engines/rfdetr_seg_n_312_b3_fp16.engine
-    - DS9/models/engines/rfdetr_seg_s_384_b3_fp16.engine
-    - DS9/models/engines/rfdetr_seg_m_432_b3_fp16.engine
+  - id: engine.yolo11_seg_alternate
+    kind: tensorrt_engine
+    role: Explicit alternate YOLO11 person PGIE with instance masks
+    output: DS9/models/engines/yolo11s-seg_cust_fused.engine
+    sources: [DS9/models/onnx/yolo11s-seg_cust_fused.onnx]
+    builder: DS9/scripts/rebuild_engines.py
+    required_profiles: [yolo11_seg, full]
+    state: missing
+    compatibility: {deepstream_major: 9, cuda: "13.1", tensorrt: "10.14.1.48", precision: fp16, batch: 3}
+    provenance:
+      source_sha256: 37dda80a37e209bf7cb122b6b8ca4b307d7d611a5e24ed8eee522c86eaf53588
+      output_sha256: null
+      built_at_utc: null
+      build_host: null
+      command: null
+      maintenance: null
+  - id: engine.reid_swin_tiny
+    kind: tensorrt_engine
+    role: Canonical NVIDIA TAO Swin-Tiny person ReID SGIE with 256-d fc_pred output
+    output: DS9/models/engines/reid_swin_tiny_aicity156_dyn_b16_fp16.engine
+    sources: [DS9/models/onnx/reid_swin_tiny_market1501_aicity156_featuredim256.onnx]
+    builder: DS9/scripts/rebuild_engines.py
+    required_profiles: [runtime_common, full]
+    state: missing
+    compatibility: {deepstream_major: 9, cuda: "13.1", tensorrt: "10.14.1.48", precision: fp16, batch: 16}
+    provenance:
+      source_sha256: 3d3e5b4cbbff08b2d77fc0259664904890354f7cfdc9cc9cb41a58289c156791
+      output_sha256: null
+      built_at_utc: null
+      build_host: null
+      command: null
+  - id: engine.pose_yolo26
+    kind: tensorrt_engine
+    role: Person pose SGIE
+    output: DS9/models/engines/yolo26n-pose_b3_fp16.engine
+    sources: [DS9/models/onnx/yolo26n-pose_b3.onnx]
+    builder: DS9/scripts/rebuild_engines.py
+    required_profiles: [runtime_common, full]
+    state: missing
+    compatibility: {deepstream_major: 9, cuda: "13.1", tensorrt: "10.14.1.48", precision: fp16, batch: 3}
+    provenance:
+      source_sha256: a7dd1fa0feb2b5cd651c18c2fd24323bd2b4691db83b25f37341b19947bafc1c
+      output_sha256: null
+      built_at_utc: null
+      build_host: null
+      command: null
+      maintenance: null
+  - id: engine.depth_tracking_dav2
+    kind: tensorrt_engine
+    role: Always-on full-frame metric depth
+    output: DS9/models/engines/depth_anything_v2_metric_hypersim_vits_294x518_b3_fp16.engine
+    sources: [DS9/models/onnx/depth_anything_v2_metric_hypersim_vits_294x518_b3.onnx]
+    builder: DS9/scripts/rebuild_engines.py
+    required_profiles: [canonical, full]
+    state: missing
+    compatibility: {deepstream_major: 9, cuda: "13.1", tensorrt: "10.14.1.48", precision: fp16, batch: 3}
+    provenance:
+      source_sha256: 2b5da07359258d56bf8eb779c7fff9e8005bb5731da229236765b5a59022b94b
+      output_sha256: null
+      built_at_utc: null
+      build_host: null
+      command: null
+      maintenance: null
+  - id: engine.mapanything
+    kind: tensorrt_engine
+    role: Gated full-frame scene depth and reconstruction
+    output: DS9/models/engines/mapanything_images_294x518_b3_fp32.plan
+    sources: [DS9/models/onnx/mapanything_images_294x518_b3.onnx]
+    builder: DS9/scripts/build_mapanything_guarded.sh
+    required_profiles: [runtime_common, full]
+    state: missing
+    compatibility: {deepstream_major: 9, cuda: "13.1", tensorrt: "10.14.1.48", precision: fp32, batch: 3}
+    provenance:
+      source_sha256: 5c64123e5a48b3d4d62c8d44930e7afd41192c60598d5460882111b92ac2002d
+      output_sha256: null
+      built_at_utc: null
+      build_host: null
+      command: null
+      maintenance: null
+  - id: engine.v3dt_bodypose
+    kind: tensorrt_engine
+    role: SV3DT BodyPose3DNet tracker pose estimator
+    output: DS9/models/engines/bodypose3dnet_accuracy_b1_fp16.engine
+    sources: [DS9/models/onnx/bodypose3dnet_accuracy.onnx]
+    builder: DS9/scripts/rebuild_engines.py
+    required_profiles: [v3dt, full]
+    state: missing
+    compatibility: {deepstream_major: 9, cuda: "13.1", tensorrt: "10.14.1.48", precision: fp16, batch: 1}
+    provenance:
+      source_sha256: 349191622aee08a9289a561802d5abd91ca26c1171ffdc60e723f306e9169440
+      output_sha256: null
+      built_at_utc: null
+      build_host: null
+      command: null
+  - id: engine.v3dt_tracker_reid
+    kind: tensorrt_engine
+    role: SV3DT NvMOT-internal TAO ResNet50 person ReID
+    output: DS9/models/engines/tracker_reid_resnet50_market1501_b32_fp16.engine
+    sources: [DS9/models/tracker_reid/resnet50_market1501.etlt]
+    builder: DS9/scripts/build_v3dt_tracker_engine.py
+    required_profiles: [v3dt, full]
+    state: missing
+    compatibility: {deepstream_major: 9, cuda: "13.1", tensorrt: "10.14.1.48", precision: fp16, batch: 32}
+    provenance:
+      source_sha256: 23d2d7c2e1210690c3983a96628bb1552305b68199cda259deeb5412fe63583b
+      output_sha256: null
+      built_at_utc: null
+      build_host: null
+      command: null
+  - id: engine.yolo11_detect
+    kind: tensorrt_engine
+    role: YOLO11 detect-only PGIE
+    output: DS9/models/engines/yolo11m_b3_fp16.engine
+    sources: [DS9/models/onnx/yolo11m.onnx]
+    builder: DS9/scripts/rebuild_engines.py
+    required_profiles: [yolo11, full]
+    state: missing
+    compatibility: {deepstream_major: 9, cuda: "13.1", tensorrt: "10.14.1.48", precision: fp16, batch: 3}
+    provenance: &empty_provenance
+      source_sha256: null
+      output_sha256: null
+      built_at_utc: null
+      build_host: null
+      command: null
+      maintenance: null
+
+  - id: engine.wholebody49_s_masks
+    kind: tensorrt_engine
+    role: DEIMv2 Wholebody49 DINOv3-S instance-mask PGIE
+    output: DS9/models/engines/deimv2_wholebody49_dinov3_s_masks_640_b3_fp16.engine
+    sources: [DS9/models/onnx/deimv2_wholebody49_dinov3_s_masks_640_ds8norm.onnx]
+    builder: DS9/scripts/rebuild_engines.py
+    required_profiles: [wholebody49, full]
+    state: missing
+    compatibility: {deepstream_major: 9, cuda: "13.1", tensorrt: "10.14.1.48", precision: fp16, batch: 3}
+    provenance:
+      source_sha256: 0099f8db4a0c3774adda3a4f3c0a7c67689a49f924ed984002af7e2499d9b202
+      output_sha256: null
+      built_at_utc: null
+      build_host: null
+      command: null
+  - id: engine.wholebody49_x_boxes
+    kind: tensorrt_engine
+    role: DEIMv2 Wholebody49 DINOv3-X bbox PGIE
+    output: DS9/models/engines/deimv2_wholebody49_dinov3_x_boxes_640_b3_fp16.engine
+    sources: [DS9/models/onnx/deimv2_wholebody49_dinov3_x_boxes_640_ds8norm.onnx]
+    builder: DS9/scripts/rebuild_engines.py
+    required_profiles: [wholebody49, full]
+    state: missing
+    compatibility: {deepstream_major: 9, cuda: "13.1", tensorrt: "10.14.1.48", precision: fp16, batch: 3}
+    provenance:
+      source_sha256: 9b0f3b1755c48782569ecb41eceeef8a457ce49cb14d241090bab6e6a88ce453
+      output_sha256: null
+      built_at_utc: null
+      build_host: null
+      command: null
+
+  - &yolo26_seg_n
+    id: engine.yolo26_seg_n
+    kind: tensorrt_engine
+    role: YOLO26 segmentation PGIE n
+    output: DS9/models/engines/yolo26n-seg_fused_b3_fp16.engine
+    sources: [DS9/models/onnx/yolo26n-seg_fused.onnx]
+    builder: DS9/scripts/rebuild_engines.py
+    required_profiles: [yolo26_seg, full]
+    state: missing
+    compatibility: {deepstream_major: 9, cuda: "13.1", tensorrt: "10.14.1.48", precision: fp16, batch: 3}
+    provenance: *empty_provenance
+  - <<: *yolo26_seg_n
+    id: engine.yolo26_seg_s
+    role: YOLO26 segmentation PGIE s
+    output: DS9/models/engines/yolo26s-seg_fused_b3_fp16.engine
+    sources: [DS9/models/onnx/yolo26s-seg_fused.onnx]
+    required_profiles: [v3dt, yolo26_seg, full]
+    provenance:
+      source_sha256: c75bb1ae62cef43a1a9f99ed126e8b36b338456f72060d170318f322c68181d4
+      output_sha256: null
+      built_at_utc: null
+      build_host: null
+      command: null
+      maintenance: null
+  - <<: *yolo26_seg_n
+    id: engine.yolo26_seg_m
+    role: YOLO26 segmentation PGIE m
+    output: DS9/models/engines/yolo26m-seg_fused_b3_fp16.engine
+    sources: [DS9/models/onnx/yolo26m-seg_fused.onnx]
+
+  - &yolo26_detect_n
+    id: engine.yolo26_detect_n
+    kind: tensorrt_engine
+    role: YOLO26 detect-only PGIE n
+    output: DS9/models/engines/yolo26n_b3_fp16.engine
+    sources: [DS9/models/onnx/yolo26n.onnx]
+    builder: DS9/scripts/rebuild_engines.py
+    required_profiles: [yolo26, full]
+    state: missing
+    compatibility: {deepstream_major: 9, cuda: "13.1", tensorrt: "10.14.1.48", precision: fp16, batch: 3}
+    provenance: *empty_provenance
+  - <<: *yolo26_detect_n
+    id: engine.yolo26_detect_s
+    role: YOLO26 detect-only PGIE s
+    output: DS9/models/engines/yolo26s_b3_fp16.engine
+    sources: [DS9/models/onnx/yolo26s.onnx]
+  - <<: *yolo26_detect_n
+    id: engine.yolo26_detect_m
+    role: YOLO26 detect-only PGIE m
+    output: DS9/models/engines/yolo26m_b3_fp16.engine
+    sources: [DS9/models/onnx/yolo26m.onnx]
+    required_profiles: [canonical, yolo26, full]
+    provenance:
+      source_sha256: 8b2db048f5b8565d1d0d635fb68f183644c91ecae3494fc827accaaff2dc1e73
+      output_sha256: null
+      built_at_utc: null
+      build_host: null
+      command: null
+      maintenance: null
+  - <<: *yolo26_detect_n
+    id: engine.yolo26_detect_l
+    role: YOLO26 detect-only PGIE l
+    output: DS9/models/engines/yolo26l_b3_fp16.engine
+    sources: [DS9/models/onnx/yolo26l.onnx]
+  - <<: *yolo26_detect_n
+    id: engine.yolo26_detect_x
+    role: YOLO26 detect-only PGIE x
+    output: DS9/models/engines/yolo26x_b3_fp16.engine
+    sources: [DS9/models/onnx/yolo26x.onnx]
+
+  - &rfdetr_detect_n
+    id: engine.rfdetr_detect_n
+    kind: tensorrt_engine
+    role: RF-DETR detect-only PGIE n
+    output: DS9/models/engines/rfdetr_n_384_b3_fp16.engine
+    sources: [DS9/models/onnx/rfdetr_n_384.onnx]
+    builder: DS9/scripts/rebuild_engines.py
+    required_profiles: [rfdetr, full]
+    state: missing
+    compatibility: {deepstream_major: 9, cuda: "13.1", tensorrt: "10.14.1.48", precision: fp16, batch: 3}
+    provenance: *empty_provenance
+  - <<: *rfdetr_detect_n
+    id: engine.rfdetr_detect_s
+    role: RF-DETR detect-only PGIE s
+    output: DS9/models/engines/rfdetr_s_512_b3_fp16.engine
+    sources: [DS9/models/onnx/rfdetr_s_512.onnx]
+  - <<: *rfdetr_detect_n
+    id: engine.rfdetr_detect_m
+    role: RF-DETR detect-only PGIE m
+    output: DS9/models/engines/rfdetr_m_576_b3_fp16.engine
+    sources: [DS9/models/onnx/rfdetr_m_576.onnx]
+
+  - &rfdetr_seg_n
+    id: engine.rfdetr_seg_n
+    kind: tensorrt_engine
+    role: RF-DETR segmentation PGIE n
+    output: DS9/models/engines/rfdetr_seg_n_312_b3_fp16.engine
+    sources: [DS9/models/onnx/rfdetr_seg_n_312.onnx]
+    builder: DS9/scripts/rebuild_engines.py
+    required_profiles: [rfdetr_seg, full]
+    state: missing
+    compatibility: {deepstream_major: 9, cuda: "13.1", tensorrt: "10.14.1.48", precision: fp16, batch: 3}
+    provenance: *empty_provenance
+  - <<: *rfdetr_seg_n
+    id: engine.rfdetr_seg_s
+    role: RF-DETR segmentation PGIE s
+    output: DS9/models/engines/rfdetr_seg_s_384_b3_fp16.engine
+    sources: [DS9/models/onnx/rfdetr_seg_s_384.onnx]
+  - <<: *rfdetr_seg_n
+    id: engine.rfdetr_seg_m
+    role: RF-DETR segmentation PGIE m
+    output: DS9/models/engines/rfdetr_seg_m_432_b3_fp16.engine
+    sources: [DS9/models/onnx/rfdetr_seg_m_432.onnx]
 
 shared_app_data:
-  configs:
-    - config/cameras.yaml
-    - config/depth_registration.json
-    - config/nvtracker.yaml
-    - config/config_nvdsanalytics_post.ini
-    - config/nvdsanalytics.yaml
-    - config/config_nvdsanalytics_exclude.ini
-  source_models:
-    - DS9/models/onnx/yolo11m.onnx
-    - DS9/models/onnx/yolo26n.onnx
-    - DS9/models/onnx/yolo26s.onnx
-    - DS9/models/onnx/yolo26m.onnx
-    - DS9/models/onnx/yolo26l.onnx
-    - DS9/models/onnx/yolo26x.onnx
-    - models/yolo11s-seg_cust_fused.onnx
-    - models/engines/reid_osnet_ibn_msmt17_dyn_b16.onnx
-    - DS9/models/onnx/yolo26n-pose_b3.onnx
-    - models/onnx/depth_anything_v2_metric_hypersim_vits_294x518_b3.onnx
-    - DS9/models/onnx/mapanything_images_294x518_b3.onnx
-    - models/yolo26n-seg_fused.onnx
-    - models/yolo26s-seg_fused.onnx
-    - models/yolo26m-seg_fused.onnx
-    - DS9/models/onnx/rfdetr_n_384.onnx
-    - DS9/models/onnx/rfdetr_s_512.onnx
-    - DS9/models/onnx/rfdetr_m_576.onnx
-    - models/onnx/rfdetr_seg_n_312.onnx
-    - models/onnx/rfdetr_seg_s_384.onnx
-    - models/onnx/rfdetr_seg_m_432.onnx
+  - config/cameras.yaml
+  - config/depth_registration.json
+  - config/nvtracker.yaml
+  - config/config_nvdsanalytics_post.ini
+  - config/nvdsanalytics.yaml
+  - config/config_nvdsanalytics_exclude.ini
 
 packaging_boundary:
-  ds9_runtime_entrypoint: DS9/noesis/ds9_runtime.py
-  ds9_runtime_core: DS9/noesis/ds9_runtime_core.py
   forbidden_runtime_entrypoint: noesis/ds8_runtime.py
   still_shared_parent_repo_context:
     - config/cameras.yaml
-    - calibration and geometry helper modules
-    - WebSocket server module
-    - selected root validation clients
+    - calibration and geometry product modules
+    - WebSocket and virtual-twin API modules
+    - identity domain modules
+    - selected validation clients
+  shared_runtime_modules:
+    - noesis_core/contracts
+    - noesis_core/world
+    - noesis_core/world_service.py
+    - noesis_core/runtime_world.py
+    - noesis/server/health_api.py
+    - noesis/server/scene_api.py

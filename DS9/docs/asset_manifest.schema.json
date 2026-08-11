@@ -1,0 +1,199 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://noesis.local/schemas/ds9-asset-manifest-v2.json",
+  "title": "Noesis DS9 artifact manifest",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "manifest_id",
+    "schema",
+    "updated_at",
+    "target",
+    "runtime",
+    "policy",
+    "artifacts",
+    "shared_app_data",
+    "packaging_boundary"
+  ],
+  "properties": {
+    "schema_version": {"const": 2},
+    "manifest_id": {"type": "string", "minLength": 1},
+    "schema": {"const": "DS9/docs/asset_manifest.schema.json"},
+    "updated_at": {"type": "string", "format": "date"},
+    "target": {
+      "type": "object",
+      "required": ["platform", "python", "deepstream", "cuda", "tensorrt", "build_image"],
+      "properties": {
+        "platform": {"type": "string"},
+        "python": {"const": "3.12"},
+        "deepstream": {
+          "type": "object",
+          "required": ["major", "version", "home"],
+          "properties": {
+            "major": {"const": 9},
+            "version": {"const": "9.0"},
+            "home": {"const": "/opt/nvidia/deepstream/deepstream-9.0"}
+          }
+        },
+        "cuda": {"const": "13.1"},
+        "tensorrt": {"const": "10.14.1.48"},
+        "build_image": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["reference", "image_id", "base_digest", "tensorrt_version", "cuda_version", "dockerfile", "dockerfile_sha256", "requirements", "requirements_sha256"],
+          "properties": {
+            "reference": {"const": "noesis-ds9-dev:9.0-20260710"},
+            "image_id": {"const": "sha256:7476b1021376cd67793c95d949cdc7d46eef7704ab98a5a76feed461e4f907a4"},
+            "base_digest": {"const": "sha256:2e45070ad134b9ab2caa4a97ba4d52fa8744a4f0db30900bd92828d51425a69a"},
+            "tensorrt_version": {"const": "10.14.1.48+cuda13.0"},
+            "cuda_version": {"const": "13.1.1.006"},
+            "dockerfile": {"const": "DS9/docker/Dockerfile"},
+            "dockerfile_sha256": {"const": "c1df566ec73759a5bef0275dc5e9edcdc41be3f6b3f3a102a19d89a5f9860c9e"},
+            "requirements": {"const": "DS9/docker/requirements.lock.txt"},
+            "requirements_sha256": {"const": "de35fb439f5c9bfd05d7fbc23436122aee033bd7b584b2eb139358e50211be48"}
+          }
+        }
+      }
+    },
+    "runtime": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "image",
+        "entrypoint",
+        "implementation",
+        "pipeline_config",
+        "v3dt_pipeline_config",
+        "v3dt_cameras_config",
+        "v3dt_tracker_config",
+        "preflight",
+        "canonical_world_factory",
+        "capability_health_api",
+        "scene_release_api"
+      ],
+      "properties": {
+        "image": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "reference",
+            "image_id",
+            "parent_reference",
+            "parent_image_id",
+            "base_digest",
+            "tensorrt_version",
+            "cuda_version",
+            "dockerfile",
+            "dockerfile_sha256"
+          ],
+          "properties": {
+            "reference": {"const": "noesis-ds9-runtime:9.0-20260710"},
+            "image_id": {"const": "sha256:ca33b4c6a84fc56b86b71feee2a444299cb2ce7f33ab018cae43ac730aaef5fc"},
+            "parent_reference": {"const": "noesis-ds9-dev:9.0-20260710"},
+            "parent_image_id": {"const": "sha256:7476b1021376cd67793c95d949cdc7d46eef7704ab98a5a76feed461e4f907a4"},
+            "base_digest": {"const": "sha256:2e45070ad134b9ab2caa4a97ba4d52fa8744a4f0db30900bd92828d51425a69a"},
+            "tensorrt_version": {"const": "10.14.1.48+cuda13.0"},
+            "cuda_version": {"const": "13.1.1.006"},
+            "dockerfile": {"const": "DS9/docker/Dockerfile.runtime"},
+            "dockerfile_sha256": {"const": "f3345a4c87483a70dc48a7185330880805d38dbc97d18d57c4b08ab1e415d51e"}
+          }
+        },
+        "entrypoint": {"const": "DS9/noesis/ds9_runtime.py"},
+        "implementation": {"const": "DS9/noesis/ds9_runtime_core.py"},
+        "pipeline_config": {"const": "DS9/config/infer.yaml"},
+        "v3dt_pipeline_config": {"const": "DS9/config/infer_v3dt.yaml"},
+        "v3dt_cameras_config": {"const": "DS9/config/cameras_v3dt.yaml"},
+        "v3dt_tracker_config": {"const": "DS9/config/v3dt/nvtracker_v3dt.yaml"},
+        "preflight": {"const": "DS9/scripts/ds9_preflight.py"},
+        "canonical_world_factory": {"const": "noesis_core/runtime_world.py"},
+        "capability_health_api": {"const": "noesis/server/health_api.py"},
+        "scene_release_api": {"const": "noesis/server/scene_api.py"}
+      }
+    },
+    "policy": {"type": "object"},
+    "artifacts": {
+      "type": "array",
+      "minItems": 1,
+      "items": {"$ref": "#/$defs/artifact"}
+    },
+    "shared_app_data": {"type": "array", "items": {"type": "string"}},
+    "packaging_boundary": {"type": "object"}
+  },
+  "$defs": {
+    "artifact": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "kind",
+        "role",
+        "output",
+        "sources",
+        "builder",
+        "required_profiles",
+        "state",
+        "compatibility",
+        "provenance"
+      ],
+      "properties": {
+        "id": {"type": "string", "pattern": "^[a-z0-9][a-z0-9_.-]+$"},
+        "kind": {
+          "enum": ["native_extension", "gstreamer_plugin", "tensorrt_plugin", "nvinfer_parser", "tensorrt_engine"]
+        },
+        "role": {"type": "string", "minLength": 1},
+        "output": {"type": "string", "pattern": "^DS9/"},
+        "sources": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "string",
+            "pattern": "^(DS9/|external/DeepStream-Yolo-Seg/nvdsinfer_custom_impl_Yolo_seg/)"
+          }
+        },
+        "builder": {"type": "string", "pattern": "^DS9/scripts/"},
+        "required_profiles": {"type": "array", "minItems": 1, "items": {"type": "string"}},
+        "state": {"enum": ["missing", "staged_unverified", "validated"]},
+        "compatibility": {
+          "type": "object",
+          "required": ["deepstream_major", "cuda", "tensorrt"],
+          "properties": {
+            "deepstream_major": {"const": 9},
+            "cuda": {"const": "13.1"},
+            "tensorrt": {"type": ["string", "null"]},
+            "precision": {"type": "string"},
+            "batch": {"type": "integer", "minimum": 1}
+          }
+        },
+        "provenance": {
+          "type": "object",
+          "required": ["source_sha256", "output_sha256", "built_at_utc", "build_host", "command"],
+          "properties": {
+            "source_sha256": {"type": ["string", "null"]},
+            "output_sha256": {"type": ["string", "null"]},
+            "built_at_utc": {"type": ["string", "null"]},
+            "build_host": {"type": ["string", "null"]},
+            "command": {"type": ["string", "null"]},
+            "maintenance": {
+              "type": ["object", "null"],
+              "properties": {
+                "manifest": {"type": "string"},
+                "output_size_bytes": {"type": "integer", "minimum": 1},
+                "image": {"type": "string"},
+                "image_id": {"type": "string"},
+                "base_digest": {"type": "string"},
+                "tensorrt_version": {"type": "string"},
+                "cuda_version": {"type": "string"},
+                "driver_version": {"type": "string"},
+                "gpu": {"type": "object"},
+                "precision": {"type": "string"},
+                "batch": {"type": "integer", "minimum": 1},
+                "tensor_contract": {"type": "object"}
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}

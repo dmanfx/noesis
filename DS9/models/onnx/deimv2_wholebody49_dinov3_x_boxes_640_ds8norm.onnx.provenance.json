@@ -1,0 +1,27 @@
+{
+  "external_tensor_count": 0,
+  "input_tensors": {
+    "images": [
+      "N",
+      3,
+      640,
+      640
+    ]
+  },
+  "onnx_opset": 17,
+  "output": "DS9/models/onnx/deimv2_wholebody49_dinov3_x_boxes_640_ds8norm.onnx",
+  "output_bytes": 202881311,
+  "output_sha256": "1b2e3b5341dffd84ec4d295b26af1ec32051efc0deb0e99abd65521fb354a285",
+  "output_tensors": {
+    "label_xyxy_score": [
+      "N",
+      1240,
+      6
+    ]
+  },
+  "schema_version": 1,
+  "source": "models/onnx/deimv2_wholebody49_dinov3_x_boxes_640_ds8norm.onnx",
+  "source_sha256": "1b2e3b5341dffd84ec4d295b26af1ec32051efc0deb0e99abd65521fb354a285",
+  "staged_at_utc": "2026-07-10T16:33:42.002739Z",
+  "staging_aggregate_sha256": "e1be977b37fc5869fb5e201f274ba7d314741108449c5417e1c1b8a1ce73b7a4"
+}

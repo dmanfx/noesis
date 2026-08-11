@@ -13,15 +13,25 @@ const uploadLabel = document.querySelector("#upload-label");
 const uploadPercent = document.querySelector("#upload-percent");
 const uploadBar = document.querySelector("#upload-bar");
 const refreshButton = document.querySelector("#refresh-button");
+const newWalkButton = document.querySelector("#new-walk-button");
+const captureCard = document.querySelector(".capture-card");
+const workspace = document.querySelector(".workspace");
 const toast = document.querySelector("#toast");
 
+const NEW_WALK_MODE_KEY = "phoneScanNewWalkMode";
+const LONG_PRESS_MS = 650;
+
 let scans = [];
-let selectedId = localStorage.getItem("phoneScanSelected") || null;
+let newWalkMode = localStorage.getItem(NEW_WALK_MODE_KEY) === "1";
+let selectedId = newWalkMode ? null : localStorage.getItem("phoneScanSelected") || null;
 let lastDetailFingerprint = "";
 let outputPage = 0;
 let currentViewer = null;
 let refreshing = false;
 let toastTimer = null;
+let uploadInProgress = false;
+let renamingScanId = null;
+let suppressScanClicksUntil = 0;
 
 const statusLabels = {
   uploading: "Uploading",
@@ -80,6 +90,63 @@ function toastMessage(message) {
   toastTimer = setTimeout(() => toast.classList.add("hidden"), 3600);
 }
 
+function setScanDetailVisible(visible) {
+  scanDetail.classList.toggle("hidden", !visible);
+  if (visible) scanDetail.removeAttribute("aria-hidden");
+  else scanDetail.setAttribute("aria-hidden", "true");
+}
+
+function syncCaptureModeUi() {
+  newWalkButton.classList.toggle("active", newWalkMode);
+  newWalkButton.setAttribute("aria-pressed", newWalkMode ? "true" : "false");
+  captureCard.classList.toggle("new-walk-mode", newWalkMode);
+  workspace.classList.toggle("new-walk-mode", newWalkMode);
+  if (newWalkMode) {
+    scanDetail.replaceChildren();
+    setScanDetailVisible(false);
+  }
+}
+
+function rememberSelectedScan(scanId) {
+  selectedId = scanId;
+  newWalkMode = false;
+  localStorage.removeItem(NEW_WALK_MODE_KEY);
+  if (selectedId) localStorage.setItem("phoneScanSelected", selectedId);
+  else localStorage.removeItem("phoneScanSelected");
+  syncCaptureModeUi();
+}
+
+function openScan(scanId) {
+  rememberSelectedScan(scanId);
+  outputPage = 0;
+  lastDetailFingerprint = "";
+  renderScanList();
+  renderSelected();
+}
+
+function startNewWalk() {
+  if (uploadInProgress) {
+    toastMessage("The current walk is still uploading. It will open as soon as it is safely saved.");
+    return;
+  }
+  newWalkMode = true;
+  selectedId = null;
+  localStorage.setItem(NEW_WALK_MODE_KEY, "1");
+  localStorage.removeItem("phoneScanSelected");
+  scanName.value = "Phone room walk";
+  cameraInput.value = "";
+  existingInput.value = "";
+  uploadPanel.classList.add("hidden");
+  outputPage = 0;
+  lastDetailFingerprint = "";
+  disposeViewer();
+  syncCaptureModeUi();
+  renderScanList();
+  renderSelected();
+  captureCard.scrollIntoView({ behavior: "smooth", block: "start" });
+  toastMessage("Ready for a new walk. Your earlier walks remain auto-saved.");
+}
+
 async function jsonFetch(url, options = {}) {
   const response = await fetch(url, options);
   if (!response.ok) {
@@ -94,6 +161,97 @@ async function jsonFetch(url, options = {}) {
   }
   if (response.status === 204) return null;
   return response.json();
+}
+
+async function renameScan(scanId) {
+  if (renamingScanId) return;
+  const scan = scans.find((item) => item.id === scanId);
+  if (!scan) return;
+  renamingScanId = scanId;
+  try {
+    const proposed = window.prompt("Rename this saved walk", scan.name);
+    if (proposed === null) return;
+    const name = proposed.trim().replace(/\s+/g, " ");
+    if (!name) {
+      toastMessage("A walk name cannot be empty");
+      return;
+    }
+    if (name.length > 80) {
+      toastMessage("A walk name can contain at most 80 characters");
+      return;
+    }
+    if (name === scan.name) return;
+    const updated = await jsonFetch(
+      `/api/scans/${encodeURIComponent(scanId)}?name=${encodeURIComponent(name)}`,
+      { method: "PATCH" },
+    );
+    const index = scans.findIndex((item) => item.id === scanId);
+    if (index >= 0) scans[index] = updated;
+    lastDetailFingerprint = "";
+    renderScanList();
+    renderSelected();
+    toastMessage(`Walk renamed to “${name}” and saved`);
+  } catch (error) {
+    toastMessage(`Rename failed: ${error.message}`);
+  } finally {
+    renamingScanId = null;
+  }
+}
+
+function wireScanCard(button) {
+  const scanId = button.dataset.scanId;
+  let holdTimer = null;
+  let holdTriggered = false;
+  let pointerStartX = 0;
+  let pointerStartY = 0;
+
+  const cancelHold = () => {
+    if (holdTimer !== null) clearTimeout(holdTimer);
+    holdTimer = null;
+  };
+
+  button.addEventListener("pointerdown", (event) => {
+    if (event.pointerType === "mouse" && event.button !== 0) return;
+    pointerStartX = event.clientX;
+    pointerStartY = event.clientY;
+    holdTriggered = false;
+    cancelHold();
+    holdTimer = setTimeout(() => {
+      holdTimer = null;
+      holdTriggered = true;
+      suppressScanClicksUntil = performance.now() + 1200;
+      void renameScan(scanId);
+    }, LONG_PRESS_MS);
+  });
+  button.addEventListener("pointermove", (event) => {
+    if (Math.hypot(event.clientX - pointerStartX, event.clientY - pointerStartY) > 12) {
+      cancelHold();
+    }
+  });
+  button.addEventListener("pointerup", cancelHold);
+  button.addEventListener("pointercancel", cancelHold);
+  button.addEventListener("pointerleave", cancelHold);
+  button.addEventListener("click", (event) => {
+    if (holdTriggered || performance.now() < suppressScanClicksUntil) {
+      event.preventDefault();
+      event.stopPropagation();
+      holdTriggered = false;
+      return;
+    }
+    openScan(scanId);
+  });
+  button.addEventListener("contextmenu", (event) => {
+    event.preventDefault();
+    cancelHold();
+    if (performance.now() < suppressScanClicksUntil) return;
+    suppressScanClicksUntil = performance.now() + 1200;
+    void renameScan(scanId);
+  });
+  button.addEventListener("keydown", (event) => {
+    if (event.key !== "F2") return;
+    event.preventDefault();
+    void renameScan(scanId);
+  });
 }
 
 async function refreshHealth() {
@@ -115,7 +273,7 @@ function renderScanList() {
   scanList.innerHTML = scans
     .map(
       (scan) => `
-        <button class="scan-card ${scan.id === selectedId ? "selected" : ""}" data-scan-id="${escapeHtml(scan.id)}" type="button">
+        <button class="scan-card ${scan.id === selectedId ? "selected" : ""}" data-scan-id="${escapeHtml(scan.id)}" type="button" title="Press and hold to rename" aria-label="${escapeHtml(scan.name)}. Tap to open; press and hold to rename.">
           <span class="scan-card-top">
             <strong>${escapeHtml(scan.name)}</strong>
             <span class="status-dot ${escapeHtml(scan.status)}"></span>
@@ -125,14 +283,7 @@ function renderScanList() {
     )
     .join("");
   scanList.querySelectorAll("[data-scan-id]").forEach((button) => {
-    button.addEventListener("click", () => {
-      selectedId = button.dataset.scanId;
-      localStorage.setItem("phoneScanSelected", selectedId);
-      outputPage = 0;
-      lastDetailFingerprint = "";
-      renderScanList();
-      renderSelected();
-    });
+    wireScanCard(button);
   });
 }
 
@@ -389,15 +540,23 @@ function initializeViewer(glbUrl) {
 }
 
 function wireDetailActions(scan) {
+  document.querySelector("#rename-scan")?.addEventListener("click", () => {
+    void renameScan(scan.id);
+  });
   document.querySelector("#delete-scan")?.addEventListener("click", async () => {
     const accepted = window.confirm(`Permanently delete “${scan.name}” and every saved video, frame, and reconstruction output?`);
     if (!accepted) return;
     try {
       await jsonFetch(`/api/scans/${encodeURIComponent(scan.id)}`, { method: "DELETE" });
       scans = scans.filter((item) => item.id !== scan.id);
-      selectedId = scans[0]?.id || null;
-      if (selectedId) localStorage.setItem("phoneScanSelected", selectedId);
-      else localStorage.removeItem("phoneScanSelected");
+      if (scans.length) rememberSelectedScan(scans[0].id);
+      else {
+        selectedId = null;
+        newWalkMode = true;
+        localStorage.removeItem("phoneScanSelected");
+        localStorage.setItem(NEW_WALK_MODE_KEY, "1");
+        syncCaptureModeUi();
+      }
       lastDetailFingerprint = "";
       disposeViewer();
       renderScanList();
@@ -453,9 +612,16 @@ function renderSelected() {
   const scan = scans.find((item) => item.id === selectedId);
   if (!scan) {
     disposeViewer();
-    scanDetail.innerHTML = `<div class="empty-state"><div class="empty-orbit"><span></span></div><h2>No scan selected</h2><p>Record a room walk above or select a saved scan.</p></div>`;
+    if (newWalkMode) {
+      scanDetail.replaceChildren();
+      setScanDetailVisible(false);
+      return;
+    }
+    setScanDetailVisible(true);
+    scanDetail.innerHTML = `<div class="empty-state"><div class="empty-orbit"><span></span></div><h2>No walk selected</h2><p>Record a room walk above or select a saved walk.</p></div>`;
     return;
   }
+  setScanDetailVisible(true);
   const fingerprint = JSON.stringify(scan);
   if (fingerprint === lastDetailFingerprint) return;
   lastDetailFingerprint = fingerprint;
@@ -473,6 +639,7 @@ function renderSelected() {
       </div>
       <div class="detail-actions">
         <a class="ghost-button" href="${scan.video?.url}" target="_blank" rel="noopener">Original video</a>
+        <button id="rename-scan" class="ghost-button" type="button">Rename</button>
         ${canDelete ? '<button id="delete-scan" class="danger-button" type="button">Delete scan</button>' : ""}
       </div>
     </div>
@@ -494,10 +661,12 @@ async function refreshScans({ force = false } = {}) {
   refreshing = true;
   try {
     scans = await jsonFetch("/api/scans");
-    if (selectedId && !scans.some((scan) => scan.id === selectedId)) selectedId = null;
-    if (!selectedId && scans.length) {
-      selectedId = scans[0].id;
-      localStorage.setItem("phoneScanSelected", selectedId);
+    if (selectedId && !scans.some((scan) => scan.id === selectedId)) {
+      selectedId = null;
+      localStorage.removeItem("phoneScanSelected");
+    }
+    if (!selectedId && scans.length && !newWalkMode) {
+      rememberSelectedScan(scans[0].id);
     }
     if (force) lastDetailFingerprint = "";
     renderScanList();
@@ -511,6 +680,11 @@ async function refreshScans({ force = false } = {}) {
 
 function uploadVideo(file) {
   if (!file) return;
+  if (uploadInProgress) {
+    toastMessage("A walk is already uploading");
+    return;
+  }
+  uploadInProgress = true;
   uploadPanel.classList.remove("hidden");
   uploadLabel.textContent = `Uploading ${file.name || "phone video"}`;
   uploadPercent.textContent = "0%";
@@ -527,6 +701,7 @@ function uploadVideo(file) {
     uploadBar.style.width = `${percent}%`;
   });
   xhr.addEventListener("load", async () => {
+    uploadInProgress = false;
     cameraInput.value = "";
     existingInput.value = "";
     if (xhr.status < 200 || xhr.status >= 300) {
@@ -537,18 +712,21 @@ function uploadVideo(file) {
       return;
     }
     const scan = JSON.parse(xhr.responseText);
-    selectedId = scan.id;
-    localStorage.setItem("phoneScanSelected", selectedId);
+    rememberSelectedScan(scan.id);
     uploadPercent.textContent = "100%";
     uploadBar.style.width = "100%";
     uploadLabel.textContent = "Upload saved · preparing multi-view frames";
-    toastMessage("Phone video saved; frame preparation started");
+    toastMessage("Walk auto-saved; frame preparation started");
     await refreshScans({ force: true });
     setTimeout(() => uploadPanel.classList.add("hidden"), 1800);
   });
   xhr.addEventListener("error", () => {
+    uploadInProgress = false;
     uploadLabel.textContent = "Upload connection failed";
     toastMessage("Upload failed. Keep this page open and confirm the phone is still on the home Wi-Fi.");
+  });
+  xhr.addEventListener("abort", () => {
+    uploadInProgress = false;
   });
   xhr.send(file);
 }
@@ -556,7 +734,10 @@ function uploadVideo(file) {
 cameraInput.addEventListener("change", () => uploadVideo(cameraInput.files?.[0]));
 existingInput.addEventListener("change", () => uploadVideo(existingInput.files?.[0]));
 refreshButton.addEventListener("click", () => refreshScans({ force: true }));
+newWalkButton.addEventListener("click", startNewWalk);
 
+if (newWalkMode) localStorage.removeItem("phoneScanSelected");
+syncCaptureModeUi();
 refreshHealth();
 refreshScans({ force: true });
 setInterval(refreshHealth, 30_000);

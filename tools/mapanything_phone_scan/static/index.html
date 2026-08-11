@@ -5,7 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
     <meta name="theme-color" content="#101312" />
     <title>Noesis · Phone Room Scan</title>
-    <link rel="stylesheet" href="/static/style.css" />
+    <link rel="stylesheet" href="/static/style.css?v=1.3.1" />
     <script type="importmap">
       {
         "imports": {
@@ -20,7 +20,12 @@
         <span class="brand-mark">N</span>
         <span><b>Noesis</b><small>Multi-view phone scan</small></span>
       </a>
-      <span id="health-pill" class="health-pill">Connecting…</span>
+      <div class="topbar-actions">
+        <button id="new-walk-button" class="new-walk-button" type="button">
+          <span aria-hidden="true">＋</span> New Walk
+        </button>
+        <span id="health-pill" class="health-pill">Connecting…</span>
+      </div>
     </header>
 
     <main>
@@ -42,7 +47,7 @@
           <input id="camera-video" class="visually-hidden" type="file" accept="video/*" capture="environment" />
           <label class="secondary-button capture-button" for="existing-video">Use an existing video</label>
           <input id="existing-video" class="visually-hidden" type="file" accept="video/*" />
-          <p class="microcopy">The original video and every generated asset stay on this Noesis machine.</p>
+          <p class="microcopy"><b>Auto-saved:</b> each uploaded walk and every generated asset stay on this Noesis machine. Starting a new walk never overwrites an older one.</p>
         </div>
         <div id="upload-panel" class="upload-panel hidden" aria-live="polite">
           <div class="progress-header"><span id="upload-label">Uploading…</span><b id="upload-percent">0%</b></div>
@@ -53,9 +58,10 @@
       <section class="workspace">
         <aside class="scan-sidebar">
           <div class="section-heading">
-            <div><span class="eyebrow">Saved locally</span><h2>Scans</h2></div>
-            <button id="refresh-button" class="icon-button" type="button" aria-label="Refresh scans">↻</button>
+            <div><span class="eyebrow">Auto-saved locally</span><h2>Walks</h2></div>
+            <button id="refresh-button" class="icon-button" type="button" aria-label="Refresh walks">↻</button>
           </div>
+          <p class="scan-list-hint">Tap to open · press and hold to rename</p>
           <div id="scan-list" class="scan-list"></div>
         </aside>
 
@@ -70,6 +76,6 @@
     </main>
 
     <div id="toast" class="toast hidden" role="status"></div>
-    <script type="module" src="/static/app.js"></script>
+    <script type="module" src="/static/app.js?v=1.3.1"></script>
   </body>
 </html>

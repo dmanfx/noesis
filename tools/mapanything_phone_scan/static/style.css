@@ -61,6 +61,24 @@ a { color: inherit; }
 .brand b, .brand small { display: block; }
 .brand b { font-size: 0.98rem; letter-spacing: 0.02em; }
 .brand small { margin-top: 2px; color: var(--muted); font-size: 0.72rem; }
+.topbar-actions { display: flex; align-items: center; gap: 9px; }
+.new-walk-button {
+  display: inline-flex;
+  min-height: 38px;
+  align-items: center;
+  justify-content: center;
+  gap: 5px;
+  padding: 8px 12px;
+  border: 1px solid rgba(141, 232, 189, 0.34);
+  border-radius: 11px;
+  background: rgba(81, 213, 155, 0.1);
+  color: var(--mint);
+  cursor: pointer;
+  font-size: 0.78rem;
+  font-weight: 760;
+}
+.new-walk-button:hover, .new-walk-button.active { background: rgba(81, 213, 155, 0.18); border-color: rgba(141, 232, 189, 0.62); }
+.new-walk-button:active { transform: translateY(1px); }
 
 .health-pill, .status-badge, .warning-chip {
   display: inline-flex;
@@ -155,14 +173,18 @@ h1 { max-width: 780px; margin: 12px 0 16px; font-size: clamp(2rem, 5.4vw, 4.6rem
 .progress-track span { display: block; width: 0; height: 100%; border-radius: inherit; background: linear-gradient(90deg, var(--mint-strong), var(--mint)); transition: width 180ms ease; }
 
 .workspace { display: grid; grid-template-columns: minmax(250px, 320px) minmax(0, 1fr); gap: 22px; margin-top: 24px; align-items: start; }
+.workspace.new-walk-mode { grid-template-columns: minmax(0, 1fr); }
+.workspace.new-walk-mode .scan-sidebar { position: static; }
+.workspace.new-walk-mode .scan-list { display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 320px)); }
 .scan-sidebar, .scan-detail { border: 1px solid var(--line); border-radius: 22px; background: rgba(21, 25, 24, 0.82); box-shadow: 0 18px 48px rgba(0, 0, 0, 0.2); }
 .scan-sidebar { position: sticky; top: 92px; padding: 18px; }
 .scan-detail { min-height: 480px; padding: clamp(18px, 3vw, 34px); }
 .section-heading { display: flex; align-items: end; justify-content: space-between; gap: 12px; margin-bottom: 14px; }
 .section-heading h2 { margin: 4px 0 0; font-size: 1.25rem; }
 .icon-button { display: grid; width: 38px; height: 38px; place-items: center; border: 1px solid var(--line); border-radius: 11px; background: var(--surface-2); color: var(--text); cursor: pointer; }
+.scan-list-hint { margin: -6px 0 13px; color: var(--muted); font-size: 0.68rem; }
 .scan-list { display: flex; flex-direction: column; gap: 9px; }
-.scan-card { width: 100%; padding: 13px; border: 1px solid transparent; border-radius: 14px; background: var(--surface-2); color: inherit; text-align: left; cursor: pointer; }
+.scan-card { width: 100%; padding: 13px; border: 1px solid transparent; border-radius: 14px; background: var(--surface-2); color: inherit; text-align: left; cursor: pointer; touch-action: pan-x pan-y; user-select: none; -webkit-user-select: none; -webkit-touch-callout: none; }
 .scan-card.selected { border-color: rgba(141, 232, 189, 0.45); background: rgba(81, 213, 155, 0.08); }
 .scan-card-top { display: flex; justify-content: space-between; gap: 10px; align-items: start; }
 .scan-card strong { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 0.88rem; }
@@ -269,8 +291,10 @@ h1 { max-width: 780px; margin: 12px 0 16px; font-size: clamp(2rem, 5.4vw, 4.6rem
 @media (max-width: 640px) {
   .topbar { min-height: 62px; padding-left: 15px; padding-right: 15px; }
   .brand small { display: none; }
+  .topbar-actions { gap: 7px; }
+  .new-walk-button { min-height: 36px; padding: 7px 10px; }
   .inference-callout { grid-template-columns: 1fr; align-items: stretch; }
-  .health-pill { max-width: 132px; overflow: hidden; text-overflow: ellipsis; }
+  .health-pill { width: 31px; min-width: 31px; padding: 7px; overflow: hidden; font-size: 0; }
   main { padding: 14px; }
   .capture-card { padding: 22px 18px; border-radius: 20px; }
   h1 { font-size: 2.25rem; }
@@ -278,6 +302,7 @@ h1 { max-width: 780px; margin: 12px 0 16px; font-size: clamp(2rem, 5.4vw, 4.6rem
   .scan-sidebar, .scan-detail { border-radius: 18px; }
   .scan-sidebar { padding: 14px; }
   .scan-list { display: flex; overflow-x: auto; flex-direction: row; padding-bottom: 3px; }
+  .workspace.new-walk-mode .scan-list { display: flex; }
   .scan-card { flex: 0 0 205px; }
   .scan-detail { min-height: 420px; padding: 17px 14px; }
   .detail-header { display: block; }

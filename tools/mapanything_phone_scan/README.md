@@ -85,21 +85,28 @@ do not forward its port through the router.
 
 ## Capture and single-provider workflow
 
-1. The original video is saved under
+1. Select **New Walk** to clear the current review and enter fresh-capture mode.
+   That mode survives a browser refresh; it does not delete or overwrite an
+   earlier walk.
+2. Give the walk a room name, then record it or choose an existing video. The
+   upload is automatically saved under
    `data/mapanything_phone_scans/<scan-id>/phone_walk.mp4`.
-2. The server extracts up to 48 views over the complete walk at a target rate
+   Saved walks appear in the **Walks** list. Press and hold a walk to rename it;
+   the new name is saved immediately without renaming or moving its asset
+   directory.
+3. The server extracts up to 48 views over the complete walk at a target rate
    of two views per second.
-3. Frame-quality warnings are informational; frames are not silently dropped.
-4. Once `prepared_frames_manifest.json` is durable, choose **MapAnything** or
+4. Frame-quality warnings are informational; frames are not silently dropped.
+5. Once `prepared_frames_manifest.json` is durable, choose **MapAnything** or
    **DA3** and select **Run reconstruction**.
-5. The selected provider runs one joint multi-view inference over every
+6. The selected provider runs one joint multi-view inference over every
    prepared frame.
-6. The tool saves a review GLB, camera trajectory, RGB, depth, confidence or
+7. The tool saves a review GLB, camera trajectory, RGB, depth, confidence or
    validity data, masks, poses, intrinsics, metric scale, and raw NPZ arrays.
-7. **Align to Noesis** estimates the phone floor, preserves gravity and metric
+8. **Align to Noesis** estimates the phone floor, preserves gravity and metric
    scale, and registers room structure to the configured static-camera room
    reconstruction.
-8. A weak or ambiguous registration fails its quality gate. A passing result
+9. A weak or ambiguous registration fails its quality gate. A passing result
    remains a review candidate until explicitly promoted by a separate workflow.
 
 The browser currently runs one provider per scan. The dual-provider consensus

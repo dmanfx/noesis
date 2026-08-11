@@ -267,9 +267,20 @@ def test_phone_scan_api_upload_initiate_review_and_delete(tmp_path: Path) -> Non
         assert ready["prepared"]["frame_count"] == 2
         assert ready["prepared"]["frames"][0]["thumbnail_url"].startswith("/assets/")
 
+        blank_name = client.patch(f"/api/scans/{scan_id}?name=%20%20%20")
+        assert blank_name.status_code == 400
+        renamed = client.patch(
+            f"/api/scans/{scan_id}?name=Living%20Room%20Daylight"
+        )
+        assert renamed.status_code == 200
+        assert renamed.json()["name"] == "Living Room Daylight"
+        assert client.get(f"/api/scans/{scan_id}").json()["name"] == "Living Room Daylight"
+        assert client.get("/api/scans").json()[0]["name"] == "Living Room Daylight"
+
         initiated = client.post(f"/api/scans/{scan_id}/initiate-ma")
         assert initiated.status_code == 202
         complete = _wait_for_status(client, scan_id, "complete")
+        assert complete["name"] == "Living Room Daylight"
         glb_url = complete["outputs"]["artifact_urls"]["reconstruction_glb"]
         assert client.get(glb_url).status_code == 200
         assert complete["outputs"]["frames"][0]["raw_npz_url"].startswith("/assets/")
@@ -290,6 +301,7 @@ def test_scan_id_path_traversal_is_rejected(tmp_path: Path) -> None:
     app = create_app(_settings(tmp_path))
     with TestClient(app) as client:
         assert client.get("/api/scans/not-a-scan").status_code == 404
+        assert client.patch("/api/scans/not-a-scan?name=Kitchen").status_code == 404
         assert client.delete("/api/scans/not-a-scan").status_code == 404
 
 

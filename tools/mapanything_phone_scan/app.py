@@ -30,6 +30,7 @@ APP_ROOT = Path(__file__).resolve().parent
 SCAN_ID_PATTERN = re.compile(r"^[0-9]{8}-[0-9]{6}-[a-f0-9]{8}$")
 ALLOWED_VIDEO_SUFFIXES = {".mp4", ".mov", ".m4v", ".webm", ".mkv", ".3gp"}
 INFERENCE_PROVIDERS = {"mapanything", "da3"}
+MAX_SCAN_NAME_LENGTH = 80
 RUNNING_STATUSES = {
     "processing_frames",
     "ma_queued",
@@ -275,6 +276,24 @@ class PhoneScanService:
         with self._lock(scan_id):
             state = self._read_state_unlocked(scan_id)
             state.update(changes)
+            self._write_state_unlocked(scan_id, state)
+            return state
+
+    def rename_scan(self, scan_id: str, name: str) -> dict[str, Any]:
+        normalized_name = " ".join(str(name).split())
+        if not normalized_name:
+            raise HTTPException(
+                status.HTTP_400_BAD_REQUEST,
+                "Walk name cannot be empty",
+            )
+        if len(normalized_name) > MAX_SCAN_NAME_LENGTH:
+            raise HTTPException(
+                status.HTTP_422_UNPROCESSABLE_ENTITY,
+                f"Walk name cannot exceed {MAX_SCAN_NAME_LENGTH} characters",
+            )
+        with self._lock(scan_id):
+            state = self._read_state_unlocked(scan_id)
+            state["name"] = normalized_name
             self._write_state_unlocked(scan_id, state)
             return state
 
@@ -708,7 +727,7 @@ def create_app(
 
     app = FastAPI(
         title="Noesis Multi-View Phone Scan",
-        version="1.2.0",
+        version="1.3.1",
         lifespan=lifespan,
     )
     app.state.phone_scan_service = service
@@ -751,10 +770,20 @@ def create_app(
     async def get_scan(scan_id: str) -> dict[str, Any]:
         return _public_state(service.read_state(scan_id))
 
+    @app.patch("/api/scans/{scan_id}")
+    async def rename_scan(
+        scan_id: str,
+        name: str = Query(min_length=1, max_length=MAX_SCAN_NAME_LENGTH),
+    ) -> dict[str, Any]:
+        return _public_state(service.rename_scan(scan_id, name))
+
     @app.post("/api/scans", status_code=status.HTTP_201_CREATED)
     async def create_scan_from_video(
         request: Request,
-        name: str = Query(default="Phone room walk", max_length=80),
+        name: str = Query(
+            default="Phone room walk",
+            max_length=MAX_SCAN_NAME_LENGTH,
+        ),
     ) -> JSONResponse:
         filename = unquote(request.headers.get("x-file-name") or "phone_walk.mp4")
         filename = Path(filename).name[:160] or "phone_walk.mp4"

@@ -6,11 +6,18 @@ import time
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional
 
-from noesis.ds8_preflight import REPO_ROOT
 from noesis.dev_console.launch_spec import LaunchSpec
+from noesis.dev_console.paths import dev_console_root
 
 
-PROFILE_ROOT = REPO_ROOT / "build" / "dev_console" / "profiles"
+# Test/operator override. The default follows NOESIS_BUILD_DIR at access time.
+PROFILE_ROOT: Path | None = None
+
+
+def profile_root() -> Path:
+    if PROFILE_ROOT is not None:
+        return Path(PROFILE_ROOT).expanduser().resolve(strict=False)
+    return dev_console_root() / "profiles"
 
 
 def _slug(text: str) -> str:
@@ -20,7 +27,7 @@ def _slug(text: str) -> str:
 
 def _profile_path(profile_id: str) -> Path:
     safe_id = _slug(profile_id)
-    return PROFILE_ROOT / f"{safe_id}.json"
+    return profile_root() / f"{safe_id}.json"
 
 
 def _profile_summary(profile: Mapping[str, Any]) -> Dict[str, Any]:
@@ -44,9 +51,10 @@ def _profile_summary(profile: Mapping[str, Any]) -> Dict[str, Any]:
 
 
 def list_profiles() -> List[Dict[str, Any]]:
-    PROFILE_ROOT.mkdir(parents=True, exist_ok=True)
+    root = profile_root()
+    root.mkdir(parents=True, exist_ok=True)
     items: List[Dict[str, Any]] = []
-    for path in sorted(PROFILE_ROOT.glob("*.json")):
+    for path in sorted(root.glob("*.json")):
         try:
             profile = json.loads(path.read_text(encoding="utf-8"))
         except Exception:
@@ -57,7 +65,7 @@ def list_profiles() -> List[Dict[str, Any]]:
 
 
 def save_profile(*, name: str, notes: str = "", spec: LaunchSpec, profile_id: Optional[str] = None) -> Dict[str, Any]:
-    PROFILE_ROOT.mkdir(parents=True, exist_ok=True)
+    profile_root().mkdir(parents=True, exist_ok=True)
     clean_name = str(name or "").strip() or f"{spec.pgie_profile} {spec.tracking_mode}"
     clean_id = _slug(profile_id or clean_name)
     path = _profile_path(clean_id)

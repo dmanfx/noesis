@@ -11,6 +11,7 @@ import yaml
 from noesis.ds8_preflight import REPO_ROOT, resolve_config_path
 from noesis.dev_console.launch_spec import LaunchSpec
 from noesis.dev_console.materialize import build_effective_config
+from noesis_core.runtime_secrets import materialize_pipeline_config
 
 
 def _load_mapping(path: Path) -> Mapping[str, Any]:
@@ -215,7 +216,7 @@ def _source_row(
 def build_source_readiness(spec: LaunchSpec, *, probe_network: bool = True, timeout_s: float = 0.35) -> Dict[str, Any]:
     pipeline_path = spec.pipeline_path
     cameras_path = spec.cameras_path
-    effective = build_effective_config(spec)
+    effective = materialize_pipeline_config(build_effective_config(spec))
     cameras_cfg = _load_mapping(cameras_path)
     cameras = cameras_cfg.get("cameras") if isinstance(cameras_cfg.get("cameras"), Mapping) else {}
     intrinsics_models = cameras_cfg.get("intrinsics_models") if isinstance(cameras_cfg.get("intrinsics_models"), Mapping) else {}

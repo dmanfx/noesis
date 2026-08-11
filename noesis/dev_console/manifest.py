@@ -52,7 +52,7 @@ DESCRIPTIONS = {
     "NOESIS_TRACKING_MODE": "Select baseline or v3dt tracking mode.",
     "NOESIS_PGIE_PROFILE": "Select the primary inference profile overlay.",
     "NOESIS_DEPTH_ENABLE_SECONDS": "Open the gated MapAnything branch on startup for this many seconds.",
-    "NOESIS_MOSAIC_WEBRTC_ENABLED": "Enable the RTSP-to-WebRTC mosaic gateway at build time.",
+    "NOESIS_MOSAIC_WEBRTC_ENABLED": "Enable the H.264 SHM feeder and WebRTC gateways at build time.",
     "NOESIS_DEV_CONSOLE_LAUNCH_DIR": "Console-owned launch artifact directory.",
 }
 

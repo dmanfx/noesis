@@ -8,8 +8,8 @@ import pytest
 
 from noesis.ds8_preflight import (
     REPO_ROOT,
-    Severity,
     derive_osd_policy_from_ini,
+    derive_osd_policy_from_profile,
     has_blocking,
     mask_output_available,
     run_preflight,
@@ -66,6 +66,81 @@ def test_mask_output_available_detect_ini():
     osd = derive_osd_policy_from_ini(props)
     assert osd["display-mask"] == 0
     assert osd["display-bbox"] == 1
+
+
+@pytest.mark.parametrize(
+    ("profile", "size", "expected_mask"),
+    [
+        ("yolo11", "m", 0),
+        ("yolo11_seg", "m", 1),
+        ("yolo26", "m", 0),
+        ("yolo26_seg", "s", 1),
+        ("rfdetr", "m", 0),
+        ("rfdetr_seg", "m", 1),
+        ("wholebody49", "s", 1),
+        ("wholebody49", "x", 0),
+    ],
+)
+def test_profile_osd_policy_is_reviewed_and_deterministic(
+    profile: str, size: str, expected_mask: int
+):
+    policy = derive_osd_policy_from_profile(profile, size)
+    assert policy == {
+        "process-mode": 0,
+        "display-mask": expected_mask,
+        "display-bbox": 1,
+        "display-text": 1,
+    }
+
+
+def test_effective_config_osd_does_not_depend_on_generated_ini(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+):
+    from noesis.dev_console.materialize import build_effective_config
+
+    build_root = tmp_path / "empty-build"
+    monkeypatch.setenv("NOESIS_BUILD_DIR", str(build_root))
+    assert not build_root.exists()
+
+    detect = build_effective_config(
+        LaunchSpec(pgie_profile="yolo26", size="m", launch_id="detect-no-build")
+    )
+    segment = build_effective_config(
+        LaunchSpec(pgie_profile="yolo26_seg", size="s", launch_id="seg-no-build")
+    )
+
+    assert detect["osd"]["display-mask"] == 0
+    assert segment["osd"]["display-mask"] == 1
+    assert not build_root.exists()
+
+
+def test_dev_console_mutable_paths_follow_noesis_build_dir(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+):
+    import noesis.dev_console.activity as activity
+    import noesis.dev_console.profiles as profiles
+
+    build_root = tmp_path / "isolated-build"
+    monkeypatch.setenv("NOESIS_BUILD_DIR", str(build_root))
+    monkeypatch.setattr(activity, "ACTIVITY_LOG", None)
+    monkeypatch.setattr(profiles, "PROFILE_ROOT", None)
+
+    spec = LaunchSpec(
+        pgie_profile="yolo11_seg",
+        size="m",
+        launch_id="isolated-launch",
+    )
+    assert spec.launch_dir == build_root / "dev_console" / "isolated-launch"
+    assert activity.activity_log_path() == (
+        build_root / "dev_console" / "activity" / "activity.jsonl"
+    )
+    assert profiles.profile_root() == build_root / "dev_console" / "profiles"
+
+    activity.record_activity("test.isolated", "Isolated activity")
+    saved = profiles.save_profile(name="isolated", spec=spec)
+    assert Path(saved["path"]).is_relative_to(build_root)
+    assert activity.activity_log_path().is_file()
+    assert not (REPO_ROOT / "build" / "dev_console" / "isolated-launch").exists()
 
 
 def test_metadata_compat_baseline_detect_warn():
@@ -180,7 +255,8 @@ def test_build_pipeline_resolves_paths_from_launch_dir():
     assert tracker_comp is not None
     ll_cfg = str(tracker_comp.config.get("ll-config-file", ""))
     assert "build/dev_console/config" not in ll_cfg
-    assert ll_cfg.endswith("config/nvtracker.yaml")
+    assert "/runtime_inference/nvtracker/" in ll_cfg
+    assert ll_cfg.endswith("/nvtracker.yaml")
 
 
 def test_depth_registration_preflight_passes_yolo11_seg():
@@ -379,7 +455,7 @@ def test_log_insights_endpoint_reads_supervisor_log(tmp_path):
         "\n".join(
             [
                 "[dev-console] argv: python3 noesis/ds8_runtime.py",
-                "WARNING RTSP sink not ready on 127.0.0.1:8554; skipping WebRTC gateway start",
+                "ERROR Mosaic H.264 SHM feeder failed before first AU",
                 "ERROR Failed to link nvinfer element in pyservicemaker pipeline",
             ]
         )
@@ -395,7 +471,7 @@ def test_log_insights_endpoint_reads_supervisor_log(tmp_path):
     assert payload["line_count"] == 3
     assert payload["status"] == "error"
     signatures = {item["id"] for item in payload["signatures"]}
-    assert "webrtc_rtsp" in signatures
+    assert "mosaic_delivery" in signatures
     assert "deepstream_pipeline" in signatures
 
 
@@ -478,6 +554,31 @@ def test_materialized_launch_applies_source_overrides():
     assert "kind" not in cfg["sources"][0]
     assert int(cfg["batch_size"]) == 1
     assert int(cfg["streammux"]["batch-size"]) == 1
+
+
+def test_materialized_launch_rejects_inline_rtsp_source_override():
+    from noesis.dev_console.launch_spec import LaunchSpec
+    from noesis.dev_console.materialize import materialize_launch_pipeline
+    from noesis_core.runtime_secrets import RuntimeSecretError
+
+    spec = LaunchSpec(
+        pipeline_config="config/infer.yaml",
+        pgie_profile="yolo11_seg",
+        tracking_mode="baseline",
+        launch_id="test-inline-rtsp-rejected",
+        source_overrides=[
+            {
+                "label": "camera",
+                "kind": "rtsp",
+                "enabled": True,
+                "uri": "rtsp://camera.invalid/private-inline",
+                "source": {"element": "nvurisrcbin"},
+            }
+        ],
+    )
+    with pytest.raises(RuntimeSecretError, match="inline RTSP URI"):
+        materialize_launch_pipeline(spec, dry_run=True)
+    assert not (spec.launch_dir / "effective_pipeline_yolo11_seg.yaml").exists()
 
 
 def test_diagnostics_snapshot_reports_ports_and_artifacts():
@@ -1225,9 +1326,9 @@ def test_source_catalog_preserves_editable_sources_and_redacted_display():
 
     assert payload["summary"]["total"] == 3
     first = payload["rows"][0]
-    assert first["uri"].startswith("rtsp://")
-    assert "jdr9oLlBkjyl3gDm" in first["uri"]
-    assert "jdr9oLlBkjyl3gDm" not in first["uri_display"]
+    assert first["uri"] == ""
+    assert first["uri_secret"] == "living-room"
+    assert first["uri_display"] == "camera-secret:living-room"
     assert first["source"]["dewarper"]["config-file"].startswith("config/")
 
 
@@ -1272,7 +1373,8 @@ def test_sources_endpoint_records_activity(monkeypatch, tmp_path):
     assert response.status_code == 200
     payload = response.json()
     assert payload["summary"]["total"] == 3
-    assert all("://" in row["uri_display"] and "7447" in row["uri_display"] for row in payload["rows"])
+    assert all(row["uri_display"].startswith("rtsp://") for row in payload["rows"])
+    assert all(row["uri_display"].endswith("/...") for row in payload["rows"])
     timeline = client.get("/api/activity?limit=5").json()["items"]
     assert timeline[0]["type"] == "sources.scan"
     assert timeline[0]["payload"]["summary"]["total"] == 3

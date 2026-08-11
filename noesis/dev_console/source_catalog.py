@@ -92,6 +92,9 @@ def _source_from_row(raw: Mapping[str, Any]) -> Dict[str, Any]:
     uri = str(raw.get("uri") or source.get("uri") or "").strip()
     if uri:
         source["uri"] = uri
+    uri_secret = str(raw.get("uri_secret") or source.get("uri_secret") or "").strip()
+    if uri_secret:
+        source["uri_secret"] = uri_secret
     return source
 
 
@@ -114,6 +117,7 @@ def build_source_catalog(spec: LaunchSpec) -> Dict[str, Any]:
     for index, raw_source in enumerate(raw_sources):
         source = _source_from_row(raw_source if isinstance(raw_source, Mapping) else {})
         uri = str(source.get("uri") or "").strip()
+        uri_secret = str(source.get("uri_secret") or "").strip()
         camera = _camera_by_index(cameras, index)
         camera_id = str(raw_source.get("camera_id") or camera.get("name") or f"camera_{index}")
         label = str(raw_source.get("label") or camera_id)
@@ -123,10 +127,11 @@ def build_source_catalog(spec: LaunchSpec) -> Dict[str, Any]:
                 "source_id": int(raw_source.get("source_id", index) or index),
                 "camera_id": camera_id,
                 "label": label,
-                "kind": str(raw_source.get("kind") or _source_kind(uri)),
+                "kind": str(raw_source.get("kind") or ("rtsp" if uri_secret else _source_kind(uri))),
                 "enabled": _source_enabled(raw_source),
                 "uri": uri,
-                "uri_display": _display_uri(uri),
+                "uri_secret": uri_secret,
+                "uri_display": f"camera-secret:{uri_secret}" if uri_secret else _display_uri(uri),
                 "source": source,
             }
         )

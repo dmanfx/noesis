@@ -140,7 +140,7 @@ def _active_gates(spec: LaunchSpec, effective: Mapping[str, Any]) -> List[Dict[s
         {
             "label": "RTSP",
             "key": "NOESIS_MOSAIC_RTSP_ENABLED",
-            "value": _gate_value(spec, effective, env, "NOESIS_MOSAIC_RTSP_ENABLED", ("mosaic_output", "rtsp_enabled"), True),
+            "value": _gate_value(spec, effective, env, "NOESIS_MOSAIC_RTSP_ENABLED", ("mosaic_output", "rtsp_enabled"), False),
             "source": "env" if "NOESIS_MOSAIC_RTSP_ENABLED" in env else "pipeline",
         },
         {

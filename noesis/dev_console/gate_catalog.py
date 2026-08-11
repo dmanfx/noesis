@@ -204,7 +204,7 @@ def build_gate_catalog(spec: LaunchSpec) -> Dict[str, Any]:
     reid_enabled = _get(effective, ("models", "reid", "enable"), True)
     pose_enabled = _get(effective, ("models", "pose", "enable"), True)
     trails_enabled = _get(effective, ("visualization", "trails", "enabled"), True)
-    rtsp_enabled = _get(effective, ("mosaic_output", "rtsp_enabled"), True)
+    rtsp_enabled = _get(effective, ("mosaic_output", "rtsp_enabled"), False)
     webrtc_enabled = _get(effective, ("mosaic_output", "mosaic_webrtc_enabled"), True)
 
     groups = [
@@ -298,7 +298,7 @@ def build_gate_catalog(spec: LaunchSpec) -> Dict[str, Any]:
         _group(
             "mosaic",
             "Mosaic",
-            "RTSP and WebRTC delivery gates for the mosaic output.",
+            "Canonical H.264 SHM/WebRTC delivery and optional RTSP tooling.",
             [
                 _env_bool_control(
                     spec,
@@ -308,8 +308,8 @@ def build_gate_catalog(spec: LaunchSpec) -> Dict[str, Any]:
                     group="mosaic",
                     inherited=rtsp_enabled,
                     source_default="pipeline",
-                    detail="Build the DS8 RTSP mosaic branch.",
-                    impact="WebRTC needs RTSP available because the gateway consumes the local mosaic stream.",
+                    detail="Add the optional DS8 RTSP tooling branch.",
+                    impact="This is independent of browser WebRTC delivery and is normally left off.",
                 ),
                 _env_bool_control(
                     spec,
@@ -319,8 +319,8 @@ def build_gate_catalog(spec: LaunchSpec) -> Dict[str, Any]:
                     group="mosaic",
                     inherited=webrtc_enabled,
                     source_default="pipeline",
-                    detail="Start the RTSP-to-WebRTC mosaic gateway with DS8.",
-                    impact="Disable for headless smoke tests or when another gateway owns the port.",
+                    detail="Start the H.264 SHM feeder and bounded WebRTC gateway slots with DS8.",
+                    impact="Disable only for media-free/headless tests; it does not require the RTSP port.",
                 ),
                 _field_control(
                     control_id="rtsp_port",

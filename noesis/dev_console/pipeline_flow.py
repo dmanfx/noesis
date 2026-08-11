@@ -256,9 +256,9 @@ def describe_flow(
     stages.append(
         _stage(
             "rtsp",
-            "RTSP mosaic",
+            "Optional RTSP mosaic",
             "output",
-            "ready" if mosaic.get("rtsp_enabled", True) else "disabled",
+            "ready" if mosaic.get("rtsp_enabled", False) else "disabled",
             detail=f":{mosaic.get('rtsp_port', 8554)}/{mosaic.get('rtsp_path', 'mosaic')}",
             controls=[
                 {"type": "number", "label": "RTSP port", "target": "rtsp_port", "value": int(rtsp_port), "min": 1024, "max": 65535},
@@ -266,7 +266,7 @@ def describe_flow(
                     "type": "toggle",
                     "label": "RTSP",
                     "target": "NOESIS_MOSAIC_RTSP_ENABLED",
-                    "value": env_map.get("NOESIS_MOSAIC_RTSP_ENABLED", "1"),
+                    "value": env_map.get("NOESIS_MOSAIC_RTSP_ENABLED", "0"),
                 },
             ],
         )
@@ -274,10 +274,13 @@ def describe_flow(
     stages.append(
         _stage(
             "webrtc",
-            "WebRTC gateway",
+            "H.264 SHM / WebRTC",
             "output",
             "ready" if mosaic.get("mosaic_webrtc_enabled", False) else "disabled",
-            detail="browser mosaic video",
+            detail=(
+                f"{int(mosaic.get('video_bitrate_kbps', 12000) or 12000)} kbps; "
+                f"IDR/{int(mosaic.get('h264_idrinterval', 10) or 10)} frames"
+            ),
             controls=[
                 {
                     "type": "toggle",
@@ -303,8 +306,8 @@ def describe_flow(
         ["pose", "world"],
         ["world", "tiler"],
         ["tiler", "osd"],
+        ["osd", "webrtc"],
         ["osd", "rtsp"],
-        ["rtsp", "webrtc"],
     ]
     env_knobs = [{"key": str(key), "value": str(value)} for key, value in sorted(env_map.items())]
     return {

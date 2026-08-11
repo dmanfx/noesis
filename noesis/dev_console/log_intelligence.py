@@ -52,12 +52,12 @@ _SIGNATURES = [
         "action": "Refresh Sources and verify camera URI, credentials, and network reachability.",
     },
     {
-        "id": "webrtc_rtsp",
-        "label": "RTSP / WebRTC",
+        "id": "mosaic_delivery",
+        "label": "Mosaic H.264 / WebRTC",
         "severity": "warn",
-        "patterns": (r"webrtc", r"rtsp sink not ready", r"rtsp.*not ready", r"gateway.*failed", r"keyframe"),
+        "patterns": (r"webrtc", r"mosaic.*shm", r"h264.*feeder", r"gateway.*failed", r"keyframe"),
         "target": "mosaic",
-        "action": "Verify RTSP is enabled, the RTSP port is free, and the WebRTC gateway can consume the mosaic stream.",
+        "action": "Verify the mosaic SHM socket, feeder first-AU readiness, force-IDR control, and decoded WebRTC media.",
     },
     {
         "id": "depth_registration",

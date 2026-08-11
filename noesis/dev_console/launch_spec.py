@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional
 
 from noesis.ds8_preflight import REPO_ROOT
+from noesis.dev_console.paths import dev_console_root
 
 
 def _launch_id() -> str:
@@ -38,7 +39,9 @@ class LaunchSpec:
 
     @property
     def launch_dir(self) -> Path:
-        return (REPO_ROOT / "build" / "dev_console" / self.launch_id).resolve()
+        return (
+            dev_console_root(self.env.get("NOESIS_BUILD_DIR")) / self.launch_id
+        ).resolve(strict=False)
 
     @property
     def pipeline_path(self) -> Path:

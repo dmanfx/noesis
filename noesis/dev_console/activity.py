@@ -7,10 +7,12 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional
 
-from noesis.ds8_preflight import REPO_ROOT
+from noesis.dev_console.paths import dev_console_root
 
 
-ACTIVITY_LOG = REPO_ROOT / "build" / "dev_console" / "activity" / "activity.jsonl"
+# Test/operator override. The default remains dynamic so a process that changes
+# NOESIS_BUILD_DIR before its first activity write cannot mutate the checkout.
+ACTIVITY_LOG: Path | None = None
 _SENSITIVE_KEY_TOKENS = ("SECRET", "TOKEN", "PASSWORD", "PASSWD", "API_KEY", "PRIVATE_KEY", "CREDENTIAL")
 _MAX_STRING = 320
 _MAX_ITEMS = 40
@@ -52,6 +54,12 @@ def _clean_severity(severity: str) -> str:
     return normalized if normalized in {"info", "ok", "warn", "block"} else "info"
 
 
+def activity_log_path() -> Path:
+    if ACTIVITY_LOG is not None:
+        return Path(ACTIVITY_LOG).expanduser().resolve(strict=False)
+    return dev_console_root() / "activity" / "activity.jsonl"
+
+
 def record_activity(
     event_type: str,
     title: str,
@@ -71,8 +79,9 @@ def record_activity(
         "detail": str(detail or ""),
         "payload": _jsonable(dict(payload or {})),
     }
-    ACTIVITY_LOG.parent.mkdir(parents=True, exist_ok=True)
-    with ACTIVITY_LOG.open("a", encoding="utf-8") as handle:
+    log_path = activity_log_path()
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    with log_path.open("a", encoding="utf-8") as handle:
         handle.write(json.dumps(event, sort_keys=True, separators=(",", ":")) + "\n")
     return event
 
@@ -88,8 +97,9 @@ def list_activity(*, limit: int = 100) -> Dict[str, Any]:
     capped = max(1, min(500, int(limit)))
     items: List[Dict[str, Any]] = []
     total = 0
-    if ACTIVITY_LOG.exists():
-        lines = ACTIVITY_LOG.read_text(encoding="utf-8", errors="replace").splitlines()
+    log_path = activity_log_path()
+    if log_path.exists():
+        lines = log_path.read_text(encoding="utf-8", errors="replace").splitlines()
         total = len(lines)
         for line in reversed(lines):
             if len(items) >= capped:
@@ -100,4 +110,4 @@ def list_activity(*, limit: int = 100) -> Dict[str, Any]:
                 continue
             if isinstance(item, Mapping):
                 items.append(dict(item))
-    return {"items": items, "limit": capped, "total": total, "path": str(ACTIVITY_LOG)}
+    return {"items": items, "limit": capped, "total": total, "path": str(log_path)}

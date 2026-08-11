@@ -10,12 +10,12 @@ import yaml
 
 from noesis.ds8_preflight import (
     REPO_ROOT,
-    derive_osd_policy_from_ini,
-    parse_nvinfer_ini,
+    derive_osd_policy_from_profile,
     resolve_config_path,
     validate_metadata_compatibility,
 )
 from noesis.dev_console.launch_spec import LaunchSpec
+from noesis_core.runtime_secrets import public_pipeline_config
 
 LOGGER = logging.getLogger(__name__)
 
@@ -152,7 +152,7 @@ def _apply_tracking_overlay(cfg: Dict[str, Any], tracking_mode: str) -> Dict[str
                 "depth_tracking": {
                     "enable": True,
                     "name": "depth_tracking_fullframe",
-                    "config-file-path": "build/config_infer_depth_tracking_da2_vits_294x518_b3_i1.ini",
+                    "config-file-path": "pipelines/config_infer_secondary_depth_tracking_da2.ini",
                     "engine": "models/engines/depth_anything_v2_metric_hypersim_vits_294x518_b3_fp16.engine",
                     "batch_size": 3,
                     "gie_id": 5,
@@ -179,11 +179,14 @@ def _runtime_source(raw: Mapping[str, Any]) -> Dict[str, Any]:
     uri = str(raw.get("uri") or source.get("uri") or "").strip()
     if uri:
         source["uri"] = uri
+    uri_secret = str(raw.get("uri_secret") or source.get("uri_secret") or "").strip()
+    if uri_secret:
+        source["uri_secret"] = uri_secret
     source.setdefault("element", "nvurisrcbin")
     source.setdefault("gpu-id", 0)
     source.setdefault("cudadec-memtype", 0)
     source.setdefault("disable-audio", True)
-    if str(source.get("uri", "")).lower().startswith("rtsp://"):
+    if uri_secret or str(source.get("uri", "")).lower().startswith(("rtsp://", "rtsps://")):
         source.setdefault("latency", 100)
         source.setdefault("select-rtp-protocol", 4)
     return source
@@ -275,19 +278,14 @@ def build_effective_config(spec: LaunchSpec) -> Dict[str, Any]:
     effective = _apply_source_overrides(effective, spec)
     effective = deep_merge(effective, {"mosaic_output": {"rtsp_port": int(spec.rtsp_port)}})
 
-    pgie = ((effective.get("models") or {}).get("pgie") or {}) if isinstance(effective.get("models"), dict) else {}
-    pgie_ini_raw = pgie.get("config-file-path") if isinstance(pgie, Mapping) else None
-    if pgie_ini_raw:
-        pgie_ini = resolve_config_path(base_path, pgie_ini_raw)
-        if pgie_ini.exists():
-            effective["osd"] = derive_osd_policy_from_ini(parse_nvinfer_ini(pgie_ini))
-    return canonicalize_runtime_paths(effective, base_path)
+    effective["osd"] = derive_osd_policy_from_profile(spec.pgie_profile, spec.size)
+    return public_pipeline_config(canonicalize_runtime_paths(effective, base_path))
 
 
 def materialize_launch_pipeline(spec: LaunchSpec, *, dry_run: bool = False) -> Path:
     launch_dir = spec.launch_dir
     launch_dir.mkdir(parents=True, exist_ok=True)
-    effective = build_effective_config(spec)
+    effective = public_pipeline_config(build_effective_config(spec))
     suffix = f"{spec.pgie_profile}_{spec.size}" if spec.size else spec.pgie_profile
     out_path = launch_dir / f"effective_pipeline_{suffix}.yaml"
     out_path.write_text(yaml.safe_dump(effective, sort_keys=False), encoding="utf-8")

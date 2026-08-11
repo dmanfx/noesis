@@ -12,6 +12,8 @@ from typing import Any, Dict, Iterable, List, Mapping, Optional
 
 import yaml
 
+from noesis_core.runtime_secrets import RuntimeSecretError, materialize_pipeline_config
+
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
@@ -137,6 +139,33 @@ def derive_osd_policy_from_ini(props: Mapping[str, Any]) -> Dict[str, int]:
     if mask_output_available(props):
         return {"process-mode": 0, "display-mask": 1, "display-bbox": 1, "display-text": 1}
     return {"process-mode": 0, "display-mask": 0, "display-bbox": 1, "display-text": 1}
+
+
+def derive_osd_policy_from_profile(profile: str, size: Any = None) -> Dict[str, int]:
+    """Derive OSD behavior from the reviewed PGIE profile contract."""
+
+    profile_norm = str(profile or "").strip().lower()
+    size_norm = str(size or "").strip().lower()
+    known = {
+        "yolo11",
+        "yolo11_seg",
+        "yolo26",
+        "yolo26_seg",
+        "rfdetr",
+        "rfdetr_seg",
+        "wholebody49",
+    }
+    if profile_norm not in known:
+        raise ValueError(f"unknown PGIE profile for OSD policy: {profile}")
+    has_masks = profile_norm in {"yolo11_seg", "yolo26_seg", "rfdetr_seg"} or (
+        profile_norm == "wholebody49" and size_norm != "x"
+    )
+    return {
+        "process-mode": 0,
+        "display-mask": int(has_masks),
+        "display-bbox": 1,
+        "display-text": 1,
+    }
 
 
 def _validate_path(
@@ -449,6 +478,25 @@ def run_preflight(
     sources = cfg.get("sources")
     if isinstance(sources, list) and sources:
         results.append(_result(Severity.INFO, "sources.ok", f"{len(sources)} source(s) configured"))
+        try:
+            materialize_pipeline_config(cfg)
+        except RuntimeSecretError as exc:
+            results.append(
+                _result(
+                    Severity.BLOCK,
+                    "sources.secrets.invalid",
+                    f"Camera source secret contract failed: {exc}",
+                    "Provision owner-only camera source state and use uri_secret references.",
+                )
+            )
+        else:
+            results.append(
+                _result(
+                    Severity.INFO,
+                    "sources.secrets.ok",
+                    "Camera source secret references resolve through owner-only state.",
+                )
+            )
     else:
         results.append(
             _result(

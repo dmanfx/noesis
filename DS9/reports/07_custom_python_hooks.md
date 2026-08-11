@@ -1,15 +1,18 @@
 # 07 Custom Python Hooks, MapAnything, BEV, Overlay, Telemetry
 
-Date: 2026-05-10
+Original audit: 2026-05-10
 
-Scope: DS9 migration audit for custom Python hooks while keeping live DS8 untouched.
-This report only audits the DS9 tree. Code and config were not edited.
+Reconciled with the current exact-capture path: 2026-07-25
+
+Scope: DS9 migration audit for custom Python hooks while keeping live DS8
+untouched. This report audits only the DS9 tree; later reconciliation records
+the implemented DS9 path and its isolated validation evidence.
 
 Audited local sources:
 
 - [`../noesis/pipelines/hooks.py`](../noesis/pipelines/hooks.py)
 - [`../noesis/pipelines/ds8_pipeline.py`](../noesis/pipelines/ds8_pipeline.py)
-- [`../noesis/telemetry/bev.py`](../noesis/telemetry/bev.py)
+- [`../../noesis/telemetry/bev.py`](../../noesis/telemetry/bev.py)
 - [`../pipelines/config_infer_secondary_mapanything.ini`](../pipelines/config_infer_secondary_mapanything.ini)
 - [`../docs/MapAnything_Depth.md`](../docs/MapAnything_Depth.md)
 - [`../docs/history/ds8/DS8_testing_guide.md`](../docs/history/ds8/DS8_testing_guide.md)
@@ -32,13 +35,21 @@ Official NVIDIA DS9 evidence used for DS9 claims:
 
 ## Executive Call
 
-DS9 Service Maker does provide the canonical shape this repo wants for
-MapAnything tensor handling without an appsink or CPU video branch: keep the
-full-frame `nvinfer` branch GPU/NVMM, enable `output-tensor-meta`, terminate the
-branch at `fakesink`, and consume tensor metadata from a Service Maker metadata
-probe. That is the canonical migration direction. It still needs an installed
-DS9 smoke test proving the Python wrapper exposes the same `tensor_items` /
-`as_tensor_output()` shape used here, but the design target is correct.
+The canonical MapAnything path is now proven without an appsink or a separate
+CPU video branch: keep full-frame `nvinfer` on GPU/NVMM with
+`output-tensor-meta`, convert its output to explicit NVMM RGB, attach a Service
+Maker `BufferOperator` probe to `mapanything_rgb_caps`, and terminate the
+branch at `fakesink`. The probe reads the exact RGB batch surface and preserved
+typed tensor metadata from the same post-inference buffer. The Service Maker
+`frame_meta.tensor_items` wrapper is not an authority here: live evidence
+exposed only sibling DAv2 UID 5, while the DS9-native typed reader found the
+required MapAnything UID 2.
+
+An isolated canonical-container run on 2026-07-25 passed this path for
+living-room, kitchen, and family-room with same-buffer `1920x1080` `rgb8`
+evidence and zero mutation during the cache-only follow-up. This validates the
+capture and manual fresh/cache-only contracts, not production promotion or
+absolute depth accuracy.
 
 `BatchMetadataOperator`, Service Maker display metadata, and the trail overlay
 path remain canonical. The DS9 code already puts overlays into display metadata
@@ -47,9 +58,9 @@ labels.
 
 The custom Python audited here is mostly edge metadata, postprocess, telemetry,
 and serialization. It does not introduce a CPU video branch in the canonical
-pipeline. The places to quarantine for DS9 prep are the raw `pyds` fallbacks in
-`hooks.py`: raw tensor extraction, raw object-list traversal, raw analytics user
-meta traversal, OSD label fallback, and Python object pruning.
+pipeline. Raw `pyds` tensor, object-list, analytics-user-meta, and OSD-label
+compatibility helpers remain quarantined from the canonical MapAnything and
+Service Maker paths.
 
 ## MapAnything Tensor Path
 
@@ -61,53 +72,60 @@ It defaults the MapAnything SGIE to tensor metadata output through the builder
 property map:
 
 - `attach_tensor_meta` maps to `output-tensor-meta` in
-  [`ds8_pipeline.py`](../noesis/pipelines/ds8_pipeline.py#L512-L532).
+  [`ds8_pipeline.py`](../noesis/pipelines/ds8_pipeline.py).
 - The MapAnything branch sets `attach_tensor_meta=True`, `gie_id=2`, uses a
-  leaky queue and gate valve, then links to a branch sink in
-  [`ds8_pipeline.py`](../noesis/pipelines/ds8_pipeline.py#L1049-L1113).
+  leaky queue and normally closed gate valve, then links
+  `nvinfer -> nvvideoconvert -> NVMM RGB caps -> fakesink` in
+  [`ds8_pipeline.py`](../noesis/pipelines/ds8_pipeline.py).
 - The MapAnything INI is full-frame SGIE input, GPU selected, tensor-from-meta
   disabled, and `output-tensor-meta=1` in
-  [`config_infer_secondary_mapanything.ini`](../pipelines/config_infer_secondary_mapanything.ini#L1-L22).
+  [`config_infer_secondary_mapanything.ini`](../pipelines/config_infer_secondary_mapanything.ini).
 - The design history explicitly records this as an SGIE branch that terminates
-  at `fakesink` and consumes outputs through `BatchMetadataOperator` tensor meta,
-  not a tiler/appsink path:
-  [`ds8_design_decisions.md`](../docs/history/ds8/ds8_design_decisions.md#L386-L388).
+  at `fakesink`, not a tiler/appsink path:
+  [`ds8_design_decisions.md`](../docs/history/ds8/ds8_design_decisions.md).
 - The runtime only attaches the MapAnything postprocess hook if MapAnything is
   enabled and the component exists in
   `ds9_runtime_core.py`.
 
-The hook side is already metadata-first:
+The hook side is buffer-and-metadata exact:
 
 - `attach_mapanything_postprocess_hook` attaches a Service Maker `Probe` with
-  `_MapAnythingOperator` in
-  [`hooks.py`](../noesis/pipelines/hooks.py#L533-L570).
-- `_MapAnythingOperator.handle_metadata` iterates `batch_meta.frame_items`,
-  reads `frame_meta.tensor_items`, calls `as_tensor_output()`, matches the
-  configured GIE id, and sends the tensor metadata to
-  `MapAnythingProcessor.handle_nvds_tensor_ds8` in
-  [`hooks.py`](../noesis/pipelines/hooks.py#L7405-L7507).
-- `MapAnythingProcessor.handle_nvds_tensor_ds8` consumes Service Maker tensor
-  metadata with `get_layers()`, clones tensors, and puts bounded async jobs on a
-  worker queue in [`hooks.py`](../noesis/pipelines/hooks.py#L1431-L1502).
-- The async worker performs tensor-to-NumPy conversion away from the probe
-  thread and emits dense depth snapshots/RPC data in
-  [`hooks.py`](../noesis/pipelines/hooks.py#L1504-L1777).
+  `_MapAnythingBufferOperator` to `mapanything_rgb_caps` and treats
+  native/attach failure as a startup failure.
+- `_MapAnythingBufferOperator.handle_buffer` iterates
+  `buffer.batch_meta.frame_items` and invokes only
+  `MapAnythingProcessor.handle_native_buffer_frame_ds9`; wrapper tensor items
+  do not select MapAnything.
+- The DS9-owned native bridge traverses typed frame user metadata, requires one
+  exact UID 2 record and exact `depth/conf/mask` per-frame shapes, and never
+  reapplies `batch_id` because nvinfer already frame-offsets the pointers.
+- `Buffer.extract(batch_id)` reads the exact `1920x1080` RGB surface from that
+  same post-conversion buffer; source, batch, frame, media PTS, and RGB digest
+  remain one capture-event cohort.
+- The bridge copies exactly three `294x518` float32 maps (`1,827,504` bytes)
+  while nvinfer's metadata owns the source pointers. It releases the Python GIL
+  during those synchronous copies and records size and duration.
+- Only the owned arrays cross to the bounded worker for alignment, validity
+  masking, storage, and RPC publication. Runtime shutdown closes admission,
+  drains accepted jobs, and joins the non-daemon worker; final-job poison is
+  fatal even if no subsequent frame arrives.
 
 ### DS9 call
 
-Keep the Service Maker metadata-probe shape. It is the DS9 migration target for
-MapAnything and does not need appsink or CPU video frames.
+Keep the Service Maker buffer-probe shape on the post-inference RGB caps
+component. It is the DS9 MapAnything target and does not need appsink or a
+separate CPU video-frame source.
 
-Change only the fallback discipline: the native tensor fallback
-`handle_native_frame_ds8` is not a `pyds` fallback, but it is still a fallback.
-For DS9 prep it should become an explicit DS9 adapter with loud logging and a
-smoke-test gate, or be removed once DS9 Service Maker tensor metadata is proven.
-It should not remain a silent canonical alternate.
-
-The CPU tensor copy inside MapAnything postprocess is an edge postprocess/RPC
-cost, not a CPU video branch. Keep it gated, bounded, and async. If DS9
-performance targets require eliminating that dense host copy, the next canonical
-move is a C++/CUDA postprocess or custom metadata producer, not appsink.
+The native exact reader is the canonical DS9 adapter, not a fallback. The
+wrapper, generic native reader, and raw-PyDS alternatives are absent from the
+production selection path. The probe-local host copy is an edge
+postprocess/RPC cost, not a CPU video branch. It cannot safely move to the
+worker without first introducing an owned device-buffer clone contract because
+the current source pointers are nvinfer-owned only for the metadata lifetime.
+If performance targets require removing it from the callback, the next
+canonical move is an owned C++/CUDA tensor clone/postprocessor or custom
+metadata producer, not asynchronous dereference of borrowed pointers and not
+appsink.
 
 ## Overlay, Display Meta, And Trail APIs
 
@@ -125,24 +143,24 @@ metadata production through `output-tensor-meta`.
 The DS9 hook module imports Service Maker metadata and OSD primitives directly:
 
 - `BatchMetadataOperator`, `Probe`, and `pyservicemaker.osd` are imported in
-  [`hooks.py`](../noesis/pipelines/hooks.py#L38-L43).
+  [`hooks.py`](../noesis/pipelines/hooks.py).
 - Trail overlay hook attachment is documented as upstream of `nvdsosd` because
   display metadata must be present before OSD in
-  [`hooks.py`](../noesis/pipelines/hooks.py#L773-L817).
+  [`hooks.py`](../noesis/pipelines/hooks.py).
 - `TrailOverlayProcessor.handle_batch_ds8` requires Service Maker OSD bindings,
   iterates `batch_meta.frame_items`, acquires display metadata, appends it to the
   frame, and uses `ds_osd.Line` / `ds_osd.Text` in
-  [`hooks.py`](../noesis/pipelines/hooks.py#L2625-L3062).
+  [`hooks.py`](../noesis/pipelines/hooks.py).
 - Pose keypoint overlay follows the same display metadata path with
   `ds_osd.Line` and `ds_osd.Circle` in
-  [`hooks.py`](../noesis/pipelines/hooks.py#L3649-L3802).
+  [`hooks.py`](../noesis/pipelines/hooks.py).
 - The main pipeline configures `nvdsosd` with GPU processing mode to keep the
   tiler to OSD to encoder path on GPU/NVMM in
-  [`ds8_pipeline.py`](../noesis/pipelines/ds8_pipeline.py#L1211-L1224).
+  [`ds8_pipeline.py`](../noesis/pipelines/ds8_pipeline.py).
 - The design history records trail overlay as Service Maker display metadata
   using `BatchMetadata.acquire_display_meta()`, `FrameMetadata.append()`, and
   `pyservicemaker.osd.Line/Text`, with no CPU appsink branch:
-  [`ds8_design_decisions.md`](../docs/history/ds8/ds8_design_decisions.md#L545-L551).
+  [`ds8_design_decisions.md`](../docs/history/ds8/ds8_design_decisions.md).
 
 ### DS9 call
 
@@ -160,29 +178,25 @@ BEV is already an edge telemetry renderer, not a pipeline video branch:
   JPEG behavior in `ds9_runtime_core.py` and
   `ds9_runtime_core.py`.
 - The DS9 config has BEV JPEG disabled by default and output overlays disabled:
-  [`config/infer.yaml`](../config/infer.yaml#L135-L153).
+  [`config/infer.yaml`](../config/infer.yaml).
 - `BevRenderer.render_and_publish` only allocates the BGR image when JPEG is
   enabled, otherwise it builds JSON footpoint/trail telemetry in
-  [`bev.py`](../noesis/telemetry/bev.py#L580-L1002).
+  [`bev.py`](../../noesis/telemetry/bev.py).
 - `_publish` always broadcasts JSON metadata and only encodes JPEG bytes when
-  JPEG is enabled in [`bev.py`](../noesis/telemetry/bev.py#L1014-L1104).
+  JPEG is enabled in [`bev.py`](../../noesis/telemetry/bev.py).
 - The design history records meta-only BEV as the default and frequent BEV JPEG
   as disabled by default:
-  [`ds8_design_decisions.md`](../docs/history/ds8/ds8_design_decisions.md#L560-L561) and
-  [`ds8_design_decisions.md`](../docs/history/ds8/ds8_design_decisions.md#L623-L625).
+  [`ds8_design_decisions.md`](../docs/history/ds8/ds8_design_decisions.md).
 
 Telemetry hooks are metadata-first:
 
 - Analytics telemetry attaches a `BatchMetadataOperator` in
-  [`hooks.py`](../noesis/pipelines/hooks.py#L714-L770).
+  [`hooks.py`](../noesis/pipelines/hooks.py).
 - The production Service Maker path iterates `frame_meta.object_items` in
-  [`hooks.py`](../noesis/pipelines/hooks.py#L4688-L5019).
+  [`hooks.py`](../noesis/pipelines/hooks.py).
 - ReID, pose, depth, and V3DT data extraction are edge metadata/identity inputs,
   not video frame copies. They do account host-copy counters where they cross to
-  CPU, for example pose metadata in
-  [`hooks.py`](../noesis/pipelines/hooks.py#L3296-L3352), pose payload
-  serialization in [`hooks.py`](../noesis/pipelines/hooks.py#L3455-L3478), and
-  ReID embeddings in [`hooks.py`](../noesis/pipelines/hooks.py#L4645-L4686).
+  CPU; see [`hooks.py`](../noesis/pipelines/hooks.py).
 
 ### DS9 call
 
@@ -198,23 +212,22 @@ surface when Service Maker metadata exposes the needed data.
 
 | Area | Current path | Evidence | Production call status | DS9 call |
 | --- | --- | --- | --- | --- |
-| Optional import | `import pyds` with `PYDS_AVAILABLE` | [`hooks.py`](../noesis/pipelines/hooks.py#L45-L48) | Module-wide optional compatibility | Keep only if a documented DS9 gap remains; otherwise quarantine behind a compatibility module. |
-| Raw frame tensor iterator | `_iter_frame_tensor_meta` walks `frame_user_meta_list`, casts `NvDsUserMeta`, checks `NVDSINFER_TENSOR_OUTPUT_META`, casts `NvDsInferTensorMeta` | [`hooks.py`](../noesis/pipelines/hooks.py#L275-L308) | Not used by the Service Maker MapAnything operator path | Remove or quarantine after DS9 tensor-items smoke test passes. |
-| Raw tensor dtype mapping | `_layer_dtype` imports `NvDsInferDataType` | [`hooks.py`](../noesis/pipelines/hooks.py#L1039-L1065) | Used by raw pyds tensor fallback | Remove from canonical MapAnything path. |
-| Raw tensor buffer copy | `_numpy_from_layer` calls `pyds.get_ptr(layer.buffer)` and copies layer bytes into NumPy | [`hooks.py`](../noesis/pipelines/hooks.py#L1068-L1104) | Used by raw pyds tensor fallback | Remove from production; this is a host tensor fallback, not canonical DS9 Service Maker handling. |
-| Raw layer extraction | `_extract_tensor_layers` falls back to `pyds.get_nvds_LayerInfo` | [`hooks.py`](../noesis/pipelines/hooks.py#L1118-L1160) | Used by raw pyds tensor fallback | Remove or isolate in a debug-only adapter. |
-| MapAnything raw pyds handler | `MapAnythingProcessor.handle_nvds_tensor` calls `_extract_tensor_layers` | [`hooks.py`](../noesis/pipelines/hooks.py#L1570-L1580) | Parallel legacy path beside `handle_nvds_tensor_ds8` | Remove from DS9 canonical path once Service Maker tensor metadata is validated. |
-| Generic pyds helpers | `_resolve_pyds_cast`, `_resolve_pyds_attr`, `_iter_meta_entries` | [`hooks.py`](../noesis/pipelines/hooks.py#L7597-L7613) | Support legacy/pyds traversal helpers | Quarantine in compatibility code if still needed for tests. |
-| Analytics raw user meta | `_extract_analytics_obj_meta` walks object user meta and casts `NvDsAnalyticsObjInfo` | [`hooks.py`](../noesis/pipelines/hooks.py#L6573-L6618) | The production Service Maker analytics path uses `nvdsanalytics_obj_items`; this is a fallback | Keep only if DS9 Python lacks the Service Maker analytics item surface; otherwise remove. |
-| Analytics raw object builder | `_build_track_dict` uses non-Service-Maker object fields and pyds analytics extraction | [`hooks.py`](../noesis/pipelines/hooks.py#L6529-L6572) | Production path uses `_build_track_dict_ds8` | Quarantine or remove from DS9 production. |
-| OSD label raw fallback | `_OsdLabelProcessor.handle_frame` uses pyds-style object iteration | [`hooks.py`](../noesis/pipelines/hooks.py#L7000-L7006) | Production operator calls `handle_frame_ds8` | Remove or quarantine; keep Service Maker object-items path. |
-| Python object pruning | `_ExcludePruneProcessor.handle_frame` and `_remove_obj` use raw frame object lists and `nvds_remove_obj_meta_from_frame` | [`hooks.py`](../noesis/pipelines/hooks.py#L7251-L7335) | Production operator calls `handle_frame_ds8`, which is read-only and logs would-prune | Remove from production. Use `nvdsroiexclude` or a native/plugin path for real pruning. |
+| Optional import | `import pyds` with `PYDS_AVAILABLE` | [`hooks.py`](../noesis/pipelines/hooks.py) | Module-wide optional compatibility | Keep only if a documented DS9 gap remains; otherwise quarantine behind a compatibility module. |
+| Raw frame tensor iterator | `_iter_frame_tensor_meta` walks `frame_user_meta_list`, casts `NvDsUserMeta`, checks `NVDSINFER_TENSOR_OUTPUT_META`, casts `NvDsInferTensorMeta` | [`hooks.py`](../noesis/pipelines/hooks.py) | Not used by the exact MapAnything buffer-operator path | Keep quarantined; it is not selected by MapAnything. |
+| Raw tensor dtype mapping | `_layer_dtype` imports `NvDsInferDataType` | [`hooks.py`](../noesis/pipelines/hooks.py) | Used by quarantined pyds compatibility code | Keep out of the canonical MapAnything path. |
+| Raw tensor buffer copy | `_numpy_from_layer` can call `pyds.get_ptr(layer.buffer)` and copy layer bytes into NumPy | [`hooks.py`](../noesis/pipelines/hooks.py) | Used by quarantined pyds compatibility code | Keep out of production MapAnything selection. |
+| Raw layer extraction | `_extract_tensor_layers` can use `pyds.get_nvds_LayerInfo` | [`hooks.py`](../noesis/pipelines/hooks.py) | Used by quarantined pyds compatibility code | Keep isolated from MapAnything. |
+| MapAnything raw pyds handler | Removed from `MapAnythingProcessor` | 2026-07-11 source audit | No parallel MapAnything path remains | Keep removed. |
+| Generic pyds helpers | `_resolve_pyds_cast`, `_resolve_pyds_attr`, `_iter_meta_entries` | [`hooks.py`](../noesis/pipelines/hooks.py) | Support quarantined compatibility traversal | Keep behind the explicit compatibility gate where still required. |
+| Analytics raw user meta | `_extract_analytics_obj_meta` walks object user meta and casts `NvDsAnalyticsObjInfo` | [`hooks.py`](../noesis/pipelines/hooks.py) | Compatibility path; the production Service Maker analytics path uses `nvdsanalytics_obj_items` | Keep quarantined from production selection. |
+| Analytics raw object builder | `_build_track_dict` uses non-Service-Maker object fields and pyds analytics extraction | [`hooks.py`](../noesis/pipelines/hooks.py) | Production path uses `_build_track_dict_ds8` | Keep quarantined from production selection. |
+| OSD label raw fallback | `_OsdLabelProcessor.handle_frame` uses pyds-style object iteration | [`hooks.py`](../noesis/pipelines/hooks.py) | Production operator calls `handle_frame_ds8` | Keep quarantined; retain the Service Maker object-items path. |
 
-Not pyds, but still a fallback to track:
+Resolved native ownership:
 
 | Area | Current path | Evidence | DS9 call |
 | --- | --- | --- | --- |
-| MapAnything native tensor fallback | `_MapAnythingOperator.handle_metadata` falls back to `handle_native_frame_ds8` when Service Maker tensor items do not match; `handle_native_frame_ds8` uses `noesis_depth_tracking_tensor_ext.capture_tensor_layers` | [`hooks.py`](../noesis/pipelines/hooks.py#L7458-L7497), [`hooks.py`](../noesis/pipelines/hooks.py#L1598-L1634) | Quarantine as an explicit DS9 adapter or remove after DS9 Service Maker tensor metadata is validated. Do not let it silently mask a broken canonical tensor path. |
+| MapAnything native tensor and exact-RGB ownership | `_MapAnythingBufferOperator` uses only `handle_native_buffer_frame_ds9`; the DS9-built bridge requires one raw UID 2 record and exact per-frame `depth/conf/mask` shape. The same post-inference, post-conversion buffer supplies preserved tensor metadata and the explicit NVMM RGB surface through `Buffer.extract(batch_id)`. Python validates batch/source/frame/PTS identity without another offset, bounds and times the tensor and armed-camera RGB copies, then hands owned arrays to one joined bounded worker. | DS9 nvinfer `attach_tensor_output_meta`, installed nvinfer/nvvideoconvert caps and metadata-copy contracts, focused exact-capture/lifecycle tests, and the 2026-07-25 isolated three-camera exact-RGB live gate | Canonical. The normally closed valve remains before inference and conversion. Appsink, source-reader, generic native, raw-PyDS, manual batch-slice, and separately reconciled RGB alternatives are absent; ambiguity, attach failure, queue/worker failure, poison, and unresolved teardown are fatal. |
 
 ## GPU-Only And Zero-Copy Assessment
 
@@ -224,9 +237,13 @@ streammux, inference, tracking, tiler, GPU `nvdsosd`, and RTSP/WebRTC output.
 
 The CPU crossings found here are edge metadata or serialization:
 
-- MapAnything dense tensors are cloned from metadata and converted to NumPy in a
-  bounded async worker for depth snapshots and depth RPC. This is a real host
-  tensor copy, but it is not a CPU video-frame branch.
+- The exact frame-local MapAnything tensors are copied once to owned NumPy
+  arrays by the DS9-native selector: exactly `1,827,504` bytes per captured
+  frame, with duration and byte counters. The borrowed pointers are
+  dereferenced under their metadata-lifetime lease while the GIL is released;
+  alignment, masking, storage, and publication then run in a bounded,
+  runtime-joined worker. This is an instrumented CPU-edge tensor copy for depth
+  snapshots/RPC, not a CPU video-frame branch.
 - Trail and pose overlays create display metadata. They do not draw on CPU frame
   pixels.
 - Analytics, pose, ReID, V3DT, object depth, websocket, and REST payloads
@@ -238,29 +255,26 @@ Risk areas if left unquarantined:
 
 - Raw pyds tensor extraction can become a hidden host-copy fallback for
   MapAnything and conceal Service Maker tensor metadata failures.
-- Python object pruning through pyds can become a hidden replacement for
-  `nvdsroiexclude` or a native/plugin pruning path.
-- The native MapAnything tensor fallback can conceal a broken Service Maker
-  tensor-items path unless it is logged and gated as an explicit compatibility
-  adapter.
+- A second MapAnything reader would conceal failure of the exact typed
+  same-buffer contract; wrapper, generic-native, and raw-PyDS alternatives
+  therefore remain absent from its selection path.
 
 ## Final Keep / Change / Remove Calls
 
 | Component | Call | Rationale |
 | --- | --- | --- |
 | Service Maker `BatchMetadataOperator` hooks | Keep | Canonical DS9 hook surface for metadata probes and custom processing. |
-| MapAnything `nvinfer` branch with `output-tensor-meta=1` and `fakesink` | Keep | Canonical tensor metadata branch; avoids appsink/CPU video frames. |
-| MapAnything Service Maker tensor metadata handling | Keep | Correct canonical target; validate installed DS9 Python wrapper with a focused smoke test. |
-| MapAnything async CPU postprocess | Keep, bounded | Edge dense-depth/RPC postprocess. Keep gated/async; move to C++/CUDA only if DS9 performance demands it. |
-| MapAnything pyds raw tensor path | Remove or quarantine | Duplicate fallback that copies raw tensors to CPU and can hide canonical tensor metadata failures. |
-| MapAnything native tensor fallback | Change/quarantine | Not pyds, but still a fallback. Make explicit and loud, or remove after DS9 tensor metadata validation. |
+| MapAnything `nvinfer -> NVMM RGB -> fakesink` branch with `output-tensor-meta=1` | Keep | Canonical same-buffer tensor/RGB branch; avoids appsink or a separately reconciled video source. |
+| MapAnything exact native tensor metadata handling | Keep | Canonical DS9 UID/layer/per-frame ownership adapter; startup rejects missing, stale, generic, or ambiguous bridge contracts. |
+| MapAnything async CPU postprocess | Keep, bounded and joined | Edge dense-depth/RPC postprocess over owned arrays. Keep gated/async with explicit runtime teardown; move the probe-local copy only after an owned device-clone contract exists. |
+| MapAnything pyds raw tensor path | Removed from canonical path | A duplicate reader could hide failure of the exact DS9 contract. |
+| MapAnything generic/wrapper tensor alternatives | Removed from canonical path | Live wrapper evidence carried only sibling UID 5; exact typed UID 2 capture is the sole authority. |
 | Trail overlay display metadata | Keep | Canonical Service Maker display meta path upstream of `nvdsosd`; no CPU drawing branch. |
 | Pose keypoint overlay display metadata | Keep | Same canonical OSD/display meta path. |
 | Analytics telemetry Service Maker path | Keep | Uses `frame_meta.object_items` and edge serialization. |
 | Analytics pyds user-meta fallback | Remove or quarantine | Keep only if DS9 Python lacks documented analytics object item access. |
 | BEV JSON telemetry | Keep | Edge metadata serialization. |
 | BEV JPEG | Keep disabled by default | CPU composition/encoding is acceptable only as explicit diagnostic/UI output. |
-| Python pyds object pruning | Remove from production | Real pruning should stay in `nvdsroiexclude` or native/plugin code, not Python list mutation. |
 | Native pose/depth/ReID metadata bridges | Keep for first DS9 port | They cover metadata surfaces not proven available in Service Maker Python. Continue to rebuild/smoke-test when touched. |
 
 Overall recommendation: port DS9 with Service Maker metadata hooks as the

@@ -87,7 +87,15 @@ What it does:
 - Uses `NvDsInferTensorMeta::out_buf_ptrs_dev` as the primary source.
 - Selects the depth layer, supports float and half outputs, converts half to float on GPU with NPP, resizes the full-frame depth tensor to canonical frame size on GPU, then keeps the aligned frame in CUDA memory.
 - Exposes `copy_roi_to_numpy(...)`, which copies only the object ROI to host for final masked statistics.
-- Also provides `capture_tensor_layers(...)` for CPU-array fallback/debug-style tensor extraction used by the MapAnything processor path.
+- Provides `capture_mapanything_tensor_layers_exact(...)` for the canonical
+  MapAnything CPU-edge product. It requires one exact UID, exact
+  per-frame `depth/conf/mask` shape, and no manual batch slice because nvinfer
+  already offsets attached frame pointers; the former generic fallback/debug
+  export has been removed. Because those pointers remain nvinfer-owned, the
+  bridge copies them only during the frame-metadata lifetime, releases the GIL
+  during D2H, and returns exactly three owned `294x518` float32 arrays
+  (`1,827,504` bytes). Alignment/storage/publication then run on the bounded
+  runtime-owned worker, which shutdown drains and joins explicitly.
 
 Local contract:
 

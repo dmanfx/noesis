@@ -1,13 +1,14 @@
 # MapAnything Heatmap Viewer (3‑Stream)
 
-This repo includes a small proof‑of‑concept script that runs the MapAnything TensorRT engine on the **three RTSP streams** listed in `pipelines/noesis_multiurisrcbin.ini` and renders **low‑FPS depth heatmaps**.
+This repo includes a small proof‑of‑concept script that runs the MapAnything TensorRT engine on the three camera-secret references listed in `pipelines/noesis_multiurisrcbin.ini` and renders low-FPS depth heatmaps.
 
 ## Script
 
 `scripts/ma_heatmap_multiuri.py`
 
 ### What it does
-- Reads RTSP URIs from `pipelines/noesis_multiurisrcbin.ini` (`[source-list].list`).
+- Resolves `camera-secret:*` entries from `pipelines/noesis_multiurisrcbin.ini`
+  through the owner-only registry documented in `Runtime_Secrets.md`.
 - Builds a lightweight GStreamer pipeline: `nvmultiurisrcbin → nvinfer (MapAnything) → fakesink`.
 - Extracts tensor meta (depth/conf/mask), converts to a heatmap, and displays it in windows.
 - Optional JPEG dumps for offline verification.

@@ -577,8 +577,8 @@ class DepthFrameProbe(BatchMetadataOperator):
                 source_id=source_id,
                 frame_id=frame_id,
                 pts_us=pts_us,
-                depth_map=np.asarray(aligned, dtype=np.float32, copy=False),
-                valid_mask=np.asarray(valid_mask, dtype=bool, copy=False),
+                depth_map=np.asarray(aligned, dtype=np.float32),
+                valid_mask=np.asarray(valid_mask, dtype=bool),
                 frame_w=frame_w,
                 frame_h=frame_h,
                 source_frame_w=source_frame_w,
@@ -589,7 +589,7 @@ class DepthFrameProbe(BatchMetadataOperator):
                 is_metric=self._depth_is_metric,
                 model_name=self._depth_model_name,
                 finite_fraction=float(np.count_nonzero(valid_mask)) / float(valid_mask.size or 1),
-                quadrant_stats=_quadrant_stats(np.asarray(aligned, dtype=np.float32, copy=False), valid_mask),
+                quadrant_stats=_quadrant_stats(np.asarray(aligned, dtype=np.float32), valid_mask),
                 transform_desc=f"resize({depth_raw.shape[1]}x{depth_raw.shape[0]}->{frame_w}x{frame_h})",
             )
             self._depth_store.put(frame)
@@ -861,7 +861,7 @@ class ObjectDepthFusionProbe(BatchMetadataOperator):
         if x1 <= x0 or y1 <= y0:
             return self._build_result(frame_meta, obj_meta, bbox=bbox, status="transform_mismatch")
 
-        depth_crop = np.asarray(depth_frame.depth_map[y0:y1, x0:x1], dtype=np.float32, copy=False)
+        depth_crop = np.asarray(depth_frame.depth_map[y0:y1, x0:x1], dtype=np.float32)
         if depth_crop.size <= 0:
             return self._build_result(frame_meta, obj_meta, bbox=bbox, status="transform_mismatch")
 

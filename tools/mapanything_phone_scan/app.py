@@ -28,6 +28,7 @@ from .processing import FramePreparationSettings, prepare_video_frames
 REPO_ROOT = Path(__file__).resolve().parents[2]
 APP_ROOT = Path(__file__).resolve().parent
 SCAN_ID_PATTERN = re.compile(r"^[0-9]{8}-[0-9]{6}-[a-f0-9]{8}$")
+CAMERA_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,159}$")
 ALLOWED_VIDEO_SUFFIXES = {".mp4", ".mov", ".m4v", ".webm", ".mkv", ".3gp"}
 INFERENCE_PROVIDERS = {"mapanything", "da3"}
 MAX_SCAN_NAME_LENGTH = 80
@@ -42,6 +43,10 @@ RUNNING_STATUSES = {
 
 def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def _camera_display_name(camera_id: str) -> str:
+    return " ".join(part.capitalize() for part in camera_id.replace("_", "-").split("-"))
 
 
 def _env_int(name: str, default: int, *, minimum: int) -> int:
@@ -67,6 +72,144 @@ def _resolve_root(raw: str | None, default: Path) -> Path:
     return path.resolve()
 
 
+def _read_json_object(path: Path, *, label: str) -> dict[str, Any]:
+    if not path.is_file():
+        raise ValueError(f"{label} is missing: {path}")
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(f"{label} is unreadable: {path}") from exc
+    if not isinstance(payload, dict):
+        raise ValueError(f"{label} must contain a JSON object: {path}")
+    return payload
+
+
+def _alignment_settings_for_revision(
+    *,
+    camera_id: str,
+    target_revision: Path,
+    calibration_path: Path,
+    calibration_rows: dict[str, Any],
+    review_point_budget: int,
+) -> NoesisAlignmentSettings:
+    if CAMERA_ID_PATTERN.fullmatch(camera_id) is None:
+        raise ValueError(f"alignment release contains invalid camera ID {camera_id!r}")
+    calibration = calibration_rows.get(camera_id)
+    if not isinstance(calibration, dict) or not isinstance(calibration.get("E"), list):
+        raise ValueError(f"alignment camera {camera_id} has no calibrated E matrix")
+    metadata = _read_json_object(
+        target_revision / "room_points_meta.json",
+        label=f"alignment revision metadata for {camera_id}",
+    )
+    if metadata.get("camera") != camera_id:
+        raise ValueError(
+            f"alignment revision {target_revision.name} belongs to "
+            f"{metadata.get('camera')}, not {camera_id}"
+        )
+    if metadata.get("coordinate_frame") != "backend_world_m_stream_points":
+        raise ValueError(
+            f"alignment revision {target_revision.name} is not in backend world coordinates"
+        )
+    if not (target_revision / "room_points.npz").is_file():
+        raise ValueError(f"alignment revision {target_revision.name} has no room_points.npz")
+    keyframes = metadata.get("rgb_keyframes")
+    if not isinstance(keyframes, dict) or not keyframes:
+        raise ValueError(f"alignment revision {target_revision.name} has no RGB keyframe")
+    for relative in keyframes.values():
+        keyframe = (target_revision / str(relative)).resolve()
+        try:
+            keyframe.relative_to(target_revision)
+        except ValueError as exc:
+            raise ValueError(
+                f"alignment revision {target_revision.name} has an unsafe RGB keyframe path"
+            ) from exc
+        if not keyframe.is_file():
+            raise ValueError(
+                f"alignment revision {target_revision.name} is missing {relative}"
+            )
+    return NoesisAlignmentSettings(
+        camera_id=camera_id,
+        target_revision=target_revision,
+        calibration_path=calibration_path,
+        review_point_budget=review_point_budget,
+    )
+
+
+def _alignment_targets_from_release(
+    release_path: Path,
+    calibration_path: Path,
+    *,
+    review_point_budget: int,
+) -> tuple[tuple[NoesisAlignmentSettings, ...], str]:
+    release = _read_json_object(release_path, label="phone-scan alignment release")
+    if release.get("contract") != "noesis.scene.release":
+        raise ValueError(f"alignment release has an unsupported contract: {release_path}")
+    release_id = str(release.get("release_id") or "").strip()
+    if not release_id:
+        raise ValueError(f"alignment release has no release_id: {release_path}")
+    validation_path = release_path.with_name(f"{release_path.stem}.validation.json")
+    validation = _read_json_object(
+        validation_path,
+        label="phone-scan alignment release validation",
+    )
+    checks = validation.get("checks")
+    if (
+        validation.get("schema") != "noesis.scene.validation.v1"
+        or validation.get("release_id") != release_id
+        or not isinstance(checks, dict)
+        or not checks
+        or not all(value is True for value in checks.values())
+    ):
+        raise ValueError(f"alignment release did not pass validation: {release_path}")
+
+    calibration_root = _read_json_object(
+        calibration_path,
+        label="phone-scan camera calibration",
+    )
+    raw_calibration_rows = calibration_root.get("cameras", calibration_root)
+    if not isinstance(raw_calibration_rows, dict):
+        raise ValueError("phone-scan camera calibration has no camera rows")
+    calibration_rows = dict(raw_calibration_rows)
+    revisions_root = (REPO_ROOT / "data" / "virtual_twin" / "revisions").resolve()
+    camera_rows = release.get("cameras")
+    if not isinstance(camera_rows, list) or not camera_rows:
+        raise ValueError(f"alignment release has no cameras: {release_path}")
+
+    targets: list[NoesisAlignmentSettings] = []
+    seen_camera_ids: set[str] = set()
+    for row in camera_rows:
+        if not isinstance(row, dict):
+            raise ValueError(f"alignment release has an invalid camera row: {release_path}")
+        camera_id = str(row.get("camera_id") or "").strip()
+        revision_id = str(row.get("revision_id") or "").strip()
+        artifact_path = str(row.get("artifact_path") or revision_id).strip()
+        if camera_id in seen_camera_ids:
+            raise ValueError(f"alignment release repeats camera {camera_id}")
+        if not revision_id or artifact_path != Path(artifact_path).name:
+            raise ValueError(f"alignment release has an unsafe revision for {camera_id}")
+        target_revision = (revisions_root / artifact_path).resolve()
+        try:
+            target_revision.relative_to(revisions_root)
+        except ValueError as exc:
+            raise ValueError(f"alignment release has an unsafe revision for {camera_id}") from exc
+        if target_revision.name != revision_id:
+            raise ValueError(
+                f"alignment release revision identity mismatch for {camera_id}: "
+                f"{revision_id} != {target_revision.name}"
+            )
+        targets.append(
+            _alignment_settings_for_revision(
+                camera_id=camera_id,
+                target_revision=target_revision,
+                calibration_path=calibration_path,
+                calibration_rows=calibration_rows,
+                review_point_budget=review_point_budget,
+            )
+        )
+        seen_camera_ids.add(camera_id)
+    return tuple(targets), release_id
+
+
 @dataclass(frozen=True)
 class PhoneScanSettings:
     storage_root: Path
@@ -77,6 +220,8 @@ class PhoneScanSettings:
     mapanything: MapAnythingScanSettings
     da3: DA3PhoneScanSettings
     alignment: NoesisAlignmentSettings
+    alignment_targets: tuple[NoesisAlignmentSettings, ...] = ()
+    alignment_release_id: str | None = None
 
     @classmethod
     def from_env(cls) -> "PhoneScanSettings":
@@ -101,29 +246,55 @@ class PhoneScanSettings:
             / "engines"
             / "da3metric_large_294x518_b3_fp16_trt10.13.engine"
         )
-        alignment_camera_id = os.environ.get(
-            "NOESIS_PHONE_SCAN_ALIGNMENT_CAMERA_ID", "living-room"
-        ).strip()
-        alignment_revision = _resolve_root(
-            os.environ.get("NOESIS_PHONE_SCAN_ALIGNMENT_REVISION"),
+        calibration_path = _resolve_root(
+            os.environ.get("NOESIS_PHONE_SCAN_ALIGNMENT_CALIBRATION"),
+            REPO_ROOT / "config" / "camera_calibration.json",
+        )
+        if str(os.environ.get("NOESIS_PHONE_SCAN_ALIGNMENT_REVISION") or "").strip():
+            raise ValueError(
+                "NOESIS_PHONE_SCAN_ALIGNMENT_REVISION is no longer a safe "
+                "multi-camera configuration; set NOESIS_PHONE_SCAN_ALIGNMENT_RELEASE"
+            )
+        alignment_release_path = _resolve_root(
+            os.environ.get("NOESIS_PHONE_SCAN_ALIGNMENT_RELEASE"),
             REPO_ROOT
             / "data"
             / "virtual_twin"
-            / "revisions"
-            / "vt_living_room_stream_rgbmesh_20260623T215821_538294633",
+            / "releases"
+            / "home_rgbmesh_20260623T2158_v1.json",
         )
+        alignment_targets, alignment_release_id = _alignment_targets_from_release(
+            alignment_release_path,
+            calibration_path,
+            review_point_budget=point_budget,
+        )
+        requested_alignment_camera_id = str(
+            os.environ.get("NOESIS_PHONE_SCAN_ALIGNMENT_CAMERA_ID") or ""
+        ).strip()
+        alignment_by_camera = {
+            target.camera_id: target for target in alignment_targets
+        }
+        if requested_alignment_camera_id:
+            alignment = alignment_by_camera.get(requested_alignment_camera_id)
+            if alignment is None:
+                raise ValueError(
+                    f"alignment release has no camera {requested_alignment_camera_id!r}"
+                )
+        else:
+            alignment = alignment_targets[0]
         anchor_enabled = os.environ.get(
             "NOESIS_PHONE_SCAN_STATIC_ANCHOR", "0"
         ).strip().lower() not in {"0", "false", "no", "off"}
-        anchor_image = (
-            _resolve_root(
-                os.environ.get("NOESIS_PHONE_SCAN_STATIC_ANCHOR_IMAGE"),
-                alignment_revision
-                / "keyframes"
-                / f"{alignment_camera_id}_0001.png",
+        anchor_image_raw = str(
+            os.environ.get("NOESIS_PHONE_SCAN_STATIC_ANCHOR_IMAGE") or ""
+        ).strip()
+        if anchor_enabled and not anchor_image_raw:
+            raise ValueError(
+                "NOESIS_PHONE_SCAN_STATIC_ANCHOR_IMAGE is required when the "
+                "multi-camera phone-scan static anchor is enabled"
             )
-            if anchor_enabled
-            else None
+        anchor_image = (
+            _resolve_root(anchor_image_raw, REPO_ROOT) if anchor_enabled else None
         )
         return cls(
             storage_root=_resolve_root(
@@ -177,15 +348,9 @@ class PhoneScanSettings:
                 ),
                 anchor_image=anchor_image,
             ),
-            alignment=NoesisAlignmentSettings(
-                camera_id=alignment_camera_id,
-                target_revision=alignment_revision,
-                calibration_path=_resolve_root(
-                    os.environ.get("NOESIS_PHONE_SCAN_ALIGNMENT_CALIBRATION"),
-                    REPO_ROOT / "config" / "camera_calibration.json",
-                ),
-                review_point_budget=point_budget,
-            ),
+            alignment=alignment,
+            alignment_targets=alignment_targets,
+            alignment_release_id=alignment_release_id,
         )
 
 
@@ -223,6 +388,16 @@ class PhoneScanService:
         self.da3_inference_runner = da3_inference_runner
         self.alignment_runner = alignment_runner
         self.settings.storage_root.mkdir(parents=True, exist_ok=True)
+        configured_alignment_targets = self.settings.alignment_targets or (
+            self.settings.alignment,
+        )
+        self._alignment_targets: dict[str, NoesisAlignmentSettings] = {}
+        for target in configured_alignment_targets:
+            if target.camera_id in self._alignment_targets:
+                raise ValueError(f"duplicate phone-scan alignment camera {target.camera_id}")
+            self._alignment_targets[target.camera_id] = target
+        if not self._alignment_targets:
+            raise ValueError("phone-scan alignment requires at least one camera target")
         self._locks_guard = threading.Lock()
         self._scan_locks: dict[str, threading.RLock] = {}
         self._inference_lock = threading.Lock()
@@ -231,6 +406,16 @@ class PhoneScanService:
 
     def shutdown(self) -> None:
         self._executor.shutdown(wait=False, cancel_futures=False)
+
+    def public_alignment_targets(self) -> list[dict[str, str]]:
+        return [
+            {
+                "camera_id": target.camera_id,
+                "label": _camera_display_name(target.camera_id),
+                "revision_id": target.target_revision.name,
+            }
+            for target in self._alignment_targets.values()
+        ]
 
     def _lock(self, scan_id: str) -> threading.RLock:
         with self._locks_guard:
@@ -288,7 +473,7 @@ class PhoneScanService:
             )
         if len(normalized_name) > MAX_SCAN_NAME_LENGTH:
             raise HTTPException(
-                status.HTTP_422_UNPROCESSABLE_ENTITY,
+                status.HTTP_422_UNPROCESSABLE_CONTENT,
                 f"Walk name cannot exceed {MAX_SCAN_NAME_LENGTH} characters",
             )
         with self._lock(scan_id):
@@ -400,7 +585,7 @@ class PhoneScanService:
         provider = str(provider).strip().lower()
         if provider not in INFERENCE_PROVIDERS:
             raise HTTPException(
-                status.HTTP_422_UNPROCESSABLE_ENTITY,
+                status.HTTP_422_UNPROCESSABLE_CONTENT,
                 f"Unsupported provider {provider!r}; choose mapanything or da3",
             )
         prefix = "ma" if provider == "mapanything" else "da3"
@@ -476,7 +661,14 @@ class PhoneScanService:
                     error=f"{type(exc).__name__}: {exc}",
                 )
 
-    def initiate_alignment(self, scan_id: str) -> dict[str, Any]:
+    def initiate_alignment(self, scan_id: str, camera_id: str) -> dict[str, Any]:
+        target = self._alignment_targets.get(str(camera_id).strip())
+        if target is None:
+            available = ", ".join(self._alignment_targets)
+            raise HTTPException(
+                status.HTTP_422_UNPROCESSABLE_CONTENT,
+                f"Unknown alignment camera {camera_id!r}; choose one of: {available}",
+            )
         with self._lock(scan_id):
             state = self._read_state_unlocked(scan_id)
             if state.get("status") != "complete" or not isinstance(state.get("outputs"), dict):
@@ -494,13 +686,17 @@ class PhoneScanService:
             state["alignment"] = {
                 "status": "queued",
                 "progress": 0.0,
-                "message": "Waiting for the Noesis alignment lane",
+                "message": (
+                    f"Waiting to align with the {_camera_display_name(target.camera_id)} "
+                    "static camera"
+                ),
                 "error": None,
-                "target_camera_id": self.settings.alignment.camera_id,
-                "target_revision_id": self.settings.alignment.target_revision.name,
+                "target_camera_id": target.camera_id,
+                "target_revision_id": target.target_revision.name,
+                "target_release_id": self.settings.alignment_release_id,
             }
             self._write_state_unlocked(scan_id, state)
-        self._executor.submit(self._alignment_worker, scan_id)
+        self._executor.submit(self._alignment_worker, scan_id, target.camera_id)
         return state
 
     def _alignment_progress(self, scan_id: str, fraction: float, message: str) -> None:
@@ -521,7 +717,9 @@ class PhoneScanService:
         except HTTPException:
             return
 
-    def _alignment_worker(self, scan_id: str) -> None:
+    def _alignment_worker(self, scan_id: str, camera_id: str) -> None:
+        target = self._alignment_targets[camera_id]
+        camera_label = _camera_display_name(camera_id)
         with self._alignment_lock:
             scan_dir = self.scan_dir(scan_id)
             build_dir = scan_dir / ".alignment-building"
@@ -533,7 +731,10 @@ class PhoneScanService:
                     {
                         "status": "running",
                         "progress": 0.01,
-                        "message": "Starting gravity-preserving Noesis alignment",
+                        "message": (
+                            f"Starting gravity-preserving alignment to the {camera_label} "
+                            "static camera"
+                        ),
                         "error": None,
                     }
                 )
@@ -545,7 +746,7 @@ class PhoneScanService:
                     scan_dir,
                     build_dir,
                     state["outputs"],
-                    self.settings.alignment,
+                    target,
                     lambda fraction, message: self._alignment_progress(
                         scan_id, fraction, message
                     ),
@@ -557,7 +758,9 @@ class PhoneScanService:
                     {
                         "status": "complete",
                         "progress": 1.0,
-                        "message": "Phone reconstruction is aligned to the living-room Noesis world",
+                        "message": (
+                            f"Phone reconstruction is aligned to the {camera_label} Noesis world"
+                        ),
                         "error": None,
                         "results": result,
                     }
@@ -727,7 +930,7 @@ def create_app(
 
     app = FastAPI(
         title="Noesis Multi-View Phone Scan",
-        version="1.3.1",
+        version="1.4.0",
         lifespan=lifespan,
     )
     app.state.phone_scan_service = service
@@ -760,6 +963,8 @@ def create_app(
             },
             "alignment_camera_id": configured.alignment.camera_id,
             "alignment_revision_id": configured.alignment.target_revision.name,
+            "alignment_release_id": configured.alignment_release_id,
+            "alignment_targets": service.public_alignment_targets(),
         }
 
     @app.get("/api/scans")
@@ -871,9 +1076,12 @@ def create_app(
         )
 
     @app.post("/api/scans/{scan_id}/align-noesis", status_code=status.HTTP_202_ACCEPTED)
-    async def initiate_alignment(scan_id: str) -> JSONResponse:
+    async def initiate_alignment(
+        scan_id: str,
+        camera_id: str = Query(min_length=1, max_length=160),
+    ) -> JSONResponse:
         return JSONResponse(
-            _public_state(service.initiate_alignment(scan_id)),
+            _public_state(service.initiate_alignment(scan_id, camera_id)),
             status_code=status.HTTP_202_ACCEPTED,
         )
 

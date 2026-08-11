@@ -32,6 +32,8 @@ let toastTimer = null;
 let uploadInProgress = false;
 let renamingScanId = null;
 let suppressScanClicksUntil = 0;
+let alignmentTargets = [];
+let alignmentReleaseId = null;
 
 const statusLabels = {
   uploading: "Uploading",
@@ -81,6 +83,44 @@ function formatDuration(seconds) {
   const mins = Math.floor(value / 60);
   const secs = Math.round(value % 60);
   return mins ? `${mins}m ${secs}s` : `${secs}s`;
+}
+
+function alignmentTargetFor(cameraId) {
+  return alignmentTargets.find((target) => target.camera_id === cameraId) || null;
+}
+
+function cameraLabel(cameraId) {
+  const configured = alignmentTargetFor(cameraId)?.label;
+  if (configured) return configured;
+  return String(cameraId || "Unknown camera")
+    .replaceAll("_", "-")
+    .split("-")
+    .filter(Boolean)
+    .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
+    .join(" ");
+}
+
+function alignmentTargetControls(selectedCameraId, buttonLabel) {
+  const selectedIsAvailable = Boolean(alignmentTargetFor(selectedCameraId));
+  const options = alignmentTargets.map((target) => `
+    <option value="${escapeHtml(target.camera_id)}" ${target.camera_id === selectedCameraId ? "selected" : ""}>
+      ${escapeHtml(target.label)} camera
+    </option>`).join("");
+  const releaseNote = alignmentReleaseId
+    ? `Validated scene release: ${escapeHtml(alignmentReleaseId)}`
+    : "No validated scene release is available";
+  return `
+    <div class="alignment-actions">
+      <label class="provider-picker alignment-picker">
+        <span>Static camera for this room</span>
+        <select id="alignment-target" ${alignmentTargets.length ? "" : "disabled"}>
+          <option value="" ${selectedIsAvailable ? "" : "selected"}>Choose camera…</option>
+          ${options}
+        </select>
+        <small>${releaseNote}</small>
+      </label>
+      <button id="align-noesis" class="primary-button" type="button" ${selectedIsAvailable ? "" : "disabled"}>${escapeHtml(buttonLabel)}</button>
+    </div>`;
 }
 
 function toastMessage(message) {
@@ -259,6 +299,18 @@ async function refreshHealth() {
     const health = await jsonFetch("/api/health");
     healthPill.textContent = `${health.device} · ${health.max_frames} views max`;
     healthPill.className = "health-pill online";
+    const nextTargets = Array.isArray(health.alignment_targets)
+      ? health.alignment_targets.filter((target) => target?.camera_id && target?.revision_id)
+      : [];
+    const nextReleaseId = health.alignment_release_id || null;
+    const alignmentConfigChanged = JSON.stringify([alignmentTargets, alignmentReleaseId])
+      !== JSON.stringify([nextTargets, nextReleaseId]);
+    alignmentTargets = nextTargets;
+    alignmentReleaseId = nextReleaseId;
+    if (alignmentConfigChanged) {
+      lastDetailFingerprint = "";
+      renderSelected();
+    }
   } catch (error) {
     healthPill.textContent = "Tool offline";
     healthPill.className = "health-pill offline";
@@ -365,14 +417,14 @@ function outputFrameCards(outputs) {
 function alignmentSection(scan) {
   const alignment = scan.alignment;
   if (!alignment) {
-    return `<div class="ready-callout alignment-callout"><div><h3>Register this walk to Noesis.</h3><p>The tool will preserve metric scale and gravity, fit the phone room structure to the fixed living-room camera reconstruction, and reject ambiguous fits.</p></div><button id="align-noesis" class="primary-button" type="button">Align to Noesis</button></div>`;
+    return `<div class="ready-callout alignment-callout"><div><h3>Register this walk to the correct room camera.</h3><p>Choose the static camera physically installed in this room. The tool will preserve metric scale and gravity, fit against that camera's validated reconstruction, and reject ambiguous fits.</p></div>${alignmentTargetControls("", "Align to selected camera")}</div>`;
   }
   if (["queued", "running"].includes(alignment.status)) {
     const progress = Math.round(Math.max(0, Math.min(1, Number(alignment.progress || 0))) * 100);
-    return `<div class="status-panel alignment-status"><div class="status-line"><span>${escapeHtml(alignment.message || "Aligning to Noesis")}</span><b>${progress}%</b></div><div class="progress-track"><span style="width:${progress}%"></span></div></div>`;
+    return `<div class="status-panel alignment-status"><div class="status-line"><span>${escapeHtml(alignment.message || "Aligning to Noesis")}</span><b>${progress}%</b></div><div class="progress-track"><span style="width:${progress}%"></span></div><p class="alignment-target-note">Target: ${escapeHtml(cameraLabel(alignment.target_camera_id))} · ${escapeHtml(alignment.target_revision_id || "validated revision")}</p></div>`;
   }
   if (alignment.status === "failed") {
-    return `<div class="status-panel alignment-status"><div class="status-line"><span>${escapeHtml(alignment.message || "Noesis alignment failed")}</span><b>Not aligned</b></div><div class="error-box">${escapeHtml(alignment.error || "The automatic fit did not pass its quality gate.")}</div><div class="artifact-row"><button id="align-noesis" class="primary-button" type="button">Try alignment again</button></div></div>`;
+    return `<div class="status-panel alignment-status"><div class="status-line"><span>${escapeHtml(alignment.message || "Noesis alignment failed")}</span><b>Not aligned</b></div><div class="error-box">${escapeHtml(alignment.error || "The automatic fit did not pass its quality gate.")}</div><p class="alignment-target-note">Previous target: ${escapeHtml(cameraLabel(alignment.target_camera_id))}</p>${alignmentTargetControls(alignment.target_camera_id || "", "Try selected camera")}</div>`;
   }
   const results = alignment.results;
   if (alignment.status !== "complete" || !results) return "";
@@ -383,14 +435,14 @@ function alignmentSection(scan) {
   const links = [
     [urls.aligned_phone_glb, "Aligned RGB GLB"],
     [urls.comparison_glb, "Noesis comparison GLB"],
-    [urls.transform, "MA → Noesis transform"],
+    [urls.transform, "Phone → Noesis transform"],
     [urls.trajectory, "Aligned camera poses"],
     [urls.camera_solution_npz, "Aligned solution NPZ"],
     [urls.report, "Quality report"],
   ].filter(([url]) => url).map(([url, label]) => `<a class="artifact-link" href="${url}" target="_blank" rel="noopener">${label}</a>`).join("");
   return `
-    <div class="subheading"><div><span class="eyebrow">Noesis registration</span><h3>Living-room alignment passed</h3></div><span class="status-badge aligned-badge">Backend world · metric</span></div>
-    <p class="alignment-note">This is a saved, quality-gated review candidate. It has not changed or promoted the live Noesis world.</p>
+    <div class="subheading"><div><span class="eyebrow">Noesis registration</span><h3>${escapeHtml(cameraLabel(results.target_camera_id || alignment.target_camera_id))} alignment passed</h3></div><span class="status-badge aligned-badge">Backend world · metric</span></div>
+    <p class="alignment-note">This is a saved, quality-gated review candidate aligned against ${escapeHtml(results.target_revision_id || alignment.target_revision_id || "the selected revision")}. It has not changed or promoted the live Noesis world.</p>
     <div class="stat-grid">
       <div class="stat"><b>${(Number(vertical.source_overlap_0_30m || 0) * 100).toFixed(1)}%</b><span>Phone structure match</span></div>
       <div class="stat"><b>${(Number(vertical.target_overlap_0_30m || 0) * 100).toFixed(1)}%</b><span>Fixed-view coverage</span></div>
@@ -582,15 +634,31 @@ function wireDetailActions(scan) {
       toastMessage(`${label} could not start: ${error.message}`);
     }
   });
-  document.querySelector("#align-noesis")?.addEventListener("click", async (event) => {
+  const alignmentTarget = document.querySelector("#alignment-target");
+  const alignmentButton = document.querySelector("#align-noesis");
+  alignmentTarget?.addEventListener("change", () => {
+    if (alignmentButton) alignmentButton.disabled = !alignmentTarget.value;
+  });
+  alignmentButton?.addEventListener("click", async (event) => {
+    const cameraId = alignmentTarget?.value || "";
+    const target = alignmentTargetFor(cameraId);
+    if (!target) {
+      toastMessage("Choose the static camera for this room before aligning");
+      event.currentTarget.disabled = true;
+      return;
+    }
+    const accepted = window.confirm(
+      `Align “${scan.name}” to the ${target.label} camera reconstruction?`,
+    );
+    if (!accepted) return;
     event.currentTarget.disabled = true;
     try {
-      const updated = await jsonFetch(`/api/scans/${encodeURIComponent(scan.id)}/align-noesis`, { method: "POST" });
+      const updated = await jsonFetch(`/api/scans/${encodeURIComponent(scan.id)}/align-noesis?camera_id=${encodeURIComponent(cameraId)}`, { method: "POST" });
       const index = scans.findIndex((item) => item.id === scan.id);
       if (index >= 0) scans[index] = updated;
       lastDetailFingerprint = "";
       renderSelected();
-      toastMessage("Noesis alignment started");
+      toastMessage(`Alignment to ${target.label} started`);
     } catch (error) {
       event.currentTarget.disabled = false;
       toastMessage(`Noesis alignment could not start: ${error.message}`);

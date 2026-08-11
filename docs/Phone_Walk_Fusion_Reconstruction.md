@@ -210,23 +210,25 @@ large storage volume, not the root filesystem.
 - a new phone scan with `prepared_frames_manifest.json` and its original video;
 - the official cached DA3 and Apache-licensed MapAnything models;
 - the validated DA3Metric-Large TensorRT engine;
-- an approved static-camera room revision containing `room_points.npz`,
-  `room_points_meta.json`, and an RGB keyframe;
+- a validated Noesis scene release that names the approved static-camera room
+  revision containing `room_points.npz`, `room_points_meta.json`, and an RGB
+  keyframe;
 - that camera's entry in `config/camera_calibration.json`; and
 - enough storage for raw provider views, variants, evaluations, and retained
   manifests.
 
-Configure the phone-scan service for the target camera and static revision
-before capture/alignment:
+Configure the phone-scan service with the home's validated scene release and
+camera calibration before capture/alignment:
 
 ```text
-NOESIS_PHONE_SCAN_ALIGNMENT_CAMERA_ID=<camera-id>
-NOESIS_PHONE_SCAN_ALIGNMENT_REVISION=data/virtual_twin/revisions/<room-revision>
+NOESIS_PHONE_SCAN_ALIGNMENT_RELEASE=data/virtual_twin/releases/<validated-release>.json
 NOESIS_PHONE_SCAN_ALIGNMENT_CALIBRATION=config/camera_calibration.json
 ```
 
-Restart the user service after changing those environment values. Do not reuse
-the living-room transform for a different room.
+Restart the user service after changing those environment values. The browser
+then requires an explicit camera selection for each walk and records the chosen
+camera, revision, and release in the scan state. Do not choose a camera from a
+different room or reuse another room's transform.
 
 ### 1. Capture, run DA3, and align
 
@@ -239,8 +241,9 @@ Use the phone browser to capture a slow walk with:
 - an early view near the calibrated static camera's view; and
 - a return near that area to provide loop evidence.
 
-Select **DA3**, run reconstruction, then select **Align to Noesis**. For a scan
-whose DA3 run is the browser's active provider, the expected inputs are:
+Select **DA3**, run reconstruction, choose the static camera installed in that
+room, then select **Align to selected camera**. For a scan whose DA3 run is the
+browser's active provider, the expected inputs are:
 
 ```text
 data/mapanything_phone_scans/<scan-id>/outputs/raw/

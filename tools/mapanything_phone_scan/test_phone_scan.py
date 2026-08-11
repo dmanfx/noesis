@@ -19,6 +19,24 @@ from tools.mapanything_phone_scan.processing import (
 
 
 def _settings(tmp_path: Path) -> PhoneScanSettings:
+    living_room_alignment = NoesisAlignmentSettings(
+        camera_id="living-room",
+        target_revision=tmp_path / "living-room-revision",
+        calibration_path=tmp_path / "camera_calibration.json",
+        review_point_budget=10_000,
+    )
+    kitchen_alignment = NoesisAlignmentSettings(
+        camera_id="kitchen",
+        target_revision=tmp_path / "kitchen-revision",
+        calibration_path=tmp_path / "camera_calibration.json",
+        review_point_budget=10_000,
+    )
+    family_room_alignment = NoesisAlignmentSettings(
+        camera_id="family-room",
+        target_revision=tmp_path / "family-room-revision",
+        calibration_path=tmp_path / "camera_calibration.json",
+        review_point_budget=10_000,
+    )
     return PhoneScanSettings(
         storage_root=tmp_path / "scans",
         static_root=APP_ROOT / "static",
@@ -30,12 +48,13 @@ def _settings(tmp_path: Path) -> PhoneScanSettings:
             point_budget=10_000,
             metric_engine_path=tmp_path / "da3metric.engine",
         ),
-        alignment=NoesisAlignmentSettings(
-            camera_id="living-room",
-            target_revision=tmp_path / "target-revision",
-            calibration_path=tmp_path / "camera_calibration.json",
-            review_point_budget=10_000,
+        alignment=living_room_alignment,
+        alignment_targets=(
+            family_room_alignment,
+            kitchen_alignment,
+            living_room_alignment,
         ),
+        alignment_release_id="test-home-release",
     )
 
 
@@ -211,7 +230,7 @@ def test_phone_scan_api_upload_initiate_review_and_delete(tmp_path: Path) -> Non
         progress: Callable[[float, str], None],
     ) -> dict[str, Any]:
         assert outputs["view_count"] == 2
-        assert settings.camera_id == "living-room"
+        assert settings.camera_id == "family-room"
         progress(0.5, "Aligning test room")
         comparison = output_dir / "noesis_phone_comparison.glb"
         report = output_dir / "alignment_report.json"
@@ -221,8 +240,8 @@ def test_phone_scan_api_upload_initiate_review_and_delete(tmp_path: Path) -> Non
         return {
             "schema": "noesis.mapanything.phone_scan.alignment_outputs.v1",
             "coordinate_frame": "backend_world_m_stream_points",
-            "target_camera_id": "living-room",
-            "target_revision_id": "test-revision",
+            "target_camera_id": settings.camera_id,
+            "target_revision_id": settings.target_revision.name,
             "quality_gate": {"passed": True, "candidate_objective_margin": 0.2},
             "vertical_structure": {
                 "source_overlap_0_30m": 0.8,
@@ -256,6 +275,12 @@ def test_phone_scan_api_upload_initiate_review_and_delete(tmp_path: Path) -> Non
         alignment_runner=fake_alignment,
     )
     with TestClient(app) as client:
+        health = client.get("/api/health")
+        assert health.status_code == 200
+        assert health.json()["alignment_release_id"] == "test-home-release"
+        assert [
+            target["camera_id"] for target in health.json()["alignment_targets"]
+        ] == ["family-room", "kitchen", "living-room"]
         created = client.post(
             "/api/scans?name=Living%20room%20walk",
             content=b"phone video bytes",
@@ -285,10 +310,20 @@ def test_phone_scan_api_upload_initiate_review_and_delete(tmp_path: Path) -> Non
         assert client.get(glb_url).status_code == 200
         assert complete["outputs"]["frames"][0]["raw_npz_url"].startswith("/assets/")
 
-        alignment_started = client.post(f"/api/scans/{scan_id}/align-noesis")
+        assert client.post(f"/api/scans/{scan_id}/align-noesis").status_code == 422
+        assert client.post(
+            f"/api/scans/{scan_id}/align-noesis?camera_id=garage"
+        ).status_code == 422
+        alignment_started = client.post(
+            f"/api/scans/{scan_id}/align-noesis?camera_id=family-room"
+        )
         assert alignment_started.status_code == 202
+        assert alignment_started.json()["alignment"]["target_camera_id"] == "family-room"
+        assert alignment_started.json()["alignment"]["target_revision_id"] == "family-room-revision"
+        assert alignment_started.json()["alignment"]["target_release_id"] == "test-home-release"
         aligned = _wait_for_alignment(client, scan_id, "complete")
         assert aligned["alignment"]["results"]["quality_gate"]["passed"] is True
+        assert aligned["alignment"]["results"]["target_camera_id"] == "family-room"
         comparison_url = aligned["alignment"]["results"]["artifact_urls"]["comparison_glb"]
         assert client.get(comparison_url).status_code == 200
 

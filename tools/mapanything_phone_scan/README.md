@@ -83,6 +83,14 @@ Connect the phone to the same trusted LAN, open the URL in Chrome, and permit
 the local-network and camera prompts. The service has no user authentication;
 do not forward its port through the router.
 
+Alignment targets come from one validated Noesis scene release. The default
+for this installation is
+`data/virtual_twin/releases/home_rgbmesh_20260623T2158_v1.json`; another home
+must set `NOESIS_PHONE_SCAN_ALIGNMENT_RELEASE` to its own validated release
+manifest before starting the service. The browser lists only cameras whose
+release revision, backend-world metadata, RGB keyframe, and calibration row are
+present.
+
 ## Capture and single-provider workflow
 
 1. Select **New Walk** to clear the current review and enter fresh-capture mode.
@@ -103,8 +111,10 @@ do not forward its port through the router.
    prepared frame.
 7. The tool saves a review GLB, camera trajectory, RGB, depth, confidence or
    validity data, masks, poses, intrinsics, metric scale, and raw NPZ arrays.
-8. **Align to Noesis** estimates the phone floor, preserves gravity and metric
-   scale, and registers room structure to the configured static-camera room
+8. Choose the static camera physically installed in the scanned room, then
+   select **Align to selected camera**. The target is saved with the walk before
+   alignment starts. The tool estimates the phone floor, preserves gravity and
+   metric scale, and registers room structure to that camera's validated room
    reconstruction.
 9. A weak or ambiguous registration fails its quality gate. A passing result
    remains a review candidate until explicitly promoted by a separate workflow.

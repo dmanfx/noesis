@@ -1,0 +1,37 @@
+{
+  "cpu_inference_provider": [
+    "CPUExecutionProvider"
+  ],
+  "created_at": "2026-07-10T14:38:41.116011+00:00",
+  "cuda_visible_devices": "",
+  "external_tensor_count": 0,
+  "identical_batch_max_abs_delta": 0.0,
+  "input_tensors": {
+    "images": [
+      3,
+      3,
+      640,
+      640
+    ]
+  },
+  "onnx_version": "1.19.1",
+  "onnxruntime_version": "1.26.0",
+  "output": "DS9/models/onnx/yolo26n-pose_b3.onnx",
+  "output_bytes": 12075358,
+  "output_sha256": "be40dd6e2e3bedf3fd5eed289881a607486a4ce2f0f1d72f57bd806a8908ce61",
+  "output_tensors": {
+    "output0": [
+      3,
+      300,
+      57
+    ]
+  },
+  "python_version": "3.12.3",
+  "schema_version": 1,
+  "source": "yolo26n-pose.pt",
+  "source_sha256": "eb3bb8268828aeaf515cec23a4bfafd793944a86fe9af94ba7823609c14522a9",
+  "torch_cuda_available": false,
+  "torch_cuda_version": "13.0",
+  "torch_version": "2.12.1+cu130",
+  "ultralytics_version": "8.4.0"
+}

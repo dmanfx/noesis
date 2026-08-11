@@ -1,0 +1,25 @@
+{
+  "external_tensor_count": 0,
+  "input_tensors": {
+    "input0": ["batch", 3, 256, 192],
+    "k_inv": ["batch", 3, 3],
+    "mean_limb_lengths": ["batch", 36],
+    "scale_normalized_mean_limb_lengths": ["batch", 36],
+    "t_form_inv": ["batch", 3, 3]
+  },
+  "onnx_ir_version": 6,
+  "onnx_opset": 11,
+  "output": "DS9/models/onnx/bodypose3dnet_accuracy.onnx",
+  "output_bytes": 70575749,
+  "output_sha256": "0452b785a70fcd6bc5bd4069249bdfd85eb139c9e9216bcf81f89df33945d028",
+  "output_tensors": {
+    "pose25d": ["batch", 34, 4],
+    "pose2d": ["batch", 34, 3],
+    "pose2d_org_img": ["batch", 34, 3],
+    "pose3d": ["batch", 34, 3]
+  },
+  "schema_version": 1,
+  "source": "models/bodypose3dnet/bodypose3dnet_accuracy.onnx",
+  "source_sha256": "0452b785a70fcd6bc5bd4069249bdfd85eb139c9e9216bcf81f89df33945d028",
+  "staged_at_utc": "2026-07-10T18:02:31Z"
+}

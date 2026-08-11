@@ -35,6 +35,8 @@ export type BevMeta = {
     normY?: number;
     normZ?: number;
     floorplanInside?: boolean;
+    coverageInside?: boolean;
+    coverageRegion?: string | null;
     gridCol?: number | null;
     gridRow?: number | null;
     gridCell?: number[];
@@ -70,6 +72,8 @@ export type BevMeta = {
       normY?: number;
       normZ?: number;
       floorplanInside?: boolean;
+      coverageInside?: boolean;
+      coverageRegion?: string | null;
       gridCol?: number | null;
       gridRow?: number | null;
     }>;
@@ -86,6 +90,20 @@ export type BevMeta = {
   fallbackReasonCounts?: Record<string, number>;
   floorplanCoordinateSpace?: string;
   floorplanBounds?: MetricBounds;
+  displayBounds?: MetricBounds;
+  coverageEnvelope?: {
+    contract?: string;
+    contractVersion?: number;
+    frame?: string;
+    units?: string;
+    cameraId?: string;
+    boundaryToleranceM?: number;
+    bounds?: MetricBounds;
+    regions?: Array<{
+      id?: string;
+      polygonXZ?: Array<[number, number]>;
+    }>;
+  };
   floorplanGridShape?: number[] | null;
   floorplanGridResM?: number | null;
   droppedFootpoints?: Array<{
@@ -94,6 +112,8 @@ export type BevMeta = {
     normX?: number;
     normY?: number;
     floorplanInside?: boolean;
+    coverageInside?: boolean;
+    coverageRegion?: string | null;
     stableId?: number | null;
     trackerId?: number | null;
     reason?: string;
@@ -133,6 +153,15 @@ type NormalizedPayloadPoint = {
   normX?: number;
   normY?: number;
   floorplanInside?: boolean | null;
+  coverageInside?: boolean | null;
+  coverageRegion?: string | null;
+};
+type CoverageRegion = { id: string; polygonXZ: Array<[number, number]> };
+type CoverageEnvelope = {
+  cameraId: string;
+  boundaryToleranceM: number;
+  bounds: MetricBounds;
+  regions: CoverageRegion[];
 };
 type FloorplanVisualSelection = {
   walkableLayer?: FloorplanResponse['walkable'];
@@ -275,6 +304,126 @@ const rawPayloadBounds = (meta: BevMeta | undefined): MetricBounds | null => {
   if (![minX, maxX, minZ, maxZ].every(Number.isFinite)) return null;
   if (maxX <= minX || maxZ <= minZ) return null;
   return { min_x: minX, max_x: maxX, min_z: minZ, max_z: maxZ };
+};
+
+const parseMetricBounds = (raw: unknown): MetricBounds | null => {
+  if (!raw || typeof raw !== 'object') return null;
+  const value = raw as Partial<MetricBounds>;
+  const minX = Number(value.min_x);
+  const maxX = Number(value.max_x);
+  const minZ = Number(value.min_z);
+  const maxZ = Number(value.max_z);
+  if (![minX, maxX, minZ, maxZ].every(Number.isFinite)) return null;
+  if (maxX <= minX || maxZ <= minZ) return null;
+  return { min_x: minX, max_x: maxX, min_z: minZ, max_z: maxZ };
+};
+
+const parseCoverageEnvelope = (meta: BevMeta | undefined): CoverageEnvelope | null => {
+  const raw = meta?.coverageEnvelope;
+  if (!raw || typeof raw !== 'object') return null;
+  if (
+    raw.contract !== 'noesis.bev.coverage_envelopes' ||
+    raw.contractVersion !== 1 ||
+    !isCameraLocalFrame(raw.frame) ||
+    !isMetricUnits(raw.units)
+  ) {
+    return null;
+  }
+  const cameraId = String(raw.cameraId || '').trim();
+  const metaCameraId = String(meta?.cameraId || meta?.camId || '').trim();
+  if (!cameraId || (metaCameraId && cameraId !== metaCameraId)) return null;
+  const boundaryToleranceM = Number(raw.boundaryToleranceM);
+  if (
+    !Number.isFinite(boundaryToleranceM) ||
+    boundaryToleranceM < 0 ||
+    boundaryToleranceM > 2
+  ) {
+    return null;
+  }
+  const bounds = parseMetricBounds(raw.bounds);
+  if (!bounds || !Array.isArray(raw.regions) || raw.regions.length < 1 || raw.regions.length > 16) {
+    return null;
+  }
+  const regions: CoverageRegion[] = [];
+  const ids = new Set<string>();
+  for (const rawRegion of raw.regions) {
+    const id = String(rawRegion?.id || '').trim();
+    const rawPolygon = rawRegion?.polygonXZ;
+    if (!id || ids.has(id) || !Array.isArray(rawPolygon) || rawPolygon.length < 3 || rawPolygon.length > 64) {
+      return null;
+    }
+    const polygonXZ: Array<[number, number]> = [];
+    for (const rawPoint of rawPolygon) {
+      if (!Array.isArray(rawPoint) || rawPoint.length !== 2) return null;
+      const x = Number(rawPoint[0]);
+      const z = Number(rawPoint[1]);
+      if (!Number.isFinite(x) || !Number.isFinite(z)) return null;
+      if (
+        x < bounds.min_x - 1e-6 ||
+        x > bounds.max_x + 1e-6 ||
+        z < bounds.min_z - 1e-6 ||
+        z > bounds.max_z + 1e-6
+      ) {
+        return null;
+      }
+      polygonXZ.push([x, z]);
+    }
+    ids.add(id);
+    regions.push({ id, polygonXZ });
+  }
+  return { cameraId, boundaryToleranceM, bounds, regions };
+};
+
+const pointSegmentDistance = (
+  x: number,
+  z: number,
+  ax: number,
+  az: number,
+  bx: number,
+  bz: number
+): number => {
+  const dx = bx - ax;
+  const dz = bz - az;
+  const denom = (dx * dx) + (dz * dz);
+  if (denom <= 1e-18) return Math.hypot(x - ax, z - az);
+  const t = clampNumber((((x - ax) * dx) + ((z - az) * dz)) / denom, 0, 1);
+  return Math.hypot(x - (ax + (t * dx)), z - (az + (t * dz)));
+};
+
+const pointInCoverageRegion = (
+  x: number,
+  z: number,
+  region: CoverageRegion,
+  boundaryToleranceM: number
+): boolean => {
+  const tolerance = Math.max(0, boundaryToleranceM);
+  let inside = false;
+  let previous = region.polygonXZ[region.polygonXZ.length - 1];
+  for (const current of region.polygonXZ) {
+    if (
+      pointSegmentDistance(x, z, previous[0], previous[1], current[0], current[1]) <= Math.max(1e-9, tolerance)
+    ) {
+      return true;
+    }
+    const crosses = (current[1] > z) !== (previous[1] > z);
+    if (crosses) {
+      const intersectionX = current[0] + (((z - current[1]) * (previous[0] - current[0])) / (previous[1] - current[1]));
+      if (x < intersectionX) inside = !inside;
+    }
+    previous = current;
+  }
+  return inside;
+};
+
+const coverageRegionForPoint = (
+  coverage: CoverageEnvelope,
+  x: number,
+  z: number
+): string | null => {
+  for (const region of coverage.regions) {
+    if (pointInCoverageRegion(x, z, region, coverage.boundaryToleranceM)) return region.id;
+  }
+  return null;
 };
 
 const boundsNearlyEqual = (a: MetricBounds | null, b: MetricBounds | null, eps = 1e-3): boolean => {
@@ -424,16 +573,60 @@ export const BevView: React.FC<BevViewProps> = ({
   const displayFloorplan = (floorplanHasRenderableGrid(floorplan) && !floorplan?.error)
     ? floorplan
     : (retainedFloorplanRef.current ?? floorplan);
+  const coverageEnvelopeContractKey = JSON.stringify(meta?.coverageEnvelope ?? null);
+  const coverageEnvelope = useMemo(
+    () => parseCoverageEnvelope(meta),
+    [coverageEnvelopeContractKey, meta?.cameraId, meta?.camId]
+  );
   const displayBounds = useMemo(
-    () => floorplanBoundsForMode(displayFloorplan, coordMode),
+    () => {
+      const floorplanBounds = floorplanBoundsForMode(displayFloorplan, coordMode);
+      if (!coverageEnvelope) return floorplanBounds;
+      const tolerance = coverageEnvelope.boundaryToleranceM;
+      const expected: MetricBounds = {
+        min_x: Math.min(
+          floorplanBounds?.min_x ?? Number.POSITIVE_INFINITY,
+          coverageEnvelope.bounds.min_x - tolerance
+        ),
+        max_x: Math.max(
+          floorplanBounds?.max_x ?? Number.NEGATIVE_INFINITY,
+          coverageEnvelope.bounds.max_x + tolerance
+        ),
+        min_z: Math.min(
+          floorplanBounds?.min_z ?? Number.POSITIVE_INFINITY,
+          coverageEnvelope.bounds.min_z - tolerance
+        ),
+        max_z: Math.max(
+          floorplanBounds?.max_z ?? Number.NEGATIVE_INFINITY,
+          coverageEnvelope.bounds.max_z + tolerance
+        ),
+      };
+      const advertised = parseMetricBounds(meta?.displayBounds) ?? rawPayloadBounds(meta);
+      if (
+        advertised &&
+        advertised.min_x <= expected.min_x + 1e-6 &&
+        advertised.max_x >= expected.max_x - 1e-6 &&
+        advertised.min_z <= expected.min_z + 1e-6 &&
+        advertised.max_z >= expected.max_z - 1e-6
+      ) {
+        return advertised;
+      }
+      return expected;
+    },
     [
       coordMode,
+      coverageEnvelope,
       displayFloorplan?.frame,
       displayFloorplan?.units,
       displayFloorplan?.bounds?.min_x,
       displayFloorplan?.bounds?.max_x,
       displayFloorplan?.bounds?.min_z,
       displayFloorplan?.bounds?.max_z,
+      meta?.displayBounds,
+      meta?.xMin,
+      meta?.xMax,
+      meta?.zMin,
+      meta?.zMax,
     ]
   );
   const resolveDisplayPoint = useCallback((x: number, y: number): ResolvedMetricPoint | null => {
@@ -448,6 +641,15 @@ export const BevView: React.FC<BevViewProps> = ({
 
   const resolvePayloadPoint = useCallback((pt: NormalizedPayloadPoint | null | undefined): ResolvedMetricPoint | null => {
     if (!pt) return null;
+    if (coverageEnvelope) {
+      const x = Number(pt.x);
+      const y = Number(pt.y);
+      if (!Number.isFinite(x) || !Number.isFinite(y) || pt.coverageInside === false) {
+        return null;
+      }
+      if (!coverageRegionForPoint(coverageEnvelope, x, y)) return null;
+      return resolveDisplayPoint(x, y);
+    }
     const normX = Number(pt.normX);
     const normY = Number(pt.normY);
     if (displayBounds && Number.isFinite(normX) && Number.isFinite(normY)) {
@@ -466,7 +668,7 @@ export const BevView: React.FC<BevViewProps> = ({
       };
     }
     return resolveDisplayPoint(Number(pt.x), Number(pt.y));
-  }, [displayBounds, resolveDisplayPoint]);
+  }, [coverageEnvelope, displayBounds, resolveDisplayPoint]);
 
   useEffect(() => {
     metaRef.current = meta;
@@ -706,6 +908,7 @@ export const BevView: React.FC<BevViewProps> = ({
       const hasComposite = visual.hasComposite;
       const basePalette = baseKind === 'walkable' ? bwColor : infernoColor;
       const hasFloorplan = visual.hasFloorplan;
+      const floorplanMetricBounds = rawFloorplanBounds(floorplanNow);
 
       // Cache the floorplan render so we don't re-decode base64 every animation frame.
       const dpr = window.devicePixelRatio || 1;
@@ -742,16 +945,137 @@ export const BevView: React.FC<BevViewProps> = ({
       const layerRenderKey = isHeightVisual
         ? `${heightLowPct}:${heightHighPct}:${heightGamma.toFixed(3)}:${densityCutoff.toFixed(4)}:${heightRenderTuning.smoothing ? 1 : 0}`
         : 'layer';
+      const coverageRenderKey = coverageEnvelope
+        ? `${coverageEnvelope.boundaryToleranceM}:${coverageEnvelope.regions
+          .map(region => `${region.id}:${region.polygonXZ.map(point => point.join(',')).join(';')}`)
+          .join('|')}`
+        : 'none';
+      const metricBoundsKey = floorplanMetricBounds
+        ? `${floorplanMetricBounds.min_x}:${floorplanMetricBounds.max_x}:${floorplanMetricBounds.min_z}:${floorplanMetricBounds.max_z}`
+        : 'none';
       const key = hasFloorplan
-        ? `${baseKind}:${floorplanNow?.snapshot_ts ?? floorplanNow?.ts ?? ''}:${baseLayer?.grid_shape?.join('x')}:${baseLayer?.value_min ?? ''}:${baseLayer?.value_max ?? ''}:${baseLayer?.grid_b64?.length ?? ''}:${hasComposite ? (obstacleHeightLayer?.grid_b64?.length ?? '') : ''}:${isHeightVisual ? (densityLayer?.grid_b64?.length ?? '') : ''}:${aspect}:${fitMode}:${boundsAspect.toFixed(6)}:${padCss.toFixed(3)}:${smoothBaseImage ? 'smooth' : 'sharp'}:${layerRenderKey}`
-        : `none:${aspect}:${fitMode}:${boundsAspect.toFixed(6)}:${padCss.toFixed(3)}`;
+        ? `${baseKind}:${floorplanNow?.snapshot_ts ?? floorplanNow?.ts ?? ''}:${baseLayer?.grid_shape?.join('x')}:${baseLayer?.value_min ?? ''}:${baseLayer?.value_max ?? ''}:${baseLayer?.grid_b64?.length ?? ''}:${hasComposite ? (obstacleHeightLayer?.grid_b64?.length ?? '') : ''}:${isHeightVisual ? (densityLayer?.grid_b64?.length ?? '') : ''}:${aspect}:${fitMode}:${boundsAspect.toFixed(6)}:${padCss.toFixed(3)}:${smoothBaseImage ? 'smooth' : 'sharp'}:${layerRenderKey}:${metricBoundsKey}:${coverageRenderKey}`
+        : `none:${aspect}:${fitMode}:${boundsAspect.toFixed(6)}:${padCss.toFixed(3)}:${metricBoundsKey}:${coverageRenderKey}`;
 
       const bg = bgCanvasRef.current ?? (bgCanvasRef.current = document.createElement('canvas'));
       const bgSize = bgSizeRef.current;
       const bgNeedsRedraw = bgKeyRef.current !== key || bgSize.w !== expectedW || bgSize.h !== expectedH;
 
       if (bgNeedsRedraw) {
-        if (hasFloorplan) {
+        if (coverageEnvelope) {
+          cvs.width = expectedW;
+          cvs.height = expectedH;
+          ctx.setTransform(1, 0, 0, 1, 0, 0);
+          ctx.fillStyle = '#111';
+          ctx.fillRect(0, 0, cvs.width, cvs.height);
+
+          const canvasAspect = cvs.width / Math.max(1, cvs.height);
+          let contentW = cvs.width;
+          let contentH = cvs.height;
+          let contentX = 0;
+          let contentY = 0;
+          if (canvasAspect > boundsAspect) {
+            contentW = contentH * boundsAspect;
+            contentX = (cvs.width - contentW) * 0.5;
+          } else {
+            contentH = contentW / boundsAspect;
+            contentY = (cvs.height - contentH) * 0.5;
+          }
+          const coverageContentRect: ContentRect = {
+            x: contentX,
+            y: contentY,
+            w: contentW,
+            h: contentH,
+          };
+          bgContentRectRef.current = coverageContentRect;
+
+          if (hasFloorplan && floorplanMetricBounds) {
+            const floorplanSpanX = floorplanMetricBounds.max_x - floorplanMetricBounds.min_x;
+            const floorplanSpanZ = floorplanMetricBounds.max_z - floorplanMetricBounds.min_z;
+            const floorplanAspect = floorplanSpanX / floorplanSpanZ;
+            const destinationX = coverageContentRect.x
+              + (((floorplanMetricBounds.min_x - xMin) / boundsSpanX) * coverageContentRect.w);
+            const destinationY = coverageContentRect.y
+              + coverageContentRect.h
+              - (((floorplanMetricBounds.max_z - zMin) / boundsSpanZ) * coverageContentRect.h);
+            const destinationW = (floorplanSpanX / boundsSpanX) * coverageContentRect.w;
+            const destinationH = (floorplanSpanZ / boundsSpanZ) * coverageContentRect.h;
+            const floorplanCanvas = document.createElement('canvas');
+            const renderOptions = {
+              fit: 'contain' as const,
+              forceAspect: floorplanAspect,
+              contentPaddingPx: 0,
+              targetWidthPx: Math.max(1, Math.round(destinationW)),
+              targetHeightPx: Math.max(1, Math.round(destinationH)),
+              pixelRatio: 1,
+            };
+            if (hasComposite) {
+              renderCompositeWalkableObstacleToCanvas(
+                floorplanCanvas,
+                walkableLayer,
+                obstacleHeightLayer,
+                {
+                  ...renderOptions,
+                  imageSmoothing: true,
+                }
+              );
+            } else {
+              renderLayerToCanvas(
+                floorplanCanvas,
+                baseLayer,
+                basePalette,
+                {
+                  ...renderOptions,
+                  imageSmoothing: isHeightVisual ? heightRenderTuning.smoothing : smoothBaseImage,
+                  ...(isHeightVisual ? {
+                    valueMinPercentile: heightLowPct,
+                    valueMaxPercentile: heightHighPct,
+                    gamma: heightGamma,
+                    maskLayer: densityLayer,
+                    maskThreshold: densityCutoff,
+                  } : {})
+                }
+              );
+            }
+            ctx.save();
+            ctx.imageSmoothingEnabled = true;
+            ctx.imageSmoothingQuality = 'high';
+            ctx.drawImage(
+              floorplanCanvas,
+              destinationX,
+              destinationY,
+              destinationW,
+              destinationH
+            );
+            ctx.restore();
+          }
+
+          ctx.save();
+          ctx.lineWidth = Math.max(1.5, dpr);
+          ctx.setLineDash([6 * dpr, 4 * dpr]);
+          ctx.strokeStyle = 'rgba(77, 220, 255, 0.78)';
+          ctx.fillStyle = 'rgba(77, 220, 255, 0.85)';
+          ctx.font = `${Math.max(10, 10 * dpr)}px sans-serif`;
+          for (const region of coverageEnvelope.regions) {
+            ctx.beginPath();
+            region.polygonXZ.forEach(([mx, mz], index) => {
+              const px = coverageContentRect.x + (((mx - xMin) / boundsSpanX) * coverageContentRect.w);
+              const py = coverageContentRect.y + coverageContentRect.h
+                - (((mz - zMin) / boundsSpanZ) * coverageContentRect.h);
+              if (index === 0) ctx.moveTo(px, py);
+              else ctx.lineTo(px, py);
+            });
+            ctx.closePath();
+            ctx.stroke();
+            const centroidX = region.polygonXZ.reduce((sum, point) => sum + point[0], 0) / region.polygonXZ.length;
+            const centroidZ = region.polygonXZ.reduce((sum, point) => sum + point[1], 0) / region.polygonXZ.length;
+            const labelX = coverageContentRect.x + (((centroidX - xMin) / boundsSpanX) * coverageContentRect.w);
+            const labelY = coverageContentRect.y + coverageContentRect.h
+              - (((centroidZ - zMin) / boundsSpanZ) * coverageContentRect.h);
+            ctx.fillText(region.id, labelX + (4 * dpr), labelY - (4 * dpr));
+          }
+          ctx.restore();
+        } else if (hasFloorplan) {
           const rendered = hasComposite
             ? renderCompositeWalkableObstacleToCanvas(cvs, walkableLayer, obstacleHeightLayer, {
               fit: fitMode,
@@ -1037,6 +1361,35 @@ export const BevView: React.FC<BevViewProps> = ({
       };
 
       const drawDroppedMarker = (pt: NormalizedPayloadPoint, labelText: string) => {
+        const metricX = Number(pt?.x);
+        const metricY = Number(pt?.y);
+        if (
+          coverageEnvelope &&
+          Number.isFinite(metricX) &&
+          Number.isFinite(metricY) &&
+          metricX >= xMin &&
+          metricX <= xMax &&
+          metricY >= zMin &&
+          metricY <= zMax
+        ) {
+          const px = drawX(metricX);
+          const py = drawY(metricY);
+          ctx.save();
+          ctx.fillStyle = 'rgba(244, 67, 54, 0.92)';
+          ctx.strokeStyle = 'rgba(0, 0, 0, 0.78)';
+          ctx.lineWidth = 1.5;
+          ctx.beginPath();
+          ctx.arc(px, py, 5, 0, 2 * Math.PI);
+          ctx.fill();
+          ctx.stroke();
+          ctx.font = 'bold 10px sans-serif';
+          ctx.lineWidth = 3;
+          ctx.strokeText(labelText, px + 7, py - 7);
+          ctx.fillStyle = '#ff8f8f';
+          ctx.fillText(labelText, px + 7, py - 7);
+          ctx.restore();
+          return;
+        }
         const nx = Number(pt?.normX);
         const ny = Number(pt?.normY);
         if (!Number.isFinite(nx) || !Number.isFinite(ny)) return;
@@ -1132,6 +1485,8 @@ export const BevView: React.FC<BevViewProps> = ({
                   normX: Number(p?.normX),
                   normY: Number(p?.normY),
                   floorplanInside: p?.floorplanInside,
+                  coverageInside: p?.coverageInside,
+                  coverageRegion: p?.coverageRegion,
                 }))
                 .map((p) => {
                   if (!Number.isFinite(p.t)) return null;
@@ -1292,7 +1647,13 @@ export const BevView: React.FC<BevViewProps> = ({
         ctx.fillStyle = 'rgba(244, 67, 54, 0.9)';
         ctx.font = 'bold 11px sans-serif';
         ctx.textAlign = 'center';
-        ctx.fillText('Tracks are outside floorplan bounds', contentRect.x + (contentRect.w / 2), contentRect.y + 16);
+        ctx.fillText(
+          coverageEnvelope
+            ? 'Tracks are outside the camera coverage envelope'
+            : 'Tracks are outside floorplan bounds',
+          contentRect.x + (contentRect.w / 2),
+          contentRect.y + 16
+        );
         ctx.textAlign = 'left';
       }
 
@@ -1301,6 +1662,7 @@ export const BevView: React.FC<BevViewProps> = ({
           `mode=${coordMode}`,
           `frame=${String(floorplanFrame || 'none')}`,
           `units=${String(metaNow?.units || floorplanNow?.units || 'unknown')}`,
+          `coverage=${coverageEnvelope ? coverageEnvelope.regions.map(region => region.id).join('+') : 'floorplan'}`,
           `pts=${finitePointCount} in=${inBoundsPointCount} drop=${droppedFootpoints.length}`,
           `x:[${xMin.toFixed(2)},${xMax.toFixed(2)}] z:[${zMin.toFixed(2)},${zMax.toFixed(2)}]`,
         ];
@@ -1324,7 +1686,7 @@ export const BevView: React.FC<BevViewProps> = ({
     return () => {
       if (animationFrameRef.current) cancelAnimationFrame(animationFrameRef.current);
     };
-  }, [coordMode, debug, displayBounds, floorplan, heightRenderTuning, overlayEnabled, resolveDisplayPoint, resolvePayloadPoint, resolvedTrailConfig, variant]);
+  }, [coordMode, coverageEnvelope, debug, displayBounds, floorplan, heightRenderTuning, overlayEnabled, resolveDisplayPoint, resolvePayloadPoint, resolvedTrailConfig, variant]);
 
   const floorplanFrame = displayFloorplan?.frame;
   const hasFloorplanFrame = typeof floorplanFrame === 'string' && floorplanFrame.trim().length > 0;

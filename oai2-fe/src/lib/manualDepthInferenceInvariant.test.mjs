@@ -40,6 +40,23 @@ test('fresh depth remains routed only through the explicit Refresh handler', asy
   assert.doesNotMatch(exportImplementation, /onRequestDepth(?:Fresh|Cached)/);
 });
 
+test('page load requests the cached depth half for every known camera', async () => {
+  const app = await source('../App.tsx');
+
+  assert.match(
+    app,
+    /for \(const cameraId of knownCameras\) {[\s\S]*requestCachedDepthRef\.current\(cameraId\);/,
+  );
+  assert.match(
+    app,
+    /if \(status !== 'open'\) {[\s\S]*startupDepthCacheCamerasRef\.current\.clear\(\);/,
+  );
+  assert.equal(
+    occurrenceCount(app, /requestMapAnythingDepth\(camId,\s*'cache-only'\)/g),
+    1,
+  );
+});
+
 test('3D renderers contain no depth or floorplan request path', async () => {
   const sources = await Promise.all([
     source('../components/CalibratedPointCloud3DView.tsx'),

@@ -291,6 +291,8 @@ function Dashboard() {
   const floorplanBootstrapStartTimerRef = useRef<number | null>(null);
   const floorplanBootstrapActionTimerRef = useRef<number | null>(null);
   const handleFloorplanBootstrapResponseRef = useRef<(payload: any, renderable: boolean) => void>(() => {});
+  const requestCachedDepthRef = useRef<(cameraId: string) => void>(() => {});
+  const startupDepthCacheCamerasRef = useRef<Set<string>>(new Set());
 
   const updateDepthRefreshState = useCallback((cameraKey: string, next?: DepthRefreshEntry) => {
     if (!cameraKey) return;
@@ -1552,6 +1554,25 @@ function Dashboard() {
     status,
     updateDepthCachePairState,
   ]);
+
+  requestCachedDepthRef.current = requestDepthCached;
+
+  useEffect(() => {
+    if (status !== 'open') {
+      startupDepthCacheCamerasRef.current.clear();
+      return;
+    }
+
+    // Floorplans are bootstrapped from cache below. Load the matching cached
+    // depth half on the same page-load/reconnect path so both BEV and Depth can
+    // publish their coherent pair before the drawer is opened. This is a cache
+    // read only; fresh MapAnything inference remains exclusive to Refresh.
+    for (const cameraId of knownCameras) {
+      if (startupDepthCacheCamerasRef.current.has(cameraId)) continue;
+      startupDepthCacheCamerasRef.current.add(cameraId);
+      requestCachedDepthRef.current(cameraId);
+    }
+  }, [knownCameras, status]);
 
   useEffect(() => {
     if (status === 'open') return;

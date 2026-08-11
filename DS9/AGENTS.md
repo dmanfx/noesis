@@ -26,3 +26,24 @@ This folder contains DeepStream 9 specific runtime overlays, generated assets, a
      `DS9/noesis/ds9_runtime_core.py`.
 
 5. Document every DS9 migration decision in `DS9/README.md` or a dedicated DS9 doc.
+
+6. Promote DS9 changes by affected capability.
+   - Follow the root `AGENTS.md` capability-scoped production-promotion policy.
+   - For MapAnything/depth-panel work, default to the focused depth,
+     exact-capture, storage/fusion, frontend-build, manual-Refresh, cache-only,
+     and service-readiness gates affected by the change.
+   - A network change requires exact listener, reachability, TLS/auth, and
+     rollback checks. A systemd change requires unit validation,
+     dependency/start/stop/restart/readiness, and rollback checks. Neither
+     automatically requires model-quality, tracking, identity, occupied-scene,
+     long-soak, or sealed full-runtime evidence.
+   - A model or native change requires the affected DS9 engine/native loading,
+     tensor/metadata contract, and direct-consumer live path. It does not
+     automatically require every unrelated DS9 capability.
+   - Use full-system assurance only when the change crosses core pipeline
+     topology or shared source/frame/timestamp/identity/world semantics, when
+     its impact cannot be bounded after inspection, for a named release
+     candidate, or when explicitly requested.
+   - Reuse unchanged realized engines, native builds, release artifacts, and
+     passed evidence. Do not restart the whole promotion sequence after an
+     unrelated failure; rerun only invalidated phases.

@@ -1,0 +1,2 @@
+# Deferred MV3DT MQTT adapter placeholder; this is not a runtime credential file.
+# Activation must materialize an owner-only adapter config outside the checkout.

@@ -1,0 +1,231 @@
+# DeepStream 9.1 MV3DT configuration contract for the Noesis Service Maker pipeline.
+# This profile is deliberately non-activatable until Kitchen geometry and
+# synchronized occupied Kitchen/Family-Room overlap evidence are accepted.
+
+version: 1
+
+depth_registration:
+  path: DS9/config/depth_registration.json
+
+batch_size: 3
+
+streammux:
+  width: 1920
+  height: 1080
+  batch-size: 3
+  live-source: 1
+  batched-push-timeout: 40000
+  # Locked V3DT calibration assumes an unpadded 1920x1080 pixel frame.
+  enable-padding: 0
+  num-surfaces-per-frame: 1
+  nvbuf-memory-type: 0
+  sync-inputs: 1
+  gpu-id: 0
+
+# Explicit calibrated validity regions for full-FoV fisheye dewarping. These
+# masks prevent border pixels outside the source lens circle from entering
+# MapAnything depth/reconstruction evidence.
+dewarper_validity_masks:
+  sources:
+    "0":
+      source-valid-region: circle
+      source-width: 1920
+      source-height: 1080
+      erode-px: 1
+    "1":
+      source-valid-region: circle
+      source-width: 1920
+      source-height: 1080
+      erode-px: 1
+    "2":
+      source-valid-region: circle
+      source-width: 1280
+      source-height: 720
+      erode-px: 1
+
+sources:
+  - element: nvurisrcbin
+    uri_secret: living-room
+    gpu-id: 0
+    cudadec-memtype: 0
+    latency: 100
+    select-rtp-protocol: 4
+    disable-audio: true
+    dewarper:
+      enable: true
+      config-file: DS9/config/dewarper_g3_instant_charuco_1080.txt
+  - element: nvurisrcbin
+    uri_secret: kitchen
+    gpu-id: 0
+    cudadec-memtype: 0
+    latency: 100
+    select-rtp-protocol: 4
+    disable-audio: true
+    dewarper:
+      enable: true
+      config-file: DS9/config/dewarper_g3_instant_charuco_1080.txt
+  - element: nvurisrcbin
+    uri_secret: family-room
+    gpu-id: 0
+    cudadec-memtype: 0
+    latency: 100
+    select-rtp-protocol: 4
+    disable-audio: true
+    dewarper:
+      enable: true
+      config-file: DS9/config/dewarper_g4_instant_charuco_720_to_1080.txt
+
+preprocess:
+  enable: true
+  config-file: DS9/pipelines/config_preproc_yolo26_seg_s.ini
+
+models:
+  pgie:
+    config-file-path: DS9/pipelines/config_infer_primary_yolo26_seg_s.ini
+    engine: DS9/models/engines/yolo26s-seg_fused_b3_fp16.engine
+    batch_size: 3
+    gie_id: 1
+    network_mode: fp16
+    attach_tensor_meta: false
+  reid:
+    enable: true
+    name: reid_sgie
+    config-file-path: DS9/pipelines/config_infer_secondary_reid_swin.ini
+    engine: DS9/models/engines/reid_swin_tiny_aicity156_dyn_b16_fp16.engine
+    batch_size: 16
+    gie_id: 3
+    layer: fc_pred
+    embedding_dim: 256
+    attach_tensor_meta: true
+  pose:
+    enable: true
+    name: yolo26_pose
+    config-file-path: DS9/pipelines/config_infer_secondary_yolo26_pose.ini
+    engine: DS9/models/engines/yolo26n-pose_b3_fp16.engine
+    batch_size: 3
+    gie_id: 4
+    attach_tensor_meta: true
+    model_size: [640, 640]
+    score_threshold: 0.25
+    kpt_threshold: 0.35
+    letterbox: true
+  depth_tracking:
+    # The baseline DAv2 lane estimates object depth for the 2D tracker. SV3DT
+    # owns the 3D observation here, so keeping that lane active would duplicate
+    # depth work without contributing to the V3DT result.
+    enable: false
+    name: depth_tracking_fullframe
+    config-file-path: DS9/pipelines/config_infer_secondary_depth_tracking_da2.ini
+    engine: DS9/models/engines/depth_anything_v2_metric_hypersim_vits_294x518_b3_fp16.engine
+    batch_size: 3
+    gie_id: 5
+    attach_tensor_meta: true
+  mapanything:
+    enable: true
+    name: mapanything_fullframe
+    config-file-path: DS9/pipelines/config_infer_secondary_mapanything.ini
+    engine: DS9/models/engines/mapanything_images_294x518_b3_fp32.plan
+    batch_size: 3
+    gie_id: 2
+    attach_tensor_meta: true
+
+tracker:
+  config-file: DS9/config/v3dt/nvtracker_mv3dt.yaml
+  ll-lib-file: /opt/nvidia/deepstream/deepstream-9.1/lib/libnvds_nvmultiobjecttracker.so
+  tracker-width: 1920
+  tracker-height: 1080
+
+analytics:
+  enable: true
+  config-file: DS9/config/config_nvdsanalytics_post.ini
+  stages_config: DS9/config/nvdsanalytics.yaml
+  exclude:
+    enable: true
+    element: nvdsroiexclude
+    config-file: DS9/config/config_nvdsanalytics_exclude.ini
+
+sinks:
+  - name: mosaic_sink
+    type: fakesink
+    sync: false
+  - name: bev_sink
+    type: fakesink
+    sync: false
+
+mosaic_output:
+  rtsp_enabled: false
+  rtsp_port: 8554
+  rtsp_path: mosaic
+  mosaic_webrtc_enabled: true
+  mosaic_h264_shm_socket: /tmp/noesis-mosaic-h264
+  video_bitrate_kbps: 12000
+  encoder: nvv4l2h264enc
+  h264_iframeinterval: 10
+  h264_idrinterval: 10
+  h264_preset_id: 4
+  h264_profile: 0
+
+bev:
+  frame: camera_local_ground_m
+  jpeg_enabled: false
+  jpeg_quality: 70
+  smoothing:
+    enabled: true
+    max_speed_mps: 4.0
+    max_jump_m: 0.75
+    alpha: 0.45
+    beta: 0.10
+    ttl_s: 2.5
+    reset_after_s: 1.25
+
+osd:
+  process-mode: 0
+  display-mask: 1
+  display-bbox: 0
+  display-text: 1
+
+visualization:
+  display_keypoints: true
+  instance_masks:
+    alpha: 0.35
+  trails:
+    enabled: true
+    anchor_mode: floor_plane_gravity_drop
+    class_ids: [0]
+    window_s: 8.0
+    draw_stride: 1
+    min_step_px: 1.0
+    min_dt_s: 0.08
+    smooth_tau_s: 0.18
+    gap_predict_ttl_s: 0.0
+    gap_predict_decay_tau_s: 0.75
+    predicted_alpha_scale: 0.65
+    height_peak_up_alpha: 0.35
+    height_peak_down_alpha: 0.05
+    height_good_frame_ratio: 0.90
+    head_smooth_tau_s: 0.06
+    trail_smooth_tau_s: 0.19
+    min_step_scene_floor: 0.0
+    min_step_scene_ceil: 0.11
+    stale_head_blink_enabled: false
+    max_speed_px_per_s: 1200.0
+    max_points_per_track: 257
+    max_segments_per_track: 64
+    max_tracks: 8
+    max_lines: 800
+    max_display_metas: 32
+    line_width: 3
+    min_alpha: 0.15
+    show_labels: false
+    color_key: stable_id
+  osd_labels:
+    font_size: 18
+    font_name: Serif
+    decimals: 2
+
+v3dt:
+  profile: mv3dt
+  activation_state: deferred
+  world_frame: backend_world_m
+  caminfo_world_axes: xzy
+  camera_order: [living-room, kitchen, family-room]

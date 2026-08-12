@@ -6814,6 +6814,12 @@ class _AnalyticsTelemetryProcessor:
             self._analytics_unique_id = None
 
         self._tracking_mode = self._resolve_tracking_mode(self.tracking_mode)
+        if self._tracking_mode_is_mv3dt():
+            raise ValueError(
+                "MV3DT activation is deferred until Kitchen geometry and synchronized "
+                "occupied Kitchen/Family-Room overlap evidence are ready; Living Room "
+                "has no MV3DT peer edge"
+            )
 
         v3dt_cfg = getattr(self.pipeline, "config", {}).get("v3dt", {}) or {}
         if self._tracking_mode_is_v3dt():
@@ -7085,7 +7091,10 @@ class _AnalyticsTelemetryProcessor:
         )
 
     def _tracking_mode_is_v3dt(self) -> bool:
-        return str(self._tracking_mode or "").strip().lower() == "v3dt"
+        return str(self._tracking_mode or "").strip().lower() in {"v3dt", "mv3dt"}
+
+    def _tracking_mode_is_mv3dt(self) -> bool:
+        return str(self._tracking_mode or "").strip().lower() == "mv3dt"
 
     def _resolve_tracking_mode(self, override: Optional[str] = None) -> str:
         if override is not None and str(override).strip():
@@ -7103,7 +7112,11 @@ class _AnalyticsTelemetryProcessor:
                 return self._normalize_tracking_mode(raw_mode)
             v3dt_cfg = cfg.get("v3dt")
             if isinstance(v3dt_cfg, Mapping):
-                raw_mode = v3dt_cfg.get("tracking_mode") or v3dt_cfg.get("mode")
+                raw_mode = (
+                    v3dt_cfg.get("tracking_mode")
+                    or v3dt_cfg.get("mode")
+                    or v3dt_cfg.get("profile")
+                )
                 if raw_mode:
                     return self._normalize_tracking_mode(raw_mode)
             tracker_cfg = cfg.get("tracker")
@@ -7116,14 +7129,18 @@ class _AnalyticsTelemetryProcessor:
     @staticmethod
     def _normalize_tracking_mode(value: Any) -> str:
         mode = str(value or "").strip().lower()
-        if mode in ("v3dt", "sv3dt", "mv3dt", "3d"):
+        if mode == "mv3dt":
+            return "mv3dt"
+        if mode in ("v3dt", "sv3dt", "3d"):
             return "v3dt"
         if mode in ("2d", "baseline", "standard", "default"):
             return "baseline"
         if not mode or mode == "auto":
             return "baseline"
-        logger.warning("Unknown tracking_mode '%s'; defaulting to baseline", value)
-        return "baseline"
+        raise ValueError(
+            "Unsupported DS9 tracking mode "
+            f"{value!r}; expected baseline, v3dt, mv3dt, or auto"
+        )
 
     def _warn_on_tracking_mode_mismatch(self) -> None:
         try:
@@ -7135,16 +7152,29 @@ class _AnalyticsTelemetryProcessor:
             return
         cfg_path = str(cfg_path)
         using_v3dt_tracker = "config/v3dt/" in cfg_path
+        using_mv3dt_tracker = "nvtracker_mv3dt" in cfg_path
         if using_v3dt_tracker and not self._tracking_mode_is_v3dt():
             logger.warning(
                 "Tracking mode '%s' with V3DT tracker config %s; V3DT meta/world will be ignored",
                 self._tracking_mode,
                 cfg_path,
             )
-        if self._tracking_mode_is_v3dt() and not using_v3dt_tracker:
+        if self._tracking_mode_is_mv3dt() and not using_mv3dt_tracker:
             logger.warning(
-                "Tracking mode 'v3dt' without V3DT tracker config (%s); V3DT meta may be absent",
+                "Tracking mode 'mv3dt' without the MV3DT tracker config (%s); "
+                "multi-view association metadata cannot be present",
                 cfg_path,
+            )
+        elif self._tracking_mode_is_v3dt() and not using_v3dt_tracker:
+            logger.warning(
+                "Tracking mode '%s' without V3DT tracker config (%s); V3DT meta may be absent",
+                self._tracking_mode,
+                cfg_path,
+            )
+        if not self._tracking_mode_is_mv3dt() and using_mv3dt_tracker:
+            raise ValueError(
+                f"Tracking mode {self._tracking_mode!r} cannot activate the "
+                f"deferred MV3DT tracker config {cfg_path}"
             )
 
     def _ensure_v3dt_caminfo_paths(self) -> None:

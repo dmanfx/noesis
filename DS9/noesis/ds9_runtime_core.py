@@ -250,7 +250,7 @@ _RFDETR_DETECTION_SIZE_HELP = "/".join(_RFDETR_DETECTION_SIZES)
 _RFDETR_SEGMENTATION_SIZE_HELP = "/".join(_RFDETR_SEGMENTATION_SIZES)
 _WHOLEBODY49_SIZE_HELP = "/".join(_WHOLEBODY49_SIZES)
 _ENV_TRUE = ("1", "true", "yes", "y", "on")
-_TRACKING_MODES = ("baseline", "v3dt")
+_TRACKING_MODES = ("baseline", "v3dt", "mv3dt")
 _MANUAL_DEPTH_MODELS = MANUAL_DEPTH_MODELS
 _RFDETR_TRT_PLUGIN_LOADED = False
 
@@ -1763,7 +1763,7 @@ def _parse_args() -> argparse.Namespace:
         default=None,
         help=(
             "PGIE profile overlay. Canonical defaults: baseline=yolo26/m, "
-            "v3dt=yolo26_seg/s. Env: NOESIS_PGIE_PROFILE"
+            "v3dt/mv3dt=yolo26_seg/s. Env: NOESIS_PGIE_PROFILE"
         ),
     )
     parser.add_argument(
@@ -1789,7 +1789,10 @@ def _parse_args() -> argparse.Namespace:
         "--tracking-mode",
         choices=_TRACKING_MODES,
         default=None,
-        help="Tracking mode selection (baseline or v3dt). Env: NOESIS_TRACKING_MODE",
+        help=(
+            "Tracking mode selection (baseline, v3dt, or deferred mv3dt). "
+            "Env: NOESIS_TRACKING_MODE"
+        ),
     )
     parser.add_argument(
         "--v3dt",
@@ -1876,7 +1879,9 @@ def _parse_args() -> argparse.Namespace:
 
 def _normalize_tracking_mode(value: Any) -> str:
     mode = str(value or "").strip().lower()
-    if mode in ("v3dt", "sv3dt", "mv3dt", "3d"):
+    if mode == "mv3dt":
+        return "mv3dt"
+    if mode in ("v3dt", "sv3dt", "3d"):
         return "v3dt"
     if mode in ("2d", "baseline", "standard", "default"):
         return "baseline"
@@ -1884,7 +1889,7 @@ def _normalize_tracking_mode(value: Any) -> str:
         return "baseline"
     raise SystemExit(
         "[FATAL] Unsupported DS9 tracking mode "
-        f"{value!r}; expected baseline, v3dt, or auto"
+        f"{value!r}; expected baseline, v3dt, mv3dt, or auto"
     )
 
 
@@ -1919,7 +1924,7 @@ def _resolve_pgie_selection(
     profile = str(args.pgie_profile or "yolo26").strip().lower()
     explicit_profile = bool(getattr(args, "_pgie_profile_explicit", False))
     mode = _normalize_tracking_mode(tracking_mode)
-    if mode == "v3dt" and not explicit_profile:
+    if mode in {"v3dt", "mv3dt"} and not explicit_profile:
         profile = "yolo26_seg"
     if profile not in _PGIE_PROFILES:
         raise SystemExit(f"[FATAL] Unsupported DS9 PGIE profile: {profile}")
@@ -1932,7 +1937,8 @@ def _resolve_pgie_selection(
         return profile, None
     default_size = (
         "s"
-        if profile == "wholebody49" or (mode == "v3dt" and profile == "yolo26_seg")
+        if profile == "wholebody49"
+        or (mode in {"v3dt", "mv3dt"} and profile == "yolo26_seg")
         else "m"
     )
     return profile, str(requested_size or default_size).strip().lower()
@@ -2011,9 +2017,11 @@ def _cuda_runtime_preflight() -> Tuple[bool, str]:
 
 
 def _mode_default_paths(mode: str) -> Tuple[Path, Path]:
-    if mode == "v3dt":
+    if mode in {"v3dt", "mv3dt"}:
         return (
-            DS9_ROOT / "config" / "infer_v3dt.yaml",
+            DS9_ROOT
+            / "config"
+            / ("infer_mv3dt.yaml" if mode == "mv3dt" else "infer_v3dt.yaml"),
             DS9_ROOT / "config" / "cameras_v3dt.yaml",
         )
     return (DS9_ROOT / "config" / "infer.yaml", REPO_ROOT / "config" / "cameras.yaml")
@@ -2108,7 +2116,11 @@ def _tracker_under_v3dt_dir(path: Path) -> bool:
 
 
 def _validate_v3dt_tracking_guardrails(
-    pipeline_path: Path, cameras_path: Path, logger: logging.Logger
+    pipeline_path: Path,
+    cameras_path: Path,
+    logger: logging.Logger,
+    *,
+    tracking_mode: str,
 ) -> Optional[V3DTAssetBundle]:
     try:
         bundle = validate_v3dt_assets(
@@ -2116,6 +2128,7 @@ def _validate_v3dt_tracking_guardrails(
             cameras_config=cameras_path,
             require_engines=True,
             require_sources=False,
+            expected_profile=tracking_mode,
         )
     except (OSError, V3DTAssetError) as exc:
         logger.error("%s", exc)
@@ -4237,6 +4250,14 @@ def _run_main(startup_main_guard: StartupMainGuard) -> int:
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
     logger = logging.getLogger("ds9.runtime")
+    tracking_mode = _resolve_tracking_mode(args)
+    if tracking_mode == "mv3dt":
+        logger.critical(
+            "MV3DT activation is deferred until Kitchen geometry and synchronized "
+            "occupied Kitchen/Family-Room overlap evidence are ready; Living Room "
+            "has no MV3DT peer edge."
+        )
+        return 78
     try:
         appliance_binding = optional_runtime_context_binding(os.environ)
     except ApplianceConfigurationError as exc:
@@ -4441,7 +4462,6 @@ def _run_main(startup_main_guard: StartupMainGuard) -> int:
 
     startup_main_guard.arm(_handle_unexpected_startup_exception)
 
-    tracking_mode = _resolve_tracking_mode(args)
     if tracking_mode not in _TRACKING_MODES:
         raise SystemExit(
             "[FATAL] Resolved DS9 tracking mode is outside the supported contract: "
@@ -4504,7 +4524,10 @@ def _run_main(startup_main_guard: StartupMainGuard) -> int:
         if not _ensure_v3dt_meta_extension(logger):
             return 1
         v3dt_bundle = _validate_v3dt_tracking_guardrails(
-            pipeline_path, cameras_path, logger
+            pipeline_path,
+            cameras_path,
+            logger,
+            tracking_mode=tracking_mode,
         )
         if v3dt_bundle is None:
             return 1
@@ -4515,7 +4538,10 @@ def _run_main(startup_main_guard: StartupMainGuard) -> int:
         # Autogeneration mutates the camera-model artifacts deliberately; rerun
         # the complete ownership/shape/provenance contract before NvMOT sees them.
         v3dt_bundle = _validate_v3dt_tracking_guardrails(
-            pipeline_path, cameras_path, logger
+            pipeline_path,
+            cameras_path,
+            logger,
+            tracking_mode=tracking_mode,
         )
         if v3dt_bundle is None:
             return 1

@@ -131,17 +131,31 @@ def _argv_value(name: str) -> str | None:
     return None
 
 
-def _v3dt_requested() -> bool:
-    if "--v3dt" in sys.argv[1:]:
-        return True
+def _requested_tracking_mode() -> str:
     raw = _argv_value("--tracking-mode")
     if raw is None:
+        if "--v3dt" in sys.argv[1:]:
+            return "v3dt"
         raw = os.environ.get("NOESIS_TRACKING_MODE", "")
-    return str(raw or "").strip().lower() in {"v3dt", "sv3dt", "mv3dt", "3d"}
+    mode = str(raw or "").strip().lower()
+    if mode == "mv3dt":
+        return "mv3dt"
+    if mode in {"v3dt", "sv3dt", "3d"}:
+        return "v3dt"
+    if mode in {"", "auto", "2d", "baseline", "standard", "default"}:
+        return "baseline"
+    raise SystemExit(
+        "[FATAL] Unsupported DS9 tracking mode "
+        f"{raw!r}; expected baseline, v3dt, mv3dt, or auto"
+    )
+
+
+def _v3dt_requested() -> bool:
+    return _requested_tracking_mode() in {"v3dt", "mv3dt"}
 
 
 def _selected_launch_paths() -> tuple[Path, Path, bool, bool]:
-    v3dt = _v3dt_requested()
+    tracking_mode = _requested_tracking_mode()
     pipeline_raw = _argv_value("--pipeline-config")
     cameras_raw = _argv_value("--cameras-config")
     pipeline_explicit = pipeline_raw is not None
@@ -151,11 +165,18 @@ def _selected_launch_paths() -> tuple[Path, Path, bool, bool]:
     if cameras_raw is None:
         cameras_raw = os.environ.get("NOESIS_CAMERAS_CONFIG", "").strip()
     if not pipeline_raw:
-        pipeline_raw = str(DS9_ROOT / "config" / ("infer_v3dt.yaml" if v3dt else "infer.yaml"))
+        default_pipeline = (
+            "infer_mv3dt.yaml"
+            if tracking_mode == "mv3dt"
+            else "infer_v3dt.yaml"
+            if tracking_mode == "v3dt"
+            else "infer.yaml"
+        )
+        pipeline_raw = str(DS9_ROOT / "config" / default_pipeline)
     if not cameras_raw:
         cameras_raw = str(
             DS9_ROOT / "config" / "cameras_v3dt.yaml"
-            if v3dt
+            if tracking_mode in {"v3dt", "mv3dt"}
             else REPO_ROOT / "config" / "cameras.yaml"
         )
     return (
@@ -189,6 +210,14 @@ def _synthetic_stub_requested() -> bool:
 
 def main() -> int:
     _ensure_runtime_sys_path()
+    if _requested_tracking_mode() == "mv3dt":
+        print(
+            "[FATAL] MV3DT activation is deferred until Kitchen geometry and "
+            "synchronized occupied Kitchen/Family-Room overlap evidence are ready; "
+            "Living Room has no MV3DT peer edge.",
+            file=sys.stderr,
+        )
+        return 78
     _set_ds9_environment()
     pipeline_path, cameras_path, pipeline_explicit, cameras_explicit = _selected_launch_paths()
     synthetic_stub = _synthetic_stub_requested()

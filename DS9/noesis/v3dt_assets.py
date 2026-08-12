@@ -1,4 +1,4 @@
-"""Strict DS9 ownership and contract validation for the SV3DT profile."""
+"""Strict DS9 ownership and contract validation for V3DT profiles."""
 
 from __future__ import annotations
 
@@ -91,6 +91,32 @@ BODYPOSE_ENGINE = DS9_ENGINE_ROOT / "bodypose3dnet_accuracy_b1_fp16.engine"
 
 EXPECTED_CAMERA_ORDER = ("living-room", "kitchen", "family-room")
 EXPECTED_CAMINFO_NAMES = tuple(f"camInfo_{name}.yml" for name in EXPECTED_CAMERA_ORDER)
+MV3DT_PUBLISH_TOPICS = (
+    "localhost:1883;ds3d/cam0",
+    "localhost:1883;ds3d/cam1",
+    "localhost:1883;ds3d/cam2",
+)
+MV3DT_SUBSCRIBE_TOPICS = (
+    (),
+    (MV3DT_PUBLISH_TOPICS[2],),
+    (MV3DT_PUBLISH_TOPICS[1],),
+)
+MV3DT_ASSOCIATOR_CONTRACT = {
+    "multiViewAssociatorType": 1,
+    "enableLatePeerReAssoc": 1,
+    "enableIDCorrection": 1,
+    "enableSeeThrough": 1,
+    "enableMsgSync": 1,
+    "maxPeerTrackletSize": 50,
+    "recentlyActiveAge": 178,
+    "minCommonFrames4MatchScore": 2,
+    "maxPeerToPredDistance4Fusion": 1.35,
+    "minPeerVisibility4Fusion": 0.15,
+    "minPeerTrackletMatchScore": 0.48,
+    "maxTrackletMatchingTimeSearchRange": 1,
+    "maxPeerFrameDiff4NoDet": 2,
+    "communicatorInitSleepTime": 0,
+}
 EXPECTED_STREAM_SIZE = (1920, 1080)
 EXPECTED_OBJECT_MODEL_HEIGHT_M = 2.2
 EXPECTED_OBJECT_MODEL_RADIUS_M = 0.35
@@ -135,9 +161,12 @@ def derive_nvmot_tracker_engine_path(
 
 @dataclass(frozen=True)
 class V3DTAssetBundle:
+    profile: str
     pipeline_config: Path
     cameras_config: Path
     tracker_config: Path
+    pub_sub_config: Path | None
+    mqtt_config_template: Path | None
     camera_models: tuple[Path, ...]
     tracker_reid_source: Path
     tracker_reid_engine: Path
@@ -238,7 +267,10 @@ def _require_owned_reference(
 
 
 def _validate_pipeline_paths(
-    pipeline: Mapping[str, Any], pipeline_path: Path, errors: list[str]
+    pipeline: Mapping[str, Any],
+    pipeline_path: Path,
+    profile: str,
+    errors: list[str],
 ) -> None:
     sources = pipeline.get("sources")
     if not isinstance(sources, list) or len(sources) != len(EXPECTED_CAMERA_ORDER):
@@ -305,7 +337,7 @@ def _validate_pipeline_paths(
         or depth_tracking.get("enable") is not False
     ):
         errors.append(
-            "models.depth_tracking.enable must be false for the SV3DT profile"
+            "models.depth_tracking.enable must be false for the V3DT profile"
         )
 
     if pipeline.get("batch_size") != len(EXPECTED_CAMERA_ORDER):
@@ -323,6 +355,8 @@ def _validate_pipeline_paths(
         )
     if streammux.get("num-surfaces-per-frame") != 1:
         errors.append("streammux.num-surfaces-per-frame must be 1")
+    if profile == "mv3dt" and streammux.get("sync-inputs") != 1:
+        errors.append("streammux.sync-inputs must be 1 for the MV3DT profile")
 
     analytics = _mapping(pipeline.get("analytics"), label="analytics", errors=errors)
     for key in ("config-file", "stages_config"):
@@ -507,12 +541,107 @@ def _atomic_write_yaml(path: Path, payload: Mapping[str, Any]) -> None:
         temporary.unlink(missing_ok=True)
 
 
+def _validate_mv3dt_tracker_contract(
+    tracker_config: Mapping[str, Any],
+    *,
+    tracker_path: Path,
+    errors: list[str],
+) -> tuple[Path, Path]:
+    associator = _mapping(
+        tracker_config.get("MultiViewAssociator"),
+        label="MultiViewAssociator",
+        errors=errors,
+    )
+    unknown_associator_keys = set(associator) - set(MV3DT_ASSOCIATOR_CONTRACT)
+    if unknown_associator_keys:
+        errors.append(
+            "MultiViewAssociator contains unsupported DeepStream 9.1 keys: "
+            + ", ".join(sorted(str(key) for key in unknown_associator_keys))
+        )
+    for key, expected in MV3DT_ASSOCIATOR_CONTRACT.items():
+        if associator.get(key) != expected:
+            errors.append(f"MultiViewAssociator.{key} must be {expected!r}")
+
+    communicator = _mapping(
+        tracker_config.get("Communicator"), label="Communicator", errors=errors
+    )
+    allowed_communicator_keys = {
+        "communicatorType",
+        "pubSubInfoConfigPath",
+        "mqttProtoAdaptorConfigPath",
+    }
+    unknown_communicator_keys = set(communicator) - allowed_communicator_keys
+    if unknown_communicator_keys:
+        errors.append(
+            "Communicator contains unsupported DeepStream 9.1 keys: "
+            + ", ".join(sorted(str(key) for key in unknown_communicator_keys))
+        )
+    if communicator.get("communicatorType") != 2:
+        errors.append("Communicator.communicatorType must be 2 (MQTT)")
+
+    pub_sub_path = _require_owned_reference(
+        communicator.get("pubSubInfoConfigPath"),
+        owner_file=tracker_path,
+        root=DS9_V3DT_CONFIG_ROOT,
+        label="Communicator.pubSubInfoConfigPath",
+        errors=errors,
+    )
+    mqtt_template_path = _require_owned_reference(
+        communicator.get("mqttProtoAdaptorConfigPath"),
+        owner_file=tracker_path,
+        root=DS9_V3DT_CONFIG_ROOT,
+        label="Communicator.mqttProtoAdaptorConfigPath",
+        errors=errors,
+    )
+
+    try:
+        pub_sub = yaml.safe_load(pub_sub_path.read_text(encoding="utf-8")) or {}
+    except Exception as exc:
+        pub_sub = {}
+        errors.append(f"unable to parse MV3DT pub/sub config {pub_sub_path}: {exc}")
+    if not isinstance(pub_sub, Mapping):
+        pub_sub = {}
+        errors.append(f"MV3DT pub/sub config must be a mapping: {pub_sub_path}")
+    unknown_pub_sub_keys = set(pub_sub) - {
+        "pubBrokerTopicStr",
+        "subPeerBrokerTopicStrs",
+    }
+    if unknown_pub_sub_keys:
+        errors.append(
+            "MV3DT pub/sub config contains unsupported keys: "
+            + ", ".join(sorted(str(key) for key in unknown_pub_sub_keys))
+        )
+    publish_topics = tuple(
+        str(value) for value in pub_sub.get("pubBrokerTopicStr", []) or []
+    )
+    if publish_topics != MV3DT_PUBLISH_TOPICS:
+        errors.append(
+            "pubBrokerTopicStr must follow living-room, kitchen, family-room order"
+        )
+    raw_subscriptions = pub_sub.get("subPeerBrokerTopicStrs")
+    subscriptions: tuple[tuple[str, ...], ...] = ()
+    if isinstance(raw_subscriptions, list):
+        try:
+            subscriptions = tuple(
+                tuple(str(topic) for topic in topics) for topics in raw_subscriptions
+            )
+        except TypeError:
+            subscriptions = ()
+    if subscriptions != MV3DT_SUBSCRIBE_TOPICS:
+        errors.append(
+            "subPeerBrokerTopicStrs must encode only Kitchen <-> Family Room; "
+            "Living Room must have no MV3DT peer edge"
+        )
+    return pub_sub_path, mqtt_template_path
+
+
 def validate_v3dt_assets(
     pipeline_config: Path,
     *,
     cameras_config: Path | None = None,
     require_engines: bool = True,
     require_sources: bool = True,
+    expected_profile: str | None = None,
 ) -> V3DTAssetBundle:
     """Validate one DS9-owned V3DT pipeline and return its resolved asset graph."""
 
@@ -551,19 +680,29 @@ def validate_v3dt_assets(
     if cameras_path.is_file():
         _validate_cameras_config(cameras_path, errors)
 
-    profile = _mapping(pipeline.get("v3dt"), label="v3dt", errors=errors)
-    if profile.get("profile") != "sv3dt":
-        errors.append("v3dt.profile must be sv3dt")
-    if profile.get("world_frame") != "backend_world_m":
+    profile_config = _mapping(pipeline.get("v3dt"), label="v3dt", errors=errors)
+    profile = str(profile_config.get("profile") or "").strip().lower()
+    if profile not in {"sv3dt", "mv3dt"}:
+        errors.append("v3dt.profile must be sv3dt or mv3dt")
+    expected_profile_normalized = str(expected_profile or "").strip().lower()
+    if expected_profile_normalized and profile != expected_profile_normalized:
+        errors.append(
+            f"v3dt.profile is {profile!r}; expected {expected_profile_normalized}"
+        )
+    if profile == "mv3dt" and profile_config.get("activation_state") != "deferred":
+        errors.append("v3dt.activation_state must remain deferred for MV3DT")
+    if profile_config.get("world_frame") != "backend_world_m":
         errors.append(
             "v3dt.world_frame must be backend_world_m after camInfo axis restoration"
         )
-    if profile.get("caminfo_world_axes") != "xzy":
+    if profile_config.get("caminfo_world_axes") != "xzy":
         errors.append("v3dt.caminfo_world_axes must bind the locked xzy camInfo map")
-    camera_order = tuple(str(value) for value in profile.get("camera_order", []) or [])
+    camera_order = tuple(
+        str(value) for value in profile_config.get("camera_order", []) or []
+    )
     if camera_order != EXPECTED_CAMERA_ORDER:
         errors.append(f"v3dt.camera_order must be {list(EXPECTED_CAMERA_ORDER)}")
-    _validate_pipeline_paths(pipeline, pipeline_path, errors)
+    _validate_pipeline_paths(pipeline, pipeline_path, profile, errors)
 
     tracker = _mapping(pipeline.get("tracker"), label="tracker", errors=errors)
     tracker_path = _require_owned_reference(
@@ -573,10 +712,18 @@ def validate_v3dt_assets(
         label="tracker.config-file",
         errors=errors,
     )
-    ll_lib = str(tracker.get("ll-lib-file") or "")
-    if "/deepstream-9.0/" not in ll_lib or "deepstream-8.0" in ll_lib:
+    expected_tracker_name = (
+        "nvtracker_mv3dt.yaml" if profile == "mv3dt" else "nvtracker_v3dt.yaml"
+    )
+    if tracker_path.name != expected_tracker_name:
         errors.append(
-            f"tracker.ll-lib-file must bind explicitly to DeepStream 9.0: {ll_lib!r}"
+            f"{profile or 'V3DT'} tracker config must be {expected_tracker_name}, "
+            f"got {tracker_path.name}"
+        )
+    ll_lib = str(tracker.get("ll-lib-file") or "")
+    if "/deepstream-9.1/" not in ll_lib:
+        errors.append(
+            f"tracker.ll-lib-file must bind explicitly to DeepStream 9.1: {ll_lib!r}"
         )
     if (
         tracker.get("tracker-width"),
@@ -594,6 +741,21 @@ def validate_v3dt_assets(
     if not isinstance(tracker_config, Mapping):
         tracker_config = {}
         errors.append(f"V3DT tracker config must be a mapping: {tracker_path}")
+
+    pub_sub_config: Path | None = None
+    mqtt_config_template: Path | None = None
+    if profile == "mv3dt":
+        pub_sub_config, mqtt_config_template = _validate_mv3dt_tracker_contract(
+            tracker_config,
+            tracker_path=tracker_path,
+            errors=errors,
+        )
+    elif any(
+        key in tracker_config for key in ("MultiViewAssociator", "Communicator")
+    ):
+        errors.append(
+            "SV3DT tracker config must not contain MultiViewAssociator or Communicator"
+        )
 
     state_estimator = _mapping(
         tracker_config.get("StateEstimator"), label="StateEstimator", errors=errors
@@ -741,9 +903,12 @@ def validate_v3dt_assets(
             "DS9 V3DT asset contract failed:\n- " + "\n- ".join(errors)
         )
     return V3DTAssetBundle(
+        profile=profile,
         pipeline_config=pipeline_path,
         cameras_config=cameras_path,
         tracker_config=tracker_path,
+        pub_sub_config=pub_sub_config,
+        mqtt_config_template=mqtt_config_template,
         camera_models=tuple(camera_models),
         tracker_reid_source=reid_source,
         tracker_reid_engine=reid_engine,
@@ -759,6 +924,7 @@ def materialize_v3dt_tracker_config(
     output_root: Path,
     tracker_reid_engine: Path | None = None,
     bodypose_engine: Path | None = None,
+    mqtt_runtime_config: Path | None = None,
 ) -> Path:
     """Write an engine-only NvMOT config with absolute DS9-owned paths.
 
@@ -795,6 +961,38 @@ def materialize_v3dt_tracker_config(
         raise V3DTAssetError(
             "V3DT tracker config is missing projection, ReID, or pose mappings"
         )
+
+    if bundle.profile == "mv3dt":
+        communicator = payload.get("Communicator")
+        if not isinstance(communicator, dict) or bundle.pub_sub_config is None:
+            raise V3DTAssetError(
+                "MV3DT tracker materialization requires validated communicator assets"
+            )
+        if mqtt_runtime_config is None:
+            raise V3DTAssetError(
+                "MV3DT tracker materialization requires an owner-only MQTT runtime config"
+            )
+        mqtt_path = Path(mqtt_runtime_config).expanduser()
+        if not mqtt_path.is_absolute():
+            raise V3DTAssetError(
+                f"MV3DT MQTT runtime config must be absolute: {mqtt_path}"
+            )
+        _reject_symlink_ancestors(mqtt_path, label="MV3DT MQTT runtime config")
+        mqtt_path = mqtt_path.resolve(strict=False)
+        if _is_below(mqtt_path, REPO_ROOT):
+            raise V3DTAssetError(
+                f"MV3DT MQTT runtime config must remain outside the checkout: {mqtt_path}"
+            )
+        if not mqtt_path.is_file() or mqtt_path.stat().st_size <= 0:
+            raise V3DTAssetError(
+                f"MV3DT MQTT runtime config is missing or empty: {mqtt_path}"
+            )
+        if stat.S_IMODE(mqtt_path.stat().st_mode) & 0o077:
+            raise V3DTAssetError(
+                f"MV3DT MQTT runtime config must be owner-only: {mqtt_path}"
+            )
+        communicator["pubSubInfoConfigPath"] = str(bundle.pub_sub_config.resolve())
+        communicator["mqttProtoAdaptorConfigPath"] = str(mqtt_path)
 
     reid_engine = Path(tracker_reid_engine or bundle.tracker_reid_engine).resolve(
         strict=False

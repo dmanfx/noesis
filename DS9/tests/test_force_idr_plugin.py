@@ -46,9 +46,10 @@ class ForceIdrPluginSourceTests(unittest.TestCase):
             encoding="utf-8"
         )
         self.assertIn("deepstream-8.0", ds8_cmake)
-        self.assertNotIn("deepstream-9.0", ds8_cmake)
-        self.assertIn("deepstream-9.0", ds9_cmake)
+        self.assertNotIn("deepstream-9.1", ds8_cmake)
+        self.assertIn("deepstream-9.1", ds9_cmake)
         self.assertNotIn("deepstream-8.0", ds9_cmake)
+        self.assertIn("NVDS_VERSION_MINOR", ds9_cmake)
 
 
 class ForceIdrPluginRegistrationTests(unittest.TestCase):

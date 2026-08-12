@@ -69,7 +69,7 @@ def _load_nvds_meta() -> Optional[ctypes.CDLL]:
         if found:
             candidates.append(found)
     # Common DeepStream install locations.
-    ds_home = str(os.environ.get("NOESIS_DEEPSTREAM_HOME", "/opt/nvidia/deepstream/deepstream-9.0") or "").rstrip("/")
+    ds_home = str(os.environ.get("NOESIS_DEEPSTREAM_HOME", "/opt/nvidia/deepstream/deepstream-9.1") or "").rstrip("/")
     candidates.extend(
         [
             f"{ds_home}/lib/libnvdsgst_meta.so",

@@ -163,7 +163,7 @@ def build_tracker_engine(
         }
     deepstream_home = Path(
         os.environ.get(
-            "NOESIS_DEEPSTREAM_HOME", "/opt/nvidia/deepstream/deepstream-9.0"
+            "NOESIS_DEEPSTREAM_HOME", "/opt/nvidia/deepstream/deepstream-9.1"
         )
     ).expanduser()
     tracker_library = _tracker_library(deepstream_home)

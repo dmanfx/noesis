@@ -140,7 +140,7 @@ models:
 
 tracker:
   config-file: config/nvtracker.yaml
-  ll-lib-file: /opt/nvidia/deepstream/deepstream-9.0/lib/libnvds_nvmultiobjecttracker.so
+  ll-lib-file: /opt/nvidia/deepstream/deepstream-9.1/lib/libnvds_nvmultiobjecttracker.so
 
 analytics:
   enable: true

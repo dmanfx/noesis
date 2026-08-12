@@ -193,6 +193,14 @@ class EngineBuildSpecTests(unittest.TestCase):
     def test_wholebody49_cpp_source_is_fail_closed_and_exact(self) -> None:
         module = _load_rebuild_module()
         source = module.WHOLEBODY_BUILDER_SOURCE.read_text(encoding="utf-8")
+        for exact_version_assertion in (
+            "NV_TENSORRT_MAJOR == 10",
+            "NV_TENSORRT_MINOR == 16",
+            "NV_TENSORRT_PATCH == 0",
+            "NV_TENSORRT_BUILD == 72",
+            "TensorRT 10.16.0.72",
+        ):
+            self.assertIn(exact_version_assertion, source)
         for token in (
             "createNetworkV2(0U)",
             "parser->parse(onnx.bytes.data(), onnx.bytes.size()",

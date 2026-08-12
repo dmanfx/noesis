@@ -131,7 +131,7 @@ models:
 
 tracker:
   config-file: DS9/config/v3dt/nvtracker_v3dt.yaml
-  ll-lib-file: /opt/nvidia/deepstream/deepstream-9.0/lib/libnvds_nvmultiobjecttracker.so
+  ll-lib-file: /opt/nvidia/deepstream/deepstream-9.1/lib/libnvds_nvmultiobjecttracker.so
   tracker-width: 1920
   tracker-height: 1080
 

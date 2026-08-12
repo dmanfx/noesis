@@ -1,5 +1,5 @@
-DS_HOME ?= /opt/nvidia/deepstream/deepstream-9.0
-CUDA_HOME ?= /usr/local/cuda-13.1
+DS_HOME ?= /opt/nvidia/deepstream/deepstream-9.1
+CUDA_HOME ?= /usr/local/cuda-13.2
 OUT_DIR ?= .
 
 CXX := g++
@@ -16,6 +16,7 @@ all: $(TARGET)
 check-ds9:
 	@test -f "$(NVDS_VERSION_H)" || (echo "[FAIL] Missing DS9 header: $(NVDS_VERSION_H)" >&2; exit 1)
 	@grep -Eq 'NVDS_VERSION_MAJOR[[:space:]]+9|NVDS_VERSION[[:space:]].*9' "$(NVDS_VERSION_H)" || (echo "[FAIL] DS_HOME does not identify as DeepStream 9: $(DS_HOME)" >&2; exit 1)
+	@grep -Eq 'NVDS_VERSION_MINOR[[:space:]]+1' "$(NVDS_VERSION_H)" || (echo "[FAIL] DS_HOME does not identify as DeepStream 9.1: $(DS_HOME)" >&2; exit 1)
 
 $(TARGET): check-ds9 $(SOURCES)
 	@mkdir -p "$(OUT_DIR)"

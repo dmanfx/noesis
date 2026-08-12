@@ -25,9 +25,9 @@
 #include <vector>
 
 static_assert(NV_TENSORRT_MAJOR == 10, "Wholebody49 builder requires TensorRT 10");
-static_assert(NV_TENSORRT_MINOR == 14, "Wholebody49 builder requires TensorRT 10.14");
-static_assert(NV_TENSORRT_PATCH == 1, "Wholebody49 builder requires TensorRT 10.14.1");
-static_assert(NV_TENSORRT_BUILD == 48, "Wholebody49 builder requires TensorRT 10.14.1.48");
+static_assert(NV_TENSORRT_MINOR == 16, "Wholebody49 builder requires TensorRT 10.16");
+static_assert(NV_TENSORRT_PATCH == 0, "Wholebody49 builder requires TensorRT 10.16.0");
+static_assert(NV_TENSORRT_BUILD == 72, "Wholebody49 builder requires TensorRT 10.16.0.72");
 
 namespace {
 

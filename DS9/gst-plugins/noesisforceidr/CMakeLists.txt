@@ -10,16 +10,26 @@ pkg_check_modules(GST REQUIRED gstreamer-1.0 gstreamer-base-1.0)
 
 set(DEEPSTREAM_HOME "$ENV{NOESIS_DEEPSTREAM_HOME}" CACHE PATH "DeepStream SDK root")
 if(NOT DEEPSTREAM_HOME)
-  set(DEEPSTREAM_HOME "/opt/nvidia/deepstream/deepstream-9.0")
+  set(DEEPSTREAM_HOME "/opt/nvidia/deepstream/deepstream-9.1")
 endif()
 
+set(NVDS_VERSION_HEADER "${DEEPSTREAM_HOME}/sources/includes/nvds_version.h")
 set(NV_EVENT_HEADER "${DEEPSTREAM_HOME}/sources/includes/gst-nvcustomevent.h")
 set(NV_EVENT_LIBRARY "${DEEPSTREAM_HOME}/lib/libgstnvcustomhelper.so")
+if(NOT EXISTS "${NVDS_VERSION_HEADER}")
+  message(FATAL_ERROR "Missing DeepStream version header: ${NVDS_VERSION_HEADER}")
+endif()
 if(NOT EXISTS "${NV_EVENT_HEADER}")
   message(FATAL_ERROR "Missing NVIDIA custom-event header: ${NV_EVENT_HEADER}")
 endif()
 if(NOT EXISTS "${NV_EVENT_LIBRARY}")
   message(FATAL_ERROR "Missing NVIDIA custom-event library: ${NV_EVENT_LIBRARY}")
+endif()
+file(READ "${NVDS_VERSION_HEADER}" NVDS_VERSION_CONTENTS)
+if(NOT NVDS_VERSION_CONTENTS MATCHES "#[ \t]*define[ \t]+NVDS_VERSION_MAJOR[ \t]+9([^0-9]|$)" OR
+   NOT NVDS_VERSION_CONTENTS MATCHES "#[ \t]*define[ \t]+NVDS_VERSION_MINOR[ \t]+1([^0-9]|$)")
+  message(FATAL_ERROR
+    "DS9 noesisforceidr must be built against DeepStream 9.1: ${DEEPSTREAM_HOME}")
 endif()
 
 add_library(gstnoesisforceidr SHARED gstnoesisforceidr.cpp)

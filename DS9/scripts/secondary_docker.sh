@@ -3,7 +3,7 @@ set -euo pipefail
 
 umask 027
 
-IMAGE="${NOESIS_DS9_IMAGE:-nvcr.io/nvidia/deepstream:9.0-triton-multiarch}"
+IMAGE="${NOESIS_DS9_IMAGE:-nvcr.io/nvidia/deepstream:9.1-triton-multiarch}"
 ROOT_RAW="${NOESIS_DS9_DOCKER_ROOT:-}"
 
 if [[ -z "${ROOT_RAW}" ]]; then

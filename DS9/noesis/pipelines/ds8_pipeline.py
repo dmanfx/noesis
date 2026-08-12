@@ -1373,7 +1373,7 @@ def build_pipeline(yaml_path: str | Path) -> DS8Pipeline:
             )
         )
     # Ensure ll-lib-file is provided when using NvDCF.
-    ds_home = str(os.environ.get("NOESIS_DEEPSTREAM_HOME", "/opt/nvidia/deepstream/deepstream-9.0") or "").rstrip("/")
+    ds_home = str(os.environ.get("NOESIS_DEEPSTREAM_HOME", "/opt/nvidia/deepstream/deepstream-9.1") or "").rstrip("/")
     tracker_cfg.setdefault(
         "ll-lib-file",
         f"{ds_home}/lib/libnvds_nvmultiobjecttracker.so",

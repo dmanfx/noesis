@@ -51,13 +51,13 @@ from noesis.reid_swin_profile import (  # noqa: E402
 from noesis.v3dt_assets import V3DTAssetError, validate_v3dt_assets  # noqa: E402
 
 DS9_HOME = Path(
-    os.environ.get("NOESIS_DEEPSTREAM_HOME", "/opt/nvidia/deepstream/deepstream-9.0")
+    os.environ.get("NOESIS_DEEPSTREAM_HOME", "/opt/nvidia/deepstream/deepstream-9.1")
 )
 DS9_GST_PLUGIN_DIR = Path(
     os.environ.get("NOESIS_GST_PLUGIN_DIR", DS9_ROOT / "gst-plugins")
 )
-DS9_MIN_DRIVER_VERSION = (590, 48, 1)
-DS9_MIN_DRIVER_LABEL = "590.48.01"
+DS9_MIN_DRIVER_VERSION = (595, 58, 3)
+DS9_MIN_DRIVER_LABEL = "595.58.03"
 DS9_OWNED_GST_PLUGINS = {
     "nvdsroiexclude": "libgstnvdsroiexclude.so",
     "noesisforceidr": "libgstnoesisforceidr.so",
@@ -231,8 +231,8 @@ def _deepstream_version_ok() -> bool:
     if "deepstream-8.0" in str(resolved):
         _fail(f"DeepStream home resolves to DS8, not DS9: {resolved}")
         return False
-    if "9.0" not in DS9_HOME.name and "9.0" not in str(resolved):
-        _fail(f"DeepStream home is not explicitly DS9: {DS9_HOME} -> {resolved}")
+    if "9.1" not in DS9_HOME.name and "9.1" not in str(resolved):
+        _fail(f"DeepStream home is not explicitly DS9.1: {DS9_HOME} -> {resolved}")
         return False
     _ok(f"DeepStream home: {DS9_HOME}")
     return True
@@ -549,8 +549,8 @@ def _config_assets_ok(config_path: Path, cameras_path: Path) -> bool:
 
     tracker = cfg.get("tracker") if isinstance(cfg.get("tracker"), dict) else {}
     tracker_lib = str(tracker.get("ll-lib-file", "") or "")
-    if "deepstream-8.0" in tracker_lib:
-        _fail(f"tracker.ll-lib-file points to DS8: {tracker_lib}")
+    if "/deepstream-9.1/" not in tracker_lib:
+        _fail(f"tracker.ll-lib-file must bind explicitly to DeepStream 9.1: {tracker_lib}")
         ok = False
 
     gst_plugin = DS9_GST_PLUGIN_DIR / "libgstnvdsroiexclude.so"

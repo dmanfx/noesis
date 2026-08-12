@@ -1,9 +1,9 @@
-FROM nvcr.io/nvidia/deepstream:9.0-triton-multiarch@sha256:2e45070ad134b9ab2caa4a97ba4d52fa8744a4f0db30900bd92828d51425a69a
+FROM nvcr.io/nvidia/deepstream:9.1-triton-multiarch@sha256:f6fa0247da9290979cbb05749e7da9435d089c93db7c4dcfe85ba2488b5f4994
 
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 
 LABEL org.opencontainers.image.title="Noesis DS9 development/runtime"
-LABEL org.opencontainers.image.base.digest="sha256:2e45070ad134b9ab2caa4a97ba4d52fa8744a4f0db30900bd92828d51425a69a"
+LABEL org.opencontainers.image.base.digest="sha256:f6fa0247da9290979cbb05749e7da9435d089c93db7c4dcfe85ba2488b5f4994"
 LABEL org.opencontainers.image.source="Noesis DS9/docker/Dockerfile"
 
 ENV DEBIAN_FRONTEND=noninteractive \
@@ -41,8 +41,11 @@ RUN apt-get update \
 COPY requirements.lock.txt /opt/noesis/requirements.lock.txt
 
 RUN python3 -m pip install --no-cache-dir -r /opt/noesis/requirements.lock.txt \
+    && python3 -m pip install --no-cache-dir \
+      /opt/nvidia/deepstream/deepstream/service-maker/python/pyservicemaker*.whl \
     && python3 -m pip check \
-    && test "$(python3 -c 'import pybind11; print(pybind11.__version__)')" = "2.12.0"
+    && test "$(python3 -c 'import pybind11; print(pybind11.__version__)')" = "2.12.0" \
+    && python3 -c 'import pyservicemaker; assert pyservicemaker.__file__'
 
 RUN GST_REGISTRY=/tmp/noesis-ds9-gst-registry.bin \
       gst-inspect-1.0 nice >/dev/null \

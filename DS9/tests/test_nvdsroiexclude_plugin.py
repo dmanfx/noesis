@@ -305,6 +305,7 @@ class RoiExcludePluginSourceTests(unittest.TestCase):
         self.assertIn('NOESIS_DEEPSTREAM_MAJOR="9"', ds9_cmake)
         self.assertNotIn('NOESIS_DEEPSTREAM_MAJOR="8"', ds9_cmake)
         self.assertIn('NVDS_VERSION_MAJOR[ \\t]+9', ds9_cmake)
+        self.assertIn('NVDS_VERSION_MINOR[ \\t]+1', ds9_cmake)
         self.assertIn("-Werror", ds9_cmake)
 
         ds8_build = (DS8_PLUGIN_ROOT / "build_nvdsroiexclude.sh").read_text(
@@ -319,7 +320,7 @@ class RoiExcludePluginSourceTests(unittest.TestCase):
 
     def test_cmake_rejects_cross_major_sdk_roots(self) -> None:
         ds8_home = Path("/opt/nvidia/deepstream/deepstream-8.0")
-        ds9_home = Path("/opt/nvidia/deepstream/deepstream-9.0")
+        ds9_home = Path("/opt/nvidia/deepstream/deepstream-9.1")
         if not ds8_home.is_dir() or not ds9_home.is_dir():
             self.skipTest("both DS8 and DS9 SDK roots are required for cross-major guard")
 

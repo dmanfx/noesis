@@ -1,7 +1,6 @@
 #!/usr/bin/env bash
 # Shared DS9 build helpers. These helpers intentionally refuse to use the
-# active /opt/nvidia/deepstream/deepstream symlink because it currently points at
-# DS8 on this machine.
+# mutable /opt/nvidia/deepstream/deepstream symlink.
 
 set -euo pipefail
 
@@ -26,7 +25,7 @@ ds9_realpath() {
 }
 
 ds9_require_deepstream_home() {
-  local candidate="${DS9_DEEPSTREAM_HOME:-/opt/nvidia/deepstream/deepstream-9.0}"
+  local candidate="${DS9_DEEPSTREAM_HOME:-/opt/nvidia/deepstream/deepstream-9.1}"
   if [[ ! -d "${candidate}" ]]; then
     ds9_fail "DeepStream 9 root not found: ${candidate}. Set DS9_DEEPSTREAM_HOME to an installed DS9 root."
   fi
@@ -47,26 +46,27 @@ ds9_require_deepstream_home() {
   [[ -f "${custom_impl_h}" ]] || ds9_fail "Missing nvinfer custom parser header: ${custom_impl_h}"
   [[ -f "${metadata_hpp}" ]] || ds9_fail "Missing Service Maker metadata header: ${metadata_hpp}"
 
-  if ! grep -Eq 'NVDS_VERSION_MAJOR[[:space:]]+9|NVDS_VERSION[[:space:]].*9' "${version_h}"; then
-    ds9_fail "DeepStream root does not identify as major version 9: ${resolved}"
+  if ! grep -Eq 'NVDS_VERSION_MAJOR[[:space:]]+9' "${version_h}" \
+      || ! grep -Eq 'NVDS_VERSION_MINOR[[:space:]]+1' "${version_h}"; then
+    ds9_fail "DeepStream root does not identify as version 9.1: ${resolved}"
   fi
 
   printf '%s\n' "${resolved}"
 }
 
 ds9_require_cuda_home() {
-  local candidate="${DS9_CUDA_HOME:-/usr/local/cuda-13.1}"
+  local candidate="${DS9_CUDA_HOME:-/usr/local/cuda-13.2}"
   if [[ ! -d "${candidate}" && -d /usr/local/cuda ]]; then
     candidate="/usr/local/cuda"
   fi
-  [[ -d "${candidate}" ]] || ds9_fail "CUDA root not found. Set DS9_CUDA_HOME to CUDA 13.1."
+  [[ -d "${candidate}" ]] || ds9_fail "CUDA root not found. Set DS9_CUDA_HOME to CUDA 13.2."
   [[ -f "${candidate}/include/cuda_runtime_api.h" ]] || ds9_fail "Missing CUDA headers under ${candidate}"
   local resolved version_file
   resolved="$(ds9_realpath "${candidate}")"
   version_file="${resolved}/version.json"
-  if [[ -f "${version_file}" ]] && ! grep -Eq '"version"[[:space:]]*:[[:space:]]*"13\.1' "${version_file}"; then
+  if [[ -f "${version_file}" ]] && ! grep -Eq '"version"[[:space:]]*:[[:space:]]*"13\.2' "${version_file}"; then
     if [[ -z "${DS9_ALLOW_CUDA_MISMATCH:-}" ]]; then
-      ds9_fail "CUDA root does not identify as CUDA 13.1: ${resolved}. Set DS9_ALLOW_CUDA_MISMATCH=1 only for investigation."
+      ds9_fail "CUDA root does not identify as CUDA 13.2: ${resolved}. Set DS9_ALLOW_CUDA_MISMATCH=1 only for investigation."
     fi
   fi
   printf '%s\n' "${resolved}"

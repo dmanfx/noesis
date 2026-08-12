@@ -10,7 +10,7 @@ pkg_check_modules(GST REQUIRED gstreamer-1.0 gstreamer-base-1.0)
 
 set(DEEPSTREAM_HOME "$ENV{NOESIS_DEEPSTREAM_HOME}" CACHE PATH "DeepStream 9 SDK root")
 if(NOT DEEPSTREAM_HOME)
-  set(DEEPSTREAM_HOME "/opt/nvidia/deepstream/deepstream-9.0")
+  set(DEEPSTREAM_HOME "/opt/nvidia/deepstream/deepstream-9.1")
 endif()
 if(NOT IS_DIRECTORY "${DEEPSTREAM_HOME}")
   message(FATAL_ERROR "DeepStream 9 SDK root does not exist: ${DEEPSTREAM_HOME}")
@@ -35,9 +35,10 @@ foreach(REQUIRED_PATH IN ITEMS
 endforeach()
 
 file(READ "${NVDS_VERSION_HEADER}" NVDS_VERSION_CONTENTS)
-if(NOT NVDS_VERSION_CONTENTS MATCHES "#[ \t]*define[ \t]+NVDS_VERSION_MAJOR[ \t]+9([^0-9]|$)")
+if(NOT NVDS_VERSION_CONTENTS MATCHES "#[ \t]*define[ \t]+NVDS_VERSION_MAJOR[ \t]+9([^0-9]|$)" OR
+   NOT NVDS_VERSION_CONTENTS MATCHES "#[ \t]*define[ \t]+NVDS_VERSION_MINOR[ \t]+1([^0-9]|$)")
   message(FATAL_ERROR
-    "DS9 nvdsroiexclude must be built against DeepStream major 9: ${DEEPSTREAM_HOME_REAL}")
+    "DS9 nvdsroiexclude must be built against DeepStream 9.1: ${DEEPSTREAM_HOME_REAL}")
 endif()
 
 add_library(gstnvdsroiexclude SHARED gstnvdsroiexclude.cpp)

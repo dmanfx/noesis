@@ -3,7 +3,7 @@ set -euo pipefail
 
 PLUGIN_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 DS9_ROOT="$(cd -- "${PLUGIN_ROOT}/.." && pwd)"
-DS_HOME="${NOESIS_DEEPSTREAM_HOME:-/opt/nvidia/deepstream/deepstream-9.0}"
+DS_HOME="${NOESIS_DEEPSTREAM_HOME:-/opt/nvidia/deepstream/deepstream-9.1}"
 BUILD_DIR="${NOESIS_FORCE_IDR_BUILD_DIR:-${DS9_ROOT}/build/noesisforceidr-ds9}"
 OUT_DIR="${PLUGIN_ROOT}"
 
@@ -15,8 +15,8 @@ if [[ ! -f "${DS_HOME}/lib/libgstnvcustomhelper.so" ]]; then
   echo "[FAIL] Missing NVIDIA custom-event library under ${DS_HOME}" >&2
   exit 1
 fi
-if [[ "$(readlink -f -- "${DS_HOME}")" != *"deepstream-9.0" ]]; then
-  echo "[FAIL] DS9 plugin must be built against deepstream-9.0: ${DS_HOME}" >&2
+if [[ "$(readlink -f -- "${DS_HOME}")" != *"deepstream-9.1" ]]; then
+  echo "[FAIL] DS9 plugin must be built against deepstream-9.1: ${DS_HOME}" >&2
   exit 1
 fi
 

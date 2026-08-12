@@ -218,7 +218,7 @@
       },
       "maintenance_build": {
         "builder": "noesis.ds9.wholebody49_builder.v1",
-        "builder_source_sha256": "2d751f52fc095bd90e418e048fad8296653875d43b8a18871d5b0a7c7938dc67",
+        "builder_source_sha256": "c5f979c5669f94bfb9fe2a02773e851794c26a1611c58fc5cb1fa4474ef922ee",
         "precision": "fp16",
         "network_mode": "explicit_batch_trt10_default",
         "builder_optimization_level": 0,
@@ -254,7 +254,7 @@
       },
       "maintenance_build": {
         "builder": "noesis.ds9.wholebody49_builder.v1",
-        "builder_source_sha256": "2d751f52fc095bd90e418e048fad8296653875d43b8a18871d5b0a7c7938dc67",
+        "builder_source_sha256": "c5f979c5669f94bfb9fe2a02773e851794c26a1611c58fc5cb1fa4474ef922ee",
         "precision": "fp16",
         "network_mode": "explicit_batch_trt10_default",
         "builder_optimization_level": 3,

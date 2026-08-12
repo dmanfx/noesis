@@ -141,7 +141,12 @@ fi
 
 if rg -n "/opt/nvidia/deepstream/deepstream/lib" "${static_prep_paths[@]}" -g '!**/archive/**' >/tmp/ds9_active_symlink_refs.txt; then
   cat /tmp/ds9_active_symlink_refs.txt >&2
-  fail "Active DS9 prep configs bind to the mutable DeepStream symlink instead of deepstream-9.0"
+  fail "Active DS9 prep configs bind to the mutable DeepStream symlink instead of deepstream-9.1"
+fi
+
+if rg -n "deepstream-9\\.0|cuda-13\\.1" "${static_prep_paths[@]}" -g '!**/archive/**' >/tmp/ds9_stale_toolchain_refs.txt; then
+  cat /tmp/ds9_stale_toolchain_refs.txt >&2
+  fail "Active DS9 prep configs still reference the DeepStream 9.0/CUDA 13.1 toolchain"
 fi
 
 rg -q "NOESIS_DS9_ALLOW_PYDS_COMPAT" DS9/noesis/pipelines/hooks.py \
@@ -236,8 +241,10 @@ for raw in (
     ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
 PY
 
-for mf in DS9/pipelines/nvdsinfer_yolo26_seg/Makefile DS9/pipelines/nvdsinfer_yolo11_seg/Makefile DS9/pipelines/nvdsinfer_yolo_detect/Makefile DS9/pipelines/nvdsinfer_rfdetr/Makefile DS9/pipelines/nvdsinfer_rfdetr_seg/Makefile DS9/pipelines/nvdsinfer_deimv2_wholebody49/Makefile; do
-  rg -q "deepstream-9.0" "${mf}" || fail "${mf} does not default to deepstream-9.0"
+for mf in DS9/pipelines/nvdsinfer_yolo26_seg/Makefile DS9/pipelines/nvdsinfer_yolo11_seg/Makefile DS9/pipelines/nvdsinfer_yolo_detect/Makefile DS9/pipelines/nvdsinfer_rfdetr/Makefile DS9/pipelines/nvdsinfer_rfdetr_seg/Makefile DS9/pipelines/nvdsinfer_rfdetr_keypoint/Makefile DS9/pipelines/nvdsinfer_deimv2_wholebody49/Makefile; do
+  rg -q "deepstream-9.1" "${mf}" || fail "${mf} does not default to deepstream-9.1"
+  rg -q "cuda-13.2" "${mf}" || fail "${mf} does not default to cuda-13.2"
+  rg -q "NVDS_VERSION_MINOR.*1" "${mf}" || fail "${mf} does not reject pre-9.1 headers"
   rg -q "check-ds9" "${mf}" || fail "${mf} missing check-ds9 guard"
 done
 

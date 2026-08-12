@@ -1,6 +1,8 @@
 # DS8 Migration Checklist – `noesis/pipelines/hooks.py`
 
-Tasks to ensure all metadata interactions (intrinsics, MapAnything, analytics telemetry, exclusion pruning) are DS8-native and cover all functionality previously provided by DS7 pad probes.
+Tasks to ensure metadata hooks (intrinsics, MapAnything, analytics telemetry)
+and the separate pre-tracker native exclusion element are DS8-native and cover
+all functionality previously provided by DS7 pad probes.
 
 ## 1. Intrinsics (Calibration Bundle; optional per-frame user meta)
 
@@ -22,6 +24,11 @@ Tasks to ensure all metadata interactions (intrinsics, MapAnything, analytics te
   _2025-12-15 (Codex): Fixed DS8 batched SGIE output handling by slicing tensors by `batch_id` per frame before postprocess/storage (prevents cross-camera mixing); validated via `python3 scripts/ma_depth_rpc_smoke_test.py` (cache-first + fresh)._
   _2025-12-16 (Codex): Added letterbox-aware alignment for MapAnything depth/conf/mask to streammux resolution before storage (undoes maintain-aspect-ratio padding); shape-checked via `_align_to_frame` (294×518 → 1080×1920) to keep floorplan coordinates in camera space._
   _2025-12-20 (Codex): Restored MapAnything postprocess to the canonical DS8 `frame_items → tensor_items → as_tensor_output → get_layers()` flow (as it was working previously)._
+  _2026-07-11 (Codex): Kept the validated DS8 tensor-selection path unchanged and corrected the DS9 successor independently after live evidence showed its MapAnything output wrapper exposing only sibling DAv2 UID 5. DS9 now has one owned native selector requiring one raw UID 2 record and exact per-frame depth/conf/mask shape, followed by bounded async CPU-edge postprocessing. Python validates batch/source identity but never double-slices because DS9 nvinfer already offsets attached frame pointers; the required metadata-lifetime copy is fixed at 1,827,504 bytes, timed, and releases the GIL. Across DS8, root V3DT, and DS9, runtime ownership now closes capture admission, preserves accepted jobs across gate closure, drains FIFO work, surfaces final-job poison, and joins the non-daemon worker before storage teardown. DS9 attachment failure is fatal; generic/wrapper alternatives, ambiguity, queue saturation, and unresolved worker ownership are rejected on its exact path. Validation: focused DS8/V3DT and DS9 Python/source/lifecycle contracts, DS9-header syntax, and Ruff checks; DS9 native rebuild and fresh live RPC/floorplan acceptance remain pending._
+  _2026-07-11 (Codex): A real successor launch exposed timestamp-based native freshness as invalid for release worktrees: all reviewed source/output hashes matched while checkout mtimes made one binary appear stale. DS9 now content-attests all six extensions before import using strict manifest/source/ABI/output and stable-file checks; DS8 remains unchanged because it has no DS9 manifest authority. An isolated exact-image no-GPU rebuild/import/linkage smoke passed all six APIs, reproduced five binaries exactly, and showed expected NVCC salt nondeterminism for the CUDA tensor extension. Fresh live runtime acceptance remains pending._
+  _2026-07-11 (Codex): Made transactional storage commit a prerequisite for `DepthResult` across DS8, protected V3DT, and DS9. Each worker waits for its exact `WriteHandle` receipt using `NOESIS_DEPTH_STORE_COMMIT_TIMEOUT_S` (30s default, finite, clamped 0.1–60s); only the committed path can be recorded or published. Timeout/write failure poisons the worker, signals runtime shutdown, and publishes nothing. Removed the `NOESIS_DEPTH_STORE_ENABLED=0` / `memory://` bypass and retained no direct-write fallback. Validation: focused lifecycle/storage tests cover exact store-wait-record-publish order, retired-disable behavior, timeout poison/callback/no-publication, and shared timeout parsing._
+  _2026-07-12 (Codex): Added mandatory DS9 MapAnything engine functional admission after a loadable FP16 plan produced NaN depth, zero masks, and confidence sentinels. The correctness-first FP32 candidate must run one pinned batch-three inference and seal engine/fixture/command/platform/tensor/count/coverage/distribution/batch evidence before atomic installation; the host finalizer and realization reconciler independently revalidate it. Adversarial CPU tests reject deserialization-only, non-finite, sentinel, zero-mask, drifted, divergent-batch, receipt, and hash failures without replacing the prior engine. No canonical engine was built or installed by this source change._
+  _2026-07-12 (Codex): Executed the guarded DS9 MapAnything transaction after sealing an immutable pre-transition checkpoint. Transaction `20260712T052425739603Z` installed the 3,883,865,652-byte FP32 engine at SHA-256 `eabc1169c7d725ed7cff171ed54c402c4282fdcf23b87a58f4e41a95fe23ecc8`; one pinned batch-three inference produced finite positive depth/confidence and 99.9954% mask coverage, both candidate and installed paths deserialized, and 8,038 NVML samples observed a 4,655 MiB peak with a 29.100129 ms maximum gap. Final realization `6fab7d456c031490f640ee2c3ce5a38922a96ed86a965020ca3051820306dce4` passes canonical, V3DT, and Wholebody49 file/provenance gates. Fresh N/N-camera runtime depth/floorplan evidence remains required._
 
 ## 2b. Pose Feature Hook (`attach_pose_feature_hook`)
 
@@ -69,6 +76,25 @@ Tasks to ensure all metadata interactions (intrinsics, MapAnything, analytics te
     _2025-12-21 (Codex): StableIDManager consumes OSNet ReID SGIE embeddings (`models.reid`, `gie_id=3`) via Service Maker object tensor meta (`ObjectMetadata.tensor_items → as_tensor_output → get_layers`) and assigns `stable_id` (people-only, `class_id==0`). Embedding decode uses a manual DLPack→cudaMemcpy (D2H) path (no torch `from_dlpack`) to avoid a native double-free/segfault; validated with `python3 scripts/reid_stable_id_smoke_test.py --pipeline-config config/infer_smoke_reid.yaml`, a 70s RTSP run (`config/infer_reid_rtsp_min.yaml`), and a MapAnything depth burst (`--depth-enable-seconds 20` on `config/infer.yaml`)._
     _2026-01-31 (Codex): Filtered ReID tensor extraction by SGIE `unique_id` to avoid selecting pose tensors and eliminate stable_id embedding shape mismatches (verified in short DS8 run)._
     _2026-02-01 (Codex): StableIDManager consumes pose feature meta (`NOESIS.POSE_FEATURES`) as a gated secondary similarity signal (pose-only fallback when embeddings are missing) with bounded in‑RAM pose galleries; analytics hook extracts pose JSON via `noesis_pose_meta_ext.extract_pose_features` and passes pose vectors into `StableIDManager.update` (validated with `pytest tests/test_stable_id_manager_pose.py`)._
+    _2026-07-10 (Codex): Identity-v2 now receives one complete detached
+    `PrimitiveFrameObservation` batch per source frame in canonical DS8, V3DT,
+    and DS9 hooks. One shared process-owned coordinator performs joint open-set
+    assignment, server evidence caching, visitor lifecycle, and exact proof-only
+    overlap permits; transient SDK object wrappers remain one-pass and
+    adapter-local. Focused hook/runtime/parity tests passed without a live restart._
+    _2026-07-11 (Codex): Occupied DS9 replay hardening now treats an accepted
+    tracker-local subject as immutable until the complete tracker state expires;
+    different candidates are hard-masked but the locked candidate must still
+    pass every open-set gate. The shared v2 adapter also replaces stale legacy
+    `embedding_present` diagnostics with exact current-frame truth and mirrors
+    the persisted provenance triad to canonical observation input. DS9 StableID
+    construction now applies and verifies the same household no-auto-merge
+    policy as DS8. Focused coordinator/service/parity tests passed._
+    _2026-07-10 (Codex): Canonical DS8, V3DT, and DS9 adapters now read both
+    `models.reid.layer` and `models.reid.embedding_dim` and pass exact
+    `gie_id=3`, `fc_pred`, `256`, normalization=true arguments to the native
+    bridge. Product-only layer/dimension fields are stripped before nvinfer
+    property application. Characterization and pipeline regressions passed._
     _2025-12-20 (Codex): (Superseded) Explored sourcing embeddings from nvtracker ReID meta (`NVDS_TRACKER_OBJ_REID_META`); abandoned due to Service Maker↔pyds bridging instability and unreliable access in-process._
   - [x] Feed per-frame StableID co-presence into `StableIDManager.observe_copresence` for alias guardrails.
     _2026-02-04 (Codex): Added `observe_copresence` after populating `present_stable_ids` in `_AnalyticsTelemetryProcessor.handle_frame_ds8` so recent co-presence can block alias merges; validation pending (exercise via `tests/test_reid_api.py` or `scripts/reid_alias_tool.py`)._
@@ -82,28 +108,64 @@ Tasks to ensure all metadata interactions (intrinsics, MapAnything, analytics te
     _2026-01-22 (Codex): Locked SV3DT baseline uses `NOESIS_V3DT_CAMINFO_INVERT_E=0` with `projectionMatrix_3x4_w2p`; `INVERT_E=1` is no longer the default for current calibrations and should only be used when `E` is camera->world. See `plans/DS8/v3dt/status_summary_2026-01-22_locked_baseline.md`._
     _2026-01-12 (Codex): Added optional V3DT diagnostics logging and ensured DS8 telemetry copies `bbox3d`/`velocity3d`/`visibility` into the public track dict while preserving stable-id-only UI contracts._
     _2026-01-23 (Codex): Added tracking_mode plumbing + guardrails in hooks: V3DT meta/world only in v3dt mode, BEV footpoint uses image_base/image_foot only in v3dt mode, and mismatched tracker config logs a warning (no validation run)._
+    _2026-07-11 (Codex): Superseded the historical best-effort/camera-local interpretation. DS8, the protected V3DT reimplementation, and DS9 now derive the locked-profile bbox ground endpoint, apply the exact `xzy` tracker-to-world map, and publish Y-up `backend_world_m`. Raw bbox/velocity stay diagnostic; native `image_foot` and opposite-endpoint `image_base` remain distinct; missing axis/bbox or wrong-frame seeded world fails closed. Rebuilt and import/API-smoked both V3DT native bridges against their own SDK majors without launching a runtime or exposing a GPU device. Focused root V3DT tests passed (41); fresh occupied runtime evidence remains pending._
 - [x] Redesign the baseline world estimator so pose remains the strongest person-anchor source and DAv2 becomes a concurrent range observation inside the same per-track world-state update.
   _2026-03-12 (Codex): `_AnalyticsTelemetryProcessor._augment_track_with_world(...)` now keeps the existing pose-first anchor chain, projects the same anchor pixel to both floor and DAv2-derived world observations, fuses them into one filtered `track.world` update, and emits the new per-track `world_source` values (`pose_depth_fused`, `pose_floor_only`, `gravity_drop`, `anchor_hold`). The estimator fails closed when neither current observation nor short hold is valid, and no bbox-bottom world path was reintroduced. Validation: `python3 -m pytest tests/test_analytics_telemetry_hook.py -q`._
   _2026-03-15 (Codex): Tuned the fused estimator for live room tracking by lowering the far-anchor support floor, weighting depth from anchor-band support (`anchor_sample_count` / `anchor_valid_fraction`), giving trusted fused updates a modest alpha bump, and shortening `anchor_hold` to `0.40s` to prevent stale world points from lingering in BEV. Validation: `python3 -m pytest tests/test_analytics_telemetry_hook.py -q` plus live BEV/WebSocket metrics collected over settled family-room windows._
   _2026-03-16 (Codex): Disabled backend constant-velocity extrapolation in `_predict_world_state()` / `_update_world_state()` so baseline `track.world` relaxes toward the latest fused observation instead of rebounding around a predicted motion vector after occlusion or reacquisition. Validation: `python3 -m pytest tests/test_analytics_telemetry_hook.py -q` with `test_world_state_update_does_not_extrapolate_prior_velocity`._
   _2026-03-16 (Codex): Promoted `NOESIS.OBJECT_DEPTH.anchor_uv` into the canonical baseline person-anchor contract so high-confidence person detections can produce `track.world` before pose arrives. The estimator now prefers pose-derived anchors but will use the person mask/depth image foot as the current anchor for `person_anchor_depth_fused` / `person_anchor_floor_only`, while keeping `gravity_drop` and `anchor_hold` as the only degraded temporal behaviors. Validation: `python3 -m pytest tests/test_analytics_telemetry_hook.py -q` (new seg-only world-anchor coverage)._
+  _2026-07-10 (Codex): Removed DS9's divergent person-ground estimator. DS8 and DS9 hooks now adapt SDK metadata into one runtime-neutral `PersonGroundState` implementation for posture, source hysteresis, human CV filtering, idle lock, and path commits; DS9 BEV consumes the same public motion/trail fields. Validation: `python3 -m unittest DS9.tests.test_person_ground_parity -v` (3 passed) and `python3 -m pytest -q tests/test_person_ground_state.py tests/test_v3dt_world_ground_state.py` (13 passed). No runtime restart was performed._
+  _2026-07-19 (Codex): Bound baseline world fusion to the July 18 guided-walk evidence with strict per-camera policies shared by DS8 and DS9: family room uses floor contact, kitchen requires registered depth, and living room retains registered-depth ownership when available. Physical innovation rejection now preserves only a short continuity hold, source changes roll back when physics rejects them, consistent reacquisition starts a durable new trail segment, and the recorder rejects pre-calibration or empty captures. Focused alignment/fusion/lifecycle coverage passed (90 tests) and DS9 parity coverage passed (7 tests); bounded live validation is recorded separately._
+  _2026-07-19 (Codex): Live successor validation showed that a rejected living-room metric sample also suppressed the independently permitted floor candidate. Registration rejection now removes only that metric observation; floor-enabled profiles may admit their calibrated ray while kitchen's depth-required profile remains fail-closed._
+  _2026-07-19 (Codex): Final DS9 validation then exposed a missing SDK-local prediction wrapper called by the shared-filter adapter. Restored it and extended parity characterization to execute the exact prefilter/update path, preventing callback exceptions from silently dropping otherwise valid world placement._
+  _2026-07-19 (Codex): Activated DS9 release `release-20260719-162900-alignment-fusion-v18` / selector `8bf1126c7cbc3d1c79580027c891dcb6a7fb3c219dd7006a5be35a462238be6a`. A 600-second oai2-fe-to-Menon acceptance captured 11,184 tracking frames and 10,745 valid `backend_world_m` observations across all cameras with zero parse errors and no service restart. Family-room floor-ray outliers remain visible in the evidence and are intentionally not clamped; the planned comprehensive guided walk remains the next calibration input._
+  _2026-07-19 (Codex): Two subsequent walk tails reproduced the remaining outliers as near-horizon floor intersections rather than a Menon transform error: plausible family/living rays ended below 20.76 m while the failure cluster began at 26.15 m and reached 148.26 m. Policy contract v2 now range-gates every floor ray at 22 m before height lock or `PersonGroundState`, leaves valid registered depth independently admissible, keeps bounded family-room floor placement, and makes living-room floor-only placement fail closed. DS8, protected V3DT, and DS9 carry the same gate; focused policy/hook/recorder/parity validation passed (64 pytest cases plus 7 DS9 characterization cases)._
+  _2026-07-19 (Codex): Activated canonical DS9 release `release-20260719-181000-floor-ray-admission-v19` on state release `state-20260719-181100-floor-ray-v19`. A 600-second capture through the oai2/Menon proxy advanced 10,870 tracking frames and 10,870 world snapshots with zero parse errors or service restart. It rejected 1,721 family-room and two living-room rays above the 22 m envelope; none became valid or floor-only world state. A sealed post-acceptance journal tail placed all 3,055 accepted source samples on the exact authored floor union, and bounded browser/RTSP probes confirmed the live dashboard and H.264 mosaic._
+  _2026-07-19 (Codex): Corrected the first projection divergence in DS8, protected V3DT, and DS9: dewarped track image dimensions now come from the declared `1920x1080` camera calibration instead of `2*cx,2*cy`. Menon diagnostic rays and reprojection cameras require the same explicit dimensions. Added exact cross-runtime parity and fail-closed frontend tests; focused tracking/validation suites passed._
+  _2026-07-19 (Codex): Replaced the stale Menon similarity with a reproducible three-camera fit bound to the exact live camera-anchor state and backend calibration digests. Runtime admission rejects anchor-state drift or a residual above 5 cm. The current fit is 2.35 cm RMSE / 2.94 cm max; live person-placement evidence remains intentionally separate from camera-anchor registration._
+  _2026-07-19 (Codex): Extended the shared DS8/DS9 strict observation boundary with bounded non-biometric world-decision provenance. Invalid observations now retain one explicit first-divergence reason plus raw floor/depth/filter diagnostics in the synchronous journal; world source evidence retains exact observation linkage and source zone, while canonical room semantics require agreement among accepted sources and fail closed on room conflict. Focused core, fusion, journal, alignment-capture, schema, and DS9 snapshot tests passed without restarting a runtime._
+  _2026-07-19 (Codex): Split analytics ROI room evidence from the camera-name occupancy fallback across DS8, protected V3DT, and DS9. Public tracks, strict observations, world source rows, and private alignment captures now preserve `zone_source` plus explicit authority; only accepted `nvdsanalytics_roi` evidence can derive canonical `room_id`. Focused contract, producer, fusion, capture, authored-scene, schema, and DS9 parity tests passed without restarting a runtime._
+  _2026-07-24 (Codex): Joined canonical room evidence to the existing per-object overcrowding membership instead of introducing duplicate polygons. One shared DS8/V3DT/DS9 resolver prefers exact `ocStatus`, admits ROI-only compatibility only when OC membership is absent, and fails closed on malformed or competing labels; `WorldEntity` independently enforces accepted-source vote coherence. Focused config, adapter, contract, fusion, and DS9 parity tests passed without restarting a runtime._
+  _2026-07-28 (Codex): Added explicit standing-person lower-body occlusion authority for feet/ankles, knees, and waist/hips. A recent full-body height lock plus pose visibility and bbox/shoulder-scale collapse now demotes valid-looking counter/table-edge anchors before depth/floor fusion. Calibrated bbox-top, nose, shoulder, and hip rays reconstruct one floor contact from learned per-track body planes; three clear lower-body updates are required before direct authority resumes, while explicit sitting/lying evidence releases occlusion immediately. DS8 and DS9 adapters remain behaviorally identical, and the reconstructed `image_foot` now drives both BEV and OSD trails. Validation: 104 focused ground/world/BEV pytest cases plus 7 DS8-vs-DS9 parity cases passed; live occupied validation remains pending._
 
 ## 4. Analytics Reload Bridge (`attach_analytics_reload_bridge`)
 
 - [x] Confirm that `analytics_api.register_reload_hook` is used to propagate ROI changes into the DS8 analytics component:
-  - [x] Verify the update mechanism (e.g., `pipeline.ds_pipeline[component.name].set({...})`) is supported and documented in Service Maker APIs.
-  - [x] Ensure runtime updates are stored in `component.config["runtime_updates"]` for observability.
+  - [x] Dispatch one monotonic `reload-request-sequence` to the pre-tracker
+    native node only after setting the exact expected INI SHA-256.
+  - [x] Read and validate the complete request/accepted/failed/hash/error/removal
+    receipt before publishing runtime updates or incrementing reload counters.
+  - [x] Treat any post-dispatch receipt/publication uncertainty as an ambiguous
+    native commit and poison the runtime instead of claiming file-only rollback.
   _2025-11-29 (Codex): Reload bridge registers analytics_api hook and pushes updates via Pipeline node.set on analytics with runtime_updates recorded for audit._
+  _2026-07-10 (Codex): Replaced inferred node-set success with the exact
+  synchronous native receipt in baseline DS8, V3DT, and DS9. Startup also
+  verifies the initial active hash/error state; rollback and ambiguous-commit
+  poison behavior is covered by `tests/test_analytics_api.py`._
 
-## 5. Exclusion Prune Hook (`attach_exclude_prune_hook`)
+## 5. Native Pre-Tracker Exclusion (`nvdsroiexclude`)
 
-- [x] Validate `_extract_exclusion_polygons` against DS8 analytics YAML schema:
-  - [x] Confirm that `analytics.stages[stage_name].streams[stream].roi_filtering.rois` is the correct place for polygon definitions.
-  - [x] Verify fallback to external analytics config file is correct for DS8 (file format, path resolution).
-- [x] Ensure `_ExcludePruneProcessor.handle_frame` uses documented APIs for removing objects from frame metadata:
-  - [x] Prefer `nvds_remove_obj_meta_from_frame` when available.
-  - [x] Maintain safe handling for list and linked-list style structures without relying on undocumented internal fields.
-  _2025-11-29 (Codex): Exclusion hook reads stage/stream roi_filtering.rois from analytics config (with YAML fallback) and prunes via nvds_remove_obj_meta_from_frame or safe list traversal._
+- [x] Make the repo-owned pre-tracker native element the sole canonical pruning
+  path; do not retain a Python exclusion processor, polygon cache, or fallback.
+- [x] Validate the derived INI strictly before startup or reload:
+  - [x] exact canonical source coverage and stream suffixes;
+  - [x] unique groups, keys, ROI labels, and canonical stream IDs;
+  - [x] finite in-bounds non-degenerate polygons;
+  - [x] at least one polygon for an enabled stream, with disabled-empty allowed;
+  - [x] single-link regular no-follow file reads bounded to 1 MiB.
+- [x] Remove matching object metadata with
+  `nvds_remove_obj_meta_from_frame` while holding the DeepStream batch metadata
+  lock, before tracker association.
+- [x] Keep byte-identical DS8/DS9 source mirrors but exact-major-scoped CMake
+  builds and separately owned binaries.
+  _2025-11-29 (Codex): Historical `attach_exclude_prune_hook` parsed YAML/INI in Python and pruned after analytics._
+  _2026-07-10 (Codex): Retired and removed the historical Python path. Native
+  source/build/origin/reload/startup behavior is covered by
+  `DS9/tests/test_nvdsroiexclude_plugin.py` and
+  `DS9/tests/test_preflight_plugin_origin.py`; DS8 and DS9 builds completed from
+  the current mirrored source. Validation: 68 focused
+  API/graph/shutdown/gate tests, 12 native plugin/origin tests, and 50 DS9
+  supervisor-boundary tests passed._
 
 ## 6. Utility Helpers (Tensor, ROI, Metadata Access)
 
@@ -138,6 +200,9 @@ Tasks to ensure all metadata interactions (intrinsics, MapAnything, analytics te
   _2026-06-23 (Codex): Camera-local BEV now publishes floorplan-normalized point/trail fields from active floorplan bounds, lets registered DAv2 depth drive display only when it is registered, in-bounds, and agrees with the current floor-contact ray, and keeps backend smoothing continuous across floor-contact/registered-depth source switches. Validation: `python3 -m py_compile noesis/telemetry/bev.py noesis/ds8_runtime.py scripts/bev_alignment_diagnostics.py`, `pytest tests/test_bev_renderer_world_smoothing.py tests/test_depth_tracking_frame_processor.py tests/test_depth_registration.py -q` (34 passed), and MP4 diagnostic `diagnostics/bev_alignment/smoothing_source_gate_v3_20260623_230902/summary.json` (`footpoint_out_of_bounds=0`, `speed_mps.p95=3.82`, `speed_mps.max=6.20`)._
   _2026-06-24 (Codex): Corrected the baseline DAv2 registration/display chain for BEV tracking: the offline builder now preserves full `[B,H,W]` DAv2 output maps, depth-registration fingerprints are stable for generated diagnostic configs, track-space image anchors are scaled into calibration image space before BEV placement, and valid in-bounds registered DAv2 depth now wins over a disagreeing floor-contact ray. Validation: `pytest tests/test_bev_renderer_world_smoothing.py tests/test_depth_registration.py tests/test_analytics_telemetry_hook.py::test_bev_footpoint_scales_track_pixels_to_calibration_image_space -q` (36 passed) plus MP4 diagnostic `diagnostics/bev_alignment/registered_depth_display_priority_20260624/summary.json` (`living-room registered_depth_anchor=409/410`, `living-room point_norm_y.p50=0.552`, `footpoint_out_of_bounds=0`, `speed_mps.p95=3.33`)._
   _2026-06-24 (Codex): Added `scripts/bev_path_alignment_report.py` so future BEV tuning can compare saved BEV telemetry against an operator-annotated red-vs-blue screenshot. Validation: fresh MP4 diagnostic `diagnostics/bev_alignment/red_blue_current_validation_20260624/summary.json` plus strict overlay `visual/red_blue_path_alignment_strict/living-room_path_alignment_overlay.png` showed living-room `registered_depth_anchor=383/383`, `footpoint_out_of_bounds=0`, `point_norm_y.p50=0.551`, and `closer_to_blue_rate=1.0` versus the user's old high red path._
+  _2026-07-11 local (Codex): Completed the exact camera-local BEV authority and publication boundary across DS8, protected V3DT, and DS9. A missing first active-floorplan record is now `startup_pending` and emits no camera-local BEV/status/fatal callback; malformed first authority and every post-ready loss remain fatal, with no config/auto-extents substitute. Exact empty frames are successful `active_ready` renders (`inactive_ready` means no successful frame yet). Registered-depth display now shares canonical status/value coherence, protected V3DT scales source anchors/candidates/bboxes to calibration image size, and tracking/BEV use one `max(tracking interval, BEV interval)` gate with tracking first, BEV only after success, and count/lifecycle changes forcing the pair. The independent parity oracle enforces the same wire semantics. Validation: focused root BEV/depth/parity suites 115 passed; focused DS9 suites 112 passed; pair-safe root/V3DT suites 81 passed; isolated DS9 suites 101 passed; Python compilation and Ruff were clean apart from pre-existing hook import-order suppressions._
+  _2026-07-12 (Codex): Tightened “tracking first” into a typed release-gated sender transaction shared by DS8, protected V3DT, and DS9. Tracking plus its prepared canonical world snapshot/events is frozen and count/byte-admitted as one finite ordered batch, but its event-loop task cannot begin client delivery until the synchronous world journal confirms the exact append count and private fusion authority commits. Commit failure aborts with zero delivery and poisons publication; unresolved gates remain in byte/future accounting and block shutdown proof. Fusion exposes only a cached immutable committed snapshot, and canonical tracking/world/event/BEV bypass generic latest-only coalescing. Paired BEV still carries the exact later tracking sequence/submission receipt. Focused commit-race, abort/cancel/shutdown, mutation, non-finite, order, byte-release, client-cap, cadence, BEV, DS9 parity, and representative synchronous-journal performance regressions pass; fresh live runtime validation remains required._
+  _2026-07-12 (Codex): Replaced the timing-fragile per-append rollback journal with storage-contract-v2 WAL/FULL persistence on one lock-owned connection. Exact legacy-v1 journals migrate only after complete schema/history validation; v2 mode drift, private-file drift, partial retention ACKs, rollback uncertainty, and inexact close checkpoints fail closed. The 31-cycle three-source gate retains both median and mean below 27 ms; focused journal/privacy/runtime-world/world-service validation passed, while live tail evidence remains pending._
 
 ## 8. Validation Steps for Hooks
 
@@ -153,11 +218,34 @@ Tasks to ensure all metadata interactions (intrinsics, MapAnything, analytics te
   - [x] Exclusion ROIs prune objects as configured in analytics YAML and/or external config.
     _2025-12-16 (Codex): Exclusion now works live without restart by treating `config/nvdsanalytics.yaml` as source of truth, regenerating `config/config_nvdsanalytics_exclude.ini`, and applying updates to the running `analytics_exclude` node; validated via `python3 scripts/roi_reload_smoke_test.py` (reload counter increments) and observed live pruning behavior changes in UI/telemetry._
     _2026-01-01 (Codex): Fixed `_extract_exclusion_polygons` to treat `config-file` as YAML *or* INI (nvdsanalytics/nvdsroiexclude) so `config/config_nvdsanalytics_exclude.ini` no longer triggers YAML parser errors during DS8 runtime startup._
+    _2026-07-10 (Codex): The two historical Python-parser notes are
+    superseded. Native plugin tests now prove exact hash acknowledgement,
+    rejected-config retention while PLAYING, strict startup failure, source
+    coverage, and the disabled-empty policy for both SDK-owned binaries._
   - [x] Analytics ROI changes via REST are reflected in live analytics behavior without restarting the pipeline.
     _2025-12-13 (Codex): ROI updates now regenerate the exclusion INI, refresh pipeline.config stages, and drive node.set on analytics+analytics_exclude; hooks reload analytics YAML on-demand so exclusion polygons update live without restart._
     _2025-12-13 (Codex): Confirmed via `python3 scripts/roi_reload_smoke_test.py --no-spawn` observing analytics_reload_count increment + exclusion reload log._
     _2025-12-14 (Codex): Revalidated ROI hot-reload with `python3 scripts/roi_reload_smoke_test.py` (spawned runtime, JPEG mosaic disabled) and saw exclusion refresh log + reload counter bump._
     _2025-12-16 (Codex): Revalidated end-to-end with oai2-fe connected; exclusion ROI edits affect live behavior immediately (no restart)._
+- [ ] Capture current authenticated occupied-person exclusion and exact restore
+  evidence with `scripts/roi_reload_smoke_test.py --hot-restore`.
+  _2026-07-10 (Codex): Implemented the gate and unit-tested native receipt
+  equality, advancing real frames, removal-count growth, unconditional restore,
+  semantic readback, person return, private evidence, and blocked unoccupied
+  scenes. No new live occupied pass is claimed yet._
+  _2026-07-11 (Codex): The first DS9 occupied run proved native removal but
+  exposed a DS9-only early return that suppressed all zero-person tracking
+  frames. Restored DS8/DS9/V3DT parity: count-to-zero publishes immediately,
+  sustained empty frames carry an advancing camera `frame_id` at a bounded
+  default 2 Hz, and empty source evidence clears from the canonical world
+  without resetting observation order. Focused hook, publisher, fusion,
+  gate, and isolated DS9 tests passed; the live occupied pass remains pending._
+  _2026-07-12 (Codex): Tracking lifecycle publication now commits exact public
+  presence, per-source sequence, and rate-gate state only after successful
+  tracking admission across DS8, DS9, and protected V3DT. A failed disappearance
+  remains forced and retries with a fresh disappearance frame/time while its
+  tombstone retains the last successfully published presence. Focused lifecycle,
+  publisher, empty-frame, and parity tests pass._
 - [x] Baseline non-`v3dt` tracking emits fused world telemetry that reduces far-camera drift without adding a second estimator downstream.
   _2026-03-12 (Codex): Added focused regression coverage for the new baseline contract (`pose_floor_only`, `pose_depth_fused`, `gravity_drop`, `anchor_hold`) and updated trail/BEV consumers to read canonical `track.world` instead of recomputing a separate floor projection. Validation: `python3 -m pytest tests/test_pipeline_build.py tests/test_analytics_telemetry_hook.py tests/test_bev_renderer_world_smoothing.py -q` (17 passed)._
   _2026-03-16 (Codex): Generated the real RTSP-backed `config/depth_registration.json` artifact against live MapAnything reference depth and confirmed the fused baseline runtime starts cleanly against it; this keeps `pose_depth_fused` on the canonical registered-depth path rather than the earlier raw-depth-only path._
@@ -170,3 +258,9 @@ Tasks to ensure all metadata interactions (intrinsics, MapAnything, analytics te
   _2025-12-24 (Codex): Updated mosaic labels to be stable-id-only ("label sid <stable_id> <confidence>") and stamp them inside the analytics telemetry hook (pre-tiler) so per-camera IDs are correct; no user-visible tracker IDs._
   _2025-12-21 (Codex): Applied font size/name for both pyds `NvOSD_TextParams.font_params` and Service Maker `osd.TextParams.font` so label sizing works in DS8._
   _2025-12-21 (Codex): Dropped DS7 font fields; DS8-only font params now use `font_params.size` and `font_params.name` with `ds_osd.FontFamily`._
+  _2026-07-10 (Codex): Authoritative identity-v2 labels now use a verified
+  Service Maker `BatchMetadataOperator` probe at the tiler sink after
+  whole-frame resolution. The probe reacquires each wrapper once and accepts
+  only an exact bounded `(camera, frame, tracker)` decision; all misses remain
+  `#XX`. DS8, V3DT, and DS9 attachment parity is covered by
+  `tests/test_identity_v2_osd.py` and focused hook tests._

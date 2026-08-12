@@ -37,8 +37,8 @@
           "contract": "noesis.depth_registration.model_content.v1",
           "engine": {
             "logical_path": "DS9/models/engines/depth_anything_v2_metric_hypersim_vits_294x518_b3_fp16.engine",
-            "sha256": "12cab7aa30115b41064e9e5803a0529783cc4a0fc7d627fa9c25904865f21b4f",
-            "size_bytes": 52508044
+            "sha256": "d5c3ce58e63ad049f2ee88fa0f4b7dd91f9742985e6617ec705eca480820bf15",
+            "size_bytes": 52519036
           },
           "onnx_authority": {
             "bundle_files": [
@@ -53,7 +53,7 @@
             "logical_path": "DS9/models/onnx/depth_anything_v2_metric_hypersim_vits_294x518_b3.onnx",
             "raw_sha256": "93c7f1c0d550d137ebed0041804d938c00dd5dc0cb71ecddd7e98bd363872294",
             "source_contract_selector": "depth_anything_v2_tracking",
-            "source_contract_sha256": "94144007b6e59f2eddd3239a6f0af02ce7d37224089e5f07a7a95d884f752b5a"
+            "source_contract_sha256": "ee75b7cd057d1c658684d644125d2ad7903081a0f06b04654b38a9318a153ba6"
           },
           "reviewed_config": {
             "logical_path": "DS9/pipelines/config_infer_secondary_depth_tracking_da2.ini",
@@ -68,7 +68,7 @@
         },
         "enable": true,
         "engine": "DS9/models/engines/depth_anything_v2_metric_hypersim_vits_294x518_b3_fp16.engine",
-        "fingerprint_sha256": "55d7d6354ce2d20daad7d1672a2eea6a65ec7c82de01162fa973f4bfa3b36da1",
+        "fingerprint_sha256": "bbd6aaa521a389c57643de066ee5206fd386577c265980e4b73f487373550f59",
         "gie_id": 5,
         "input_size": [
           518,
@@ -119,8 +119,8 @@
           "contract": "noesis.depth_registration.model_content.v1",
           "engine": {
             "logical_path": "DS9/models/engines/mapanything_images_294x518_b3_fp32.plan",
-            "sha256": "eabc1169c7d725ed7cff171ed54c402c4282fdcf23b87a58f4e41a95fe23ecc8",
-            "size_bytes": 3883865652
+            "sha256": "265a650dbb213f454b2de3c93b31daf222f5194e7fecba4d328d788ebef0e4d1",
+            "size_bytes": 3884566708
           },
           "onnx_authority": {
             "bundle_files": [
@@ -3657,22 +3657,22 @@
             "logical_path": "DS9/models/onnx/mapanything_images_294x518_b3.onnx",
             "raw_sha256": "0a27dca24238d8103b83df67ce8f71d11c6a79574d83d6e9bab237f3d9c222c7",
             "source_contract_selector": "mapanything",
-            "source_contract_sha256": "94144007b6e59f2eddd3239a6f0af02ce7d37224089e5f07a7a95d884f752b5a"
+            "source_contract_sha256": "ee75b7cd057d1c658684d644125d2ad7903081a0f06b04654b38a9318a153ba6"
           },
           "reviewed_config": {
             "logical_path": "DS9/pipelines/config_infer_secondary_mapanything.ini",
-            "sha256": "e180e94f91516e78a25367d6a8801a04e6d2f79c4328e1b1b95bdce3c51b0c1e",
-            "size_bytes": 700
+            "sha256": "43694bfdb08b1f9268c148324de9aa87faf28a1bb5bcb03fc1c91dd14f1771e8",
+            "size_bytes": 970
           },
           "runtime_config": {
             "logical_path": "DS9/runtime_inference/mapanything.ini",
-            "sha256": "3e380518e017002bdb5faed2661f3e58dcd0ddd2f7a651ad9e0d815beceb32aa",
-            "size_bytes": 384
+            "sha256": "689d629e06c2fbb2d7653a09796857fa1b0edc3766bc0797e8ddfd628bf20ad6",
+            "size_bytes": 422
           }
         },
         "enable": true,
         "engine": "DS9/models/engines/mapanything_images_294x518_b3_fp32.plan",
-        "fingerprint_sha256": "a367f91fc5224308a3826399953b80a057d2bdd7445cde166bda90f37a417863",
+        "fingerprint_sha256": "b7596f4f754e57810126e90466f55678c22959ef3cf64da3abc4a42665dfdb20",
         "gie_id": 2,
         "name": "mapanything_fullframe",
         "scope": "mapanything_reference_depth"
@@ -3984,7 +3984,7 @@
         3.6184754371643066,
         14.211116790771484
       ],
-      "registration_id": "family-room:b05baa5884ad62a8380c9121b373e4c31f384c06524e58cadb06f353e489ee5f",
+      "registration_id": "family-room:00b4146829372956cb11a0506c214c5b76364a5ba9c3128c901b28116ccf9843",
       "sample_counts": {
         "input_pairs": 297,
         "num_knots": 7,
@@ -4037,8 +4037,8 @@
           "contract": "noesis.depth_registration.model_content.v1",
           "engine": {
             "logical_path": "DS9/models/engines/depth_anything_v2_metric_hypersim_vits_294x518_b3_fp16.engine",
-            "sha256": "12cab7aa30115b41064e9e5803a0529783cc4a0fc7d627fa9c25904865f21b4f",
-            "size_bytes": 52508044
+            "sha256": "d5c3ce58e63ad049f2ee88fa0f4b7dd91f9742985e6617ec705eca480820bf15",
+            "size_bytes": 52519036
           },
           "onnx_authority": {
             "bundle_files": [
@@ -4053,7 +4053,7 @@
             "logical_path": "DS9/models/onnx/depth_anything_v2_metric_hypersim_vits_294x518_b3.onnx",
             "raw_sha256": "93c7f1c0d550d137ebed0041804d938c00dd5dc0cb71ecddd7e98bd363872294",
             "source_contract_selector": "depth_anything_v2_tracking",
-            "source_contract_sha256": "94144007b6e59f2eddd3239a6f0af02ce7d37224089e5f07a7a95d884f752b5a"
+            "source_contract_sha256": "ee75b7cd057d1c658684d644125d2ad7903081a0f06b04654b38a9318a153ba6"
           },
           "reviewed_config": {
             "logical_path": "DS9/pipelines/config_infer_secondary_depth_tracking_da2.ini",
@@ -4068,7 +4068,7 @@
         },
         "enable": true,
         "engine": "DS9/models/engines/depth_anything_v2_metric_hypersim_vits_294x518_b3_fp16.engine",
-        "fingerprint_sha256": "55d7d6354ce2d20daad7d1672a2eea6a65ec7c82de01162fa973f4bfa3b36da1",
+        "fingerprint_sha256": "bbd6aaa521a389c57643de066ee5206fd386577c265980e4b73f487373550f59",
         "gie_id": 5,
         "input_size": [
           518,
@@ -4119,8 +4119,8 @@
           "contract": "noesis.depth_registration.model_content.v1",
           "engine": {
             "logical_path": "DS9/models/engines/mapanything_images_294x518_b3_fp32.plan",
-            "sha256": "eabc1169c7d725ed7cff171ed54c402c4282fdcf23b87a58f4e41a95fe23ecc8",
-            "size_bytes": 3883865652
+            "sha256": "265a650dbb213f454b2de3c93b31daf222f5194e7fecba4d328d788ebef0e4d1",
+            "size_bytes": 3884566708
           },
           "onnx_authority": {
             "bundle_files": [
@@ -7657,22 +7657,22 @@
             "logical_path": "DS9/models/onnx/mapanything_images_294x518_b3.onnx",
             "raw_sha256": "0a27dca24238d8103b83df67ce8f71d11c6a79574d83d6e9bab237f3d9c222c7",
             "source_contract_selector": "mapanything",
-            "source_contract_sha256": "94144007b6e59f2eddd3239a6f0af02ce7d37224089e5f07a7a95d884f752b5a"
+            "source_contract_sha256": "ee75b7cd057d1c658684d644125d2ad7903081a0f06b04654b38a9318a153ba6"
           },
           "reviewed_config": {
             "logical_path": "DS9/pipelines/config_infer_secondary_mapanything.ini",
-            "sha256": "e180e94f91516e78a25367d6a8801a04e6d2f79c4328e1b1b95bdce3c51b0c1e",
-            "size_bytes": 700
+            "sha256": "43694bfdb08b1f9268c148324de9aa87faf28a1bb5bcb03fc1c91dd14f1771e8",
+            "size_bytes": 970
           },
           "runtime_config": {
             "logical_path": "DS9/runtime_inference/mapanything.ini",
-            "sha256": "3e380518e017002bdb5faed2661f3e58dcd0ddd2f7a651ad9e0d815beceb32aa",
-            "size_bytes": 384
+            "sha256": "689d629e06c2fbb2d7653a09796857fa1b0edc3766bc0797e8ddfd628bf20ad6",
+            "size_bytes": 422
           }
         },
         "enable": true,
         "engine": "DS9/models/engines/mapanything_images_294x518_b3_fp32.plan",
-        "fingerprint_sha256": "a367f91fc5224308a3826399953b80a057d2bdd7445cde166bda90f37a417863",
+        "fingerprint_sha256": "b7596f4f754e57810126e90466f55678c22959ef3cf64da3abc4a42665dfdb20",
         "gie_id": 2,
         "name": "mapanything_fullframe",
         "scope": "mapanything_reference_depth"
@@ -7984,7 +7984,7 @@
         5.549107789993286,
         14.828376293182373
       ],
-      "registration_id": "kitchen:9ebaa5be8631704f17f1c1488db33ee2f3d8b83bad7906e4f3fd8a8878428479",
+      "registration_id": "kitchen:824a05b74372b5b9e181f0f64595266a2ecd1eb50898e8c192dfb977f2debfd7",
       "sample_counts": {
         "input_pairs": 221,
         "num_knots": 7,
@@ -8037,8 +8037,8 @@
           "contract": "noesis.depth_registration.model_content.v1",
           "engine": {
             "logical_path": "DS9/models/engines/depth_anything_v2_metric_hypersim_vits_294x518_b3_fp16.engine",
-            "sha256": "12cab7aa30115b41064e9e5803a0529783cc4a0fc7d627fa9c25904865f21b4f",
-            "size_bytes": 52508044
+            "sha256": "d5c3ce58e63ad049f2ee88fa0f4b7dd91f9742985e6617ec705eca480820bf15",
+            "size_bytes": 52519036
           },
           "onnx_authority": {
             "bundle_files": [
@@ -8053,7 +8053,7 @@
             "logical_path": "DS9/models/onnx/depth_anything_v2_metric_hypersim_vits_294x518_b3.onnx",
             "raw_sha256": "93c7f1c0d550d137ebed0041804d938c00dd5dc0cb71ecddd7e98bd363872294",
             "source_contract_selector": "depth_anything_v2_tracking",
-            "source_contract_sha256": "94144007b6e59f2eddd3239a6f0af02ce7d37224089e5f07a7a95d884f752b5a"
+            "source_contract_sha256": "ee75b7cd057d1c658684d644125d2ad7903081a0f06b04654b38a9318a153ba6"
           },
           "reviewed_config": {
             "logical_path": "DS9/pipelines/config_infer_secondary_depth_tracking_da2.ini",
@@ -8068,7 +8068,7 @@
         },
         "enable": true,
         "engine": "DS9/models/engines/depth_anything_v2_metric_hypersim_vits_294x518_b3_fp16.engine",
-        "fingerprint_sha256": "55d7d6354ce2d20daad7d1672a2eea6a65ec7c82de01162fa973f4bfa3b36da1",
+        "fingerprint_sha256": "bbd6aaa521a389c57643de066ee5206fd386577c265980e4b73f487373550f59",
         "gie_id": 5,
         "input_size": [
           518,
@@ -8119,8 +8119,8 @@
           "contract": "noesis.depth_registration.model_content.v1",
           "engine": {
             "logical_path": "DS9/models/engines/mapanything_images_294x518_b3_fp32.plan",
-            "sha256": "eabc1169c7d725ed7cff171ed54c402c4282fdcf23b87a58f4e41a95fe23ecc8",
-            "size_bytes": 3883865652
+            "sha256": "265a650dbb213f454b2de3c93b31daf222f5194e7fecba4d328d788ebef0e4d1",
+            "size_bytes": 3884566708
           },
           "onnx_authority": {
             "bundle_files": [
@@ -11657,22 +11657,22 @@
             "logical_path": "DS9/models/onnx/mapanything_images_294x518_b3.onnx",
             "raw_sha256": "0a27dca24238d8103b83df67ce8f71d11c6a79574d83d6e9bab237f3d9c222c7",
             "source_contract_selector": "mapanything",
-            "source_contract_sha256": "94144007b6e59f2eddd3239a6f0af02ce7d37224089e5f07a7a95d884f752b5a"
+            "source_contract_sha256": "ee75b7cd057d1c658684d644125d2ad7903081a0f06b04654b38a9318a153ba6"
           },
           "reviewed_config": {
             "logical_path": "DS9/pipelines/config_infer_secondary_mapanything.ini",
-            "sha256": "e180e94f91516e78a25367d6a8801a04e6d2f79c4328e1b1b95bdce3c51b0c1e",
-            "size_bytes": 700
+            "sha256": "43694bfdb08b1f9268c148324de9aa87faf28a1bb5bcb03fc1c91dd14f1771e8",
+            "size_bytes": 970
           },
           "runtime_config": {
             "logical_path": "DS9/runtime_inference/mapanything.ini",
-            "sha256": "3e380518e017002bdb5faed2661f3e58dcd0ddd2f7a651ad9e0d815beceb32aa",
-            "size_bytes": 384
+            "sha256": "689d629e06c2fbb2d7653a09796857fa1b0edc3766bc0797e8ddfd628bf20ad6",
+            "size_bytes": 422
           }
         },
         "enable": true,
         "engine": "DS9/models/engines/mapanything_images_294x518_b3_fp32.plan",
-        "fingerprint_sha256": "a367f91fc5224308a3826399953b80a057d2bdd7445cde166bda90f37a417863",
+        "fingerprint_sha256": "b7596f4f754e57810126e90466f55678c22959ef3cf64da3abc4a42665dfdb20",
         "gie_id": 2,
         "name": "mapanything_fullframe",
         "scope": "mapanything_reference_depth"
@@ -11984,7 +11984,7 @@
         8.385019779205322,
         11.797159671783447
       ],
-      "registration_id": "living-room:e26450e076956080a5ac1b0a934fc84affa66317cc0525c0fbc2e3241f0a4a76",
+      "registration_id": "living-room:a5e6c1244e357c27407c5852752ba9775898017c408ffa8db6579e36e2e3b530",
       "sample_counts": {
         "input_pairs": 96,
         "num_knots": 7,

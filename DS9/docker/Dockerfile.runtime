@@ -1,12 +1,12 @@
-FROM sha256:7476b1021376cd67793c95d949cdc7d46eef7704ab98a5a76feed461e4f907a4
+FROM sha256:88d80ad35f12ec3a574cf2555a8242d33ac4110abdcc5f88a6cbdee40dfcf872
 
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 
 LABEL org.opencontainers.image.title="Noesis DS9 canonical runtime"
-LABEL org.opencontainers.image.base.digest="sha256:2e45070ad134b9ab2caa4a97ba4d52fa8744a4f0db30900bd92828d51425a69a"
+LABEL org.opencontainers.image.base.digest="sha256:f6fa0247da9290979cbb05749e7da9435d089c93db7c4dcfe85ba2488b5f4994"
 LABEL org.opencontainers.image.source="Noesis DS9/docker/Dockerfile.runtime"
-LABEL com.noesis.engine-build.image.reference="noesis-ds9-dev:9.0-20260710"
-LABEL com.noesis.engine-build.image.id="sha256:7476b1021376cd67793c95d949cdc7d46eef7704ab98a5a76feed461e4f907a4"
+LABEL com.noesis.engine-build.image.reference="noesis-ds9-dev:9.1-20260812"
+LABEL com.noesis.engine-build.image.id="sha256:88d80ad35f12ec3a574cf2555a8242d33ac4110abdcc5f88a6cbdee40dfcf872"
 
 ENV DEBIAN_FRONTEND=noninteractive
 
@@ -20,7 +20,8 @@ RUN apt-get update \
       gir1.2-gst-plugins-bad-1.0=1.24.2-1ubuntu4 \
     && rm -rf /var/lib/apt/lists/*
 
-RUN python3 -c 'import gi; gi.require_version("Gst", "1.0"); gi.require_version("GstSdp", "1.0"); gi.require_version("GstWebRTC", "1.0"); from gi.repository import GLib, Gst, GstSdp, GstWebRTC; Gst.init(None); required=("rtspsrc", "rtph264depay", "h264parse", "rtph264pay", "webrtcbin", "queue", "fakesink"); missing=[name for name in required if Gst.ElementFactory.find(name) is None]; assert not missing, missing; assert all((GLib, GstSdp, GstWebRTC))' \
+RUN GST_REGISTRY=/tmp/noesis-ds9-runtime-gst-registry.bin \
+      python3 -c 'import gi; gi.require_version("Gst", "1.0"); gi.require_version("GstSdp", "1.0"); gi.require_version("GstWebRTC", "1.0"); from gi.repository import GLib, Gst, GstSdp, GstWebRTC; Gst.init(None); required=("rtspsrc", "rtph264depay", "h264parse", "rtph264pay", "webrtcbin", "queue", "fakesink"); missing=[name for name in required if Gst.ElementFactory.find(name) is None]; assert not missing, missing; assert all((GLib, GstSdp, GstWebRTC))' \
     && GST_REGISTRY=/tmp/noesis-ds9-runtime-gst-registry.bin \
       gst-inspect-1.0 webrtcbin >/dev/null \
     && rm -f /tmp/noesis-ds9-runtime-gst-registry.bin

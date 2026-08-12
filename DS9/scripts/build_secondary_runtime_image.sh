@@ -3,9 +3,9 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DS9_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
-PARENT_IMAGE_REF="noesis-ds9-dev:9.0-20260710"
-PARENT_IMAGE_ID="sha256:7476b1021376cd67793c95d949cdc7d46eef7704ab98a5a76feed461e4f907a4"
-RUNTIME_IMAGE="${NOESIS_DS9_RUNTIME_IMAGE:-noesis-ds9-runtime:9.0-20260710}"
+PARENT_IMAGE_REF="noesis-ds9-dev:9.1-20260812"
+PARENT_IMAGE_ID="sha256:88d80ad35f12ec3a574cf2555a8242d33ac4110abdcc5f88a6cbdee40dfcf872"
+RUNTIME_IMAGE="${NOESIS_DS9_RUNTIME_IMAGE:-noesis-ds9-runtime:9.1-20260812}"
 
 if [[ -z "${NOESIS_DS9_DOCKER_ROOT:-}" ]]; then
   echo "[FAIL] NOESIS_DS9_DOCKER_ROOT must name the explicit secondary Docker staging root." >&2

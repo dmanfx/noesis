@@ -77,7 +77,7 @@ if [[ -d "$DEEPSTREAM_SYS_DIR" ]]; then
   for so in "$DEEPSTREAM_SYS_DIR"/*.so; do
     base="$(basename "$so")"
     if [[ "$base" == "libnvdsgst_tracker.so" ]]; then
-      ln -sf "$OUT_DIR/libnvdsgst_tracker.so" "$DEEPSTREAM_OVERRIDE_DIR/$base"
+      install -m 0755 "$OUT_DIR/libnvdsgst_tracker.so" "$DEEPSTREAM_OVERRIDE_DIR/$base"
     else
       ln -sf "$so" "$DEEPSTREAM_OVERRIDE_DIR/$base"
     fi
@@ -95,4 +95,4 @@ fi
 
 echo "[PASS] Built patched plugin: $OUT_DIR/libnvdsgst_tracker.so"
 echo "To use it for DS8 runs:"
-echo "  export NOESIS_USE_PATCHED_NVTRACKER=1"
+echo "  export NOESIS_V3DT_USE_PATCHED_NVTRACKER=1"

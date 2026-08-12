@@ -80,7 +80,9 @@ py::object extract_obj_3d_meta(const deepstream::ObjectMetadata& obj_meta) {
   }
 
   // --- 3D bbox extraction (with try/catch for robustness) ---
-  // This is the core SV3DT/MV3DT output: 3D bounding box in world coordinates.
+  // This is the core SV3DT/MV3DT output. Preserve the tracker-profile tuple;
+  // the Python producer owns the explicit axis/extent conversion to canonical
+  // backend_world_m.
   try {
   obj_meta.iterate(
       [&](const deepstream::UserMetadata& user_meta) {
@@ -136,11 +138,13 @@ py::object extract_obj_3d_meta(const deepstream::ObjectMetadata& obj_meta) {
 
 PYBIND11_MODULE(noesis_v3dt_meta_ext, m) {
   m.doc() =
-      "Noesis DS8 helper bindings for accessing nvtracker SV3DT/MV3DT user meta "
+      "Noesis helper bindings for accessing nvtracker SV3DT/MV3DT user meta "
       "(NVDS_OBJ_3D_META, NVDS_OBJ_VISIBILITY, NVDS_OBJ_IMAGE_FOOT_LOCATION) "
       "from Service Maker Python ObjectMetadata.\n\n"
       "Note: NVDS_OBJ_WORLD_FOOT_LOCATION is NOT exposed by Service Maker; "
-      "world footpoints must be derived from bbox3d (yCentre - 0.5*yLen).";
+      "bbox3d and velocity values remain in the selected tracker profile's "
+      "tuple. The producer must validate that profile's extent/axis contract "
+      "before publishing canonical world coordinates.";
   m.def("extract_obj_3d_meta", &extract_obj_3d_meta,
         "Extract NVDS_OBJ_3D_META (NvDsObj3DBbox), NVDS_OBJ_VISIBILITY, and "
         "NVDS_OBJ_IMAGE_FOOT_LOCATION from a Service Maker ObjectMetadata. "

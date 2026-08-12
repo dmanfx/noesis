@@ -12,6 +12,9 @@ import numpy as np
 import yaml
 
 
+REPO_ROOT = Path(__file__).resolve().parents[1]
+
+
 def load_yaml(path: Path) -> Dict[str, Any]:
     try:
         with path.open("r", encoding="utf-8") as f:
@@ -36,9 +39,8 @@ def resolve_like_noesis(yaml_path: Path, raw: str) -> Path:
     if candidate.is_absolute():
         return candidate
     base_dir = yaml_path.parent.resolve()
-    repo_root = base_dir.parent
-    if value.startswith(('config/', 'models/', 'pipelines/')):
-        return (repo_root / candidate).resolve()
+    if value.startswith(('config/', 'models/', 'pipelines/', 'DS9/')):
+        return (REPO_ROOT / candidate).resolve()
     return (base_dir / candidate).resolve()
 
 

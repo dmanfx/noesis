@@ -279,8 +279,8 @@ def test_ds8_and_ds9_pipeline_components_do_not_receive_uri_secret(
         graph = module.build_pipeline(path)
         source_components = [
             component
-            for name, component in graph.components.items()
-            if name.startswith("source_")
+            for component in graph.components.values()
+            if component.element == "nvurisrcbin"
         ]
         assert source_components
         assert all("uri_secret" not in component.config for component in source_components)

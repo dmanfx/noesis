@@ -454,6 +454,23 @@ def test_ds9_build_pipeline_honors_analytics_exclude_env(
     graph = ds9_pipeline.build_pipeline(ROOT / "DS9" / "config" / "infer.yaml")
 
     assert graph.components["analytics_exclude"].config["config-file"] == str(exclude_path)
+    expected_latest_only_queue = {
+        "leaky": 2,
+        "max-size-buffers": 4,
+        "max-size-bytes": 0,
+        "max-size-time": 0,
+    }
+    for source_id in range(3):
+        queue_name = f"source_decode_queue_{source_id}"
+        assert graph.components[queue_name].config == expected_latest_only_queue
+        assert (f"source_{source_id}", queue_name) in graph.ds_pipeline.links
+        assert (queue_name, f"dewarper_conv_{source_id}") in graph.ds_pipeline.links
+    assert graph.source_progress_targets == {
+        0: "dewarper_caps_out_0",
+        1: "dewarper_caps_out_1",
+        2: "dewarper_caps_out_2",
+    }
+    assert graph.source_progress_monitor is not None
     rgb_convert = graph.components["mapanything_rgb_convert"]
     rgb_caps = graph.components["mapanything_rgb_caps"]
     assert rgb_convert.element == "nvvideoconvert"

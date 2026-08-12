@@ -23,6 +23,10 @@ from noesis_core.servicemaker_shutdown import (
     SyntheticStubEosMessage,
     synthetic_stub_lifecycle_evidence,
 )
+from noesis_core.source_progress import (
+    DecodedSourceProgressMonitor,
+    SourceProgressPolicy,
+)
 from noesis.telemetry.latency_metrics import LatencyCollector
 
 logger = logging.getLogger(__name__)
@@ -343,6 +347,8 @@ class DS8Pipeline:
     frame_size: Tuple[int, int] = field(default_factory=lambda: (0, 0))
     analytics_reload_count: int = 0
     latency_collector: Optional[LatencyCollector] = None
+    source_progress_monitor: Optional[DecodedSourceProgressMonitor] = None
+    source_progress_targets: Dict[int, str] = field(default_factory=dict)
     _timer: Optional[threading.Timer] = field(default=None, init=False, repr=False)
     _prime_timer: Optional[threading.Timer] = field(default=None, init=False, repr=False)
     _depth_lock: threading.Lock = field(default_factory=threading.Lock, init=False, repr=False)
@@ -483,6 +489,23 @@ class LatencyProbeOperator(_BufferOperatorBase):  # pragma: no cover - runtime o
             if not self._warned:
                 self._warned = True
                 logger.warning("Latency probe: SM buffer path failed (%s)", exc)
+        return True
+
+
+class DecodedProgressProbeOperator(_BufferOperatorBase):  # pragma: no cover - runtime only
+    """Count buffers at the canonical post-decode/dewarp liveness boundary."""
+
+    def __init__(
+        self, monitor: DecodedSourceProgressMonitor, source_id: int
+    ) -> None:
+        if BufferOperator is None:
+            raise RuntimeError("pyservicemaker.BufferOperator is unavailable")
+        super().__init__()
+        self.monitor = monitor
+        self.source_id = int(source_id)
+
+    def handle_buffer(self, buffer) -> bool:  # type: ignore[override]
+        self.monitor.record_progress(self.source_id)
         return True
 
 
@@ -715,6 +738,43 @@ def _attach_latency_probe(pipeline: DS8Pipeline) -> None:
     except Exception as exc:  # pragma: no cover - runtime dependent
         # Non-fatal: latency telemetry should never prevent the pipeline from starting.
         logger.warning("Latency probe attach failed (non-fatal): %s", exc)
+
+
+def _attach_source_progress_probes(pipeline: DS8Pipeline) -> None:
+    """Attach mandatory per-source decoded/dewarped progress probes."""
+
+    monitor = pipeline.source_progress_monitor
+    targets = pipeline.source_progress_targets
+    if monitor is None and not targets:
+        return
+    if monitor is None or not targets:
+        pipeline.errors.append("source_progress:missing_monitor_or_targets")
+        return
+    if isinstance(pipeline.ds_pipeline, _NoopDSPipeline):
+        return
+    if BufferOperator is None or Probe is None or pipeline.ds_pipeline is None:
+        pipeline.errors.append("source_progress:servicemaker_probe_unavailable")
+        return
+    for source_id, target in sorted(targets.items()):
+        if target not in pipeline.components:
+            pipeline.errors.append(f"source_progress:missing_target:{target}")
+            continue
+        try:
+            probe = Probe(
+                f"source_progress_{source_id}",
+                DecodedProgressProbeOperator(monitor, source_id),
+            )
+            pipeline.ds_pipeline.attach(target, probe, tips="src")
+            logger.info(
+                "Decoded progress probe attached to source=%d target=%s:src",
+                source_id,
+                target,
+            )
+        except Exception as exc:  # pragma: no cover - runtime dependent
+            pipeline.errors.append(
+                f"source_progress_attach:{source_id}:{target}:"
+                f"{redact_runtime_secrets(exc)}"
+            )
 
 
 def build_pipeline(yaml_path: str | Path) -> DS8Pipeline:
@@ -1029,12 +1089,15 @@ def build_pipeline(yaml_path: str | Path) -> DS8Pipeline:
 
     # Track source output nodes when linking into nvstreammux.
     source_nodes: List[Tuple[str, int]] = []
+    source_progress_labels: Dict[int, str] = {}
+    source_progress_targets: Dict[int, str] = {}
 
     # Precompute URIs for tiler layout / diagnostics.
     uris = [str(s.get("uri") or "").strip() for s in sources if str(s.get("uri") or "").strip()]
 
     if per_source_pipeline:
-        # Per-source pipeline: nvurisrcbin → (optional dewarper) → nvstreammux
+        # Per-source pipeline: nvurisrcbin → decoded-frame isolation queue →
+        # (optional dewarper) → nvstreammux.
         streammux = Component(
             name="streammux",
             element=streammux_element,
@@ -1047,6 +1110,10 @@ def build_pipeline(yaml_path: str | Path) -> DS8Pipeline:
 
         loop_local_mp4 = _env_truthy("NOESIS_DS8_LOOP_LOCAL_MP4", default=True)
         for idx, source_cfg in enumerate(sources):
+            camera_id = str(
+                source_cfg.get("uri_secret") or f"source-{idx}"
+            ).strip()
+            source_progress_labels[idx] = camera_id or f"source-{idx}"
             props = dict(source_cfg)
             props.pop("uri_secret", None)
             dewarp_cfg_raw = props.pop("dewarper", None)
@@ -1073,6 +1140,28 @@ def build_pipeline(yaml_path: str | Path) -> DS8Pipeline:
             pipeline.components[source.name] = source
             _safe_add(ds_pipeline, source, pipeline.errors)
             _apply_component_config(ds_pipeline, source, pipeline.errors)
+
+            # Isolate each decoded source before dewarping/muxing so one
+            # reconnecting camera cannot back-pressure the other sources. The
+            # progress probe is attached after this queue, or after dewarping
+            # when dewarping is enabled, so packet arrival alone is never
+            # counted as decoded-frame progress.
+            decode_queue = Component(
+                name=f"source_decode_queue_{idx}",
+                element="queue",
+                config={
+                    "leaky": 2,
+                    "max-size-buffers": 4,
+                    "max-size-bytes": 0,
+                    "max-size-time": 0,
+                },
+                downstream=[],
+            )
+            pipeline.components[decode_queue.name] = decode_queue
+            _safe_add(ds_pipeline, decode_queue, pipeline.errors)
+            _apply_component_config(ds_pipeline, decode_queue, pipeline.errors)
+            _safe_link(ds_pipeline, pipeline.errors, source.name, decode_queue.name)
+            source.downstream = [decode_queue.name]
 
             dewarp_cfg = dict(dewarp_cfg_raw) if isinstance(dewarp_cfg_raw, dict) else {}
             dewarp_enabled = bool(dewarp_cfg.get("enable", False))
@@ -1120,13 +1209,19 @@ def build_pipeline(yaml_path: str | Path) -> DS8Pipeline:
                     _safe_add(ds_pipeline, comp, pipeline.errors)
                     _apply_component_config(ds_pipeline, comp, pipeline.errors)
 
-                _safe_link(ds_pipeline, pipeline.errors, source.name, conv.name)
+                _safe_link(ds_pipeline, pipeline.errors, decode_queue.name, conv.name)
                 _safe_link(ds_pipeline, pipeline.errors, conv.name, caps_in.name)
                 _safe_link(ds_pipeline, pipeline.errors, caps_in.name, dewarper.name)
                 _safe_link(ds_pipeline, pipeline.errors, dewarper.name, caps_out.name)
+                decode_queue.downstream = [conv.name]
+                conv.downstream = [caps_in.name]
+                caps_in.downstream = [dewarper.name]
+                dewarper.downstream = [caps_out.name]
                 source_nodes.append((caps_out.name, idx))
+                source_progress_targets[idx] = caps_out.name
             else:
-                source_nodes.append((source.name, idx))
+                source_nodes.append((decode_queue.name, idx))
+                source_progress_targets[idx] = decode_queue.name
     else:
         # Multi-URI source path: nvmultiurisrcbin performs source ingest + mux.
         uri_list = ",".join(uris)
@@ -1185,6 +1280,13 @@ def build_pipeline(yaml_path: str | Path) -> DS8Pipeline:
         pipeline.components[streammux.name] = streammux
         _safe_add(ds_pipeline, streammux, pipeline.errors)
         _apply_component_config(ds_pipeline, streammux, pipeline.errors)
+
+    if source_progress_targets:
+        pipeline.source_progress_targets = dict(source_progress_targets)
+        pipeline.source_progress_monitor = DecodedSourceProgressMonitor(
+            source_progress_labels,
+            policy=SourceProgressPolicy.from_environment(),
+        )
 
     try:
         pipeline.frame_size = (
@@ -2076,6 +2178,7 @@ def build_pipeline(yaml_path: str | Path) -> DS8Pipeline:
     _attach_depth_gate(pipeline)
     _attach_fps_probes(pipeline)
     _attach_latency_probe(pipeline)
+    _attach_source_progress_probes(pipeline)
     _PIPELINE_SINGLETON = pipeline
     # Depth is disabled by default; the MapAnything gate is closed shortly after activation
     # (see activate()) to avoid a "stuck-at-PAUSED" preroll issue when the valve is closed

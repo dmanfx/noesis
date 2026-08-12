@@ -19,6 +19,7 @@ def test_ds9_processor_publishes_rate_limited_advancing_empty_frames() -> None:
 
         from noesis.pipelines import hooks
         from noesis.telemetry.publishers import TrackingPublicationReceipt
+        from noesis_core.runtime_publication import RuntimePublicationGate
 
         assert Path(hooks.__file__).resolve().is_relative_to(
             (Path.cwd() / "DS9").resolve()
@@ -51,6 +52,7 @@ def test_ds9_processor_publishes_rate_limited_advancing_empty_frames() -> None:
             tracking_pub=Publisher(),
             camera_labels={0: "living-room"},
             sensor_id_map={},
+            publication_gate=RuntimePublicationGate(),
         )
         processor._tracking_empty_publish_interval_s = 0.5
         now = [100.0]
@@ -104,6 +106,7 @@ def test_ds9_processor_forces_same_count_tracker_replacement_publication() -> No
         from noesis.pipelines import hooks
         from noesis.telemetry.bev import BevPublicationReceipt
         from noesis.telemetry.publishers import TrackingPublicationReceipt
+        from noesis_core.runtime_publication import RuntimePublicationGate
 
         bev_frames = []
 
@@ -141,6 +144,7 @@ def test_ds9_processor_forces_same_count_tracker_replacement_publication() -> No
             sensor_id_map={},
             bev_renderer=Renderer(),
             bev_calibration=Calibration(),
+            publication_gate=RuntimePublicationGate(),
         )
         processor._tracking_publish_interval_s = 10.0
         processor._bev_publish_interval_s = 10.0
@@ -247,6 +251,7 @@ def test_ds9_processor_uses_pair_safe_tracking_bev_cadence_above_15fps() -> None
         from noesis.pipelines import hooks
         from noesis.telemetry.bev import BevPublicationReceipt
         from noesis.telemetry.publishers import TrackingPublicationReceipt
+        from noesis_core.runtime_publication import RuntimePublicationGate
 
         os.environ["NOESIS_REID_TEST_MODE"] = "1"
         os.environ["NOESIS_TRACKING_PUBLISH_MAX_HZ"] = "15"
@@ -304,6 +309,7 @@ def test_ds9_processor_uses_pair_safe_tracking_bev_cadence_above_15fps() -> None
             sensor_id_map={},
             bev_renderer=Renderer(),
             bev_calibration=Calibration(),
+            publication_gate=RuntimePublicationGate(),
         )
         now = [100.0]
         hooks.time.time = lambda: now[0]

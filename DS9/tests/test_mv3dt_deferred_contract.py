@@ -76,6 +76,7 @@ with (
 ):
     from noesis import ds9_runtime_core as runtime
     from noesis.pipelines import hooks
+    from noesis_core.runtime_publication import RuntimePublicationGate
 
 assert runtime._normalize_tracking_mode("mv3dt") == "mv3dt"
 assert hooks._AnalyticsTelemetryProcessor._normalize_tracking_mode("mv3dt") == "mv3dt"
@@ -104,6 +105,7 @@ try:
         camera_labels={0: "living-room"},
         sensor_id_map={},
         tracking_mode="mv3dt",
+        publication_gate=RuntimePublicationGate(),
     )
 except ValueError as exc:
     assert "MV3DT activation is deferred" in str(exc)

@@ -42,7 +42,7 @@ def test_runtime_closes_callback_resources_only_after_pipeline_quiescence(
     source = runtime_path.read_text(encoding="utf-8")
     shutdown = source[source.index('logger.info("Shutting down') :]
 
-    ordered_markers = (
+    ordered_prefix = (
         "_arm_shutdown_watchdog()",
         "rest_shutdown_receipt = _stop_rest_server(",
         "if not rest_shutdown_receipt.quiesced:",
@@ -50,9 +50,21 @@ def test_runtime_closes_callback_resources_only_after_pipeline_quiescence(
         "provider_shutdown_receipt = ws_server.quiesce_blocking_providers(",
         "detached_gateways = ws_server.begin_webrtc_shutdown(",
         "gateway_executor.submit(gateway.stop)",
-        "_stop_websocket_server(ws_server, ws_thread, ws_loop)",
-        "pipeline.cancel_control_timers()",
-        "pipeline.mark_depth_enabled(False)",
+    )
+    if runtime_path.name == "ds9_runtime_core.py":
+        ordered_runtime_boundary = (
+            "pipeline.cancel_control_timers()",
+            "pipeline.mark_depth_enabled(False)",
+            "runtime_publication_gate.close_and_wait(",
+            "_stop_websocket_server(ws_server, ws_thread, ws_loop)",
+        )
+    else:
+        ordered_runtime_boundary = (
+            "_stop_websocket_server(ws_server, ws_thread, ws_loop)",
+            "pipeline.cancel_control_timers()",
+            "pipeline.mark_depth_enabled(False)",
+        )
+    ordered_suffix = (
         "request_orderly_eos(pipeline)",
         "wait_thread.join(",
         "if not pipeline_quiesced:",
@@ -64,6 +76,7 @@ def test_runtime_closes_callback_resources_only_after_pipeline_quiescence(
         "diagnostics_logger.close()",
         "signal.alarm(0)",
     )
+    ordered_markers = ordered_prefix + ordered_runtime_boundary + ordered_suffix
     positions = [shutdown.index(marker) for marker in ordered_markers]
     assert positions == sorted(positions)
     rest_failure = shutdown[

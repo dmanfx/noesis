@@ -39,6 +39,7 @@ def _normalized_properties(path: Path) -> dict[str, str]:
 def _characterize_hook(adapter_root: Path, module_name: str = "hooks") -> dict[str, object]:
     script = r'''
 import json
+import inspect
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -61,12 +62,19 @@ cfg = {
         }
     }
 }
-processor = hooks._AnalyticsTelemetryProcessor(
+processor_kwargs = dict(
     pipeline=SimpleNamespace(config=cfg),
     tracking_pub=SimpleNamespace(),
     camera_labels={},
     sensor_id_map={},
 )
+if "publication_gate" in inspect.signature(
+    hooks._AnalyticsTelemetryProcessor
+).parameters:
+    from noesis_core.runtime_publication import RuntimePublicationGate
+
+    processor_kwargs["publication_gate"] = RuntimePublicationGate()
+processor = hooks._AnalyticsTelemetryProcessor(**processor_kwargs)
 calls = []
 class Native:
     @staticmethod

@@ -13,6 +13,7 @@ from typing import Mapping, MutableSequence, Sequence
 
 DS9_NATIVE_EXTENSION_MODULES: tuple[str, ...] = (
     "noesis_pose_meta_ext",
+    "noesis_analytics_meta_ext",
     "noesis_v3dt_meta_ext",
     "noesis_reid_meta_ext",
     "noesis_latency_ext",

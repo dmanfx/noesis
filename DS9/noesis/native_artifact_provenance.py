@@ -25,6 +25,8 @@ _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _MAX_MANIFEST_BYTES = 2 * 1024 * 1024
 _MAX_SOURCE_BYTES = 32 * 1024 * 1024
 _MAX_EXTENSION_BYTES = 128 * 1024 * 1024
+_SUPPLEMENTAL_NATIVE_MANIFEST = "native_artifact_manifest.yaml"
+_SUPPLEMENTAL_NATIVE_MODULES = frozenset({"noesis_analytics_meta_ext"})
 
 
 class DS9NativeArtifactProvenanceError(RuntimeError):
@@ -41,6 +43,13 @@ class _NativeContract:
 
 
 _NATIVE_CONTRACTS: Mapping[str, _NativeContract] = {
+    "noesis_analytics_meta_ext": _NativeContract(
+        artifact_id="native.analytics_meta",
+        output="DS9/native_extensions/noesis_analytics_meta_ext*.so",
+        sources=("DS9/native/noesis_analytics_meta_ext.cpp",),
+        builder="DS9/scripts/build_noesis_analytics_meta_ext.sh",
+        required_profiles=("runtime_common", "full"),
+    ),
     "noesis_pose_meta_ext": _NativeContract(
         artifact_id="native.pose_meta",
         output="DS9/native_extensions/noesis_pose_meta_ext*.so",
@@ -259,12 +268,16 @@ def _assert_identity(path: Path, expected: _FileIdentity, *, label: str) -> None
         )
 
 
-def _load_manifest(payload: bytes) -> Mapping[str, Any]:
+def _load_manifest(
+    payload: bytes,
+    *,
+    label: str = "DS9 asset manifest",
+) -> Mapping[str, Any]:
     try:
         text = payload.decode("utf-8")
     except UnicodeDecodeError as exc:
         raise DS9NativeArtifactProvenanceError(
-            "DS9 asset manifest must be UTF-8"
+            f"{label} must be UTF-8"
         ) from exc
     loader = _UniqueKeySafeLoader(text)
     try:
@@ -273,13 +286,13 @@ def _load_manifest(payload: bytes) -> Mapping[str, Any]:
         raise
     except yaml.YAMLError as exc:
         raise DS9NativeArtifactProvenanceError(
-            "DS9 asset manifest is not valid strict YAML"
+            f"{label} is not valid strict YAML"
         ) from exc
     finally:
         loader.dispose()
     if not isinstance(manifest, Mapping):
         raise DS9NativeArtifactProvenanceError(
-            "DS9 asset manifest root must be a mapping"
+            f"{label} root must be a mapping"
         )
     return manifest
 
@@ -348,6 +361,60 @@ def _require_manifest_authority(manifest: Mapping[str, Any]) -> None:
         )
 
 
+def _supplemental_native_records(
+    manifest: Mapping[str, Any],
+    *,
+    base_manifest_payload: bytes,
+) -> Mapping[str, Mapping[str, Any]]:
+    if set(manifest) != {"schema_version", "contract", "base_manifest", "artifacts"}:
+        raise DS9NativeArtifactProvenanceError(
+            "DS9 native artifact manifest has unexpected or missing fields"
+        )
+    if (
+        manifest.get("schema_version") != 1
+        or manifest.get("contract") != "noesis.ds9.native_artifact_manifest"
+        or manifest.get("base_manifest")
+        != {
+            "path": "DS9/asset_manifest.yaml",
+            "sha256": _sha256(base_manifest_payload),
+        }
+    ):
+        raise DS9NativeArtifactProvenanceError(
+            "DS9 native artifact manifest authority does not match the base manifest"
+        )
+    records = _artifact_records(manifest)
+    if set(records) != {"native.analytics_meta"}:
+        raise DS9NativeArtifactProvenanceError(
+            "DS9 native artifact manifest must contain exactly native.analytics_meta"
+        )
+    artifact = records["native.analytics_meta"]
+    if set(artifact) != {
+        "id",
+        "kind",
+        "role",
+        "output",
+        "sources",
+        "builder",
+        "required_profiles",
+        "state",
+        "compatibility",
+        "provenance",
+    }:
+        raise DS9NativeArtifactProvenanceError(
+            "DS9 native artifact manifest record has unexpected or missing fields"
+        )
+    compatibility = artifact.get("compatibility")
+    if compatibility != {
+        "deepstream_major": 9,
+        "cuda": "13.1",
+        "tensorrt": None,
+    }:
+        raise DS9NativeArtifactProvenanceError(
+            "DS9 native artifact manifest compatibility authority drifted"
+        )
+    return records
+
+
 def _sha256(payload: bytes) -> str:
     return hashlib.sha256(payload).hexdigest()
 
@@ -392,7 +459,33 @@ def attest_ds9_native_artifacts(
     )
     manifest = _load_manifest(manifest_payload)
     _require_manifest_authority(manifest)
-    records = _artifact_records(manifest)
+    records = dict(_artifact_records(manifest))
+    supplemental_path: Path | None = None
+    supplemental_payload: bytes | None = None
+    supplemental_identity: _FileIdentity | None = None
+    if set(requested) & _SUPPLEMENTAL_NATIVE_MODULES:
+        supplemental_path = ds9_root / _SUPPLEMENTAL_NATIVE_MANIFEST
+        supplemental_payload, supplemental_identity = _read_stable_regular(
+            supplemental_path,
+            root=repo_root,
+            label="DS9 native artifact manifest",
+            maximum_bytes=_MAX_MANIFEST_BYTES,
+        )
+        supplemental_manifest = _load_manifest(
+            supplemental_payload,
+            label="DS9 native artifact manifest",
+        )
+        supplemental_records = _supplemental_native_records(
+            supplemental_manifest,
+            base_manifest_payload=manifest_payload,
+        )
+        duplicates = sorted(set(records) & set(supplemental_records))
+        if duplicates:
+            raise DS9NativeArtifactProvenanceError(
+                "DS9 native artifact manifest duplicates base artifact IDs: "
+                + ", ".join(duplicates)
+            )
+        records.update(supplemental_records)
     extension_suffix = str(sysconfig.get_config_var("EXT_SUFFIX") or "")
     if not extension_suffix.startswith(".") or not extension_suffix.endswith(".so"):
         raise DS9NativeArtifactProvenanceError(
@@ -408,6 +501,10 @@ def attest_ds9_native_artifacts(
         if artifact is None:
             raise DS9NativeArtifactProvenanceError(
                 f"DS9 asset manifest is missing {contract.artifact_id}"
+            )
+        if artifact.get("state") == "missing":
+            raise DS9NativeArtifactProvenanceError(
+                f"{contract.artifact_id} is pending rebuild for the active DS9 SDK"
             )
         if (
             artifact.get("kind") != "native_extension"
@@ -509,6 +606,24 @@ def attest_ds9_native_artifacts(
         raise DS9NativeArtifactProvenanceError(
             "DS9 asset manifest changed during native attestation"
         )
+    if (
+        supplemental_path is not None
+        and supplemental_payload is not None
+        and supplemental_identity is not None
+    ):
+        final_supplemental, final_supplemental_identity = _read_stable_regular(
+            supplemental_path,
+            root=repo_root,
+            label="DS9 native artifact manifest",
+            maximum_bytes=_MAX_MANIFEST_BYTES,
+        )
+        if (
+            final_supplemental != supplemental_payload
+            or final_supplemental_identity != supplemental_identity
+        ):
+            raise DS9NativeArtifactProvenanceError(
+                "DS9 native artifact manifest changed during native attestation"
+            )
     return attested
 
 

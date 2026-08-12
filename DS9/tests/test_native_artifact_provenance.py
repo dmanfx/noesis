@@ -43,6 +43,29 @@ def _fixture(
     suffix = str(sysconfig.get_config_var("EXT_SUFFIX"))
     output = native_dir / f"{module_name}{suffix}"
     output.write_bytes(output_payload)
+    artifact = {
+        "id": contract.artifact_id,
+        "kind": "native_extension",
+        "role": "test-only reviewed native extension",
+        "output": contract.output,
+        "sources": list(contract.sources),
+        "builder": contract.builder,
+        "required_profiles": list(contract.required_profiles),
+        "state": "staged_unverified",
+        "compatibility": {
+            "deepstream_major": 9,
+            "cuda": "13.1",
+            "tensorrt": None,
+        },
+        "provenance": {
+            "source_sha256": _source_digest(source_payloads),
+            "output_sha256": hashlib.sha256(output_payload).hexdigest(),
+            "built_at_utc": "2026-07-11T00:00:00Z",
+            "build_host": "test-ds9-build-image",
+            "command": "test-only reviewed build command",
+        },
+    }
+    supplemental = module_name in provenance._SUPPLEMENTAL_NATIVE_MODULES
     manifest = {
         "schema_version": 2,
         "manifest_id": "noesis-ds9-artifacts",
@@ -68,29 +91,25 @@ def _fixture(
             "output_roots": ["DS9/native_extensions"],
             "source_roots": ["DS9/native"],
         },
-        "artifacts": [
-            {
-                "id": contract.artifact_id,
-                "kind": "native_extension",
-                "output": contract.output,
-                "sources": list(contract.sources),
-                "builder": contract.builder,
-                "required_profiles": list(contract.required_profiles),
-                "state": "staged_unverified",
-                "provenance": {
-                    "source_sha256": _source_digest(source_payloads),
-                    "output_sha256": hashlib.sha256(output_payload).hexdigest(),
-                    "built_at_utc": "2026-07-11T00:00:00Z",
-                    "build_host": "test-ds9-build-image",
-                    "command": "test-only reviewed build command",
-                },
-            }
-        ],
+        "artifacts": [] if supplemental else [artifact],
     }
-    (ds9_root / "asset_manifest.yaml").write_text(
-        yaml.safe_dump(manifest, sort_keys=False),
-        encoding="utf-8",
-    )
+    manifest_path = ds9_root / "asset_manifest.yaml"
+    manifest_path.write_text(yaml.safe_dump(manifest, sort_keys=False), encoding="utf-8")
+    if supplemental:
+        manifest_payload = manifest_path.read_bytes()
+        native_manifest = {
+            "schema_version": 1,
+            "contract": "noesis.ds9.native_artifact_manifest",
+            "base_manifest": {
+                "path": "DS9/asset_manifest.yaml",
+                "sha256": hashlib.sha256(manifest_payload).hexdigest(),
+            },
+            "artifacts": [artifact],
+        }
+        (ds9_root / provenance._SUPPLEMENTAL_NATIVE_MANIFEST).write_text(
+            yaml.safe_dump(native_manifest, sort_keys=False),
+            encoding="utf-8",
+        )
     return ds9_root, native_dir, source_paths, output
 
 
@@ -112,6 +131,52 @@ def test_exact_content_passes_when_binary_mtime_is_older_than_source(
         os.utime(source, (2, 2))
 
     assert _attest(ds9_root, native_dir, module_name) == {module_name: output}
+
+
+def test_analytics_extension_uses_manifest_bound_supplement(
+    tmp_path: Path,
+) -> None:
+    module_name = "noesis_analytics_meta_ext"
+    ds9_root, native_dir, _sources, output = _fixture(tmp_path, module_name)
+
+    assert _attest(ds9_root, native_dir, module_name) == {module_name: output}
+
+    manifest_path = ds9_root / "asset_manifest.yaml"
+    manifest_path.write_bytes(manifest_path.read_bytes() + b"\n")
+    with pytest.raises(
+        provenance.DS9NativeArtifactProvenanceError,
+        match="authority does not match the base manifest",
+    ):
+        _attest(ds9_root, native_dir, module_name)
+
+
+def test_missing_supplemental_artifact_fails_before_binary_lookup(
+    tmp_path: Path,
+) -> None:
+    module_name = "noesis_analytics_meta_ext"
+    ds9_root, native_dir, _sources, output = _fixture(tmp_path, module_name)
+    output.unlink()
+    native_manifest_path = ds9_root / provenance._SUPPLEMENTAL_NATIVE_MANIFEST
+    native_manifest = yaml.safe_load(native_manifest_path.read_text(encoding="utf-8"))
+    artifact = native_manifest["artifacts"][0]
+    artifact["state"] = "missing"
+    artifact["provenance"] = {
+        "source_sha256": artifact["provenance"]["source_sha256"],
+        "output_sha256": "pending_ds9_1_rebuild",
+        "built_at_utc": None,
+        "build_host": None,
+        "command": "bash DS9/scripts/build_noesis_analytics_meta_ext.sh",
+    }
+    native_manifest_path.write_text(
+        yaml.safe_dump(native_manifest, sort_keys=False),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(
+        provenance.DS9NativeArtifactProvenanceError,
+        match="native.analytics_meta is pending rebuild for the active DS9 SDK",
+    ):
+        _attest(ds9_root, native_dir, module_name)
 
 
 @pytest.mark.parametrize("target", ["source", "output"])

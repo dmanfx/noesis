@@ -234,9 +234,10 @@ def test_missing_selected_origin_is_rejected(
             )
 
 
-def test_exact_six_module_set_is_shared_with_preflight() -> None:
+def test_exact_seven_module_set_is_shared_with_preflight() -> None:
     expected = (
         "noesis_pose_meta_ext",
+        "noesis_analytics_meta_ext",
         "noesis_v3dt_meta_ext",
         "noesis_reid_meta_ext",
         "noesis_latency_ext",

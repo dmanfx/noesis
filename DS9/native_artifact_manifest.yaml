@@ -1,0 +1,21 @@
+schema_version: 1
+contract: noesis.ds9.native_artifact_manifest
+base_manifest:
+  path: DS9/asset_manifest.yaml
+  sha256: 12d66f1afe959bc822b54833c4dd4c1294852b9391a5047fe810158f3242f60f
+artifacts:
+  - id: native.analytics_meta
+    kind: native_extension
+    role: NvDsAnalytics object metadata extraction through public Service Maker iteration
+    output: DS9/native_extensions/noesis_analytics_meta_ext*.so
+    sources: [DS9/native/noesis_analytics_meta_ext.cpp]
+    builder: DS9/scripts/build_noesis_analytics_meta_ext.sh
+    required_profiles: [runtime_common, full]
+    state: missing
+    compatibility: {deepstream_major: 9, cuda: "13.1", tensorrt: null}
+    provenance:
+      source_sha256: d9f3e48e33efc20a6aac29176014796fbda3956ce8347657739a67a75dbbe765
+      output_sha256: pending_ds9_1_rebuild
+      built_at_utc: null
+      build_host: null
+      command: bash DS9/scripts/build_noesis_analytics_meta_ext.sh

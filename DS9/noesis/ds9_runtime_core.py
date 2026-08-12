@@ -6410,15 +6410,6 @@ def _run_main(startup_main_guard: StartupMainGuard) -> int:
     ws_server.webrtc_activity_callback = None
 
     try:
-        _stop_websocket_server(ws_server, ws_thread, ws_loop)
-    except Exception:
-        runtime_state["pipeline_failed"] = True
-        logger.exception("WebSocket listener/worker quiescence failed")
-        while True:
-            signal.pause()
-    runtime_state["websocket_shutdown_quiesced"] = True
-
-    try:
         pipeline.cancel_control_timers()
         pipeline.mark_depth_enabled(False)
     except Exception:
@@ -6459,6 +6450,15 @@ def _run_main(startup_main_guard: StartupMainGuard) -> int:
         logger.exception("Native runtime publication gate shutdown failed")
         while True:
             signal.pause()
+
+    try:
+        _stop_websocket_server(ws_server, ws_thread, ws_loop)
+    except Exception:
+        runtime_state["pipeline_failed"] = True
+        logger.exception("WebSocket listener/worker quiescence failed")
+        while True:
+            signal.pause()
+    runtime_state["websocket_shutdown_quiesced"] = True
 
     # The live-source reconnect probe inside nvurisrcbin intentionally drops
     # pipeline-level EOS.  Request EOS from the repo-owned bridge immediately

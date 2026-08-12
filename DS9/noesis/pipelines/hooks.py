@@ -68,6 +68,7 @@ from noesis_core.servicemaker_shutdown import is_synthetic_stub_pipeline
 from noesis_core.depth_contract import usable_registered_depth_m
 from noesis_core.scene_prior import ScenePriorError, ScenePriorSet
 from noesis_core.analytics_zones import resolve_authoritative_analytics_zone
+from noesis_core.runtime_publication import RuntimePublicationGate
 from noesis_core.tracking_continuity import (
     TrackingLifecycleRegistry,
     pair_safe_publication_interval_s,
@@ -1277,6 +1278,7 @@ def attach_analytics_telemetry_hook(
     world_fusion_policy: WorldFusionPolicy | None = None,
     scene_priors: ScenePriorSet | None = None,
     diagnostics_logger: "TrackingDiagnosticsLogger" | None = None,
+    publication_gate: RuntimePublicationGate,
 ) -> None:
     """Attach a BatchMetadataOperator that extracts analytics telemetry."""
     if tracking_pub is None:
@@ -1304,6 +1306,7 @@ def attach_analytics_telemetry_hook(
         world_fusion_policy=world_fusion_policy,
         scene_priors=scene_priors,
         diagnostics_logger=diagnostics_logger,
+        publication_gate=publication_gate,
     )
     analytics_component.config["_analytics_processor"] = processor
     setattr(pipeline, "analytics_telemetry_processor", processor)
@@ -6693,6 +6696,7 @@ class _AnalyticsTelemetryProcessor:
     tracking_pub: "TrackingTelemetryPublisher"
     camera_labels: Mapping[int, str]
     sensor_id_map: Mapping[int, int]
+    publication_gate: RuntimePublicationGate
     tracking_mode: Optional[str] = None
     bev_renderer: Any = None
     bev_calibration: Any = None
@@ -7399,6 +7403,14 @@ class _AnalyticsTelemetryProcessor:
         return None
 
     def handle_frame_ds8(self, frame_meta: Any) -> None:
+        lease = self.publication_gate.acquire()
+        if lease is None:
+            _increment_core_counter("runtime_publication_gate_rejected_frames_total")
+            return
+        with lease:
+            self._handle_frame_ds8_admitted(frame_meta)
+
+    def _handle_frame_ds8_admitted(self, frame_meta: Any) -> None:
         """Extract tracking telemetry for a single frame using DS8 pyservicemaker API."""
         frame_start_ns = time.perf_counter_ns()
         try:
@@ -7965,6 +7977,14 @@ class _AnalyticsTelemetryProcessor:
             _record_core_stage_timing("analytics.handle_frame_ds8", frame_start_ns)
 
     def handle_frame(self, frame_meta: Any) -> None:
+        lease = self.publication_gate.acquire()
+        if lease is None:
+            _increment_core_counter("runtime_publication_gate_rejected_frames_total")
+            return
+        with lease:
+            self._handle_frame_compat_admitted(frame_meta)
+
+    def _handle_frame_compat_admitted(self, frame_meta: Any) -> None:
         """Extract tracking telemetry for a single frame and publish it."""
         if not _allow_raw_pyds_compat():
             _record_quarantined_compat_path("_AnalyticsTelemetryProcessor.handle_frame", _PYDS_COMPAT_ENV)

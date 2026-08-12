@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import ast
 import tempfile
 import time
 import unittest
@@ -154,8 +155,21 @@ class WorldSnapshotRuntimeTests(unittest.TestCase):
         self.assertIn("health_monitor=capability_monitor", runtime)
 
     def test_ds9_tracking_publisher_has_no_ds8_contract_drift(self) -> None:
-        ds8 = (REPO_ROOT / "noesis" / "telemetry" / "publishers.py").read_text(encoding="utf-8")
-        ds9 = (REPO_ROOT / "DS9" / "noesis" / "telemetry" / "publishers.py").read_text(encoding="utf-8")
+        def tracking_class(path: Path) -> str:
+            source = path.read_text(encoding="utf-8")
+            tree = ast.parse(source)
+            node = next(
+                item
+                for item in tree.body
+                if isinstance(item, ast.ClassDef)
+                and item.name == "TrackingTelemetryPublisher"
+            )
+            return ast.get_source_segment(source, node) or ""
+
+        ds8 = tracking_class(REPO_ROOT / "noesis" / "telemetry" / "publishers.py")
+        ds9 = tracking_class(
+            REPO_ROOT / "DS9" / "noesis" / "telemetry" / "publishers.py"
+        )
         self.assertEqual(ds9, ds8)
 
     def test_both_ds9_public_track_paths_apply_time_and_identity_contracts(self) -> None:

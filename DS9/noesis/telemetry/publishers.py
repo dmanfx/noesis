@@ -6,6 +6,7 @@ import time
 from typing import Any, Iterable, Mapping, NamedTuple, Optional, Sequence
 
 from noesis.metadata.depth_result import DepthResult
+from noesis_core.runtime_publication import RuntimePublicationGate
 from noesis_core.tracking_continuity import (
     TRACKING_CONTINUITY_CONTRACT,
     TRACKING_CONTINUITY_CONTRACT_VERSION,
@@ -99,16 +100,25 @@ class DepthTelemetryPublisher:
     def __init__(
         self,
         ws_server: Any,
+        publication_gate: RuntimePublicationGate,
         failure_callback: Optional[Any] = None,
     ) -> None:
         self._ws = ws_server
         self._failure_callback = failure_callback
+        self._publication_gate = publication_gate
 
     def _report_failure(self, error: BaseException) -> None:
         if callable(self._failure_callback):
             self._failure_callback(error)
 
     def publish(self, result: DepthResult) -> None:
+        lease = self._publication_gate.acquire()
+        if lease is None:
+            return
+        with lease:
+            self._publish_admitted(result)
+
+    def _publish_admitted(self, result: DepthResult) -> None:
         response_model_started_ns = time.perf_counter_ns()
         try:
             message = {

@@ -45,7 +45,8 @@ RUN python3 -m pip install --no-cache-dir -r /opt/noesis/requirements.lock.txt \
       /opt/nvidia/deepstream/deepstream/service-maker/python/pyservicemaker*.whl \
     && python3 -m pip check \
     && test "$(python3 -c 'import pybind11; print(pybind11.__version__)')" = "2.12.0" \
-    && python3 -c 'import pyservicemaker; assert pyservicemaker.__file__'
+    && LD_LIBRARY_PATH=/usr/local/cuda-13.2/compat/lib.real:${LD_LIBRARY_PATH:-} \
+      python3 -c 'import pyservicemaker; assert pyservicemaker.__file__'
 
 RUN GST_REGISTRY=/tmp/noesis-ds9-gst-registry.bin \
       gst-inspect-1.0 nice >/dev/null \

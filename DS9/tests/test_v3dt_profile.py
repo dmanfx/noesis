@@ -90,7 +90,7 @@ else:
         preflight = _load_module(
             "ds9_preflight_driver_floor_test", "DS9/scripts/ds9_preflight.py"
         )
-        result = SimpleNamespace(returncode=0, stdout="590.47.99\n", stderr="")
+        result = SimpleNamespace(returncode=0, stdout="595.58.02\n", stderr="")
         with (
             mock.patch.object(preflight.shutil, "which", return_value="/usr/bin/nvidia-smi"),
             mock.patch.object(preflight.subprocess, "run", return_value=result),

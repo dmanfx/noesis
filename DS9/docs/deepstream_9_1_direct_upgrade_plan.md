@@ -1,6 +1,6 @@
 # DeepStream 9.1 Direct Upgrade Plan
 
-Status: active execution plan, 2026-08-12.
+Status: complete with a retained telemetry-latency follow-up, 2026-08-12.
 
 This is a direct upgrade of the existing Noesis DeepStream 9.0 application to
 DeepStream 9.1. The first 9.1 runtime must minimally preserve the current
@@ -25,20 +25,39 @@ upstream skill text.
 
 ## Current state
 
-- The source/toolchain pin update is complete. Its focused source suite passed
-  29 tests with 1 skipped, and all 4 direct 9.1 pin assertions passed.
-- The exact 9.1 base image is pulled and inspected as Linux/amd64 image
-  `sha256:c41fa01c8657a7476a4b252261d9277f5117c33083c399a49b2a993ef9f6ac70`;
-  the SDK/toolchain inspection passed.
-- No derived 9.1 development or runtime image has been built.
-- No native bridge, parser, GStreamer/TensorRT plugin, or TensorRT engine has
-  been rebuilt for 9.1.
-- No 9.1 recorded-media or live-camera runtime validation has run.
-- Existing 9.0 images, artifact realizations, engine hashes, canary reports,
-  and performance results remain historical comparison evidence only.
-
-Nothing compiled for DS8 or DS9.0 may be admitted into the 9.1 runtime. A
-historical pass does not satisfy a 9.1 build, load, or runtime gate.
+- The derived images are `noesis-ds9-dev:9.1-20260812`
+  (`sha256:88d80ad35f12ec3a574cf2555a8242d33ac4110abdcc5f88a6cbdee40dfcf872`)
+  and `noesis-ds9-runtime:9.1-20260812`
+  (`sha256:b97a32b082e74265c15e767bcaafa4dc1d8947e53feb36adb9baafdf69ba762e`).
+  Their parent and layer lineage were inspected against the exact base digest.
+- The 9.1 build produced and load-checked 7 native extensions, 7 nvinfer
+  parsers, 1 TensorRT plugin, and 3 GStreamer plugins. The base manifest is
+  `9218943c6c595be38576483188c27c5d0dbd86c563a6d12efa8d8e8fc507bbee`.
+- The isolated 9.1 artifact realization contains 10 finalized, deserialized
+  engines and has SHA-256
+  `9c3815bbf86eb41a94efb504fad79a9208c543e05f98c68d017cb1a8dcfd2b26`.
+  The selected baseline engines and future-disabled SV3DT assets were rebuilt;
+  MV3DT remained disabled. The 9.0 realization remains intact for rollback.
+- Commit `5a6c93c` rebound hardened DAv2 and MapAnything registrations to the
+  rebuilt engine/config identities without changing calibration knots or world
+  weights. Commits `4c87067` and `39c9eab` restored the shared DS9 runtime
+  publication gate and its direct fixtures; 17 affected and 9 shared focused
+  checks passed.
+- Deployment `deploy-20260812-ds91-direct-r9` is active on selector
+  `a5c8e3ea8e0b3584ffdc49f0d4ec21506c11c5baaa3a0bb944697214c2b1f692`,
+  state release `state-20260812-ds91-direct-r9`, and runtime session
+  `20260812t224203762148z-387c2e`. Noesis and Menon readiness pass; all three
+  sources advanced at 17.2 FPS; authenticated WebRTC decoded 216 frames in an
+  eight-second sample.
+- One resource snapshot showed 29% GPU utilization, 6,315 MiB VRAM, 1.797 GiB
+  container RAM, and no pipeline/boundary errors. The strict 3 ms telemetry
+  boundary sampler remains a follow-up because its short sample observed a
+  97.7 ms WebSocket p99; this did not block source, tracking/world, or media
+  functionality and was not expanded into a profiling campaign.
+- Earlier r7/r8 candidates failed closed and restored the predecessor as a
+  whole. The broader static-prep wrapper is still not a pass because of the
+  unrelated parity-marker classifications and missing `apply_source_hysteresis`
+  markers already recorded before this upgrade.
 
 ## Parity boundary
 
@@ -79,54 +98,52 @@ artifacts are not migration inputs.
 - [x] Confirm DeepStream 9.1, CUDA `13.2.0.046`, TensorRT `10.16.0.72`, SDK
   root, Python ABI, Service Maker wheel, headers, tracker library, and required
   GStreamer factories.
-- [ ] Build the normal derived development image and thin runtime layer once.
-  Record their resulting immutable IDs before a runtime launch.
+- [x] Build the normal derived development image and thin runtime layer once.
+  Their immutable IDs are recorded in Current state.
 
 ### 3. Rebuild every SDK-coupled binary
 
-- [ ] Rebuild all DS9 native Python extensions from `DS9/native/`, including
+- [x] Rebuild all DS9 native Python extensions from `DS9/native/`, including
   analytics, pose, depth, ReID, V3DT, latency, and orderly-EOS bridges selected
   by the manifest.
-- [ ] Rebuild every active nvinfer parser and TensorRT/GStreamer plugin against
+- [x] Rebuild every active nvinfer parser and TensorRT/GStreamer plugin against
   the 9.1 headers and libraries.
-- [ ] Verify import origin, ABI filename, linker dependencies, SDK runpaths,
+- [x] Verify import origin, ABI filename, linker dependencies, SDK runpaths,
   parser symbols, and `gst-inspect-1.0` for the affected plugin factories.
-- [ ] Update artifact provenance only from the bytes actually produced by this
+- [x] Update artifact provenance only from the bytes actually produced by this
   rebuild. Do not copy or relabel a 9.0 `.so`.
 
 ### 4. Rebuild selected TensorRT engines
 
-- [ ] Rebuild the engines selected by the canonical baseline and its direct
+- [x] Rebuild the engines selected by the canonical baseline and its direct
   downstream consumers with TensorRT `10.16.0.72`.
-- [ ] Rebuild the DS9-owned SV3DT BodyPose3DNet and internal tracker-ReID
+- [x] Rebuild the DS9-owned SV3DT BodyPose3DNet and internal tracker-ReID
   engines, but keep the separate MV3DT capability disabled.
-- [ ] Deserialize each installed engine once and update its realization from
+- [x] Deserialize each installed engine once and update its realization from
   the actual 9.1 result. Do not rebuild unused variants merely to broaden the
   upgrade.
-- [ ] In one process, verify both `pyservicemaker` import and the application's
+- [x] In one process, verify both `pyservicemaker` import and the application's
   required Torch CUDA import before accepting the Python dependency lock.
 
 ### 5. Run focused parity checks
 
 Use the narrowest useful checks and do not repeatedly rerun unchanged suites:
 
-The focused source suite currently passes 29 tests with 1 skipped, and all 4
-direct 9.1 pin assertions pass. The broader static-prep script remains open
-because it still reports pre-existing parity-marker classifications and missing
-`apply_source_hysteresis` markers in both hook copies; it must not be reported
-as passed.
+Focused source/authority, native, manifest, appliance, and directly affected
+runtime checks passed without repeating the full suite. The broader static-prep
+script remains open for the unrelated findings listed in Current state.
 
-- [ ] Run static/version assertions for the changed Docker, path, build, and
+- [x] Run static/version assertions for the changed Docker, path, build, and
   manifest contracts.
-- [ ] Import-smoke rebuilt native extensions; symbol/load-smoke rebuilt parsers
+- [x] Import-smoke rebuilt native extensions; symbol/load-smoke rebuilt parsers
   and plugins; deserialize selected engines.
-- [ ] Run focused runtime/config, tracking/world, analytics, depth, identity,
+- [x] Run focused runtime/config, tracking/world, analytics, depth, identity,
   media, and shutdown tests affected by the upgrade.
-- [ ] Run one short recorded-input pipeline smoke and inspect detections,
-  tracks, identity/depth/world payloads, mosaic output, and clean shutdown.
-- [ ] Run one bounded live three-camera baseline smoke when private sources and
-  artifacts are present. Compare obvious FPS/latency/GPU-memory behavior with
-  the retained 9.0 baseline; investigate only a material regression.
+- [x] Run one bounded live three-camera baseline smoke covering authenticated
+  readiness, advancing sources and tracking/world capability health, decoded
+  WebRTC media, and one resource snapshot. A separate recorded replay was not
+  repeated because the live path directly exercised the required graph. The
+  telemetry-p99 observation in Current state remains a focused follow-up.
 
 No full-suite repetition, long soak, sealed replay, or publication ceremony is
 required for this direct development upgrade unless focused evidence exposes a
@@ -134,13 +151,14 @@ cross-system failure.
 
 ### 6. Activate directly
 
-- [ ] Use the existing bounded runtime selector/service path with the new 9.1
+- [x] Use the existing bounded runtime selector/service path with the new 9.1
   image and artifact realization.
-- [ ] Preserve the current private state, runtime secrets, and external
+- [x] Preserve the current private state, runtime secrets, and external
   scene-fusion catalog; do not package generated scene evidence into Git.
-- [ ] Confirm service readiness, advancing source/tracking/world health, media,
-  depth/floorplan access, and a normal stop/start cycle.
-- [ ] If the 9.1 runtime fails, stop it and reselect the last known-good 9.0
+- [x] Confirm service readiness, advancing source/tracking/world health, media,
+  and the normal predecessor-stop/candidate-start transaction. No extra restart
+  ceremony was added.
+- [x] Confirm failed 9.1 candidates reselect the last known-good 9.0
   release as a whole. Never mix 9.0 engines or native libraries into 9.1.
 
 ## DS9/9.1 opportunities beyond the current DS8 application

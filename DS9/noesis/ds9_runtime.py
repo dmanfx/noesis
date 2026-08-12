@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+import json
 import os
 import subprocess
 import sys
@@ -9,14 +10,33 @@ from pathlib import Path
 
 DS9_ROOT = Path(__file__).resolve().parents[1]
 REPO_ROOT = DS9_ROOT.parent
+for _bootstrap_path in (str(DS9_ROOT), str(REPO_ROOT)):
+    while _bootstrap_path in sys.path:
+        sys.path.remove(_bootstrap_path)
+sys.path.insert(0, str(REPO_ROOT))
+sys.path.insert(0, str(DS9_ROOT))
+
+from noesis.runtime_paths import (  # noqa: E402
+    configure_ds9_runtime_import_paths,
+    load_ds9_native_extensions,
+)
+from noesis.native_artifact_provenance import (  # noqa: E402
+    attest_ds9_native_artifacts,
+)
+from noesis_core.servicemaker_shutdown import (  # noqa: E402
+    synthetic_stub_lifecycle_evidence,
+)
+
+
+_ENV_TRUE = {"1", "true", "yes", "y", "on"}
 
 
 def _ensure_runtime_sys_path() -> None:
-    for value in (str(DS9_ROOT), str(REPO_ROOT)):
-        if value in sys.path:
-            sys.path.remove(value)
-    sys.path.insert(0, str(REPO_ROOT))
-    sys.path.insert(0, str(DS9_ROOT))
+    configure_ds9_runtime_import_paths(
+        ds9_root=DS9_ROOT,
+        repo_root=REPO_ROOT,
+        system_site=_ds9_system_python_site(),
+    )
 
 
 def _prepend_env_path(name: str, value: Path) -> None:
@@ -28,28 +48,38 @@ def _prepend_env_path(name: str, value: Path) -> None:
     os.environ[name] = os.pathsep.join(parts)
 
 
-def _prepend_sys_path(value: Path) -> None:
-    value_str = str(value)
-    if value_str in sys.path:
-        sys.path.remove(value_str)
-    sys.path.insert(0, value_str)
-
-
 def _ds9_system_python_site() -> Path:
     return Path(f"/usr/local/lib/python{sys.version_info.major}.{sys.version_info.minor}/dist-packages")
 
 
-def _truthy_env(name: str, default: bool) -> bool:
-    raw = str(os.environ.get(name, "1" if default else "0")).strip().lower()
-    return raw not in {"0", "false", "no", "off"}
+def _configured_model_root() -> Path:
+    raw = str(os.environ.get("NOESIS_DS9_ARTIFACT_ROOT", "") or "").strip()
+    if not raw:
+        return (DS9_ROOT / "models").resolve()
+    candidate = Path(raw).expanduser()
+    if not candidate.is_absolute():
+        raise SystemExit(f"[FATAL] NOESIS_DS9_ARTIFACT_ROOT must be absolute: {raw}")
+    artifact_root = candidate.resolve(strict=False)
+    if artifact_root in {Path("/"), REPO_ROOT.resolve(), DS9_ROOT.resolve()}:
+        raise SystemExit(f"[FATAL] refusing unsafe NOESIS_DS9_ARTIFACT_ROOT: {artifact_root}")
+    try:
+        artifact_root.relative_to(REPO_ROOT.resolve())
+    except ValueError:
+        pass
+    else:
+        raise SystemExit(
+            f"[FATAL] NOESIS_DS9_ARTIFACT_ROOT must not be inside the checkout: {artifact_root}"
+        )
+    return artifact_root / "models"
 
 
 def _set_ds9_environment() -> None:
+    model_root = _configured_model_root()
     os.environ.setdefault("NOESIS_DEEPSTREAM_MAJOR", "9")
     os.environ.setdefault("NOESIS_DEEPSTREAM_HOME", "/opt/nvidia/deepstream/deepstream-9.0")
-    os.environ.setdefault("NOESIS_MODEL_DIR", str(DS9_ROOT / "models"))
-    os.environ.setdefault("NOESIS_ONNX_DIR", str(DS9_ROOT / "models" / "onnx"))
-    os.environ.setdefault("NOESIS_ENGINE_DIR", str(DS9_ROOT / "models" / "engines"))
+    os.environ.setdefault("NOESIS_MODEL_DIR", str(model_root))
+    os.environ.setdefault("NOESIS_ONNX_DIR", str(model_root / "onnx"))
+    os.environ.setdefault("NOESIS_ENGINE_DIR", str(model_root / "engines"))
     os.environ.setdefault("NOESIS_PIPELINE_DIR", str(DS9_ROOT / "pipelines"))
     os.environ.setdefault("NOESIS_BUILD_DIR", str(DS9_ROOT / "build"))
     os.environ.setdefault("NOESIS_NATIVE_EXT_DIR", str(DS9_ROOT / "native_extensions"))
@@ -62,17 +92,78 @@ def _set_ds9_environment() -> None:
     ds9_site = _ds9_system_python_site()
     if (ds9_site / "pyservicemaker" / "_pydeepstream.so").exists():
         _prepend_env_path("PYTHONPATH", ds9_site)
-        _prepend_sys_path(ds9_site)
 
-    _prepend_env_path("PYTHONPATH", DS9_ROOT / "native_extensions")
-    _prepend_sys_path(DS9_ROOT / "native_extensions")
+    native_dir = Path(os.environ["NOESIS_NATIVE_EXT_DIR"])
+    _prepend_env_path("PYTHONPATH", native_dir)
+    attest_ds9_native_artifacts(ds9_root=DS9_ROOT, native_dir=native_dir)
+    native_dir = configure_ds9_runtime_import_paths(
+        ds9_root=DS9_ROOT,
+        repo_root=REPO_ROOT,
+        system_site=ds9_site,
+    )
+    load_ds9_native_extensions(native_dir)
     _prepend_env_path("LD_LIBRARY_PATH", Path(os.environ["NOESIS_DEEPSTREAM_HOME"]) / "lib")
     _prepend_env_path("GST_PLUGIN_PATH", Path(os.environ["NOESIS_GST_PLUGIN_DIR"]))
 
 
-def _run_preflight() -> int:
+def _run_preflight(config_path: Path, cameras_path: Path) -> int:
     script = DS9_ROOT / "scripts" / "ds9_preflight.py"
-    return subprocess.run([sys.executable, str(script)], cwd=str(REPO_ROOT)).returncode
+    return subprocess.run(
+        [
+            sys.executable,
+            str(script),
+            "--config",
+            str(config_path),
+            "--cameras-config",
+            str(cameras_path),
+        ],
+        cwd=str(REPO_ROOT),
+    ).returncode
+
+
+def _argv_value(name: str) -> str | None:
+    for index, value in enumerate(sys.argv[1:], start=1):
+        if value == name and index + 1 < len(sys.argv):
+            return sys.argv[index + 1]
+        prefix = f"{name}="
+        if value.startswith(prefix):
+            return value[len(prefix) :]
+    return None
+
+
+def _v3dt_requested() -> bool:
+    if "--v3dt" in sys.argv[1:]:
+        return True
+    raw = _argv_value("--tracking-mode")
+    if raw is None:
+        raw = os.environ.get("NOESIS_TRACKING_MODE", "")
+    return str(raw or "").strip().lower() in {"v3dt", "sv3dt", "mv3dt", "3d"}
+
+
+def _selected_launch_paths() -> tuple[Path, Path, bool, bool]:
+    v3dt = _v3dt_requested()
+    pipeline_raw = _argv_value("--pipeline-config")
+    cameras_raw = _argv_value("--cameras-config")
+    pipeline_explicit = pipeline_raw is not None
+    cameras_explicit = cameras_raw is not None
+    if pipeline_raw is None:
+        pipeline_raw = os.environ.get("NOESIS_DS9_PIPELINE_CONFIG", "").strip()
+    if cameras_raw is None:
+        cameras_raw = os.environ.get("NOESIS_CAMERAS_CONFIG", "").strip()
+    if not pipeline_raw:
+        pipeline_raw = str(DS9_ROOT / "config" / ("infer_v3dt.yaml" if v3dt else "infer.yaml"))
+    if not cameras_raw:
+        cameras_raw = str(
+            DS9_ROOT / "config" / "cameras_v3dt.yaml"
+            if v3dt
+            else REPO_ROOT / "config" / "cameras.yaml"
+        )
+    return (
+        Path(pipeline_raw).expanduser().resolve(),
+        Path(cameras_raw).expanduser().resolve(),
+        pipeline_explicit,
+        cameras_explicit,
+    )
 
 
 def _preload_ds9_python_runtime() -> None:
@@ -90,29 +181,43 @@ def _preload_ds9_python_runtime() -> None:
         print(f"[WARN] DS9 Torch CUDA warmup skipped: {type(exc).__name__}: {exc}", file=sys.stderr)
 
 
+def _synthetic_stub_requested() -> bool:
+    """Return true only for the DS9-owned explicit synthetic test selector."""
+
+    return str(os.environ.get("NOESIS_DS9_STUB_PIPELINE", "")).strip().lower() in _ENV_TRUE
+
+
 def main() -> int:
     _ensure_runtime_sys_path()
     _set_ds9_environment()
-    if _run_preflight() != 0:
-        return 1
-
-    _preload_ds9_python_runtime()
+    pipeline_path, cameras_path, pipeline_explicit, cameras_explicit = _selected_launch_paths()
+    synthetic_stub = _synthetic_stub_requested()
+    if synthetic_stub:
+        print(
+            json.dumps(
+                {
+                    "event": "pipeline_backend_selected",
+                    **synthetic_stub_lifecycle_evidence(),
+                },
+                separators=(",", ":"),
+            ),
+            file=sys.stderr,
+        )
+    else:
+        if _run_preflight(pipeline_path, cameras_path) != 0:
+            return 1
+        _preload_ds9_python_runtime()
 
     from noesis.ds9_runtime_core import main as _runtime_main
 
-    if "--pipeline-config" not in sys.argv:
-        sys.argv.extend(["--pipeline-config", str(DS9_ROOT / "config" / "infer.yaml")])
-    if "--cameras-config" not in sys.argv:
-        sys.argv.extend(["--cameras-config", str(REPO_ROOT / "config" / "cameras.yaml")])
+    if not pipeline_explicit:
+        sys.argv.extend(["--pipeline-config", str(pipeline_path)])
+    if not cameras_explicit:
+        sys.argv.extend(["--cameras-config", str(cameras_path)])
     if "--storage-base" not in sys.argv:
         sys.argv.extend(["--storage-base", str(DS9_ROOT / "data" / "depth")])
     return int(_runtime_main())
 
 
 if __name__ == "__main__":
-    _exit_code = int(main())
-    if _truthy_env("NOESIS_DS9_BYPASS_NATIVE_GC_ON_EXIT", True):
-        sys.stdout.flush()
-        sys.stderr.flush()
-        os._exit(_exit_code)
-    raise SystemExit(_exit_code)
+    raise SystemExit(int(main()))

@@ -1,14 +1,17 @@
 #!/usr/bin/env python3
+# ruff: noqa: E402 - DS9 import authority must be established before runtime imports.
 from __future__ import annotations
 
 import argparse
 import asyncio
+import concurrent.futures
 import configparser
 import ctypes
 import copy
+import hashlib
 import inspect
-import json
 import logging
+import math
 import os
 import re
 import subprocess
@@ -18,43 +21,66 @@ import sys
 import threading
 import time
 from pathlib import Path
-from typing import Any, Callable, Dict, Optional, Tuple, Mapping
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Mapping, NamedTuple, NoReturn, Optional, Tuple
 
 import yaml
 import numpy as np
 
+if TYPE_CHECKING:
+    import uvicorn
+    from fastapi import FastAPI
+
 DS9_ROOT = Path(__file__).resolve().parents[1]
 REPO_ROOT = DS9_ROOT.parent
 for _path in (str(DS9_ROOT), str(REPO_ROOT)):
-    if _path in sys.path:
+    while _path in sys.path:
         sys.path.remove(_path)
 sys.path.insert(0, str(REPO_ROOT))
 sys.path.insert(0, str(DS9_ROOT))
 
-
-def _agent_debug_log_path() -> Path:
-    return Path(os.environ.get("NOESIS_AGENT_DEBUG_LOG", REPO_ROOT / ".cursor" / "debug.log")).expanduser()
-
-
-from calibration_bundle import (
-    assemble_calibration_bundle,
-    load_alignment,
-    load_extrinsics,
-    load_intrinsics,
-    pose_to_E_col_major,
-    save_alignment,
-    save_extrinsics,
+from noesis.runtime_paths import (  # noqa: E402
+    configure_ds9_runtime_import_paths,
+    require_ds9_native_extension_origins,
 )
-from geometry.depth_source import DepthStorageManager
+from noesis.native_artifact_provenance import (  # noqa: E402
+    attest_ds9_native_artifacts,
+)
+
+_DS9_NATIVE_EXTENSION_DIR = configure_ds9_runtime_import_paths(
+    ds9_root=DS9_ROOT,
+    repo_root=REPO_ROOT,
+    system_site=Path(
+        f"/usr/local/lib/python{sys.version_info.major}.{sys.version_info.minor}/dist-packages"
+    ),
+)
+attest_ds9_native_artifacts(
+    ds9_root=DS9_ROOT,
+    native_dir=_DS9_NATIVE_EXTENSION_DIR,
+)
+require_ds9_native_extension_origins(_DS9_NATIVE_EXTENSION_DIR)
+
+from calibration_bundle import pose_to_E_col_major
+from geometry.depth_source import DepthStorageManager, StorageFailure
 from mapanything_config import load_service_config
 from noesis.calibration.depth_registration import (
     DepthRegistrationError,
     DepthRegistrationManager,
+    HARDENED_CONTRACT_VERSION as _DEPTH_REGISTRATION_HARDENED_CONTRACT_VERSION,
+    MODEL_CONTENT_BINDING_CONTRACT as _DEPTH_REGISTRATION_MODEL_CONTENT_BINDING_CONTRACT,
+    content_bundle_fingerprint as _depth_registration_content_bundle_fingerprint,
+    content_file_fingerprint as _depth_registration_content_file_fingerprint,
     model_profile_fingerprint as _depth_registration_model_profile_fingerprint,
 )
-from noesis.calibration.manager import CalibrationManager
+from noesis.calibration.world_fusion_policy import (
+    WorldFusionPolicy,
+    WorldFusionPolicyError,
+    load_world_fusion_policy,
+)
+from noesis.calibration.manager import create_calibration_manager, load_camera_labels
 from noesis.calibration.pose_v1 import normalize_pose_v1
 from noesis.calibration.pose_v1 import POSE_V1_FRAME_BACKEND_WORLD_M
+from noesis_core.scene_prior import ScenePriorError, ScenePriorSet
+from noesis_core.scene_fusion import SceneFusionError, SceneFusionSet
 from noesis.depth_tracking_materialization import (
     DEFAULT_BATCH_SIZE as _DEPTH_TRACKING_BATCH_SIZE,
     DEFAULT_GIE_ID as _DEPTH_TRACKING_GIE_ID,
@@ -64,16 +90,120 @@ from noesis.depth_tracking_materialization import (
     ensure_native_object_depth_extension as _ensure_native_object_depth_extension,
     materialize_depth_tracking_assets as _materialize_depth_tracking_assets,
 )
+from noesis.deimv2_wholebody49_assets import (
+    WHOLEBODY49_SIZES as _WHOLEBODY49_SIZES,
+    materialize_wholebody49_configs as _shared_materialize_wholebody49_configs,
+    resolve_wholebody49_assets as _shared_resolve_wholebody49_assets,
+    validate_wholebody49_pgie_properties as _validate_wholebody49_pgie_properties,
+    validate_wholebody49_preprocess_properties as _validate_wholebody49_preprocess_properties,
+)
+from noesis.rfdetr_1_8_3_assets import (
+    RFDETR_DETECTION_SIZES as _RFDETR_DETECTION_SIZES,
+    RFDETR_KEYPOINT_VARIANTS as _RFDETR_KEYPOINT_VARIANTS,
+    RFDETR_SEGMENTATION_SIZES as _RFDETR_SEGMENTATION_SIZES,
+    materialize_rfdetr_1_8_3_configs as _shared_materialize_rfdetr_configs,
+    resolve_rfdetr_1_8_3_assets as _shared_resolve_rfdetr_assets,
+    validate_rfdetr_class_attrs as _validate_rfdetr_class_attrs,
+    validate_rfdetr_pgie_properties as _validate_rfdetr_pgie_properties,
+)
+from noesis.reid_swin_profile import (
+    load_reid_swin_nvinfer_properties as _load_reid_swin_nvinfer_properties,
+    validate_reid_swin_model_config as _validate_reid_swin_model_config,
+    validate_reid_swin_nvinfer_properties as _validate_reid_swin_nvinfer_properties,
+)
+from noesis.capture_event_controller import (
+    CanonicalCameraAliases,
+    CaptureEventController,
+)
+from noesis.capture_event_rgb_provider import PipelineRgbFrameProvider
+from noesis.capture_event_runtime import (
+    CaptureEventRuntimeError,
+    CaptureEventRuntimeProviders,
+    resolve_capture_event_drain_timeout_s,
+)
+from noesis.manual_depth_models import (
+    MANUAL_DEPTH_MODELS,
+    build_manual_depth_overlay,
+    normalize_manual_depth_model,
+)
 from noesis.pipelines import ds8_pipeline, hooks
+from noesis.depth_capture_event import DepthStorageCaptureEventAdapter
+from noesis.runtime_storage import close_depth_storage, storage_close_evidence
+require_ds9_native_extension_origins(_DS9_NATIVE_EXTENSION_DIR)
 from noesis.metadata.intrinsics import CameraConfigLoader
 from noesis.telemetry.publishers import DepthTelemetryPublisher, TrackingTelemetryPublisher, bind_occupancy_publisher
+from noesis_core.runtime_world import create_runtime_capability_monitor, create_runtime_world_service
+from noesis_core.runtime_health import require_complete_camera_health
+from noesis_core.runtime_publication import (
+    RuntimePublicationGate,
+    RuntimePublicationQuiescenceError,
+)
+from noesis_core.active_floorplan import ActiveFloorplanError, ActiveFloorplanRegistry
+from noesis_core.capture_event_fusion import CaptureEventFusionError
+from noesis_core.appliance import (
+    ApplianceConfigurationError,
+    optional_runtime_context_binding,
+)
+from noesis_core.servicemaker_shutdown import (
+    OrderlyEosError,
+    SyntheticStubEosMessage,
+    pipeline_expects_finite_source_eos,
+    request_orderly_eos,
+    validate_synthetic_stub_eos_message,
+)
+from noesis_core.startup_lifecycle import (
+    RuntimeStartupTransaction,
+    StartupMainGuard,
+    StartupOwnershipAmbiguous,
+    StartupPhase,
+    StartupResourceRegistrationError,
+)
+from noesis_core.runtime_secrets import (
+    load_pipeline_config as load_runtime_pipeline_config,
+    public_pipeline_config,
+)
+from noesis_core.inference_runtime_contract import render_nvinfer_engine_only_config
+from noesis_core.strict_json import strict_json_loads
 from noesis.diagnostics.telemetry_log import TrackingDiagnosticsLogger
-from noesis.telemetry.bev import BevRenderer, CalibrationSnapshot
+from noesis.telemetry.bev import BevRenderer
 from noesis.yolo26_seg_materialization import (
     materialize_yolo26_seg_configs as _shared_materialize_yolo26_seg_configs,
+    resolve_yolo26_seg_assets as _shared_resolve_yolo26_assets,
 )
-from noesis.yolo26_seg_materialization import resolve_yolo26_seg_assets as _shared_resolve_yolo26_seg_assets
-from websocket_server import WebSocketServer
+from noesis.runtime_config import apply_osd_from_pgie_ini
+from noesis.v3dt_assets import (
+    EXPECTED_OBJECT_MODEL_HEIGHT_M,
+    EXPECTED_OBJECT_MODEL_RADIUS_M,
+    V3DTAssetBundle,
+    V3DTAssetError,
+    materialize_v3dt_tracker_config,
+    validate_v3dt_assets,
+)
+from websocket_server import (
+    WebSocketServer,
+    WebSocketStartupError,
+    WebSocketStartupReceipt,
+)
+
+SHUTDOWN_WATCHDOG_DEFAULT_S = 75
+SHUTDOWN_EXTERNAL_SUPERVISOR_TIMEOUT_S = 90
+SHUTDOWN_KNOWN_PHASE_BUDGET_S = (
+    5.0  # REST and analytics drain
+    + WebSocketServer.STATS_COLLECTOR_DRAIN_TIMEOUT_S
+    + 5.0  # blocking WebSocket providers
+    + 5.0  # retired WebRTC lifecycle workers
+    + WebSocketServer.WEBRTC_GATEWAY_DRAIN_TIMEOUT_S
+    + WebSocketServer.RUNTIME_SHUTDOWN_TIMEOUT_S
+    + 15.0  # Service Maker EOS/wait thread
+    + 5.0  # capture-controller admission/owner drain
+    + 5.0  # MapAnything capture/worker drain
+    + 5.0  # bounded storage writers/retention flush allowance
+)
+SHUTDOWN_WATCHDOG_MARGIN_S = (
+    SHUTDOWN_WATCHDOG_DEFAULT_S - SHUTDOWN_KNOWN_PHASE_BUDGET_S
+)
+if SHUTDOWN_WATCHDOG_MARGIN_S <= 0.0:
+    raise RuntimeError("shutdown phase budgets exceed the runtime watchdog")
 
 # GLib/GObject for GStreamer main loop (required for bus event dispatch)
 try:
@@ -101,16 +231,27 @@ except Exception:
     _PYSERVICEMAKER_MSGS = False
 
 
-_PGIE_PROFILES = ("yolo11_seg", "yolo11", "yolo26_seg", "yolo26", "rfdetr_seg", "rfdetr")
-_SIZED_PGIE_PROFILES = ("yolo26_seg", "yolo26", "rfdetr_seg", "rfdetr")
+_PGIE_PROFILES = ("yolo11_seg", "yolo11", "yolo26_seg", "yolo26", "rfdetr_seg", "rfdetr", "rfdetr_keypoint", "wholebody49")
+_SIZED_PGIE_PROFILES = ("yolo26_seg", "yolo26", "rfdetr_seg", "rfdetr", "wholebody49")
 _YOLO26_DETECT_SIZES = ("n", "s", "m", "l", "x")
 _YOLO26_SEG_SIZES = ("n", "s", "m")
-_RFDETR_SIZES = ("n", "s", "m")
+_PGIE_SIZE_CHOICES = tuple(
+    dict.fromkeys(
+        (
+            *_YOLO26_DETECT_SIZES,
+            *_RFDETR_SEGMENTATION_SIZES,
+            *_WHOLEBODY49_SIZES,
+        )
+    )
+)
 _YOLO26_DETECT_SIZE_HELP = "/".join(_YOLO26_DETECT_SIZES)
 _YOLO26_SEG_SIZE_HELP = "/".join(_YOLO26_SEG_SIZES)
-_RFDETR_SIZE_HELP = "/".join(_RFDETR_SIZES)
+_RFDETR_DETECTION_SIZE_HELP = "/".join(_RFDETR_DETECTION_SIZES)
+_RFDETR_SEGMENTATION_SIZE_HELP = "/".join(_RFDETR_SEGMENTATION_SIZES)
+_WHOLEBODY49_SIZE_HELP = "/".join(_WHOLEBODY49_SIZES)
 _ENV_TRUE = ("1", "true", "yes", "y", "on")
 _TRACKING_MODES = ("baseline", "v3dt")
+_MANUAL_DEPTH_MODELS = MANUAL_DEPTH_MODELS
 _RFDETR_TRT_PLUGIN_LOADED = False
 
 
@@ -155,6 +296,15 @@ def _deep_merge_dict(base: Any, overlay: Any) -> Any:
     return overlay
 
 
+def _manual_depth_overlay(
+    base_cfg: Mapping[str, Any], manual_depth_model: str
+) -> dict[str, Any]:
+    try:
+        return build_manual_depth_overlay(base_cfg, manual_depth_model)
+    except ValueError as exc:
+        raise SystemExit(f"[FATAL] {exc}") from exc
+
+
 def _resolve_pipeline_cfg_path(yaml_path: Path, raw: str) -> Path:
     value = str(raw or "").strip()
     if not value:
@@ -163,9 +313,19 @@ def _resolve_pipeline_cfg_path(yaml_path: Path, raw: str) -> Path:
     if candidate.is_absolute():
         return candidate
     base_dir = yaml_path.parent.resolve()
+    for prefix, root in (
+        ("DS9/models/engines/", _engine_dir()),
+        ("DS9/models/onnx/", _onnx_dir()),
+        ("DS9/models/", _model_dir()),
+        ("models/engines/", _engine_dir()),
+        ("models/onnx/", _onnx_dir()),
+        ("models/", _model_dir()),
+    ):
+        if value.startswith(prefix):
+            return (root / value[len(prefix) :]).resolve()
     if value.startswith("DS9/"):
         return (REPO_ROOT / candidate).resolve()
-    if value.startswith(("config/", "models/", "pipelines/", "build/")):
+    if value.startswith(("config/", "pipelines/", "build/")):
         return (_path_scope_for_yaml(yaml_path) / candidate).resolve()
     return (base_dir / candidate).resolve()
 
@@ -183,6 +343,14 @@ def _canonicalize_effective_pipeline_paths(cfg: Dict[str, Any], base_yaml_path: 
     depth_registration = effective.get("depth_registration")
     if isinstance(depth_registration, dict) and str(depth_registration.get("path") or "").strip():
         depth_registration["path"] = _resolve_pipeline_path_value(base_yaml_path, depth_registration["path"])
+
+    scene_priors = effective.get("scene_priors")
+    if isinstance(scene_priors, dict) and str(scene_priors.get("path") or "").strip():
+        scene_priors["path"] = _resolve_pipeline_path_value(base_yaml_path, scene_priors["path"])
+
+    scene_fusions = effective.get("scene_fusions")
+    if isinstance(scene_fusions, dict) and str(scene_fusions.get("path") or "").strip():
+        scene_fusions["path"] = _resolve_pipeline_path_value(base_yaml_path, scene_fusions["path"])
 
     sources = effective.get("sources")
     if isinstance(sources, list):
@@ -285,7 +453,7 @@ def _validate_dewarper_intrinsics_sync(
     pipeline_path: Path, cameras_path: Path, logger: logging.Logger
 ) -> bool:
     try:
-        pipeline_cfg = yaml.safe_load(pipeline_path.read_text(encoding="utf-8")) or {}
+        pipeline_cfg = load_runtime_pipeline_config(pipeline_path, materialize_secrets=False)
     except Exception as exc:
         logger.error("Dewarp intrinsics check failed: unable to read %s: %s", pipeline_path, exc)
         return False
@@ -410,54 +578,10 @@ def _validate_dewarper_intrinsics_sync(
     return ok
 
 
-def _newest_model_artifact(
-    pattern: str,
-    *,
-    excluded_tokens: Tuple[str, ...] = (),
-    root: Optional[Path] = None,
-) -> Optional[Path]:
-    models_dir = (root or _model_dir()).resolve()
-    if not models_dir.exists():
-        return None
-    candidates = []
-    for path in models_dir.rglob(pattern):
-        name = path.name.lower()
-        if any(token in name for token in excluded_tokens):
-            continue
-        if not path.is_file():
-            continue
-        candidates.append(path.resolve())
-    if not candidates:
-        return None
-    return max(candidates, key=lambda item: (item.stat().st_mtime_ns, str(item)))
-
-
-def _family_artifact_summary(*patterns: str, limit: int = 8) -> str:
-    models_dir = _model_dir().resolve()
-    if not models_dir.exists():
-        return "<models directory missing>"
-    matches = []
-    seen = set()
-    for pattern in patterns:
-        for path in models_dir.rglob(pattern):
-            if not path.is_file():
-                continue
-            resolved = path.resolve()
-            if resolved in seen:
-                continue
-            seen.add(resolved)
-            matches.append(resolved)
-    if not matches:
-        return "<none>"
-    newest = sorted(matches, key=lambda item: (item.stat().st_mtime_ns, str(item)), reverse=True)
-    return "\n".join(f"  - {path}" for path in newest[:limit])
-
-
 def _resolve_yolo_detect_assets(profile: str, size: Optional[str]) -> Dict[str, Any]:
     profile_norm = str(profile or "").strip().lower()
     if profile_norm == "yolo11":
         label = "YOLO11"
-        family_prefix = "yolo11"
         size_norm = ""
         tensor_name = "input"
     elif profile_norm == "yolo26":
@@ -465,25 +589,16 @@ def _resolve_yolo_detect_assets(profile: str, size: Optional[str]) -> Dict[str, 
         if size_norm not in _YOLO26_DETECT_SIZES:
             raise SystemExit(f"[FATAL] YOLO26 detection size must be one of {_YOLO26_DETECT_SIZE_HELP} (got: {size})")
         label = f"YOLO26 {size_norm}"
-        family_prefix = f"yolo26{size_norm}"
         tensor_name = "images"
     else:
         raise SystemExit(f"[FATAL] Unsupported YOLO detection profile: {profile}")
 
-    excluded = ("seg", "pose")
-    onnx_path = _newest_model_artifact(f"{family_prefix}*.onnx", excluded_tokens=excluded, root=_model_dir())
-    if onnx_path is None:
-        observed = _family_artifact_summary(f"{family_prefix}*")
-        raise SystemExit(
-            f"[FATAL] {label} detection ONNX not found under {_model_dir()}.\n"
-            f"Looked for {family_prefix}*.onnx excluding seg/pose variants.\n"
-            f"Current matching artifacts:\n{observed}\n"
-            f"Use {profile_norm}_seg for the current segmentation assets, or add a detector ONNX/engine pair."
-        )
-
-    engine_path = _newest_model_artifact(f"{family_prefix}*.engine", excluded_tokens=excluded, root=_engine_dir())
-    if engine_path is None:
-        engine_path = (_engine_dir() / f"{onnx_path.stem}_b3_fp16.engine").resolve()
+    if profile_norm == "yolo11":
+        onnx_path = (_onnx_dir() / "yolo11m.onnx").resolve()
+        engine_path = (_engine_dir() / "yolo11m_b3_fp16.engine").resolve()
+    else:
+        onnx_path = (_onnx_dir() / f"yolo26{size_norm}.onnx").resolve()
+        engine_path = (_engine_dir() / f"yolo26{size_norm}_b3_fp16.engine").resolve()
 
     size_suffix = f"_{size_norm}" if size_norm else ""
     return {
@@ -494,6 +609,7 @@ def _resolve_yolo_detect_assets(profile: str, size: Optional[str]) -> Dict[str, 
         "tensor_name": tensor_name,
         "onnx": onnx_path,
         "engine": engine_path,
+        "labels": (_model_dir() / "coco_labels.txt").resolve(),
         "output": (_build_dir() / f"config_infer_primary_{profile_norm}{size_suffix}.ini").resolve(),
     }
 
@@ -555,15 +671,23 @@ def _materialize_yolo_detect_pgie_ini(profile: str, size: Optional[str], logger:
         raise SystemExit(f"[FATAL] YOLO detection PGIE template missing: {template_path}")
 
     text = template_path.read_text(encoding="utf-8")
-    text, onnx_count = re.subn(
-        r"(?m)^onnx-file=.*$",
-        f"onnx-file={assets['onnx']}",
-        text,
-        count=1,
-    )
+    text = re.sub(r"(?m)^\s*onnx-file\s*=.*(?:\n|$)", "", text)
     text, engine_count = re.subn(
         r"(?m)^model-engine-file=.*$",
         f"model-engine-file={assets['engine']}",
+        text,
+        count=1,
+    )
+    labels_path = Path(assets["labels"])
+    try:
+        labels_ready = labels_path.is_file() and labels_path.stat().st_size > 0
+    except OSError:
+        labels_ready = False
+    if not labels_ready:
+        raise SystemExit(f"[FATAL] YOLO detection labels file missing or empty: {labels_path}")
+    text, labels_count = re.subn(
+        r"(?m)^labelfile-path=.*$",
+        f"labelfile-path={labels_path}",
         text,
         count=1,
     )
@@ -576,8 +700,11 @@ def _materialize_yolo_detect_pgie_ini(profile: str, size: Optional[str], logger:
     )
     if lib_count != 1:
         raise SystemExit(f"[FATAL] YOLO detection PGIE template is missing custom-lib-path: {template_path}")
-    if onnx_count != 1 or engine_count != 1:
-        raise SystemExit(f"[FATAL] YOLO detection PGIE template is missing onnx-file/model-engine-file: {template_path}")
+    if engine_count != 1 or labels_count != 1:
+        raise SystemExit(
+            "[FATAL] YOLO detection PGIE template is missing "
+            f"model-engine-file/labelfile-path: {template_path}"
+        )
 
     out_path = assets["output"]
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -588,128 +715,128 @@ def _materialize_yolo_detect_pgie_ini(profile: str, size: Optional[str], logger:
 
 
 def _resolve_rfdetr_detect_assets(size: str) -> Dict[str, Any]:
-    size_norm = str(size or "").strip().lower()
-    if size_norm not in ("n", "s", "m"):
-        raise SystemExit(f"[FATAL] RF-DETR detection size must be one of n/s/m (got: {size})")
-    model_info = {
-        "n": {"model": "rf-detr-nano", "weights": "rf-detr-nano.pth", "resolution": 384, "max_detections": 30},
-        "s": {"model": "rf-detr-small", "weights": "rf-detr-small.pth", "resolution": 512, "max_detections": 50},
-        "m": {"model": "rf-detr-medium", "weights": "rf-detr-medium.pth", "resolution": 576, "max_detections": 80},
-    }[size_norm]
-    resolution = int(model_info["resolution"])
-    return {
-        "model": model_info["model"],
-        "resolution": resolution,
-        "max_detections": int(model_info["max_detections"]),
-        "template": (_pipeline_dir() / "config_infer_primary_rfdetr.template.ini").resolve(),
-        "preproc": (_pipeline_dir() / f"config_preproc_rfdetr_detect_{resolution}.ini").resolve(),
-        "weights": (REPO_ROOT / "models" / str(model_info["weights"])).resolve(),
-        "onnx": (_onnx_dir() / f"rfdetr_{size_norm}_{resolution}.onnx").resolve(),
-        "engine": (_engine_dir() / f"rfdetr_{size_norm}_{resolution}_b3_fp16.engine").resolve(),
-        "output": (_build_dir() / f"config_infer_primary_rfdetr_{size_norm}.ini").resolve(),
-    }
-
-
-def _materialize_rfdetr_detect_pgie_ini(size: str, logger: logging.Logger) -> Path:
-    assets = _resolve_rfdetr_detect_assets(size)
-    template_path = assets["template"]
-    if not template_path.exists():
-        raise SystemExit(f"[FATAL] RF-DETR detection PGIE template missing: {template_path}")
-    preproc_path = assets["preproc"]
-    if not preproc_path.exists():
-        raise SystemExit(f"[FATAL] RF-DETR detection preprocess config missing: {preproc_path}")
-    out_path = assets["output"]
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    text = template_path.read_text(encoding="utf-8")
-    text = text.replace("@ONNX_PATH@", str(assets["onnx"]))
-    text = text.replace("@ENGINE_PATH@", str(assets["engine"]))
-    text = text.replace("@TOPK@", str(assets["max_detections"]))
-    text = re.sub(
-        r"(?m)^labelfile-path=.*$",
-        f"labelfile-path={(_model_dir() / 'coco_labels.txt').resolve()}",
-        text,
-        count=1,
-    )
-    text = re.sub(
-        r"(?m)^custom-lib-path=.*$",
-        f"custom-lib-path={(_pipeline_dir() / 'nvdsinfer_rfdetr' / 'libnvdsinfer_rfdetr.so').resolve()}",
-        text,
-        count=1,
-    )
-    out_path.write_text(text, encoding="utf-8")
-    logger.info("RF-DETR detection PGIE config materialized: %s", out_path)
-    return out_path
-
-
-def _resolve_rfdetr_assets(size: str) -> Dict[str, Any]:
-    size_norm = str(size or "").strip().lower()
-    if size_norm not in ("n", "s", "m"):
-        raise SystemExit(f"[FATAL] RF-DETR size must be one of n/s/m (got: {size})")
-
-    model_info = {
-        "n": {"model": "rfdetr-seg-nano", "resolution": 312, "max_detections": 10},
-        "s": {"model": "rfdetr-seg-small", "resolution": 384, "max_detections": 20},
-        "m": {"model": "rfdetr-seg-medium", "resolution": 432, "max_detections": 30},
-    }[size_norm]
-    resolution = int(model_info["resolution"])
-    return {
-        "model": model_info["model"],
-        "resolution": resolution,
-        "max_detections": int(model_info["max_detections"]),
-        "template": (_pipeline_dir() / "config_infer_primary_rfdetr_seg.template.ini").resolve(),
-        "preproc": (_pipeline_dir() / f"config_preproc_rfdetr_{resolution}.ini").resolve(),
-        "weights": (REPO_ROOT / "models" / f"rf-detr-seg-{size_norm}.pt").resolve(),
-        "onnx": (_onnx_dir() / f"rfdetr_seg_{size_norm}_{resolution}.onnx").resolve(),
-        "engine": (_engine_dir() / f"rfdetr_seg_{size_norm}_{resolution}_b3_fp16.engine").resolve(),
-        "output": (_build_dir() / f"config_infer_primary_rfdetr_seg_{size_norm}.ini").resolve(),
-    }
-
-
-def _materialize_rfdetr_pgie_ini(size: str, logger: logging.Logger) -> Path:
-    assets = _resolve_rfdetr_assets(size)
-    template_path = assets["template"]
-    if not template_path.exists():
-        raise SystemExit(f"[FATAL] RF-DETR PGIE template missing: {template_path}")
-    preproc_path = assets["preproc"]
-    if not preproc_path.exists():
-        raise SystemExit(f"[FATAL] RF-DETR preprocess config missing: {preproc_path}")
-    out_path = assets["output"]
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    text = template_path.read_text(encoding="utf-8")
-    text = text.replace("@ONNX_PATH@", str(assets["onnx"]))
-    text = text.replace("@ENGINE_PATH@", str(assets["engine"]))
-    text = text.replace("@TOPK@", str(assets["max_detections"]))
-    text = re.sub(
-        r"(?m)^labelfile-path=.*$",
-        f"labelfile-path={(_model_dir() / 'coco_labels.txt').resolve()}",
-        text,
-        count=1,
-    )
-    text = re.sub(
-        r"(?m)^custom-lib-path=.*$",
-        f"custom-lib-path={(_pipeline_dir() / 'nvdsinfer_rfdetr_seg' / 'libnvdsinfer_rfdetr_seg.so').resolve()}",
-        text,
-        count=1,
-    )
-    out_path.write_text(text, encoding="utf-8")
-    logger.info("RF-DETR PGIE config materialized: %s", out_path)
-    return out_path
-
-
-def _resolve_yolo26_assets(size: str) -> Dict[str, Path]:
     try:
-        return _shared_resolve_yolo26_assets(size)
+        return dict(_shared_resolve_rfdetr_assets("detection", size))
     except ValueError as exc:
         raise SystemExit(f"[FATAL] {exc}") from exc
 
 
-def _materialize_yolo26_configs(size: str, src_ids: Tuple[int, ...], logger: logging.Logger) -> Dict[str, Path]:
+def _materialize_rfdetr_detect_pgie_ini(size: str, logger: logging.Logger) -> Path:
+    materialized = _materialize_rfdetr_configs(
+        "detection", size, (0, 1, 2), logger
+    )
+    return Path(materialized["pgie_config"])
+
+
+def _resolve_rfdetr_assets(size: str) -> Dict[str, Any]:
     try:
-        return _shared_materialize_yolo26_seg_configs(
+        return dict(_shared_resolve_rfdetr_assets("segmentation", size))
+    except ValueError as exc:
+        raise SystemExit(f"[FATAL] {exc}") from exc
+
+
+def _materialize_rfdetr_pgie_ini(size: str, logger: logging.Logger) -> Path:
+    materialized = _materialize_rfdetr_configs(
+        "segmentation", size, (0, 1, 2), logger
+    )
+    return Path(materialized["pgie_config"])
+
+
+def _materialize_rfdetr_configs(
+    family: str,
+    size: str,
+    src_ids: Tuple[int, ...],
+    logger: logging.Logger,
+) -> Dict[str, Any]:
+    try:
+        return dict(
+            _shared_materialize_rfdetr_configs(
+                family=family,
+                size=size,
+                batch_size=3,
+                src_ids=src_ids,
+                include_model_source=False,
+                logger=logger,
+            )
+        )
+    except (FileNotFoundError, ValueError) as exc:
+        raise SystemExit(f"[FATAL] {exc}") from exc
+
+
+def _resolve_yolo26_assets(size: str) -> Dict[str, Path]:
+    try:
+        shared = _shared_resolve_yolo26_assets(size)
+    except ValueError as exc:
+        raise SystemExit(f"[FATAL] {exc}") from exc
+    size_norm = str(size).strip().lower()
+    # The shared resolver owns supported-size/name semantics. DS9 owns every
+    # runtime artifact path and must never inherit root/DS8 binaries from it.
+    return {
+        **shared,
+        "template": (_pipeline_dir() / "config_infer_primary_yolo26_seg.template.ini").resolve(),
+        "preproc_template": (_pipeline_dir() / "config_preproc.ini").resolve(),
+        "onnx": (_onnx_dir() / f"yolo26{size_norm}-seg_fused.onnx").resolve(),
+        "engine": (_engine_dir() / f"yolo26{size_norm}-seg_fused_b3_fp16.engine").resolve(),
+        "labels": (_model_dir() / "coco_labels.txt").resolve(),
+        "parser": (_pipeline_dir() / "nvdsinfer_yolo26_seg" / "libnvdsinfer_yolo26_seg.so").resolve(),
+        "output": (_build_dir() / f"config_infer_primary_yolo26_seg_{size_norm}.ini").resolve(),
+        "default_output": (_build_dir() / f"config_infer_primary_yolo26_seg_{size_norm}.ini").resolve(),
+    }
+
+
+def _materialize_yolo26_configs(size: str, src_ids: Tuple[int, ...], logger: logging.Logger) -> Dict[str, Path]:
+    assets = _resolve_yolo26_assets(size)
+    try:
+        materialized = _shared_materialize_yolo26_seg_configs(
             size=size,
             batch_size=3,
             src_ids=src_ids,
             logger=logger,
+            onnx_path=assets["onnx"],
+            engine_path=assets["engine"],
+            pgie_output_path=assets["default_output"],
+            preprocess_output_path=(_build_dir() / f"config_preproc_yolo26_seg_{str(size).strip().lower()}_b3.ini"),
+            include_model_source=False,
+        )
+    except (FileNotFoundError, ValueError) as exc:
+        raise SystemExit(f"[FATAL] {exc}") from exc
+    pgie_path = Path(materialized["pgie_config"])
+    text = pgie_path.read_text(encoding="utf-8")
+    text = re.sub(
+        r"(?m)^labelfile-path=.*$",
+        f"labelfile-path={assets['labels']}",
+        text,
+        count=1,
+    )
+    text = re.sub(
+        r"(?m)^custom-lib-path=.*$",
+        f"custom-lib-path={assets['parser']}",
+        text,
+        count=1,
+    )
+    pgie_path.write_text(text, encoding="utf-8")
+    return {**materialized, **assets, "pgie_config": pgie_path.resolve()}
+
+
+def _resolve_wholebody49_assets(size: str) -> Dict[str, Any]:
+    try:
+        return dict(_shared_resolve_wholebody49_assets(size))
+    except ValueError as exc:
+        raise SystemExit(f"[FATAL] {exc}") from exc
+
+
+def _materialize_wholebody49_configs(
+    size: str, src_ids: Tuple[int, ...], logger: logging.Logger
+) -> Dict[str, Any]:
+    try:
+        return dict(
+            _shared_materialize_wholebody49_configs(
+                size=size,
+                batch_size=3,
+                src_ids=src_ids,
+                include_model_source=False,
+                logger=logger,
+            )
         )
     except (FileNotFoundError, ValueError) as exc:
         raise SystemExit(f"[FATAL] {exc}") from exc
@@ -760,9 +887,83 @@ def _load_rfdetr_trt_plugin_library(yaml_path: Path, logger: logging.Logger) -> 
     logger.info("RF-DETR TensorRT plugin library loaded: %s", lib_path)
 
 
-def _preflight_pgie_profile(profile: str, pipeline_cfg: Dict[str, Any], yaml_path: Path, logger: logging.Logger) -> None:
-    if profile not in ("yolo11", "yolo26", "rfdetr", "rfdetr_seg", "yolo26_seg"):
+def _preflight_reid_profile(
+    pipeline_cfg: Dict[str, Any], yaml_path: Path, logger: logging.Logger
+) -> None:
+    models_cfg = pipeline_cfg.get("models") if isinstance(pipeline_cfg, dict) else None
+    reid_cfg = (models_cfg or {}).get("reid") if isinstance(models_cfg, dict) else None
+    if not isinstance(reid_cfg, dict) or not bool(reid_cfg.get("enable", True)):
         return
+
+    try:
+        _validate_reid_swin_model_config(reid_cfg)
+    except ValueError as exc:
+        raise SystemExit(f"[FATAL] {exc}") from exc
+
+    config_path = _resolve_pipeline_cfg_path(
+        yaml_path, str(reid_cfg.get("config-file-path") or "")
+    )
+    if not config_path.is_file():
+        raise SystemExit(f"[FATAL] DS9 ReID SGIE config missing: {config_path}")
+    try:
+        props = _load_reid_swin_nvinfer_properties(config_path)
+        _validate_reid_swin_nvinfer_properties(props)
+    except ValueError as exc:
+        raise SystemExit(f"[FATAL] {exc}") from exc
+
+    engine_path = _resolve_pipeline_cfg_path(
+        yaml_path, str(reid_cfg.get("engine") or "")
+    )
+    if not engine_path.is_file() or engine_path.stat().st_size <= 0:
+        raise SystemExit(
+            "[FATAL] Canonical DS9 TAO Swin-Tiny ReID engine missing.\n"
+            f"engine: {engine_path}\n"
+            "Build it during an exclusive-GPU window with:\n"
+            "  DS9/scripts/run_canonical_engine_maintenance.sh --only reid_swin"
+        )
+    logger.info(
+        "Canonical DS9 TAO Swin-Tiny ReID profile found: engine=%s",
+        engine_path,
+    )
+
+
+def _require_nonempty_runtime_engine(engine_path: Path, *, label: str) -> None:
+    try:
+        ready = engine_path.is_file() and engine_path.stat().st_size > 0
+    except OSError:
+        ready = False
+    if not ready:
+        raise SystemExit(
+            f"[FATAL] {label} engine missing or empty: {engine_path}\n"
+            "Runtime startup cannot export ONNX or build TensorRT engines. "
+            "Stage the engine with the explicit offline maintenance command first."
+        )
+
+
+def _preflight_pgie_profile(profile: str, pipeline_cfg: Dict[str, Any], yaml_path: Path, logger: logging.Logger) -> None:
+    if profile not in _PGIE_PROFILES:
+        return
+    models_cfg = pipeline_cfg.get("models") if isinstance(pipeline_cfg, dict) else None
+    pgie_cfg = (models_cfg or {}).get("pgie") if isinstance(models_cfg, dict) else None
+    engine_raw = (pgie_cfg or {}).get("engine") if isinstance(pgie_cfg, dict) else None
+    if not str(engine_raw or "").strip():
+        raise SystemExit(
+            f"[FATAL] {profile} profile requires models.pgie.engine to be set"
+        )
+    profile_engine_labels = {
+        "yolo11": "YOLO11 detection DS9 PGIE",
+        "yolo11_seg": "YOLO11-seg DS9 PGIE",
+        "yolo26": "YOLO26 detection DS9 PGIE",
+        "rfdetr": "RF-DETR detection DS9 PGIE",
+        "rfdetr_seg": "RF-DETR DS9 PGIE",
+        "rfdetr_keypoint": "RF-DETR keypoint-preview DS9 PGIE",
+        "yolo26_seg": "YOLO26 DS9 PGIE",
+        "wholebody49": "Wholebody49 DS9 PGIE",
+    }
+    _require_nonempty_runtime_engine(
+        _resolve_pipeline_cfg_path(yaml_path, str(engine_raw)),
+        label=profile_engine_labels[profile],
+    )
 
     if profile in ("yolo11", "yolo26"):
         label = str(profile).upper()
@@ -823,26 +1024,11 @@ def _preflight_pgie_profile(profile: str, pipeline_cfg: Dict[str, Any], yaml_pat
         if batch_size and batch_size != "3":
             raise SystemExit(f"[FATAL] {label} detection PGIE batch-size must be 3 for DS9 batch (got {batch_size})")
 
-        if engine_path.exists():
-            logger.info("%s detection PGIE engine found: %s", label, engine_path)
-            return
-
-        onnx_raw = str(props.get("onnx-file", "") or "").strip()
-        onnx_path = _resolve_pipeline_cfg_path(yaml_path, onnx_raw)
-        if not onnx_raw or not onnx_path.exists():
-            raise SystemExit(
-                f"[FATAL] {label} detection PGIE engine is missing and no ONNX is available to rebuild it.\n"
-                f"engine (from YAML models.pgie.engine): {engine_path}\n"
-                f"onnx-file (from PGIE INI): {onnx_raw or '<unset>'}\n"
-                f"resolved: {onnx_path}\n"
-            )
-
-        logger.warning(
-            "%s detection PGIE engine missing (%s); nvinfer will attempt to build it from ONNX (%s) on startup.",
-            label,
+        _require_nonempty_runtime_engine(
             engine_path,
-            onnx_path,
+            label=f"{label} detection PGIE",
         )
+        logger.info("%s detection PGIE engine found: %s", label, engine_path)
         return
 
     if profile == "rfdetr":
@@ -877,31 +1063,176 @@ def _preflight_pgie_profile(profile: str, pipeline_cfg: Dict[str, Any], yaml_pat
                 f"PGIE INI: {pgie_ini}\n"
                 f"custom-lib-path: {lib_raw or '<unset>'}\n"
                 f"resolved: {lib_path}\n"
-                "Build it with: make -C pipelines/nvdsinfer_rfdetr\n"
+                "Build it with: make -C DS9/pipelines/nvdsinfer_rfdetr\n"
             )
 
         gie_uid = str(props.get("gie-unique-id", "") or "").strip()
         if gie_uid and gie_uid != "1":
             raise SystemExit(f"[FATAL] RF-DETR detection PGIE gie-unique-id must remain 1 (got {gie_uid})")
 
-        if engine_path.exists():
-            logger.info("RF-DETR detection PGIE engine found: %s", engine_path)
-            return
+        _require_nonempty_runtime_engine(
+            engine_path,
+            label="RF-DETR detection PGIE",
+        )
+        logger.info("RF-DETR detection PGIE engine found: %s", engine_path)
+        return
 
-        onnx_raw = str(props.get("onnx-file", "") or "").strip()
-        onnx_path = _resolve_pipeline_cfg_path(yaml_path, onnx_raw)
-        if not onnx_raw or not onnx_path.exists():
+    if profile == "rfdetr_keypoint":
+        _load_rfdetr_trt_plugin_library(yaml_path, logger)
+        preprocess_cfg = (
+            pipeline_cfg.get("preprocess")
+            if isinstance(pipeline_cfg, dict)
+            else None
+        )
+        if not isinstance(preprocess_cfg, dict) or preprocess_cfg.get("enable") is not False:
             raise SystemExit(
-                "[FATAL] RF-DETR detection PGIE engine is missing and no ONNX is available to rebuild it.\n"
-                f"engine (from YAML models.pgie.engine): {engine_path}\n"
-                f"onnx-file (from PGIE INI): {onnx_raw or '<unset>'}\n"
-                f"resolved: {onnx_path}\n"
+                "[FATAL] RF-DETR keypoint profile requires preprocess.enable=false "
+                "so nvinfer owns direct-square frame preprocessing and emits "
+                "frame-owned tensor metadata"
             )
 
-        logger.warning(
-            "RF-DETR detection PGIE engine missing (%s); nvinfer will attempt to build it from ONNX (%s) on startup.",
+        models_cfg = (
+            pipeline_cfg.get("models")
+            if isinstance(pipeline_cfg, dict)
+            else None
+        )
+        pgie_cfg = (
+            (models_cfg or {}).get("pgie")
+            if isinstance(models_cfg, dict)
+            else None
+        )
+        pgie_ini_raw = (
+            (pgie_cfg or {}).get("config-file-path")
+            if isinstance(pgie_cfg, dict)
+            else None
+        )
+        pgie_ini = _resolve_pipeline_cfg_path(
+            yaml_path, str(pgie_ini_raw or "")
+        )
+        if not pgie_ini.exists():
+            raise SystemExit(
+                "[FATAL] RF-DETR keypoint profile requires PGIE "
+                f"config-file-path at: {pgie_ini}"
+            )
+        engine_raw = (
+            (pgie_cfg or {}).get("engine")
+            if isinstance(pgie_cfg, dict)
+            else None
+        )
+        engine_path = _resolve_pipeline_cfg_path(
+            yaml_path, str(engine_raw or "")
+        )
+        if not str(engine_raw or "").strip():
+            raise SystemExit(
+                "[FATAL] RF-DETR keypoint profile requires "
+                "models.pgie.engine to be set"
+            )
+
+        parser = configparser.ConfigParser(interpolation=None)
+        parser.read(pgie_ini, encoding="utf-8")
+        props = (
+            parser["property"]
+            if parser.has_section("property")
+            else {}
+        )
+        try:
+            selected_assets = _shared_resolve_rfdetr_assets(
+                "keypoint", _RFDETR_KEYPOINT_VARIANTS[0]
+            )
+            _validate_rfdetr_pgie_properties(
+                props,
+                family="keypoint",
+                engine_profile=str(selected_assets["engine_profile"]),
+                query_count=100,
+                batch_size=3,
+            )
+            class_attrs = (
+                parser["class-attrs-all"]
+                if parser.has_section("class-attrs-all")
+                else {}
+            )
+            parser_score_threshold = _validate_rfdetr_class_attrs(
+                class_attrs,
+                family="keypoint",
+                query_count=100,
+                expected_threshold=0.4,
+            )
+        except ValueError as exc:
+            raise SystemExit(f"[FATAL] {exc} ({pgie_ini})") from exc
+
+        lib_raw = str(props.get("custom-lib-path", "") or "").strip()
+        lib_path = _resolve_pipeline_cfg_path(yaml_path, lib_raw)
+        if not lib_raw or not lib_path.exists():
+            raise SystemExit(
+                "[FATAL] RF-DETR keypoint PGIE custom parser library missing.\n"
+                f"PGIE INI: {pgie_ini}\n"
+                f"custom-lib-path: {lib_raw or '<unset>'}\n"
+                f"resolved: {lib_path}\n"
+                "Build it with: make -C "
+                "DS9/pipelines/nvdsinfer_rfdetr_keypoint\n"
+            )
+        pose_cfg = (
+            (models_cfg or {}).get("pose")
+            if isinstance(models_cfg, dict)
+            else None
+        )
+        if not isinstance(pose_cfg, dict) or pose_cfg.get("enable") is not False:
+            raise SystemExit(
+                "[FATAL] RF-DETR keypoint profile must explicitly disable "
+                "the YOLO pose SGIE"
+            )
+        bridge_cfg = (
+            (models_cfg or {}).get("rfdetr_keypoint")
+            if isinstance(models_cfg, dict)
+            else None
+        )
+        required_bridge = {
+            "enable": True,
+            "tensor_source": "rfdetr_pgie_frame",
+            "gie_id": 1,
+            "attach_component": "world_observation_stage",
+            "model_size": [576, 576],
+            "score_threshold": parser_score_threshold,
+            "kpt_threshold": 0.35,
+            "letterbox": False,
+            "match_min_iou": 0.7,
+            "match_ambiguity_margin": 0.05,
+            "pose_cache_max_age_frames": 0,
+        }
+        if not isinstance(bridge_cfg, dict) or any(
+            bridge_cfg.get(key) != value
+            for key, value in required_bridge.items()
+        ):
+            raise SystemExit(
+                "[FATAL] RF-DETR keypoint metadata bridge config is missing "
+                "or incompatible"
+            )
+        native = getattr(hooks, "noesis_pose_meta_ext", None)
+        required_native_symbols = (
+            "extract_rfdetr_keypoint_matches",
+            "attach_pose_features",
+        )
+        missing_native_symbols = [
+            symbol
+            for symbol in required_native_symbols
+            if native is None or not callable(getattr(native, symbol, None))
+        ]
+        if missing_native_symbols:
+            raise SystemExit(
+                "[FATAL] RF-DETR keypoint profile requires a DS9 "
+                "noesis_pose_meta_ext build with callable symbols: "
+                + ", ".join(required_native_symbols)
+                + " (missing: "
+                + ", ".join(missing_native_symbols)
+                + ")"
+            )
+        _require_nonempty_runtime_engine(
             engine_path,
-            onnx_path,
+            label="RF-DETR keypoint-preview PGIE",
+        )
+        logger.info(
+            "RF-DETR keypoint-preview PGIE and strict metadata bridge found: %s",
+            engine_path,
         )
         return
 
@@ -937,32 +1268,15 @@ def _preflight_pgie_profile(profile: str, pipeline_cfg: Dict[str, Any], yaml_pat
                 f"PGIE INI: {pgie_ini}\n"
                 f"custom-lib-path: {lib_raw or '<unset>'}\n"
                 f"resolved: {lib_path}\n"
-                "Build it with: make -C pipelines/nvdsinfer_rfdetr_seg\n"
+                "Build it with: make -C DS9/pipelines/nvdsinfer_rfdetr_seg\n"
             )
 
         gie_uid = str(props.get("gie-unique-id", "") or "").strip()
         if gie_uid and gie_uid != "1":
             raise SystemExit(f"[FATAL] RF-DETR PGIE gie-unique-id must remain 1 (got {gie_uid})")
 
-        if engine_path.exists():
-            logger.info("RF-DETR PGIE engine found: %s", engine_path)
-            return
-
-        onnx_raw = str(props.get("onnx-file", "") or "").strip()
-        onnx_path = _resolve_pipeline_cfg_path(yaml_path, onnx_raw)
-        if not onnx_raw or not onnx_path.exists():
-            raise SystemExit(
-                "[FATAL] RF-DETR PGIE engine is missing and no ONNX is available to rebuild it.\n"
-                f"engine (from YAML models.pgie.engine): {engine_path}\n"
-                f"onnx-file (from PGIE INI): {onnx_raw or '<unset>'}\n"
-                f"resolved: {onnx_path}\n"
-            )
-
-        logger.warning(
-            "RF-DETR PGIE engine missing (%s); nvinfer will attempt to build it from ONNX (%s) on startup.",
-            engine_path,
-            onnx_path,
-        )
+        _require_nonempty_runtime_engine(engine_path, label="RF-DETR PGIE")
+        logger.info("RF-DETR PGIE engine found: %s", engine_path)
         return
 
     if profile == "yolo26_seg":
@@ -983,8 +1297,7 @@ def _preflight_pgie_profile(profile: str, pipeline_cfg: Dict[str, Any], yaml_pat
         engine_path = _resolve_pipeline_cfg_path(yaml_path, str(engine_raw or ""))
         if not str(engine_raw or "").strip():
             raise SystemExit("[FATAL] YOLO26 profile requires models.pgie.engine to be set")
-        if not engine_path.exists():
-            raise SystemExit(f"[FATAL] YOLO26 PGIE engine missing: {engine_path}")
+        _require_nonempty_runtime_engine(engine_path, label="YOLO26 PGIE")
 
         parser = configparser.ConfigParser()
         parser.read(pgie_ini, encoding="utf-8")
@@ -1009,6 +1322,65 @@ def _preflight_pgie_profile(profile: str, pipeline_cfg: Dict[str, Any], yaml_pat
         if batch_size and batch_size != "3":
             raise SystemExit(f"[FATAL] YOLO26 PGIE batch-size must be 3 for DS9 b3 engines (got {batch_size})")
 
+    if profile == "wholebody49":
+        preprocess_cfg = pipeline_cfg.get("preprocess") if isinstance(pipeline_cfg, dict) else None
+        preprocess_path_raw = (preprocess_cfg or {}).get("config-file") if isinstance(preprocess_cfg, dict) else None
+        preprocess_path = _resolve_pipeline_cfg_path(yaml_path, str(preprocess_path_raw or ""))
+        if not preprocess_path.exists():
+            raise SystemExit(f"[FATAL] Wholebody49 profile requires preprocess config-file at: {preprocess_path}")
+
+        preproc_parser = configparser.ConfigParser()
+        preproc_parser.read(preprocess_path, encoding="utf-8")
+        preproc_props = preproc_parser["property"] if preproc_parser.has_section("property") else {}
+        try:
+            _validate_wholebody49_preprocess_properties(preproc_props, batch_size=3)
+        except ValueError as exc:
+            raise SystemExit(f"[FATAL] {exc} ({preprocess_path})") from exc
+
+        models_cfg = pipeline_cfg.get("models") if isinstance(pipeline_cfg, dict) else None
+        pgie_cfg = (models_cfg or {}).get("pgie") if isinstance(models_cfg, dict) else None
+        pgie_ini_raw = (pgie_cfg or {}).get("config-file-path") if isinstance(pgie_cfg, dict) else None
+        pgie_ini = _resolve_pipeline_cfg_path(yaml_path, str(pgie_ini_raw or ""))
+        if not pgie_ini.exists():
+            raise SystemExit(f"[FATAL] Wholebody49 profile requires PGIE config-file-path at: {pgie_ini}")
+
+        engine_raw = (pgie_cfg or {}).get("engine") if isinstance(pgie_cfg, dict) else None
+        engine_path = _resolve_pipeline_cfg_path(yaml_path, str(engine_raw or ""))
+        if not str(engine_raw or "").strip():
+            raise SystemExit("[FATAL] Wholebody49 profile requires models.pgie.engine to be set")
+        _require_nonempty_runtime_engine(engine_path, label="Wholebody49 DS9 PGIE")
+
+        parser = configparser.ConfigParser()
+        parser.read(pgie_ini, encoding="utf-8")
+        props = parser["property"] if parser.has_section("property") else {}
+
+        lib_raw = str(props.get("custom-lib-path", "") or "").strip()
+        lib_path = _resolve_pipeline_cfg_path(yaml_path, lib_raw)
+        if not lib_raw or not lib_path.exists():
+            raise SystemExit(
+                "[FATAL] Wholebody49 DS9 parser library missing.\n"
+                f"PGIE INI: {pgie_ini}\n"
+                f"custom-lib-path: {lib_raw or '<unset>'}\n"
+                f"resolved: {lib_path}\n"
+                "Build it with: make -C DS9/pipelines/nvdsinfer_deimv2_wholebody49\n"
+            )
+
+        labels_raw = str(props.get("labelfile-path", "") or "").strip()
+        labels_path = _resolve_pipeline_cfg_path(yaml_path, labels_raw)
+        if not labels_raw or not labels_path.exists():
+            raise SystemExit(
+                "[FATAL] Wholebody49 DS9 label file missing.\n"
+                f"PGIE INI: {pgie_ini}\n"
+                f"labelfile-path: {labels_raw or '<unset>'}\n"
+                f"resolved: {labels_path}\n"
+            )
+
+        try:
+            mode = _validate_wholebody49_pgie_properties(props, batch_size=3)
+        except ValueError as exc:
+            raise SystemExit(f"[FATAL] {exc} ({pgie_ini})") from exc
+        logger.info("Wholebody49 DS9 PGIE engine found: %s (mode=%s)", engine_path, mode)
+
 
 def _materialize_effective_pipeline_yaml(
     base_yaml_path: Path,
@@ -1017,9 +1389,11 @@ def _materialize_effective_pipeline_yaml(
     *,
     pgie_size: Optional[str] = None,
     tracking_mode: str = "baseline",
+    manual_depth_model: str = "mapanything",
+    v3dt_bundle: Optional[V3DTAssetBundle] = None,
 ) -> Path:
     try:
-        base_cfg = yaml.safe_load(base_yaml_path.read_text(encoding="utf-8")) or {}
+        base_cfg = load_runtime_pipeline_config(base_yaml_path, materialize_secrets=False)
     except Exception as exc:
         raise SystemExit(f"[FATAL] Unable to read DS9 pipeline YAML: {base_yaml_path} ({exc})") from exc
     if not isinstance(base_cfg, dict):
@@ -1043,36 +1417,98 @@ def _materialize_effective_pipeline_yaml(
         logger.info("%s detection PGIE selected", str(assets["label"]))
     if profile == "rfdetr":
         if not pgie_size:
-            raise SystemExit(f"[FATAL] RF-DETR detection profile requires --size ({_RFDETR_SIZE_HELP})")
+            raise SystemExit(
+                "[FATAL] RF-DETR detection profile requires --size "
+                f"({_RFDETR_DETECTION_SIZE_HELP})"
+            )
         size_norm = str(pgie_size).strip().lower()
-        assets = _resolve_rfdetr_detect_assets(size_norm)
-        pgie_ini = _materialize_rfdetr_detect_pgie_ini(size_norm, logger)
+        sources_cfg = base_cfg.get("sources") if isinstance(base_cfg, dict) else None
+        source_count = len(sources_cfg) if isinstance(sources_cfg, list) else 0
+        src_ids = tuple(range(source_count)) or (0, 1, 2)
+        assets = _materialize_rfdetr_configs(
+            "detection", size_norm, src_ids, logger
+        )
         overlay = {
-            "preprocess": {"config-file": str(assets["preproc"])},
+            "preprocess": {"config-file": str(assets["preprocess_config"])},
             "models": {
                 "pgie": {
-                    "config-file-path": str(pgie_ini),
+                    "config-file-path": str(assets["pgie_config"]),
                     "engine": str(assets["engine"]),
                 }
             },
         }
-        logger.info("RF-DETR detection PGIE size: %s", size_norm)
+        logger.info(
+            "RF-DETR 1.8.3 detection PGIE size: %s (engine profile=%s)",
+            size_norm,
+            assets["engine_profile"],
+        )
+    if profile == "rfdetr_keypoint":
+        sources_cfg = (
+            base_cfg.get("sources") if isinstance(base_cfg, dict) else None
+        )
+        source_count = (
+            len(sources_cfg) if isinstance(sources_cfg, list) else 0
+        )
+        src_ids = tuple(range(source_count)) or (0, 1, 2)
+        assets = _materialize_rfdetr_configs(
+            "keypoint", _RFDETR_KEYPOINT_VARIANTS[0], src_ids, logger
+        )
+        overlay = {
+            "preprocess": {"enable": False},
+            "models": {
+                "pgie": {
+                    "config-file-path": str(assets["pgie_config"]),
+                    "engine": str(assets["engine"]),
+                    "attach_tensor_meta": True,
+                },
+                "pose": {"enable": False},
+                "rfdetr_keypoint": {
+                    "enable": True,
+                    "tensor_source": "rfdetr_pgie_frame",
+                    "gie_id": 1,
+                    "attach_component": "world_observation_stage",
+                    "model_size": [576, 576],
+                    "score_threshold": 0.4,
+                    "kpt_threshold": 0.35,
+                    "letterbox": False,
+                    "match_min_iou": 0.7,
+                    "match_ambiguity_margin": 0.05,
+                    "pose_cache_max_age_frames": 0,
+                },
+            },
+        }
+        logger.info(
+            "RF-DETR 1.8.3 keypoint-preview PGIE selected "
+            "(engine profile=%s; strict frame tensor bridge)",
+            assets["engine_profile"],
+        )
     if profile == "rfdetr_seg":
         if not pgie_size:
-            raise SystemExit(f"[FATAL] RF-DETR profile requires --size ({_RFDETR_SIZE_HELP})")
+            raise SystemExit(
+                "[FATAL] RF-DETR segmentation profile requires --size "
+                f"({_RFDETR_SEGMENTATION_SIZE_HELP})"
+            )
         size_norm = str(pgie_size).strip().lower()
-        assets = _resolve_rfdetr_assets(size_norm)
-        pgie_ini = _materialize_rfdetr_pgie_ini(size_norm, logger)
+        sources_cfg = base_cfg.get("sources") if isinstance(base_cfg, dict) else None
+        source_count = len(sources_cfg) if isinstance(sources_cfg, list) else 0
+        src_ids = tuple(range(source_count)) or (0, 1, 2)
+        assets = _materialize_rfdetr_configs(
+            "segmentation", size_norm, src_ids, logger
+        )
         overlay = {
-            "preprocess": {"config-file": str(assets["preproc"])},
+            "preprocess": {"config-file": str(assets["preprocess_config"])},
             "models": {
                 "pgie": {
-                    "config-file-path": str(pgie_ini),
+                    "config-file-path": str(assets["pgie_config"]),
                     "engine": str(assets["engine"]),
                 }
             },
         }
-        logger.info("RF-DETR PGIE size: %s", size_norm)
+        logger.info(
+            "RF-DETR 1.8.3 segmentation PGIE size: %s (engine profile=%s)",
+            size_norm,
+            assets["engine_profile"],
+        )
     if profile == "yolo26_seg":
         if not pgie_size:
             raise SystemExit(f"[FATAL] YOLO26 profile requires --size ({_YOLO26_SEG_SIZE_HELP})")
@@ -1091,6 +1527,24 @@ def _materialize_effective_pipeline_yaml(
             },
         }
         logger.info("YOLO26 PGIE size: %s", size_norm)
+    if profile == "wholebody49":
+        if not pgie_size:
+            raise SystemExit(f"[FATAL] Wholebody49 profile requires --size ({_WHOLEBODY49_SIZE_HELP})")
+        size_norm = str(pgie_size).strip().lower()
+        sources_cfg = base_cfg.get("sources") if isinstance(base_cfg, dict) else None
+        source_count = len(sources_cfg) if isinstance(sources_cfg, list) else 0
+        src_ids = tuple(range(source_count)) or (0, 1, 2)
+        assets = _materialize_wholebody49_configs(size_norm, src_ids, logger)
+        overlay = {
+            "preprocess": {"config-file": str(assets["preprocess_config"])},
+            "models": {
+                "pgie": {
+                    "config-file-path": str(assets["pgie_config"]),
+                    "engine": str(assets["engine"]),
+                }
+            },
+        }
+        logger.info("Wholebody49 PGIE size: %s (%s)", size_norm, assets.get("mode"))
 
     if str(tracking_mode).strip().lower() == "baseline":
         models_cfg = base_cfg.get("models") if isinstance(base_cfg, dict) else None
@@ -1147,11 +1601,16 @@ def _materialize_effective_pipeline_yaml(
             },
         )
 
+    manual_depth_model = _normalize_manual_depth_model(manual_depth_model)
+    overlay = _deep_merge_dict(
+        overlay,
+        _manual_depth_overlay(base_cfg, manual_depth_model),
+    )
+
     effective_cfg = _deep_merge_dict(base_cfg, overlay)
     if not isinstance(effective_cfg, dict):
         raise SystemExit("[FATAL] Internal error: effective pipeline config is not a mapping")
-
-    from noesis.ds8_preflight import apply_osd_from_pgie_ini
+    effective_cfg["tracking_mode"] = str(tracking_mode).strip().lower()
 
     preprocess_cfg = effective_cfg.get("preprocess") if isinstance(effective_cfg, dict) else None
     preprocess_path_raw = (preprocess_cfg or {}).get("config-file") if isinstance(preprocess_cfg, dict) else None
@@ -1161,6 +1620,7 @@ def _materialize_effective_pipeline_yaml(
     engine_raw = (pgie_cfg or {}).get("engine") if isinstance(pgie_cfg, dict) else None
 
     logger.info("PGIE profile: %s", profile)
+    logger.info("Manual depth model: %s", manual_depth_model)
     logger.info(
         "PGIE (effective): preprocess.config-file=%s, models.pgie.config-file-path=%s, models.pgie.engine=%s",
         preprocess_path_raw,
@@ -1180,14 +1640,34 @@ def _materialize_effective_pipeline_yaml(
     out_dir.mkdir(parents=True, exist_ok=True)
     out_path = out_dir / f"effective_pipeline_{profile}.yaml"
     effective_cfg = _canonicalize_effective_pipeline_paths(effective_cfg, base_yaml_path)
+    if str(tracking_mode).strip().lower() == "v3dt":
+        if v3dt_bundle is None:
+            raise SystemExit("[FATAL] V3DT runtime tracker materialization requires a validated asset bundle")
+        tracker_out = materialize_v3dt_tracker_config(
+            v3dt_bundle,
+            out_dir / "config" / "v3dt" / "nvtracker_v3dt_runtime.yaml",
+            output_root=out_dir,
+        )
+        tracker_cfg = effective_cfg.get("tracker")
+        if not isinstance(tracker_cfg, dict):
+            raise SystemExit("[FATAL] V3DT effective pipeline is missing tracker configuration")
+        tracker_cfg["config-file"] = str(tracker_out)
+        logger.info("Materialized absolute-path DS9 V3DT tracker config: %s", tracker_out)
+    _preflight_reid_profile(effective_cfg, out_path, logger)
     effective_cfg = apply_osd_from_pgie_ini(effective_cfg, out_path)
+    effective_cfg = public_pipeline_config(effective_cfg)
     out_path.write_text(yaml.safe_dump(effective_cfg, sort_keys=False), encoding="utf-8")
 
     _preflight_pgie_profile(profile, effective_cfg, out_path, logger)
     return out_path
 
 
-def _maybe_autogen_v3dt_caminfo(pipeline_path: Path, cameras_path: Path, logger: logging.Logger) -> bool:
+def _maybe_autogen_v3dt_caminfo(
+    pipeline_path: Path,
+    cameras_path: Path,
+    bundle: V3DTAssetBundle,
+    logger: logging.Logger,
+) -> bool:
     """Optionally regenerate V3DT camInfo files from current calibration.
 
     Controlled by `NOESIS_V3DT_AUTOGEN_CAMINFO` (default: 0).
@@ -1197,19 +1677,24 @@ def _maybe_autogen_v3dt_caminfo(pipeline_path: Path, cameras_path: Path, logger:
         return True
 
     try:
-        pipeline_cfg = yaml.safe_load(pipeline_path.read_text(encoding="utf-8")) or {}
+        pipeline_cfg = load_runtime_pipeline_config(pipeline_path, materialize_secrets=False)
     except Exception as exc:
         logger.error("V3DT autogen camInfo failed: unable to read %s: %s", pipeline_path, exc)
         return False
 
-    tracker_cfg = pipeline_cfg.get("tracker") or {}
-    ll_cfg_path = str((tracker_cfg or {}).get("config-file") or "").strip()
-    if not ll_cfg_path.startswith("config/v3dt/"):
-        logger.info(
-            "V3DT autogen camInfo: skipped (tracker config not under config/v3dt/): %s",
-            ll_cfg_path or "<missing>",
+    tracker_path = _resolve_tracker_config_path(pipeline_cfg, pipeline_path)
+    if tracker_path is None or tracker_path.resolve() != bundle.tracker_config.resolve():
+        logger.error(
+            "V3DT autogen camInfo requires the validated DS9 tracker config: expected=%s actual=%s",
+            bundle.tracker_config,
+            tracker_path or "<missing>",
         )
-        return True
+        return False
+    output_dirs = {path.parent.resolve() for path in bundle.camera_models}
+    if len(output_dirs) != 1:
+        logger.error("V3DT autogen camInfo requires one bounded camera-model directory: %s", output_dirs)
+        return False
+    output_dir = next(iter(output_dirs))
 
     # Use the streammux output resolution for camInfo generation.
     #
@@ -1241,6 +1726,14 @@ def _maybe_autogen_v3dt_caminfo(pipeline_path: Path, cameras_path: Path, logger:
         str(int(target_w)),
         "--target-height",
         str(int(target_h)),
+        "--output-dir",
+        str(output_dir),
+        "--model-height",
+        str(EXPECTED_OBJECT_MODEL_HEIGHT_M),
+        "--model-radius",
+        str(EXPECTED_OBJECT_MODEL_RADIUS_M),
+        "--calibration",
+        str(REPO_ROOT / "config" / "camera_calibration.json"),
     ]
     logger.warning("V3DT autogen camInfo enabled; running: %s", " ".join(cmd))
     try:
@@ -1255,8 +1748,6 @@ def _maybe_autogen_v3dt_caminfo(pipeline_path: Path, cameras_path: Path, logger:
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Noesis DS9 runtime harness")
 
-    default_pgie_profile = str(os.environ.get("NOESIS_PGIE_PROFILE", "yolo11_seg") or "").strip() or "yolo11_seg"
-
     parser.add_argument(
         "--pipeline-config",
         type=Path,
@@ -1265,17 +1756,27 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--pgie-profile",
+        "--pgie_profile",
+        "-pgie-profile",
+        "-pgie_profile",
         choices=_PGIE_PROFILES,
-        default=default_pgie_profile,
-        help="PGIE profile overlay (default: yolo11_seg). Env: NOESIS_PGIE_PROFILE",
+        default=None,
+        help=(
+            "PGIE profile overlay. Canonical defaults: baseline=yolo26/m, "
+            "v3dt=yolo26_seg/s. Env: NOESIS_PGIE_PROFILE"
+        ),
     )
     parser.add_argument(
         "--size",
-        choices=_YOLO26_DETECT_SIZES,
+        choices=_PGIE_SIZE_CHOICES,
         default=None,
         help=(
             "Model size. YOLO26 detection supports n/s/m/l/x; "
-            "YOLO26 segmentation and RF-DETR profiles currently support n/s/m. Default: m."
+            "YOLO26 segmentation supports n/s/m; RF-DETR 1.8.3 detection "
+            f"supports {_RFDETR_DETECTION_SIZE_HELP}; RF-DETR 1.8.3 "
+            f"segmentation supports {_RFDETR_SEGMENTATION_SIZE_HELP}; "
+            "RF-DETR keypoint uses its sole preview variant without --size; "
+            "Wholebody49 supports s/x. Default: m, except Wholebody49 defaults to s."
         ),
     )
     parser.add_argument(
@@ -1299,7 +1800,7 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--ws-host",
-        default=os.environ.get("NOESIS_WS_HOST", "0.0.0.0"),
+        default=os.environ.get("NOESIS_WS_HOST", "127.0.0.1"),
         help="WebSocket host to bind.",
     )
     parser.add_argument(
@@ -1310,7 +1811,7 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--rest-host",
-        default=os.environ.get("NOESIS_REST_HOST", "0.0.0.0"),
+        default=os.environ.get("NOESIS_REST_HOST", "127.0.0.1"),
         help="REST host to bind when enabled.",
     )
     parser.add_argument(
@@ -1356,7 +1857,21 @@ def _parse_args() -> argparse.Namespace:
         default=int(os.environ.get("NOESIS_DEPTH_ENABLE_SECONDS", "0")),
         help="Enable the MapAnything depth valve for this many seconds on startup (0 to disable).",
     )
-    return parser.parse_args()
+    parser.add_argument(
+        "--manual-depth-model",
+        choices=_MANUAL_DEPTH_MODELS,
+        default=None,
+        help=(
+            "Manual full-frame depth model (mapanything or da3metric-large). "
+            "Env: NOESIS_MANUAL_DEPTH_MODEL; default: mapanything."
+        ),
+    )
+    args = parser.parse_args()
+    env_profile = str(os.environ.get("NOESIS_PGIE_PROFILE", "") or "").strip()
+    cli_profile = str(args.pgie_profile or "").strip()
+    args._pgie_profile_explicit = bool(cli_profile or env_profile)
+    args.pgie_profile = cli_profile or env_profile or "yolo26"
+    return args
 
 
 def _normalize_tracking_mode(value: Any) -> str:
@@ -1367,8 +1882,10 @@ def _normalize_tracking_mode(value: Any) -> str:
         return "baseline"
     if not mode or mode == "auto":
         return "baseline"
-    logging.getLogger("ds9.runtime").warning("Unknown tracking mode '%s'; defaulting to baseline", value)
-    return "baseline"
+    raise SystemExit(
+        "[FATAL] Unsupported DS9 tracking mode "
+        f"{value!r}; expected baseline, v3dt, or auto"
+    )
 
 
 def _resolve_tracking_mode(args: argparse.Namespace) -> str:
@@ -1380,6 +1897,45 @@ def _resolve_tracking_mode(args: argparse.Namespace) -> str:
     if str(env_mode).strip():
         return _normalize_tracking_mode(env_mode)
     return "baseline"
+
+
+def _normalize_manual_depth_model(value: Any) -> str:
+    try:
+        return normalize_manual_depth_model(value)
+    except ValueError as exc:
+        raise SystemExit(f"[FATAL] {exc}") from exc
+
+
+def _resolve_manual_depth_model(args: argparse.Namespace) -> str:
+    cli_value = str(getattr(args, "manual_depth_model", "") or "").strip()
+    env_value = str(os.environ.get("NOESIS_MANUAL_DEPTH_MODEL", "") or "").strip()
+    return _normalize_manual_depth_model(cli_value or env_value or "mapanything")
+
+
+def _resolve_pgie_selection(
+    args: argparse.Namespace,
+    tracking_mode: str,
+) -> tuple[str, Optional[str]]:
+    profile = str(args.pgie_profile or "yolo26").strip().lower()
+    explicit_profile = bool(getattr(args, "_pgie_profile_explicit", False))
+    mode = _normalize_tracking_mode(tracking_mode)
+    if mode == "v3dt" and not explicit_profile:
+        profile = "yolo26_seg"
+    if profile not in _PGIE_PROFILES:
+        raise SystemExit(f"[FATAL] Unsupported DS9 PGIE profile: {profile}")
+
+    requested_size = getattr(args, "size", None)
+    if requested_size is not None and profile not in _SIZED_PGIE_PROFILES:
+        sized = ", ".join(_SIZED_PGIE_PROFILES)
+        raise SystemExit(f"[FATAL] --size is only valid with --pgie-profile in: {sized}")
+    if profile not in _SIZED_PGIE_PROFILES:
+        return profile, None
+    default_size = (
+        "s"
+        if profile == "wholebody49" or (mode == "v3dt" and profile == "yolo26_seg")
+        else "m"
+    )
+    return profile, str(requested_size or default_size).strip().lower()
 
 
 def _port_bindable(host: str, port: int) -> bool:
@@ -1418,27 +1974,9 @@ def _select_ws_port(host: str, requested_port: int, max_fallback_tries: int, log
         return port
     if _port_bindable(host, port):
         return port
-
-    tries = max(0, int(max_fallback_tries))
-    for offset in range(1, tries + 1):
-        candidate = port + offset
-        if candidate > 65535:
-            break
-        if _port_bindable(host, candidate):
-            logger.warning(
-                "Requested WS port %s unavailable on %s; using fallback port %s",
-                port,
-                host,
-                candidate,
-            )
-            return candidate
-    logger.error(
-        "Requested WS port %s unavailable on %s and no fallback port found within %s tries",
-        port,
-        host,
-        tries,
+    raise RuntimeError(
+        f"required WebSocket endpoint is unavailable: host={host} port={port}"
     )
-    return port
 
 
 def _cuda_runtime_preflight() -> Tuple[bool, str]:
@@ -1475,8 +2013,8 @@ def _cuda_runtime_preflight() -> Tuple[bool, str]:
 def _mode_default_paths(mode: str) -> Tuple[Path, Path]:
     if mode == "v3dt":
         return (
-            REPO_ROOT / "config" / "infer_v3dt_baseline.yaml",
-            REPO_ROOT / "config" / "cameras_v3dt_baseline.yaml",
+            DS9_ROOT / "config" / "infer_v3dt.yaml",
+            DS9_ROOT / "config" / "cameras_v3dt.yaml",
         )
     return (DS9_ROOT / "config" / "infer.yaml", REPO_ROOT / "config" / "cameras.yaml")
 
@@ -1492,10 +2030,7 @@ def _resolve_pipeline_and_camera_paths(
     if pipeline_path is not None:
         pipeline_src = "cli"
     else:
-        env_pipeline = os.environ.get("NOESIS_DS9_PIPELINE_CONFIG", "") or os.environ.get(
-            "NOESIS_DS8_PIPELINE_CONFIG",
-            "",
-        )
+        env_pipeline = os.environ.get("NOESIS_DS9_PIPELINE_CONFIG", "")
         if str(env_pipeline).strip():
             pipeline_path = Path(env_pipeline)
             pipeline_src = "env"
@@ -1528,7 +2063,7 @@ def _resolve_pipeline_and_camera_paths(
 
 def _load_pipeline_config(path: Path, logger: logging.Logger) -> Optional[Dict[str, Any]]:
     try:
-        data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+        data = load_runtime_pipeline_config(path, materialize_secrets=False)
     except Exception as exc:
         logger.error("Unable to read pipeline config %s: %s", path, exc)
         return None
@@ -1536,17 +2071,6 @@ def _load_pipeline_config(path: Path, logger: logging.Logger) -> Optional[Dict[s
         logger.error("Pipeline config must be a mapping: %s", path)
         return None
     return data
-
-
-def _pipeline_expects_finite_source_eos(config: Mapping[str, Any]) -> bool:
-    streammux = config.get("streammux") if isinstance(config, Mapping) else None
-    if not isinstance(streammux, Mapping):
-        return False
-    live_source = streammux.get("live-source", streammux.get("live_source", 1))
-    try:
-        return int(live_source) == 0
-    except Exception:
-        return str(live_source).strip().lower() in {"0", "false", "no", "off"}
 
 
 def _allow_depthless_reid_smoke(pipeline_cfg: Mapping[str, Any]) -> bool:
@@ -1575,7 +2099,7 @@ def _resolve_tracker_config_path(pipeline_cfg: Dict[str, Any], pipeline_path: Pa
 
 
 def _tracker_under_v3dt_dir(path: Path) -> bool:
-    v3dt_root = (REPO_ROOT / "config" / "v3dt").resolve()
+    v3dt_root = (DS9_ROOT / "config" / "v3dt").resolve()
     try:
         path.resolve().relative_to(v3dt_root)
         return True
@@ -1583,56 +2107,41 @@ def _tracker_under_v3dt_dir(path: Path) -> bool:
         return False
 
 
-def _validate_v3dt_tracking_guardrails(pipeline_path: Path, logger: logging.Logger) -> bool:
-    pipeline_cfg = _load_pipeline_config(pipeline_path, logger)
-    if pipeline_cfg is None:
-        return False
-    tracker_path = _resolve_tracker_config_path(pipeline_cfg, pipeline_path)
-    if tracker_path is None:
-        logger.error("Tracking mode 'v3dt' requires tracker.config-file to be set in %s", pipeline_path)
-        return False
-    if not tracker_path.exists():
-        logger.error("Tracking mode 'v3dt' tracker config missing: %s", tracker_path)
-        return False
-    if not _tracker_under_v3dt_dir(tracker_path):
-        logger.error(
-            "Tracking mode 'v3dt' requires tracker config under config/v3dt/ (got %s)",
-            tracker_path,
-        )
-        return False
+def _validate_v3dt_tracking_guardrails(
+    pipeline_path: Path, cameras_path: Path, logger: logging.Logger
+) -> Optional[V3DTAssetBundle]:
     try:
-        tracker_cfg = yaml.safe_load(tracker_path.read_text(encoding="utf-8")) or {}
-    except Exception as exc:
-        logger.error("Unable to read V3DT tracker config %s: %s", tracker_path, exc)
-        return False
-    if not isinstance(tracker_cfg, dict):
-        logger.error("V3DT tracker config must be a mapping: %s", tracker_path)
-        return False
-    omp = tracker_cfg.get("ObjectModelProjection") or {}
-    caminfo = (omp or {}).get("cameraModelFilepath") if isinstance(omp, dict) else None
-    if isinstance(caminfo, (list, tuple)) and caminfo:
-        return True
-    if isinstance(caminfo, str) and caminfo.strip():
-        return True
-    logger.error(
-        "Tracking mode 'v3dt' requires ObjectModelProjection.cameraModelFilepath in %s",
-        tracker_path,
+        bundle = validate_v3dt_assets(
+            pipeline_path,
+            cameras_config=cameras_path,
+            require_engines=True,
+            require_sources=False,
+        )
+    except (OSError, V3DTAssetError) as exc:
+        logger.error("%s", exc)
+        return None
+    logger.info(
+        "DS9-owned V3DT asset graph validated: tracker=%s cameras=%d",
+        bundle.tracker_config,
+        len(bundle.camera_models),
     )
-    return False
+    return bundle
 
 
-def _warn_baseline_with_v3dt_tracker(pipeline_path: Path, logger: logging.Logger) -> None:
+def _reject_baseline_with_v3dt_tracker(pipeline_path: Path, logger: logging.Logger) -> bool:
     pipeline_cfg = _load_pipeline_config(pipeline_path, logger)
     if pipeline_cfg is None:
-        return
+        return False
     tracker_path = _resolve_tracker_config_path(pipeline_cfg, pipeline_path)
     if tracker_path is None:
-        return
+        return True
     if _tracker_under_v3dt_dir(tracker_path):
-        logger.warning(
-            "Tracking mode 'baseline' with V3DT tracker config %s; V3DT meta/bbox3d will be ignored",
+        logger.error(
+            "Tracking mode 'baseline' cannot use V3DT tracker config %s; select --tracking-mode v3dt",
             tracker_path,
         )
+        return False
+    return True
 
 
 def _ensure_v3dt_meta_extension(logger: logging.Logger) -> bool:
@@ -1690,7 +2199,7 @@ def _resolve_depth_registration_path(args: argparse.Namespace, *, pipeline_path:
         return Path(raw).resolve()
     if pipeline_path is not None and pipeline_path.exists():
         try:
-            pipeline_cfg = yaml.safe_load(pipeline_path.read_text(encoding="utf-8")) or {}
+            pipeline_cfg = load_runtime_pipeline_config(pipeline_path, materialize_secrets=False)
         except Exception:
             pipeline_cfg = {}
         reg_cfg = pipeline_cfg.get("depth_registration") if isinstance(pipeline_cfg, Mapping) else None
@@ -1703,17 +2212,385 @@ def _resolve_depth_registration_path(args: argparse.Namespace, *, pipeline_path:
     return (DS9_ROOT / "config" / "depth_registration.json").resolve()
 
 
+def _logical_ds9_model_reference(value: Any) -> Any:
+    """Map only reviewed DS9 model roots to their stable logical identity."""
+
+    if not isinstance(value, (str, os.PathLike)):
+        return value
+    raw = os.fspath(value).strip()
+    if not raw:
+        return raw
+    candidate = Path(raw).expanduser()
+    logical_root = Path("DS9/models")
+    if not candidate.is_absolute():
+        try:
+            relative = candidate.relative_to(logical_root)
+        except ValueError:
+            return raw
+        return (logical_root / relative).as_posix()
+
+    allowed_roots = [(DS9_ROOT / "models").resolve(strict=False)]
+    artifact_root_raw = str(os.environ.get("NOESIS_DS9_ARTIFACT_ROOT", "") or "").strip()
+    if artifact_root_raw:
+        artifact_root = Path(artifact_root_raw).expanduser()
+        if artifact_root.is_absolute():
+            allowed_roots.append((artifact_root / "models").resolve(strict=False))
+
+    resolved = candidate.resolve(strict=False)
+    for allowed_root in allowed_roots:
+        try:
+            relative = resolved.relative_to(allowed_root)
+        except ValueError:
+            continue
+        return (logical_root / relative).as_posix()
+    return raw
+
+
+def _canonicalize_ds9_registration_model_paths(
+    model_cfg: Mapping[str, Any],
+) -> dict[str, Any]:
+    canonical = dict(model_cfg)
+    for key in ("engine", "model-engine-file", "onnx", "onnx-file"):
+        if key in canonical:
+            canonical[key] = _logical_ds9_model_reference(canonical[key])
+    return canonical
+
+
+_DEPTH_REGISTRATION_SOURCE_CONTRACTS = DS9_ROOT / "config" / "engine_source_contracts.json"
+_DEPTH_REGISTRATION_SOURCE_SELECTORS = {
+    "depth_tracking": "depth_anything_v2_tracking",
+    "mapanything": "mapanything",
+}
+_DEPTH_REGISTRATION_REVIEWED_CONFIGS = {
+    "depth_tracking": DS9_ROOT
+    / "pipelines"
+    / "config_infer_secondary_depth_tracking_da2.ini",
+    "mapanything": DS9_ROOT
+    / "pipelines"
+    / "config_infer_secondary_mapanything.ini",
+}
+_DEPTH_REGISTRATION_REVIEWED_LOGICAL_CONFIGS = {
+    "depth_tracking": "DS9/pipelines/config_infer_secondary_depth_tracking_da2.ini",
+    "mapanything": "DS9/pipelines/config_infer_secondary_mapanything.ini",
+}
+
+
+def _canonicalize_ds9_registration_model_profile(
+    model_key: str,
+    model_cfg: Mapping[str, Any],
+) -> dict[str, Any]:
+    canonical = _canonicalize_ds9_registration_model_paths(model_cfg)
+    canonical.pop("config-file", None)
+    canonical["config-file-path"] = _DEPTH_REGISTRATION_REVIEWED_LOGICAL_CONFIGS[
+        model_key
+    ]
+    return canonical
+
+
+def _registration_logical_source_path(value: str) -> str:
+    raw = str(value or "").strip()
+    if raw.startswith("models/"):
+        return f"DS9/{raw}"
+    return str(_logical_ds9_model_reference(raw))
+
+
+def _registration_source_contract(selector: str) -> tuple[Mapping[str, Any], str]:
+    source_record = _depth_registration_content_file_fingerprint(
+        _DEPTH_REGISTRATION_SOURCE_CONTRACTS,
+        logical_path="DS9/config/engine_source_contracts.json",
+    )
+    try:
+        raw = _DEPTH_REGISTRATION_SOURCE_CONTRACTS.read_bytes()
+    except OSError as exc:
+        raise DepthRegistrationError(
+            f"unable to read DS9 engine source contracts: {exc}"
+        ) from exc
+    if hashlib.sha256(raw).hexdigest() != source_record["sha256"]:
+        raise DepthRegistrationError("DS9 engine source contracts changed while reading")
+    try:
+        payload = strict_json_loads(raw, label="DS9 engine source contracts")
+    except Exception as exc:
+        raise DepthRegistrationError(
+            f"DS9 engine source contracts are invalid: {exc}"
+        ) from exc
+    if (
+        not isinstance(payload, Mapping)
+        or set(payload) != {"schema_version", "contracts"}
+        or payload.get("schema_version") != 1
+    ):
+        raise DepthRegistrationError(
+            "DS9 engine source contracts root does not match schema version 1"
+        )
+    contracts = payload.get("contracts")
+    contract = contracts.get(selector) if isinstance(contracts, Mapping) else None
+    if not isinstance(contract, Mapping):
+        raise DepthRegistrationError(
+            f"DS9 engine source contract selector is missing: {selector}"
+        )
+    for key in ("staged", "raw_sha256", "bundle_sha256"):
+        if not str(contract.get(key) or "").strip():
+            raise DepthRegistrationError(
+                f"DS9 engine source contract {selector} is missing {key}"
+            )
+    staged = Path(str(contract.get("staged") or ""))
+    if (
+        staged.is_absolute()
+        or ".." in staged.parts
+        or staged.parts[:2] != ("models", "onnx")
+    ):
+        raise DepthRegistrationError(
+            f"DS9 engine source contract {selector} staged ONNX path is not portable"
+        )
+    return contract, str(source_record["sha256"])
+
+
+def _registration_onnx_bundle_binding(
+    *,
+    source_contract: Mapping[str, Any],
+    pipeline_path: Path,
+) -> tuple[str, list[dict[str, Any]]]:
+    staged = str(source_contract.get("staged") or "").strip()
+    logical_onnx = _registration_logical_source_path(staged)
+    onnx_path = _resolve_pipeline_cfg_path(pipeline_path, staged)
+    initial_main = _depth_registration_content_file_fingerprint(
+        onnx_path,
+        logical_path=logical_onnx,
+    )
+    try:
+        import onnx
+
+        model = onnx.load(str(onnx_path), load_external_data=False)
+    except Exception as exc:
+        raise DepthRegistrationError(
+            f"unable to inspect DS9 depth-registration ONNX bundle {logical_onnx}: {exc}"
+        ) from exc
+
+    locations: set[Path] = set()
+    external_initializer_count = 0
+    for tensor in model.graph.initializer:
+        if tensor.data_location != onnx.TensorProto.EXTERNAL:
+            continue
+        external_initializer_count += 1
+        metadata = {item.key: item.value for item in tensor.external_data}
+        raw_location = str(metadata.get("location", "") or "").strip()
+        relative = Path(raw_location)
+        if not raw_location or relative.is_absolute() or ".." in relative.parts:
+            raise DepthRegistrationError(
+                f"unsafe DS9 depth-registration ONNX external-data location: {raw_location!r}"
+            )
+        locations.add(relative)
+    expected_onnx = source_contract.get("onnx")
+    if isinstance(expected_onnx, Mapping) and "external_initializer_count" in expected_onnx:
+        if external_initializer_count != int(expected_onnx["external_initializer_count"]):
+            raise DepthRegistrationError(
+                "DS9 depth-registration ONNX external initializer count disagrees with source authority"
+            )
+
+    members: list[tuple[str, Path, str]] = [("main", onnx_path, logical_onnx)]
+    logical_parent = Path(logical_onnx).parent
+    for relative in sorted(locations, key=lambda value: value.as_posix()):
+        members.append(
+            (
+                f"external::{relative.as_posix()}",
+                onnx_path.parent / relative,
+                (logical_parent / relative).as_posix(),
+            )
+        )
+    observed = _depth_registration_content_bundle_fingerprint(members)
+    files = observed.get("files")
+    if not isinstance(files, list) or not files or files[0] != {"label": "main", **initial_main}:
+        raise DepthRegistrationError(
+            "DS9 depth-registration ONNX changed while its bundle was inspected"
+        )
+    if str(initial_main["sha256"]) != str(source_contract.get("raw_sha256") or ""):
+        raise DepthRegistrationError(
+            "DS9 depth-registration ONNX raw digest disagrees with source authority"
+        )
+    if str(observed.get("bundle_sha256") or "") != str(
+        source_contract.get("bundle_sha256") or ""
+    ):
+        raise DepthRegistrationError(
+            "DS9 depth-registration ONNX bundle digest disagrees with source authority"
+        )
+    return logical_onnx, [dict(record) for record in files]
+
+
+def _registration_model_content_binding(
+    *,
+    model_key: str,
+    model_cfg: Mapping[str, Any],
+    pipeline_path: Path,
+) -> dict[str, Any]:
+    selector = _DEPTH_REGISTRATION_SOURCE_SELECTORS[model_key]
+    source_contract, source_contract_sha256 = _registration_source_contract(selector)
+    logical_onnx, onnx_bundle_files = _registration_onnx_bundle_binding(
+        source_contract=source_contract,
+        pipeline_path=pipeline_path,
+    )
+    engine_raw = str(model_cfg.get("engine") or model_cfg.get("model-engine-file") or "").strip()
+    config_raw = str(model_cfg.get("config-file-path") or model_cfg.get("config-file") or "").strip()
+    if not engine_raw or not config_raw:
+        raise DepthRegistrationError(
+            f"DS9 depth registration {model_key} requires engine and runtime config paths"
+        )
+    engine_path = _resolve_pipeline_cfg_path(pipeline_path, engine_raw)
+    selected_config_path = _resolve_pipeline_cfg_path(pipeline_path, config_raw)
+    reviewed_config_path = _DEPTH_REGISTRATION_REVIEWED_CONFIGS[model_key]
+    logical_engine = str(_logical_ds9_model_reference(engine_path))
+    reviewed_config_record = _depth_registration_content_file_fingerprint(
+        reviewed_config_path,
+        logical_path=_DEPTH_REGISTRATION_REVIEWED_LOGICAL_CONFIGS[model_key],
+    )
+    engine_record = _depth_registration_content_file_fingerprint(
+        engine_path,
+        logical_path=logical_engine,
+    )
+    try:
+        rendered_runtime_config = render_nvinfer_engine_only_config(
+            source_config=reviewed_config_path,
+            engine_path=engine_path,
+            repo_root=REPO_ROOT,
+        )
+    except Exception as exc:
+        raise DepthRegistrationError(
+            f"unable to render DS9 depth registration runtime config for {model_key}: {exc}"
+        ) from exc
+    rendered_bytes = rendered_runtime_config.encode("utf-8")
+    execution_runtime_config_record = {
+        "logical_path": f"DS9/runtime_inference/{model_key}.ini",
+        "size_bytes": int(len(rendered_bytes)),
+        "sha256": hashlib.sha256(rendered_bytes).hexdigest(),
+    }
+    rendered_engine_path = engine_path.expanduser().resolve(strict=False)
+    engine_line = f"model-engine-file={rendered_engine_path}\n"
+    if rendered_runtime_config.count(engine_line) != 1:
+        raise DepthRegistrationError(
+            f"DS9 depth registration {model_key} runtime config engine binding is ambiguous"
+        )
+    if not logical_engine.startswith("DS9/models/engines/"):
+        raise DepthRegistrationError(
+            f"DS9 depth registration {model_key} engine lacks a portable logical identity"
+        )
+    portable_runtime_config = rendered_runtime_config.replace(
+        engine_line,
+        f"model-engine-file={logical_engine}\n",
+        1,
+    ).encode("utf-8")
+    runtime_config_record = {
+        "logical_path": f"DS9/runtime_inference/{model_key}.ini",
+        "size_bytes": int(len(portable_runtime_config)),
+        "sha256": hashlib.sha256(portable_runtime_config).hexdigest(),
+    }
+    if selected_config_path.resolve(strict=False) != reviewed_config_path.resolve(strict=False):
+        selected_record = _depth_registration_content_file_fingerprint(
+            selected_config_path,
+            logical_path=f"DS9/runtime_inference/{model_key}.ini",
+        )
+        if selected_record != execution_runtime_config_record:
+            raise DepthRegistrationError(
+                f"DS9 depth registration {model_key} runtime config bytes disagree with the reviewed derivation"
+            )
+
+    parser = configparser.ConfigParser(interpolation=None, strict=True)
+    parser.optionxform = str
+    try:
+        parser.read_string(reviewed_config_path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        raise DepthRegistrationError(
+            f"DS9 depth registration reviewed config is invalid: {reviewed_config_path}: {exc}"
+        ) from exc
+    if "property" not in parser:
+        raise DepthRegistrationError(
+            f"DS9 depth registration reviewed config lacks [property]: {reviewed_config_path}"
+        )
+    properties = parser["property"]
+    configured_engine = str(properties.get("model-engine-file") or "").strip()
+    if not configured_engine:
+        raise DepthRegistrationError(
+            f"DS9 depth registration reviewed config lacks model-engine-file: {reviewed_config_path}"
+        )
+    configured_engine_path = _resolve_pipeline_cfg_path(pipeline_path, configured_engine)
+    if configured_engine_path.resolve(strict=False) != engine_path.resolve(strict=False):
+        raise DepthRegistrationError(
+            f"DS9 depth registration {model_key} engine disagrees with its runtime config"
+        )
+
+    configured_onnx = str(properties.get("onnx-file") or "").strip()
+    if configured_onnx:
+        configured_logical = _registration_logical_source_path(configured_onnx)
+        if configured_logical != logical_onnx:
+            raise DepthRegistrationError(
+                f"DS9 depth registration {model_key} ONNX disagrees with source authority"
+            )
+    return {
+        "contract": _DEPTH_REGISTRATION_MODEL_CONTENT_BINDING_CONTRACT,
+        "engine": engine_record,
+        "reviewed_config": reviewed_config_record,
+        "runtime_config": runtime_config_record,
+        "onnx_authority": {
+            "logical_path": logical_onnx,
+            "raw_sha256": str(source_contract.get("raw_sha256") or ""),
+            "bundle_sha256": str(source_contract.get("bundle_sha256") or ""),
+            "bundle_files": onnx_bundle_files,
+            "source_contract_selector": selector,
+            "source_contract_sha256": source_contract_sha256,
+        },
+    }
+
+
 def _build_depth_registration_profile_fingerprints(
     pipeline_cfg: Mapping[str, Any],
     *,
     pipeline_path: Path,
+    bind_artifact_content: bool = False,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     models_cfg = pipeline_cfg.get("models") if isinstance(pipeline_cfg, Mapping) else {}
     depth_cfg = (models_cfg or {}).get("depth_tracking") if isinstance(models_cfg, Mapping) else {}
     ma_cfg = (models_cfg or {}).get("mapanything") if isinstance(models_cfg, Mapping) else {}
+    registration_cfg = (
+        pipeline_cfg.get("depth_registration")
+        if isinstance(pipeline_cfg, Mapping)
+        else {}
+    )
+    ma_reference_cfg = (
+        (registration_cfg or {}).get("mapanything_reference")
+        if isinstance(registration_cfg, Mapping)
+        else None
+    )
+    if not isinstance(ma_reference_cfg, Mapping):
+        ma_reference_cfg = ma_cfg
     repo_root = REPO_ROOT.resolve()
+    depth_profile_cfg = (
+        _canonicalize_ds9_registration_model_profile("depth_tracking", depth_cfg)
+        if isinstance(depth_cfg, Mapping)
+        else {}
+    )
+    mapanything_profile_cfg = (
+        _canonicalize_ds9_registration_model_profile(
+            "mapanything", ma_reference_cfg
+        )
+        if isinstance(ma_reference_cfg, Mapping)
+        else {}
+    )
+    if bind_artifact_content:
+        if not isinstance(depth_cfg, Mapping) or not isinstance(
+            ma_reference_cfg, Mapping
+        ):
+            raise DepthRegistrationError(
+                "DS9 hardened depth registration requires both active model profiles"
+            )
+        depth_profile_cfg["content_binding"] = _registration_model_content_binding(
+            model_key="depth_tracking",
+            model_cfg=depth_cfg,
+            pipeline_path=pipeline_path,
+        )
+        mapanything_profile_cfg["content_binding"] = _registration_model_content_binding(
+            model_key="mapanything",
+            model_cfg=ma_reference_cfg,
+            pipeline_path=pipeline_path,
+        )
     depth_profile = _depth_registration_model_profile_fingerprint(
-        depth_cfg if isinstance(depth_cfg, Mapping) else {},
+        depth_profile_cfg,
         repo_root=repo_root,
         extra={
             "model_name": "depth-anything-v2-metric-hypersim-vits",
@@ -1724,7 +2601,7 @@ def _build_depth_registration_profile_fingerprints(
         },
     )
     mapanything_profile = _depth_registration_model_profile_fingerprint(
-        ma_cfg if isinstance(ma_cfg, Mapping) else {},
+        mapanything_profile_cfg,
         repo_root=repo_root,
         extra={"scope": "mapanything_reference_depth"},
     )
@@ -1755,10 +2632,14 @@ def _load_depth_registration_manager(
     camera_labels: Mapping[int, str],
     logger: logging.Logger,
 ) -> DepthRegistrationManager:
-    manager = DepthRegistrationManager.load(path)
+    manager = DepthRegistrationManager.load(
+        path,
+        required_contract_version=_DEPTH_REGISTRATION_HARDENED_CONTRACT_VERSION,
+    )
     depth_profile, mapanything_profile = _build_depth_registration_profile_fingerprints(
         pipeline_cfg,
         pipeline_path=pipeline_path,
+        bind_artifact_content=True,
     )
     missing: list[str] = []
     for source_id, camera_id in _active_baseline_camera_ids(pipeline_cfg, camera_labels):
@@ -1783,35 +2664,116 @@ def _load_depth_registration_manager(
     return manager
 
 
-def _load_camera_labels(path: Path) -> Dict[int, str]:
-    if not path.exists():
-        return {}
-    try:
-        with path.open("r", encoding="utf-8") as stream:
-            data = yaml.safe_load(stream) or {}
-    except Exception:
-        logging.getLogger(__name__).warning("Unable to read cameras config at %s", path)
-        return {}
+def _load_world_measurement_fusion_policy(
+    *,
+    pipeline_cfg: Mapping[str, Any],
+    camera_labels: Mapping[int, str],
+    depth_registration: DepthRegistrationManager,
+    logger: logging.Logger,
+) -> WorldFusionPolicy:
+    policy_cfg = pipeline_cfg.get("world_measurement_fusion")
+    if not isinstance(policy_cfg, Mapping) or not str(policy_cfg.get("path") or "").strip():
+        raise WorldFusionPolicyError(
+            "baseline tracking requires world_measurement_fusion.path"
+        )
+    path = Path(str(policy_cfg["path"]).strip()).expanduser()
+    if not path.is_absolute():
+        path = (REPO_ROOT / path).resolve()
+    active = [
+        camera_id
+        for _source_id, camera_id in _active_baseline_camera_ids(
+            pipeline_cfg,
+            camera_labels,
+        )
+    ]
+    policy = load_world_fusion_policy(
+        path,
+        runtime_lane="ds9",
+        active_camera_ids=active,
+        depth_registration=depth_registration,
+    )
+    logger.info(
+        "Loaded calibrated world fusion policy %s id=%s cameras=%d",
+        path,
+        policy.policy_id,
+        len(policy.cameras),
+    )
+    return policy
 
-    cameras = data.get("cameras", {})
-    labels: Dict[int, str] = {}
-    for key, entry in cameras.items():
-        try:
-            idx = int(key)
-        except Exception:
-            continue
-        if isinstance(entry, dict):
-            name = entry.get("name")
-            if isinstance(name, str) and name.strip():
-                labels[idx] = name.strip()
-                continue
-        labels[idx] = f"camera_{idx}"
-    return labels
+
+def _load_scene_priors(
+    *,
+    pipeline_cfg: Mapping[str, Any],
+    pipeline_path: Path,
+    logger: logging.Logger,
+) -> ScenePriorSet | None:
+    configured = pipeline_cfg.get("scene_priors")
+    if configured is None:
+        return None
+    if not isinstance(configured, Mapping):
+        raise ScenePriorError("scene_priors must be a mapping")
+    raw_path = str(configured.get("path") or "").strip()
+    if not raw_path:
+        raise ScenePriorError("scene_priors.path is required when scene priors are configured")
+    path = _resolve_pipeline_cfg_path(pipeline_path, raw_path)
+    priors = ScenePriorSet.load(path)
+    logger.info(
+        "Loaded scene-prior catalog %s site=%s cameras=%s mode=shadow",
+        path,
+        priors.catalog.site_id,
+        ",".join(priors.camera_ids) or "none",
+    )
+    return priors
 
 
-def _build_storage_manager(args: argparse.Namespace) -> DepthStorageManager:
+def _load_scene_fusions(
+    *,
+    pipeline_cfg: Mapping[str, Any],
+    pipeline_path: Path,
+    logger: logging.Logger,
+) -> SceneFusionSet | None:
+    configured = pipeline_cfg.get("scene_fusions")
+    if configured is None:
+        return None
+    if not isinstance(configured, Mapping):
+        raise SceneFusionError("scene_fusions must be a mapping")
+    raw_path = str(configured.get("path") or "").strip()
+    if not raw_path:
+        raise SceneFusionError(
+            "scene_fusions.path is required when scene fusions are configured"
+        )
+    path = _resolve_pipeline_cfg_path(pipeline_path, raw_path)
+    fusions = SceneFusionSet.load(path)
+    logger.info(
+        "Loaded scene-fusion catalog %s site=%s cameras=%s diagnostic_only=true",
+        path,
+        fusions.site_id,
+        ",".join(fusions.camera_ids) or "none",
+    )
+    return fusions
+
+
+def _build_storage_manager(
+    args: argparse.Namespace,
+    *,
+    on_failure: Optional[Callable[[StorageFailure], None]] = None,
+) -> DepthStorageManager:
     service_cfg = load_service_config()
-    storage_cfg = service_cfg.storage
+    return _build_storage_manager_from_settings(
+        args,
+        storage_cfg=service_cfg.storage,
+        min_conf=service_cfg.performance.min_conf,
+        on_failure=on_failure,
+    )
+
+
+def _build_storage_manager_from_settings(
+    args: argparse.Namespace,
+    *,
+    storage_cfg: Any,
+    min_conf: float,
+    on_failure: Optional[Callable[[StorageFailure], None]] = None,
+) -> DepthStorageManager:
     base_path = Path(args.storage_base) if args.storage_base else Path(storage_cfg.depth_base)
     return DepthStorageManager(
         base_path=base_path,
@@ -1827,11 +2789,18 @@ def _build_storage_manager(args: argparse.Namespace) -> DepthStorageManager:
         size_hysteresis_ratio=storage_cfg.quota_hysteresis_ratio,
         zarr_clevel=storage_cfg.zarr_clevel,
         zarr_chunk_px=storage_cfg.zarr_chunk_px,
-        min_conf=getattr(getattr(service_cfg, "performance", None), "min_conf", float("nan")),
+        min_conf=float(min_conf),
+        on_failure=on_failure,
+        legacy_policy="ignore",
     )
 
 
-def _build_stable_id_manager(logger: logging.Logger, *, pipeline_config: Optional[Mapping[str, Any]] = None):
+def _build_stable_id_manager(
+    logger: logging.Logger,
+    *,
+    pipeline_config: Optional[Mapping[str, Any]] = None,
+    camera_labels: Optional[Mapping[int, str]] = None,
+):
     """Instantiate StableIDManager if enabled and available."""
     flag = os.environ.get("NOESIS_REID_ENABLED", "1")
     if str(flag).strip().lower() not in ("1", "true", "yes", "on"):
@@ -1839,8 +2808,15 @@ def _build_stable_id_manager(logger: logging.Logger, *, pipeline_config: Optiona
         return None
     try:
         from reid.stable_id_manager import StableIDManager  # type: ignore
+        from reid.household_state import (  # type: ignore
+            is_household_identity_enabled,
+            prepare_household_stable_id_overrides,
+        )
     except Exception as exc:  # pragma: no cover - optional dependency
-        logger.warning("Stable ID manager unavailable (import failed): %s", exc)
+        logger.error(
+            "Stable ID/household policy unavailable for canonical DS9 runtime: %s",
+            exc,
+        )
         return None
 
     try:
@@ -1923,6 +2899,14 @@ def _build_stable_id_manager(logger: logging.Logger, *, pipeline_config: Optiona
             max_total_ids = 12
         total_id_reuse_env = os.environ.get("NOESIS_REID_TOTAL_ID_REUSE", "1")
         total_id_reuse = str(total_id_reuse_env).strip().lower() in ("1", "true", "yes", "on")
+        household_identity_enabled = is_household_identity_enabled()
+        cos_sim_high_env_set = os.environ.get("NOESIS_REID_COS_SIM_HIGH_THRESHOLD") is not None
+        try:
+            cos_sim_high_threshold = float(
+                os.environ.get("NOESIS_REID_COS_SIM_HIGH_THRESHOLD", "0.70") or 0.70
+            )
+        except Exception:
+            cos_sim_high_threshold = 0.70
         try:
             total_id_reuse_min_age_s = float(os.environ.get("NOESIS_REID_TOTAL_ID_REUSE_MIN_AGE_S", "60") or 60.0)
         except Exception:
@@ -2000,6 +2984,25 @@ def _build_stable_id_manager(logger: logging.Logger, *, pipeline_config: Optiona
             gpu_min_gallery = int(os.environ.get("NOESIS_STABLEID_GPU_MIN_GALLERY", "32") or 32)
         except Exception:
             gpu_min_gallery = 32
+        allow_multi_zone_active = True
+        household_overrides: Dict[str, Any] = {}
+        if household_identity_enabled:
+            household_overrides = prepare_household_stable_id_overrides(
+                logger,
+                repo_root=REPO_ROOT,
+                cos_sim_high_threshold=cos_sim_high_threshold,
+                cos_sim_high_env_set=cos_sim_high_env_set,
+            )
+            allow_multi_zone_active = bool(
+                household_overrides.pop("allow_multi_zone_active", False)
+            )
+            auto_merge_enabled = bool(
+                household_overrides.pop("auto_merge_enabled", False)
+            )
+            if "NOESIS_REID_POSE_ENABLED" not in os.environ and not str(
+                pose_flag
+            ).strip():
+                pose_enabled = True
         extra_kwargs = {
             "max_total_ids": max_total_ids,
             "total_id_reuse": total_id_reuse,
@@ -2028,6 +3031,10 @@ def _build_stable_id_manager(logger: logging.Logger, *, pipeline_config: Optiona
             "gpu_device": gpu_device,
             "gpu_min_gallery": gpu_min_gallery,
         }
+        if household_identity_enabled:
+            extra_kwargs.update(household_overrides)
+        if camera_labels is not None:
+            extra_kwargs["camera_labels"] = dict(camera_labels)
         try:
             sig = inspect.signature(StableIDManager.__init__)
             valid_params = set(sig.parameters)
@@ -2040,7 +3047,7 @@ def _build_stable_id_manager(logger: logging.Logger, *, pipeline_config: Optiona
             device=device,
             model_name=model_name,
             image_size=(img_h, img_w),
-            allow_multi_zone_active=True,
+            allow_multi_zone_active=allow_multi_zone_active,
             # Noesis stable IDs source embeddings from an explicit OSNet SGIE; do not load torchreid.
             use_extractor=False,
             embed_interval_s=embed_interval_s,
@@ -2061,13 +3068,24 @@ def _build_stable_id_manager(logger: logging.Logger, *, pipeline_config: Optiona
             **extra_kwargs,
         )
         logger.info(
-            "Stable ID manager initialised (SGIE embeddings; allow_multi_zone_active=%s, embed_interval_s=%.3f, new_id_hysteresis_frames=%d, new_id_confirm_frames_at_cap=%d, pose_enabled=%s)",
-            True,
+            "Stable ID manager initialised (SGIE embeddings; household_mode=%s, allow_multi_zone_active=%s, embed_interval_s=%.3f, new_id_hysteresis_frames=%d, new_id_confirm_frames_at_cap=%d, pose_enabled=%s)",
+            household_identity_enabled,
+            allow_multi_zone_active,
             embed_interval_s,
             new_id_hysteresis_frames,
             new_id_confirm_frames_at_cap,
             pose_enabled,
         )
+        if household_identity_enabled and (
+            not bool(getattr(mgr, "household_mode", False))
+            or bool(getattr(mgr, "auto_merge_enabled", True))
+            or bool(getattr(mgr, "allow_multi_zone_active", True))
+        ):
+            raise RuntimeError(
+                "canonical DS9 household StableID policy admission failed: "
+                "household_mode=true, auto_merge_enabled=false, and "
+                "allow_multi_zone_active=false are required"
+            )
         try:
             sid_metrics = dict(mgr.get_sid_metrics() or {})
         except Exception:
@@ -2085,316 +3103,18 @@ def _build_stable_id_manager(logger: logging.Logger, *, pipeline_config: Optiona
         return None
 
 
-class _CalibrationProvider:
-    """Provide calibration snapshots and WS bundle for BEV rendering."""
-
-    def __init__(
-        self,
-        cameras_path: Path,
-        pipeline_cfg: Dict[str, object],
-        *,
-        tracking_mode: Optional[str] = None,
-        extrinsics_path: Optional[Path] = None,
-    ) -> None:
-        self._loader = CameraConfigLoader(cameras_path)
-        self._camera_model_res = self._load_camera_model_resolutions(cameras_path)
-        self._intrinsics_models = load_intrinsics(str(REPO_ROOT / "intrinsics.json"))
-        self._align = load_alignment(str(REPO_ROOT / "config" / "ply_alignment.json"))
-        tracking_mode_norm = str(tracking_mode or "").strip().lower() or "baseline"
-        default_extrinsics_path = REPO_ROOT / "config" / "camera_calibration.json"
-        env_path = os.environ.get("NOESIS_CALIBRATION_EXTRINSICS", "")
-        if not extrinsics_path and env_path.strip():
-            extrinsics_path = Path(env_path.strip())
-        self._extrinsics_path = Path(extrinsics_path) if extrinsics_path else default_extrinsics_path
-        self._extrinsics = load_extrinsics(str(self._extrinsics_path), align_data=self._align)
-        logging.getLogger(__name__).info("Calibration extrinsics path=%s", self._extrinsics_path)
-        try:
-            from config import config as app_config  # type: ignore
-
-            calib_cfg = getattr(app_config, "calibration", None)
-            self._model_map = dict(getattr(calib_cfg, "CAMERA_INTRINSICS_MODEL_MAP", {}) or {})
-            self._camera_specs = dict(getattr(calib_cfg, "CAMERA_SPECS", {}) or {})
-        except Exception:
-            self._model_map = {}
-            self._camera_specs = {}
-        streammux_cfg = pipeline_cfg.get("streammux") or {}
-        try:
-            self._frame_size = (
-                int((streammux_cfg or {}).get("width", 0) or 0),
-                int((streammux_cfg or {}).get("height", 0) or 0),
-            )
-        except Exception:
-            self._frame_size = (0, 0)
-        self._camera_labels: Dict[int, str] = {}
-        self._bundle_cache: Optional[Dict[str, object]] = None
-        pose_only_env = str(os.environ.get("NOESIS_CALIBRATION_POSE_ONLY", "1") or "").strip().lower()
-        self._pose_only = pose_only_env in ("1", "true", "yes", "on", "y")
-
-    @staticmethod
-    def _resolution_from_entry(entry: Any) -> Optional[Tuple[int, int]]:
-        if not isinstance(entry, dict):
-            return None
-        res = entry.get("resolution")
-        if isinstance(res, (list, tuple)) and len(res) >= 2:
-            try:
-                w = int(res[0])
-                h = int(res[1])
-                if w > 0 and h > 0:
-                    return w, h
-            except Exception:
-                return None
-        intr = entry.get("intrinsics")
-        if isinstance(intr, dict):
-            res = intr.get("resolution")
-            if isinstance(res, (list, tuple)) and len(res) >= 2:
-                try:
-                    w = int(res[0])
-                    h = int(res[1])
-                    if w > 0 and h > 0:
-                        return w, h
-                except Exception:
-                    return None
-        return None
-
-    @classmethod
-    def _load_camera_model_resolutions(cls, cameras_path: Path) -> Dict[str, Tuple[int, int]]:
-        try:
-            data = yaml.safe_load(Path(cameras_path).read_text()) or {}
-        except Exception:
-            return {}
-        models = data.get("intrinsics_models") or {}
-        cameras = data.get("cameras") or {}
-        if not isinstance(models, dict) or not isinstance(cameras, dict):
-            return {}
-        model_res: Dict[str, Tuple[int, int]] = {}
-        for key, entry in models.items():
-            res = cls._resolution_from_entry(entry)
-            if res:
-                model_res[str(key)] = res
-        cam_res: Dict[str, Tuple[int, int]] = {}
-        for entry in cameras.values():
-            if not isinstance(entry, dict):
-                continue
-            name = entry.get("name")
-            model = entry.get("model") or entry.get("intrinsics_model")
-            if isinstance(name, str) and isinstance(model, str):
-                res = model_res.get(model)
-                if res:
-                    cam_res[name] = res
-        return cam_res
-
-    def set_camera_labels(self, labels: Dict[int, str]) -> None:
-        self._camera_labels = dict(labels or {})
-        self._bundle_cache = None
-
-    def pose_only_enabled(self) -> bool:
-        return bool(self._pose_only)
-
-    def extrinsics_path(self) -> Path:
-        return Path(self._extrinsics_path)
-
-    def validate_pose_coverage(self) -> Dict[str, str]:
-        errors: Dict[str, str] = {}
-        camera_ids = sorted({name for name in self._camera_labels.values() if isinstance(name, str) and str(name).strip()})
-        if not camera_ids:
-            return errors
-        cams = self._extrinsics.get("cameras", {}) if isinstance(self._extrinsics, dict) else {}
-        align = self._align if isinstance(self._align, dict) else {}
-        try:
-            floor_y = float(align.get("floor_y", 0.0) or 0.0)
-        except Exception:
-            floor_y = 0.0
-        for camera_id in camera_ids:
-            entry = cams.get(camera_id)
-            if not isinstance(entry, dict):
-                errors[camera_id] = "missing_camera_entry"
-                continue
-            pose = entry.get("pose")
-            if not isinstance(pose, dict):
-                errors[camera_id] = "missing_or_invalid_pose"
-                continue
-            E = entry.get("E")
-            if not (isinstance(E, list) and len(E) == 16):
-                errors[camera_id] = "pose_to_extrinsics_failed"
-                continue
-            try:
-                Emat = np.array(E, dtype=np.float64).reshape((4, 4), order="F")
-                Twc = np.linalg.inv(Emat)
-                C_world = Twc[:3, 3].copy()
-                if not np.all(np.isfinite(C_world)):
-                    errors[camera_id] = "non_finite_camera_center"
-                    continue
-                if float(C_world[1]) <= float(floor_y) + 1e-3:
-                    errors[camera_id] = "camera_not_above_floor"
-                    continue
-                R_wc = Twc[:3, :3].copy()
-                forward = R_wc @ np.array([0.0, 0.0, 1.0], dtype=np.float64)
-                denom = float(forward[1])
-                if abs(denom) < 1e-6:
-                    errors[camera_id] = "camera_forward_parallel_to_floor"
-                    continue
-                t_hit = (float(floor_y) - float(C_world[1])) / denom
-                if t_hit <= 0.0:
-                    errors[camera_id] = "camera_forward_misses_floor"
-            except Exception:
-                errors[camera_id] = "invalid_pose_geometry"
-        return errors
-
-    def reload_extrinsics(self) -> None:
-        """Reload extrinsics from the configured calibration path without touching alignment."""
-        self._extrinsics = load_extrinsics(str(self._extrinsics_path), align_data=self._align)
-        self._bundle_cache = None
-
-    def reload_alignment(self) -> None:
-        """Reload alignment from ply_alignment.json."""
-        self._align = load_alignment(str(REPO_ROOT / "config" / "ply_alignment.json"))
-        self._extrinsics = load_extrinsics(str(self._extrinsics_path), align_data=self._align)
-        self._bundle_cache = None
-
-    def snapshot(self, source_id: int, camera_id: str) -> Optional["CalibrationSnapshot"]:
-        intr = self._loader.get(source_id)
-        if intr is None:
-            return None
-        try:
-            K = np.array(
-                [
-                    [float(intr.fx), 0.0, float(intr.cx)],
-                    [0.0, float(intr.fy), float(intr.cy)],
-                    [0.0, 0.0, 1.0],
-                ],
-                dtype=np.float64,
-            )
-        except Exception:
-            return None
-        extr_entry = self._extrinsics.get("cameras", {}).get(camera_id) if isinstance(self._extrinsics, dict) else None
-        E = extr_entry.get("E") if isinstance(extr_entry, dict) else None
-        if not isinstance(E, list) or len(E) != 16:
-            return None
-        align_dict = self._align if isinstance(self._align, dict) else {}
-        floor_y = float(align_dict.get("floor_y", 0.0) or 0.0)
-        unit_scale = 1.0
-        frame_w, frame_h = self._frame_size
-        if frame_w <= 0 or frame_h <= 0:
-            frame_w, frame_h = 1920, 1080
-
-        # Align intrinsics with the current streammux resolution.
-        base_w = base_h = None
-        res = self._camera_model_res.get(camera_id)
-        if res:
-            base_w, base_h = res
-        if base_w is None or base_h is None:
-            try:
-                spec = (self._camera_specs or {}).get(camera_id) if isinstance(self._camera_specs, dict) else None
-                if isinstance(spec, dict):
-                    res = spec.get("resolution")
-                    if isinstance(res, (list, tuple)) and len(res) >= 2:
-                        base_w = base_w or int(res[0]) or None
-                        base_h = base_h or int(res[1]) or None
-            except Exception:
-                pass
-        if (base_w is None or base_h is None) and isinstance(self._model_map, dict):
-            model_key = self._model_map.get(camera_id)
-            model = (self._intrinsics_models or {}).get(model_key, {}) if model_key else {}
-            res = model.get("resolution") if isinstance(model, dict) else None
-            if isinstance(res, (list, tuple)) and len(res) >= 2:
-                try:
-                    bw = int(res[0]); bh = int(res[1])
-                    base_w = base_w or bw
-                    base_h = base_h or bh
-                except Exception:
-                    pass
-        if base_w is None or base_h is None:
-            try:
-                bw_guess = int(round(float(K[0, 2]) * 2.0))
-                bh_guess = int(round(float(K[1, 2]) * 2.0))
-                if bw_guess > 0 and bh_guess > 0:
-                    base_w = base_w or bw_guess
-                    base_h = base_h or bh_guess
-            except Exception:
-                pass
-        if base_w and base_h and (base_w != frame_w or base_h != frame_h):
-            try:
-                sx = float(frame_w) / float(base_w)
-                sy = float(frame_h) / float(base_h)
-                K = K.copy()
-                K[0, 0] *= sx
-                K[0, 2] *= sx
-                K[1, 1] *= sy
-                K[1, 2] *= sy
-            except Exception:
-                pass
-        return CalibrationSnapshot(
-            camera_id=camera_id,
-            intrinsics=K,
-            extrinsics_col_major=list(E),
-            floor_y=floor_y,
-            image_size=(int(frame_w), int(frame_h)),
-            unit_scale=unit_scale,
-        )
-
-    def calibration_bundle(self) -> Dict[str, object]:
-        if self._bundle_cache is not None:
-            return dict(self._bundle_cache)
-        camera_ids = sorted({name for name in self._camera_labels.values() if isinstance(name, str)})
-        if not camera_ids:
-            return {}
-        bundle = assemble_calibration_bundle(
-            camera_ids=camera_ids,
-            intrinsics_models=self._intrinsics_models,
-            model_map=self._model_map,
-            extrinsics_data=self._extrinsics,
-            align_data=self._align,
-            camera_specs=self._camera_specs,
-        )
-        cams_node = bundle.setdefault("cameras", {})
-        k_table = cams_node.setdefault("K", {})
-        frame_w, frame_h = self._frame_size
-        if frame_w <= 0 or frame_h <= 0:
-            frame_w, frame_h = 1920, 1080
-        for src_id, cam_name in self._camera_labels.items():
-            intr = self._loader.get(src_id)
-            if intr is None:
-                continue
-            try:
-                fx = float(intr.fx)
-                fy = float(intr.fy)
-                cx = float(intr.cx)
-                cy = float(intr.cy)
-            except Exception:
-                continue
-            base_w = base_h = 0
-            res = self._camera_model_res.get(cam_name)
-            if res:
-                base_w, base_h = res
-            if base_w <= 0 or base_h <= 0:
-                try:
-                    base_w = int(round(cx * 2.0))
-                    base_h = int(round(cy * 2.0))
-                except Exception:
-                    base_w = base_h = 0
-            if base_w > 0 and base_h > 0 and (base_w != frame_w or base_h != frame_h):
-                try:
-                    sx = float(frame_w) / float(base_w)
-                    sy = float(frame_h) / float(base_h)
-                    fx *= sx
-                    cx *= sx
-                    fy *= sy
-                    cy *= sy
-                except Exception:
-                    pass
-            k_table[cam_name] = [fx, fy, cx, cy]
-        self._bundle_cache = bundle
-        return dict(bundle)
 
 def _build_stats_callback(
     pipeline: ds8_pipeline.DS8Pipeline,
     camera_labels: Dict[int, str],
     ws_metrics_getter: Optional[Callable[[], Dict[str, Any]]] = None,
     ws_metrics_resetter: Optional[Callable[[], None]] = None,
+    runtime_state: Optional[Mapping[str, Any]] = None,
 ) -> Callable[[], Dict[str, object]]:
     start_time = time.time()
     stats_logger = logging.getLogger(__name__)
     sid_metrics_fetch_warned = False
+    state = runtime_state if runtime_state is not None else {}
 
     def _default_stableid_metrics() -> Dict[str, Any]:
         return {
@@ -2493,6 +3213,8 @@ def _build_stats_callback(
         except Exception:
             depth_fps = 0.0
         reload_count = getattr(pipeline, "analytics_reload_count", 0)
+        reload_receipt = getattr(pipeline, "analytics_reload_receipt", None)
+        initial_receipt = getattr(pipeline, "analytics_initial_receipt", None)
         stableid_metrics: Dict[str, Any] = _default_stableid_metrics()
         try:
             sid_mgr = getattr(pipeline, "stable_id_mgr", None)
@@ -2522,23 +3244,41 @@ def _build_stats_callback(
         core_violations = int(core_counters.get("core_path.cpu_copy_violation.total", 0))
         ws_boundary_metrics: Dict[str, Any] = {}
         if callable(ws_metrics_getter):
-            try:
-                ws_boundary_metrics = ws_metrics_getter() or {}
-            except Exception:
-                ws_boundary_metrics = {}
-        rest_boundary_metrics: Dict[str, Any] = {}
-        try:
-            from noesis.server import boundary_metrics as _rest_boundary_metrics
+            ws_boundary_metrics = ws_metrics_getter()
+            if not isinstance(ws_boundary_metrics, dict):
+                raise TypeError("WebSocket boundary metrics getter must return a dict")
+        from noesis.server import boundary_metrics as _rest_boundary_metrics
 
-            rest_boundary_metrics = _rest_boundary_metrics.get_boundary_serialization_metrics() or {}
-        except Exception:
-            rest_boundary_metrics = {}
+        compact_getter = getattr(
+            _rest_boundary_metrics,
+            "get_boundary_serialization_metrics_compact",
+            _rest_boundary_metrics.get_boundary_serialization_metrics,
+        )
+        rest_boundary_metrics = compact_getter()
+        if not isinstance(rest_boundary_metrics, dict):
+            raise TypeError("REST boundary metrics getter must return a dict")
         ws_p50 = ws_boundary_metrics.get("p50_ms")
         ws_p95 = ws_boundary_metrics.get("p95_ms")
-        ws_p99 = ws_boundary_metrics.get("p99_ms")
+        ws_p99 = ws_boundary_metrics.get(
+            "max_path_p99_ms", ws_boundary_metrics.get("p99_ms")
+        )
+        ws_p99_10s = ws_boundary_metrics.get(
+            "max_path_p99_10s_ms", ws_boundary_metrics.get("p99_10s_ms")
+        )
+        ws_p99_60s = ws_boundary_metrics.get(
+            "max_path_p99_60s_ms", ws_boundary_metrics.get("p99_60s_ms")
+        )
         rest_p50 = rest_boundary_metrics.get("p50_ms")
         rest_p95 = rest_boundary_metrics.get("p95_ms")
-        rest_p99 = rest_boundary_metrics.get("p99_ms")
+        rest_p99 = rest_boundary_metrics.get(
+            "max_path_p99_ms", rest_boundary_metrics.get("p99_ms")
+        )
+        rest_p99_10s = rest_boundary_metrics.get(
+            "max_path_p99_10s_ms", rest_boundary_metrics.get("p99_10s_ms")
+        )
+        rest_p99_60s = rest_boundary_metrics.get(
+            "max_path_p99_60s_ms", rest_boundary_metrics.get("p99_60s_ms")
+        )
 
         def _max_nullable(a: Any, b: Any) -> Any:
             try:
@@ -2552,7 +3292,16 @@ def _build_stats_callback(
 
         boundary_p50 = _max_nullable(ws_p50, rest_p50)
         boundary_p95 = _max_nullable(ws_p95, rest_p95)
-        boundary_p99 = _max_nullable(ws_p99, rest_p99)
+        boundary_p99_10s = _max_nullable(ws_p99_10s, rest_p99_10s)
+        boundary_p99_60s = _max_nullable(ws_p99_60s, rest_p99_60s)
+        boundary_p99 = _max_nullable(boundary_p99_10s, boundary_p99_60s)
+        ws_boundary_errors = int(
+            ws_boundary_metrics.get("boundary_serialization_errors_total", 0) or 0
+        )
+        rest_boundary_errors = int(
+            rest_boundary_metrics.get("boundary_serialization_errors_total", 0) or 0
+        )
+        boundary_errors = ws_boundary_errors + rest_boundary_errors
         latency_collector = getattr(pipeline, "latency_collector", None)
         latency_by_source: Dict[int, Dict[str, object]] = {}
         latency_aggregate: Optional[Dict[str, object]] = None
@@ -2571,12 +3320,29 @@ def _build_stats_callback(
             except Exception:
                 latency_disabled = None
 
+        source_progress_monitor = getattr(pipeline, "source_progress_monitor", None)
+        source_progress: Dict[str, Any] = {
+            "healthy": False,
+            "started": False,
+            "sources": {},
+            "fatal": None,
+            "reason": "not_configured",
+        }
+        if source_progress_monitor is not None:
+            source_progress = source_progress_monitor.snapshot()
+        source_progress_rows = source_progress.get("sources", {})
+        if not isinstance(source_progress_rows, dict):
+            raise TypeError("decoded source progress snapshot sources must be a dict")
+
         # Access analytics processor if attached to the pipeline components
         analytics_comp = pipeline.components.get("analytics")
         analytics_proc = analytics_comp.config.get("_analytics_processor") if analytics_comp else None
 
         for sensor_id, name in sorted(camera_labels.items()):
             cam_key = str(name)
+            progress_row = source_progress_rows.get(str(int(sensor_id)), {})
+            if not isinstance(progress_row, dict):
+                progress_row = {}
 
             tracking: Dict[str, Any] = {
                 "occupancy": {},
@@ -2618,13 +3384,57 @@ def _build_stats_callback(
                     latency_payload = dict(latency_disabled)
 
             cameras_stats[cam_key] = {
-                "fps": 0.0,
-                "frames_processed": 0,
-                "status": "running" if pipeline.activated else "unknown",
+                "fps": float(progress_row.get("fps", 0.0) or 0.0),
+                "frames_processed": int(progress_row.get("frames", 0) or 0),
+                "status": str(
+                    progress_row.get(
+                        "status", "running" if pipeline.activated else "unknown"
+                    )
+                ),
+                "decoded_progress": progress_row,
                 "tracking": tracking,
                 **({"latency_ms": latency_payload} if latency_payload is not None else {}),
             }
-        return {
+        bev_renderer = getattr(pipeline, "bev_renderer", None)
+        active_floorplans = getattr(pipeline, "active_floorplan_registry", None)
+        capture_controller = getattr(pipeline, "capture_event_controller", None)
+        scene_priors = getattr(pipeline, "scene_priors", None)
+        scene_fusions = getattr(pipeline, "scene_fusions", None)
+        bev_health = (
+            bev_renderer.health_snapshot()
+            if bev_renderer is not None
+            else {"healthy": False, "cameras": {}, "reason": "not_configured"}
+        )
+        bev_health = require_complete_camera_health(
+            bev_health,
+            camera_labels.values(),
+        )
+        active_floorplan_health = (
+            active_floorplans.health_snapshot()
+            if active_floorplans is not None
+            else {"healthy": False, "cameras": {}, "reason": "not_configured"}
+        )
+        capture_event_health = (
+            capture_controller.health_snapshot()
+            if capture_controller is not None
+            else {"healthy": False, "reason": "not_configured"}
+        )
+        scene_prior_health = (
+            scene_priors.health_snapshot()
+            if scene_priors is not None
+            else {"contract": "noesis.scene_prior.health", "contract_version": 1, "mode": "shadow", "status": "not_configured"}
+        )
+        scene_fusion_health = (
+            scene_fusions.health_snapshot()
+            if scene_fusions is not None
+            else {
+                "contract": "noesis.scene_fusion.health",
+                "contract_version": 1,
+                "status": "not_configured",
+            }
+        )
+        response_model_started_ns = time.perf_counter_ns()
+        stats_payload = {
             "timestamp": now,
             "uptime": now - start_time,
             "stack": "ds8",
@@ -2639,6 +3449,15 @@ def _build_stats_callback(
                 "activated": pipeline.activated,
                 "depth_enabled": pipeline.depth_enabled,
                 "depth_fps": depth_fps,
+                "lifecycle_evidence": getattr(pipeline, "lifecycle_evidence", None),
+                "bev": {
+                    "frame": "camera_local_ground_m",
+                    "health": bev_health,
+                },
+                "active_floorplan": active_floorplan_health,
+                "capture_event_fusion": capture_event_health,
+                "scene_prior": scene_prior_health,
+                "scene_fusion": scene_fusion_health,
                 "zero_copy_profile": str(os.environ.get("NOESIS_ZERO_COPY_PROFILE", "strict") or "strict"),
                 "zero_copy_core_enabled": True,
                 "zero_copy_violations": core_violations,
@@ -2649,9 +3468,18 @@ def _build_stats_callback(
                 "boundary_cpu_serialization_p50_ms": boundary_p50,
                 "boundary_cpu_serialization_p95_ms": boundary_p95,
                 "boundary_cpu_serialization_p99_ms": boundary_p99,
+                "boundary_cpu_serialization_p99_10s_ms": boundary_p99_10s,
+                "boundary_cpu_serialization_p99_60s_ms": boundary_p99_60s,
                 "boundary_cpu_serialization_ws_p99_ms": ws_p99,
                 "boundary_cpu_serialization_rest_p99_ms": rest_p99,
+                "boundary_serialization_errors_total": boundary_errors,
+                "boundary_serialization_ws_errors_total": ws_boundary_errors,
+                "boundary_serialization_rest_errors_total": rest_boundary_errors,
                 "analytics_reload_count": reload_count,
+                "analytics_reload_receipt": reload_receipt,
+                "analytics_initial_receipt": initial_receipt,
+                "analytics_state_poisoned": state.get("analytics_state_poisoned"),
+                "source_progress": source_progress,
                 "mosaic_layout": _mosaic_layout(),
                 **({"latency_ms": latency_aggregate} if latency_aggregate is not None else {}),
                 "zero_copy_core": {
@@ -2667,6 +3495,10 @@ def _build_stats_callback(
             },
             "cameras": cameras_stats,
         }
+        return WebSocketServer.timed_payload_since(
+            stats_payload,
+            response_model_started_ns,
+        )
 
     def _clear_stats() -> None:
         try:
@@ -2695,10 +3527,16 @@ def _build_stats_callback(
     return _stats
 
 
-def _start_websocket_server(server: WebSocketServer) -> tuple[threading.Thread, Optional[asyncio.AbstractEventLoop]]:
+def _start_websocket_server(
+    server: WebSocketServer,
+    timeout_s: float = WebSocketServer.STARTUP_TIMEOUT_S,
+) -> tuple[threading.Thread, asyncio.AbstractEventLoop]:
     logger = logging.getLogger(__name__)
+    timeout = float(timeout_s)
+    if not math.isfinite(timeout) or timeout <= 0.0:
+        raise ValueError("WebSocket startup timeout must be positive")
     started = threading.Event()
-    loop_holder: Dict[str, asyncio.AbstractEventLoop] = {}
+    loop_holder: Dict[str, Any] = {}
 
     def _run() -> None:
         loop = asyncio.new_event_loop()
@@ -2706,178 +3544,131 @@ def _start_websocket_server(server: WebSocketServer) -> tuple[threading.Thread, 
         loop_holder["loop"] = loop
         try:
             server.event_loop = loop
-            loop.run_until_complete(server.start())
+            start_task = loop.create_task(
+                server.start(),
+                name="WebSocketServerStartup",
+            )
+            loop_holder["start_task"] = start_task
+            loop.run_until_complete(
+                asyncio.wait_for(start_task, timeout=timeout)
+            )
+            if getattr(server, "server", None) is None:
+                raise RuntimeError(
+                    "WebSocket startup completed without a bound listener"
+                )
             started.set()
             loop.run_forever()
-        except Exception:
+        except BaseException as exc:
+            loop_holder["startup_error"] = exc
             logger.exception("WebSocket server thread terminated unexpectedly")
+            server.report_lifecycle_failure(exc)
             started.set()
         finally:
             try:
                 loop.run_until_complete(server.stop())
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.critical(
+                    "WebSocket shutdown proof failed in event-loop owner",
+                    exc_info=True,
+                )
+                server.report_lifecycle_failure(exc)
+                loop.run_forever()
             finally:
-                if not loop.is_closed():
+                if not getattr(server, "_shutdown_quiesced", False):
+                    logger.critical(
+                        "WebSocket event-loop owner retained after unproven shutdown"
+                    )
+                    threading.Event().wait()
+                elif not loop.is_closed():
                     loop.stop()
                     loop.close()
 
-    thread = threading.Thread(target=_run, name="DS9-WebSocket", daemon=True)
+    thread = threading.Thread(target=_run, name="DS9-WebSocket", daemon=False)
     thread.start()
-    started.wait(timeout=5.0)
-    return thread, loop_holder.get("loop")
+    startup_signaled = started.wait(timeout=timeout + 0.5)
+    loop = loop_holder.get("loop")
+    start_task = loop_holder.get("start_task")
+    startup_error = loop_holder.get("startup_error")
+    server_bound = getattr(server, "server", None) is not None
+    if (
+        startup_signaled
+        and startup_error is None
+        and server_bound
+        and isinstance(loop, asyncio.AbstractEventLoop)
+        and thread.is_alive()
+    ):
+        return thread, loop
 
-
-def _wait_for_rtsp_ready(host: str, port: int, timeout: float = 15.0, interval: float = 0.2) -> bool:
-    """Wait for RTSP port to accept TCP connections before starting the gateway."""
-    deadline = time.time() + timeout
-    addr = (host, port)
-    attempt = 0
-    start_ts = time.time()
-    last_log = 0.0
-    #region agent log
-    try:
-        with _agent_debug_log_path().open("a", encoding="utf-8") as _f:
-            _f.write(
-                json.dumps(
-                    {
-                        "sessionId": "debug-session",
-                        "runId": "run1",
-                        "hypothesisId": "H2",
-                        "location": "ds9_runtime_core.py:_wait_for_rtsp_ready",
-                        "message": "rtsp wait start",
-                        "data": {"host": host, "port": port, "timeout_s": timeout},
-                        "timestamp": int(time.time() * 1000),
-                    }
-                )
-                + "\n"
-            )
-    except Exception:
-        pass
-    #endregion
-    while time.time() < deadline:
-        attempt += 1
-        try:
-            with socket.create_connection(addr, timeout=0.3):
-                #region agent log
-                try:
-                    with _agent_debug_log_path().open("a", encoding="utf-8") as _f:
-                        _f.write(
-                            json.dumps(
-                                {
-                                    "sessionId": "debug-session",
-                                    "runId": "run1",
-                                    "hypothesisId": "H2",
-                                    "location": "ds9_runtime_core.py:_wait_for_rtsp_ready",
-                                    "message": "rtsp port ready",
-                                    "data": {"host": host, "port": port, "attempt": attempt, "elapsed_ms": int((time.time() - (deadline - timeout)) * 1000)},
-                                    "timestamp": int(time.time() * 1000),
-                                }
-                            )
-                            + "\n"
-                        )
-                except Exception:
-                    pass
-                #endregion
-                return True
-        except Exception:
-            now = time.time()
-            if now - last_log >= 1.0:
-                last_log = now
-                #region agent log
-                try:
-                    with _agent_debug_log_path().open("a", encoding="utf-8") as _f:
-                        _f.write(
-                            json.dumps(
-                                {
-                                    "sessionId": "debug-session",
-                                    "runId": "run1",
-                                    "hypothesisId": "H2",
-                                    "location": "ds9_runtime_core.py:_wait_for_rtsp_ready",
-                                    "message": "rtsp wait attempt",
-                                    "data": {
-                                        "host": host,
-                                        "port": port,
-                                        "attempt": attempt,
-                                        "elapsed_ms": int((now - start_ts) * 1000),
-                                    },
-                                    "timestamp": int(time.time() * 1000),
-                                }
-                            )
-                            + "\n"
-                        )
-                except Exception:
-                    pass
-                #endregion
-            time.sleep(interval)
-    #region agent log
-    try:
-        with _agent_debug_log_path().open("a", encoding="utf-8") as _f:
-            _f.write(
-                json.dumps(
-                    {
-                        "sessionId": "debug-session",
-                        "runId": "run1",
-                        "hypothesisId": "H2",
-                        "location": "ds9_runtime_core.py:_wait_for_rtsp_ready",
-                        "message": "rtsp port not ready",
-                        "data": {"host": host, "port": port, "timeout_s": timeout},
-                        "timestamp": int(time.time() * 1000),
-                    }
-                )
-                + "\n"
-            )
-    except Exception:
-        pass
-    #endregion
-    return False
+    if (
+        isinstance(loop, asyncio.AbstractEventLoop)
+        and loop.is_running()
+        and start_task is not None
+        and not start_task.done()
+    ):
+        loop.call_soon_threadsafe(start_task.cancel)
+    thread.join(timeout=WebSocketServer.RUNTIME_SHUTDOWN_TIMEOUT_S)
+    receipt = WebSocketStartupReceipt(
+        startup_signaled=bool(startup_signaled),
+        server_bound=bool(getattr(server, "server", None) is not None),
+        start_task_done=bool(start_task is not None and start_task.done()),
+        thread_stopped=not thread.is_alive(),
+        event_loop_closed=bool(
+            isinstance(loop, asyncio.AbstractEventLoop) and loop.is_closed()
+        ),
+    )
+    raise WebSocketStartupError(
+        "WebSocket listener failed bounded startup",
+        receipt,
+    ) from startup_error
 
 
 def _stop_websocket_server(
     server: WebSocketServer,
     thread: Optional[threading.Thread],
     loop: Optional[asyncio.AbstractEventLoop],
-    timeout: float = 5.0,
+    timeout: float = WebSocketServer.RUNTIME_SHUTDOWN_TIMEOUT_S,
 ) -> None:
     if thread is None:
         return
+    if loop is None or not loop.is_running():
+        raise RuntimeError("WebSocket event loop was unavailable during shutdown")
+    deadline = time.monotonic() + max(0.0, float(timeout))
     try:
-        if loop is not None and loop.is_running():
-            future = asyncio.run_coroutine_threadsafe(server.stop(), loop)
-            future.result(timeout=timeout)
-            loop.call_soon_threadsafe(loop.stop)
-    except Exception:
-        pass
-    finally:
-        thread.join(timeout=timeout)
+        future = asyncio.run_coroutine_threadsafe(server.stop(), loop)
+        async_bound = min(
+            max(0.0, deadline - time.monotonic()),
+            float(WebSocketServer.ASYNC_SHUTDOWN_TIMEOUT_S),
+        )
+        future.result(timeout=async_bound)
+    except Exception as exc:
+        raise RuntimeError("WebSocket server did not quiesce during shutdown") from exc
+    loop.call_soon_threadsafe(loop.stop)
+    thread.join(timeout=max(0.0, deadline - time.monotonic()))
+    if thread.is_alive():
+        raise RuntimeError("WebSocket server thread remained alive after shutdown")
 
 
-def _build_rest_app() -> "FastAPI":
+def _build_rest_app(
+    *, ws_host: str = "127.0.0.1", ws_port: int = 6008
+) -> "FastAPI":
     from fastapi import FastAPI
     from fastapi.middleware.cors import CORSMiddleware
-    from noesis.server import analytics_api, depth_api, reid_api, semantic_seg_api, virtual_twin_api
+    from noesis.server import alignment_walk_api, analytics_api, depth_api, health_api, reid_api, reid_v2_api, scene_api, scene_prior_api, semantic_seg_api, virtual_twin_api
+    from noesis.server.internal_auth import InternalAuthConfigurationError, configure_internal_rest_app
 
     app = FastAPI(title="Noesis DS9 Runtime API")
     origins_env = os.environ.get("NOESIS_REST_CORS_ORIGINS", "").strip()
     allow_all = os.environ.get("NOESIS_REST_CORS_ALLOW_ALL", "").strip().lower() in {"1", "true", "yes", "on"}
     origin_regex = os.environ.get("NOESIS_REST_CORS_ORIGIN_REGEX", "").strip()
     origins = [origin.strip() for origin in origins_env.split(",") if origin.strip()] if origins_env else []
-    if allow_all and "*" not in origins:
-        origins = ["*"]
-    if not origins and not origin_regex:
-        origin_regex = (
-            r"^https?://("
-            r"localhost|127\.0\.0\.1|"
-            r"10\.\d+\.\d+\.\d+|"
-            r"172\.(1[6-9]|2\d|3[0-1])\.\d+\.\d+|"
-            r"192\.168\.\d+\.\d+"
-            r")(:\d+)?$"
-        )
+    if allow_all:
+        raise InternalAuthConfigurationError("NOESIS_REST_CORS_ALLOW_ALL is forbidden; use the same-origin gateway")
+    if origin_regex:
+        raise InternalAuthConfigurationError("regex CORS is forbidden; declare exact NOESIS_REST_CORS_ORIGINS")
     if origins or origin_regex:
         app.add_middleware(
             CORSMiddleware,
             allow_origins=origins,
-            allow_origin_regex=origin_regex or None,
             allow_credentials=True,
             allow_methods=["*"],
             allow_headers=["*"],
@@ -2885,8 +3676,19 @@ def _build_rest_app() -> "FastAPI":
     app.include_router(depth_api.app.router)
     app.include_router(analytics_api.app.router)
     app.include_router(reid_api.app.router)
+    app.include_router(reid_v2_api.router)
     app.include_router(virtual_twin_api.app.router)
+    app.include_router(health_api.router)
+    app.include_router(scene_api.router)
+    app.include_router(scene_prior_api.app.router)
     app.include_router(semantic_seg_api.router)
+    auth_config = configure_internal_rest_app(app)
+    alignment_walk_api.install_alignment_walk_api(
+        app,
+        ws_host=ws_host,
+        ws_port=ws_port,
+        auth_config=auth_config,
+    )
     return app
 
 
@@ -2902,48 +3704,53 @@ def _preload_rest_server_runtime() -> bool:
     return True
 
 
-def _start_rest_server(app: "FastAPI", host: str, port: int) -> tuple[Optional["uvicorn.Server"], Optional[threading.Thread]]:
-    """Start the FastAPI REST server unless the port is already in use.
+class RestStartupError(RuntimeError):
+    """REST startup failed after thread ownership may have been acquired."""
 
-    If something is already listening on the requested host/port, we assume a
-    REST instance is active and skip starting another one to avoid conflicts.
-    """
+    def __init__(
+        self,
+        message: str,
+        *,
+        server: object,
+        thread: threading.Thread,
+        cleanup_proven: bool,
+    ) -> None:
+        self.server = server
+        self.thread = thread
+        self.cleanup_proven = bool(cleanup_proven)
+        super().__init__(str(message))
+
+
+def _start_rest_server(
+    app: "FastAPI",
+    host: str,
+    port: int,
+    *,
+    startup_timeout_s: float = 10.0,
+    cleanup_timeout_s: float = 2.0,
+) -> tuple[Optional["uvicorn.Server"], Optional[threading.Thread]]:
+    """Start the FastAPI REST server on its exact required endpoint."""
+    from noesis.server.internal_auth import validate_internal_auth_listener
+
+    auth_state = getattr(getattr(app, "state", None), "noesis_internal_auth", None)
+    if not isinstance(auth_state, dict) or "mode" not in auth_state:
+        raise RuntimeError("canonical REST application is missing internal auth state")
+    validate_internal_auth_listener(str(auth_state["mode"]), host)
     try:
         import uvicorn
-    except Exception:
-        logging.getLogger(__name__).warning("uvicorn not available; REST server disabled")
-        return None, None
+    except Exception as exc:
+        raise RuntimeError("uvicorn is required for the canonical REST surface") from exc
+    if not _port_bindable(host, int(port)):
+        raise RuntimeError(f"required REST endpoint is unavailable: host={host} port={port}")
 
-    # Safety check: skip starting another REST server if port is already in use
-    try:
-        import socket
-
-        def _can_connect(_host: str, _port: int, timeout: float = 0.25) -> bool:
-            try:
-                with socket.create_connection((_host, int(_port)), timeout=timeout):
-                    return True
-            except Exception:
-                return False
-
-        # Normalize host for connectivity test when binding to all interfaces
-        test_host = host
-        if not test_host or test_host == "0.0.0.0":
-            test_host = "127.0.0.1"
-        elif test_host == "::":
-            test_host = "::1"
-
-        if _can_connect(test_host, port):
-            logging.getLogger(__name__).info(
-                "REST port %s is already in use on %s; assuming server active and skipping start",
-                port,
-                test_host,
-            )
-            return None, None
-    except Exception:
-        # Non-fatal: if the check fails, proceed to start server
-        pass
-
-    config = uvicorn.Config(app=app, host=host, port=port, log_level="info", access_log=False)
+    config = uvicorn.Config(
+        app=app,
+        host=host,
+        port=port,
+        log_level="info",
+        access_log=False,
+        timeout_graceful_shutdown=None,
+    )
     server = uvicorn.Server(config=config)
 
     def _run() -> None:
@@ -2951,262 +3758,174 @@ def _start_rest_server(app: "FastAPI", host: str, port: int) -> tuple[Optional["
         server.run()
 
     thread = threading.Thread(target=_run, name="DS9-REST", daemon=True)
-    thread.start()
-    return server, thread
+    thread_started = False
+    failure: BaseException | None = None
+    try:
+        thread.start()
+        thread_started = True
+        deadline = time.monotonic() + max(0.0, float(startup_timeout_s))
+        while time.monotonic() < deadline:
+            if bool(getattr(server, "started", False)):
+                if not thread.is_alive():
+                    raise RuntimeError("required REST server exited at readiness")
+                return server, thread
+            if not thread.is_alive():
+                raise RuntimeError("required REST server exited before readiness")
+            time.sleep(0.02)
+        raise TimeoutError("required REST server readiness timed out")
+    except BaseException as exc:
+        failure = exc
 
-
-def _stop_rest_server(server: Optional["uvicorn.Server"], thread: Optional[threading.Thread], timeout: float = 5.0) -> None:
-    if server is None or thread is None:
-        return
     try:
         server.should_exit = True
-    except Exception:
-        pass
-    thread.join(timeout=timeout)
-
-
-def _setup_webrtc_signaling(
-    pipeline: ds8_pipeline.DS8Pipeline,
-    ws_server: WebSocketServer,
-    logger: logging.Logger,
-) -> None:
-    """Attach WebRTC signaling handlers from webrtcbin to WebSocketServer."""
-    from gi.repository import Gst
-
-    ds = getattr(pipeline, "ds_pipeline", None)
-    if ds is None:
-        logger.warning("DS9 pipeline handle unavailable; WebRTC signaling not attached")
-        return
-
-    mosaic_cfg = pipeline.config.get("mosaic_output") or {}
-    webrtc_name = str(mosaic_cfg.get("webrtc_name", "mosaic_webrtc"))
-
-    # Try to get the underlying GStreamer pipeline to use get_by_name()
-    gst_pipeline: Gst.Pipeline = None
-    webrtc_elem: Gst.Element = None
-
-    # First, try to find the Gst.Pipeline handle
-    for attr in ("pipeline", "_pipeline", "gst_pipeline", "_gst_pipeline", "handle", "_handle"):
+    except BaseException as exc:
+        if failure is None:
+            failure = exc
+    if thread_started:
         try:
-            candidate = getattr(ds, attr, None)
-        except Exception:
-            candidate = None
-        if isinstance(candidate, Gst.Pipeline):
-            gst_pipeline = candidate
-            break
-        if candidate is not None and hasattr(candidate, "get_by_name"):
-            gst_pipeline = candidate
-            break
-
-    # Also check inner attributes
-    if gst_pipeline is None:
-        for name in dir(ds):
-            if name.startswith("__"):
-                continue
-            try:
-                candidate = getattr(ds, name)
-            except Exception:
-                continue
-            if isinstance(candidate, Gst.Pipeline):
-                gst_pipeline = candidate
-                break
-            if hasattr(candidate, "get_by_name"):
-                gst_pipeline = candidate
-                break
-
-    # Try to get webrtcbin element by name from the GStreamer pipeline
-    if gst_pipeline is not None:
-        try:
-            webrtc_elem = gst_pipeline.get_by_name(webrtc_name)
-        except Exception as exc:
-            logger.debug("Failed to get webrtcbin by name: %s", exc)
-
-    # Try to get rtsp_out for diagnostics
-    if gst_pipeline is not None:
-        try:
-            rtsp_elem = gst_pipeline.get_by_name("rtsp_out")
-            if rtsp_elem is not None:
-                try:
-                    with _agent_debug_log_path().open("a", encoding="utf-8") as _f:
-                        _f.write(
-                            json.dumps(
-                                {
-                                    "sessionId": "debug-session",
-                                    "runId": "run1",
-                                    "hypothesisId": "H2",
-                                    "location": "ds9_runtime_core.py:_setup_webrtc_signaling",
-                                    "message": "rtsp element found",
-                                    "data": {"name": rtsp_elem.get_name()},
-                                    "timestamp": int(time.time() * 1000),
-                                }
-                            )
-                            + "\n"
-                        )
-                except Exception:
-                    pass
-        except Exception:
-            pass
-
-    # Fallback: try pyservicemaker node attributes
-    if webrtc_elem is None:
-        try:
-            node = ds[webrtc_name]
-            for attr in ("element", "_element", "obj", "_obj", "gst_element", "_gst_element"):
-                candidate = getattr(node, attr, None)
-                if candidate is not None and isinstance(candidate, Gst.Element):
-                    webrtc_elem = candidate
-                    break
-        except Exception as exc:
-            logger.warning("webrtcbin '%s' not found in pipeline: %s", webrtc_name, exc)
-
-    if webrtc_elem is None:
-        logger.warning("webrtcbin element not found; WebRTC signaling not attached")
-        return
-
-    # Attach to WebSocket server for signaling
-    ws_server.attach_webrtc_endpoint(webrtc_elem)
-    logger.info("WebRTC signaling attached to webrtcbin '%s'", webrtc_name)
+            thread.join(timeout=max(0.0, float(cleanup_timeout_s)))
+        except BaseException as exc:
+            if failure is None:
+                failure = exc
+    cleanup_proven = bool(not thread_started or not thread.is_alive())
+    message = str(failure or "required REST server startup failed")
+    if not cleanup_proven:
+        message = f"{message}; cleanup was not proven"
+    raise RestStartupError(
+        message,
+        server=server,
+        thread=thread,
+        cleanup_proven=cleanup_proven,
+    ) from failure
 
 
-def _build_rtsp_keyframe_requester(
-    pipeline: ds8_pipeline.DS8Pipeline,
-    logger: logging.Logger,
-) -> Optional[Callable[[str], None]]:
-    """Best-effort keyframe/IDR request into the DS9 RTSP encoder pipeline.
+class RestShutdownReceipt(NamedTuple):
+    """Proof that REST can no longer race callback-owned native resources."""
 
-    This is used to reduce "ICE connected but black" startups where the browser
-    receives RTP bytes but decodes 0 frames until the next IDR arrives.
+    rest_pair_consistent: bool
+    stop_requested: bool
+    server_thread_stopped: bool
+    analytics_transaction_lock_retained: bool
+
+    @property
+    def quiesced(self) -> bool:
+        return bool(
+            self.rest_pair_consistent
+            and self.stop_requested
+            and self.server_thread_stopped
+            and self.analytics_transaction_lock_retained
+        )
+
+
+def _stop_rest_server(
+    server: Optional["uvicorn.Server"],
+    thread: Optional[threading.Thread],
+    analytics_transaction_lock: Any,
+    timeout: float = 5.0,
+) -> RestShutdownReceipt:
+    """Stop REST and retain the analytics transaction lock through process exit.
+
+    Uvicorn dispatches synchronous handlers through worker threads, so joining
+    only its server thread is not sufficient proof that a native analytics
+    reload has completed.  Once the listener thread is gone, retaining the
+    analytics lock both proves any prior transaction completed and prevents a
+    late worker from entering another transaction during native teardown.
     """
-    if not _GLIB_AVAILABLE or Gst is None:
-        return None
-    try:
-        gi.require_version("GstVideo", "1.0")
-        from gi.repository import GstVideo  # type: ignore
-    except Exception:
-        return None
 
+    try:
+        bounded_timeout = max(0.0, float(timeout))
+    except (TypeError, ValueError):
+        bounded_timeout = 0.0
+    deadline = time.monotonic() + bounded_timeout
+    rest_pair_consistent = (server is None) == (thread is None)
+    stop_requested = server is None
+    if server is not None:
+        try:
+            server.should_exit = True
+            stop_requested = True
+        except Exception:
+            stop_requested = False
+
+    server_thread_stopped = bool(server is None and thread is None)
+    if thread is not None:
+        try:
+            thread.join(timeout=max(0.0, deadline - time.monotonic()))
+            server_thread_stopped = not thread.is_alive()
+        except Exception:
+            server_thread_stopped = False
+    if not rest_pair_consistent:
+        server_thread_stopped = False
+
+    analytics_lock_retained = False
+    if server_thread_stopped:
+        try:
+            analytics_lock_retained = bool(
+                analytics_transaction_lock.acquire(
+                    timeout=max(0.0, deadline - time.monotonic())
+                )
+            )
+        except Exception:
+            analytics_lock_retained = False
+
+    return RestShutdownReceipt(
+        rest_pair_consistent=rest_pair_consistent,
+        stop_requested=stop_requested,
+        server_thread_stopped=server_thread_stopped,
+        analytics_transaction_lock_retained=analytics_lock_retained,
+    )
+
+
+def _build_mosaic_keyframe_requester(
+    pipeline: ds8_pipeline.DS8Pipeline,
+    logger: logging.Logger,
+    *,
+    failure_callback: Optional[Callable[[BaseException], None]] = None,
+) -> Optional[Callable[[str], None]]:
+    """Build the supported Service Maker force-IDR control for mosaic H.264."""
     ds = getattr(pipeline, "ds_pipeline", None)
     if ds is None:
         return None
-
-    # Attempt to find the underlying Gst.Pipeline handle to look up rtsp_out by name.
-    gst_pipeline: Optional[Gst.Pipeline] = None
-    for attr in ("pipeline", "_pipeline", "gst_pipeline", "_gst_pipeline", "handle", "_handle"):
-        try:
-            candidate = getattr(ds, attr, None)
-        except Exception:
-            candidate = None
-        if candidate is None:
-            continue
-        if isinstance(candidate, Gst.Pipeline):
-            gst_pipeline = candidate
-            break
-        if hasattr(candidate, "get_by_name"):
-            gst_pipeline = candidate  # type: ignore[assignment]
-            break
-
-    if gst_pipeline is None:
-        for name in dir(ds):
-            if name.startswith("__"):
-                continue
-            try:
-                candidate = getattr(ds, name)
-            except Exception:
-                continue
-            if isinstance(candidate, Gst.Pipeline):
-                gst_pipeline = candidate
-                break
-            if candidate is not None and hasattr(candidate, "get_by_name"):
-                gst_pipeline = candidate  # type: ignore[assignment]
-                break
-
-    rtsp_out = None
-    if gst_pipeline is not None:
-        try:
-            rtsp_out = gst_pipeline.get_by_name("rtsp_out")
-        except Exception:
-            rtsp_out = None
-
-    # Fallback: try pyservicemaker node attributes (some wheels don't expose a Gst.Pipeline handle).
-    if rtsp_out is None:
-        try:
-            node = ds["rtsp_out"]
-            for attr in ("element", "_element", "obj", "_obj", "gst_element", "_gst_element"):
-                candidate = getattr(node, attr, None)
-                if candidate is not None and isinstance(candidate, Gst.Element):
-                    rtsp_out = candidate
-                    break
-        except Exception:
-            rtsp_out = None
-
-    if rtsp_out is None:
+    component = getattr(pipeline, "components", {}).get("mosaic_force_idr")
+    if component is None or getattr(component, "element", None) != "noesisforceidr":
+        return None
+    try:
+        trigger = ds["mosaic_force_idr"]
+        if not callable(getattr(trigger, "set", None)):
+            return None
+        getter = getattr(trigger, "get", None)
+        if not callable(getter):
+            return None
+        request_sequence = int(getter("accepted-sequence"))
+        getter("last-request-ok")
+    except Exception as exc:
+        logger.error("Mosaic force-IDR trigger is unavailable: %s", exc)
         return None
 
-    # Prefer sending the upstream force-key-unit event from the internal RTP payloader if present.
-    pay = None
-    try:
-        pay = rtsp_out.get_child_by_name("rtsp-video_rtppay")
-    except Exception:
-        pay = None
-    if pay is None:
-        try:
-            n_children = int(rtsp_out.get_children_count())
-        except Exception:
-            n_children = 0
-        for i in range(n_children):
-            try:
-                child = rtsp_out.get_child_by_index(i)
-            except Exception:
-                child = None
-            if child is None:
-                continue
-            try:
-                factory = child.get_factory()
-                if factory is not None and factory.get_name() == "rtph264pay":
-                    pay = child
-                    break
-            except Exception:
-                continue
+    request_lock = threading.Lock()
 
     def request_keyframe(reason: str) -> None:
+        nonlocal request_sequence
         try:
-            ev = GstVideo.video_event_new_upstream_force_key_unit(Gst.CLOCK_TIME_NONE, True, 0)
-        except Exception:
-            logger.debug("Failed to create upstream force-key-unit event", exc_info=True)
-            return
-
-        ok = False
-        try:
-            if pay is not None:
-                sink_pad = pay.get_static_pad("sink")
-                if sink_pad is not None:
-                    ok = bool(sink_pad.send_event(ev))
-                else:
-                    ok = bool(pay.send_event(ev))
-            else:
-                ok = bool(rtsp_out.send_event(ev))
-        except Exception:
-            ok = False
-
-        logger.info("Requested RTSP keyframe (reason=%s ok=%s)", reason, ok)
-        try:
-            with _agent_debug_log_path().open("a", encoding="utf-8") as _f:
-                _f.write(
-                    json.dumps(
-                        {
-                            "sessionId": "debug-session",
-                            "runId": "run1",
-                            "hypothesisId": "H4",
-                            "location": "ds9_runtime_core.py:_build_rtsp_keyframe_requester",
-                            "message": "rtsp keyframe requested",
-                            "data": {"reason": reason, "ok": ok},
-                            "timestamp": int(time.time() * 1000),
-                        }
+            with request_lock:
+                request_sequence += 1
+                requested = request_sequence
+                trigger.set({"request-sequence": requested})
+                accepted = int(getter("accepted-sequence"))
+                request_ok = bool(getter("last-request-ok"))
+                if not request_ok or accepted != requested:
+                    raise RuntimeError(
+                        f"force-IDR event rejected: requested={requested} accepted={accepted}"
                     )
-                    + "\n"
-                )
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.error("Required mosaic force-IDR request failed (reason=%s): %s", reason, exc)
+            if callable(failure_callback):
+                failure_callback(exc)
+            raise
+        logger.info(
+            "Requested mosaic IDR through NVIDIA encoder event (reason=%s sequence=%d)",
+            reason,
+            requested,
+        )
 
     return request_keyframe
 
@@ -3228,74 +3947,14 @@ def _on_bus_message(
         src_name = message.src.get_name() if message.src else "unknown"
         logger.error("🚨 Pipeline ERROR from '%s': %s", src_name, err.message)
         logger.error("🚨 Debug: %s", debug)
-        #region agent log
-        try:
-            with _agent_debug_log_path().open("a", encoding="utf-8") as _f:
-                _f.write(
-                    json.dumps(
-                        {
-                            "sessionId": "debug-session",
-                            "runId": "run1",
-                            "hypothesisId": "H2",
-                            "location": "ds9_runtime_core.py:_on_bus_message",
-                            "message": "bus error",
-                            "data": {"src": src_name, "error": err.message, "debug": debug},
-                            "timestamp": int(time.time() * 1000),
-                        }
-                    )
-                    + "\n"
-                )
-        except Exception:
-            pass
-        #endregion
         # Check if this is a source-related error suggesting stream issues
         if any(k in src_name.lower() for k in ("source", "urisrc", "rtspsrc", "decodebin")):
             logger.error("    → Source/decoder error; check RTSP stream connectivity.")
     elif msg_type == Gst.MessageType.EOS:
         logger.warning("⚠️ EOS received on pipeline (unexpected for live sources)")
-        #region agent log
-        try:
-            with _agent_debug_log_path().open("a", encoding="utf-8") as _f:
-                _f.write(
-                    json.dumps(
-                        {
-                            "sessionId": "debug-session",
-                            "runId": "run1",
-                            "hypothesisId": "H2",
-                            "location": "ds9_runtime_core.py:_on_bus_message",
-                            "message": "bus eos",
-                            "data": {},
-                            "timestamp": int(time.time() * 1000),
-                        }
-                    )
-                    + "\n"
-                )
-        except Exception:
-            pass
-        #endregion
     elif msg_type == Gst.MessageType.WARNING:
         warn, debug = message.parse_warning()
         logger.warning("⚠️ Pipeline warning: %s", warn.message)
-        #region agent log
-        try:
-            with _agent_debug_log_path().open("a", encoding="utf-8") as _f:
-                _f.write(
-                    json.dumps(
-                        {
-                            "sessionId": "debug-session",
-                            "runId": "run1",
-                            "hypothesisId": "H2",
-                            "location": "ds9_runtime_core.py:_on_bus_message",
-                            "message": "bus warning",
-                            "data": {"warning": warn.message, "debug": debug},
-                            "timestamp": int(time.time() * 1000),
-                        }
-                    )
-                    + "\n"
-                )
-        except Exception:
-            pass
-        #endregion
     elif msg_type == Gst.MessageType.STATE_CHANGED:
         if message.src and hasattr(message.src, "get_name"):
             name = message.src.get_name()
@@ -3309,31 +3968,6 @@ def _on_bus_message(
                     new.value_nick if new else "?",
                     pending.value_nick if pending else "none",
                 )
-                #region agent log
-                try:
-                    with _agent_debug_log_path().open("a", encoding="utf-8") as _f:
-                        _f.write(
-                            json.dumps(
-                                {
-                                    "sessionId": "debug-session",
-                                    "runId": "run1",
-                                    "hypothesisId": "H2",
-                                    "location": "ds9_runtime_core.py:_on_bus_message",
-                                    "message": "state change",
-                                    "data": {
-                                        "src": name,
-                                        "old": old.value_nick if old else "?",
-                                        "new": new.value_nick if new else "?",
-                                        "pending": pending.value_nick if pending else "none",
-                                    },
-                                    "timestamp": int(time.time() * 1000),
-                                }
-                            )
-                            + "\n"
-                        )
-                except Exception:
-                    pass
-                #endregion
 
     return True  # Keep receiving messages
 
@@ -3368,6 +4002,27 @@ def _on_pyservicemaker_message(
     state: Optional[Dict[str, Any]] = None,
 ) -> None:
     """Handle pyservicemaker pipeline messages (EOS, state transitions, etc.)."""
+    if type(message) is SyntheticStubEosMessage:
+        try:
+            sequence = validate_synthetic_stub_eos_message(ds_pipeline, message)
+        except Exception:
+            if state is not None:
+                state["pipeline_failed"] = True
+            raise
+        shutdown_requested = shutdown_event.is_set()
+        finite_source = bool((state or {}).get("expected_eos")) and not shutdown_requested
+        eos_reason = "shutdown_requested" if shutdown_requested else "finite_source" if finite_source else "unexpected"
+        if state is not None:
+            state["pipeline_eos_seen"] = True
+            state["pipeline_eos_reason"] = eos_reason
+            state["synthetic_eos_request_sequence"] = sequence
+            if not (shutdown_requested or finite_source):
+                state["pipeline_failed"] = True
+        if shutdown_requested or finite_source:
+            logger.info("EOS received on pipeline (reason=%s)", eos_reason)
+        else:
+            logger.warning("EOS received on live pipeline (reason=unexpected)")
+        return
     if not _PYSERVICEMAKER_MSGS:
         return
 
@@ -3381,13 +4036,22 @@ def _on_pyservicemaker_message(
     )
 
     if isinstance(message, EOSMessage):
-        expected_eos = shutdown_event.is_set() or bool((state or {}).get("expected_eos"))
+        shutdown_requested = shutdown_event.is_set()
+        finite_source = bool((state or {}).get("expected_eos")) and not shutdown_requested
+        eos_reason = (
+            "shutdown_requested"
+            if shutdown_requested
+            else "finite_source"
+            if finite_source
+            else "unexpected"
+        )
         if state is not None:
             state["pipeline_eos_seen"] = True
-        if expected_eos:
-            logger.info("EOS received on pipeline during expected shutdown/finite-source completion")
+            state["pipeline_eos_reason"] = eos_reason
+        if shutdown_requested or finite_source:
+            logger.info("EOS received on pipeline (reason=%s)", eos_reason)
             return
-        logger.warning("⚠️ EOS received on pipeline (unexpected for live sources)")
+        logger.warning("EOS received on live pipeline (reason=unexpected)")
         if state is not None:
             state["pipeline_failed"] = True
     elif isinstance(message, StateTransitionMessage):
@@ -3404,13 +4068,7 @@ def _start_pyservicemaker_wait_loop(
     logger: logging.Logger,
     state: Optional[Dict[str, Any]] = None,
 ) -> Optional[threading.Thread]:
-    """Start a background thread that calls ds_pipeline.wait() to keep the pipeline alive.
-
-    pyservicemaker's wait() blocks until the pipeline stops and processes internal events.
-    Without this, the pipeline may stop processing after initial buffers.
-
-    Returns the thread, or None if unavailable.
-    """
+    """Join Service Maker's native loop without blocking the API/control thread."""
     if ds_pipeline is None:
         logger.warning("No DSPipeline available for wait loop")
         return None
@@ -3421,51 +4079,14 @@ def _start_pyservicemaker_wait_loop(
 
     def _wait_loop() -> None:
         try:
-            #region agent log
-            try:
-                with _agent_debug_log_path().open("a", encoding="utf-8") as _f:
-                    _f.write(
-                        json.dumps(
-                            {
-                                "sessionId": "debug-session",
-                                "runId": "run1",
-                                "hypothesisId": "H1",
-                                "location": "ds9_runtime_core.py:_start_pyservicemaker_wait_loop",
-                                "message": "wait() entered",
-                                "data": {},
-                                "timestamp": int(time.time() * 1000),
-                            }
-                        )
-                        + "\n"
-                    )
-            except Exception:
-                pass
-            #endregion
             logger.debug("pyservicemaker wait loop started")
             ds_pipeline.wait()
             logger.info("pyservicemaker wait() returned (pipeline stopped)")
         except Exception:
+            if state is not None:
+                state["wait_failed"] = True
+                state["pipeline_failed"] = True
             logger.exception("pyservicemaker wait loop error")
-            #region agent log
-            try:
-                with _agent_debug_log_path().open("a", encoding="utf-8") as _f:
-                    _f.write(
-                        json.dumps(
-                            {
-                                "sessionId": "debug-session",
-                                "runId": "run1",
-                                "hypothesisId": "H1",
-                                "location": "ds9_runtime_core.py:_start_pyservicemaker_wait_loop",
-                                "message": "wait() exception",
-                                "data": {},
-                                "timestamp": int(time.time() * 1000),
-                            }
-                        )
-                        + "\n"
-                    )
-            except Exception:
-                pass
-            #endregion
         finally:
             was_signalled = shutdown_event.is_set()
             # Signal shutdown when pipeline stops
@@ -3477,31 +4098,47 @@ def _start_pyservicemaker_wait_loop(
             )
             if state is not None and not was_signalled and not expected_finite_eos:
                 state["pipeline_failed"] = True
-            #region agent log
-            try:
-                with _agent_debug_log_path().open("a", encoding="utf-8") as _f:
-                    _f.write(
-                        json.dumps(
-                            {
-                                "sessionId": "debug-session",
-                                "runId": "run1",
-                                "hypothesisId": "H1",
-                                "location": "ds9_runtime_core.py:_start_pyservicemaker_wait_loop",
-                                "message": "wait() exited",
-                                "data": {},
-                                "timestamp": int(time.time() * 1000),
-                            }
-                        )
-                        + "\n"
-                    )
-            except Exception:
-                pass
-            #endregion
 
     thread = threading.Thread(target=_wait_loop, name="DS9-WaitLoop", daemon=True)
     thread.start()
     logger.info("pyservicemaker wait loop started for pipeline event handling")
     return thread
+
+
+_SERVICE_MAKER_STDIN_WRITE_FD: Optional[int] = None
+_SERVICE_MAKER_STDIN_LOCK = threading.Lock()
+
+
+def _install_servicemaker_stdin_keepalive(logger: logging.Logger) -> None:
+    """Keep non-interactive stdin open while Service Maker owns its key watcher."""
+
+    global _SERVICE_MAKER_STDIN_WRITE_FD
+
+    with _SERVICE_MAKER_STDIN_LOCK:
+        if _SERVICE_MAKER_STDIN_WRITE_FD is not None or os.isatty(0):
+            return
+        read_fd, write_fd = os.pipe()
+        try:
+            os.dup2(read_fd, 0)
+        except Exception:
+            os.close(write_fd)
+            raise
+        finally:
+            os.close(read_fd)
+        _SERVICE_MAKER_STDIN_WRITE_FD = write_fd
+        logger.info("Service Maker non-interactive stdin keepalive installed")
+
+
+def _close_servicemaker_stdin_keepalive() -> None:
+    """Release the idle stdin writer only after Pipeline.wait() has returned."""
+
+    global _SERVICE_MAKER_STDIN_WRITE_FD
+
+    with _SERVICE_MAKER_STDIN_LOCK:
+        write_fd = _SERVICE_MAKER_STDIN_WRITE_FD
+        _SERVICE_MAKER_STDIN_WRITE_FD = None
+    if write_fd is not None:
+        os.close(write_fd)
 
 
 _ENCODE_LATENCY_FILTER_INSTALLED = False
@@ -3591,7 +4228,7 @@ def _install_encode_latency_suppression(logger: logging.Logger) -> None:
         logger.info("Suppressed encoder KPI prints (NOESIS_SUPPRESS_ENCODE_LATENCY=0 to disable)")
 
 
-def main() -> int:
+def _run_main(startup_main_guard: StartupMainGuard) -> int:
     os.environ.setdefault("NOESIS_MOSAIC_WEBRTC_ENABLED", "1")
     os.environ.setdefault("NOESIS_DEPTH_ENABLE_SECONDS", "0")
     args = _parse_args()
@@ -3600,12 +4237,23 @@ def main() -> int:
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
     logger = logging.getLogger("ds9.runtime")
-    ws_fallback_tries_raw = os.environ.get("NOESIS_WS_PORT_FALLBACK_TRIES", "32")
     try:
-        ws_fallback_tries = int(str(ws_fallback_tries_raw).strip() or "32")
-    except Exception:
-        ws_fallback_tries = 32
-    args.ws_port = _select_ws_port(args.ws_host, int(args.ws_port), ws_fallback_tries, logger)
+        appliance_binding = optional_runtime_context_binding(os.environ)
+    except ApplianceConfigurationError as exc:
+        logger.critical("Permanent appliance runtime-context rejection: %s", exc)
+        return 78
+    try:
+        args.ws_port = _select_ws_port(args.ws_host, int(args.ws_port), 0, logger)
+    except RuntimeError as exc:
+        logger.error("%s", exc)
+        return 1
+    if args.enable_rest and not _port_bindable(args.rest_host, int(args.rest_port)):
+        logger.error(
+            "required REST endpoint is unavailable: host=%s port=%s",
+            args.rest_host,
+            args.rest_port,
+        )
+        return 1
     os.environ["NOESIS_WS_PORT"] = str(int(args.ws_port))
     # DeepStream's gst-nvvideo4linux2 encoder plugin can emit extremely noisy
     # "Encode Latency = ..." prints when NVDS latency measurement is enabled.
@@ -3618,61 +4266,37 @@ def main() -> int:
     runtime_state: Dict[str, Any] = {"pipeline_failed": False}
     pgie_size: Optional[str] = None
 
-    if args.size is not None and str(args.pgie_profile) not in _SIZED_PGIE_PROFILES:
-        sized = ", ".join(_SIZED_PGIE_PROFILES)
-        raise SystemExit(f"[FATAL] --size is only valid with --pgie-profile in: {sized}")
-    if str(args.pgie_profile) in _SIZED_PGIE_PROFILES:
-        pgie_size = (args.size or "m").strip().lower()
-
     # Install SIGINT/SIGTERM handling early (before DS/GStreamer init), because
     # some backends install their own handlers/masks which can make `timeout(1)`
     # leave behind orphaned processes that keep ports bound.
     shutdown_event = threading.Event()
+    shutdown_watchdog_armed = False
+
+    def _arm_shutdown_watchdog() -> None:
+        nonlocal shutdown_watchdog_armed
+        if shutdown_watchdog_armed:
+            return
+        try:
+            grace_s = max(
+                SHUTDOWN_WATCHDOG_DEFAULT_S,
+                int(
+                    os.environ.get(
+                        "NOESIS_SHUTDOWN_GRACE_SECONDS",
+                        str(SHUTDOWN_WATCHDOG_DEFAULT_S),
+                    )
+                ),
+            )
+        except Exception:
+            grace_s = SHUTDOWN_WATCHDOG_DEFAULT_S
+        signal.signal(signal.SIGALRM, lambda _sig, _frame: os._exit(2))
+        signal.alarm(grace_s)
+        shutdown_watchdog_armed = True
 
     def _signal_handler(signum: int, _frame: object) -> None:
         logger.info("Received signal %s; initiating shutdown", signum)
-        # Best-effort debug breadcrumb (useful when the backend swallows SIGTERM).
-        try:
-            with _agent_debug_log_path().open("a", encoding="utf-8") as _f:
-                _f.write(
-                    json.dumps(
-                        {
-                            "sessionId": "debug-session",
-                            "runId": "run1",
-                            "hypothesisId": "H0",
-                            "location": "ds9_runtime_core.py:_signal_handler",
-                            "message": "signal received",
-                            "data": {"signum": int(signum)},
-                            "timestamp": int(time.time() * 1000),
-                        }
-                    )
-                    + "\n"
-                )
-        except Exception:
-            pass
-        shutdown_event.set()
-        # `timeout(1)` uses SIGTERM; DS/GStreamer backends can hang shutdown (and sometimes
-        # starve Python threads), so hard-exit to avoid leaving orphaned processes/ports.
         if signum == signal.SIGTERM:
-            try:
-                with _agent_debug_log_path().open("a", encoding="utf-8") as _f:
-                    _f.write(
-                        json.dumps(
-                            {
-                                "sessionId": "debug-session",
-                                "runId": "run1",
-                                "hypothesisId": "H0",
-                                "location": "ds9_runtime_core.py:_signal_handler",
-                                "message": "sigterm hard exit",
-                                "data": {},
-                                "timestamp": int(time.time() * 1000),
-                            }
-                        )
-                        + "\n"
-                    )
-            except Exception:
-                pass
-            os._exit(0)
+            _arm_shutdown_watchdog()
+        shutdown_event.set()
 
     # Some DS/GStreamer backends manipulate signal masks; ensure SIGINT/SIGTERM are unblocked.
     try:
@@ -3681,18 +4305,184 @@ def main() -> int:
         pass
 
     signal.signal(signal.SIGINT, _signal_handler)
-    # Prefer SIGTERM default behavior so external supervisors (e.g. `timeout(1)`) can
-    # always terminate the process even if Python threads/GIL are starved by GI callbacks.
-    try:
-        signal.signal(signal.SIGTERM, signal.SIG_DFL)
-    except Exception:
-        signal.signal(signal.SIGTERM, _signal_handler)
+    signal.signal(signal.SIGTERM, _signal_handler)
+
+    def _startup_ownership_ambiguous(reason: str) -> None:
+        runtime_state["pipeline_failed"] = True
+        runtime_state["startup_ownership_ambiguous"] = str(reason)
+        logger.critical("Runtime startup ownership is ambiguous: %s", reason)
+        shutdown_event.set()
+        _arm_shutdown_watchdog()
+
+    startup_transaction = RuntimeStartupTransaction(
+        on_ambiguous=_startup_ownership_ambiguous
+    )
+
+    def _abort_startup(reason: str, code: int = 1) -> int:
+        logger.error("Runtime startup aborted: %s", reason)
+        receipt = startup_transaction.abort_reversible()
+        runtime_state["startup_abort_receipt"] = {
+            "phase_before": receipt.phase_before.value,
+            "phase_after": receipt.phase_after.value,
+            "completed": receipt.completed,
+            "cleanup": [
+                {
+                    "name": row.name,
+                    "completed": row.completed,
+                    "error_type": row.error_type,
+                    "error_message": row.error_message,
+                }
+                for row in receipt.cleanup
+            ],
+        }
+        if not receipt.completed:
+            runtime_state["pipeline_failed"] = True
+            logger.critical(
+                "Reversible startup cleanup was incomplete; waiting for watchdog"
+            )
+            _arm_shutdown_watchdog()
+            while True:
+                signal.pause()
+        return int(code)
+
+    def _record_startup_ambiguity(error: StartupOwnershipAmbiguous) -> None:
+        runtime_state["startup_ambiguity_receipt"] = {
+            "ingress_quiesced": error.ingress_quiesced,
+            "cleanup": [
+                {
+                    "name": row.name,
+                    "completed": row.completed,
+                    "error_type": row.error_type,
+                    "error_message": row.error_message,
+                }
+                for row in error.ingress_cleanup
+            ],
+        }
+        if not error.ingress_quiesced:
+            logger.critical(
+                "Startup ingress cleanup was not proven; watchdog exit remains armed"
+            )
+
+    def _preserve_ambiguous_and_wait(
+        reason: str,
+        error: StartupOwnershipAmbiguous | None = None,
+    ) -> NoReturn:
+        _arm_shutdown_watchdog()
+        if error is not None:
+            _record_startup_ambiguity(error)
+        logger.critical(
+            "Preserving callback-owned startup resources until watchdog exit: %s",
+            reason,
+        )
+        while True:
+            signal.pause()
+
+    def _abort_ambiguous_and_wait(reason: str) -> NoReturn:
+        _arm_shutdown_watchdog()
+        try:
+            startup_transaction.abort_ambiguous(reason)
+        except StartupOwnershipAmbiguous as exc:
+            _preserve_ambiguous_and_wait(reason, exc)
+        except BaseException as exc:
+            runtime_state["startup_ambiguity_transaction_error"] = type(exc).__name__
+            _startup_ownership_ambiguous(reason)
+            logger.critical(
+                "Startup ambiguity transaction failed",
+                exc_info=(type(exc), exc, exc.__traceback__),
+            )
+            _preserve_ambiguous_and_wait(reason)
+
+    def _handle_unexpected_startup_exception(exc: BaseException) -> int:
+        phase = startup_transaction.phase
+        logger.critical(
+            "Unhandled runtime startup exception during phase=%s",
+            phase.value,
+            exc_info=(type(exc), exc, exc.__traceback__),
+        )
+        if phase in {StartupPhase.ASSEMBLING, StartupPhase.PREPARED}:
+            code = _abort_startup(
+                f"unhandled_startup_exception:{type(exc).__name__}"
+            )
+            if (
+                isinstance(exc, StartupResourceRegistrationError)
+                and not exc.rollback_completed
+            ):
+                runtime_state["startup_registration_rollback"] = [
+                    {
+                        "name": row.name,
+                        "completed": row.completed,
+                        "error_type": row.error_type,
+                        "error_message": row.error_message,
+                    }
+                    for row in exc.rollback
+                ]
+                logger.critical(
+                    "Newly acquired startup resource rollback was not proven"
+                )
+                _arm_shutdown_watchdog()
+                while True:
+                    signal.pause()
+            return code
+        if phase in {
+            StartupPhase.ACTIVATION_ATTEMPTED,
+            StartupPhase.ACTIVE_WAIT_OWNED,
+        }:
+            _abort_ambiguous_and_wait(
+                f"unhandled_activation_exception:{type(exc).__name__}"
+            )
+        runtime_state["pipeline_failed"] = True
+        logger.critical(
+            "Unexpected startup guard phase=%s; preserving process ownership",
+            phase.value,
+        )
+        _arm_shutdown_watchdog()
+        while True:
+            signal.pause()
+
+    startup_main_guard.arm(_handle_unexpected_startup_exception)
 
     tracking_mode = _resolve_tracking_mode(args)
-    os.environ["NOESIS_TRACKING_MODE"] = tracking_mode
     if tracking_mode not in _TRACKING_MODES:
-        logger.warning("Normalized tracking mode '%s' is unknown; defaulting to baseline", tracking_mode)
-        tracking_mode = "baseline"
+        raise SystemExit(
+            "[FATAL] Resolved DS9 tracking mode is outside the supported contract: "
+            f"{tracking_mode!r}"
+        )
+    os.environ["NOESIS_TRACKING_MODE"] = tracking_mode
+    pgie_profile, pgie_size = _resolve_pgie_selection(args, tracking_mode)
+    manual_depth_model = _resolve_manual_depth_model(args)
+    args.pgie_profile = pgie_profile
+    args.manual_depth_model = manual_depth_model
+    os.environ["NOESIS_MANUAL_DEPTH_MODEL"] = manual_depth_model
+    if appliance_binding is not None:
+        expected_variant = (
+            f"ds9:wholebody49-{pgie_size}"
+            if pgie_profile == "wholebody49"
+            else "ds9:v3dt"
+            if tracking_mode == "v3dt"
+            else "ds9:baseline"
+        )
+        if (
+            appliance_binding.runtime_family != "ds9"
+            or appliance_binding.runtime_variant != expected_variant
+            or args.ws_host != "127.0.0.1"
+            or int(args.ws_port) != 6008
+            or args.rest_host != "127.0.0.1"
+            or int(args.rest_port) != 8080
+            or not args.enable_rest
+        ):
+            logger.critical(
+                "Permanent appliance runtime selection/endpoints differ from context"
+            )
+            return 78
+    logger.info(
+        "DS9 inference selection: tracking_mode=%s pgie_profile=%s size=%s "
+        "manual_depth_model=%s explicit_profile=%s",
+        tracking_mode,
+        pgie_profile,
+        pgie_size or "fixed",
+        manual_depth_model,
+        bool(getattr(args, "_pgie_profile_explicit", False)),
+    )
 
     pipeline_path, cameras_path = _resolve_pipeline_and_camera_paths(args, tracking_mode, logger)
     pipeline_path = pipeline_path.expanduser().resolve()
@@ -3703,22 +4493,39 @@ def main() -> int:
     try:
         os.chdir(REPO_ROOT)
     except Exception:
-        logging.getLogger("ds9.runtime").warning("Unable to chdir to REPO_ROOT %s", REPO_ROOT)
+        logger.exception("Unable to chdir to required REPO_ROOT %s", REPO_ROOT)
+        return _abort_startup("repo_root_chdir_failed")
 
     if not pipeline_path.exists():
         logger.error("Pipeline configuration not found: %s", pipeline_path)
         return 1
+    v3dt_bundle: Optional[V3DTAssetBundle] = None
     if tracking_mode == "v3dt":
         if not _ensure_v3dt_meta_extension(logger):
             return 1
-        if not _validate_v3dt_tracking_guardrails(pipeline_path, logger):
+        v3dt_bundle = _validate_v3dt_tracking_guardrails(
+            pipeline_path, cameras_path, logger
+        )
+        if v3dt_bundle is None:
+            return 1
+        if not _maybe_autogen_v3dt_caminfo(
+            pipeline_path, cameras_path, v3dt_bundle, logger
+        ):
+            return 1
+        # Autogeneration mutates the camera-model artifacts deliberately; rerun
+        # the complete ownership/shape/provenance contract before NvMOT sees them.
+        v3dt_bundle = _validate_v3dt_tracking_guardrails(
+            pipeline_path, cameras_path, logger
+        )
+        if v3dt_bundle is None:
             return 1
     else:
-        _warn_baseline_with_v3dt_tracker(pipeline_path, logger)
+        if not _reject_baseline_with_v3dt_tracker(pipeline_path, logger):
+            return 1
 
     skip_cuda_preflight = str(os.environ.get("NOESIS_SKIP_CUDA_PREFLIGHT", "")).strip().lower() in _ENV_TRUE
     stub_pipeline = (
-        str(os.environ.get("NOESIS_DS9_STUB_PIPELINE", "") or os.environ.get("NOESIS_DS8_STUB_PIPELINE", ""))
+        str(os.environ.get("NOESIS_DS9_STUB_PIPELINE", ""))
         .strip()
         .lower()
         in _ENV_TRUE
@@ -3739,10 +4546,12 @@ def main() -> int:
     base_pipeline_path = pipeline_path
     pipeline_path = _materialize_effective_pipeline_yaml(
         base_pipeline_path,
-        str(args.pgie_profile),
+        pgie_profile,
         logger,
         pgie_size=pgie_size,
         tracking_mode=tracking_mode,
+        manual_depth_model=manual_depth_model,
+        v3dt_bundle=v3dt_bundle,
     )
     depth_registration_path = _resolve_depth_registration_path(args, pipeline_path=pipeline_path)
     logger.info("Building DS9 pipeline from %s (base: %s)", pipeline_path, base_pipeline_path)
@@ -3756,8 +4565,6 @@ def main() -> int:
             )
             return 1
 
-    if not _maybe_autogen_v3dt_caminfo(pipeline_path, cameras_path, logger):
-        return 1
     if not _validate_dewarper_intrinsics_sync(pipeline_path, cameras_path, logger):
         return 1
 
@@ -3767,74 +4574,138 @@ def main() -> int:
         from noesis.server import analytics_api
 
         os.environ.setdefault(analytics_api.ANALYTICS_CONFIG_ENV, str(REPO_ROOT / "config" / "nvdsanalytics.yaml"))
-        analytics_api._load_config(force=True)  # type: ignore[attr-defined]
+        pipeline_cfg_for_analytics = load_runtime_pipeline_config(
+            pipeline_path,
+            materialize_secrets=False,
+        )
+        exclude_cfg = (pipeline_cfg_for_analytics.get("analytics") or {}).get("exclude") or {}
+        exclude_raw_path = str(exclude_cfg.get("config-file") or "").strip()
+        if not exclude_raw_path:
+            raise RuntimeError("Analytics exclusion config path is missing")
+        os.environ.setdefault(
+            "NOESIS_ANALYTICS_EXCLUDE_CONFIG",
+            str(_resolve_pipeline_cfg_path(pipeline_path, exclude_raw_path)),
+        )
+        analytics_cfg = analytics_api._load_config(force=True)  # type: ignore[attr-defined]
+        stages_cfg = (analytics_cfg.get("analytics") or {}).get("stages") or {}
+        if "exclude" not in stages_cfg or not isinstance(stages_cfg["exclude"], dict):
+            raise RuntimeError("Writable analytics config is missing the required exclude stage")
+        startup_exclude_path = analytics_api._sync_exclude_stage(  # type: ignore[attr-defined]
+            "exclude", stages_cfg["exclude"]
+        )
+        if startup_exclude_path is None:
+            raise RuntimeError("Writable analytics exclusion state did not materialize")
+        analytics_startup_reload_context = analytics_api._build_exclude_reload_context(  # type: ignore[attr-defined]
+            startup_exclude_path
+        )
+
+        def _analytics_state_poisoned(reason: str) -> None:
+            runtime_state["analytics_state_poisoned"] = reason
+            runtime_state["pipeline_failed"] = True
+            shutdown_event.set()
+
+        startup_transaction.bind(
+            "analytics_runtime_hooks",
+            lambda: analytics_api.register_poison_hook(_analytics_state_poisoned),
+            analytics_api.clear_runtime_hooks,
+        )
+    except StartupResourceRegistrationError:
+        raise
     except Exception:
-        pass
+        logger.exception("Failed to load and synchronize writable analytics state at startup")
+        return _abort_startup("analytics_state_initialization_failed")
 
     prebuilt_rest_app = None
     if args.enable_rest:
         try:
             if not _preload_rest_server_runtime():
                 logger.error("Failed to preload REST server runtime")
-                return 1
-            prebuilt_rest_app = _build_rest_app()
+                return _abort_startup("rest_runtime_preload_failed")
+            prebuilt_rest_app = _build_rest_app(
+                ws_host=args.ws_host,
+                ws_port=int(args.ws_port),
+            )
             logger.info("REST app and server runtime prebuilt before DeepStream pipeline startup")
         except Exception:
             logger.exception("Failed to build REST app")
-            return 1
+            return _abort_startup("rest_app_prebuild_failed")
 
-    camera_labels = _load_camera_labels(cameras_path)
-    storage_manager = _build_storage_manager(args)
+    camera_labels = load_camera_labels(cameras_path, strict=True)
+    try:
+        capture_camera_aliases = CanonicalCameraAliases(camera_labels)
+    except ValueError:
+        logger.exception("Capture-event camera aliases are invalid")
+        return _abort_startup("capture_event_camera_aliases_invalid")
+    camera_aliases = {
+        alias: camera
+        for source_id, camera in camera_labels.items()
+        for alias in (str(source_id), str(camera))
+    }
+    try:
+        active_floorplan_registry = ActiveFloorplanRegistry(camera_aliases)
+    except ActiveFloorplanError:
+        logger.exception("Active floorplan registry configuration is invalid")
+        return _abort_startup("active_floorplan_registry_invalid")
+
+    def _depth_storage_failed(failure: StorageFailure) -> None:
+        runtime_state["depth_storage_failure"] = {
+            "write_id": failure.write_id,
+            "sequence": failure.sequence,
+            "camera_id": failure.camera_id,
+            "ts_us": failure.ts_us,
+            "error_type": failure.error_type,
+            "message": failure.message,
+        }
+        runtime_state["pipeline_failed"] = True
+        logger.critical(
+            "Transactional depth storage failed: write_id=%s sequence=%s type=%s message=%s",
+            failure.write_id,
+            failure.sequence,
+            failure.error_type,
+            failure.message,
+        )
+        shutdown_event.set()
+
+    try:
+        storage_manager = startup_transaction.acquire(
+            "depth_storage",
+            lambda: _build_storage_manager(
+                args,
+                on_failure=_depth_storage_failed,
+            ),
+            lambda manager: close_depth_storage(manager, timeout_s=5.0),
+            validator=lambda receipt: bool(receipt.completed),
+        )
+    except StartupResourceRegistrationError:
+        raise
+    except Exception:
+        logger.exception("Failed to initialize transactional depth storage")
+        return _abort_startup("depth_storage_initialization_failed")
+    runtime_state["depth_storage_startup"] = storage_manager.startup_report()
+    if runtime_state["depth_storage_startup"].get("legacy_entries"):
+        logger.warning(
+            "Ignoring %d legacy depth snapshots without commit manifests",
+            len(runtime_state["depth_storage_startup"]["legacy_entries"]),
+        )
     auto_calibrate_lock = threading.Lock()
 
     def _resolve_auto_calibrate_cameras(camera_id: Optional[str]) -> list[str]:
         if camera_id is None or not str(camera_id).strip():
-            ordered = [
-                name
-                for _, name in sorted(camera_labels.items(), key=lambda item: int(item[0]))
-                if isinstance(name, str)
+            return [
+                capture_camera_aliases.canonicalize(name)
+                for _, name in sorted(
+                    camera_labels.items(),
+                    key=lambda item: int(item[0]),
+                )
             ]
-            seen: set[str] = set()
-            cameras: list[str] = []
-            for name in ordered:
-                if name in seen:
-                    continue
-                cameras.append(name)
-                seen.add(name)
-            return cameras
-
-        request_camera = str(camera_id).strip()
-        canonical_camera = request_camera
-        try:
-            cam_idx = int(request_camera)
-        except Exception:
-            cam_idx = None
-        if cam_idx is not None and cam_idx in camera_labels:
-            canonical_camera = camera_labels[cam_idx]
-        else:
-            reverse_labels = {v: k for k, v in camera_labels.items()}
-            if canonical_camera in reverse_labels:
-                canonical_camera = request_camera
-        return [canonical_camera]
-
-    def _read_latest_depth_ts(camera_id: str) -> int:
-        if storage_manager is None:
-            return 0
-        try:
-            payload = storage_manager.load_latest_depth(camera_id, None)
-        except Exception:
-            return 0
-        if not isinstance(payload, dict):
-            return 0
-        try:
-            return int(payload.get("ts", 0) or 0)
-        except Exception:
-            return 0
+        return [capture_camera_aliases.canonicalize(camera_id)]
 
     def _ds8_auto_calibrate_handler(camera_id: Optional[str] = None) -> Dict[str, Any]:
         if not auto_calibrate_lock.acquire(blocking=False):
             return {"ok": False, "results": [], "updated": [], "error": "busy"}
         try:
+            if shutdown_event.is_set():
+                return {"ok": False, "results": [], "updated": [], "error": "shutting_down"}
             if not pipeline.activated:
                 return {"ok": False, "results": [], "updated": [], "error": "pipeline_not_running"}
             if storage_manager is None:
@@ -3845,51 +4716,103 @@ def main() -> int:
             if not depth_branch_present:
                 return {"ok": False, "results": [], "updated": [], "error": "depth_branch_unavailable"}
 
-            cameras = _resolve_auto_calibrate_cameras(camera_id)
-            if not cameras:
-                return {"ok": False, "results": [], "updated": [], "error": "no_cameras_configured"}
-
-            baseline_ts = {cam: _read_latest_depth_ts(cam) for cam in cameras}
-
-            enable_env = os.environ.get("NOESIS_AUTOCALIB_ENABLE_SECONDS", "10")
             try:
-                enable_seconds = int(float(str(enable_env).strip()))
-            except Exception:
-                enable_seconds = 10
-            enable_seconds = max(1, min(15, enable_seconds))
-
-            if not pipeline.depth_enabled:
-                try:
-                    ds8_pipeline.enable_depth(seconds=enable_seconds)
-                except Exception:
-                    logger.warning("Auto-calibrate failed to enable depth burst", exc_info=True)
-
-            wait_timeout_s = min(float(enable_seconds) + 2.0, 18.0)
-            deadline = time.time() + wait_timeout_s
-            fresh = set()
-            while time.time() < deadline and len(fresh) < len(cameras):
-                for cam in cameras:
-                    latest_ts = _read_latest_depth_ts(cam)
-                    if latest_ts > baseline_ts.get(cam, 0):
-                        fresh.add(cam)
-                if len(fresh) >= len(cameras):
-                    break
-                time.sleep(0.12)
-
-            try:
-                from scripts.auto_calibrate_from_depth import auto_calibrate_from_latest_depth
-            except Exception as exc:
+                cameras = _resolve_auto_calibrate_cameras(camera_id)
+            except CaptureEventFusionError as exc:
                 return {
                     "ok": False,
                     "results": [],
                     "updated": [],
-                    "error": f"import_failed: {exc}",
+                    "error": exc.code,
+                }
+            if not cameras:
+                return {"ok": False, "results": [], "updated": [], "error": "no_cameras_configured"}
+
+            raw_enable_seconds = os.environ.get(
+                "NOESIS_AUTOCALIB_ENABLE_SECONDS",
+                "10",
+            )
+            try:
+                enable_seconds = float(str(raw_enable_seconds).strip())
+            except Exception:
+                enable_seconds = float("nan")
+            if (
+                not math.isfinite(enable_seconds)
+                or not 0.01 <= enable_seconds <= 15.0
+            ):
+                error = CaptureEventRuntimeError(
+                    "capture_event_configuration_invalid"
+                )
+                _runtime_component_failed("capture_event", error)
+                return {
+                    "ok": False,
+                    "results": [],
+                    "updated": [],
+                    "error": error.code,
+                }
+
+            providers = getattr(
+                pipeline,
+                "capture_event_runtime_providers",
+                None,
+            )
+            if not isinstance(providers, CaptureEventRuntimeProviders):
+                error = CaptureEventRuntimeError(
+                    "capture_event_controller_unavailable"
+                )
+                _runtime_component_failed("capture_event", error)
+                return {
+                    "ok": False,
+                    "results": [],
+                    "updated": [],
+                    "error": error.code,
+                }
+            try:
+                capture_outcomes = providers.capture_for_auto_calibration(
+                    cameras,
+                    burst_seconds=enable_seconds,
+                )
+            except (CaptureEventFusionError, CaptureEventRuntimeError) as exc:
+                return {
+                    "ok": False,
+                    "results": [],
+                    "updated": [],
+                    "error": exc.code,
+                }
+            auto_capture_evidence = {
+                outcome.canonical_camera: outcome.compact_evidence_payload()
+                for outcome in capture_outcomes
+            }
+
+            if shutdown_event.is_set():
+                return {
+                    "ok": False,
+                    "results": [],
+                    "updated": [],
+                    "error": "shutting_down",
+                }
+
+            try:
+                from scripts.auto_calibrate_from_depth import auto_calibrate_from_latest_depth
+            except Exception:
+                logger.exception("Auto-calibration implementation is unavailable")
+                return {
+                    "ok": False,
+                    "results": [],
+                    "updated": [],
+                    "error": "auto_calibration_unavailable",
                 }
 
             try:
                 res = auto_calibrate_from_latest_depth(cameras, persist=False)
-            except Exception as exc:
-                return {"ok": False, "results": [], "updated": [], "error": str(exc) or "calibration_failed"}
+            except Exception:
+                logger.exception("Auto-calibration computation failed")
+                return {
+                    "ok": False,
+                    "results": [],
+                    "updated": [],
+                    "error": "auto_calibration_failed",
+                }
 
             results = res.get("results") if isinstance(res, dict) else []
             updated: list[str] = []
@@ -3921,12 +4844,35 @@ def main() -> int:
 
             if updated:
                 try:
+                    for updated_camera in updated:
+                        active_floorplan_registry.clear(updated_camera)
+                        storage_manager.invalidate_floorplan_cache(updated_camera)
+                except Exception as exc:
+                    _runtime_component_failed(
+                        "calibration_cache_invalidation",
+                        exc,
+                    )
+                    return {
+                        "ok": False,
+                        "results": results or [],
+                        "updated": updated,
+                        "error": "calibration_cache_invalidation_failed",
+                        "capture_events": auto_capture_evidence,
+                    }
+                try:
                     storage_manager.calibration_bundle = calibration_provider.calibration_bundle()
                 except Exception:
                     logger.debug("Unable to refresh storage calibration bundle", exc_info=True)
                 try:
+                    response_model_started_ns = time.perf_counter_ns()
                     bundle = calibration_provider.calibration_bundle()
-                    ws_server.broadcast_sync({"type": "calibration-bundle", "data": bundle})
+                    message = {"type": "calibration-bundle", "data": bundle}
+                    ws_server.broadcast_sync(
+                        message,
+                        response_model_timing=ws_server.response_model_timing_since(
+                            response_model_started_ns
+                        ),
+                    )
                 except Exception:
                     logger.debug("Failed to broadcast calibration bundle", exc_info=True)
 
@@ -3935,6 +4881,7 @@ def main() -> int:
                 "results": results or [],
                 "updated": updated,
                 "error": top_error,
+                "capture_events": auto_capture_evidence,
             }
         finally:
             auto_calibrate_lock.release()
@@ -3943,230 +4890,55 @@ def main() -> int:
         cam_id: str,
         ts_max_us: Optional[object] = None,
         request_id: Optional[str] = None,
+        cache_only: bool = False,
+        **_ignored: object,
     ) -> Dict[str, Any]:
-        request_camera = str(cam_id).strip()
-        camera_key = request_camera
-        canonical_camera = camera_key
-        alt_keys: List[str] = []
-        norm_ts_max: Optional[int] = None
-        try:
-            cam_idx = int(camera_key)
-            if cam_idx in camera_labels:
-                canonical_camera = camera_labels[cam_idx]
-                camera_key = canonical_camera
-                alt_keys.append(str(cam_idx))
-        except Exception:
-            reverse_labels = {v: k for k, v in camera_labels.items()}
-            cam_idx = reverse_labels.get(camera_key)
-            if cam_idx is not None:
-                canonical_camera = camera_key
-                alt_keys.append(str(cam_idx))
-
-        def _normalize_ts_max_us(value: Optional[object]) -> Optional[int]:
-            if value is None:
-                return None
-            try:
-                if isinstance(value, str):
-                    text = value.strip()
-                    if not text:
-                        return None
-                    raw = int(float(text))
-                else:
-                    raw = int(value)  # type: ignore[arg-type]
-            except Exception:
-                return None
-            if raw < 0:
-                return None
-            if raw < 1_000_000_000:
-                return raw * 1_000_000
-            if raw < 1_000_000_000_000:
-                return raw * 1000
-            return raw
-
-        norm_ts_max = _normalize_ts_max_us(ts_max_us)
-
-        def _payload_has_valid_depth(payload: Dict[str, Any]) -> bool:
-            """Best-effort guard against invalid all-zero/NaN depth payloads."""
-            try:
-                shape = payload.get("shape")
-                if not (isinstance(shape, (list, tuple)) and len(shape) == 2):
-                    return False
-                height = int(shape[0] or 0)
-                width = int(shape[1] or 0)
-                if height <= 0 or width <= 0:
-                    return False
-                depth_b64 = payload.get("depth_b64") or payload.get("depth_z_b64")
-                if not isinstance(depth_b64, str) or not depth_b64:
-                    return False
-                import base64
-
-                raw = base64.b64decode(depth_b64)
-                arr = np.frombuffer(raw, dtype=np.float32)
-                needed = height * width
-                if arr.size < needed:
-                    return False
-                arr = arr[:needed]
-                finite = np.isfinite(arr)
-                if not finite.any():
-                    return False
-                # Floorplan generation uses depth>0.1m as a validity threshold; align with it here.
-                return bool(np.any(arr[finite] > 0.1))
-            except Exception:
-                return False
-
-        def _maybe_attach_normals(payload: Dict[str, Any]) -> None:
-            if not isinstance(payload, dict):
-                return
-            flag = os.environ.get("NOESIS_MAPANYTHING_NORMALS_ENABLE", "1")
-            if str(flag).strip().lower() not in ("1", "true", "yes", "on"):
-                return
-            if storage_manager is None:
-                return
-            space = os.environ.get("NOESIS_MAPANYTHING_NORMALS_SPACE", "camera")
-            dtype = os.environ.get("NOESIS_MAPANYTHING_NORMALS_DTYPE", "float16")
-            try:
-                storage_manager.attach_normals_to_payload(canonical_camera, payload, space=space, dtype=dtype)
-            except Exception:
-                logger.debug("Failed to attach depth normals for camera %s", canonical_camera, exc_info=True)
-
-        def _response(
-            served_from_cache: bool,
-            payload: Optional[Dict[str, Any]] = None,
-            ts_us: Optional[int] = None,
-            error: Optional[str] = None,
-        ) -> Dict[str, Any]:
-            ts_val: Any = ts_us
-            if ts_val is None and payload is not None:
-                try:
-                    ts_val = int(payload.get("ts", 0) or 0)
-                except Exception:
-                    ts_val = payload.get("ts", 0)
-            resp: Dict[str, Any] = {
+        providers = getattr(pipeline, "capture_event_runtime_providers", None)
+        if not isinstance(providers, CaptureEventRuntimeProviders):
+            error = CaptureEventRuntimeError(
+                "capture_event_controller_unavailable"
+            )
+            _runtime_component_failed("capture_event", error)
+            response: Dict[str, Any] = {
                 "type": "ma_depth_response",
-                "camera": canonical_camera,
-                "served_from_cache": bool(served_from_cache),
-                "ts_us": int(ts_val or 0),
+                "camera": str(cam_id or "").strip(),
+                "cache_only": bool(cache_only),
+                "served_from_cache": False,
+                "ts_us": 0,
+                "ok": False,
+                "error": error.code,
             }
             if request_id:
-                resp["request_id"] = request_id
-            if payload is not None:
-                _maybe_attach_normals(payload)
-                resp["payload"] = payload
-            if error:
-                resp["error"] = error
-            resp["ok"] = error is None
-            return resp
+                response["request_id"] = request_id
+            return response
+        return providers.depth_provider(
+            cam_id,
+            ts_max_us=ts_max_us,
+            request_id=request_id,
+            cache_only=cache_only,
+            **_ignored,
+        )
 
-        if storage_manager is None:
-            return _response(False, error="depth_source_unavailable")
-
-        def _load_latest(camera_id: str, ts_cutoff: Optional[int]) -> Optional[Dict[str, Any]]:
-            try:
-                return storage_manager.load_latest_depth(camera_id, ts_cutoff)
-            except Exception:
-                return None
-
-        keys_to_check = [camera_key] + [k for k in alt_keys if k and k != camera_key]
-
-        cached: Optional[Dict[str, Any]] = None
-        cached_ts: Optional[int] = None
-        if norm_ts_max is not None:
-            for key in keys_to_check:
-                cached = _load_latest(key, norm_ts_max)
-                if cached is not None:
-                    break
-            if cached is not None and _payload_has_valid_depth(cached):
-                try:
-                    cached_ts = int(cached.get("ts", 0) or 0)
-                except Exception:
-                    cached_ts = 0
-                return _response(True, payload=cached, ts_us=cached_ts)
-            cached = None
-        else:
-            cached = _load_latest(camera_key, None)
-            if cached is None:
-                for alt_key in alt_keys:
-                    cached = _load_latest(alt_key, None)
-                    if cached is not None:
-                        break
-            if cached is not None and _payload_has_valid_depth(cached):
-                try:
-                    cached_ts = int(cached.get("ts", 0) or 0)
-                except Exception:
-                    cached_ts = 0
-            else:
-                cached = None
-                cached_ts = None
-
-        depth_branch_present = bool(pipeline.depth_gate_attach and pipeline.depth_gate_attach in pipeline.components)
-        if not depth_branch_present:
-            if cached is not None:
-                return _response(True, payload=cached, ts_us=cached_ts, error="depth_branch_unavailable")
-            return _response(False, error="depth_branch_unavailable")
-
-        baseline_ts_by_key: Dict[str, int] = {}
-        for key in keys_to_check:
-            baseline_ts_by_key[key] = 0
-            payload = _load_latest(key, None)
-            if payload is None:
-                continue
-            try:
-                baseline_ts_by_key[key] = int(payload.get("ts", 0) or 0)
-            except Exception:
-                baseline_ts_by_key[key] = 0
-
-        # Trigger a short depth burst and wait for a newer cached snapshot to land.
-        enable_env = os.environ.get("NOESIS_DEPTH_RPC_ENABLE_SECONDS", "4")
+    def _record_active_floorplan_payload(
+        camera_key: str,
+        payload: Mapping[str, Any],
+    ) -> bool:
+        if payload.get("error"):
+            return False
         try:
-            enable_seconds = int(str(enable_env).strip())
-        except Exception:
-            enable_seconds = 4
-        enable_seconds = max(1, min(20, enable_seconds))
-        try:
-            ds8_pipeline.enable_depth(seconds=enable_seconds)
-        except Exception as exc:
-            if cached is not None:
-                return _response(True, payload=cached, ts_us=cached_ts, error=str(exc) or "depth_enable_failed")
-            return _response(False, error=str(exc) or "depth_enable_failed")
+            return active_floorplan_registry.record(
+                camera_key,
+                payload,
+                snapshot_ref=str(payload.get("snapshot_ref") or ""),
+            )
+        except ActiveFloorplanError as exc:
+            _runtime_component_failed("active_floorplan", exc)
+            raise
 
-        wait_env = os.environ.get("NOESIS_DEPTH_RPC_WAIT_TIMEOUT_SECONDS", "")
-        try:
-            wait_timeout_s = float(str(wait_env).strip()) if str(wait_env).strip() else min(12.0, float(enable_seconds) + 4.0)
-        except Exception:
-            wait_timeout_s = min(12.0, float(enable_seconds) + 4.0)
-        wait_timeout_s = max(1.0, min(30.0, wait_timeout_s))
-        deadline = time.time() + wait_timeout_s
-        while time.time() < deadline:
-            for key in keys_to_check:
-                payload = _load_latest(key, None)
-                if payload is None:
-                    continue
-                if not _payload_has_valid_depth(payload):
-                    continue
-                try:
-                    payload_ts = int(payload.get("ts", 0) or 0)
-                except Exception:
-                    payload_ts = 0
-                if payload_ts <= baseline_ts_by_key.get(key, 0):
-                    continue
-                return _response(False, payload=payload, ts_us=payload_ts)
-            time.sleep(0.12)
-
-        if cached is not None:
-            return _response(True, payload=cached, ts_us=cached_ts, error="timeout_waiting_for_depth")
-        payload = _load_latest(camera_key, None)
-        if payload is None:
-            for alt_key in alt_keys:
-                payload = _load_latest(alt_key, None)
-                if payload is not None:
-                    break
-        if payload is None or not _payload_has_valid_depth(payload):
-            return _response(False, error="timeout_waiting_for_depth")
-        try:
-            payload_ts = int(payload.get("ts", 0) or 0)
-        except Exception:
-            payload_ts = 0
-        return _response(True, payload=payload, ts_us=payload_ts, error="timeout_waiting_for_depth")
+    def _bev_active_floorplan_bounds_provider(
+        camera_key: str,
+    ) -> Optional[Mapping[str, Any]]:
+        return active_floorplan_registry.bounds_for(camera_key)
 
     def _ds8_floorplan_provider(
         camera: Optional[str] = None,
@@ -4176,208 +4948,162 @@ def main() -> int:
         cache_only: bool = False,
         **_ignored: object,
     ) -> Dict[str, Any]:
-        request_camera = str(camera or "").strip()
-        camera_id = request_camera
-        alt_keys: List[str] = []
-        try:
-            cam_idx = int(camera_id)
-            if cam_idx in camera_labels:
-                camera_id = camera_labels[cam_idx]
-                alt_keys.append(str(cam_idx))
-        except Exception:
-            reverse_labels = {v: k for k, v in camera_labels.items()}
-            cam_idx = reverse_labels.get(camera_id)
-            if cam_idx is not None:
-                alt_keys.append(str(cam_idx))
-
-        if not camera_id:
-            return {"error": "camera_required", "ts": int(time.time() * 1_000_000)}
-        if storage_manager is None:
-            return {"error": "depth_source_unavailable", "camera_id": camera_id}
-
-        keys_to_check = [camera_id] + [key for key in alt_keys if key and key != camera_id]
-
-        def _generate_for_key(key: str) -> Dict[str, Any]:
-            return storage_manager.generate_topdown_floorplan(
-                key,
-                max_age_sec=max_age_sec,
-                grid_res_m=grid_res_m,
-                max_extent_m=max_extent_m,
-                cache_only=cache_only,
+        providers = getattr(pipeline, "capture_event_runtime_providers", None)
+        if not isinstance(providers, CaptureEventRuntimeProviders):
+            error = CaptureEventRuntimeError(
+                "capture_event_controller_unavailable"
             )
+            _runtime_component_failed("capture_event", error)
+            return {
+                "error": error.code,
+                "camera_id": str(camera or "").strip(),
+            }
+        payload = providers.floorplan_provider(
+            camera,
+            max_age_sec=max_age_sec,
+            grid_res_m=grid_res_m,
+            max_extent_m=max_extent_m,
+            cache_only=cache_only,
+            **_ignored,
+        )
+        camera_id = str(payload.get("camera_id") or camera or "").strip()
 
-        def _generate_with_alternates() -> Dict[str, Any]:
-            first_exc: Optional[Exception] = None
+        def _with_scene_fusion(result: Mapping[str, Any]) -> Dict[str, Any]:
+            if scene_fusion_set is None:
+                return dict(result)
             try:
-                return _generate_for_key(camera_id)
-            except Exception as exc:
-                first_exc = exc
-            for alt_key in alt_keys:
-                try:
-                    return _generate_for_key(alt_key)
-                except Exception:
-                    continue
-            if first_exc is not None:
-                raise first_exc
-            return {"error": "floorplan_failed", "camera_id": camera_id, "ts": int(time.time() * 1_000_000)}
+                return scene_fusion_set.compose_floorplan(camera_id, result)
+            except SceneFusionError as exc:
+                failed = dict(result)
+                failed["scene_fusion_error"] = str(exc)
+                logger.error("Scene-fusion floorplan composition failed: %s", exc)
+                return failed
 
-        def _needs_live_depth_burst(payload: Mapping[str, Any]) -> bool:
-            if cache_only:
-                return False
+        if scene_prior_set is None:
+            return _with_scene_fusion(payload)
+        binding = scene_prior_set.binding(camera_id)
+        if binding is None or not binding.include_floorplan_layers:
+            return _with_scene_fusion(payload)
+        if payload.get("error"):
             try:
-                requested_max_age = float(max_age_sec)
-            except Exception:
-                requested_max_age = 60.0
-            if requested_max_age <= 0.0:
-                return True
-            error = str(payload.get("error") or "").strip().lower()
-            return error in {"no_depth", "stale_depth", "load_failed", "invalid_snapshot"}
-
-        try:
-            payload = _generate_with_alternates()
-        except Exception as exc:
-            logger.warning(
-                "DS9 floorplan provider failed (camera=%s, cache_only=%s): %s",
-                camera_id,
-                cache_only,
-                exc,
-            )
-            return {"error": str(exc) or "floorplan_failed", "camera_id": camera_id}
-        if not _needs_live_depth_burst(payload):
-            return payload
-
-        depth_branch_present = bool(pipeline.depth_gate_attach and pipeline.depth_gate_attach in pipeline.components)
-        if not depth_branch_present:
-            payload = dict(payload)
-            payload.setdefault("camera_id", camera_id)
-            payload["error"] = "depth_branch_unavailable"
-            payload["depth_burst_triggered"] = False
-            return payload
-
-        baseline_ts_by_key = {key: _read_latest_depth_ts(key) for key in keys_to_check}
-        enable_env = os.environ.get(
-            "NOESIS_FLOORPLAN_DEPTH_ENABLE_SECONDS",
-            os.environ.get("NOESIS_DEPTH_RPC_ENABLE_SECONDS", "4"),
+                return _with_scene_fusion(
+                    scene_prior_set.compose_static_floorplan(camera_id, payload)
+                )
+            except ScenePriorError as exc:
+                result = dict(payload)
+                result["scene_prior_error"] = str(exc)
+                logger.error("Scene-prior static floorplan composition failed: %s", exc)
+                return _with_scene_fusion(result)
+        source_id = next(
+            (
+                int(candidate)
+                for candidate, label in camera_labels.items()
+                if str(label) == camera_id
+            ),
+            None,
         )
         try:
-            enable_seconds = int(float(str(enable_env).strip()))
-        except Exception:
-            enable_seconds = 4
-        enable_seconds = max(1, min(20, enable_seconds))
-        try:
-            ds8_pipeline.enable_depth(seconds=enable_seconds)
-        except Exception as exc:
-            payload = dict(payload)
-            payload.setdefault("camera_id", camera_id)
-            payload["error"] = str(exc) or "depth_enable_failed"
-            payload["depth_burst_triggered"] = False
-            return payload
-
-        deadline = time.time() + min(12.0, float(enable_seconds) + 4.0)
-        fresh_depth = False
-        while time.time() < deadline:
-            for key in keys_to_check:
-                latest_ts = _read_latest_depth_ts(key)
-                if latest_ts > baseline_ts_by_key.get(key, 0):
-                    fresh_depth = True
-                    break
-            if fresh_depth:
-                break
-            time.sleep(0.12)
-
-        try:
-            refreshed = dict(_generate_with_alternates())
-        except Exception as exc:
-            logger.warning(
-                "DS9 floorplan provider failed after depth burst (camera=%s): %s",
-                camera_id,
-                exc,
+            if source_id is None:
+                raise ScenePriorError(
+                    f"scene-prior camera {camera_id!r} is not an active calibrated source"
+                )
+            calibration = calibration_provider.snapshot(source_id, camera_id)
+            if calibration is None or calibration.extrinsics_col_major is None:
+                raise ScenePriorError(
+                    f"scene-prior camera {camera_id!r} has no calibrated extrinsics"
+                )
+            revision = scene_prior_set.revision_for_camera(camera_id)
+            if revision is None:
+                raise ScenePriorError(
+                    f"scene-prior camera {camera_id!r} has no loaded revision"
+                )
+            return _with_scene_fusion(
+                scene_prior_set.compose_floorplan(
+                    camera_id,
+                    payload,
+                    extrinsics_col_major=calibration.extrinsics_col_major,
+                    floor_y_m=revision.manifest.derivation.floor_y_m,
+                )
             )
-            refreshed = {"error": str(exc) or "floorplan_failed", "camera_id": camera_id}
-        refreshed["depth_burst_triggered"] = True
-        refreshed["depth_burst_fresh"] = bool(fresh_depth)
-        if refreshed.get("error") and not fresh_depth:
-            refreshed.setdefault("details", "timeout_waiting_for_depth")
-        return refreshed
+        except ScenePriorError as exc:
+            result = dict(payload)
+            result["scene_prior_error"] = str(exc)
+            result["scene_prior_meta"] = {
+                "contract": "noesis.scene_prior.floorplan_composite",
+                "contract_version": 1,
+                "mode": "shadow",
+                "status": "error",
+                "camera_id": camera_id,
+                "reason": str(exc),
+            }
+            logger.error("Scene-prior floorplan composition failed: %s", exc)
+            return _with_scene_fusion(result)
 
     pipeline = ds8_pipeline.build_pipeline(pipeline_path)
-    runtime_state["expected_eos"] = _pipeline_expects_finite_source_eos(pipeline.config)
+    setattr(pipeline, "active_floorplan_registry", active_floorplan_registry)
+    runtime_state["expected_eos"] = pipeline_expects_finite_source_eos(pipeline)
     runtime_state["pipeline_eos_seen"] = False
+    runtime_state["pipeline_eos_reason"] = (
+        "finite_source" if runtime_state["expected_eos"] else None
+    )
     setattr(pipeline, "camera_labels", camera_labels)
     if getattr(pipeline, "ds_pipeline", None) is None:
         logger.error("pyservicemaker unavailable; DS9 runtime cannot continue")
-        return 1
+        return _abort_startup("pyservicemaker_unavailable")
     try:
-        from noesis.server import analytics_api
-
-        analytics_cfg = analytics_api._load_config()  # type: ignore[attr-defined]
-        stage_cfg = (analytics_cfg.get("analytics") or {}).get("stages", {}).get("exclude") or {}
-        if stage_cfg:
-            analytics_api._sync_exclude_stage("exclude", stage_cfg)  # type: ignore[attr-defined]
-    except Exception:
-        logger.debug("Unable to sync exclusion config at startup", exc_info=True)
-
+        scene_prior_set = _load_scene_priors(
+            pipeline_cfg=pipeline.config,
+            pipeline_path=pipeline_path,
+            logger=logger,
+        )
+    except ScenePriorError as exc:
+        logger.error("Configured scene priors are invalid: %s", exc)
+        return _abort_startup("scene_prior_invalid")
+    setattr(pipeline, "scene_priors", scene_prior_set)
+    try:
+        scene_fusion_set = _load_scene_fusions(
+            pipeline_cfg=pipeline.config,
+            pipeline_path=pipeline_path,
+            logger=logger,
+        )
+    except SceneFusionError as exc:
+        logger.error("Configured scene fusions are invalid: %s", exc)
+        return _abort_startup("scene_fusion_invalid")
+    setattr(pipeline, "scene_fusions", scene_fusion_set)
     # Parse mosaic_output toggles from the *built pipeline config* (source of truth).
     # Do not re-apply env overrides here: env vars are consumed during build in ds8_pipeline,
     # and re-applying them here can desync runtime behavior from the actual pipeline graph.
     mosaic_cfg = pipeline.config.get("mosaic_output") or {}
-    rtsp_port = int(mosaic_cfg.get("rtsp_port", 8554) or 8554)
-    rtsp_path = str(mosaic_cfg.get("rtsp_path", "mosaic")).strip() or "mosaic"
     mosaic_webrtc_enabled = bool(mosaic_cfg.get("mosaic_webrtc_enabled", False))
 
     rtsp_built = "rtsp_out" in getattr(pipeline, "components", {})
 
+    mosaic_shm_built = "mosaic_h264_shmsink" in getattr(pipeline, "components", {})
+    mosaic_h264_shm_socket = str(
+        mosaic_cfg.get("mosaic_h264_shm_socket", "") or "/tmp/noesis-mosaic-h264"
+    ).strip() or "/tmp/noesis-mosaic-h264"
     logger.info(
-        "Mosaic output toggles (effective): RTSP=%s (built=%s), WebRTC_Gateway=%s",
+        "Mosaic output toggles (effective): RTSP=%s (built=%s), WebRTC_Gateway=%s (shm_built=%s socket=%s)",
         bool(mosaic_cfg.get("rtsp_enabled", False)),
         rtsp_built,
         mosaic_webrtc_enabled,
+        mosaic_shm_built,
+        mosaic_h264_shm_socket,
     )
-    #region agent log
-    try:
-        with _agent_debug_log_path().open("a", encoding="utf-8") as _f:
-            _f.write(
-                json.dumps(
-                    {
-                        "sessionId": "debug-session",
-                        "runId": "run1",
-                        "hypothesisId": "H2",
-                        "location": "ds9_runtime_core.py:main",
-                        "message": "mosaic toggles",
-                        "data": {
-                            "rtsp_enabled": bool(mosaic_cfg.get("rtsp_enabled", False)),
-                            "rtsp_port": rtsp_port,
-                            "rtsp_path": rtsp_path,
-                            "webrtc_enabled": mosaic_webrtc_enabled,
-                            "rtsp_built": rtsp_built,
-                        },
-                        "timestamp": int(time.time() * 1000),
-                    }
-                )
-                + "\n"
-            )
-    except Exception:
-        pass
-    #endregion
 
-    streammux_cfg = pipeline.config.get("streammux") or {}
-    try:
-        streammux_size = (
-            int((streammux_cfg or {}).get("width", 0) or 0),
-            int((streammux_cfg or {}).get("height", 0) or 0),
-        )
-    except Exception:
-        streammux_size = (0, 0)
-    if streammux_size[0] <= 0 or streammux_size[1] <= 0:
-        streammux_size = (1920, 1080)
-
-    calibration_provider = CalibrationManager(
+    calibration_provider = create_calibration_manager(
         cameras_yaml_path=cameras_path,
-        camera_calibration_json_path=REPO_ROOT / "config" / "camera_calibration.json",
-        ply_alignment_json_path=REPO_ROOT / "config" / "ply_alignment.json",
-        streammux_size=streammux_size,
+        pipeline_config=pipeline.config,
+        camera_calibration_json_path=Path(
+            os.environ.get("NOESIS_CAMERA_CALIBRATION_FILE", "")
+            or REPO_ROOT / "config" / "camera_calibration.json"
+        ).expanduser().resolve(),
+        ply_alignment_json_path=Path(
+            os.environ.get("NOESIS_PLY_ALIGNMENT_FILE", "")
+            or REPO_ROOT / "config" / "ply_alignment.json"
+        ).expanduser().resolve(),
+        camera_labels=camera_labels,
     )
-    calibration_provider.set_camera_labels(camera_labels)
     setattr(pipeline, "bev_calibration", calibration_provider)
     if calibration_provider.pose_only_enabled():
         pose_errors = calibration_provider.validate_pose_coverage()
@@ -4386,13 +5112,14 @@ def main() -> int:
             for camera_id, reason in sorted(pose_errors.items()):
                 logger.error("  camera=%s reason=%s", camera_id, reason)
             logger.error("Aborting startup due to strict pose-only calibration mode.")
-            return 1
+            return _abort_startup("pose_only_calibration_invalid")
         logger.warning("Strict pose-only calibration mode enabled (NOESIS_CALIBRATION_POSE_ONLY=1).")
     try:
         storage_manager.calibration_bundle = calibration_provider.calibration_bundle()
     except Exception:
         logger.debug("Unable to seed calibration bundle on storage manager", exc_info=True)
     depth_registration_manager: DepthRegistrationManager | None = None
+    world_fusion_policy: WorldFusionPolicy | None = None
     depthless_reid_smoke = _allow_depthless_reid_smoke(pipeline.config)
     if tracking_mode == "baseline" and not depthless_reid_smoke:
         try:
@@ -4404,15 +5131,25 @@ def main() -> int:
                 camera_labels=camera_labels,
                 logger=logger,
             )
-        except DepthRegistrationError as exc:
-            logger.error("Baseline tracking requires a valid depth registration artifact: %s", exc)
-            return 1
+            world_fusion_policy = _load_world_measurement_fusion_policy(
+                pipeline_cfg=pipeline.config,
+                camera_labels=camera_labels,
+                depth_registration=depth_registration_manager,
+                logger=logger,
+            )
+        except (DepthRegistrationError, WorldFusionPolicyError) as exc:
+            logger.error("Baseline tracking calibration policy is invalid: %s", exc)
+            return _abort_startup("world_measurement_policy_invalid")
     elif depthless_reid_smoke:
         logger.warning("Skipping depth registration load for explicit ReID smoke validation config")
-    stable_id_mgr = _build_stable_id_manager(logger, pipeline_config=pipeline.config)
+    stable_id_mgr = _build_stable_id_manager(
+        logger,
+        pipeline_config=pipeline.config,
+        camera_labels=camera_labels,
+    )
     if stable_id_mgr is None:
         logger.error("Stable ID manager is required for zero-copy hard-cutover; aborting startup")
-        return 1
+        return _abort_startup("stable_id_manager_unavailable")
     # Ensure occupancy publisher slot exists for telemetry hooks; real publisher can be bound later.
     bind_occupancy_publisher(pipeline, None)
     # Stable ID manager is optional; attach slot so hooks can discover it.
@@ -4420,10 +5157,19 @@ def main() -> int:
     try:
         from noesis.server import reid_api
 
-        reid_api.register_reid_manager_getter(lambda: getattr(pipeline, "stable_id_mgr", None))
+        startup_transaction.bind(
+            "reid_api_binding",
+            lambda: reid_api.register_reid_manager_getter(
+                lambda: getattr(pipeline, "stable_id_mgr", None)
+            ),
+            reid_api.clear_reid_manager_getter,
+        )
+    except StartupResourceRegistrationError:
+        raise
     except Exception:
-        logger.debug("ReID API registration skipped", exc_info=True)
-    # Intrinsics are served via the calibration bundle (`_CalibrationProvider`) rather than per-frame user meta.
+        logger.exception("Required ReID API registration failed")
+        return _abort_startup("reid_api_binding_failed")
+    # Intrinsics come from the shared CalibrationManager rather than per-frame user meta.
 
     trails_cfg: Dict[str, Any] = {}
     try:
@@ -4448,17 +5194,69 @@ def main() -> int:
     bev_smoothing_cfg = bev_cfg.get("smoothing") if isinstance(bev_cfg, dict) else None
     if not isinstance(bev_smoothing_cfg, dict):
         bev_smoothing_cfg = None
-    bev_frame = None
-    if isinstance(bev_cfg, dict):
-        bev_frame = bev_cfg.get("frame") or bev_cfg.get("frame_mode")
-    bev_frame_env = os.environ.get("NOESIS_BEV_FRAME")
-    if bev_frame_env:
-        bev_frame = bev_frame_env
-    if not bev_frame:
-        bev_frame = POSE_V1_FRAME_BACKEND_WORLD_M
+    bev_coverage_envelopes_cfg = (
+        bev_cfg.get("coverage_envelopes")
+        if isinstance(bev_cfg, dict)
+        else None
+    )
+    locked_bev_frame = "camera_local_ground_m"
+    bev_frame = (
+        bev_cfg.get("frame") or bev_cfg.get("frame_mode")
+        if isinstance(bev_cfg, dict)
+        else None
+    )
+    bev_frame_env = str(os.environ.get("NOESIS_BEV_FRAME") or "").strip()
+    if bev_frame_env and bev_frame_env != locked_bev_frame:
+        logger.error("NOESIS_BEV_FRAME cannot override the locked local floorplan frame")
+        return _abort_startup("bev_frame_override_rejected")
+    if bev_frame != locked_bev_frame:
+        logger.error("BEV frame must be %s; configured=%r", locked_bev_frame, bev_frame)
+        return _abort_startup("bev_frame_contract_invalid")
+    bev_frame = locked_bev_frame
     # JPEG BEV binary delivery retired (meta-only is the supported baseline per contracts + design decisions).
     # The old jpeg_enabled / NOESIS_BEV_JPEG_ENABLED knobs are ignored; only frame mode remains relevant.
     logger.info("BEV JPEG output retired (meta-only mode). frame mode=%s", bev_frame)
+
+    def _runtime_component_failed(component: str, error: BaseException) -> None:
+        message = f"{component}_failed:{type(error).__name__}:{error}"
+        if message not in pipeline.errors:
+            pipeline.errors.append(message)
+        runtime_state["pipeline_failed"] = True
+        capture_controller = getattr(pipeline, "capture_event_controller", None)
+        if isinstance(capture_controller, CaptureEventController):
+            capture_controller.close_admission()
+        shutdown_event.set()
+
+    def _ws_boundary_failed(error: BaseException) -> None:
+        _runtime_component_failed("ws_boundary", error)
+
+    def _bev_failed(error: BaseException) -> None:
+        _runtime_component_failed("bev_renderer", error)
+
+    def _mapanything_failed(error: BaseException) -> None:
+        _runtime_component_failed("mapanything_postprocess", error)
+
+    capture_event_runtime_providers = CaptureEventRuntimeProviders(
+        aliases=capture_camera_aliases,
+        storage=storage_manager,
+        controller_getter=lambda: getattr(
+            pipeline,
+            "capture_event_controller",
+            None,
+        ),
+        depth_branch_available=lambda: bool(
+            pipeline.depth_gate_attach
+            and pipeline.depth_gate_attach in pipeline.components
+        ),
+        shutdown_requested=shutdown_event.is_set,
+        runtime_failure=_runtime_component_failed,
+        record_floorplan=_record_active_floorplan_payload,
+    )
+    setattr(
+        pipeline,
+        "capture_event_runtime_providers",
+        capture_event_runtime_providers,
+    )
 
     ws_server = WebSocketServer(
         host=args.ws_host,
@@ -4466,6 +5264,8 @@ def main() -> int:
         stats_callback=None,
         initial_trail_state=bool(trail_settings.enabled),
     )
+    ws_server.boundary_failure_callback = _ws_boundary_failed
+    ws_server.lifecycle_failure_callback = _ws_boundary_failed
     def _ws_trail_settings_getter() -> Dict[str, Any]:
         cfg = dict(trails_cfg or {})
         cfg["enabled"] = bool(ws_server.initial_trail_state)
@@ -4474,8 +5274,9 @@ def main() -> int:
     ws_server.stats_callback = _build_stats_callback(
         pipeline,
         camera_labels,
-        ws_metrics_getter=ws_server.get_boundary_serialization_metrics,
+        ws_metrics_getter=ws_server.get_boundary_serialization_metrics_compact,
         ws_metrics_resetter=ws_server.reset_boundary_serialization_metrics,
+        runtime_state=runtime_state,
     )
     trail_processor = getattr(pipeline, "trail_overlay_processor", None)
     bev_renderer: Optional[BevRenderer] = None
@@ -4506,6 +5307,7 @@ def main() -> int:
 
     def _broadcast_calibration_bundle() -> None:
         try:
+            response_model_started_ns = time.perf_counter_ns()
             bundle = calibration_provider.calibration_bundle()
         except Exception:
             logger.debug("Failed to build calibration bundle for broadcast", exc_info=True)
@@ -4516,7 +5318,13 @@ def main() -> int:
             except Exception:
                 logger.debug("Failed to update storage calibration bundle", exc_info=True)
         try:
-            ws_server.broadcast_sync({"type": "calibration-bundle", "data": bundle})
+            message = {"type": "calibration-bundle", "data": bundle}
+            ws_server.broadcast_sync(
+                message,
+                response_model_timing=ws_server.response_model_timing_since(
+                    response_model_started_ns
+                ),
+            )
         except Exception:
             logger.debug("Failed to broadcast calibration bundle", exc_info=True)
 
@@ -4614,6 +5422,10 @@ def main() -> int:
             return persist_result
 
         logger.warning("WS set_extrinsics persisted camera=%s path=%s", cam_id, calibration_provider.extrinsics_path())
+        active_floorplan_registry.clear(cam_id)
+        storage_manager.invalidate_floorplan_cache(
+            active_floorplan_registry.canonical_camera(cam_id)
+        )
         _broadcast_calibration_bundle()
         return {"ok": True, "cameraId": cam_id}
 
@@ -4654,6 +5466,8 @@ def main() -> int:
             return persist_result
 
         logger.warning("WS set_align persisted path=%s", calibration_provider.alignment_path())
+        active_floorplan_registry.clear()
+        storage_manager.invalidate_floorplan_cache()
         _broadcast_calibration_bundle()
         return {"ok": True}
 
@@ -4817,15 +5631,160 @@ def main() -> int:
         trails_cfg=trails_cfg,
         smoothing_cfg=bev_smoothing_cfg,
         frame=str(bev_frame),
+        floorplan_bounds_provider=_bev_active_floorplan_bounds_provider,
+        coverage_envelopes_cfg=bev_coverage_envelopes_cfg,
+        failure_callback=_bev_failed,
         # jpeg_* retired — meta-only mode (see BevRenderer and design decisions)
     )
+    setattr(pipeline, "bev_renderer", bev_renderer)
     ws_server.bev_config_callback = lambda cam_id, cfg: bev_renderer.update_config(cam_id, cfg)
     ws_server.bev_overlay_callback = lambda cam_id, enabled: bev_renderer.update_config(cam_id, {"overlay": enabled})
-    depth_pub = DepthTelemetryPublisher(ws_server)
-    tracking_pub = TrackingTelemetryPublisher(ws_server, metadata_getter=_tracking_contract_metadata)
+    runtime_publication_gate = RuntimePublicationGate()
+    setattr(pipeline, "runtime_publication_gate", runtime_publication_gate)
+    depth_pub = DepthTelemetryPublisher(
+        ws_server,
+        failure_callback=_ws_boundary_failed,
+        publication_gate=runtime_publication_gate,
+    )
+    world_service = startup_transaction.acquire(
+        "canonical_world",
+        lambda: create_runtime_world_service(
+            runtime="ds9",
+            pipeline_config=pipeline.config,
+            camera_labels=camera_labels,
+            calibration_provider=calibration_provider,
+            repo_root=REPO_ROOT,
+            software_revision=(
+                appliance_binding.software_revision
+                if appliance_binding is not None
+                else None
+            ),
+        ),
+        lambda service: service.close(),
+    )
+    capability_monitor = create_runtime_capability_monitor(world_service)
+    from noesis.server import health_api
+
+    startup_transaction.bind(
+        "health_api_bindings",
+        lambda: (
+            health_api.register_capability_monitor_getter(
+                lambda: capability_monitor
+            ),
+            health_api.register_deployment_binding_getter(
+                lambda: appliance_binding
+            ),
+        ),
+        health_api.clear_runtime_bindings,
+    )
+    if appliance_binding is not None:
+        appliance_binding.bind_producer(
+            instance_id=world_service.producer.instance_id,
+            run_id=world_service.producer.run_id,
+        )
+        ws_server.health_payload_getter = lambda: appliance_binding.websocket_health(
+            capability_monitor
+        ).model_dump(mode="json")
+
+    def _canonical_publication_failed(error: BaseException) -> None:
+        message = f"canonical_world_publication_failed:{type(error).__name__}:{error}"
+        if message not in pipeline.errors:
+            pipeline.errors.append(message)
+        runtime_state["pipeline_failed"] = True
+        shutdown_event.set()
+
+    from noesis.identity_v2_service import (
+        IdentityV2ConfigurationError,
+        create_identity_v2_service,
+    )
+    try:
+        identity_v2_service = create_identity_v2_service(
+            pipeline_config=pipeline.config,
+            pipeline_yaml_path=getattr(pipeline, "yaml_path", pipeline_path),
+            camera_labels=camera_labels,
+            repo_root=REPO_ROOT,
+            run_id=world_service.producer.run_id,
+        )
+    except IdentityV2ConfigurationError as exc:
+        logger.error("Identity-v2 startup validation failed: %s", exc)
+        return _abort_startup("identity_v2_configuration_invalid")
+    except Exception:
+        logger.exception("Identity-v2 startup failed")
+        return _abort_startup("identity_v2_startup_failed")
+    setattr(pipeline, "identity_v2_service", identity_v2_service)
+    if identity_v2_service is not None:
+        identity_v2_service = startup_transaction.acquire(
+            "identity_v2",
+            lambda: identity_v2_service,
+            lambda service: service.close(),
+        )
+
+    def _identity_v2_failed(error: BaseException) -> None:
+        message = f"identity_v2_failed:{type(error).__name__}:{error}"
+        if message not in pipeline.errors:
+            pipeline.errors.append(message)
+        runtime_state["pipeline_failed"] = True
+        shutdown_event.set()
+
+    setattr(pipeline, "identity_v2_failure_callback", _identity_v2_failed)
+    from noesis.server import reid_v2_api
+
+    startup_transaction.bind(
+        "identity_v2_api_bindings",
+        lambda: (
+            reid_v2_api.register_identity_v2_runtime_getter(
+                lambda: (
+                    identity_v2_service.runtime
+                    if identity_v2_service is not None
+                    else None
+                )
+            ),
+            reid_v2_api.register_identity_v2_service_getter(
+                lambda: identity_v2_service
+            ),
+        ),
+        reid_v2_api.clear_identity_v2_bindings,
+    )
+    if identity_v2_service is None:
+        logger.info("Identity-v2 runtime disabled")
+    else:
+        logger.info(
+            "Identity-v2 runtime ready: mode=%s run_id=%s model_sha256=%s layer=%s dim=%d scoring=%s",
+            identity_v2_service.mode.value,
+            identity_v2_service.run_id,
+            identity_v2_service.model_fingerprint,
+            identity_v2_service.model_layer,
+            identity_v2_service.embedding_dim,
+            identity_v2_service.runtime.scoring_calibration_status,
+        )
+
+    tracking_pub = TrackingTelemetryPublisher(
+        ws_server,
+        metadata_getter=_tracking_contract_metadata,
+        world_service=world_service,
+        health_monitor=capability_monitor,
+        failure_callback=_canonical_publication_failed,
+    )
+    logger.info("Canonical world service ready: run_id=%s", world_service.producer.run_id)
     diagnostics_logger = TrackingDiagnosticsLogger.from_env()
     if diagnostics_logger:
+        diagnostics_logger = startup_transaction.acquire(
+            "tracking_diagnostics",
+            lambda: diagnostics_logger,
+            lambda diagnostics: diagnostics.close(),
+        )
         logger.info("V3DT diagnostics logging enabled: %s", diagnostics_logger.output_path)
+
+    capture_rgb_provider: PipelineRgbFrameProvider | None = None
+
+    def _close_startup_mapanything_processor() -> None:
+        processor = getattr(pipeline, "mapanything_processor", None)
+        try:
+            if processor is not None:
+                processor.shutdown(wait=True, timeout_s=5.0)
+        finally:
+            if capture_rgb_provider is not None:
+                capture_rgb_provider.close()
 
     # Attach MapAnything postprocess only if SGIE is present/enabled
     try:
@@ -4838,20 +5797,64 @@ def main() -> int:
         if not ma_post_enabled:
             logger.info("MapAnything postprocess disabled (NOESIS_MAPANYTHING_POSTPROCESS_ENABLED=%s)", env_ma_post)
         elif ma_enabled and "mapanything_fullframe" in pipeline.components:
-            hooks.attach_mapanything_postprocess_hook(
+            capture_rgb_provider = PipelineRgbFrameProvider(
+                camera_sources=camera_labels,
+            )
+
+            def _install_mapanything_processor() -> Any:
+                hooks.attach_mapanything_postprocess_hook(
+                    pipeline,
+                    storage=storage_manager,
+                    depth_pub=depth_pub,
+                    camera_labels=camera_labels,
+                    failure_callback=_mapanything_failed,
+                    rgb_provider=capture_rgb_provider,
+                )
+                processor = getattr(pipeline, "mapanything_processor", None)
+                if processor is None:
+                    raise RuntimeError(
+                        "MapAnything hook did not publish its owned processor"
+                    )
+                return processor
+
+            mapanything_processor = startup_transaction.bind(
+                "mapanything_processor",
+                _install_mapanything_processor,
+                _close_startup_mapanything_processor,
+            )
+            capture_event_controller = CaptureEventController(
+                aliases=capture_camera_aliases,
+                storage=DepthStorageCaptureEventAdapter(storage_manager),
+                mapanything=mapanything_processor,
+                set_depth_gate=pipeline.mark_depth_enabled,
+                depth_gate_is_open=lambda: bool(pipeline.depth_enabled),
+                burst_waiter=shutdown_event.wait,
+                stop_requested=shutdown_event.is_set,
+                failure_callback=lambda error: _runtime_component_failed(
+                    "capture_event", error
+                ),
+                manual_drain_timeout_s=resolve_capture_event_drain_timeout_s(),
+                rgb_provider=capture_rgb_provider,
+                require_rgb=True,
+            )
+            setattr(
                 pipeline,
-                storage=storage_manager,
-                depth_pub=depth_pub,
-                camera_labels=camera_labels,
+                "capture_event_controller",
+                capture_event_controller,
             )
         else:
             logger.info("SGIE disabled or missing; skipping MapAnything postprocess hook")
-    except Exception:
+    except StartupResourceRegistrationError:
+        raise
+    except Exception as exc:
         logger.exception("Error while evaluating MapAnything postprocess attachment")
+        _mapanything_failed(exc)
+        return _abort_startup("mapanything_hook_failed")
     try:
         hooks.attach_pose_feature_hook(pipeline, camera_labels=camera_labels)
     except Exception:
         logger.exception("Error while attaching pose feature hook")
+        return _abort_startup("pose_feature_hook_failed")
     if tracking_mode == "baseline" and not depthless_reid_smoke:
         try:
             hooks.attach_object_depth_fusion_hook(
@@ -4862,7 +5865,7 @@ def main() -> int:
             )
         except Exception:
             logger.exception("Baseline tracking requires the DAv2 object-depth fusion hook")
-            return 1
+            return _abort_startup("object_depth_fusion_hook_failed")
     elif depthless_reid_smoke:
         logger.warning("Skipping DAv2 object-depth fusion hook for explicit ReID smoke validation config")
     hooks.attach_analytics_telemetry_hook(
@@ -4873,9 +5876,11 @@ def main() -> int:
         bev_renderer=bev_renderer,
         bev_calibration=calibration_provider,
         depth_registration=depth_registration_manager,
+        world_fusion_policy=world_fusion_policy,
+        scene_priors=scene_prior_set,
         diagnostics_logger=diagnostics_logger,
+        publication_gate=runtime_publication_gate,
     )
-    hooks.attach_exclude_prune_hook(pipeline)
     hooks.attach_analytics_reload_bridge(pipeline)
 
     # Wire pyservicemaker Pipeline messages into our logger + shutdown handling.
@@ -4891,212 +5896,316 @@ def main() -> int:
         except Exception:
             logger.exception("Error in pyservicemaker message callback")
 
+    if shutdown_event.is_set():
+        return _abort_startup("shutdown_requested_before_prepare")
     logger.info("Preparing DS9 pipeline")
     if not ds8_pipeline.prepare(on_message=_psm_message_cb):
         logger.error("DS9 pipeline preparation failed: %s", pipeline.errors)
-        return 1
+        return _abort_startup("pipeline_prepare_failed")
+    startup_transaction.mark_prepared()
+    if shutdown_event.is_set():
+        return _abort_startup("shutdown_requested_after_prepare")
 
-    ws_thread, ws_loop = _start_websocket_server(ws_server)
-    if getattr(ws_server, "server", None) is None:
-        ws_bind_retry_raw = os.environ.get("NOESIS_WS_BIND_RETRY_TRIES", "4")
-        try:
-            ws_bind_retry_tries = max(0, int(str(ws_bind_retry_raw).strip() or "4"))
-        except Exception:
-            ws_bind_retry_tries = 4
-        for retry_idx in range(ws_bind_retry_tries):
-            next_port = _select_ws_port(args.ws_host, int(args.ws_port) + 1, 32, logger)
-            if next_port == int(args.ws_port):
-                break
-            if not _port_bindable(args.ws_host, int(next_port)):
-                logger.error(
-                    "No bindable WebSocket fallback port available starting at %s",
-                    int(args.ws_port) + 1,
-                )
-                break
-            args.ws_port = int(next_port)
-            os.environ["NOESIS_WS_PORT"] = str(int(args.ws_port))
-            ws_server.port = int(args.ws_port)
-            logger.warning(
-                "Retrying WebSocket server start on fallback port %s (attempt %s/%s)",
-                args.ws_port,
-                retry_idx + 1,
-                ws_bind_retry_tries,
+    try:
+        ws_thread, ws_loop = _start_websocket_server(ws_server)
+    except WebSocketStartupError as exc:
+        if not exc.receipt.quiesced:
+            logger.critical(
+                "WebSocket startup cleanup was not proven; refusing normal return"
             )
-            ws_thread, ws_loop = _start_websocket_server(ws_server)
-            if getattr(ws_server, "server", None) is not None:
-                break
-        if getattr(ws_server, "server", None) is None:
-            logger.error("WebSocket server failed to start after retries; aborting DS9 runtime")
-            return 1
+            runtime_state["pipeline_failed"] = True
+            _arm_shutdown_watchdog()
+            while True:
+                signal.pause()
+        logger.error("WebSocket server failed bounded startup: %s", exc)
+        return _abort_startup("websocket_startup_failed")
+    ws_owner = (ws_thread, ws_loop)
+    startup_transaction.acquire(
+        "websocket_listener",
+        lambda: ws_owner,
+        lambda owner: _stop_websocket_server(ws_server, owner[0], owner[1]),
+        ingress=True,
+    )
+    if getattr(ws_server, "server", None) is None:
+        logger.error(
+            "WebSocket server failed to bind required endpoint %s:%s; aborting DS9 runtime",
+            args.ws_host,
+            args.ws_port,
+        )
+        return _abort_startup("websocket_listener_missing")
+    if shutdown_event.is_set():
+        return _abort_startup("shutdown_requested_before_activation")
 
     # Activate the DS9 pipeline after prepare() using activate() not start()
     # NOTE: We use activate() because prepare() was already called above.
     # Using start() after prepare() causes "Tried to add new watch while one was already there"
     # because start() internally calls prepare() + sets bus watch, conflicting with existing watch.
+    try:
+        startup_transaction.bind(
+            "servicemaker_stdin_keepalive",
+            lambda: _install_servicemaker_stdin_keepalive(logger),
+            _close_servicemaker_stdin_keepalive,
+        )
+    except StartupResourceRegistrationError:
+        raise
+    except Exception:
+        logger.exception("Failed to establish Service Maker stdin lifecycle contract")
+        return _abort_startup("servicemaker_stdin_contract_failed")
+    if shutdown_event.is_set():
+        return _abort_startup("shutdown_requested_before_activation")
+    startup_transaction.mark_activation_attempted()
     if not ds8_pipeline.activate():
         logger.error("DS9 pipeline activation failed: %s", pipeline.errors)
-        return 1
+        _abort_ambiguous_and_wait("pipeline_activation_failed")
     ds = getattr(pipeline, "ds_pipeline", None)
     if ds is None:
         logger.error("DS9 pipeline activated but ds_pipeline is missing")
-        return 1
+        _abort_ambiguous_and_wait("activated_pipeline_owner_missing")
     logger.info("DS9 pipeline activated successfully")
 
     # Start pyservicemaker wait loop to keep pipeline alive and processing events
     # This is critical - without wait(), the pipeline may stop after initial buffers
     wait_thread = _start_pyservicemaker_wait_loop(ds, shutdown_event, logger, runtime_state)
+    try:
+        startup_transaction.claim_wait_owner(wait_thread)
+    except StartupOwnershipAmbiguous as exc:
+        logger.critical("Service Maker wait ownership was not proven")
+        _preserve_ambiguous_and_wait("servicemaker_wait_owner_missing", exc)
+    startup_transaction.handoff_to_runtime()
+    startup_main_guard.disarm()
 
-    # Start WebRTC gateway(s) if enabled (requires RTSP output)
-    webrtc_gateways = []
-    if mosaic_webrtc_enabled:
-        if rtsp_built:
+    source_progress_monitor = getattr(pipeline, "source_progress_monitor", None)
+    if source_progress_monitor is None:
+        logger.critical(
+            "Canonical per-source pipeline has no decoded-progress monitor"
+        )
+        runtime_state["pipeline_failed"] = True
+        runtime_state["source_progress_failure"] = {
+            "reason": "monitor_missing"
+        }
+        shutdown_event.set()
+    else:
+        def _source_progress_fatal(failure: Any) -> None:
+            failure_payload = (
+                failure.to_dict()
+                if hasattr(failure, "to_dict")
+                else {"reason": str(failure)}
+            )
+            runtime_state["source_progress_failure"] = failure_payload
+            runtime_state["pipeline_failed"] = True
+            logger.critical(
+                "Decoded/dewarped source progress exhausted bounded recovery; "
+                "terminating DS9 for supervisor-owned restart: %s",
+                failure,
+            )
+            shutdown_event.set()
+
+        try:
+            source_progress_monitor.start(_source_progress_fatal)
+            logger.info("Decoded/dewarped source progress monitor started")
+        except Exception:
+            logger.exception("Decoded/dewarped source progress monitor failed to start")
+            runtime_state["pipeline_failed"] = True
+            runtime_state["source_progress_failure"] = {
+                "reason": "monitor_start_failed"
+            }
+            shutdown_event.set()
+
+    try:
+        hooks.verify_analytics_exclusion_initial_receipt(
+            pipeline,
+            analytics_startup_reload_context,
+        )
+    except Exception:
+        logger.exception("Native analytics exclusion startup receipt validation failed")
+        runtime_state["pipeline_failed"] = True
+        shutdown_event.set()
+
+    # Start WebRTC gateway(s) if enabled (consumes encoded AUs via SHM bridge).
+    mosaic_h264_feeder = None
+    if mosaic_webrtc_enabled and not shutdown_event.is_set():
+        if not mosaic_shm_built:
+            logger.error(
+                "WebRTC gateway enabled but mosaic H.264 SHM sink was not built; cannot start gateway"
+            )
+            runtime_state["pipeline_failed"] = True
+            shutdown_event.set()
+        else:
             try:
-                ready = _wait_for_rtsp_ready("127.0.0.1", rtsp_port, timeout=15.0, interval=0.2)
-                if not ready:
-                    logger.error("RTSP sink not ready on 127.0.0.1:%s; skipping WebRTC gateway start", rtsp_port)
-                    #region agent log
-                    try:
-                        with _agent_debug_log_path().open("a", encoding="utf-8") as _f:
-                            _f.write(
-                                json.dumps(
-                                    {
-                                        "sessionId": "debug-session",
-                                        "runId": "run1",
-                                        "hypothesisId": "H2",
-                                        "location": "ds9_runtime_core.py:main",
-                                        "message": "gateway skipped - rtsp not ready",
-                                        "data": {"host": "127.0.0.1", "port": rtsp_port},
-                                        "timestamp": int(time.time() * 1000),
-                                    }
-                                )
-                                + "\n"
-                            )
-                    except Exception:
-                        pass
-                    #endregion
-                else:
-                    from noesis.mosaic_webrtc_gateway import MosaicWebRTCGateway
+                from noesis.mosaic_h264_bridge import MosaicH264ShmFeeder
+                from noesis.mosaic_webrtc_gateway import MosaicWebRTCGateway
 
-                    rtsp_uri = f"rtsp://127.0.0.1:{rtsp_port}/{rtsp_path}"
-                    try:
-                        max_webrtc_clients = max(1, int(os.environ.get("NOESIS_MOSAIC_WEBRTC_MAX_CLIENTS", "5")))
-                    except Exception:
-                        max_webrtc_clients = 5
-                    rtsp_keyframe_requester = _build_rtsp_keyframe_requester(pipeline, logger)
-                    if rtsp_keyframe_requester is None:
-                        logger.debug("RTSP keyframe requester unavailable; falling back to natural IDR cadence")
-                    for slot in range(max_webrtc_clients):
-                        try:
-                            gateway = MosaicWebRTCGateway(
-                                ws_server=ws_server,
-                                rtsp_uri=rtsp_uri,
-                                request_rtsp_keyframe=rtsp_keyframe_requester,
-                            )
-                            gateway.start()
-                            webrtc_gateways.append(gateway)
-                            logger.info(
-                                "WebRTC gateway slot %d/%d started, consuming RTSP at %s",
-                                slot + 1,
-                                max_webrtc_clients,
-                                rtsp_uri,
-                            )
-                        except Exception:
-                            logger.exception("Failed to start WebRTC gateway slot %d", slot + 1)
-                    logger.info(
-                        "WebRTC gateway capacity: %d active slot(s)",
-                        len(webrtc_gateways),
+                try:
+                    max_webrtc_clients = max(
+                        1, int(os.environ.get("NOESIS_MOSAIC_WEBRTC_MAX_CLIENTS", "5"))
                     )
-                    #region agent log
+                except Exception:
+                    max_webrtc_clients = 5
+                try:
+                    initial_webrtc_clients = max(
+                        0, int(os.environ.get("NOESIS_MOSAIC_WEBRTC_INITIAL_CLIENTS", "1"))
+                    )
+                except Exception:
+                    initial_webrtc_clients = 1
+                initial_webrtc_clients = min(initial_webrtc_clients, max_webrtc_clients)
+
+                def _keyframe_failed(error: BaseException) -> None:
+                    message = f"mosaic_force_idr_failed:{type(error).__name__}:{error}"
+                    if message not in pipeline.errors:
+                        pipeline.errors.append(message)
+                    runtime_state["pipeline_failed"] = True
+                    shutdown_event.set()
+
+                def _mosaic_transport_failed(error: BaseException) -> None:
+                    message = (
+                        "mosaic_h264_shm_failed:"
+                        f"{type(error).__name__}:{error}"
+                    )
+                    if message not in pipeline.errors:
+                        pipeline.errors.append(message)
+                    runtime_state["pipeline_failed"] = True
+                    shutdown_event.set()
+
+                keyframe_requester = _build_mosaic_keyframe_requester(
+                    pipeline,
+                    logger,
+                    failure_callback=_keyframe_failed,
+                )
+                if keyframe_requester is None:
+                    raise RuntimeError(
+                        "WebRTC late-viewer support requires a mosaic force-IDR requester"
+                    )
+
+                mosaic_h264_feeder = MosaicH264ShmFeeder(
+                    mosaic_h264_shm_socket,
+                    request_keyframe=keyframe_requester,
+                    on_fatal_error=_mosaic_transport_failed,
+                )
+                mosaic_h264_feeder.start()
+                logger.info(
+                    "Mosaic H.264 SHM feeder started at %s",
+                    mosaic_h264_shm_socket,
+                )
+
+                def _create_mosaic_gateway() -> MosaicWebRTCGateway:
+                    gateway = MosaicWebRTCGateway(
+                        ws_server=ws_server,
+                        h264_feeder=mosaic_h264_feeder,
+                        request_keyframe=keyframe_requester,
+                    )
                     try:
-                        with _agent_debug_log_path().open("a", encoding="utf-8") as _f:
-                            _f.write(
-                                json.dumps(
-                                    {
-                                        "sessionId": "debug-session",
-                                        "runId": "run1",
-                                        "hypothesisId": "H4",
-                                        "location": "ds9_runtime_core.py:main",
-                                        "message": "gateway started",
-                                        "data": {"rtsp_uri": rtsp_uri, "slots": len(webrtc_gateways)},
-                                        "timestamp": int(time.time() * 1000),
-                                    }
-                                )
-                                + "\n"
-                            )
+                        gateway.start()
                     except Exception:
-                        pass
-                    #endregion
+                        try:
+                            gateway.stop()
+                        except Exception:
+                            logger.exception(
+                                "Partially started WebRTC gateway did not quiesce"
+                            )
+                        raise
+                    logger.info("WebRTC gateway started (H.264 AU feeder)")
+                    return gateway
+
+                ws_server.register_webrtc_gateway_factory(
+                    _create_mosaic_gateway,
+                    max_clients=max_webrtc_clients,
+                    initial_clients=initial_webrtc_clients,
+                )
+                for slot in range(initial_webrtc_clients):
+                    gateway = None
+                    try:
+                        gateway = _create_mosaic_gateway()
+                        ws_server.register_webrtc_gateway(gateway)
+                    except Exception:
+                        if gateway is not None:
+                            try:
+                                gateway.stop()
+                            except Exception:
+                                logger.exception(
+                                    "Unregistered WebRTC gateway slot %d did not stop",
+                                    slot + 1,
+                                )
+                        logger.exception("Failed to start WebRTC gateway slot %d", slot + 1)
+                        runtime_state["pipeline_failed"] = True
+                        shutdown_event.set()
+                logger.info(
+                    "WebRTC gateway capacity: %d max, %d warm slot(s)",
+                    max_webrtc_clients,
+                    len(ws_server.webrtc_gateways),
+                )
             except Exception:
                 logger.exception("Failed to start WebRTC gateway")
-        else:
-            logger.error("WebRTC gateway enabled but RTSP branch was not built; cannot start gateway")
+                runtime_state["pipeline_failed"] = True
+                shutdown_event.set()
 
     depth_branch_present = bool(pipeline.depth_gate_attach and pipeline.depth_gate_attach in pipeline.components)
     if args.depth_enable_seconds > 0:
         if depth_branch_present:
             try:
-                ds8_pipeline.enable_depth(seconds=args.depth_enable_seconds)
+                depth_controller = getattr(pipeline, "capture_event_controller", None)
+                if not isinstance(depth_controller, CaptureEventController):
+                    raise RuntimeError("capture-event depth controller is unavailable")
+                depth_controller.start_refresh(args.depth_enable_seconds)
                 logger.info(
                     "Depth branch enabled for %s seconds (startup burst)",
                     args.depth_enable_seconds,
                 )
             except Exception:
                 logger.exception("Failed to enable depth burst on startup")
+                runtime_state["pipeline_failed"] = True
+                shutdown_event.set()
         else:
-            logger.info(
-                "Depth startup enable skipped (no MapAnything branch present)"
-            )
+            logger.error("Requested startup depth burst but no MapAnything branch is present")
+            runtime_state["pipeline_failed"] = True
+            shutdown_event.set()
     if not getattr(pipeline, "activated", False):
         logger.warning("DS9 pipeline not activated; check pipeline.errors for details: %s", pipeline.errors)
 
     rest_server = None
     rest_thread = None
 
-    if args.enable_rest:
+    if args.enable_rest and not shutdown_event.is_set():
         try:
-            from noesis.server import analytics_api
-
-            analytics_cfg_path = REPO_ROOT / "config" / "nvdsanalytics.yaml"
-            os.environ.setdefault(analytics_api.ANALYTICS_CONFIG_ENV, str(analytics_cfg_path))
-        except Exception:
-            pass
-        rest_app = prebuilt_rest_app if prebuilt_rest_app is not None else _build_rest_app()
-        rest_server, rest_thread = _start_rest_server(rest_app, args.rest_host, args.rest_port)
-        if rest_server:
+            if prebuilt_rest_app is None:
+                raise RuntimeError("required prebuilt DS9 REST app is unavailable")
+            rest_app = prebuilt_rest_app
+            depth_controller = getattr(pipeline, "capture_event_controller", None)
+            if not isinstance(depth_controller, CaptureEventController):
+                raise RuntimeError("capture-event depth controller is unavailable")
+            rest_app.state.depth_refresh_provider = depth_controller.start_refresh
+            rest_app.state.depth_storage = storage_manager
+            rest_server, rest_thread = _start_rest_server(rest_app, args.rest_host, args.rest_port)
             logger.info("REST server listening on http://%s:%s", args.rest_host, args.rest_port)
+        except RestStartupError as exc:
+            runtime_state["rest_startup_receipt"] = {
+                "cleanup_proven": exc.cleanup_proven,
+                "thread_alive": exc.thread.is_alive(),
+            }
+            if not exc.cleanup_proven:
+                logger.critical(
+                    "REST startup ownership is unresolved; preserving callback-owned "
+                    "resources until watchdog exit",
+                    exc_info=True,
+                )
+                runtime_state["pipeline_failed"] = True
+                _arm_shutdown_watchdog()
+                while True:
+                    signal.pause()
+            logger.exception("Required REST server failed bounded startup")
+            runtime_state["pipeline_failed"] = True
+            shutdown_event.set()
+        except Exception:
+            logger.exception("Required REST server failed to start")
+            runtime_state["pipeline_failed"] = True
+            shutdown_event.set()
 
-    # Re-assert SIGTERM default behavior after DS/GStreamer initialization.
+    # DeepStream dependencies may replace handlers during initialization.
     try:
-        signal.signal(signal.SIGTERM, signal.SIG_DFL)
+        signal.signal(signal.SIGTERM, _signal_handler)
     except Exception:
         pass
 
     logger.info("DS9 runtime is active. Press Ctrl+C to stop.")
-
-    # Spawn a heartbeat logger to confirm liveness while waiting/processing
-    def _heartbeat() -> None:
-        for i in range(6):
-            time.sleep(3)
-            try:
-                with _agent_debug_log_path().open("a", encoding="utf-8") as _f:
-                    _f.write(
-                        json.dumps(
-                            {
-                                "sessionId": "debug-session",
-                                "runId": "run1",
-                                "hypothesisId": "H1",
-                                "location": "ds9_runtime_core.py:main",
-                                "message": "heartbeat",
-                                "data": {"tick": i + 1},
-                                "timestamp": int(time.time() * 1000),
-                            }
-                        )
-                        + "\n"
-                    )
-            except Exception:
-                pass
-
-    threading.Thread(target=_heartbeat, name="DS9-Heartbeat", daemon=True).start()
     try:
         while not shutdown_event.is_set():
             time.sleep(0.5)
@@ -5104,64 +6213,490 @@ def main() -> int:
         shutdown_event.set()
 
     logger.info("Shutting down DS9 runtime")
-    try:
-        pipeline.mark_depth_enabled(False)
-    except Exception:
-        pass
+    _arm_shutdown_watchdog()
+    runtime_state["expected_eos"] = True
+    if wait_thread is None or wait_thread.is_alive():
+        runtime_state["pipeline_eos_reason"] = "shutdown_requested"
+
+    source_progress_receipt = {
+        "present": source_progress_monitor is not None,
+        "quiesced": source_progress_monitor is None,
+        "fatal": False,
+    }
+    if source_progress_monitor is not None:
+        try:
+            source_progress_receipt = source_progress_monitor.stop(
+                timeout_seconds=3.0
+            )
+        except Exception:
+            logger.exception("Decoded source progress monitor shutdown failed")
+            source_progress_receipt = {
+                "present": True,
+                "quiesced": False,
+                "fatal": True,
+            }
+    runtime_state["source_progress_shutdown_receipt"] = source_progress_receipt
+    if not bool(source_progress_receipt.get("quiesced")):
+        runtime_state["pipeline_failed"] = True
+        logger.error("Decoded source progress monitor did not quiesce")
+
+    # Quiesce external request/consumer edges before touching native producers.
+    # The retained lock is intentionally not released: it is the shutdown lease
+    # that prevents a late REST worker from entering an analytics transaction.
+    rest_shutdown_receipt = _stop_rest_server(
+        rest_server,
+        rest_thread,
+        analytics_api._CONFIG_LOCK,  # type: ignore[attr-defined]
+    )
+    runtime_state["rest_shutdown_receipt"] = {
+        **rest_shutdown_receipt._asdict(),
+        "quiesced": rest_shutdown_receipt.quiesced,
+    }
+    if not rest_shutdown_receipt.quiesced:
+        runtime_state["pipeline_failed"] = True
+        logger.critical(
+            "REST/analytics quiescence was not proven "
+            "(rest_pair_consistent=%s stop_requested=%s server_thread_stopped=%s "
+            "analytics_transaction_lock_retained=%s); preserving callback-owned "
+            "native resources until watchdog exit",
+            rest_shutdown_receipt.rest_pair_consistent,
+            rest_shutdown_receipt.stop_requested,
+            rest_shutdown_receipt.server_thread_stopped,
+            rest_shutdown_receipt.analytics_transaction_lock_retained,
+        )
+        while True:
+            signal.pause()
 
     try:
-        storage_manager.flush(timeout=5.0)
-    except Exception:
-        pass
-    try:
-        storage_manager.shutdown(wait=True)
-    except Exception:
-        pass
-    try:
-        if diagnostics_logger is not None:
-            diagnostics_logger.close()
-    except Exception:
-        logger.exception("Error closing diagnostics logger")
+        stats_shutdown_receipt = ws_server.quiesce_stats_collector(
+            timeout_s=WebSocketServer.STATS_COLLECTOR_DRAIN_TIMEOUT_S
+        )
+    except Exception as exc:
+        failed_receipt = getattr(exc, "receipt", None)
+        if failed_receipt is not None and hasattr(failed_receipt, "_asdict"):
+            runtime_state["ws_stats_shutdown_receipt"] = {
+                **failed_receipt._asdict(),
+                "quiesced": False,
+            }
+        runtime_state["pipeline_failed"] = True
+        logger.critical(
+            "WebSocket stats collector did not quiesce; preserving native "
+            "resources until watchdog exit: %s",
+            exc,
+        )
+        while True:
+            signal.pause()
+    runtime_state["ws_stats_shutdown_receipt"] = {
+        **stats_shutdown_receipt._asdict(),
+        "quiesced": stats_shutdown_receipt.quiesced,
+    }
 
-    _stop_rest_server(rest_server, rest_thread)
+    try:
+        provider_shutdown_receipt = ws_server.quiesce_blocking_providers(
+            timeout_s=5.0
+        )
+    except Exception as exc:
+        failed_receipt = getattr(exc, "receipt", None)
+        if failed_receipt is not None and hasattr(failed_receipt, "_asdict"):
+            runtime_state["ws_provider_shutdown_receipt"] = {
+                **failed_receipt._asdict(),
+                "quiesced": False,
+            }
+        runtime_state["pipeline_failed"] = True
+        logger.critical(
+            "Blocking WebSocket providers did not quiesce; preserving native "
+            "and storage resources until watchdog exit: %s",
+            exc,
+        )
+        while True:
+            signal.pause()
+    runtime_state["ws_provider_shutdown_receipt"] = {
+        **provider_shutdown_receipt._asdict(),
+        "quiesced": provider_shutdown_receipt.quiesced,
+    }
 
-    # Stop WebRTC gateways if running
-    if webrtc_gateways:
-        for idx, gateway in enumerate(webrtc_gateways, start=1):
+    try:
+        detached_gateways = ws_server.begin_webrtc_shutdown(timeout_s=5.0)
+    except Exception:
+        runtime_state["pipeline_failed"] = True
+        logger.exception("WebRTC gateway admission/lifecycle drain failed")
+        while True:
+            signal.pause()
+
+    gateways_to_stop: List[Any] = []
+    for gateway in list(detached_gateways):
+        if gateway is not None and gateway not in gateways_to_stop:
+            gateways_to_stop.append(gateway)
+    gateways_quiesced = True
+    gateway_executor: Optional[concurrent.futures.ThreadPoolExecutor] = None
+    if gateways_to_stop:
+        gateway_executor = concurrent.futures.ThreadPoolExecutor(
+            max_workers=len(gateways_to_stop),
+            thread_name_prefix="NoesisWebRTCStop",
+        )
+        gateway_futures = {
+            gateway_executor.submit(gateway.stop): idx
+            for idx, gateway in enumerate(gateways_to_stop, start=1)
+        }
+        done, pending = concurrent.futures.wait(
+            gateway_futures,
+            timeout=WebSocketServer.WEBRTC_GATEWAY_DRAIN_TIMEOUT_S,
+        )
+        for future in done:
+            idx = gateway_futures[future]
             try:
-                gateway.stop()
+                future.result()
                 logger.info("WebRTC gateway slot %d stopped", idx)
             except Exception:
                 logger.exception("Error stopping WebRTC gateway slot %d", idx)
+                gateways_quiesced = False
+        if pending:
+            logger.error(
+                "WebRTC gateway slots exceeded concurrent drain timeout: %s",
+                sorted(gateway_futures[future] for future in pending),
+            )
+            gateways_quiesced = False
+        gateway_executor.shutdown(
+            wait=not pending,
+            cancel_futures=False,
+        )
+    if not gateways_quiesced:
+        runtime_state["pipeline_failed"] = True
 
-    # Stop pyservicemaker pipeline and wait thread
-    if ds is not None:
-        stop_done = threading.Event()
+    if not gateways_quiesced:
+        logger.critical(
+            "WebRTC gateways did not quiesce; preserving native resources "
+            "until watchdog exit"
+        )
+        while True:
+            signal.pause()
 
-        def _stop_psm() -> None:
-            try:
-                ds.stop()
-                logger.info("pyservicemaker pipeline stopped")
-            except Exception:
-                logger.exception("Error stopping pyservicemaker pipeline")
-            finally:
-                stop_done.set()
+    if mosaic_h264_feeder is not None:
+        try:
+            mosaic_h264_feeder.stop()
+            logger.info("Mosaic H.264 SHM feeder stopped")
+        except Exception:
+            runtime_state["pipeline_failed"] = True
+            logger.exception("Failed to stop mosaic H.264 SHM feeder")
+            while True:
+                signal.pause()
 
-        threading.Thread(target=_stop_psm, name="DS9-StopPipeline", daemon=True).start()
-        if not stop_done.wait(timeout=5.0):
-            logger.warning("pyservicemaker pipeline stop timed out; continuing shutdown")
+    ws_server.webrtc_activity_callback = None
 
+    try:
+        _stop_websocket_server(ws_server, ws_thread, ws_loop)
+    except Exception:
+        runtime_state["pipeline_failed"] = True
+        logger.exception("WebSocket listener/worker quiescence failed")
+        while True:
+            signal.pause()
+    runtime_state["websocket_shutdown_quiesced"] = True
+
+    try:
+        pipeline.cancel_control_timers()
+        pipeline.mark_depth_enabled(False)
+    except Exception:
+        runtime_state["pipeline_failed"] = True
+        logger.exception("Failed to quiesce pipeline control timers")
+        while True:
+            signal.pause()
+
+    try:
+        publication_receipt = runtime_publication_gate.close_and_wait(
+            timeout_s=5.0
+        )
+        runtime_state["runtime_publication_shutdown_receipt"] = (
+            publication_receipt.to_dict()
+        )
+        logger.info(
+            "Native runtime publication callbacks quiesced: "
+            "admitted=%d completed=%d rejected=%d active=%d",
+            publication_receipt.admitted,
+            publication_receipt.completed,
+            publication_receipt.rejected,
+            publication_receipt.active,
+        )
+    except RuntimePublicationQuiescenceError as exc:
+        runtime_state["runtime_publication_shutdown_receipt"] = (
+            exc.receipt.to_dict()
+        )
+        runtime_state["pipeline_failed"] = True
+        logger.critical(
+            "Native runtime publication callbacks did not quiesce; "
+            "preserving WebSocket and native resources until watchdog exit: %s",
+            exc,
+        )
+        while True:
+            signal.pause()
+    except Exception:
+        runtime_state["pipeline_failed"] = True
+        logger.exception("Native runtime publication gate shutdown failed")
+        while True:
+            signal.pause()
+
+    # The live-source reconnect probe inside nvurisrcbin intentionally drops
+    # pipeline-level EOS.  Request EOS from the repo-owned bridge immediately
+    # downstream of streammux; it emits asynchronously after Service Maker has
+    # released setter locks.  Require its exact bounded acknowledgement, the
+    # pipeline EOS callback, and wait-thread completion before releasing any
+    # callback-owned resources.
+    wait_was_alive = bool(wait_thread is not None and wait_thread.is_alive())
+    eos_accepted = False
+    if wait_was_alive:
+        try:
+            logger.info("Orderly pipeline EOS request initiated")
+            eos_evidence = request_orderly_eos(pipeline)
+            eos_accepted = True
+            logger.info(
+                "Orderly pipeline EOS accepted: component=%s request_sequence=%d",
+                eos_evidence.component_name,
+                eos_evidence.request_sequence,
+            )
+        except OrderlyEosError:
+            logger.exception("Orderly pipeline EOS request failed")
+            runtime_state["pipeline_failed"] = True
+    else:
+        eos_accepted = bool(runtime_state.get("pipeline_eos_seen"))
+
+    wait_completed = wait_thread is not None and not wait_thread.is_alive()
     if wait_thread is not None and wait_thread.is_alive():
         try:
-            wait_thread.join(timeout=3.0)
-            if wait_thread.is_alive():
-                logger.warning("Wait thread did not terminate cleanly")
+            wait_thread.join(timeout=15.0)
+            wait_completed = not wait_thread.is_alive()
+            if not wait_completed:
+                logger.error("pyservicemaker wait thread did not terminate")
         except Exception:
+            wait_completed = False
             logger.exception("Error joining wait thread")
 
-    _stop_websocket_server(ws_server, ws_thread, ws_loop)
+    eos_seen = bool(runtime_state.get("pipeline_eos_seen"))
+    wait_failed = bool(runtime_state.get("wait_failed"))
+    pipeline_quiesced = bool(
+        eos_accepted and eos_seen and wait_completed and not wait_failed
+    )
+    if not pipeline_quiesced:
+        runtime_state["pipeline_failed"] = True
+        logger.error(
+            "Pipeline quiescence was not proven "
+            "(eos_accepted=%s eos_seen=%s wait_completed=%s wait_failed=%s); "
+            "preserving callback-owned resources until watchdog exit",
+            eos_accepted,
+            eos_seen,
+            wait_completed,
+            wait_failed,
+        )
+    else:
+        capture_controller = getattr(pipeline, "capture_event_controller", None)
+        capture_event_quiesced = capture_controller is None
+        if capture_controller is not None:
+            try:
+                capture_controller.shutdown(timeout_s=5.0)
+                capture_health = capture_controller.health_snapshot()
+                manual_health = capture_health.get("manual_refresh", {})
+                capture_event_quiesced = bool(
+                    manual_health.get("phase") == "shutdown"
+                    and not manual_health.get("active")
+                    and not manual_health.get("thread_alive")
+                    and not capture_health.get("shared_gate_owned")
+                )
+            except Exception:
+                runtime_state["pipeline_failed"] = True
+                logger.exception("Capture-event controller shutdown failed")
+                capture_event_quiesced = False
+        runtime_state["capture_event_shutdown_receipt"] = {
+            "present": capture_controller is not None,
+            "quiesced": capture_event_quiesced,
+        }
+        logger.info(
+            "Capture-event controller shutdown quiesced: present=%d quiesced=%d",
+            int(capture_controller is not None),
+            int(capture_event_quiesced),
+        )
+        if not capture_event_quiesced:
+            logger.critical(
+                "Capture-event gate ownership remains unresolved; preserving "
+                "MapAnything and storage resources until watchdog exit"
+            )
+            while True:
+                signal.pause()
 
-    logger.info("Shutdown complete")
+        mapanything_processor = getattr(pipeline, "mapanything_processor", None)
+        mapanything_quiesced = mapanything_processor is None
+        if mapanything_processor is not None:
+            try:
+                shutdown_mapanything = getattr(mapanything_processor, "shutdown", None)
+                if not callable(shutdown_mapanything):
+                    raise RuntimeError(
+                        "MapAnything processor has no owned shutdown contract"
+                    )
+                shutdown_mapanything(wait=True, timeout_s=5.0)
+                mapanything_quiesced = True
+            except Exception:
+                runtime_state["pipeline_failed"] = True
+                logger.exception("MapAnything postprocess shutdown failed")
+                quiescence_check = getattr(
+                    mapanything_processor,
+                    "async_shutdown_quiesced",
+                    None,
+                )
+                try:
+                    mapanything_quiesced = bool(
+                        callable(quiescence_check) and quiescence_check()
+                    )
+                except Exception:
+                    logger.exception(
+                        "MapAnything postprocess quiescence proof failed"
+                    )
+                    mapanything_quiesced = False
+        runtime_state["mapanything_shutdown_receipt"] = {
+            "present": mapanything_processor is not None,
+            "quiesced": mapanything_quiesced,
+        }
+        logger.info(
+            "MapAnything source workers shutdown quiesced: "
+            "present=%d quiesced=%d",
+            int(mapanything_processor is not None),
+            int(mapanything_quiesced),
+        )
+        if not mapanything_quiesced:
+            logger.critical(
+                "MapAnything worker ownership remains unresolved; preserving "
+                "storage and callback resources until watchdog exit"
+            )
+            while True:
+                signal.pause()
+
+        publication_final_receipt = runtime_publication_gate.snapshot()
+        runtime_state["runtime_publication_final_receipt"] = (
+            publication_final_receipt.to_dict()
+        )
+        if not publication_final_receipt.quiesced:
+            runtime_state["pipeline_failed"] = True
+            logger.critical(
+                "Native runtime publication gate lost quiescence after EOS"
+            )
+            while True:
+                signal.pause()
+        logger.info(
+            "Native runtime publication shutdown finalized: "
+            "admitted=%d completed=%d rejected=%d active=%d",
+            publication_final_receipt.admitted,
+            publication_final_receipt.completed,
+            publication_final_receipt.rejected,
+            publication_final_receipt.active,
+        )
+
+        runtime_finalization_failures: list[dict[str, str]] = []
+
+        def _record_finalization_failure(
+            name: str,
+            error: BaseException,
+        ) -> None:
+            runtime_state["pipeline_failed"] = True
+            runtime_finalization_failures.append(
+                {
+                    "name": str(name),
+                    "error_type": type(error).__name__,
+                }
+            )
+
+        try:
+            _close_servicemaker_stdin_keepalive()
+        except BaseException as exc:
+            logger.exception("Service Maker stdin ownership did not close")
+            _record_finalization_failure("servicemaker_stdin_keepalive", exc)
+
+        try:
+            mgr = getattr(pipeline, "stable_id_mgr", None)
+            if mgr is not None and getattr(mgr, "gallery_persist_file", None):
+                if not mgr.save_gallery():
+                    raise RuntimeError("StableID gallery save returned false")
+                logger.info(
+                    "StableID gallery persisted to %s",
+                    mgr.gallery_persist_file,
+                )
+        except BaseException as exc:
+            logger.exception("Error persisting StableID gallery")
+            _record_finalization_failure("stable_id_gallery", exc)
+
+        try:
+            identity_v2_service = getattr(pipeline, "identity_v2_service", None)
+            if identity_v2_service is not None:
+                identity_v2_service.close()
+        except BaseException as exc:
+            logger.exception("Failed to close identity-v2 store")
+            _record_finalization_failure("identity_v2", exc)
+
+        try:
+            world_service.close()
+        except BaseException as exc:
+            logger.exception("Failed to flush canonical world journal")
+            _record_finalization_failure("canonical_world", exc)
+
+        try:
+            storage_shutdown_receipt = close_depth_storage(
+                storage_manager,
+                timeout_s=5.0,
+            )
+            runtime_state["depth_storage_shutdown_receipt"] = storage_close_evidence(
+                storage_shutdown_receipt
+            )
+        except BaseException as exc:
+            logger.exception("Depth storage ownership did not quiesce")
+            _record_finalization_failure("depth_storage", exc)
+
+        try:
+            if diagnostics_logger is not None:
+                diagnostics_logger.close()
+        except BaseException as exc:
+            logger.exception("Error closing diagnostics logger")
+            _record_finalization_failure("tracking_diagnostics", exc)
+
+        for binding_name, clear_binding in (
+            ("analytics_runtime_hooks", analytics_api.clear_runtime_hooks),
+            ("reid_api_binding", reid_api.clear_reid_manager_getter),
+            ("identity_v2_api_bindings", reid_v2_api.clear_identity_v2_bindings),
+            ("health_api_bindings", health_api.clear_runtime_bindings),
+        ):
+            try:
+                clear_binding()
+            except BaseException as exc:
+                logger.exception("Runtime binding cleanup failed: %s", binding_name)
+                _record_finalization_failure(binding_name, exc)
+
+        if not runtime_finalization_failures:
+            try:
+                startup_transaction.mark_quiesced()
+            except BaseException as exc:
+                logger.exception("Runtime ownership finalization failed")
+                _record_finalization_failure("startup_transaction", exc)
+
+        runtime_state["runtime_finalization_failures"] = list(
+            runtime_finalization_failures
+        )
+        if runtime_finalization_failures:
+            logger.critical(
+                "Runtime finalization was not proven; waiting for shutdown watchdog: %s",
+                [row["name"] for row in runtime_finalization_failures],
+            )
+            while True:
+                signal.pause()
+
+        try:
+            signal.alarm(0)
+        except BaseException as exc:
+            logger.exception("Shutdown watchdog cancellation failed")
+            _record_finalization_failure("shutdown_watchdog", exc)
+            runtime_state["runtime_finalization_failures"] = list(
+                runtime_finalization_failures
+            )
+            while True:
+                signal.pause()
+        logger.info("Shutdown complete")
+    if not pipeline_quiesced:
+        logger.critical("Native pipeline teardown failed; waiting for shutdown watchdog")
+        while True:
+            signal.pause()
     fatal_errors: List[Any] = []
     try:
         for err in getattr(pipeline, "errors", []) or []:
@@ -5175,6 +6710,11 @@ def main() -> int:
     if runtime_state.get("pipeline_failed") or fatal_errors:
         exit_code = 1
     return exit_code
+
+
+def main() -> int:
+    startup_main_guard = StartupMainGuard()
+    return startup_main_guard.run(lambda: _run_main(startup_main_guard))
 
 
 if __name__ == "__main__":

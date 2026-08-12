@@ -11,9 +11,13 @@ and worklogs live in `docs/history/`.
   `DS8_metadata_contracts.md`, `Telemetry_Schema.md`
 - **WebSocket overview:** `WebSocket_API.md`
 - **Testing:** `DS8_testing_guide.md`
+- **YOLO26-seg engine maintenance:** `DS8_yolo26_seg_engine_maintenance.md`
+- **Runtime secrets:** `Runtime_Secrets.md`
 - **Codebase overview:** `CODEBASE_DESCRIPTION.md`
 - **V3DT forensics & calibration:** `DS8_v3dt_forensics.md`
-- **Depth / MapAnything:** `MapAnything_Depth.md`, `MapAnything_Heatmap_Viewer.md`, `DEPTH_STACK_FLOW_V2.md`, `depth_metadata.md`
+- **Depth (DAv2 + MapAnything):** `depth_metadata.md`,
+  `DEPTH_STACK_FLOW_V2.md`, `MapAnything_Depth.md`,
+  `MapAnything_Heatmap_Viewer.md`
 - **Virtual twin reconstruction:** `Virtual_Twin_Reconstruction.md`
 - **Phone-walk fusion reconstruction:** `Phone_Walk_Fusion_Reconstruction.md`
 - **Archived references:** see `history/` (archived)
@@ -46,6 +50,243 @@ and worklogs live in `docs/history/`.
 - Documented the validated DA3-conditioned MapAnything phone-walk fusion,
   static-camera authority boundary, retained evidence, and repeatable workflow
   for reconstructing additional rooms (`Phone_Walk_Fusion_Reconstruction.md`).
+
+## Doc changes (2026-08-02)
+- Defined Scene Prior standalone previews as calibration-derived,
+  reference-camera-facing review artifacts while preserving the canonical
+  backend-world grid (`scene_prior_v1.md`).
+
+## Doc changes (2026-07-24)
+- Corrected MapAnything ray-to-floorplan alignment to fit only observed
+  depth-floor contacts while keeping the authored calibration floor distinct
+  from the AGL-corrected depth floor (`MapAnything_Depth.md`).
+- Joined canonical entity rooms to the existing per-object overcrowding
+  membership labels with exact, single-label, fail-closed resolution shared by
+  DS8/V3DT/DS9; camera-derived zones remain non-authoritative diagnostics
+  (`Occupancy_Publishing.md`, `DS8_metadata_contracts.md`,
+  `DS8_api_contracts_ws.md`).
+
+## Doc changes (2026-07-19)
+- Distinguished spatially authoritative nvdsanalytics ROI zones from
+  camera-name occupancy fallbacks in tracking observations and canonical world
+  source evidence; camera defaults can no longer become `room_id`
+  (`DS8_api_contracts_ws.md`, `DS8_testing_guide.md`).
+
+## Doc changes (2026-07-12)
+- Versioned the synchronous canonical world journal as storage contract v2:
+  exact legacy state is validated before one-time WAL/FULL migration, v2 mode
+  drift and retained-history corruption fail closed, and the three-source
+  cadence gate now covers 31 cycles with median and mean budgets while live
+  soaks own tail latency (`DS8_testing_guide.md`,
+  `plans/DS8/ds8_design_decisions.md`).
+- Made the canonical DS8/V3DT lifecycle canary safe for immutable-checkpoint
+  execution: a mandatory marked external private state cohort owns every
+  mutable runtime, calibration, identity, cache, and evidence path; secret
+  bytes never cross the launcher boundary; and sequential profiles may reuse
+  identity state without overwriting create-once evidence
+  (`DS8_testing_guide.md`, `plans/DS8/ds8_design_decisions.md`).
+- Defined and adversarially tightened the shared DS8/protected-V3DT/DS9
+  publication commit boundary: finite size/count-bounded JSON is encoded once
+  and immutably admitted, but one ordered tracking/world/event batch remains
+  behind a one-shot release gate until a synchronous exact-count journal
+  acknowledgement and private world commit. Commit failure aborts before any
+  client delivery and poisons the publisher; mutable fusion is no longer
+  public; canonical types never latest-only coalesce; and paired BEV carries a
+  typed exact tracking sequence/submission cohort. The queue also owns a 256 MiB
+  frozen-byte cap with zero-byte shutdown proof, and authenticated telemetry
+  fanout is hard-capped at 16 while health bypasses the set
+  (`DS8_api_contracts_ws.md`,
+  `DS8_testing_guide.md`, `Telemetry_Schema.md`,
+  `DS9/README.md`, `DS9/docs/migration_state.md`,
+  `DS9/docs/canonical_world.md`,
+  `DS9/docs/validation_runbook.md`,
+  `DS9/docs/bev_capture_event_integration.md`,
+  `DS9/docs/runtime_ownership.yaml`,
+  `plans/DS8/ds8_design_decisions.md`).
+- Replaced load-only DS9 MapAnything admission with a correctness-first FP32
+  transaction: a pinned batch-three real inference must seal finite/depth/mask/
+  distribution/batch evidence before installation, and finalization plus direct
+  realization reconciliation independently revalidate the receipt. The invalid
+  FP16 plan remains non-qualifying and fresh multi-camera runtime parity is
+  still open (`DS9/docs/MapAnything_Engine_Parity_Plan.md`,
+  `DS9/DS9_REBUILD_AND_SMOKE_GATES.md`, `DS9/docs/known_blockers.md`,
+  `plans/DS8/ds8_design_decisions.md`).
+- Superseded the unpromoted semantic-v2 draft with replayable semantic v3: an
+  exact persisted identity anchor may join independently scheduled pose,
+  registered depth, and backend-world frames only across 1.5 seconds of both
+  capture and observation time. Its source now seals an ownership-bound
+  acquisition interval, a fixed two-second pre-window capture-latency allowance,
+  all-frame acquisition and canonical publication-clock bounds,
+  window-contiguous but origin-unanchored live publication/lifecycle evidence,
+  first-frame-only unanchored tombstones followed by exact in-window
+  last-presence provenance, shared strict unique-key JSON, and marker-only
+  privacy failures. The neutral gate now serves baseline and V3DT; baseline
+  ReID promotion requires both identity and semantic evidence
+  (`DS8_api_contracts_ws.md`,
+  `DS8_metadata_contracts.md`, `DS8_testing_guide.md`,
+  `DS9/docs/runtime_ownership_evidence.md`).
+- Corrected the inline floorplan BEV contract: camera-local source/frame/time
+  identity is explicit, parity validation uses calibrated transforms instead of
+  cross-frame subtraction, and BEV health v2 distinguishes exact-frame
+  activity, pre-first-success inactivity, authority state, and actual failures.
+  Exact empty frames are active successes. The replayable DS9 floorplan gate is
+  v4 while retaining N/N configured-camera floorplan correctness
+  (`DS8_api_contracts_ws.md`, `Telemetry_Schema.md`, `DS8_testing_guide.md`,
+  `DS9/docs/bev_capture_event_integration.md`).
+
+## Doc changes (2026-07-11)
+- Reconciled the shared BEV/floorplan contract with implementation: first
+  authority absence is non-publishing `startup_pending`, post-ready loss is
+  fatal, exact empty frames are active successes, registered depth is coherent,
+  protected V3DT scales to calibration image size, and tracking-first BEV pairs
+  use the maximum effective interval with forced lifecycle/count transitions
+  (`DS8_api_contracts_ws.md`, `DS9/docs/bev_capture_event_integration.md`,
+  `DS9/docs/validation_runbook.md`).
+- Declared repository validation helpers as an explicit Python package so an
+  unrelated installed `scripts` distribution cannot shadow authenticated DS9
+  smoke clients in immutable checkouts (`DS9/README.md`,
+  `DS9/docs/validation_runbook.md`).
+- Replaced DS9 native mtime freshness guidance with pre-import content
+  attestation of all six extension source bundles, ABI filenames, and manifest
+  output hashes; documented the controlled rebuild evidence showing NVCC
+  binary nondeterminism (`DS9/README.md`, `DS9/docs/validation_runbook.md`,
+  `plans/DS8/ds8_design_decisions.md`).
+- Documented the shared exact capture-event transaction across DS8, V3DT, and
+  DS9: one owned MapAnything valve, cache-only zero-mutation reads, immutable
+  snapshot/floorplan identity, depth-only RGB evidence, active-floorplan local
+  BEV health, calibration-driven invalidation, and the replayable DS9
+  floorplan live-gate v2 (`MapAnything_Depth.md`,
+  `DS8_api_contracts_ws.md`, `Telemetry_Schema.md`,
+  `DS9/docs/bev_capture_event_integration.md`).
+- Defined `height_agl_meta.floor_offset_m` as the exact single bounded AGL
+  correction shared by both floorplan generators and added the focused
+  dual-path regression to the depth validation matrix (`MapAnything_Depth.md`,
+  `DS8_testing_guide.md`).
+- Made the DS8/V3DT/DS9 REST boundary metric wire-truthful: FastAPI now renders
+  each measured response exactly once, metrics observe the returned bytes, and
+  true rolling 10/60-second pooled plus max-path p99 gates prevent sparse slow
+  routes from hiding in aggregate percentiles. Hard sample/detail/error caps
+  fail closed on live saturation, compact stats retain bounded ranked offenders,
+  and DS9 now has exact v1 household resident/identity-health parity with DS8.
+  Coverage now includes all 41 framework-rendered product JSON routes; the five verified
+  pre-rendered/file responses are named exemptions, and every other unmarked
+  success fails closed.
+- Restored the authoritative assembled WebSocket boundary budget and shutdown
+  ownership contract: producer/executor/send dispatch all remain inside 3 ms,
+  intentional coalescing dwell alone is excluded, blocking RPC providers use a
+  drained owned executor, and REST/WS/depth/EOS/Map/storage teardown is ordered
+  and fail-closed (`DS9/docs/migration_state.md`,
+  `MapAnything_Depth.md`, `DS9/docs/MapAnything_Depth.md`,
+  `DS9/docs/validation_runbook.md`,
+  `plans/zero_copy_gpu/03_boundary_serialization_contract.md`,
+  `plans/DS8/ds8_design_decisions.md`).
+- Documented the DS9-only MapAnything ownership correction: one exact typed
+  native UID/per-frame-layer selector replaces the quarantined generic fallback,
+  the metadata-lifetime copy is exactly bounded/timed, owned CPU slices retain
+  bounded async postprocessing with explicit runtime drain/join and final-job
+  poison detection, and the failed 2026-07-11 depth/floorplan evidence remains
+  blocked pending native rebuild and live rerun (`DS9/README.md`,
+  `DS9/docs/MapAnything_Depth.md`,
+  `DS9/docs/MapAnything_Engine_Parity_Plan.md`,
+  `DS9/docs/validation_runbook.md`, `DS9/docs/migration_state.md`).
+- Closed occupied identity truth/parity defects: accepted tracker subjects are
+  immutable until an evidence-gap expiry without bypassing open-set rejection,
+  `embedding_present` and persisted provenance are exact-frame v2 facts, and
+  DS9 now enforces the same default household no-auto-merge policy as DS8
+  (`DS8_api_contracts_ws.md`, `DS8_metadata_contracts.md`,
+  `DS9/docs/migration_state.md`, `plans/household_identity/decisions.md`).
+- Closed the DS9 typed ownership selector over its already validated runtime
+  image ID, so asset/runtime promotion bindings and terminal CAS retain exact
+  image authority rather than dropping it (`DS9/docs/runtime_ownership_evidence.md`,
+  `plans/DS8/ds8_design_decisions.md`).
+- Replaced the stale V3DT camera-local contract with the locked global-world
+  boundary: raw bbox/velocity remain tracker diagnostics, producers apply the
+  exact `xzy` map before publishing Y-up `backend_world_m`, native image-foot
+  stays independent from image-base replay, and DS9 promotion requires a
+  privacy-safe same-session v2 gate while MV3DT overlap/time-sync/fusion remains
+  separately unproven (`DS8_Baselines.md`, `DS8_metadata_contracts.md`,
+  `DS8_api_contracts_ws.md`, `DS9/README.md`,
+  `DS9/docs/validation_runbook.md`,
+  `plans/DS8/v3dt/integration_plan.md`).
+- Refreshed the shared tracking/depth contract: persisted ReID provenance is an
+  all-or-none sequence/model/dimension triad, `depth_present` requires usable
+  finite depth, zero-person frames clear presence and continue as bounded
+  heartbeats, DAv2 capture/fusion uses a bounded exact-frame rendezvous with
+  public counters, native attachment failures are explicit, and occupied
+  semantic acceptance remains pending live evidence
+  (`DS8_api_contracts_ws.md`, `Telemetry_Schema.md`,
+  `DS8_metadata_contracts.md`, `depth_metadata.md`,
+  `DEPTH_STACK_FLOW_V2.md`, `DS8_Baselines.md`,
+  `DS8_testing_guide.md`).
+
+## Doc changes (2026-07-10)
+- Documented the fail-closed analytics boundary: native pre-tracker exclusion
+  is the sole DS8/V3DT/DS9 path, ROI mutations require exact hash/sequence
+  receipts and fatal ambiguous-commit handling, YAML/INI limits are 4 MiB/1
+  MiB, DS9 persists only the analytics pair with per-session evidence, REST
+  shutdown retains an analytics quiescence lease, and the authenticated
+  occupied-scene restore gate remains explicitly pending
+  (`DS8_api_contracts_rest.md`, `DS8_testing_guide.md`,
+  `Static_ROI_Exclusion.md`, `DS8_roi_editor.md`,
+  `DS8_README_FOR_AGENTS.md`, `CODEBASE_DESCRIPTION.md`,
+  `plans/DS8/ds8_design_decisions.md`,
+  `plans/DS8/ds8_migration_checklist_ds8_pipeline.md`,
+  `plans/DS8/ds8_migration_checklist_hooks.md`).
+- Documented the shared DS8/DS9 fail-closed inference boundary: production
+  graph configs are atomically derived engine-only artifacts, runtime model and
+  native-extension materializers never build, and source-rich configs remain
+  explicit offline-maintenance inputs (`DS8_README_FOR_AGENTS.md`,
+  `DS8_testing_guide.md`, `DS9/README.md`,
+  `plans/DS8/ds8_design_decisions.md`,
+  `plans/DS8/ds8_migration_checklist_ds8_pipeline.md`).
+- Recorded accepted 30-second baseline and V3DT engine-only lifecycle evidence,
+  including deserialization, advancing tracking, source-key absence, orderly
+  EOS/wait completion, clean exit, and residual-owner checks
+  (`DS8_testing_guide.md`,
+  `plans/DS8/ds8_migration_checklist_ds8_pipeline.md`).
+- Recorded the shared Swin `fc_pred/256` identity cutover and sequential
+  V3DT-to-baseline continuity proof with no gallery/state reset
+  (`DS8_testing_guide.md`, `plans/DS8/ds8_design_decisions.md`,
+  `plans/DS8/ds8_migration_checklist_ds8_pipeline.md`).
+- Documented depth-registration v1's path-based MapAnything identity limitation,
+  the narrow semantic compatibility rule for content-addressed runtime configs,
+  and the future engine/config content-hash requirement
+  (`MapAnything_Depth.md`, `DS8_testing_guide.md`,
+  `plans/DS8/ds8_design_decisions.md`).
+- Added the explicit guarded DS8 YOLO26-seg `n/s/m` engine maintenance workflow,
+  including CPU-only planning, exact build provenance, prior-byte preservation,
+  resource bounds, atomic installation, and rejection of false-positive
+  `trtexec` load results (`DS8_yolo26_seg_engine_maintenance.md`,
+  `DS8_testing_guide.md`).
+- Documented the canonical authenticated 30-second DS8 baseline/V3DT lifecycle
+  gates and their acknowledged downstream-EOS, fail-closed wait-thread
+  quiescence contract (`DS8_testing_guide.md`,
+  `plans/DS8/ds8_design_decisions.md`,
+  `plans/DS8/ds8_migration_checklist_ds8_pipeline.md`).
+- Documented the identity-v2 authority scope boundary: semantic provenance now
+  binds the loaded native/Python score transforms, while public promotion
+  requires a separately pinned DS8/DS9 cutover artifact with exact coordinator-
+  replay and occupied-scene reports (`DS8_api_contracts_rest.md`,
+  `DS8_testing_guide.md`, `plans/household_identity/*`).
+- Externalized active DS8/V3DT/DS9 camera locators and the MapAnything RPC key
+  into strict owner-only appliance state; documented provisioning, rotation,
+  public config references, fail-closed validation, and artifact/fingerprint
+  privacy (`Runtime_Secrets.md`, `DS8_README_FOR_AGENTS.md`,
+  `MapAnything_Depth.md`, `MapAnything_Heatmap_Viewer.md`,
+  `DS8_testing_guide.md`).
+- Corrected MQTT/Influx documentation to match the dormant runtime call graph,
+  removed embedded credential guidance, and documented strict owner-only
+  secret-file activation and rotation boundaries
+  (`Integrations_Playbook.md`, `Occupancy_Publishing.md`,
+  `integrations/occupancy_mqtt_influx.md`, `CODEBASE_DESCRIPTION.md`).
+- Documented the complete immutable scene-release bundle, including authored
+  OBJ material/texture dependencies, current-release URLs, and the validated
+  three-camera candidate (`DS8_api_contracts_rest.md`,
+  `Virtual_Twin_Reconstruction.md`).
+- Corrected the DS9 MapAnything build documentation to distinguish the now-true
+  FP16 builder intent from the still-open provenance and runtime-quality
+  artifact gate (`DS9/docs/migration_state.md`,
+  `DS9/docs/MapAnything_Engine_Parity_Plan.md`).
 
 ## Doc changes (2026-07-03)
 - Updated the codebase overview and DS8 decision ledger for the Swin-Tiny ReID
@@ -82,8 +323,9 @@ and worklogs live in `docs/history/`.
   agreement, floor contact, trail agreement, timestamp alignment, and transform
   audit evidence (`scripts/noesis_validation_menon_trace_report.py`,
   `plans/noesis_menon_validation/minimal_menon_trace.json`).
-- Added Menon browser debug capture and conversion into the shared Menon trace
-  contract for live browser placement validation
+- Added private Menon browser debug capture with fresh same-origin session proof
+  and strict canonical-state/presentation/path/cohort admission into the shared
+  Menon trace contract for live browser placement validation
   (`scripts/noesis_validation_capture_menon_trace.py`,
   `noesis/validation/menon_browser.py`,
   `plans/noesis_menon_validation/minimal_menon_browser_snapshot.json`).
@@ -150,6 +392,37 @@ and worklogs live in `docs/history/`.
 
 ## Doc changes (2026-07-09)
 - Clarified household identity is ON by default (`NOESIS_HOUSEHOLD_IDENTITY` unset/`1`; opt out with `=0`) in REST contracts and household plan docs (`DS8_api_contracts_rest.md`, `plans/household_identity/*`).
+
+## Doc changes (2026-07-10)
+- Documented the shared DS8/V3DT/DS9 identity-v2 runtime, default shadow and calibrated-authoritative modes, server-only exact-observation enrollment evidence, whole-frame assignment, proof-only overlap permits, nullable authoritative unknown identity, and explicit ReID engine/layer/dimension provenance (`DS8_api_contracts_rest.md`, `DS8_api_contracts_ws.md`, `DS8_metadata_contracts.md`).
+- Hardened identity authority documentation with artifact v2 two-stratum
+  benchmark/household evidence, deterministic correlation units,
+  truth-person-worst-case benchmark confidence, encounter-worst-case local
+  checks, monotonic local tightening, 1% benchmark FAR/misidentification
+  ceilings, active semantic/artifact pins, conservative gallery envelopes, and
+  owner-only fail-loud evidence
+  storage (`DS8_api_contracts_rest.md`, `DS8_testing_guide.md`,
+  `plans/household_identity/calibration_and_enrollment.md`).
+- Documented the bounded no-follow immutable scene-release boundary, exact
+  staged-tree publication, selected-byte serving semantics, shared
+  DS8/V3DT/DS9 router parity, and the focused adversarial/real-candidate gate
+  (`DS8_api_contracts_rest.md`, `DS8_testing_guide.md`,
+  `Virtual_Twin_Reconstruction.md`, `plans/spatial_os/*`).
+
+## Doc changes (2026-07-19)
+- Documented strict invalid-world decision provenance, exact observation-to-
+  source lineage, and conflict-safe canonical room derivation shared by DS8 and
+  DS9 (`DS8_api_contracts_ws.md`, `DS8_metadata_contracts.md`,
+  `plans/DS8/ds8_design_decisions.md`,
+  `plans/DS8/ds8_migration_checklist_hooks.md`).
+
+## Doc changes (2026-07-29)
+- Documented the DS8/DS9 camera-local BEV coverage-envelope union, its
+  separation from active MapAnything raster bounds, raw-metric rendering beyond
+  the raster, and non-clamping boundary tolerance
+  (`DS8_api_contracts_ws.md`, `Telemetry_Schema.md`,
+  `plans/DS8/ds8_design_decisions.md`,
+  `plans/DS8/ds8_migration_checklist_telemetry.md`).
 
 ## Doc changes (2026-07-08)
 - Documented producer-owned human pathing realism (`PersonGroundState`): stationary/idle lock, posture-aware floor contact, source hysteresis, human CV filter, trail non-append while locked, and public `motion_mode` / `posture` / `trail_append_allowed` / `idle_jitter_m` fields on tracking + BEV payloads (`DS8_Baselines.md`, `DS8_api_contracts_ws.md`, `DS8_metadata_contracts.md`, `Telemetry_Schema.md`, `DS8_MIGRATION_KNOWLEDGE_BASE.md`, `DS8_README_FOR_AGENTS.md`, `plans/DS8/ds8_design_decisions.md`).

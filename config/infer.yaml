@@ -8,6 +8,18 @@ version: 1
 depth_registration:
   path: config/depth_registration.json
 
+# Calibration-bound arbitration between floor-ray and registered-depth person
+# measurements. Runtime startup fails if this policy does not match the active
+# camera calibration and the lane-specific depth-registration artifact.
+world_measurement_fusion:
+  path: config/world_measurement_fusion_policy.json
+
+# Immutable scan-derived evidence, bound to cameras in explicit shadow mode.
+# Runtime world positions remain producer-owned; the prior adds diagnostics and
+# static/composite floorplan layers without replacing live observations.
+scene_priors:
+  path: ../data/scene_priors/catalog.json
+
 # Process all three sources per batch.
 batch_size: 3
 

@@ -6,6 +6,21 @@ version: 1
 depth_registration:
   path: DS9/config/depth_registration.json
 
+world_measurement_fusion:
+  path: config/world_measurement_fusion_policy.json
+
+# Immutable scan-derived evidence, bound to cameras in explicit shadow mode.
+# Runtime world positions remain producer-owned; the prior adds diagnostics and
+# static/composite floorplan layers without replacing live observations.
+scene_priors:
+  path: ../../data/scene_priors/catalog.json
+
+# Quality-gated fixed-camera + phone-walk diagnostic artifacts. These cached
+# layers feed review-only 3D views and never initiate inference or mutate live
+# world/tracking state.
+scene_fusions:
+  path: ../../data/scene_fusions/catalog.json
+
 batch_size: 3
 
 streammux:
@@ -136,6 +151,12 @@ analytics:
     element: nvdsroiexclude
     config-file: config/config_nvdsanalytics_exclude.ini
 
+canonical_world:
+  person_admission:
+    min_unposed_detection_confidence: 0.50
+  provisional_handoff:
+    max_distance_m: 1.0
+
 sinks:
   - name: mosaic_sink
     type: fakesink
@@ -150,6 +171,7 @@ mosaic_output:
   rtsp_path: mosaic
   mosaic_webrtc_enabled: true
   mosaic_h264_shm_socket: /tmp/noesis-mosaic-h264
+  mosaic_h264_shm_size_bytes: 67108864
   video_bitrate_kbps: 12000  # Quality floor for the 3840x720, 30 fps, short-GOP mosaic
   encoder: nvv4l2h264enc
   h264_iframeinterval: 10

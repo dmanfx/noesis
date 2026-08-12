@@ -45,7 +45,14 @@ import cv2
 import numpy as np
 import yaml
 
-from geometry.depth_source import DepthStorageManager
+from geometry.depth_source import (
+    DepthStorageManager,
+    resolve_depth_store_commit_timeout_s,
+)
+from geometry.dewarper_validity import (
+    build_dewarper_fov_mask as _build_dewarper_fov_mask,
+    load_dewarper_fov_spec as _load_dewarper_fov_spec,
+)
 from geometry.homography import (
     Plane,
     estimate_upright_height_from_top_and_foot,
@@ -55,24 +62,72 @@ from geometry.homography import (
     ray_from_pixel,
 )
 from noesis.calibration.depth_registration import DepthRegistrationManager
+from noesis.calibration.world_fusion_policy import WorldFusionPolicy
 from noesis.calibration.geometry import pixel_to_world
 from noesis.metadata import intrinsics as intrinsics_module
 from noesis.metadata.depth_result import DepthResult
 from noesis.metadata.object_depth import ObjectDepthResult
 from noesis.metadata.pose_features import PoseFeatureResult
-from noesis.telemetry.bev import Footpoint
+from noesis.identity_v2_service import IdentityFramePrimitive
+from noesis.reid_swin_profile import (
+    REID_SWIN_EMBEDDING_DIM,
+    REID_SWIN_OUTPUT_LAYER,
+)
+from noesis.identity_v2_osd import (
+    IdentityV2PostResolutionOsdOperator as _SharedIdentityV2OsdOperator,
+    IdentityV2PostResolutionOsdProcessor,
+)
+from noesis_core.v3dt_validation import (
+    V3DTAxisMap,
+    V3DTAxisMapError,
+    v3dt_bbox3d_world_foot,
+)
+from noesis_core.mapanything_lifecycle import MapAnythingIdleReceipt
+from noesis_core.depth_contract import usable_registered_depth_m
+from noesis_core.scene_prior import ScenePriorError, ScenePriorSet
+from noesis_core.analytics_zones import resolve_authoritative_analytics_zone
+from noesis_core.tracking_continuity import (
+    TrackingLifecycleRegistry,
+    pair_safe_publication_interval_s,
+)
+from noesis.telemetry.bev import (
+    BevPublicationReceipt,
+    CalibrationSnapshot,
+    Footpoint,
+)
+from noesis.telemetry.publishers import TrackingPublicationReceipt
 from noesis.telemetry.person_ground_state import (
     HumanGroundConfig,
     PersonGroundState,
     PoseAnchorCandidate,
-    apply_source_hysteresis,
+    assess_lower_body_occlusion,
+    begin_source_admission,
     classify_posture,
     commit_image_path_point,
+    complete_source_admission,
     resolve_pose_floor_anchor,
     source_score,
     update_human_cv_filter,
     update_motion_mode,
 )
+
+
+def _require_tracking_publication_receipt(
+    value: Any,
+    *,
+    source_id: int,
+    frame_id: int,
+    observed_at_us: int,
+) -> TrackingPublicationReceipt:
+    if not isinstance(value, TrackingPublicationReceipt):
+        raise RuntimeError("tracking publisher returned no typed admission receipt")
+    if (
+        value.source_id != int(source_id)
+        or value.frame_id != int(frame_id)
+        or value.observed_at_us != int(observed_at_us)
+    ):
+        raise RuntimeError("tracking publication receipt cohort mismatch")
+    return value
 
 try:  # DeepStream imports are optional during unit tests
     from pyservicemaker import BatchMetadataOperator, Probe, osd as ds_osd  # type: ignore
@@ -80,6 +135,18 @@ except Exception:  # pragma: no cover - exercised only in DS runtime
     BatchMetadataOperator = None  # type: ignore
     Probe = None  # type: ignore
     ds_osd = None  # type: ignore
+
+
+class _UnavailableBatchMetadataOperator:
+    def __init__(self, *_args: Any, **_kwargs: Any) -> None:
+        raise RuntimeError("pyservicemaker.BatchMetadataOperator is unavailable")
+
+
+_BatchMetadataOperatorBase = (
+    BatchMetadataOperator
+    if BatchMetadataOperator is not None
+    else _UnavailableBatchMetadataOperator
+)
 
 try:  # pragma: no cover - DeepStream bindings are optional during unit tests
     import pyds  # type: ignore
@@ -112,17 +179,58 @@ except Exception:  # pragma: no cover - extension unavailable in tests
     noesis_depth_tracking_tensor_ext = None  # type: ignore
 
 try:  # pragma: no cover - diagnostics optional in tests
-    from noesis.diagnostics.telemetry_log import TrackingDiagnosticsLogger
+    from noesis.diagnostics.telemetry_log import (
+        TrackingDiagnosticsLogger,
+        build_v3dt_session_start_payload,
+    )
 except Exception:  # pragma: no cover - fallback when diagnostics are absent
     TrackingDiagnosticsLogger = None  # type: ignore
+    build_v3dt_session_start_payload = None  # type: ignore
 
 logger = logging.getLogger(__name__)
 _REID_NATIVE_MISSING_LOGGED = False
 _DLPACK_HOST_READ_LOCK = threading.Lock()
 _POSE_META_MAX_JSON_BYTES = 65536
+_OBJECT_DEPTH_EXACT_FRAME_WAIT_DEFAULT_MS = 20.0
+_OBJECT_DEPTH_EXACT_FRAME_WAIT_MAX_MS = 250.0
 _OSD_LABEL_DEPTH_RE = re.compile(r"\s+z=(?:n/a|[-+]?\d+(?:\.\d+)?m)\s*$", re.IGNORECASE)
 _OSD_LABEL_CONF_RE = re.compile(r"\s+[-+]?\d+(?:\.\d+)?\s*$")
 _OSD_LABEL_ID_RE = re.compile(r"\s+(?:\[[^\]]+\]\s*\|\s*\[[^\]]+\]|XX|\d+)\s*$")
+_MAPANYTHING_ASYNC_STOP = object()
+_MAPANYTHING_AMBIGUOUS_CONFIDENCE_SCALE = 0.50
+_MAPANYTHING_OUTSIDE_CALIBRATED_FOV_CONFIDENCE_SCALE = 0.25
+_WORLD_ESTIMATOR_DIAGNOSTIC_FIELDS = (
+    "world_estimator_evaluated",
+    "world_floor_candidate",
+    "world_floor_range_m",
+    "world_floor_range_limit_m",
+    "world_floor_incidence_sin",
+    "world_floor_admitted",
+    "world_floor_rejection_reason",
+    "world_depth_candidate",
+    "world_prefilter_measurement",
+    "world_filter_prediction",
+    "world_measurement_accepted",
+    "world_rejection_reason",
+    "world_innovation_m",
+    "world_innovation_limit_m",
+    "world_reacquire_count",
+    "world_reacquired",
+    "trail_break_required",
+    "trail_segment_id",
+    "world_fusion_policy_id",
+    "world_floor_weight_scale",
+    "world_depth_weight_scale",
+    "world_floor_weight_effective",
+    "world_depth_weight_effective",
+    "motion_mode",
+    "posture",
+    "trail_append_allowed",
+    "idle_jitter_m",
+    "source_switch_count",
+    "sticky_world_source",
+    "scene_prior",
+)
 
 
 @dataclass
@@ -321,6 +429,19 @@ def _read_env_bool(name: str, default: bool = False) -> bool:
     return str(raw).strip().lower() in ("1", "true", "yes", "on")
 
 
+def _bounded_object_depth_wait_ms(value: Any, *, default: float = 0.0) -> float:
+    try:
+        parsed = float(value)
+    except Exception:
+        parsed = float(default)
+    if not math.isfinite(parsed):
+        parsed = float(default)
+    return min(
+        float(_OBJECT_DEPTH_EXACT_FRAME_WAIT_MAX_MS),
+        max(0.0, float(parsed)),
+    )
+
+
 def _serialize_compact_json_with_metrics(payload: Mapping[str, Any], *, metric: str) -> str:
     start_ns = time.perf_counter_ns()
     encoded = ""
@@ -370,6 +491,22 @@ def _frame_pts_key_us(frame_meta: Any) -> int:
     if raw > 0:
         return raw // 1000
     return int(time.time_ns() // 1000)
+
+
+def _public_frame_timing(frame_meta: Any, observed_at_s: float) -> Dict[str, Any]:
+    observed_at_us = max(1, int(float(observed_at_s) * 1_000_000))
+    fields: Dict[str, Any] = {
+        "captured_at_us": observed_at_us,
+        "observed_at_us": observed_at_us,
+        "capture_time_status": "estimated",
+    }
+    try:
+        media_pts_ns = int(_meta_lookup(frame_meta, "buf_pts", "buffer_pts", "pts", default=-1))
+    except Exception:
+        media_pts_ns = -1
+    if media_pts_ns >= 0:
+        fields["media_pts_ns"] = media_pts_ns
+    return fields
 
 
 def _depth_frame_key(frame_meta: Any) -> FrameKey:
@@ -688,6 +825,7 @@ def attach_mapanything_postprocess_hook(
     storage: DepthStorageManager,
     depth_pub: "DepthTelemetryPublisher" | None = None,
     camera_labels: Optional[Mapping[int, str]] = None,
+    failure_callback: Optional[Callable[[BaseException], None]] = None,
 ) -> None:
     """Attach the MapAnything post-process hook to decode full-frame tensor meta.
 
@@ -707,8 +845,10 @@ def attach_mapanything_postprocess_hook(
         depth_pub=depth_pub,
         gie_id=gie_id,
         camera_labels=camera_labels or getattr(pipeline, "camera_labels", {}) or {},
+        failure_callback=failure_callback,
     )
     component.config["_mapanything_processor"] = processor
+    pipeline.mapanything_processor = processor
 
     if pipeline.ds_pipeline is None or BatchMetadataOperator is None or Probe is None:
         logger.debug("Stored MapAnything processor for lazy execution (pyservicemaker unavailable)")
@@ -896,6 +1036,8 @@ def attach_analytics_telemetry_hook(
     bev_renderer: Any | None = None,
     bev_calibration: Any | None = None,
     depth_registration: DepthRegistrationManager | None = None,
+    world_fusion_policy: WorldFusionPolicy | None = None,
+    scene_priors: ScenePriorSet | None = None,
     diagnostics_logger: "TrackingDiagnosticsLogger" | None = None,
 ) -> None:
     """Attach a BatchMetadataOperator that extracts analytics telemetry."""
@@ -915,6 +1057,8 @@ def attach_analytics_telemetry_hook(
         bev_renderer=bev_renderer,
         bev_calibration=bev_calibration,
         depth_registration=depth_registration,
+        world_fusion_policy=world_fusion_policy,
+        scene_priors=scene_priors,
         diagnostics_logger=diagnostics_logger,
     )
     analytics_component.config["_analytics_processor"] = processor
@@ -931,6 +1075,12 @@ def attach_analytics_telemetry_hook(
     except Exception:
         logger.exception("Failed to initialize OSD label processor; mosaic labels may be missing")
 
+    attach_identity_v2_post_resolution_osd_hook(
+        pipeline,
+        camera_labels=camera_labels or {},
+        sensor_id_map=sensor_id_map or {},
+    )
+
     attach_component = pipeline.components.get("tracking_telemetry_stage") or analytics_component
 
     if pipeline.ds_pipeline is None or BatchMetadataOperator is None or Probe is None:
@@ -943,6 +1093,54 @@ def attach_analytics_telemetry_hook(
         logger.info("Attached analytics telemetry probe to %s", attach_component.name)
     except Exception:  # pragma: no cover - depends on DS runtime availability
         logger.exception("Failed to attach analytics telemetry probe")
+
+
+def attach_identity_v2_post_resolution_osd_hook(
+    pipeline: "DS8Pipeline",
+    *,
+    camera_labels: Mapping[int, str],
+    sensor_id_map: Mapping[int, int],
+) -> None:
+    """Stamp authoritative v2 labels on fresh metadata at the tiler sink."""
+
+    service = getattr(pipeline, "identity_v2_service", None)
+    if service is None or not bool(getattr(service, "authoritative", False)):
+        return
+    tiler = pipeline.components.get("tiler")
+    if tiler is None:
+        raise KeyError(
+            "tiler component missing; authoritative identity OSD cannot be attached"
+        )
+    label_processor = getattr(pipeline, "osd_label_processor", None)
+    decimals = int(getattr(label_processor, "decimals", 2) or 0)
+    processor = IdentityV2PostResolutionOsdProcessor(
+        pipeline=pipeline,
+        camera_labels=dict(camera_labels),
+        sensor_id_map=dict(sensor_id_map),
+        decimals=decimals,
+    )
+    tiler.config["_identity_v2_post_resolution_osd_processor"] = processor
+    setattr(pipeline, "identity_v2_post_resolution_osd_processor", processor)
+    if pipeline.ds_pipeline is None or BatchMetadataOperator is None or Probe is None:
+        logger.debug(
+            "Stored Identity v2 post-resolution OSD processor for lazy execution"
+        )
+        return
+    try:
+        probe = Probe(
+            "identity_v2_post_resolution_osd",
+            _IdentityV2PostResolutionOsdOperator(processor),
+        )
+        # Explicit sink placement is essential: the source camera metadata is
+        # still intact here, and the upstream telemetry stage has already
+        # completed whole-frame identity resolution.
+        pipeline.ds_pipeline.attach(tiler.name, probe, tips="sink")
+        logger.info(
+            "Attached authoritative Identity v2 OSD probe to %s sink", tiler.name
+        )
+    except Exception:
+        logger.exception("Failed to attach authoritative Identity v2 OSD probe")
+        raise
 
 
 def attach_trail_overlay_hook(
@@ -1084,6 +1282,12 @@ def attach_osd_label_hook(pipeline: "DS8Pipeline") -> None:
         logger.exception("Failed to attach OSD label probe")
 
 
+class AnalyticsReloadStateAmbiguous(RuntimeError):
+    """Raised when a native reload may be active but cannot be fully acknowledged."""
+
+    native_state_ambiguous = True
+
+
 def attach_analytics_reload_bridge(
     pipeline: "DS8Pipeline",
     *,
@@ -1098,87 +1302,163 @@ def attach_analytics_reload_bridge(
 
     lock = threading.Lock()
     pipeline.analytics_reload_count = getattr(pipeline, "analytics_reload_count", 0)
+    exclude_component = pipeline.components.get("analytics_exclude")
+    if exclude_component is None:
+        raise KeyError("analytics_exclude component missing; cannot attach reload bridge")
+    if pipeline.ds_pipeline is not None and type(pipeline.ds_pipeline).__name__ != "_NoopDSPipeline":
+        node = pipeline.ds_pipeline[exclude_component.name]
+        expected_types = {
+            "config-file": str,
+            "reload-request-sequence": int,
+            "reload-accepted-sequence": int,
+            "reload-failed-sequence": int,
+            "last-reload-ok": bool,
+            "expected-config-sha256": str,
+            "active-config-sha256": str,
+            "reload-error-count": int,
+            "objects-removed-count": int,
+            "last-reload-error": str,
+        }
+        for property_name, expected_type in expected_types.items():
+            value = node.get(property_name)
+            if not isinstance(value, expected_type):
+                raise RuntimeError(
+                    f"Native analytics reload property {property_name!r} is unavailable or has "
+                    f"the wrong type: {type(value).__name__}"
+                )
 
-    def _apply(stage: str, cfg: Dict[str, Any]) -> None:
+    def _apply(
+        stage: str,
+        cfg: Dict[str, Any],
+        reload_context: Mapping[str, Any],
+    ) -> Mapping[str, Any]:
+        del cfg
+        if stage != stage_name:
+            raise RuntimeError(f"Native analytics reload does not support stage {stage!r}")
+        exclude_component = pipeline.components.get("analytics_exclude")
+        if exclude_component is None or pipeline.ds_pipeline is None:
+            raise RuntimeError("Native analytics exclusion node is unavailable")
+        config_path = Path(str(reload_context.get("config_path") or ""))
+        expected_sha256 = str(reload_context.get("config_sha256") or "")
+        component_path = Path(str(exclude_component.config.get("config-file") or "")).absolute()
+        if component_path != config_path:
+            raise RuntimeError(
+                "Analytics exclusion component path does not match the transaction path "
+                f"({component_path} != {config_path})"
+            )
+
         with lock:
-            pipeline.analytics_reload_count = getattr(pipeline, "analytics_reload_count", 0) + 1
-            runtime_updates = component.config.setdefault("runtime_updates", {})
-            runtime_updates[stage] = cfg
-            pipeline.config.setdefault("analytics", {}).setdefault("stages", {})[stage] = cfg
-            refreshed_polygons: Optional[Dict[int, List[Tuple[str, List[Tuple[float, float]]]]]] = None
-            if stage == stage_name:
-                refreshed_polygons = _refresh_exclusion_polygons(pipeline, stage_name=stage)
-            if pipeline.ds_pipeline is None:
-                logger.info(
-                    "Recorded analytics runtime update for stage %s (reload_count=%s)",
-                    stage,
-                    pipeline.analytics_reload_count,
+            node = pipeline.ds_pipeline[exclude_component.name]
+            active_config_path = Path(str(node.get("config-file") or "")).absolute()
+            if active_config_path != config_path:
+                raise RuntimeError(
+                    "Native analytics exclusion path does not match the writable state path "
+                    f"({active_config_path} != {config_path})"
                 )
-                return
+            request_sequence = int(node.get("reload-request-sequence"))
+            accepted_sequence = int(node.get("reload-accepted-sequence"))
+            failed_sequence = int(node.get("reload-failed-sequence"))
+            next_sequence = max(request_sequence, accepted_sequence, failed_sequence) + 1
+            if next_sequence > 0xFFFFFFFF:
+                raise RuntimeError("Analytics reload sequence is exhausted")
+            error_count_before = int(node.get("reload-error-count"))
+            node.set({"expected-config-sha256": expected_sha256})
             try:
-                node = pipeline.ds_pipeline[component.name]
-                node.set({"config-file": component.config.get("config-file", "config/nvdsanalytics.yaml")})
-                logger.info(
-                    "Applied analytics runtime update for stage %s (reload_count=%s)",
-                    stage,
-                    pipeline.analytics_reload_count,
+                # The GObject setter performs the synchronous native swap.  Any
+                # exception from this point until the complete receipt is read
+                # makes the active native state unknowable and must poison the
+                # runtime rather than attempt an ordinary file-only rollback.
+                node.set({"reload-request-sequence": next_sequence})
+                observed_request = int(node.get("reload-request-sequence"))
+                observed_accepted = int(node.get("reload-accepted-sequence"))
+                observed_failed = int(node.get("reload-failed-sequence"))
+                last_reload_ok = bool(node.get("last-reload-ok"))
+                active_sha256 = str(node.get("active-config-sha256") or "")
+                error_count_after = int(node.get("reload-error-count"))
+                objects_removed_count = int(node.get("objects-removed-count"))
+                last_error = str(node.get("last-reload-error") or "")[:512]
+            except Exception as exc:
+                raise AnalyticsReloadStateAmbiguous(
+                    "Native analytics reload receipt could not be read after dispatch"
+                ) from exc
+            native_candidate_active = (
+                observed_request == next_sequence
+                and observed_accepted == next_sequence
+                and active_sha256 == expected_sha256
+                and last_reload_ok
+            )
+            if not (
+                native_candidate_active
+                and observed_failed != next_sequence
+                and error_count_after == error_count_before
+                and last_error == ""
+            ):
+                error_type = (
+                    AnalyticsReloadStateAmbiguous
+                    if native_candidate_active
+                    else RuntimeError
                 )
-            except Exception:  # pragma: no cover - depends on DS runtime availability
-                logger.exception("Failed to push analytics runtime update for stage %s", stage)
-            if stage == stage_name:
-                exclude_component = pipeline.components.get("analytics_exclude")
-                if exclude_component is not None:
-                    try:
-                        node_excl = pipeline.ds_pipeline[exclude_component.name]
-                        cfg_path = exclude_component.config.get("config-file", "config/config_nvdsanalytics_exclude.ini")
-                        node_excl.set({"config-file": cfg_path})
-                        logger.info(
-                            "Applied exclusion runtime update for stage %s via %s (reload_count=%s)",
-                            stage,
-                            exclude_component.name,
-                            pipeline.analytics_reload_count,
-                        )
-                    except Exception:
-                        logger.exception("Failed to push exclusion runtime update for stage %s", stage)
-                if refreshed_polygons is not None:
-                    logger.info(
-                        "Exclusion polygons refreshed for stage %s (%d stream(s))",
-                        stage,
-                        len(refreshed_polygons),
-                    )
+                raise error_type(
+                    "Native analytics reload was rejected or unacknowledged "
+                    f"(request={observed_request}, accepted={observed_accepted}, "
+                    f"failed={observed_failed}, active_sha256={active_sha256!r}, "
+                    f"error_count={error_count_after}, error={last_error!r})"
+                )
+            receipt = {
+                "request_sequence": observed_request,
+                "accepted_sequence": observed_accepted,
+                "failed_sequence": observed_failed,
+                "active_config_sha256": active_sha256,
+                "reload_error_count": error_count_after,
+                "objects_removed_count": objects_removed_count,
+            }
+            try:
+                pipeline.analytics_reload_count = (
+                    getattr(pipeline, "analytics_reload_count", 0) + 1
+                )
+                pipeline.analytics_reload_receipt = receipt
+            except Exception as exc:
+                raise AnalyticsReloadStateAmbiguous(
+                    "Native analytics reload committed but hook publication failed"
+                ) from exc
+            return receipt
 
     analytics_api.register_reload_hook(_apply)
     logger.info("Registered analytics reload bridge for stage '%s'", stage_name)
 
 
-def attach_exclude_prune_hook(
+def verify_analytics_exclusion_initial_receipt(
     pipeline: "DS8Pipeline",
-    *,
-    stage_name: str = "exclude",
-) -> None:
-    """Prune objects fully contained within exclusion ROIs after nvdsanalytics."""
-    component = pipeline.components.get("analytics")
-    if component is None:
-        raise KeyError("analytics component missing; cannot attach exclusion prune hook")
-
-    polygons = _extract_exclusion_polygons(pipeline, stage_name=stage_name)
-    if not polygons:
-        logger.info("No exclusion polygons configured; skip exclusion prune hook")
-        return
-
-    processor = _ExcludePruneProcessor(polygons=polygons)
-    component.config["_exclude_prune_processor"] = processor
-
-    if pipeline.ds_pipeline is None or BatchMetadataOperator is None or Probe is None:
-        logger.debug("Stored exclusion prune processor for lazy execution (pyservicemaker unavailable)")
-        return
-
-    try:
-        probe = Probe("analytics_exclude_prune", _ExcludePruneOperator(processor))
-        pipeline.ds_pipeline.attach(component.name, probe)
-        logger.info("Attached exclusion prune probe to %s", component.name)
-    except Exception:  # pragma: no cover - depends on DS runtime availability
-        logger.exception("Failed to attach exclusion prune probe")
+    reload_context: Mapping[str, Any],
+) -> Dict[str, Any]:
+    """Require the native exclusion element to acknowledge the prepared startup INI."""
+    component = pipeline.components.get("analytics_exclude")
+    if component is None or pipeline.ds_pipeline is None:
+        raise RuntimeError("Native analytics exclusion node is unavailable")
+    expected_path = Path(str(reload_context.get("config_path") or ""))
+    expected_sha256 = str(reload_context.get("config_sha256") or "")
+    node = pipeline.ds_pipeline[component.name]
+    active_path = Path(str(node.get("config-file") or "")).absolute()
+    receipt = {
+        "request_sequence": int(node.get("reload-request-sequence")),
+        "accepted_sequence": int(node.get("reload-accepted-sequence")),
+        "failed_sequence": int(node.get("reload-failed-sequence")),
+        "active_config_sha256": str(node.get("active-config-sha256") or ""),
+        "reload_error_count": int(node.get("reload-error-count")),
+        "objects_removed_count": int(node.get("objects-removed-count")),
+        "last_reload_ok": bool(node.get("last-reload-ok")),
+        "last_reload_error": str(node.get("last-reload-error") or "")[:512],
+    }
+    if not (
+        active_path == expected_path
+        and receipt["active_config_sha256"] == expected_sha256
+        and receipt["reload_error_count"] == 0
+        and receipt["last_reload_ok"]
+        and receipt["last_reload_error"] == ""
+    ):
+        raise RuntimeError(f"Native analytics initial receipt mismatch: {receipt}")
+    pipeline.analytics_initial_receipt = receipt
+    return receipt
 
 
 def _resolve_intrinsics_loader(config_path: str | Path | None) -> intrinsics_module.CameraConfigLoader:
@@ -1335,135 +1615,6 @@ def _extract_tensor_layers(tensor_meta: Any) -> Dict[str, np.ndarray]:
     return tensors
 
 
-def _extract_exclusion_polygons(
-    pipeline: "DS8Pipeline",
-    *,
-    stage_name: str = "exclude",
-) -> Dict[int, List[Tuple[str, List[Tuple[float, float]]]]]:
-    analytics_cfg = pipeline.config.get("analytics") or {}
-    stages_cfg = analytics_cfg.get("stages") or {}
-    try:
-        # Prefer live analytics YAML (keeps REST updates in sync with running hooks)
-        from noesis.server import analytics_api
-
-        live_cfg = analytics_api._load_config(force=True)  # type: ignore[attr-defined]
-        live_stages = (live_cfg.get("analytics") or {}).get("stages") or {}
-        if live_stages:
-            stages_cfg = live_stages
-    except Exception:
-        pass
-
-    stage_cfg = stages_cfg.get(stage_name) or {}
-    streams_cfg = stage_cfg.get("streams") or {}
-
-    polygons: Dict[int, List[Tuple[str, List[Tuple[float, float]]]]] = {}
-    for stream_id, stream_cfg in streams_cfg.items():
-        try:
-            stream_idx = int(stream_id)
-        except Exception:
-            logger.debug("Skipping non-integer analytics stream id %s", stream_id)
-            continue
-        roi_filtering = stream_cfg.get("roi_filtering") or {}
-        if not roi_filtering.get("enable", False):
-            continue
-        rois = roi_filtering.get("rois") or []
-        for roi in rois:
-            roi_id = str(roi.get("id") or roi.get("label") or "").strip() or "roi"
-            points_raw = roi.get("points_px") or []
-            points: List[Tuple[float, float]] = []
-            for point in points_raw:
-                if not isinstance(point, (list, tuple)) or len(point) < 2:
-                    continue
-                try:
-                    px = float(point[0])
-                    py = float(point[1])
-                except Exception:
-                    continue
-                points.append((px, py))
-            if len(points) >= 3:
-                polygons.setdefault(stream_idx, []).append((roi_id, points))
-    if polygons:
-        return polygons
-
-    # Fall back to loading the external nvdsanalytics YAML if specified.
-    analytics_component = pipeline.components.get("analytics_exclude") or pipeline.components.get("analytics")
-    if not analytics_component:
-        return polygons
-    config_file = analytics_component.config.get("config-file") if isinstance(analytics_component.config, dict) else None
-    if not config_file:
-        return polygons
-
-    try:
-        cfg_path = Path(config_file)
-        candidates: List[Path] = []
-        if cfg_path.is_absolute():
-            candidates.append(cfg_path)
-        else:
-            candidates.append((pipeline.yaml_path.parent / cfg_path).resolve())
-            candidates.append((pipeline.yaml_path.parent.parent / cfg_path).resolve())
-            candidates.append(Path.cwd() / cfg_path)
-
-        resolved = next((cand for cand in candidates if cand.exists()), None)
-        if resolved is None:
-            logger.debug("Analytics config file %s does not exist; skipping exclusion polygon extraction", cfg_path)
-            return polygons
-        cfg_path = resolved
-        with cfg_path.open("r", encoding="utf-8") as stream:
-            analytics_yaml = yaml.safe_load(stream) or {}
-    except Exception:
-        logger.exception("Failed to load analytics config from %s", config_file)
-        return polygons
-
-    yaml_analytics = analytics_yaml.get("analytics") or {}
-    yaml_stages = yaml_analytics.get("stages") or {}
-    yaml_stage = yaml_stages.get(stage_name) or {}
-    yaml_streams = yaml_stage.get("streams") or {}
-
-    for stream_id, stream_cfg in yaml_streams.items():
-        try:
-            stream_idx = int(stream_id)
-        except Exception:
-            continue
-        roi_filtering = stream_cfg.get("roi_filtering") or {}
-        if not roi_filtering.get("enable", False):
-            continue
-        rois = roi_filtering.get("rois") or []
-        for roi in rois:
-            roi_id = str(roi.get("id") or roi.get("label") or "").strip() or "roi"
-            points_raw = roi.get("points_px") or []
-            points: List[Tuple[float, float]] = []
-            for point in points_raw:
-                if not isinstance(point, (list, tuple)) or len(point) < 2:
-                    continue
-                try:
-                    px = float(point[0])
-                    py = float(point[1])
-                except Exception:
-                    continue
-                points.append((px, py))
-            if len(points) >= 3:
-                polygons.setdefault(stream_idx, []).append((roi_id, points))
-    return polygons
-
-
-def _refresh_exclusion_polygons(
-    pipeline: "DS8Pipeline",
-    stage_name: str = "exclude",
-) -> Dict[int, List[Tuple[str, List[Tuple[float, float]]]]]:
-    """Recompute exclusion polygons and update the stored processor if present."""
-    polygons = _extract_exclusion_polygons(pipeline, stage_name=stage_name)
-    component = pipeline.components.get("analytics")
-    processor = None
-    if component and isinstance(component.config, dict):
-        processor = component.config.get("_exclude_prune_processor")
-    if processor is not None:
-        try:
-            processor.polygons = polygons
-        except Exception:
-            logger.debug("Failed to refresh exclusion processor polygons")
-    return polygons
-
-
 @dataclass
 class MapAnythingProcessor:
     pipeline: "DS8Pipeline"
@@ -1471,17 +1622,66 @@ class MapAnythingProcessor:
     depth_pub: "DepthTelemetryPublisher" | None
     gie_id: int
     camera_labels: Mapping[int, str] = field(default_factory=dict)
+    failure_callback: Optional[Callable[[BaseException], None]] = field(
+        default=None, repr=False
+    )
     tensor_samples: int = 0
     _async_enabled: bool = field(default=True, init=False, repr=False)
-    _async_queue: "queue.Queue[_MapAnythingJob]" = field(default_factory=lambda: queue.Queue(maxsize=32), init=False, repr=False)
+    _async_queue: "queue.Queue[Any]" = field(default_factory=lambda: queue.Queue(maxsize=32), init=False, repr=False)
     _async_thread: Optional[threading.Thread] = field(default=None, init=False, repr=False)
     _async_lock: threading.Lock = field(default_factory=threading.Lock, init=False, repr=False)
+    _async_idle: threading.Condition = field(init=False, repr=False)
+    _async_failure: Optional[str] = field(default=None, init=False, repr=False)
+    _async_accepting: bool = field(default=True, init=False, repr=False)
+    _async_active_captures: int = field(default=0, init=False, repr=False)
+    _async_stop_enqueued: bool = field(default=False, init=False, repr=False)
+    _async_stopped: threading.Event = field(default_factory=threading.Event, init=False, repr=False)
+    _async_shutdown_complete: bool = field(default=False, init=False, repr=False)
     _dropped_jobs: int = field(default=0, init=False, repr=False)
     _last_drop_log: float = field(default=0.0, init=False, repr=False)
+    _dewarper_fov_masks: Dict[Tuple[int, int, int], np.ndarray] = field(default_factory=dict, init=False, repr=False)
+    _storage_commit_timeout_s: float = field(default=30.0, init=False, repr=False)
 
     def __post_init__(self) -> None:
         # MapAnything host conversion must stay off the probe thread in DS8 production.
         self._async_enabled = True
+        self._async_idle = threading.Condition(self._async_lock)
+        self._storage_commit_timeout_s = resolve_depth_store_commit_timeout_s()
+
+    def _dewarper_validity_mask(self, source_id: int, target_size: Tuple[int, int]) -> Optional[np.ndarray]:
+        target_w, target_h = int(target_size[0]), int(target_size[1])
+        key = (int(source_id), target_w, target_h)
+        if key in self._dewarper_fov_masks:
+            return self._dewarper_fov_masks[key]
+        config = getattr(self.pipeline, "config", {}) or {}
+        masks = config.get("dewarper_validity_masks") if isinstance(config, Mapping) else None
+        if not isinstance(masks, Mapping):
+            return None
+        sources = masks.get("sources") if isinstance(masks.get("sources"), Mapping) else masks
+        mask_cfg = sources.get(str(int(source_id)), sources.get(int(source_id))) if isinstance(sources, Mapping) else None
+        if not isinstance(mask_cfg, Mapping):
+            return None
+        source_configs = config.get("sources") if isinstance(config, Mapping) else None
+        if not isinstance(source_configs, Sequence) or int(source_id) >= len(source_configs):
+            raise RuntimeError(f"dewarper validity source {source_id} is absent from pipeline sources")
+        source_cfg = source_configs[int(source_id)]
+        if not isinstance(source_cfg, Mapping):
+            raise RuntimeError(f"pipeline source {source_id} is not a mapping")
+        spec = _load_dewarper_fov_spec(
+            source_cfg=source_cfg,
+            pipeline_yaml_path=getattr(self.pipeline, "yaml_path", None),
+            mask_cfg=mask_cfg,
+            repo_root=Path(__file__).resolve().parents[2],
+        )
+        if spec is None:
+            return None
+        mask = _build_dewarper_fov_mask(
+            spec,
+            target_size=(target_w, target_h),
+            erode_px=int(mask_cfg.get("erode-px", mask_cfg.get("erode_px", 1)) or 0),
+        )
+        self._dewarper_fov_masks[key] = mask
+        return mask
 
     def _to_numpy(self, tensor: Any) -> Optional[np.ndarray]:
         """Convert pyservicemaker Tensor to a CPU numpy array via DLPack.
@@ -1605,10 +1805,11 @@ class MapAnythingProcessor:
 
     def handle_nvds_tensor_ds8(self, frame_meta: Any, tensor_meta: Any) -> Optional[DepthResult]:
         """Handle DS8 pyservicemaker TensorOutputUserMetadata."""
+        if not self.pipeline.depth_enabled:
+            logger.debug("Depth disabled; dropping MapAnything tensors before DS8 conversion")
+            return None
+        self._begin_async_capture()
         try:
-            if not self.pipeline.depth_enabled:
-                logger.debug("Depth disabled; dropping MapAnything tensors before DS8 conversion")
-                return None
             # DS8 API: tensor_meta.get_layers() returns dict[str, Tensor]
             layers = tensor_meta.get_layers() or {}
             if not layers:
@@ -1659,88 +1860,335 @@ class MapAnythingProcessor:
                 mask=mask_tensor,
             )
 
-            self._start_async_worker()
-            try:
-                self._async_queue.put_nowait(job)
-            except queue.Full:
-                self._dropped_jobs += 1
-                now = time.time()
-                if now - self._last_drop_log >= 2.0:
-                    self._last_drop_log = now
-                    logger.debug(
-                        "MapAnything postprocess queue full; dropped %d jobs",
-                        self._dropped_jobs,
-                    )
+            self._enqueue_async_job(job)
             return None
         except Exception:
             logger.exception("Failed to extract tensor layers from DS8 TensorOutputUserMetadata")
-            return None
+            raise
+        finally:
+            self._end_async_capture()
 
-    def _start_async_worker(self) -> None:
-        if self._async_thread is not None and self._async_thread.is_alive():
-            return
+    def _raise_async_failure(self) -> None:
         with self._async_lock:
-            if self._async_thread is not None and self._async_thread.is_alive():
-                return
+            failure = self._async_failure
+        if failure is not None:
+            raise RuntimeError(
+                f"MapAnything async postprocess is poisoned: {failure}"
+            )
 
-            def _loop() -> None:
-                while True:
-                    try:
-                        job = self._async_queue.get()
-                    except Exception:
-                        time.sleep(0.01)
+    def _async_unfinished_task_count(self) -> int:
+        with self._async_queue.mutex:
+            return int(self._async_queue.unfinished_tasks)
+
+    def _poison_async_worker(self, exc: BaseException) -> None:
+        failure = f"{type(exc).__name__}: {exc}"
+        with self._async_idle:
+            first_failure = self._async_failure is None
+            if first_failure:
+                self._async_failure = failure
+            self._async_idle.notify_all()
+        if first_failure:
+            _increment_core_counter("mapanything_async_postprocess_failures_total")
+            logger.exception("Async MapAnything postprocess failed")
+            callback = self.failure_callback
+            if callable(callback):
+                try:
+                    callback(exc)
+                except Exception:
+                    logger.exception("MapAnything runtime failure callback failed")
+
+    @staticmethod
+    def _slice_async_batch(arr: np.ndarray, batch_id: int | None) -> np.ndarray:
+        if batch_id is None:
+            return arr
+        if arr.ndim == 4:
+            batch_size = int(arr.shape[0] or 0)
+            if batch_size > 0:
+                index = batch_id if 0 <= batch_id < batch_size else 0
+                return arr[index]
+        if arr.ndim == 3 and arr.shape[0] > 1:
+            batch_size = int(arr.shape[0] or 0)
+            index = batch_id if 0 <= batch_id < batch_size else 0
+            return arr[index]
+        return arr
+
+    def _async_worker_loop(self) -> None:
+        try:
+            while True:
+                job = self._async_queue.get()
+                try:
+                    if job is _MAPANYTHING_ASYNC_STOP:
+                        return
+                    with self._async_lock:
+                        poisoned = self._async_failure is not None
+                    if poisoned:
+                        _increment_core_counter(
+                            "mapanything_async_poisoned_jobs_total"
+                        )
                         continue
                     try:
-                        if not self.pipeline.depth_enabled:
-                            continue
                         tensors: Dict[str, np.ndarray] = {}
-
-                        def _slice_batch(arr: np.ndarray, batch_id: int | None) -> np.ndarray:
-                            if batch_id is None:
-                                return arr
-                            if arr.ndim == 4:
-                                b = int(arr.shape[0] or 0)
-                                if b > 0:
-                                    idx = batch_id if 0 <= batch_id < b else 0
-                                    return arr[idx]
-                            if arr.ndim == 3 and arr.shape[0] > 1:
-                                b = int(arr.shape[0] or 0)
-                                idx = batch_id if 0 <= batch_id < b else 0
-                                return arr[idx]
-                            return arr
-
                         depth_arr = self._to_numpy(job.depth)
                         if depth_arr is None:
                             continue
-                        tensors["depth"] = _slice_batch(depth_arr, job.batch_id)
+                        tensors["depth"] = self._slice_async_batch(
+                            depth_arr, job.batch_id
+                        )
                         if job.confidence is not None:
                             conf_arr = self._to_numpy(job.confidence)
                             if conf_arr is not None:
-                                tensors["confidence"] = _slice_batch(conf_arr, job.batch_id)
+                                tensors["confidence"] = self._slice_async_batch(
+                                    conf_arr, job.batch_id
+                                )
                         if job.mask is not None:
                             mask_arr = self._to_numpy(job.mask)
                             if mask_arr is not None:
-                                tensors["mask"] = _slice_batch(mask_arr, job.batch_id)
+                                tensors["mask"] = self._slice_async_batch(
+                                    mask_arr, job.batch_id
+                                )
                         self.handle_numpy_arrays(
                             source_id=int(job.source_id),
                             frame_id=int(job.frame_id),
                             pts_ns=int(job.pts_ns),
                             tensors=tensors,
+                            captured_while_enabled=True,
                         )
-                    except Exception:
-                        logger.exception("Async MapAnything postprocess failed")
-                    finally:
-                        try:
-                            self._async_queue.task_done()
-                        except Exception:
-                            pass
+                    except Exception as exc:
+                        self._poison_async_worker(exc)
+                finally:
+                    self._async_queue.task_done()
+                    with self._async_idle:
+                        self._async_idle.notify_all()
+        except BaseException as exc:
+            self._poison_async_worker(exc)
+        finally:
+            self._async_stopped.set()
+            with self._async_idle:
+                self._async_idle.notify_all()
 
-            self._async_thread = threading.Thread(
-                target=_loop,
-                name="MapAnythingPostprocess",
-                daemon=True,
+    def _start_async_worker_locked(self) -> None:
+        if self._async_failure is not None:
+            raise RuntimeError(
+                "MapAnything async postprocess is poisoned: "
+                f"{self._async_failure}"
             )
-            self._async_thread.start()
+        if not self._async_accepting and self._async_active_captures <= 0:
+            raise RuntimeError("MapAnything async postprocess is shutting down")
+        if self._async_thread is not None and self._async_thread.is_alive():
+            return
+        if self._async_thread is not None:
+            raise RuntimeError(
+                "MapAnything async postprocess worker cannot be restarted"
+            )
+        self._async_stopped.clear()
+        self._async_thread = threading.Thread(
+            target=self._async_worker_loop,
+            name="MapAnythingPostprocess",
+            daemon=False,
+        )
+        self._async_thread.start()
+
+    def _start_async_worker(self) -> None:
+        with self._async_idle:
+            self._start_async_worker_locked()
+
+    def _begin_async_capture(self) -> None:
+        with self._async_idle:
+            if self._async_failure is not None:
+                raise RuntimeError(
+                    "MapAnything async postprocess is poisoned: "
+                    f"{self._async_failure}"
+                )
+            if not self._async_accepting:
+                raise RuntimeError("MapAnything async postprocess is shutting down")
+            self._async_active_captures += 1
+
+    def _end_async_capture(self) -> None:
+        with self._async_idle:
+            if self._async_active_captures <= 0:
+                raise RuntimeError(
+                    "MapAnything async capture ownership underflow"
+                )
+            self._async_active_captures -= 1
+            self._async_idle.notify_all()
+
+    def _enqueue_async_job(self, job: "_MapAnythingJob") -> bool:
+        # An admitted capture may enqueue after shutdown closes admission.
+        # Shutdown waits for every capture lease before appending the FIFO stop
+        # sentinel, so the sentinel cannot overtake this accepted job.
+        with self._async_idle:
+            self._start_async_worker_locked()
+            if self._async_failure is not None:
+                raise RuntimeError(
+                    "MapAnything async postprocess is poisoned: "
+                    f"{self._async_failure}"
+                )
+            try:
+                self._async_queue.put_nowait(job)
+            except queue.Full as exc:
+                self._dropped_jobs += 1
+                _increment_core_counter("mapanything_async_queue_full_total")
+                raise RuntimeError(
+                    "MapAnything bounded async postprocess queue is full"
+                ) from exc
+        return True
+
+    def async_shutdown_quiesced(self) -> bool:
+        with self._async_lock:
+            thread = self._async_thread
+            active_captures = int(self._async_active_captures)
+            stopped = bool(self._async_stopped.is_set())
+        unfinished = self._async_unfinished_task_count()
+        return bool(
+            active_captures == 0
+            and unfinished == 0
+            and (
+                thread is None
+                or (not thread.is_alive() and stopped)
+            )
+        )
+
+    def wait_idle(self, *, timeout_s: float = 5.0) -> MapAnythingIdleReceipt:
+        """Wait for admitted captures and queued jobs without closing admission."""
+
+        timeout = float(timeout_s)
+        if not math.isfinite(timeout) or timeout <= 0.0:
+            raise ValueError("MapAnything idle timeout must be positive")
+        deadline = time.monotonic() + timeout
+        with self._async_idle:
+            while True:
+                if self._async_failure is not None:
+                    raise RuntimeError(
+                        "MapAnything async postprocess is poisoned: "
+                        f"{self._async_failure}"
+                    )
+                if not self._async_accepting or self._async_shutdown_complete:
+                    raise RuntimeError(
+                        "MapAnything async postprocess is shutting down"
+                    )
+                active_captures = int(self._async_active_captures)
+                unfinished = self._async_unfinished_task_count()
+                thread = self._async_thread
+                if active_captures == 0 and unfinished == 0:
+                    return MapAnythingIdleReceipt(
+                        active_captures=0,
+                        unfinished_tasks=0,
+                        worker_started=thread is not None,
+                        worker_alive=bool(thread is not None and thread.is_alive()),
+                        accepting=True,
+                    )
+                if unfinished > 0 and (
+                    thread is None or not thread.is_alive()
+                ):
+                    raise RuntimeError(
+                        "MapAnything has queued work without a live owned worker"
+                    )
+                remaining = deadline - time.monotonic()
+                if remaining <= 0.0:
+                    raise TimeoutError(
+                        "MapAnything did not become idle before timeout "
+                        f"(active_captures={active_captures} unfinished={unfinished})"
+                    )
+                self._async_idle.wait(timeout=min(remaining, 0.05))
+
+    def shutdown(self, *, wait: bool = True, timeout_s: float = 5.0) -> None:
+        """Close capture admission, drain accepted jobs, and join the worker.
+
+        The stop sentinel is enqueued only after every probe-local capture
+        lease completes. FIFO ordering then proves that no accepted job can be
+        overtaken during teardown.
+        """
+        if not wait:
+            raise ValueError("MapAnything shutdown requires wait=True")
+        timeout = float(timeout_s)
+        if not math.isfinite(timeout) or timeout <= 0.0:
+            raise ValueError("MapAnything shutdown timeout must be positive")
+        deadline = time.monotonic() + timeout
+
+        with self._async_idle:
+            self._async_accepting = False
+            if self._async_shutdown_complete:
+                completed = True
+            else:
+                completed = False
+                while self._async_active_captures > 0:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0.0:
+                        _increment_core_counter(
+                            "mapanything_async_shutdown_failures_total"
+                        )
+                        raise RuntimeError(
+                            "MapAnything active tensor capture did not quiesce "
+                            "before shutdown timeout"
+                        )
+                    self._async_idle.wait(timeout=remaining)
+            thread = self._async_thread
+        if completed:
+            self._raise_async_failure()
+            return
+
+        if thread is None:
+            if self._async_unfinished_task_count() != 0:
+                _increment_core_counter(
+                    "mapanything_async_shutdown_failures_total"
+                )
+                raise RuntimeError(
+                    "MapAnything has queued work without an owned worker"
+                )
+            self._async_stopped.set()
+            with self._async_idle:
+                self._async_shutdown_complete = True
+                self._async_idle.notify_all()
+            _increment_core_counter("mapanything_async_shutdown_total")
+            self._raise_async_failure()
+            return
+
+        with self._async_idle:
+            enqueue_stop = not self._async_stop_enqueued
+            if enqueue_stop:
+                self._async_stop_enqueued = True
+        if enqueue_stop:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0.0:
+                with self._async_idle:
+                    self._async_stop_enqueued = False
+                _increment_core_counter(
+                    "mapanything_async_shutdown_failures_total"
+                )
+                raise RuntimeError(
+                    "MapAnything shutdown timed out before stop enqueue"
+                )
+            try:
+                self._async_queue.put(
+                    _MAPANYTHING_ASYNC_STOP,
+                    timeout=remaining,
+                )
+            except queue.Full as exc:
+                with self._async_idle:
+                    self._async_stop_enqueued = False
+                _increment_core_counter(
+                    "mapanything_async_shutdown_failures_total"
+                )
+                raise RuntimeError(
+                    "MapAnything stop sentinel could not enter the bounded queue"
+                ) from exc
+
+        remaining = max(0.0, deadline - time.monotonic())
+        thread.join(timeout=remaining)
+        unfinished = self._async_unfinished_task_count()
+        if thread.is_alive() or not self._async_stopped.is_set() or unfinished != 0:
+            _increment_core_counter("mapanything_async_shutdown_failures_total")
+            raise RuntimeError(
+                "MapAnything async worker shutdown is unresolved "
+                f"(alive={thread.is_alive()} stopped={self._async_stopped.is_set()} "
+                f"unfinished={unfinished})"
+            )
+
+        with self._async_idle:
+            self._async_shutdown_complete = True
+            self._async_idle.notify_all()
+        _increment_core_counter("mapanything_async_shutdown_total")
+        self._raise_async_failure()
 
     def handle_nvds_tensor(self, frame_meta: Any, tensor_meta: Any) -> Optional[DepthResult]:
         if pyds is None:
@@ -1761,6 +2209,7 @@ class MapAnythingProcessor:
         frame_id: int,
         pts_ns: int,
         tensors: Mapping[str, np.ndarray],
+        captured_while_enabled: bool = False,
     ) -> Optional[DepthResult]:
         frame_meta = {
             "pad_index": source_id,
@@ -1768,7 +2217,11 @@ class MapAnythingProcessor:
             "buf_pts": pts_ns,
         }
         self.tensor_samples += 1
-        return self._emit_from_tensors(frame_meta, tensors)
+        return self._emit_from_tensors(
+            frame_meta,
+            tensors,
+            captured_while_enabled=bool(captured_while_enabled),
+        )
 
     def handle_native_frame_ds8(self, frame_meta: Any) -> Optional[DepthResult]:
         """Read MapAnything tensors from raw DeepStream frame metadata.
@@ -1784,32 +2237,43 @@ class MapAnythingProcessor:
         capture_fn = getattr(noesis_depth_tracking_tensor_ext, "capture_tensor_layers", None)
         if not callable(capture_fn):
             return None
+        self._begin_async_capture()
         try:
-            layers = capture_fn(frame_meta, int(self.gie_id))
-        except Exception:
-            logger.debug("Native MapAnything tensor capture failed", exc_info=True)
-            return None
-        if not layers:
-            return None
-        try:
-            tensors = {str(key): np.asarray(value) for key, value in dict(layers).items()}
-        except Exception:
-            logger.debug("Native MapAnything tensor payload was not array-like", exc_info=True)
-            return None
-        if not tensors:
-            return None
-        source_id = int(_meta_lookup(frame_meta, "pad_index", "source_id", default=0))
-        frame_id = int(_meta_lookup(frame_meta, "frame_num", "frame_number", default=0))
-        pts_ns = int(_meta_lookup(frame_meta, "buf_pts", "buffer_pts", default=0))
-        return self.handle_numpy_arrays(
-            source_id=source_id,
-            frame_id=frame_id,
-            pts_ns=pts_ns,
-            tensors=tensors,
-        )
+            try:
+                layers = capture_fn(frame_meta, int(self.gie_id))
+            except Exception:
+                logger.debug("Native MapAnything tensor capture failed", exc_info=True)
+                return None
+            if not layers:
+                return None
+            try:
+                tensors = {str(key): np.asarray(value) for key, value in dict(layers).items()}
+            except Exception:
+                logger.debug("Native MapAnything tensor payload was not array-like", exc_info=True)
+                return None
+            if not tensors:
+                return None
+            source_id = int(_meta_lookup(frame_meta, "pad_index", "source_id", default=0))
+            frame_id = int(_meta_lookup(frame_meta, "frame_num", "frame_number", default=0))
+            pts_ns = int(_meta_lookup(frame_meta, "buf_pts", "buffer_pts", default=0))
+            return self.handle_numpy_arrays(
+                source_id=source_id,
+                frame_id=frame_id,
+                pts_ns=pts_ns,
+                tensors=tensors,
+                captured_while_enabled=True,
+            )
+        finally:
+            self._end_async_capture()
 
-    def _emit_from_tensors(self, frame_meta: Any, tensors: Mapping[str, np.ndarray]) -> Optional[DepthResult]:
-        if not self.pipeline.depth_enabled:
+    def _emit_from_tensors(
+        self,
+        frame_meta: Any,
+        tensors: Mapping[str, np.ndarray],
+        *,
+        captured_while_enabled: bool = False,
+    ) -> Optional[DepthResult]:
+        if not self.pipeline.depth_enabled and not captured_while_enabled:
             logger.debug("Depth disabled; dropping MapAnything tensors")
             return None
 
@@ -1874,10 +2338,37 @@ class MapAnythingProcessor:
             if confidence.shape != depth.shape:
                 logger.debug("Confidence tensor shape %s does not match aligned depth %s", confidence.shape, depth.shape)
                 confidence = None
-        mask = np.asarray(mask, dtype=bool) if mask is not None else np.ones_like(depth, dtype=bool)
-        mask = np.logical_and(mask, np.isfinite(depth))
+        model_mask = (
+            np.asarray(mask, dtype=bool)
+            if mask is not None
+            else np.ones_like(depth, dtype=bool)
+        )
+        source_id = int(_meta_lookup(frame_meta, "pad_index", "source_id", default=0))
+        fov_mask = self._dewarper_validity_mask(source_id, (depth.shape[1], depth.shape[0]))
+        finite_depth = np.isfinite(depth) & (depth > 0.0)
+        if fov_mask is not None:
+            fov_mask = np.asarray(fov_mask, dtype=bool)
+            if fov_mask.shape != depth.shape:
+                raise RuntimeError(
+                    "calibrated MapAnything FoV mask shape "
+                    f"{fov_mask.shape} does not match depth {depth.shape}"
+                )
+
+        # The model output is a non-ambiguity signal, not a geometric
+        # invalidity mask. Keep dense finite depth for the manual quality path
+        # and carry model/dewarper uncertainty through confidence instead.
+        mask = finite_depth
 
         conf_array = confidence.astype(np.float32, copy=False) if confidence is not None else np.zeros_like(depth, dtype=np.float32)
+        conf_array = np.array(conf_array, dtype=np.float32, copy=True)
+        conf_array[~model_mask & finite_depth] *= float(
+            _MAPANYTHING_AMBIGUOUS_CONFIDENCE_SCALE
+        )
+        if fov_mask is not None:
+            conf_array[~fov_mask & finite_depth] *= float(
+                _MAPANYTHING_OUTSIDE_CALIBRATED_FOV_CONFIDENCE_SCALE
+            )
+        conf_array[~finite_depth] = 0.0
 
         valid = depth[mask]
         if self.tensor_samples <= 5 or (self.tensor_samples % 50) == 0:
@@ -1892,18 +2383,12 @@ class MapAnythingProcessor:
                 max_val,
             )
         if valid.size == 0:
-            if depth.size > 0:
-                depth = np.nan_to_num(depth, nan=0.0, posinf=0.0, neginf=0.0)
-                mask = np.ones_like(depth, dtype=bool)
-                if confidence is None:
-                    conf_array = np.zeros_like(depth, dtype=np.float32)
-                valid = depth[mask]
-                logger.debug("Depth all-NaN/invalid; filled zeros to emit frame")
-            else:
-                logger.debug("No valid depth pixels after masking; skipping frame")
-                return None
+            logger.debug("No finite positive MapAnything depth pixels; skipping frame")
+            return None
 
-        source_id = int(_meta_lookup(frame_meta, "pad_index", "source_id", default=0))
+        depth = np.array(depth, dtype=np.float32, copy=True)
+        depth[~mask] = np.nan
+
         frame_id = int(_meta_lookup(frame_meta, "frame_num", "frame_number", default=0))
         pts_ns = int(_meta_lookup(frame_meta, "buf_pts", "buffer_pts", default=0))
         # Some DS8 bindings expose GStreamer PTS (relative) rather than epoch time.
@@ -1924,13 +2409,24 @@ class MapAnythingProcessor:
         camera_id = str(self.camera_labels.get(source_id, source_id))
         mask_u8 = mask.astype(np.uint8, copy=False)
 
-        store_enabled_env = os.environ.get("NOESIS_DEPTH_STORE_ENABLED", "1")
-        store_enabled = str(store_enabled_env).strip().lower() in ("1", "true", "yes", "on")
-        if store_enabled:
-            dest_path = self.storage.store(camera_id, ts_us, depth, conf_array, mask_u8)
-            depth_ref = str(dest_path)
-        else:
-            depth_ref = f"memory://depth/{camera_id}/{ts_us}"
+        write_handle = self.storage.store(
+            camera_id,
+            ts_us,
+            depth,
+            conf_array,
+            mask_u8,
+        )
+        try:
+            commit_receipt = write_handle.wait(
+                timeout=self._storage_commit_timeout_s
+            )
+        except Exception:
+            _increment_core_counter(
+                "mapanything_depth_store_commit_failures_total"
+            )
+            raise
+        _increment_core_counter("mapanything_depth_store_commits_total")
+        depth_ref = str(commit_receipt.path)
         self.pipeline.record_depth_frame(time.time())
 
         result = DepthResult(
@@ -2152,6 +2648,7 @@ class _TrailTrackState:
     vel_world_x: float = 0.0
     vel_world_z: float = 0.0
     last_measure_speed: float = 0.0
+    trail_segment_id: Optional[int] = None
 
 
 # Shared person-ground types (Phases 1–6). Historical names retained for tests/call sites.
@@ -2210,12 +2707,16 @@ class _AlignedDepthFrameStore:
     def __init__(self, max_entries: int = 16) -> None:
         self._max_entries = max(2, int(max_entries))
         self._entries: "OrderedDict[FrameKey, _AlignedDepthFrame]" = OrderedDict()
+        self._condition = threading.Condition()
 
     def put(self, frame: _AlignedDepthFrame) -> None:
-        self._entries[frame.key] = frame
-        self._entries.move_to_end(frame.key)
-        while len(self._entries) > self._max_entries:
-            self._entries.popitem(last=False)
+        with self._condition:
+            self._entries[frame.key] = frame
+            self._entries.move_to_end(frame.key)
+            while len(self._entries) > self._max_entries:
+                self._entries.popitem(last=False)
+            self._condition.notify_all()
+        _increment_core_counter("depth_bridge_put_total")
 
     def resolve(
         self,
@@ -2224,21 +2725,56 @@ class _AlignedDepthFrameStore:
         frame_id: int,
         pts_us: int,
         max_age_frames: int,
+        wait_ms: float = 0.0,
     ) -> Tuple[Optional[_AlignedDepthFrame], int, float]:
-        exact = self._entries.get((int(source_id), int(frame_id), int(pts_us)))
-        if exact is not None:
-            return exact, 0, 0.0
+        source_key = int(source_id)
+        frame_key = int(frame_id)
+        pts_key = int(pts_us)
+        exact_key = (source_key, frame_key, pts_key)
         max_age = max(0, int(max_age_frames))
-        if max_age <= 0:
-            return None, 0, 0.0
-        for candidate in reversed(list(self._entries.values())):
-            if int(candidate.source_id) != int(source_id):
-                continue
-            age_frames = int(frame_id) - int(candidate.frame_id)
-            if age_frames < 0 or age_frames > max_age:
-                continue
-            age_ms = max(0.0, float(int(pts_us) - int(candidate.pts_us)) / 1000.0)
-            return candidate, age_frames, age_ms
+        bounded_wait_ms = _bounded_object_depth_wait_ms(wait_ms)
+        with self._condition:
+            exact = self._entries.get(exact_key)
+            if exact is not None:
+                _increment_core_counter("depth_bridge_exact_resolve_total")
+                return exact, 0, 0.0
+
+            if bounded_wait_ms > 0.0:
+                _increment_core_counter("depth_bridge_wait_total")
+                deadline = time.monotonic() + (bounded_wait_ms / 1000.0)
+                while exact is None:
+                    remaining_s = deadline - time.monotonic()
+                    if remaining_s <= 0.0:
+                        break
+                    self._condition.wait(timeout=remaining_s)
+                    exact = self._entries.get(exact_key)
+                if exact is not None:
+                    _increment_core_counter("depth_bridge_exact_resolve_total")
+                    return exact, 0, 0.0
+                _increment_core_counter("depth_bridge_wait_timeout_total")
+
+            if max_age > 0:
+                for candidate in reversed(tuple(self._entries.values())):
+                    if int(candidate.source_id) != source_key:
+                        continue
+                    age_frames = frame_key - int(candidate.frame_id)
+                    if age_frames <= 0 or age_frames > max_age:
+                        continue
+                    age_us = pts_key - int(candidate.pts_us)
+                    if age_us < 0:
+                        continue
+                    age_ms = float(age_us) / 1000.0
+                    _increment_core_counter("depth_bridge_lagged_resolve_total")
+                    _increment_core_counter(
+                        "depth_bridge_lagged_age_frames_total",
+                        age_frames,
+                    )
+                    _increment_core_counter(
+                        "depth_bridge_lagged_age_us_total",
+                        age_us,
+                    )
+                    return candidate, age_frames, age_ms
+        _increment_core_counter("depth_bridge_miss_total")
         return None, 0, 0.0
 
 
@@ -3058,6 +3594,19 @@ class TrailOverlayProcessor:
             track_info = track_map.get(int(track_id)) if isinstance(track_map, Mapping) else None
             append_allowed = True
             if isinstance(track_info, Mapping):
+                segment_id = track_info.get("trail_segment_id")
+                segment_changed = (
+                    segment_id is not None
+                    and state.trail_segment_id is not None
+                    and int(segment_id) != int(state.trail_segment_id)
+                )
+                if bool(track_info.get("trail_break_required", False)) or segment_changed:
+                    state.points.clear()
+                    state.ema_x = None
+                    state.ema_y = None
+                    state.ema_ts = 0.0
+                if segment_id is not None:
+                    state.trail_segment_id = int(segment_id)
                 if "trail_append_allowed" in track_info:
                     append_allowed = bool(track_info.get("trail_append_allowed"))
                 motion_mode = str(track_info.get("motion_mode") or "").strip().lower()
@@ -4327,11 +4876,14 @@ class _DepthTrackingFrameProcessor:
             return
         depth_w = int(getattr(depth_device_frame, "depth_width", frame_w) or frame_w)
         depth_h = int(getattr(depth_device_frame, "depth_height", frame_h) or frame_h)
+        source_id = int(_meta_lookup(frame_meta, "source_id", "pad_index", default=0) or 0)
+        frame_id = int(_meta_lookup(frame_meta, "frame_number", "frame_num", default=0) or 0)
+        pts_us = _frame_pts_key_us(frame_meta)
         frame = _AlignedDepthFrame(
-            key=_depth_frame_key(frame_meta),
-            source_id=int(_meta_lookup(frame_meta, "source_id", "pad_index", default=0) or 0),
-            frame_id=int(_meta_lookup(frame_meta, "frame_number", "frame_num", default=0) or 0),
-            pts_us=_frame_pts_key_us(frame_meta),
+            key=(source_id, frame_id, pts_us),
+            source_id=source_id,
+            frame_id=frame_id,
+            pts_us=pts_us,
             depth_map=None,
             valid_mask=None,
             frame_w=frame_w,
@@ -4344,6 +4896,7 @@ class _DepthTrackingFrameProcessor:
             depth_device_frame=depth_device_frame,
         )
         self.depth_store.put(frame)
+        _increment_core_counter("depth_tracking_device_frames_total")
 
 
 @dataclass
@@ -4371,6 +4924,16 @@ class _ObjectDepthFusionProcessor:
 
     def _cache_max_bbox_shift(self) -> float:
         return _read_env_float("NOESIS_OBJECT_DEPTH_CACHE_MAX_BBOX_SHIFT", 0.25, min_value=0.0)
+
+    def _exact_frame_wait_ms(self) -> float:
+        raw = os.environ.get(
+            "NOESIS_OBJECT_DEPTH_EXACT_FRAME_WAIT_MS",
+            str(_OBJECT_DEPTH_EXACT_FRAME_WAIT_DEFAULT_MS),
+        )
+        return _bounded_object_depth_wait_ms(
+            raw,
+            default=_OBJECT_DEPTH_EXACT_FRAME_WAIT_DEFAULT_MS,
+        )
 
     def _allow_host_roi_copy(self) -> bool:
         return _read_env_bool("NOESIS_OBJECT_DEPTH_ALLOW_HOST_ROI_COPY", False)
@@ -4509,18 +5072,75 @@ class _ObjectDepthFusionProcessor:
             metric="object_depth.user_meta_json",
         )
 
-    def _attach_object_depth_payload(self, obj_meta: Any, payload: Mapping[str, Any] | str) -> bool:
+    def _record_object_depth_attach(
+        self,
+        *,
+        attached: bool,
+        status: str | None,
+        failure_reason: str | None = None,
+    ) -> bool:
+        if attached:
+            _increment_core_counter("object_depth_attach_total")
+            status_key = re.sub(
+                r"[^a-z0-9_]+",
+                "_",
+                str(status or "unknown").strip().lower(),
+            ).strip("_") or "unknown"
+            _increment_core_counter(f"object_depth_status_total.{status_key}")
+            return True
+        reason_key = re.sub(
+            r"[^a-z0-9_]+",
+            "_",
+            str(failure_reason or "unknown").strip().lower(),
+        ).strip("_") or "unknown"
+        count = _increment_core_counter("object_depth_attach_failure_total")
+        _increment_core_counter(f"object_depth_attach_failure_total.{reason_key}")
+        if count <= 3 or (count % 250) == 0:
+            logger.warning(
+                "NOESIS.OBJECT_DEPTH attachment failed (reason=%s, count=%d)",
+                reason_key,
+                count,
+            )
+        return False
+
+    def _attach_object_depth_payload(
+        self,
+        obj_meta: Any,
+        payload: Mapping[str, Any] | str,
+        *,
+        status: str | None = None,
+    ) -> bool:
+        payload_status = status
+        if payload_status is None and isinstance(payload, Mapping):
+            payload_status = str(payload.get("status") or "unknown")
         if noesis_depth_meta_ext is None:
-            return False
+            return self._record_object_depth_attach(
+                attached=False,
+                status=payload_status,
+                failure_reason="native_extension_unavailable",
+            )
         attach_fn = getattr(noesis_depth_meta_ext, "attach_object_depth", None)
         if not callable(attach_fn):
-            return False
+            return self._record_object_depth_attach(
+                attached=False,
+                status=payload_status,
+                failure_reason="attach_function_unavailable",
+            )
         try:
             payload_json = payload if isinstance(payload, str) else self._payload_json(payload)
-            return bool(attach_fn(obj_meta, payload_json, True))
+            attached = bool(attach_fn(obj_meta, payload_json, True))
         except Exception:
             logger.exception("Failed to attach NOESIS.OBJECT_DEPTH to object metadata")
-            return False
+            return self._record_object_depth_attach(
+                attached=False,
+                status=payload_status,
+                failure_reason="native_exception",
+            )
+        return self._record_object_depth_attach(
+            attached=attached,
+            status=payload_status,
+            failure_reason=None if attached else "native_rejected",
+        )
 
     def _resolve_calibration_snapshot(self, source_id: int) -> Any | None:
         resolver = self.calibration_resolver
@@ -4566,6 +5186,7 @@ class _ObjectDepthFusionProcessor:
             )
             _increment_core_counter("detection_wake.object_depth_roi_copy")
             _increment_core_counter("tensor_host_copies_total.object_depth_roi")
+            _increment_core_counter("object_depth_gpu_roi_copies_total")
             return roi
         except Exception:
             logger.exception("GPU depth ROI copy failed")
@@ -4777,6 +5398,7 @@ class _ObjectDepthFusionProcessor:
             return None
         if not isinstance(stats_raw, Mapping):
             return None
+        _increment_core_counter("object_depth_gpu_roi_copies_total")
         stats = dict(stats_raw)
         try:
             sample_count = int(stats.get("sample_count", 0) or 0)
@@ -4984,6 +5606,7 @@ class _ObjectDepthFusionProcessor:
             )
         if stats is None:
             return None
+        _increment_core_counter("object_depth_gpu_roi_copies_total")
 
         def _int_stat(key: str, default: int = 0) -> int:
             try:
@@ -5268,12 +5891,8 @@ class _ObjectDepthFusionProcessor:
         source_id = int(_meta_lookup(frame_meta, "source_id", "pad_index", default=0) or 0)
         frame_id = int(_meta_lookup(frame_meta, "frame_number", "frame_num", default=0) or 0)
         pts_us = _frame_pts_key_us(frame_meta)
-        depth_frame, _age_frames, _age_ms = self.depth_store.resolve(
-            source_id=source_id,
-            frame_id=frame_id,
-            pts_us=pts_us,
-            max_age_frames=max(0, int(self.depth_every_n_frames) - 1),
-        )
+        depth_frame: Optional[_AlignedDepthFrame] = None
+        depth_frame_resolved = False
         samples_remaining = self._max_objects_per_frame()
         for obj_meta in getattr(frame_meta, "object_items", None) or []:
             try:
@@ -5306,6 +5925,15 @@ class _ObjectDepthFusionProcessor:
                 continue
             samples_remaining -= 1
             sample_start_ns = time.perf_counter_ns()
+            if not depth_frame_resolved:
+                depth_frame, _age_frames, _age_ms = self.depth_store.resolve(
+                    source_id=source_id,
+                    frame_id=frame_id,
+                    pts_us=pts_us,
+                    max_age_frames=max(0, int(self.depth_every_n_frames) - 1),
+                    wait_ms=self._exact_frame_wait_ms(),
+                )
+                depth_frame_resolved = True
             if depth_frame is None:
                 result = self._build_result(frame_meta, obj_meta, bbox=bbox, status="depth_not_ready")
             else:
@@ -5323,10 +5951,14 @@ class _ObjectDepthFusionProcessor:
                 payload=payload,
                 payload_json=payload_json,
             )
-            self._attach_object_depth_payload(obj_meta, payload_json)
+            self._attach_object_depth_payload(
+                obj_meta,
+                payload_json,
+                status=str(payload.get("status") or "unknown"),
+            )
 
 
-class _DepthTrackingFrameOperator(BatchMetadataOperator):  # pragma: no cover - requires DS runtime
+class _DepthTrackingFrameOperator(_BatchMetadataOperatorBase):  # pragma: no cover - requires DS runtime
     def __init__(self, processor: _DepthTrackingFrameProcessor) -> None:
         super().__init__()
         self.processor = processor
@@ -5342,7 +5974,7 @@ class _DepthTrackingFrameOperator(BatchMetadataOperator):  # pragma: no cover - 
                 logger.exception("Failed to capture aligned DAv2 depth frame within batch metadata (DS8)")
 
 
-class _ObjectDepthFusionOperator(BatchMetadataOperator):  # pragma: no cover - requires DS runtime
+class _ObjectDepthFusionOperator(_BatchMetadataOperatorBase):  # pragma: no cover - requires DS runtime
     def __init__(self, processor: _ObjectDepthFusionProcessor) -> None:
         super().__init__()
         self.processor = processor
@@ -5368,6 +6000,8 @@ class _AnalyticsTelemetryProcessor:
     bev_renderer: Any = None
     bev_calibration: Any = None
     depth_registration: DepthRegistrationManager | None = None
+    world_fusion_policy: WorldFusionPolicy | None = None
+    scene_priors: ScenePriorSet | None = None
     diagnostics_logger: Any = None
     osd_label_processor: Any = None
     _analytics_obj_meta_type: Any = field(default=None, init=False, repr=False)
@@ -5381,7 +6015,8 @@ class _AnalyticsTelemetryProcessor:
     _bev_class_ids: frozenset[int] = field(default_factory=lambda: frozenset({0}), init=False, repr=False)
     _bev_class_ids_ready: bool = field(default=False, init=False, repr=False)
     _reid_unique_id: int = field(default=3, init=False, repr=False)
-    _reid_layer_name: str = field(default="features", init=False, repr=False)
+    _reid_layer_name: str = field(default=REID_SWIN_OUTPUT_LAYER, init=False, repr=False)
+    _reid_embedding_dim: int = field(default=REID_SWIN_EMBEDDING_DIM, init=False, repr=False)
     _reid_diag_use_tracker_id: bool = field(default=False, init=False, repr=False)
     _mask_alpha: float = field(default=0.35, init=False, repr=False)
     _mask_alpha_ready: bool = field(default=False, init=False, repr=False)
@@ -5402,6 +6037,7 @@ class _AnalyticsTelemetryProcessor:
     _v3dt_caminfo_paths: Dict[int, Path] = field(default_factory=dict, init=False, repr=False)
     _v3dt_caminfo_cache: Dict[int, Tuple[str, List[List[float]]]] = field(default_factory=dict, init=False, repr=False)
     _v3dt_caminfo_logged_missing: bool = field(default=False, init=False, repr=False)
+    _v3dt_axis_map: V3DTAxisMap | None = field(default=None, init=False, repr=False)
     _sid_metrics_log_enabled: bool = field(default=True, init=False, repr=False)
     _sid_metrics_log_interval_s: float = field(default=10.0, init=False, repr=False)
     _sid_metrics_last_log_by_sensor: Dict[int, float] = field(default_factory=dict, init=False, repr=False)
@@ -5431,11 +6067,15 @@ class _AnalyticsTelemetryProcessor:
     _pose_anchor_native_per_frame_max: int = field(default=1, init=False, repr=False)
     _pose_anchor_native_remaining: int = field(default=1, init=False, repr=False)
     _tracking_publish_interval_s: float = field(default=0.0, init=False, repr=False)
+    _tracking_empty_publish_interval_s: float = field(default=0.5, init=False, repr=False)
     _bev_publish_interval_s: float = field(default=0.0, init=False, repr=False)
     _last_tracking_publish_ts_by_sensor: Dict[int, float] = field(default_factory=dict, init=False, repr=False)
     _last_bev_publish_ts_by_sensor: Dict[int, float] = field(default_factory=dict, init=False, repr=False)
     _last_tracking_count_by_sensor: Dict[int, int] = field(default_factory=dict, init=False, repr=False)
     _last_bev_count_by_sensor: Dict[int, int] = field(default_factory=dict, init=False, repr=False)
+    _tracking_lifecycle: TrackingLifecycleRegistry = field(
+        default_factory=TrackingLifecycleRegistry, init=False, repr=False
+    )
 
     def __post_init__(self) -> None:
         # Discover the ReID SGIE unique-id from the built pipeline config when present.
@@ -5449,18 +6089,28 @@ class _AnalyticsTelemetryProcessor:
                 layer_name = reid_cfg.get("layer")
                 if layer_name:
                     self._reid_layer_name = str(layer_name)
+                embedding_dim = reid_cfg.get("embedding_dim")
+                if embedding_dim is not None:
+                    self._reid_embedding_dim = int(embedding_dim)
         except Exception:
             self._reid_unique_id = 3
 
         self._tracking_mode = self._resolve_tracking_mode(self.tracking_mode)
 
-        try:
-            v3dt_cfg = getattr(self.pipeline, "config", {}).get("v3dt", {}) or {}
-            frame = v3dt_cfg.get("world_frame") if isinstance(v3dt_cfg, dict) else None
-            if frame:
-                self._world_frame = str(frame)
-        except Exception:
+        v3dt_cfg = getattr(self.pipeline, "config", {}).get("v3dt", {}) or {}
+        if self._tracking_mode_is_v3dt():
+            if not isinstance(v3dt_cfg, Mapping):
+                raise ValueError("V3DT runtime requires an explicit v3dt config mapping")
+            if v3dt_cfg.get("world_frame") != "backend_world_m":
+                raise ValueError(
+                    "V3DT runtime requires world_frame=backend_world_m after camInfo axis restoration"
+                )
             self._world_frame = "backend_world_m"
+            self._v3dt_axis_map = V3DTAxisMap.parse(
+                v3dt_cfg.get("caminfo_world_axes")
+            )
+        elif isinstance(v3dt_cfg, Mapping) and v3dt_cfg.get("world_frame"):
+            self._world_frame = str(v3dt_cfg["world_frame"])
 
         flag = str(os.environ.get("NOESIS_V3DT_META_EXTRACT", "1") or "").strip().lower()
         self._v3dt_meta_enabled = flag in ("", "1", "true", "yes", "y", "on")
@@ -5579,8 +6229,29 @@ class _AnalyticsTelemetryProcessor:
             _read_env_float("NOESIS_WS_BEV_MAX_HZ", 12.0, min_value=0.0),
             min_value=0.0,
         )
+        empty_tracking_hz = _read_env_float(
+            "NOESIS_TRACKING_EMPTY_HEARTBEAT_HZ",
+            2.0,
+            min_value=0.0,
+        )
         self._tracking_publish_interval_s = 0.0 if tracking_max_hz <= 0.0 else 1.0 / float(tracking_max_hz)
+        self._tracking_empty_publish_interval_s = (
+            0.0 if empty_tracking_hz <= 0.0 else 1.0 / float(empty_tracking_hz)
+        )
         self._bev_publish_interval_s = 0.0 if bev_max_hz <= 0.0 else 1.0 / float(bev_max_hz)
+
+    def _tracking_interval_for_frame(self, track_count: int) -> float:
+        return pair_safe_publication_interval_s(
+            track_count=int(track_count),
+            tracking_interval_s=float(
+                getattr(self, "_tracking_publish_interval_s", 0.0)
+            ),
+            empty_tracking_interval_s=float(
+                getattr(self, "_tracking_empty_publish_interval_s", 0.0)
+            ),
+            bev_interval_s=float(getattr(self, "_bev_publish_interval_s", 0.0)),
+            bev_active=getattr(self, "bev_renderer", None) is not None,
+        )
 
     def _publish_gate_due(
         self,
@@ -5593,13 +6264,20 @@ class _AnalyticsTelemetryProcessor:
         interval_s: float,
         counter_prefix: str,
         update: bool = True,
+        force: bool = False,
     ) -> bool:
         sid = int(sensor_id)
         current_count = int(count)
         previous_count = count_by_sensor.get(sid)
         last_ts = float(last_by_sensor.get(sid, 0.0))
         count_changed = previous_count is None or int(previous_count) != current_count
-        due = bool(count_changed or interval_s <= 0.0 or last_ts <= 0.0 or (float(now_ts) - last_ts) >= float(interval_s))
+        due = bool(
+            force
+            or count_changed
+            or interval_s <= 0.0
+            or last_ts <= 0.0
+            or (float(now_ts) - last_ts) >= float(interval_s)
+        )
         if due:
             if update:
                 last_by_sensor[sid] = float(now_ts)
@@ -5847,8 +6525,13 @@ class _AnalyticsTelemetryProcessor:
             return None
         if not (math.isfinite(x) and math.isfinite(y) and math.isfinite(z) and math.isfinite(z_len)):
             return None
-        z_base = z - 0.5 * z_len
-        uv = self._project_point(P, (x, y, z_base))
+        # The xzy camInfo lane places the tracker ground endpoint at
+        # zCentre-0.5*zLen. NVIDIA's image-foot meta follows that model point,
+        # while the opposite vertical endpoint aligns with the visible detector
+        # base in the validated three-camera lane. Publish that projected point
+        # as image_base; canonical world still uses the ground endpoint.
+        z_image_base = z + 0.5 * z_len
+        uv = self._project_point(P, (x, y, z_image_base))
         if uv is None:
             return None
         u, v = uv
@@ -5864,14 +6547,13 @@ class _AnalyticsTelemetryProcessor:
             return
         self._diag_logged = True
         try:
-            payload = {
-                "type": "v3dt_session_start",
-                "ts": time.time(),
-                "camera_labels": dict(self.camera_labels or {}),
-                "sensor_id_map": dict(self.sensor_id_map or {}),
-                "pipeline_config": getattr(self.pipeline, "config", {}),
-                "env": {k: v for k, v in os.environ.items() if k.startswith("NOESIS_")},
-            }
+            if build_v3dt_session_start_payload is None:
+                raise RuntimeError("V3DT diagnostic context builder is unavailable")
+            payload = build_v3dt_session_start_payload(
+                pipeline_config=getattr(self.pipeline, "config", {}),
+                camera_labels=self.camera_labels or {},
+                sensor_id_map=self.sensor_id_map or {},
+            )
             self.diagnostics_logger.log_event(payload)
         except Exception:
             logger.debug("Failed to log V3DT diagnostics session start", exc_info=True)
@@ -5897,19 +6579,14 @@ class _AnalyticsTelemetryProcessor:
         except Exception:
             return None
 
-    @staticmethod
-    def _world_from_bbox3d(bbox3d: Mapping[str, Any]) -> Optional[List[float]]:
+    def _world_from_bbox3d(self, bbox3d: Mapping[str, Any]) -> Optional[List[float]]:
+        if self._v3dt_axis_map is None:
+            raise V3DTAxisMapError("V3DT axis map was not initialized")
         try:
-            x = float(bbox3d.get("xCentre"))
-            y = float(bbox3d.get("yCentre"))
-            z = float(bbox3d.get("zCentre"))
-            z_len = float(bbox3d.get("zLen"))
-        except Exception:
+            world = v3dt_bbox3d_world_foot(bbox3d, self._v3dt_axis_map)
+        except V3DTAxisMapError:
             return None
-        if not (math.isfinite(x) and math.isfinite(y) and math.isfinite(z) and math.isfinite(z_len)):
-            return None
-        # SV3DT uses Z-up; place the footpoint on the ground plane (Z = center - 0.5 * height).
-        return [float(x), float(y), float(z - 0.5 * z_len)]
+        return [float(world[0]), float(world[1]), float(world[2])]
 
     def _extract_reid_embedding_native(self, obj_meta: Any) -> Optional[np.ndarray]:
         if noesis_reid_meta_ext is None:
@@ -5922,7 +6599,7 @@ class _AnalyticsTelemetryProcessor:
                 obj_meta,
                 int(self._reid_unique_id),
                 str(self._reid_layer_name),
-                512,
+                int(self._reid_embedding_dim),
                 True,
             )
         except Exception:
@@ -5944,7 +6621,7 @@ class _AnalyticsTelemetryProcessor:
         return (emb / n).astype(np.float32, copy=False)
 
     def _extract_reid_embedding_ds8(self, obj_meta: Any) -> Optional[np.ndarray]:
-        """Extract OSNet embedding from DS8 object tensor meta (SGIE output)."""
+        """Extract the configured ReID embedding from object tensor metadata."""
         emb_native = self._extract_reid_embedding_native(obj_meta)
         if emb_native is not None:
             return emb_native
@@ -5962,6 +6639,12 @@ class _AnalyticsTelemetryProcessor:
             sensor_id = self.sensor_id_map.get(source_id, source_id)
             camera_id = self.camera_labels.get(sensor_id, f"camera_{sensor_id}")
             now_ts = time.time()
+            public_frame_timing = _public_frame_timing(frame_meta, now_ts)
+            identity_v2_service = getattr(self.pipeline, "identity_v2_service", None)
+            identity_v2_authoritative = bool(
+                identity_v2_service is not None
+                and getattr(identity_v2_service, "authoritative", False)
+            )
             self._pose_anchor_native_remaining = int(self._pose_anchor_native_per_frame_max)
             reid_budget_remaining = int(self._reid_embeds_per_frame_max)
             _increment_core_counter("detection_wake.frames")
@@ -5978,6 +6661,7 @@ class _AnalyticsTelemetryProcessor:
             present_track_ids: set[int] = set()
             present_stable_ids: set[int] = set()
             footpoints: List[Footpoint] = []
+            identity_v2_primitives: List[IdentityFramePrimitive] = []
             frame_dims = self._track_image_size(sensor_id, frame_meta)
 
             # Service Maker object_items is a one-shot iterator of transient
@@ -6015,6 +6699,8 @@ class _AnalyticsTelemetryProcessor:
                     class_id = -1
 
                 zone = raw.get("zone")
+                zone_source = raw.get("zone_source")
+                zone_authoritative = raw.get("zone_authoritative") is True
 
                 # People-only public identity. Do not show raw tracker IDs.
                 if class_id != 0:
@@ -6026,32 +6712,40 @@ class _AnalyticsTelemetryProcessor:
                 _increment_core_counter("detection_wake.person_tracks")
                 if not zone:
                     zone = _fallback_zone_from_camera(camera_id)
+                    zone_source = "camera_default" if zone else None
+                    zone_authoritative = False
 
                 if reid_debug:
                     self._reid_debug_people += 1
 
                 emb = None
                 mgr = getattr(self.pipeline, "stable_id_mgr", None)
-                if self._stable_id_enabled and mgr is not None:
+                identity_v2_enabled = identity_v2_service is not None
+                if identity_v2_enabled or (self._stable_id_enabled and mgr is not None):
                     need_emb = True
-                    needs_fn = getattr(mgr, "needs_embedding", None)
-                    if callable(needs_fn):
-                        try:
-                            need_emb = bool(needs_fn(int(sensor_id), int(track_id), float(now_ts)))
-                        except Exception:
-                            need_emb = True
-                    else:
-                        try:
-                            rec = mgr.active_tracks.get((int(sensor_id), int(track_id)))
-                            need_emb = rec is None or rec.get("emb") is None
-                        except Exception:
-                            need_emb = True
-                    if need_emb:
+                    if (
+                        self._stable_id_enabled
+                        and mgr is not None
+                        and not identity_v2_authoritative
+                    ):
+                        needs_fn = getattr(mgr, "needs_embedding", None)
+                        if callable(needs_fn):
+                            try:
+                                need_emb = bool(needs_fn(int(sensor_id), int(track_id), float(now_ts)))
+                            except Exception:
+                                need_emb = True
+                        else:
+                            try:
+                                rec = mgr.active_tracks.get((int(sensor_id), int(track_id)))
+                                need_emb = rec is None or rec.get("emb") is None
+                            except Exception:
+                                need_emb = True
+                    if need_emb or identity_v2_enabled:
                         _increment_core_counter("detection_wake.reid_emb_due")
-                        if reid_budget_remaining <= 0:
+                        if reid_budget_remaining <= 0 and not identity_v2_enabled:
                             _increment_core_counter("detection_wake.reid_emb_budget_skipped")
                         else:
-                            reid_budget_remaining -= 1
+                            reid_budget_remaining = max(0, reid_budget_remaining - 1)
                             reid_start_ns = time.perf_counter_ns()
                             emb = self._extract_reid_embedding_ds8(obj_meta)
                             _record_core_stage_timing("reid.extract_embedding", reid_start_ns)
@@ -6065,13 +6759,16 @@ class _AnalyticsTelemetryProcessor:
                             else:
                                 self._reid_debug_emb_found += 1
 
-                pose_features, pose_quality = self._extract_stable_id_pose_inputs(
-                    obj_meta,
-                    mgr,
-                    sensor_id=int(sensor_id),
-                    track_id=int(track_id),
-                    now_ts=float(now_ts),
-                )
+                if identity_v2_authoritative:
+                    pose_features, pose_quality = None, None
+                else:
+                    pose_features, pose_quality = self._extract_stable_id_pose_inputs(
+                        obj_meta,
+                        mgr,
+                        sensor_id=int(sensor_id),
+                        track_id=int(track_id),
+                        now_ts=float(now_ts),
+                    )
                 # World must be available BEFORE StableID so same-frame overlap
                 # permits are not denied as missing_world on first sightings.
                 world_xy, world_valid, pose_kpts_abs, depth_result = (
@@ -6085,33 +6782,51 @@ class _AnalyticsTelemetryProcessor:
                     )
                 )
 
-                sid_start_ns = time.perf_counter_ns()
-                stable_id = self._maybe_assign_stable_id(
-                    sensor_id=sensor_id,
-                    track_id=track_id,
-                    bbox=raw.get("bbox"),
-                    zone=zone,
-                    ts=now_ts,
-                    frame_bgr=None,
-                    embedding=emb,
-                    pose_features=pose_features,
-                    pose_quality=pose_quality,
-                    world_xy=world_xy,
-                    world_valid=world_valid,
-                )
-                _record_core_stage_timing("stable_id.update_track", sid_start_ns)
+                stable_id = None
+                if not identity_v2_authoritative:
+                    sid_start_ns = time.perf_counter_ns()
+                    stable_id = self._maybe_assign_stable_id(
+                        sensor_id=sensor_id,
+                        track_id=track_id,
+                        bbox=raw.get("bbox"),
+                        zone=zone,
+                        ts=now_ts,
+                        frame_bgr=None,
+                        embedding=emb,
+                        pose_features=pose_features,
+                        pose_quality=pose_quality,
+                        world_xy=world_xy,
+                        world_valid=world_valid,
+                    )
+                    _record_core_stage_timing("stable_id.update_track", sid_start_ns)
                 if stable_id is None:
-                    # People should always have a stable_id; if we can't produce one, show placeholder.
-                    self._stamp_osd_label_ds8(obj_meta, sensor_id=sensor_id, stable_id=None)
-                    if diag_track is not None:
-                        diagnostics_tracks.append(diag_track)
-                    continue
+                    if not identity_v2_authoritative:
+                        callback = getattr(
+                            self.pipeline, "identity_v2_failure_callback", None
+                        )
+                        if callable(callback) and identity_v2_service is not None:
+                            callback(
+                                RuntimeError(
+                                    "legacy identity unavailable while identity-v2 is shadowing"
+                                )
+                            )
+                        self._stamp_osd_label_ds8(
+                            obj_meta, sensor_id=sensor_id, stable_id=None
+                        )
+                        if diag_track is not None:
+                            diagnostics_tracks.append(diag_track)
+                        continue
 
-                stable_id_int = int(stable_id)
-                present_stable_ids.add(stable_id_int)
+                stable_id_int = int(stable_id) if stable_id is not None else 0
+                if stable_id_int > 0:
+                    present_stable_ids.add(stable_id_int)
                 tracker_id_int = int(track_id)
                 id_diag: Dict[str, Any] = {}
-                get_id_diag = getattr(mgr, "get_track_diagnostics", None)
+                get_id_diag = (
+                    getattr(mgr, "get_track_diagnostics", None)
+                    if not identity_v2_authoritative
+                    else None
+                )
                 if callable(get_id_diag):
                     try:
                         id_diag = dict(get_id_diag(int(sensor_id), int(track_id)) or {})
@@ -6122,17 +6837,25 @@ class _AnalyticsTelemetryProcessor:
                 sid_candidate = id_diag.get("sid_candidate")
                 embedding_present = bool(id_diag.get("embedding_present", emb is not None))
                 id_display = None
-                if self._reid_diag_use_tracker_id:
+                if self._reid_diag_use_tracker_id and stable_id_int > 0:
                     id_display = f"[{tracker_id_int}] | [{stable_id_int}]"
 
-                dwell = self._update_dwell_time(sensor_id, stable_id_int, zone, now_ts)
+                dwell = (
+                    self._update_dwell_time(sensor_id, stable_id_int, zone, now_ts)
+                    if stable_id_int > 0 and not identity_v2_authoritative
+                    else None
+                )
 
                 analytics = raw.get("analytics")
                 if analytics and "lcStatus" in analytics:
                     lc = analytics["lcStatus"]
                     if isinstance(lc, dict):
                         for line_name, status in lc.items():
-                            if status == 1:
+                            if (
+                                status == 1
+                                and stable_id_int > 0
+                                and not identity_v2_authoritative
+                            ):
                                 self._record_transition(
                                     sensor_id=sensor_id,
                                     stable_id=stable_id_int,
@@ -6160,7 +6883,7 @@ class _AnalyticsTelemetryProcessor:
                     pose_present = pose_kpts_abs is not None
 
                 public_track: Dict[str, Any] = {
-                    "stable_id": stable_id_int,
+                    "stable_id": stable_id_int if stable_id_int > 0 else None,
                     "tracker_id": tracker_id_int,
                     "camera_id": camera_id,
                     "bbox": raw.get("bbox"),
@@ -6170,6 +6893,8 @@ class _AnalyticsTelemetryProcessor:
                     "tracker_confidence": raw.get("tracker_confidence"),
                     "analytics": raw.get("analytics"),
                     "zone": zone,
+                    "zone_source": zone_source,
+                    "zone_authoritative": zone_authoritative,
                     "frame_id": frame_id,
                     "dwell_time": dwell,
                     "id_event": id_event,
@@ -6177,6 +6902,7 @@ class _AnalyticsTelemetryProcessor:
                     "embedding_present": bool(embedding_present),
                     "pose_present": bool(pose_present),
                     "sid_candidate": sid_candidate,
+                    **public_frame_timing,
                 }
                 self._apply_household_id_diag_fields(public_track, id_diag)
                 frame_w, frame_h = frame_dims
@@ -6199,6 +6925,9 @@ class _AnalyticsTelemetryProcessor:
                 ):
                     if key in raw:
                         public_track[key] = raw.get(key)
+                for key in _WORLD_ESTIMATOR_DIAGNOSTIC_FIELDS:
+                    if key in raw:
+                        public_track[key] = raw.get(key)
 
                 # Idempotent when world was already filled pre-StableID.
                 self._augment_track_with_world(
@@ -6209,6 +6938,7 @@ class _AnalyticsTelemetryProcessor:
                     pose_kpts_abs=pose_kpts_abs,
                     depth_result=depth_result,
                 )
+                self._apply_scene_prior_shadow(camera_id, public_track)
                 self._record_stable_id_world_cache(sensor_id, track_id, public_track, now_ts)
                 self._apply_public_depth_fields(public_track, depth_result)
                 try:
@@ -6217,8 +6947,15 @@ class _AnalyticsTelemetryProcessor:
                     pass
                 # Stamp OSD label after world/depth augmentation so z= reflects the
                 # registered depth actually used by the estimator.
-                self._stamp_osd_label_ds8(obj_meta, sensor_id=sensor_id, stable_id=stable_id_int)
-                self._apply_instance_mask_color_ds8(obj_meta, stable_id=stable_id_int)
+                self._stamp_osd_label_ds8(
+                    obj_meta,
+                    sensor_id=sensor_id,
+                    # Zero is an explicit neutral override.  None would ask the
+                    # OSD processor to look up stale legacy StableID state.
+                    stable_id=0 if identity_v2_authoritative else stable_id_int,
+                )
+                if not identity_v2_authoritative:
+                    self._apply_instance_mask_color_ds8(obj_meta, stable_id=stable_id_int)
                 if diag_track is not None:
                     diag_track.update(
                         {
@@ -6226,6 +6963,8 @@ class _AnalyticsTelemetryProcessor:
                             "tracker_id": tracker_id_int,
                             **({"id_display": str(id_display)} if id_display else {}),
                             "zone": zone,
+                            "zone_source": zone_source,
+                            "zone_authoritative": zone_authoritative,
                             "dwell_time": dwell,
                             "world": public_track.get("world"),
                             "world_valid": public_track.get("world_valid"),
@@ -6251,6 +6990,22 @@ class _AnalyticsTelemetryProcessor:
                     )
                     self._apply_household_id_diag_fields(diag_track, id_diag)
                 tracks.append(public_track)
+                identity_v2_primitives.append(
+                    IdentityFramePrimitive(
+                        camera_id=camera_id,
+                        tracker_id=str(tracker_id_int),
+                        frame_id=frame_id,
+                        public_track=public_track,
+                        embedding=emb,
+                        diagnostic_track=diag_track,
+                        bbox=public_track.get("bbox"),
+                        frame_size=frame_dims,
+                        detection_confidence=public_track.get("confidence"),
+                        tracker_confidence=public_track.get("tracker_confidence"),
+                        world_xyz=public_track.get("world"),
+                        world_valid=public_track.get("world_valid") is True,
+                    )
+                )
                 if diag_track is not None:
                     diagnostics_tracks.append(diag_track)
 
@@ -6262,9 +7017,62 @@ class _AnalyticsTelemetryProcessor:
                 if fp is not None:
                     footpoints.append(fp)
 
+            self._process_identity_v2_source_frame(
+                camera_id=camera_id,
+                frame_id=frame_id,
+                primitives=identity_v2_primitives,
+                observed_at=now_ts,
+            )
+            identity_v2_service = getattr(self.pipeline, "identity_v2_service", None)
+            if bool(
+                identity_v2_service is not None
+                and getattr(identity_v2_service, "authoritative", False)
+            ):
+                present_stable_ids = set()
+                footpoints = []
+                for track in tracks:
+                    try:
+                        resolved_sid = int(track.get("stable_id"))
+                    except (TypeError, ValueError):
+                        resolved_sid = 0
+                    if resolved_sid > 0:
+                        present_stable_ids.add(resolved_sid)
+                        track["dwell_time"] = self._update_dwell_time(
+                            sensor_id,
+                            resolved_sid,
+                            track.get("zone"),
+                            now_ts,
+                        )
+                        analytics = track.get("analytics")
+                        if isinstance(analytics, Mapping):
+                            line_status = analytics.get("lcStatus")
+                            if isinstance(line_status, Mapping):
+                                for line_name, status in line_status.items():
+                                    if status == 1:
+                                        self._record_transition(
+                                            sensor_id=sensor_id,
+                                            stable_id=resolved_sid,
+                                            line_name=str(line_name),
+                                            ts=now_ts,
+                                        )
+                    else:
+                        track["dwell_time"] = None
+                    fp = self._footpoint_from_track(
+                        track,
+                        frame_dims,
+                        target_image_size=self._bev_target_image_size(sensor_id, camera_id),
+                    )
+                    if fp is not None:
+                        footpoints.append(fp)
+                for primitive in identity_v2_primitives:
+                    if primitive.diagnostic_track is not None:
+                        primitive.diagnostic_track["dwell_time"] = (
+                            primitive.public_track.get("dwell_time")
+                        )
+
             mgr = getattr(self.pipeline, "stable_id_mgr", None)
             observe_fn = getattr(mgr, "observe_copresence", None)
-            if callable(observe_fn):
+            if callable(observe_fn) and not identity_v2_authoritative:
                 try:
                     observe_fn(sorted(present_stable_ids), float(now_ts))
                 except Exception:
@@ -6272,9 +7080,11 @@ class _AnalyticsTelemetryProcessor:
 
             self._publish_occupancy(sensor_id, occupancy_counts)
             self._cleanup_zone_state(sensor_id, present_stable_ids)
-            self._maintain_stable_ids(sensor_id, present_track_ids, now_ts)
+            if not identity_v2_authoritative:
+                self._maintain_stable_ids(sensor_id, present_track_ids, now_ts)
             self._active_tracks[sensor_id] = tracks
-            self._maybe_log_stable_id_metrics(sensor_id, now_ts)
+            if not identity_v2_authoritative:
+                self._maybe_log_stable_id_metrics(sensor_id, now_ts)
 
             if diagnostics_enabled:
                 bbox3d_count = 0
@@ -6325,10 +7135,15 @@ class _AnalyticsTelemetryProcessor:
                 self._reid_debug_emb_found = 0
                 self._reid_debug_emb_missing = 0
 
-            if not tracks and os.environ.get("NOESIS_REID_TEST_MODE") == "1":
+            if (
+                not tracks
+                and os.environ.get("NOESIS_REID_TEST_MODE") == "1"
+                and not identity_v2_authoritative
+            ):
                 synthetic = {
                     "camera_id": camera_id,
                     "stable_id": 1,
+                    "tracker_id": 1,
                     "bbox": (0.0, 0.0, 10.0, 10.0),
                     "frame_id": frame_id,
                     "zone": None,
@@ -6337,6 +7152,14 @@ class _AnalyticsTelemetryProcessor:
                 tracks.append(synthetic)
                 present_stable_ids.add(1)
                 present_track_ids.add(1)
+
+            continuity = self._tracking_lifecycle.update_frame(
+                source_id=sensor_id,
+                camera_id=camera_id,
+                frame_id=frame_id,
+                observed_at_us=int(public_frame_timing["observed_at_us"]),
+                tracks=tracks,
+            )
 
             # Always evaluate the tracking publish gate, including zero-track
             # frames. Count transitions to 0 must reach Menon so clients can
@@ -6347,26 +7170,65 @@ class _AnalyticsTelemetryProcessor:
                 sensor_id=sensor_id,
                 now_ts=now_ts,
                 count=len(tracks),
-                interval_s=float(self._tracking_publish_interval_s),
+                interval_s=self._tracking_interval_for_frame(len(tracks)),
                 counter_prefix="tracking",
+                update=False,
+                force=continuity.tracker_keys_changed,
             ):
+                tracking_published = False
                 try:
                     publish_start_ns = time.perf_counter_ns()
-                    self.tracking_pub.publish(sensor_id, tracks)
+                    tracking_receipt = _require_tracking_publication_receipt(
+                        self.tracking_pub.publish(
+                            sensor_id,
+                            tracks,
+                            frame_metadata={
+                                "frame_id": frame_id,
+                                "tracker_lifecycle_tombstones": list(
+                                    continuity.tombstones
+                                ),
+                                **public_frame_timing,
+                            },
+                        ),
+                        source_id=sensor_id,
+                        frame_id=frame_id,
+                        observed_at_us=int(
+                            public_frame_timing["observed_at_us"]
+                        ),
+                    )
+                    self._tracking_lifecycle.mark_published(continuity)
+                    self._last_tracking_publish_ts_by_sensor[int(sensor_id)] = float(
+                        now_ts
+                    )
+                    self._last_tracking_count_by_sensor[int(sensor_id)] = len(tracks)
                     _record_core_stage_timing("tracking.publish", publish_start_ns, item_count=len(tracks))
+                    tracking_published = True
                 except Exception:  # pragma: no cover - telemetry should never break pipeline
                     logger.exception("Tracking telemetry publish failed for sensor %s", sensor_id)
-            try:
-                self._publish_bev(
-                    sensor_id,
-                    camera_id,
-                    frame_meta,
-                    footpoints,
-                    now_ts=now_ts,
-                    track_count=len(tracks),
-                )
-            except Exception:
-                logger.exception("BEV publish failed for sensor %s", sensor_id)
+                if tracking_published:
+                    try:
+                        bev_receipt = self._publish_bev(
+                            sensor_id,
+                            camera_id,
+                            frame_meta,
+                            footpoints,
+                            now_ts=now_ts,
+                            track_count=len(tracks),
+                            paired_with_tracking=True,
+                            tracking_receipt=tracking_receipt,
+                        )
+                        if bev_receipt.status == "failed":
+                            raise bev_receipt.failure or RuntimeError(
+                                "BEV publication failed without a cause"
+                            )
+                        if bev_receipt.status == "startup_pending":
+                            logger.debug(
+                                "BEV authority startup pending for sensor %s frame %s",
+                                sensor_id,
+                                frame_id,
+                            )
+                    except Exception:
+                        logger.exception("BEV publish failed for sensor %s", sensor_id)
             _record_core_stage_timing("analytics.handle_frame_ds8", frame_start_ns, item_count=len(tracks))
         except Exception:  # pragma: no cover - defensive guardrail
             logger.exception("Failed to process analytics telemetry for frame (DS8)")
@@ -6379,6 +7241,7 @@ class _AnalyticsTelemetryProcessor:
             sensor_id = self.sensor_id_map.get(source_id, source_id)
             camera_id = self.camera_labels.get(sensor_id, f"camera_{sensor_id}")
             now_ts = time.time()
+            public_frame_timing = _public_frame_timing(frame_meta, now_ts)
             self._log_diag_session_start()
 
             tracks: List[Dict[str, Any]] = []
@@ -6411,6 +7274,8 @@ class _AnalyticsTelemetryProcessor:
                 except Exception:
                     class_id = -1
                 zone = raw.get("zone")
+                zone_source = raw.get("zone_source")
+                zone_authoritative = raw.get("zone_authoritative") is True
                 if class_id != 0:
                     self._stamp_osd_label(obj_meta, sensor_id=sensor_id, stable_id=None)
                     if diag_track is not None:
@@ -6419,6 +7284,8 @@ class _AnalyticsTelemetryProcessor:
 
                 if not zone:
                     zone = _fallback_zone_from_camera(camera_id)
+                    zone_source = "camera_default" if zone else None
+                    zone_authoritative = False
 
                 mgr = getattr(self.pipeline, "stable_id_mgr", None)
                 pose_features, pose_quality = self._extract_stable_id_pose_inputs(
@@ -6493,8 +7360,11 @@ class _AnalyticsTelemetryProcessor:
                     "tracker_confidence": raw.get("tracker_confidence"),
                     "analytics": raw.get("analytics"),
                     "zone": zone,
+                    "zone_source": zone_source,
+                    "zone_authoritative": zone_authoritative,
                     "frame_id": frame_id,
                     "dwell_time": dwell,
+                    **public_frame_timing,
                 }
                 frame_w, frame_h = frame_dims
                 if frame_w > 8 and frame_h > 8:
@@ -6516,6 +7386,9 @@ class _AnalyticsTelemetryProcessor:
                 ):
                     if key in raw:
                         public_track[key] = raw.get(key)
+                for key in _WORLD_ESTIMATOR_DIAGNOSTIC_FIELDS:
+                    if key in raw:
+                        public_track[key] = raw.get(key)
 
                 if pose_kpts_abs is None:
                     pose_kpts_abs = self._extract_pose_keypoints_for_anchor(
@@ -6531,6 +7404,7 @@ class _AnalyticsTelemetryProcessor:
                     pose_kpts_abs=pose_kpts_abs,
                     depth_result=depth_result,
                 )
+                self._apply_scene_prior_shadow(camera_id, public_track)
                 self._record_stable_id_world_cache(sensor_id, track_id, public_track, now_ts)
                 self._apply_public_depth_fields(public_track, depth_result)
                 try:
@@ -6545,6 +7419,8 @@ class _AnalyticsTelemetryProcessor:
                             "tracker_id": tracker_id_int,
                             **({"id_display": str(id_display)} if id_display else {}),
                             "zone": zone,
+                            "zone_source": zone_source,
+                            "zone_authoritative": zone_authoritative,
                             "dwell_time": dwell,
                             "world": public_track.get("world"),
                             "world_valid": public_track.get("world_valid"),
@@ -6616,6 +7492,7 @@ class _AnalyticsTelemetryProcessor:
                 synthetic = {
                     "camera_id": camera_id,
                     "stable_id": 1,
+                    "tracker_id": 1,
                     "bbox": (0.0, 0.0, 10.0, 10.0),
                     "frame_id": frame_id,
                     "zone": None,
@@ -6625,16 +7502,79 @@ class _AnalyticsTelemetryProcessor:
                 present_stable_ids.add(1)
                 present_track_ids.add(1)
 
+            continuity = self._tracking_lifecycle.update_frame(
+                source_id=sensor_id,
+                camera_id=camera_id,
+                frame_id=frame_id,
+                observed_at_us=int(public_frame_timing["observed_at_us"]),
+                tracks=tracks,
+            )
+
             # Publish tracking even when the frame has zero people so downstream
             # clients (Menon) can clear presence without waiting on TTLs.
-            try:
-                self.tracking_pub.publish(sensor_id, tracks)
-            except Exception:  # pragma: no cover - telemetry should never break pipeline
-                logger.exception("Tracking telemetry publish failed for sensor %s", sensor_id)
-            try:
-                self._publish_bev(sensor_id, camera_id, frame_meta, footpoints)
-            except Exception:
-                logger.exception("BEV publish failed for sensor %s", sensor_id)
+            if self._publish_gate_due(
+                self._last_tracking_publish_ts_by_sensor,
+                self._last_tracking_count_by_sensor,
+                sensor_id=sensor_id,
+                now_ts=now_ts,
+                count=len(tracks),
+                interval_s=self._tracking_interval_for_frame(len(tracks)),
+                counter_prefix="tracking",
+                update=False,
+                force=continuity.tracker_keys_changed,
+            ):
+                tracking_published = False
+                try:
+                    tracking_receipt = _require_tracking_publication_receipt(
+                        self.tracking_pub.publish(
+                            sensor_id,
+                            tracks,
+                            frame_metadata={
+                                "frame_id": frame_id,
+                                "tracker_lifecycle_tombstones": list(
+                                    continuity.tombstones
+                                ),
+                                **public_frame_timing,
+                            },
+                        ),
+                        source_id=sensor_id,
+                        frame_id=frame_id,
+                        observed_at_us=int(
+                            public_frame_timing["observed_at_us"]
+                        ),
+                    )
+                    self._tracking_lifecycle.mark_published(continuity)
+                    self._last_tracking_publish_ts_by_sensor[int(sensor_id)] = float(
+                        now_ts
+                    )
+                    self._last_tracking_count_by_sensor[int(sensor_id)] = len(tracks)
+                    tracking_published = True
+                except Exception:  # pragma: no cover - telemetry should never break pipeline
+                    logger.exception("Tracking telemetry publish failed for sensor %s", sensor_id)
+                if tracking_published:
+                    try:
+                        bev_receipt = self._publish_bev(
+                            sensor_id,
+                            camera_id,
+                            frame_meta,
+                            footpoints,
+                            now_ts=now_ts,
+                            track_count=len(tracks),
+                            paired_with_tracking=True,
+                            tracking_receipt=tracking_receipt,
+                        )
+                        if bev_receipt.status == "failed":
+                            raise bev_receipt.failure or RuntimeError(
+                                "BEV publication failed without a cause"
+                            )
+                        if bev_receipt.status == "startup_pending":
+                            logger.debug(
+                                "BEV authority startup pending for sensor %s frame %s",
+                                sensor_id,
+                                frame_id,
+                            )
+                    except Exception:
+                        logger.exception("BEV publish failed for sensor %s", sensor_id)
         except Exception:  # pragma: no cover - defensive guardrail
             logger.exception("Failed to process analytics telemetry for frame")
 
@@ -6754,12 +7694,16 @@ class _AnalyticsTelemetryProcessor:
         if intr is None:
             return None
         try:
-            width = int(round(float(getattr(intr, "cx", 0.0) or 0.0) * 2.0))
-            height = int(round(float(getattr(intr, "cy", 0.0) or 0.0) * 2.0))
+            width = int(getattr(intr, "width", 0) or 0)
+            height = int(getattr(intr, "height", 0) or 0)
         except Exception:
             return None
         if width > 8 and height > 8:
             return width, height
+        # A principal point is not required to be the image center. Inferring
+        # dimensions as 2*cx/2*cy silently rescales dewarped detections whenever
+        # the calibrated optical center is off-center. Let frame metadata own
+        # the size when calibration has no declared resolution.
         return None
 
     def _track_image_size(self, sensor_id: int, frame_meta: Any) -> Tuple[int, int]:
@@ -6940,31 +7884,12 @@ class _AnalyticsTelemetryProcessor:
                 except Exception:
                     world_x = None
                     world_z = None
-        registration_status_raw = track.get("depth_registration_status")
-        registration_status = str(registration_status_raw or "").strip().lower()
-        has_registration_status = registration_status not in ("", "none", "null")
-        if registration_status == "ok":
-            depth_keys = ("depth_registered_m", "depth_used_m")
-        elif has_registration_status:
-            # Raw DAv2/object-depth values are not in the MapAnything floorplan
-            # basis when registration rejected the sample. Keep the BEV overlay
-            # on the image-floor/world path instead of drawing a mismatched range.
-            depth_keys = ()
-        else:
-            depth_keys = ("depth_registered_m", "depth_used_m", "depth_anchor_m")
-
         depth_m = None
         depth_source = None
-        for depth_key in depth_keys:
-            raw_depth = track.get(depth_key)
-            try:
-                depth_candidate = float(raw_depth)
-            except Exception:
-                continue
-            if math.isfinite(depth_candidate) and 0.05 < depth_candidate < 50.0:
-                depth_m = float(depth_candidate)
-                depth_source = depth_key
-                break
+        depth_candidate = usable_registered_depth_m(track)
+        if depth_candidate is not None and 0.05 < depth_candidate < 50.0:
+            depth_m = float(depth_candidate)
+            depth_source = "depth_registered_m"
         image_candidates: List[Dict[str, Any]] = []
         for idx, (key, label) in enumerate((("image_foot", "image_foot"), ("image_base", "image_base"))):
             uv = _parse_uv(track.get(key))
@@ -7013,6 +7938,13 @@ class _AnalyticsTelemetryProcessor:
             trail_append_bool = None
         else:
             trail_append_bool = bool(trail_append)
+        trail_break = track.get("trail_break_required")
+        trail_break_bool = bool(trail_break) if trail_break is not None else None
+        trail_segment = track.get("trail_segment_id")
+        try:
+            trail_segment_int = int(trail_segment) if trail_segment is not None else None
+        except Exception:
+            trail_segment_int = None
         idle_jitter = track.get("idle_jitter_m")
         try:
             idle_jitter_f = float(idle_jitter) if idle_jitter is not None else None
@@ -7037,6 +7969,8 @@ class _AnalyticsTelemetryProcessor:
             motion_mode=str(track.get("motion_mode")) if track.get("motion_mode") not in (None, "") else None,
             posture=str(track.get("posture")) if track.get("posture") not in (None, "") else None,
             trail_append_allowed=trail_append_bool,
+            trail_break_required=trail_break_bool,
+            trail_segment_id=trail_segment_int,
             idle_jitter_m=idle_jitter_f,
             debug={
                 "image_candidates": image_candidates,
@@ -7087,8 +8021,10 @@ class _AnalyticsTelemetryProcessor:
         return False, False
 
     def _world_track_key(self, sensor_id: int, track: Mapping[str, Any]) -> Optional[Tuple[int, int]]:
-        # Prefer stable_id so PersonGroundState survives tracker reassignments.
-        for key_name in ("stable_id", "tracker_id", "track_id"):
+        # Physical motion belongs to the camera-local tracker lifecycle.  A
+        # semantic StableID may be reassigned or shared across cameras and must
+        # never splice two people's kinematic state together.
+        for key_name in ("tracker_id", "track_id"):
             raw = track.get(key_name)
             if raw is None:
                 continue
@@ -7361,6 +8297,28 @@ class _AnalyticsTelemetryProcessor:
         sy = float(dst_h) / float(src_h)
         return [left * sx, top * sy, width * sx, height * sy]
 
+    @staticmethod
+    def _scale_pose_keypoints_to_image_size(
+        keypoints: Optional[np.ndarray],
+        source_size: Optional[Tuple[int, int]],
+        dest_size: Optional[Tuple[int, int]],
+    ) -> Optional[np.ndarray]:
+        if keypoints is None:
+            return None
+        points = np.asarray(keypoints, dtype=np.float64)
+        if points.ndim != 2 or points.shape[1] < 2:
+            return points
+        if source_size is None or dest_size is None or source_size == dest_size:
+            return points
+        src_w, src_h = source_size
+        dst_w, dst_h = dest_size
+        if src_w <= 0 or src_h <= 0 or dst_w <= 0 or dst_h <= 0:
+            return points
+        scaled = points.copy()
+        scaled[:, 0] *= float(dst_w) / float(src_w)
+        scaled[:, 1] *= float(dst_h) / float(src_h)
+        return scaled
+
     def _maybe_update_world_height_reference(
         self,
         state: _WorldAnchorState,
@@ -7370,6 +8328,7 @@ class _AnalyticsTelemetryProcessor:
         *,
         flip_u: bool,
         flip_v: bool,
+        pose_kpts_abs: Optional[np.ndarray] = None,
     ) -> None:
         if len(bbox) < 4:
             return
@@ -7403,9 +8362,176 @@ class _AnalyticsTelemetryProcessor:
             return
         if state.height_ref_scene is None:
             state.height_ref_scene = float(est_height)
+        else:
+            alpha = float(self._world_height_update_alpha)
+            state.height_ref_scene = float(
+                state.height_ref_scene
+                + alpha * (float(est_height) - float(state.height_ref_scene))
+            )
+        self._maybe_update_body_plane_height_fractions(
+            state,
+            calib,
+            pose_kpts_abs,
+            foot_world,
+            flip_u=flip_u,
+            flip_v=flip_v,
+        )
+
+    def _maybe_update_body_plane_height_fractions(
+        self,
+        state: _WorldAnchorState,
+        calib: Any,
+        pose_kpts_abs: Optional[np.ndarray],
+        foot_world: Sequence[float],
+        *,
+        flip_u: bool,
+        flip_v: bool,
+    ) -> None:
+        """Learn this track's visible-body planes from trusted full-body frames."""
+        if (
+            pose_kpts_abs is None
+            or state.height_ref_scene is None
+            or float(state.height_ref_scene) <= 1e-6
+            or len(foot_world) < 3
+        ):
             return
-        alpha = float(self._world_height_update_alpha)
-        state.height_ref_scene = float(state.height_ref_scene + alpha * (float(est_height) - float(state.height_ref_scene)))
+
+        def _midpoint(
+            left_name: str,
+            right_name: str,
+        ) -> Optional[Tuple[float, float]]:
+            left_point = self._pose_point(pose_kpts_abs, left_name)
+            right_point = self._pose_point(pose_kpts_abs, right_name)
+            if left_point is None and right_point is None:
+                return None
+            if left_point is None:
+                return right_point
+            if right_point is None:
+                return left_point
+            return (
+                (float(left_point[0]) + float(right_point[0])) * 0.5,
+                (float(left_point[1]) + float(right_point[1])) * 0.5,
+            )
+
+        references: Tuple[
+            Tuple[str, Optional[Tuple[float, float]], float, float],
+            ...,
+        ] = (
+            ("nose", self._pose_point(pose_kpts_abs, "nose"), 0.72, 1.08),
+            (
+                "shoulders",
+                _midpoint("left_shoulder", "right_shoulder"),
+                0.55,
+                0.96,
+            ),
+            ("hips", _midpoint("left_hip", "right_hip"), 0.30, 0.76),
+        )
+        try:
+            width_src, height_src = calib.image_size
+            R_wc, C_world = parse_extrinsics(calib.extrinsics_col_major)
+            C_world = C_world * self._scene_per_meter(calib)
+            foot_x = float(foot_world[0])
+            foot_z = float(foot_world[2])
+            floor_y = float(calib.floor_y)
+            height_ref = float(state.height_ref_scene)
+        except Exception:
+            return
+
+        alpha = float(self._human_ground_cfg.upright_reference_alpha)
+        for label, uv, min_fraction, max_fraction in references:
+            if uv is None:
+                continue
+            try:
+                u_ray, v_ray = self._apply_image_flip(
+                    float(uv[0]),
+                    float(uv[1]),
+                    int(width_src),
+                    int(height_src),
+                    bool(flip_u),
+                    bool(flip_v),
+                )
+                origin, direction = ray_from_pixel(
+                    u_ray,
+                    v_ray,
+                    calib.intrinsics,
+                    R_wc,
+                    C_world,
+                )
+                denom_xz = float(direction[0]) ** 2 + float(direction[2]) ** 2
+                if denom_xz <= 1e-12:
+                    continue
+                ray_t = (
+                    (foot_x - float(origin[0])) * float(direction[0])
+                    + (foot_z - float(origin[2])) * float(direction[2])
+                ) / denom_xz
+                if not math.isfinite(ray_t) or ray_t <= 0.0:
+                    continue
+                point_y = float(origin[1]) + ray_t * float(direction[1])
+                fraction = (point_y - floor_y) / height_ref
+                if (
+                    not math.isfinite(fraction)
+                    or fraction < float(min_fraction)
+                    or fraction > float(max_fraction)
+                ):
+                    continue
+                previous = state.body_plane_height_fractions.get(label)
+                if previous is None or not math.isfinite(float(previous)):
+                    state.body_plane_height_fractions[label] = float(fraction)
+                else:
+                    state.body_plane_height_fractions[label] = float(
+                        float(previous)
+                        + alpha * (float(fraction) - float(previous))
+                    )
+            except Exception:
+                continue
+
+    def _reference_plane_floor_world(
+        self,
+        calib: Any,
+        u: float,
+        v: float,
+        plane_height_scene: float,
+        *,
+        flip_u: bool,
+        flip_v: bool,
+    ) -> Optional[np.ndarray]:
+        try:
+            width_src, height_src = calib.image_size
+            u_ray, v_ray = self._apply_image_flip(
+                float(u),
+                float(v),
+                int(width_src),
+                int(height_src),
+                bool(flip_u),
+                bool(flip_v),
+            )
+            R_wc, C_world = parse_extrinsics(calib.extrinsics_col_major)
+            C_world = C_world * self._scene_per_meter(calib)
+            origin, direction = ray_from_pixel(
+                u_ray,
+                v_ray,
+                calib.intrinsics,
+                R_wc,
+                C_world,
+            )
+            denom = float(direction[1])
+            if abs(denom) < 1e-9:
+                return None
+            plane_y = float(calib.floor_y) + float(plane_height_scene)
+            ray_t = (plane_y - float(origin[1])) / denom
+            if not math.isfinite(ray_t) or ray_t <= 0.0:
+                return None
+            reference_point = origin + (direction * ray_t)
+            return np.array(
+                [
+                    float(reference_point[0]),
+                    float(calib.floor_y),
+                    float(reference_point[2]),
+                ],
+                dtype=np.float64,
+            )
+        except Exception:
+            return None
 
     def _gravity_drop_world(
         self,
@@ -7415,6 +8541,8 @@ class _AnalyticsTelemetryProcessor:
         *,
         flip_u: bool,
         flip_v: bool,
+        pose_kpts_abs: Optional[np.ndarray] = None,
+        state: Optional[_WorldAnchorState] = None,
     ) -> Optional[np.ndarray]:
         if len(bbox) < 4:
             return None
@@ -7424,25 +8552,108 @@ class _AnalyticsTelemetryProcessor:
             return None
         if width <= 0.0 or float(height_ref_scene) <= 0.0:
             return None
-        try:
-            width_src, height_src = calib.image_size
-            u_top = float(left) + float(width) * 0.5
-            v_top = float(top)
-            u_ray, v_ray = self._apply_image_flip(u_top, v_top, int(width_src), int(height_src), bool(flip_u), bool(flip_v))
-            R_wc, C_world = parse_extrinsics(calib.extrinsics_col_major)
-            C_world = C_world * self._scene_per_meter(calib)
-            origin, direction = ray_from_pixel(u_ray, v_ray, calib.intrinsics, R_wc, C_world)
-            denom = float(direction[1])
-            if abs(denom) < 1e-9:
-                return None
-            plane_y = float(calib.floor_y) + float(height_ref_scene)
-            t = (plane_y - float(origin[1])) / denom
-            if not math.isfinite(t) or t <= 0.0:
-                return None
-            head = origin + (direction * t)
-            return np.array([float(head[0]), float(calib.floor_y), float(head[2])], dtype=np.float64)
-        except Exception:
+        candidates: List[Tuple[np.ndarray, float]] = []
+
+        def _append_candidate(
+            uv: Optional[Tuple[float, float]],
+            *,
+            height_fraction: float,
+            weight: float,
+        ) -> None:
+            if uv is None:
+                return
+            point = self._reference_plane_floor_world(
+                calib,
+                float(uv[0]),
+                float(uv[1]),
+                float(height_ref_scene) * float(height_fraction),
+                flip_u=flip_u,
+                flip_v=flip_v,
+            )
+            if point is not None:
+                candidates.append((point, float(weight)))
+
+        # The bbox top remains the self-consistent primary reference because the
+        # standing height lock was learned from that same detector edge.
+        _append_candidate(
+            (float(left) + float(width) * 0.5, float(top)),
+            height_fraction=1.0,
+            weight=2.0,
+        )
+
+        if (
+            pose_kpts_abs is not None
+            and isinstance(pose_kpts_abs, np.ndarray)
+            and pose_kpts_abs.shape[0] >= 17
+        ):
+            fractions = (
+                state.body_plane_height_fractions
+                if state is not None
+                else {}
+            )
+
+            def _midpoint(
+                left_name: str,
+                right_name: str,
+            ) -> Optional[Tuple[float, float]]:
+                left_point = self._pose_point(pose_kpts_abs, left_name)
+                right_point = self._pose_point(pose_kpts_abs, right_name)
+                if left_point is None and right_point is None:
+                    return None
+                if left_point is None:
+                    return right_point
+                if right_point is None:
+                    return left_point
+                return (
+                    (float(left_point[0]) + float(right_point[0])) * 0.5,
+                    (float(left_point[1]) + float(right_point[1])) * 0.5,
+                )
+
+            _append_candidate(
+                self._pose_point(pose_kpts_abs, "nose"),
+                height_fraction=float(fractions.get("nose", 0.94)),
+                weight=0.75,
+            )
+            _append_candidate(
+                _midpoint("left_shoulder", "right_shoulder"),
+                height_fraction=float(fractions.get("shoulders", 0.82)),
+                weight=1.35,
+            )
+            _append_candidate(
+                _midpoint("left_hip", "right_hip"),
+                height_fraction=float(fractions.get("hips", 0.55)),
+                weight=0.55,
+            )
+
+        if not candidates:
             return None
+        if len(candidates) == 1:
+            return np.asarray(candidates[0][0], dtype=np.float64)
+
+        # Reject anthropometric/keypoint candidates that disagree strongly with
+        # the detector-top reference, then blend the remaining calibrated rays.
+        primary = np.asarray(candidates[0][0], dtype=np.float64)
+        inliers: List[Tuple[np.ndarray, float]] = [candidates[0]]
+        for point, weight in candidates[1:]:
+            disagreement = math.hypot(
+                float(point[0]) - float(primary[0]),
+                float(point[2]) - float(primary[2]),
+            )
+            if math.isfinite(disagreement) and disagreement <= 0.75:
+                inliers.append((point, weight))
+        total_weight = sum(float(weight) for _point, weight in inliers)
+        if total_weight <= 1e-9:
+            return primary
+        world_x = sum(
+            float(point[0]) * float(weight) for point, weight in inliers
+        ) / total_weight
+        world_z = sum(
+            float(point[2]) * float(weight) for point, weight in inliers
+        ) / total_weight
+        return np.array(
+            [float(world_x), float(calib.floor_y), float(world_z)],
+            dtype=np.float64,
+        )
 
     def _fallback_quality_reason(
         self,
@@ -7664,6 +8875,143 @@ class _AnalyticsTelemetryProcessor:
             force_accept=bool(force_accept),
         )
 
+    def _update_track_world_state(
+        self,
+        track: Dict[str, Any],
+        state: Optional[_WorldAnchorState],
+        *,
+        measurement: np.ndarray,
+        floor_y: float,
+        now_ts: float,
+        alpha: float,
+        beta: float,
+        quality: str = "good",
+        force_accept: bool = False,
+    ) -> np.ndarray:
+        """Record pre-filter evidence and apply the shared physical filter."""
+        track["world_prefilter_measurement"] = [
+            float(measurement[0]),
+            float(floor_y),
+            float(measurement[2]),
+        ]
+        if state is not None:
+            pred_x, pred_z, _dt = self._predict_world_state(state, now_ts)
+            track["world_filter_prediction"] = (
+                [float(pred_x), float(floor_y), float(pred_z)]
+                if pred_x is not None and pred_z is not None
+                else None
+            )
+        result = self._update_world_state(
+            state,
+            measurement=measurement,
+            floor_y=float(floor_y),
+            now_ts=float(now_ts),
+            alpha=float(alpha),
+            beta=float(beta),
+            quality=str(quality or "good"),
+            force_accept=bool(force_accept),
+        )
+        if state is not None:
+            complete_source_admission(
+                state,
+                measurement_accepted=bool(state.measurement_accepted),
+            )
+        return result
+
+    def _admit_live_world_source(
+        self,
+        state: Optional[_WorldAnchorState],
+        *,
+        candidate_source: str,
+        quality: str,
+        depth_weight: float,
+        posture: str,
+        authoritative: bool = False,
+    ) -> bool:
+        if state is None:
+            return True
+        return begin_source_admission(
+            state,
+            candidate_source=str(candidate_source),
+            candidate_score=source_score(
+                str(candidate_source),
+                quality=str(quality),
+                depth_weight=float(depth_weight),
+                posture=str(posture),
+            ),
+            config=self._human_ground_cfg,
+            authoritative=bool(authoritative),
+        )
+
+    def _world_fusion_weights(
+        self,
+        camera_id: str,
+        *,
+        floor_weight: float,
+        depth_weight: float,
+        track: Dict[str, Any],
+    ) -> Tuple[float, float, bool]:
+        policy = self.world_fusion_policy
+        if policy is None:
+            return float(floor_weight), float(depth_weight), True
+        profile = policy.profile(str(camera_id))
+        effective_floor = float(floor_weight) * float(profile.floor_weight_scale)
+        effective_depth = float(depth_weight) * float(profile.depth_weight_scale)
+        track["world_fusion_policy_id"] = str(policy.policy_id)
+        track["world_floor_weight_scale"] = float(profile.floor_weight_scale)
+        track["world_depth_weight_scale"] = float(profile.depth_weight_scale)
+        track["world_floor_weight_effective"] = float(effective_floor)
+        track["world_depth_weight_effective"] = float(effective_depth)
+        return effective_floor, effective_depth, bool(profile.floor_only_allowed)
+
+    def _admit_floor_ray_range(
+        self,
+        camera_id: str,
+        *,
+        calib: Any,
+        floor_candidate: np.ndarray,
+        track: Dict[str, Any],
+    ) -> bool:
+        policy = self.world_fusion_policy
+        if policy is None:
+            return True
+        profile = policy.profile(str(camera_id))
+        limit_m = float(profile.floor_ray_max_range_m)
+        track["world_floor_range_limit_m"] = limit_m
+        admitted = False
+        rejection_reason = "floor_ray_geometry_invalid"
+        try:
+            _rotation, camera_world = parse_extrinsics(calib.extrinsics_col_major)
+            unit_scale = float(getattr(calib, "unit_scale", 1.0) or 1.0)
+            if not math.isfinite(unit_scale) or unit_scale <= 0.0:
+                unit_scale = 1.0
+            camera_world = np.asarray(camera_world, dtype=np.float64) * unit_scale
+            candidate = np.asarray(floor_candidate, dtype=np.float64)
+            delta = candidate - camera_world
+            horizontal_range_m = float(math.hypot(float(delta[0]), float(delta[2])))
+            ray_range_m = float(np.linalg.norm(delta))
+            incidence_sin = (
+                abs(float(delta[1])) / ray_range_m
+                if math.isfinite(ray_range_m) and ray_range_m > 1e-9
+                else 0.0
+            )
+            track["world_floor_range_m"] = horizontal_range_m
+            track["world_floor_incidence_sin"] = incidence_sin
+            admitted = bool(
+                math.isfinite(horizontal_range_m)
+                and horizontal_range_m <= limit_m
+            )
+            if not admitted:
+                rejection_reason = "floor_ray_range_exceeded"
+        except Exception:
+            admitted = False
+        track["world_floor_admitted"] = admitted
+        if admitted:
+            track.pop("world_floor_rejection_reason", None)
+        else:
+            track["world_floor_rejection_reason"] = rejection_reason
+        return admitted
+
     def _set_track_image_base_from_world(
         self,
         track: Dict[str, Any],
@@ -7738,7 +9086,8 @@ class _AnalyticsTelemetryProcessor:
                 state.ts = float(now_ts)
 
             measurement = np.array([mx, float(calib.floor_y), mz], dtype=np.float64)
-            hit = self._update_world_state(
+            hit = self._update_track_world_state(
+                track,
                 state,
                 measurement=measurement,
                 floor_y=float(calib.floor_y),
@@ -7747,6 +9096,32 @@ class _AnalyticsTelemetryProcessor:
                 beta=max(0.0, min(1.0, float(self._world_smooth_alpha_good) * 0.25)),
                 quality="good",
             )
+
+            if state is not None and not state.measurement_accepted:
+                hold_age = float(now_ts) - float(state.last_good_ts or 0.0)
+                if (
+                    state.last_good_world is not None
+                    and hold_age <= float(self._world_anchor_hold_ttl_s)
+                ):
+                    hit = np.asarray(state.last_good_world, dtype=np.float64)
+                    world_source_label = "anchor_hold"
+                    track["world_quality"] = "estimated"
+                    track["world_quality_reason"] = str(
+                        state.measurement_rejection_reason or "physical_measurement_rejected"
+                    )
+                else:
+                    track["world_estimator_evaluated"] = True
+                    track["world_valid"] = False
+                    track["world_quality"] = "invalid"
+                    track["world_quality_reason"] = str(
+                        state.measurement_rejection_reason or "physical_measurement_rejected"
+                    )
+                    track.pop("world", None)
+                    track.pop("world_source", None)
+                    for key, value in state.as_public_fields().items():
+                        if value is not None:
+                            track[key] = value
+                    return
 
             image_uv = None
             for key in ("image_base", "image_foot"):
@@ -7775,13 +9150,19 @@ class _AnalyticsTelemetryProcessor:
                     state.vel_world_z = 0.0
 
             flip_u, flip_v = self._infer_image_flips(camera_id, calib)
-            self._set_track_image_base_from_world(
-                track,
-                calib=calib,
-                world_point=hit,
-                flip_u=flip_u,
-                flip_v=flip_v,
-            )
+            # V3DT already publishes ``image_base`` from the opposite cuboid
+            # endpoint in the tracker/camInfo frame.  Keep that diagnostic
+            # projection stable while the canonical world point is filtered;
+            # only synthesize an image anchor when the producer did not supply
+            # one.
+            if "image_base" not in track:
+                self._set_track_image_base_from_world(
+                    track,
+                    calib=calib,
+                    world_point=hit,
+                    flip_u=flip_u,
+                    flip_v=flip_v,
+                )
             wx = float(hit[0])
             wy = float(hit[1])
             wz = float(hit[2])
@@ -7791,16 +9172,79 @@ class _AnalyticsTelemetryProcessor:
             track["world_frame"] = self._world_frame
             track["world_source"] = str(world_source_label)
             if state is not None:
-                state.sticky_source = str(world_source_label)
                 for key, value in state.as_public_fields().items():
                     if value is not None:
                         track[key] = value
-                state.last_good_world = (float(wx), float(wy), float(wz))
-                state.last_good_ts = float(now_ts)
+                if world_source_label != "anchor_hold":
+                    state.last_good_world = (float(wx), float(wy), float(wz))
+                    state.last_good_ts = float(now_ts)
                 state.ts = float(now_ts)
         except Exception:
             track.setdefault("world_quality", "good")
             track.setdefault("world_frame", self._world_frame)
+
+    def _apply_scene_prior_shadow(
+        self,
+        camera_id: str,
+        track: Dict[str, Any],
+    ) -> None:
+        priors = self.scene_priors
+        if priors is None:
+            return
+        revision = priors.revision_for_camera(camera_id)
+        if revision is None:
+            return
+        base = {
+            "contract": "noesis.scene_prior.track_diagnostic",
+            "contract_version": 1,
+            "prior_id": revision.manifest.prior_id,
+            "space_id": revision.manifest.space_id,
+            "mode": "shadow",
+            "coordinate_frame": "backend_world_m",
+        }
+        world = track.get("world")
+        if (
+            track.get("world_valid") is not True
+            or not isinstance(world, (list, tuple))
+            or len(world) < 3
+        ):
+            track["scene_prior"] = {
+                **base,
+                "status": "unknown",
+                "inside_extent": False,
+                "inside_authored_space": False,
+                "evidence_observed": False,
+                "evidence_confidence": 0.0,
+                "reasons": ["world_position_unavailable"],
+            }
+            return
+        if track.get("world_frame") != "backend_world_m":
+            track["scene_prior"] = {
+                **base,
+                "status": "error",
+                "inside_extent": False,
+                "inside_authored_space": False,
+                "evidence_observed": False,
+                "evidence_confidence": 0.0,
+                "reasons": ["world_frame_mismatch"],
+            }
+            return
+        try:
+            diagnostic = priors.evaluate(camera_id, world)
+        except ScenePriorError as exc:
+            track["scene_prior"] = {
+                **base,
+                "status": "error",
+                "inside_extent": False,
+                "inside_authored_space": False,
+                "evidence_observed": False,
+                "evidence_confidence": 0.0,
+                "reasons": ["scene_prior_evaluation_error"],
+                "error": str(exc),
+            }
+            return
+        if diagnostic is not None:
+            track["scene_prior"] = diagnostic
 
     def _augment_track_with_world(
         self,
@@ -7813,7 +9257,38 @@ class _AnalyticsTelemetryProcessor:
         depth_result: Optional[ObjectDepthResult] = None,
     ) -> None:
         """Calculate world coordinates for a track if calibration is available."""
+        if self._tracking_mode_is_v3dt():
+            has_bbox3d_world = bool(
+                isinstance(track.get("bbox3d"), Mapping)
+                and track.get("world_source") == "bbox3d"
+                and track.get("world_frame") == self._world_frame
+                and track.get("world_valid") is True
+                and isinstance(track.get("world"), (list, tuple))
+            )
+            if has_bbox3d_world:
+                if self.bev_calibration is not None:
+                    self._refine_seeded_world_with_ground_state(
+                        sensor_id,
+                        camera_id,
+                        track,
+                        world_source_label="bbox3d",
+                    )
+                return
+            # Missing or malformed V3DT metadata is a missing observation. It
+            # must never be replaced by the baseline ray/depth estimator.
+            for field_name in (
+                "world",
+                "world_valid",
+                "world_quality",
+                "world_quality_reason",
+                "world_frame",
+                "world_source",
+            ):
+                track.pop(field_name, None)
+            return
         if self.bev_calibration is None:
+            return
+        if track.get("world_estimator_evaluated") is True:
             return
         if track.get("world_source") == "bbox3d":
             if track.get("world_valid") is True:
@@ -7857,13 +9332,41 @@ class _AnalyticsTelemetryProcessor:
 
             if pose_kpts_abs is None:
                 pose_kpts_abs = self._extract_pose_keypoints_for_anchor(obj_meta, bbox)
+            pose_kpts_project = self._scale_pose_keypoints_to_image_size(
+                pose_kpts_abs,
+                track_image_size,
+                calib_image_size,
+            )
 
             posture = classify_posture(
                 kpts_abs=pose_kpts_abs,
-                bbox=bbox_project,
+                bbox=bbox,
                 height_ref_scene=state.height_ref_scene if state is not None else None,
                 config=self._human_ground_cfg,
             )
+            occlusion_assessment = (
+                assess_lower_body_occlusion(
+                    state,
+                    kpts_abs=pose_kpts_abs,
+                    bbox=bbox,
+                    posture=posture,
+                    now_ts=float(now_ts),
+                    config=self._human_ground_cfg,
+                )
+                if state is not None
+                else None
+            )
+            force_occlusion_gravity = bool(
+                occlusion_assessment is not None
+                and occlusion_assessment.active
+                and state is not None
+                and state.height_ref_scene is not None
+            )
+            if force_occlusion_gravity:
+                # The track has a recent upright height lock and current lower
+                # anatomy is hidden. Preserve the upright interpretation rather
+                # than allowing a short torso box to transition into "sitting".
+                posture = "standing"
             if state is not None:
                 state.posture = str(posture)
 
@@ -7883,12 +9386,16 @@ class _AnalyticsTelemetryProcessor:
                 anchor_candidate = pose_anchor
 
             hit: Optional[np.ndarray] = None
+            floor_candidate: Optional[np.ndarray] = None
             quality = "invalid"
             quality_reason: Optional[str] = "no_floor_intersection"
             world_source: Optional[str] = None
-            depth_weight_for_score = 0.0
+            source_measurement_rejected = False
+            reject_current_geometry = False
+            floor_ray_admitted = True
+            floor_ray_rejection_reason: Optional[str] = None
 
-            if anchor_candidate is not None:
+            if anchor_candidate is not None and not force_occlusion_gravity:
                 track["image_foot"] = [float(anchor_candidate.u), float(anchor_candidate.v)]
                 pose_u, pose_v = self._scale_uv_to_image_size(
                     float(anchor_candidate.u),
@@ -7904,19 +9411,12 @@ class _AnalyticsTelemetryProcessor:
                     flip_v=flip_v,
                 )
                 if hit is not None:
-                    if (
-                        state is not None
-                        and anchor_candidate.height_lock_eligible
-                        and posture in ("standing", "unknown")
-                    ):
-                        self._maybe_update_world_height_reference(
-                            state,
-                            calib,
-                            bbox_project,
-                            hit,
-                            flip_u=flip_u,
-                            flip_v=flip_v,
-                        )
+                    floor_candidate = np.asarray(hit, dtype=np.float64).copy()
+                    track["world_floor_candidate"] = [
+                        float(floor_candidate[0]),
+                        float(floor_candidate[1]),
+                        float(floor_candidate[2]),
+                    ]
                     depth_observation = self._depth_observation_from_anchor(
                         calib=calib,
                         anchor=anchor_candidate,
@@ -7926,7 +9426,6 @@ class _AnalyticsTelemetryProcessor:
                     )
                     depth_obs = depth_observation.world_point
                     depth_weight = float(depth_observation.weight)
-                    depth_weight_for_score = depth_weight
                     depth_reason = str(depth_observation.reason)
                     if depth_observation.raw_depth_m is not None:
                         track["depth_anchor_m"] = float(depth_observation.raw_depth_m)
@@ -7938,11 +9437,69 @@ class _AnalyticsTelemetryProcessor:
                     track["depth_used_m"] = track.get("depth_registered_m")
                     track["depth_registration_status"] = depth_observation.registration_status
                     track["depth_registration_id"] = depth_observation.registration_id
-                    floor_weight = 1.0 if anchor_candidate.quality == "good" else 0.75
-                    if depth_obs is not None and depth_weight > 0.0:
-                        meas_x = ((float(hit[0]) * floor_weight) + (float(depth_obs[0]) * depth_weight)) / (floor_weight + depth_weight)
-                        meas_z = ((float(hit[2]) * floor_weight) + (float(depth_obs[2]) * depth_weight)) / (floor_weight + depth_weight)
-                        fused = np.array([meas_x, float(calib.floor_y), meas_z], dtype=np.float64)
+                    if depth_obs is not None:
+                        track["world_depth_candidate"] = [
+                            float(depth_obs[0]),
+                            float(depth_obs[1]),
+                            float(depth_obs[2]),
+                        ]
+                    base_floor_weight = 1.0 if anchor_candidate.quality == "good" else 0.75
+                    floor_weight, effective_depth_weight, floor_only_allowed = self._world_fusion_weights(
+                        camera_id,
+                        floor_weight=base_floor_weight,
+                        depth_weight=depth_weight,
+                        track=track,
+                    )
+                    floor_ray_admitted = self._admit_floor_ray_range(
+                        camera_id,
+                        calib=calib,
+                        floor_candidate=floor_candidate,
+                        track=track,
+                    )
+                    if not floor_ray_admitted:
+                        floor_ray_rejection_reason = str(
+                            track.get("world_floor_rejection_reason")
+                            or "floor_ray_geometry_invalid"
+                        )
+                        floor_weight = 0.0
+                        floor_only_allowed = False
+                        track["world_floor_weight_effective"] = 0.0
+                    registration_status = depth_observation.registration_status
+                    reject_current_geometry = bool(
+                        registration_status is not None
+                        and registration_status not in ("ok", "raw_passthrough")
+                    )
+                    if reject_current_geometry:
+                        # Reject the unusable metric range without discarding an
+                        # independently permitted floor-ray observation.  The
+                        # per-camera policy decides whether floor-only geometry
+                        # is admissible; depth-required cameras still fail
+                        # closed below.  Do not seed height-lock state from a
+                        # sample whose metric registration was rejected.
+                        quality_reason = (
+                            f"anchor={anchor_candidate.source},depth={depth_reason},"
+                            f"depth_registration={registration_status}"
+                        )
+                    elif (
+                        state is not None
+                        and floor_ray_admitted
+                        and anchor_candidate.height_lock_eligible
+                        and posture in ("standing", "unknown")
+                    ):
+                        self._maybe_update_world_height_reference(
+                            state,
+                            calib,
+                            bbox_project,
+                            hit,
+                            flip_u=flip_u,
+                            flip_v=flip_v,
+                            pose_kpts_abs=pose_kpts_project,
+                        )
+                    if not reject_current_geometry and depth_obs is not None and effective_depth_weight > 0.0:
+                        fused = np.array(
+                            [float(depth_obs[0]), float(calib.floor_y), float(depth_obs[2])],
+                            dtype=np.float64,
+                        )
                         depth_anchor_source = str(depth_result.anchor_source or "") if depth_result is not None else ""
                         alpha_boost = 0.10 if depth_anchor_source == "lower_body_band" else 0.05
                         if str(anchor_candidate.source) == "person_mask_floor":
@@ -7950,16 +9507,30 @@ class _AnalyticsTelemetryProcessor:
                         alpha = min(1.0, float(self._world_smooth_alpha_good) + float(alpha_boost))
                         beta = max(0.0, min(1.0, float(alpha) * 0.25))
                         quality = "good" if anchor_candidate.quality == "good" else "estimated"
-                        hit = self._update_world_state(
+                        if floor_weight <= 0.0:
+                            world_source = "pose_depth_only" if pose_anchor is not None else "person_anchor_depth_only"
+                        else:
+                            world_source = "pose_depth_fused" if pose_anchor is not None else "person_anchor_depth_fused"
+                        if self._admit_live_world_source(
                             state,
-                            measurement=fused,
-                            floor_y=float(calib.floor_y),
-                            now_ts=float(now_ts),
-                            alpha=alpha,
-                            beta=beta,
+                            candidate_source=world_source,
                             quality=quality,
-                        )
-                        world_source = "pose_depth_fused" if pose_anchor is not None else "person_anchor_depth_fused"
+                            depth_weight=float(effective_depth_weight),
+                            posture=str(posture),
+                        ):
+                            hit = self._update_track_world_state(
+                                track,
+                                state,
+                                measurement=fused,
+                                floor_y=float(calib.floor_y),
+                                now_ts=float(now_ts),
+                                alpha=alpha,
+                                beta=beta,
+                                quality=quality,
+                            )
+                        else:
+                            hit = None
+                            source_measurement_rejected = True
                         depth_support_count = int(
                             depth_result.anchor_sample_count
                             if depth_result is not None and depth_result.anchor_sample_count is not None
@@ -7977,24 +9548,44 @@ class _AnalyticsTelemetryProcessor:
                         registration_status = track.get("depth_registration_status")
                         if registration_status:
                             quality_reason = f"{quality_reason},depth_registration={registration_status}"
-                    else:
+                    elif floor_weight > 0.0 and floor_only_allowed:
                         alpha = float(self._world_smooth_alpha_good if anchor_candidate.quality == "good" else self._world_smooth_alpha_weak)
                         beta = max(0.0, min(1.0, float(alpha) * 0.20))
                         quality = "good" if anchor_candidate.quality == "good" else "estimated"
-                        hit = self._update_world_state(
-                            state,
-                            measurement=hit,
-                            floor_y=float(calib.floor_y),
-                            now_ts=float(now_ts),
-                            alpha=alpha,
-                            beta=beta,
-                            quality=quality,
-                        )
                         world_source = "pose_floor_only" if pose_anchor is not None else "person_anchor_floor_only"
+                        floor_measurement = np.asarray(hit, dtype=np.float64)
+                        if self._admit_live_world_source(
+                            state,
+                            candidate_source=world_source,
+                            quality=quality,
+                            depth_weight=0.0,
+                            posture=str(posture),
+                        ):
+                            hit = self._update_track_world_state(
+                                track,
+                                state,
+                                measurement=floor_measurement,
+                                floor_y=float(calib.floor_y),
+                                now_ts=float(now_ts),
+                                alpha=alpha,
+                                beta=beta,
+                                quality=quality,
+                            )
+                        else:
+                            hit = None
+                            source_measurement_rejected = True
                         quality_reason = f"anchor={anchor_candidate.source},depth={depth_reason}"
                         registration_status = track.get("depth_registration_status")
                         if registration_status:
                             quality_reason = f"{quality_reason},depth_registration={registration_status}"
+                    else:
+                        hit = None
+                        source_measurement_rejected = True
+                        quality = "invalid"
+                        if not floor_ray_admitted:
+                            quality_reason = floor_ray_rejection_reason
+                        elif not reject_current_geometry:
+                            quality_reason = "fusion_policy_requires_registered_depth"
                 else:
                     hit = None
 
@@ -8004,33 +9595,120 @@ class _AnalyticsTelemetryProcessor:
             allow_gravity = True
             if posture == "lying":
                 allow_gravity = False
-            if state is not None and str(state.motion_mode) in ("sit", "lie"):
+            if (
+                not force_occlusion_gravity
+                and state is not None
+                and str(state.motion_mode) in ("sit", "lie")
+            ):
                 allow_gravity = False
-            if hit is None and allow_gravity and state is not None and state.height_ref_scene is not None:
+            gravity_fallback_requested = bool(
+                not source_measurement_rejected
+                and hit is None
+                and not reject_current_geometry
+            )
+            if (
+                (force_occlusion_gravity or gravity_fallback_requested)
+                and allow_gravity
+                and state is not None
+                and state.height_ref_scene is not None
+            ):
                 gravity_hit = self._gravity_drop_world(
                     calib,
                     bbox_project,
                     float(state.height_ref_scene),
                     flip_u=flip_u,
                     flip_v=flip_v,
+                    pose_kpts_abs=pose_kpts_project,
+                    state=state,
                 )
                 if gravity_hit is not None:
-                    hit = self._update_world_state(
-                        state,
-                        measurement=gravity_hit,
-                        floor_y=float(calib.floor_y),
-                        now_ts=float(now_ts),
-                        alpha=float(self._world_smooth_alpha_weak),
-                        beta=max(0.0, min(1.0, float(self._world_smooth_alpha_weak) * 0.15)),
-                        quality="estimated",
-                    )
-                    world_source = "gravity_drop"
-                    quality = "estimated"
-                    quality_reason = "current_anchor_unavailable" if anchor_candidate is None else "current_anchor_projection_failed"
+                    gravity_admitted = True
+                    if force_occlusion_gravity:
+                        gravity_admitted = self._admit_live_world_source(
+                            state,
+                            candidate_source="gravity_drop",
+                            quality="estimated",
+                            depth_weight=0.0,
+                            posture="standing",
+                            authoritative=True,
+                        )
+                    if gravity_admitted:
+                        hit = self._update_track_world_state(
+                            track,
+                            state,
+                            measurement=gravity_hit,
+                            floor_y=float(calib.floor_y),
+                            now_ts=float(now_ts),
+                            alpha=float(self._world_smooth_alpha_weak),
+                            beta=max(
+                                0.0,
+                                min(
+                                    1.0,
+                                    float(self._world_smooth_alpha_weak) * 0.15,
+                                ),
+                            ),
+                            quality="estimated",
+                        )
+                        world_source = "gravity_drop"
+                        quality = "estimated"
+                        if force_occlusion_gravity and occlusion_assessment is not None:
+                            quality_reason = (
+                                "lower_body_occlusion="
+                                f"{occlusion_assessment.level}"
+                            )
+                            if occlusion_assessment.reason:
+                                quality_reason = (
+                                    f"{quality_reason},"
+                                    f"evidence={occlusion_assessment.reason}"
+                                )
+                        else:
+                            quality_reason = (
+                                "current_anchor_unavailable"
+                                if anchor_candidate is None
+                                else "current_anchor_projection_failed"
+                            )
 
             fallback_reason = self._fallback_quality_reason(pose_kpts_abs, pose_anchor, person_anchor, depth_result, state)
+            if source_measurement_rejected:
+                fallback_reason = (
+                    quality_reason
+                    if quality_reason in (
+                        "fusion_policy_requires_registered_depth",
+                        "floor_ray_range_exceeded",
+                        "floor_ray_geometry_invalid",
+                    )
+                    else "source_hysteresis_rejected_current_measurement"
+                )
 
-            if hit is None and state is not None and state.last_good_world is not None:
+            measurement_rejected = bool(
+                state is not None
+                and "world_prefilter_measurement" in track
+                and not state.measurement_accepted
+            )
+            if measurement_rejected:
+                quality_reason = str(
+                    state.measurement_rejection_reason or "physical_measurement_rejected"
+                )
+                fallback_reason = quality_reason
+                hold_age = float(now_ts) - float(state.last_good_ts or 0.0)
+                if (
+                    state.last_good_world is not None
+                    and hold_age <= float(self._world_anchor_hold_ttl_s)
+                ):
+                    hit = np.asarray(state.last_good_world, dtype=np.float64)
+                    quality = "estimated"
+                    world_source = "anchor_hold"
+                else:
+                    hit = None
+                    quality = "invalid"
+                    world_source = None
+
+            if (
+                not measurement_rejected
+                and hit is None
+                and state is not None
+                and state.last_good_world is not None
+            ):
                 hold_age = float(now_ts) - float(state.last_good_ts or 0.0)
                 if hold_age <= float(self._world_anchor_hold_ttl_s):
                     hit = np.asarray(state.last_good_world, dtype=np.float64)
@@ -8038,45 +9716,32 @@ class _AnalyticsTelemetryProcessor:
                     quality = "estimated"
                     quality_reason = fallback_reason
 
-            # Phase 2: sticky source hysteresis among live observations.
-            # Degraded modes (anchor_hold / gravity_drop) always win when they are the
-            # only current evidence — do not keep a stale sticky live source label.
-            if state is not None and world_source is not None:
-                if world_source in ("anchor_hold", "gravity_drop"):
-                    state.sticky_source = str(world_source)
-                    state.sticky_source_frames = 1
-                    state.sticky_source_score = source_score(
-                        world_source,
-                        quality=str(quality),
-                        depth_weight=0.0,
-                        posture=str(posture),
-                    )
-                else:
-                    cand_score = source_score(
-                        world_source,
-                        quality=str(quality),
-                        depth_weight=float(depth_weight_for_score),
-                        posture=str(posture),
-                    )
-                    accepted_source, _switched = apply_source_hysteresis(
-                        state,
-                        candidate_source=str(world_source),
-                        candidate_score=float(cand_score),
-                        config=self._human_ground_cfg,
-                    )
-                    if accepted_source != world_source and accepted_source not in ("anchor_hold", "gravity_drop"):
-                        # Keep sticky live source; reuse filtered state rather than the
-                        # rejected weak candidate measurement when available.
-                        world_source = str(accepted_source)
-                        if state.world_x is not None and state.world_z is not None:
-                            hit = np.array(
-                                [float(state.world_x), float(calib.floor_y), float(state.world_z)],
-                                dtype=np.float64,
-                            )
-                    else:
-                        world_source = str(accepted_source)
-
             if hit is not None:
+                track["world_estimator_evaluated"] = True
+                if (
+                    world_source == "gravity_drop"
+                    and state is not None
+                    and state.lower_body_occluded
+                ):
+                    # The observed bbox/keypoint bottom is the occluder edge, not
+                    # a foot. Publish the calibrated reconstructed floor contact
+                    # to both BEV and mosaic trail consumers.
+                    self._set_track_image_base_from_world(
+                        track,
+                        calib=calib,
+                        world_point=hit,
+                        flip_u=flip_u,
+                        flip_v=flip_v,
+                    )
+                    reconstructed_foot = track.get("image_base")
+                    if (
+                        isinstance(reconstructed_foot, (list, tuple))
+                        and len(reconstructed_foot) >= 2
+                    ):
+                        track["image_foot"] = [
+                            float(reconstructed_foot[0]),
+                            float(reconstructed_foot[1]),
+                        ]
                 # Phase 1: motion mode / stationary lock using image foot + speed.
                 image_uv = None
                 raw_foot = track.get("image_foot")
@@ -8128,6 +9793,7 @@ class _AnalyticsTelemetryProcessor:
                         state.last_good_ts = float(now_ts)
                         state.ts = float(now_ts)
             else:
+                track["world_estimator_evaluated"] = True
                 track["world_valid"] = False
                 track["world_quality"] = "invalid"
                 track["world_quality_reason"] = str(fallback_reason or "no_floor_intersection")
@@ -8149,39 +9815,180 @@ class _AnalyticsTelemetryProcessor:
         *,
         now_ts: Optional[float] = None,
         track_count: Optional[int] = None,
-    ) -> None:
-        if self.bev_renderer is None or self.bev_calibration is None:
-            return
-        ts_now = float(now_ts) if now_ts is not None else time.time()
-        fp_count = int(track_count) if track_count is not None else len(footpoints)
-        if not self._publish_gate_due(
-            self._last_bev_publish_ts_by_sensor,
-            self._last_bev_count_by_sensor,
-            sensor_id=sensor_id,
-            now_ts=ts_now,
-            count=fp_count,
-            interval_s=float(self._bev_publish_interval_s),
-            counter_prefix="bev",
+        paired_with_tracking: bool = False,
+        tracking_receipt: Optional[TrackingPublicationReceipt] = None,
+    ) -> BevPublicationReceipt:
+        if self.bev_renderer is None:
+            raise RuntimeError("BEV publication requested without a renderer")
+        if paired_with_tracking and not isinstance(
+            tracking_receipt,
+            TrackingPublicationReceipt,
         ):
-            return
+            raise RuntimeError(
+                "paired BEV publication requires a tracking admission receipt"
+            )
+        ts_now = float(now_ts) if now_ts is not None else time.time()
+        ts_us = self._frame_timestamp_us(frame_meta)
+        frame_id = int(
+            _meta_lookup(
+                frame_meta,
+                "frame_number",
+                "frame_num",
+                default=0,
+            )
+            or 0
+        )
+        observed_at_us = max(1, int(ts_now * 1_000_000))
+        tracking_sequence = (
+            tracking_receipt.tracking_publication_sequence
+            if tracking_receipt is not None
+            else None
+        )
+        tracking_submission_id = (
+            tracking_receipt.outbound_submission_id
+            if tracking_receipt is not None
+            else None
+        )
+        fp_count = int(track_count) if track_count is not None else len(footpoints)
+        if not paired_with_tracking:
+            if not self._publish_gate_due(
+                self._last_bev_publish_ts_by_sensor,
+                self._last_bev_count_by_sensor,
+                sensor_id=sensor_id,
+                now_ts=ts_now,
+                count=fp_count,
+                interval_s=float(self._bev_publish_interval_s),
+                counter_prefix="bev",
+            ):
+                raise RuntimeError(
+                    "standalone BEV gate skipped a requested publication"
+                )
+        if self.bev_calibration is None:
+            failure = self.bev_renderer.record_input_failure(
+                camera_id,
+                stage="calibration_provider",
+                timestamp_us=ts_us,
+                cause=RuntimeError("BEV calibration provider is unavailable"),
+            )
+            return BevPublicationReceipt(
+                status="failed",
+                camera_id=camera_id,
+                source_id=int(sensor_id),
+                frame_id=frame_id,
+                observed_at_us=observed_at_us,
+                tracking_publication_sequence=tracking_sequence,
+                tracking_outbound_submission_id=tracking_submission_id,
+                failure=failure,
+            )
         try:
             calib = self.bev_calibration.snapshot(sensor_id, camera_id)
-        except Exception:
-            calib = None
+        except Exception as exc:
+            failure = self.bev_renderer.record_input_failure(
+                camera_id,
+                stage="calibration_snapshot",
+                timestamp_us=ts_us,
+                cause=exc,
+            )
+            return BevPublicationReceipt(
+                status="failed",
+                camera_id=camera_id,
+                source_id=int(sensor_id),
+                frame_id=frame_id,
+                observed_at_us=observed_at_us,
+                tracking_publication_sequence=tracking_sequence,
+                tracking_outbound_submission_id=tracking_submission_id,
+                failure=failure,
+            )
         if calib is None:
-            return
-        ts_us = self._frame_timestamp_us(frame_meta)
+            failure = self.bev_renderer.record_input_failure(
+                camera_id,
+                stage="calibration_snapshot",
+                timestamp_us=ts_us,
+                cause=LookupError("BEV calibration snapshot is unavailable"),
+            )
+            return BevPublicationReceipt(
+                status="failed",
+                camera_id=camera_id,
+                source_id=int(sensor_id),
+                frame_id=frame_id,
+                observed_at_us=observed_at_us,
+                tracking_publication_sequence=tracking_sequence,
+                tracking_outbound_submission_id=tracking_submission_id,
+                failure=failure,
+            )
         try:
             publish_start_ns = time.perf_counter_ns()
-            self.bev_renderer.render_and_publish(
+            receipt = self.bev_renderer.render_and_publish(
                 camera_id=camera_id,
                 calib=calib,
                 footpoints=list(footpoints),
                 timestamp_us=ts_us,
+                source_id=int(sensor_id),
+                frame_id=frame_id,
+                observed_at_us=observed_at_us,
+                tracking_publication_sequence=tracking_sequence,
+                tracking_outbound_submission_id=tracking_submission_id,
             )
             _record_core_stage_timing("bev.render_and_publish", publish_start_ns, item_count=len(footpoints))
-        except Exception:
-            logger.exception("BEV render failed for %s", camera_id)
+        except Exception as exc:
+            failure = self.bev_renderer.record_input_failure(
+                camera_id,
+                stage="render_call",
+                timestamp_us=ts_us,
+                cause=exc,
+            )
+            return BevPublicationReceipt(
+                status="failed",
+                camera_id=camera_id,
+                source_id=int(sensor_id),
+                frame_id=frame_id,
+                observed_at_us=observed_at_us,
+                tracking_publication_sequence=tracking_sequence,
+                tracking_outbound_submission_id=tracking_submission_id,
+                failure=failure,
+            )
+        if not isinstance(receipt, BevPublicationReceipt):
+            failure = self.bev_renderer.record_input_failure(
+                camera_id,
+                stage="publication_receipt",
+                timestamp_us=ts_us,
+                cause=RuntimeError("BEV renderer returned no typed receipt"),
+            )
+            return BevPublicationReceipt(
+                status="failed",
+                camera_id=camera_id,
+                source_id=int(sensor_id),
+                frame_id=frame_id,
+                observed_at_us=observed_at_us,
+                tracking_publication_sequence=tracking_sequence,
+                tracking_outbound_submission_id=tracking_submission_id,
+                failure=failure,
+            )
+        if (
+            receipt.source_id != int(sensor_id)
+            or receipt.frame_id != frame_id
+            or receipt.observed_at_us != observed_at_us
+            or receipt.tracking_publication_sequence != tracking_sequence
+            or receipt.tracking_outbound_submission_id
+            != tracking_submission_id
+        ):
+            failure = self.bev_renderer.record_input_failure(
+                camera_id,
+                stage="publication_receipt",
+                timestamp_us=ts_us,
+                cause=RuntimeError("BEV publication receipt cohort mismatch"),
+            )
+            return BevPublicationReceipt(
+                status="failed",
+                camera_id=camera_id,
+                source_id=int(sensor_id),
+                frame_id=frame_id,
+                observed_at_us=observed_at_us,
+                tracking_publication_sequence=tracking_sequence,
+                tracking_outbound_submission_id=tracking_submission_id,
+                failure=failure,
+            )
+        return receipt
 
     def _iter_object_meta(self, frame_meta: Any) -> Iterable[Any]:
         cast = _resolve_pyds_cast("NvDsObjectMeta")
@@ -8252,6 +10059,8 @@ class _AnalyticsTelemetryProcessor:
                 zone = _primary_zone_from_analytics(analytics_meta)
                 if zone:
                     track["zone"] = zone
+                    track["zone_source"] = "nvdsanalytics_roi"
+                    track["zone_authoritative"] = True
                     logger.debug(f"DS8 track {track_id} assigned zone: {zone}")
                 break  # Use first analytics item
 
@@ -8319,6 +10128,8 @@ class _AnalyticsTelemetryProcessor:
             zone = _primary_zone_from_analytics(analytics_meta)
             if zone:
                 track["zone"] = zone
+                track["zone_source"] = "nvdsanalytics_roi"
+                track["zone_authoritative"] = True
 
         return track
 
@@ -8450,6 +10261,7 @@ class _AnalyticsTelemetryProcessor:
             pose_kpts_abs=pose_kpts_abs,
             depth_result=depth_result,
         )
+        self._apply_scene_prior_shadow(camera_id, world_track)
         for key in (
             "image_foot",
             "image_base",
@@ -8460,6 +10272,9 @@ class _AnalyticsTelemetryProcessor:
             "world_frame",
             "world_source",
         ):
+            if key in world_track:
+                raw[key] = world_track.get(key)
+        for key in _WORLD_ESTIMATOR_DIAGNOSTIC_FIELDS:
             if key in world_track:
                 raw[key] = world_track.get(key)
 
@@ -8581,9 +10396,34 @@ class _AnalyticsTelemetryProcessor:
             "identity_kind",
             "resident_uuid",
             "display_name",
+            "visitor_generation",
         ):
             if key in id_diag and id_diag.get(key) is not None:
                 target[key] = id_diag.get(key)
+
+    def _process_identity_v2_source_frame(
+        self,
+        *,
+        camera_id: str,
+        frame_id: int,
+        primitives: Sequence[IdentityFramePrimitive],
+        observed_at: float,
+    ) -> None:
+        service = getattr(self.pipeline, "identity_v2_service", None)
+        if service is None:
+            return
+        try:
+            service.process_source_frame(
+                camera_id=str(camera_id),
+                frame_id=int(frame_id),
+                primitives=tuple(primitives),
+                observed_at=float(observed_at),
+            )
+        except Exception as exc:
+            callback = getattr(self.pipeline, "identity_v2_failure_callback", None)
+            if callable(callback):
+                callback(exc)
+            raise
 
     def _maybe_assign_stable_id(
         self,
@@ -9115,7 +10955,7 @@ class _OsdLabelProcessor:
         return conf_text
 
 
-class _OsdLabelOperator(BatchMetadataOperator):  # pragma: no cover - requires DeepStream runtime
+class _OsdLabelOperator(_BatchMetadataOperatorBase):  # pragma: no cover - requires DeepStream runtime
     def __init__(self, processor: _OsdLabelProcessor) -> None:
         super().__init__()
         self._processor = processor
@@ -9134,7 +10974,18 @@ class _OsdLabelOperator(BatchMetadataOperator):  # pragma: no cover - requires D
                 logger.exception("Failed to stamp OSD labels within batch metadata (DS8)")
 
 
-class _AnalyticsTelemetryOperator(BatchMetadataOperator):  # pragma: no cover - requires DeepStream runtime
+class _IdentityV2PostResolutionOsdOperator(
+    _BatchMetadataOperatorBase
+):  # pragma: no cover - requires DeepStream runtime
+    def __init__(self, processor: IdentityV2PostResolutionOsdProcessor) -> None:
+        super().__init__()
+        self._operator = _SharedIdentityV2OsdOperator(processor)
+
+    def handle_metadata(self, batch_meta: Any) -> None:
+        self._operator.handle_metadata(batch_meta)
+
+
+class _AnalyticsTelemetryOperator(_BatchMetadataOperatorBase):  # pragma: no cover - requires DeepStream runtime
     def __init__(self, processor: _AnalyticsTelemetryProcessor) -> None:
         super().__init__()
         self._processor = processor
@@ -9153,144 +11004,7 @@ class _AnalyticsTelemetryOperator(BatchMetadataOperator):  # pragma: no cover - 
                 logger.exception("Failed to process analytics telemetry within batch metadata (DS8)")
 
 
-@dataclass
-class _ExcludePruneProcessor:
-    polygons: Mapping[int, Sequence[Tuple[str, Sequence[Tuple[float, float]]]]]
-    _object_meta_cast: Optional[Callable[[Any], Any]] = field(default=None, init=False, repr=False)
-
-    def handle_frame_ds8(self, frame_meta: Any) -> None:
-        """Handle frame using DS8 pyservicemaker API."""
-        source_id = int(getattr(frame_meta, "pad_index", getattr(frame_meta, "source_id", -1)))
-        if source_id < 0:
-            return
-        poly_specs = self.polygons.get(source_id)
-        if not poly_specs:
-            return
-
-        # DS8 API: object_items is read-only iterable; we can't remove items
-        # Instead, we filter and log which objects would be pruned
-        object_items = getattr(frame_meta, "object_items", None) or []
-        pruned_count = 0
-        for obj_meta in object_items:
-            rect = getattr(obj_meta, "rect_params", None)
-            bbox = _rect_to_bbox(rect)
-            if bbox is None:
-                continue
-            corners = _bbox_corners(bbox)
-            if self._inside_exclusion(corners, poly_specs):
-                pruned_count += 1
-                # Note: DS8 pyservicemaker doesn't expose object removal API
-                # Objects are filtered downstream by analytics/hooks
-        if pruned_count:
-            logger.debug("DS8: Would prune %s object(s) from exclusion ROIs on source %s (read-only)", pruned_count, source_id)
-
-    def handle_frame(self, frame_meta: Any) -> None:
-        source_id = int(_meta_lookup(frame_meta, "source_id", "pad_index", default=-1))
-        if source_id < 0:
-            return
-        poly_specs = self.polygons.get(source_id)
-        if not poly_specs:
-            return
-
-        to_remove: List[Any] = []
-        cast = self._resolve_object_meta_cast()
-        obj_iter = _iter_meta_entries(getattr(frame_meta, "obj_meta_list", None), cast)
-        for obj_meta in obj_iter:
-            rect = getattr(obj_meta, "rect_params", None)
-            bbox = _rect_to_bbox(rect)
-            if bbox is None:
-                continue
-            corners = _bbox_corners(bbox)
-            if self._inside_exclusion(corners, poly_specs):
-                to_remove.append(obj_meta)
-
-        if not to_remove:
-            return
-
-        removed = 0
-        for obj_meta in to_remove:
-            if self._remove_obj(frame_meta, obj_meta):
-                removed += 1
-
-        if removed:
-            logger.debug("Pruned %s object(s) from exclusion ROIs on source %s", removed, source_id)
-
-    def _inside_exclusion(
-        self,
-        corners: Sequence[Tuple[float, float]],
-        poly_specs: Sequence[Tuple[str, Sequence[Tuple[float, float]]]],
-    ) -> bool:
-        for _, poly in poly_specs:
-            if len(poly) < 3:
-                continue
-            if all(_point_in_polygon(point, poly) for point in corners):
-                return True
-        return False
-
-    def _resolve_object_meta_cast(self) -> Optional[Callable[[Any], Any]]:
-        if self._object_meta_cast is not None:
-            return self._object_meta_cast
-        self._object_meta_cast = _resolve_pyds_cast("NvDsObjectMeta")
-        return self._object_meta_cast
-
-    def _remove_obj(self, frame_meta: Any, obj_meta: Any) -> bool:
-        remover = _resolve_pyds_attr("nvds_remove_obj_meta_from_frame")
-        if callable(remover):
-            try:  # pragma: no cover - requires DeepStream runtime
-                remover(frame_meta, obj_meta)
-                return True
-            except Exception:
-                logger.exception("Failed to remove NvDsObjectMeta via nvds_remove_obj_meta_from_frame")
-
-        obj_list = getattr(frame_meta, "obj_meta_list", None)
-        if isinstance(obj_list, list):
-            try:
-                obj_list.remove(obj_meta)
-                return True
-            except ValueError:
-                return False
-
-        # Fallback for simple single-link structures
-        try:
-            head = getattr(frame_meta, "obj_meta_list", None)
-            prev = None
-            node = head
-            while node is not None:
-                data = getattr(node, "data", node)
-                if data is obj_meta:
-                    nxt = getattr(node, "next", None)
-                    if prev is None:
-                        setattr(frame_meta, "obj_meta_list", nxt)
-                    else:
-                        setattr(prev, "next", nxt)
-                    return True
-                prev = node
-                node = getattr(node, "next", None)
-        except Exception:
-            pass
-        return False
-
-
-class _ExcludePruneOperator(BatchMetadataOperator):  # pragma: no cover - requires DeepStream runtime
-    def __init__(self, processor: _ExcludePruneProcessor) -> None:
-        super().__init__()
-        self._processor = processor
-
-    def handle_metadata(self, batch_meta: Any) -> None:
-        if batch_meta is None:
-            return
-
-        frame_items = getattr(batch_meta, "frame_items", None)
-        if frame_items is None:
-            return
-        for frame_meta in frame_items:
-            try:
-                self._processor.handle_frame_ds8(frame_meta)
-            except Exception:
-                logger.exception("Failed to prune exclusion objects within batch metadata (DS8)")
-
-
-class _TrailOverlayOperator(BatchMetadataOperator):  # pragma: no cover - requires DeepStream runtime
+class _TrailOverlayOperator(_BatchMetadataOperatorBase):  # pragma: no cover - requires DeepStream runtime
     def __init__(self, processor: TrailOverlayProcessor) -> None:
         super().__init__()
         self._processor = processor
@@ -9322,7 +11036,7 @@ class _IntrinsicsProcessor:
             logger.exception("Failed to attach intrinsics for source %s", source_id)
 
 
-class _IntrinsicsOperator(BatchMetadataOperator):  # pragma: no cover - requires DeepStream runtime
+class _IntrinsicsOperator(_BatchMetadataOperatorBase):  # pragma: no cover - requires DeepStream runtime
     def __init__(self, processor: _IntrinsicsProcessor) -> None:
         super().__init__()
         self._processor = processor
@@ -9338,7 +11052,7 @@ class _IntrinsicsOperator(BatchMetadataOperator):  # pragma: no cover - requires
                 logger.exception("Failed to apply intrinsics within batch metadata probe (DS8)")
 
 
-class _MapAnythingOperator(BatchMetadataOperator):  # pragma: no cover - requires DeepStream runtime
+class _MapAnythingOperator(_BatchMetadataOperatorBase):  # pragma: no cover - requires DeepStream runtime
     def __init__(self, processor: MapAnythingProcessor) -> None:
         super().__init__()
         self._processor = processor
@@ -9441,9 +11155,10 @@ class _MapAnythingOperator(BatchMetadataOperator):  # pragma: no cover - require
                         self._warned_no_match = True
             except Exception:
                 logger.exception("Failed to process MapAnything tensors from batch metadata (DS8)")
+                raise
 
 
-class _PoseFeatureOperator(BatchMetadataOperator):  # pragma: no cover - requires DeepStream runtime
+class _PoseFeatureOperator(_BatchMetadataOperatorBase):  # pragma: no cover - requires DeepStream runtime
     def __init__(self, processor: PoseFeatureProcessor) -> None:
         super().__init__()
         self._processor = processor
@@ -9461,7 +11176,7 @@ class _PoseFeatureOperator(BatchMetadataOperator):  # pragma: no cover - require
                 logger.exception("Failed to compute pose features within batch metadata (DS8)")
 
 
-class _PoseKeypointOverlayOperator(BatchMetadataOperator):  # pragma: no cover - requires DeepStream runtime
+class _PoseKeypointOverlayOperator(_BatchMetadataOperatorBase):  # pragma: no cover - requires DeepStream runtime
     def __init__(self, processor: PoseKeypointOverlayProcessor) -> None:
         super().__init__()
         self._processor = processor
@@ -9624,43 +11339,17 @@ def _bbox_center(bbox: Sequence[float]) -> List[float]:
         return [0.0, 0.0]
 
 
-def _iter_roi_labels(raw: Any) -> Iterable[str]:
-    if raw is None:
-        return
-    if isinstance(raw, dict):
-        for key, value in raw.items():
-            status = str(value).strip().lower()
-            if status in {"1", "true", "in", "inside", "present"}:
-                yield str(key).strip()
-    elif isinstance(raw, (list, tuple, set)):
-        for item in raw:
-            label = str(item).strip()
-            if label:
-                yield label
-    elif isinstance(raw, str):
-        for part in raw.split(","):
-            label = part.strip()
-            if label:
-                yield label
-    else:
-        label = str(raw).strip()
-        if label:
-            yield label
-
-
 def _primary_zone_from_analytics(analytics_meta: Mapping[str, Any]) -> Optional[str]:
-    roi_status = analytics_meta.get("roiStatus")
-    for label in _iter_roi_labels(roi_status):
-        if label:
-            return label
-    return None
+    return resolve_authoritative_analytics_zone(analytics_meta)
 
 
 def _fallback_zone_from_camera(camera_id: Any) -> Optional[str]:
-    """Fallback for Zone/Dwell/Occupancy when nvdsanalytics ROI labels are absent.
+    """Return a diagnostic camera zone when analytics membership is unavailable.
 
-    Treat each camera/stream as its own room so UI occupancy and dwell timers remain useful
-    even when the analytics config does not emit per-object `roiStatus`.
+    The caller stamps this as non-authoritative `camera_default` evidence for
+    occupancy, dwell, and operator diagnostics only. It never populates
+    canonical `room_id`; authoritative membership requires exact `ocStatus` or
+    ROI-only compatibility evidence from nvdsanalytics.
     """
     try:
         value = str(camera_id).strip()

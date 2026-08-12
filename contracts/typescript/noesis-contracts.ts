@@ -46,7 +46,7 @@ export type ActorRole = "viewer" | "operator" | "owner" | "agent" | "automation"
 export type ApplianceEndpoints = {
   readonly websocket: "ws://127.0.0.1:6008";
   readonly rest: "http://127.0.0.1:8080";
-  readonly rtsp: "rtsp://127.0.0.1:8554/mosaic";
+  readonly rtsp: "rtsp://127.0.0.1:8554/ds-test";
 };
 
 export type ApplianceReadinessVersions = {

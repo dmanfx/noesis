@@ -9,7 +9,7 @@
           "type": "string"
         },
         "rtsp": {
-          "const": "rtsp://127.0.0.1:8554/mosaic",
+          "const": "rtsp://127.0.0.1:8554/ds-test",
           "title": "Rtsp",
           "type": "string"
         },

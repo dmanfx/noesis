@@ -141,7 +141,7 @@ def _fixture(
         endpoints=ApplianceEndpoints(
             websocket="ws://127.0.0.1:6008",
             rest="http://127.0.0.1:8080",
-            rtsp="rtsp://127.0.0.1:8554/mosaic",
+            rtsp="rtsp://127.0.0.1:8554/ds-test",
         ),
         runtime=DS8RuntimeSelector(
             family="ds8",

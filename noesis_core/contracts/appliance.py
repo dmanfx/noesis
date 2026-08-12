@@ -102,7 +102,7 @@ class StateReleaseBinding(ContractModel):
 class ApplianceEndpoints(ContractModel):
     websocket: Literal["ws://127.0.0.1:6008"]
     rest: Literal["http://127.0.0.1:8080"]
-    rtsp: Literal["rtsp://127.0.0.1:8554/mosaic"]
+    rtsp: Literal["rtsp://127.0.0.1:8554/ds-test"]
 
 
 class ApplianceReadinessVersions(ContractModel):

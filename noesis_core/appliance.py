@@ -92,6 +92,33 @@ NOESIS_RUNTIME_MODEL_FILES = (
     "models/engines/deimv2_wholebody49_dinov3_x_boxes_640_b3_fp16.engine",
 )
 NOESIS_RUNTIME_DIRECT_FILES = (
+    "external/DeepStream-Yolo-Seg/nvdsinfer_custom_impl_Yolo_seg/Makefile",
+    "external/DeepStream-Yolo-Seg/nvdsinfer_custom_impl_Yolo_seg/"
+    "nvdsparseseg_Yolo.cpp",
+    "external/DeepStream-Yolo-Seg/nvdsinfer_custom_impl_Yolo_seg/"
+    "nvdsparseseg_Yolo11.cpp",
+    "external/DeepStream-Yolo-Seg/nvdsinfer_custom_impl_Yolo_seg/"
+    "trt_plugins/common.cpp",
+    "external/DeepStream-Yolo-Seg/nvdsinfer_custom_impl_Yolo_seg/"
+    "trt_plugins/common.h",
+    "external/DeepStream-Yolo-Seg/nvdsinfer_custom_impl_Yolo_seg/"
+    "trt_plugins/efficientNMSPlugin/efficientNMSInference.cu",
+    "external/DeepStream-Yolo-Seg/nvdsinfer_custom_impl_Yolo_seg/"
+    "trt_plugins/efficientNMSPlugin/efficientNMSInference.h",
+    "external/DeepStream-Yolo-Seg/nvdsinfer_custom_impl_Yolo_seg/"
+    "trt_plugins/efficientNMSPlugin/efficientNMSParameters.h",
+    "external/DeepStream-Yolo-Seg/nvdsinfer_custom_impl_Yolo_seg/"
+    "trt_plugins/efficientNMSPlugin/efficientNMSPlugin.cpp",
+    "external/DeepStream-Yolo-Seg/nvdsinfer_custom_impl_Yolo_seg/"
+    "trt_plugins/efficientNMSPlugin/efficientNMSPlugin.h",
+    "external/DeepStream-Yolo-Seg/nvdsinfer_custom_impl_Yolo_seg/"
+    "trt_plugins/roiAlignPlugin/roiAlignKernel.cu",
+    "external/DeepStream-Yolo-Seg/nvdsinfer_custom_impl_Yolo_seg/"
+    "trt_plugins/roiAlignPlugin/roiAlignKernel.h",
+    "external/DeepStream-Yolo-Seg/nvdsinfer_custom_impl_Yolo_seg/"
+    "trt_plugins/roiAlignPlugin/roiAlignPlugin.cpp",
+    "external/DeepStream-Yolo-Seg/nvdsinfer_custom_impl_Yolo_seg/"
+    "trt_plugins/roiAlignPlugin/roiAlignPlugin.h",
     "external/DeepStream-Yolo-Seg/nvdsinfer_custom_impl_Yolo_seg/"
     "libnvdsinfer_custom_impl_Yolo_seg.so",
 )

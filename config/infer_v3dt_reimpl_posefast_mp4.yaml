@@ -18,14 +18,14 @@ streammux:
   live-source: 1
   batched-push-timeout: 40000
   enable-padding: 0
-  nvbuf-memory-type: 0  # Canonical NVMM setting used across streammux/dewarper/RTSP vconv in DS8 builder.
+  nvbuf-memory-type: 0  # Canonical NVMM setting used across streammux/dewarper/mosaic encode conversion.
   sync-inputs: 0
   gpu-id: 0
 
 sources:
   - element: nvurisrcbin
-    uri: rtsp://192.168.3.214:7447/jdr9oLlBkjyl3gDm?
-    #uri: file:///home/mayor/Downloads/livingroomclip.mp4
+    uri_secret: living-room
+    # uri: file:///path/to/living-room.mp4
     gpu-id: 0
     cudadec-memtype: 0
     latency: 100
@@ -36,9 +36,8 @@ sources:
       config-file: config/dewarper_g3_instant_charuco_1080.txt
   - element: nvurisrcbin
     #kitchen camera
-    #uri: rtsp://192.168.3.214:7447/qt3VqVdZpgG1B4Vk?
-    uri: rtsp://192.168.3.214:7447/qt3VqVdZpgG1B4Vk?
-    #uri: file:///home/mayor/Downloads/kitchenclip.mp4
+    uri_secret: kitchen
+    # uri: file:///path/to/kitchen.mp4
     gpu-id: 0
     cudadec-memtype: 0
     latency: 100
@@ -49,9 +48,8 @@ sources:
       config-file: config/dewarper_g3_instant_charuco_1080.txt
   - element: nvurisrcbin
     #family room camera
-    #uri: rtsp://192.168.3.214:7447/4qWTBhW6b4nLeUFE?
-    uri: rtsp://192.168.3.214:7447/4qWTBhW6b4nLeUFE?
-    #uri: file:///home/mayor/Downloads/familyroomclip.mp4
+    uri_secret: family-room
+    # uri: file:///path/to/family-room.mp4
     gpu-id: 0
     cudadec-memtype: 0
     latency: 100
@@ -81,6 +79,8 @@ models:
     engine: models/engines/reid_osnet_ibn_msmt17_dyn_b16_fp16.engine
     batch_size: 16
     gie_id: 3
+    layer: features
+    embedding_dim: 512
     attach_tensor_meta: true
   pose:
     enable: false
@@ -97,7 +97,7 @@ models:
   depth_tracking:
     enable: false
     name: depth_tracking_fullframe
-    config-file-path: build/config_infer_depth_tracking_da2_vits_294x518_b3_i1.ini
+    config-file-path: pipelines/config_infer_secondary_depth_tracking_da2.ini
     engine: models/engines/depth_anything_v2_metric_hypersim_vits_294x518_b3_fp16.engine
     batch_size: 3
     gie_id: 5
@@ -126,32 +126,33 @@ analytics:
 
 sinks:
   - name: mosaic_sink
-    type: fakesink  # Placeholder reserved for Flow retrievers (not used for mosaic video; mosaic is RTSP→WebRTC).
+    type: fakesink  # Semantic placeholder only; mosaic video uses encoded-AU SHM→WebRTC.
     sync: false
   - name: bev_sink
     type: fakesink
     sync: false  # Placeholder for future BEV retrieval; current BEV path uses telemetry hooks, not Flow/appsinks.
 
-# Legacy frame output stanza (not used in tiled DS8 mode; mosaic video is RTSP→WebRTC).
+# Legacy frame output stanza (not used in tiled DS8 mode; mosaic video is encoded-AU SHM→WebRTC).
 output:
   enable_frames: false  # No per-camera JPEG-over-WS frame output in DS8 tiled mode.
   codec: jpeg
   jpeg_quality: 85
   overlays: false
 
-# Mosaic output configuration: RTSP and WebRTC paths
+# Mosaic output configuration: canonical SHM/WebRTC plus optional RTSP tooling
 mosaic_output:
-  rtsp_enabled: true         # Enable RTSP mosaic output (required for WebRTC gateway)
+  rtsp_enabled: false        # Optional tooling only; WebRTC consumes H.264 AUs through SHM
   rtsp_port: 8554            # RTSP server port (unused when rtsp_enabled is false)
   rtsp_path: "mosaic"        # RTSP stream path (url: rtsp://host:port/path)
-  mosaic_webrtc_enabled: true   # Enable WebRTC gateway (consumes the local RTSP mosaic)
-  video_bitrate_kbps: 4000   # H.264 encoder bitrate
-  encoder: "nvh264enc"       # H.264 encoder (fallback to x264enc if unavailable)
-  # RTSP encoder tuning for faster WebRTC startup:
-  # Frequent IDR frames reduce "connected but black" (RTP bytes flowing but 0 decoded frames) on late joins.
-  rtsp_iframeinterval: 30    # IDR/I-frame interval in frames (nvrtspoutsinkbin)
-  rtsp_idrinterval: 30       # IDR interval in frames (nvrtspoutsinkbin)
-  rtsp_profile: 0            # 0=baseline, 1=main, 2=high (H.264)
+  mosaic_webrtc_enabled: true
+  mosaic_h264_shm_socket: "/tmp/noesis-mosaic-h264"
+  video_bitrate_kbps: 12000  # Quality floor for the 3840x720 short-GOP mosaic
+  encoder: "nvv4l2h264enc"   # Required GPU encoder; no CPU fallback
+  # IDR every 10 input frames for bounded decoder recovery.
+  h264_iframeinterval: 10
+  h264_idrinterval: 10
+  h264_preset_id: 4
+  h264_profile: 0            # 0=baseline, 1=main, 2=high (H.264)
 
 bev:
   # The inline BEV panels overlay tracks on camera-local MapAnything floorplans.

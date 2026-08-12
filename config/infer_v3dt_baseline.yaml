@@ -14,8 +14,8 @@ streammux:
 sources:
 - element: nvurisrcbin
   #living room camera
-  uri: rtsp://192.168.3.214:7447/jdr9oLlBkjyl3gDm?
-  #uri: file:///home/mayor/Downloads/livingroomclip.mp4
+  uri_secret: living-room
+  # uri: file:///path/to/living-room.mp4
   gpu-id: 0
   cudadec-memtype: 0
   latency: 10
@@ -26,8 +26,8 @@ sources:
     config-file: config/dewarper_g3_instant_charuco_1080.txt
 - element: nvurisrcbin
   #kitchen camera
-  uri: rtsp://192.168.3.214:7447/qt3VqVdZpgG1B4Vk?
-  #uri: file:///home/mayor/Downloads/kitchenclip.mp4
+  uri_secret: kitchen
+  # uri: file:///path/to/kitchen.mp4
   gpu-id: 0
   cudadec-memtype: 0
   latency: 10
@@ -38,8 +38,8 @@ sources:
     config-file: config/dewarper_g3_instant_charuco_1080.txt
 - element: nvurisrcbin
   #family room camera
-  uri: rtsp://192.168.3.214:7447/4qWTBhW6b4nLeUFE?
-  #uri: file:///home/mayor/Downloads/familyroomclip.mp4
+  uri_secret: family-room
+  # uri: file:///path/to/family-room.mp4
   gpu-id: 0
   cudadec-memtype: 0
   latency: 10
@@ -54,7 +54,7 @@ preprocess:
 models:
   pgie:
     config-file-path: pipelines/config_infer_primary_yolo11_seg.ini
-    engine: /home/mayor/Noesis_Devel/models/engines/yolo11s-seg_cust_fused.engine
+    engine: models/engines/yolo11s-seg_cust_fused.engine
     batch_size: 3
     gie_id: 1
     network_mode: fp16
@@ -67,12 +67,13 @@ models:
     batch_size: 16
     gie_id: 3
     layer: fc_pred
+    embedding_dim: 256
     attach_tensor_meta: true
   mapanything:
     enable: true
     name: mapanything_fullframe
     config-file-path: pipelines/config_infer_secondary_mapanything.ini
-    engine: /home/mayor/Noesis_Devel/models/mapanything_depth/1/model.plan
+    engine: models/mapanything_depth/1/model.plan
     batch_size: 3
     gie_id: 2
     attach_tensor_meta: true
@@ -97,16 +98,19 @@ sinks:
   type: fakesink
   sync: false
 mosaic_output:
-  rtsp_enabled: true
+  rtsp_enabled: false
   rtsp_port: 8554
   rtsp_path: mosaic
   mosaic_webrtc_enabled: true
-  video_bitrate_kbps: 4000
-  encoder: nvh264enc
-  rtsp_iframeinterval: 30
-  rtsp_idrinterval: 30
-  rtsp_profile: 0
+  mosaic_h264_shm_socket: /tmp/noesis-mosaic-h264
+  video_bitrate_kbps: 12000
+  encoder: nvv4l2h264enc
+  h264_iframeinterval: 10
+  h264_idrinterval: 10
+  h264_preset_id: 4
+  h264_profile: 0
 bev:
+  frame: camera_local_ground_m
   jpeg_enabled: false
   jpeg_quality: 70
   smoothing:
@@ -144,4 +148,5 @@ visualization:
     font_name: Serif
     decimals: 2
 v3dt:
-  world_frame: camera_local
+  world_frame: backend_world_m
+  caminfo_world_axes: xzy

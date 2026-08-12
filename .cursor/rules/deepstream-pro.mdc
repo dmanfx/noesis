@@ -11,8 +11,13 @@ globs:
   - "**/*.md"
 ---
 
-# Mandatory Preflight (evidence required)
-Before proposing any solution:
+# Mandatory skill-first preflight
+Before proposing or implementing a DeepStream solution:
+0) Read the matching NVIDIA skill under `.agents/skills/` and follow its routed
+   references. Start with `deepstream-dev`; add the pipeline, model, profiling,
+   or MV3DT skill when the task matches. See
+   `DS9/docs/deepstream_9_1_agent_skills.md`. Repository DS9.1 pins override
+   older example versions in upstream skill text. AMC execution is deferred.
 1) **Summarize** (3–7 bullets total) the most relevant parts of:
    - **Primary Source (Local Docs):** The distilled documentation in `/docs/deepstream-docs/`. Start with the `README.md` to navigate.
    - **Secondary Source (Fallback):** If the local docs are insufficient, consult the official NVIDIA Dev Guide (TOC + specific components you intend to use) → https://docs.nvidia.com/metropolis/deepstream/dev-guide/
@@ -63,4 +68,3 @@ Before proposing any solution:
 - Missing or vague acceptance criteria
 - DS/TRT version mismatch likely to change behavior
 - Attempt to re‑implement a feature that DS already offers (without a gap analysis from local docs)
-

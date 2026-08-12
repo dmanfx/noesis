@@ -1,8 +1,13 @@
 # AGENTS.md (Root) – Guidance for Codex Agents
 
-This repository is centered on the DeepStream 8 stack:
+This repository is centered on the DeepStream 9.1 stack:
 
-- **DS8 (canonical):** `noesis/` tree (`ds8_runtime.py`, `pipelines/`, `server/`, `telemetry/`, `metadata/`, `config/`) built on DeepStream 8 Service Maker and Flow APIs.
+- **DS9.1 (canonical):** `DS9/` owns the executable runtime, native bridges,
+  parsers, configs, and engine realizations. Shared application contracts and
+  services remain under `noesis/` and `noesis_core/` where DS9 imports them.
+- **DS8 (maintenance/reference):** `noesis/ds8_runtime.py` and the DS8 plans are
+  retained for compatibility work and migration history; do not route DS9.1
+  failures through them.
 - **Pre-DS8 artifacts (deprecated):** retained only for historical context or explicit one-off maintenance.
 
 ## Policy precedence
@@ -12,6 +17,23 @@ This repository is centered on the DeepStream 8 stack:
 - Files under `docs/history/` are archival and non-normative for active implementation work.
 
 When you (the agent) work in this repo:
+
+0. **Use the NVIDIA DeepStream skills before direct implementation**
+   - Start DeepStream work by reading the matching `SKILL.md` under
+     `.agents/skills/` and the references it routes to. The routing guide is
+     `DS9/docs/deepstream_9_1_agent_skills.md`.
+   - Use `deepstream-dev` for SDK/API/runtime work,
+     `deepstream-generate-pipeline` for new graphs/configs,
+     `deepstream-import-vision-model` for model/engine work,
+     `deepstream-profile-pipeline` for performance work, and
+     `deepstream-run-mv3dt` for MV3DT work. Use `deepstream-sop` only for an SOP
+     application.
+   - AMC skills are installed for future calibration work but are currently
+     deferred. Do not run AMC or treat MV3DT as enabled until the Kitchen
+     geometry and Kitchen/Family Room overlap evidence are ready.
+   - Repository and `DS9/AGENTS.md` version pins override stale example pins in
+     upstream skill material. If no skill covers the task, state that briefly
+     and then work directly from verified official APIs.
 
 1. **Respect the deprecated-stack vs DS8 split**
    - Do not silently route DS8 failures through removed pre-DS8 runtime paths. If DS8 code cannot be made to work, fail loudly in logs/docs and stop.

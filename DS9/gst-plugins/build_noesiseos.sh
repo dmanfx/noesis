@@ -16,7 +16,7 @@ if [[ "$(readlink -f -- "${DS_HOME}")" != *"deepstream-9.1" ]]; then
   exit 1
 fi
 
-cmake -S "${PLUGIN_ROOT}/noesiseos" -B "${BUILD_DIR}" \
+cmake --fresh -S "${PLUGIN_ROOT}/noesiseos" -B "${BUILD_DIR}" \
   -DCMAKE_BUILD_TYPE=Release \
   -DCMAKE_LIBRARY_OUTPUT_DIRECTORY="${OUT_DIR}"
 cmake --build "${BUILD_DIR}" --parallel

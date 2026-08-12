@@ -20,7 +20,7 @@ if [[ "$(readlink -f -- "${DS_HOME}")" != *"deepstream-9.1" ]]; then
   exit 1
 fi
 
-cmake -S "${PLUGIN_ROOT}/noesisforceidr" -B "${BUILD_DIR}" \
+cmake --fresh -S "${PLUGIN_ROOT}/noesisforceidr" -B "${BUILD_DIR}" \
   -DCMAKE_BUILD_TYPE=Release \
   -DDEEPSTREAM_HOME="${DS_HOME}" \
   -DCMAKE_LIBRARY_OUTPUT_DIRECTORY="${OUT_DIR}"

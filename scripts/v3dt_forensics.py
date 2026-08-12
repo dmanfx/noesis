@@ -6,11 +6,13 @@ import argparse
 import http.server
 import json
 import os
+import re
 import socketserver
 import sys
 import time
 from pathlib import Path
 from typing import Optional
+from urllib.parse import unquote, urlsplit
 
 from noesis.diagnostics.v3dt_forensics import (
     analyze_tracking_log,
@@ -19,8 +21,26 @@ from noesis.diagnostics.v3dt_forensics import (
     render_report_markdown,
     render_snapshot_markdown,
 )
+from noesis_core.private_paths import (
+    PrivatePathError,
+    atomic_write_private_file,
+    ensure_private_directory,
+    read_private_file,
+    validate_private_file,
+)
 
 _DEFAULT_SCALE_SWEEP = [0.01, 0.1, 0.5, 1.0, 2.0, 10.0, 100.0]
+_MAX_JSON_BYTES = 32 * 1024 * 1024
+_MAX_LOG_BYTES = 512 * 1024 * 1024
+_MAX_PANEL_BYTES = 16 * 1024 * 1024
+_PANEL_NAME_RE = re.compile(r"^v3dt_panel_[A-Za-z0-9._-]{1,96}\.html$")
+
+
+def _default_diagnostics_dir() -> Path:
+    configured = str(os.environ.get("NOESIS_V3DT_DIAG_DIR", "") or "").strip()
+    if configured:
+        return Path(configured).expanduser()
+    return Path.home() / ".local" / "state" / "noesis" / "diagnostics"
 
 
 def _default_pipeline() -> Path:
@@ -37,17 +57,38 @@ def _default_pipeline() -> Path:
     return candidates[-1]
 
 
-def _pick_latest(pattern: str) -> Optional[Path]:
-    paths = list(Path("diagnostics").glob(pattern))
+def _pick_latest(directory: Path, pattern: str) -> Optional[Path]:
+    root = ensure_private_directory(directory, label="V3DT diagnostics")
+    paths = [
+        validate_private_file(path, label="V3DT diagnostic artifact")
+        for path in root.glob(pattern)
+    ]
     if not paths:
         return None
-    paths.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+    paths.sort(key=lambda p: p.lstat().st_mtime_ns, reverse=True)
     return paths[0]
 
 
 def _write_output(path: Path, content: str) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(content, encoding="utf-8")
+    atomic_write_private_file(
+        path,
+        content.encode("utf-8"),
+        label="V3DT diagnostic artifact",
+    )
+
+
+def _read_private_json(path: Path, *, label: str) -> object:
+    payload = read_private_file(path, label=label, max_bytes=_MAX_JSON_BYTES)
+    return json.loads(payload.decode("utf-8"))
+
+
+def _validated_log(path: Path) -> Path:
+    validated = validate_private_file(path, label="V3DT tracking log")
+    if validated.lstat().st_size > _MAX_LOG_BYTES:
+        raise PrivatePathError(
+            f"V3DT tracking log exceeds the {_MAX_LOG_BYTES}-byte analysis limit"
+        )
+    return validated
 
 def _parse_scale_sweep(raw: str) -> Optional[list[float]]:
     value = (raw or "").strip()
@@ -80,7 +121,7 @@ def _snapshot_cmd(args: argparse.Namespace) -> int:
         tracker_config_path=Path(args.tracker_config) if args.tracker_config else None,
     )
     ts = time.strftime("%Y%m%d_%H%M%S", time.localtime())
-    out_dir = Path(args.output_dir)
+    out_dir = ensure_private_directory(args.output_dir, label="V3DT diagnostics")
     json_path = out_dir / f"v3dt_snapshot_{ts}.json"
     md_path = out_dir / f"v3dt_snapshot_{ts}.md"
     _write_output(json_path, json.dumps(snapshot, indent=2, ensure_ascii=True))
@@ -91,21 +132,22 @@ def _snapshot_cmd(args: argparse.Namespace) -> int:
 
 
 def _analyze_cmd(args: argparse.Namespace) -> int:
-    log_path = Path(args.log)
+    log_path = Path(args.log).expanduser()
     if not log_path.exists():
         print(f"[FAIL] log file not found: {log_path}")
         return 1
+    log_path = _validated_log(log_path)
     snapshot = None
     if args.snapshot:
-        snap_path = Path(args.snapshot)
+        snap_path = Path(args.snapshot).expanduser()
         if not snap_path.exists():
             print(f"[FAIL] snapshot file not found: {snap_path}")
             return 1
-        snapshot = json.loads(snap_path.read_text(encoding="utf-8"))
+        snapshot = _read_private_json(snap_path, label="V3DT snapshot")
     scale_sweep = _parse_scale_sweep(args.scale_sweep)
     report = analyze_tracking_log(log_path, snapshot=snapshot, scale_sweep=scale_sweep)
     ts = time.strftime("%Y%m%d_%H%M%S", time.localtime())
-    out_dir = Path(args.output_dir)
+    out_dir = ensure_private_directory(args.output_dir, label="V3DT diagnostics")
     json_path = out_dir / f"v3dt_report_{ts}.json"
     md_path = out_dir / f"v3dt_report_{ts}.md"
     _write_output(json_path, json.dumps(report, indent=2, ensure_ascii=True))
@@ -116,16 +158,24 @@ def _analyze_cmd(args: argparse.Namespace) -> int:
 
 
 def _panel_cmd(args: argparse.Namespace) -> int:
-    snapshot_path = Path(args.snapshot) if args.snapshot else _pick_latest("v3dt_snapshot_*.json")
-    report_path = Path(args.report) if args.report else _pick_latest("v3dt_report_*.json")
+    out_dir = ensure_private_directory(args.output_dir, label="V3DT diagnostics")
+    snapshot_path = (
+        Path(args.snapshot).expanduser()
+        if args.snapshot
+        else _pick_latest(out_dir, "v3dt_snapshot_*.json")
+    )
+    report_path = (
+        Path(args.report).expanduser()
+        if args.report
+        else _pick_latest(out_dir, "v3dt_report_*.json")
+    )
     if snapshot_path is None or report_path is None:
         print("[FAIL] Could not locate snapshot/report JSON. Provide --snapshot and --report.")
         return 1
-    snapshot = json.loads(snapshot_path.read_text(encoding="utf-8"))
-    report = json.loads(report_path.read_text(encoding="utf-8"))
+    snapshot = _read_private_json(snapshot_path, label="V3DT snapshot")
+    report = _read_private_json(report_path, label="V3DT report")
     html = render_panel_html(snapshot, report)
     ts = time.strftime("%Y%m%d_%H%M%S", time.localtime())
-    out_dir = Path(args.output_dir)
     out_path = out_dir / f"v3dt_panel_{ts}.html"
     _write_output(out_path, html)
     print(f"Wrote panel: {out_path}")
@@ -133,13 +183,42 @@ def _panel_cmd(args: argparse.Namespace) -> int:
 
 
 def _serve_cmd(args: argparse.Namespace) -> int:
-    root = Path(args.dir).resolve()
-    if not root.exists():
-        print(f"[FAIL] directory not found: {root}")
+    if args.host not in {"127.0.0.1", "localhost"}:
+        print("[FAIL] V3DT panels may only bind to the local loopback interface")
         return 1
-    os.chdir(root)
-    handler = http.server.SimpleHTTPRequestHandler
-    with socketserver.TCPServer((args.host, args.port), handler) as httpd:
+    root = ensure_private_directory(args.dir, label="V3DT diagnostics")
+
+    class _PrivatePanelHandler(http.server.BaseHTTPRequestHandler):
+        def _send_panel(self, *, include_body: bool) -> None:
+            requested = unquote(urlsplit(self.path).path).lstrip("/")
+            if not _PANEL_NAME_RE.fullmatch(requested):
+                self.send_error(404)
+                return
+            try:
+                payload = read_private_file(
+                    root / requested,
+                    label="V3DT panel",
+                    max_bytes=_MAX_PANEL_BYTES,
+                )
+            except PrivatePathError:
+                self.send_error(404)
+                return
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(payload)))
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.end_headers()
+            if include_body:
+                self.wfile.write(payload)
+
+        def do_GET(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler contract
+            self._send_panel(include_body=True)
+
+        def do_HEAD(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler contract
+            self._send_panel(include_body=False)
+
+    with socketserver.TCPServer((args.host, args.port), _PrivatePanelHandler) as httpd:
         print(f"Serving {root} at http://{args.host}:{args.port}")
         try:
             httpd.serve_forever()
@@ -159,7 +238,7 @@ def main() -> int:
     snap.add_argument("--alignment", default="config/ply_alignment.json")
     snap.add_argument("--caminfo-dir", default="config/v3dt")
     snap.add_argument("--tracker-config", default="")
-    snap.add_argument("--output-dir", default="diagnostics")
+    snap.add_argument("--output-dir", default=str(_default_diagnostics_dir()))
 
     analyze = sub.add_parser("analyze", help="Analyze V3DT tracking NDJSON")
     analyze.add_argument("--log", required=True, help="NDJSON log from NOESIS_V3DT_DIAG_LOG")
@@ -169,15 +248,15 @@ def main() -> int:
         default="",
         help="Comma-separated world scale factors (e.g. 0.01,0.1,1,10) or 'auto'",
     )
-    analyze.add_argument("--output-dir", default="diagnostics")
+    analyze.add_argument("--output-dir", default=str(_default_diagnostics_dir()))
 
     panel = sub.add_parser("panel", help="Generate HTML panel from snapshot + report")
     panel.add_argument("--snapshot", default="", help="Snapshot JSON (defaults to latest)")
     panel.add_argument("--report", default="", help="Report JSON (defaults to latest)")
-    panel.add_argument("--output-dir", default="diagnostics")
+    panel.add_argument("--output-dir", default=str(_default_diagnostics_dir()))
 
     serve = sub.add_parser("serve", help="Serve diagnostics directory")
-    serve.add_argument("--dir", default="diagnostics")
+    serve.add_argument("--dir", default=str(_default_diagnostics_dir()))
     serve.add_argument("--host", default="127.0.0.1")
     serve.add_argument("--port", type=int, default=8777)
 

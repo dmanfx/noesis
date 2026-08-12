@@ -1,7 +1,13 @@
 # DS8 V3DT Forensics Toolkit
-_Status: current as of 2026-02-02._
+_Status: current as of 2026-07-10._
 
 This toolkit captures calibration + camInfo state, logs per-frame tracking telemetry, and generates an explicit report/panel so 3D tracking failures can be diagnosed from concrete data instead of guesswork.
+
+All commands share one private artifact directory:
+
+```bash
+export NOESIS_V3DT_DIAG_DIR="$HOME/.local/state/noesis/diagnostics"
+```
 
 ## 1) Capture a Snapshot (Calibration + Projection Math)
 
@@ -11,8 +17,8 @@ python3 scripts/v3dt_forensics.py snapshot \
 ```
 
 Outputs:
-- `diagnostics/v3dt_snapshot_<timestamp>.json`
-- `diagnostics/v3dt_snapshot_<timestamp>.md`
+- `$NOESIS_V3DT_DIAG_DIR/v3dt_snapshot_<timestamp>.json`
+- `$NOESIS_V3DT_DIAG_DIR/v3dt_snapshot_<timestamp>.md`
 
 The snapshot includes:
 - Raw inputs: `config/cameras.yaml`, `config/camera_calibration.json`, `config/ply_alignment.json`, `config/v3dt/camInfo_*.yml`, effective pipeline config, and tracker config.
@@ -25,7 +31,6 @@ Set the env vars before running DS8:
 
 ```bash
 export NOESIS_V3DT_DIAG_LOG=1
-export NOESIS_V3DT_DIAG_DIR=diagnostics
 # Baseline defaults (tracking works on all cameras)
 export NOESIS_V3DT_AUTOGEN_CAMINFO=1
 export NOESIS_V3DT_CAMINFO_WORLD_SCALE=1
@@ -39,7 +44,7 @@ python3 noesis/ds8_runtime.py --pipeline-config config/infer_v3dt_medium.yaml
 ```
 
 Outputs:
-- `diagnostics/v3dt_frames_<session>.ndjson`
+- `$NOESIS_V3DT_DIAG_DIR/v3dt_frames_<session>.ndjson`
 
 Each line contains a full per-frame payload with track data (including `bbox3d`, `velocity3d`, `visibility`, `image_foot`) and counts.
 
@@ -47,13 +52,13 @@ Each line contains a full per-frame payload with track data (including `bbox3d`,
 
 ```bash
 python3 scripts/v3dt_forensics.py analyze \
-  --log diagnostics/v3dt_frames_run_kitchen_001.ndjson \
-  --snapshot diagnostics/v3dt_snapshot_<timestamp>.json
+  --log "$NOESIS_V3DT_DIAG_DIR/v3dt_frames_run_kitchen_001.ndjson" \
+  --snapshot "$NOESIS_V3DT_DIAG_DIR/v3dt_snapshot_<timestamp>.json"
 ```
 
 Outputs:
-- `diagnostics/v3dt_report_<timestamp>.json`
-- `diagnostics/v3dt_report_<timestamp>.md`
+- `$NOESIS_V3DT_DIAG_DIR/v3dt_report_<timestamp>.json`
+- `$NOESIS_V3DT_DIAG_DIR/v3dt_report_<timestamp>.md`
 
 The report flags:
 - Missing `bbox3d` coverage.
@@ -71,8 +76,8 @@ To quickly test whether the 3D outputs are off by a constant scale (cm↔m, etc.
 
 ```bash
 python3 scripts/v3dt_forensics.py analyze \
-  --log diagnostics/v3dt_frames_run_kitchen_001.ndjson \
-  --snapshot diagnostics/v3dt_snapshot_<timestamp>.json \
+  --log "$NOESIS_V3DT_DIAG_DIR/v3dt_frames_run_kitchen_001.ndjson" \
+  --snapshot "$NOESIS_V3DT_DIAG_DIR/v3dt_snapshot_<timestamp>.json" \
   --scale-sweep auto
 ```
 
@@ -85,30 +90,61 @@ median reprojection error + median height per scale so you can spot the most pla
 
 ```bash
 python3 scripts/v3dt_forensics.py panel \
-  --snapshot diagnostics/v3dt_snapshot_<timestamp>.json \
-  --report diagnostics/v3dt_report_<timestamp>.json
+  --snapshot "$NOESIS_V3DT_DIAG_DIR/v3dt_snapshot_<timestamp>.json" \
+  --report "$NOESIS_V3DT_DIAG_DIR/v3dt_report_<timestamp>.json"
 ```
 
 Outputs:
-- `diagnostics/v3dt_panel_<timestamp>.html`
+- `$NOESIS_V3DT_DIAG_DIR/v3dt_panel_<timestamp>.html`
 
-Open the HTML file locally to view the full report. For quick sharing:
+Open the HTML file locally to view the full report. For loopback-only viewing:
 
 ```bash
-python3 scripts/v3dt_forensics.py serve --dir diagnostics --port 8777
+python3 scripts/v3dt_forensics.py serve --port 8777
 ```
 
 Then open `http://127.0.0.1:8777/v3dt_panel_<timestamp>.html`.
+The server refuses non-loopback binds and exposes only validated private panel
+HTML files; it does not expose snapshots, reports, raw logs, or directory
+listings.
+
+## Artifact privacy and retention
+
+The diagnostics directory must be owned by the service user with mode `0700`.
+Every generated artifact is a single-link regular file with mode `0600`; the
+tool refuses symlinks, hard links, public directories, and insecure existing
+files instead of changing their permissions. Runtime session headers and
+snapshots serialize only public pipeline source references and an explicit
+non-secret environment allowlist. Materialized RTSP locators and auth values
+are never serialized.
+
+Runtime NDJSON stops accepting records at 64 MiB per session and retains at
+most eight session logs by default. The bounds may be changed deliberately:
+
+```bash
+export NOESIS_V3DT_DIAG_MAX_BYTES=$((128 * 1024 * 1024))
+export NOESIS_V3DT_DIAG_MAX_FILES=12
+```
+
+The accepted ranges are 1-512 MiB and 1-64 files. Capacity exhaustion drops
+later records with a bounded warning; it never rolls into an undeclared file.
 
 ## 5) Raw Menon Payload Logging
 
-Every `set_extrinsics` call now logs the raw payload (pre-coercion) into:
+Every well-formed `set_extrinsics` attempt records the raw payload
+(pre-coercion) in the owner-private calibration audit directory:
 
 ```
-logs/calibration_raw/<timestamp>_<camera>.json
+$HOME/.local/state/noesis/calibration/raw/calibration_<timestamp>_<ns>_<camera>.json
 ```
 
-This captures the exact E/Twc payload, unit coercion notes, and the final stored `E`.
+Set `NOESIS_CALIBRATION_AUDIT_DIR` to another owner-only directory when needed.
+Records capture the exact E/Twc/pose payload, unit-coercion notes, and the final
+stored `E`; they are mode `0600` single-link files under a mode `0700`
+directory. The latest 64 records are retained by default
+(`NOESIS_CALIBRATION_AUDIT_MAX_FILES`, range 1-256). If the audit record cannot
+be written safely, the calibration mutation fails with
+`calibration_audit_failed` instead of proceeding without an audit trail.
 
 ## 6) Tilt-only preview from depth (pitch/roll only)
 

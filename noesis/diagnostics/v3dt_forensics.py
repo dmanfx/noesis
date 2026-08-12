@@ -12,6 +12,9 @@ from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 import numpy as np
 import yaml
 
+from noesis.diagnostics.telemetry_log import public_v3dt_environment
+from noesis_core.runtime_secrets import public_pipeline_config
+
 _ENV_TRUE = {"1", "true", "yes", "y", "on"}
 
 
@@ -199,11 +202,7 @@ def _project_point(P: np.ndarray, xyz: Sequence[float]) -> Optional[Tuple[float,
 
 
 def _collect_env_snapshot() -> Dict[str, str]:
-    out: Dict[str, str] = {}
-    for key, value in os.environ.items():
-        if key.startswith("NOESIS_"):
-            out[key] = str(value)
-    return out
+    return public_v3dt_environment()
 
 
 def build_snapshot(
@@ -227,8 +226,19 @@ def build_snapshot(
     tracker_cfg = pipeline_cfg.get("tracker", {}) if isinstance(pipeline_cfg, dict) else {}
     tracker_w = _safe_int(tracker_cfg.get("tracker-width", tracker_cfg.get("tracker_width", stream_w)), stream_w)
     tracker_h = _safe_int(tracker_cfg.get("tracker-height", tracker_cfg.get("tracker_height", stream_h)), stream_h)
-    tracker_cfg_path = tracker_config_path or Path(str(tracker_cfg.get("config-file") or tracker_cfg.get("ll-config-file") or ""))
-    tracker_cfg_data = _load_yaml(tracker_cfg_path) if tracker_cfg_path and tracker_cfg_path.exists() else {}
+    tracker_cfg_path = tracker_config_path
+    if tracker_cfg_path is None:
+        tracker_cfg_value = str(
+            tracker_cfg.get("config-file")
+            or tracker_cfg.get("ll-config-file")
+            or ""
+        ).strip()
+        tracker_cfg_path = Path(tracker_cfg_value) if tracker_cfg_value else None
+    tracker_cfg_data = (
+        _load_yaml(tracker_cfg_path)
+        if tracker_cfg_path is not None and tracker_cfg_path.is_file()
+        else {}
+    )
 
     align = align_cfg or {}
     floor_y = _safe_float(align.get("floor_y", 0.0), 0.0)
@@ -407,7 +417,7 @@ def build_snapshot(
             "tracker_config_path": str(tracker_cfg_path) if tracker_cfg_path else "",
             "env": _collect_env_snapshot(),
             "raw": {
-                "pipeline": pipeline_cfg,
+                "pipeline": public_pipeline_config(pipeline_cfg),
                 "cameras": cameras_cfg,
                 "calibration": calibration_cfg,
                 "alignment": align_cfg,

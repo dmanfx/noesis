@@ -160,7 +160,10 @@ class ScenePriorDerivation(ContractModel):
 
 
 class ScenePriorSource(ContractModel):
-    source_type: Literal["mapanything_multiview_room_walk"]
+    source_type: Literal[
+        "mapanything_multiview_room_walk",
+        "conditioned_multimodel_room_walk",
+    ]
     bundle_id: str = Field(
         min_length=1,
         max_length=200,

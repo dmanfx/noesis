@@ -100,12 +100,14 @@ MAX_RUNTIME_BYTES = 4 * 1024 * 1024 * 1024
 APPLIANCE_STATE_SCHEMAS = {
     "analytics_roi": 1,
     "identity": 1,
+    "scene": 1,
     "world": 3,
 }
 APPLIANCE_STATE_FILES = {
     "analytics_config": "payload/analytics/nvdsanalytics.yaml",
     "analytics_exclude": "payload/analytics/config_nvdsanalytics_exclude.ini",
     "identity_store": "payload/identity.db",
+    "scene_store": "payload/scene/scene_releases.sqlite3",
     "world_store": "payload/world.db",
 }
 FORBIDDEN_NESTED_LEASE_ENV = frozenset(
@@ -912,7 +914,8 @@ def _validate_state_release(selector: DeploymentSelector) -> ApplianceStateEvide
         _fail("state release manifest must be stored beneath its release root")
     if release.schemas != APPLIANCE_STATE_SCHEMAS:
         _fail(
-            "state release schemas must be exactly analytics_roi=1, identity=1, world=3"
+            "state release schemas must be exactly analytics_roi=1, identity=1, "
+            "scene=1, world=3"
         )
     baseline_path, baseline_payload, baseline = _read_canonical_contract(
         release.baseline.inventory_path,
@@ -1099,6 +1102,7 @@ def _require_environment_binding(
             state.runtime_files["analytics_exclude"]
         ),
         "NOESIS_IDENTITY_V2_STORE": os.fspath(state.runtime_files["identity_store"]),
+        "NOESIS_SCENE_STORE_PATH": os.fspath(state.runtime_files["scene_store"]),
         "NOESIS_WORLD_JOURNAL_PATH": os.fspath(state.runtime_files["world_store"]),
         "NOESIS_BUILD_DIR": os.fspath(state.build_directory),
     }

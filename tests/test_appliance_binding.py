@@ -71,6 +71,7 @@ def _fixture(
         "payload/analytics/nvdsanalytics.yaml": b"analytics:\n  stages: {}\n",
         "payload/analytics/config_nvdsanalytics_exclude.ini": b"[property]\nenable=1\n",
         "payload/identity.db": b"identity-state\n",
+        "payload/scene/scene_releases.sqlite3": b"scene-state\n",
         "payload/world.db": b"world-state\n",
     }
     state_payloads.update(extra_state_payloads or {})
@@ -101,7 +102,7 @@ def _fixture(
         parent_release_id=None,
         created_at="2026-07-11T12:01:00.000Z",
         root=os.fspath(release_root),
-        schemas={"analytics_roi": 1, "identity": 1, "world": 3},
+        schemas={"analytics_roi": 1, "identity": 1, "scene": 1, "world": 3},
         migration=StateMigration(
             mode="fresh",
             tool_sha256=SHA_A,
@@ -174,6 +175,9 @@ def _fixture(
             release_root / "payload/analytics/config_nvdsanalytics_exclude.ini"
         ),
         "NOESIS_IDENTITY_V2_STORE": os.fspath(release_root / "payload/identity.db"),
+        "NOESIS_SCENE_STORE_PATH": os.fspath(
+            release_root / "payload/scene/scene_releases.sqlite3"
+        ),
         "NOESIS_WORLD_JOURNAL_PATH": os.fspath(release_root / "payload/world.db"),
         "NOESIS_BUILD_DIR": os.fspath(build_root),
     }
@@ -204,6 +208,7 @@ def test_exact_selector_release_and_environment_binding_is_accepted(tmp_path: Pa
     assert binding.state.release.schemas == {
         "analytics_roi": 1,
         "identity": 1,
+        "scene": 1,
         "world": 3,
     }
     assert binding.selector.noesis_checkout.snapshot_kind == "noesis-runtime-v1"

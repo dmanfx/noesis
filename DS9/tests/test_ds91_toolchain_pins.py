@@ -89,3 +89,37 @@ def test_preflight_uses_exact_ds91_driver_floor() -> None:
     assert 'DS9_MIN_DRIVER_VERSION = (595, 58, 3)' in preflight
     assert 'DS9_MIN_DRIVER_LABEL = "595.58.03"' in preflight
     assert DS_HOME in preflight
+
+
+def test_active_authority_contracts_pin_the_built_ds91_images() -> None:
+    manifest = yaml.safe_load(_read("asset_manifest.yaml"))
+    assert manifest["target"]["deepstream"] == {
+        "major": 9,
+        "version": "9.1",
+        "home": DS_HOME,
+    }
+    assert manifest["target"]["cuda"] == "13.2"
+    assert manifest["target"]["tensorrt"] == "10.16.0.72"
+    assert manifest["target"]["build_image"]["image_id"] == (
+        "sha256:88d80ad35f12ec3a574cf2555a8242d33ac4110abdcc5f88a6cbdee40dfcf872"
+    )
+    assert manifest["runtime"]["image"]["image_id"] == (
+        "sha256:b97a32b082e74265c15e767bcaafa4dc1d8947e53feb36adb9baafdf69ba762e"
+    )
+    assert all(
+        item["compatibility"]["cuda"] == "13.2"
+        for item in manifest["artifacts"]
+    )
+    assert all(
+        item["compatibility"]["tensorrt"] == "10.16.0.72"
+        for item in manifest["artifacts"]
+        if item["kind"] in {"nvinfer_parser", "tensorrt_plugin", "tensorrt_engine"}
+    )
+
+    launcher = _read("scripts/run_canonical_runtime_container.py")
+    maintenance = _read("scripts/run_canonical_engine_maintenance.sh")
+    for source in (launcher, maintenance):
+        assert "9.0-20260710" not in source
+        assert "10.14.1.48" not in source
+    assert "TensorRT v101600" in maintenance
+    assert 'REQUIRED_DRIVER_VERSION="595.58.03"' in maintenance

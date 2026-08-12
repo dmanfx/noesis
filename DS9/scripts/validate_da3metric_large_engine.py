@@ -242,12 +242,12 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--receipt", type=Path, required=True)
     parser.add_argument("--gpu", default="NVIDIA GeForce RTX 3060 12GB")
     parser.add_argument("--compute-capability", default="8.6")
-    parser.add_argument("--tensorrt", default="10.14.1.48")
-    parser.add_argument("--build-image", default="noesis-ds9-dev:9.0-20260710")
+    parser.add_argument("--tensorrt", default="10.16.0.72")
+    parser.add_argument("--build-image", default="noesis-ds9-dev:9.1-20260812")
     parser.add_argument(
         "--build-image-id",
         default=(
-            "sha256:7476b1021376cd67793c95d949cdc7d46eef7704ab98a5a76feed461e4f907a4"
+            "sha256:88d80ad35f12ec3a574cf2555a8242d33ac4110abdcc5f88a6cbdee40dfcf872"
         ),
     )
     return parser.parse_args(argv)

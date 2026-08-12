@@ -4,10 +4,10 @@ set -euo pipefail
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 DS9_ROOT="$(cd -- "${SCRIPT_DIR}/.." && pwd)"
 REPO_ROOT="$(cd -- "${DS9_ROOT}/.." && pwd)"
-REQUIRED_IMAGE_REF="noesis-ds9-dev:9.0-20260710"
+REQUIRED_IMAGE_REF="noesis-ds9-dev:9.1-20260812"
 IMAGE="${NOESIS_DS9_DEV_IMAGE:-${REQUIRED_IMAGE_REF}}"
-REQUIRED_IMAGE_ID="sha256:7476b1021376cd67793c95d949cdc7d46eef7704ab98a5a76feed461e4f907a4"
-REQUIRED_DRIVER_MAJOR=590
+REQUIRED_IMAGE_ID="sha256:88d80ad35f12ec3a574cf2555a8242d33ac4110abdcc5f88a6cbdee40dfcf872"
+REQUIRED_DRIVER_VERSION="595.58.03"
 GPU_DEVICE_INDEX=0
 FINALIZER="${SCRIPT_DIR}/finalize_engine_realization.py"
 GPU_OWNERSHIP_HELPER="${SCRIPT_DIR}/verify_gpu_process_ownership.py"
@@ -717,14 +717,14 @@ HOST_DRIVER_VERSION="$(trim_whitespace "${HOST_DRIVER_VERSION}")"
     && "${GPU_COMPUTE_CAPABILITY}" =~ ^[0-9]+\.[0-9]+$ \
     && "${GPU_MEMORY_MIB}" =~ ^[0-9]+$ ]] \
   || fail "unable to capture the exact GPU ${GPU_DEVICE_INDEX} maintenance profile"
-HOST_DRIVER_MAJOR="${HOST_DRIVER_VERSION%%.*}"
-[[ "${HOST_DRIVER_MAJOR}" =~ ^[0-9]+$ ]] \
+[[ "${HOST_DRIVER_VERSION}" =~ ^[0-9]+\.[0-9]+(\.[0-9]+)?$ ]] \
   || fail "unable to determine the host NVIDIA driver version"
-if (( HOST_DRIVER_MAJOR < REQUIRED_DRIVER_MAJOR )); then
+LOWEST_DRIVER_VERSION="$(printf '%s\n' "${REQUIRED_DRIVER_VERSION}" "${HOST_DRIVER_VERSION}" | sort -V | head -n 1)"
+if [[ "${LOWEST_DRIVER_VERSION}" != "${REQUIRED_DRIVER_VERSION}" ]]; then
   if (( PLAN )); then
-    echo "[WARN] host NVIDIA driver ${HOST_DRIVER_VERSION} is below the installed DeepStream 9 requirement (${REQUIRED_DRIVER_MAJOR}+); no-GPU plan only"
+    echo "[WARN] host NVIDIA driver ${HOST_DRIVER_VERSION} is below the DeepStream 9.1 requirement (${REQUIRED_DRIVER_VERSION}+); no-GPU plan only"
   else
-    fail "host NVIDIA driver ${HOST_DRIVER_VERSION} is below the installed DeepStream 9 requirement (${REQUIRED_DRIVER_MAJOR}+); upgrade the driver before any DS9 engine build or cutover"
+    fail "host NVIDIA driver ${HOST_DRIVER_VERSION} is below the DeepStream 9.1 requirement (${REQUIRED_DRIVER_VERSION}+); upgrade the driver before any DS9 engine build or cutover"
   fi
 fi
 
@@ -867,13 +867,13 @@ IMAGE_ID="$(docker image inspect "${IMAGE}" --format '{{.Id}}')"
 # Resolve the reviewed tag exactly once, then inspect and launch only by the
 # immutable image ID. A concurrent retag cannot change metadata or execution.
 BASE_DIGEST="$(docker image inspect "${IMAGE_ID}" --format '{{index .Config.Labels "org.opencontainers.image.base.digest"}}')"
-[[ "${BASE_DIGEST}" == "sha256:2e45070ad134b9ab2caa4a97ba4d52fa8744a4f0db30900bd92828d51425a69a" ]] \
+[[ "${BASE_DIGEST}" == "sha256:f6fa0247da9290979cbb05749e7da9435d089c93db7c4dcfe85ba2488b5f4994" ]] \
   || fail "derived image has an unexpected DS9 base digest: ${BASE_DIGEST}"
 IMAGE_TRT_VERSION="$(docker image inspect "${IMAGE_ID}" --format '{{index .Config.Labels "com.nvidia.tensorrt.version"}}')"
 IMAGE_CUDA_VERSION="$(docker image inspect "${IMAGE_ID}" --format '{{range .Config.Env}}{{println .}}{{end}}' | awk -F= '$1 == "CUDA_VERSION" {print $2; exit}')"
-[[ "${IMAGE_TRT_VERSION}" == "10.14.1.48+cuda13.0" ]] \
+[[ "${IMAGE_TRT_VERSION}" == "10.16.0.72" ]] \
   || fail "derived image has an unexpected TensorRT version: ${IMAGE_TRT_VERSION}"
-[[ "${IMAGE_CUDA_VERSION}" == "13.1.1.006" ]] \
+[[ "${IMAGE_CUDA_VERSION}" == "13.2.0.046" ]] \
   || fail "derived image has an unexpected CUDA version: ${IMAGE_CUDA_VERSION}"
 
 run_engine() {
@@ -1374,7 +1374,7 @@ expected = {
     "gpu_uuid": gpu_uuid,
     "gpu_compute_capability": gpu_cc,
     "gpu_memory_mib": gpu_memory,
-    "expected_trtexec_banner": "TensorRT v101401",
+    "expected_trtexec_banner": "TensorRT v101600",
 }
 if any(str(platform.get(key)) != str(value) for key, value in expected.items()):
     raise SystemExit("maintenance manifest platform provenance mismatch")

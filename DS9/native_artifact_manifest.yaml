@@ -2,7 +2,7 @@ schema_version: 1
 contract: noesis.ds9.native_artifact_manifest
 base_manifest:
   path: DS9/asset_manifest.yaml
-  sha256: 12d66f1afe959bc822b54833c4dd4c1294852b9391a5047fe810158f3242f60f
+  sha256: 9218943c6c595be38576483188c27c5d0dbd86c563a6d12efa8d8e8fc507bbee
 artifacts:
   - id: native.analytics_meta
     kind: native_extension
@@ -11,11 +11,11 @@ artifacts:
     sources: [DS9/native/noesis_analytics_meta_ext.cpp]
     builder: DS9/scripts/build_noesis_analytics_meta_ext.sh
     required_profiles: [runtime_common, full]
-    state: missing
-    compatibility: {deepstream_major: 9, cuda: "13.1", tensorrt: null}
+    state: validated
+    compatibility: {deepstream_major: 9, cuda: "13.2", tensorrt: null}
     provenance:
       source_sha256: d9f3e48e33efc20a6aac29176014796fbda3956ce8347657739a67a75dbbe765
-      output_sha256: pending_ds9_1_rebuild
-      built_at_utc: null
-      build_host: null
-      command: bash DS9/scripts/build_noesis_analytics_meta_ext.sh
+      output_sha256: f535287518ec36ed17a357d80a8b4237549f183e2bbdab79d2e95f5208de8240
+      built_at_utc: "2026-08-12T14:47:33Z"
+      build_host: "noesis-ds9-dev@sha256:88d80ad35f12ec3a574cf2555a8242d33ac4110abdcc5f88a6cbdee40dfcf872 (driver 595.71.05)"
+      command: bash DS9/scripts/build_native_extensions.sh

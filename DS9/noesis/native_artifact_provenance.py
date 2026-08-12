@@ -333,12 +333,12 @@ def _require_manifest_authority(manifest: Mapping[str, Any]) -> None:
         not isinstance(target, Mapping)
         or target.get("platform") != "linux-x86_64-dgpu"
         or target.get("python") != "3.12"
-        or target.get("cuda") != "13.1"
-        or target.get("tensorrt") != "10.14.1.48"
+        or target.get("cuda") != "13.2"
+        or target.get("tensorrt") != "10.16.0.72"
         or not isinstance(deepstream, Mapping)
         or deepstream.get("major") != 9
-        or deepstream.get("version") != "9.0"
-        or deepstream.get("home") != "/opt/nvidia/deepstream/deepstream-9.0"
+        or deepstream.get("version") != "9.1"
+        or deepstream.get("home") != "/opt/nvidia/deepstream/deepstream-9.1"
     ):
         raise DS9NativeArtifactProvenanceError(
             "DS9 asset manifest target authority is not the reviewed SDK contract"
@@ -406,7 +406,7 @@ def _supplemental_native_records(
     compatibility = artifact.get("compatibility")
     if compatibility != {
         "deepstream_major": 9,
-        "cuda": "13.1",
+        "cuda": "13.2",
         "tensorrt": None,
     }:
         raise DS9NativeArtifactProvenanceError(

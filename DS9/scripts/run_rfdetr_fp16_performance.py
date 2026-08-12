@@ -38,13 +38,13 @@ BASELINE_MEDIA_MANIFEST_SHA256 = (
     "8be04f483aea3a14b1a398dd0269db63ca6da0fe12d1fdd573c5a7607ce8b52c"
 )
 IMAGE_ID = (
-    "sha256:7476b1021376cd67793c95d949cdc7d46eef7704ab98a5a76"
-    "feed461e4f907a4"
+    "sha256:88d80ad35f12ec3a574cf2555a8242d33ac4110abdcc5f88a"
+    "6cbdee40dfcf872"
 )
-IMAGE_REF = "noesis-ds9-dev:9.0-20260710"
-TRT_VERSION = "10.14.1.48"
-IMAGE_TRT_VERSION = "10.14.1.48+cuda13.0"
-CUDA_VERSION = "13.1.1.006"
+IMAGE_REF = "noesis-ds9-dev:9.1-20260812"
+TRT_VERSION = "10.16.0.72"
+IMAGE_TRT_VERSION = "10.16.0.72"
+CUDA_VERSION = "13.2.0.046"
 EXPECTED_MODEL_IDS = (
     "detect_nano",
     "detect_small",

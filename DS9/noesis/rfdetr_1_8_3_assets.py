@@ -519,11 +519,11 @@ def _attest_parser(
         or manifest.get("manifest_id") != "noesis-ds9-artifacts"
         or manifest.get("schema") != "DS9/docs/asset_manifest.schema.json"
         or not isinstance(target, Mapping)
-        or target.get("cuda") != "13.1"
-        or target.get("tensorrt") != "10.14.1.48"
+        or target.get("cuda") != "13.2"
+        or target.get("tensorrt") != "10.16.0.72"
         or not isinstance(deepstream, Mapping)
         or deepstream.get("major") != 9
-        or deepstream.get("version") != "9.0"
+        or deepstream.get("version") != "9.1"
     ):
         raise RFDETRAssetAttestationError(
             "RF-DETR parser manifest authority drifted"
@@ -560,8 +560,8 @@ def _attest_parser(
         or compatibility
         != {
             "deepstream_major": 9,
-            "cuda": "13.1",
-            "tensorrt": "10.14.1.48",
+            "cuda": "13.2",
+            "tensorrt": "10.16.0.72",
         }
     ):
         raise RFDETRAssetAttestationError(
@@ -1206,7 +1206,7 @@ def materialize_rfdetr_1_8_3_configs(
         Path(
             os.environ.get(
                 "NOESIS_DEEPSTREAM_HOME",
-                "/opt/nvidia/deepstream/deepstream-9.0",
+                "/opt/nvidia/deepstream/deepstream-9.1",
             )
         ).expanduser()
         / "lib"

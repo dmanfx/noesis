@@ -32,24 +32,24 @@
           "required": ["major", "version", "home"],
           "properties": {
             "major": {"const": 9},
-            "version": {"const": "9.0"},
-            "home": {"const": "/opt/nvidia/deepstream/deepstream-9.0"}
+            "version": {"const": "9.1"},
+            "home": {"const": "/opt/nvidia/deepstream/deepstream-9.1"}
           }
         },
-        "cuda": {"const": "13.1"},
-        "tensorrt": {"const": "10.14.1.48"},
+        "cuda": {"const": "13.2"},
+        "tensorrt": {"const": "10.16.0.72"},
         "build_image": {
           "type": "object",
           "additionalProperties": false,
           "required": ["reference", "image_id", "base_digest", "tensorrt_version", "cuda_version", "dockerfile", "dockerfile_sha256", "requirements", "requirements_sha256"],
           "properties": {
-            "reference": {"const": "noesis-ds9-dev:9.0-20260710"},
-            "image_id": {"const": "sha256:7476b1021376cd67793c95d949cdc7d46eef7704ab98a5a76feed461e4f907a4"},
-            "base_digest": {"const": "sha256:2e45070ad134b9ab2caa4a97ba4d52fa8744a4f0db30900bd92828d51425a69a"},
-            "tensorrt_version": {"const": "10.14.1.48+cuda13.0"},
-            "cuda_version": {"const": "13.1.1.006"},
+            "reference": {"const": "noesis-ds9-dev:9.1-20260812"},
+            "image_id": {"const": "sha256:88d80ad35f12ec3a574cf2555a8242d33ac4110abdcc5f88a6cbdee40dfcf872"},
+            "base_digest": {"const": "sha256:f6fa0247da9290979cbb05749e7da9435d089c93db7c4dcfe85ba2488b5f4994"},
+            "tensorrt_version": {"const": "10.16.0.72"},
+            "cuda_version": {"const": "13.2.0.046"},
             "dockerfile": {"const": "DS9/docker/Dockerfile"},
-            "dockerfile_sha256": {"const": "c1df566ec73759a5bef0275dc5e9edcdc41be3f6b3f3a102a19d89a5f9860c9e"},
+            "dockerfile_sha256": {"const": "9f5f63a18c41256e06cab5514dcb6c5b47d290b8ea06a172490026776c56f01a"},
             "requirements": {"const": "DS9/docker/requirements.lock.txt"},
             "requirements_sha256": {"const": "de35fb439f5c9bfd05d7fbc23436122aee033bd7b584b2eb139358e50211be48"}
           }
@@ -88,15 +88,15 @@
             "dockerfile_sha256"
           ],
           "properties": {
-            "reference": {"const": "noesis-ds9-runtime:9.0-20260710"},
-            "image_id": {"const": "sha256:ca33b4c6a84fc56b86b71feee2a444299cb2ce7f33ab018cae43ac730aaef5fc"},
-            "parent_reference": {"const": "noesis-ds9-dev:9.0-20260710"},
-            "parent_image_id": {"const": "sha256:7476b1021376cd67793c95d949cdc7d46eef7704ab98a5a76feed461e4f907a4"},
-            "base_digest": {"const": "sha256:2e45070ad134b9ab2caa4a97ba4d52fa8744a4f0db30900bd92828d51425a69a"},
-            "tensorrt_version": {"const": "10.14.1.48+cuda13.0"},
-            "cuda_version": {"const": "13.1.1.006"},
+            "reference": {"const": "noesis-ds9-runtime:9.1-20260812"},
+            "image_id": {"const": "sha256:b97a32b082e74265c15e767bcaafa4dc1d8947e53feb36adb9baafdf69ba762e"},
+            "parent_reference": {"const": "noesis-ds9-dev:9.1-20260812"},
+            "parent_image_id": {"const": "sha256:88d80ad35f12ec3a574cf2555a8242d33ac4110abdcc5f88a6cbdee40dfcf872"},
+            "base_digest": {"const": "sha256:f6fa0247da9290979cbb05749e7da9435d089c93db7c4dcfe85ba2488b5f4994"},
+            "tensorrt_version": {"const": "10.16.0.72"},
+            "cuda_version": {"const": "13.2.0.046"},
             "dockerfile": {"const": "DS9/docker/Dockerfile.runtime"},
-            "dockerfile_sha256": {"const": "f3345a4c87483a70dc48a7185330880805d38dbc97d18d57c4b08ab1e415d51e"}
+            "dockerfile_sha256": {"const": "4061b2dd98298aa07f0438ccf8ea9e1ae6e238621ba4b5ed363d4ce87d6cc133"}
           }
         },
         "entrypoint": {"const": "DS9/noesis/ds9_runtime.py"},
@@ -159,7 +159,7 @@
           "required": ["deepstream_major", "cuda", "tensorrt"],
           "properties": {
             "deepstream_major": {"const": 9},
-            "cuda": {"const": "13.1"},
+            "cuda": {"const": "13.2"},
             "tensorrt": {"type": ["string", "null"]},
             "precision": {"type": "string"},
             "batch": {"type": "integer", "minimum": 1}

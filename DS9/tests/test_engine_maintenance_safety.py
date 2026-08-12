@@ -62,7 +62,7 @@ def _fake_trtexec(root: Path) -> Path:
             args = sys.argv[1:]
 
             if "--help" in args:
-                print("TensorRT v101401 [fake]")
+                print("TensorRT v101600 [fake]")
                 if mode == "probe_failure":
                     print("[E] Model missing")
                     print("&&&& FAILED TensorRT.trtexec")
@@ -703,7 +703,7 @@ class EngineMaintenanceSafetyTests(unittest.TestCase):
         )
         result = SimpleNamespace(
             returncode=1,
-            stdout="TensorRT v101401 [fake]\n",
+            stdout="TensorRT v101600 [fake]\n",
             stderr="[E] Model missing\n&&&& FAILED TensorRT.trtexec\n",
         )
         with (
@@ -721,7 +721,7 @@ class EngineMaintenanceSafetyTests(unittest.TestCase):
         )
         result = SimpleNamespace(
             returncode=0,
-            stdout="TensorRT v101401 [fake]\nhelp text\n",
+            stdout="TensorRT v101600 [fake]\nhelp text\n",
             stderr="",
         )
         with (

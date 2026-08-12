@@ -18,9 +18,9 @@ from unittest import mock
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 WRAPPER = REPO_ROOT / "DS9" / "scripts" / "run_canonical_engine_maintenance.sh"
-IMAGE_REF = "noesis-ds9-dev:9.0-20260710"
-IMAGE_ID = "sha256:7476b1021376cd67793c95d949cdc7d46eef7704ab98a5a76feed461e4f907a4"
-BASE_DIGEST = "sha256:2e45070ad134b9ab2caa4a97ba4d52fa8744a4f0db30900bd92828d51425a69a"
+IMAGE_REF = "noesis-ds9-dev:9.1-20260812"
+IMAGE_ID = "sha256:88d80ad35f12ec3a574cf2555a8242d33ac4110abdcc5f88a6cbdee40dfcf872"
+BASE_DIGEST = "sha256:f6fa0247da9290979cbb05749e7da9435d089c93db7c4dcfe85ba2488b5f4994"
 
 
 def _write_executable(path: Path, body: str) -> None:
@@ -468,9 +468,9 @@ class WrapperFixture:
             import time
             from pathlib import Path
 
-            IMAGE_REF = "noesis-ds9-dev:9.0-20260710"
-            IMAGE_ID = "sha256:7476b1021376cd67793c95d949cdc7d46eef7704ab98a5a76feed461e4f907a4"
-            BASE = "sha256:2e45070ad134b9ab2caa4a97ba4d52fa8744a4f0db30900bd92828d51425a69a"
+            IMAGE_REF = "noesis-ds9-dev:9.1-20260812"
+            IMAGE_ID = "sha256:88d80ad35f12ec3a574cf2555a8242d33ac4110abdcc5f88a6cbdee40dfcf872"
+            BASE = "sha256:f6fa0247da9290979cbb05749e7da9435d089c93db7c4dcfe85ba2488b5f4994"
             CONTAINER_ID = "c" * 64
             args = sys.argv[1:]
             raw_args = list(args)
@@ -623,9 +623,9 @@ class WrapperFixture:
                 elif target == IMAGE_ID and "base.digest" in template:
                     print(BASE)
                 elif target == IMAGE_ID and "tensorrt.version" in template:
-                    print("10.14.1.48+cuda13.0")
+                    print("10.16.0.72")
                 elif target == IMAGE_ID and "Config.Env" in template:
-                    print("CUDA_VERSION=13.1.1.006")
+                    print("CUDA_VERSION=13.2.0.046")
                 else:
                     raise SystemExit(81)
                 raise SystemExit(0)
@@ -729,7 +729,7 @@ class WrapperFixture:
                             "gpu_uuid": env["NOESIS_DS9_MAINT_GPU_UUID"],
                             "gpu_compute_capability": env["NOESIS_DS9_MAINT_GPU_COMPUTE_CAPABILITY"],
                             "gpu_memory_mib": env["NOESIS_DS9_MAINT_GPU_MEMORY_MIB"],
-                            "expected_trtexec_banner": "TensorRT v101401",
+                            "expected_trtexec_banner": "TensorRT v101600",
                         }},
                     }
                     manifest_path = evidence / "manifest.json"

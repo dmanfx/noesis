@@ -114,65 +114,23 @@ WHOLEBODY_LOGGER_POLICY = {
     "captured_message_truncation": "fatal",
     "error_state": "sticky_fatal",
 }
-# Exact pre-guard realization trust anchors captured at the 2026-07-11T13:18:00Z
-# contract cutoff.  Only these immutable artifact/output/maintenance tuples may
-# remain valid without a sealed NVML guard; every new reconciliation emits one.
-LEGACY_GPU_MEMORY_GUARD_EXEMPTIONS = {
-    "engine.depth_tracking_dav2": {
-        "output_sha256": "12cab7aa30115b41064e9e5803a0529783cc4a0fc7d627fa9c25904865f21b4f",
-        "maintenance_manifest": "DS9/models/engine_maintenance/20260711T020008426097Z-depth_anything_v2_tracking/manifest.json",
-        "maintenance_manifest_sha256": "10dd12607c1b475d7a3d83823d29a37d973cc0aa47ceabec58dffebe74fd6d65",
-    },
-    "engine.mapanything": {
-        "output_sha256": "aeb7140a56c31b8e420c7a1d31fb21ef4590c38d85e9eb41299dfe0d55b6891d",
-        "maintenance_manifest": "DS9/models/engine_maintenance/20260711T020601067719Z-mapanything/manifest.json",
-        "maintenance_manifest_sha256": "25119de4cd486c687792f7311556625e963a4b6ffb99baa5b4ee8ab29fd88549",
-    },
-    "engine.pose_yolo26": {
-        "output_sha256": "811dcef0af9d458a7fdb0b516b362daa61aaf866c625bbc4c0a87ee53a20d846",
-        "maintenance_manifest": "DS9/models/engine_maintenance/20260711T015202292155Z-yolo26_pose_n/manifest.json",
-        "maintenance_manifest_sha256": "4c7808afe2869a290ed0749c712d5725e1585a3e54368578f1f1926793e45238",
-    },
-    "engine.reid_swin_tiny": {
-        "output_sha256": "67a6d8f1a96217b477ec48fa08bc005b1eba85a9f6573f9a2f82ee39ed735151",
-        "maintenance_manifest": "DS9/models/engine_maintenance/20260711T014808685200Z-reid_swin/manifest.json",
-        "maintenance_manifest_sha256": "a7f0b9cdd9732ba1450ffd0432ecca5a13df22a2b98ac425f26d97271be587f8",
-    },
-    "engine.v3dt_bodypose": {
-        "output_sha256": "82ef2559f656daaae3e60a6dcba59bcd1516e22bb80368a2199502bee13a764e",
-        "maintenance_manifest": "DS9/models/engine_maintenance/20260711T052149845989Z-bodypose3dnet/manifest.json",
-        "maintenance_manifest_sha256": "78920c4971e8a4e811e5a0592f0962aa3960fef689d9da01c2c6ca36ba481052",
-    },
-    "engine.v3dt_tracker_reid": {
-        "output_sha256": "4d8ad85b95b2dab15257887294163f0c982d37fa284131e708a051cea5cd70bc",
-        "maintenance_manifest": "DS9/models/engine_maintenance/20260711T061948587409Z-v3dt_tracker_reid/manifest.json",
-        "maintenance_manifest_sha256": "84d0ac2b7900a4ae684cbd622953d803c85ae787b8f7e86a2a3ff0f8c722a25d",
-    },
-    "engine.yolo26_detect_m": {
-        "output_sha256": "ae6e4833eb1c7fc0072148203877282cdf447ef6a1e578d03c4740efc29eb3ba",
-        "maintenance_manifest": "DS9/models/engine_maintenance/20260711T004043385489Z-yolo26_m/manifest.json",
-        "maintenance_manifest_sha256": "0771e1328d6e7fd9a1d6d12df6d5246c674ed16e4a839607bc85b05f34e2f704",
-    },
-    "engine.yolo26_seg_s": {
-        "output_sha256": "f832df3f8f1d415d6fc75826f329228c5fb6f6622b9418eff9c13d4519766ece",
-        "maintenance_manifest": "DS9/models/engine_maintenance/20260711T051751032329Z-yolo26_seg_s/manifest.json",
-        "maintenance_manifest_sha256": "7d1a97a0760395121f714e83759aab57e9b335db7487839e7fc6f4bf2af43957",
-    },
-}
+# DeepStream 9.1 admits no pre-guard DS9.0 engine receipts. Every newly
+# realized engine must carry the sealed NVML guard emitted by maintenance.
+LEGACY_GPU_MEMORY_GUARD_EXEMPTIONS: dict[str, dict[str, str]] = {}
 UNCONDITIONALLY_GUARD_REQUIRED_ARTIFACT_IDS = {
     "engine.wholebody49_s_masks",
     "engine.wholebody49_x_boxes",
 }
 RUNTIME_IMAGE_AUTHORITY = {
-    "reference": "noesis-ds9-runtime:9.0-20260710",
-    "image_id": "sha256:ca33b4c6a84fc56b86b71feee2a444299cb2ce7f33ab018cae43ac730aaef5fc",
-    "parent_reference": "noesis-ds9-dev:9.0-20260710",
-    "parent_image_id": "sha256:7476b1021376cd67793c95d949cdc7d46eef7704ab98a5a76feed461e4f907a4",
-    "base_digest": "sha256:2e45070ad134b9ab2caa4a97ba4d52fa8744a4f0db30900bd92828d51425a69a",
-    "tensorrt_version": "10.14.1.48+cuda13.0",
-    "cuda_version": "13.1.1.006",
+    "reference": "noesis-ds9-runtime:9.1-20260812",
+    "image_id": "sha256:b97a32b082e74265c15e767bcaafa4dc1d8947e53feb36adb9baafdf69ba762e",
+    "parent_reference": "noesis-ds9-dev:9.1-20260812",
+    "parent_image_id": "sha256:88d80ad35f12ec3a574cf2555a8242d33ac4110abdcc5f88a6cbdee40dfcf872",
+    "base_digest": "sha256:f6fa0247da9290979cbb05749e7da9435d089c93db7c4dcfe85ba2488b5f4994",
+    "tensorrt_version": "10.16.0.72",
+    "cuda_version": "13.2.0.046",
     "dockerfile": "DS9/docker/Dockerfile.runtime",
-    "dockerfile_sha256": "f3345a4c87483a70dc48a7185330880805d38dbc97d18d57c4b08ab1e415d51e",
+    "dockerfile_sha256": "4061b2dd98298aa07f0438ccf8ea9e1ae6e238621ba4b5ed363d4ce87d6cc133",
 }
 
 
@@ -560,24 +518,24 @@ def validate_manifest(
     if (
         not isinstance(deepstream, Mapping)
         or deepstream.get("major") != 9
-        or deepstream.get("version") != "9.0"
+        or deepstream.get("version") != "9.1"
     ):
-        errors.append("target.deepstream must declare major 9 and version 9.0")
-    if target.get("cuda") != "13.1":
-        errors.append("target.cuda must be 13.1")
-    if target.get("tensorrt") != "10.14.1.48":
-        errors.append("target.tensorrt must be 10.14.1.48")
+        errors.append("target.deepstream must declare major 9 and version 9.1")
+    if target.get("cuda") != "13.2":
+        errors.append("target.cuda must be 13.2")
+    if target.get("tensorrt") != "10.16.0.72":
+        errors.append("target.tensorrt must be 10.16.0.72")
     if target.get("python") != "3.12":
         errors.append("target.python must be 3.12")
     build_image = target.get("build_image")
     expected_build_image = {
-        "reference": "noesis-ds9-dev:9.0-20260710",
-        "image_id": "sha256:7476b1021376cd67793c95d949cdc7d46eef7704ab98a5a76feed461e4f907a4",
-        "base_digest": "sha256:2e45070ad134b9ab2caa4a97ba4d52fa8744a4f0db30900bd92828d51425a69a",
-        "tensorrt_version": "10.14.1.48+cuda13.0",
-        "cuda_version": "13.1.1.006",
+        "reference": "noesis-ds9-dev:9.1-20260812",
+        "image_id": "sha256:88d80ad35f12ec3a574cf2555a8242d33ac4110abdcc5f88a6cbdee40dfcf872",
+        "base_digest": "sha256:f6fa0247da9290979cbb05749e7da9435d089c93db7c4dcfe85ba2488b5f4994",
+        "tensorrt_version": "10.16.0.72",
+        "cuda_version": "13.2.0.046",
         "dockerfile": "DS9/docker/Dockerfile",
-        "dockerfile_sha256": "c1df566ec73759a5bef0275dc5e9edcdc41be3f6b3f3a102a19d89a5f9860c9e",
+        "dockerfile_sha256": "9f5f63a18c41256e06cab5514dcb6c5b47d290b8ea06a172490026776c56f01a",
         "requirements": "DS9/docker/requirements.lock.txt",
         "requirements_sha256": "de35fb439f5c9bfd05d7fbc23436122aee033bd7b584b2eb139358e50211be48",
     }

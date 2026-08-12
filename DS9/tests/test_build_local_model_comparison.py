@@ -176,7 +176,7 @@ def _environment() -> dict[str, object]:
             "driver_version": "1.2.3",
         },
         "image_id": "sha256:fixture",
-        "tensorrt_version": "10.14.1.48",
+        "tensorrt_version": "10.16.0.72",
     }
 
 

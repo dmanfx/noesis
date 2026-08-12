@@ -62,15 +62,15 @@ _REALIZATION_KEYS = {
     "artifacts",
 }
 REVIEWED_RUNTIME_IMAGE_AUTHORITY = {
-    "reference": "noesis-ds9-runtime:9.0-20260710",
-    "image_id": "sha256:ca33b4c6a84fc56b86b71feee2a444299cb2ce7f33ab018cae43ac730aaef5fc",
-    "parent_reference": "noesis-ds9-dev:9.0-20260710",
-    "parent_image_id": "sha256:7476b1021376cd67793c95d949cdc7d46eef7704ab98a5a76feed461e4f907a4",
-    "base_digest": "sha256:2e45070ad134b9ab2caa4a97ba4d52fa8744a4f0db30900bd92828d51425a69a",
-    "tensorrt_version": "10.14.1.48+cuda13.0",
-    "cuda_version": "13.1.1.006",
+    "reference": "noesis-ds9-runtime:9.1-20260812",
+    "image_id": "sha256:b97a32b082e74265c15e767bcaafa4dc1d8947e53feb36adb9baafdf69ba762e",
+    "parent_reference": "noesis-ds9-dev:9.1-20260812",
+    "parent_image_id": "sha256:88d80ad35f12ec3a574cf2555a8242d33ac4110abdcc5f88a6cbdee40dfcf872",
+    "base_digest": "sha256:f6fa0247da9290979cbb05749e7da9435d089c93db7c4dcfe85ba2488b5f4994",
+    "tensorrt_version": "10.16.0.72",
+    "cuda_version": "13.2.0.046",
     "dockerfile": "DS9/docker/Dockerfile.runtime",
-    "dockerfile_sha256": "f3345a4c87483a70dc48a7185330880805d38dbc97d18d57c4b08ab1e415d51e",
+    "dockerfile_sha256": "4061b2dd98298aa07f0438ccf8ea9e1ae6e238621ba4b5ed363d4ce87d6cc133",
 }
 
 

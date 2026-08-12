@@ -816,7 +816,7 @@ def _preflight_selected_spec(spec: EngineSpec) -> None:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Rebuild Noesis TensorRT engines for DeepStream 9 / TensorRT 10.14")
+    parser = argparse.ArgumentParser(description="Rebuild Noesis TensorRT engines for DeepStream 9.1 / TensorRT 10.16")
     parser.add_argument("--only", default="", help="Comma-separated engine names to build.")
     parser.add_argument("--include-mapanything", action="store_true", help="Also build MapAnything from DS9/models/onnx/mapanything_images_294x518_b3.onnx.")
     parser.add_argument(

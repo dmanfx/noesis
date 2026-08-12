@@ -110,7 +110,7 @@ def _platform() -> dict[str, str]:
         "image": "noesis-ds9-dev:test",
         "image_id": "sha256:" + "1" * 64,
         "base_digest": "sha256:" + "2" * 64,
-        "tensorrt_version": "10.14.1.48",
+        "tensorrt_version": "10.16.0.72",
         "cuda_version": "13.0",
         "driver_version": "595.71.05",
         "gpu_name": "NVIDIA GeForce RTX 3060",

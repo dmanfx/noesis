@@ -54,7 +54,7 @@ def _fixture(
         "state": "staged_unverified",
         "compatibility": {
             "deepstream_major": 9,
-            "cuda": "13.1",
+            "cuda": "13.2",
             "tensorrt": None,
         },
         "provenance": {
@@ -75,11 +75,11 @@ def _fixture(
             "python": "3.12",
             "deepstream": {
                 "major": 9,
-                "version": "9.0",
-                "home": "/opt/nvidia/deepstream/deepstream-9.0",
+                "version": "9.1",
+                "home": "/opt/nvidia/deepstream/deepstream-9.1",
             },
-            "cuda": "13.1",
-            "tensorrt": "10.14.1.48",
+            "cuda": "13.2",
+            "tensorrt": "10.16.0.72",
         },
         "policy": {
             "ds8_binary_reuse": "forbidden",

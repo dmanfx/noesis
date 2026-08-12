@@ -146,7 +146,7 @@ fi
 
 if rg -n "deepstream-9\\.0|cuda-13\\.1" "${static_prep_paths[@]}" -g '!**/archive/**' >/tmp/ds9_stale_toolchain_refs.txt; then
   cat /tmp/ds9_stale_toolchain_refs.txt >&2
-  fail "Active DS9 prep configs still reference the DeepStream 9.0/CUDA 13.1 toolchain"
+  fail "Active DS9 prep configs still reference the retired DeepStream 9.0/CUDA 13.1 toolchain"
 fi
 
 rg -q "NOESIS_DS9_ALLOW_PYDS_COMPAT" DS9/noesis/pipelines/hooks.py \

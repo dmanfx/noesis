@@ -63,7 +63,7 @@ class AssetRealizationRebaseTests(unittest.TestCase):
             "builder": "DS9/scripts/build_one.sh",
             "required_profiles": ["canonical"],
             "state": "missing",
-            "compatibility": {"tensorrt": "10.14.1.48"},
+            "compatibility": {"tensorrt": "10.16.0.72"},
             "provenance": {"source_sha256": "1" * 64},
         }
         engine_two = {
@@ -75,7 +75,7 @@ class AssetRealizationRebaseTests(unittest.TestCase):
             "builder": "DS9/scripts/build_two.sh",
             "required_profiles": ["alternate"],
             "state": "missing",
-            "compatibility": {"tensorrt": "10.14.1.48"},
+            "compatibility": {"tensorrt": "10.16.0.72"},
             "provenance": {"source_sha256": "2" * 64},
         }
         plugin = {
@@ -96,9 +96,9 @@ class AssetRealizationRebaseTests(unittest.TestCase):
             "schema": "DS9/docs/asset_manifest.schema.json",
             "updated_at": "2026-07-10",
             "target": {
-                "deepstream": {"major": 9, "version": "9.0"},
-                "cuda": "13.1",
-                "tensorrt": "10.14.1.48",
+                "deepstream": {"major": 9, "version": "9.1"},
+                "cuda": "13.2",
+                "tensorrt": "10.16.0.72",
                 "build_image": {"image_id": "sha256:" + "a" * 64},
             },
             "runtime": {"entrypoint": "DS9/noesis/ds9_runtime.py"},

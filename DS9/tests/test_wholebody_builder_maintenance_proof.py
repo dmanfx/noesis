@@ -267,8 +267,8 @@ def _fixture(root: Path, engine: str = ENGINE) -> dict[str, object]:
                 "image": "noesis-ds9-dev:test",
                 "image_id": "sha256:image",
                 "base_digest": "sha256:base",
-                "tensorrt_version": "10.14.1.48+cuda13.0",
-                "cuda_version": "13.1.1.006",
+                "tensorrt_version": "10.16.0.72",
+                "cuda_version": "13.2.0.046",
                 "driver_version": "595.71.05",
                 "gpu_name": "fixture-gpu",
                 "gpu_uuid": "GPU-fixture",
@@ -317,8 +317,8 @@ def _fixture(root: Path, engine: str = ENGINE) -> dict[str, object]:
             "reference": "noesis-ds9-dev:test",
             "image_id": "sha256:image",
             "base_digest": "sha256:base",
-            "tensorrt_version": "10.14.1.48+cuda13.0",
-            "cuda_version": "13.1.1.006",
+            "tensorrt_version": "10.16.0.72",
+            "cuda_version": "13.2.0.046",
         }
     }
     artifact = {"compatibility": {"precision": "fp16", "batch": 3}}
@@ -330,8 +330,8 @@ def _fixture(root: Path, engine: str = ENGINE) -> dict[str, object]:
             "image": "noesis-ds9-dev:test",
             "image_id": "sha256:image",
             "base_digest": "sha256:base",
-            "tensorrt_version": "10.14.1.48+cuda13.0",
-            "cuda_version": "13.1.1.006",
+            "tensorrt_version": "10.16.0.72",
+            "cuda_version": "13.2.0.046",
             "driver_version": "595.71.05",
             "gpu": {
                 "name": "fixture-gpu",

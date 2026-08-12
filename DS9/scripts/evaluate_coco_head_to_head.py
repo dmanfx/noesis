@@ -38,7 +38,7 @@ try:
 except ImportError as exc:  # pragma: no cover - environment failure
     raise SystemExit(
         "TensorRT Python bindings are required. Run this evaluator with the "
-        "TensorRT 10.14.1.48 toolchain used to build the DS9 engines."
+        "TensorRT 10.16.0.72 toolchain used to build the DS9 engines."
     ) from exc
 
 
@@ -51,7 +51,7 @@ RF_MATRIX_SCHEMA = "noesis.ds9.rfdetr-model-matrix.v1"
 YOLO_MATRIX_SCHEMA = "noesis.ds9.yolo26-performance-model-matrix.v2"
 YOLO_PERFORMANCE_SCHEMA = "noesis.ds9.yolo26-performance-benchmark.v2"
 REPORT_SCHEMA = "noesis.ds9.local-coco-person-evaluation.v2"
-EXPECTED_TRT_VERSION = "10.14.1.48"
+EXPECTED_TRT_VERSION = "10.16.0.72"
 DEFAULT_SCORE_FLOOR = 0.001
 DEFAULT_TOPK = 100
 COCO_STAT_NAMES = {

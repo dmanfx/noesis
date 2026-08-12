@@ -76,7 +76,7 @@ def _configured_model_root() -> Path:
 def _set_ds9_environment() -> None:
     model_root = _configured_model_root()
     os.environ.setdefault("NOESIS_DEEPSTREAM_MAJOR", "9")
-    os.environ.setdefault("NOESIS_DEEPSTREAM_HOME", "/opt/nvidia/deepstream/deepstream-9.0")
+    os.environ.setdefault("NOESIS_DEEPSTREAM_HOME", "/opt/nvidia/deepstream/deepstream-9.1")
     os.environ.setdefault("NOESIS_MODEL_DIR", str(model_root))
     os.environ.setdefault("NOESIS_ONNX_DIR", str(model_root / "onnx"))
     os.environ.setdefault("NOESIS_ENGINE_DIR", str(model_root / "engines"))

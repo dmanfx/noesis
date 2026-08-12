@@ -44,17 +44,18 @@ RUNTIME_ENGINE_RECEIPT_SCHEMA = (
     "noesis.ds9.rfdetr-runtime-engine-provenance.v1"
 )
 RELEASE_VERSION = "1.8.3"
-REQUIRED_IMAGE_REF = "noesis-ds9-dev:9.0-20260710"
+REQUIRED_IMAGE_REF = "noesis-ds9-dev:9.1-20260812"
 REQUIRED_IMAGE_ID = (
-    "sha256:7476b1021376cd67793c95d949cdc7d46eef7704ab98a5a76feed461e4f907a4"
+    "sha256:88d80ad35f12ec3a574cf2555a8242d33ac4110abdcc5f88a6cbdee40dfcf872"
 )
 REQUIRED_BASE_DIGEST = (
-    "sha256:2e45070ad134b9ab2caa4a97ba4d52fa8744a4f0db30900bd92828d51425a69a"
+    "sha256:f6fa0247da9290979cbb05749e7da9435d089c93db7c4dcfe85ba2488b5f4994"
 )
-REQUIRED_TRT_VERSION = "10.14.1.48"
-REQUIRED_IMAGE_TRT_VERSION = "10.14.1.48+cuda13.0"
-REQUIRED_CUDA_VERSION = "13.1.1.006"
-REQUIRED_TRT_BANNER = "TensorRT v101401"
+REQUIRED_TRT_VERSION = "10.16.0.72"
+REQUIRED_IMAGE_TRT_VERSION = "10.16.0.72"
+REQUIRED_CUDA_VERSION = "13.2.0.046"
+REQUIRED_TRT_BANNER = "TensorRT v101600"
+REQUIRED_DRIVER_VERSION = (595, 58, 3)
 GPU_DEVICE_INDEX = 0
 MAINTENANCE_MEMORY_BYTES = 25_769_803_776
 MAINTENANCE_PIDS_LIMIT = 512
@@ -1300,15 +1301,21 @@ def _gpu_identity() -> dict[str, str]:
             strict=True,
         )
     )
+    raw_driver_parts = identity["driver_version"].split(".")
     try:
-        driver_major = int(identity["driver_version"].split(".", 1)[0])
+        driver_parts = tuple(int(part) for part in raw_driver_parts)
     except ValueError as exc:
         raise BuilderError(
             f"GPU driver version is invalid: {identity['driver_version']}"
         ) from exc
-    if driver_major < 590:
+    if not 2 <= len(driver_parts) <= 3:
         raise BuilderError(
-            f"DS9 engine generation requires driver major >=590, "
+            f"GPU driver version is invalid: {identity['driver_version']}"
+        )
+    normalized_driver = driver_parts + (0,) * (3 - len(driver_parts))
+    if normalized_driver < REQUIRED_DRIVER_VERSION:
+        raise BuilderError(
+            "DS9.1 engine generation requires driver >=595.58.03, "
             f"found {identity['driver_version']}"
         )
     return identity

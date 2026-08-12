@@ -31,10 +31,14 @@ def test_runtime_requires_the_analytics_bridge() -> None:
     assert "noesis_analytics_meta_ext.extract_analytics is required" in hooks
 
 
-def test_analytics_bridge_is_marked_pending_until_ds91_rebuild() -> None:
+def test_analytics_bridge_records_the_ds91_rebuild() -> None:
     manifest = (ROOT / "native_artifact_manifest.yaml").read_text(encoding="utf-8")
 
     assert "contract: noesis.ds9.native_artifact_manifest" in manifest
     assert "id: native.analytics_meta" in manifest
-    assert "state: missing" in manifest
-    assert "output_sha256: pending_ds9_1_rebuild" in manifest
+    assert "state: validated" in manifest
+    assert (
+        "output_sha256: "
+        "f535287518ec36ed17a357d80a8b4237549f183e2bbdab79d2e95f5208de8240"
+    ) in manifest
+    assert "noesis-ds9-dev@sha256:88d80ad35f12ec3a574cf2555a8242d33ac4110abdcc5f88a6cbdee40dfcf872" in manifest

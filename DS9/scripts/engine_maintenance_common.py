@@ -31,7 +31,7 @@ from noesis_core.strict_json import StrictJSONError, strict_json_loads  # noqa: 
 
 CONTRACT = "noesis.ds9.engine_maintenance"
 SCHEMA_VERSION = 1
-DS9_TRTEXEC_BANNER = "TensorRT v101401"
+DS9_TRTEXEC_BANNER = "TensorRT v101600"
 MAPANYTHING_QUALITY_CONTRACT = "noesis.ds9.mapanything_functional_quality.v1"
 MAPANYTHING_QUALITY_EVIDENCE_LABEL = "functional_quality"
 MAPANYTHING_QUALITY_COMMAND_LABEL = "mapanything-functional-quality"

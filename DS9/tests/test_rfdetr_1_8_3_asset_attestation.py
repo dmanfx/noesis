@@ -218,9 +218,9 @@ def runtime_tree(
         "manifest_id": "noesis-ds9-artifacts",
         "schema": "DS9/docs/asset_manifest.schema.json",
         "target": {
-            "cuda": "13.1",
-            "tensorrt": "10.14.1.48",
-            "deepstream": {"major": 9, "version": "9.0"},
+            "cuda": "13.2",
+            "tensorrt": "10.16.0.72",
+            "deepstream": {"major": 9, "version": "9.1"},
         },
         "artifacts": [
             {
@@ -237,8 +237,8 @@ def runtime_tree(
                 "state": "staged_unverified",
                 "compatibility": {
                     "deepstream_major": 9,
-                    "cuda": "13.1",
-                    "tensorrt": "10.14.1.48",
+                    "cuda": "13.2",
+                    "tensorrt": "10.16.0.72",
                 },
                 "provenance": {
                     "source_sha256": _manifest_source_sha(

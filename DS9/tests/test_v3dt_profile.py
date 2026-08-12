@@ -779,8 +779,8 @@ extern "C" void NvMOT_DeInit(NvMOTContextHandle context) {
         source = (
             DS9_ROOT / "scripts" / "run_canonical_engine_maintenance.sh"
         ).read_text(encoding="utf-8")
-        self.assertIn("REQUIRED_DRIVER_MAJOR=590", source)
-        self.assertIn("HOST_DRIVER_MAJOR < REQUIRED_DRIVER_MAJOR", source)
+        self.assertIn('REQUIRED_DRIVER_VERSION="595.58.03"', source)
+        self.assertIn('LOWEST_DRIVER_VERSION', source)
         self.assertIn("upgrade the driver before any DS9 engine build", source)
 
 

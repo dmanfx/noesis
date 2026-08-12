@@ -39,8 +39,15 @@ notes for the Noesis Service Maker app.
 
 6. Document every DS9 migration decision in `DS9/README.md` or a dedicated DS9 doc.
 
-7. Promote DS9 changes by affected capability.
-   - Follow the root `AGENTS.md` capability-scoped production-promotion policy.
+7. Validate DS9 changes directly by affected capability.
+   - Follow the root `AGENTS.md` direct-application validation policy.
+   - For ordinary DS9 work, do not stage an appliance release, clone state,
+     build a selector, publish a candidate, or run activation/rollback
+     ceremony. Use the local runtime/container, focused tests, and one short
+     live or recorded smoke instead.
+   - Use the Menon appliance selector/readiness/rollback path only when the
+     user explicitly requests promotion or the change cannot be exercised
+     without an external service/state lifecycle transition.
    - For MapAnything/depth-panel work, default to the focused depth,
      exact-capture, storage/fusion, frontend-build, manual-Refresh, cache-only,
      and service-readiness gates affected by the change.
@@ -56,6 +63,6 @@ notes for the Noesis Service Maker app.
      topology or shared source/frame/timestamp/identity/world semantics, when
      its impact cannot be bounded after inspection, for a named release
      candidate, or when explicitly requested.
-   - Reuse unchanged realized engines, native builds, release artifacts, and
-     passed evidence. Do not restart the whole promotion sequence after an
-     unrelated failure; rerun only invalidated phases.
+   - Reuse unchanged realized engines, native builds, and passed evidence. Do
+     not restart a release sequence after an unrelated failure; rerun only the
+     direct checks invalidated by the change.

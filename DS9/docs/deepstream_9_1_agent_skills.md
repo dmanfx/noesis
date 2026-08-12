@@ -64,3 +64,16 @@ affected engines, run a short recorded smoke, and exercise the live camera path
 only when its required private assets are present. Profiling uses matched inputs;
 documentation-only skill routing changes require only the docs-consistency
 check.
+
+## Default execution mode
+
+The skill is an implementation and application-validation entrypoint, not a
+release-promotion workflow. After reading the skill and routed references,
+prefer direct local runtime/container checks, focused tests, and one bounded
+live or recorded smoke. Do not create immutable appliance releases, clone state,
+render bundles, build deployment selectors, publish candidates, or rehearse
+rollback for ordinary DS9 work. Use those Menon/appliance mechanics only for an
+explicitly requested production promotion or a change whose behavior cannot be
+exercised without an external service/state lifecycle transition. A missing
+private asset or unavailable GPU is a reported blocker, not a reason to widen
+the validation ceremony.

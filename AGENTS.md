@@ -251,29 +251,38 @@ A normal development task does not require proving every possible failure path, 
 
 ### Capability-scoped production promotion
 
+Direct application validation is the default; production promotion is
+exceptional. A normal code or configuration task ends after focused tests and
+one practical application smoke prove the changed producer, contract, and
+consumer. Do not create or invoke immutable appliance releases, state clones,
+deployment selectors, bundle inventories, candidate publication, promotion
+ceremonies, or rollback rehearsals for ordinary development. Use those release
+mechanics only when the user explicitly requests a production promotion/release
+or the task genuinely changes an external service/state lifecycle that cannot
+be exercised directly.
+
 Production promotion is capability-scoped. Select checks from the behavior and
 boundaries actually changed, not from the perceived importance of the project
 or from broad filename categories.
 
 Use these three levels:
 
-1. **Standard promotion (default):** localized application changes. Run
-   focused static, unit, component, and direct-consumer checks; build the
-   affected deliverable once; activate through the existing bounded
-   selector/readiness/rollback path; and exercise the changed behavior live.
-   Target completion in 30 minutes or less.
-2. **Scoped integration promotion:** changes that require real integration but
-   affect a bounded capability such as network exposure, TLS, systemd
-   lifecycle, frontend delivery, one REST/WebSocket contract, one state
-   migration, or one model/native lane. Test that capability and its direct
-   consumers only. Network and systemd changes do not by themselves require
-   perception-quality suites, occupied-scene evidence, every application
-   surface, or sealed full-runtime ceremonies.
-3. **Full-system assurance:** use only when correctness genuinely depends on
-   running the complete pipeline and application, when a change crosses core
-   inference/tracking/world/Menon semantics, when the impact cannot be bounded
-   after inspection, for a named release candidate, or when the user
-   explicitly requests exhaustive validation.
+1. **Standard application validation (default):** localized application
+   changes. Run focused static, unit, component, and direct-consumer checks;
+   build the affected deliverable once when needed; and exercise the changed
+   behavior directly. Do not activate a selector or stage a release.
+2. **Scoped integration promotion (explicit only):** changes that require real
+   integration but affect a bounded capability such as network exposure, TLS,
+   systemd lifecycle, frontend delivery, one REST/WebSocket contract, one
+   state migration, or one model/native lane. Test that capability and its
+   direct consumers only. Network and systemd changes do not by themselves
+   require perception-quality suites, occupied-scene evidence, every
+   application surface, or sealed full-runtime ceremonies.
+3. **Full-system assurance (explicit only):** use only when correctness
+   genuinely depends on running the complete pipeline and application, when a
+   change crosses core inference/tracking/world/Menon semantics, when the impact
+   cannot be bounded after inspection, for a named release candidate, or when
+   the user explicitly requests exhaustive validation.
 
 Map changes to capabilities such as `network`, `service_lifecycle`, `gateway`,
 `frontend`, `depth`, `tracking`, `identity`, `world`, `state`, and
@@ -281,7 +290,7 @@ Map changes to capabilities such as `network`, `service_lifecycle`, `gateway`,
 and live-smoke gates that proves those capabilities. A path name alone must
 not escalate a change to full-system assurance.
 
-Standard and scoped promotions must:
+When an explicit promotion is authorized, it must:
 
 - stage from an explicit changed-file or release-delta manifest rather than
   treating every dirty-worktree file as part of the release;
@@ -317,6 +326,12 @@ The preferred validation loop is:
 6. Continue iterating against observed application failures.
 
 Do not restart the complete DS9 release, artifact-publication, provenance, packaging, or cutover sequence after an unrelated or low-risk change.
+
+Prefer direct local runtime/container checks, existing attach-only probes, and
+the application's own live or recorded smoke scripts. Do not turn a successful
+application check into a release candidate merely to obtain more evidence. If
+the direct path is blocked by missing private inputs or hardware, report that
+blocker plainly instead of compensating with staging mechanics.
 
 Do not scan entire staging, recording, model, calibration, or artifact directories when known paths or manifests are available.
 

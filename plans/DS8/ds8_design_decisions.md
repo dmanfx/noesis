@@ -13,6 +13,25 @@ Use this file to record non-trivial design choices made during the DS8 migration
 
 ## Entries
 
+- **Date:** 2026-08-12
+- **Author:** Codex
+- **Area:** Development validation and release boundaries
+- **Decision:** Treat direct application validation as the default for DS8/DS9
+  implementation work: focused tests for the changed surface, direct
+  producer/consumer contract checks, and one bounded runtime or recorded smoke.
+  Appliance staging, immutable state/selector candidates, bundle publication,
+  promotion, and rollback rehearsal are release mechanics and must remain out
+  of ordinary development unless a user explicitly requests promotion or the
+  behavior requires an external service/state lifecycle transition.
+- **Rationale:** The DS9.1 upgrade demonstrated that staging and evidence
+  ceremonies can consume substantial effort without increasing confidence in a
+  local application change. Keeping the application path and release path
+  separate makes failures visible, preserves narrow testing, and avoids
+  repeating unchanged validation.
+- **References:** `AGENTS.md`, `DS9/AGENTS.md`,
+  `docs/DS8_testing_guide.md`,
+  `plans/noesis_menon_validation/validation_tiers.md`.
+
 - **Date:** 2026-08-11
 - **Author:** Codex
 - **Area:** Room-walk fusion, static-world alignment, and Scene Prior promotion

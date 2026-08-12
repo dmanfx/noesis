@@ -48,6 +48,15 @@ reprojection, and any diagnostic overlay meant to prove spatial correctness.
 
 ## Validation depth rules
 
+Use direct application evidence by default. Choose the lowest tier that covers
+the changed producer, contract, consumer, and one practical runtime path, then
+stop. Do not invoke appliance staging, state cloning, selector publication,
+bundle rendering, promotion, or rollback rehearsal for ordinary validation-tool
+or application work; reserve those mechanics for an explicitly requested
+release or an unavoidable external service/state transition. Report missing
+Menon, private assets, or hardware as blocked evidence rather than compensating
+with a broader tier.
+
 - For schema-only changes, run schema/unit tests and update the machine-readable
   report contract if fields change.
 - For transform or calibration changes, require round-trip, known-anchor,

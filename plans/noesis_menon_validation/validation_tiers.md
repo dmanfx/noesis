@@ -5,6 +5,19 @@ Status: current as of 2026-05-27.
 Use the lowest tier that proves the changed behavior, then add higher tiers when
 the change crosses runtime, spatial, or Menon boundaries.
 
+## Default execution rule
+
+These tiers describe direct application evidence, not a release ceremony. For
+ordinary work, select the narrowest tier covering the changed producer,
+contract, consumer, and one practical runtime path, then stop. Do not create
+Menon appliance releases, clone state, publish selectors, render deployment
+bundles, or run promotion/rollback rehearsals unless the user explicitly asks
+for a release or the behavior requires an external service/state transition.
+The adoption gate below validates this toolbox itself; it is not a mandatory
+precondition for every feature change. Missing private inputs or unavailable
+hardware should be reported as blocked evidence rather than replaced by a
+wider, unrelated tier.
+
 ## Tier 1 - Unit, schema, and math
 
 No GPU or live runtime required.

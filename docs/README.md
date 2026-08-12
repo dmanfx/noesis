@@ -49,6 +49,12 @@ and worklogs live in `docs/history/`.
 - Status headers (“Status: validated as of …”) should only be updated when the doc has been re-validated against code/configs.
 
 ## Doc changes (2026-08-12)
+- Made direct application validation the default for future agents and reserved
+  appliance staging, candidate/selector ceremony, promotion, rollback, and
+  broad unchanged validation for explicitly requested releases or unavoidable
+  external lifecycle transitions (`AGENTS.md`, `DS9/AGENTS.md`,
+  `docs/DS8_testing_guide.md`, `DS9/docs/deepstream_9_1_agent_skills.md`,
+  `plans/noesis_menon_validation/validation_tiers.md`).
 - Defined the exact DeepStream 9.1 direct-upgrade target and parity-first
   execution path, recorded the completed source pins and base-image inspection,
   retained 9.0 results as historical evidence, and explicitly deferred AMC

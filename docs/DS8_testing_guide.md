@@ -20,6 +20,19 @@ See `plans/noesis_menon_validation/validation_tiers.md` and
 `plans/noesis_menon_validation/validation_asset_inventory.md` for command
 selection and reusable existing smoke tests.
 
+## Default validation mode
+
+Use the lowest tier that proves the changed application behavior. Start with
+the affected unit/schema or component tests, add direct producer/consumer
+contract checks, and run one short DS8 runtime or recorded smoke when practical.
+Stop when that evidence is sufficient. Do not automatically run the full CPU
+contract gate, a complete regression suite, appliance staging, selector/state
+release work, or a promotion ceremony for an ordinary code or documentation
+change. Those broader checks are reserved for an explicitly named release,
+promotion, or genuinely cross-system change. If a required GPU, camera, or
+Menon input is unavailable, record the blocked check instead of manufacturing
+confidence with unrelated validation.
+
 ## Canonical CPU contract gate
 
 The hosted and local Tier 1 contract is:

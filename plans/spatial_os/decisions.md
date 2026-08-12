@@ -383,3 +383,19 @@
   Deserialization alone cannot admit the engine. FP32 functional admission is
   necessary but does not claim all-camera floorplan parity or acceptable
   full-runtime GPU headroom; those remain separate fail-closed live gates.
+
+## SOD-042 - Application validation precedes release mechanics
+
+- Date: 2026-08-12
+- Decision: For ordinary Noesis/DS8/DS9 feature and repair work, validate the
+  changed application path directly with focused tests, affected contracts, and
+  one bounded live or recorded smoke. Do not create appliance candidates,
+  clone state, publish selectors or bundles, or rehearse promotion/rollback
+  unless a production release is explicitly requested or the change requires
+  an external service/state lifecycle transition.
+- Rationale: Release machinery proves deployment state, not local application
+  correctness. Keeping it exceptional reduces token/time cost and prevents
+  broad unchanged validation from obscuring the direct failure or result.
+- References: `AGENTS.md`, `DS9/AGENTS.md`,
+  `DS9/docs/deepstream_9_1_agent_skills.md`,
+  `plans/noesis_menon_validation/validation_tiers.md`.

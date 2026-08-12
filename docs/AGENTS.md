@@ -58,6 +58,10 @@ right doc. Read this before touching code.
   workspace before finalizing edits.
 - After AGENTS/docs changes, run `./scripts/check_agents_docs_consistency.py` and
   resolve any failures before closing the task.
+- Documentation and guidance changes use the docs-consistency check and
+  `git diff --check` only; do not trigger application, packaging, appliance
+  staging, or release validation unless the documentation change also changes
+  an executable contract and that contract is explicitly being tested.
 
 ## If You’re Stuck
 - Confirm you are working on the DS8 canonical stack (not deprecated paths).

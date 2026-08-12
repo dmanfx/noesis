@@ -59,3 +59,11 @@ This directory tree is the canonical DeepStream 8 / Service Maker / Flow impleme
 9. **Portable paths only**
    - Do not introduce new hardcoded absolute machine-local paths in DS8 runtime code.
    - Use repo-relative resolution (`REPO_ROOT`) or explicit config/env inputs.
+
+10. **Direct application validation**
+   - Validate ordinary DS8 changes with the affected focused tests, direct
+     contract consumers, and one practical runtime or recorded smoke.
+   - Do not invoke DS9/Menon appliance staging, immutable candidate selectors,
+     state cloning, bundle publication, or promotion ceremonies for DS8 work.
+     Those mechanics belong only to an explicitly requested external release
+     or service-lifecycle task.

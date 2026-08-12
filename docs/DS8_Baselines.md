@@ -21,10 +21,22 @@ you don’t have to sift through the historical work orders.
   is enabled by default (`NOESIS_REID_ENABLED=1`). Default embedding interval is
   `0.0s` (every frame); device defaults to `cuda:0`. Disable entirely with
   `NOESIS_REID_ENABLED=0`.
+- Public persisted embedding provenance is the all-or-none
+  `embedding_sequence` / `embedding_model_sha256` /
+  `embedding_dimension` triad. It is stamped only after the exact private
+  identity-evidence row is durable; capture-disabled, failed-append, and
+  continuity-held rows omit all three fields. No raw embedding vector is
+  public.
+- Zero-person frames remain authoritative telemetry. A transition to
+  `tracks: []` publishes immediately; sustained emptiness advances `frame_id`
+  at `NOESIS_TRACKING_EMPTY_HEARTBEAT_HZ` (2 Hz default). Consumers clear that
+  camera's presence/world evidence rather than waiting on a browser TTL.
 
 ## Output & Delivery
-- Mosaic video is delivered via RTSP → WebRTC gateway; WebSocket is signaling
-  only for mosaic (no JPEG-over-WS in DS8).
+- Mosaic video is encoded once on the GPU, published as AU-aligned H.264 over
+  local SHM, and packetized once per WebRTC peer. WebSocket is signaling only
+  for mosaic (no JPEG-over-WS in DS8), and RTSP is optional tooling rather than
+  a WebRTC dependency.
 - BEV JPEG binaries are **retired**:
   - `NOESIS_BEV_JPEG_ENABLED` and `bev.jpeg_enabled` are ignored.
   - JSON BEV metadata is the supported delivery path.
@@ -58,7 +70,7 @@ you don’t have to sift through the historical work orders.
   is no longer the only depth-related path in DS8.
 - MapAnything lane:
   - gated with `mapanything_valve`
-  - REST: `GET /api/v1/depth/refresh?seconds=N` opens the gate for N seconds
+  - REST: `POST /api/v1/depth/refresh?seconds=N` opens the gate for N seconds
   - owns `depth_result` and `ma_depth_response`
   - writes dense snapshots under `data/depth/<camera>/...`
 - Baseline non-`v3dt` tracking lane:
@@ -67,6 +79,10 @@ you don’t have to sift through the historical work orders.
   - fuses pose anchor + floor observation + registered DAv2 range inside the
     backend world estimator (`PersonGroundState` / human CV filter)
   - does not publish a second full-frame WebSocket depth stream
+  - rendezvouses capture and object fusion by exact
+    `(source_id, frame_id, media PTS)`, waiting up to
+    `NOESIS_OBJECT_DEPTH_EXACT_FRAME_WAIT_MS` (20 ms default, 250 ms cap)
+    before considering only a bounded same-source prior frame
 - Baseline startup now requires a valid DAv2->MapAnything registration artifact:
   - config key: `depth_registration.path`
   - default artifact: `config/depth_registration.json`
@@ -74,10 +90,25 @@ you don’t have to sift through the historical work orders.
 - `depth_used_m` and the OSD `z=` label represent the registered DAv2 depth
   that actually participated in the fused world update, not the raw
   `anchor_depth_m`.
+- Strict observation `depth_present` is true only for `depth_status="ok"` and
+  finite positive usable depth. Registration/transform rejection is false; a
+  raw anchor alone does not qualify when registration status is `ok`.
+- DAv2 bridge health lives in
+  `stats.payload.pipeline.zero_copy_core.counters`: `depth_bridge_*` records
+  exact waits, bounded lag, and misses; `object_depth_attach_total` /
+  `object_depth_status_total.<status>` record successful attachment;
+  `object_depth_attach_failure_total[.<reason>]` records missing/rejected native
+  attachment. Failure never counts as a successful status.
 - Depth normals (in `ma_depth_response`) are optional; enable/disable with
   `NOESIS_MAPANYTHING_NORMALS_ENABLE=1|0` and choose space/dtype via
   `NOESIS_MAPANYTHING_NORMALS_SPACE` (`camera`|`world`) and
   `NOESIS_MAPANYTHING_NORMALS_DTYPE` (`float16`|`float32`).
+- Lifecycle readiness and empty-house heartbeats do not prove person semantics.
+  Occupied acceptance additionally requires an exact public track → strict
+  observation → private persisted-evidence link with the complete embedding
+  triad, pose, usable depth, finite backend world, no raw vectors, and no
+  pipeline errors. The gate is implemented, but no occupied live pass is
+  recorded here.
 
 ## Detector Profiles (PGIE)
 - **Default:** YOLO11 detect, PGIE `unique-id=1`, person is `class_id=0`.
@@ -142,11 +173,11 @@ you don’t have to sift through the historical work orders.
 - Camera-namespaced fallback colors remain enabled to avoid cross-camera color
   collisions when stable_id is absent.
 
-## V3DT / SV3DT Baseline (2026-01-22 locked)
+## V3DT / SV3DT Baseline (2026-07-11 global-world contract)
 - Pipeline: `config/infer_v3dt_baseline.yaml`
 - Tracker: `config/v3dt/nvtracker_v3dt_baseline.yml`
 - CamInfo dir: `config/v3dt/caminfo_baseline/`
-- Calibration: `config/archive/calibration_v3dt_baseline.json`
+- Active calibration: `config/camera_calibration.json`
 - Per-camera pitch (preview extrinsics): family-room **-16°**, kitchen **-21°**,
   living-room **-15°**
 - Model dimensions: height **2.2 m**, radius **0.35 m**
@@ -155,16 +186,26 @@ you don’t have to sift through the historical work orders.
   - `NOESIS_V3DT_CAMINFO_Y_FLIP=1`
   - `NOESIS_V3DT_CAMINFO_WORLD_AXES=xzy`
   - `NOESIS_V3DT_CAMINFO_WORLD_SCALE=1`
-- Known gaps: living-room still slightly shallow (bottom offset ~160px); BEV
-  validation pending. See `history/ds8/v3dt/` for detailed runs.
+- The active calibration has separated camera centers in one metric world; the
+  DS8 and DS9 locked camInfo files are byte-identical. `bbox3d`/`velocity3d`
+  remain tracker-tuple diagnostics. The producer converts the bbox ground
+  endpoint through `xzy` before publishing Y-up `backend_world_m`.
+- Remaining gate: one fresh, occupied, same-session v2 run must cover all three
+  cameras and validate native image-foot reprojection. MV3DT overlap/time-sync,
+  peer association, and fused-output acceptance remain separate and unproven.
 - Optional camInfo regeneration: `NOESIS_V3DT_AUTOGEN_CAMINFO=1` regenerates
   camInfo using the current streammux resolution before starting the pipeline.
 
 ## WebRTC / Mosaic
-- Canonical mosaic path is RTSP (`nvrtspoutsinkbin`) consumed by
-  `noesis/mosaic_webrtc_gateway.py`.
-- Ensure RTSP output is enabled when WebRTC is enabled
-  (`mosaic_output.mosaic_webrtc_enabled: true` auto-enables RTSP).
+- Canonical mosaic path is `nvv4l2h264enc → h264parse → shmsink`, one
+  `MosaicH264ShmFeeder`, then bounded per-peer
+  `appsrc → rtph264pay → webrtcbin` pipelines.
+- Active defaults are `mosaic_webrtc_enabled: true`, `rtsp_enabled: false`,
+  12,000 kbps CBR, and a 10-frame IDR cadence. Only the four-buffer raw
+  pre-encode queue is leaky; compressed AU/RTP queues are bounded and
+  non-leaky.
+- `NOESIS_MOSAIC_H264_SHM` can override the configured socket for an isolated
+  canary. Enabling WebRTC does not enable RTSP.
 
 ## Where to Confirm Details
 - Full rationale and history: `DS8_MIGRATION_KNOWLEDGE_BASE.md`,

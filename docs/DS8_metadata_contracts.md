@@ -1,5 +1,5 @@
 # DS8 Metadata Contracts
-_Status: validation-diagnostics addendum current as of 2026-05-27._
+_Status: shared observation and depth contracts current as of 2026-07-11._
 
 This document summarizes the key metadata structures used by the DS8 pipeline, both on-frame (user meta) and in downstream telemetry.
 
@@ -137,7 +137,11 @@ Via `.to_dict()` / `.to_json()`:
 }
 ```
 
-Consumers (WS clients, REST, or back-end services) must treat `depth_map_ref` as an opaque reference; its structure is defined by the storage subsystem.
+`.to_dict()` is the internal persistence representation and may contain a local
+storage path. `DepthTelemetryPublisher` uses `.to_public_dict()` instead. The
+wire value is a deterministic `noesis-depth://artifact/<sha256>` identifier and
+never exposes a filesystem path, camera directory, or backend storage URI.
+Consumers must treat it as opaque; it is not itself a fetch URL.
 
 ## 2.1 Depth Normals (MapAnything)
 
@@ -178,9 +182,9 @@ Attached as NvDsUserMeta with type `NVIDIA.DSANALYTICSOBJ.USER_META` (or equival
 ```json
 {
   "dirStatus": "<string|null>",
-  "lcStatus": "<string|null>",
-  "ocStatus": "<string|null>",
-  "roiStatus": "<string|null>",
+  "lcStatus": ["<line-label>", "..."],
+  "ocStatus": ["<overcrowding-roi-label>", "..."],
+  "roiStatus": ["<roi-filtering-label>", "..."],
   "direction_status": "<string|null>",
   "line_crossing_status": "<string|null>",
   "overcrowding_status": "<string|null>",
@@ -189,6 +193,14 @@ Attached as NvDsUserMeta with type `NVIDIA.DSANALYTICSOBJ.USER_META` (or equival
 ```
 
 Snake_case keys are provided for backwards compatibility with older consumers.
+
+For household room membership, `ocStatus` is the primary per-object polygon
+evidence because the established overcrowding ROIs already carry the exact room
+IDs. `roiStatus` is consulted only when there is no nonempty `ocStatus`
+membership. The shared DS8/V3DT/DS9 resolver requires one exact unique label;
+identical duplicates collapse, while padded, empty, over-160-character,
+malformed, or multiple distinct labels fail closed. It never trims,
+case-normalizes, truncates, or picks the first label.
 
 ### Frame-Level Analytics Meta
 
@@ -224,7 +236,8 @@ Each track emitted via tracking telemetry or internal structures has fields such
   "analytics": { /* see analytics obj meta above */ },
   "zone": "<string|null>",
   "frame_id": <int>,
-  "stable_id": <int>,
+  "stable_id": <int|null>,
+  "tracker_id": <int>,
   "dwell_time": <float|null>,
   "bbox3d": {
     "xCentre": <float>, "yCentre": <float>, "zCentre": <float>,
@@ -239,16 +252,59 @@ Each track emitted via tracking telemetry or internal structures has fields such
   "world_quality": "good"|"estimated"|"invalid",
   "world_quality_reason": "<string|null>",
   "world_frame": "<string|null>",
-  "world_source": "bbox3d"|"pose_depth_fused"|"pose_floor_only"|"person_anchor_depth_fused"|"person_anchor_floor_only"|"gravity_drop"|"anchor_hold"|null,
+  "world_source": "bbox3d"|"pose_depth_fused"|"person_anchor_depth_fused"|"pose_depth_only"|"person_anchor_depth_only"|"pose_floor_only"|"person_anchor_floor_only"|"gravity_drop"|"anchor_hold"|null,
+  "world_floor_candidate": [<float x>, <float y>, <float z>]|null,
+  "world_floor_range_m": <float|null>,
+  "world_floor_range_limit_m": <float|null>,
+  "world_floor_incidence_sin": <float|null>,
+  "world_floor_admitted": <bool|null>,
+  "world_floor_rejection_reason": "floor_ray_range_exceeded"|"floor_ray_geometry_invalid"|null,
+  "world_depth_candidate": [<float x>, <float y>, <float z>]|null,
+  "world_prefilter_measurement": [<float x>, <float y>, <float z>]|null,
+  "world_filter_prediction": [<float x>, <float y>, <float z>]|null,
+  "world_measurement_accepted": <bool|null>,
+  "world_rejection_reason": "<string|null>",
+  "world_innovation_m": <float|null>,
+  "world_innovation_limit_m": <float|null>,
+  "world_reacquire_count": <int|null>,
+  "world_reacquired": <bool|null>,
+  "world_fusion_policy_id": "<sha256|null>",
+  "world_floor_weight_scale": <float|null>,
+  "world_depth_weight_scale": <float|null>,
+  "world_floor_weight_effective": <float|null>,
+  "world_depth_weight_effective": <float|null>,
   "motion_mode": "walk"|"idle"|"sit"|"lie"|"unknown"|null,
   "posture": "standing"|"sitting"|"lying"|"unknown"|null,
   "trail_append_allowed": <bool|null>,
+  "trail_break_required": <bool|null>,
+  "trail_segment_id": <int|null>,
   "idle_jitter_m": <float|null>,
+  "source_switch_count": <int|null>,
+  "sticky_world_source": "<string|null>",
+  "scene_prior": {
+    "contract": "noesis.scene_prior.track_diagnostic",
+    "contract_version": 1,
+    "prior_id": "<immutable prior id>",
+    "space_id": "<physical space id>",
+    "mode": "shadow",
+    "coordinate_frame": "backend_world_m",
+    "status": "pass"|"warning"|"fail"|"unknown"|"error",
+    "inside_extent": <bool>,
+    "inside_authored_space": <bool>,
+    "evidence_observed": <bool>,
+    "evidence_confidence": <float 0..1>,
+    "reasons": ["<stable reason>", ...]
+  } | null,
   "projection_confidence": <float|null>,
   "temporal_confidence": <float|null>,
   "reid_confidence": <float|null>,
   "reid_identity": "<string|null>",
   "appearance_id": "<string|null>",
+  "embedding_present": <bool|null>,
+  "embedding_sequence": <int|null>,
+  "embedding_model_sha256": "<lowercase sha256|null>",
+  "embedding_dimension": <int|null>,
+  "pose_present": <bool|null>,
   "occluded": <bool|null>,
   "occlusion_uncertainty_m": <float|null>
 }
@@ -256,22 +312,102 @@ Each track emitted via tracking telemetry or internal structures has fields such
 
 These structures are not stored as user meta on frames by default but are the basis for WebSocket tracking telemetry and occupancy calculations.
 
+`scene_prior` is detached, runtime-derived shadow evidence. It is evaluated
+after the producer owns a valid backend-world track and cannot mutate the
+world estimator, canonical observation, identity, occupancy, or authored room
+semantics. A camera without an exact catalog binding omits the field.
+
+Zero-person camera frames still produce a tracking publication with
+`track_count=0`, `tracks=[]`, an empty observation set, and advancing frame
+timing. The nonempty-to-empty transition is immediate; sustained emptiness is
+cadenced by `NOESIS_TRACKING_EMPTY_HEARTBEAT_HZ` (2 Hz default). Canonical world
+state removes that producer/source evidence while retaining its sequence
+watermark so absence cannot be confused with replay or telemetry stall.
+
 - `track_id` remains an internal tracker identifier and must not be emitted to clients.
-- `stable_id` is global (can be present across multiple cameras) and must be an integer `>= 1` for people tracks.
+- `tracker_id` is the bounded camera/run-local association key used by strict
+  observation joins. It may be emitted for diagnostics but is not a durable or
+  user-visible identity.
+- `stable_id` is the numeric compatibility boundary. It is an integer `>= 1`
+  for a resolved resident/visitor and may be null for an authoritative
+  identity-v2 open-set unknown.
 - Negative/provisional stable IDs are internal-only and must not be emitted to clients.
 - `dwell_time` is derived per track by `_AnalyticsTelemetryProcessor` using zone entry timestamps; it is null when no zone is available.
-- `bbox3d` and `velocity3d` are attached when `NVDS_OBJ_3D_META` (SV3DT/MV3DT) is present.
-- `image_foot` is the active current-frame image anchor chosen by the backend estimator: posture-aware pose contact when available (ankles standing, hip/body sitting/lying), otherwise the person mask/depth anchor from `NOESIS.OBJECT_DEPTH.anchor_uv`. `image_base` is the canonical image reprojection of the filtered world state.
-- In baseline (non-`v3dt`) DS8 mode, `world` is produced by the shared `PersonGroundState` estimator (`noesis/telemetry/person_ground_state.py`, wired from `hooks.py`): posture-aware pose contact when available, otherwise `NOESIS.OBJECT_DEPTH.anchor_uv` for class-0 tracks. A concurrent DAv2 range observation from `NOESIS.OBJECT_DEPTH.anchor_depth_m` can refine either current-anchor path as `pose_depth_fused` or `person_anchor_depth_fused`. When DAv2 is unavailable for a frame, the same estimator continues as `pose_floor_only`, `person_anchor_floor_only`, `gravity_drop` (upright height-lock only), or `anchor_hold`. Stationary lock publishes `motion_mode` / `trail_append_allowed` so trails freeze when people stop moving.
-- In `v3dt` mode, `world`/`world_source="bbox3d"` continue to come from `NVDS_OBJ_3D_META`.
-- `world_frame` may be set to `"camera_local"` until shared global calibration is available.
-- `world_quality_reason` is the canonical diagnostic string explaining why the current update was fused, floor-only, guarded, held, or invalid.
+- `bbox3d` and `velocity3d` are attached when `NVDS_OBJ_3D_META` (SV3DT/MV3DT) is present. In the locked V3DT profile they retain the tracker tuple for diagnostics; consumers must not reinterpret them directly as canonical world coordinates.
+- In baseline mode, `image_foot` is the active current-frame image anchor chosen by the backend estimator and `image_base` is the canonical image reprojection of the filtered world state. In V3DT mode, `image_foot` is the native tracker ground-foot metadata, while `image_base` is the separately derived projection of the opposite cuboid endpoint. Keeping both prevents a self-referential reprojection check.
+- In baseline mode, `world` is produced by the shared `PersonGroundState` estimator. A startup-validated, calibration- and depth-registration-bound policy selects the admitted observation mix per camera. Every calibrated floor ray is independently range-gated against the camera profile before it can seed height lock or filter state; a non-finite ray or one beyond `floor_ray_max_range_m` remains diagnostic-only and reports `floor_ray_geometry_invalid` or `floor_ray_range_exceeded`. When registered depth is admitted, it owns X/Z and the floor plane contributes contact Y; the two positions are not averaged. A rejected floor ray does not suppress a valid registered-depth observation, which is admitted as depth-only. A rejected registered-depth sample is never projected or used for height lock, but it does not suppress an independent in-range floor ray when that camera's policy explicitly permits floor-only placement. A registered-depth-only profile remains fail-closed and never silently falls back to a floor ray. `gravity_drop` and the bounded `anchor_hold` are explicitly degraded temporal outputs, not live measurement sources.
+- Impossible innovations are rejected rather than clipped into plausible motion. A bounded run of mutually consistent observations may reacquire the same tracker lifecycle; that increments durable `trail_segment_id` and pulses `trail_break_required` so trail consumers cannot draw a teleport even if they miss the pulse frame. Source hysteresis is committed only after the physical gate accepts the observation.
+- In `v3dt` mode, `world`/`world_source="bbox3d"` come from the bbox ground endpoint only after the profile's required `xzy` tracker-to-world conversion. The public result is Y-up meters in `world_frame="backend_world_m"`; absent/invalid bbox or axis metadata leaves world invalid instead of selecting a ray-plane fallback.
+- The current V3DT contract does not permit `world_frame="camera_local"`. Shared-world SV3DT output does not by itself prove MV3DT overlap fusion or cross-camera ID propagation.
+- `world_quality_reason` is the canonical diagnostic string explaining why the current update was fused, floor-only, guarded, held, or invalid. Producer-side floor-ray rejection uses the stable reasons `floor_ray_range_exceeded` and `floor_ray_geometry_invalid`; downstream renderers must not clamp or reinterpret those rejected candidates as valid world positions.
 - `projection_confidence`, `temporal_confidence`, `reid_confidence`,
   `reid_identity`, `appearance_id`, `occluded`, and
   `occlusion_uncertainty_m` are optional validation diagnostics. They are used
   by saved/live telemetry validation and track-audit reports when present; their
   absence means the corresponding validation evidence is incomplete, not
   implicitly passing.
+- Identity-v2 does not attach Python objects or embeddings as DeepStream user
+  meta. Each hook copies server-extracted SGIE values into immutable
+  `PrimitiveFrameObservation` rows while walking the transient source frame
+  once, invokes the shared coordinator once for the complete source batch, and
+  then decorates only detached public dictionaries. The exact enrollment key is
+  derived from run/camera/tracker/frame identity, active engine-byte SHA-256,
+  declared tensor layer/dimension, and float32 embedding bytes. Public metadata
+  exposes the key and decision diagnostics, never the embedding.
+- Persisted public embedding provenance is the all-or-none
+  `embedding_sequence` / `embedding_model_sha256` / `embedding_dimension`
+  triad. The sequence links to the exact durably appended private evidence row;
+  the fingerprint and dimension must match the active model. The triad is
+  omitted when evidence capture is disabled, persistence fails, or the public
+  identity is only a tracker-continuity hold. Partial triads are invalid.
+- `embedding_present` is rewritten by the process-owned identity-v2 adapter and
+  describes only a valid server extraction for that exact track/frame. A
+  legacy gallery/cache diagnostic is not frame evidence. With shadow capture
+  enabled, a true value requires the exact observation key and the complete
+  persisted triad on both the detached public track and strict observation.
+  Missing tensors and continuity holds set it false and clear those fields.
+- The adapter may retain a resolved public overlay for a bounded tracker-
+  continuity window when SGIE does not emit a fresh tensor on an intervening
+  frame. It does not retain that row as overlap/enrollment evidence, marks it
+  `fresh_embedding=false`, and removes it on the first camera frame where the
+  tracker is absent.
+- An accepted subject is immutable for the lifetime of that camera-local
+  tracker state. Other subjects become hard constraints, not score competitors;
+  the locked subject still has to pass every open-set and exclusivity gate.
+  Contradictory evidence therefore publishes unknown rather than a new subject,
+  and only an evidence gap long enough to expire tracker state permits
+  reassignment.
+- Missing fresh SGIE evidence without a valid tracker-continuity hold is
+  represented as `provisional`; `unknown` is reserved for an evidence-backed
+  open-set rejection. In authoritative mode the metadata walk writes an
+  explicit neutral OSD override (`#XX`) before whole-frame resolution so stale
+  legacy StableID labels cannot leak. Detached tracking/world dictionaries are
+  resolved in the same frame, but transient DeepStream wrappers are not retained
+  or revisited for an unsafe second-pass OSD restamp.
+- The active ReID engine path, output layer, and embedding dimension are
+  explicit runtime configuration. Startup hashes the actual engine bytes and
+  rejects a missing/empty engine, missing layer/dimension, topology mismatch,
+  or incompatible persisted model profile instead of inferring a model.
+- The strict `noesis.observation.person` envelope mirrors the complete
+  embedding-provenance triad and exposes `pose_present` and `depth_present` as
+  semantic booleans. `depth_present=true` requires object-depth `status="ok"`,
+  `depth_registration_status="ok"`, and a finite positive
+  `depth_registered_m`; `depth_used_m`, when present, must match the registered
+  value. Missing, raw-passthrough, or rejected registration and raw anchors do
+  not qualify.
+- The strict envelope's optional `world_diagnostics` object is bounded,
+  non-biometric decision evidence. It carries finite raw floor/depth candidates,
+  prefilter/prediction points, floor admission and range, physical innovation,
+  active fusion weights, and depth-registration status. An image-only/invalid
+  world observation emitted by the canonical service always has an explicit
+  `first_divergence_reason`; retaining diagnostics does not admit that candidate.
+- Canonical `WorldSourceEvidence` preserves the strict `observation_id` and
+  source zone. Fusion and the `WorldEntity` contract derive `room_id` only from
+  agreeing accepted authoritative analytics source zones. Rejected,
+  camera-default, and unprovenanced sources do not vote. One exact accepted
+  label requires the matching non-null `room_id`; no label requires a null
+  room; and multiple distinct labels require both a null room and visible
+  conflict state.
 - Noesis/Menon validation traces may serialize the track `world` vector as
   `backend_world_m` when proving world-to-BEV or world-to-Menon agreement. That
   alias is a validation/debug naming convention for the same backend-owned
@@ -290,7 +426,12 @@ Occupancy per zone is represented as:
 
 The occupancy publisher (`occupancy_publisher`) expects `publish_state(room_id, occupied, count, ts_ns)` calls aligned with this representation.
 
-In DS8, `_AnalyticsTelemetryProcessor` derives occupancy counts per sensor from analytics ROI status (zones) on each frame and publishes through `pipeline.occupancy_publisher`, emitting vacate events when a previously occupied zone disappears.
+In DS8, `_AnalyticsTelemetryProcessor` derives diagnostic occupancy counts per
+sensor from each published local track zone and publishes through
+`pipeline.occupancy_publisher`, emitting vacate events when a previously
+occupied zone disappears. Those local counts may include a `camera_default`
+fallback; only exact authoritative analytics evidence can vote for canonical
+`room_id`.
 
 Vacates are emitted immediately when a zone’s count drops to zero; there is no grace window in the current DS8 implementation.
 
@@ -368,7 +509,10 @@ static void pose_meta_release(gpointer data, gpointer) {
 
 ## 7. Object Depth User Meta (Object-Level)
 
-**Producer:** DS8 seg+depth prototype and the baseline DS8 runtime depth-tracking lane (YOLO26 seg + DepthAnything V2 metric) attach this payload after full-frame depth is aligned once into canonical DS8 frame coordinates and sampled strictly over the decoded instance mask.
+**Producer:** the baseline DS8 runtime DAv2 depth-tracking lane attaches this
+payload after full-frame depth is aligned once into canonical DS8 frame
+coordinates. Mask-capable detectors use the decoded person instance mask;
+box-only detectors use a bounded lower-person bbox band.
 
 **Meta type:** `NOESIS.OBJECT_DEPTH` (user meta attached to each `NvDsObjectMeta`).
 
@@ -385,7 +529,7 @@ static void pose_meta_release(gpointer data, gpointer) {
   "class_id": 0,
   "bbox": [left, top, width, height],
   "score": 0.87,
-  "sampling_mode": "instance_mask",
+  "sampling_mode": "instance_mask" | "bbox_band",
   "status": "ok",
   "unit": "m",
   "is_metric": true,
@@ -411,16 +555,16 @@ static void pose_meta_release(gpointer data, gpointer) {
   "projection_method": "depth",
   "spatial_status": "ok",
   "spatial_class": "person",
-  "depth_map_ref": "memory://depth/family-room/1700000000000",
+  "depth_map_ref": "noesis-depth://artifact/<sha256>",
   "ts_us": 1700000000000
 }
 ```
 
 **Notes:**
 
-- The payload is attached per object only after full-frame depth has been aligned once into canonical post-mux DS8 frame coordinates and sampled strictly over the decoded instance mask.
-- `bbox` and all mask/depth statistics are expressed in that canonical DS8 frame space. Source-native dimensions (`source_frame_width`, `source_frame_height`) are diagnostic-only and must not be used for object-depth sampling.
-- There is no bbox fallback in the current prototype path. If the mask is missing, mask decode fails, the aligned depth frame is not ready, or the geometry is inconsistent, the payload is still attached with a non-`"ok"` `status`.
+- The payload is attached per object only after full-frame depth has been aligned once into canonical post-mux DS8 frame coordinates. `instance_mask` samples the decoded mask; `bbox_band` samples the configured lower-person band when the selected detector has no usable mask.
+- `bbox` and all mask/band/depth statistics are expressed in that canonical DS8 frame space. Source-native dimensions (`source_frame_width`, `source_frame_height`) are diagnostic-only and must not be used for object-depth sampling.
+- If neither the native mask nor bounded bbox-band path can produce usable statistics, the aligned depth frame is not ready, or geometry is inconsistent, the payload may still be attached with a non-`"ok"` `status`.
 - `status` is mandatory and distinguishes usable samples (`"ok"`) from object-local failures such as `"no_valid_depth"`, `"missing_mask"`, `"mask_decode_failed"`, `"depth_not_ready"`, or `"transform_mismatch"`.
 - Version `2` adds optional person-only spatial fields derived from the segmentation mask plus the DS8 calibration bundle. `anchor_uv` is the bottom-of-mask image anchor in canonical frame space, `anchor_depth_m` is the preferred lower-body or torso-core depth sample, and `world_point*` fields are produced by `pixel_to_world(...)` without applying `align.matrix`.
 - `anchor_sample_count` and `anchor_valid_fraction` describe the support of the specific lower-body / torso anchor band that produced `anchor_depth_m`. Baseline DS8 tracking weights DAv2 using these anchor-band support fields instead of whole-mask support alone so far-camera people can still contribute depth when the chosen anchor band is well supported.
@@ -430,10 +574,23 @@ static void pose_meta_release(gpointer data, gpointer) {
 - The object-level `world_point`, `world_point_depth`, `world_point_floor`, and `projection_method` fields remain diagnostic-only in baseline runtime mode. They are useful for inspection and parity testing, but they are not the authoritative tracking output once the fused estimator is active.
 - Non-person classes keep the raw object-depth payload behavior and omit the spatial fields.
 - The runtime uses a bounded internal aligned-depth cache to hand the canonical full-frame depth map from the depth-capture operator to the later object-fusion/overlay operators. That cache is prototype-internal only and is not a public DS8 metadata contract.
-- `sampling_mode` is currently fixed to `"instance_mask"`. Consumers must not infer bbox-based semantics from missing numeric fields.
+- The bridge keys frames by exact `(source_id, frame_id, media PTS)`. Object
+  fusion waits up to `NOESIS_OBJECT_DEPTH_EXACT_FRAME_WAIT_MS` for the sibling
+  DAv2 frame (20 ms default, hard-clamped to 0–250 ms), then may use only a
+  same-source, non-future prior frame within the configured cadence. Wrong-PTS,
+  future, over-age, and wrong-source frames are misses rather than implicit
+  matches.
+- `sampling_mode` explicitly identifies `"instance_mask"` or `"bbox_band"`;
+  consumers must not infer one mode from missing numeric fields.
 - `unit` and `is_metric` travel with the payload so downstream consumers can distinguish metric meters from relative-depth fallbacks without guessing from the model name.
 - `depth_map_ref` is optional and is an opaque pointer to any stored full-frame depth artifact when one exists; consumers must not parse semantics out of the string.
-- Attached in DS8 via `noesis_depth_meta_ext.attach_object_depth(...)`; instance masks are copied out of `NvOSD_MaskParams` via the native helper `noesis_depth_meta_ext.extract_object_mask(...)` before sampling.
+- Attached in DS8 via `noesis_depth_meta_ext.attach_object_depth(...)`; instance masks are copied out of `NvOSD_MaskParams` via the native helper `noesis_depth_meta_ext.extract_object_mask(...)` before sampling. Native attachment must receive the owning batch metadata and return success. A missing function/extension, native exception, or native rejection means the object does not carry this user meta; it is not silently counted as an attached non-`ok` payload.
+- `stats.payload.pipeline.zero_copy_core.counters` makes the bridge observable.
+  Exact/lagged/miss behavior uses the `depth_bridge_*` counters; successful
+  attachment uses `object_depth_attach_total` and
+  `object_depth_status_total.<status>`; failures use
+  `object_depth_attach_failure_total` and a reason-suffixed counter. Attachment
+  failures also emit a rate-limited warning.
 
 ## 8. Pose Keypoint Visualization (OSD)
 

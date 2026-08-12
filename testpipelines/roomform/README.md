@@ -1,9 +1,10 @@
-# Roomform living-room phone-walk pipeline
+# Roomform phone-walk pipeline
 
 This offline pipeline runs the released Roomform 55M structural model and the
 released Pointcept PTv3 ScanNet-20 object lifter locally. It accepts either an
 aligned `living-room` MapAnything phone walk or an explicit point-preserving
-DA3+MapAnything fusion with its matching camera solution. It preserves metric
+DA3+MapAnything fusion with its matching camera solution. The room defaults to
+`living-room`; use `--room-id` for another aligned room. It preserves metric
 RGB points and camera stations, converts the declared source frame to Roomform
 Z-up, and produces the structured scene plus object geometry.
 
@@ -80,6 +81,16 @@ env PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
 "$PTV3_ENV/bin/python" testpipelines/roomform/render_standalone_objects.py "$run_dir"
 "$PTV3_ENV/bin/python" testpipelines/roomform/validate_run.py "$run_dir"
 ```
+
+For an aligned DA3 family-room walk, use the same command with its scan path
+and add:
+
+```bash
+--room-id family-room
+```
+
+The adapter verifies that the requested room matches the alignment report and
+accepts either the saved MapAnything or DA3 phone-walk provider contract.
 
 ## Build a point-preserving consensus cloud
 

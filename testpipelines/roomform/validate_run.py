@@ -77,8 +77,9 @@ def validate(run_dir: Path, comparison_run: Path | None) -> dict[str, Any]:
     input_manifest = json.loads(
         (run_dir / "input" / "input_manifest.json").read_text(encoding="utf-8")
     )
-    if report.get("camera") != "living-room" or input_manifest.get("camera") != "living-room":
-        raise RuntimeError("run is not living-room-only")
+    room_id = str(report.get("camera") or "").strip()
+    if not room_id or input_manifest.get("camera") != room_id:
+        raise RuntimeError("run report and input manifest room ids do not match")
     patchgraph = np.load(run_dir / "patchgraph.npz")
     scene_doc = json.loads((run_dir / "scene.json").read_text(encoding="utf-8"))
     object_count = len(scene_doc.get("objects", []))
@@ -91,7 +92,7 @@ def validate(run_dir: Path, comparison_run: Path | None) -> dict[str, Any]:
     result: dict[str, Any] = {
         "schema": "noesis.roomform.validation.v1",
         "run_dir": str(run_dir),
-        "camera": "living-room",
+        "camera": room_id,
         "checkpoint_sha256": report["checkpoint_sha256"],
         "source_revision": input_manifest["source_revision"],
         "point_count": input_manifest["point_count"],

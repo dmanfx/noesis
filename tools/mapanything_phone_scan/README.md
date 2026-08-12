@@ -116,10 +116,12 @@ present.
    alignment starts. The tool estimates the phone floor, preserves gravity and
    metric scale, and registers room structure to that camera's validated room
    reconstruction. It also verifies that the selected camera faces its own
-   target cloud. If an imported pose has the common local-X/Z half-turn
-   convention, alignment stops with a calibration error. Correct the camera
-   pose before retrying; the workflow never rotates the authoritative target
-   cloud or silently rewrites the global Noesis calibration.
+   target cloud. If the calibrated pose is valid but the imported target cloud
+   has the common local-X/Z half-turn convention, the alignment copy of that
+   target cloud is rotated 180 degrees about the calibrated camera center and
+   world-up axis. The calibrated camera pose remains unchanged and the report
+   records the correction. Ambiguous cases still fail; the workflow never
+   silently rewrites the global Noesis calibration.
 9. A weak or ambiguous registration fails its quality gate. A passing result
    remains a review candidate until explicitly promoted by a separate workflow.
 
@@ -373,6 +375,33 @@ independent validation target. Adding its RGB/depth as a 49th joint inference
 view did not improve this walk. Live detections and tracks must continue to use
 the exact per-camera calibration; the phone reconstruction supplies the room
 surface and floorplan, not a replacement for calibrated track projection.
+
+### Family Room qualification
+
+The same workflow was repeated for landscape scan
+`20260810-215847-571c6efe`. Its imported static target cloud was reversed
+relative to the valid calibrated Family Room pose: forward visibility changed
+from 0% to 100% after the alignment-only 180-degree target-cloud correction.
+The correction preserved the calibrated camera pose, and every alignment gate
+passed.
+
+| Candidate | Internal median | Held-out median | Static source median | Static target median | Source within 30 cm | Target within 30 cm | Fixed-camera depth delta |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| DA3 | 3.69 cm | 4.66 cm | 10.99 cm | 7.15 cm | 83.2% | 87.0% | 12.65 cm |
+| MapAnything + DA3 pose/depth | 4.41 cm | 5.53 cm | 12.96 cm | 9.29 cm | 81.3% | 77.8% | 13.84 cm |
+| **Prior-conditioned MA + DA3 fusion** | **3.35 cm** | **4.40 cm** | 12.25 cm | 9.37 cm | 82.7% | 78.4% | 12.94 cm |
+
+DA3 alone remained slightly closer to the fixed-camera target, while the
+prior-conditioned fusion retained the best internal and held-out phone-view
+consistency and the cleaner review geometry. The selected scene-prior source is
+therefore `prior_conditioned_consensus_da3_carrier`; DA3 and the unfused
+pose/depth result remain required comparison evidence.
+
+This qualifies a room-local static scene prior only. It does **not** establish
+cross-camera overlap or authorize AMC/MV3DT calibration. The current topology
+has no Living Room/Family Room overlap; the only prospective multi-view edge is
+Kitchen/Family Room, and that edge remains disabled until the Kitchen geometry
+is corrected and synchronized occupied overlap evidence passes review.
 
 ### Reusable commands
 

@@ -52,6 +52,35 @@ def test_load_point_preserving_fusion(tmp_path: Path) -> None:
     np.testing.assert_allclose(cloud.axis_transform, MODULE.DA3_TO_ROOMFORM_Z_UP)
 
 
+def test_phone_provider_accepts_legacy_mapanything_and_da3() -> None:
+    assert MODULE._phone_provider(
+        {"model": {"id": "facebook/map-anything-apache"}}
+    ) == ("mapanything", "facebook/map-anything-apache")
+    assert MODULE._phone_provider(
+        {"provider": "da3", "model_id": "depth-anything/DA3-BASE"}
+    ) == ("da3", "depth-anything/DA3-BASE")
+
+
+def test_family_room_revision_discovery(tmp_path: Path) -> None:
+    revision = tmp_path / "vt_family_room_stream_rgbmesh_1"
+    revision.mkdir()
+    (revision / "manifest.json").write_text(
+        '{"camera":"family-room","created_ts_us":3}', encoding="utf-8"
+    )
+    (revision / "room_points_meta.json").write_text(
+        '{"camera":"family-room",'
+        '"color_source":"mapanything_persisted_zarr_rgb_texture",'
+        '"source":"mapanything_zarr_current_calibration_backprojection_texture_colored"}',
+        encoding="utf-8",
+    )
+    np.savez(
+        revision / "room_points.npz",
+        points=np.zeros((2, 3)),
+        colors=np.zeros((2, 3)),
+    )
+    assert MODULE.find_cached_room_revision(tmp_path, "family-room") == revision
+
+
 def test_revision_discovery_is_living_room_rgb_only(tmp_path: Path) -> None:
     wrong = tmp_path / "vt_living_room_stream_rgbmesh_1"
     wrong.mkdir()

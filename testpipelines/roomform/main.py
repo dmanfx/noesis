@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
-"""Run Roomform locally on a living-room phone reconstruction."""
+"""Run Roomform locally on an aligned room reconstruction."""
 
 from __future__ import annotations
 
 import argparse
 import hashlib
 import json
+import re
 import subprocess
 import sys
 import time
@@ -22,7 +23,8 @@ import trimesh
 REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
-CAMERA_ID = "living-room"
+DEFAULT_ROOM_ID = "living-room"
+ROOM_ID_PATTERN = re.compile(r"[a-z0-9][a-z0-9-]{0,63}")
 EXPECTED_COLOR_SOURCE = "mapanything_persisted_zarr_rgb_texture"
 AXIS_TRANSFORM = np.asarray(
     [
@@ -44,6 +46,7 @@ DA3_TO_ROOMFORM_Z_UP = np.asarray(
 
 @dataclass(frozen=True)
 class CachedCloud:
+    room_id: str
     revision_dir: Path
     source_kind: str
     source_points_path: Path
@@ -82,17 +85,31 @@ def _bounds(points: np.ndarray) -> dict[str, list[float]]:
 def _camera_station(points_meta: dict[str, Any]) -> np.ndarray:
     raw = np.asarray(points_meta.get("extrinsics_col_major"), dtype=np.float64)
     if raw.shape != (16,) or not np.all(np.isfinite(raw)):
-        raise RuntimeError("living-room cache has no valid camera extrinsics")
+        raise RuntimeError("room cache has no valid camera extrinsics")
     matrix = raw.reshape((4, 4), order="F")
     station = matrix[:3, 3]
     if not np.all(np.isfinite(station)):
-        raise RuntimeError("living-room cache has a non-finite camera station")
+        raise RuntimeError("room cache has a non-finite camera station")
     return station.astype(np.float32)
 
 
-def find_cached_living_room_revision(virtual_twin_root: Path) -> Path:
+def _validated_room_id(room_id: str) -> str:
+    value = room_id.strip().lower()
+    if not ROOM_ID_PATTERN.fullmatch(value):
+        raise RuntimeError(
+            "room id must contain only lowercase letters, numbers, and hyphens"
+        )
+    return value
+
+
+def find_cached_room_revision(
+    virtual_twin_root: Path,
+    room_id: str = DEFAULT_ROOM_ID,
+) -> Path:
+    room_id = _validated_room_id(room_id)
     candidates: list[tuple[int, Path]] = []
-    for path in virtual_twin_root.glob("vt_living_room_stream_rgbmesh_*"):
+    revision_prefix = room_id.replace("-", "_")
+    for path in virtual_twin_root.glob(f"vt_{revision_prefix}_stream_rgbmesh_*"):
         manifest_path = path / "manifest.json"
         points_path = path / "room_points.npz"
         meta_path = path / "room_points_meta.json"
@@ -100,9 +117,9 @@ def find_cached_living_room_revision(virtual_twin_root: Path) -> Path:
             continue
         manifest = _read_json(manifest_path)
         meta = _read_json(meta_path)
-        if str(manifest.get("camera")) != CAMERA_ID:
+        if str(manifest.get("camera")) != room_id:
             continue
-        if str(meta.get("camera")) != CAMERA_ID:
+        if str(meta.get("camera")) != room_id:
             continue
         if str(meta.get("color_source")) != EXPECTED_COLOR_SOURCE:
             continue
@@ -113,17 +130,28 @@ def find_cached_living_room_revision(virtual_twin_root: Path) -> Path:
         candidates.append((created, path))
     if not candidates:
         raise RuntimeError(
-            f"no RGB-backed living-room MapAnything reconstruction found under "
+            f"no RGB-backed {room_id} MapAnything reconstruction found under "
             f"{virtual_twin_root}"
         )
     return max(candidates, key=lambda row: row[0])[1]
 
 
-def load_cached_cloud(revision_dir: Path) -> CachedCloud:
+def find_cached_living_room_revision(virtual_twin_root: Path) -> Path:
+    return find_cached_room_revision(virtual_twin_root, DEFAULT_ROOM_ID)
+
+
+def load_cached_cloud(
+    revision_dir: Path,
+    room_id: str = DEFAULT_ROOM_ID,
+) -> CachedCloud:
+    room_id = _validated_room_id(room_id)
     manifest = _read_json(revision_dir / "manifest.json")
     points_meta = _read_json(revision_dir / "room_points_meta.json")
-    if str(manifest.get("camera")) != CAMERA_ID or str(points_meta.get("camera")) != CAMERA_ID:
-        raise RuntimeError("refusing non-living-room cache input")
+    if (
+        str(manifest.get("camera")) != room_id
+        or str(points_meta.get("camera")) != room_id
+    ):
+        raise RuntimeError(f"refusing cache input that is not for {room_id}")
     if str(points_meta.get("color_source")) != EXPECTED_COLOR_SOURCE:
         raise RuntimeError(
             "the Roomform 55M checkpoint needs the RGB-backed MapAnything cache; "
@@ -142,6 +170,7 @@ def load_cached_cloud(revision_dir: Path) -> CachedCloud:
     points = np.ascontiguousarray(points[valid])
     colors = np.ascontiguousarray(colors[valid, :3])
     return CachedCloud(
+        room_id=room_id,
         revision_dir=revision_dir,
         source_kind="fixed_camera_mapanything_cache",
         source_points_path=revision_dir / "room_points.npz",
@@ -162,7 +191,27 @@ def load_cached_cloud(revision_dir: Path) -> CachedCloud:
     )
 
 
-def load_phone_walk_cloud(scan_dir: Path) -> CachedCloud:
+def _phone_provider(outputs_manifest: dict[str, Any]) -> tuple[str, str]:
+    provider = str(outputs_manifest.get("provider") or "").strip().lower()
+    legacy_model = outputs_manifest.get("model", {})
+    legacy_model_id = (
+        str(legacy_model.get("id") or "") if isinstance(legacy_model, dict) else ""
+    )
+    model_id = str(outputs_manifest.get("model_id") or legacy_model_id).strip()
+    if not provider and "map-anything" in model_id.lower():
+        provider = "mapanything"
+    if provider not in {"mapanything", "da3"}:
+        raise RuntimeError(
+            f"unsupported phone-walk provider={provider!r} model_id={model_id!r}"
+        )
+    return provider, model_id
+
+
+def load_phone_walk_cloud(
+    scan_dir: Path,
+    room_id: str = DEFAULT_ROOM_ID,
+) -> CachedCloud:
+    room_id = _validated_room_id(room_id)
     alignment_dir = scan_dir / "alignment"
     points_path = alignment_dir / "aligned_phone_points.glb"
     trajectory_path = alignment_dir / "aligned_camera_trajectory.json"
@@ -178,15 +227,13 @@ def load_phone_walk_cloud(scan_dir: Path) -> CachedCloud:
     if (
         alignment.get("status") != "passed"
         or gate.get("passed") is not True
-        or target.get("camera_id") != CAMERA_ID
+        or target.get("camera_id") != room_id
     ):
         raise RuntimeError(
-            "refusing a phone walk that did not pass living-room alignment gates"
+            f"refusing a phone walk that did not pass {room_id} alignment gates"
         )
     outputs_manifest = _read_json(outputs_manifest_path)
-    model = outputs_manifest.get("model", {})
-    if "map-anything" not in str(model.get("id", "")).lower():
-        raise RuntimeError("refusing a phone walk that is not MapAnything output")
+    provider, model_id = _phone_provider(outputs_manifest)
 
     scene = trimesh.load(points_path, force="scene")
     geometry_name = "phone_mapanything_aligned_rgb"
@@ -219,8 +266,9 @@ def load_phone_walk_cloud(scan_dir: Path) -> CachedCloud:
         )
 
     return CachedCloud(
+        room_id=room_id,
         revision_dir=scan_dir,
-        source_kind="aligned_mapanything_phone_walk",
+        source_kind=f"aligned_{provider}_phone_walk",
         source_points_path=points_path,
         points=points,
         colors=colors,
@@ -229,7 +277,7 @@ def load_phone_walk_cloud(scan_dir: Path) -> CachedCloud:
         manifest=outputs_manifest,
         points_meta={
             "coordinate_frame": coordinate_frame,
-            "color_source": "mapanything_aligned_phone_walk_rgb",
+            "color_source": f"{provider}_aligned_phone_walk_rgb",
         },
         provenance={
             "source_aligned_points_glb": str(points_path),
@@ -238,7 +286,9 @@ def load_phone_walk_cloud(scan_dir: Path) -> CachedCloud:
             "source_alignment_status": alignment.get("status"),
             "source_alignment_admission": alignment.get("admission"),
             "source_frame_count": outputs_manifest.get("view_count"),
-            "source_mapanything_model": model,
+            "source_provider": provider,
+            "source_model_id": model_id,
+            "source_model": outputs_manifest.get("model"),
             "target_revision": target.get("revision_id"),
         },
     )
@@ -247,7 +297,9 @@ def load_phone_walk_cloud(scan_dir: Path) -> CachedCloud:
 def load_point_preserving_fusion(
     cloud_path: Path,
     camera_solution_path: Path,
+    room_id: str = DEFAULT_ROOM_ID,
 ) -> CachedCloud:
+    room_id = _validated_room_id(room_id)
     report_path = cloud_path.parent / "point_preserving_fusion_report.json"
     for path in (cloud_path, camera_solution_path, report_path):
         if not path.is_file():
@@ -287,6 +339,7 @@ def load_point_preserving_fusion(
         )
 
     return CachedCloud(
+        room_id=room_id,
         revision_dir=cloud_path.parent,
         source_kind="da3_mapanything_point_preserving_fusion",
         source_points_path=cloud_path,
@@ -321,7 +374,7 @@ def write_roomform_scan(
     stations_z_up = np.ascontiguousarray(
         cloud.stations @ cloud.axis_transform.T, dtype=np.float32
     )
-    scan_stem = f"living-room-{cloud.source_kind.replace('_', '-')}"
+    scan_stem = f"{cloud.room_id}-{cloud.source_kind.replace('_', '-')}"
     scan_npz = input_dir / f"{scan_stem}.npz"
     np.savez_compressed(
         scan_npz,
@@ -333,7 +386,7 @@ def write_roomform_scan(
     trimesh.PointCloud(points_z_up, colors=cloud.colors).export(scan_ply)
     provenance = {
         "schema": "noesis.roomform.input.v2",
-        "camera": CAMERA_ID,
+        "camera": cloud.room_id,
         "source_kind": cloud.source_kind,
         "source_revision": cloud.revision_dir.name,
         "source_revision_dir": str(cloud.revision_dir),
@@ -517,6 +570,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--roomform-root", type=Path, required=True)
     parser.add_argument("--checkpoint", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
+    parser.add_argument("--room-id", default=DEFAULT_ROOM_ID)
     parser.add_argument(
         "--virtual-twin-root",
         type=Path,
@@ -540,6 +594,7 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
+    room_id = _validated_room_id(args.room_id)
     output_dir = args.output_dir.expanduser().resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
     roomform_root = args.roomform_root.expanduser().resolve()
@@ -555,18 +610,23 @@ def main() -> int:
         cloud = load_point_preserving_fusion(
             args.fusion_cloud_npz.expanduser().resolve(),
             args.fusion_camera_solution.expanduser().resolve(),
+            room_id,
         )
     elif args.phone_scan_dir is not None:
-        cloud = load_phone_walk_cloud(args.phone_scan_dir.expanduser().resolve())
+        cloud = load_phone_walk_cloud(
+            args.phone_scan_dir.expanduser().resolve(),
+            room_id,
+        )
     else:
         revision = (
             args.source_revision.expanduser().resolve()
             if args.source_revision is not None
-            else find_cached_living_room_revision(
-                args.virtual_twin_root.expanduser().resolve()
+            else find_cached_room_revision(
+                args.virtual_twin_root.expanduser().resolve(),
+                room_id,
             )
         )
-        cloud = load_cached_cloud(revision)
+        cloud = load_cached_cloud(revision, room_id)
     print(
         f"[roomform] source={cloud.source_kind} points={len(cloud.points):,} "
         f"stations={len(cloud.stations)}",
@@ -661,7 +721,7 @@ def main() -> int:
     report = {
         "schema": "noesis.roomform.run.v1",
         "created_at": datetime.now(timezone.utc).isoformat(),
-        "camera": CAMERA_ID,
+        "camera": cloud.room_id,
         "source_kind": cloud.source_kind,
         "roomform_commit": _git_commit(roomform_root),
         "checkpoint": str(checkpoint),

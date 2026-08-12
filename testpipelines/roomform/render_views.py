@@ -72,6 +72,7 @@ def render(run_dir: Path, output_dir: Path) -> list[Path]:
     evidence = np.load(run_dir / "evidence.npz")
     patchgraph = np.load(run_dir / "patchgraph.npz")
     report = json.loads((run_dir / "run_report.json").read_text(encoding="utf-8"))
+    room_label = str(report.get("camera") or "room").replace("-", " ")
     scene_doc = json.loads((run_dir / "scene.json").read_text(encoding="utf-8"))
     vox = float(report["evidence"]["vox_m"])
     occ_cells = np.argwhere(evidence["occ"] > 0)
@@ -192,7 +193,7 @@ def render(run_dir: Path, output_dir: Path) -> list[Path]:
             pane.set_edgecolor((0.3, 0.35, 0.4, 0.35))
         axis.grid(True, alpha=0.18)
         axis.set_title(
-            "Roomform 55M + local PTv3 — living-room phone walk — "
+            f"Roomform 55M + local PTv3 — {room_label} phone walk — "
             f"{name.replace('_', ' ')}",
             color="#f2f5f8",
             fontsize=14,
@@ -231,7 +232,7 @@ def render(run_dir: Path, output_dir: Path) -> list[Path]:
     draw = ImageDraw.Draw(sheet)
     draw.text(
         (24, 24),
-        "Roomform + local PTv3 living-room phone walk — four model-space views",
+        f"Roomform + local PTv3 {room_label} phone walk — four model-space views",
         fill="#f2f5f8",
     )
     for index, image in enumerate(images):

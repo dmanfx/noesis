@@ -13,6 +13,623 @@ Use this file to record non-trivial design choices made during the DS8 migration
 
 ## Entries
 
+- **Date:** 2026-08-11
+- **Author:** Codex
+- **Area:** Room-walk fusion, static-world alignment, and Scene Prior promotion
+- **Decision:** Use the consistency-gated, prior-conditioned MapAnything + DA3
+  reconstruction with the DA3 trajectory as pose carrier for approved room
+  priors. Keep reconstruction inputs phone-only; use the calibrated static
+  reconstruction afterward as world-frame alignment authority and independent
+  validation evidence. Do not add the static RGB/depth frame to the joint model
+  batch because the controlled Living Room variant did not improve quality.
+- **Decision:** When forward-visibility evidence proves that an imported static
+  target cloud has the local-X/Z half-turn convention but the calibrated camera
+  pose is valid, rotate only the alignment working copy of the target cloud 180
+  degrees about the calibrated camera center and world-up axis. Preserve the
+  deployed camera calibration and record the correction in the alignment
+  report; fail ambiguous cases.
+- **Decision:** Publish approved geometry as an immutable 2.5 cm Scene Prior in
+  `shadow` mode. The phone reconstruction supplies static room evidence; live
+  producer-owned tracking and its calibrated projection remain authoritative.
+- **Decision:** Reuse the Depth drawer's established Obstacles, Heightfield,
+  Point cloud, and Visible floor modes for promoted room evidence instead of
+  adding fusion/prior-specific duplicate subtabs. Select the dedicated
+  fixed+phone obstacle, surface, point, and floor-support products per view;
+  fall back to the conditioned prior and then the live cache only when the
+  stronger per-view product is unavailable. All four views use camera-right
+  toward screen-right and camera-forward toward screen-up.
+- **Rationale:** The conditioned fusion produced the cleanest furniture and
+  floorplan representation while retaining the best phone-walk internal and
+  held-out consistency. Separating phone reconstruction from static alignment
+  prevents circular validation, and correcting reversed target evidence at its
+  own boundary avoids corrupting a valid global camera pose. Reusing stable UI
+  representations keeps comparisons meaningful while allowing better evidence
+  to improve their geometry without multiplying controls by data source.
+- **Validation:** Family Room scan `20260810-215847-571c6efe` passed alignment
+  after target forward visibility improved from 0% to 100% with the recorded
+  half-turn correction. The selected fusion measured 3.35 cm internal and 4.40
+  cm held-out median reprojection error, 12.25 cm/9.37 cm static source/target
+  medians, and 12.94 cm fixed-camera depth delta. Scene Prior
+  `sceneprior_family-room_20260811T015847Z_b2e023e59271` was promoted as
+  deployment `deploy-20260811-family-room-conditioned-prior-v2-ds9`; live REST
+  readback returned its exact 1,358,760-byte GLB with SHA-256
+  `df980fa615db93f1c9f60dcae52f7acedb70646f42375e1786fb024aca4b325d`.
+- **References:** `tools/mapanything_phone_scan/README.md`,
+  `docs/scene_prior_v1.md`, `tools/mapanything_phone_scan/alignment.py`,
+  `tools/mapanything_phone_scan/build_conditioned_scene_prior_bundle.py`.
+
+- **Date:** 2026-08-08
+- **Author:** Codex
+- **Area:** Mosaic H.264 transport, WebRTC lifecycle, and quality defaults
+- **Decision:** The canonical dashboard path is one GPU mosaic encode followed
+  by byte-stream, AU-aligned SHM fanout: `sink_tee →` bounded leaky raw queue
+  `→ nvvideoconvert → noesisforceidr → nvv4l2h264enc → h264parse →` bounded
+  non-leaky AU queue `→ shmsink`. One process-wide feeder reads
+  `shmsrc → h264parse → appsink` and copies complete AUs to bounded per-peer
+  `appsrc → rtph264pay →` bounded non-leaky RTP queue `→ webrtcbin` pipelines.
+  RTSP is disabled by default and remains optional tooling only. The active
+  3840x720 profile uses 12,000 kbps CBR and `iframeinterval=10`,
+  `idrinterval=10`; the former RTSP-prefixed H.264 keys and component names are
+  retired.
+- **Rationale:** This removes localhost UDP backlog, RTSP re-consumption, and
+  double RTP packetization from browser delivery. Only the raw pre-encode queue
+  is deliberately leaky, protecting analytics without dropping compressed
+  frames mid-GOP. Slow-peer admission rejects a newly arriving whole AU only
+  for that peer, requests a fresh IDR, and never drops individual RTP packets.
+  Twelve Mbps, rather than the proposed eight-Mbps starting point, gives the
+  3840x720/30 composite additional headroom for three moving scenes, OSD edges,
+  and the short GOP; it remains a measurable starting floor, not a substitute
+  for occupied-scene appliance acceptance.
+  The feeder proves the SHM socket, PLAYING state, and first AU before startup
+  succeeds; unexpected feeder error/EOS is runtime-fatal. Peer rebuild and
+  shutdown serialize against AU push, gateways do not mutate the WebSocket
+  registry while rebuilding, and the signaling server is the sole strong owner
+  of live/retiring slots. A gateway bus error or unexpected EOS retires and
+  stops only that slot; failed factory registration also stops the unregistered
+  pipeline. RTP output moves from the drain to `webrtcbin` only under the
+  blocking-pad probe; failure does not fall back to an unsafe direct relink.
+  Timestamps are regenerated in each peer clock domain, and all feeder/gateway
+  callbacks share one ref-counted default GLib context driver.
+- **Validation:** Focused bridge/gateway, topology, runtime-wiring, canary, and
+  plugin tests cover queue bounds, path ownership, startup failure, peer reset,
+  shutdown, config parity, and decoded-media gating. A local NVIDIA encoder
+  probe produced IDR NALs at frames 0/10/20/30/40 with `10/10`; the rejected
+  `10/1` setting produced an IDR for all 45 frames. With the natural GOP set to
+  `100/100`, a `noesisforceidr` request after output frame 14 was acknowledged
+  by the trigger's monotonic property contract and NVENC emitted frame 15 as the only
+  additional non-delta frame, proving that late-peer recovery does not depend
+  on RTSP. Local end-to-end signaling tests carried synthetic AU-aligned H.264
+  through `shmsink`, the shared feeder, the actual `WebSocketServer`, and one
+  and then two simultaneous gateways; the single peer decoded 158/159 received
+  RTP packets and both concurrent peers decoded 159/160. Live-camera dashboard
+  transport acceptance on 2026-08-09 deployed
+  `deploy-20260809-mosaic-shm-v2-ds9` on top of the retained semseg Small/Large
+  v12 work. The live SHM stream delivered 240 complete AUs in 9.822 seconds
+  (24.43 fps, 9.82 Mbit/s, 24 keyframes), one peer decoded 307 frames in 10
+  seconds, and two simultaneous peers decoded 221 and 220 frames. All six
+  appliance units remained active, with no listener on UDP 5400 or RTSP 8554
+  and no severe media signature in the startup/peer lifecycle log. The
+  occupied-person visual motion check described in `docs/DS8_testing_guide.md`
+  remains the subjective artifact-closure gate.
+- **Supersedes:** The Grok entry immediately below and older entries that call
+  RTSP ingress, leaky post-payloader queues, or always-open RTSP the canonical
+  WebRTC path.
+- **References:** `noesis/mosaic_h264_bridge.py`,
+  `noesis/mosaic_glib_context.py`, `noesis/mosaic_webrtc_gateway.py`,
+  `noesis/pipelines/ds8_pipeline.py`, `DS9/noesis/pipelines/ds8_pipeline.py`,
+  `scripts/ds8_runtime_30s_gate.py`, `docs/DS8_testing_guide.md`.
+
+- **Date:** 2026-08-08
+- **Author:** Grok
+- **Area:** Mosaic encode / WebRTC delivery
+- **Status:** Superseded by the Codex decision above. In particular,
+  `idrinterval=1` is not the final setting on this encoder.
+- **Decision:** Replace the localhost UDP RTSP handoff and RTSP→depay→re-pay
+  WebRTC path with a single encode → SHM AU publish → one `rtph264pay` into
+  `webrtcbin`. Pre-encode queue remains leaky; all post-encode AU/RTP queues
+  are non-leaky. Default GOP is IDR every 10 frames (`iframeinterval=10`,
+  `idrinterval=1`). Optional RTSP via `nvrtspoutsinkbin` is tooling-only and no
+  longer required for the dashboard.
+- **Rationale:** Live diagnosis showed UDP `:5400` Recv-Q saturation, ~1–2 Mbps
+  delivered vs 24 Mbps configured, and sticky motion-region macroblocking from
+  mid-GOP loss. Double re-packetization and leaky post-encode queues amplified
+  temporal error propagation. SHM AU fanout plus a single RTP payloader removes
+  those failure modes while keeping main-pipeline isolation via the pre-encode
+  leaky queue.
+- **References:** `noesis/mosaic_h264_bridge.py`, `noesis/mosaic_webrtc_gateway.py`,
+  `DS9/noesis/pipelines/ds8_pipeline.py`, `noesis/pipelines/ds8_pipeline.py`,
+  `config/infer.yaml`, `DS9/config/infer.yaml`.
+
+- **Date:** 2026-07-29
+- **Author:** Codex
+- **Area:** Camera-local BEV coverage and floorplan rendering
+- **Decision:** Keep the active MapAnything floorplan as the exact raster,
+  snapshot, grid, and normalization authority, while allowing a camera to
+  declare a separate versioned union of semantic coverage polygons in
+  `camera_local_ground_m`. The living-room camera declares the projected
+  Living Room and Foyer envelopes. Polygon membership owns floor-contact
+  admission; a small boundary tolerance admits measurement uncertainty without
+  moving or clipping coordinates. Display bounds cover both surfaces, but the
+  dashboard renders the floorplan only inside its original metric bounds and
+  leaves the added semantic area visibly unknown.
+- **Rationale:** One MapAnything capture rectangle is observed depth extent, not
+  the complete walkable camera FoV. Expanding that rectangle or stretching its
+  raster would admit invalid corner space and corrupt alignment. A polygon
+  union represents the non-rectangular room-plus-foyer shape while keeping
+  Noesis independent of a runtime Menon query. DS8 and DS9 consume the same
+  strict contract and identical configured geometry.
+- **Validation:** Coverage parser and semantic-gate characterization pass 31/31
+  canonical BEV tests and 15/15 DS9 parity tests. TypeScript no-emit and a
+  production oai2-fe build pass. Live occupied validation remains pending.
+- **References:** `noesis/telemetry/bev.py`, `config/infer.yaml`,
+  `DS9/config/infer.yaml`, `docs/DS8_api_contracts_ws.md`.
+
+- **Date:** 2026-07-28
+- **Author:** Codex
+- **Area:** Guided alignment operator and DS8/DS9 calibration contract
+- **Decision:** Keep guided calibration capture inside the canonical runtime as
+  one bounded owner-authenticated session shared by DS8 and DS9. Menon supplies
+  an immutable scene binding and exact authored-model waypoints, then selects a
+  run-local tracklet from image-only active-track data at every arrival. Camera
+  rotation and physical-depth candidates use the inverse captured active
+  similarity plus exact image/depth evidence; current producer world points and
+  the optional global-similarity fit are diagnostic only. The calibration
+  bundle publishes an authoritative digest over its similarity matrix and
+  scale, which must travel as one authority.
+- **Rationale:** Using current world position to choose the walker or derive the
+  physical target made the calibration validate itself and failed exactly at
+  the room extremes being repaired. Browser-side float hashing and mixing
+  `scene_similarity.matrix` with legacy `align.units` also allowed an
+  unverifiable binding and a 92.5x metric error.
+- **Validation:** Focused alignment, REST lifecycle/auth, concurrency, manager
+  digest, and DS8/DS9 parity tests pass. Synthetic guided evidence retains
+  admissible camera rotation/depth candidates with all producer final-world
+  samples invalid.
+- **References:** `noesis/server/alignment_walk_api.py`,
+  `noesis/validation/alignment_walk.py`,
+  `noesis/calibration/manager.py`, `docs/DS8_api_contracts_rest.md`,
+  `docs/DS8_api_contracts_ws.md`.
+
+- **Date:** 2026-07-19
+- **Author:** Codex
+- **Area:** Guided physical alignment calibration evidence
+- **Decision:** Treat a measured waypoint as one exact, deterministic
+  nearest-marker source sample after multi-person tracklet assignment. Bind it
+  to camera, frame, media PTS, image foot and size, K, E, calibration and
+  similarity digests, raw/registered depth, every producer world stage, and a
+  known Menon XYZ. Similarity candidates may use only explicitly declared
+  `fit` waypoints; `holdout` waypoints remain untouched and are reported
+  separately. Per camera, use FIT-only rays for a proper fixed-center
+  Wahba/Kabsch rotation candidate, reject reflective or degenerate evidence,
+  and use the candidate E plus real post-marker FIT frames with the verified
+  monotonic piecewise fitter to map raw DAv2 range to physical optical Z.
+  Candidate output is advisory and never writes active config.
+- **Rationale:** Window medians can hide frame provenance and allow a fitted
+  transform to validate itself. Exact cohort evidence makes image geometry,
+  fixed-camera-center rotation, physical depth registration, producer-stage
+  divergence, and independent holdout error reproducible without UI smoothing
+  or an implicit calibration mutation.
+- **Validation:** `python3 -m pytest -q tests/test_alignment_walk.py` passed 14
+  tests; targeted Python compilation and Ruff checks passed.
+- **References:** `noesis/validation/alignment_walk.py`,
+  `scripts/noesis_alignment_walk.py`, `docs/DS8_testing_guide.md`.
+
+- **Date:** 2026-07-19
+- **Author:** Codex
+- **Area:** DS8/DS9 canonical person-world alignment and trail continuity
+- **Decision:** Treat each physical tracker lifecycle as the estimator key; reject
+  impossible motion, permit relocation only after three mutually consistent
+  observations, and increment a durable trail-segment generation on
+  reacquisition. Commit source hysteresis only after physical admission. Bind a
+  strict per-camera measurement policy to the exact calibration and
+  lane-specific depth-registration artifacts: family room is floor-only,
+  kitchen is registered-depth-only with no floor fallback, and living room
+  now also requires registered depth. Before any floor ray can seed height lock
+  or filter state, apply a 22 m camera-to-hit horizontal range envelope; retain
+  rejected geometry only as diagnostics and continue to admit an independent
+  valid registered-depth observation. Menon continues to apply the
+  authored world-to-scene transform exactly once; it does not clamp or repair
+  producer coordinates.
+- **Rationale:** The July 18 guided walk separated camera-specific measurement
+  bias from presentation alignment: one global admission rule could not keep all three
+  rooms contained. Rejecting teleports without a bounded reacquisition path
+  caused flicker, while a one-frame trail-break pulse could be missed by a
+  cadenced consumer. Calibration-bound policies correct the producer evidence
+  without hiding geometry errors behind smoothing or UI offsets. Two July 19
+  journal tails then showed a clean physical separation: plausible family and
+  living floor rays ended below 20.76 m, while the near-horizon outlier cluster
+  began at 26.15 m and reached 148.26 m. Living-room depth-backed observations
+  remained on the authored floor while its live floor-only observations did
+  not, justifying the depth-required profile.
+- **Validation:** Focused policy, estimator, hook, BEV, recorder, and DS9 parity
+  suites passed, including exact DS8/DS9 gate parity. Release
+  `release-20260719-181000-floor-ray-admission-v19` then completed a 600-second
+  oai2-to-Menon acceptance with 10,870 tracking frames, 19,694 policy-bound
+  observations, and zero parse errors or service restarts. The gate rejected
+  1,721 over-range family-room rays and two living-room rays; zero rejected
+  rays became valid or floor-only world state. An exact promoted-model audit
+  placed all 3,055 accepted source samples in the sealed journal tail on the
+  authored 139-triangle floor union.
+- **References:** `config/world_measurement_fusion_policy.json`,
+  `noesis/calibration/world_fusion_policy.py`,
+  `noesis/telemetry/person_ground_state.py`,
+  `noesis/validation/alignment_walk.py`.
+
+- **Date:** 2026-07-11
+- **Author:** Codex
+- **Area:** DS8/DS9 synthetic lifecycle test backend
+- **Decision:** Keep the pure-Python pipeline stub as a truthful, explicitly
+  selected test backend. It implements readable property nodes, synthetic
+  analytics receipts, monotonic asynchronous orderly-EOS acknowledgement, a
+  typed synthetic callback, and blocking wait semantics. Its exact
+  lifecycle identity is `backend=synthetic_stub`, `native_runtime=false`, and
+  `promotable=false`. DS8 and DS9 use their own selectors; a DS8 selector does
+  not activate the DS9 backend. Spawned tools isolate all mutable build,
+  analytics, depth, world, and household identity state under a private
+  temporary home while retaining read-only absolute secret inputs.
+- **Rationale:** The former no-op object could activate and return immediately
+  but could neither satisfy native property reads nor block for shutdown. Stub
+  smokes therefore crashed at analytics startup and then hung until forced
+  termination, while a superficially passing result could be confused with
+  native lifecycle evidence. Modeling the control protocol makes CPU harness
+  tests useful without weakening native EOS, media, GPU, or promotion gates.
+- **Validation:** Focused synthetic lifecycle, Service Maker shutdown, pipeline,
+  inference-contract, zero-copy boundary, and EOS graph tests pass. Three-second
+  isolated-state spawned smokes passed for DS8 (four samples, boundary p99
+  `0.724547 ms`) and DS9 (four samples, `0.739423 ms`); both had zero errors/violations, every
+  lifecycle marker, exit `0`, no forced kill, and the exact non-promotable
+  evidence record.
+- **References:** `noesis_core/servicemaker_shutdown.py`,
+  `noesis/pipelines/ds8_pipeline.py`,
+  `DS9/noesis/pipelines/ds8_pipeline.py`,
+  `DS9/noesis/ds9_runtime.py`,
+  `tests/test_synthetic_stub_lifecycle.py`, `docs/DS8_testing_guide.md`.
+
+- **Date:** 2026-07-11
+- **Author:** Codex
+- **Area:** DS8/V3DT/DS9 WebSocket truth, collection health, and media readiness
+- **Decision:** Require explicit response-construction timing on every
+  producer-created JSON payload before send, broadcast, or coalescing. Assemble
+  the 3 ms WebSocket total from response construction, publisher and serializer
+  handoff, NumPy conversion, JSON encoding, and local send dispatch; exclude
+  provider/domain work, intentional coalescing dwell, and network flow control.
+  Bound blocking providers before executor submission and expose stable
+  `provider_capacity_exceeded` RPC errors. Live zero-copy collectors require p99
+  and error-counter truth on every sample and reject nonzero or growing boundary
+  errors. V3DT shares DS8/DS9 successful-DESCRIBE readiness and warm-one,
+  demand-created WebRTC capacity.
+- **Rationale:** Untimed producers made the metric optional, saturated provider
+  queues leaked implementation prose, missing samples could pass a live gate,
+  and V3DT could call an open-but-503 RTSP port ready while eagerly allocating
+  every gateway. Central admission and exact evidence make false success
+  structurally impossible without charging network backpressure to a CPU-only
+  budget.
+- **Validation:** WebSocket/provider adversarial tests passed (45); the focused
+  boundary, stats, shutdown, WebRTC, MapAnything, and DS9 matrix passed (242).
+  Follow-up zero-copy tracker tests passed (21), DS8/V3DT/DS9 media/canary tests
+  passed (115), and the DS9 RTSP suite passed independently (3).
+- **References:** `websocket_server.py`, `noesis/telemetry/publishers.py`,
+  `noesis/telemetry/bev.py`, `scripts/zero_copy_boundary_diagnostics.py`,
+  `scripts/ds8_runtime_30s_gate.py`, `noesis/ds8_runtime_v3dt_reimpl.py`,
+  `docs/DS8_api_contracts_ws.md`, `docs/DS8_testing_guide.md`.
+
+- **Date:** 2026-07-11
+- **Author:** Codex
+- **Area:** DS8/V3DT/DS9 REST serialization truth and zero-copy admission
+- **Decision:** Preserve FastAPI's normal `response_model` path as the only REST
+  renderer. Endpoint handlers store model-assembly timing metadata on the
+  request; a shared `APIRoute` wrapper observes the framework's completed byte
+  response, records its exact length, and includes worker handoff, response-
+  model validation/filtering, the actual render, and response creation in the
+  3 ms total. Keep pooled percentiles as diagnostics, but make the conservative
+  maximum p99 across every budgeted path and both true monotonic rolling 10- and
+  60-second windows the admission truth. Cap detailed route/stage/error
+  cardinality and every live sample buffer; saturation forces the affected
+  window above budget until expiry. Runtime stats use a compact getter with at
+  most eight ranked budget paths. Require every successful product route using
+  the wrapper to declare either measurement or a named exemption. Measure all
+  41 JSON routes; exempt only the four already-rendered verified scene artifacts
+  and one virtual-twin file response. Keep v1 household resident CRUD and
+  identity health as exact source/OpenAPI/wire parity between DS8 and DS9.
+- **Rationale:** The previous helper called `model_dump` plus `json.dumps` on a
+  surrogate and then returned the original model for FastAPI to validate and
+  render again. Its timing and byte count therefore described bytes that were
+  never sent, could disagree with aliases or exclusion settings, and added work
+  to the measured path. Count-only pooled deques could also retain stale samples
+  indefinitely and hide a low-volume slow endpoint behind high-volume fast
+  traffic; even a bounded overflow bucket could dilute one slow route. Observing
+  the one real response, using overflow max, and failing closed on sample
+  saturation removes those false claims without changing any REST schema,
+  status, or header. Tagged counters distinguish local model/validation/render
+  failures from provider and network failures, while compact stats avoid the
+  measured ~47 ms cost of building full detail during ordinary polling.
+- **Validation:** The focused REST/auth/zero-copy/DS9 supervisor matrix passed
+  171 tests. An independent adversarial re-run passed 29/29 and verified
+  sync-worker handoff inclusion, provider exclusion, exact one-render byte
+  observation, undiluted route totals, and sparse-path rolling-window authority.
+  Follow-up tests cover tagged errors, cardinality overflow, high-rate sample
+  saturation/expiry, bounded compact offender diagnostics, complete response-
+  assembly timing, and DS8/DS9 resident OpenAPI/wire parity. Ruff, Python
+  compilation, diff whitespace, and docs consistency checks pass.
+- **References:** `noesis/server/boundary_metrics.py`,
+  `DS9/noesis/server/boundary_metrics.py`,
+  `tests/test_rest_boundary_metrics.py`,
+  `tests/test_rest_product_boundary_coverage.py`,
+  `tests/test_zero_copy_boundary_budget.py`,
+  `tests/test_reid_ds9_parity.py`,
+  `plans/zero_copy_gpu/03_boundary_serialization_contract.md`,
+  `docs/DS8_api_contracts_rest.md`.
+
+- **Date:** 2026-07-11
+- **Author:** Codex
+- **Area:** DS8/DS9 capability health, WebSocket boundary metrics, and shutdown proof
+- **Decision:** Use the world snapshot publication timestamp, not the aggregate
+  entity observation-window endpoint, as capability progress time; preserve the
+  latter as `world_observed_end_us` evidence. Keep the 3 ms WebSocket boundary
+  total assembled: producer-to-loop dispatch, serializer-worker dispatch,
+  conversion, JSON encoding, and local send dispatch all count. Preserve each
+  stage separately, exclude only intentional coalescing dwell, and isolate large
+  JSON work on one prewarmed owned executor. Propagate closed-client exceptions to the connection
+  lifecycle handler, classify normal/abrupt disconnects below `ERROR`, and
+  require listener coroutine plus worker-thread quiescence before runtime
+  shutdown can complete. All blocking WebSocket providers use a second bounded
+  owned executor with admission leases. Shutdown closes and drains REST and WS
+  providers, stops gateways/listener, closes depth admission, proves pipeline
+  EOS/wait, joins MapAnything postprocess, and only then releases storage.
+  Attached live-validation behavior directories must be exact owner-owned mode
+  `0700` directories.
+- **Rationale:** Interleaved camera removal legitimately made a newer world
+  snapshot's aggregate `observed_end_us` regress while sequence and publication
+  time advanced. The first final-baseline DS9 session exposed real assembled
+  boundary delay and repeatedly processed already closed gate clients. Treating
+  executor or event-loop dispatch as a non-budget CPU diagnostic would have
+  weakened the authoritative contract. Dedicated workers remove avoidable
+  contention while the unchanged total still fails on actual queue or send
+  delay. Provider admission leases are necessary because canceling an asyncio
+  waiter cannot stop a running executor callback from reopening depth or
+  touching storage during teardown. Separating content time, producer progress,
+  boundary stages, and client lifecycle preserves fail-closed gates without
+  fabricating monotonic world content or redefining the threshold.
+- **Validation:** Focused health/world replay, WebSocket timing/disconnect,
+  strict shutdown, behavior-directory, zero-copy diagnostic, live-runner, and
+  supervisor tests passed in the original repair (`228 passed`). Follow-up
+  boundary/lifecycle regressions cover delayed executor, event-loop, and send
+  dispatch; intentional coalescing exclusion; provider cancellation/drain; Map
+  ordering; and blocked Uvicorn sync handlers. A fresh DS9 live session is still
+  required before promotion.
+- **References:** `noesis/telemetry/publishers.py`,
+  `DS9/noesis/telemetry/publishers.py`, `websocket_server.py`,
+  `scripts/zero_copy_boundary_diagnostics.py`,
+  `DS9/scripts/ds9_live_validation_runner.py`, `noesis/ds8_runtime.py`,
+  `noesis/ds8_runtime_v3dt_reimpl.py`, `DS9/noesis/ds9_runtime_core.py`.
+
+- **Date:** 2026-07-11
+- **Author:** Codex
+- **Area:** DS9 / typed ownership selector closure
+- **Decision:** Make the exact validated `runtime_image_id` a required field of
+  both `asset_realization` and inherited `runtime_session` selectors. The
+  selector builder reads it from the tracked manifest's runtime-image authority;
+  typed validation requires exact equality; promotion stores it in the artifact
+  binding and repeats it during terminal artifact CAS before registry append.
+- **Rationale:** Asset validation already returned the runtime image as a
+  validated detail, but the closed selector key set and builder omitted it.
+  Terminal CAS therefore compared a six-field selector-derived binding with a
+  seven-field validated result and could never succeed. Dropping the extra field
+  would weaken the intended image binding; carrying it through the closed
+  contract fixes the mismatch and ensures image drift invalidates both realized
+  and live promotions.
+- **References:** `DS9/scripts/validate_runtime_ownership.py`,
+  `DS9/scripts/promote_runtime_ownership_evidence.py`,
+  `DS9/tests/test_runtime_ownership_typed_evidence.py`,
+  `DS9/tests/test_runtime_ownership_promotion_cli.py`,
+  `DS9/docs/runtime_ownership_evidence.md`.
+
+- **Date:** 2026-07-11
+- **Author:** Codex
+- **Area:** DS9 / realization provenance across engine maintenance
+- **Decision:** Permit multiple source/manifest-rebase realization components
+  only when the gap between them is an independently validated engine-
+  maintenance interval: component timestamps and evidence chronology must be
+  strictly ordered, and the next component's realized-engine inventory must be
+  a monotonic superset of the prior terminal inventory. Continue rejecting
+  branches, ambiguous predecessors, cycles, dropped engines, overlapping
+  timestamps, and backdated evidence. A terminal not equal to the current
+  realization retains the same monotonic-superset and advancing-time rule.
+- **Rationale:** Engine maintenance legitimately changes the realization hash
+  and may add engine records without changing either source-contract or asset-
+  manifest authority, so it emits no authority-rebase edge. A later non-engine
+  manifest rebase otherwise appears disconnected even though both adjacent
+  rebase transactions and every final engine record validate exactly. Bounded
+  chronological components preserve that legitimate history without treating
+  an arbitrary disconnected graph as authoritative.
+- **References:** `DS9/scripts/validate_asset_manifest.py`,
+  `DS9/tests/test_source_contract_rebase_chain_validator.py`,
+  `DS9/scripts/rebase_asset_realization.py`.
+
+- **Date:** 2026-07-11
+- **Author:** Codex
+- **Area:** V3DT / canonical world boundary and promotion evidence
+- **Decision:** Supersede the 2026-07-10 camera-local V3DT hold. The active
+  calibration and locked camInfo cohort define one shared metric frame. Preserve
+  `bbox3d` and `velocity3d` as profile-specific tracker-tuple diagnostics; derive
+  the ground endpoint with this profile's Z-up `zLen`, apply the exact configured
+  signed-permutation (`xzy`), and publish only the result as Y-up
+  `backend_world_m`. This Z-up extent rule is a property of the locked camInfo
+  profile, not a blanket reinterpretation of the SDK's default
+  `NvDsObj3DBbox` convention. Preserve native tracker `image_foot` separately
+  from the independently projected opposite-endpoint `image_base`. Missing or
+  malformed axis/bbox state, and a pre-seeded point in another frame, fail
+  closed instead of selecting a V3DT ray-plane fallback.
+- **Promotion boundary:** Accept only privacy-safe global-world v2 source/report
+  evidence from the exact same sealed DS9 supervisor session. Bind exact runtime
+  identity and effective pipeline/tracker/camera/calibration/alignment/camInfo
+  hashes; require all-camera continuity, typed/native-meta coverage, old raw
+  tuple rejection, floor consistency, native image-foot reprojection no worse
+  than 40 px p95, and exact image-base replay. Reject v1, skipped required
+  companion gates, stale sessions, and config drift. Do not derive room,
+  overlap, time-sync, peer-ID, or MV3DT fused-position claims from this SV3DT
+  evidence.
+- **Rationale:** The generator right-multiplies world-to-camera extrinsics by the
+  axis permutation, so publishing the tracker tuple unchanged silently permutes
+  public space. A report that merely restates that same tuple or reprojects the
+  same endpoint is self-confirming. One shared conversion implementation and an
+  independently replayed, session/config-bound gate make DS8 and DS9 agree while
+  keeping MV3DT acceptance honest and separate.
+- **References:** `noesis_core/v3dt_validation.py`,
+  `noesis/pipelines/hooks.py`, `noesis/pipelines/hooks_v3dt_reimpl.py`,
+  `DS9/noesis/pipelines/hooks.py`,
+  `DS9/scripts/v3dt_world_contract_smoke_test.py`,
+  `DS9/scripts/validate_runtime_ownership.py`,
+  `docs/DS8_metadata_contracts.md`, `docs/DS8_api_contracts_ws.md`.
+
+- **Date:** 2026-07-11
+- **Author:** Codex
+- **Area:** Tracking telemetry / canonical world liveness
+- **Decision:** Treat a zero-person tracker frame as positive source evidence,
+  not absence of telemetry. Publish the count transition immediately, then an
+  advancing per-camera empty heartbeat at
+  `NOESIS_TRACKING_EMPTY_HEARTBEAT_HZ` (default 2 Hz). Carry top-level frame
+  identity/timing on every tracking envelope. On an empty source frame, remove
+  that exact camera/source/run observation from world fusion immediately while
+  retaining its observation-order watermark.
+- **Rationale:** Suppressing empty frames makes downstream clients retain stale
+  people and makes a healthy zero-person camera indistinguishable from a
+  stalled producer. Retaining fusion evidence until TTL duplicates tracker
+  occlusion policy and leaves stale world entities after the tracker has
+  authoritatively reported zero. A bounded heartbeat preserves liveness without
+  journaling or broadcasting camera frame rate forever, and retained ordering
+  prevents delayed pre-clear observations from becoming current again.
+- **References:** `noesis/telemetry/publishers.py`,
+  `noesis/pipelines/hooks.py`, `noesis/pipelines/hooks_v3dt_reimpl.py`,
+  `DS9/noesis/pipelines/hooks.py`, `noesis_core/world/fusion.py`,
+  `noesis_core/world_service.py`, `scripts/roi_reload_smoke_test.py`,
+  `docs/DS8_api_contracts_ws.md`
+
+- **Date:** 2026-07-10
+- **Author:** Codex
+- **Area:** Analytics / native exclusion / transactional REST reload
+- **Decision:** Make the repo-owned pre-tracker `nvdsroiexclude` element the
+  sole canonical exclusion path in baseline DS8, V3DT, and DS9; retire
+  `attach_exclude_prune_hook` and every Python metadata-pruning fallback. Keep
+  byte-identical owned C++ source mirrors but build separate exact-major DS8 and
+  DS9 binaries. Require exact canonical source coverage, at least one polygon
+  for each enabled stream, and allow an empty polygon set only when that stream
+  is disabled. Bound the durable YAML at 4 MiB and its derived native INI at
+  1 MiB. Treat each REST mutation as an atomic YAML/INI/cache/native transaction
+  whose success requires a monotonic request/accepted receipt and the exact
+  active INI SHA-256. Roll back a definite rejection; poison the process and
+  initiate fatal shutdown when rollback fails or a post-dispatch native commit
+  is ambiguous.
+- **Rationale:** Post-tracker Python pruning duplicated the native stage,
+  diverged after hot reload, and allowed objects to influence tracking before
+  being removed. File-write or node-set success also could not prove which
+  config the streaming path had activated. One pre-tracker native owner plus a
+  hash-and-sequence commit receipt makes source coverage, restartability,
+  rollback, and failure state observable without concealing uncertainty.
+- **References:** `noesis/server/analytics_api.py`,
+  `noesis/pipelines/hooks.py`, `noesis/pipelines/hooks_v3dt_reimpl.py`,
+  `DS9/noesis/pipelines/hooks.py`,
+  `gst-plugins/nvdsroiexclude/gstnvdsroiexclude.cpp`,
+  `DS9/csrc/nvdsroiexclude/gstnvdsroiexclude.cpp`,
+  `tests/test_analytics_api.py`, `DS9/tests/test_nvdsroiexclude_plugin.py`,
+  `docs/DS8_api_contracts_rest.md`
+
+- **Date:** 2026-07-10
+- **Author:** Codex
+- **Area:** Analytics / DS9 appliance persistence / shutdown quiescence
+- **Decision:** Persist only the validated DS9 analytics YAML/INI pair across
+  supervisor sessions under `persistent/analytics`, mounted over the nested
+  analytics directory inside otherwise session-local state. Preserve immutable
+  owner-only before/after copies and hashes in each session's launcher evidence.
+  During DS8, V3DT, and DS9 shutdown, stop and join REST first, then acquire and
+  retain the analytics transaction lock as a shutdown lease before tearing down
+  callback-owned native resources. An unproven lease is fatal. Keep the
+  authenticated real occupied-person full-frame exclusion and exact restore as
+  a separate live acceptance gate; unit/native behavior does not close it.
+- **Rationale:** Per-session analytics edits disappeared on the next DS9 run,
+  while persisting the entire canary state tree would destroy isolation and
+  import unrelated identity/journal state. Uvicorn synchronous workers can also
+  outlive the listener thread, so native teardown is unsafe until both the
+  server thread and ROI transaction boundary are quiescent. Narrow persistence,
+  session evidence, and a retained lock prove the intended appliance behavior
+  without broad state reuse or a shutdown race.
+- **References:** `DS9/scripts/run_canonical_runtime_container.py`,
+  `DS9/tests/test_runtime_container_boundary.py`,
+  `noesis/ds8_runtime.py`, `noesis/ds8_runtime_v3dt_reimpl.py`,
+  `DS9/noesis/ds9_runtime_core.py`, `tests/test_runtime_shutdown_contract.py`,
+  `scripts/roi_reload_smoke_test.py`,
+  `DS9/docs/runtime_container_boundary.md`
+
+- **Date:** 2026-07-10
+- **Author:** Codex
+- **Area:** DS9 / isolated runtime-container canary
+- **Decision:** Make one fail-closed supervisor the canonical secondary-Docker live boundary. Keep plan mode write-free and incapable of `docker run`; require explicit authorization before adding GPU device 0 plus host network/IPC. Pin baseline readiness to YOLO26 detect `m`, pin the separate V3DT lane to YOLO26-seg `s`, and treat YOLO11-seg as alternate-only. Keep the tracked asset manifest immutable and require an owner-only external realization overlay that may supply only engine state/provenance and pins exact current digests for the tracked manifest plus engine-source contracts. Serialize engine maintenance and runtime startup with one owner-only artifact transaction lock held from immediate revalidation through container GPU-owner confirmation. Run the immutable image ID as a non-root user with a read-only root, checkout, and external artifact mount; mount build, state, depth, and runtime evidence separately; bind only the camera registry, MapAnything key, and internal bearer beneath a mode-`0700` tmpfs; and enforce an exact 26 GiB memory plus memory-and-swap ceiling with zero swappiness. Accept shutdown only after SIGTERM, exit zero, ordered EOS/callback/Service Maker wait/completion evidence, container removal, closed ports, and an unchanged checkout.
+- **Rationale:** A copied `docker run` line cannot prove image provenance, exclusive ownership, atomic artifact realization, mount writability, secret minimization, profile identity, bounded host-memory exposure, orderly native teardown, cleanup, or source immutability. Treating all of those as one supervised transaction prevents a stale tag, partially reconciled engine graph, alternate PGIE, concurrent DS8/build owner, writable checkout, leaked host secret, host-wide OOM exposure, or forced container removal from being mistaken for a DS9 acceptance run.
+- **References:** `DS9/scripts/run_canonical_runtime_container.py`, `DS9/tests/test_runtime_container_boundary.py`, `DS9/docs/runtime_container_boundary.md`, `DS9/docs/validation_runbook.md`, `DS9/docs/secondary_docker_staging.md`
+
+- **Date:** 2026-07-10
+- **Author:** Codex
+- **Area:** Identity / runtime-family continuity
+- **Decision:** Use the exact TAO Swin-Tiny ReID engine and `fc_pred/256` tensor contract across baseline, V3DT, and DS9; do not allow V3DT to retain the historical OSNet/512 model profile.
+- **Rationale:** Switching from V3DT's old OSNet fingerprint/dimension to baseline Swin while visitor sessions were active raised `ModelProfileMismatch` immediately. One byte-pinned model/tensor identity preserves galleries and in-flight visitor state across runtime-family transitions without deleting or resetting identity state.
+- **References:** `config/infer_v3dt_reimpl_fast1056_mp4.yaml`, `noesis/reid_swin_profile.py`, `tests/test_identity_v2_service.py`, `plans/DS8/ds8_migration_checklist_ds8_pipeline.md`
+
+- **Date:** 2026-07-10
+- **Author:** Codex
+- **Area:** DS8 / DS9 inference runtime boundary
+- **Decision:** Treat TensorRT plans and native extensions as prebuilt runtime artifacts. Keep reviewed source-rich nvinfer/NvMOT templates for explicit offline maintenance, but atomically derive engine-only runtime configs below the selected build root before graph construction. Require every active model to name a nonempty staged engine; strip all ONNX, ETLT, UFF, calibration, and custom engine-builder inputs; reject custom libraries that export TensorRT builder entrypoints; and reject `force_engine_rebuild` even when false. Runtime depth/profile materializers and native-extension checks may validate artifacts but may not export, compile, invoke `trtexec`, delete, or rebuild them. Load profile-required TensorRT plugins from the selected engine/profile contract, not by inspecting model-source bytes.
+- **Rationale:** Installed nvinfer and NvMOT attempt an SDK-level rebuild after engine deserialization failure whenever model sources or builder entrypoints remain in their configs. Merely checking that an engine path exists therefore does not fail closed. Removing every build vector at the last graph boundary makes an incompatible or corrupt engine terminate startup instead of mutating production state, while preserving source/provenance inputs for deliberate guarded maintenance.
+- **References:** `noesis_core/inference_runtime_contract.py`, `noesis/pipelines/ds8_pipeline.py`, `DS9/noesis/pipelines/ds8_pipeline.py`, `noesis/depth_tracking_materialization.py`, `DS9/noesis/depth_tracking_materialization.py`, `DS9/noesis/v3dt_assets.py`, `tests/test_inference_runtime_contract.py`, `docs/DS8_testing_guide.md`
+
+- **Date:** 2026-07-12
+- **Author:** Codex
+- **Area:** DS9 / engine-maintenance planning boundary
+- **Decision:** Treat engine-maintenance `--plan` as byte- and metadata-read-only. Plan mode requires the engine, private maintenance-evidence, and log directories plus the owner-only transaction lock to exist with their reviewed ownership and modes; it opens the lock read-only and refuses missing or unsafe paths. Only an actual maintenance invocation may create or chmod those paths.
+- **Rationale:** `mkdir -p` and even an idempotent `chmod` mutate observable filesystem metadata, so the former preflight contradicted its write-free release claim and could alter checkpoint evidence. Refusing drift makes repeated plans reproducible and keeps preparation authority on the explicit mutating path.
+- **References:** `DS9/scripts/run_canonical_engine_maintenance.sh`, `DS9/tests/test_engine_maintenance_wrapper.py`, `DS9/docs/secondary_docker_staging.md`
+
+- **Date:** 2026-07-10
+- **Author:** Codex
+- **Area:** Depth registration / runtime-derived inference config
+- **Decision:** Validate legacy MapAnything registration identity semantically when the only fingerprint drift is the content-addressed engine-only runtime config path or inference cadence/source plumbing. Continue to require equality for the recorded engine path, model name, batch, GIE, enable/tensor-meta behavior, scope, and all other recorded semantic fields.
+- **Rationale:** The v1 artifact fingerprint included the reviewed nvinfer config path but did not bind engine bytes. Passing an equivalent derived engine-only config should not invalidate a proven room-depth fit, while weakening engine or model semantics would be unsafe. Future versioned builders should bind engine and runtime-config content hashes; v1 cannot gain that guarantee retroactively.
+- **References:** `noesis/calibration/depth_registration.py`, `tests/test_depth_registration.py`, `docs/MapAnything_Depth.md`
+
+- **Date:** 2026-07-10
+- **Author:** Codex
+- **Area:** DS8 / TensorRT engine maintenance
+- **Decision:** Rebuild DS8 YOLO26-seg `n/s/m` engines only through an explicit guarded maintenance command, never opportunistically during `nvinfer` startup. Bind each run to the reviewed TensorRT 10.13.3.9, CUDA 13.0, driver 595.71.05, RTX 3060, fixed-batch fused tensor, parser, and template hashes. Preserve old bytes first, build into a bounded sibling temporary, install atomically only after a separate load process has no TensorRT error signatures and contains positive engine-size, deserialization, and skipped-inference markers, then apply the same gate once more to the final installed path.
+- **Rationale:** The restored `n/s/m` plans were serialized by TensorRT 10.14 and are incompatible with DS8. On this stack, `trtexec --loadEngine --skipInference` can still return zero and print `PASSED` after Error[6], Error[4], and failed deserialization, so exit status alone can falsely bless a broken plan. Explicit provenance, resource ownership, positive evidence, and preserved rollback bytes make model maintenance auditable without hiding defects behind runtime rebuild behavior.
+- **References:** `scripts/ds8_yolo26_seg_engine_maintenance.py`, `tests/test_ds8_yolo26_seg_engine_maintenance.py`, `docs/DS8_yolo26_seg_engine_maintenance.md`, `plans/DS8/ds8_migration_checklist_ds8_pipeline.md`
+
+- **Date:** 2026-07-10
+- **Author:** Codex
+- **Area:** Identity v2 / authority scope and executable provenance
+- **Decision:** Bind open-set model semantics to the actually loaded ReID native extraction binary and Python transform/scoring implementations. Keep scorer calibration separate from public runtime promotion: `authoritative` requires a second independently byte-pinned `noesis.identity.authority_cutover` artifact that binds the exact DS8/DS9 executable profile, model/scorer semantics, topology/cameras, and distinct private coordinator-replay plus occupied-scene report bytes.
+- **Rationale:** Engine/config provenance cannot detect a rebuilt tensor extractor, and scorer evidence cannot validate whole-frame assignment, overlap, OSD, adapters, or occupied-scene behavior. A separate fail-closed cutover boundary prevents accidental scope escalation and stale DS8 evidence reuse on DS9.
+- **References:** `noesis/identity_v2_service.py`, `noesis_core/contracts/identity_calibration.py`, `contracts/schema/identity_authority_cutover.schema.json`, `plans/household_identity/calibration_and_enrollment.md`, `tests/test_identity_v2_service.py`
+
+- **Date:** 2026-07-10
+- **Author:** Codex
+- **Area:** DS9 / V3DT artifact and projection ownership
+- **Decision:** Port the locked DS8 SV3DT semantics into a DS9-owned profile without copying any DS8 engine or native binary. Keep reviewed configs on stable virtual `DS9/models/...` paths, resolve large sources and engines through explicit `NOESIS_DS9_ARTIFACT_ROOT`, preserve 10 GiB of residual filesystem headroom, and build BodyPose3DNet before the NvMOT-internal ReID engine in an exclusive-GPU window. Pin the V3DT pixel contract to an unpadded `1920x1080` single surface and keep the inherited output truthfully labeled `camera_local` until shared metric calibration is accepted.
+- **Rationale:** DS9 needs option-surface parity without tying production to root-disk capacity, DS8 TensorRT/ABI artifacts, or a working-directory accident. NvMOT initializes both internal model paths together, so an ordered, atomically installed, separately deserialized build is safer than opportunistic tracker startup. Padding changes invalidate the locked projection matrices, and relabeling camera-local values as global would silently corrupt world fusion.
+- **References:** `DS9/config/infer_v3dt.yaml`, `DS9/config/v3dt/nvtracker_v3dt.yaml`, `DS9/noesis/v3dt_assets.py`, `DS9/scripts/stage_canonical_sources.py`, `DS9/scripts/build_v3dt_tracker_engine.py`, `DS9/scripts/run_canonical_engine_maintenance.sh`, `DS9/tests/test_v3dt_profile.py`, `DS9/DS9_REBUILD_AND_SMOKE_GATES.md`
+
+- **Date:** 2026-07-10
+- **Author:** Codex
+- **Area:** V3DT / private diagnostics
+- **Decision:** Treat V3DT runtime telemetry, calibration snapshots, raw calibration mutation records, analysis reports, and rendered panels as owner-private operational state across DS8, the V3DT runtime, and DS9. Use one shared redacted session-header contract, owner-only no-follow files, bounded logging and retention, fail-closed calibration auditing, and a loopback-only panel server that serves panel HTML exclusively.
+- **Rationale:** The earlier toolkit defaulted to repository-local artifacts, serialized every `NOESIS_*` environment value, and could include a materialized camera URI in the raw pipeline snapshot. It also exposed an unrestricted static-file server option. The forensic detail is useful, but camera topology, calibration, connection material, and household tracks must not become a second telemetry or credential surface.
+- **References:** `noesis/diagnostics/telemetry_log.py`, `noesis/diagnostics/v3dt_forensics.py`, `noesis/calibration/manager.py`, `DS9/noesis/calibration/manager.py`, `scripts/v3dt_forensics.py`, `tests/test_v3dt_forensics_logger.py`, `tests/test_v3dt_forensics_privacy.py`, `tests/test_calibration_manager.py`, `docs/DS8_v3dt_forensics.md`
+
+- **Date:** 2026-07-10
+- **Author:** Codex
+- **Area:** WebRTC / LAN privacy and diagnostics
+- **Decision:** Keep WebRTC negotiation material in memory only. Active DS8, V3DT, and DS9 gateways may log bounded state, payload-type, direction, and counter summaries, but must not persist or log full SDP, ICE candidates, DTLS fingerprints, or TURN credentials. External STUN is disabled by default for the single-home LAN appliance and requires an explicit server configuration.
+- **Rationale:** SDP and ICE diagnostics contain ephemeral connection material and were being copied into a repository-local, machine-hardcoded debug log; the full answer was also emitted at INFO. The household product does not need an external STUN lookup on its normal LAN path. Structured non-secret summaries preserve operability without creating a private-data side channel or an undeclared Internet dependency.
+- **References:** `noesis/mosaic_webrtc_gateway.py`, `tests/test_websocket_boundary_metrics.py`, `docs/DS8_api_contracts_ws.md`, `docs/DS8_testing_guide.md`
+
 - **Date:** 2026-07-09
 - **Author:** Codex
 - **Area:** V3DT performance + BEV/world usefulness
@@ -115,6 +732,9 @@ Use this file to record non-trivial design choices made during the DS8 migration
 - **Date:** 2026-06-16
 - **Author:** Codex
 - **Area:** DS9 Migration / Service Maker Binding And Shutdown
+- **Status:** Superseded on 2026-07-10 by the acknowledged downstream-EOS
+  lifecycle decision below. Immediate process exit and interpreter-GC bypass
+  are no longer permitted completion paths.
 - **Decision:** DS9 preflight and launcher must prefer the DeepStream 9 system
   `pyservicemaker` package under `/usr/local/lib/python3.12/dist-packages` before
   user-site packages. When `DS9/noesis/ds9_runtime.py` is executed as a script,
@@ -132,7 +752,7 @@ Use this file to record non-trivial design choices made during the DS8 migration
   Finite-source MP4 EOS and MP4 SIGINT shutdown smokes exited `0` with no fatal
   Python, segfault, malloc, double-free, or heap-corruption markers.
 - **References:** `DS9/noesis/ds9_runtime.py`, `DS9/scripts/ds9_preflight.py`,
-  `noesis/ds8_runtime.py`, `tests/test_ds8_runtime_shutdown.py`,
+  `noesis/ds8_runtime.py`, `tests/test_runtime_shutdown_contract.py`,
   `DS9/docs/migration_state.md`, `DS9/docs/known_blockers.md`,
   `DS9/docs/validation_runbook.md`, `DS9/README.md`.
 
@@ -1131,6 +1751,8 @@ Use this file to record non-trivial design choices made during the DS8 migration
 - **Date:** 2025-12-12
 - **Author:** Codex
 - **Area:** Runtime / Shutdown
+- **Status:** Superseded on 2026-07-10 by the acknowledged downstream-EOS
+  lifecycle decision below. SIGTERM now initiates verified orderly quiescence.
 - **Decision:** Treat WebSocket startup failure as fatal in DS8 runtime, and re-assert `SIGTERM` default handling (terminate) to make `timeout(1)`-based debug runs reliable (avoid orphaned DS8 processes holding ports).
 - **Rationale:** A running DS8 pipeline without a WS server breaks WebRTC signaling and UI telemetry, and orphan processes cause misleading “websocket doesn’t connect” regressions via port conflicts. Default SIGTERM termination avoids reliance on Python-level shutdown when GI/GStreamer callbacks can delay signal handling.
 - **References:** noesis/ds8_runtime.py
@@ -1818,6 +2440,2012 @@ Use this file to record non-trivial design choices made during the DS8 migration
 - **Decision:** The canonical object-depth fusion path now treats host ROI depth copies as an explicit debug-only path (`NOESIS_OBJECT_DEPTH_ALLOW_HOST_ROI_COPY=1`). Production object-depth relies on native scalar/stat samplers; when those are unavailable it attaches `native_stats_unavailable` instead of copying a depth crop to NumPy. Object-depth metadata attachment caches compact JSON strings, and masked object-depth passes pre-thresholded `uint8` masks to the native extension. The combined native person-mask stats call now also returns `foot_u`/`foot_v`, so the common path no longer rescans masks in Python to compute the person foot anchor.
 - **Rationale:** This keeps the always-on DAv2 tracking lane aligned with the zero-copy goal: full-frame depth stays device-owned, object-depth uses compact native stats, and the remaining host-resident mask metadata is represented as a byte mask rather than a float mask. Failing closed when native stats are missing is preferable to silently reintroducing per-object depth ROI D2H copies.
 - **References:** `noesis/pipelines/hooks.py`, `native/noesis_depth_tracking_tensor_ext.cpp`, `native/noesis_depth_tracking_tensor_kernels.cu`, `tests/test_depth_tracking_frame_processor.py`
+
+- **Date:** 2026-07-09
+- **Author:** Codex
+- **Area:** DS8/DS9 product contracts and world ownership
+- **Decision:** Runtime-neutral product truth lives in the regular `noesis_core` package. DS8 and DS9 normalize SDK-owned metadata into immutable, versioned observation, identity, world, scene, health, and action contracts. The backend owns global entity fusion; compatible observations are uncertainty-weighted, while contradictory observations remain explicit conflicts rather than being averaged.
+- **Rationale:** Copied runtime trees and browser-side fusion made behavior drift and hid source disagreement. A shared product core gives both SDK generations the same semantics without pretending their graph, metadata, ABI, asset, or lifecycle code is interchangeable.
+- **References:** `noesis_core/contracts/`, `noesis_core/world/fusion.py`, `plans/spatial_os/implementation_plan.md`, `tests/test_noesis_core_contracts.py`, `tests/test_noesis_core_world_fusion.py`
+
+- **Date:** 2026-07-09
+- **Author:** Codex
+- **Area:** DS8 MapAnything / calibrated dewarper validity
+- **Decision:** Canonical and V3DT MapAnything processors derive their valid output pixels from the declared nvdewarper calibration and explicit source geometry. Invalid pixels are represented as NaN depth and zero confidence; configured invalid calibration fails visibly instead of substituting a full-frame-valid mask.
+- **Rationale:** Dewarped output rectangles include pixels without valid source support. Treating those pixels as real depth corrupts registration and downstream world geometry, while silently filling them masks the calibration defect.
+- **References:** `geometry/dewarper_validity.py`, `config/infer.yaml`, `noesis/pipelines/hooks.py`, `noesis/pipelines/hooks_v3dt_reimpl.py`, `tests/test_dewarper_validity_mask.py`
+
+- **Date:** 2026-07-10
+- **Author:** Codex
+- **Area:** DS8/DS9 contract compatibility and replay evidence
+- **Decision:** Public product payloads require an explicit contract name/version and coordinate frame/units. JSON Schema and TypeScript are generated from the runtime-neutral Pydantic source, and deterministic characterization evidence uses owner-only, contract-validated, SHA-256-chained `noesis.replay` archives.
+- **Rationale:** Filling missing versions or coordinate semantics with defaults makes incompatible producers appear healthy. One generated contract source and tamper-evident replay let DS8, DS9, Menon, and offline validation compare the same evidence without retaining SDK metadata wrappers.
+- **References:** `noesis_core/contracts/`, `noesis_core/replay.py`, `scripts/export_noesis_core_schemas.py`, `contracts/`, `tests/test_noesis_core_contracts.py`, `tests/test_noesis_core_replay.py`
+
+- **Date:** 2026-07-10
+- **Author:** Codex
+- **Area:** Household identity v2 open-set assignment
+- **Decision:** Identity-v2 applies quality, absolute appearance, hard-constraint, calibrated-confidence, and pre-prior ambiguity gates before a bounded resident assignment prior. Each simultaneous tracklet has its own unknown option; assignments are joint and one-to-one unless an identity-specific overlap permit explicitly authorizes sharing.
+- **Rationale:** Residents are the common case in this home, so a small prior improves close admissible ranking, but visitors must never be forced onto a known name. Joint deterministic assignment prevents iteration order and greedy identity theft from deciding similar-person outcomes.
+- **References:** `reid/identity_v2/`, `tests/test_identity_v2_scoring.py`, `tests/test_identity_v2_resolver.py`, `plans/household_identity/decisions.md`
+
+- **Date:** 2026-07-10
+- **Author:** Codex
+- **Area:** Virtual twin / coherent scene release state
+- **Decision:** Scene release content is immutable and content-addressed. Current scene selection is a separate atomic compare-and-swap pointer with append-only promotion/rollback history; camera artifacts use normalized relative paths under a configured root.
+- **Rationale:** Mutating candidate records into promoted records breaks reproducibility, while choosing independently newest camera revisions creates mixed calibration/model cohorts. Immutable content plus one promotion pointer gives Menon an auditable coherent scene and safe rollback.
+- **References:** `noesis_core/contracts/scene.py`, `noesis_core/scene_store.py`, `tests/test_noesis_core_scene_store.py`, `plans/spatial_os/implementation_plan.md`
+
+- **Date:** 2026-07-10
+- **Author:** Codex
+- **Area:** Household identity-v2 runtime ownership and authority gate
+- **Decision:** DS8, V3DT, and DS9 use one shared process-owned identity-v2
+  service. Hooks detach the complete source-frame primitive batch and resolve it
+  once. Shadow is the default; authoritative mode requires an artifact-backed
+  scoring calibration. The runtime hashes actual active ReID engine bytes and
+  requires explicit output layer/dimension and exact camera topology.
+- **Rationale:** Whole-frame assignment is the only place one-to-one and exact
+  overlap constraints can be applied without object iteration order deciding
+  identity. Explicit model/topology provenance and a calibrated authority gate
+  prevent a mode toggle from silently making guessed scores public truth.
+- **References:** `noesis/identity_v2_service.py`, `reid/identity_v2/`,
+  `tests/test_identity_v2_service.py`, `tests/test_identity_v2_runtime_integration.py`
+
+- **Date:** 2026-07-10
+- **Author:** Codex
+- **Area:** Identity-v2 enrollment and overlap evidence
+- **Decision:** Enrollment consumes one exact, bounded, server-produced
+  observation key; request bodies cannot supply embeddings. Dual-camera sharing
+  requires topology, contemporaneous world distance, and appearance evidence on
+  every permit and clears camera-local proof when a track disappears.
+- **Rationale:** Client biometrics and stale SID selectors are forgeable. A
+  topology edge is only possibility, not proof that two detections are one body.
+- **References:** `noesis/server/reid_v2_api.py`,
+  `noesis/identity_v2_service.py`, `tests/test_reid_v2_api.py`
+
+- **Date:** 2026-07-10
+- **Author:** Codex
+- **Area:** Integrations / MQTT and Influx credentials
+- **Decision:** Active source/configuration contains no MQTT password or Influx
+  token defaults. The currently unwired integration sinks default off. A future
+  explicit depth-diagnostics activation reads each credential only at publisher
+  construction from an existing owner-owned `0400`/`0600` regular file, rejects
+  symlinks/hardlinks/ambiguous content, and treats missing credentials,
+  dependencies, or client initialization as fatal. Environment support is
+  limited to `*_FILE` path overrides; plaintext secret variables are rejected.
+  Multi-sink initialization is transactional and the reader never chmods a
+  configured file or parent directory.
+- **Rationale:** The repository embedded live-form credential defaults even
+  though DS8, V3DT, and DS9 bind no occupancy publisher and the optional depth
+  publisher has no active constructor call. Loading or silently disabling sinks
+  at config import would expand exposure and mask operator intent. File-only,
+  fail-closed activation preserves truthful dormant behavior while establishing
+  a secure boundary for future wiring. The deployed Influx operator credential
+  was revoked and replaced with separate owner and bucket-scoped writer tokens;
+  the deployed MQTT user password was also rotated. Replacement values exist
+  only in owner-only secret files and both retired credentials were verified
+  unusable without printing them.
+- **References:** `config.py`, `geometry/depth_publisher.py`,
+  `tests/test_depth_diagnostics_credentials.py`,
+  `docs/integrations/occupancy_mqtt_influx.md`
+
+# 2026-07-10 — Canonical world contracts, replay, and exact appliance endpoints
+
+- DS8 and DS9 publish the same strict person observation, global world
+  snapshot, and semantic event models from `noesis_core`; SDK metadata remains
+  adapter-local and is copied into primitives once.
+- Provisional world entities are stable for one `(run, camera, tracker)` rather
+  than one frame. Residents key by UUID; visitors include runtime run and
+  non-repeating generation. Contradictory simultaneous cameras are retained as
+  conflicts and never averaged.
+- Effective calibration, model/tracker file content, and runtime configuration
+  are fingerprinted in every observation. Canonical observations, snapshots,
+  and events are also retained in a bounded owner-only integrity-chained SQLite
+  journal.
+- REST and WebSocket controls default to loopback. Required endpoints fail on
+  collision; port hopping and assuming an unrelated existing listener are
+  prohibited. Required RTSP/WebRTC/depth startup failures mark the runtime
+  failed instead of continuing in an undeclared degraded mode.
+
+# 2026-07-10 — Coherent scene release ownership
+
+- A scene release selects explicit camera revisions as one immutable cohort.
+  Shared calibration/model bundle hashes are separate from each camera's
+  individual calibration/model/manifest hashes.
+- Promotion verifies the exact manifest bytes, revision/camera identity, every
+  declared artifact, cohort timing, authored-home content, and validation
+  report, then atomically compare-and-swaps one current release. Menon must not
+  reconstruct production truth from independently newest revisions.
+
+# 2026-07-10 — Verifiable journal retention
+
+- The runtime contract journal discards only a contiguous oldest sequence
+  prefix and anchors the retained chain to the final discarded hash. Timestamp
+  age never deletes a middle record when delayed or clock-adjusted evidence is
+  appended out of order.
+- An asynchronous writer failure remains a fatal runtime condition, but teardown
+  still drains the queue, delivers the stop sentinel, joins the writer, and then
+  reports the failure. This preserves both fail-closed behavior and deterministic
+  shutdown.
+- **2026-07-12 supersession:** The asynchronous writer remains a tested generic
+  journal utility, but canonical runtime world authority no longer uses it.
+  Tracking/world/event release now requires the synchronous journal's exact
+  append acknowledgement; accepting a queued async batch was not proof that the
+  visible cohort had been retained.
+
+# 2026-07-10 — Scene releases close over bounded descriptor-verified bytes
+
+- Camera manifests alone are not an immutable scene: every declared camera
+  artifact carries a safe relative path, byte length, and SHA-256 in the release
+  contract. The authored OBJ, all referenced MTL/texture dependencies, and the
+  validation report are materialized under one release-owned directory with the
+  same proof. Bundle paths are unique, and a release ID cannot be overwritten
+  with different bytes.
+- Roots and path components are opened without following links. Every file must
+  be non-empty, regular, single-link, bounded, stable across the descriptor read,
+  and match its declared length and SHA-256. OBJ/MTL discovery is strict UTF-8
+  with bounded files, lines, dependencies, and known map options. A release tree
+  is staged off-path and atomically published without replacement; existing
+  content is validated and never overwritten or chmod-repaired.
+- Promotion, `/current`, and `/current/payload` revalidate the complete cohort.
+  Each role-addressed binary route verifies only its selected file against the
+  integrity-checked current release row and returns that verified byte snapshot,
+  avoiding both path-reopen races and O(N-squared) hashing. Mutated or missing
+  render content returns an explicit conflict. DS8, V3DT, and DS9 mount the same
+  router and store implementation.
+
+# 2026-07-10 — Atomic world identity transitions
+
+- Canonical fusion explicitly owns each `(camera, source, run, tracker)`
+  tracklet. A transition from provisional or unknown to a resident/visitor
+  removes the prior entity observation before inserting the resolved subject,
+  so one physical track does not appear twice during the world TTL window.
+- Open-set rejection remains an explicit `unknown` world subject without a
+  display name. It is not mislabeled as still-provisional evidence.
+
+# 2026-07-10 — Identity-v2 authority excludes legacy mutation
+
+- Authoritative DS8, V3DT, and DS9 hooks do not call legacy StableID assignment,
+  copresence, or maintenance. Dwell and line-crossing transitions are computed
+  only after whole-frame v2 resolution and only for its positive compatibility
+  SID.
+- A fresh-evidence rejection remains `unknown`; absence of fresh evidence and a
+  continuity hold is `provisional`. The initial transient metadata walk stamps
+  neutral `#XX`; it never retains wrappers or displays stale legacy identity.
+  A separate tiler-sink callback may display the resolved decision only through
+  the exact bounded join described below.
+
+# 2026-07-10 — Development auth disablement is loopback-only
+
+- `NOESIS_INTERNAL_AUTH_MODE=disabled` may bind only `localhost` or a literal
+  loopback address. Both REST and WebSocket startup reject wildcard, LAN, and
+  arbitrary hostname listeners in this mode across DS8, V3DT, and DS9.
+- This makes the documented development exception an executable network
+  boundary instead of relying on the operator to remember a matching host flag.
+
+# 2026-07-10 — Depth telemetry uses opaque artifact identity
+
+- `DepthResult` retains its real storage reference for internal persistence and
+  reconstruction code, but `DepthTelemetryPublisher` emits only
+  `noesis-depth://artifact/<sha256>`. Filesystem roots, camera directories, and
+  backend storage URIs do not cross the WS boundary in DS8 or DS9.
+
+# 2026-07-10 — Canonical world does not replace local diagnostic BEV geometry
+
+- DS8 and DS9 share the strict `backend_world_m` product observation/snapshot
+  contract. The DS8 camera-local BEV renderer may keep its separately declared
+  display frame because that path has its own registration and trail-stability
+  evidence.
+- Runtime parity is measured at the product contract boundary; changing proven
+  local display geometry merely to equalize a config key would create risk
+  without improving global world truth.
+
+# 2026-07-10 — DS8/DS9 late-viewer media parity
+
+- Both adapters require a successful DESCRIBE for the exact normalized RTSP
+  mosaic mount before WebRTC startup and require a keyframe requester. A TCP
+  listener alone is not treated as usable media.
+- One bounded warm gateway is configurable; additional client slots are created
+  on demand up to the declared maximum instead of eagerly starting every
+  gateway at runtime boot.
+
+# 2026-07-10 — DS9 MapAnything build intent is not artifact evidence
+
+- The guarded DS9 MapAnything builder now requests true FP16 and a regression
+  test prevents the prior BF16/FP16-name mismatch. This source correction does
+  not clear the cutover blocker.
+- A newly built artifact must carry precision/checksum/build provenance and pass
+  tensor, NaN, depth, and floorplan parity. The historically loadable BF16 plan
+  with an FP16 filename is explicitly non-qualifying.
+
+# 2026-07-10 — Identity-v2 authority requires held-out calibration evidence
+
+- Superseded by the correlation-aware decision below. Artifact v1 counted
+  frame-level outcomes while accepting only three declared independence groups;
+  it therefore could not support its own 1% safety claim. Version 1 calibration
+  labels, datasets, and authority artifacts now fail closed rather than being
+  reinterpreted.
+- Resident prevalence may influence assignment only through a bounded prior
+  after all evidence gates. It cannot turn an unknown/rejected observation into
+  a known resident. Shadow remains the default until real household holdout
+  evidence passes.
+- Browser enrollment uses short-lived exact server observation keys and a
+  two-step proposal/confirmation. Evidence capture status and legacy migration
+  review are owner-only and biometric-free; migration has no browser apply
+  route and no automatic duplicate resolution.
+- Evidence/replay state is owner-only, newline-complete, size/count/age bounded,
+  and written through create-private-or-validate-private atomic paths. Existing
+  files are never chmodded or followed through links. Evidence contract v2 uses
+  a sequence/previous-event hash chain plus a private head/tail/count/byte
+  checkpoint; deterministic pruning removes only a contiguous prefix and keeps
+  the predecessor reference, so unexplained interior, prefix, or suffix loss is
+  rejected before labeling or calibration.
+
+# 2026-07-10 — Identity-v2 authority is two-stratum and person-statistical
+
+- Authoritative scoring accepts only
+  `noesis.identity.open_set_calibration` v2. It binds the active engine bytes,
+  layer, dimension, runtime-derived crop/preprocessing/tensor semantic digest,
+  deterministic evidence-unit policy, a provenance-locked benchmark dataset,
+  and a separate household domain-verification dataset. Independent exact-byte
+  artifact and active-semantic pins are mandatory.
+- The subject-disjoint benchmark holdout carries the generic claim with at
+  least 300 challenge-covered resident people and 300 challenge-covered unknown
+  people. Each person's result is worst-case across encounters. Exact one-sided
+  95% Clopper-Pearson upper bounds for false acceptance and misidentification
+  must each be at most 1%; FRR remains at most 35%. Benchmark train needs 50
+  resident and 50 unknown people for fitting/policy selection but is not
+  presented as the large-N confidence result.
+- The local dataset needs 10 known/10 unknown train and 20 known/20 unknown
+  holdout encounters. Both household partitions require zero false accepts,
+  zero misidentifications, FRR at most 35%, and zero harmful or
+  rejection-rescuing prior changes. Household tuning may only keep or raise the
+  benchmark rejection bars and cannot change its calibrated mapping or bounded
+  resident prior.
+- Raw events are deterministically grouped by capture
+  session/run/source/camera/tracklet/five-second window, capped at 300 per unit,
+  thinned to one center fit representative for at most eight temporally spread
+  units per encounter, and encounter-balanced before class balancing. Metrics
+  retain all observations, aggregate at encounter worst case, and aggregate
+  benchmark confidence again at truth-person worst case. Multiple frames,
+  windows, tracklets, or encounters for one person never increase benchmark
+  confidence denominators. Session/run/encounter leakage always rejects;
+  subject-disjoint separates benchmark person keys, and household unknown
+  people are split-disjoint even though residents may repeat across visits.
+- Every authority encounter contains hard-allowed, non-empty resident and
+  visitor gallery competition plus an impostor; training also requires genuine
+  coverage. The scorer-only artifact authorizes no coordinator claim and caps
+  runtime gallery shape at the minimum coverage observed across both strata.
+  Startup and prospective mutations fail closed outside that envelope.
+- This division lets large provenance-reviewed evidence carry the generic
+  statistical claim without making homeowner labeling infeasible. The smaller
+  home corpus detects installed-camera domain shift but is structurally unable
+  to loosen or rescue benchmark rejection behavior. No fixture or unit artifact
+  clears the live evidence gate.
+
+# 2026-07-10 — Identity-v2 OSD uses a fresh downstream exact join
+
+- Installed Service Maker APIs prove an explicit tiler-sink
+  `BatchMetadataOperator` callback is downstream of whole-frame resolution and
+  still upstream of source collapse and nvOSD. DS8, V3DT, and DS9 attach the
+  same adapter there.
+- The callback walks fresh metadata wrappers exactly once and joins a bounded
+  `(camera, frame, tracker)` decision cache. Resident and visitor labels render
+  only on an exact match; stale, missing, unknown, provisional, and mismatched
+  rows remain `#XX`. SDK wrappers are never retained across callbacks.
+
+# 2026-07-10 — Runtime credentials are owner-only authorities, not config
+
+- Active DS8, V3DT, and DS9 pipeline YAML identifies cameras with stable
+  `uri_secret` references. Complete locators are read from one owner-only JSON
+  authority, materialized only in process memory, and removed before public
+  serialization and before source property maps reach Service Maker.
+- The MapAnything RPC key has no source default. It is an authority-grade
+  URL-safe value in an owner-only single-link file and is compared for every
+  inference request. Missing, weak, shared, symlinked, hardlinked, or inline
+  credential state is a startup error; there is no unauthenticated fallback.
+- Public config, world fingerprints, model/depth-registration fingerprints,
+  generated pipeline YAML, dev-console artifacts, and reconstruction
+  provenance depend on stable references rather than secret bytes. Credential
+  rotation therefore does not stale spatial/model evidence.
+- The deprecated pre-DS8 `config.py` locator list is not changed under the
+  active-stack policy. `mapanything_config.py` no longer imports that module,
+  so the residual cannot act as DS8/DS9 or MapAnything source authority.
+
+# 2026-07-10 — Validation clients use the production internal-auth boundary
+
+- **Area:** DS8/DS9 validation / internal REST and WebSocket authentication
+- **Decision:** Every canonical live smoke client reads one existing owner-only
+  token file and sends the bearer only in the HTTP or WebSocket Authorization
+  header. Orchestrators pass a token-file path, never token bytes; missing or
+  invalid state aborts before a runtime is spawned or a network gate starts.
+- **Rationale:** An anonymous validation path cannot prove an authenticated
+  appliance contract. A shared read-only client helper keeps HTTP, WebSocket,
+  standalone-runtime, and DS9-orchestrated behavior identical while preventing
+  URL/query, command-line, report, or environment-value disclosure.
+
+# 2026-07-10 — Person-ground behavior is shared; SDK traversal stays adapted
+
+- Posture classification, support-point selection, source hysteresis, human
+  motion filtering, idle locking, and path commitment have one owner in
+  `noesis/telemetry/person_ground_state.py`. DS8 and DS9 may differ only in
+  transient SDK metadata traversal, projection, and attachment mechanics.
+- DS9 extends its telemetry package path to consume that neutral owner and no
+  longer carries a private `_WorldAnchorState` or `_PoseAnchorCandidate`
+  algorithm. A DS8-vs-DS9 characterization test guards behavioral symmetry.
+
+# 2026-07-10 — Wholebody49 semantics are shared; artifacts remain SDK-owned
+
+- Variant selection, tensor names, parser modes, preprocessing, mask/bbox
+  semantics, and generated config policy are one product contract in
+  `noesis/deimv2_wholebody49_assets.py`, parameterized by runtime artifact-root
+  environment variables.
+- Parser binaries, ONNX staging, TensorRT engines, build provenance, and ABI
+  checks belong to each SDK adapter. DS9 owns its parser source/build output and
+  engine paths and must never copy or load a DS8 engine.
+- Source/config/parser parity is not runtime-quality parity. DS9 Wholebody49
+  remains blocked until both TensorRT 10.14 engines deserialize and occupied
+  scenes prove tensor/parser/mask/OSD quality, throughput, and GPU memory. This
+  preserves the earlier decision that successful serialization alone cannot
+  rehabilitate a poor-performing variant.
+
+# 2026-07-11 — Wholebody49 parser callbacks are exact and fail closed
+
+- The active DS8 and DS9 custom parsers accept only the exact, unique output
+  set for the selected model: `label_xyxy_score` alone for boxes, or
+  `label_xyxy_score` plus `masks` for instance masks. Layer order is irrelevant;
+  positional, renamed, duplicate, missing, and additional outputs are rejected.
+- Callback dimensions are the batch-stripped NvDsInfer shapes `[1240,6]` and
+  `[1240,80,80]`, with exact element counts and FLOAT storage. Coordinates are
+  finite normalized xyxy values, class IDs are finite integral values, and only
+  body class `0` may produce an object. Non-finite consumed mask values reject
+  the callback and release all results allocated during that invocation.
+- Installed DS8 and pinned DS9 `nvdsinfer` `SplitFullDims` implementations both
+  remove dimension zero before populating `NvDsInferLayerInfo::inferDims`.
+  Accepting batch-bearing shapes or positional output guesses would therefore
+  conceal an SDK/model ABI drift instead of preserving compatibility.
+- Parser source remains byte-identical, but each SDK must rebuild and validate
+  its own binary. Source parity never authorizes copying a DS8 parser into DS9;
+  the DS9 manifest/realization must be rebased after its native rebuild and
+  before any Wholebody49 runtime canary.
+
+# 2026-07-10 — ReID semantics are shared; DS9 engines and quality remain gated
+
+- DS8, V3DT, and DS9 use one NVIDIA TAO ReIdentificationNet Transformer
+  Swin-Tiny product contract: provenance-locked deployable ONNX, RGB ImageNet
+  preprocessing, direct `256x128` resize, dynamic batch 1..16, raw `fc_pred`
+  tensor metadata, and a 256-dimensional normalized embedding. There is no
+  custom parser and no OSNet fallback.
+- The SDK-neutral contract lives in `noesis/reid_swin_profile.py`. Runtime
+  adapters own their config paths, ONNX staging, TensorRT engines, manifests,
+  and ABI/runtime gates. Hook adapters obtain layer and dimension from the
+  effective model configuration and pass both explicitly to the native bridge.
+- DS9 source/config/build parity is not runtime identity parity. DS9 remains
+  blocked until an exclusive-GPU window produces and separately deserializes a
+  TensorRT 10.14 engine with complete provenance, followed by occupied-scene
+  resident/visitor open-set, cross-camera handoff, false-accept, continuity,
+  throughput, and GPU-memory validation. Engine startup alone cannot clear it.
+
+# 2026-07-10 — Appliance WebSocket health is a separate bounded path
+
+- DS8, V3DT, and DS9 reserve authenticated `/healthz` for one exact
+  `noesis.ws.health` v1 frame. This proves the WebSocket upgrade and handler
+  path without registering a telemetry client or invoking initial UI snapshot,
+  calibration, stats, trail, world, or WebRTC work.
+- Startup validates the health frame once. The appliance guard checks core
+  capability/HTTPS health every ten seconds and this lightweight WebSocket
+  path every sixth cycle, with independent consecutive-failure budgets. A
+  normal root-path connection is never used as a health probe.
+
+# 2026-07-10 — DS9 V3DT source, engine, platform, and world gates stay separate
+
+- DS9 owns its V3DT pipeline, camera/camInfo/tracker configuration, native
+  bridge, provenance, runtime materialization, smoke, and NvMOT build helper.
+  Large sources and engines resolve through an explicit external artifact root
+  with residual-capacity and atomic-install gates; DS8 binaries are not reused.
+- Source/config parity does not claim engine or runtime parity. Actual builds
+  require the installed DeepStream 9 driver floor in addition to an exclusive
+  GPU window, then separate deserialization, bbox3d, identity, resource, and
+  shutdown evidence. The locked profile remains `camera_local` until a shared
+  metric calibration is separately accepted for canonical world fusion.
+
+# 2026-07-10 — DS9-capable driver migration preserves the DS8 host stack
+
+- The host driver moves from APT/DKMS-managed open driver 580.167.08 to exact
+  Ubuntu 595.71.05 only after complete source/runtime and offline-package
+  checkpoints. Noble's 590 package is transitional, and the NVIDIA runfile is
+  not mixed into this package-managed installation.
+- Host CUDA remains 13.0 and host TensorRT remains 10.13.3 for DS8. TensorRT
+  10.14 is confined to the pinned DS9 build/runtime image, so platform enablement
+  does not silently become a host inference-stack migration.
+- A coherent 595 module after reboot is necessary but insufficient. Every
+  configured DS8 engine must deserialize and DS8 runtime, decoded media,
+  identity, MapAnything/floorplan, resource, shutdown, and desktop/RDP gates
+  must pass before DS9 receives the exclusive GPU. Any regression triggers the
+  exact cached 580 rollback and the same DS8 acceptance suite.
+- The rollback rehearsal is a separate evidence state, never shorthand for an
+  executed rollback. It rehashes the complete private checkpoint and exact 33
+  archive/control contracts, verifies current module/DKMS/boot coherence, and
+  runs only a local-archive `apt-get --simulate --no-download` transaction. The
+  held 595 cohort is removed explicitly. Generic removals are rejected unless
+  an exact cached relationship proves solver necessity; `nvidia-prime` is the
+  sole such package because `nvidia-driver-580-open` conflicts/replaces it and
+  the accepted 580 baseline records it removed. Execution still requires an
+  exclusive maintenance window, initramfs rebuild, reboot, and complete DS8
+  engine/runtime/media/world/identity/depth/resource/desktop acceptance.
+
+# 2026-07-10 — DS8/DS9 shutdown requires acknowledged downstream EOS
+
+- **Area:** DS8, V3DT, and DS9 Service Maker lifecycle
+- **Decision:** Supersede the 2025-12 default-SIGTERM termination, the
+  2026-06-16 immediate-process-exit workaround, and source-classification-only
+  shutdown behavior. Each SDK-owned graph contains
+  its own repo-built `noesiseos` zero-copy transform immediately after
+  `streammux`. A monotonic control request atomically enters terminal buffer-drop
+  state, returns from the Service Maker property setter, and has a detached GLib
+  worker push standard downstream EOS only after setter locks are released.
+  Runtime teardown requires the exact bridge acknowledgement, the expected
+  pipeline EOS callback, and `Pipeline.wait()` thread completion before closing
+  identity, world, storage, diagnostics, WebSocket, or other callback-owned
+  resources. `Pipeline.stop()`, forced termination, and interpreter-exit bypass
+  are not canonical shutdown paths. A retained idle stdin pipe prevents
+  Service Maker's noninteractive stdin watcher from generating false EOF/GLib
+  lifecycle faults. Downstream valves use EOS-preserving drop modes. A
+  `Pipeline.wait()` exception is recorded independently from thread completion
+  and always invalidates quiescence; a returned thread alone is not success.
+- **Rationale:** Installed Service Maker `Pipeline.stop()` only sends EOS at the
+  pipeline boundary, while NVIDIA `nvurisrcbin` reconnect handling intentionally
+  consumes upstream EOS. Minimal live reproductions showed `stop()` return while
+  `wait()` remained alive and sources reconnected; allowing Python teardown in
+  that state produced a native `sem_wait` crash. Synchronous event injection
+  from a property setter deadlocked, and placing the bridge after asynchronous
+  inference produced upstream flow errors. The asynchronous post-streammux
+  bridge preserves live-source reconnect during operation, avoids Service Maker
+  setter/stream locks, reaches every terminal, and makes native quiescence an
+  observable fail-closed contract.
+- **Validation:** Repo-owned DS8 and DS9 plugin build/origin/manifest tests,
+  exact-ack and finite-source unit tests, graph and runtime shutdown contract
+  tests (including fail-closed wait-exception coverage), and the canonical
+  authenticated DS8 YOLO26m live gate passed. The live
+  gate observed advancing sequences `38` through `1017` for 30 seconds, accepted
+  EOS, received the expected callback, returned from `wait()`, completed shutdown
+  in 1.567 seconds, exited `0`, and required no forced kill. The full root suite
+  passed with `785 passed, 15 skipped`; the DS9 suite passed with `90 passed`.
+- **References:** `noesis_core/servicemaker_shutdown.py`,
+  `gst-plugins/noesiseos/`, `DS9/gst-plugins/noesiseos/`,
+  `noesis/pipelines/ds8_pipeline.py`, `DS9/noesis/pipelines/ds8_pipeline.py`,
+  `noesis/ds8_runtime.py`, `noesis/ds8_runtime_v3dt_reimpl.py`,
+  `DS9/noesis/ds9_runtime_core.py`, `scripts/ds8_runtime_30s_gate.py`.
+
+# 2026-07-10 — DS9 live identity and floorplan claims are evidence-scoped
+
+- **Area:** DS9 behavior acceptance / shared identity and floorplan contracts
+- **Decision:** The routine occupied-scene identity gate proves authenticated
+  shadow-runtime health, fresh server-produced ReID observations, exact
+  observation keys, and tracker-local shadow-subject continuity while requiring
+  public authority to remain blocked. Cross-camera assignment continuity and a
+  fresh open-set non-force decision are separate `observed`/`not_observed`
+  claims that can be made mandatory for a staged or naturally occurring scene.
+  Neither state is reported as person-level accuracy without licensed truth.
+  The floorplan gate derives the active camera inventory from the reviewed
+  configs and requires a fresh, non-empty v7 meter-space payload for every
+  active camera; a first-camera pass or 1x1 zero-density sentinel is not
+  acceptance evidence.
+- **Rationale:** Repeated numeric IDs can prove only frame persistence, and one
+  successful RPC can hide stale or missing geometry on other cameras. Separating
+  mechanism exercise from labeled accuracy prevents optimistic promotion while
+  still allowing ordinary family-only health runs to finish without fabricated
+  resident or unknown labels. Identity authority remains gated by the existing
+  scorer, licensed-truth, coordinator-replay, and occupied-scene artifacts.
+- **Validation:** Focused DS9 gate and runner tests cover shadow/authority/model
+  health, coherent fresh observations, subject flips, opt-in absent events,
+  truthful report statuses, active-camera inventory, stale/empty/corrupt grids,
+  and owner-private report ingestion. The focused behavior set passed 37 tests;
+  the complete DS9 suite passed 278 tests, with only pre-existing dependency
+  deprecation warnings. Ruff, syntax compilation, diff checks, and the
+  AGENTS/docs consistency check also passed.
+- **References:** `DS9/scripts/ds9_identity_shadow_live_gate.py`,
+  `DS9/scripts/ds9_floorplan_live_gate.py`,
+  `DS9/scripts/ds9_live_validation_runner.py`,
+  `docs/DS8_api_contracts_ws.md`, `plans/household_identity/validation.md`.
+
+# 2026-07-11 — DS9 Wholebody builds cap optimizer tactic DRAM explicitly
+
+- **Area:** DS9 Wholebody49 TensorRT engine maintenance
+- **Decision:** Supersede the workspace-only Wholebody `trtexec` build contract
+  with one DS9-owned TensorRT 10.14.1.48 C++ builder. The builder retains the
+  existing FP16 semantics, uses TensorRT 10's explicit-batch default, requires
+  the exact S-mask or X-box tensor set, adds one fixed batch-three
+  `images=3x3x640x640` optimization profile, sets WORKSPACE to exactly 4 GiB,
+  and sets TACTIC_DRAM to exactly 2 GiB. Both limits are positive powers of two,
+  enforced by C++ compile-time assertions, Python maintenance validation, and
+  independent source-contract/provenance validation. It registers a fail-closed
+  error recorder and verifies both configured limits through their getters
+  before building. Optimization level, tactic sources, and auxiliary streams
+  remain unchanged so this is a single-variable memory-ceiling adjustment.
+  `trtexec` remains the separately recorded candidate and final-path
+  deserializer; the outer 9 GiB S and 11 GiB X host guards remain unchanged.
+- **Rationale:** Two guarded S-mask builds reached 9,441 MiB and 9,436 MiB even
+  with the 4 GiB workspace flag, and both rolled back cleanly. The first native
+  builder trial then limited TACTIC_DRAM to 4 GiB but still reached 9,441 MiB
+  across 78 host samples; transaction `20260711T075013061941Z` stopped before
+  candidate publication and proved the prior realization unchanged. TensorRT
+  10.14's `trtexec` CLI does not expose the `kTACTIC_DRAM` pool, whose dGPU
+  default is total device memory. Transaction `20260711T080353252694Z` then
+  rejected the 3 GiB value before candidate creation or optimizer allocation,
+  with a 51 MiB peak across two host samples and the prior realization retained.
+  The exact API failure was `Error Code 3: API Usage Error (Parameter check
+  failed, condition: (pool == MemoryPoolType::kDLA_MANAGED_SRAM && poolSize ==
+  0) || (static_cast<int64_t>(poolSize) >= kDLA_MIN_MEMORY_POOL_SIZE &&
+  hasSingleBit(poolSize)).  In validatePoolSize at
+  /_src/optimizer/api/builderConfig.cpp:340)`. Lowering only TACTIC_DRAM to the
+  next legal 2 GiB value is therefore the controlled experiment. Raising the
+  host guard would hide the optimizer allocation problem; changing optimization
+  or tactic selection simultaneously would make the result ambiguous.
+- **Provenance boundary:** Maintenance snapshots the reviewed zero-external-
+  data ONNX and the hash-pinned C++ source into private container tmpfs before
+  parsing or compilation. Evidence binds both exclusive copies, the exact
+  compiler command and empty `-Werror` log, compiled executable digest/mode,
+  variant-specific positive transcript, exclusive mode-0600 candidate, and
+  independent loads. Partial candidates remain exclusively owned by the host
+  finalizer's audited rollback/recovery transaction.
+- **Validation:** Strict compilation and linkage against the pinned DS9 image,
+  C++ boundary sanitizer coverage, focused build/rollback/transcript/provenance
+  tests, source-contract chain tests, lint/syntax checks, and CPU-only S/X
+  maintenance plans. No GPU engine build or runtime-quality claim is made by
+  this decision.
+- **References:** `DS9/csrc/wholebody49_engine_builder/`,
+  `DS9/scripts/rebuild_engines.py`,
+  `DS9/scripts/engine_maintenance_common.py`,
+  `DS9/scripts/validate_asset_manifest.py`,
+  `DS9/DS9_REBUILD_AND_SMOKE_GATES.md`.
+
+# 2026-07-11 — DS9 Wholebody workspace ceilings are variant-specific
+
+- **Area:** DS9 Wholebody49 TensorRT engine maintenance
+- **Decision:** Supersede the shared 4 GiB WORKSPACE setting with a value
+  selected only from the already validated builder variant: S masks uses
+  exactly 2 GiB under its unchanged 9,000 MiB guard, while X boxes retains
+  exactly 4 GiB under its unchanged 11,000 MiB guard. Both variants retain the
+  legal 2 GiB TACTIC_DRAM ceiling, FP16, fixed batch-three profile, exact output
+  sets, and TensorRT's default optimization-level, tactic-source, and
+  auxiliary-stream policies. The compiled source has power-of-two assertions
+  for both workspace values and the shared tactic limit. Runtime setter/getter
+  checks and exactly one variant-specific transcript marker bind the selected
+  value; producer and independent provenance validators reject a swapped,
+  missing, or duplicate workspace marker.
+- **Rationale:** Transaction `20260711T081443440868Z` proved that lowering only
+  TACTIC_DRAM from 4 GiB to the legal 2 GiB value did not reduce the S build's
+  9,441 MiB peak across 78 samples. The host finalizer proved no candidate was
+  published, rollback completed with the engine already absent, and realization
+  `c183f91aaecaca3764081b87c962a87233b2b5c21b2d028e2c12f113a9cb16dd`
+  remained authoritative. Installed TensorRT 10.14.1.48 headers define
+  WORKSPACE as per-operation intermediate storage and document that a smaller
+  limit removes tactics over that threshold. Restricting only S is therefore
+  the narrowest next controlled experiment; reducing X without observed need
+  would spend performance headroom under its larger guard.
+- **Provenance boundary:** The shared builder-source digest changes for both
+  contracts, so both S and X must be included in one append-only source-contract
+  realization rebase before GPU work. Only S changes its semantic workspace
+  value; X retains 4 GiB. The predecessor snapshot is immutable and no engine,
+  external realization, or tracked asset manifest is changed by the source
+  implementation step.
+- **Validation:** The 134-test producer, transcript, independent-maintenance-
+  proof, rollback, provenance, source-contract-chain, and adversarial set
+  passes. Strict compilation against the pinned image and both isolated S/X
+  no-GPU plans also pass without authority mutation. The real guarded builds
+  remain separate required gates.
+- **References:** `DS9/csrc/wholebody49_engine_builder/`,
+  `DS9/config/engine_source_contracts.json`,
+  `DS9/DS9_REBUILD_AND_SMOKE_GATES.md`,
+  `DS9/tests/test_engine_build_specs.py`,
+  `DS9/tests/test_wholebody_builder_maintenance_proof.py`.
+
+# 2026-07-11 — DS9 Wholebody S uses optimization level zero
+
+- **Area:** DS9 Wholebody49 TensorRT engine maintenance
+- **Decision:** Retain the reviewed variant workspaces (S 2 GiB, X 4 GiB),
+  shared 2 GiB TACTIC_DRAM, FP16, fixed batch-three profile, exact output sets,
+  tactic sources, auxiliary-stream policy, and 9,000/11,000 MiB outer guards.
+  Select and pin TensorRT builder optimization level from the validated variant:
+  S masks uses level 0 while X boxes explicitly retains level 3. The setter is
+  checked through the registered error recorder, getter-verified immediately,
+  getter-verified again before serialization, and represented by exactly one
+  variant-specific transcript marker. Producer and independent proof validators
+  reject missing, swapped, duplicate, non-integer, or out-of-range levels.
+- **Rationale:** Transaction `20260711T083837156365Z` proved that the legal
+  2 GiB S WORKSPACE limit alone still reached 9,436 MiB across 78 samples. The
+  finalizer proved no candidate, an already-absent engine, complete rollback,
+  and realization
+  `cda791ecc5aacd6e043f8714c6d19c8bd72879f5492dbea56fe223e34a59dc99`
+  preserved. Installed TensorRT 10.14.1.48 headers define level 0 as disabling
+  dynamic kernel generation and selecting the first tactic that executes
+  successfully. This is the narrowest verified remaining search-pressure
+  control. X keeps level 3 because its larger 11,000 MiB guard has not produced
+  contrary evidence.
+- **Provenance boundary:** The shared builder-source digest changes both source
+  contracts. S semantically changes to optimization level 0; X explicitly pins
+  its existing level-3 behavior. Both unrealized contracts must therefore move
+  through one append-only source-contract realization rebase before GPU work.
+  No engine, external authority, or tracked asset manifest changes during the
+  implementation step.
+- **Validation:** The 140-test focused producer/transcript/proof/rollback/
+  provenance/source-chain/adversarial set, strict pinned-image compilation, and
+  both no-GPU plans pass. Lint, syntax, JSON, shell, docs-consistency, and diff
+  checks also pass without GPU or authority mutation. The real build and
+  occupied-scene quality gate remain separate evidence.
+- **References:** `DS9/csrc/wholebody49_engine_builder/`,
+  `DS9/config/engine_source_contracts.json`,
+  `DS9/DS9_REBUILD_AND_SMOKE_GATES.md`,
+  `DS9/tests/test_engine_build_specs.py`,
+  `DS9/tests/test_wholebody_builder_maintenance_proof.py`.
+
+# 2026-07-11 — DS9 Wholebody S admits the evidenced half tactic with 8 GiB WORKSPACE
+
+- **Area:** DS9 Wholebody49 TensorRT engine maintenance
+- **Decision:** Raise only S-mask WORKSPACE from 2 GiB to 8 GiB. Retain S
+  builder optimization level 0, X WORKSPACE at 4 GiB and optimization level 3,
+  shared 2 GiB TACTIC_DRAM, FP16, fixed batch-three profiles, exact output sets,
+  tactic sources, auxiliary-stream policy, and the 9,000/11,000 MiB outer
+  guards. The variant getter checks, compile-time power-of-two assertions,
+  source contract, producer transcript proof, and independent validator all pin
+  the exact 8,589,934,592-byte S value.
+- **Rationale:** Transaction `20260711T130350917674Z` proved optimization level
+  0 solved the previous build-peak failure: the run peaked at 506 MiB across 19
+  samples. It then failed cleanly at the final mask-producing Myelin node because
+  both half-format attempts requested exactly 4,571,136,000 bytes against
+  budgets of 1,952,111,042 and 1,954,461,634 bytes; the float-format attempt
+  requested 9,142,272,000 bytes against 1,856,672,132 bytes. TensorRT advised
+  increasing WORKSPACE, skipped all tactics, and returned Error Code 10 with no
+  implementation. An 8 GiB pool is comfortably above the observed half request
+  while remaining below the observed float request. This is the narrowest
+  power-of-two admission change that preserves the intended FP16 path. The
+  unchanged outer guard remains authoritative if actual allocation pressure
+  rises.
+- **Failure and rollback evidence:** No candidate was published. The engine was
+  already absent, candidate cleanup completed, rollback reported the realization
+  already prior, and realization
+  `3a896c8dc8dc50d424e9f87e69e9396f9d10e8251e44312d2859312596defc8e`
+  remained authoritative.
+- **Provenance boundary:** The shared builder-source digest changes both
+  unrealized Wholebody contracts even though only S changes workspace semantics.
+  The immutable predecessor is the artifact-root-relative snapshot
+  `source_contract_rebase/inputs/20260711T130600Z-wholebody-s-workspace-8192-opt0/old_engine_source_contracts.json`
+  with SHA-256
+  `2e9a73a18f2105b547118b43b01a2636fa0b05e26e3be284da4830eb027096a2`.
+  No engine, external realization, or tracked asset manifest changes during this
+  implementation step.
+- **Validation:** Strict compilation against the pinned TensorRT 10.14.1.48
+  image passes, as do 141 focused producer/transcript/independent-proof/
+  rollback/provenance/source-chain/adversarial tests and isolated no-GPU S/X
+  plans. The builder digest is
+  `d066b43fb6c1f13d6b28213c5fd05d2d55a504fd4c2167ac5509abe73fa6918a`;
+  the new source-contract digest is
+  `67597d75664b42841bb5dea232b42e312306622e6496abb3f57689ad5c5e4a85`.
+  A deterministic dry-run at `2026-07-11T13:10:00Z` proposes realization
+  `493d1cdb168a80751a366b0d12382e0e647e1a2a91b35cc14ee3c09a48a95bb0`
+  with only `source_contracts.sha256` and `updated_at_utc` changed. Apply and the
+  real GPU build remain separately authorized gates.
+- **References:** `DS9/csrc/wholebody49_engine_builder/`,
+  `DS9/config/engine_source_contracts.json`,
+  `DS9/DS9_REBUILD_AND_SMOKE_GATES.md`,
+  `DS9/tests/test_engine_build_specs.py`,
+  `DS9/tests/test_wholebody_builder_maintenance_proof.py`.
+
+# 2026-07-11 — DS9 Wholebody logger ignores only VERBOSE before bounded copy
+
+- **Area:** DS9 Wholebody49 TensorRT engine maintenance and proof
+- **Decision:** Set the dedicated builder's minimum captured TensorRT severity
+  to INFO. Return immediately for `Severity::kVERBOSE`, before bounded copy,
+  output, truncation bookkeeping, or error bookkeeping. Continue to emit and
+  bound INFO, WARNING, ERROR, and INTERNAL_ERROR; any captured-message
+  truncation remains fatal, and ERROR/INTERNAL_ERROR continue to set sticky
+  fatal state. Both S and X maintenance contracts pin `minimum_severity=info`,
+  `verbose=ignored_before_copy`, `captured_message_truncation=fatal`, and
+  `error_state=sticky_fatal`. Producer and independent transcript proof require
+  one exact marker for each property.
+- **Rationale:** Transaction `20260711T131135058479Z` proved the preceding
+  8 GiB S workspace policy successfully generated an engine in 55.7403 seconds.
+  The old wrapper observed 4,880 MiB across only 19 coarse samples, which is not
+  an authoritative peak; TensorRT's 4,603 MiB result covers only its allocator.
+  Publication was nevertheless withheld because
+  the previous logger bounded every severity and one overlong message among
+  55,191 VERBOSE diagnostics set its sticky truncation flag. The log contained
+  25 INFO, three WARNING, zero ERROR, and zero INTERNAL_ERROR messages. Ignoring
+  only VERBOSE aligns logging admission with the useful diagnostic threshold;
+  weakening captured-message truncation or real-error checks would discard the
+  fail-closed proof boundary and is explicitly rejected.
+- **Failure and rollback evidence:** The builder failed after serialization and
+  before candidate write, so no candidate was published. The host transaction
+  completed candidate cleanup, found the engine already absent, reported the
+  realization already prior, and preserved
+  `493d1cdb168a80751a366b0d12382e0e647e1a2a91b35cc14ee3c09a48a95bb0`.
+- **Provenance boundary:** The logger implementation is shared, so its source
+  digest changes both unrealized Wholebody contracts; both also gain the exact
+  logger-policy object. The immutable predecessor is the artifact-root-relative
+  snapshot
+  `source_contract_rebase/inputs/20260711T131400Z-wholebody-logger-info/old_engine_source_contracts.json`
+  with SHA-256
+  `67597d75664b42841bb5dea232b42e312306622e6496abb3f57689ad5c5e4a85`.
+  No engine, external realization, or tracked asset manifest changes during this
+  implementation step.
+- **Validation:** A host-compiled harness extracts and executes the production
+  Logger class: overlong VERBOSE causes no output/state, overlong INFO/WARNING
+  sets fatal truncation state, overlong ERROR/INTERNAL_ERROR sets truncation and
+  sticky error state, and a normal real error remains sticky. Strict pinned
+  TensorRT 10.14.1.48 compilation, 148 focused producer/proof/rollback/
+  provenance/adversarial tests, and isolated S/X no-GPU plans pass. The builder
+  digest is
+  `2ef26613e87ff9bafb68e8e400e3e596012d75f7b98ff54276ae180154849780`;
+  the source-contract digest is
+  `7049fe51e553393a5aa4d646ac792c2233dd38849c7f1e022c74854e787aecca`.
+  A deterministic dry-run at `2026-07-11T13:18:00Z` proposes realization
+  `e87a620dbcc1f231cc8e2e753e20fe49babb00322ce1184f71fba09a697a501b`
+  with only `source_contracts.sha256` and `updated_at_utc` changed. Apply and a
+  new real build remain separately authorized gates.
+- **References:** `DS9/csrc/wholebody49_engine_builder/`,
+  `DS9/config/engine_source_contracts.json`,
+  `DS9/DS9_REBUILD_AND_SMOKE_GATES.md`,
+  `DS9/tests/test_engine_build_specs.py`,
+  `DS9/tests/test_wholebody_builder_maintenance_proof.py`.
+
+# 2026-07-11 — Engine realization requires durable raw NVML guard evidence
+
+- **Area:** DS9 TensorRT engine maintenance, finalization, and realized
+  provenance
+- **Decision:** Create each maintenance container without starting it, launch an
+  NVML-v2 sampler bound to the exact GPU UUID/index, engine, container,
+  transaction digest, artifact-root ID, and wrapper PID/start ticks, require an
+  initial sample, and only then start the container. Sample raw used/reserved
+  bytes every 25 ms and reject any raw-byte guard breach, NVML failure, sampler
+  death, malformed evidence, or gap above 250 ms. Store the mode-0600 JSONL at
+  `models/engine_finalize/<transaction>-<engine>/gpu-memory.jsonl` inside the
+  retained mode-0700 transaction cohort. Persist its exact path, digest,
+  identities, policy, and independently reconstructed summary under
+  `provenance.maintenance.gpu_memory_guard`. Finalization, reconciliation, and
+  later authoritative realization validation each reopen and reconstruct the
+  raw evidence; a mutating direct reconcile cannot omit the guard.
+- **Compatibility boundary:** Wholebody49 always requires the guard. Existing
+  non-Wholebody realization records are not broadly grandfathered by schema or
+  timestamp. Only the eight exact artifact ID/output digest/maintenance
+  path/secure maintenance digest tuples present at the
+  2026-07-11T13:18:00Z cutoff may remain guardless. Changing any tuple consumes
+  the exemption. A present null or malformed guard is invalid. Authoritative
+  provenance validation also requires file checks; it cannot return success
+  with `check_files=False`.
+- **Rationale:** Transaction `20260711T132034937854Z` generated and independently
+  deserialized a 25,348,956-byte S engine but finalization exposed a missing
+  caller-known maintenance-manifest path and rolled the no-prior engine back.
+  The old wrapper's 4,846 MiB result came from 20 coarse samples while an
+  operator observed roughly 9,472 MiB. The preceding 4,880 MiB result was
+  similarly coarse, and TensorRT's 4,603 MiB metric was allocator-scoped. None
+  can prove compliance with the 9,000 MiB S ceiling. Starting a high-frequency
+  monitor before GPU work and making its raw evidence part of artifact
+  acceptance closes both the transient-sampling gap and the direct-reconcile
+  omission path.
+- **Trust boundary:** This is fail-closed operational evidence under the
+  appliance's same-UID private-file model, not cryptographic attestation. The
+  evidence and maintenance host-transaction fields could still be fabricated by
+  a hostile process with the same UID. Cross-checking the eventually committed
+  finalizer transaction is retained as hardening debt because realization
+  validation occurs before the transaction transitions from prepared to
+  committed.
+- **Validation:** The sampler/Wholebody/reconcile/finalizer suite passes 94
+  tests; the complete maintenance-wrapper suite passes 33, including transient
+  breach, already-exited sampler, sampler death, evidence mutation/absence,
+  direct-reconcile omission, strict legacy exemption, and transaction-versus-
+  realization equality. Live read-only validation accepts the unchanged eight
+  pre-guard records at realization
+  `e87a620dbcc1f231cc8e2e753e20fe49babb00322ce1184f71fba09a697a501b`
+  with zero errors or blockers. No engine build or GPU run was performed after
+  this design change.
+- **References:** `DS9/scripts/nvml_gpu_memory_sampler.py`,
+  `DS9/scripts/run_canonical_engine_maintenance.sh`,
+  `DS9/scripts/finalize_engine_realization.py`,
+  `DS9/scripts/reconcile_engine_provenance.py`,
+  `DS9/scripts/validate_asset_manifest.py`,
+  `DS9/tests/test_nvml_gpu_memory_sampler.py`,
+  `DS9/tests/test_engine_maintenance_wrapper.py`.
+
+# 2026-07-11 — Tier-4 browser evidence is a private exact-state admission contract
+
+- **Area:** DS8/DS9 to Menon cross-space validation
+- **Decision:** Admit live Tier-4 browser evidence only when a fresh authenticated
+  owner/operator session proves the exact final same-origin page, and the page's
+  canonical world state, presentation/debug snapshot, active scene cohort,
+  current render paths, authored transform, entity identity and lifecycle,
+  timestamps, backend positions, and rendered positions agree under one
+  run/sequence cursor. DS8 and DS9 are valid producers of that shared contract;
+  replay/test producers and self-labeled debug or latest-path arrays are not.
+  Browser snapshots, traces, screenshots, and reports are private household
+  evidence and therefore require owner-only directories and files.
+- **Rationale:** A plausible path array or an authenticated page alone cannot
+  prove that Menon rendered current canonical Noesis state. Exact cross-surface
+  binding prevents stale, mixed-run, transformed, spoofed, or selectively copied
+  debug data from being promoted as integration evidence, while producer-neutral
+  admission preserves the DS8-to-DS9 cutover boundary.
+- **Validation:** The canonical browser fixture passes the shared trace report.
+  Focused tests reject absent or expired session proof, origin/final-URL changes,
+  stale entities, cursor and path drift, inactive cohorts, identity/lifecycle
+  changes, wrong positions or transform counts, and unsafe evidence paths; IPv4
+  and IPv6 LAN origins are normalized canonically.
+- **References:** `noesis/validation/menon_browser.py`,
+  `scripts/noesis_validation_capture_menon_trace.py`,
+  `plans/noesis_menon_validation/validation_tiers.md`,
+  `plans/noesis_menon_validation/minimal_menon_browser_snapshot.json`.
+
+# 2026-07-11 — DS9 static ownership truth is separate from dynamic acceptance
+
+- **Area:** DS8-to-DS9 successor governance and runtime evidence promotion
+- **Decision:** Keep `DS9/docs/runtime_ownership.yaml` selector-free. Its status
+  describes static implementation/contract truth only: implemented surfaces may
+  be `parity`, `shared`, or `adapter_specific` while current evidence is absent;
+  `known_gap` and `blocked` remain normative and cannot be overridden. Store
+  realized/runtime selectors only in a fixed owner-private external registry
+  below the explicit DS9 runtime root. Registry events use canonical unique-key
+  JSONL, a global hash chain, explicit per-key supersession, current matrix and
+  checkout digests, complete artifact/session bindings, a persisted head,
+  descriptor CAS, advisory locking, and fsync before success.
+- **Rationale:** Editing hashes into the tracked matrix made promotion mutate
+  the checkout it was meant to prove and created a matrix-digest deadlock.
+  Independent static and dynamic axes preserve honest contract state, let a
+  current promotion clear only an evidence requirement, and intentionally
+  invalidate prior promotions when real policy changes.
+- **Behavior evidence:** Wholebody, floorplan, and V3DT world claims now seal
+  bounded timestamped minimal-field source transcripts, matching the existing
+  identity/semantic replay model. Reports are exactly recomputed and their
+  source windows must fall inside the inspected container lifetime. Images,
+  raw embeddings, full payloads, and secrets are excluded.
+- **Trust boundary:** This is tamper-evident under the appliance's owner-private
+  same-UID model, not remote attestation. A hostile same-UID process can rewrite
+  both registry and head; a privileged or remote monotonic anchor is future
+  hardening. One-sided rollback, truncation, splice, branch, and conflict are
+  rejected now.
+- **Validation:** Offline adversarial coverage includes selector-free policy,
+  static blocker precedence, missing-evidence blockers, current and stale matrix
+  epochs, explicit supersession/revoke, digest/chain/duplicate-key/rollback and
+  symlink rejection, session/event binding, source privacy/replay, Docker
+  swappiness, and terminal launcher/checkout CAS. No live runtime or GPU action
+  is part of registry recording.
+- **References:** `DS9/scripts/validate_runtime_ownership.py`,
+  `DS9/scripts/runtime_ownership_registry.py`,
+  `DS9/scripts/promote_runtime_ownership_evidence.py`,
+  `DS9/docs/runtime_ownership_evidence.md`.
+
+# 2026-07-11 — Wholebody49 tactic admission and the full-device build guard are separate contracts
+
+- **Area:** DS9 TensorRT 10.14 Wholebody49 S-mask and X-box engine maintenance
+- **Decision:** Keep S at builder optimization level 0, 6 GiB WORKSPACE, and
+  2 GiB TACTIC_DRAM, with a 10,000 MiB outer NVML guard. Keep X at optimization
+  level 3, 4 GiB WORKSPACE, 2 GiB TACTIC_DRAM, and its existing 11,000 MiB
+  outer guard. WORKSPACE must be positive and MiB-aligned; TACTIC_DRAM retains
+  TensorRT's positive power-of-two rule. Both variants continue to use the
+  DS9-owned C++ builder, exact fixed batch-three profiles, FP16, unchanged tactic
+  sources/auxiliary-stream policy, private source/ONNX snapshots, exclusive
+  candidate creation, and independent candidate/final deserialization.
+- **Why:** The final S mask node requires a 4,571,136,000-byte half-format
+  tactic, so 2 GiB WORKSPACE cannot build the graph. The installed TensorRT
+  10.14 headers define WORKSPACE as intermediate operation memory and level 0 as
+  selecting the first tactic that succeeds. A successful builder transcript
+  separately reported a 4,603 MiB TensorRT allocator peak. Full-device NVML
+  evidence nevertheless remained near 9.48 GiB: transaction
+  `20260711T150649395390Z` reached 9,481 MiB with 8 GiB WORKSPACE, while
+  `20260711T151452845569Z` reached 9,476 MiB with 6 GiB. WORKSPACE reduction is
+  therefore not a valid process-peak control. A 10,000 MiB S guard accepts the
+  repeatable measured envelope while preserving more than 2 GiB free on the
+  12 GiB target and remaining stricter than the X guard.
+- **Source realization:** Builder SHA-256
+  `2d751f52fc095bd90e418e048fad8296653875d43b8a18871d5b0a7c7938dc67`
+  and source-contract SHA-256
+  `7ddd449c82e80d5c3195c0ccfb4ba4c3d4d542c654234f5d1f31d4ea549a20e0`
+  were applied through append-only source-rebase transaction
+  `20260711T151317697215Z`, producing realization
+  `f1bad48cc1638399da2a08f614801c7120409a8d8a8fc5c730f846146f231224`.
+  The first 10,000 MiB S build generated and loaded a candidate, but transaction
+  `20260711T151938705545Z` rejected a disconnected source-rebase graph and
+  rolled back. The corrected validator requires an exact internal rebase graph
+  while allowing only a monotonic successor realization: no realized artifact
+  may disappear and the realization timestamp must strictly advance.
+- **Realized result:** Committed transaction `20260711T152338477896Z` installed
+  the mode-0600, 25,327,772-byte S engine at SHA-256
+  `1fb95225e8258af13ac96de5136b85dadb60419a8c49058e70536eef06dd6bdf`.
+  Its sealed guard evidence contains 2,738 samples, a 27.742316 ms maximum gap,
+  and 9,481 MiB maximum observed. Committed transaction
+  `20260711T152552934749Z` installed the mode-0600, 108,579,580-byte X engine at
+  SHA-256
+  `a5f4322d7e123461a1bbc64388b6f0e30c9359091e76ac7a95144648841138c3`.
+  Its evidence contains 12,750 samples, a 30.858598 ms maximum gap, and 1,017
+  MiB maximum observed. Candidate and installed-path deserialization passed for
+  both. The final ten-engine realization is
+  `99dc3aba39f6a177f404a22ac70e02b2109c89ca476eb717540e3577a4ad614b`;
+  canonical, V3DT, and Wholebody49 profiles pass file/provenance validation.
+- **Boundary:** These results prove deterministic artifact realization and the
+  sampled build-memory envelope. They do not prove live S-mask or X-box quality,
+  occupied-scene behavior, throughput, runtime memory stability, or cutover
+  readiness; those remain separate typed runtime-evidence gates.
+- **References:** `DS9/csrc/wholebody49_engine_builder/`,
+  `DS9/config/engine_source_contracts.json`,
+  `DS9/scripts/run_canonical_engine_maintenance.sh`,
+  `DS9/scripts/validate_asset_manifest.py`,
+  `DS9/DS9_REBUILD_AND_SMOKE_GATES.md`.
+
+# 2026-07-11 — Wholebody runtime promotion requires three replayable truths
+
+- **Area:** DS9 Wholebody49 live quality, resources, media, and ownership
+- **Decision:** A Wholebody49 promotion requires three distinct typed documents
+  from one terminally sealed supervisor session: occupied parser-path evidence
+  v2, direct-RTSP plus WebRTC decoded-media evidence, and generic resource-soak
+  evidence v2. Occupancy is never inferred from resource or media health. The
+  occupied transcript records only timestamp, source ID, frame ID, person count,
+  three zero-copy counters, and readiness/error booleans; it requires the exact
+  configured source inventory, at least 30 seconds, strictly advancing frames,
+  a provisional 2 frame-ID/s floor per source, and no observation gap above 2.5
+  seconds. An empty house is explicitly `scene_status=empty` and cannot pass.
+- **Resource boundary:** V3DT and both Wholebody lanes share the same 300-second,
+  five-second-sample, 60-second-warmup evaluator. It rejects OOM/OOM-kill,
+  cgroup memory at 20 GiB, post-warmup growth above 512 MiB or slope above 1
+  MiB/s, PIDs at 4096, S GPU process memory at 10,000 MiB, and X/V3DT GPU
+  process memory at 11,000 MiB. Every sampled GPU owner must descend from the
+  exact container. The report and raw samples bind container, image, checkout,
+  realization, primary lane engine, pipeline config, and camera config. These
+  are provisional fail-closed policy bounds, not empirical throughput claims;
+  they are never relaxed automatically.
+- **Media/lifecycle boundary:** The media report persists only closed connection
+  states and aggregate RTP/decode counters, requires at least one directly
+  decoded RTSP H264 frame and one decoded WebRTC frame, and contains no image,
+  SDP, ICE, address, or secret payload. CPU `avdec_h264` exists only in this edge
+  validation client. The runtime-session validator separately requires exact
+  readiness, container inspection, zero OOM, exit zero, acknowledged ordered
+  EOS, removal, closed ports, unchanged checkout, current artifacts, and
+  terminal launcher/checksum CAS. The retired V3DT-only soak contract is
+  rejected rather than silently reinterpreted.
+- **Validation:** Focused producer, transcript, decoded-media, resource,
+  supervisor, runner, ownership-replay, and adversarial tests pass without
+  starting a runtime, Docker container, or GPU workload. Fresh live S and X
+  sessions remain required.
+- **References:** `DS9/scripts/wholebody49_occupied_scene_smoke_test.py`,
+  `DS9/scripts/wholebody49_media_decode_gate.py`,
+  `DS9/scripts/run_canonical_runtime_container.py`,
+  `DS9/scripts/validate_runtime_ownership.py`,
+  `DS9/docs/runtime_ownership_evidence.md`.
+
+# 2026-07-11 — Selector-bound appliance admission and shared state ownership
+
+- **Area:** DS8/DS9 deployment, runtime identity, mutable product state, health
+- **Decision:** Appliance deployment uses one closed canonical selector and the
+  cross-language `noesis-runtime-v1` identity. A clean Git revision/tree is not
+  sufficient: the identity also byte-binds every approved ignored runtime
+  directory, native extension, parser, and selected external model artifact.
+  Admission rejects duplicate JSON keys, noncanonical bytes, checkout drift,
+  symlink/hardlink escapes, and mutation during inventory. DS9 repeats the full
+  identity immediately before container exec; health retains the exact selector
+  digest instead of claiming a full rehash on each request.
+- **State boundary:** The selected release owns exact analytics, identity, and
+  world schema versions plus an immutable activation baseline. Its four mutable
+  payload files and release-local build directory are bound by exact process
+  environment and admitted inode cohort, rechecked immediately before runtime
+  state use. DS9 mounts those same selected stores into canonical container
+  paths; it does not seed, copy, or fall back to canary state. The selected DS9
+  executable is frozen to the canonical owner-owned, single-link supervisor.
+  Menon owns the one full-runtime shared release lease. Noesis accepts no nested
+  lease interface or inherited lease variable.
+- **Health boundary:** Selector-driven REST health v1 and WebSocket health v2
+  require one exact producer identity and healthy advancing
+  `tracking_observations` plus `global_world`. Non-selector WebSocket health
+  remains v1. A selector runtime that is not ready closes/fails; it never emits
+  partial selector health or downgrades to v1.
+- **Rationale:** A release is a coherent product deployment, not a source commit
+  plus whichever ignored engines, writable databases, or cached configs happen
+  to be present. Binding code, runtime bytes, state, producer progress, and
+  lifecycle ownership prevents split truth while keeping mutable home state
+  outside immutable checkouts.
+- **Validation:** Generated schema drift passes; focused Noesis appliance,
+  health, inference-path, DS9 supervisor/mount, and cross-language Menon
+  deployment/release tests pass without launching Docker, a service, or GPU
+  work.
+- **References:** `contracts/noesis-runtime-v1.md`,
+  `noesis_core/appliance.py`, `noesis/ds8_runtime.py`,
+  `DS9/scripts/run_canonical_runtime_container.py`,
+  `docs/DS8_api_contracts_rest.md`, `docs/DS8_api_contracts_ws.md`.
+
+# 2026-07-11 — Canonical BEV ownership and raw-only capture-event fusion
+
+- **Area:** DS8/DS9 local BEV display, capture-event depth fusion, and failure truth
+- **Decision:** Keep one SDK-neutral BEV implementation at
+  `noesis/telemetry/bev.py`. DS9 extends the telemetry namespace and may not
+  shadow that module. Ownership evidence is an isolated DS9-first import-origin
+  check plus the canonical 25-case behavior characterization, not source-string
+  resemblance.
+- **Decision:** Reset camera-local smoother and tracker trail history when the
+  selected measurement source or active floorplan coordinate-space signature
+  changes. A failed current homography is not replaced with a cached transform;
+  homography and publication failures update structured health and invoke the
+  runtime failure callback.
+- **Decision:** `noesis_core.capture_event_fusion` owns one deterministic,
+  raw-only intra-capture cohort. Cache-only requests reject before any provider
+  or write; derived inputs, mixed scopes, duplicates, stale baselines, overwide
+  cohorts, and result/source substitution fail closed. Optional RGB must be a
+  typed timestamped frame already offered by the active pipeline. No second
+  source reader, CPU decode branch, or hidden RGB fallback is permitted.
+- **Runtime boundary:** Current DS9 hooks do not expose a legitimate full RGB
+  frame. Initial runtime integration therefore uses explicitly requested
+  depth-only fusion or returns `rgb_frame_unavailable`; GPU-first RGB enrichment
+  is separate. DS8, protected V3DT, and DS9 now share the same owned controller,
+  active-floorplan registry, failure callback, and exact response provider;
+  real DS9 promotion evidence remains a separate release gate.
+- **Validation:** Canonical BEV `25/25`; combined focused BEV, capture-fusion,
+  and ownership tests pass without a runtime, GPU, camera open, or network
+  source.
+- **References:** `noesis/telemetry/bev.py`,
+  `noesis_core/capture_event_fusion.py`, `DS9/tests/test_bev_parity.py`,
+  `DS9/tests/test_capture_event_fusion.py`,
+  `DS9/docs/bev_capture_event_integration.md`.
+
+# 2026-07-11 — Tracker-lifetime identity continuity and exact embedding provenance
+
+- **Area:** Shared DS8/V3DT/DS9 household identity and public observation truth
+- **Decision:** Once identity-v2 accepts a subject for a camera-local tracker,
+  hard-mask every alternative subject until the tracker state expires after a
+  real fresh-evidence gap. The locked subject receives no force-match bonus: it
+  must still pass all prior-independent open-set and exclusivity gates, else the
+  fresh result is unknown. A post-resolution invariant also downgrades any
+  concurrent gallery-race subject change to unknown.
+- **Decision:** The process-owned v2 adapter, not legacy StableID cache
+  diagnostics, owns exact-frame `embedding_present`. Fresh server evidence
+  carries its observation key, and enabled shadow capture adds only the complete
+  persisted sequence/model/dimension triad to both public and canonical
+  observation surfaces.
+- **Decision:** Shadow JSONL consumes the resolver's exact post-constraint
+  candidate rows. It does not recompute a second gallery snapshot after or
+  alongside resolution, so continuity/copresence masks and their reasons remain
+  replayable and cannot drift across a retention mutation.
+- **Decision:** DS9 must construct legacy StableID under the same default-on
+  household policy as DS8. Household admission forces and verifies
+  `auto_merge_enabled=false` and `allow_multi_zone_active=false`; an old
+  environment request cannot override those invariants.
+- **Rationale:** The first sealed occupied DS9 baseline transcript observed a
+  same-tracker visitor switch within 0.683 seconds, stale frame-level embedding
+  claims without persisted association, and a DS9-only automatic alias merge.
+  These violated tracker continuity, semantic provenance, and the no-pressure-
+  merge product rule while identity-v2 remained shadow-only.
+- **Validation:** Deterministic replay of the contested two-track assignment,
+  exact service provenance tests, and isolated DS9 builder-policy execution all
+  pass without launching Docker/GPU work or altering the sealed evidence.
+- **References:** `plans/household_identity/decisions.md`,
+  `docs/DS8_api_contracts_ws.md`, `docs/DS8_metadata_contracts.md`,
+  `DS9/docs/migration_state.md`.
+
+# 2026-07-11 — Depth snapshots are immutable transactional commits
+
+- **Area:** Shared DS8/V3DT/DS9 MapAnything snapshot storage and fusion
+- **Decision:** Admit every depth snapshot as a unique camera/timestamp write
+  with a process-unique write ID and monotonic sequence through one bounded
+  queue. Publish only a validated same-parent staging tree carrying a complete
+  file-hash commit manifest, using no-replace rename and parent-directory fsync.
+  A write failure permanently poisons the manager with the first failure;
+  callers receive exact write, flush, and shutdown receipts instead of inferred
+  queue state or synchronous fallback behavior.
+- **Decision:** Treat committed snapshot trees as immutable. RGB and fusion
+  provenance must be part of the original atomic job; post-commit dataset or
+  attribute attachment is rejected. Fusion pins every source against retention
+  until its exact derived commit completes. Startup indexes only fully validated
+  committed manifests in timestamp order. Pre-contract Zarr trees are reported
+  and ignored unless an operator explicitly republishes one through the
+  validation-and-commit migration API. A public immutable snapshot descriptor
+  binds camera, timestamp, write sequence, path/reference, manifest/content
+  digests, and role. Fusion seals that identity for every requested source and
+  rejects the entire operation if any member cannot be proven exactly.
+- **Decision:** A MapAnything result is not observable until its exact write
+  handle returns a commit receipt. DS8, protected V3DT, and DS9 wait within the
+  shared finite 0.1–60 second bound (30 seconds default); failure poisons the
+  worker and signals runtime shutdown before any frame receipt or telemetry is
+  emitted. The former storage-disable `memory://` publication path is retired,
+  with no direct-write fallback.
+- **Rationale:** A returned pathname previously meant only that work might have
+  been queued; queue pressure silently switched to direct writes, worker errors
+  were log-only, two workers could disorder the newest index, fusion attributes
+  were mutated after a generic flush, and retention could remove active fusion
+  inputs. Those behaviors made durability, restart recovery, and shutdown
+  evidence unknowable. The transactional boundary makes every accepted or
+  rejected state replayable without introducing a second storage path.
+- **Validation:** `tests/test_depth_storage_transactions.py` exercises blocked
+  writers and deadlines, saturation, disk poison, reordered completion,
+  duplicate reservation, interrupted restart and explicit migration, exact
+  fusion commit, read-lease pruning, immutable RGB input, parent durability,
+  and corruption rejection. `tests/test_depth_capture_event_adapter.py` proves
+  the public descriptor/evidence boundary and derived-input exclusion.
+- **Validation:** `tests/test_mapanything_worker_lifecycle.py` and
+  `DS9/tests/test_mapanything_exact_native_capture.py` prove exact
+  store/receipt/record/publication order plus timeout poison, runtime callback,
+  and no-publication behavior in all active hook families.
+- **References:** `geometry/depth_source.py`,
+  `noesis/depth_capture_event.py`,
+  `tests/test_depth_storage_transactions.py`,
+  `tests/test_depth_capture_event_adapter.py`, `docs/DS8_testing_guide.md`.
+
+# 2026-07-11 — Public controls require an applied-state owner
+
+- **Area:** Noesis WebSocket controls, dashboard, and Menon gateway
+- **Decision:** Retire `update_detection_config`, `set_detection_toggle`, and
+  `ma_heatmap_ready` across the server and clients. Do not acknowledge or
+  rebroadcast an apparent applied state unless an active DS8/V3DT/DS9 runtime
+  callback owns the operation and can return a real receipt.
+- **Rationale:** These routes had no registered runtime callbacks. Detection
+  sliders and toggles only rebroadcast client input, while the heatmap-ready
+  notification performed no server action, creating product UI that looked
+  operational but could not change or confirm runtime state.
+- **Validation:** The WebSocket regression suite asserts the retired routes are
+  absent; the dashboard production build passes; Menon's gateway tests pass
+  under its declared Node 22 runtime.
+- **References:** `websocket_server.py`, `oai2-fe/src/hooks/useWebSocketClient.ts`,
+  `oai2-fe/src/components/ControlsPanel.tsx`,
+  `oai2-fe/src/components/DepthDrawer.tsx`,
+  `Menon/server/gateway/ws-proxy.js`.
+
+# 2026-07-11 — Capture events and active floorplans are exact owned transactions
+
+- **Area:** DS8, protected V3DT, and DS9 depth/floorplan RPCs and inline BEV
+- **Decision:** One synchronous capture controller owns the process-wide
+  MapAnything valve, per-camera admission, worker-idle barriers, durable storage
+  frontiers, and exactly one raw-only fusion. Cache-only requests return before
+  admission or capture. The shared valve prevents safe cross-camera overlap, so
+  concurrent capture attempts fail explicitly with `capture_event_busy` until a
+  source-specific gate exists.
+- **Decision:** A fresh response reloads only the fused commit identified by its
+  canonical camera, portable storage reference, write ID, manifest/content
+  digests, and timestamp. Floorplan generation pins that exact commit and keys
+  its cache by snapshot identity. Every non-cache floorplan request is an
+  explicit fresh capture; it never asks for “latest” before or after fusion and
+  never returns an older cached payload beside a capture error. Exact success
+  atomically publishes isolated bounded memory entries under its write-ID key
+  and explicit cache-only `latest` alias without overwriting the generic disk
+  cache.
+- **Decision:** Inline BEV is locked to `camera_local_ground_m` in every active
+  DS8/DS9 baseline and V3DT configuration. A bounded registry accepts only
+  contract-valid floorplans with exact snapshot and calibration identities;
+  calibration changes clear affected records before publication. Canonical
+  world telemetry remains independently owned in `backend_world_m`.
+- **Decision:** Startup owns Python resources in a reversible transaction until
+  native activation begins. Once activation is attempted, only external ingress
+  may close until a live Service Maker wait owner is proven. Normal teardown
+  releases callback-owned storage and services only after REST, WebSocket,
+  WebRTC, MapAnything, EOS, and wait-loop quiescence receipts succeed.
+- **Rationale:** The former path could open a second RTSP reader, mutate a
+  committed snapshot, fuse the first arriving frame before the cohort drained,
+  race two RPCs through one valve, regenerate a floorplan from a later raw
+  frame, or tear storage down beneath partially activated native callbacks.
+  Those states looked successful but were not replayable or ownership-safe.
+- **Validation:** Transactional storage, controller, exact floorplan, active
+  registry, lifecycle, boundary, and synthetic non-promotable smoke tests cover
+  the CPU-only contract. Promotion still requires fresh real DS9 baseline,
+  V3DT, and Wholebody runtime evidence.
+- **References:** `noesis/capture_event_controller.py`,
+  `noesis/depth_capture_event.py`, `geometry/depth_source.py`,
+  `noesis_core/active_floorplan.py`, `noesis_core/startup_lifecycle.py`,
+  `DS9/docs/bev_capture_event_integration.md`.
+
+# 2026-07-11 — Runtime ownership is one fail-closed transaction through finalization
+
+- **Area:** DS8, protected V3DT, and DS9 process lifecycle ownership
+- **Decision:** Every resource created during reversible startup is registered
+  atomically with its cleanup, and every process-global binding registers an
+  idempotent cleanup before mutation. Registration or installation failure
+  performs and records the exact local rollback; an unproven rollback cannot
+  return normally.
+- **Decision:** A phase-aware main guard owns all otherwise-unhandled failures
+  from the first reversible binding through successful Service Maker wait-owner
+  handoff. Before activation, it drains the transaction. Once activation is
+  attempted, it arms the independent watchdog before closing external ingress,
+  records the exact ingress-cleanup receipt, and preserves callback-owned
+  dependencies until process exit whenever native ownership is ambiguous.
+- **Decision:** Runtime completion is a positive proof, not the absence of an
+  exception. Persistence, owned services, storage, diagnostics, and every
+  process-global binding finalize independently; the startup transaction may
+  become quiesced and the watchdog may be canceled only after every receipt
+  succeeds. No finalizer failure may emit `Shutdown complete`.
+- **Rationale:** Construction, registration, and global installation were
+  separate operations, so exceptions could leave an unowned resource or a
+  partially installed binding. Assembly and wait-handoff exceptions could also
+  escape the lifecycle transaction, while normal teardown could report success
+  after a close or persistence failure. One explicit ownership protocol makes
+  those states fail-closed and keeps DS8/DS9 successor behavior aligned.
+- **Validation:** Focused lifecycle, shutdown-contract, synthetic-backend,
+  storage, diagnostics, and DS9 profile coverage passed 131 tests. Targeted
+  syntax and lint checks passed. Fresh native runtime acceptance remains a
+  separate promotion gate.
+- **References:** `noesis_core/startup_lifecycle.py`,
+  `noesis/ds8_runtime.py`, `noesis/ds8_runtime_v3dt_reimpl.py`,
+  `DS9/noesis/ds9_runtime_core.py`.
+
+# 2026-07-11 — DS9 native freshness is content provenance, not filesystem time
+
+- **Area:** DS9 native extension admission and immutable release worktrees
+- **Decision:** Before any DS9 extension import, attest all six exact native
+  artifacts against the fixed tracked manifest. Admission requires strict
+  unique-key YAML, exact artifact/source/builder membership, validator-identical
+  aggregate source hashing, one active-CPython-ABI output directly under
+  `DS9/native_extensions`, exact output SHA-256, and stable regular owner file
+  identities. Runtime materialization repeats the two depth attestations before
+  graph construction. Multiple wildcard outputs, symlinks, hardlinks, path
+  escape, mutation during read, or any source/output mismatch fail startup.
+- **Decision:** Keep DS8's existing native policy unchanged. DS8 has no
+  equivalent DS9 artifact-manifest authority, and consuming the successor's
+  manifest would collapse the intentional SDK-major ownership boundary.
+- **Rationale:** The first immutable-checkpoint launch rejected an unchanged
+  depth bridge solely because checkout creation made the tracked source mtime
+  newer than its separately hydrated binary. All source aggregates and binary
+  hashes matched reviewed provenance. An isolated rebuild then reproduced five
+  extensions byte-for-byte while two identical CUDA/NPP tensor builds produced
+  different binaries due to NVCC-generated identifier salts. Timestamp order
+  and blind rebuilding are therefore both weaker than exact content identity.
+- **Validation:** Focused provenance, origin, pre-import ordering, manifest
+  ambiguity, inference-runtime, and DS9 profile tests pass. Exact DS9 build and
+  runtime images completed no-GPU rebuild, import/API, and ELF linkage smokes
+  with no device nodes; fresh live baseline acceptance remains a separate gate.
+- **References:** `DS9/noesis/native_artifact_provenance.py`,
+  `DS9/noesis/ds9_runtime.py`, `DS9/scripts/ds9_preflight.py`,
+  `DS9/scripts/validate_asset_manifest.py`,
+  `DS9/tests/test_native_artifact_provenance.py`.
+
+# 2026-07-12 — Validation helpers have explicit repository package authority
+
+- **Area:** Shared authenticated smoke clients and DS9 live evidence runner
+- **Decision:** Treat root `scripts/` as an explicit Python package. Every
+  command that inserts the repository root and imports
+  `scripts.internal_auth_client` must resolve the repository package and helper
+  files exactly; a subprocess regression owns that origin contract.
+- **Rationale:** A healthy sealed DS9 baseline processed advancing world state
+  and RTSP video, but every Python behavior gate exited before connecting. The
+  host had an unrelated regular package named `scripts`; under PEP 420 it won
+  over the repository's implicit namespace even with the repository path first.
+  An explicit package marker removes that environment-dependent ambiguity
+  without duplicating authentication logic or adding an alternate client path.
+- **Validation:** The internal-auth client suite and all 17 authenticated smoke
+  command `--help` imports pass under the same host interpreter that reproduced
+  the collision. Fresh same-checkout live behavior evidence remains required.
+- **References:** `scripts/__init__.py`,
+  `scripts/internal_auth_client.py`,
+  `tests/test_internal_auth_smoke_clients.py`,
+  `DS9/scripts/ds9_live_validation_runner.py`.
+
+# 2026-07-12 — Semantic completeness is a bounded immutable identity cohort (semantic-v2 draft; superseded below)
+
+- **Area:** DS9 occupied semantic acceptance and V3DT runtime ownership
+- **Decision:** An exact public-track/canonical-observation/private-evidence
+  embedding row is the semantic identity anchor. Pose, usable depth, and
+  `backend_world_m` may come from independently scheduled frames only when the
+  selected cohort spans at most 1.5 seconds and every observed frame retains
+  the same runtime run, source, camera, tracker, non-null identity-v2 subject,
+  compatibility SID, resident UUID or visitor generation, and exact
+  calibration/model/config fingerprints. Exact-frame evidence is span zero.
+- **Decision:** Any observed tracker absence, null/conflicting identity,
+  tracker-ID reuse, fingerprint change, replay, or out-of-bound endpoint breaks
+  the cohort. Pose/depth/world availability is reported independently so a
+  failed join cannot be misreported as a missing producer component.
+- **Rationale:** ReID, pose, DAv2 depth, and canonical world run at different
+  cadences. Requiring one lucky all-modal frame rejected healthy pipelines;
+  joining by tracker ID alone could instead splice a reused tracker or changed
+  identity/config. The bounded immutable segment preserves causality without a
+  fallback or temporal smoothing path.
+- **Validation:** The semantic v2 unit suite covers both inclusive endpoints,
+  one-microsecond overflow, cross-camera/run/fingerprint splices, observed
+  disappearance/reuse, null/conflicting identity, resident and visitor
+  continuity, source/private replay, and raw-vector privacy. The live runner
+  and ownership validator require schema/contract v2 and recompute the report
+  from its sealed source transcript plus exact private evidence snapshot.
+- **References:** `DS9/scripts/ds9_semantic_observation_smoke_test.py`,
+  `DS9/scripts/validate_runtime_ownership.py`,
+  `DS9/docs/validation_runbook.md`, `docs/DS8_testing_guide.md`.
+
+# 2026-07-12 — Semantic v3 binds publication, lifecycle, capture, registration, and privacy
+
+- **Area:** DS8/V3DT/DS9 tracking publication and DS9 occupied semantic
+  acceptance.
+- **Decision:** A camera frame ID is not a publication sequence because tracking
+  is intentionally rate limited. The publisher therefore owns one contiguous
+  per-source sequence, while a shared registry processes every frame, assigns a
+  positive tracker lifecycle generation, forces publication whenever the
+  tracker-key set changes, and emits exact disappearance tombstones. A reused
+  numeric tracker ID never inherits the prior lifecycle generation. Because an
+  attached live gate may begin mid-run, its first observed publication sequence
+  and lifecycle generation are explicitly externally unanchored; continuity is
+  claimed only within the sealed acquisition window. Tombstone last-seen
+  frame/time must equal the registry's actual preceding published presence.
+- **Decision:** Semantic cohorts independently bound captured and observed time
+  to 1.5 seconds and require coherent media PTS. Depth qualifies only with
+  `depth_status=ok`, `depth_registration_status=ok`, positive finite
+  `depth_registered_m`, and a finite positive `depth_used_m` matching within
+  relative and absolute tolerance `1e-6` when present. Canonical observations
+  use the actual `camera_calibration`, `tracking_model_manifest`, and
+  `pipeline_config` roles; unavailable calibration is non-qualifying.
+- **Decision:** The source checksum covers the exact wall-clock acquisition
+  start/end. Observed samples must fall inside that closed interval. Capture
+  time may precede its start only by a fixed two-second allowance for bounded
+  receive and processing latency, and may never follow its end. Runtime
+  ownership independently places the acquisition interval inside the inspected
+  container lifetime.
+- **Decision:** The sealed transcript is an explicit semantic projection.
+  Nested identity mappings are exact-projected; sensitive encoded/mixed
+  embedding shapes, nested 256-value tensors, and authentication material are
+  rejected before persistence. A failure seals only a bounded redaction marker,
+  never the offending bytes. Live-runner acceptance exactly replays the
+  owner-private report, projected source, acquisition window, and identity
+  snapshot.
+- **Rationale:** Semantic-v2 was never promoted live and its synthetic fixtures
+  hid incompatible runtime roles, raw-depth admission, ambiguous tracker reuse,
+  observed-time-only joins, duplicate associations, denylist privacy gaps, and
+  incomplete runner validation. An explicit v3 contract is more honest than
+  silently redefining v2.
+- **Validation:** Focused semantic, runtime-world, tracking-continuity,
+  empty-frame, runner, and ownership producer suites cover the discovered false
+  passes and exact v3 replay. Fresh occupied runtime evidence remains required.
+- **References:** `noesis_core/tracking_continuity.py`,
+  `noesis_core/world_service.py`,
+  `DS9/scripts/ds9_semantic_observation_smoke_test.py`,
+  `DS9/scripts/ds9_live_validation_runner.py`,
+  `DS9/scripts/validate_runtime_ownership.py`.
+
+# 2026-07-12 — Semantic v3 authority is lane-neutral and receipt-bound
+
+- **Area:** DS8/protected-V3DT/DS9 tracking lifecycle publication and DS9
+  semantic ownership replay.
+- **Decision:** Keep processed tracker continuity separate from committed public
+  presence. A tombstone names the last successfully published presence, not a
+  later rate-limited frame. Tracking sequence, lifecycle presence, publish-gate
+  timestamp, and published count advance only after the canonical tracking
+  admission succeeds. A failed transition remains due; each retry retains the
+  fixed last-published presence and regenerates its disappearance frame/time.
+  Once canonical admission succeeds, a later auxiliary side-effect failure
+  cannot revoke that receipt.
+- **Decision:** A partial acquisition may accept and count a tombstone without
+  an in-window predecessor only on the first received tracking frame for that
+  source. Every later tombstone must exactly match an in-window published
+  lifecycle presence. Acquisition bounds cover every received tracking frame,
+  including empty frames, and every canonical observation publication clock
+  must satisfy `observed_at_us <= published_at_us <= acquisition_finished_at_us`.
+- **Decision:** All raw WebSocket, report, source-replay, identity-snapshot, and
+  ownership JSON uses the shared unique-key, finite-number UTF-8 decoder before
+  projection or model validation. Duplicate-key source rejection is
+  checksum-covered without retaining the key or payload.
+- **Decision:** The behavior authority is the lane-neutral
+  `semantic_gate_v3`, valid for baseline and V3DT. Baseline ReID promotion
+  requires both `reid_open_set_occupied_v1` and `semantic_gate_v3`; neither
+  evidence document can stand in for the other. Any ownership-attached runner
+  writes the semantic report, source, and exact identity snapshot directly to
+  the checksum-covered launcher directory. Post-gate dispatch supplies only
+  identity arguments to ReID validation and supplies the reviewed pipeline plus
+  exact identity-snapshot path to semantic validation.
+- **Rationale:** Processed frames are not downstream facts; treating them as
+  published created unverifiable tombstones and allowed failed transitions to
+  consume continuity state. Partial live capture needs one explicit boundary
+  exception, not a permanent missing-predecessor escape. Neutral semantic
+  ownership prevents baseline ReID promotion from claiming live multimodal
+  completeness with identity evidence alone.
+- **Validation:** Shared strict-JSON, semantic-gate, ownership-producer,
+  live-runner, tracking-continuity, publisher, empty-frame, DS9 parity, and
+  runtime-world focused suites pass. Fresh occupied baseline and V3DT runtime
+  evidence remains required.
+- **References:** `noesis_core/strict_json.py`,
+  `noesis_core/tracking_continuity.py`, `noesis/telemetry/publishers.py`,
+  `DS9/scripts/ds9_semantic_observation_smoke_test.py`,
+  `DS9/scripts/ds9_live_validation_runner.py`,
+  `DS9/scripts/validate_runtime_ownership.py`.
+
+# 2026-07-12 — Behavior acceptance replays producer evidence instead of trusting reports
+
+- **Area:** DS9 behavior evidence, live-runner post-validation, and runtime
+  ownership promotion.
+- **Decision:** Identity shadow, V3DT world, Wholebody occupied, and Wholebody
+  decoded-media producers each export one strict sealed-evidence validator.
+  Validators read only owner-private single-link bounded files with canonical
+  names, reject duplicate-key/non-finite JSON, verify source digest and exact
+  session/lane/runtime identity, reconstruct the canonical source, rerun the
+  producer analyzer, and require exact canonical report equality. V3DT also
+  rebuilds and compares the live config/launch-plan binding.
+- **Decision:** Identity source evidence advances from v1 to v2. V2 seals the
+  exact gate policy and projected before/after health snapshots needed to
+  recompute health and claim rows. V1 cannot prove those claims and receives no
+  compatibility route. V3DT world v2, Wholebody occupied v2, and decoded-media
+  v1 remain version-stable.
+- **Decision:** The live runner invokes producer validators for ReID, semantic,
+  floorplan, V3DT world, Wholebody occupied, and Wholebody media (the latter
+  behind the `webrtc` step). It validates only after a successful, non-timeout,
+  zero-return-code subprocess and appends `exact_source_replay=pass` only after
+  exact replay. Authenticated capability/WS health and supervisor launch/runtime
+  identity JSON use the shared strict decoder before existing contract checks.
+- **Rationale:** A report and matching source hash can still collude if the
+  runner trusts report fields or if the source omits inputs used to derive a
+  claim. Producer-owned replay closes that gap and prevents stale files from a
+  failed subprocess from being mistaken for fresh evidence.
+- **Validation:** Adversarial tests cover report mutation, source mutation,
+  duplicate keys, non-finite input, schema/version drift, real V3DT
+  config/launcher rebinding, all runner dispatch branches, and failed/timeout
+  suppression. Focused producer, runner, ownership, registry, and promotion
+  suites pass without live runtime or GPU use.
+- **References:** `DS9/scripts/ds9_identity_shadow_live_gate.py`,
+  `DS9/scripts/v3dt_world_contract_smoke_test.py`,
+  `DS9/scripts/wholebody49_occupied_scene_smoke_test.py`,
+  `DS9/scripts/wholebody49_media_decode_gate.py`,
+  `DS9/scripts/ds9_live_validation_runner.py`,
+  `DS9/scripts/validate_runtime_ownership.py`.
+
+# 2026-07-11 (local) — Inline BEV authority and publication are exact pairs
+
+- **Area:** DS8/protected-V3DT/DS9 BEV telemetry, floorplan readiness, and live
+  acceptance
+- **Decision:** Keep inline floorplan BEV locked to
+  `camera_local_ground_m`/meters. Every BEV frame carries exact source ID, frame
+  ID, and observation time, and every current footpoint repeats the frame ID.
+  Validation joins that exact cohort and independently applies the calibrated
+  world-to-camera transform, registered-depth unprojection, or image-ray/floor
+  intersection declared by `displaySource`; it never directly subtracts
+  canonical `backend_world_m` coordinates from camera-local coordinates.
+- **Decision:** A configured active-floorplan provider is the sole bounds
+  authority. Before its first valid record, `None` records
+  `startup_pending` and emits no camera-local BEV/status or fatal callback; it
+  does not select config bounds or auto extents. Invalid provider data fails
+  immediately, and any missing/invalid authority after readiness is fatal with
+  state `lost`. A successfully emitted exact empty frame is still a renderer
+  success and `active_ready`; `inactive_ready` means no exact BEV success yet,
+  not empty occupancy. The replayable DS9 floorplan behavior gate is v4 and
+  retains N/N exact fresh/cache-only floorplan and active-registry checks.
+- **Decision:** While BEV is configured, tracking and BEV use one pair-safe
+  interval: `max(selected tracking interval, BEV interval)`. Tracking publishes
+  first and BEV runs only after that same-frame publication succeeds. Count
+  transitions and tracker-lifecycle/key-set changes force both pair members;
+  tracking failure suppresses BEV. Without BEV, the tracking cadence is
+  unchanged.
+- **Decision:** Registered-depth admission is shared by canonical observations,
+  BEV production, and the independent parity oracle: both statuses must be
+  `ok`, `depth_registered_m` must be positive and finite, and a present
+  `depth_used_m` must match it within relative/absolute tolerance `1e-6`.
+  Protected V3DT also scales every source-frame image anchor/candidate/bbox into
+  the active calibration image size before BEV projection, matching DS8 and
+  DS9.
+- **Rationale:** Independent tracking/BEV gates could publish an unjoinable BEV
+  frame above 15 fps. Treating the empty startup registry as a fatal floorplan
+  loss could terminate the runtime before a capture could establish authority,
+  while reusing config bounds would conceal the same defect. Finally, loose
+  depth admission and unscaled V3DT pixels could make validation disagree with
+  canonical world semantics. One authority lifecycle, one exact publication
+  pair, and one depth/image-space contract make the display replayable.
+- **Validation:** Focused root BEV/depth/parity suites passed (115), focused DS9
+  parity suites passed (112), and the pair-safe root/DS9/V3DT suites passed (81
+  root plus 101 isolated DS9). Python compilation and Ruff checks were clean
+  apart from repository-preexisting hook import-order suppressions. Fresh native
+  runtime promotion remains a separate gate.
+- **References:** `noesis/telemetry/bev.py`,
+  `noesis_core/depth_contract.py`, `noesis_core/runtime_health.py`,
+  `noesis_core/tracking_continuity.py`,
+  `noesis/pipelines/hooks_v3dt_reimpl.py`,
+  `scripts/menon_bev_track_parity_smoke_test.py`,
+  `DS9/scripts/ds9_floorplan_live_gate.py`.
+
+# 2026-07-12 — MapAnything engines require functional admission before install
+
+- **Area:** DS9 MapAnything TensorRT maintenance and realization
+- **Decision:** Select correctness-first FP32 for the next DS9 MapAnything
+  engine and omit a precision flag entirely. Before `install_candidate`, run
+  exactly one real TensorRT inference against a tracked-hash, owner-private,
+  identical-batch fixture and seal a receipt binding candidate bytes, fixture,
+  exact command, build/runtime platform, float32 IO, finite and positive
+  counts, confidence sentinel rejection, mask coverage, distribution envelope,
+  batch consistency, and raw output evidence. The host finalizer and direct
+  realization reconciler must independently revalidate that receipt and the
+  installed bytes before publishing realization.
+- **Rationale:** The prior FP16 engine passed build and independent
+  deserialization but emitted all-NaN depth, an all-zero mask, and invalid
+  confidence sentinels. The isolated FP32 diagnostic was finite, positive,
+  dense, and batch-consistent; BF16 was finite but materially farther from the
+  DS8-good reference. Deserialization therefore proves compatibility, not
+  function. Placing the gate before atomic replacement prevents a broken plan
+  from becoming canonical, while revalidation closes forged-receipt and direct-
+  reconcile publication paths. FP32 functional admission still does not claim
+  DS8 parity or live multi-camera quality.
+- **Validation:** Focused source, admission, wrapper, finalizer, reconciliation,
+  and adversarial numeric tests cover empty precision argv, skip-inference-only
+  proof, NaN/Inf, confidence sentinels, zero masks, envelope drift, batch
+  divergence, changed receipt/engine hashes, prior-engine preservation, and a
+  valid atomic install. Guarded transaction `20260712T052425739603Z` then
+  installed the 3,883,865,652-byte engine at SHA-256
+  `eabc1169c7d725ed7cff171ed54c402c4282fdcf23b87a58f4e41a95fe23ecc8`.
+  Real batch-three inference produced finite positive depth/confidence and
+  99.9954% mask coverage; both loads passed, and 8,038 NVML samples observed a
+  4,655 MiB peak with a 29.100129 ms maximum gap. Final realization
+  `6fab7d456c031490f640ee2c3ce5a38922a96ed86a965020ca3051820306dce4`
+  passes canonical, V3DT, and Wholebody49 file/provenance validation. Live
+  multi-camera depth/floorplan quality remains separately gated.
+- **References:** `DS9/scripts/rebuild_engines.py`,
+  `DS9/scripts/engine_maintenance_common.py`,
+  `DS9/scripts/finalize_engine_realization.py`,
+  `DS9/scripts/reconcile_engine_provenance.py`,
+  `DS9/docs/MapAnything_Engine_Parity_Plan.md`,
+  `DS9/tests/test_mapanything_engine_quality_gate.py`.
+
+# 2026-07-12 — Canonical publication is release-gated by committed authority
+
+- **Area:** DS8/protected-V3DT/DS9 tracking, global world, BEV, WebSocket
+  lifecycle, and shutdown
+- **Decision (tightening the 2026-07-11 exact-pair decision):** Cross-thread
+  WebSocket sends return typed sender-admission receipts or raise typed
+  lifecycle/capacity failures. Admission is finite by in-flight count,
+  batch-message count, and encoded bytes. Public JSON is finite-only and is
+  encoded once into immutable bytes before receipt; post-receipt caller mutation
+  cannot change delivery. A canonical tracking/world/event batch receives an
+  unresolved one-shot authority gate: sender admission reserves ownership but
+  no client delivery may begin until `commit_then_release()` succeeds.
+  Canonical tracking/world/event/BEV types bypass the generic latest-only
+  coalescer even if a generic interval is configured for their type.
+- **Decision:** The 256-submission queue also owns one 256 MiB global in-flight
+  byte budget, so worst-case 32 MiB batches cannot multiply into multi-gigabyte
+  retention. Exact frozen bytes are reserved atomically with scheduling and
+  released once on success, failure, explicit gate abort, or cancellation;
+  shutdown waits for every unresolved gate and requires zero reserved bytes.
+  Aborted submissions/bytes are separately observable. Authenticated telemetry
+  fanout is separately bounded to 8
+  clients by default and hard-clamped to 1–16. Excess clients close with `1013`
+  / `telemetry_capacity_reached` before registration or initial snapshots;
+  `/healthz` is excluded from that set and remains available at capacity.
+- **Decision:** A tracking frame, its canonical world snapshot, and all world
+  events are prepared under one publication lock and admitted as one ordered,
+  non-coalesced batch. `CanonicalWorldService.prepare()` forks isolated
+  copy-on-write fusion state without changing authoritative fusion, sequences,
+  lifecycle events, or journal. The runtime uses the synchronous
+  completion-proven `ContractJournal`; `commit()` requires an exact append
+  count before installing its owner-bound candidate and rejects retention that
+  cannot hold the complete current cohort. `AsyncContractJournal` is rejected
+  at this authority boundary. Only then does the outbox release the
+  frozen batch. Abandoned candidates are hard-bounded to 16 per service.
+  Pre-admission failure discards its candidate and preserves sequence zero for
+  an exact retry. Journal/authority failure after admission aborts the gate so
+  no client sees the candidate, then poisons the publisher because commit
+  outcome may be uncertain. A release failure after successful commit also
+  poisons, preventing an unannounced successor.
+- **Decision:** Fusion authority is service-private. The service detaches an
+  injected fusion instance, exposes no mutable fusion object, and returns only
+  its cached immutable last-committed snapshot. Reads cannot consume snapshot
+  sequence, expire entities, clear sources, or bypass the service revision and
+  journal.
+- **Decision:** Canonical routing is exclusive. The gated route accepts only a
+  tracking-first batch whose optional separate snapshot/events exactly match
+  the embedded cohort; generic sync/batch/targeted/async/coalescer routes reject
+  tracking, world snapshot/event, and BEV. BEV uses its own dedicated typed
+  receipt route after tracking commit. The gate callback is an in-process trust
+  boundary rather than a cryptographic capability, so a static regression
+  permits production gated-API references only in the shared WebSocket owner
+  and byte-identical DS8/DS9 tracking publishers. Generic routing inspects raw
+  text/UTF-8 binary top-level JSON types, while server-frozen envelopes bind an
+  owner token, exact encoded byte count, and matching declared/encoded type;
+  neither raw JSON nor caller-forged frozen values bypasses the table.
+- **Decision:** Tracking lifecycle/tombstone state, cadence gates, and health
+  progress advance only after the typed tracking receipt. Paired BEV receives
+  that exact source/frame/time/sequence/submission cohort and returns one of
+  `admitted`, `startup_pending`, or `failed`; an admitted BEV submission must
+  follow the tracking batch. Gate release is not a client-delivery ACK and does
+  not make multiple WebSocket frames transport-atomic.
+- **Rationale:** Mutating world or lifecycle authority before a best-effort
+  cross-thread handoff created irrecoverable phantom state, while generic
+  coalescing could create sequence gaps and split tracking/world/BEV cohorts.
+  An opaque prepare/commit transaction plus a release-gated, exactly bounded
+  outbox prevents both phantom world state and the inverse race where the event
+  loop exposes an admitted candidate before its journal commit. Synchronous
+  journal acknowledgement makes runtime retention a prerequisite for release;
+  the throughput cost is intentionally paid in the publication critical path
+  instead of hiding late disk failure behind visible authority.
+- **Performance:** The fusion fork copies only mutable container layers and
+  shares immutable contract values. On the reference host, a 64-entity,
+  four-camera preparation measured about 8 ms median with about 1.4 MiB peak
+  traced allocation; a regression gate requires median below 30 ms and peak
+  below 8 MiB. At the pair-safe approximately 12 Hz/source cadence, three
+  serialized sources have an aggregate 27.8 ms service period. A representative
+  six-person-per-camera three-source synchronous
+  prepare+journal+authority cycle measured about 24.4 ms median locally and is
+  gated below 27 ms. Maximum-capacity 64-entity preparation remains a stress
+  contract, not an admitted steady-state journal load. Sync JSON regression
+  tests also require exactly one encoder pass.
+- **Validation:** Focused world/service, WebSocket boundary, BEV, V3DT, DS9
+  empty-frame, and DS9 parity suites cover rollback/retry, owner/identity-bound
+  candidates, commit-gated release, commit abort with zero delivery, gate
+  cancellation, shutdown waiting, exact byte release/abort accounting,
+  synchronous journal acknowledgement, private non-mutating snapshot reads,
+  finite-only single/batch/targeted sends, mutation isolation, exact
+  order/cohort, startup pending, and failed receipts. Fresh live runtime
+  validation remains required.
+- **References:** `websocket_server.py`, `noesis_core/world/fusion.py`,
+  `noesis_core/world_service.py`, `noesis/telemetry/publishers.py`,
+  `noesis/telemetry/bev.py`, `noesis/pipelines/hooks.py`,
+  `noesis/pipelines/hooks_v3dt_reimpl.py`,
+  `DS9/noesis/pipelines/hooks.py`.
+
+# 2026-07-12 — Behavior evidence is immutable and canary-bound
+
+- **Area:** DS9 behavior producers, runtime ownership, V3DT, Wholebody49, and
+  semantic-v3 promotion evidence
+- **Decision:** Every behavior source, snapshot, and report is a bounded
+  owner-private create-if-absent publication. The shared primitive writes and
+  fsyncs a same-directory temporary inode, publishes with a no-replace hard
+  link, fsyncs the parent, and validates owner, mode, inode, size, and link
+  count. Producers preflight the complete canonical filename cohort and publish
+  sources before reports. Existing outputs or interrupted residue are never
+  replaced, chmodded, or completed; the operator must start a fresh session.
+- **Decision:** Every registered behavior report and replay source, including
+  resource-soak raw samples, must equal the exact encoder owned by its producer,
+  not merely parse to an equal object. Semantic-v3 identity JSONL rows carry the
+  same exact-byte rule.
+  Wholebody ownership independently derives the complete lane source inventory
+  from reviewed pipeline/camera authorities and requires exact typed ordered
+  equality across launch plan, report, observations, and source. V3DT ownership
+  derives every session path and the ephemeral build root independently, then
+  cross-checks the launch plan and inspected mount before replay.
+- **Decision:** `runtime_session` promotion is bounded ephemeral-canary
+  evidence only. Selector-bound `appliance-run` has persistent build/state and
+  an indefinite lifecycle, so it is rejected explicitly and remains a separate
+  deployment-health contract.
+- **Rationale:** Replace-on-write let reruns erase evidence, self-declared
+  source subsets could satisfy Wholebody, and launch-plan text could redirect
+  V3DT replay to an alternate build tree. Object-equal JSON also allowed raw
+  encoding drift. Closing all four boundaries makes one checksum-covered
+  session an auditable fact rather than a producer assertion while preserving
+  the appliance/canary lifecycle distinction.
+- **Validation:** Private publication races, existing symlink/hard-link and
+  residue, parent mutation, partial-bundle rerun, all six producers, non-finite
+  payloads, semantic whitespace/key-order/number spelling, Wholebody
+  subset/superset/reorder/boolean for S and X, alternate/resealed V3DT paths,
+  source-ID drift, cross-validator whitespace/key-order reseals, and appliance
+  rejection are covered by focused tests. No
+  runtime, container, GPU job, registry mutation, or protected identity-state
+  mutation was performed.
+- **References:** `noesis_core/private_paths.py`,
+  `DS9/scripts/validate_runtime_ownership.py`,
+  `DS9/scripts/ds9_semantic_observation_smoke_test.py`,
+  `DS9/scripts/v3dt_world_contract_smoke_test.py`,
+  `DS9/scripts/wholebody49_occupied_scene_smoke_test.py`,
+  `DS9/docs/runtime_ownership_evidence.md`.
+
+# 2026-07-12 — Native DS8 parity canaries own an external mutable-state cohort
+
+- **Area:** DS8/protected-V3DT lifecycle validation, immutable checkpoints,
+  calibration, identity continuity, and runtime secrets
+- **Decision:** `scripts/ds8_runtime_30s_gate.py` requires one explicit absolute
+  external state root. The root must be an owner-owned mode-0700 real directory,
+  separate from the checkout and operator home, outside every sealed checkpoint,
+  and either empty or marked with the exact canary-state contract. A marked root
+  may be reused for sequential baseline/V3DT runs; initialization validates
+  canonical analytics/calibration seed bytes but never clears persisted
+  household gallery, resident/visitor, identity-v2, world, or scene state.
+  Logs and verdicts are private create-once files with caller-unique names.
+- **Decision:** The launcher builds the child environment from a narrow
+  OS/GPU/media allowlist instead of inheriting the operator session. It resolves
+  the camera registry, MapAnything RPC key, and internal bearer file paths before
+  isolating HOME and passes paths only. All three files must already be
+  owner-private; bearer loading cannot create or repair authority. Mutable HOME,
+  Python user base, XDG/TMP/CUDA/GStreamer caches, generated build artifacts,
+  depth/floorplan storage, analytics YAML/INI, calibration/alignment/audit,
+  StableID/identity-v2, world journal, scene database, virtual-twin root, and
+  diagnostics are rooted in the canary cohort. Runtime argv always includes the
+  exact external `--storage-base`.
+- **Decision:** Baseline DS8, protected V3DT, and DS9 honor the same explicit
+  calibration/alignment path variables. Protected V3DT also routes its generated
+  effective pipeline and GStreamer registry through the external build/state
+  authorities while retaining the reviewed repo-owned patched tracker binary as
+  an immutable input.
+- **Rationale:** The prior canary could mutate `build/`, `data/depth`, the native
+  exclusion INI, calibration JSON, GStreamer registry, and operator household
+  identity merely by starting. That made evidence from a sealed source tree
+  non-reproducible and could silently alter the family's protected gallery.
+  Explicit state ownership preserves immutable-source provenance and allows the
+  V3DT-to-baseline identity continuity proof without borrowing production state.
+- **Validation:** Focused state-root, environment, secret-path, load-only token,
+  calibration parity, V3DT build-path, lifecycle, and existing canary tests pass
+  without starting DeepStream, a container, or a GPU workload. Because the
+  runtime source contract changed, final native validation must use a newly
+  sealed checkpoint and supersede the canonical graph before promotion.
+- **References:** `scripts/ds8_runtime_30s_gate.py`,
+  `tests/test_ds8_runtime_30s_gate.py`, `noesis/ds8_runtime.py`,
+  `noesis/ds8_runtime_v3dt_reimpl.py`, `DS9/noesis/ds9_runtime_core.py`,
+  `docs/DS8_testing_guide.md`.
+
+# 2026-07-12 — The release-gated world journal uses durable WAL storage contract v2
+
+- **Area:** Canonical world authority, synchronous publication release,
+  private runtime state, restart admission, and three-camera cadence
+- **Decision:** `ContractJournal` owns one persistent SQLite connection for its
+  process lifetime. All access remains serialized by its existing reentrant
+  lock, and cross-thread connection use is enabled only behind that lock. The
+  exact connection profile is WAL, `synchronous=FULL`, and a 1,000-page
+  autocheckpoint. Every operation rechecks that profile. Shutdown requires an
+  exact `(0, 0, 0)` truncate-checkpoint receipt, closes the connection even on
+  failure, and makes a close failure sticky.
+- **Decision:** Storage contract v2 binds the main database and private
+  WAL/shared-memory cohort by owner, exact mode, link count, parent, and inode.
+  Startup performs SQLite integrity checking, exact schema/table/index
+  validation, and a complete replay of the retained state, contiguous
+  sequences, anchor boundary, timestamps, canonical JSON, contract column,
+  model normalization, and hash chain. A validated v1 `DELETE` journal may
+  migrate once: WAL is selected, FULL synchronization is confirmed, and v2 is
+  stamped transactionally. An interrupted v1/WAL migration is retryable. A v2
+  database not already in WAL, a corrupt v1 database, or an unrelated version-0
+  database is rejected without repair or adoption.
+- **Decision:** An append receipt means every named record remains retained at
+  commit. Batches larger than record capacity and batches whose own timestamp
+  span would prune their prefix roll back without an acknowledgement. Any
+  `BaseException` rolls back; rollback failure closes and poisons the journal
+  because transaction outcome is uncertain. Async persistence remains
+  forbidden at canonical world authority.
+- **Rationale:** The previous open/commit/close rollback-journal transaction
+  paid three storage-sensitive commit paths for each serialized three-camera
+  aggregate. On the reference host its median moved between roughly 27 and
+  37 ms under ordinary storage variance, crossing the 27 ms cadence gate. WAL
+  with FULL synchronization preserves completion-proven durability while
+  removing rollback-journal churn; it does not defer acknowledgement, weaken
+  synchronization, or batch visible authority asynchronously. Explicit v2
+  admission prevents that performance change from becoming silent repair on a
+  later restart.
+- **Performance:** The test warms three aggregate cycles and measures 31. Both
+  median and arithmetic mean remain gated below 27 ms. Twenty independent
+  local runs passed both gates; the worst mean was about 17.9 ms and the worst
+  median about 17.6 ms. Maximum filesystem latency is intentionally a live-soak
+  concern rather than a flaky unit assertion.
+- **Validation:** Focused journal, private-path, runtime-world, and world-service
+  suites cover v1 migration and v2 restart, corrupt/foreign/no-repair
+  admission, physical corruption normalization, exact schema/history/state,
+  GENESIS/pruned-anchor relations, private sidecars and inode swaps,
+  cross-thread serialization, unclean-process recovery, retention ACKs,
+  BaseException rollback and rollback-failure poison, exact sticky close, and
+  the longer cadence gate. Fresh live DS8/DS9 soak evidence remains required.
+- **References:** `noesis_core/journal.py`,
+  `noesis_core/world_service.py`, `tests/test_noesis_core_journal.py`,
+  `tests/test_noesis_core_world_service.py`, `docs/DS8_testing_guide.md`.
+
+# 2026-07-12 — Reviewed inference sources are portable and mutable console state follows the build authority
+
+- **Area:** DS8/DS9 inference configuration, immutable source checkpoints, and
+  dev-console materialization
+- **Decision:** Canonical baseline and supported alternate pipeline YAMLs point
+  at tracked, reviewed DAv2 source INIs under their owning `pipelines/` trees.
+  Those source configs use repository-prefixed relative model paths. Production
+  continues to derive an engine-only nvinfer config below `NOESIS_BUILD_DIR`;
+  the reviewed source is never replaced by or made dependent on an ignored
+  generated build file. Active DS8 model, label, and parser references use the
+  same repository-relative resolver contract.
+- **Decision:** Dev-console launch artifacts, activity history, and saved
+  profiles share the existing `NOESIS_BUILD_DIR` authority, with the historical
+  repository `build/` directory only as the default. OSD mask/box policy is a
+  total mapping of the selected reviewed profile and size: segmentation and
+  Wholebody49 S expose masks, while detection and Wholebody49 X do not. File
+  existence in a generated build directory cannot change that policy.
+- **Rationale:** A sealed checkout could previously require a generated DAv2
+  INI containing another checkout's absolute paths and could still write
+  dev-console state into its own source tree. Detect profiles also inherited
+  the base segmentation OSD policy whenever their generated INI was absent.
+  One reviewed source plus one explicit mutable build authority makes source
+  provenance reproducible and removes both hidden environment dependencies.
+- **Validation:** Focused pipeline, dev-console, and inference-runtime tests
+  passed (153), including a canonical graph build from an empty external build
+  root and inspection of derived pose, DAv2, and MapAnything engine-only
+  configs. DS9 static preparation passed without the old generated config.
+  YAML/INI parsing, active-path scans, Python compilation, and focused lint
+  passed; live DeepStream/GPU behavior was not changed or launched.
+- **References:** `pipelines/config_infer_secondary_depth_tracking_da2.ini`,
+  `DS9/pipelines/config_infer_secondary_depth_tracking_da2.ini`,
+  `noesis_core/inference_runtime_contract.py`,
+  `noesis/dev_console/paths.py`, `noesis/dev_console/materialize.py`.
+
+# 2026-07-19 — Registration rejection is scoped to metric depth
+
+- **Area:** DS8/DS9 baseline person-ground world placement and Menon trails.
+- **Decision:** A rejected registered-depth sample is never projected, clipped,
+  or used for height lock. It does not invalidate a separate calibrated
+  floor-ray candidate when the startup-bound camera policy has positive floor
+  weight and explicitly permits floor-only placement. Depth-required profiles
+  remain fail-closed. DS9 owns the same small prediction wrapper as DS8 around
+  the shared physical filter.
+- **Rationale:** Live successor evidence showed the living-room floor candidate
+  was valid but suppressed by an unrelated depth-domain rejection, and then
+  exposed the DS9 adapter calling a prediction wrapper it had not defined.
+  Scoping rejection to the failed observation preserves the evidence-backed
+  camera policy; restoring adapter parity prevents valid world updates from
+  disappearing at the callback boundary.
+- **Validation:** Focused allowed/required policy tests and seven cross-runtime
+  person-ground parity tests pass. Final bounded DS9/Menon acceptance is stored
+  with the release evidence.
+
+# 2026-07-19 — Strict world provenance keeps invalid decisions and derives rooms from admitted evidence
+
+- **Area:** Shared DS8/DS9 canonical observations, synchronous world journal,
+  global fusion, and privacy-safe alignment capture.
+- **Decision:** `noesis.observation.person` v1 gains an optional bounded
+  `world_diagnostics` object. The canonical service emits it for invalid world
+  observations and whenever producer diagnostics exist, retaining only finite
+  floor/depth candidates, filter decisions, policy weights, and depth status.
+  An invalid observation always receives an explicit first-divergence reason;
+  diagnostics never promote a rejected point into fusion.
+- **Decision:** World source evidence preserves the exact strict observation ID,
+  source zone label, `zone_source`, and explicit authority. Only an
+  `nvdsanalytics_roi` label is spatially authoritative and eligible to derive
+  `WorldEntity.room_id`; a camera-name fallback remains diagnostic for
+  occupancy/dwell but never votes on room. Rejected positional sources do not
+  vote; disagreement among accepted authoritative sources yields a null room
+  and a visible conflict. Owner-private alignment captures replace raw
+  observation IDs with stable per-run ephemeral keys, preserving exact joins
+  and zone provenance without persisting runtime or identity-bearing
+  identifiers.
+- **Rationale:** A missing Menon marker was previously indistinguishable from a
+  transport/render failure once the strict observation discarded the producer's
+  invalid-world evidence, and canonical entities lost their available room
+  semantics. The additive evidence makes the first failed geometry stage and
+  source-to-snapshot lineage deterministic while retaining the existing
+  fail-closed fusion and privacy boundaries.
+- **Validation:** Focused observation/schema, fusion, world-service/journal,
+  sanitizer/privacy, and DS9 world-snapshot tests pass; no runtime or service
+  was restarted.
+
+# 2026-07-24 — Existing overcrowding membership is the canonical room designation
+
+- **Area:** Shared DS8/protected-V3DT/DS9 analytics adapters, canonical
+  observations, world fusion, and Menon room occupancy.
+- **Decision:** The established post-tracker overcrowding ROI is the single
+  household room designation. NVIDIA attaches its label per object in
+  `ocStatus`; the frame `object-threshold` controls overcrowding state, not
+  object membership. One shared DS8/V3DT/DS9 resolver therefore uses exactly
+  one unique nonempty `ocStatus` label first and accepts a unique `roiStatus`
+  label only when no overcrowding membership exists. Identical duplicates are
+  harmless; padded, empty, overlength, malformed, or distinct competing labels
+  fail closed without trimming, normalization, truncation, or first-wins
+  selection. No duplicate room polygon taxonomy is introduced.
+- **Decision:** `PersonObservation`, `WorldSourceEvidence`, and the canonical
+  world service preserve exact zone bytes and provenance. `WorldEntity`
+  validates its derived room against accepted authoritative source rows:
+  rejected, camera-default, and unprovenanced rows do not vote; one exact label
+  requires the same non-null `room_id`; no vote requires null; and competing
+  labels require null plus `conflict=true`.
+- **Rationale:** Existing room occupancy already has the correct per-object
+  polygon label. Reusing that evidence joins aggregate occupancy and entity
+  membership without a second editable geometry definition, while the strict
+  resolver and entity validator prevent ambiguous or normalized identifiers
+  from becoming spatial authority.
+- **Validation:** Focused analytics resolver/config/adapter, observation/schema,
+  direct entity-contract, fusion, world-service, validation-fixture, and DS9
+  parity tests pass; no runtime or service was restarted.
+
+# 2026-07-19 — Dewarped resolution and Menon camera anchors are explicit geometry authorities
+
+- **Area:** DS8/DS9 person-ground projection, protected V3DT parity, Menon
+  diagnostic rays, and `backend_world_m` to `menon_scene` registration.
+- **Decision:** Every producer uses the calibrated dewarped output resolution
+  declared by `CameraIntrinsics`; a principal point is never interpreted as an
+  image extent. Menon ray and reprojection diagnostics likewise require an
+  explicit image size and fail closed when it is absent. The three active
+  cameras declare `1920x1080` in both runtime and public scene calibration.
+- **Decision:** The global scene similarity is rebuilt from the current Menon
+  camera-device anchors and backend camera centers. The fit carries exact
+  camera-anchor and camera-calibration SHA-256 bindings plus metric RMSE and
+  worst-anchor residuals. The calibration manager rejects a mismatched anchor
+  digest or a fit above its declared 5 cm limit; DS8 and DS9 use identical
+  parsing and validation. Menon's diagnostic camera centers are synchronized to
+  the same bound anchor state.
+- **Rationale:** The former `2*cx,2*cy` inference rescaled valid foot pixels and
+  moved floor intersections by meter-scale distances. The former similarity
+  also retained an obsolete kitchen anchor and missed current camera devices by
+  58.46 scene units RMSE. These are geometry-authority defects and must not be
+  hidden with renderer clamping, room fitting, or presentation smoothing.
+- **Validation:** Focused projection/parity, scene-registration, calibration
+  manager, authored-scene, production-renderer, and Menon coordinate tests pass.
+  The admitted camera-anchor fit is 2.35 cm RMSE and 2.94 cm worst residual.
+  Physical person-position admission remains a separate live/guided-waypoint
+  gate.
+
+# 2026-07-26 — RF-DETR detection uses every-other-frame cadence
+
+- **Area:** DS9 RF-DETR 1.8.3 detection PGIE selection and downstream GPU
+  headroom.
+- **Decision:** Materialized RF-DETR detection configs require `interval=1`.
+  The attestation validator rejects cadence drift. This applies to every
+  selected RF-DETR detection size and does not alter the active YOLO baseline.
+- **Rationale:** The cadence matches the selected YOLO26-M baseline and keeps
+  the architecture comparison free of a reinference-rate confound. In the
+  corrected three-camera peer gate, RF-DETR Medium at this cadence added only
+  2.34 GPU-utilization percentage points and 4.14 W mean power while preserving
+  depth-device throughput in an empty scene. In the matched-path guided
+  occupied gate it added 1.28 GPU-utilization percentage points and 4.28 W mean
+  power, with a ten-point higher utilization maximum. Every-frame RF-DETR
+  inference is not selected without separate evidence that its added work
+  preserves the headroom needed by tracking, ReID, pose, depth, MapAnything,
+  mosaic, and telemetry stages.
+- **Validation:** RF-DETR Medium loaded its exact FP16/TF32 engine and current
+  attested parser on all three live feeds; bridge, RTSP DESCRIBE, hardware
+  decode, strict zero-copy, explicit counter-delta, and runtime-error gates
+  passed. The first occupied RF-DETR attempt used a different, phone-interrupted
+  route and is invalid for comparison. In the replacement matched-path arm,
+  RF-DETR produced 17.73% fewer person rows, 26.92% fewer fresh embedding rows,
+  and only two living-room identity-journal rows versus YOLO's 19. The evidence
+  is not frame-labeled ground truth, so it supports retaining YOLO26-M rather
+  than claiming a detector-accuracy ranking. The generation-221 selector-driven
+  YOLO26-M baseline was restored. The earlier Large-gate cumulative counter
+  maxima are not treated as throughput deltas.
+
+# 2026-07-28 — Lower-body occlusion makes gravity-drop authoritative
+
+- **Area:** Shared DS8/DS9 baseline person-ground tracking and BEV/OSD trails.
+- **Decision:** Treat feet/ankle, knee, and waist/hip occlusion as explicit
+  standing-person states rather than waiting for the current anchor to become
+  invalid. A recent trusted full-body height lock, current upper-body evidence,
+  lost lower-body keypoint groups, and detector-box collapse relative to the
+  learned upright body and shoulder scale determine entry. Explicit bent-leg,
+  sitting, or lying evidence blocks entry and immediately releases an active
+  occlusion state. Otherwise, three consecutive clear lower-body updates are
+  required before direct pose/depth authority resumes.
+- **Decision:** Learn per-track nose, shoulder, and hip height fractions from
+  trusted full-body frames. During occlusion, reconstruct floor contact from the
+  calibrated bbox-top ray plus consistent visible-body plane rays, reject
+  spatial outliers, and publish that reconstructed point as both the world
+  observation and `image_foot`. A syntactically valid bbox-bottom or registered
+  depth sample on a counter/table edge is demoted while this state is active.
+- **Decision:** The static MapAnything floorplan is not used as a live range
+  substitute. Camera calibration, the learned upright body model, and the
+  existing floor plane remain the runtime geometry authorities.
+- **Rationale:** The former gravity-drop path ran only after all current anchors
+  failed. Counter and table edges commonly produce valid but physically wrong
+  bbox/depth anchors, so tracks could jump despite every fallback being enabled.
+  Making the occlusion state authoritative corrects the source selection before
+  filtering instead of hiding the jump with additional smoothing.
+- **Validation:** 104 focused shared-state, analytics/world, V3DT ground-state,
+  and BEV tests pass; 7 DS8-vs-DS9 parity tests pass. Live occupied
+  counter-walk validation remains pending.
+
+# 2026-08-01 — Scene priors are site/space evidence and remain shadow-only
+
+- **Area:** MapAnything room-walk reconstruction, authored-scene semantics,
+  tracking diagnostics, and floorplan review.
+- **Decision:** Model a prior revision by portable `site_id` and physical
+  `space_id`, independently of sensor identity. A mutable site catalog binds
+  cameras to exact immutable revisions. Authored room labels and OBJ groups
+  remain semantic authority; scan geometry supplies measured occupancy and
+  height evidence only.
+- **Decision:** Store prior grids in `backend_world_m` and resample them through
+  current calibrated camera extrinsics when extending a camera-local floorplan
+  response. Preserve every live layer unchanged. Composite cells select live
+  observed height first and use static evidence only where live observation is
+  unknown.
+- **Decision:** V1 is explicit `shadow` mode. Per-track prior diagnostics cannot
+  mutate, admit, reject, smooth, or replace `track.world`, canonical
+  observations, global world state, zone semantics, or lower-body occlusion
+  handling. Named objects, doorways, navigation, and tracking correction need
+  separate reviewed contracts before promotion.
+- **Rationale:** A room scan is durable evidence about a physical space, not a
+  camera artifact or a second world authority. Separating space from sensor
+  identity supports multiple cameras, repeated room scans, additional rooms,
+  and multi-home beta deployment without creating room-specific schemas or
+  silently feeding static geometry into live person placement.
+- **Validation:** The verified Living Room bundle deterministically produced
+  revision `sceneprior_living-room_20260801T152036Z_109fe40d4e18` from 531,368
+  selected points with 77.20% authored-cell observation coverage. Five focused
+  contract/integrity/composition tests pass, generated schemas are current,
+  Python compile checks pass, and the frontend production build succeeds.
+
+# 2026-08-02 — Scene-prior PNG reviews use the verified reference-camera frame
+
+- **Area:** Generic Scene Prior construction and standalone review artifacts.
+- **Decision:** Keep the immutable 2.5D grid in canonical `backend_world_m`, but
+  render `preview.png` in the source bundle's verified fixed-camera ground
+  frame. Calibrated camera-right maps to screen-right and calibrated
+  camera-forward maps toward image-up. Derive both axes from the exact camera
+  extrinsic composed with the target reconstruction's floor-world correction;
+  do not use a room-specific mirror or heuristic image flip.
+- **Decision:** Record the calibration and target-metadata fingerprints, camera
+  position, ground axes, and local preview bounds in an additive revision
+  field. Include that metadata in immutable identity so orientation changes
+  produce a new revision while preserving prior bytes.
+- **Rationale:** Backend-world +X points nearly opposite the Living Room
+  camera's screen-right direction, so the former world-axis PNG appeared
+  backwards even though its runtime geometry was correct. Separating review
+  orientation from geometry authority makes the artifact intuitive for every
+  calibrated room without perturbing tracking or floorplan composition.
+- **Validation:** Seven focused scene-prior tests pass. A deterministic Living
+  Room rebuild produces camera-right `(-0.973939, -0.226811)` and
+  camera-forward `(-0.226811, 0.973939)`; its canonical `grid.npz` SHA-256 is
+  identical to the superseded revision, and the new PNG matches the captured
+  fixed-camera layout.
 
 # 2026-08-07 — YOLO26 ADE20K remains a semantic utility lane
 

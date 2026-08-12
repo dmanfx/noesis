@@ -1,6 +1,6 @@
 # DS9 Migration State
 
-Last updated: 2026-06-30
+Last updated: 2026-07-28
 
 ## Goal
 
@@ -30,6 +30,152 @@ runtime fallback.
 - DS9 SDK root expected by scripts:
   `/opt/nvidia/deepstream/deepstream-9.0`
 
+## MapAnything Depth-Panel Quality Acceptance — 2026-07-27
+
+The active appliance deployment
+`deploy-20260727-mapanything-depth-floorplan-v10-ds9` retains the selected
+correctness-first FP32 MapAnything model and canonical DS9 baseline lane. Fresh
+manual Refresh completed for living room, kitchen, and family room in
+32.6–34.3 seconds. All three responses were floorplan contract v9 products from
+the exact captured snapshot, with 1.60–1.68 million points and strict temporal
+consensus coverage of 47.14%, 53.94%, and 60.96% against the 40% gate.
+
+Floorplan v9 separates dominant horizontal surfaces, furniture, vertical wall
+support, room footprint and boundary, and exact-snapshot RGB instead of
+collapsing them into one averaged height cell. Observed metric bounds replace
+near-horizon calibration expansion, and quarantine-aware fusion voting uses
+only the surviving cohort while still failing closed below three usable frames.
+The resulting 0.10 m live grids span 15×7 m, 17×8.5 m, and 15×10.5 m. This
+closes the fresh multi-camera MapAnything depth/floorplan quality gate; it is
+not a claim of full DS9 option-surface parity or surveyed absolute-scale
+acceptance.
+
+## Runtime Ownership And Drift Governance
+
+The current ownership contract is `DS9/docs/runtime_ownership.yaml`. It classifies
+SDK-neutral shared modules, DS8/DS9 adapter modules, every copied module that
+still needs convergence, and parity across CLI, configuration, API, telemetry,
+metadata, media, tracking, and artifact surfaces.
+
+`DS9/scripts/validate_runtime_ownership.py` currently classifies all 23 files
+duplicated between `noesis/` and `DS9/noesis/`. Its structural mode passes while
+reporting declared gaps. `--require-parity` makes those gaps cutover blockers.
+The canonical artifact graph is promoted from its exact external realization.
+The three remaining dynamic-evidence gaps are Wholebody49 runtime quality, Swin
+ReID runtime quality, and V3DT runtime/world quality. The selected engines and
+artifact profiles, including the correctness-first FP32 MapAnything
+replacement, are realized. Fresh three-camera MapAnything depth/floorplan
+quality is accepted as described above. Household identity APIs and
+person-ground product behavior are shared/parity.
+The guarded MapAnything build specification now uses correctness-first FP32 and
+requires a real-inference functional admission receipt after the loadable FP16
+plan produced non-finite depth, zero masks, and confidence sentinels. The
+guarded FP32 build, artifact realization, and fresh multi-camera runtime
+acceptance now pass. Mosaic WebRTC readiness now matches DS8: one SHM feeder
+must prove its socket, PLAYING state, and first complete H.264 AU; one warm
+gateway slot is bounded, and additional gateways are allocated on demand.
+Optional RTSP output is not consumed by those gateways.
+
+DS9 configuration materialization now owns its PGIE-derived OSD helper in
+`DS9/noesis/runtime_config.py`. DS9 executable code no longer imports
+`noesis.ds8_preflight`; both DS8 runtime and DS8 preflight imports are forbidden
+by the drift gate.
+
+The DS9 runtime also passes its active `camera_labels` map into the shared
+stable-ID manager. The shared fail-fast camera-topology validation therefore
+applies equally to DS8 and DS9 instead of allowing successor-only drift.
+
+Identity-v2 runtime product behavior is now shared at source level. DS8,
+V3DT, and DS9 construct `noesis/identity_v2_service.py` with the canonical world
+producer run ID, an SHA-256 of the actual active ReID engine bytes, an explicit
+tensor layer/dimension, and a strictly matching camera topology. Each adapter
+walks transient SDK metadata once and submits one detached complete source-frame
+batch. The shared authenticated `/api/v2/reid` enrollment path consumes exact
+server evidence only; clients cannot submit embeddings. Default mode is shadow,
+and authoritative startup requires an artifact-backed scoring calibration.
+In authoritative mode DS9 also bypasses legacy StableID mutation and resolves
+SID-dependent analytics only after its complete identity-v2 frame batch. The
+one-shot object metadata pass remains neutral, then a dedicated tiler-sink
+BatchMetadataOperator joins the resolved same-frame identity result and stamps
+the authoritative OSD label. Tracking/world telemetry and OSD therefore share
+the same resolved v2 authority without a stale legacy lookup.
+
+The first sealed occupied baseline attempt on 2026-07-11 exposed three real
+parity defects and was not promoted: one camera-local tracker changed visitor
+subjects within 0.683 seconds under joint-assignment contention, legacy cached
+`embedding_present` values escaped without exact persisted association, and
+DS9 legacy StableID performed one pressure auto-merge while identity-v2 was
+shadow-only. The shared coordinator now hard-locks an accepted subject until a
+fresh-evidence gap expires the tracker state without bypassing open-set gates;
+the shared service owns exact-frame embedding/provenance truth; and DS9 admits
+and verifies the same default household no-auto-merge/no-blanket-sharing policy
+as DS8. CPU replay/parity tests pass. Fresh same-session occupied evidence is
+still required; the failed transcript remains immutable evidence, not a pass.
+
+Recovery validation on 2026-07-10: focused identity/calibration/DS9 parity
+suites and the complete containerized DS9 suite passed, and
+`DS9/scripts/run_static_prep_checks.sh` passed. At that checkpoint strict
+ownership parity reported five capability gaps, sixteen native/plugin/parser
+artifacts were provenance-complete, and strict canonical asset validation
+reported only the five then-unbuilt baseline engines. This closed household identity API/runtime,
+person-ground copied-product-logic drift, and the ReID source/config/tensor
+mismatch, but not the DS9 ReID/live identity-quality gate, Wholebody49 live
+parity evidence, or V3DT runtime/world evidence.
+
+Current 2026-07-11 artifact validation supersedes the build-status portion of
+that recovery snapshot. The external realization contains ten engines and
+passes canonical, V3DT, and Wholebody49 file/provenance profiles with no errors
+or blockers at
+`6fab7d456c031490f640ee2c3ce5a38922a96ed86a965020ca3051820306dce4`.
+This closes selected-engine construction and canonical-graph promotion, not the
+four live-session dynamic-evidence gates.
+
+Canonical world publication is now at DS8 parity. DS9 constructs the shared
+`CanonicalWorldService` with `create_runtime_world_service(...)` from the
+effective pipeline configuration, content evidence for selected model/tracker
+files, and the active calibration provider. `TrackingTelemetryPublisher`
+publishes versioned person observations plus a separate world snapshot and
+advances the shared capability monitor. The same monitor is exposed at
+`GET /api/v1/health/capabilities`; readiness therefore reflects compatible
+producer progress rather than port reachability.
+
+DS9 also mounts the shared `noesis/server/scene_api.py` router. Scene release
+registration, promotion, rollback, current payload, and history therefore use
+the same owner-governed store and contracts as DS8; DS9 has no private scene
+state implementation.
+
+DS9 also mounts the shared owner-authenticated alignment-walk controller used
+by DS8. It captures the successor runtime's own calibration and per-camera
+tracking stream, exposes only image geometry plus run-local tracklet keys to
+Menon, and produces FIT-only fixed-center rotation and physical-depth
+candidates that must pass untouched HOLDOUT checks. It never applies a
+candidate or uses the current producer world point as calibration truth.
+
+Both DS9 public-track adapters stamp processing-time `observed_at_us`, explicit
+`capture_time_status: estimated`, and a nonnegative stream-relative
+`media_pts_ns`. Stable-ID diagnostics also carry `visitor_generation`, keeping
+recycled visitor IDs distinct in canonical world entity IDs.
+
+The artifact contract is schema version 2:
+
+- `DS9/docs/asset_manifest.schema.json` defines the machine-readable shape.
+- `DS9/asset_manifest.yaml` records role, DS9-owned output/source paths, builder,
+  required profiles, compatibility, staging state, and provenance.
+- `DS9/scripts/validate_asset_manifest.py` validates structure by default and
+  adds file/profile/provenance gates for rebuild and cutover phases.
+
+The tracked manifest remains declarative and does not claim realized output
+hashes. The owner-private external realization records ten selected TensorRT
+engines with exact maintenance provenance. Structural governance and canonical,
+V3DT, and Wholebody49 file/provenance validation pass; dynamic acceptance stays
+in the external evidence registry.
+
+The DS9 baseline also declares the same calibrated circular dewarper-validity
+regions as DS8. `DS9/noesis/pipelines/hooks.py` applies the shared calibrated
+geometry mask after aligning MapAnything tensors, writes invalid depth as NaN,
+zeros invalid confidence, and rejects empty evidence rather than emitting a
+full-frame zero-depth substitute.
+
 ## Completed Migration Work
 
 - Staged DS9 implementation resources under `DS9/`.
@@ -41,12 +187,18 @@ runtime fallback.
   `DS9/config/depth_registration.json`.
 - Added DS9 runtime Python dependencies at `DS9/requirements-runtime.txt`.
   REST-enabled validation requires both `fastapi` and `uvicorn[standard]`.
+- Wired the shared canonical world/fusion service, content-addressed runtime
+  provenance, and capability-progress health route into DS9 telemetry.
 - Added DS9 model labels at `DS9/models/coco_labels.txt`.
 - Added DS9 preflight script at `DS9/scripts/ds9_preflight.py`.
 - Added DS9 build scripts for custom parsers, native extensions, GStreamer
   plugins, TensorRT plugins, TensorRT engine rebuilds, and guarded MapAnything
   plan generation.
 - Rebuilt DS9 parser/native/plugin artifacts in DS9-target locations.
+- Ported the Wholebody49 `s` mask and `x` box profile through the shared semantic
+  materializer with DS9-owned templates, labels, parser, ONNX staging, CLI,
+  preflight, guarded engine specs, and independently realized engines. Live
+  quality evidence remains pending.
 - Rebuilt TensorRT engines for DS9/TensorRT 10.14.x.
 - Added the DS9 YOLO detect-only parser under
   `DS9/pipelines/nvdsinfer_yolo_detect/` and rebuilt
@@ -67,6 +219,27 @@ runtime fallback.
   smoke client.
 
 ## Recent Fixes And Follow-up Results
+
+- Replaced the failed DS9 MapAnything compatibility gate with one exact,
+  DS9-owned native tensor contract. The 2026-07-11 baseline evidence proved
+  that the Python Service Maker wrapper at `mapanything_fullframe` exposed only
+  the sibling DAv2 UID twice, so wrapper IDs no longer select MapAnything.
+  Native capture now requires one raw UID 2 record and exact per-frame
+  `depth/conf/mask` shape; Python validates batch/source identity without
+  applying another batch offset because DS9 nvinfer already attaches
+  frame-offset pointers. The metadata-lifetime copy is fixed at three
+  `294x518` float32 maps (`1,827,504` bytes), timed, and releases the GIL while
+  dereferencing nvinfer-owned storage. The owned arrays enter a bounded
+  asynchronous postprocessor; runtime shutdown closes capture admission,
+  drains accepted jobs, and joins its non-daemon worker before closing depth
+  storage. Ambiguity, attachment failure, queue saturation, final-job poison,
+  or unresolved teardown is fatal.
+  Source tests pass. The canonical DS9 build image rebuilt the native binary
+  without GPU access on 2026-07-11; manifest provenance now binds output SHA-256
+  `fcd38dceadcbc62c14e257efc5c997d1bb1cc924490541cf452061be09065423`,
+  the exact export imports from the staged DS9 path, the retired generic export
+  is absent, and canonical/V3DT/Wholebody49 artifact-realization profiles pass.
+  Fresh live depth/floorplan gates remain pending.
 
 - Ported the detection-wake performance work from DS8 to DS9 while preserving
   DS9-specific compatibility guards:
@@ -97,15 +270,15 @@ runtime fallback.
     `DS9/native_extensions/`.
 - Updated DS9 SGIE cadence and tracking defaults for detection-wake load:
   - YOLO26 pose SGIE now uses batch size 3 and `secondary-reinfer-interval=8`.
-  - ReID SGIE now uses `secondary-reinfer-interval=6` and keeps synchronous
-    tensor metadata extraction.
+  - ReID SGIE uses the shared TAO Swin-Tiny `fc_pred/256` contract,
+    `secondary-reinfer-interval=12`, and synchronous tensor metadata extraction.
   - DS9 NvDCF defaults are trimmed for home-scale scenes: lower target cap,
     shorter shadow age, HOG disabled, smaller feature image size, and internal
     NvDCF ReID disabled.
 - Updated the DS9 YOLO26 pose asset contract to fail fast on DS9-owned batch-3
-  assets: `DS9/models/onnx/yolo26n-pose_b3.onnx` must be staged before
-  `DS9/models/engines/yolo26n-pose_b3_fp16.engine` can be rebuilt. The root
-  DS8 pose engine is not reused.
+  assets. `DS9/models/onnx/yolo26n-pose_b3.onnx` is now CPU-exported and
+  hash-verified; `DS9/models/engines/yolo26n-pose_b3_fp16.engine` is independently
+  realized for DS9. The root DS8 pose engine is not reused.
 - Implemented the DS9-native pose metadata path:
   - `DS9/noesis/ds9_runtime.py` prepends `DS9/native_extensions` so DS9 imports
     DS9-built native extensions, not root DS8 `.so` artifacts.
@@ -118,10 +291,31 @@ runtime fallback.
     `NOESIS.POSE_FEATURES` contract, and keeps a bounded DS9 latest-real-pose
     cache per track so telemetry can consume sparse SGIE tensor metadata without
     synthetic keypoints.
-- Rebuilt MapAnything with DS9 TensorRT using BF16 precision. The engine path is
-  still `DS9/models/engines/mapanything_images_294x518_b3_fp16.plan` for config
-  compatibility, but the guarded builder invokes `trtexec --bf16`.
-- Set DS9 BEV output to `backend_world_m` in `DS9/config/infer.yaml`.
+- Historical validation rebuilt MapAnything with DS9 TensorRT using BF16 while
+  naming the engine `mapanything_images_294x518_b3_fp16.plan`; that artifact is
+  not accepted. The current guarded realization omits reduced-precision flags,
+  records precision `fp32`, and requires a replayable real-inference functional
+  receipt before installation. Fresh depth/floorplan runtime quality remains
+  mandatory before cutover.
+- 2026-07-11: DS9 inline BEV is wired to the shared renderer and the DS9-owned
+  active-floorplan registry/provider/fatal callback with
+  `frame=camera_local_ground_m`; the separate canonical global world remains
+  `backend_world_m`. Before the first valid authority, `None` is
+  `startup_pending` and emits no local BEV. Invalid first authority and every
+  post-ready loss fail closed without config/auto-extents substitution. Exact
+  empty frames count as successful active renders. Tracking/BEV publication is
+  same-frame and tracking-first at
+  `max(selected tracking interval, BEV interval)`, with count/lifecycle changes
+  forcing the pair and tracking failure suppressing BEV. “Tracking-first” now
+  means one immutable finite-only ordered tracking/world/event batch is bounded
+  and frozen behind a one-shot sender gate; synchronous exact-count journal and
+  private world/lifecycle authority commit before release. Paired BEV carries
+  the exact sequence/submission cohort with a later admission ID. Pre-admission
+  failure is exactly retryable; post-admission authority failure aborts with
+  zero delivery and poisons publication. Registered-depth
+  coherence and calibration-image scaling are shared with DS8 and protected
+  V3DT. Static and focused tests pass; fresh
+  `mapanything_depth_quality_v4` live evidence remains required before release.
 - Increased on-demand MapAnything RPC burst/wait timeouts and made the
   WebSocket depth-provider timeout configurable with
   `NOESIS_DEPTH_RPC_TIMEOUT_SECONDS`.
@@ -157,7 +351,7 @@ runtime fallback.
   - The materialization matrix covers `yolo11`, `yolo26 n/s/m/l/x`,
     `yolo26_seg n/s/m`, `rfdetr n/s/m`, and `rfdetr_seg n/s/m`.
 
-## Current Validation State
+## Validation State And Historical Evidence
 
 The 2026-06-30 detection-wake DS9 port passed focused static/native checks on
 the host:
@@ -176,12 +370,16 @@ the host:
   `sample_masked_person_roi_stats` are exposed from
   `DS9/native_extensions/noesis_depth_tracking_tensor_ext*.so`.
 
-Full `DS9/scripts/ds9_preflight.py` is currently blocked on this host because
-`/usr/local/bin/trtexec` reports TensorRT 10.13.3 instead of DS9-required
-10.14.x, and because DS9 model/parser/plugin artifacts are not staged. The
-native depth-tensor extension was rebuilt into `DS9/native_extensions/`, but the
-full preflight still requires the remaining DS9 artifacts. The DS9 YOLO26 pose
-rebuild correctly stops until `DS9/models/onnx/yolo26n-pose_b3.onnx` exists.
+Host-SDK preflight remains intentionally unsuitable because the host
+`/usr/local/bin/trtexec` reports TensorRT 10.13.3. It now explicitly accepts the
+installed `595.71.05` driver against the exact `590.48.01` floor before failing
+the independent TensorRT gate. The isolated derived image passes the DS9 9.0 /
+TensorRT 10.14 environment, Service Maker, GStreamer, native-import, static,
+and test gates without GPU devices. Current authoritative artifact preflight
+passes the canonical, V3DT, and Wholebody49 profiles against the ten-engine
+external realization. Native/plugin/parser outputs and the CPU-exported
+`DS9/models/onnx/yolo26n-pose_b3.onnx` plus the other selected source inputs are
+staged and hash-verified in the explicit artifact workspace.
 
 The latest DS9 core parity pass proved these checks in
 `nvcr.io/nvidia/deepstream:9.0-triton-multiarch`:
@@ -190,7 +388,8 @@ The latest DS9 core parity pass proved these checks in
   - `mapanything_fullframe`
   - `depth_tracking_fullframe`
   - `yolo26_pose`
-  - `reid_osnet`
+  - `reid_osnet` (historical evidence only; it does not validate the currently
+    selected `reid_sgie` Swin-Tiny engine)
   - `yolo11_pgie`
 - RTSP mosaic port `8554` is open.
 - WebRTC signaling port `6008` is open.
@@ -291,14 +490,15 @@ Host-specific runtime fixes made during cutover:
   binding and caused minimal constructor/destructor crashes plus native heap
   corruption during shutdown; that user-site package has been removed on the
   host.
-- Script-mode `DS9/noesis/ds9_runtime.py` now exits immediately with the runtime
-  return code after Noesis teardown completes. This avoids Python interpreter GC
-  destructing Service Maker native objects while a native wait thread is still
-  alive after EOS.
-- `DS9/noesis/ds9_runtime_core.py` treats Service Maker EOS as expected when
-  shutdown is already requested or when the built graph is a finite-source graph
-  (`streammux.live-source=0`). This prevents MP4 validation EOS from poisoning
-  the runtime exit code while preserving surprise live-source EOS as a failure.
+- The earlier script-mode immediate-exit workaround is superseded. DS9 now
+  injects acknowledged EOS through its repo-owned `noesiseos` transform
+  immediately after `streammux`, requires the expected EOS callback and Service
+  Maker `wait()` return, and only then closes callback-owned resources. The
+  launcher exits normally through `SystemExit`; native quiescence may not be
+  replaced by interpreter-GC bypass.
+- Finite-source completion remains narrowly classified by local-file source,
+  non-live stream mux, disabled loop, and pipeline-EOS propagation. Surprise
+  live-source EOS remains a failure.
 - `DS9/noesis/ds9_runtime_core.py` preserves DS9-specified depth-tracking
   `config-file-path` and `engine` entries instead of rematerializing root DS8
   depth assets when `NOESIS_DEEPSTREAM_MAJOR=9`.
@@ -362,15 +562,62 @@ Occupied-camera live-RTSP host gates proved on 2026-06-16:
 - MapAnything depth RPC passed cache-first plus fresh for `family-room`.
 - Floorplan RPC passed for `kitchen` and then `family-room`; the first
   `family-room` attempt timed out before succeeding on retry.
-- Shutdown/native cleanup was reproduced with MP4 file inputs and fixed for the
-  DS9 launcher path: preflight now reports the system DS9 `pyservicemaker`,
+- Historical June shutdown/native cleanup was reproduced with MP4 file inputs
+  under the prior launcher workaround: preflight reported the system DS9 `pyservicemaker`,
   SIGINT posts EOS, and the process exits `0` with no fatal Python, segfault,
   malloc, double-free, or heap-corruption markers. Looping MP4 sources can still
   log `Wait thread did not terminate cleanly` because Service Maker `wait()` does
   not unwind after EOS in that graph. Live RTSP SIGINT shutdown also exited `0`,
   closed ports `6008`, `8080`, and `8554`, left no DS9 runtime process, and
   showed no native heap/fatal markers. The shutdown tail logged the wait-thread
-  warning and one `source_2` reconnect warning after EOS was posted.
+  warning and one `source_2` reconnect warning after EOS was posted. This result
+  is retained only as regression provenance; the current canonical runner must
+  reject the wait warning and requires acknowledged EOS plus `wait()` return.
+
+## 2026-07-11 Canonical Baseline Validation Repair
+
+Session `baseline-final2-20260711-1832` is preserved failure evidence, not an
+acceptance or promotion. Its EOS request/acknowledgement/callback/Service Maker
+wait/completion markers were present and ordered, but the supervisor correctly
+rejected the run because the complete log still contained `ERROR` severity.
+Two sources were real runtime defects: capability health used the aggregate
+world observation-window endpoint as its monotonic progress clock even though
+interleaved camera/entity removal can legitimately move that endpoint backward,
+and closed validation clients were caught inside the request loop and processed
+again, generating repeated send/receive errors through shutdown.
+
+The shared DS8/DS9 publisher now uses the advancing world publication timestamp
+for health progress and retains aggregate `world_observed_end_us` as evidence.
+Closed clients leave the handler through its lifecycle path, normal/abrupt
+disconnects no longer become runtime `ERROR` messages, and WebSocket teardown
+must prove both listener and thread quiescence. The behavior evidence leaf is
+created as exact mode `0700`. The unchanged 3 ms zero-copy limit now measures
+the complete local boundary: producer-to-event-loop dispatch,
+serializer-worker dispatch, conversion, single admission-freeze encoding, and
+WebSocket send dispatch. Sync producers carry the exact pre-encoded bytes to
+delivery, so caller mutation and a second unmeasured encode are impossible.
+Those stages remain separately visible; only explicitly configured
+non-canonical coalescing dwell and authority-gate persistence dwell are
+excluded. Canonical tracking/world/event/BEV never
+coalesce. Large JSON work uses a dedicated prewarmed owned
+executor rather than competing with provider work. Gate output includes bounded
+WS/REST and total-stage attribution with no payload content. The sender owns a
+256 MiB global frozen-byte cap in addition to its 256-submission cap, counts
+explicit gate aborts, and proves zero reserved bytes at shutdown. Telemetry
+fanout defaults to 8 authenticated
+clients, is hard-clamped to 16, rejects excess clients before snapshots, and
+does not charge `/healthz` against that set. Focused
+cross-runtime tests passed (228), followed by dedicated assembled-boundary and
+shutdown regressions.
+
+Blocking depth, floorplan, and auto-calibration WebSocket callbacks now use an
+owned admission-tracked provider executor. Shutdown rejects new calls, drains
+and joins admitted calls, stops the listener, closes depth admission, proves
+pipeline EOS/wait, joins MapAnything postprocess, and only then releases depth
+storage. Cancellation cannot counterfeit provider completion; a bounded drain
+failure preserves native/store resources until the watchdog exits nonzero.
+A fresh supervised live run is still required; none of these static results is
+runtime acceptance.
 
 ## Broader Migration Validation Results
 
@@ -384,25 +631,37 @@ option-surface parity. Current broader-gate status:
 - Passed: enabled YOLO11 detect-only, YOLO26 detect-only `n/s/m/l/x`,
   YOLO26-seg, RF-DETR-seg, and RF-DETR detect-only profile materialization and
   focused startup coverage.
-- Blocked: V3DT is not yet DS9-native. The DS9 V3DT smoke script now refuses to
-  spawn unless an explicit DS9 V3DT pipeline config is provided, and the
-  available V3DT configs still reference root DS8 engines, local `/home/...`
-  clips, and non-DS9 tracker paths.
+- Artifact-complete, runtime blocked: V3DT now has DS9-owned pipeline, cameras, camInfo,
+  tracker, source provenance, native bridge, NvMOT helper, preflight/runtime
+  materialization, and smoke surfaces. Large bytes resolve through the explicit
+  artifact root; no root DS8 binary or machine-local clip is used. Its three
+  selected DS9 TensorRT 10.14 engines are realized; fresh live behavior evidence
+  remains absent. Static coordinate parity is complete: the active shared
+  calibration has separated camera centers, DS8/DS9 locked camInfo bytes match,
+  and the producer converts `xzy` tracker coordinates to Y-up
+  `backend_world_m`. Promotion accepts only the same-session privacy-safe v2
+  replay; MV3DT overlap/time-sync/fusion remains a separate claim.
 - Passed: bridge-specific object-depth, depth tensor, and ReID native extraction
-  smoke. V3DT bridge evidence remains out of scope until DS9-native V3DT staging
-  exists.
+  smoke. Fresh V3DT bridge evidence remains pending until its runtime gate is
+  scheduled.
 - Passed: focused host MP4 ReID stable-ID smoke using the validation-only
   depthless ReID config, plus occupied-camera live-RTSP production ReID evidence.
 
 ## Verified Local Paths
 
-These paths existed when this handoff was written:
+These source/governance paths exist in the current checkout:
 
 - `DS9/noesis/ds9_runtime.py`
 - `DS9/noesis/ds9_runtime_core.py`
+- `DS9/noesis/runtime_config.py`
 - `DS9/config/infer.yaml`
 - `DS9/config/depth_registration.json`
 - `DS9/models/coco_labels.txt`
+- `DS9/docs/runtime_ownership.yaml`
+- `DS9/asset_manifest.yaml`
+- `DS9/docs/asset_manifest.schema.json`
+- `DS9/scripts/validate_runtime_ownership.py`
+- `DS9/scripts/validate_asset_manifest.py`
 - `DS9/scripts/ds9_preflight.py`
 - `DS9/scripts/rebuild_engines.py`
 - `DS9/scripts/build_gst_plugins.sh`
@@ -413,12 +672,6 @@ These paths existed when this handoff was written:
 - `DS9/scripts/ds9_bridge_contract_smoke_test.py`
 - `DS9/scripts/ds9_live_validation_runner.py`
 - `DS9/pipelines/config_infer_secondary_yolo26_pose.ini`
-- `DS9/models/onnx/rfdetr_n_384.onnx`
-- `DS9/models/onnx/rfdetr_s_512.onnx`
-- `DS9/models/onnx/rfdetr_m_576.onnx`
-- `DS9/models/engines/rfdetr_n_384_b3_fp16.engine`
-- `DS9/models/engines/rfdetr_s_512_b3_fp16.engine`
-- `DS9/models/engines/rfdetr_m_576_b3_fp16.engine`
 - `noesis/pipelines/hooks.py`
 - `scripts/menon_bev_track_parity_smoke_test.py`
 - `scripts/webrtc_gateway_smoke_test.py`
@@ -428,18 +681,29 @@ These paths existed when this handoff was written:
 - `DS9/pipelines/nvdsinfer_yolo_detect/nvdsinfer_yolo_detect.cpp`
 - `DS9/pipelines/nvdsinfer_yolo_detect/Makefile`
 
+Large TensorRT bytes live outside the checkout and their truth comes from the
+external realization, not the declarative manifest or this source-path list.
+Native extensions, parsers, and plugins are staged with provenance. Run the
+artifact validator rather than inferring readiness from filenames.
+
 ## Remaining Work
 
-- Stage DS9-native V3DT pipeline/camera/tracker assets before attempting V3DT
-  metadata parity. Do not run V3DT smokes against root DS8 configs as DS9
-  evidence.
+- The checkpointed Ubuntu `595.71.05` open-driver transaction and post-reboot
+  module/DKMS/platform checks are complete. Preserve host CUDA 13.0 and
+  TensorRT 10.13.3 for DS8; do not substitute Noble's transitional 590 package
+  or mix NVIDIA's runfile installer into the APT/DKMS stack. Complete the
+  remaining DS8 runtime/media/identity/MapAnything/resource/shutdown acceptance
+  gates, then run the realized DS9 V3DT lane through bbox3d, global-world-v2,
+  identity, resource, and shutdown gates. Follow with separate occupied
+  kitchen/family-room MV3DT overlap/time-sync/peer-fusion acceptance. Do not run
+  V3DT smokes against root DS8 pipeline/tracker artifacts as DS9 evidence.
 - Decide whether DS9 should remain a folder in the Noesis monorepo that shares
   app helpers, or become a hermetic standalone repository with vendored/extracted
   shared modules.
 - Keep `DS9/scripts/ds9_bridge_contract_smoke_test.py` in the regression set
   when object-depth, depth tensor, or ReID native bridge code changes.
-- Keep the DS9-native pose path and MapAnything BF16/runtime timeout behavior
-  covered by future regression gates.
+- Keep the DS9-native pose path and validated-FP32 MapAnything functional
+  admission/runtime timeout behavior covered by future regression gates.
 - Collect longer host RTSP soak evidence if production acceptance requires more
   than the occupied-camera validation window already captured. Use
   `DS9/scripts/ds9_live_validation_runner.py` for future full-bundle host

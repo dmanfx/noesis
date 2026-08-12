@@ -3,12 +3,14 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import concurrent.futures
 import configparser
 import ctypes
 import inspect
-import json
 import logging
+import math
 import os
+import re
 import subprocess
 import signal
 import socket
@@ -16,7 +18,11 @@ import sys
 import threading
 import time
 from pathlib import Path
-from typing import Any, Callable, Dict, Optional, Tuple, Mapping
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Mapping, NamedTuple, NoReturn, Optional, Tuple
+
+if TYPE_CHECKING:
+    import uvicorn
+    from fastapi import FastAPI
 
 import yaml
 import numpy as np
@@ -25,23 +31,30 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from calibration_bundle import (
-    assemble_calibration_bundle,
-    load_alignment,
-    load_extrinsics,
-    load_intrinsics,
-    pose_to_E_col_major,
-    save_alignment,
-    save_extrinsics,
-)
-from geometry.depth_source import DepthStorageManager
+_gst_plugin_dir = Path(
+    os.environ.get("NOESIS_GST_PLUGIN_DIR", str(REPO_ROOT / "gst-plugins"))
+).expanduser()
+if not _gst_plugin_dir.is_absolute():
+    _gst_plugin_dir = (REPO_ROOT / _gst_plugin_dir).resolve()
+if _gst_plugin_dir.exists():
+    _gst_plugin_dir_text = str(_gst_plugin_dir)
+    _gst_plugin_paths = [
+        item for item in os.environ.get("GST_PLUGIN_PATH", "").split(os.pathsep) if item
+    ]
+    if _gst_plugin_dir_text not in _gst_plugin_paths:
+        os.environ["GST_PLUGIN_PATH"] = os.pathsep.join(
+            [_gst_plugin_dir_text, *_gst_plugin_paths]
+        )
+
+from calibration_bundle import pose_to_E_col_major
+from geometry.depth_source import DepthStorageManager, StorageFailure
 from mapanything_config import load_service_config
 from noesis.calibration.depth_registration import (
     DepthRegistrationError,
     DepthRegistrationManager,
     model_profile_fingerprint as _depth_registration_model_profile_fingerprint,
 )
-from noesis.calibration.manager import CalibrationManager
+from noesis.calibration.manager import create_calibration_manager, load_camera_labels
 from noesis.calibration.pose_v1 import normalize_pose_v1
 from noesis.calibration.pose_v1 import POSE_V1_FRAME_BACKEND_WORLD_M
 from noesis.depth_tracking_materialization import (
@@ -53,16 +66,71 @@ from noesis.depth_tracking_materialization import (
     ensure_native_object_depth_extension as _ensure_native_object_depth_extension,
     materialize_depth_tracking_assets as _materialize_depth_tracking_assets,
 )
+from noesis.capture_event_controller import (
+    CanonicalCameraAliases,
+    CaptureEventController,
+)
+from noesis.capture_event_runtime import (
+    CaptureEventRuntimeError,
+    CaptureEventRuntimeProviders,
+)
 from noesis.pipelines import ds8_pipeline, hooks_v3dt_reimpl as hooks
+from noesis.depth_capture_event import DepthStorageCaptureEventAdapter
+from noesis.runtime_storage import close_depth_storage, storage_close_evidence
 from noesis.metadata.intrinsics import CameraConfigLoader
 from noesis.telemetry.publishers import DepthTelemetryPublisher, TrackingTelemetryPublisher, bind_occupancy_publisher
+from noesis_core.runtime_world import create_runtime_capability_monitor, create_runtime_world_service
+from noesis_core.runtime_health import require_complete_camera_health
+from noesis_core.active_floorplan import ActiveFloorplanError, ActiveFloorplanRegistry
+from noesis_core.capture_event_fusion import CaptureEventFusionError
+from noesis_core.servicemaker_shutdown import (
+    OrderlyEosError,
+    SyntheticStubEosMessage,
+    pipeline_expects_finite_source_eos,
+    request_orderly_eos,
+    validate_synthetic_stub_eos_message,
+)
+from noesis_core.startup_lifecycle import (
+    RuntimeStartupTransaction,
+    StartupMainGuard,
+    StartupOwnershipAmbiguous,
+    StartupPhase,
+    StartupResourceRegistrationError,
+)
+from noesis_core.runtime_secrets import (
+    load_pipeline_config as load_runtime_pipeline_config,
+    public_pipeline_config,
+)
 from noesis.diagnostics.telemetry_log import TrackingDiagnosticsLogger
-from noesis.telemetry.bev import BevRenderer, CalibrationSnapshot
+from noesis.telemetry.bev import BevRenderer
 from noesis.yolo26_seg_materialization import (
     materialize_yolo26_seg_configs as _shared_materialize_yolo26_seg_configs,
+    resolve_yolo26_seg_assets as _shared_resolve_yolo26_assets,
 )
-from noesis.yolo26_seg_materialization import resolve_yolo26_seg_assets as _shared_resolve_yolo26_seg_assets
-from websocket_server import WebSocketServer
+from websocket_server import (
+    WebSocketServer,
+    WebSocketStartupError,
+    WebSocketStartupReceipt,
+)
+
+SHUTDOWN_WATCHDOG_DEFAULT_S = 75
+SHUTDOWN_EXTERNAL_SUPERVISOR_TIMEOUT_S = 90
+SHUTDOWN_KNOWN_PHASE_BUDGET_S = (
+    5.0
+    + WebSocketServer.STATS_COLLECTOR_DRAIN_TIMEOUT_S
+    + 5.0
+    + 5.0
+    + WebSocketServer.WEBRTC_GATEWAY_DRAIN_TIMEOUT_S
+    + WebSocketServer.RUNTIME_SHUTDOWN_TIMEOUT_S
+    + 15.0
+    + 5.0
+    + 5.0
+)
+SHUTDOWN_WATCHDOG_MARGIN_S = (
+    SHUTDOWN_WATCHDOG_DEFAULT_S - SHUTDOWN_KNOWN_PHASE_BUDGET_S
+)
+if SHUTDOWN_WATCHDOG_MARGIN_S <= 0.0:
+    raise RuntimeError("shutdown phase budgets exceed the runtime watchdog")
 
 # GLib/GObject for GStreamer main loop (required for bus event dispatch)
 try:
@@ -95,6 +163,12 @@ _ENV_TRUE = ("1", "true", "yes", "y", "on")
 _ENV_FALSE = ("0", "false", "no", "n", "off")
 _TRACKING_MODES = ("baseline", "v3dt")
 _RFDETR_TRT_PLUGIN_LOADED = False
+
+
+def _build_dir() -> Path:
+    return Path(
+        os.environ.get("NOESIS_BUILD_DIR", REPO_ROOT / "build")
+    ).expanduser().resolve()
 
 
 def _prepend_env_paths(name: str, paths: list[Path]) -> None:
@@ -135,9 +209,11 @@ def _configure_v3dt_patched_nvtracker_plugin(logger: logging.Logger) -> bool:
     _prepend_env_paths("GST_PLUGIN_PATH", plugin_paths)
     _prepend_env_paths("GST_PLUGIN_SYSTEM_PATH", plugin_paths)
 
-    registry_path = (REPO_ROOT / "build" / "gst-registry-v3dt.bin").resolve()
+    registry_path = Path(
+        os.environ.get("GST_REGISTRY_1_0", _build_dir() / "gst-registry-v3dt.bin")
+    ).expanduser().resolve()
     registry_path.parent.mkdir(parents=True, exist_ok=True)
-    os.environ.setdefault("GST_REGISTRY_1_0", str(registry_path))
+    os.environ["GST_REGISTRY_1_0"] = str(registry_path)
 
     logger.info("V3DT patched nvtracker enabled: %s", patched_plugin)
     logger.info("V3DT GST_PLUGIN_PATH=%s", os.environ.get("GST_PLUGIN_PATH", ""))
@@ -230,7 +306,7 @@ def _validate_dewarper_intrinsics_sync(
     pipeline_path: Path, cameras_path: Path, logger: logging.Logger
 ) -> bool:
     try:
-        pipeline_cfg = yaml.safe_load(pipeline_path.read_text(encoding="utf-8")) or {}
+        pipeline_cfg = load_runtime_pipeline_config(pipeline_path, materialize_secrets=False)
     except Exception as exc:
         logger.error("Dewarp intrinsics check failed: unable to read %s: %s", pipeline_path, exc)
         return False
@@ -375,7 +451,7 @@ def _resolve_rfdetr_assets(size: str) -> Dict[str, Any]:
         "weights": (REPO_ROOT / "models" / f"rf-detr-seg-{size_norm}.pt").resolve(),
         "onnx": (REPO_ROOT / "models" / "onnx" / f"rfdetr_seg_{size_norm}_{resolution}.onnx").resolve(),
         "engine": (REPO_ROOT / "models" / "engines" / f"rfdetr_seg_{size_norm}_{resolution}_b3_fp16.engine").resolve(),
-        "output": (REPO_ROOT / "build" / f"config_infer_primary_rfdetr_seg_{size_norm}.ini").resolve(),
+        "output": (_build_dir() / f"config_infer_primary_rfdetr_seg_{size_norm}.ini").resolve(),
     }
 
 
@@ -390,7 +466,7 @@ def _materialize_rfdetr_pgie_ini(size: str, logger: logging.Logger) -> Path:
     out_path = assets["output"]
     out_path.parent.mkdir(parents=True, exist_ok=True)
     text = template_path.read_text(encoding="utf-8")
-    text = text.replace("@ONNX_PATH@", str(assets["onnx"]))
+    text = re.sub(r"(?m)^\s*onnx-file\s*=.*(?:\n|$)", "", text)
     text = text.replace("@ENGINE_PATH@", str(assets["engine"]))
     text = text.replace("@TOPK@", str(assets["max_detections"]))
     out_path.write_text(text, encoding="utf-8")
@@ -411,6 +487,7 @@ def _materialize_yolo26_configs(size: str, src_ids: Tuple[int, ...], logger: log
             size=size,
             batch_size=3,
             src_ids=src_ids,
+            include_model_source=False,
             logger=logger,
         )
     except (FileNotFoundError, ValueError) as exc:
@@ -455,9 +532,37 @@ def _load_rfdetr_trt_plugin_library(yaml_path: Path, logger: logging.Logger) -> 
     logger.info("RF-DETR TensorRT plugin library loaded: %s", lib_path)
 
 
+def _require_nonempty_runtime_engine(engine_path: Path, *, label: str) -> None:
+    try:
+        ready = engine_path.is_file() and engine_path.stat().st_size > 0
+    except OSError:
+        ready = False
+    if not ready:
+        raise SystemExit(
+            f"[FATAL] {label} engine missing or empty: {engine_path}\n"
+            "Runtime startup cannot export ONNX or build TensorRT engines. "
+            "Stage the engine with the explicit offline maintenance command first."
+        )
+
+
 def _preflight_pgie_profile(profile: str, pipeline_cfg: Dict[str, Any], yaml_path: Path, logger: logging.Logger) -> None:
     if profile not in ("rfdetr_seg", "yolo26_seg"):
         return
+    models_cfg = pipeline_cfg.get("models") if isinstance(pipeline_cfg, dict) else None
+    pgie_cfg = (models_cfg or {}).get("pgie") if isinstance(models_cfg, dict) else None
+    engine_raw = (pgie_cfg or {}).get("engine") if isinstance(pgie_cfg, dict) else None
+    if not str(engine_raw or "").strip():
+        raise SystemExit(
+            f"[FATAL] {profile} profile requires models.pgie.engine to be set"
+        )
+    profile_engine_labels = {
+        "rfdetr_seg": "RF-DETR PGIE",
+        "yolo26_seg": "YOLO26 PGIE",
+    }
+    _require_nonempty_runtime_engine(
+        _resolve_pipeline_cfg_path(yaml_path, str(engine_raw)),
+        label=profile_engine_labels[profile],
+    )
 
     if profile == "rfdetr_seg":
         _load_rfdetr_trt_plugin_library(yaml_path, logger)
@@ -498,25 +603,8 @@ def _preflight_pgie_profile(profile: str, pipeline_cfg: Dict[str, Any], yaml_pat
         if gie_uid and gie_uid != "1":
             raise SystemExit(f"[FATAL] RF-DETR PGIE gie-unique-id must remain 1 (got {gie_uid})")
 
-        if engine_path.exists():
-            logger.info("RF-DETR PGIE engine found: %s", engine_path)
-            return
-
-        onnx_raw = str(props.get("onnx-file", "") or "").strip()
-        onnx_path = _resolve_pipeline_cfg_path(yaml_path, onnx_raw)
-        if not onnx_raw or not onnx_path.exists():
-            raise SystemExit(
-                "[FATAL] RF-DETR PGIE engine is missing and no ONNX is available to rebuild it.\n"
-                f"engine (from YAML models.pgie.engine): {engine_path}\n"
-                f"onnx-file (from PGIE INI): {onnx_raw or '<unset>'}\n"
-                f"resolved: {onnx_path}\n"
-            )
-
-        logger.warning(
-            "RF-DETR PGIE engine missing (%s); nvinfer will attempt to build it from ONNX (%s) on startup.",
-            engine_path,
-            onnx_path,
-        )
+        _require_nonempty_runtime_engine(engine_path, label="RF-DETR PGIE")
+        logger.info("RF-DETR PGIE engine found: %s", engine_path)
         return
 
     if profile == "yolo26_seg":
@@ -537,8 +625,7 @@ def _preflight_pgie_profile(profile: str, pipeline_cfg: Dict[str, Any], yaml_pat
         engine_path = _resolve_pipeline_cfg_path(yaml_path, str(engine_raw or ""))
         if not str(engine_raw or "").strip():
             raise SystemExit("[FATAL] YOLO26 profile requires models.pgie.engine to be set")
-        if not engine_path.exists():
-            raise SystemExit(f"[FATAL] YOLO26 PGIE engine missing: {engine_path}")
+        _require_nonempty_runtime_engine(engine_path, label="YOLO26 PGIE")
 
         parser = configparser.ConfigParser()
         parser.read(pgie_ini, encoding="utf-8")
@@ -573,7 +660,7 @@ def _materialize_effective_pipeline_yaml(
     tracking_mode: str = "baseline",
 ) -> Path:
     try:
-        base_cfg = yaml.safe_load(base_yaml_path.read_text(encoding="utf-8")) or {}
+        base_cfg = load_runtime_pipeline_config(base_yaml_path, materialize_secrets=False)
     except Exception as exc:
         raise SystemExit(f"[FATAL] Unable to read DS8 pipeline YAML: {base_yaml_path} ({exc})") from exc
     if not isinstance(base_cfg, dict):
@@ -657,6 +744,7 @@ def _materialize_effective_pipeline_yaml(
     effective_cfg = _deep_merge_dict(base_cfg, overlay)
     if not isinstance(effective_cfg, dict):
         raise SystemExit("[FATAL] Internal error: effective pipeline config is not a mapping")
+    effective_cfg = public_pipeline_config(effective_cfg)
 
     preprocess_cfg = effective_cfg.get("preprocess") if isinstance(effective_cfg, dict) else None
     preprocess_path_raw = (preprocess_cfg or {}).get("config-file") if isinstance(preprocess_cfg, dict) else None
@@ -673,7 +761,7 @@ def _materialize_effective_pipeline_yaml(
         engine_raw,
     )
 
-    out_dir = (REPO_ROOT / "build").resolve()
+    out_dir = _build_dir()
     out_dir.mkdir(parents=True, exist_ok=True)
     out_path = out_dir / f"effective_pipeline_{profile}.yaml"
     out_path.write_text(yaml.safe_dump(effective_cfg, sort_keys=False), encoding="utf-8")
@@ -692,7 +780,7 @@ def _maybe_autogen_v3dt_caminfo(pipeline_path: Path, cameras_path: Path, logger:
         return True
 
     try:
-        pipeline_cfg = yaml.safe_load(pipeline_path.read_text(encoding="utf-8")) or {}
+        pipeline_cfg = load_runtime_pipeline_config(pipeline_path, materialize_secrets=False)
     except Exception as exc:
         logger.error("V3DT autogen camInfo failed: unable to read %s: %s", pipeline_path, exc)
         return False
@@ -791,7 +879,7 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--ws-host",
-        default=os.environ.get("NOESIS_WS_HOST", "0.0.0.0"),
+        default=os.environ.get("NOESIS_WS_HOST", "127.0.0.1"),
         help="WebSocket host to bind.",
     )
     parser.add_argument(
@@ -802,7 +890,7 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--rest-host",
-        default=os.environ.get("NOESIS_REST_HOST", "0.0.0.0"),
+        default=os.environ.get("NOESIS_REST_HOST", "127.0.0.1"),
         help="REST host to bind when enabled.",
     )
     parser.add_argument(
@@ -859,8 +947,10 @@ def _normalize_tracking_mode(value: Any) -> str:
         return "baseline"
     if not mode or mode == "auto":
         return "baseline"
-    logging.getLogger("ds8.runtime").warning("Unknown tracking mode '%s'; defaulting to baseline", value)
-    return "baseline"
+    raise SystemExit(
+        "[FATAL] Unsupported DS8 tracking mode "
+        f"{value!r}; expected baseline, v3dt, or auto"
+    )
 
 
 def _resolve_tracking_mode(args: argparse.Namespace) -> str:
@@ -910,27 +1000,9 @@ def _select_ws_port(host: str, requested_port: int, max_fallback_tries: int, log
         return port
     if _port_bindable(host, port):
         return port
-
-    tries = max(0, int(max_fallback_tries))
-    for offset in range(1, tries + 1):
-        candidate = port + offset
-        if candidate > 65535:
-            break
-        if _port_bindable(host, candidate):
-            logger.warning(
-                "Requested WS port %s unavailable on %s; using fallback port %s",
-                port,
-                host,
-                candidate,
-            )
-            return candidate
-    logger.error(
-        "Requested WS port %s unavailable on %s and no fallback port found within %s tries",
-        port,
-        host,
-        tries,
+    raise RuntimeError(
+        f"required WebSocket endpoint is unavailable: host={host} port={port}"
     )
-    return port
 
 
 def _cuda_runtime_preflight() -> Tuple[bool, str]:
@@ -1017,7 +1089,7 @@ def _resolve_pipeline_and_camera_paths(
 
 def _load_pipeline_config(path: Path, logger: logging.Logger) -> Optional[Dict[str, Any]]:
     try:
-        data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+        data = load_runtime_pipeline_config(path, materialize_secrets=False)
     except Exception as exc:
         logger.error("Unable to read pipeline config %s: %s", path, exc)
         return None
@@ -1148,7 +1220,7 @@ def _resolve_depth_registration_path(args: argparse.Namespace, *, pipeline_path:
         return Path(raw).resolve()
     if pipeline_path is not None and pipeline_path.exists():
         try:
-            pipeline_cfg = yaml.safe_load(pipeline_path.read_text(encoding="utf-8")) or {}
+            pipeline_cfg = load_runtime_pipeline_config(pipeline_path, materialize_secrets=False)
         except Exception:
             pipeline_cfg = {}
         reg_cfg = pipeline_cfg.get("depth_registration") if isinstance(pipeline_cfg, Mapping) else None
@@ -1241,33 +1313,11 @@ def _load_depth_registration_manager(
     return manager
 
 
-def _load_camera_labels(path: Path) -> Dict[int, str]:
-    if not path.exists():
-        return {}
-    try:
-        with path.open("r", encoding="utf-8") as stream:
-            data = yaml.safe_load(stream) or {}
-    except Exception:
-        logging.getLogger(__name__).warning("Unable to read cameras config at %s", path)
-        return {}
-
-    cameras = data.get("cameras", {})
-    labels: Dict[int, str] = {}
-    for key, entry in cameras.items():
-        try:
-            idx = int(key)
-        except Exception:
-            continue
-        if isinstance(entry, dict):
-            name = entry.get("name")
-            if isinstance(name, str) and name.strip():
-                labels[idx] = name.strip()
-                continue
-        labels[idx] = f"camera_{idx}"
-    return labels
-
-
-def _build_storage_manager(args: argparse.Namespace) -> DepthStorageManager:
+def _build_storage_manager(
+    args: argparse.Namespace,
+    *,
+    on_failure: Optional[Callable[[StorageFailure], None]] = None,
+) -> DepthStorageManager:
     service_cfg = load_service_config()
     storage_cfg = service_cfg.storage
     base_path = Path(args.storage_base) if args.storage_base else Path(storage_cfg.depth_base)
@@ -1286,10 +1336,17 @@ def _build_storage_manager(args: argparse.Namespace) -> DepthStorageManager:
         zarr_clevel=storage_cfg.zarr_clevel,
         zarr_chunk_px=storage_cfg.zarr_chunk_px,
         min_conf=getattr(getattr(service_cfg, "performance", None), "min_conf", float("nan")),
+        on_failure=on_failure,
+        legacy_policy="ignore",
     )
 
 
-def _build_stable_id_manager(logger: logging.Logger, *, pipeline_config: Optional[Mapping[str, Any]] = None):
+def _build_stable_id_manager(
+    logger: logging.Logger,
+    *,
+    pipeline_config: Optional[Mapping[str, Any]] = None,
+    camera_labels: Optional[Mapping[int, str]] = None,
+):
     """Instantiate StableIDManager if enabled and available."""
     flag = os.environ.get("NOESIS_REID_ENABLED", "1")
     if str(flag).strip().lower() not in ("1", "true", "yes", "on"):
@@ -1621,6 +1678,8 @@ def _build_stable_id_manager(logger: logging.Logger, *, pipeline_config: Optiona
             extra_kwargs["gallery_persist_file"] = gallery_persist_file
         if household_identity_enabled:
             extra_kwargs.update(household_overrides)
+        if camera_labels is not None:
+            extra_kwargs["camera_labels"] = dict(camera_labels)
         try:
             sig = inspect.signature(StableIDManager.__init__)
             valid_params = set(sig.parameters)
@@ -1683,316 +1742,18 @@ def _build_stable_id_manager(logger: logging.Logger, *, pipeline_config: Optiona
         return None
 
 
-class _CalibrationProvider:
-    """Provide calibration snapshots and WS bundle for BEV rendering."""
-
-    def __init__(
-        self,
-        cameras_path: Path,
-        pipeline_cfg: Dict[str, object],
-        *,
-        tracking_mode: Optional[str] = None,
-        extrinsics_path: Optional[Path] = None,
-    ) -> None:
-        self._loader = CameraConfigLoader(cameras_path)
-        self._camera_model_res = self._load_camera_model_resolutions(cameras_path)
-        self._intrinsics_models = load_intrinsics(str(REPO_ROOT / "intrinsics.json"))
-        self._align = load_alignment(str(REPO_ROOT / "config" / "ply_alignment.json"))
-        tracking_mode_norm = str(tracking_mode or "").strip().lower() or "baseline"
-        default_extrinsics_path = REPO_ROOT / "config" / "camera_calibration.json"
-        env_path = os.environ.get("NOESIS_CALIBRATION_EXTRINSICS", "")
-        if not extrinsics_path and env_path.strip():
-            extrinsics_path = Path(env_path.strip())
-        self._extrinsics_path = Path(extrinsics_path) if extrinsics_path else default_extrinsics_path
-        self._extrinsics = load_extrinsics(str(self._extrinsics_path), align_data=self._align)
-        logging.getLogger(__name__).info("Calibration extrinsics path=%s", self._extrinsics_path)
-        try:
-            from config import config as app_config  # type: ignore
-
-            calib_cfg = getattr(app_config, "calibration", None)
-            self._model_map = dict(getattr(calib_cfg, "CAMERA_INTRINSICS_MODEL_MAP", {}) or {})
-            self._camera_specs = dict(getattr(calib_cfg, "CAMERA_SPECS", {}) or {})
-        except Exception:
-            self._model_map = {}
-            self._camera_specs = {}
-        streammux_cfg = pipeline_cfg.get("streammux") or {}
-        try:
-            self._frame_size = (
-                int((streammux_cfg or {}).get("width", 0) or 0),
-                int((streammux_cfg or {}).get("height", 0) or 0),
-            )
-        except Exception:
-            self._frame_size = (0, 0)
-        self._camera_labels: Dict[int, str] = {}
-        self._bundle_cache: Optional[Dict[str, object]] = None
-        pose_only_env = str(os.environ.get("NOESIS_CALIBRATION_POSE_ONLY", "1") or "").strip().lower()
-        self._pose_only = pose_only_env in ("1", "true", "yes", "on", "y")
-
-    @staticmethod
-    def _resolution_from_entry(entry: Any) -> Optional[Tuple[int, int]]:
-        if not isinstance(entry, dict):
-            return None
-        res = entry.get("resolution")
-        if isinstance(res, (list, tuple)) and len(res) >= 2:
-            try:
-                w = int(res[0])
-                h = int(res[1])
-                if w > 0 and h > 0:
-                    return w, h
-            except Exception:
-                return None
-        intr = entry.get("intrinsics")
-        if isinstance(intr, dict):
-            res = intr.get("resolution")
-            if isinstance(res, (list, tuple)) and len(res) >= 2:
-                try:
-                    w = int(res[0])
-                    h = int(res[1])
-                    if w > 0 and h > 0:
-                        return w, h
-                except Exception:
-                    return None
-        return None
-
-    @classmethod
-    def _load_camera_model_resolutions(cls, cameras_path: Path) -> Dict[str, Tuple[int, int]]:
-        try:
-            data = yaml.safe_load(Path(cameras_path).read_text()) or {}
-        except Exception:
-            return {}
-        models = data.get("intrinsics_models") or {}
-        cameras = data.get("cameras") or {}
-        if not isinstance(models, dict) or not isinstance(cameras, dict):
-            return {}
-        model_res: Dict[str, Tuple[int, int]] = {}
-        for key, entry in models.items():
-            res = cls._resolution_from_entry(entry)
-            if res:
-                model_res[str(key)] = res
-        cam_res: Dict[str, Tuple[int, int]] = {}
-        for entry in cameras.values():
-            if not isinstance(entry, dict):
-                continue
-            name = entry.get("name")
-            model = entry.get("model") or entry.get("intrinsics_model")
-            if isinstance(name, str) and isinstance(model, str):
-                res = model_res.get(model)
-                if res:
-                    cam_res[name] = res
-        return cam_res
-
-    def set_camera_labels(self, labels: Dict[int, str]) -> None:
-        self._camera_labels = dict(labels or {})
-        self._bundle_cache = None
-
-    def pose_only_enabled(self) -> bool:
-        return bool(self._pose_only)
-
-    def extrinsics_path(self) -> Path:
-        return Path(self._extrinsics_path)
-
-    def validate_pose_coverage(self) -> Dict[str, str]:
-        errors: Dict[str, str] = {}
-        camera_ids = sorted({name for name in self._camera_labels.values() if isinstance(name, str) and str(name).strip()})
-        if not camera_ids:
-            return errors
-        cams = self._extrinsics.get("cameras", {}) if isinstance(self._extrinsics, dict) else {}
-        align = self._align if isinstance(self._align, dict) else {}
-        try:
-            floor_y = float(align.get("floor_y", 0.0) or 0.0)
-        except Exception:
-            floor_y = 0.0
-        for camera_id in camera_ids:
-            entry = cams.get(camera_id)
-            if not isinstance(entry, dict):
-                errors[camera_id] = "missing_camera_entry"
-                continue
-            pose = entry.get("pose")
-            if not isinstance(pose, dict):
-                errors[camera_id] = "missing_or_invalid_pose"
-                continue
-            E = entry.get("E")
-            if not (isinstance(E, list) and len(E) == 16):
-                errors[camera_id] = "pose_to_extrinsics_failed"
-                continue
-            try:
-                Emat = np.array(E, dtype=np.float64).reshape((4, 4), order="F")
-                Twc = np.linalg.inv(Emat)
-                C_world = Twc[:3, 3].copy()
-                if not np.all(np.isfinite(C_world)):
-                    errors[camera_id] = "non_finite_camera_center"
-                    continue
-                if float(C_world[1]) <= float(floor_y) + 1e-3:
-                    errors[camera_id] = "camera_not_above_floor"
-                    continue
-                R_wc = Twc[:3, :3].copy()
-                forward = R_wc @ np.array([0.0, 0.0, 1.0], dtype=np.float64)
-                denom = float(forward[1])
-                if abs(denom) < 1e-6:
-                    errors[camera_id] = "camera_forward_parallel_to_floor"
-                    continue
-                t_hit = (float(floor_y) - float(C_world[1])) / denom
-                if t_hit <= 0.0:
-                    errors[camera_id] = "camera_forward_misses_floor"
-            except Exception:
-                errors[camera_id] = "invalid_pose_geometry"
-        return errors
-
-    def reload_extrinsics(self) -> None:
-        """Reload extrinsics from the configured calibration path without touching alignment."""
-        self._extrinsics = load_extrinsics(str(self._extrinsics_path), align_data=self._align)
-        self._bundle_cache = None
-
-    def reload_alignment(self) -> None:
-        """Reload alignment from ply_alignment.json."""
-        self._align = load_alignment(str(REPO_ROOT / "config" / "ply_alignment.json"))
-        self._extrinsics = load_extrinsics(str(self._extrinsics_path), align_data=self._align)
-        self._bundle_cache = None
-
-    def snapshot(self, source_id: int, camera_id: str) -> Optional["CalibrationSnapshot"]:
-        intr = self._loader.get(source_id)
-        if intr is None:
-            return None
-        try:
-            K = np.array(
-                [
-                    [float(intr.fx), 0.0, float(intr.cx)],
-                    [0.0, float(intr.fy), float(intr.cy)],
-                    [0.0, 0.0, 1.0],
-                ],
-                dtype=np.float64,
-            )
-        except Exception:
-            return None
-        extr_entry = self._extrinsics.get("cameras", {}).get(camera_id) if isinstance(self._extrinsics, dict) else None
-        E = extr_entry.get("E") if isinstance(extr_entry, dict) else None
-        if not isinstance(E, list) or len(E) != 16:
-            return None
-        align_dict = self._align if isinstance(self._align, dict) else {}
-        floor_y = float(align_dict.get("floor_y", 0.0) or 0.0)
-        unit_scale = 1.0
-        frame_w, frame_h = self._frame_size
-        if frame_w <= 0 or frame_h <= 0:
-            frame_w, frame_h = 1920, 1080
-
-        # Align intrinsics with the current streammux resolution.
-        base_w = base_h = None
-        res = self._camera_model_res.get(camera_id)
-        if res:
-            base_w, base_h = res
-        if base_w is None or base_h is None:
-            try:
-                spec = (self._camera_specs or {}).get(camera_id) if isinstance(self._camera_specs, dict) else None
-                if isinstance(spec, dict):
-                    res = spec.get("resolution")
-                    if isinstance(res, (list, tuple)) and len(res) >= 2:
-                        base_w = base_w or int(res[0]) or None
-                        base_h = base_h or int(res[1]) or None
-            except Exception:
-                pass
-        if (base_w is None or base_h is None) and isinstance(self._model_map, dict):
-            model_key = self._model_map.get(camera_id)
-            model = (self._intrinsics_models or {}).get(model_key, {}) if model_key else {}
-            res = model.get("resolution") if isinstance(model, dict) else None
-            if isinstance(res, (list, tuple)) and len(res) >= 2:
-                try:
-                    bw = int(res[0]); bh = int(res[1])
-                    base_w = base_w or bw
-                    base_h = base_h or bh
-                except Exception:
-                    pass
-        if base_w is None or base_h is None:
-            try:
-                bw_guess = int(round(float(K[0, 2]) * 2.0))
-                bh_guess = int(round(float(K[1, 2]) * 2.0))
-                if bw_guess > 0 and bh_guess > 0:
-                    base_w = base_w or bw_guess
-                    base_h = base_h or bh_guess
-            except Exception:
-                pass
-        if base_w and base_h and (base_w != frame_w or base_h != frame_h):
-            try:
-                sx = float(frame_w) / float(base_w)
-                sy = float(frame_h) / float(base_h)
-                K = K.copy()
-                K[0, 0] *= sx
-                K[0, 2] *= sx
-                K[1, 1] *= sy
-                K[1, 2] *= sy
-            except Exception:
-                pass
-        return CalibrationSnapshot(
-            camera_id=camera_id,
-            intrinsics=K,
-            extrinsics_col_major=list(E),
-            floor_y=floor_y,
-            image_size=(int(frame_w), int(frame_h)),
-            unit_scale=unit_scale,
-        )
-
-    def calibration_bundle(self) -> Dict[str, object]:
-        if self._bundle_cache is not None:
-            return dict(self._bundle_cache)
-        camera_ids = sorted({name for name in self._camera_labels.values() if isinstance(name, str)})
-        if not camera_ids:
-            return {}
-        bundle = assemble_calibration_bundle(
-            camera_ids=camera_ids,
-            intrinsics_models=self._intrinsics_models,
-            model_map=self._model_map,
-            extrinsics_data=self._extrinsics,
-            align_data=self._align,
-            camera_specs=self._camera_specs,
-        )
-        cams_node = bundle.setdefault("cameras", {})
-        k_table = cams_node.setdefault("K", {})
-        frame_w, frame_h = self._frame_size
-        if frame_w <= 0 or frame_h <= 0:
-            frame_w, frame_h = 1920, 1080
-        for src_id, cam_name in self._camera_labels.items():
-            intr = self._loader.get(src_id)
-            if intr is None:
-                continue
-            try:
-                fx = float(intr.fx)
-                fy = float(intr.fy)
-                cx = float(intr.cx)
-                cy = float(intr.cy)
-            except Exception:
-                continue
-            base_w = base_h = 0
-            res = self._camera_model_res.get(cam_name)
-            if res:
-                base_w, base_h = res
-            if base_w <= 0 or base_h <= 0:
-                try:
-                    base_w = int(round(cx * 2.0))
-                    base_h = int(round(cy * 2.0))
-                except Exception:
-                    base_w = base_h = 0
-            if base_w > 0 and base_h > 0 and (base_w != frame_w or base_h != frame_h):
-                try:
-                    sx = float(frame_w) / float(base_w)
-                    sy = float(frame_h) / float(base_h)
-                    fx *= sx
-                    cx *= sx
-                    fy *= sy
-                    cy *= sy
-                except Exception:
-                    pass
-            k_table[cam_name] = [fx, fy, cx, cy]
-        self._bundle_cache = bundle
-        return dict(bundle)
 
 def _build_stats_callback(
     pipeline: ds8_pipeline.DS8Pipeline,
     camera_labels: Dict[int, str],
     ws_metrics_getter: Optional[Callable[[], Dict[str, Any]]] = None,
     ws_metrics_resetter: Optional[Callable[[], None]] = None,
+    runtime_state: Optional[Mapping[str, Any]] = None,
 ) -> Callable[[], Dict[str, object]]:
     start_time = time.time()
     stats_logger = logging.getLogger(__name__)
     sid_metrics_fetch_warned = False
+    state = runtime_state if runtime_state is not None else {}
 
     def _default_stableid_metrics() -> Dict[str, Any]:
         return {
@@ -2091,6 +1852,8 @@ def _build_stats_callback(
         except Exception:
             depth_fps = 0.0
         reload_count = getattr(pipeline, "analytics_reload_count", 0)
+        reload_receipt = getattr(pipeline, "analytics_reload_receipt", None)
+        initial_receipt = getattr(pipeline, "analytics_initial_receipt", None)
         stableid_metrics: Dict[str, Any] = _default_stableid_metrics()
         try:
             sid_mgr = getattr(pipeline, "stable_id_mgr", None)
@@ -2119,23 +1882,41 @@ def _build_stats_callback(
         core_violations = int(core_counters.get("core_path.cpu_copy_violation.total", 0))
         ws_boundary_metrics: Dict[str, Any] = {}
         if callable(ws_metrics_getter):
-            try:
-                ws_boundary_metrics = ws_metrics_getter() or {}
-            except Exception:
-                ws_boundary_metrics = {}
-        rest_boundary_metrics: Dict[str, Any] = {}
-        try:
-            from noesis.server import boundary_metrics as _rest_boundary_metrics
+            ws_boundary_metrics = ws_metrics_getter()
+            if not isinstance(ws_boundary_metrics, dict):
+                raise TypeError("WebSocket boundary metrics getter must return a dict")
+        from noesis.server import boundary_metrics as _rest_boundary_metrics
 
-            rest_boundary_metrics = _rest_boundary_metrics.get_boundary_serialization_metrics() or {}
-        except Exception:
-            rest_boundary_metrics = {}
+        compact_getter = getattr(
+            _rest_boundary_metrics,
+            "get_boundary_serialization_metrics_compact",
+            _rest_boundary_metrics.get_boundary_serialization_metrics,
+        )
+        rest_boundary_metrics = compact_getter()
+        if not isinstance(rest_boundary_metrics, dict):
+            raise TypeError("REST boundary metrics getter must return a dict")
         ws_p50 = ws_boundary_metrics.get("p50_ms")
         ws_p95 = ws_boundary_metrics.get("p95_ms")
-        ws_p99 = ws_boundary_metrics.get("p99_ms")
+        ws_p99 = ws_boundary_metrics.get(
+            "max_path_p99_ms", ws_boundary_metrics.get("p99_ms")
+        )
+        ws_p99_10s = ws_boundary_metrics.get(
+            "max_path_p99_10s_ms", ws_boundary_metrics.get("p99_10s_ms")
+        )
+        ws_p99_60s = ws_boundary_metrics.get(
+            "max_path_p99_60s_ms", ws_boundary_metrics.get("p99_60s_ms")
+        )
         rest_p50 = rest_boundary_metrics.get("p50_ms")
         rest_p95 = rest_boundary_metrics.get("p95_ms")
-        rest_p99 = rest_boundary_metrics.get("p99_ms")
+        rest_p99 = rest_boundary_metrics.get(
+            "max_path_p99_ms", rest_boundary_metrics.get("p99_ms")
+        )
+        rest_p99_10s = rest_boundary_metrics.get(
+            "max_path_p99_10s_ms", rest_boundary_metrics.get("p99_10s_ms")
+        )
+        rest_p99_60s = rest_boundary_metrics.get(
+            "max_path_p99_60s_ms", rest_boundary_metrics.get("p99_60s_ms")
+        )
 
         def _max_nullable(a: Any, b: Any) -> Any:
             try:
@@ -2149,7 +1930,16 @@ def _build_stats_callback(
 
         boundary_p50 = _max_nullable(ws_p50, rest_p50)
         boundary_p95 = _max_nullable(ws_p95, rest_p95)
-        boundary_p99 = _max_nullable(ws_p99, rest_p99)
+        boundary_p99_10s = _max_nullable(ws_p99_10s, rest_p99_10s)
+        boundary_p99_60s = _max_nullable(ws_p99_60s, rest_p99_60s)
+        boundary_p99 = _max_nullable(boundary_p99_10s, boundary_p99_60s)
+        ws_boundary_errors = int(
+            ws_boundary_metrics.get("boundary_serialization_errors_total", 0) or 0
+        )
+        rest_boundary_errors = int(
+            rest_boundary_metrics.get("boundary_serialization_errors_total", 0) or 0
+        )
+        boundary_errors = ws_boundary_errors + rest_boundary_errors
         latency_collector = getattr(pipeline, "latency_collector", None)
         latency_by_source: Dict[int, Dict[str, object]] = {}
         latency_aggregate: Optional[Dict[str, object]] = None
@@ -2221,7 +2011,30 @@ def _build_stats_callback(
                 "tracking": tracking,
                 **({"latency_ms": latency_payload} if latency_payload is not None else {}),
             }
-        return {
+        bev_renderer = getattr(pipeline, "bev_renderer", None)
+        active_floorplans = getattr(pipeline, "active_floorplan_registry", None)
+        capture_controller = getattr(pipeline, "capture_event_controller", None)
+        bev_health = (
+            bev_renderer.health_snapshot()
+            if bev_renderer is not None
+            else {"healthy": False, "cameras": {}, "reason": "not_configured"}
+        )
+        bev_health = require_complete_camera_health(
+            bev_health,
+            camera_labels.values(),
+        )
+        active_floorplan_health = (
+            active_floorplans.health_snapshot()
+            if active_floorplans is not None
+            else {"healthy": False, "cameras": {}, "reason": "not_configured"}
+        )
+        capture_event_health = (
+            capture_controller.health_snapshot()
+            if capture_controller is not None
+            else {"healthy": False, "reason": "not_configured"}
+        )
+        response_model_started_ns = time.perf_counter_ns()
+        stats_payload = {
             "timestamp": now,
             "uptime": now - start_time,
             "stack": "ds8",
@@ -2236,6 +2049,13 @@ def _build_stats_callback(
                 "activated": pipeline.activated,
                 "depth_enabled": pipeline.depth_enabled,
                 "depth_fps": depth_fps,
+                "lifecycle_evidence": getattr(pipeline, "lifecycle_evidence", None),
+                "bev": {
+                    "frame": "camera_local_ground_m",
+                    "health": bev_health,
+                },
+                "active_floorplan": active_floorplan_health,
+                "capture_event_fusion": capture_event_health,
                 "zero_copy_profile": str(os.environ.get("NOESIS_ZERO_COPY_PROFILE", "strict") or "strict"),
                 "zero_copy_core_enabled": True,
                 "zero_copy_violations": core_violations,
@@ -2246,9 +2066,17 @@ def _build_stats_callback(
                 "boundary_cpu_serialization_p50_ms": boundary_p50,
                 "boundary_cpu_serialization_p95_ms": boundary_p95,
                 "boundary_cpu_serialization_p99_ms": boundary_p99,
+                "boundary_cpu_serialization_p99_10s_ms": boundary_p99_10s,
+                "boundary_cpu_serialization_p99_60s_ms": boundary_p99_60s,
                 "boundary_cpu_serialization_ws_p99_ms": ws_p99,
                 "boundary_cpu_serialization_rest_p99_ms": rest_p99,
+                "boundary_serialization_errors_total": boundary_errors,
+                "boundary_serialization_ws_errors_total": ws_boundary_errors,
+                "boundary_serialization_rest_errors_total": rest_boundary_errors,
                 "analytics_reload_count": reload_count,
+                "analytics_reload_receipt": reload_receipt,
+                "analytics_initial_receipt": initial_receipt,
+                "analytics_state_poisoned": state.get("analytics_state_poisoned"),
                 "mosaic_layout": _mosaic_layout(),
                 **({"latency_ms": latency_aggregate} if latency_aggregate is not None else {}),
                 "zero_copy_core": {
@@ -2263,6 +2091,10 @@ def _build_stats_callback(
             },
             "cameras": cameras_stats,
         }
+        return WebSocketServer.timed_payload_since(
+            stats_payload,
+            response_model_started_ns,
+        )
 
     def _clear_stats() -> None:
         try:
@@ -2291,10 +2123,16 @@ def _build_stats_callback(
     return _stats
 
 
-def _start_websocket_server(server: WebSocketServer) -> tuple[threading.Thread, Optional[asyncio.AbstractEventLoop]]:
+def _start_websocket_server(
+    server: WebSocketServer,
+    timeout_s: float = WebSocketServer.STARTUP_TIMEOUT_S,
+) -> tuple[threading.Thread, asyncio.AbstractEventLoop]:
     logger = logging.getLogger(__name__)
+    timeout = float(timeout_s)
+    if not math.isfinite(timeout) or timeout <= 0.0:
+        raise ValueError("WebSocket startup timeout must be positive")
     started = threading.Event()
-    loop_holder: Dict[str, asyncio.AbstractEventLoop] = {}
+    loop_holder: Dict[str, Any] = {}
 
     def _run() -> None:
         loop = asyncio.new_event_loop()
@@ -2302,178 +2140,129 @@ def _start_websocket_server(server: WebSocketServer) -> tuple[threading.Thread, 
         loop_holder["loop"] = loop
         try:
             server.event_loop = loop
-            loop.run_until_complete(server.start())
+            start_task = loop.create_task(
+                server.start(),
+                name="WebSocketServerStartup",
+            )
+            loop_holder["start_task"] = start_task
+            loop.run_until_complete(
+                asyncio.wait_for(start_task, timeout=timeout)
+            )
+            if getattr(server, "server", None) is None:
+                raise RuntimeError(
+                    "WebSocket startup completed without a bound listener"
+                )
             started.set()
             loop.run_forever()
-        except Exception:
+        except BaseException as exc:
+            loop_holder["startup_error"] = exc
             logger.exception("WebSocket server thread terminated unexpectedly")
+            server.report_lifecycle_failure(exc)
             started.set()
         finally:
             try:
                 loop.run_until_complete(server.stop())
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.critical(
+                    "WebSocket shutdown proof failed in event-loop owner",
+                    exc_info=True,
+                )
+                server.report_lifecycle_failure(exc)
+                loop.run_forever()
             finally:
-                if not loop.is_closed():
+                if not getattr(server, "_shutdown_quiesced", False):
+                    logger.critical(
+                        "WebSocket event-loop owner retained after unproven shutdown"
+                    )
+                    threading.Event().wait()
+                elif not loop.is_closed():
                     loop.stop()
                     loop.close()
 
-    thread = threading.Thread(target=_run, name="DS8-WebSocket", daemon=True)
+    thread = threading.Thread(target=_run, name="DS8-WebSocket", daemon=False)
     thread.start()
-    started.wait(timeout=5.0)
-    return thread, loop_holder.get("loop")
+    startup_signaled = started.wait(timeout=timeout + 0.5)
+    loop = loop_holder.get("loop")
+    start_task = loop_holder.get("start_task")
+    startup_error = loop_holder.get("startup_error")
+    server_bound = getattr(server, "server", None) is not None
+    if (
+        startup_signaled
+        and startup_error is None
+        and server_bound
+        and isinstance(loop, asyncio.AbstractEventLoop)
+        and thread.is_alive()
+    ):
+        return thread, loop
 
-
-def _wait_for_rtsp_ready(host: str, port: int, timeout: float = 15.0, interval: float = 0.2) -> bool:
-    """Wait for RTSP port to accept TCP connections before starting the gateway."""
-    deadline = time.time() + timeout
-    addr = (host, port)
-    attempt = 0
-    start_ts = time.time()
-    last_log = 0.0
-    #region agent log
-    try:
-        with open("/home/mayor/Noesis_Devel/.cursor/debug.log", "a", encoding="utf-8") as _f:
-            _f.write(
-                json.dumps(
-                    {
-                        "sessionId": "debug-session",
-                        "runId": "run1",
-                        "hypothesisId": "H2",
-                        "location": "ds8_runtime.py:_wait_for_rtsp_ready",
-                        "message": "rtsp wait start",
-                        "data": {"host": host, "port": port, "timeout_s": timeout},
-                        "timestamp": int(time.time() * 1000),
-                    }
-                )
-                + "\n"
-            )
-    except Exception:
-        pass
-    #endregion
-    while time.time() < deadline:
-        attempt += 1
-        try:
-            with socket.create_connection(addr, timeout=0.3):
-                #region agent log
-                try:
-                    with open("/home/mayor/Noesis_Devel/.cursor/debug.log", "a", encoding="utf-8") as _f:
-                        _f.write(
-                            json.dumps(
-                                {
-                                    "sessionId": "debug-session",
-                                    "runId": "run1",
-                                    "hypothesisId": "H2",
-                                    "location": "ds8_runtime.py:_wait_for_rtsp_ready",
-                                    "message": "rtsp port ready",
-                                    "data": {"host": host, "port": port, "attempt": attempt, "elapsed_ms": int((time.time() - (deadline - timeout)) * 1000)},
-                                    "timestamp": int(time.time() * 1000),
-                                }
-                            )
-                            + "\n"
-                        )
-                except Exception:
-                    pass
-                #endregion
-                return True
-        except Exception:
-            now = time.time()
-            if now - last_log >= 1.0:
-                last_log = now
-                #region agent log
-                try:
-                    with open("/home/mayor/Noesis_Devel/.cursor/debug.log", "a", encoding="utf-8") as _f:
-                        _f.write(
-                            json.dumps(
-                                {
-                                    "sessionId": "debug-session",
-                                    "runId": "run1",
-                                    "hypothesisId": "H2",
-                                    "location": "ds8_runtime.py:_wait_for_rtsp_ready",
-                                    "message": "rtsp wait attempt",
-                                    "data": {
-                                        "host": host,
-                                        "port": port,
-                                        "attempt": attempt,
-                                        "elapsed_ms": int((now - start_ts) * 1000),
-                                    },
-                                    "timestamp": int(time.time() * 1000),
-                                }
-                            )
-                            + "\n"
-                        )
-                except Exception:
-                    pass
-                #endregion
-            time.sleep(interval)
-    #region agent log
-    try:
-        with open("/home/mayor/Noesis_Devel/.cursor/debug.log", "a", encoding="utf-8") as _f:
-            _f.write(
-                json.dumps(
-                    {
-                        "sessionId": "debug-session",
-                        "runId": "run1",
-                        "hypothesisId": "H2",
-                        "location": "ds8_runtime.py:_wait_for_rtsp_ready",
-                        "message": "rtsp port not ready",
-                        "data": {"host": host, "port": port, "timeout_s": timeout},
-                        "timestamp": int(time.time() * 1000),
-                    }
-                )
-                + "\n"
-            )
-    except Exception:
-        pass
-    #endregion
-    return False
+    if (
+        isinstance(loop, asyncio.AbstractEventLoop)
+        and loop.is_running()
+        and start_task is not None
+        and not start_task.done()
+    ):
+        loop.call_soon_threadsafe(start_task.cancel)
+    thread.join(timeout=WebSocketServer.RUNTIME_SHUTDOWN_TIMEOUT_S)
+    receipt = WebSocketStartupReceipt(
+        startup_signaled=bool(startup_signaled),
+        server_bound=bool(getattr(server, "server", None) is not None),
+        start_task_done=bool(start_task is not None and start_task.done()),
+        thread_stopped=not thread.is_alive(),
+        event_loop_closed=bool(
+            isinstance(loop, asyncio.AbstractEventLoop) and loop.is_closed()
+        ),
+    )
+    raise WebSocketStartupError(
+        "WebSocket listener failed bounded startup",
+        receipt,
+    ) from startup_error
 
 
 def _stop_websocket_server(
     server: WebSocketServer,
     thread: Optional[threading.Thread],
     loop: Optional[asyncio.AbstractEventLoop],
-    timeout: float = 5.0,
+    timeout: float = WebSocketServer.RUNTIME_SHUTDOWN_TIMEOUT_S,
 ) -> None:
     if thread is None:
         return
+    if loop is None or not loop.is_running():
+        raise RuntimeError("WebSocket event loop was unavailable during shutdown")
+    deadline = time.monotonic() + max(0.0, float(timeout))
     try:
-        if loop is not None and loop.is_running():
-            future = asyncio.run_coroutine_threadsafe(server.stop(), loop)
-            future.result(timeout=timeout)
-            loop.call_soon_threadsafe(loop.stop)
-    except Exception:
-        pass
-    finally:
-        thread.join(timeout=timeout)
+        future = asyncio.run_coroutine_threadsafe(server.stop(), loop)
+        async_bound = min(
+            max(0.0, deadline - time.monotonic()),
+            float(WebSocketServer.ASYNC_SHUTDOWN_TIMEOUT_S),
+        )
+        future.result(timeout=async_bound)
+    except Exception as exc:
+        raise RuntimeError("WebSocket server did not quiesce during shutdown") from exc
+    loop.call_soon_threadsafe(loop.stop)
+    thread.join(timeout=max(0.0, deadline - time.monotonic()))
+    if thread.is_alive():
+        raise RuntimeError("WebSocket server thread remained alive after shutdown")
 
 
 def _build_rest_app() -> "FastAPI":
     from fastapi import FastAPI
     from fastapi.middleware.cors import CORSMiddleware
-    from noesis.server import analytics_api, depth_api, reid_api, virtual_twin_api
+    from noesis.server import analytics_api, depth_api, health_api, reid_api, reid_v2_api, scene_api, virtual_twin_api
+    from noesis.server.internal_auth import InternalAuthConfigurationError, configure_internal_rest_app
 
     app = FastAPI(title="Noesis DS8 Runtime API")
     origins_env = os.environ.get("NOESIS_REST_CORS_ORIGINS", "").strip()
     allow_all = os.environ.get("NOESIS_REST_CORS_ALLOW_ALL", "").strip().lower() in {"1", "true", "yes", "on"}
     origin_regex = os.environ.get("NOESIS_REST_CORS_ORIGIN_REGEX", "").strip()
     origins = [origin.strip() for origin in origins_env.split(",") if origin.strip()] if origins_env else []
-    if allow_all and "*" not in origins:
-        origins = ["*"]
-    if not origins and not origin_regex:
-        origin_regex = (
-            r"^https?://("
-            r"localhost|127\.0\.0\.1|"
-            r"10\.\d+\.\d+\.\d+|"
-            r"172\.(1[6-9]|2\d|3[0-1])\.\d+\.\d+|"
-            r"192\.168\.\d+\.\d+"
-            r")(:\d+)?$"
-        )
+    if allow_all:
+        raise InternalAuthConfigurationError("NOESIS_REST_CORS_ALLOW_ALL is forbidden; use the same-origin gateway")
+    if origin_regex:
+        raise InternalAuthConfigurationError("regex CORS is forbidden; declare exact NOESIS_REST_CORS_ORIGINS")
     if origins or origin_regex:
         app.add_middleware(
             CORSMiddleware,
             allow_origins=origins,
-            allow_origin_regex=origin_regex or None,
             allow_credentials=True,
             allow_methods=["*"],
             allow_headers=["*"],
@@ -2481,52 +2270,61 @@ def _build_rest_app() -> "FastAPI":
     app.include_router(depth_api.app.router)
     app.include_router(analytics_api.app.router)
     app.include_router(reid_api.app.router)
+    app.include_router(reid_v2_api.router)
     app.include_router(virtual_twin_api.app.router)
+    app.include_router(health_api.router)
+    app.include_router(scene_api.router)
+    configure_internal_rest_app(app)
     return app
 
 
-def _start_rest_server(app: "FastAPI", host: str, port: int) -> tuple[Optional["uvicorn.Server"], Optional[threading.Thread]]:
-    """Start the FastAPI REST server unless the port is already in use.
+class RestStartupError(RuntimeError):
+    """REST startup failed after thread ownership may have been acquired."""
 
-    If something is already listening on the requested host/port, we assume a
-    REST instance is active and skip starting another one to avoid conflicts.
-    """
+    def __init__(
+        self,
+        message: str,
+        *,
+        server: object,
+        thread: threading.Thread,
+        cleanup_proven: bool,
+    ) -> None:
+        self.server = server
+        self.thread = thread
+        self.cleanup_proven = bool(cleanup_proven)
+        super().__init__(str(message))
+
+
+def _start_rest_server(
+    app: "FastAPI",
+    host: str,
+    port: int,
+    *,
+    startup_timeout_s: float = 10.0,
+    cleanup_timeout_s: float = 2.0,
+) -> tuple[Optional["uvicorn.Server"], Optional[threading.Thread]]:
+    """Start the FastAPI REST server on its exact required endpoint."""
+    from noesis.server.internal_auth import validate_internal_auth_listener
+
+    auth_state = getattr(getattr(app, "state", None), "noesis_internal_auth", None)
+    if not isinstance(auth_state, dict) or "mode" not in auth_state:
+        raise RuntimeError("canonical REST application is missing internal auth state")
+    validate_internal_auth_listener(str(auth_state["mode"]), host)
     try:
         import uvicorn
-    except Exception:
-        logging.getLogger(__name__).warning("uvicorn not available; REST server disabled")
-        return None, None
+    except Exception as exc:
+        raise RuntimeError("uvicorn is required for the canonical REST surface") from exc
+    if not _port_bindable(host, int(port)):
+        raise RuntimeError(f"required REST endpoint is unavailable: host={host} port={port}")
 
-    # Safety check: skip starting another REST server if port is already in use
-    try:
-        import socket
-
-        def _can_connect(_host: str, _port: int, timeout: float = 0.25) -> bool:
-            try:
-                with socket.create_connection((_host, int(_port)), timeout=timeout):
-                    return True
-            except Exception:
-                return False
-
-        # Normalize host for connectivity test when binding to all interfaces
-        test_host = host
-        if not test_host or test_host == "0.0.0.0":
-            test_host = "127.0.0.1"
-        elif test_host == "::":
-            test_host = "::1"
-
-        if _can_connect(test_host, port):
-            logging.getLogger(__name__).info(
-                "REST port %s is already in use on %s; assuming server active and skipping start",
-                port,
-                test_host,
-            )
-            return None, None
-    except Exception:
-        # Non-fatal: if the check fails, proceed to start server
-        pass
-
-    config = uvicorn.Config(app=app, host=host, port=port, log_level="info", access_log=False)
+    config = uvicorn.Config(
+        app=app,
+        host=host,
+        port=port,
+        log_level="info",
+        access_log=False,
+        timeout_graceful_shutdown=None,
+    )
     server = uvicorn.Server(config=config)
 
     def _run() -> None:
@@ -2534,262 +2332,174 @@ def _start_rest_server(app: "FastAPI", host: str, port: int) -> tuple[Optional["
         server.run()
 
     thread = threading.Thread(target=_run, name="DS8-REST", daemon=True)
-    thread.start()
-    return server, thread
+    thread_started = False
+    failure: BaseException | None = None
+    try:
+        thread.start()
+        thread_started = True
+        deadline = time.monotonic() + max(0.0, float(startup_timeout_s))
+        while time.monotonic() < deadline:
+            if bool(getattr(server, "started", False)):
+                if not thread.is_alive():
+                    raise RuntimeError("required REST server exited at readiness")
+                return server, thread
+            if not thread.is_alive():
+                raise RuntimeError("required REST server exited before readiness")
+            time.sleep(0.02)
+        raise TimeoutError("required REST server readiness timed out")
+    except BaseException as exc:
+        failure = exc
 
-
-def _stop_rest_server(server: Optional["uvicorn.Server"], thread: Optional[threading.Thread], timeout: float = 5.0) -> None:
-    if server is None or thread is None:
-        return
     try:
         server.should_exit = True
-    except Exception:
-        pass
-    thread.join(timeout=timeout)
-
-
-def _setup_webrtc_signaling(
-    pipeline: ds8_pipeline.DS8Pipeline,
-    ws_server: WebSocketServer,
-    logger: logging.Logger,
-) -> None:
-    """Attach WebRTC signaling handlers from webrtcbin to WebSocketServer."""
-    from gi.repository import Gst
-
-    ds = getattr(pipeline, "ds_pipeline", None)
-    if ds is None:
-        logger.warning("DS8 pipeline handle unavailable; WebRTC signaling not attached")
-        return
-
-    mosaic_cfg = pipeline.config.get("mosaic_output") or {}
-    webrtc_name = str(mosaic_cfg.get("webrtc_name", "mosaic_webrtc"))
-
-    # Try to get the underlying GStreamer pipeline to use get_by_name()
-    gst_pipeline: Gst.Pipeline = None
-    webrtc_elem: Gst.Element = None
-
-    # First, try to find the Gst.Pipeline handle
-    for attr in ("pipeline", "_pipeline", "gst_pipeline", "_gst_pipeline", "handle", "_handle"):
+    except BaseException as exc:
+        if failure is None:
+            failure = exc
+    if thread_started:
         try:
-            candidate = getattr(ds, attr, None)
-        except Exception:
-            candidate = None
-        if isinstance(candidate, Gst.Pipeline):
-            gst_pipeline = candidate
-            break
-        if candidate is not None and hasattr(candidate, "get_by_name"):
-            gst_pipeline = candidate
-            break
-
-    # Also check inner attributes
-    if gst_pipeline is None:
-        for name in dir(ds):
-            if name.startswith("__"):
-                continue
-            try:
-                candidate = getattr(ds, name)
-            except Exception:
-                continue
-            if isinstance(candidate, Gst.Pipeline):
-                gst_pipeline = candidate
-                break
-            if hasattr(candidate, "get_by_name"):
-                gst_pipeline = candidate
-                break
-
-    # Try to get webrtcbin element by name from the GStreamer pipeline
-    if gst_pipeline is not None:
-        try:
-            webrtc_elem = gst_pipeline.get_by_name(webrtc_name)
-        except Exception as exc:
-            logger.debug("Failed to get webrtcbin by name: %s", exc)
-
-    # Try to get rtsp_out for diagnostics
-    if gst_pipeline is not None:
-        try:
-            rtsp_elem = gst_pipeline.get_by_name("rtsp_out")
-            if rtsp_elem is not None:
-                try:
-                    with open("/home/mayor/Noesis_Devel/.cursor/debug.log", "a", encoding="utf-8") as _f:
-                        _f.write(
-                            json.dumps(
-                                {
-                                    "sessionId": "debug-session",
-                                    "runId": "run1",
-                                    "hypothesisId": "H2",
-                                    "location": "ds8_runtime.py:_setup_webrtc_signaling",
-                                    "message": "rtsp element found",
-                                    "data": {"name": rtsp_elem.get_name()},
-                                    "timestamp": int(time.time() * 1000),
-                                }
-                            )
-                            + "\n"
-                        )
-                except Exception:
-                    pass
-        except Exception:
-            pass
-
-    # Fallback: try pyservicemaker node attributes
-    if webrtc_elem is None:
-        try:
-            node = ds[webrtc_name]
-            for attr in ("element", "_element", "obj", "_obj", "gst_element", "_gst_element"):
-                candidate = getattr(node, attr, None)
-                if candidate is not None and isinstance(candidate, Gst.Element):
-                    webrtc_elem = candidate
-                    break
-        except Exception as exc:
-            logger.warning("webrtcbin '%s' not found in pipeline: %s", webrtc_name, exc)
-
-    if webrtc_elem is None:
-        logger.warning("webrtcbin element not found; WebRTC signaling not attached")
-        return
-
-    # Attach to WebSocket server for signaling
-    ws_server.attach_webrtc_endpoint(webrtc_elem)
-    logger.info("WebRTC signaling attached to webrtcbin '%s'", webrtc_name)
+            thread.join(timeout=max(0.0, float(cleanup_timeout_s)))
+        except BaseException as exc:
+            if failure is None:
+                failure = exc
+    cleanup_proven = bool(not thread_started or not thread.is_alive())
+    message = str(failure or "required REST server startup failed")
+    if not cleanup_proven:
+        message = f"{message}; cleanup was not proven"
+    raise RestStartupError(
+        message,
+        server=server,
+        thread=thread,
+        cleanup_proven=cleanup_proven,
+    ) from failure
 
 
-def _build_rtsp_keyframe_requester(
-    pipeline: ds8_pipeline.DS8Pipeline,
-    logger: logging.Logger,
-) -> Optional[Callable[[str], None]]:
-    """Best-effort keyframe/IDR request into the DS8 RTSP encoder pipeline.
+class RestShutdownReceipt(NamedTuple):
+    """Proof that REST can no longer race callback-owned native resources."""
 
-    This is used to reduce "ICE connected but black" startups where the browser
-    receives RTP bytes but decodes 0 frames until the next IDR arrives.
+    rest_pair_consistent: bool
+    stop_requested: bool
+    server_thread_stopped: bool
+    analytics_transaction_lock_retained: bool
+
+    @property
+    def quiesced(self) -> bool:
+        return bool(
+            self.rest_pair_consistent
+            and self.stop_requested
+            and self.server_thread_stopped
+            and self.analytics_transaction_lock_retained
+        )
+
+
+def _stop_rest_server(
+    server: Optional["uvicorn.Server"],
+    thread: Optional[threading.Thread],
+    analytics_transaction_lock: Any,
+    timeout: float = 5.0,
+) -> RestShutdownReceipt:
+    """Stop REST and retain the analytics transaction lock through process exit.
+
+    Uvicorn dispatches synchronous handlers through worker threads, so joining
+    only its server thread is not sufficient proof that a native analytics
+    reload has completed.  Once the listener thread is gone, retaining the
+    analytics lock both proves any prior transaction completed and prevents a
+    late worker from entering another transaction during native teardown.
     """
-    if not _GLIB_AVAILABLE or Gst is None:
-        return None
-    try:
-        gi.require_version("GstVideo", "1.0")
-        from gi.repository import GstVideo  # type: ignore
-    except Exception:
-        return None
 
+    try:
+        bounded_timeout = max(0.0, float(timeout))
+    except (TypeError, ValueError):
+        bounded_timeout = 0.0
+    deadline = time.monotonic() + bounded_timeout
+    rest_pair_consistent = (server is None) == (thread is None)
+    stop_requested = server is None
+    if server is not None:
+        try:
+            server.should_exit = True
+            stop_requested = True
+        except Exception:
+            stop_requested = False
+
+    server_thread_stopped = bool(server is None and thread is None)
+    if thread is not None:
+        try:
+            thread.join(timeout=max(0.0, deadline - time.monotonic()))
+            server_thread_stopped = not thread.is_alive()
+        except Exception:
+            server_thread_stopped = False
+    if not rest_pair_consistent:
+        server_thread_stopped = False
+
+    analytics_lock_retained = False
+    if server_thread_stopped:
+        try:
+            analytics_lock_retained = bool(
+                analytics_transaction_lock.acquire(
+                    timeout=max(0.0, deadline - time.monotonic())
+                )
+            )
+        except Exception:
+            analytics_lock_retained = False
+
+    return RestShutdownReceipt(
+        rest_pair_consistent=rest_pair_consistent,
+        stop_requested=stop_requested,
+        server_thread_stopped=server_thread_stopped,
+        analytics_transaction_lock_retained=analytics_lock_retained,
+    )
+
+
+def _build_mosaic_keyframe_requester(
+    pipeline: ds8_pipeline.DS8Pipeline,
+    logger: logging.Logger,
+    *,
+    failure_callback: Optional[Callable[[BaseException], None]] = None,
+) -> Optional[Callable[[str], None]]:
+    """Build the supported Service Maker force-IDR control for mosaic H.264."""
     ds = getattr(pipeline, "ds_pipeline", None)
     if ds is None:
         return None
-
-    # Attempt to find the underlying Gst.Pipeline handle to look up rtsp_out by name.
-    gst_pipeline: Optional[Gst.Pipeline] = None
-    for attr in ("pipeline", "_pipeline", "gst_pipeline", "_gst_pipeline", "handle", "_handle"):
-        try:
-            candidate = getattr(ds, attr, None)
-        except Exception:
-            candidate = None
-        if candidate is None:
-            continue
-        if isinstance(candidate, Gst.Pipeline):
-            gst_pipeline = candidate
-            break
-        if hasattr(candidate, "get_by_name"):
-            gst_pipeline = candidate  # type: ignore[assignment]
-            break
-
-    if gst_pipeline is None:
-        for name in dir(ds):
-            if name.startswith("__"):
-                continue
-            try:
-                candidate = getattr(ds, name)
-            except Exception:
-                continue
-            if isinstance(candidate, Gst.Pipeline):
-                gst_pipeline = candidate
-                break
-            if candidate is not None and hasattr(candidate, "get_by_name"):
-                gst_pipeline = candidate  # type: ignore[assignment]
-                break
-
-    rtsp_out = None
-    if gst_pipeline is not None:
-        try:
-            rtsp_out = gst_pipeline.get_by_name("rtsp_out")
-        except Exception:
-            rtsp_out = None
-
-    # Fallback: try pyservicemaker node attributes (some wheels don't expose a Gst.Pipeline handle).
-    if rtsp_out is None:
-        try:
-            node = ds["rtsp_out"]
-            for attr in ("element", "_element", "obj", "_obj", "gst_element", "_gst_element"):
-                candidate = getattr(node, attr, None)
-                if candidate is not None and isinstance(candidate, Gst.Element):
-                    rtsp_out = candidate
-                    break
-        except Exception:
-            rtsp_out = None
-
-    if rtsp_out is None:
+    component = getattr(pipeline, "components", {}).get("mosaic_force_idr")
+    if component is None or getattr(component, "element", None) != "noesisforceidr":
+        return None
+    try:
+        trigger = ds["mosaic_force_idr"]
+        if not callable(getattr(trigger, "set", None)):
+            return None
+        getter = getattr(trigger, "get", None)
+        if not callable(getter):
+            return None
+        request_sequence = int(getter("accepted-sequence"))
+        getter("last-request-ok")
+    except Exception as exc:
+        logger.error("Mosaic force-IDR trigger is unavailable: %s", exc)
         return None
 
-    # Prefer sending the upstream force-key-unit event from the internal RTP payloader if present.
-    pay = None
-    try:
-        pay = rtsp_out.get_child_by_name("rtsp-video_rtppay")
-    except Exception:
-        pay = None
-    if pay is None:
-        try:
-            n_children = int(rtsp_out.get_children_count())
-        except Exception:
-            n_children = 0
-        for i in range(n_children):
-            try:
-                child = rtsp_out.get_child_by_index(i)
-            except Exception:
-                child = None
-            if child is None:
-                continue
-            try:
-                factory = child.get_factory()
-                if factory is not None and factory.get_name() == "rtph264pay":
-                    pay = child
-                    break
-            except Exception:
-                continue
+    request_lock = threading.Lock()
 
     def request_keyframe(reason: str) -> None:
+        nonlocal request_sequence
         try:
-            ev = GstVideo.video_event_new_upstream_force_key_unit(Gst.CLOCK_TIME_NONE, True, 0)
-        except Exception:
-            logger.debug("Failed to create upstream force-key-unit event", exc_info=True)
-            return
-
-        ok = False
-        try:
-            if pay is not None:
-                sink_pad = pay.get_static_pad("sink")
-                if sink_pad is not None:
-                    ok = bool(sink_pad.send_event(ev))
-                else:
-                    ok = bool(pay.send_event(ev))
-            else:
-                ok = bool(rtsp_out.send_event(ev))
-        except Exception:
-            ok = False
-
-        logger.info("Requested RTSP keyframe (reason=%s ok=%s)", reason, ok)
-        try:
-            with open("/home/mayor/Noesis_Devel/.cursor/debug.log", "a", encoding="utf-8") as _f:
-                _f.write(
-                    json.dumps(
-                        {
-                            "sessionId": "debug-session",
-                            "runId": "run1",
-                            "hypothesisId": "H4",
-                            "location": "ds8_runtime.py:_build_rtsp_keyframe_requester",
-                            "message": "rtsp keyframe requested",
-                            "data": {"reason": reason, "ok": ok},
-                            "timestamp": int(time.time() * 1000),
-                        }
+            with request_lock:
+                request_sequence += 1
+                requested = request_sequence
+                trigger.set({"request-sequence": requested})
+                accepted = int(getter("accepted-sequence"))
+                request_ok = bool(getter("last-request-ok"))
+                if not request_ok or accepted != requested:
+                    raise RuntimeError(
+                        f"force-IDR event rejected: requested={requested} accepted={accepted}"
                     )
-                    + "\n"
-                )
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.error("Required mosaic force-IDR request failed (reason=%s): %s", reason, exc)
+            if callable(failure_callback):
+                failure_callback(exc)
+            raise
+        logger.info(
+            "Requested mosaic IDR through NVIDIA encoder event (reason=%s sequence=%d)",
+            reason,
+            requested,
+        )
 
     return request_keyframe
 
@@ -2811,74 +2521,14 @@ def _on_bus_message(
         src_name = message.src.get_name() if message.src else "unknown"
         logger.error("🚨 Pipeline ERROR from '%s': %s", src_name, err.message)
         logger.error("🚨 Debug: %s", debug)
-        #region agent log
-        try:
-            with open("/home/mayor/Noesis_Devel/.cursor/debug.log", "a", encoding="utf-8") as _f:
-                _f.write(
-                    json.dumps(
-                        {
-                            "sessionId": "debug-session",
-                            "runId": "run1",
-                            "hypothesisId": "H2",
-                            "location": "ds8_runtime.py:_on_bus_message",
-                            "message": "bus error",
-                            "data": {"src": src_name, "error": err.message, "debug": debug},
-                            "timestamp": int(time.time() * 1000),
-                        }
-                    )
-                    + "\n"
-                )
-        except Exception:
-            pass
-        #endregion
         # Check if this is a source-related error suggesting stream issues
         if any(k in src_name.lower() for k in ("source", "urisrc", "rtspsrc", "decodebin")):
             logger.error("    → Source/decoder error; check RTSP stream connectivity.")
     elif msg_type == Gst.MessageType.EOS:
         logger.warning("⚠️ EOS received on pipeline (unexpected for live sources)")
-        #region agent log
-        try:
-            with open("/home/mayor/Noesis_Devel/.cursor/debug.log", "a", encoding="utf-8") as _f:
-                _f.write(
-                    json.dumps(
-                        {
-                            "sessionId": "debug-session",
-                            "runId": "run1",
-                            "hypothesisId": "H2",
-                            "location": "ds8_runtime.py:_on_bus_message",
-                            "message": "bus eos",
-                            "data": {},
-                            "timestamp": int(time.time() * 1000),
-                        }
-                    )
-                    + "\n"
-                )
-        except Exception:
-            pass
-        #endregion
     elif msg_type == Gst.MessageType.WARNING:
         warn, debug = message.parse_warning()
         logger.warning("⚠️ Pipeline warning: %s", warn.message)
-        #region agent log
-        try:
-            with open("/home/mayor/Noesis_Devel/.cursor/debug.log", "a", encoding="utf-8") as _f:
-                _f.write(
-                    json.dumps(
-                        {
-                            "sessionId": "debug-session",
-                            "runId": "run1",
-                            "hypothesisId": "H2",
-                            "location": "ds8_runtime.py:_on_bus_message",
-                            "message": "bus warning",
-                            "data": {"warning": warn.message, "debug": debug},
-                            "timestamp": int(time.time() * 1000),
-                        }
-                    )
-                    + "\n"
-                )
-        except Exception:
-            pass
-        #endregion
     elif msg_type == Gst.MessageType.STATE_CHANGED:
         if message.src and hasattr(message.src, "get_name"):
             name = message.src.get_name()
@@ -2892,31 +2542,6 @@ def _on_bus_message(
                     new.value_nick if new else "?",
                     pending.value_nick if pending else "none",
                 )
-                #region agent log
-                try:
-                    with open("/home/mayor/Noesis_Devel/.cursor/debug.log", "a", encoding="utf-8") as _f:
-                        _f.write(
-                            json.dumps(
-                                {
-                                    "sessionId": "debug-session",
-                                    "runId": "run1",
-                                    "hypothesisId": "H2",
-                                    "location": "ds8_runtime.py:_on_bus_message",
-                                    "message": "state change",
-                                    "data": {
-                                        "src": name,
-                                        "old": old.value_nick if old else "?",
-                                        "new": new.value_nick if new else "?",
-                                        "pending": pending.value_nick if pending else "none",
-                                    },
-                                    "timestamp": int(time.time() * 1000),
-                                }
-                            )
-                            + "\n"
-                        )
-                except Exception:
-                    pass
-                #endregion
 
     return True  # Keep receiving messages
 
@@ -2951,6 +2576,27 @@ def _on_pyservicemaker_message(
     state: Optional[Dict[str, Any]] = None,
 ) -> None:
     """Handle pyservicemaker pipeline messages (EOS, state transitions, etc.)."""
+    if type(message) is SyntheticStubEosMessage:
+        try:
+            sequence = validate_synthetic_stub_eos_message(ds_pipeline, message)
+        except Exception:
+            if state is not None:
+                state["pipeline_failed"] = True
+            raise
+        shutdown_requested = shutdown_event.is_set()
+        finite_source = bool((state or {}).get("expected_eos")) and not shutdown_requested
+        eos_reason = "shutdown_requested" if shutdown_requested else "finite_source" if finite_source else "unexpected"
+        if state is not None:
+            state["pipeline_eos_seen"] = True
+            state["pipeline_eos_reason"] = eos_reason
+            state["synthetic_eos_request_sequence"] = sequence
+            if not (shutdown_requested or finite_source):
+                state["pipeline_failed"] = True
+        if shutdown_requested or finite_source:
+            logger.info("EOS received on pipeline (reason=%s)", eos_reason)
+        else:
+            logger.warning("EOS received on live pipeline (reason=unexpected)")
+        return
     if not _PYSERVICEMAKER_MSGS:
         return
 
@@ -2959,7 +2605,22 @@ def _on_pyservicemaker_message(
     log_state = str(os.environ.get("NOESIS_DS8_STATE_LOG", "")).strip().lower() in ("1", "true", "yes", "on")
 
     if isinstance(message, EOSMessage):
-        logger.warning("⚠️ EOS received on pipeline (unexpected for live sources)")
+        shutdown_requested = shutdown_event.is_set()
+        finite_source = bool((state or {}).get("expected_eos")) and not shutdown_requested
+        eos_reason = (
+            "shutdown_requested"
+            if shutdown_requested
+            else "finite_source"
+            if finite_source
+            else "unexpected"
+        )
+        if state is not None:
+            state["pipeline_eos_seen"] = True
+            state["pipeline_eos_reason"] = eos_reason
+        if shutdown_requested or finite_source:
+            logger.info("EOS received on pipeline (reason=%s)", eos_reason)
+            return
+        logger.warning("EOS received on live pipeline (reason=unexpected)")
         if state is not None:
             state["pipeline_failed"] = True
     elif isinstance(message, StateTransitionMessage):
@@ -2976,13 +2637,7 @@ def _start_pyservicemaker_wait_loop(
     logger: logging.Logger,
     state: Optional[Dict[str, Any]] = None,
 ) -> Optional[threading.Thread]:
-    """Start a background thread that calls ds_pipeline.wait() to keep the pipeline alive.
-    
-    pyservicemaker's wait() blocks until the pipeline stops and processes internal events.
-    Without this, the pipeline may stop processing after initial buffers.
-    
-    Returns the thread, or None if unavailable.
-    """
+    """Join Service Maker's native loop without blocking the API/control thread."""
     if ds_pipeline is None:
         logger.warning("No DSPipeline available for wait loop")
         return None
@@ -2993,82 +2648,66 @@ def _start_pyservicemaker_wait_loop(
 
     def _wait_loop() -> None:
         try:
-            #region agent log
-            try:
-                with open("/home/mayor/Noesis_Devel/.cursor/debug.log", "a", encoding="utf-8") as _f:
-                    _f.write(
-                        json.dumps(
-                            {
-                                "sessionId": "debug-session",
-                                "runId": "run1",
-                                "hypothesisId": "H1",
-                                "location": "ds8_runtime.py:_start_pyservicemaker_wait_loop",
-                                "message": "wait() entered",
-                                "data": {},
-                                "timestamp": int(time.time() * 1000),
-                            }
-                        )
-                        + "\n"
-                    )
-            except Exception:
-                pass
-            #endregion
             logger.debug("pyservicemaker wait loop started")
             ds_pipeline.wait()
             logger.info("pyservicemaker wait() returned (pipeline stopped)")
         except Exception:
+            if state is not None:
+                state["wait_failed"] = True
+                state["pipeline_failed"] = True
             logger.exception("pyservicemaker wait loop error")
-            #region agent log
-            try:
-                with open("/home/mayor/Noesis_Devel/.cursor/debug.log", "a", encoding="utf-8") as _f:
-                    _f.write(
-                        json.dumps(
-                            {
-                                "sessionId": "debug-session",
-                                "runId": "run1",
-                                "hypothesisId": "H1",
-                                "location": "ds8_runtime.py:_start_pyservicemaker_wait_loop",
-                                "message": "wait() exception",
-                                "data": {},
-                                "timestamp": int(time.time() * 1000),
-                            }
-                        )
-                        + "\n"
-                    )
-            except Exception:
-                pass
-            #endregion
         finally:
             was_signalled = shutdown_event.is_set()
             # Signal shutdown when pipeline stops
             shutdown_event.set()
-            if state is not None and not was_signalled:
+            expected_finite_eos = bool(
+                state is not None
+                and state.get("expected_eos")
+                and state.get("pipeline_eos_seen")
+            )
+            if state is not None and not was_signalled and not expected_finite_eos:
                 state["pipeline_failed"] = True
-            #region agent log
-            try:
-                with open("/home/mayor/Noesis_Devel/.cursor/debug.log", "a", encoding="utf-8") as _f:
-                    _f.write(
-                        json.dumps(
-                            {
-                                "sessionId": "debug-session",
-                                "runId": "run1",
-                                "hypothesisId": "H1",
-                                "location": "ds8_runtime.py:_start_pyservicemaker_wait_loop",
-                                "message": "wait() exited",
-                                "data": {},
-                                "timestamp": int(time.time() * 1000),
-                            }
-                        )
-                        + "\n"
-                    )
-            except Exception:
-                pass
-            #endregion
 
     thread = threading.Thread(target=_wait_loop, name="DS8-WaitLoop", daemon=True)
     thread.start()
     logger.info("pyservicemaker wait loop started for pipeline event handling")
     return thread
+
+
+_SERVICE_MAKER_STDIN_WRITE_FD: Optional[int] = None
+_SERVICE_MAKER_STDIN_LOCK = threading.Lock()
+
+
+def _install_servicemaker_stdin_keepalive(logger: logging.Logger) -> None:
+    """Keep non-interactive stdin open while Service Maker owns its key watcher."""
+
+    global _SERVICE_MAKER_STDIN_WRITE_FD
+
+    with _SERVICE_MAKER_STDIN_LOCK:
+        if _SERVICE_MAKER_STDIN_WRITE_FD is not None or os.isatty(0):
+            return
+        read_fd, write_fd = os.pipe()
+        try:
+            os.dup2(read_fd, 0)
+        except Exception:
+            os.close(write_fd)
+            raise
+        finally:
+            os.close(read_fd)
+        _SERVICE_MAKER_STDIN_WRITE_FD = write_fd
+        logger.info("Service Maker non-interactive stdin keepalive installed")
+
+
+def _close_servicemaker_stdin_keepalive() -> None:
+    """Release the idle stdin writer only after Pipeline.wait() has returned."""
+
+    global _SERVICE_MAKER_STDIN_WRITE_FD
+
+    with _SERVICE_MAKER_STDIN_LOCK:
+        write_fd = _SERVICE_MAKER_STDIN_WRITE_FD
+        _SERVICE_MAKER_STDIN_WRITE_FD = None
+    if write_fd is not None:
+        os.close(write_fd)
 
 
 _ENCODE_LATENCY_FILTER_INSTALLED = False
@@ -3158,7 +2797,7 @@ def _install_encode_latency_suppression(logger: logging.Logger) -> None:
         logger.info("Suppressed encoder KPI prints (NOESIS_SUPPRESS_ENCODE_LATENCY=0 to disable)")
 
 
-def main() -> int:
+def _run_main(startup_main_guard: StartupMainGuard) -> int:
     os.environ.setdefault("NOESIS_MOSAIC_WEBRTC_ENABLED", "1")
     os.environ.setdefault("NOESIS_DEPTH_ENABLE_SECONDS", "0")
     args = _parse_args()
@@ -3167,12 +2806,18 @@ def main() -> int:
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
     logger = logging.getLogger("ds8.runtime")
-    ws_fallback_tries_raw = os.environ.get("NOESIS_WS_PORT_FALLBACK_TRIES", "32")
     try:
-        ws_fallback_tries = int(str(ws_fallback_tries_raw).strip() or "32")
-    except Exception:
-        ws_fallback_tries = 32
-    args.ws_port = _select_ws_port(args.ws_host, int(args.ws_port), ws_fallback_tries, logger)
+        args.ws_port = _select_ws_port(args.ws_host, int(args.ws_port), 0, logger)
+    except RuntimeError as exc:
+        logger.error("%s", exc)
+        return 1
+    if args.enable_rest and not _port_bindable(args.rest_host, int(args.rest_port)):
+        logger.error(
+            "required REST endpoint is unavailable: host=%s port=%s",
+            args.rest_host,
+            args.rest_port,
+        )
+        return 1
     os.environ["NOESIS_WS_PORT"] = str(int(args.ws_port))
     # DeepStream's gst-nvvideo4linux2 encoder plugin can emit extremely noisy
     # "Encode Latency = ..." prints when NVDS latency measurement is enabled.
@@ -3194,51 +2839,33 @@ def main() -> int:
     # some backends install their own handlers/masks which can make `timeout(1)`
     # leave behind orphaned processes that keep ports bound.
     shutdown_event = threading.Event()
+    shutdown_watchdog_armed = False
+
+    def _arm_shutdown_watchdog() -> None:
+        nonlocal shutdown_watchdog_armed
+        if shutdown_watchdog_armed:
+            return
+        try:
+            grace_s = max(
+                SHUTDOWN_WATCHDOG_DEFAULT_S,
+                int(
+                    os.environ.get(
+                        "NOESIS_SHUTDOWN_GRACE_SECONDS",
+                        str(SHUTDOWN_WATCHDOG_DEFAULT_S),
+                    )
+                ),
+            )
+        except Exception:
+            grace_s = SHUTDOWN_WATCHDOG_DEFAULT_S
+        signal.signal(signal.SIGALRM, lambda _sig, _frame: os._exit(2))
+        signal.alarm(grace_s)
+        shutdown_watchdog_armed = True
 
     def _signal_handler(signum: int, _frame: object) -> None:
         logger.info("Received signal %s; initiating shutdown", signum)
-        # Best-effort debug breadcrumb (useful when the backend swallows SIGTERM).
-        try:
-            with open("/home/mayor/Noesis_Devel/.cursor/debug.log", "a", encoding="utf-8") as _f:
-                _f.write(
-                    json.dumps(
-                        {
-                            "sessionId": "debug-session",
-                            "runId": "run1",
-                            "hypothesisId": "H0",
-                            "location": "ds8_runtime.py:_signal_handler",
-                            "message": "signal received",
-                            "data": {"signum": int(signum)},
-                            "timestamp": int(time.time() * 1000),
-                        }
-                    )
-                    + "\n"
-                )
-        except Exception:
-            pass
-        shutdown_event.set()
-        # `timeout(1)` uses SIGTERM; DS/GStreamer backends can hang shutdown (and sometimes
-        # starve Python threads), so hard-exit to avoid leaving orphaned processes/ports.
         if signum == signal.SIGTERM:
-            try:
-                with open("/home/mayor/Noesis_Devel/.cursor/debug.log", "a", encoding="utf-8") as _f:
-                    _f.write(
-                        json.dumps(
-                            {
-                                "sessionId": "debug-session",
-                                "runId": "run1",
-                                "hypothesisId": "H0",
-                                "location": "ds8_runtime.py:_signal_handler",
-                                "message": "sigterm hard exit",
-                                "data": {},
-                                "timestamp": int(time.time() * 1000),
-                            }
-                        )
-                        + "\n"
-                    )
-            except Exception:
-                pass
-            os._exit(0)
+            _arm_shutdown_watchdog()
+        shutdown_event.set()
 
     # Some DS/GStreamer backends manipulate signal masks; ensure SIGINT/SIGTERM are unblocked.
     try:
@@ -3247,18 +2874,146 @@ def main() -> int:
         pass
 
     signal.signal(signal.SIGINT, _signal_handler)
-    # Prefer SIGTERM default behavior so external supervisors (e.g. `timeout(1)`) can
-    # always terminate the process even if Python threads/GIL are starved by GI callbacks.
-    try:
-        signal.signal(signal.SIGTERM, signal.SIG_DFL)
-    except Exception:
-        signal.signal(signal.SIGTERM, _signal_handler)
+    signal.signal(signal.SIGTERM, _signal_handler)
+
+    def _startup_ownership_ambiguous(reason: str) -> None:
+        runtime_state["pipeline_failed"] = True
+        runtime_state["startup_ownership_ambiguous"] = str(reason)
+        logger.critical("Runtime startup ownership is ambiguous: %s", reason)
+        shutdown_event.set()
+        _arm_shutdown_watchdog()
+
+    startup_transaction = RuntimeStartupTransaction(
+        on_ambiguous=_startup_ownership_ambiguous
+    )
+
+    def _abort_startup(reason: str, code: int = 1) -> int:
+        logger.error("Runtime startup aborted: %s", reason)
+        receipt = startup_transaction.abort_reversible()
+        runtime_state["startup_abort_receipt"] = {
+            "phase_before": receipt.phase_before.value,
+            "phase_after": receipt.phase_after.value,
+            "completed": receipt.completed,
+            "cleanup": [
+                {
+                    "name": row.name,
+                    "completed": row.completed,
+                    "error_type": row.error_type,
+                    "error_message": row.error_message,
+                }
+                for row in receipt.cleanup
+            ],
+        }
+        if not receipt.completed:
+            runtime_state["pipeline_failed"] = True
+            logger.critical(
+                "Reversible startup cleanup was incomplete; waiting for watchdog"
+            )
+            _arm_shutdown_watchdog()
+            while True:
+                signal.pause()
+        return int(code)
+
+    def _record_startup_ambiguity(error: StartupOwnershipAmbiguous) -> None:
+        runtime_state["startup_ambiguity_receipt"] = {
+            "ingress_quiesced": error.ingress_quiesced,
+            "cleanup": [
+                {
+                    "name": row.name,
+                    "completed": row.completed,
+                    "error_type": row.error_type,
+                    "error_message": row.error_message,
+                }
+                for row in error.ingress_cleanup
+            ],
+        }
+        if not error.ingress_quiesced:
+            logger.critical(
+                "Startup ingress cleanup was not proven; watchdog exit remains armed"
+            )
+
+    def _preserve_ambiguous_and_wait(
+        reason: str,
+        error: StartupOwnershipAmbiguous | None = None,
+    ) -> NoReturn:
+        _arm_shutdown_watchdog()
+        if error is not None:
+            _record_startup_ambiguity(error)
+        logger.critical(
+            "Preserving callback-owned startup resources until watchdog exit: %s",
+            reason,
+        )
+        while True:
+            signal.pause()
+
+    def _abort_ambiguous_and_wait(reason: str) -> NoReturn:
+        _arm_shutdown_watchdog()
+        try:
+            startup_transaction.abort_ambiguous(reason)
+        except StartupOwnershipAmbiguous as exc:
+            _preserve_ambiguous_and_wait(reason, exc)
+        except BaseException as exc:
+            runtime_state["startup_ambiguity_transaction_error"] = type(exc).__name__
+            _startup_ownership_ambiguous(reason)
+            logger.critical(
+                "Startup ambiguity transaction failed",
+                exc_info=(type(exc), exc, exc.__traceback__),
+            )
+            _preserve_ambiguous_and_wait(reason)
+
+    def _handle_unexpected_startup_exception(exc: BaseException) -> int:
+        phase = startup_transaction.phase
+        logger.critical(
+            "Unhandled runtime startup exception during phase=%s",
+            phase.value,
+            exc_info=(type(exc), exc, exc.__traceback__),
+        )
+        if phase in {StartupPhase.ASSEMBLING, StartupPhase.PREPARED}:
+            code = _abort_startup(
+                f"unhandled_startup_exception:{type(exc).__name__}"
+            )
+            if (
+                isinstance(exc, StartupResourceRegistrationError)
+                and not exc.rollback_completed
+            ):
+                runtime_state["startup_registration_rollback"] = [
+                    {
+                        "name": row.name,
+                        "completed": row.completed,
+                        "error_type": row.error_type,
+                        "error_message": row.error_message,
+                    }
+                    for row in exc.rollback
+                ]
+                logger.critical(
+                    "Newly acquired startup resource rollback was not proven"
+                )
+                _arm_shutdown_watchdog()
+                while True:
+                    signal.pause()
+            return code
+        if phase in {
+            StartupPhase.ACTIVATION_ATTEMPTED,
+            StartupPhase.ACTIVE_WAIT_OWNED,
+        }:
+            _abort_ambiguous_and_wait(
+                f"unhandled_activation_exception:{type(exc).__name__}"
+            )
+        runtime_state["pipeline_failed"] = True
+        logger.critical(
+            "Unexpected startup guard phase=%s; preserving process ownership",
+            phase.value,
+        )
+        _arm_shutdown_watchdog()
+        while True:
+            signal.pause()
+
+    startup_main_guard.arm(_handle_unexpected_startup_exception)
 
     tracking_mode = _resolve_tracking_mode(args)
     os.environ["NOESIS_TRACKING_MODE"] = tracking_mode
     if tracking_mode not in _TRACKING_MODES:
-        logger.warning("Normalized tracking mode '%s' is unknown; defaulting to baseline", tracking_mode)
-        tracking_mode = "baseline"
+        return _abort_startup("tracking_mode_invalid")
 
     pipeline_path, cameras_path = _resolve_pipeline_and_camera_paths(args, tracking_mode, logger)
     pipeline_path = pipeline_path.expanduser().resolve()
@@ -3269,7 +3024,8 @@ def main() -> int:
     try:
         os.chdir(REPO_ROOT)
     except Exception:
-        logging.getLogger("ds8.runtime").warning("Unable to chdir to REPO_ROOT %s", REPO_ROOT)
+        logger.exception("Unable to chdir to required REPO_ROOT %s", REPO_ROOT)
+        return _abort_startup("repo_root_chdir_failed")
 
     if not pipeline_path.exists():
         logger.error("Pipeline configuration not found: %s", pipeline_path)
@@ -3329,61 +3085,123 @@ def main() -> int:
         from noesis.server import analytics_api
 
         os.environ.setdefault(analytics_api.ANALYTICS_CONFIG_ENV, str(REPO_ROOT / "config" / "nvdsanalytics.yaml"))
-    except Exception:
-        pass
+        pipeline_cfg_for_analytics = load_runtime_pipeline_config(
+            pipeline_path,
+            materialize_secrets=False,
+        )
+        exclude_cfg = (pipeline_cfg_for_analytics.get("analytics") or {}).get("exclude") or {}
+        exclude_raw_path = str(exclude_cfg.get("config-file") or "").strip()
+        if not exclude_raw_path:
+            raise RuntimeError("Analytics exclusion config path is missing")
+        os.environ.setdefault(
+            "NOESIS_ANALYTICS_EXCLUDE_CONFIG",
+            str(_resolve_pipeline_cfg_path(pipeline_path, exclude_raw_path)),
+        )
+        analytics_cfg = analytics_api._load_config(force=True)  # type: ignore[attr-defined]
+        stages_cfg = (analytics_cfg.get("analytics") or {}).get("stages") or {}
+        if "exclude" not in stages_cfg or not isinstance(stages_cfg["exclude"], dict):
+            raise RuntimeError("Writable analytics config is missing the required exclude stage")
+        startup_exclude_path = analytics_api._sync_exclude_stage(  # type: ignore[attr-defined]
+            "exclude", stages_cfg["exclude"]
+        )
+        if startup_exclude_path is None:
+            raise RuntimeError("Writable analytics exclusion state did not materialize")
+        analytics_startup_reload_context = analytics_api._build_exclude_reload_context(  # type: ignore[attr-defined]
+            startup_exclude_path
+        )
 
-    camera_labels = _load_camera_labels(cameras_path)
-    storage_manager = _build_storage_manager(args)
+        def _analytics_state_poisoned(reason: str) -> None:
+            runtime_state["analytics_state_poisoned"] = reason
+            runtime_state["pipeline_failed"] = True
+            shutdown_event.set()
+
+        startup_transaction.bind(
+            "analytics_runtime_hooks",
+            lambda: analytics_api.register_poison_hook(_analytics_state_poisoned),
+            analytics_api.clear_runtime_hooks,
+        )
+    except StartupResourceRegistrationError:
+        raise
+    except Exception:
+        logger.exception("Failed to load and synchronize writable analytics state at startup")
+        return _abort_startup("analytics_state_initialization_failed")
+
+    camera_labels = load_camera_labels(cameras_path, strict=True)
+    try:
+        capture_camera_aliases = CanonicalCameraAliases(camera_labels)
+    except ValueError:
+        logger.exception("Capture-event camera aliases are invalid")
+        return _abort_startup("capture_event_camera_aliases_invalid")
+    camera_aliases = {
+        alias: camera
+        for source_id, camera in camera_labels.items()
+        for alias in (str(source_id), str(camera))
+    }
+    try:
+        active_floorplan_registry = ActiveFloorplanRegistry(camera_aliases)
+    except ActiveFloorplanError:
+        logger.exception("Active floorplan registry configuration is invalid")
+        return _abort_startup("active_floorplan_registry_invalid")
+
+    def _depth_storage_failed(failure: StorageFailure) -> None:
+        runtime_state["depth_storage_failure"] = {
+            "write_id": failure.write_id,
+            "sequence": failure.sequence,
+            "camera_id": failure.camera_id,
+            "ts_us": failure.ts_us,
+            "error_type": failure.error_type,
+            "message": failure.message,
+        }
+        runtime_state["pipeline_failed"] = True
+        logger.critical(
+            "Transactional depth storage failed: write_id=%s sequence=%s type=%s message=%s",
+            failure.write_id,
+            failure.sequence,
+            failure.error_type,
+            failure.message,
+        )
+        shutdown_event.set()
+
+    try:
+        storage_manager = startup_transaction.acquire(
+            "depth_storage",
+            lambda: _build_storage_manager(
+                args,
+                on_failure=_depth_storage_failed,
+            ),
+            lambda manager: close_depth_storage(manager, timeout_s=5.0),
+            validator=lambda receipt: bool(receipt.completed),
+        )
+    except StartupResourceRegistrationError:
+        raise
+    except Exception:
+        logger.exception("Failed to initialize transactional depth storage")
+        return _abort_startup("depth_storage_initialization_failed")
+    runtime_state["depth_storage_startup"] = storage_manager.startup_report()
+    if runtime_state["depth_storage_startup"].get("legacy_entries"):
+        logger.warning(
+            "Ignoring %d legacy depth snapshots without commit manifests",
+            len(runtime_state["depth_storage_startup"]["legacy_entries"]),
+        )
     auto_calibrate_lock = threading.Lock()
 
     def _resolve_auto_calibrate_cameras(camera_id: Optional[str]) -> list[str]:
         if camera_id is None or not str(camera_id).strip():
-            ordered = [
-                name
-                for _, name in sorted(camera_labels.items(), key=lambda item: int(item[0]))
-                if isinstance(name, str)
+            return [
+                capture_camera_aliases.canonicalize(name)
+                for _, name in sorted(
+                    camera_labels.items(),
+                    key=lambda item: int(item[0]),
+                )
             ]
-            seen: set[str] = set()
-            cameras: list[str] = []
-            for name in ordered:
-                if name in seen:
-                    continue
-                cameras.append(name)
-                seen.add(name)
-            return cameras
-
-        request_camera = str(camera_id).strip()
-        canonical_camera = request_camera
-        try:
-            cam_idx = int(request_camera)
-        except Exception:
-            cam_idx = None
-        if cam_idx is not None and cam_idx in camera_labels:
-            canonical_camera = camera_labels[cam_idx]
-        else:
-            reverse_labels = {v: k for k, v in camera_labels.items()}
-            if canonical_camera in reverse_labels:
-                canonical_camera = request_camera
-        return [canonical_camera]
-
-    def _read_latest_depth_ts(camera_id: str) -> int:
-        if storage_manager is None:
-            return 0
-        try:
-            payload = storage_manager.load_latest_depth(camera_id, None)
-        except Exception:
-            return 0
-        if not isinstance(payload, dict):
-            return 0
-        try:
-            return int(payload.get("ts", 0) or 0)
-        except Exception:
-            return 0
+        return [capture_camera_aliases.canonicalize(camera_id)]
 
     def _ds8_auto_calibrate_handler(camera_id: Optional[str] = None) -> Dict[str, Any]:
         if not auto_calibrate_lock.acquire(blocking=False):
             return {"ok": False, "results": [], "updated": [], "error": "busy"}
         try:
+            if shutdown_event.is_set():
+                return {"ok": False, "results": [], "updated": [], "error": "shutting_down"}
             if not pipeline.activated:
                 return {"ok": False, "results": [], "updated": [], "error": "pipeline_not_running"}
             if storage_manager is None:
@@ -3394,51 +3212,103 @@ def main() -> int:
             if not depth_branch_present:
                 return {"ok": False, "results": [], "updated": [], "error": "depth_branch_unavailable"}
 
-            cameras = _resolve_auto_calibrate_cameras(camera_id)
-            if not cameras:
-                return {"ok": False, "results": [], "updated": [], "error": "no_cameras_configured"}
-
-            baseline_ts = {cam: _read_latest_depth_ts(cam) for cam in cameras}
-
-            enable_env = os.environ.get("NOESIS_AUTOCALIB_ENABLE_SECONDS", "10")
             try:
-                enable_seconds = int(float(str(enable_env).strip()))
-            except Exception:
-                enable_seconds = 10
-            enable_seconds = max(1, min(15, enable_seconds))
-
-            if not pipeline.depth_enabled:
-                try:
-                    ds8_pipeline.enable_depth(seconds=enable_seconds)
-                except Exception:
-                    logger.warning("Auto-calibrate failed to enable depth burst", exc_info=True)
-
-            wait_timeout_s = min(float(enable_seconds) + 2.0, 18.0)
-            deadline = time.time() + wait_timeout_s
-            fresh = set()
-            while time.time() < deadline and len(fresh) < len(cameras):
-                for cam in cameras:
-                    latest_ts = _read_latest_depth_ts(cam)
-                    if latest_ts > baseline_ts.get(cam, 0):
-                        fresh.add(cam)
-                if len(fresh) >= len(cameras):
-                    break
-                time.sleep(0.12)
-
-            try:
-                from scripts.auto_calibrate_from_depth import auto_calibrate_from_latest_depth
-            except Exception as exc:
+                cameras = _resolve_auto_calibrate_cameras(camera_id)
+            except CaptureEventFusionError as exc:
                 return {
                     "ok": False,
                     "results": [],
                     "updated": [],
-                    "error": f"import_failed: {exc}",
+                    "error": exc.code,
+                }
+            if not cameras:
+                return {"ok": False, "results": [], "updated": [], "error": "no_cameras_configured"}
+
+            raw_enable_seconds = os.environ.get(
+                "NOESIS_AUTOCALIB_ENABLE_SECONDS",
+                "10",
+            )
+            try:
+                enable_seconds = float(str(raw_enable_seconds).strip())
+            except Exception:
+                enable_seconds = float("nan")
+            if (
+                not math.isfinite(enable_seconds)
+                or not 0.01 <= enable_seconds <= 15.0
+            ):
+                error = CaptureEventRuntimeError(
+                    "capture_event_configuration_invalid"
+                )
+                _runtime_component_failed("capture_event", error)
+                return {
+                    "ok": False,
+                    "results": [],
+                    "updated": [],
+                    "error": error.code,
+                }
+
+            providers = getattr(
+                pipeline,
+                "capture_event_runtime_providers",
+                None,
+            )
+            if not isinstance(providers, CaptureEventRuntimeProviders):
+                error = CaptureEventRuntimeError(
+                    "capture_event_controller_unavailable"
+                )
+                _runtime_component_failed("capture_event", error)
+                return {
+                    "ok": False,
+                    "results": [],
+                    "updated": [],
+                    "error": error.code,
+                }
+            try:
+                capture_outcomes = providers.capture_for_auto_calibration(
+                    cameras,
+                    burst_seconds=enable_seconds,
+                )
+            except (CaptureEventFusionError, CaptureEventRuntimeError) as exc:
+                return {
+                    "ok": False,
+                    "results": [],
+                    "updated": [],
+                    "error": exc.code,
+                }
+            auto_capture_evidence = {
+                outcome.canonical_camera: outcome.compact_evidence_payload()
+                for outcome in capture_outcomes
+            }
+
+            if shutdown_event.is_set():
+                return {
+                    "ok": False,
+                    "results": [],
+                    "updated": [],
+                    "error": "shutting_down",
+                }
+
+            try:
+                from scripts.auto_calibrate_from_depth import auto_calibrate_from_latest_depth
+            except Exception:
+                logger.exception("Auto-calibration implementation is unavailable")
+                return {
+                    "ok": False,
+                    "results": [],
+                    "updated": [],
+                    "error": "auto_calibration_unavailable",
                 }
 
             try:
                 res = auto_calibrate_from_latest_depth(cameras, persist=False)
-            except Exception as exc:
-                return {"ok": False, "results": [], "updated": [], "error": str(exc) or "calibration_failed"}
+            except Exception:
+                logger.exception("Auto-calibration computation failed")
+                return {
+                    "ok": False,
+                    "results": [],
+                    "updated": [],
+                    "error": "auto_calibration_failed",
+                }
 
             results = res.get("results") if isinstance(res, dict) else []
             updated: list[str] = []
@@ -3470,12 +3340,35 @@ def main() -> int:
 
             if updated:
                 try:
+                    for updated_camera in updated:
+                        active_floorplan_registry.clear(updated_camera)
+                        storage_manager.invalidate_floorplan_cache(updated_camera)
+                except Exception as exc:
+                    _runtime_component_failed(
+                        "calibration_cache_invalidation",
+                        exc,
+                    )
+                    return {
+                        "ok": False,
+                        "results": results or [],
+                        "updated": updated,
+                        "error": "calibration_cache_invalidation_failed",
+                        "capture_events": auto_capture_evidence,
+                    }
+                try:
                     storage_manager.calibration_bundle = calibration_provider.calibration_bundle()
                 except Exception:
                     logger.debug("Unable to refresh storage calibration bundle", exc_info=True)
                 try:
+                    response_model_started_ns = time.perf_counter_ns()
                     bundle = calibration_provider.calibration_bundle()
-                    ws_server.broadcast_sync({"type": "calibration-bundle", "data": bundle})
+                    message = {"type": "calibration-bundle", "data": bundle}
+                    ws_server.broadcast_sync(
+                        message,
+                        response_model_timing=ws_server.response_model_timing_since(
+                            response_model_started_ns
+                        ),
+                    )
                 except Exception:
                     logger.debug("Failed to broadcast calibration bundle", exc_info=True)
 
@@ -3484,6 +3377,7 @@ def main() -> int:
                 "results": results or [],
                 "updated": updated,
                 "error": top_error,
+                "capture_events": auto_capture_evidence,
             }
         finally:
             auto_calibrate_lock.release()
@@ -3492,225 +3386,55 @@ def main() -> int:
         cam_id: str,
         ts_max_us: Optional[object] = None,
         request_id: Optional[str] = None,
+        cache_only: bool = False,
+        **_ignored: object,
     ) -> Dict[str, Any]:
-        request_camera = str(cam_id).strip()
-        camera_key = request_camera
-        canonical_camera = camera_key
-        alt_keys: List[str] = []
-        norm_ts_max: Optional[int] = None
-        try:
-            cam_idx = int(camera_key)
-            if cam_idx in camera_labels:
-                canonical_camera = camera_labels[cam_idx]
-                camera_key = canonical_camera
-                alt_keys.append(str(cam_idx))
-        except Exception:
-            reverse_labels = {v: k for k, v in camera_labels.items()}
-            cam_idx = reverse_labels.get(camera_key)
-            if cam_idx is not None:
-                canonical_camera = camera_key
-                alt_keys.append(str(cam_idx))
-
-        def _normalize_ts_max_us(value: Optional[object]) -> Optional[int]:
-            if value is None:
-                return None
-            try:
-                if isinstance(value, str):
-                    text = value.strip()
-                    if not text:
-                        return None
-                    raw = int(float(text))
-                else:
-                    raw = int(value)  # type: ignore[arg-type]
-            except Exception:
-                return None
-            if raw < 0:
-                return None
-            if raw < 1_000_000_000:
-                return raw * 1_000_000
-            if raw < 1_000_000_000_000:
-                return raw * 1000
-            return raw
-
-        norm_ts_max = _normalize_ts_max_us(ts_max_us)
-
-        def _payload_has_valid_depth(payload: Dict[str, Any]) -> bool:
-            """Best-effort guard against invalid all-zero/NaN depth payloads."""
-            try:
-                shape = payload.get("shape")
-                if not (isinstance(shape, (list, tuple)) and len(shape) == 2):
-                    return False
-                height = int(shape[0] or 0)
-                width = int(shape[1] or 0)
-                if height <= 0 or width <= 0:
-                    return False
-                depth_b64 = payload.get("depth_b64") or payload.get("depth_z_b64")
-                if not isinstance(depth_b64, str) or not depth_b64:
-                    return False
-                import base64
-
-                raw = base64.b64decode(depth_b64)
-                arr = np.frombuffer(raw, dtype=np.float32)
-                needed = height * width
-                if arr.size < needed:
-                    return False
-                arr = arr[:needed]
-                finite = np.isfinite(arr)
-                if not finite.any():
-                    return False
-                # Floorplan generation uses depth>0.1m as a validity threshold; align with it here.
-                return bool(np.any(arr[finite] > 0.1))
-            except Exception:
-                return False
-
-        def _maybe_attach_normals(payload: Dict[str, Any]) -> None:
-            if not isinstance(payload, dict):
-                return
-            flag = os.environ.get("NOESIS_MAPANYTHING_NORMALS_ENABLE", "1")
-            if str(flag).strip().lower() not in ("1", "true", "yes", "on"):
-                return
-            if storage_manager is None:
-                return
-            space = os.environ.get("NOESIS_MAPANYTHING_NORMALS_SPACE", "camera")
-            dtype = os.environ.get("NOESIS_MAPANYTHING_NORMALS_DTYPE", "float16")
-            try:
-                storage_manager.attach_normals_to_payload(canonical_camera, payload, space=space, dtype=dtype)
-            except Exception:
-                logger.debug("Failed to attach depth normals for camera %s", canonical_camera, exc_info=True)
-
-        def _response(
-            served_from_cache: bool,
-            payload: Optional[Dict[str, Any]] = None,
-            ts_us: Optional[int] = None,
-            error: Optional[str] = None,
-        ) -> Dict[str, Any]:
-            ts_val: Any = ts_us
-            if ts_val is None and payload is not None:
-                try:
-                    ts_val = int(payload.get("ts", 0) or 0)
-                except Exception:
-                    ts_val = payload.get("ts", 0)
-            resp: Dict[str, Any] = {
+        providers = getattr(pipeline, "capture_event_runtime_providers", None)
+        if not isinstance(providers, CaptureEventRuntimeProviders):
+            error = CaptureEventRuntimeError(
+                "capture_event_controller_unavailable"
+            )
+            _runtime_component_failed("capture_event", error)
+            response: Dict[str, Any] = {
                 "type": "ma_depth_response",
-                "camera": canonical_camera,
-                "served_from_cache": bool(served_from_cache),
-                "ts_us": int(ts_val or 0),
+                "camera": str(cam_id or "").strip(),
+                "cache_only": bool(cache_only),
+                "served_from_cache": False,
+                "ts_us": 0,
+                "ok": False,
+                "error": error.code,
             }
             if request_id:
-                resp["request_id"] = request_id
-            if payload is not None:
-                _maybe_attach_normals(payload)
-                resp["payload"] = payload
-            if error:
-                resp["error"] = error
-            resp["ok"] = error is None
-            return resp
+                response["request_id"] = request_id
+            return response
+        return providers.depth_provider(
+            cam_id,
+            ts_max_us=ts_max_us,
+            request_id=request_id,
+            cache_only=cache_only,
+            **_ignored,
+        )
 
-        if storage_manager is None:
-            return _response(False, error="depth_source_unavailable")
-
-        def _load_latest(camera_id: str, ts_cutoff: Optional[int]) -> Optional[Dict[str, Any]]:
-            try:
-                return storage_manager.load_latest_depth(camera_id, ts_cutoff)
-            except Exception:
-                return None
-
-        keys_to_check = [camera_key] + [k for k in alt_keys if k and k != camera_key]
-
-        cached: Optional[Dict[str, Any]] = None
-        cached_ts: Optional[int] = None
-        if norm_ts_max is not None:
-            for key in keys_to_check:
-                cached = _load_latest(key, norm_ts_max)
-                if cached is not None:
-                    break
-            if cached is not None and _payload_has_valid_depth(cached):
-                try:
-                    cached_ts = int(cached.get("ts", 0) or 0)
-                except Exception:
-                    cached_ts = 0
-                return _response(True, payload=cached, ts_us=cached_ts)
-            cached = None
-        else:
-            cached = _load_latest(camera_key, None)
-            if cached is None:
-                for alt_key in alt_keys:
-                    cached = _load_latest(alt_key, None)
-                    if cached is not None:
-                        break
-            if cached is not None and _payload_has_valid_depth(cached):
-                try:
-                    cached_ts = int(cached.get("ts", 0) or 0)
-                except Exception:
-                    cached_ts = 0
-            else:
-                cached = None
-                cached_ts = None
-
-        depth_branch_present = bool(pipeline.depth_gate_attach and pipeline.depth_gate_attach in pipeline.components)
-        if not depth_branch_present:
-            if cached is not None:
-                return _response(True, payload=cached, ts_us=cached_ts, error="depth_branch_unavailable")
-            return _response(False, error="depth_branch_unavailable")
-
-        baseline_ts_by_key: Dict[str, int] = {}
-        for key in keys_to_check:
-            baseline_ts_by_key[key] = 0
-            payload = _load_latest(key, None)
-            if payload is None:
-                continue
-            try:
-                baseline_ts_by_key[key] = int(payload.get("ts", 0) or 0)
-            except Exception:
-                baseline_ts_by_key[key] = 0
-
-        # Trigger a short depth burst and wait for a newer cached snapshot to land.
-        enable_env = os.environ.get("NOESIS_DEPTH_RPC_ENABLE_SECONDS", "2")
+    def _record_active_floorplan_payload(
+        camera_key: str,
+        payload: Mapping[str, Any],
+    ) -> bool:
+        if payload.get("error"):
+            return False
         try:
-            enable_seconds = int(str(enable_env).strip())
-        except Exception:
-            enable_seconds = 2
-        enable_seconds = max(1, min(20, enable_seconds))
-        try:
-            ds8_pipeline.enable_depth(seconds=enable_seconds)
-        except Exception as exc:
-            if cached is not None:
-                return _response(True, payload=cached, ts_us=cached_ts, error=str(exc) or "depth_enable_failed")
-            return _response(False, error=str(exc) or "depth_enable_failed")
+            return active_floorplan_registry.record(
+                camera_key,
+                payload,
+                snapshot_ref=str(payload.get("snapshot_ref") or ""),
+            )
+        except ActiveFloorplanError as exc:
+            _runtime_component_failed("active_floorplan", exc)
+            raise
 
-        wait_timeout_s = min(3.0, float(enable_seconds) + 1.0)
-        deadline = time.time() + wait_timeout_s
-        while time.time() < deadline:
-            for key in keys_to_check:
-                payload = _load_latest(key, None)
-                if payload is None:
-                    continue
-                if not _payload_has_valid_depth(payload):
-                    continue
-                try:
-                    payload_ts = int(payload.get("ts", 0) or 0)
-                except Exception:
-                    payload_ts = 0
-                if payload_ts <= baseline_ts_by_key.get(key, 0):
-                    continue
-                return _response(False, payload=payload, ts_us=payload_ts)
-            time.sleep(0.12)
-
-        if cached is not None:
-            return _response(True, payload=cached, ts_us=cached_ts, error="timeout_waiting_for_depth")
-        payload = _load_latest(camera_key, None)
-        if payload is None:
-            for alt_key in alt_keys:
-                payload = _load_latest(alt_key, None)
-                if payload is not None:
-                    break
-        if payload is None or not _payload_has_valid_depth(payload):
-            return _response(False, error="timeout_waiting_for_depth")
-        try:
-            payload_ts = int(payload.get("ts", 0) or 0)
-        except Exception:
-            payload_ts = 0
-        return _response(True, payload=payload, ts_us=payload_ts, error="timeout_waiting_for_depth")
+    def _bev_active_floorplan_bounds_provider(
+        camera_key: str,
+    ) -> Optional[Mapping[str, Any]]:
+        return active_floorplan_registry.bounds_for(camera_key)
 
     def _ds8_floorplan_provider(
         camera: Optional[str] = None,
@@ -3720,206 +3444,70 @@ def main() -> int:
         cache_only: bool = False,
         **_ignored: object,
     ) -> Dict[str, Any]:
-        request_camera = str(camera or "").strip()
-        camera_id = request_camera
-        alt_keys: List[str] = []
-        try:
-            cam_idx = int(camera_id)
-            if cam_idx in camera_labels:
-                camera_id = camera_labels[cam_idx]
-                alt_keys.append(str(cam_idx))
-        except Exception:
-            reverse_labels = {v: k for k, v in camera_labels.items()}
-            cam_idx = reverse_labels.get(camera_id)
-            if cam_idx is not None:
-                alt_keys.append(str(cam_idx))
-
-        if not camera_id:
-            return {"error": "camera_required", "ts": int(time.time() * 1_000_000)}
-        if storage_manager is None:
-            return {"error": "depth_source_unavailable", "camera_id": camera_id}
-
-        keys_to_check = [camera_id] + [key for key in alt_keys if key and key != camera_id]
-
-        def _generate_for_key(key: str) -> Dict[str, Any]:
-            return storage_manager.generate_topdown_floorplan(
-                key,
-                max_age_sec=max_age_sec,
-                grid_res_m=grid_res_m,
-                max_extent_m=max_extent_m,
-                cache_only=cache_only,
+        providers = getattr(pipeline, "capture_event_runtime_providers", None)
+        if not isinstance(providers, CaptureEventRuntimeProviders):
+            error = CaptureEventRuntimeError(
+                "capture_event_controller_unavailable"
             )
-
-        def _generate_with_alternates() -> Dict[str, Any]:
-            first_exc: Optional[Exception] = None
-            try:
-                return _generate_for_key(camera_id)
-            except Exception as exc:
-                first_exc = exc
-            for alt_key in alt_keys:
-                try:
-                    return _generate_for_key(alt_key)
-                except Exception:
-                    continue
-            if first_exc is not None:
-                raise first_exc
-            return {"error": "floorplan_failed", "camera_id": camera_id, "ts": int(time.time() * 1_000_000)}
-
-        def _needs_live_depth_burst(payload: Mapping[str, Any]) -> bool:
-            if cache_only:
-                return False
-            try:
-                requested_max_age = float(max_age_sec)
-            except Exception:
-                requested_max_age = 60.0
-            if requested_max_age <= 0.0:
-                return True
-            error = str(payload.get("error") or "").strip().lower()
-            return error in {"no_depth", "stale_depth", "load_failed", "invalid_snapshot"}
-
-        try:
-            payload = _generate_with_alternates()
-        except Exception as exc:
-            logger.warning(
-                "DS8 floorplan provider failed (camera=%s, cache_only=%s): %s",
-                camera_id,
-                cache_only,
-                exc,
-            )
-            return {"error": str(exc) or "floorplan_failed", "camera_id": camera_id}
-        if not _needs_live_depth_burst(payload):
-            return payload
-
-        depth_branch_present = bool(pipeline.depth_gate_attach and pipeline.depth_gate_attach in pipeline.components)
-        if not depth_branch_present:
-            payload = dict(payload)
-            payload.setdefault("camera_id", camera_id)
-            payload["error"] = "depth_branch_unavailable"
-            payload["depth_burst_triggered"] = False
-            return payload
-
-        baseline_ts_by_key = {key: _read_latest_depth_ts(key) for key in keys_to_check}
-        enable_env = os.environ.get(
-            "NOESIS_FLOORPLAN_DEPTH_ENABLE_SECONDS",
-            os.environ.get("NOESIS_DEPTH_RPC_ENABLE_SECONDS", "4"),
+            _runtime_component_failed("capture_event", error)
+            return {
+                "error": error.code,
+                "camera_id": str(camera or "").strip(),
+            }
+        return providers.floorplan_provider(
+            camera,
+            max_age_sec=max_age_sec,
+            grid_res_m=grid_res_m,
+            max_extent_m=max_extent_m,
+            cache_only=cache_only,
+            **_ignored,
         )
-        try:
-            enable_seconds = int(float(str(enable_env).strip()))
-        except Exception:
-            enable_seconds = 4
-        enable_seconds = max(1, min(20, enable_seconds))
-        try:
-            ds8_pipeline.enable_depth(seconds=enable_seconds)
-        except Exception as exc:
-            payload = dict(payload)
-            payload.setdefault("camera_id", camera_id)
-            payload["error"] = str(exc) or "depth_enable_failed"
-            payload["depth_burst_triggered"] = False
-            return payload
-
-        deadline = time.time() + min(12.0, float(enable_seconds) + 4.0)
-        fresh_depth = False
-        while time.time() < deadline:
-            for key in keys_to_check:
-                latest_ts = _read_latest_depth_ts(key)
-                if latest_ts > baseline_ts_by_key.get(key, 0):
-                    fresh_depth = True
-                    break
-            if fresh_depth:
-                break
-            time.sleep(0.12)
-
-        try:
-            refreshed = dict(_generate_with_alternates())
-        except Exception as exc:
-            logger.warning(
-                "DS8 floorplan provider failed after depth burst (camera=%s): %s",
-                camera_id,
-                exc,
-            )
-            refreshed = {"error": str(exc) or "floorplan_failed", "camera_id": camera_id}
-        refreshed["depth_burst_triggered"] = True
-        refreshed["depth_burst_fresh"] = bool(fresh_depth)
-        if refreshed.get("error") and not fresh_depth:
-            refreshed.setdefault("details", "timeout_waiting_for_depth")
-        return refreshed
 
     pipeline = ds8_pipeline.build_pipeline(pipeline_path)
+    setattr(pipeline, "active_floorplan_registry", active_floorplan_registry)
+    runtime_state["expected_eos"] = pipeline_expects_finite_source_eos(pipeline)
+    runtime_state["pipeline_eos_seen"] = False
+    runtime_state["pipeline_eos_reason"] = (
+        "finite_source" if runtime_state["expected_eos"] else None
+    )
     setattr(pipeline, "camera_labels", camera_labels)
     if getattr(pipeline, "ds_pipeline", None) is None:
         logger.error("pyservicemaker unavailable; DS8 runtime cannot continue")
-        return 1
-    try:
-        from noesis.server import analytics_api
-
-        analytics_cfg = analytics_api._load_config(force=True)  # type: ignore[attr-defined]
-        stage_cfg = (analytics_cfg.get("analytics") or {}).get("stages", {}).get("exclude") or {}
-        if stage_cfg:
-            analytics_api._sync_exclude_stage("exclude", stage_cfg)  # type: ignore[attr-defined]
-    except Exception:
-        logger.debug("Unable to sync exclusion config at startup", exc_info=True)
-
+        return _abort_startup("pyservicemaker_unavailable")
     # Parse mosaic_output toggles from the *built pipeline config* (source of truth).
     # Do not re-apply env overrides here: env vars are consumed during build in ds8_pipeline,
     # and re-applying them here can desync runtime behavior from the actual pipeline graph.
     mosaic_cfg = pipeline.config.get("mosaic_output") or {}
-    rtsp_port = int(mosaic_cfg.get("rtsp_port", 8554) or 8554)
-    rtsp_path = str(mosaic_cfg.get("rtsp_path", "mosaic")).strip() or "mosaic"
     mosaic_webrtc_enabled = bool(mosaic_cfg.get("mosaic_webrtc_enabled", False))
 
     rtsp_built = "rtsp_out" in getattr(pipeline, "components", {})
+    mosaic_shm_built = "mosaic_h264_shmsink" in getattr(pipeline, "components", {})
+    mosaic_h264_shm_socket = str(
+        mosaic_cfg.get("mosaic_h264_shm_socket", "") or "/tmp/noesis-mosaic-h264"
+    ).strip() or "/tmp/noesis-mosaic-h264"
 
     logger.info(
-        "Mosaic output toggles (effective): RTSP=%s (built=%s), WebRTC_Gateway=%s",
+        "Mosaic output toggles (effective): RTSP=%s (built=%s), WebRTC_Gateway=%s (shm_built=%s socket=%s)",
         bool(mosaic_cfg.get("rtsp_enabled", False)),
         rtsp_built,
         mosaic_webrtc_enabled,
+        mosaic_shm_built,
+        mosaic_h264_shm_socket,
     )
-    #region agent log
-    try:
-        with open("/home/mayor/Noesis_Devel/.cursor/debug.log", "a", encoding="utf-8") as _f:
-            _f.write(
-                json.dumps(
-                    {
-                        "sessionId": "debug-session",
-                        "runId": "run1",
-                        "hypothesisId": "H2",
-                        "location": "ds8_runtime.py:main",
-                        "message": "mosaic toggles",
-                        "data": {
-                            "rtsp_enabled": bool(mosaic_cfg.get("rtsp_enabled", False)),
-                            "rtsp_port": rtsp_port,
-                            "rtsp_path": rtsp_path,
-                            "webrtc_enabled": mosaic_webrtc_enabled,
-                            "rtsp_built": rtsp_built,
-                        },
-                        "timestamp": int(time.time() * 1000),
-                    }
-                )
-                + "\n"
-            )
-    except Exception:
-        pass
-    #endregion
 
-    streammux_cfg = pipeline.config.get("streammux") or {}
-    try:
-        streammux_size = (
-            int((streammux_cfg or {}).get("width", 0) or 0),
-            int((streammux_cfg or {}).get("height", 0) or 0),
-        )
-    except Exception:
-        streammux_size = (0, 0)
-    if streammux_size[0] <= 0 or streammux_size[1] <= 0:
-        streammux_size = (1920, 1080)
-
-    calibration_provider = CalibrationManager(
+    calibration_provider = create_calibration_manager(
         cameras_yaml_path=cameras_path,
-        camera_calibration_json_path=REPO_ROOT / "config" / "camera_calibration.json",
-        ply_alignment_json_path=REPO_ROOT / "config" / "ply_alignment.json",
-        streammux_size=streammux_size,
+        pipeline_config=pipeline.config,
+        camera_calibration_json_path=Path(
+            os.environ.get("NOESIS_CAMERA_CALIBRATION_FILE", "")
+            or REPO_ROOT / "config" / "camera_calibration.json"
+        ).expanduser().resolve(),
+        ply_alignment_json_path=Path(
+            os.environ.get("NOESIS_PLY_ALIGNMENT_FILE", "")
+            or REPO_ROOT / "config" / "ply_alignment.json"
+        ).expanduser().resolve(),
+        camera_labels=camera_labels,
     )
-    calibration_provider.set_camera_labels(camera_labels)
     setattr(pipeline, "bev_calibration", calibration_provider)
     if calibration_provider.pose_only_enabled():
         pose_errors = calibration_provider.validate_pose_coverage()
@@ -3928,7 +3516,7 @@ def main() -> int:
             for camera_id, reason in sorted(pose_errors.items()):
                 logger.error("  camera=%s reason=%s", camera_id, reason)
             logger.error("Aborting startup due to strict pose-only calibration mode.")
-            return 1
+            return _abort_startup("pose_only_calibration_invalid")
         logger.warning("Strict pose-only calibration mode enabled (NOESIS_CALIBRATION_POSE_ONLY=1).")
     try:
         storage_manager.calibration_bundle = calibration_provider.calibration_bundle()
@@ -3947,11 +3535,15 @@ def main() -> int:
             )
         except DepthRegistrationError as exc:
             logger.error("Baseline tracking requires a valid depth registration artifact: %s", exc)
-            return 1
-    stable_id_mgr = _build_stable_id_manager(logger, pipeline_config=pipeline.config)
+            return _abort_startup("depth_registration_invalid")
+    stable_id_mgr = _build_stable_id_manager(
+        logger,
+        pipeline_config=pipeline.config,
+        camera_labels=camera_labels,
+    )
     if stable_id_mgr is None:
         logger.error("Stable ID manager is required for zero-copy hard-cutover; aborting startup")
-        return 1
+        return _abort_startup("stable_id_manager_unavailable")
     # Ensure occupancy publisher slot exists for telemetry hooks; real publisher can be bound later.
     bind_occupancy_publisher(pipeline, None)
     # Stable ID manager is optional; attach slot so hooks can discover it.
@@ -3959,10 +3551,19 @@ def main() -> int:
     try:
         from noesis.server import reid_api
 
-        reid_api.register_reid_manager_getter(lambda: getattr(pipeline, "stable_id_mgr", None))
+        startup_transaction.bind(
+            "reid_api_binding",
+            lambda: reid_api.register_reid_manager_getter(
+                lambda: getattr(pipeline, "stable_id_mgr", None)
+            ),
+            reid_api.clear_reid_manager_getter,
+        )
+    except StartupResourceRegistrationError:
+        raise
     except Exception:
-        logger.debug("ReID API registration skipped", exc_info=True)
-    # Intrinsics are served via the calibration bundle (`_CalibrationProvider`) rather than per-frame user meta.
+        logger.exception("Required ReID API registration failed")
+        return _abort_startup("reid_api_binding_failed")
+    # Intrinsics come from the shared CalibrationManager rather than per-frame user meta.
 
     trails_cfg: Dict[str, Any] = {}
     try:
@@ -3992,16 +3593,60 @@ def main() -> int:
     bev_smoothing_cfg = bev_cfg.get("smoothing") if isinstance(bev_cfg, dict) else None
     if not isinstance(bev_smoothing_cfg, dict):
         bev_smoothing_cfg = None
-    bev_frame = None
-    if isinstance(bev_cfg, dict):
-        bev_frame = bev_cfg.get("frame") or bev_cfg.get("frame_mode")
-    bev_frame_env = os.environ.get("NOESIS_BEV_FRAME")
-    if bev_frame_env:
-        bev_frame = bev_frame_env
-    if not bev_frame:
-        bev_frame = POSE_V1_FRAME_BACKEND_WORLD_M
+    locked_bev_frame = "camera_local_ground_m"
+    bev_frame = (
+        bev_cfg.get("frame") or bev_cfg.get("frame_mode")
+        if isinstance(bev_cfg, dict)
+        else None
+    )
+    bev_frame_env = str(os.environ.get("NOESIS_BEV_FRAME") or "").strip()
+    if bev_frame_env and bev_frame_env != locked_bev_frame:
+        logger.error("NOESIS_BEV_FRAME cannot override the locked local floorplan frame")
+        return _abort_startup("bev_frame_override_rejected")
+    if bev_frame != locked_bev_frame:
+        logger.error("BEV frame must be %s; configured=%r", locked_bev_frame, bev_frame)
+        return _abort_startup("bev_frame_contract_invalid")
+    bev_frame = locked_bev_frame
     # JPEG BEV binary delivery retired (meta-only is the supported baseline).
     logger.info("BEV JPEG output retired (meta-only mode). frame mode=%s", bev_frame)
+
+    def _runtime_component_failed(component: str, error: BaseException) -> None:
+        message = f"{component}_failed:{type(error).__name__}:{error}"
+        if message not in pipeline.errors:
+            pipeline.errors.append(message)
+        runtime_state["pipeline_failed"] = True
+        shutdown_event.set()
+
+    def _ws_boundary_failed(error: BaseException) -> None:
+        _runtime_component_failed("ws_boundary", error)
+
+    def _bev_failed(error: BaseException) -> None:
+        _runtime_component_failed("bev_renderer", error)
+
+    def _mapanything_failed(error: BaseException) -> None:
+        _runtime_component_failed("mapanything_postprocess", error)
+
+    capture_event_runtime_providers = CaptureEventRuntimeProviders(
+        aliases=capture_camera_aliases,
+        storage=storage_manager,
+        controller_getter=lambda: getattr(
+            pipeline,
+            "capture_event_controller",
+            None,
+        ),
+        depth_branch_available=lambda: bool(
+            pipeline.depth_gate_attach
+            and pipeline.depth_gate_attach in pipeline.components
+        ),
+        shutdown_requested=shutdown_event.is_set,
+        runtime_failure=_runtime_component_failed,
+        record_floorplan=_record_active_floorplan_payload,
+    )
+    setattr(
+        pipeline,
+        "capture_event_runtime_providers",
+        capture_event_runtime_providers,
+    )
 
     ws_server = WebSocketServer(
         host=args.ws_host,
@@ -4009,6 +3654,8 @@ def main() -> int:
         stats_callback=None,
         initial_trail_state=bool(trail_settings.enabled),
     )
+    ws_server.boundary_failure_callback = _ws_boundary_failed
+    ws_server.lifecycle_failure_callback = _ws_boundary_failed
     def _ws_trail_settings_getter() -> Dict[str, Any]:
         cfg = dict(trails_cfg or {})
         cfg["enabled"] = bool(ws_server.initial_trail_state)
@@ -4017,8 +3664,9 @@ def main() -> int:
     ws_server.stats_callback = _build_stats_callback(
         pipeline,
         camera_labels,
-        ws_metrics_getter=ws_server.get_boundary_serialization_metrics,
+        ws_metrics_getter=ws_server.get_boundary_serialization_metrics_compact,
         ws_metrics_resetter=ws_server.reset_boundary_serialization_metrics,
+        runtime_state=runtime_state,
     )
     trail_processor = getattr(pipeline, "trail_overlay_processor", None)
     bev_renderer: Optional[BevRenderer] = None
@@ -4049,6 +3697,7 @@ def main() -> int:
 
     def _broadcast_calibration_bundle() -> None:
         try:
+            response_model_started_ns = time.perf_counter_ns()
             bundle = calibration_provider.calibration_bundle()
         except Exception:
             logger.debug("Failed to build calibration bundle for broadcast", exc_info=True)
@@ -4059,7 +3708,13 @@ def main() -> int:
             except Exception:
                 logger.debug("Failed to update storage calibration bundle", exc_info=True)
         try:
-            ws_server.broadcast_sync({"type": "calibration-bundle", "data": bundle})
+            message = {"type": "calibration-bundle", "data": bundle}
+            ws_server.broadcast_sync(
+                message,
+                response_model_timing=ws_server.response_model_timing_since(
+                    response_model_started_ns
+                ),
+            )
         except Exception:
             logger.debug("Failed to broadcast calibration bundle", exc_info=True)
 
@@ -4157,6 +3812,10 @@ def main() -> int:
             return persist_result
 
         logger.warning("WS set_extrinsics persisted camera=%s path=%s", cam_id, calibration_provider.extrinsics_path())
+        active_floorplan_registry.clear(cam_id)
+        storage_manager.invalidate_floorplan_cache(
+            active_floorplan_registry.canonical_camera(cam_id)
+        )
         _broadcast_calibration_bundle()
         return {"ok": True, "cameraId": cam_id}
 
@@ -4197,6 +3856,8 @@ def main() -> int:
             return persist_result
 
         logger.warning("WS set_align persisted path=%s", calibration_provider.alignment_path())
+        active_floorplan_registry.clear()
+        storage_manager.invalidate_floorplan_cache()
         _broadcast_calibration_bundle()
         return {"ok": True}
 
@@ -4361,15 +4022,132 @@ def main() -> int:
         trails_cfg=trails_cfg,
         smoothing_cfg=bev_smoothing_cfg,
         frame=str(bev_frame),
+        floorplan_bounds_provider=_bev_active_floorplan_bounds_provider,
+        failure_callback=_bev_failed,
         # jpeg_* retired — meta-only mode (parity with canonical DS8)
     )
+    setattr(pipeline, "bev_renderer", bev_renderer)
     ws_server.bev_config_callback = lambda cam_id, cfg: bev_renderer.update_config(cam_id, cfg)
     ws_server.bev_overlay_callback = lambda cam_id, enabled: bev_renderer.update_config(cam_id, {"overlay": enabled})
-    depth_pub = DepthTelemetryPublisher(ws_server)
-    tracking_pub = TrackingTelemetryPublisher(ws_server, metadata_getter=_tracking_contract_metadata)
+    depth_pub = DepthTelemetryPublisher(
+        ws_server,
+        failure_callback=_ws_boundary_failed,
+    )
+    world_service = startup_transaction.acquire(
+        "canonical_world",
+        lambda: create_runtime_world_service(
+            runtime="ds8",
+            pipeline_config=pipeline.config,
+            camera_labels=camera_labels,
+            calibration_provider=calibration_provider,
+            repo_root=REPO_ROOT,
+        ),
+        lambda service: service.close(),
+    )
+    capability_monitor = create_runtime_capability_monitor(world_service)
+    from noesis.server import health_api
+
+    startup_transaction.bind(
+        "health_api_bindings",
+        lambda: health_api.register_capability_monitor_getter(
+            lambda: capability_monitor
+        ),
+        health_api.clear_runtime_bindings,
+    )
+
+    def _canonical_publication_failed(error: BaseException) -> None:
+        message = f"canonical_world_publication_failed:{type(error).__name__}:{error}"
+        if message not in pipeline.errors:
+            pipeline.errors.append(message)
+        runtime_state["pipeline_failed"] = True
+        shutdown_event.set()
+
+    from noesis.identity_v2_service import (
+        IdentityV2ConfigurationError,
+        create_identity_v2_service,
+    )
+    try:
+        identity_v2_service = create_identity_v2_service(
+            pipeline_config=pipeline.config,
+            pipeline_yaml_path=getattr(pipeline, "yaml_path", pipeline_path),
+            camera_labels=camera_labels,
+            repo_root=REPO_ROOT,
+            run_id=world_service.producer.run_id,
+        )
+    except IdentityV2ConfigurationError as exc:
+        logger.error("Identity-v2 startup validation failed: %s", exc)
+        return _abort_startup("identity_v2_configuration_invalid")
+    except Exception:
+        logger.exception("Identity-v2 startup failed")
+        return _abort_startup("identity_v2_startup_failed")
+    setattr(pipeline, "identity_v2_service", identity_v2_service)
+    if identity_v2_service is not None:
+        identity_v2_service = startup_transaction.acquire(
+            "identity_v2",
+            lambda: identity_v2_service,
+            lambda service: service.close(),
+        )
+
+    def _identity_v2_failed(error: BaseException) -> None:
+        message = f"identity_v2_failed:{type(error).__name__}:{error}"
+        if message not in pipeline.errors:
+            pipeline.errors.append(message)
+        runtime_state["pipeline_failed"] = True
+        shutdown_event.set()
+
+    setattr(pipeline, "identity_v2_failure_callback", _identity_v2_failed)
+    from noesis.server import reid_v2_api
+
+    startup_transaction.bind(
+        "identity_v2_api_bindings",
+        lambda: (
+            reid_v2_api.register_identity_v2_runtime_getter(
+                lambda: (
+                    identity_v2_service.runtime
+                    if identity_v2_service is not None
+                    else None
+                )
+            ),
+            reid_v2_api.register_identity_v2_service_getter(
+                lambda: identity_v2_service
+            ),
+        ),
+        reid_v2_api.clear_identity_v2_bindings,
+    )
+    if identity_v2_service is None:
+        logger.info("Identity-v2 runtime disabled")
+    else:
+        logger.info(
+            "Identity-v2 runtime ready: mode=%s run_id=%s model_sha256=%s layer=%s dim=%d scoring=%s",
+            identity_v2_service.mode.value,
+            identity_v2_service.run_id,
+            identity_v2_service.model_fingerprint,
+            identity_v2_service.model_layer,
+            identity_v2_service.embedding_dim,
+            identity_v2_service.runtime.scoring_calibration_status,
+        )
+
+    tracking_pub = TrackingTelemetryPublisher(
+        ws_server,
+        metadata_getter=_tracking_contract_metadata,
+        world_service=world_service,
+        health_monitor=capability_monitor,
+        failure_callback=_canonical_publication_failed,
+    )
+    logger.info("Canonical world service ready: run_id=%s", world_service.producer.run_id)
     diagnostics_logger = TrackingDiagnosticsLogger.from_env()
     if diagnostics_logger:
+        diagnostics_logger = startup_transaction.acquire(
+            "tracking_diagnostics",
+            lambda: diagnostics_logger,
+            lambda diagnostics: diagnostics.close(),
+        )
         logger.info("V3DT diagnostics logging enabled: %s", diagnostics_logger.output_path)
+
+    def _close_startup_mapanything_processor() -> None:
+        processor = getattr(pipeline, "mapanything_processor", None)
+        if processor is not None:
+            processor.shutdown(wait=True, timeout_s=5.0)
 
     # Attach MapAnything postprocess only if SGIE is present/enabled
     try:
@@ -4382,20 +4160,53 @@ def main() -> int:
         if not ma_post_enabled:
             logger.info("MapAnything postprocess disabled (NOESIS_MAPANYTHING_POSTPROCESS_ENABLED=%s)", env_ma_post)
         elif ma_enabled and "mapanything_fullframe" in pipeline.components:
-            hooks.attach_mapanything_postprocess_hook(
+            def _install_mapanything_processor() -> Any:
+                hooks.attach_mapanything_postprocess_hook(
+                    pipeline,
+                    storage=storage_manager,
+                    depth_pub=depth_pub,
+                    camera_labels=camera_labels,
+                    failure_callback=_mapanything_failed,
+                )
+                processor = getattr(pipeline, "mapanything_processor", None)
+                if processor is None:
+                    raise RuntimeError(
+                        "MapAnything hook did not publish its owned processor"
+                    )
+                return processor
+
+            mapanything_processor = startup_transaction.bind(
+                "mapanything_processor",
+                _install_mapanything_processor,
+                _close_startup_mapanything_processor,
+            )
+            capture_event_controller = CaptureEventController(
+                aliases=capture_camera_aliases,
+                storage=DepthStorageCaptureEventAdapter(storage_manager),
+                mapanything=mapanything_processor,
+                set_depth_gate=pipeline.mark_depth_enabled,
+                depth_gate_is_open=lambda: bool(pipeline.depth_enabled),
+                burst_waiter=shutdown_event.wait,
+                stop_requested=shutdown_event.is_set,
+            )
+            setattr(
                 pipeline,
-                storage=storage_manager,
-                depth_pub=depth_pub,
-                camera_labels=camera_labels,
+                "capture_event_controller",
+                capture_event_controller,
             )
         else:
             logger.info("SGIE disabled or missing; skipping MapAnything postprocess hook")
-    except Exception:
+    except StartupResourceRegistrationError:
+        raise
+    except Exception as exc:
         logger.exception("Error while evaluating MapAnything postprocess attachment")
+        _mapanything_failed(exc)
+        return _abort_startup("mapanything_hook_failed")
     try:
         hooks.attach_pose_feature_hook(pipeline, camera_labels=camera_labels)
     except Exception:
         logger.exception("Error while attaching pose feature hook")
+        return _abort_startup("pose_feature_hook_failed")
     if tracking_mode == "baseline":
         try:
             hooks.attach_object_depth_fusion_hook(
@@ -4406,7 +4217,7 @@ def main() -> int:
             )
         except Exception:
             logger.exception("Baseline tracking requires the DAv2 object-depth fusion hook")
-            return 1
+            return _abort_startup("object_depth_fusion_hook_failed")
     hooks.attach_analytics_telemetry_hook(
         pipeline,
         tracking_pub=tracking_pub,
@@ -4417,7 +4228,6 @@ def main() -> int:
         depth_registration=depth_registration_manager,
         diagnostics_logger=diagnostics_logger,
     )
-    hooks.attach_exclude_prune_hook(pipeline)
     hooks.attach_analytics_reload_bridge(pipeline)
 
     # Wire pyservicemaker Pipeline messages into our logger + shutdown handling.
@@ -4433,145 +4243,211 @@ def main() -> int:
         except Exception:
             logger.exception("Error in pyservicemaker message callback")
 
+    if shutdown_event.is_set():
+        return _abort_startup("shutdown_requested_before_prepare")
     logger.info("Preparing DS8 pipeline")
     if not ds8_pipeline.prepare(on_message=_psm_message_cb):
         logger.error("DS8 pipeline preparation failed: %s", pipeline.errors)
-        return 1
+        return _abort_startup("pipeline_prepare_failed")
+    startup_transaction.mark_prepared()
+    if shutdown_event.is_set():
+        return _abort_startup("shutdown_requested_after_prepare")
 
-    ws_thread, ws_loop = _start_websocket_server(ws_server)
-    if getattr(ws_server, "server", None) is None:
-        ws_bind_retry_raw = os.environ.get("NOESIS_WS_BIND_RETRY_TRIES", "4")
-        try:
-            ws_bind_retry_tries = max(0, int(str(ws_bind_retry_raw).strip() or "4"))
-        except Exception:
-            ws_bind_retry_tries = 4
-        for retry_idx in range(ws_bind_retry_tries):
-            next_port = _select_ws_port(args.ws_host, int(args.ws_port) + 1, 32, logger)
-            if next_port == int(args.ws_port):
-                break
-            if not _port_bindable(args.ws_host, int(next_port)):
-                logger.error(
-                    "No bindable WebSocket fallback port available starting at %s",
-                    int(args.ws_port) + 1,
-                )
-                break
-            args.ws_port = int(next_port)
-            os.environ["NOESIS_WS_PORT"] = str(int(args.ws_port))
-            ws_server.port = int(args.ws_port)
-            logger.warning(
-                "Retrying WebSocket server start on fallback port %s (attempt %s/%s)",
-                args.ws_port,
-                retry_idx + 1,
-                ws_bind_retry_tries,
+    try:
+        ws_thread, ws_loop = _start_websocket_server(ws_server)
+    except WebSocketStartupError as exc:
+        if not exc.receipt.quiesced:
+            logger.critical(
+                "WebSocket startup cleanup was not proven; refusing normal return"
             )
-            ws_thread, ws_loop = _start_websocket_server(ws_server)
-            if getattr(ws_server, "server", None) is not None:
-                break
-        if getattr(ws_server, "server", None) is None:
-            logger.error("WebSocket server failed to start after retries; aborting DS8 runtime")
-            return 1
+            runtime_state["pipeline_failed"] = True
+            _arm_shutdown_watchdog()
+            while True:
+                signal.pause()
+        logger.error("WebSocket server failed bounded startup: %s", exc)
+        return _abort_startup("websocket_startup_failed")
+    ws_owner = (ws_thread, ws_loop)
+    startup_transaction.acquire(
+        "websocket_listener",
+        lambda: ws_owner,
+        lambda owner: _stop_websocket_server(ws_server, owner[0], owner[1]),
+        ingress=True,
+    )
+    if getattr(ws_server, "server", None) is None:
+        logger.error(
+            "WebSocket server failed to bind required endpoint %s:%s; aborting DS8 runtime",
+            args.ws_host,
+            args.ws_port,
+        )
+        return _abort_startup("websocket_listener_missing")
+    if shutdown_event.is_set():
+        return _abort_startup("shutdown_requested_before_activation")
 
     # Activate the DS8 pipeline after prepare() using activate() not start()
     # NOTE: We use activate() because prepare() was already called above.
     # Using start() after prepare() causes "Tried to add new watch while one was already there"
     # because start() internally calls prepare() + sets bus watch, conflicting with existing watch.
+    try:
+        startup_transaction.bind(
+            "servicemaker_stdin_keepalive",
+            lambda: _install_servicemaker_stdin_keepalive(logger),
+            _close_servicemaker_stdin_keepalive,
+        )
+    except StartupResourceRegistrationError:
+        raise
+    except Exception:
+        logger.exception("Failed to establish Service Maker stdin lifecycle contract")
+        return _abort_startup("servicemaker_stdin_contract_failed")
+    if shutdown_event.is_set():
+        return _abort_startup("shutdown_requested_before_activation")
+    startup_transaction.mark_activation_attempted()
     if not ds8_pipeline.activate():
         logger.error("DS8 pipeline activation failed: %s", pipeline.errors)
-        return 1
+        _abort_ambiguous_and_wait("pipeline_activation_failed")
     ds = getattr(pipeline, "ds_pipeline", None)
     if ds is None:
         logger.error("DS8 pipeline activated but ds_pipeline is missing")
-        return 1
+        _abort_ambiguous_and_wait("activated_pipeline_owner_missing")
     logger.info("DS8 pipeline activated successfully")
 
     # Start pyservicemaker wait loop to keep pipeline alive and processing events
     # This is critical - without wait(), the pipeline may stop after initial buffers
     wait_thread = _start_pyservicemaker_wait_loop(ds, shutdown_event, logger, runtime_state)
+    try:
+        startup_transaction.claim_wait_owner(wait_thread)
+    except StartupOwnershipAmbiguous as exc:
+        logger.critical("Service Maker wait ownership was not proven")
+        _preserve_ambiguous_and_wait("servicemaker_wait_owner_missing", exc)
+    startup_transaction.handoff_to_runtime()
+    startup_main_guard.disarm()
 
-    # Start WebRTC gateway(s) if enabled (requires RTSP output)
-    webrtc_gateways = []
-    if mosaic_webrtc_enabled:
-        if rtsp_built:
+    try:
+        hooks.verify_analytics_exclusion_initial_receipt(
+            pipeline,
+            analytics_startup_reload_context,
+        )
+    except Exception:
+        logger.exception("Native analytics exclusion startup receipt validation failed")
+        runtime_state["pipeline_failed"] = True
+        shutdown_event.set()
+
+    # Start WebRTC gateway(s) if enabled (consumes encoded AUs via SHM bridge).
+    mosaic_h264_feeder = None
+    if mosaic_webrtc_enabled and not shutdown_event.is_set():
+        if not mosaic_shm_built:
+            logger.error(
+                "WebRTC gateway enabled but mosaic H.264 SHM sink was not built; cannot start gateway"
+            )
+            runtime_state["pipeline_failed"] = True
+            shutdown_event.set()
+        else:
             try:
-                ready = _wait_for_rtsp_ready("127.0.0.1", rtsp_port, timeout=15.0, interval=0.2)
-                if not ready:
-                    logger.error("RTSP sink not ready on 127.0.0.1:%s; skipping WebRTC gateway start", rtsp_port)
-                    #region agent log
-                    try:
-                        with open("/home/mayor/Noesis_Devel/.cursor/debug.log", "a", encoding="utf-8") as _f:
-                            _f.write(
-                                json.dumps(
-                                    {
-                                        "sessionId": "debug-session",
-                                        "runId": "run1",
-                                        "hypothesisId": "H2",
-                                        "location": "ds8_runtime.py:main",
-                                        "message": "gateway skipped - rtsp not ready",
-                                        "data": {"host": "127.0.0.1", "port": rtsp_port},
-                                        "timestamp": int(time.time() * 1000),
-                                    }
-                                )
-                                + "\n"
-                            )
-                    except Exception:
-                        pass
-                    #endregion
-                else:
-                    from noesis.mosaic_webrtc_gateway import MosaicWebRTCGateway
+                from noesis.mosaic_h264_bridge import MosaicH264ShmFeeder
+                from noesis.mosaic_webrtc_gateway import MosaicWebRTCGateway
 
-                    rtsp_uri = f"rtsp://127.0.0.1:{rtsp_port}/{rtsp_path}"
-                    try:
-                        max_webrtc_clients = max(1, int(os.environ.get("NOESIS_MOSAIC_WEBRTC_MAX_CLIENTS", "5")))
-                    except Exception:
-                        max_webrtc_clients = 5
-                    rtsp_keyframe_requester = _build_rtsp_keyframe_requester(pipeline, logger)
-                    if rtsp_keyframe_requester is None:
-                        logger.debug("RTSP keyframe requester unavailable; falling back to natural IDR cadence")
-                    for slot in range(max_webrtc_clients):
-                        try:
-                            gateway = MosaicWebRTCGateway(
-                                ws_server=ws_server,
-                                rtsp_uri=rtsp_uri,
-                                request_rtsp_keyframe=rtsp_keyframe_requester,
-                            )
-                            gateway.start()
-                            webrtc_gateways.append(gateway)
-                            logger.info(
-                                "WebRTC gateway slot %d/%d started, consuming RTSP at %s",
-                                slot + 1,
-                                max_webrtc_clients,
-                                rtsp_uri,
-                            )
-                        except Exception:
-                            logger.exception("Failed to start WebRTC gateway slot %d", slot + 1)
-                    logger.info(
-                        "WebRTC gateway capacity: %d active slot(s)",
-                        len(webrtc_gateways),
+                try:
+                    max_webrtc_clients = max(
+                        1, int(os.environ.get("NOESIS_MOSAIC_WEBRTC_MAX_CLIENTS", "5"))
                     )
-                    #region agent log
+                except Exception:
+                    max_webrtc_clients = 5
+                try:
+                    initial_webrtc_clients = max(
+                        0,
+                        int(os.environ.get("NOESIS_MOSAIC_WEBRTC_INITIAL_CLIENTS", "1")),
+                    )
+                except Exception:
+                    initial_webrtc_clients = 1
+                initial_webrtc_clients = min(initial_webrtc_clients, max_webrtc_clients)
+
+                def _keyframe_failed(error: BaseException) -> None:
+                    message = f"mosaic_force_idr_failed:{type(error).__name__}:{error}"
+                    if message not in pipeline.errors:
+                        pipeline.errors.append(message)
+                    runtime_state["pipeline_failed"] = True
+                    shutdown_event.set()
+
+                def _mosaic_transport_failed(error: BaseException) -> None:
+                    message = (
+                        "mosaic_h264_shm_failed:"
+                        f"{type(error).__name__}:{error}"
+                    )
+                    if message not in pipeline.errors:
+                        pipeline.errors.append(message)
+                    runtime_state["pipeline_failed"] = True
+                    shutdown_event.set()
+
+                keyframe_requester = _build_mosaic_keyframe_requester(
+                    pipeline,
+                    logger,
+                    failure_callback=_keyframe_failed,
+                )
+                if keyframe_requester is None:
+                    raise RuntimeError(
+                        "WebRTC late-viewer support requires a mosaic force-IDR requester"
+                    )
+
+                mosaic_h264_feeder = MosaicH264ShmFeeder(
+                    mosaic_h264_shm_socket,
+                    request_keyframe=keyframe_requester,
+                    on_fatal_error=_mosaic_transport_failed,
+                )
+                mosaic_h264_feeder.start()
+                logger.info(
+                    "Mosaic H.264 SHM feeder started at %s",
+                    mosaic_h264_shm_socket,
+                )
+
+                def _create_mosaic_gateway() -> MosaicWebRTCGateway:
+                    gateway = MosaicWebRTCGateway(
+                        ws_server=ws_server,
+                        h264_feeder=mosaic_h264_feeder,
+                        request_keyframe=keyframe_requester,
+                    )
                     try:
-                        with open("/home/mayor/Noesis_Devel/.cursor/debug.log", "a", encoding="utf-8") as _f:
-                            _f.write(
-                                json.dumps(
-                                    {
-                                        "sessionId": "debug-session",
-                                        "runId": "run1",
-                                        "hypothesisId": "H4",
-                                        "location": "ds8_runtime.py:main",
-                                        "message": "gateway started",
-                                        "data": {"rtsp_uri": rtsp_uri, "slots": len(webrtc_gateways)},
-                                        "timestamp": int(time.time() * 1000),
-                                    }
-                                )
-                                + "\n"
-                            )
+                        gateway.start()
                     except Exception:
-                        pass
-                    #endregion
+                        try:
+                            gateway.stop()
+                        except Exception:
+                            logger.exception(
+                                "Partially started WebRTC gateway did not quiesce"
+                            )
+                        raise
+                    logger.info("WebRTC gateway started (H.264 AU feeder)")
+                    return gateway
+
+                ws_server.register_webrtc_gateway_factory(
+                    _create_mosaic_gateway,
+                    max_clients=max_webrtc_clients,
+                    initial_clients=initial_webrtc_clients,
+                )
+                for slot in range(initial_webrtc_clients):
+                    gateway = None
+                    try:
+                        gateway = _create_mosaic_gateway()
+                        ws_server.register_webrtc_gateway(gateway)
+                    except Exception:
+                        if gateway is not None:
+                            try:
+                                gateway.stop()
+                            except Exception:
+                                logger.exception(
+                                    "Unregistered WebRTC gateway slot %d did not stop",
+                                    slot + 1,
+                                )
+                        logger.exception("Failed to start WebRTC gateway slot %d", slot + 1)
+                        runtime_state["pipeline_failed"] = True
+                        shutdown_event.set()
+                logger.info(
+                    "WebRTC gateway capacity: %d max, %d warm slot(s)",
+                    max_webrtc_clients,
+                    len(ws_server.webrtc_gateways),
+                )
             except Exception:
                 logger.exception("Failed to start WebRTC gateway")
-        else:
-            logger.error("WebRTC gateway enabled but RTSP branch was not built; cannot start gateway")
+                runtime_state["pipeline_failed"] = True
+                shutdown_event.set()
 
     depth_branch_present = bool(pipeline.depth_gate_attach and pipeline.depth_gate_attach in pipeline.components)
     if args.depth_enable_seconds > 0:
@@ -4584,61 +4460,66 @@ def main() -> int:
                 )
             except Exception:
                 logger.exception("Failed to enable depth burst on startup")
+                runtime_state["pipeline_failed"] = True
+                shutdown_event.set()
         else:
-            logger.info(
-                "Depth startup enable skipped (no MapAnything branch present)"
-            )
+            logger.error("Requested startup depth burst but no MapAnything branch is present")
+            runtime_state["pipeline_failed"] = True
+            shutdown_event.set()
     if not getattr(pipeline, "activated", False):
         logger.warning("DS8 pipeline not activated; check pipeline.errors for details: %s", pipeline.errors)
 
     rest_server = None
     rest_thread = None
 
-    if args.enable_rest:
+    if args.enable_rest and not shutdown_event.is_set():
         try:
-            from noesis.server import analytics_api
-
-            analytics_cfg_path = REPO_ROOT / "config" / "nvdsanalytics.yaml"
-            os.environ.setdefault(analytics_api.ANALYTICS_CONFIG_ENV, str(analytics_cfg_path))
-        except Exception:
-            pass
-        rest_app = _build_rest_app()
-        rest_server, rest_thread = _start_rest_server(rest_app, args.rest_host, args.rest_port)
-        if rest_server:
+            rest_app = _build_rest_app()
+            depth_controller = getattr(
+                pipeline,
+                "capture_event_controller",
+                None,
+            )
+            if not isinstance(depth_controller, CaptureEventController):
+                raise RuntimeError(
+                    "capture-event depth controller is unavailable"
+                )
+            rest_app.state.depth_refresh_provider = (
+                depth_controller.start_refresh
+            )
+            rest_app.state.depth_storage = storage_manager
+            rest_server, rest_thread = _start_rest_server(rest_app, args.rest_host, args.rest_port)
             logger.info("REST server listening on http://%s:%s", args.rest_host, args.rest_port)
+        except RestStartupError as exc:
+            runtime_state["rest_startup_receipt"] = {
+                "cleanup_proven": exc.cleanup_proven,
+                "thread_alive": exc.thread.is_alive(),
+            }
+            if not exc.cleanup_proven:
+                logger.critical(
+                    "REST startup ownership is unresolved; preserving callback-owned "
+                    "resources until watchdog exit",
+                    exc_info=True,
+                )
+                runtime_state["pipeline_failed"] = True
+                _arm_shutdown_watchdog()
+                while True:
+                    signal.pause()
+            logger.exception("Required REST server failed bounded startup")
+            runtime_state["pipeline_failed"] = True
+            shutdown_event.set()
+        except Exception:
+            logger.exception("Required REST server failed to start")
+            runtime_state["pipeline_failed"] = True
+            shutdown_event.set()
 
-    # Re-assert SIGTERM default behavior after DS/GStreamer initialization.
+    # DeepStream dependencies may replace handlers during initialization.
     try:
-        signal.signal(signal.SIGTERM, signal.SIG_DFL)
+        signal.signal(signal.SIGTERM, _signal_handler)
     except Exception:
         pass
 
     logger.info("DS8 runtime is active. Press Ctrl+C to stop.")
-
-    # Spawn a heartbeat logger to confirm liveness while waiting/processing
-    def _heartbeat() -> None:
-        for i in range(6):
-            time.sleep(3)
-            try:
-                with open("/home/mayor/Noesis_Devel/.cursor/debug.log", "a", encoding="utf-8") as _f:
-                    _f.write(
-                        json.dumps(
-                            {
-                                "sessionId": "debug-session",
-                                "runId": "run1",
-                                "hypothesisId": "H1",
-                                "location": "ds8_runtime.py:main",
-                                "message": "heartbeat",
-                                "data": {"tick": i + 1},
-                                "timestamp": int(time.time() * 1000),
-                            }
-                        )
-                        + "\n"
-                    )
-            except Exception:
-                pass
-
-    threading.Thread(target=_heartbeat, name="DS8-Heartbeat", daemon=True).start()
     try:
         while not shutdown_event.is_set():
             time.sleep(0.5)
@@ -4646,64 +4527,375 @@ def main() -> int:
         shutdown_event.set()
 
     logger.info("Shutting down DS8 runtime")
-    try:
-        pipeline.mark_depth_enabled(False)
-    except Exception:
-        pass
+    _arm_shutdown_watchdog()
+    runtime_state["expected_eos"] = True
+    if wait_thread is None or wait_thread.is_alive():
+        runtime_state["pipeline_eos_reason"] = "shutdown_requested"
+
+    # Quiesce external request/consumer edges before touching native producers.
+    # The retained lock is intentionally not released: it is the shutdown lease
+    # that prevents a late REST worker from entering an analytics transaction.
+    rest_shutdown_receipt = _stop_rest_server(
+        rest_server,
+        rest_thread,
+        analytics_api._CONFIG_LOCK,  # type: ignore[attr-defined]
+    )
+    runtime_state["rest_shutdown_receipt"] = {
+        **rest_shutdown_receipt._asdict(),
+        "quiesced": rest_shutdown_receipt.quiesced,
+    }
+    if not rest_shutdown_receipt.quiesced:
+        runtime_state["pipeline_failed"] = True
+        logger.critical(
+            "REST/analytics quiescence was not proven "
+            "(rest_pair_consistent=%s stop_requested=%s server_thread_stopped=%s "
+            "analytics_transaction_lock_retained=%s); preserving callback-owned "
+            "native resources until watchdog exit",
+            rest_shutdown_receipt.rest_pair_consistent,
+            rest_shutdown_receipt.stop_requested,
+            rest_shutdown_receipt.server_thread_stopped,
+            rest_shutdown_receipt.analytics_transaction_lock_retained,
+        )
+        while True:
+            signal.pause()
 
     try:
-        storage_manager.flush(timeout=5.0)
-    except Exception:
-        pass
-    try:
-        storage_manager.shutdown(wait=True)
-    except Exception:
-        pass
-    try:
-        if diagnostics_logger is not None:
-            diagnostics_logger.close()
-    except Exception:
-        logger.exception("Error closing diagnostics logger")
+        stats_shutdown_receipt = ws_server.quiesce_stats_collector(
+            timeout_s=WebSocketServer.STATS_COLLECTOR_DRAIN_TIMEOUT_S
+        )
+    except Exception as exc:
+        failed_receipt = getattr(exc, "receipt", None)
+        if failed_receipt is not None and hasattr(failed_receipt, "_asdict"):
+            runtime_state["ws_stats_shutdown_receipt"] = {
+                **failed_receipt._asdict(),
+                "quiesced": False,
+            }
+        runtime_state["pipeline_failed"] = True
+        logger.critical(
+            "WebSocket stats collector did not quiesce; preserving native "
+            "resources until watchdog exit: %s",
+            exc,
+        )
+        while True:
+            signal.pause()
+    runtime_state["ws_stats_shutdown_receipt"] = {
+        **stats_shutdown_receipt._asdict(),
+        "quiesced": stats_shutdown_receipt.quiesced,
+    }
 
-    _stop_rest_server(rest_server, rest_thread)
+    try:
+        provider_shutdown_receipt = ws_server.quiesce_blocking_providers(
+            timeout_s=5.0
+        )
+    except Exception as exc:
+        failed_receipt = getattr(exc, "receipt", None)
+        if failed_receipt is not None and hasattr(failed_receipt, "_asdict"):
+            runtime_state["ws_provider_shutdown_receipt"] = {
+                **failed_receipt._asdict(),
+                "quiesced": False,
+            }
+        runtime_state["pipeline_failed"] = True
+        logger.critical(
+            "Blocking WebSocket providers did not quiesce; preserving native "
+            "and storage resources until watchdog exit: %s",
+            exc,
+        )
+        while True:
+            signal.pause()
+    runtime_state["ws_provider_shutdown_receipt"] = {
+        **provider_shutdown_receipt._asdict(),
+        "quiesced": provider_shutdown_receipt.quiesced,
+    }
 
-    # Stop WebRTC gateways if running
-    if webrtc_gateways:
-        for idx, gateway in enumerate(webrtc_gateways, start=1):
+    try:
+        detached_gateways = ws_server.begin_webrtc_shutdown(timeout_s=5.0)
+    except Exception:
+        runtime_state["pipeline_failed"] = True
+        logger.exception("WebRTC gateway admission/lifecycle drain failed")
+        while True:
+            signal.pause()
+
+    gateways_to_stop: List[Any] = []
+    for gateway in list(detached_gateways):
+        if gateway is not None and gateway not in gateways_to_stop:
+            gateways_to_stop.append(gateway)
+    gateways_quiesced = True
+    gateway_executor: Optional[concurrent.futures.ThreadPoolExecutor] = None
+    if gateways_to_stop:
+        gateway_executor = concurrent.futures.ThreadPoolExecutor(
+            max_workers=len(gateways_to_stop),
+            thread_name_prefix="NoesisWebRTCStop",
+        )
+        gateway_futures = {
+            gateway_executor.submit(gateway.stop): idx
+            for idx, gateway in enumerate(gateways_to_stop, start=1)
+        }
+        done, pending = concurrent.futures.wait(
+            gateway_futures,
+            timeout=WebSocketServer.WEBRTC_GATEWAY_DRAIN_TIMEOUT_S,
+        )
+        for future in done:
+            idx = gateway_futures[future]
             try:
-                gateway.stop()
+                future.result()
                 logger.info("WebRTC gateway slot %d stopped", idx)
             except Exception:
                 logger.exception("Error stopping WebRTC gateway slot %d", idx)
+                gateways_quiesced = False
+        if pending:
+            logger.error(
+                "WebRTC gateway slots exceeded concurrent drain timeout: %s",
+                sorted(gateway_futures[future] for future in pending),
+            )
+            gateways_quiesced = False
+        gateway_executor.shutdown(
+            wait=not pending,
+            cancel_futures=False,
+        )
+    if not gateways_quiesced:
+        runtime_state["pipeline_failed"] = True
 
-    # Stop pyservicemaker pipeline and wait thread
-    if ds is not None:
-        stop_done = threading.Event()
+    if not gateways_quiesced:
+        logger.critical(
+            "WebRTC gateways did not quiesce; preserving native resources "
+            "until watchdog exit"
+        )
+        while True:
+            signal.pause()
 
-        def _stop_psm() -> None:
-            try:
-                ds.stop()
-                logger.info("pyservicemaker pipeline stopped")
-            except Exception:
-                logger.exception("Error stopping pyservicemaker pipeline")
-            finally:
-                stop_done.set()
+    if mosaic_h264_feeder is not None:
+        try:
+            mosaic_h264_feeder.stop()
+            logger.info("Mosaic H.264 SHM feeder stopped")
+        except Exception:
+            runtime_state["pipeline_failed"] = True
+            logger.exception("Failed to stop mosaic H.264 SHM feeder")
+            while True:
+                signal.pause()
 
-        threading.Thread(target=_stop_psm, name="DS8-StopPipeline", daemon=True).start()
-        if not stop_done.wait(timeout=5.0):
-            logger.warning("pyservicemaker pipeline stop timed out; continuing shutdown")
+    ws_server.webrtc_activity_callback = None
 
+    try:
+        _stop_websocket_server(ws_server, ws_thread, ws_loop)
+    except Exception:
+        runtime_state["pipeline_failed"] = True
+        logger.exception("WebSocket listener/worker quiescence failed")
+        while True:
+            signal.pause()
+    runtime_state["websocket_shutdown_quiesced"] = True
+
+    try:
+        pipeline.cancel_control_timers()
+        pipeline.mark_depth_enabled(False)
+    except Exception:
+        logger.exception("Failed to quiesce pipeline control timers")
+        runtime_state["pipeline_failed"] = True
+        while True:
+            signal.pause()
+
+    # The live-source reconnect probe inside nvurisrcbin intentionally drops
+    # pipeline-level EOS.  Request EOS from the repo-owned bridge immediately
+    # downstream of streammux; it emits asynchronously after Service Maker has
+    # released setter locks.  Require its exact bounded acknowledgement, the
+    # pipeline EOS callback, and wait-thread completion before releasing any
+    # callback-owned resources.
+    wait_was_alive = bool(wait_thread is not None and wait_thread.is_alive())
+    eos_accepted = False
+    if wait_was_alive:
+        try:
+            logger.info("Orderly pipeline EOS request initiated")
+            eos_evidence = request_orderly_eos(pipeline)
+            eos_accepted = True
+            logger.info(
+                "Orderly pipeline EOS accepted: component=%s request_sequence=%d",
+                eos_evidence.component_name,
+                eos_evidence.request_sequence,
+            )
+        except OrderlyEosError:
+            logger.exception("Orderly pipeline EOS request failed")
+            runtime_state["pipeline_failed"] = True
+    else:
+        eos_accepted = bool(runtime_state.get("pipeline_eos_seen"))
+
+    wait_completed = wait_thread is not None and not wait_thread.is_alive()
     if wait_thread is not None and wait_thread.is_alive():
         try:
-            wait_thread.join(timeout=3.0)
-            if wait_thread.is_alive():
-                logger.warning("Wait thread did not terminate cleanly")
+            wait_thread.join(timeout=15.0)
+            wait_completed = not wait_thread.is_alive()
+            if not wait_completed:
+                logger.error("pyservicemaker wait thread did not terminate")
         except Exception:
+            wait_completed = False
             logger.exception("Error joining wait thread")
 
-    _stop_websocket_server(ws_server, ws_thread, ws_loop)
+    eos_seen = bool(runtime_state.get("pipeline_eos_seen"))
+    wait_failed = bool(runtime_state.get("wait_failed"))
+    pipeline_quiesced = bool(
+        eos_accepted and eos_seen and wait_completed and not wait_failed
+    )
+    if not pipeline_quiesced:
+        runtime_state["pipeline_failed"] = True
+        logger.error(
+            "Pipeline quiescence was not proven "
+            "(eos_accepted=%s eos_seen=%s wait_completed=%s wait_failed=%s); "
+            "preserving callback-owned resources until watchdog exit",
+            eos_accepted,
+            eos_seen,
+            wait_completed,
+            wait_failed,
+        )
+    else:
+        mapanything_processor = getattr(pipeline, "mapanything_processor", None)
+        mapanything_quiesced = mapanything_processor is None
+        if mapanything_processor is not None:
+            try:
+                shutdown_mapanything = getattr(mapanything_processor, "shutdown", None)
+                if not callable(shutdown_mapanything):
+                    raise RuntimeError(
+                        "MapAnything processor has no owned shutdown contract"
+                    )
+                shutdown_mapanything(wait=True, timeout_s=5.0)
+                mapanything_quiesced = True
+            except Exception:
+                runtime_state["pipeline_failed"] = True
+                logger.exception("MapAnything postprocess shutdown failed")
+                quiescence_check = getattr(
+                    mapanything_processor,
+                    "async_shutdown_quiesced",
+                    None,
+                )
+                try:
+                    mapanything_quiesced = bool(
+                        callable(quiescence_check) and quiescence_check()
+                    )
+                except Exception:
+                    logger.exception(
+                        "MapAnything postprocess quiescence proof failed"
+                    )
+                    mapanything_quiesced = False
+        runtime_state["mapanything_shutdown_receipt"] = {
+            "present": mapanything_processor is not None,
+            "quiesced": mapanything_quiesced,
+        }
+        if not mapanything_quiesced:
+            logger.critical(
+                "MapAnything worker ownership remains unresolved; preserving "
+                "storage and callback resources until watchdog exit"
+            )
+            while True:
+                signal.pause()
 
-    logger.info("Shutdown complete")
+        runtime_finalization_failures: list[dict[str, str]] = []
+
+        def _record_finalization_failure(
+            name: str,
+            error: BaseException,
+        ) -> None:
+            runtime_state["pipeline_failed"] = True
+            runtime_finalization_failures.append(
+                {
+                    "name": str(name),
+                    "error_type": type(error).__name__,
+                }
+            )
+
+        try:
+            _close_servicemaker_stdin_keepalive()
+        except BaseException as exc:
+            logger.exception("Service Maker stdin ownership did not close")
+            _record_finalization_failure("servicemaker_stdin_keepalive", exc)
+
+        try:
+            mgr = getattr(pipeline, "stable_id_mgr", None)
+            if mgr is not None and getattr(mgr, "gallery_persist_file", None):
+                if not mgr.save_gallery():
+                    raise RuntimeError("StableID gallery save returned false")
+                logger.info(
+                    "StableID gallery persisted to %s",
+                    mgr.gallery_persist_file,
+                )
+        except BaseException as exc:
+            logger.exception("Error persisting StableID gallery")
+            _record_finalization_failure("stable_id_gallery", exc)
+
+        try:
+            identity_v2_service = getattr(pipeline, "identity_v2_service", None)
+            if identity_v2_service is not None:
+                identity_v2_service.close()
+        except BaseException as exc:
+            logger.exception("Failed to close identity-v2 store")
+            _record_finalization_failure("identity_v2", exc)
+
+        try:
+            world_service.close()
+        except BaseException as exc:
+            logger.exception("Failed to flush canonical world journal")
+            _record_finalization_failure("canonical_world", exc)
+
+        try:
+            storage_shutdown_receipt = close_depth_storage(
+                storage_manager,
+                timeout_s=5.0,
+            )
+            runtime_state["depth_storage_shutdown_receipt"] = storage_close_evidence(
+                storage_shutdown_receipt
+            )
+        except BaseException as exc:
+            logger.exception("Depth storage ownership did not quiesce")
+            _record_finalization_failure("depth_storage", exc)
+
+        try:
+            if diagnostics_logger is not None:
+                diagnostics_logger.close()
+        except BaseException as exc:
+            logger.exception("Error closing diagnostics logger")
+            _record_finalization_failure("tracking_diagnostics", exc)
+
+        for binding_name, clear_binding in (
+            ("analytics_runtime_hooks", analytics_api.clear_runtime_hooks),
+            ("reid_api_binding", reid_api.clear_reid_manager_getter),
+            ("identity_v2_api_bindings", reid_v2_api.clear_identity_v2_bindings),
+            ("health_api_bindings", health_api.clear_runtime_bindings),
+        ):
+            try:
+                clear_binding()
+            except BaseException as exc:
+                logger.exception("Runtime binding cleanup failed: %s", binding_name)
+                _record_finalization_failure(binding_name, exc)
+
+        if not runtime_finalization_failures:
+            try:
+                startup_transaction.mark_quiesced()
+            except BaseException as exc:
+                logger.exception("Runtime ownership finalization failed")
+                _record_finalization_failure("startup_transaction", exc)
+
+        runtime_state["runtime_finalization_failures"] = list(
+            runtime_finalization_failures
+        )
+        if runtime_finalization_failures:
+            logger.critical(
+                "Runtime finalization was not proven; waiting for shutdown watchdog: %s",
+                [row["name"] for row in runtime_finalization_failures],
+            )
+            while True:
+                signal.pause()
+
+        try:
+            signal.alarm(0)
+        except BaseException as exc:
+            logger.exception("Shutdown watchdog cancellation failed")
+            _record_finalization_failure("shutdown_watchdog", exc)
+            runtime_state["runtime_finalization_failures"] = list(
+                runtime_finalization_failures
+            )
+            while True:
+                signal.pause()
+        logger.info("Shutdown complete")
+    if not pipeline_quiesced:
+        logger.critical("Native pipeline teardown failed; waiting for shutdown watchdog")
+        while True:
+            signal.pause()
     fatal_errors: List[Any] = []
     try:
         for err in getattr(pipeline, "errors", []) or []:
@@ -4717,6 +4909,11 @@ def main() -> int:
     if runtime_state.get("pipeline_failed") or fatal_errors:
         exit_code = 1
     return exit_code
+
+
+def main() -> int:
+    startup_main_guard = StartupMainGuard()
+    return startup_main_guard.run(lambda: _run_main(startup_main_guard))
 
 
 if __name__ == "__main__":

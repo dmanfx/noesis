@@ -49,7 +49,6 @@ export type LoadedDepthBulkSnapshot = {
   mask: Uint8Array;
   rgb?: Uint8Array;
   rgbShape?: [number, number, number];
-  rgbComponentSha256?: string;
   normals: Float32Array;
   normalsShape: [number, number, number];
   surfaceNormals?: Int8Array;

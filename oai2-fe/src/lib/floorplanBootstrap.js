@@ -14,10 +14,8 @@ const responseError = (payload) => String(payload?.error || '').trim();
 
 /**
  * Coordinates the dashboard's floorplan bootstrap without owning transport.
- * Bootstrap is deliberately cache-only. A cache miss is terminal for that
- * camera and never escalates into inference; only an explicit user refresh may
- * start a fresh depth/floorplan sequence. At most one cache request is active
- * across all cameras.
+ * Bootstrap is strictly cache-only. Missing views remain absent until the
+ * operator explicitly requests a fresh depth-panel capture.
  */
 export class FloorplanBootstrapCoordinator {
   constructor({
@@ -38,7 +36,7 @@ export class FloorplanBootstrapCoordinator {
   restart(cameras) {
     const normalized = uniqueCameraIds(cameras);
     if (this.active) {
-      // Coalesce reconnect/calibration churn. The active backend request cannot
+      // Coalesce reconnect/calibration churn. The active backend capture cannot
       // be cancelled, so finish it before starting the newest requested run.
       this.pendingRestart = normalized;
       return null;
@@ -69,18 +67,15 @@ export class FloorplanBootstrapCoordinator {
       return this.finishCamera({ completedCamera: active.camera });
     }
 
-    if (error === 'no_cached_floorplan') {
-      return this.finishCamera({
-        failedCamera: active.camera,
-        error,
-      });
+    if (active.phase === 'cache' && error === 'no_cached_floorplan') {
+      return this.finishCamera({ completedCamera: active.camera });
     }
 
     if (TRANSIENT_ERRORS.has(error) && active.retryCount < this.maxTransientRetries) {
       const retryCount = active.retryCount + 1;
       return {
         handled: true,
-        action: this.activate(active.camera, retryCount, this.retryDelayMs),
+        action: this.activate(active.camera, active.phase, retryCount, this.retryDelayMs),
       };
     }
 
@@ -96,6 +91,7 @@ export class FloorplanBootstrapCoordinator {
       queue: [...this.queue],
       active: this.active ? {
         camera: this.active.camera,
+        phase: this.active.phase,
         retryCount: this.active.retryCount,
         requestId: this.active.request.requestId,
       } : null,
@@ -117,26 +113,26 @@ export class FloorplanBootstrapCoordinator {
       this.active = null;
       return null;
     }
-    return this.activate(camera, 0, 0);
+    return this.activate(camera, 'cache', 0, 0);
   }
 
-  activate(camera, retryCount, delayMs) {
+  activate(camera, phase, retryCount, delayMs) {
     const requestId = [
       this.requestIdPrefix,
       this.run,
       ++this.sequence,
-      'cache',
+      phase,
       camera,
     ].join('-');
     const request = {
       camera,
       requestId,
-      maxAgeSec: 600,
+      maxAgeSec: phase === 'cache' ? 600 : 0,
       gridResM: 0.04,
       maxExtentM: 20,
-      cacheOnly: true,
+      cacheOnly: phase === 'cache',
     };
-    this.active = { camera, retryCount, request };
+    this.active = { camera, phase, retryCount, request };
     return { request, delayMs };
   }
 

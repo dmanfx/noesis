@@ -173,3 +173,19 @@ test('heightfield downsampling places odd source blocks at their metric centroid
       - (bounds.max_z - (((sourceRow0 + sourceRow1) * 0.5) * sourceDz)),
   ) < 1e-6);
 });
+
+test('heightfield presentation cutoff leaves overhead cells open', () => {
+  const model = buildMaskedHeightfield({
+    heightValues: Float32Array.from([0.4, 2.1, 0.7, 2.2]),
+    densityValues: Float32Array.from([1, 1, 1, 1]),
+    rows: 2,
+    cols: 2,
+    maxVisibleHeightM: 1.95,
+  });
+
+  assert.ok(model);
+  assert.deepEqual(Array.from(model.observed), [1, 0, 1, 0]);
+  assert.equal(model.observedCount, 2);
+  assert.equal(model.triangleCount, 0);
+  assert.ok(Math.abs(model.maxHeightM - 0.7) < 1e-6);
+});

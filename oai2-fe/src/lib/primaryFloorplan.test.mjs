@@ -8,23 +8,16 @@ const source = async (relativeUrl) => readFile(
   'utf8',
 );
 
-test('primary floorplan is observed scalar height with a clean Inferno render', async () => {
+test('primary floorplan is the observed texture-first metric orthophoto', async () => {
   const drawer = await source('../components/DepthDrawer.tsx');
 
-  assert.match(drawer, /const HEIGHT_CONTRAST_PCT_LO = 3;/);
-  assert.match(drawer, /const HEIGHT_CONTRAST_PCT_HI = 97;/);
-  assert.match(drawer, /const HEIGHT_CONTRAST_GAMMA = 0\.9;/);
   assert.match(
     drawer,
-    /const primaryFloorplanLayer = heightLayer\?\.grid_b64 && heightLayer\.grid_shape\s*\? heightLayer\s*: heightAglLayer;/,
-  );
-  assert.match(
-    drawer,
-    /renderLayerToCanvas\(\s*floorplanCompositeCanvasRef\.current,\s*primaryFloorplanLayer,\s*infernoColor,/,
+    /renderTextureFloorplanToCanvas\(\s*floorplanCompositeCanvasRef\.current,\s*structuralHeightLayer,\s*roomFootprintLayer,\s*measuredPerimeterLayer,\s*surfaceRgbLayer,/,
   );
 
   const primaryStart = drawer.indexOf(
-    'renderLayerToCanvas(\n          floorplanCompositeCanvasRef.current',
+    'renderTextureFloorplanToCanvas(\n          floorplanCompositeCanvasRef.current',
   );
   const structuralStart = drawer.indexOf(
     'renderStructuralFloorplanToCanvas(',
@@ -33,36 +26,58 @@ test('primary floorplan is observed scalar height with a clean Inferno render', 
   assert.ok(primaryStart >= 0 && structuralStart > primaryStart);
   const primaryRender = drawer.slice(primaryStart, structuralStart);
 
-  assert.match(primaryRender, /maskLayer: renderObservationMaskLayer/);
-  assert.match(primaryRender, /maskInvert: renderObservationMaskInvert/);
-  assert.match(primaryRender, /unknownColor: PRIMARY_FLOORPLAN_UNKNOWN/);
-  assert.match(primaryRender, /repairIsolatedMaskHoles: true/);
-  assert.match(primaryRender, /unknownAltColor: PRIMARY_FLOORPLAN_UNKNOWN/);
-  assert.match(primaryRender, /sourceRect: displaySourceRectForLayer\(primaryFloorplanLayer\)/);
+  assert.match(primaryRender, /sourceRect: displaySourceRectForLayer\(structuralHeightLayer\)/);
   assert.match(primaryRender, /background: '#000'/);
-  assert.match(primaryRender, /imageSmoothing: true/);
-  assert.match(primaryRender, /gamma: HEIGHT_CONTRAST_GAMMA/);
-  assert.doesNotMatch(primaryRender, /surfaceRgbLayer|wallSupportLayer|roomFootprintLayer|metricGridM/);
+  assert.match(primaryRender, /imageSmoothing: false/);
+  assert.doesNotMatch(primaryRender, /flipHorizontal|flipVertical/);
+  assert.doesNotMatch(primaryRender, /renderLayerToCanvas|heightLayer|heightAglLayer|metricGridM/);
 });
 
-test('primary floorplan export preserves the reference-matched height gamma', async () => {
+test('primary floorplan export uses the identical texture renderer and orientation', async () => {
   const drawer = await source('../components/DepthDrawer.tsx');
   const exportStart = drawer.indexOf(
-    'const result = renderLayerToCanvas(\n          canvas,\n          primaryFloorplanLayer',
+    'const result = renderTextureFloorplanToCanvas(\n          canvas,\n          structuralHeightLayer',
   );
   const exportEnd = drawer.indexOf(
     "addFloorplanLayer('density-gray'",
     exportStart,
   );
   assert.ok(exportStart >= 0 && exportEnd > exportStart);
+  const primaryExport = drawer.slice(exportStart, exportEnd);
+  assert.match(primaryExport, /roomFootprintLayer,\s*measuredPerimeterLayer,\s*surfaceRgbLayer,/);
+  assert.match(primaryExport, /imageSmoothing: false/);
+  assert.doesNotMatch(primaryExport, /flipHorizontal|flipVertical/);
+  assert.match(primaryExport, /label: 'floorplan-observed-texture-primary'/);
+  assert.doesNotMatch(primaryExport, /renderLayerToCanvas|primaryFloorplanLayer|HEIGHT_CONTRAST_GAMMA/);
   assert.match(
-    drawer.slice(exportStart, exportEnd),
-    /gamma: HEIGHT_CONTRAST_GAMMA/,
+    drawer,
+    /floorplan_image_flip: activeTab === 'heatmap'[\s\S]*u: Boolean\(cameraFloorplan\?\.image_flip\?\.u\),[\s\S]*v: Boolean\(cameraFloorplan\?\.image_flip\?\.v\),/,
   );
-  assert.match(
-    drawer.slice(exportStart, exportEnd),
-    /repairIsolatedMaskHoles: true/,
+});
+
+test('texture renderer keeps inferred space black and bounds every repair to 0.12 m', async () => {
+  const renderer = await source('./renderUtils.ts');
+  const start = renderer.indexOf('export function renderTextureFloorplanToCanvas');
+  const end = renderer.indexOf(
+    'export function renderStructuralFloorplanToCanvas',
+    start,
   );
+  assert.ok(start >= 0 && end > start);
+  const textureRenderer = renderer.slice(start, end);
+
+  assert.match(textureRenderer, /percentileSorted\(luminanceSamples, 1\)/);
+  assert.match(textureRenderer, /percentileSorted\(luminanceSamples, 99\)/);
+  assert.match(textureRenderer, /nearestDistanceSquared\[index\] <= 9/);
+  assert.match(textureRenderer, /footprint\[index\]\s*&& nearestSource\[index\] >= 0/);
+  assert.match(textureRenderer, /0\.90 \* textureR/);
+  assert.match(textureRenderer, /0\.10 \* \(heightR \/ 255\)/);
+  assert.match(textureRenderer, /heightM \/ 1\.65/);
+  assert.match(textureRenderer, /writeCompositePixel\(index, 2, 4, 7\)/);
+  assert.match(textureRenderer, /measuredPerimeterValues\[index\] <= 0\.18/);
+  assert.match(textureRenderer, /const measuredMix = 0\.35 \+ \(0\.30 \* measuredStrength\)/);
+  assert.match(textureRenderer, /image\[offset\] = Math\.max\(image\[offset\], 70\)/);
+  assert.match(textureRenderer, /const clearCanvas = \(\) =>/);
+  assert.doesNotMatch(textureRenderer, /maskLayer: roomFootprint|fillStyle.*footprint/);
 });
 
 test('structural composite remains diagnostic and cannot style the primary canvas', async () => {

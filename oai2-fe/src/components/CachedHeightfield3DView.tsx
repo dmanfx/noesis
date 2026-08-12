@@ -6,12 +6,15 @@ import { computeMaskedRange } from '../lib/depthQuality.js';
 import { buildMaskedHeightfield } from '../lib/heightfieldModel.js';
 import { decodeFloat32, turboColor } from '../lib/renderUtils';
 import { framePerspectiveBounds } from '../lib/threeViewFraming';
+import { detectOverheadBand } from '../lib/overheadPresentation.js';
 
 type CachedHeightfield3DViewProps = {
   floorplan?: FloorplanResponse | null;
   heightLayer?: FloorplanLayer;
   densityLayer?: FloorplanLayer;
   heightExaggeration?: number;
+  hideOverhead?: boolean;
+  renderMode?: 'mesh-and-points' | 'points';
   onCanvasReady?: (canvas: HTMLCanvasElement | null) => void;
 };
 
@@ -33,6 +36,8 @@ export default function CachedHeightfield3DView({
   heightLayer,
   densityLayer,
   heightExaggeration = 1,
+  hideOverhead = false,
+  renderMode = 'mesh-and-points',
   onCanvasReady,
 }: CachedHeightfield3DViewProps) {
   const containerRef = useRef<HTMLDivElement | null>(null);
@@ -48,6 +53,7 @@ export default function CachedHeightfield3DView({
     const [rows, cols] = heightLayer.grid_shape;
     const heightValues = decodeFloat32(heightLayer.grid_b64);
     if (!heightValues || heightValues.length < rows * cols) return null;
+    const overhead = hideOverhead ? detectOverheadBand(heightValues) : null;
     let densityValues: Float32Array | null = null;
     if (
       densityLayer?.grid_b64
@@ -66,6 +72,7 @@ export default function CachedHeightfield3DView({
       densityThreshold: 1e-6,
       maxVertices: 65_536,
       heightExaggeration,
+      maxVisibleHeightM: overhead?.cutoffM,
     });
   }, [
     densityLayer?.grid_b64,
@@ -73,6 +80,7 @@ export default function CachedHeightfield3DView({
     floorplan?.bounds,
     floorplan?.scale_m_per_px,
     heightExaggeration,
+    hideOverhead,
     heightLayer?.grid_b64,
     heightLayer?.grid_shape,
   ]);
@@ -97,7 +105,7 @@ export default function CachedHeightfield3DView({
       bounds,
       camera,
       controls,
-      viewDirection: new THREE.Vector3(0.48, 1.15, 0.62),
+      viewDirection: new THREE.Vector3(0, 1.15, -0.62),
       margin: 1.16,
     });
   }, []);
@@ -110,6 +118,7 @@ export default function CachedHeightfield3DView({
 
     const group = new THREE.Group();
     group.name = 'cached-height-agl-surface';
+    group.scale.x = -1;
     const colorRange = computeMaskedRange(model.heights, {
       mask: model.observed,
       maskThreshold: 0,
@@ -130,7 +139,7 @@ export default function CachedHeightfield3DView({
       colors[idx * 3 + 2] = b / 255;
     }
 
-    if (model.indices.length) {
+    if (renderMode === 'mesh-and-points' && model.indices.length) {
       const geometry = new THREE.BufferGeometry();
       geometry.setAttribute('position', new THREE.BufferAttribute(model.positions, 3));
       geometry.setAttribute('color', new THREE.BufferAttribute(colors, 3));
@@ -165,10 +174,13 @@ export default function CachedHeightfield3DView({
       pointGeometry,
       new THREE.PointsMaterial({
         vertexColors: true,
-        size: Math.max(0.015, Math.min(model.dx, model.dz) * 0.32),
+        size: Math.max(
+          0.015,
+          Math.min(model.dx, model.dz) * (renderMode === 'points' ? 0.68 : 0.32),
+        ),
         sizeAttenuation: true,
         transparent: true,
-        opacity: 0.82,
+        opacity: renderMode === 'points' ? 0.96 : 0.82,
       }),
     );
     points.name = 'observed-heightfield-points';
@@ -195,7 +207,7 @@ export default function CachedHeightfield3DView({
     // Unknown vertices remain omitted and the user can still zoom out to the
     // complete metric grid.
     frameModel(model.observedCount ? points : group);
-  }, [clearModel, frameModel, model]);
+  }, [clearModel, frameModel, model, renderMode]);
 
   useEffect(() => {
     if (rendererRef.current || !containerRef.current) return;

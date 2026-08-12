@@ -310,23 +310,44 @@
   flex-wrap: wrap;
 }
 
+.floorplan-height-legend {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 210px;
+  color: rgba(255, 255, 255, 0.62);
+  font-size: 10px;
+}
+
+.floorplan-height-legend__bar {
+  width: 116px;
+  height: 10px;
+  border: 1px solid rgba(255, 255, 255, 0.2);
+  border-radius: 999px;
+}
+
 .unknown-cell-key span {
   width: 22px;
   height: 12px;
   border: 1px solid rgba(255, 255, 255, 0.16);
   background:
     linear-gradient(45deg, #101620 25%, transparent 25%, transparent 75%, #101620 75%),
-    linear-gradient(45deg, #101620 25%, #232c3a 25%, #232c3a 75%, #101620 75%);
+    linear-gradient(45deg, #101620 25%, #141c27 25%, #141c27 75%, #101620 75%);
   background-position: 0 0, 4px 4px;
   background-size: 8px 8px;
 }
 
 .unknown-cell-key--inferred span {
   background:
-    linear-gradient(45deg, #34668c 25%, transparent 25%, transparent 75%, #34668c 75%),
-    linear-gradient(45deg, #34668c 25%, #487ea4 25%, #487ea4 75%, #34668c 75%);
+    linear-gradient(45deg, #233943 25%, transparent 25%, transparent 75%, #233943 75%),
+    linear-gradient(45deg, #233943 25%, #29444f 25%, #29444f 75%, #233943 75%);
   background-position: 0 0, 4px 4px;
   background-size: 8px 8px;
+}
+
+.unknown-cell-key--obstacle span {
+  border-color: rgba(247, 176, 73, 0.7);
+  background: rgba(247, 176, 73, 0.22);
 }
 
 .depth-diagnostics {
@@ -346,6 +367,20 @@
 
 .depth-diagnostics[open] summary {
   margin-bottom: 12px;
+}
+
+.scene-fusion-diagnostics {
+  margin-top: 0;
+}
+
+.scene-fusion-diagnostics__provenance {
+  margin: 0 0 12px;
+  padding: 8px 10px;
+  border-left: 3px solid rgba(88, 214, 141, 0.48);
+  background: rgba(88, 214, 141, 0.06);
+  color: rgba(255, 255, 255, 0.72);
+  font-size: 11px;
+  line-height: 1.45;
 }
 
 .primitives-layout {
@@ -462,8 +497,24 @@
 }
 
 .calibrated-point-cloud-view {
+  position: relative;
   width: 100%;
   height: 100%;
+}
+
+.scene-prior-point-cloud-status {
+  position: absolute;
+  left: 10px;
+  bottom: 8px;
+  z-index: 2;
+  max-width: calc(100% - 20px);
+  padding: 4px 7px;
+  border-radius: 5px;
+  background: rgba(5, 10, 18, 0.78);
+  color: #cbd5e1;
+  font-size: 11px;
+  line-height: 1.35;
+  pointer-events: none;
 }
 
 .cached-heightfield-view canvas,

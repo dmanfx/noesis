@@ -9,7 +9,7 @@
     "preview": "vite preview",
     "test:depth-bulk": "node scripts/run-depth-bulk-tests.mjs",
     "test:floorplan-bootstrap": "node --test src/lib/floorplanBootstrap.test.mjs",
-    "test:depth-quality": "node --test src/lib/depthQuality.test.mjs src/lib/depthRefreshSequence.test.mjs src/lib/floorplanBootstrap.test.mjs src/lib/floorplanViewport.test.mjs src/lib/heightfieldModel.test.mjs src/lib/manualDepthInferenceInvariant.test.mjs src/lib/pointCloudModel.test.mjs src/lib/primaryFloorplan.test.mjs src/lib/semanticSegmentation.test.mjs"
+    "test:depth-quality": "node --test src/lib/depthQuality.test.mjs src/lib/existing3DViewInvariant.test.mjs src/lib/floorplanBootstrap.test.mjs src/lib/floorplanViewport.test.mjs src/lib/heightfieldModel.test.mjs src/lib/overheadPresentation.test.mjs src/lib/pointCloudModel.test.mjs src/lib/primaryFloorplan.test.mjs src/lib/sceneFusionDiagnosticLayers.test.mjs src/lib/semanticSegmentation.test.mjs"
   },
   "dependencies": {
     "react": "^18.2.0",

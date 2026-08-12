@@ -3,7 +3,7 @@ import * as THREE from 'three';
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
 import type { VisibleFloorPlaneModel } from '../lib/visibleFloorPlane';
 
-const MODEL_COMPARISON_TOP_DOWN_UP = new THREE.Vector3(-1, 0, 0);
+const MODEL_COMPARISON_TOP_DOWN_UP = new THREE.Vector3(0, 0, 1);
 
 type FloorPlane3DViewProps = {
   model: VisibleFloorPlaneModel | null;
@@ -55,7 +55,8 @@ const FloorPlane3DView: React.FC<FloorPlane3DViewProps> = ({ model, onCanvasRead
     camera.near = Math.max(0.01, dist * 0.01);
     camera.far = Math.max(50, dist * 8);
     // Keep geometry in camera-local ground (X/Z with Y height), but present it
-    // in the same top-down screen basis used by the model-alignment view.
+    // in the same top-down screen basis as the heatmap: camera right is
+    // screen-right and camera forward is screen-up.
     camera.up.copy(MODEL_COMPARISON_TOP_DOWN_UP);
     camera.lookAt(center);
     camera.updateProjectionMatrix();

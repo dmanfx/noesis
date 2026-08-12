@@ -661,7 +661,6 @@ const loadSnapshot = async (
     rgbShape: rgbBytes
       ? components.rgb?.shape as [number, number, number] | undefined
       : undefined,
-    rgbComponentSha256: rgbBytes ? components.rgb?.sha256 : undefined,
     normals,
     normalsShape: [descriptor.shape[0], descriptor.shape[1], 3],
     surfaceNormals,

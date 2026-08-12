@@ -43,4 +43,5 @@ export function buildMaskedHeightfield(options: {
   densityThreshold?: number;
   maxVertices?: number;
   heightExaggeration?: number;
+  maxVisibleHeightM?: number;
 }): HeightfieldModel | null;

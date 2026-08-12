@@ -66,6 +66,16 @@ export type FloorplanRgbLayer = {
   observed_b64?: string;
 };
 
+export type SceneFusionPoints = {
+  frame?: string;
+  units?: string;
+  point_count?: number;
+  positions_f32_b64?: string;
+  colors_rgb_u8_b64?: string;
+  confidence_f32_b64?: string;
+  provenance_u8_b64?: string;
+};
+
 export type FloorplanResponse = {
   type?: string;
   request_id?: string;
@@ -79,6 +89,7 @@ export type FloorplanResponse = {
   cache_only?: boolean;
   frame?: string;
   bounds?: { min_x?: number; max_x?: number; min_z?: number; max_z?: number };
+  image_flip?: { u?: boolean; v?: boolean };
   scale_m_per_px?: number;
   scale_scene_per_px?: number;
   units?: string;
@@ -87,6 +98,7 @@ export type FloorplanResponse = {
   max_extent_scene?: number;
   point_count?: number;
   error?: string;
+  scene_prior_error?: string;
   density?: FloorplanLayer;
   height?: FloorplanLayer;
   height_agl?: FloorplanLayer;
@@ -102,6 +114,15 @@ export type FloorplanResponse = {
   room_footprint?: FloorplanLayer;
   wall_support?: FloorplanLayer;
   room_boundary?: FloorplanLayer;
+  measured_perimeter?: FloorplanLayer;
+  wall_segments?: Array<{
+    space?: string;
+    start?: [number, number];
+    end?: [number, number];
+    length_m?: number;
+    measured_coverage?: number;
+    confidence?: number;
+  }>;
   surface_rgb?: FloorplanRgbLayer;
   observation_meta?: {
     observed_cells?: number;
@@ -110,6 +131,85 @@ export type FloorplanResponse = {
     [key: string]: unknown;
   };
   height_agl_meta?: { floor_y?: number; floor_estimate?: unknown };
+  scene_static_height_agl?: FloorplanLayer;
+  scene_static_observed?: FloorplanLayer;
+  scene_static_confidence?: FloorplanLayer;
+  scene_composite_height_agl?: FloorplanLayer;
+  scene_composite_observed?: FloorplanLayer;
+  scene_composite_source?: FloorplanLayer;
+  scene_prior_meta?: {
+    contract?: string;
+    contract_version?: number;
+    status?: string;
+    prior_id?: string;
+    space_id?: string;
+    mode?: string;
+    source_type?: string;
+    source_model?: string;
+    composition_policy?: string;
+    live_observed_cells?: number;
+    static_available_cells?: number;
+    static_fill_cells?: number;
+    composite_observed_cells?: number;
+    reason?: string;
+  };
+  scene_fusion_height_agl?: FloorplanLayer;
+  scene_fusion_observed?: FloorplanLayer;
+  scene_fusion_confidence?: FloorplanLayer;
+  scene_fusion_obstacle_height?: FloorplanLayer;
+  scene_fusion_obstacle_mask?: FloorplanLayer;
+  scene_fusion_floor_supported?: FloorplanLayer;
+  scene_fusion_floor_height?: FloorplanLayer;
+  scene_fusion_provenance?: FloorplanLayer;
+  scene_fusion_diagnostic_density?: FloorplanLayer;
+  scene_fusion_diagnostic_height?: FloorplanLayer;
+  scene_fusion_diagnostic_height_agl?: FloorplanLayer;
+  scene_fusion_diagnostic_distance?: FloorplanLayer;
+  scene_fusion_diagnostic_gradient?: FloorplanLayer;
+  scene_fusion_diagnostic_obstacle_height?: FloorplanLayer;
+  scene_fusion_diagnostic_walkable?: FloorplanLayer;
+  scene_fusion_diagnostic_structural_height?: FloorplanLayer;
+  scene_fusion_diagnostic_surface_observed?: FloorplanLayer;
+  scene_fusion_diagnostic_room_footprint?: FloorplanLayer;
+  scene_fusion_diagnostic_wall_support?: FloorplanLayer;
+  scene_fusion_diagnostic_room_boundary?: FloorplanLayer;
+  scene_fusion_diagnostic_surface_rgb?: FloorplanRgbLayer;
+  scene_fusion_points?: SceneFusionPoints;
+  scene_fusion_error?: string;
+  scene_fusion_meta?: {
+    contract?: string;
+    contract_version?: number;
+    fusion_id?: string;
+    status?: string;
+    diagnostic_only?: boolean;
+    space_id?: string;
+    camera_id?: string;
+    inference?: string;
+    quality?: {
+      fixed_to_phone_median_m?: number;
+      fixed_overlap_0p25m?: number;
+      phone_overlap_0p25m?: number;
+    };
+    source_counts?: {
+      fixed_only?: number;
+      phone_only?: number;
+      fixed_phone_agreement?: number;
+    };
+    diagnostic_layers?: {
+      contract?: string;
+      contract_version?: number;
+      source?: string;
+      derived_at_catalog_load?: boolean;
+      mapanything_inference_triggered?: boolean;
+      registration_triggered?: boolean;
+      bounds?: FloorplanResponse['bounds'];
+      grid_shape?: [number, number];
+      raster_orientation?: string;
+      fixed_anchor_view_count?: number;
+      phone_view_count?: number;
+      predicted_anchor_geometry_used_in_fusion?: boolean;
+    };
+  };
 };
 
 export type DepthRefreshEntry = {
@@ -122,17 +222,36 @@ export type DepthCachePairEntry = {
   error?: string;
 };
 
+type ProductionDepthRefreshEntry = {
+  status: 'idle' | 'capturing-floorplan' | 'loading-depth' | 'error';
+  requestId?: string;
+  snapshotTsUs?: number;
+  error?: string;
+};
+
+type FloorplanRequestOptions = {
+  camera?: string;
+  requestId?: string;
+  maxAgeSec?: number;
+  gridResM?: number;
+  maxExtentM?: number;
+  cacheOnly?: boolean;
+};
+
 interface DepthDrawerProps {
   open: boolean;
   onClose: () => void;
   diagnostics: Record<string, DiagnosticsEntry>;
   depthData: Record<string, DepthEntry>;
   depthMeta?: Record<string, DepthMetaEntry>;
-  onRequestDepthFresh: (cameraId: string) => void;
-  onRequestDepthCached: (cameraId: string) => void;
+  onRequestDepthFresh?: (cameraId: string) => void;
+  onRefreshDepthPanel?: (cameraId: string) => void;
+  onRequestDepthCached: (cameraId: string) => boolean | void;
+  transportOpen?: boolean;
   floorplans: Record<string, FloorplanResponse>;
-  refreshState?: Record<string, DepthRefreshEntry>;
+  refreshState?: Record<string, DepthRefreshEntry | ProductionDepthRefreshEntry>;
   cachePairState?: Record<string, DepthCachePairEntry>;
+  onRequestFloorplan?: (options: FloorplanRequestOptions) => string | void;
   availableCameras: string[];
   mosaicLayout?: MosaicLayout | null;
   videoRef?: RefObject<HTMLVideoElement>;
@@ -144,8 +263,9 @@ import {
   grayscaleColor,
   bwColor,
   infernoColor,
-  renderLayerToCanvas,
   renderStructuralFloorplanToCanvas,
+  renderTextureFloorplanToCanvas,
+  renderLayerToCanvas,
   turboColor,
   viridisColor
 } from '../lib/renderUtils';
@@ -161,9 +281,12 @@ import { computeObservedFloorplanViewport } from '../lib/floorplanViewport.js';
 import { buildExtrudedFloorplanModel, DEFAULT_OBSTACLE_SETTINGS, renderExtrudedFloorplanToCanvas } from '../lib/extrudedFloorplan';
 import { getExtrinsicsAny, getIntrinsicsAny } from '../lib/calibration';
 import { buildVisibleFloorPlaneModel } from '../lib/visibleFloorPlane';
+import { buildScenePriorFloorPlaneModel } from '../lib/scenePriorFloorPlane';
 import FloorPlane3DView from './FloorPlane3DView';
 import CachedHeightfield3DView from './CachedHeightfield3DView';
 import CalibratedPointCloud3DView from './CalibratedPointCloud3DView';
+import FusedPointCloud3DView from './FusedPointCloud3DView';
+import ScenePriorPointCloud3DView from './ScenePriorPointCloud3DView';
 
 const DEFAULT_WIDTH = 700;
 const MAX_WIDTH = 960;
@@ -181,9 +304,10 @@ const HEIGHT_AGL_VIEW_MIN_M = 0.0;
 const HEIGHT_AGL_VIEW_MAX_M = 1.2;
 const HEIGHT_AGL_ROOM_MAX_M = 2.5;
 const UNKNOWN_CELL_COLOR: [number, number, number, number] = [16, 22, 32, 255];
-const UNKNOWN_CELL_ALT_COLOR: [number, number, number, number] = [35, 44, 58, 255];
-const PRIMARY_FLOORPLAN_UNKNOWN: [number, number, number, number] = [0, 0, 0, 255];
+const UNKNOWN_CELL_ALT_COLOR: [number, number, number, number] = [20, 28, 39, 255];
 const PRIMARY_FLOORPLAN_VIEWPORT_PADDING_M = 0.3;
+const INFERRED_CELL_COLOR: [number, number, number, number] = [35, 57, 67, 255];
+const INFERRED_CELL_ALT_COLOR: [number, number, number, number] = [41, 68, 79, 255];
 
 function percentileSorted(sorted: number[], pct: number): number {
   if (!sorted.length) return 0;
@@ -241,10 +365,13 @@ const DepthDrawer = memo(function DepthDrawer({
   depthData,
   depthMeta = {},
   onRequestDepthFresh,
+  onRefreshDepthPanel,
   onRequestDepthCached,
+  transportOpen = true,
   floorplans,
   refreshState = {},
   cachePairState = {},
+  onRequestFloorplan,
   availableCameras,
   mosaicLayout,
   videoRef,
@@ -262,6 +389,8 @@ const DepthDrawer = memo(function DepthDrawer({
   const [selectedCamera, setSelectedCamera] = useState<string>('');
   const [drawerWidth, setDrawerWidth] = useState<number>(DEFAULT_WIDTH);
   const onRequestDepthCachedRef = useRef(onRequestDepthCached);
+  const onRequestFloorplanRef = useRef(onRequestFloorplan);
+  const floorplanCacheProbedRef = useRef(new Set<string>());
   const drawerRef = useRef<HTMLDivElement | null>(null);
   const isResizingRef = useRef(false);
   const previousUserSelectRef = useRef('');
@@ -284,6 +413,8 @@ const DepthDrawer = memo(function DepthDrawer({
   const walkableCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const floorplanCompositeCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const structuralFloorplanCanvasRef = useRef<HTMLCanvasElement | null>(null);
+  const sceneStaticCanvasRef = useRef<HTMLCanvasElement | null>(null);
+  const sceneCompositeCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const streamPreviewCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const extrudedCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const floorPlaneCanvasRef = useRef<HTMLCanvasElement | null>(null);
@@ -295,7 +426,7 @@ const DepthDrawer = memo(function DepthDrawer({
   const [primitivesShowPreview, setPrimitivesShowPreview] = useState(true);
   const [primitivesShowBoxes, setPrimitivesShowBoxes] = useState(true);
   const [primitivesSelectedBoxId, setPrimitivesSelectedBoxId] = useState<string | null>(null);
-  const [primitivesHeightExaggeration, setPrimitivesHeightExaggeration] = useState(1.6);
+  const [primitivesHeightExaggeration, setPrimitivesHeightExaggeration] = useState(1);
   const [primitivesMinHeightM, setPrimitivesMinHeightM] = useState(DEFAULT_OBSTACLE_SETTINGS.minHeightM);
   const [primitivesMinDensity, setPrimitivesMinDensity] = useState(DEFAULT_OBSTACLE_SETTINGS.minDensity);
   const [primitivesMinFootprintM2, setPrimitivesMinFootprintM2] = useState(DEFAULT_OBSTACLE_SETTINGS.minFootprintM2);
@@ -308,7 +439,7 @@ const DepthDrawer = memo(function DepthDrawer({
   const [diagnosticsOpen, setDiagnosticsOpen] = useState(false);
   // Floorplan selection (declared early to avoid TDZ in hooks below)
   const cameraFloorplan = floorplans[selectedCamera];
-  const structuralFloorplanBounds = useMemo(() => {
+  const detailedFloorplanBounds = useMemo(() => {
     const bounds = cameraFloorplan?.bounds;
     const minX = Number(bounds?.min_x);
     const maxX = Number(bounds?.max_x);
@@ -327,10 +458,27 @@ const DepthDrawer = memo(function DepthDrawer({
     return { min_x: minX, max_x: maxX, min_z: minZ, max_z: maxZ };
   }, [cameraFloorplan?.bounds]);
   const selectedRefresh = refreshState[selectedCamera];
+  const selectedRefreshPhase = selectedRefresh && 'phase' in selectedRefresh
+    ? selectedRefresh.phase
+    : selectedRefresh?.status === 'capturing-floorplan'
+      ? 'requesting-floorplan'
+      : selectedRefresh?.status === 'loading-depth'
+        ? 'requesting-depth'
+        : selectedRefresh?.status === 'error'
+          ? 'error'
+          : undefined;
   const selectedCachePair = cachePairState[selectedCamera];
-  const refreshPending = selectedRefresh?.phase === 'requesting-depth'
-    || selectedRefresh?.phase === 'requesting-floorplan';
-  const refreshError = selectedRefresh?.phase === 'error'
+  const refreshPending = selectedRefreshPhase === 'requesting-depth'
+    || selectedRefreshPhase === 'requesting-floorplan';
+  const anyRefreshPending = Object.values(refreshState).some((entry) => (
+    ('phase' in entry && (
+      entry.phase === 'requesting-depth' || entry.phase === 'requesting-floorplan'
+    ))
+    || ('status' in entry && (
+      entry.status === 'capturing-floorplan' || entry.status === 'loading-depth'
+    ))
+  ));
+  const refreshError = selectedRefreshPhase === 'error'
     ? selectedRefresh.error || 'unknown_refresh_error'
     : '';
   const cachePairError = !refreshPending && selectedCachePair?.phase === 'error'
@@ -351,7 +499,21 @@ const DepthDrawer = memo(function DepthDrawer({
   const roomFootprintLayer = cameraFloorplan?.room_footprint;
   const wallSupportLayer = cameraFloorplan?.wall_support;
   const roomBoundaryLayer = cameraFloorplan?.room_boundary;
+  const measuredPerimeterLayer = cameraFloorplan?.measured_perimeter;
   const surfaceRgbLayer = cameraFloorplan?.surface_rgb;
+  const sceneStaticHeightLayer = cameraFloorplan?.scene_static_height_agl;
+  const sceneStaticObservedLayer = cameraFloorplan?.scene_static_observed;
+  const sceneCompositeHeightLayer = cameraFloorplan?.scene_composite_height_agl;
+  const sceneCompositeObservedLayer = cameraFloorplan?.scene_composite_observed;
+  const scenePriorMeta = cameraFloorplan?.scene_prior_meta;
+  const sceneFusionHeightLayer = cameraFloorplan?.scene_fusion_height_agl;
+  const sceneFusionObservedLayer = cameraFloorplan?.scene_fusion_observed;
+  const sceneFusionObstacleHeightLayer = cameraFloorplan?.scene_fusion_obstacle_height;
+  const sceneFusionObstacleMaskLayer = cameraFloorplan?.scene_fusion_obstacle_mask;
+  const sceneFusionFloorHeightLayer = cameraFloorplan?.scene_fusion_floor_height;
+  const sceneFusionFloorSupportedLayer = cameraFloorplan?.scene_fusion_floor_supported;
+  const sceneFusionPoints = cameraFloorplan?.scene_fusion_points;
+  const sceneFusionMeta = cameraFloorplan?.scene_fusion_meta;
   // v8 exposes unknown explicitly. Renderers invert that binary mask so an
   // unknown cell never falls through as a valid zero-height/obstacle cell.
   const observationMaskLayer = observedLayer ?? densityLayer;
@@ -359,9 +521,6 @@ const DepthDrawer = memo(function DepthDrawer({
   const renderObservationMaskInvert = Boolean(unknownLayer);
   const floorplanViewportMaskLayer = unknownLayer ?? observationMaskLayer;
   const floorplanViewportMaskInvert = Boolean(unknownLayer);
-  const primaryFloorplanLayer = heightLayer?.grid_b64 && heightLayer.grid_shape
-    ? heightLayer
-    : heightAglLayer;
   const floorplanError = cameraFloorplan?.error ?? null;
   const floorplanServedFromCache = cameraFloorplan?.served_from_cache ?? false;
   const hasDensity = !!(densityLayer && densityLayer.grid_b64 && densityLayer.grid_shape);
@@ -374,6 +533,47 @@ const DepthDrawer = memo(function DepthDrawer({
   const hasObserved = !!(observedLayer?.grid_b64 && observedLayer.grid_shape);
   const hasUnknown = !!(unknownLayer?.grid_b64 && unknownLayer.grid_shape);
   const hasInferredWalkable = !!(inferredWalkableLayer?.grid_b64 && inferredWalkableLayer.grid_shape);
+  const hasScenePrior = !!(sceneStaticHeightLayer?.grid_b64 && sceneStaticHeightLayer.grid_shape);
+  const hasSceneComposite = !!(sceneCompositeHeightLayer?.grid_b64 && sceneCompositeHeightLayer.grid_shape);
+  const hasSceneFusionSurface = !!(
+    sceneFusionHeightLayer?.grid_b64
+    && sceneFusionHeightLayer.grid_shape
+    && sceneFusionObservedLayer?.grid_b64
+    && sceneFusionObservedLayer.grid_shape
+  );
+  const hasSceneFusionObstacles = !!(
+    sceneFusionObstacleHeightLayer?.grid_b64
+    && sceneFusionObstacleHeightLayer.grid_shape
+    && sceneFusionObstacleMaskLayer?.grid_b64
+    && sceneFusionObstacleMaskLayer.grid_shape
+  );
+  const hasSceneFusionFloor = !!(
+    sceneFusionFloorHeightLayer?.grid_b64
+    && sceneFusionFloorHeightLayer.grid_shape
+    && sceneFusionFloorSupportedLayer?.grid_b64
+    && sceneFusionFloorSupportedLayer.grid_shape
+  );
+  const hasSceneFusionPoints = !!(
+    sceneFusionPoints?.positions_f32_b64
+    && sceneFusionPoints?.colors_rgb_u8_b64
+    && (sceneFusionPoints.point_count ?? 0) > 0
+  );
+  const primitivesHeightLayer = hasSceneFusionSurface
+    ? sceneFusionHeightLayer
+    : hasScenePrior
+      ? sceneStaticHeightLayer
+      : (heightAglLayer ?? heightLayer);
+  const primitivesObservedLayer = hasSceneFusionSurface
+    ? sceneFusionObservedLayer
+    : hasScenePrior
+      ? sceneStaticObservedLayer
+      : observationMaskLayer;
+  const primitivesObstacleHeightLayer = hasSceneFusionObstacles
+    ? sceneFusionObstacleHeightLayer
+    : primitivesHeightLayer;
+  const primitivesObstacleObservedLayer = hasSceneFusionObstacles
+    ? sceneFusionObstacleMaskLayer
+    : primitivesObservedLayer;
   const observationCounts = useMemo(() => floorplanObservationCounts(
     cameraFloorplan?.observation_meta,
     inferredWalkableLayer?.grid_b64
@@ -396,7 +596,6 @@ const DepthDrawer = memo(function DepthDrawer({
       maskThreshold: HEIGHT_CONTRAST_DENSITY_THRESH,
       bounds: cameraFloorplan?.bounds,
       paddingM: PRIMARY_FLOORPLAN_VIEWPORT_PADDING_M,
-      fallbackPaddingCells: 3,
     });
   }, [
     cameraFloorplan?.bounds,
@@ -496,33 +695,14 @@ const DepthDrawer = memo(function DepthDrawer({
     }
     return { min: HEIGHT_AGL_VIEW_MIN_M, max: HEIGHT_AGL_VIEW_MAX_M };
   }, [aglRangeMode, heightAglAutoRange]);
-  const primaryFloorplanRange = useMemo<SimpleRange | null>(() => {
-    if (primaryFloorplanLayer === heightLayer) {
-      return heightContrastRange ?? heightRange;
-    }
-    if (heightAglAutoRange) {
-      return {
-        min: heightAglAutoRange.min,
-        max: heightAglAutoRange.max,
-      };
-    }
-    return primaryFloorplanLayer ? heightAglRange : null;
-  }, [
-    heightAglAutoRange,
-    heightAglRange,
-    heightContrastRange,
-    heightLayer,
-    heightRange,
-    primaryFloorplanLayer,
-  ]);
   const spanX = cameraFloorplan?.bounds ? Math.abs((cameraFloorplan.bounds.max_x ?? 0) - (cameraFloorplan.bounds.min_x ?? 0)) : undefined;
   const spanZ = cameraFloorplan?.bounds ? Math.abs((cameraFloorplan.bounds.max_z ?? 0) - (cameraFloorplan.bounds.min_z ?? 0)) : undefined;
   const floorplanStatusText = useMemo(() => {
     if (!open || (activeTab !== 'heatmap' && activeTab !== '3d')) return '';
-    if (selectedRefresh?.phase === 'requesting-depth') {
+    if (selectedRefreshPhase === 'requesting-depth') {
       return 'Capturing a fresh depth snapshot; the previous coherent view remains visible.';
     }
-    if (selectedRefresh?.phase === 'requesting-floorplan') {
+    if (selectedRefreshPhase === 'requesting-floorplan') {
       return 'Building the exact matching floorplan; the previous coherent view remains visible.';
     }
     if (selectedCachePair?.phase === 'requesting-depth') {
@@ -541,7 +721,7 @@ const DepthDrawer = memo(function DepthDrawer({
   }, [
     open,
     activeTab,
-    selectedRefresh?.phase,
+    selectedRefreshPhase,
     selectedCachePair?.phase,
     floorplanError,
     cameraFloorplan,
@@ -603,13 +783,50 @@ const DepthDrawer = memo(function DepthDrawer({
   }, [onRequestDepthCached]);
 
   useEffect(() => {
-    if (!open || !selectedCamera) return;
+    onRequestFloorplanRef.current = onRequestFloorplan;
+  }, [onRequestFloorplan]);
+
+  useEffect(() => {
+    if (!open || !selectedCamera || !transportOpen || depthData[selectedCamera]) return;
     // The websocket hook owns transport state and may provide a new callback
     // identity after unrelated dashboard renders. Cache reads are a
     // transition effect: one per drawer-open/camera-selection transition, not
     // one per callback identity.
     onRequestDepthCachedRef.current(selectedCamera);
-  }, [open, selectedCamera]);
+  }, [depthData, open, selectedCamera, transportOpen]);
+
+  useEffect(() => {
+    if (!open || !selectedCamera || !transportOpen || !onRequestFloorplanRef.current) return;
+    if (floorplanCacheProbedRef.current.has(selectedCamera)) return;
+    const hasRenderableFloorplan = Boolean(
+      cameraFloorplan
+      && !cameraFloorplan.error
+      && (
+        cameraFloorplan.density?.grid_b64
+        || cameraFloorplan.height?.grid_b64
+        || cameraFloorplan.height_agl?.grid_b64
+        || cameraFloorplan.walkable?.grid_b64
+      )
+    );
+    if (hasRenderableFloorplan) return;
+    floorplanCacheProbedRef.current.add(selectedCamera);
+    onRequestFloorplanRef.current({
+      camera: selectedCamera,
+      requestId: `drawer-cache-${selectedCamera}-${Date.now()}`,
+      gridResM: 0.04,
+      maxExtentM: 20,
+      cacheOnly: true,
+    });
+  }, [cameraFloorplan, open, selectedCamera, transportOpen]);
+
+  useEffect(() => {
+    if (open && transportOpen) return;
+    floorplanCacheProbedRef.current.clear();
+  }, [open, transportOpen]);
+
+  useEffect(() => {
+    floorplanCacheProbedRef.current.clear();
+  }, [calibrationEpoch]);
 
   useEffect(() => {
     if (open) {
@@ -1029,10 +1246,11 @@ const DepthDrawer = memo(function DepthDrawer({
     return buildExtrudedFloorplanModel(
       {
         bounds: cameraFloorplan.bounds,
-        // Geometry is metric height above the fitted floor. Raw camera-Y
-        // height is convention-sensitive and can invert or offset obstacles.
-        height: cameraFloorplan.height_agl ?? cameraFloorplan.height,
-        density: cameraFloorplan.density,
+        // Use the purpose-built fixed+phone obstacle product in the existing
+        // representation. Conditioned-prior and live layers are per-view
+        // fallbacks when that stronger product is unavailable.
+        height: primitivesObstacleHeightLayer,
+        density: primitivesObstacleObservedLayer,
       },
       {
         maxCells: primitivesMaxCells,
@@ -1042,7 +1260,7 @@ const DepthDrawer = memo(function DepthDrawer({
         maxBoxes: primitivesMaxBoxes,
       }
     );
-  }, [cameraFloorplan, primitivesMaxBoxes, primitivesMaxCells, primitivesMinDensity, primitivesMinFootprintM2, primitivesMinHeightM]);
+  }, [cameraFloorplan, primitivesObstacleHeightLayer, primitivesObstacleObservedLayer, primitivesMaxBoxes, primitivesMaxCells, primitivesMinDensity, primitivesMinFootprintM2, primitivesMinHeightM]);
 
   const obstacleBoxes = primitivesModel?.boxes ?? [];
   const selectedIntrinsics = useMemo(
@@ -1066,7 +1284,34 @@ const DepthDrawer = memo(function DepthDrawer({
     selectedExtrinsics,
     cameraFloorplan,
   ]);
-  const visibleFloorModel = visibleFloorResult.model;
+  const scenePriorFloorResult = useMemo(() => buildScenePriorFloorPlaneModel({
+    cameraId: selectedCamera,
+    floorplan: cameraFloorplan,
+    heightLayer: sceneStaticHeightLayer,
+    observedLayer: sceneStaticObservedLayer,
+  }), [
+    selectedCamera,
+    cameraFloorplan,
+    sceneStaticHeightLayer,
+    sceneStaticObservedLayer,
+  ]);
+  const sceneFusionFloorResult = useMemo(() => buildScenePriorFloorPlaneModel({
+    cameraId: selectedCamera,
+    floorplan: cameraFloorplan,
+    heightLayer: sceneFusionFloorHeightLayer,
+    observedLayer: sceneFusionFloorSupportedLayer,
+  }), [
+    selectedCamera,
+    cameraFloorplan,
+    sceneFusionFloorHeightLayer,
+    sceneFusionFloorSupportedLayer,
+  ]);
+  const floorPlaneResult = hasSceneFusionFloor
+    ? sceneFusionFloorResult
+    : hasScenePrior
+      ? scenePriorFloorResult
+      : visibleFloorResult;
+  const visibleFloorModel = floorPlaneResult.model;
   const handleFloorPlaneCanvasReady = useCallback((canvas: HTMLCanvasElement | null) => {
     floorPlaneCanvasRef.current = canvas;
   }, []);
@@ -1222,6 +1467,8 @@ const DepthDrawer = memo(function DepthDrawer({
         clearCanvasElement(walkableCanvasRef.current);
         clearCanvasElement(floorplanCompositeCanvasRef.current);
         clearCanvasElement(structuralFloorplanCanvasRef.current);
+        clearCanvasElement(sceneStaticCanvasRef.current);
+        clearCanvasElement(sceneCompositeCanvasRef.current);
       }
       return;
     }
@@ -1260,31 +1507,43 @@ const DepthDrawer = memo(function DepthDrawer({
           sourceRect: displaySourceRectForLayer(heightAglLayer),
           imageSmoothing: false,
         });
+        renderLayerToCanvas(sceneStaticCanvasRef.current, sceneStaticHeightLayer, turboColor, {
+          fit: 'contain',
+          valueMin: 0,
+          valueMax: HEIGHT_AGL_ROOM_MAX_M,
+          maskLayer: sceneStaticObservedLayer,
+          maskThreshold: HEIGHT_CONTRAST_DENSITY_THRESH,
+          unknownColor: UNKNOWN_CELL_COLOR,
+          unknownAltColor: UNKNOWN_CELL_ALT_COLOR,
+          imageSmoothing: false,
+        });
+        renderLayerToCanvas(sceneCompositeCanvasRef.current, sceneCompositeHeightLayer, turboColor, {
+          fit: 'contain',
+          valueMin: 0,
+          valueMax: HEIGHT_AGL_ROOM_MAX_M,
+          maskLayer: sceneCompositeObservedLayer,
+          maskThreshold: HEIGHT_CONTRAST_DENSITY_THRESH,
+          unknownColor: UNKNOWN_CELL_COLOR,
+          unknownAltColor: UNKNOWN_CELL_ALT_COLOR,
+          imageSmoothing: false,
+        });
         renderTopdownLayer(distanceCanvasRef.current, distanceLayer, viridisColor);
         renderTopdownLayer(obstacleHeightCanvasRef.current, obstacleHeightLayer, infernoColor);
         renderTopdownLayer(walkableCanvasRef.current, walkableLayer, bwColor, true);
-        renderLayerToCanvas(
+        renderTextureFloorplanToCanvas(
           floorplanCompositeCanvasRef.current,
-          primaryFloorplanLayer,
-          infernoColor,
+          structuralHeightLayer,
+          roomFootprintLayer,
+          measuredPerimeterLayer,
+          surfaceRgbLayer,
           {
             fit: 'contain',
-            ...(primaryFloorplanRange
-              ? {
-                valueMin: primaryFloorplanRange.min,
-                valueMax: primaryFloorplanRange.max,
-              }
-              : {}),
-            gamma: HEIGHT_CONTRAST_GAMMA,
-            maskLayer: renderObservationMaskLayer,
-            maskThreshold: HEIGHT_CONTRAST_DENSITY_THRESH,
-            maskInvert: renderObservationMaskInvert,
-            unknownColor: PRIMARY_FLOORPLAN_UNKNOWN,
-            unknownAltColor: PRIMARY_FLOORPLAN_UNKNOWN,
-            repairIsolatedMaskHoles: true,
-            sourceRect: displaySourceRectForLayer(primaryFloorplanLayer),
+            sourceRect: displaySourceRectForLayer(structuralHeightLayer),
             background: '#000',
-            imageSmoothing: true,
+            imageSmoothing: false,
+            // Floorplan grids are already serialized in final camera-local
+            // orientation. image_flip is diagnostic-only and must not be
+            // applied again at the display boundary.
           },
         );
         renderStructuralFloorplanToCanvas(
@@ -1297,10 +1556,8 @@ const DepthDrawer = memo(function DepthDrawer({
           surfaceRgbLayer,
           {
             fit: 'contain',
-            unknownColor: UNKNOWN_CELL_COLOR,
-            unknownAltColor: UNKNOWN_CELL_ALT_COLOR,
             sourceRect: displaySourceRectForLayer(structuralHeightLayer),
-            bounds: structuralFloorplanBounds,
+            bounds: detailedFloorplanBounds,
             metricGridM: 1,
             imageSmoothing: false,
           }
@@ -1308,7 +1565,7 @@ const DepthDrawer = memo(function DepthDrawer({
         renderTopdownLayer(gradientCanvasRef.current, gradientLayer, viridisColor);
       }
     }
-  }, [activeTab, open, cameraFloorplan, densityLayer, renderObservationMaskLayer, renderObservationMaskInvert, heightLayer, heightAglLayer, heightContrastRange, heightMaxRaw, heightAglRange, primaryFloorplanLayer, primaryFloorplanRange, distanceLayer, gradientLayer, obstacleHeightLayer, walkableLayer, structuralHeightLayer, roomFootprintLayer, surfaceObservedLayer, wallSupportLayer, roomBoundaryLayer, surfaceRgbLayer, structuralFloorplanBounds, renderTopdownLayer, clearCanvasElement, drawerWidth, floorplanError, diagnosticsOpen, displaySourceRectForLayer]);
+  }, [activeTab, open, cameraFloorplan, densityLayer, renderObservationMaskLayer, renderObservationMaskInvert, inferredWalkableLayer, heightLayer, heightAglLayer, heightContrastRange, heightMaxRaw, heightAglRange, distanceLayer, gradientLayer, obstacleHeightLayer, walkableLayer, structuralHeightLayer, roomFootprintLayer, surfaceObservedLayer, wallSupportLayer, roomBoundaryLayer, measuredPerimeterLayer, surfaceRgbLayer, sceneStaticHeightLayer, sceneStaticObservedLayer, sceneCompositeHeightLayer, sceneCompositeObservedLayer, renderTopdownLayer, clearCanvasElement, drawerWidth, floorplanError, diagnosticsOpen, displaySourceRectForLayer, detailedFloorplanBounds]);
 
   useEffect(() => {
     if (!open) return;
@@ -1400,7 +1657,7 @@ const DepthDrawer = memo(function DepthDrawer({
     type ExportRaster = {
       label: string;
       canvas: HTMLCanvasElement | null;
-      source: 'payload' | 'floorplan-grid' | 'display';
+      source: 'payload' | 'floorplan-grid' | 'display' | 'scene-fusion-diagnostic';
       valueRange?: SimpleRange | null;
       integerScale?: number;
     };
@@ -1412,6 +1669,8 @@ const DepthDrawer = memo(function DepthDrawer({
       palette: (t: number) => [number, number, number],
       valueRange?: SimpleRange | null,
       showInferredWalkable = false,
+      maskLayer: FloorplanLayer | undefined = renderObservationMaskLayer,
+      maskInvert = renderObservationMaskInvert,
     ) => {
       if (!layer?.grid_shape || !layer.grid_b64) return;
       const [rows, cols] = layer.grid_shape;
@@ -1424,9 +1683,9 @@ const DepthDrawer = memo(function DepthDrawer({
         targetHeightPx: rows * scale,
         pixelRatio: 1,
         imageSmoothing: false,
-        maskLayer: renderObservationMaskLayer,
+        maskLayer,
         maskThreshold: HEIGHT_CONTRAST_DENSITY_THRESH,
-        maskInvert: renderObservationMaskInvert,
+        maskInvert,
         unknownColor: UNKNOWN_CELL_COLOR,
         unknownAltColor: UNKNOWN_CELL_ALT_COLOR,
         ...(showInferredWalkable ? { inferredWalkableLayer } : {}),
@@ -1462,45 +1721,36 @@ const DepthDrawer = memo(function DepthDrawer({
           valueRange: heatmapRange,
         });
       }
-      if (primaryFloorplanLayer?.grid_shape && primaryFloorplanLayer.grid_b64) {
-        const [rows, cols] = primaryFloorplanLayer.grid_shape;
-        const sourceRect = displaySourceRectForLayer(primaryFloorplanLayer);
+      if (structuralHeightLayer?.grid_shape && structuralHeightLayer.grid_b64) {
+        const [rows, cols] = structuralHeightLayer.grid_shape;
+        const sourceRect = displaySourceRectForLayer(structuralHeightLayer);
         const outputRows = sourceRect?.height ?? rows;
         const outputCols = sourceRect?.width ?? cols;
         const scale = integerExportScale(outputRows, outputCols);
         const canvas = document.createElement('canvas');
-        const result = renderLayerToCanvas(
+        const result = renderTextureFloorplanToCanvas(
           canvas,
-          primaryFloorplanLayer,
-          infernoColor,
+          structuralHeightLayer,
+          roomFootprintLayer,
+          measuredPerimeterLayer,
+          surfaceRgbLayer,
           {
             fit: 'stretch',
             targetWidthPx: outputCols * scale,
             targetHeightPx: outputRows * scale,
             pixelRatio: 1,
-            imageSmoothing: true,
-            maskLayer: renderObservationMaskLayer,
-            maskThreshold: HEIGHT_CONTRAST_DENSITY_THRESH,
-            maskInvert: renderObservationMaskInvert,
-            unknownColor: PRIMARY_FLOORPLAN_UNKNOWN,
-            unknownAltColor: PRIMARY_FLOORPLAN_UNKNOWN,
-            repairIsolatedMaskHoles: true,
+            imageSmoothing: false,
             sourceRect,
-            ...(primaryFloorplanRange
-              ? {
-                valueMin: primaryFloorplanRange.min,
-                valueMax: primaryFloorplanRange.max,
-              }
-              : {}),
-            gamma: HEIGHT_CONTRAST_GAMMA,
+            background: '#000',
+            // Match the on-screen final-oriented raster exactly.
           },
         );
         if (result) {
           canvases.push({
-            label: 'floorplan-observed-height-primary',
+            label: 'floorplan-observed-texture-primary',
             canvas,
             source: 'floorplan-grid',
-            valueRange: result.valueRange ?? primaryFloorplanRange,
+            valueRange: result.valueRange,
             integerScale: scale,
           });
         }
@@ -1512,7 +1762,26 @@ const DepthDrawer = memo(function DepthDrawer({
       addFloorplanLayer('distance-viridis', distanceLayer, viridisColor);
       addFloorplanLayer('obstacle-height-clean', obstacleHeightLayer, infernoColor);
       addFloorplanLayer('walkable-binary', walkableLayer, bwColor, null, true);
+      addFloorplanLayer('measured-perimeter', measuredPerimeterLayer, bwColor);
       addFloorplanLayer('gradient-edges', gradientLayer, viridisColor);
+      addFloorplanLayer(
+        'conditioned-room-walk-static-prior',
+        sceneStaticHeightLayer,
+        turboColor,
+        { min: 0, max: HEIGHT_AGL_ROOM_MAX_M },
+        false,
+        sceneStaticObservedLayer,
+        false,
+      );
+      addFloorplanLayer(
+        'live-conditioned-prior-composite',
+        sceneCompositeHeightLayer,
+        turboColor,
+        { min: 0, max: HEIGHT_AGL_ROOM_MAX_M },
+        false,
+        sceneCompositeObservedLayer,
+        false,
+      );
 
       const compositeLayer = structuralHeightLayer;
       if (compositeLayer?.grid_shape && compositeLayer.grid_b64) {
@@ -1533,9 +1802,7 @@ const DepthDrawer = memo(function DepthDrawer({
             targetHeightPx: rows * scale,
             pixelRatio: 1,
             imageSmoothing: false,
-            unknownColor: UNKNOWN_CELL_COLOR,
-            unknownAltColor: UNKNOWN_CELL_ALT_COLOR,
-            bounds: structuralFloorplanBounds,
+            bounds: detailedFloorplanBounds,
             metricGridM: 1,
           },
         );
@@ -1560,11 +1827,35 @@ const DepthDrawer = memo(function DepthDrawer({
     } else if (activeTab === '3d') {
       canvases.push({ label: 'stream-preview', canvas: streamPreviewCanvasRef.current, source: 'display' });
       if (primitivesView === 'visible-floor') {
-        canvases.push({ label: 'visible-floor-plane', canvas: floorPlaneCanvasRef.current, source: 'display' });
+        canvases.push({
+          label: hasSceneFusionFloor
+            ? 'fixed-phone-fusion-floor-plane'
+            : hasScenePrior
+              ? 'conditioned-room-walk-floor-plane'
+              : 'visible-floor-plane',
+          canvas: floorPlaneCanvasRef.current,
+          source: 'display',
+        });
       } else if (primitivesView === 'heightfield') {
-        canvases.push({ label: 'cached-heightfield', canvas: heightfieldCanvasRef.current, source: 'display' });
+        canvases.push({
+          label: hasSceneFusionSurface
+            ? 'fixed-phone-fusion-heightfield'
+            : hasScenePrior
+              ? 'conditioned-room-walk-heightfield'
+              : 'cached-heightfield',
+          canvas: heightfieldCanvasRef.current,
+          source: 'display',
+        });
       } else if (primitivesView === 'point-cloud') {
-        canvases.push({ label: `calibrated-point-cloud-${pointCloudColorMode}`, canvas: pointCloudCanvasRef.current, source: 'display' });
+        canvases.push({
+          label: hasSceneFusionPoints
+            ? 'fixed-phone-fusion-point-cloud'
+            : hasScenePrior
+              ? 'conditioned-room-walk-point-cloud'
+              : `calibrated-point-cloud-${pointCloudColorMode}`,
+          canvas: pointCloudCanvasRef.current,
+          source: 'display',
+        });
       } else {
         canvases.push({ label: 'extruded-floorplan', canvas: extrudedCanvasRef.current, source: 'display' });
       }
@@ -1624,9 +1915,15 @@ const DepthDrawer = memo(function DepthDrawer({
       floorplan_snapshot_id: cameraFloorplan?.snapshot_id ?? null,
       floorplan_snapshot_content_sha256: cameraFloorplan?.snapshot_content_sha256 ?? null,
       floorplan_served_from_cache: cameraFloorplan?.served_from_cache ?? null,
+      floorplan_image_flip: activeTab === 'heatmap'
+        ? {
+          u: Boolean(cameraFloorplan?.image_flip?.u),
+          v: Boolean(cameraFloorplan?.image_flip?.v),
+        }
+        : null,
       floorplan_display_viewport: activeTab === 'heatmap' && floorplanDisplayViewport
         ? {
-          mode: 'observed_cells_crop_v2',
+          mode: 'observed_footprint_crop_v1',
           source_rect_grid: floorplanDisplayViewport.sourceRect,
           crop_width_m: floorplanDisplayViewport.cropWidthM,
           crop_depth_m: floorplanDisplayViewport.cropDepthM,
@@ -1635,7 +1932,27 @@ const DepthDrawer = memo(function DepthDrawer({
           authoritative_grid_unchanged: true,
         }
         : null,
-      floor_plane_status: activeTab === '3d' ? visibleFloorResult.status : undefined,
+      floor_plane_status: activeTab === '3d' ? floorPlaneResult.status : undefined,
+      scene_prior_3d_source: activeTab === '3d' && hasScenePrior
+        ? {
+          prior_id: scenePriorMeta?.prior_id ?? null,
+          source_type: scenePriorMeta?.source_type ?? null,
+          source_model: scenePriorMeta?.source_model ?? null,
+        }
+        : null,
+      scene_fusion_3d_source: activeTab === '3d' && (
+        hasSceneFusionSurface
+        || hasSceneFusionObstacles
+        || hasSceneFusionFloor
+        || hasSceneFusionPoints
+      )
+        ? {
+          fusion_id: sceneFusionMeta?.fusion_id ?? null,
+          inference: sceneFusionMeta?.inference ?? null,
+          point_count: sceneFusionPoints?.point_count ?? null,
+          per_view_selection: true,
+        }
+        : null,
     };
     saveBlob(
       new Blob([JSON.stringify(manifest, null, 2)], { type: 'application/json' }),
@@ -1649,38 +1966,45 @@ const DepthDrawer = memo(function DepthDrawer({
     depthEntry,
     depthMetaEntry,
     decodedDepth,
+    detailedFloorplanBounds,
+    displaySourceRectForLayer,
     distanceLayer,
     floorplanDisplayViewport,
-    displaySourceRectForLayer,
     gradientLayer,
     heatmapRange,
     heatmapRangeMode,
+    hasSceneFusionFloor,
+    hasSceneFusionObstacles,
+    hasSceneFusionPoints,
+    hasSceneFusionSurface,
+    hasScenePrior,
     heightAglLayer,
     heightAglRange,
     heightContrastRange,
     heightLayer,
     obstacleHeightLayer,
     observationMaskLayer,
+    measuredPerimeterLayer,
     normalsView,
     renderObservationMaskLayer,
     renderObservationMaskInvert,
     inferredWalkableLayer,
-    roomBoundaryLayer,
-    roomFootprintLayer,
-    structuralFloorplanBounds,
-    structuralHeightLayer,
-    surfaceObservedLayer,
-    surfaceRgbLayer,
-    wallSupportLayer,
     pointCloudColorMode,
-    primaryFloorplanLayer,
-    primaryFloorplanRange,
     primitivesView,
     rgbOverlayOpacity,
     saveBlob,
     saveCanvas,
     selectedCamera,
-    visibleFloorResult.status,
+    structuralHeightLayer,
+    roomFootprintLayer,
+    surfaceObservedLayer,
+    wallSupportLayer,
+    roomBoundaryLayer,
+    sceneFusionMeta,
+    sceneFusionPoints,
+    scenePriorMeta,
+    surfaceRgbLayer,
+    floorPlaneResult.status,
     walkableLayer,
   ]);
 
@@ -1750,11 +2074,17 @@ const DepthDrawer = memo(function DepthDrawer({
                     onClick={() => {
                       if (!selectedCamera) return;
                       try { console.debug('[UI] refresh depth', selectedCamera); } catch { }
-                      onRequestDepthFresh(selectedCamera);
+                      (onRequestDepthFresh ?? onRefreshDepthPanel)?.(selectedCamera);
                     }}
-                    disabled={refreshPending}
+                    disabled={!selectedCamera || !transportOpen || anyRefreshPending}
                     aria-label="Refresh depth frame"
-                    title={refreshPending ? 'A coherent depth/floorplan refresh is already running.' : undefined}
+                    title={
+                      !transportOpen
+                        ? 'WebSocket is disconnected.'
+                        : anyRefreshPending
+                          ? 'A coherent depth/floorplan refresh is already running.'
+                          : 'Capture one coherent depth and floorplan snapshot'
+                    }
                   >
                     <svg viewBox="0 0 16 16" aria-hidden="true">
                       <path
@@ -1886,11 +2216,11 @@ const DepthDrawer = memo(function DepthDrawer({
                 )}
                 <div className="heatmap-cell heatmap-cell--primary heatmap-cell--no-scale">
                   <div className="heatmap-cell__body">
-                    <div className="heatmap-cell__title">Observed Height Floorplan · Primary</div>
+                    <div className="heatmap-cell__title">Observed Textured Floorplan · Primary</div>
                     <canvas
                       ref={floorplanCompositeCanvasRef}
                       className="heatmap-canvas"
-                      style={{ aspectRatio: `${displayLayerAspect(primaryFloorplanLayer)}` }}
+                      style={{ aspectRatio: `${displayLayerAspect(structuralHeightLayer)}` }}
                     />
                     <div className="floorplan-class-keys">
                       {floorplanDisplayViewport && (
@@ -1900,10 +2230,13 @@ const DepthDrawer = memo(function DepthDrawer({
                         </div>
                       )}
                       <div className="unknown-cell-key">
-                        Black = unknown · Inferno = observed scalar height
-                        {primaryFloorplanRange
-                          ? ` (${formatNumber(primaryFloorplanRange.min, 2)}–${formatNumber(primaryFloorplanRange.max, 2)} m)`
-                          : ''}
+                        Texture = observed horizontal surfaces · subtle color = fixed 0–1.65 m structural height
+                      </div>
+                      <div className="unknown-cell-key">
+                        Black = unsupported · gray outline = inferred footprint · light edge = measured wall support
+                      </div>
+                      <div className="unknown-cell-key">
+                        Sampling gaps are repaired only within 0.12 m
                       </div>
                     </div>
                   </div>
@@ -1945,6 +2278,42 @@ const DepthDrawer = memo(function DepthDrawer({
                       </div>
                     </div>
                   </div>
+                  {hasScenePrior && (
+                    <div className="heatmap-cell heatmap-cell--left">
+                      <div className="heatmap-cell__scale">
+                        {renderScale(turboGradient, 0, HEIGHT_AGL_ROOM_MAX_M / 2, HEIGHT_AGL_ROOM_MAX_M, ' m')}
+                      </div>
+                      <div className="heatmap-cell__body">
+                        <div className="heatmap-cell__title">Conditioned Room Walk · Static Prior</div>
+                        <canvas
+                          ref={sceneStaticCanvasRef}
+                          className="heatmap-canvas"
+                          style={{ aspectRatio: `${layerAspect(sceneStaticHeightLayer)}` }}
+                        />
+                        <div className="unknown-cell-key">
+                          Camera right → · camera forward ↑ · unknown cells remain open
+                        </div>
+                      </div>
+                    </div>
+                  )}
+                  {hasSceneComposite && (
+                    <div className="heatmap-cell heatmap-cell--right">
+                      <div className="heatmap-cell__body">
+                        <div className="heatmap-cell__title">Live + Conditioned Prior · Composite</div>
+                        <canvas
+                          ref={sceneCompositeCanvasRef}
+                          className="heatmap-canvas"
+                          style={{ aspectRatio: `${layerAspect(sceneCompositeHeightLayer)}` }}
+                        />
+                        <div className="unknown-cell-key">
+                          Same camera-ground orientation · live observed cells win
+                        </div>
+                      </div>
+                      <div className="heatmap-cell__scale">
+                        {renderScale(turboGradient, 0, HEIGHT_AGL_ROOM_MAX_M / 2, HEIGHT_AGL_ROOM_MAX_M, ' m')}
+                      </div>
+                    </div>
+                  )}
                   <div className="heatmap-cell heatmap-cell--left">
                     <div className="heatmap-cell__body">
                       <div className="heatmap-cell__title">Density (Grayscale)</div>
@@ -2198,76 +2567,113 @@ const DepthDrawer = memo(function DepthDrawer({
                     />
                     <div className="primitives-submeta">
                       {primitivesModel
-                        ? `Grid ${primitivesModel.cols}×${primitivesModel.rows} · max height ${formatNumber(primitivesModel.maxHeightM)} m`
+                        ? `${hasSceneFusionObstacles ? 'Fixed + phone fusion' : hasScenePrior ? 'Conditioned room walk' : 'Live cached floorplan'} · grid ${primitivesModel.cols}×${primitivesModel.rows} · max height ${formatNumber(primitivesModel.maxHeightM)} m`
                         : 'Waiting for floorplan grids…'}
                     </div>
                   </div>
                 ) : primitivesView === 'heightfield' ? (
                   <div className="primitives-panel">
-                    <div className="primitives-panel__title">Observed Height Above Floor</div>
+                    <div className="primitives-panel__title">
+                      {hasSceneFusionSurface
+                        ? 'Fixed + Phone Fusion Height Above Floor'
+                        : hasScenePrior
+                          ? 'Conditioned Room Height Above Floor'
+                          : 'Observed Height Above Floor'}
+                    </div>
                     <div className="floor-plane-view-wrap">
                       <CachedHeightfield3DView
                         floorplan={cameraFloorplan}
-                        heightLayer={heightAglLayer}
-                        densityLayer={observationMaskLayer}
+                        heightLayer={primitivesHeightLayer}
+                        densityLayer={primitivesObservedLayer}
                         heightExaggeration={primitivesHeightExaggeration}
                         onCanvasReady={handleHeightfieldCanvasReady}
                       />
-                      {!hasHeightAgl && (
-                        <div className="floor-plane-empty">Waiting for cached height_agl and density grids.</div>
+                      {!primitivesHeightLayer?.grid_b64 && (
+                        <div className="floor-plane-empty">Waiting for height and observation grids.</div>
                       )}
                     </div>
                     <div className="primitives-submeta">
-                      {hasHeightAgl
-                        ? `Grid ${heightAglLayer?.grid_shape?.[1] ?? 0}×${heightAglLayer?.grid_shape?.[0] ?? 0} · highest observed surface per cell · unknown cells omitted · zero plane is fitted floor · ${formatNumber(primitivesHeightExaggeration, 1)}× height`
+                      {primitivesHeightLayer?.grid_b64
+                        ? `${hasSceneFusionSurface ? `Fusion ${sceneFusionMeta?.fusion_id ?? 'unknown'} · ` : hasScenePrior ? `Prior ${scenePriorMeta?.prior_id ?? 'unknown'} · ` : ''}grid ${primitivesHeightLayer.grid_shape?.[1] ?? 0}×${primitivesHeightLayer.grid_shape?.[0] ?? 0} · highest supported surface per cell · unknown cells omitted · zero plane is fitted floor · ${formatNumber(primitivesHeightExaggeration, 1)}× height`
                         : 'Waiting for plane-relative height data…'}
                     </div>
                   </div>
                 ) : primitivesView === 'point-cloud' ? (
                   <div className="primitives-panel">
-                    <div className="primitives-panel__title">Calibrated Dense Point Cloud</div>
+                    <div className="primitives-panel__title">
+                      {hasSceneFusionPoints
+                        ? 'Fixed + Phone Fusion Point Cloud'
+                        : hasScenePrior
+                          ? 'Conditioned Fusion Point Cloud'
+                          : 'Calibrated Dense Point Cloud'}
+                    </div>
                     <div className="floor-plane-view-wrap">
-                      <CalibratedPointCloud3DView
-                        depthValues={decodedDepth?.depth}
-                        confidenceValues={decodedDepth?.confidence}
-                        maskValues={decodedDepth?.mask}
-                        rgbValues={decodedDepth?.rgb}
-                        rgbShape={decodedDepth?.rgbShape}
-                        width={decodedDepth?.width}
-                        height={decodedDepth?.height}
-                        intrinsics={selectedIntrinsics}
-                        floorModel={visibleFloorModel}
-                        colorMode={pointCloudColorMode}
-                        onCanvasReady={handlePointCloudCanvasReady}
-                      />
-                      {(!decodedDepth || !selectedIntrinsics) && (
+                      {hasSceneFusionPoints ? (
+                        <FusedPointCloud3DView
+                          artifact={sceneFusionPoints}
+                          colorMode="rgb"
+                          hideOverhead={false}
+                          onCanvasReady={handlePointCloudCanvasReady}
+                        />
+                      ) : hasScenePrior ? (
+                        <ScenePriorPointCloud3DView
+                          cameraId={selectedCamera}
+                          expectedPriorId={scenePriorMeta?.prior_id}
+                          onCanvasReady={handlePointCloudCanvasReady}
+                        />
+                      ) : (
+                        <CalibratedPointCloud3DView
+                          depthValues={decodedDepth?.depth}
+                          confidenceValues={decodedDepth?.confidence}
+                          maskValues={decodedDepth?.mask}
+                          rgbValues={decodedDepth?.rgb}
+                          rgbShape={decodedDepth?.rgbShape}
+                          width={decodedDepth?.width}
+                          height={decodedDepth?.height}
+                          intrinsics={selectedIntrinsics}
+                          floorModel={visibleFloorModel}
+                          colorMode={pointCloudColorMode}
+                          onCanvasReady={handlePointCloudCanvasReady}
+                        />
+                      )}
+                      {!hasSceneFusionPoints && !hasScenePrior && (!decodedDepth || !selectedIntrinsics) && (
                         <div className="floor-plane-empty">
                           {!decodedDepth ? 'Waiting for cached dense depth.' : 'Waiting for camera intrinsics.'}
                         </div>
                       )}
                     </div>
                     <div className="primitives-submeta">
-                      {decodedDepth && selectedIntrinsics
+                      {hasSceneFusionPoints
+                        ? `${sceneFusionPoints?.point_count ?? 0} fixed + phone fusion points · fixed→phone median ${formatNumber(sceneFusionMeta?.quality?.fixed_to_phone_median_m ?? 0, 3)} m · ${formatNumber((sceneFusionMeta?.quality?.fixed_overlap_0p25m ?? 0) * 100, 1)}% fixed overlap at 25 cm · camera right → · forward ↑`
+                        : hasScenePrior
+                          ? `MapAnything + DA3 prior-conditioned consensus · ${scenePriorMeta?.static_available_cells ?? 0} represented grid cells · backend world transformed to this camera · prior ${scenePriorMeta?.prior_id ?? 'unknown'}`
+                          : decodedDepth && selectedIntrinsics
                         ? `Source ${decodedDepth.width}×${decodedDepth.height} · bounded to 250,000 mask-valid points · ${decodedDepth.rgb ? 'exact snapshot RGB available' : 'exact snapshot RGB unavailable'} · camera-local metric frame`
                         : 'Depth and camera calibration are required.'}
                     </div>
                   </div>
                 ) : (
                   <div className="primitives-panel">
-                    <div className="primitives-panel__title">Visible Floor Plane</div>
+                    <div className="primitives-panel__title">
+                      {hasSceneFusionFloor
+                        ? 'Visible Floor · Fixed + Phone Fusion'
+                        : hasScenePrior
+                          ? 'Visible Floor · Conditioned Room Walk'
+                          : 'Visible Floor Plane'}
+                    </div>
                     <div className="floor-plane-view-wrap">
                       <FloorPlane3DView
                         model={visibleFloorModel}
                         onCanvasReady={handleFloorPlaneCanvasReady}
                       />
                       {!visibleFloorModel && (
-                        <div className="floor-plane-empty">{visibleFloorResult.message}</div>
+                        <div className="floor-plane-empty">{floorPlaneResult.message}</div>
                       )}
                     </div>
                     <div className="primitives-submeta">
                       {visibleFloorModel
-                        ? `Support ${visibleFloorModel.metrics.estimatedVisibleFloorPixelCount} px · footprint ${visibleFloorModel.footprintMesh.cellCount} cells · ${formatNumber(visibleFloorModel.footprintMesh.areaM2, 1)} m²`
-                        : visibleFloorResult.message}
+                        ? `${hasSceneFusionFloor ? 'Fusion floor support' : hasScenePrior ? 'Conditioned floor support' : 'Visible support'} ${visibleFloorModel.metrics.estimatedVisibleFloorPixelCount} cells · footprint ${visibleFloorModel.footprintMesh.cellCount} cells · ${formatNumber(visibleFloorModel.footprintMesh.areaM2, 1)} m²${hasSceneFusionFloor ? ` · fusion ${sceneFusionMeta?.fusion_id ?? 'unknown'}` : hasScenePrior ? ` · prior ${scenePriorMeta?.prior_id ?? 'unknown'}` : ''}`
+                        : floorPlaneResult.message}
                     </div>
                   </div>
                 )}
@@ -2293,7 +2699,7 @@ const DepthDrawer = memo(function DepthDrawer({
                 </details>
               )}
 
-              {primitivesView === 'point-cloud' && (
+              {primitivesView === 'point-cloud' && !hasSceneFusionPoints && !hasScenePrior && (
                 <details className="primitives-details">
                   <summary>Point-cloud settings</summary>
                   <div className="primitives-settings">

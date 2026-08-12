@@ -25,6 +25,7 @@ export type FloorplanBootstrapSnapshot = {
   queue: string[];
   active: null | {
     camera: string;
+    phase: 'cache' | 'fresh';
     retryCount: number;
     requestId: string;
   };

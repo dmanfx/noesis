@@ -76,11 +76,7 @@ export type FrameHandlers = {
   onMADiagnostics?: (payload: any) => void;
   onMADepth?: (
     payload: any,
-    context?: {
-      requestId: string;
-      deadlineAtMs: number;
-      expectedCameraId: string;
-    },
+    context?: { requestId: string; deadlineAtMs: number },
   ) => void | Promise<void>;
   onFloorplan?: (payload: any) => void;
   onAutoCalibrateResult?: (payload: any) => void;
@@ -97,9 +93,6 @@ export type FloorplanRequest = {
   maxExtentM?: number;
   requestId?: string;
   cacheOnly?: boolean;
-  snapshotRef?: string;
-  snapshotId?: string;
-  snapshotContentSha256?: string;
 };
 
 export type DepthRequestStrategy = 'fresh' | 'cache-first' | 'cache-only';
@@ -119,7 +112,7 @@ export function useWebSocketClient(url: string, handlers: FrameHandlers) {
   const maxRetries = 10;
   const heartbeatRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const reconnectTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const depthInFlightRef = useRef<Record<string, Set<string>>>({});
+  const depthInFlightRef = useRef<Map<string, Set<string>>>(new Map());
   const depthRequestTimeoutsRef = useRef<Map<string, PendingDepthRequest>>(new Map());
   const handlersRef = useRef(handlers);
   handlersRef.current = handlers;
@@ -129,24 +122,28 @@ export function useWebSocketClient(url: string, handlers: FrameHandlers) {
       ? ''
       : String(requestId);
     if (requestKey) {
-      const request = depthRequestTimeoutsRef.current.get(requestKey);
-      if (request) clearTimeout(request.timeout);
+      const pendingRequest = depthRequestTimeoutsRef.current.get(requestKey);
+      if (pendingRequest) clearTimeout(pendingRequest.timeout);
       depthRequestTimeoutsRef.current.delete(requestKey);
-      for (const [camera, pending] of Object.entries(depthInFlightRef.current)) {
+      for (const [camera, pending] of depthInFlightRef.current.entries()) {
         if (!pending.delete(requestKey)) continue;
-        if (pending.size === 0) delete depthInFlightRef.current[camera];
+        if (pending.size === 0) depthInFlightRef.current.delete(camera);
         return;
       }
+      return;
     }
+
     const cameraKey = cameraId === undefined || cameraId === null
       ? ''
       : String(cameraId);
-    const pending = depthInFlightRef.current[cameraKey];
+    const pending = depthInFlightRef.current.get(cameraKey);
     if (!pending) return;
-    if (requestKey) pending.delete(requestKey);
-    if (!requestKey || pending.size === 0) {
-      delete depthInFlightRef.current[cameraKey];
+    for (const id of pending) {
+      const pendingRequest = depthRequestTimeoutsRef.current.get(id);
+      if (pendingRequest) clearTimeout(pendingRequest.timeout);
+      depthRequestTimeoutsRef.current.delete(id);
     }
+    depthInFlightRef.current.delete(cameraKey);
   };
 
   const clearAllDepthRequests = () => {
@@ -154,14 +151,16 @@ export function useWebSocketClient(url: string, handlers: FrameHandlers) {
       clearTimeout(request.timeout);
     }
     depthRequestTimeoutsRef.current.clear();
-    depthInFlightRef.current = {};
+    depthInFlightRef.current.clear();
   };
 
   const registerDepthRequest = (cameraId: string, requestId: string) => {
     if (!cameraId || !requestId) return;
-    const bucket = depthInFlightRef.current[cameraId] || new Set<string>();
+    const bucket = depthInFlightRef.current.get(cameraId) || new Set<string>();
     bucket.add(requestId);
-    depthInFlightRef.current[cameraId] = bucket;
+    depthInFlightRef.current.set(cameraId, bucket);
+    const existingRequest = depthRequestTimeoutsRef.current.get(requestId);
+    if (existingRequest) clearTimeout(existingRequest.timeout);
     const deadlineAtMs = performance.now() + DEPTH_REQUEST_TIMEOUT_MS;
     const timeout = setTimeout(
       () => finishDepthRequest(cameraId, requestId),
@@ -189,9 +188,6 @@ export function useWebSocketClient(url: string, handlers: FrameHandlers) {
         grid_res_m: (obj as any).grid_res_m,
         max_extent_m: (obj as any).max_extent_m,
         cache_only: (obj as any).cache_only,
-        snapshot_ref: (obj as any).snapshot_ref,
-        snapshot_id: (obj as any).snapshot_id,
-        snapshot_content_sha256: (obj as any).snapshot_content_sha256,
       };
     }
     if (type === 'get_ma_depth' || type === 'get_ma_depth_cache') {
@@ -286,6 +282,7 @@ export function useWebSocketClient(url: string, handlers: FrameHandlers) {
             return;
           }
           const data = JSON.parse(ev.data);
+          const currentHandlers = handlersRef.current;
 
           // Handle ping messages by responding with pong
           if (data.type === 'ping') {
@@ -300,7 +297,7 @@ export function useWebSocketClient(url: string, handlers: FrameHandlers) {
 
           if (data.type === 'auto_calibrate_result') {
             wsLog.debug('[WS] auto-calibrate result', data);
-            try { handlersRef.current.onAutoCalibrateResult?.(data); } catch { }
+            try { currentHandlers.onAutoCalibrateResult?.(data); } catch { }
             return;
           }
 
@@ -312,40 +309,46 @@ export function useWebSocketClient(url: string, handlers: FrameHandlers) {
           }
 
           if (data.type === 'stats' && data.payload) {
-            handlersRef.current.onStats(data.payload as StatsPayload);
+            currentHandlers.onStats(data.payload as StatsPayload);
           } else if (data.type === 'calibration-bundle' && data.data) {
             try { setCalibration(data); } catch { }
             try {
-              handlersRef.current.onCalibration?.(data.data);
+              currentHandlers.onCalibration?.(data.data);
             } catch (err) {
               console.warn('Calibration handler failed', err);
             }
           } else if (data.type === 'toggle_update' && data.toggle_name === 'trail_visualization_enabled') {
-            handlersRef.current.onTrailToggle?.(!!data.enabled);
+            currentHandlers.onTrailToggle?.(!!data.enabled);
           } else if (data.type === 'trail_visualization_enabled_update') {
-            handlersRef.current.onTrailToggle?.(!!data.enabled);
+            currentHandlers.onTrailToggle?.(!!data.enabled);
           } else if (data.type === 'trail_settings_update') {
             const cfg = (data && typeof data.config === 'object' && data.config !== null)
               ? data.config as Record<string, unknown>
               : null;
-            if (cfg) handlersRef.current.onTrailSettings?.(cfg);
+            if (cfg) currentHandlers.onTrailSettings?.(cfg);
           } else if (data.type === 'ma_diagnostics') {
-            handlersRef.current.onMADiagnostics?.(data);
+            currentHandlers.onMADiagnostics?.(data);
           } else if (data.type === 'ma_depth_response') {
             const cam = data.camera || data.cam_id || data.cameraId || data.camera_id || data.camId;
             const requestId = data.request_id || data.requestId || data.requestID;
             const requestKey = requestId === undefined || requestId === null
               ? ''
               : String(requestId);
+            const finish = () => {
+              if (requestKey) finishDepthRequest(cam, requestKey);
+            };
             const pendingRequest = requestKey
               ? depthRequestTimeoutsRef.current.get(requestKey)
               : undefined;
+            // Correlated depth responses are admitted only while their
+            // original monotonic request budget remains live. A late response
+            // must not start a fresh bulk-transfer deadline.
             if (
               !requestKey
               || !pendingRequest
               || performance.now() >= pendingRequest.deadlineAtMs
             ) {
-              finishDepthRequest(cam, requestKey);
+              finish();
               wsLog.warn('[WS] late or unknown depth response rejected', {
                 camera: String(cam || ''),
                 requestId: requestKey,
@@ -353,40 +356,44 @@ export function useWebSocketClient(url: string, handlers: FrameHandlers) {
               return;
             }
             try {
-              const completion = handlersRef.current.onMADepth?.(data, {
-                requestId: requestKey,
-                deadlineAtMs: pendingRequest.deadlineAtMs,
-                expectedCameraId: pendingRequest.cameraId,
-              });
+              const completion = currentHandlers.onMADepth?.(
+                data,
+                pendingRequest
+                  ? {
+                      requestId: requestKey,
+                      deadlineAtMs: pendingRequest.deadlineAtMs,
+                    }
+                  : undefined,
+              );
               if (completion && typeof (completion as Promise<void>).then === 'function') {
                 void Promise.resolve(completion)
-                  .catch((error) => wsLog.warn('[WS] depth handler failed', { error: String(error) }))
-                  .finally(() => finishDepthRequest(cam, requestKey));
+                  .catch((error) => wsLog.warn('[WS] depth bulk handler failed', { error: String(error) }))
+                  .finally(finish);
               } else {
-                finishDepthRequest(cam, requestKey);
+                finish();
               }
             } catch (error) {
-              finishDepthRequest(cam, requestKey);
+              finish();
               throw error;
             }
           } else if (data.type === 'floorplan_response') {
-            handlersRef.current.onFloorplan?.(data);
+            currentHandlers.onFloorplan?.(data);
           } else if (data.type === 'bev-frame') {
-            handlersRef.current.onBevMeta?.(data);
+            currentHandlers.onBevMeta?.(data);
           } else if (data.type === 'bev-status') {
-            handlersRef.current.onBevMeta?.(data);
+            currentHandlers.onBevMeta?.(data);
           }
           // WebRTC signaling responses from server
           else if (data.type === 'webrtc_answer' && data.sdp) {
-            handlersRef.current.onWebRTCAnswer?.(data.sdp);
+            currentHandlers.onWebRTCAnswer?.(data.sdp);
           } else if (data.type === 'webrtc_ice_candidate' && data.candidate) {
-            handlersRef.current.onWebRTCIceCandidate?.({
+            currentHandlers.onWebRTCIceCandidate?.({
               candidate: data.candidate,
               sdpMLineIndex: data.sdpMLineIndex ?? 0,
               sdpMid: data.sdpMid,
             });
           } else if (data.type === 'webrtc_error') {
-            handlersRef.current.onWebRTCError?.(data.error || 'Unknown WebRTC error');
+            currentHandlers.onWebRTCError?.(data.error || 'Unknown WebRTC error');
           }
         } catch (e) {
           // Previously swallowed silently — major source of "BEV went blank with no signal".
@@ -409,8 +416,8 @@ export function useWebSocketClient(url: string, handlers: FrameHandlers) {
         clearTimeout(reconnectTimeoutRef.current);
         reconnectTimeoutRef.current = null;
       }
-      socketRef.current?.close();
       clearAllDepthRequests();
+      socketRef.current?.close();
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [url, retry]);
@@ -458,10 +465,7 @@ export function useWebSocketClient(url: string, handlers: FrameHandlers) {
     sendAutoCalibrate: (camId?: string) => sendJson({ type: 'auto_calibrate_pose', camera: camId }),
     requestMapAnythingDepth: (camId: string, strategy: DepthRequestStrategy = 'fresh', tsMaxOverride?: number) => {
       if (!camId) return false;
-      const existing = depthInFlightRef.current[camId];
-      // Keep a camera's snapshot chain single-flight. In particular, repeated
-      // refresh clicks must not start competing fresh inferences whose
-      // floorplan continuations could arrive out of order.
+      const existing = depthInFlightRef.current.get(camId);
       if (existing && existing.size > 0) {
         return false;
       }
@@ -494,14 +498,7 @@ export function useWebSocketClient(url: string, handlers: FrameHandlers) {
         max_age_sec: options?.maxAgeSec ?? 60,
         grid_res_m: options?.gridResM ?? 0.04,
         max_extent_m: options?.maxExtentM ?? 20,
-        // Omitted options must never start inference. A fresh floorplan request
-        // is always explicit and, for the depth panel, bound to one snapshot.
-        cache_only: options?.cacheOnly ?? true,
-        ...(options?.snapshotRef ? { snapshot_ref: options.snapshotRef } : {}),
-        ...(options?.snapshotId ? { snapshot_id: options.snapshotId } : {}),
-        ...(options?.snapshotContentSha256
-          ? { snapshot_content_sha256: options.snapshotContentSha256 }
-          : {}),
+        cache_only: options?.cacheOnly ?? false
       };
       const ok = sendJson(payload);
       return ok ? requestId : '';

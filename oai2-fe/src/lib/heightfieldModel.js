@@ -31,6 +31,7 @@ export function buildMaskedHeightfield({
   densityThreshold = 1e-6,
   maxVertices = 65_536,
   heightExaggeration = 1,
+  maxVisibleHeightM = Number.POSITIVE_INFINITY,
 } = {}) {
   const sourceRows = Math.max(0, Math.floor(Number(rows) || 0));
   const sourceCols = Math.max(0, Math.floor(Number(cols) || 0));
@@ -59,6 +60,7 @@ export function buildMaskedHeightfield({
   const observed = new Uint8Array(targetRows * targetCols);
   const coverage = new Float32Array(targetRows * targetCols);
   const densityCutoff = finiteNumber(densityThreshold, 1e-6);
+  const visibleHeightMaximum = finiteNumber(maxVisibleHeightM, Number.POSITIVE_INFINITY);
   const sourceRowRanges = Array.from({ length: targetRows }, (_, row) => {
     const start = Math.floor((row * sourceRows) / targetRows);
     const end = Math.min(
@@ -94,6 +96,7 @@ export function buildMaskedHeightfield({
           const sourceIdx = (sourceRow * sourceCols) + sourceCol;
           const height = Number(heightValues[sourceIdx]);
           if (!Number.isFinite(height)) continue;
+          if (height >= visibleHeightMaximum) continue;
           if (densityValues) {
             const density = Number(densityValues[sourceIdx]);
             if (!Number.isFinite(density) || density <= densityCutoff) continue;

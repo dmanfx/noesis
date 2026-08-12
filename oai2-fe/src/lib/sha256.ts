@@ -1,4 +1,4 @@
-const INITIAL_STATE = new Uint32Array([
+const SHA256_INITIAL_STATE = new Uint32Array([
   0x6a09e667,
   0xbb67ae85,
   0x3c6ef372,
@@ -9,7 +9,7 @@ const INITIAL_STATE = new Uint32Array([
   0x5be0cd19,
 ]);
 
-const ROUND_CONSTANTS = new Uint32Array([
+const SHA256_ROUND_CONSTANTS = new Uint32Array([
   0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5,
   0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
   0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3,
@@ -28,104 +28,126 @@ const ROUND_CONSTANTS = new Uint32Array([
   0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
 ]);
 
-const rotateRight = (value: number, count: number): number => (
-  (value >>> count) | (value << (32 - count))
+const rotateRight = (value: number, places: number): number => (
+  (value >>> places) | (value << (32 - places))
 );
 
-/**
- * Compute SHA-256 without relying on secure-context-only WebCrypto.
- *
- * The depth dashboard is intentionally available over trusted LAN HTTP. This
- * implementation runs in its worker, keeps exact component verification on
- * that origin, and allocates only the fixed-size SHA working buffers.
- */
-export const sha256Hex = (input: Uint8Array): string => {
-  const state = INITIAL_STATE.slice();
-  const words = new Uint32Array(64);
-
-  const processBlock = (block: Uint8Array, offset: number): void => {
-    for (let index = 0; index < 16; index += 1) {
-      const byteOffset = offset + index * 4;
-      words[index] = (
-        (block[byteOffset] << 24)
-        | (block[byteOffset + 1] << 16)
-        | (block[byteOffset + 2] << 8)
-        | block[byteOffset + 3]
-      ) >>> 0;
-    }
-    for (let index = 16; index < 64; index += 1) {
-      const previous15 = words[index - 15];
-      const previous2 = words[index - 2];
-      const sigma0 = (
-        rotateRight(previous15, 7)
-        ^ rotateRight(previous15, 18)
-        ^ (previous15 >>> 3)
-      );
-      const sigma1 = (
-        rotateRight(previous2, 17)
-        ^ rotateRight(previous2, 19)
-        ^ (previous2 >>> 10)
-      );
-      words[index] = (
-        words[index - 16]
-        + sigma0
-        + words[index - 7]
-        + sigma1
-      ) >>> 0;
-    }
-
-    let a = state[0];
-    let b = state[1];
-    let c = state[2];
-    let d = state[3];
-    let e = state[4];
-    let f = state[5];
-    let g = state[6];
-    let h = state[7];
-
-    for (let index = 0; index < 64; index += 1) {
-      const choice = (e & f) ^ (~e & g);
-      const majority = (a & b) ^ (a & c) ^ (b & c);
-      const sum0 = rotateRight(a, 2) ^ rotateRight(a, 13) ^ rotateRight(a, 22);
-      const sum1 = rotateRight(e, 6) ^ rotateRight(e, 11) ^ rotateRight(e, 25);
-      const temporary1 = (h + sum1 + choice + ROUND_CONSTANTS[index] + words[index]) >>> 0;
-      const temporary2 = (sum0 + majority) >>> 0;
-      h = g;
-      g = f;
-      f = e;
-      e = (d + temporary1) >>> 0;
-      d = c;
-      c = b;
-      b = a;
-      a = (temporary1 + temporary2) >>> 0;
-    }
-
-    state[0] = (state[0] + a) >>> 0;
-    state[1] = (state[1] + b) >>> 0;
-    state[2] = (state[2] + c) >>> 0;
-    state[3] = (state[3] + d) >>> 0;
-    state[4] = (state[4] + e) >>> 0;
-    state[5] = (state[5] + f) >>> 0;
-    state[6] = (state[6] + g) >>> 0;
-    state[7] = (state[7] + h) >>> 0;
-  };
-
-  const completeByteCount = input.byteLength - (input.byteLength % 64);
-  for (let offset = 0; offset < completeByteCount; offset += 64) {
-    processBlock(input, offset);
+const compressSha256Block = (
+  state: Uint32Array,
+  bytes: Uint8Array,
+  offset: number,
+  schedule: Uint32Array,
+): void => {
+  for (let index = 0; index < 16; index += 1) {
+    const byteOffset = offset + (index * 4);
+    schedule[index] = (
+      (bytes[byteOffset] << 24)
+      | (bytes[byteOffset + 1] << 16)
+      | (bytes[byteOffset + 2] << 8)
+      | bytes[byteOffset + 3]
+    ) >>> 0;
+  }
+  for (let index = 16; index < 64; index += 1) {
+    const previous15 = schedule[index - 15];
+    const previous2 = schedule[index - 2];
+    const sigma0 = (
+      rotateRight(previous15, 7)
+      ^ rotateRight(previous15, 18)
+      ^ (previous15 >>> 3)
+    );
+    const sigma1 = (
+      rotateRight(previous2, 17)
+      ^ rotateRight(previous2, 19)
+      ^ (previous2 >>> 10)
+    );
+    schedule[index] = (
+      schedule[index - 16]
+      + sigma0
+      + schedule[index - 7]
+      + sigma1
+    ) >>> 0;
   }
 
-  const remainder = input.byteLength - completeByteCount;
-  const tail = new Uint8Array(remainder < 56 ? 64 : 128);
-  tail.set(input.subarray(completeByteCount));
-  tail[remainder] = 0x80;
-  const bitLengthHigh = Math.floor(input.byteLength / 0x20000000);
-  const bitLengthLow = (input.byteLength * 8) >>> 0;
-  const tailView = new DataView(tail.buffer);
-  tailView.setUint32(tail.byteLength - 8, bitLengthHigh, false);
-  tailView.setUint32(tail.byteLength - 4, bitLengthLow, false);
-  for (let offset = 0; offset < tail.byteLength; offset += 64) {
-    processBlock(tail, offset);
+  let a = state[0];
+  let b = state[1];
+  let c = state[2];
+  let d = state[3];
+  let e = state[4];
+  let f = state[5];
+  let g = state[6];
+  let h = state[7];
+
+  for (let index = 0; index < 64; index += 1) {
+    const sum1 = rotateRight(e, 6) ^ rotateRight(e, 11) ^ rotateRight(e, 25);
+    const choose = (e & f) ^ (~e & g);
+    const temporary1 = (
+      h
+      + sum1
+      + choose
+      + SHA256_ROUND_CONSTANTS[index]
+      + schedule[index]
+    ) >>> 0;
+    const sum0 = rotateRight(a, 2) ^ rotateRight(a, 13) ^ rotateRight(a, 22);
+    const majority = (a & b) ^ (a & c) ^ (b & c);
+    const temporary2 = (sum0 + majority) >>> 0;
+
+    h = g;
+    g = f;
+    f = e;
+    e = (d + temporary1) >>> 0;
+    d = c;
+    c = b;
+    b = a;
+    a = (temporary1 + temporary2) >>> 0;
+  }
+
+  state[0] = (state[0] + a) >>> 0;
+  state[1] = (state[1] + b) >>> 0;
+  state[2] = (state[2] + c) >>> 0;
+  state[3] = (state[3] + d) >>> 0;
+  state[4] = (state[4] + e) >>> 0;
+  state[5] = (state[5] + f) >>> 0;
+  state[6] = (state[6] + g) >>> 0;
+  state[7] = (state[7] + h) >>> 0;
+};
+
+/**
+ * Compute SHA-256 without relying on Web Crypto's secure-context restriction.
+ *
+ * The depth dashboard is intentionally available on a trusted HTTP LAN
+ * origin, where `crypto.subtle` is absent. Bulk snapshot integrity must still
+ * be verified rather than skipped, so the worker uses this implementation on
+ * every origin.
+ */
+export const sha256Hex = (bytes: Uint8Array): string => {
+  const state = SHA256_INITIAL_STATE.slice();
+  const schedule = new Uint32Array(64);
+  const completeByteCount = bytes.byteLength - (bytes.byteLength % 64);
+  for (let offset = 0; offset < completeByteCount; offset += 64) {
+    compressSha256Block(state, bytes, offset, schedule);
+  }
+
+  const remainingByteCount = bytes.byteLength - completeByteCount;
+  const paddedByteCount = remainingByteCount < 56 ? 64 : 128;
+  const tail = new Uint8Array(paddedByteCount);
+  tail.set(bytes.subarray(completeByteCount));
+  tail[remainingByteCount] = 0x80;
+
+  const bitLength = bytes.byteLength * 8;
+  const highBitLength = Math.floor(bitLength / 0x1_0000_0000);
+  const lowBitLength = bitLength >>> 0;
+  const lengthOffset = paddedByteCount - 8;
+  tail[lengthOffset] = (highBitLength >>> 24) & 0xff;
+  tail[lengthOffset + 1] = (highBitLength >>> 16) & 0xff;
+  tail[lengthOffset + 2] = (highBitLength >>> 8) & 0xff;
+  tail[lengthOffset + 3] = highBitLength & 0xff;
+  tail[lengthOffset + 4] = (lowBitLength >>> 24) & 0xff;
+  tail[lengthOffset + 5] = (lowBitLength >>> 16) & 0xff;
+  tail[lengthOffset + 6] = (lowBitLength >>> 8) & 0xff;
+  tail[lengthOffset + 7] = lowBitLength & 0xff;
+
+  for (let offset = 0; offset < paddedByteCount; offset += 64) {
+    compressSha256Block(state, tail, offset, schedule);
   }
 
   return Array.from(state)

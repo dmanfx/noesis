@@ -1,4 +1,14 @@
 import type { FloorplanLayer } from '../components/DepthDrawer';
+import {
+  architecturalHeightColor,
+  buildDetailedFloorplanOverlay,
+} from './depthPanelRendering';
+
+export type FloorplanRgbLayer = {
+  rgb_b64?: string;
+  rgb_shape?: [number, number, number];
+  observed_b64?: string;
+};
 
 export const VIRIDIS = [
   [68, 1, 84],
@@ -65,49 +75,6 @@ export function turboColor(t: number): [number, number, number] {
   const clamp = (v: number) => Math.round(Math.min(1, Math.max(0, v)) * 255);
   return [clamp(r), clamp(g), clamp(b)];
 }
-
-const STRUCTURAL_HEIGHT_STOPS: ReadonlyArray<{
-  heightM: number;
-  color: readonly [number, number, number];
-}> = [
-  { heightM: 0.00, color: [238, 239, 234] },
-  { heightM: 0.12, color: [184, 216, 207] },
-  { heightM: 0.30, color: [76, 170, 181] },
-  { heightM: 0.50, color: [35, 125, 169] },
-  { heightM: 0.75, color: [68, 83, 157] },
-  { heightM: 1.00, color: [122, 60, 142] },
-  { heightM: 1.30, color: [187, 61, 104] },
-  { heightM: 1.65, color: [242, 142, 56] },
-];
-
-const structuralHeightColor = (
-  heightMValue: number,
-): [number, number, number] => {
-  const heightM = Math.min(
-    STRUCTURAL_HEIGHT_STOPS[STRUCTURAL_HEIGHT_STOPS.length - 1].heightM,
-    Math.max(0, Number.isFinite(heightMValue) ? heightMValue : 0),
-  );
-  for (let index = 0; index < STRUCTURAL_HEIGHT_STOPS.length - 1; index += 1) {
-    const lower = STRUCTURAL_HEIGHT_STOPS[index];
-    const upper = STRUCTURAL_HEIGHT_STOPS[index + 1];
-    if (heightM > upper.heightM) continue;
-    const span = upper.heightM - lower.heightM;
-    const mix = span > 0 ? (heightM - lower.heightM) / span : 0;
-    return [
-      Math.round(lower.color[0] + ((upper.color[0] - lower.color[0]) * mix)),
-      Math.round(lower.color[1] + ((upper.color[1] - lower.color[1]) * mix)),
-      Math.round(lower.color[2] + ((upper.color[2] - lower.color[2]) * mix)),
-    ];
-  }
-  const last = STRUCTURAL_HEIGHT_STOPS[STRUCTURAL_HEIGHT_STOPS.length - 1];
-  return [last.color[0], last.color[1], last.color[2]];
-};
-
-export type FloorplanRgbLayer = {
-  rgb_b64?: string;
-  rgb_shape?: [number, number, number];
-  observed_b64?: string;
-};
 
 export function decodeFloat32(base64?: string): Float32Array | null {
   if (!base64) return null;
@@ -225,8 +192,11 @@ type RenderLayerOptions = {
   // original grid through this rectangle; it never rewrites metric bounds or
   // semantic values.
   sourceRect?: { x: number; y: number; width: number; height: number };
+  // Display-only metric reference lines for the detailed floorplan.
   bounds?: { min_x: number; max_x: number; min_z: number; max_z: number };
   metricGridM?: number;
+  flipHorizontal?: boolean;
+  flipVertical?: boolean;
 };
 
 type RenderLayerResult = {
@@ -670,24 +640,22 @@ export function renderLayerToCanvas(
     let v = values[idx];
     const offset = idx * 4;
 
-    if (maskValues) {
-      if (!maskPasses(idx)) {
-        const repairedValue = isolatedHoleValue(idx);
-        if (repairedValue !== null) {
-          v = repairedValue;
-        } else {
-          const inferredWalkable = inferredWalkableValues
-            && Number.isFinite(inferredWalkableValues[idx])
-            && inferredWalkableValues[idx] > 0.5;
-          writeRgba(
-            data,
-            offset,
-            inferredWalkable
-              ? inferredWalkableColorForCell(optObj, Math.floor(idx / cols), idx % cols)
-              : unknownColorForCell(optObj, Math.floor(idx / cols), idx % cols),
-          );
-          continue;
-        }
+    if (maskValues && !maskPasses(idx)) {
+      const repairedValue = isolatedHoleValue(idx);
+      if (repairedValue !== null) {
+        v = repairedValue;
+      } else {
+        const inferredWalkable = inferredWalkableValues
+          && Number.isFinite(inferredWalkableValues[idx])
+          && inferredWalkableValues[idx] > 0.5;
+        writeRgba(
+          data,
+          offset,
+          inferredWalkable
+            ? inferredWalkableColorForCell(optObj, Math.floor(idx / cols), idx % cols)
+            : unknownColorForCell(optObj, Math.floor(idx / cols), idx % cols),
+        );
+        continue;
       }
     }
 
@@ -803,11 +771,674 @@ export function renderLayerToCanvas(
 }
 
 /**
- * Render the v9 structural floorplan without mixing walls or ceilings into
- * furniture height. Inferred interior floor remains visibly distinct, while
- * learned RGB supplies only a restrained texture cue and never changes the
- * metric height color.
+ * Renders the observed highest surface as a continuous, physical AGL product.
+ * Clean semantic layers remain supporting evidence: they add a fine obstacle
+ * rim and inferred-space hatch but never replace furniture-height values.
  */
+export function renderDetailedFloorplanToCanvas(
+  canvas: HTMLCanvasElement | null,
+  heightAgl: FloorplanLayer | undefined,
+  obstacleHeight: FloorplanLayer | undefined,
+  options?: RenderLayerOptions,
+): RenderLayerResult | null {
+  if (
+    !canvas
+    || !heightAgl?.grid_b64
+    || !heightAgl.grid_shape
+  ) {
+    if (canvas) {
+      const clearContext = canvas.getContext('2d');
+      if (clearContext) {
+        clearContext.setTransform(1, 0, 0, 1, 0, 0);
+        clearContext.clearRect(0, 0, canvas.width, canvas.height);
+      }
+    }
+    return null;
+  }
+  const [rows, cols] = heightAgl.grid_shape;
+  const heightValues = decodeFloat32(heightAgl.grid_b64);
+  if (!rows || !cols || !heightValues || heightValues.length < rows * cols) {
+    return null;
+  }
+
+  let observationMaskValues: Float32Array | null = null;
+  if (
+    options?.maskLayer?.grid_b64
+    && options.maskLayer.grid_shape?.[0] === rows
+    && options.maskLayer.grid_shape?.[1] === cols
+  ) {
+    observationMaskValues = decodeFloat32(options.maskLayer.grid_b64);
+  }
+  let obstacleValues: Float32Array | null = null;
+  if (
+    obstacleHeight?.grid_b64
+    && obstacleHeight.grid_shape?.[0] === rows
+    && obstacleHeight.grid_shape?.[1] === cols
+  ) {
+    obstacleValues = decodeFloat32(obstacleHeight.grid_b64);
+  }
+
+  const result = renderLayerToCanvas(
+    canvas,
+    heightAgl,
+    (normalized) => architecturalHeightColor(normalized * 2.5),
+    {
+      ...options,
+      valueMin: 0,
+      valueMax: 2.5,
+      gamma: 1,
+      imageSmoothing: false,
+    },
+  );
+  if (!result) return null;
+
+  const context = canvas.getContext('2d');
+  if (!context) return result;
+  const overlay = buildDetailedFloorplanOverlay({
+    heightAgl: heightValues,
+    rows,
+    cols,
+    observationMask: observationMaskValues,
+    observationMaskInvert: Boolean(options?.maskInvert),
+    observationMaskThreshold: options?.maskThreshold,
+    obstacleHeight: obstacleValues,
+  });
+  const sourceRect = result.sourceRectGrid;
+  const content = result.contentRectPx;
+  const cellWidthPx = content.w / sourceRect.width;
+  const cellHeightPx = content.h / sourceRect.height;
+
+  context.save();
+  context.setTransform(1, 0, 0, 1, 0, 0);
+  for (let row = sourceRect.y; row < sourceRect.y + sourceRect.height; row += 1) {
+    for (let col = sourceRect.x; col < sourceRect.x + sourceRect.width; col += 1) {
+      const index = (row * cols) + col;
+      if (!overlay.observed[index]) continue;
+      const x = content.x + ((col - sourceRect.x) * cellWidthPx);
+      const y = content.y + ((row - sourceRect.y) * cellHeightPx);
+      const width = cellWidthPx + 0.35;
+      const height = cellHeightPx + 0.35;
+      const shade = overlay.shade[index];
+      if (shade < 0.995) {
+        context.fillStyle = `rgba(0, 0, 0, ${Math.min(0.26, (1 - shade) * 0.9)})`;
+        context.fillRect(x, y, width, height);
+      } else if (shade > 1.005) {
+        context.fillStyle = `rgba(255, 255, 255, ${Math.min(0.10, (shade - 1) * 0.55)})`;
+        context.fillRect(x, y, width, height);
+      }
+      if (overlay.contour[index]) {
+        context.fillStyle = 'rgba(5, 9, 15, 0.38)';
+        context.fillRect(x, y, width, height);
+      }
+      if (overlay.frontier[index]) {
+        context.fillStyle = 'rgba(10, 19, 25, 0.18)';
+        context.fillRect(x, y, width, height);
+      }
+      if (overlay.obstacleRim[index]) {
+        context.fillStyle = 'rgba(247, 176, 73, 0.22)';
+        context.fillRect(x, y, width, height);
+      }
+    }
+  }
+
+  const bounds = options?.bounds;
+  const metricStep = Number(options?.metricGridM ?? 1);
+  if (
+    bounds
+    && Number.isFinite(metricStep)
+    && metricStep > 0
+    && bounds.max_x > bounds.min_x
+    && bounds.max_z > bounds.min_z
+  ) {
+    const cellWidthM = (bounds.max_x - bounds.min_x) / cols;
+    const cellDepthM = (bounds.max_z - bounds.min_z) / rows;
+    const sourceMinX = bounds.min_x + (sourceRect.x * cellWidthM);
+    const sourceMaxX = sourceMinX + (sourceRect.width * cellWidthM);
+    const sourceMaxZ = bounds.max_z - (sourceRect.y * cellDepthM);
+    const sourceMinZ = sourceMaxZ - (sourceRect.height * cellDepthM);
+    context.beginPath();
+    context.strokeStyle = 'rgba(255, 255, 255, 0.12)';
+    context.lineWidth = 1;
+    for (
+      let xM = Math.ceil((sourceMinX - 1e-9) / metricStep) * metricStep;
+      xM <= sourceMaxX + 1e-9;
+      xM += metricStep
+    ) {
+      const cellX = ((xM - bounds.min_x) / cellWidthM) - sourceRect.x;
+      const pixelX = content.x + (cellX * cellWidthPx);
+      context.moveTo(pixelX, content.y);
+      context.lineTo(pixelX, content.y + content.h);
+    }
+    for (
+      let zM = Math.ceil((sourceMinZ - 1e-9) / metricStep) * metricStep;
+      zM <= sourceMaxZ + 1e-9;
+      zM += metricStep
+    ) {
+      const cellY = ((bounds.max_z - zM) / cellDepthM) - sourceRect.y;
+      const pixelY = content.y + (cellY * cellHeightPx);
+      context.moveTo(content.x, pixelY);
+      context.lineTo(content.x + content.w, pixelY);
+    }
+    context.stroke();
+  }
+  context.restore();
+
+  return {
+    ...result,
+    valueRange: { min: 0, max: 2.5 },
+  };
+}
+
+/**
+ * Renders the highest observed horizontal surfaces as a metric orthophoto.
+ *
+ * MapAnything's mean-height raster is useful numerically but visually mixes
+ * floors, furniture, walls, and projection bands. The registered surface RGB
+ * retains the room and furniture detail people actually need from a floorplan,
+ * so it is the dominant signal here. Structural height contributes only a
+ * fixed-range tint and restrained relief. Inferred room footprint cells are
+ * never filled; the footprint is shown only as a one-cell perimeter.
+ */
+export function renderTextureFloorplanToCanvas(
+  canvas: HTMLCanvasElement | null,
+  structuralHeight: FloorplanLayer | undefined,
+  roomFootprint: FloorplanLayer | undefined,
+  measuredPerimeter: FloorplanLayer | undefined,
+  surfaceRgb: FloorplanRgbLayer | undefined,
+  options?: RenderLayerOptions,
+): RenderLayerResult | null {
+  if (!canvas) return null;
+  const clearCanvas = () => {
+    const context = canvas.getContext('2d');
+    if (!context) return;
+    context.setTransform(1, 0, 0, 1, 0, 0);
+    context.clearRect(0, 0, canvas.width, canvas.height);
+  };
+  if (
+    !structuralHeight?.grid_b64
+    || !structuralHeight.grid_shape
+    || !roomFootprint?.grid_b64
+    || !roomFootprint.grid_shape
+    || !surfaceRgb?.rgb_b64
+    || !surfaceRgb.rgb_shape
+    || !surfaceRgb.observed_b64
+  ) {
+    clearCanvas();
+    return null;
+  }
+
+  const [rows, cols] = structuralHeight.grid_shape;
+  const count = rows * cols;
+  if (
+    rows <= 0
+    || cols <= 0
+    || roomFootprint.grid_shape[0] !== rows
+    || roomFootprint.grid_shape[1] !== cols
+    || surfaceRgb.rgb_shape[0] !== rows
+    || surfaceRgb.rgb_shape[1] !== cols
+    || surfaceRgb.rgb_shape[2] !== 3
+  ) {
+    clearCanvas();
+    return null;
+  }
+
+  const heightValues = decodeFloat32(structuralHeight.grid_b64);
+  const footprintValues = decodeFloat32(roomFootprint.grid_b64);
+  const measuredPerimeterValues = (
+    measuredPerimeter?.grid_b64
+    && measuredPerimeter.grid_shape?.[0] === rows
+    && measuredPerimeter.grid_shape?.[1] === cols
+  )
+    ? decodeFloat32(measuredPerimeter.grid_b64)
+    : null;
+  const rgbValues = decodeUint8(surfaceRgb.rgb_b64);
+  const rgbObservedValues = decodeFloat32(surfaceRgb.observed_b64);
+  if (
+    !heightValues
+    || heightValues.length < count
+    || !footprintValues
+    || footprintValues.length < count
+    || !rgbValues
+    || rgbValues.length < count * 3
+    || !rgbObservedValues
+    || rgbObservedValues.length < count
+  ) {
+    clearCanvas();
+    return null;
+  }
+
+  const directObserved = new Uint8Array(count);
+  const footprint = new Uint8Array(count);
+  const luminanceSamples: number[] = [];
+  for (let index = 0; index < count; index += 1) {
+    const isDirect = Number.isFinite(rgbObservedValues[index])
+      && rgbObservedValues[index] > 0.5;
+    const isFootprint = Number.isFinite(footprintValues[index])
+      && footprintValues[index] > 0.5;
+    directObserved[index] = isDirect ? 1 : 0;
+    footprint[index] = isFootprint ? 1 : 0;
+    if (isDirect) {
+      const rgbOffset = index * 3;
+      luminanceSamples.push((
+        (0.2126 * rgbValues[rgbOffset])
+        + (0.7152 * rgbValues[rgbOffset + 1])
+        + (0.0722 * rgbValues[rgbOffset + 2])
+      ) / 255);
+    }
+  }
+  if (luminanceSamples.length < 16) {
+    clearCanvas();
+    return null;
+  }
+  luminanceSamples.sort((a, b) => a - b);
+  const luminanceLow = percentileSorted(luminanceSamples, 1);
+  const luminanceHigh = percentileSorted(luminanceSamples, 99);
+  const luminanceSpan = Math.max(luminanceHigh - luminanceLow, 0.05);
+
+  const toneR = new Float32Array(count);
+  const toneG = new Float32Array(count);
+  const toneB = new Float32Array(count);
+  for (let index = 0; index < count; index += 1) {
+    const rgbOffset = index * 3;
+    toneR[index] = Math.min(1, Math.max(
+      0,
+      ((rgbValues[rgbOffset] / 255) - luminanceLow) / luminanceSpan,
+    ));
+    toneG[index] = Math.min(1, Math.max(
+      0,
+      ((rgbValues[rgbOffset + 1] / 255) - luminanceLow) / luminanceSpan,
+    ));
+    toneB[index] = Math.min(1, Math.max(
+      0,
+      ((rgbValues[rgbOffset + 2] / 255) - luminanceLow) / luminanceSpan,
+    ));
+  }
+
+  // The visible repair radius is exactly three 0.04 m cells (0.12 m).
+  // A six-cell nearest-source lookup also supplies the two-cell bilateral
+  // neighbourhood around every supported output cell.
+  const nearestSource = new Int32Array(count);
+  const nearestDistanceSquared = new Float32Array(count);
+  nearestSource.fill(-1);
+  nearestDistanceSquared.fill(Number.POSITIVE_INFINITY);
+  const nearestSearchRadius = 6;
+  for (let row = 0; row < rows; row += 1) {
+    for (let col = 0; col < cols; col += 1) {
+      const index = (row * cols) + col;
+      if (directObserved[index]) {
+        nearestSource[index] = index;
+        nearestDistanceSquared[index] = 0;
+        continue;
+      }
+      let bestIndex = -1;
+      let bestDistanceSquared = Number.POSITIVE_INFINITY;
+      for (let rowOffset = -nearestSearchRadius; rowOffset <= nearestSearchRadius; rowOffset += 1) {
+        const sourceRow = row + rowOffset;
+        if (sourceRow < 0 || sourceRow >= rows) continue;
+        for (let colOffset = -nearestSearchRadius; colOffset <= nearestSearchRadius; colOffset += 1) {
+          const distanceSquared = (rowOffset * rowOffset) + (colOffset * colOffset);
+          if (distanceSquared > 36 || distanceSquared >= bestDistanceSquared) continue;
+          const sourceCol = col + colOffset;
+          if (sourceCol < 0 || sourceCol >= cols) continue;
+          const sourceIndex = (sourceRow * cols) + sourceCol;
+          if (!directObserved[sourceIndex]) continue;
+          bestIndex = sourceIndex;
+          bestDistanceSquared = distanceSquared;
+        }
+      }
+      nearestSource[index] = bestIndex;
+      nearestDistanceSquared[index] = bestDistanceSquared;
+    }
+  }
+
+  const textureSupport = new Uint8Array(count);
+  for (let index = 0; index < count; index += 1) {
+    textureSupport[index] = (
+      footprint[index]
+      && nearestSource[index] >= 0
+      && nearestDistanceSquared[index] <= 9
+    ) ? 1 : 0;
+  }
+
+  const bilateralR = new Float32Array(count);
+  const bilateralG = new Float32Array(count);
+  const bilateralB = new Float32Array(count);
+  const sigmaColor = 22 / 255;
+  const sigmaSpace = 1.4;
+  const colorDenominator = 2 * sigmaColor * sigmaColor;
+  const spaceDenominator = 2 * sigmaSpace * sigmaSpace;
+  for (let row = 0; row < rows; row += 1) {
+    for (let col = 0; col < cols; col += 1) {
+      const index = (row * cols) + col;
+      if (!textureSupport[index]) continue;
+      const centerSource = nearestSource[index];
+      const centerR = Math.round(toneR[centerSource] * 255) / 255;
+      const centerG = Math.round(toneG[centerSource] * 255) / 255;
+      const centerB = Math.round(toneB[centerSource] * 255) / 255;
+      let weightSum = 0;
+      let sumR = 0;
+      let sumG = 0;
+      let sumB = 0;
+      for (let rowOffset = -2; rowOffset <= 2; rowOffset += 1) {
+        const sampleRow = row + rowOffset;
+        if (sampleRow < 0 || sampleRow >= rows) continue;
+        for (let colOffset = -2; colOffset <= 2; colOffset += 1) {
+          const sampleCol = col + colOffset;
+          if (sampleCol < 0 || sampleCol >= cols) continue;
+          const sampleIndex = (sampleRow * cols) + sampleCol;
+          const sampleSource = nearestSource[sampleIndex];
+          if (sampleSource < 0) continue;
+          const sampleR = Math.round(toneR[sampleSource] * 255) / 255;
+          const sampleG = Math.round(toneG[sampleSource] * 255) / 255;
+          const sampleB = Math.round(toneB[sampleSource] * 255) / 255;
+          const diffR = sampleR - centerR;
+          const diffG = sampleG - centerG;
+          const diffB = sampleB - centerB;
+          const colorDistanceSquared = (
+            (diffR * diffR) + (diffG * diffG) + (diffB * diffB)
+          );
+          const spaceDistanceSquared = (
+            (rowOffset * rowOffset) + (colOffset * colOffset)
+          );
+          const weight = Math.exp(
+            -(colorDistanceSquared / colorDenominator)
+            - (spaceDistanceSquared / spaceDenominator),
+          );
+          weightSum += weight;
+          sumR += sampleR * weight;
+          sumG += sampleG * weight;
+          sumB += sampleB * weight;
+        }
+      }
+      const inverseWeight = weightSum > 1e-12 ? 1 / weightSum : 0;
+      bilateralR[index] = weightSum > 1e-12 ? sumR * inverseWeight : centerR;
+      bilateralG[index] = weightSum > 1e-12 ? sumG * inverseWeight : centerG;
+      bilateralB[index] = weightSum > 1e-12 ? sumB * inverseWeight : centerB;
+    }
+  }
+
+  // Approximate scipy's sigma=1 Gaussian with its default four-sigma support.
+  const gaussianKernel = new Float32Array(9);
+  let gaussianTotal = 0;
+  for (let offset = -4; offset <= 4; offset += 1) {
+    const value = Math.exp(-(offset * offset) / 2);
+    gaussianKernel[offset + 4] = value;
+    gaussianTotal += value;
+  }
+  for (let index = 0; index < gaussianKernel.length; index += 1) {
+    gaussianKernel[index] /= gaussianTotal;
+  }
+  const heightHorizontal = new Float32Array(count);
+  const heightSmooth = new Float32Array(count);
+  for (let row = 0; row < rows; row += 1) {
+    for (let col = 0; col < cols; col += 1) {
+      let value = 0;
+      for (let offset = -4; offset <= 4; offset += 1) {
+        const sampleCol = Math.min(cols - 1, Math.max(0, col + offset));
+        const sampleHeight = heightValues[(row * cols) + sampleCol];
+        value += (Number.isFinite(sampleHeight) ? sampleHeight : 0)
+          * gaussianKernel[offset + 4];
+      }
+      heightHorizontal[(row * cols) + col] = value;
+    }
+  }
+  for (let row = 0; row < rows; row += 1) {
+    for (let col = 0; col < cols; col += 1) {
+      let value = 0;
+      for (let offset = -4; offset <= 4; offset += 1) {
+        const sampleRow = Math.min(rows - 1, Math.max(0, row + offset));
+        value += heightHorizontal[(sampleRow * cols) + col]
+          * gaussianKernel[offset + 4];
+      }
+      heightSmooth[(row * cols) + col] = value;
+    }
+  }
+
+  const offscreen = document.createElement('canvas');
+  offscreen.width = cols;
+  offscreen.height = rows;
+  const offscreenContext = offscreen.getContext('2d');
+  const context = canvas.getContext('2d');
+  if (!offscreenContext || !context) {
+    clearCanvas();
+    return null;
+  }
+  const imageData = offscreenContext.createImageData(cols, rows);
+  const image = imageData.data;
+  const heightAt = (row: number, col: number): number => (
+    heightSmooth[
+      (Math.min(rows - 1, Math.max(0, row)) * cols)
+      + Math.min(cols - 1, Math.max(0, col))
+    ]
+  );
+  const writeCompositePixel = (
+    index: number,
+    red: number,
+    green: number,
+    blue: number,
+  ) => {
+    const offset = index * 4;
+    image[offset] = Math.round(Math.min(255, Math.max(0, red)));
+    image[offset + 1] = Math.round(Math.min(255, Math.max(0, green)));
+    image[offset + 2] = Math.round(Math.min(255, Math.max(0, blue)));
+    image[offset + 3] = 255;
+  };
+
+  for (let row = 0; row < rows; row += 1) {
+    for (let col = 0; col < cols; col += 1) {
+      const index = (row * cols) + col;
+      if (!textureSupport[index]) {
+        writeCompositePixel(index, 2, 4, 7);
+        continue;
+      }
+      const sourceIndex = nearestSource[index];
+      const textureR = directObserved[index]
+        ? (0.78 * toneR[sourceIndex]) + (0.22 * bilateralR[index])
+        : bilateralR[index];
+      const textureG = directObserved[index]
+        ? (0.78 * toneG[sourceIndex]) + (0.22 * bilateralG[index])
+        : bilateralG[index];
+      const textureB = directObserved[index]
+        ? (0.78 * toneB[sourceIndex]) + (0.22 * bilateralB[index])
+        : bilateralB[index];
+      const heightM = Number.isFinite(heightValues[index]) ? heightValues[index] : 0;
+      const [heightR, heightG, heightB] = viridisColor(
+        Math.min(1, Math.max(0, heightM / 1.65)),
+      );
+      const gradientX = (
+        heightAt(row - 1, col + 1)
+        + (2 * heightAt(row, col + 1))
+        + heightAt(row + 1, col + 1)
+        - heightAt(row - 1, col - 1)
+        - (2 * heightAt(row, col - 1))
+        - heightAt(row + 1, col - 1)
+      ) / 8;
+      const gradientY = (
+        heightAt(row + 1, col - 1)
+        + (2 * heightAt(row + 1, col))
+        + heightAt(row + 1, col + 1)
+        - heightAt(row - 1, col - 1)
+        - (2 * heightAt(row - 1, col))
+        - heightAt(row - 1, col + 1)
+      ) / 8;
+      const relief = Math.min(1.10, Math.max(
+        0.85,
+        0.98 + (0.12 * ((-0.55 * gradientX) - (0.83 * gradientY))),
+      ));
+      writeCompositePixel(
+        index,
+        (((0.90 * textureR) + (0.10 * (heightR / 255))) * relief) * 255,
+        (((0.90 * textureG) + (0.10 * (heightG / 255))) * relief) * 255,
+        (((0.90 * textureB) + (0.10 * (heightB / 255))) * relief) * 255,
+      );
+    }
+  }
+
+  // The producer's measured one-cell perimeter remains a soft edge overlay,
+  // never a replacement surface or justification for filling unsupported
+  // space. Its confidence changes only the blend strength.
+  if (
+    measuredPerimeterValues
+    && measuredPerimeterValues.length >= count
+  ) {
+    for (let index = 0; index < count; index += 1) {
+      if (
+        !textureSupport[index]
+        || !Number.isFinite(measuredPerimeterValues[index])
+        || measuredPerimeterValues[index] <= 0.18
+      ) {
+        continue;
+      }
+      const measuredStrength = Math.min(
+        1,
+        Math.max(
+          0,
+          (measuredPerimeterValues[index] - 0.18) / 0.82,
+        ),
+      );
+      const measuredMix = 0.35 + (0.30 * measuredStrength);
+      const offset = index * 4;
+      image[offset] = Math.round(
+        ((1 - measuredMix) * image[offset]) + (measuredMix * 205),
+      );
+      image[offset + 1] = Math.round(
+        ((1 - measuredMix) * image[offset + 1]) + (measuredMix * 211),
+      );
+      image[offset + 2] = Math.round(
+        ((1 - measuredMix) * image[offset + 2]) + (measuredMix * 210),
+      );
+    }
+  }
+
+  // Show inferred extent only as a one-cell perimeter (3x3 erosion frontier).
+  for (let row = 0; row < rows; row += 1) {
+    for (let col = 0; col < cols; col += 1) {
+      const index = (row * cols) + col;
+      if (!footprint[index]) continue;
+      let perimeter = false;
+      for (let rowOffset = -1; rowOffset <= 1 && !perimeter; rowOffset += 1) {
+        for (let colOffset = -1; colOffset <= 1; colOffset += 1) {
+          const neighbourRow = row + rowOffset;
+          const neighbourCol = col + colOffset;
+          if (
+            neighbourRow < 0
+            || neighbourRow >= rows
+            || neighbourCol < 0
+            || neighbourCol >= cols
+            || !footprint[(neighbourRow * cols) + neighbourCol]
+          ) {
+            perimeter = true;
+            break;
+          }
+        }
+      }
+      if (perimeter) {
+        const offset = index * 4;
+        image[offset] = Math.max(image[offset], 70);
+        image[offset + 1] = Math.max(image[offset + 1], 82);
+        image[offset + 2] = Math.max(image[offset + 2], 94);
+      }
+    }
+  }
+  offscreenContext.putImageData(imageData, 0, 0);
+
+  const sourceRect = normalizeSourceRect(options, rows, cols);
+  const fit = options?.fit ?? 'stretch';
+  const forceAspect = options?.forceAspect;
+  const background = options?.background ?? '#000';
+  const paddingCss = options?.contentPaddingPx
+    ? Math.max(0, Number(options.contentPaddingPx) || 0)
+    : 0;
+  const imageSmoothing = options?.imageSmoothing ?? false;
+  const dpr = (
+    typeof options?.pixelRatio === 'number'
+    && Number.isFinite(options.pixelRatio)
+  )
+    ? Math.max(0.1, options.pixelRatio)
+    : (window.devicePixelRatio || 1);
+  let { width, height } = applyCanvasSize(
+    canvas,
+    options?.targetWidthPx,
+    options?.targetHeightPx,
+  );
+  if (fit === 'stretch') {
+    const aspect = forceAspect || (sourceRect.width / sourceRect.height);
+    height = width / aspect;
+  }
+  canvas.width = Math.max(1, Math.round(width * dpr));
+  canvas.height = Math.max(1, Math.round(height * dpr));
+
+  const contentAspect = forceAspect || (sourceRect.width / sourceRect.height);
+  let contentWidth = width;
+  let contentHeight = height;
+  let contentX = 0;
+  let contentY = 0;
+  if (fit === 'contain') {
+    const canvasAspect = width / height;
+    if (canvasAspect > contentAspect) {
+      contentHeight = height;
+      contentWidth = height * contentAspect;
+      contentX = (width - contentWidth) * 0.5;
+    } else {
+      contentWidth = width;
+      contentHeight = width / contentAspect;
+      contentY = (height - contentHeight) * 0.5;
+    }
+  }
+  if (paddingCss > 0) {
+    const shrink = paddingCss * 2;
+    if (contentWidth > shrink && contentHeight > shrink) {
+      contentX += paddingCss;
+      contentY += paddingCss;
+      contentWidth -= shrink;
+      contentHeight -= shrink;
+    }
+  }
+
+  context.save();
+  context.scale(dpr, dpr);
+  context.clearRect(0, 0, width, height);
+  if (fit === 'contain' && background) {
+    context.fillStyle = background;
+    context.fillRect(0, 0, width, height);
+  }
+  context.imageSmoothingEnabled = imageSmoothing;
+  if (imageSmoothing) context.imageSmoothingQuality = 'high';
+  if (options?.flipHorizontal || options?.flipVertical) {
+    context.translate(
+      options.flipHorizontal ? width : 0,
+      options.flipVertical ? height : 0,
+    );
+    context.scale(
+      options.flipHorizontal ? -1 : 1,
+      options.flipVertical ? -1 : 1,
+    );
+  }
+  context.drawImage(
+    offscreen,
+    sourceRect.x,
+    sourceRect.y,
+    sourceRect.width,
+    sourceRect.height,
+    contentX,
+    contentY,
+    contentWidth,
+    contentHeight,
+  );
+  context.restore();
+
+  return {
+    contentRectPx: {
+      x: contentX * dpr,
+      y: contentY * dpr,
+      w: contentWidth * dpr,
+      h: contentHeight * dpr,
+    },
+    sourceRectGrid: sourceRect,
+    valueRange: { min: 0, max: 1.65 },
+  };
+}
+
 export function renderStructuralFloorplanToCanvas(
   canvas: HTMLCanvasElement | null,
   structuralHeight: FloorplanLayer | undefined,
@@ -885,7 +1516,7 @@ export function renderStructuralFloorplanToCanvas(
   const result = renderLayerToCanvas(
     canvas,
     structuralHeight,
-    (normalized) => structuralHeightColor(normalized * 1.65),
+    (normalized) => architecturalHeightColor(normalized * 1.65),
     {
       ...options,
       valueMin: 0,

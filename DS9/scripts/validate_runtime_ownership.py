@@ -4626,7 +4626,7 @@ def _required_runtime_environment(
         "NOESIS_V3DT_DIAG_SESSION": session_id,
         "NOESIS_PGIE_PROFILE": str(lane["pgie_profile"]),
         "NOESIS_TRACKING_MODE": str(lane["tracking_mode"]),
-        "NOESIS_MOSAIC_RTSP_ENABLED": "1",
+        "NOESIS_MOSAIC_RTSP_ENABLED": "0",
         "NOESIS_MOSAIC_WEBRTC_ENABLED": "1",
         "NOESIS_REID_ENABLED": "1",
         "NOESIS_SHUTDOWN_GRACE_SECONDS": "75",

@@ -741,6 +741,12 @@ def test_runtime_command_exposes_no_secret_bytes_and_locks_mounts(
     assert env_values["NOESIS_ANALYTICS_EXCLUDE_CONFIG"] == str(
         runtime.CONTAINER_ANALYTICS_EXCLUDE_CONFIG
     )
+    assert env_values["NOESIS_MOSAIC_RTSP_ENABLED"] == "0"
+    assert env_values["NOESIS_MOSAIC_WEBRTC_ENABLED"] == "1"
+    assert runtime.CANONICAL_PORTS == (
+        runtime.CANONICAL_WS_PORT,
+        runtime.CANONICAL_REST_PORT,
+    )
 
 
 def test_analytics_state_seeds_private_files_with_production_render_bytes(

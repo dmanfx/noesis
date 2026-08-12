@@ -2,7 +2,26 @@
 
 This document is a consolidated deep-dive on **SV3DT** and **MV3DT** as implemented in DeepStream 8, with an emphasis on: how they fit into a pipeline, how they are configured, what metadata they output, and what is realistically accessible from Python in a DS8 (Service Maker) deployment.
 
-## 0) Current implementation addendum (2026-01-22)
+## 0) Current implementation addendum (2026-07-11)
+
+The January baseline below remains useful historical tuning evidence, but it is
+not the current coordinate contract. The active DS8, protected reimplementation,
+and DS9 V3DT profiles now share `config/camera_calibration.json`, whose camera
+centers are separated in one metric `backend_world_m` frame. Their locked
+camInfo files are byte-identical and use `WORLD_AXES=xzy`.
+
+The tracker-owned `bbox3d` and `velocity3d` values remain diagnostic values in
+the profile-specific tracker tuple. At the producer boundary, Noesis derives
+the tracker ground endpoint using `zCentre - zLen / 2`, applies the exact `xzy`
+signed-permutation contract, and only then publishes `world` in canonical Y-up
+`backend_world_m`. Missing or malformed axis metadata fails closed; it does not
+fall back to a ray-projected V3DT world point.
+
+This completes the static shared-world and axis correction for SV3DT. It does
+not prove MV3DT overlap fusion. MV3DT still requires one occupied, synchronized
+kitchen/family-room session that exercises peer association and fused output.
+
+### Historical locked baseline (2026-01-22)
 
 The current SV3DT baseline is locked and summarized in:
 `plans/DS8/v3dt/status_summary_2026-01-22_locked_baseline.md`.
@@ -16,8 +35,8 @@ Key points to carry into any new work:
 - **CamInfo conventions:** `w2p`, `INVERT_E=0`, `Y_FLIP=1`, `WORLD_AXES=xzy`, `WORLD_SCALE=1`
 - **Confirmed no-go:** do not enable PGIE aspect ratio/padding; do not change `s_obj_to_m` away from `1.0`
 
-Shortfalls remain (living-room still shallow; BEV not validated). See the summary
-doc for the full list of gaps and non-negotiable constraints.
+Those dated shortfalls describe the January tuning snapshot. See the summary
+document for its exact historical gaps and non-negotiable projection constraints.
 
 ## 1) Where SV3DT/MV3DT live in DeepStream
 
@@ -65,8 +84,8 @@ Noesis already stores the ingredients needed to generate camInfo files:
 - Extrinsics: `config/camera_calibration.json` (`E` is stored as **column-major**, and the canonical convention is **world→camera**)
 - Tracker pixel space: `config/infer.yaml` streammux `width/height` (currently 1920×1080 for all streams; family-room is scaled up from 1280×720)
 
-In this repo we now prefer `projectionMatrix_3x4` (matches NVIDIA’s `deepstream-tracker-3d` sample),
-but `projectionMatrix_3x4_w2p` is also supported if needed. For either variant, compute per camera:
+The active locked profiles use `projectionMatrix_3x4_w2p`; the generator also
+supports `projectionMatrix_3x4`. For either variant, compute per camera:
 
 - Reshape `E` into a 4×4 matrix with `order="F"` (column-major).
 - Treat `E` as **World→Camera** and extract `[R|t] = E[:3, :]` (3×4).
@@ -81,7 +100,9 @@ Note: If your calibration source provides `Twc` (Camera→World) instead, you mu
 - Flatten row-major 12 floats into `projectionMatrix_3x4_w2p`.
   - For `projectionMatrix_3x4`, flatten the same way but keep the principal point zero-centered (DeepStream shifts internally).
 
-Note: With your *current* `config/camera_calibration.json`, this produces **camera-local** 3D coordinates (good enough to bring up SV3DT), but MV3DT still requires a **shared** world frame across cameras.
+The current `config/camera_calibration.json` produces one shared metric world
+frame across all three cameras. That is necessary for MV3DT but is not, by
+itself, evidence that overlap synchronization or peer fusion works live.
 
 ### 2.3 SV3DT configuration knobs (confirmed)
 

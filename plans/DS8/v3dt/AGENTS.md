@@ -46,7 +46,7 @@ Use this baseline set for reproducible V3DT runs:
 
 - Pipeline: `config/infer_v3dt_baseline.yaml`
 - Cameras: `config/cameras_v3dt_baseline.yaml`
-- Calibration: `config/archive/calibration_v3dt_baseline.json`
+- Calibration: `config/camera_calibration.json`
 - Dewarper: `config/dewarper_v3dt_baseline.txt`
 - Tracker config: `config/v3dt/nvtracker_v3dt_baseline.yml`
 - camInfo dir: `config/v3dt/caminfo_baseline/`
@@ -81,7 +81,7 @@ Commands (locked baseline):
 python3 scripts/generate_v3dt_caminfo.py \
   --pipeline-config config/infer_v3dt_baseline.yaml \
   --cameras-config config/cameras_v3dt_baseline.yaml \
-  --calibration config/archive/calibration_v3dt_baseline.json \
+  --calibration config/camera_calibration.json \
   --output-dir config/v3dt/caminfo_baseline \
   --model-height 2.2 \
   --model-radius 0.35 \
@@ -91,7 +91,11 @@ python3 scripts/generate_v3dt_caminfo.py \
 python3 scripts/sanity_check_v3dt_calibration.py \
   --pipeline-config config/infer_v3dt_baseline.yaml \
   --cameras-config config/cameras_v3dt_baseline.yaml \
-  --calibration config/archive/calibration_v3dt_baseline.json
+  --calibration config/camera_calibration.json
 ```
 
-For intentional non-baseline experiments, set a different `--calibration` path explicitly (for example `config/camera_calibration.json`) and record that run as non-baseline.
+`config/camera_calibration.json` is the active shared metric calibration. The
+formerly documented `config/archive/calibration_v3dt_baseline.json` path does
+not exist and has never existed in Git; do not reconstruct or substitute it.
+MV3DT promotion still requires separate occupied overlap, timestamp-sync, and
+live fusion evidence even though the SV3DT camInfo inputs are global.

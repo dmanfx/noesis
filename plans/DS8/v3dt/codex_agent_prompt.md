@@ -1,6 +1,6 @@
 # Codex Agent Prompt – Implement SV3DT + MV3DT in DS8 Noesis
 
-You are a Codex agent implementing **SV3DT** and **MV3DT** integration into the **DS8 canonical stack** under `noesis/` in `/home/mayor/Noesis_Devel`.
+You are a Codex agent implementing **SV3DT** and **MV3DT** integration into the **DS8 canonical stack** under `noesis/` at the repository root.
 
 ## Current baseline (do not regress)
 
@@ -39,28 +39,28 @@ Specifically:
 ## Inputs you must confirm early (blockers)
 
 1. Verify the current stream/camera mapping (do not assume it’s unchanged if configs were edited):
-   - source 0 → `living-room` (camera id `0`) `rtsp://192.168.3.214:7447/jdr9oLlBkjyl3gDm?`
-   - source 1 → `kitchen` (camera id `1`) `rtsp://192.168.3.214:7447/qt3VqVdZpgG1B4Vk?`
-   - source 2 → `family-room` (camera id `2`) `rtsp://192.168.3.214:7447/4qWTBhW6b4nLeUFE?`
+   - source 0 → `living-room` (camera id `0`) `camera-secret:living-room`
+   - source 1 → `kitchen` (camera id `1`) `camera-secret:kitchen`
+   - source 2 → `family-room` (camera id `2`) `camera-secret:family-room`
    - streammux output is 1920×1080; family-room intrinsics originate at 1280×720 and must be scaled when building camInfo.
-2. Confirm global calibration is real:
-   - Current `config/camera_calibration.json` appears camera-local (centers x≈0,z≈0).
-   - MV3DT requires a shared global world frame (meters, Y-up).
-   - If global extrinsics are missing, implement only SV3DT “bbox recovery” mode and explicitly disable MV3DT, with clear logs/docs.
+2. Confirm the active global calibration and axis contract are unchanged:
+   - `config/camera_calibration.json` currently has separated camera centers in one `backend_world_m` frame.
+   - Locked camInfo uses `xzy`; convert the profile-specific tracker tuple back to canonical Y-up world before publication.
+   - MV3DT still requires separate occupied overlap, time-sync, peer-association, and fused-position acceptance. Shared calibration alone is not MV3DT proof.
 3. Confirm MQTT broker settings for MV3DT:
    - host/port (assume `127.0.0.1:1883` unless user overrides)
    - auth requirements (if any)
 
 ## Implementation outline (do in this order)
 
-0. **Pre-calibration staging (Phase 0a; do first if Menon extrinsics aren’t ready yet)**
+0. **Canonical SV3DT contract (do first)**
    - Create the `config/v3dt/` config skeleton (SV3DT + MV3DT configs + MQTT configs + pub/sub graph).
    - Integrate DS8 hook support to parse `NVDS_OBJ_3D_META` (`pyds.NvDsObj3DBbox`) when present and publish additive 3D fields.
    - Provision BodyPose3DNet assets/engine and wire `PoseEstimator` into the tracker config.
-   - Keep MV3DT disabled and treat any 3D coordinates as **camera-local** until global calibration is real.
-1. **Global calibration (Phase 0)**
-   - Implement or integrate a workflow to produce correct shared-world extrinsics in `config/camera_calibration.json` (world→camera, column-major 16 floats).
-   - Validate by computing camera centers and checking separation in X/Z.
+   - Keep MV3DT disabled until its separate overlap/time-sync/live-fusion gate passes. Treat `bbox3d`/`velocity3d` as tracker-frame diagnostics and publish only axis-restored `world` as `backend_world_m`.
+1. **Global calibration verification (Phase 0)**
+   - Validate the shared-world extrinsics in `config/camera_calibration.json` (world→camera, column-major 16 floats).
+   - Compute camera centers, check separation, and run exact camInfo sanity; do not overwrite the active calibration with a phantom archived baseline.
 2. **Generate camInfo YAMLs**
    - Create `config/v3dt/camInfo_*.yml` with `projectionMatrix_3x4` (preferred; matches NVIDIA sample) or `projectionMatrix_3x4_w2p`, and `modelInfo` in units consistent with the chosen camInfo scale (meters or centimeters).
    - Ensure camInfo list order matches source order (pad index).

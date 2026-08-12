@@ -22,6 +22,11 @@ This folder contains DS8-focused planning docs for integrating **SV3DT** (Single
 - Targets: **people**; dogs only if low complexity.
 - Tracking should use **pose** (enable BodyPose3DNet inside the tracker).
 
+Current execution status (2026-08-12): AMC and MV3DT activation are paused
+until the Kitchen geometry is corrected. Living Room and Family Room do not
+overlap. Kitchen and Family Room remain the sole prospective MV3DT pair, with
+enablement blocked on corrected geometry and synchronized occupied evidence.
+
 ## Documents
 
 - `plans/DS8/v3dt/research_notes.md` – SV3DT/MV3DT deep dive (how it works, configs, outputs/meta, Python access).
@@ -46,7 +51,7 @@ Quick reference:
 - Pipeline: `config/infer_v3dt_baseline.yaml`
 - Tracker: `config/v3dt/nvtracker_v3dt_baseline.yml`
 - CamInfo dir: `config/v3dt/caminfo_baseline/`
-- Calibration (baseline): `config/archive/calibration_v3dt_baseline.json`
+- Calibration: `config/camera_calibration.json`
 - Cameras config: `config/cameras_v3dt_baseline.yaml`
 - Use tracking mode `v3dt` (`--tracking-mode v3dt` or `NOESIS_TRACKING_MODE=v3dt`) with these configs.
 
@@ -75,7 +80,7 @@ defined in `noesis/ds8_runtime.py`.
 python3 scripts/generate_v3dt_caminfo.py \
   --pipeline-config config/infer_v3dt_baseline.yaml \
   --cameras-config config/cameras_v3dt_baseline.yaml \
-  --calibration config/archive/calibration_v3dt_baseline.json \
+  --calibration config/camera_calibration.json \
   --output-dir config/v3dt/caminfo_baseline \
   --model-height 2.2 \
   --model-radius 0.35 \
@@ -85,26 +90,27 @@ python3 scripts/generate_v3dt_caminfo.py \
 python3 scripts/sanity_check_v3dt_calibration.py \
   --pipeline-config config/infer_v3dt_baseline.yaml \
   --cameras-config config/cameras_v3dt_baseline.yaml \
-  --calibration config/archive/calibration_v3dt_baseline.json
+  --calibration config/camera_calibration.json
 ```
 
-These commands are for locked-baseline recovery. If you intentionally run against live calibration (`config/camera_calibration.json`), treat that run as non-baseline and record it explicitly in notes/checklists.
+These commands rebuild the active locked camInfo inputs. The formerly named
+`config/archive/calibration_v3dt_baseline.json` path does not exist and has
+never existed in Git; do not recreate it or silently select another file.
 
-## Critical dependency (must be solved early)
+## Current global-world boundary
 
-Your current `config/camera_calibration.json` extrinsics appear to be **camera-local** (camera centers all near x≈0,z≈0). **MV3DT requires a shared global world frame** across cameras. The plan treats “global calibration” as Phase 0.
+`config/camera_calibration.json` now contains meaningfully separated camera
+centers in one metric Y-up frame. The root and reimplementation calibration
+files are byte-identical, and the DS8/DS9 camInfo triplets are byte-identical.
+Their locked `xzy` projection convention means the tracker emits its cuboid in
+the profile-specific Z-up tuple; DS8 and DS9 restore that tuple before
+publishing `world_frame=backend_world_m`.
 
-## What we can do before Menon extrinsics
-
-We can still get most of the integration “mechanics” ready without a shared-world calibration:
-
-- Add DS8 hook support to extract SV3DT/MV3DT 3D bbox meta (`NVDS_OBJ_3D_META` / `NvDsObj3DBbox`) and publish additive 3D fields.
-  - Note: Service Maker Python `ObjectMetadata` does not expose `obj_user_meta_list`, so DS8 requires the native bridge module `noesis_v3dt_meta_ext` (build: `scripts/build_noesis_v3dt_meta_ext.sh`).
-- Prepare SV3DT/MV3DT tracker configs + MQTT neighbor graph configs (but keep MV3DT disabled until global calibration exists).
-- Provision BodyPose3DNet assets/engine and enable pose in the tracker config (helps SV3DT robustness even in single-camera mode).
-- Gate `nvstreammux.sync-inputs=1` behind a config toggle for later MV3DT experiments (only useful once timestamps + overlap are validated).
-
-We should *not* enable MV3DT fusion/ID propagation or interpret 3D positions as a shared house/world frame until Menon (or another tool) provides global extrinsics.
+This closes the SV3DT axis/configuration defect. It does **not** prove MV3DT:
+keep MV3DT fusion and ID propagation unpromoted until an occupied
+kitchen/family-room overlap run independently proves timestamp alignment,
+peer association, and fused positions. `bbox3d`/`velocity3d` remain tracker-
+frame diagnostics; only `world` is the canonical backend position.
 
 ## Quick validation (SV3DT meta plumbing)
 
@@ -263,14 +269,22 @@ Use the forensics tool when calibration/3D tracking issues need explicit math + 
 ```bash
 python3 scripts/v3dt_forensics.py snapshot --pipeline-config build/effective_pipeline_yolo11_seg.yaml
 export NOESIS_V3DT_DIAG_LOG=1
-export NOESIS_V3DT_DIAG_DIR=diagnostics
+export NOESIS_V3DT_DIAG_DIR="$HOME/.local/state/noesis/diagnostics"
 python3 noesis/ds8_runtime.py --pipeline-config config/infer_v3dt_medium.yaml
-python3 scripts/v3dt_forensics.py analyze --log diagnostics/v3dt_frames_<session>.ndjson \
-  --snapshot diagnostics/v3dt_snapshot_<timestamp>.json \
+python3 scripts/v3dt_forensics.py analyze \
+  --log "$NOESIS_V3DT_DIAG_DIR/v3dt_frames_<session>.ndjson" \
+  --snapshot "$NOESIS_V3DT_DIAG_DIR/v3dt_snapshot_<timestamp>.json" \
   --scale-sweep auto
-python3 scripts/v3dt_forensics.py panel --snapshot diagnostics/v3dt_snapshot_<timestamp>.json \
-  --report diagnostics/v3dt_report_<timestamp>.json
+python3 scripts/v3dt_forensics.py panel \
+  --snapshot "$NOESIS_V3DT_DIAG_DIR/v3dt_snapshot_<timestamp>.json" \
+  --report "$NOESIS_V3DT_DIAG_DIR/v3dt_report_<timestamp>.json"
 ```
+
+Forensic output is private and bounded by default: the directory must be
+owner-only (`0700`), artifacts are `0600`, runtime logs stop at 64 MiB, and
+only eight sessions are retained. The snapshot and runtime session headers
+serialize public source references plus an explicit non-secret environment
+allowlist; they never serialize materialized camera locators or auth values.
 
 See `docs/DS8_v3dt_forensics.md` for the full workflow.
 

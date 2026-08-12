@@ -1,5 +1,10 @@
 # V3DT Iteration Notes — 2026-01-22
 
+> Historical tuning log. Do not use its scratch calibration/config paths as
+> current runtime instructions. The active calibration is
+> `config/camera_calibration.json`; see `plans/DS8/v3dt/integration_plan.md` for
+> current global-world and MV3DT acceptance status.
+
 Goal: refine family-room V3DT tracking via pitch sweep and model height checks.
 
 ## Pitch sweep (model height 2.0)
@@ -89,7 +94,8 @@ Goal: refine family-room V3DT tracking via pitch sweep and model height checks.
   - Tracker: `config/v3dt/nvtracker_sv3dt_preview_charuco_fr_rtsp_dewarp_rect774_pitch_m16_h220_k21_l13.yml`
   - Pipeline: `config/infer_v3dt_medium_preview_charuco_fr_rtsp_dewarp_tuned_rect774_pitch_m16_h220_k21_l13.yaml`
 - Variant D (kitchen -21, living-room -15):
-  - Calibration: `config/archive/calibration_v3dt_baseline.json`
+  - Calibration: the then-selected baseline snapshot (now superseded by
+    `config/camera_calibration.json`)
   - CamInfo dir: `config/v3dt/caminfo_baseline/`
   - Tracker: `config/v3dt/nvtracker_v3dt_baseline.yml`
   - Pipeline: `config/infer_v3dt_baseline.yaml`

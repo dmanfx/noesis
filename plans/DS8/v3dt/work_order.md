@@ -10,8 +10,9 @@ This is the DS8 implementation checklist for integrating **SV3DT** and **MV3DT**
   - source 2 → `family-room` (camera id `2`)
 - Streammux output resolution: 1920×1080 (`config/infer.yaml`)
   - family-room intrinsics are defined at 1280×720 in `config/cameras.yaml` and need scaling to 1920×1080 when building camInfo.
-- MV3DT reference config (verified keys/sections):
-  - `/tmp/deepstream_reference_apps/deepstream-tracker-3d-multi-view/config_templates/config_tracker.yml`
+- MV3DT reference config: use NVIDIA's installed DeepStream 3D multi-view
+  tracker sample for the selected SDK; do not copy a machine-local scratch path
+  into runtime configuration.
 
 ## Current SV3DT baseline (2026-01-22)
 
@@ -21,7 +22,16 @@ baseline, shortfalls, and confirmed no-go items. Key files:
 - Pipeline: `config/infer_v3dt_baseline.yaml`
 - Tracker: `config/v3dt/nvtracker_v3dt_baseline.yml`
 - CamInfo dir: `config/v3dt/caminfo_baseline/`
-- Calibration (baseline): `config/archive/calibration_v3dt_baseline.json`
+- Active calibration: `config/camera_calibration.json`
+
+The dated January status summary is a historical tuning snapshot. Current
+shared-world truth and remaining live gates are recorded below.
+
+**2026-08-12 execution decision:** AMC and MV3DT activation are deferred until
+the Kitchen geometry is corrected. Living Room and Family Room have no overlap
+and therefore no MV3DT edge. Kitchen/Family Room remains the only prospective
+edge, but its config must stay disabled until corrected geometry plus
+synchronized occupied overlap evidence passes the Phase 2 gates.
 
 ## Phase 0a — Pre-calibration staging (do now; MV3DT stays disabled)
 
@@ -67,10 +77,13 @@ baseline, shortfalls, and confirmed no-go items. Key files:
   - Attach additive fields to the per-track payload:
     - `bbox3d` (use `NvDsObj3DBbox` field names)
     - `velocity3d`
-    - best-effort `world` (prefer SV3DT; fallback to existing ray-plane path)
+    - canonical `world` derived from the V3DT bbox ground endpoint and the
+      configured tracker-to-world axis map
 - Guardrails:
-  - Until Phase 0 is complete, mark/handle SV3DT world coords as **camera-local** only.
-  - Do not add cross-camera dedupe logic yet.
+  - Keep raw `bbox3d`/`velocity3d` in the tracker tuple for diagnostics.
+  - Publish `world` only after conversion to Y-up `backend_world_m`; missing or
+    malformed axis/bbox data is invalid, not a ray-plane fallback.
+  - Do not claim MV3DT dedupe until occupied overlap evidence exists.
 
 **Acceptance**
 - [ ] With SV3DT enabled, >95% of person tracks have `NVDS_OBJ_3D_META`.
@@ -79,6 +92,7 @@ baseline, shortfalls, and confirmed no-go items. Key files:
   _2025-12-27 (Codex): Wired DS8 `NVDS_OBJ_3D_META` extraction via `noesis_v3dt_meta_ext` (Service Maker C++ meta iterators) and plumbed `bbox3d`/`velocity3d`/`world` into DS8 telemetry; validated `bbox3d` appears in tracking WS telemetry via `python3 scripts/sv3dt_meta_smoke_test.py` (offline `config/infer_v3dt_sample.yaml`)._
   _2025-12-28 (Codex): Extended V3DT meta plumbing to also extract `NVDS_OBJ_WORLD_FOOT_LOCATION` (`world_foot`) + `NVDS_OBJ_VISIBILITY` and prefer `world_foot` for the BEV/world footpoint; added DS8 runtime preflight to regenerate `config/v3dt/camInfo_*.yml` from current calibration when a V3DT tracker config is selected (prevents stale camInfo drift after auto-calibrate)._
   _2025-12-29 (Codex): Fixed a reproducible Service Maker SIGSEGV by disabling `NVDS_OBJ_WORLD_FOOT_LOCATION` extraction inside `native/noesis_v3dt_meta_ext.cpp`; `bbox3d` telemetry validated again via `python3 scripts/sv3dt_meta_smoke_test.py --pipeline-config config/infer_v3dt_sample.yaml`._
+  _2026-07-11 (Codex): Restored the locked `xzy` tracker tuple to canonical Y-up `backend_world_m` in DS8, the protected reimplementation, and DS9. The V3DT lane now fails closed when axis/bbox metadata is absent or malformed, preserves the native tracker image-foot separately from the opposite cuboid endpoint, and rejects a pre-seeded world point in the wrong frame. Rebuilt/import-smoked both SDK-major native bridges; focused root tests passed (41), focused DS9 V3DT/ownership tests passed (153), and exact V3DT artifact provenance passed. Fresh occupied runtime evidence remains pending._
 
 ### Task V3DT-0A-04 — Fix SV3DT host-RAM leak (DeepStream `nvtracker`)
 
@@ -91,7 +105,7 @@ baseline, shortfalls, and confirmed no-go items. Key files:
 
 ## Phase 0 — Global calibration (MV3DT blocker)
 
-### Task V3DT-00 — Replace camera-local extrinsics with shared-world extrinsics
+### Task V3DT-00 — Maintain shared-world extrinsics and prove their live use
 
 **Description**
 - Export camera transforms from Menon (preferred) into a **single, shared** world frame:
@@ -100,8 +114,21 @@ baseline, shortfalls, and confirmed no-go items. Key files:
 - Write to `config/camera_calibration.json` as **world→camera** 4×4 `E`, stored column-major.
 
 **Acceptance**
-- [ ] Camera centers computed from `E` have meaningful X/Z separation (not all x≈0,z≈0).
-- [ ] Reprojection sanity check passes (<10px on a few known 3D↔2D correspondences per camera).
+- [x] Camera centers computed from `E` have meaningful X/Z separation (not all x≈0,z≈0).
+- [x] DS8, protected-reimplementation, and DS9 camInfo files match the active
+  calibration and locked `w2p` / `xzy` projection contract.
+- [ ] A fresh occupied same-session v2 gate covers all three cameras, advances
+  per-camera tracker continuity, and keeps native image-foot reprojection at or
+  below 40 px p95.
+- [ ] MV3DT separately proves synchronized kitchen/family-room overlap, peer
+  association, and fused output; shared calibration alone cannot satisfy this.
+
+  _2026-07-11 (Codex): Verified separated camera centers in the active shared
+  calibration, byte-identical DS8/DS9 camInfo sets, and exact `xzy` projection
+  replay. Protected offline tracks across all three cameras support the 40 px
+  native image-foot p95 threshold. The privacy-safe v2 same-session live gate is
+  implemented and ownership-enforced, but no fresh live session was launched or
+  promoted in this pass._
 
 ## Phase 1 — SV3DT bring-up (single-camera 3D tracking)
 
@@ -109,7 +136,9 @@ baseline, shortfalls, and confirmed no-go items. Key files:
 
 **Description**
 - Build a 3×4 projection matrix for each camera (world→pixel):
-  - Prefer `projectionMatrix_3x4` (as in NVIDIA’s `deepstream-tracker-3d` sample). This variant assumes a zero-centered principal point and DeepStream internally shifts by `(img_w/2, img_h/2)` at runtime.
+  - The locked active profile uses `projectionMatrix_3x4_w2p`, whose matrix
+    already includes the pixel principal point. Keep matrix type explicit;
+    `projectionMatrix_3x4` has different centering semantics.
   - Use the **streammux output resolution** (e.g., 1920×1080) when scaling intrinsics, not `tracker-width/height`.
     - Rationale: `tracker-width/height` is an internal optimization; using 1920×1056 can introduce non-uniform scaling and distort SV3DT’s model projection (observed as “stretched line” cuboids and sporadic tracks).
   - Scale family-room intrinsics from 1280×720 → 1920×1080 (x1.5 in width, x1.5 in height).
@@ -134,6 +163,7 @@ baseline, shortfalls, and confirmed no-go items. Key files:
   _2026-01-12 (Codex): Updated camInfo generation to follow NVIDIA `deepstream-tracker-3d` sample: generate `projectionMatrix_3x4` at streammux resolution (1920×1080) to avoid non-uniform tracker resize artifacts; autogen now uses streammux dimensions._
   _2026-01-22 (Codex): Locked SV3DT baseline with per-camera pitch preview extrinsics (family-room -16, kitchen -21, living-room -15) and model height 2.2; camInfo generated under `config/v3dt/caminfo_baseline/` and validated via V3DT forensics (see `plans/DS8/v3dt/status_summary_2026-01-22_locked_baseline.md`)._
   _2026-05-22 (Codex): Refined the isolated V3DT reimplementation path to publish Menon-facing `track.world` from the V3DT bbox3d-derived floor/contact point (`world_source=v3dt_bbox3d_foot`) without sending public cuboid geometry. Validated 2,925 MP4 samples across living-room, kitchen, and family-room with required payload fields present, no public raw V3DT fields, floor p95 0m, room-hit ratio 1.0, and image-base reprojection p95 below 1e-12px for every camera; exact non-V3DT baseline smoke still advertised `world_source=backend_world_fused` and a sample track used `pose_floor_only`._
+  _2026-07-11 (Codex): Corrected the May replay interpretation: the raw tracker tuple is not itself public world. The producer now applies the locked `xzy` map before publishing Y-up `backend_world_m`, while native tracker image-foot and the derived opposite cuboid endpoint remain independently testable. The v2 replay rejects the old raw tuple and any camera-local frame label._
 
 ### Task V3DT-02 — Enable SV3DT in `nvtracker_sv3dt.yml`
 
@@ -165,14 +195,15 @@ baseline, shortfalls, and confirmed no-go items. Key files:
 - Create `config/v3dt/mqtt_proto_adaptor.txt` for local Mosquitto.
 
 **Acceptance**
-- [ ] With broker down, pipeline still runs SV3DT-only (clear warning logs).
+- [ ] With broker down, an explicitly selected MV3DT lane fails loudly rather
+  than silently degrading to SV3DT-only.
 - [ ] With broker up, tracker connects and publishes/subscribes without repeated reconnect loops.
 
 ### Task V3DT-04 — Enable MV3DT in `nvtracker_mv3dt.yml`
 
 **Description**
-- Start from the NVIDIA reference sections in:
-  - `/tmp/deepstream_reference_apps/deepstream-tracker-3d-multi-view/config_templates/config_tracker.yml`
+- Start from the NVIDIA reference sections in the installed DeepStream
+  multi-view 3D tracker sample for the selected SDK.
 - Enable:
   - `MultiViewAssociator` (including advanced toggles)
   - `Communicator` (`communicatorType: 2`)

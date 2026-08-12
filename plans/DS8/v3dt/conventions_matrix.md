@@ -7,7 +7,7 @@ expectations across DS8 SV3DT modules so diagnostics can verify each contract.
 
 - Pipeline: `config/infer_v3dt_baseline.yaml`
 - Cameras (intrinsics): `config/cameras_v3dt_baseline.yaml`
-- Extrinsics (baseline): `config/archive/calibration_v3dt_baseline.json`
+- Extrinsics: `config/camera_calibration.json`
 - Dewarper: `config/dewarper_v3dt_baseline.txt`
 - Tracker config: `config/v3dt/nvtracker_v3dt_baseline.yml`
 - camInfo dir: `config/v3dt/caminfo_baseline/`
@@ -114,6 +114,14 @@ Source: `docs/DS8_v3dt_forensics.md`
 > export NOESIS_V3DT_CAMINFO_Y_FLIP=1
 > export NOESIS_V3DT_CAMINFO_WORLD_AXES=xzy
 
+The generator right-multiplies the canonical world-to-camera transform by the
+`xzy` axis map. Therefore the locked tracker profile emits coordinates in that
+remapped tracker tuple and the producer must apply the same signed permutation
+before publishing `backend_world_m`. For this profile, the real tracker output
+uses `zLen` as height and its ground endpoint is
+`(xCentre, yCentre, zCentre - 0.5*zLen)`. This is a measured property of the
+locked camInfo/profile, not a blanket claim about every `NvDsObj3DBbox` layout.
+
 ### 7) nvtracker SV3DT (ObjectModelProjection)
 
 - camInfo supports projectionMatrix_3x4 or projectionMatrix_3x4_w2p.
@@ -179,10 +187,12 @@ Source: `noesis/diagnostics/v3dt_forensics.py`
    - streammux scaling (expected bbox height from fy and zLen)
    - dewarper dst K deviations (family-room rectified K)
 
-## Open Questions (initial)
+## Open Questions (current)
 
-- The nvtracker docs do not state an explicit world-axis orientation (Z-up vs Y-up);
-  we will confirm using DeepStream sample configs and/or the installed tracker headers.
+- The installed binding documents the SDK default `NvDsObj3DBbox` as Y-up, while
+  the locked `xzy` camInfo profile is empirically Z-up (`zLen` is the 1.85 m
+  height). Any new camInfo profile must prove its own axis contract rather than
+  inheriting the locked profile's Z-foot rule.
 - The calibration snapshot scaling uses 2*cx; if camera models have off-center
   principal points, we need to decide whether to encode base resolution explicitly
   in cameras.yaml or adjust diagnostics to use the explicit resolution field.

@@ -1,7 +1,15 @@
 # V3DT Status Summary — 2026-01-22 (Locked Baseline)
 
-This document captures the current **SV3DT working baseline**, why it works, the
-known shortfalls, and the **confirmed no-go** changes that should not be repeated.
+> Historical snapshot, superseded for current coordinate/runtime truth by the
+> 2026-07-11 addendum in `plans/DS8/v3dt/integration_plan.md`. The active
+> calibration is `config/camera_calibration.json`; its separated camera centers
+> and the locked `xzy` camInfo set now define one shared metric world. MV3DT is
+> still unproven because occupied overlap, synchronization, peer association,
+> and fused-output evidence remain pending.
+
+This document captures the **January 2026 SV3DT working baseline**, why it
+worked, its then-known shortfalls, and confirmed projection no-go changes that
+should not be repeated.
 
 ## Current baseline (SV3DT only, DS8 only)
 
@@ -9,7 +17,7 @@ known shortfalls, and the **confirmed no-go** changes that should not be repeate
 - Tracker: `config/v3dt/nvtracker_v3dt_baseline.yml`
 - CamInfo dir: `config/v3dt/caminfo_baseline/`
 - Cameras config: `config/cameras_v3dt_baseline.yaml`
-- Calibration (baseline): `config/archive/calibration_v3dt_baseline.json`
+- Calibration used by the current profile: `config/camera_calibration.json`
 - Dewarper (family-room): `config/dewarper_v3dt_baseline.txt`
 - Alignment: `config/ply_alignment.json` with `units.s_obj_to_m=1.0`
 - Tracking mode: `v3dt` (`NOESIS_TRACKING_MODE=v3dt` or `--tracking-mode v3dt`)
@@ -67,7 +75,9 @@ Family-room best runs (non-live):
   additional tilt or a better extrinsics solve.
 - **Depth ratio off** for family-room in several runs (depth bias remains).
 - **BEV not yet validated** against this baseline; fix after SV3DT stability.
-- **MV3DT disabled** pending shared-world calibration.
+- **MV3DT disabled:** the shared-world calibration now exists, but occupied
+  overlap, time synchronization, peer association, and fused output remain
+  separate unpassed gates.
 
 ## Confirmed no-go items (do not repeat)
 

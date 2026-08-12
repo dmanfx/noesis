@@ -2,12 +2,20 @@
 
 This plan is tailored to the **DS8 canonical stack** (`noesis/`). It assumes we will **not** touch deprecated pre-DS8 runtime code and we will **not** add CPU/appsink branches to DS8.
 
-## Current baseline addendum (2026-01-22)
+## Current baseline addendum (2026-08-12)
 
-SV3DT is now working with a locked baseline (per-camera pitch preview + model height 2.2).
-See `plans/DS8/v3dt/status_summary_2026-01-22_locked_baseline.md` for the exact
-configs, why it works, and confirmed no-go items. This plan still applies for
-MV3DT and the shared-world calibration work.
+SV3DT uses the locked per-camera pitch/model profile and one shared metric
+calibration. `config/camera_calibration.json` and the reimplementation copy are
+byte-identical; DS8 and DS9 camInfo files are byte-identical and match the
+locked `xzy` projection exactly. Producers now convert the tracker tuple back
+to Y-up `backend_world_m` before publishing `world`.
+
+The dated January status summary remains historical evidence. AMC and MV3DT
+activation are deferred until the Kitchen geometry is corrected. Living Room
+and Family Room do not overlap and must never be connected as vision neighbors.
+Kitchen and Family Room are the only prospective MV3DT pair; their close
+adjacency/overlap still requires synchronized occupied evidence, peer
+association, and live fused-position acceptance before enablement.
 
 ## 0) Executive summary (what we will build)
 
@@ -35,20 +43,25 @@ Related docs:
   - `config/ply_alignment.json` (floor_y, s_obj_to_m, align matrix)
 - Confirmed stream/camera order (must stay consistent across camInfo + MV3DT pub/sub configs):
   - **Stream 0 / source index 0:** `living-room` (camera id `0`)
-    - `config/infer.yaml` source 0: `rtsp://192.168.3.214:7447/jdr9oLlBkjyl3gDm?`
+    - `config/infer.yaml` source 0: `camera-secret:living-room`
   - **Stream 1 / source index 1:** `kitchen` (camera id `1`)
-    - `config/infer.yaml` source 1: `rtsp://192.168.3.214:7447/qt3VqVdZpgG1B4Vk?`
+    - `config/infer.yaml` source 1: `camera-secret:kitchen`
   - **Stream 2 / source index 2:** `family-room` (camera id `2`)
-    - `config/infer.yaml` source 2: `rtsp://192.168.3.214:7447/4qWTBhW6b4nLeUFE?`
+    - `config/infer.yaml` source 2: `camera-secret:family-room`
     - family-room is 1280×720 intrinsics in `config/cameras.yaml` but is scaled to 1920×1080 by streammux (per `config/config_nvdsanalytics_post.ini` comments)
-- **Critical blocker:** `config/camera_calibration.json` currently looks **camera-local** (camera centers x≈0,z≈0 for all). MV3DT needs a shared global world frame.
+- **Current boundary:** `config/camera_calibration.json` has separated camera
+  centers in one `backend_world_m` frame. Shared calibration is necessary but
+  is not sufficient evidence for MV3DT overlap fusion.
 
-## 2) Inputs we still need from you (blocking for Phase 0/1)
+## 2) Inputs still blocking MV3DT/AMC activation
 
-1. **Global camera poses**:
-   - If Menon still has camera transforms in your house model: provide/export them (preferred).
-   - Otherwise we must do a new calibration procedure (PnP/tag-based/manual correspondences).
-2. **MQTT broker details** (for MV3DT MQTT communicator):
+1. **Corrected Kitchen geometry**:
+   - Finish the Kitchen room geometry and verify its shared-world placement
+     against Family Room before any AMC run or MV3DT activation.
+2. **Occupied overlap and timestamp evidence**:
+   - Capture kitchen/family-room overlap with independently advancing streams.
+   - Prove the timestamp/synchronization policy before accepting peer fusion.
+3. **MQTT broker details** (for MV3DT MQTT communicator):
    - We can start with the existing local Mosquitto defaults already used in this repo (`config.py` → `IntegrationsSettings`).
    - Confirm whether you want MV3DT to use the same broker/auth as occupancy publishing.
 
@@ -122,9 +135,10 @@ Update docs accordingly:
 
 ## 5) Implementation phases (concrete)
 
-### Phase 0a — Pre-calibration staging (do now; MV3DT disabled)
+### Phase 0a — Canonical SV3DT staging (MV3DT disabled)
 
-**Goal:** get *everything except shared-world fusion* ready so that when Menon extrinsics land we can flip on MV3DT quickly.
+**Goal:** keep the canonical SV3DT metadata/axis path complete while MV3DT
+overlap and synchronization evidence remains pending.
 
 What we can do safely before global extrinsics:
 
@@ -140,20 +154,22 @@ What we can do safely before global extrinsics:
      - Metadata path: `pyds` traversal of `obj_user_meta_list`.
      - DS8 path: Service Maker `ObjectMetadata` does not expose `obj_user_meta_list`, so use the native bridge module `noesis_v3dt_meta_ext` (build: `scripts/build_noesis_v3dt_meta_ext.sh`).
    - Keep existing bbox-ray `world` fallback for when SV3DT is off or meta isn’t present.
-3. **Add explicit “frame-of-reference” guardrails**:
-   - Until Phase 0 is complete, treat any SV3DT-derived “world” coordinates as **camera-local** and do not use them for cross-camera comparisons or dedupe.
-   - MV3DT remains disabled until we have a shared global frame.
+3. **Add explicit frame-of-reference guardrails**:
+   - Treat `bbox3d` and `velocity3d` as tracker-frame diagnostics.
+   - Apply the configured signed axis permutation before publishing
+     `world_frame=backend_world_m`; missing/invalid axis configuration fails
+     closed and missing bbox3d never invokes the baseline estimator.
+   - MV3DT remains disabled until overlap/time-sync/live-fusion acceptance.
 
 Acceptance criteria:
 
 - DS8 pipeline still runs in baseline 2D mode unchanged.
 - With SV3DT disabled, telemetry/BEV remain unchanged (no regressions).
-- With SV3DT enabled but using camera-local calibration, the system:
-  - runs without crashing,
-  - emits 3D bbox meta for people (if the projection matrices are valid enough),
-  - does **not** claim cross-camera consistency.
+- With SV3DT enabled, the system runs without crashing, emits 3D bbox meta for
+  people, restores the locked xzy tracker tuple into `backend_world_m`, and
+  does **not** use this SV3DT evidence to claim MV3DT association/fusion.
 
-### Phase 0 — Global calibration (required for MV3DT; strongly recommended for SV3DT→BEV)
+### Phase 0 — Global calibration verification (static complete; live fusion separate)
 
 **Goal:** produce shared-world extrinsics in `config/camera_calibration.json` such that camera centers are meaningfully separated in X/Z (meters).
 
@@ -169,8 +185,12 @@ Tasks:
    - a few known world points project plausibly into each camera frame
 
 Acceptance criteria:
-- Camera centers (world) differ across cameras (not all x≈0,z≈0).
-- BEV rendering for each camera places footpoints in consistent house locations.
+- Camera centers (world) differ across cameras (complete).
+- Generated camInfo exactly matches the active calibration with `xzy`
+  restoration (complete).
+- Live per-camera image-foot/floor/world evidence passes the typed v2 gate
+  (pending a fresh occupied run).
+- MV3DT overlap/time-sync/fused-position evidence passes separately (pending).
 
 ### Phase 1 — SV3DT bring-up (single-camera 3D tracking)
 
@@ -307,7 +327,9 @@ Use `docs/DS8_testing_guide.md` as the baseline. Add these targeted validations.
 ### 6.3 Contract checks
 
 - **ID contract:** WS payloads show `stable_id` only; no raw tracker IDs.
-- **Frame of reference:** before Phase 0, do not treat SV3DT “world” coords as shared across cameras (must be labeled/guarded as camera-local).
+- **Frame of reference:** `bbox3d`/`velocity3d` remain in the locked tracker
+  tuple; `world` is axis-restored `backend_world_m`. This does not itself prove
+  MV3DT cross-camera association.
 
 ## 7) Risk register (with mitigations)
 

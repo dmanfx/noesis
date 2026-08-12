@@ -1,10 +1,10 @@
-# Isolated DS9 Docker Staging
+# Isolated DS9.1 Docker Staging
 
-Last updated: 2026-07-10
+Last updated: 2026-08-12
 
 ## Purpose
 
-Use a second Docker daemon to stage the official DS9 image on a large local
+Use a second Docker daemon to stage the official DS9.1 image on a large local
 filesystem without moving, restarting, or reconfiguring the primary daemon.
 This is primarily a staging and inspection boundary. Its only live-runtime use
 is the explicitly authorized, exclusive-GPU canary supervised by
@@ -67,7 +67,7 @@ docker run --rm \
   --security-opt=no-new-privileges \
   --env NVIDIA_VISIBLE_DEVICES=void \
   --entrypoint /bin/bash \
-  nvcr.io/nvidia/deepstream:9.0-triton-multiarch \
+  nvcr.io/nvidia/deepstream:9.1-triton-multiarch@sha256:f6fa0247da9290979cbb05749e7da9435d089c93db7c4dcfe85ba2488b5f4994 \
   -lc 'deepstream-app --version-all; python3 --version'
 ```
 
@@ -117,7 +117,18 @@ and proves the requested mount and 26 GiB memory-ceiling contract without
 invoking `docker run`. See `runtime_container_boundary.md`; do not reconstruct
 its live command by hand.
 
-## Observed Image Provenance
+## Current DeepStream 9.1 Image Authority
+
+The required base is
+`nvcr.io/nvidia/deepstream:9.1-triton-multiarch@sha256:f6fa0247da9290979cbb05749e7da9435d089c93db7c4dcfe85ba2488b5f4994`.
+It was pulled and inspected through this staging boundary on 2026-08-12 as
+Linux/amd64 image
+`sha256:c41fa01c8657a7476a4b252261d9277f5117c33083c399a49b2a993ef9f6ac70`.
+The inspection confirmed the required SDK/toolchain contract. No 9.1 derived
+image ID exists yet. Follow `deepstream_9_1_direct_upgrade_plan.md` and record
+the derived IDs before using the live supervisor.
+
+## Historical DeepStream 9.0 Image Provenance
 
 The official image pulled on 2026-07-10 was:
 
@@ -134,7 +145,7 @@ The read-only probe reported DeepStream 9.0.0, CUDA runtime 13.1, TensorRT
 10.14, cuDNN 9.17, Python 3.12.3, CUDA compiler 13.1.115, CMake 3.28.3, and
 GCC 13.3. No NVIDIA device nodes or driver libraries were visible.
 
-## Engine-Build Image Provenance
+## Historical DeepStream 9.0 Engine-Build Image Provenance
 
 `DS9/docker/Dockerfile` builds the digest-pinned Noesis engine-build image
 through `DS9/scripts/build_secondary_dev_image.sh`. The observed 2026-07-10
@@ -156,7 +167,7 @@ libav, required codec shared objects, pybind11 2.12.0, and Torch
 2.12.1+cu130. A read-only runc validation passed `pip check`, runtime imports,
 NICE and H.264 GStreamer inspection, and reported zero Torch CUDA devices.
 
-## Runtime Image Provenance
+## Historical DeepStream 9.0 Runtime Image Provenance
 
 Live runtime dependencies are layered separately so an unrelated service
 package change cannot falsify TensorRT engine evidence. Build and inspect the
@@ -434,9 +445,10 @@ from killing a builder after engine installation but before final-load or
 rollback evidence. MapAnything is the
 dominant risk on a 12 GiB GPU and a swapless host. Historical on-host evidence
 shows a related MapAnything plan built in about 348 seconds, but reserve a
-45-90 minute window for all five DS9 10.14 builds, deserialization checks, and
-a short runtime smoke rather than treating that historical time as a promise.
-The installed DeepStream 9 stack requires driver 590+; the runner permits
+45-90 minute window for all five historical DS9.0 TensorRT 10.14 builds,
+deserialization checks, and a short runtime smoke rather than treating that
+historical time as a 9.1 promise. Remeasure only the selected 9.1 artifacts.
+The DeepStream 9.1 stack requires driver `595.58.03` or newer; the runner permits
 no-GPU plans on older drivers but rejects actual engine builds before GPU
 access.
 The current `595.71.05` host driver satisfies this version floor; DS8 product

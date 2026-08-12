@@ -1,21 +1,29 @@
-# Noesis DeepStream 9 Port
+# Noesis DeepStream 9.1 Runtime
 
-Status: DS9 runtime ownership and the canonical baseline container lane are in
-place. The launch path is `DS9/noesis/ds9_runtime.py` ->
-`DS9/noesis/ds9_runtime_core.py`; DS9 executable code no longer imports or
-spawns `noesis/ds8_runtime.py` and no longer imports DS8 preflight helpers. The
-host has a DS9-compatible driver while intentionally retaining the DS8
-TensorRT stack. DS9 TensorRT 10.14 work and live execution stay inside the
-isolated secondary-Docker boundary. All ten currently selected baseline,
-V3DT, and Wholebody49 engines are independently realized with exact maintenance
-provenance. Canonical, V3DT, and Wholebody49 artifact/profile validation pass
-against realization
-`6fab7d456c031490f640ee2c3ce5a38922a96ed86a965020ca3051820306dce4`.
-The 2026-07-11 canonical 30-second baseline canary also passed image, artifact,
-GPU-owner, WebRTC, analytics-persistence, acknowledged-EOS, cleanup, and
-evidence gates. This is artifact and baseline runtime readiness, not DS9 cutover
-approval: fresh V3DT and Wholebody49 runtime-quality evidence, occupied semantic
-quality, soak, and appliance promotion remain separate gates.
+Status: direct 9.0-to-9.1 upgrade in progress. The launch path remains
+`DS9/noesis/ds9_runtime.py` -> `DS9/noesis/ds9_runtime_core.py`; DS9 executable
+code does not import or spawn `noesis/ds8_runtime.py` or import DS8 preflight
+helpers. The host driver `595.71.05` satisfies the DeepStream 9.1 floor, while
+the SDK, CUDA, TensorRT, compiled artifacts, and runtime remain isolated in the
+secondary-Docker boundary.
+
+The source/toolchain pins are updated. The focused source suite passed 29 tests
+with 1 skipped, and the four direct 9.1 pin assertions also pass. The exact 9.1
+base has been pulled and inspected as image
+`sha256:c41fa01c8657a7476a4b252261d9277f5117c33083c399a49b2a993ef9f6ac70`.
+The derived image is not built, and no 9.1 native library, parser, plugin,
+TensorRT engine, recorded-media smoke, or live-camera result is accepted. The
+previous 9.0 realization
+`6fab7d456c031490f640ee2c3ce5a38922a96ed86a965020ca3051820306dce4`
+and its dated canary/performance results remain historical comparison and
+rollback evidence only. They are not reusable 9.1 artifacts. Follow
+`DS9/docs/deepstream_9_1_direct_upgrade_plan.md` for the active execution state.
+
+AMC is deferred. MV3DT remains a separate disabled capability: the only future
+edge is Kitchen/Family Room, Living Room has no MV3DT edge, and activation is
+blocked on corrected Kitchen geometry plus synchronized occupied overlap,
+peer-association, and fused-position evidence. The existing `v3dt` lane remains
+SV3DT and must not be presented as MV3DT.
 
 This folder is runtime-standalone from the DS8 entrypoint, DS8 engines, and DS8
 native extension binaries. It is not yet a hermetic standalone repository:
@@ -451,27 +459,32 @@ unwrap path. The supported path is:
    latest-real-pose cache covers sparse SGIE tensor emission without synthetic
    keypoints.
 
-## Verified DS9 Requirements
+## Verified DS9.1 Requirements
 
-From NVIDIA DS9 docs:
+The direct-upgrade target is:
 
-- DeepStream 9 targets Ubuntu 24.04, Python 3.12, CUDA 13.1, TensorRT 10.14.1.48, and driver 590.48.01 or later.
+- Base image: `nvcr.io/nvidia/deepstream:9.1-triton-multiarch@sha256:f6fa0247da9290979cbb05749e7da9435d089c93db7c4dcfe85ba2488b5f4994`.
+- DeepStream 9.1 at `/opt/nvidia/deepstream/deepstream-9.1`.
+- CUDA `13.2.0.046`, TensorRT `10.16.0.72`, and driver `595.58.03` or later.
 - DeepStream Python bindings are deprecated; `pyservicemaker` is the recommended Python interface.
-- DS8 apps are documented as compatible with DS9, but compiled apps must be rebuilt with DS9 (`NVDS_VERSION=9.0` for Makefile-based apps).
-- NVIDIA documents a DS8 library-symlink method for old compiled apps. This port does not use that method because it would make DS9 run against DS8 compatibility paths.
+- The Service Maker wheel is bundled but must be installed explicitly in the
+  derived image.
+- Every DS8/DS9.0 native library, parser, plugin, and TensorRT engine must be
+  rebuilt. This port does not use compatibility symlinks.
 
 ## Current Host Platform Gate
 
-The 2026-07-10 post-reboot audit clears the driver prerequisite: GPU, loaded
-kernel module, on-disk module, and DKMS all report `595.71.05`, which is newer
-than the installed DeepStream 9 minimum of `590.48.01`. The current boot has no
+The host audit clears the driver prerequisite: GPU, loaded kernel module,
+on-disk module, DKMS, and userspace all report `595.71.05`, which is newer than
+the DeepStream 9.1 minimum of `595.58.03`. The current boot has no
 Xid, API-mismatch, GPU-fallen-off, or `RmInitAdapter` event. The host deliberately
 keeps `/usr/local/cuda` on CUDA 13.0, Python and `trtexec` on TensorRT 10.13.3.9,
 and the canonical `deepstream` link on DS8 so DS8 remains recoverable.
 
 This clears only the driver/platform prerequisite. Host preflight now reports
-the 595 driver as compatible and still fails closed on host TensorRT 10.13. DS9
-TensorRT 10.14 builds and runtime validation use the pinned isolated image. The
+the 595 driver as compatible and still fails closed on host TensorRT 10.13.
+DS9.1 CUDA 13.2 / TensorRT 10.16 builds and runtime validation use the pinned
+isolated image. The
 canonical authenticated DS8 YOLO26m gate has now passed a 30-second advancing
 world-state window followed by acknowledged EOS, the expected EOS callback,
 Service Maker `wait()` return, exact exit `0`, and no forced kill. That clears
@@ -571,11 +584,12 @@ Relevant local sample pattern: `docs/deepstream-docs/03_Sample_Applications.md` 
 
 ## Build Order
 
-Run inside a DeepStream 9 container or host install:
+Run inside the pinned DeepStream 9.1 container:
 
 ```bash
 cd <repo>
-export NOESIS_DEEPSTREAM_HOME=/opt/nvidia/deepstream/deepstream-9.0
+export NOESIS_DEEPSTREAM_HOME=/opt/nvidia/deepstream/deepstream-9.1
+export DS9_CUDA_HOME=/usr/local/cuda-13.2
 
 python3 DS9/scripts/ds9_preflight.py --env-only
 bash DS9/scripts/build_gst_plugins.sh
@@ -749,14 +763,14 @@ Hook attachment points and DS9-specific native metadata paths are documented in 
 - `streammux.batch-size`: stays `3` to match three sources and fixed batch engines.
 - `models.*.engine`: moved to `DS9/models/engines/*`; DS8 engines are not used.
 - `models.*.config-file-path`: moved to `DS9/pipelines/*`.
-- `tracker.ll-lib-file`: points at `/opt/nvidia/deepstream/deepstream-9.0/lib/libnvds_nvmultiobjecttracker.so`.
+- `tracker.ll-lib-file`: points at `/opt/nvidia/deepstream/deepstream-9.1/lib/libnvds_nvmultiobjecttracker.so`.
 - V3DT streammux remains exactly unpadded `1920x1080` with one surface per
   frame so the locked projection matrices stay valid.
 - `NOESIS_DS9_ARTIFACT_ROOT`: external physical owner for virtual
   `DS9/models/...` paths. Source staging and engine maintenance retain at least
   10 GiB of free space by default.
-- Actual DS9 engine maintenance requires the installed DeepStream 9 driver
-  floor (`590.48.01` or newer). The current `595.71.05` driver satisfies that
+- Actual DS9.1 engine maintenance requires the installed DeepStream 9.1 driver
+  floor (`595.58.03` or newer). The current `595.71.05` driver satisfies that
   prerequisite. Plan mode remains CPU-only and is not build-readiness evidence.
 - `mosaic_output.*`: unchanged behavior, RTSP to WebRTC remains canonical.
 - `analytics.exclude.config-file`: still uses shared ROI config because ROI geometry is app data, not SDK-version-specific.

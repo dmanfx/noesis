@@ -1,6 +1,32 @@
 # DS9 Known Blockers
 
-Last updated: 2026-07-27
+Last updated: 2026-08-12
+
+## Current DeepStream 9.1 Upgrade Blockers
+
+The direct 9.0-to-9.1 upgrade is not runtime-ready yet:
+
+- Source/toolchain pinning is complete; its focused source suite passed 29
+  tests with 1 skipped, and all 4 direct 9.1 pin assertions passed.
+- The exact 9.1 base image is pulled and its SDK/toolchain inspection passed.
+  No derived 9.1 development/runtime image has been built.
+- All selected native extensions, parsers, GStreamer/TensorRT plugins, and
+  TensorRT engines still require a 9.1 rebuild and focused load validation.
+- No 9.1 recorded-media or live three-camera baseline smoke has run.
+- `run_static_prep_checks.sh` still exits nonzero on pre-existing parity-marker
+  classifications and missing `apply_source_hysteresis` markers in both hook
+  copies; do not report the broader static-prep gate as passed.
+
+The exact target is DeepStream 9.1, CUDA `13.2.0.046`, TensorRT `10.16.0.72`,
+SDK root `/opt/nvidia/deepstream/deepstream-9.1`, and minimum driver
+`595.58.03`. The host driver `595.71.05` clears only the driver floor. Existing
+9.0 artifact realizations and validation reports do not clear any 9.1 binary or
+runtime gate.
+
+AMC is deferred. MV3DT remains a distinct disabled capability with only a
+future Kitchen/Family Room edge; Living Room has no MV3DT edge. Corrected
+Kitchen geometry and synchronized occupied overlap evidence are prerequisites,
+not part of the direct 9.1 baseline upgrade.
 
 ## Current MapAnything Status
 
@@ -18,7 +44,11 @@ Surveyed anchors and held-out-scene evaluation remain future confidence work
 for absolute scale and unseen geometry; they do not invalidate the accepted
 manual depth-panel path.
 
-## Current Checkout Blockers
+## Retained DeepStream 9.0 Checkout Record
+
+The material in this section records the last 9.0 readiness/blocker state. It
+is retained for regression comparison and rollback context, not as current 9.1
+acceptance evidence.
 
 The selected DS9 artifact profiles and canonical baseline lane are runnable, but
 the current checkout is not ready to cut over:

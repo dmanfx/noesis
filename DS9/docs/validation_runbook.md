@@ -1,9 +1,19 @@
 # DS9 Validation Runbook
 
-Last updated: 2026-07-10
+Last updated: 2026-08-12
 
 Commands assume the repo is mounted at `/workspace` inside the DS9 container.
 Do not run these against a DS8 install.
+
+The active target is the digest-pinned DeepStream 9.1 image documented in
+`deepstream_9_1_direct_upgrade_plan.md`: SDK 9.1, CUDA `13.2.0.046`, TensorRT
+`10.16.0.72`, SDK root `/opt/nvidia/deepstream/deepstream-9.1`, and driver
+floor `595.58.03`. The current host driver `595.71.05` passes that floor.
+
+The exact official base is pulled and its SDK/toolchain inspection passed. No
+application-owned 9.1 binary, engine, or runtime result has been accepted yet.
+Dated 9.0 results later in this runbook are retained historical baselines and
+must not be reported as 9.1 validation.
 
 For host validation, run the same gates from the repo checkout. First verify the
 host stack:
@@ -60,10 +70,11 @@ The 2026-06-16 host cutover snapshot was:
 - Torch `2.12.0+cu130` with CUDA available.
 
 The current 2026-07-10 recovery host is intentionally different: driver
-`595.71.05` satisfies the installed DS9 minimum, but the host remains on the
-DS8 CUDA 13.0 / TensorRT 10.13.3 stack. Use the pinned isolated image for DS9
-TensorRT 10.14 work. A host `ds9_preflight.py --env-only` run is a split
-diagnostic: it must accept the driver and fail the independent TensorRT check.
+`595.71.05` also satisfies the current DS9.1 minimum, but the host remains on
+the DS8 CUDA 13.0 / TensorRT 10.13.3 stack. Use the pinned isolated 9.1 image
+for CUDA 13.2 / TensorRT 10.16 work. A host `ds9_preflight.py --env-only` run is
+a split diagnostic: it must accept the driver and fail the independent TensorRT
+check.
 
 ## Start A DS9 Development Container
 
@@ -75,7 +86,7 @@ cd <repo>
 docker run --rm -it --gpus all --network host --ipc host \
   -v "$PWD:/workspace" \
   -w /workspace \
-  nvcr.io/nvidia/deepstream:9.0-triton-multiarch \
+  nvcr.io/nvidia/deepstream:9.1-triton-multiarch@sha256:f6fa0247da9290979cbb05749e7da9435d089c93db7c4dcfe85ba2488b5f4994 \
   bash
 ```
 
@@ -95,6 +106,9 @@ apt-get install -y \
   libx264-164 \
   libx265-199 \
   libmpg123-0t64
+python3 -m pip install --break-system-packages \
+  /opt/nvidia/deepstream/deepstream/service-maker/python/pyservicemaker*.whl \
+  pyyaml
 python3 -m pip install --break-system-packages -r DS9/requirements-runtime.txt
 ```
 
@@ -382,9 +396,10 @@ Confirm the output reports `pyservicemaker` from
 `pyservicemaker` wheel can shadow the DeepStream 9 binding and cause native
 heap corruption during construction/destruction and shutdown; the DS9 preflight
 and launcher pin the system binding before importing Service Maker. Preflight
-requires driver `590.48.01` or newer independently from TensorRT 10.14. The
-current host therefore reports `595.71.05` as compatible but still exits
-nonzero on host TensorRT 10.13; do not weaken or bypass that failure. Preflight
+requires driver `595.58.03` or newer independently from TensorRT 10.16.0.72.
+The current host therefore reports `595.71.05` as compatible but must still
+exit nonzero when run against the host TensorRT 10.13 stack; do not weaken or
+bypass that failure. Preflight
 also requires `nvdsroiexclude`, `noesisforceidr`, and `noesiseos` to resolve to
 the exact DS9-owned binaries under `DS9/gst-plugins/`; finding a same-named DS8
 or system plugin is a failure. It also imports the exact GI namespaces used by
@@ -974,8 +989,8 @@ DS8 option-surface parity. Keep these broader gates separate in reports:
   ```
 
   Build without `--plan` only after every GPU compute owner has stopped and the
-  host driver satisfies the installed DeepStream 9 requirement of 590+, in the
-  same order. Then run the canonical `--lane v3dt` plan/canary and attached
+  host driver satisfies the DeepStream 9.1 requirement of `595.58.03` or newer,
+  in the same order. Then run the canonical `--lane v3dt` plan/canary and attached
   V3DT validation bundle above. Both V3DT clients require the owner-only bearer;
   anonymous WebSocket success is not accepted. The world gate requires
   `world_frame=backend_world_m` and `world_source=bbox3d`, all configured cameras
@@ -1194,7 +1209,7 @@ timeout 75s python3 DS9/noesis/ds9_runtime.py \
   --disable-rest
 ```
 
-Do not run the Wholebody49 launch commands until both DS9 TensorRT 10.14
+Do not run the Wholebody49 launch commands until both DS9.1 TensorRT 10.16
 engines exist. Before then, use the CPU/source/parser and `--plan` gates in
 `../DS9_REBUILD_AND_SMOKE_GATES.md`; expected preflight failure is not runtime
 evidence.

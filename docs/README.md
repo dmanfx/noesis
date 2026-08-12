@@ -4,6 +4,8 @@ This folder is the live reference for the Noesis video stack. Historical plans
 and worklogs live in `docs/history/`.
 
 ## Quick Links
+- **DeepStream 9.1 direct upgrade:**
+  `../DS9/docs/deepstream_9_1_direct_upgrade_plan.md`
 - **Start here (DS8):** `DS8_README_FOR_AGENTS.md`
 - **Current baselines & defaults:** `DS8_Baselines.md`
 - **Pose-assisted StableID:** `DS8_pose_stable_id_integration.md`
@@ -45,6 +47,13 @@ and worklogs live in `docs/history/`.
   active stack.
 - When you edit docs, append a one-line entry under “Doc changes” (date + what changed) for any **substantive** update: new features/processes/workflows, contract or baseline changes, behavior-affecting diagrams. Skip trivial typo/style fixes or purely cosmetic diagram tweaks.
 - Status headers (“Status: validated as of …”) should only be updated when the doc has been re-validated against code/configs.
+
+## Doc changes (2026-08-12)
+- Defined the exact DeepStream 9.1 direct-upgrade target and parity-first
+  execution path, recorded the completed source pins and base-image inspection,
+  retained 9.0 results as historical evidence, and explicitly deferred AMC
+  plus MV3DT activation pending corrected Kitchen geometry
+  (`../DS9/docs/deepstream_9_1_direct_upgrade_plan.md`).
 
 ## Doc changes (2026-08-10)
 - Documented the validated DA3-conditioned MapAnything phone-walk fusion,

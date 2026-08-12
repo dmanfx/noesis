@@ -1,36 +1,47 @@
 # DS9 Docs Index
 
-This directory is the launch handoff for the DeepStream 9 Noesis app under
+This directory is the launch handoff for the DeepStream 9.1 Noesis app under
 `DS9/`.
 
 ## Read First
 
-1. `../README.md` - current DS9 launch status, runtime ownership boundary, build
+1. `deepstream_9_1_direct_upgrade_plan.md` - active direct-upgrade target,
+   execution order, minimal parity checks, rollback, and deferred MV3DT/AMC
+   boundary.
+2. `../README.md` - current DS9.1 launch status, runtime ownership boundary, build
    order, run commands, and latest validation summary.
-2. `migration_state.md` - detailed migration state, validated gates, and
+3. `migration_state.md` - detailed migration state, validated gates, and
    remaining work.
-3. `known_blockers.md` - active caveats and resolved blockers.
-4. `validation_runbook.md` - commands for the next validation pass.
-5. `driver_595_migration.md` - checkpointed host-driver maintenance, DS8
+4. `known_blockers.md` - active caveats and resolved blockers.
+5. `validation_runbook.md` - commands for the next validation pass.
+6. `driver_595_migration.md` - checkpointed host-driver maintenance, DS8
    acceptance, and offline rollback boundary.
-6. `driver_580_rollback_rehearsal_2026-07-10.md` - exact non-mutating rollback
+7. `driver_580_rollback_rehearsal_2026-07-10.md` - exact non-mutating rollback
    evidence, corrected solver transaction, ordered recovery, and post-reboot
    DS8 acceptance contract.
-7. `secondary_docker_staging.md` - isolated DS9 image, external artifact,
+8. `secondary_docker_staging.md` - isolated DS9 image, external artifact,
    canonical engine-build, capacity, and rollback workflow.
-8. `runtime_container_boundary.md` - canonical isolated-container plan/run,
+9. `runtime_container_boundary.md` - canonical isolated-container plan/run,
    mount security, profile policy, lifecycle, cleanup, and evidence contract.
-9. `runtime_ownership.yaml` - machine-readable shared/adapter/duplicate
+10. `runtime_ownership.yaml` - machine-readable shared/adapter/duplicate
    ownership and capability-parity state.
-10. `../asset_manifest.yaml` plus `asset_manifest.schema.json` - expected
+11. `../asset_manifest.yaml` plus `asset_manifest.schema.json` - expected
    DS9-owned assets, compatibility, staging state, and provenance contract.
-11. `canonical_world.md` - canonical observations, world snapshots, artifact
-    fingerprints, time semantics, identity generations, and capability health.
-12. `bev_capture_event_integration.md` - canonical BEV ownership, exact paired
+12. `canonical_world.md` - canonical observations, world snapshots, artifact
+   fingerprints, time semantics, identity generations, and capability health.
+13. `bev_capture_event_integration.md` - canonical BEV ownership, exact paired
     publication, active-floorplan authority lifecycle, raw-only capture fusion,
     GPU-first RGB boundary, and the v4 live acceptance contract.
 
 ## Current Position
+
+The active target is DeepStream 9.1 on the exact image, SDK, CUDA, TensorRT,
+and driver contract recorded in `deepstream_9_1_direct_upgrade_plan.md`.
+Source/toolchain pinning and focused contract tests are complete, and the exact
+official base has been pulled and inspected. The derived image, compiled
+artifacts, engines, and runtime validation remain open. All dated 9.0 image
+IDs, engine hashes, and validation reports in this directory remain historical
+comparison evidence and must not be reused as 9.1 artifact proof.
 
 DS9 runtime execution is owned by:
 
@@ -48,6 +59,8 @@ is an explicit packaging boundary, not a DS8 runtime fallback.
 
 ## Active Docs
 
+- `deepstream_9_1_direct_upgrade_plan.md` - active, parity-first direct upgrade
+  from 9.0 to 9.1, including the disabled MV3DT topology and AMC deferment.
 - `known_blockers.md` - current blocker/caveat list.
 - `migration_state.md` - detailed state and historical validation evidence.
 - `validation_runbook.md` - operator validation commands.

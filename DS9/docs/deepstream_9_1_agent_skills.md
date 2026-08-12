@@ -26,11 +26,16 @@ DeepStream method, property, or config key.
 - DeepStream SDK: 9.1
 - CUDA: 13.2
 - TensorRT: 10.16.0.72
-- Canonical dGPU image: `nvcr.io/nvidia/deepstream:9.1-triton-multiarch`
+- Canonical dGPU image:
+  `nvcr.io/nvidia/deepstream:9.1-triton-multiarch@sha256:f6fa0247da9290979cbb05749e7da9435d089c93db7c4dcfe85ba2488b5f4994`
 - SDK root: `/opt/nvidia/deepstream/deepstream-9.1` (or the vendor link that
   resolves there)
+- Minimum driver: `595.58.03` (current host `595.71.05` passes)
 - DS8/DS9.0 engines, parsers, GStreamer plugins, and native Python extensions
   are incompatible inputs and must be rebuilt.
+
+The active execution sequence and current not-yet-built status are recorded in
+`DS9/docs/deepstream_9_1_direct_upgrade_plan.md`.
 
 ## MV3DT and AMC status
 

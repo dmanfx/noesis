@@ -1,10 +1,22 @@
 # DS9 Migration State
 
-Last updated: 2026-07-28
+Last updated: 2026-08-12
 
 ## Goal
 
-Migrate the canonical Noesis DeepStream 8 app to DeepStream 9 without fallbacks.
+Directly upgrade the canonical Noesis DeepStream 9.0 app to DeepStream 9.1
+without fallbacks while preserving the current application graph, contracts,
+and operator process. The executable ownership established during the earlier
+DS8-to-9.0 migration remains unchanged.
+
+The active execution checklist is
+`DS9/docs/deepstream_9_1_direct_upgrade_plan.md`. Source/toolchain pinning and
+its focused contract tests are complete. The exact 9.1 base image has been
+pulled and inspected; the derived image has not been built, and no 9.1 native
+binary, parser, plugin, TensorRT engine, recorded-media smoke, or live-camera
+result is accepted. The 9.0 results retained below are historical comparison
+evidence only.
+
 The DS8 entrypoint remains `noesis/ds8_runtime.py`; the DS9 entrypoint is
 `DS9/noesis/ds9_runtime.py`.
 
@@ -23,12 +35,17 @@ runtime fallback.
 
 ## Target Environment
 
-- Docker image validated so far:
-  `nvcr.io/nvidia/deepstream:9.0-triton-multiarch`
-- DeepStream: 9.0
-- TensorRT: 10.14.x, specifically 10.14.1.48 in local DS9 docs
-- DS9 SDK root expected by scripts:
-  `/opt/nvidia/deepstream/deepstream-9.0`
+- Canonical base image:
+  `nvcr.io/nvidia/deepstream:9.1-triton-multiarch@sha256:f6fa0247da9290979cbb05749e7da9435d089c93db7c4dcfe85ba2488b5f4994`
+- DeepStream: 9.1
+- CUDA: 13.2.0.046
+- TensorRT: 10.16.0.72
+- DS9 SDK root: `/opt/nvidia/deepstream/deepstream-9.1`
+- Minimum driver: 595.58.03; current host: 595.71.05
+
+The previous 9.0 target and its exact artifacts remain recorded in dated
+sections below. DS8/DS9.0 engines and compiled libraries are incompatible
+inputs for this target and must be rebuilt.
 
 ## MapAnything Depth-Panel Quality Acceptance — 2026-07-27
 
@@ -688,15 +705,18 @@ artifact validator rather than inferring readiness from filenames.
 
 ## Remaining Work
 
-- The checkpointed Ubuntu `595.71.05` open-driver transaction and post-reboot
-  module/DKMS/platform checks are complete. Preserve host CUDA 13.0 and
-  TensorRT 10.13.3 for DS8; do not substitute Noble's transitional 590 package
-  or mix NVIDIA's runfile installer into the APT/DKMS stack. Complete the
-  remaining DS8 runtime/media/identity/MapAnything/resource/shutdown acceptance
-  gates, then run the realized DS9 V3DT lane through bbox3d, global-world-v2,
-  identity, resource, and shutdown gates. Follow with separate occupied
-  kitchen/family-room MV3DT overlap/time-sync/peer-fusion acceptance. Do not run
-  V3DT smokes against root DS8 pipeline/tracker artifacts as DS9 evidence.
+- Build the normal derived images from the inspected 9.1 base; the Dockerfile
+  installs the bundled Service Maker wheel explicitly.
+- Rebuild every selected native bridge, parser, GStreamer/TensorRT plugin, and
+  TensorRT engine against DeepStream 9.1 / CUDA 13.2 / TensorRT 10.16.0.72.
+  Validate actual 9.1 bytes and never relabel 9.0 provenance.
+- Run the focused static, import/load, engine-deserialization, recorded-media,
+  and bounded live-baseline checks listed in the direct-upgrade plan. Activate
+  through the existing selector only after those direct checks pass.
+- Keep AMC deferred. Keep MV3DT distinct and disabled: Kitchen/Family Room is
+  the only prospective edge, Living Room has no MV3DT edge, and activation is
+  blocked on corrected Kitchen geometry plus synchronized occupied overlap,
+  peer-association, and fused-position evidence.
 - Decide whether DS9 should remain a folder in the Noesis monorepo that shares
   app helpers, or become a hermetic standalone repository with vendored/extracted
   shared modules.

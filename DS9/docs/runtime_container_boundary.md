@@ -1,10 +1,13 @@
-# Canonical DS9 Runtime Container Boundary
+# Canonical DS9.1 Runtime Container Boundary
 
-Status: implemented, adversarially tested, and live-baseline accepted on
-2026-07-11. Session `baseline-runtime-image-canary2-20260711t0422z` ran the
-canonical baseline for 30 seconds, proved GPU ownership and WebRTC RTP flow,
-then exited `0` through acknowledged EOS with no forced removal or error-level
-log signatures.
+Status: the supervisor boundary is implemented, but DeepStream 9.1 has not yet
+been run through it. The 2026-07-11 session
+`baseline-runtime-image-canary2-20260711t0422z` accepted the former 9.0 image;
+that result remains historical lifecycle comparison evidence only. The exact
+9.1 base is recorded in `deepstream_9_1_direct_upgrade_plan.md` and has now been
+pulled and inspected. Do not launch a 9.1 canary until the actual derived 9.1
+image IDs and rebuilt artifact realization have replaced the historical
+authorities below.
 
 ## Decision
 
@@ -24,7 +27,7 @@ The readiness profiles are intentionally narrow:
 | Wholebody49 X | DINOv3-X Wholebody49 | `x` | Occupied-scene bbox-only lane |
 | YOLO11 segmentation | Explicit alternate only | N/A | Never satisfies canonical readiness |
 
-## Separate Build And Runtime Image Authorities
+## Historical DeepStream 9.0 Build And Runtime Image Authorities
 
 TensorRT build provenance and runtime service dependencies have different
 change cadences and therefore use different immutable image identities:
@@ -388,7 +391,9 @@ config cohort. It requires `world_frame=backend_world_m`,
 native image-foot reprojection, and independent image-base replay; v1 and old
 camera-local/raw-tuple evidence are rejected. This per-camera SV3DT contract
 does not claim MV3DT overlap, synchronization, peer association, or fused
-positions. Wholebody49 behavior acceptance pairs the
+positions. MV3DT remains disabled with only a future Kitchen/Family Room edge;
+Living Room has no edge, and AMC is deferred until the Kitchen geometry is
+corrected. Wholebody49 behavior acceptance pairs the
 same-lane RTSP decode with `wholebody49_occupied_scene_smoke_test.py`: the S lane
 must consume instance-mask depth samples; the X lane must consume bbox samples
 and must not activate the mask path. Subjective overlay aesthetics remain a

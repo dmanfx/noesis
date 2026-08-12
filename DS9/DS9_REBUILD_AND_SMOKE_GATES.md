@@ -1,7 +1,14 @@
-# DS9 Rebuild And Smoke Gates
+# DS9.1 Rebuild And Smoke Gates
 
-This file lists the first rebuild/smoke work to run only after DS9 is installed
-or a DS9 root is provided through `DS9_DEEPSTREAM_HOME`.
+This file lists the focused rebuild/smoke work to run only after DeepStream 9.1
+is installed or its root is provided through `DS9_DEEPSTREAM_HOME`.
+
+The exact target is SDK root `/opt/nvidia/deepstream/deepstream-9.1`, CUDA
+`13.2.0.046`, TensorRT `10.16.0.72`, and driver `595.58.03` or newer. The exact
+official base image is pulled and inspected; no application-owned 9.1 binary or
+engine has been accepted yet. Hashes and results below that identify TensorRT
+10.14 or DeepStream 9.0 are retained historical evidence and must be regenerated
+before they can satisfy these gates.
 
 Do not run these against the live DS8 symlink.
 
@@ -30,8 +37,8 @@ DS8 runtime/preflight helper.
 ## Prerequisite Gate
 
 ```bash
-DS9_DEEPSTREAM_HOME=/opt/nvidia/deepstream/deepstream-9.0 \
-DS9_CUDA_HOME=/usr/local/cuda-13.1 \
+DS9_DEEPSTREAM_HOME=/opt/nvidia/deepstream/deepstream-9.1 \
+DS9_CUDA_HOME=/usr/local/cuda-13.2 \
   ./DS9/scripts/check_ds9_prereqs.sh
 ```
 
@@ -41,8 +48,8 @@ stop; do not point it at `/opt/nvidia/deepstream/deepstream`.
 ## Native Bridge Rebuilds
 
 ```bash
-DS9_DEEPSTREAM_HOME=/opt/nvidia/deepstream/deepstream-9.0 \
-DS9_CUDA_HOME=/usr/local/cuda-13.1 \
+DS9_DEEPSTREAM_HOME=/opt/nvidia/deepstream/deepstream-9.1 \
+DS9_CUDA_HOME=/usr/local/cuda-13.2 \
   ./DS9/scripts/build_all_native_ds9.sh
 ```
 
@@ -58,6 +65,7 @@ Required bridges:
 - `noesis_depth_tracking_tensor_ext`
 - `noesis_reid_meta_ext`
 - `noesis_v3dt_meta_ext`
+- `noesis_analytics_meta_ext`
 - `noesis_latency_ext` only if in-process latency remains required
 
 `noesis_depth_tracking_tensor_ext` also builds the sibling CUDA kernel source
@@ -85,14 +93,14 @@ PY
 The YOLO26 pose SGIE now targets the DS9-staged batch-3 asset pair
 `DS9/models/onnx/yolo26n-pose_b3.onnx` and
 `DS9/models/engines/yolo26n-pose_b3_fp16.engine`. The CPU-exported ONNX source
-is staged and hash-verified. Rebuild/runtime must fail fast until the DS9 10.14
-engine exists; do not copy or reuse the root DS8 engine.
+is staged and hash-verified. Rebuild/runtime must fail fast until the DS9.1
+TensorRT 10.16 engine exists; do not copy or reuse the root DS8 engine.
 
 ## Parser Rebuilds
 
 ```bash
-DS9_DEEPSTREAM_HOME=/opt/nvidia/deepstream/deepstream-9.0 \
-DS9_CUDA_HOME=/usr/local/cuda-13.1 \
+DS9_DEEPSTREAM_HOME=/opt/nvidia/deepstream/deepstream-9.1 \
+DS9_CUDA_HOME=/usr/local/cuda-13.2 \
   ./DS9/scripts/build_all_parsers_ds9.sh
 ```
 
@@ -124,7 +132,7 @@ DS9 target unless a DS9 runtime test proves tensor-only SGIE config is rejected.
 ## ROI Exclusion Plugin Rebuild
 
 ```bash
-DS9_DEEPSTREAM_HOME=/opt/nvidia/deepstream/deepstream-9.0 \
+DS9_DEEPSTREAM_HOME=/opt/nvidia/deepstream/deepstream-9.1 \
   ./DS9/scripts/build_nvdsroiexclude_ds9.sh
 ```
 
@@ -489,8 +497,8 @@ NOESIS_DS9_ARTIFACT_ROOT=<absolute-artifact-root> \
 In an announced exclusive-GPU window, rerun those commands without `--plan`,
 in the same order. BodyPose3DNet must exist before NvMOT initializes the tracker
 graph and serializes its internal ReID engine. The wrapper rejects any active
-GPU compute owner and any host driver below the installed DeepStream 9 minimum
-of 590, preserves 10 GiB of residual artifact-root capacity, writes engines
+GPU compute owner and any host driver below the DeepStream 9.1 minimum of
+`595.58.03`, preserves 10 GiB of residual artifact-root capacity, writes engines
 atomically, and separately deserializes each new engine. A prelaunch host
 transaction binds the builder to the exact prior engine; host commit then
 publishes the engine and external realization together or restores both.
@@ -512,9 +520,12 @@ global-world-v2 replay, identity continuity, throughput/GPU-memory, and
 clean-shutdown gates. The v2 gate binds the exact same supervisor session and
 effective config hashes, requires all-camera continuity, converts the locked
 `xzy` tuple to Y-up `backend_world_m`, and rejects v1/camera-local/raw-tuple
-evidence. MV3DT overlap/time-sync/peer-fusion remains a separate gate.
+evidence. MV3DT remains disabled and separate: only Kitchen/Family Room is a
+prospective future edge, Living Room has no edge, and corrected Kitchen
+geometry plus synchronized occupied evidence is required before activation.
+AMC execution is deferred and is not part of this rebuild.
 
-## Runtime Smoke Gates After DS9 Cutover
+## Runtime Smoke Gates After DS9.1 Cutover
 
 - Pose: tensor-only YOLO26 pose SGIE emits object-level tensor metadata and
   `noesis_pose_meta_ext` extracts keypoints and attaches `NOESIS.POSE_FEATURES`.

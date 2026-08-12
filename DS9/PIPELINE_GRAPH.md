@@ -1,4 +1,4 @@
-# DS9 Pipeline Graph (Noesis)
+# DS9.1 Pipeline Graph (Noesis)
 
 This document maps the **DS9 pipeline** as built and run via:
 
@@ -9,7 +9,10 @@ This document maps the **DS9 pipeline** as built and run via:
 - Config: `DS9/config/infer.yaml` (canonical) or
   `DS9/config/infer_v3dt.yaml` (SV3DT profile)
 
-All heavy inference, tracking, tiling, and OSD remain on GPU (NVMM). CPU is touched only at the edges for telemetry publishing, calibration, and optional native metadata bridges.
+The active SDK target is DeepStream 9.1 at
+`/opt/nvidia/deepstream/deepstream-9.1`. All heavy inference, tracking, tiling,
+and OSD remain on GPU (NVMM). CPU is touched only at the edges for telemetry
+publishing, calibration, and optional native metadata bridges.
 
 ## High-Level Flow
 
@@ -74,7 +77,7 @@ flowchart TD
 | **Primary Inference** | yolo11_pgie                           | nvinfer                     | YOLO11-seg (custom fused engine under DS9/models/engines). gie-id=1. Segmentation masks enabled. |
 | **Branch Point**      | main_tee                              | tee                         | Splits to tracker path + full-frame depth SGIEs (MapAnything + DAv2). |
 | **ROI Pruning**       | analytics_exclude                     | nvdsroiexclude (custom)     | Pre-tracker ROI exclusion (DS9/build + gst-plugins copy of plugin). |
-| **Tracking**          | tracker                               | nvtracker                   | NvDCF (DS9-specific ll-lib under /opt/.../deepstream-9.0). |
+| **Tracking**          | tracker                               | nvtracker                   | NvDCF/SV3DT (DS9-specific ll-lib under `/opt/nvidia/deepstream/deepstream-9.1/lib`). |
 | **ReID SGIE**         | reid_sgie                             | nvinfer                     | NVIDIA TAO Swin-Tiny (gie-id=3), dynamic batch 1..16, raw `fc_pred` 256-d tensor metadata for identity. No custom parser. |
 | **Pose SGIE**         | yolo26_pose                           | nvinfer                     | YOLO26-n pose (gie-id=4). Keypoints + features via tensor meta + native DS9 bridge. |
 | **Depth SGIE 1 (baseline)** | depth_tracking_fullframe         | nvinfer                     | Depth-Anything-V2 metric (gie-id=5). Full-frame. Tensor meta consumed by object-depth fusion hook. Gated? No (always on in current config). |
@@ -102,7 +105,10 @@ flowchart TD
 - preserves `bbox3d`/`velocity3d` as tracker-tuple diagnostics, converts the
   bbox ground endpoint through the locked `xzy` map, and publishes only Y-up
   `backend_world_m` to the canonical world service. Missing axis/bbox state
-  fails closed; MV3DT overlap/fusion remains a separate promotion gate.
+  fails closed. This is SV3DT. MV3DT is separate and disabled: only
+  Kitchen/Family Room is a future candidate edge, Living Room has no edge, and
+  corrected Kitchen geometry plus synchronized occupied overlap evidence is
+  required before activation. AMC is deferred.
 
 Large V3DT model and engine bytes live under `NOESIS_DS9_ARTIFACT_ROOT`. The
 virtual `DS9/models/...` paths remain stable in reviewed configs and are mapped
@@ -133,6 +139,7 @@ Native DS9 extensions live in `DS9/native_extensions/` (built against DS9 header
 - `noesis_depth_tracking_tensor_ext.so`
 - `noesis_reid_meta_ext.so`
 - `noesis_v3dt_meta_ext.so`
+- `noesis_analytics_meta_ext.so`
 - `noesis_latency_ext.so`
 
 These provide zero-copy-ish or safe Service Maker + DS9 batch meta allocation paths (avoiding the unsafe pyds paths that were problematic on DS9).
@@ -180,11 +187,12 @@ absolute-depth-accuracy result.
 - `DS9/config/infer.yaml` — the declarative spec (models, sources, sinks, visualization).
 - `DS9/noesis/pipelines/ds8_pipeline.py:build_pipeline()` — the code that materializes Components + links.
 - `DS9/noesis/pipelines/hooks.py` — all attach_* functions and the processors (pose, depth fusion, overlays, telemetry).
-- `DS9/noesis/ds9_runtime.py` — only sets env + preflight then calls shared `noesis.ds8_runtime`.
+- `DS9/noesis/ds9_runtime.py` — sets the DS9.1 environment, runs preflight, and
+  delegates to `DS9/noesis/ds9_runtime_core.py`.
 - Runtime wiring in `DS9/noesis/ds9_runtime_core.py` (around the post-build hook attachment block).
 
 For validation, see `DS9/scripts/*_smoke_test.py`, `DS9/docs/validation_runbook.md`, and the broader regression gates in `DS9/DS9_REBUILD_AND_SMOKE_GATES.md`.
 
 ---
 
-**Last updated**: 2026-07-25 (post-inference exact-RGB capture target and isolated three-camera contract proof).
+**Last updated**: 2026-08-12 (DeepStream 9.1 target and deferred MV3DT/AMC boundary).

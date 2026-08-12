@@ -125,7 +125,7 @@ Source: `DS9/csrc/nvdsroiexclude/`
   - Confirm `[property].config-width/height` match the design space used for ROI coordinates (commonly the mux output size, e.g., 1920x1080).
   - Streammux letterboxing is handled automatically via uniform scale + `dx/dy`, so you don’t need to pre‑adjust.
 - No overlays but removals occur (or vice versa): ensure `osd-mode` is non‑zero for overlays; both overlay and exclusion share the same transformed polygons.
-- Plugin not found: verify `GST_PLUGIN_PATH=$PWD/DS9/gst-plugins:${GST_PLUGIN_PATH:-}` and `LD_LIBRARY_PATH=/opt/nvidia/deepstream/deepstream-9.0/lib:${LD_LIBRARY_PATH:-}`.
+- Plugin not found: verify `GST_PLUGIN_PATH=$PWD/DS9/gst-plugins:${GST_PLUGIN_PATH:-}` and `LD_LIBRARY_PATH=/opt/nvidia/deepstream/deepstream-9.1/lib:${LD_LIBRARY_PATH:-}`.
 - Python segfaults in metadata probes: this plugin removes the hot path; if needed, temporarily set `NOESIS_DISABLE_ANALYTICS_PROBE=1` during dev.
 
 ## Developer Notes

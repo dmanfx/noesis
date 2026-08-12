@@ -5,7 +5,12 @@ acceptance, and the non-mutating offline rollback rehearsal are complete. DS8
 product soak and DS9 build/runtime gates remain open. The rollback itself has
 not been executed.
 
-NVIDIA's DeepStream 9 dGPU stack requires Ubuntu 24.04, driver 590.48.01 or
+Current 9.1 note (2026-08-12): DeepStream 9.1 requires driver `595.58.03` or
+newer; the installed `595.71.05` driver passes. The 9.1 CUDA 13.2 / TensorRT
+10.16 work remains isolated in the pinned container. The rest of this document
+preserves the earlier 9.0 driver transaction and DS8 rollback evidence.
+
+The former DeepStream 9.0 dGPU target required Ubuntu 24.04, driver 590.48.01 or
 later, CUDA 13.1, and TensorRT 10.14.1.48. On Noble,
 `nvidia-driver-590-open` is a transitional package for 595. This host therefore
 uses Ubuntu's previously exercised `nvidia-driver-595-open` 595.71.05 package,
@@ -13,7 +18,8 @@ not NVIDIA's runfile installer. Mixing the runfile with the existing APT/DKMS
 stack would weaken rollback.
 
 This is a driver-only migration. Keep the host CUDA default on 13.0 and host
-TensorRT on 10.13.3 for DS8. DS9 TensorRT 10.14 builds run only in the pinned
+TensorRT on 10.13.3 for DS8. At that checkpoint, DS9 TensorRT 10.14 builds ran
+only in the pinned
 isolated image.
 
 The 2026-07-10 post-reboot audit confirms `595.71.05` across `nvidia-smi`, the

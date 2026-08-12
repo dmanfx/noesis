@@ -45,6 +45,8 @@ NOESIS_RUNTIME_DIRECTORY_ROOTS = (
     "artifacts/native",
     "plugins",
     "external/ds_preprocess_shim",
+    "data/scene_priors",
+    "data/scene_fusions",
     "oai2-fe/dist",
     "DS9/artifacts",
     "DS9/native_extensions",

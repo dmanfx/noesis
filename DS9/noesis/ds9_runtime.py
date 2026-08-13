@@ -8,6 +8,31 @@ import sys
 from pathlib import Path
 
 
+_CPU_MATH_THREAD_ENV_VARS = (
+    "OPENBLAS_NUM_THREADS",
+    "OMP_NUM_THREADS",
+    "MKL_NUM_THREADS",
+    "NUMEXPR_NUM_THREADS",
+    "VECLIB_MAXIMUM_THREADS",
+    "BLIS_NUM_THREADS",
+)
+
+
+def _configure_cpu_math_threads() -> None:
+    raw_default = str(os.environ.get("NOESIS_CPU_MATH_THREADS", "1") or "1").strip()
+    if raw_default.lower() in ("0", "off", "false", "no"):
+        return
+    try:
+        default_threads = str(max(1, int(raw_default)))
+    except Exception:
+        default_threads = "1"
+    for name in _CPU_MATH_THREAD_ENV_VARS:
+        os.environ.setdefault(name, default_threads)
+
+
+_configure_cpu_math_threads()
+
+
 DS9_ROOT = Path(__file__).resolve().parents[1]
 REPO_ROOT = DS9_ROOT.parent
 for _bootstrap_path in (str(DS9_ROOT), str(REPO_ROOT)):

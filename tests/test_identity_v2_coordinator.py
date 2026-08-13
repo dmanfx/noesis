@@ -513,6 +513,43 @@ def test_frame_replay_is_rejected_and_concurrent_distinct_tracks_are_safe(
         store.close()
 
 
+def test_durable_retention_is_bounded_off_the_per_frame_hot_path(
+    tmp_path, monkeypatch
+) -> None:
+    store, runtime = _runtime(tmp_path)
+    try:
+        calls: list[float] = []
+        original = runtime.run_retention
+
+        def counted_retention(*, now=None):
+            calls.append(float(now))
+            return original(now=now)
+
+        monkeypatch.setattr(runtime, "run_retention", counted_retention)
+        coordinator = IdentityFrameCoordinator(
+            runtime,
+            config=FrameCoordinatorConfig(retention_interval_s=1.0),
+        )
+
+        first = coordinator.process_frame((), timestamp=10.0)
+        skipped = coordinator.process_frame((), timestamp=10.5)
+        boundary = coordinator.process_frame((), timestamp=11.0)
+
+        assert calls == [10.0, 11.0]
+        assert first.retention == boundary.retention
+        assert skipped.retention.visitor_sessions == 0
+        assert skipped.retention.provisional_sessions == 0
+        assert skipped.retention.quarantine_exemplars == 0
+        assert skipped.retention.enrollment_proposals == 0
+    finally:
+        store.close()
+
+
+def test_retention_interval_must_be_positive() -> None:
+    with pytest.raises(ValueError, match="retention_interval_s"):
+        FrameCoordinatorConfig(retention_interval_s=0.0)
+
+
 def test_coordinator_household_batch_latency(tmp_path) -> None:
     store, runtime = _runtime(tmp_path)
     try:

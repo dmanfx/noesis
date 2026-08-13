@@ -74,6 +74,7 @@ class FrameCoordinatorConfig:
     visitor_slot_min: int = 1000
     visitor_slot_max: int = 1031
     visitor_record_interval_frames: int = 5
+    retention_interval_s: float = 1.0
 
     def __post_init__(self) -> None:
         for name in (
@@ -91,6 +92,7 @@ class FrameCoordinatorConfig:
             "active_claim_ttl_s",
             "visitor_release_after_s",
             "visitor_session_ttl_s",
+            "retention_interval_s",
         ):
             value = float(getattr(self, name))
             if not math.isfinite(value) or value <= 0.0:
@@ -219,6 +221,7 @@ class IdentityFrameCoordinator:
         self._active_claims: dict[str, dict[str, _ActiveClaimState]] = {}
         self._camera_overlap_by_pair = overlap_by_pair
         self._last_batch_timestamp: Optional[float] = None
+        self._last_retention_at: Optional[float] = None
 
     def process_frame(
         self,
@@ -256,7 +259,7 @@ class IdentityFrameCoordinator:
             ):
                 raise FrameReplayError("frame batch timestamp moved backwards")
             self._validate_monotonic(runtime_observations)
-            retention = self.runtime.run_retention(now=now)
+            retention = self._run_retention_if_due(now)
             self._expire_tracker_state(now)
             self._expire_active_claims(now)
             released = self._release_inactive_visitors(now)
@@ -538,6 +541,19 @@ class IdentityFrameCoordinator:
         )
         for tracklet_id in expired:
             self._trackers.pop(tracklet_id, None)
+
+    def _run_retention_if_due(self, now: float) -> PurgeResult:
+        """Keep durable cleanup off the per-frame identity hot path."""
+
+        previous = self._last_retention_at
+        if (
+            previous is not None
+            and now - previous < self.config.retention_interval_s
+        ):
+            return PurgeResult(0, 0, 0, 0)
+        result = self.runtime.run_retention(now=now)
+        self._last_retention_at = now
+        return result
 
     def _expire_active_claims(self, now: float) -> None:
         for subject_id in sorted(tuple(self._active_claims)):

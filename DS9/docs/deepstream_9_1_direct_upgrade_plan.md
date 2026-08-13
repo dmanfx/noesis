@@ -1,6 +1,6 @@
 # DeepStream 9.1 Direct Upgrade Plan
 
-Status: complete with a retained telemetry-latency follow-up, 2026-08-12.
+Status: complete; optional telemetry-boundary optimization deferred, 2026-08-12.
 
 This is a direct upgrade of the existing Noesis DeepStream 9.0 application to
 DeepStream 9.1. The first 9.1 runtime must minimally preserve the current
@@ -43,17 +43,21 @@ upstream skill text.
   weights. Commits `4c87067` and `39c9eab` restored the shared DS9 runtime
   publication gate and its direct fixtures; 17 affected and 9 shared focused
   checks passed.
-- Deployment `deploy-20260812-ds91-direct-r9` is active on selector
-  `a5c8e3ea8e0b3584ffdc49f0d4ec21506c11c5baaa3a0bb944697214c2b1f692`,
-  state release `state-20260812-ds91-direct-r9`, and runtime session
-  `20260812t224203762148z-387c2e`. Noesis and Menon readiness pass; all three
-  sources advanced at 17.2 FPS; authenticated WebRTC decoded 216 frames in an
-  eight-second sample.
-- One resource snapshot showed 29% GPU utilization, 6,315 MiB VRAM, 1.797 GiB
-  container RAM, and no pipeline/boundary errors. The strict 3 ms telemetry
-  boundary sampler remains a follow-up because its short sample observed a
-  97.7 ms WebSocket p99; this did not block source, tracking/world, or media
-  functionality and was not expanded into a profiling campaign.
+- The initial managed activation was
+  `deploy-20260812-ds91-direct-r9`. Its 17.2 FPS sample exposed a CPU regression
+  rather than a DeepStream or TensorRT throughput limit. Commit `4c19515`
+  restored the one-second identity-retention cadence instead of performing
+  durable retention on every source frame, and capped DS9 CPU math pools before
+  NumPy-backed imports. Forty-two directly affected tests passed.
+- The corrected three-camera live run sustained 29.8-30 FPS per source;
+  authenticated WebRTC decoded 239 frames in eight seconds. A resource snapshot
+  showed about 86% container CPU, 53% GPU utilization, 6,308 MiB VRAM, 1.643 GiB
+  container RAM, no pipeline/boundary errors, and zero zero-copy violations.
+- The strict 3 ms telemetry boundary remains an optional optimization target.
+  Corrected live samples observed roughly 6-11 ms WebSocket p99 without
+  suppressing source, tracking/world, or media throughput. The earlier 97.7 ms
+  p99 was CPU-bound boundary preparation during the regression, not inference,
+  camera, network, or dashboard-rendering latency.
 - Earlier r7/r8 candidates failed closed and restored the predecessor as a
   whole. The broader static-prep wrapper is still not a pass because of the
   unrelated parity-marker classifications and missing `apply_source_hysteresis`

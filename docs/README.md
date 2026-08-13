@@ -49,6 +49,10 @@ and worklogs live in `docs/history/`.
 - Status headers (“Status: validated as of …”) should only be updated when the doc has been re-validated against code/configs.
 
 ## Doc changes (2026-08-12)
+- Corrected the DeepStream 9.1 completion record after removing per-frame
+  identity retention and excess CPU math workers: the accepted live baseline is
+  29.8-30 FPS per camera, while the remaining 6-11 ms WebSocket boundary p99 is
+  optional optimization work (`../DS9/docs/deepstream_9_1_direct_upgrade_plan.md`).
 - Made direct application validation the default for future agents and reserved
   appliance staging, candidate/selector ceremony, promotion, rollback, and
   broad unchanged validation for explicitly requested releases or unavoidable

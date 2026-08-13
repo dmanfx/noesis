@@ -5,6 +5,7 @@ export type FloorplanBootstrapRequest = {
   gridResM: number;
   maxExtentM: number;
   cacheOnly: boolean;
+  scenePriorOnly: boolean;
 };
 
 export type FloorplanBootstrapAction = {

@@ -770,6 +770,114 @@ export function renderLayerToCanvas(
   };
 }
 
+export function renderHeightfieldNormalsToCanvas(
+  canvas: HTMLCanvasElement,
+  heightLayer: FloorplanLayer | undefined,
+  observedLayer: FloorplanLayer | undefined,
+  {
+    resolutionM,
+    smoothingRadius = 0,
+  }: {
+    resolutionM: number;
+    smoothingRadius?: number;
+  },
+): HTMLCanvasElement | null {
+  if (!heightLayer?.grid_b64 || !heightLayer.grid_shape || !Number.isFinite(resolutionM) || resolutionM <= 0) {
+    return null;
+  }
+  const [rows, columns] = heightLayer.grid_shape;
+  const count = rows * columns;
+  const heights = decodeFloat32(heightLayer.grid_b64);
+  const observed = observedLayer?.grid_b64
+    && observedLayer.grid_shape?.[0] === rows
+    && observedLayer.grid_shape?.[1] === columns
+    ? decodeFloat32(observedLayer.grid_b64)
+    : null;
+  if (!heights || heights.length < count) return null;
+
+  const validAt = (index: number) => (
+    Number.isFinite(heights[index])
+    && (!observed || observed[index] > 0.5)
+  );
+  const filtered = new Float32Array(count);
+  filtered.fill(Number.NaN);
+  const radius = Math.max(0, Math.min(2, Math.floor(smoothingRadius)));
+  for (let row = 0; row < rows; row += 1) {
+    for (let column = 0; column < columns; column += 1) {
+      const index = row * columns + column;
+      if (!validAt(index)) continue;
+      if (radius === 0) {
+        filtered[index] = heights[index];
+        continue;
+      }
+      let sum = 0;
+      let samples = 0;
+      for (let rowOffset = -radius; rowOffset <= radius; rowOffset += 1) {
+        const sampleRow = row + rowOffset;
+        if (sampleRow < 0 || sampleRow >= rows) continue;
+        for (let columnOffset = -radius; columnOffset <= radius; columnOffset += 1) {
+          const sampleColumn = column + columnOffset;
+          if (sampleColumn < 0 || sampleColumn >= columns) continue;
+          const sampleIndex = sampleRow * columns + sampleColumn;
+          if (!validAt(sampleIndex)) continue;
+          sum += heights[sampleIndex];
+          samples += 1;
+        }
+      }
+      if (samples >= 3) filtered[index] = sum / samples;
+    }
+  }
+
+  const source = document.createElement('canvas');
+  source.width = columns;
+  source.height = rows;
+  const sourceContext = source.getContext('2d');
+  if (!sourceContext) return null;
+  const image = sourceContext.createImageData(columns, rows);
+  for (let row = 1; row < rows - 1; row += 1) {
+    for (let column = 1; column < columns - 1; column += 1) {
+      const index = row * columns + column;
+      const left = filtered[index - 1];
+      const right = filtered[index + 1];
+      const forward = filtered[index - columns];
+      const backward = filtered[index + columns];
+      if (![filtered[index], left, right, forward, backward].every(Number.isFinite)) continue;
+      const derivativeX = (right - left) / (2 * resolutionM);
+      const derivativeZ = (forward - backward) / (2 * resolutionM);
+      let normalX = -derivativeX;
+      let normalY = 1;
+      let normalZ = -derivativeZ;
+      const norm = Math.hypot(normalX, normalY, normalZ);
+      if (!Number.isFinite(norm) || norm <= 1e-9) continue;
+      normalX /= norm;
+      normalY /= norm;
+      normalZ /= norm;
+      const offset = index * 4;
+      image.data[offset] = Math.round((normalX * 0.5 + 0.5) * 255);
+      image.data[offset + 1] = Math.round((normalY * 0.5 + 0.5) * 255);
+      image.data[offset + 2] = Math.round((normalZ * 0.5 + 0.5) * 255);
+      image.data[offset + 3] = 255;
+    }
+  }
+  sourceContext.putImageData(image, 0, 0);
+
+  const context = canvas.getContext('2d');
+  if (!context) return null;
+  const rect = canvas.getBoundingClientRect();
+  const width = rect.width || canvas.clientWidth || columns;
+  const height = width / (columns / rows);
+  const dpr = window.devicePixelRatio || 1;
+  canvas.width = Math.max(1, Math.round(width * dpr));
+  canvas.height = Math.max(1, Math.round(height * dpr));
+  context.save();
+  context.scale(dpr, dpr);
+  context.clearRect(0, 0, width, height);
+  context.imageSmoothingEnabled = false;
+  context.drawImage(source, 0, 0, width, height);
+  context.restore();
+  return source;
+}
+
 /**
  * Renders the observed highest surface as a continuous, physical AGL product.
  * Clean semantic layers remain supporting evidence: they add a fine obstacle

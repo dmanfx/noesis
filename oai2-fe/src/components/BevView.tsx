@@ -205,6 +205,11 @@ const DEFAULT_HEIGHT_RENDER_TUNING: HeightRenderTuning = {
 const clampNumber = (value: number, min: number, max: number): number => Math.min(max, Math.max(min, value));
 
 const floorplanHasRenderableGrid = (floorplan?: FloorplanResponse | null): boolean => Boolean(
+  floorplan?.scene_prior_diagnostic_walkable?.grid_b64 ||
+  floorplan?.scene_prior_diagnostic_obstacle_height?.grid_b64 ||
+  floorplan?.scene_prior_diagnostic_height_agl?.grid_b64 ||
+  floorplan?.scene_prior_diagnostic_density?.grid_b64 ||
+  floorplan?.scene_prior_diagnostic_distance?.grid_b64 ||
   floorplan?.walkable?.grid_b64 ||
   floorplan?.obstacle_height?.grid_b64 ||
   floorplan?.height?.grid_b64 ||
@@ -226,11 +231,23 @@ const selectFloorplanVisualSelection = (
   isCompatible = true,
   preferHeightVisual = false
 ): FloorplanVisualSelection => {
-  const walkableLayer = floorplan?.walkable;
-  const obstacleHeightLayer = floorplan?.obstacle_height;
-  const heightLayer = floorplan?.height;
-  const densityLayer = floorplan?.density;
-  const distanceLayer = floorplan?.distance;
+  const canonicalPcf = floorplan?.scene_prior_only === true
+    && floorplan?.display_source === 'pcf';
+  const walkableLayer = canonicalPcf
+    ? floorplan?.scene_prior_diagnostic_walkable
+    : floorplan?.walkable;
+  const obstacleHeightLayer = canonicalPcf
+    ? floorplan?.scene_prior_diagnostic_obstacle_height
+    : floorplan?.obstacle_height;
+  const heightLayer = canonicalPcf
+    ? floorplan?.scene_prior_diagnostic_height_agl
+    : floorplan?.height;
+  const densityLayer = canonicalPcf
+    ? floorplan?.scene_prior_diagnostic_density
+    : floorplan?.density;
+  const distanceLayer = canonicalPcf
+    ? floorplan?.scene_prior_diagnostic_distance
+    : floorplan?.distance;
   const hasWalkable = isCompatible && !!(walkableLayer?.grid_b64 && walkableLayer?.grid_shape);
   const hasObstacleHeight = isCompatible && !!(obstacleHeightLayer?.grid_b64 && obstacleHeightLayer?.grid_shape);
   const hasHeight = isCompatible && !!(heightLayer?.grid_b64 && heightLayer?.grid_shape);
@@ -686,6 +703,17 @@ export const BevView: React.FC<BevViewProps> = ({
 
   useEffect(() => {
     const bounds = displayFloorplan?.bounds;
+    const canonicalPcf = displayFloorplan?.scene_prior_only === true
+      && displayFloorplan?.display_source === 'pcf';
+    const spaceWalkable = canonicalPcf
+      ? displayFloorplan?.scene_prior_diagnostic_walkable
+      : displayFloorplan?.walkable;
+    const spaceObstacle = canonicalPcf
+      ? displayFloorplan?.scene_prior_diagnostic_obstacle_height
+      : displayFloorplan?.obstacle_height;
+    const spaceHeight = canonicalPcf
+      ? displayFloorplan?.scene_prior_diagnostic_height_agl
+      : displayFloorplan?.height;
     const boundsKey = bounds
       ? [
           Number(bounds.min_x).toFixed(3),
@@ -700,9 +728,9 @@ export const BevView: React.FC<BevViewProps> = ({
       String(displayFloorplan?.units || '').trim().toLowerCase(),
       boundsKey,
       String(displayFloorplan?.snapshot_ts ?? displayFloorplan?.ts ?? ''),
-      String(displayFloorplan?.walkable?.grid_b64?.length ?? ''),
-      String(displayFloorplan?.obstacle_height?.grid_b64?.length ?? ''),
-      String(displayFloorplan?.height?.grid_b64?.length ?? ''),
+      String(spaceWalkable?.grid_b64?.length ?? ''),
+      String(spaceObstacle?.grid_b64?.length ?? ''),
+      String(spaceHeight?.grid_b64?.length ?? ''),
     ].join('|');
 
     if (trailSpaceKeyRef.current && trailSpaceKeyRef.current !== nextSpaceKey) {
@@ -725,6 +753,11 @@ export const BevView: React.FC<BevViewProps> = ({
     displayFloorplan?.walkable?.grid_b64,
     displayFloorplan?.obstacle_height?.grid_b64,
     displayFloorplan?.height?.grid_b64,
+    displayFloorplan?.scene_prior_only,
+    displayFloorplan?.display_source,
+    displayFloorplan?.scene_prior_diagnostic_walkable?.grid_b64,
+    displayFloorplan?.scene_prior_diagnostic_obstacle_height?.grid_b64,
+    displayFloorplan?.scene_prior_diagnostic_height_agl?.grid_b64,
   ]);
 
   useEffect(() => {

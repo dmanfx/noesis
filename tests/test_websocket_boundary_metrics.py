@@ -369,6 +369,56 @@ def test_get_floorplan_forwards_exact_snapshot_identity_to_provider() -> None:
     assert response["snapshot_id"] == "fused-1"
 
 
+def test_get_floorplan_forwards_explicit_scene_prior_only_mode() -> None:
+    observed: list[tuple[str, bool, bool]] = []
+
+    def provider(
+        camera: str,
+        _max_age_sec: float,
+        _grid_res_m: float,
+        _max_extent_m: float,
+        *,
+        cache_only: bool = False,
+        scene_prior_only: bool = False,
+    ) -> dict[str, object]:
+        observed.append((camera, cache_only, scene_prior_only))
+        return {
+            "camera_id": camera,
+            "scene_prior_only": scene_prior_only,
+            "display_source": "pcf",
+            "ok": True,
+        }
+
+    async def _run() -> tuple[WebSocketServer, _InboundSocket]:
+        ws = WebSocketServer(stats_callback=None)
+        ws.floorplan_provider = provider
+        socket = _InboundSocket([
+            {
+                "type": "get_floorplan",
+                "camera": "living-room",
+                "request_id": "pcf-floorplan",
+                "cache_only": True,
+                "scene_prior_only": True,
+            }
+        ])
+        await ws.handle_client(socket)
+        return ws, socket
+
+    ws, socket = asyncio.run(_run())
+    receipt = ws.quiesce_blocking_providers(timeout_s=1.0)
+    assert receipt.quiesced is True
+    assert observed == [("living-room", True, True)]
+    response = next(
+        json.loads(str(payload))
+        for payload in socket.sent
+        if isinstance(payload, str)
+        and json.loads(str(payload)).get("type") == "floorplan_response"
+    )
+    assert response["request_id"] == "pcf-floorplan"
+    assert response["scene_prior_only"] is True
+    assert response["display_source"] == "pcf"
+
+
 def test_blocking_calibration_rpc_runs_off_event_loop() -> None:
     ticks = 0
     heartbeat_done = asyncio.Event()

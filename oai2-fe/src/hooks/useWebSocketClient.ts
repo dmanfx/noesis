@@ -93,6 +93,7 @@ export type FloorplanRequest = {
   maxExtentM?: number;
   requestId?: string;
   cacheOnly?: boolean;
+  scenePriorOnly?: boolean;
 };
 
 export type DepthRequestStrategy = 'fresh' | 'cache-first' | 'cache-only';
@@ -188,6 +189,7 @@ export function useWebSocketClient(url: string, handlers: FrameHandlers) {
         grid_res_m: (obj as any).grid_res_m,
         max_extent_m: (obj as any).max_extent_m,
         cache_only: (obj as any).cache_only,
+        scene_prior_only: (obj as any).scene_prior_only,
       };
     }
     if (type === 'get_ma_depth' || type === 'get_ma_depth_cache') {
@@ -498,7 +500,8 @@ export function useWebSocketClient(url: string, handlers: FrameHandlers) {
         max_age_sec: options?.maxAgeSec ?? 60,
         grid_res_m: options?.gridResM ?? 0.04,
         max_extent_m: options?.maxExtentM ?? 20,
-        cache_only: options?.cacheOnly ?? false
+        cache_only: options?.cacheOnly ?? false,
+        scene_prior_only: options?.scenePriorOnly ?? false,
       };
       const ok = sendJson(payload);
       return ok ? requestId : '';

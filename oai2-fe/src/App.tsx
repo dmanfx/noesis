@@ -1143,6 +1143,27 @@ function Dashboard() {
     const key = detectCameraKey(camId) || camId;
     const nextPayload = payload as FloorplanResponse;
     const nextHasRenderableGrid = floorplanHasRenderableGrid(nextPayload);
+    if (refreshResult.handled && refreshCamera) {
+      const active = depthPanelRefreshStateRef.current[refreshCamera];
+      if (refreshResult.error || !refreshResult.completed) {
+        failDepthPanelRefresh(
+          refreshCamera,
+          refreshRequestId,
+          refreshResult.error || 'floorplan_refresh_failed',
+        );
+      } else {
+        clearDepthPanelPhaseResources(refreshCamera);
+        updateDepthPanelRefreshState(refreshCamera, {
+          ...active,
+          status: 'idle',
+          error: undefined,
+        });
+      }
+      // A manual Refresh is now a static comparison capture only. Its depth,
+      // floorplan, diagnostics, and timestamp are intentionally not admitted
+      // into the PCF-backed presentation state.
+      return;
+    }
     const existingFloorplan = floorplanDataRef.current[key];
     const floorplanAdmitted = shouldAdmitFloorplan(existingFloorplan, nextPayload);
     if (floorplanAdmitted) {
@@ -1151,34 +1172,6 @@ function Dashboard() {
       setFloorplanData(nextFloorplans);
     }
     handleFloorplanBootstrapResponseRef.current(payload, nextHasRenderableGrid);
-
-    if (refreshResult.handled && refreshCamera) {
-      const active = depthPanelRefreshStateRef.current[refreshCamera];
-      if (refreshResult.error || !refreshResult.action) {
-        failDepthPanelRefresh(
-          refreshCamera,
-          refreshRequestId,
-          refreshResult.error || 'floorplan_refresh_failed',
-        );
-      } else if (!floorplanAdmitted) {
-        failDepthPanelRefresh(refreshCamera, refreshRequestId, 'floorplan_snapshot_stale');
-      } else if (refreshResult.action.kind === 'depth-cache') {
-        const loadingEntry: DepthPanelRefreshEntry = {
-          ...active,
-          status: 'loading-depth',
-          snapshotTsUs: refreshResult.action.tsMaxUs,
-          snapshotId: typeof payload.snapshot_id === 'string' ? payload.snapshot_id : undefined,
-          snapshotRef: typeof payload.snapshot_ref === 'string' ? payload.snapshot_ref : undefined,
-          snapshotContentSha256: typeof payload.snapshot_content_sha256 === 'string'
-            ? payload.snapshot_content_sha256
-            : undefined,
-          error: undefined,
-        };
-        updateDepthPanelRefreshState(refreshCamera, loadingEntry);
-        armDepthPanelDeadline(refreshCamera, refreshRequestId, 'depth');
-        queueExactDepthPanelRequest(refreshCamera, refreshRequestId, refreshResult.action);
-      }
-    }
 
     const label = labelForCameraId(key);
     const now = Date.now();
@@ -1363,12 +1356,7 @@ function Dashboard() {
     }
   }, [status, webrtc.connect, webrtc.disconnect]);
 
-  const requestDepthCached = useCallback((camId: string) => {
-    if (!camId || status !== 'open') return false;
-    return requestMapAnythingDepth(camId, 'cache-only');
-  }, [requestMapAnythingDepth, status]);
-
-  const handleRequestFloorplan = useCallback((options?: { camera?: string; requestId?: string; maxAgeSec?: number; gridResM?: number; maxExtentM?: number; cacheOnly?: boolean }) => {
+  const handleRequestFloorplan = useCallback((options?: { camera?: string; requestId?: string; maxAgeSec?: number; gridResM?: number; maxExtentM?: number; cacheOnly?: boolean; scenePriorOnly?: boolean }) => {
     return requestFloorplanRef.current(options);
   }, []);
 
@@ -1760,12 +1748,9 @@ function Dashboard() {
       <DepthDrawer
         open={depthDrawerOpen}
         onClose={() => setDepthDrawerOpen(false)}
-        diagnostics={maDiagnostics}
         depthData={maDepthData}
-        depthMeta={maDepthMeta}
         onRefreshDepthPanel={requestDepthPanelRefresh}
         refreshState={depthPanelRefreshState}
-        onRequestDepthCached={requestDepthCached}
         transportOpen={status === 'open'}
         floorplans={floorplanData}
         onRequestFloorplan={handleRequestFloorplan}

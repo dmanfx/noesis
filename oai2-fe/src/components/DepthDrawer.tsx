@@ -1,7 +1,6 @@
 import { PointerEvent as ReactPointerEvent, memo, useCallback, useEffect, useMemo, useRef, useState, RefObject } from 'react';
 import { CameraKey, cameraIndex, cameraLabel, detectCameraKey } from '../lib/camera';
 import type { MosaicLayout } from '../hooks/useWebSocketClient';
-import { closeThinSurfaceNormalGapsInPlace } from '../lib/normalDisplay';
 import SemanticSegView from './SemanticSegView';
 import '../styles/depth-drawer.css';
 
@@ -87,6 +86,8 @@ export type FloorplanResponse = {
   snapshot_ts?: number | null;
   served_from_cache?: boolean;
   cache_only?: boolean;
+  scene_prior_only?: boolean;
+  display_source?: string;
   frame?: string;
   bounds?: { min_x?: number; max_x?: number; min_z?: number; max_z?: number };
   image_flip?: { u?: boolean; v?: boolean };
@@ -137,6 +138,36 @@ export type FloorplanResponse = {
   scene_composite_height_agl?: FloorplanLayer;
   scene_composite_observed?: FloorplanLayer;
   scene_composite_source?: FloorplanLayer;
+  scene_prior_diagnostic_density?: FloorplanLayer;
+  scene_prior_diagnostic_height?: FloorplanLayer;
+  scene_prior_diagnostic_height_agl?: FloorplanLayer;
+  scene_prior_diagnostic_distance?: FloorplanLayer;
+  scene_prior_diagnostic_gradient?: FloorplanLayer;
+  scene_prior_diagnostic_obstacle_height?: FloorplanLayer;
+  scene_prior_diagnostic_obstacle_mask?: FloorplanLayer;
+  scene_prior_diagnostic_walkable?: FloorplanLayer;
+  scene_prior_diagnostic_observed?: FloorplanLayer;
+  scene_prior_diagnostic_unknown?: FloorplanLayer;
+  scene_prior_diagnostic_inferred_walkable?: FloorplanLayer;
+  scene_prior_diagnostic_structural_height?: FloorplanLayer;
+  scene_prior_diagnostic_surface_observed?: FloorplanLayer;
+  scene_prior_diagnostic_room_footprint?: FloorplanLayer;
+  scene_prior_diagnostic_wall_support?: FloorplanLayer;
+  scene_prior_diagnostic_room_boundary?: FloorplanLayer;
+  scene_prior_diagnostic_measured_perimeter?: FloorplanLayer;
+  scene_prior_diagnostic_surface_rgb?: FloorplanRgbLayer;
+  scene_prior_diagnostic_confidence?: FloorplanLayer;
+  scene_prior_floor_supported?: FloorplanLayer;
+  scene_prior_floor_height?: FloorplanLayer;
+  scene_prior_diagnostic_meta?: {
+    contract?: string;
+    contract_version?: number;
+    source?: string;
+    bounds?: FloorplanResponse['bounds'];
+    grid_shape?: [number, number];
+    raster_orientation?: string;
+    point_count?: number;
+  };
   scene_prior_meta?: {
     contract?: string;
     contract_version?: number;
@@ -151,6 +182,19 @@ export type FloorplanResponse = {
     static_available_cells?: number;
     static_fill_cells?: number;
     composite_observed_cells?: number;
+    display_source?: string;
+    quality?: {
+      passed?: boolean;
+      source_point_count?: number;
+      selected_point_count?: number;
+      authored_cell_count?: number;
+      observed_cell_count?: number;
+      floor_supported_cell_count?: number;
+      obstacle_cell_count?: number;
+      authored_observed_fraction?: number;
+      authored_floor_supported_fraction?: number;
+      alignment_status?: string;
+    };
     reason?: string;
   };
   scene_fusion_height_agl?: FloorplanLayer;
@@ -217,11 +261,6 @@ export type DepthRefreshEntry = {
   error?: string;
 };
 
-export type DepthCachePairEntry = {
-  phase: 'requesting-depth' | 'waiting-depth' | 'waiting-floorplan' | 'error';
-  error?: string;
-};
-
 type ProductionDepthRefreshEntry = {
   status: 'idle' | 'capturing-floorplan' | 'loading-depth' | 'error';
   requestId?: string;
@@ -236,21 +275,18 @@ type FloorplanRequestOptions = {
   gridResM?: number;
   maxExtentM?: number;
   cacheOnly?: boolean;
+  scenePriorOnly?: boolean;
 };
 
 interface DepthDrawerProps {
   open: boolean;
   onClose: () => void;
-  diagnostics: Record<string, DiagnosticsEntry>;
   depthData: Record<string, DepthEntry>;
-  depthMeta?: Record<string, DepthMetaEntry>;
   onRequestDepthFresh?: (cameraId: string) => void;
   onRefreshDepthPanel?: (cameraId: string) => void;
-  onRequestDepthCached: (cameraId: string) => boolean | void;
   transportOpen?: boolean;
   floorplans: Record<string, FloorplanResponse>;
   refreshState?: Record<string, DepthRefreshEntry | ProductionDepthRefreshEntry>;
-  cachePairState?: Record<string, DepthCachePairEntry>;
   onRequestFloorplan?: (options: FloorplanRequestOptions) => string | void;
   availableCameras: string[];
   mosaicLayout?: MosaicLayout | null;
@@ -263,6 +299,7 @@ import {
   grayscaleColor,
   bwColor,
   infernoColor,
+  renderHeightfieldNormalsToCanvas,
   renderStructuralFloorplanToCanvas,
   renderTextureFloorplanToCanvas,
   renderLayerToCanvas,
@@ -272,20 +309,15 @@ import {
 import {
   chooseDepthRange,
   computeMaskedRange,
-  floorplanObservationCounts,
   integerExportScale,
   snapshotExportStem,
   type SimpleRange,
 } from '../lib/depthQuality.js';
 import { computeObservedFloorplanViewport } from '../lib/floorplanViewport.js';
 import { buildExtrudedFloorplanModel, DEFAULT_OBSTACLE_SETTINGS, renderExtrudedFloorplanToCanvas } from '../lib/extrudedFloorplan';
-import { getExtrinsicsAny, getIntrinsicsAny } from '../lib/calibration';
-import { buildVisibleFloorPlaneModel } from '../lib/visibleFloorPlane';
 import { buildScenePriorFloorPlaneModel } from '../lib/scenePriorFloorPlane';
 import FloorPlane3DView from './FloorPlane3DView';
 import CachedHeightfield3DView from './CachedHeightfield3DView';
-import CalibratedPointCloud3DView from './CalibratedPointCloud3DView';
-import FusedPointCloud3DView from './FusedPointCloud3DView';
 import ScenePriorPointCloud3DView from './ScenePriorPointCloud3DView';
 
 const DEFAULT_WIDTH = 700;
@@ -361,16 +393,12 @@ function layerRange(layer?: FloorplanLayer): SimpleRange | null {
 const DepthDrawer = memo(function DepthDrawer({
   open,
   onClose,
-  diagnostics,
   depthData,
-  depthMeta = {},
   onRequestDepthFresh,
   onRefreshDepthPanel,
-  onRequestDepthCached,
   transportOpen = true,
   floorplans,
   refreshState = {},
-  cachePairState = {},
   onRequestFloorplan,
   availableCameras,
   mosaicLayout,
@@ -388,18 +416,14 @@ const DepthDrawer = memo(function DepthDrawer({
   const [normalsView, setNormalsView] = useState<'surface' | 'detail'>('surface');
   const [selectedCamera, setSelectedCamera] = useState<string>('');
   const [drawerWidth, setDrawerWidth] = useState<number>(DEFAULT_WIDTH);
-  const onRequestDepthCachedRef = useRef(onRequestDepthCached);
   const onRequestFloorplanRef = useRef(onRequestFloorplan);
-  const floorplanCacheProbedRef = useRef(new Set<string>());
+  const scenePriorProbedRef = useRef(new Set<string>());
   const drawerRef = useRef<HTMLDivElement | null>(null);
   const isResizingRef = useRef(false);
   const previousUserSelectRef = useRef('');
   const activePointerIdRef = useRef<number | null>(null);
   const heatmapCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const heatmapSourceCanvasRef = useRef<HTMLCanvasElement | null>(null);
-  const rgbSourceCanvasRef = useRef<HTMLCanvasElement | null>(null);
-  const rgbDepthOverlayCanvasRef = useRef<HTMLCanvasElement | null>(null);
-  const rgbDepthOverlaySourceCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const normalsCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const normalsSourceCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const histogramCanvasRef = useRef<HTMLCanvasElement | null>(null);
@@ -413,8 +437,6 @@ const DepthDrawer = memo(function DepthDrawer({
   const walkableCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const floorplanCompositeCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const structuralFloorplanCanvasRef = useRef<HTMLCanvasElement | null>(null);
-  const sceneStaticCanvasRef = useRef<HTMLCanvasElement | null>(null);
-  const sceneCompositeCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const streamPreviewCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const extrudedCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const floorPlaneCanvasRef = useRef<HTMLCanvasElement | null>(null);
@@ -422,7 +444,6 @@ const DepthDrawer = memo(function DepthDrawer({
   const pointCloudCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const exportSequenceRef = useRef(0);
   const [primitivesView, setPrimitivesView] = useState<'obstacles' | 'heightfield' | 'point-cloud' | 'visible-floor'>('heightfield');
-  const [pointCloudColorMode, setPointCloudColorMode] = useState<'rgb' | 'depth' | 'confidence'>('rgb');
   const [primitivesShowPreview, setPrimitivesShowPreview] = useState(true);
   const [primitivesShowBoxes, setPrimitivesShowBoxes] = useState(true);
   const [primitivesSelectedBoxId, setPrimitivesSelectedBoxId] = useState<string | null>(null);
@@ -433,7 +454,6 @@ const DepthDrawer = memo(function DepthDrawer({
   const [primitivesMaxBoxes, setPrimitivesMaxBoxes] = useState(DEFAULT_OBSTACLE_SETTINGS.maxBoxes);
   const [primitivesMaxCells, setPrimitivesMaxCells] = useState(DEFAULT_OBSTACLE_SETTINGS.maxCells);
   const [heatmapRangeMode, setHeatmapRangeMode] = useState<'auto' | 'full' | 'locked'>('auto');
-  const [rgbOverlayOpacity, setRgbOverlayOpacity] = useState(0.48);
   const [lockedHeatmapRanges, setLockedHeatmapRanges] = useState<Record<string, SimpleRange>>({});
   const [aglRangeMode, setAglRangeMode] = useState<'furniture' | 'room' | 'auto'>('furniture');
   const [diagnosticsOpen, setDiagnosticsOpen] = useState(false);
@@ -467,9 +487,6 @@ const DepthDrawer = memo(function DepthDrawer({
         : selectedRefresh?.status === 'error'
           ? 'error'
           : undefined;
-  const selectedCachePair = cachePairState[selectedCamera];
-  const refreshPending = selectedRefreshPhase === 'requesting-depth'
-    || selectedRefreshPhase === 'requesting-floorplan';
   const anyRefreshPending = Object.values(refreshState).some((entry) => (
     ('phase' in entry && (
       entry.phase === 'requesting-depth' || entry.phase === 'requesting-floorplan'
@@ -481,39 +498,33 @@ const DepthDrawer = memo(function DepthDrawer({
   const refreshError = selectedRefreshPhase === 'error'
     ? selectedRefresh.error || 'unknown_refresh_error'
     : '';
-  const cachePairError = !refreshPending && selectedCachePair?.phase === 'error'
-    ? selectedCachePair.error || 'cached_pair_unavailable'
-    : '';
-  const densityLayer = cameraFloorplan?.density;
-  const heightLayer = cameraFloorplan?.height;
-  const heightAglLayer = cameraFloorplan?.height_agl;
-  const distanceLayer = cameraFloorplan?.distance;
-  const gradientLayer = cameraFloorplan?.gradient;
-  const obstacleHeightLayer = cameraFloorplan?.obstacle_height;
-  const walkableLayer = cameraFloorplan?.walkable;
-  const observedLayer = cameraFloorplan?.observed;
-  const unknownLayer = cameraFloorplan?.unknown;
-  const inferredWalkableLayer = cameraFloorplan?.inferred_walkable;
-  const structuralHeightLayer = cameraFloorplan?.structural_height;
-  const surfaceObservedLayer = cameraFloorplan?.surface_observed;
-  const roomFootprintLayer = cameraFloorplan?.room_footprint;
-  const wallSupportLayer = cameraFloorplan?.wall_support;
-  const roomBoundaryLayer = cameraFloorplan?.room_boundary;
-  const measuredPerimeterLayer = cameraFloorplan?.measured_perimeter;
-  const surfaceRgbLayer = cameraFloorplan?.surface_rgb;
-  const sceneStaticHeightLayer = cameraFloorplan?.scene_static_height_agl;
-  const sceneStaticObservedLayer = cameraFloorplan?.scene_static_observed;
-  const sceneCompositeHeightLayer = cameraFloorplan?.scene_composite_height_agl;
-  const sceneCompositeObservedLayer = cameraFloorplan?.scene_composite_observed;
-  const scenePriorMeta = cameraFloorplan?.scene_prior_meta;
-  const sceneFusionHeightLayer = cameraFloorplan?.scene_fusion_height_agl;
-  const sceneFusionObservedLayer = cameraFloorplan?.scene_fusion_observed;
-  const sceneFusionObstacleHeightLayer = cameraFloorplan?.scene_fusion_obstacle_height;
-  const sceneFusionObstacleMaskLayer = cameraFloorplan?.scene_fusion_obstacle_mask;
-  const sceneFusionFloorHeightLayer = cameraFloorplan?.scene_fusion_floor_height;
-  const sceneFusionFloorSupportedLayer = cameraFloorplan?.scene_fusion_floor_supported;
-  const sceneFusionPoints = cameraFloorplan?.scene_fusion_points;
-  const sceneFusionMeta = cameraFloorplan?.scene_fusion_meta;
+  const hasCanonicalPcf = Boolean(
+    cameraFloorplan?.scene_prior_only === true
+    && cameraFloorplan?.display_source === 'pcf'
+  );
+  const densityLayer = hasCanonicalPcf ? cameraFloorplan?.scene_prior_diagnostic_density : undefined;
+  const heightLayer = hasCanonicalPcf ? cameraFloorplan?.scene_prior_diagnostic_height : undefined;
+  const heightAglLayer = hasCanonicalPcf ? cameraFloorplan?.scene_prior_diagnostic_height_agl : undefined;
+  const distanceLayer = hasCanonicalPcf ? cameraFloorplan?.scene_prior_diagnostic_distance : undefined;
+  const gradientLayer = hasCanonicalPcf ? cameraFloorplan?.scene_prior_diagnostic_gradient : undefined;
+  const obstacleHeightLayer = hasCanonicalPcf ? cameraFloorplan?.scene_prior_diagnostic_obstacle_height : undefined;
+  const walkableLayer = hasCanonicalPcf ? cameraFloorplan?.scene_prior_diagnostic_walkable : undefined;
+  const observedLayer = hasCanonicalPcf ? cameraFloorplan?.scene_prior_diagnostic_observed : undefined;
+  const unknownLayer = hasCanonicalPcf ? cameraFloorplan?.scene_prior_diagnostic_unknown : undefined;
+  const inferredWalkableLayer = hasCanonicalPcf ? cameraFloorplan?.scene_prior_diagnostic_inferred_walkable : undefined;
+  const structuralHeightLayer = hasCanonicalPcf ? cameraFloorplan?.scene_prior_diagnostic_structural_height : undefined;
+  const surfaceObservedLayer = hasCanonicalPcf ? cameraFloorplan?.scene_prior_diagnostic_surface_observed : undefined;
+  const roomFootprintLayer = hasCanonicalPcf ? cameraFloorplan?.scene_prior_diagnostic_room_footprint : undefined;
+  const wallSupportLayer = hasCanonicalPcf ? cameraFloorplan?.scene_prior_diagnostic_wall_support : undefined;
+  const roomBoundaryLayer = hasCanonicalPcf ? cameraFloorplan?.scene_prior_diagnostic_room_boundary : undefined;
+  const measuredPerimeterLayer = hasCanonicalPcf ? cameraFloorplan?.scene_prior_diagnostic_measured_perimeter : undefined;
+  const surfaceRgbLayer = hasCanonicalPcf ? cameraFloorplan?.scene_prior_diagnostic_surface_rgb : undefined;
+  const scenePriorFloorHeightLayer = hasCanonicalPcf ? cameraFloorplan?.scene_prior_floor_height : undefined;
+  const scenePriorFloorSupportedLayer = hasCanonicalPcf ? cameraFloorplan?.scene_prior_floor_supported : undefined;
+  const pcfHeightLayer = hasCanonicalPcf ? cameraFloorplan?.scene_prior_diagnostic_height_agl : undefined;
+  const pcfObservedLayer = hasCanonicalPcf ? cameraFloorplan?.scene_prior_diagnostic_observed : undefined;
+  const pcfConfidenceLayer = hasCanonicalPcf ? cameraFloorplan?.scene_prior_diagnostic_confidence : undefined;
+  const scenePriorMeta = hasCanonicalPcf ? cameraFloorplan?.scene_prior_meta : undefined;
   // v8 exposes unknown explicitly. Renderers invert that binary mask so an
   // unknown cell never falls through as a valid zero-height/obstacle cell.
   const observationMaskLayer = observedLayer ?? densityLayer;
@@ -522,7 +533,6 @@ const DepthDrawer = memo(function DepthDrawer({
   const floorplanViewportMaskLayer = unknownLayer ?? observationMaskLayer;
   const floorplanViewportMaskInvert = Boolean(unknownLayer);
   const floorplanError = cameraFloorplan?.error ?? null;
-  const floorplanServedFromCache = cameraFloorplan?.served_from_cache ?? false;
   const hasDensity = !!(densityLayer && densityLayer.grid_b64 && densityLayer.grid_shape);
   const hasHeight = !!(heightLayer && heightLayer.grid_b64 && heightLayer.grid_shape);
   const hasHeightAgl = !!(heightAglLayer && heightAglLayer.grid_b64 && heightAglLayer.grid_shape);
@@ -533,55 +543,32 @@ const DepthDrawer = memo(function DepthDrawer({
   const hasObserved = !!(observedLayer?.grid_b64 && observedLayer.grid_shape);
   const hasUnknown = !!(unknownLayer?.grid_b64 && unknownLayer.grid_shape);
   const hasInferredWalkable = !!(inferredWalkableLayer?.grid_b64 && inferredWalkableLayer.grid_shape);
-  const hasScenePrior = !!(sceneStaticHeightLayer?.grid_b64 && sceneStaticHeightLayer.grid_shape);
-  const hasSceneComposite = !!(sceneCompositeHeightLayer?.grid_b64 && sceneCompositeHeightLayer.grid_shape);
-  const hasSceneFusionSurface = !!(
-    sceneFusionHeightLayer?.grid_b64
-    && sceneFusionHeightLayer.grid_shape
-    && sceneFusionObservedLayer?.grid_b64
-    && sceneFusionObservedLayer.grid_shape
-  );
-  const hasSceneFusionObstacles = !!(
-    sceneFusionObstacleHeightLayer?.grid_b64
-    && sceneFusionObstacleHeightLayer.grid_shape
-    && sceneFusionObstacleMaskLayer?.grid_b64
-    && sceneFusionObstacleMaskLayer.grid_shape
-  );
-  const hasSceneFusionFloor = !!(
-    sceneFusionFloorHeightLayer?.grid_b64
-    && sceneFusionFloorHeightLayer.grid_shape
-    && sceneFusionFloorSupportedLayer?.grid_b64
-    && sceneFusionFloorSupportedLayer.grid_shape
-  );
-  const hasSceneFusionPoints = !!(
-    sceneFusionPoints?.positions_f32_b64
-    && sceneFusionPoints?.colors_rgb_u8_b64
-    && (sceneFusionPoints.point_count ?? 0) > 0
-  );
-  const primitivesHeightLayer = hasSceneFusionSurface
-    ? sceneFusionHeightLayer
-    : hasScenePrior
-      ? sceneStaticHeightLayer
-      : (heightAglLayer ?? heightLayer);
-  const primitivesObservedLayer = hasSceneFusionSurface
-    ? sceneFusionObservedLayer
-    : hasScenePrior
-      ? sceneStaticObservedLayer
-      : observationMaskLayer;
-  const primitivesObstacleHeightLayer = hasSceneFusionObstacles
-    ? sceneFusionObstacleHeightLayer
-    : primitivesHeightLayer;
-  const primitivesObstacleObservedLayer = hasSceneFusionObstacles
-    ? sceneFusionObstacleMaskLayer
-    : primitivesObservedLayer;
-  const observationCounts = useMemo(() => floorplanObservationCounts(
-    cameraFloorplan?.observation_meta,
-    inferredWalkableLayer?.grid_b64
-      ? decodeFloat32(inferredWalkableLayer.grid_b64)
-      : null,
-  ), [
-    cameraFloorplan?.observation_meta,
+  const hasScenePrior = !!(pcfHeightLayer?.grid_b64 && pcfHeightLayer.grid_shape);
+  const primitivesHeightLayer = hasScenePrior ? pcfHeightLayer : undefined;
+  const primitivesObservedLayer = hasScenePrior ? pcfObservedLayer : undefined;
+  const primitivesObstacleHeightLayer = hasScenePrior ? obstacleHeightLayer : undefined;
+  const primitivesObstacleObservedLayer = hasScenePrior
+    ? cameraFloorplan?.scene_prior_diagnostic_obstacle_mask
+    : undefined;
+  const observationCounts = useMemo(() => {
+    const countPositive = (layer?: FloorplanLayer) => {
+      const values = layer?.grid_b64 ? decodeFloat32(layer.grid_b64) : null;
+      if (!values) return null;
+      let count = 0;
+      for (const value of values) {
+        if (Number.isFinite(value) && value > 0.5) count += 1;
+      }
+      return count;
+    };
+    return {
+      observed: countPositive(observedLayer),
+      unknown: countPositive(unknownLayer),
+      inferredWalkable: countPositive(inferredWalkableLayer) ?? 0,
+    };
+  }, [
     inferredWalkableLayer?.grid_b64,
+    observedLayer?.grid_b64,
+    unknownLayer?.grid_b64,
   ]);
   const floorplanDisplayViewport = useMemo(() => {
     if (!floorplanViewportMaskLayer?.grid_b64 || !floorplanViewportMaskLayer.grid_shape) return null;
@@ -700,37 +687,27 @@ const DepthDrawer = memo(function DepthDrawer({
   const floorplanStatusText = useMemo(() => {
     if (!open || (activeTab !== 'heatmap' && activeTab !== '3d')) return '';
     if (selectedRefreshPhase === 'requesting-depth') {
-      return 'Capturing a fresh depth snapshot; the previous coherent view remains visible.';
+      return 'Capturing a static comparison snapshot; canonical PCF remains visible.';
     }
     if (selectedRefreshPhase === 'requesting-floorplan') {
-      return 'Building the exact matching floorplan; the previous coherent view remains visible.';
-    }
-    if (selectedCachePair?.phase === 'requesting-depth') {
-      return 'Checking cached depth; the current coherent view remains visible.';
-    }
-    if (selectedCachePair?.phase === 'waiting-floorplan') {
-      return 'Cached depth is staged while waiting for its exact cached floorplan. No inference will run.';
-    }
-    if (selectedCachePair?.phase === 'waiting-depth') {
-      return 'Cached floorplan is staged while waiting for its exact cached depth. No inference will run.';
+      return 'Capturing a static comparison snapshot; canonical PCF remains visible.';
     }
     if (floorplanError) return `Floorplan error: ${floorplanError}`;
-    if (cameraFloorplan?.served_from_cache) return 'Showing cached floorplan. Press refresh to regenerate.';
-    if (cameraFloorplan) return 'Floorplan generated from the latest depth snapshot.';
-    return 'Waiting for floorplan data.';
+    if (hasCanonicalPcf) {
+      return `Showing canonical PCF room reconstruction${scenePriorMeta?.prior_id ? ` · ${scenePriorMeta.prior_id}` : ''}.`;
+    }
+    return 'Loading the canonical PCF room reconstruction.';
   }, [
     open,
     activeTab,
     selectedRefreshPhase,
-    selectedCachePair?.phase,
     floorplanError,
-    cameraFloorplan,
+    hasCanonicalPcf,
+    scenePriorMeta?.prior_id,
   ]);
   const panelErrorText = refreshError
     ? `Refresh failed: ${refreshError}`
-    : cachePairError
-      ? `Cached pair unavailable: ${cachePairError}. The previous coherent view was preserved.`
-      : floorplanError
+    : floorplanError
         ? `Floorplan error: ${floorplanError}`
         : '';
   const clearCanvasElement = useCallback((canvas: HTMLCanvasElement | null) => {
@@ -779,54 +756,37 @@ const DepthDrawer = memo(function DepthDrawer({
   }, [cameras, selectedCamera]);
 
   useEffect(() => {
-    onRequestDepthCachedRef.current = onRequestDepthCached;
-  }, [onRequestDepthCached]);
-
-  useEffect(() => {
     onRequestFloorplanRef.current = onRequestFloorplan;
   }, [onRequestFloorplan]);
 
   useEffect(() => {
-    if (!open || !selectedCamera || !transportOpen || depthData[selectedCamera]) return;
-    // The websocket hook owns transport state and may provide a new callback
-    // identity after unrelated dashboard renders. Cache reads are a
-    // transition effect: one per drawer-open/camera-selection transition, not
-    // one per callback identity.
-    onRequestDepthCachedRef.current(selectedCamera);
-  }, [depthData, open, selectedCamera, transportOpen]);
+    scenePriorProbedRef.current.clear();
+  }, [calibrationEpoch]);
 
   useEffect(() => {
     if (!open || !selectedCamera || !transportOpen || !onRequestFloorplanRef.current) return;
-    if (floorplanCacheProbedRef.current.has(selectedCamera)) return;
-    const hasRenderableFloorplan = Boolean(
-      cameraFloorplan
-      && !cameraFloorplan.error
-      && (
-        cameraFloorplan.density?.grid_b64
-        || cameraFloorplan.height?.grid_b64
-        || cameraFloorplan.height_agl?.grid_b64
-        || cameraFloorplan.walkable?.grid_b64
-      )
+    if (scenePriorProbedRef.current.has(selectedCamera)) return;
+    const hasCanonicalPcf = Boolean(
+      cameraFloorplan?.scene_prior_only === true
+      && cameraFloorplan?.display_source === 'pcf'
+      && cameraFloorplan?.scene_prior_diagnostic_height_agl?.grid_b64
     );
-    if (hasRenderableFloorplan) return;
-    floorplanCacheProbedRef.current.add(selectedCamera);
+    if (hasCanonicalPcf) return;
+    scenePriorProbedRef.current.add(selectedCamera);
     onRequestFloorplanRef.current({
       camera: selectedCamera,
-      requestId: `drawer-cache-${selectedCamera}-${Date.now()}`,
-      gridResM: 0.04,
+      requestId: `drawer-pcf-${selectedCamera}-${Date.now()}`,
+      gridResM: 0.025,
       maxExtentM: 20,
       cacheOnly: true,
+      scenePriorOnly: true,
     });
-  }, [cameraFloorplan, open, selectedCamera, transportOpen]);
+  }, [calibrationEpoch, cameraFloorplan, open, selectedCamera, transportOpen]);
 
   useEffect(() => {
     if (open && transportOpen) return;
-    floorplanCacheProbedRef.current.clear();
+    scenePriorProbedRef.current.clear();
   }, [open, transportOpen]);
-
-  useEffect(() => {
-    floorplanCacheProbedRef.current.clear();
-  }, [calibrationEpoch]);
 
   useEffect(() => {
     if (open) {
@@ -834,58 +794,37 @@ const DepthDrawer = memo(function DepthDrawer({
     }
   }, [open]);
 
-  const depthEntry = selectedCamera ? depthData[selectedCamera] : undefined;
-  const depthMetaEntry = selectedCamera && depthMeta ? depthMeta[selectedCamera] : undefined;
-  const summaryEntry = selectedCamera ? diagnostics[selectedCamera] : undefined;
-  const decodedDepth = useMemo(() => {
-    if (!depthEntry) return null;
-    const [height, width] = depthEntry.shape;
-    const count = height * width;
-    if (!height || !width || count <= 0) return null;
-    const depth = depthEntry.depth;
-    if (!depth || depth.length < count) return null;
-    const confidence = depthEntry.conf;
-    const mask = depthEntry.mask;
-    const rgbShape = depthEntry.rgb_shape;
-    const rgb = (
-      depthEntry.rgb
-      && Array.isArray(rgbShape)
-      && rgbShape[0] === height
-      && rgbShape[1] === width
-      && rgbShape[2] === 3
-      && depthEntry.rgb.length >= count * 3
-    )
-      ? depthEntry.rgb
-      : null;
-    return {
-      height,
-      width,
-      count,
-      depth,
-      confidence: confidence && confidence.length >= count ? confidence : null,
-      mask: mask && mask.length >= count ? mask : null,
-      rgb,
-      rgbShape: rgb ? [height, width, 3] as [number, number, number] : null,
-    };
-  }, [depthEntry]);
   const heatmapRanges = useMemo(() => {
-    if (!decodedDepth) return { robust: null, full: null };
-    const common = {
-      mask: decodedDepth.mask,
-      positiveOnly: true,
-    };
-    const robust = computeMaskedRange(decodedDepth.depth, {
+    if (!heightAglLayer?.grid_b64 || !heightAglLayer.grid_shape) {
+      return { robust: null, full: null };
+    }
+    const values = decodeFloat32(heightAglLayer.grid_b64);
+    let mask: Float32Array | null = null;
+    if (
+      observationMaskLayer?.grid_b64
+      && observationMaskLayer.grid_shape?.[0] === heightAglLayer.grid_shape[0]
+      && observationMaskLayer.grid_shape?.[1] === heightAglLayer.grid_shape[1]
+    ) {
+      mask = decodeFloat32(observationMaskLayer.grid_b64);
+    }
+    const common = { mask, maskThreshold: HEIGHT_CONTRAST_DENSITY_THRESH };
+    const robust = computeMaskedRange(values, {
       ...common,
       lowPercentile: 2,
       highPercentile: 98,
     });
-    const full = computeMaskedRange(decodedDepth.depth, {
+    const full = computeMaskedRange(values, {
       ...common,
       lowPercentile: 0,
       highPercentile: 100,
     });
     return { robust, full };
-  }, [decodedDepth]);
+  }, [
+    heightAglLayer?.grid_b64,
+    heightAglLayer?.grid_shape,
+    observationMaskLayer?.grid_b64,
+    observationMaskLayer?.grid_shape,
+  ]);
   const heatmapRange = useMemo(
     () => chooseDepthRange(
       heatmapRangeMode,
@@ -895,19 +834,9 @@ const DepthDrawer = memo(function DepthDrawer({
     ),
     [heatmapRangeMode, heatmapRanges, lockedHeatmapRanges, selectedCamera],
   );
-  const depthAspect = decodedDepth
-    ? decodedDepth.width / decodedDepth.height
-    : WIDE_ASPECT;
-  useEffect(() => {
-    if (decodedDepth && !decodedDepth.rgb && pointCloudColorMode === 'rgb') {
-      setPointCloudColorMode('depth');
-    }
-  }, [decodedDepth, pointCloudColorMode]);
-  const selectedNormals = normalsView === 'surface'
-    ? depthEntry?.surface_normals
-    : depthEntry?.normals;
+  const depthAspect = displayLayerAspect(heightAglLayer);
   const normalsInfo = useMemo(() => {
-    if (!depthEntry) {
+    if (!heightAglLayer?.grid_shape || !heightAglLayer.grid_b64) {
       return {
         available: false,
         height: 0,
@@ -917,240 +846,97 @@ const DepthDrawer = memo(function DepthDrawer({
         error: null as string | null,
       };
     }
-    const shape = normalsView === 'surface'
-      ? depthEntry.surface_normals_shape
-      : depthEntry.normals_shape;
-    let height = depthEntry.shape[0];
-    let width = depthEntry.shape[1];
-    if (Array.isArray(shape) && shape.length >= 2) {
-      height = Number(shape[0]) || height;
-      width = Number(shape[1]) || width;
-    }
     return {
-      available: Boolean(selectedNormals),
-      height,
-      width,
-      dtype: depthEntry.normals_dtype || '',
-      space: depthEntry.normals_space || '',
-      error: depthEntry.normals_error ?? null,
+      available: true,
+      height: heightAglLayer.grid_shape[0],
+      width: heightAglLayer.grid_shape[1],
+      dtype: 'derived float32',
+      space: 'camera-local ground',
+      error: null as string | null,
     };
-  }, [depthEntry, normalsView, selectedNormals]);
+  }, [heightAglLayer?.grid_b64, heightAglLayer?.grid_shape]);
   const normalsStatusText = useMemo(() => {
-    if (!depthEntry) return 'Waiting for depth snapshot.';
-    if (normalsInfo.error) return `Normals error: ${normalsInfo.error}`;
-    if (!normalsInfo.available) {
-      return normalsView === 'surface'
-        ? 'Plane-aware surface normals are unavailable for this snapshot.'
-        : 'Detail normals are unavailable for this snapshot.';
-    }
-    const spaceLabel = normalsInfo.space || 'camera';
-    const dtypeLabel = normalsInfo.dtype || 'float32';
-    const viewLabel = normalsView === 'surface' ? 'Plane-aware surface' : 'Edge-aware detail';
-    return `${viewLabel} normals attached (${spaceLabel}, ${dtypeLabel}).`;
-  }, [depthEntry, normalsInfo, normalsView]);
+    if (!normalsInfo.available) return 'Waiting for the canonical PCF heightfield.';
+    return normalsView === 'surface'
+      ? 'PCF surface normals derived from the smoothed room heightfield.'
+      : 'PCF detail normals derived from the native 2.5 cm room heightfield.';
+  }, [normalsInfo.available, normalsView]);
 
   useEffect(() => {
     const canvas = heatmapCanvasRef.current;
     if (!canvas || activeTab !== 'heatmap') return;
-    if (!decodedDepth || !heatmapRange) {
+    if (!heightAglLayer?.grid_b64 || !heightAglLayer.grid_shape || !heatmapRange) {
       heatmapSourceCanvasRef.current = null;
-      rgbSourceCanvasRef.current = null;
-      rgbDepthOverlaySourceCanvasRef.current = null;
       clearCanvasElement(canvas);
-      clearCanvasElement(rgbDepthOverlayCanvasRef.current);
       return;
     }
-
-    const {
-      height,
-      width,
-      count,
-      depth,
-      confidence,
-      mask,
-      rgb,
-    } = decodedDepth;
-    const range = heatmapRange.max - heatmapRange.min;
+    const [rows, columns] = heightAglLayer.grid_shape;
     const offscreen = document.createElement('canvas');
-    offscreen.width = width;
-    offscreen.height = height;
-    const offCtx = offscreen.getContext('2d');
-    if (!offCtx) return;
-    const imageData = offCtx.createImageData(width, height);
-    const data = imageData.data;
-
-    for (let i = 0; i < count; i += 1) {
-      const d = depth[i];
-      const idx = i * 4;
-      const maskOk = !mask || mask[i] > 0;
-      if (!Number.isFinite(d) || d <= 0 || !maskOk) {
-        data[idx + 3] = 0;
-        continue;
-      }
-      const norm = Math.min(1, Math.max(0, (d - heatmapRange.min) / range));
-      const [r, g, b] = turboColor(norm);
-      let alpha = 0.9;
-      if (confidence) {
-        const conf = Math.max(0, Math.min(1, confidence[i]));
-        alpha = 0.3 + conf * 0.7;
-      }
-      data[idx] = r;
-      data[idx + 1] = g;
-      data[idx + 2] = b;
-      data[idx + 3] = Math.round(alpha * 255);
-    }
-
-    offCtx.putImageData(imageData, 0, 0);
+    renderLayerToCanvas(offscreen, heightAglLayer, turboColor, {
+      fit: 'stretch',
+      targetWidthPx: columns,
+      targetHeightPx: rows,
+      pixelRatio: 1,
+      valueMin: heatmapRange.min,
+      valueMax: heatmapRange.max,
+      maskLayer: renderObservationMaskLayer,
+      maskThreshold: HEIGHT_CONTRAST_DENSITY_THRESH,
+      maskInvert: renderObservationMaskInvert,
+      unknownColor: UNKNOWN_CELL_COLOR,
+      unknownAltColor: UNKNOWN_CELL_ALT_COLOR,
+      sourceRect: displaySourceRectForLayer(heightAglLayer),
+      imageSmoothing: false,
+    });
     heatmapSourceCanvasRef.current = offscreen;
-
-    const drawSourceToDisplay = (
-      target: HTMLCanvasElement | null,
-      source: HTMLCanvasElement,
-    ) => {
-      if (!target) return;
-      const targetCtx = target.getContext('2d');
-      if (!targetCtx) return;
-      const rect = target.getBoundingClientRect();
-      const targetWidth = rect.width || target.clientWidth || width;
-      const targetHeight = targetWidth / (width / height);
-      const dpr = window.devicePixelRatio || 1;
-      target.width = Math.max(1, Math.round(targetWidth * dpr));
-      target.height = Math.max(1, Math.round(targetHeight * dpr));
-      targetCtx.save();
-      targetCtx.scale(dpr, dpr);
-      targetCtx.clearRect(0, 0, targetWidth, targetHeight);
-      targetCtx.imageSmoothingEnabled = true;
-      targetCtx.imageSmoothingQuality = 'high';
-      targetCtx.drawImage(source, 0, 0, targetWidth, targetHeight);
-      targetCtx.restore();
-    };
-    drawSourceToDisplay(canvas, offscreen);
-
-    if (rgb) {
-      const rgbSource = document.createElement('canvas');
-      rgbSource.width = width;
-      rgbSource.height = height;
-      const rgbCtx = rgbSource.getContext('2d');
-      if (rgbCtx) {
-        const rgbImage = rgbCtx.createImageData(width, height);
-        for (let idx = 0; idx < count; idx += 1) {
-          const source = idx * 3;
-          const target = idx * 4;
-          rgbImage.data[target] = rgb[source];
-          rgbImage.data[target + 1] = rgb[source + 1];
-          rgbImage.data[target + 2] = rgb[source + 2];
-          rgbImage.data[target + 3] = 255;
-        }
-        rgbCtx.putImageData(rgbImage, 0, 0);
-        rgbSourceCanvasRef.current = rgbSource;
-
-        const overlaySource = document.createElement('canvas');
-        overlaySource.width = width;
-        overlaySource.height = height;
-        const overlayCtx = overlaySource.getContext('2d');
-        if (overlayCtx) {
-          overlayCtx.drawImage(rgbSource, 0, 0);
-          overlayCtx.globalAlpha = rgbOverlayOpacity;
-          overlayCtx.drawImage(offscreen, 0, 0);
-          overlayCtx.globalAlpha = 1;
-          rgbDepthOverlaySourceCanvasRef.current = overlaySource;
-          drawSourceToDisplay(rgbDepthOverlayCanvasRef.current, overlaySource);
-        }
-      }
-    } else {
-      rgbSourceCanvasRef.current = null;
-      rgbDepthOverlaySourceCanvasRef.current = null;
-      clearCanvasElement(rgbDepthOverlayCanvasRef.current);
-    }
+    renderLayerToCanvas(canvas, heightAglLayer, turboColor, {
+      fit: 'contain',
+      valueMin: heatmapRange.min,
+      valueMax: heatmapRange.max,
+      maskLayer: renderObservationMaskLayer,
+      maskThreshold: HEIGHT_CONTRAST_DENSITY_THRESH,
+      maskInvert: renderObservationMaskInvert,
+      unknownColor: UNKNOWN_CELL_COLOR,
+      unknownAltColor: UNKNOWN_CELL_ALT_COLOR,
+      sourceRect: displaySourceRectForLayer(heightAglLayer),
+      imageSmoothing: false,
+    });
   }, [
     activeTab,
     clearCanvasElement,
-    decodedDepth,
+    displaySourceRectForLayer,
     drawerWidth,
+    heightAglLayer,
     heatmapRange,
-    rgbOverlayOpacity,
+    renderObservationMaskInvert,
+    renderObservationMaskLayer,
   ]);
 
   useEffect(() => {
     const canvas = normalsCanvasRef.current;
     if (!canvas || activeTab !== 'normals') return;
-    if (!selectedNormals || !normalsInfo.available) {
+    if (!normalsInfo.available) {
       normalsSourceCanvasRef.current = null;
       clearCanvasElement(canvas);
       return;
     }
-    const height = normalsInfo.height;
-    const width = normalsInfo.width;
-    if (!height || !width) {
-      normalsSourceCanvasRef.current = null;
-      clearCanvasElement(canvas);
-      return;
-    }
-    const normalsArray = selectedNormals;
-    if (!normalsArray || normalsArray.length < width * height * 3) {
-      normalsSourceCanvasRef.current = null;
-      clearCanvasElement(canvas);
-      return;
-    }
-    const offscreen = document.createElement('canvas');
-    offscreen.width = width;
-    offscreen.height = height;
-    const offCtx = offscreen.getContext('2d');
-    if (!offCtx) return;
-    const imageData = offCtx.createImageData(width, height);
-    const data = imageData.data;
-    const total = width * height;
-    const componentScale = normalsView === 'surface' ? 1 / 127 : 1;
-    for (let i = 0; i < total; i += 1) {
-      const base = i * 3;
-      const nx = normalsArray[base] * componentScale;
-      const ny = normalsArray[base + 1] * componentScale;
-      const nz = normalsArray[base + 2] * componentScale;
-      const idx = i * 4;
-      if (!Number.isFinite(nx) || !Number.isFinite(ny) || !Number.isFinite(nz)) {
-        data[idx + 3] = 0;
-        continue;
-      }
-      const mag = Math.sqrt(nx * nx + ny * ny + nz * nz);
-      if (!Number.isFinite(mag) || mag <= 0.0001) {
-        data[idx + 3] = 0;
-        continue;
-      }
-      const r = Math.round((Math.min(1, Math.max(-1, nx)) * 0.5 + 0.5) * 255);
-      const g = Math.round((Math.min(1, Math.max(-1, ny)) * 0.5 + 0.5) * 255);
-      const b = Math.round((Math.min(1, Math.max(-1, nz)) * 0.5 + 0.5) * 255);
-      data[idx] = r;
-      data[idx + 1] = g;
-      data[idx + 2] = b;
-      data[idx + 3] = 255;
-    }
-    if (normalsView === 'surface') {
-      closeThinSurfaceNormalGapsInPlace(data, width, height);
-    }
-    offCtx.putImageData(imageData, 0, 0);
-    normalsSourceCanvasRef.current = offscreen;
-    const ctx = canvas.getContext('2d');
-    if (!ctx) return;
-    const rect = canvas.getBoundingClientRect();
-    const targetWidth = rect.width || canvas.clientWidth || width;
-    const targetHeight = targetWidth / (width / height);
-    const dpr = window.devicePixelRatio || 1;
-    canvas.width = Math.max(1, Math.round(targetWidth * dpr));
-    canvas.height = Math.max(1, Math.round(targetHeight * dpr));
-    ctx.save();
-    ctx.scale(dpr, dpr);
-    ctx.clearRect(0, 0, targetWidth, targetHeight);
-    ctx.imageSmoothingEnabled = true;
-    ctx.imageSmoothingQuality = 'high';
-    ctx.drawImage(offscreen, 0, 0, targetWidth, targetHeight);
-    ctx.restore();
+    normalsSourceCanvasRef.current = renderHeightfieldNormalsToCanvas(
+      canvas,
+      heightAglLayer,
+      observedLayer,
+      {
+        resolutionM: Number(cameraFloorplan?.scale_m_per_px) || 0.025,
+        smoothingRadius: normalsView === 'surface' ? 1 : 0,
+      },
+    );
   }, [
     activeTab,
+    cameraFloorplan?.scale_m_per_px,
     clearCanvasElement,
     drawerWidth,
+    heightAglLayer,
     normalsInfo,
     normalsView,
-    selectedNormals,
+    observedLayer,
   ]);
 
   // Avoid showing stale topdown canvases when switching cameras.
@@ -1246,9 +1032,8 @@ const DepthDrawer = memo(function DepthDrawer({
     return buildExtrudedFloorplanModel(
       {
         bounds: cameraFloorplan.bounds,
-        // Use the purpose-built fixed+phone obstacle product in the existing
-        // representation. Conditioned-prior and live layers are per-view
-        // fallbacks when that stronger product is unavailable.
+        // Canonical PCF obstacle support only. Static-camera products remain
+        // stored for future comparison and never enter presentation state.
         height: primitivesObstacleHeightLayer,
         density: primitivesObstacleObservedLayer,
       },
@@ -1263,54 +1048,18 @@ const DepthDrawer = memo(function DepthDrawer({
   }, [cameraFloorplan, primitivesObstacleHeightLayer, primitivesObstacleObservedLayer, primitivesMaxBoxes, primitivesMaxCells, primitivesMinDensity, primitivesMinFootprintM2, primitivesMinHeightM]);
 
   const obstacleBoxes = primitivesModel?.boxes ?? [];
-  const selectedIntrinsics = useMemo(
-    () => (selectedCamera ? getIntrinsicsAny(selectedCamera) : null),
-    [selectedCamera, calibrationEpoch]
-  );
-  const selectedExtrinsics = useMemo(
-    () => (selectedCamera ? getExtrinsicsAny(selectedCamera) : null),
-    [selectedCamera, calibrationEpoch]
-  );
-  const visibleFloorResult = useMemo(() => buildVisibleFloorPlaneModel({
-    cameraId: selectedCamera,
-    depthEntry,
-    intrinsics: selectedIntrinsics,
-    extrinsics: selectedExtrinsics,
-    floorplan: cameraFloorplan,
-  }), [
-    selectedCamera,
-    depthEntry,
-    selectedIntrinsics,
-    selectedExtrinsics,
-    cameraFloorplan,
-  ]);
   const scenePriorFloorResult = useMemo(() => buildScenePriorFloorPlaneModel({
     cameraId: selectedCamera,
     floorplan: cameraFloorplan,
-    heightLayer: sceneStaticHeightLayer,
-    observedLayer: sceneStaticObservedLayer,
+    heightLayer: scenePriorFloorHeightLayer,
+    observedLayer: scenePriorFloorSupportedLayer,
   }), [
     selectedCamera,
     cameraFloorplan,
-    sceneStaticHeightLayer,
-    sceneStaticObservedLayer,
+    scenePriorFloorHeightLayer,
+    scenePriorFloorSupportedLayer,
   ]);
-  const sceneFusionFloorResult = useMemo(() => buildScenePriorFloorPlaneModel({
-    cameraId: selectedCamera,
-    floorplan: cameraFloorplan,
-    heightLayer: sceneFusionFloorHeightLayer,
-    observedLayer: sceneFusionFloorSupportedLayer,
-  }), [
-    selectedCamera,
-    cameraFloorplan,
-    sceneFusionFloorHeightLayer,
-    sceneFusionFloorSupportedLayer,
-  ]);
-  const floorPlaneResult = hasSceneFusionFloor
-    ? sceneFusionFloorResult
-    : hasScenePrior
-      ? scenePriorFloorResult
-      : visibleFloorResult;
+  const floorPlaneResult = scenePriorFloorResult;
   const visibleFloorModel = floorPlaneResult.model;
   const handleFloorPlaneCanvasReady = useCallback((canvas: HTMLCanvasElement | null) => {
     floorPlaneCanvasRef.current = canvas;
@@ -1359,8 +1108,10 @@ const DepthDrawer = memo(function DepthDrawer({
 
   useEffect(() => {
     const canvas = histogramCanvasRef.current;
-    if (!canvas || !depthEntry || activeTab !== 'histogram') return;
-    const confArray = decodedDepth?.confidence;
+    if (!canvas || activeTab !== 'histogram') return;
+    const confArray = pcfConfidenceLayer?.grid_b64
+      ? decodeFloat32(pcfConfidenceLayer.grid_b64)
+      : null;
     if (!confArray) {
       const ctx = canvas.getContext('2d');
       if (ctx) {
@@ -1389,48 +1140,71 @@ const DepthDrawer = memo(function DepthDrawer({
       ctx.font = '12px system-ui';
       ctx.fillText(`${idx / 10}-${(idx + 1) / 10}`, idx * barWidth + 6, canvas.height - 6);
     });
-  }, [depthEntry, decodedDepth, activeTab]);
+  }, [activeTab, pcfConfidenceLayer?.grid_b64]);
 
-  const summary = summaryEntry?.summary;
   const metrics = useMemo(() => {
-    if (!summary) return [] as Array<{ label: string; type: 'bar' | 'text'; text: string; fraction?: number }>;
-    const confidence = summary.conf_mean !== undefined ? Math.max(0, Math.min(1, summary.conf_mean)) : null;
-    const coverage = summary.valid_ratio !== undefined ? Math.max(0, Math.min(1, summary.valid_ratio)) : null;
+    if (!hasCanonicalPcf || !scenePriorMeta) {
+      return [] as Array<{ label: string; type: 'bar' | 'text'; text: string; fraction?: number }>;
+    }
+    const confidenceValues = pcfConfidenceLayer?.grid_b64
+      ? decodeFloat32(pcfConfidenceLayer.grid_b64)
+      : null;
+    let confidenceSum = 0;
+    let confidenceCount = 0;
+    if (confidenceValues) {
+      for (const value of confidenceValues) {
+        if (!Number.isFinite(value) || value <= 0) continue;
+        confidenceSum += value;
+        confidenceCount += 1;
+      }
+    }
+    const confidence = confidenceCount > 0
+      ? Math.max(0, Math.min(1, confidenceSum / confidenceCount))
+      : null;
+    const coverageRaw = scenePriorMeta.quality?.authored_observed_fraction;
+    const floorSupportRaw = scenePriorMeta.quality?.authored_floor_supported_fraction;
+    const coverage = Number.isFinite(coverageRaw)
+      ? Math.max(0, Math.min(1, Number(coverageRaw)))
+      : null;
+    const floorSupport = Number.isFinite(floorSupportRaw)
+      ? Math.max(0, Math.min(1, Number(floorSupportRaw)))
+      : null;
     return [
       {
-        label: 'Confidence',
+        label: 'PCF Evidence Confidence',
         type: 'bar' as const,
         fraction: confidence ?? 0,
         text: confidence !== null ? `${Math.round(confidence * 100)}%` : 'n/a'
       },
       {
-        label: 'Valid Coverage',
+        label: 'PCF Observed Coverage',
         type: 'bar' as const,
         fraction: coverage ?? 0,
         text: coverage !== null ? `${Math.round(coverage * 100)}%` : 'n/a'
       },
       {
-        label: 'Median Depth',
-        type: 'text' as const,
-        text: summary.median !== undefined ? `${summary.median.toFixed(2)} m` : 'n/a'
+        label: 'PCF Floor Support',
+        type: 'bar' as const,
+        fraction: floorSupport ?? 0,
+        text: floorSupport !== null ? `${Math.round(floorSupport * 100)}%` : 'n/a'
       },
       {
-        label: 'Depth Range',
+        label: 'Selected Points',
         type: 'text' as const,
-        text: summary.p10 !== undefined && summary.p90 !== undefined ? `${summary.p10.toFixed(2)}–${summary.p90.toFixed(2)} m` : 'n/a'
+        text: Number(scenePriorMeta.quality?.selected_point_count ?? 0).toLocaleString()
       },
       {
-        label: 'Samples',
+        label: 'Prior Revision',
         type: 'text' as const,
-        text: summary.sample_count !== undefined ? `${summary.sample_count}` : 'n/a'
+        text: scenePriorMeta.prior_id ?? 'n/a'
       },
       {
         label: 'Method',
         type: 'text' as const,
-        text: summary.method ? summary.method.toUpperCase() : (confidence !== null && confidence >= 0.5 ? 'MDE' : 'FLOOR')
+        text: 'MAPANYTHING + DA3 PRIOR-CONDITIONED FUSION'
       }
     ];
-  }, [summary]);
+  }, [hasCanonicalPcf, scenePriorMeta, pcfConfidenceLayer?.grid_b64]);
 
   const renderScale = (gradient: string, min?: number, _mid?: number, max?: number, unit = '') => (
     <div className="color-scale">
@@ -1467,8 +1241,6 @@ const DepthDrawer = memo(function DepthDrawer({
         clearCanvasElement(walkableCanvasRef.current);
         clearCanvasElement(floorplanCompositeCanvasRef.current);
         clearCanvasElement(structuralFloorplanCanvasRef.current);
-        clearCanvasElement(sceneStaticCanvasRef.current);
-        clearCanvasElement(sceneCompositeCanvasRef.current);
       }
       return;
     }
@@ -1505,26 +1277,6 @@ const DepthDrawer = memo(function DepthDrawer({
           unknownColor: UNKNOWN_CELL_COLOR,
           unknownAltColor: UNKNOWN_CELL_ALT_COLOR,
           sourceRect: displaySourceRectForLayer(heightAglLayer),
-          imageSmoothing: false,
-        });
-        renderLayerToCanvas(sceneStaticCanvasRef.current, sceneStaticHeightLayer, turboColor, {
-          fit: 'contain',
-          valueMin: 0,
-          valueMax: HEIGHT_AGL_ROOM_MAX_M,
-          maskLayer: sceneStaticObservedLayer,
-          maskThreshold: HEIGHT_CONTRAST_DENSITY_THRESH,
-          unknownColor: UNKNOWN_CELL_COLOR,
-          unknownAltColor: UNKNOWN_CELL_ALT_COLOR,
-          imageSmoothing: false,
-        });
-        renderLayerToCanvas(sceneCompositeCanvasRef.current, sceneCompositeHeightLayer, turboColor, {
-          fit: 'contain',
-          valueMin: 0,
-          valueMax: HEIGHT_AGL_ROOM_MAX_M,
-          maskLayer: sceneCompositeObservedLayer,
-          maskThreshold: HEIGHT_CONTRAST_DENSITY_THRESH,
-          unknownColor: UNKNOWN_CELL_COLOR,
-          unknownAltColor: UNKNOWN_CELL_ALT_COLOR,
           imageSmoothing: false,
         });
         renderTopdownLayer(distanceCanvasRef.current, distanceLayer, viridisColor);
@@ -1565,7 +1317,7 @@ const DepthDrawer = memo(function DepthDrawer({
         renderTopdownLayer(gradientCanvasRef.current, gradientLayer, viridisColor);
       }
     }
-  }, [activeTab, open, cameraFloorplan, densityLayer, renderObservationMaskLayer, renderObservationMaskInvert, inferredWalkableLayer, heightLayer, heightAglLayer, heightContrastRange, heightMaxRaw, heightAglRange, distanceLayer, gradientLayer, obstacleHeightLayer, walkableLayer, structuralHeightLayer, roomFootprintLayer, surfaceObservedLayer, wallSupportLayer, roomBoundaryLayer, measuredPerimeterLayer, surfaceRgbLayer, sceneStaticHeightLayer, sceneStaticObservedLayer, sceneCompositeHeightLayer, sceneCompositeObservedLayer, renderTopdownLayer, clearCanvasElement, drawerWidth, floorplanError, diagnosticsOpen, displaySourceRectForLayer, detailedFloorplanBounds]);
+  }, [activeTab, open, cameraFloorplan, densityLayer, renderObservationMaskLayer, renderObservationMaskInvert, inferredWalkableLayer, heightLayer, heightAglLayer, heightContrastRange, heightMaxRaw, heightAglRange, distanceLayer, gradientLayer, obstacleHeightLayer, walkableLayer, structuralHeightLayer, roomFootprintLayer, surfaceObservedLayer, wallSupportLayer, roomBoundaryLayer, measuredPerimeterLayer, surfaceRgbLayer, renderTopdownLayer, clearCanvasElement, drawerWidth, floorplanError, diagnosticsOpen, displaySourceRectForLayer, detailedFloorplanBounds]);
 
   useEffect(() => {
     if (!open) return;
@@ -1649,7 +1401,7 @@ const DepthDrawer = memo(function DepthDrawer({
       .replace(/^-+|-+$/g, '') || 'unknown';
     const savedAt = new Date();
     const stem = snapshotExportStem(selectedCamera, activeTab, {
-      depthTs: depthEntry?.ts ?? null,
+      depthTs: null,
       floorplanTs: cameraFloorplan?.snapshot_ts ?? cameraFloorplan?.ts ?? null,
       now: savedAt,
     });
@@ -1703,24 +1455,11 @@ const DepthDrawer = memo(function DepthDrawer({
 
     if (activeTab === 'heatmap') {
       canvases.push({
-        label: 'camera-depth-turbo',
+        label: 'pcf-room-height-primary',
         canvas: heatmapSourceCanvasRef.current,
-        source: 'payload',
+        source: 'floorplan-grid',
         valueRange: heatmapRange,
       });
-      if (rgbSourceCanvasRef.current && rgbDepthOverlaySourceCanvasRef.current) {
-        canvases.push({
-          label: 'exact-snapshot-rgb',
-          canvas: rgbSourceCanvasRef.current,
-          source: 'payload',
-        });
-        canvases.push({
-          label: 'exact-snapshot-rgb-depth-overlay',
-          canvas: rgbDepthOverlaySourceCanvasRef.current,
-          source: 'payload',
-          valueRange: heatmapRange,
-        });
-      }
       if (structuralHeightLayer?.grid_shape && structuralHeightLayer.grid_b64) {
         const [rows, cols] = structuralHeightLayer.grid_shape;
         const sourceRect = displaySourceRectForLayer(structuralHeightLayer);
@@ -1764,24 +1503,6 @@ const DepthDrawer = memo(function DepthDrawer({
       addFloorplanLayer('walkable-binary', walkableLayer, bwColor, null, true);
       addFloorplanLayer('measured-perimeter', measuredPerimeterLayer, bwColor);
       addFloorplanLayer('gradient-edges', gradientLayer, viridisColor);
-      addFloorplanLayer(
-        'conditioned-room-walk-static-prior',
-        sceneStaticHeightLayer,
-        turboColor,
-        { min: 0, max: HEIGHT_AGL_ROOM_MAX_M },
-        false,
-        sceneStaticObservedLayer,
-        false,
-      );
-      addFloorplanLayer(
-        'live-conditioned-prior-composite',
-        sceneCompositeHeightLayer,
-        turboColor,
-        { min: 0, max: HEIGHT_AGL_ROOM_MAX_M },
-        false,
-        sceneCompositeObservedLayer,
-        false,
-      );
 
       const compositeLayer = structuralHeightLayer;
       if (compositeLayer?.grid_shape && compositeLayer.grid_b64) {
@@ -1828,31 +1549,19 @@ const DepthDrawer = memo(function DepthDrawer({
       canvases.push({ label: 'stream-preview', canvas: streamPreviewCanvasRef.current, source: 'display' });
       if (primitivesView === 'visible-floor') {
         canvases.push({
-          label: hasSceneFusionFloor
-            ? 'fixed-phone-fusion-floor-plane'
-            : hasScenePrior
-              ? 'conditioned-room-walk-floor-plane'
-              : 'visible-floor-plane',
+          label: 'pcf-visible-floor',
           canvas: floorPlaneCanvasRef.current,
           source: 'display',
         });
       } else if (primitivesView === 'heightfield') {
         canvases.push({
-          label: hasSceneFusionSurface
-            ? 'fixed-phone-fusion-heightfield'
-            : hasScenePrior
-              ? 'conditioned-room-walk-heightfield'
-              : 'cached-heightfield',
+          label: 'pcf-heightfield',
           canvas: heightfieldCanvasRef.current,
           source: 'display',
         });
       } else if (primitivesView === 'point-cloud') {
         canvases.push({
-          label: hasSceneFusionPoints
-            ? 'fixed-phone-fusion-point-cloud'
-            : hasScenePrior
-              ? 'conditioned-room-walk-point-cloud'
-              : `calibrated-point-cloud-${pointCloudColorMode}`,
+          label: 'pcf-point-cloud',
           canvas: pointCloudCanvasRef.current,
           source: 'display',
         });
@@ -1890,20 +1599,7 @@ const DepthDrawer = memo(function DepthDrawer({
       tab: activeTab,
       images: imageNames,
       exports,
-      depth_ts_us: depthEntry?.ts ?? null,
-      depth_served_from_cache: depthMetaEntry?.servedFromCache ?? null,
-      depth_source_camera_id: depthMetaEntry?.sourceCameraId ?? null,
-      depth_snapshot_ref: depthMetaEntry?.snapshotRef ?? null,
-      depth_snapshot_id: depthMetaEntry?.snapshotId ?? null,
-      depth_snapshot_content_sha256: depthMetaEntry?.snapshotContentSha256 ?? null,
-      exact_snapshot_rgb_component_sha256: depthMetaEntry?.rgbComponentSha256 ?? null,
-      depth_transfer_bytes: depthMetaEntry?.transferBytes ?? null,
-      depth_transfer_duration_ms: depthMetaEntry?.transferDurationMs ?? null,
-      exact_snapshot_rgb_available: Boolean(decodedDepth?.rgb),
-      exact_snapshot_rgb_shape: decodedDepth?.rgbShape ?? null,
-      rgb_depth_overlay_opacity: activeTab === 'heatmap' && decodedDepth?.rgb
-        ? rgbOverlayOpacity
-        : null,
+      presentation_source: 'pcf',
       depth_range_mode: activeTab === 'heatmap' ? heatmapRangeMode : null,
       depth_range: activeTab === 'heatmap' ? heatmapRange : null,
       normals_view: activeTab === 'normals' ? normalsView : null,
@@ -1940,19 +1636,6 @@ const DepthDrawer = memo(function DepthDrawer({
           source_model: scenePriorMeta?.source_model ?? null,
         }
         : null,
-      scene_fusion_3d_source: activeTab === '3d' && (
-        hasSceneFusionSurface
-        || hasSceneFusionObstacles
-        || hasSceneFusionFloor
-        || hasSceneFusionPoints
-      )
-        ? {
-          fusion_id: sceneFusionMeta?.fusion_id ?? null,
-          inference: sceneFusionMeta?.inference ?? null,
-          point_count: sceneFusionPoints?.point_count ?? null,
-          per_view_selection: true,
-        }
-        : null,
     };
     saveBlob(
       new Blob([JSON.stringify(manifest, null, 2)], { type: 'application/json' }),
@@ -1963,9 +1646,6 @@ const DepthDrawer = memo(function DepthDrawer({
     aglRangeMode,
     cameraFloorplan,
     densityLayer,
-    depthEntry,
-    depthMetaEntry,
-    decodedDepth,
     detailedFloorplanBounds,
     displaySourceRectForLayer,
     distanceLayer,
@@ -1973,10 +1653,6 @@ const DepthDrawer = memo(function DepthDrawer({
     gradientLayer,
     heatmapRange,
     heatmapRangeMode,
-    hasSceneFusionFloor,
-    hasSceneFusionObstacles,
-    hasSceneFusionPoints,
-    hasSceneFusionSurface,
     hasScenePrior,
     heightAglLayer,
     heightAglRange,
@@ -1989,9 +1665,7 @@ const DepthDrawer = memo(function DepthDrawer({
     renderObservationMaskLayer,
     renderObservationMaskInvert,
     inferredWalkableLayer,
-    pointCloudColorMode,
     primitivesView,
-    rgbOverlayOpacity,
     saveBlob,
     saveCanvas,
     selectedCamera,
@@ -2000,8 +1674,6 @@ const DepthDrawer = memo(function DepthDrawer({
     surfaceObservedLayer,
     wallSupportLayer,
     roomBoundaryLayer,
-    sceneFusionMeta,
-    sceneFusionPoints,
     scenePriorMeta,
     surfaceRgbLayer,
     floorPlaneResult.status,
@@ -2022,7 +1694,7 @@ const DepthDrawer = memo(function DepthDrawer({
           role="presentation"
         />
         <header>
-          <h2>MapAnything Depth</h2>
+          <h2>PCF Room Reconstruction</h2>
           <button onClick={onClose} aria-label="Close depth drawer">×</button>
         </header>
         <div className="tabs">
@@ -2034,7 +1706,7 @@ const DepthDrawer = memo(function DepthDrawer({
           <button className={activeTab === 'metrics' ? 'active' : ''} onClick={() => setActiveTab('metrics')}>Metrics</button>
         </div>
         <div className="content">
-          {!cameras.length && activeTab !== 'semantic' && <p>No MapAnything diagnostics received yet.</p>}
+          {!cameras.length && activeTab !== 'semantic' && <p>No room cameras are available yet.</p>}
           {cameras.length > 0 && activeTab !== 'semantic' && (
             <div className={`drawer-toolbar ${(activeTab === 'heatmap' || activeTab === '3d' || activeTab === 'normals') ? 'drawer-toolbar--heatmap' : ''}`}>
               <label className="drawer-toolbar__camera" htmlFor="ma-depth-select">
@@ -2077,13 +1749,13 @@ const DepthDrawer = memo(function DepthDrawer({
                       (onRequestDepthFresh ?? onRefreshDepthPanel)?.(selectedCamera);
                     }}
                     disabled={!selectedCamera || !transportOpen || anyRefreshPending}
-                    aria-label="Refresh depth frame"
+                    aria-label="Capture static comparison frame"
                     title={
                       !transportOpen
                         ? 'WebSocket is disconnected.'
                         : anyRefreshPending
-                          ? 'A coherent depth/floorplan refresh is already running.'
-                          : 'Capture one coherent depth and floorplan snapshot'
+                          ? 'A static comparison capture is already running.'
+                          : 'Capture a static-camera comparison snapshot; PCF remains displayed'
                     }
                   >
                     <svg viewBox="0 0 16 16" aria-hidden="true">
@@ -2108,7 +1780,7 @@ const DepthDrawer = memo(function DepthDrawer({
               )}
               <div className="depth-view-controls">
                 <label>
-                  <span>Depth range</span>
+                  <span>PCF height range</span>
                   <select
                     value={heatmapRangeMode}
                     onChange={(event) => {
@@ -2163,23 +1835,10 @@ const DepthDrawer = memo(function DepthDrawer({
                     </label>
                   </div>
                 )}
-                {decodedDepth?.rgb && (
-                  <label>
-                    <span>RGB overlay {Math.round(rgbOverlayOpacity * 100)}%</span>
-                    <input
-                      type="range"
-                      min={0}
-                      max={1}
-                      step={0.05}
-                      value={rgbOverlayOpacity}
-                      onChange={(event) => setRgbOverlayOpacity(Number(event.target.value))}
-                    />
-                  </label>
-                )}
                 <span className="depth-view-controls__meta">
                   {heatmapRanges.robust
-                    ? `${heatmapRanges.robust.sampleCount.toLocaleString()} mask-valid positive pixels`
-                    : 'No valid depth pixels'}
+                    ? `${heatmapRanges.robust.sampleCount.toLocaleString()} observed PCF cells`
+                    : 'Waiting for PCF height cells'}
                 </span>
               </div>
 
@@ -2189,7 +1848,7 @@ const DepthDrawer = memo(function DepthDrawer({
                     {renderScale(turboGradient, heatmapRange?.min ?? undefined, heatmapRange ? (heatmapRange.min + heatmapRange.max) / 2 : undefined, heatmapRange?.max ?? undefined, ' m')}
                   </div>
                   <div className="heatmap-cell__body">
-                    <div className="heatmap-cell__title">Camera Depth · Primary</div>
+                    <div className="heatmap-cell__title">PCF Room Height · Primary</div>
                     <canvas
                       ref={heatmapCanvasRef}
                       className="heatmap-canvas"
@@ -2197,26 +1856,9 @@ const DepthDrawer = memo(function DepthDrawer({
                     />
                   </div>
                 </div>
-                {decodedDepth?.rgb && (
-                  <div className="heatmap-cell heatmap-cell--primary heatmap-cell--no-scale">
-                    <div className="heatmap-cell__body">
-                      <div className="heatmap-cell__title">Exact Snapshot RGB + Depth</div>
-                      <canvas
-                        ref={rgbDepthOverlayCanvasRef}
-                        className="heatmap-canvas"
-                        style={{ aspectRatio: `${depthAspect}` }}
-                      />
-                      <div className="floorplan-class-keys">
-                        <div className="unknown-cell-key">
-                          Digest-verified RGB and depth from one snapshot identity
-                        </div>
-                      </div>
-                    </div>
-                  </div>
-                )}
                 <div className="heatmap-cell heatmap-cell--primary heatmap-cell--no-scale">
                   <div className="heatmap-cell__body">
-                    <div className="heatmap-cell__title">Observed Textured Floorplan · Primary</div>
+                    <div className="heatmap-cell__title">PCF Observed Textured Floorplan · Primary</div>
                     <canvas
                       ref={floorplanCompositeCanvasRef}
                       className="heatmap-canvas"
@@ -2278,42 +1920,6 @@ const DepthDrawer = memo(function DepthDrawer({
                       </div>
                     </div>
                   </div>
-                  {hasScenePrior && (
-                    <div className="heatmap-cell heatmap-cell--left">
-                      <div className="heatmap-cell__scale">
-                        {renderScale(turboGradient, 0, HEIGHT_AGL_ROOM_MAX_M / 2, HEIGHT_AGL_ROOM_MAX_M, ' m')}
-                      </div>
-                      <div className="heatmap-cell__body">
-                        <div className="heatmap-cell__title">Conditioned Room Walk · Static Prior</div>
-                        <canvas
-                          ref={sceneStaticCanvasRef}
-                          className="heatmap-canvas"
-                          style={{ aspectRatio: `${layerAspect(sceneStaticHeightLayer)}` }}
-                        />
-                        <div className="unknown-cell-key">
-                          Camera right → · camera forward ↑ · unknown cells remain open
-                        </div>
-                      </div>
-                    </div>
-                  )}
-                  {hasSceneComposite && (
-                    <div className="heatmap-cell heatmap-cell--right">
-                      <div className="heatmap-cell__body">
-                        <div className="heatmap-cell__title">Live + Conditioned Prior · Composite</div>
-                        <canvas
-                          ref={sceneCompositeCanvasRef}
-                          className="heatmap-canvas"
-                          style={{ aspectRatio: `${layerAspect(sceneCompositeHeightLayer)}` }}
-                        />
-                        <div className="unknown-cell-key">
-                          Same camera-ground orientation · live observed cells win
-                        </div>
-                      </div>
-                      <div className="heatmap-cell__scale">
-                        {renderScale(turboGradient, 0, HEIGHT_AGL_ROOM_MAX_M / 2, HEIGHT_AGL_ROOM_MAX_M, ' m')}
-                      </div>
-                    </div>
-                  )}
                   <div className="heatmap-cell heatmap-cell--left">
                     <div className="heatmap-cell__body">
                       <div className="heatmap-cell__title">Density (Grayscale)</div>
@@ -2392,26 +1998,21 @@ const DepthDrawer = memo(function DepthDrawer({
               {/* Meta information below the grid */}
               <div className="heatmap-meta">
                 <div className="heatmap-meta__item">
-                  {depthEntry ? (() => {
-                    const parts = [`Updated ${new Date(depthEntry.ts / 1000).toLocaleTimeString()}`];
-                    if (depthMetaEntry && typeof depthMetaEntry.servedFromCache === 'boolean') {
-                      parts.push(depthMetaEntry.servedFromCache ? 'from cache' : 'fresh');
-                    }
-                    parts.push(`Resolution ${depthEntry.shape[1]}×${depthEntry.shape[0]}`);
-                    return parts.join(' · ');
-                  })() : 'No depth frame cached yet for this camera.'}
+                  {hasCanonicalPcf
+                    ? `PCF prior ${scenePriorMeta?.prior_id ?? 'unknown'} · ${heightAglLayer?.grid_shape?.[1] ?? 0}×${heightAglLayer?.grid_shape?.[0] ?? 0}`
+                    : 'Waiting for the canonical PCF scene prior.'}
                 </div>
                 <div className="heatmap-meta__item">
-                  {hasDensity ? 'Normalized point density' : 'Waiting for density data'}
+                  {hasDensity ? 'PCF normalized point density' : 'Waiting for PCF density data'}
                 </div>
                 <div className="heatmap-meta__item">
-                  {hasHeight ? 'Highest surface per cell.' : 'Waiting for height data'}
+                  {hasHeight ? 'PCF highest supported surface per cell.' : 'Waiting for PCF height data'}
                 </div>
                 <div className="heatmap-meta__item">
-                  {hasHeightAgl ? 'Height above estimated floor (AGL).' : 'Waiting for AGL height'}
+                  {hasHeightAgl ? 'PCF height above fitted floor (AGL).' : 'Waiting for PCF AGL height'}
                 </div>
                 <div className="heatmap-meta__item">
-                  {hasDistance ? 'Average distance from camera.' : 'Waiting for distance data'}
+                  {hasDistance ? 'PCF cell range from the static camera pose.' : 'Waiting for PCF distance data'}
                 </div>
                 <div className="heatmap-meta__item">
                   {hasGradient ? 'Height gradient magnitude (edges).' : 'Waiting for gradient layer'}
@@ -2425,7 +2026,7 @@ const DepthDrawer = memo(function DepthDrawer({
                 <div className="heatmap-meta__item">
                   {hasObserved && hasUnknown
                     ? `Observed ${observationCounts.observed ?? 'n/a'} · unknown ${observationCounts.unknown ?? 'n/a'}${hasInferredWalkable ? ` · inferred walkable ${observationCounts.inferredWalkable}` : ''}`
-                    : 'Legacy observation mask fallback in use'}
+                    : 'Waiting for PCF observation support'}
                 </div>
               </div>
 
@@ -2434,7 +2035,7 @@ const DepthDrawer = memo(function DepthDrawer({
                   Points: {cameraFloorplan.point_count ?? 0}
                   {spanX !== undefined && spanZ !== undefined ? ` · Span ${formatNumber(spanX)}m × ${formatNumber(spanZ)}m` : ''}
                   {cameraFloorplan.ts
-                    ? ` · Updated ${new Date(cameraFloorplan.ts / 1000).toLocaleTimeString()}${floorplanServedFromCache ? ' (cached)' : ''}`
+                    ? ` · Prior created ${new Date(cameraFloorplan.ts / 1000).toLocaleString()}`
                     : ''}
                 </p>
               )}
@@ -2474,8 +2075,8 @@ const DepthDrawer = memo(function DepthDrawer({
                 <div className="heatmap-cell__body">
                   <div className="heatmap-cell__title">
                     {normalsView === 'surface'
-                      ? 'Plane-Aware Surface Normals (RGB)'
-                      : 'Edge-Aware Detail Normals (RGB)'}
+                      ? 'PCF Smoothed Surface Normals (RGB)'
+                      : 'PCF Native-Grid Detail Normals (RGB)'}
                   </div>
                   <canvas
                     ref={normalsCanvasRef}
@@ -2486,9 +2087,9 @@ const DepthDrawer = memo(function DepthDrawer({
               </div>
               <p className="floorplan-meta">
                 {normalsView === 'surface'
-                  ? 'Regularized from coherent calibrated depth surfaces. Planes share one robust orientation; uncertain, curved, and boundary regions retain detail normals.'
-                  : 'Variance-preserving metric depth normals for inspecting local model behavior and fine structure.'}
-                {' '}RGB encodes X/Y/Z orientation from −1..1; transparent pixels lack valid local support.
+                  ? 'Derived from the canonical PCF heightfield after one-cell spatial smoothing.'
+                  : 'Derived directly from the canonical 2.5 cm PCF heightfield.'}
+                {' '}RGB encodes camera-right/up/forward orientation from −1..1; transparent pixels lack PCF support.
               </p>
             </>
           )}
@@ -2559,7 +2160,7 @@ const DepthDrawer = memo(function DepthDrawer({
 
                 {primitivesView === 'obstacles' ? (
                   <div className="primitives-panel">
-                    <div className="primitives-panel__title">Extruded Floorplan Primitives</div>
+                    <div className="primitives-panel__title">PCF Extruded Floorplan Primitives</div>
                     <canvas
                       ref={extrudedCanvasRef}
                       className="primitives-canvas primitives-canvas--extruded"
@@ -2567,19 +2168,13 @@ const DepthDrawer = memo(function DepthDrawer({
                     />
                     <div className="primitives-submeta">
                       {primitivesModel
-                        ? `${hasSceneFusionObstacles ? 'Fixed + phone fusion' : hasScenePrior ? 'Conditioned room walk' : 'Live cached floorplan'} · grid ${primitivesModel.cols}×${primitivesModel.rows} · max height ${formatNumber(primitivesModel.maxHeightM)} m`
-                        : 'Waiting for floorplan grids…'}
+                        ? `Prior-conditioned fusion · grid ${primitivesModel.cols}×${primitivesModel.rows} · max height ${formatNumber(primitivesModel.maxHeightM)} m`
+                        : 'Waiting for the canonical PCF obstacle grid…'}
                     </div>
                   </div>
                 ) : primitivesView === 'heightfield' ? (
                   <div className="primitives-panel">
-                    <div className="primitives-panel__title">
-                      {hasSceneFusionSurface
-                        ? 'Fixed + Phone Fusion Height Above Floor'
-                        : hasScenePrior
-                          ? 'Conditioned Room Height Above Floor'
-                          : 'Observed Height Above Floor'}
-                    </div>
+                    <div className="primitives-panel__title">PCF Room Height Above Floor</div>
                     <div className="floor-plane-view-wrap">
                       <CachedHeightfield3DView
                         floorplan={cameraFloorplan}
@@ -2594,73 +2189,37 @@ const DepthDrawer = memo(function DepthDrawer({
                     </div>
                     <div className="primitives-submeta">
                       {primitivesHeightLayer?.grid_b64
-                        ? `${hasSceneFusionSurface ? `Fusion ${sceneFusionMeta?.fusion_id ?? 'unknown'} · ` : hasScenePrior ? `Prior ${scenePriorMeta?.prior_id ?? 'unknown'} · ` : ''}grid ${primitivesHeightLayer.grid_shape?.[1] ?? 0}×${primitivesHeightLayer.grid_shape?.[0] ?? 0} · highest supported surface per cell · unknown cells omitted · zero plane is fitted floor · ${formatNumber(primitivesHeightExaggeration, 1)}× height`
-                        : 'Waiting for plane-relative height data…'}
+                        ? `PCF ${scenePriorMeta?.prior_id ?? 'unknown'} · grid ${primitivesHeightLayer.grid_shape?.[1] ?? 0}×${primitivesHeightLayer.grid_shape?.[0] ?? 0} · highest supported surface per cell · unknown cells omitted · zero plane is fitted floor · ${formatNumber(primitivesHeightExaggeration, 1)}× height`
+                        : 'Waiting for the canonical PCF heightfield…'}
                     </div>
                   </div>
                 ) : primitivesView === 'point-cloud' ? (
                   <div className="primitives-panel">
-                    <div className="primitives-panel__title">
-                      {hasSceneFusionPoints
-                        ? 'Fixed + Phone Fusion Point Cloud'
-                        : hasScenePrior
-                          ? 'Conditioned Fusion Point Cloud'
-                          : 'Calibrated Dense Point Cloud'}
-                    </div>
+                    <div className="primitives-panel__title">PCF Conditioned Fusion Point Cloud</div>
                     <div className="floor-plane-view-wrap">
-                      {hasSceneFusionPoints ? (
-                        <FusedPointCloud3DView
-                          artifact={sceneFusionPoints}
-                          colorMode="rgb"
-                          hideOverhead={false}
-                          onCanvasReady={handlePointCloudCanvasReady}
-                        />
-                      ) : hasScenePrior ? (
+                      {hasScenePrior ? (
                         <ScenePriorPointCloud3DView
                           cameraId={selectedCamera}
                           expectedPriorId={scenePriorMeta?.prior_id}
+                          calibrationEpoch={calibrationEpoch}
                           onCanvasReady={handlePointCloudCanvasReady}
                         />
-                      ) : (
-                        <CalibratedPointCloud3DView
-                          depthValues={decodedDepth?.depth}
-                          confidenceValues={decodedDepth?.confidence}
-                          maskValues={decodedDepth?.mask}
-                          rgbValues={decodedDepth?.rgb}
-                          rgbShape={decodedDepth?.rgbShape}
-                          width={decodedDepth?.width}
-                          height={decodedDepth?.height}
-                          intrinsics={selectedIntrinsics}
-                          floorModel={visibleFloorModel}
-                          colorMode={pointCloudColorMode}
-                          onCanvasReady={handlePointCloudCanvasReady}
-                        />
-                      )}
-                      {!hasSceneFusionPoints && !hasScenePrior && (!decodedDepth || !selectedIntrinsics) && (
+                      ) : null}
+                      {!hasScenePrior && (
                         <div className="floor-plane-empty">
-                          {!decodedDepth ? 'Waiting for cached dense depth.' : 'Waiting for camera intrinsics.'}
+                          No canonical PCF point cloud is assigned to this camera.
                         </div>
                       )}
                     </div>
                     <div className="primitives-submeta">
-                      {hasSceneFusionPoints
-                        ? `${sceneFusionPoints?.point_count ?? 0} fixed + phone fusion points · fixed→phone median ${formatNumber(sceneFusionMeta?.quality?.fixed_to_phone_median_m ?? 0, 3)} m · ${formatNumber((sceneFusionMeta?.quality?.fixed_overlap_0p25m ?? 0) * 100, 1)}% fixed overlap at 25 cm · camera right → · forward ↑`
-                        : hasScenePrior
-                          ? `MapAnything + DA3 prior-conditioned consensus · ${scenePriorMeta?.static_available_cells ?? 0} represented grid cells · backend world transformed to this camera · prior ${scenePriorMeta?.prior_id ?? 'unknown'}`
-                          : decodedDepth && selectedIntrinsics
-                        ? `Source ${decodedDepth.width}×${decodedDepth.height} · bounded to 250,000 mask-valid points · ${decodedDepth.rgb ? 'exact snapshot RGB available' : 'exact snapshot RGB unavailable'} · camera-local metric frame`
-                        : 'Depth and camera calibration are required.'}
+                      {hasScenePrior
+                        ? `MapAnything + DA3 prior-conditioned consensus · ${scenePriorMeta?.quality?.selected_point_count ?? 0} selected points · backend world transformed to this camera · prior ${scenePriorMeta?.prior_id ?? 'unknown'}`
+                        : 'A PCF scene prior is required.'}
                     </div>
                   </div>
                 ) : (
                   <div className="primitives-panel">
-                    <div className="primitives-panel__title">
-                      {hasSceneFusionFloor
-                        ? 'Visible Floor · Fixed + Phone Fusion'
-                        : hasScenePrior
-                          ? 'Visible Floor · Conditioned Room Walk'
-                          : 'Visible Floor Plane'}
-                    </div>
+                    <div className="primitives-panel__title">PCF Visible Floor Support</div>
                     <div className="floor-plane-view-wrap">
                       <FloorPlane3DView
                         model={visibleFloorModel}
@@ -2672,7 +2231,7 @@ const DepthDrawer = memo(function DepthDrawer({
                     </div>
                     <div className="primitives-submeta">
                       {visibleFloorModel
-                        ? `${hasSceneFusionFloor ? 'Fusion floor support' : hasScenePrior ? 'Conditioned floor support' : 'Visible support'} ${visibleFloorModel.metrics.estimatedVisibleFloorPixelCount} cells · footprint ${visibleFloorModel.footprintMesh.cellCount} cells · ${formatNumber(visibleFloorModel.footprintMesh.areaM2, 1)} m²${hasSceneFusionFloor ? ` · fusion ${sceneFusionMeta?.fusion_id ?? 'unknown'}` : hasScenePrior ? ` · prior ${scenePriorMeta?.prior_id ?? 'unknown'}` : ''}`
+                        ? `PCF floor support ${visibleFloorModel.metrics.estimatedVisibleFloorPixelCount} cells · footprint ${visibleFloorModel.footprintMesh.cellCount} cells · ${formatNumber(visibleFloorModel.footprintMesh.areaM2, 1)} m² · prior ${scenePriorMeta?.prior_id ?? 'unknown'}`
                         : floorPlaneResult.message}
                     </div>
                   </div>
@@ -2694,27 +2253,6 @@ const DepthDrawer = memo(function DepthDrawer({
                         onChange={(e) => setPrimitivesHeightExaggeration(parseFloat(e.target.value))}
                       />
                       <span className="primitives-value">{formatNumber(primitivesHeightExaggeration, 1)}×</span>
-                    </div>
-                  </div>
-                </details>
-              )}
-
-              {primitivesView === 'point-cloud' && !hasSceneFusionPoints && !hasScenePrior && (
-                <details className="primitives-details">
-                  <summary>Point-cloud settings</summary>
-                  <div className="primitives-settings">
-                    <div className="primitives-row">
-                      <label htmlFor="point-cloud-color-mode">Color by</label>
-                      <select
-                        id="point-cloud-color-mode"
-                        value={pointCloudColorMode}
-                        onChange={(event) => setPointCloudColorMode(event.target.value as 'rgb' | 'depth' | 'confidence')}
-                      >
-                        <option value="rgb" disabled={!decodedDepth?.rgb}>Exact snapshot RGB</option>
-                        <option value="depth">Depth (p2–p98)</option>
-                        <option value="confidence">Confidence (p2–p98)</option>
-                      </select>
-                      <span className="primitives-value">{pointCloudColorMode}</span>
                     </div>
                   </div>
                 </details>
@@ -2857,7 +2395,10 @@ const DepthDrawer = memo(function DepthDrawer({
           {activeTab === 'semantic' && <SemanticSegView />}
 
           {activeTab === 'histogram' && (
-            <canvas ref={histogramCanvasRef} className="histogram" />
+            <>
+              <p className="floorplan-status">PCF evidence-confidence distribution</p>
+              <canvas ref={histogramCanvasRef} className="histogram" />
+            </>
           )}
 
           {activeTab === 'metrics' && (

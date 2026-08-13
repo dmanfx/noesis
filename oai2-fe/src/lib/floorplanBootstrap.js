@@ -14,8 +14,8 @@ const responseError = (payload) => String(payload?.error || '').trim();
 
 /**
  * Coordinates the dashboard's floorplan bootstrap without owning transport.
- * Bootstrap is strictly cache-only. Missing views remain absent until the
- * operator explicitly requests a fresh depth-panel capture.
+ * Bootstrap is strictly read-only and requests the admitted PCF scene prior.
+ * It never consults or captures a static-camera floorplan.
  */
 export class FloorplanBootstrapCoordinator {
   constructor({
@@ -128,9 +128,10 @@ export class FloorplanBootstrapCoordinator {
       camera,
       requestId,
       maxAgeSec: phase === 'cache' ? 600 : 0,
-      gridResM: 0.04,
+      gridResM: 0.025,
       maxExtentM: 20,
       cacheOnly: phase === 'cache',
+      scenePriorOnly: true,
     };
     this.active = { camera, phase, retryCount, request };
     return { request, delayMs };

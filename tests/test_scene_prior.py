@@ -17,6 +17,7 @@ from noesis.scene_prior_builder import (
 )
 from noesis.pipelines.hooks import _AnalyticsTelemetryProcessor
 from noesis.server import scene_prior_api
+from noesis.virtual_twin.artifacts import write_points_glb
 from noesis_core.contracts.base import ArtifactFingerprint
 from noesis_core.contracts.scene_prior import (
     ScenePriorArtifact,
@@ -69,11 +70,28 @@ def _write_prior(root: Path) -> tuple[Path, dict[str, bytes]]:
         "floor_support_count": np.full(shape, 3, dtype=np.uint32),
         "obstacle_support_count": np.asarray([[0, 4], [0, 0]], dtype=np.uint32),
     }
+    point_positions = np.asarray(
+        [
+            (column + 0.5, height, row + 0.5)
+            for row in range(2)
+            for column in range(2)
+            for height in (0.0, 0.05, 0.2, 0.25, 0.5, 0.55, 1.0, 1.05)
+        ],
+        dtype=np.float32,
+    )
+    point_colors = np.tile(
+        np.asarray([[64, 128, 192]], dtype=np.uint8),
+        (point_positions.shape[0], 1),
+    )
+    fixture_glb = root / "fixture-points.glb"
+    write_points_glb(fixture_glb, point_positions, point_colors)
+    points_glb = fixture_glb.read_bytes()
+    fixture_glb.unlink()
     artifact_payloads = {
         "grid.npz": _deterministic_npz(arrays),
         "metrics.json": b"{}\n",
         "preview.png": b"png",
-        "points.glb": b"glb",
+        "points.glb": points_glb,
     }
     revision = ScenePriorRevision(
         contract="noesis.scene_prior.revision",
@@ -265,6 +283,8 @@ def test_scene_prior_static_floorplan_survives_live_cache_miss(tmp_path: Path) -
     assert result["live_floorplan_error"] == "no_cached_floorplan"
     assert result["frame"] == "camera_local_ground_m"
     assert result["scene_prior_meta"]["status"] == "static_only"
+    assert result["scene_prior_only"] is False
+    assert "scene_prior_diagnostic_height_agl" not in result
     assert result["scene_prior_meta"]["live_observed_cells"] == 0
     assert result["scene_prior_meta"]["static_available_cells"] == 4
     np.testing.assert_allclose(
@@ -278,6 +298,73 @@ def test_scene_prior_static_floorplan_survives_live_cache_miss(tmp_path: Path) -
     assert result["scene_prior_meta"]["raster_orientation"] == (
         "row_zero_max_z_rows_toward_min_z_columns_min_x_to_max_x"
     )
+
+
+def test_scene_prior_only_floorplan_is_canonical_pcf_presentation(tmp_path: Path) -> None:
+    catalog_path, _ = _write_prior(tmp_path)
+    priors = ScenePriorSet.load(catalog_path)
+
+    result = priors.compose_static_floorplan(
+        "camera-a",
+        {
+            "type": "floorplan_response",
+            "request_id": "pcf-only",
+            "camera_id": "camera-a",
+            "cache_only": True,
+            "scene_prior_only": True,
+        },
+        extrinsics_col_major=np.eye(4).flatten(order="F").tolist(),
+    )
+
+    assert result["scene_prior_only"] is True
+    assert result["display_source"] == "pcf"
+    assert result["served_from_cache"] is True
+    assert result["scene_prior_meta"]["status"] == "pcf"
+    assert result["scene_prior_meta"]["camera_geometry_source"] == (
+        "current_calibrated_extrinsics"
+    )
+    assert result["scene_prior_meta"]["composition_policy"] == "pcf_only"
+    assert result["scene_prior_diagnostic_meta"]["source"] == "map-anything"
+    assert result["scene_prior_diagnostic_meta"]["derivation"] == (
+        "prior_conditioned_fusion_points_and_grid"
+    )
+    np.testing.assert_allclose(
+        _decode(result["scene_prior_diagnostic_height_agl"]),
+        [[3.0, 4.0], [1.0, 2.0]],
+    )
+    assert result["scene_prior_diagnostic_surface_rgb"]["rgb_shape"] == [2, 2, 3]
+    assert "scene_static_height_agl" not in result
+    assert "scene_composite_height_agl" not in result
+
+
+def test_scene_prior_only_floorplan_uses_current_camera_calibration(tmp_path: Path) -> None:
+    catalog_path, _ = _write_prior(tmp_path)
+    priors = ScenePriorSet.load(catalog_path)
+    world_to_camera = np.eye(4, dtype=np.float64)
+    world_to_camera[0, 3] = -0.25
+
+    result = priors.compose_static_floorplan(
+        "camera-a",
+        {
+            "camera_id": "camera-a",
+            "cache_only": True,
+            "scene_prior_only": True,
+        },
+        extrinsics_col_major=world_to_camera.flatten(order="F").tolist(),
+    )
+
+    assert result["bounds"] == {
+        "min_x": -1.0,
+        "max_x": 2.0,
+        "min_z": 0.0,
+        "max_z": 2.0,
+    }
+    assert result["scene_prior_diagnostic_meta"]["camera_position_world_m"] == [
+        0.25,
+        0.0,
+        0.0,
+    ]
+    assert result["scene_prior_diagnostic_height_agl"]["grid_shape"] == [2, 3]
 
 
 def test_scene_prior_camera_view_exposes_verified_camera_local_cloud(

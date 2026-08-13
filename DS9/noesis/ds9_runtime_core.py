@@ -4972,8 +4972,65 @@ def _run_main(startup_main_guard: StartupMainGuard) -> int:
         grid_res_m: float = 0.5,
         max_extent_m: float = 20.0,
         cache_only: bool = False,
+        scene_prior_only: bool = False,
         **_ignored: object,
     ) -> Dict[str, Any]:
+        requested_camera_id = str(camera or "").strip()
+        if scene_prior_only:
+            if scene_prior_set is None:
+                return {
+                    "camera_id": requested_camera_id,
+                    "scene_prior_only": True,
+                    "error": "scene_prior_not_configured",
+                }
+            binding = scene_prior_set.binding(requested_camera_id)
+            if binding is None or not binding.include_floorplan_layers:
+                return {
+                    "camera_id": requested_camera_id,
+                    "scene_prior_only": True,
+                    "error": "scene_prior_camera_not_bound",
+                }
+            source_id = next(
+                (
+                    int(candidate)
+                    for candidate, label in camera_labels.items()
+                    if str(label) == requested_camera_id
+                ),
+                None,
+            )
+            if source_id is None:
+                return {
+                    "camera_id": requested_camera_id,
+                    "scene_prior_only": True,
+                    "error": "scene_prior_camera_not_active",
+                }
+            try:
+                calibration = calibration_provider.snapshot(
+                    source_id, requested_camera_id
+                )
+                if calibration is None or calibration.extrinsics_col_major is None:
+                    return {
+                        "camera_id": requested_camera_id,
+                        "scene_prior_only": True,
+                        "error": "scene_prior_calibration_unavailable",
+                    }
+                return scene_prior_set.compose_static_floorplan(
+                    requested_camera_id,
+                    {
+                        "camera_id": requested_camera_id,
+                        "cache_only": True,
+                        "scene_prior_only": True,
+                        "served_from_cache": True,
+                    },
+                    extrinsics_col_major=calibration.extrinsics_col_major,
+                )
+            except ScenePriorError as exc:
+                logger.error("Canonical scene-prior floorplan composition failed: %s", exc)
+                return {
+                    "camera_id": requested_camera_id,
+                    "scene_prior_only": True,
+                    "error": str(exc),
+                }
         providers = getattr(pipeline, "capture_event_runtime_providers", None)
         if not isinstance(providers, CaptureEventRuntimeProviders):
             error = CaptureEventRuntimeError(

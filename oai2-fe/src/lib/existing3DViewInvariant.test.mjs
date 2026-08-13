@@ -10,7 +10,7 @@ const source = async (relativeUrl) => readFile(
 
 const occurrenceCount = (text, pattern) => text.match(pattern)?.length ?? 0;
 
-test('conditioned fusion populates exactly the established four 3D views', async () => {
+test('canonical PCF populates exactly the established four 3D views', async () => {
   const drawer = await source('../components/DepthDrawer.tsx');
 
   assert.equal(occurrenceCount(drawer, /setPrimitivesView\('/g), 4);
@@ -18,16 +18,17 @@ test('conditioned fusion populates exactly the established four 3D views', async
     drawer,
     /setPrimitivesView\('(fusion-|scene-prior|scene-composite|room-cloud)/,
   );
-  assert.match(drawer, /const primitivesHeightLayer = hasSceneFusionSurface/);
+  assert.match(drawer, /const primitivesHeightLayer = hasScenePrior \? pcfHeightLayer : undefined/);
   assert.match(
     drawer,
     /height: primitivesObstacleHeightLayer,[\s\S]*density: primitivesObstacleObservedLayer/,
   );
   assert.match(
     drawer,
-    /hasSceneFusionPoints \? \([\s\S]*<FusedPointCloud3DView[\s\S]*hasScenePrior \? \([\s\S]*<ScenePriorPointCloud3DView/,
+    /hasScenePrior \? \([\s\S]*<ScenePriorPointCloud3DView/,
   );
-  assert.match(drawer, /const floorPlaneResult = hasSceneFusionFloor/);
+  assert.match(drawer, /const floorPlaneResult = scenePriorFloorResult/);
+  assert.doesNotMatch(drawer, /<FusedPointCloud3DView|<CalibratedPointCloud3DView/);
 });
 
 test('3D rendering remains read-only with respect to depth and floorplan inference', async () => {

@@ -49,6 +49,11 @@ and worklogs live in `docs/history/`.
 - Status headers (“Status: validated as of …”) should only be updated when the doc has been re-validated against code/configs.
 
 ## Doc changes (2026-08-12)
+- Made camera-bound PCF Scene Prior data the canonical source for every standard
+  Depth drawer reconstruction and diagnostic view, documented automatic
+  read-only loading, and retained manual Refresh as a non-displayed static
+  comparison capture (`scene_prior_v1.md`, `DS8_api_contracts_ws.md`,
+  `../DS9/README.md`).
 - Corrected the DeepStream 9.1 completion record after removing per-frame
   identity retention and excess CPU math workers: the accepted live baseline is
   29.8-30 FPS per camera, while the remaining 6-11 ms WebSocket boundary p99 is

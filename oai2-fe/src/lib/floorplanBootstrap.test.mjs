@@ -10,11 +10,12 @@ const reply = (action, fields = {}) => ({
   ...fields,
 });
 
-test('cache hit advances without a fresh capture', () => {
+test('PCF response advances without a fresh static capture', () => {
   const coordinator = new FloorplanBootstrapCoordinator();
   const first = coordinator.restart(['living-room', 'kitchen']);
   assert.equal(first.request.cacheOnly, true);
-  assert.equal(first.request.gridResM, 0.04);
+  assert.equal(first.request.scenePriorOnly, true);
+  assert.equal(first.request.gridResM, 0.025);
 
   const result = coordinator.handleResponse(reply(first), { renderable: true });
   assert.equal(result.completedCamera, 'living-room');

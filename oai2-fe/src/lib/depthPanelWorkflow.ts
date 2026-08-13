@@ -12,6 +12,10 @@ export type FloorplanResponseLike = {
   snapshot_ts?: unknown;
   ts?: unknown;
   served_from_cache?: unknown;
+  cache_only?: unknown;
+  scene_prior_only?: unknown;
+  display_source?: unknown;
+  live_floorplan_error?: unknown;
   error?: unknown;
   density?: FloorplanGridLayerLike;
   height?: FloorplanGridLayerLike;
@@ -22,6 +26,7 @@ export type FloorplanResponseLike = {
   walkable?: FloorplanGridLayerLike;
   scene_static_height_agl?: FloorplanGridLayerLike;
   scene_composite_height_agl?: FloorplanGridLayerLike;
+  scene_prior_diagnostic_height_agl?: FloorplanGridLayerLike;
 };
 
 export type DepthPanelFloorplanRequest = {
@@ -48,6 +53,7 @@ export type DepthPanelRefreshAction =
 export type DepthPanelRefreshResult = {
   handled: boolean;
   action: DepthPanelRefreshAction | null;
+  completed?: boolean;
   error?: string;
 };
 
@@ -59,6 +65,7 @@ type PendingRefresh = {
 const floorplanLayers = (floorplan: FloorplanResponseLike): Array<FloorplanGridLayerLike | undefined> => [
   floorplan.scene_composite_height_agl,
   floorplan.scene_static_height_agl,
+  floorplan.scene_prior_diagnostic_height_agl,
   floorplan.walkable,
   floorplan.obstacle_height,
   floorplan.height_agl,
@@ -95,20 +102,16 @@ export const shouldAdmitFloorplan = (
   existing: FloorplanResponseLike | undefined,
   incoming: FloorplanResponseLike,
 ): boolean => {
-  if (!floorplanHasRenderableGrid(existing)) return true;
-  if (!floorplanHasRenderableGrid(incoming)) return false;
-  const existingTs = floorplanSnapshotTsUs(existing);
-  const incomingTs = floorplanSnapshotTsUs(incoming);
-  if (existingTs === null || incomingTs === null) return true;
-  if (incomingTs < existingTs) return false;
-  if (
-    incomingTs === existingTs
-    && existing?.served_from_cache === false
-    && incoming.served_from_cache === true
-  ) {
-    return false;
+  const existingIsPcf = existing?.scene_prior_only === true
+    && existing?.display_source === 'pcf';
+  const incomingIsPcf = incoming.scene_prior_only === true
+    && incoming.display_source === 'pcf';
+  if (incoming.scene_prior_only === true) {
+    return incomingIsPcf
+      ? floorplanHasRenderableGrid(incoming)
+      : !existingIsPcf;
   }
-  return true;
+  return false;
 };
 
 export const isFloorplanCacheMiss = (
@@ -145,9 +148,9 @@ const responseError = (payload: FloorplanResponseLike): string => String(
 ).trim();
 
 /**
- * Coordinates the manual depth-panel refresh without owning its transport.
- * One fresh floorplan capture is followed by one cache-only depth request
- * bounded to that floorplan's exact fused-snapshot timestamp.
+ * Coordinates a manual static-camera comparison capture without owning its
+ * transport. The response is validated and acknowledged, but never becomes a
+ * presentation action; the visible panel remains bound to PCF.
  */
 export class DepthPanelRefreshCoordinator {
   private sequence = 0;
@@ -200,6 +203,17 @@ export class DepthPanelRefreshCoordinator {
     }
     const error = responseError(payload);
     if (error) return { handled: true, action: null, error };
+    const liveFloorplanError = String(payload.live_floorplan_error ?? '').trim();
+    if (liveFloorplanError) {
+      return { handled: true, action: null, error: liveFloorplanError };
+    }
+    if (
+      payload.scene_prior_only === true
+      || payload.cache_only === true
+      || payload.served_from_cache !== false
+    ) {
+      return { handled: true, action: null, error: 'static_capture_not_fresh' };
+    }
     if (!floorplanHasRenderableGrid(payload)) {
       return { handled: true, action: null, error: 'floorplan_not_renderable' };
     }
@@ -207,15 +221,7 @@ export class DepthPanelRefreshCoordinator {
     if (!Number.isSafeInteger(snapshotTs) || Number(snapshotTs) <= 0) {
       return { handled: true, action: null, error: 'floorplan_snapshot_ts_invalid' };
     }
-    return {
-      handled: true,
-      action: {
-        kind: 'depth-cache',
-        cameraId: pending.cameraId,
-        strategy: 'cache-only',
-        tsMaxUs: Number(snapshotTs),
-      },
-    };
+    return { handled: true, action: null, completed: true };
   }
 
   cancel(cameraIdValue?: unknown): void {

@@ -120,16 +120,23 @@ For a bound camera:
   the exact backend-world prior. It includes room containment, observed-state,
   confidence, boundary distance, obstacle clearance, static height, and stable
   reason codes. It cannot alter the adjacent world fields.
-- `floorplan_response` retains every live layer and adds static and composite
-  layers in the same current `camera_local_ground_m` grid. Live observed cells
-  always win; the prior fills only live unknown cells.
+- A normal fresh `floorplan_response` retains every live layer and adds static
+  and composite layers in the same current `camera_local_ground_m` grid. Live
+  observed cells always win; the prior fills only live unknown cells. This
+  remains the static-camera comparison lane.
+- A `get_floorplan` request with `scene_prior_only=true` is the read-only PCF
+  presentation lane. It bypasses static capture and caches, and derives its
+  full diagnostic raster family and 3D inputs directly from the immutable,
+  camera-bound Scene Prior. It fails explicitly when no enabled prior is bound.
 - The Depth drawer keeps its four established 3D representations: Obstacles,
   Heightfield, Point cloud, and Visible floor. It does not add source-specific
-  duplicate modes. Each representation selects the strongest admitted data
-  available for that camera: purpose-built fixed+phone fusion layers first,
-  the conditioned Scene Prior second, and the live cached depth/floorplan only
-  when no promoted room evidence is bound. Export metadata records the exact
-  fusion/prior identity and which per-view source was selected.
+  duplicate modes. PCF is the canonical and sole reconstruction source for
+  those representations and for the standard Heatmap diagnostics, textured
+  floorplan, derived normals, confidence histogram, and room metrics. Opening
+  the drawer loads PCF automatically. Refresh may still run a fresh static
+  capture for later comparison, but oai2-fe does not admit that response into
+  the displayed drawer state or allow it to replace PCF. Export metadata records
+  the exact prior identity.
 
 V1 deliberately does not infer named furniture, doorway topology, navigation
 policy, occlusion correction, or tracking authority. Those require separate

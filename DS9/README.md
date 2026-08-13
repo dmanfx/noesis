@@ -164,6 +164,15 @@ DS9-native artifact set is rebuilt, checksummed, and given build provenance.
 
 ## Configuration Decisions
 
+- 2026-08-12: A camera-bound prior-conditioned fusion (PCF) Scene Prior is the
+  canonical presentation source for the oai2-fe Depth drawer. Explicit
+  `scene_prior_only` floorplan requests bypass DS9 static capture and caches and
+  derive the Heatmap diagnostics, textured floorplan, and established four 3D
+  representations from that immutable prior. Manual Refresh retains the normal
+  fresh static-frame capture path as comparison evidence, but the frontend
+  validates and discards its response from visible drawer state so it cannot
+  replace PCF.
+
 - 2026-07-11: DS9 depth, analytics, and ReID REST routes share the same
   single-render metric boundary as DS8. Handlers retain their declared FastAPI
   response models and mark model-assembly timing only; the route wrapper

@@ -1246,6 +1246,7 @@ Returned from `get_floorplan` (`DepthStorageManager.generate_topdown_floorplan`)
   "grid_res_m": <optional float>,
   "max_extent_m": <optional float>,
   "cache_only": <optional bool>,
+  "scene_prior_only": <optional bool>,
   "snapshot_ref": "<optional exact depth response reference>",
   "snapshot_id": "<optional exact depth response write ID>",
   "snapshot_content_sha256": "<optional bulk descriptor content_sha256>"
@@ -1258,6 +1259,8 @@ Returned from `get_floorplan` (`DepthStorageManager.generate_topdown_floorplan`)
   "request_id": "<id>",
   "camera_id": "<camera>",
   "cache_only": <bool>,
+  "scene_prior_only": <bool>,
+  "display_source": "pcf"|"static_fallback"|null,
   "served_from_cache": <bool>,
   "ts": <int>,
   "snapshot_ts": <int|null>,
@@ -1320,10 +1323,30 @@ Returned from `get_floorplan` (`DepthStorageManager.generate_topdown_floorplan`)
     "composite_observed_cells": <int>
   },
   "scene_prior_error": "<explicit shadow-composition error; optional>",
+  "scene_prior_diagnostic_height_agl": {"grid_b64": "<base64 float32>", "grid_shape": [<H>,<W>], "value_min": 0, "value_max": <float>},
+  "scene_prior_diagnostic_observed": {"grid_b64": "<float32 0|1>", "grid_shape": [<H>,<W>]},
+  "scene_prior_diagnostic_unknown": {"grid_b64": "<float32 0|1>", "grid_shape": [<H>,<W>]},
+  "scene_prior_diagnostic_surface_rgb": {"rgb_b64": "<base64 uint8 RGB>", "rgb_shape": [<H>,<W>,3]},
+  "scene_prior_diagnostic_meta": {"source": "<manifest source model>", "derivation": "prior_conditioned_fusion_points_and_grid", "prior_id": "<immutable prior id>"},
   "error": "<string optional>"
 }
 ```
 
+- `scene_prior_only=true` is the read-only canonical PCF presentation request.
+  DS9 bypasses static-frame capture, depth/floorplan caches, and MapAnything gate
+  control, then derives the complete diagnostic raster family and point/floor
+  layers from the immutable Scene Prior revision bound to the camera. Success
+  declares `scene_prior_only=true`, `display_source="pcf"`, and the exact
+  `scene_prior_meta.prior_id`. A missing or disabled binding is an explicit
+  error; it is never replaced with a static-camera result.
+- The `scene_prior_diagnostic_*` family includes density, height, height AGL,
+  distance, gradient, obstacle height/mask, walkable/observed/unknown masks,
+  inferred walkable, structural and surface evidence, room footprint and
+  boundaries, measured perimeter, RGB surface color, confidence, and floor
+  support. All grids share the response's calibrated
+  `camera_local_ground_m` bounds and orientation.
+  In `scene_prior_only` mode this family is authoritative, so the response
+  omits the redundant `scene_static_*` and `scene_composite_*` raster copies.
 - `cache_only=true` returns only a contract- and calibration-valid memory/disk
   floorplan cache entry. On a miss it returns
   `error:"no_cached_floorplan"` before snapshot access, floorplan generation,
@@ -1379,6 +1402,13 @@ Returned from `get_floorplan` (`DepthStorageManager.generate_topdown_floorplan`)
   observed cell always owns the composite value. Static evidence may fill only
   a live unknown cell; it never overwrites or relabels the original live
   `height_agl`, `observed`, `unknown`, `walkable`, or structural layers.
+- The oai2-fe Depth drawer uses explicit `scene_prior_only` responses as the
+  sole source for its standard Heatmap diagnostics, derived normals,
+  confidence histogram/metrics, textured floorplan, and four established 3D
+  representations. Opening the drawer requests that PCF payload automatically.
+  Its Refresh control still issues a normal fresh static-frame request for
+  later comparison work, but validates and discards that response from visible
+  drawer state; it cannot replace an admitted PCF response.
 
 The wire payload above is `floorplan_contract_version=10`. DS9 promotion
 uses the separate replayable `noesis.ds9.floorplan-live-gate` schema/contract

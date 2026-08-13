@@ -18,6 +18,7 @@ type ScenePriorCameraView = {
 type ScenePriorPointCloud3DViewProps = {
   cameraId: string;
   expectedPriorId?: string | null;
+  calibrationEpoch?: number;
   onCanvasReady?: (canvas: HTMLCanvasElement | null) => void;
 };
 
@@ -57,6 +58,7 @@ function parseTransform(rows?: number[][]): THREE.Matrix4 {
 export default function ScenePriorPointCloud3DView({
   cameraId,
   expectedPriorId,
+  calibrationEpoch = 0,
   onCanvasReady,
 }: ScenePriorPointCloud3DViewProps) {
   const containerRef = useRef<HTMLDivElement | null>(null);
@@ -285,7 +287,7 @@ export default function ScenePriorPointCloud3DView({
       controller.abort();
       clearModel();
     };
-  }, [cameraId, clearModel, expectedPriorId, frameModel]);
+  }, [calibrationEpoch, cameraId, clearModel, expectedPriorId, frameModel]);
 
   return (
     <div className="calibrated-point-cloud-view scene-prior-point-cloud-view" ref={containerRef}>

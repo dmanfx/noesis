@@ -3993,6 +3993,9 @@ class WebSocketServer:
                         grid_res_m = float(data.get('grid_res_m', data.get('gridResM', 0.5)))
                         max_extent_m = float(data.get('max_extent_m', data.get('maxExtentM', 20.0)))
                         cache_only = bool(data.get('cache_only', data.get('cacheOnly', False)))
+                        scene_prior_only = bool(
+                            data.get('scene_prior_only', data.get('scenePriorOnly', False))
+                        )
                         snapshot_ref = data.get('snapshot_ref', data.get('snapshotRef'))
                         snapshot_id = data.get('snapshot_id', data.get('snapshotId'))
                         snapshot_content_sha256 = data.get(
@@ -4015,6 +4018,7 @@ class WebSocketServer:
                             'request_id': request_id,
                             'camera_id': camera,
                             'cache_only': cache_only,
+                            'scene_prior_only': scene_prior_only,
                         }
                         base_response_model_ms = self.response_model_timing_since(
                             base_response_started_ns
@@ -4037,7 +4041,9 @@ class WebSocketServer:
                             continue
 
                         mode_key = (
-                            "cache"
+                            "scene_prior"
+                            if scene_prior_only
+                            else "cache"
                             if cache_only
                             else "exact"
                             if exact_snapshot_requested
@@ -4076,6 +4082,8 @@ class WebSocketServer:
                         try:
                             provider_start_ns = time.perf_counter_ns()
                             provider_kwargs = {'cache_only': cache_only}
+                            if scene_prior_only:
+                                provider_kwargs['scene_prior_only'] = True
                             if exact_snapshot_requested:
                                 provider_kwargs.update({
                                     'snapshot_ref': snapshot_ref,

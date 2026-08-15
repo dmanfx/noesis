@@ -15,6 +15,15 @@ license: CC-BY-4.0 AND Apache-2.0
 
 # Skill: Run DeepStream MV3DT
 
+## Noesis repository override
+
+When the active workspace is the Noesis repository, read the root and
+`DS9/AGENTS.md` first and stop before the container workflow below. Noesis runs
+only native DS9.1, Docker is prohibited, and MV3DT/AMC remain disabled until
+the Kitchen geometry and Kitchen/Family Room overlap evidence are accepted.
+Use the material below only as an upstream reference outside the Noesis
+application; it is not an executable fallback for Noesis.
+
 ## When to Use This Skill
 
 Activate this skill when the user wants to set up, run, verify, or debug the DeepStream Multi-View 3D Tracking reference app. Typical prompts:

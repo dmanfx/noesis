@@ -17,5 +17,5 @@ Inspect it without installing it globally:
 GST_PLUGIN_PATH="$PWD/DS9/gst-plugins" gst-inspect-1.0 noesisforceidr
 ```
 
-The source is intentionally mirrored instead of linking or loading the DS8
-plugin. DS9 must produce and load its own binary.
+The source is intentionally mirrored instead of linking or loading an archived
+binary. Native DS9.1 must produce and load its own artifact.

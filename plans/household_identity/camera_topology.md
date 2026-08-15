@@ -1,50 +1,40 @@
-# Household Identity — Camera Topology
+# Household identity — camera topology
 
-Defines when the same physical person may legally hold one SID on two cameras.
+This topology governs only StableID exclusivity and handoff. It does not assert
+MV3DT geometry and does not enable AMC.
 
-## Known layout
+## Current source map
 
-- Cameras include **kitchen** and **family-room** with a real FoV overlap region.
-- A third camera (often living-room / other) may have little or no overlap.
-- Exact `source_id` indices depend on the active infer/sources YAML — verify at
-  implementation time; do not assume 0/1/2 without reading the running config.
+The order is verified against `DS9/config/infer.yaml` and recorded in
+`config/camera_topology.yaml`:
 
-## Overlap permit algorithm
+| Source ID | Camera |
+| --- | --- |
+| 0 | Living Room |
+| 1 | Kitchen |
+| 2 | Family Room |
 
-Given candidate assignment of identity `I` already active on camera `A`, and a
-new/updated track on camera `B` wanting `I`:
+## Geometry boundary
 
-1. If `(A,B)` not in enabled overlap pairs → **DENY** (exclusivity).
-2. If either track lacks a valid world/footpoint → **DENY** unless
-   `overlap_allow_appearance_only=false` (default false in household mode).
-   Phase 0 may temporarily allow appearance-only with high sim (≥ 0.85) and
-   log `overlap_permit_degraded=appearance_only` for metrics — record if used.
-3. If `|tA - tB| > max_time_delta_s` → **DENY**.
-4. If `||worldA - worldB|| > max_world_dist_m` → **DENY**.
-5. Optional: if appearance sim < `require_appearance_sim` → **DENY**.
-6. Else **GRANT** `overlap_permit=true` and allow dual-active SID.
+- Kitchen ↔ Family Room: configured identity-overlap candidate.
+- Living Room ↔ Family Room: no overlap.
+- Kitchen ↔ Living Room: close adjacency, not overlap.
 
-Handoff without overlap (person left A, appears on B):
-- Not a dual-active case. Use ghost (same cam) or gallery match after A releases
-  activity (track lost / grace). Do not require overlap permit.
+The Kitchen ↔ Family Room permit is not unconditional. The manager grants it
+only when the pair is enabled and timestamps, world distance, and appearance
+meet the configured bounds. Missing or invalid world evidence denies the
+permit; `overlap_allow_appearance_only` is false.
 
-## Config file
+Handoff after a track has left one camera is not dual-camera activity and uses
+normal continuity/gallery policy.
 
-Create `config/camera_topology.yaml` (see `contracts.md`). Load from
-`ds8_runtime` / StableID manager construction. Missing file → exclusivity
-without permits (safe default: no dual-active).
+## Practical checks
 
-## Calibration dependency
+1. One person genuinely co-visible in Kitchen/Family Room keeps one identity.
+2. Different people in those rooms never share an identity.
+3. Kitchen-to-Family handoff remains continuous after release.
+4. Living/Family and Kitchen/Living never receive a simultaneous overlap
+   permit.
 
-World distances require existing Menon/DS8 world projection to be sane. If world
-quality is `invalid`, do not grant overlap permits. Prefer failing closed
-(unique IDs per camera) over false shares.
-
-## Validation scenes
-
-1. Person standing in kitchen–family overlap → same SID both cams.
-2. Two different people, one in kitchen / one in family (no shared body) →
-   different SIDs even if similarly dressed.
-3. Walk kitchen → family through overlap → continuous SID, brief dual-active OK.
-4. Walk kitchen → living-room with no overlap → SID continues after release,
-   never dual-active during transit gap.
+Do not broaden the overlap graph until current geometry and synchronized video
+prove the physical relationship.

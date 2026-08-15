@@ -1,120 +1,112 @@
-# Noesis: A GPU-Accelerated Video Analytics Pipeline
+# Noesis
 
-Noesis is a high-performance, real-time video analytics application designed for pure GPU processing. It leverages the power of NVIDIA DeepStream to create an end-to-end pipeline that handles everything from video decoding to AI inference and streaming, all on the GPU. This approach minimizes CPU bottlenecks and provides a robust, scalable foundation for demanding video analysis tasks.
+Noesis is a native-host, three-camera spatial-perception application built on
+NVIDIA DeepStream 9.1. It detects and tracks people, maintains household
+identity and canonical world state, estimates object and scene depth, publishes
+telemetry, and feeds the Menon/oai2-fe dashboard.
 
-See diagrams in `docs/reference/pipeline_flow.md`.
+## Current runtime
 
-## Key Features
+- DeepStream 9.1.0, CUDA 13.2, TensorRT 10.16.0.72, GStreamer 1.24.2.
+- Native Python 3.12 environment; Docker is not part of the canonical runtime
+  or build path.
+- Three live `nvurisrcbin` sources: Living Room, Kitchen, and Family Room.
+- YOLO26-m detector, NvDCF tracker, Swin ReID, YOLO26 pose, always-on
+  DepthAnythingV2 object-depth, and gated MapAnything full-frame depth.
+- One GPU H.264 mosaic delivered through SHM/WebRTC. RTSP output is disabled.
+- REST is loopback-only on 8080 and WebSocket/WebRTC signaling is loopback-only
+  on 6008; Menon owns browser-facing authentication and delivery.
+- Baseline tracking is canonical. MV3DT and AMC are disabled pending accepted
+  Kitchen geometry and Kitchen/Family Room overlap evidence.
 
-- **End-to-End GPU Processing**: The entire pipeline, from RTSP stream decoding to AI inference and visualization, runs on the GPU, ensuring maximum performance and minimal latency.
-- **DeepStream-Native**: Built on the NVIDIA DeepStream SDK, Noesis uses optimized GStreamer plugins for all core video processing tasks.
-- **YOLOv11 Integration**: The pipeline uses a custom-parsed YOLOv11 model for primary object detection, with support for other models via configuration.
-- **Advanced Analytics**: Integrated with `nvdsanalytics` for high-level event detection, including:
-    - **ROI (Region of Interest) Filtering**: Monitor specific areas of the video feed.
-    - **Line Crossing Detection**: Trigger events when objects cross a virtual line.
-    - **Direction Detection**: Analyze the direction of object movement.
-    - **Overcrowding Detection**: Monitor the number of objects in a defined area.
-- **Motion-Trail Visualization**: Draw persistent, fading trails behind tracked objects (GPU-rendered via `nvdsosd`) with configurable length, opacity, stride, and optional labels. Features intelligent line budget allocation and frame-rate optimization.
-- **Real-time Streaming**: Processed video and metadata are streamed in real-time to a web-based frontend via WebSockets, allowing for remote monitoring and control.
-- **Configurable Architecture**: Noesis is highly configurable, with the ability to toggle between native DeepStream components and custom Python-based logic for tasks like object tracking and visualization.
-- **Robust and Scalable**: Designed for production environments, with features like automatic pipeline recovery, health monitoring, and support for multiple camera streams.
+DeepStream 8, DeepStream 9.0, and the former DS9.1 container deployment are
+historical. They are not supported runtime alternatives. Their remaining inert
+entrypoints/packages are tracked for destructive removal in
+[`plans/ds91_native_host_only_migration.md`](plans/ds91_native_host_only_migration.md).
 
-## Architecture Overview
+## Architecture at a glance
 
-The Noesis pipeline is divided into two main layers:
-
-1.  **DeepStream Pipeline Layer**: This is the core of the application, where all heavy lifting is done. It's a GStreamer pipeline that uses a series of optimized plugins to:
-    - Decode and batch multiple streams (`nvmultiurisrcbin`).
-    - Preprocess the frames for inference (`nvdspreprocess`).
-    - Run a YOLOv11 object detection model (`nvinfer`).
-    - Track objects across frames (`nvtracker`).
-    - Perform high-level analytics (`nvdsanalytics`).
-    - Overlay visualizations on the video per stream (`nvdsosd` in per-branch paths).
-
-2.  **DS8 Runtime Layer**: This layer coordinates startup, configuration, telemetry, and APIs around the DS8 pipeline:
-    - `noesis/ds8_runtime.py` is the canonical runtime entrypoint.
-    - `noesis/pipelines/ds8_pipeline.py` builds the Service Maker graph and core DeepStream components.
-    - `noesis/pipelines/hooks.py` handles metadata extraction, overlays, analytics wiring, and runtime callbacks.
-    - `websocket_server.py` streams telemetry, tracking, BEV, and WebRTC signaling to clients.
-    - `noesis/server/*.py` provides the FastAPI endpoints used by the DS8 runtime REST service.
-
-For a more detailed breakdown of the pipeline, see the `docs/reference/DEEPSTREAM_PIPELINE_MAP.md`.
-
-## Getting Started
-
-### Prerequisites
-
-- **Hardware**: An NVIDIA GPU with CUDA support (Turing architecture or later recommended).
-- **Software**:
-    - Ubuntu 20.04 or later.
-    - NVIDIA DeepStream 6.0 or later.
-    - Python 3.8 or later.
-    - GStreamer and its development libraries.
-
-### Installation
-
-1.  **Clone the repository**:
-    ```bash
-    git clone https://github.com/your-username/noesis.git
-    cd noesis
-    ```
-
-2.  **Install Python dependencies**:
-    ```bash
-    pip install -r requirements.txt
-    ```
-
-3.  **Activate DeepStream environment (once per shell)**:
-    ```bash
-    source ./activate_deepstream.sh
-    # Optional sanity check
-    gst-inspect-1.0 nvmultiurisrcbin | head -n 5
-    ```
-
-4.  **Configure the pipeline**:
-    - Set stream + pipeline topology in `config/infer.yaml` (or another runtime YAML passed via `--pipeline-config`).
-    - Set camera metadata/intrinsics in `config/cameras.yaml` (or another YAML passed via `--cameras-config`).
-    - Review DeepStream config files under `pipelines/` for model, tracker, preprocess, and analytics tuning.
-
-### Running the Application
-
-Use the DS8 runtime harness as the canonical entrypoint:
-
-```bash
-python3 noesis/ds8_runtime.py \
-  --pipeline-config config/infer.yaml \
-  --cameras-config config/cameras.yaml
+```mermaid
+flowchart LR
+    CAM[3 RTSP cameras] --> DS[Native DeepStream 9.1 pipeline]
+    DS --> PERCEPTION[Detection · tracking · ReID · pose · depth]
+    PERCEPTION --> WORLD[Canonical observations and world state]
+    WORLD --> WS[Authenticated WS telemetry :6008]
+    DS --> MEDIA[H.264 SHM/WebRTC]
+    DS --> REST[Authenticated REST :8080]
+    WS --> MENON[Menon gateway]
+    MEDIA --> MENON
+    REST --> MENON
+    MENON --> UI[oai2-fe dashboard]
 ```
 
-Example with V3DT tracking mode and REST disabled:
+The detailed graph and authority boundaries are in
+[`DS9/PIPELINE_GRAPH.md`](DS9/PIPELINE_GRAPH.md) and
+[`docs/CODEBASE_DESCRIPTION.md`](docs/CODEBASE_DESCRIPTION.md).
+
+## Repository map
+
+| Path | Purpose |
+| --- | --- |
+| `DS9/` | Canonical DeepStream 9.1 adapter, configs, native sources, parsers, scripts, and tests |
+| `noesis/` | Shared application services, telemetry, metadata, identity, depth, and world logic |
+| `noesis_core/` | SDK-neutral contracts, state, scene, validation, and lifecycle primitives |
+| `config/` | Shared camera, analytics, calibration, and world-policy configuration |
+| `oai2-fe/` | Noesis diagnostics/dashboard frontend delivered through Menon |
+| `docs/` | Current architecture, contracts, operating guidance, and history index |
+| `plans/` | Active work orders; completed/superseded plans are under `plans/archive/` |
+
+## Operating the installed application
+
+The user service owns the canonical runtime. Use the existing service rather
+than starting a second process:
 
 ```bash
-python3 noesis/ds8_runtime.py \
-  --pipeline-config config/infer_v3dt_baseline.yaml \
-  --cameras-config config/cameras.yaml \
-  --tracking-mode v3dt \
-  --disable-rest
+systemctl --user status noesis-appliance.service
+systemctl --user restart noesis-appliance.service
 ```
 
-To start the dashboard UI in development mode run the following inside `electron-frontend`:
+The native supervisor validates the host, virtual environment, secrets, model
+realization, and pipeline config before opening cameras:
 
 ```bash
-npm install
-npm run dev
+NATIVE_ENV_FILE="$(
+  systemctl --user show noesis-appliance.service \
+    -p EnvironmentFiles --value --no-pager |
+    awk '$1 ~ /\/native\.env$/ { print $1; exit }'
+)"
+test -n "$NATIVE_ENV_FILE" && test -f "$NATIVE_ENV_FILE"
+set -a
+. "$NATIVE_ENV_FILE"
+set +a
+
+"${NOESIS_DS91_NATIVE_ROOT}/venv/bin/python" \
+  DS9/scripts/run_canonical_runtime_host.py check
 ```
 
-For a production build run `npm run build` and then launch Electron with `npm start`. This will open the bundled `dist/index.html` automatically.
+Do not run the supervisor's `run` mode beside systemd; ports 6008 and 8080 are
+single-owner resources.
+
+## Development and validation
+
+Start with the relevant NVIDIA skill routed by
+[`DS9/docs/deepstream_9_1_agent_skills.md`](DS9/docs/deepstream_9_1_agent_skills.md).
+Then use the smallest focused checks for the changed component and one direct
+live or recorded smoke when the application path is affected. Do not stage an
+appliance release or create candidate/selector ceremony for normal work.
+
+See [`docs/testing_guide.md`](docs/testing_guide.md) for practical commands.
 
 ## Documentation
 
-- `docs/reference/DEEPSTREAM_PIPELINE_MAP.md`: Detailed map of the entire pipeline, from input to output.
-- `docs/reference/pipeline_flow.md`: High-level architecture with Mermaid diagrams.
-- `docs/reference/Static_ROI_Exclusion.md`: ROI exclusion plugin usage, stream ID vs pad index mapping, and stream shuffle checklist.
-
-## Contributing
-
-Contributions are welcome! Please feel free to submit a pull request or open an issue if you have any suggestions or improvements.
-
-## License
-
-This project is licensed under the MIT License.
+- [`docs/README.md`](docs/README.md): current documentation index.
+- [`docs/runtime_baseline.md`](docs/runtime_baseline.md): exact runtime and
+  performance baseline.
+- [`docs/api_contracts_ws.md`](docs/api_contracts_ws.md),
+  [`docs/api_contracts_rest.md`](docs/api_contracts_rest.md), and
+  [`docs/metadata_contracts.md`](docs/metadata_contracts.md): public/internal
+  application contracts.
+- [`docs/architecture_decisions.md`](docs/architecture_decisions.md): current
+  decisions and rationale.
+- [`docs/upgrade_history.md`](docs/upgrade_history.md): dated upgrade record.
+- [`docs/history/README.md`](docs/history/README.md): historical archive map.

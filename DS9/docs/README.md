@@ -1,97 +1,44 @@
-# DS9 Docs Index
+# DS9.1 documentation index
 
-This directory is the launch handoff for the DeepStream 9.1 Noesis app under
-`DS9/`.
+Status: native-host baseline, 2026-08-15.
 
-## Read First
+## Current operational docs
 
-1. `deepstream_9_1_direct_upgrade_plan.md` - active direct-upgrade target,
-   execution order, minimal parity checks, rollback, and deferred MV3DT/AMC
-   boundary.
-2. `../README.md` - current DS9.1 launch status, runtime ownership boundary, build
-   order, run commands, and latest validation summary.
-3. `migration_state.md` - detailed migration state, validated gates, and
-   remaining work.
-4. `known_blockers.md` - active caveats and resolved blockers.
-5. `validation_runbook.md` - commands for the next validation pass.
-6. `driver_595_migration.md` - checkpointed host-driver maintenance, DS8
-   acceptance, and offline rollback boundary.
-7. `driver_580_rollback_rehearsal_2026-07-10.md` - exact non-mutating rollback
-   evidence, corrected solver transaction, ordered recovery, and post-reboot
-   DS8 acceptance contract.
-8. `secondary_docker_staging.md` - isolated DS9 image, external artifact,
-   canonical engine-build, capacity, and rollback workflow.
-9. `runtime_container_boundary.md` - canonical isolated-container plan/run,
-   mount security, profile policy, lifecycle, cleanup, and evidence contract.
-10. `runtime_ownership.yaml` - machine-readable shared/adapter/duplicate
-   ownership and capability-parity state.
-11. `../asset_manifest.yaml` plus `asset_manifest.schema.json` - expected
-   DS9-owned assets, compatibility, staging state, and provenance contract.
-12. `canonical_world.md` - canonical observations, world snapshots, artifact
-   fingerprints, time semantics, identity generations, and capability health.
-13. `bev_capture_event_integration.md` - canonical BEV ownership, exact paired
-    publication, active-floorplan authority lifecycle, raw-only capture fusion,
-    GPU-first RGB boundary, and the v4 live acceptance contract.
+1. [`../README.md`](../README.md): runtime ownership, versions, lane, and start
+   point.
+2. [`../PIPELINE_GRAPH.md`](../PIPELINE_GRAPH.md): exact graph and data flow.
+3. [`runtime_host_boundary.md`](runtime_host_boundary.md): native environment,
+   preflight, lifecycle, readiness, and security boundary.
+4. [`validation_runbook.md`](validation_runbook.md): focused direct checks.
+5. [`deepstream_9_1_agent_skills.md`](deepstream_9_1_agent_skills.md): required
+   skill routing and repository pin overrides.
+6. [`../DS9_REBUILD_AND_SMOKE_GATES.md`](../DS9_REBUILD_AND_SMOKE_GATES.md):
+   affected-artifact rebuild and smoke guidance.
 
-## Current Position
+## Current product/model docs
 
-The active target is DeepStream 9.1 on the exact image, SDK, CUDA, TensorRT,
-and driver contract recorded in `deepstream_9_1_direct_upgrade_plan.md`.
-Source/toolchain pinning and focused contract tests are complete, and the exact
-official base has been pulled and inspected. The derived image, compiled
-artifacts, engines, and runtime validation remain open. All dated 9.0 image
-IDs, engine hashes, and validation reports in this directory remain historical
-comparison evidence and must not be reused as 9.1 artifact proof.
+- [`canonical_world.md`](canonical_world.md): observation and world authority.
+- [`bev_capture_event_integration.md`](bev_capture_event_integration.md): BEV,
+  active floorplan, and exact capture publication.
+- [`MapAnything_Depth.md`](MapAnything_Depth.md): selected full-frame manual
+  depth lane.
+- [`DA3Metric_Large.md`](DA3Metric_Large.md): optional manual depth profile,
+  not selected by default.
+- [`Static_ROI_Exclusion.md`](Static_ROI_Exclusion.md): native exclusion plugin
+  and transactional reload behavior.
+- [`asset_manifest.schema.json`](asset_manifest.schema.json) and
+  [`runtime_ownership.yaml`](runtime_ownership.yaml): machine-readable asset and
+  source ownership contracts.
 
-DS9 runtime execution is owned by:
+## Capability state
 
-- `DS9/noesis/ds9_runtime.py`
-- `DS9/noesis/ds9_runtime_core.py`
+The baseline lane is YOLO26-m + NvDCF with Swin ReID, YOLO26 pose, always-on
+DAv2 tracking depth, gated MapAnything depth, WebRTC media, and JSON BEV. MV3DT
+and AMC are disabled pending the documented Kitchen geometry/overlap gate.
 
-DS9 executable code must not import or spawn `noesis/ds8_runtime.py`, or import
-DS8 preflight helpers. The static prep and ownership checks enforce that
-boundary.
+## History
 
-DS9 is not yet a hermetic standalone repository. It still consumes parent-repo
-shared application context such as `config/cameras.yaml`, common calibration and
-geometry helpers, WebSocket server code, and a few root validation clients. That
-is an explicit packaging boundary, not a DS8 runtime fallback.
-
-## Active Docs
-
-- `deepstream_9_1_direct_upgrade_plan.md` - active, parity-first direct upgrade
-  from 9.0 to 9.1, including the disabled MV3DT topology and AMC deferment.
-- `known_blockers.md` - current blocker/caveat list.
-- `migration_state.md` - detailed state and historical validation evidence.
-- `validation_runbook.md` - operator validation commands.
-- `driver_595_migration.md` - exact driver-only migration, DS8 regression, and
-  offline 580 rollback runbook.
-- `driver_580_rollback_rehearsal_2026-07-10.md` - validated offline cache,
-  dependency transaction, recovery order, and the remaining reboot boundary.
-- `secondary_docker_staging.md` - fail-closed secondary Docker and canonical
-  plus promoted Wholebody49/V3DT engine maintenance workflow.
-- `runtime_container_boundary.md` - fail-closed canonical live-canary
-  supervisor, immutable/read-write mount split, exclusive ownership, and
-  private evidence.
-- `../DS9_REBUILD_AND_SMOKE_GATES.md` - ordered V3DT no-GPU plans,
-  exclusive-GPU builds, and live bbox3d/world/identity acceptance gates.
-- `MapAnything_Depth.md` - MapAnything depth behavior notes.
-- `DA3Metric_Large.md` - official DA3Metric-Large export, FP16 engine,
-  restart-scoped manual-depth selector, metric scaling, and validation record.
-- `MapAnything_Depth_Panel_Quality_Plan.md` - measured inference, fusion,
-  floorplan, 2D, and 3D quality program.
-- `MapAnything_HR0_Runbook.md` - isolated FP32 `378x672` export, fixture,
-  source-inspection, build, and benchmark workflow.
-- `canonical_world.md` - canonical world and capability-health adapter contract.
-- `bev_capture_event_integration.md` - shared BEV/fusion implementation and v4
-  live-promotion acceptance boundary.
-- `Static_ROI_Exclusion.md` - ROI exclusion behavior notes.
-
-## Historical Reference
-
-`history/ds8/` contains copied DS8-era contract/reference documents and the
-DS8 design-decision ledger. Keep them only as migration evidence until a later
-docs pass rewrites the remaining contracts into DS9-native names.
-
-Do not use historical DS8 docs as permission to route DS9 execution through DS8
-runtime paths, DS8 engines, or DS8 native extension binaries.
+[`history/README.md`](history/README.md) indexes the DS8 migration copies,
+DS9.0/container deployment material, completed 9.1 upgrade plans, bridge audits,
+and model experiments. Those files are evidence only and must not be used as
+current run/build instructions.

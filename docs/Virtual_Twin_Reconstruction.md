@@ -10,17 +10,17 @@ versioned GLB/JSON artifacts that Noesis writes under
 
 The living-room builder combines four evidence sources:
 
-- RGB keyframes captured from the configured DS8 camera source.
-- DS8-persisted MapAnything Zarr snapshots from `data/depth/<camera>/...`.
+- RGB keyframes captured from the configured DS9.1 camera source.
+- DS9.1-persisted MapAnything Zarr snapshots from `data/depth/<camera>/...`.
 - ZeroPlane plane masks/normals/depth estimates for the same keyframes.
 - Menon structural surfaces parsed from the SweetHome3D OBJ.
 
-The builder triggers `POST /api/v1/depth/refresh?seconds=N` on the DS8 runtime
+The builder triggers `POST /api/v1/depth/refresh?seconds=N` on the DS9.1 runtime
 REST API before each keyframe unless `--no-mapanything-refresh` is explicitly
 passed. In the split dev setup, the standalone virtual-twin artifact API uses
-port `8080` and the DS8 runtime depth API uses port `8082`; override the
+port `8080` and the DS9.1 runtime depth API uses port `8082`; override the
 refresh URL with `--mapanything-refresh-url` when those ports differ. That means
-the virtual twin consumes the same MapAnything path that the DS8 pipeline
+the virtual twin consumes the same MapAnything path that the DS9.1 pipeline
 persists to disk; it does not switch to the always-on DAv2 tracking lane as a
 geometry source.
 

@@ -1,102 +1,67 @@
-# Household Identity Rework
+# Household identity
 
-Status: runtime/product implementation complete at offline gates; authoritative
-identity remains blocked on qualifying benchmark and household evidence.
+Status: application implementation is present in the native DeepStream 9.1
+baseline. Final authority still depends on the qualifying household evidence
+listed in `work_order.md` and `validation.md`.
 
-Transform Noesis StableID from an open-world ReID minting engine into a
-**closed-world household identity system** with geometry-aware multi-camera
-association, quality-gated galleries, and a stronger ReID backbone — while
-keeping the DS8 path GPU-first and low-latency.
+The goal is a closed-world household identity system: a small enrolled resident
+set, bounded visitor identities, geometry-aware multi-camera association, and
+quality-gated Swin embeddings without CPU-frame extraction.
 
-## Problem statement
+## Current data flow
 
-Current StableID does a decent job of cross-camera ReID, but:
-
-1. The same SID can appear on two cameras for **different** people (false share).
-2. Kitchen ↔ family-room FoV overlap means the **same** person can legitimately
-   appear on both cameras at once — exclusivity must allow that case.
-3. SID values climb into the thousands because the system mints freely, then
-   auto-merges aliases as cleanup. Live state showed gallery SID ~4132 and
-   504 alias mappings (222 collapsing into SID 358).
-4. Pose fusion exists in the manager but is not wired from hooks.
-5. Soft `max_total_ids` does not create a true closed resident set.
-
-User goal: consistently ID ~4 household residents day-to-day, with ≤10–15 total
-people over short windows, then alias residents to human names.
-
-## Doctrine
-
-```text
-tracklet (sensor, tracker_id)
-  + ReID embedding (SGIE, zero-copy tensor meta)
-  + pose features (optional boost)
-  + world/BEV footpoint (geometry)
-        │
-        ▼
-  Identity Resolver
-        │
-        ├── resident gallery (enrolled, stable, named)
-        ├── visitor gallery (ephemeral, TTL)
-        └── overlap permit (camera topology + world distance)
-        │
-        ▼
-  public identity: resident_id | visitor_id | provisional
+```mermaid
+flowchart LR
+    TRACK[DS9.1 NvDCF track] --> JOIN[DS9.1 identity hook]
+    REID[Swin SGIE tensor meta] --> JOIN
+    POSE[Pose and quality evidence] --> JOIN
+    WORLD[Fresh world/BEV footpoint] --> JOIN
+    TOPO[Accepted camera topology] --> JOIN
+    JOIN --> RESOLVE[StableID manager]
+    RESOLVE --> RESIDENT[Enrolled resident]
+    RESOLVE --> VISITOR[TTL visitor]
+    RESOLVE --> PROVISIONAL[Withheld provisional]
+    RESIDENT --> WIRE[tracking/world telemetry]
+    VISITOR --> WIRE
 ```
 
-## Workstream files
+The only prospective co-visibility edge is Kitchen ↔ Family Room and it remains
+disabled until the geometry and synchronized overlap evidence are accepted.
+Living Room ↔ Family Room do not overlap. Kitchen ↔ Living Room are adjacent,
+not overlapping.
+
+## Current implementation
+
+- `reid/stable_id_manager.py` owns identity assignment, resident/visitor state,
+  assignment constraints, and gallery policy.
+- `DS9/noesis/ds9_runtime_core.py` constructs the process-owned manager.
+- `DS9/noesis/pipelines/hooks.py` joins tracker, ReID, pose, and world evidence.
+- `noesis/server/reid_api.py` exposes enrollment and alias operations.
+- `DS9/pipelines/config_infer_secondary_reid_swin.ini` is the selected ReID
+  SGIE; `DS9/config/infer.yaml` selects it.
+
+MV3DT is not part of the active identity path. Older DS8 implementation phase
+documents are retained under
+`plans/archive/completed/household_identity_ds8_implementation/` only to explain
+how the current contracts evolved.
+
+## Active records
 
 | File | Role |
-|------|------|
-| `AGENTS.md` | Agent operating rules |
-| `README.md` | This overview |
-| `work_order.md` | Ordered checklist + gates |
-| `decisions.md` | Locked design decisions |
-| `contracts.md` | WS/REST/schema contracts |
-| `performance.md` | Zero-copy / latency budgets |
-| `validation.md` | Acceptance tests and metrics |
-| `camera_topology.md` | Overlap graph for kitchen/family-room |
-| `phase0_stop_the_bleeding.md` | Exclusivity, pose wire, reset, telemetry |
-| `phase1_closed_world.md` | Resident/visitor spaces + mutex |
-| `phase2_sota_matching.md` | Backbone, quality gallery, assignment |
-| `phase3_enrollment_product.md` | Names, enrollment UX, health reports |
-| `calibration_and_enrollment.md` | Correlation-aware artifact v2, two-stratum authority, owner enrollment, migration review |
+| --- | --- |
+| `work_order.md` | Remaining acceptance and optional work |
+| `decisions.md` | Identity-specific design decisions |
+| `contracts.md` | Identity fields and lifecycle contracts |
+| `camera_topology.md` | Overlap/exclusivity authority |
+| `calibration_and_enrollment.md` | Evidence, calibration, and enrollment gates |
+| `performance.md` | Embedding and latency budgets |
+| `validation.md` | Focused and household acceptance checks |
 
-## Phase summary
+## Acceptance target
 
-### Phase 0 — Stop the bleeding
-Archive poisoned gallery/aliases; disable pressure auto-merge; enforce
-geometry-aware exclusivity (overlap exception); wire pose into `update()`;
-raise embedding budget carefully; emit confidence/reject telemetry.
-
-### Phase 1 — Closed-world identity
-Split resident vs visitor ID spaces; provisional public suppression; hard
-global mutex with overlap permits; retire reliance on `_public_stable_id`
-band-aids.
-
-### Phase 2 — SOTA matching
-Default/harden Swin-Tiny ReID (already in `config/infer.yaml`); optional
-SOLIDER upgrade path; quality-gated gallery updates; multi-exemplar outfit
-clusters; Hungarian/MNN assignment; spatiotemporal handoff using topology+BEV.
-
-### Phase 3 — Product layer
-Enrollment API + UI; human name aliases bound to resident UUID; suggest-only
-merges; nightly identity health report.
-
-## Related code (current)
-
-- `reid/stable_id_manager.py` — identity engine
-- `noesis/pipelines/hooks.py` / `hooks_v3dt_reimpl.py` — embedding extract + assign
-- `noesis/ds8_runtime.py` — manager construction / env knobs
-- `noesis/server/reid_api.py` — alias REST
-- `pipelines/config_infer_secondary_reid_swin.ini` — default ReID SGIE
-- `pipelines/config_infer_secondary_reid_osnet.ini` — legacy OSNet SGIE
-- `native/noesis_reid_meta_ext.cpp` — zero-copy tensor unwrap
-
-## Success metric (14-day home validation)
-
-- Resident SID space ≤ enrolled count
-- Visitor SIDs ≤ ~20 with recycle
-- Zero false same-SID shares across cameras for different people
-- True overlap co-visibility keeps the same SID
-- Cross-camera handoff recall for residents >90% within 30s
-- False merge rate ≈ 0 under manual audit
+- resident identity count stays within the enrolled household;
+- visitor identities remain bounded and recycle by policy;
+- no false same-identity sharing across non-overlapping cameras;
+- accepted overlap co-visibility preserves one identity;
+- resident handoff recall exceeds the recorded target in `validation.md`;
+- no material regression to the accepted three-camera FPS/latency baseline.

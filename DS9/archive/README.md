@@ -12,6 +12,6 @@ not needed for the DS9 pose SGIE target because the active pose config is the
 DS9-documented tensor-output shape: `network-type=100` plus
 `output-tensor-meta=1`, with no `custom-lib-path` or parser function reference.
 
-Keep the archived source as historical evidence only. The first DS9 port should
-consume pose tensors through metadata and `noesis_pose_meta_ext`, while the
-metadata bridge remains in the active rebuild/smoke-test plan.
+Keep the archived source as historical evidence only. Native DS9.1 consumes
+pose tensors through metadata and `noesis_pose_meta_ext`; the selected pose
+engine/parser contract is recorded in `DS9/asset_manifest.yaml`.

@@ -1,7 +1,5 @@
-# MapAnything Depth (DS9)
-_Status: reconciled on 2026-07-25. Isolated three-camera exact-RGB and
-fresh/cache-only contract validation passed; production promotion and absolute
-depth-accuracy acceptance remain separate._
+# MapAnything depth
+_Status: canonical native DS9.1 manual-depth lane, updated 2026-08-15._
 
 MapAnything is a first-class DS9 depth component, but it is not the only
 depth-related path in the runtime.
@@ -14,14 +12,15 @@ DS9 currently uses two distinct depth lanes:
   - Full-frame SGIE branch in the live DS9 pipeline.
   - On-demand and gate-controlled.
   - Owns the `depth_result` WebSocket payload and `get_ma_depth` RPC contract.
-  - Persists dense full-frame snapshots under `DS9/data/depth/...`.
+  - Persists dense full-frame snapshots below the native runtime root selected
+    by `NOESIS_DS9_RUNTIME_ROOT`.
 - `models.depth_tracking`
-  - Full-frame Depth Anything V2 metric lane used by baseline non-`v3dt`
+  - Full-frame Depth Anything V2 metric lane used by the active baseline
     world tracking.
   - Always on in baseline mode.
   - Does not publish a second full-frame depth WebSocket stream.
   - Contributes through `NOESIS.OBJECT_DEPTH` and the fused backend world
-    estimator in `noesis/pipelines/hooks.py`.
+    estimator in `DS9/noesis/pipelines/hooks.py`.
 
 MapAnything also acts as the offline reference source for the DAv2 room
 registration artifact used by baseline tracking.
@@ -127,7 +126,7 @@ MapAnything-specific. They are not reused for the baseline DAv2 tracking lane.
 
 ## Offline DAv2 -> MapAnything Registration
 
-Baseline non-`v3dt` world tracking now requires a prebuilt registration artifact
+Baseline world tracking requires a prebuilt registration artifact
 that maps raw DAv2 anchor range into MapAnything-aligned room range.
 
 Canonical pieces:
@@ -198,22 +197,17 @@ Baseline room-relative tracking remains:
   - proves one native capture surface, exact UID/layers/batch ownership,
     exact probe-local copy bound/timing, fail-fast attachment, bounded async
     handoff, poisoned-final-job detection, and joined teardown
-- Isolated live contract gate, after intentionally starting a canonical DS9
-  validation session and obtaining its exact runtime identity:
-  `python3 DS9/scripts/ds9_floorplan_live_gate.py --session-id "$SESSION_ID" --runtime-lane baseline --runtime-instance-id "$RUNTIME_INSTANCE_ID" --runtime-run-id "$RUNTIME_RUN_ID" --out "$RESULT_DIR/mapanything-depth-quality.json" --source-out "$RESULT_DIR/mapanything-depth-quality-source.json"`
-  - manually requests fresh capture for each configured camera, requires
-    same-buffer exact RGB evidence, then proves passive/cache-only requests
-    cause zero snapshot mutation
-- `python3 DS9/scripts/ma_depth_rpc_smoke_test.py --no-spawn`
-  - manually requests and validates a live `ma_depth_response`; it is not a
-    passive/cache-only check
+- Direct live contract gate against the managed native runtime:
+  `python3 DS9/scripts/ma_depth_rpc_smoke_test.py --no-spawn`
+  - manually requests one live `ma_depth_response` and validates its exact
+    component descriptors and request identity
 - `python3 DS9/scripts/build_depth_registration.py --help`
   - validates builder surface
-- `timeout 45s python3 DS9/noesis/ds9_runtime.py --pgie-profile yolo26 --size m --disable-rest`
-  - proves DS9 can start with the current registration artifact and detector
-    profile
 
-The 2026-07-25 isolated live gate passed all three configured cameras with
+Use one `scene_prior_only` floorplan request when PCF presentation changed, or
+one fresh request when capture/storage changed. Do not rerun every camera or
+start a second runtime unless the result is ambiguous.
+
+The retained 2026-07-25 live gate passed all three configured cameras with
 `1920x1080` `rgb8` evidence and cache-only zero mutation. It proves exact
-capture identity and request behavior, not appliance promotion or metric
-ground-truth accuracy.
+capture identity and request behavior, not metric ground-truth accuracy.

@@ -1,51 +1,62 @@
-# AGENTS.md – `plans/household_identity/`
+# AGENTS.md — Household identity
 
-Operating rules for the Household Identity / StableID–ReID rework.
+This directory tracks the remaining StableID/household-identity acceptance work
+for the canonical native DeepStream 9.1 application.
 
 ## Policy precedence
 
-- Extends root `AGENTS.md` and `plans/AGENTS.md`.
-- DS8 rules still apply: canonical path under `noesis/`, no hidden fallbacks, GPU-first / zero-copy where DeepStream supports it, no guessed DeepStream APIs.
-- This directory is the authoritative task definition for identity work. If code and these plans disagree, update the plan or record a design decision — do not silently invent behavior.
+- Root `AGENTS.md` and `plans/AGENTS.md` apply.
+- Historical DS8 implementation notes were moved to
+  `plans/archive/completed/household_identity_ds8_implementation/` and are not
+  runtime instructions.
+- `work_order.md` is the active checklist; `decisions.md` and `contracts.md`
+  define the current product behavior.
 
-## Required read order
+## Required reading
 
-1. `AGENTS.md` (this file)
-2. `README.md`
-3. `decisions.md`
-4. `contracts.md`
-5. `work_order.md`
-6. The phase doc for the active task (`phase0_*.md` … `phase3_*.md`)
-7. `performance.md` before any change that touches embeddings, gallery matching, or per-frame budgets
-8. `validation.md` before claiming a phase complete
-9. Relevant runtime docs: `docs/DS8_api_contracts_ws.md`, `docs/DS8_api_contracts_rest.md`, `docs/DS8_testing_guide.md`
+1. `README.md`
+2. `work_order.md`
+3. `decisions.md` and `contracts.md`
+4. `camera_topology.md` for overlap or exclusivity work
+5. `performance.md` before changing embedding or per-frame budgets
+6. `validation.md` before claiming identity authority or acceptance
+7. `docs/api_contracts_ws.md`, `docs/api_contracts_rest.md`, and
+   `docs/testing_guide.md` for current application boundaries
 
-## Non-negotiable product rules
+## Product rules
 
-1. **Closed-world residents.** Enrolled household members occupy a small stable resident ID space. Day-to-day matching retrieves against that gallery; it does not mint unbounded SIDs for known people.
-2. **Visitors are ephemeral.** Unknown people get visitor slots with TTL recycle. Visitor minting must not pollute resident numbering.
-3. **Global exclusivity with FoV-overlap exception.** A SID may be active on two cameras only when geometry (and optionally appearance) supports the same physical person in a configured overlap region. Different people must never share a SID.
-4. **Provisional ≠ public.** Weak / no-embedding / confirming tracks must not mint permanent public IDs.
-5. **No auto-merge under pressure.** Alias merges are enrollment/user-driven (or high-confidence suggest-only). Do not use auto-merge as a substitute for correct matching.
-6. **Zero-copy / low-latency.** Prefer SGIE tensor meta → native extract → numpy view / GPU matmul. Do not add CPU crop→torchreid paths on the DS8 runtime. Do not raise per-frame embedding budgets without measuring detection-wake cost.
-7. **No poisoned-state carryover.** Identity state files that encode historical fragmentation must be archived/reset as part of cutover, not silently reused.
+- Residents use a bounded, enrolled identity space; visitors are ephemeral.
+- Provisional evidence does not mint a permanent public identity.
+- A stable identity may be co-visible only across an accepted overlap edge and
+  only when fresh geometry and appearance evidence support the same person.
+- No pressure-driven auto-merge or hidden identity fallback is allowed.
+- Use Swin ReID tensor metadata from the canonical DS9.1 SGIE/native bridge.
+  Do not add CPU crop-to-TorchReID extraction or raise embedding budgets without
+  measuring the live three-camera path.
+- Preserve `stable_id` as the public identity; tracker IDs remain process-local.
 
-## Implementation boundaries
+## Canonical implementation boundary
 
-- Primary code: `reid/stable_id_manager.py`, `noesis/pipelines/hooks.py`, `noesis/pipelines/hooks_v3dt_reimpl.py`, `noesis/ds8_runtime.py`, `noesis/server/reid_api.py`, ReID SGIE configs under `pipelines/`, models under `models/`.
-- Do not route identity through deprecated pre-DS8 runtimes.
-- Do not treat V3DT `_public_stable_id` remapping as the real identity fix; it may remain as a temporary UI shim only until closed-world IDs land, then retire or reduce to pass-through.
-- Portable paths only (no new `/home/...` hardcodes).
+- Identity engine: `reid/stable_id_manager.py`
+- Runtime construction: `DS9/noesis/ds9_runtime_core.py`
+- Per-frame integration: `DS9/noesis/pipelines/hooks.py`
+- REST service: `noesis/server/reid_api.py`
+- ReID config: `DS9/pipelines/config_infer_secondary_reid_swin.ini`
+- Pipeline selection: `DS9/config/infer.yaml`
+- Camera topology: `config/camera_topology.yaml`
 
-## Progress updates
+MV3DT remains disabled. Do not use an MV3DT remap as an identity solution or
+enable cross-camera overlap outside the geometry boundary recorded in
+`camera_topology.md`.
 
-- Update `work_order.md` checkboxes after each coherent unit of work.
-- Add a dated one-line note under completed items.
-- Non-trivial design changes → `decisions.md` and a short entry in `plans/DS8/ds8_design_decisions.md`.
-- After docs/AGENTS edits: run `./scripts/check_agents_docs_consistency.py`.
+## Work and validation
 
-## Parallelism guidance for subagents
-
-- Prefer one phase owner at a time for `reid/stable_id_manager.py` (high conflict risk).
-- Safe parallel tracks: backbone/export scripts, REST/enrollment API, frontend alias UX, unit tests, docs/contracts, camera-topology config.
-- Always re-read `contracts.md` before changing WS/REST fields.
+- Change the smallest producer/contract/consumer surface.
+- Run focused identity tests and one bounded recorded or live identity smoke
+  when runtime behavior changes.
+- Do not stage releases, build candidates, or run broad suites for ordinary
+  identity work.
+- Update `work_order.md` only when an item is actually complete. Record durable
+  design changes in both `decisions.md` and `docs/architecture_decisions.md`.
+- After documentation changes, run
+  `./scripts/check_agents_docs_consistency.py` and `git diff --check`.

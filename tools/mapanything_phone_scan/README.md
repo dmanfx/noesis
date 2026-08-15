@@ -19,7 +19,7 @@ the fixed Noesis alignment and validation reference. A static frame is not
 silently mixed into phone-only inference or fusion.
 
 This tool saves review candidates. It does not automatically publish them into
-the live DS8/DS9 depth, tracking, floorplan, or virtual-twin contracts.
+the live native DS9.1 depth, tracking, floorplan, or virtual-twin contracts.
 
 The canonical fusion decision, validation basis, authority boundaries, and
 repeat-for-another-room procedure are in

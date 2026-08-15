@@ -1,10 +1,14 @@
 # Kitchen V3DT tracking candidate
 
+Status: archived experimental profile. MV3DT is disabled in the canonical
+native DS9.1 application. The Kitchen geometry is not accepted, so this profile
+must not be launched or promoted.
+
 This profile preserves the accepted living-room work and the best current
 Kitchen no-image-Y-flip projection, but it is not an optimized or promoted
 Kitchen profile. It remains isolated from the non-V3DT lane.
 
-Select it with:
+Historical reproduction command (not a current operating command):
 
 ```bash
 NOESIS_CAMERA_CALIBRATION_FILE="$PWD/DS9/config/v3dt/living_kitchen_tracking_candidate/camera_calibration.json" \

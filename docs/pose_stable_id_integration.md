@@ -1,7 +1,7 @@
-# DS8 Pose-Assisted StableID Integration
-_Status: current as of 2026-02-02._
+# Pose-assisted StableID integration
+_Status: canonical native DS9.1 behavior, updated 2026-08-15._
 
-This note records how pose features are used to strengthen StableID assignment in the DS8 pipeline.
+This note records how pose features are used to strengthen StableID assignment in the DS9.1 pipeline.
 
 ## Overview
 
@@ -64,10 +64,10 @@ Memory caps:
   - `python3 -m pytest tests/test_stable_id_manager_pose.py`
 - Runtime:
   - Ensure `noesis_pose_meta_ext` is built.
-  - Run DS8 pipeline and confirm stable_id persistence when pose is present.
+  - Run DS9.1 pipeline and confirm stable_id persistence when pose is present.
 
 ## Notes for Agents
 
 - Service Maker Python does not expose `obj_user_meta_list`; pose extraction **must**
   go through the native bridge.
-- This integration is DS8-only; do not add legacy pad-probe or CPU fallback branches.
+- This integration is DS9.1-only; do not add legacy pad-probe or CPU fallback branches.

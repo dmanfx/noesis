@@ -1,7 +1,7 @@
-# Depth Stack Flow (DS8)
-_Status: validated against shared DS8/DS9 depth contracts on 2026-07-11._
+# Depth stack flow
+_Status: canonical native DS9.1 depth topology, updated 2026-08-15._
 
-DS8 has two GPU-first full-frame depth branches: always-on DAv2 supplies
+DS9.1 has two GPU-first full-frame depth branches: always-on DAv2 supplies
 tracking observations, while gated MapAnything supplies dense snapshots, RPCs,
 and floorplans. Earlier MapAnything-only flowcharts are archived under
 `docs/history/`.
@@ -37,7 +37,7 @@ flowchart LR
 ```
 
 ## Runtime Touchpoints
-- **DAv2 cadence:** baseline non-`v3dt` runs the
+- **DAv2 cadence:** the active baseline runs the
   `models.depth_tracking` branch continuously. V3DT disables it because the 3D
   tracker owns that observation.
 - **Exact-frame rendezvous:** the capture and fusion operators key on exact
@@ -94,6 +94,6 @@ are visible failures, with rate-limited warnings.
 
 ## Related Docs
 - `MapAnything_Depth.md` – pipeline branch, gating, normals, env toggles
-- `DS8_metadata_contracts.md` – `DepthResult`, registration, and
+- `metadata_contracts.md` – `DepthResult`, registration, and
   `NOESIS.OBJECT_DEPTH` schemas
-- `DS8_api_contracts_ws.md` – `ma_depth_response` / `floorplan_response` contracts
+- `api_contracts_ws.md` – `ma_depth_response` / `floorplan_response` contracts

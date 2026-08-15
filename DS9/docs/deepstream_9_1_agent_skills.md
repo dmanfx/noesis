@@ -3,8 +3,8 @@
 DeepStream work in this repository starts with the official NVIDIA skill that
 matches the task. Read that skill's complete `SKILL.md`, then the references it
 selects, before editing SDK-facing code. Repository policy and `DS9/AGENTS.md`
-are authoritative when an upstream example still names DeepStream 9.0 or an
-older CUDA/TensorRT release.
+are authoritative when an upstream example still names DeepStream 9.0, older
+CUDA/TensorRT releases, or Docker.
 
 ## First route
 
@@ -26,16 +26,15 @@ DeepStream method, property, or config key.
 - DeepStream SDK: 9.1
 - CUDA: 13.2
 - TensorRT: 10.16.0.72
-- Canonical dGPU image:
-  `nvcr.io/nvidia/deepstream:9.1-triton-multiarch@sha256:f6fa0247da9290979cbb05749e7da9435d089c93db7c4dcfe85ba2488b5f4994`
 - SDK root: `/opt/nvidia/deepstream/deepstream-9.1` (or the vendor link that
   resolves there)
 - Minimum driver: `595.58.03` (current host `595.71.05` passes)
-- DS8/DS9.0 engines, parsers, GStreamer plugins, and native Python extensions
-  are incompatible inputs and must be rebuilt.
+- Python: 3.12 in the native root selected by `NOESIS_DS91_NATIVE_ROOT`
+- DS8/DS9.0/container engines, parsers, GStreamer plugins, and native Python
+  extensions are incompatible inputs and must not be loaded.
 
-The active execution sequence and current not-yet-built status are recorded in
-`DS9/docs/deepstream_9_1_direct_upgrade_plan.md`.
+The accepted execution baseline is recorded in `docs/runtime_baseline.md` and
+`DS9/docs/runtime_host_boundary.md`.
 
 ## MV3DT and AMC status
 
@@ -69,7 +68,7 @@ check.
 
 The skill is an implementation and application-validation entrypoint, not a
 release-promotion workflow. After reading the skill and routed references,
-prefer direct local runtime/container checks, focused tests, and one bounded
+prefer direct native-host runtime checks, focused tests, and one bounded
 live or recorded smoke. Do not create immutable appliance releases, clone state,
 render bundles, build deployment selectors, publish candidates, or rehearse
 rollback for ordinary DS9 work. Use those Menon/appliance mechanics only for an
@@ -77,3 +76,7 @@ explicitly requested production promotion or a change whose behavior cannot be
 exercised without an external service/state lifecycle transition. A missing
 private asset or unavailable GPU is a reported blocker, not a reason to widen
 the validation ceremony.
+
+The upstream `docker_containers.md` reference is not an execution option for
+Noesis. Read it only when comparing a generic vendor example; do not copy its
+commands, image pins, mounts, or installation assumptions into this repository.

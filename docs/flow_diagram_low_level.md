@@ -1,38 +1,34 @@
-# Low-Level Pipeline Flow (Detailed)
-_Status: current as of 2026-02-02._
+# Low-level perception and publication flow
 
 ```mermaid
-flowchart LR
-  %% Elements
-  SRC[nvurisrcbin (per source)]
-  MUX[nvstreammux<br/>batching]
-  PRE[nvdspreprocess<br/>config: pipelines/config_preproc.ini]
-  PGIE[nvinfer (PGIE YOLO11)]
-  TEE[main_tee]
-  ROIX[nvdsroiexclude<br/>config: config/config_nvdsanalytics_exclude.ini]
-  TRK[nvtracker<br/>lib: libnvds_nvmultiobjecttracker.so<br/>conf: config/nvtracker.yaml]
-  ANA[nvdsanalytics (post)<br/>config: config/config_nvdsanalytics_post.ini]
-  REID[nvinfer (ReID SGIE)]
-  POSE[nvinfer (Pose SGIE)]
-  TILER[nvmultistreamtiler]
-  OSD[nvdsosd]
-  OUTTEE[sink_tee]
-  RTSPQ[rtsp_queue] --> RTSPV[nvvideoconvert] --> RTSP[nvrtspoutsinkbin]
-  BEV[bev_sink (fakesink)]
+flowchart TB
+    SRC[nvurisrcbin ×3] --> DEW[Per-camera dewarp + NVMM caps]
+    DEW --> MUX[nvstreammux batch=3, 1920×1080]
+    MUX --> PRE[nvdspreprocess YOLO26]
+    PRE --> PGIE[YOLO26-m PGIE]
+    PGIE --> TEE{Main tee}
 
-  %% Flow
-  SRC --> MUX --> PRE --> PGIE --> TEE
-  TEE --> ROIX --> TRK --> ANA --> REID --> POSE --> TILER --> OSD --> OUTTEE
-  OUTTEE --> RTSPQ
-  OUTTEE --> BEV
+    TEE --> ROI[nvdsroiexclude]
+    ROI --> TRK[NvDCF tracker]
+    TRK --> ANA[nvdsanalytics]
+    ANA --> REID[Swin ReID SGIE]
+    REID --> POSE[YOLO26 pose SGIE]
+    POSE --> OBS[Canonical observation/world hooks]
+    OBS --> TILER[Tiler + OSD]
+    TILER --> ENC[Single H.264 encode]
+    ENC --> SHM[Private SHM]
+    SHM --> WEBRTC[WebRTC gateway]
 
-  %% MapAnything branch
-  TEE --> MAQ[mapanything_queue] --> MAV[mapanything_valve] --> MASGIE[nvinfer (MapAnything SGIE)] --> MASINK[fakesink]
+    TEE --> DAV2[DAv2 full-frame tracking depth]
+    DAV2 --> OBS
+    TEE --> VALVE[Request gate]
+    VALVE --> MA[MapAnything full-frame FP32]
+    MA --> DEPTH[Exact depth capture/store/floorplan]
 
-  %% Hooks / metadata
-  ANA -. telemetry hook .-> TELE[_AnalyticsTelemetryProcessor]
-  REID -. tensor meta .-> SID[StableIDManager embeddings]
-  POSE -. tensor meta .-> PF[PoseFeatureProcessor → NOESIS.POSE_FEATURES (object user meta)]
-  TILER -. display meta .-> KP[PoseKeypointOverlayProcessor]
-  MASGIE -. tensor meta .-> MA[MapAnythingProcessor (depth/conf/mask)]
+    OBS --> COMMIT[Tracking/world commit]
+    COMMIT --> WS[Tracking → world → BEV publication]
+    DEPTH --> REST[REST/WS depth descriptors]
 ```
+
+All core video stages stay on GPU/NVMM. CPU work is restricted to explicit
+metadata, serialization, persistence, and dashboard boundaries.

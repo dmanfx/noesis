@@ -29,7 +29,7 @@
     {
       "id": "minimal_telemetry",
       "path": "minimal_telemetry.ndjson",
-      "description": "Saved DS8-style WebSocket telemetry for tracking, occlusion bridge, BEV path smoothness, and BEV agreement validation.",
+      "description": "Saved runtime-neutral WebSocket telemetry for tracking, occlusion bridge, BEV path smoothness, and BEV agreement validation.",
       "tiers": ["offline", "runtime-contract"],
       "rooms": ["fixture-room"],
       "cameras": ["fixture-camera"],

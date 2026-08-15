@@ -1,20 +1,16 @@
-Active configs
-- config_infer_primary_yolo11.ini: Primary detector (YOLO‑11), used by nvinfer in deepstream_video_pipeline.py
-- config_preproc.ini: nvdspreprocess settings for pre‑inference GPU transforms
-- config_nvdsanalytics_exclude.ini, config_nvdsanalytics_post.ini: Analytics stages for zone filtering and post‑tracker analytics
-- config_tracker_nvdcf_batch.yml: Tracker config used by nvtracker (includes NvDCF tuning for occlusions)
+# Legacy pipeline directory
 
-Example/Reference configs (not wired into the current pipeline)
-- config_infer_secondary_classification.ini
-- config_tracker_nvdcf_basic.yml
-- config_tracker_nvdcf_batch_lowlevel.yml
-- dstest1_pgie_config.txt
+This root directory contains pre-DS9.1 configs and build remnants. It is not the
+canonical pipeline/config authority and must not be used to launch, rebuild, or
+repair the current application.
 
-Note: The primary detector uses a custom parser library. Current deployment points to the system lib path. Rebuild from legacy/deepstream_parser if you want to pin a local parser lib and update config_infer_primary_yolo11.ini accordingly.
+Current files live under:
 
-ReID/StableID Integration
-- OSNet ReID is integrated via `reid/` modules; see `reid/README.md` for details and config flags.
-- Tracker config (`config_tracker_nvdcf_batch.yml`) is tuned for partial occlusions:
-  - `searchRegionPaddingScale: 5.0`
-  - `targetVisibilityThreshold: 0.3`
-  - `maxMatchingFrameGap: 40`, `maxTrackingFrameGap: 90`
+- `DS9/config/` — canonical graph configuration;
+- `DS9/pipelines/` — model/preprocess/parser configuration;
+- `DS9/native/` and `DS9/gst-plugins/` — native DS9.1 sources;
+- external artifact root selected by `NOESIS_DS9_ARTIFACT_ROOT` — accepted
+  engines and realization.
+
+Do not load the old YOLO11, OSNet, parser, tracker, or DeepStream 8 binaries
+from this directory. Historical rationale is under `docs/history/`.

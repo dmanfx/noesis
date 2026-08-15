@@ -1,12 +1,14 @@
-# Telemetry Schema (DS8)
-_Status: validated against shared DS8/DS9 contracts on 2026-07-11._
+# Telemetry schema
+_Status: canonical native DS9.1 summary, updated 2026-08-15._
 
-Canonical WebSocket payloads live in `docs/DS8_api_contracts_ws.md`. This page summarizes **where** telemetry is produced in the DS8 stack and the exact field sets emitted today. Older telemetry descriptions are archived under `docs/history/`.
+Canonical WebSocket payloads live in `docs/api_contracts_ws.md`. This page summarizes **where** telemetry is produced in the DS9.1 stack and the exact field sets emitted today. Older telemetry descriptions are archived under `docs/history/`.
 
 ## Producers and Message Types
 
-- **Stats** – built in `noesis/ds8_runtime.py:_build_stats_callback` and broadcast once per second when clients are connected.
-- **Tracking** – `TrackingTelemetryPublisher.publish` in `noesis/telemetry/publishers.py`, fed by `_AnalyticsTelemetryProcessor` (`noesis/pipelines/hooks.py`).
+- **Stats** – built in `DS9/noesis/ds9_runtime_core.py:_build_stats_callback` and broadcast once per second when clients are connected.
+- **Tracking** – `TrackingTelemetryPublisher.publish` in the DS9.1-owned
+  telemetry module, fed by `_AnalyticsTelemetryProcessor` in
+  `DS9/noesis/pipelines/hooks.py`.
 - **Dense depth telemetry** – `DepthTelemetryPublisher.publish` in
   `noesis/telemetry/publishers.py`, fed by the gated `MapAnythingProcessor`.
 - **Tracking depth evidence** – the always-on baseline DAv2 branch rendezvous
@@ -24,14 +26,14 @@ Canonical WebSocket payloads live in `docs/DS8_api_contracts_ws.md`. This page s
   "payload": {
     "timestamp": <float>,
     "uptime": <float>,
-    "stack": "ds8",
+    "stack": "ds9",
     "application": {
       "running": <bool>,
       "cameras_active": <int>,
       "processors_active": <int>
     },
     "pipeline": {
-      "stack": "ds8",
+      "stack": "ds9",
       "prepared": <bool>,
       "activated": <bool>,
       "depth_enabled": <bool>,
@@ -105,7 +107,8 @@ Notes:
 - `latency_ms` comes from `LatencyCollector` and is populated only when `NVDS_ENABLE_LATENCY_MEASUREMENT` is truthy and the DeepStream latency meta library is available.
 - `mosaic_layout` mirrors the current tiler layout: `mosaic_w/h`, optional `rows/cols`, `square_seq_grid`, `frame_w/h`, `source_count`, and `sources` array of `{source_id, camera_id}`.
 - `bev.health`, `active_floorplan`, and `capture_event_fusion` are bounded
-  fixed-schema health surfaces shared by DS8, protected V3DT, and DS9. BEV v2
+  fixed-schema health surfaces shared by the DS9.1 baseline and disabled V3DT
+  adapter. BEV v2
   reports configuration/renderer readiness separately from occupied render
   activity: an empty camera is `inactive_ready`, while a real homography or
   publication failure is `failed`. Active-floorplan health still requires an
@@ -226,7 +229,12 @@ with no partial visibility.
   or identity is only continuity-held. Partial triads are invalid, and no raw
   embedding vector is public.
 - Top-level `world_source="backend_world_fused"` means the backend owns the canonical baseline world estimator; per-track `world_source` records which observation path updated that track on the current frame.
-- In baseline non-`v3dt` mode, `world` is produced by the shared `PersonGroundState` estimator (`noesis/telemetry/person_ground_state.py`): posture-aware pose contact when available, otherwise the person mask/depth anchor from `NOESIS.OBJECT_DEPTH.anchor_uv`, with human CV filtering and stationary lock. Tracks may also carry `motion_mode`, `posture`, `trail_append_allowed`, and `idle_jitter_m`. In `v3dt` mode, `world_source="bbox3d"` continues to come from tracker 3D metadata.
+- In the active baseline, `world` is produced by the shared
+  `PersonGroundState` estimator (`noesis/telemetry/person_ground_state.py`):
+  posture-aware pose contact when available, otherwise the person mask/depth
+  anchor from `NOESIS.OBJECT_DEPTH.anchor_uv`, with human CV filtering and
+  stationary lock. Tracks may also carry `motion_mode`, `posture`,
+  `trail_append_allowed`, and `idle_jitter_m`.
 - `depth_used_m` is the DAv2 anchor depth that actually contributed to the fused baseline world update on that frame; `depth_anchor_m` remains the raw anchor carried by `NOESIS.OBJECT_DEPTH`.
 - `depth_registered_m` is the room-registered DAv2 anchor depth after applying the offline DAv2->MapAnything mapping for that camera; this is the value the estimator projects when registration is active.
 - `depth_registration_status` and `depth_registration_id` make the registration path observable on both tracks and active-tracks without changing the raw `NOESIS.OBJECT_DEPTH` payload semantics.
@@ -261,7 +269,10 @@ Published per MapAnything inference result via `DepthResult.to_dict()`:
 - This full-frame `depth_result` contract remains MapAnything-specific. The always-on DAv2 tracking lane does not publish a second full-frame depth message; it contributes through `NOESIS.OBJECT_DEPTH` and the fused tracking world update.
 - `depth_map_ref` is an opaque artifact identifier, not a filesystem path or
   fetch URL.
-- Baseline non-`v3dt` startup also requires a read-only depth-registration artifact (`config/depth_registration.json` by default, overridable via `depth_registration.path` in `infer.yaml` or `--depth-registration-config`). That artifact is loaded before activation and is not generated automatically by the runtime.
+- Baseline startup also requires the read-only depth-registration artifact at
+  `DS9/config/depth_registration.json`, selected by `depth_registration.path`
+  in `DS9/config/infer.yaml` or an explicit command argument. It is loaded
+  before sources open and is not generated automatically by the runtime.
 
 Fresh `ma_depth_response` and floorplan RPCs use a separate capture-event
 contract. One shared controller owns the process-wide MapAnything valve plus
@@ -319,7 +330,7 @@ errors remain stable machine codes and never return a stale payload as success.
 ```
 
 - BEV JPEG binary delivery is retired. BEV is metadata-only; `bev.jpeg_enabled`
-  and `NOESIS_BEV_JPEG_ENABLED` are ignored by the DS8 runtime.
+  and `NOESIS_BEV_JPEG_ENABLED` are ignored by the DS9.1 runtime.
 - Footpoints use `stableId` when available; `trackerId` may be present as a debug/fallback identity key (not stable across restarts).
 - The primary inline floorplan BEV uses `frame=camera_local_ground_m`;
   `footpoints[].x` is local X and `footpoints[].y` is local Z in meters so
@@ -351,6 +362,6 @@ errors remain stable machine codes and never return a stale payload as success.
 
 ## Related Docs
 
-- Contracts and RPCs: `docs/DS8_api_contracts_ws.md`
-- Metadata shapes: `docs/DS8_metadata_contracts.md`
-- BEV rendering and smoothing: `docs/DS8_Baselines.md` (BEV section)
+- Contracts and RPCs: `docs/api_contracts_ws.md`
+- Metadata shapes: `docs/metadata_contracts.md`
+- BEV rendering and smoothing: `DS9/docs/bev_capture_event_integration.md`

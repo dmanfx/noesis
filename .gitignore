@@ -38,8 +38,14 @@ docs/ma-integration/*.md
 # Always track agent policy docs and all docs/ content
 !AGENTS.md
 !**/AGENTS.md
+!README.md
+!contracts/README.md
 !docs/
 !docs/**
+!plans/archive/README.md
+!plans/ds91_native_host_only_migration.md
+!testpipelines/*/README.md
+!utils/onnx2trt/README.md
 
 # Archive docs are not tracked
 docs/history/

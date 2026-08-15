@@ -1,41 +1,18 @@
-# High-Level Pipeline Flow
-_Status: current as of 2026-02-02._
+# High-level application flow
 
 ```mermaid
-graph TD
-  subgraph "Input"
-    A[RTSP / File / Camera Sources]
-  end
-
-  subgraph "DeepStream Pipeline (DS8)"
-    A --> S0[nvurisrcbin (per source)]
-    S0 --> MUX[nvstreammux (batching)]
-    MUX --> PRE[nvdspreprocess]
-    PRE --> PGIE[nvinfer (PGIE YOLO11)]
-    PGIE --> TEE[main_tee]
-    TEE --> EX[nvdsroiexclude]
-    EX --> TRK[nvtracker]
-    TRK --> ANA[nvdsanalytics (post)]
-    ANA --> REID[nvinfer (ReID SGIE)]
-    REID --> POSE[nvinfer (Pose SGIE)]
-    POSE --> TILER[nvmultistreamtiler]
-    TILER --> OSD[nvdsosd]
-    OSD --> OUTTEE[sink_tee]
-    OUTTEE --> RTSP[nvrtspoutsinkbin]
-  end
-
-  subgraph "MapAnything Branch"
-    TEE --> MAQ[mapanything_queue]
-    MAQ --> MAV[mapanything_valve]
-    MAV --> MASGIE[nvinfer (MapAnything SGIE)]
-    MASGIE --> MASINK[fakesink]
-  end
-
-  subgraph "Python Application"
-    ANA -. telemetry .-> WS[WebSocket Server]
-    POSE -. object meta .-> META[NOESIS.POSE_FEATURES user meta]
-    TILER -. display meta .-> KP[Pose keypoint overlay]
-  end
-
-  WS --> CLIENTS[Web Clients]
+flowchart LR
+    A[Three RTSP cameras] --> B[Native DS9.1 GPU pipeline]
+    B --> C[Detection + tracking + ReID + pose + depth]
+    C --> D[Canonical observations/world]
+    D --> E[Tracking/world/BEV telemetry]
+    B --> F[H.264 SHM/WebRTC mosaic]
+    B --> G[Depth and control REST]
+    E --> H[Menon gateway]
+    F --> H
+    G --> H
+    H --> I[oai2-fe dashboard]
 ```
+
+The application has no Docker or legacy-runtime hop. Noesis ports are
+loopback-only; Menon owns browser authentication and delivery.

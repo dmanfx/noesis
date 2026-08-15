@@ -1,17 +1,19 @@
-# DS8 Metadata Contracts
-_Status: shared observation and depth contracts current as of 2026-07-11._
+# DS9.1 metadata contracts
+_Status: canonical native-host metadata contract, updated 2026-08-15._
 
-This document summarizes the key metadata structures used by the DS8 pipeline, both on-frame (user meta) and in downstream telemetry.
+This document summarizes the key metadata structures used by the DS9.1 pipeline, both on-frame (user meta) and in downstream telemetry.
 
 ## 1. Intrinsics (Calibration Bundle + optional per-frame meta)
 
-**Primary producer (DS8 runtime):** `noesis/ds8_runtime._CalibrationProvider` via the `calibration-bundle` WebSocket message and `CalibrationSnapshot` for BEV/geometry consumers.
+**Primary producer:** the calibration provider in
+`DS9/noesis/ds9_runtime_core.py`, via the `calibration-bundle` WebSocket message
+and `CalibrationSnapshot` for BEV/geometry consumers.
 
 **Optional producer (DeepStream user meta):** `noesis/metadata/intrinsics.py` via `attach_intrinsics` (supported for `pyds.NvDsFrameMeta`).
 
 ### Storage
 
-- DS8 canonical path (Service Maker pipelines):
+- DS9.1 canonical path (Service Maker pipelines):
   - Intrinsics are distributed out-of-band via `calibration-bundle` (WS) and stored on the depth subsystem (`DepthStorageManager.calibration_bundle`).
   - BEV/geometry consumers should use `_CalibrationProvider.snapshot(...)` to obtain a `CalibrationSnapshot` (K + E + floor_y + unit scale).
 - For DeepStream frames (NvDsFrameMeta), intrinsics are attached as NvDsUserMeta:
@@ -40,15 +42,15 @@ The intrinsics payload (after `as_payload()`) has the shape:
 
 The loader accepts either a `cameras` or `sources` mapping at the root of `config/cameras.yaml`, and supports reusable intrinsics under `intrinsics_models` (or `models`) referenced by `model`/`intrinsics_model`. Keys `fx`, `fy`, `cx`, `cy` are required, with optional `K_matrix`/`camera_matrix` fallbacks and distortion coefficients (`k1`/`k2`/`k3` or `distortion_coeffs`).
 
-DS8 code that consumes intrinsics should prefer the runtime `calibration-bundle` / `CalibrationSnapshot`. Per-frame intrinsics user meta may be absent in Service Maker pipelines.
+DS9.1 code that consumes intrinsics should prefer the runtime `calibration-bundle` / `CalibrationSnapshot`. Per-frame intrinsics user meta may be absent in Service Maker pipelines.
 
 ## 1.1 Depth Registration Artifact
 
 **Primary producer:** offline builder `scripts/build_depth_registration.py`.
 
-**Primary consumer:** baseline DS8 startup + fused world estimator (`noesis/ds8_runtime.py`, `noesis/pipelines/hooks.py`).
+**Primary consumer:** baseline DS9.1 startup + fused world estimator (`DS9/noesis/ds9_runtime_core.py`, `DS9/noesis/pipelines/hooks.py`).
 
-This artifact is separate from `NOESIS.OBJECT_DEPTH`, `DepthResult`, floorplan caches, and MapAnything snapshot storage. It is a DS8-owned config artifact that maps raw DAv2 anchor range into MapAnything-aligned room range on a per-camera basis.
+This artifact is separate from `NOESIS.OBJECT_DEPTH`, `DepthResult`, floorplan caches, and MapAnything snapshot storage. It is a DS9.1-owned config artifact that maps raw DAv2 anchor range into MapAnything-aligned room range on a per-camera basis.
 
 Canonical bundle shape:
 
@@ -94,14 +96,15 @@ Canonical bundle shape:
 ```
 
 Contract rules:
-- Runtime must treat the artifact as read-only and load it before pipeline activation.
-- In baseline non-`v3dt` mode, every enabled camera must have a valid entry whose calibration + model fingerprints match the active runtime inputs.
+- Runtime must treat the artifact as read-only and load it before opening sources.
+- In the native baseline, every enabled camera must have a valid entry whose calibration + model fingerprints match the active runtime inputs.
 - The artifact corrects only the estimator-local depth observation. It must not overwrite the raw `NOESIS.OBJECT_DEPTH` payload.
 - `registration_id`, `created_ts_us`, `generation_tool_version`, `fit_metrics`, `sample_counts`, and `provenance` are all part of the operational contract now and should be preserved when regenerating the bundle.
 
 ## 2. Depth Result
 
-**Producer:** `noesis/pipelines/hooks.MapAnythingProcessor` → `DepthStorageManager` + `DepthTelemetryPublisher`.
+**Producer:** `DS9/noesis/pipelines/hooks.MapAnythingProcessor` →
+`DepthStorageManager` + `DepthTelemetryPublisher`.
 
 ### In-Memory Schema
 
@@ -197,7 +200,7 @@ Snake_case keys are provided for backwards compatibility with older consumers.
 For household room membership, `ocStatus` is the primary per-object polygon
 evidence because the established overcrowding ROIs already carry the exact room
 IDs. `roiStatus` is consulted only when there is no nonempty `ocStatus`
-membership. The shared DS8/V3DT/DS9 resolver requires one exact unique label;
+membership. The shared DS9.1/V3DT resolver requires one exact unique label;
 identical duplicates collapse, while padded, empty, over-160-character,
 malformed, or multiple distinct labels fail closed. It never trims,
 case-normalizes, truncates, or picks the first label.
@@ -426,18 +429,18 @@ Occupancy per zone is represented as:
 
 The occupancy publisher (`occupancy_publisher`) expects `publish_state(room_id, occupied, count, ts_ns)` calls aligned with this representation.
 
-In DS8, `_AnalyticsTelemetryProcessor` derives diagnostic occupancy counts per
+In DS9.1, `_AnalyticsTelemetryProcessor` derives diagnostic occupancy counts per
 sensor from each published local track zone and publishes through
 `pipeline.occupancy_publisher`, emitting vacate events when a previously
 occupied zone disappears. Those local counts may include a `camera_default`
 fallback; only exact authoritative analytics evidence can vote for canonical
 `room_id`.
 
-Vacates are emitted immediately when a zone’s count drops to zero; there is no grace window in the current DS8 implementation.
+Vacates are emitted immediately when a zone’s count drops to zero; there is no grace window in the current DS9.1 implementation.
 
-## 5. Custom User Meta Lifecycle (DS8 / DeepStream)
+## 5. Custom User Meta Lifecycle (DS9.1 / DeepStream)
 
-When attaching **custom user meta** (`NvDsUserMeta`) from DS8 hooks or native bridges, follow DeepStream’s copy/release semantics exactly to avoid heap corruption:
+When attaching **custom user meta** (`NvDsUserMeta`) from DS9.1 hooks or native bridges, follow DeepStream’s copy/release semantics exactly to avoid heap corruption:
 
 - `copy_func(data, user_data)` and `release_func(data, user_data)` are called with `data == NvDsUserMeta*` **(not** `user_meta_data`).
 - `copy_func` must **deep‑copy** `user_meta_data` and return the new payload pointer.
@@ -462,7 +465,7 @@ static void pose_meta_release(gpointer data, gpointer) {
 }
 ```
 
-**DS8 note:** Service Maker Python wrappers do not expose `obj_user_meta_list` or `append` for arbitrary user meta. Use a **native bridge** (e.g., `native/noesis_pose_meta_ext.cpp`) to unwrap `ObjectMetadata` → `NvDsObjectMeta*` and call `nvds_add_user_meta_to_obj`.
+**DS9.1 note:** Service Maker Python wrappers do not expose `obj_user_meta_list` or `append` for arbitrary user meta. Use a **native bridge** (e.g., `native/noesis_pose_meta_ext.cpp`) to unwrap `ObjectMetadata` → `NvDsObjectMeta*` and call `nvds_add_user_meta_to_obj`.
 
 ## 6. Pose Feature User Meta (Object-Level)
 
@@ -504,13 +507,13 @@ static void pose_meta_release(gpointer data, gpointer) {
 - The payload is intended for downstream StableID enhancements; it is **not** emitted on the WebSocket tracking stream.
 - StableIDManager may consume this meta as a secondary identity signal with a bounded in‑RAM pose gallery (no disk persistence).
 - The baseline fused world estimator also consumes the pose keypoints as the canonical image-anchor authority. DAv2 depth may refine range for that same anchor, but pose meta remains the source of the floor anchor chain.
-- See `docs/DS8_pose_stable_id_integration.md` for fusion thresholds, env flags, and memory caps.
-- Attached in DS8 via `noesis_pose_meta_ext.attach_pose_features(...)` which calls `nvds_add_user_meta_to_obj` with the lifecycle functions defined above.
+- See `docs/pose_stable_id_integration.md` for fusion thresholds, env flags, and memory caps.
+- Attached in DS9.1 via `noesis_pose_meta_ext.attach_pose_features(...)` which calls `nvds_add_user_meta_to_obj` with the lifecycle functions defined above.
 
 ## 7. Object Depth User Meta (Object-Level)
 
-**Producer:** the baseline DS8 runtime DAv2 depth-tracking lane attaches this
-payload after full-frame depth is aligned once into canonical DS8 frame
+**Producer:** the baseline DS9.1 runtime DAv2 depth-tracking lane attaches this
+payload after full-frame depth is aligned once into canonical DS9.1 frame
 coordinates. Mask-capable detectors use the decoded person instance mask;
 box-only detectors use a bounded lower-person bbox band.
 
@@ -562,18 +565,22 @@ box-only detectors use a bounded lower-person bbox band.
 
 **Notes:**
 
-- The payload is attached per object only after full-frame depth has been aligned once into canonical post-mux DS8 frame coordinates. `instance_mask` samples the decoded mask; `bbox_band` samples the configured lower-person band when the selected detector has no usable mask.
-- `bbox` and all mask/band/depth statistics are expressed in that canonical DS8 frame space. Source-native dimensions (`source_frame_width`, `source_frame_height`) are diagnostic-only and must not be used for object-depth sampling.
+- The payload is attached per object only after full-frame depth has been aligned once into canonical post-mux DS9.1 frame coordinates. `instance_mask` samples the decoded mask; `bbox_band` samples the configured lower-person band when the selected detector has no usable mask.
+- `bbox` and all mask/band/depth statistics are expressed in that canonical DS9.1 frame space. Source-native dimensions (`source_frame_width`, `source_frame_height`) are diagnostic-only and must not be used for object-depth sampling.
 - If neither the native mask nor bounded bbox-band path can produce usable statistics, the aligned depth frame is not ready, or geometry is inconsistent, the payload may still be attached with a non-`"ok"` `status`.
 - `status` is mandatory and distinguishes usable samples (`"ok"`) from object-local failures such as `"no_valid_depth"`, `"missing_mask"`, `"mask_decode_failed"`, `"depth_not_ready"`, or `"transform_mismatch"`.
-- Version `2` adds optional person-only spatial fields derived from the segmentation mask plus the DS8 calibration bundle. `anchor_uv` is the bottom-of-mask image anchor in canonical frame space, `anchor_depth_m` is the preferred lower-body or torso-core depth sample, and `world_point*` fields are produced by `pixel_to_world(...)` without applying `align.matrix`.
-- `anchor_sample_count` and `anchor_valid_fraction` describe the support of the specific lower-body / torso anchor band that produced `anchor_depth_m`. Baseline DS8 tracking weights DAv2 using these anchor-band support fields instead of whole-mask support alone so far-camera people can still contribute depth when the chosen anchor band is well supported.
+- Version `2` adds optional person-only spatial fields derived from the segmentation mask plus the DS9.1 calibration bundle. `anchor_uv` is the bottom-of-mask image anchor in canonical frame space, `anchor_depth_m` is the preferred lower-body or torso-core depth sample, and `world_point*` fields are produced by `pixel_to_world(...)` without applying `align.matrix`.
+- `anchor_sample_count` and `anchor_valid_fraction` describe the support of the specific lower-body / torso anchor band that produced `anchor_depth_m`. Baseline DS9.1 tracking weights DAv2 using these anchor-band support fields instead of whole-mask support alone so far-camera people can still contribute depth when the chosen anchor band is well supported.
 - `projection_method` is one of `"depth"`, `"floor_guarded"`, `"depth_only"`, or `"floor_only"`. `spatial_status` surfaces whether that world projection is usable (`"ok"`) or why it is absent (`"geometry_unavailable"`, `"anchor_unavailable"`, `"projection_unavailable"`).
-- In the baseline DS8 runtime, `NOESIS.OBJECT_DEPTH` is a required observation for the non-`v3dt` fused world estimator. The runtime consumes the raw depth/anchor fields (`status`, `sample_count`, `valid_fraction`, `anchor_source`, `anchor_depth_m`, `anchor_sample_count`, `anchor_valid_fraction`) and computes the canonical per-track `track.world` inside `hooks.py`.
+- In the baseline DS9.1 runtime, `NOESIS.OBJECT_DEPTH` is required by the fused
+  world estimator. The runtime consumes the raw depth/anchor fields (`status`,
+  `sample_count`, `valid_fraction`, `anchor_source`, `anchor_depth_m`,
+  `anchor_sample_count`, `anchor_valid_fraction`) and computes canonical
+  `track.world` inside `DS9/noesis/pipelines/hooks.py`.
 - When a valid depth-registration artifact is loaded, the runtime keeps `anchor_depth_m` raw in `NOESIS.OBJECT_DEPTH`, derives a corrected `depth_registered_m` only inside the fused estimator, and projects that corrected value on the pose anchor ray before writing `track.world`.
 - The object-level `world_point`, `world_point_depth`, `world_point_floor`, and `projection_method` fields remain diagnostic-only in baseline runtime mode. They are useful for inspection and parity testing, but they are not the authoritative tracking output once the fused estimator is active.
 - Non-person classes keep the raw object-depth payload behavior and omit the spatial fields.
-- The runtime uses a bounded internal aligned-depth cache to hand the canonical full-frame depth map from the depth-capture operator to the later object-fusion/overlay operators. That cache is prototype-internal only and is not a public DS8 metadata contract.
+- The runtime uses a bounded internal aligned-depth cache to hand the canonical full-frame depth map from the depth-capture operator to the later object-fusion/overlay operators. That cache is prototype-internal only and is not a public DS9.1 metadata contract.
 - The bridge keys frames by exact `(source_id, frame_id, media PTS)`. Object
   fusion waits up to `NOESIS_OBJECT_DEPTH_EXACT_FRAME_WAIT_MS` for the sibling
   DAv2 frame (20 ms default, hard-clamped to 0–250 ms), then may use only a
@@ -584,7 +591,7 @@ box-only detectors use a bounded lower-person bbox band.
   consumers must not infer one mode from missing numeric fields.
 - `unit` and `is_metric` travel with the payload so downstream consumers can distinguish metric meters from relative-depth fallbacks without guessing from the model name.
 - `depth_map_ref` is optional and is an opaque pointer to any stored full-frame depth artifact when one exists; consumers must not parse semantics out of the string.
-- Attached in DS8 via `noesis_depth_meta_ext.attach_object_depth(...)`; instance masks are copied out of `NvOSD_MaskParams` via the native helper `noesis_depth_meta_ext.extract_object_mask(...)` before sampling. Native attachment must receive the owning batch metadata and return success. A missing function/extension, native exception, or native rejection means the object does not carry this user meta; it is not silently counted as an attached non-`ok` payload.
+- Attached in DS9.1 via `noesis_depth_meta_ext.attach_object_depth(...)`; instance masks are copied out of `NvOSD_MaskParams` via the native helper `noesis_depth_meta_ext.extract_object_mask(...)` before sampling. Native attachment must receive the owning batch metadata and return success. A missing function/extension, native exception, or native rejection means the object does not carry this user meta; it is not silently counted as an attached non-`ok` payload.
 - `stats.payload.pipeline.zero_copy_core.counters` makes the bridge observable.
   Exact/lagged/miss behavior uses the `depth_bridge_*` counters; successful
   attachment uses `object_depth_attach_total` and
@@ -594,9 +601,9 @@ box-only detectors use a bounded lower-person bbox band.
 
 ## 8. Pose Keypoint Visualization (OSD)
 
-Pose keypoints/skeletons are **rendered in the mosaic** using DS8 display metadata inserted just before `nvdsosd`:
+Pose keypoints/skeletons are **rendered in the mosaic** using DS9.1 display metadata inserted just before `nvdsosd`:
 
-- Config gate: `visualization.display_keypoints` (in `config/infer.yaml`).
+- Config gate: `visualization.display_keypoints` in `DS9/config/infer.yaml`.
 - Source: YOLO26 pose SGIE tensor meta (`unique_id` from `models.pose.gie_id`).
 - Rendering: `PoseKeypointOverlayProcessor` attaches `DisplayMeta` lines/circles at the tiler stage.
 
@@ -611,10 +618,11 @@ This visualization does **not** add new user meta; it is purely an OSD overlay.
   - RPCs like `set_extrinsics`, `set_align`, and `auto_calibrate_pose`.
   - BEV computations based on `CalibrationSnapshot` in `bev.py`.
 
-The baseline non-`v3dt` world estimator depends on this calibration stack in three places that must stay semantically aligned:
+The baseline world estimator depends on this calibration stack in three places
+that must stay semantically aligned:
 
 - pose-derived image anchors from `NOESIS.POSE_FEATURES` / pose keypoints,
 - DAv2 range observations from `NOESIS.OBJECT_DEPTH.anchor_depth_m`,
 - and world projection via `pixel_to_world(...)` in `hooks.py`.
 
-Any change to calibration formats or semantics must be reflected here and in the corresponding DS8 docs, because the backend fused estimator is now the canonical owner of `track.world`.
+Any change to calibration formats or semantics must be reflected here and in the corresponding DS9.1 docs, because the backend fused estimator is now the canonical owner of `track.world`.

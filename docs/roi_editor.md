@@ -1,5 +1,5 @@
-# DS8 ROI Editor (Exclusion Zones)
-_Status: current as of 2026-07-10._
+# ROI editor (exclusion zones)
+_Status: canonical native DS9.1 workflow, updated 2026-08-15._
 
 The ROI editor is a dashboard drawer for the writable `exclude` analytics
 stage. It previews one camera from the live WebRTC mosaic, edits polygons in the
@@ -14,10 +14,10 @@ not infer success from a file write.
 
 ## Access boundary
 
-Appliance browsers reach Noesis through the authenticated same-origin gateway.
+Dashboard browsers reach Noesis through Menon's authenticated same-origin gateway.
 The gateway keeps the owner-only internal bearer and sends it to Noesis; the
 browser must never receive or persist that token. Direct browser-to-Noesis REST
-with required authentication is not an appliance path.
+with required authentication is not the product path.
 
 Explicit loopback development may use `NOESIS_INTERNAL_AUTH_MODE=disabled`, but
 both REST and WebSocket must bind to `localhost` or a literal loopback address.
@@ -25,7 +25,7 @@ If cross-origin loopback development is required, list exact origins in
 `NOESIS_REST_CORS_ORIGINS`. Wildcard/regex CORS and
 `NOESIS_REST_CORS_ALLOW_ALL` are forbidden.
 
-The runtime must have REST and the RTSP-to-WebRTC mosaic enabled. The dashboard
+The runtime must have REST and the SHM-to-WebRTC mosaic enabled. The dashboard
 also needs `stats.payload.pipeline.mosaic_layout`; its ordered source rows map
 analytics stream IDs to mosaic tiles. Do not guess tile placement from camera
 names when layout metadata is absent.
@@ -46,7 +46,7 @@ names when layout metadata is absent.
   remains an error and must not be presented as applied.
 
 API shapes, size limits, receipt fields, rollback, poisoning, and shutdown
-quiescence are normative in `docs/DS8_api_contracts_rest.md`.
+quiescence are normative in `docs/api_contracts_rest.md`.
 
 ## Validation
 
@@ -60,8 +60,8 @@ python3 -m pytest -q \
   DS9/tests/test_nvdsroiexclude_plugin.py
 ```
 
-Then capture current behavior only with a real occupied camera and the
-authenticated restore gate:
+Then, only when exclusion behavior changed, capture current behavior with one
+occupied camera and the authenticated restore gate:
 
 ```bash
 python3 scripts/roi_reload_smoke_test.py \
@@ -80,7 +80,7 @@ counter-only smoke evidence is not acceptance for the hardened path.
 
 - **Layout unavailable:** require current `mosaic_layout` rows/columns and
   source entries; do not hardcode a tile order.
-- **GET/POST returns 401/403:** use the appliance gateway, or explicit
+- **GET/POST returns 401/403:** use the Menon gateway, or explicit
   loopback-only development auth disablement. Do not put the internal bearer in
   frontend code, a URL, or local storage.
 - **Apply returns 422:** check final-ROI enable state, ROI ID, coordinate bounds,

@@ -1,79 +1,45 @@
-% GStreamer and DeepStream Cache Clearing  
-_Status: current as of 2026-02-02._
+# GStreamer registry and engine cache repair
 
-%% Overview
-This document provides commands for clearing GStreamer and DeepStream caches when pipelines fail to detect plugins or after system updates.
+Status: native DS9.1 guidance, 2026-08-15.
 
-%% When to Clear Cache
-Clear the cache when experiencing:
-- Pipeline fails to start with plugin detection errors
-- GStreamer cannot find plugins that should be available
-- After installing or updating GStreamer/DeepStream plugins
-- After moving or updating plugin libraries
-- Pipeline worked previously but suddenly stops working
-- "Could not find plugin" or similar errors
+Cache repair is targeted. Never recursively delete model or engine trees to
+"see if it helps"; the canonical runtime requires a content-bound realization.
 
-%% GStreamer Plugin Registry Cache
+## Native GStreamer registry
 
-%%% Standard Cache Clear
-The most common cache to clear is the GStreamer plugin registry:
+The native runtime uses the registry selected by `GST_REGISTRY`, normally below
+`NOESIS_DS91_NATIVE_ROOT`. If a newly rebuilt plugin is not discovered:
 
-```bash
-rm -f ${HOME}/.cache/gstreamer-1.0/registry.x86_64.bin
-```
+1. Stop the managed Noesis service if it owns that registry.
+2. Resolve and inspect the exact path:
 
-This removes the cached plugin registry. GStreamer will automatically rebuild it on the next pipeline run.
+   ```bash
+   printf '%s\n' "$GST_REGISTRY"
+   test -f "$GST_REGISTRY" && ls -l "$GST_REGISTRY"
+   ```
 
-%%% Complete User Cache Clear
-For a more thorough cleanup of all GStreamer user cache:
+3. Remove only that exact registry file, then run the native supervisor check
+   or start the service so GStreamer rebuilds it.
+4. Verify only the affected factory with `gst-inspect-1.0`.
 
-```bash
-rm -rf ${HOME}/.cache/gstreamer-1.0/*
-```
+Do not clear `$HOME/.cache/gstreamer-1.0` unless the process actually uses that
+registry. The managed service normally does not.
 
-%%% System-Wide Cache Clear
-If you have root access and need to clear system-wide cache:
+## TensorRT engines
 
-```bash
-sudo rm -f /root/.cache/gstreamer-1.0/registry.x86_64.bin
-```
+Never delete all `.engine` or `.plan` files. Rebuild the specific declared
+engine with `DS9/scripts/run_canonical_engine_maintenance_host.sh`, let the
+maintenance finalizer update its realization record, and run its focused
+deserialize/output check. See `DS9/DS9_REBUILD_AND_SMOKE_GATES.md`.
 
-%% DeepStream and TensorRT Caches
-
-%%% TensorRT Engine Cache
-TensorRT engine files are typically cached in model directories. Check your DeepStream config files for `engine-file` paths. To force regeneration:
-
-1. Locate engine files in your model directories (usually `.engine` or `.trt` files)
-2. Delete the engine files to force TensorRT to rebuild them
-3. The engine files will be regenerated on the next inference run
-
-Example:
-```bash
-# Find and remove TensorRT engine files (adjust paths as needed)
-find . -name "*.engine" -type f -delete
-find . -name "*.trt" -type f -delete
-```
-
-%%% DeepStream Model Cache
-DeepStream may cache model configurations. Check your config files for cache-related settings.
-
-%% Verification
-
-After clearing the cache, verify GStreamer can detect your plugins:
+## Useful inspection
 
 ```bash
-# List available GStreamer plugins
-gst-inspect-1.0 | grep -i nv
-
-# Check specific DeepStream plugins
 gst-inspect-1.0 nvurisrcbin
 gst-inspect-1.0 nvinfer
 gst-inspect-1.0 nvtracker
 ```
 
-%% Notes
-
-- The registry cache is automatically regenerated on the next pipeline run
-- No restart is required after clearing the cache
-- Clearing cache does not affect installed plugins, only the discovery cache
-- If issues persist after clearing cache, check plugin installation paths and environment variables
+For a custom plugin, set the native `GST_PLUGIN_PATH` and inspect its exact
+factory name. A plugin discovery failure is not a reason to change the pipeline
+or load a legacy binary.

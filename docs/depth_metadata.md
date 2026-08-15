@@ -1,7 +1,7 @@
-# Depth Metadata (DS8)
-_Status: validated against shared DS8/DS9 depth contracts on 2026-07-11._
+# Depth metadata
+_Status: canonical native DS9.1 contract, updated 2026-08-15._
 
-DS8 has two distinct depth paths. They share calibration and world-estimation
+DS9.1 has two distinct depth paths. They share calibration and world-estimation
 semantics, but they do not share a public payload or runtime cadence.
 
 ## Gated dense MapAnything depth
@@ -56,7 +56,7 @@ the successful attachment/status counters or be reinterpreted as usable depth.
 
 Calibration is distributed via `calibration-bundle` and cached on the storage
 manager so MapAnything floorplans, DAv2 registration, and depth-to-world
-projections use one authority. See `DS8_metadata_contracts.md` for the full
+projections use one authority. See `metadata_contracts.md` for the full
 `DepthResult`, registration, and `NOESIS.OBJECT_DEPTH` schemas.
 
 The older per-object `NOESIS.MDE` user-meta format is archived under `docs/history/` for reference.

@@ -1,8 +1,7 @@
 # DA3Metric-Large Manual Depth Backend
 
-_Status: deployed and selector-bound on 2026-08-05 EDT (2026-08-06 UTC).
-The RTX 3060 FP16 engine, canonical three-camera canary, appliance readiness,
-and one fresh manual capture have passed._
+_Status: optional native DS9.1 manual-depth profile. Historical engine evidence
+is retained, but MapAnything remains the selected baseline._
 
 ## Scope
 
@@ -76,48 +75,28 @@ Paths below are relative to the canonical DS9 artifact root:
 - Validation receipt:
   `models/engine_validation/da3metric-large/validation-receipt.json`
 
-The engine is specific to the installed RTX 3060 (compute capability 8.6),
-TensorRT 10.14.1.48, the reviewed DS9 build image, fixed batch `3`, and FP32
-I/O with FP16 internal compute. Rebuild it after changing the GPU, TensorRT,
-CUDA/driver compatibility boundary, ONNX, profile, or build image.
+The recorded engine was built on the former pre-native TensorRT environment and
+is therefore not valid native DS9.1 runtime authority. Before selecting DA3 on
+the current host, rebuild it with TensorRT 10.16.0.72/CUDA 13.2 using native
+maintenance, refresh its realization/provenance, deserialize it, and repeat one
+direct manual-depth smoke.
 
 ## Selection and Toggle
 
 Accepted values are exactly `mapanything` and `da3metric-large`. MapAnything is
 the code default when no selector is supplied.
 
-For direct DS9 launches, select at process start with either:
+For an isolated direct DS9.1 development launch, select at process start with:
 
 ```bash
 python3 DS9/noesis/ds9_runtime.py --manual-depth-model da3metric-large
 ```
 
-or:
-
-```bash
-NOESIS_MANUAL_DEPTH_MODEL=da3metric-large \
-  python3 DS9/scripts/run_canonical_runtime_container.py plan --lane baseline
-```
-
-The canonical supervisor validates the value and injects it into the runtime
-container. It is not a hot in-process switch.
-
-For the appliance, the companion Menon bundle renderer accepts the same closed
-choice:
-
-```bash
-node scripts/appliance-systemd.mjs --render \
-  --output-dir "$BUNDLE" \
-  --menon-repo "$RELEASE/menon" \
-  --noesis-repo "$RELEASE/noesis" \
-  --manual-depth-model da3metric-large \
-  --homeseer-base-url http://127.0.0.1
-```
-
-Render and validate a new bundle, then activate it through the normal selector
-transaction. To return to MapAnything, render with
-`--manual-depth-model mapanything` and activate that bundle. Do not hand-edit
-the installed `noesis.env`; it is part of the bundle integrity contract.
+The native supervisor accepts only `mapanything` or `da3metric-large` through
+`NOESIS_MANUAL_DEPTH_MODEL`. It is a process-start choice, not a hot switch.
+For the managed service, change the installed native environment deliberately
+and perform one bounded service restart; do not create a release candidate or
+selector.
 
 ## Registration Boundary
 
@@ -141,7 +120,7 @@ The FP16 engine passed:
 - 213 of 220 compute layers reporting FP16 output, with FP32 I/O;
 - a canonical real-camera canary with all three sources, clean shutdown, and
   the DA3 engine/config deserialized under UID `2`;
-- selector-bound Noesis and Menon production readiness;
+- Noesis and Menon readiness in the former deployment;
 - one five-second manual Refresh producing one committed `1080 x 1920` Zarr
   snapshot for family room, kitchen, and living room, with all `6,220,800`
   depth pixels finite and positive; the valve closed again after the window.

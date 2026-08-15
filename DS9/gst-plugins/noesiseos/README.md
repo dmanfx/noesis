@@ -16,9 +16,9 @@ Build and inspect only the DS9-owned artifact:
 GST_PLUGIN_PATH="$PWD/DS9/gst-plugins" gst-inspect-1.0 noesiseos
 ```
 
-The DS9 binary is built independently and identifies itself as DS9. It must not
-load the DS8 artifact. Runtime graph placement and shutdown orchestration are a
-separate lifecycle change and are intentionally outside this plugin package.
+The DS9.1 binary is built against the installed native SDK. It must not load an
+archived DS8/DS9.0 artifact. Runtime graph placement and shutdown orchestration
+remain outside this plugin package.
 
 Closed downstream valves must use `drop-mode=1` or `drop-mode=2` so sticky EOS
 continues downstream. A `drop-mode=0` valve must be opened before an EOS

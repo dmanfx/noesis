@@ -109,7 +109,7 @@ is never modified.
 
 ## Runtime behavior
 
-When `scene_priors.path` is configured, DS8 and DS9 verify the catalog,
+When `scene_priors.path` is configured, the native DS9.1 runtime verifies the catalog,
 manifest, every artifact digest/size, and the bounded NPZ inventory before
 startup. Invalid configured evidence aborts startup; there is no substitute
 revision or legacy path.
@@ -182,9 +182,7 @@ python3 -m py_compile \
   noesis/scene_prior_builder.py \
   noesis_core/contracts/scene_prior.py \
   noesis_core/scene_prior.py \
-  noesis/ds8_runtime.py \
   DS9/noesis/ds9_runtime_core.py \
-  noesis/pipelines/hooks.py \
   DS9/noesis/pipelines/hooks.py
 (cd oai2-fe && npm run build)
 ```

@@ -1,11 +1,11 @@
-# DS8 WebSocket API Contracts
-_Status: canonical observation/world/depth contracts, including dense-depth bulk descriptors, floorplan v10, and Scene Prior v1, current as of 2026-08-01._
+# DS9.1 WebSocket API contracts
+_Status: canonical native-host observation/world/depth/PCF contract, updated 2026-08-15._
 
-The WebSocket server (`websocket_server.WebSocketServer`) is the primary transport for DS8 telemetry, depth retrieval, and WebRTC signaling. All active DS8 telemetry message types are JSON unless a future binary payload explicitly documents otherwise.
+The WebSocket server (`websocket_server.WebSocketServer`) is the primary transport for DS9.1 telemetry, depth retrieval, and WebRTC signaling. All active DS9.1 telemetry message types are JSON unless a future binary payload explicitly documents otherwise.
 
 ## Authentication boundary
 
-The runtime WebSocket is an internal appliance transport. Its HTTP upgrade must
+The runtime WebSocket is an internal native-host transport. Its HTTP upgrade must
 carry `Authorization: Bearer <internal gateway token>`; the token is loaded from
 `NOESIS_INTERNAL_AUTH_TOKEN_FILE` (owner-only) and is never accepted in a URL or
 query string. Browsers obtain a short-lived, one-use ticket from Menon and
@@ -15,15 +15,16 @@ connect through the same-origin gateway; they never receive the internal token.
 not a production fallback. Missing or invalid authentication returns HTTP 401
 before a client enters the WebSocket connection set.
 
-The exact authenticated path `/healthz` is reserved for appliance lifecycle
+The exact authenticated path `/healthz` is reserved for runtime lifecycle
 checks. After a successful upgrade it sends one bounded frame and closes:
 
 ```json
 {"type":"health","contract":"noesis.ws.health","contract_version":1}
 ```
 
-That v1 frame is the non-selector runtime liveness contract. A selector-driven
-DS8 or DS9 runtime instead sends strict `noesis.ws.health` v2:
+That v1 frame is the unbound development liveness contract. The canonical
+native DS9.1 runtime sends strict `noesis.ws.health` v2 from its explicit health
+identity:
 
 ```json
 {
@@ -33,7 +34,7 @@ DS8 or DS9 runtime instead sends strict `noesis.ws.health` v2:
   "deployment_id": "<deployment-id>",
   "selector_sha256": "<64 lowercase hex characters>",
   "state_release_id": "<state-release-id>",
-  "runtime_family": "ds8|ds9",
+  "runtime_family": "ds9",
   "runtime_variant": "<family-prefixed exact variant>",
   "instance_id": "<producer instance>",
   "run_id": "<producer run>",
@@ -51,7 +52,7 @@ it never sends a partial v2 payload or falls back to v1.
 
 Health connections never enter the telemetry client set, acquire a WebRTC
 gateway, invoke UI snapshot callbacks, or receive configuration, calibration,
-trail, stats, tracking, world, or media payloads. DS8, V3DT, and DS9 share this
+trail, stats, tracking, world, or media payloads. DS9.1 baseline and the disabled V3DT adapter share this
 server boundary. They are therefore excluded from telemetry-client capacity.
 
 Authenticated telemetry clients are bounded for the single-home LAN product.
@@ -121,7 +122,7 @@ Canonical type routing is explicit and fail-closed:
 
 The release callback is an in-process authority trust boundary, not a
 cryptographic capability. Production call-site tests therefore restrict the
-gated API to the byte-identical DS8/DS9 tracking publishers plus its WebSocket
+gated API to the byte-identical DS9.1 tracking publishers plus its WebSocket
 definition; those publishers alone bind it to `CanonicalWorldService.commit`.
 An arbitrary same-process caller could always violate Python object privacy, so
 exclusive call sites, exact shape validation, and fail-closed runtime review are
@@ -137,7 +138,8 @@ non-canonical message type, occurs only after sender admission.
 
 ## 2. Stats (`type: stats`)
 
-Emitted ~1 Hz when `stats_callback` is registered (`ds8_runtime._build_stats_callback`).
+Emitted ~1 Hz when `stats_callback` is registered
+(`DS9/noesis/ds9_runtime_core.py`).
 
 ```json
 {
@@ -145,14 +147,14 @@ Emitted ~1 Hz when `stats_callback` is registered (`ds8_runtime._build_stats_cal
   "payload": {
     "timestamp": <float>,
     "uptime": <float>,
-    "stack": "ds8",
+    "stack": "ds9",
     "application": {
       "running": <bool>,
       "cameras_active": <int>,
       "processors_active": <int>
     },
     "pipeline": {
-      "stack": "ds8",
+      "stack": "ds9",
       "prepared": <bool>,
       "activated": <bool>,
       "depth_enabled": <bool>,
@@ -305,9 +307,15 @@ The three geometry/capture health blocks are runtime-owned and fixed-schema:
   false while a request owns a per-camera/global admission lease and remains
   false after a fatal barrier error until a later exact capture succeeds.
 
-`depth_enabled` and `depth_fps` still describe the on-demand MapAnything branch. The baseline DAv2 depth-tracking lane used by non-`v3dt` world estimation is separate and always-on when the baseline runtime starts successfully.
+`depth_enabled` and `depth_fps` still describe the on-demand MapAnything branch.
+The baseline DAv2 depth-tracking lane used by world estimation is separate and
+always on when the baseline runtime starts successfully.
 
-Baseline non-`v3dt` startup also requires a prebuilt room-registration artifact (`depth_registration.path` in `config/infer.yaml`, default `config/depth_registration.json`). DS8 loads that artifact before activation and fails fast if any enabled camera is missing a valid DAv2→MapAnything registration entry.
+Native baseline startup also requires a prebuilt room-registration artifact
+(`depth_registration.path` in `DS9/config/infer.yaml`, default
+`DS9/config/depth_registration.json`). DS9.1 loads that artifact before opening
+the sources and fails fast if an enabled camera lacks a valid
+DAv2-to-MapAnything registration entry.
 
 The baseline DAv2 capture and later object-fusion operators rendezvous by exact
 `(source_id, frame_id, media PTS)`. Fusion waits for the exact sibling frame for
@@ -331,7 +339,8 @@ accepts a future/wrong-source frame. The result is observable under
 
 ## 3. Mosaic Video (WebRTC)
 
-Mosaic video is delivered via RTSP→WebRTC gateway; WebSocket is **signaling only**.
+Mosaic video is delivered through one private H.264 SHM→WebRTC path; WebSocket
+is **signaling only**.
 
 - `webrtc_offer` (client → server): `{ "type": "webrtc_offer", "sdp": "<offer sdp>" }`
 - `webrtc_answer` (server → owner): `{ "type": "webrtc_answer", "sdp": "<answer sdp>" }`
@@ -349,15 +358,16 @@ clears owner routing, and `reset_peer` rebuilds ICE, DTLS, and RTP state before 
 warm gateway slot may be reused. Reset failure retires that slot. Menon closes
 its `RTCPeerConnection` and stops all local media tracks whenever the Noesis
 socket disconnects or its authenticated browser session becomes invalid.
-DS8, the protected V3DT runtime, and DS9 require the RTSP mount to answer a
-successful `DESCRIBE` before starting a warm gateway. They start a bounded warm
-set (one by default) and create remaining configured slots only on demand.
+The native runtime requires advancing H.264 access units from the private SHM
+edge before a warm gateway is useful. It starts a bounded warm set (one by
+default) and creates remaining configured slots only on demand. RTSP is disabled
+and is not a media or readiness dependency.
 
 Negotiation privacy: offer/answer SDP, ICE candidates, DTLS fingerprints, and
 TURN credentials are transient signaling data and are not persisted or written
 to runtime logs. Diagnostics expose only bounded connection-state, direction,
 payload-type, and packet/frame-count summaries. External STUN is disabled by
-default for the LAN appliance; `NOESIS_MOSAIC_WEBRTC_STUN_SERVER` is an explicit
+default for the LAN deployment; `NOESIS_MOSAIC_WEBRTC_STUN_SERVER` is an explicit
 deployment opt-in.
 
 ## 4. BEV Frames
@@ -492,17 +502,25 @@ Emitted by `BevRenderer`:
 - A valid authority plus an exact tracking frame with no people is still a
   normal BEV publication (`footpoints: []`) and a renderer success. Health must
   not reinterpret empty occupancy as absence of a frame attempt.
-- DS8, DS9, and the protected V3DT producer scale image anchors, candidate
+- The DS9.1 baseline and disabled V3DT adapter scale image anchors, candidate
   points, and bbox coordinates from the track/frame image size into the active
   calibration snapshot's `image_size` before BEV homography, ray-floor, or
-  registered-depth unprojection. Protected V3DT does not retain its historical
+  registered-depth unprojection. The disabled V3DT adapter does not retain its historical
   unscaled source-frame path.
 - `footpoints[].motionMode`, `posture`, `trailAppendAllowed`, and `idleJitterM` are producer-owned human-pathing diagnostics from `PersonGroundState` (`noesis/telemetry/person_ground_state.py`). When `trailAppendAllowed` is false (stationary / sit / lie lock), backend trails must not grow new path samples for that track; the head may still update in place.
 - When `NOESIS_BEV_ALIGNMENT_DEBUG=1` is set, `bev-frame` may include top-level `alignmentDebug`, and each footpoint may include `rawX`, `rawY`, `smoothed`, and `alignmentDebug` with per-candidate image anchors, ray-floor projections, optional static floorplan/MapAnything snapshot samples, live-world candidate diagnostics, snapshot ids, grid cells, and selected-coordinate bounds. These fields are diagnostic-only and are not used to place live tracked people.
 
-- Optional JPEG binary: **Retired**. The framed `bev:<camera>` binary path is no longer produced (meta-only mode is the supported baseline per design decisions and Baselines.md). The general binary coalescer in the WebSocket server is retained for potential future use (e.g., binary depth).
+- Optional JPEG binary: **Retired**. The framed `bev:<camera>` binary path is no
+  longer produced (metadata-only mode is the supported baseline documented in
+  `runtime_baseline.md`). The general binary coalescer remains available only
+  for explicitly contracted binary payloads.
 - In world mode (`frame_mode=world`), BEV footpoints remain producer-owned scene coordinates and should be treated as the canonical `track.world` head points emitted by the backend. The BEV renderer must not apply a second world-space low-pass filter to those points.
-- Motion smoothing ownership is declared explicitly by `trail_smoothing_owner`. In the current baseline world-mode path the backend owns trail history (`trail_smoothing_owner=backend`) while `bev_world_points_smoothed=false`, because the canonical per-track world estimator in `hooks.py` / `person_ground_state.py` already owns the only track-position filtering stage (human CV filter + stationary lock).
+- Motion smoothing ownership is declared explicitly by `trail_smoothing_owner`.
+  In the current baseline world-mode path the backend owns trail history
+  (`trail_smoothing_owner=backend`) while `bev_world_points_smoothed=false`,
+  because `DS9/noesis/pipelines/hooks.py` and the shared
+  `person_ground_state.py` already own the only track-position filtering stage
+  (human CV filter + stationary lock).
 - When `trail_smoothing_owner=backend`, `trails` carries the producer trail polylines already used by the BEV renderer, in the declared BEV `frame` with epoch-millisecond sample times. The dashboard should render those directly instead of reconstructing its own history from `footpoints`.
 - World-mode BEV omits `anchor_hold` head points from `footpoints`/`trails` so stale held positions do not render as drifting or out-of-bounds trail segments after temporary occlusion.
 - Backend world-BEV smoothing and trail history are keyed by tracker-local identity (`trackerId` when present, otherwise `stableId`) to match the nvOSD trail path; `stableId` remains display metadata and may legitimately span multiple tracker histories over time.
@@ -530,7 +548,13 @@ so a mismatch is a cache miss, not permission to publish the previous geometry.
 
 Also inspect producer pathing health: `motionMode` / `posture` thrash, `trailAppendAllowed=false` while still growing path history, elevated `idleJitterM` while a person is clearly stationary, and `world_source` flip rate (sticky hysteresis should keep sources stable across brief pose dropouts). Sitting/lying vibration is primarily a contact-geometry + idle-lock problem, not something to “fix” with heavier global EMA.
 
-Use `scripts/bev_alignment_diagnostics.py` against the same DS8/RTSP path that reproduces the issue and inspect `trail_segment_speed_mps`, `top_trail_segments`, `speed_by_source_transition_mps`, `raw_speed_by_source_transition_mps`, `top_jumps`, and `display_selection_reason_by_camera`. A cosmetic smoother may hide the symptom, but a durable fix should explain whether the jump came from a floorplan-space reset miss, an identity/tracker transition, a source-policy flip such as `registered_depth_anchor->world_to_camera_local`, or bad raw anchor geometry. The 2026-07-02 retained fix is documented in `plans/DS8/ds8_design_decisions.md` under "BEV floorplan / trail source stability"; the rejected experiment that globally preferred live world points over registered depth increased source flips and trail p95, so avoid reintroducing that policy as a jitter fix. The 2026-07-08 human pathing work (`person_ground_state.py`) is the retained fix for sit/stand/lie stability and idle trail scribble.
+Use `scripts/bev_alignment_diagnostics.py` against the same native WebSocket
+path that reproduces the issue and inspect `trail_segment_speed_mps`,
+`top_trail_segments`, source transitions, raw jumps, and display-selection
+reason. A cosmetic smoother may hide the symptom; a durable fix explains
+whether it came from a floorplan reset, identity/tracker transition, projection
+policy change, or bad raw anchor geometry. Historical experiments are recorded
+in `plans/archive/ds8/ds8_design_decisions.md`.
 
 ## 5. Depth Telemetry (`type: depth_result`)
 
@@ -556,7 +580,8 @@ The reference is an opaque stable identifier for the internal artifact, not a
 filesystem path or fetch URL. Public telemetry never reveals the storage root,
 camera directory, or backend URI.
 
-Publication is durable-before-visible across DS8, protected V3DT, and DS9.
+Publication is durable-before-visible across the DS9.1 baseline and disabled
+V3DT adapter.
 The MapAnything worker must receive the exact `WriteHandle` commit receipt
 before it records the depth frame, constructs `DepthResult`, or publishes this
 message. `NOESIS_DEPTH_STORE_COMMIT_TIMEOUT_S` controls that bounded wait: the
@@ -737,7 +762,7 @@ Empty frames are first-class: when a camera's active person count is zero, Noesi
 }
 ```
 
-For `tracks[].zone`, the shared DS8/V3DT/DS9 resolver treats per-object
+For `tracks[].zone`, the shared DS9.1/V3DT resolver treats per-object
 `analytics.ocStatus` as the primary household room membership. A unique
 `analytics.roiStatus` label is compatibility evidence only when `ocStatus` has
 no nonempty membership. Labels are compared exactly: identical duplicates are
@@ -747,7 +772,7 @@ labels produce no authoritative zone. A camera-derived fallback is stamped
 
 Tracking telemetry has two world-source scopes:
 
-- Top-level `world_source="backend_world_fused"` advertises that the baseline DS8 runtime owns the canonical world estimator in the backend.
+- Top-level `world_source="backend_world_fused"` advertises that the baseline DS9.1 runtime owns the canonical world estimator in the backend.
 - Per-track `world_source` records which observation path updated that specific track on the current frame.
 
 `tracks[].scene_prior` is optional, additive shadow evidence for cameras bound
@@ -846,7 +871,7 @@ the missing cohort. The same committed snapshot is then emitted independently:
     "contract": "noesis.world.snapshot",
     "contract_version": 1,
     "snapshot_id": "<run-id>:<sequence>",
-    "producer": {"runtime": "ds8", "instance_id": "<host>", "run_id": "<uuid>", "software_revision": "<revision>"},
+    "producer": {"runtime": "ds9", "instance_id": "<host>", "run_id": "<uuid>", "software_revision": "<revision>"},
     "sequence": <int>,
     "observed_start_us": <int>,
     "observed_end_us": <int>,
@@ -894,7 +919,13 @@ Fusion state is service-private; read consumers receive only the cached
 immutable last-committed snapshot, so inspection cannot consume a sequence,
 expire an entity, clear a source, or bypass the journal/revision boundary.
 
-Baseline non-`v3dt` mode uses one canonical person-anchor estimator in `noesis/telemetry/person_ground_state.py` (via analytics hooks): pose-derived image anchor when available (posture-aware: ankles for standing, hip/body for sitting/lying), otherwise the person mask/depth image anchor from `NOESIS.OBJECT_DEPTH.anchor_uv`. Bent-leg ankle extrapolation (`pose_leg_floor`) is rejected. A concurrent DAv2 range observation from `NOESIS.OBJECT_DEPTH` is fused on that same current-anchor ray when valid. The canonical per-track values are:
+The active baseline uses one canonical person-anchor estimator in
+`noesis/telemetry/person_ground_state.py` through the DS9.1 analytics hook:
+pose-derived image anchor when available (posture-aware ankles for standing,
+hip/body for sitting or lying), otherwise the person mask/depth image anchor
+from `NOESIS.OBJECT_DEPTH.anchor_uv`. Bent-leg ankle extrapolation
+(`pose_leg_floor`) is rejected. A concurrent DAv2 range observation is fused on
+that same current-anchor ray when valid. The canonical per-track values are:
 
 Before a floor intersection can seed height lock or person-ground filter state,
 the producer measures its horizontal camera-to-hit range in calibrated world
@@ -966,7 +997,7 @@ Depth exposure:
   rule above. Consumers must not infer it from `depth_anchor_m`,
   `depth_median_m`, or attachment attempts independently.
 
-When pose anchoring, gravity-drop, and recent-anchor hold all fail, DS8 leaves `world_valid=false` instead of promoting bbox-bottom floor projection into a synthetic world point.
+When pose anchoring, gravity-drop, and recent-anchor hold all fail, DS9.1 leaves `world_valid=false` instead of promoting bbox-bottom floor projection into a synthetic world point.
 
 Validation diagnostics:
 
@@ -1069,7 +1100,7 @@ Handled in `websocket_server.py`:
 - Heartbeat: `ping` → `pong`.
 
 The former `update_detection_config`, `set_detection_toggle`, and
-`ma_heatmap_ready` messages are retired. None had a registered DS8/V3DT/DS9
+`ma_heatmap_ready` messages are retired. None had a registered DS9.1/V3DT
 runtime owner, so acknowledging or rebroadcasting them misrepresented frontend
 state as applied. The dashboard no longer emits them and Menon's gateway does
 not admit them. Any future live detector control must first define an explicit
@@ -1410,12 +1441,10 @@ Returned from `get_floorplan` (`DepthStorageManager.generate_topdown_floorplan`)
   later comparison work, but validates and discards that response from visible
   drawer state; it cannot replace an admitted PCF response.
 
-The wire payload above is `floorplan_contract_version=10`. DS9 promotion
-uses the separate replayable `noesis.ds9.floorplan-live-gate` schema/contract
-v4 (`mapanything_depth_quality_v4`): it proves exact fresh captures and
-zero-mutation cache-only reads for every configured camera, N/N active-registry
-authority, and reconciled BEV renderer health. Pre-v4 reports are not valid
-promotion evidence.
+The wire payload above is `floorplan_contract_version=10`. The retained
+`noesis.ds9.floorplan-live-gate` v4 schema can replay exact-capture evidence, but
+ordinary development validates only the affected fresh/cache/PCF path directly;
+it does not require a promotion report.
 
 ### Depth/floorplan error codes
 
@@ -1448,15 +1477,15 @@ payload.
 
 ### auto_calibrate_result
 
-Current DS8 runtime proxies Menon auto-calibration: `{ type: "auto_calibrate_result", ok: <bool>, updated: [<cameraId>], results: [...], error?: <string|null> }`.
+Current DS9.1 runtime proxies Menon auto-calibration: `{ type: "auto_calibrate_result", ok: <bool>, updated: [<cameraId>], results: [...], error?: <string|null> }`.
 
 ## 8. Calibration Data Conventions
 
-Same as prior DS8 revisions:
+Same as prior DS9.1 revisions:
 
 - **Extrinsics (`E`)**: stored in `config/camera_calibration.json`, world→camera, 4×4 column-major, meters.
-- **PoseV1 (`pose`)**: stored scene pose summaries (`position`, `yaw_pitch_roll_deg`, `rotation_order=YXZ`, `frame=menon_scene`) are authoritative scene-camera poses, not raw OpenCV image-camera extrinsics. Converting PoseV1 to `E` applies a fixed local 180 degree roll so the resulting camera basis matches DS8 depth/image math (`+X right`, `+Y down`, `+Z forward`).
-- **Intrinsics (`K`)**: from `config/cameras.yaml` (`intrinsics_models` + `cameras` map). Scaled to streammux resolution in `ds8_runtime._CalibrationProvider`.
+- **PoseV1 (`pose`)**: stored scene pose summaries (`position`, `yaw_pitch_roll_deg`, `rotation_order=YXZ`, `frame=menon_scene`) are authoritative scene-camera poses, not raw OpenCV image-camera extrinsics. Converting PoseV1 to `E` applies a fixed local 180 degree roll so the resulting camera basis matches DS9.1 depth/image math (`+X right`, `+Y down`, `+Z forward`).
+- **Intrinsics (`K`)**: from `config/cameras.yaml` (`intrinsics_models` + `cameras` map). Scaled to streammux resolution by the calibration provider in `DS9/noesis/ds9_runtime_core.py`.
 - **Alignment (`align`)**: `config/ply_alignment.json` with `matrix` (room-model alignment), `floor_y`, and `units.s_obj_to_m`.
 - **Calibration bundle (`calibration-bundle`)**: carries the canonical backend-world-meters pose/extrinsics plus the room-alignment metadata Menon needs for its own scene conversion. When `align.scene_similarity` is present, it includes `s_obj_to_m` and authoritative `world_to_scene_sha256`, computed over canonical JSON `{world_to_scene_col_major, s_obj_to_m}`. Consumers use that digest directly rather than reproducing Python float serialization.
 - `pixel_to_world_response` returns world-frame meters; Menon applies its room alignment and scene-unit conversion client-side.

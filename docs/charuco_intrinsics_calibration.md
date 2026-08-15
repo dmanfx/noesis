@@ -1,5 +1,5 @@
-# ChArUco Intrinsics Calibration (DS8)
-_Status: current as of 2026-02-02._
+# ChArUco intrinsics calibration
+_Status: native DS9.1 workflow, updated 2026-08-15._
 
 This guide shows how to calibrate camera intrinsics using a ChArUco board and
 apply the results to both `intrinsics.json` and `config/cameras.yaml`.
@@ -16,8 +16,8 @@ if it differs from 30 mm.
 
 ## Capture checklist
 
-1. Use the exact camera feed settings you run in DS8 (resolution, crop, zoom).
-   If DS8 uses a substream, calibrate on that substream; scaling a full-res
+1. Use the exact camera feed settings you run in DS9.1 (resolution, crop, zoom).
+   If DS9.1 uses a substream, calibrate on that substream; scaling a full-res
    calibration can be wrong when the substream is cropped/zoomed.
 2. Capture 30 to 80 images with the board at:
    - different positions across the frame (center, corners, edges)
@@ -47,7 +47,7 @@ python3 scripts/charuco_calibrate_intrinsics.py \
 The script writes a JSON report under `diagnostics/` and prints the intrinsics.
 Aim for median reprojection error around 0.5 to 1.5 px; lower is better.
 
-## Update intrinsics.json (DS8 tilt preview + intrinsics bundle)
+## Update calibrated intrinsics
 
 To update the canonical intrinsics file:
 
@@ -113,6 +113,11 @@ Note: the dewarper config now includes `dst-focal-length` and
 
 ## After calibration
 
-1. Regenerate camInfo using the updated intrinsics:
-   - `NOESIS_V3DT_AUTOGEN_CAMINFO=1 python3 noesis/ds8_runtime.py --pipeline-config config/infer_v3dt_medium.yaml`
-2. Run the V3DT forensics snapshot + analyze to confirm projection metrics.
+1. Update the selected model in `config/cameras.yaml` and bind the camera to it.
+2. Run the focused calibration/intrinsics tests and one projection overlay for
+   the changed camera.
+3. Restart the managed runtime only when accepting the new intrinsics.
+
+MV3DT is currently disabled. If its geometry work resumes, regenerate its
+camInfo with `scripts/generate_v3dt_caminfo.py` and validate the explicit
+candidate config; do not enable it as part of ordinary intrinsics calibration.

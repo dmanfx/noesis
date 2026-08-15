@@ -6,7 +6,7 @@ metadata:
   author: "NVIDIA CORPORATION <info@nvidia.com>"
 service: deepstream
 version: 1.1.1
-reviewed: 2026-04-24
+reviewed: 2026-08-15
 license: CC-BY-4.0 AND Apache-2.0
 ---
 
@@ -16,14 +16,22 @@ This skill requires access to all of the reference documents listed in the `refe
 
 When this skill is active, **ALWAYS read the relevant reference documents** before generating code. Do NOT rely on memory - the reference documents contain critical details about exact property names, correct API usage, and common pitfalls.
 
+## Noesis repository override
+
+For this repository the canonical target is DeepStream **9.1 on the native
+host**, never Docker. Root `AGENTS.md`, `DS9/AGENTS.md`, the installed SDK, and
+`DS9/docs/deepstream_9_1_agent_skills.md` override older sample versions or
+container recipes in the bundled vendor references. Do not use the Docker
+reference for Noesis implementation, build, validation, or operation.
+
 ## SDK and Architecture Quick Reference
 
 ### DeepStream SDK Version Requirements
 
 - **GStreamer**: 1.24.2
-- **NVIDIA Driver**: 590+
-- **CUDA**: 13.1
-- **TensorRT**: 10.14.1.48
+- **NVIDIA Driver**: 595.58.03 or newer
+- **CUDA**: 13.2
+- **TensorRT**: 10.16.0.72
 - **Platforms**: Ubuntu 24.04 (x86_64 and ARM64/Jetson)
 
 ### Typical Pipeline Flow
@@ -129,7 +137,7 @@ DeepStream uses NVIDIA Video Memory Manager (NVMM) for zero-copy GPU buffer tran
     ```bash
     python3 -m venv venv
     source venv/bin/activate
-    pip install /opt/nvidia/deepstream/deepstream/service-maker/python/pyservicemaker*.whl pyyaml
+    pip install /opt/nvidia/deepstream/deepstream-9.1/service-maker/python/pyservicemaker*.whl pyyaml
     pip install -r requirements.txt  # other dependencies
     ```
     **Symptom if missing**: `ModuleNotFoundError: No module named 'pyservicemaker'` when running the app inside the venv.
@@ -162,7 +170,7 @@ DeepStream uses NVIDIA Video Memory Manager (NVMM) for zero-copy GPU buffer tran
 | [references/troubleshooting.md](references/troubleshooting.md) | Error messages and solutions |
 | [references/rest_api_dynamic.md](references/rest_api_dynamic.md) | REST API, dynamic source add/remove, nvmultiurisrcbin |
 | [references/metamux_config.md](references/metamux_config.md) | nvdsmetamux config, parallel multi-model inference, metadata merging, source ID filtering |
-| [references/docker_containers.md](references/docker_containers.md) | Docker images, Dockerfile examples, pyservicemaker install, container run commands |
+| [references/docker_containers.md](references/docker_containers.md) | Generic upstream reference only; prohibited for the native Noesis runtime |
 | [references/nvds_msgapi_adapter.md](references/nvds_msgapi_adapter.md) | Building custom protocol adapters: nvds_msgapi |
 
 ## Quick Error Reference
@@ -180,7 +188,7 @@ DeepStream uses NVIDIA Video Memory Manager (NVMM) for zero-copy GPU buffer tran
 | RTSP no data/reconnecting | Test URL with ffplay, check credentials |
 | `RuntimeError: Probe failure` | `measure_fps_probe` cannot attach to sink elements; use `nvinfer` or `nvosdbin` instead |
 | `setDimensions` negative dims / engine build failed | Add `infer-dims=C;H;W` for dynamic ONNX models (e.g., `infer-dims=3;640;640`) |
-| `No module named 'pyservicemaker'` in venv | `pip install /opt/nvidia/deepstream/deepstream/service-maker/python/pyservicemaker*.whl pyyaml` inside the venv |
+| `No module named 'pyservicemaker'` in venv | Install the wheel from `/opt/nvidia/deepstream/deepstream-9.1/service-maker/python/` inside the native venv; do not change the pipeline API |
 | `AttributeError: object has no attribute 'obj_label'` | Use `obj_meta.label` not `obj_meta.obj_label` in pyservicemaker (C API name differs from Python binding) |
 
 <!-- Signing refresh marker. -->

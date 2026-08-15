@@ -22,12 +22,11 @@ version: "0.1.0"
 reviewed: "2026-04-24"
 license: CC-BY-4.0 AND Apache-2.0
 compatibility: >
-  DeepStream SDK 9.0 on Ubuntu 22.04 or 24.04, run from the
-  `nvcr.io/nvidia/deepstream:9.0-triton-multiarch` container (the dev image; the slimmer
-  `samples-multiarch` variant strips the nsys NVTX injector and produces empty per-plugin
-  NVTX traces — do not use it for profiling). Requires `nsys` (Nsight Systems 2024+) and
-  `nvidia-smi` on PATH. No GUI dependency — the skill runs fully headless and uses only
-  `nsys profile` + `nsys stats`.
+  DeepStream SDK 9.1.0 on the native Ubuntu 24.04 Noesis host. Use the
+  installed SDK and the repository's exact CUDA/TensorRT/native artifacts;
+  Docker and older DeepStream SDKs are not valid Noesis profiling targets.
+  Requires `nsys` (Nsight Systems 2024+) and `nvidia-smi` on PATH. No GUI
+  dependency; the skill runs headlessly with `nsys profile` and `nsys stats`.
 data_classification: "internal"
 ---
 
@@ -89,7 +88,7 @@ them; they just get a pipeline that's already in the right shape.
 | Decoder `cudadec-memtype` | `0` (NVMM) | — |
 | Sink | `fakesink sync=False` for the benchmark variant | User asked for on-screen display or on-disk recording (then keep OSD/tiler/encoder/sink and produce TWO variants). |
 | OSD + tiler | omit | User asked for visible output. |
-| Tracker `ll-config-file` | `config_tracker_NvDCF_max_perf.yml` (perf-tuned NvDCF preset shipped with DS 9.0) | Tracker not present. |
+| Tracker `ll-config-file` | the repository-selected NvDCF performance profile for the installed DS9.1 SDK | Tracker not present. |
 | Tracker `tracker-width / height` | 480 / 288 | — |
 | Tracker `enable-batch-process` (in linked YAML) | `1` | — |
 | Queue between source and pgie | `max-size-buffers = batch_size × 4` | No queue requested (rare). |
@@ -279,7 +278,7 @@ Report (Markdown, to stdout — no external UI):
 | ...             | ...                | ...       | (other plugins as the verification probe shows) |
 
 (Numbers above are illustrative — fill in from `nsys stats --report nvtx_sum`. Plugins
-that don't emit NVTX in your DS / image combo simply don't appear; that's not a bug, it's
+that don't emit NVTX in your DS / toolchain combo simply don't appear; that's not a bug, it's
 the limit of what NVTX captures here. See `references/nvtx-coverage.md`.)
 
 ### Applied configs (sample shape; values come from R1–R6 + Stage 3 measurements)
@@ -320,15 +319,16 @@ Keep the summary terse. Raw `nsys stats` CSV goes into the temp file, not the re
 
 - `deepstream-generate-pipeline` — upstream pipeline generation. This skill
   assumes a pipeline already exists or is about to be generated.
-- `deepstream-byovm` — HF → TensorRT engine building. Run first if the user
-  brought a new model; come here after.
+- `deepstream-import-vision-model` — model import and TensorRT engine building.
+  Run it first when the user brings a new detection model, then return here.
 
 ## Notes
 
-- Lives in `skills/deepstream-profile-pipeline/` alongside the other DS skills, per
-  the repo convention in `CLAUDE.md`.
+- Lives in `.agents/skills/deepstream-profile-pipeline/` alongside the other
+  DeepStream skills. Repository routing and pins are documented in
+  `DS9/docs/deepstream_9_1_agent_skills.md`.
 - For ground-truth on **any** plugin's properties (types, defaults, ranges) and pad caps,
-  query the loaded binary inside the DS container:
+  query the installed native DS9.1 binary on the host:
   ```bash
   gst-inspect-1.0 nvinfer
   gst-inspect-1.0 nvstreammux

@@ -1,68 +1,51 @@
-# AGENTS.md - DeepStream 9.1 Runtime
+# AGENTS.md — DeepStream 9.1 native runtime
 
-This folder owns the DeepStream 9.1 runtime, generated assets, and migration
-notes for the Noesis Service Maker app.
+`DS9/` owns the only executable DeepStream application in this repository.
 
-## Rules
+## Policy precedence
 
-1. Run DS9 only on the pinned DeepStream 9.1 stack.
-   - Required SDK path: `/opt/nvidia/deepstream/deepstream-9.1` or the vendor
-     `deepstream` link resolving to 9.1.
-   - Required CUDA/TensorRT baseline: CUDA 13.2 and TensorRT 10.16.0.72.
-   - Do not create DeepStream 8 or 9.0 compatibility symlinks.
+- Root `AGENTS.md` applies first; this file narrows DS9.1 work.
+- `DS9/docs/history/` is non-normative migration and experiment evidence.
 
-2. Use the matching NVIDIA skill first.
-   - Read the relevant `.agents/skills/*/SKILL.md` and routed references before
-     direct SDK, pipeline, model, profiling, or MV3DT work.
-   - Follow `DS9/docs/deepstream_9_1_agent_skills.md`; this file's 9.1 pins
-     override older example versions in upstream skill text.
-   - AMC execution is deferred. MV3DT remains disabled and has only one future
-     candidate edge, Kitchen/Family Room. Living Room/Family Room is not an
-     overlap pair.
+## Runtime authority
 
-3. Keep DS9 artifacts under `DS9/`.
-   - TensorRT engines: `DS9/models/engines/`
-   - Generated ONNX/configs: `DS9/models/onnx/`, `DS9/build/`
-   - Custom parser libs: `DS9/pipelines/*/*.so`
-   - Native Python extensions: `DS9/native_extensions/`
+- DeepStream 9.1.0 at `/opt/nvidia/deepstream/deepstream-9.1`.
+- CUDA 13.2, TensorRT 10.16.0.72, GStreamer 1.24.2, Python 3.12.
+- Native-host execution through `scripts/run_canonical_runtime_host.py`.
+- Entrypoint `noesis/ds9_runtime.py`; core wiring
+  `noesis/ds9_runtime_core.py`; config `config/infer.yaml`.
+- Canonical lane: YOLO26-m, NvDCF baseline tracking, Swin ReID, YOLO26 pose,
+  always-on DAv2 tracking depth, and gated MapAnything manual depth.
+- WebRTC/SHM mosaic enabled; RTSP disabled.
 
-4. Do not reuse DS8 or DS9.0 TensorRT engines or native extension binaries.
-   - Rebuild engines with DS9.1 TensorRT 10.16.0.72.
-   - Rebuild parser/native `.so` files against DS9.1 headers/libs.
+Do not use Docker, a container supervisor, DS8/DS9.0 binaries, or
+`noesis/ds8_runtime.py`. Container scripts retained pending archival/removal are
+not valid implementation or validation paths.
 
-5. Fail fast.
-   - If DS9 dependencies, parser libs, native extensions, engines, or source model artifacts are missing, report the missing item and stop.
-   - Do not route DS9 execution through DS8 install paths or fallback workflows.
-   - Do not import or spawn `noesis/ds8_runtime.py` from DS9 executable code.
-     DS9 runtime ownership lives in `DS9/noesis/ds9_runtime.py` and
-     `DS9/noesis/ds9_runtime_core.py`.
+## Required workflow
 
-6. Document every DS9 migration decision in `DS9/README.md` or a dedicated DS9 doc.
+1. Read the relevant NVIDIA skill and routed references using
+   `docs/deepstream_9_1_agent_skills.md`.
+2. Confirm APIs/config keys against the installed DS9.1 stack.
+3. Change the smallest owned implementation surface.
+4. Rebuild only affected native/parser/plugin/engine artifacts.
+5. Run focused tests and one bounded direct runtime or recorded smoke for the
+   changed capability.
 
-7. Validate DS9 changes directly by affected capability.
-   - Follow the root `AGENTS.md` direct-application validation policy.
-   - For ordinary DS9 work, do not stage an appliance release, clone state,
-     build a selector, publish a candidate, or run activation/rollback
-     ceremony. Use the local runtime/container, focused tests, and one short
-     live or recorded smoke instead.
-   - Use the Menon appliance selector/readiness/rollback path only when the
-     user explicitly requests promotion or the change cannot be exercised
-     without an external service/state lifecycle transition.
-   - For MapAnything/depth-panel work, default to the focused depth,
-     exact-capture, storage/fusion, frontend-build, manual-Refresh, cache-only,
-     and service-readiness gates affected by the change.
-   - A network change requires exact listener, reachability, TLS/auth, and
-     rollback checks. A systemd change requires unit validation,
-     dependency/start/stop/restart/readiness, and rollback checks. Neither
-     automatically requires model-quality, tracking, identity, occupied-scene,
-     long-soak, or sealed full-runtime evidence.
-   - A model or native change requires the affected DS9 engine/native loading,
-     tensor/metadata contract, and direct-consumer live path. It does not
-     automatically require every unrelated DS9 capability.
-   - Use full-system assurance only when the change crosses core pipeline
-     topology or shared source/frame/timestamp/identity/world semantics, when
-     its impact cannot be bounded after inspection, for a named release
-     candidate, or when explicitly requested.
-   - Reuse unchanged realized engines, native builds, and passed evidence. Do
-     not restart a release sequence after an unrelated failure; rerun only the
-     direct checks invalidated by the change.
+Do not create release candidates, selectors, state clones, bundles, promotion
+gates, or broad validation runs for ordinary DS9.1 work.
+
+## Artifact and capability constraints
+
+- Engines: external root selected by `NOESIS_DS9_ARTIFACT_ROOT`; declarations
+  and provenance in `asset_manifest.yaml` and `asset_realization.json`.
+- Native extension sources: `native/`; runtime binaries are installed into the
+  native root/realized location selected by the supervisor.
+- Parser/config sources: `pipelines/`; GStreamer plugins: `gst-plugins/`.
+- Fail closed on missing or incompatible artifacts. Never fall back to archived
+  engines or native libraries.
+- AMC and MV3DT remain disabled under the geometry gate in root policy.
+
+Record current DS9.1 decisions in `../docs/architecture_decisions.md` and dated
+milestones in `../docs/upgrade_history.md`; put migration diaries under
+`docs/history/`.

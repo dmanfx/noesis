@@ -1,44 +1,34 @@
-# Integrations Playbook (DS8)
-_Status: validated against code on 2026-07-10._
+# Integrations playbook
 
-DS8, V3DT, and DS9 do not wire MQTT/Influx publishing. The older integrations
-playbook is archived under `docs/history/`; it is not an activation runbook for
-the current appliance.
+Status: native DS9.1 application, 2026-08-15.
 
-## What Exists
-- `noesis.telemetry.publishers.bind_occupancy_publisher(...)` exposes an adapter
-  slot, but every active runtime binds it to `None` and no active occupancy
-  publisher implementation exists.
-- `geometry/depth_publisher.py` is a dormant depth-summary publisher
-  (median/p10/p90/conf/valid ratio/sample count). No active code imports or
-  constructs it.
-- `config.py` contains disabled integration flags and non-secret connection
-  metadata. It contains no MQTT password or Influx token.
+No MQTT or Influx publisher is enabled in the canonical runtime. Occupancy and
+depth diagnostics are available through the authenticated Noesis contracts and
+Menon gateway.
 
-## How to Wire in DS8
-Treat activation as a product change, not a configuration-only operation:
+## Existing integration points
 
-1. Define and test the typed publisher adapter in the shared product boundary.
-2. Use `DepthDiagnosticsPublisher.from_settings(...)` so disabled sinks read no
-   credentials and enabled sinks fail closed.
-3. Bind occupancy through
-   `noesis.telemetry.publishers.bind_occupancy_publisher(...)` only after an
-   active implementation exists.
-4. Apply equivalent product behavior to DS8 and DS9 without adding appsink/CPU
-   branches.
-5. Validate credentials and client startup before runtime activation; do not
-   continue with an enabled sink silently disabled.
+- `noesis.telemetry.publishers.bind_occupancy_publisher(...)` defines an
+  optional adapter slot; the canonical runtime binds no external publisher.
+- Tracking WebSocket payloads carry per-track zone labels and per-camera
+  occupancy counts.
+- `geometry/depth_publisher.py` is dormant and not constructed by DS9.1.
+- Public config contains only non-secret connection metadata. Credentials must
+  come from validated owner-only files.
 
-The owner-only file contract and rotation procedure are documented in
-`docs/integrations/occupancy_mqtt_influx.md`.
+## Adding an external publisher
 
-## Recommended Contracts
-- Occupancy topics/measurements: reuse the schema from `docs/Occupancy_Publishing.md` (room slugs + retained MQTT scalars; nanosecond Influx points on change).
-- Depth summaries: use fields (`median`, `p10`, `p90`, `conf_mean`, `valid_ratio`, `sample_count`) keyed by camera/room.
+Treat activation as a product/contract change:
 
-## Notes
-- DS8 tracking telemetry already carries occupancy counts (`stats.payload.cameras[*].tracking.occupancy`). Use WebSocket when possible to avoid duplicate plumbing.
-- Keep non-secret integration behavior in version-controlled config. Deployment
-  tooling may supply only the private credential-file paths through the
-  documented `*_FILE` environment variables; raw secret environment variables
-  are rejected.
+1. Define the typed adapter and failure policy.
+2. Keep frame processing GPU-first; publish from metadata, not a new frame
+   appsink.
+3. Load credentials only when enabled and fail closed if they are invalid.
+4. Test the producer, adapter, broker/client contract, and one direct consumer.
+5. Measure only the affected serialization/network boundary.
+
+Do not silently continue with a configured sink disabled. Do not add a second
+occupancy taxonomy; use canonical room IDs from post-tracker analytics.
+
+The credential contract and proposed MQTT/Influx shapes are in
+`integrations/occupancy_mqtt_influx.md`.

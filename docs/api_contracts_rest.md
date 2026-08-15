@@ -1,11 +1,11 @@
-# DS8 REST API Contracts
-_Status: dense-depth bulk transport and validation-toolbox addenda current as of 2026-07-24._
+# DS9.1 REST API contracts
+_Status: canonical native-host contract, updated 2026-08-15._
 
-This document describes the REST endpoints used by the DS8 runtime. Implementations must preserve these contracts unless all consumers are updated in lockstep.
+This document describes the REST endpoints used by the DS9.1 runtime. Implementations must preserve these contracts unless all consumers are updated in lockstep.
 
 ## Wire-render and boundary-metric contract
 
-All 41 successful FastAPI-rendered product JSON routes shared by DS8, V3DT, and DS9 keep
+All 41 successful FastAPI-rendered product JSON routes shared by DS9.1 baseline and the disabled V3DT adapter keep
 FastAPI's declared `response_model`, status, headers, aliases, and exclusion
 settings as the wire authority. This includes depth, analytics, ReID v1/v2,
 capability/deployment health, scene metadata, and virtual-twin metadata.
@@ -40,7 +40,7 @@ responses are not successful product payloads and do not fabricate samples.
 
 ## Authentication boundary
 
-The runtime REST application is internal to the local appliance. Every request
+The runtime REST application is internal to the native host. Every request
 requires `Authorization: Bearer <internal gateway token>`, loaded from the
 owner-only `NOESIS_INTERNAL_AUTH_TOKEN_FILE`. Menon terminates browser sessions,
 CSRF/origin policy, roles, confirmations, and audit, then calls Noesis with this
@@ -62,10 +62,11 @@ failed when publication stops; an open listener alone never counts as health.
 The canonical runtime reports `tracking_observations` and `global_world` from
 actual observation/world publication cycles.
 
-## Selector-bound deployment health
+## Native deployment health
 
-`GET /api/v1/health/deployment` is the admission surface for a selector-driven
-appliance runtime. It returns strict `noesis.appliance.deployment_health` v1
+`GET /api/v1/health/deployment` is the native runtime identity/readiness
+surface. It retains the strict `noesis.appliance.deployment_health` v1 schema
+for consumer compatibility and returns it
 only after the runtime has bound one immutable producer identity and both
 `tracking_observations` and `global_world` are currently healthy:
 
@@ -76,7 +77,7 @@ only after the runtime has bound one immutable producer identity and both
   "deployment_id": "<deployment-id>",
   "selector_sha256": "<64 lowercase hex characters>",
   "state_release_id": "<state-release-id>",
-  "runtime_family": "ds8|ds9",
+  "runtime_family": "ds9",
   "runtime_variant": "<family-prefixed exact variant>",
   "instance_id": "<producer instance>",
   "run_id": "<producer run>",
@@ -87,16 +88,16 @@ only after the runtime has bound one immutable producer identity and both
 }
 ```
 
-The route returns `503` when no selector binding exists, the producer is not
-bound, the capability monitor is unavailable, either required capability has
-not advanced into healthy state, or producer identities disagree. It never
+The route returns `503` when native health identity is missing, the producer is
+not bound, the capability monitor is unavailable, either required capability
+has not advanced into healthy state, or producer identities disagree. It never
 turns listener liveness into readiness.
 
-`selector_sha256` is the retained admission proof. The canonical selector
-binds the `noesis-runtime-v1` checkout/runtime snapshot and the selected state
-release; the response deliberately does not claim a fresh full-checkout hash
-on every health read. DS8 verifies that snapshot during selector admission and
-DS9 verifies it during admission and again immediately before container exec.
+`selector_sha256` is a legacy field name retained on the wire. The native
+supervisor supplies a fixed health-authority digest through
+`NOESIS_HEALTH_SELECTOR_SHA256`; it does not read a deployment-selector file.
+`state_release_id` names the installed state baseline. The response deliberately
+does not rehash the checkout or state on every health read.
 
 ## Scene releases
 
@@ -135,8 +136,9 @@ and other artifacts at 256 MiB each. All authored bundle paths must be unique
 and owned by `releases/<release_id>/`. Payload artifact URLs stay under the
 current-release namespace; they do not point back to the unrestricted revision
 catalog. Menon renders `current/payload`; legacy virtual-twin `latest` is an
-operator/diagnostic catalog, not coherent multi-camera product truth. DS8,
-V3DT, and DS9 mount this same shared router and store implementation.
+operator/diagnostic catalog, not coherent multi-camera product truth. The
+native DS9.1 baseline and disabled V3DT adapter use this same shared router and
+store implementation.
 
 ## 1. Depth API
 
@@ -147,8 +149,8 @@ V3DT, and DS9 mount this same shared router and store implementation.
 - `POST /api/v1/depth/refresh?seconds=<int>`
 
 This endpoint changes GPU/runtime state and is intentionally not available via
-GET. Appliance deployments must call it through the authenticated action
-boundary; loopback engineering calls remain POST-only.
+GET. Product calls must pass through Menon's authenticated action boundary;
+loopback engineering calls remain POST-only.
 
 ### Query Parameters
 
@@ -171,15 +173,18 @@ This matches the `DepthRefreshResponse` Pydantic model.
 ### Error Responses
 
 - `503 Service Unavailable`
-  - Depth pipeline not ready (e.g., `infer.yaml` missing or DS8 pipeline failed to initialize).
+  - Depth pipeline not ready (e.g., `infer.yaml` missing or DS9.1 pipeline failed to initialize).
 - `500 Internal Server Error`
   - Depth control failed or returned a malformed payload.
 
 Environment/config notes:
-- Pipeline config path: `NOESIS_DS8_PIPELINE_CONFIG` (default `config/infer.yaml`).
-- Explicit stub mode (tests only): set `NOESIS_DEPTH_API_FORCE_STUB=1` to bypass DS8 bindings while preserving the contract. Import failures never select the stub implicitly.
+- Pipeline config path: `NOESIS_DS9_PIPELINE_CONFIG` (default
+  `DS9/config/infer.yaml`).
+- Explicit stub mode (tests only): set `NOESIS_DEPTH_API_FORCE_STUB=1` to bypass DS9.1 bindings while preserving the contract. Import failures never select the stub implicitly.
 
-Implementation note: the underlying `enable_depth(seconds)` function in `noesis.pipelines.ds8_pipeline` must control DS8 gating (e.g., a `BufferOperator` gate) and not deprecated valve paths.
+Implementation note: the underlying `enable_depth(seconds)` function in the
+DS9-owned pipeline controls the one MapAnything valve; no alternate legacy path
+may answer the request.
 
 ### Exact dense snapshot component stream
 
@@ -260,8 +265,8 @@ and client-side decoding/normals are reported as separate bulk diagnostics.
 
 **Module:** `noesis/server/analytics_api.py`
 
-The analytics API exposes the writable `exclude` stage shared by baseline DS8,
-the V3DT runtime, and DS9. `NOESIS_ANALYTICS_CONFIG` identifies the durable YAML
+The analytics API exposes the writable `exclude` stage shared by the DS9.1
+baseline and disabled V3DT adapter. `NOESIS_ANALYTICS_CONFIG` identifies the durable YAML
 source of truth and `NOESIS_ANALYTICS_EXCLUDE_CONFIG` identifies its derived
 native exclusion INI. The repo-owned pre-tracker `nvdsroiexclude` element is the
 only canonical object-pruning path. There is no post-tracker Python pruning
@@ -397,16 +402,15 @@ stop was requested, the server thread stopped, and the transaction lock was
 retained. Failure to obtain this lease is fatal; callback-owned native state is
 not torn down while a late ROI transaction could still enter.
 
-### DS9 persistence boundary
+### Native analytics persistence boundary
 
-The canonical DS9 supervisor mounts only the analytics pair from
-`persistent/analytics` beneath `NOESIS_DS9_RUNTIME_ROOT` at
-`/var/lib/noesis/state/analytics`. It seeds the pair once from the reviewed
-YAML, preserves later accepted edits across new supervisor sessions, and
-rejects partial, mismatched, linked, unsafe-mode, unexpected, oversized, or
-source-incomplete state. All other DS9 state remains session-local. Each
-session records immutable owner-only before/after copies and hashes in launcher
-evidence; persistence is not a reason to reuse a whole prior canary state tree.
+The native host service receives explicit writable
+`NOESIS_ANALYTICS_CONFIG` and `NOESIS_ANALYTICS_EXCLUDE_CONFIG` paths from its
+environment. It does not mount or seed a container path. The runtime validates
+that exact pair before graph construction, and accepted API edits persist
+across host-service restarts because the same files remain configured. Runtime
+scratch state, build outputs, depth output, and diagnostic evidence stay under
+unique session directories beneath `NOESIS_DS9_RUNTIME_ROOT`.
 
 ### Error Handling
 
@@ -430,7 +434,7 @@ Environment/config notes:
 **Module:** `noesis/server/reid_api.py`
 
 The ReID alias API manages StableID “soft merges” (aliasing), suggestions, and
-audit history. These endpoints are DS8-only and operate on the live
+audit history. These endpoints are DS9.1-only and operate on the live
 `StableIDManager` in memory.
 
 ### Common Data Structures (Pydantic Models)
@@ -644,7 +648,7 @@ Environment:
 - **GET** `/api/v1/reid/identity_health`
   - Mint / false-share / overlap / gallery counters plus resident list.
 
-These household resident and health routes are exact DS8/DS9 product parity;
+These household resident and health routes are exact DS9.1 product parity;
 their source, OpenAPI paths/schemas, response bytes, and boundary instrumentation
 are regression-tested together.
 
@@ -661,9 +665,9 @@ Persistence (household mode):
 
 **Module:** `noesis/server/reid_v2_api.py`
 
-The versioned identity surface is mounted in the authenticated DS8, V3DT, and
-DS9 runtime applications at `/api/v2/reid`. It is backed by one process-owned
-SQLite store, open-set runtime, and whole-frame coordinator. The browser never
+The versioned identity surface is mounted in the authenticated native DS9.1
+baseline and disabled V3DT adapter at `/api/v2/reid`. It is backed by one
+process-owned SQLite store, open-set runtime, and whole-frame coordinator. The browser never
 submits an embedding: enrollment intent names an exact server observation key,
 and the server consumes the short-lived immutable evidence cached for that key.
 
@@ -709,13 +713,14 @@ Public authority also requires
 `NOESIS_IDENTITY_V2_AUTHORITY_CUTOVER_ARTIFACT` and its independent exact-byte
 `NOESIS_IDENTITY_V2_AUTHORITY_CUTOVER_ARTIFACT_SHA256` pin. The strict
 `noesis.identity.authority_cutover` v1 contract binds the scorer artifact,
-active model semantic profile, DS8/DS9 executable authority profile, camera
+active model semantic profile, DS9.1 executable authority profile, camera
 topology, and exact camera set. It contains two distinct literal-pass evidence
 records—whole-frame coordinator replay and occupied-scene runtime—whose owner-
 private report paths, sizes, SHA-256 values, revisions, and completion times are
-re-read and verified before the identity store opens. DS8 evidence cannot
-authorize DS9; changed code, topology, cameras, scorer bytes, native extraction,
-or report bytes fail startup. The generated schema is
+re-read and verified before the identity store opens. DS8, DS9.0, or mismatched
+DS9.1 evidence cannot authorize the current native runtime; changed code,
+topology, cameras, scorer bytes, native extraction, or report bytes fail
+startup. The generated schema is
 `contracts/schema/identity_authority_cutover.schema.json`.
 
 `disabled` leaves the routes mounted but returns 503 because no v2
@@ -771,7 +776,7 @@ Read-only APIs expose Noesis-owned offline virtual-twin revisions built under
 `data/virtual_twin/revisions/<revision_id>/`. These endpoints do not trigger
 reconstruction work and do not fall back to browser-side depth projection.
 Revisions are built by `scripts/build_virtual_twin_reconstruction.py`, which
-triggers the DS8 `/api/v1/depth/refresh` path and consumes the persisted
+triggers the DS9.1 `/api/v1/depth/refresh` path and consumes the persisted
 MapAnything Zarr snapshots under `data/depth/<camera>/.../*.zarr`. The builder
 also copies RGB keyframes and MapAnything depth/confidence/mask arrays into the
 revision bundle so the reconstruction evidence survives depth-retention pruning.
@@ -803,7 +808,7 @@ revision bundle so the reconstruction evidence survives depth-retention pruning.
 - **GET** `/api/v1/virtual-twin/revisions/{id}/artifacts/{path}`
   - Serves revision-relative GLB, JSON, PLY, or NPZ artifacts.
 
-Appliance browsers consume these artifacts through the authenticated
+Dashboard browsers consume these artifacts through Menon's authenticated
 same-origin gateway; the internal bearer is never exposed to browser code.
 Explicit loopback development may declare exact origins with
 `NOESIS_REST_CORS_ORIGINS`. Regex, wildcard, RFC1918-default, and
@@ -854,7 +859,7 @@ in readback mode or opt into applying the revision transform through its
 
 ## 5. Guided alignment-walk API
 
-DS8 and DS9 mount the same owner-authenticated, one-active-session controller
+DS9.1 mount the same owner-authenticated, one-active-session controller
 under `/api/v1/alignment-walk`. The controller consumes the runtime's own
 authenticated WebSocket stream, persists owner-private evidence, and exposes
 only run-local tracklet keys and image geometry to the operator.
@@ -898,7 +903,7 @@ operator-asserted fields; it never claims a full scene-release match.
 
 ## 6. Manual semantic-capture API
 
-DS8 and DS9 expose the same owner-private batch capture contract for the OAI2
+DS9.1 expose the same owner-private batch capture contract for the OAI2
 Sem-seg diagnostic. A browser starts capture only through Menon's coordinated
 `POST /api/diagnostics/semantic-seg/captures` action; Menon supplies internal
 authentication, idempotency, audit, and exact latest-result readback.
@@ -928,7 +933,7 @@ latest.
 ## 7. Validation Toolbox API Status
 
 The Noesis/Menon validation toolbox currently exposes CLI/report contracts, not
-DS8 REST endpoints. Its public artifacts are JSON files under
+DS9.1 REST endpoints. Its public artifacts are JSON files under
 `diagnostics/validation/<run_id>/`, plus optional visual evidence indexed by
 `visual/index.json`.
 
@@ -936,9 +941,9 @@ If a future change publishes validation reports, Menon camera reprojection
 evidence, or regression summaries over REST, add the endpoint, request, response,
 and failure/status semantics here before treating that surface as public.
 
-## 8. Future DS8 REST Endpoints
+## 8. Future DS9.1 REST Endpoints
 
-If additional DS8 REST endpoints are introduced (e.g., for calibration, debug, or pipeline control), they should:
+If additional DS9.1 REST endpoints are introduced (e.g., for calibration, debug, or pipeline control), they should:
 
 - Reuse the same pattern of Pydantic models for clear JSON schemas.
 - Be documented here with:

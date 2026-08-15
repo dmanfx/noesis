@@ -1,10 +1,15 @@
 # Living-room + family-room optimized V3DT profile
 
+Status: archived experimental profile. MV3DT is disabled in the canonical
+native DS9.1 application. Do not launch or promote this profile unless the user
+explicitly reopens MV3DT after Kitchen geometry and synchronized
+Kitchen/Family Room overlap evidence are accepted.
+
 This cumulative DS9 profile keeps the accepted living-room tuning and adds the
 Family Room calibration derived from its 2026-08-10 phone walk. It is isolated
 from the non-V3DT tracker and from the locked V3DT baseline assets.
 
-Select it with:
+Historical reproduction command (not a current operating command):
 
 ```bash
 NOESIS_CAMERA_CALIBRATION_FILE="$PWD/DS9/config/v3dt/living_family_phone_optimized/camera_calibration.json" \

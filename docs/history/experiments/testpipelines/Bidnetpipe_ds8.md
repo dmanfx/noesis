@@ -1,0 +1,42 @@
+# Bidnetpipe Doc Trail
+
+- https://docs.nvidia.com/metropolis/deepstream/dev-guide/text/DS_service_maker_python_into_to_flow_api.html
+  - Confirmed Flow API exists; not used directly in Bidnetpipe pipeline (Pipeline API chosen).
+- https://docs.nvidia.com/metropolis/deepstream/dev-guide/text/DS_service_maker_python_into_to_pipeline_api.html
+  - Verified Pipeline API usage (`Pipeline.add`, `Pipeline.link`, `Pipeline.start`, `Pipeline.wait`, `Pipeline.attach(Probe, ...)`).
+- https://docs.nvidia.com/metropolis/deepstream/dev-guide/text/DS_plugin_gst-nvmultiurisrcbin.html
+  - Verified `uri-list`, `sensor-id-list`, `sensor-name-list`, `port` (0 disables REST), `max-batch-size` properties.
+  - Sample pipeline shows `width`, `height`, and `live-source` as supported properties.
+- https://docs.nvidia.com/metropolis/deepstream/dev-guide/text/DS_plugin_gst-nvinfer.html
+  - Verified config keys: `onnx-file`, `model-engine-file`, `network-type` (2=segmentation), `network-mode` (0 FP32 / 1 INT8 / 2 FP16 / 3 BEST), `model-color-format` (0 RGB), `net-scale-factor`, `segmentation-threshold`, `segmentation-output-order` (0 NCHW / 1 NHWC).
+  - Verified config keys: `output-blob-names`, `custom-lib-path`, `parse-segmentation-func-name` (custom segmentation parser).
+- `/opt/nvidia/deepstream/deepstream-8.0/sources/deepstream_python_apps/apps/deepstream-segmentation/dstest_segmentation_citysemsegformer_config.txt`
+  - Sample segmentation config notes `num-detected-classes` is required to set `NvDsInferSegmentationMeta::classes` for `network-type=2`.
+- Local TensorRT `trtexec --help`
+  - Confirmed `--onnx`, `--saveEngine`, `--fp16` options used to prebuild the engine when missing.
+- Local `gst-inspect-1.0 nvsegvisual`
+  - Verified `alpha`, `batch-size`, `gpu-on`, `original-background`, `class-id`, `operate-on-seg-meta-id` properties beyond the doc table.
+  - Verified `width`/`height` are the output frame dimensions; if they don't match the segmentation meta resolution, the overlay is applied only to the top-left portion of the frame.
+- `/opt/nvidia/deepstream/deepstream-8.0/sources/deepstream_python_apps/apps/deepstream-segmentation/deepstream_segmentation.py`
+  - (Local reference) sample sets `nvsegvisual` `width`/`height` to the network output resolution (e.g. 512x512).
+- https://docs.nvidia.com/metropolis/deepstream/dev-guide/text/DS_plugin_gst-nvsegvisual.html
+  - Confirms plugin overlays segmentation on video output.
+  - Note: the doc text around `width`/`height` is ambiguous; local `gst-inspect-1.0 nvsegvisual` describes them as output frame dimensions.
+- https://docs.nvidia.com/metropolis/deepstream/dev-guide/text/DS_plugin_gst-nvmultistreamtiler.html
+  - Verified `rows`, `columns`, `width`, `height` properties for mosaic output.
+- Local `gst-inspect-1.0 nvdsosd`
+  - Verified `nvdsosd` exists and draws text from display metadata (used to label per-stream top classes and floor counts).
+- https://docs.nvidia.com/metropolis/deepstream/dev-guide/python-api/PYTHON_API/NvDsInfer/NvDsInferSegmentationMeta.html
+  - Verified `class_map` indexing (y * width + x) and probability map layout.
+- https://github.com/CoinCheung/BiSeNet
+  - `configs/bisenetv2_ade20k.py` confirms ADE20K crop size (640x640) and class count (150).
+  - `lib/data/ade20k.py` provides ADE20K mean/std and label mapping (`lb_map = np.arange(200) - 1`, labels start at 1).
+- https://raw.githubusercontent.com/CSAILVision/sceneparsing/master/objectInfo150.csv
+  - Parsed label CSV to locate `floor;flooring` class and compute class_id = Idx - 1.
+- Local DeepStream 8 Python bindings (`pyservicemaker._pydeepstream`)
+  - Verified `FrameMetadata.segmentation_items` and `SegmentationUserMetadata` fields (`class_map`, `class_probabilities_map`, `width`, `height`).
+  - Local observation: Service Maker property setting via `node.set({...})` does not accept float values for some properties (e.g. `nvsegvisual alpha`), so Bidnetpipe avoids setting them and uses plugin defaults instead.
+- `/opt/nvidia/deepstream/deepstream-8.0/sources/includes/nvdsinfer_custom_impl.h`
+  - Verified `NvDsInferSemSegmentationParseCustomFunc` signature and `CHECK_CUSTOM_SEM_SEGMENTATION_PARSE_FUNC_PROTOTYPE` macro for custom segmentation parsers.
+- Bidnetpipe custom parser (`Bidnetpipe/custom/bidnet_segparser.cpp`)
+  - Uses `BIDNET_FLOOR_CLASS_ID` (required) and `BIDNET_BG_CLASS_ID` (optional, default 0) environment variables to emit floor-only class_map output.

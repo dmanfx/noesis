@@ -1,18 +1,19 @@
 # MQTT and Influx integration security
-_Status: validated against the active DS8, V3DT, and DS9 code on 2026-07-10._
+_Status: validated against the active DS9.1 baseline and the disabled V3DT adapter code on 2026-07-10._
 
 ## Current runtime truth
 
-- No active runtime publishes occupancy to MQTT or InfluxDB. DS8, V3DT, and DS9
+- No active runtime publishes occupancy to MQTT or InfluxDB. DS9.1 baseline and the disabled V3DT adapter
   explicitly bind the occupancy publisher slot to `None`.
 - The active tree has no occupancy MQTT/Influx publisher implementation.
 - `geometry/depth_publisher.py` contains an optional MapAnything depth-summary
   publisher, but no active module imports or constructs it.
 - Canonical occupancy remains the authenticated Noesis tracking/world telemetry
-  consumed through the appliance gateway.
+  consumed through the Menon gateway.
 
 Setting an integration flag does not wire a publisher into a runtime. Wiring is
-an explicit future product change and must be validated in both DS8 and DS9.
+an explicit future product change and must be validated in the native DS9.1
+producer and its direct consumer.
 
 ## Credential contract
 
@@ -87,7 +88,7 @@ client exception text that might contain authentication material.
 
 ## Related references
 
-- `docs/Occupancy_Publishing.md` describes the current DS8 telemetry contract.
+- `docs/Occupancy_Publishing.md` describes the current DS9.1 telemetry contract.
 - `docs/Integrations_Playbook.md` records the deliberate non-wiring boundary.
 - `tests/test_depth_diagnostics_credentials.py` covers secure-file and
   fail-closed behavior.

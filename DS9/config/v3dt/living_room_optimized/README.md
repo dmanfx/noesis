@@ -1,10 +1,14 @@
 # Living-room optimized V3DT profile
 
+Status: archived experimental profile. MV3DT is disabled in the canonical
+native DS9.1 application. Keep this material only as prior tuning evidence; do
+not launch it unless the user explicitly reopens the MV3DT workstream.
+
 This directory is an isolated DS9 SV3DT tuning profile. It does not replace
 the locked V3DT assets in `caminfo_baseline/` and does not change the
 non-V3DT tracker.
 
-Select it with:
+Historical reproduction command (not a current operating command):
 
 ```bash
 NOESIS_CAMERA_CALIBRATION_FILE="$PWD/DS9/config/v3dt/living_room_optimized/camera_calibration.json" \

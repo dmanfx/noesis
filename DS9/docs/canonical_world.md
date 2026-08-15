@@ -1,84 +1,54 @@
-# DS9 Canonical World And Capability Health
+# Canonical world and capability health
 
-DS9 uses the same SDK-neutral world owner as DS8. The runtime constructs
-`CanonicalWorldService` through `noesis_core.runtime_world.create_runtime_world_service`
-and passes it to the DS9 copy of `TrackingTelemetryPublisher`. There is no DS8
-runtime import and no alternate DS9 world schema.
+The native DS9.1 runtime uses the SDK-neutral
+`CanonicalWorldService` from `noesis_core.runtime_world`. DS9 pipeline hooks
+adapt frame/object metadata into versioned observations; there is no alternate
+legacy world schema or fallback runtime.
 
-## Provenance Inputs
+## Provenance and time
 
-The factory receives the already-materialized `pipeline.config`, not the base
-template. Its model fingerprint covers the selected `models` and `tracker`
-configuration and hashes referenced files that actually exist. Its runtime
-configuration fingerprint covers the effective configuration. Calibration is
-fingerprinted per source from the active calibration-provider snapshot; an
-unavailable snapshot is represented explicitly rather than replaced with a
-synthetic calibration.
+The world factory fingerprints the effective model/tracker config, referenced
+files, runtime config, and per-camera calibration snapshot. Missing calibration
+is explicit; it is never replaced with synthetic geometry.
 
-These are semantic provenance fingerprints for canonical observations. They do
-not replace the DS9 build-provenance and checksum requirements in
-`DS9/asset_manifest.yaml`.
+Public tracks include:
 
-## Public Track Evidence
+- positive `observed_at_us` processing time;
+- `capture_time_status` (currently `estimated` because cameras are not
+  synchronized);
+- nonnegative stream-relative `media_pts_ns`, never represented as Unix time;
+- stable identity and visitor generation where applicable.
 
-Both DS9 public-track paths add:
+## Transactional publication
 
-- `observed_at_us`: positive wall-clock time when the frame was processed;
-- `capture_time_status: estimated`: the cameras are not yet clock-synchronized;
-- `media_pts_ns`: the nonnegative, stream-relative DeepStream buffer PTS;
-- stable identity fields from shared diagnostics, including
-  `visitor_generation` when the subject is a visitor.
+For each publishable frame:
 
-Media PTS is never presented as Unix time. Visitor generation is part of the
-canonical visitor entity ID, preventing a recycled bounded visitor SID from
-aliasing an earlier person.
+1. DS9 creates canonical observations.
+2. The world service commits the exact snapshot/event cohort and journal count.
+3. The publication gate releases ordered `tracking`, `world_snapshot`, and
+   `world_event` messages.
+4. The BEV publisher attaches the exact committed tracking cohort and publishes
+   afterward.
 
-## Publications And Health
+Generic WebSocket paths reject canonical message types. A failed commit or
+post-admission authority error produces no partial successor and poisons that
+publisher. Shutdown closes and drains the runtime publication gate before
+WebSocket egress.
 
-Each tracking publication retains the existing `type: tracking` envelope and
-adds versioned person observations plus the current `noesis.world.snapshot`.
-The snapshot is also broadcast as its own `type: world_snapshot` message.
-The complete tracking/snapshot/event cohort is frozen and count/byte-admitted
-first, but client delivery remains behind a one-shot gate. The shared world
-owner synchronously confirms the exact integrity-journal append count, commits
-private fusion authority, and only then releases the batch. Commit failure
-aborts with zero delivery and poisons the publisher; accepting an asynchronous
-journal queue item is not sufficient authority. Read consumers receive only
-the immutable cached committed snapshot and cannot mutate fusion state.
-The WebSocket boundary accepts this route only as a tracking-first exact cohort;
-generic broadcast paths reject tracking, world snapshot/event, and BEV types.
-`bev-frame` has a separate dedicated typed-receipt route after tracking commit.
-Because the release callback is in-process rather than cryptographic, a static
-regression restricts production gated-API call sites to the byte-identical
-DS8/DS9 tracking publishers and the WebSocket definition.
+## Capability health
 
-After successful canonical publication, the capability monitor records producer
-progress for `tracking_observations` and `global_world`. The shared REST router
-exposes the resulting contract at:
+After successful publication, the monitor records progress for
+`tracking_observations` and `global_world`. The authenticated endpoint is:
 
 ```text
 GET /api/v1/health/capabilities
 ```
 
-Unknown, stale, failed, and blocked states remain explicit. A listening port or
-running process is not sufficient evidence of capability health.
+Unknown, stale, blocked, and failed remain distinct. A running process or open
+port alone is not capability health.
 
-The DS9 REST app also mounts the shared `/api/v1/scenes` router. Atomic scene
-release registration, promotion, rollback, current payload, and history remain
-single-owner product state rather than an SDK-specific world-model fork.
+## Focused validation
 
-## Validation
-
-These checks are safe on the current DS8 host and do not load DeepStream:
-
-```bash
-python3 -m unittest \
-  DS9.tests.test_world_contract_adapter \
-  DS9.tests.test_world_snapshot_runtime -v
-python3 DS9/scripts/validate_runtime_ownership.py
-bash DS9/scripts/run_static_prep_checks.sh
-```
-
-Fresh DS9 runtime evidence remains blocked by the missing DS9-native artifact
-set recorded in the manifest. Do not treat the focused contract tests as a
-runtime cutover result.
+Run the directly affected observation/world/publication tests and, when runtime
+behavior changed, one short authenticated tracking/world/BEV smoke. Do not run
+the historical static-prep or release-promotion suites by default.

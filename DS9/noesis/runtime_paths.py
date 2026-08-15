@@ -26,6 +26,27 @@ class DS9NativeExtensionOriginError(RuntimeError):
     """Raised when a DS9 runtime could resolve a non-DS9 native extension."""
 
 
+def in_virtual_environment() -> bool:
+    """True when the running interpreter is a dedicated virtual environment."""
+
+    return sys.prefix != getattr(sys, "base_prefix", sys.prefix)
+
+
+def service_maker_system_site() -> Path | None:
+    """Return the DS9.1 system site only when not running in a dedicated venv.
+
+    Native-host execution installs Service Maker into the virtual environment.
+    Prefetching ``/usr/local/lib/python3.12/dist-packages`` would shadow that
+    wheel with the SDK postinst copy.
+    """
+
+    if in_virtual_environment():
+        return None
+    return Path(
+        f"/usr/local/lib/python{sys.version_info.major}.{sys.version_info.minor}/dist-packages"
+    )
+
+
 def configured_native_extension_dir(ds9_root: Path) -> Path:
     """Return the configured, existing DS9 native-extension directory."""
 
@@ -219,6 +240,8 @@ __all__ = [
     "DS9NativeExtensionOriginError",
     "configure_ds9_runtime_import_paths",
     "configured_native_extension_dir",
+    "in_virtual_environment",
     "load_ds9_native_extensions",
     "require_ds9_native_extension_origins",
+    "service_maker_system_site",
 ]

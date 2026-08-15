@@ -1660,6 +1660,43 @@ def maintenance_provenance_from_environment() -> dict[str, str]:
     return provenance
 
 
+def native_host_build_authority(
+    *,
+    source_sha256: str,
+    output_sha256: str,
+    command: Sequence[str],
+) -> dict[str, str]:
+    """Simple native-host rebuild authority. Not a sealing/attestation record."""
+
+    compiler = str(os.environ.get("NOESIS_DS9_MAINT_COMPILER") or "").strip()
+    python_abi = str(os.environ.get("NOESIS_DS9_MAINT_PYTHON_ABI") or "").strip()
+    deepstream = str(
+        os.environ.get("NOESIS_DEEPSTREAM_HOME")
+        or "/opt/nvidia/deepstream/deepstream-9.1"
+    ).strip()
+    cuda = str(os.environ.get("CUDA_HOME") or "/usr/local/cuda-13.2").strip()
+    if not compiler or not python_abi:
+        raise EngineMaintenanceError(
+            "native_host provenance requires NOESIS_DS9_MAINT_COMPILER and "
+            "NOESIS_DS9_MAINT_PYTHON_ABI"
+        )
+    if output_sha256 and (
+        len(output_sha256) != 64 or any(ch not in "0123456789abcdef" for ch in output_sha256)
+    ):
+        raise EngineMaintenanceError("native_host output_sha256 must be a SHA-256 hex digest")
+    return {
+        "backend": "native_host",
+        "deepstream": deepstream,
+        "cuda": cuda,
+        "tensorrt": DS9_TRTEXEC_BANNER,
+        "compiler": compiler,
+        "python_abi": python_abi,
+        "source_sha256": source_sha256,
+        "output_sha256": output_sha256,
+        "command": " ".join(str(part) for part in command),
+    }
+
+
 @contextmanager
 def engine_maintenance_lock(lock_path: Path, *, dry_run: bool) -> Iterator[None]:
     if dry_run:

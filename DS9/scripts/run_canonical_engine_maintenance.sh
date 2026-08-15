@@ -4,6 +4,9 @@ set -euo pipefail
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 DS9_ROOT="$(cd -- "${SCRIPT_DIR}/.." && pwd)"
 REPO_ROOT="$(cd -- "${DS9_ROOT}/.." && pwd)"
+if [[ "${NOESIS_DS9_ENGINE_BACKEND:-native_host}" != "docker" ]]; then
+  exec "${SCRIPT_DIR}/run_canonical_engine_maintenance_host.sh" "$@"
+fi
 REQUIRED_IMAGE_REF="noesis-ds9-dev:9.1-20260812"
 IMAGE="${NOESIS_DS9_DEV_IMAGE:-${REQUIRED_IMAGE_REF}}"
 REQUIRED_IMAGE_ID="sha256:88d80ad35f12ec3a574cf2555a8242d33ac4110abdcc5f88a6cbdee40dfcf872"

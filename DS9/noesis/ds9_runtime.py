@@ -44,6 +44,7 @@ sys.path.insert(0, str(DS9_ROOT))
 from noesis.runtime_paths import (  # noqa: E402
     configure_ds9_runtime_import_paths,
     load_ds9_native_extensions,
+    service_maker_system_site,
 )
 from noesis.native_artifact_provenance import (  # noqa: E402
     attest_ds9_native_artifacts,
@@ -73,8 +74,8 @@ def _prepend_env_path(name: str, value: Path) -> None:
     os.environ[name] = os.pathsep.join(parts)
 
 
-def _ds9_system_python_site() -> Path:
-    return Path(f"/usr/local/lib/python{sys.version_info.major}.{sys.version_info.minor}/dist-packages")
+def _ds9_system_python_site() -> Path | None:
+    return service_maker_system_site()
 
 
 def _configured_model_root() -> Path:
@@ -115,7 +116,10 @@ def _set_ds9_environment() -> None:
     os.environ.setdefault("NOESIS_DEPTH_ENABLE_SECONDS", "0")
 
     ds9_site = _ds9_system_python_site()
-    if (ds9_site / "pyservicemaker" / "_pydeepstream.so").exists():
+    if (
+        ds9_site is not None
+        and (ds9_site / "pyservicemaker" / "_pydeepstream.so").exists()
+    ):
         _prepend_env_path("PYTHONPATH", ds9_site)
 
     native_dir = Path(os.environ["NOESIS_NATIVE_EXT_DIR"])

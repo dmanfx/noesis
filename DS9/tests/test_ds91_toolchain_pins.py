@@ -118,8 +118,13 @@ def test_active_authority_contracts_pin_the_built_ds91_images() -> None:
 
     launcher = _read("scripts/run_canonical_runtime_container.py")
     maintenance = _read("scripts/run_canonical_engine_maintenance.sh")
-    for source in (launcher, maintenance):
+    host_maintenance = _read("scripts/run_canonical_engine_maintenance_host.sh")
+    for source in (launcher, maintenance, host_maintenance):
         assert "9.0-20260710" not in source
         assert "10.14.1.48" not in source
     assert "TensorRT v101600" in maintenance
     assert 'REQUIRED_DRIVER_VERSION="595.58.03"' in maintenance
+    assert 'NOESIS_DS9_ENGINE_BACKEND:-native_host' in maintenance
+    assert "run_canonical_engine_maintenance_host.sh" in maintenance
+    assert "native maintenance refuses NOESIS_DS9_DOCKER_ROOT" in host_maintenance
+    assert "MV3DT/AMC remain disabled" in host_maintenance

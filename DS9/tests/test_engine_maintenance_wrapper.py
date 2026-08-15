@@ -899,6 +899,7 @@ class WrapperFixture:
             **os.environ,
             "PATH": f"{self.bin}:{os.environ['PATH']}",
             "NOESIS_DS9_DOCKER_ROOT": str(self.docker_root),
+            "NOESIS_DS9_ENGINE_BACKEND": "docker",
             "NOESIS_DS9_ARTIFACT_ROOT": str(self.artifact_root),
             "NOESIS_DS9_MIN_FREE_HEADROOM_BYTES": "0",
             "FAKE_DOCKER_LOG": str(self.docker_log),

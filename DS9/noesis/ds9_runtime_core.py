@@ -41,6 +41,7 @@ sys.path.insert(0, str(DS9_ROOT))
 from noesis.runtime_paths import (  # noqa: E402
     configure_ds9_runtime_import_paths,
     require_ds9_native_extension_origins,
+    service_maker_system_site,
 )
 from noesis.native_artifact_provenance import (  # noqa: E402
     attest_ds9_native_artifacts,
@@ -49,9 +50,7 @@ from noesis.native_artifact_provenance import (  # noqa: E402
 _DS9_NATIVE_EXTENSION_DIR = configure_ds9_runtime_import_paths(
     ds9_root=DS9_ROOT,
     repo_root=REPO_ROOT,
-    system_site=Path(
-        f"/usr/local/lib/python{sys.version_info.major}.{sys.version_info.minor}/dist-packages"
-    ),
+    system_site=service_maker_system_site(),
 )
 attest_ds9_native_artifacts(
     ds9_root=DS9_ROOT,

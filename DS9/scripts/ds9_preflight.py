@@ -28,6 +28,7 @@ from noesis.runtime_paths import (  # noqa: E402
     DS9NativeExtensionOriginError,
     configure_ds9_runtime_import_paths,
     load_ds9_native_extensions,
+    service_maker_system_site,
 )
 from noesis.native_artifact_provenance import (  # noqa: E402
     DS9NativeArtifactProvenanceError,
@@ -109,10 +110,8 @@ def _warn(msg: str) -> None:
     print(f"[WARN] {msg}")
 
 
-def _ds9_system_python_site() -> Path:
-    return Path(
-        f"/usr/local/lib/python{sys.version_info.major}.{sys.version_info.minor}/dist-packages"
-    )
+def _ds9_system_python_site() -> Path | None:
+    return service_maker_system_site()
 
 
 def _prepend_env_path(name: str, value: Path) -> None:
@@ -126,6 +125,8 @@ def _prepend_env_path(name: str, value: Path) -> None:
 
 def _prefer_ds9_pyservicemaker() -> None:
     ds9_site = _ds9_system_python_site()
+    if ds9_site is None:
+        return
     if not (ds9_site / "pyservicemaker" / "_pydeepstream.so").exists():
         return
     site_str = str(ds9_site)

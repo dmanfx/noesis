@@ -28,6 +28,7 @@ from engine_maintenance_common import (  # noqa: E402
     load_source_contracts,
     maintenance_provenance_from_environment,
     mapanything_quality_gate_from_source_contracts,
+    native_host_build_authority,
     new_run_id,
     require_absent_candidate_path,
     required_regular_file,
@@ -423,6 +424,18 @@ def _build(
             **(
                 {"quality_gate_authority": quality_authority}
                 if quality_authority is not None
+                else {}
+            ),
+            **(
+                {
+                    "native_host": native_host_build_authority(
+                        source_sha256="",
+                        output_sha256="",
+                        command=["trtexec"],
+                    )
+                }
+                if str(os.environ.get("NOESIS_DS9_MAINT_BACKEND") or "").strip()
+                == "native_host"
                 else {}
             ),
         },

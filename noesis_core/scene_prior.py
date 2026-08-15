@@ -1315,6 +1315,18 @@ class ScenePriorSet:
         static_source = static_valid.astype(np.float32)
 
         live_error = str(result.pop("error", "") or "").strip()
+        catalog_entry = next(
+            (
+                entry
+                for entry in self.catalog.revisions
+                if entry.prior_id == revision.manifest.prior_id
+            ),
+            None,
+        )
+        if catalog_entry is None:
+            raise ScenePriorError(
+                f"scene-prior {revision.manifest.prior_id} is absent from its catalog"
+            )
         presentation_identity: dict[str, Any] = {
             "camera_id": camera_id,
             "scene_prior_only": explicit_scene_prior_only,
@@ -1370,6 +1382,8 @@ class ScenePriorSet:
                     "contract_version": 1,
                     "status": "pcf" if explicit_scene_prior_only else "static_only",
                     "prior_id": revision.manifest.prior_id,
+                    "revision_manifest_path": catalog_entry.manifest_path,
+                    "revision_manifest_sha256": catalog_entry.manifest_sha256,
                     "space_id": revision.manifest.space_id,
                     "mode": binding.mode,
                     "source_type": revision.manifest.source.source_type,

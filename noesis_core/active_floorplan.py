@@ -393,6 +393,19 @@ def _snapshot_ref(value: object, snapshot_ts_us: int) -> str:
     return value
 
 
+def _portable_reference(value: object, name: str) -> str:
+    if not isinstance(value, str) or value != value.strip() or not value:
+        raise ActiveFloorplanError(f"{name} must be a portable relative path")
+    if len(value.encode("utf-8")) > _MAX_SNAPSHOT_REF_BYTES:
+        raise ActiveFloorplanError(f"{name} exceeds the bounded contract")
+    if value.startswith("/") or "\\" in value or "//" in value:
+        raise ActiveFloorplanError(f"{name} must be a portable relative path")
+    parts = value.split("/")
+    if any(_PORTABLE_REF_COMPONENT_RE.fullmatch(part) is None for part in parts):
+        raise ActiveFloorplanError(f"{name} must be a portable relative path")
+    return value
+
+
 class _SameVersionConflict(ActiveFloorplanError):
     """Private signal used to classify conflicting record attempts."""
 
@@ -487,6 +500,134 @@ class ActiveFloorplanRegistry:
                 str(exc),
             )
             raise
+
+    def record_scene_prior(
+        self,
+        requested_camera: object,
+        payload: Mapping[str, Any],
+        *,
+        calibration_fingerprint: str,
+    ) -> bool:
+        """Admit an explicitly requested canonical PCF presentation for BEV."""
+
+        try:
+            return self._record_scene_prior_validated(
+                requested_camera,
+                payload,
+                calibration_fingerprint=calibration_fingerprint,
+            )
+        except _SameVersionConflict as exc:
+            self._note_rejection("conflict", requested_camera, str(exc))
+            raise
+        except ActiveFloorplanError as exc:
+            self._note_rejection("invalid", requested_camera, str(exc))
+            raise
+
+    def _record_scene_prior_validated(
+        self,
+        requested_camera: object,
+        payload: Mapping[str, Any],
+        *,
+        calibration_fingerprint: str,
+    ) -> bool:
+        if not isinstance(payload, Mapping):
+            raise ActiveFloorplanError("scene-prior floorplan payload must be an object")
+        if payload.get("error"):
+            return False
+        canonical = self.canonical_camera(requested_camera)
+        payload_camera = self.canonical_camera(payload.get("camera_id") or canonical)
+        if payload_camera != canonical:
+            raise ActiveFloorplanError("floorplan camera does not match the request")
+        if payload.get("scene_prior_only") is not True or payload.get("display_source") != "pcf":
+            raise ActiveFloorplanError("scene-prior BEV authority must be the explicit PCF presentation")
+        if payload.get("served_from_cache") is not True:
+            raise ActiveFloorplanError("scene-prior BEV authority must be immutable cached evidence")
+        frame = _required_text(payload.get("frame"), "frame")
+        units = _required_text(payload.get("units"), "units")
+        if frame != _FRAME or units != _UNITS:
+            raise ActiveFloorplanError(
+                f"scene-prior BEV authority must use frame={_FRAME} and units={_UNITS}"
+            )
+        meta = payload.get("scene_prior_meta")
+        if not isinstance(meta, Mapping):
+            raise ActiveFloorplanError("scene_prior_meta is required")
+        if (
+            meta.get("contract") != "noesis.scene_prior.floorplan_composite"
+            or meta.get("status") != "pcf"
+            or meta.get("display_source") != "pcf"
+        ):
+            raise ActiveFloorplanError("scene-prior metadata does not identify canonical PCF")
+        prior_id = _required_text(meta.get("prior_id"), "scene_prior_meta.prior_id")
+        manifest_path = _portable_reference(
+            meta.get("revision_manifest_path"),
+            "scene_prior_meta.revision_manifest_path",
+        )
+        manifest_sha256 = _sha256_field(
+            meta,
+            "revision_manifest_sha256",
+        )
+        calibration_sha256 = _sha256_field(
+            {"calibration_fingerprint": calibration_fingerprint},
+            "calibration_fingerprint",
+        )
+        diagnostic_meta = payload.get("scene_prior_diagnostic_meta")
+        if not isinstance(diagnostic_meta, Mapping):
+            raise ActiveFloorplanError("scene_prior_diagnostic_meta is required")
+        raw_shape = diagnostic_meta.get("grid_shape")
+        if not isinstance(raw_shape, (list, tuple)) or len(raw_shape) != 2:
+            raise ActiveFloorplanError("scene-prior diagnostic grid shape is invalid")
+        rows = _positive_int(raw_shape[0], "scene-prior grid rows")
+        columns = _positive_int(raw_shape[1], "scene-prior grid columns")
+        if (
+            rows > _MAX_GRID_DIMENSION
+            or columns > _MAX_GRID_DIMENSION
+            or rows * columns > _MAX_GRID_CELLS
+        ):
+            raise ActiveFloorplanError("scene-prior grid shape exceeds the bounded contract")
+        grid_res_m = _finite_bounded(
+            payload.get("scale_m_per_px"),
+            "scale_m_per_px",
+            max_abs=_MAX_GRID_RES_M,
+            positive=True,
+        )
+        bounds = _bounds(payload)
+        snapshot_ts_us = _positive_int(payload.get("ts"), "scene-prior timestamp")
+        snapshot_ref = f"scene_priors/{manifest_path}"
+        max_extent_m = max(
+            bounds["max_x"] - bounds["min_x"],
+            bounds["max_z"] - bounds["min_z"],
+        )
+        snapshot_identity = {
+            "camera_id": canonical,
+            "snapshot_ts_us": snapshot_ts_us,
+            "snapshot_ref": snapshot_ref,
+            "snapshot_id": prior_id,
+            "snapshot_content_sha256": manifest_sha256,
+            "calibration_fingerprint": calibration_sha256,
+        }
+        record: dict[str, Any] = {
+            "camera_id": canonical,
+            "snapshot_ts_us": snapshot_ts_us,
+            "floorplan_ts_us": snapshot_ts_us,
+            "served_from_cache": True,
+            "grid_res_m": grid_res_m,
+            "max_extent_m": max_extent_m,
+            "grid_shape": [rows, columns],
+            "grid_shape_source": "scene_prior_diagnostic_meta",
+            "bounds": bounds,
+            "frame": frame,
+            "orientation": _ORIENTATION,
+            "floorplan_contract_version": _FLOORPLAN_CONTRACT_VERSION,
+            "units": units,
+            "calibration_fingerprint": calibration_sha256,
+            "snapshot_ref": snapshot_ref,
+            "snapshot_id": prior_id,
+            "snapshot_content_sha256": manifest_sha256,
+            "snapshot_identity": snapshot_identity,
+            "source": "active_floorplan",
+            "authority_kind": "scene_prior_pcf",
+        }
+        return self._store_record(canonical, record)
 
     def _record_validated(
         self,
@@ -586,6 +727,11 @@ class ActiveFloorplanRegistry:
         }
         if alignment is not None:
             record["ray_to_floorplan_alignment"] = alignment
+        return self._store_record(canonical, record)
+
+    def _store_record(self, canonical: str, record: dict[str, Any]) -> bool:
+        snapshot_ts_us = int(record["snapshot_ts_us"])
+        floorplan_ts_us = int(record["floorplan_ts_us"])
         with self._lock:
             previous = self._records.get(canonical)
             if previous is not None:
@@ -702,6 +848,7 @@ class ActiveFloorplanRegistry:
                     "calibration_fingerprint": record["calibration_fingerprint"],
                     "frame": record["frame"],
                     "units": record["units"],
+                    "authority_kind": record.get("authority_kind", "depth_snapshot"),
                 }
                 for camera, record in sorted(self._records.items())
             }

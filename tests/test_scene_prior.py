@@ -324,6 +324,10 @@ def test_scene_prior_only_floorplan_is_canonical_pcf_presentation(tmp_path: Path
         "current_calibrated_extrinsics"
     )
     assert result["scene_prior_meta"]["composition_policy"] == "pcf_only"
+    assert result["scene_prior_meta"]["revision_manifest_path"] == (
+        "revisions/sceneprior_room-a_20260801T000000Z_123456789abc/manifest.json"
+    )
+    assert len(result["scene_prior_meta"]["revision_manifest_sha256"]) == 64
     assert result["scene_prior_diagnostic_meta"]["source"] == "map-anything"
     assert result["scene_prior_diagnostic_meta"]["derivation"] == (
         "prior_conditioned_fusion_points_and_grid"

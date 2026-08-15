@@ -51,6 +51,29 @@ def _snapshot_ref(timestamp_us: int) -> str:
     return f"snapshots/20260711/12/{timestamp_us}.zarr"
 
 
+def _pcf_payload() -> dict[str, object]:
+    return {
+        "camera_id": "living-room",
+        "scene_prior_only": True,
+        "display_source": "pcf",
+        "served_from_cache": True,
+        "ts": 2_000_000,
+        "frame": "camera_local_ground_m",
+        "units": "meters",
+        "scale_m_per_px": 0.025,
+        "bounds": {"min_x": -3.0, "max_x": 4.0, "min_z": -1.0, "max_z": 6.0},
+        "scene_prior_meta": {
+            "contract": "noesis.scene_prior.floorplan_composite",
+            "status": "pcf",
+            "display_source": "pcf",
+            "prior_id": "sceneprior_living-room_exact",
+            "revision_manifest_path": "revisions/sceneprior_living-room_exact/manifest.json",
+            "revision_manifest_sha256": _SNAPSHOT_DIGEST,
+        },
+        "scene_prior_diagnostic_meta": {"grid_shape": [280, 280]},
+    }
+
+
 def _record(
     registry: ActiveFloorplanRegistry,
     camera_id: str,
@@ -105,6 +128,37 @@ def test_registry_is_alias_bounded_and_preserves_exact_floorplan_space() -> None
     }
     assert registry.health_snapshot()["healthy"] is True
     assert registry.health_snapshot()["missing_cameras"] == []
+
+
+def test_registry_admits_explicit_pcf_as_active_bev_authority() -> None:
+    registry = ActiveFloorplanRegistry({"living-room": "living-room"})
+
+    assert registry.record_scene_prior(
+        "living-room",
+        _pcf_payload(),
+        calibration_fingerprint=_FINGERPRINT,
+    )
+    record = registry.bounds_for("living-room")
+    assert record is not None
+    assert record["authority_kind"] == "scene_prior_pcf"
+    assert record["source"] == "active_floorplan"
+    assert record["grid_shape"] == [280, 280]
+    assert record["snapshot_id"] == "sceneprior_living-room_exact"
+    assert record["snapshot_content_sha256"] == _SNAPSHOT_DIGEST
+    assert registry.health_snapshot()["healthy"] is True
+
+
+def test_registry_rejects_noncanonical_scene_prior_authority() -> None:
+    registry = ActiveFloorplanRegistry({"living-room": "living-room"})
+    payload = _pcf_payload()
+    payload["display_source"] = "static_fallback"
+
+    with pytest.raises(ActiveFloorplanError, match="explicit PCF"):
+        registry.record_scene_prior(
+            "living-room",
+            payload,
+            calibration_fingerprint=_FINGERPRINT,
+        )
 
 
 def test_registry_rejects_unknown_camera_cross_camera_and_bad_space() -> None:

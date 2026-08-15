@@ -59,7 +59,11 @@ attest_ds9_native_artifacts(
 require_ds9_native_extension_origins(_DS9_NATIVE_EXTENSION_DIR)
 
 from calibration_bundle import pose_to_E_col_major
-from geometry.depth_source import DepthStorageManager, StorageFailure
+from geometry.depth_source import (
+    DepthStorageManager,
+    StorageFailure,
+    _floorplan_calibration_fingerprint,
+)
 from mapanything_config import load_service_config
 from noesis.calibration.depth_registration import (
     DepthRegistrationError,
@@ -5013,7 +5017,7 @@ def _run_main(startup_main_guard: StartupMainGuard) -> int:
                         "scene_prior_only": True,
                         "error": "scene_prior_calibration_unavailable",
                     }
-                return scene_prior_set.compose_static_floorplan(
+                result = scene_prior_set.compose_static_floorplan(
                     requested_camera_id,
                     {
                         "camera_id": requested_camera_id,
@@ -5023,7 +5027,21 @@ def _run_main(startup_main_guard: StartupMainGuard) -> int:
                     },
                     extrinsics_col_major=calibration.extrinsics_col_major,
                 )
-            except ScenePriorError as exc:
+                calibration_fingerprint = _floorplan_calibration_fingerprint(
+                    calibration_provider.calibration_bundle(),
+                    requested_camera_id,
+                )
+                if calibration_fingerprint is None:
+                    raise ActiveFloorplanError(
+                        "scene-prior calibration fingerprint is unavailable"
+                    )
+                active_floorplan_registry.record_scene_prior(
+                    requested_camera_id,
+                    result,
+                    calibration_fingerprint=calibration_fingerprint,
+                )
+                return result
+            except (ScenePriorError, ActiveFloorplanError) as exc:
                 logger.error("Canonical scene-prior floorplan composition failed: %s", exc)
                 return {
                     "camera_id": requested_camera_id,

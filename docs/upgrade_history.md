@@ -3,6 +3,25 @@
 This is the concise operational record of major runtime and behavior changes.
 Detailed work orders, evidence, and superseded diagrams remain in the archives.
 
+## 2026-08-18 — Kitchen and Family Room SV3DT profiles reached per-room parity
+
+- Accepted the Kitchen phone-walk Scene Prior as per-room geometry and retained
+  its existing reviewed V3DT camera orientation.
+- Added a V3DT-only analytics bundle that removes Kitchen portraits and Family
+  Room portrait, TV/reflection, and window detections before tracking while
+  leaving baseline analytics untouched.
+- Made the V3DT household confirmation threshold profile-controlled and used a
+  one-embedding threshold in the Kitchen and Family Room profiles; the
+  non-V3DT identity policy is unchanged.
+- Revalidated repeated July one-person replays with zero tracks in inactive
+  rooms, complete BBox3D/world output, and primary StableID reuse for 24/25
+  Kitchen and 46/47 Family Room raw tracklets.
+- Applied and visually checked the corrected feet-anchored cuboid in both room
+  profiles at multiple image positions.
+- Confirmed a short synchronized Kitchen/Family doorway overlap, but kept
+  MV3DT disabled because the latest common three-room registration remains
+  rejected and review-only.
+
 ## 2026-08-15 — Documentation authority reconciliation
 
 - Rebuilt the current index, architecture description, native baseline,

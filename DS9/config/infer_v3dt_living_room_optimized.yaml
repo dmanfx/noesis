@@ -139,11 +139,11 @@ tracker:
 analytics:
   enable: true
   config-file: DS9/config/config_nvdsanalytics_post.ini
-  stages_config: DS9/config/nvdsanalytics.yaml
+  stages_config: DS9/config/v3dt/household_tracking_exclusions/nvdsanalytics.yaml
   exclude:
     enable: true
     element: nvdsroiexclude
-    config-file: DS9/config/config_nvdsanalytics_exclude.ini
+    config-file: DS9/config/v3dt/household_tracking_exclusions/config_nvdsanalytics_exclude.ini
 
 sinks:
   - name: mosaic_sink
@@ -189,6 +189,15 @@ visualization:
   display_keypoints: true
   instance_masks:
     alpha: 0.35
+  v3dt_cuboid:
+    enabled: true
+    class_ids: [0]
+    # Source-normalized image point used to orient cuboid depth lines.
+    vanishing_point: [0.50, 0.18]
+    depth_scale: 0.22
+    line_width: 3
+    color: [0.05, 0.70, 1.0]
+    alpha: 1.0
   trails:
     enabled: true
     anchor_mode: floor_plane_gravity_drop

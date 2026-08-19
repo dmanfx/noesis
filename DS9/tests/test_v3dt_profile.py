@@ -44,6 +44,16 @@ assert runtime._normalize_tracking_mode("") == "baseline"
 assert runtime._normalize_tracking_mode("auto") == "baseline"
 assert runtime._normalize_tracking_mode("standard") == "baseline"
 assert runtime._normalize_tracking_mode("sv3dt") == "v3dt"
+assert runtime._v3dt_profile_for_tracking_mode("v3dt") == "sv3dt"
+assert runtime._v3dt_profile_for_tracking_mode("sv3dt") == "sv3dt"
+assert runtime._v3dt_profile_for_tracking_mode("mv3dt") == "mv3dt"
+
+try:
+    runtime._v3dt_profile_for_tracking_mode("baseline")
+except ValueError as exc:
+    assert "requires v3dt or mv3dt" in str(exc)
+else:
+    raise AssertionError("baseline mode was accepted as a V3DT profile")
 
 try:
     runtime._normalize_tracking_mode("v3dtt")

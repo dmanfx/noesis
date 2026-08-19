@@ -1434,6 +1434,54 @@ def attach_trail_overlay_hook(
         logger.exception("Failed to attach trail overlay probe")
 
 
+def attach_v3dt_cuboid_overlay_hook(
+    pipeline: "DS8Pipeline", *, tracking_mode: str
+) -> None:
+    """Replace nvtracker's debug projection with a person-base anchored cuboid."""
+    vis_cfg = pipeline.config.get("visualization") or {}
+    raw_cfg = vis_cfg.get("v3dt_cuboid") if isinstance(vis_cfg, Mapping) else None
+    settings = V3DTCuboidOverlayConfig.from_mapping(
+        raw_cfg if isinstance(raw_cfg, Mapping) else {}
+    )
+    if not settings.enabled:
+        logger.info("V3DT cuboid correction disabled")
+        return
+
+    mode = str(tracking_mode or "").strip().lower()
+    if mode not in ("v3dt", "sv3dt", "mv3dt"):
+        raise ValueError(
+            "visualization.v3dt_cuboid is only valid for a V3DT tracking mode"
+        )
+    attach_component = pipeline.components.get("tracking_telemetry_stage")
+    if attach_component is None:
+        raise KeyError(
+            "tracking_telemetry_stage missing; cannot attach V3DT cuboid correction"
+        )
+    if pipeline.ds_pipeline is None or BufferOperator is None or Probe is None:
+        logger.debug("Stored V3DT cuboid correction for lazy execution")
+        return
+    if noesis_v3dt_meta_ext is None:
+        raise RuntimeError("V3DT cuboid correction requires noesis_v3dt_meta_ext")
+    scrub = getattr(
+        noesis_v3dt_meta_ext, "scrub_tracker_projection_display_meta", None
+    )
+    extract_base = getattr(noesis_v3dt_meta_ext, "extract_person_base", None)
+    if not callable(scrub) or not callable(extract_base):
+        raise RuntimeError(
+            "noesis_v3dt_meta_ext lacks the V3DT cuboid correction API"
+        )
+
+    processor = V3DTCuboidOverlayProcessor(pipeline=pipeline, config=settings)
+    attach_component.config["_v3dt_cuboid_overlay_processor"] = processor
+    setattr(pipeline, "v3dt_cuboid_overlay_processor", processor)
+    probe = Probe("v3dt_cuboid_correction", _V3DTCuboidBufferOperator(processor))
+    pipeline.ds_pipeline.attach(attach_component.name, probe)
+    logger.info(
+        "Attached V3DT person-base cuboid correction to %s",
+        attach_component.name,
+    )
+
+
 def attach_pose_keypoint_overlay_hook(pipeline: "DS8Pipeline") -> None:
     """Attach a DS8 pose keypoint overlay hook (draws skeletons on the mosaic)."""
     vis_cfg = pipeline.config.get("visualization") or {}
@@ -3035,6 +3083,283 @@ class _MapAnythingNativeJob:
     pts_ns: int
     captured_at_us: int
     tensors: Mapping[str, np.ndarray]
+
+
+@dataclass(frozen=True)
+class V3DTCuboidOverlayConfig:
+    enabled: bool = False
+    class_ids: frozenset[int] = field(default_factory=lambda: frozenset({0}))
+    line_width: int = 3
+    color: Tuple[float, float, float] = (0.05, 0.70, 1.0)
+    alpha: float = 1.0
+    depth_scale: float = 0.22
+    vanishing_point: Tuple[float, float] = (0.50, 0.18)
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "line_width", max(1, int(self.line_width)))
+        object.__setattr__(self, "alpha", min(1.0, max(0.0, float(self.alpha))))
+        object.__setattr__(
+            self, "depth_scale", min(0.5, max(0.02, float(self.depth_scale)))
+        )
+        color = tuple(min(1.0, max(0.0, float(value))) for value in self.color[:3])
+        if len(color) != 3:
+            color = (0.05, 0.70, 1.0)
+        object.__setattr__(self, "color", color)
+        vp = tuple(float(value) for value in self.vanishing_point[:2])
+        if len(vp) != 2 or not all(math.isfinite(value) for value in vp):
+            vp = (0.50, 0.18)
+        object.__setattr__(self, "vanishing_point", vp)
+        class_ids: set[int] = set()
+        for value in self.class_ids:
+            try:
+                class_ids.add(int(value))
+            except Exception:
+                continue
+        object.__setattr__(self, "class_ids", frozenset(class_ids or {0}))
+
+    @classmethod
+    def from_mapping(cls, cfg: Mapping[str, Any]) -> "V3DTCuboidOverlayConfig":
+        def _bool(value: Any, default: bool) -> bool:
+            if value is None:
+                return default
+            if isinstance(value, bool):
+                return value
+            text = str(value).strip().lower()
+            if text in _ENV_TRUE_VALUES:
+                return True
+            if text in ("0", "false", "no", "off", "n"):
+                return False
+            return default
+
+        def _tuple(raw: Any, length: int, default: Tuple[float, ...]) -> Tuple[float, ...]:
+            if not isinstance(raw, (list, tuple)) or len(raw) < length:
+                return default
+            try:
+                return tuple(float(value) for value in raw[:length])
+            except Exception:
+                return default
+
+        raw_ids = cfg.get("class_ids", [0])
+        if not isinstance(raw_ids, (list, tuple, set, frozenset)):
+            raw_ids = [raw_ids]
+        class_ids: set[int] = set()
+        for value in raw_ids:
+            try:
+                class_ids.add(int(value))
+            except Exception:
+                continue
+        try:
+            line_width = int(cfg.get("line_width", 3) or 3)
+        except Exception:
+            line_width = 3
+        try:
+            alpha = float(cfg.get("alpha", 1.0) or 1.0)
+        except Exception:
+            alpha = 1.0
+        try:
+            depth_scale = float(cfg.get("depth_scale", 0.22) or 0.22)
+        except Exception:
+            depth_scale = 0.22
+        return cls(
+            enabled=_bool(cfg.get("enabled"), False),
+            class_ids=frozenset(class_ids or {0}),
+            line_width=line_width,
+            color=_tuple(cfg.get("color"), 3, (0.05, 0.70, 1.0)),
+            alpha=alpha,
+            depth_scale=depth_scale,
+            vanishing_point=_tuple(
+                cfg.get("vanishing_point"), 2, (0.50, 0.18)
+            ),
+        )
+
+
+def _anchored_cuboid_segments(
+    bbox: Tuple[float, float, float, float],
+    anchor: Tuple[float, float],
+    depth_vector: Tuple[float, float],
+) -> Tuple[Tuple[Point2, Point2], ...]:
+    """Build cuboid edges with the bottom-face centroid exactly at anchor."""
+    _left, _top, width, height = bbox
+    anchor_x, anchor_y = anchor
+    depth_x, depth_y = depth_vector
+    half_width = max(1.0, float(width)) * 0.5
+    box_height = max(1.0, float(height))
+
+    front_bottom_mid = (
+        float(anchor_x) - (0.5 * float(depth_x)),
+        float(anchor_y) - (0.5 * float(depth_y)),
+    )
+    back_bottom_mid = (
+        float(anchor_x) + (0.5 * float(depth_x)),
+        float(anchor_y) + (0.5 * float(depth_y)),
+    )
+    front_bottom_left = (front_bottom_mid[0] - half_width, front_bottom_mid[1])
+    front_bottom_right = (front_bottom_mid[0] + half_width, front_bottom_mid[1])
+    back_bottom_left = (back_bottom_mid[0] - half_width, back_bottom_mid[1])
+    back_bottom_right = (back_bottom_mid[0] + half_width, back_bottom_mid[1])
+    front_top_left = (front_bottom_left[0], front_bottom_left[1] - box_height)
+    front_top_right = (front_bottom_right[0], front_bottom_right[1] - box_height)
+    back_top_left = (back_bottom_left[0], back_bottom_left[1] - box_height)
+    back_top_right = (back_bottom_right[0], back_bottom_right[1] - box_height)
+
+    return (
+        (front_top_left, front_top_right),
+        (front_top_right, front_bottom_right),
+        (front_bottom_right, front_bottom_left),
+        (front_bottom_left, front_top_left),
+        (back_top_left, back_top_right),
+        (back_top_right, back_bottom_right),
+        (back_bottom_right, back_bottom_left),
+        (back_bottom_left, back_top_left),
+        (front_top_left, back_top_left),
+        (front_top_right, back_top_right),
+        (front_bottom_right, back_bottom_right),
+        (front_bottom_left, back_bottom_left),
+    )
+
+
+@dataclass
+class V3DTCuboidOverlayProcessor:
+    pipeline: "DS8Pipeline"
+    config: V3DTCuboidOverlayConfig
+    _last_log_ts: float = field(default=0.0, init=False, repr=False)
+    _frames: int = field(default=0, init=False, repr=False)
+    _objects: int = field(default=0, init=False, repr=False)
+    _mask_anchors: int = field(default=0, init=False, repr=False)
+    _bbox_anchors: int = field(default=0, init=False, repr=False)
+    _vendor_boxes_removed: int = field(default=0, init=False, repr=False)
+    _vendor_feet_removed: int = field(default=0, init=False, repr=False)
+
+    def _frame_size(self, frame_meta: Any) -> Tuple[int, int]:
+        frame_w = int(
+            _meta_lookup(
+                frame_meta, "source_frame_width", "frame_width", "width", default=0
+            )
+            or 0
+        )
+        frame_h = int(
+            _meta_lookup(
+                frame_meta, "source_frame_height", "frame_height", "height", default=0
+            )
+            or 0
+        )
+        if frame_w <= 0 or frame_h <= 0:
+            try:
+                frame_w, frame_h = tuple(getattr(self.pipeline, "frame_size", (0, 0)))
+                frame_w, frame_h = int(frame_w), int(frame_h)
+            except Exception:
+                frame_w, frame_h = 0, 0
+        return frame_w, frame_h
+
+    def _depth_vector(
+        self,
+        *,
+        anchor: Tuple[float, float],
+        bbox: Tuple[float, float, float, float],
+        frame_size: Tuple[int, int],
+    ) -> Tuple[float, float]:
+        frame_w, frame_h = frame_size
+        vp_x = float(self.config.vanishing_point[0]) * float(max(1, frame_w))
+        vp_y = float(self.config.vanishing_point[1]) * float(max(1, frame_h))
+        direction_x = vp_x - float(anchor[0])
+        direction_y = vp_y - float(anchor[1])
+        norm = math.hypot(direction_x, direction_y)
+        if norm <= 1e-6:
+            direction_x, direction_y, norm = 0.0, -1.0, 1.0
+        magnitude = max(
+            4.0,
+            min(float(bbox[2]), float(bbox[3])) * float(self.config.depth_scale),
+        )
+        return (
+            (direction_x / norm) * magnitude,
+            (direction_y / norm) * magnitude,
+        )
+
+    def scrub_vendor_overlay(self, buffer: Any) -> None:
+        stats = noesis_v3dt_meta_ext.scrub_tracker_projection_display_meta(buffer)
+        if isinstance(stats, Mapping):
+            self._vendor_boxes_removed += int(stats.get("bbox3d_removed", 0) or 0)
+            self._vendor_feet_removed += int(stats.get("foot_removed", 0) or 0)
+
+    def render_batch(self, batch_meta: Any) -> None:
+        if ds_osd is None or batch_meta is None:
+            return
+        acquire_display_meta = getattr(batch_meta, "acquire_display_meta", None)
+        frame_items = getattr(batch_meta, "frame_items", None)
+        if not callable(acquire_display_meta) or frame_items is None:
+            return
+        for frame_meta in frame_items:
+            self._frames += 1
+            append_meta = getattr(frame_meta, "append", None)
+            if not callable(append_meta):
+                continue
+            frame_size = self._frame_size(frame_meta)
+            for obj_meta in getattr(frame_meta, "object_items", None) or []:
+                try:
+                    class_id = int(getattr(obj_meta, "class_id", -1))
+                except Exception:
+                    class_id = -1
+                if class_id not in self.config.class_ids:
+                    continue
+                bbox = _rect_to_bbox(getattr(obj_meta, "rect_params", None))
+                if bbox is None or bbox[2] <= 1.0 or bbox[3] <= 1.0:
+                    continue
+                raw_anchor = noesis_v3dt_meta_ext.extract_person_base(obj_meta)
+                if not isinstance(raw_anchor, Mapping):
+                    continue
+                try:
+                    anchor = (float(raw_anchor["x"]), float(raw_anchor["y"]))
+                except Exception:
+                    continue
+                if not all(math.isfinite(value) for value in anchor):
+                    continue
+                source = str(raw_anchor.get("source") or "bbox_bottom")
+                if source == "instance_mask_base":
+                    self._mask_anchors += 1
+                else:
+                    self._bbox_anchors += 1
+                depth_vector = self._depth_vector(
+                    anchor=anchor, bbox=bbox, frame_size=frame_size
+                )
+                segments = _anchored_cuboid_segments(bbox, anchor, depth_vector)
+                display_meta = acquire_display_meta()
+                if not display_meta:
+                    continue
+                line = ds_osd.Line()
+                line.width = int(self.config.line_width)
+                line.color.r = float(self.config.color[0])
+                line.color.g = float(self.config.color[1])
+                line.color.b = float(self.config.color[2])
+                line.color.a = float(self.config.alpha)
+                frame_w, frame_h = frame_size
+                for start, end in segments:
+                    x1, y1 = start
+                    x2, y2 = end
+                    if frame_w > 0:
+                        x1 = min(float(frame_w - 1), max(0.0, x1))
+                        x2 = min(float(frame_w - 1), max(0.0, x2))
+                    if frame_h > 0:
+                        y1 = min(float(frame_h - 1), max(0.0, y1))
+                        y2 = min(float(frame_h - 1), max(0.0, y2))
+                    line.x1, line.y1 = int(round(x1)), int(round(y1))
+                    line.x2, line.y2 = int(round(x2)), int(round(y2))
+                    display_meta.add_line(line)
+                append_meta(display_meta)
+                self._objects += 1
+
+        now = time.time()
+        if now - self._last_log_ts >= 10.0:
+            logger.info(
+                "V3DT cuboid correction: frames=%d objects=%d mask_anchors=%d "
+                "bbox_anchors=%d vendor_boxes_removed=%d vendor_feet_removed=%d",
+                self._frames,
+                self._objects,
+                self._mask_anchors,
+                self._bbox_anchors,
+                self._vendor_boxes_removed,
+                self._vendor_feet_removed,
+            )
+            self._last_log_ts = now
 
 
 @dataclass(frozen=True)
@@ -11806,6 +12131,21 @@ class _MapAnythingOperator(_BatchMetadataOperatorBase):  # pragma: no cover - so
                 continue
             self._matched_frames += 1
             _increment_core_counter("mapanything_exact_native_capture_frames_total")
+
+
+class _V3DTCuboidBufferOperator(_BufferOperatorBase):  # pragma: no cover - requires DeepStream runtime
+    def __init__(self, processor: V3DTCuboidOverlayProcessor) -> None:
+        super().__init__()
+        self._processor = processor
+
+    def handle_buffer(self, buffer: Any) -> bool:
+        try:
+            self._processor.scrub_vendor_overlay(buffer)
+            self._processor.render_batch(getattr(buffer, "batch_meta", None))
+            return True
+        except Exception:
+            logger.exception("V3DT cuboid correction failed")
+            return False
 
 
 class _PoseFeatureOperator(_BatchMetadataOperatorBase):  # pragma: no cover - requires DeepStream runtime

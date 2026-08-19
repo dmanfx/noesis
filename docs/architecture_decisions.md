@@ -29,11 +29,12 @@ sealing, broad suites, and promotion ceremony require explicit need.
 
 ## ADR-003 — Baseline three-camera tracking remains canonical
 
-**Accepted:** 2026-08-12
+**Accepted:** 2026-08-12; overlap evidence updated 2026-08-18
 
 YOLO26-m + NvDCF baseline tracking is active. MV3DT and AMC remain disabled.
-Only Kitchen/Family Room is a prospective overlap edge; Living Room/Family
-Room do not overlap and Kitchen/Living Room are adjacency only.
+Kitchen/Family Room has a short synchronized common-FOV doorway interval, but
+its latest shared three-room registration is rejected and review-only. Living
+Room/Family Room do not overlap and Kitchen/Living Room are adjacency only.
 
 **Why:** Cross-camera 3D tracking requires correct shared geometry and occupied,
 synchronized overlap evidence. Enabling it earlier would create false spatial

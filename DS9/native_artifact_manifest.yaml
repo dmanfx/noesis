@@ -2,7 +2,7 @@ schema_version: 1
 contract: noesis.ds9.native_artifact_manifest
 base_manifest:
   path: DS9/asset_manifest.yaml
-  sha256: 9218943c6c595be38576483188c27c5d0dbd86c563a6d12efa8d8e8fc507bbee
+  sha256: 352fd52e24b7577a3de30c0de5d26d88f3c73422a8a9a74231a3fcc625753923
 artifacts:
   - id: native.analytics_meta
     kind: native_extension

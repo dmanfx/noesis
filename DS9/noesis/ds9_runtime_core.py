@@ -2118,6 +2118,19 @@ def _tracker_under_v3dt_dir(path: Path) -> bool:
         return False
 
 
+def _v3dt_profile_for_tracking_mode(tracking_mode: str) -> str:
+    """Translate the runtime selector to the profile name stored in YAML."""
+
+    normalized = _normalize_tracking_mode(tracking_mode)
+    if normalized == "v3dt":
+        return "sv3dt"
+    if normalized == "mv3dt":
+        return "mv3dt"
+    raise ValueError(
+        f"V3DT profile validation requires v3dt or mv3dt, got {tracking_mode!r}"
+    )
+
+
 def _validate_v3dt_tracking_guardrails(
     pipeline_path: Path,
     cameras_path: Path,
@@ -2131,7 +2144,7 @@ def _validate_v3dt_tracking_guardrails(
             cameras_config=cameras_path,
             require_engines=True,
             require_sources=False,
-            expected_profile=tracking_mode,
+            expected_profile=_v3dt_profile_for_tracking_mode(tracking_mode),
         )
     except (OSError, V3DTAssetError) as exc:
         logger.error("%s", exc)
@@ -2816,6 +2829,7 @@ def _build_stable_id_manager(
     *,
     pipeline_config: Optional[Mapping[str, Any]] = None,
     camera_labels: Optional[Mapping[int, str]] = None,
+    tracking_mode: str = "baseline",
 ):
     """Instantiate StableIDManager if enabled and available."""
     flag = os.environ.get("NOESIS_REID_ENABLED", "1")
@@ -3047,6 +3061,36 @@ def _build_stable_id_manager(
             "gpu_device": gpu_device,
             "gpu_min_gallery": gpu_min_gallery,
         }
+        v3dt_cfg = (
+            pipeline_config.get("v3dt")
+            if isinstance(pipeline_config, Mapping)
+            else None
+        )
+        v3dt_tracking_active = str(tracking_mode).strip().lower() in {
+            "v3dt",
+            "sv3dt",
+            "mv3dt",
+        }
+        if (
+            v3dt_tracking_active
+            and isinstance(v3dt_cfg, Mapping)
+            and "household_confirm_embeddings" in v3dt_cfg
+        ):
+            try:
+                v3dt_confirm_embeddings = int(
+                    v3dt_cfg["household_confirm_embeddings"]
+                )
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    "v3dt.household_confirm_embeddings must be an integer"
+                ) from exc
+            if not 1 <= v3dt_confirm_embeddings <= 8:
+                raise ValueError(
+                    "v3dt.household_confirm_embeddings must be within 1..8"
+                )
+            extra_kwargs["household_confirm_embeddings"] = (
+                v3dt_confirm_embeddings
+            )
         if household_identity_enabled:
             extra_kwargs.update(household_overrides)
         if camera_labels is not None:
@@ -3084,12 +3128,13 @@ def _build_stable_id_manager(
             **extra_kwargs,
         )
         logger.info(
-            "Stable ID manager initialised (SGIE embeddings; household_mode=%s, allow_multi_zone_active=%s, embed_interval_s=%.3f, new_id_hysteresis_frames=%d, new_id_confirm_frames_at_cap=%d, pose_enabled=%s)",
+            "Stable ID manager initialised (SGIE embeddings; household_mode=%s, allow_multi_zone_active=%s, embed_interval_s=%.3f, new_id_hysteresis_frames=%d, new_id_confirm_frames_at_cap=%d, household_confirm_embeddings=%d, pose_enabled=%s)",
             household_identity_enabled,
             allow_multi_zone_active,
             embed_interval_s,
             new_id_hysteresis_frames,
             new_id_confirm_frames_at_cap,
+            int(getattr(mgr, "household_confirm_embeddings", 0)),
             pose_enabled,
         )
         if household_identity_enabled and (
@@ -4602,12 +4647,25 @@ def _run_main(startup_main_guard: StartupMainGuard) -> int:
     try:
         from noesis.server import analytics_api
 
-        os.environ.setdefault(analytics_api.ANALYTICS_CONFIG_ENV, str(REPO_ROOT / "config" / "nvdsanalytics.yaml"))
         pipeline_cfg_for_analytics = load_runtime_pipeline_config(
             pipeline_path,
             materialize_secrets=False,
         )
-        exclude_cfg = (pipeline_cfg_for_analytics.get("analytics") or {}).get("exclude") or {}
+        analytics_pipeline_cfg = pipeline_cfg_for_analytics.get("analytics") or {}
+        analytics_default_path = REPO_ROOT / "config" / "nvdsanalytics.yaml"
+        if tracking_mode in ("v3dt", "sv3dt", "mv3dt"):
+            stages_raw_path = str(
+                analytics_pipeline_cfg.get("stages_config") or ""
+            ).strip()
+            if stages_raw_path:
+                analytics_default_path = _resolve_pipeline_cfg_path(
+                    pipeline_path, stages_raw_path
+                )
+        os.environ.setdefault(
+            analytics_api.ANALYTICS_CONFIG_ENV,
+            str(analytics_default_path),
+        )
+        exclude_cfg = analytics_pipeline_cfg.get("exclude") or {}
         exclude_raw_path = str(exclude_cfg.get("config-file") or "").strip()
         if not exclude_raw_path:
             raise RuntimeError("Analytics exclusion config path is missing")
@@ -5246,6 +5304,7 @@ def _run_main(startup_main_guard: StartupMainGuard) -> int:
         logger,
         pipeline_config=pipeline.config,
         camera_labels=camera_labels,
+        tracking_mode=tracking_mode,
     )
     if stable_id_mgr is None:
         logger.error("Stable ID manager is required for zero-copy hard-cutover; aborting startup")
@@ -5281,6 +5340,14 @@ def _run_main(startup_main_guard: StartupMainGuard) -> int:
     except Exception:
         trails_cfg = {}
     trail_settings = hooks.TrailOverlayConfig.from_mapping(trails_cfg)
+    if tracking_mode in ("v3dt", "sv3dt", "mv3dt"):
+        try:
+            hooks.attach_v3dt_cuboid_overlay_hook(
+                pipeline, tracking_mode=tracking_mode
+            )
+        except Exception:
+            logger.exception("Failed to attach V3DT cuboid correction")
+            return _abort_startup("v3dt_cuboid_correction_failed")
     try:
         hooks.attach_trail_overlay_hook(pipeline, config=trails_cfg)
     except Exception:

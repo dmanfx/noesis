@@ -1,6 +1,5 @@
-# DeepStream 9 Kitchen SV3DT tracking candidate. This is intentionally
-# separate from infer_v3dt.yaml and is not promotable until Kitchen geometry
-# is validated with its phone walk.
+# DeepStream 9 Kitchen SV3DT optimized profile. This is intentionally
+# separate from infer_v3dt.yaml and from the canonical non-V3DT lane.
 # Launch with NOESIS_V3DT_AUTOGEN_CAMINFO=0 and point
 # NOESIS_CAMERA_CALIBRATION_FILE at the paired calibration beside its tracker.
 
@@ -140,11 +139,11 @@ tracker:
 analytics:
   enable: true
   config-file: DS9/config/config_nvdsanalytics_post.ini
-  stages_config: DS9/config/nvdsanalytics.yaml
+  stages_config: DS9/config/v3dt/household_tracking_exclusions/nvdsanalytics.yaml
   exclude:
     enable: true
     element: nvdsroiexclude
-    config-file: DS9/config/config_nvdsanalytics_exclude.ini
+    config-file: DS9/config/v3dt/household_tracking_exclusions/config_nvdsanalytics_exclude.ini
 
 sinks:
   - name: mosaic_sink
@@ -190,6 +189,14 @@ visualization:
   display_keypoints: true
   instance_masks:
     alpha: 0.35
+  v3dt_cuboid:
+    enabled: true
+    class_ids: [0]
+    vanishing_point: [0.50, 0.18]
+    depth_scale: 0.22
+    line_width: 3
+    color: [0.05, 0.70, 1.0]
+    alpha: 1.0
   trails:
     enabled: true
     anchor_mode: floor_plane_gravity_drop
@@ -232,3 +239,6 @@ v3dt:
   camera_order: [living-room, kitchen, family-room]
   # Keep the StableID mapping alive across short V3DT-only raw-track gaps.
   reid_track_grace_s: 0.5
+  # Promote an embedding-backed V3DT track before short doorway appearances
+  # end, so the same-camera ghost matcher can reuse it after an FOV gap.
+  household_confirm_embeddings: 1

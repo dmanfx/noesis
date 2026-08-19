@@ -1,0 +1,114 @@
+version: 1
+
+# V3DT uses the same dewarped 1920x1080 source space as the room profiles,
+# but its wider 3D tracker turns static portrait detections into long-lived
+# tracks. Keep these exclusions isolated from the canonical non-V3DT state.
+analytics:
+  enable: true
+  stages:
+    exclude:
+      plugin: nvdsroiexclude
+      unique_id: 101
+      osd_mode: 0
+      display_font_size: 4
+      config_width: 1920
+      config_height: 1080
+      defaults:
+        class_ids: [-1]
+        inverse_roi: false
+      streams:
+        "0":
+          label: living_room
+          roi_filtering:
+            enable: true
+            rois:
+              - id: RF3
+                description: Mirror
+                points_px: [[0, 147], [0, 455], [121, 371], [77, 125]]
+              - id: RF4
+                description: TV
+                points_px: [[1088, 257], [1059, 412], [1282, 422], [1319, 268]]
+        "1":
+          label: kitchen
+          roi_filtering:
+            enable: true
+            rois:
+              - id: RF2
+                description: Kitchen wall portraits including detector box extent
+                points_px: [[1030, 300], [1500, 300], [1500, 620], [1030, 620]]
+        "2":
+          label: family_room
+          roi_filtering:
+            enable: true
+            rois:
+              - id: RF1
+                description: Family Room wall portrait including detector box extent
+                points_px: [[350, 300], [575, 300], [575, 625], [350, 625]]
+              - id: RF2
+                description: TV and reflected-person detections
+                points_px: [[0, 1080], [0, 270], [300, 270], [350, 850]]
+              - id: RF3
+                description: Window
+                points_px: [[1822, 541], [1814, 666], [1902, 669], [1920, 548]]
+    post:
+      plugin: nvdsanalytics
+      unique_id: 201
+      osd_mode: 0
+      display_font_size: 12
+      config_width: 1920
+      config_height: 1080
+      streams:
+        "0":
+          label: living_room
+          direction_detection:
+            enable: true
+            class_ids: [-1]
+            vectors:
+              - {id: North, start_px: [960, 300], end_px: [960, 150]}
+              - {id: South, start_px: [960, 780], end_px: [960, 930]}
+              - {id: East, start_px: [750, 540], end_px: [900, 540]}
+              - {id: West, start_px: [1170, 540], end_px: [1020, 540]}
+          overcrowding:
+            enable: true
+            class_ids: [0]
+            object_threshold: 1
+            roi:
+              id: LivingRoom
+              points_px: [[0, 0], [1920, 0], [1920, 1080], [0, 1080]]
+        "1":
+          label: kitchen
+          direction_detection:
+            enable: true
+            class_ids: [-1]
+            vectors:
+              - {id: North, start_px: [960, 300], end_px: [960, 150]}
+              - {id: South, start_px: [960, 780], end_px: [960, 930]}
+              - {id: East, start_px: [750, 540], end_px: [900, 540]}
+              - {id: West, start_px: [1170, 540], end_px: [1020, 540]}
+          overcrowding:
+            enable: true
+            class_ids: [0]
+            object_threshold: 1
+            roi:
+              id: Kitchen
+              points_px: [[0, 0], [1920, 0], [1920, 1080], [0, 1080]]
+        "2":
+          label: family_room
+          direction_detection:
+            enable: true
+            class_ids: [-1]
+            vectors:
+              - {id: North, start_px: [960, 300], end_px: [960, 150]}
+              - {id: South, start_px: [960, 780], end_px: [960, 930]}
+              - {id: East, start_px: [750, 540], end_px: [900, 540]}
+              - {id: West, start_px: [1170, 540], end_px: [1020, 540]}
+          overcrowding:
+            enable: true
+            class_ids: [0]
+            object_threshold: 1
+            roi:
+              id: FamilyRoom
+              points_px: [[0, 0], [1920, 0], [1920, 1080], [0, 1080]]
+
+depth_floor_filter:
+  enable: false

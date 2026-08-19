@@ -149,11 +149,11 @@ artifacts:
     state: validated
     compatibility: {deepstream_major: 9, cuda: "13.2", tensorrt: null}
     provenance:
-      source_sha256: 146d39598199374aea430d5f54e0cc54a22199d25177435880bc26d1ecb7beb2
-      output_sha256: 0a28879b93c0c463e3f91201a25151a833f79b336bc3518cb069191ba9df3666
-      built_at_utc: "2026-08-12T14:47:56Z"
+      source_sha256: d8841f034dab24de1d38f971559e01fc1328fe8a306c0580766e4ccac121bf74
+      output_sha256: 5cb4bb971513161e1674eb2be9eef93e8ff6ac78612e5d709991e0d93ffda42a
+      built_at_utc: "2026-08-15T17:13:20Z"
       build_host: "noesis-ds9-dev@sha256:88d80ad35f12ec3a574cf2555a8242d33ac4110abdcc5f88a6cbdee40dfcf872 (driver 595.71.05)"
-      command: bash DS9/scripts/build_native_extensions.sh
+      command: bash DS9/scripts/build_noesis_v3dt_meta_ext.sh
   - id: native.latency
     kind: native_extension
     role: In-process latency metadata

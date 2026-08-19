@@ -1,15 +1,15 @@
 # Living-room + family-room optimized V3DT profile
 
-Status: archived experimental profile. MV3DT is disabled in the canonical
-native DS9.1 application. Do not launch or promote this profile unless the user
-explicitly reopens MV3DT after Kitchen geometry and synchronized
-Kitchen/Family Room overlap evidence are accepted.
+Status: validated, opt-in per-camera SV3DT profile. MV3DT remains disabled in
+the canonical native DS9.1 application. This profile is isolated from the
+non-V3DT lane and does not replace its tracker, analytics, identity settings,
+or camera assets.
 
 This cumulative DS9 profile keeps the accepted living-room tuning and adds the
 Family Room calibration derived from its 2026-08-10 phone walk. It is isolated
 from the non-V3DT tracker and from the locked V3DT baseline assets.
 
-Historical reproduction command (not a current operating command):
+Bounded recorded-input reproduction command:
 
 ```bash
 NOESIS_CAMERA_CALIBRATION_FILE="$PWD/DS9/config/v3dt/living_family_phone_optimized/camera_calibration.json" \
@@ -77,10 +77,26 @@ track, one canonical StableID, complete embeddings and 3D/world output, and
 with abrupt detector-box truncation; the operational BEV path already applies
 its bounded motion smoother.
 
-## Kitchen status
+The 2026-08-18 accelerated repeated replay revalidated the full pipeline after
+the shared V3DT-coordinate analytics and cuboid changes. Living Room and
+Kitchen produced zero tracks. Family Room produced 898 track rows, all with
+BBox3D and valid world output; 46 of 47 raw tracklets stayed on StableID 1000.
+One two-frame duplicate low-level track was held provisional before receiving
+an alternate StableID. Retaining the anti-merge guard is safer than suppressing
+a legitimate nearby second person in live use. Visual captures at near,
+mid-room, and far positions place the replacement cuboid's bottom-face center
+beneath the feet.
 
-Kitchen remains a tracking-only candidate in this bundle. With the corrected
-one-person scoring it reaches 92.22% coverage, uses eight raw IDs versus six in
-non-V3DT, and produces two canonical StableIDs. Do not treat it as optimized or
-promote it yet. Repeat this geometry-first process after the Kitchen phone walk
-is available.
+## Kitchen and MV3DT status
+
+Kitchen now has an accepted per-room phone-walk Scene Prior and its own
+validated opt-in SV3DT profile. Synchronized July clips also demonstrate a
+short Kitchen/Family doorway overlap at approximately 47.0-49.5 seconds.
+
+The fused Kitchen/Family/Living reconstruction is not tracking authority. Its
+latest registration is `rejected` and the artifact remains `review_only` due
+to training and held-out observation error, per-view deformation, and temporal
+holdout failure. Family Room therefore remains validated only in its accepted
+per-room frame. Do not enable MV3DT until a common Kitchen/Family transform
+passes those gates; Living/Family remain non-overlapping and Kitchen/Living
+remain adjacency-only.

@@ -1901,7 +1901,7 @@ def _parse_args() -> argparse.Namespace:
         default=None,
         help=(
             "PGIE profile overlay. Canonical defaults: baseline=yolo26/m, "
-            "v3dt/mv3dt=yolo26_seg/s. Env: NOESIS_PGIE_PROFILE"
+            "v3dt=yolo26_seg/s, mv3dt=yolo26/m. Env: NOESIS_PGIE_PROFILE"
         ),
     )
     parser.add_argument(
@@ -2062,8 +2062,10 @@ def _resolve_pgie_selection(
     profile = str(args.pgie_profile or "yolo26").strip().lower()
     explicit_profile = bool(getattr(args, "_pgie_profile_explicit", False))
     mode = _normalize_tracking_mode(tracking_mode)
-    if mode in {"v3dt", "mv3dt"} and not explicit_profile:
+    if mode == "v3dt" and not explicit_profile:
         profile = "yolo26_seg"
+    elif mode == "mv3dt" and not explicit_profile:
+        profile = "yolo26"
     if profile not in _PGIE_PROFILES:
         raise SystemExit(f"[FATAL] Unsupported DS9 PGIE profile: {profile}")
 

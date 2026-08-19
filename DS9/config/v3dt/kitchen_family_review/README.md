@@ -4,6 +4,11 @@ Status: accepted explicit runtime option. Select `--tracking-mode mv3dt` (or
 `NOESIS_TRACKING_MODE=mv3dt`) to use `DS9/config/infer_mv3dt.yaml`. Baseline and
 SV3DT are not modified by this profile; baseline remains the default.
 
+The canonical MV3DT selector uses the same YOLO26-m detection PGIE as baseline.
+The detector does not emit instance masks, so the replacement cuboid uses its
+tracked-bbox bottom-center fallback for the image gravity anchor. The recorded
+evaluation profile remains available for segmentation-specific comparisons.
+
 On the native host, run the same supervisor used by the normal appliance with
 an explicit lane selection:
 
@@ -45,8 +50,9 @@ Kitchen/Family doorway episodes, including late reassociation after the peer
 left view. The multi-person spans produced shared native IDs only on visually
 confirmed same-person pairs; the separate person and partial-body duplicate
 tracks were not merged. A rendered 22-second mosaic was inspected at near,
-far, doorway, and full-body positions; the replacement cuboid bottom-face
-centroid remained on the segmentation-mask feet/gravity anchor.
+far, doorway, and full-body positions; that segmentation-PGIE run kept the
+replacement cuboid bottom-face centroid on the mask feet/gravity anchor. The
+canonical YOLO26-m fallback must be judged from the live occupied view.
 
 Both recorded evaluation and live opt-in profiles require complete batches
 (`batched-push-timeout: -1`) with `sync-inputs: 0` and

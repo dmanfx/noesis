@@ -128,8 +128,8 @@ def test_mv3dt_command_is_an_explicit_native_host_lane(tmp_path: Path) -> None:
     )
     assert argv[argv.index("--pipeline-config") + 1] == "DS9/config/infer_mv3dt.yaml"
     assert argv[argv.index("--cameras-config") + 1] == "DS9/config/cameras_v3dt.yaml"
-    assert argv[argv.index("--pgie-profile") + 1] == "yolo26_seg"
-    assert argv[argv.index("--size") + 1] == "s"
+    assert argv[argv.index("--pgie-profile") + 1] == "yolo26"
+    assert argv[argv.index("--size") + 1] == "m"
     assert argv[argv.index("--tracking-mode") + 1] == "mv3dt"
 
 
@@ -183,7 +183,7 @@ def test_mv3dt_run_environment_preserves_explicit_opt_in(tmp_path: Path) -> None
             tracking_mode="mv3dt",
         )
     assert built["NOESIS_TRACKING_MODE"] == "mv3dt"
-    assert built["NOESIS_PGIE_PROFILE"] == "yolo26_seg"
+    assert built["NOESIS_PGIE_PROFILE"] == "yolo26"
     context = json.loads(built["NOESIS_APPLIANCE_RUNTIME_CONTEXT"])
     assert context["runtime_variant"] == "ds9:v3dt"
 

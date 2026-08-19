@@ -85,12 +85,12 @@ sources:
 
 preprocess:
   enable: true
-  config-file: DS9/pipelines/config_preproc_yolo26_seg_s.ini
+  config-file: DS9/pipelines/config_preproc_yolo26_m.ini
 
 models:
   pgie:
-    config-file-path: DS9/pipelines/config_infer_primary_yolo26_seg_s.ini
-    engine: DS9/models/engines/yolo26s-seg_fused_b3_fp16.engine
+    config-file-path: DS9/pipelines/config_infer_primary_yolo26_m.ini
+    engine: DS9/models/engines/yolo26m_b3_fp16.engine
     batch_size: 3
     gie_id: 1
     network_mode: fp16
@@ -118,7 +118,7 @@ models:
     kpt_threshold: 0.35
     letterbox: true
   depth_tracking:
-    # The baseline DAv2 lane estimates object depth for the 2D tracker. SV3DT
+    # The baseline DAv2 lane estimates object depth for the 2D tracker. MV3DT
     # owns the 3D observation here, so keeping that lane active would duplicate
     # depth work without contributing to the V3DT result.
     enable: false

@@ -48,6 +48,15 @@ assert runtime._v3dt_profile_for_tracking_mode("v3dt") == "sv3dt"
 assert runtime._v3dt_profile_for_tracking_mode("sv3dt") == "sv3dt"
 assert runtime._v3dt_profile_for_tracking_mode("mv3dt") == "mv3dt"
 
+default_pgie = SimpleNamespace(
+    pgie_profile="yolo26",
+    _pgie_profile_explicit=False,
+    size=None,
+)
+assert runtime._resolve_pgie_selection(default_pgie, "baseline") == ("yolo26", "m")
+assert runtime._resolve_pgie_selection(default_pgie, "v3dt") == ("yolo26_seg", "s")
+assert runtime._resolve_pgie_selection(default_pgie, "mv3dt") == ("yolo26", "m")
+
 try:
     runtime._v3dt_profile_for_tracking_mode("baseline")
 except ValueError as exc:

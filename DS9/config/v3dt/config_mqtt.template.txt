@@ -1,2 +1,5 @@
-# Deferred MV3DT MQTT adapter placeholder; this is not a runtime credential file.
-# Activation must materialize an owner-only adapter config outside the checkout.
+# Credential-free local MQTT adapter template for the isolated MV3DT evaluation lane.
+# Runtime materializes an owner-only copy outside the checkout. The canonical
+# deferred profile remains non-activatable without the explicit evaluation gate.
+[message-broker]
+set-threaded = 0

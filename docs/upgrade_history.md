@@ -3,6 +3,24 @@
 This is the concise operational record of major runtime and behavior changes.
 Detailed work orders, evidence, and superseded diagrams remain in the archives.
 
+## 2026-08-19 — Kitchen/Family MV3DT evaluation lane
+
+- Added an explicitly gated, evaluation-only Kitchen/Family MV3DT profile while
+  leaving the canonical appliance and per-room SV3DT profiles unchanged.
+- Bound the review Kitchen transform into the Family gauge and limited real
+  peer exchange to Kitchen and Family Room. A Living self-topic loop avoids a
+  DS9.1 empty-peer batch deadlock without creating a cross-camera edge.
+- Made recorded replay use complete batches and shared batch frame IDs.
+- Materialized MV3DT MQTT and analytics state outside the checkout and baseline
+  writable state, restoring the V3DT-specific portrait/reflection exclusions.
+- Replayed a complete July single-person cycle and a complete 120-second
+  multi-person segment. Both advanced at application rate with complete 3D
+  metadata; visual samples confirmed cuboid bases remain under the feet.
+- Kept the lane review-only: neither cohort proves a Kitchen/Family StableID
+  handoff, and the bound geometry still fails its held-out acceptance gates.
+  The remaining input is a synchronized occupied shared-FOV Kitchen/Family
+  capture tied to accepted connector geometry.
+
 ## 2026-08-18 — Kitchen and Family Room SV3DT profiles reached per-room parity
 
 - Accepted the Kitchen phone-walk Scene Prior as per-room geometry and retained

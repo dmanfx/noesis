@@ -262,6 +262,13 @@ def _artifact_dir(env_name: str, default: Path) -> Path:
     return Path(os.environ.get(env_name, default)).expanduser().resolve()
 
 
+def _mv3dt_evaluation_requested() -> bool:
+    return (
+        str(os.environ.get("NOESIS_MV3DT_EVALUATION", "")).strip().lower()
+        in _ENV_TRUE
+    )
+
+
 def _model_dir() -> Path:
     return _artifact_dir("NOESIS_MODEL_DIR", DS9_ROOT / "models")
 
@@ -1643,13 +1650,27 @@ def _materialize_effective_pipeline_yaml(
     out_dir.mkdir(parents=True, exist_ok=True)
     out_path = out_dir / f"effective_pipeline_{profile}.yaml"
     effective_cfg = _canonicalize_effective_pipeline_paths(effective_cfg, base_yaml_path)
-    if str(tracking_mode).strip().lower() == "v3dt":
+    normalized_tracking_mode = str(tracking_mode).strip().lower()
+    if normalized_tracking_mode in {"v3dt", "mv3dt"}:
         if v3dt_bundle is None:
             raise SystemExit("[FATAL] V3DT runtime tracker materialization requires a validated asset bundle")
+        mqtt_runtime_config = None
+        tracker_filename = "nvtracker_v3dt_runtime.yaml"
+        if normalized_tracking_mode == "mv3dt":
+            mqtt_runtime_config = _materialize_mv3dt_mqtt_runtime_config(
+                v3dt_bundle
+            )
+            tracker_filename = "nvtracker_mv3dt_runtime.yaml"
+        tracker_materialization_kwargs: Dict[str, Any] = {}
+        if mqtt_runtime_config is not None:
+            tracker_materialization_kwargs["mqtt_runtime_config"] = (
+                mqtt_runtime_config
+            )
         tracker_out = materialize_v3dt_tracker_config(
             v3dt_bundle,
-            out_dir / "config" / "v3dt" / "nvtracker_v3dt_runtime.yaml",
+            out_dir / "config" / "v3dt" / tracker_filename,
             output_root=out_dir,
+            **tracker_materialization_kwargs,
         )
         tracker_cfg = effective_cfg.get("tracker")
         if not isinstance(tracker_cfg, dict):
@@ -1663,6 +1684,120 @@ def _materialize_effective_pipeline_yaml(
 
     _preflight_pgie_profile(profile, effective_cfg, out_path, logger)
     return out_path
+
+
+def _materialize_mv3dt_mqtt_runtime_config(bundle: V3DTAssetBundle) -> Path:
+    """Materialize the credential-free local MQTT adapter config outside Git."""
+
+    template = bundle.mqtt_config_template
+    if template is None or not template.is_file():
+        raise SystemExit("[FATAL] MV3DT evaluation requires a validated MQTT template")
+    payload = template.read_text(encoding="utf-8")
+    if "[message-broker]" not in payload or "set-threaded" not in payload:
+        raise SystemExit(
+            "[FATAL] MV3DT MQTT template must contain the message-broker section "
+            "and set-threaded setting"
+        )
+
+    runtime_root_raw = str(os.environ.get("NOESIS_MV3DT_RUNTIME_DIR", "")).strip()
+    if runtime_root_raw:
+        runtime_root = Path(runtime_root_raw).expanduser()
+        if not runtime_root.is_absolute():
+            raise SystemExit("[FATAL] NOESIS_MV3DT_RUNTIME_DIR must be absolute")
+    else:
+        xdg_runtime = str(os.environ.get("XDG_RUNTIME_DIR", "")).strip()
+        runtime_root = (
+            Path(xdg_runtime) / "noesis" / "mv3dt"
+            if xdg_runtime
+            else Path(f"/tmp/noesis-mv3dt-{os.getuid()}")
+        )
+    runtime_root = runtime_root.resolve(strict=False)
+    try:
+        runtime_root.relative_to(REPO_ROOT.resolve())
+    except ValueError:
+        pass
+    else:
+        raise SystemExit(
+            "[FATAL] MV3DT runtime material must remain outside the checkout"
+        )
+    if runtime_root == Path("/"):
+        raise SystemExit("[FATAL] refusing unsafe MV3DT runtime directory")
+
+    runtime_root.mkdir(parents=True, exist_ok=True, mode=0o700)
+    runtime_root.chmod(0o700)
+    destination = runtime_root / "config_mqtt.txt"
+    temporary = runtime_root / f".config_mqtt.txt.partial-{os.getpid()}"
+    try:
+        temporary.write_text(payload, encoding="utf-8")
+        temporary.chmod(0o600)
+        os.replace(temporary, destination)
+        destination.chmod(0o600)
+    finally:
+        temporary.unlink(missing_ok=True)
+    return destination
+
+
+def _materialize_mv3dt_analytics_runtime_configs(
+    stages_source: Path,
+    exclude_source: Path,
+) -> tuple[Path, Path]:
+    """Copy evaluation-only analytics state outside Git and baseline state."""
+
+    for label, source in (
+        ("stages", stages_source),
+        ("exclude", exclude_source),
+    ):
+        if not source.is_file():
+            raise SystemExit(
+                f"[FATAL] MV3DT evaluation analytics {label} config is missing: {source}"
+            )
+        try:
+            source.resolve().relative_to(DS9_ROOT / "config")
+        except ValueError as exc:
+            raise SystemExit(
+                f"[FATAL] MV3DT evaluation analytics {label} config must be DS9-owned: {source}"
+            ) from exc
+
+    runtime_root_raw = str(os.environ.get("NOESIS_MV3DT_RUNTIME_DIR", "")).strip()
+    if runtime_root_raw:
+        runtime_root = Path(runtime_root_raw).expanduser()
+        if not runtime_root.is_absolute():
+            raise SystemExit("[FATAL] NOESIS_MV3DT_RUNTIME_DIR must be absolute")
+    else:
+        xdg_runtime = str(os.environ.get("XDG_RUNTIME_DIR", "")).strip()
+        runtime_root = (
+            Path(xdg_runtime) / "noesis" / "mv3dt"
+            if xdg_runtime
+            else Path(f"/tmp/noesis-mv3dt-{os.getuid()}")
+        )
+    analytics_root = (runtime_root / "analytics").resolve(strict=False)
+    try:
+        analytics_root.relative_to(REPO_ROOT.resolve())
+    except ValueError:
+        pass
+    else:
+        raise SystemExit(
+            "[FATAL] MV3DT runtime analytics material must remain outside the checkout"
+        )
+    analytics_root.mkdir(parents=True, exist_ok=True, mode=0o700)
+    analytics_root.chmod(0o700)
+
+    destinations = []
+    for name, source in (
+        ("nvdsanalytics.yaml", stages_source),
+        ("config_nvdsanalytics_exclude.ini", exclude_source),
+    ):
+        destination = analytics_root / name
+        temporary = analytics_root / f".{name}.partial-{os.getpid()}"
+        try:
+            temporary.write_text(source.read_text(encoding="utf-8"), encoding="utf-8")
+            temporary.chmod(0o600)
+            os.replace(temporary, destination)
+            destination.chmod(0o600)
+        finally:
+            temporary.unlink(missing_ok=True)
+        destinations.append(destination)
+    return destinations[0], destinations[1]
 
 
 def _maybe_autogen_v3dt_caminfo(
@@ -2145,6 +2280,11 @@ def _validate_v3dt_tracking_guardrails(
             require_engines=True,
             require_sources=False,
             expected_profile=_v3dt_profile_for_tracking_mode(tracking_mode),
+            expected_activation_state=(
+                "evaluation_only"
+                if _normalize_tracking_mode(tracking_mode) == "mv3dt"
+                else None
+            ),
         )
     except (OSError, V3DTAssetError) as exc:
         logger.error("%s", exc)
@@ -4299,11 +4439,12 @@ def _run_main(startup_main_guard: StartupMainGuard) -> int:
     )
     logger = logging.getLogger("ds9.runtime")
     tracking_mode = _resolve_tracking_mode(args)
-    if tracking_mode == "mv3dt":
+    if tracking_mode == "mv3dt" and not _mv3dt_evaluation_requested():
         logger.critical(
             "MV3DT activation is deferred until Kitchen geometry and synchronized "
             "occupied Kitchen/Family-Room overlap evidence are ready; Living Room "
-            "has no MV3DT peer edge."
+            "has no MV3DT peer edge. The isolated review lane additionally requires "
+            "NOESIS_MV3DT_EVALUATION=1 and an evaluation_only profile."
         )
         return 78
     try:
@@ -4526,7 +4667,7 @@ def _run_main(startup_main_guard: StartupMainGuard) -> int:
             f"ds9:wholebody49-{pgie_size}"
             if pgie_profile == "wholebody49"
             else "ds9:v3dt"
-            if tracking_mode == "v3dt"
+            if tracking_mode in {"v3dt", "mv3dt"}
             else "ds9:baseline"
         )
         if (
@@ -4568,7 +4709,7 @@ def _run_main(startup_main_guard: StartupMainGuard) -> int:
         logger.error("Pipeline configuration not found: %s", pipeline_path)
         return 1
     v3dt_bundle: Optional[V3DTAssetBundle] = None
-    if tracking_mode == "v3dt":
+    if tracking_mode in {"v3dt", "mv3dt"}:
         if not _ensure_v3dt_meta_extension(logger):
             return 1
         v3dt_bundle = _validate_v3dt_tracking_guardrails(
@@ -4579,20 +4720,21 @@ def _run_main(startup_main_guard: StartupMainGuard) -> int:
         )
         if v3dt_bundle is None:
             return 1
-        if not _maybe_autogen_v3dt_caminfo(
-            pipeline_path, cameras_path, v3dt_bundle, logger
-        ):
-            return 1
-        # Autogeneration mutates the camera-model artifacts deliberately; rerun
-        # the complete ownership/shape/provenance contract before NvMOT sees them.
-        v3dt_bundle = _validate_v3dt_tracking_guardrails(
-            pipeline_path,
-            cameras_path,
-            logger,
-            tracking_mode=tracking_mode,
-        )
-        if v3dt_bundle is None:
-            return 1
+        if tracking_mode == "v3dt":
+            if not _maybe_autogen_v3dt_caminfo(
+                pipeline_path, cameras_path, v3dt_bundle, logger
+            ):
+                return 1
+            # Autogeneration mutates the camera-model artifacts deliberately; rerun
+            # the complete ownership/shape/provenance contract before NvMOT sees them.
+            v3dt_bundle = _validate_v3dt_tracking_guardrails(
+                pipeline_path,
+                cameras_path,
+                logger,
+                tracking_mode=tracking_mode,
+            )
+            if v3dt_bundle is None:
+                return 1
     else:
         if not _reject_baseline_with_v3dt_tracker(pipeline_path, logger):
             return 1
@@ -4653,6 +4795,9 @@ def _run_main(startup_main_guard: StartupMainGuard) -> int:
         )
         analytics_pipeline_cfg = pipeline_cfg_for_analytics.get("analytics") or {}
         analytics_default_path = REPO_ROOT / "config" / "nvdsanalytics.yaml"
+        mv3dt_evaluation = (
+            tracking_mode == "mv3dt" and _mv3dt_evaluation_requested()
+        )
         if tracking_mode in ("v3dt", "sv3dt", "mv3dt"):
             stages_raw_path = str(
                 analytics_pipeline_cfg.get("stages_config") or ""
@@ -4661,18 +4806,31 @@ def _run_main(startup_main_guard: StartupMainGuard) -> int:
                 analytics_default_path = _resolve_pipeline_cfg_path(
                     pipeline_path, stages_raw_path
                 )
-        os.environ.setdefault(
-            analytics_api.ANALYTICS_CONFIG_ENV,
-            str(analytics_default_path),
-        )
         exclude_cfg = analytics_pipeline_cfg.get("exclude") or {}
         exclude_raw_path = str(exclude_cfg.get("config-file") or "").strip()
         if not exclude_raw_path:
             raise RuntimeError("Analytics exclusion config path is missing")
-        os.environ.setdefault(
-            "NOESIS_ANALYTICS_EXCLUDE_CONFIG",
-            str(_resolve_pipeline_cfg_path(pipeline_path, exclude_raw_path)),
-        )
+        exclude_path = _resolve_pipeline_cfg_path(pipeline_path, exclude_raw_path)
+        if mv3dt_evaluation:
+            analytics_default_path, exclude_path = (
+                _materialize_mv3dt_analytics_runtime_configs(
+                    analytics_default_path,
+                    exclude_path,
+                )
+            )
+            os.environ[analytics_api.ANALYTICS_CONFIG_ENV] = str(
+                analytics_default_path
+            )
+            os.environ["NOESIS_ANALYTICS_EXCLUDE_CONFIG"] = str(exclude_path)
+        else:
+            os.environ.setdefault(
+                analytics_api.ANALYTICS_CONFIG_ENV,
+                str(analytics_default_path),
+            )
+            os.environ.setdefault(
+                "NOESIS_ANALYTICS_EXCLUDE_CONFIG",
+                str(exclude_path),
+            )
         analytics_cfg = analytics_api._load_config(force=True)  # type: ignore[attr-defined]
         stages_cfg = (analytics_cfg.get("analytics") or {}).get("stages") or {}
         if "exclude" not in stages_cfg or not isinstance(stages_cfg["exclude"], dict):

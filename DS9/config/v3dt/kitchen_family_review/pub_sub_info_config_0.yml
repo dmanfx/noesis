@@ -1,0 +1,8 @@
+pubBrokerTopicStr:
+- 'localhost:1883;ds3d/cam0'
+- 'localhost:1883;ds3d/cam1'
+- 'localhost:1883;ds3d/cam2'
+subPeerBrokerTopicStrs:
+- - 'localhost:1883;ds3d/cam0'
+- - 'localhost:1883;ds3d/cam2'
+- - 'localhost:1883;ds3d/cam1'

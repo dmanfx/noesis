@@ -237,13 +237,26 @@ def _synthetic_stub_requested() -> bool:
     return str(os.environ.get("NOESIS_DS9_STUB_PIPELINE", "")).strip().lower() in _ENV_TRUE
 
 
+def _mv3dt_evaluation_requested() -> bool:
+    """Return true only for the explicit, non-canonical MV3DT evaluation lane."""
+
+    return (
+        str(os.environ.get("NOESIS_MV3DT_EVALUATION", "")).strip().lower()
+        in _ENV_TRUE
+    )
+
+
 def main() -> int:
     _ensure_runtime_sys_path()
-    if _requested_tracking_mode() == "mv3dt":
+    if (
+        _requested_tracking_mode() == "mv3dt"
+        and not _mv3dt_evaluation_requested()
+    ):
         print(
             "[FATAL] MV3DT activation is deferred until Kitchen geometry and "
             "synchronized occupied Kitchen/Family-Room overlap evidence are ready; "
-            "Living Room has no MV3DT peer edge.",
+            "Living Room has no MV3DT peer edge. The isolated review lane additionally "
+            "requires NOESIS_MV3DT_EVALUATION=1 and an evaluation_only profile.",
             file=sys.stderr,
         )
         return 78

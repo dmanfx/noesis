@@ -1,0 +1,25 @@
+{
+  "schema": "noesis.mv3dt.geometry_binding.v1",
+  "status": "review_only",
+  "canonical_use": false,
+  "fixed_gauge": "family-room",
+  "moving_room": "kitchen",
+  "transform_convention": "column-vector; maps Kitchen backend world to Family Room backend world",
+  "moving_correction_in_backend_world_row_major": [
+    [0.9509890280393867, 0.0, 0.30922462474502693, -4.51875994],
+    [0.0, 1.0, 0.0, -0.00001779536248314173],
+    [-0.30922462474502693, 0.0, 0.9509890280393867, 8.87101457],
+    [0.0, 0.0, 0.0, 1.0]
+  ],
+  "yaw_deg": 18.012509,
+  "source_report_storage_relative": "noesis_devel/pcf_multiroom/kitchen_family_cross_session_20260815/floor_constrained_review_reintegration_v2/pose_graph_validation_report.json",
+  "source_report_sha256": "455cc55e31b09e5551077c9fee4418a67832db279df7b95cdf751e648c1e2ac1",
+  "source_calibration": "DS9/config/v3dt/living_family_phone_optimized/camera_calibration.json",
+  "source_calibration_sha256": "2257abe9c4e6c3fbbc4accdb41d22a87e1d05cdc10f54ada4c9fbb68903731c5",
+  "accepted": false,
+  "reason_codes": [
+    "heldout_observation_error_exceeded",
+    "segment_holdout_training_support_collapsed",
+    "temporal_segment_holdout_failed"
+  ]
+}

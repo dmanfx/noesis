@@ -101,3 +101,37 @@ must remain explicit and fail closed.
 Superseded DS7/DS8, DS9.0, container, migration, experiment, and validation
 diaries are retained under `docs/history/`, `DS9/docs/history/`, and
 `plans/archive/`. Active indexes never route implementation work through them.
+
+## ADR-017 — Kitchen/Family MV3DT remains an isolated evaluation lane
+
+**Accepted:** 2026-08-19 for recorded-input evaluation only
+
+The canonical appliance remains non-MV3DT. A separate Kitchen/Family review
+profile may run only with `NOESIS_MV3DT_EVALUATION=1`; the runtime rejects that
+profile without the explicit flag. It binds the current review-only
+Kitchen-to-Family transform, keeps Family Room as the fixed gauge, and gives
+only Kitchen and Family Room cross-camera MQTT edges. Living Room retains its
+local geometry and uses a self-topic synchronization loop because the ordered
+DS9.1 communicator blocks a batched tracker when a stream has an empty peer
+entry. The self-loop is not a vision-neighbor edge and exposes no other
+camera's measurements or IDs to Living Room.
+
+Recorded cohorts use complete batches, the shared tracker batch counter for
+frame IDs, and profile-owned analytics state materialized outside both Git and
+the baseline writable state. This prevents appliance state from silently
+replacing the V3DT portrait/reflection exclusions while preserving the
+non-V3DT runtime unchanged.
+
+The profile is not promotable. Both the July single-person cohort and the
+multi-person stress segment advance normally after the communicator fix, and
+visual samples place the corrected cuboid base under the tracked feet. The
+single-person exclusions reduce coincident Kitchen/Family observations from
+81 frames to 12, but neither cohort produces a verified cross-room StableID
+handoff. The bound static transform is still rejected by its held-out geometry
+gates, and the recordings do not provide an accepted same-person shared-FOV
+correspondence set. Canonical MV3DT therefore remains blocked on accepted
+Kitchen geometry plus a synchronized occupied Kitchen/Family overlap capture.
+
+**Why:** This preserves a fast, directly testable two-room implementation
+without granting tracking authority to rejected geometry or changing the
+proven baseline/SV3DT lane.

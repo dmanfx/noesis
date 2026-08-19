@@ -7143,14 +7143,20 @@ class _AnalyticsTelemetryProcessor:
             self._analytics_unique_id = None
 
         self._tracking_mode = self._resolve_tracking_mode(self.tracking_mode)
-        if self._tracking_mode_is_mv3dt():
+        v3dt_cfg = getattr(self.pipeline, "config", {}).get("v3dt", {}) or {}
+        if self._tracking_mode_is_mv3dt() and (
+            str(os.environ.get("NOESIS_MV3DT_EVALUATION", "")).strip().lower()
+            not in {"1", "true", "yes", "y", "on"}
+            or not isinstance(v3dt_cfg, Mapping)
+            or v3dt_cfg.get("activation_state") != "evaluation_only"
+        ):
             raise ValueError(
                 "MV3DT activation is deferred until Kitchen geometry and synchronized "
                 "occupied Kitchen/Family-Room overlap evidence are ready; Living Room "
-                "has no MV3DT peer edge"
+                "has no MV3DT peer edge. The isolated review lane additionally requires "
+                "NOESIS_MV3DT_EVALUATION=1 and an evaluation_only profile"
             )
 
-        v3dt_cfg = getattr(self.pipeline, "config", {}).get("v3dt", {}) or {}
         if self._tracking_mode_is_v3dt():
             if not isinstance(v3dt_cfg, Mapping):
                 raise ValueError("V3DT runtime requires an explicit v3dt config mapping")

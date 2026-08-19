@@ -101,6 +101,11 @@ MV3DT_SUBSCRIBE_TOPICS = (
     (MV3DT_PUBLISH_TOPICS[2],),
     (MV3DT_PUBLISH_TOPICS[1],),
 )
+MV3DT_EVALUATION_SUBSCRIBE_TOPICS = (
+    (MV3DT_PUBLISH_TOPICS[0],),
+    (MV3DT_PUBLISH_TOPICS[2],),
+    (MV3DT_PUBLISH_TOPICS[1],),
+)
 MV3DT_ASSOCIATOR_CONTRACT = {
     "multiViewAssociatorType": 1,
     "enableLatePeerReAssoc": 1,
@@ -271,6 +276,8 @@ def _validate_pipeline_paths(
     pipeline_path: Path,
     profile: str,
     errors: list[str],
+    *,
+    activation_state: str = "",
 ) -> None:
     sources = pipeline.get("sources")
     if not isinstance(sources, list) or len(sources) != len(EXPECTED_CAMERA_ORDER):
@@ -355,8 +362,15 @@ def _validate_pipeline_paths(
         )
     if streammux.get("num-surfaces-per-frame") != 1:
         errors.append("streammux.num-surfaces-per-frame must be 1")
-    if profile == "mv3dt" and streammux.get("sync-inputs") != 1:
-        errors.append("streammux.sync-inputs must be 1 for the MV3DT profile")
+    if profile == "mv3dt":
+        sync_inputs = streammux.get("sync-inputs")
+        if activation_state == "evaluation_only":
+            if sync_inputs not in {0, 1}:
+                errors.append(
+                    "evaluation-only MV3DT streammux.sync-inputs must be 0 or 1"
+                )
+        elif sync_inputs != 1:
+            errors.append("streammux.sync-inputs must be 1 for the MV3DT profile")
 
     analytics = _mapping(pipeline.get("analytics"), label="analytics", errors=errors)
     for key in ("config-file", "stages_config"):
@@ -545,6 +559,7 @@ def _validate_mv3dt_tracker_contract(
     tracker_config: Mapping[str, Any],
     *,
     tracker_path: Path,
+    activation_state: str,
     errors: list[str],
 ) -> tuple[Path, Path]:
     associator = _mapping(
@@ -627,10 +642,15 @@ def _validate_mv3dt_tracker_contract(
             )
         except TypeError:
             subscriptions = ()
-    if subscriptions != MV3DT_SUBSCRIBE_TOPICS:
+    expected_subscriptions = (
+        MV3DT_EVALUATION_SUBSCRIBE_TOPICS
+        if activation_state == "evaluation_only"
+        else MV3DT_SUBSCRIBE_TOPICS
+    )
+    if subscriptions != expected_subscriptions:
         errors.append(
             "subPeerBrokerTopicStrs must encode only Kitchen <-> Family Room; "
-            "Living Room must have no MV3DT peer edge"
+            "Living Room must have no cross-camera MV3DT peer edge"
         )
     return pub_sub_path, mqtt_template_path
 
@@ -642,6 +662,7 @@ def validate_v3dt_assets(
     require_engines: bool = True,
     require_sources: bool = True,
     expected_profile: str | None = None,
+    expected_activation_state: str | None = None,
 ) -> V3DTAssetBundle:
     """Validate one DS9-owned V3DT pipeline and return its resolved asset graph."""
 
@@ -689,8 +710,65 @@ def validate_v3dt_assets(
         errors.append(
             f"v3dt.profile is {profile!r}; expected {expected_profile_normalized}"
         )
-    if profile == "mv3dt" and profile_config.get("activation_state") != "deferred":
-        errors.append("v3dt.activation_state must remain deferred for MV3DT")
+    activation_state = str(profile_config.get("activation_state") or "").strip()
+    if profile == "mv3dt":
+        if activation_state not in {"deferred", "evaluation_only"}:
+            errors.append(
+                "v3dt.activation_state must be deferred or evaluation_only for MV3DT"
+            )
+        if activation_state == "evaluation_only":
+            if profile_config.get("evaluation_scope") != "kitchen-family":
+                errors.append(
+                    "evaluation-only MV3DT must set evaluation_scope=kitchen-family"
+                )
+            if profile_config.get("geometry_authority") != "review_only":
+                errors.append(
+                    "evaluation-only MV3DT must keep geometry_authority=review_only"
+                )
+            geometry_binding_path = _require_owned_reference(
+                profile_config.get("geometry_binding"),
+                owner_file=pipeline_path,
+                root=DS9_V3DT_CONFIG_ROOT,
+                label="v3dt.geometry_binding",
+                errors=errors,
+            )
+            if geometry_binding_path.is_file():
+                try:
+                    geometry_binding = strict_json_loads(
+                        geometry_binding_path.read_text(encoding="utf-8"),
+                        label="MV3DT geometry binding",
+                    )
+                except Exception as exc:
+                    geometry_binding = {}
+                    errors.append(
+                        f"unable to parse MV3DT geometry binding "
+                        f"{geometry_binding_path}: {exc}"
+                    )
+                if not isinstance(geometry_binding, Mapping):
+                    geometry_binding = {}
+                    errors.append(
+                        f"MV3DT geometry binding must be a mapping: "
+                        f"{geometry_binding_path}"
+                    )
+                expected_geometry = {
+                    "schema": "noesis.mv3dt.geometry_binding.v1",
+                    "status": "review_only",
+                    "canonical_use": False,
+                    "fixed_gauge": "family-room",
+                    "moving_room": "kitchen",
+                    "accepted": False,
+                }
+                for key, expected in expected_geometry.items():
+                    if geometry_binding.get(key) != expected:
+                        errors.append(
+                            f"MV3DT geometry binding {key} must be {expected!r}"
+                        )
+    expected_activation = str(expected_activation_state or "").strip()
+    if expected_activation and activation_state != expected_activation:
+        errors.append(
+            f"v3dt.activation_state is {activation_state!r}; expected "
+            f"{expected_activation!r}"
+        )
     if profile_config.get("world_frame") != "backend_world_m":
         errors.append(
             "v3dt.world_frame must be backend_world_m after camInfo axis restoration"
@@ -702,7 +780,13 @@ def validate_v3dt_assets(
     )
     if camera_order != EXPECTED_CAMERA_ORDER:
         errors.append(f"v3dt.camera_order must be {list(EXPECTED_CAMERA_ORDER)}")
-    _validate_pipeline_paths(pipeline, pipeline_path, profile, errors)
+    _validate_pipeline_paths(
+        pipeline,
+        pipeline_path,
+        profile,
+        errors,
+        activation_state=activation_state,
+    )
 
     tracker = _mapping(pipeline.get("tracker"), label="tracker", errors=errors)
     tracker_path = _require_owned_reference(
@@ -742,12 +826,32 @@ def validate_v3dt_assets(
         tracker_config = {}
         errors.append(f"V3DT tracker config must be a mapping: {tracker_path}")
 
+    if profile == "mv3dt" and activation_state == "evaluation_only":
+        streammux = pipeline.get("streammux")
+        sync_inputs = (
+            streammux.get("sync-inputs")
+            if isinstance(streammux, Mapping)
+            else None
+        )
+        base_config = tracker_config.get("BaseConfig")
+        use_batch_number = (
+            base_config.get("useBatchNumForFrameId")
+            if isinstance(base_config, Mapping)
+            else None
+        )
+        if sync_inputs == 0 and use_batch_number != 1:
+            errors.append(
+                "evaluation-only MV3DT with sync-inputs=0 must set "
+                "BaseConfig.useBatchNumForFrameId=1"
+            )
+
     pub_sub_config: Path | None = None
     mqtt_config_template: Path | None = None
     if profile == "mv3dt":
         pub_sub_config, mqtt_config_template = _validate_mv3dt_tracker_contract(
             tracker_config,
             tracker_path=tracker_path,
+            activation_state=activation_state,
             errors=errors,
         )
     elif any(

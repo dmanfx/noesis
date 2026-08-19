@@ -48,10 +48,13 @@ tracks were not merged. A rendered 22-second mosaic was inspected at near,
 far, doorway, and full-body positions; the replacement cuboid bottom-face
 centroid remained on the segmentation-mask feet/gravity anchor.
 
-The recorded evaluation profile uses complete batches (`batched-push-timeout:
--1`) with `sync-inputs: 0` and `BaseConfig.useBatchNumForFrameId: 1`. The live
-opt-in profile uses the normal finite live timeout and also leaves
-`sync-inputs: 0`, because these RTSP encoders do not expose one shared PTP/NTP
-timestamp domain. In both cases, `useBatchNumForFrameId: 1` supplies the common
-tracker frame ID for each complete batch. The replay-only infinite timeout must
-not be copied into the live profile.
+Both recorded evaluation and live opt-in profiles require complete batches
+(`batched-push-timeout: -1`) with `sync-inputs: 0` and
+`BaseConfig.useBatchNumForFrameId: 1`. The RTSP encoders do not expose one
+shared PTP/NTP timestamp domain, so timestamp synchronization remains disabled;
+the mux instead waits for one current frame from every camera and the tracker
+batch number supplies their common MV3DT frame ID. A finite live timeout can
+emit a partial batch when one encoder jitters and deadlock the ordered peer
+message synchronizer. A camera that stops producing is handled by Noesis's
+bounded per-source progress recovery and supervisor restart rather than by
+feeding an incomplete batch to MV3DT.

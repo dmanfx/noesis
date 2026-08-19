@@ -39,6 +39,8 @@ def test_review_profile_is_isolated_and_explicit() -> None:
     }
     assert candidate["tracker"]["config-file"] == canonical["tracker"]["config-file"]
     assert candidate["v3dt"]["geometry_binding"] != canonical["v3dt"]["geometry_binding"]
+    assert canonical["streammux"]["live-source"] == 1
+    assert canonical["streammux"]["batched-push-timeout"] == -1
     assert candidate["streammux"]["sync-inputs"] == 0
     assert candidate["streammux"]["batched-push-timeout"] == -1
     tracker = yaml.safe_load(

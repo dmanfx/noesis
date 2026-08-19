@@ -96,6 +96,19 @@ Detailed work orders, evidence, and superseded diagrams remain in the archives.
   environment parity.
 - Recorded in commit `3f1cae4`.
 
+## 2026-08-19 — Live MV3DT complete-batch repair
+
+- Changed only the explicit MV3DT profile to wait for a complete three-camera
+  streammux batch; baseline remains unchanged.
+- Bound the asset validator and focused tests to the complete-batch invariant
+  required by the ordered MV3DT peer-message synchronizer.
+- Corrected the prior 137-frame live smoke classification: it proved startup,
+  not sustained progress, whereas the synchronized July replay completed 7,110
+  source-frame publications and normal EOS.
+- A probe-free live run sustained approximately 30 FPS per camera for 148
+  seconds after first output, delivered 4,480 encoded mosaic frames without a
+  drop, completed 13,443 publication callbacks, and accepted orderly EOS.
+
 ## 2026-08-15 — PCF BEV tracking authority repair
 
 - Paired canonical committed tracking cohorts with PCF-backed BEV frames so

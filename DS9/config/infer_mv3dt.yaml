@@ -14,7 +14,12 @@ streammux:
   height: 1080
   batch-size: 3
   live-source: 1
-  batched-push-timeout: 40000
+  # MV3DT's ordered peer-message synchronizer requires every mux output to
+  # contain all three cameras.  A finite timeout can emit a partial live batch
+  # when one RTSP encoder jitters, which wedges the tracker and back-pressures
+  # the complete graph.  Wait for a complete batch; the per-source progress
+  # watchdog remains the bounded recovery authority for an unavailable camera.
+  batched-push-timeout: -1
   # Locked V3DT calibration assumes an unpadded 1920x1080 pixel frame.
   enable-padding: 0
   num-surfaces-per-frame: 1

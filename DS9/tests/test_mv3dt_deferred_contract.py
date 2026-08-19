@@ -146,6 +146,8 @@ def test_mv3dt_config_is_ready_opt_in_and_has_only_kitchen_family_peer_edge() ->
     assert pipeline["v3dt"]["profile"] == "mv3dt"
     assert pipeline["v3dt"]["activation_state"] == "ready_opt_in"
     assert pipeline["streammux"]["sync-inputs"] == 0
+    assert pipeline["streammux"]["live-source"] == 1
+    assert pipeline["streammux"]["batched-push-timeout"] == -1
     assert pipeline["tracker"]["config-file"].endswith("nvtracker_mv3dt.yaml")
 
     associator = tracker["MultiViewAssociator"]

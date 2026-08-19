@@ -179,3 +179,32 @@ drops during the bounded active interval.
 anchors, a communicator startup race, an over-strict match threshold, and
 camera-scoped handling of a batch-global MV3DT ID. Those failures are now
 corrected and exercised while the normal tracking lanes remain isolated.
+
+## ADR-019 — Live MV3DT waits for complete camera batches
+
+**Accepted:** 2026-08-19; supersedes the live batching and live-smoke claims in
+ADR-018
+
+The opt-in live MV3DT profile uses `streammux.batched-push-timeout: -1` while
+retaining `live-source: 1` and `sync-inputs: 0`. The ordered MV3DT peer-message
+synchronizer and `useBatchNumForFrameId: 1` require every tracker input buffer
+to contain all three camera frames. The installed `nvstreammux` documents that
+a finite timeout pushes a partial batch; live RTSP jitter reproduced a tracker
+wedge after 137-139 complete output batches, followed by graph-wide
+backpressure and failed orderly EOS. The earlier 137-frame live smoke therefore
+was startup evidence, not sustained-liveness evidence.
+
+The synchronized July file replay completed 7,110 source-frame publications
+and normal finite-source EOS with complete batches. Live MV3DT now applies the
+same completeness invariant. A probe-free live run then sustained all three
+sources at approximately 30 FPS for 148 seconds after first output, delivered
+4,480 encoded mosaic frames with zero drops, completed 13,443 publication
+callbacks, and accepted orderly EOS. An unavailable camera remains a
+fail-closed condition handled by the existing per-source progress watchdog and
+supervisor-owned restart; the runtime does not feed partial batches to MV3DT
+or silently fall back to baseline/SV3DT. Baseline configuration and graph
+construction are unchanged.
+
+**Why:** Queue isolation cannot repair a peer synchronizer that received an
+invalid partial cohort. Enforcing complete tracker cohorts removes the trigger
+while preserving the accepted batch-global identity and geometry contracts.

@@ -369,6 +369,12 @@ def _validate_pipeline_paths(
         errors.append("streammux.num-surfaces-per-frame must be 1")
     if profile == "mv3dt":
         sync_inputs = streammux.get("sync-inputs")
+        batched_push_timeout = streammux.get("batched-push-timeout")
+        if batched_push_timeout != -1:
+            errors.append(
+                "MV3DT streammux.batched-push-timeout must be -1 so the "
+                "ordered peer-message synchronizer receives complete batches"
+            )
         if activation_state == "evaluation_only":
             if sync_inputs not in {0, 1}:
                 errors.append(

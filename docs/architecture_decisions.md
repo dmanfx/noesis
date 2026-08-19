@@ -29,12 +29,11 @@ sealing, broad suites, and promotion ceremony require explicit need.
 
 ## ADR-003 — Baseline three-camera tracking remains canonical
 
-**Accepted:** 2026-08-12; overlap evidence updated 2026-08-18
+**Accepted:** 2026-08-12; MV3DT option updated 2026-08-19
 
-YOLO26-m + NvDCF baseline tracking is active. MV3DT and AMC remain disabled.
-Kitchen/Family Room has a short synchronized common-FOV doorway interval, but
-its latest shared three-room registration is rejected and review-only. Living
-Room/Family Room do not overlap and Kitchen/Living Room are adjacency only.
+YOLO26-m + NvDCF baseline tracking remains the default. Kitchen/Family MV3DT is
+an explicit opt-in under ADR-018; AMC remains disabled. Living Room/Family Room
+do not overlap and Kitchen/Living Room are adjacency only.
 
 **Why:** Cross-camera 3D tracking requires correct shared geometry and occupied,
 synchronized overlap evidence. Enabling it earlier would create false spatial
@@ -102,7 +101,7 @@ Superseded DS7/DS8, DS9.0, container, migration, experiment, and validation
 diaries are retained under `docs/history/`, `DS9/docs/history/`, and
 `plans/archive/`. Active indexes never route implementation work through them.
 
-## ADR-017 — Kitchen/Family MV3DT remains an isolated evaluation lane
+## ADR-017 — Kitchen/Family MV3DT remains an isolated evaluation lane (superseded)
 
 **Accepted:** 2026-08-19 for recorded-input evaluation only
 
@@ -135,3 +134,48 @@ Kitchen geometry plus a synchronized occupied Kitchen/Family overlap capture.
 **Why:** This preserves a fast, directly testable two-room implementation
 without granting tracking authority to rejected geometry or changing the
 proven baseline/SV3DT lane.
+
+## ADR-018 — Kitchen/Family MV3DT is a ready explicit runtime option
+
+**Accepted:** 2026-08-19; supersedes ADR-017 for current operation
+
+`--tracking-mode mv3dt` selects the accepted Kitchen/Family Room profile. It is
+never the implicit default, so baseline and SV3DT behavior remain unchanged.
+Kitchen and Family Room are the only peer edge. Living Room remains local-only;
+its MQTT self-topic satisfies the DS9.1 ordered communicator without exposing
+peer measurements or IDs.
+
+The native host supervisor exposes the same explicit selector on both `check`
+and `run`; omitting it remains baseline. The live cameras do not publish one
+shared PTP/NTP timestamp domain, so streammux uses complete current-frame
+batches with `sync-inputs: 0`, and `useBatchNumForFrameId: 1` gives every camera
+in each batch the common MV3DT frame ID. The recorded lane retains its infinite
+complete-batch timeout; the live lane retains the normal finite timeout.
+
+The accepted geometry uses independent Kitchen and Family Room static-camera
+anchors in the Family Room gauge. Shared MQTT connection startup prevents a
+camera communicator from joining only at end-of-stream. The 1.7 m object model,
+two-frame probation and common-frame gate, 0.18 peer score, 4.75 m peer fusion
+safety radius, and 0.05 peer-visibility floor are confined to this MV3DT
+profile. Product identity uses MV3DT's batch-global tracker ID as one StableID
+manager key and unions present IDs across cameras; baseline and SV3DT retain
+their camera-scoped lifecycle.
+
+Acceptance evidence is direct application behavior: all three July
+Kitchen/Family doorway episodes adopted a shared native ID, including late
+reassociation after the peer view disappeared. The multi-person recording
+produced shared IDs on visually confirmed same-person pairs without merging
+the other person or persistent partial-body duplicate tracks. A captured
+rendered mosaic confirmed that the replacement cuboid bottom-face centroid
+stays on the person-mask foot/gravity point at near, far, doorway, and full-body
+positions.
+
+A native-host live-camera smoke loaded the accepted profile, connected all
+three communicators, started WebRTC/REST/WebSocket, completed 412 publication
+callbacks without rejection, and delivered 137 encoded mosaic frames without
+drops during the bounded active interval.
+
+**Why:** The prior blocker was not missing code; it was incorrect camera
+anchors, a communicator startup race, an over-strict match threshold, and
+camera-scoped handling of a batch-global MV3DT ID. Those failures are now
+corrected and exercised while the normal tracking lanes remain isolated.

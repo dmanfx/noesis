@@ -3,6 +3,33 @@
 This is the concise operational record of major runtime and behavior changes.
 Detailed work orders, evidence, and superseded diagrams remain in the archives.
 
+## 2026-08-19 — Kitchen/Family MV3DT promoted to explicit opt-in
+
+- Replaced the rejected room transform with independent Kitchen and Family
+  Room static-camera anchors and accepted their binding after direct dynamic
+  handoff validation.
+- Fixed the DS9.1 communicator startup race with one shared, non-threaded MQTT
+  connection, so all three streams are online before the first batch.
+- Tuned the Kitchen/Family-only object model and association gates for the
+  short occluded doorway overlap, including two-frame late reassociation.
+- Preserved MV3DT's batch-global native ID through the product StableID layer;
+  baseline and SV3DT remain camera-scoped and unchanged.
+- Replayed the complete July single-person set, two May multi-person spans, and
+  a targeted difficult partial-body interval. All three July doorway episodes
+  handed off, visually confirmed same-person multi-view pairs fused, and no
+  separate-person or partial-body duplicate track was falsely merged.
+- Captured the rendered three-camera mosaic and checked the cuboid anchor at
+  four image positions. Its bottom-face centroid remained on the feet/gravity
+  point.
+- Made `--tracking-mode mv3dt` select the accepted profile without an evaluation
+  environment flag through both the DS9 runtime and native-host supervisor.
+  MV3DT remains opt-in; omitting the selector still launches baseline.
+- Removed strict streammux timestamp synchronization for the non-PTP live RTSP
+  set while retaining common batch frame IDs. A native-host live smoke brought
+  up all three communicators, WebRTC, REST, and WebSocket, completed 412
+  publication callbacks, and delivered 137 encoded mosaic frames with zero
+  drops during the bounded active interval.
+
 ## 2026-08-19 — Kitchen/Family MV3DT evaluation lane
 
 - Added an explicitly gated, evaluation-only Kitchen/Family MV3DT profile while

@@ -21,7 +21,8 @@ def test_review_profile_is_isolated_and_explicit() -> None:
     )
     candidate = yaml.safe_load(PIPELINE_PATH.read_text(encoding="utf-8"))
 
-    assert canonical["v3dt"]["activation_state"] == "deferred"
+    assert canonical["v3dt"]["activation_state"] == "ready_opt_in"
+    assert canonical["v3dt"]["geometry_authority"] == "accepted"
     assert candidate["v3dt"] == {
         "profile": "mv3dt",
         "activation_state": "evaluation_only",
@@ -36,14 +37,28 @@ def test_review_profile_is_isolated_and_explicit() -> None:
         "reid_track_grace_s": 0.5,
         "household_confirm_embeddings": 1,
     }
-    assert candidate["tracker"]["config-file"] != canonical["tracker"]["config-file"]
+    assert candidate["tracker"]["config-file"] == canonical["tracker"]["config-file"]
+    assert candidate["v3dt"]["geometry_binding"] != canonical["v3dt"]["geometry_binding"]
     assert candidate["streammux"]["sync-inputs"] == 0
     assert candidate["streammux"]["batched-push-timeout"] == -1
     tracker = yaml.safe_load(
         (PROFILE_ROOT / "nvtracker_mv3dt.yaml").read_text(encoding="utf-8")
     )
     assert tracker["BaseConfig"]["useBatchNumForFrameId"] == 1
+    assert tracker["TargetManagement"]["probationAge"] == 2
     assert tracker["MultiViewAssociator"]["enableMsgSync"] == 1
+    assert tracker["MultiViewAssociator"]["minCommonFrames4MatchScore"] == 2
+    assert tracker["MultiViewAssociator"]["maxPeerToPredDistance4Fusion"] == 4.75
+    assert tracker["MultiViewAssociator"]["minPeerVisibility4Fusion"] == 0.05
+    assert tracker["MultiViewAssociator"]["minPeerTrackletMatchScore"] == 0.18
+    for camera_model in tracker["ObjectModelProjection"]["cameraModelFilepath"]:
+        model = yaml.safe_load((REPO_ROOT / camera_model).read_text(encoding="utf-8"))
+        assert model["modelInfo"] == {"height": 1.7, "radius": 0.35}
+    mqtt_template = (DS9_ROOT / "config/v3dt/config_mqtt.template.txt").read_text(
+        encoding="utf-8"
+    )
+    assert "share-connection = 1" in mqtt_template
+    assert "set-threaded = 0" in mqtt_template
 
 
 def test_review_profile_validates_only_as_evaluation_mv3dt() -> None:
@@ -62,6 +77,40 @@ def test_review_profile_validates_only_as_evaluation_mv3dt() -> None:
         "camInfo_kitchen.yml",
         "camInfo_family-room.yml",
     ]
+
+
+def test_canonical_mv3dt_profile_is_ready_but_still_explicit_opt_in() -> None:
+    canonical_path = DS9_ROOT / "config" / "infer_mv3dt.yaml"
+    bundle = validate_v3dt_assets(
+        canonical_path,
+        cameras_config=DS9_ROOT / "config" / "cameras_v3dt.yaml",
+        require_engines=False,
+        require_sources=False,
+        expected_profile="mv3dt",
+        expected_activation_state="ready_opt_in",
+    )
+    config = yaml.safe_load(canonical_path.read_text(encoding="utf-8"))
+    binding = json.loads(
+        (PROFILE_ROOT / "geometry_binding_accepted.json").read_text(encoding="utf-8")
+    )
+
+    assert bundle.tracker_config == PROFILE_ROOT / "nvtracker_mv3dt.yaml"
+    assert config["v3dt"]["activation_state"] == "ready_opt_in"
+    assert binding["accepted"] is True
+    assert binding["canonical_use"] is True
+    assert binding["status"] == "accepted"
+    np.testing.assert_array_equal(
+        np.asarray(
+            binding["moving_correction_in_backend_world_row_major"],
+            dtype=np.float64,
+        ),
+        np.eye(4, dtype=np.float64),
+    )
+    assert binding["yaw_deg"] == 0.0
+    assert binding["calibration_config"].endswith(
+        "kitchen_family_review/camera_calibration.json"
+    )
+    assert "source_report_storage_relative" not in binding
 
 
 def test_only_kitchen_and_family_are_peers() -> None:
@@ -103,6 +152,21 @@ def test_kitchen_calibration_is_composed_into_family_gauge() -> None:
         candidate["cameras"]["kitchen"]["E"], dtype=np.float64
     ).reshape((4, 4), order="F")
 
-    np.testing.assert_allclose(candidate_e, source_e @ np.linalg.inv(transform))
-    assert candidate["cameras"]["family-room"] == source["cameras"]["family-room"]
+    np.testing.assert_allclose(
+        candidate_e,
+        source_e @ np.linalg.inv(transform),
+        atol=1e-12,
+    )
     assert candidate["cameras"]["living-room"] == source["cameras"]["living-room"]
+    assert candidate["cameras"]["kitchen"]["pose"]["source"] == (
+        "kitchen_phone_walk_static_camera_localization_2026-08-19"
+    )
+    assert candidate["cameras"]["family-room"]["pose"]["source"] == (
+        "family_scene_prior_static_camera_anchor_v3_2026-08-17"
+    )
+    assert binding["static_camera_anchors"]["kitchen"]["status"] == (
+        "passed_review_anchor"
+    )
+    assert binding["static_camera_anchors"]["family-room"]["status"] == (
+        "passed_review_anchor"
+    )

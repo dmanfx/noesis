@@ -34,9 +34,11 @@ TensorRT 10.16.0.72, GStreamer 1.24.2, Python 3.12, and driver 595.58.03 or
 newer. Verify API names and config keys in the installed modules or official
 documentation; never guess.
 
-AMC remains deferred. MV3DT remains disabled until Kitchen geometry and a
-synchronized Kitchen/Family Room overlap dataset are accepted. Living
-Room/Family Room do not overlap, and Kitchen/Living Room are adjacency only.
+AMC remains deferred. MV3DT is an explicit runtime opt-in with one accepted
+Kitchen/Family Room peer edge. Living Room participates only as a local stream;
+Living Room/Family Room do not overlap, and Kitchen/Living Room are adjacency
+only. Do not add another MV3DT peer edge without accepted geometry and occupied
+overlap evidence for that exact pair.
 
 ## Canonical implementation boundary
 

@@ -42,18 +42,19 @@ SV3DT remains the existing single-view lane. MV3DT is a separate capability;
 selecting it must never fall back to or alias SV3DT.
 
 The current physical topology does not provide Living Room/Family Room overlap.
-The only prospective MV3DT edge is Kitchen/Family Room, and it remains disabled
-until the Kitchen geometry is corrected and synchronized occupied overlap data
-passes review. AMC execution is deferred for the same reason. The four AMC
-skills are installed as documentation and future workflow entrypoints only:
+Kitchen/Family Room is the only accepted MV3DT edge and is available through
+the explicit `mv3dt` runtime selector; Living Room remains local-only. AMC
+execution remains deferred. The four AMC skills are installed as documentation
+and future workflow entrypoints only:
 
 - `amc-setup-calibration-stack`
 - `amc-run-sample-calibration`
 - `amc-run-video-calibration`
 - `amc-run-rtsp-calibration`
 
-Do not start the calibration stack, generate an AMC dataset, or claim a valid
-multi-view calibration while this deferment is in effect.
+Do not start the calibration stack or generate an AMC dataset while the AMC
+deferment is in effect. Do not add MV3DT peer edges beyond Kitchen/Family Room
+without pair-specific accepted geometry and occupied-overlap evidence.
 
 ## Practical validation
 

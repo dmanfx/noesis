@@ -2,4 +2,5 @@
 # Runtime materializes an owner-only copy outside the checkout. The canonical
 # deferred profile remains non-activatable without the explicit evaluation gate.
 [message-broker]
+share-connection = 1
 set-threaded = 0

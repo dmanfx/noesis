@@ -34,7 +34,8 @@ Status: native-host baseline, 2026-08-15.
 
 The baseline lane is YOLO26-m + NvDCF with Swin ReID, YOLO26 pose, always-on
 DAv2 tracking depth, gated MapAnything depth, WebRTC media, and JSON BEV. MV3DT
-and AMC are disabled pending the documented Kitchen geometry/overlap gate.
+is available as an explicit opt-in for the accepted Kitchen/Family Room edge;
+AMC remains deferred.
 
 ## History
 

@@ -97,11 +97,6 @@ MV3DT_PUBLISH_TOPICS = (
     "localhost:1883;ds3d/cam2",
 )
 MV3DT_SUBSCRIBE_TOPICS = (
-    (),
-    (MV3DT_PUBLISH_TOPICS[2],),
-    (MV3DT_PUBLISH_TOPICS[1],),
-)
-MV3DT_EVALUATION_SUBSCRIBE_TOPICS = (
     (MV3DT_PUBLISH_TOPICS[0],),
     (MV3DT_PUBLISH_TOPICS[2],),
     (MV3DT_PUBLISH_TOPICS[1],),
@@ -122,8 +117,18 @@ MV3DT_ASSOCIATOR_CONTRACT = {
     "maxPeerFrameDiff4NoDet": 2,
     "communicatorInitSleepTime": 0,
 }
+MV3DT_KITCHEN_FAMILY_ASSOCIATOR_OVERRIDES = {
+    # Doorway occlusion can displace the vendor cylinder-foot estimate by about
+    # 4 m. Permit ID adoption after two common frames; appearance remains part
+    # of the vendor score, and the multi-person replay is the false-merge gate.
+    "minCommonFrames4MatchScore": 2,
+    "maxPeerToPredDistance4Fusion": 4.75,
+    "minPeerVisibility4Fusion": 0.05,
+    "minPeerTrackletMatchScore": 0.18,
+}
 EXPECTED_STREAM_SIZE = (1920, 1080)
 EXPECTED_OBJECT_MODEL_HEIGHT_M = 2.2
+MV3DT_KITCHEN_FAMILY_OBJECT_MODEL_HEIGHT_M = 1.7
 EXPECTED_OBJECT_MODEL_RADIUS_M = 0.35
 EXPECTED_BODYPOSE_INPUTS = {
     "input0": ["batch", 3, 256, 192],
@@ -369,6 +374,12 @@ def _validate_pipeline_paths(
                 errors.append(
                     "evaluation-only MV3DT streammux.sync-inputs must be 0 or 1"
                 )
+        elif activation_state == "ready_opt_in":
+            if sync_inputs != 0:
+                errors.append(
+                    "ready Kitchen/Family MV3DT streammux.sync-inputs must be 0 "
+                    "for the non-PTP RTSP camera set"
+                )
         elif sync_inputs != 1:
             errors.append("streammux.sync-inputs must be 1 for the MV3DT profile")
 
@@ -393,7 +404,12 @@ def _validate_pipeline_paths(
     )
 
 
-def _validate_caminfo(path: Path, errors: list[str]) -> None:
+def _validate_caminfo(
+    path: Path,
+    errors: list[str],
+    *,
+    expected_height_m: float = EXPECTED_OBJECT_MODEL_HEIGHT_M,
+) -> None:
     try:
         payload = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
     except Exception as exc:
@@ -427,7 +443,7 @@ def _validate_caminfo(path: Path, errors: list[str]) -> None:
         errors.append(f"camera model modelInfo is required: {path}")
         return
     expected_model = {
-        "height": EXPECTED_OBJECT_MODEL_HEIGHT_M,
+        "height": expected_height_m,
         "radius": EXPECTED_OBJECT_MODEL_RADIUS_M,
     }
     for key, expected in expected_model.items():
@@ -562,6 +578,17 @@ def _validate_mv3dt_tracker_contract(
     activation_state: str,
     errors: list[str],
 ) -> tuple[Path, Path]:
+    target_management = _mapping(
+        tracker_config.get("TargetManagement"),
+        label="TargetManagement",
+        errors=errors,
+    )
+    if (
+        activation_state in {"evaluation_only", "ready_opt_in"}
+        and target_management.get("probationAge") != 2
+    ):
+        errors.append("TargetManagement.probationAge must be 2 for Kitchen/Family MV3DT")
+
     associator = _mapping(
         tracker_config.get("MultiViewAssociator"),
         label="MultiViewAssociator",
@@ -573,7 +600,10 @@ def _validate_mv3dt_tracker_contract(
             "MultiViewAssociator contains unsupported DeepStream 9.1 keys: "
             + ", ".join(sorted(str(key) for key in unknown_associator_keys))
         )
-    for key, expected in MV3DT_ASSOCIATOR_CONTRACT.items():
+    expected_associator = dict(MV3DT_ASSOCIATOR_CONTRACT)
+    if activation_state in {"evaluation_only", "ready_opt_in"}:
+        expected_associator.update(MV3DT_KITCHEN_FAMILY_ASSOCIATOR_OVERRIDES)
+    for key, expected in expected_associator.items():
         if associator.get(key) != expected:
             errors.append(f"MultiViewAssociator.{key} must be {expected!r}")
 
@@ -608,6 +638,17 @@ def _validate_mv3dt_tracker_contract(
         label="Communicator.mqttProtoAdaptorConfigPath",
         errors=errors,
     )
+    try:
+        mqtt_template = mqtt_template_path.read_text(encoding="utf-8")
+    except OSError as exc:
+        mqtt_template = ""
+        errors.append(
+            f"unable to read MV3DT MQTT template {mqtt_template_path}: {exc}"
+        )
+    if "share-connection = 1" not in mqtt_template:
+        errors.append("MV3DT MQTT template must set share-connection = 1")
+    if "set-threaded = 0" not in mqtt_template:
+        errors.append("MV3DT MQTT template must set set-threaded = 0")
 
     try:
         pub_sub = yaml.safe_load(pub_sub_path.read_text(encoding="utf-8")) or {}
@@ -642,12 +683,7 @@ def _validate_mv3dt_tracker_contract(
             )
         except TypeError:
             subscriptions = ()
-    expected_subscriptions = (
-        MV3DT_EVALUATION_SUBSCRIBE_TOPICS
-        if activation_state == "evaluation_only"
-        else MV3DT_SUBSCRIBE_TOPICS
-    )
-    if subscriptions != expected_subscriptions:
+    if subscriptions != MV3DT_SUBSCRIBE_TOPICS:
         errors.append(
             "subPeerBrokerTopicStrs must encode only Kitchen <-> Family Room; "
             "Living Room must have no cross-camera MV3DT peer edge"
@@ -712,18 +748,23 @@ def validate_v3dt_assets(
         )
     activation_state = str(profile_config.get("activation_state") or "").strip()
     if profile == "mv3dt":
-        if activation_state not in {"deferred", "evaluation_only"}:
+        if activation_state not in {"deferred", "evaluation_only", "ready_opt_in"}:
             errors.append(
-                "v3dt.activation_state must be deferred or evaluation_only for MV3DT"
+                "v3dt.activation_state must be deferred, evaluation_only, or "
+                "ready_opt_in for MV3DT"
             )
-        if activation_state == "evaluation_only":
+        if activation_state in {"evaluation_only", "ready_opt_in"}:
             if profile_config.get("evaluation_scope") != "kitchen-family":
                 errors.append(
-                    "evaluation-only MV3DT must set evaluation_scope=kitchen-family"
+                    "Kitchen/Family MV3DT must set evaluation_scope=kitchen-family"
                 )
-            if profile_config.get("geometry_authority") != "review_only":
+            expected_authority = (
+                "review_only" if activation_state == "evaluation_only" else "accepted"
+            )
+            if profile_config.get("geometry_authority") != expected_authority:
                 errors.append(
-                    "evaluation-only MV3DT must keep geometry_authority=review_only"
+                    f"{activation_state} MV3DT must set "
+                    f"geometry_authority={expected_authority}"
                 )
             geometry_binding_path = _require_owned_reference(
                 profile_config.get("geometry_binding"),
@@ -750,13 +791,14 @@ def validate_v3dt_assets(
                         f"MV3DT geometry binding must be a mapping: "
                         f"{geometry_binding_path}"
                     )
+                ready = activation_state == "ready_opt_in"
                 expected_geometry = {
                     "schema": "noesis.mv3dt.geometry_binding.v1",
-                    "status": "review_only",
-                    "canonical_use": False,
+                    "status": "accepted" if ready else "review_only",
+                    "canonical_use": ready,
                     "fixed_gauge": "family-room",
                     "moving_room": "kitchen",
-                    "accepted": False,
+                    "accepted": ready,
                 }
                 for key, expected in expected_geometry.items():
                     if geometry_binding.get(key) != expected:
@@ -826,7 +868,10 @@ def validate_v3dt_assets(
         tracker_config = {}
         errors.append(f"V3DT tracker config must be a mapping: {tracker_path}")
 
-    if profile == "mv3dt" and activation_state == "evaluation_only":
+    if profile == "mv3dt" and activation_state in {
+        "evaluation_only",
+        "ready_opt_in",
+    }:
         streammux = pipeline.get("streammux")
         sync_inputs = (
             streammux.get("sync-inputs")
@@ -841,7 +886,7 @@ def validate_v3dt_assets(
         )
         if sync_inputs == 0 and use_batch_number != 1:
             errors.append(
-                "evaluation-only MV3DT with sync-inputs=0 must set "
+                "Kitchen/Family MV3DT with sync-inputs=0 must set "
                 "BaseConfig.useBatchNumForFrameId=1"
             )
 
@@ -904,7 +949,16 @@ def validate_v3dt_assets(
                 f"camera model index {index} must be {EXPECTED_CAMINFO_NAMES[index]}, got {path.name}"
             )
         if path.is_file():
-            _validate_caminfo(path, errors)
+            _validate_caminfo(
+                path,
+                errors,
+                expected_height_m=(
+                    MV3DT_KITCHEN_FAMILY_OBJECT_MODEL_HEIGHT_M
+                    if profile == "mv3dt"
+                    and activation_state in {"evaluation_only", "ready_opt_in"}
+                    else EXPECTED_OBJECT_MODEL_HEIGHT_M
+                ),
+            )
 
     reid = _mapping(tracker_config.get("ReID"), label="ReID", errors=errors)
     if reid.get("reidType") != 2 or reid.get("batchSize") != 32:

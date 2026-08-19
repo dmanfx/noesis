@@ -75,6 +75,11 @@ CANONICAL_SIZE = "m"
 CANONICAL_TRACKING_MODE = "baseline"
 PIPELINE_CONFIG = "DS9/config/infer.yaml"
 CAMERAS_CONFIG = "config/cameras.yaml"
+OPT_IN_TRACKING_MODES = (CANONICAL_TRACKING_MODE, "mv3dt")
+MV3DT_PROFILE = "yolo26_seg"
+MV3DT_SIZE = "s"
+MV3DT_PIPELINE_CONFIG = "DS9/config/infer_mv3dt.yaml"
+MV3DT_CAMERAS_CONFIG = "DS9/config/cameras_v3dt.yaml"
 REALIZATION_FILENAME = "asset_realization.json"
 REALIZATION_CONTRACT = "noesis.ds9.asset_realization"
 REALIZATION_SHA256 = "9c3815bbf86eb41a94efb504fad79a9208c543e05f98c68d017cb1a8dcfd2b26"
@@ -250,19 +255,50 @@ def load_native_config(env: Mapping[str, str] | None = None) -> NativeHostConfig
     )
 
 
-def canonical_runtime_arguments(*, storage_base: Path) -> list[str]:
+def _runtime_lane(tracking_mode: str) -> dict[str, str]:
+    mode = str(tracking_mode or "").strip().lower()
+    if mode == CANONICAL_TRACKING_MODE:
+        return {
+            "name": "baseline",
+            "tracking_mode": CANONICAL_TRACKING_MODE,
+            "pgie_profile": CANONICAL_PROFILE,
+            "model_size": CANONICAL_SIZE,
+            "pipeline_config": PIPELINE_CONFIG,
+            "cameras_config": CAMERAS_CONFIG,
+        }
+    if mode == "mv3dt":
+        return {
+            "name": "mv3dt",
+            "tracking_mode": "mv3dt",
+            "pgie_profile": MV3DT_PROFILE,
+            "model_size": MV3DT_SIZE,
+            "pipeline_config": MV3DT_PIPELINE_CONFIG,
+            "cameras_config": MV3DT_CAMERAS_CONFIG,
+        }
+    _fail(
+        "native host tracking mode must be one of: "
+        + ", ".join(OPT_IN_TRACKING_MODES)
+    )
+
+
+def canonical_runtime_arguments(
+    *,
+    storage_base: Path,
+    tracking_mode: str = CANONICAL_TRACKING_MODE,
+) -> list[str]:
+    lane = _runtime_lane(tracking_mode)
     return [
         "DS9/noesis/ds9_runtime.py",
         "--pipeline-config",
-        PIPELINE_CONFIG,
+        lane["pipeline_config"],
         "--cameras-config",
-        CAMERAS_CONFIG,
+        lane["cameras_config"],
         "--pgie-profile",
-        CANONICAL_PROFILE,
+        lane["pgie_profile"],
         "--size",
-        CANONICAL_SIZE,
+        lane["model_size"],
         "--tracking-mode",
-        CANONICAL_TRACKING_MODE,
+        lane["tracking_mode"],
         "--ws-host",
         "127.0.0.1",
         "--ws-port",
@@ -279,9 +315,14 @@ def canonical_runtime_arguments(*, storage_base: Path) -> list[str]:
     ]
 
 
-def build_health_context_env(env: Mapping[str, str]) -> dict[str, str]:
+def build_health_context_env(
+    env: Mapping[str, str],
+    *,
+    tracking_mode: str = CANONICAL_TRACKING_MODE,
+) -> dict[str, str]:
     """Emit existing health-contract identity without reading a selector file."""
 
+    selected_mode = _runtime_lane(tracking_mode)["tracking_mode"]
     deployment_id = str(env.get("NOESIS_DEPLOYMENT_ID") or "").strip()
     selector_sha256 = str(env.get("NOESIS_HEALTH_SELECTOR_SHA256") or "").strip()
     state_release_id = str(env.get("NOESIS_STATE_RELEASE_ID") or "").strip()
@@ -303,7 +344,9 @@ def build_health_context_env(env: Mapping[str, str]) -> dict[str, str]:
         selector_sha256=selector_sha256,
         state_release_id=state_release_id,
         runtime_family="ds9",
-        runtime_variant="ds9:baseline",
+        runtime_variant=(
+            "ds9:v3dt" if selected_mode == "mv3dt" else "ds9:baseline"
+        ),
         software_revision=software_revision,
         boot_id=boot_id,
     )
@@ -682,7 +725,9 @@ def build_run_environment(
     storage_base: Path,
     evidence_root: Path,
     build_root: Path,
+    tracking_mode: str = CANONICAL_TRACKING_MODE,
 ) -> dict[str, str]:
+    lane = _runtime_lane(tracking_mode)
     env = {
         key: value
         for key, value in os.environ.items()
@@ -741,8 +786,8 @@ def build_run_environment(
     env["NOESIS_CALIBRATION_AUDIT_DIR"] = str(evidence_root / "calibration")
     env["NOESIS_V3DT_DIAG_DIR"] = str(evidence_root / "v3dt")
     env["NOESIS_V3DT_DIAG_SESSION"] = session_id
-    env["NOESIS_PGIE_PROFILE"] = CANONICAL_PROFILE
-    env["NOESIS_TRACKING_MODE"] = CANONICAL_TRACKING_MODE
+    env["NOESIS_PGIE_PROFILE"] = lane["pgie_profile"]
+    env["NOESIS_TRACKING_MODE"] = lane["tracking_mode"]
     env["NOESIS_MANUAL_DEPTH_MODEL"] = str(
         env.get("NOESIS_MANUAL_DEPTH_MODEL", "mapanything") or "mapanything"
     ).strip().lower()
@@ -759,7 +804,7 @@ def build_run_environment(
     env["NOESIS_DEV_CONSOLE_LAUNCH_DIR"] = str(build_root)
     if env["NOESIS_MANUAL_DEPTH_MODEL"] not in {"mapanything", "da3metric-large"}:
         _fail("NOESIS_MANUAL_DEPTH_MODEL must be mapanything or da3metric-large")
-    env.update(build_health_context_env(env))
+    env.update(build_health_context_env(env, tracking_mode=lane["tracking_mode"]))
     return env
 
 
@@ -789,16 +834,22 @@ def prepare_session_directories(config: NativeHostConfig, session_id: str) -> di
     }
 
 
-def run_preflight(config: NativeHostConfig, env: Mapping[str, str]) -> None:
+def run_preflight(
+    config: NativeHostConfig,
+    env: Mapping[str, str],
+    *,
+    tracking_mode: str = CANONICAL_TRACKING_MODE,
+) -> None:
+    lane = _runtime_lane(tracking_mode)
     script = DS9_ROOT / "scripts" / "ds9_preflight.py"
     result = subprocess.run(
         [
             str(config.venv_python),
             str(script),
             "--config",
-            str(config.repo_root / PIPELINE_CONFIG),
+            str(config.repo_root / lane["pipeline_config"]),
             "--cameras-config",
-            str(config.repo_root / CAMERAS_CONFIG),
+            str(config.repo_root / lane["cameras_config"]),
         ],
         check=False,
         cwd=str(config.repo_root),
@@ -809,8 +860,13 @@ def run_preflight(config: NativeHostConfig, env: Mapping[str, str]) -> None:
         _fail(f"ds9_preflight failed with exit {result.returncode}")
 
 
-def check_native(config: NativeHostConfig) -> dict[str, Any]:
+def check_native(
+    config: NativeHostConfig,
+    *,
+    tracking_mode: str = CANONICAL_TRACKING_MODE,
+) -> dict[str, Any]:
     started = time.monotonic()
+    lane = _runtime_lane(tracking_mode)
     validate_secret_files(config.secrets)
     platform = verify_platform_versions()
     python_origin: dict[str, Any] = verify_python_origin(config.venv_python)
@@ -825,8 +881,9 @@ def check_native(config: NativeHostConfig) -> dict[str, Any]:
         storage_base=config.runtime / "depth" / "check",
         evidence_root=config.runtime / "evidence" / "check" / "runtime",
         build_root=config.runtime / "build" / "check",
+        tracking_mode=lane["tracking_mode"],
     )
-    run_preflight(config, check_env)
+    run_preflight(config, check_env, tracking_mode=lane["tracking_mode"])
     return {
         "ok": True,
         "contract": CONTRACT,
@@ -839,10 +896,8 @@ def check_native(config: NativeHostConfig) -> dict[str, Any]:
         "artifacts": artifacts,
         "ports": occupancy,
         "lane": {
-            "name": "baseline",
-            "pgie_profile": CANONICAL_PROFILE,
-            "model_size": CANONICAL_SIZE,
-            "tracking_mode": CANONICAL_TRACKING_MODE,
+            key: lane[key]
+            for key in ("name", "pgie_profile", "model_size", "tracking_mode")
         },
     }
 
@@ -852,15 +907,24 @@ def build_run_command(
     *,
     session_id: str,
     storage_base: Path,
+    tracking_mode: str = CANONICAL_TRACKING_MODE,
 ) -> list[str]:
     return [
         str(config.venv_python),
         str(config.repo_root / "DS9" / "noesis" / "ds9_runtime.py"),
-        *canonical_runtime_arguments(storage_base=storage_base)[1:],
+        *canonical_runtime_arguments(
+            storage_base=storage_base,
+            tracking_mode=tracking_mode,
+        )[1:],
     ]
 
 
-def run_native(config: NativeHostConfig) -> NoReturn:
+def run_native(
+    config: NativeHostConfig,
+    *,
+    tracking_mode: str = CANONICAL_TRACKING_MODE,
+) -> NoReturn:
+    lane = _runtime_lane(tracking_mode)
     occupancy = port_occupancy()
     if occupancy["occupied"]:
         _fail(
@@ -875,11 +939,13 @@ def run_native(config: NativeHostConfig) -> NoReturn:
         storage_base=directories["session_state"],
         evidence_root=directories["evidence_root"],
         build_root=directories["build_root"],
+        tracking_mode=lane["tracking_mode"],
     )
     command = build_run_command(
         config,
         session_id=session_id,
         storage_base=directories["storage_base"],
+        tracking_mode=lane["tracking_mode"],
     )
     os.execve(command[0], command, env)
 
@@ -887,6 +953,15 @@ def run_native(config: NativeHostConfig) -> NoReturn:
 def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Canonical DS9.1 native-host supervisor")
     parser.add_argument("mode", choices=("check", "run"))
+    parser.add_argument(
+        "--tracking-mode",
+        choices=OPT_IN_TRACKING_MODES,
+        default=CANONICAL_TRACKING_MODE,
+        help=(
+            "Runtime tracking lane. Baseline remains the default; mv3dt is an "
+            "explicit Kitchen/Family Room opt-in."
+        ),
+    )
     return parser.parse_args(list(argv) if argv is not None else None)
 
 
@@ -895,11 +970,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         config = load_native_config()
         if args.mode == "check":
-            payload = check_native(config)
+            payload = check_native(config, tracking_mode=args.tracking_mode)
             json.dump(payload, sys.stdout, indent=2, sort_keys=True)
             sys.stdout.write("\n")
             return 0
-        run_native(config)
+        run_native(config, tracking_mode=args.tracking_mode)
     except NativeRuntimeError as exc:
         print(f"[FAIL] {exc}", file=sys.stderr)
         return 1

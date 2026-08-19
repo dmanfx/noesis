@@ -6,20 +6,30 @@
   "moving_room": "kitchen",
   "transform_convention": "column-vector; maps Kitchen backend world to Family Room backend world",
   "moving_correction_in_backend_world_row_major": [
-    [0.9509890280393867, 0.0, 0.30922462474502693, -4.51875994],
-    [0.0, 1.0, 0.0, -0.00001779536248314173],
-    [-0.30922462474502693, 0.0, 0.9509890280393867, 8.87101457],
+    [0.9236803803138277, 1.26161989766878e-17, 0.38316387489337006, -4.3216084920869715],
+    [1.965323184204958e-17, 1.0000000000000002, 5.710541877934488e-18, -4.440892098500626e-16],
+    [-0.38316387489337006, 7.129554518288217e-17, 0.923680380313828, 9.50395839330719],
     [0.0, 0.0, 0.0, 1.0]
   ],
-  "yaw_deg": 18.012509,
+  "yaw_deg": 22.52979857741824,
   "source_report_storage_relative": "noesis_devel/pcf_multiroom/kitchen_family_cross_session_20260815/floor_constrained_review_reintegration_v2/pose_graph_validation_report.json",
   "source_report_sha256": "455cc55e31b09e5551077c9fee4418a67832db279df7b95cdf751e648c1e2ac1",
+  "static_camera_anchors": {
+    "kitchen": {
+      "report_storage_relative": "noesis_mv3dt_review/20260819_geometry_solve/kitchen_static_camera_anchor_v1/static_camera_anchor_report.json",
+      "report_sha256": "2529c9441e1bc34f6bf72ba2a37d4ec0f49ee8fad830befc2e88c4411fc88016",
+      "status": "passed_review_anchor"
+    },
+    "family-room": {
+      "report_storage_relative": "noesis_devel/pcf_multiroom/kitchen_family_living_bridge_20260816_152331/static_camera_anchor_family_v3_scene_prior/static_camera_anchor_report.json",
+      "report_sha256": "ef26aeb2b7019b581343f375bcc59b4e8dee06e2eda8201185f943875660bb6c",
+      "status": "passed_review_anchor"
+    }
+  },
   "source_calibration": "DS9/config/v3dt/living_family_phone_optimized/camera_calibration.json",
   "source_calibration_sha256": "2257abe9c4e6c3fbbc4accdb41d22a87e1d05cdc10f54ada4c9fbb68903731c5",
   "accepted": false,
   "reason_codes": [
-    "heldout_observation_error_exceeded",
-    "segment_holdout_training_support_collapsed",
-    "temporal_segment_holdout_failed"
+    "pending_dynamic_handoff_validation"
   ]
 }

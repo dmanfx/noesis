@@ -1,0 +1,35 @@
+{
+  "schema": "noesis.mv3dt.geometry_binding.v1",
+  "status": "accepted",
+  "canonical_use": true,
+  "fixed_gauge": "family-room",
+  "moving_room": "kitchen",
+  "transform_convention": "column-vector; independent anchors are already expressed in backend_world_m, so no additional room correction is applied",
+  "moving_correction_in_backend_world_row_major": [
+    [1.0, 0.0, 0.0, 0.0],
+    [0.0, 1.0, 0.0, 0.0],
+    [0.0, 0.0, 1.0, 0.0],
+    [0.0, 0.0, 0.0, 1.0]
+  ],
+  "yaw_deg": 0.0,
+  "calibration_config": "DS9/config/v3dt/kitchen_family_review/camera_calibration.json",
+  "calibration_method": "independent_static_camera_anchors_with_dynamic_handoff_validation",
+  "static_camera_anchors": {
+    "kitchen": {
+      "report_storage_relative": "noesis_mv3dt_review/20260819_geometry_solve/kitchen_static_camera_anchor_v1/static_camera_anchor_report.json",
+      "report_sha256": "2529c9441e1bc34f6bf72ba2a37d4ec0f49ee8fad830befc2e88c4411fc88016",
+      "status": "passed_review_anchor"
+    },
+    "family-room": {
+      "report_storage_relative": "noesis_devel/pcf_multiroom/kitchen_family_living_bridge_20260816_152331/static_camera_anchor_family_v3_scene_prior/static_camera_anchor_report.json",
+      "report_sha256": "ef26aeb2b7019b581343f375bcc59b4e8dee06e2eda8201185f943875660bb6c",
+      "status": "passed_review_anchor"
+    }
+  },
+  "accepted": true,
+  "reason_codes": [
+    "independent_static_camera_anchors_passed",
+    "july_three_handoff_episodes_passed",
+    "multi_person_false_merge_review_passed"
+  ]
+}

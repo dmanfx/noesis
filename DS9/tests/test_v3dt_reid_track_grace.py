@@ -36,6 +36,7 @@ def _processor(*, tracking_mode: str, grace_s: float) -> tuple[object, _StableID
     processor._tracking_mode = tracking_mode
     processor._v3dt_reid_track_grace_s = grace_s
     processor._v3dt_reid_last_seen_by_track = {}
+    processor._mv3dt_present_track_ids_by_sensor = {}
     return processor, manager
 
 
@@ -137,3 +138,26 @@ def test_v3dt_grace_does_not_cross_sensor_boundaries() -> None:
     processor._maintain_stable_ids(1, [], 10.1)
 
     assert manager.present_calls[-1][0:2] == (1, [])
+
+
+def test_mv3dt_uses_one_global_identity_key_and_unions_present_tracks() -> None:
+    processor, manager = _processor(tracking_mode="mv3dt", grace_s=0.0)
+
+    processor._maintain_stable_ids(1, [7], 10.0)
+    processor._maintain_stable_ids(2, [9], 10.0)
+    processor._maintain_stable_ids(1, [], 10.1)
+
+    assert processor._stable_id_manager_sensor_id(1) == -1
+    assert processor._stable_id_manager_sensor_id(2) == -1
+    assert [call[:2] for call in manager.present_calls] == [
+        (-1, [7]),
+        (-1, [7, 9]),
+        (-1, [9]),
+    ]
+
+
+def test_non_mv3dt_identity_key_remains_camera_scoped() -> None:
+    processor, _manager = _processor(tracking_mode="v3dt", grace_s=0.5)
+
+    assert processor._stable_id_manager_sensor_id(0) == 0
+    assert processor._stable_id_manager_sensor_id(2) == 2

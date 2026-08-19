@@ -18,8 +18,8 @@ streammux:
   enable-padding: 0
   num-surfaces-per-frame: 1
   nvbuf-memory-type: 0
-  # The aligned MP4 cohort shares frame order, while separately attached
-  # system timestamps do not. NvMOT uses its shared batch counter below.
+  # The recorded replay supplies frame-aligned, equal-length clips and runs
+  # each source once. NvMOT uses the shared batch counter below.
   sync-inputs: 0
   gpu-id: 0
 

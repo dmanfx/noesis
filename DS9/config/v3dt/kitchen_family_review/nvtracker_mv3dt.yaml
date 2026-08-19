@@ -9,7 +9,7 @@ TargetManagement:
   maxTargetsPerStream: 150
   minIouDiff4NewTarget: 0.37
   minTrackerConfidence: 0.2
-  probationAge: 4
+  probationAge: 2
   maxShadowTrackingAge: 300
   earlyTerminationAge: 10
   outputTerminatedTracks: 1
@@ -80,9 +80,9 @@ MultiViewAssociator:
   maxPeerTrackletSize: 50
   recentlyActiveAge: 178
   minCommonFrames4MatchScore: 2
-  maxPeerToPredDistance4Fusion: 1.35
-  minPeerVisibility4Fusion: 0.15
-  minPeerTrackletMatchScore: 0.48
+  maxPeerToPredDistance4Fusion: 4.75
+  minPeerVisibility4Fusion: 0.05
+  minPeerTrackletMatchScore: 0.18
   maxTrackletMatchingTimeSearchRange: 1
   maxPeerFrameDiff4NoDet: 2
   communicatorInitSleepTime: 0

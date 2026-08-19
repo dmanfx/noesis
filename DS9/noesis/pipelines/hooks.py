@@ -7043,6 +7043,9 @@ class _AnalyticsTelemetryProcessor:
     _v3dt_reid_last_seen_by_track: Dict[Tuple[int, int], float] = field(
         default_factory=dict, init=False, repr=False
     )
+    _mv3dt_present_track_ids_by_sensor: Dict[int, set[int]] = field(
+        default_factory=dict, init=False, repr=False
+    )
     _bev_class_ids: frozenset[int] = field(default_factory=lambda: frozenset({0}), init=False, repr=False)
     _bev_class_ids_ready: bool = field(default=False, init=False, repr=False)
     _reid_unique_id: int = field(default=3, init=False, repr=False)
@@ -7144,18 +7147,22 @@ class _AnalyticsTelemetryProcessor:
 
         self._tracking_mode = self._resolve_tracking_mode(self.tracking_mode)
         v3dt_cfg = getattr(self.pipeline, "config", {}).get("v3dt", {}) or {}
-        if self._tracking_mode_is_mv3dt() and (
-            str(os.environ.get("NOESIS_MV3DT_EVALUATION", "")).strip().lower()
-            not in {"1", "true", "yes", "y", "on"}
-            or not isinstance(v3dt_cfg, Mapping)
-            or v3dt_cfg.get("activation_state") != "evaluation_only"
-        ):
-            raise ValueError(
-                "MV3DT activation is deferred until Kitchen geometry and synchronized "
-                "occupied Kitchen/Family-Room overlap evidence are ready; Living Room "
-                "has no MV3DT peer edge. The isolated review lane additionally requires "
-                "NOESIS_MV3DT_EVALUATION=1 and an evaluation_only profile"
+        if self._tracking_mode_is_mv3dt():
+            evaluation_requested = (
+                str(os.environ.get("NOESIS_MV3DT_EVALUATION", "")).strip().lower()
+                in {"1", "true", "yes", "y", "on"}
             )
+            expected_activation = (
+                "evaluation_only" if evaluation_requested else "ready_opt_in"
+            )
+            if (
+                not isinstance(v3dt_cfg, Mapping)
+                or v3dt_cfg.get("activation_state") != expected_activation
+            ):
+                raise ValueError(
+                    "MV3DT runtime/profile mismatch: expected activation_state="
+                    f"{expected_activation} for the current launch"
+                )
 
         if self._tracking_mode_is_v3dt():
             if not isinstance(v3dt_cfg, Mapping):
@@ -7823,6 +7830,7 @@ class _AnalyticsTelemetryProcessor:
 
                 emb = None
                 mgr = getattr(self.pipeline, "stable_id_mgr", None)
+                manager_sensor_id = self._stable_id_manager_sensor_id(sensor_id)
                 identity_v2_enabled = identity_v2_service is not None
                 if identity_v2_enabled or (self._stable_id_enabled and mgr is not None):
                     need_emb = True
@@ -7834,12 +7842,20 @@ class _AnalyticsTelemetryProcessor:
                         needs_fn = getattr(mgr, "needs_embedding", None)
                         if callable(needs_fn):
                             try:
-                                need_emb = bool(needs_fn(int(sensor_id), int(track_id), float(now_ts)))
+                                need_emb = bool(
+                                    needs_fn(
+                                        manager_sensor_id,
+                                        int(track_id),
+                                        float(now_ts),
+                                    )
+                                )
                             except Exception:
                                 need_emb = True
                         else:
                             try:
-                                rec = mgr.active_tracks.get((int(sensor_id), int(track_id)))
+                                rec = mgr.active_tracks.get(
+                                    (manager_sensor_id, int(track_id))
+                                )
                                 need_emb = rec is None or rec.get("emb") is None
                             except Exception:
                                 need_emb = True
@@ -7906,12 +7922,14 @@ class _AnalyticsTelemetryProcessor:
                 )
                 if callable(get_id_diag):
                     try:
-                        id_diag = dict(get_id_diag(int(sensor_id), int(track_id)) or {})
+                        id_diag = dict(
+                            get_id_diag(manager_sensor_id, int(track_id)) or {}
+                        )
                     except Exception:
                         id_diag = {}
                 identity_contract = _stable_identity_contract(
                     None if identity_v2_authoritative else mgr,
-                    sensor_id=sensor_id,
+                    sensor_id=manager_sensor_id,
                     tracker_id=tracker_id_int,
                     diagnostics={} if identity_v2_authoritative else id_diag,
                 )
@@ -8385,9 +8403,10 @@ class _AnalyticsTelemetryProcessor:
                 present_stable_ids.add(stable_id_int)
                 tracker_id_int = int(track_id)
                 mgr = getattr(self.pipeline, "stable_id_mgr", None)
+                manager_sensor_id = self._stable_id_manager_sensor_id(sensor_id)
                 identity_contract = _stable_identity_contract(
                     mgr,
-                    sensor_id=sensor_id,
+                    sensor_id=manager_sensor_id,
                     tracker_id=tracker_id_int,
                 )
                 id_display = None
@@ -11410,8 +11429,9 @@ class _AnalyticsTelemetryProcessor:
         mgr = getattr(self.pipeline, "stable_id_mgr", None)
         if self._stable_id_enabled and mgr is not None:
             try:
+                manager_sensor_id = self._stable_id_manager_sensor_id(sensor_id)
                 stable_id = mgr.update(
-                    sensor_id=int(sensor_id),
+                    sensor_id=manager_sensor_id,
                     ds_obj_id=int(track_id),
                     bbox_ltrbwh=(float(safe_bbox[0]), float(safe_bbox[1]), float(safe_bbox[2]), float(safe_bbox[3])),
                     ts=float(ts),
@@ -11427,6 +11447,18 @@ class _AnalyticsTelemetryProcessor:
                 self._stable_id_enabled = False
 
         return None
+
+    def _stable_id_manager_sensor_id(self, sensor_id: int) -> int:
+        """Use MV3DT's batch-global object ID as the legacy identity key.
+
+        NvMultiObjectTracker allocates MV3DT IDs across the whole batched camera
+        graph and propagates the winning ID to peer cameras.  Scoping that ID by
+        camera recreates the split that MV3DT just resolved.  The sentinel is
+        confined to the MV3DT hook; baseline and SV3DT retain their historical
+        per-camera identity keys.
+        """
+
+        return -1 if self._tracking_mode_is_mv3dt() else int(sensor_id)
 
     def _reid_crop_from_track(
         self,
@@ -11484,19 +11516,27 @@ class _AnalyticsTelemetryProcessor:
         mgr = getattr(self.pipeline, "stable_id_mgr", None)
         if self._stable_id_enabled and mgr is not None:
             try:
+                manager_sensor_id = self._stable_id_manager_sensor_id(sensor_id_int)
+                if self._tracking_mode_is_mv3dt():
+                    self._mv3dt_present_track_ids_by_sensor[sensor_id_int] = set(
+                        present_set
+                    )
+                    present_set = set().union(
+                        *self._mv3dt_present_track_ids_by_sensor.values()
+                    )
                 if self._tracking_mode_is_v3dt() and self._v3dt_reid_track_grace_s > 0.0:
                     for track_id in present_set:
-                        self._v3dt_reid_last_seen_by_track[(sensor_id_int, track_id)] = now_ts
+                        self._v3dt_reid_last_seen_by_track[(manager_sensor_id, track_id)] = now_ts
                     for key, last_seen_ts in list(self._v3dt_reid_last_seen_by_track.items()):
                         cached_sensor_id, cached_track_id = key
-                        if cached_sensor_id != sensor_id_int or cached_track_id in present_set:
+                        if cached_sensor_id != manager_sensor_id or cached_track_id in present_set:
                             continue
                         age_s = now_ts - last_seen_ts
                         if 0.0 <= age_s <= self._v3dt_reid_track_grace_s:
                             present_set.add(cached_track_id)
                         else:
                             self._v3dt_reid_last_seen_by_track.pop(key, None)
-                mgr.remove_missing_tracks(sensor_id_int, list(present_set), now_ts)
+                mgr.remove_missing_tracks(manager_sensor_id, list(present_set), now_ts)
                 mgr.prune_ghosts(now_ts)
             except Exception:
                 logger.exception("StableIDManager maintenance failed for sensor %s", sensor_id_int)

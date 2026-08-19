@@ -1,8 +1,6 @@
 from __future__ import annotations
 
-import contextlib
 import importlib.util
-import io
 import os
 import subprocess
 import sys
@@ -27,7 +25,7 @@ def _load_launcher():
     return module
 
 
-def test_launcher_keeps_mv3dt_distinct_and_fails_before_preflight() -> None:
+def test_launcher_keeps_mv3dt_distinct_and_reaches_preflight() -> None:
     launcher = _load_launcher()
     with mock.patch.object(
         sys,
@@ -51,20 +49,17 @@ def test_launcher_keeps_mv3dt_distinct_and_fails_before_preflight() -> None:
         assert pipeline_explicit is False
         assert cameras_explicit is False
 
-        stderr = io.StringIO()
         with (
             mock.patch.object(launcher, "_ensure_runtime_sys_path"),
             mock.patch.object(launcher, "_set_ds9_environment") as set_environment,
-            mock.patch.object(launcher, "_run_preflight") as preflight,
-            contextlib.redirect_stderr(stderr),
+            mock.patch.object(launcher, "_run_preflight", return_value=1) as preflight,
         ):
-            assert launcher.main() == 78
-        set_environment.assert_not_called()
-        preflight.assert_not_called()
-        assert "MV3DT activation is deferred" in stderr.getvalue()
+            assert launcher.main() == 1
+        set_environment.assert_called_once()
+        preflight.assert_called_once()
 
 
-def test_core_and_hooks_preserve_mv3dt_mode_and_core_refuses_activation() -> None:
+def test_core_and_hooks_preserve_mv3dt_mode_and_reject_deferred_profile() -> None:
     code = r'''
 import sys
 from types import SimpleNamespace
@@ -108,17 +103,21 @@ try:
         publication_gate=RuntimePublicationGate(),
     )
 except ValueError as exc:
-    assert "MV3DT activation is deferred" in str(exc)
+    assert "runtime/profile mismatch" in str(exc)
 else:
-    raise AssertionError("hooks allowed direct MV3DT activation")
+    raise AssertionError("hooks allowed a deferred MV3DT profile")
 
 sys.argv = ["ds9_runtime_core.py", "--tracking-mode", "mv3dt"]
-with mock.patch.object(
-    runtime,
-    "_select_ws_port",
-    side_effect=AssertionError("MV3DT guard ran after endpoint preflight"),
+with (
+    mock.patch.object(runtime, "_resolve_tracking_mode", return_value="mv3dt"),
+    mock.patch.object(runtime, "optional_runtime_context_binding", return_value=None),
+    mock.patch.object(
+        runtime,
+        "_select_ws_port",
+        side_effect=RuntimeError("bounded test stop"),
+    ),
 ):
-    assert runtime._run_main(SimpleNamespace()) == 78
+    assert runtime._run_main(SimpleNamespace()) == 1
 '''
     env = dict(os.environ)
     env["PYTHONPATH"] = os.pathsep.join(
@@ -135,18 +134,18 @@ with mock.patch.object(
     assert result.returncode == 0, result.stdout + result.stderr
 
 
-def test_mv3dt_config_is_deferred_and_has_only_kitchen_family_peer_edge() -> None:
+def test_mv3dt_config_is_ready_opt_in_and_has_only_kitchen_family_peer_edge() -> None:
     pipeline_path = DS9_ROOT / "config" / "infer_mv3dt.yaml"
-    tracker_path = DS9_ROOT / "config" / "v3dt" / "nvtracker_mv3dt.yaml"
-    pub_sub_path = DS9_ROOT / "config" / "v3dt" / "pub_sub_info_config_0.yml"
 
     pipeline = yaml.safe_load(pipeline_path.read_text(encoding="utf-8"))
+    tracker_path = REPO_ROOT / pipeline["tracker"]["config-file"]
     tracker = yaml.safe_load(tracker_path.read_text(encoding="utf-8"))
+    pub_sub_path = REPO_ROOT / tracker["Communicator"]["pubSubInfoConfigPath"]
     pub_sub = yaml.safe_load(pub_sub_path.read_text(encoding="utf-8"))
 
     assert pipeline["v3dt"]["profile"] == "mv3dt"
-    assert pipeline["v3dt"]["activation_state"] == "deferred"
-    assert pipeline["streammux"]["sync-inputs"] == 1
+    assert pipeline["v3dt"]["activation_state"] == "ready_opt_in"
+    assert pipeline["streammux"]["sync-inputs"] == 0
     assert pipeline["tracker"]["config-file"].endswith("nvtracker_mv3dt.yaml")
 
     associator = tracker["MultiViewAssociator"]
@@ -156,10 +155,10 @@ def test_mv3dt_config_is_deferred_and_has_only_kitchen_family_peer_edge() -> Non
     assert communicator["communicatorType"] == 2
 
     living, kitchen, family = pub_sub["pubBrokerTopicStr"]
-    assert pub_sub["subPeerBrokerTopicStrs"] == [[], [family], [kitchen]]
+    assert pub_sub["subPeerBrokerTopicStrs"] == [[living], [family], [kitchen]]
     assert living not in {
         topic
-        for subscriptions in pub_sub["subPeerBrokerTopicStrs"]
+        for subscriptions in pub_sub["subPeerBrokerTopicStrs"][1:]
         for topic in subscriptions
     }
 
@@ -177,6 +176,7 @@ bundle = validate_v3dt_assets(
     expected_profile="mv3dt",
 )
 assert bundle.profile == "mv3dt"
+assert bundle.tracker_config.parent.name == "kitchen_family_review"
 assert bundle.pub_sub_config.name == "pub_sub_info_config_0.yml"
 assert bundle.mqtt_config_template.name == "config_mqtt.template.txt"
 

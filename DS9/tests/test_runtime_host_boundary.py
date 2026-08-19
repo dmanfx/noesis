@@ -120,6 +120,19 @@ def test_canonical_command_uses_host_storage_and_baseline_lane(tmp_path: Path) -
     assert argv[argv.index("--rest-port") + 1] == "8080"
 
 
+def test_mv3dt_command_is_an_explicit_native_host_lane(tmp_path: Path) -> None:
+    storage = tmp_path / "depth"
+    argv = host.canonical_runtime_arguments(
+        storage_base=storage,
+        tracking_mode="mv3dt",
+    )
+    assert argv[argv.index("--pipeline-config") + 1] == "DS9/config/infer_mv3dt.yaml"
+    assert argv[argv.index("--cameras-config") + 1] == "DS9/config/cameras_v3dt.yaml"
+    assert argv[argv.index("--pgie-profile") + 1] == "yolo26_seg"
+    assert argv[argv.index("--size") + 1] == "s"
+    assert argv[argv.index("--tracking-mode") + 1] == "mv3dt"
+
+
 def test_run_environment_strips_selector_and_docker(tmp_path: Path) -> None:
     env = _config_env(tmp_path)
     env.update(
@@ -155,6 +168,24 @@ def test_run_environment_strips_selector_and_docker(tmp_path: Path) -> None:
     assert built["NOESIS_MOSAIC_WEBRTC_ENABLED"] == "1"
     assert built["NOESIS_WORLD_JOURNAL_PATH"] == env["NOESIS_WORLD_JOURNAL_PATH"]
     assert built["NOESIS_CPU_MATH_THREADS"] == "1"
+
+
+def test_mv3dt_run_environment_preserves_explicit_opt_in(tmp_path: Path) -> None:
+    env = _config_env(tmp_path)
+    with mock.patch.dict(os.environ, env, clear=False):
+        config = host.load_native_config(env)
+        built = host.build_run_environment(
+            config,
+            session_id="sess-mv3dt",
+            storage_base=tmp_path / "state",
+            evidence_root=tmp_path / "evidence",
+            build_root=tmp_path / "build",
+            tracking_mode="mv3dt",
+        )
+    assert built["NOESIS_TRACKING_MODE"] == "mv3dt"
+    assert built["NOESIS_PGIE_PROFILE"] == "yolo26_seg"
+    context = json.loads(built["NOESIS_APPLIANCE_RUNTIME_CONTEXT"])
+    assert context["runtime_variant"] == "ds9:v3dt"
 
 
 def test_run_environment_requires_health_identity(tmp_path: Path) -> None:

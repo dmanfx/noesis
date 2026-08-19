@@ -1928,7 +1928,7 @@ def _parse_args() -> argparse.Namespace:
         choices=_TRACKING_MODES,
         default=None,
         help=(
-            "Tracking mode selection (baseline, v3dt, or deferred mv3dt). "
+            "Tracking mode selection (baseline, v3dt, or opt-in mv3dt). "
             "Env: NOESIS_TRACKING_MODE"
         ),
     )
@@ -2282,6 +2282,9 @@ def _validate_v3dt_tracking_guardrails(
             expected_profile=_v3dt_profile_for_tracking_mode(tracking_mode),
             expected_activation_state=(
                 "evaluation_only"
+                if _normalize_tracking_mode(tracking_mode) == "mv3dt"
+                and _mv3dt_evaluation_requested()
+                else "ready_opt_in"
                 if _normalize_tracking_mode(tracking_mode) == "mv3dt"
                 else None
             ),
@@ -4439,14 +4442,6 @@ def _run_main(startup_main_guard: StartupMainGuard) -> int:
     )
     logger = logging.getLogger("ds9.runtime")
     tracking_mode = _resolve_tracking_mode(args)
-    if tracking_mode == "mv3dt" and not _mv3dt_evaluation_requested():
-        logger.critical(
-            "MV3DT activation is deferred until Kitchen geometry and synchronized "
-            "occupied Kitchen/Family-Room overlap evidence are ready; Living Room "
-            "has no MV3DT peer edge. The isolated review lane additionally requires "
-            "NOESIS_MV3DT_EVALUATION=1 and an evaluation_only profile."
-        )
-        return 78
     try:
         appliance_binding = optional_runtime_context_binding(os.environ)
     except ApplianceConfigurationError as exc:
@@ -4795,9 +4790,7 @@ def _run_main(startup_main_guard: StartupMainGuard) -> int:
         )
         analytics_pipeline_cfg = pipeline_cfg_for_analytics.get("analytics") or {}
         analytics_default_path = REPO_ROOT / "config" / "nvdsanalytics.yaml"
-        mv3dt_evaluation = (
-            tracking_mode == "mv3dt" and _mv3dt_evaluation_requested()
-        )
+        mv3dt_isolated_analytics = tracking_mode == "mv3dt"
         if tracking_mode in ("v3dt", "sv3dt", "mv3dt"):
             stages_raw_path = str(
                 analytics_pipeline_cfg.get("stages_config") or ""
@@ -4811,7 +4804,7 @@ def _run_main(startup_main_guard: StartupMainGuard) -> int:
         if not exclude_raw_path:
             raise RuntimeError("Analytics exclusion config path is missing")
         exclude_path = _resolve_pipeline_cfg_path(pipeline_path, exclude_raw_path)
-        if mv3dt_evaluation:
+        if mv3dt_isolated_analytics:
             analytics_default_path, exclude_path = (
                 _materialize_mv3dt_analytics_runtime_configs(
                     analytics_default_path,

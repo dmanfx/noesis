@@ -588,6 +588,30 @@ class PhoneScanService:
             for target in self._alignment_targets.values()
         ]
 
+    @staticmethod
+    def _user_unit_active(unit: str) -> bool:
+        completed = subprocess.run(
+            ["systemctl", "--user", "is-active", "--quiet", unit],
+            check=False,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=15,
+        )
+        return completed.returncode == 0
+
+    @staticmethod
+    def _systemctl_user(action: str, unit: str, *, timeout_s: int) -> None:
+        completed = subprocess.run(
+            ["systemctl", "--user", action, unit],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=timeout_s,
+        )
+        if completed.returncode != 0:
+            detail = (completed.stderr or completed.stdout or "unknown systemd error").strip()
+            raise RuntimeError(f"systemctl --user {action} {unit} failed: {detail}")
+
     def _lock(self, scan_id: str) -> threading.RLock:
         with self._locks_guard:
             return self._scan_locks.setdefault(scan_id, threading.RLock())
@@ -1377,6 +1401,317 @@ class PhoneScanService:
                 except HTTPException:
                     return
 
+    def initiate_pcf(self, scan_id: str) -> dict[str, Any]:
+        with self._lock(scan_id):
+            state = self._read_state_unlocked(scan_id)
+            if state.get("status") != "complete" or not isinstance(
+                state.get("outputs"), dict
+            ):
+                raise HTTPException(
+                    status.HTTP_409_CONFLICT,
+                    "PCF requires a completed DA3 reconstruction",
+                )
+            provider = str(
+                state.get("provider") or state.get("outputs", {}).get("provider") or ""
+            ).lower()
+            if provider != "da3":
+                raise HTTPException(
+                    status.HTTP_409_CONFLICT,
+                    "PCF requires DA3 as the base reconstruction provider",
+                )
+            alignment = state.get("alignment")
+            alignment_results = (
+                alignment.get("results") if isinstance(alignment, dict) else None
+            )
+            if (
+                not isinstance(alignment, dict)
+                or alignment.get("status") != "complete"
+                or not isinstance(alignment_results, dict)
+                or not isinstance(alignment_results.get("quality_gate"), dict)
+                or alignment_results["quality_gate"].get("passed") is not True
+            ):
+                raise HTTPException(
+                    status.HTTP_409_CONFLICT,
+                    "PCF requires a completed alignment that passed its quality gate",
+                )
+            camera_id = str(
+                alignment_results.get("target_camera_id")
+                or alignment.get("target_camera_id")
+                or ""
+            )
+            target = self._alignment_targets.get(camera_id)
+            if target is None:
+                raise HTTPException(
+                    status.HTTP_409_CONFLICT,
+                    "The aligned camera is not available in the active scene release",
+                )
+            if alignment_results.get("target_revision_id") != target.target_revision.name:
+                raise HTTPException(
+                    status.HTTP_409_CONFLICT,
+                    "The aligned static revision is not the active camera revision",
+                )
+            if state.get("active_revision"):
+                raise HTTPException(
+                    status.HTTP_409_CONFLICT,
+                    "PCF currently requires the original DA3 walk; an active added-video revision is not silently included",
+                )
+            if any(
+                isinstance(row, dict)
+                and row.get("status") in SUPPLEMENT_RUNNING_STATUSES
+                for row in state.get("supplements") or []
+            ):
+                raise HTTPException(
+                    status.HTTP_409_CONFLICT,
+                    "Wait for the added-video operation to finish before starting PCF",
+                )
+            previous = state.get("pcf")
+            previous_status = previous.get("status") if isinstance(previous, dict) else None
+            if previous_status not in {None, "failed"}:
+                raise HTTPException(
+                    status.HTTP_409_CONFLICT,
+                    f"PCF cannot start while status is {previous_status}",
+                )
+            run_id = f"pcf-{datetime.now().strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:8]}"
+            now = _utc_now()
+            state["pcf"] = {
+                "schema": "noesis.phone_scan.pcf_job.v1",
+                "run_id": run_id,
+                "created_at": now,
+                "updated_at": now,
+                "status": "queued",
+                "progress": 0.0,
+                "message": "Waiting for the PCF reconstruction lane",
+                "error": None,
+                "target_camera_id": target.camera_id,
+                "target_revision_id": target.target_revision.name,
+                "source_provider": "da3",
+                "source_scope": "original_prepared_walk",
+                "review_only": True,
+            }
+            self._write_state_unlocked(scan_id, state)
+        self._executor.submit(self._pcf_worker, scan_id, run_id, target.camera_id)
+        return state
+
+    def _pcf_progress(self, scan_id: str, fraction: float, message: str) -> None:
+        try:
+            with self._lock(scan_id):
+                state = self._read_state_unlocked(scan_id)
+                pcf = state.get("pcf")
+                if not isinstance(pcf, dict) or pcf.get("status") not in PCF_RUNNING_STATUSES:
+                    return
+                pcf.update(
+                    {
+                        "progress": float(min(1.0, max(0.0, fraction))),
+                        "message": str(message),
+                        "updated_at": _utc_now(),
+                    }
+                )
+                state["pcf"] = pcf
+                self._write_state_unlocked(scan_id, state)
+        except HTTPException:
+            return
+
+    def _update_pcf_runtime_lease(
+        self, scan_id: str, run_id: str, **changes: Any
+    ) -> None:
+        with self._lock(scan_id):
+            state = self._read_state_unlocked(scan_id)
+            pcf = dict(state.get("pcf") or {})
+            if pcf.get("run_id") != run_id:
+                raise RuntimeError("PCF job identity changed during the runtime lease")
+            runtime_lease = dict(pcf.get("runtime_lease") or {})
+            runtime_lease.update(changes)
+            pcf["runtime_lease"] = runtime_lease
+            pcf["updated_at"] = _utc_now()
+            state["pcf"] = pcf
+            self._write_state_unlocked(scan_id, state)
+
+    def _pcf_worker(self, scan_id: str, run_id: str, camera_id: str) -> None:
+        target = self._alignment_targets[camera_id]
+        with self._inference_lock:
+            pcf_scan_root = self.pcf_scan_dir(scan_id)
+            run_root = pcf_scan_root / "runs" / run_id
+            appliance_was_active = False
+            appliance_paused = False
+            runtime_restore_error: Exception | None = None
+            runner_error: Exception | None = None
+            result: dict[str, Any] | None = None
+            try:
+                state = self.read_state(scan_id)
+                pcf = dict(state.get("pcf") or {})
+                if pcf.get("run_id") != run_id:
+                    raise RuntimeError("PCF job identity changed before execution")
+                if state.get("active_revision"):
+                    raise RuntimeError(
+                        "an added-video revision became active before PCF started"
+                    )
+                pcf.update(
+                    {
+                        "status": "running",
+                        "progress": 0.01,
+                        "message": "Starting Prior-Conditioned Fusion",
+                        "error": None,
+                        "runtime_lease": {
+                            "configured": bool(self.settings.pcf_pause_appliance),
+                            "appliance_target": PCF_APPLIANCE_TARGET,
+                            "appliance_was_active": None,
+                            "pause_requested": False,
+                            "appliance_paused": False,
+                            "restore_passed": None,
+                        },
+                        "updated_at": _utc_now(),
+                    }
+                )
+                self.update_state(scan_id, pcf=pcf)
+                run_root.parent.mkdir(parents=True, exist_ok=True)
+                run_root.mkdir(exist_ok=False)
+                try:
+                    if self.settings.pcf_pause_appliance:
+                        appliance_was_active = self._user_unit_active(
+                            PCF_APPLIANCE_TARGET
+                        )
+                        self._update_pcf_runtime_lease(
+                            scan_id,
+                            run_id,
+                            appliance_was_active=appliance_was_active,
+                        )
+                        if appliance_was_active:
+                            self._pcf_progress(
+                                scan_id,
+                                0.02,
+                                "Pausing the Noesis/Menon appliance for PCF GPU headroom",
+                            )
+                            # Record restoration responsibility before issuing the
+                            # stop so a phone-tool restart can recover the appliance.
+                            self._update_pcf_runtime_lease(
+                                scan_id,
+                                run_id,
+                                pause_requested=True,
+                            )
+                            self._systemctl_user(
+                                "stop", PCF_APPLIANCE_TARGET, timeout_s=150
+                            )
+                            appliance_paused = True
+                            self._update_pcf_runtime_lease(
+                                scan_id,
+                                run_id,
+                                appliance_paused=True,
+                            )
+                            if self._user_unit_active("noesis-appliance.service"):
+                                raise RuntimeError(
+                                    "native Noesis remained active after the PCF GPU pause"
+                                )
+                    result = self.pcf_runner(
+                        self.scan_dir(scan_id),
+                        run_root,
+                        state,
+                        target,
+                        self.settings.mapanything,
+                        lambda fraction, message: self._pcf_progress(
+                            scan_id, 0.04 + 0.90 * float(fraction), message
+                        ),
+                    )
+                except Exception as exc:
+                    runner_error = exc
+                finally:
+                    if appliance_was_active:
+                        try:
+                            self._pcf_progress(
+                                scan_id,
+                                0.96,
+                                "Restoring the native Noesis/Menon appliance",
+                            )
+                            self._systemctl_user(
+                                "start", PCF_APPLIANCE_TARGET, timeout_s=300
+                            )
+                            if not self._user_unit_active("noesis-appliance.service"):
+                                raise RuntimeError(
+                                    "native Noesis was not active after appliance restore"
+                                )
+                        except Exception as exc:
+                            runtime_restore_error = exc
+                        finally:
+                            self._update_pcf_runtime_lease(
+                                scan_id,
+                                run_id,
+                                restore_passed=runtime_restore_error is None,
+                                restore_error=(
+                                    None
+                                    if runtime_restore_error is None
+                                    else f"{type(runtime_restore_error).__name__}: "
+                                    f"{runtime_restore_error}"
+                                ),
+                            )
+                if runner_error is not None:
+                    if runtime_restore_error is not None:
+                        raise RuntimeError(
+                            f"{runner_error}; appliance restore also failed: "
+                            f"{runtime_restore_error}"
+                        ) from runner_error
+                    raise runner_error
+                if result is None:
+                    raise RuntimeError("PCF runner returned no result")
+                result["runtime_lease"] = {
+                    "configured": bool(self.settings.pcf_pause_appliance),
+                    "appliance_target": PCF_APPLIANCE_TARGET,
+                    "appliance_was_active": appliance_was_active,
+                    "appliance_paused": appliance_paused,
+                    "restore_passed": runtime_restore_error is None,
+                }
+                if runtime_restore_error is not None:
+                    result["runtime_restore_error"] = (
+                        f"{type(runtime_restore_error).__name__}: "
+                        f"{runtime_restore_error}"
+                    )
+                saved_result = _pcf_paths_for_state(run_id, result)
+                with self._lock(scan_id):
+                    latest = self._read_state_unlocked(scan_id)
+                    completed = dict(latest.get("pcf") or {})
+                    if completed.get("run_id") != run_id:
+                        raise RuntimeError("PCF job identity changed during execution")
+                    completed.update(
+                        {
+                            "status": "complete",
+                            "progress": 1.0,
+                            "message": (
+                                "PCF review candidate and diagnostics are saved"
+                                if runtime_restore_error is None
+                                else "PCF is saved, but the native appliance needs attention"
+                            ),
+                            "error": None,
+                            "results": saved_result,
+                            "updated_at": _utc_now(),
+                        }
+                    )
+                    latest["pcf"] = completed
+                    self._write_state_unlocked(scan_id, latest)
+            except Exception as exc:
+                try:
+                    state = self.read_state(scan_id)
+                    failed = dict(state.get("pcf") or {})
+                    if failed.get("run_id") != run_id:
+                        return
+                    log_path = run_root / "pcf_run.log"
+                    failed.update(
+                        {
+                            "status": "failed",
+                            "progress": 0.0,
+                            "message": (
+                                "PCF failed; the DA3 walk, alignment, and completed "
+                                "stage outputs are preserved"
+                            ),
+                            "error": f"{type(exc).__name__}: {exc}",
+                            "updated_at": _utc_now(),
+                        }
+                    )
+                    if log_path.is_file():
+                        failed["log"] = (
+                            Path("runs") / run_id / log_path.name
+                        ).as_posix()
+                    self.update_state(scan_id, pcf=failed)
+                except HTTPException:
+                    return
+
     def delete_scan(self, scan_id: str) -> None:
         with self._lock(scan_id):
             state = self._read_state_unlocked(scan_id)
@@ -1953,6 +2288,13 @@ def create_app(
             status_code=status.HTTP_202_ACCEPTED,
         )
 
+    @app.post("/api/scans/{scan_id}/initiate-pcf", status_code=status.HTTP_202_ACCEPTED)
+    async def initiate_pcf(scan_id: str) -> JSONResponse:
+        return JSONResponse(
+            _public_state(service.initiate_pcf(scan_id)),
+            status_code=status.HTTP_202_ACCEPTED,
+        )
+
     @app.delete("/api/scans/{scan_id}", status_code=status.HTTP_204_NO_CONTENT)
     async def delete_scan(scan_id: str) -> Response:
         service.delete_scan(scan_id)
@@ -1973,6 +2315,11 @@ def create_app(
         "/assets",
         StaticFiles(directory=configured.storage_root),
         name="phone-scan-assets",
+    )
+    app.mount(
+        "/pcf-assets",
+        StaticFiles(directory=service.pcf_storage_root),
+        name="phone-scan-pcf-assets",
     )
     return app
 

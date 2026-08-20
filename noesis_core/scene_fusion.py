@@ -12,6 +12,12 @@ from typing import Any, Mapping
 
 import numpy as np
 
+from noesis_core.coordinate_frames import (
+    CoordinateFrameError,
+    camera_ground_frame_from_camera_to_world,
+    transform_positions,
+)
+
 
 MAX_CATALOG_BYTES = 4 * 1024 * 1024
 MAX_MANIFEST_BYTES = 4 * 1024 * 1024
@@ -713,22 +719,21 @@ class SceneFusionSet:
             if pose.size != 16 or not np.isfinite(pose).all():
                 raise SceneFusionError(f"{camera_id} fusion reference camera pose is invalid")
             pose = pose.reshape((4, 4))
-            forward = pose[:3, 2].copy()
-            forward[1] = 0.0
-            forward /= max(float(np.linalg.norm(forward)), 1e-9)
-            right = np.cross(np.asarray([0.0, 1.0, 0.0]), forward)
-            right /= max(float(np.linalg.norm(right)), 1e-9)
-            if float(np.dot(right, pose[:3, 0])) < 0.0:
-                right *= -1.0
-            delta = points["points_world_m"].astype(np.float64) - pose[:3, 3]
-            local_points = np.stack(
-                [
-                    delta @ right,
-                    points["points_world_m"][:, 1] - float(manifest["floor_y_m"]),
-                    delta @ forward,
-                ],
-                axis=1,
-            ).astype(np.float32)
+            try:
+                camera_frame = camera_ground_frame_from_camera_to_world(pose)
+                world_to_camera_local = (
+                    camera_frame.world_to_camera_local_display_matrix(
+                        float(manifest["floor_y_m"])
+                    )
+                )
+                local_points = transform_positions(
+                    points["points_world_m"],
+                    world_to_camera_local,
+                ).astype(np.float32)
+            except (CoordinateFrameError, TypeError, ValueError) as exc:
+                raise SceneFusionError(
+                    f"{camera_id} fusion reference camera pose is invalid: {exc}"
+                ) from exc
             diagnostics = _derive_diagnostic_grids(
                 local_points=local_points,
                 points=points,

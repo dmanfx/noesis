@@ -10,7 +10,7 @@ import tempfile
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 from PIL import Image
@@ -193,17 +193,6 @@ def _decode_grid(layer: Dict[str, Any]) -> np.ndarray:
         raise ValueError("Missing/invalid grid_shape")
     h, w = int(shape[0]), int(shape[1])
     return _decode_b64_array(b64, np.float32, (h, w))
-
-
-def _apply_image_flip(grid: np.ndarray, image_flip: Dict[str, Any]) -> np.ndarray:
-    out = grid
-    flip_u = bool(image_flip.get("u", False))
-    flip_v = bool(image_flip.get("v", False))
-    if flip_v:
-        out = out[::-1, :]
-    if flip_u:
-        out = out[:, ::-1]
-    return out
 
 
 def _percentile_range(values: np.ndarray, lo: float, hi: float) -> Tuple[float, float]:
@@ -449,7 +438,7 @@ def _parse_grid_res_list(text: str) -> List[float]:
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Dump DS8 floorplan layers + MapAnything camera heatmap to PNGs for rapid iteration."
+        description="Dump canonical Noesis floorplan layers and camera heatmaps to PNGs."
     )
     parser.add_argument("--ws", default="ws://127.0.0.1:6008", help="WebSocket URL")
     parser.add_argument("--from-disk", action="store_true", help="Load latest depth snapshot from disk (no WS required)")
@@ -481,12 +470,6 @@ def main() -> int:
     parser.add_argument("--offline-floorplan", action="store_true", help="Compute floorplan locally from ma_depth_response + config instead of calling get_floorplan over WS")
     parser.add_argument("--floorplan-timeout-s", type=float, default=180.0, help="Timeout per floorplan RPC (seconds)")
     parser.add_argument("--depth-timeout-s", type=float, default=60.0, help="Timeout for MapAnything depth RPC (seconds)")
-    parser.add_argument(
-        "--apply-image-flip",
-        action="store_true",
-        help="Legacy debug option: reapply the diagnostic image_flip hint onto floorplan grids.",
-    )
-    parser.add_argument("--no-flip", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument(
         "--depth-ts-max-us",
         type=int,
@@ -842,14 +825,12 @@ def main() -> int:
                 continue
 
             image_flip = resp.get("image_flip") if isinstance(resp.get("image_flip"), dict) else {}
-            do_flip = bool(args.apply_image_flip) and not bool(args.no_flip)
 
             def _get_layer(name: str) -> Optional[np.ndarray]:
                 layer = resp.get(name)
                 if not isinstance(layer, dict):
                     return None
-                grid = _decode_grid(layer)
-                return _apply_image_flip(grid, image_flip) if (do_flip and image_flip) else grid
+                return _decode_grid(layer)
 
             density = _get_layer("density")
             height = _get_layer("height")

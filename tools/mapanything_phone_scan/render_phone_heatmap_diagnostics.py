@@ -13,6 +13,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -24,6 +25,17 @@ from scipy import ndimage as ndi
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt  # noqa: E402
 
+REPO_ROOT = Path(__file__).resolve().parents[2]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from noesis_core.coordinate_frames import (  # noqa: E402
+    CAMERA_LOCAL_RASTER_ORIENTATION,
+    camera_ground_frame_from_camera_to_world,
+    camera_local_raster_indices,
+    transform_positions,
+)
+
 
 @dataclass
 class PhoneCloud:
@@ -34,6 +46,7 @@ class PhoneCloud:
     camera_to_world: np.ndarray
     frame_zero_depth: np.ndarray
     frame_zero_rgb: np.ndarray
+    presentation_camera_positions: np.ndarray | None = None
 
 
 def _load_raw_phone_cloud(raw_root: Path, point_budget: int, provider: str) -> PhoneCloud:
@@ -126,7 +139,7 @@ def _load_consensus(
 
 
 def _umeyama(source: np.ndarray, target: np.ndarray) -> tuple[float, np.ndarray, np.ndarray]:
-    """Return scale, rotation, translation mapping source to target."""
+    """Return a proper Sim(3) mapping source to target (never a reflection)."""
     source = np.asarray(source, dtype=np.float64)
     target = np.asarray(target, dtype=np.float64)
     source_mean = source.mean(axis=0)
@@ -139,6 +152,8 @@ def _umeyama(source: np.ndarray, target: np.ndarray) -> tuple[float, np.ndarray,
     if np.linalg.det(u @ vt) < 0:
         sign[-1, -1] = -1
     rotation = u @ sign @ vt
+    if not math.isclose(float(np.linalg.det(rotation)), 1.0, abs_tol=1e-8):
+        raise ValueError("Umeyama alignment produced an improper rotation")
     variance = float(np.sum(source_centered * source_centered) / source.shape[0])
     scale = float(np.sum(singular * np.diag(sign)) / variance)
     translation = target_mean - scale * (rotation @ source_mean)
@@ -218,12 +233,52 @@ def _apply_rigid(cloud: PhoneCloud, transform: np.ndarray) -> PhoneCloud:
     )
 
 
+def _camera_positions(cloud: PhoneCloud) -> np.ndarray:
+    if cloud.presentation_camera_positions is not None:
+        return np.asarray(cloud.presentation_camera_positions, dtype=np.float64)
+    return np.asarray(cloud.camera_to_world[:, :3, 3], dtype=np.float64)
+
+
+def _present_camera_ground(
+    cloud: PhoneCloud,
+    world_to_camera_local_display: np.ndarray,
+) -> PhoneCloud:
+    """Create a display-only cloud without transforming any pose rotation.
+
+    The matrix is normally improper because OpenCV camera-down becomes
+    camera-local height-up.  It is therefore applied only to point and path
+    positions after all metric registration has completed.
+    """
+
+    matrix = np.asarray(world_to_camera_local_display, dtype=np.float64)
+    return PhoneCloud(
+        points=transform_positions(cloud.points, matrix).astype(np.float32),
+        colors=cloud.colors,
+        weights=cloud.weights,
+        ranges=cloud.ranges,
+        camera_to_world=cloud.camera_to_world,
+        frame_zero_depth=cloud.frame_zero_depth,
+        frame_zero_rgb=cloud.frame_zero_rgb,
+        presentation_camera_positions=transform_positions(
+            cloud.camera_to_world[:, :3, 3],
+            matrix,
+        ),
+    )
+
+
 def _shared_bounds(clouds: list[PhoneCloud]) -> tuple[float, float, float, float]:
     points = np.concatenate([cloud.points for cloud in clouds])
-    cameras = np.concatenate([cloud.camera_to_world[:, :3, 3] for cloud in clouds])
-    horizontal = np.concatenate([points[:, [0, 2]], cameras[:, [0, 2]]])
-    low = np.percentile(horizontal, 0.6, axis=0) - 0.35
-    high = np.percentile(horizontal, 99.4, axis=0) + 0.35
+    cameras = np.concatenate([_camera_positions(cloud) for cloud in clouds])
+    point_horizontal = points[:, [0, 2]]
+    camera_horizontal = cameras[:, [0, 2]]
+    low = np.minimum(
+        np.percentile(point_horizontal, 0.6, axis=0),
+        np.min(camera_horizontal, axis=0),
+    ) - 0.35
+    high = np.maximum(
+        np.percentile(point_horizontal, 99.4, axis=0),
+        np.max(camera_horizontal, axis=0),
+    ) + 0.35
     return float(low[0]), float(high[0]), float(low[1]), float(high[1])
 
 
@@ -246,10 +301,19 @@ def _rasterize(cloud: PhoneCloud, bounds: tuple[float, float, float, float], gri
     weights = cloud.weights[valid]
     ranges = cloud.ranges[valid]
     colors = cloud.colors[valid]
-    xi = np.clip(((x - min_x) / grid_res).astype(np.int32), 0, cols - 1)
-    # Dashboard convention: increasing phone-world Z points toward the bottom
-    # of the BEV, which keeps the foyer/hallway at the camera-relative top-left.
-    zi = np.clip(((z - min_z) / grid_res).astype(np.int32), 0, rows - 1)
+    zi, xi, raster_valid = camera_local_raster_indices(
+        x,
+        z,
+        min_x_m=min_x,
+        min_z_m=min_z,
+        resolution_m=grid_res,
+        rows=rows,
+        columns=cols,
+    )
+    if not np.all(raster_valid):
+        raise ValueError("bounded camera-local points escaped their raster")
+    xi = xi.astype(np.int32)
+    zi = zi.astype(np.int32)
     index = (zi, xi)
 
     support = np.zeros((rows, cols), dtype=np.uint32)
@@ -317,12 +381,20 @@ def _rasterize(cloud: PhoneCloud, bounds: tuple[float, float, float, float], gri
     structural[obstacle_edges] = (255, 148, 44)
     structural[floor_edges] = (90, 220, 255)
 
-    camera_x = np.clip(((cloud.camera_to_world[:, 0, 3] - min_x) / grid_res).astype(int), 0, cols - 1)
-    camera_z = np.clip(
-        ((cloud.camera_to_world[:, 2, 3] - min_z) / grid_res).astype(int),
-        0,
-        rows - 1,
+    camera_positions = _camera_positions(cloud)
+    camera_z, camera_x, camera_valid = camera_local_raster_indices(
+        camera_positions[:, 0],
+        camera_positions[:, 2],
+        min_x_m=min_x,
+        min_z_m=min_z,
+        resolution_m=grid_res,
+        rows=rows,
+        columns=cols,
     )
+    camera_x = np.clip(camera_x, 0, cols - 1).astype(int)
+    camera_z = np.clip(camera_z, 0, rows - 1).astype(int)
+    if not np.all(camera_valid):
+        raise ValueError("bounded camera path escaped its raster")
     path = np.stack((camera_x, camera_z), axis=1).astype(np.int32)
     cv2.polylines(structural, [path.reshape(-1, 1, 2)], False, (58, 255, 118), 1, cv2.LINE_AA)
     cv2.circle(structural, tuple(path[0]), 2, (70, 255, 70), -1)
@@ -411,16 +483,19 @@ def _point_splat(
     image = np.full((rows, cols, 3), (7, 8, 10), dtype=np.uint8)
     if selected.size == 0:
         return image, {"point_count": 0, "occupied_cell_count": 0}
-    xi = np.clip(
-        ((points[selected, 0] - min_x) / cell_res_m).astype(np.int32),
-        0,
-        cols - 1,
+    zi, xi, raster_valid = camera_local_raster_indices(
+        points[selected, 0],
+        points[selected, 2],
+        min_x_m=min_x,
+        min_z_m=min_z,
+        resolution_m=cell_res_m,
+        rows=rows,
+        columns=cols,
     )
-    zi = np.clip(
-        ((points[selected, 2] - min_z) / cell_res_m).astype(np.int32),
-        0,
-        rows - 1,
-    )
+    if not np.all(raster_valid):
+        raise ValueError("bounded point splat escaped its raster")
+    xi = xi.astype(np.int32)
+    zi = zi.astype(np.int32)
     # Low-confidence samples are written first, so a collision is resolved by
     # an actual phone-walk sample rather than an average or synthetic surface.
     order = np.argsort(cloud.weights[selected], kind="stable")
@@ -438,7 +513,6 @@ def _render_point_preserving_layers(
     bounds: tuple[float, float, float, float],
     cell_res_m: float,
     provider_dir: Path,
-    rotate_180: bool = False,
 ) -> tuple[str, dict[str, dict[str, int]]]:
     bands = (
         ("All accepted samples", "all", (-0.15, 2.70)),
@@ -454,8 +528,6 @@ def _render_point_preserving_layers(
         image, layer_metrics = _point_splat(
             cloud, bounds, cell_res_m, height_range
         )
-        if rotate_180:
-            image = np.rot90(image, 2).copy()
         panels.append((title, image))
         metrics[slug] = layer_metrics
         _save_panel(provider_dir / f"point_splat_{slug}_{resolution_slug}.png", image)
@@ -589,6 +661,15 @@ def main() -> int:
     mapanything = _apply_rigid(mapanything, floor_transform)
     da3 = _apply_rigid(da3, floor_transform)
     consensus = _apply_rigid(consensus, floor_transform)
+    presentation_frame = camera_ground_frame_from_camera_to_world(
+        mapanything.camera_to_world[0]
+    )
+    presentation_matrix = presentation_frame.world_to_camera_local_display_matrix(
+        0.0
+    )
+    mapanything = _present_camera_ground(mapanything, presentation_matrix)
+    da3 = _present_camera_ground(da3, presentation_matrix)
+    consensus = _present_camera_ground(consensus, presentation_matrix)
     bounds = _shared_bounds([mapanything, da3, consensus])
 
     outputs = {}
@@ -599,7 +680,21 @@ def main() -> int:
         "frame_count": int(mapanything.camera_to_world.shape[0]),
         "grid_res_m": float(args.grid_res_m),
         "point_splat_res_m": float(args.point_splat_res_m),
-        "shared_bounds_phone_frame_m": list(bounds),
+        "shared_bounds_camera_local_ground_m": list(bounds),
+        "presentation": {
+            "source_coordinate_frame": "leveled_phone_world_m",
+            "target_coordinate_frame": "camera_local_ground_m",
+            "reference_view_index": 0,
+            "presentation_only": True,
+            "backend_geometry_mutated": False,
+            "linear_determinant": float(
+                np.linalg.det(presentation_matrix[:3, :3])
+            ),
+            "world_to_camera_local_row_major": presentation_matrix.tolist(),
+            "raster_orientation": CAMERA_LOCAL_RASTER_ORIENTATION,
+            "screen_right": "camera_right_positive_x",
+            "screen_up": "camera_forward_positive_z",
+        },
         "da3_to_mapanything_phone_pose_sim3": {
             "scale": scale,
             "rotation_row_major": rotation.tolist(),

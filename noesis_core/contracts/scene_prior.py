@@ -77,7 +77,14 @@ class ScenePriorGrid(ContractModel):
 class ScenePriorPreview(ContractModel):
     coordinate_frame: Literal["camera_local_ground_m"]
     units: Literal["meters"]
-    orientation: Literal["row_increases_camera_forward_column_increases_camera_right"]
+    # New revisions describe the actual PNG/raster addressing.  The legacy
+    # value remains readable because deployed immutable revisions used it for
+    # the pre-image numeric grid even though preview.png was vertically
+    # converted to row-zero-far addressing.
+    orientation: Literal[
+        "row_zero_max_z_rows_toward_min_z_columns_min_x_to_max_x",
+        "row_increases_camera_forward_column_increases_camera_right",
+    ]
     reference_camera_id: str = Field(
         min_length=1,
         max_length=160,
@@ -133,7 +140,10 @@ class ScenePriorPreview(ContractModel):
 
 
 class ScenePriorDerivation(ContractModel):
-    algorithm: Literal["noesis_scene_prior_2_5d_v1"]
+    algorithm: Literal[
+        "noesis_scene_prior_2_5d_v1",
+        "noesis_scene_prior_2_5d_full_evidence_v2",
+    ]
     floor_y_m: float
     floor_support_band_m: float = Field(gt=0.0, le=1.0)
     obstacle_min_height_m: float = Field(gt=0.0, le=2.0)

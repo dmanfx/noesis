@@ -118,7 +118,10 @@
       "additionalProperties": false,
       "properties": {
         "algorithm": {
-          "const": "noesis_scene_prior_2_5d_v1",
+          "enum": [
+            "noesis_scene_prior_2_5d_v1",
+            "noesis_scene_prior_2_5d_full_evidence_v2"
+          ],
           "title": "Algorithm",
           "type": "string"
         },
@@ -287,7 +290,10 @@
           "type": "string"
         },
         "orientation": {
-          "const": "row_increases_camera_forward_column_increases_camera_right",
+          "enum": [
+            "row_zero_max_z_rows_toward_min_z_columns_min_x_to_max_x",
+            "row_increases_camera_forward_column_increases_camera_right"
+          ],
           "title": "Orientation",
           "type": "string"
         },
@@ -485,7 +491,10 @@
           "type": "string"
         },
         "source_type": {
-          "const": "mapanything_multiview_room_walk",
+          "enum": [
+            "mapanything_multiview_room_walk",
+            "conditioned_multimodel_room_walk"
+          ],
           "title": "Source Type",
           "type": "string"
         }

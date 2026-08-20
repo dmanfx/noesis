@@ -15,6 +15,13 @@ from typing import Any, Mapping, Sequence
 import numpy as np
 from pydantic import ValidationError
 
+from noesis_core.coordinate_frames import (
+    CAMERA_LOCAL_RASTER_ORIENTATION,
+    CameraGroundFrame,
+    CoordinateFrameError,
+    camera_ground_frame_from_extrinsics_col_major,
+    transform_positions,
+)
 from noesis_core.contracts.scene_prior import (
     MAX_SCENE_PRIOR_GRID_CELLS,
     MAX_SCENE_PRIOR_GRID_DIMENSION,
@@ -43,6 +50,7 @@ _DIAGNOSTIC_SURFACE_HEIGHT_MAX_M = 1.80
 _DIAGNOSTIC_FURNITURE_MIN_M = 0.12
 _DIAGNOSTIC_FURNITURE_MAX_M = 1.65
 _DIAGNOSTIC_HEIGHT_BIN_M = 0.05
+_FULL_EVIDENCE_DERIVATION = "noesis_scene_prior_2_5d_full_evidence_v2"
 _GRID_ARRAYS = (
     "authored_walkable",
     "observed",
@@ -460,23 +468,86 @@ def _decode_float32_layer(
     encoded = layer.get("grid_b64")
     if not isinstance(encoded, str) or not encoded:
         raise ScenePriorError(f"floorplan layer {name} has no encoded grid")
-    expected_bytes = shape[0] * shape[1] * np.dtype(np.float32).itemsize
+    cell_count = shape[0] * shape[1]
+    encoded_payload = encoded
+    dtype = np.dtype(np.float32)
+    packed_bits = False
+    if encoded.startswith("bit:"):
+        try:
+            _, encoded_count, encoded_payload = encoded.split(":", 2)
+            packed_count = int(encoded_count)
+        except (TypeError, ValueError) as exc:
+            raise ScenePriorError(
+                f"floorplan layer {name} has an invalid packed-mask header"
+            ) from exc
+        if packed_count != cell_count:
+            raise ScenePriorError(
+                f"floorplan layer {name} packed-mask count does not match its shape"
+            )
+        packed_bits = True
+        expected_bytes = (cell_count + 7) // 8
+    else:
+        if encoded.startswith("f16:"):
+            encoded_payload = encoded.removeprefix("f16:")
+            dtype = np.dtype(np.float16)
+        elif encoded.startswith("u8:"):
+            encoded_payload = encoded.removeprefix("u8:")
+            dtype = np.dtype(np.uint8)
+        expected_bytes = cell_count * dtype.itemsize
     maximum_encoded_bytes = 4 * ((expected_bytes + 2) // 3)
-    if len(encoded) > maximum_encoded_bytes:
+    if len(encoded_payload) > maximum_encoded_bytes:
         raise ScenePriorError(f"floorplan layer {name} encoded grid exceeds its shape bound")
     try:
-        raw = base64.b64decode(encoded, validate=True)
+        raw = base64.b64decode(encoded_payload, validate=True)
     except Exception as exc:
         raise ScenePriorError(f"floorplan layer {name} is not valid base64") from exc
     if len(raw) != expected_bytes:
         raise ScenePriorError(f"floorplan layer {name} byte length does not match its shape")
-    return np.frombuffer(raw, dtype=np.float32).reshape(shape).copy()
+    if packed_bits:
+        return np.unpackbits(
+            np.frombuffer(raw, dtype=np.uint8),
+            count=cell_count,
+            bitorder="big",
+        ).astype(np.float32).reshape(shape)
+    return np.frombuffer(raw, dtype=dtype).astype(np.float32).reshape(shape)
 
 
 def _encoded_layer(values: np.ndarray, *, value_min: float, value_max: float) -> dict[str, Any]:
-    grid = np.asarray(values, dtype=np.float32)
+    # Scene-prior rasters are a visualization contract. Explicitly marked FP16
+    # preserves binary masks exactly and retains sub-cell precision for metric
+    # layers while keeping the complete response within the bounded transport.
+    grid = np.asarray(values, dtype=np.float16)
     return {
-        "grid_b64": base64.b64encode(grid.tobytes(order="C")).decode("ascii"),
+        "grid_b64": "f16:" + base64.b64encode(grid.tobytes(order="C")).decode("ascii"),
+        "grid_shape": [int(grid.shape[0]), int(grid.shape[1])],
+        "value_min": float(value_min),
+        "value_max": float(value_max),
+    }
+
+
+def _encoded_mask_layer(values: np.ndarray) -> dict[str, Any]:
+    mask = np.ascontiguousarray(np.asarray(values) > 0, dtype=np.uint8)
+    packed = np.packbits(mask.reshape(-1), bitorder="big")
+    return {
+        "grid_b64": (
+            f"bit:{mask.size}:"
+            + base64.b64encode(packed.tobytes(order="C")).decode("ascii")
+        ),
+        "grid_shape": [int(mask.shape[0]), int(mask.shape[1])],
+        "value_min": 0.0,
+        "value_max": 1.0,
+    }
+
+
+def _encoded_uint8_layer(
+    values: np.ndarray,
+    *,
+    value_min: float,
+    value_max: float,
+) -> dict[str, Any]:
+    grid = np.ascontiguousarray(values, dtype=np.uint8)
+    return {
+        "grid_b64": "u8:" + base64.b64encode(grid.tobytes(order="C")).decode("ascii"),
         "grid_shape": [int(grid.shape[0]), int(grid.shape[1])],
         "value_min": float(value_min),
         "value_max": float(value_max),
@@ -485,11 +556,15 @@ def _encoded_layer(values: np.ndarray, *, value_min: float, value_max: float) ->
 
 def _encoded_rgb_layer(rgb: np.ndarray, observed: np.ndarray) -> dict[str, Any]:
     colors = np.ascontiguousarray(rgb, dtype=np.uint8)
-    mask = np.ascontiguousarray(observed, dtype=np.float32)
+    mask = np.ascontiguousarray(np.asarray(observed) > 0, dtype=np.uint8)
+    packed_mask = np.packbits(mask.reshape(-1), bitorder="big")
     return {
         "rgb_b64": base64.b64encode(colors.tobytes()).decode("ascii"),
         "rgb_shape": [int(colors.shape[0]), int(colors.shape[1]), 3],
-        "observed_b64": base64.b64encode(mask.tobytes()).decode("ascii"),
+        "observed_b64": (
+            f"bit:{mask.size}:"
+            + base64.b64encode(packed_mask.tobytes()).decode("ascii")
+        ),
     }
 
 
@@ -545,27 +620,17 @@ def _sobel_gradient(values: np.ndarray, observed: np.ndarray) -> np.ndarray:
 def _camera_ground_basis(
     extrinsics_col_major: Sequence[float],
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    values = np.asarray(extrinsics_col_major, dtype=np.float64)
-    if values.size != 16 or not np.all(np.isfinite(values)):
-        raise ScenePriorError("camera extrinsics must contain 16 finite values")
-    world_to_camera = values.reshape((4, 4), order="F")
-    if not np.allclose(world_to_camera[3, :], [0.0, 0.0, 0.0, 1.0], atol=1e-8):
-        raise ScenePriorError("camera extrinsics are not affine")
-    rotation_wc = world_to_camera[:3, :3].T
-    camera_world = -rotation_wc @ world_to_camera[:3, 3]
-    forward = np.asarray([rotation_wc[0, 2], 0.0, rotation_wc[2, 2]], dtype=np.float64)
-    forward_norm = float(np.linalg.norm(forward))
-    if not math.isfinite(forward_norm) or forward_norm <= 1e-6:
-        raise ScenePriorError("camera forward axis has no stable ground projection")
-    forward /= forward_norm
-    right = np.cross(np.asarray([0.0, 1.0, 0.0]), forward)
-    right_norm = float(np.linalg.norm(right))
-    if not math.isfinite(right_norm) or right_norm <= 1e-6:
-        raise ScenePriorError("camera right axis has no stable ground projection")
-    right /= right_norm
-    if float(np.dot(right, rotation_wc[:, 0])) < 0.0:
-        right *= -1.0
-    return camera_world, right, forward
+    try:
+        frame = camera_ground_frame_from_extrinsics_col_major(
+            extrinsics_col_major
+        )
+    except CoordinateFrameError as exc:
+        raise ScenePriorError(str(exc)) from exc
+    return (
+        frame.camera_world_m,
+        frame.camera_right_world,
+        frame.camera_forward_world,
+    )
 
 
 def _preview_raster_geometry(revision: LoadedScenePrior) -> _DiagnosticRasterGeometry:
@@ -607,17 +672,18 @@ def _calibrated_raster_geometry(
         extrinsics_col_major
     )
     source_grid = revision.manifest.grid
-    authored_rows, authored_columns = np.nonzero(
-        np.asarray(revision.arrays["authored_walkable"]) > 0
-    )
-    if authored_rows.size == 0:
+    extent = np.asarray(revision.arrays["authored_walkable"]) > 0
+    if revision.manifest.derivation.algorithm == _FULL_EVIDENCE_DERIVATION:
+        extent |= np.asarray(revision.arrays["observed"]) > 0
+    extent_rows, extent_columns = np.nonzero(extent)
+    if extent_rows.size == 0:
         raise ScenePriorError("scene-prior authored room has no cells")
     source_resolution = float(source_grid.resolution_m)
     world_x = float(source_grid.bounds.min_x) + (
-        authored_columns.astype(np.float64) + 0.5
+        extent_columns.astype(np.float64) + 0.5
     ) * source_resolution
     world_z = float(source_grid.bounds.min_z) + (
-        authored_rows.astype(np.float64) + 0.5
+        extent_rows.astype(np.float64) + 0.5
     ) * source_resolution
     local_x = (
         (world_x - float(camera_world[0])) * float(right_world[0])
@@ -708,9 +774,13 @@ def _derive_preview_diagnostics(
     sampled = revision.sample(world_x, world_z)
     inside = np.asarray(sampled["inside_extent"], dtype=bool)
     authored = inside & (np.asarray(sampled["authored_walkable"]) > 0)
-    observed = authored & (np.asarray(sampled["observed"]) > 0)
-    floor_supported = authored & (np.asarray(sampled["floor_supported"]) > 0)
-    obstacle_mask = authored & (np.asarray(sampled["obstacle_mask"]) > 0)
+    full_evidence = revision.manifest.derivation.algorithm == _FULL_EVIDENCE_DERIVATION
+    evidence_extent = inside if full_evidence else authored
+    observed = evidence_extent & (np.asarray(sampled["observed"]) > 0)
+    floor_supported = evidence_extent & (
+        np.asarray(sampled["floor_supported"]) > 0
+    )
+    obstacle_mask = evidence_extent & (np.asarray(sampled["obstacle_mask"]) > 0)
     height_agl = np.asarray(sampled["height_agl_p95_m"], dtype=np.float32)
     height_agl = np.where(
         observed & np.isfinite(height_agl),
@@ -725,14 +795,21 @@ def _derive_preview_diagnostics(
 
     points = np.asarray(revision.points_world_m, dtype=np.float64)
     colors = np.asarray(revision.colors_rgb_u8, dtype=np.uint8)
-    delta = points - camera_world
-    point_local = np.stack(
-        [
-            (delta[:, 0] * right_world[0]) + (delta[:, 2] * right_world[1]),
-            points[:, 1] - float(revision.manifest.derivation.floor_y_m),
-            (delta[:, 0] * forward_world[0]) + (delta[:, 2] * forward_world[1]),
-        ],
-        axis=1,
+    point_local = transform_positions(
+        points,
+        CameraGroundFrame(
+            camera_world_m=camera_world,
+            camera_right_world=np.asarray(
+                [right_world[0], 0.0, right_world[1]],
+                dtype=np.float64,
+            ),
+            camera_forward_world=np.asarray(
+                [forward_world[0], 0.0, forward_world[1]],
+                dtype=np.float64,
+            ),
+        ).world_to_camera_local_display_matrix(
+            float(revision.manifest.derivation.floor_y_m)
+        ),
     )
     point_columns = np.floor(
         (point_local[:, 0] - float(geometry.min_x)) / resolution_x
@@ -785,8 +862,9 @@ def _derive_preview_diagnostics(
         else np.zeros((rows, columns), dtype=np.float32)
     ).astype(np.float32)
     distance = np.where(observed, np.hypot(x_grid, z_grid), np.nan).astype(np.float32)
+    walkable_extent = evidence_extent if full_evidence else authored
     walkable = (
-        authored
+        walkable_extent
         & (np.asarray(sampled["walkable_candidate"]) > 0)
         & ~obstacle_mask
     ).astype(np.float32)
@@ -897,12 +975,13 @@ def _derive_preview_diagnostics(
     wall_support = wall_support.reshape((rows, columns)).astype(np.float32)
     measured_perimeter = _binary_perimeter(observed).astype(np.float32)
     room_footprint = authored.astype(np.float32)
+    reconstruction_extent = (authored | observed).astype(np.float32)
     room_boundary = np.maximum(
         wall_support,
         _binary_perimeter(authored).astype(np.float32) * 0.35,
     ).astype(np.float32)
 
-    return {
+    diagnostics: dict[str, np.ndarray] = {
         "density": density,
         "height": height_agl.copy(),
         "height_agl": height_agl,
@@ -912,11 +991,16 @@ def _derive_preview_diagnostics(
         "obstacle_mask": obstacle_mask.astype(np.float32),
         "walkable": walkable,
         "observed": observed.astype(np.float32),
-        "unknown": (~observed).astype(np.float32),
+        "unknown": (
+            (reconstruction_extent.astype(bool) & ~observed)
+            if full_evidence
+            else ~observed
+        ).astype(np.float32),
         "inferred_walkable": (authored & ~observed & ~obstacle_mask).astype(np.float32),
         "structural_height": structural_height.reshape((rows, columns)),
         "surface_observed": surface_observed.reshape((rows, columns)).astype(np.float32),
         "room_footprint": room_footprint,
+        "reconstruction_extent": reconstruction_extent,
         "wall_support": wall_support,
         "room_boundary": room_boundary,
         "measured_perimeter": measured_perimeter,
@@ -926,6 +1010,7 @@ def _derive_preview_diagnostics(
         "floor_supported": floor_supported.astype(np.float32),
         "floor_height": np.where(floor_supported, 0.0, np.nan).astype(np.float32),
     }
+    return diagnostics
 
 
 def _scene_prior_diagnostic_payload(
@@ -933,7 +1018,7 @@ def _scene_prior_diagnostic_payload(
     diagnostics: Mapping[str, np.ndarray],
     geometry: _DiagnosticRasterGeometry,
 ) -> dict[str, Any]:
-    return {
+    payload: dict[str, Any] = {
         "scene_prior_diagnostic_density": _encoded_layer(
             diagnostics["density"], value_min=0.0, value_max=1.0
         ),
@@ -960,31 +1045,28 @@ def _scene_prior_diagnostic_payload(
             value_min=0.0,
             value_max=_finite_percentile(diagnostics["obstacle_height"], 99.0),
         ),
-        "scene_prior_diagnostic_obstacle_mask": _encoded_layer(
-            diagnostics["obstacle_mask"], value_min=0.0, value_max=1.0
+        "scene_prior_diagnostic_obstacle_mask": _encoded_mask_layer(
+            diagnostics["obstacle_mask"]
         ),
-        "scene_prior_diagnostic_walkable": _encoded_layer(
-            diagnostics["walkable"], value_min=0.0, value_max=1.0
-        ),
-        "scene_prior_diagnostic_observed": _encoded_layer(
-            diagnostics["observed"], value_min=0.0, value_max=1.0
-        ),
-        "scene_prior_diagnostic_unknown": _encoded_layer(
-            diagnostics["unknown"], value_min=0.0, value_max=1.0
-        ),
-        "scene_prior_diagnostic_inferred_walkable": _encoded_layer(
-            diagnostics["inferred_walkable"], value_min=0.0, value_max=1.0
+        "scene_prior_diagnostic_walkable": _encoded_mask_layer(diagnostics["walkable"]),
+        "scene_prior_diagnostic_observed": _encoded_mask_layer(diagnostics["observed"]),
+        "scene_prior_diagnostic_unknown": _encoded_mask_layer(diagnostics["unknown"]),
+        "scene_prior_diagnostic_inferred_walkable": _encoded_mask_layer(
+            diagnostics["inferred_walkable"]
         ),
         "scene_prior_diagnostic_structural_height": _encoded_layer(
             diagnostics["structural_height"],
             value_min=0.0,
             value_max=_DIAGNOSTIC_FURNITURE_MAX_M,
         ),
-        "scene_prior_diagnostic_surface_observed": _encoded_layer(
-            diagnostics["surface_observed"], value_min=0.0, value_max=1.0
+        "scene_prior_diagnostic_surface_observed": _encoded_mask_layer(
+            diagnostics["surface_observed"]
         ),
-        "scene_prior_diagnostic_room_footprint": _encoded_layer(
-            diagnostics["room_footprint"], value_min=0.0, value_max=1.0
+        "scene_prior_diagnostic_room_footprint": _encoded_mask_layer(
+            diagnostics["room_footprint"]
+        ),
+        "scene_prior_diagnostic_reconstruction_extent": _encoded_mask_layer(
+            diagnostics["reconstruction_extent"]
         ),
         "scene_prior_diagnostic_wall_support": _encoded_layer(
             diagnostics["wall_support"], value_min=0.0, value_max=1.0
@@ -992,8 +1074,8 @@ def _scene_prior_diagnostic_payload(
         "scene_prior_diagnostic_room_boundary": _encoded_layer(
             diagnostics["room_boundary"], value_min=0.0, value_max=1.0
         ),
-        "scene_prior_diagnostic_measured_perimeter": _encoded_layer(
-            diagnostics["measured_perimeter"], value_min=0.0, value_max=1.0
+        "scene_prior_diagnostic_measured_perimeter": _encoded_mask_layer(
+            diagnostics["measured_perimeter"]
         ),
         "scene_prior_diagnostic_surface_rgb": _encoded_rgb_layer(
             diagnostics["surface_rgb"], diagnostics["surface_rgb_observed"]
@@ -1001,8 +1083,8 @@ def _scene_prior_diagnostic_payload(
         "scene_prior_diagnostic_confidence": _encoded_layer(
             diagnostics["confidence"], value_min=0.0, value_max=1.0
         ),
-        "scene_prior_floor_supported": _encoded_layer(
-            diagnostics["floor_supported"], value_min=0.0, value_max=1.0
+        "scene_prior_floor_supported": _encoded_mask_layer(
+            diagnostics["floor_supported"]
         ),
         "scene_prior_floor_height": _encoded_layer(
             diagnostics["floor_height"], value_min=0.0, value_max=0.0
@@ -1027,12 +1109,11 @@ def _scene_prior_diagnostic_payload(
             "camera_forward_world_xz": [
                 float(value) for value in geometry.camera_forward_world_xz.tolist()
             ],
-            "raster_orientation": (
-                "row_zero_max_z_rows_toward_min_z_columns_min_x_to_max_x"
-            ),
+            "raster_orientation": CAMERA_LOCAL_RASTER_ORIENTATION,
             "point_count": int(revision.points_world_m.shape[0]),
         },
     }
+    return payload
 
 
 class ScenePriorSet:
@@ -1154,24 +1235,13 @@ class ScenePriorSet:
             extrinsics_col_major,
         )
         floor_y_m = float(revision.manifest.derivation.floor_y_m)
-        world_to_camera_local = np.asarray(
-            [
-                [
-                    float(right_world[0]),
-                    float(right_world[1]),
-                    float(right_world[2]),
-                    -float(np.dot(right_world, camera_world)),
-                ],
-                [0.0, 1.0, 0.0, -floor_y_m],
-                [
-                    float(forward_world[0]),
-                    float(forward_world[1]),
-                    float(forward_world[2]),
-                    -float(np.dot(forward_world, camera_world)),
-                ],
-                [0.0, 0.0, 0.0, 1.0],
-            ],
-            dtype=np.float64,
+        world_to_camera_local = CameraGroundFrame(
+            camera_world_m=camera_world,
+            camera_right_world=right_world,
+            camera_forward_world=forward_world,
+        ).world_to_camera_local_display_matrix(floor_y_m)
+        linear_determinant = float(
+            np.linalg.det(world_to_camera_local[:3, :3])
         )
         points_artifact = next(
             (
@@ -1197,6 +1267,9 @@ class ScenePriorSet:
             "source_model": revision.manifest.source.model,
             "source_coordinate_frame": "backend_world_m",
             "target_coordinate_frame": "camera_local_ground_m",
+            "transform_semantics": "presentation_only_coordinate_frame_conversion",
+            "backend_geometry_mutated": False,
+            "linear_determinant": linear_determinant,
             "orientation": {
                 "screen_right": "camera_right_positive_x",
                 "screen_up": "camera_forward_positive_z",
@@ -1352,11 +1425,7 @@ class ScenePriorSet:
                     value_min=0.0,
                     value_max=max(0.0, static_max),
                 ),
-                "scene_static_observed": _encoded_layer(
-                    static_observed,
-                    value_min=0.0,
-                    value_max=1.0,
-                ),
+                "scene_static_observed": _encoded_mask_layer(static_observed),
                 "scene_static_confidence": _encoded_layer(
                     static_confidence,
                     value_min=0.0,
@@ -1367,12 +1436,8 @@ class ScenePriorSet:
                     value_min=0.0,
                     value_max=max(0.0, static_max),
                 ),
-                "scene_composite_observed": _encoded_layer(
-                    static_observed,
-                    value_min=0.0,
-                    value_max=1.0,
-                ),
-                "scene_composite_source": _encoded_layer(
+                "scene_composite_observed": _encoded_mask_layer(static_observed),
+                "scene_composite_source": _encoded_uint8_layer(
                     static_source,
                     value_min=0.0,
                     value_max=2.0,
@@ -1398,9 +1463,7 @@ class ScenePriorSet:
                     "display_source": (
                         "pcf" if explicit_scene_prior_only else "static_fallback"
                     ),
-                    "raster_orientation": (
-                        "row_zero_max_z_rows_toward_min_z_columns_min_x_to_max_x"
-                    ),
+                    "raster_orientation": CAMERA_LOCAL_RASTER_ORIENTATION,
                     "floor_y_m": float(revision.manifest.derivation.floor_y_m),
                     "composition_policy": (
                         "pcf_only"
@@ -1533,11 +1596,7 @@ class ScenePriorSet:
             value_min=0.0,
             value_max=max(0.0, static_max),
         )
-        result["scene_static_observed"] = _encoded_layer(
-            static_observed,
-            value_min=0.0,
-            value_max=1.0,
-        )
+        result["scene_static_observed"] = _encoded_mask_layer(static_observed)
         result["scene_static_confidence"] = _encoded_layer(
             static_confidence,
             value_min=0.0,
@@ -1548,12 +1607,8 @@ class ScenePriorSet:
             value_min=0.0,
             value_max=max(0.0, composite_max),
         )
-        result["scene_composite_observed"] = _encoded_layer(
-            composite_valid.astype(np.float32),
-            value_min=0.0,
-            value_max=1.0,
-        )
-        result["scene_composite_source"] = _encoded_layer(
+        result["scene_composite_observed"] = _encoded_mask_layer(composite_valid)
+        result["scene_composite_source"] = _encoded_uint8_layer(
             composite_source,
             value_min=0.0,
             value_max=2.0,
@@ -1568,9 +1623,7 @@ class ScenePriorSet:
             "source_model": revision.manifest.source.model,
             "source_frame": "backend_world_m",
             "target_frame": "camera_local_ground_m",
-            "raster_orientation": (
-                "row_zero_max_z_rows_toward_min_z_columns_min_x_to_max_x"
-            ),
+            "raster_orientation": CAMERA_LOCAL_RASTER_ORIENTATION,
             "floor_y_m": float(floor_y_m),
             "composition_policy": "live_observed_wins_static_fills_live_unknown",
             "live_observed_cells": int(np.count_nonzero(live_valid)),

@@ -1357,6 +1357,7 @@ Returned from `get_floorplan` (`DepthStorageManager.generate_topdown_floorplan`)
   "scene_prior_diagnostic_height_agl": {"grid_b64": "<base64 float32>", "grid_shape": [<H>,<W>], "value_min": 0, "value_max": <float>},
   "scene_prior_diagnostic_observed": {"grid_b64": "<float32 0|1>", "grid_shape": [<H>,<W>]},
   "scene_prior_diagnostic_unknown": {"grid_b64": "<float32 0|1>", "grid_shape": [<H>,<W>]},
+  "scene_prior_diagnostic_reconstruction_extent": {"grid_b64": "<float32 0|1>", "grid_shape": [<H>,<W>]},
   "scene_prior_diagnostic_surface_rgb": {"rgb_b64": "<base64 uint8 RGB>", "rgb_shape": [<H>,<W>,3]},
   "scene_prior_diagnostic_meta": {"source": "<manifest source model>", "derivation": "prior_conditioned_fusion_points_and_grid", "prior_id": "<immutable prior id>"},
   "error": "<string optional>"
@@ -1372,9 +1373,11 @@ Returned from `get_floorplan` (`DepthStorageManager.generate_topdown_floorplan`)
   error; it is never replaced with a static-camera result.
 - The `scene_prior_diagnostic_*` family includes density, height, height AGL,
   distance, gradient, obstacle height/mask, walkable/observed/unknown masks,
-  inferred walkable, structural and surface evidence, room footprint and
-  boundaries, measured perimeter, RGB surface color, confidence, and floor
-  support. All grids share the response's calibrated
+  inferred walkable, structural and surface evidence, authored room footprint,
+  complete reconstruction extent, boundaries, measured perimeter, RGB surface
+  color, confidence, and floor support. The reconstruction extent frames every
+  PCF view; the authored footprint remains semantic room authority and does not
+  crop measured evidence. All grids share the response's calibrated
   `camera_local_ground_m` bounds and orientation.
   In `scene_prior_only` mode this family is authoritative, so the response
   omits the redundant `scene_static_*` and `scene_composite_*` raster copies.

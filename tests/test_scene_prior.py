@@ -11,13 +11,17 @@ from fastapi.testclient import TestClient
 from pydantic import ValidationError
 
 from noesis.scene_prior_builder import (
+    _authored_grid,
+    _camera_local_raster_to_preview_image,
     _camera_local_preview_arrays,
     _camera_preview_frame,
+    _derive_arrays,
     _deterministic_npz,
 )
 from noesis.pipelines.hooks import _AnalyticsTelemetryProcessor
 from noesis.server import scene_prior_api
 from noesis.virtual_twin.artifacts import write_points_glb
+from noesis_core.coordinate_frames import CAMERA_LOCAL_RASTER_ORIENTATION
 from noesis_core.contracts.base import ArtifactFingerprint
 from noesis_core.contracts.scene_prior import (
     ScenePriorArtifact,
@@ -33,7 +37,16 @@ from noesis_core.contracts.scene_prior import (
     ScenePriorSemanticBinding,
     ScenePriorSource,
 )
-from noesis_core.scene_prior import ScenePriorError, ScenePriorSet
+from noesis_core.scene_prior import (
+    LoadedScenePrior,
+    ScenePriorError,
+    ScenePriorSet,
+    _calibrated_raster_geometry,
+    _decode_float32_layer,
+    _derive_preview_diagnostics,
+    _encoded_mask_layer,
+    _encoded_uint8_layer,
+)
 
 
 def _json_bytes(value: object) -> bytes:
@@ -132,7 +145,7 @@ def _write_prior(root: Path) -> tuple[Path, dict[str, bytes]]:
         preview=ScenePriorPreview(
             coordinate_frame="camera_local_ground_m",
             units="meters",
-            orientation="row_increases_camera_forward_column_increases_camera_right",
+            orientation=CAMERA_LOCAL_RASTER_ORIENTATION,
             reference_camera_id="camera-a",
             camera_calibration=ArtifactFingerprint(
                 role="camera_calibration",
@@ -221,11 +234,37 @@ def _layer(values: np.ndarray) -> dict[str, object]:
     }
 
 
+def test_scene_prior_preview_reads_legacy_numeric_grid_orientation(
+    tmp_path: Path,
+) -> None:
+    catalog_path, _ = _write_prior(tmp_path)
+    revision = ScenePriorSet.load(catalog_path).revision_for_camera("camera-a")
+    assert revision is not None and revision.manifest.preview is not None
+    payload = revision.manifest.preview.model_dump(mode="json")
+    payload["orientation"] = (
+        "row_increases_camera_forward_column_increases_camera_right"
+    )
+
+    legacy = ScenePriorPreview.model_validate(payload)
+
+    assert legacy.orientation == payload["orientation"]
+
+
 def _decode(layer: dict[str, object]) -> np.ndarray:
     shape = tuple(layer["grid_shape"])
-    return np.frombuffer(
-        base64.b64decode(str(layer["grid_b64"])), dtype=np.float32
-    ).reshape(shape)
+    return _decode_float32_layer({"layer": layer}, "layer", expected_shape=shape)
+
+
+def test_compact_mask_and_uint8_layers_round_trip_without_geometry_loss() -> None:
+    mask = np.asarray([[0, 1, 1, 0, 1], [1, 0, 0, 1, 0]], dtype=np.float32)
+    encoded_mask = _encoded_mask_layer(mask)
+    assert str(encoded_mask["grid_b64"]).startswith(f"bit:{mask.size}:")
+    np.testing.assert_array_equal(_decode(encoded_mask), mask)
+
+    source = np.asarray([[0, 1, 2], [2, 1, 0]], dtype=np.float32)
+    encoded_source = _encoded_uint8_layer(source, value_min=0.0, value_max=2.0)
+    assert str(encoded_source["grid_b64"]).startswith("u8:")
+    np.testing.assert_array_equal(_decode(encoded_source), source)
 
 
 def test_scene_prior_load_evaluate_and_live_wins_composition(tmp_path: Path) -> None:
@@ -521,6 +560,146 @@ def test_scene_prior_preview_follows_reference_camera_right_and_forward() -> Non
         np.asarray([[0, 0, 1], [1, 0, 0]], dtype=bool),
     )
     assert bounds == ScenePriorBounds(min_x=-3, max_x=0, min_z=0, max_z=2)
+
+
+def test_scene_prior_preview_image_puts_forward_at_top_without_mirroring_x() -> None:
+    # Numeric preview rows increase with camera-forward +Z. PNG rows increase
+    # downward, so this is the one intentional row-address conversion.
+    numeric = np.asarray(
+        [
+            [[255, 0, 0], [0, 0, 255]],   # near: left red, right blue
+            [[0, 255, 0], [255, 255, 0]], # far: left green, right yellow
+        ],
+        dtype=np.uint8,
+    )
+
+    image = _camera_local_raster_to_preview_image(numeric)
+
+    np.testing.assert_array_equal(image[0, 0], [0, 255, 0])
+    np.testing.assert_array_equal(image[0, 1], [255, 255, 0])
+    np.testing.assert_array_equal(image[1, 0], [255, 0, 0])
+    np.testing.assert_array_equal(image[1, 1], [0, 0, 255])
+
+
+def test_full_evidence_derivation_retains_points_outside_authored_room() -> None:
+    triangle = np.asarray(
+        [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 0.0, 1.0]],
+        dtype=np.float64,
+    )
+    points = np.repeat(
+        np.asarray(
+            [[0.25, 0.0, 0.25], [2.25, 0.0, 0.25]],
+            dtype=np.float64,
+        ),
+        60,
+        axis=0,
+    )
+    grid, authored = _authored_grid(
+        [triangle],
+        1.0,
+        evidence_points=points,
+    )
+    derivation = ScenePriorDerivation(
+        algorithm="noesis_scene_prior_2_5d_full_evidence_v2",
+        floor_y_m=0,
+        floor_support_band_m=0.12,
+        obstacle_min_height_m=0.18,
+        obstacle_max_height_m=2.2,
+        obstacle_min_support=3,
+        max_source_height_m=3.2,
+    )
+
+    arrays, selected = _derive_arrays(
+        points,
+        grid=grid,
+        authored=authored,
+        derivation=derivation,
+    )
+
+    assert grid.bounds.max_x == 3.0
+    assert int(np.count_nonzero(selected)) == 120
+    assert arrays["authored_walkable"][0, 2] == 0
+    assert arrays["observed"][0, 2] == 1
+    assert arrays["floor_supported"][0, 2] == 1
+    assert arrays["walkable_candidate"][0, 2] == 1
+
+
+def test_full_evidence_diagnostics_frame_reconstruction_not_authored_box(
+    tmp_path: Path,
+) -> None:
+    catalog_path, _ = _write_prior(tmp_path)
+    base = ScenePriorSet.load(catalog_path).revision_for_camera("camera-a")
+    assert base is not None
+    shape = (2, 3)
+    arrays = {
+        "authored_walkable": np.asarray([[1, 1, 0], [1, 1, 0]], dtype=np.uint8),
+        "observed": np.ones(shape, dtype=np.uint8),
+        "evidence_confidence": np.full(shape, 0.8, dtype=np.float32),
+        "floor_supported": np.ones(shape, dtype=np.uint8),
+        "obstacle_mask": np.zeros(shape, dtype=np.uint8),
+        "walkable_candidate": np.ones(shape, dtype=np.uint8),
+        "floor_height_m": np.zeros(shape, dtype=np.float32),
+        "height_agl_p95_m": np.full(shape, 0.5, dtype=np.float32),
+        "boundary_signed_distance_m": np.asarray(
+            [[1.0, 1.0, -1.0], [1.0, 1.0, -1.0]], dtype=np.float32
+        ),
+        "obstacle_signed_clearance_m": np.ones(shape, dtype=np.float32),
+        "point_count": np.full(shape, 8, dtype=np.uint32),
+        "floor_support_count": np.full(shape, 3, dtype=np.uint32),
+        "obstacle_support_count": np.zeros(shape, dtype=np.uint32),
+    }
+    grid = ScenePriorGrid(
+        coordinate_frame="backend_world_m",
+        units="meters",
+        orientation="row_increases_positive_z_column_increases_positive_x",
+        bounds=ScenePriorBounds(min_x=0, max_x=3, min_z=0, max_z=2),
+        resolution_m=1,
+        rows=2,
+        columns=3,
+    )
+    preview = base.manifest.preview.model_copy(
+        update={
+            "bounds": ScenePriorBounds(min_x=0, max_x=3, min_z=0, max_z=2),
+            "columns": 3,
+        }
+    )
+    derivation = base.manifest.derivation.model_copy(
+        update={"algorithm": "noesis_scene_prior_2_5d_full_evidence_v2"}
+    )
+    points = np.asarray(
+        [
+            (column + 0.5, height, row + 0.5)
+            for row in range(2)
+            for column in range(3)
+            for height in (0.0, 0.5, 1.0)
+        ],
+        dtype=np.float32,
+    )
+    revision = LoadedScenePrior(
+        manifest=base.manifest.model_copy(
+            update={"grid": grid, "preview": preview, "derivation": derivation}
+        ),
+        root=base.root,
+        arrays=arrays,
+        points_world_m=points,
+        colors_rgb_u8=np.full((points.shape[0], 3), 128, dtype=np.uint8),
+    )
+
+    geometry = _calibrated_raster_geometry(
+        revision,
+        np.eye(4).flatten(order="F").tolist(),
+    )
+    diagnostics = _derive_preview_diagnostics(revision, geometry)
+
+    assert geometry.bounds_payload() == {
+        "min_x": 0.0,
+        "max_x": 3.0,
+        "min_z": 0.0,
+        "max_z": 2.0,
+    }
+    assert int(np.count_nonzero(diagnostics["room_footprint"])) == 4
+    assert int(np.count_nonzero(diagnostics["reconstruction_extent"])) == 6
+    assert int(np.count_nonzero(diagnostics["observed"])) == 6
 
 
 def test_scene_prior_preview_frame_composes_floor_corrected_camera_pose() -> None:

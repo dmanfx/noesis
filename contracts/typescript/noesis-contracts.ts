@@ -617,7 +617,7 @@ export type ScenePriorCatalogEntry = {
 };
 
 export type ScenePriorDerivation = {
-  readonly algorithm: "noesis_scene_prior_2_5d_v1";
+  readonly algorithm: "noesis_scene_prior_2_5d_v1" | "noesis_scene_prior_2_5d_full_evidence_v2";
   readonly floor_y_m: number;
   readonly floor_support_band_m: number;
   readonly obstacle_min_height_m: number;
@@ -639,7 +639,7 @@ export type ScenePriorGrid = {
 export type ScenePriorPreview = {
   readonly coordinate_frame: "camera_local_ground_m";
   readonly units: "meters";
-  readonly orientation: "row_increases_camera_forward_column_increases_camera_right";
+  readonly orientation: "row_zero_max_z_rows_toward_min_z_columns_min_x_to_max_x" | "row_increases_camera_forward_column_increases_camera_right";
   readonly reference_camera_id: string;
   readonly camera_calibration: ArtifactFingerprint;
   readonly target_revision_metadata: ArtifactFingerprint;
@@ -693,7 +693,7 @@ export type ScenePriorSemanticBinding = {
 };
 
 export type ScenePriorSource = {
-  readonly source_type: "mapanything_multiview_room_walk";
+  readonly source_type: "mapanything_multiview_room_walk" | "conditioned_multimodel_room_walk";
   readonly bundle_id: string;
   readonly bundle_schema: string;
   readonly bundle_manifest_sha256: string;

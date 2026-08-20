@@ -3,8 +3,14 @@
 Scene Prior v1 turns a verified, world-aligned room walk into immutable spatial
 evidence that Noesis can compare with live tracking and floorplan observations.
 It is generic across sites, physical spaces, cameras, and scan revisions. The
-current deployed catalog covers the Living Room and Family Room, but no
-contract or builder path is room-specific.
+current deployed catalog covers the Living Room, Family Room, and Kitchen, but
+no contract or builder path is room-specific.
+
+Prior-Conditioned Fusion (PCF) is the selected offline reconstruction method;
+a Scene Prior is the immutable runtime artifact derived from a sealed PCF
+room-scan bundle. [`PCF_Workflow.md`](PCF_Workflow.md) is the canonical
+end-to-end runbook. This document defines the resulting runtime contract and
+derivation.
 
 ## Authority and ontology
 
@@ -40,8 +46,15 @@ product contracts under `contracts/schema/` and `contracts/typescript/`.
 
 ## Derived evidence
 
-The builder clips aligned scan points to the selected authored room surfaces and
-derives a deterministic 2.5D grid with these layers:
+The current `noesis_scene_prior_2_5d_full_evidence_v2` derivation retains every
+vertically admitted point in the aligned room-walk reconstruction. Its grid
+extent is the union of that measured evidence and the selected authored room
+surfaces. The older `noesis_scene_prior_2_5d_v1` derivation remains readable for
+immutable-revision compatibility, but clipped points to the authored room
+surface and must not be used for new priors.
+
+The full-evidence derivation keeps measured reconstruction extent and semantic
+room membership separate and produces these deterministic 2.5D layers:
 
 - `authored_walkable`: authored semantic floor support.
 - `observed`: at least one admitted scan point in the cell.
@@ -49,8 +62,9 @@ derives a deterministic 2.5D grid with these layers:
 - `floor_supported`: scan evidence near the declared floor.
 - `obstacle_mask`: a scan-derived static obstacle candidate, not a semantic
   object label.
-- `walkable_candidate`: advisory intersection of authored floor, observation,
-  floor support, and no obstacle candidate.
+- `walkable_candidate`: advisory intersection of observation, floor support,
+  and no obstacle candidate. It can extend outside the authored room and does
+  not grant semantic room membership.
 - `floor_height_m` and `height_agl_p95_m`: robust floor and surface height.
 - `boundary_signed_distance_m` and `obstacle_signed_clearance_m`: metric
   diagnostic distance fields.
@@ -59,8 +73,13 @@ derives a deterministic 2.5D grid with these layers:
 The immutable revision contains `manifest.json`, `grid.npz`, `metrics.json`, a
 camera-facing top-down `preview.png`, and a bounded review `points.glb`. The
 manifest records the exact camera-calibration and target-revision fingerprints,
-camera position, ground-plane axes, and preview bounds. Rebuilding unchanged
-inputs and thresholds produces the same prior ID and bytes.
+camera position, ground-plane axes, preview bounds, and the preview's actual
+row-zero-max-camera-forward raster addressing. Already-deployed immutable
+revisions carrying the legacy `row_increases_camera_forward...` label remain
+readable; that label described the numeric grid before PNG row conversion and
+does not authorize a consumer-side flip. Rebuilding unchanged inputs and
+thresholds produces the same prior ID and bytes within the same builder
+contract.
 
 ## Building any room
 
@@ -71,6 +90,28 @@ including the fixed-camera calibration and target reconstruction metadata,
 against both bundle inventories. It refuses failed or mismatched alignment,
 camera, authored-scene, room-map, or coordinate evidence.
 
+For a selected `prior_conditioned_consensus_da3_carrier` candidate, create that
+bundle with the gate-enforcing handoff tool before invoking the Scene Prior
+builder:
+
+```bash
+python3 \
+  tools/mapanything_phone_scan/build_conditioned_scene_prior_bundle.py \
+  --scan-dir data/mapanything_phone_scans/<scan-id> \
+  --suite-root <suite-root> \
+  --evaluation-dir <suite-root>/evaluation_static_world \
+  --target-revision data/virtual_twin/revisions/<room-revision> \
+  --calibration config/camera_calibration.json \
+  --camera-id <camera-id> \
+  --output-dir <durable-room-scan-bundle>
+```
+
+The tool verifies the passed source alignment, requested camera and revision,
+metric transform, selected evaluation candidate, static-visible overlap and
+vertical support, then seals a complete checksum inventory. It refuses to
+overwrite an existing bundle. See [`PCF_Workflow.md`](PCF_Workflow.md) for the
+required inputs, exact thresholds, review checklist, and activation boundary.
+
 ```bash
 python3 scripts/build_scene_prior.py \
   --source-bundle <verified-room-scan-bundle> \
@@ -80,13 +121,19 @@ python3 scripts/build_scene_prior.py \
   --authored-scene data/virtual_twin/releases/<release-id>/<scene>.obj \
   --room-group-map config/authored_scene_room_groups.json \
   --world-to-scene config/ply_alignment.json \
-  --bind-camera <camera-id>
+  --bind-camera <camera-id> \
+  --grid-resolution-m 0.025
 ```
+
+The explicit 2.5 cm value matches the current admitted PCF room priors. The
+builder's generic default remains 5 cm and must not be mistaken for the current
+deployment choice.
 
 Repeat `--semantic-room` only when one physical prior intentionally spans more
 than one authored room. Repeat `--bind-camera` for multiple sensors occupying
-the same space. Do not broaden the semantic selection merely because scan
-points leak through a doorway; the authored map owns that decision.
+the same space. Do not broaden the semantic selection merely because the scan
+reconstructs through a doorway: the complete measured geometry is retained,
+while the authored map independently owns room membership.
 
 The output root defaults to `data/scene_priors/`:
 
@@ -128,6 +175,16 @@ For a bound camera:
   presentation lane. It bypasses static capture and caches, and derives its
   full diagnostic raster family and 3D inputs directly from the immutable,
   camera-bound Scene Prior. It fails explicitly when no enabled prior is bound.
+- Every PCF diagnostic uses the full measured reconstruction as its raster and
+  viewport extent. `scene_prior_diagnostic_reconstruction_extent` carries that
+  shared display mask. `scene_prior_diagnostic_room_footprint` remains the
+  authored semantic overlay and is never a reconstruction crop boundary.
+- PCF presentation grids use an explicit `f16:` prefix on `grid_b64` (and on
+  the RGB surface layer's `observed_b64`) followed by base64-encoded row-major
+  IEEE 754 binary16 values. Consumers continue to accept the legacy unprefixed
+  float32 form. Binary masks remain exact, metric display precision remains
+  finer than the 2.5 cm cells, and the complete diagnostics cross the bounded
+  WebSocket transport without omitting any layer or reconstruction cell.
 - The Depth drawer keeps its four established 3D representations: Obstacles,
   Heightfield, Point cloud, and Visible floor. It does not add source-specific
   duplicate modes. PCF is the canonical and sole reconstruction source for
@@ -144,34 +201,47 @@ reviewed contracts and evidence before promotion beyond shadow diagnostics.
 
 ## Current deployed revisions
 
-The deployed `tanglewood-manor` catalog binds two conditioned-fusion revisions
+The deployed `tanglewood-manor` catalog binds three conditioned-fusion revisions
 in `shadow` mode:
 
-- Living Room: `sceneprior_living-room_20260802T202254Z_a3a77e7dcada`,
+- Living Room: `sceneprior_living-room_20260802T202254Z_737f02e4f303`,
   bound to camera and space `living-room`. At 2.5 cm resolution it contains
-  150,901 source points, 128,401 authored-room selections, 62,252 authored
-  cells, 39,066 observed cells (62.75%), 22,734 floor-supported cells (36.52%),
-  and 9,350 obstacle cells.
-- Family Room: `sceneprior_family-room_20260811T015847Z_b2e023e59271`,
+  150,901 source points, 148,768 vertically admitted full-reconstruction
+  selections, 62,252 authored cells, 39,065 authored observed cells (62.75%),
+  and 22,733 authored floor-supported cells (36.52%). Across the complete
+  reconstruction it retains 45,516 observed cells, 26,189 floor-supported
+  cells, and 11,171 obstacle-candidate cells.
+- Family Room: `sceneprior_family-room_20260811T015847Z_ffdc144a8f59`,
   bound to camera and space `family-room`. At 2.5 cm resolution it contains
-  119,554 source points, 90,521 authored-room selections, 49,762 authored
-  cells, 24,960 observed cells (50.16%), 11,920 floor-supported cells (23.95%),
-  and 8,588 obstacle cells.
+  119,554 source points, 118,819 vertically admitted full-reconstruction
+  selections, 49,762 authored cells, 24,960 authored observed cells (50.16%),
+  and 11,920 authored floor-supported cells (23.95%). Across the complete
+  reconstruction it retains 32,502 observed cells, 15,789 floor-supported
+  cells, and 11,014 obstacle-candidate cells.
+- Kitchen: `sceneprior_kitchen_20260814T230412Z_cb6d1e0f8483`, bound to camera
+  and space `kitchen`. At 2.5 cm resolution it contains 168,795 source points,
+  167,338 vertically admitted full-reconstruction selections, 72,850 authored
+  cells, 36,107 authored observed cells (49.56%), and 26,353 authored
+  floor-supported cells (36.17%). Across the complete reconstruction it
+  retains 57,561 observed cells, 38,749 floor-supported cells, and 12,286
+  obstacle-candidate cells.
 
-Both revisions use the prior-conditioned MapAnything + DA3 consensus with the
-DA3 trajectory as pose carrier. Phone-walk inputs remain phone-only; the
+All three revisions use the prior-conditioned MapAnything + DA3 consensus with
+the DA3 trajectory as pose carrier. Phone-walk inputs remain phone-only; the
 calibrated static reconstruction is the alignment authority and independent
-validation target. For the Family Room, the imported target cloud had a
-verified 180-degree local-X/Z convention mismatch. The alignment process
-rotated only its working target-cloud copy about the calibrated camera center
-and world-up axis, preserved the global camera pose, and recorded the action in
-the passed alignment report.
+validation target. The immutable Family Room lineage resolved an earlier
+local-X/Z target-frame mismatch before admission. Current alignment treats the
+target cloud and calibrated camera as authoritative, validates forward
+visibility, and refuses a mismatch instead of rotating either one. No
+room-specific correction is applied during Scene Prior serialization or
+presentation.
 
 The Living Room preview uses camera-right `(-0.973939, -0.226811)` and
 camera-forward `(-0.226811, 0.973939)` in backend-world X/Z. The Family Room
 preview uses camera-right `(0.929727, 0.368249)` and camera-forward
-`(0.368249, -0.929727)`. These values describe review orientation, not
-production tracking acceptance.
+`(0.368249, -0.929727)`. The Kitchen preview uses camera-right
+`(-0.994522, 0.104528)` and camera-forward `(0.104528, 0.994522)`. These values
+describe review orientation, not production tracking acceptance.
 
 ## Focused validation
 

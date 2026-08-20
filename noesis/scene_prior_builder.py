@@ -20,6 +20,11 @@ import numpy as np
 
 from noesis.validation.authored_scene import AuthoredSceneGeometry, load_similarity
 from noesis.virtual_twin.artifacts import write_points_glb
+from noesis_core.coordinate_frames import (
+    CAMERA_LOCAL_RASTER_ORIENTATION,
+    CoordinateFrameError,
+    camera_ground_frame_from_camera_to_world,
+)
 from noesis_core.contracts.base import ArtifactFingerprint
 from noesis_core.contracts.scene_prior import (
     ScenePriorArtifact,
@@ -542,18 +547,13 @@ def _camera_preview_frame(inputs: Mapping[str, Any]) -> _CameraPreviewFrame:
         camera_to_world = world_correction @ np.linalg.inv(camera_from_backend)
     except np.linalg.LinAlgError as exc:
         raise ScenePriorBuildError("reference camera transform is singular") from exc
-    forward = np.asarray(camera_to_world[[0, 2], 2], dtype=np.float64)
-    right = np.asarray(camera_to_world[[0, 2], 0], dtype=np.float64)
-    forward_norm = float(np.linalg.norm(forward))
-    if not math.isfinite(forward_norm) or forward_norm <= 1e-9:
-        raise ScenePriorBuildError("reference camera has no ground-plane forward axis")
-    forward /= forward_norm
-    right -= float(np.dot(right, forward)) * forward
-    right_norm = float(np.linalg.norm(right))
-    if not math.isfinite(right_norm) or right_norm <= 1e-9:
-        raise ScenePriorBuildError("reference camera has no ground-plane right axis")
-    right /= right_norm
-    position = camera_to_world[:3, 3]
+    try:
+        camera_frame = camera_ground_frame_from_camera_to_world(camera_to_world)
+    except CoordinateFrameError as exc:
+        raise ScenePriorBuildError(str(exc)) from exc
+    forward = camera_frame.camera_forward_world[[0, 2]]
+    right = camera_frame.camera_right_world[[0, 2]]
+    position = camera_frame.camera_world_m
     camera_id = str(inputs["reference_camera_id"])
     return _CameraPreviewFrame(
         camera_id=camera_id,
@@ -664,12 +664,29 @@ def _points_in_triangle_xz(
 def _authored_grid(
     triangles: Sequence[np.ndarray],
     resolution_m: float,
+    *,
+    evidence_points: np.ndarray | None = None,
 ) -> tuple[ScenePriorGrid, np.ndarray]:
-    vertices = np.concatenate(triangles, axis=0)
+    authored_vertices = np.concatenate(triangles, axis=0)
+    extent_vertices = authored_vertices
+    if evidence_points is not None:
+        evidence = np.asarray(evidence_points, dtype=np.float64)
+        if evidence.ndim != 2 or evidence.shape[1] != 3:
+            raise ScenePriorBuildError("scene-prior evidence points must be Nx3")
+        if evidence.shape[0] == 0 or not np.all(np.isfinite(evidence)):
+            raise ScenePriorBuildError(
+                "scene-prior evidence extent requires finite source points"
+            )
+        extent_vertices = np.concatenate((authored_vertices, evidence), axis=0)
+    vertices = extent_vertices
     min_x = math.floor(float(np.min(vertices[:, 0])) / resolution_m) * resolution_m
-    max_x = math.ceil(float(np.max(vertices[:, 0])) / resolution_m) * resolution_m
+    max_x = (
+        math.floor(float(np.max(vertices[:, 0])) / resolution_m) + 1
+    ) * resolution_m
     min_z = math.floor(float(np.min(vertices[:, 2])) / resolution_m) * resolution_m
-    max_z = math.ceil(float(np.max(vertices[:, 2])) / resolution_m) * resolution_m
+    max_z = (
+        math.floor(float(np.max(vertices[:, 2])) / resolution_m) + 1
+    ) * resolution_m
     columns = int(round((max_x - min_x) / resolution_m))
     rows = int(round((max_z - min_z) / resolution_m))
     if columns < 1 or rows < 1 or columns * rows > 16 * 1024 * 1024:
@@ -764,10 +781,8 @@ def _derive_arrays(
     )
     safe_rows = np.clip(point_rows, 0, rows - 1)
     safe_columns = np.clip(point_columns, 0, columns - 1)
-    selected = (
-        in_grid
-        & authored[safe_rows, safe_columns]
-        & (
+    vertically_admitted = (
+        (
             points[:, 1]
             >= float(derivation.floor_y_m) - float(derivation.floor_support_band_m)
         )
@@ -776,12 +791,18 @@ def _derive_arrays(
             <= float(derivation.floor_y_m) + float(derivation.max_source_height_m)
         )
     )
+    full_evidence = (
+        derivation.algorithm == "noesis_scene_prior_2_5d_full_evidence_v2"
+    )
+    selected = in_grid & vertically_admitted
+    if not full_evidence:
+        selected &= authored[safe_rows, safe_columns]
     selected_points = points[selected]
     selected_rows = point_rows[selected]
     selected_columns = point_columns[selected]
     if selected_points.shape[0] < 100:
         raise ScenePriorBuildError(
-            "too few aligned points intersect the selected authored space"
+            "too few aligned points remain in the selected scene-prior extent"
         )
     linear = selected_rows * columns + selected_columns
     cell_count = rows * columns
@@ -822,15 +843,25 @@ def _derive_arrays(
         percentile=50.0,
         default=float(derivation.floor_y_m),
     ).reshape((rows, columns))
-    observed = authored & (point_count > 0)
-    floor_supported = authored & (floor_count > 0)
-    obstacle = authored & (obstacle_count >= int(derivation.obstacle_min_support))
-    walkable_candidate = authored & observed & floor_supported & ~obstacle
+    if full_evidence:
+        observed = point_count > 0
+        floor_supported = floor_count > 0
+        obstacle = obstacle_count >= int(derivation.obstacle_min_support)
+        walkable_candidate = observed & floor_supported & ~obstacle
+    else:
+        observed = authored & (point_count > 0)
+        floor_supported = authored & (floor_count > 0)
+        obstacle = authored & (
+            obstacle_count >= int(derivation.obstacle_min_support)
+        )
+        walkable_candidate = authored & observed & floor_supported & ~obstacle
     evidence_confidence = np.zeros((rows, columns), dtype=np.float32)
     density_confidence = 1.0 - np.exp(-point_count.astype(np.float32) / 8.0)
     floor_confidence = 1.0 - np.exp(-floor_count.astype(np.float32) / 3.0)
-    evidence_confidence[authored] = (
-        0.7 * density_confidence[authored] + 0.3 * floor_confidence[authored]
+    confidence_extent = observed if full_evidence else authored
+    evidence_confidence[confidence_extent] = (
+        0.7 * density_confidence[confidence_extent]
+        + 0.3 * floor_confidence[confidence_extent]
     )
     try:
         from scipy.ndimage import distance_transform_edt
@@ -976,6 +1007,12 @@ def _camera_local_preview_arrays(
     )
 
 
+def _camera_local_raster_to_preview_image(values: np.ndarray) -> np.ndarray:
+    """Convert +Z-increasing numeric rows to row-zero-far image addressing."""
+
+    return np.flip(np.asarray(values), axis=0).copy()
+
+
 def _preview_png(arrays: Mapping[str, np.ndarray]) -> bytes:
     try:
         from PIL import Image
@@ -989,10 +1026,13 @@ def _preview_png(arrays: Mapping[str, np.ndarray]) -> bytes:
     obstacle = np.asarray(arrays["obstacle_mask"], dtype=bool)
     preview = np.full((*authored.shape, 3), [20, 24, 30], dtype=np.uint8)
     preview[authored] = [72, 76, 84]
-    preview[authored & observed] = [62, 118, 151]
-    preview[authored & floor_supported] = [70, 160, 118]
+    preview[observed] = [62, 118, 151]
+    preview[floor_supported] = [70, 160, 118]
     preview[obstacle] = [222, 103, 72]
-    image = Image.fromarray(np.flipud(preview), mode="RGB")
+    image = Image.fromarray(
+        _camera_local_raster_to_preview_image(preview),
+        mode="RGB",
+    )
     scale = min(
         8,
         max(
@@ -1190,7 +1230,6 @@ def build_scene_prior(config: ScenePriorBuildConfig) -> ScenePriorBuildResult:
     triangles = _selected_authored_triangles(
         geometry, authored_groups, similarity.matrix
     )
-    grid, authored = _authored_grid(triangles, float(cfg.grid_resolution_m))
     world_to_scene_payload = load_strict_json(
         world_to_scene_file.data,
         label="world-to-scene alignment",
@@ -1208,7 +1247,7 @@ def build_scene_prior(config: ScenePriorBuildConfig) -> ScenePriorBuildResult:
     if not math.isfinite(floor_y_m):
         raise ScenePriorBuildError("world-to-scene floor_y must be finite")
     derivation = ScenePriorDerivation(
-        algorithm="noesis_scene_prior_2_5d_v1",
+        algorithm="noesis_scene_prior_2_5d_full_evidence_v2",
         floor_y_m=floor_y_m,
         floor_support_band_m=float(cfg.floor_support_band_m),
         obstacle_min_height_m=float(cfg.obstacle_min_height_m),
@@ -1217,6 +1256,21 @@ def build_scene_prior(config: ScenePriorBuildConfig) -> ScenePriorBuildResult:
         max_source_height_m=float(cfg.max_source_height_m),
     )
     points, colors = _load_points_glb(inputs["aligned_bytes"])
+    extent_points = points[
+        (
+            points[:, 1]
+            >= float(derivation.floor_y_m) - float(derivation.floor_support_band_m)
+        )
+        & (
+            points[:, 1]
+            <= float(derivation.floor_y_m) + float(derivation.max_source_height_m)
+        )
+    ]
+    grid, authored = _authored_grid(
+        triangles,
+        float(cfg.grid_resolution_m),
+        evidence_points=extent_points,
+    )
     arrays, selected = _derive_arrays(
         points,
         grid=grid,
@@ -1226,23 +1280,38 @@ def build_scene_prior(config: ScenePriorBuildConfig) -> ScenePriorBuildResult:
     selected_points = points[selected]
     selected_colors = colors[selected]
     authored_count = int(np.count_nonzero(arrays["authored_walkable"]))
-    observed_count = int(np.count_nonzero(arrays["observed"]))
-    floor_count = int(np.count_nonzero(arrays["floor_supported"]))
-    obstacle_count = int(np.count_nonzero(arrays["obstacle_mask"]))
+    authored_observed_count = int(
+        np.count_nonzero(
+            np.asarray(arrays["authored_walkable"], dtype=bool)
+            & np.asarray(arrays["observed"], dtype=bool)
+        )
+    )
+    authored_floor_count = int(
+        np.count_nonzero(
+            np.asarray(arrays["authored_walkable"], dtype=bool)
+            & np.asarray(arrays["floor_supported"], dtype=bool)
+        )
+    )
+    authored_obstacle_count = int(
+        np.count_nonzero(
+            np.asarray(arrays["authored_walkable"], dtype=bool)
+            & np.asarray(arrays["obstacle_mask"], dtype=bool)
+        )
+    )
     source_quality = inputs["reference"]["quality"]
     alignment_status = str(inputs["alignment"].get("status") or "unknown")
     quality = ScenePriorQuality(
         passed=bool(source_quality.get("passed"))
         and alignment_status == "passed"
-        and observed_count > 0,
+        and authored_observed_count > 0,
         source_point_count=int(points.shape[0]),
         selected_point_count=int(selected_points.shape[0]),
         authored_cell_count=authored_count,
-        observed_cell_count=observed_count,
-        floor_supported_cell_count=floor_count,
-        obstacle_cell_count=obstacle_count,
-        authored_observed_fraction=observed_count / authored_count,
-        authored_floor_supported_fraction=floor_count / authored_count,
+        observed_cell_count=authored_observed_count,
+        floor_supported_cell_count=authored_floor_count,
+        obstacle_cell_count=authored_obstacle_count,
+        authored_observed_fraction=authored_observed_count / authored_count,
+        authored_floor_supported_fraction=authored_floor_count / authored_count,
         alignment_status=alignment_status,
     )
     if not quality.passed:
@@ -1309,7 +1378,7 @@ def build_scene_prior(config: ScenePriorBuildConfig) -> ScenePriorBuildResult:
     preview = ScenePriorPreview(
         coordinate_frame="camera_local_ground_m",
         units="meters",
-        orientation="row_increases_camera_forward_column_increases_camera_right",
+        orientation=CAMERA_LOCAL_RASTER_ORIENTATION,
         reference_camera_id=preview_frame.camera_id,
         camera_calibration=preview_frame.camera_calibration,
         target_revision_metadata=preview_frame.target_revision_metadata,
@@ -1359,7 +1428,7 @@ def build_scene_prior(config: ScenePriorBuildConfig) -> ScenePriorBuildResult:
             for name, value in sorted(arrays.items())
         },
         "interpretation": {
-            "walkable_candidate": "advisory intersection of authored floor, scan observation, floor support, and no static obstacle candidate",
+            "walkable_candidate": "advisory intersection of scan observation, floor support, and no static obstacle candidate; authored_walkable remains the separate semantic room authority",
             "obstacle_mask": "scan-derived candidate only; never semantic authority",
             "floorplan_composition": "live observed cells win; static evidence only fills live unknown cells",
         },

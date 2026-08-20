@@ -34,6 +34,7 @@ let renamingScanId = null;
 let suppressScanClicksUntil = 0;
 let alignmentTargets = [];
 let alignmentReleaseId = null;
+let pcfPausesAppliance = false;
 
 const statusLabels = {
   uploading: "Uploading",
@@ -47,6 +48,17 @@ const statusLabels = {
   da3_running: "DA3 running",
   da3_failed: "DA3 failed",
   complete: "Complete",
+};
+
+const supplementStatusLabels = {
+  uploading: "Uploading video",
+  processing_frames: "Preparing new views",
+  ready: "Ready to integrate",
+  frame_failed: "Frame preparation failed",
+  queued: "Integration queued",
+  running: "Registering and merging",
+  integration_failed: "Not merged",
+  complete: "Merged revision saved",
 };
 
 function escapeHtml(value) {
@@ -297,16 +309,25 @@ function wireScanCard(button) {
 async function refreshHealth() {
   try {
     const health = await jsonFetch("/api/health");
-    healthPill.textContent = `${health.device} · ${health.max_frames} views max`;
+    healthPill.textContent = `${health.device} · adaptive views · ${health.max_selected_frames} emergency max`;
     healthPill.className = "health-pill online";
     const nextTargets = Array.isArray(health.alignment_targets)
       ? health.alignment_targets.filter((target) => target?.camera_id && target?.revision_id)
       : [];
     const nextReleaseId = health.alignment_release_id || null;
-    const alignmentConfigChanged = JSON.stringify([alignmentTargets, alignmentReleaseId])
-      !== JSON.stringify([nextTargets, nextReleaseId]);
+    const nextPcfPausesAppliance = health.pcf_pauses_appliance === true;
+    const alignmentConfigChanged = JSON.stringify([
+      alignmentTargets,
+      alignmentReleaseId,
+      pcfPausesAppliance,
+    ]) !== JSON.stringify([
+      nextTargets,
+      nextReleaseId,
+      nextPcfPausesAppliance,
+    ]);
     alignmentTargets = nextTargets;
     alignmentReleaseId = nextReleaseId;
+    pcfPausesAppliance = nextPcfPausesAppliance;
     if (alignmentConfigChanged) {
       lastDetailFingerprint = "";
       renderSelected();
@@ -356,6 +377,7 @@ function statusPanel(scan) {
 function preparedSection(scan) {
   const prepared = scan.prepared;
   if (!prepared) return "";
+  const selection = prepared.selection || {};
   const warnings = prepared.quality_warning_counts || {};
   const warningHtml = Object.entries(warnings)
     .filter(([, count]) => Number(count) > 0)
@@ -365,22 +387,23 @@ function preparedSection(scan) {
     const flagged = frame.quality?.warnings?.length ? "flagged" : "";
     return `<a class="prepared-thumb ${flagged}" href="${frame.frame_url}" target="_blank" rel="noopener">
       <img src="${frame.thumbnail_url}" alt="Prepared view ${Number(frame.index) + 1}" loading="lazy" />
-      <span>#${Number(frame.index) + 1} · ${Number(frame.timestamp_s).toFixed(1)}s</span>
+      <span>#${Number(frame.index) + 1} · ${Number(frame.timestamp_s).toFixed(1)}s${frame.selection_reason ? ` · ${escapeHtml(frame.selection_reason.replaceAll("_", " "))}` : ""}</span>
     </a>`;
   }).join("");
   return `
     <div class="stat-grid">
       <div class="stat"><b>${Number(prepared.frame_count)}</b><span>Prepared views</span></div>
-      <div class="stat"><b>${Number(prepared.effective_fps).toFixed(2)}</b><span>Views / second</span></div>
+      <div class="stat"><b>${Number(prepared.candidate_count || prepared.frame_count)}</b><span>Analyzed candidates</span></div>
       <div class="stat"><b>${formatDuration(prepared.probe?.duration_s)}</b><span>Video duration</span></div>
-      <div class="stat"><b>${escapeHtml(prepared.probe?.codec || "—")}</b><span>Video codec</span></div>
+      <div class="stat"><b>${Number(selection.adjacent_connectivity_pass_fraction ?? 0).toLocaleString(undefined, { style: "percent", maximumFractionDigits: 0 })}</b><span>Connected view pairs</span></div>
     </div>
+    ${selection.selection_limited ? '<div class="warning-row"><span class="warning-chip">Emergency view ceiling reached</span></div>' : ""}
     ${warningHtml ? `<div class="warning-row">${warningHtml}</div>` : ""}
     <div class="media-panel">
       <img src="${prepared.contact_sheet_url}" alt="Prepared frame contact sheet" loading="lazy" />
       <div class="media-caption"><span>Prepared view coverage</span><a href="${prepared.manifest_url}" target="_blank" rel="noopener">Frame manifest</a></div>
     </div>
-    <div class="subheading"><div><span class="eyebrow">Prepared input</span><h3>Sampled views</h3></div><span class="status-badge">First ${Math.min(24, prepared.frame_count)} shown</span></div>
+    <div class="subheading"><div><span class="eyebrow">Prepared input</span><h3>Adaptive reconstruction views</h3></div><span class="status-badge">First ${Math.min(24, prepared.frame_count)} shown</span></div>
     <div class="thumb-grid">${thumbs}</div>`;
 }
 
@@ -444,10 +467,10 @@ function alignmentSection(scan) {
     <div class="subheading"><div><span class="eyebrow">Noesis registration</span><h3>${escapeHtml(cameraLabel(results.target_camera_id || alignment.target_camera_id))} alignment passed</h3></div><span class="status-badge aligned-badge">Backend world · metric</span></div>
     <p class="alignment-note">This is a saved, quality-gated review candidate aligned against ${escapeHtml(results.target_revision_id || alignment.target_revision_id || "the selected revision")}. It has not changed or promoted the live Noesis world.</p>
     <div class="stat-grid">
-      <div class="stat"><b>${(Number(vertical.source_overlap_0_30m || 0) * 100).toFixed(1)}%</b><span>Phone structure match</span></div>
+      <div class="stat"><b>${(Number(vertical.source_overlap_0_30m || 0) * 100).toFixed(1)}%</b><span>Camera-visible structure match</span></div>
       <div class="stat"><b>${(Number(vertical.target_overlap_0_30m || 0) * 100).toFixed(1)}%</b><span>Fixed-view coverage</span></div>
       <div class="stat"><b>${Number(vertical.plane_residual_median_m || 0).toFixed(3)}m</b><span>Wall residual</span></div>
-      <div class="stat"><b>${(Number(full.source_overlap_0_30m || 0) * 100).toFixed(1)}%</b><span>Full cloud match</span></div>
+      <div class="stat"><b>${(Number(full.source_overlap_0_30m || 0) * 100).toFixed(1)}%</b><span>Camera-visible cloud match</span></div>
     </div>
     <div class="artifact-row">${links}</div>
     <div class="alignment-evidence-grid">
@@ -456,15 +479,140 @@ function alignmentSection(scan) {
     </div>`;
 }
 
+function pcfSection(scan) {
+  if (scan.alignment?.status !== "complete") return "";
+  const provider = String(scan.provider || scan.outputs?.provider || "").toLowerCase();
+  const pcf = scan.pcf;
+  const hasActiveSupplement = Boolean(scan.active_revision?.supplement_id);
+  if (!pcf && provider !== "da3") {
+    return `<div class="ready-callout pcf-callout pcf-unavailable"><div><span class="eyebrow">Optional final stage</span><h3>Prior-Conditioned Fusion requires a DA3 base walk.</h3><p>This walk was reconstructed with MapAnything. Its existing outputs remain valid, but PCF will not silently substitute or overwrite the provider.</p></div><span class="status-badge">Unavailable for this walk</span></div>`;
+  }
+  if (!pcf && hasActiveSupplement) {
+    return `<div class="ready-callout pcf-callout pcf-unavailable"><div><span class="eyebrow">Optional final stage</span><h3>PCF is not available for this merged revision yet.</h3><p>The current PCF contract requires one exact prepared-view set through DA3 and conditioned MapAnything. The added-video revision will not be silently omitted.</p></div><span class="status-badge">Base-walk PCF only</span></div>`;
+  }
+  if (!pcf) {
+    const runtimeNote = pcfPausesAppliance
+      ? " The native Noesis/Menon appliance will be paused for GPU headroom and restored automatically afterward."
+      : "";
+    return `<div class="ready-callout pcf-callout"><div><span class="eyebrow">Optional final stage</span><h3>Build a Prior-Conditioned Fusion review.</h3><p>Run conditioned MapAnything over these same adaptive views, consistency-gate it against DA3, and generate static-world diagnostics. This saves a review candidate only; it does not publish a Scene Prior.${runtimeNote}</p></div><button id="initiate-pcf" class="primary-button" type="button">Generate PCF review</button></div>`;
+  }
+  if (["queued", "running"].includes(pcf.status)) {
+    const progress = Math.round(Math.max(0, Math.min(1, Number(pcf.progress || 0))) * 100);
+    return `<div class="status-panel pcf-status"><div class="status-line"><span>${escapeHtml(pcf.message || "Building PCF review")}</span><b>${progress}%</b></div><div class="progress-track"><span style="width:${progress}%"></span></div><p class="alignment-target-note">${escapeHtml(cameraLabel(pcf.target_camera_id))} · review-only candidate · original prepared walk</p></div>`;
+  }
+  if (pcf.status === "failed") {
+    return `<div class="status-panel pcf-status"><div class="status-line"><span>${escapeHtml(pcf.message || "PCF failed")}</span><b>Not completed</b></div><div class="error-box">${escapeHtml(pcf.error || "The PCF run did not complete.")}</div><div class="artifact-row">${pcf.log_url ? `<a class="artifact-link" href="${pcf.log_url}" target="_blank" rel="noopener">Run log</a>` : ""}<button id="initiate-pcf" class="primary-button compact-button" type="button">Retry PCF</button></div></div>`;
+  }
+  const results = pcf.results;
+  if (pcf.status !== "complete" || !results) return "";
+  const urls = results.artifact_urls || {};
+  const fusion = results.fusion || {};
+  const surfels = results.surfel_fusion || {};
+  const multiview = results.multiview_consistency?.consensus || {};
+  const heldout = results.heldout_even_to_odd_reprojection?.consensus || {};
+  const staticVisible = results.evaluation?.fixed_camera_visible_cloud_metrics || {};
+  const links = [
+    [urls.pcf_glb, "PCF surfel GLB"],
+    [urls.conditioned_mapanything_glb, "Conditioned MapAnything GLB"],
+    [urls.collaboration_diagnostics, "Provider collaboration"],
+    [urls.consensus_manifest, "Consensus manifest"],
+    [urls.conditioned_mapanything_manifest, "Conditioned MA manifest"],
+    [urls.evaluation_metrics, "Evaluation metrics"],
+    [urls.run_log, "Run log"],
+  ].filter(([url]) => url).map(([url, label]) => `<a class="artifact-link" href="${url}" target="_blank" rel="noopener">${label}</a>`).join("");
+  const evidence = [
+    [urls.diagnostic_layers, "Static-world diagnostic layers"],
+    [urls.point_preserving_layers, "2.5 cm point-preserving layers"],
+    [urls.static_alignment_topdown, "PCF and static-camera alignment"],
+    [urls.fixed_camera_reprojection, "Fixed-camera reprojection"],
+    [urls.collaboration_diagnostics, "MapAnything and DA3 collaboration"],
+    [urls.evaluation_overview, "DA3, conditioned MA, and PCF overview"],
+  ].filter(([url]) => url).map(([url, label]) => `<div class="media-panel"><a href="${url}" target="_blank" rel="noopener"><img src="${url}" alt="${escapeHtml(label)}" loading="lazy" /></a><div class="media-caption"><span>${escapeHtml(label)}</span><a href="${url}" target="_blank" rel="noopener">Full size</a></div></div>`).join("");
+  return `
+    <section class="pcf-results">
+      <div class="subheading"><div><span class="eyebrow">Optional final stage</span><h3>Prior-Conditioned Fusion complete</h3></div><span class="status-badge aligned-badge">Review candidate · not published</span></div>
+      <p class="alignment-note">PCF used the original ${Number(results.view_count || scan.outputs?.view_count || 0)}-view DA3 walk, its passed ${escapeHtml(cameraLabel(results.target_camera_id || pcf.target_camera_id))} alignment, conditioned MapAnything, and DA3-carried consistency fusion. Raw evidence and diagnostics are auto-saved separately from the walk.</p>
+      ${results.runtime_restore_error ? `<div class="error-box">The PCF files are complete, but automatic appliance restoration needs attention: ${escapeHtml(results.runtime_restore_error)}</div>` : ""}
+      <div class="stat-grid">
+        <div class="stat"><b>${Number(surfels.surfel_count || 0).toLocaleString()}</b><span>PCF surfels</span></div>
+        <div class="stat"><b>${(Number(fusion.agreement_fraction_of_both || 0) * 100).toFixed(1)}%</b><span>Provider agreement</span></div>
+        <div class="stat"><b>${Number(multiview.p80_error_m || 0).toFixed(3)}m</b><span>Multiview p80</span></div>
+        <div class="stat"><b>${(Number(heldout.odd_frame_valid_pixel_coverage_fraction || 0) * 100).toFixed(1)}%</b><span>Held-out coverage</span></div>
+        <div class="stat"><b>${Number(heldout.even_frame_map_to_odd_frame_depth_median_m || 0).toFixed(3)}m</b><span>Held-out median</span></div>
+        <div class="stat"><b>${(Number(staticVisible.source_overlap_0_30m || 0) * 100).toFixed(1)}%</b><span>Static-visible match</span></div>
+      </div>
+      <div class="artifact-row">${links}</div>
+      <div class="pcf-evidence-grid">${evidence}</div>
+    </section>`;
+}
+
+function supplementsSection(scan) {
+  const supplements = Array.isArray(scan.supplements) ? scan.supplements : [];
+  const providerLabel = scan.provider === "da3" || scan.outputs?.provider === "da3" ? "DA3" : "MapAnything";
+  const cards = supplements.map((addition, index) => {
+    const running = ["uploading", "processing_frames", "queued", "running"].includes(addition.status);
+    const progress = Math.round(Math.max(0, Math.min(1, Number(addition.progress || 0))) * 100);
+    const prepared = addition.prepared || {};
+    const results = addition.results || {};
+    const urls = results.artifact_urls || {};
+    const fusion = results.fusion || {};
+    const active = scan.active_revision?.supplement_id === addition.id;
+    const links = [
+      [urls.merged_reconstruction_glb, "Merged RGB GLB"],
+      [urls.added_evidence_glb, "Added evidence GLB"],
+      [urls.source_comparison_glb, "Blue/orange source comparison"],
+      [urls.trajectory_preview, "Added camera path"],
+      [urls.append_to_base_transform, "Registration transform"],
+      [urls.report, "Integration report"],
+      [urls.manifest, "Revision manifest"],
+    ].filter(([url]) => url).map(([url, label]) => `<a class="artifact-link" href="${url}" target="_blank" rel="noopener">${label}</a>`).join("");
+    const canDelete = !running;
+    const canIntegrate = ["ready", "integration_failed"].includes(addition.status);
+    return `
+      <article class="supplement-card ${active ? "active" : ""}">
+        <div class="supplement-head">
+          <div>
+            <span class="eyebrow">Additional pass ${index + 1}</span>
+            <h4>${escapeHtml(supplementStatusLabels[addition.status] || addition.status)}</h4>
+            <small>${escapeHtml(formatDate(addition.created_at))} · ${formatBytes(addition.video?.size_bytes)}</small>
+          </div>
+          <div class="supplement-actions">
+            ${active ? '<span class="status-badge aligned-badge">Current revision</span>' : ""}
+            <a class="ghost-button compact-button" href="${addition.video?.url}" target="_blank" rel="noopener">Video</a>
+            ${canDelete ? `<button class="danger-button compact-button" type="button" data-delete-supplement="${escapeHtml(addition.id)}">Delete</button>` : ""}
+          </div>
+        </div>
+        ${running ? `<div class="status-panel supplement-progress"><div class="status-line"><span>${escapeHtml(addition.message || supplementStatusLabels[addition.status])}</span><b>${progress}%</b></div><div class="progress-track"><span style="width:${progress}%"></span></div></div>` : ""}
+        ${addition.error ? `<div class="error-box">${escapeHtml(addition.error)}</div>` : ""}
+        ${active && scan.active_revision?.noesis_derivative_error ? `<div class="error-box">Merged revision saved, but its Noesis-world derivative failed: ${escapeHtml(scan.active_revision.noesis_derivative_error)}</div>` : ""}
+        ${prepared.contact_sheet_url && addition.status !== "complete" ? `<div class="supplement-ready-grid"><a class="supplement-sheet" href="${prepared.contact_sheet_url}" target="_blank" rel="noopener"><img src="${prepared.contact_sheet_url}" alt="Prepared views from additional video" loading="lazy" /></a><div><b>${Number(prepared.frame_count || 0)} new views prepared</b><p>The tool will choose exact old bridge views, jointly infer them with these frames, and publish only if duplicate-pose and independent RGB/3D checks agree.</p>${canIntegrate ? `<button class="primary-button" type="button" data-integrate-supplement="${escapeHtml(addition.id)}">${addition.status === "integration_failed" ? "Retry integration" : `Integrate with ${providerLabel}`}</button>` : ""}</div></div>` : ""}
+        ${addition.status === "complete" ? `<div class="supplement-result-grid"><div class="stat"><b>${Number(fusion.point_count || 0).toLocaleString()}</b><span>Merged surfels</span></div><div class="stat"><b>${Number(fusion.new_only_voxel_count || 0).toLocaleString()}</b><span>New-only voxels</span></div><div class="stat"><b>${Number(results.bridge?.selected_count || 0)}</b><span>Bridge views</span></div><div class="stat"><b>${Number(results.independent_pnp_validation?.accepted_anchor_count || 0)}</b><span>Independent anchors</span></div></div><div class="artifact-row">${links}</div>` : ""}
+      </article>`;
+  }).join("");
+  return `
+    <section class="supplements-section">
+      <div class="subheading supplement-title"><div><span class="eyebrow">Additive reconstruction</span><h3>Additional room videos</h3></div><label class="ghost-button compact-button" for="additional-existing-video">Use saved video</label></div>
+      <p class="alignment-note">Each pass is auto-saved. The current reconstruction stays immutable; accepted additions create a new versioned revision in its coordinate frame.</p>
+      <input id="additional-existing-video" class="visually-hidden" type="file" accept="video/*" />
+      ${cards || '<div class="supplement-empty"><b>No added passes yet.</b><span>Use Add Video above and begin where the earlier walk has recognizable overlap.</span></div>'}
+    </section>`;
+}
+
 function outputsSection(scan) {
   const outputs = scan.outputs;
   if (!outputs) return "";
   const urls = outputs.artifact_urls || {};
   const aligned = scan.alignment?.status === "complete" ? scan.alignment.results : null;
   const alignedUrls = aligned?.artifact_urls || {};
+  const activeRevision = scan.active_revision || null;
+  const activeUrls = activeRevision?.artifact_urls || {};
+  const pcfResult = scan.pcf?.status === "complete" ? scan.pcf.results : null;
+  const pcfUrls = pcfResult?.artifact_urls || {};
   const providerLabel = outputs.provider === "da3" ? "DA3" : "MapAnything";
-  const viewerTitle = aligned ? "Noesis-aligned comparison" : `${providerLabel} reconstruction`;
-  const viewerBadge = aligned ? "Aligned backend world frame" : `Unaligned ${providerLabel} world frame`;
+  const viewerTitle = activeRevision ? "Current merged reconstruction" : (pcfResult ? "Prior-Conditioned Fusion reconstruction" : (aligned ? "Noesis-aligned comparison" : `${providerLabel} reconstruction`));
+  const viewerBadge = activeRevision
+    ? (activeUrls.noesis_aligned_glb ? "Merged · aligned backend world" : "Merged · original phone world")
+    : (pcfResult ? "PCF surfels · DA3 carrier frame" : (aligned ? "Aligned backend world frame" : `Unaligned ${providerLabel} world frame`));
   const scale = outputs.scale || {};
   const files = outputs.files || [];
   const artifactLinks = [
@@ -472,27 +620,30 @@ function outputsSection(scan) {
     [urls.trajectory_preview, "Camera path PNG"],
     [urls.trajectory_json, "Camera poses JSON"],
     [urls.camera_solution_npz, "Camera solution NPZ"],
+    [urls.window_registration_report, "Window registration report"],
     [urls.manifest, "Output manifest"],
   ].filter(([url]) => url).map(([url, label]) => `<a class="artifact-link" href="${url}" target="_blank" rel="noopener">${label}</a>`).join("");
   const fileRows = files.map((file) => `<div class="file-row"><a href="${file.url}" target="_blank" rel="noopener">${escapeHtml(file.path)}</a><span>${formatBytes(file.size_bytes)}</span></div>`).join("");
   return `
     <div class="stat-grid">
-      <div class="stat"><b>${Number(outputs.view_count)}</b><span>Joint views</span></div>
+      <div class="stat"><b>${Number(outputs.view_count)}</b><span>Selected views</span></div>
       <div class="stat"><b>${Number(outputs.review_point_count).toLocaleString()}</b><span>Review points</span></div>
+      <div class="stat"><b>${Number(outputs.window_count || 1)}</b><span>Joint inference windows</span></div>
       <div class="stat"><b>${Number(scale.median || 0).toFixed(3)}</b><span>Median metric scale</span></div>
-      <div class="stat"><b>${files.length}</b><span>Saved output files</span></div>
     </div>
+    ${supplementsSection(scan)}
     ${alignmentSection(scan)}
+    ${pcfSection(scan)}
     <div class="subheading"><div><span class="eyebrow">3D review</span><h3>${viewerTitle}</h3></div><span class="status-badge">${viewerBadge}</span></div>
     <div class="viewer-wrap">
       <div id="viewer-canvas" class="viewer-canvas"></div>
       <div id="viewer-overlay" class="viewer-overlay">Loading the saved GLB…</div>
       <div class="viewer-hint">One finger rotates · two fingers pan and zoom</div>
     </div>
-    <div class="artifact-row">${alignedUrls.comparison_glb ? `<a class="artifact-link" href="${alignedUrls.comparison_glb}" target="_blank" rel="noopener">Current 3D comparison</a>` : ""}${artifactLinks}</div>
+    <div class="artifact-row">${pcfUrls.pcf_glb ? `<a class="artifact-link" href="${pcfUrls.pcf_glb}" target="_blank" rel="noopener">PCF surfel reconstruction</a>` : ""}${activeUrls.source_comparison_glb ? `<a class="artifact-link" href="${activeUrls.source_comparison_glb}" target="_blank" rel="noopener">Current source comparison</a>` : ""}${alignedUrls.comparison_glb ? `<a class="artifact-link" href="${alignedUrls.comparison_glb}" target="_blank" rel="noopener">Noesis alignment comparison</a>` : ""}${artifactLinks}</div>
     <div class="media-panel">
-      <img src="${urls.trajectory_preview}" alt="Top-down camera trajectory" loading="lazy" />
-      <div class="media-caption"><span>Green is the first camera pose; orange is the walk path.</span><a href="${urls.trajectory_json}" target="_blank" rel="noopener">Pose data</a></div>
+      <img src="${activeUrls.trajectory_preview || urls.trajectory_preview}" alt="Top-down camera trajectory" loading="lazy" />
+      <div class="media-caption"><span>Green is the first camera pose; orange is the walk path.</span><a href="${activeUrls.trajectory_json || urls.trajectory_json}" target="_blank" rel="noopener">Pose data</a></div>
     </div>
     <div class="subheading"><div><span class="eyebrow">Per-view outputs</span><h3>RGB, depth, confidence, mask, and raw arrays</h3></div></div>
     <div id="output-pages">${outputFrameCards(outputs)}</div>
@@ -634,6 +785,50 @@ function wireDetailActions(scan) {
       toastMessage(`${label} could not start: ${error.message}`);
     }
   });
+  document.querySelector("#additional-camera-video")?.addEventListener("change", (event) => {
+    void uploadSupplementVideo(scan, event.currentTarget.files?.[0]);
+  });
+  document.querySelector("#additional-existing-video")?.addEventListener("change", (event) => {
+    void uploadSupplementVideo(scan, event.currentTarget.files?.[0]);
+  });
+  document.querySelectorAll("[data-integrate-supplement]").forEach((button) => {
+    button.addEventListener("click", async (event) => {
+      const supplementId = event.currentTarget.dataset.integrateSupplement;
+      if (!supplementId) return;
+      const providerLabel = scan.provider === "da3" || scan.outputs?.provider === "da3" ? "DA3" : "MapAnything";
+      const accepted = window.confirm(`Run a joint ${providerLabel} bridge reconstruction and merge this added pass if its registration checks pass?`);
+      if (!accepted) return;
+      event.currentTarget.disabled = true;
+      try {
+        const updated = await jsonFetch(`/api/scans/${encodeURIComponent(scan.id)}/supplements/${encodeURIComponent(supplementId)}/integrate`, { method: "POST" });
+        const index = scans.findIndex((item) => item.id === scan.id);
+        if (index >= 0) scans[index] = updated;
+        lastDetailFingerprint = "";
+        renderSelected();
+        toastMessage(`${providerLabel} bridge integration started`);
+      } catch (error) {
+        event.currentTarget.disabled = false;
+        toastMessage(`Integration could not start: ${error.message}`);
+      }
+    });
+  });
+  document.querySelectorAll("[data-delete-supplement]").forEach((button) => {
+    button.addEventListener("click", async (event) => {
+      const supplementId = event.currentTarget.dataset.deleteSupplement;
+      if (!supplementId) return;
+      const accepted = window.confirm("Delete this added video, its prepared frames, and its revision outputs? The original room walk will remain untouched.");
+      if (!accepted) return;
+      event.currentTarget.disabled = true;
+      try {
+        await jsonFetch(`/api/scans/${encodeURIComponent(scan.id)}/supplements/${encodeURIComponent(supplementId)}`, { method: "DELETE" });
+        toastMessage("Added video and its revision were deleted");
+        await refreshScans({ force: true });
+      } catch (error) {
+        event.currentTarget.disabled = false;
+        toastMessage(`Added video could not be deleted: ${error.message}`);
+      }
+    });
+  });
   const alignmentTarget = document.querySelector("#alignment-target");
   const alignmentButton = document.querySelector("#align-noesis");
   alignmentTarget?.addEventListener("change", () => {
@@ -662,6 +857,27 @@ function wireDetailActions(scan) {
     } catch (error) {
       event.currentTarget.disabled = false;
       toastMessage(`Noesis alignment could not start: ${error.message}`);
+    }
+  });
+  document.querySelector("#initiate-pcf")?.addEventListener("click", async (event) => {
+    const runtimeSentence = pcfPausesAppliance
+      ? " The native Noesis/Menon appliance will be temporarily paused for GPU headroom and restored automatically when the job exits."
+      : "";
+    const accepted = window.confirm(
+      `Generate the review-only PCF candidate now? This runs conditioned MapAnything, DA3 consistency fusion, and static-world evaluation. It can take a while and needs substantial GPU headroom and storage.${runtimeSentence}`,
+    );
+    if (!accepted) return;
+    event.currentTarget.disabled = true;
+    try {
+      const updated = await jsonFetch(`/api/scans/${encodeURIComponent(scan.id)}/initiate-pcf`, { method: "POST" });
+      const index = scans.findIndex((item) => item.id === scan.id);
+      if (index >= 0) scans[index] = updated;
+      lastDetailFingerprint = "";
+      renderSelected();
+      toastMessage("PCF review started; the page can remain open while it runs");
+    } catch (error) {
+      event.currentTarget.disabled = false;
+      toastMessage(`PCF could not start: ${error.message}`);
     }
   });
   document.querySelector("#output-prev")?.addEventListener("click", () => {
@@ -695,7 +911,9 @@ function renderSelected() {
   lastDetailFingerprint = fingerprint;
   disposeViewer();
   const alignmentRunning = ["queued", "running"].includes(scan.alignment?.status);
-  const canDelete = !["uploading", "processing_frames", "ma_queued", "ma_running", "da3_queued", "da3_running"].includes(scan.status) && !alignmentRunning;
+  const supplementRunning = (scan.supplements || []).some((addition) => ["uploading", "processing_frames", "queued", "running"].includes(addition.status));
+  const pcfRunning = ["queued", "running"].includes(scan.pcf?.status);
+  const canDelete = !["uploading", "processing_frames", "ma_queued", "ma_running", "da3_queued", "da3_running"].includes(scan.status) && !alignmentRunning && !supplementRunning && !pcfRunning;
   const canInitiate = ["ready", "ma_failed", "da3_failed"].includes(scan.status);
   const videoSize = formatBytes(scan.video?.size_bytes);
   scanDetail.innerHTML = `
@@ -706,20 +924,26 @@ function renderSelected() {
         <div class="detail-meta"><span>${escapeHtml(formatDate(scan.created_at))}</span><span>${videoSize}</span><span>${escapeHtml(scan.id)}</span></div>
       </div>
       <div class="detail-actions">
+        ${scan.status === "complete" && !supplementRunning && !pcfRunning ? '<label class="secondary-button" for="additional-camera-video">＋ Add Video</label><input id="additional-camera-video" class="visually-hidden" type="file" accept="video/*" capture="environment" />' : ""}
         <a class="ghost-button" href="${scan.video?.url}" target="_blank" rel="noopener">Original video</a>
         <button id="rename-scan" class="ghost-button" type="button">Rename</button>
         ${canDelete ? '<button id="delete-scan" class="danger-button" type="button">Delete scan</button>' : ""}
       </div>
     </div>
     ${statusPanel(scan)}
-    ${canInitiate ? `<div class="ready-callout inference-callout"><div><h3>${scan.status.endsWith("_failed") ? "The prepared views are still safe." : "The room walk is ready."}</h3><p>Both options jointly reconstruct all ${Number(scan.prepared?.frame_count || 0)} phone views. DA3 uses DA3-BASE any-view geometry plus the validated DA3Metric-Large FP16 TensorRT engine for metric scale.</p></div><label class="provider-picker"><span>Provider</span><select id="inference-provider"><option value="mapanything" ${scan.provider !== "da3" ? "selected" : ""}>MapAnything</option><option value="da3" ${scan.provider === "da3" ? "selected" : ""}>DA3</option></select></label><button id="initiate-inference" class="primary-button" type="button">Run reconstruction</button></div>` : ""}
+    ${canInitiate ? `<div class="ready-callout inference-callout"><div><h3>${scan.status.endsWith("_failed") ? "The prepared views are still safe." : "The room walk is ready."}</h3><p>Reconstruction uses all ${Number(scan.prepared?.frame_count || 0)} adaptive phone views. MapAnything automatically uses overlapping registered windows above its measured joint-view capacity. DA3 uses DA3-BASE any-view geometry plus the validated DA3Metric-Large FP16 TensorRT engine for metric scale.</p></div><label class="provider-picker"><span>Provider</span><select id="inference-provider"><option value="mapanything" ${scan.provider !== "da3" ? "selected" : ""}>MapAnything</option><option value="da3" ${scan.provider === "da3" ? "selected" : ""}>DA3</option></select></label><button id="initiate-inference" class="primary-button" type="button">Run reconstruction</button></div>` : ""}
     ${scan.status === "complete" ? outputsSection(scan) : preparedSection(scan)}
     ${scan.status !== "complete" && scan.video?.url ? `<div class="subheading"><div><span class="eyebrow">Source</span><h3>Original phone video</h3></div></div><div class="media-panel"><video src="${scan.video.url}" controls preload="metadata" playsinline></video><div class="media-caption"><span>${escapeHtml(scan.video.original_name || "phone video")}</span><span>${videoSize}</span></div></div>` : ""}`;
   wireDetailActions(scan);
   if (scan.status === "complete") {
-    const viewerUrl = scan.alignment?.status === "complete"
-      ? scan.alignment?.results?.artifact_urls?.comparison_glb
-      : scan.outputs?.artifact_urls?.reconstruction_glb;
+    const revisionUrls = scan.active_revision?.artifact_urls || {};
+    const pcfUrls = scan.pcf?.status === "complete" ? scan.pcf.results?.artifact_urls || {} : {};
+    const viewerUrl = revisionUrls.noesis_aligned_glb
+      || revisionUrls.merged_reconstruction_glb
+      || pcfUrls.pcf_glb
+      || (scan.alignment?.status === "complete"
+        ? scan.alignment?.results?.artifact_urls?.comparison_glb
+        : scan.outputs?.artifact_urls?.reconstruction_glb);
     requestAnimationFrame(() => initializeViewer(viewerUrl));
   }
 }
@@ -792,6 +1016,60 @@ function uploadVideo(file) {
     uploadInProgress = false;
     uploadLabel.textContent = "Upload connection failed";
     toastMessage("Upload failed. Keep this page open and confirm the phone is still on the home Wi-Fi.");
+  });
+  xhr.addEventListener("abort", () => {
+    uploadInProgress = false;
+  });
+  xhr.send(file);
+}
+
+function uploadSupplementVideo(scan, file) {
+  if (!file) return;
+  if (uploadInProgress) {
+    toastMessage("A video is already uploading");
+    return;
+  }
+  uploadInProgress = true;
+  uploadPanel.classList.remove("hidden");
+  uploadLabel.textContent = `Adding ${file.name || "room video"} to ${scan.name}`;
+  uploadPercent.textContent = "0%";
+  uploadBar.style.width = "0%";
+  toastMessage("Uploading and auto-saving the additional pass");
+  const xhr = new XMLHttpRequest();
+  xhr.open("POST", `/api/scans/${encodeURIComponent(scan.id)}/supplements`);
+  xhr.setRequestHeader("Content-Type", file.type || "application/octet-stream");
+  xhr.setRequestHeader("X-File-Name", encodeURIComponent(file.name || "additional_walk.mp4"));
+  xhr.upload.addEventListener("progress", (event) => {
+    if (!event.lengthComputable) return;
+    const percent = Math.round((event.loaded / event.total) * 100);
+    uploadPercent.textContent = `${percent}%`;
+    uploadBar.style.width = `${percent}%`;
+  });
+  xhr.addEventListener("load", async () => {
+    uploadInProgress = false;
+    if (xhr.status < 200 || xhr.status >= 300) {
+      let detail = `${xhr.status} upload failed`;
+      try { detail = JSON.parse(xhr.responseText).detail || detail; } catch (_) { /* retain HTTP detail */ }
+      uploadLabel.textContent = detail;
+      toastMessage(`Additional video was not saved: ${detail}`);
+      return;
+    }
+    const updated = JSON.parse(xhr.responseText);
+    const index = scans.findIndex((item) => item.id === scan.id);
+    if (index >= 0) scans[index] = updated;
+    uploadPercent.textContent = "100%";
+    uploadBar.style.width = "100%";
+    uploadLabel.textContent = "Additional video saved · preparing new views";
+    lastDetailFingerprint = "";
+    renderSelected();
+    toastMessage("Additional pass auto-saved; frame preparation started");
+    await refreshScans({ force: true });
+    setTimeout(() => uploadPanel.classList.add("hidden"), 1800);
+  });
+  xhr.addEventListener("error", () => {
+    uploadInProgress = false;
+    uploadLabel.textContent = "Upload connection failed";
+    toastMessage("Additional video upload failed. Confirm the phone is still on home Wi-Fi.");
   });
   xhr.addEventListener("abort", () => {
     uploadInProgress = false;

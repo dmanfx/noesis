@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import hashlib
+import json
 import time
+from dataclasses import replace
 from pathlib import Path
 from typing import Any, Callable
 
@@ -12,6 +15,8 @@ from fastapi.testclient import TestClient
 from tools.mapanything_phone_scan.alignment import (
     NoesisAlignmentError,
     NoesisAlignmentSettings,
+    _fixed_camera_comparable_mask,
+    _fixed_camera_visible_cloud_metrics,
     _resolve_target_camera_orientation,
     _resolve_target_cloud_for_calibrated_camera,
 )
@@ -48,7 +53,14 @@ def _settings(tmp_path: Path) -> PhoneScanSettings:
         static_root=APP_ROOT / "static",
         three_root=REPO_ROOT / "oai2-fe" / "node_modules" / "three",
         max_upload_bytes=10 * 1024 * 1024,
-        frame=FramePreparationSettings(target_fps=2.0, max_frames=12, max_edge_px=640),
+        frame=FramePreparationSettings(
+            candidate_fps=4.0,
+            max_candidate_frames=48,
+            max_selected_frames=24,
+            candidate_edge_px=640,
+            feature_edge_px=640,
+            max_edge_px=640,
+        ),
         mapanything=MapAnythingScanSettings(point_budget=10_000),
         da3=DA3PhoneScanSettings(
             point_budget=10_000,
@@ -61,6 +73,7 @@ def _settings(tmp_path: Path) -> PhoneScanSettings:
             living_room_alignment,
         ),
         alignment_release_id="test-home-release",
+        pcf_storage_root=tmp_path / "pcf",
     )
 
 
@@ -86,6 +99,196 @@ def _wait_for_alignment(client: TestClient, scan_id: str, expected: str) -> dict
             return payload
         time.sleep(0.02)
     raise AssertionError(f"scan {scan_id} alignment did not reach {expected}")
+
+
+def _wait_for_pcf(client: TestClient, scan_id: str, expected: str) -> dict[str, Any]:
+    deadline = time.monotonic() + 5.0
+    while time.monotonic() < deadline:
+        response = client.get(f"/api/scans/{scan_id}")
+        assert response.status_code == 200
+        payload = response.json()
+        if payload.get("pcf", {}).get("status") == expected:
+            return payload
+        time.sleep(0.02)
+    raise AssertionError(f"scan {scan_id} PCF did not reach {expected}")
+
+
+def test_whole_home_review_assembly_is_release_bound_and_digest_verified(
+    tmp_path: Path,
+) -> None:
+    settings = _settings(tmp_path)
+    assembly_id = "pcf-home-review"
+    assembly_dir = settings.pcf_storage_root / "review-assemblies" / assembly_id
+    assembly_dir.mkdir(parents=True)
+    artifact = assembly_dir / "multiroom_points.glb"
+    artifact.write_bytes(b"review-glb-bytes")
+    digest = hashlib.sha256(artifact.read_bytes()).hexdigest()
+    manifest = {
+        "contract": "noesis.scene.review_assembly",
+        "contract_version": 3,
+        "assembly_id": assembly_id,
+        "created_at_us": 1,
+        "status": "review_only",
+        "accepted_for_canonical_use": False,
+        "coordinate_frame": "backend_world_m",
+        "assembly_gauge": "family_accepted_backend_world_m",
+        "units": "meters",
+        "scene_binding": {"release_id": "test-home-release"},
+        "artifact": {
+            "role": "multiroom_points_glb",
+            "relative_path": (
+                f"review-assemblies/{assembly_id}/multiroom_points.glb"
+            ),
+            "sha256": digest,
+            "size_bytes": artifact.stat().st_size,
+            "media_type": "model/gltf-binary",
+            "point_count": 3,
+            "owner_point_counts": {"1": 1, "2": 1, "3": 1},
+        },
+        "camera_anchor": {
+            "status": "review_pose_estimate",
+            "accepted_for_canonical_use": False,
+            "camera_id": "family-room",
+            "coordinate_frame": "family_accepted_backend_world_m",
+            "pose_convention": "opencv_cam2world_x_right_y_down_z_forward",
+            "anchor_mode": "floor_locked_planar",
+            "camera_height_source": "admitted_scene_prior_reference_camera",
+            "vertical_anchor_translation_m": 0.0,
+            "camera_to_assembly_col_major": [
+                1,
+                0,
+                0,
+                0,
+                0,
+                1,
+                0,
+                0,
+                0,
+                0,
+                1,
+                0,
+                14,
+                2,
+                11,
+                1,
+            ],
+            "device_reference_camera_to_assembly_col_major": [
+                1,
+                0,
+                0,
+                0,
+                0,
+                1,
+                0,
+                0,
+                0,
+                0,
+                1,
+                0,
+                15,
+                2,
+                13,
+                1,
+            ],
+            "camera_center_assembly_m": [14, 2, 11],
+            "source_report_sha256": "a" * 64,
+        },
+        "camera_markers": {
+            "status": "review_camera_positions",
+            "accepted_for_canonical_use": False,
+            "coordinate_frame": "family_accepted_backend_world_m",
+            "method": "static_camera_centers_composed_through_recorded_room_transforms",
+            "sphere_radius_m": 0.18,
+            "color_hex": "#ffd400",
+            "markers": [
+                {
+                    "camera_id": "family-room",
+                    "position_assembly_m": [14, 2, 11],
+                },
+                {
+                    "camera_id": "kitchen",
+                    "position_assembly_m": [9, 2.2, 5],
+                },
+                {
+                    "camera_id": "living-room",
+                    "position_assembly_m": [3, 1.9, 8],
+                },
+            ],
+            "source_report_sha256": "b" * 64,
+        },
+        "provenance": {
+            "source_camera_anchor_report_sha256": "a" * 64,
+            "source_camera_markers_report_sha256": "b" * 64,
+        },
+    }
+    current = settings.pcf_storage_root / "review-assemblies" / "current.json"
+    current.write_text(json.dumps(manifest), encoding="utf-8")
+
+    with TestClient(create_app(settings)) as client:
+        descriptor = client.get(
+            "/api/v1/scenes/current/review-assemblies/whole-home"
+        )
+        assert descriptor.status_code == 200
+        assert descriptor.json()["assembly_id"] == assembly_id
+        assert descriptor.json()["artifact_url"].endswith(
+            "/artifacts/multiroom_points_glb"
+        )
+        response = client.get(descriptor.json()["artifact_url"])
+        assert response.status_code == 200
+        assert response.content == artifact.read_bytes()
+        assert response.headers["x-noesis-artifact-sha256"] == digest
+
+        missing_role = client.get(
+            "/api/v1/scenes/current/review-assemblies/whole-home/"
+            "artifacts/multiroom_surface_mesh_glb"
+        )
+        assert missing_role.status_code == 404
+
+        mesh_artifact = assembly_dir / "multiroom_surface_mesh.glb"
+        mesh_artifact.write_bytes(b"review-mesh-glb-bytes")
+        mesh_digest = hashlib.sha256(mesh_artifact.read_bytes()).hexdigest()
+        point_artifact = manifest["artifact"]
+        manifest["contract_version"] = 4
+        manifest["artifact"] = {
+            "role": "multiroom_surface_mesh_glb",
+            "relative_path": (
+                f"review-assemblies/{assembly_id}/multiroom_surface_mesh.glb"
+            ),
+            "sha256": mesh_digest,
+            "size_bytes": mesh_artifact.stat().st_size,
+            "media_type": "model/gltf-binary",
+            "vertex_count": 12,
+            "triangle_count": 18,
+            "owner_triangle_counts": {"1": 6, "2": 6, "3": 6},
+        }
+        current.write_text(json.dumps(manifest), encoding="utf-8")
+        mesh_descriptor = client.get(
+            "/api/v1/scenes/current/review-assemblies/whole-home"
+        )
+        assert mesh_descriptor.status_code == 200
+        assert mesh_descriptor.json()["artifact_url"].endswith(
+            "/artifacts/multiroom_surface_mesh_glb"
+        )
+        mesh_response = client.get(mesh_descriptor.json()["artifact_url"])
+        assert mesh_response.status_code == 200
+        assert mesh_response.content == mesh_artifact.read_bytes()
+        manifest["contract_version"] = 3
+        manifest["artifact"] = point_artifact
+
+        manifest["camera_markers"]["markers"][2]["camera_id"] = "kitchen"
+        current.write_text(json.dumps(manifest), encoding="utf-8")
+        bad_markers = client.get(
+            "/api/v1/scenes/current/review-assemblies/whole-home"
+        )
+        assert bad_markers.status_code == 409
+        manifest["camera_markers"]["markers"][2]["camera_id"] = "living-room"
+
+        manifest["scene_binding"]["release_id"] = "wrong-release"
+        current.write_text(json.dumps(manifest), encoding="utf-8")
+        rejected = client.get(
+            "/api/v1/scenes/current/review-assemblies/whole-home"
+        )
+        assert rejected.status_code == 409
 
 
 def test_target_camera_orientation_preserves_forward_facing_pose() -> None:
@@ -140,6 +343,59 @@ def test_target_cloud_rejects_half_turn_instead_of_rotating_geometry() -> None:
         )
 
 
+def test_fixed_camera_visibility_excludes_only_occluded_source_points() -> None:
+    intrinsics = np.asarray(
+        [[10.0, 0.0, 5.0], [0.0, 10.0, 5.0], [0.0, 0.0, 1.0]],
+        dtype=np.float64,
+    )
+    target_depth = np.full((10, 10), np.inf, dtype=np.float64)
+    target_depth[5, 5] = 2.0
+    source = np.asarray(
+        [[0.0, 0.0, 1.0], [0.0, 0.0, 2.2], [0.0, 0.0, 2.5]],
+        dtype=np.float64,
+    )
+
+    comparable, metrics = _fixed_camera_comparable_mask(
+        source,
+        target_depth,
+        np.eye(4, dtype=np.float64),
+        intrinsics,
+        cell_px=1,
+        occlusion_tolerance_m=0.30,
+    )
+
+    assert comparable.tolist() == [True, True, False]
+    assert metrics["target_supported_point_count"] == 3.0
+    assert metrics["comparable_point_count"] == 2.0
+
+
+def test_fixed_camera_visibility_keeps_bad_foreground_in_score() -> None:
+    intrinsics = np.asarray(
+        [[10.0, 0.0, 5.0], [0.0, 10.0, 5.0], [0.0, 0.0, 1.0]],
+        dtype=np.float64,
+    )
+    target = np.asarray([[0.0, 0.0, 2.0]], dtype=np.float64)
+    target_depth = np.full((10, 10), np.inf, dtype=np.float64)
+    target_depth[5, 5] = 2.0
+    source = np.asarray(
+        [[0.0, 0.0, 1.0], [0.0, 0.0, 2.1], [0.0, 0.0, 2.5]],
+        dtype=np.float64,
+    )
+
+    metrics = _fixed_camera_visible_cloud_metrics(
+        source,
+        target,
+        target_depth,
+        np.eye(4, dtype=np.float64),
+        intrinsics,
+        cell_px=1,
+        occlusion_tolerance_m=0.30,
+    )
+
+    assert metrics["comparable_point_count"] == 2.0
+    assert metrics["source_overlap_0_30m"] == 0.5
+
+
 def test_prepare_video_frames_preserves_full_walk_coverage(tmp_path: Path) -> None:
     scan_dir = tmp_path / "scan"
     scan_dir.mkdir()
@@ -163,12 +419,22 @@ def test_prepare_video_frames_preserves_full_walk_coverage(tmp_path: Path) -> No
     result = prepare_video_frames(
         video,
         scan_dir,
-        FramePreparationSettings(target_fps=2.0, max_frames=12, max_edge_px=640),
+        FramePreparationSettings(
+            candidate_fps=4.0,
+            max_candidate_frames=48,
+            max_selected_frames=24,
+            candidate_edge_px=640,
+            feature_edge_px=640,
+            max_edge_px=640,
+        ),
         lambda fraction, message: progress_rows.append((fraction, message)),
     )
 
-    assert 5 <= result["frame_count"] <= 7
-    assert result["frames"][0]["timestamp_s"] == 0.0
+    assert 3 <= result["frame_count"] <= 10
+    assert result["candidate_count"] >= result["frame_count"]
+    assert result["selection"]["policy"] == "adaptive_quality_motion_overlap_connectivity_v1"
+    assert result["selection"]["selection_limited"] is False
+    assert result["frames"][0]["timestamp_s"] <= 0.5
     assert result["frames"][-1]["timestamp_s"] >= 2.0
     assert (scan_dir / result["manifest"]).is_file()
     assert (scan_dir / result["contact_sheet"]).is_file()
@@ -462,3 +728,190 @@ def test_phone_scan_da3_provider_selector_uses_da3_runner(tmp_path: Path) -> Non
             complete["outputs"]["artifact_urls"]["reconstruction_glb"]
         ).status_code == 200
     assert calls == ["depth-anything/DA3-BASE"]
+
+
+def test_aligned_da3_walk_can_build_saved_pcf_review(tmp_path: Path) -> None:
+    calls: list[tuple[str, str]] = []
+
+    def fake_pcf(
+        scan_dir: Path,
+        run_root: Path,
+        state: dict[str, Any],
+        target: NoesisAlignmentSettings,
+        _: MapAnythingScanSettings,
+        progress: Callable[[float, str], None],
+    ) -> dict[str, Any]:
+        calls.append((str(state["id"]), target.camera_id))
+        assert scan_dir.name == state["id"]
+        progress(0.5, "Building fake PCF")
+        consensus = run_root / "prior_conditioned_consensus_da3_carrier"
+        evaluation = run_root / "evaluation_static_world" / "prior_conditioned_consensus"
+        consensus.mkdir(parents=True)
+        evaluation.mkdir(parents=True)
+        glb = consensus / "consensus_surfel_reconstruction.glb"
+        diagnostics = evaluation / "static_world_heatmap_diagnostics.png"
+        log = run_root / "pcf_run.log"
+        glb.write_bytes(b"pcf")
+        diagnostics.write_bytes(b"png")
+        log.write_text("complete\n", encoding="utf-8")
+        progress(1.0, "Fake PCF complete")
+        return {
+            "schema": "noesis.phone_scan.pcf_review.v1",
+            "method": "prior_conditioned_consensus_da3_carrier",
+            "review_only": True,
+            "published_to_scene_prior": False,
+            "coordinate_frame": "backend_world_m_stream_points",
+            "target_camera_id": target.camera_id,
+            "target_revision_id": target.target_revision.name,
+            "view_count": 12,
+            "fusion": {"agreement_fraction_of_both": 0.9},
+            "surfel_fusion": {"surfel_count": 1234},
+            "multiview_consistency": {"consensus": {"p80_error_m": 0.05}},
+            "heldout_even_to_odd_reprojection": {
+                "consensus": {
+                    "even_frame_map_to_odd_frame_depth_median_m": 0.04,
+                    "odd_frame_valid_pixel_coverage_fraction": 0.8,
+                }
+            },
+            "evaluation": {
+                "fixed_camera_visible_cloud_metrics": {
+                    "source_overlap_0_30m": 0.75
+                }
+            },
+            "artifacts": {
+                "pcf_glb": glb.relative_to(run_root).as_posix(),
+                "diagnostic_layers": diagnostics.relative_to(run_root).as_posix(),
+                "run_log": log.relative_to(run_root).as_posix(),
+            },
+            "files": [
+                {
+                    "path": glb.relative_to(run_root).as_posix(),
+                    "size_bytes": glb.stat().st_size,
+                }
+            ],
+        }
+
+    app = create_app(
+        replace(_settings(tmp_path), pcf_pause_appliance=True),
+        pcf_runner=fake_pcf,
+    )
+    service = app.state.phone_scan_service
+    appliance_active = True
+    runtime_calls: list[tuple[str, str]] = []
+
+    def fake_unit_active(unit: str) -> bool:
+        return appliance_active if unit in {
+            "menon-appliance.target",
+            "noesis-appliance.service",
+        } else False
+
+    def fake_systemctl(action: str, unit: str, *, timeout_s: int) -> None:
+        nonlocal appliance_active
+        assert timeout_s > 0
+        runtime_calls.append((action, unit))
+        appliance_active = action == "start"
+
+    service._user_unit_active = fake_unit_active
+    service._systemctl_user = fake_systemctl
+    scan_id = "20260816-010000-1234abcd"
+    scan_dir = service.scan_dir(scan_id)
+    scan_dir.mkdir(parents=True)
+    service._write_state_unlocked(
+        scan_id,
+        {
+            "schema": "noesis.phone_scan.state.v2",
+            "id": scan_id,
+            "name": "Aligned DA3 PCF test",
+            "created_at": "2026-08-16T01:00:00+00:00",
+            "updated_at": "2026-08-16T01:00:00+00:00",
+            "status": "complete",
+            "progress": 1.0,
+            "message": "complete",
+            "error": None,
+            "provider": "da3",
+            "video": {"path": "phone_walk.mp4", "size_bytes": 1},
+            "prepared": {"frame_count": 12, "frames": []},
+            "outputs": {"provider": "da3", "view_count": 12},
+            "alignment": {
+                "status": "complete",
+                "target_camera_id": "family-room",
+                "target_revision_id": "family-room-revision",
+                "results": {
+                    "target_camera_id": "family-room",
+                    "target_revision_id": "family-room-revision",
+                    "quality_gate": {"passed": True},
+                },
+            },
+        },
+    )
+
+    with TestClient(app) as client:
+        started = client.post(f"/api/scans/{scan_id}/initiate-pcf")
+        assert started.status_code == 202
+        assert started.json()["pcf"]["source_scope"] == "original_prepared_walk"
+        complete = _wait_for_pcf(client, scan_id, "complete")
+        assert complete["pcf"]["results"]["review_only"] is True
+        runtime_lease = complete["pcf"]["results"]["runtime_lease"]
+        assert runtime_lease["appliance_paused"] is True
+        assert runtime_lease["restore_passed"] is True
+        glb_url = complete["pcf"]["results"]["artifact_urls"]["pcf_glb"]
+        assert glb_url.startswith(f"/pcf-assets/{scan_id}/runs/pcf-")
+        assert client.get(glb_url).content == b"pcf"
+        assert client.post(f"/api/scans/{scan_id}/initiate-pcf").status_code == 409
+        pcf_root = service.pcf_scan_dir(scan_id)
+        assert pcf_root.is_dir()
+        assert client.delete(f"/api/scans/{scan_id}").status_code == 204
+        assert not pcf_root.exists()
+
+    assert calls == [(scan_id, "family-room")]
+    assert runtime_calls == [
+        ("stop", "menon-appliance.target"),
+        ("start", "menon-appliance.target"),
+    ]
+
+
+def test_interrupted_pcf_restores_recorded_appliance_lease(tmp_path: Path) -> None:
+    app = create_app(_settings(tmp_path))
+    service = app.state.phone_scan_service
+    scan_id = "20260816-020000-1234abcd"
+    scan_dir = service.scan_dir(scan_id)
+    scan_dir.mkdir(parents=True)
+    service._write_state_unlocked(
+        scan_id,
+        {
+            "schema": "noesis.phone_scan.state.v2",
+            "id": scan_id,
+            "name": "Interrupted PCF test",
+            "created_at": "2026-08-16T02:00:00+00:00",
+            "updated_at": "2026-08-16T02:00:00+00:00",
+            "status": "complete",
+            "progress": 1.0,
+            "message": "complete",
+            "error": None,
+            "provider": "da3",
+            "pcf": {
+                "run_id": "pcf-20260816-020000-1234abcd",
+                "status": "running",
+                "runtime_lease": {
+                    "appliance_target": "menon-appliance.target",
+                    "appliance_was_active": True,
+                    "pause_requested": True,
+                    "appliance_paused": True,
+                    "restore_passed": None,
+                },
+            },
+        },
+    )
+    runtime_calls: list[tuple[str, str]] = []
+    service._systemctl_user = lambda action, unit, *, timeout_s: runtime_calls.append(
+        (action, unit)
+    )
+    service._user_unit_active = lambda unit: unit == "noesis-appliance.service"
+
+    service.recover_interrupted_states()
+
+    recovered = service.read_state(scan_id)["pcf"]
+    assert recovered["status"] == "failed"
+    assert recovered["runtime_lease"]["restore_passed"] is True
+    assert recovered["runtime_lease"]["recovered_after_tool_restart"] is True
+    assert runtime_calls == [("start", "menon-appliance.target")]

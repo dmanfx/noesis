@@ -1,15 +1,18 @@
 from __future__ import annotations
 
 import json
+import hashlib
+import math
 import os
 import re
 import shutil
+import subprocess
 import threading
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from copy import deepcopy
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
@@ -20,14 +23,24 @@ from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 from .alignment import NoesisAlignmentSettings, run_noesis_alignment
-from .da3_inference import DA3PhoneScanSettings, run_da3_phone_scan
-from .inference import MapAnythingScanSettings, run_mapanything_scan
+from .da3_inference import DA3PhoneScanSettings
+from .inference import MapAnythingScanSettings
+from .windowed_inference import run_adaptive_mapanything_scan
+from .windowed_da3_inference import run_adaptive_da3_phone_scan
+from .pcf import run_pcf_review_candidate
 from .processing import FramePreparationSettings, prepare_video_frames
+from .supplement import (
+    SupplementIntegrationSettings,
+    materialize_noesis_revision,
+    public_active_revision,
+    run_supplement_integration,
+)
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 APP_ROOT = Path(__file__).resolve().parent
 SCAN_ID_PATTERN = re.compile(r"^[0-9]{8}-[0-9]{6}-[a-f0-9]{8}$")
+SUPPLEMENT_ID_PATTERN = re.compile(r"^add-[0-9]{8}-[0-9]{6}-[a-f0-9]{8}$")
 CAMERA_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,159}$")
 ALLOWED_VIDEO_SUFFIXES = {".mp4", ".mov", ".m4v", ".webm", ".mkv", ".3gp"}
 INFERENCE_PROVIDERS = {"mapanything", "da3"}
@@ -39,10 +52,21 @@ RUNNING_STATUSES = {
     "da3_queued",
     "da3_running",
 }
+SUPPLEMENT_RUNNING_STATUSES = {"uploading", "processing_frames", "queued", "running"}
+PCF_RUNNING_STATUSES = {"queued", "running"}
+PCF_APPLIANCE_TARGET = "menon-appliance.target"
 
 
 def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def _camera_display_name(camera_id: str) -> str:
@@ -63,6 +87,13 @@ def _env_float(name: str, default: float, *, minimum: float) -> float:
     if value < minimum:
         raise ValueError(f"{name} must be at least {minimum}")
     return value
+
+
+def _env_bool(name: str, default: bool = False) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() not in {"0", "false", "no", "off"}
 
 
 def _resolve_root(raw: str | None, default: Path) -> Path:
@@ -222,9 +253,15 @@ class PhoneScanSettings:
     alignment: NoesisAlignmentSettings
     alignment_targets: tuple[NoesisAlignmentSettings, ...] = ()
     alignment_release_id: str | None = None
+    pcf_storage_root: Path | None = None
+    pcf_pause_appliance: bool = False
 
     @classmethod
     def from_env(cls) -> "PhoneScanSettings":
+        storage_root = _resolve_root(
+            os.environ.get("NOESIS_PHONE_SCAN_STORAGE_ROOT"),
+            REPO_ROOT / "data" / "mapanything_phone_scans",
+        )
         three_root = _resolve_root(
             os.environ.get("NOESIS_PHONE_SCAN_THREE_ROOT"),
             REPO_ROOT / "oai2-fe" / "node_modules" / "three",
@@ -237,14 +274,14 @@ class PhoneScanSettings:
             Path(artifact_root_raw)
             / "models"
             / "engines"
-            / "da3metric_large_294x518_b3_fp16_trt10.13.engine"
+            / "da3metric_large_294x518_b3_fp16_trt10.16.engine"
             if artifact_root_raw
             else REPO_ROOT
             / "data"
             / "ds9_artifacts"
             / "models"
             / "engines"
-            / "da3metric_large_294x518_b3_fp16_trt10.13.engine"
+            / "da3metric_large_294x518_b3_fp16_trt10.16.engine"
         )
         calibration_path = _resolve_root(
             os.environ.get("NOESIS_PHONE_SCAN_ALIGNMENT_CALIBRATION"),
@@ -297,10 +334,7 @@ class PhoneScanSettings:
             _resolve_root(anchor_image_raw, REPO_ROOT) if anchor_enabled else None
         )
         return cls(
-            storage_root=_resolve_root(
-                os.environ.get("NOESIS_PHONE_SCAN_STORAGE_ROOT"),
-                REPO_ROOT / "data" / "mapanything_phone_scans",
-            ),
+            storage_root=storage_root,
             static_root=APP_ROOT / "static",
             three_root=three_root,
             max_upload_bytes=_env_int(
@@ -309,8 +343,27 @@ class PhoneScanSettings:
                 minimum=1024 * 1024,
             ),
             frame=FramePreparationSettings(
-                target_fps=_env_float("NOESIS_PHONE_SCAN_TARGET_FPS", 2.0, minimum=0.1),
-                max_frames=_env_int("NOESIS_PHONE_SCAN_MAX_FRAMES", 48, minimum=2),
+                candidate_fps=_env_float(
+                    "NOESIS_PHONE_SCAN_CANDIDATE_FPS", 4.0, minimum=0.5
+                ),
+                max_candidate_frames=_env_int(
+                    "NOESIS_PHONE_SCAN_MAX_CANDIDATE_FRAMES", 1200, minimum=8
+                ),
+                max_selected_frames=_env_int(
+                    "NOESIS_PHONE_SCAN_MAX_SELECTED_FRAMES", 256, minimum=8
+                ),
+                candidate_edge_px=_env_int(
+                    "NOESIS_PHONE_SCAN_CANDIDATE_EDGE_PX", 1280, minimum=518
+                ),
+                feature_edge_px=_env_int(
+                    "NOESIS_PHONE_SCAN_FEATURE_EDGE_PX", 640, minimum=320
+                ),
+                min_keyframe_interval_s=_env_float(
+                    "NOESIS_PHONE_SCAN_MIN_KEYFRAME_INTERVAL_S", 0.40, minimum=0.10
+                ),
+                max_keyframe_interval_s=_env_float(
+                    "NOESIS_PHONE_SCAN_MAX_KEYFRAME_INTERVAL_S", 1.25, minimum=0.30
+                ),
                 max_edge_px=_env_int("NOESIS_PHONE_SCAN_MAX_EDGE_PX", 1920, minimum=518),
             ),
             mapanything=MapAnythingScanSettings(
@@ -325,6 +378,12 @@ class PhoneScanSettings:
                 ).strip().lower()
                 not in {"0", "false", "no", "off"},
                 anchor_image=anchor_image,
+                max_joint_views=_env_int(
+                    "NOESIS_PHONE_SCAN_MA_MAX_JOINT_VIEWS", 80, minimum=16
+                ),
+                window_overlap_views=_env_int(
+                    "NOESIS_PHONE_SCAN_MA_WINDOW_OVERLAP_VIEWS", 24, minimum=4
+                ),
             ),
             da3=DA3PhoneScanSettings(
                 model_id=os.environ.get(
@@ -346,11 +405,24 @@ class PhoneScanSettings:
                     os.environ.get("NOESIS_PHONE_SCAN_DA3_ENGINE"),
                     default_da3_engine,
                 ),
+                max_joint_views=_env_int(
+                    "NOESIS_PHONE_SCAN_DA3_MAX_JOINT_VIEWS", 48, minimum=16
+                ),
+                window_overlap_views=_env_int(
+                    "NOESIS_PHONE_SCAN_DA3_WINDOW_OVERLAP_VIEWS", 16, minimum=4
+                ),
                 anchor_image=anchor_image,
             ),
             alignment=alignment,
             alignment_targets=alignment_targets,
             alignment_release_id=alignment_release_id,
+            pcf_storage_root=_resolve_root(
+                os.environ.get("NOESIS_PHONE_SCAN_PCF_STORAGE_ROOT"),
+                storage_root / "pcf",
+            ),
+            pcf_pause_appliance=_env_bool(
+                "NOESIS_PHONE_SCAN_PCF_PAUSE_APPLIANCE", False
+            ),
         )
 
 
@@ -370,6 +442,87 @@ AlignmentRunner = Callable[
     [Path, Path, dict[str, Any], NoesisAlignmentSettings, Callable[[float, str], None]],
     dict[str, Any],
 ]
+SupplementRunner = Callable[
+    [
+        Path,
+        Path,
+        Path,
+        dict[str, Any],
+        dict[str, Any],
+        str,
+        Callable[..., dict[str, Any]],
+        Any,
+        SupplementIntegrationSettings,
+        Callable[[float, str], None],
+    ],
+    dict[str, Any],
+]
+PCFRunner = Callable[
+    [
+        Path,
+        Path,
+        dict[str, Any],
+        NoesisAlignmentSettings,
+        MapAnythingScanSettings,
+        Callable[[float, str], None],
+    ],
+    dict[str, Any],
+]
+
+
+def _prepared_paths_in_scan(
+    scan_dir: Path,
+    prepared_root: Path,
+    prepared: dict[str, Any],
+) -> dict[str, Any]:
+    result = deepcopy(prepared)
+
+    def rewrite(raw: str) -> str:
+        candidate = (prepared_root / raw).resolve()
+        try:
+            candidate.relative_to(prepared_root.resolve())
+            return candidate.relative_to(scan_dir.resolve()).as_posix()
+        except ValueError as exc:
+            raise ValueError(f"prepared artifact escaped its added-video directory: {raw}") from exc
+
+    for key in ("contact_sheet", "manifest"):
+        if isinstance(result.get(key), str):
+            result[key] = rewrite(result[key])
+    frames = result.get("frames")
+    if isinstance(frames, list):
+        for row in frames:
+            if not isinstance(row, dict):
+                continue
+            for key in ("frame", "thumbnail"):
+                if isinstance(row.get(key), str):
+                    row[key] = rewrite(row[key])
+    return result
+
+
+def _pcf_paths_for_state(run_id: str, result: dict[str, Any]) -> dict[str, Any]:
+    public = deepcopy(result)
+    prefix = Path("runs") / run_id
+
+    def rewrite(raw: str) -> str:
+        relative = Path(raw)
+        if relative.is_absolute() or ".." in relative.parts:
+            raise ValueError(f"PCF artifact path is unsafe: {raw}")
+        return (prefix / relative).as_posix()
+
+    artifacts = public.get("artifacts")
+    if isinstance(artifacts, dict):
+        public["artifacts"] = {
+            key: rewrite(value)
+            for key, value in artifacts.items()
+            if isinstance(value, str)
+        }
+    files = public.get("files")
+    if isinstance(files, list):
+        for item in files:
+            if isinstance(item, dict) and isinstance(item.get("path"), str):
+                item["path"] = rewrite(item["path"])
+    public["run_root"] = prefix.as_posix()
+    return public
 
 
 class PhoneScanService:
@@ -378,16 +531,34 @@ class PhoneScanService:
         settings: PhoneScanSettings,
         *,
         frame_processor: FrameProcessor = prepare_video_frames,
-        inference_runner: InferenceRunner = run_mapanything_scan,
-        da3_inference_runner: DA3InferenceRunner = run_da3_phone_scan,
+        inference_runner: InferenceRunner = run_adaptive_mapanything_scan,
+        da3_inference_runner: DA3InferenceRunner = run_adaptive_da3_phone_scan,
         alignment_runner: AlignmentRunner = run_noesis_alignment,
+        supplement_runner: SupplementRunner = run_supplement_integration,
+        pcf_runner: PCFRunner = run_pcf_review_candidate,
     ) -> None:
         self.settings = settings
         self.frame_processor = frame_processor
         self.inference_runner = inference_runner
         self.da3_inference_runner = da3_inference_runner
         self.alignment_runner = alignment_runner
+        self.supplement_runner = supplement_runner
+        self.pcf_runner = pcf_runner
+        self.supplement_settings = SupplementIntegrationSettings(
+            max_total_views=self.settings.mapanything.max_joint_views,
+            point_budget=max(
+                self.settings.mapanything.point_budget,
+                self.settings.da3.point_budget,
+            ),
+        )
         self.settings.storage_root.mkdir(parents=True, exist_ok=True)
+        self.pcf_storage_root = (
+            self.settings.pcf_storage_root
+            or self.settings.storage_root / "pcf"
+        ).resolve()
+        if self.pcf_storage_root == self.settings.storage_root:
+            raise ValueError("PCF storage root must not equal the phone-scan storage root")
+        self.pcf_storage_root.mkdir(parents=True, exist_ok=True)
         configured_alignment_targets = self.settings.alignment_targets or (
             self.settings.alignment,
         )
@@ -431,6 +602,27 @@ class PhoneScanService:
             raise HTTPException(status.HTTP_404_NOT_FOUND, "Scan not found") from exc
         return candidate
 
+    def supplement_dir(self, scan_id: str, supplement_id: str) -> Path:
+        if not SUPPLEMENT_ID_PATTERN.fullmatch(supplement_id):
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "Added video not found")
+        root = (self.scan_dir(scan_id) / "supplements").resolve()
+        candidate = (root / supplement_id).resolve()
+        try:
+            candidate.relative_to(root)
+        except ValueError as exc:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "Added video not found") from exc
+        return candidate
+
+    def pcf_scan_dir(self, scan_id: str) -> Path:
+        if not SCAN_ID_PATTERN.fullmatch(scan_id):
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "Scan not found")
+        candidate = (self.pcf_storage_root / scan_id).resolve()
+        try:
+            candidate.relative_to(self.pcf_storage_root)
+        except ValueError as exc:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "Scan not found") from exc
+        return candidate
+
     def _state_path(self, scan_id: str) -> Path:
         return self.scan_dir(scan_id) / "scan_state.json"
 
@@ -463,6 +655,68 @@ class PhoneScanService:
             state.update(changes)
             self._write_state_unlocked(scan_id, state)
             return state
+
+    @staticmethod
+    def _supplement_index(state: dict[str, Any], supplement_id: str) -> int:
+        supplements = state.get("supplements")
+        if not isinstance(supplements, list):
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "Added video not found")
+        for index, supplement in enumerate(supplements):
+            if isinstance(supplement, dict) and supplement.get("id") == supplement_id:
+                return index
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Added video not found")
+
+    def add_supplement(self, scan_id: str, supplement: dict[str, Any]) -> dict[str, Any]:
+        with self._lock(scan_id):
+            state = self._read_state_unlocked(scan_id)
+            if state.get("status") != "complete" or not isinstance(state.get("outputs"), dict):
+                raise HTTPException(
+                    status.HTTP_409_CONFLICT,
+                    "Additional video requires a completed reconstruction",
+                )
+            pcf = state.get("pcf")
+            if isinstance(pcf, dict) and pcf.get("status") in PCF_RUNNING_STATUSES:
+                raise HTTPException(
+                    status.HTTP_409_CONFLICT,
+                    "Wait for the PCF review run to finish before adding another video",
+                )
+            supplements = list(state.get("supplements") or [])
+            if any(
+                isinstance(row, dict)
+                and row.get("status") in SUPPLEMENT_RUNNING_STATUSES
+                for row in supplements
+            ):
+                raise HTTPException(
+                    status.HTTP_409_CONFLICT,
+                    "Another added video is still being prepared or integrated",
+                )
+            supplements.append(supplement)
+            state["supplements"] = supplements
+            self._write_state_unlocked(scan_id, state)
+            return state
+
+    def update_supplement(
+        self,
+        scan_id: str,
+        supplement_id: str,
+        **changes: Any,
+    ) -> dict[str, Any]:
+        with self._lock(scan_id):
+            state = self._read_state_unlocked(scan_id)
+            index = self._supplement_index(state, supplement_id)
+            supplement = dict(state["supplements"][index])
+            supplement.update(changes)
+            supplement["updated_at"] = _utc_now()
+            state["supplements"][index] = supplement
+            self._write_state_unlocked(scan_id, state)
+            return state
+
+    def discard_supplement_state(self, scan_id: str, supplement_id: str) -> None:
+        with self._lock(scan_id):
+            state = self._read_state_unlocked(scan_id)
+            index = self._supplement_index(state, supplement_id)
+            del state["supplements"][index]
+            self._write_state_unlocked(scan_id, state)
 
     def rename_scan(self, scan_id: str, name: str) -> dict[str, Any]:
         normalized_name = " ".join(str(name).split())
@@ -524,6 +778,109 @@ class PhoneScanService:
                     }
                 )
                 self.update_state(scan_id, alignment=alignment)
+            restore_interrupted_appliance = False
+            with self._lock(scan_id):
+                latest = self._read_state_unlocked(scan_id)
+                supplements = latest.get("supplements")
+                changed = False
+                pcf = latest.get("pcf")
+                if isinstance(pcf, dict) and pcf.get("status") in PCF_RUNNING_STATUSES:
+                    interrupted_pcf = dict(pcf)
+                    runtime_lease = dict(interrupted_pcf.get("runtime_lease") or {})
+                    restore_interrupted_appliance = bool(
+                        runtime_lease.get("appliance_target") == PCF_APPLIANCE_TARGET
+                        and runtime_lease.get("appliance_was_active") is True
+                        and runtime_lease.get("pause_requested") is True
+                        and runtime_lease.get("restore_passed") is not True
+                    )
+                    interrupted_pcf.update(
+                        {
+                            "status": "failed",
+                            "progress": 0.0,
+                            "message": "PCF was interrupted by a tool restart",
+                            "error": (
+                                "The DA3 walk, alignment, and any completed PCF stage "
+                                "outputs are preserved; retry PCF to create a new run."
+                            ),
+                            "updated_at": _utc_now(),
+                        }
+                    )
+                    latest["pcf"] = interrupted_pcf
+                    changed = True
+                if isinstance(supplements, list):
+                    for index, supplement in enumerate(supplements):
+                        if not isinstance(supplement, dict):
+                            continue
+                        previous_status = supplement.get("status")
+                        updated = dict(supplement)
+                        if previous_status in {"uploading", "processing_frames"}:
+                            updated.update(
+                                {
+                                    "status": "frame_failed",
+                                    "progress": 0.0,
+                                    "message": "Additional-video preparation was interrupted by a tool restart",
+                                    "error": "Delete this incomplete addition and upload the video again.",
+                                }
+                            )
+                        elif previous_status in {"queued", "running"}:
+                            updated.update(
+                                {
+                                    "status": "integration_failed",
+                                    "progress": 0.0,
+                                    "message": "Additional-video integration was interrupted by a tool restart",
+                                    "error": "The video and prepared frames are preserved; retry integration.",
+                                }
+                            )
+                        else:
+                            continue
+                        updated["updated_at"] = _utc_now()
+                        supplements[index] = updated
+                        changed = True
+                if changed:
+                    latest["supplements"] = supplements
+                    self._write_state_unlocked(scan_id, latest)
+            if restore_interrupted_appliance:
+                restore_error: Exception | None = None
+                try:
+                    self._systemctl_user(
+                        "start", PCF_APPLIANCE_TARGET, timeout_s=300
+                    )
+                    if not self._user_unit_active("noesis-appliance.service"):
+                        raise RuntimeError(
+                            "native Noesis was not active after interrupted PCF recovery"
+                        )
+                except Exception as exc:
+                    restore_error = exc
+                try:
+                    with self._lock(scan_id):
+                        latest = self._read_state_unlocked(scan_id)
+                        interrupted_pcf = dict(latest.get("pcf") or {})
+                        runtime_lease = dict(
+                            interrupted_pcf.get("runtime_lease") or {}
+                        )
+                        runtime_lease.update(
+                            {
+                                "restore_passed": restore_error is None,
+                                "restore_error": (
+                                    None
+                                    if restore_error is None
+                                    else f"{type(restore_error).__name__}: "
+                                    f"{restore_error}"
+                                ),
+                                "recovered_after_tool_restart": True,
+                            }
+                        )
+                        interrupted_pcf["runtime_lease"] = runtime_lease
+                        if restore_error is not None:
+                            interrupted_pcf["error"] = (
+                                f"{interrupted_pcf.get('error')} Automatic appliance "
+                                f"restore also failed: {runtime_lease['restore_error']}"
+                            )
+                        interrupted_pcf["updated_at"] = _utc_now()
+                        latest["pcf"] = interrupted_pcf
+                        self._write_state_unlocked(scan_id, latest)
+                except HTTPException:
+                    continue
 
     def list_states(self) -> list[dict[str, Any]]:
         states: list[dict[str, Any]] = []
@@ -577,6 +934,213 @@ class PhoneScanService:
                 message="Frame preparation failed",
                 error=f"{type(exc).__name__}: {exc}",
             )
+
+    def submit_supplement_preparation(self, scan_id: str, supplement_id: str) -> None:
+        self._executor.submit(self._prepare_supplement_worker, scan_id, supplement_id)
+
+    def _supplement_progress(
+        self,
+        scan_id: str,
+        supplement_id: str,
+        fraction: float,
+        message: str,
+    ) -> None:
+        try:
+            self.update_supplement(
+                scan_id,
+                supplement_id,
+                progress=float(min(1.0, max(0.0, fraction))),
+                message=str(message),
+            )
+        except HTTPException:
+            return
+
+    def _prepare_supplement_worker(self, scan_id: str, supplement_id: str) -> None:
+        try:
+            state = self.read_state(scan_id)
+            index = self._supplement_index(state, supplement_id)
+            supplement = state["supplements"][index]
+            scan_dir = self.scan_dir(scan_id)
+            supplement_dir = self.supplement_dir(scan_id, supplement_id)
+            video_path = scan_dir / str(supplement["video"]["path"])
+            frame_settings = replace(
+                self.settings.frame,
+                max_selected_frames=self.supplement_settings.new_view_limit,
+            )
+            prepared_local = self.frame_processor(
+                video_path,
+                supplement_dir,
+                frame_settings,
+                lambda fraction, message: self._supplement_progress(
+                    scan_id, supplement_id, fraction, message
+                ),
+            )
+            prepared = _prepared_paths_in_scan(
+                scan_dir, supplement_dir, prepared_local
+            )
+            provider = str(state.get("provider") or state["outputs"].get("provider") or "mapanything")
+            label = "DA3" if provider == "da3" else "MapAnything"
+            self.update_supplement(
+                scan_id,
+                supplement_id,
+                status="ready",
+                progress=1.0,
+                message=(
+                    f"{prepared['frame_count']} new views are ready to bridge into the "
+                    f"current {label} reconstruction"
+                ),
+                error=None,
+                prepared=prepared,
+                provider=provider,
+            )
+        except Exception as exc:
+            try:
+                self.update_supplement(
+                    scan_id,
+                    supplement_id,
+                    status="frame_failed",
+                    progress=0.0,
+                    message="Additional-video frame preparation failed",
+                    error=f"{type(exc).__name__}: {exc}",
+                )
+            except HTTPException:
+                return
+
+    def initiate_supplement_integration(
+        self, scan_id: str, supplement_id: str
+    ) -> dict[str, Any]:
+        with self._lock(scan_id):
+            state = self._read_state_unlocked(scan_id)
+            pcf = state.get("pcf")
+            if isinstance(pcf, dict) and pcf.get("status") in PCF_RUNNING_STATUSES:
+                raise HTTPException(
+                    status.HTTP_409_CONFLICT,
+                    "Wait for the PCF review run to finish before integrating another video",
+                )
+            index = self._supplement_index(state, supplement_id)
+            supplement = dict(state["supplements"][index])
+            if supplement.get("status") not in {"ready", "integration_failed"}:
+                raise HTTPException(
+                    status.HTTP_409_CONFLICT,
+                    "This added video is not ready to integrate",
+                )
+            if any(
+                row_index != index
+                and isinstance(row, dict)
+                and row.get("status") in SUPPLEMENT_RUNNING_STATUSES
+                for row_index, row in enumerate(state["supplements"])
+            ):
+                raise HTTPException(
+                    status.HTTP_409_CONFLICT,
+                    "Another added video is still being prepared or integrated",
+                )
+            provider = str(
+                supplement.get("provider")
+                or state.get("provider")
+                or state.get("outputs", {}).get("provider")
+                or "mapanything"
+            ).lower()
+            if provider not in INFERENCE_PROVIDERS:
+                raise HTTPException(
+                    status.HTTP_409_CONFLICT,
+                    "The base reconstruction provider is unavailable",
+                )
+            supplement.update(
+                {
+                    "status": "queued",
+                    "progress": 0.0,
+                    "message": "Waiting for the reconstruction GPU lane",
+                    "error": None,
+                    "provider": provider,
+                }
+            )
+            state["supplements"][index] = supplement
+            self._write_state_unlocked(scan_id, state)
+        self._executor.submit(
+            self._supplement_integration_worker, scan_id, supplement_id, provider
+        )
+        return state
+
+    def _supplement_integration_worker(
+        self, scan_id: str, supplement_id: str, provider: str
+    ) -> None:
+        runner = (
+            self.inference_runner if provider == "mapanything" else self.da3_inference_runner
+        )
+        provider_settings = (
+            self.settings.mapanything if provider == "mapanything" else self.settings.da3
+        )
+        label = "MapAnything" if provider == "mapanything" else "DA3"
+        with self._inference_lock:
+            scan_dir = self.scan_dir(scan_id)
+            supplement_dir = self.supplement_dir(scan_id, supplement_id)
+            build_dir = supplement_dir / ".revision-building"
+            final_dir = supplement_dir / "revision"
+            try:
+                state = self.read_state(scan_id)
+                supplement_index = self._supplement_index(state, supplement_id)
+                supplement = dict(state["supplements"][supplement_index])
+                self.update_supplement(
+                    scan_id,
+                    supplement_id,
+                    status="running",
+                    progress=0.01,
+                    message=f"Starting joint {label} bridge reconstruction",
+                    error=None,
+                )
+                if build_dir.exists():
+                    shutil.rmtree(build_dir)
+                if final_dir.exists():
+                    raise RuntimeError("this added video already has a completed revision")
+                result = self.supplement_runner(
+                    scan_dir,
+                    supplement_dir,
+                    build_dir,
+                    state,
+                    supplement,
+                    provider,
+                    runner,
+                    provider_settings,
+                    self.supplement_settings,
+                    lambda fraction, message: self._supplement_progress(
+                        scan_id, supplement_id, fraction, message
+                    ),
+                )
+                os.replace(build_dir, final_dir)
+                with self._lock(scan_id):
+                    latest = self._read_state_unlocked(scan_id)
+                    index = self._supplement_index(latest, supplement_id)
+                    completed = dict(latest["supplements"][index])
+                    completed.update(
+                        {
+                            "status": "complete",
+                            "progress": 1.0,
+                            "message": "Added video is registered and saved as the current revision",
+                            "error": None,
+                            "results": result,
+                            "updated_at": _utc_now(),
+                        }
+                    )
+                    latest["supplements"][index] = completed
+                    latest["active_revision"] = public_active_revision(result)
+                    self._write_state_unlocked(scan_id, latest)
+            except Exception as exc:
+                if build_dir.exists():
+                    shutil.rmtree(build_dir)
+                try:
+                    self.update_supplement(
+                        scan_id,
+                        supplement_id,
+                        status="integration_failed",
+                        progress=0.0,
+                        message=(
+                            "Added video was not merged; the base reconstruction and "
+                            "prepared frames are preserved"
+                        ),
+                        error=f"{type(exc).__name__}: {exc}",
+                    )
+                except HTTPException:
+                    return
 
     def initiate_mapanything(self, scan_id: str) -> dict[str, Any]:
         return self.initiate_inference(scan_id, "mapanything")
@@ -765,7 +1329,36 @@ class PhoneScanService:
                         "results": result,
                     }
                 )
-                self.update_state(scan_id, alignment=alignment)
+                with self._lock(scan_id):
+                    latest = self._read_state_unlocked(scan_id)
+                    active = latest.get("active_revision")
+                    if isinstance(active, dict) and active.get("supplement_id"):
+                        supplement_id = str(active["supplement_id"])
+                        supplement_index = self._supplement_index(latest, supplement_id)
+                        supplement = dict(latest["supplements"][supplement_index])
+                        supplement_result = supplement.get("results")
+                        if not isinstance(supplement_result, dict):
+                            raise RuntimeError("the active added-video revision is missing")
+                        try:
+                            supplement_result = materialize_noesis_revision(
+                                scan_dir, supplement_result, result
+                            )
+                            supplement["results"] = supplement_result
+                            supplement["updated_at"] = _utc_now()
+                            latest["supplements"][supplement_index] = supplement
+                            latest["active_revision"] = public_active_revision(
+                                supplement_result
+                            )
+                        except Exception as derivative_exc:
+                            alignment["active_revision_derivative_error"] = (
+                                f"{type(derivative_exc).__name__}: {derivative_exc}"
+                            )
+                            active["noesis_derivative_error"] = alignment[
+                                "active_revision_derivative_error"
+                            ]
+                            latest["active_revision"] = active
+                    latest["alignment"] = alignment
+                    self._write_state_unlocked(scan_id, latest)
             except Exception as exc:
                 if build_dir.exists():
                     shutil.rmtree(build_dir)
@@ -801,16 +1394,89 @@ class PhoneScanService:
                     status.HTTP_409_CONFLICT,
                     "A running alignment cannot be deleted; wait for it to finish or fail",
                 )
+            if any(
+                isinstance(row, dict)
+                and row.get("status") in SUPPLEMENT_RUNNING_STATUSES
+                for row in state.get("supplements") or []
+            ):
+                raise HTTPException(
+                    status.HTTP_409_CONFLICT,
+                    "A running added video cannot be deleted; wait for it to finish or fail",
+                )
+            pcf = state.get("pcf")
+            if isinstance(pcf, dict) and pcf.get("status") in PCF_RUNNING_STATUSES:
+                raise HTTPException(
+                    status.HTTP_409_CONFLICT,
+                    "A running PCF job cannot be deleted; wait for it to finish or fail",
+                )
             scan_dir = self.scan_dir(scan_id)
             if scan_dir.parent != self.settings.storage_root:
                 raise HTTPException(status.HTTP_400_BAD_REQUEST, "Unsafe scan path")
             shutil.rmtree(scan_dir)
+            pcf_scan_dir = self.pcf_scan_dir(scan_id)
+            if pcf_scan_dir.exists():
+                if pcf_scan_dir.parent != self.pcf_storage_root:
+                    raise HTTPException(status.HTTP_400_BAD_REQUEST, "Unsafe PCF scan path")
+                shutil.rmtree(pcf_scan_dir)
         with self._locks_guard:
             self._scan_locks.pop(scan_id, None)
+
+    def delete_supplement(self, scan_id: str, supplement_id: str) -> None:
+        with self._lock(scan_id):
+            state = self._read_state_unlocked(scan_id)
+            index = self._supplement_index(state, supplement_id)
+            supplement = state["supplements"][index]
+            if supplement.get("status") in SUPPLEMENT_RUNNING_STATUSES:
+                raise HTTPException(
+                    status.HTTP_409_CONFLICT,
+                    "A running added video cannot be deleted",
+                )
+            result = supplement.get("results")
+            revision_id = result.get("revision_id") if isinstance(result, dict) else None
+            if revision_id:
+                for other in state["supplements"]:
+                    if other is supplement or not isinstance(other, dict):
+                        continue
+                    other_result = other.get("results")
+                    if (
+                        isinstance(other_result, dict)
+                        and other_result.get("parent_revision_id") == revision_id
+                    ):
+                        raise HTTPException(
+                            status.HTTP_409_CONFLICT,
+                            "Delete the newer dependent added video first",
+                        )
+            supplement_dir = self.supplement_dir(scan_id, supplement_id)
+            if supplement_dir.exists():
+                shutil.rmtree(supplement_dir)
+            del state["supplements"][index]
+            active = state.get("active_revision")
+            if isinstance(active, dict) and active.get("supplement_id") == supplement_id:
+                parent_revision_id = (
+                    result.get("parent_revision_id") if isinstance(result, dict) else None
+                )
+                replacement = None
+                for row in state["supplements"]:
+                    row_result = row.get("results") if isinstance(row, dict) else None
+                    if (
+                        isinstance(row_result, dict)
+                        and row_result.get("revision_id") == parent_revision_id
+                    ):
+                        replacement = public_active_revision(row_result)
+                        break
+                if replacement is None:
+                    state.pop("active_revision", None)
+                else:
+                    state["active_revision"] = replacement
+            self._write_state_unlocked(scan_id, state)
 
 
 def _asset_url(scan_id: str, relative_path: str) -> str:
     return f"/assets/{scan_id}/{quote(relative_path, safe='/')}"
+
+
+def _pcf_asset_url(scan_id: str, relative_path: str) -> str:
+    return f"/pcf-assets/{scan_id}/{quote(relative_path, safe='/')}"
 
 
 def _public_state(state: dict[str, Any]) -> dict[str, Any]:
@@ -877,6 +1543,77 @@ def _public_state(state: dict[str, Any]) -> dict[str, Any]:
                 for item in files:
                     if isinstance(item, dict) and isinstance(item.get("path"), str):
                         item["url"] = _asset_url(scan_id, item["path"])
+    supplements = public.get("supplements")
+    if isinstance(supplements, list):
+        for supplement in supplements:
+            if not isinstance(supplement, dict):
+                continue
+            supplement_video = supplement.get("video")
+            if (
+                isinstance(supplement_video, dict)
+                and isinstance(supplement_video.get("path"), str)
+            ):
+                supplement_video["url"] = _asset_url(
+                    scan_id, supplement_video["path"]
+                )
+            supplement_prepared = supplement.get("prepared")
+            if isinstance(supplement_prepared, dict):
+                for key in ("contact_sheet", "manifest"):
+                    if isinstance(supplement_prepared.get(key), str):
+                        supplement_prepared[f"{key}_url"] = _asset_url(
+                            scan_id, supplement_prepared[key]
+                        )
+                for frame in supplement_prepared.get("frames") or []:
+                    if not isinstance(frame, dict):
+                        continue
+                    for key in ("frame", "thumbnail"):
+                        if isinstance(frame.get(key), str):
+                            frame[f"{key}_url"] = _asset_url(scan_id, frame[key])
+            results = supplement.get("results")
+            if isinstance(results, dict):
+                artifacts = results.get("artifacts")
+                if isinstance(artifacts, dict):
+                    results["artifact_urls"] = {
+                        key: _asset_url(scan_id, value)
+                        for key, value in artifacts.items()
+                        if isinstance(value, str)
+                    }
+                for item in results.get("files") or []:
+                    if isinstance(item, dict) and isinstance(item.get("path"), str):
+                        item["url"] = _asset_url(scan_id, item["path"])
+                for frame in results.get("capture_views") or []:
+                    if not isinstance(frame, dict):
+                        continue
+                    for key in ("source_frame", "raw_npz"):
+                        if isinstance(frame.get(key), str):
+                            frame[f"{key}_url"] = _asset_url(scan_id, frame[key])
+    active_revision = public.get("active_revision")
+    if isinstance(active_revision, dict):
+        artifacts = active_revision.get("artifacts")
+        if isinstance(artifacts, dict):
+            active_revision["artifact_urls"] = {
+                key: _asset_url(scan_id, value)
+                for key, value in artifacts.items()
+                if isinstance(value, str)
+            }
+    pcf = public.get("pcf")
+    if isinstance(pcf, dict):
+        if isinstance(pcf.get("log"), str):
+            pcf["log_url"] = _pcf_asset_url(scan_id, pcf["log"])
+        results = pcf.get("results")
+        if isinstance(results, dict):
+            artifacts = results.get("artifacts")
+            if isinstance(artifacts, dict):
+                results["artifact_urls"] = {
+                    key: _pcf_asset_url(scan_id, value)
+                    for key, value in artifacts.items()
+                    if isinstance(value, str)
+                }
+            files = results.get("files")
+            if isinstance(files, list):
+                for item in files:
+                    if isinstance(item, dict) and isinstance(item.get("path"), str):
+                        item["url"] = _pcf_asset_url(scan_id, item["path"])
     return public
 
 
@@ -903,9 +1640,11 @@ def create_app(
     settings: PhoneScanSettings | None = None,
     *,
     frame_processor: FrameProcessor = prepare_video_frames,
-    inference_runner: InferenceRunner = run_mapanything_scan,
-    da3_inference_runner: DA3InferenceRunner = run_da3_phone_scan,
+    inference_runner: InferenceRunner = run_adaptive_mapanything_scan,
+    da3_inference_runner: DA3InferenceRunner = run_adaptive_da3_phone_scan,
     alignment_runner: AlignmentRunner = run_noesis_alignment,
+    supplement_runner: SupplementRunner = run_supplement_integration,
+    pcf_runner: PCFRunner = run_pcf_review_candidate,
 ) -> FastAPI:
     configured = settings or PhoneScanSettings.from_env()
     if not configured.static_root.is_dir():
@@ -920,6 +1659,8 @@ def create_app(
         inference_runner=inference_runner,
         da3_inference_runner=da3_inference_runner,
         alignment_runner=alignment_runner,
+        supplement_runner=supplement_runner,
+        pcf_runner=pcf_runner,
     )
 
     @asynccontextmanager
@@ -930,7 +1671,7 @@ def create_app(
 
     app = FastAPI(
         title="Noesis Multi-View Phone Scan",
-        version="1.4.0",
+        version="1.8.1",
         lifespan=lifespan,
     )
     app.state.phone_scan_service = service
@@ -942,12 +1683,22 @@ def create_app(
     @app.get("/api/health")
     async def health() -> dict[str, Any]:
         usage = shutil.disk_usage(configured.storage_root)
+        pcf_usage = shutil.disk_usage(service.pcf_storage_root)
         return {
             "status": "ok",
             "version": app.version,
             "storage_free_bytes": int(usage.free),
-            "target_fps": configured.frame.target_fps,
-            "max_frames": configured.frame.max_frames,
+            "pcf_storage_free_bytes": int(pcf_usage.free),
+            "pcf_review_available": True,
+            "pcf_pauses_appliance": bool(configured.pcf_pause_appliance),
+            "frame_selection": "adaptive_keyframe_selection_v1",
+            "candidate_fps": configured.frame.candidate_fps,
+            "max_candidate_frames": configured.frame.max_candidate_frames,
+            "max_selected_frames": configured.frame.max_selected_frames,
+            "mapanything_max_joint_views": configured.mapanything.max_joint_views,
+            "mapanything_window_overlap_views": configured.mapanything.window_overlap_views,
+            "da3_max_joint_views": configured.da3.max_joint_views,
+            "da3_window_overlap_views": configured.da3.window_overlap_views,
             "model_id": configured.mapanything.model_id,
             "device": configured.mapanything.device,
             "providers": {
@@ -1057,6 +1808,123 @@ def create_app(
             raise
         service.submit_frame_preparation(scan_id)
         return JSONResponse(_public_state(state_payload), status_code=status.HTTP_201_CREATED)
+
+    @app.post(
+        "/api/scans/{scan_id}/supplements",
+        status_code=status.HTTP_201_CREATED,
+    )
+    async def add_video_to_scan(scan_id: str, request: Request) -> JSONResponse:
+        service.read_state(scan_id)
+        filename = unquote(request.headers.get("x-file-name") or "additional_walk.mp4")
+        filename = Path(filename).name[:160] or "additional_walk.mp4"
+        content_type = request.headers.get("content-type") or "application/octet-stream"
+        suffix = _video_suffix(filename, content_type)
+        content_length = request.headers.get("content-length")
+        if content_length:
+            try:
+                declared = int(content_length)
+            except ValueError as exc:
+                raise HTTPException(
+                    status.HTTP_400_BAD_REQUEST, "Invalid Content-Length"
+                ) from exc
+            if declared > configured.max_upload_bytes:
+                raise HTTPException(
+                    status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+                    "Video exceeds the upload limit",
+                )
+
+        supplement_id = (
+            f"add-{datetime.now().strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:8]}"
+        )
+        supplement_dir = service.supplement_dir(scan_id, supplement_id)
+        supplement_dir.parent.mkdir(parents=True, exist_ok=True)
+        supplement_dir.mkdir(exist_ok=False)
+        video_name = f"additional_walk{suffix}"
+        video_path = supplement_dir / video_name
+        relative_video = video_path.relative_to(service.scan_dir(scan_id)).as_posix()
+        temporary = supplement_dir / f".{video_name}.uploading"
+        now = _utc_now()
+        supplement = {
+            "schema": "noesis.phone_scan.supplement.state.v1",
+            "id": supplement_id,
+            "created_at": now,
+            "updated_at": now,
+            "status": "uploading",
+            "progress": 0.0,
+            "message": "Receiving additional room video",
+            "error": None,
+            "video": {
+                "path": relative_video,
+                "original_name": filename,
+                "content_type": content_type,
+            },
+        }
+        state_added = False
+        try:
+            service.add_supplement(scan_id, supplement)
+            state_added = True
+            received = 0
+            with temporary.open("wb") as handle:
+                async for chunk in request.stream():
+                    received += len(chunk)
+                    if received > configured.max_upload_bytes:
+                        raise HTTPException(
+                            status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+                            "Video exceeds the upload limit",
+                        )
+                    handle.write(chunk)
+            if received <= 0:
+                raise HTTPException(
+                    status.HTTP_400_BAD_REQUEST, "The uploaded video is empty"
+                )
+            os.replace(temporary, video_path)
+            state = service.update_supplement(
+                scan_id,
+                supplement_id,
+                status="processing_frames",
+                progress=0.0,
+                message="Additional video saved; preparing new reconstruction views",
+                video={
+                    **supplement["video"],
+                    "size_bytes": received,
+                    "sha256": _sha256_file(video_path),
+                },
+            )
+        except Exception:
+            if temporary.exists():
+                temporary.unlink()
+            if supplement_dir.exists():
+                shutil.rmtree(supplement_dir)
+            if state_added:
+                try:
+                    service.discard_supplement_state(scan_id, supplement_id)
+                except HTTPException:
+                    pass
+            raise
+        service.submit_supplement_preparation(scan_id, supplement_id)
+        return JSONResponse(_public_state(state), status_code=status.HTTP_201_CREATED)
+
+    @app.post(
+        "/api/scans/{scan_id}/supplements/{supplement_id}/integrate",
+        status_code=status.HTTP_202_ACCEPTED,
+    )
+    async def integrate_added_video(
+        scan_id: str, supplement_id: str
+    ) -> JSONResponse:
+        return JSONResponse(
+            _public_state(
+                service.initiate_supplement_integration(scan_id, supplement_id)
+            ),
+            status_code=status.HTTP_202_ACCEPTED,
+        )
+
+    @app.delete(
+        "/api/scans/{scan_id}/supplements/{supplement_id}",
+        status_code=status.HTTP_204_NO_CONTENT,
+    )
+    async def delete_added_video(scan_id: str, supplement_id: str) -> Response:
+        service.delete_supplement(scan_id, supplement_id)
+        return Response(status_code=status.HTTP_204_NO_CONTENT)
 
     @app.post("/api/scans/{scan_id}/initiate-ma", status_code=status.HTTP_202_ACCEPTED)
     async def initiate_mapanything(scan_id: str) -> JSONResponse:

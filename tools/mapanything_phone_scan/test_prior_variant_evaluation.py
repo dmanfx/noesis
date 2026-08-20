@@ -7,10 +7,12 @@ import numpy as np
 
 from tools.mapanything_phone_scan.evaluate_mapanything_prior_variants import (
     _bounded_source,
-    _camera_oriented_bev,
     _parse_args,
     _pose_carrier_alignment_mode,
     _pose_metrics,
+)
+from tools.mapanything_phone_scan.build_conditioned_scene_prior_bundle import (
+    _conditioned_admission_checks,
 )
 
 
@@ -34,12 +36,13 @@ def test_pose_metrics_reports_translation_and_closure() -> None:
     assert metrics["start_end_distance_m"] == 0.5
 
 
-def test_camera_oriented_bev_rotates_hallway_convention_180_degrees() -> None:
-    image = np.arange(12).reshape(3, 4)
-    np.testing.assert_array_equal(
-        _camera_oriented_bev(image),
-        np.asarray([[11, 10, 9, 8], [7, 6, 5, 4], [3, 2, 1, 0]]),
-    )
+def test_evaluator_has_no_room_specific_bev_rotation() -> None:
+    source = Path(
+        "tools/mapanything_phone_scan/evaluate_mapanything_prior_variants.py"
+    ).read_text(encoding="utf-8")
+    assert "np.rot90" not in source
+    assert "rotate_180" not in source
+    assert "foyer/hallway" not in source
 
 
 def test_parse_args_accepts_room_specific_inputs_and_selected_variant(
@@ -102,3 +105,53 @@ def test_pose_carrier_alignment_mode_applies_late_da3_alignment(
     )
 
     assert _pose_carrier_alignment_mode(variant) == "world_from_da3"
+
+
+def _candidate_admission_metrics() -> dict[str, object]:
+    return {
+        "static_cloud_room_bounds_metrics": {"target_overlap_0_30m": 0.41},
+        "fixed_camera_visible_cloud_metrics": {
+            "source_point_count": 100_000,
+            "comparable_point_count": 8_000,
+            "source_overlap_0_30m": 0.90,
+        },
+        "fixed_camera_visible_structure_metrics": {
+            "source_point_count": 4_000,
+            "comparable_point_count": 600,
+            "source_overlap_0_30m": 0.80,
+            "plane_residual_median_m": 0.08,
+        },
+    }
+
+
+def test_conditioned_admission_uses_static_camera_visible_domain() -> None:
+    checks = _conditioned_admission_checks(
+        _candidate_admission_metrics(),
+        metric_scale_preserved=True,
+    )
+
+    assert all(checks.values())
+
+
+def test_conditioned_admission_rejects_low_visible_support() -> None:
+    candidate = _candidate_admission_metrics()
+    candidate["fixed_camera_visible_cloud_metrics"]["comparable_point_count"] = 4_999  # type: ignore[index]
+
+    checks = _conditioned_admission_checks(
+        candidate,
+        metric_scale_preserved=True,
+    )
+
+    assert checks["fixed_camera_visible_support_admitted"] is False
+
+
+def test_conditioned_admission_rejects_bad_vertical_geometry() -> None:
+    candidate = _candidate_admission_metrics()
+    candidate["fixed_camera_visible_structure_metrics"]["plane_residual_median_m"] = 0.11  # type: ignore[index]
+
+    checks = _conditioned_admission_checks(
+        candidate,
+        metric_scale_preserved=True,
+    )
+
+    assert checks["fixed_camera_vertical_structure_admitted"] is False

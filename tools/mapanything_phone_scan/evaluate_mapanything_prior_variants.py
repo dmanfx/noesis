@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any
 
 import matplotlib
+import cv2
 import numpy as np
 
 matplotlib.use("Agg")
@@ -25,8 +26,12 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from tools.mapanything_phone_scan.alignment import (  # noqa: E402
+    _fixed_camera_visible_cloud_metrics,
+    _fixed_camera_visible_structure_metrics,
     _full_cloud_metrics,
+    _project_depth_grid,
     _resolve_target_cloud_for_calibrated_camera,
+    _vertical_structure,
     _write_reprojection,
     _write_topdown,
 )
@@ -41,14 +46,21 @@ from tools.mapanything_phone_scan.render_phone_heatmap_diagnostics import (  # n
     PhoneCloud,
     _apply_rigid,
     _apply_sim3,
+    _camera_positions,
     _colorize,
     _depth_panel,
     _load_raw_phone_cloud,
     _overlay_panel,
     _point_splat,
+    _present_camera_ground,
     _rasterize,
     _render_point_preserving_layers,
     _save_panel,
+)
+from noesis_core.coordinate_frames import (  # noqa: E402
+    CAMERA_LOCAL_RASTER_ORIENTATION,
+    camera_ground_frame_from_camera_to_world,
+    transform_positions,
 )
 from tools.mapanything_phone_scan.run_mapanything_prior_variants import (  # noqa: E402
     VARIANT_SPECS,
@@ -71,11 +83,6 @@ class Candidate:
     alignment_rotation: np.ndarray
     alignment_translation: np.ndarray
     alignment_method: str
-
-
-def _camera_oriented_bev(image: np.ndarray) -> np.ndarray:
-    """Put the foyer/hallway at the review convention's top-left."""
-    return np.rot90(np.asarray(image), 2).copy()
 
 
 def _load_target_points(revision: Path) -> tuple[np.ndarray, np.ndarray]:
@@ -261,62 +268,50 @@ def _render_diagnostic_montage(
         ),
         (
             "Observed Height Floorplan · Primary",
-            _camera_oriented_bev(_colorize(grids["height"], "inferno", observed)),
+            _colorize(grids["height"], "inferno", observed),
         ),
-        ("Structural Composite (Diagnostic)", _camera_oriented_bev(grids["structural"])),
+        ("Structural Composite (Diagnostic)", grids["structural"]),
         (
             "Density (Grayscale)",
-            _camera_oriented_bev(
-                _colorize(grids["density"], "gray", observed, (0.0, 1.0))
-            ),
+            _colorize(grids["density"], "gray", observed, (0.0, 1.0)),
         ),
         (
             "Raw Height (Inferno)",
-            _camera_oriented_bev(_colorize(grids["height"], "inferno", observed)),
+            _colorize(grids["height"], "inferno", observed),
         ),
         (
             "Raw Height (Contrast)",
-            _camera_oriented_bev(_colorize(grids["height"], "turbo", observed)),
+            _colorize(grids["height"], "turbo", observed),
         ),
         (
             "Height Above Floor",
-            _camera_oriented_bev(
-                _colorize(grids["height_agl"], "turbo", observed, (0.0, 1.2))
-            ),
+            _colorize(grids["height_agl"], "turbo", observed, (0.0, 1.2)),
         ),
         (
             "Distance (Viridis)",
-            _camera_oriented_bev(
-                _colorize(grids["distance"], "viridis", observed)
-            ),
+            _colorize(grids["distance"], "viridis", observed),
         ),
         (
             "Obstacle Height (Clean)",
-            _camera_oriented_bev(
-                _colorize(
-                    grids["obstacle_height"],
-                    "inferno",
-                    grids["obstacle_height"] > 0,
-                    (0.0, 1.8),
-                )
+            _colorize(
+                grids["obstacle_height"],
+                "inferno",
+                grids["obstacle_height"] > 0,
+                (0.0, 1.8),
             ),
         ),
         (
             "Walkable (Binary)",
-            _camera_oriented_bev(
-                _colorize(
-                    grids["walkable"],
-                    "gray",
-                    grids["walkable"] >= 0,
-                    (0.0, 1.0),
-                )
+            _colorize(
+                grids["walkable"],
+                "gray",
+                grids["walkable"] >= 0,
+                (0.0, 1.0),
             ),
         ),
         (
             "Gradient (Edges)",
-            _camera_oriented_bev(
-                _colorize(grids["gradient"], "viridis", observed, (0.0, 1.0))
-            ),
+            _colorize(grids["gradient"], "viridis", observed, (0.0, 1.0)),
         ),
     ]
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -352,7 +347,7 @@ def _render_diagnostic_montage(
     figure.text(
         0.5,
         0.008,
-        "Shared backend-world crop · 5 cm diagnostics · green path is supplied/aligned phone trajectory",
+        "Shared camera-local crop · row zero is forward · green path is supplied/aligned phone trajectory",
         color="#bcc7d1",
         fontsize=10,
         ha="center",
@@ -378,7 +373,7 @@ def _render_overview(
         squeeze=False,
     )
     figure.suptitle(
-        "Horizontal phone walk · shared static-camera world crop",
+        "Horizontal phone walk · shared static-camera presentation crop",
         color="white",
         fontsize=20,
         y=0.988,
@@ -388,24 +383,20 @@ def _render_overview(
         candidate_grids = grids[candidate.slug]
         observed = candidate_grids["observed"]
         images = (
-            _camera_oriented_bev(candidate_grids["structural"]),
-            _camera_oriented_bev(
-                _colorize(
-                    candidate_grids["height_agl"],
-                    "turbo",
-                    observed,
-                    (0.0, 1.2),
-                )
+            candidate_grids["structural"],
+            _colorize(
+                candidate_grids["height_agl"],
+                "turbo",
+                observed,
+                (0.0, 1.2),
             ),
-            _camera_oriented_bev(
-                _colorize(
-                    candidate_grids["density"],
-                    "gray",
-                    observed,
-                    (0.0, 1.0),
-                )
+            _colorize(
+                candidate_grids["density"],
+                "gray",
+                observed,
+                (0.0, 1.0),
             ),
-            _camera_oriented_bev(splats[candidate.slug]),
+            splats[candidate.slug],
         )
         for column, (axis, image) in enumerate(zip(axes[row], images)):
             axis.imshow(image, interpolation="nearest")
@@ -508,6 +499,21 @@ def main() -> int:
         target_points,
         static.camera_to_world,
     )
+    target_image = cv2.imread(str(static.source_image), cv2.IMREAD_COLOR)
+    if target_image is None:
+        raise ValueError(f"static-camera keyframe is unreadable: {static.source_image}")
+    target_depth_grid = _project_depth_grid(
+        target_points,
+        static.camera_from_world,
+        static.intrinsics,
+        target_image.shape[1],
+        target_image.shape[0],
+        8,
+    )
+    target_structure, target_structure_normals = _vertical_structure(
+        target_points,
+        0.10,
+    )
     world_from_da3 = _load_world_from_da3(args.world_from_da3.resolve())
     da3_raw = args.da3_raw.resolve()
     da3_sequence = _load_sequence(da3_raw, "DA3")
@@ -596,16 +602,57 @@ def main() -> int:
             )
         )
 
-    low = np.min(target_points[:, [0, 2]], axis=0) - 0.35
-    high = np.max(target_points[:, [0, 2]], axis=0) + 0.35
-    bounds = (float(low[0]), float(high[0]), float(low[1]), float(high[1]))
+    metric_low = np.min(target_points[:, [0, 2]], axis=0) - 0.35
+    metric_high = np.max(target_points[:, [0, 2]], axis=0) + 0.35
+    metric_bounds = (
+        float(metric_low[0]),
+        float(metric_high[0]),
+        float(metric_low[1]),
+        float(metric_high[1]),
+    )
+    target_metadata_path = target_revision / "room_points_meta.json"
+    target_metadata = json.loads(target_metadata_path.read_text(encoding="utf-8"))
+    floor_y_m = float(target_metadata.get("floor_y", 0.0))
+    presentation_frame = camera_ground_frame_from_camera_to_world(
+        static.camera_to_world
+    )
+    presentation_matrix = presentation_frame.world_to_camera_local_display_matrix(
+        floor_y_m
+    )
+    presented_target = transform_positions(target_points, presentation_matrix)
+    presented_static_camera = transform_positions(
+        static.camera_to_world[None, :3, 3],
+        presentation_matrix,
+    )[0]
+    presentation_low = np.min(presented_target[:, [0, 2]], axis=0) - 0.35
+    presentation_high = np.max(presented_target[:, [0, 2]], axis=0) + 0.35
+    presentation_bounds = (
+        float(presentation_low[0]),
+        float(presentation_high[0]),
+        float(presentation_low[1]),
+        float(presentation_high[1]),
+    )
+    presentation_metadata = {
+        "source_coordinate_frame": "backend_world_m",
+        "target_coordinate_frame": "camera_local_ground_m",
+        "presentation_only": True,
+        "backend_geometry_mutated": False,
+        "reference_camera_id": args.camera,
+        "world_to_camera_local_row_major": presentation_matrix.tolist(),
+        "linear_determinant": float(np.linalg.det(presentation_matrix[:3, :3])),
+        "shared_bounds_xz_m": list(presentation_bounds),
+        "raster_orientation": CAMERA_LOCAL_RASTER_ORIENTATION,
+        "screen_right": "camera_right_positive_x",
+        "screen_up": "camera_forward_positive_z",
+        "room_specific_rotation_deg": 0,
+    }
     reused_metrics: dict[str, Any] | None = None
     if args.reuse_metrics_from is not None:
         reuse_path = args.reuse_metrics_from.resolve()
         reused_metrics = json.loads(reuse_path.read_text(encoding="utf-8"))
         if reused_metrics.get("schema") != "noesis.mapanything.prior_variant_evaluation.v1":
             raise ValueError(f"unsupported reused metrics schema in {reuse_path}")
-        if reused_metrics.get("shared_bev_bounds_xz_m") != list(bounds):
+        if reused_metrics.get("shared_bev_bounds_xz_m") != list(metric_bounds):
             raise ValueError("reused metrics used different static-world bounds")
         if float(reused_metrics.get("grid_res_m")) != float(args.grid_res_m):
             raise ValueError("reused metrics used a different diagnostic grid resolution")
@@ -617,10 +664,7 @@ def main() -> int:
         metrics["generated_at"] = datetime.now(timezone.utc).isoformat()
         metrics["scan_dir"] = str(scan_dir)
         metrics["metrics_reused_from"] = str(reuse_path)
-        metrics["presentation"] = {
-            "bev_rotation_deg": 180,
-            "reason": "camera-oriented review convention with foyer/hallway at top-left",
-        }
+        metrics["presentation"] = presentation_metadata
         metrics["candidates"] = {}
     else:
         metrics = {
@@ -630,13 +674,10 @@ def main() -> int:
             "coordinate_frame": "backend_world_m_stream_points",
             "alignment_reference": "validated DA3 phone trajectory mapped into static-camera backend world",
             "static_target_revision": str(target_revision),
-            "shared_bev_bounds_xz_m": list(bounds),
+            "shared_bev_bounds_xz_m": list(metric_bounds),
             "grid_res_m": float(args.grid_res_m),
             "point_splat_res_m": float(args.point_splat_res_m),
-            "presentation": {
-                "bev_rotation_deg": 180,
-                "reason": "camera-oriented review convention with foyer/hallway at top-left",
-            },
+            "presentation": presentation_metadata,
             "candidates": {},
         }
     grids_by_slug: dict[str, dict[str, np.ndarray]] = {}
@@ -655,10 +696,33 @@ def main() -> int:
         candidate_dir.mkdir()
         reprojection_path = candidate_dir / "fixed_camera_reprojection.jpg"
         topdown_path = candidate_dir / "static_alignment_topdown.png"
+        presentation_cloud = _present_camera_ground(
+            candidate.cloud,
+            presentation_matrix,
+        )
         if needs_evaluation:
             bounded = _bounded_source(candidate.cloud.points, target_points, 0.25)
             full_metrics = _full_cloud_metrics(candidate.cloud.points, target_points)
             bounded_metrics = _full_cloud_metrics(bounded, target_points)
+            visible_cloud_metrics = _fixed_camera_visible_cloud_metrics(
+                candidate.cloud.points,
+                target_points,
+                target_depth_grid,
+                static.camera_from_world,
+                static.intrinsics,
+            )
+            candidate_structure, _ = _vertical_structure(
+                candidate.cloud.points,
+                0.10,
+            )
+            visible_structure_metrics = _fixed_camera_visible_structure_metrics(
+                candidate_structure,
+                target_structure,
+                target_structure_normals,
+                target_depth_grid,
+                static.camera_from_world,
+                static.intrinsics,
+            )
             consistency = _multiview_consistency(
                 candidate.sequence.depth * candidate.alignment_scale,
                 candidate.sequence.mask,
@@ -681,44 +745,46 @@ def main() -> int:
                 static.intrinsics,
                 args.camera.replace("-", " "),
             )
-            _write_topdown(
-                topdown_path,
-                candidate.cloud.points,
-                target_points,
-                candidate.cloud.camera_to_world[:, :3, 3],
-                static.camera_to_world[:3, 3],
-            )
         else:
             reuse_root = args.reuse_metrics_from.resolve().parent
-            for filename, target in (
-                ("fixed_camera_reprojection.jpg", reprojection_path),
-                ("static_alignment_topdown.png", topdown_path),
-            ):
-                source = reuse_root / candidate.slug / filename
-                if not source.is_file():
-                    raise ValueError(f"reused artifact is missing: {source}")
-                os.link(source, target)
-        grids = _rasterize(candidate.cloud, bounds, args.grid_res_m)
+            source = reuse_root / candidate.slug / "fixed_camera_reprojection.jpg"
+            if not source.is_file():
+                raise ValueError(f"reused artifact is missing: {source}")
+            os.link(source, reprojection_path)
+        # This file is a presentation diagnostic, so regenerate it even when
+        # metric results are reused.  Older copies may contain the retired
+        # backend-X/Z or Living-Room-specific orientation.
+        _write_topdown(
+            topdown_path,
+            presentation_cloud.points,
+            presented_target,
+            _camera_positions(presentation_cloud),
+            presented_static_camera,
+        )
+        grids = _rasterize(
+            presentation_cloud,
+            presentation_bounds,
+            args.grid_res_m,
+        )
         grids_by_slug[candidate.slug] = grids
         montage = _render_diagnostic_montage(candidate, grids, candidate_dir)
         point_layers, point_layer_metrics = _render_point_preserving_layers(
             candidate.label,
-            candidate.cloud,
-            bounds,
+            presentation_cloud,
+            presentation_bounds,
             args.point_splat_res_m,
             candidate_dir,
-            rotate_180=True,
         )
         splat, splat_metrics = _point_splat(
-            candidate.cloud,
-            bounds,
+            presentation_cloud,
+            presentation_bounds,
             args.point_splat_res_m,
             (-0.15, 2.70),
         )
         splats_by_slug[candidate.slug] = splat
         _save_panel(
             candidate_dir / "point_splat_all_2p5cm.png",
-            _camera_oriented_bev(splat),
+            splat,
         )
         artifact_row = {
             "diagnostic_layout": str(montage.relative_to(output_dir)),
@@ -751,6 +817,8 @@ def main() -> int:
                 "heldout_even_to_odd_reprojection": heldout,
                 "static_cloud_full_metrics": full_metrics,
                 "static_cloud_room_bounds_metrics": bounded_metrics,
+                "fixed_camera_visible_cloud_metrics": visible_cloud_metrics,
+                "fixed_camera_visible_structure_metrics": visible_structure_metrics,
                 "fixed_camera_reprojection": reprojection,
                 "render_counts": {
                     "sampled_phone_point_count": int(candidate.cloud.points.shape[0]),

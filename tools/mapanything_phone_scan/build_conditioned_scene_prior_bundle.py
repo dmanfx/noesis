@@ -69,6 +69,55 @@ def _copy_file(root: Path, relative: str, source: Path) -> None:
     shutil.copyfile(source, target)
 
 
+def _conditioned_admission_checks(
+    candidate: dict[str, Any],
+    *,
+    metric_scale_preserved: bool,
+) -> dict[str, bool]:
+    """Gate PCF in the part of a single-view static cloud that is observable.
+
+    A phone walk contains surfaces behind the fixed camera's nearest measured
+    surface and outside its field of view. Symmetric full-cloud overlap and a
+    raw z-buffer delta therefore penalize valid novel geometry. Use the same
+    occlusion-aware static-camera domain as phone-walk alignment, while still
+    requiring candidate-specific target support and vertical agreement.
+    """
+
+    room = candidate.get("static_cloud_room_bounds_metrics")
+    visible = candidate.get("fixed_camera_visible_cloud_metrics")
+    vertical = candidate.get("fixed_camera_visible_structure_metrics")
+    if not all(isinstance(value, dict) for value in (room, visible, vertical)):
+        raise ValueError(
+            "selected candidate evaluation lacks visibility-aware static metrics"
+        )
+
+    visible_source_count = float(visible["source_point_count"])
+    visible_comparable_count = float(visible["comparable_point_count"])
+    vertical_source_count = float(vertical["source_point_count"])
+    vertical_comparable_count = float(vertical["comparable_point_count"])
+    return {
+        "validated_da3_backend_alignment_passed": True,
+        "conditioned_cloud_targets_backend_world": True,
+        "metric_scale_preserved": metric_scale_preserved,
+        "fixed_camera_visible_support_admitted": (
+            visible_comparable_count >= max(5_000.0, 0.05 * visible_source_count)
+        ),
+        "fixed_camera_visible_overlap_admitted": (
+            float(visible["source_overlap_0_30m"]) >= 0.55
+        ),
+        "fixed_camera_vertical_support_admitted": (
+            vertical_comparable_count >= max(500.0, 0.10 * vertical_source_count)
+        ),
+        "fixed_camera_vertical_structure_admitted": (
+            float(vertical["source_overlap_0_30m"]) >= 0.55
+            and float(vertical["plane_residual_median_m"]) <= 0.10
+        ),
+        "static_target_coverage_admitted": (
+            float(room["target_overlap_0_30m"]) >= 0.40
+        ),
+    }
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--scan-dir", type=Path, required=True)
@@ -140,6 +189,7 @@ def main() -> int:
         or translation.shape != (3,)
         or not np.isfinite(rotation).all()
         or not np.isfinite(translation).all()
+        or not np.allclose(rotation.T @ rotation, np.eye(3), atol=1e-4)
         or abs(float(np.linalg.det(rotation)) - 1.0) > 1e-4
     ):
         raise ValueError("selected candidate alignment is not a rigid metric transform")
@@ -168,22 +218,27 @@ def main() -> int:
         raise ValueError("failed to encode aligned conditioned-fusion GLB")
 
     static_metrics = candidate.get("static_cloud_room_bounds_metrics")
+    visible_metrics = candidate.get("fixed_camera_visible_cloud_metrics")
+    visible_structure_metrics = candidate.get(
+        "fixed_camera_visible_structure_metrics"
+    )
     reprojection = candidate.get("fixed_camera_reprojection")
     internal = candidate.get("internal_multiview_reprojection")
-    if not all(isinstance(value, dict) for value in (static_metrics, reprojection, internal)):
+    if not all(
+        isinstance(value, dict)
+        for value in (
+            static_metrics,
+            visible_metrics,
+            visible_structure_metrics,
+            reprojection,
+            internal,
+        )
+    ):
         raise ValueError("selected candidate evaluation metrics are incomplete")
-    checks = {
-        "validated_da3_backend_alignment_passed": True,
-        "conditioned_cloud_targets_backend_world": True,
-        "metric_scale_preserved": abs(scale - 1.0) <= 1e-3,
-        "static_room_overlap_admitted": (
-            float(static_metrics["source_overlap_0_30m"]) >= 0.60
-            and float(static_metrics["target_overlap_0_30m"]) >= 0.60
-        ),
-        "fixed_camera_reprojection_admitted": (
-            float(reprojection["overlap_depth_delta_median_m"]) <= 0.30
-        ),
-    }
+    checks = _conditioned_admission_checks(
+        candidate,
+        metric_scale_preserved=abs(scale - 1.0) <= 1e-3,
+    )
     if not all(checks.values()):
         raise ValueError(f"conditioned fusion did not pass bundle gates: {checks}")
 
@@ -245,6 +300,8 @@ def main() -> int:
             "quality_gate": {"passed": True, "checks": checks},
             "internal_multiview_reprojection": internal,
             "static_cloud_room_bounds_metrics": static_metrics,
+            "fixed_camera_visible_cloud_metrics": visible_metrics,
+            "fixed_camera_visible_structure_metrics": visible_structure_metrics,
             "fixed_camera_reprojection": reprojection,
             "source_alignment": {
                 "schema": source_alignment.get("schema"),

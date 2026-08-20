@@ -11,6 +11,13 @@ from typing import Any, Callable
 import cv2
 import numpy as np
 
+from noesis_core.coordinate_frames import (
+    CAMERA_LOCAL_RASTER_ORIENTATION,
+    CoordinateFrameError,
+    camera_ground_frame_from_camera_to_world,
+    transform_positions,
+)
+
 
 ProgressCallback = Callable[[float, str], None]
 
@@ -523,6 +530,445 @@ def _full_cloud_metrics(
     }
 
 
+def _angular_distance_deg(first: float, second: float) -> float:
+    return abs((float(first) - float(second) + 180.0) % 360.0 - 180.0)
+
+
+def _fixed_camera_comparable_mask(
+    source_points: np.ndarray,
+    target_depth_grid: np.ndarray,
+    camera_from_world: np.ndarray,
+    intrinsics: np.ndarray,
+    *,
+    cell_px: int,
+    occlusion_tolerance_m: float,
+) -> tuple[np.ndarray, dict[str, float]]:
+    """Select source points a single-view target could have observed.
+
+    A phone point behind the fixed camera's nearest measured surface is occluded
+    and cannot fairly be scored against that single-view reconstruction. Points
+    in front of the target surface remain comparable and are not hidden by this
+    mask, so novel or incorrectly aligned foreground geometry is still penalized.
+    """
+
+    source_points = np.asarray(source_points, dtype=np.float64)
+    camera_points = _transform_points(source_points, camera_from_world)
+    finite = np.isfinite(camera_points).all(axis=1) & (camera_points[:, 2] > 0.05)
+    cells = np.full((source_points.shape[0], 2), -1, dtype=np.int64)
+    if np.any(finite):
+        projected = (intrinsics @ camera_points[finite].T).T
+        pixels = projected[:, :2] / projected[:, 2, None]
+        cells[finite] = np.floor(pixels / cell_px).astype(np.int64)
+    grid_height, grid_width = target_depth_grid.shape
+    in_frame = (
+        finite
+        & (cells[:, 0] >= 0)
+        & (cells[:, 0] < grid_width)
+        & (cells[:, 1] >= 0)
+        & (cells[:, 1] < grid_height)
+    )
+    target_depth = np.full(source_points.shape[0], np.inf, dtype=np.float64)
+    target_depth[in_frame] = target_depth_grid[
+        cells[in_frame, 1], cells[in_frame, 0]
+    ]
+    target_supported = in_frame & np.isfinite(target_depth)
+    comparable = target_supported & (
+        camera_points[:, 2] <= target_depth + occlusion_tolerance_m
+    )
+    point_count = int(source_points.shape[0])
+    return comparable, {
+        "source_point_count": float(point_count),
+        "fixed_camera_frustum_point_count": float(np.count_nonzero(in_frame)),
+        "target_supported_point_count": float(np.count_nonzero(target_supported)),
+        "comparable_point_count": float(np.count_nonzero(comparable)),
+        "comparable_fraction": float(np.count_nonzero(comparable) / max(1, point_count)),
+        "grid_cell_px": float(cell_px),
+        "occlusion_tolerance_m": float(occlusion_tolerance_m),
+    }
+
+
+def _fixed_camera_visible_cloud_metrics(
+    aligned_source: np.ndarray,
+    target: np.ndarray,
+    target_depth_grid: np.ndarray,
+    camera_from_world: np.ndarray,
+    intrinsics: np.ndarray,
+    *,
+    cell_px: int = 8,
+    occlusion_tolerance_m: float = 0.30,
+) -> dict[str, float]:
+    from scipy.spatial import cKDTree
+
+    comparable, metrics = _fixed_camera_comparable_mask(
+        aligned_source,
+        target_depth_grid,
+        camera_from_world,
+        intrinsics,
+        cell_px=cell_px,
+        occlusion_tolerance_m=occlusion_tolerance_m,
+    )
+    selected = np.asarray(aligned_source, dtype=np.float64)[comparable]
+    if selected.shape[0] == 0:
+        return {
+            **metrics,
+            "source_median_m": math.inf,
+            "source_overlap_0_20m": 0.0,
+            "source_overlap_0_30m": 0.0,
+            "source_overlap_0_50m": 0.0,
+        }
+    source_distance, _ = cKDTree(target).query(selected, k=1)
+    return {
+        **metrics,
+        "source_median_m": float(np.median(source_distance)),
+        "source_overlap_0_20m": float(np.mean(source_distance < 0.20)),
+        "source_overlap_0_30m": float(np.mean(source_distance < 0.30)),
+        "source_overlap_0_50m": float(np.mean(source_distance < 0.50)),
+    }
+
+
+def _fixed_camera_visible_structure_metrics(
+    aligned_source_structure: np.ndarray,
+    target_structure: np.ndarray,
+    target_normals: np.ndarray,
+    target_depth_grid: np.ndarray,
+    camera_from_world: np.ndarray,
+    intrinsics: np.ndarray,
+    *,
+    cell_px: int = 8,
+    occlusion_tolerance_m: float = 0.30,
+) -> dict[str, float]:
+    from scipy.spatial import cKDTree
+
+    comparable, metrics = _fixed_camera_comparable_mask(
+        aligned_source_structure,
+        target_depth_grid,
+        camera_from_world,
+        intrinsics,
+        cell_px=cell_px,
+        occlusion_tolerance_m=occlusion_tolerance_m,
+    )
+    selected = np.asarray(aligned_source_structure, dtype=np.float64)[comparable]
+    if selected.shape[0] == 0:
+        return {
+            **metrics,
+            "source_overlap_0_30m": 0.0,
+            "plane_residual_median_m": math.inf,
+            "plane_residual_p80_m": math.inf,
+        }
+    source_distance, target_indices = cKDTree(target_structure).query(selected, k=1)
+    plane_residual = np.abs(
+        np.sum(
+            (selected - target_structure[target_indices])
+            * target_normals[target_indices],
+            axis=1,
+        )
+    )
+    usable = np.sort(plane_residual[source_distance < 0.80])
+    if usable.size == 0:
+        usable = np.asarray([math.inf], dtype=np.float64)
+    else:
+        usable = usable[: max(1, int(0.75 * usable.size))]
+    return {
+        **metrics,
+        "source_overlap_0_30m": float(np.mean(source_distance < 0.30)),
+        "plane_residual_median_m": float(np.median(usable)),
+        "plane_residual_p80_m": float(np.percentile(usable, 80.0)),
+    }
+
+
+def _visual_alignment_anchor(
+    scan_dir: Path,
+    target_points: np.ndarray,
+    target_keyframe_path: Path,
+    target_camera_from_world: np.ndarray,
+    target_intrinsics: np.ndarray,
+    leveled_poses: np.ndarray,
+    progress: ProgressCallback,
+) -> tuple[np.ndarray | None, dict[str, Any]]:
+    """Estimate a room transform from fixed/phone RGB overlap and phone poses."""
+
+    from scipy.spatial import cKDTree
+
+    target_image = cv2.imread(str(target_keyframe_path), cv2.IMREAD_COLOR)
+    if target_image is None:
+        raise NoesisAlignmentError(
+            f"fixed-camera keyframe is unreadable: {target_keyframe_path}"
+        )
+    image_height, image_width = target_image.shape[:2]
+    target_camera_points = _transform_points(target_points, target_camera_from_world)
+    target_visible = np.isfinite(target_camera_points).all(axis=1) & (
+        target_camera_points[:, 2] > 0.05
+    )
+    projected = (target_intrinsics @ target_camera_points[target_visible].T).T
+    target_pixels = projected[:, :2] / projected[:, 2, None]
+    in_image = (
+        (target_pixels[:, 0] >= 0.0)
+        & (target_pixels[:, 0] < image_width)
+        & (target_pixels[:, 1] >= 0.0)
+        & (target_pixels[:, 1] < image_height)
+    )
+    target_indices = np.flatnonzero(target_visible)[in_image]
+    target_pixels = target_pixels[in_image]
+    if target_pixels.shape[0] < 1_000:
+        raise NoesisAlignmentError(
+            "fixed-camera target has too few image-supported points for RGB anchoring"
+        )
+
+    sift = cv2.SIFT_create(nfeatures=5_000, contrastThreshold=0.02)
+    target_gray = cv2.cvtColor(target_image, cv2.COLOR_BGR2GRAY)
+    target_keypoints, target_descriptors = sift.detectAndCompute(target_gray, None)
+    if target_descriptors is None or len(target_keypoints) < 40:
+        return None, {
+            "status": "insufficient_target_features",
+            "method": "sift_mutual_matches_target_depth_pnp_consensus",
+            "target_feature_count": int(len(target_keypoints)),
+            "accepted_view_count": 0,
+        }
+
+    projection_tree = cKDTree(target_pixels)
+    matcher = cv2.BFMatcher(cv2.NORM_L2)
+    raw_paths = sorted((scan_dir / "outputs" / "raw").glob("view_*.npz"))
+    if len(raw_paths) != len(leveled_poses):
+        raise NoesisAlignmentError("phone RGB views do not match the reconstructed poses")
+    rows: list[dict[str, Any]] = []
+    ratio_threshold = 0.72
+    for view_index, path in enumerate(raw_paths):
+        with np.load(path) as row:
+            image = np.asarray(row["model_rgb"])
+            phone_intrinsics = np.asarray(row["intrinsics"], dtype=np.float64)
+        image_u8 = np.clip(
+            image * 255.0 if float(np.nanmax(image)) <= 1.5 else image,
+            0,
+            255,
+        ).astype(np.uint8)
+        if image_u8.ndim != 3 or image_u8.shape[2] != 3:
+            continue
+        if phone_intrinsics.shape != (3, 3) or not np.isfinite(phone_intrinsics).all():
+            continue
+        phone_gray = cv2.cvtColor(image_u8, cv2.COLOR_RGB2GRAY)
+        phone_keypoints, phone_descriptors = sift.detectAndCompute(phone_gray, None)
+        if phone_descriptors is None or len(phone_keypoints) < 20:
+            continue
+
+        forward_pairs = matcher.knnMatch(target_descriptors, phone_descriptors, k=2)
+        reverse_pairs = matcher.knnMatch(phone_descriptors, target_descriptors, k=2)
+        forward: dict[int, int] = {}
+        for pair in forward_pairs:
+            if len(pair) == 2 and pair[0].distance < ratio_threshold * pair[1].distance:
+                forward[int(pair[0].queryIdx)] = int(pair[0].trainIdx)
+        reverse: dict[int, int] = {}
+        for pair in reverse_pairs:
+            if len(pair) == 2 and pair[0].distance < ratio_threshold * pair[1].distance:
+                reverse[int(pair[0].queryIdx)] = int(pair[0].trainIdx)
+        mutual = [
+            (target_index, phone_index)
+            for target_index, phone_index in forward.items()
+            if reverse.get(phone_index) == target_index
+        ]
+        if len(mutual) < 8:
+            continue
+
+        target_feature_pixels = np.asarray(
+            [target_keypoints[index].pt for index, _ in mutual],
+            dtype=np.float64,
+        )
+        projection_distance, projection_indices = projection_tree.query(
+            target_feature_pixels,
+            k=1,
+        )
+        supported = projection_distance <= 7.0
+        if int(np.count_nonzero(supported)) < 8:
+            continue
+        supported_pairs = [pair for pair, keep in zip(mutual, supported) if keep]
+        object_points = target_points[
+            target_indices[projection_indices[supported]]
+        ].astype(np.float64)
+        image_points = np.asarray(
+            [phone_keypoints[phone_index].pt for _, phone_index in supported_pairs],
+            dtype=np.float64,
+        )
+        solved, rotation_vector, translation_vector, inliers = cv2.solvePnPRansac(
+            object_points,
+            image_points,
+            phone_intrinsics,
+            None,
+            iterationsCount=1_000,
+            reprojectionError=3.0,
+            confidence=0.999,
+            flags=cv2.SOLVEPNP_EPNP,
+        )
+        if not solved or inliers is None or len(inliers) < 8:
+            continue
+        inlier_indices = np.asarray(inliers, dtype=np.int64).reshape(-1)
+        inlier_objects = object_points[inlier_indices]
+        inlier_images = image_points[inlier_indices]
+        if hasattr(cv2, "solvePnPRefineLM"):
+            rotation_vector, translation_vector = cv2.solvePnPRefineLM(
+                inlier_objects,
+                inlier_images,
+                phone_intrinsics,
+                None,
+                rotation_vector,
+                translation_vector,
+            )
+        projected_inliers, _ = cv2.projectPoints(
+            inlier_objects,
+            rotation_vector,
+            translation_vector,
+            phone_intrinsics,
+            None,
+        )
+        reprojection_error = np.linalg.norm(
+            projected_inliers.reshape((-1, 2)) - inlier_images,
+            axis=1,
+        )
+        rotation, _ = cv2.Rodrigues(rotation_vector)
+        phone_camera_from_world = np.eye(4, dtype=np.float64)
+        phone_camera_from_world[:3, :3] = rotation
+        phone_camera_from_world[:3, 3] = np.asarray(
+            translation_vector,
+            dtype=np.float64,
+        ).reshape(3)
+        phone_camera_to_world = np.linalg.inv(phone_camera_from_world)
+        target_heading = _heading_deg(phone_camera_to_world[:3, 2])
+        source_heading = _heading_deg(leveled_poses[view_index, :3, 2])
+        yaw = (target_heading - source_heading + 180.0) % 360.0 - 180.0
+        rotation_only = _yaw_transform(np.asarray([yaw, 0.0, 0.0]))
+        rotated_center = _transform_points(
+            leveled_poses[view_index, None, :3, 3],
+            rotation_only,
+        )[0]
+        translation = phone_camera_to_world[:3, 3] - rotated_center
+        parameters = np.asarray([yaw, translation[0], translation[2]], dtype=np.float64)
+        span = np.ptp(inlier_objects, axis=0)
+        inlier_fraction = float(len(inlier_indices) / len(object_points))
+        median_reprojection = float(np.median(reprojection_error))
+        camera_height = float(phone_camera_to_world[1, 3])
+        accepted = bool(
+            inlier_fraction >= 0.40
+            and median_reprojection <= 3.0
+            and float(np.linalg.norm(span)) >= 1.0
+            and 0.40 <= camera_height <= 3.0
+        )
+        rows.append(
+            {
+                "view_index": int(view_index),
+                "correspondence_count": int(len(object_points)),
+                "inlier_count": int(len(inlier_indices)),
+                "inlier_fraction": inlier_fraction,
+                "reprojection_median_px": median_reprojection,
+                "target_support_span_m": span.tolist(),
+                "estimated_camera_height_m": camera_height,
+                "yaw_tx_tz": parameters.tolist(),
+                "accepted": accepted,
+            }
+        )
+        if view_index % max(1, len(raw_paths) // 8) == 0:
+            progress(
+                0.31 + 0.19 * ((view_index + 1) / len(raw_paths)),
+                f"Checking fixed-camera RGB overlap in phone view {view_index + 1} of {len(raw_paths)}",
+            )
+
+    accepted_rows = [row for row in rows if row["accepted"]]
+    for row in accepted_rows:
+        row["weight"] = float(
+            row["inlier_count"]
+            * row["inlier_fraction"]
+            / max(0.75, row["reprojection_median_px"])
+        )
+    best_members: list[dict[str, Any]] = []
+    best_weight = 0.0
+    for seed in accepted_rows:
+        seed_parameters = np.asarray(seed["yaw_tx_tz"], dtype=np.float64)
+        members = []
+        for row in accepted_rows:
+            parameters = np.asarray(row["yaw_tx_tz"], dtype=np.float64)
+            if (
+                _angular_distance_deg(parameters[0], seed_parameters[0]) <= 7.0
+                and float(np.linalg.norm(parameters[1:] - seed_parameters[1:])) <= 0.65
+            ):
+                members.append(row)
+        weight = float(sum(float(row["weight"]) for row in members))
+        if (len(members), weight) > (len(best_members), best_weight):
+            best_members = members
+            best_weight = weight
+
+    report: dict[str, Any] = {
+        "status": "no_consensus",
+        "method": "sift_mutual_matches_target_depth_pnp_consensus",
+        "target_feature_count": int(len(target_keypoints)),
+        "evaluated_view_count": int(len(raw_paths)),
+        "solved_view_count": int(len(rows)),
+        "accepted_view_count": int(len(accepted_rows)),
+        "view_summary": sorted(
+            rows,
+            key=lambda row: (-int(row["inlier_count"]), int(row["view_index"])),
+        )[:12],
+    }
+    if len(best_members) < 2:
+        return None, report
+
+    representative = max(best_members, key=lambda row: float(row["weight"]))
+    reference_yaw = float(representative["yaw_tx_tz"][0])
+    weights = np.asarray([row["weight"] for row in best_members], dtype=np.float64)
+    member_parameters = np.asarray(
+        [row["yaw_tx_tz"] for row in best_members],
+        dtype=np.float64,
+    )
+    unwrapped_yaw = np.asarray(
+        [
+            reference_yaw
+            + (float(parameters[0]) - reference_yaw + 180.0) % 360.0
+            - 180.0
+            for parameters in member_parameters
+        ],
+        dtype=np.float64,
+    )
+    consensus = np.asarray(
+        [
+            float(np.average(unwrapped_yaw, weights=weights)),
+            float(np.average(member_parameters[:, 1], weights=weights)),
+            float(np.average(member_parameters[:, 2], weights=weights)),
+        ],
+        dtype=np.float64,
+    )
+    consensus[0] = (consensus[0] + 180.0) % 360.0 - 180.0
+    yaw_residuals = np.asarray(
+        [
+            _angular_distance_deg(parameters[0], consensus[0])
+            for parameters in member_parameters
+        ],
+        dtype=np.float64,
+    )
+    translation_residuals = np.linalg.norm(
+        member_parameters[:, 1:] - consensus[None, 1:],
+        axis=1,
+    )
+    total_inliers = int(sum(int(row["inlier_count"]) for row in best_members))
+    passed = bool(
+        total_inliers >= 24
+        and float(np.percentile(yaw_residuals, 80.0)) <= 6.0
+        and float(np.percentile(translation_residuals, 80.0)) <= 0.55
+    )
+    report.update(
+        {
+            "status": "passed" if passed else "inconsistent_consensus",
+            "consensus_view_indices": [
+                int(row["view_index"]) for row in best_members
+            ],
+            "consensus_view_count": int(len(best_members)),
+            "consensus_total_inliers": total_inliers,
+            "consensus_yaw_tx_tz": consensus.tolist(),
+            "yaw_residual_p80_deg": float(np.percentile(yaw_residuals, 80.0)),
+            "translation_residual_p80_m": float(
+                np.percentile(translation_residuals, 80.0)
+            ),
+            "representative_view_index": int(representative["view_index"]),
+        }
+    )
+    return (consensus if passed else None), report
+
+
 def _cylinder_between(start: np.ndarray, end: np.ndarray, radius: float, color: list[int]) -> Any | None:
     import trimesh
 
@@ -585,9 +1031,9 @@ def _write_glbs(
         (len(marker.vertices), 1),
     )
     comparison_scene.add_geometry(marker, geom_name="fixed_camera_magenta")
-    rotation_x = trimesh.transformations.rotation_matrix(np.pi, [1.0, 0.0, 0.0])
-    aligned_scene.apply_transform(rotation_x)
-    comparison_scene.apply_transform(rotation_x)
+    # These artifacts are already in backend_world_m.  Keep their vertices in
+    # that metric frame; a viewer owns camera presentation and must not bake a
+    # phone/GLTF half-turn into the aligned geometry.
     aligned_scene.export(str(aligned_path))
     comparison_scene.export(str(comparison_path))
 
@@ -839,6 +1285,15 @@ def run_noesis_alignment(
     intrinsics = np.asarray(target_meta.get("intrinsics"), dtype=np.float64)
     if intrinsics.shape != (3, 3) or not np.isfinite(intrinsics).all():
         raise NoesisAlignmentError("target revision intrinsics are malformed")
+    keyframes = target_meta.get("rgb_keyframes")
+    if not isinstance(keyframes, dict) or not keyframes:
+        raise NoesisAlignmentError("target revision has no fixed-camera keyframe")
+    keyframe_relative = next(iter(keyframes.values()))
+    keyframe_path = target_revision / str(keyframe_relative)
+    if not keyframe_path.is_file():
+        raise NoesisAlignmentError(
+            f"fixed-camera keyframe is missing: {keyframe_path}"
+        )
 
     progress(0.22, "Extracting gravity-preserving wall and doorway structure")
     source_voxel = _voxel_points(leveled_registration, 0.14)
@@ -859,6 +1314,11 @@ def run_noesis_alignment(
         type(raw_anchor_index) is int
         and 0 <= int(raw_anchor_index) < len(initials)
     )
+    visual_anchor_parameters: np.ndarray | None = None
+    visual_anchor_report: dict[str, Any] = {
+        "status": "not_attempted_joint_fixed_camera_anchor",
+        "method": "sift_mutual_matches_target_depth_pnp_consensus",
+    }
     if explicit_anchor:
         anchor_index = int(raw_anchor_index)
         selected_basins = [
@@ -873,32 +1333,55 @@ def run_noesis_alignment(
             "Using the jointly inferred fixed-camera view as the registration anchor",
         )
     else:
-        basin_rows: list[tuple[np.ndarray, dict[str, float], int]] = []
-        for index, initial in enumerate(initials):
-            parameters, metrics = _basin_refine(source_voxel, target_voxel, initial)
-            basin_rows.append((parameters, metrics, index))
-            if index % max(1, len(initials) // 8) == 0:
-                progress(
-                    0.30 + 0.28 * ((index + 1) / len(initials)),
-                    f"Testing phone pose anchor {index + 1} of {len(initials)}",
-                )
-        basin_rows.sort(
-            key=lambda row: (
-                row[1]["median_m"] - 0.35 * row[1]["overlap_0_30m"],
-                row[2],
-            )
+        progress(0.31, "Finding shared RGB landmarks between the fixed camera and phone")
+        visual_anchor_parameters, visual_anchor_report = _visual_alignment_anchor(
+            scan_dir,
+            target_points,
+            keyframe_path,
+            target_camera_from_world,
+            intrinsics,
+            leveled_poses,
+            progress,
         )
-        selected_basins = []
-        for row in basin_rows:
-            if any(
-                abs(float(row[0][0] - existing[0][0])) < 2.0
-                and float(np.linalg.norm(row[0][1:] - existing[0][1:])) < 0.25
-                for existing in selected_basins
-            ):
-                continue
-            selected_basins.append(row)
-            if len(selected_basins) >= 14:
-                break
+        if visual_anchor_parameters is not None:
+            selected_basins = [
+                (
+                    visual_anchor_parameters,
+                    {"median_m": math.nan, "overlap_0_30m": math.nan},
+                    int(visual_anchor_report["representative_view_index"]),
+                )
+            ]
+            progress(
+                0.58,
+                "Using multi-view RGB landmark consensus as the room-registration anchor",
+            )
+        else:
+            basin_rows: list[tuple[np.ndarray, dict[str, float], int]] = []
+            for index, initial in enumerate(initials):
+                parameters, metrics = _basin_refine(source_voxel, target_voxel, initial)
+                basin_rows.append((parameters, metrics, index))
+                if index % max(1, len(initials) // 8) == 0:
+                    progress(
+                        0.30 + 0.28 * ((index + 1) / len(initials)),
+                        f"Testing phone pose anchor {index + 1} of {len(initials)}",
+                    )
+            basin_rows.sort(
+                key=lambda row: (
+                    row[1]["median_m"] - 0.35 * row[1]["overlap_0_30m"],
+                    row[2],
+                )
+            )
+            selected_basins = []
+            for row in basin_rows:
+                if any(
+                    abs(float(row[0][0] - existing[0][0])) < 2.0
+                    and float(np.linalg.norm(row[0][1:] - existing[0][1:])) < 0.25
+                    for existing in selected_basins
+                ):
+                    continue
+                selected_basins.append(row)
+                if len(selected_basins) >= 14:
+                    break
 
     progress(0.60, "Refining candidate fits against walls and vertical room structure")
     candidate_rows: list[dict[str, Any]] = []
@@ -912,7 +1395,11 @@ def run_noesis_alignment(
             bounds_delta=(
                 np.asarray([5.0, 0.20, 0.20], dtype=np.float64)
                 if explicit_anchor
-                else None
+                else (
+                    np.asarray([5.0, 0.35, 0.35], dtype=np.float64)
+                    if visual_anchor_parameters is not None
+                    else None
+                )
             ),
         )
         candidate_rows.append(
@@ -953,6 +1440,52 @@ def run_noesis_alignment(
     identity_error = float(np.max(np.abs(inverse @ world_from_phone - np.eye(4))))
     aligned_registration = _transform_points(registration_points, world_from_phone)
     full_metrics = _full_cloud_metrics(aligned_registration, target_points)
+    target_image = cv2.imread(str(keyframe_path), cv2.IMREAD_COLOR)
+    if target_image is None:
+        raise NoesisAlignmentError(
+            f"fixed-camera keyframe is unreadable: {keyframe_path}"
+        )
+    image_height, image_width = target_image.shape[:2]
+    visibility_cell_px = 8
+    target_depth_grid = _project_depth_grid(
+        target_points,
+        target_camera_from_world,
+        intrinsics,
+        image_width,
+        image_height,
+        visibility_cell_px,
+    )
+    aligned_source_structure = _apply_yaw_parameters(
+        source_structure,
+        np.asarray(best["parameters"], dtype=np.float64),
+    )
+    visible_structure_metrics = _fixed_camera_visible_structure_metrics(
+        aligned_source_structure,
+        target_structure,
+        target_normals,
+        target_depth_grid,
+        target_camera_from_world,
+        intrinsics,
+        cell_px=visibility_cell_px,
+    )
+    visible_full_metrics = _fixed_camera_visible_cloud_metrics(
+        aligned_registration,
+        target_points,
+        target_depth_grid,
+        target_camera_from_world,
+        intrinsics,
+        cell_px=visibility_cell_px,
+    )
+    admitted_vertical_metrics = {
+        **best["metrics"],
+        **visible_structure_metrics,
+        "metric_domain": "fixed_camera_visible_source_vs_single_view_target",
+    }
+    admitted_full_metrics = {
+        **full_metrics,
+        **visible_full_metrics,
+        "metric_domain": "fixed_camera_visible_source_vs_single_view_target",
+    }
     anchor_metrics: dict[str, float] | None = None
     if explicit_anchor:
         aligned_anchor = world_from_phone @ phone_poses[int(raw_anchor_index)]
@@ -974,6 +1507,20 @@ def run_noesis_alignment(
             "position_error_m": anchor_position_error,
             "heading_error_deg": float(anchor_heading_error),
         }
+    visual_anchor_metrics: dict[str, float] | None = None
+    if visual_anchor_parameters is not None:
+        visual_anchor_metrics = {
+            "heading_error_deg": _angular_distance_deg(
+                float(best["parameters"][0]),
+                float(visual_anchor_parameters[0]),
+            ),
+            "translation_error_m": float(
+                np.linalg.norm(
+                    np.asarray(best["parameters"][1:], dtype=np.float64)
+                    - visual_anchor_parameters[1:]
+                )
+            ),
+        }
     candidate_margin = (
         float(runner_up["metrics"]["objective"] - best["metrics"]["objective"])
         if runner_up is not None
@@ -987,19 +1534,49 @@ def run_noesis_alignment(
         "target_camera_forward_visibility": bool(
             target_camera_orientation["selected_forward_fraction"] >= 0.75
         ),
-        "candidate_separation": bool(explicit_anchor or candidate_margin >= 0.05),
+        "candidate_separation": bool(
+            explicit_anchor
+            or visual_anchor_parameters is not None
+            or candidate_margin >= 0.05
+        ),
         "fixed_camera_anchor_position": bool(
             anchor_metrics is None or anchor_metrics["position_error_m"] <= 0.30
         ),
         "fixed_camera_anchor_heading": bool(
             anchor_metrics is None or anchor_metrics["heading_error_deg"] <= 7.0
         ),
-        "vertical_source_overlap": bool(best["metrics"]["source_overlap_0_30m"] >= 0.55),
+        "visual_anchor_refinement_heading": bool(
+            visual_anchor_metrics is None
+            or visual_anchor_metrics["heading_error_deg"] <= 7.0
+        ),
+        "visual_anchor_refinement_translation": bool(
+            visual_anchor_metrics is None
+            or visual_anchor_metrics["translation_error_m"] <= 0.60
+        ),
+        "vertical_source_visibility_support": bool(
+            visible_structure_metrics["comparable_point_count"]
+            >= max(
+                500.0,
+                0.10 * visible_structure_metrics["source_point_count"],
+            )
+        ),
+        "vertical_source_overlap": bool(
+            visible_structure_metrics["source_overlap_0_30m"] >= 0.55
+        ),
         "vertical_target_overlap": bool(best["metrics"]["target_overlap_0_30m"] >= 0.45),
         "vertical_plane_residual": bool(
-            best["metrics"]["plane_residual_median_m"] <= 0.10
+            visible_structure_metrics["plane_residual_median_m"] <= 0.10
         ),
-        "full_source_overlap": bool(full_metrics["source_overlap_0_30m"] >= 0.55),
+        "full_source_visibility_support": bool(
+            visible_full_metrics["comparable_point_count"]
+            >= max(
+                5_000.0,
+                0.05 * visible_full_metrics["source_point_count"],
+            )
+        ),
+        "full_source_overlap": bool(
+            visible_full_metrics["source_overlap_0_30m"] >= 0.55
+        ),
         "full_target_overlap": bool(full_metrics["target_overlap_0_30m"] >= 0.40),
     }
     failed_checks = [name for name, passed in checks.items() if not passed]
@@ -1009,10 +1586,25 @@ def run_noesis_alignment(
             + ", ".join(failed_checks)
             + "; anchor="
             + json.dumps(anchor_metrics, sort_keys=True)
+            + "; visual_anchor="
+            + json.dumps(
+                {
+                    "status": visual_anchor_report.get("status"),
+                    "consensus_view_indices": visual_anchor_report.get(
+                        "consensus_view_indices"
+                    ),
+                    "residual": visual_anchor_metrics,
+                },
+                sort_keys=True,
+            )
             + "; vertical="
             + json.dumps(best["metrics"], sort_keys=True)
+            + "; visible_vertical="
+            + json.dumps(visible_structure_metrics, sort_keys=True)
             + "; full="
             + json.dumps(full_metrics, sort_keys=True)
+            + "; visible_full="
+            + json.dumps(visible_full_metrics, sort_keys=True)
         )
 
     progress(0.78, "Writing aligned point clouds, trajectory, and fixed-camera evidence")
@@ -1029,19 +1621,40 @@ def run_noesis_alignment(
         aligned_poses[:, :3, 3],
         target_camera_to_world[:3, 3],
     )
+    try:
+        topdown_frame = camera_ground_frame_from_camera_to_world(
+            target_camera_to_world
+        )
+        topdown_display = topdown_frame.world_to_camera_local_display_matrix(
+            float(target_meta.get("floor_y", 0.0))
+        )
+    except (CoordinateFrameError, TypeError, ValueError) as exc:
+        raise NoesisAlignmentError(
+            f"cannot derive the fixed-camera presentation frame: {exc}"
+        ) from exc
     topdown_path = output_dir / "alignment_topdown.png"
     _write_topdown(
         topdown_path,
-        aligned_review,
-        target_points,
-        aligned_poses[:, :3, 3],
-        target_camera_to_world[:3, 3],
+        transform_positions(aligned_review, topdown_display),
+        transform_positions(target_points, topdown_display),
+        transform_positions(aligned_poses[:, :3, 3], topdown_display),
+        transform_positions(
+            target_camera_to_world[None, :3, 3],
+            topdown_display,
+        )[0],
     )
-    keyframes = target_meta.get("rgb_keyframes")
-    if not isinstance(keyframes, dict) or not keyframes:
-        raise NoesisAlignmentError("target revision has no fixed-camera keyframe")
-    keyframe_relative = next(iter(keyframes.values()))
-    keyframe_path = target_revision / str(keyframe_relative)
+    topdown_presentation = {
+        "source_coordinate_frame": coordinate_frame,
+        "target_coordinate_frame": "camera_local_ground_m",
+        "presentation_only": True,
+        "backend_geometry_mutated": False,
+        "pose_rotations_transformed": False,
+        "world_to_camera_local_row_major": topdown_display.tolist(),
+        "linear_determinant": float(np.linalg.det(topdown_display[:3, :3])),
+        "raster_orientation": CAMERA_LOCAL_RASTER_ORIENTATION,
+        "screen_right": "camera_right_positive_x",
+        "screen_up": "camera_forward_positive_z",
+    }
     reprojection_path = output_dir / "fixed_camera_reprojection.jpg"
     reprojection_metrics = _write_reprojection(
         reprojection_path,
@@ -1107,7 +1720,11 @@ def run_noesis_alignment(
             "name": (
                 "joint_fixed_camera_view_anchor_with_bounded_vertical_structure_refinement"
                 if explicit_anchor
-                else "gravity_preserving_pose_seed_search_and_vertical_structure_registration"
+                else (
+                    "multi_view_rgb_depth_pnp_anchor_with_bounded_vertical_structure_refinement"
+                    if visual_anchor_parameters is not None
+                    else "gravity_preserving_pose_seed_search_and_vertical_structure_registration"
+                )
             ),
             "degrees_of_freedom": ["yaw", "translation_x", "translation_z"],
             "fixed_scale": 1.0,
@@ -1118,15 +1735,30 @@ def run_noesis_alignment(
             "winning_pose_anchor_index": int(best["pose_anchor_index"]),
             "explicit_fixed_camera_anchor": bool(explicit_anchor),
             "fixed_camera_anchor_residual": anchor_metrics,
+            "visual_anchor_used": bool(visual_anchor_parameters is not None),
+            "visual_anchor_residual": visual_anchor_metrics,
+            "source_metric_domain": (
+                "fixed_camera_visible_source_vs_single_view_target"
+            ),
         },
         "quality_gate": {
             "passed": True,
             "checks": checks,
-            "candidate_objective_margin": candidate_margin,
+            "candidate_objective_margin": (
+                candidate_margin if math.isfinite(candidate_margin) else None
+            ),
         },
-        "vertical_structure": best["metrics"],
-        "full_cloud": full_metrics,
+        "visual_anchor": visual_anchor_report,
+        "vertical_structure": admitted_vertical_metrics,
+        "full_cloud": admitted_full_metrics,
+        "global_vertical_structure": best["metrics"],
+        "global_full_cloud": full_metrics,
+        "fixed_camera_visibility": {
+            "vertical_structure": visible_structure_metrics,
+            "full_cloud": visible_full_metrics,
+        },
         "fixed_camera_reprojection": reprojection_metrics,
+        "topdown_presentation": topdown_presentation,
         "transform": transform_payload,
         "candidate_summary": [
             {
@@ -1178,9 +1810,14 @@ def run_noesis_alignment(
         "target_camera_orientation": target_camera_orientation,
         "admission": "saved_review_candidate_not_promoted_to_live_noesis",
         "quality_gate": report["quality_gate"],
-        "vertical_structure": best["metrics"],
-        "full_cloud": full_metrics,
+        "visual_anchor": visual_anchor_report,
+        "vertical_structure": admitted_vertical_metrics,
+        "full_cloud": admitted_full_metrics,
+        "global_vertical_structure": best["metrics"],
+        "global_full_cloud": full_metrics,
+        "fixed_camera_visibility": report["fixed_camera_visibility"],
         "fixed_camera_reprojection": reprojection_metrics,
+        "topdown_presentation": topdown_presentation,
         "artifacts": artifacts,
         "files": files,
     }

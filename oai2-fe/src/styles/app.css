@@ -374,6 +374,9 @@
   position: absolute;
   bottom: 8px;
   right: 8px;
+  display: flex;
+  align-items: center;
+  gap: 6px;
 }
 .bev-look-control-wrap {
   position: absolute;

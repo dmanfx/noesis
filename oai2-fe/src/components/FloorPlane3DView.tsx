@@ -2,8 +2,9 @@ import React, { useCallback, useEffect, useRef } from 'react';
 import * as THREE from 'three';
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
 import type { VisibleFloorPlaneModel } from '../lib/visibleFloorPlane';
+import { CAMERA_GROUND_TOP_DOWN_UP } from '../lib/cameraGroundPresentation.js';
 
-const MODEL_COMPARISON_TOP_DOWN_UP = new THREE.Vector3(0, 0, 1);
+const MODEL_COMPARISON_TOP_DOWN_UP = new THREE.Vector3(...CAMERA_GROUND_TOP_DOWN_UP);
 
 type FloorPlane3DViewProps = {
   model: VisibleFloorPlaneModel | null;

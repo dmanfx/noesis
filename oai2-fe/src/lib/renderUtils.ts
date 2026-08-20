@@ -3,6 +3,7 @@ import {
   architecturalHeightColor,
   buildDetailedFloorplanOverlay,
 } from './depthPanelRendering';
+import { derivePlanarFloorMask } from './planarFloor.mjs';
 
 export type FloorplanRgbLayer = {
   rgb_b64?: string;
@@ -78,7 +79,35 @@ export function turboColor(t: number): [number, number, number] {
 
 export function decodeFloat32(base64?: string): Float32Array | null {
   if (!base64) return null;
+  if (base64.startsWith('f16:')) {
+    return decodeFloat16(base64.slice(4));
+  }
   try {
+    if (base64.startsWith('bit:')) {
+      const countSeparator = base64.indexOf(':', 4);
+      if (countSeparator < 0) throw new Error('Packed mask is missing its cell count');
+      const count = Number(base64.slice(4, countSeparator));
+      if (!Number.isSafeInteger(count) || count < 0) {
+        throw new Error('Packed mask has an invalid cell count');
+      }
+      const binary = atob(base64.slice(countSeparator + 1));
+      if (binary.length !== Math.ceil(count / 8)) {
+        throw new Error('Packed mask byte length does not match its cell count');
+      }
+      const values = new Float32Array(count);
+      for (let index = 0; index < count; index += 1) {
+        values[index] = (binary.charCodeAt(index >> 3) >> (7 - (index & 7))) & 1;
+      }
+      return values;
+    }
+    if (base64.startsWith('u8:')) {
+      const binary = atob(base64.slice(3));
+      const values = new Float32Array(binary.length);
+      for (let index = 0; index < binary.length; index += 1) {
+        values[index] = binary.charCodeAt(index);
+      }
+      return values;
+    }
     const binary = atob(base64);
     const len = binary.length;
     const bytes = new Uint8Array(len);
@@ -180,6 +209,9 @@ type RenderLayerOptions = {
   inferredWalkableLayer?: FloorplanLayer;
   inferredWalkableColor?: [number, number, number, number?];
   inferredWalkableAltColor?: [number, number, number, number?];
+  planarFloorSupportLayer?: FloorplanLayer;
+  planarFloorExpansionCells?: number;
+  showPlanarFloor?: boolean;
   // Display-only repair for an isolated raster sampling hole. A masked cell
   // is rendered from the median of at least five valid 8-neighbours; larger
   // unknown regions and room edges remain explicitly unknown.
@@ -195,8 +227,6 @@ type RenderLayerOptions = {
   // Display-only metric reference lines for the detailed floorplan.
   bounds?: { min_x: number; max_x: number; min_z: number; max_z: number };
   metricGridM?: number;
-  flipHorizontal?: boolean;
-  flipVertical?: boolean;
 };
 
 type RenderLayerResult = {
@@ -320,10 +350,11 @@ export function renderCompositeWalkableObstacleToCanvas(
   const obsMax = obstacleHeight!.value_max ?? 1;
   const obsDenom = obsMax - obsMin === 0 ? 1 : (obsMax - obsMin);
   const obstacleEps = 0.05;
-  const floorColor: [number, number, number] = [230, 228, 222];
+  // Keep the floor visually quiet so inferno remains reserved for measured height.
+  const floorColor: [number, number, number] = [184, 180, 170];
   const optObj = (typeof options === 'object') ? options : undefined;
   let maskValues: Float32Array | null = null;
-  let inferredWalkableValues: Float32Array | null = null;
+  let planarFloorValues: Uint8Array | null = null;
   let maskThreshold = 1e-6;
   let maskInvert = false;
   const maskLayer = optObj?.maskLayer;
@@ -340,14 +371,22 @@ export function renderCompositeWalkableObstacleToCanvas(
       }
     }
   }
-  const inferredWalkableLayer = optObj?.inferredWalkableLayer;
-  if (inferredWalkableLayer?.grid_b64 && inferredWalkableLayer.grid_shape) {
-    const [inferredRows, inferredCols] = inferredWalkableLayer.grid_shape;
-    if (inferredRows === rowsW && inferredCols === colsW) {
-      const decoded = decodeFloat32(inferredWalkableLayer.grid_b64);
-      if (decoded && decoded.length >= rowsW * colsW) {
-        inferredWalkableValues = decoded;
-      }
+  const planarFloorSupportLayer = optObj?.planarFloorSupportLayer;
+  if (
+    optObj?.showPlanarFloor !== false
+    &&
+    planarFloorSupportLayer?.grid_b64
+    && planarFloorSupportLayer.grid_shape?.[0] === rowsW
+    && planarFloorSupportLayer.grid_shape?.[1] === colsW
+  ) {
+    const floorSupport = decodeFloat32(planarFloorSupportLayer.grid_b64);
+    if (floorSupport) {
+      planarFloorValues = derivePlanarFloorMask({
+        floorSupport,
+        rows: rowsW,
+        cols: colsW,
+        expansionCells: optObj?.planarFloorExpansionCells ?? 2,
+      });
     }
   }
 
@@ -355,22 +394,17 @@ export function renderCompositeWalkableObstacleToCanvas(
     const row = Math.floor(idx / colsW);
     const col = idx % colsW;
     const offset = idx * 4;
+    const isPlanarFloor = Boolean(planarFloorValues?.[idx]);
     if (maskValues) {
       const mv = maskValues[idx];
       const finiteMask = Number.isFinite(mv);
       const positive = finiteMask && mv > maskThreshold;
       const pass = finiteMask && (maskInvert ? !positive : positive);
-      if (!pass) {
-        const inferredWalkable = inferredWalkableValues
-          && Number.isFinite(inferredWalkableValues[idx])
-          && inferredWalkableValues[idx] > 0.5;
-        writeRgba(
-          data,
-          offset,
-          inferredWalkable
-            ? inferredWalkableColorForCell(optObj, row, col)
-            : unknownColorForCell(optObj, row, col),
-        );
+      if (!pass && !isPlanarFloor) {
+        data[offset] = 0;
+        data[offset + 1] = 0;
+        data[offset + 2] = 0;
+        data[offset + 3] = 255;
         continue;
       }
     }
@@ -385,7 +419,7 @@ export function renderCompositeWalkableObstacleToCanvas(
       const t = Math.min(1, Math.max(0, (oh - obsMin) / obsDenom));
       const [rr, gg, bb] = infernoColor(t);
       r = rr; g = gg; b = bb;
-    } else if (Number.isFinite(w) && w > 0.5) {
+    } else if (isPlanarFloor || (Number.isFinite(w) && w > 0.5)) {
       r = floorColor[0];
       g = floorColor[1];
       b = floorColor[2];
@@ -634,7 +668,6 @@ export function renderLayerToCanvas(
       ? neighbours[middle]
       : (neighbours[middle - 1] + neighbours[middle]) / 2;
   };
-
   const n = rows * cols;
   for (let idx = 0; idx < n; idx += 1) {
     let v = values[idx];
@@ -1512,16 +1545,6 @@ export function renderTextureFloorplanToCanvas(
   }
   context.imageSmoothingEnabled = imageSmoothing;
   if (imageSmoothing) context.imageSmoothingQuality = 'high';
-  if (options?.flipHorizontal || options?.flipVertical) {
-    context.translate(
-      options.flipHorizontal ? width : 0,
-      options.flipVertical ? height : 0,
-    );
-    context.scale(
-      options.flipHorizontal ? -1 : 1,
-      options.flipVertical ? -1 : 1,
-    );
-  }
   context.drawImage(
     offscreen,
     sourceRect.x,

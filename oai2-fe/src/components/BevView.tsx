@@ -1,7 +1,7 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { CameraKey, cameraLabel, colorIdForPerson } from '../lib/camera';
 import { FloorplanResponse } from './DepthDrawer';
-import { renderLayerToCanvas, renderCompositeWalkableObstacleToCanvas, infernoColor, bwColor } from '../lib/renderUtils';
+import { renderLayerToCanvas, renderCompositeWalkableObstacleToCanvas, infernoColor } from '../lib/renderUtils';
 import type { BevFrameMode as CoordFrameMode } from '../lib/coordTransforms';
 import { isCameraLocalFrame, isWorldFrame } from '../lib/coordTransforms';
 import {
@@ -169,6 +169,9 @@ type FloorplanVisualSelection = {
   heightLayer?: FloorplanResponse['height'];
   densityLayer?: FloorplanResponse['density'];
   distanceLayer?: FloorplanResponse['distance'];
+  observationMaskLayer?: FloorplanResponse['observed'];
+  observationMaskInvert: boolean;
+  planarFloorSupportLayer?: FloorplanResponse['scene_prior_floor_supported'];
   baseLayer?: FloorplanResponse['height'];
   baseKind: 'composite' | 'walkable' | 'obstacle_height' | 'height' | 'none';
   hasComposite: boolean;
@@ -201,6 +204,11 @@ const DEFAULT_HEIGHT_RENDER_TUNING: HeightRenderTuning = {
   densityCutoff: 0.0,
   smoothing: true,
 };
+const BEV_WALKABLE_MASK_THRESHOLD = 1e-6;
+const BEV_UNKNOWN_CELL_COLOR: [number, number, number, number] = [16, 22, 32, 255];
+const BEV_UNKNOWN_CELL_ALT_COLOR: [number, number, number, number] = [20, 28, 39, 255];
+const BEV_DISPLAY_SAFETY_PADDING_M = 1.0;
+const BEV_PLANAR_FLOOR_EXPANSION_CELLS = 2;
 
 const clampNumber = (value: number, min: number, max: number): number => Math.min(max, Math.max(min, value));
 
@@ -229,7 +237,7 @@ const hasCompatibleFloorplanUnits = (units?: string): boolean => isSceneUnits(un
 const selectFloorplanVisualSelection = (
   floorplan: FloorplanResponse | undefined,
   isCompatible = true,
-  preferHeightVisual = false
+  preferWalkableVisual = false
 ): FloorplanVisualSelection => {
   const canonicalPcf = floorplan?.scene_prior_only === true
     && floorplan?.display_source === 'pcf';
@@ -248,18 +256,27 @@ const selectFloorplanVisualSelection = (
   const distanceLayer = canonicalPcf
     ? floorplan?.scene_prior_diagnostic_distance
     : floorplan?.distance;
+  const observedLayer = canonicalPcf
+    ? floorplan?.scene_prior_diagnostic_observed
+    : floorplan?.observed;
+  const unknownLayer = canonicalPcf
+    ? floorplan?.scene_prior_diagnostic_unknown
+    : floorplan?.unknown;
+  const planarFloorSupportLayer = canonicalPcf
+    ? floorplan?.scene_prior_floor_supported
+    : undefined;
   const hasWalkable = isCompatible && !!(walkableLayer?.grid_b64 && walkableLayer?.grid_shape);
   const hasObstacleHeight = isCompatible && !!(obstacleHeightLayer?.grid_b64 && obstacleHeightLayer?.grid_shape);
   const hasHeight = isCompatible && !!(heightLayer?.grid_b64 && heightLayer?.grid_shape);
   const hasComposite = hasWalkable && hasObstacleHeight;
-  const useHeightVisual = preferHeightVisual && hasHeight;
-  const baseLayer = useHeightVisual
-    ? heightLayer
+  const useWalkableVisual = preferWalkableVisual && hasWalkable;
+  const baseLayer = useWalkableVisual
+    ? walkableLayer
     : (hasComposite
       ? walkableLayer
       : (hasWalkable ? walkableLayer : (hasObstacleHeight ? obstacleHeightLayer : heightLayer)));
-  const baseKind = useHeightVisual
-    ? 'height'
+  const baseKind = useWalkableVisual
+    ? 'walkable'
     : (hasComposite
       ? 'composite'
       : (hasWalkable ? 'walkable' : (hasObstacleHeight ? 'obstacle_height' : (hasHeight ? 'height' : 'none'))));
@@ -269,9 +286,14 @@ const selectFloorplanVisualSelection = (
     heightLayer,
     densityLayer,
     distanceLayer,
+    observationMaskLayer: canonicalPcf
+      ? (observedLayer ?? densityLayer)
+      : (unknownLayer ?? observedLayer ?? densityLayer),
+    observationMaskInvert: canonicalPcf ? false : Boolean(unknownLayer),
+    planarFloorSupportLayer,
     baseLayer,
     baseKind,
-    hasComposite: useHeightVisual ? false : hasComposite,
+    hasComposite,
     hasFloorplan: !!(baseLayer?.grid_b64 && baseLayer?.grid_shape),
   };
 };
@@ -311,6 +333,16 @@ const rawFloorplanBounds = (floorplan: FloorplanResponse | undefined): MetricBou
   if (![minX, maxX, minZ, maxZ].every(Number.isFinite)) return null;
   if (maxX <= minX || maxZ <= minZ) return null;
   return { min_x: minX, max_x: maxX, min_z: minZ, max_z: maxZ };
+};
+
+const expandMetricBounds = (bounds: MetricBounds, paddingM: number): MetricBounds => {
+  const padding = Math.max(0, Number(paddingM) || 0);
+  return {
+    min_x: bounds.min_x - padding,
+    max_x: bounds.max_x + padding,
+    min_z: bounds.min_z - padding,
+    max_z: bounds.max_z + padding,
+  };
 };
 
 const rawPayloadBounds = (meta: BevMeta | undefined): MetricBounds | null => {
@@ -537,6 +569,7 @@ export const BevView: React.FC<BevViewProps> = ({
   const [overlayEnabled, setOverlayEnabled] = useState(false);
   const [lookPanelOpen, setLookPanelOpen] = useState(false);
   const [heightRenderTuning, setHeightRenderTuning] = useState<HeightRenderTuning>(DEFAULT_HEIGHT_RENDER_TUNING);
+  const [floorPlaneEnabled, setFloorPlaneEnabled] = useState(true);
 
   const smoothState = useRef<Map<string, { x: number; y: number; lastSeen: number; stableId?: string; colorId: number }>>(new Map());
   const trailsRef = useRef<Map<string, TrailTrack>>(new Map());
@@ -598,23 +631,27 @@ export const BevView: React.FC<BevViewProps> = ({
   const displayBounds = useMemo(
     () => {
       const floorplanBounds = floorplanBoundsForMode(displayFloorplan, coordMode);
-      if (!coverageEnvelope) return floorplanBounds;
+      const paddedFloorplanBounds = floorplanBounds && displayFloorplan?.scene_prior_only === true
+        && displayFloorplan?.display_source === 'pcf'
+        ? expandMetricBounds(floorplanBounds, BEV_DISPLAY_SAFETY_PADDING_M)
+        : floorplanBounds;
+      if (!coverageEnvelope) return paddedFloorplanBounds;
       const tolerance = coverageEnvelope.boundaryToleranceM;
       const expected: MetricBounds = {
         min_x: Math.min(
-          floorplanBounds?.min_x ?? Number.POSITIVE_INFINITY,
+          paddedFloorplanBounds?.min_x ?? Number.POSITIVE_INFINITY,
           coverageEnvelope.bounds.min_x - tolerance
         ),
         max_x: Math.max(
-          floorplanBounds?.max_x ?? Number.NEGATIVE_INFINITY,
+          paddedFloorplanBounds?.max_x ?? Number.NEGATIVE_INFINITY,
           coverageEnvelope.bounds.max_x + tolerance
         ),
         min_z: Math.min(
-          floorplanBounds?.min_z ?? Number.POSITIVE_INFINITY,
+          paddedFloorplanBounds?.min_z ?? Number.POSITIVE_INFINITY,
           coverageEnvelope.bounds.min_z - tolerance
         ),
         max_z: Math.max(
-          floorplanBounds?.max_z ?? Number.NEGATIVE_INFINITY,
+          paddedFloorplanBounds?.max_z ?? Number.NEGATIVE_INFINITY,
           coverageEnvelope.bounds.max_z + tolerance
         ),
       };
@@ -635,6 +672,8 @@ export const BevView: React.FC<BevViewProps> = ({
       coverageEnvelope,
       displayFloorplan?.frame,
       displayFloorplan?.units,
+      displayFloorplan?.scene_prior_only,
+      displayFloorplan?.display_source,
       displayFloorplan?.bounds?.min_x,
       displayFloorplan?.bounds?.max_x,
       displayFloorplan?.bounds?.min_z,
@@ -655,6 +694,22 @@ export const BevView: React.FC<BevViewProps> = ({
     }
     return { x, y, mapped: false };
   }, [displayBounds]);
+  const normalizedPayloadBounds = useMemo(
+    () => parseMetricBounds(meta?.floorplanBounds)
+      ?? floorplanBoundsForMode(displayFloorplan, coordMode)
+      ?? displayBounds,
+    [
+      coordMode,
+      displayBounds,
+      displayFloorplan?.frame,
+      displayFloorplan?.units,
+      displayFloorplan?.bounds?.min_x,
+      displayFloorplan?.bounds?.max_x,
+      displayFloorplan?.bounds?.min_z,
+      displayFloorplan?.bounds?.max_z,
+      meta?.floorplanBounds,
+    ]
+  );
 
   const resolvePayloadPoint = useCallback((pt: NormalizedPayloadPoint | null | undefined): ResolvedMetricPoint | null => {
     if (!pt) return null;
@@ -669,23 +724,22 @@ export const BevView: React.FC<BevViewProps> = ({
     }
     const normX = Number(pt.normX);
     const normY = Number(pt.normY);
-    if (displayBounds && Number.isFinite(normX) && Number.isFinite(normY)) {
+    if (normalizedPayloadBounds && Number.isFinite(normX) && Number.isFinite(normY)) {
       if (pt.floorplanInside === false || normX < 0 || normX > 1 || normY < 0 || normY > 1) {
         return null;
       }
-      const spanX = displayBounds.max_x - displayBounds.min_x;
-      const spanZ = displayBounds.max_z - displayBounds.min_z;
+      const spanX = normalizedPayloadBounds.max_x - normalizedPayloadBounds.min_x;
+      const spanZ = normalizedPayloadBounds.max_z - normalizedPayloadBounds.min_z;
       if (!Number.isFinite(spanX) || !Number.isFinite(spanZ) || spanX <= 0 || spanZ <= 0) {
         return null;
       }
-      return {
-        x: displayBounds.min_x + (normX * spanX),
-        y: displayBounds.max_z - (normY * spanZ),
-        mapped: true,
-      };
+      const x = normalizedPayloadBounds.min_x + (normX * spanX);
+      const y = normalizedPayloadBounds.max_z - (normY * spanZ);
+      const resolved = resolveDisplayPoint(x, y);
+      return resolved ? { ...resolved, mapped: true } : null;
     }
     return resolveDisplayPoint(Number(pt.x), Number(pt.y));
-  }, [coverageEnvelope, displayBounds, resolveDisplayPoint]);
+  }, [coverageEnvelope, normalizedPayloadBounds, resolveDisplayPoint]);
 
   useEffect(() => {
     metaRef.current = meta;
@@ -936,10 +990,13 @@ export const BevView: React.FC<BevViewProps> = ({
       const walkableLayer = visual.walkableLayer;
       const obstacleHeightLayer = visual.obstacleHeightLayer;
       const densityLayer = visual.densityLayer;
+      const observationMaskLayer = visual.observationMaskLayer;
+      const observationMaskInvert = visual.observationMaskInvert;
+      const planarFloorSupportLayer = visual.planarFloorSupportLayer;
       const baseLayer = visual.baseLayer;
       const baseKind = visual.baseKind;
       const hasComposite = visual.hasComposite;
-      const basePalette = baseKind === 'walkable' ? bwColor : infernoColor;
+      const basePalette = infernoColor;
       const hasFloorplan = visual.hasFloorplan;
       const floorplanMetricBounds = rawFloorplanBounds(floorplanNow);
 
@@ -970,14 +1027,29 @@ export const BevView: React.FC<BevViewProps> = ({
       }
 
       const isHeightVisual = baseKind === 'height';
-      const smoothBaseImage = hasComposite || baseKind === 'walkable' || baseKind === 'obstacle_height' || isHeightVisual;
+      const isWalkableVisual = baseKind === 'walkable';
+      const smoothBaseImage = hasComposite || baseKind === 'obstacle_height' || isHeightVisual || isWalkableVisual;
       const heightLowPct = clampNumber(heightRenderTuning.lowPct, 0, Math.min(99, heightRenderTuning.highPct - 1));
       const heightHighPct = clampNumber(heightRenderTuning.highPct, Math.max(1, heightLowPct + 1), 100);
       const heightGamma = clampNumber(heightRenderTuning.gamma, 0.25, 3.0);
       const densityCutoff = clampNumber(heightRenderTuning.densityCutoff, 0.0, 0.5);
       const layerRenderKey = isHeightVisual
         ? `${heightLowPct}:${heightHighPct}:${heightGamma.toFixed(3)}:${densityCutoff.toFixed(4)}:${heightRenderTuning.smoothing ? 1 : 0}`
-        : 'layer';
+        : (isWalkableVisual
+          ? `inferno-walkable:${observationMaskInvert ? 'invert' : 'normal'}:${observationMaskLayer?.grid_b64?.length ?? ''}`
+          : 'layer');
+      const walkableRenderOptions = isWalkableVisual
+        ? {
+            maskLayer: observationMaskLayer,
+            maskThreshold: BEV_WALKABLE_MASK_THRESHOLD,
+            maskInvert: observationMaskInvert,
+            unknownColor: BEV_UNKNOWN_CELL_COLOR,
+            unknownAltColor: BEV_UNKNOWN_CELL_ALT_COLOR,
+            planarFloorSupportLayer,
+            planarFloorExpansionCells: BEV_PLANAR_FLOOR_EXPANSION_CELLS,
+            showPlanarFloor: floorPlaneEnabled,
+          }
+        : {};
       const coverageRenderKey = coverageEnvelope
         ? `${coverageEnvelope.boundaryToleranceM}:${coverageEnvelope.regions
           .map(region => `${region.id}:${region.polygonXZ.map(point => point.join(',')).join(';')}`)
@@ -986,16 +1058,26 @@ export const BevView: React.FC<BevViewProps> = ({
       const metricBoundsKey = floorplanMetricBounds
         ? `${floorplanMetricBounds.min_x}:${floorplanMetricBounds.max_x}:${floorplanMetricBounds.min_z}:${floorplanMetricBounds.max_z}`
         : 'none';
+      const displayBoundsKey = `${xMin}:${xMax}:${zMin}:${zMax}`;
+      const planarFloorKey = planarFloorSupportLayer?.grid_b64
+        ? `${floorPlaneEnabled ? 'visible' : 'hidden'}:${planarFloorSupportLayer.grid_b64.length}:${planarFloorSupportLayer.grid_b64.slice(0, 16)}:${planarFloorSupportLayer.grid_b64.slice(-16)}`
+        : 'none';
       const key = hasFloorplan
-        ? `${baseKind}:${floorplanNow?.snapshot_ts ?? floorplanNow?.ts ?? ''}:${baseLayer?.grid_shape?.join('x')}:${baseLayer?.value_min ?? ''}:${baseLayer?.value_max ?? ''}:${baseLayer?.grid_b64?.length ?? ''}:${hasComposite ? (obstacleHeightLayer?.grid_b64?.length ?? '') : ''}:${isHeightVisual ? (densityLayer?.grid_b64?.length ?? '') : ''}:${aspect}:${fitMode}:${boundsAspect.toFixed(6)}:${padCss.toFixed(3)}:${smoothBaseImage ? 'smooth' : 'sharp'}:${layerRenderKey}:${metricBoundsKey}:${coverageRenderKey}`
-        : `none:${aspect}:${fitMode}:${boundsAspect.toFixed(6)}:${padCss.toFixed(3)}:${metricBoundsKey}:${coverageRenderKey}`;
+        ? `${baseKind}:${floorplanNow?.snapshot_ts ?? floorplanNow?.ts ?? ''}:${baseLayer?.grid_shape?.join('x')}:${baseLayer?.value_min ?? ''}:${baseLayer?.value_max ?? ''}:${baseLayer?.grid_b64?.length ?? ''}:${hasComposite ? (obstacleHeightLayer?.grid_b64?.length ?? '') : ''}:${isHeightVisual ? (densityLayer?.grid_b64?.length ?? '') : ''}:${aspect}:${fitMode}:${boundsAspect.toFixed(6)}:${padCss.toFixed(3)}:${smoothBaseImage ? 'smooth' : 'sharp'}:${layerRenderKey}:${metricBoundsKey}:${displayBoundsKey}:${coverageRenderKey}:${planarFloorKey}`
+        : `none:${aspect}:${fitMode}:${boundsAspect.toFixed(6)}:${padCss.toFixed(3)}:${metricBoundsKey}:${displayBoundsKey}:${coverageRenderKey}`;
 
       const bg = bgCanvasRef.current ?? (bgCanvasRef.current = document.createElement('canvas'));
       const bgSize = bgSizeRef.current;
       const bgNeedsRedraw = bgKeyRef.current !== key || bgSize.w !== expectedW || bgSize.h !== expectedH;
 
       if (bgNeedsRedraw) {
-        if (coverageEnvelope) {
+        const placeFloorplanInMetricBounds = Boolean(
+          hasFloorplan
+          && floorplanMetricBounds
+          && displayBounds
+          && !boundsNearlyEqual(floorplanMetricBounds, displayBounds)
+        );
+        if (coverageEnvelope || placeFloorplanInMetricBounds) {
           cvs.width = expectedW;
           cvs.height = expectedH;
           ctx.setTransform(1, 0, 0, 1, 0, 0);
@@ -1021,6 +1103,40 @@ export const BevView: React.FC<BevViewProps> = ({
             h: contentH,
           };
           bgContentRectRef.current = coverageContentRect;
+
+          // The margin is deliberately rendered as unknown space. It makes the
+          // authored PCF grid boundary visible without pretending the room was
+          // measured outside that grid.
+          const checkerSize = Math.max(8, Math.round(10 * dpr));
+          ctx.save();
+          ctx.beginPath();
+          ctx.rect(
+            coverageContentRect.x,
+            coverageContentRect.y,
+            coverageContentRect.w,
+            coverageContentRect.h,
+          );
+          ctx.clip();
+          for (
+            let checkerY = coverageContentRect.y;
+            checkerY < coverageContentRect.y + coverageContentRect.h;
+            checkerY += checkerSize
+          ) {
+            for (
+              let checkerX = coverageContentRect.x;
+              checkerX < coverageContentRect.x + coverageContentRect.w;
+              checkerX += checkerSize
+            ) {
+              const checkerCol = Math.floor((checkerX - coverageContentRect.x) / checkerSize);
+              const checkerRow = Math.floor((checkerY - coverageContentRect.y) / checkerSize);
+              const color = ((checkerRow + checkerCol) & 1)
+                ? BEV_UNKNOWN_CELL_ALT_COLOR
+                : BEV_UNKNOWN_CELL_COLOR;
+              ctx.fillStyle = `rgba(${color[0]}, ${color[1]}, ${color[2]}, ${(color[3] ?? 255) / 255})`;
+              ctx.fillRect(checkerX, checkerY, checkerSize, checkerSize);
+            }
+          }
+          ctx.restore();
 
           if (hasFloorplan && floorplanMetricBounds) {
             const floorplanSpanX = floorplanMetricBounds.max_x - floorplanMetricBounds.min_x;
@@ -1050,6 +1166,7 @@ export const BevView: React.FC<BevViewProps> = ({
                 {
                   ...renderOptions,
                   imageSmoothing: true,
+                  ...walkableRenderOptions,
                 }
               );
             } else {
@@ -1060,6 +1177,7 @@ export const BevView: React.FC<BevViewProps> = ({
                 {
                   ...renderOptions,
                   imageSmoothing: isHeightVisual ? heightRenderTuning.smoothing : smoothBaseImage,
+                  ...walkableRenderOptions,
                   ...(isHeightVisual ? {
                     valueMinPercentile: heightLowPct,
                     valueMaxPercentile: heightHighPct,
@@ -1083,44 +1201,48 @@ export const BevView: React.FC<BevViewProps> = ({
             ctx.restore();
           }
 
-          ctx.save();
-          ctx.lineWidth = Math.max(1.5, dpr);
-          ctx.setLineDash([6 * dpr, 4 * dpr]);
-          ctx.strokeStyle = 'rgba(77, 220, 255, 0.78)';
-          ctx.fillStyle = 'rgba(77, 220, 255, 0.85)';
-          ctx.font = `${Math.max(10, 10 * dpr)}px sans-serif`;
-          for (const region of coverageEnvelope.regions) {
-            ctx.beginPath();
-            region.polygonXZ.forEach(([mx, mz], index) => {
-              const px = coverageContentRect.x + (((mx - xMin) / boundsSpanX) * coverageContentRect.w);
-              const py = coverageContentRect.y + coverageContentRect.h
-                - (((mz - zMin) / boundsSpanZ) * coverageContentRect.h);
-              if (index === 0) ctx.moveTo(px, py);
-              else ctx.lineTo(px, py);
-            });
-            ctx.closePath();
-            ctx.stroke();
-            const centroidX = region.polygonXZ.reduce((sum, point) => sum + point[0], 0) / region.polygonXZ.length;
-            const centroidZ = region.polygonXZ.reduce((sum, point) => sum + point[1], 0) / region.polygonXZ.length;
-            const labelX = coverageContentRect.x + (((centroidX - xMin) / boundsSpanX) * coverageContentRect.w);
-            const labelY = coverageContentRect.y + coverageContentRect.h
-              - (((centroidZ - zMin) / boundsSpanZ) * coverageContentRect.h);
-            ctx.fillText(region.id, labelX + (4 * dpr), labelY - (4 * dpr));
+          if (coverageEnvelope) {
+            ctx.save();
+            ctx.lineWidth = Math.max(1.5, dpr);
+            ctx.setLineDash([6 * dpr, 4 * dpr]);
+            ctx.strokeStyle = 'rgba(77, 220, 255, 0.78)';
+            ctx.fillStyle = 'rgba(77, 220, 255, 0.85)';
+            ctx.font = `${Math.max(10, 10 * dpr)}px sans-serif`;
+            for (const region of coverageEnvelope.regions) {
+              ctx.beginPath();
+              region.polygonXZ.forEach(([mx, mz], index) => {
+                const px = coverageContentRect.x + (((mx - xMin) / boundsSpanX) * coverageContentRect.w);
+                const py = coverageContentRect.y + coverageContentRect.h
+                  - (((mz - zMin) / boundsSpanZ) * coverageContentRect.h);
+                if (index === 0) ctx.moveTo(px, py);
+                else ctx.lineTo(px, py);
+              });
+              ctx.closePath();
+              ctx.stroke();
+              const centroidX = region.polygonXZ.reduce((sum, point) => sum + point[0], 0) / region.polygonXZ.length;
+              const centroidZ = region.polygonXZ.reduce((sum, point) => sum + point[1], 0) / region.polygonXZ.length;
+              const labelX = coverageContentRect.x + (((centroidX - xMin) / boundsSpanX) * coverageContentRect.w);
+              const labelY = coverageContentRect.y + coverageContentRect.h
+                - (((centroidZ - zMin) / boundsSpanZ) * coverageContentRect.h);
+              ctx.fillText(region.id, labelX + (4 * dpr), labelY - (4 * dpr));
+            }
+            ctx.restore();
           }
-          ctx.restore();
         } else if (hasFloorplan) {
           const rendered = hasComposite
             ? renderCompositeWalkableObstacleToCanvas(cvs, walkableLayer, obstacleHeightLayer, {
               fit: fitMode,
               forceAspect: boundsAspect,
               contentPaddingPx: padCss,
-              imageSmoothing: true
+              imageSmoothing: true,
+              ...walkableRenderOptions,
             })
             : renderLayerToCanvas(cvs, baseLayer, basePalette, {
               fit: fitMode,
               forceAspect: boundsAspect,
               contentPaddingPx: padCss,
               imageSmoothing: isHeightVisual ? heightRenderTuning.smoothing : smoothBaseImage,
+              ...walkableRenderOptions,
               ...(isHeightVisual ? {
                 valueMinPercentile: heightLowPct,
                 valueMaxPercentile: heightHighPct,
@@ -1658,9 +1780,11 @@ export const BevView: React.FC<BevViewProps> = ({
         }
       });
 
-      // Camera marker at the bottom-center to preserve the BEV forward-view convention.
-      const camPx = drawX((xMin + xMax) * 0.5);
-      const camPy = drawY(zMin);
+      // PCF is camera-local: draw the actual camera origin (0, 0), which sits
+      // near the bottom while preserving any measured space behind the camera.
+      const cameraOrigin = resolveForDraw(0, 0) ?? { x: (xMin + xMax) * 0.5, y: zMin, mapped: false };
+      const camPx = drawX(cameraOrigin.x);
+      const camPy = drawY(cameraOrigin.y);
       ctx.fillStyle = 'rgba(255, 215, 64, 0.95)';
       ctx.strokeStyle = 'rgba(0, 0, 0, 0.65)';
       ctx.lineWidth = 2;
@@ -1719,7 +1843,7 @@ export const BevView: React.FC<BevViewProps> = ({
     return () => {
       if (animationFrameRef.current) cancelAnimationFrame(animationFrameRef.current);
     };
-  }, [coordMode, coverageEnvelope, debug, displayBounds, floorplan, heightRenderTuning, overlayEnabled, resolveDisplayPoint, resolvePayloadPoint, resolvedTrailConfig, variant]);
+  }, [coordMode, coverageEnvelope, debug, displayBounds, floorPlaneEnabled, floorplan, heightRenderTuning, overlayEnabled, resolveDisplayPoint, resolvePayloadPoint, resolvedTrailConfig, variant]);
 
   const floorplanFrame = displayFloorplan?.frame;
   const hasFloorplanFrame = typeof floorplanFrame === 'string' && floorplanFrame.trim().length > 0;
@@ -1735,10 +1859,15 @@ export const BevView: React.FC<BevViewProps> = ({
   const visualSelection = selectFloorplanVisualSelection(displayFloorplan, isFloorplanCompatible, variant === 'inline');
   const hasWalkableLayer = visualSelection.baseKind === 'walkable' || visualSelection.baseKind === 'composite';
   const hasObstacleHeightLayer = visualSelection.baseKind === 'obstacle_height';
+  const hasPlanarFloorLayer = Boolean(
+    visualSelection.planarFloorSupportLayer?.grid_b64,
+  );
   const floorplanHasImage = visualSelection.hasFloorplan;
 
   const isFrameMismatch = coordMode === 'world' && isFloorplanCameraLocal;
-  const baseLabel = visualSelection.baseKind === 'composite'
+  const baseLabel = hasPlanarFloorLayer
+    ? 'PCF Floor Plane'
+    : visualSelection.baseKind === 'composite'
     ? 'Footprint Map'
     : (hasWalkableLayer ? 'Walkable Map' : (hasObstacleHeightLayer ? 'Obstacle Height' : 'Height Map'));
   const floorplanError = String(floorplan?.error || '').trim();
@@ -1811,6 +1940,18 @@ export const BevView: React.FC<BevViewProps> = ({
       Grid
     </label>
   );
+  const floorPlaneToggleLabel = variant === 'inline'
+    && hasPlanarFloorLayer ? (
+      <label className="bev-grid-toggle">
+        <input
+          type="checkbox"
+          checked={floorPlaneEnabled}
+          onChange={(event) => setFloorPlaneEnabled(event.target.checked)}
+          style={{ marginRight: 6 }}
+        />
+        Floor plane
+      </label>
+    ) : null;
   const lookControls = hasHeightLookControls ? (
     <div className="bev-look-control-wrap">
       <button
@@ -1910,6 +2051,7 @@ export const BevView: React.FC<BevViewProps> = ({
           {canvasContent}
           {lookControls}
           <div className="bev-grid-toggle-wrap">
+            {floorPlaneToggleLabel}
             {toggleLabel}
           </div>
         </div>

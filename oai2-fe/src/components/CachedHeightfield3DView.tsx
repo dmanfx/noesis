@@ -7,6 +7,7 @@ import { buildMaskedHeightfield } from '../lib/heightfieldModel.js';
 import { decodeFloat32, turboColor } from '../lib/renderUtils';
 import { framePerspectiveBounds } from '../lib/threeViewFraming';
 import { detectOverheadBand } from '../lib/overheadPresentation.js';
+import { CAMERA_GROUND_OBLIQUE_VIEW_DIRECTION } from '../lib/cameraGroundPresentation.js';
 
 type CachedHeightfield3DViewProps = {
   floorplan?: FloorplanResponse | null;
@@ -105,7 +106,7 @@ export default function CachedHeightfield3DView({
       bounds,
       camera,
       controls,
-      viewDirection: new THREE.Vector3(0, 1.15, -0.62),
+      viewDirection: new THREE.Vector3(...CAMERA_GROUND_OBLIQUE_VIEW_DIRECTION),
       margin: 1.16,
     });
   }, []);
@@ -118,7 +119,6 @@ export default function CachedHeightfield3DView({
 
     const group = new THREE.Group();
     group.name = 'cached-height-agl-surface';
-    group.scale.x = -1;
     const colorRange = computeMaskedRange(model.heights, {
       mask: model.observed,
       maskThreshold: 0,

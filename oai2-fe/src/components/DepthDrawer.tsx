@@ -152,6 +152,7 @@ export type FloorplanResponse = {
   scene_prior_diagnostic_structural_height?: FloorplanLayer;
   scene_prior_diagnostic_surface_observed?: FloorplanLayer;
   scene_prior_diagnostic_room_footprint?: FloorplanLayer;
+  scene_prior_diagnostic_reconstruction_extent?: FloorplanLayer;
   scene_prior_diagnostic_wall_support?: FloorplanLayer;
   scene_prior_diagnostic_room_boundary?: FloorplanLayer;
   scene_prior_diagnostic_measured_perimeter?: FloorplanLayer;
@@ -337,7 +338,8 @@ const HEIGHT_AGL_VIEW_MAX_M = 1.2;
 const HEIGHT_AGL_ROOM_MAX_M = 2.5;
 const UNKNOWN_CELL_COLOR: [number, number, number, number] = [16, 22, 32, 255];
 const UNKNOWN_CELL_ALT_COLOR: [number, number, number, number] = [20, 28, 39, 255];
-const PRIMARY_FLOORPLAN_VIEWPORT_PADDING_M = 0.3;
+const PRIMARY_FLOORPLAN_VIEWPORT_PADDING_M = 1.0;
+const PCF_DIAGNOSTIC_CONTENT_PADDING_PX = 36;
 const INFERRED_CELL_COLOR: [number, number, number, number] = [35, 57, 67, 255];
 const INFERRED_CELL_ALT_COLOR: [number, number, number, number] = [41, 68, 79, 255];
 
@@ -515,6 +517,7 @@ const DepthDrawer = memo(function DepthDrawer({
   const structuralHeightLayer = hasCanonicalPcf ? cameraFloorplan?.scene_prior_diagnostic_structural_height : undefined;
   const surfaceObservedLayer = hasCanonicalPcf ? cameraFloorplan?.scene_prior_diagnostic_surface_observed : undefined;
   const roomFootprintLayer = hasCanonicalPcf ? cameraFloorplan?.scene_prior_diagnostic_room_footprint : undefined;
+  const reconstructionExtentLayer = hasCanonicalPcf ? cameraFloorplan?.scene_prior_diagnostic_reconstruction_extent : undefined;
   const wallSupportLayer = hasCanonicalPcf ? cameraFloorplan?.scene_prior_diagnostic_wall_support : undefined;
   const roomBoundaryLayer = hasCanonicalPcf ? cameraFloorplan?.scene_prior_diagnostic_room_boundary : undefined;
   const measuredPerimeterLayer = hasCanonicalPcf ? cameraFloorplan?.scene_prior_diagnostic_measured_perimeter : undefined;
@@ -530,8 +533,15 @@ const DepthDrawer = memo(function DepthDrawer({
   const observationMaskLayer = observedLayer ?? densityLayer;
   const renderObservationMaskLayer = unknownLayer ?? observationMaskLayer;
   const renderObservationMaskInvert = Boolean(unknownLayer);
-  const floorplanViewportMaskLayer = unknownLayer ?? observationMaskLayer;
-  const floorplanViewportMaskInvert = Boolean(unknownLayer);
+  // Frame every PCF view around the complete admitted reconstruction. The
+  // authored room footprint remains a semantic overlay, not a crop boundary.
+  const floorplanViewportMaskLayer = reconstructionExtentLayer
+    ?? roomFootprintLayer
+    ?? inferredWalkableLayer
+    ?? unknownLayer
+    ?? observationMaskLayer;
+  const floorplanViewportMaskInvert = floorplanViewportMaskLayer === unknownLayer
+    && Boolean(unknownLayer);
   const floorplanError = cameraFloorplan?.error ?? null;
   const hasDensity = !!(densityLayer && densityLayer.grid_b64 && densityLayer.grid_shape);
   const hasHeight = !!(heightLayer && heightLayer.grid_b64 && heightLayer.grid_shape);
@@ -717,6 +727,64 @@ const DepthDrawer = memo(function DepthDrawer({
     ctx.setTransform(1, 0, 0, 1, 0, 0);
     ctx.clearRect(0, 0, canvas.width, canvas.height);
   }, []);
+  const drawCameraOriginMarker = useCallback((
+    canvas: HTMLCanvasElement | null,
+    layer: FloorplanLayer | undefined,
+    rendered: ReturnType<typeof renderLayerToCanvas>,
+  ) => {
+    if (!canvas || !layer?.grid_shape || !rendered || !detailedFloorplanBounds) return;
+    const [rows, cols] = layer.grid_shape;
+    const spanX = detailedFloorplanBounds.max_x - detailedFloorplanBounds.min_x;
+    const spanZ = detailedFloorplanBounds.max_z - detailedFloorplanBounds.min_z;
+    if (
+      rows <= 0
+      || cols <= 0
+      || spanX <= 0
+      || spanZ <= 0
+      || 0 < detailedFloorplanBounds.min_x
+      || 0 > detailedFloorplanBounds.max_x
+      || 0 < detailedFloorplanBounds.min_z
+      || 0 > detailedFloorplanBounds.max_z
+    ) {
+      return;
+    }
+    const source = rendered.sourceRectGrid;
+    const content = rendered.contentRectPx;
+    const cameraColumn = ((0 - detailedFloorplanBounds.min_x) / spanX) * cols;
+    const cameraRow = ((detailedFloorplanBounds.max_z - 0) / spanZ) * rows;
+    const normalizedX = (cameraColumn - source.x) / source.width;
+    const normalizedY = (cameraRow - source.y) / source.height;
+    if (normalizedX < 0 || normalizedX > 1 || normalizedY < 0 || normalizedY > 1) return;
+
+    const x = content.x + (normalizedX * content.w);
+    const y = content.y + (normalizedY * content.h);
+    const dpr = Math.max(1, canvas.width / Math.max(1, canvas.getBoundingClientRect().width));
+    const size = 8 * dpr;
+    const context = canvas.getContext('2d');
+    if (!context) return;
+    context.save();
+    context.fillStyle = 'rgba(255, 215, 64, 0.98)';
+    context.strokeStyle = 'rgba(0, 0, 0, 0.82)';
+    context.lineWidth = Math.max(1.5, 1.5 * dpr);
+    context.beginPath();
+    context.moveTo(x, y - (size * 1.45));
+    context.lineTo(x + size, y + (size * 0.45));
+    context.lineTo(x - size, y + (size * 0.45));
+    context.closePath();
+    context.fill();
+    context.stroke();
+    context.beginPath();
+    context.moveTo(x, y - (size * 1.45));
+    context.lineTo(x, y - (size * 3.0));
+    context.stroke();
+    context.font = `bold ${Math.round(9 * dpr)}px sans-serif`;
+    context.fillStyle = 'rgba(255, 224, 102, 0.98)';
+    context.strokeStyle = 'rgba(0, 0, 0, 0.82)';
+    context.lineWidth = Math.max(2, 2.5 * dpr);
+    context.strokeText('CAM', x + (size * 1.25), y + (size * 0.25));
+    context.fillText('CAM', x + (size * 1.25), y + (size * 0.25));
+    context.restore();
+  }, [detailedFloorplanBounds]);
 
   const renderTopdownLayer = useCallback(
     (
@@ -725,7 +793,7 @@ const DepthDrawer = memo(function DepthDrawer({
       palette: (t: number) => [number, number, number],
       showInferredWalkable = false,
     ) => {
-      renderLayerToCanvas(canvas, layer, palette, {
+      const rendered = renderLayerToCanvas(canvas, layer, palette, {
         fit: 'contain',
         maskLayer: renderObservationMaskLayer,
         maskThreshold: HEIGHT_CONTRAST_DENSITY_THRESH,
@@ -734,10 +802,14 @@ const DepthDrawer = memo(function DepthDrawer({
         unknownAltColor: UNKNOWN_CELL_ALT_COLOR,
         sourceRect: displaySourceRectForLayer(layer),
         ...(showInferredWalkable ? { inferredWalkableLayer } : {}),
+        contentPaddingPx: PCF_DIAGNOSTIC_CONTENT_PADDING_PX,
         imageSmoothing: false,
       });
+      drawCameraOriginMarker(canvas, layer, rendered);
+      return rendered;
     },
     [
+      drawCameraOriginMarker,
       inferredWalkableLayer,
       displaySourceRectForLayer,
       renderObservationMaskInvert,
@@ -885,10 +957,11 @@ const DepthDrawer = memo(function DepthDrawer({
       unknownColor: UNKNOWN_CELL_COLOR,
       unknownAltColor: UNKNOWN_CELL_ALT_COLOR,
       sourceRect: displaySourceRectForLayer(heightAglLayer),
+      contentPaddingPx: PCF_DIAGNOSTIC_CONTENT_PADDING_PX,
       imageSmoothing: false,
     });
     heatmapSourceCanvasRef.current = offscreen;
-    renderLayerToCanvas(canvas, heightAglLayer, turboColor, {
+    const rendered = renderLayerToCanvas(canvas, heightAglLayer, turboColor, {
       fit: 'contain',
       valueMin: heatmapRange.min,
       valueMax: heatmapRange.max,
@@ -900,10 +973,12 @@ const DepthDrawer = memo(function DepthDrawer({
       sourceRect: displaySourceRectForLayer(heightAglLayer),
       imageSmoothing: false,
     });
+    drawCameraOriginMarker(canvas, heightAglLayer, rendered);
   }, [
     activeTab,
     clearCanvasElement,
     displaySourceRectForLayer,
+    drawCameraOriginMarker,
     drawerWidth,
     heightAglLayer,
     heatmapRange,
@@ -1252,7 +1327,7 @@ const DepthDrawer = memo(function DepthDrawer({
         // A display-only contrast view: clamp to a small height range and hide unobserved cells.
         const contrastMin = heightContrastRange?.min ?? 0;
         const contrastMax = heightContrastRange?.max ?? (heightMaxRaw ?? 1);
-        renderLayerToCanvas(heightContrastCanvasRef.current, heightLayer, turboColor, {
+        const heightContrastRendered = renderLayerToCanvas(heightContrastCanvasRef.current, heightLayer, turboColor, {
           fit: 'contain',
           valueMin: contrastMin,
           valueMax: contrastMax,
@@ -1263,10 +1338,12 @@ const DepthDrawer = memo(function DepthDrawer({
           unknownColor: UNKNOWN_CELL_COLOR,
           unknownAltColor: UNKNOWN_CELL_ALT_COLOR,
           sourceRect: displaySourceRectForLayer(heightLayer),
+          contentPaddingPx: PCF_DIAGNOSTIC_CONTENT_PADDING_PX,
           imageSmoothing: false,
         });
+        drawCameraOriginMarker(heightContrastCanvasRef.current, heightLayer, heightContrastRendered);
         // Height above estimated floor (AGL): user-selected physical range.
-        renderLayerToCanvas(heightAglCanvasRef.current, heightAglLayer, turboColor, {
+        const heightAglRendered = renderLayerToCanvas(heightAglCanvasRef.current, heightAglLayer, turboColor, {
           fit: 'contain',
           valueMin: heightAglRange.min,
           valueMax: heightAglRange.max,
@@ -1277,12 +1354,14 @@ const DepthDrawer = memo(function DepthDrawer({
           unknownColor: UNKNOWN_CELL_COLOR,
           unknownAltColor: UNKNOWN_CELL_ALT_COLOR,
           sourceRect: displaySourceRectForLayer(heightAglLayer),
+          contentPaddingPx: PCF_DIAGNOSTIC_CONTENT_PADDING_PX,
           imageSmoothing: false,
         });
+        drawCameraOriginMarker(heightAglCanvasRef.current, heightAglLayer, heightAglRendered);
         renderTopdownLayer(distanceCanvasRef.current, distanceLayer, viridisColor);
         renderTopdownLayer(obstacleHeightCanvasRef.current, obstacleHeightLayer, infernoColor);
         renderTopdownLayer(walkableCanvasRef.current, walkableLayer, bwColor, true);
-        renderTextureFloorplanToCanvas(
+        const textureFloorplanRendered = renderTextureFloorplanToCanvas(
           floorplanCompositeCanvasRef.current,
           structuralHeightLayer,
           roomFootprintLayer,
@@ -1292,13 +1371,19 @@ const DepthDrawer = memo(function DepthDrawer({
             fit: 'contain',
             sourceRect: displaySourceRectForLayer(structuralHeightLayer),
             background: '#000',
+            contentPaddingPx: PCF_DIAGNOSTIC_CONTENT_PADDING_PX,
             imageSmoothing: false,
             // Floorplan grids are already serialized in final camera-local
             // orientation. image_flip is diagnostic-only and must not be
             // applied again at the display boundary.
           },
         );
-        renderStructuralFloorplanToCanvas(
+        drawCameraOriginMarker(
+          floorplanCompositeCanvasRef.current,
+          structuralHeightLayer,
+          textureFloorplanRendered,
+        );
+        const structuralFloorplanRendered = renderStructuralFloorplanToCanvas(
           structuralFloorplanCanvasRef.current,
           structuralHeightLayer,
           roomFootprintLayer,
@@ -1311,13 +1396,19 @@ const DepthDrawer = memo(function DepthDrawer({
             sourceRect: displaySourceRectForLayer(structuralHeightLayer),
             bounds: detailedFloorplanBounds,
             metricGridM: 1,
+            contentPaddingPx: PCF_DIAGNOSTIC_CONTENT_PADDING_PX,
             imageSmoothing: false,
           }
+        );
+        drawCameraOriginMarker(
+          structuralFloorplanCanvasRef.current,
+          structuralHeightLayer,
+          structuralFloorplanRendered,
         );
         renderTopdownLayer(gradientCanvasRef.current, gradientLayer, viridisColor);
       }
     }
-  }, [activeTab, open, cameraFloorplan, densityLayer, renderObservationMaskLayer, renderObservationMaskInvert, inferredWalkableLayer, heightLayer, heightAglLayer, heightContrastRange, heightMaxRaw, heightAglRange, distanceLayer, gradientLayer, obstacleHeightLayer, walkableLayer, structuralHeightLayer, roomFootprintLayer, surfaceObservedLayer, wallSupportLayer, roomBoundaryLayer, measuredPerimeterLayer, surfaceRgbLayer, renderTopdownLayer, clearCanvasElement, drawerWidth, floorplanError, diagnosticsOpen, displaySourceRectForLayer, detailedFloorplanBounds]);
+  }, [activeTab, open, cameraFloorplan, densityLayer, renderObservationMaskLayer, renderObservationMaskInvert, inferredWalkableLayer, heightLayer, heightAglLayer, heightContrastRange, heightMaxRaw, heightAglRange, distanceLayer, gradientLayer, obstacleHeightLayer, walkableLayer, structuralHeightLayer, roomFootprintLayer, surfaceObservedLayer, wallSupportLayer, roomBoundaryLayer, measuredPerimeterLayer, surfaceRgbLayer, renderTopdownLayer, clearCanvasElement, drawerWidth, floorplanError, diagnosticsOpen, displaySourceRectForLayer, detailedFloorplanBounds, drawCameraOriginMarker]);
 
   useEffect(() => {
     if (!open) return;
@@ -1867,7 +1958,7 @@ const DepthDrawer = memo(function DepthDrawer({
                     <div className="floorplan-class-keys">
                       {floorplanDisplayViewport && (
                         <div className="unknown-cell-key">
-                          Observed crop {formatNumber(floorplanDisplayViewport.cropWidthM, 1)}×{formatNumber(floorplanDisplayViewport.cropDepthM, 1)} m
+                          Room framing {formatNumber(floorplanDisplayViewport.cropWidthM, 1)}×{formatNumber(floorplanDisplayViewport.cropDepthM, 1)} m
                           {' '}· full grid {formatNumber(floorplanDisplayViewport.fullWidthM, 1)}×{formatNumber(floorplanDisplayViewport.fullDepthM, 1)} m
                         </div>
                       )}
@@ -1999,7 +2090,7 @@ const DepthDrawer = memo(function DepthDrawer({
               <div className="heatmap-meta">
                 <div className="heatmap-meta__item">
                   {hasCanonicalPcf
-                    ? `PCF prior ${scenePriorMeta?.prior_id ?? 'unknown'} · ${heightAglLayer?.grid_shape?.[1] ?? 0}×${heightAglLayer?.grid_shape?.[0] ?? 0}`
+                    ? `PCF prior ${scenePriorMeta?.prior_id ?? 'unknown'} · ${heightAglLayer?.grid_shape?.[1] ?? 0}×${heightAglLayer?.grid_shape?.[0] ?? 0} · camera at bottom, +Z forward`
                     : 'Waiting for the canonical PCF scene prior.'}
                 </div>
                 <div className="heatmap-meta__item">

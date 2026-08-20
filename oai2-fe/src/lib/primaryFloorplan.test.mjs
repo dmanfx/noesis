@@ -98,15 +98,16 @@ test('structural composite remains diagnostic and cannot style the primary canva
   );
 });
 
-test('primary viewport follows explicitly observed cells rather than inferred footprint', async () => {
+test('primary viewport includes the complete reconstruction without relabeling room membership', async () => {
   const drawer = await source('../components/DepthDrawer.tsx');
 
   assert.match(
     drawer,
-    /const floorplanViewportMaskLayer = unknownLayer \?\? observationMaskLayer;/,
+    /const floorplanViewportMaskLayer = reconstructionExtentLayer\s*\?\? roomFootprintLayer\s*\?\? inferredWalkableLayer\s*\?\? unknownLayer\s*\?\? observationMaskLayer;/,
   );
   assert.match(drawer, /maskInvert: floorplanViewportMaskInvert/);
   assert.match(drawer, /paddingM: PRIMARY_FLOORPLAN_VIEWPORT_PADDING_M/);
+  assert.match(drawer, /maskLayer: renderObservationMaskLayer/);
 
   const viewportStart = drawer.indexOf('const floorplanDisplayViewport = useMemo');
   const viewportEnd = drawer.indexOf(
@@ -114,8 +115,8 @@ test('primary viewport follows explicitly observed cells rather than inferred fo
     viewportStart,
   );
   assert.ok(viewportStart >= 0 && viewportEnd > viewportStart);
-  assert.doesNotMatch(
+  assert.match(
     drawer.slice(viewportStart, viewportEnd),
-    /roomFootprintLayer/,
+    /decodeFloat32\(floorplanViewportMaskLayer\.grid_b64\)/,
   );
 });

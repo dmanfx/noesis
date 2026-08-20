@@ -4,6 +4,7 @@ import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
 import type { SceneFusionPoints } from './DepthDrawer';
 import { framePerspectiveBounds } from '../lib/threeViewFraming';
 import { detectOverheadBand } from '../lib/overheadPresentation.js';
+import { CAMERA_GROUND_OBLIQUE_VIEW_DIRECTION } from '../lib/cameraGroundPresentation.js';
 
 type Props = {
   artifact?: SceneFusionPoints | null;
@@ -130,7 +131,7 @@ export default function FusedPointCloud3DView({
       bounds,
       camera,
       controls,
-      viewDirection: new THREE.Vector3(0, 1.2, -0.68),
+      viewDirection: new THREE.Vector3(...CAMERA_GROUND_OBLIQUE_VIEW_DIRECTION),
       margin: 1.12,
     });
   }, []);
@@ -142,9 +143,6 @@ export default function FusedPointCloud3DView({
     if (!model) return;
     const group = new THREE.Group();
     group.name = 'anchored-fixed-phone-fusion';
-    // Match the heatmap and the other conditioned views: camera right is
-    // screen-right and camera forward is screen-up without mutating evidence.
-    group.scale.x = -1;
     const colors = new Float32Array(model.count * 3);
     for (let index = 0; index < model.count; index += 1) {
       const source = colorMode === 'provenance'

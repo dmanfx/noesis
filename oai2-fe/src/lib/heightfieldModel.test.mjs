@@ -50,6 +50,39 @@ test('heightfield emits two triangles per fully observed quad', () => {
   assert.equal(model.aggregation.reducer, 'exact');
 });
 
+test('heightfield maps asymmetric far/right landmarks without a mirror or half-turn', () => {
+  const heights = new Float32Array(3 * 4);
+  heights[(2 * 4) + 0] = 0.25; // near-left
+  heights[(0 * 4) + 0] = 1.25; // forward-left
+  heights[(2 * 4) + 3] = 2.25; // near-right
+  const density = new Float32Array(3 * 4);
+  density.fill(1);
+  const model = buildMaskedHeightfield({
+    heightValues: heights,
+    densityValues: density,
+    rows: 3,
+    cols: 4,
+    bounds: { min_x: 0, max_x: 4, min_z: 0, max_z: 3 },
+  });
+
+  assert.ok(model);
+  const nearLeft = (2 * 4) + 0;
+  const forwardLeft = (0 * 4) + 0;
+  const nearRight = (2 * 4) + 3;
+  assert.deepEqual(
+    [model.positions[nearLeft * 3], model.positions[(nearLeft * 3) + 2]],
+    [0.5, 0.5],
+  );
+  assert.deepEqual(
+    [model.positions[forwardLeft * 3], model.positions[(forwardLeft * 3) + 2]],
+    [0.5, 2.5],
+  );
+  assert.deepEqual(
+    [model.positions[nearRight * 3], model.positions[(nearRight * 3) + 2]],
+    [3.5, 0.5],
+  );
+});
+
 test('heightfield caps vertices and preserves supported peaks when downsampling', () => {
   const rows = 400;
   const cols = 400;

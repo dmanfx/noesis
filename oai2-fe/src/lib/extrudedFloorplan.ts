@@ -1,4 +1,5 @@
 import { decodeFloat32, infernoColor } from './renderUtils';
+import { cameraLocalRasterToIsometric } from './cameraGroundPresentation.js';
 
 export type GridLayer = {
   grid_b64?: string;
@@ -417,10 +418,9 @@ export function renderExtrudedFloorplanToCanvas(
   const tileH = tileW * 0.5;
   const heightScalePx = (tileW / gridResM) * heightExaggeration;
 
-  const iso = (r: number, c: number) => ({
-    x: (c - r) * (tileW / 2),
-    y: (c + r) * (tileH / 2),
-  });
+  const iso = (r: number, c: number) => (
+    cameraLocalRasterToIsometric(r, c, tileW, tileH)
+  );
 
   // Intersections range from (0,0) to (rows, cols)
   const xMin = iso(rows, 0).x;

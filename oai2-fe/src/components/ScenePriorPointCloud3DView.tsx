@@ -3,6 +3,7 @@ import * as THREE from 'three';
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
 import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js';
 import { framePerspectiveBounds } from '../lib/threeViewFraming';
+import { CAMERA_GROUND_OBLIQUE_VIEW_DIRECTION } from '../lib/cameraGroundPresentation.js';
 
 type ScenePriorCameraView = {
   prior_id?: string;
@@ -84,14 +85,14 @@ export default function ScenePriorPointCloud3DView({
     if (!camera || !controls) return;
     const bounds = new THREE.Box3().setFromObject(object);
     if (bounds.isEmpty()) return;
-    // Ground views use the same visual convention as the heatmap: camera
-    // right is screen-right and camera forward is screen-up. Reflecting only
-    // camera-local +Z into Three's -Z-forward display basis preserves +X.
+    // Frame the unmodified camera-local geometry from below the ground plane.
+    // That camera basis, unlike a negative model scale, keeps +X screen-right
+    // and +Z screen-up without mirroring metric landmarks.
     framePerspectiveBounds({
       bounds,
       camera,
       controls,
-      viewDirection: new THREE.Vector3(0, 1.2, -0.68),
+      viewDirection: new THREE.Vector3(...CAMERA_GROUND_OBLIQUE_VIEW_DIRECTION),
       margin: 1.12,
     });
   }, []);
@@ -265,9 +266,6 @@ export default function ScenePriorPointCloud3DView({
       group.add(grid);
       group.add(new THREE.AxesHelper(Math.max(0.5, Math.min(gridSize * 0.12, 1.5))));
 
-      // Match every other camera-ground 3D view: camera-right is screen-right
-      // and camera-forward is screen-up. The immutable artifact is unchanged.
-      group.scale.x = -1;
       clearModel();
       scene.add(group);
       groupRef.current = group;

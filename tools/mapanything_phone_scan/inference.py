@@ -4,6 +4,7 @@ import gc
 import json
 import math
 import os
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
@@ -57,6 +58,8 @@ class MapAnythingScanSettings:
     point_budget: int = 600_000
     local_files_only: bool = True
     anchor_image: Path | None = None
+    max_joint_views: int = 80
+    window_overlap_views: int = 24
 
 
 def _tensor_numpy(value: Any, *, name: str) -> np.ndarray:
@@ -272,6 +275,7 @@ def run_mapanything_scan(
     settings: MapAnythingScanSettings,
     progress: ProgressCallback,
 ) -> dict[str, Any]:
+    run_started = time.monotonic()
     if not settings.model_id.endswith("-apache"):
         raise MapAnythingScanError("the phone-scan tool only permits the Apache-licensed MapAnything model")
     frame_rows = prepared.get("frames")
@@ -312,6 +316,7 @@ def run_mapanything_scan(
     progress(0.02, "Loading the Apache MapAnything model")
     model: Any | None = None
     outputs: Any | None = None
+    runtime_metrics: dict[str, Any] = {}
     try:
         import torch
         from mapanything.models import MapAnything
@@ -334,6 +339,11 @@ def run_mapanything_scan(
                 f"MapAnything loaded {len(views)} views, expected {len(frame_paths)}"
             )
         progress(0.20, f"Running joint MapAnything inference on {len(views)} views")
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
+            torch.cuda.reset_peak_memory_stats(device)
+            torch.cuda.synchronize(device)
+        inference_started = time.monotonic()
         with torch.inference_mode():
             outputs = model.infer(
                 views,
@@ -347,6 +357,17 @@ def run_mapanything_scan(
                 confidence_percentile=10,
                 use_multiview_confidence=False,
             )
+        if device.type == "cuda":
+            torch.cuda.synchronize(device)
+            runtime_metrics["cuda_peak_allocated_bytes"] = int(
+                torch.cuda.max_memory_allocated(device)
+            )
+            runtime_metrics["cuda_peak_reserved_bytes"] = int(
+                torch.cuda.max_memory_reserved(device)
+            )
+        runtime_metrics["joint_inference_s"] = float(
+            time.monotonic() - inference_started
+        )
         if not isinstance(outputs, list) or len(outputs) != len(frame_paths):
             raise MapAnythingScanError(
                 f"MapAnything returned {len(outputs) if isinstance(outputs, list) else 'invalid'} views"
@@ -488,6 +509,10 @@ def run_mapanything_scan(
                 "apply_mask": True,
                 "mask_edges": True,
                 "use_multiview_confidence": False,
+            },
+            "runtime": {
+                **runtime_metrics,
+                "total_processing_s": float(time.monotonic() - run_started),
             },
             "view_count": len(frame_results),
             "phone_view_count": len(frame_rows),

@@ -945,6 +945,249 @@ def _variant_output_name(variant: str) -> str:
     return f"mapanything_{variant}"
 
 
+def _prediction_to_numpy(prediction: dict[str, Any]) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for key, value in prediction.items():
+        try:
+            import torch
+
+            if isinstance(value, torch.Tensor):
+                result[key] = value.detach().cpu().numpy()
+                continue
+        except ImportError:
+            pass
+        result[key] = value.copy() if isinstance(value, np.ndarray) else value
+    return result
+
+
+def _scale_prediction_geometry(prediction: dict[str, Any], scale: float) -> None:
+    for key in ("depth_z", "pts3d"):
+        if key in prediction:
+            prediction[key] = np.asarray(prediction[key]) * float(scale)
+    if "metric_scaling_factor" in prediction:
+        prediction["metric_scaling_factor"] = (
+            np.asarray(prediction["metric_scaling_factor"]) * float(scale)
+        )
+    if "camera_poses" in prediction:
+        pose = np.asarray(prediction["camera_poses"]).copy()
+        pose[..., :3, 3] *= float(scale)
+        prediction["camera_poses"] = pose
+
+
+def _conditioned_overlap_scale_and_gate(
+    canonical: list[dict[str, Any] | None],
+    window: list[dict[str, Any]],
+    *,
+    start: int,
+    end: int,
+) -> tuple[float, dict[str, Any]]:
+    ratios: list[np.ndarray] = []
+    common_fractions: list[float] = []
+    overlap_rows: list[tuple[np.ndarray, np.ndarray, np.ndarray]] = []
+    for local_index, global_index in enumerate(range(start, end)):
+        base = canonical[global_index]
+        if base is None:
+            continue
+        base_depth = _map2d(base.get("depth_z"), name="base depth").astype(np.float64)
+        new_depth = _map2d(
+            window[local_index].get("depth_z"), name="window depth"
+        ).astype(np.float64)
+        base_mask = _map2d(base.get("mask"), name="base mask").astype(bool)
+        new_mask = _map2d(
+            window[local_index].get("mask"), name="window mask"
+        ).astype(bool)
+        if base_depth.shape != new_depth.shape:
+            raise MapAnythingScanError(
+                "conditioned MapAnything windows returned incompatible depth shapes"
+            )
+        common = (
+            base_mask
+            & new_mask
+            & np.isfinite(base_depth)
+            & np.isfinite(new_depth)
+            & (base_depth > 0.0)
+            & (new_depth > 0.0)
+        )
+        common_fractions.append(float(np.count_nonzero(common) / common.size))
+        indices = np.flatnonzero(common.reshape(-1))
+        if indices.size:
+            positions = np.linspace(
+                0, indices.size - 1, min(20_000, indices.size), dtype=np.int64
+            )
+            chosen = indices[positions]
+            base_values = base_depth.reshape(-1)[chosen]
+            new_values = new_depth.reshape(-1)[chosen]
+            ratios.append(base_values / new_values)
+            overlap_rows.append((base_values, new_values, chosen))
+    if not ratios:
+        raise MapAnythingScanError(
+            "conditioned MapAnything windows had no common valid overlap depth"
+        )
+    ratio_values = np.concatenate(ratios)
+    ratio_values = ratio_values[
+        np.isfinite(ratio_values) & (ratio_values > 0.25) & (ratio_values < 4.0)
+    ]
+    if ratio_values.size < 1_000:
+        raise MapAnythingScanError(
+            "conditioned MapAnything windows had too few robust scale samples"
+        )
+    scale = float(np.exp(np.median(np.log(ratio_values))))
+    residuals = np.concatenate(
+        [np.abs(new_values * scale - base_values) for base_values, new_values, _ in overlap_rows]
+    )
+    metrics = {
+        "overlap_view_count": len(overlap_rows),
+        "sample_count": int(residuals.size),
+        "depth_scale_to_base": scale,
+        "common_valid_fraction_p50": float(np.median(common_fractions)),
+        "depth_residual_m_p50": float(np.percentile(residuals, 50.0)),
+        "depth_residual_m_p80": float(np.percentile(residuals, 80.0)),
+    }
+    metrics["checks"] = {
+        "metric_scale": 0.67 <= scale <= 1.50,
+        "common_geometry": metrics["common_valid_fraction_p50"] >= 0.40,
+        "median_residual": metrics["depth_residual_m_p50"] <= 0.20,
+        "p80_residual": metrics["depth_residual_m_p80"] <= 0.40,
+    }
+    if not all(metrics["checks"].values()):
+        failed = ", ".join(
+            name for name, passed in metrics["checks"].items() if not passed
+        )
+        raise MapAnythingScanError(
+            "conditioned MapAnything window overlap did not clear the depth gate: "
+            f"{failed}; scale={scale:.3f}, "
+            f"median={metrics['depth_residual_m_p50']:.3f}m, "
+            f"p80={metrics['depth_residual_m_p80']:.3f}m"
+        )
+    return scale, metrics
+
+
+def _run_conditioned_mapanything_windows(
+    model: Any,
+    raw_views: list[dict[str, Any]],
+    *,
+    preprocess_inputs: Any,
+    torch: Any,
+    amp_dtype: str,
+    max_joint_views: int,
+    window_overlap_views: int,
+    require_depth_prior: bool,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[str, Any]]:
+    from tools.mapanything_phone_scan.windowed_inference import _window_ranges
+
+    ranges = _window_ranges(len(raw_views), max_joint_views, window_overlap_views)
+    canonical: list[dict[str, Any] | None] = [None] * len(raw_views)
+    canonical_processed: list[dict[str, Any] | None] = [None] * len(raw_views)
+    reports: list[dict[str, Any]] = []
+    expected_shape: tuple[int, ...] | None = None
+    for window_index, (start, end) in enumerate(ranges):
+        print(
+            f"[window {window_index + 1}/{len(ranges)}] preprocessing views "
+            f"{start + 1}-{end}",
+            flush=True,
+        )
+        processed = preprocess_inputs(raw_views[start:end], verbose=True)
+        window_shape = tuple(processed[0]["img"].shape[-2:])
+        if expected_shape is None:
+            expected_shape = window_shape
+        if window_shape != expected_shape or any(
+            tuple(view["img"].shape[-2:]) != expected_shape for view in processed
+        ):
+            raise MapAnythingScanError(
+                "conditioned MapAnything windows do not share one image shape"
+            )
+        if require_depth_prior:
+            prior_counts = [
+                int(np.count_nonzero(_numpy_from_processed(view["depth_z"])))
+                for view in processed
+            ]
+            if min(prior_counts) < 500:
+                raise MapAnythingScanError(
+                    "a conditioned MapAnything window has fewer than 500 depth-prior "
+                    "samples in a view"
+                )
+        with torch.inference_mode():
+            predicted = model.infer(
+                processed,
+                memory_efficient_inference=True,
+                use_amp=True,
+                amp_dtype=amp_dtype,
+                apply_mask=True,
+                mask_edges=True,
+                apply_confidence_mask=False,
+                confidence_percentile=10,
+            )
+        if not isinstance(predicted, list) or len(predicted) != len(processed):
+            raise MapAnythingScanError(
+                "a conditioned MapAnything window returned an invalid prediction list"
+            )
+        window = [_prediction_to_numpy(row) for row in predicted]
+        overlap_metrics: dict[str, Any] | None = None
+        window_scale = 1.0
+        if any(canonical[index] is not None for index in range(start, end)):
+            window_scale, overlap_metrics = _conditioned_overlap_scale_and_gate(
+                canonical, window, start=start, end=end
+            )
+            for row in window:
+                _scale_prediction_geometry(row, window_scale)
+        for local_index, global_index in enumerate(range(start, end)):
+            if canonical[global_index] is not None:
+                continue
+            canonical[global_index] = window[local_index]
+            canonical_processed[global_index] = {
+                "depth_z": (
+                    _numpy_from_processed(processed[local_index]["depth_z"]).copy()
+                    if require_depth_prior
+                    else None
+                )
+            }
+        reports.append(
+            {
+                "window_index": window_index,
+                "global_start": start,
+                "global_end_exclusive": end,
+                "view_count": end - start,
+                "depth_scale_to_base": window_scale,
+                "duplicate_depth_gate": overlap_metrics,
+            }
+        )
+        del predicted, window, processed
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    if any(row is None for row in canonical) or any(
+        row is None for row in canonical_processed
+    ):
+        raise MapAnythingScanError("conditioned MapAnything windows lost prepared views")
+    return (
+        [row for row in canonical if row is not None],
+        [row for row in canonical_processed if row is not None],
+        {
+            "enabled": len(ranges) > 1,
+            "window_count": len(ranges),
+            "max_joint_views": max_joint_views,
+            "window_overlap_views": window_overlap_views,
+            "all_duplicate_depth_gates_passed": True,
+            "windows": reports,
+        },
+    )
+
+
+def _rewrite_variant_manifest(
+    output_dir: Path, summary: dict[str, Any]
+) -> None:
+    manifest_path = output_dir / "variant_manifest.json"
+    summary["files"] = _file_inventory(output_dir, excluded=[manifest_path])
+    manifest_row = {"path": "variant_manifest.json", "size_bytes": 0}
+    summary["files"].append(manifest_row)
+    for _ in range(3):
+        manifest_path.write_text(json.dumps(summary, indent=2), encoding="utf-8")
+        size = int(manifest_path.stat().st_size)
+        if manifest_row["size_bytes"] == size:
+            break
+        manifest_row["size_bytes"] = size
+
+
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("scan_dir", type=Path)
@@ -979,6 +1222,8 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--amp-dtype", choices=("bf16", "fp16", "fp32"), default="bf16")
     parser.add_argument("--point-budget", type=int, default=600_000)
+    parser.add_argument("--max-joint-views", type=int, default=80)
+    parser.add_argument("--window-overlap-views", type=int, default=24)
     parser.add_argument("--consistency-threshold", type=float, default=0.55)
     parser.add_argument("--boundary-threshold", type=float, default=0.50)
     parser.add_argument("--sparse-sample-fraction", type=float, default=0.10)
@@ -997,6 +1242,12 @@ def main() -> int:
         raise MapAnythingScanError("only the Apache-licensed MapAnything model is permitted")
     scan_dir = args.scan_dir.resolve()
     output_root = args.output_root.resolve()
+    if args.max_joint_views < 16:
+        raise MapAnythingScanError("--max-joint-views must be at least 16")
+    if not 4 <= args.window_overlap_views < args.max_joint_views:
+        raise MapAnythingScanError(
+            "--window-overlap-views must be at least 4 and below --max-joint-views"
+        )
     output_root.mkdir(parents=True, exist_ok=True)
     frame_rows = _load_frame_rows(scan_dir)
     da3 = _load_sequence(args.da3_raw.resolve(), "DA3")
@@ -1096,45 +1347,28 @@ def main() -> int:
                 sparse,
                 static,
             )
-            processed_views = preprocess_inputs(raw_views, verbose=True)
-            del raw_views
-            expected_shape = tuple(processed_views[0]["img"].shape[-2:])
-            if any(tuple(view["img"].shape[-2:]) != expected_shape for view in processed_views):
-                raise MapAnythingScanError("preprocessed views do not share one image shape")
-            if bool(VARIANT_SPECS[variant]["use_depth"]):
-                prior_counts = [
-                    int(np.count_nonzero(_numpy_from_processed(view["depth_z"])))
-                    for view in processed_views
-                ]
-                if min(prior_counts) < 500:
-                    raise MapAnythingScanError(
-                        f"{variant} has fewer than 500 preprocessed depth-prior samples in a view"
-                    )
-                print(
-                    f"[{variant}] preprocessed shape={expected_shape}, depth samples/view min={min(prior_counts)} median={np.median(prior_counts):.0f} max={max(prior_counts)}",
-                    flush=True,
-                )
             print(
-                f"[{variant}] running joint inference over {len(processed_views)} views",
+                f"[{variant}] running overlap-gated inference over {len(raw_views)} views",
                 flush=True,
             )
             outputs: list[dict[str, Any]] | None = None
+            processed_views: list[dict[str, Any]] = []
             try:
-                with torch.inference_mode():
-                    outputs = model.infer(
-                        processed_views,
-                        memory_efficient_inference=True,
-                        use_amp=True,
+                outputs, processed_views, window_report = (
+                    _run_conditioned_mapanything_windows(
+                        model,
+                        raw_views,
+                        preprocess_inputs=preprocess_inputs,
+                        torch=torch,
                         amp_dtype=args.amp_dtype,
-                        apply_mask=True,
-                        mask_edges=True,
-                        apply_confidence_mask=False,
-                        confidence_percentile=10,
+                        max_joint_views=args.max_joint_views,
+                        window_overlap_views=args.window_overlap_views,
+                        require_depth_prior=bool(
+                            VARIANT_SPECS[variant]["use_depth"]
+                        ),
                     )
-                if not isinstance(outputs, list) or len(outputs) != len(processed_views):
-                    raise MapAnythingScanError(
-                        f"{variant} returned an invalid prediction list"
-                    )
+                )
+                del raw_views
                 print(f"[{variant}] inference complete; writing review artifacts", flush=True)
                 summary = _save_variant_outputs(
                     stage_dir,
@@ -1152,6 +1386,8 @@ def main() -> int:
                     model_metadata,
                     args.point_budget,
                 )
+                summary["joint_inference"] = window_report
+                _rewrite_variant_manifest(stage_dir, summary)
                 os.replace(stage_dir, final_dir)
                 suite_rows.append(
                     {
@@ -1211,6 +1447,11 @@ def main() -> int:
                 str(args.calibration.resolve()) if args.calibration is not None else None
             ),
             "model": model_metadata,
+            "joint_inference": {
+                "max_joint_views": args.max_joint_views,
+                "window_overlap_views": args.window_overlap_views,
+                "policy": "overlap_gated_conditioned_windows",
+            },
             "sparse_depth_prior": sparse.metrics,
             "variants": suite_rows,
         }

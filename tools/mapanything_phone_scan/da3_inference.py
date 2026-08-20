@@ -39,9 +39,11 @@ class DA3PhoneScanSettings:
     local_files_only: bool = True
     metric_engine_path: Path = Path(
         "data/ds9_artifacts/models/engines/"
-        "da3metric_large_294x518_b3_fp16_trt10.13.engine"
+        "da3metric_large_294x518_b3_fp16_trt10.16.engine"
     )
     metric_focal_denominator: float = 300.0
+    max_joint_views: int = 48
+    window_overlap_views: int = 16
     anchor_image: Path | None = None
 
 
@@ -76,7 +78,10 @@ class _TensorRTRunner:
         self.runtime = trt.Runtime(self.logger)
         self.engine = self.runtime.deserialize_cuda_engine(engine_path.read_bytes())
         if self.engine is None:
-            raise DA3PhoneScanError(f"cannot deserialize TensorRT engine {engine_path}")
+            raise DA3PhoneScanError(
+                f"cannot deserialize TensorRT engine {engine_path} with TensorRT "
+                f"{trt.__version__}; rebuild the engine for the installed TensorRT runtime"
+            )
         self.context = self.engine.create_execution_context()
         if self.context is None:
             raise DA3PhoneScanError("cannot create DA3Metric-Large TensorRT context")

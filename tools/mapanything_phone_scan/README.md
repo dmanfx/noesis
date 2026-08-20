@@ -1,6 +1,6 @@
 # Phone-Walk Room Reconstruction
 
-This LAN-only tool records a phone walk, prepares a bounded set of views, and
+This LAN-only tool records a phone walk, prepares an adaptive set of views, and
 runs either MapAnything or Depth Anything 3 (DA3). It also contains an offline
 consensus workflow that combines both model outputs into a cleaner shared room
 reconstruction.
@@ -21,9 +21,12 @@ silently mixed into phone-only inference or fusion.
 This tool saves review candidates. It does not automatically publish them into
 the live native DS9.1 depth, tracking, floorplan, or virtual-twin contracts.
 
-The canonical fusion decision, validation basis, authority boundaries, and
-repeat-for-another-room procedure are in
-`docs/Phone_Walk_Fusion_Reconstruction.md`.
+The [canonical end-to-end Prior-Conditioned Fusion (PCF) operating and handoff
+runbook](../../docs/PCF_Workflow.md) carries the process from capture through
+the sealed evidence bundle, immutable Scene Prior, runtime binding, and
+dashboard verification. The fusion decision, validation basis, and algorithm
+detail are in
+[`Phone_Walk_Fusion_Reconstruction.md`](../../docs/Phone_Walk_Fusion_Reconstruction.md).
 
 ## Validated reference capture
 
@@ -102,32 +105,98 @@ present.
    Saved walks appear in the **Walks** list. Press and hold a walk to rename it;
    the new name is saved immediately without renaming or moving its asset
    directory.
-3. The server extracts up to 48 views over the complete walk at a target rate
-   of two views per second.
-4. Frame-quality warnings are informational; frames are not silently dropped.
+3. The server analyzes a dense four-view-per-second candidate stream. It keeps
+   frames that add viewpoint information, enforces temporal coverage, and
+   inserts bridge views when adjacent selected frames lack reliable visual
+   overlap. The default 256 selected-view limit is an emergency ceiling, not a
+   requested frame count; preparation reports if it ever constrains a walk.
+4. Selection combines relative sharpness, exposure, feature coverage, visual
+   motion, and overlap. The manifest records every selected timestamp, reason,
+   quality score, adjacent-view connectivity measurement, and any warnings.
 5. Once `prepared_frames_manifest.json` is durable, choose **MapAnything** or
    **DA3** and select **Run reconstruction**.
-6. The selected provider runs one joint multi-view inference over every
-   prepared frame.
+6. The selected provider reconstructs every prepared frame. MapAnything uses
+   one joint pass through 80 views. Larger adaptive sets are divided into
+   80-view windows with 24 exact duplicate views between
+   neighboring windows. Duplicate camera poses initialize a proper Sim(3),
+   pixel-corresponding duplicate 3D surfaces robustly refine scale and
+   translation, and both camera and dense-surface gates must pass before a
+   window enters the saved reconstruction. DA3 uses the same fail-closed
+   mechanism with 48-view windows and 16 exact duplicate views. Unique views
+   from every accepted
+   window are retained; review points are confidence weighted and averaged in
+   3.5 cm voxels.
 7. The tool saves a review GLB, camera trajectory, RGB, depth, confidence or
    validity data, masks, poses, intrinsics, metric scale, and raw NPZ arrays.
 8. Choose the static camera physically installed in the scanned room, then
    select **Align to selected camera**. The target is saved with the walk before
    alignment starts. The tool estimates the phone floor, preserves gravity and
    metric scale, and registers room structure to that camera's validated room
-   reconstruction. It also verifies that the selected camera faces its own
-   target cloud. If the calibrated pose is valid but the imported target cloud
-   has the common local-X/Z half-turn convention, the alignment copy of that
-   target cloud is rotated 180 degrees about the calibrated camera center and
-   world-up axis. The calibrated camera pose remains unchanged and the report
-   records the correction. Ambiguous cases still fail; the workflow never
-   silently rewrites the global Noesis calibration.
-9. A weak or ambiguous registration fails its quality gate. A passing result
-   remains a review candidate until explicitly promoted by a separate workflow.
+   reconstruction. For an ordinary phone-only walk, shared RGB landmarks across
+   multiple phone views and the fixed-camera keyframe choose the room pose by
+   depth-backed PnP consensus; vertical geometry then performs only a bounded
+   refinement. Source-fit metrics are evaluated over surfaces the single static
+   camera could actually observe, while points hidden behind its measured depth
+   remain recorded as global diagnostics instead of counting as alignment
+   failures. Foreground disagreements are still scored. The tool also verifies
+   that the selected camera faces its own target cloud and never rotates or
+   rewrites the authoritative cloud or global Noesis calibration.
+9. A weak or ambiguous registration fails its quality gate. After a passed DA3
+   alignment, select **Generate PCF review** to run the canonical
+   `da3_pose_sparse_depth` conditioned MapAnything stage, DA3-carried
+   consistency fusion, and static-world evaluation over the same prepared
+   views. The app auto-saves the PCF GLB, raw evidence, collaboration image,
+   diagnostic layers, 2.5 cm point layers, evaluation metrics, and run log.
+   On GPU-constrained installations,
+   `NOESIS_PHONE_SCAN_PCF_PAUSE_APPLIANCE=1` makes this button explicitly pause
+   the native Noesis/Menon appliance and restore it when the PCF job exits. The
+   runtime lease and any restoration error are saved with the job.
+10. A completed browser PCF remains a review candidate. The button never seals
+    a room-scan bundle, builds or binds a Scene Prior, or changes live Noesis.
 
-The browser currently runs one provider per scan. The dual-provider consensus
-builder is an offline expert workflow and expects both provider output roots to
-have been preserved. It is not yet a one-button browser operation.
+## Adding another video to an existing walk
+
+After the first reconstruction completes, select **Add Video** to record another
+pass or **Use saved video** to upload one already on the phone. The upload and
+its prepared frames are immediately auto-saved below
+`<scan-id>/supplements/<addition-id>/`; the original video, prepared views, and
+reconstruction outputs are never overwritten.
+
+An addition uses the provider selected for the original reconstruction. Before
+using the GPU, the service searches the current reconstruction's retained RGB
+views for strong overlap with the new video. It copies up to eight exact prior
+views into the new inference batch as bridge views and reserves the remaining
+view budget for the new pass. Static-camera images are not inserted into this
+phone-to-phone bridge batch.
+
+Publishing an added pass requires both checks below:
+
+1. The duplicate bridge camera poses must agree on one stable metric Sim(3)
+   transform from the new joint reconstruction into the original phone frame.
+2. Independently matched RGB landmarks from the new views must solve against
+   prior reconstructed 3D points with a camera pose consistent with that
+   transform.
+
+If either gate fails, the base reconstruction remains current and all uploaded
+video and prepared frames remain available for review or retry. If both pass,
+the service creates an immutable revision containing the joint inference,
+append-to-base transform, source comparison, camera path, confidence-weighted
+4 cm surfels, raw provenance counts, report, and manifest. New-only voxels need
+support from at least two views; overlapping evidence is confidence weighted,
+with the original reconstruction retaining greater authority. Later additions
+may bridge through retained frames from any accepted earlier pass.
+
+If the base walk is already registered to Noesis, the saved phone-to-Noesis
+transform is composed into a Noesis-world derivative of the merged revision.
+If Noesis registration happens later, that derivative is generated when the
+alignment completes. Deleting an addition is allowed only from the newest end
+of a dependent revision chain.
+
+The browser runs one base provider per scan. A completed, quality-gated DA3
+alignment exposes the optional PCF action, which runs conditioned MapAnything
+and the selected dual-provider fusion without replacing the base DA3 output.
+PCF currently uses the original prepared walk only. If an added-video revision
+is active, the app refuses PCF rather than silently omitting those added views.
 
 ## Provider semantics
 
@@ -136,6 +205,14 @@ have been preserved. It is not yet a one-button browser operation.
 - Official Apache-licensed `facebook/map-anything-apache` model.
 - Jointly predicts multi-view poses, depth, intrinsics, metric scaling, and
   learned confidence.
+- The installed RTX 3060 capacity check passes 80 joint views at 10.56 GB peak
+  allocated memory; 96 views OOM with DS9.1 stopped. The 80-view default is a
+  measured per-window GPU limit, not a capture limit. Use
+  `benchmark_mapanything_capacity.py` before increasing it on another GPU.
+- Native DS9.1 must be paused while this offline reconstruction owns the GPU;
+  the deployed browser action exposes and records its configured automatic
+  pause/restore lease rather than competing for memory or silently changing
+  runtime authority.
 
 ### DA3
 
@@ -143,9 +220,16 @@ have been preserved. It is not yet a one-button browser operation.
   geometry, poses, intrinsics, and learned multiview confidence.
 - DA3Metric-Large supplies metric depth through the validated FP16 TensorRT
   engine for the RTX 3060.
+- That DA3Metric engine is coupled to the installed TensorRT version and must
+  be rebuilt after a TensorRT upgrade. MapAnything and consensus fusion do not
+  use serialized TensorRT plans in this utility.
 - The DA3Metric non-sky output is a validity mask, not a confidence map.
 - The integration uses DA3 Base confidence for weighting and the DA3Metric
   non-sky mask for validity. It does not invent confidence values.
+- Adaptive sequences above 48 views use 16-view-overlap DA3 windows. Exact
+  duplicate RGB-D views gate each fixed-scale window registration, and every
+  unique accepted view is retained for the conditioned MapAnything and PCF
+  stages.
 
 ## Consensus fusion workflow
 
@@ -240,10 +324,12 @@ Consensus:   data/mapanything_phone_scans/20260801-112036-2d9225dd/consensus_fus
 
 ## Heatmap-style diagnostic views
 
-The renderer applies the same floor estimation, BEV orientation, rasterization,
-height, density, obstacle, walkable, and edge calculations to MapAnything, DA3,
-and consensus outputs. The hallway/foyer convention places it toward the
-top-left of the BEV.
+The renderer applies the same floor estimation, camera-ground presentation,
+rasterization, height, density, obstacle, walkable, and edge calculations to
+MapAnything, DA3, and consensus outputs. It derives +X camera-right and +Z
+camera-forward from the first phone view (or the selected static camera for
+backend-world evaluation), writes row zero at maximum +Z, and never applies a
+room-specific rotate or mirror.
 
 For reusable paths:
 
@@ -379,11 +465,11 @@ surface and floorplan, not a replacement for calibrated track projection.
 ### Family Room qualification
 
 The same workflow was repeated for landscape scan
-`20260810-215847-571c6efe`. Its imported static target cloud was reversed
-relative to the valid calibrated Family Room pose: forward visibility changed
-from 0% to 100% after the alignment-only 180-degree target-cloud correction.
-The correction preserved the calibrated camera pose, and every alignment gate
-passed.
+`20260810-215847-571c6efe`. Its admitted immutable lineage resolved an earlier
+Family Room target-frame mismatch upstream. Current alignment validates the
+calibrated camera against the authoritative cloud and refuses a backwards
+target; it does not rotate a working target copy or add a Family-only display
+correction.
 
 | Candidate | Internal median | Held-out median | Static source median | Static target median | Source within 30 cm | Target within 30 cm | Fixed-camera depth delta |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
@@ -460,6 +546,89 @@ pose separately as `model_camera_pose`; their `world_points` use predicted
 MapAnything depth and intrinsics backprojected through the supplied world pose
 carrier.
 
+### Hand off an approved PCF candidate to Noesis
+
+Do not treat a successful evaluation directory as a deployed room. Continue at
+**Seal the approved reconstruction** in the
+[canonical PCF runbook](../../docs/PCF_Workflow.md). That runbook uses
+`build_conditioned_scene_prior_bundle.py` to enforce the alignment and
+static-visible admission gates, then uses `scripts/build_scene_prior.py` to
+derive and bind the immutable 2.5 cm Scene Prior. This explicit bridge is the
+only documented PCF-to-runtime path.
+
+### Align a whole-home PCF review assembly to an authored model
+
+Use `solve_pcf_model_structural_alignment.py` only for a Menon review overlay;
+it does not publish calibration or canonical world state. The admitted static
+camera supplies a bounded yaw/correspondence seed. The final uniform planar
+similarity (yaw, X/Z, and XZ scale) comes from the four dominant Family Room
+vertical wall planes and the reviewed Family Room floor polygon in the authored
+OBJ. It deliberately does not use whole-cloud ICP or the editable camera-device
+position as final geometry authority.
+
+Run it from the repository root so the package imports resolve:
+
+```bash
+python3 -m tools.mapanything_phone_scan.solve_pcf_model_structural_alignment \
+  --review-manifest "$PCF_REVIEW_MANIFEST" \
+  --surfels-npz "$PCF_SURFELS_NPZ" \
+  --surfels-manifest "$PCF_SURFELS_MANIFEST" \
+  --authored-scene "$MENON_AUTHORED_SCENE_OBJ" \
+  --room-group-map config/authored_scene_room_groups.json \
+  --seed-yaw-deg "$PCF_CAMERA_SEED_YAW_DEG" \
+  --output "$PCF_STRUCTURAL_ALIGNMENT_REPORT"
+```
+
+The generated `noesis.pcf.menon_structural_alignment` report is review-only and
+fail-closed. Its assembly, GLB, surfel, authored-scene, room-group, and camera-
+anchor digests must remain bound, all structural gates must pass, and Menon must
+apply the resulting transform once to the complete assembly. `Structural fit`
+restores this report; `Camera seed` is only a diagnostic comparison. Internal
+room-to-room registration uncertainty remains unchanged by this global model
+alignment.
+
+### Derive a surface mesh for Menon review
+
+`build_pcf_review_surface_mesh.py` converts the retained multi-room PCF surfels
+into a colored cutaway surface for owner review. It reconstructs each room owner
+independently with screened Poisson, trims triangles that are not supported by
+nearby measurements, and removes only small disconnected components. Rebuilding
+rooms separately prevents an uncertain cross-room registration from inventing
+surfaces across a doorway or room join. The default 4 cm voxel size, 10 cm
+support limit, and 1.85 m ceiling cutaway favor a readable interior without
+claiming unobserved closure.
+
+```bash
+python3 tools/mapanything_phone_scan/build_pcf_review_surface_mesh.py \
+  --surfels-npz "$PCF_SURFELS_NPZ" \
+  --surfels-manifest "$PCF_SURFELS_MANIFEST" \
+  --output-glb "$PCF_MESH_GLB" \
+  --output-manifest "$PCF_MESH_MANIFEST"
+```
+
+To expose that derived GLB through the same bounded Noesis-to-Menon review
+route, create a new immutable contract-v4 assembly from the active contract-v3
+point assembly:
+
+```bash
+python3 tools/mapanything_phone_scan/publish_pcf_review_surface_mesh.py \
+  --pcf-storage-root "$NOESIS_PHONE_SCAN_PCF_STORAGE_ROOT" \
+  --current-descriptor "$NOESIS_PHONE_SCAN_PCF_STORAGE_ROOT/review-assemblies/current.json" \
+  --mesh-glb "$PCF_MESH_GLB" \
+  --mesh-manifest "$PCF_MESH_MANIFEST" \
+  --source-structural-alignment "$PCF_STRUCTURAL_ALIGNMENT_REPORT" \
+  --structural-output "$MENON_PCF_STRUCTURAL_ALIGNMENT_CONFIG" \
+  --assembly-id "$PCF_MESH_ASSEMBLY_ID" \
+  --activate
+```
+
+The publisher verifies the point-assembly, surfel, mesh, and structural-report
+digest chain before changing the active review selector. It preserves the
+source point assembly, copies the already reviewed transform without changing
+its yaw, translation, or scale, and binds Menon to the new mesh digest. Both the
+mesh and point variants remain presentation-only; neither changes calibration,
+room registration, canonical world state, or tracking authority.
+
 ## Detection and tracking integration contract
 
 The intended detection/tracking use is not to rebuild the room continuously.
@@ -508,22 +677,43 @@ Common optional environment variables:
 ```text
 NOESIS_PHONE_SCAN_PORT=8788
 NOESIS_PHONE_SCAN_STORAGE_ROOT=data/mapanything_phone_scans
+NOESIS_PHONE_SCAN_PCF_STORAGE_ROOT=/large-storage-root/noesis-phone-pcf
+NOESIS_PHONE_SCAN_PCF_PAUSE_APPLIANCE=0
 NOESIS_PHONE_SCAN_RUNTIME_ROOT=data/mapanything_phone_scan_runtime
-NOESIS_PHONE_SCAN_TARGET_FPS=2
-NOESIS_PHONE_SCAN_MAX_FRAMES=48
+NOESIS_PHONE_SCAN_CANDIDATE_FPS=4
+NOESIS_PHONE_SCAN_MAX_CANDIDATE_FRAMES=1200
+NOESIS_PHONE_SCAN_MAX_SELECTED_FRAMES=256
+NOESIS_PHONE_SCAN_CANDIDATE_EDGE_PX=1280
+NOESIS_PHONE_SCAN_FEATURE_EDGE_PX=640
+NOESIS_PHONE_SCAN_MIN_KEYFRAME_INTERVAL_S=0.40
+NOESIS_PHONE_SCAN_MAX_KEYFRAME_INTERVAL_S=1.25
 NOESIS_PHONE_SCAN_MAX_EDGE_PX=1920
+NOESIS_PHONE_SCAN_MA_MAX_JOINT_VIEWS=80
+NOESIS_PHONE_SCAN_MA_WINDOW_OVERLAP_VIEWS=24
 NOESIS_PHONE_SCAN_POINT_BUDGET=600000
 NOESIS_PHONE_SCAN_MA_DEVICE=cuda:0
 NOESIS_PHONE_SCAN_DA3_DEVICE=cuda:0
 NOESIS_PHONE_SCAN_DA3_PROCESS_RES=504
 NOESIS_PHONE_SCAN_DA3_REF_VIEW=middle
-NOESIS_PHONE_SCAN_DA3_ENGINE=data/ds9_artifacts/models/engines/da3metric_large_294x518_b3_fp16_trt10.13.engine
+NOESIS_PHONE_SCAN_DA3_MAX_JOINT_VIEWS=48
+NOESIS_PHONE_SCAN_DA3_WINDOW_OVERLAP_VIEWS=16
+NOESIS_PHONE_SCAN_DA3_ENGINE=data/ds9_artifacts/models/engines/da3metric_large_294x518_b3_fp16_trt10.16.engine
 NOESIS_PHONE_SCAN_LOCAL_FILES_ONLY=1
 NOESIS_PHONE_SCAN_STATIC_ANCHOR=0
 NOESIS_PHONE_SCAN_ALIGNMENT_CAMERA_ID=living-room
-NOESIS_PHONE_SCAN_ALIGNMENT_REVISION=data/virtual_twin/revisions/vt_living_room_stream_rgbmesh_20260623T215821_538294633
+NOESIS_PHONE_SCAN_ALIGNMENT_RELEASE=data/virtual_twin/releases/home_rgbmesh_20260623T2158_v1.json
 NOESIS_PHONE_SCAN_ALIGNMENT_CALIBRATION=config/camera_calibration.json
 ```
+
+PCF retains conditioned MapAnything raw arrays, fused raw arrays, and static-
+world review artifacts. Budget roughly 1.5-2 GB for a 180-210-view room and
+place `NOESIS_PHONE_SCAN_PCF_STORAGE_ROOT` on durable large storage. Deleting a
+walk from the app also deletes that walk's separately stored PCF runs.
+Set `NOESIS_PHONE_SCAN_PCF_PAUSE_APPLIANCE=1` when the conditioned MapAnything
+window cannot coexist with the native appliance on the installed GPU. The app
+stops `menon-appliance.target` only if it was active before PCF and restores it
+on both success and failure. An interrupted phone-tool process records the
+lease before stopping the target so its next startup can recover the appliance.
 
 The app fails clearly if FFmpeg, CUDA, cached official models, the validated
 TensorRT engine, or the local Three.js dependency is unavailable. It does not

@@ -67,6 +67,93 @@ Detailed work orders, evidence, and superseded diagrams remain in the archives.
   MV3DT disabled because the latest common three-room registration remains
   rejected and review-only.
 
+## 2026-08-16 — PCF became an optional Room Walk browser stage
+
+- Added a persisted **Generate PCF review** action after a passed DA3-to-static-
+  camera alignment.
+- The action runs the selected DA3-pose-plus-sparse-depth conditioned
+  MapAnything variant, DA3-carried consistency fusion, and static-world
+  evaluation over the exact adaptive prepared-view set.
+- Added browser review for the PCF GLB, collaboration diagnostics, 5 cm layers,
+  2.5 cm point-preserving layers, fixed-camera evidence, metrics, manifests,
+  and run log.
+- Kept the action review-only and fail-closed: it does not publish a Scene
+  Prior and refuses MapAnything base walks, failed alignments, camera/revision
+  mismatches, and active provider-specific added-video revisions.
+- Added configurable large-storage placement through
+  `NOESIS_PHONE_SCAN_PCF_STORAGE_ROOT`; deleting a walk deletes its separately
+  stored PCF runs as well.
+- Added an explicit, persisted GPU runtime lease for constrained hosts. When
+  configured, PCF pauses an active `menon-appliance.target`, restores it after
+  success or failure, and recovers that restoration after a phone-tool restart.
+
+## 2026-08-15 — Phone-walk frame selection became adaptive
+
+- Replaced uniform 48-view sampling with dense quality, motion, coverage, and
+  feature-connectivity selection plus a 256-view emergency ceiling.
+- Added measured 80-view MapAnything windows with 24 exact overlap views,
+  duplicate-pose Sim(3), robust duplicate-surface refinement, and fail-closed
+  camera/surface gates.
+- Added 48-view DA3 windows with 16 exact overlap views and the same fail-closed
+  duplicate-pose and dense-surface registration, so all adaptive views feed the
+  DA3-prior MapAnything and PCF stages.
+- On the stored Living Room walk, increased 48 to 182 retained views, improved
+  connected adjacent pairs from 83% to 100%, and reduced median matched-3D
+  residual from 8.3 cm to 4.6 cm while recovering 98.3% of baseline points
+  within 20 cm.
+- The independent calibrated Living Room alignment passed every gate at 7.2 cm
+  median vertical-plane residual, 89.5% vertical source overlap within 30 cm,
+  8.2 cm full-cloud source median, and 97.8% full-cloud source overlap within
+  30 cm.
+- Confirmed adaptive selection retained 184 Family Room and 206 Kitchen views
+  with 100% adjacent connectivity and without reaching the 256-view ceiling.
+- Rebuilt matched PCF candidates from 182 Living Room, 184 Family Room, and 206
+  Kitchen views and generated 48-versus-adaptive diagnostics using the saved
+  baseline crop, 5 cm grids, 2.5 cm point layers, and DA3-carrier pose
+  correspondence rather than applying the world transform twice.
+
+## 2026-08-15 — PCF and Scene Prior orientation contract unified
+
+- Centralized calibrated camera-ground conversion and row-zero-max-Z raster
+  addressing for Scene Prior, cached scene fusion, and offline PCF diagnostics.
+- Corrected new Scene Prior preview manifests to describe the written
+  row-zero-max-Z PNG while retaining read compatibility for immutable revisions
+  carrying the older pre-PNG numeric-grid label.
+- Removed the evaluator's Living Room 180-degree convention, heatmap
+  post-rotation, three negative Three.js model scales, optional canvas/raster
+  flips, and the aligned-backend GLB half-turn.
+- Kept the backend-to-camera determinant-`-1` basis presentation-only while
+  strengthening proper metric-transform gates for PCF and multi-room inputs.
+- Added asymmetric left/right/forward tests and validated the deployed Living
+  Room, Family Room, and Kitchen rasters plus the review-only Family/Kitchen
+  presentation without changing backend geometry.
+- Detailed audit: [`PCF_Coordinate_Orientation_Audit.md`](PCF_Coordinate_Orientation_Audit.md).
+
+## 2026-08-15 — Living Room SV3DT cuboid anchor correction
+
+- Preserved SV3DT image-foot and 3D object metadata while removing only the
+  tracker-generated red foot dot and displaced blue debug cuboid.
+- Added a Living Room-only replacement cuboid with its bottom-face centroid
+  fixed to the instance-mask person base and bbox-bottom fallback.
+- Validated the exact centroid invariant in focused tests and inspected a
+  34-second July Living Room replay at standing, walking, and seated positions.
+- Kept the baseline configuration and tracking/world/StableID contracts
+  unchanged.
+
+## 2026-08-15 — PCF became a reproducible first-class capability
+
+- Defined PCF consistently as Prior-Conditioned Fusion and recorded
+  `prior_conditioned_consensus_da3_carrier` as the selected candidate.
+- Added one canonical capture-to-runtime runbook with verified commands for
+  conditioned inference, fusion, common evaluation, machine and human quality
+  gates, evidence sealing, 2.5 cm Scene Prior construction, catalog binding,
+  native runtime loading, and dashboard verification.
+- Preserved the phone-only reconstruction boundary, independent static-camera
+  alignment/validation authority, calibrated live-track authority, and the
+  separation between measured extent and authored semantic membership.
+- Documented artifact retention, safe retry/cleanup rules, a handoff prompt,
+  and the active Living Room, Family Room, and Kitchen PCF inventory.
+
 ## 2026-08-15 — Documentation authority reconciliation
 
 - Rebuilt the current index, architecture description, native baseline,
@@ -117,6 +204,23 @@ Detailed work orders, evidence, and superseded diagrams remain in the archives.
   tracking authority.
 - Focused tests and a short live BEV capture verified all three cameras.
 - Recorded in commit `59aae04`.
+
+## 2026-08-15 — Reproducible PCF multi-room registration lab path
+
+- Added exhaustive learned cross-walk matching, bidirectional RGB-D PnP, a
+  floor-locked planar pose graph, complete-view and temporal holdouts, bounded
+  local-overlap refinement, and provenance-preserving 2.5 cm reintegration.
+- Produced a review-only continuous Kitchen/Family Room reconstruction from
+  the two accepted PCF walks while keeping Family Room as the fixed gauge.
+- Re-exported that review through the recorded Family camera-ground basis after
+  a raw backend-X/Z plot made Kitchen appear reversed. The exporter applies one
+  shared presentation transform to both rooms, proves the fused NPZ remains
+  unchanged, and does not introduce a Kitchen geometry flip.
+- Rejected canonical admission because held-out planar prediction remained
+  above gate and one temporal holdout lacked independent Kitchen support. The
+  next input is a short Kitchen/Family connector walk, not another full-room
+  capture.
+- Detailed workflow: [`PCF_Multiroom_Registration.md`](PCF_Multiroom_Registration.md).
 
 ## 2026-08-13 — PCF became the depth-panel presentation source
 

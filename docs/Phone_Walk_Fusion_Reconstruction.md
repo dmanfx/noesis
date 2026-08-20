@@ -1,7 +1,14 @@
 # Phone-Walk Fusion Reconstruction
 
-Status: validated 2026-08-10 against the current phone-scan tools and the
-48-view landscape living-room artifacts.
+Status: current algorithm and decision record, 2026-08-15. The selection was
+validated on the 48-view landscape Living Room walk and subsequently admitted
+for the Family Room and Kitchen through the same gated workflow.
+
+For an operational handoff, start with
+[`PCF_Workflow.md`](PCF_Workflow.md). It defines PCF as Prior-Conditioned
+Fusion and is the canonical capture-to-runtime runbook. This document preserves
+the method rationale, controlled comparisons, fusion mechanics, and quality
+interpretation.
 
 ## Decision
 
@@ -160,9 +167,12 @@ samples remain available, and the optional 2 cm point-preserving export can be
 used by PTv3 or Roomform as described in
 `tools/mapanything_phone_scan/README.md`.
 
-The camera-oriented review convention rotates the rendered BEV 180 degrees so
-the living-room hallway/foyer appears at the top-left. This changes presentation
-only; it does not rotate the saved backend-world geometry.
+Camera-oriented review rasters are now authored directly in
+`camera_local_ground_m`: row zero is maximum camera-forward +Z, rows move back
+toward the camera, and columns increase toward camera-right +X. There is no
+Living Room 180-degree convention and no room-specific post-render rotation.
+The presentation frame is derived from the selected calibrated camera only
+after all proper metric registration has completed.
 
 ## Validated landscape result
 
@@ -201,6 +211,12 @@ Curated image evidence and hashes are stored in
 `docs/evidence/phone_walk_fusion/20260809-landscape-living-room/`.
 
 ## Repeat the selected workflow for another room
+
+Follow the complete sequence in [`PCF_Workflow.md`](PCF_Workflow.md). The
+stages below cover candidate generation and evaluation; the canonical runbook
+also covers the required admission review, sealed room-scan bundle, immutable
+2.5 cm Scene Prior, catalog binding, native DS9.1 load, dashboard verification,
+and artifact retention.
 
 Run all commands from the repository root. Put large generated artifacts on a
 large storage volume, not the root filesystem.
@@ -368,6 +384,8 @@ looks better.
 
 ## Related references
 
+- [`PCF_Workflow.md`](PCF_Workflow.md) — canonical end-to-end operational and
+  handoff runbook.
 - `tools/mapanything_phone_scan/README.md` — service, provider, artifact, and
   operator details.
 - `docs/Virtual_Twin_Reconstruction.md` — static-camera room-revision contract.

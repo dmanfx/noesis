@@ -67,14 +67,34 @@ callbacks. Shutdown closes and drains that gate before WebSocket egress.
 **Why:** Dashboard state must never outrun committed world authority, and native
 callbacks must not race transport teardown.
 
-## ADR-007 — PCF is the canonical depth-panel floorplan source
+## ADR-007 — Prior-Conditioned Fusion is the canonical room source
 
-**Accepted:** 2026-08-13
+**Accepted:** 2026-08-13; lifecycle and authority clarified 2026-08-15
 
-For an admitted camera-bound Scene Prior, the depth drawer and BEV floorplan use
-the immutable PCF revision. Full measured reconstruction extent is distinct
-from authored semantic room membership. Live tracking authority is paired into
-the PCF BEV payload; PCF does not create or replace tracks.
+PCF means **Prior-Conditioned Fusion**: DA3 world poses and sparse reliable
+metric depth condition MapAnything, then the two surface estimates are
+consistency-gated with DA3 retained as pose carrier. Its selected artifact name
+is `prior_conditioned_consensus_da3_carrier`. A calibrated static-camera room
+revision aligns and independently validates the phone-only reconstruction; its
+RGB/depth is not inserted into the phone inference batch.
+
+An approved PCF candidate is sealed as a room-scan bundle and converted into an
+immutable, camera-bound Scene Prior before Noesis may load it. For that admitted
+Scene Prior, the depth drawer and BEV floorplan use the PCF reconstruction.
+Full measured reconstruction extent is distinct from authored semantic room
+membership. Live tracking authority is paired into the PCF BEV payload; PCF
+does not create, move, or replace tracks. The canonical lifecycle and gates are
+in [`PCF_Workflow.md`](PCF_Workflow.md).
+
+**Why:** Phone coverage produces the clearest room geometry observed so far;
+DA3 supplies the stable metric pose carrier, sparse DA3 depth constrains
+MapAnything without treating every correlated pixel as truth, and final
+consistency gating rejects unsupported conflicts. Keeping the static camera
+independent preserves a meaningful registration check and the existing
+calibrated tracking authority. Room-layout models, learned point refiners,
+meshes, and Gaussian splats remain optional derivatives unless they demonstrate
+new measured capability; they are not PCF admission dependencies or replacement
+geometry authority.
 
 ## ADR-008 — Menon owns the browser boundary
 
@@ -100,6 +120,196 @@ must remain explicit and fail closed.
 Superseded DS7/DS8, DS9.0, container, migration, experiment, and validation
 diaries are retained under `docs/history/`, `DS9/docs/history/`, and
 `plans/archive/`. Active indexes never route implementation work through them.
+
+## ADR-011 — SV3DT metadata and cuboid presentation are separate
+
+**Accepted:** 2026-08-15 for the Living Room optimized profile
+
+SV3DT keeps `outputFootLocation` enabled because image-foot and 3D object user
+metadata are tracking evidence. The tracker-generated red foot dot and blue
+projected cuboid are debug presentation only; a V3DT-only probe removes those
+exact display primitives without removing their user metadata. Noesis draws a
+replacement cuboid whose bottom-face centroid is the person's instance-mask
+base, with tracked bbox bottom-center as a bounded fallback.
+
+The correction is visual only: it does not change 3D world coordinates,
+StableID, tracker association, or the baseline pipeline. Other room profiles
+must enable and validate the presentation independently.
+
+**Why:** NVIDIA couples useful projection metadata to a debug cuboid whose
+image projection can be visibly displaced from the tracked person. Product
+presentation must remain person-anchored without corrupting tracking authority.
+
+## ADR-012 — Multi-room PCF joins are observation-gated planar pose graphs
+
+**Accepted:** 2026-08-15 for the lab workflow; no Kitchen/Family canonical join
+accepted yet
+
+Two independently accepted PCF rooms may share a home-world transform only
+after original-RGB overlap discovery, bidirectional depth-backed PnP, a fixed
+metric scale, an accepted-floor Y lock, a view-balanced planar pose graph, and
+complete-view plus temporal-segment holdouts. One accepted room remains the
+immutable world gauge. Whole-room ICP, nearest-neighbor initialization,
+reflection, scale fitting, and visually nudged transforms are not admission
+paths.
+
+If the evidence graph fails, a short doorway connector walk adds overlap; the
+system does not repeat full-room capture or promote the best-looking rejected
+transform. A rejected transform may drive a clearly marked review-only
+reintegrated artifact, with no Scene Prior, tracking, or dashboard authority.
+Human review uses one recorded reference-camera ground basis applied to all
+registered rooms after reintegration. Backend-world X/Z plots are not an
+orientation contract. Camera-display handedness, raster row inversion, and 3D
+view transforms must not be fed back into registration or applied to only one
+room. In particular, Kitchen has no pre-registration flip; its accepted proper
+Sim(3) is the complete local-to-backend transform.
+The reproducible workflow and gates are in
+[`PCF_Multiroom_Registration.md`](PCF_Multiroom_Registration.md).
+
+**Why:** Cross-room surfaces can produce a convincing but wrong join when a
+patterned floor or one textured view dominates. Independent phone-view and
+temporal holdouts measure whether the placement generalizes, while the common
+accepted floor removes a weak PnP degree of freedom. A short connector is the
+minimum household action that supplies missing evidence without rebuilding
+accepted rooms.
+
+## ADR-013 — PCF presentation uses one camera-ground coordinate contract
+
+**Accepted:** 2026-08-15
+
+PCF and Scene Prior metric geometry remains in proper local/world frames through
+all registration and serialization authority. A calibrated camera-ground
+display frame is derived only after registration: positive X is camera-right,
+positive Y is height above floor, and positive Z is camera-forward. For the
+deployed OpenCV cameras its backend-to-display linear determinant is `-1`
+because camera Y-down becomes height Y-up; that matrix is presentation-only and
+may transform display positions, never registration geometry or pose
+rotations.
+
+Serialized display rasters use row zero at maximum camera-forward Z and columns
+from minimum to maximum camera-right X. oai2-fe draws that row order directly.
+New Scene Prior revision manifests use the same literal orientation value;
+already-deployed immutable manifests with the older numeric-grid label remain
+read-compatible but never trigger another display flip.
+Three.js preserves model geometry and obtains camera-right screen-right plus
+camera-forward screen-up through camera placement, not negative model scale.
+Room-specific 180-degree rotations, consumer-applied `image_flip`, and manual
+presentation nudges are prohibited. The implementation and complete retained-
+operation inventory are in
+[`PCF_Coordinate_Orientation_Audit.md`](PCF_Coordinate_Orientation_Audit.md).
+
+**Why:** A display reflection can be visually plausible while reversing
+asymmetric landmarks or contaminating metric registration. Separating proper
+physical transforms, the explicit camera-basis conversion, raster addressing,
+and viewer-camera presentation makes each operation testable and prevents a
+Living Room convention from becoming hidden geometry authority.
+
+## ADR-014 — Phone walks use adaptive views and gated provider windows
+
+**Accepted:** 2026-08-15
+
+Phone-walk preparation analyzes a dense candidate stream and selects views from
+relative image quality, viewpoint change, temporal coverage, and adjacent-view
+feature connectivity. The 256-view configuration is an emergency ceiling, not
+a requested count. Selection records candidate count, selected timestamps,
+reasons, quality, connectivity, and whether that ceiling constrained the walk.
+
+MapAnything remains joint only within a measured 80-view GPU window. Longer
+selected sequences use 24 exact duplicate views between neighboring windows.
+Duplicate camera poses initialize a proper Sim(3); pixel-corresponding 3D from
+the duplicate images robustly refines scale and translation while preserving
+the pose-derived rotation. Both camera and dense-surface gates must pass before
+a window enters the reconstruction. Unique views are retained in one base
+phone frame and their review points are confidence-weighted in 3.5 cm voxels.
+DA3 uses the same exact-overlap, fail-closed registration pattern with a
+48-view joint window and 16 duplicate views. The resulting full adaptive DA3
+trajectory—not a 48-view truncation—carries the sparse metric priors and final
+PCF reconstruction.
+This does not mix in a static-camera frame or change static reconstruction and
+calibration authority.
+
+**Why:** Uniform 48-view sampling left multi-second gaps and weak or broken
+adjacent overlap in all three stored room walks. The RTX 3060 runs 80 views but
+OOMs at 96 even with native DS9.1 stopped, so one larger monolithic pass is not
+a valid implementation. Exact-overlap windows preserve the full adaptive walk
+while making both GPU capacity and cross-window geometric consistency explicit
+and fail-closed.
+
+## ADR-015 — The Room Walk browser may build review-only PCF candidates
+
+**Accepted:** 2026-08-16
+
+After a DA3 base reconstruction has passed registration to the explicitly
+selected static camera and revision, the Room Walk browser may run the selected
+Prior-Conditioned Fusion path as an optional final stage. The application runs
+DA3-pose-plus-sparse-depth conditioned MapAnything over the same immutable
+prepared views, fuses it against DA3 with the DA3 pose carrier, and evaluates
+the result in the independent static-camera world. PCF jobs are persisted
+separately on configurable large storage and expose their GLB, raw evidence,
+diagnostics, metrics, provenance, and log in the browser.
+
+This browser boundary ends at a review candidate. It does not seal a room-scan
+bundle, build or bind a Scene Prior, or change live tracking/world authority.
+On GPU-constrained hosts, an explicit deployment setting may give the job a
+recorded resource lease that pauses the native appliance only when it was
+already active and restores it on success, failure, or interrupted-tool
+recovery. The current action also refuses provider-specific
+added-video revisions because silently omitting or pretending to absorb those
+views would violate the exact shared-view PCF contract.
+
+**Why:** PCF is the selected room-reconstruction method, but requiring an
+expert to manually reproduce three canonical commands after every accepted
+walk made the routine path error-prone. A persisted, fail-closed browser job
+can automate those same commands without widening the publication boundary or
+weakening camera/revision identity checks.
+
+## ADR-016 — Whole-home PCF is a release-bound Menon review sidecar
+
+**Accepted:** 2026-08-16 for review; the current three-room registration remains
+rejected for canonical use
+
+Noesis owns the metric PCF assembly and publishes its immutable point artifact,
+provenance, registration status, uncertainty, and complete binding to the
+current authored scene. The binding records the scene release, authored-model,
+calibration, runtime-configuration, and runtime world-alignment digests plus the
+exact live `world_to_scene_col_major` similarity. It also binds the calibrated
+Family Room device-reference camera pose and that camera's admitted Scene Prior
+reference pose inside the final PCF. The anchor keeps metric scale, gravity,
+floor height, calibrated pitch, and calibrated roll fixed. Sparse mutual RGB
+matches and PCF-depth-backed PnP remain an uncertainty diagnostic only; their
+free translation is not admitted. A static image supplies registration
+evidence only; its points are not inserted into the phone reconstruction.
+
+Menon is a read-only presentation consumer: it verifies those values against
+its loaded cohort and applies one floor-locked planar camera correction to the
+entire assembly. The correction maps the admitted Family camera X/Z and heading
+to the device-reference X/Z and heading while applying zero vertical
+translation, then composes with `world_to_scene`. Menon may expose the result
+only as an owner-visible toggleable sidecar. It does not anchor a PCF corner or
+bounding box, recenter, reflect, ICP-align, transform rooms independently,
+visually nudge, or write the PCF into its authored model.
+
+The review descriptor also carries the inferred static-camera center for every
+room in the common assembly frame. Menon may render these centers as yellow
+diagnostic spheres, but must place them in the same transform group as the PCF
+geometry. A marker may never drive an additional per-room adjustment. Its
+purpose is to make room-registration disagreement with authored camera devices
+visible instead of hiding that disagreement behind the primary Family anchor.
+The Menon review renderer may apply a non-authoritative ceiling cutaway above
+1.85 m to the loaded point copy so the rooms remain inspectable from above.
+That presentation filter never changes the immutable GLB or Noesis geometry.
+
+Any missing or mismatched binding, changed artifact bytes, or unavailable
+current release fails closed. A rejected multi-room registration remains
+visibly labeled review-only with its measured uncertainty; successful visual
+projection does not grant tracking, world, Scene Prior, deployment, or
+canonical geometry authority.
+
+**Why:** The authored model and PCF already share the Noesis world only through
+an explicit deployed scene transform. Reusing that authority gives a
+reproducible overlay without inventing a second alignment in Menon, while exact
+release and byte binding prevents a convincing but stale or misregistered
+artifact from silently entering the digital home.
 
 ## ADR-017 — Kitchen/Family MV3DT remains an isolated evaluation lane (superseded)
 

@@ -49,6 +49,8 @@ identity, selected metrics, dimensions, sizes, and hashes are recorded in
 | `consensus_collaboration_diagnostics.png` | `03e589951a3060b7f1cc47219bb416380a6d261819e3da98280eecddbde2ea74` |
 | `selected_fixed_camera_reprojection.jpg` | `e8a8270833b3a02a19ee7db73e162cc1666335b6104c2cea5ecb46c6667a8992` |
 
-The BEV images use the camera-oriented review convention with the hallway and
-foyer toward the top-left. That 180-degree presentation rotation does not alter
-the stored backend-world coordinates.
+These sealed BEV images predate the canonical camera-ground raster contract and
+retain the former Living Room–specific 180-degree review rotation. They are
+historical evidence only and must not be used as an orientation template. New
+diagnostics use row zero at maximum camera-forward +Z with no room-specific
+rotation; neither presentation changes stored backend-world coordinates.

@@ -1971,6 +1971,197 @@ def _video_suffix(filename: str, content_type: str) -> str:
     )
 
 
+def _current_review_assembly(
+    pcf_storage_root: Path,
+    *,
+    alignment_release_id: str | None,
+) -> tuple[dict[str, Any], Path]:
+    manifest_path = pcf_storage_root / "review-assemblies" / "current.json"
+    try:
+        if manifest_path.stat().st_size > 256 * 1024:
+            raise ValueError("manifest exceeds 256 KiB")
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except FileNotFoundError as exc:
+        raise HTTPException(
+            status.HTTP_404_NOT_FOUND,
+            "No whole-home PCF review assembly is published",
+        ) from exc
+    except Exception as exc:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            f"The whole-home PCF review manifest is invalid: {exc}",
+        ) from exc
+    if not isinstance(manifest, dict):
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            "The whole-home PCF review manifest is not an object",
+        )
+    if (
+        manifest.get("contract") != "noesis.scene.review_assembly"
+        or manifest.get("contract_version") not in {3, 4}
+        or manifest.get("status") != "review_only"
+        or manifest.get("accepted_for_canonical_use") is not False
+        or manifest.get("coordinate_frame") != "backend_world_m"
+        or manifest.get("units") != "meters"
+    ):
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            "The whole-home PCF review manifest violates its fail-closed contract",
+        )
+    scene_binding = manifest.get("scene_binding")
+    if not isinstance(scene_binding, dict):
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            "The whole-home PCF review manifest has no scene binding",
+        )
+    if alignment_release_id and scene_binding.get("release_id") != alignment_release_id:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            "The whole-home PCF review is not bound to the active alignment release",
+        )
+    camera_anchor = manifest.get("camera_anchor")
+    provenance = manifest.get("provenance")
+    solved_pose = (
+        camera_anchor.get("camera_to_assembly_col_major")
+        if isinstance(camera_anchor, dict)
+        else None
+    )
+    device_pose = (
+        camera_anchor.get("device_reference_camera_to_assembly_col_major")
+        if isinstance(camera_anchor, dict)
+        else None
+    )
+    if (
+        not isinstance(camera_anchor, dict)
+        or camera_anchor.get("status") != "review_pose_estimate"
+        or camera_anchor.get("accepted_for_canonical_use") is not False
+        or camera_anchor.get("camera_id") != "family-room"
+        or camera_anchor.get("coordinate_frame")
+        != "family_accepted_backend_world_m"
+        or camera_anchor.get("pose_convention")
+        != "opencv_cam2world_x_right_y_down_z_forward"
+        or camera_anchor.get("anchor_mode") != "floor_locked_planar"
+        or camera_anchor.get("camera_height_source")
+        != "admitted_scene_prior_reference_camera"
+        or camera_anchor.get("vertical_anchor_translation_m") != 0.0
+        or not isinstance(solved_pose, list)
+        or len(solved_pose) != 16
+        or not all(isinstance(value, (int, float)) for value in solved_pose)
+        or not isinstance(device_pose, list)
+        or len(device_pose) != 16
+        or not all(isinstance(value, (int, float)) for value in device_pose)
+        or not isinstance(provenance, dict)
+        or camera_anchor.get("source_report_sha256")
+        != provenance.get("source_camera_anchor_report_sha256")
+    ):
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            "The whole-home PCF review has no valid static-camera anchor",
+        )
+    camera_markers = manifest.get("camera_markers")
+    marker_values = (
+        camera_markers.get("markers") if isinstance(camera_markers, dict) else None
+    )
+    marker_ids = {
+        marker.get("camera_id")
+        for marker in marker_values or []
+        if isinstance(marker, dict)
+    }
+    family_marker = next(
+        (
+            marker
+            for marker in marker_values or []
+            if isinstance(marker, dict) and marker.get("camera_id") == "family-room"
+        ),
+        None,
+    )
+    family_position = (
+        family_marker.get("position_assembly_m")
+        if isinstance(family_marker, dict)
+        else None
+    )
+    anchor_position = camera_anchor.get("camera_center_assembly_m")
+    if (
+        not isinstance(camera_markers, dict)
+        or camera_markers.get("status") != "review_camera_positions"
+        or camera_markers.get("accepted_for_canonical_use") is not False
+        or camera_markers.get("coordinate_frame")
+        != "family_accepted_backend_world_m"
+        or camera_markers.get("color_hex") != "#ffd400"
+        or not isinstance(camera_markers.get("sphere_radius_m"), (int, float))
+        or not 0.05 <= float(camera_markers["sphere_radius_m"]) <= 0.5
+        or not isinstance(marker_values, list)
+        or len(marker_values) != 3
+        or marker_ids != {"family-room", "kitchen", "living-room"}
+        or not all(
+            isinstance(marker, dict)
+            and isinstance(marker.get("position_assembly_m"), list)
+            and len(marker["position_assembly_m"]) == 3
+            and all(
+                isinstance(value, (int, float)) and math.isfinite(float(value))
+                for value in marker["position_assembly_m"]
+            )
+            for marker in marker_values
+        )
+        or not isinstance(anchor_position, list)
+        or not isinstance(family_position, list)
+        or any(
+            abs(float(value) - float(anchor_position[index])) > 1e-8
+            for index, value in enumerate(family_position)
+        )
+        or camera_markers.get("source_report_sha256")
+        != provenance.get("source_camera_markers_report_sha256")
+    ):
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            "The whole-home PCF review has no valid static-camera markers",
+        )
+    artifact = manifest.get("artifact")
+    relative = artifact.get("relative_path") if isinstance(artifact, dict) else None
+    expected_role = (
+        "multiroom_surface_mesh_glb"
+        if manifest.get("contract_version") == 4
+        else "multiroom_points_glb"
+    )
+    if (
+        not isinstance(relative, str)
+        or not relative
+        or Path(relative).is_absolute()
+        or ".." in Path(relative).parts
+        or artifact.get("role") != expected_role
+        or artifact.get("media_type") != "model/gltf-binary"
+    ):
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            "The whole-home PCF review artifact declaration is invalid",
+        )
+    storage_root = pcf_storage_root.resolve()
+    artifact_path = (pcf_storage_root / relative).resolve()
+    if storage_root not in artifact_path.parents:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            "The whole-home PCF review artifact escapes PCF storage",
+        )
+    try:
+        size = artifact_path.stat().st_size
+    except FileNotFoundError as exc:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            "The whole-home PCF review artifact is missing",
+        ) from exc
+    if size != artifact.get("size_bytes") or size > 64 * 1024 * 1024:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            "The whole-home PCF review artifact size does not match",
+        )
+    if _sha256_file(artifact_path) != artifact.get("sha256"):
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            "The whole-home PCF review artifact digest does not match",
+        )
+    return manifest, artifact_path
+
+
 def create_app(
     settings: PhoneScanSettings | None = None,
     *,
@@ -2052,6 +2243,50 @@ def create_app(
             "alignment_release_id": configured.alignment_release_id,
             "alignment_targets": service.public_alignment_targets(),
         }
+
+    @app.get("/api/v1/scenes/current/review-assemblies/whole-home")
+    async def current_whole_home_review_assembly() -> JSONResponse:
+        manifest, _ = _current_review_assembly(
+            service.pcf_storage_root,
+            alignment_release_id=configured.alignment_release_id,
+        )
+        payload = deepcopy(manifest)
+        payload["artifact_url"] = (
+            "/api/v1/scenes/current/review-assemblies/whole-home/artifacts/"
+            f"{manifest['artifact']['role']}"
+        )
+        response = JSONResponse(payload)
+        response.headers["Cache-Control"] = "no-store"
+        response.headers["X-Noesis-Review-Assembly"] = str(
+            manifest.get("assembly_id") or ""
+        )
+        return response
+
+    @app.get(
+        "/api/v1/scenes/current/review-assemblies/whole-home/"
+        "artifacts/{artifact_role}"
+    )
+    async def current_whole_home_review_artifact(artifact_role: str) -> FileResponse:
+        manifest, artifact_path = _current_review_assembly(
+            service.pcf_storage_root,
+            alignment_release_id=configured.alignment_release_id,
+        )
+        artifact = manifest["artifact"]
+        if artifact_role != artifact["role"]:
+            raise HTTPException(
+                status.HTTP_404_NOT_FOUND,
+                "The requested whole-home review artifact is not active",
+            )
+        return FileResponse(
+            artifact_path,
+            media_type="model/gltf-binary",
+            headers={
+                "Cache-Control": "no-store",
+                "ETag": f'"sha256-{artifact["sha256"]}"',
+                "X-Noesis-Artifact-Sha256": artifact["sha256"],
+                "X-Noesis-Review-Assembly": str(manifest.get("assembly_id") or ""),
+            },
+        )
 
     @app.get("/api/scans")
     async def list_scans() -> list[dict[str, Any]]:

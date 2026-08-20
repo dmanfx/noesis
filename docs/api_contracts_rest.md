@@ -140,6 +140,61 @@ operator/diagnostic catalog, not coherent multi-camera product truth. The
 native DS9.1 baseline and disabled V3DT adapter use this same shared router and
 store implementation.
 
+### Whole-home PCF review assembly
+
+The Room Walk service may expose one explicitly selected, review-only multi-room
+PCF sidecar for the current authored scene:
+
+- `GET /api/v1/scenes/current/review-assemblies/whole-home` returns the strict
+  descriptor, artifact URL, byte length, SHA-256, registration status and
+  uncertainty, source-room counts, and its exact scene binding.
+- `GET /api/v1/scenes/current/review-assemblies/whole-home/artifacts/multiroom_points_glb`
+  serves the descriptor-selected point-cloud GLB only after revalidating its
+  safe regular path, exact byte length, SHA-256, and current scene-release
+  binding. Contract version 3 uses the `multiroom_points_glb` role.
+- The same descriptor-selected artifact route may serve
+  `.../artifacts/multiroom_surface_mesh_glb` for contract version 4. The v4
+  surface mesh is a bounded, derived review presentation (maximum 64 MiB),
+  never canonical scene geometry; it carries its source-point digest and the
+  same scene, calibration, runtime, registration, and camera-marker binding.
+
+The binding includes the current scene release, authored-model digest,
+calibration digest, runtime configuration digest, runtime world-alignment
+digest, and the exact `world_to_scene_col_major` similarity used by Menon. It
+also includes a strict `camera_anchor` block. The anchor records the calibrated
+Family Room camera pose used by the authored scene and the admitted Scene Prior
+reference-camera pose inside the final PCF assembly. Contract version 3 uses a
+floor-locked planar anchor: camera X/Z and heading may map to the authored
+device reference, while Y remains unchanged. The prior's 1.63 m reference
+camera height, metric scale, and gravity remain authoritative. Sparse
+static-to-phone depth-backed PnP is retained only as an uncertainty diagnostic;
+its translation cannot move the anchor, and the static image contributes no
+geometry to the phone reconstruction.
+
+The descriptor additionally carries `camera_markers`: one explicit
+assembly-frame position for each Family Room, Kitchen, and Living Room static
+camera. The Family marker is the solved anchor pose. Kitchen and Living Room
+markers are their Scene Prior reference-camera positions composed through the
+same recorded room-registration transforms that produced the joined geometry.
+Menon renders them as yellow review spheres inside the same transform group as
+the PCF points. They are diagnostics, not alignment inputs or geometry.
+
+Menon must compare the release binding with its already loaded scene and live
+Noesis runtime configuration. It then derives one proper planar correction
+that maps the admitted Family camera X/Z and heading to the calibrated device
+reference while preserving assembly Y, and composes it after
+`world_to_scene`. The one resulting transform applies to the complete
+multi-room artifact. Bounding-box or corner anchoring, vertical camera-forced
+translation, whole-cloud
+ICP, reflections, per-room transforms, and visual nudges are not part of the
+contract. A mismatch, mutation, missing field, improper camera-pose matrix,
+incomplete or displaced camera-marker set, rejected registration represented
+as canonical, or unavailable current release fails closed. The endpoint never
+promotes the PCF, changes tracking/world
+authority, or makes a rejected join canonical. Menon exposes this route only to
+the single-owner review capability and presents it as a toggleable sidecar over
+the unchanged authored model.
+
 ## 1. Depth API
 
 **Module:** `noesis/server/depth_api.py`

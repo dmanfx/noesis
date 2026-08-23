@@ -1,0 +1,89 @@
+{
+  "artifacts": {
+    "kitchen_family_corrected_continuous_space.png": {
+      "sha256": "333647a7e9a5c1571bf38d3ffb87b4270cbd1ae670de5725f26d2eaad39305ee",
+      "size_bytes": 1986077
+    },
+    "kitchen_family_family_oriented_review.glb": {
+      "sha256": "356fa0d8bfbb0f13c92e4800fc9772ea3ebb9617286cbfda558443d865077feb",
+      "size_bytes": 4580224
+    },
+    "kitchen_family_orientation_validation.png": {
+      "sha256": "fdf0bd493228154bcfa65271dee2158e3fa082bf3d17916ad4f843de63fbf18f",
+      "size_bytes": 974659
+    }
+  },
+  "backend_world_relative_transform_changed": false,
+  "canonical_coordinate_frame": "backend_world_m",
+  "decision": "retain_calibrated_geometry_correct_shared_display_orientation",
+  "family_room_held_fixed": true,
+  "generated_at": "2026-08-15",
+  "inputs": {
+    "family_prior_id": "sceneprior_family-room_20260811T015847Z_ffdc144a8f59",
+    "kitchen_prior_id": "sceneprior_kitchen_20260814T230412Z_cb6d1e0f8483",
+    "kitchen_static_keyframe": "data/virtual_twin/revisions/vt_kitchen_stream_rgbmesh_20260623T215835_609188061/keyframes/kitchen_0001.png"
+  },
+  "physical_evidence": {
+    "admitted_kitchen_left_back_projected_pixel_bounds_xy": {
+      "max": [
+        913.654789723772,
+        509.80612160634394
+      ],
+      "min": [
+        673.968494278951,
+        347.7989618893076
+      ]
+    },
+    "kitchen_left_back_pair_fraction": 0.9801652892561984,
+    "orientation_hypothesis_reciprocal_pair_counts": {
+      "Calibrated": 396,
+      "Mirror F/B": 0,
+      "Mirror L/R": 181,
+      "Yaw +90\u00b0": 6,
+      "Yaw -90\u00b0": 69,
+      "Yaw 180\u00b0": 0
+    },
+    "pair_distance_median_m": 0.022676676143462107,
+    "pair_distance_p90_m": 0.04336620157666237,
+    "projected_pixel_bounds_xy": {
+      "max": [
+        1623.9804979110727,
+        705.2855275277813
+      ],
+      "min": [
+        673.9684791673212,
+        347.7989617373636
+      ]
+    },
+    "reciprocal_vertical_pair_count": 605
+  },
+  "presentation_coordinate_frame": "family_camera_local_ground_m_review",
+  "schema": "noesis.pcf.multiroom_orientation_review.v2",
+  "status": "review_candidate",
+  "world_to_family_presentation_row_major": [
+    [
+      0.9297270684666662,
+      0.0,
+      0.36824934237603063,
+      -18.950158378065172
+    ],
+    [
+      0.0,
+      1.0,
+      0.0,
+      0.0
+    ],
+    [
+      0.36824934237603063,
+      0.0,
+      -0.9297270684666662,
+      5.971260094442704
+    ],
+    [
+      0.0,
+      0.0,
+      0.0,
+      1.0
+    ]
+  ]
+}

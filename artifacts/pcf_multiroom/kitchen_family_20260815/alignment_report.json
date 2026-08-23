@@ -1,0 +1,99 @@
+{
+  "applied_transform_kitchen_to_family": [
+    [
+      1.0,
+      0.0,
+      0.0,
+      0.0
+    ],
+    [
+      0.0,
+      1.0,
+      0.0,
+      0.0
+    ],
+    [
+      0.0,
+      0.0,
+      1.0,
+      0.0
+    ],
+    [
+      0.0,
+      0.0,
+      0.0,
+      1.0
+    ]
+  ],
+  "artifacts": {
+    "alignment_diagnostic_png": "kitchen_family_alignment_diagnostic.png",
+    "combined_glb": "kitchen_family_shared_world.glb",
+    "continuous_space_png": "kitchen_family_continuous_space.png",
+    "kitchen_family_alignment_diagnostic.png_sha256": "e1131855885fee47be009440f2766b5d0850bdbd9c6348afbbcef75f10216c2b",
+    "kitchen_family_continuous_space.png_sha256": "1ae4447aeeaee5312a49d43fb94c938a966bd290d251299ff3d56681355ac33b",
+    "kitchen_family_shared_world.glb_sha256": "b366e239caa79e208baffae61762be8d7c54c506adbd3fbaeded003b776e08ac"
+  },
+  "authority": "presentation_only_no_scene_prior_or_calibration_mutation",
+  "coordinate_frame": "backend_world_m",
+  "decision": "retain_calibrated_shared_world_identity",
+  "diagnostic_rigid_suggestion_all_pairs": {
+    "median_residual_m": 0.018824299797415733,
+    "robust_pair_count": 423,
+    "rotation_angle_deg": 0.05595291190411357,
+    "translation_m": [
+      -0.00011920928955078125,
+      0.0064643025398254395,
+      -0.00012636184692382812
+    ],
+    "translation_norm_m": 0.006466636434197426
+  },
+  "diagnostic_rigid_suggestion_color_filtered": {
+    "max_rgb_distance": 120,
+    "median_residual_m": 0.018710285425186157,
+    "robust_pair_count": 190,
+    "rotation_angle_deg": 0.17017419378319848,
+    "translation_m": [
+      -0.00678253173828125,
+      -0.01337134838104248,
+      0.015454769134521484
+    ],
+    "translation_norm_m": 0.02153243124485016
+  },
+  "generated_at": "2026-08-15",
+  "reciprocal_vertical_overlap": {
+    "maximum_pair_distance_m": 0.1,
+    "median_distance_m": 0.022676676511764526,
+    "p90_distance_m": 0.04336620271205902,
+    "pair_count": 605,
+    "support_bounds_xz_m": {
+      "max": [
+        18.618900299072266,
+        9.678384780883789
+      ],
+      "min": [
+        10.401285171508789,
+        3.537083148956299
+      ]
+    },
+    "voxel_m": 0.04
+  },
+  "rejected_unconstrained_icp": {
+    "fine_stage_fitness": 0.07435104342038291,
+    "reason": "low-support drift aligns unrelated room geometry",
+    "rotation_angle_deg": 7.489923548372803,
+    "translation_norm_m": 1.8231047747386528
+  },
+  "rooms": {
+    "family_room": {
+      "capture_id": "20260810-215847-571c6efe",
+      "point_count": 118819,
+      "prior_id": "sceneprior_family-room_20260811T015847Z_ffdc144a8f59"
+    },
+    "kitchen": {
+      "capture_id": "20260814-190412-ea26c040",
+      "point_count": 167338,
+      "prior_id": "sceneprior_kitchen_20260814T230412Z_cb6d1e0f8483"
+    }
+  },
+  "schema": "noesis.pcf.multiroom_alignment_review.v1"
+}

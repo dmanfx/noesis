@@ -7,6 +7,14 @@ version: 1
 depth_registration:
   path: DS9/config/depth_registration.json
 
+# Keep the shared review-only floorplan sources available to the dashboard.
+# SV3DT owns live 3D observations; these artifacts remain presentation-only.
+scene_priors:
+  path: ../../data/scene_priors/catalog.json
+
+scene_fusions:
+  path: ../../data/scene_fusions/catalog.json
+
 batch_size: 3
 
 streammux:
@@ -77,12 +85,12 @@ sources:
 
 preprocess:
   enable: true
-  config-file: DS9/pipelines/config_preproc_yolo26_seg_s.ini
+  config-file: DS9/pipelines/config_preproc_yolo26_m.ini
 
 models:
   pgie:
-    config-file-path: DS9/pipelines/config_infer_primary_yolo26_seg_s.ini
-    engine: DS9/models/engines/yolo26s-seg_fused_b3_fp16.engine
+    config-file-path: DS9/pipelines/config_infer_primary_yolo26_m.ini
+    engine: DS9/models/engines/yolo26m_b3_fp16.engine
     batch_size: 3
     gie_id: 1
     network_mode: fp16
@@ -110,9 +118,9 @@ models:
     kpt_threshold: 0.35
     letterbox: true
   depth_tracking:
-    # The baseline DAv2 lane estimates object depth for the 2D tracker. SV3DT
-    # owns the 3D observation here, so keeping that lane active would duplicate
-    # depth work without contributing to the V3DT result.
+    # SV3DT owns live 3D observations. The BEV floorplan authority is admitted
+    # from the configured PCF scene-prior path; keep the duplicate DAv2 branch
+    # disabled so the V3DT asset contract remains valid.
     enable: false
     name: depth_tracking_fullframe
     config-file-path: DS9/pipelines/config_infer_secondary_depth_tracking_da2.ini
@@ -169,6 +177,27 @@ bev:
   frame: camera_local_ground_m
   jpeg_enabled: false
   jpeg_quality: 70
+  coverage_envelopes:
+    contract: noesis.bev.coverage_envelopes
+    contract_version: 1
+    frame: camera_local_ground_m
+    units: meters
+    cameras:
+      living-room:
+        boundary_tolerance_m: 0.35
+        regions:
+          - id: living-room
+            polygon_xz_m:
+              - [6.485358, 1.927884]
+              - [-1.583682, 0.127085]
+              - [-2.694162, 4.769288]
+              - [5.374878, 6.570087]
+          - id: foyer
+            polygon_xz_m:
+              - [0.494046, 5.416398]
+              - [-4.741911, 4.247869]
+              - [-5.825244, 8.776586]
+              - [-0.589286, 9.945115]
   smoothing:
     enabled: true
     max_speed_mps: 4.0

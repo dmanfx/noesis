@@ -72,19 +72,20 @@ const CALIBRATION_TABLE_KEYS = new Set([
   'pose_confidence',
   'intrinsics',
   'extrinsics',
+  'frame_bindings',
 ]);
 
 function isObjectRecord(value: unknown): value is Record<string, unknown> {
   return !!value && typeof value === 'object' && !Array.isArray(value);
 }
 
-function isCalibrationTableKey(key: string): boolean {
-  return CALIBRATION_TABLE_KEYS.has(key.toLowerCase().trim());
+export function isCameraDiscoveryMetadataKey(key: unknown): boolean {
+  return CALIBRATION_TABLE_KEYS.has(String(key ?? '').toLowerCase().trim());
 }
 
 function addCameraKey(discovered: Set<CameraKey>, rawId: unknown): void {
   const id = String(rawId || '').trim();
-  if (!id) return;
+  if (!id || isCameraDiscoveryMetadataKey(id)) return;
   const key = detectCameraKey(id) || id.toLowerCase();
   if (key) discovered.add(key);
 }
@@ -116,7 +117,7 @@ export function discoverCamerasFromPayloads(payloads: any[]): CameraKey[] {
     if (p.data?.cameras || p.cameras) {
       const cams = p.data?.cameras || p.cameras;
       for (const [key, value] of Object.entries(cams || {})) {
-        if (isCalibrationTableKey(key)) {
+        if (isCameraDiscoveryMetadataKey(key)) {
           if (isObjectRecord(value)) {
             Object.keys(value).forEach((cameraId) => addCameraKey(discovered, cameraId));
           }

@@ -7,7 +7,7 @@ import { ControlsPanel } from './components/ControlsPanel';
 import { TelemetryPanel } from './telemetry/TelemetryPanel';
 import { TelemetryProvider, useTelemetry } from './telemetry/TelemetryContext';
 import { TrailStore } from './lib/trails';
-import { cameraOrder, colorForTrack, cameraLabel, detectCameraKey, CameraKey, colorIdForPerson, identityKeyForPerson, discoverCamerasFromPayloads } from './lib/camera';
+import { cameraOrder, colorForTrack, cameraLabel, detectCameraKey, CameraKey, colorIdForPerson, identityKeyForPerson, discoverCamerasFromPayloads, isCameraDiscoveryMetadataKey } from './lib/camera';
 import { getExtrinsics, getIntrinsics4, getIntrinsicsAny, extractPoseFromExtrinsics, forwardXZFromExtrinsics } from './lib/calibration';
 import { isCameraLocalFrame, projectWorldPointToCameraLocal, resolveBevFrameModeFromPayload } from './lib/coordTransforms';
 import { useWebSocketClient, StatsPayload, MosaicLayout, type DepthRequestStrategy } from './hooks/useWebSocketClient';
@@ -417,9 +417,12 @@ function Dashboard() {
   // Extends the known camera list so BEV panels can appear for newly discovered rooms without code changes.
   const updateKnownCamerasFromPayload = (payload: any) => {
     const next = discoverCamerasFromPayloads([payload]);
-    const current = knownCamerasRef.current;
+    // Hot reloads can preserve an already-discovered metadata pseudo-camera.
+    // Prune reserved calibration table names as well as preventing new ones.
+    const previous = knownCamerasRef.current;
+    const current = previous.filter(c => !isCameraDiscoveryMetadataKey(c));
     const added = next.filter(c => !current.includes(c));
-    if (added.length > 0) {
+    if (added.length > 0 || current.length !== previous.length) {
       const updated = [...current, ...added];
       knownCamerasRef.current = updated;
       setKnownCameras(updated);

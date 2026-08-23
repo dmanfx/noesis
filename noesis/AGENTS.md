@@ -26,14 +26,18 @@ authority from those names or launch `noesis/ds8_runtime.py`.
    them; test the producer and direct consumer together.
 2. Keep GPU/native work in the DS9.1 adapter or native bridge. Do not add raw
    frame CPU branches or analytics appsinks to shared modules.
-3. No hidden fallback algorithms, alternate metadata sources, or legacy runtime
+3. Shared telemetry, journal, identity, persistence, and integration code must
+   not perform unbounded work or durable/network I/O on the media callback.
+   Use bounded workers and reuse already-extracted compact metadata rather than
+   repeating tensor, NumPy, or JSON conversion.
+4. No hidden fallback algorithms, alternate metadata sources, or legacy runtime
    routes.
-4. Maintain canonical publication ordering and lifecycle barriers for tracking,
+5. Maintain canonical publication ordering and lifecycle barriers for tracking,
    world, BEV, depth, and WebSocket output.
-5. For mirrored files, modify the DS9.1-owned copy required by
+6. For mirrored files, modify the DS9.1-owned copy required by
    `DS9/docs/runtime_ownership.yaml`; update the shared copy only when the
    contract is intentionally shared.
-6. Validate ordinary changes with focused tests and the affected direct
+7. Validate ordinary changes with focused tests and the affected direct
    consumer. Do not invoke appliance staging or promotion.
-7. Use portable paths and private-file/environment authorities for runtime
+8. Use portable paths and private-file/environment authorities for runtime
    state and credentials.

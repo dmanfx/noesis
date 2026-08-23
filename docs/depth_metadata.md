@@ -19,9 +19,11 @@ semantics, but they do not share a public payload or runtime cadence.
 
 - The full-frame DAv2 branch captures aligned device depth and rendezvouses with
   the later object-fusion stage by exact `(source_id, frame_id, media PTS)`.
-- Fusion waits for `NOESIS_OBJECT_DEPTH_EXACT_FRAME_WAIT_MS` (20 ms by default,
-  clamped to 0–250 ms). After timeout it may use only a same-source, non-future
-  prior frame within the configured depth cadence.
+- Live fusion is nonblocking by default
+  (`NOESIS_OBJECT_DEPTH_EXACT_FRAME_WAIT_MS=0`, clamped to 0–250 ms). It uses
+  an already-available exact frame or only a same-source, non-future prior
+  frame within the configured depth cadence. A positive wait is available for
+  explicit bounded diagnostics.
 - Person masks, or a bounded lower-person bbox band for box-only detectors, are
   sampled into `NOESIS.OBJECT_DEPTH` object user meta. The raw payload declares
   `sampling_mode` and retains `status`, support, anchor, and metric-depth

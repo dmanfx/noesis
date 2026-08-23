@@ -82,6 +82,7 @@ export type FloorplanResponse = {
   snapshot_ref?: string;
   snapshot_id?: string;
   snapshot_content_sha256?: string;
+  calibration_fingerprint?: string;
   ts?: number;
   snapshot_ts?: number | null;
   served_from_cache?: boolean;

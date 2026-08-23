@@ -77,7 +77,7 @@ def test_post_resolution_osd_uses_exact_decision_and_preserves_depth_fragment() 
     )
     rows = _OneShotObjects(
         [
-            _object(11, label="person XX z=2.37m 0.91"),
+            _object(11, label="person XX depth=2.37m 0.91"),
             _object(12, label="#XX 0.82", confidence=0.82),
             _object(99, class_id=2, label="dog 0.70", confidence=0.70),
         ]
@@ -95,7 +95,7 @@ def test_post_resolution_osd_uses_exact_decision_and_preserves_depth_fragment() 
     )
     processor.handle_frame_ds8(frame)
     assert rows.iterations == 1
-    assert rows.rows[0].text_params.display_text == "#1 Alice z=2.37m 0.91"
+    assert rows.rows[0].text_params.display_text == "#1 Alice depth=2.37m 0.91"
     assert rows.rows[1].text_params.display_text == "#1000 0.82"
     assert rows.rows[2].text_params.display_text == "dog 0.70"
     assert not any("object" in key or "frame" in key for key in processor.__dict__)

@@ -38,6 +38,7 @@ class RuntimeConfigTests(unittest.TestCase):
             )
             self.assertEqual(result["osd"]["display-mask"], 1)
             self.assertEqual(result["osd"]["display-bbox"], 1)
+            self.assertEqual(result["osd"]["process-mode"], 1)
 
     def test_detect_only_pgie_disables_masks_and_shows_boxes(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -50,12 +51,14 @@ class RuntimeConfigTests(unittest.TestCase):
             )
             self.assertEqual(result["osd"]["display-mask"], 0)
             self.assertEqual(result["osd"]["display-bbox"], 1)
+            self.assertEqual(result["osd"]["process-mode"], 1)
 
     def test_missing_pgie_path_uses_safe_bbox_policy(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             result = runtime_config.apply_osd_from_pgie_ini({}, Path(tmp) / "infer.yaml")
             self.assertEqual(result["osd"]["display-mask"], 0)
             self.assertEqual(result["osd"]["display-bbox"], 1)
+            self.assertEqual(result["osd"]["process-mode"], 1)
 
 
 if __name__ == "__main__":

@@ -418,3 +418,56 @@ construction are unchanged.
 **Why:** Queue isolation cannot repair a peer synchronizer that received an
 invalid partial cohort. Enforcing complete tracker cohorts removes the trigger
 while preserving the accepted batch-global identity and geometry contracts.
+
+## ADR-020 — One revision-bound ground state feeds every spatial view
+
+**Accepted:** 2026-08-23
+
+Baseline person grounding is estimated once in the camera's active
+`backend_world_m` revision. Family Room binds raw camera calibration to the
+active room prior with an explicit rigid `Wc` edge; raw `E` remains calibration
+evidence, while live floor rays use `E @ inv(Wc)` and the leveled floor. Frame,
+transform, calibration, alignment, and Scene Prior revisions must agree or the
+observation fails closed.
+
+Seated or lying hips and torsos are never projected as floor contacts. Visible
+ankles or supported person pixels may contribute; bbox-only and contaminated
+depth remain diagnostics. BEV, the dashboard, OSD trails, and later 3D clients
+consume the filtered world state and may only apply a revision-checked view
+transform. They cannot reselect depth, cast a new floor ray, or smooth the
+canonical point a second time.
+
+**Why:** A second display estimator and two different floor revisions produced
+posture- and range-dependent metre-scale placement errors. One explicit state
+and one immutable frame edge make every view numerically comparable and keep
+uncertain evidence visible without granting it position authority.
+
+## ADR-021 — Optional depth and persistence cannot stall media
+
+**Accepted:** 2026-08-23
+
+The mosaic path uses GPU `nvdsosd`; mapping the 3840x720 RGBA surface through
+the host is forbidden. Full-frame DAv2 remains a secondary observation branch:
+its queue is latest-frame-only, device readiness is query-only, and its private
+CUDA work cannot back-pressure tracking, OSD, or NVENC. Compact per-person ROI
+results use private streams and reusable pinned host buffers.
+
+Periodic identity evidence and gallery persistence run through bounded writers
+outside the media callback. StableID prewarms the production-shaped CUDA
+similarity operation during startup so lazy Torch/CUDA initialization cannot
+land on the first occupied frame. Mux and tiler pools are explicitly sized for
+the bounded metadata queues rather than relying on SDK defaults.
+
+Native tensor/surface extraction is single-owner per frame and shared by its
+consumers. Work amplified by detections, tracks, cameras, clients, or retained
+evidence has explicit bounds. Performance changes preserve the selected models,
+resolution, inference cadence, tracker, and outputs unless an explicit matched
+quality tradeoff is approved. Config flags alone do not establish zero-copy;
+the native consumer and source/encode/delivery layers must be measured. The
+operational rules are centralized in
+[`performance_invariants.md`](performance_invariants.md).
+
+**Why:** The observed corruption and freezes were buffer starvation and
+synchronization effects, not insufficient detector throughput. Optional
+evidence and durable I/O must degrade their own freshness without delaying the
+authoritative video/tracking path.

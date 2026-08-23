@@ -7,6 +7,13 @@ from typing import Literal
 from pydantic import Field, model_validator
 
 from .base import ArtifactFingerprint, ContractModel, Sha256, TimestampUs
+from noesis_core.coordinate_frames import (
+    BACKEND_WORLD_FRAME_ID,
+    CoordinateFrameError,
+    MetricFloorPlane,
+    RevisionedFrame,
+    RevisionedFrameTransform,
+)
 from noesis_core.scene_files import SceneFileError, normalized_scene_relative_path
 
 
@@ -321,6 +328,129 @@ class ScenePriorCatalogEntry(ContractModel):
         return self
 
 
+class ScenePriorFrameRef(ContractModel):
+    frame_id: Literal["backend_world_m"]
+    revision: str = Field(
+        min_length=1,
+        max_length=200,
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,199}$",
+    )
+
+
+class ScenePriorFloorPlane(ContractModel):
+    frame: ScenePriorFrameRef
+    normal: tuple[float, float, float]
+    offset_m: float
+
+    @model_validator(mode="after")
+    def _valid_metric_plane(self) -> "ScenePriorFloorPlane":
+        try:
+            MetricFloorPlane(
+                frame=RevisionedFrame(
+                    frame_id=self.frame.frame_id,
+                    revision=self.frame.revision,
+                ),
+                normal=tuple(float(value) for value in self.normal),
+                offset_m=float(self.offset_m),
+            )
+        except CoordinateFrameError as exc:
+            raise ValueError(str(exc)) from exc
+        return self
+
+
+class ScenePriorFrameBinding(ContractModel):
+    """Immutable raw-to-active world revision edge for one camera binding."""
+
+    contract: Literal["noesis.scene_prior.frame_binding"]
+    contract_version: Literal[1]
+    source_frame: ScenePriorFrameRef
+    target_frame: ScenePriorFrameRef
+    source_camera_calibration_sha256: Sha256
+    source_world_alignment_sha256: Sha256
+    target_revision_id: str = Field(
+        min_length=1,
+        max_length=200,
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,199}$",
+    )
+    target_revision_metadata_sha256: Sha256
+    target_from_source_col_major: tuple[float, ...] = Field(
+        min_length=16,
+        max_length=16,
+    )
+    target_from_source_sha256: Sha256
+    source_floor_plane: ScenePriorFloorPlane
+    target_floor_plane: ScenePriorFloorPlane
+
+    @model_validator(mode="after")
+    def _valid_revisioned_transform(self) -> "ScenePriorFrameBinding":
+        if self.source_frame.frame_id != BACKEND_WORLD_FRAME_ID:
+            raise ValueError("scene-prior source frame must be backend_world_m")
+        if self.target_frame.frame_id != BACKEND_WORLD_FRAME_ID:
+            raise ValueError("scene-prior target frame must be backend_world_m")
+        try:
+            source = RevisionedFrame(
+                frame_id=self.source_frame.frame_id,
+                revision=self.source_frame.revision,
+            )
+            target = RevisionedFrame(
+                frame_id=self.target_frame.frame_id,
+                revision=self.target_frame.revision,
+            )
+            RevisionedFrameTransform(
+                source_frame=source,
+                target_frame=target,
+                target_from_source_col_major=tuple(
+                    float(value) for value in self.target_from_source_col_major
+                ),
+                transform_sha256=self.target_from_source_sha256,
+                source_floor_plane=MetricFloorPlane(
+                    frame=source,
+                    normal=tuple(
+                        float(value) for value in self.source_floor_plane.normal
+                    ),
+                    offset_m=float(self.source_floor_plane.offset_m),
+                ),
+                target_floor_plane=MetricFloorPlane(
+                    frame=target,
+                    normal=tuple(
+                        float(value) for value in self.target_floor_plane.normal
+                    ),
+                    offset_m=float(self.target_floor_plane.offset_m),
+                ),
+            )
+        except CoordinateFrameError as exc:
+            raise ValueError(str(exc)) from exc
+        return self
+
+    def frame_transform(self) -> RevisionedFrameTransform:
+        source = RevisionedFrame(
+            frame_id=self.source_frame.frame_id,
+            revision=self.source_frame.revision,
+        )
+        target = RevisionedFrame(
+            frame_id=self.target_frame.frame_id,
+            revision=self.target_frame.revision,
+        )
+        return RevisionedFrameTransform(
+            source_frame=source,
+            target_frame=target,
+            target_from_source_col_major=tuple(
+                float(value) for value in self.target_from_source_col_major
+            ),
+            transform_sha256=self.target_from_source_sha256,
+            source_floor_plane=MetricFloorPlane(
+                frame=source,
+                normal=tuple(float(value) for value in self.source_floor_plane.normal),
+                offset_m=float(self.source_floor_plane.offset_m),
+            ),
+            target_floor_plane=MetricFloorPlane(
+                frame=target,
+                normal=tuple(float(value) for value in self.target_floor_plane.normal),
+                offset_m=float(self.target_floor_plane.offset_m),
+            ),
+        )
+
+
 class ScenePriorCameraBinding(ContractModel):
     camera_id: str = Field(
         min_length=1,
@@ -339,6 +469,7 @@ class ScenePriorCameraBinding(ContractModel):
     )
     mode: Literal["shadow"]
     include_floorplan_layers: bool = True
+    frame_binding: ScenePriorFrameBinding | None = None
 
 
 class ScenePriorCatalog(ContractModel):
@@ -378,6 +509,13 @@ class ScenePriorCatalog(ContractModel):
                 raise ValueError(
                     f"scene-prior camera {binding.camera_id} space does not match its revision"
                 )
+            if (
+                binding.frame_binding is not None
+                and binding.frame_binding.target_frame.revision != binding.prior_id
+            ):
+                raise ValueError(
+                    f"scene-prior camera {binding.camera_id} frame revision does not match its active prior"
+                )
         return self
 
 
@@ -389,6 +527,9 @@ __all__ = [
     "ScenePriorCatalog",
     "ScenePriorCatalogEntry",
     "ScenePriorDerivation",
+    "ScenePriorFloorPlane",
+    "ScenePriorFrameBinding",
+    "ScenePriorFrameRef",
     "ScenePriorGrid",
     "ScenePriorPreview",
     "ScenePriorQuality",

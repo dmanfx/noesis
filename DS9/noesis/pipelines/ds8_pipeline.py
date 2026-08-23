@@ -1053,6 +1053,14 @@ def build_pipeline(yaml_path: str | Path) -> DS8Pipeline:
     streammux_cfg.setdefault("width", 1920)
     streammux_cfg.setdefault("height", 1080)
     streammux_cfg.setdefault("live-source", 1)
+    # DeepStream defaults this pool to four surfaces. That is insufficient for
+    # this graph's bounded telemetry queues and caused the mux to wait for
+    # returned output buffers during short callback spikes.
+    streammux_cfg.setdefault("buffer-pool-size", 8)
+    streammux_buffer_pool_size = int(streammux_cfg.get("buffer-pool-size", 8))
+    if not 4 <= streammux_buffer_pool_size <= 1024:
+        raise ValueError("streammux.buffer-pool-size must be between 4 and 1024")
+    streammux_cfg["buffer-pool-size"] = streammux_buffer_pool_size
     # Preserve input aspect by padding when streammux scales to the configured size.
     streammux_cfg.setdefault("enable-padding", 1)
     first_gpu = sources[0].get("gpu-id") if sources else 0
@@ -1518,7 +1526,15 @@ def build_pipeline(yaml_path: str | Path) -> DS8Pipeline:
         depth_tracking_queue = Component(
             name="depth_tracking_queue",
             element="queue",
-            config={"max-size-buffers": 4, "max-size-bytes": 0, "max-size-time": 0},
+            # DAv2 is a secondary observation branch. It must consume the
+            # newest available frame without ever back-pressuring main_tee and
+            # freezing tracking/OSD/encode for every camera.
+            config={
+                "leaky": 2,
+                "max-size-buffers": 2,
+                "max-size-bytes": 0,
+                "max-size-time": 0,
+            },
             downstream=[depth_tracking.name],
         )
         depth_tracking_sink = Component(
@@ -1687,6 +1703,9 @@ def build_pipeline(yaml_path: str | Path) -> DS8Pipeline:
         "gpu-id": zero_copy_gpu_id,
         "width": streammux_cfg.get("width", 1920),
         "height": streammux_cfg.get("height", 1080),
+        # Match the expanded mux pool so a short downstream callback spike
+        # cannot exhaust the tiler's default five output surfaces.
+        "buffer-pool-size": 8,
     }
     if tiler_square_seq_grid:
         # Use the plugin's square layout mode to keep tile aspect aligned to the output aspect.
@@ -1732,6 +1751,12 @@ def build_pipeline(yaml_path: str | Path) -> DS8Pipeline:
                 "columns": tiler_cfg.get("columns"),
                 "rows": tiler_cfg.get("rows"),
                 "streammux_enable_padding": int(streammux_cfg.get("enable-padding", 0) or 0),
+                "streammux_buffer_pool_size": int(
+                    streammux_cfg.get("buffer-pool-size", 0) or 0
+                ),
+                "tiler_buffer_pool_size": int(
+                    tiler_cfg.get("buffer-pool-size", 0) or 0
+                ),
             },
             separators=(",", ":"),
         )
@@ -1747,7 +1772,18 @@ def build_pipeline(yaml_path: str | Path) -> DS8Pipeline:
     _safe_add(ds_pipeline, tiler, pipeline.errors)
     _apply_component_config(ds_pipeline, tiler, pipeline.errors)
 
-    osd_process_mode = 0
+    raw_osd_cfg = cfg.get("osd", {}) or {}
+    if not isinstance(raw_osd_cfg, Mapping):
+        raise ValueError("osd must be a mapping")
+    try:
+        osd_process_mode = int(raw_osd_cfg.get("process-mode", 1))
+    except (TypeError, ValueError) as exc:
+        raise ValueError("osd.process-mode must be the DeepStream integer enum") from exc
+    # DeepStream's nvdsosd enum is 0=CPU, 1=GPU. CPU mode maps the complete
+    # tiled RGBA surface through host memory before handing it to NVENC, so it
+    # is not a valid mode for the canonical NVMM mosaic path.
+    if osd_process_mode != 1:
+        raise ValueError("canonical DS9 osd.process-mode must be 1 (GPU)")
     osd = Component(
         name="osd",
         element="nvdsosd",
@@ -1755,11 +1791,11 @@ def build_pipeline(yaml_path: str | Path) -> DS8Pipeline:
             # Keep OSD on GPU so the tiler -> OSD -> encoder path stays zero-copy/NVMM.
             "process-mode": osd_process_mode,
             # Show instance segmentation masks from NvDsInferInstanceMaskInfo
-            "display-mask": 1,
+            "display-mask": int(raw_osd_cfg.get("display-mask", 1)),
             # Hide bbox rectangles to emphasize masks; set to 1 if you want both
-            "display-bbox": 0,
+            "display-bbox": int(raw_osd_cfg.get("display-bbox", 0)),
             # Keep labels visible (class name + confidence)
-            "display-text": 1,
+            "display-text": int(raw_osd_cfg.get("display-text", 1)),
         },
         downstream=[],
     )
@@ -2042,8 +2078,14 @@ def build_pipeline(yaml_path: str | Path) -> DS8Pipeline:
                 "source_count": len(sources),
                 "streammux_gpu_id": zero_copy_gpu_id,
                 "streammux_nvbuf_memory_type": zero_copy_nvbuf_memory_type,
+                "streammux_buffer_pool_size": int(
+                    streammux_cfg.get("buffer-pool-size", 0) or 0
+                ),
                 "source_cudadec_memtype": source_decode_memtypes,
                 "tiler_gpu_id": int(tiler_cfg.get("gpu-id", zero_copy_gpu_id) or zero_copy_gpu_id),
+                "tiler_buffer_pool_size": int(
+                    tiler_cfg.get("buffer-pool-size", 0) or 0
+                ),
                 "osd_process_mode": osd_process_mode,
                 "rtsp_enabled": rtsp_enabled,
                 "mosaic_vconv_nvbuf_memory_type": (

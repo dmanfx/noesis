@@ -4,7 +4,7 @@ Phases implemented here (shared by baseline and V3DT analytics hooks):
 
 1. Stationary lock — freeze world when idle; trails do not append.
 2. Source hysteresis — sticky world_source selection; reject bent-leg ankle fakes.
-3. Posture-aware contact — standing ankles vs sitting pelvis vs lying body.
+3. Posture-aware contact — only observed ground-contact anatomy is projected.
 4. Human constant-velocity filter with adaptive process/measurement noise.
 5. PersonGroundState — single producer state consumed by BEV + OSD trails.
 6. Path simplification — RDP / collinear merge on committed history only.
@@ -730,8 +730,12 @@ def classify_posture(
                 leg_v = abs(float(ankle[1]) - float(hip[1]))
                 if leg_v < float(config.sit_bbox_height_ratio) * max(torso_v, 1.0):
                     return "sitting"
-            if legs_are_bent(kpts_abs, config=config):
-                return "sitting"
+        # The missing-ankle branch in legs_are_bent deliberately recognizes
+        # compact hip/knee geometry. Keep that signal available when seated
+        # feet are occluded so an old standing height lock cannot trigger a
+        # fabricated gravity-drop floor measurement.
+        if legs_are_bent(kpts_abs, config=config):
+            return "sitting"
 
         if (
             height_ref_scene is None
@@ -855,44 +859,21 @@ def resolve_pose_floor_anchor(
 
     left_ankle = pose_point(kpts_abs, "left_ankle", conf_threshold=thr)
     right_ankle = pose_point(kpts_abs, "right_ankle", conf_threshold=thr)
-    left_hip = pose_point(kpts_abs, "left_hip", conf_threshold=thr)
-    right_hip = pose_point(kpts_abs, "right_hip", conf_threshold=thr)
-    left_shoulder = pose_point(kpts_abs, "left_shoulder", conf_threshold=thr)
-    right_shoulder = pose_point(kpts_abs, "right_shoulder", conf_threshold=thr)
-    hip_mid = _mid_xy(left_hip, right_hip)
-    shoulder_mid = _mid_xy(left_shoulder, right_shoulder)
-
-    # Sitting / lying: prefer pelvis / torso contact, not noisy ankles.
-    if effective_posture in ("sitting", "lying"):
-        if hip_mid is not None:
-            return PoseAnchorCandidate(
-                u=float(hip_mid[0]),
-                v=float(hip_mid[1]),
-                source="pose_hip_floor" if effective_posture == "sitting" else "pose_body_floor",
-                quality="good" if left_hip is not None and right_hip is not None else "estimated",
-                quality_reason=f"posture={effective_posture}",
-                height_lock_eligible=False,
-                score=0.92 if effective_posture == "sitting" else 0.88,
-            )
-        if shoulder_mid is not None and effective_posture == "lying":
-            return PoseAnchorCandidate(
-                u=float(shoulder_mid[0]),
-                v=float(shoulder_mid[1]),
-                source="pose_body_floor",
-                quality="estimated",
-                quality_reason="posture=lying,hip_missing",
-                height_lock_eligible=False,
-                score=0.70,
-            )
-
-    # Standing (or unknown upright): ankles first.
+    # Ankles are observed floor-contact anatomy for standing and sitting people.
+    # A pelvis/torso keypoint is elevated above the floor and must never be
+    # ray-intersected with the floor as if it were a contact point.
     if left_ankle is not None and right_ankle is not None:
         return PoseAnchorCandidate(
             u=float(left_ankle[0] + right_ankle[0]) * 0.5,
             v=float(left_ankle[1] + right_ankle[1]) * 0.5,
             source="pose_ankle_floor",
             quality="good",
-            height_lock_eligible=True,
+            quality_reason=(
+                f"posture={effective_posture},observed_ankles"
+                if effective_posture in ("sitting", "lying")
+                else None
+            ),
+            height_lock_eligible=effective_posture not in ("sitting", "lying"),
             score=1.0,
         )
     if left_ankle is not None or right_ankle is not None:
@@ -903,22 +884,19 @@ def resolve_pose_floor_anchor(
             v=float(ankle[1]),
             source="pose_single_ankle_floor",
             quality="good",
-            height_lock_eligible=True,
+            quality_reason=(
+                f"posture={effective_posture},observed_single_ankle"
+                if effective_posture in ("sitting", "lying")
+                else None
+            ),
+            height_lock_eligible=effective_posture not in ("sitting", "lying"),
             score=0.90,
         )
 
-    # Leg extension only when legs are not bent (Phase 2).
+    # Bent/non-upright legs cannot be safely extended, and upper-body points do
+    # not provide a ground contact. Fail closed until another contact-bearing
+    # source (for example an instance mask) is available.
     if bent or effective_posture in ("sitting", "lying"):
-        if hip_mid is not None:
-            return PoseAnchorCandidate(
-                u=float(hip_mid[0]),
-                v=float(hip_mid[1]),
-                source="pose_hip_floor",
-                quality="estimated",
-                quality_reason="bent_leg_blocks_pose_leg_floor",
-                height_lock_eligible=False,
-                score=0.72,
-            )
         return None
 
     estimates: List[Tuple[float, float]] = []
@@ -955,8 +933,11 @@ def source_score(
     base = {
         "pose_ankle_floor": 1.00,
         "pose_single_ankle_floor": 0.90,
-        "pose_hip_floor": 0.88,
-        "pose_body_floor": 0.84,
+        # Compatibility-only labels from older payloads. They are deliberately
+        # non-authoritative: current code never emits an elevated hip/body
+        # point as a floor contact.
+        "pose_hip_floor": 0.05,
+        "pose_body_floor": 0.05,
         "pose_depth_fused": 1.05,
         "pose_depth_only": 1.05,
         "pose_floor_only": 0.95,
@@ -976,10 +957,8 @@ def source_score(
         base -= 0.40
     base += 0.10 * max(0.0, min(1.0, float(depth_weight)))
     if posture in ("sitting", "lying"):
-        if "ankle" in src or src == "pose_leg_floor":
+        if src == "pose_leg_floor":
             base -= 0.25
-        if "hip" in src or "body" in src:
-            base += 0.12
         if src == "gravity_drop":
             base -= 0.20
     return float(base)

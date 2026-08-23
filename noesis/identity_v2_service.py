@@ -942,6 +942,11 @@ class IdentityV2Service:
             self._held_overlays.clear()
             self._osd_decisions.clear()
             self._osd_frame_order.clear()
+            recorder = self.evidence_recorder
+        try:
+            if recorder is not None:
+                recorder.close()
+        finally:
             self.store.close()
 
     def lookup_osd_decision(
@@ -1054,6 +1059,7 @@ class IdentityV2Service:
                 tuple(observations),
                 overlap_permits=permits,
             )
+            persisted_records: Sequence[ShadowIdentityEvidenceRecord] = ()
             if self.evidence_recorder is not None:
                 persisted_records = self.evidence_recorder.append_frame(
                     run_id=self.run_id,
@@ -1071,11 +1077,16 @@ class IdentityV2Service:
                     scorer=self.runtime.resolver.scorer,
                     runtime_mode=self.mode.value,
                 )
-                self._stamp_persisted_embedding_provenance(
-                    observation_by_tracklet=observation_by_tracklet,
-                    primitives_by_tracklet=primitives_by_tracklet,
-                    persisted_records=persisted_records,
-                )
+                # DS9/replay recorders enqueue rows and fsync them on their
+                # owner thread.  Do not label a media-side row as durable
+                # before that worker has completed; the evidence health
+                # surface exposes the pending/dropped/error state instead.
+                if not getattr(self.evidence_recorder, "async_mode", False):
+                    self._stamp_persisted_embedding_provenance(
+                        observation_by_tracklet=observation_by_tracklet,
+                        primitives_by_tracklet=primitives_by_tracklet,
+                        persisted_records=persisted_records,
+                    )
             overlay_by_tracklet = {
                 overlay.key.tracklet_id: overlay for overlay in batch.overlays
             }
@@ -1083,6 +1094,17 @@ class IdentityV2Service:
             for tracklet_id, primitive in primitives_by_tracklet.items():
                 overlay = overlay_by_tracklet[tracklet_id]
                 self._apply_overlay(primitive.public_track, overlay)
+                if getattr(self.evidence_recorder, "async_mode", False):
+                    self._mark_queued_embedding_evidence(
+                        primitive,
+                        accepted=bool(persisted_records),
+                    )
+                elif persisted_records:
+                    identity = primitive.public_track.get("identity_v2")
+                    if isinstance(identity, Mapping):
+                        updated_identity = dict(identity)
+                        updated_identity["evidence_persistence"] = "durable"
+                        primitive.public_track["identity_v2"] = updated_identity
                 self._sync_diagnostic_track(primitive)
                 if overlay.subject_id is not None and overlay.identity_state in (
                     "resident",
@@ -1233,6 +1255,31 @@ class IdentityV2Service:
             track.pop(field, None)
 
     @classmethod
+    def _mark_queued_embedding_evidence(
+        cls,
+        primitive: IdentityFramePrimitive,
+        *,
+        accepted: bool,
+    ) -> None:
+        """Keep live extraction/identity truth separate from durability."""
+
+        track = primitive.public_track
+        # The key, embedding_present, and fresh_embedding fields describe the
+        # live frame.  Only the durable triad is withheld until the writer
+        # commits; evidence_persistence makes that distinction explicit.
+        cls._clear_embedding_provenance(track)
+        identity = track.get("identity_v2")
+        if isinstance(identity, Mapping):
+            updated = dict(identity)
+            updated["evidence_persistence"] = "queued" if accepted else "dropped"
+            updated["reason"] = (
+                "identity_evidence_queued"
+                if accepted
+                else "identity_evidence_dropped_queue_full"
+            )
+            track["identity_v2"] = updated
+
+    @classmethod
     def _set_frame_embedding_presence(
         cls,
         primitive: IdentityFramePrimitive,
@@ -1242,10 +1289,12 @@ class IdentityV2Service:
         """Stamp exact current-frame embedding truth on detached track surfaces."""
 
         value = bool(present)
+        primitive.public_track.pop("identity_observation_key", None)
         cls._clear_embedding_provenance(primitive.public_track)
         primitive.public_track["embedding_present"] = value
         diagnostic = primitive.diagnostic_track
         if diagnostic is not None:
+            diagnostic.pop("identity_observation_key", None)
             cls._clear_embedding_provenance(diagnostic)
             diagnostic["embedding_present"] = value
 
@@ -1704,11 +1753,10 @@ def create_identity_v2_service(
             .strip()
             .lower()
         )
-        inferred_runtime = "ds9" if "DS9" in yaml_path.parts else "ds8"
         evidence_runtime = (
             str(
-                env.get("NOESIS_IDENTITY_V2_EVIDENCE_RUNTIME", inferred_runtime)
-                or inferred_runtime
+                env.get("NOESIS_IDENTITY_V2_EVIDENCE_RUNTIME", runtime_name)
+                or runtime_name
             )
             .strip()
             .lower()
@@ -1752,6 +1800,10 @@ def create_identity_v2_service(
                 max_records=evidence_max_records,
                 max_bytes=evidence_max_bytes,
                 max_age_s=evidence_max_age_s,
+                # The native DS9/replay media callback must never fsync.  The
+                # test runtime intentionally remains synchronous so existing
+                # unit fixtures can inspect the file before teardown.
+                async_mode=evidence_runtime in {"ds9", "replay"},
             )
         except Exception as exc:
             raise IdentityV2ConfigurationError(

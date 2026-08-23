@@ -136,13 +136,13 @@ def ensure_private_directory(
     return path
 
 
-def validate_private_file(
+def validate_private_file_with_stat(
     path: str | Path,
     *,
     label: str,
     allowed_modes: Iterable[int] = (PRIVATE_FILE_MODE,),
-) -> Path:
-    """Validate an existing owner-only, single-link regular file."""
+) -> tuple[Path, os.stat_result]:
+    """Validate one private file and return its exact stat result."""
 
     candidate = _without_symlink_components(path, label=label)
     try:
@@ -166,6 +166,22 @@ def validate_private_file(
         )
     if info.st_nlink != 1:
         raise PrivatePathError(f"{label} must have exactly one hard link")
+    return candidate, info
+
+
+def validate_private_file(
+    path: str | Path,
+    *,
+    label: str,
+    allowed_modes: Iterable[int] = (PRIVATE_FILE_MODE,),
+) -> Path:
+    """Validate an existing owner-only, single-link regular file."""
+
+    candidate, _info = validate_private_file_with_stat(
+        path,
+        label=label,
+        allowed_modes=allowed_modes,
+    )
     return candidate
 
 

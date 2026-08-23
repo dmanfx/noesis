@@ -12,6 +12,7 @@ document and live source/config win.
 | --- | --- |
 | System architecture and ownership | [`CODEBASE_DESCRIPTION.md`](CODEBASE_DESCRIPTION.md) |
 | Installed runtime, models, versions, ports, and performance | [`runtime_baseline.md`](runtime_baseline.md) |
+| Pipeline hot-path and performance invariants | [`performance_invariants.md`](performance_invariants.md) |
 | Exact DeepStream graph | [`../DS9/PIPELINE_GRAPH.md`](../DS9/PIPELINE_GRAPH.md) |
 | Native runtime operation | [`../DS9/docs/runtime_host_boundary.md`](../DS9/docs/runtime_host_boundary.md) |
 | Focused validation | [`testing_guide.md`](testing_guide.md) |
@@ -81,6 +82,10 @@ but are not instructions for the current app.
 
 ## Documentation change log
 
+- **2026-08-23:** Made the occupied-scene performance recovery durable through
+  one canonical hot-path policy covering GPU/NVMM ownership, bounded optional
+  work, exact publication cohorts, pooled reuse, occupancy-amplification caps,
+  capability preservation, and source/encode/WebRTC measurement.
 - **2026-08-15:** Established one PCF/Scene Prior camera-ground orientation
   contract, removed room-specific and duplicated display flips, and validated
   Living Room, Family Room, Kitchen, and the review-only Family/Kitchen

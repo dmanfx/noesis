@@ -227,6 +227,34 @@ class IdentityV2Runtime:
         }
         return residents, visitors
 
+    def _hot_gallery_inventory_locked(
+        self,
+        *,
+        now: float,
+    ) -> tuple[dict[str, int], dict[str, int]]:
+        """Return gallery counts from the immutable in-memory snapshot.
+
+        Runtime mutations hold ``_lock`` and refresh the snapshot after the
+        durable store commit.  Authority checks on that path therefore do not
+        need to reopen and decode every gallery from SQLite.
+        """
+
+        residents: dict[str, int] = {}
+        visitors: dict[str, int] = {}
+        for subject in self._hot_subjects:
+            descriptor = subject.descriptor
+            if descriptor.expires_at is not None and descriptor.expires_at <= now:
+                continue
+            exemplar_count = len(subject.normalized_vectors)
+            if exemplar_count == 0:
+                continue
+            if descriptor.identity_kind is IdentityKind.RESIDENT:
+                if descriptor.resident_uuid is not None:
+                    residents[descriptor.resident_uuid] = exemplar_count
+            elif descriptor.visitor_session_uuid is not None:
+                visitors[descriptor.visitor_session_uuid] = exemplar_count
+        return residents, visitors
+
     def _assert_prospective_gallery_authority_locked(
         self,
         *,
@@ -234,6 +262,7 @@ class IdentityV2Runtime:
         add_resident_candidates: int = 0,
         add_visitor_candidates: int = 0,
         prospective_exemplar_count: int = 0,
+        inventory: Optional[tuple[dict[str, int], dict[str, int]]] = None,
     ) -> None:
         policy = self.resolver.scorer.policy
         if all(
@@ -246,7 +275,10 @@ class IdentityV2Runtime:
             )
         ):
             return
-        residents, visitors = self._gallery_inventory(now=now)
+        if inventory is None:
+            residents, visitors = self._gallery_inventory(now=now)
+        else:
+            residents, visitors = inventory
         resident_count = len(residents) + int(add_resident_candidates)
         visitor_count = len(visitors) + int(add_visitor_candidates)
         maximum_exemplars = max(
@@ -399,6 +431,46 @@ class IdentityV2Runtime:
             capacity_evictions=self._cache_capacity_evictions,
         )
 
+    def _assert_hot_gallery_authority_locked(
+        self,
+        hot: Sequence[_HotSubject],
+    ) -> None:
+        policy = self.resolver.scorer.policy
+        resident_candidates = sum(
+            item.descriptor.identity_kind is IdentityKind.RESIDENT for item in hot
+        )
+        visitor_candidates = sum(
+            item.descriptor.identity_kind is IdentityKind.VISITOR for item in hot
+        )
+        total_candidates = len(hot)
+        maximum_exemplars = max(
+            (len(item.normalized_vectors) for item in hot), default=0
+        )
+        authority_limits = (
+            (
+                "resident candidates",
+                resident_candidates,
+                policy.maximum_resident_candidates,
+            ),
+            (
+                "visitor candidates",
+                visitor_candidates,
+                policy.maximum_visitor_candidates,
+            ),
+            ("total candidates", total_candidates, policy.maximum_total_candidates),
+            (
+                "exemplars per candidate",
+                maximum_exemplars,
+                policy.maximum_exemplars_per_candidate,
+            ),
+        )
+        for label, actual, maximum in authority_limits:
+            if maximum is not None and actual > maximum:
+                raise RuntimeError(
+                    "identity calibration gallery authority exceeded: "
+                    f"{label} {actual} > {maximum}"
+                )
+
     def refresh(self, *, now: Optional[float] = None) -> Tuple[SubjectDescriptor, ...]:
         timestamp = float(self._clock() if now is None else now)
         with self._lock:
@@ -454,41 +526,7 @@ class IdentityV2Runtime:
                             ),
                         )
                     )
-            policy = self.resolver.scorer.policy
-            resident_candidates = sum(
-                item.descriptor.identity_kind is IdentityKind.RESIDENT for item in hot
-            )
-            visitor_candidates = sum(
-                item.descriptor.identity_kind is IdentityKind.VISITOR for item in hot
-            )
-            total_candidates = len(hot)
-            maximum_exemplars = max(
-                (len(item.normalized_vectors) for item in hot), default=0
-            )
-            authority_limits = (
-                (
-                    "resident candidates",
-                    resident_candidates,
-                    policy.maximum_resident_candidates,
-                ),
-                (
-                    "visitor candidates",
-                    visitor_candidates,
-                    policy.maximum_visitor_candidates,
-                ),
-                ("total candidates", total_candidates, policy.maximum_total_candidates),
-                (
-                    "exemplars per candidate",
-                    maximum_exemplars,
-                    policy.maximum_exemplars_per_candidate,
-                ),
-            )
-            for label, actual, maximum in authority_limits:
-                if maximum is not None and actual > maximum:
-                    raise RuntimeError(
-                        "identity calibration gallery authority exceeded: "
-                        f"{label} {actual} > {maximum}"
-                    )
+            self._assert_hot_gallery_authority_locked(hot)
             self._hot_subjects = tuple(
                 sorted(hot, key=lambda item: item.descriptor.subject_id)
             )
@@ -498,6 +536,67 @@ class IdentityV2Runtime:
             }
             self._refreshed_at = timestamp
             return tuple(item.descriptor for item in self._hot_subjects)
+
+    def _refresh_visitor_subject_locked(
+        self,
+        session_uuid: str,
+        *,
+        now: float,
+    ) -> None:
+        """Replace one visitor's hot gallery after a durable mutation.
+
+        ``add_visitor_exemplar`` bounds and orders the persisted gallery.  A
+        single-session read gives the hot snapshot the exact post-prune state
+        without reloading residents or unrelated visitor sessions.
+        """
+
+        session, exemplars = self.store.load_visitor_gallery(session_uuid)
+        self._assert_profile(
+            session.model_fingerprint,
+            session.embedding_dim,
+            subject=f"visitor session {session.session_uuid}",
+        )
+        for exemplar in exemplars:
+            self._assert_profile(
+                exemplar.model_fingerprint,
+                exemplar.embedding_dim,
+                subject=f"visitor exemplar {exemplar.exemplar_uuid}",
+            )
+
+        replacement: Optional[_HotSubject] = None
+        if (
+            session.state == "active"
+            and session.expires_at > now
+            and exemplars
+        ):
+            replacement = _HotSubject(
+                descriptor=self._visitor_descriptor(session),
+                normalized_vectors=tuple(
+                    self._normalize_vector(row.vector, subject=row.exemplar_uuid)
+                    for row in exemplars
+                ),
+            )
+
+        updated = [
+            item
+            for item in self._hot_subjects
+            if item.descriptor.visitor_session_uuid != session.session_uuid
+            and (
+                item.descriptor.expires_at is None
+                or item.descriptor.expires_at > now
+            )
+        ]
+        if replacement is not None:
+            updated.append(replacement)
+        self._assert_hot_gallery_authority_locked(updated)
+        self._hot_subjects = tuple(
+            sorted(updated, key=lambda item: item.descriptor.subject_id)
+        )
+        self._subject_index = {
+            item.descriptor.subject_id: item.descriptor
+            for item in self._hot_subjects
+        }
+        self._refreshed_at = now
 
     def hot_subjects(
         self, *, now: Optional[float] = None
@@ -725,7 +824,8 @@ class IdentityV2Runtime:
         )
         with self._lock:
             session = self.store.get_visitor_session(session_uuid)
-            _, visitors = self._gallery_inventory(now=timestamp)
+            inventory = self._hot_gallery_inventory_locked(now=timestamp)
+            _, visitors = inventory
             current_exemplars = visitors.get(session.session_uuid, 0)
             self._assert_prospective_gallery_authority_locked(
                 now=timestamp,
@@ -734,6 +834,7 @@ class IdentityV2Runtime:
                     current_exemplars + 1,
                     self._visitor_gallery_max_exemplars,
                 ),
+                inventory=inventory,
             )
             exemplar = self.store.add_visitor_exemplar(
                 session_uuid=session_uuid,
@@ -744,7 +845,7 @@ class IdentityV2Runtime:
                 max_exemplars=self._visitor_gallery_max_exemplars,
                 now=timestamp,
             )
-            self.refresh(now=timestamp)
+            self._refresh_visitor_subject_locked(session.session_uuid, now=timestamp)
             return exemplar
 
     def release_visitor_session(
@@ -896,7 +997,13 @@ class IdentityV2Runtime:
         with self._lock:
             self._evict_expired_observations_locked(timestamp)
             result = self.store.purge_expired(now=timestamp)
-            self.refresh(now=timestamp)
+            # Expired visitor sessions cascade-delete their visitor galleries,
+            # which changes the hot identity snapshot.  Provisional sessions,
+            # pending proposals, and quarantine exemplars are not part of that
+            # snapshot, so a no-op (or those unrelated retention changes) does
+            # not justify reopening and decoding every gallery.
+            if result.visitor_sessions:
+                self.refresh(now=timestamp)
             return result
 
     def _validated_raw_vector(self, vector: Sequence[float]) -> Tuple[float, ...]:

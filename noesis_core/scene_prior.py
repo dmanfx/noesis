@@ -16,10 +16,13 @@ import numpy as np
 from pydantic import ValidationError
 
 from noesis_core.coordinate_frames import (
+    BACKEND_WORLD_FRAME_ID,
     CAMERA_LOCAL_RASTER_ORIENTATION,
     CameraGroundFrame,
     CoordinateFrameError,
+    RevisionedFrameTransform,
     camera_ground_frame_from_extrinsics_col_major,
+    revisioned_frame_sha256,
     transform_positions,
 )
 from noesis_core.contracts.scene_prior import (
@@ -28,6 +31,7 @@ from noesis_core.contracts.scene_prior import (
     ScenePriorArtifact,
     ScenePriorCameraBinding,
     ScenePriorCatalog,
+    ScenePriorFrameBinding,
     ScenePriorRevision,
 )
 from noesis_core.scene_files import (
@@ -1200,6 +1204,37 @@ class ScenePriorSet:
                     points_world_m=points_world_m,
                     colors_rgb_u8=colors_rgb_u8,
                 )
+            for binding in catalog.camera_bindings:
+                frame_binding = binding.frame_binding
+                if frame_binding is None:
+                    continue
+                revision = revisions[binding.prior_id]
+                preview = revision.manifest.preview
+                if preview is None:
+                    raise ScenePriorError(
+                        f"scene-prior camera {binding.camera_id} frame binding requires preview provenance"
+                    )
+                if (
+                    preview.camera_calibration.sha256
+                    != frame_binding.source_camera_calibration_sha256
+                ):
+                    raise ScenePriorError(
+                        f"scene-prior camera {binding.camera_id} calibration revision mismatch"
+                    )
+                if (
+                    revision.manifest.world_to_scene.sha256
+                    != frame_binding.source_world_alignment_sha256
+                ):
+                    raise ScenePriorError(
+                        f"scene-prior camera {binding.camera_id} world-alignment revision mismatch"
+                    )
+                if (
+                    preview.target_revision_metadata.sha256
+                    != frame_binding.target_revision_metadata_sha256
+                ):
+                    raise ScenePriorError(
+                        f"scene-prior camera {binding.camera_id} target revision mismatch"
+                    )
         except ScenePriorError:
             raise
         except SceneFileError as exc:
@@ -1212,6 +1247,67 @@ class ScenePriorSet:
 
     def binding(self, camera_id: str) -> ScenePriorCameraBinding | None:
         return self._bindings.get(str(camera_id))
+
+    def frame_binding(self, camera_id: str) -> ScenePriorFrameBinding | None:
+        binding = self.binding(camera_id)
+        return binding.frame_binding if binding is not None else None
+
+    def frame_bindings(self) -> dict[str, ScenePriorFrameBinding]:
+        return {
+            camera_id: binding.frame_binding
+            for camera_id, binding in self._bindings.items()
+            if binding.frame_binding is not None
+        }
+
+    def world_frame_transform(
+        self,
+        camera_id: str,
+    ) -> RevisionedFrameTransform | None:
+        binding = self.frame_binding(camera_id)
+        return binding.frame_transform() if binding is not None else None
+
+    def _scene_world_extrinsics(
+        self,
+        camera_id: str,
+        calibration_extrinsics_col_major: Sequence[float],
+    ) -> Sequence[float]:
+        transform = self.world_frame_transform(camera_id)
+        if transform is None:
+            return calibration_extrinsics_col_major
+        try:
+            return transform.camera_from_target_col_major(
+                calibration_extrinsics_col_major
+            )
+        except CoordinateFrameError as exc:
+            raise ScenePriorError(str(exc)) from exc
+
+    def _world_frame_metadata(self, camera_id: str) -> tuple[str, str]:
+        binding = self.frame_binding(camera_id)
+        if binding is None:
+            revision = self.revision_for_camera(camera_id)
+            if revision is None:
+                raise ScenePriorError(
+                    f"scene-prior camera {camera_id!r} has no loaded revision"
+                )
+            preview = revision.manifest.preview
+            if preview is None:
+                raise ScenePriorError(
+                    f"scene-prior camera {camera_id!r} has no raw frame provenance"
+                )
+            return (
+                BACKEND_WORLD_FRAME_ID,
+                revisioned_frame_sha256(
+                    BACKEND_WORLD_FRAME_ID,
+                    artifact_sha256s=(
+                        preview.camera_calibration.sha256,
+                        revision.manifest.world_to_scene.sha256,
+                    ),
+                ),
+            )
+        return (
+            binding.target_frame.frame_id,
+            binding.target_frame.revision,
+        )
 
     def revision_for_camera(self, camera_id: str) -> LoadedScenePrior | None:
         binding = self.binding(camera_id)
@@ -1231,9 +1327,15 @@ class ScenePriorSet:
             raise ScenePriorError(
                 f"scene-prior camera {camera_id!r} has no loaded revision"
             )
-        camera_world, right_world, forward_world = _camera_ground_basis(
+        world_extrinsics = self._scene_world_extrinsics(
+            camera_id,
             extrinsics_col_major,
         )
+        camera_world, right_world, forward_world = _camera_ground_basis(
+            world_extrinsics,
+        )
+        world_frame, world_frame_revision = self._world_frame_metadata(camera_id)
+        frame_binding = self.frame_binding(camera_id)
         floor_y_m = float(revision.manifest.derivation.floor_y_m)
         world_to_camera_local = CameraGroundFrame(
             camera_world_m=camera_world,
@@ -1265,7 +1367,8 @@ class ScenePriorSet:
             "mode": binding.mode,
             "source_type": revision.manifest.source.source_type,
             "source_model": revision.manifest.source.model,
-            "source_coordinate_frame": "backend_world_m",
+            "source_coordinate_frame": world_frame,
+            "source_coordinate_frame_revision": world_frame_revision,
             "target_coordinate_frame": "camera_local_ground_m",
             "transform_semantics": "presentation_only_coordinate_frame_conversion",
             "backend_geometry_mutated": False,
@@ -1283,6 +1386,16 @@ class ScenePriorSet:
                 float(value) for value in forward_world.tolist()
             ],
             "floor_y_m": floor_y_m,
+            "frame_transform_sha256": (
+                frame_binding.target_from_source_sha256
+                if frame_binding is not None
+                else None
+            ),
+            "target_revision_id": (
+                frame_binding.target_revision_id
+                if frame_binding is not None
+                else None
+            ),
             "world_to_camera_local_row_major": world_to_camera_local.tolist(),
             "quality": revision.manifest.quality.model_dump(mode="json"),
             "points": {
@@ -1336,7 +1449,10 @@ class ScenePriorSet:
                 raise ScenePriorError(
                     "canonical PCF presentation requires calibrated camera extrinsics"
                 )
-            geometry = _calibrated_raster_geometry(revision, extrinsics_col_major)
+            geometry = _calibrated_raster_geometry(
+                revision,
+                self._scene_world_extrinsics(camera_id, extrinsics_col_major),
+            )
         else:
             geometry = _preview_raster_geometry(revision)
 
@@ -1400,6 +1516,8 @@ class ScenePriorSet:
             raise ScenePriorError(
                 f"scene-prior {revision.manifest.prior_id} is absent from its catalog"
             )
+        world_frame, world_frame_revision = self._world_frame_metadata(camera_id)
+        frame_binding = self.frame_binding(camera_id)
         presentation_identity: dict[str, Any] = {
             "camera_id": camera_id,
             "scene_prior_only": explicit_scene_prior_only,
@@ -1416,6 +1534,10 @@ class ScenePriorSet:
         result.update(
             {
                 **presentation_identity,
+                "snapshot_id": revision.manifest.prior_id,
+                "snapshot_content_sha256": catalog_entry.manifest_sha256,
+                "world_frame": world_frame,
+                "world_frame_revision": world_frame_revision,
                 "frame": preview.coordinate_frame,
                 "units": preview.units,
                 "bounds": geometry.bounds_payload(),
@@ -1453,7 +1575,18 @@ class ScenePriorSet:
                     "mode": binding.mode,
                     "source_type": revision.manifest.source.source_type,
                     "source_model": revision.manifest.source.model,
-                    "source_frame": "backend_world_m",
+                    "source_frame": world_frame,
+                    "source_frame_revision": world_frame_revision,
+                    "frame_transform_sha256": (
+                        frame_binding.target_from_source_sha256
+                        if frame_binding is not None
+                        else None
+                    ),
+                    "target_revision_id": (
+                        frame_binding.target_revision_id
+                        if frame_binding is not None
+                        else None
+                    ),
                     "target_frame": preview.coordinate_frame,
                     "camera_geometry_source": (
                         "current_calibrated_extrinsics"
@@ -1523,6 +1656,12 @@ class ScenePriorSet:
         bounds = payload.get("bounds")
         if not isinstance(bounds, Mapping):
             raise ScenePriorError("scene-prior composition requires floorplan bounds")
+        world_extrinsics = self._scene_world_extrinsics(
+            camera_id,
+            extrinsics_col_major,
+        )
+        world_frame, world_frame_revision = self._world_frame_metadata(camera_id)
+        frame_binding = self.frame_binding(camera_id)
         live_height = _decode_float32_layer(payload, "height_agl")
         shape = live_height.shape
         try:
@@ -1551,7 +1690,7 @@ class ScenePriorSet:
         )
         x_grid, z_grid = np.meshgrid(local_x, local_z)
         camera_world, right_world, forward_world = _camera_ground_basis(
-            extrinsics_col_major,
+            world_extrinsics,
         )
         world_x = (
             float(camera_world[0])
@@ -1621,7 +1760,18 @@ class ScenePriorSet:
             "mode": binding.mode,
             "source_type": revision.manifest.source.source_type,
             "source_model": revision.manifest.source.model,
-            "source_frame": "backend_world_m",
+            "source_frame": world_frame,
+            "source_frame_revision": world_frame_revision,
+            "frame_transform_sha256": (
+                frame_binding.target_from_source_sha256
+                if frame_binding is not None
+                else None
+            ),
+            "target_revision_id": (
+                frame_binding.target_revision_id
+                if frame_binding is not None
+                else None
+            ),
             "target_frame": "camera_local_ground_m",
             "raster_orientation": CAMERA_LOCAL_RASTER_ORIENTATION,
             "floor_y_m": float(floor_y_m),
@@ -1631,6 +1781,8 @@ class ScenePriorSet:
             "static_fill_cells": int(np.count_nonzero(static_valid & ~live_valid)),
             "composite_observed_cells": int(np.count_nonzero(composite_valid)),
         }
+        result["world_frame"] = world_frame
+        result["world_frame_revision"] = world_frame_revision
         return result
 
     def health_snapshot(self) -> dict[str, Any]:
@@ -1647,6 +1799,12 @@ class ScenePriorSet:
                     "space_id": binding.space_id,
                     "prior_id": binding.prior_id,
                     "include_floorplan_layers": binding.include_floorplan_layers,
+                    "world_frame": (
+                        self._world_frame_metadata(camera_id)[0]
+                    ),
+                    "world_frame_revision": (
+                        self._world_frame_metadata(camera_id)[1]
+                    ),
                 }
                 for camera_id, binding in sorted(self._bindings.items())
             },

@@ -29,6 +29,16 @@ from noesis_core.private_paths import (
     ensure_private_directory,
     validate_private_file,
 )
+from noesis_core.coordinate_frames import (
+    BACKEND_WORLD_FRAME_ID,
+    CoordinateFrameError,
+    MetricFloorPlane,
+    RevisionedFrame,
+    RevisionedFrameTransform,
+    revisioned_frame_sha256,
+    revisioned_transform_sha256,
+)
+from noesis_core.contracts.scene_prior import ScenePriorFrameBinding
 from noesis.metadata.intrinsics import CameraConfigLoader, CameraIntrinsics
 from noesis.calibration.pose_v1 import (
     E_col_major_to_pose_v1,
@@ -63,11 +73,97 @@ class CalibrationSnapshot:
     """Immutable calibration snapshot for a single camera."""
 
     camera_id: str
-    intrinsics: np.ndarray  # 3x3 K matrix
-    extrinsics_col_major: List[float]  # 16 floats, column-major E (world->camera)
+    intrinsics: np.ndarray  # read-only 3x3 K matrix
+    extrinsics_col_major: Tuple[float, ...]  # 16 floats, column-major E (world->camera)
     floor_y: float  # meters
     image_size: Tuple[int, int]  # (width, height)
     unit_scale: float = 1.0  # s_obj_to_m
+    frame_contract: RevisionedFrameTransform | None = None
+    camera_calibration_sha256: str | None = None
+    world_alignment_sha256: str | None = None
+    scene_prior_id: str | None = None
+    target_revision_id: str | None = None
+
+    @property
+    def calibration_frame(self) -> RevisionedFrame | None:
+        contract = self.frame_contract
+        return contract.source_frame if contract is not None else None
+
+    @property
+    def world_frame(self) -> RevisionedFrame | None:
+        contract = self.frame_contract
+        return contract.target_frame if contract is not None else None
+
+    @property
+    def world_extrinsics_col_major(self) -> Tuple[float, ...]:
+        contract = self.frame_contract
+        if contract is None:
+            return tuple(float(value) for value in self.extrinsics_col_major)
+        return contract.camera_from_target_col_major(self.extrinsics_col_major)
+
+    @property
+    def world_floor_y(self) -> float:
+        contract = self.frame_contract
+        if contract is None:
+            return float(self.floor_y)
+        return contract.target_floor_plane.horizontal_y_m
+
+    def world_estimator_view(self) -> "WorldCalibrationSnapshot":
+        """Return the explicit target-frame view used by live world estimation."""
+
+        contract = self.frame_contract
+        if contract is None:
+            raise CalibrationValidationError(
+                f"{self.camera_id}: revision-bound frame contract is unavailable"
+            )
+        return WorldCalibrationSnapshot(
+            camera_id=self.camera_id,
+            intrinsics=self.intrinsics,
+            extrinsics_col_major=self.world_extrinsics_col_major,
+            floor_y=self.world_floor_y,
+            image_size=self.image_size,
+            unit_scale=self.unit_scale,
+            calibration_extrinsics_col_major=tuple(
+                float(value) for value in self.extrinsics_col_major
+            ),
+            calibration_floor_y=float(self.floor_y),
+            calibration_frame_id=contract.source_frame.frame_id,
+            calibration_frame_revision=contract.source_frame.revision,
+            world_frame_id=contract.target_frame.frame_id,
+            world_frame_revision=contract.target_frame.revision,
+            frame_transform_sha256=contract.transform_sha256,
+            floor_plane_normal=contract.target_floor_plane.normal,
+            floor_plane_offset_m=contract.target_floor_plane.offset_m,
+            camera_calibration_sha256=self.camera_calibration_sha256,
+            world_alignment_sha256=self.world_alignment_sha256,
+            scene_prior_id=self.scene_prior_id,
+            target_revision_id=self.target_revision_id,
+        )
+
+
+@dataclass(frozen=True)
+class WorldCalibrationSnapshot:
+    """Target-frame camera/floor view for the live world estimator only."""
+
+    camera_id: str
+    intrinsics: np.ndarray
+    extrinsics_col_major: Tuple[float, ...]
+    floor_y: float
+    image_size: Tuple[int, int]
+    unit_scale: float
+    calibration_extrinsics_col_major: Tuple[float, ...]
+    calibration_floor_y: float
+    calibration_frame_id: str
+    calibration_frame_revision: str
+    world_frame_id: str
+    world_frame_revision: str
+    frame_transform_sha256: str
+    floor_plane_normal: Tuple[float, float, float]
+    floor_plane_offset_m: float
+    camera_calibration_sha256: str | None = None
+    world_alignment_sha256: str | None = None
+    scene_prior_id: str | None = None
+    target_revision_id: str | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -83,6 +179,14 @@ def _read_json(path: str) -> Optional[Dict[str, Any]]:
             return json.load(f)
     except Exception:
         return None
+
+
+def _sha256_file(path: Path, *, label: str) -> str:
+    try:
+        payload = path.read_bytes()
+    except OSError as exc:
+        raise CalibrationValidationError(f"{label} cannot be read: {path}") from exc
+    return hashlib.sha256(payload).hexdigest()
 
 
 def _write_json(path: str, data: Dict[str, Any]) -> bool:
@@ -398,6 +502,9 @@ class CalibrationManager:
         ply_alignment_json_path: Path,
         streammux_size: Tuple[int, int] = (1920, 1080),
         raw_audit_dir: Path | None = None,
+        scene_prior_frame_bindings: Mapping[
+            str, ScenePriorFrameBinding
+        ] | None = None,
     ) -> None:
         self._cameras_yaml_path = Path(cameras_yaml_path)
         self._camera_calibration_path = Path(camera_calibration_json_path)
@@ -420,12 +527,25 @@ class CalibrationManager:
         self._align: Dict[str, Any] = {}
         self._camera_labels: Dict[int, str] = {}  # source_id -> camera_name
         self._bundle_cache: Optional[Dict[str, Any]] = None
+        self._snapshot_cache: Dict[Tuple[int, str], CalibrationSnapshot] = {}
+        self._world_snapshot_cache: Dict[Tuple[int, str], WorldCalibrationSnapshot] = {}
+        self._snapshot_intrinsics: Dict[Tuple[int, str], CameraIntrinsics] = {}
+        self._scene_prior_frame_bindings = {
+            str(camera_id): binding
+            for camera_id, binding in dict(
+                scene_prior_frame_bindings or {}
+            ).items()
+        }
+        self._frame_contracts: Dict[str, RevisionedFrameTransform] = {}
+        self._camera_calibration_sha256 = ""
+        self._world_alignment_sha256 = ""
         pose_only_env = str(os.environ.get("NOESIS_CALIBRATION_POSE_ONLY", "1") or "").strip().lower()
         self._pose_only = pose_only_env in ("1", "true", "yes", "on", "y")
 
         # Load initial data
         self._load_alignment()
         self._load_extrinsics()
+        self._load_frame_contracts()
 
         # Optional callback for derived artifact regeneration (V3DT camInfo)
         self._on_extrinsics_changed: Optional[Callable[[str], None]] = None
@@ -439,6 +559,7 @@ class CalibrationManager:
         with self._lock:
             self._camera_labels = dict(labels or {})
             self._bundle_cache = None
+            self._invalidate_snapshot_cache()
 
     def pose_only_enabled(self) -> bool:
         return bool(self._pose_only)
@@ -459,6 +580,10 @@ class CalibrationManager:
             if isinstance(self._align.get("scene_similarity"), dict):
                 data["scene_similarity"] = dict(self._align["scene_similarity"])
             return data
+
+    def frame_contract(self, camera_id: str) -> RevisionedFrameTransform:
+        with self._lock:
+            return self._frame_contract_for_camera(str(camera_id))
 
     def set_on_extrinsics_changed(self, callback: Optional[Callable[[str], None]]) -> None:
         """Set callback to invoke when extrinsics change (for V3DT camInfo regeneration)."""
@@ -518,28 +643,35 @@ class CalibrationManager:
     def reload_extrinsics(self) -> None:
         """Reload extrinsics from camera_calibration.json."""
         with self._lock:
+            self._invalidate_snapshot_cache()
             self._load_extrinsics()
+            self._load_frame_contracts()
             self._bundle_cache = None
 
     def reload_alignment(self) -> None:
         """Reload alignment from ply_alignment.json."""
         with self._lock:
+            self._invalidate_snapshot_cache()
             self._load_alignment()
             self._load_extrinsics()
+            self._load_frame_contracts()
             self._bundle_cache = None
 
     def reload_intrinsics(self) -> None:
         """Invalidate and reload intrinsics from cameras.yaml."""
         with self._lock:
+            self._invalidate_snapshot_cache()
             self._intrinsics_loader.invalidate()
             self._bundle_cache = None
 
     def reload_all(self) -> None:
         """Reload all calibration data."""
         with self._lock:
+            self._invalidate_snapshot_cache()
             self._intrinsics_loader.invalidate()
             self._load_alignment()
             self._load_extrinsics()
+            self._load_frame_contracts()
             self._bundle_cache = None
 
     # -----------------------------------------------------------------------
@@ -549,7 +681,15 @@ class CalibrationManager:
     def snapshot(self, source_id: int, camera_id: str) -> Optional[CalibrationSnapshot]:
         """Get calibration snapshot for a camera, with K scaled to streammux resolution."""
         with self._lock:
+            cache_key = (int(source_id), str(camera_id))
             intr = self._intrinsics_loader.get(source_id)
+            cached = self._snapshot_cache.get(cache_key)
+            if cached is not None and self._snapshot_intrinsics.get(cache_key) == intr:
+                return cached
+            if cached is not None:
+                # CameraConfigLoader hot-reloads by mtime.  Do not let a
+                # changed intrinsics entry leave any other snapshot stale.
+                self._invalidate_snapshot_cache()
             if intr is None:
                 _LOGGER.warning("snapshot: no intrinsics for source_id=%d camera_id=%s", source_id, camera_id)
                 return None
@@ -564,6 +704,9 @@ class CalibrationManager:
             except CalibrationValidationError as exc:
                 _LOGGER.error("snapshot validation failed: %s", exc)
                 return None
+            # Cached snapshots are shared across all consumers.  Keep the
+            # matrix read-only so a caller cannot corrupt the cached value.
+            K.setflags(write=False)
 
             # Get extrinsics
             E = self._get_E(camera_id)
@@ -580,15 +723,62 @@ class CalibrationManager:
 
             floor_y = float(self._align.get("floor_y", 0.0) or 0.0)
             unit_scale = 1.0
+            frame_contract = self._frame_contract_for_camera(camera_id)
+            frame_binding = self._scene_prior_frame_bindings.get(camera_id)
 
-            return CalibrationSnapshot(
+            snapshot = CalibrationSnapshot(
                 camera_id=camera_id,
                 intrinsics=K,
-                extrinsics_col_major=list(E),
+                extrinsics_col_major=tuple(float(value) for value in E),
                 floor_y=floor_y,
                 image_size=self._streammux_size,
                 unit_scale=unit_scale,
+                frame_contract=frame_contract,
+                camera_calibration_sha256=self._camera_calibration_sha256,
+                world_alignment_sha256=self._world_alignment_sha256,
+                scene_prior_id=(
+                    frame_binding.target_frame.revision
+                    if frame_binding is not None
+                    else None
+                ),
+                target_revision_id=(
+                    frame_binding.target_revision_id
+                    if frame_binding is not None
+                    else None
+                ),
             )
+            self._snapshot_cache[cache_key] = snapshot
+            self._snapshot_intrinsics[cache_key] = intr
+            return snapshot
+
+    def _invalidate_snapshot_cache(self) -> None:
+        """Drop raw/active snapshots as one atomic calibration generation."""
+
+        self._snapshot_cache.clear()
+        self._world_snapshot_cache.clear()
+        self._snapshot_intrinsics.clear()
+
+    def world_snapshot(
+        self,
+        source_id: int,
+        camera_id: str,
+    ) -> Optional[WorldCalibrationSnapshot]:
+        """Get the explicit target-frame calibration for live world estimation."""
+
+        with self._lock:
+            # Resolve the raw snapshot first.  Besides sharing its cache, this
+            # observes CameraConfigLoader's mtime-based hot reload before an
+            # active-frame cache hit can be returned.
+            snapshot = self.snapshot(source_id, camera_id)
+            if snapshot is None:
+                return None
+            cache_key = (int(source_id), str(camera_id))
+            cached = self._world_snapshot_cache.get(cache_key)
+            if cached is not None:
+                return cached
+            world_snapshot = snapshot.world_estimator_view()
+            self._world_snapshot_cache[cache_key] = world_snapshot
+            return world_snapshot
 
     # -----------------------------------------------------------------------
     # Public API: Bundle
@@ -607,6 +797,7 @@ class CalibrationManager:
             k_table: Dict[str, List[float]] = {}
             e_table: Dict[str, List[float]] = {}
             pose_table: Dict[str, Dict[str, Any]] = {}
+            frame_table: Dict[str, Dict[str, Any]] = {}
 
             units = self._align.get("units") or {}
             s_obj_to_m = float(units.get("s_obj_to_m", 1.0) or 1.0)
@@ -625,6 +816,47 @@ class CalibrationManager:
                 pose = self._get_pose(cam_name)
                 if isinstance(pose, dict):
                     pose_table[cam_name] = dict(pose)
+                try:
+                    contract = self._frame_contract_for_camera(cam_name)
+                except CalibrationValidationError:
+                    continue
+                binding = self._scene_prior_frame_bindings.get(cam_name)
+                frame_table[cam_name] = {
+                    "contract": "noesis.calibration.frame_binding",
+                    "contract_version": 1,
+                    "calibration_frame": {
+                        "frame_id": contract.source_frame.frame_id,
+                        "revision": contract.source_frame.revision,
+                    },
+                    "world_frame": {
+                        "frame_id": contract.target_frame.frame_id,
+                        "revision": contract.target_frame.revision,
+                    },
+                    "target_from_calibration_col_major": list(
+                        contract.target_from_source_col_major
+                    ),
+                    "transform_sha256": contract.transform_sha256,
+                    "calibration_floor_plane": {
+                        "normal": list(contract.source_floor_plane.normal),
+                        "offset_m": contract.source_floor_plane.offset_m,
+                    },
+                    "world_floor_plane": {
+                        "normal": list(contract.target_floor_plane.normal),
+                        "offset_m": contract.target_floor_plane.offset_m,
+                    },
+                    "camera_calibration_sha256": self._camera_calibration_sha256,
+                    "world_alignment_sha256": self._world_alignment_sha256,
+                    "scene_prior_id": (
+                        binding.target_frame.revision
+                        if binding is not None
+                        else None
+                    ),
+                    "target_revision_id": (
+                        binding.target_revision_id
+                        if binding is not None
+                        else None
+                    ),
+                }
 
             # Alignment
             align_matrix = self._align.get("matrix")
@@ -644,6 +876,7 @@ class CalibrationManager:
                     "E": e_table,
                     "pose": pose_table,
                     "pose_confidence": {},
+                    "frame_bindings": frame_table,
                 },
                 "meta": {
                     "version": 3,
@@ -651,6 +884,8 @@ class CalibrationManager:
                     "coord_space": POSE_V1_FRAME_BACKEND_WORLD_M,
                     "units": "meters",
                     "world_frame": POSE_V1_FRAME_BACKEND_WORLD_M,
+                    "world_frame_contract": "revision_bound_per_camera_v1",
+                    "cameras_E_semantics": "camera_from_calibration_frame_raw",
                     "scene_per_m": float(1.0 / s_obj_to_m) if math.isfinite(s_obj_to_m) and s_obj_to_m > 1e-9 else 1.0,
                 },
                 "metric_scale": 1.0,
@@ -848,6 +1083,11 @@ class CalibrationManager:
         E_to_save, units_note = self._coerce_extrinsics_translation_to_meters(camera_id, E_to_save)
         if units_note:
             _LOGGER.warning("set_extrinsics: coerced translation units for %s: %s", camera_id, units_note)
+        if self._scene_prior_frame_bindings:
+            return {
+                "ok": False,
+                "error": "revision_bound_frame_contract_requires_atomic_regeneration",
+            }
         try:
             self._log_raw_extrinsics_payload(camera_id, raw_kind, raw_payload, E_to_save, units_note)
         except Exception:
@@ -919,6 +1159,12 @@ class CalibrationManager:
             except CalibrationValidationError as exc:
                 return {"ok": False, "error": str(exc)}
 
+        if self._scene_prior_frame_bindings:
+            return {
+                "ok": False,
+                "error": "revision_bound_frame_contract_requires_atomic_regeneration",
+            }
+
         # Persist
         if not self._save_alignment(align_update):
             return {"ok": False, "error": "persist_failed"}
@@ -931,6 +1177,122 @@ class CalibrationManager:
     # -----------------------------------------------------------------------
     # Internal: Loading
     # -----------------------------------------------------------------------
+
+    def _identity_frame_contract(self) -> RevisionedFrameTransform:
+        revision = revisioned_frame_sha256(
+            BACKEND_WORLD_FRAME_ID,
+            artifact_sha256s=(
+                self._camera_calibration_sha256,
+                self._world_alignment_sha256,
+            ),
+        )
+        frame = RevisionedFrame(
+            frame_id=BACKEND_WORLD_FRAME_ID,
+            revision=revision,
+        )
+        identity = tuple(float(value) for value in np.eye(4).flatten(order="F"))
+        floor_y = float(self._align.get("floor_y", 0.0) or 0.0)
+        plane = MetricFloorPlane(
+            frame=frame,
+            normal=(0.0, 1.0, 0.0),
+            offset_m=-floor_y,
+        )
+        return RevisionedFrameTransform(
+            source_frame=frame,
+            target_frame=frame,
+            target_from_source_col_major=identity,
+            transform_sha256=revisioned_transform_sha256(
+                frame,
+                frame,
+                identity,
+            ),
+            source_floor_plane=plane,
+            target_floor_plane=plane,
+        )
+
+    def _load_frame_contracts(self) -> None:
+        """Bind current calibration artifacts to explicit raw/active frame edges."""
+
+        # Frame bindings are part of both raw and active snapshot semantics.
+        # Clear before rebuilding so a validation failure can never leave the
+        # previous generation available to a concurrent caller.
+        self._invalidate_snapshot_cache()
+        self._camera_calibration_sha256 = _sha256_file(
+            self._camera_calibration_path,
+            label="camera calibration",
+        )
+        self._world_alignment_sha256 = _sha256_file(
+            self._ply_alignment_path,
+            label="world alignment",
+        )
+        raw_contract = self._identity_frame_contract()
+        cameras = self._extrinsics.get("cameras")
+        if not isinstance(cameras, Mapping):
+            cameras = {}
+        contracts: Dict[str, RevisionedFrameTransform] = {
+            str(camera_id): raw_contract for camera_id in cameras
+        }
+        for camera_id, raw_binding in self._scene_prior_frame_bindings.items():
+            try:
+                binding = (
+                    raw_binding
+                    if isinstance(raw_binding, ScenePriorFrameBinding)
+                    else ScenePriorFrameBinding.model_validate(raw_binding)
+                )
+            except Exception as exc:
+                raise CalibrationValidationError(
+                    f"{camera_id}: scene-prior frame binding is invalid: {exc}"
+                ) from exc
+            self._scene_prior_frame_bindings[camera_id] = binding
+            if camera_id not in cameras:
+                raise CalibrationValidationError(
+                    f"{camera_id}: scene-prior frame binding has no camera calibration"
+                )
+            if (
+                binding.source_camera_calibration_sha256
+                != self._camera_calibration_sha256
+            ):
+                raise CalibrationValidationError(
+                    f"{camera_id}: scene-prior frame binding calibration revision mismatch"
+                )
+            if (
+                binding.source_world_alignment_sha256
+                != self._world_alignment_sha256
+            ):
+                raise CalibrationValidationError(
+                    f"{camera_id}: scene-prior frame binding world-alignment revision mismatch"
+                )
+            if binding.source_frame.revision != raw_contract.source_frame.revision:
+                raise CalibrationValidationError(
+                    f"{camera_id}: scene-prior source frame revision mismatch"
+                )
+            try:
+                contract = binding.frame_transform()
+                E = cameras[camera_id].get("E")
+                if not isinstance(E, list) or len(E) != 16:
+                    raise CoordinateFrameError(
+                        "camera calibration has no usable extrinsics"
+                    )
+                world_E = list(contract.camera_from_target_col_major(E))
+                _validate_E(world_E, camera_id)
+                contract.target_floor_plane.horizontal_y_m
+            except (CoordinateFrameError, CalibrationValidationError) as exc:
+                raise CalibrationValidationError(
+                    f"{camera_id}: scene-prior frame binding cannot drive world estimation: {exc}"
+                ) from exc
+            contracts[camera_id] = contract
+        self._frame_contracts = contracts
+
+    def _frame_contract_for_camera(
+        self,
+        camera_id: str,
+    ) -> RevisionedFrameTransform:
+        contract = self._frame_contracts.get(str(camera_id))
+        if contract is None:
+            raise CalibrationValidationError(
+                f"{camera_id}: revision-bound frame contract is unavailable"
+            )
+        return contract
 
     def _load_extrinsics(self) -> None:
         """Load extrinsics from camera_calibration.json."""
@@ -1235,6 +1597,9 @@ def create_calibration_manager(
     camera_calibration_json_path: str | Path,
     ply_alignment_json_path: str | Path,
     camera_labels: Mapping[int, str] | None = None,
+    scene_prior_frame_bindings: Mapping[
+        str, ScenePriorFrameBinding
+    ] | None = None,
 ) -> CalibrationManager:
     """Construct the one calibration authority used by live and offline paths."""
 
@@ -1263,6 +1628,7 @@ def create_calibration_manager(
         camera_calibration_json_path=extrinsics_path,
         ply_alignment_json_path=alignment_path,
         streammux_size=streammux_size_from_pipeline_config(pipeline_config),
+        scene_prior_frame_bindings=scene_prior_frame_bindings,
     )
     manager.set_camera_labels(labels)
     return manager

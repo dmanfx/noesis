@@ -88,8 +88,8 @@ class Wholebody49ProfileTests(unittest.TestCase):
 
             mask_osd = runtime_config.derive_osd_policy_from_ini(small_props)
             box_osd = runtime_config.derive_osd_policy_from_ini(large_props)
-            self.assertEqual(mask_osd, {"process-mode": 0, "display-mask": 1, "display-bbox": 1, "display-text": 1})
-            self.assertEqual(box_osd, {"process-mode": 0, "display-mask": 0, "display-bbox": 1, "display-text": 1})
+            self.assertEqual(mask_osd, {"process-mode": 1, "display-mask": 1, "display-bbox": 1, "display-text": 1})
+            self.assertEqual(box_osd, {"process-mode": 1, "display-mask": 0, "display-bbox": 1, "display-text": 1})
 
     def test_contract_validator_rejects_tensor_or_mask_drift(self) -> None:
         mask_props = dict(_properties(DS9_ROOT / "pipelines" / "config_infer_primary_deimv2_wholebody49_masks.template.ini"))

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import threading
 from pathlib import Path
 
 import pytest
@@ -372,3 +373,258 @@ def test_evidence_writer_refuses_shared_parent_and_links_without_chmod(
             runtime="test",
         )
     assert real.stat().st_mode & 0o777 == 0o600
+
+
+def test_async_evidence_writer_is_ordered_and_flushes_durably(tmp_path: Path) -> None:
+    path = tmp_path / "async" / "evidence.jsonl"
+    recorder = IdentityEvidenceRecorder(
+        path,
+        session_id="session-a",
+        source="shadow",
+        runtime="replay",
+        async_mode=True,
+        queue_capacity=4,
+    )
+    try:
+        _append_unknown(recorder, frame=1, observed_at_us=1)
+        _append_unknown(recorder, frame=2, observed_at_us=2)
+        assert recorder.health().pending_event_count >= 0
+        recorder.flush()
+        rows = [json.loads(line) for line in path.read_text().splitlines()]
+        assert [row["sequence"] for row in rows] == [0, 1]
+        assert recorder.health().pending_event_count == 0
+        assert recorder.health().failed is False
+    finally:
+        recorder.close()
+
+
+def test_async_health_keeps_durability_boundary_explicit_while_writer_is_blocked(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "async" / "evidence.jsonl"
+    recorder = IdentityEvidenceRecorder(
+        path,
+        session_id="session-a",
+        source="shadow",
+        runtime="replay",
+        async_mode=True,
+    )
+    started = threading.Event()
+    release = threading.Event()
+    original_append = recorder._append_payload
+
+    def blocked_append(payload: bytes) -> None:
+        started.set()
+        assert release.wait(timeout=30.0)
+        original_append(payload)
+
+    recorder._append_payload = blocked_append  # type: ignore[method-assign]
+    try:
+        _append_unknown(recorder, frame=1, observed_at_us=1)
+        assert started.wait(timeout=2.0)
+        health = recorder.health()
+        assert health.recorded_event_count == 0
+        assert health.last_observed_at_us is None
+        assert health.pending_event_count == 1
+        release.set()
+        recorder.flush()
+        assert recorder.health().recorded_event_count == 1
+    finally:
+        release.set()
+        recorder.close()
+
+
+def test_async_reservations_reconcile_after_retention(tmp_path: Path) -> None:
+    path = tmp_path / "async" / "evidence.jsonl"
+    recorder = IdentityEvidenceRecorder(
+        path,
+        session_id="session-a",
+        source="shadow",
+        runtime="replay",
+        async_mode=True,
+        max_records=2,
+    )
+    try:
+        for frame in range(8):
+            _append_unknown(recorder, frame=frame, observed_at_us=frame + 1)
+        recorder.flush()
+        assert recorder.health().recorded_event_count == 2
+        assert len(recorder._reserved_event_ids) == 2
+    finally:
+        recorder.close()
+
+
+def test_async_writer_failure_is_health_visible_and_next_append_fails(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "async" / "evidence.jsonl"
+    recorder = IdentityEvidenceRecorder(
+        path,
+        session_id="session-a",
+        source="shadow",
+        runtime="replay",
+        async_mode=True,
+    )
+
+    def fail_append(_payload: bytes) -> None:
+        raise OSError("synthetic evidence disk failure")
+
+    recorder._append_payload = fail_append  # type: ignore[method-assign]
+    try:
+        _append_unknown(recorder, frame=1, observed_at_us=1)
+        for _ in range(100):
+            if recorder.health().failed:
+                break
+            threading.Event().wait(0.001)
+        health = recorder.health()
+        assert health.failed is True
+        assert "synthetic evidence disk failure" in (health.last_error or "")
+        with pytest.raises(IdentityEvidenceError, match="synthetic evidence"):
+            _append_unknown(recorder, frame=2, observed_at_us=2)
+    finally:
+        with pytest.raises(IdentityEvidenceError, match="synthetic evidence"):
+            recorder.close()
+
+
+def test_async_close_closes_admission_and_is_idempotent(tmp_path: Path) -> None:
+    recorder = IdentityEvidenceRecorder(
+        tmp_path / "async" / "evidence.jsonl",
+        session_id="session-a",
+        source="shadow",
+        runtime="replay",
+        async_mode=True,
+    )
+    recorder.close()
+    recorder.close()
+    with pytest.raises(IdentityEvidenceError, match="closed"):
+        _append_unknown(recorder, frame=1, observed_at_us=1)
+
+
+def test_async_close_admission_wins_against_concurrent_append(tmp_path: Path) -> None:
+    recorder = IdentityEvidenceRecorder(
+        tmp_path / "async" / "evidence.jsonl",
+        session_id="session-a",
+        source="shadow",
+        runtime="replay",
+        async_mode=True,
+    )
+    started = threading.Event()
+    release = threading.Event()
+    original_append = recorder._append_payload
+
+    def blocked_append(payload: bytes) -> None:
+        started.set()
+        assert release.wait(timeout=30.0)
+        original_append(payload)
+
+    recorder._append_payload = blocked_append  # type: ignore[method-assign]
+    _append_unknown(recorder, frame=1, observed_at_us=1)
+    assert started.wait(timeout=2.0)
+    close_done = threading.Event()
+
+    def close_recorder() -> None:
+        try:
+            recorder.close()
+        finally:
+            close_done.set()
+
+    closer = threading.Thread(target=close_recorder)
+    closer.start()
+    for _ in range(100):
+        with recorder._lock:
+            if recorder._admission_closed:
+                break
+        threading.Event().wait(0.001)
+    with pytest.raises(IdentityEvidenceError, match="closed"):
+        _append_unknown(recorder, frame=2, observed_at_us=2)
+    release.set()
+    closer.join(timeout=5.0)
+    assert close_done.is_set()
+
+
+def test_async_close_surfaces_failure_that_occurs_during_drain(tmp_path: Path) -> None:
+    recorder = IdentityEvidenceRecorder(
+        tmp_path / "async" / "evidence.jsonl",
+        session_id="session-a",
+        source="shadow",
+        runtime="replay",
+        async_mode=True,
+        queue_capacity=2,
+    )
+    first_started = threading.Event()
+    release_first = threading.Event()
+    calls = 0
+    original_append = recorder._append_payload
+
+    def block_then_fail(payload: bytes) -> None:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            first_started.set()
+            assert release_first.wait(timeout=30.0)
+            original_append(payload)
+            return
+        raise OSError("synthetic final evidence failure")
+
+    recorder._append_payload = block_then_fail  # type: ignore[method-assign]
+    _append_unknown(recorder, frame=1, observed_at_us=1)
+    assert first_started.wait(timeout=2.0)
+    _append_unknown(recorder, frame=2, observed_at_us=2)
+    outcome: list[BaseException] = []
+    done = threading.Event()
+
+    def close_recorder() -> None:
+        try:
+            recorder.close()
+        except BaseException as exc:  # capture the required close failure
+            outcome.append(exc)
+        finally:
+            done.set()
+
+    closer = threading.Thread(target=close_recorder)
+    closer.start()
+    release_first.set()
+    closer.join(timeout=5.0)
+    assert done.is_set(), "close hung while writer failed during drain"
+    assert outcome and isinstance(outcome[0], IdentityEvidenceError)
+    assert "synthetic final evidence failure" in str(outcome[0])
+
+
+def test_async_evidence_queue_drop_is_explicit_and_chain_remains_contiguous(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "async" / "evidence.jsonl"
+    recorder = IdentityEvidenceRecorder(
+        path,
+        session_id="session-a",
+        source="shadow",
+        runtime="replay",
+        async_mode=True,
+        queue_capacity=2,
+    )
+    started = threading.Event()
+    release = threading.Event()
+    original_append = recorder._append_payload
+
+    def blocked_append(payload: bytes) -> None:
+        started.set()
+        assert release.wait(timeout=30.0)
+        original_append(payload)
+
+    recorder._append_payload = blocked_append  # type: ignore[method-assign]
+    try:
+        _append_unknown(recorder, frame=1, observed_at_us=1)
+        assert started.wait(timeout=2.0)
+        _append_unknown(recorder, frame=2, observed_at_us=2)
+        _append_unknown(recorder, frame=3, observed_at_us=3)
+        health = recorder.health()
+        assert health.dropped_event_count == 1
+        assert health.failed is False
+        release.set()
+        recorder.flush()
+        rows = [json.loads(line) for line in path.read_text().splitlines()]
+        assert [row["sequence"] for row in rows] == [0, 1]
+        assert load_evidence_checkpoint(path).next_sequence == 2
+    finally:
+        release.set()
+        recorder.close()

@@ -165,6 +165,11 @@ class IdentityEvidenceStatusResponse(BaseModel):
     max_bytes: Optional[int] = None
     max_age_s: Optional[float] = None
     pruned_event_count: int = 0
+    pending_event_count: int = 0
+    pending_frame_count: int = 0
+    dropped_event_count: int = 0
+    failed: bool = False
+    last_error: Optional[str] = None
     contains_embeddings: bool = False
 
 
@@ -430,6 +435,11 @@ def identity_v2_evidence_status(request: Request) -> IdentityEvidenceStatusRespo
                 max_bytes=getattr(row, "max_bytes", None),
                 max_age_s=getattr(row, "max_age_s", None),
                 pruned_event_count=int(getattr(row, "pruned_event_count", 0)),
+                pending_event_count=int(getattr(row, "pending_event_count", 0)),
+                pending_frame_count=int(getattr(row, "pending_frame_count", 0)),
+                dropped_event_count=int(getattr(row, "dropped_event_count", 0)),
+                failed=bool(getattr(row, "failed", False)),
+                last_error=getattr(row, "last_error", None),
             )
     mark_rest_response(
         request,

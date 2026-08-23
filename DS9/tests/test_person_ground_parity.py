@@ -196,7 +196,7 @@ class PersonGroundParityTests(unittest.TestCase):
         ds8 = _characterize(REPO_ROOT)
         ds9 = _characterize(DS9_ROOT)
         self.assertEqual(ds9, ds8)
-        self.assertEqual(ds9["candidate_source"], "pose_hip_floor")
+        self.assertEqual(ds9["candidate_source"], "pose_ankle_floor")
         self.assertEqual(ds9["state_owner"], "noesis.telemetry.person_ground_state")
         self.assertEqual(ds9["prediction"]["prior"], [1.1, 0.0, 1.95])
 

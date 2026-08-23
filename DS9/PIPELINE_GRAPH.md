@@ -1,6 +1,6 @@
 # Canonical DeepStream 9.1 pipeline graph
 
-Status: native baseline, 2026-08-15. Source of truth:
+Status: native baseline, 2026-08-23. Source of truth:
 `DS9/config/infer.yaml` plus `DS9/noesis/pipelines/`.
 
 ## Video graph
@@ -10,7 +10,7 @@ flowchart TB
     L[Living Room nvurisrcbin] --> LD[G3 dewarp 1080]
     K[Kitchen nvurisrcbin] --> KD[G3 dewarp 1080]
     F[Family Room nvurisrcbin] --> FD[G4 dewarp 720→1080]
-    LD --> MUX[nvstreammux 3×1920×1080]
+    LD --> MUX[nvstreammux 3×1920×1080 · pool 8]
     KD --> MUX
     FD --> MUX
 
@@ -25,13 +25,13 @@ flowchart TB
     ANALYTICS --> REID[Swin ReID · GIE 3]
     REID --> POSE[YOLO26 pose · GIE 4]
     POSE --> WORLD[observation · identity · world hooks]
-    WORLD --> TILER[nvmultistreamtiler]
-    TILER --> OSD[nvosdbin GPU mode]
+    WORLD --> TILER[nvmultistreamtiler · pool 8]
+    TILER --> OSD[nvdsosd GPU · process-mode 1]
     OSD --> ENCODE[nvv4l2h264enc]
     ENCODE --> SHM[private SHM H.264]
     SHM --> WEBRTC[WebRTC media gateway]
 
-    TEE --> Q2[queue]
+    TEE --> Q2[latest-only queue · max 2 · leaky downstream]
     Q2 --> DAV2[DAv2 full-frame · GIE 5]
     DAV2 --> OBJDEPTH[object-depth fusion]
     OBJDEPTH --> WORLD
@@ -67,8 +67,25 @@ provides dots and trails. PCF does not synthesize people.
   720-to-1080 dewarper.
 - Calibrated validity masks exclude pixels outside the fisheye image circle.
 - `nvstreammux`: batch 3, 1920×1080, live source, 40,000 µs timeout, NVMM.
-- Each sink/tee branch is queued and configured for non-blocking live state
-  transitions.
+- `nvstreammux` and `nvmultistreamtiler` each use an explicit eight-surface
+  pool; GPU OSD is `process-mode=1` on the installed DS9.1 stack.
+- The authoritative tracking/OSD/encode path is lossless within its declared
+  pipeline contract. The secondary DAv2 branch uses a two-buffer
+  downstream-leaky latest-only queue so it cannot back-pressure that path.
+- MapAnything remains closed outside startup negotiation or an admitted manual
+  capture. Its branch queue does not grant it live tracking authority.
+
+## Hot-path contract
+
+- Full video surfaces remain in NVMM/GPU memory through OSD and encode.
+- DAv2 alignment/readiness uses pooled private CUDA resources and query-only
+  completion; compact per-person readbacks use reusable pinned host buffers.
+- Optional depth/evidence/persistence work bounds its own queue and freshness.
+  Canonical tracking/world/BEV publication remains exact, ordered, and
+  revision-bound rather than latest-only.
+- Models, resolution, and inference cadence are part of the accepted baseline.
+  See [`../docs/performance_invariants.md`](../docs/performance_invariants.md)
+  before changing the graph or callback path.
 
 ## Inference roles
 

@@ -464,6 +464,7 @@ def test_coordinator_restart_reacquires_durable_visitor_without_remint(
             reopened_store,
             model_fingerprint=FINGERPRINT,
             embedding_dim=DIMENSION,
+            clock=lambda: 3.0,
         )
         restarted = IdentityFrameCoordinator(reopened_runtime, config=config)
         result = restarted.process_frame(

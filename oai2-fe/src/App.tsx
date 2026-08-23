@@ -34,6 +34,11 @@ import {
   shouldAdmitFloorplan,
   type DepthPanelRefreshAction,
 } from './lib/depthPanelWorkflow';
+import {
+  admitBevFrame,
+  bevMatchesFloorplan,
+  clearBevForStatus,
+} from './lib/bevPayloadAdmission.js';
 
 const WS_URL = noesisWebSocketUrl();
 const REST_URL = NOESIS_REST_BASE;
@@ -481,34 +486,6 @@ function Dashboard() {
     return true;
   };
 
-  const mergeBevMetaPayload = (prevPayload: BevMeta | undefined, payload: BevMeta): BevMeta => {
-    if (!prevPayload) return payload;
-    const merged: BevMeta = { ...prevPayload, ...payload };
-    if (!Array.isArray(payload.footpoints) && Array.isArray(prevPayload.footpoints)) {
-      merged.footpoints = prevPayload.footpoints;
-    }
-    if (!Array.isArray(payload.trails) && Array.isArray(prevPayload.trails)) {
-      merged.trails = prevPayload.trails;
-    }
-    if (typeof payload.xMin !== 'number' && typeof prevPayload.xMin === 'number') merged.xMin = prevPayload.xMin;
-    if (typeof payload.xMax !== 'number' && typeof prevPayload.xMax === 'number') merged.xMax = prevPayload.xMax;
-    if (typeof payload.zMin !== 'number' && typeof prevPayload.zMin === 'number') merged.zMin = prevPayload.zMin;
-    if (typeof payload.zMax !== 'number' && typeof prevPayload.zMax === 'number') merged.zMax = prevPayload.zMax;
-    if (payload.type === 'bev-frame' && !Object.prototype.hasOwnProperty.call(payload, 'error')) {
-      delete merged.error;
-    }
-    if (payload.type === 'bev-frame' && !Object.prototype.hasOwnProperty.call(payload, 'details')) {
-      delete merged.details;
-    }
-    if (payload.type === 'bev-frame' && !Object.prototype.hasOwnProperty.call(payload, 'fallbackActive')) {
-      merged.fallbackActive = false;
-      delete merged.fallbackTrackCount;
-      delete merged.fallbackSources;
-      delete merged.fallbackReasonCounts;
-    }
-    return merged;
-  };
-
   const normalizeBevMetaForDisplay = useCallback((cam: CameraKey, payload: BevMeta, mode: BevFrameMode): BevMeta => {
     const isWorldMode = mode === 'world';
     if (!isWorldMode) return payload;
@@ -536,7 +513,16 @@ function Dashboard() {
       if (!projected) return point;
 
       didProject = true;
-      return { ...point, x: projected.x, y: projected.y };
+      const {
+        normX: _normX,
+        normY: _normY,
+        floorplanInside: _floorplanInside,
+        coverageInside: _coverageInside,
+        coverageRegion: _coverageRegion,
+        alignmentDebug: _alignmentDebug,
+        ...rest
+      } = point;
+      return { ...rest, x: projected.x, y: projected.y };
     }) : points;
 
     const projectedTrails = Array.isArray(trails) ? trails.map((trail) => {
@@ -550,17 +536,49 @@ function Dashboard() {
         if (!projected) return point;
         projectedAny = true;
         didProject = true;
-        return { ...point, x: projected.x, y: projected.y };
+        const {
+          normX: _normX,
+          normY: _normY,
+          floorplanInside: _floorplanInside,
+          coverageInside: _coverageInside,
+          coverageRegion: _coverageRegion,
+          ...rest
+        } = point;
+        return { ...rest, x: projected.x, y: projected.y };
       });
       return projectedAny ? { ...trail, points: nextPoints } : trail;
     }) : trails;
 
     if (!didProject) return payload;
 
+    const bounds = floorplan?.bounds;
+    const hasBounds = bounds
+      && [bounds.min_x, bounds.max_x, bounds.min_z, bounds.max_z]
+        .every((value) => Number.isFinite(Number(value)));
+    const displayBounds = hasBounds ? {
+      min_x: Number(bounds?.min_x),
+      max_x: Number(bounds?.max_x),
+      min_z: Number(bounds?.min_z),
+      max_z: Number(bounds?.max_z),
+    } : undefined;
+
     return {
       ...payload,
-      frame: String(fallbackFrame || '').trim() || payload.frame,
+      frame: 'camera_local_ground_m',
+      world_frame: 'camera_local_ground_m',
+      frame_mode: 'camera_local',
       units: String(floorplan?.units || '').trim() || payload.units,
+      ...(displayBounds ? {
+        xMin: displayBounds.min_x,
+        xMax: displayBounds.max_x,
+        zMin: displayBounds.min_z,
+        zMax: displayBounds.max_z,
+        displayBounds,
+        floorplanBounds: displayBounds,
+      } : {}),
+      floorplanSnapshotId: floorplan?.snapshot_id ?? null,
+      floorplanSnapshotContentSha256: floorplan?.snapshot_content_sha256 ?? null,
+      floorplanCalibrationFingerprint: floorplan?.calibration_fingerprint ?? null,
       footpoints: projectedPoints,
       trails: projectedTrails,
     };
@@ -1170,6 +1188,18 @@ function Dashboard() {
       const nextFloorplans = { ...floorplanDataRef.current, [key]: nextPayload };
       floorplanDataRef.current = nextFloorplans;
       setFloorplanData(nextFloorplans);
+      const previousBev = bevMetaRawRef.current[key];
+      if (previousBev && !bevMatchesFloorplan(previousBev, nextPayload)) {
+        const cleared = clearBevForStatus(previousBev, {
+          type: 'bev-status',
+          cameraId: key,
+          error: 'floorplan_revision_changed',
+        } as BevMeta) as BevMeta;
+        bevMetaRawRef.current = { ...bevMetaRawRef.current, [key]: cleared };
+        bevMetaRef.current = { ...bevMetaRef.current, [key]: cleared };
+        setBevMetaRaw((prev) => ({ ...prev, [key]: cleared }));
+        setBevMeta((prev) => ({ ...prev, [key]: cleared }));
+      }
     }
     handleFloorplanBootstrapResponseRef.current(payload, nextHasRenderableGrid);
 
@@ -1221,21 +1251,46 @@ function Dashboard() {
   const handleBevMeta = useCallback((payload: BevMeta) => {
     if (!payload) return;
     updateKnownCamerasFromPayload(payload); // Item 4 discovery
-    const cam = resolveDisplayCameraKey((payload.cameraId || payload.camId || '').toString());
+    const cam = resolveDisplayCameraKey((payload.cameraId || payload.camId || payload.camera_id || payload.cam_id || '').toString());
     if (!cam) return;
+    const prevRaw = bevMetaRawRef.current[cam];
+
+    if (payload.type === 'bev-status') {
+      const cleared = clearBevForStatus(prevRaw, payload) as BevMeta;
+      bevMetaRawRef.current = { ...bevMetaRawRef.current, [cam]: cleared };
+      setBevMetaRaw((prev) => ({ ...prev, [cam]: cleared }));
+      bevMetaRef.current = { ...bevMetaRef.current, [cam]: cleared };
+      setBevMeta((prev) => ({ ...prev, [cam]: cleared }));
+      return;
+    }
+
+    const admission = admitBevFrame(prevRaw, payload);
+    if (!admission.admitted || !admission.payload) return;
+    const admittedPayload = admission.payload as BevMeta;
+    if (!bevMatchesFloorplan(admittedPayload, floorplanDataRef.current[cam])) {
+      const cleared = clearBevForStatus(prevRaw, {
+        type: 'bev-status',
+        cameraId: cam,
+        error: 'floorplan_revision_mismatch',
+      } as BevMeta) as BevMeta;
+      bevMetaRawRef.current = { ...bevMetaRawRef.current, [cam]: cleared };
+      setBevMetaRaw((prev) => ({ ...prev, [cam]: cleared }));
+      bevMetaRef.current = { ...bevMetaRef.current, [cam]: cleared };
+      setBevMeta((prev) => ({ ...prev, [cam]: cleared }));
+      return;
+    }
+
     const prevMode = bevFrameModeByCamRef.current[cam] || 'world';
-    const nextMode = resolveBevFrameMode(payload, prevMode);
+    const nextMode = resolveBevFrameMode(admittedPayload, prevMode);
     setBevFrameMode(cam, nextMode);
 
-    const prevRaw = bevMetaRawRef.current[cam];
-    const mergedRaw = mergeBevMetaPayload(prevRaw, payload);
-    bevMetaRawRef.current = { ...bevMetaRawRef.current, [cam]: mergedRaw };
-    setBevMetaRaw((prev) => ({ ...prev, [cam]: mergedRaw }));
+    bevMetaRawRef.current = { ...bevMetaRawRef.current, [cam]: admittedPayload };
+    setBevMetaRaw((prev) => ({ ...prev, [cam]: admittedPayload }));
 
-    const normalizedPayload = normalizeBevMetaForDisplay(cam, mergedRaw, nextMode);
+    const normalizedPayload = normalizeBevMetaForDisplay(cam, admittedPayload, nextMode);
     bevMetaRef.current = { ...bevMetaRef.current, [cam]: normalizedPayload };
     setBevMeta((prev) => ({ ...prev, [cam]: normalizedPayload }));
-  }, [mergeBevMetaPayload, normalizeBevMetaForDisplay, resolveBevFrameMode, resolveDisplayCameraKey]);
+  }, [normalizeBevMetaForDisplay, resolveBevFrameMode, resolveDisplayCameraKey]);
 
   useEffect(() => {
     let changed = false;
@@ -1390,6 +1445,28 @@ function Dashboard() {
     for (const [cameraId, entry] of Object.entries(depthPanelRefreshStateRef.current)) {
       if (entry.status !== 'capturing-floorplan' && entry.status !== 'loading-depth') continue;
       failDepthPanelRefresh(cameraId, entry.requestId, 'depth_panel_transport_closed');
+    }
+    const currentRaw = bevMetaRawRef.current;
+    const cameraIds = Object.keys(currentRaw) as CameraKey[];
+    if (cameraIds.length > 0) {
+      const clearedRaw = { ...currentRaw };
+      const clearedDisplay = { ...bevMetaRef.current };
+      for (const cameraId of cameraIds) {
+        // A socket close ends the producer ordering epoch. Clear visual state
+        // without retaining the old process-local outbound watermark so a
+        // restarted runtime may begin again at submission 1.
+        const cleared = clearBevForStatus(undefined, {
+          type: 'bev-status',
+          cameraId,
+          error: 'transport_closed',
+        } as BevMeta) as BevMeta;
+        clearedRaw[cameraId] = cleared;
+        clearedDisplay[cameraId] = cleared;
+      }
+      bevMetaRawRef.current = clearedRaw;
+      bevMetaRef.current = clearedDisplay;
+      setBevMetaRaw(clearedRaw);
+      setBevMeta(clearedDisplay);
     }
   }, [failDepthPanelRefresh, status]);
 

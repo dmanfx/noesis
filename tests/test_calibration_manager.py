@@ -12,6 +12,7 @@ Run with: pytest tests/test_calibration_manager.py -v
 from __future__ import annotations
 
 import json
+import hashlib
 import importlib.util
 from pathlib import Path
 import sys
@@ -25,6 +26,17 @@ from noesis.calibration.manager import (
     _world_to_scene_sha256,
     create_calibration_manager,
     load_camera_labels,
+)
+from noesis_core.contracts.scene_prior import (
+    ScenePriorFloorPlane,
+    ScenePriorFrameBinding,
+    ScenePriorFrameRef,
+)
+from noesis_core.coordinate_frames import (
+    BACKEND_WORLD_FRAME_ID,
+    RevisionedFrame,
+    revisioned_frame_sha256,
+    revisioned_transform_sha256,
 )
 
 
@@ -179,6 +191,121 @@ def test_k_divergence_bundle_matches_snapshot(manager: CalibrationManager):
     np.testing.assert_allclose(bundle_K[1], snap_K[1, 1], rtol=1e-6, err_msg="fy diverged")
     np.testing.assert_allclose(bundle_K[2], snap_K[0, 2], rtol=1e-6, err_msg="cx diverged")
     np.testing.assert_allclose(bundle_K[3], snap_K[1, 2], rtol=1e-6, err_msg="cy diverged")
+
+
+def test_snapshot_and_world_snapshot_reuse_one_immutable_generation(
+    manager: CalibrationManager,
+) -> None:
+    """Hot tracking/BEV callers receive the exact same immutable objects."""
+
+    raw_first = manager.snapshot(source_id=0, camera_id="test-camera")
+    raw_second = manager.snapshot(source_id=0, camera_id="test-camera")
+    world_first = manager.world_snapshot(source_id=0, camera_id="test-camera")
+    world_second = manager.world_snapshot(source_id=0, camera_id="test-camera")
+
+    assert raw_first is not None and raw_second is raw_first
+    assert world_first is not None and world_second is world_first
+    assert world_first.intrinsics is raw_first.intrinsics
+    assert raw_first.intrinsics.flags.writeable is False
+    with pytest.raises(ValueError):
+        raw_first.intrinsics[0, 0] = 123.0
+    assert isinstance(raw_first.extrinsics_col_major, tuple)
+
+
+def test_snapshot_cache_is_invalidated_by_every_public_calibration_reload_or_setter(
+    manager: CalibrationManager,
+    temp_calibration_dir: Path,
+) -> None:
+    """Each calibration generation gets new raw and active snapshot objects."""
+
+    def assert_replaced() -> None:
+        old_raw = manager.snapshot(source_id=0, camera_id="test-camera")
+        old_world = manager.world_snapshot(source_id=0, camera_id="test-camera")
+        assert old_raw is not None and old_world is not None
+        manager._load_frame_contracts()
+        new_raw = manager.snapshot(source_id=0, camera_id="test-camera")
+        new_world = manager.world_snapshot(source_id=0, camera_id="test-camera")
+        assert new_raw is not None and new_world is not None
+        assert new_raw is not old_raw
+        assert new_world is not old_world
+
+    # Camera-label changes are a public setter and must not leave a snapshot
+    # from a previous source/camera mapping in the live cache.
+    manager.set_camera_labels({0: "test-camera"})
+    assert_replaced()
+
+    extrinsics = json.loads(
+        (temp_calibration_dir / "camera_calibration.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    extrinsics["cameras"]["test-camera"]["E"][12] = 0.25
+    (temp_calibration_dir / "camera_calibration.json").write_text(
+        json.dumps(extrinsics), encoding="utf-8"
+    )
+    manager.reload_extrinsics()
+    assert_replaced()
+
+    alignment = json.loads(
+        (temp_calibration_dir / "ply_alignment.json").read_text(encoding="utf-8")
+    )
+    alignment["floor_y"] = 0.25
+    (temp_calibration_dir / "ply_alignment.json").write_text(
+        json.dumps(alignment), encoding="utf-8"
+    )
+    manager.reload_alignment()
+    assert_replaced()
+
+    cameras_path = temp_calibration_dir / "cameras.yaml"
+    cameras_path.write_text(
+        cameras_path.read_text(encoding="utf-8").replace("fx: 800.0", "fx: 900.0"),
+        encoding="utf-8",
+    )
+    manager.reload_intrinsics()
+    assert_replaced()
+
+    manager.reload_all()
+    assert_replaced()
+
+    updated_E = [
+        1.0, 0.0, 0.0, 0.0,
+        0.0, 1.0, 0.0, 0.0,
+        0.0, 0.0, 1.0, 0.0,
+        0.5, 0.0, 0.0, 1.0,
+    ]
+    assert manager.set_extrinsics("test-camera", E=updated_E)["ok"] is True
+    assert_replaced()
+
+    assert manager.set_align({"floor_y": 0.5})["ok"] is True
+    assert_replaced()
+
+
+def test_snapshot_failure_is_not_cached_across_extrinsics_reload(
+    manager: CalibrationManager,
+    temp_calibration_dir: Path,
+) -> None:
+    """A transient missing camera can recover on the next reload."""
+
+    assert manager.snapshot(source_id=0, camera_id="test-camera") is not None
+    (temp_calibration_dir / "camera_calibration.json").write_text(
+        json.dumps({"cameras": {}}), encoding="utf-8"
+    )
+    manager.reload_extrinsics()
+    assert manager.snapshot(source_id=0, camera_id="test-camera") is None
+
+    identity = [
+        1.0, 0.0, 0.0, 0.0,
+        0.0, 1.0, 0.0, 0.0,
+        0.0, 0.0, 1.0, 0.0,
+        0.0, 0.0, 0.0, 1.0,
+    ]
+    (temp_calibration_dir / "camera_calibration.json").write_text(
+        json.dumps({"cameras": {"test-camera": {"E": identity}}}),
+        encoding="utf-8",
+    )
+    manager.reload_extrinsics()
+    recovered = manager.snapshot(source_id=0, camera_id="test-camera")
+    assert recovered is not None
 
 
 def test_explicit_intrinsics_resolution_handles_offcenter_principal_point(temp_calibration_dir: Path):
@@ -545,6 +672,195 @@ def test_ds8_ds9_world_to_scene_digest_contract_is_identical() -> None:
     assert module._world_to_scene_sha256(  # type: ignore[attr-defined]
         matrix, scene_to_m
     ) == _world_to_scene_sha256(matrix, scene_to_m)
+
+
+def _family_active_frame_binding(repo_root: Path) -> ScenePriorFrameBinding:
+    """Exact active Family PCF edge captured from its revision metadata."""
+
+    calibration_sha256 = hashlib.sha256(
+        (repo_root / "config" / "camera_calibration.json").read_bytes()
+    ).hexdigest()
+    alignment_sha256 = hashlib.sha256(
+        (repo_root / "config" / "ply_alignment.json").read_bytes()
+    ).hexdigest()
+    assert calibration_sha256 == "9b34e3ea8a3808475584a55383afcff96373a9e0845d33dc026a6659c975be93"
+    assert alignment_sha256 == "88e05c3259bde42265c8bdc97e1c86762ca7540402041ebcceadb407d72df82b"
+    source = RevisionedFrame(
+        BACKEND_WORLD_FRAME_ID,
+        revisioned_frame_sha256(
+            BACKEND_WORLD_FRAME_ID,
+            artifact_sha256s=(calibration_sha256, alignment_sha256),
+        ),
+    )
+    assert source.revision == "b73b6a742e2d0d5936876875d904aa74c98996088f06efd04d552dac3f96a214"
+    target = RevisionedFrame(
+        BACKEND_WORLD_FRAME_ID,
+        "sceneprior_family-room_20260811T015847Z_ffdc144a8f59",
+    )
+    world_correction = (
+        0.9958827241807826, -0.09059934064225462, 0.0030592733536001456, 0.0,
+        0.09059934064225462, 0.9936095819714693, -0.06731833397872138, 0.0,
+        0.0030592733536001456, 0.06731833397872138, 0.9977268577906867, 0.0,
+        -0.0035292452401627372, 0.17446172385443262, 0.0026223470070050325, 1.0,
+    )
+    transform_sha256 = revisioned_transform_sha256(
+        source,
+        target,
+        world_correction,
+    )
+    assert transform_sha256 == "7c040ed440b0008d7d5da369af32ba0a729f47da610d77595f9bfdce97e31969"
+    return ScenePriorFrameBinding(
+        contract="noesis.scene_prior.frame_binding",
+        contract_version=1,
+        source_frame=ScenePriorFrameRef(
+            frame_id=source.frame_id,
+            revision=source.revision,
+        ),
+        target_frame=ScenePriorFrameRef(
+            frame_id=target.frame_id,
+            revision=target.revision,
+        ),
+        source_camera_calibration_sha256=calibration_sha256,
+        source_world_alignment_sha256=alignment_sha256,
+        target_revision_id="vt_family_room_stream_rgbmesh_20260623T215850_645134993",
+        target_revision_metadata_sha256="67dee858ad3c5b0564e7d364b9522e59842f14b7c7de1c07659216e1defedd9c",
+        target_from_source_col_major=world_correction,
+        target_from_source_sha256=transform_sha256,
+        source_floor_plane=ScenePriorFloorPlane(
+            frame=ScenePriorFrameRef(
+                frame_id=source.frame_id,
+                revision=source.revision,
+            ),
+            normal=(-0.09059934064225462, 0.9936095819714694, 0.06731833397872138),
+            offset_m=0.17558377759227575,
+        ),
+        target_floor_plane=ScenePriorFloorPlane(
+            frame=ScenePriorFrameRef(
+                frame_id=target.frame_id,
+                revision=target.revision,
+            ),
+            normal=(0.0, 1.0, 0.0),
+            offset_m=0.0,
+        ),
+    )
+
+
+def test_family_active_world_view_intersects_revision_floor_at_reported_scale(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from noesis.calibration.geometry import pixel_to_world
+
+    repo_root = Path(__file__).resolve().parents[1]
+    binding = _family_active_frame_binding(repo_root)
+    manager = CalibrationManager(
+        cameras_yaml_path=repo_root / "config" / "cameras.yaml",
+        camera_calibration_json_path=repo_root / "config" / "camera_calibration.json",
+        ply_alignment_json_path=repo_root / "config" / "ply_alignment.json",
+        streammux_size=(1920, 1080),
+        scene_prior_frame_bindings={"family-room": binding},
+    )
+    manager.set_camera_labels({0: "living-room", 1: "kitchen", 2: "family-room"})
+
+    raw = manager.snapshot(2, "family-room")
+    active = manager.world_snapshot(2, "family-room")
+    assert raw is not None and active is not None
+    assert raw.world_frame is not None
+    assert raw.world_frame.frame_id == BACKEND_WORLD_FRAME_ID
+    assert raw.world_frame.revision == binding.target_frame.revision
+    assert tuple(raw.extrinsics_col_major) == active.calibration_extrinsics_col_major
+    assert active.world_frame_id == BACKEND_WORLD_FRAME_ID
+    assert active.world_frame_revision == binding.target_frame.revision
+    assert active.floor_y == pytest.approx(0.0)
+    assert tuple(active.extrinsics_col_major) != tuple(raw.extrinsics_col_major)
+
+    raw_matrix = np.asarray(raw.extrinsics_col_major).reshape((4, 4), order="F")
+    active_matrix = np.asarray(active.extrinsics_col_major).reshape((4, 4), order="F")
+    world_correction = raw.frame_contract.matrix  # type: ignore[union-attr]
+    np.testing.assert_allclose(
+        active_matrix,
+        raw_matrix @ np.linalg.inv(world_correction),
+        atol=1e-12,
+    )
+    raw_camera = np.linalg.inv(raw_matrix)[:3, 3]
+
+    for v, expected_range_m, minimum_displacement_m in (
+        (653.0, 5.902, 2.0),
+        (550.0, 9.395, 4.0),
+    ):
+        raw_hit = pixel_to_world(
+            raw.intrinsics,
+            raw.extrinsics_col_major,
+            raw.floor_y,
+            raw.unit_scale,
+            1100.0,
+            v,
+        )
+        active_hit = pixel_to_world(
+            active.intrinsics,
+            active.extrinsics_col_major,
+            active.floor_y,
+            active.unit_scale,
+            1100.0,
+            v,
+        )
+        assert raw_hit.ok and raw_hit.world_point is not None
+        assert active_hit.ok and active_hit.world_point is not None
+        raw_point = np.asarray(raw_hit.world_point, dtype=np.float64)
+        active_point = np.asarray(active_hit.world_point, dtype=np.float64)
+        assert np.linalg.norm(raw_point - raw_camera) == pytest.approx(
+            expected_range_m,
+            abs=0.02,
+        )
+        raw_point_in_active = (world_correction @ np.r_[raw_point, 1.0])[:3]
+        assert np.linalg.norm(raw_point_in_active - active_point) > minimum_displacement_m
+        assert active_point[1] == pytest.approx(0.0, abs=1e-9)
+        active_point_in_source = (
+            np.linalg.inv(world_correction) @ np.r_[active_point, 1.0]
+        )[:3]
+        source_plane = binding.source_floor_plane
+        assert (
+            np.dot(np.asarray(source_plane.normal), active_point_in_source)
+            + source_plane.offset_m
+        ) == pytest.approx(0.0, abs=0.002)
+
+    living_raw = manager.snapshot(0, "living-room")
+    living_active = manager.world_snapshot(0, "living-room")
+    assert living_raw is not None and living_active is not None
+    assert living_active.world_frame_id == BACKEND_WORLD_FRAME_ID
+    assert tuple(living_active.extrinsics_col_major) == tuple(
+        living_raw.extrinsics_col_major
+    )
+
+    def _unexpected_write(*_args: object, **_kwargs: object) -> bool:
+        raise AssertionError("revision-bound calibration mutation reached persistence")
+
+    monkeypatch.setattr(manager, "_log_raw_extrinsics_payload", _unexpected_write)
+    monkeypatch.setattr(manager, "_save_extrinsics", _unexpected_write)
+    monkeypatch.setattr(manager, "_save_alignment", _unexpected_write)
+    expected_rejection = {
+        "ok": False,
+        "error": "revision_bound_frame_contract_requires_atomic_regeneration",
+    }
+    assert manager.set_extrinsics(
+        "family-room",
+        E=list(raw.extrinsics_col_major),
+    ) == expected_rejection
+    assert manager.set_align({"floor_y": 0.0}) == expected_rejection
+
+
+def test_calibration_manager_rejects_stale_frame_binding() -> None:
+    repo_root = Path(__file__).resolve().parents[1]
+    stale = _family_active_frame_binding(repo_root).model_copy(
+        update={"source_camera_calibration_sha256": "0" * 64}
+    )
+    with pytest.raises(CalibrationValidationError, match="calibration revision mismatch"):
+        CalibrationManager(
+            cameras_yaml_path=repo_root / "config" / "cameras.yaml",
+            camera_calibration_json_path=repo_root / "config" / "camera_calibration.json",
+            ply_alignment_json_path=repo_root / "config" / "ply_alignment.json",
+            streammux_size=(1920, 1080),
+            scene_prior_frame_bindings={"family-room": stale},
+        )
 
 
 def test_camera_anchor_scene_similarity_preserves_binding_and_rejects_bad_fit(

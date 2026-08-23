@@ -41,9 +41,10 @@ flowchart LR
   `models.depth_tracking` branch continuously. V3DT disables it because the 3D
   tracker owns that observation.
 - **Exact-frame rendezvous:** the capture and fusion operators key on exact
-  source/frame/PTS. Fusion waits for
-  `NOESIS_OBJECT_DEPTH_EXACT_FRAME_WAIT_MS` (20 ms default, 250 ms hard cap),
-  then may consume only an admissible same-source prior frame within cadence.
+  source/frame/PTS. Live fusion is nonblocking by default
+  (`NOESIS_OBJECT_DEPTH_EXACT_FRAME_WAIT_MS=0`, 250 ms hard cap): it uses an
+  already-available exact frame or an admissible same-source prior frame within
+  cadence. A positive wait is reserved for explicit bounded diagnostics.
 - **Object depth:** the native bridge attaches `NOESIS.OBJECT_DEPTH` only when
   attachment succeeds. A non-`ok` object-local sample may still be attached for
   diagnostics; native rejection/unavailability means no meta and a failure

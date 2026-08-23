@@ -13,7 +13,9 @@ from dataclasses import dataclass, field
 from typing import Any, Mapping
 
 
-_DEPTH_FRAGMENT = re.compile(r"\bz=(?:n/a|[-+]?(?:\d+(?:\.\d*)?|\.\d+)m)\b")
+_DEPTH_FRAGMENT = re.compile(
+    r"\b(?:depth|z)=(?:n/a|[-+]?(?:\d+(?:\.\d*)?|\.\d+)m)\b"
+)
 
 
 def _integer_attr(value: Any, *names: str, default: int = -1) -> int:

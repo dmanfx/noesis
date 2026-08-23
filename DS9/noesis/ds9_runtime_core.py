@@ -5246,6 +5246,20 @@ def _run_main(startup_main_guard: StartupMainGuard) -> int:
                     raise ActiveFloorplanError(
                         "scene-prior calibration fingerprint is unavailable"
                     )
+                world_frame = calibration.world_frame
+                if world_frame is None:
+                    raise ActiveFloorplanError(
+                        "scene-prior world frame contract is unavailable"
+                    )
+                result["world_frame"] = world_frame.frame_id
+                result["world_frame_revision"] = world_frame.revision
+                result["calibration_fingerprint"] = calibration_fingerprint
+                scene_prior_meta = result.get("scene_prior_meta")
+                if isinstance(scene_prior_meta, Mapping):
+                    scene_prior_meta = dict(scene_prior_meta)
+                    scene_prior_meta["source_frame"] = world_frame.frame_id
+                    scene_prior_meta["source_frame_revision"] = world_frame.revision
+                    result["scene_prior_meta"] = scene_prior_meta
                 active_floorplan_registry.record_scene_prior(
                     requested_camera_id,
                     result,
@@ -5414,6 +5428,11 @@ def _run_main(startup_main_guard: StartupMainGuard) -> int:
             or REPO_ROOT / "config" / "ply_alignment.json"
         ).expanduser().resolve(),
         camera_labels=camera_labels,
+        scene_prior_frame_bindings=(
+            scene_prior_set.frame_bindings()
+            if scene_prior_set is not None
+            else None
+        ),
     )
     setattr(pipeline, "bev_calibration", calibration_provider)
     if calibration_provider.pose_only_enabled():

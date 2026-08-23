@@ -78,6 +78,14 @@ class ObjectDepthResult:
     anchor_depth_m: Optional[float] = None
     anchor_sample_count: Optional[int] = None
     anchor_valid_fraction: Optional[float] = None
+    evidence_quality: Optional[str] = None
+    evidence_reason: Optional[str] = None
+    depth_spread_m: Optional[float] = None
+    anchor_depth_spread_m: Optional[float] = None
+    measurement_frame_id: Optional[int] = None
+    measurement_ts_us: Optional[int] = None
+    measurement_age_us: Optional[int] = None
+    measurement_cached: Optional[bool] = None
     world_point: Optional[Sequence[float]] = None
     world_point_depth: Optional[Sequence[float]] = None
     world_point_floor: Optional[Sequence[float]] = None
@@ -123,6 +131,22 @@ class ObjectDepthResult:
             object.__setattr__(self, "anchor_sample_count", max(0, int(self.anchor_sample_count)))
         if self.anchor_valid_fraction is not None:
             object.__setattr__(self, "anchor_valid_fraction", max(0.0, min(1.0, float(self.anchor_valid_fraction))))
+        if self.evidence_quality is not None:
+            object.__setattr__(self, "evidence_quality", str(self.evidence_quality).strip() or None)
+        if self.evidence_reason is not None:
+            object.__setattr__(self, "evidence_reason", str(self.evidence_reason).strip() or None)
+        if self.depth_spread_m is not None:
+            object.__setattr__(self, "depth_spread_m", max(0.0, float(self.depth_spread_m)))
+        if self.anchor_depth_spread_m is not None:
+            object.__setattr__(self, "anchor_depth_spread_m", max(0.0, float(self.anchor_depth_spread_m)))
+        if self.measurement_frame_id is not None:
+            object.__setattr__(self, "measurement_frame_id", int(self.measurement_frame_id))
+        if self.measurement_ts_us is not None:
+            object.__setattr__(self, "measurement_ts_us", int(self.measurement_ts_us))
+        if self.measurement_age_us is not None:
+            object.__setattr__(self, "measurement_age_us", max(0, int(self.measurement_age_us)))
+        if self.measurement_cached is not None:
+            object.__setattr__(self, "measurement_cached", bool(self.measurement_cached))
         object.__setattr__(self, "world_point", _coerce_optional_point3(self.world_point))
         object.__setattr__(self, "world_point_depth", _coerce_optional_point3(self.world_point_depth))
         object.__setattr__(self, "world_point_floor", _coerce_optional_point3(self.world_point_floor))
@@ -171,6 +195,14 @@ class ObjectDepthResult:
             "anchor_depth_m": self.anchor_depth_m,
             "anchor_sample_count": self.anchor_sample_count,
             "anchor_valid_fraction": self.anchor_valid_fraction,
+            "evidence_quality": self.evidence_quality,
+            "evidence_reason": self.evidence_reason,
+            "depth_spread_m": self.depth_spread_m,
+            "anchor_depth_spread_m": self.anchor_depth_spread_m,
+            "measurement_frame_id": self.measurement_frame_id,
+            "measurement_ts_us": self.measurement_ts_us,
+            "measurement_age_us": self.measurement_age_us,
+            "measurement_cached": self.measurement_cached,
             "world_point": list(self.world_point) if self.world_point is not None else None,
             "world_point_depth": list(self.world_point_depth) if self.world_point_depth is not None else None,
             "world_point_floor": list(self.world_point_floor) if self.world_point_floor is not None else None,

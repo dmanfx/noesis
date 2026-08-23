@@ -800,8 +800,11 @@ Read endpoints:
   returns a path, candidate scores, embeddings, or vectors. Evidence contract
   v2 is sequence/hash chained and requires a private retained-head/tail
   checkpoint; unexplained deletion or truncation fails before calibration.
-  Every row also binds the runtime-derived model semantic profile, which label
-  provenance must match exactly.
+  `recorded_event_count` and `last_observed_at_us` are durable-only. Async
+  writers additionally report `pending_event_count`, `pending_frame_count`,
+  `dropped_event_count`, `failed`, and `last_error`; pending rows are not yet
+  calibration evidence. Every row also binds the runtime-derived model
+  semantic profile, which label provenance must match exactly.
 - `GET /api/v2/reid/migration/review` returns an optional sanitized,
   biometric-free legacy review containing duplicate normalized-name groups,
   blocked records, and residents without importable anchors. The response

@@ -10,9 +10,13 @@ Covers:
 
 from __future__ import annotations
 
+import threading
+import time
+
 import numpy as np
 import pytest
 
+import reid.stable_id_manager as stable_id_manager_module
 from reid.stable_id_manager import StableIDManager
 
 
@@ -105,6 +109,87 @@ def test_gallery_persistence_roundtrip(tmp_path):
     assert sims[2] == pytest.approx(1.0, abs=1e-5)
     # Loaded SID must not be re-allocatable.
     assert 2 not in mgr2._free_sids_set
+
+
+def test_gallery_autosave_does_not_block_identity_callback(tmp_path):
+    """Periodic compression is dispatched off the StableIDManager lock."""
+    mgr = _make_manager(tmp_path, gallery_autosave_interval_s=1.0)
+    started = threading.Event()
+    release = threading.Event()
+
+    def slow_save(**_kwargs) -> bool:
+        started.set()
+        assert release.wait(timeout=2.0)
+        return True
+
+    mgr.save_gallery = slow_save  # type: ignore[method-assign]
+    with mgr._lock:
+        start = time.perf_counter()
+        mgr._maybe_autosave_gallery(1.0)
+        elapsed = time.perf_counter() - start
+    assert elapsed < 0.10
+    assert started.wait(timeout=2.0)
+    worker = mgr._gallery_autosave_thread
+    assert worker is not None
+    release.set()
+    worker.join(timeout=2.0)
+    assert not worker.is_alive()
+    assert mgr._gallery_autosave_thread is None
+
+
+def test_gallery_autosave_file_write_does_not_hold_manager_lock(tmp_path, monkeypatch):
+    """A slow compression write cannot stall the next identity update."""
+    mgr = _make_manager(tmp_path, gallery_autosave_interval_s=1.0)
+    emb = _unit(_basis_vec(16, 0))
+    mgr.update(0, 1, (10.0, 10.0, 50.0, 120.0), 1.0, None, embedding=emb)
+    started = threading.Event()
+    release = threading.Event()
+    original_save = stable_id_manager_module.np.savez_compressed
+
+    def blocked_save(*args, **kwargs):
+        started.set()
+        assert release.wait(timeout=2.0)
+        return original_save(*args, **kwargs)
+
+    monkeypatch.setattr(stable_id_manager_module.np, "savez_compressed", blocked_save)
+    with mgr._lock:
+        mgr._maybe_autosave_gallery(3.0)
+    assert started.wait(timeout=2.0)
+    start = time.perf_counter()
+    mgr.update(0, 1, (10.0, 10.0, 50.0, 120.0), 4.0, None, embedding=None)
+    assert (time.perf_counter() - start) < 0.10
+    release.set()
+    worker = mgr._gallery_autosave_thread
+    assert worker is not None
+    worker.join(timeout=2.0)
+    assert not worker.is_alive()
+
+
+def test_newer_explicit_gallery_save_wins_over_older_autosave(tmp_path):
+    """An older autosave cannot overwrite a newer explicit snapshot."""
+    mgr = _make_manager(tmp_path)
+    path = str(tmp_path / "ordered-gallery.npz")
+    old_arrays = {"sids": np.asarray([1], dtype=np.int64)}
+    new_arrays = {"sids": np.asarray([2], dtype=np.int64)}
+    old_ready = threading.Event()
+    release_old = threading.Event()
+
+    def old_writer() -> None:
+        old_ready.set()
+        assert release_old.wait(timeout=2.0)
+        assert mgr._write_gallery_snapshot(path, old_arrays, 1)
+
+    thread = threading.Thread(target=old_writer, name="old-gallery-autosave")
+    thread.start()
+    assert old_ready.wait(timeout=2.0)
+    assert mgr._write_gallery_snapshot(path, new_arrays, 2)
+    release_old.set()
+    thread.join(timeout=2.0)
+    assert not thread.is_alive()
+
+    with np.load(path, allow_pickle=False) as saved:
+        assert np.asarray(saved["sids"]).tolist() == [2]
+    assert mgr._gallery_last_written_generation == 2
 
 
 def test_gallery_persistence_drops_stale_identities(tmp_path):

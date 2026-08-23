@@ -21,9 +21,13 @@ import numpy as np
 from noesis.validation.authored_scene import AuthoredSceneGeometry, load_similarity
 from noesis.virtual_twin.artifacts import write_points_glb
 from noesis_core.coordinate_frames import (
+    BACKEND_WORLD_FRAME_ID,
     CAMERA_LOCAL_RASTER_ORIENTATION,
     CoordinateFrameError,
+    RevisionedFrame,
     camera_ground_frame_from_camera_to_world,
+    revisioned_frame_sha256,
+    revisioned_transform_sha256,
 )
 from noesis_core.contracts.base import ArtifactFingerprint
 from noesis_core.contracts.scene_prior import (
@@ -33,6 +37,9 @@ from noesis_core.contracts.scene_prior import (
     ScenePriorCatalog,
     ScenePriorCatalogEntry,
     ScenePriorDerivation,
+    ScenePriorFloorPlane,
+    ScenePriorFrameBinding,
+    ScenePriorFrameRef,
     ScenePriorGrid,
     ScenePriorPreview,
     ScenePriorQuality,
@@ -164,6 +171,11 @@ class _CameraPreviewFrame:
     camera_forward_world_xz: tuple[float, float]
     camera_calibration: ArtifactFingerprint
     target_revision_metadata: ArtifactFingerprint
+    target_revision_id: str
+    target_from_source_col_major: tuple[float, ...]
+    source_floor_normal: tuple[float, float, float]
+    source_floor_offset_m: float
+    target_floor_y_m: float
 
 
 def _canonical_json(value: Any) -> bytes:
@@ -555,6 +567,31 @@ def _camera_preview_frame(inputs: Mapping[str, Any]) -> _CameraPreviewFrame:
     right = camera_frame.camera_right_world[[0, 2]]
     position = camera_frame.camera_world_m
     camera_id = str(inputs["reference_camera_id"])
+    floor_alignment = target_metadata.get("floor_alignment")
+    if not isinstance(floor_alignment, Mapping):
+        raise ScenePriorBuildError("reference target floor alignment is missing")
+    try:
+        target_revision_id = str(target_metadata["revision_id"])
+        source_floor_normal = tuple(
+            float(value) for value in floor_alignment["source_floor_normal"]
+        )
+        source_floor_offset_m = float(floor_alignment["source_floor_offset"])
+        target_floor_y_m = float(floor_alignment["target_floor_y"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ScenePriorBuildError(
+            "reference target floor-frame metadata is malformed"
+        ) from exc
+    if (
+        re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,199}", target_revision_id)
+        is None
+        or len(source_floor_normal) != 3
+        or not all(math.isfinite(value) for value in source_floor_normal)
+        or not math.isfinite(source_floor_offset_m)
+        or not math.isfinite(target_floor_y_m)
+    ):
+        raise ScenePriorBuildError(
+            "reference target floor-frame metadata is invalid"
+        )
     return _CameraPreviewFrame(
         camera_id=camera_id,
         camera_position_world_m=tuple(float(value) for value in position),
@@ -572,6 +609,13 @@ def _camera_preview_frame(inputs: Mapping[str, Any]) -> _CameraPreviewFrame:
             version=str(target_metadata.get("schema") or "unknown"),
             producer="noesis.virtual_twin",
         ),
+        target_revision_id=target_revision_id,
+        target_from_source_col_major=tuple(
+            float(value) for value in world_correction.flatten(order="F")
+        ),
+        source_floor_normal=source_floor_normal,
+        source_floor_offset_m=source_floor_offset_m,
+        target_floor_y_m=target_floor_y_m,
     )
 
 
@@ -1128,6 +1172,7 @@ def _updated_catalog(
     entry: ScenePriorCatalogEntry,
     camera_ids: Sequence[str],
     include_floorplan_layers: bool,
+    frame_binding: ScenePriorFrameBinding,
 ) -> ScenePriorCatalog:
     if path.exists():
         _, payload = _read_json_file(
@@ -1163,6 +1208,7 @@ def _updated_catalog(
             prior_id=entry.prior_id,
             mode="shadow",
             include_floorplan_layers=include_floorplan_layers,
+            frame_binding=frame_binding,
         )
     return ScenePriorCatalog(
         contract="noesis.scene_prior.catalog",
@@ -1405,6 +1451,65 @@ def build_scene_prior(config: ScenePriorBuildConfig) -> ScenePriorBuildResult:
     }
     identity_digest = _sha256(_compact_json(identity_payload))
     prior_id = f"sceneprior_{cfg.space_id}_{_timestamp_slug(captured_at_us)}_{identity_digest[:12]}"
+    source_frame = RevisionedFrame(
+        frame_id=BACKEND_WORLD_FRAME_ID,
+        revision=revisioned_frame_sha256(
+            BACKEND_WORLD_FRAME_ID,
+            artifact_sha256s=(
+                preview_frame.camera_calibration.sha256,
+                world_to_scene_fingerprint.sha256,
+            ),
+        ),
+    )
+    target_frame = RevisionedFrame(
+        frame_id=BACKEND_WORLD_FRAME_ID,
+        revision=prior_id,
+    )
+    transform_sha256 = revisioned_transform_sha256(
+        source_frame,
+        target_frame,
+        preview_frame.target_from_source_col_major,
+    )
+    frame_binding = ScenePriorFrameBinding(
+        contract="noesis.scene_prior.frame_binding",
+        contract_version=1,
+        source_frame=ScenePriorFrameRef(
+            frame_id=source_frame.frame_id,
+            revision=source_frame.revision,
+        ),
+        target_frame=ScenePriorFrameRef(
+            frame_id=target_frame.frame_id,
+            revision=target_frame.revision,
+        ),
+        source_camera_calibration_sha256=(
+            preview_frame.camera_calibration.sha256
+        ),
+        source_world_alignment_sha256=world_to_scene_fingerprint.sha256,
+        target_revision_id=preview_frame.target_revision_id,
+        target_revision_metadata_sha256=(
+            preview_frame.target_revision_metadata.sha256
+        ),
+        target_from_source_col_major=(
+            preview_frame.target_from_source_col_major
+        ),
+        target_from_source_sha256=transform_sha256,
+        source_floor_plane=ScenePriorFloorPlane(
+            frame=ScenePriorFrameRef(
+                frame_id=source_frame.frame_id,
+                revision=source_frame.revision,
+            ),
+            normal=preview_frame.source_floor_normal,
+            offset_m=preview_frame.source_floor_offset_m,
+        ),
+        target_floor_plane=ScenePriorFloorPlane(
+            frame=ScenePriorFrameRef(
+                frame_id=target_frame.frame_id,
+                revision=target_frame.revision,
+            ),
+            normal=(0.0, 1.0, 0.0),
+            offset_m=-float(preview_frame.target_floor_y_m),
+        ),
+    )
 
     grid_bytes = _deterministic_npz(arrays)
     metrics_payload = {
@@ -1492,6 +1597,7 @@ def build_scene_prior(config: ScenePriorBuildConfig) -> ScenePriorBuildResult:
         entry=entry,
         camera_ids=cfg.camera_ids,
         include_floorplan_layers=cfg.include_floorplan_layers,
+        frame_binding=frame_binding,
     )
     catalog_bytes = _canonical_json(catalog)
     _atomic_write_catalog(catalog_path, catalog_bytes)

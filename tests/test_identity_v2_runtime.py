@@ -455,6 +455,111 @@ def test_visitor_subject_identity_includes_uuid_and_generation_across_reuse_and_
         assert first_decision.subject.subject_id != decision.subject.subject_id
 
 
+def test_visitor_observation_refreshes_only_exact_bounded_gallery(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    store, runtime = _runtime(
+        tmp_path,
+        visitor_gallery_max_exemplars=2,
+    )
+    try:
+        session = runtime.open_visitor_session(slot=1000, ttl_s=60.0, now=10.0)
+        runtime.record_visitor_observation(
+            session.session_uuid,
+            _observation("visitor-one", vector=(1.0, 0.0, 0.0, 0.0)),
+            now=11.0,
+        )
+
+        def unexpected_global_gallery_read(*args, **kwargs):
+            raise AssertionError("repeat visitor observation performed a global read")
+
+        monkeypatch.setattr(
+            store,
+            "list_residents",
+            unexpected_global_gallery_read,
+        )
+        monkeypatch.setattr(
+            store,
+            "load_resident_gallery",
+            unexpected_global_gallery_read,
+        )
+        monkeypatch.setattr(
+            store,
+            "load_active_visitor_galleries",
+            unexpected_global_gallery_read,
+        )
+
+        runtime.record_visitor_observation(
+            session.session_uuid,
+            _observation("visitor-two", vector=(0.0, 1.0, 0.0, 0.0), frame=101),
+            now=12.0,
+        )
+        runtime.record_visitor_observation(
+            session.session_uuid,
+            _observation("visitor-three", vector=(0.0, 0.0, 1.0, 0.0), frame=102),
+            now=13.0,
+        )
+
+        persisted_session, persisted = store.load_visitor_gallery(session.session_uuid)
+        assert persisted_session.expires_at == pytest.approx(73.0)
+        assert len(persisted) == 2
+        hot = tuple(
+            item
+            for item in runtime._hot_subjects
+            if item.descriptor.visitor_session_uuid == session.session_uuid
+        )
+        assert len(hot) == 1
+        assert len(hot[0].normalized_vectors) == 2
+        assert hot[0].normalized_vectors == tuple(
+            runtime._normalize_vector(row.vector, subject=row.exemplar_uuid)
+            for row in persisted
+        )
+    finally:
+        store.close()
+
+
+def test_noop_retention_does_not_refresh_hot_gallery(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    store, runtime = _runtime(tmp_path)
+    try:
+        session = runtime.open_visitor_session(slot=1000, ttl_s=60.0, now=10.0)
+        runtime.record_visitor_observation(
+            session.session_uuid,
+            _observation("retention-hot", vector=(1.0, 0.0, 0.0, 0.0)),
+            now=11.0,
+        )
+        hot_before = runtime._hot_subjects
+        refreshed_before = runtime.refreshed_at
+
+        def unexpected_global_gallery_read(*args, **kwargs):
+            raise AssertionError("no-op retention performed a global gallery read")
+
+        monkeypatch.setattr(store, "list_residents", unexpected_global_gallery_read)
+        monkeypatch.setattr(
+            store,
+            "load_resident_gallery",
+            unexpected_global_gallery_read,
+        )
+        monkeypatch.setattr(
+            store,
+            "load_active_visitor_galleries",
+            unexpected_global_gallery_read,
+        )
+
+        result = runtime.run_retention(now=20.0)
+        assert result.visitor_sessions == 0
+        assert result.provisional_sessions == 0
+        assert result.quarantine_exemplars == 0
+        assert result.enrollment_proposals == 0
+        assert runtime._hot_subjects == hot_before
+        assert runtime.refreshed_at == refreshed_before
+    finally:
+        store.close()
+
+
 def test_calibrated_gallery_envelope_rejects_growth_before_store_mutation(
     tmp_path,
 ) -> None:

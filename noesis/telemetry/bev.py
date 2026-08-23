@@ -209,6 +209,9 @@ class Footpoint:
     bbox: Optional[Tuple[float, float, float, float]] = None
     image_size: Optional[Tuple[int, int]] = None
     frame_id: Optional[int] = None
+    canonical_world_required: bool = False
+    world_frame: Optional[str] = None
+    world_frame_revision: Optional[str] = None
     motion_mode: Optional[str] = None
     posture: Optional[str] = None
     trail_append_allowed: Optional[bool] = None
@@ -2440,6 +2443,16 @@ class BevRenderer:
         dropped_footpoints: List[Dict[str, Any]] = []
 
         R_wc, C_world = parse_extrinsics(calib.extrinsics_col_major)
+        calibration_frame = getattr(calib, "calibration_frame", None)
+        expected_world_frame = str(
+            getattr(calib, "world_frame_id", "")
+            or getattr(calibration_frame, "frame_id", "")
+            or "backend_world_m"
+        ).strip()
+        expected_world_revision = str(
+            getattr(calib, "world_frame_revision", "")
+            or getattr(calibration_frame, "revision", "")
+        ).strip()
         max_distance_m = float(self._resolve_max_distance_scene(cfg, calib))
         # In world mode the producer already owns the canonical filtered track.world state.
         # Do not low-pass filter those points again in the BEV renderer.
@@ -2449,6 +2462,32 @@ class BevRenderer:
             anchor_source = str(fp.anchor_source or "").strip().lower()
             if anchor_source == "anchor_hold":
                 continue
+            is_canonical_track = bool(fp.canonical_world_required)
+            if is_canonical_track:
+                observed_world_frame = str(fp.world_frame or "").strip()
+                observed_world_revision = str(
+                    fp.world_frame_revision or ""
+                ).strip()
+                if (
+                    (observed_world_frame and observed_world_frame != expected_world_frame)
+                    or (
+                        observed_world_revision
+                        and expected_world_revision
+                        and observed_world_revision != expected_world_revision
+                    )
+                ):
+                    dropped_footpoints.append(
+                        {
+                            "stableId": fp.stable_id,
+                            "trackerId": fp.tracker_id,
+                            "reason": "canonical_world_revision_mismatch",
+                            "worldFrame": observed_world_frame or None,
+                            "worldFrameRevision": observed_world_revision or None,
+                            "expectedWorldFrame": expected_world_frame,
+                            "expectedWorldFrameRevision": expected_world_revision or None,
+                        }
+                    )
+                    continue
             selection_debug: Optional[Dict[str, Any]] = None
             prefer_floor_contact = False
             wx = wz = None
@@ -2543,7 +2582,10 @@ class BevRenderer:
                 if (
                     wx is not None
                     and wz is not None
-                    and self._world_source_is_live_tracking(fp.anchor_source)
+                    and (
+                        is_canonical_track
+                        or self._world_source_is_live_tracking(fp.anchor_source)
+                    )
                 ):
                     candidate_x, candidate_z = self._world_to_camera_local_ground(
                         float(wx),
@@ -2773,6 +2815,27 @@ class BevRenderer:
                     )
                     display_source = "image_anchor"
 
+                # Live tracked people have exactly one spatial authority:
+                # the producer-owned, filtered ``track.world`` observation.
+                # Depth anchors and image/floor rays above are retained only as
+                # diagnostics; a renderer must never turn them into a second
+                # person-position estimator.
+                if is_canonical_track:
+                    if world_candidate is None or not bool(
+                        world_candidate.get("insideBounds", False)
+                    ):
+                        continue
+                    px = float(world_candidate["x"])
+                    pz = float(world_candidate["z"])
+                    display_source = "world_to_camera_local"
+                    selection_debug = {
+                        "selected": "world_to_camera_local",
+                        "reason": "canonical_live_world_only",
+                        "worldCandidate": world_candidate,
+                        "registeredDepthCandidate": registered_depth_candidate,
+                        "floorContactCandidate": floor_contact_candidate,
+                    }
+
                 if max_distance_m > 0.0 and math.hypot(float(px), float(pz)) > max_distance_m:
                     continue
                 if prefer_floor_contact and not self._point_in_admission_surface(
@@ -2893,11 +2956,25 @@ class BevRenderer:
                     ),
                     "idle_jitter_m": float(fp.idle_jitter_m) if fp.idle_jitter_m is not None else None,
                     "requires_admission_gate": bool(prefer_floor_contact),
+                    "canonical_world_required": is_canonical_track,
+                    "world_frame": str(fp.world_frame) if fp.world_frame else None,
+                    "world_frame_revision": (
+                        str(fp.world_frame_revision)
+                        if fp.world_frame_revision
+                        else None
+                    ),
                 }
             )
 
+        points_smoothed = bool(
+            apply_backend_smoothing
+            and any(
+                not bool(item.get("canonical_world_required"))
+                for item in raw_points
+            )
+        )
         with self._lock:
-            if apply_backend_smoothing:
+            if points_smoothed:
                 self._smoother.prune(now_s)
             for item in raw_points:
                 history_key = item["history_key"]
@@ -2907,7 +2984,9 @@ class BevRenderer:
                 method = str(item["method"])
                 stable_id = item.get("stable_id")
                 tracker_id = item.get("tracker_id")
-                if apply_backend_smoothing:
+                if apply_backend_smoothing and not bool(
+                    item.get("canonical_world_required")
+                ):
                     smooth_x = float(lx)
                     smooth_z = float(lz)
                     smoother_key = (camera_id, *history_key)
@@ -2966,6 +3045,8 @@ class BevRenderer:
                     'trailBreakRequired': item.get("trail_break_required"),
                     'trailSegmentId': item.get("trail_segment_id"),
                     'idleJitterM': item.get("idle_jitter_m"),
+                    'worldFrame': item.get("world_frame"),
+                    'worldFrameRevision': item.get("world_frame_revision"),
                 }
                 point_payload.update(
                     self._floorplan_point_fields(
@@ -3251,7 +3332,7 @@ class BevRenderer:
             ),
             width_px=width_px,
             height_px=height_px,
-            points_smoothed=bool(apply_backend_smoothing),
+            points_smoothed=points_smoothed,
             bounds_source=str(bounds_source),
             floorplan_space=active_floorplan_space,
             coverage_envelope=coverage_envelope,
@@ -3316,6 +3397,16 @@ class BevRenderer:
             except Exception:
                 sample_xz = None
             frame_name = "backend_world_m" if self._frame_mode == "world" else "camera_local_ground_m"
+            calibration_frame = getattr(calib, "calibration_frame", None)
+            canonical_world_frame = str(
+                getattr(calib, "world_frame_id", "")
+                or getattr(calibration_frame, "frame_id", "")
+                or "backend_world_m"
+            ).strip()
+            canonical_world_revision = str(
+                getattr(calib, "world_frame_revision", "")
+                or getattr(calibration_frame, "revision", "")
+            ).strip()
             floorplan_space = result.floorplan_space
             display_bounds = {
                 "min_x": float(result.config.x_range[0]),
@@ -3421,6 +3512,12 @@ class BevRenderer:
                 "sampleXZ": list(sample_xz) if sample_xz is not None else None,
                 "frame": frame_name,
                 "world_frame": frame_name,
+                "canonicalWorldFrame": canonical_world_frame,
+                "canonicalWorldFrameRevision": canonical_world_revision or None,
+                "canonicalWorldTransformSha256": (
+                    str(getattr(calib, "frame_transform_sha256", "") or "").strip()
+                    or None
+                ),
                 "frame_mode": self._frame_mode,
                 "units": "meters",
                 "s_obj_to_m": float(getattr(calib, "unit_scale", 1.0) or 1.0),

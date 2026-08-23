@@ -318,11 +318,12 @@ the sources and fails fast if an enabled camera lacks a valid
 DAv2-to-MapAnything registration entry.
 
 The baseline DAv2 capture and later object-fusion operators rendezvous by exact
-`(source_id, frame_id, media PTS)`. Fusion waits for the exact sibling frame for
-`NOESIS_OBJECT_DEPTH_EXACT_FRAME_WAIT_MS` (20 ms by default, clamped to
-0–250 ms). Only after that bounded wait expires may it use an admissible prior
-frame within the configured depth cadence; it never waits indefinitely or
-accepts a future/wrong-source frame. The result is observable under
+`(source_id, frame_id, media PTS)`. Live fusion is nonblocking by default
+(`NOESIS_OBJECT_DEPTH_EXACT_FRAME_WAIT_MS=0`, clamped to 0–250 ms): it consumes
+the exact sibling when already available, otherwise an admissible prior frame
+within the configured depth cadence. An explicit positive wait remains
+available for bounded offline diagnostics; future and wrong-source frames are
+never accepted. The result is observable under
 `pipeline.zero_copy_core.counters`:
 
 - `depth_bridge_put_total`, `depth_bridge_exact_resolve_total`,
@@ -415,6 +416,9 @@ Emitted by `BevRenderer`:
   "floorplanGridResM": <float|null>,
   "floorplanSnapshotTsUs": <int|null>,
   "floorplanTsUs": <int|null>,
+  "floorplanSnapshotId": "<immutable snapshot id>",
+  "floorplanSnapshotContentSha256": "<sha256>",
+  "floorplanCalibrationFingerprint": "<sha256>",
   "overlay": <bool>,
   "footpoints": [
     {
@@ -428,6 +432,8 @@ Emitted by `BevRenderer`:
       "anchorQuality": "<string|null>",
       "anchorReason": "<string|null>",
       "displaySource": "world"|"world_to_camera_local"|"image_anchor"|"image_depth_anchor"|"floor_contact_ray"|"registered_depth_anchor",
+      "worldFrame": "backend_world_m"|null,
+      "worldFrameRevision": "<revision>"|null,
       "motionMode": "walk"|"idle"|"sit"|"lie"|"unknown"|null,
       "posture": "standing"|"sitting"|"lying"|"unknown"|null,
       "trailAppendAllowed": <bool|null>,
@@ -442,6 +448,9 @@ Emitted by `BevRenderer`:
   "sampleXZ": [<float x>, <float z>] | null,
   "frame": "backend_world_m"|"camera_local_ground_m",
   "world_frame": "backend_world_m"|"camera_local_ground_m",
+  "canonicalWorldFrame": "backend_world_m",
+  "canonicalWorldFrameRevision": "<revision>"|null,
+  "canonicalWorldTransformSha256": "<sha256>"|null,
   "frame_mode": "world"|"camera_local",
   "units": "meters",
   "s_obj_to_m": <float>,
@@ -458,6 +467,10 @@ Emitted by `BevRenderer`:
   repeats that `frameId`. Validators join by camera/source/frame and require
   the tracking and BEV observation times to agree; last-seen identity joins are
   not an acceptable substitute.
+- The top-level cohort fields, nested `cohort`, and
+  `trackingOutboundSubmissionId` are all required. Dashboard ingestion rejects
+  partial, contradictory, duplicate, or older cohorts, including frames that
+  arrive after a status/error message.
 - When the BEV renderer is active, tracking and BEV share one publication gate.
   Its effective interval is
   `max(selected tracking interval, configured BEV interval)`, where the
@@ -472,13 +485,14 @@ Emitted by `BevRenderer`:
   that frame. A renderer that is not configured does not change tracking
   cadence.
 - `footpoints[].anchorSource`, `anchorQuality`, and `anchorReason` mirror the backend world estimator diagnostics from tracking telemetry so BEV/Three.js consumers can explain why a point was accepted, guarded, or held.
-- `footpoints[].displaySource` declares which coordinate path produced the displayed BEV point. The primary inline floorplan view uses `frame_mode=camera_local` and `frame=camera_local_ground_m`, so displayed points and producer trails are in the same camera-local ground frame as MapAnything floorplan rasters. For tracked people, a valid in-bounds registered-depth anchor is the stable active-floorplan display source when available. `world_to_camera_local` is used when live backend world evidence is available and the registered-depth display point is not usable. `floor_contact_ray` is the calibrated image-ground fallback when no current registered-depth or live world display point is available. `image_depth_anchor` remains a legacy/non-person direct image-depth path; static MapAnything/floorplan snapshots are not a live person-depth placement source.
+- `footpoints[].displaySource` declares which coordinate path produced the displayed BEV point. The primary inline floorplan view uses `frame_mode=camera_local` and `frame=camera_local_ground_m`, so displayed points and producer trails are in the same camera-local ground frame as MapAnything floorplan rasters. Every live tracker footpoint is marked canonical-world-required by the DS9 producer: its only admissible production display source is `world_to_camera_local`, projected from the producer-owned filtered `track.world`. Registered depth, floor-contact rays, and image anchors may appear in alignment diagnostics, but they cannot move a live tracked-person dot. A live track without a finite, in-bounds canonical world point is omitted. `registered_depth_anchor`, `floor_contact_ray`, `image_depth_anchor`, and `image_anchor` remain legacy/non-tracker or diagnostic source values only.
 - `floorplanBounds` and the other `floorplan*` fields bind the MapAnything raster
   to the active floorplan registry's metric bounds, grid, resolution, exact
   snapshot identity, and capture timestamps. The registry accepts only
-  successful `camera_local_ground_m`/meter floorplans with a current calibration
-  fingerprint; stale, conflicting, or malformed responses never replace the
-  active record.
+  successful `camera_local_ground_m`/meter floorplans with an exact snapshot
+  ID, content SHA, and current calibration fingerprint tuple. Stale,
+  conflicting, or malformed responses never replace the active record, and
+  the dashboard clears points instead of retaining a dot across a mismatch.
   When a reviewed ray-to-floorplan transform exists, `floorplanAlignment`
   reports its quality/count/residual evidence and whether it was applied.
 - A configured `coverageEnvelope` is a separate semantic admission surface for
@@ -533,7 +547,7 @@ Emitted by `BevRenderer`:
 
 ### BEV Trail Jitter Regression Checks
 
-When a camera-local floorplan trail looks jumpy or twitchy, first check whether the producer is mixing coordinate spaces or switching display sources before adding smoothing. `BevRenderer` resets that camera's smoother and trail history when the active floorplan coordinate-space signature changes, and resets the affected tracker history when its selected display source changes; otherwise samples from distinct measurement regimes can be spliced into one apparently continuous path. Once the active floorplan is ready, a valid in-bounds registered-depth anchor is the stable display source, while live fused-world candidates remain diagnostic unless registered depth is unusable.
+When a camera-local floorplan trail looks jumpy or twitchy, first check whether the producer is mixing coordinate spaces or revisions before adding smoothing. `BevRenderer` resets that camera's smoother and trail history when the active floorplan coordinate-space signature changes. Live tracked-person history has one stable source, `world_to_camera_local`; registered depth and floor-ray candidates are diagnostic only and cannot create source-switch trail segments. Canonical live points are not smoothed again in BEV: each displayed point is the direct revision-checked transform of that cohort's filtered `track.world`.
 
 BEV renderer health is fail-closed. A current homography failure publishes a
 `bev-status` error and is never hidden with a last-known transform. Homography
@@ -732,7 +746,8 @@ Empty frames are first-class: when a camera's active person count is zero, Noesi
         "calibrated_confidence": <float|null>,
         "provisional_evidence_count": <int|null>,
         "overlap_permit": <bool|null>,
-        "fresh_embedding": <bool|null>
+        "fresh_embedding": <bool|null>,
+        "evidence_persistence": "durable"|"queued"|"dropped"|null
       } | null,
       "id_event": "<string|null>",
       "id_reject_reason": "<string|null>",
@@ -821,21 +836,23 @@ track and its matching `observations[].payload`:
   the reviewed Swin `fc_pred` profile).
 
 The triad is stamped only after the private evidence append returns a complete,
-model-matching record for every observation in that source frame. If evidence
-capture is disabled, the append fails, or identity is only a continuity hold,
-all three fields are omitted. Partial triads are contract errors. Their absence
-does not by itself mean that no live embedding was extracted; it means there is
-no durable public-to-private evidence linkage. Raw embedding vectors are never
-part of public tracking or observation payloads.
+model-matching durable record for every observation in that source frame. Async
+DS9/replay publication may omit the triad while the frame is still being
+persisted; `identity_v2.evidence_persistence` is then `queued` or `dropped`.
+Partial triads are contract errors. Raw embedding vectors are never part of
+public tracking or observation payloads.
 
 `embedding_present` is exact current-frame truth owned by identity-v2. It is
-`true` only when the server extracted and validated a model-profile embedding
-for that exact track/frame, so the row also has `identity_observation_key`.
-Legacy StableID gallery/cache diagnostics cannot set it. When shadow evidence
-capture is active, every such row must also carry the complete persisted triad
-above on both the public track and canonical observation. A missing tensor or a
-tracker-continuity hold sets `identity_v2.fresh_embedding=false`, clears the
-key/triad, and reports `embedding_present=false`.
+`true` when the server extracted and validated a model-profile embedding for
+that exact track/frame, so the row also has `identity_observation_key`.
+Legacy StableID gallery/cache diagnostics cannot set it. `fresh_embedding`
+likewise describes the live identity decision. `evidence_persistence` is
+`durable` when the triad is present, `queued` while async score-only evidence
+is awaiting the writer, and `dropped` when bounded admission discarded it.
+Queued/dropped rows retain live identity truth but are not durable evidence
+anchors. A missing tensor or tracker-continuity hold sets
+`identity_v2.fresh_embedding=false`, clears the key/triad, and reports
+`embedding_present=false`.
 
 `observations[].payload.depth_present` is semantic evidence, not a proxy for a
 non-null depth field. Registered depth is usable only when both
@@ -992,7 +1009,9 @@ Depth exposure:
 - `depth_registration_id` identifies the exact per-camera registration artifact entry used by the estimator.
 - `depth_status`, `depth_anchor_source`, `depth_sample_count`, and `depth_valid_fraction` are published on both `tracking.tracks[]` and `stats.payload.cameras[*].tracking.active_tracks[]` so the runtime OSD and dashboard can explain whether baseline depth is contributing on a given frame.
 - `depth_anchor_sample_count` and `depth_anchor_valid_fraction` surface the support of the actual lower-body / torso anchor band that drove the fused update. These fields are the canonical explanation for why a track landed on `pose_depth_fused` / `person_anchor_depth_fused` versus `pose_floor_only` / `person_anchor_floor_only`; whole-mask support can be lower or noisier without disqualifying a good anchor-band sample.
-- The on-screen `z=` label is sourced from the same `depth_used_m` value that the estimator actually projected, not directly from the raw `depth_anchor_m`.
+- The on-screen `depth=` label is optical/registered range sourced from
+  `depth_used_m`; it is not canonical world Z. The parser still removes or
+  preserves legacy `z=` fragments during mixed-version transitions.
 - The strict observation's `depth_present` boolean follows the usable-depth
   rule above. Consumers must not infer it from `depth_anchor_m`,
   `depth_median_m`, or attachment attempts independently.

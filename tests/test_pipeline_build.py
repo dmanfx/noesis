@@ -454,6 +454,15 @@ def test_ds9_build_pipeline_honors_analytics_exclude_env(
     graph = ds9_pipeline.build_pipeline(ROOT / "DS9" / "config" / "infer.yaml")
 
     assert graph.components["analytics_exclude"].config["config-file"] == str(exclude_path)
+    assert graph.components["osd"].config["process-mode"] == 1
+    assert graph.components["depth_tracking_queue"].config == {
+        "leaky": 2,
+        "max-size-buffers": 2,
+        "max-size-bytes": 0,
+        "max-size-time": 0,
+    }
+    assert graph.components["streammux"].config["buffer-pool-size"] == 8
+    assert graph.components["tiler"].config["buffer-pool-size"] == 8
     expected_latest_only_queue = {
         "leaky": 2,
         "max-size-buffers": 4,

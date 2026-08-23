@@ -169,6 +169,39 @@ def test_journal_rejects_main_database_inode_swap_while_open(
     journal.close()
 
 
+def test_journal_rejects_main_database_swap_after_path_validation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import noesis_core.journal as journal_module
+
+    path = tmp_path / "world.sqlite3"
+    journal = ContractJournal(path)
+    journal.append_many([_payload(1)], recorded_at_us=2_000)
+    original = tmp_path / "original.sqlite3"
+    real_validate = journal_module.validate_private_file
+    swapped = False
+
+    def validate_then_swap(*args, **kwargs):
+        nonlocal swapped
+        validated = real_validate(*args, **kwargs)
+        if not swapped and kwargs.get("label") == "contract journal":
+            swapped = True
+            path.rename(original)
+            path.touch(mode=0o600)
+        return validated
+
+    monkeypatch.setattr(journal_module, "validate_private_file", validate_then_swap)
+    with pytest.raises(ContractJournalError, match="database inode changed"):
+        journal.records()
+
+    path.unlink()
+    original.rename(path)
+    monkeypatch.setattr(journal_module, "validate_private_file", real_validate)
+    assert len(journal.records()) == 1
+    journal.close()
+
+
 def test_journal_revalidates_main_inode_after_connection_close(
     tmp_path: Path,
 ) -> None:
@@ -276,6 +309,93 @@ def test_journal_is_bounded_restartable_and_owner_only(tmp_path: Path) -> None:
     assert path.stat().st_mode & 0o777 == 0o600
     assert path.parent.stat().st_mode & 0o777 == 0o700
     assert ContractJournal(path, max_records=3, max_age_us=1_000_000).records() == records
+
+
+def test_journal_retention_append_work_does_not_scale_with_capacity(
+    tmp_path: Path,
+) -> None:
+    def append_vm_steps(capacity: int) -> int:
+        journal = ContractJournal(
+            tmp_path / f"world-{capacity}.sqlite3",
+            max_records=capacity,
+            max_age_us=10_000_000,
+        )
+        journal.append_many(
+            [_payload(sequence) for sequence in range(capacity)],
+            recorded_at_us=2_000,
+        )
+        connection = journal._connection_handle
+        assert connection is not None
+        steps = 0
+
+        def count_step() -> None:
+            nonlocal steps
+            steps += 1
+
+        connection.set_progress_handler(count_step, 1)
+        try:
+            journal.append_many([_payload(capacity)], recorded_at_us=2_001)
+        finally:
+            connection.set_progress_handler(None, 0)
+        assert [record.sequence for record in journal.records()] == list(
+            range(1, capacity + 1)
+        )
+        journal.close()
+        return steps
+
+    small_steps = append_vm_steps(64)
+    large_steps = append_vm_steps(2_048)
+
+    assert large_steps <= small_steps + 100
+
+
+def test_journal_long_aged_prefix_uses_timestamp_index(
+    tmp_path: Path,
+) -> None:
+    def prune_vm_steps(capacity: int) -> int:
+        journal = ContractJournal(
+            tmp_path / f"aged-{capacity}.sqlite3",
+            max_records=capacity + 1,
+            max_age_us=50,
+        )
+        journal.append_many(
+            [_payload(sequence) for sequence in range(capacity)],
+            recorded_at_us=100,
+        )
+        connection = journal._connection_handle
+        assert connection is not None
+        steps = 0
+
+        def count_step() -> None:
+            nonlocal steps
+            steps += 1
+
+        connection.execute(
+            "INSERT INTO records("
+            "sequence, recorded_at_us, contract, payload_json, "
+            "previous_sha256, record_sha256"
+            ") SELECT ?, ?, contract, payload_json, previous_sha256, "
+            "printf('%064x', ?) "
+            "FROM records WHERE sequence = 0",
+            (capacity, 1_000, capacity + 1),
+        )
+        connection.set_progress_handler(count_step, 1)
+        try:
+            boundary = journal._age_delete_through(
+                connection,
+                cutoff=950,
+                observed_last_sequence=capacity,
+            )
+        finally:
+            connection.set_progress_handler(None, 0)
+        assert boundary == capacity - 1
+        journal.close()
+        return steps
+
+    small_steps = prune_vm_steps(512)
+    large_steps = prune_vm_steps(8_192)
+
+    assert large_steps <= small_steps + 200
 
 
 def test_journal_detects_database_tampering(tmp_path: Path) -> None:
@@ -544,6 +664,28 @@ def _stored_record_sha256(
     return hashlib.sha256(encoded).hexdigest()
 
 
+def test_journal_append_hashes_match_canonical_core(tmp_path: Path) -> None:
+    journal = ContractJournal(tmp_path / "world.sqlite3")
+    appended = journal.append_entries(
+        (
+            (_payload(1), 2_000),
+            (_payload(2), 2_001),
+        )
+    )
+
+    assert [record.record_sha256 for record in appended] == [
+        _stored_record_sha256(
+            sequence=record.sequence,
+            recorded_at_us=record.recorded_at_us,
+            payload=record.payload,
+            previous_sha256=record.previous_sha256,
+        )
+        for record in appended
+    ]
+    assert journal.records() == appended
+    journal.close()
+
+
 def _assert_reopen_rejects_and_cleans_up(path: Path) -> None:
     with pytest.raises(ContractJournalError):
         ContractJournal(path)
@@ -734,8 +876,14 @@ def test_journal_rolls_back_transaction_after_baseexception(
     journal = ContractJournal(tmp_path / "world.sqlite3")
     real_prune = journal._prune
 
-    def abort_prune(_connection, *, now_us: int) -> None:
+    def abort_prune(
+        _connection,
+        *,
+        now_us: int,
+        last_sequence: int,
+    ) -> None:
         assert now_us == 2_000
+        assert last_sequence == 0
         raise DeliberateAbort
 
     monkeypatch.setattr(journal, "_prune", abort_prune)
@@ -1038,8 +1186,14 @@ def test_journal_rollback_failure_poison_is_sticky_and_restart_safe(
         def close(self) -> None:
             real_connection.close()
 
-    def abort_prune(_connection, *, now_us: int) -> None:
+    def abort_prune(
+        _connection,
+        *,
+        now_us: int,
+        last_sequence: int,
+    ) -> None:
         assert now_us == 2_000
+        assert last_sequence == 0
         raise DeliberateAbort
 
     journal._connection_handle = RollbackFailureConnection()  # type: ignore[assignment]

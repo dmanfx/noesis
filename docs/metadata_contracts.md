@@ -364,11 +364,14 @@ watermark so absence cannot be confused with replay or telemetry stall.
   omitted when evidence capture is disabled, persistence fails, or the public
   identity is only a tracker-continuity hold. Partial triads are invalid.
 - `embedding_present` is rewritten by the process-owned identity-v2 adapter and
-  describes only a valid server extraction for that exact track/frame. A
-  legacy gallery/cache diagnostic is not frame evidence. With shadow capture
-  enabled, a true value requires the exact observation key and the complete
-  persisted triad on both the detached public track and strict observation.
-  Missing tensors and continuity holds set it false and clear those fields.
+  describes a valid server extraction for that exact track/frame. A legacy
+  gallery/cache diagnostic is not frame evidence. `identity_observation_key`
+  and `identity_v2.fresh_embedding` likewise describe live extraction/decision
+  truth. Async DS9/replay rows may omit the durable triad while
+  `identity_v2.evidence_persistence` is explicitly `queued` or `dropped`;
+  those rows retain live identity truth but cannot serve as durable evidence
+  anchors. Synchronous persisted rows use `durable`. Missing tensors and
+  continuity holds set the live fields false and clear the key/triad.
 - The adapter may retain a resolved public overlay for a bounded tracker-
   continuity window when SGIE does not emit a fresh tensor on an intervening
   frame. It does not retain that row as overlap/enrollment evidence, marks it
@@ -565,12 +568,19 @@ box-only detectors use a bounded lower-person bbox band.
 
 **Notes:**
 
-- The payload is attached per object only after full-frame depth has been aligned once into canonical post-mux DS9.1 frame coordinates. `instance_mask` samples the decoded mask; `bbox_band` samples the configured lower-person band when the selected detector has no usable mask.
+- The payload is attached per object only after full-frame depth has been aligned once into canonical post-mux DS9.1 frame coordinates. `instance_mask` samples decoded person support; `pose_capsule` samples ankle/lower-leg support derived from attached pose metadata. A bbox-only core sample is diagnostic and cannot become person-ground authority.
 - `bbox` and all mask/band/depth statistics are expressed in that canonical DS9.1 frame space. Source-native dimensions (`source_frame_width`, `source_frame_height`) are diagnostic-only and must not be used for object-depth sampling.
 - If neither the native mask nor bounded bbox-band path can produce usable statistics, the aligned depth frame is not ready, or geometry is inconsistent, the payload may still be attached with a non-`"ok"` `status`.
 - `status` is mandatory and distinguishes usable samples (`"ok"`) from object-local failures such as `"no_valid_depth"`, `"missing_mask"`, `"mask_decode_failed"`, `"depth_not_ready"`, or `"transform_mismatch"`.
 - Version `2` adds optional person-only spatial fields derived from the segmentation mask plus the DS9.1 calibration bundle. `anchor_uv` is the bottom-of-mask image anchor in canonical frame space, `anchor_depth_m` is the preferred lower-body or torso-core depth sample, and `world_point*` fields are produced by `pixel_to_world(...)` without applying `align.matrix`.
 - `anchor_sample_count` and `anchor_valid_fraction` describe the support of the specific lower-body / torso anchor band that produced `anchor_depth_m`. Baseline DS9.1 tracking weights DAv2 using these anchor-band support fields instead of whole-mask support alone so far-camera people can still contribute depth when the chosen anchor band is well supported.
+- `depth_spread_m` and `anchor_depth_spread_m` are P10-P90 evidence spreads.
+  `evidence_quality` and `evidence_reason` state whether support was accepted;
+  high-spread, low-support, and bbox-only person evidence is rejected.
+- `measurement_frame_id`, `measurement_ts_us`, `measurement_age_us`, and
+  `measurement_cached` retain the original sample provenance when a bounded
+  prior depth result is reused; cache reuse never rewrites an old observation
+  as a current measurement.
 - `projection_method` is one of `"depth"`, `"floor_guarded"`, `"depth_only"`, or `"floor_only"`. `spatial_status` surfaces whether that world projection is usable (`"ok"`) or why it is absent (`"geometry_unavailable"`, `"anchor_unavailable"`, `"projection_unavailable"`).
 - In the baseline DS9.1 runtime, `NOESIS.OBJECT_DEPTH` is required by the fused
   world estimator. The runtime consumes the raw depth/anchor fields (`status`,
@@ -582,12 +592,14 @@ box-only detectors use a bounded lower-person bbox band.
 - Non-person classes keep the raw object-depth payload behavior and omit the spatial fields.
 - The runtime uses a bounded internal aligned-depth cache to hand the canonical full-frame depth map from the depth-capture operator to the later object-fusion/overlay operators. That cache is prototype-internal only and is not a public DS9.1 metadata contract.
 - The bridge keys frames by exact `(source_id, frame_id, media PTS)`. Object
-  fusion waits up to `NOESIS_OBJECT_DEPTH_EXACT_FRAME_WAIT_MS` for the sibling
-  DAv2 frame (20 ms default, hard-clamped to 0–250 ms), then may use only a
-  same-source, non-future prior frame within the configured cadence. Wrong-PTS,
-  future, over-age, and wrong-source frames are misses rather than implicit
-  matches.
-- `sampling_mode` explicitly identifies `"instance_mask"` or `"bbox_band"`;
+  fusion is nonblocking by default
+  (`NOESIS_OBJECT_DEPTH_EXACT_FRAME_WAIT_MS=0`, hard-clamped to 0–250 ms): it
+  consumes an already-available exact frame or only a same-source, non-future
+  prior frame within the configured cadence. A positive wait is available for
+  explicit bounded diagnostics. Wrong-PTS, future, over-age, and wrong-source
+  frames are misses rather than implicit matches.
+- `sampling_mode` explicitly identifies instance-mask, pose-capsule, or
+  bbox-diagnostic sampling;
   consumers must not infer one mode from missing numeric fields.
 - `unit` and `is_metric` travel with the payload so downstream consumers can distinguish metric meters from relative-depth fallbacks without guessing from the model name.
 - `depth_map_ref` is optional and is an opaque pointer to any stored full-frame depth artifact when one exists; consumers must not parse semantics out of the string.

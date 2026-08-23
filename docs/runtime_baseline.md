@@ -1,6 +1,6 @@
 # Native DeepStream 9.1 runtime baseline
 
-Status: accepted application baseline, updated 2026-08-15.
+Status: accepted application baseline, updated 2026-08-23.
 
 ## Platform
 
@@ -66,14 +66,33 @@ ports.
 
 ## Performance reference
 
-After restoring dependency/environment parity and removing identity-retention
-work from the per-frame hot path, the live three-camera app returned to roughly
-29.9 FPS per camera.
+The accepted occupied-scene baseline preserves all selected models, input
+resolution, inference cadence, tracking, depth, pose, identity, world/BEV, and
+WebRTC output. It does not obtain throughput by skipping inference or reducing
+quality.
 
-A bounded 90.67-second recorded pressure run using the non-July sample MP4s
-measured 25.45 FPS per camera (76.36 aggregate), average CPU 128.2%, average GPU
-53.1%, and VRAM p95 6380 MiB, with no pipeline errors or zero-copy violations.
-This is a practical regression reference, not a hardware benchmark guarantee.
+The 2026-08-23 recovery removed a full 3840x720 RGBA device-to-host and
+host-to-device round trip from every mosaic frame, made secondary DAv2 work
+latest-frame-only and readiness-query-only, pooled native CUDA/pinned resources,
+moved evidence/gallery persistence off callbacks, prewarmed StableID CUDA work,
+and explicitly sized streammux/tiler pools.
+
+A full three-room replay using the 82.7-second Family Room motion clip sustained
+30.10 encoded access units per second over 90.1 seconds. Encoded-AU p99 was
+80 ms, the maximum gap was 144 ms, no gap exceeded 150 or 250 ms, all sources
+remained healthy at approximately 30 FPS, the H.264 feeder dropped zero frames,
+and WebRTC decoded 908 frames in 30 seconds.
+
+The finalized live baseline then measured 29.8-30.0 FPS for every camera with
+zero source recovery attempts. A direct 30-second H.264 sample delivered 912
+access units at 30.36 FPS; p99 was 57.5 ms, the maximum gap was 65.9 ms, and no
+gap exceeded 100 ms. A direct WebRTC client decoded 305 frames in 10 seconds.
+
+These are practical regression references on the accepted host, not universal
+hardware guarantees. Compare source progress, encoded cadence/drops, and
+WebRTC decode separately according to
+[`performance_invariants.md`](performance_invariants.md); the dashboard's
+aggregate receiver FPS is not a substitute for those measurements.
 
 ## Accepted visual behavior
 

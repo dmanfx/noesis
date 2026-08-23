@@ -127,7 +127,7 @@ export function discoverCamerasFromPayloads(payloads: any[]): CameraKey[] {
     }
 
     // From floorplan or bev meta
-    const cam = p.camera || p.cameraId || p.camId;
+    const cam = p.camera || p.cameraId || p.camId || p.camera_id || p.cam_id;
     if (cam) addCameraKey(discovered, cam);
   }
 

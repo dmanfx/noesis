@@ -1324,6 +1324,48 @@ class IdentityStore:
                 )
         return tuple(out)
 
+    def load_visitor_gallery(
+        self,
+        session_uuid: str,
+    ) -> Tuple[VisitorSession, Tuple[VisitorExemplarRecord, ...]]:
+        """Load one visitor session and its bounded gallery.
+
+        This is the mutation-side counterpart to
+        :meth:`load_active_visitor_galleries`.  Runtime updates already know
+        the exact session that changed, so reading that gallery directly
+        avoids reloading every active visitor gallery after each observation.
+        The caller remains responsible for applying active/expiry semantics.
+        """
+
+        session_id = str(session_uuid)
+        with self._lock:
+            session_row = self._conn.execute(
+                "SELECT * FROM visitor_sessions WHERE session_uuid = ?",
+                (session_id,),
+            ).fetchone()
+            if session_row is None:
+                raise KeyError(f"unknown visitor session UUID: {session_uuid}")
+            session = VisitorSession(
+                session_uuid=str(session_row["session_uuid"]),
+                slot=int(session_row["slot"]),
+                generation=int(session_row["generation"]),
+                state=str(session_row["state"]),
+                model_fingerprint=str(session_row["model_fingerprint"]),
+                embedding_dim=int(session_row["embedding_dim"]),
+                created_at=float(session_row["created_at"]),
+                last_seen_at=float(session_row["last_seen_at"]),
+                expires_at=float(session_row["expires_at"]),
+            )
+            rows = self._conn.execute(
+                """
+                SELECT * FROM visitor_exemplars
+                WHERE session_uuid = ?
+                ORDER BY created_at, exemplar_uuid
+                """,
+                (session_id,),
+            ).fetchall()
+        return session, tuple(self._visitor_exemplar_from_row(row) for row in rows)
+
     def release_visitor_session(
         self, session_uuid: str, *, now: Optional[float] = None
     ) -> None:

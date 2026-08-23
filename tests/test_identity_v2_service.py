@@ -924,12 +924,63 @@ def test_shadow_service_exports_score_only_evidence_with_explicit_session(tmp_pa
         assert "embedding" not in rows[0]
         assert "vector" not in rows[0]
         assert rows[0]["embedding_dim"] == 4
+        assert primitive.public_track["identity_v2"]["evidence_persistence"] == (
+            "durable"
+        )
         assert primitive.public_track["embedding_sequence"] == rows[0]["sequence"]
         assert (
             primitive.public_track["embedding_model_sha256"] == rows[0]["model_sha256"]
         )
         assert primitive.public_track["embedding_dimension"] == rows[0]["embedding_dim"]
         assert service.evidence_recorder.health().recorded_event_count == 1
+    finally:
+        service.close()
+
+
+def test_ds9_default_evidence_runtime_uses_async_writer_without_override(tmp_path):
+    evidence_path = tmp_path / "evidence" / "shadow.jsonl"
+    service, _ = _service(
+        tmp_path,
+        extra_env={
+            "NOESIS_DEEPSTREAM_MAJOR": "9",
+            "NOESIS_IDENTITY_V2_EVIDENCE_PATH": str(evidence_path),
+            "NOESIS_IDENTITY_V2_EVIDENCE_SESSION_ID": "household-session-a",
+        },
+    )
+    try:
+        assert service.evidence_recorder.runtime == "ds9"
+        assert service.evidence_recorder.async_mode is True
+    finally:
+        service.close()
+
+
+def test_async_ds9_service_does_not_publish_queued_evidence_as_durable(
+    tmp_path,
+):
+    evidence_path = tmp_path / "evidence" / "shadow.jsonl"
+    service, _ = _service(
+        tmp_path,
+        extra_env={
+            "NOESIS_DEEPSTREAM_MAJOR": "9",
+            "NOESIS_IDENTITY_V2_EVIDENCE_PATH": str(evidence_path),
+            "NOESIS_IDENTITY_V2_EVIDENCE_SESSION_ID": "household-session-a",
+        },
+    )
+    try:
+        primitive = _primitive(frame=1)
+        service.process_source_frame(
+            camera_id="camera-a",
+            frame_id=1,
+            primitives=(primitive,),
+            observed_at=10.0,
+        )
+        public = primitive.public_track
+        assert public["embedding_present"] is True
+        assert public["identity_observation_key"]["observation_id"].startswith("obs1:")
+        assert "embedding_sequence" not in public
+        assert public["identity_v2"]["fresh_embedding"] is True
+        assert public["identity_v2"]["evidence_persistence"] == "queued"
+        assert primitive.diagnostic_track is None
     finally:
         service.close()
 

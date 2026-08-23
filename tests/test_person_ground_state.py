@@ -250,17 +250,34 @@ def test_height_lock_prevents_bbox_only_torso_from_becoming_sitting() -> None:
     )
 
 
-def test_phase2_bent_leg_blocks_pose_leg_floor() -> None:
+def test_phase2_bent_leg_without_ankles_has_no_floor_contact() -> None:
     cfg = HumanGroundConfig()
     assert legs_are_bent(_kpts_sitting(), config=cfg) is True
     # Zero ankle conf so only leg-extension path would fire for standing logic
     k = _kpts_sitting().copy()
     k[15, 2] = 0.0
     k[16, 2] = 0.0
+    assert (
+        classify_posture(
+            kpts_abs=k,
+            bbox=[0.0, 0.0, 90.0, 110.0],
+            height_ref_scene=1.8,
+            config=cfg,
+        )
+        == "sitting"
+    )
     cand = resolve_pose_floor_anchor(k, posture="sitting", config=cfg)
+    assert cand is None
+
+
+def test_phase3_sitting_uses_observed_ankles_not_hips() -> None:
+    cfg = HumanGroundConfig()
+    cand = resolve_pose_floor_anchor(_kpts_sitting(), posture="sitting", config=cfg)
     assert cand is not None
-    assert cand.source in ("pose_hip_floor", "pose_body_floor")
-    assert cand.source != "pose_leg_floor"
+    assert cand.source == "pose_ankle_floor"
+    assert cand.u == pytest.approx(160.0)
+    assert cand.v == pytest.approx(215.0)
+    assert cand.height_lock_eligible is False
 
 
 def test_phase3_standing_uses_ankle_mid() -> None:
@@ -671,7 +688,7 @@ def test_phase6_rdp_and_commit_path_point() -> None:
     assert len(pts) == before
 
 
-def test_source_score_prefers_hip_when_sitting() -> None:
+def test_source_score_never_prefers_hip_when_sitting() -> None:
     ankle = source_score("pose_ankle_floor", quality="good", posture="sitting")
     hip = source_score("pose_hip_floor", quality="good", posture="sitting")
-    assert hip > ankle
+    assert ankle > hip

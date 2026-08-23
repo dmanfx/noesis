@@ -199,9 +199,12 @@ logger = logging.getLogger(__name__)
 _REID_NATIVE_MISSING_LOGGED = False
 _DLPACK_HOST_READ_LOCK = threading.Lock()
 _POSE_META_MAX_JSON_BYTES = 65536
-_OBJECT_DEPTH_EXACT_FRAME_WAIT_DEFAULT_MS = 20.0
+_OBJECT_DEPTH_EXACT_FRAME_WAIT_DEFAULT_MS = 0.0
 _OBJECT_DEPTH_EXACT_FRAME_WAIT_MAX_MS = 250.0
-_OSD_LABEL_DEPTH_RE = re.compile(r"\s+z=(?:n/a|[-+]?\d+(?:\.\d+)?m)\s*$", re.IGNORECASE)
+_OSD_LABEL_DEPTH_RE = re.compile(
+    r"\s+(?:depth|z)=(?:n/a|[-+]?\d+(?:\.\d+)?m)\s*$",
+    re.IGNORECASE,
+)
 _OSD_LABEL_CONF_RE = re.compile(r"\s+[-+]?\d+(?:\.\d+)?\s*$")
 _OSD_LABEL_ID_RE = re.compile(r"\s+(?:\[[^\]]+\]\s*\|\s*\[[^\]]+\]|XX|\d+)\s*$")
 _ENV_TRUE_VALUES = {"1", "true", "yes", "on", "y"}
@@ -677,6 +680,78 @@ def _bounded_depth_stat_values(values: np.ndarray, *, env_name: str = "NOESIS_OB
     return np.asarray(arr[::stride][:max_samples], dtype=np.float32)
 
 
+def _depth_spread_from_bounds(
+    depth_p10: Optional[float],
+    depth_p90: Optional[float],
+) -> Optional[float]:
+    if depth_p10 is None or depth_p90 is None:
+        return None
+    try:
+        spread = float(depth_p90) - float(depth_p10)
+    except Exception:
+        return None
+    if not math.isfinite(spread) or spread < 0.0:
+        return None
+    return float(spread)
+
+
+def _depth_spread_limit_m(depth_m: Optional[float], *, strict: bool) -> float:
+    try:
+        center = abs(float(depth_m)) if depth_m is not None else 0.0
+    except Exception:
+        center = 0.0
+    relative = center * (0.10 if strict else 0.14)
+    floor = 0.25 if strict else 0.35
+    ceiling = 0.55 if strict else 0.75
+    return float(min(ceiling, max(floor, relative)))
+
+
+def _depth_spread_is_supported(
+    depth_m: Optional[float],
+    depth_spread_m: Optional[float],
+    *,
+    strict: bool,
+) -> bool:
+    if depth_m is None or depth_spread_m is None:
+        return False
+    try:
+        center = float(depth_m)
+        spread = float(depth_spread_m)
+    except Exception:
+        return False
+    return bool(
+        math.isfinite(center)
+        and center > 0.0
+        and math.isfinite(spread)
+        and 0.0 <= spread <= _depth_spread_limit_m(center, strict=strict)
+    )
+
+
+def _depth_evidence_rejection_reason(
+    *,
+    sample_count: int,
+    valid_fraction: float,
+    depth_m: Optional[float],
+    depth_spread_m: Optional[float],
+    min_sample_count: int,
+    min_valid_fraction: float,
+    strict_spread: bool,
+) -> Optional[str]:
+    if int(sample_count) < int(min_sample_count):
+        return "depth_support_count_low"
+    if float(valid_fraction) < float(min_valid_fraction):
+        return "depth_support_fraction_low"
+    if depth_spread_m is None:
+        return "depth_spread_unavailable"
+    if not _depth_spread_is_supported(
+        depth_m,
+        depth_spread_m,
+        strict=bool(strict_spread),
+    ):
+        return "depth_spread_exceeded"
+    return None
+
+
 def _extract_person_depth_anchor(
     mask: np.ndarray,
     depth_crop: np.ndarray,
@@ -690,6 +765,8 @@ def _extract_person_depth_anchor(
             anchor_depth_m=None,
             anchor_sample_count=0,
             anchor_valid_fraction=0.0,
+            anchor_depth_spread_m=None,
+            anchor_rejection_reason="empty_person_support",
             lower_body_sample_count=0,
             lower_body_valid_fraction=0.0,
             torso_sample_count=0,
@@ -734,13 +811,27 @@ def _extract_person_depth_anchor(
     lower_area = int(np.count_nonzero(lower_body_mask))
     lower_valid_fraction = float(lower_count) / float(lower_area or 1)
     lower_min_count, lower_min_valid_fraction = _anchor_support_requirements(lower_area, "lower_body_band")
-    if lower_count >= lower_min_count and lower_valid_fraction >= lower_min_valid_fraction:
+    lower_median = float(np.median(lower_values)) if lower_values.size > 0 else None
+    lower_p10 = float(np.percentile(lower_values, 10.0)) if lower_values.size > 0 else None
+    lower_p90 = float(np.percentile(lower_values, 90.0)) if lower_values.size > 0 else None
+    lower_spread = _depth_spread_from_bounds(lower_p10, lower_p90)
+    lower_support_ok = bool(
+        lower_count >= lower_min_count
+        and lower_valid_fraction >= lower_min_valid_fraction
+    )
+    if lower_support_ok and _depth_spread_is_supported(
+        lower_median,
+        lower_spread,
+        strict=False,
+    ):
         return _DepthAnchorSample(
             foot_uv=foot_uv,
             anchor_source="lower_body_band",
-            anchor_depth_m=float(np.median(lower_values)),
+            anchor_depth_m=lower_median,
             anchor_sample_count=lower_count,
             anchor_valid_fraction=lower_valid_fraction,
+            anchor_depth_spread_m=lower_spread,
+            anchor_rejection_reason=None,
             lower_body_sample_count=lower_count,
             lower_body_valid_fraction=lower_valid_fraction,
             torso_sample_count=0,
@@ -754,18 +845,41 @@ def _extract_person_depth_anchor(
     torso_area = int(np.count_nonzero(torso_mask))
     torso_valid_fraction = float(torso_count) / float(torso_area or 1)
     torso_min_count, torso_min_valid_fraction = _anchor_support_requirements(torso_area, "torso_core")
+    torso_median = float(np.median(torso_values)) if torso_values.size > 0 else None
+    torso_p10 = float(np.percentile(torso_values, 10.0)) if torso_values.size > 0 else None
+    torso_p90 = float(np.percentile(torso_values, 90.0)) if torso_values.size > 0 else None
+    torso_spread = _depth_spread_from_bounds(torso_p10, torso_p90)
+    torso_support_ok = bool(
+        torso_count >= torso_min_count
+        and torso_valid_fraction >= torso_min_valid_fraction
+    )
     anchor_depth = (
-        float(np.median(torso_values))
-        if torso_count >= torso_min_count and torso_valid_fraction >= torso_min_valid_fraction
+        torso_median
+        if torso_support_ok
+        and _depth_spread_is_supported(torso_median, torso_spread, strict=False)
         else None
     )
     anchor_source = "torso_core" if anchor_depth is not None else None
+    if anchor_depth is not None:
+        rejection_reason = None
+        anchor_spread = torso_spread
+    elif lower_support_ok and lower_spread is not None:
+        rejection_reason = "lower_body_depth_spread_exceeded"
+        anchor_spread = lower_spread
+    elif torso_support_ok and torso_spread is not None:
+        rejection_reason = "torso_depth_spread_exceeded"
+        anchor_spread = torso_spread
+    else:
+        rejection_reason = "person_depth_support_low"
+        anchor_spread = torso_spread if torso_spread is not None else lower_spread
     return _DepthAnchorSample(
         foot_uv=foot_uv,
         anchor_source=anchor_source,
         anchor_depth_m=anchor_depth,
         anchor_sample_count=torso_count if anchor_depth is not None else 0,
         anchor_valid_fraction=torso_valid_fraction if anchor_depth is not None else 0.0,
+        anchor_depth_spread_m=anchor_spread,
+        anchor_rejection_reason=rejection_reason,
         lower_body_sample_count=lower_count,
         lower_body_valid_fraction=lower_valid_fraction,
         torso_sample_count=torso_count,
@@ -798,6 +912,8 @@ def _depth_used_m(depth_result: Optional[ObjectDepthResult]) -> Optional[float]:
     if depth_result is None:
         return None
     if str(depth_result.status) != "ok":
+        return None
+    if str(depth_result.evidence_quality or "").strip().lower() == "rejected":
         return None
     depth_m = depth_result.anchor_depth_m
     if depth_m is None:
@@ -832,8 +948,8 @@ def _format_depth_label_fragment(depth_result: Optional[ObjectDepthResult], *, d
         return None
     depth_used = _depth_used_m(depth_result)
     if depth_used is not None:
-        return f"z={depth_used:.{max(0, int(decimals))}f}m"
-    return "z=n/a"
+        return f"depth={depth_used:.{max(0, int(decimals))}f}m"
+    return "depth=n/a"
 
 
 def _clean_osd_base_label(label: str) -> str:
@@ -3572,6 +3688,8 @@ class _DepthAnchorSample:
     anchor_depth_m: Optional[float]
     anchor_sample_count: int
     anchor_valid_fraction: float
+    anchor_depth_spread_m: Optional[float]
+    anchor_rejection_reason: Optional[str]
     lower_body_sample_count: int
     lower_body_valid_fraction: float
     torso_sample_count: int
@@ -3607,6 +3725,29 @@ class _AlignedDepthFrame:
     depth_device_frame: Any | None = None
 
 
+def _aligned_depth_frame_is_ready(frame: _AlignedDepthFrame) -> bool:
+    """Return readiness without ever synchronizing a device depth frame.
+
+    Host-backed depth maps are complete when inserted.  The native DAv2 frame
+    exposes ``is_ready()`` as a query-only CUDA event check; a missing method
+    is retained as ready for test doubles and legacy host-backed providers.
+    A failed readiness query is fail-closed so the media callback cannot turn
+    a secondary depth error into a blocking wait.
+    """
+    device_frame = getattr(frame, "depth_device_frame", None)
+    if device_frame is None:
+        return True
+    query = getattr(device_frame, "is_ready", None)
+    if not callable(query):
+        return True
+    try:
+        return bool(query())
+    except Exception:
+        _increment_core_counter("depth_bridge_readiness_error_total")
+        logger.debug("Aligned depth readiness query failed", exc_info=True)
+        return False
+
+
 class _AlignedDepthFrameStore:
     def __init__(self, max_entries: int = 16) -> None:
         self._max_entries = max(2, int(max_entries))
@@ -3636,29 +3777,23 @@ class _AlignedDepthFrameStore:
         pts_key = int(pts_us)
         exact_key = (source_key, frame_key, pts_key)
         max_age = max(0, int(max_age_frames))
-        bounded_wait_ms = _bounded_object_depth_wait_ms(wait_ms)
+        # ``wait_ms`` remains in the contract for callers/config compatibility,
+        # but depth is an optional secondary input on the media callback.  A
+        # wait here serializes encode/analytics behind the private CUDA stream,
+        # so readiness is query-only and the value is deliberately ignored.
         with self._condition:
             exact = self._entries.get(exact_key)
-            if exact is not None:
+            if exact is not None and _aligned_depth_frame_is_ready(exact):
                 _increment_core_counter("depth_bridge_exact_resolve_total")
                 return exact, 0, 0.0
-
-            if bounded_wait_ms > 0.0:
-                _increment_core_counter("depth_bridge_wait_total")
-                deadline = time.monotonic() + (bounded_wait_ms / 1000.0)
-                while exact is None:
-                    remaining_s = deadline - time.monotonic()
-                    if remaining_s <= 0.0:
-                        break
-                    self._condition.wait(timeout=remaining_s)
-                    exact = self._entries.get(exact_key)
-                if exact is not None:
-                    _increment_core_counter("depth_bridge_exact_resolve_total")
-                    return exact, 0, 0.0
-                _increment_core_counter("depth_bridge_wait_timeout_total")
+            if exact is not None:
+                _increment_core_counter("depth_bridge_pending_exact_total")
+            if float(wait_ms or 0.0) > 0.0:
+                _increment_core_counter("depth_bridge_wait_bypassed_total")
 
             if max_age > 0:
-                for candidate in reversed(tuple(self._entries.values())):
+                ready_lagged: list[tuple[int, int, _AlignedDepthFrame]] = []
+                for candidate in self._entries.values():
                     if int(candidate.source_id) != source_key:
                         continue
                     age_frames = frame_key - int(candidate.frame_id)
@@ -3667,6 +3802,19 @@ class _AlignedDepthFrameStore:
                     age_us = pts_key - int(candidate.pts_us)
                     if age_us < 0:
                         continue
+                    if not _aligned_depth_frame_is_ready(candidate):
+                        _increment_core_counter(
+                            "depth_bridge_pending_lagged_skipped_total"
+                        )
+                        continue
+                    ready_lagged.append((int(candidate.frame_id), int(candidate.pts_us), candidate))
+                if ready_lagged:
+                    _candidate_frame_id, _candidate_pts_us, candidate = max(
+                        ready_lagged,
+                        key=lambda item: (item[0], item[1]),
+                    )
+                    age_frames = frame_key - int(candidate.frame_id)
+                    age_us = pts_key - int(candidate.pts_us)
                     age_ms = float(age_us) / 1000.0
                     _increment_core_counter("depth_bridge_lagged_resolve_total")
                     _increment_core_counter(
@@ -5979,6 +6127,7 @@ class _ObjectDepthFusionProcessor:
     calibration_resolver: Any | None = None
     camera_labels: Mapping[int, str] = field(default_factory=dict)
     _result_cache: Dict[Tuple[int, int], Dict[str, Any]] = field(default_factory=dict, init=False, repr=False)
+    _depth_retry_tracks: set[Tuple[int, int]] = field(default_factory=set, init=False, repr=False)
 
     def _max_objects_per_frame(self) -> int:
         return _read_env_int("NOESIS_OBJECT_DEPTH_MAX_OBJECTS_PER_FRAME", 2, min_value=0)
@@ -6064,6 +6213,19 @@ class _ObjectDepthFusionProcessor:
             return None
         payload = {str(k): v for k, v in entry.items() if not str(k).startswith("_")}
         try:
+            measurement_frame_id = int(
+                payload.get("measurement_frame_id", payload.get("frame_id", frame_id))
+            )
+        except Exception:
+            measurement_frame_id = int(frame_id)
+        try:
+            measurement_ts_us = int(
+                payload.get("measurement_ts_us", payload.get("ts_us", pts_us))
+            )
+        except Exception:
+            measurement_ts_us = int(pts_us)
+        measurement_age_us = max(0, int(pts_us) - int(measurement_ts_us))
+        try:
             object_id = int(getattr(obj_meta, "object_id", payload.get("object_id", -1)))
         except Exception:
             object_id = int(payload.get("object_id", -1) or -1)
@@ -6079,6 +6241,10 @@ class _ObjectDepthFusionProcessor:
                 "bbox": [float(x) for x in bbox[:4]],
                 "score": float(score),
                 "ts_us": int(pts_us),
+                "measurement_frame_id": int(measurement_frame_id),
+                "measurement_ts_us": int(measurement_ts_us),
+                "measurement_age_us": int(measurement_age_us),
+                "measurement_cached": True,
             }
         )
         return payload
@@ -6093,6 +6259,11 @@ class _ObjectDepthFusionProcessor:
         max_hz = self._max_hz_per_track()
         if max_hz <= 0.0:
             return False
+        # A previous sample attempt had no ready secondary depth frame.  Do
+        # not let the old valid cache cadence hide the next completed DAv2
+        # frame; retry once per incoming frame until sampling succeeds.
+        if key in self._depth_retry_tracks:
+            return True
         try:
             sample_ts_us = int(entry.get("_sample_ts_us", 0) or 0)
         except Exception:
@@ -6241,6 +6412,210 @@ class _ObjectDepthFusionProcessor:
         band_height = max(1, int(math.ceil(float(height) * self._bbox_fallback_band_fraction())))
         return max(int(y0), int(y1) - int(band_height))
 
+    def _bbox_fallback_rect(
+        self,
+        x0: int,
+        y0: int,
+        x1: int,
+        y1: int,
+    ) -> Tuple[int, int, int, int]:
+        """Return a tight diagnostic ROI for detections without person support.
+
+        Finite depth inside a detector rectangle is not evidence that the
+        pixels belong to the person. Keep this small ROI for diagnostics only;
+        callers must not publish its bottom edge as a floor contact.
+        """
+
+        width = max(1, int(x1) - int(x0))
+        height = max(1, int(y1) - int(y0))
+        width_fraction = _read_env_float(
+            "NOESIS_OBJECT_DEPTH_BBOX_CORE_WIDTH_FRACTION",
+            0.32,
+            min_value=0.10,
+        )
+        height_fraction = _read_env_float(
+            "NOESIS_OBJECT_DEPTH_BBOX_CORE_HEIGHT_FRACTION",
+            0.24,
+            min_value=0.08,
+        )
+        core_width = max(1, min(width, int(math.ceil(width * min(0.60, width_fraction)))))
+        core_height = max(1, min(height, int(math.ceil(height * min(0.40, height_fraction)))))
+        center_x = (int(x0) + int(x1)) // 2
+        core_x0 = max(int(x0), min(int(x1) - 1, center_x - (core_width // 2)))
+        core_x1 = min(int(x1), core_x0 + core_width)
+        core_x0 = max(int(x0), core_x1 - core_width)
+        core_y1 = int(y1)
+        core_y0 = max(int(y0), core_y1 - core_height)
+        return int(core_x0), int(core_y0), int(core_x1), int(core_y1)
+
+    def _attached_pose_keypoints(
+        self,
+        obj_meta: Any,
+        bbox: Tuple[float, float, float, float],
+    ) -> Optional[np.ndarray]:
+        if obj_meta is None or noesis_pose_meta_ext is None:
+            return None
+        extract_pose = getattr(noesis_pose_meta_ext, "extract_pose_features", None)
+        if not callable(extract_pose):
+            return None
+        try:
+            raw_payload = extract_pose(obj_meta)
+        except Exception:
+            return None
+        if raw_payload is None:
+            return None
+        if isinstance(raw_payload, Mapping):
+            payload = dict(raw_payload)
+        else:
+            try:
+                payload = json.loads(str(raw_payload))
+            except Exception:
+                return None
+        if not isinstance(payload, Mapping):
+            return None
+
+        src_bbox = payload.get("bbox")
+        src_width = float(bbox[2])
+        src_height = float(bbox[3])
+        if isinstance(src_bbox, (list, tuple)) and len(src_bbox) >= 4:
+            try:
+                src_width = float(src_bbox[2])
+                src_height = float(src_bbox[3])
+            except Exception:
+                src_width = float(bbox[2])
+                src_height = float(bbox[3])
+        scale_x = float(bbox[2]) / src_width if src_width > 1e-6 else 1.0
+        scale_y = float(bbox[3]) / src_height if src_height > 1e-6 else 1.0
+
+        raw_roi = payload.get("keypoints_roi")
+        if isinstance(raw_roi, (list, tuple)) and len(raw_roi) >= 17:
+            rows: List[List[float]] = []
+            for item in raw_roi[:17]:
+                if not isinstance(item, (list, tuple)) or len(item) < 3:
+                    return None
+                try:
+                    rows.append(
+                        [
+                            float(bbox[0]) + (float(item[0]) * scale_x),
+                            float(bbox[1]) + (float(item[1]) * scale_y),
+                            float(item[2]),
+                        ]
+                    )
+                except Exception:
+                    return None
+            points = np.asarray(rows, dtype=np.float32)
+            if points.shape == (17, 3) and np.isfinite(points).all():
+                return points
+
+        raw_abs = payload.get("keypoints_abs")
+        if not isinstance(raw_abs, (list, tuple)) or len(raw_abs) < 17:
+            return None
+        rows_abs: List[List[float]] = []
+        for item in raw_abs[:17]:
+            if not isinstance(item, (list, tuple)) or len(item) < 3:
+                return None
+            try:
+                rows_abs.append([float(item[0]), float(item[1]), float(item[2])])
+            except Exception:
+                return None
+        points_abs = np.asarray(rows_abs, dtype=np.float32)
+        if points_abs.shape != (17, 3) or not np.isfinite(points_abs).all():
+            return None
+        return points_abs
+
+    def _pose_capsule_masks(
+        self,
+        keypoints: np.ndarray,
+        *,
+        crop_rect: Tuple[int, int, int, int],
+        bbox: Tuple[float, float, float, float],
+    ) -> Tuple[np.ndarray, np.ndarray, Optional[List[float]], int]:
+        x0, y0, x1, y1 = [int(value) for value in crop_rect]
+        width = max(0, x1 - x0)
+        height = max(0, y1 - y0)
+        body_mask = np.zeros((height, width), dtype=np.uint8)
+        contact_mask = np.zeros((height, width), dtype=np.uint8)
+        if width <= 0 or height <= 0:
+            return body_mask.astype(bool), contact_mask.astype(bool), None, 0
+
+        threshold = _read_env_float(
+            "NOESIS_OBJECT_DEPTH_POSE_KPT_THRESHOLD",
+            0.35,
+            min_value=0.0,
+        )
+        scale = max(1.0, min(float(bbox[2]), float(bbox[3])))
+        joint_radius = max(2, min(10, int(round(scale * 0.045))))
+        limb_width = max(3, min(18, joint_radius * 2))
+        contact_radius = max(3, min(14, int(round(scale * 0.065))))
+
+        def _point(index: int) -> Optional[Tuple[int, int]]:
+            if index < 0 or index >= int(keypoints.shape[0]):
+                return None
+            try:
+                px = float(keypoints[index, 0])
+                py = float(keypoints[index, 1])
+                confidence = float(keypoints[index, 2])
+            except Exception:
+                return None
+            if confidence < threshold or not (math.isfinite(px) and math.isfinite(py)):
+                return None
+            return int(round(px - x0)), int(round(py - y0))
+
+        support_indices = (5, 6, 11, 12, 13, 14, 15, 16)
+        support_segments = (
+            (5, 6),
+            (5, 11),
+            (6, 12),
+            (11, 12),
+            (11, 13),
+            (12, 14),
+            (13, 15),
+            (14, 16),
+        )
+        for first, second in support_segments:
+            point_a = _point(first)
+            point_b = _point(second)
+            if point_a is not None and point_b is not None:
+                cv2.line(body_mask, point_a, point_b, 1, thickness=limb_width)
+        for index in support_indices:
+            point = _point(index)
+            if point is not None:
+                cv2.circle(body_mask, point, joint_radius, 1, thickness=-1)
+
+        contact_points: List[Tuple[int, int]] = []
+        for knee_index, ankle_index in ((13, 15), (14, 16)):
+            ankle = _point(ankle_index)
+            if ankle is None:
+                continue
+            contact_points.append(ankle)
+            knee = _point(knee_index)
+            if knee is not None:
+                lower_leg_start = (
+                    int(round((0.35 * float(knee[0])) + (0.65 * float(ankle[0])))),
+                    int(round((0.35 * float(knee[1])) + (0.65 * float(ankle[1])))),
+                )
+                cv2.line(
+                    contact_mask,
+                    lower_leg_start,
+                    ankle,
+                    1,
+                    thickness=max(3, contact_radius),
+                )
+            cv2.circle(contact_mask, ankle, contact_radius, 1, thickness=-1)
+
+        if not contact_points:
+            return body_mask.astype(bool), contact_mask.astype(bool), None, 0
+        contact_uv = [
+            float(x0) + (sum(float(point[0]) for point in contact_points) / len(contact_points)),
+            float(y0) + (sum(float(point[1]) for point in contact_points) / len(contact_points)),
+        ]
+        return (
+            body_mask.astype(bool),
+            contact_mask.astype(bool),
+            contact_uv,
+            len(contact_points),
+        )
+
     def _extract_instance_mask_payload(self, obj_meta: Any) -> Optional[Mapping[str, Any]]:
         if noesis_depth_meta_ext is None:
             return None
@@ -6296,6 +6671,8 @@ class _ObjectDepthFusionProcessor:
         values: Optional[np.ndarray] = None,
         anchor_fields: Optional[Mapping[str, Any]] = None,
         sampling_mode: str = "instance_mask",
+        evidence_quality: Optional[str] = None,
+        evidence_reason: Optional[str] = None,
     ) -> ObjectDepthResult:
         try:
             object_id = int(getattr(obj_meta, "object_id", -1))
@@ -6311,9 +6688,13 @@ class _ObjectDepthFusionProcessor:
             score = 0.0
         values_arr = np.asarray(values, dtype=np.float32) if values is not None else np.empty(0, dtype=np.float32)
         has_values = bool(values_arr.size)
+        depth_p10 = float(np.percentile(values_arr, 10.0)) if has_values else None
+        depth_p90 = float(np.percentile(values_arr, 90.0)) if has_values else None
+        frame_id = int(_meta_lookup(frame_meta, "frame_number", "frame_num", default=0) or 0)
+        ts_us = _frame_pts_key_us(frame_meta)
         payload: Dict[str, Any] = {
             "source_id": int(_meta_lookup(frame_meta, "source_id", "pad_index", default=0) or 0),
-            "frame_id": int(_meta_lookup(frame_meta, "frame_number", "frame_num", default=0) or 0),
+            "frame_id": frame_id,
             "object_id": object_id,
             "class_id": class_id,
             "bbox": bbox,
@@ -6327,13 +6708,20 @@ class _ObjectDepthFusionProcessor:
             "depth_center": depth_center,
             "depth_median": float(np.median(values_arr)) if has_values else None,
             "depth_mean": float(np.mean(values_arr)) if has_values else None,
-            "depth_p10": float(np.percentile(values_arr, 10.0)) if has_values else None,
-            "depth_p90": float(np.percentile(values_arr, 90.0)) if has_values else None,
+            "depth_p10": depth_p10,
+            "depth_p90": depth_p90,
             "depth_min": float(np.min(values_arr)) if has_values else None,
             "depth_max": float(np.max(values_arr)) if has_values else None,
+            "depth_spread_m": _depth_spread_from_bounds(depth_p10, depth_p90),
             "mask_area_px": max(0, int(mask_area_px)),
             "model": self.depth_model_name,
-            "ts_us": _frame_pts_key_us(frame_meta),
+            "ts_us": ts_us,
+            "measurement_frame_id": frame_id,
+            "measurement_ts_us": ts_us,
+            "measurement_age_us": 0,
+            "measurement_cached": False,
+            "evidence_quality": evidence_quality,
+            "evidence_reason": evidence_reason,
         }
         if anchor_fields:
             payload.update({str(key): value for key, value in anchor_fields.items() if value is not None})
@@ -6350,24 +6738,13 @@ class _ObjectDepthFusionProcessor:
         depth_center: Optional[float],
     ) -> ObjectDepthResult:
         mask_area = int(depth_crop.size)
-        synthetic_mask = np.ones(depth_crop.shape, dtype=bool)
-        anchor = _extract_person_depth_anchor(
-            synthetic_mask,
-            depth_crop,
-            frame_origin=(int(crop_origin[0]), int(crop_origin[1])),
-        )
         anchor_fields: Dict[str, Any] = {
             "spatial_class": "person",
-            "anchor_uv": list(anchor.foot_uv) if anchor.foot_uv is not None else None,
-            "anchor_source": anchor.anchor_source,
-            "anchor_depth_m": anchor.anchor_depth_m,
-            "anchor_sample_count": int(anchor.anchor_sample_count) if anchor.anchor_sample_count > 0 else None,
-            "anchor_valid_fraction": float(anchor.anchor_valid_fraction) if anchor.anchor_valid_fraction > 0.0 else None,
         }
         values_full = np.asarray(depth_crop[np.isfinite(depth_crop)], dtype=np.float32)
         values = _bounded_depth_stat_values(values_full)
         sample_count = int(values_full.size)
-        status = "ok" if sample_count > 0 and anchor.anchor_depth_m is not None else "no_valid_depth"
+        status = "no_ground_contact" if sample_count > 0 else "no_valid_depth"
         return self._build_result(
             frame_meta,
             obj_meta,
@@ -6379,7 +6756,104 @@ class _ObjectDepthFusionProcessor:
             depth_center=depth_center,
             values=values,
             anchor_fields=anchor_fields,
-            sampling_mode="bbox_band",
+            sampling_mode="bbox_core",
+            evidence_quality="rejected",
+            evidence_reason="bbox_only_without_person_contact_support",
+        )
+
+    def _sample_pose_capsule_result(
+        self,
+        frame_meta: Any,
+        obj_meta: Any,
+        *,
+        bbox: Tuple[float, float, float, float],
+        depth_crop: np.ndarray,
+        body_mask: np.ndarray,
+        contact_mask: np.ndarray,
+        contact_uv: Optional[Sequence[float]],
+        visible_ankles: int,
+        depth_center: Optional[float],
+    ) -> ObjectDepthResult:
+        body_valid = np.logical_and(np.asarray(body_mask, dtype=bool), np.isfinite(depth_crop))
+        body_values_full = np.asarray(depth_crop[body_valid], dtype=np.float32)
+        body_values = _bounded_depth_stat_values(body_values_full)
+        body_area = int(np.count_nonzero(body_mask))
+        sample_count = int(body_values_full.size)
+        valid_fraction = float(sample_count) / float(body_area or 1)
+
+        anchor_source: Optional[str] = None
+        anchor_depth_m: Optional[float] = None
+        anchor_sample_count: Optional[int] = None
+        anchor_valid_fraction: Optional[float] = None
+        anchor_depth_spread_m: Optional[float] = None
+        evidence_quality = "rejected"
+        evidence_reason: Optional[str] = "pose_ankles_unavailable"
+        status = "no_ground_contact" if sample_count > 0 else "no_valid_depth"
+
+        contact_area = int(np.count_nonzero(contact_mask))
+        if contact_uv is not None and visible_ankles > 0 and contact_area > 0:
+            contact_valid = np.logical_and(
+                np.asarray(contact_mask, dtype=bool),
+                np.isfinite(depth_crop),
+            )
+            contact_values_full = np.asarray(depth_crop[contact_valid], dtype=np.float32)
+            contact_values = _bounded_depth_stat_values(
+                contact_values_full,
+                env_name="NOESIS_OBJECT_DEPTH_MAX_ANCHOR_SAMPLES",
+            )
+            contact_count = int(contact_values_full.size)
+            contact_fraction = float(contact_count) / float(contact_area or 1)
+            contact_median = (
+                float(np.median(contact_values)) if contact_values.size > 0 else None
+            )
+            contact_spread = _depth_spread_from_bounds(
+                float(np.percentile(contact_values, 10.0)) if contact_values.size > 0 else None,
+                float(np.percentile(contact_values, 90.0)) if contact_values.size > 0 else None,
+            )
+            min_contact_count = max(8, min(20, int(math.ceil(contact_area * 0.20))))
+            evidence_reason = _depth_evidence_rejection_reason(
+                sample_count=contact_count,
+                valid_fraction=contact_fraction,
+                depth_m=contact_median,
+                depth_spread_m=contact_spread,
+                min_sample_count=min_contact_count,
+                min_valid_fraction=0.60,
+                strict_spread=True,
+            )
+            anchor_depth_spread_m = contact_spread
+            if evidence_reason is None:
+                anchor_source = "pose_ankle_support"
+                anchor_depth_m = contact_median
+                anchor_sample_count = int(contact_count)
+                anchor_valid_fraction = float(contact_fraction)
+                evidence_quality = "good" if int(visible_ankles) >= 2 else "estimated"
+                status = "ok"
+            else:
+                status = "ambiguous_depth"
+
+        anchor_fields: Dict[str, Any] = {
+            "spatial_class": "person",
+            "anchor_uv": list(contact_uv) if anchor_source is not None and contact_uv is not None else None,
+            "anchor_source": anchor_source,
+            "anchor_depth_m": anchor_depth_m,
+            "anchor_sample_count": anchor_sample_count,
+            "anchor_valid_fraction": anchor_valid_fraction,
+            "anchor_depth_spread_m": anchor_depth_spread_m,
+        }
+        return self._build_result(
+            frame_meta,
+            obj_meta,
+            bbox=bbox,
+            status=status,
+            mask_area_px=body_area,
+            sample_count=sample_count,
+            valid_fraction=valid_fraction,
+            depth_center=depth_center,
+            values=body_values,
+            anchor_fields=anchor_fields,
+            sampling_mode="pose_capsule",
+            evidence_quality=evidence_quality,
+            evidence_reason=evidence_reason,
         )
 
     def _stats_float(self, stats: Mapping[str, Any], key: str) -> Optional[float]:
@@ -6439,7 +6913,10 @@ class _ObjectDepthFusionProcessor:
             mask_area = int(width * height)
         valid_fraction = self._stats_float(stats, "valid_fraction") or 0.0
         depth_median = self._stats_float(stats, "depth_median")
-        status = "ok" if sample_count > 0 and depth_median is not None else "no_valid_depth"
+        depth_p10 = self._stats_float(stats, "depth_p10")
+        depth_p90 = self._stats_float(stats, "depth_p90")
+        depth_spread = _depth_spread_from_bounds(depth_p10, depth_p90)
+        status = "no_ground_contact" if sample_count > 0 and depth_median is not None else "no_valid_depth"
         try:
             object_id = int(getattr(obj_meta, "object_id", -1))
         except Exception:
@@ -6459,7 +6936,7 @@ class _ObjectDepthFusionProcessor:
             "class_id": class_id,
             "bbox": bbox,
             "score": score,
-            "sampling_mode": "bbox_band_native",
+            "sampling_mode": "bbox_core_native",
             "status": status,
             "unit": self.depth_unit,
             "is_metric": self.depth_is_metric,
@@ -6468,19 +6945,21 @@ class _ObjectDepthFusionProcessor:
             "depth_center": self._stats_float(stats, "depth_center"),
             "depth_median": depth_median,
             "depth_mean": self._stats_float(stats, "depth_mean"),
-            "depth_p10": self._stats_float(stats, "depth_p10"),
-            "depth_p90": self._stats_float(stats, "depth_p90"),
+            "depth_p10": depth_p10,
+            "depth_p90": depth_p90,
             "depth_min": self._stats_float(stats, "depth_min"),
             "depth_max": self._stats_float(stats, "depth_max"),
+            "depth_spread_m": depth_spread,
             "mask_area_px": max(0, int(mask_area)),
             "model": self.depth_model_name,
             "ts_us": _frame_pts_key_us(frame_meta),
             "spatial_class": "person",
-            "anchor_uv": [float(x0) + (float(width) * 0.5), float(y1 - 1)],
-            "anchor_source": "lower_body_band",
-            "anchor_depth_m": depth_median,
-            "anchor_sample_count": int(sample_count) if sample_count > 0 else None,
-            "anchor_valid_fraction": float(valid_fraction) if valid_fraction > 0.0 else None,
+            "evidence_quality": "rejected",
+            "evidence_reason": "bbox_only_without_person_contact_support",
+            "measurement_frame_id": int(_meta_lookup(frame_meta, "frame_number", "frame_num", default=0) or 0),
+            "measurement_ts_us": _frame_pts_key_us(frame_meta),
+            "measurement_age_us": 0,
+            "measurement_cached": False,
         }
         _increment_core_counter("detection_wake.object_depth_native_stats")
         return ObjectDepthResult(**payload)
@@ -6524,6 +7003,150 @@ class _ObjectDepthFusionProcessor:
         if not isinstance(stats_raw, Mapping):
             return None
         return dict(stats_raw)
+
+    def _sample_pose_capsule_result_native(
+        self,
+        frame_meta: Any,
+        obj_meta: Any,
+        *,
+        bbox: Tuple[float, float, float, float],
+        depth_frame: _AlignedDepthFrame,
+        crop_rect: Tuple[int, int, int, int],
+        body_mask: np.ndarray,
+        contact_mask: np.ndarray,
+        contact_uv: Optional[Sequence[float]],
+        visible_ankles: int,
+    ) -> Optional[ObjectDepthResult]:
+        depth_device_frame = getattr(depth_frame, "depth_device_frame", None)
+        if depth_device_frame is None:
+            return None
+        body_area = int(np.count_nonzero(body_mask))
+        if body_area <= 0:
+            return None
+        body_stats = self._sample_mask_stats_native(
+            depth_device_frame,
+            crop_rect=crop_rect,
+            mask=body_mask,
+            stage_name="object_depth.native_pose_capsule_stats",
+        )
+        if body_stats is None:
+            return None
+        _increment_core_counter("object_depth_gpu_roi_copies_total")
+
+        try:
+            sample_count = int(body_stats.get("sample_count", 0) or 0)
+        except Exception:
+            sample_count = 0
+        valid_fraction = self._stats_float(body_stats, "valid_fraction") or 0.0
+        depth_median = self._stats_float(body_stats, "depth_median")
+        depth_p10 = self._stats_float(body_stats, "depth_p10")
+        depth_p90 = self._stats_float(body_stats, "depth_p90")
+        depth_spread = _depth_spread_from_bounds(depth_p10, depth_p90)
+
+        anchor_source: Optional[str] = None
+        anchor_depth_m: Optional[float] = None
+        anchor_sample_count: Optional[int] = None
+        anchor_valid_fraction: Optional[float] = None
+        anchor_depth_spread_m: Optional[float] = None
+        evidence_quality = "rejected"
+        evidence_reason: Optional[str] = "pose_ankles_unavailable"
+        status = "no_ground_contact" if sample_count > 0 else "no_valid_depth"
+
+        contact_area = int(np.count_nonzero(contact_mask))
+        if contact_uv is not None and visible_ankles > 0 and contact_area > 0:
+            contact_stats = self._sample_mask_stats_native(
+                depth_device_frame,
+                crop_rect=crop_rect,
+                mask=contact_mask,
+                max_samples_env="NOESIS_OBJECT_DEPTH_MAX_ANCHOR_SAMPLES",
+                stage_name="object_depth.native_pose_contact_stats",
+            )
+            if contact_stats is not None:
+                try:
+                    contact_count = int(contact_stats.get("sample_count", 0) or 0)
+                except Exception:
+                    contact_count = 0
+                contact_fraction = self._stats_float(contact_stats, "valid_fraction") or 0.0
+                contact_median = self._stats_float(contact_stats, "depth_median")
+                contact_spread = _depth_spread_from_bounds(
+                    self._stats_float(contact_stats, "depth_p10"),
+                    self._stats_float(contact_stats, "depth_p90"),
+                )
+                min_contact_count = max(8, min(20, int(math.ceil(contact_area * 0.20))))
+                evidence_reason = _depth_evidence_rejection_reason(
+                    sample_count=contact_count,
+                    valid_fraction=contact_fraction,
+                    depth_m=contact_median,
+                    depth_spread_m=contact_spread,
+                    min_sample_count=min_contact_count,
+                    min_valid_fraction=0.60,
+                    strict_spread=True,
+                )
+                anchor_depth_spread_m = contact_spread
+                if evidence_reason is None:
+                    anchor_source = "pose_ankle_support"
+                    anchor_depth_m = contact_median
+                    anchor_sample_count = int(contact_count)
+                    anchor_valid_fraction = float(contact_fraction)
+                    evidence_quality = "good" if int(visible_ankles) >= 2 else "estimated"
+                    status = "ok"
+                else:
+                    status = "ambiguous_depth"
+
+        try:
+            object_id = int(getattr(obj_meta, "object_id", -1))
+        except Exception:
+            object_id = -1
+        try:
+            class_id = int(getattr(obj_meta, "class_id", -1))
+        except Exception:
+            class_id = -1
+        try:
+            score = float(getattr(obj_meta, "confidence", 0.0))
+        except Exception:
+            score = 0.0
+        frame_id = int(_meta_lookup(frame_meta, "frame_number", "frame_num", default=0) or 0)
+        ts_us = _frame_pts_key_us(frame_meta)
+        payload: Dict[str, Any] = {
+            "source_id": int(_meta_lookup(frame_meta, "source_id", "pad_index", default=0) or 0),
+            "frame_id": frame_id,
+            "object_id": object_id,
+            "class_id": class_id,
+            "bbox": bbox,
+            "score": score,
+            "sampling_mode": "pose_capsule_native",
+            "status": status,
+            "unit": self.depth_unit,
+            "is_metric": self.depth_is_metric,
+            "sample_count": max(0, int(sample_count)),
+            "valid_fraction": max(0.0, min(1.0, float(valid_fraction))),
+            "depth_center": self._stats_float(body_stats, "depth_center"),
+            "depth_median": depth_median,
+            "depth_mean": self._stats_float(body_stats, "depth_mean"),
+            "depth_p10": depth_p10,
+            "depth_p90": depth_p90,
+            "depth_min": self._stats_float(body_stats, "depth_min"),
+            "depth_max": self._stats_float(body_stats, "depth_max"),
+            "depth_spread_m": depth_spread,
+            "mask_area_px": body_area,
+            "model": self.depth_model_name,
+            "ts_us": ts_us,
+            "spatial_class": "person",
+            "anchor_uv": list(contact_uv) if anchor_source is not None and contact_uv is not None else None,
+            "anchor_source": anchor_source,
+            "anchor_depth_m": anchor_depth_m,
+            "anchor_sample_count": anchor_sample_count,
+            "anchor_valid_fraction": anchor_valid_fraction,
+            "anchor_depth_spread_m": anchor_depth_spread_m,
+            "evidence_quality": evidence_quality,
+            "evidence_reason": evidence_reason,
+            "measurement_frame_id": frame_id,
+            "measurement_ts_us": ts_us,
+            "measurement_age_us": 0,
+            "measurement_cached": False,
+        }
+        _increment_core_counter("detection_wake.object_depth_pose_capsule_stats")
+        return ObjectDepthResult(**payload)
 
     def _sample_person_mask_stats_native(
         self,
@@ -6652,13 +7275,18 @@ class _ObjectDepthFusionProcessor:
         mask_area_native = _int_stat("mask_area_px", mask_area)
         valid_fraction = self._stats_float(stats, "valid_fraction") or 0.0
         depth_median = self._stats_float(stats, "depth_median")
-        status = "ok" if sample_count > 0 and depth_median is not None else "no_valid_depth"
+        depth_p10 = self._stats_float(stats, "depth_p10")
+        depth_p90 = self._stats_float(stats, "depth_p90")
+        depth_spread = _depth_spread_from_bounds(depth_p10, depth_p90)
+        status = "no_valid_depth"
 
         foot_uv = self._mask_foot_uv(mask, frame_origin=(x0, y0))
         anchor_source: Optional[str] = None
         anchor_depth_m: Optional[float] = None
         anchor_sample_count: Optional[int] = None
         anchor_valid_fraction: Optional[float] = None
+        anchor_depth_spread_m: Optional[float] = None
+        anchor_rejection_reason: Optional[str] = "person_depth_support_low"
 
         lower_count = 0
         lower_valid_fraction = 0.0
@@ -6669,23 +7297,59 @@ class _ObjectDepthFusionProcessor:
             lower_count = _int_stat("lower_sample_count", 0)
             lower_valid_fraction = self._stats_float(stats, "lower_valid_fraction") or 0.0
             lower_depth = self._stats_float(stats, "lower_depth_median")
+            lower_spread = _depth_spread_from_bounds(
+                self._stats_float(stats, "lower_depth_p10"),
+                self._stats_float(stats, "lower_depth_p90"),
+            )
             lower_min_count, lower_min_valid_fraction = self._anchor_support_requirements(lower_area, "lower_body_band")
-            if lower_depth is not None and lower_count >= lower_min_count and lower_valid_fraction >= lower_min_valid_fraction:
+            lower_support_ok = bool(
+                lower_depth is not None
+                and lower_count >= lower_min_count
+                and lower_valid_fraction >= lower_min_valid_fraction
+            )
+            if lower_support_ok and _depth_spread_is_supported(
+                lower_depth,
+                lower_spread,
+                strict=False,
+            ):
                 anchor_source = "lower_body_band"
                 anchor_depth_m = lower_depth
                 anchor_sample_count = int(lower_count)
                 anchor_valid_fraction = float(lower_valid_fraction)
+                anchor_depth_spread_m = lower_spread
+                anchor_rejection_reason = None
+            elif lower_support_ok:
+                anchor_depth_spread_m = lower_spread
+                anchor_rejection_reason = "lower_body_depth_spread_exceeded"
             if anchor_depth_m is None:
                 torso_area = _int_stat("torso_mask_area_px", 0)
                 torso_count = _int_stat("torso_sample_count", 0)
                 torso_valid_fraction = self._stats_float(stats, "torso_valid_fraction") or 0.0
                 torso_depth = self._stats_float(stats, "torso_depth_median")
+                torso_spread = _depth_spread_from_bounds(
+                    self._stats_float(stats, "torso_depth_p10"),
+                    self._stats_float(stats, "torso_depth_p90"),
+                )
                 torso_min_count, torso_min_valid_fraction = self._anchor_support_requirements(torso_area, "torso_core")
-                if torso_depth is not None and torso_count >= torso_min_count and torso_valid_fraction >= torso_min_valid_fraction:
+                torso_support_ok = bool(
+                    torso_depth is not None
+                    and torso_count >= torso_min_count
+                    and torso_valid_fraction >= torso_min_valid_fraction
+                )
+                if torso_support_ok and _depth_spread_is_supported(
+                    torso_depth,
+                    torso_spread,
+                    strict=False,
+                ):
                     anchor_source = "torso_core"
                     anchor_depth_m = torso_depth
                     anchor_sample_count = int(torso_count)
                     anchor_valid_fraction = float(torso_valid_fraction)
+                    anchor_depth_spread_m = torso_spread
+                    anchor_rejection_reason = None
+                elif torso_support_ok:
+                    anchor_depth_spread_m = torso_spread
+                    anchor_rejection_reason = "torso_depth_spread_exceeded"
         else:
             eroded_mask = _erode_mask(mask, kernel_size=3)
             lower_body_mask = _band_mask(eroded_mask, y0_ratio=0.88, y1_ratio=1.0, center_width_ratio=0.35)
@@ -6706,12 +7370,30 @@ class _ObjectDepthFusionProcessor:
                     lower_count = 0
                 lower_valid_fraction = self._stats_float(lower_stats, "valid_fraction") or 0.0
                 lower_depth = self._stats_float(lower_stats, "depth_median")
+                lower_spread = _depth_spread_from_bounds(
+                    self._stats_float(lower_stats, "depth_p10"),
+                    self._stats_float(lower_stats, "depth_p90"),
+                )
                 lower_min_count, lower_min_valid_fraction = self._anchor_support_requirements(lower_area, "lower_body_band")
-                if lower_depth is not None and lower_count >= lower_min_count and lower_valid_fraction >= lower_min_valid_fraction:
+                lower_support_ok = bool(
+                    lower_depth is not None
+                    and lower_count >= lower_min_count
+                    and lower_valid_fraction >= lower_min_valid_fraction
+                )
+                if lower_support_ok and _depth_spread_is_supported(
+                    lower_depth,
+                    lower_spread,
+                    strict=False,
+                ):
                     anchor_source = "lower_body_band"
                     anchor_depth_m = lower_depth
                     anchor_sample_count = int(lower_count)
                     anchor_valid_fraction = float(lower_valid_fraction)
+                    anchor_depth_spread_m = lower_spread
+                    anchor_rejection_reason = None
+                elif lower_support_ok:
+                    anchor_depth_spread_m = lower_spread
+                    anchor_rejection_reason = "lower_body_depth_spread_exceeded"
 
             if anchor_depth_m is None:
                 torso_mask = _band_mask(eroded_mask, y0_ratio=0.35, y1_ratio=0.70, center_width_ratio=0.50)
@@ -6732,12 +7414,30 @@ class _ObjectDepthFusionProcessor:
                         torso_count = 0
                     torso_valid_fraction = self._stats_float(torso_stats, "valid_fraction") or 0.0
                     torso_depth = self._stats_float(torso_stats, "depth_median")
+                    torso_spread = _depth_spread_from_bounds(
+                        self._stats_float(torso_stats, "depth_p10"),
+                        self._stats_float(torso_stats, "depth_p90"),
+                    )
                     torso_min_count, torso_min_valid_fraction = self._anchor_support_requirements(torso_area, "torso_core")
-                    if torso_depth is not None and torso_count >= torso_min_count and torso_valid_fraction >= torso_min_valid_fraction:
+                    torso_support_ok = bool(
+                        torso_depth is not None
+                        and torso_count >= torso_min_count
+                        and torso_valid_fraction >= torso_min_valid_fraction
+                    )
+                    if torso_support_ok and _depth_spread_is_supported(
+                        torso_depth,
+                        torso_spread,
+                        strict=False,
+                    ):
                         anchor_source = "torso_core"
                         anchor_depth_m = torso_depth
                         anchor_sample_count = int(torso_count)
                         anchor_valid_fraction = float(torso_valid_fraction)
+                        anchor_depth_spread_m = torso_spread
+                        anchor_rejection_reason = None
+                    elif torso_support_ok:
+                        anchor_depth_spread_m = torso_spread
+                        anchor_rejection_reason = "torso_depth_spread_exceeded"
         try:
             object_id = int(getattr(obj_meta, "object_id", -1))
         except Exception:
@@ -6751,9 +7451,13 @@ class _ObjectDepthFusionProcessor:
         except Exception:
             score = 0.0
 
+        if sample_count > 0 and depth_median is not None:
+            status = "ok" if anchor_source is not None else "ambiguous_depth"
+        frame_id = int(_meta_lookup(frame_meta, "frame_number", "frame_num", default=0) or 0)
+        ts_us = _frame_pts_key_us(frame_meta)
         payload: Dict[str, Any] = {
             "source_id": int(_meta_lookup(frame_meta, "source_id", "pad_index", default=0) or 0),
-            "frame_id": int(_meta_lookup(frame_meta, "frame_number", "frame_num", default=0) or 0),
+            "frame_id": frame_id,
             "object_id": object_id,
             "class_id": class_id,
             "bbox": bbox,
@@ -6767,19 +7471,31 @@ class _ObjectDepthFusionProcessor:
             "depth_center": self._stats_float(stats, "depth_center"),
             "depth_median": depth_median,
             "depth_mean": self._stats_float(stats, "depth_mean"),
-            "depth_p10": self._stats_float(stats, "depth_p10"),
-            "depth_p90": self._stats_float(stats, "depth_p90"),
+            "depth_p10": depth_p10,
+            "depth_p90": depth_p90,
             "depth_min": self._stats_float(stats, "depth_min"),
             "depth_max": self._stats_float(stats, "depth_max"),
+            "depth_spread_m": depth_spread,
             "mask_area_px": max(0, int(mask_area_native)),
             "model": self.depth_model_name,
-            "ts_us": _frame_pts_key_us(frame_meta),
+            "ts_us": ts_us,
             "spatial_class": "person",
-            "anchor_uv": foot_uv,
+            "anchor_uv": foot_uv if anchor_source is not None else None,
             "anchor_source": anchor_source,
             "anchor_depth_m": anchor_depth_m,
             "anchor_sample_count": anchor_sample_count,
             "anchor_valid_fraction": anchor_valid_fraction,
+            "anchor_depth_spread_m": anchor_depth_spread_m,
+            "evidence_quality": (
+                "good"
+                if anchor_source == "lower_body_band"
+                else ("estimated" if anchor_source == "torso_core" else "rejected")
+            ),
+            "evidence_reason": anchor_rejection_reason,
+            "measurement_frame_id": frame_id,
+            "measurement_ts_us": ts_us,
+            "measurement_age_us": 0,
+            "measurement_cached": False,
         }
         _increment_core_counter("detection_wake.object_depth_native_mask_stats")
         return ObjectDepthResult(**payload)
@@ -6810,14 +7526,57 @@ class _ObjectDepthFusionProcessor:
             return self._build_result(frame_meta, obj_meta, bbox=bbox, status="transform_mismatch")
 
         mask_payload = self._extract_instance_mask_payload(obj_meta)
-        crop_y0 = y0 if mask_payload else self._bbox_fallback_y0(y0, y1)
+        crop_x0, crop_y0, crop_x1, crop_y1 = x0, y0, x1, y1
+        pose_body_mask: Optional[np.ndarray] = None
+        pose_contact_mask: Optional[np.ndarray] = None
+        pose_contact_uv: Optional[List[float]] = None
+        pose_visible_ankles = 0
         if not mask_payload:
+            pose_keypoints = self._attached_pose_keypoints(obj_meta, bbox)
+            if pose_keypoints is not None:
+                (
+                    pose_body_mask,
+                    pose_contact_mask,
+                    pose_contact_uv,
+                    pose_visible_ankles,
+                ) = self._pose_capsule_masks(
+                    pose_keypoints,
+                    crop_rect=(x0, y0, x1, y1),
+                    bbox=bbox,
+                )
+                if int(np.count_nonzero(pose_body_mask)) <= 0:
+                    pose_body_mask = None
+                    pose_contact_mask = None
+                    pose_contact_uv = None
+                    pose_visible_ankles = 0
+
+        if not mask_payload and pose_body_mask is not None and pose_contact_mask is not None:
+            native_pose_result = self._sample_pose_capsule_result_native(
+                frame_meta,
+                obj_meta,
+                bbox=bbox,
+                depth_frame=depth_frame,
+                crop_rect=(x0, y0, x1, y1),
+                body_mask=pose_body_mask,
+                contact_mask=pose_contact_mask,
+                contact_uv=pose_contact_uv,
+                visible_ankles=pose_visible_ankles,
+            )
+            if native_pose_result is not None:
+                return native_pose_result
+        elif not mask_payload:
+            crop_x0, crop_y0, crop_x1, crop_y1 = self._bbox_fallback_rect(
+                x0,
+                y0,
+                x1,
+                y1,
+            )
             native_result = self._sample_bbox_band_result_native(
                 frame_meta,
                 obj_meta,
                 bbox=bbox,
                 depth_frame=depth_frame,
-                crop_rect=(x0, crop_y0, x1, y1),
+                crop_rect=(crop_x0, crop_y0, crop_x1, crop_y1),
             )
             if native_result is not None:
                 return native_result
@@ -6827,12 +7586,18 @@ class _ObjectDepthFusionProcessor:
                 obj_meta,
                 bbox=bbox,
                 depth_frame=depth_frame,
-                crop_rect=(x0, crop_y0, x1, y1),
+                crop_rect=(crop_x0, crop_y0, crop_x1, crop_y1),
                 mask_payload=mask_payload,
             )
             if native_mask_result is not None:
                 return native_mask_result
-        depth_crop = self._copy_depth_crop(depth_frame, x0, crop_y0, x1, y1)
+        depth_crop = self._copy_depth_crop(
+            depth_frame,
+            crop_x0,
+            crop_y0,
+            crop_x1,
+            crop_y1,
+        )
         if depth_crop is None:
             return self._build_result(frame_meta, obj_meta, bbox=bbox, status="depth_not_ready")
         if depth_crop.size <= 0:
@@ -6842,11 +7607,24 @@ class _ObjectDepthFusionProcessor:
         if mask_payload:
             cy = max(0, min(frame_h - 1, int(round(top + (height * 0.5)))))
         else:
-            cy = max(0, min(frame_h - 1, int(round(crop_y0 + ((y1 - crop_y0) * 0.5)))))
-        local_cx = max(0, min(int(depth_crop.shape[1]) - 1, cx - x0))
+            cy = max(0, min(frame_h - 1, int(round(crop_y0 + ((crop_y1 - crop_y0) * 0.5)))))
+        local_cx = max(0, min(int(depth_crop.shape[1]) - 1, cx - crop_x0))
         local_cy = max(0, min(int(depth_crop.shape[0]) - 1, cy - crop_y0))
         center_sample = float(depth_crop[local_cy, local_cx])
         center_value = center_sample if np.isfinite(center_sample) else None
+
+        if not mask_payload and pose_body_mask is not None and pose_contact_mask is not None:
+            return self._sample_pose_capsule_result(
+                frame_meta,
+                obj_meta,
+                bbox=bbox,
+                depth_crop=depth_crop,
+                body_mask=pose_body_mask,
+                contact_mask=pose_contact_mask,
+                contact_uv=pose_contact_uv,
+                visible_ankles=pose_visible_ankles,
+                depth_center=center_value,
+            )
 
         mask, _mask_status = self._decode_instance_mask_payload(mask_payload, depth_crop.shape)
         if mask is None:
@@ -6855,7 +7633,7 @@ class _ObjectDepthFusionProcessor:
                 obj_meta,
                 bbox=bbox,
                 depth_crop=depth_crop,
-                crop_origin=(x0, crop_y0),
+                crop_origin=(crop_x0, crop_y0),
                 depth_center=center_value,
             )
 
@@ -6867,7 +7645,7 @@ class _ObjectDepthFusionProcessor:
                 obj_meta,
                 bbox=bbox,
                 depth_crop=depth_crop,
-                crop_origin=(x0, crop_y0),
+                crop_origin=(crop_x0, crop_y0),
                 depth_center=center_value,
             )
 
@@ -6877,15 +7655,20 @@ class _ObjectDepthFusionProcessor:
         anchor = _extract_person_depth_anchor(
             mask,
             depth_crop,
-            frame_origin=(int(x0), int(crop_y0)),
+            frame_origin=(int(crop_x0), int(crop_y0)),
         )
         anchor_fields: Dict[str, Any] = {
             "spatial_class": "person",
-            "anchor_uv": list(anchor.foot_uv) if anchor.foot_uv is not None else None,
+            "anchor_uv": (
+                list(anchor.foot_uv)
+                if anchor.foot_uv is not None and anchor.anchor_source is not None
+                else None
+            ),
             "anchor_source": anchor.anchor_source,
             "anchor_depth_m": anchor.anchor_depth_m,
             "anchor_sample_count": int(anchor.anchor_sample_count) if anchor.anchor_sample_count > 0 else None,
             "anchor_valid_fraction": float(anchor.anchor_valid_fraction) if anchor.anchor_valid_fraction > 0.0 else None,
+            "anchor_depth_spread_m": anchor.anchor_depth_spread_m,
         }
         sample_count = int(values_full.size)
         if sample_count <= 0:
@@ -6897,12 +7680,15 @@ class _ObjectDepthFusionProcessor:
                 mask_area_px=mask_area,
                 depth_center=center_value,
                 anchor_fields=anchor_fields,
+                sampling_mode="instance_mask",
+                evidence_quality="rejected",
+                evidence_reason=anchor.anchor_rejection_reason or "person_depth_support_low",
             )
         return self._build_result(
             frame_meta,
             obj_meta,
             bbox=bbox,
-            status="ok",
+            status="ok" if anchor.anchor_source is not None else "ambiguous_depth",
             mask_area_px=mask_area,
             sample_count=sample_count,
             valid_fraction=float(sample_count) / float(mask_area),
@@ -6910,6 +7696,12 @@ class _ObjectDepthFusionProcessor:
             values=values,
             anchor_fields=anchor_fields,
             sampling_mode="instance_mask",
+            evidence_quality=(
+                "good"
+                if anchor.anchor_source == "lower_body_band"
+                else ("estimated" if anchor.anchor_source == "torso_core" else "rejected")
+            ),
+            evidence_reason=anchor.anchor_rejection_reason,
         )
 
     def handle_frame_ds8(self, batch_meta: Any, frame_meta: Any) -> None:
@@ -6968,13 +7760,36 @@ class _ObjectDepthFusionProcessor:
                 )
                 depth_frame_resolved = True
             if depth_frame is None:
-                result = self._build_result(frame_meta, obj_meta, bbox=bbox, status="depth_not_ready")
+                track_key = self._track_key(source_id, obj_meta)
+                if track_key is not None:
+                    self._depth_retry_tracks.add(track_key)
+                _increment_core_counter("detection_wake.object_depth_pending_skip_total")
+                # A not-ready secondary frame is not an observation.  Do not
+                # cache a negative result or attach it to the live metadata:
+                # the next frame must be free to consume the newly completed
+                # DAv2 output without waiting or cadence suppression.  A
+                # still-valid prior measurement remains useful and already
+                # carries explicit cached/age provenance, so preserve it while
+                # the retry stays armed instead of creating a one-frame depth
+                # hole.
+                if cached_payload is not None and self._attach_object_depth_payload(
+                    batch_meta,
+                    obj_meta,
+                    cached_payload,
+                ):
+                    _increment_core_counter(
+                        "detection_wake.object_depth_pending_cache_hit"
+                    )
+                continue
             else:
                 result = self._sample_person_result(frame_meta, obj_meta, depth_frame)
             if result is None:
                 continue
             _record_core_stage_timing("object_depth.sample_person", sample_start_ns)
             _increment_core_counter("detection_wake.object_depth_sampled")
+            track_key = self._track_key(source_id, obj_meta)
+            if track_key is not None:
+                self._depth_retry_tracks.discard(track_key)
             self._cache_result(source_id=source_id, pts_us=pts_us, obj_meta=obj_meta, result=result)
             self._attach_object_depth_payload(
                 batch_meta,
@@ -7437,6 +8252,27 @@ class _AnalyticsTelemetryProcessor:
 
     def _tracking_mode_is_mv3dt(self) -> bool:
         return str(self._tracking_mode or "").strip().lower() == "mv3dt"
+
+    def _world_calibration_snapshot(
+        self,
+        sensor_id: int,
+        camera_id: str,
+    ) -> Any:
+        """Return the calibration view owned by the active world producer.
+
+        Baseline tracking estimates world positions in the revision-bound
+        active world view. V3DT/MV3DT already own their metric world output and
+        therefore continue to use the raw calibration snapshot.
+        """
+
+        provider = self.bev_calibration
+        if provider is None:
+            return None
+        if not self._tracking_mode_is_v3dt():
+            world_snapshot = getattr(provider, "world_snapshot", None)
+            if callable(world_snapshot):
+                return world_snapshot(sensor_id, camera_id)
+        return provider.snapshot(sensor_id, camera_id)
 
     def _resolve_tracking_mode(self, override: Optional[str] = None) -> str:
         if override is not None and str(override).strip():
@@ -8037,8 +8873,8 @@ class _AnalyticsTelemetryProcessor:
                     setattr(obj_meta, "_noesis_depth_used_m", public_track.get("depth_used_m"))
                 except Exception:
                     pass
-                # Stamp OSD label after world/depth augmentation so z= reflects the
-                # registered depth actually used by the estimator.
+                # Stamp OSD after world/depth augmentation so ``depth=`` reflects
+                # registered optical range without implying canonical world Z.
                 self._stamp_osd_label_ds8(
                     obj_meta,
                     sensor_id=sensor_id,
@@ -9080,6 +9916,20 @@ class _AnalyticsTelemetryProcessor:
             bbox=bbox_tuple,
             image_size=target_image_size_tuple or source_image_size_tuple,
             frame_id=frame_id_value,
+            # Every live tracker footpoint is a projection consumer of the
+            # canonical world estimator.  BEV may expose depth/ray candidates
+            # for diagnostics, but it must not use them as display positions.
+            canonical_world_required=True,
+            world_frame=(
+                str(track.get("world_frame"))
+                if track.get("world_frame") not in (None, "")
+                else None
+            ),
+            world_frame_revision=(
+                str(track.get("world_frame_revision"))
+                if track.get("world_frame_revision") not in (None, "")
+                else None
+            ),
             motion_mode=str(track.get("motion_mode")) if track.get("motion_mode") not in (None, "") else None,
             posture=str(track.get("posture")) if track.get("posture") not in (None, "") else None,
             trail_append_allowed=trail_append_bool,
@@ -9378,12 +10228,37 @@ class _AnalyticsTelemetryProcessor:
         )
 
     def _resolve_person_depth_anchor(self, depth_result: Optional[ObjectDepthResult]) -> Optional[_PoseAnchorCandidate]:
+        if depth_result is None or str(depth_result.status) != "ok":
+            return None
+        sampling_mode = str(depth_result.sampling_mode or "").strip().lower()
+        if sampling_mode.startswith("bbox_"):
+            return None
+        evidence_quality = str(depth_result.evidence_quality or "").strip().lower()
+        if evidence_quality == "rejected":
+            return None
+        anchor_band = str(depth_result.anchor_source or "")
+        if anchor_band not in ("lower_body_band", "torso_core", "pose_ankle_support"):
+            return None
+        anchor_depth_m = depth_result.anchor_depth_m
+        if (
+            anchor_depth_m is None
+            or not math.isfinite(float(anchor_depth_m))
+            or float(anchor_depth_m) <= 0.0
+        ):
+            return None
         anchor_uv = _depth_anchor_uv(depth_result)
         if anchor_uv is None:
             return None
-        anchor_band = str(depth_result.anchor_source or "") if depth_result is not None else ""
-        quality = "good" if anchor_band == "lower_body_band" else "estimated"
-        quality_reason = f"mask_anchor={anchor_band or 'foot_uv'}"
+        quality = (
+            "good"
+            if anchor_band in ("lower_body_band", "pose_ankle_support")
+            and evidence_quality != "estimated"
+            else "estimated"
+        )
+        quality_reason = (
+            f"depth_anchor={anchor_band},sampling={sampling_mode or 'unknown'},"
+            f"evidence={evidence_quality or 'legacy'}"
+        )
         return _PoseAnchorCandidate(
             u=float(anchor_uv[0]),
             v=float(anchor_uv[1]),
@@ -9907,6 +10782,11 @@ class _AnalyticsTelemetryProcessor:
             min_support_fraction = 0.40
             support_scale_denom = 96.0
             anchor_source_weight = 1.0
+        elif anchor_source == "pose_ankle_support":
+            min_support_count = 8
+            min_support_fraction = 0.60
+            support_scale_denom = 48.0
+            anchor_source_weight = 1.0
         elif anchor_source == "torso_core":
             min_support_count = 20
             min_support_fraction = 0.45
@@ -9932,6 +10812,18 @@ class _AnalyticsTelemetryProcessor:
                 None,
                 0.0,
                 "depth_support_low",
+                raw_depth_m=float(anchor_depth_m),
+            )
+        anchor_spread_m = depth_result.anchor_depth_spread_m
+        if anchor_spread_m is not None and not _depth_spread_is_supported(
+            float(anchor_depth_m),
+            float(anchor_spread_m),
+            strict=anchor_source == "pose_ankle_support",
+        ):
+            return _DepthObservationResult(
+                None,
+                0.0,
+                "depth_spread_high",
                 raw_depth_m=float(anchor_depth_m),
             )
         raw_depth_value = float(anchor_depth_m)
@@ -10339,13 +11231,25 @@ class _AnalyticsTelemetryProcessor:
         revision = priors.revision_for_camera(camera_id)
         if revision is None:
             return
+        frame_binding = priors.frame_binding(camera_id)
+        expected_world_frame = (
+            str(frame_binding.target_frame.frame_id)
+            if frame_binding is not None
+            else "backend_world_m"
+        )
+        expected_world_revision = (
+            str(frame_binding.target_frame.revision)
+            if frame_binding is not None
+            else None
+        )
         base = {
             "contract": "noesis.scene_prior.track_diagnostic",
             "contract_version": 1,
             "prior_id": revision.manifest.prior_id,
             "space_id": revision.manifest.space_id,
             "mode": "shadow",
-            "coordinate_frame": "backend_world_m",
+            "coordinate_frame": expected_world_frame,
+            "coordinate_frame_revision": expected_world_revision,
         }
         world = track.get("world")
         if (
@@ -10363,7 +11267,13 @@ class _AnalyticsTelemetryProcessor:
                 "reasons": ["world_position_unavailable"],
             }
             return
-        if track.get("world_frame") != "backend_world_m":
+        if (
+            track.get("world_frame") != expected_world_frame
+            or (
+                expected_world_revision is not None
+                and track.get("world_frame_revision") != expected_world_revision
+            )
+        ):
             track["scene_prior"] = {
                 **base,
                 "status": "error",
@@ -10451,7 +11361,7 @@ class _AnalyticsTelemetryProcessor:
             return
 
         try:
-            calib = self.bev_calibration.snapshot(sensor_id, camera_id)
+            calib = self._world_calibration_snapshot(sensor_id, camera_id)
             if calib is None or calib.intrinsics is None or calib.extrinsics_col_major is None:
                 return
 
@@ -10518,11 +11428,7 @@ class _AnalyticsTelemetryProcessor:
                 if pose_kpts_abs is not None
                 else None
             )
-            # Prefer person-mask foot when pose is weak/bent and posture is non-upright.
             person_anchor = self._resolve_person_depth_anchor(depth_result)
-            if pose_anchor is not None and person_anchor is not None and posture in ("sitting", "lying"):
-                if str(pose_anchor.source) in ("pose_leg_floor", "pose_single_ankle_floor"):
-                    pose_anchor = None
             if pose_anchor is None:
                 anchor_candidate = person_anchor
             else:
@@ -10732,12 +11638,10 @@ class _AnalyticsTelemetryProcessor:
                 else:
                     hit = None
 
-            # Gravity-drop assumes upright height. Skip only for confirmed non-upright
-            # motion modes (or clear lying boxes). A short box alone can be lower-body
+            # Gravity-drop assumes upright height. Skip confirmed non-upright
+            # postures/motion modes. A short box alone can be lower-body
             # occlusion of a standing person — height lock is exactly for that case.
-            allow_gravity = True
-            if posture == "lying":
-                allow_gravity = False
+            allow_gravity = posture not in ("sitting", "lying")
             if (
                 not force_occlusion_gravity
                 and state is not None
@@ -10919,7 +11823,17 @@ class _AnalyticsTelemetryProcessor:
                     track["world_quality_reason"] = str(quality_reason)
                 else:
                     track.pop("world_quality_reason", None)
-                track["world_frame"] = self._world_frame
+                track["world_frame"] = str(
+                    getattr(calib, "world_frame_id", self._world_frame)
+                    or self._world_frame
+                )
+                world_frame_revision = str(
+                    getattr(calib, "world_frame_revision", "") or ""
+                ).strip()
+                if world_frame_revision:
+                    track["world_frame_revision"] = world_frame_revision
+                else:
+                    track.pop("world_frame_revision", None)
                 if world_source:
                     track["world_source"] = str(world_source)
                 else:
@@ -11021,7 +11935,7 @@ class _AnalyticsTelemetryProcessor:
                 failure=failure,
             )
         try:
-            calib = self.bev_calibration.snapshot(sensor_id, camera_id)
+            calib = self._world_calibration_snapshot(sensor_id, camera_id)
         except Exception as exc:
             failure = self.bev_renderer.record_input_failure(
                 camera_id,
@@ -11692,6 +12606,16 @@ class _AnalyticsTelemetryProcessor:
         track: Dict[str, Any],
         depth_result: Optional[ObjectDepthResult],
     ) -> None:
+        diagnostic_fields = (
+            "depth_evidence_quality",
+            "depth_evidence_reason",
+            "depth_spread_m",
+            "depth_anchor_spread_m",
+            "depth_measurement_frame_id",
+            "depth_measurement_ts_us",
+            "depth_measurement_age_us",
+            "depth_measurement_cached",
+        )
         if depth_result is None:
             track["depth_status"] = None
             track["depth_anchor_source"] = None
@@ -11704,7 +12628,27 @@ class _AnalyticsTelemetryProcessor:
             track["depth_median_m"] = None
             track["depth_sample_count"] = None
             track["depth_valid_fraction"] = None
+            for field_name in diagnostic_fields:
+                track[field_name] = None
             return
+
+        def _bounded_text(value: Any, *, max_chars: int) -> Optional[str]:
+            if value is None:
+                return None
+            text = str(value).strip()
+            return text[:max_chars] if text else None
+
+        def _nonnegative_float(value: Any) -> Optional[float]:
+            if value is None:
+                return None
+            try:
+                parsed = float(value)
+            except Exception:
+                return None
+            if not math.isfinite(parsed) or parsed < 0.0:
+                return None
+            return parsed
+
         track["depth_status"] = str(depth_result.status)
         track["depth_anchor_source"] = str(depth_result.anchor_source) if depth_result.anchor_source else None
         if track.get("depth_anchor_m") is None:
@@ -11718,6 +12662,38 @@ class _AnalyticsTelemetryProcessor:
         track["depth_median_m"] = float(depth_result.depth_median) if depth_result.depth_median is not None else None
         track["depth_sample_count"] = int(depth_result.sample_count)
         track["depth_valid_fraction"] = float(depth_result.valid_fraction)
+        track["depth_evidence_quality"] = _bounded_text(
+            depth_result.evidence_quality,
+            max_chars=32,
+        )
+        track["depth_evidence_reason"] = _bounded_text(
+            depth_result.evidence_reason,
+            max_chars=160,
+        )
+        track["depth_spread_m"] = _nonnegative_float(depth_result.depth_spread_m)
+        track["depth_anchor_spread_m"] = _nonnegative_float(
+            depth_result.anchor_depth_spread_m
+        )
+        track["depth_measurement_frame_id"] = (
+            max(0, int(depth_result.measurement_frame_id))
+            if depth_result.measurement_frame_id is not None
+            else None
+        )
+        track["depth_measurement_ts_us"] = (
+            max(0, int(depth_result.measurement_ts_us))
+            if depth_result.measurement_ts_us is not None
+            else None
+        )
+        track["depth_measurement_age_us"] = (
+            max(0, int(depth_result.measurement_age_us))
+            if depth_result.measurement_age_us is not None
+            else None
+        )
+        track["depth_measurement_cached"] = (
+            bool(depth_result.measurement_cached)
+            if depth_result.measurement_cached is not None
+            else None
+        )
 
     def _stamp_osd_label_ds8(self, obj_meta: Any, *, sensor_id: int, stable_id: Optional[int]) -> None:
         proc = self.osd_label_processor
@@ -11954,9 +12930,9 @@ class _OsdLabelProcessor:
                 except Exception:
                     depth_val = float("nan")
                 if math.isfinite(depth_val) and depth_val > 0.0:
-                    depth_text = f"z={depth_val:.{max(0, int(self.decimals))}f}m"
+                    depth_text = f"depth={depth_val:.{max(0, int(self.decimals))}f}m"
                 else:
-                    depth_text = "z=n/a"
+                    depth_text = "depth=n/a"
             else:
                 depth_text = _format_depth_label_fragment(
                     _extract_object_depth_result_from_meta(obj_meta),

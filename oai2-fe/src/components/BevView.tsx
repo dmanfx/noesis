@@ -20,9 +20,25 @@ export type BevMeta = {
   type?: string;
   cameraId?: string;
   camId?: string;
+  camera_id?: string;
+  cam_id?: string;
   ts?: number;
+  sourceId?: number;
+  frameId?: number;
+  observedAtUs?: number;
+  trackingPublicationSequence?: number;
+  trackingOutboundSubmissionId?: number;
+  cohort?: {
+    source_id?: number;
+    frame_id?: number;
+    observed_at_us?: number;
+    tracking_publication_sequence?: number;
+  };
   frame?: string;
   world_frame?: string;
+  canonicalWorldFrame?: string;
+  canonicalWorldFrameRevision?: string | null;
+  canonicalWorldTransformSha256?: string | null;
   frame_mode?: string;
   units?: string;
   s_obj_to_m?: number;
@@ -106,6 +122,9 @@ export type BevMeta = {
   };
   floorplanGridShape?: number[] | null;
   floorplanGridResM?: number | null;
+  floorplanSnapshotId?: string | null;
+  floorplanSnapshotContentSha256?: string | null;
+  floorplanCalibrationFingerprint?: string | null;
   droppedFootpoints?: Array<{
     x?: number;
     y?: number;
@@ -780,6 +799,9 @@ export const BevView: React.FC<BevViewProps> = ({
       coordMode,
       String(displayFloorplan?.frame || '').trim().toLowerCase(),
       String(displayFloorplan?.units || '').trim().toLowerCase(),
+      String(displayFloorplan?.snapshot_id || ''),
+      String(displayFloorplan?.snapshot_content_sha256 || ''),
+      String(displayFloorplan?.calibration_fingerprint || ''),
       boundsKey,
       String(displayFloorplan?.snapshot_ts ?? displayFloorplan?.ts ?? ''),
       String(spaceWalkable?.grid_b64?.length ?? ''),
@@ -798,6 +820,9 @@ export const BevView: React.FC<BevViewProps> = ({
     coordMode,
     displayFloorplan?.frame,
     displayFloorplan?.units,
+    displayFloorplan?.snapshot_id,
+    displayFloorplan?.snapshot_content_sha256,
+    displayFloorplan?.calibration_fingerprint,
     displayFloorplan?.bounds?.min_x,
     displayFloorplan?.bounds?.max_x,
     displayFloorplan?.bounds?.min_z,
@@ -1063,7 +1088,7 @@ export const BevView: React.FC<BevViewProps> = ({
         ? `${floorPlaneEnabled ? 'visible' : 'hidden'}:${planarFloorSupportLayer.grid_b64.length}:${planarFloorSupportLayer.grid_b64.slice(0, 16)}:${planarFloorSupportLayer.grid_b64.slice(-16)}`
         : 'none';
       const key = hasFloorplan
-        ? `${baseKind}:${floorplanNow?.snapshot_ts ?? floorplanNow?.ts ?? ''}:${baseLayer?.grid_shape?.join('x')}:${baseLayer?.value_min ?? ''}:${baseLayer?.value_max ?? ''}:${baseLayer?.grid_b64?.length ?? ''}:${hasComposite ? (obstacleHeightLayer?.grid_b64?.length ?? '') : ''}:${isHeightVisual ? (densityLayer?.grid_b64?.length ?? '') : ''}:${aspect}:${fitMode}:${boundsAspect.toFixed(6)}:${padCss.toFixed(3)}:${smoothBaseImage ? 'smooth' : 'sharp'}:${layerRenderKey}:${metricBoundsKey}:${displayBoundsKey}:${coverageRenderKey}:${planarFloorKey}`
+        ? `${baseKind}:${floorplanNow?.snapshot_id ?? ''}:${floorplanNow?.snapshot_content_sha256 ?? ''}:${floorplanNow?.calibration_fingerprint ?? ''}:${floorplanNow?.snapshot_ts ?? floorplanNow?.ts ?? ''}:${baseLayer?.grid_shape?.join('x')}:${baseLayer?.value_min ?? ''}:${baseLayer?.value_max ?? ''}:${baseLayer?.grid_b64?.length ?? ''}:${hasComposite ? (obstacleHeightLayer?.grid_b64?.length ?? '') : ''}:${isHeightVisual ? (densityLayer?.grid_b64?.length ?? '') : ''}:${aspect}:${fitMode}:${boundsAspect.toFixed(6)}:${padCss.toFixed(3)}:${smoothBaseImage ? 'smooth' : 'sharp'}:${layerRenderKey}:${metricBoundsKey}:${displayBoundsKey}:${coverageRenderKey}:${planarFloorKey}`
         : `none:${aspect}:${fitMode}:${boundsAspect.toFixed(6)}:${padCss.toFixed(3)}:${metricBoundsKey}:${displayBoundsKey}:${coverageRenderKey}`;
 
       const bg = bgCanvasRef.current ?? (bgCanvasRef.current = document.createElement('canvas'));

@@ -52,6 +52,7 @@ def _snapshot_ref(timestamp_us: int) -> str:
 
 
 def _pcf_payload() -> dict[str, object]:
+    prior_id = "sceneprior_living-room_exact"
     return {
         "camera_id": "living-room",
         "scene_prior_only": True,
@@ -60,15 +61,22 @@ def _pcf_payload() -> dict[str, object]:
         "ts": 2_000_000,
         "frame": "camera_local_ground_m",
         "units": "meters",
+        "snapshot_id": prior_id,
+        "snapshot_content_sha256": _SNAPSHOT_DIGEST,
+        "calibration_fingerprint": _FINGERPRINT,
+        "world_frame": "backend_world_m",
+        "world_frame_revision": prior_id,
         "scale_m_per_px": 0.025,
         "bounds": {"min_x": -3.0, "max_x": 4.0, "min_z": -1.0, "max_z": 6.0},
         "scene_prior_meta": {
             "contract": "noesis.scene_prior.floorplan_composite",
             "status": "pcf",
             "display_source": "pcf",
-            "prior_id": "sceneprior_living-room_exact",
+            "prior_id": prior_id,
             "revision_manifest_path": "revisions/sceneprior_living-room_exact/manifest.json",
             "revision_manifest_sha256": _SNAPSHOT_DIGEST,
+            "source_frame": "backend_world_m",
+            "source_frame_revision": prior_id,
         },
         "scene_prior_diagnostic_meta": {"grid_shape": [280, 280]},
     }
@@ -145,7 +153,23 @@ def test_registry_admits_explicit_pcf_as_active_bev_authority() -> None:
     assert record["grid_shape"] == [280, 280]
     assert record["snapshot_id"] == "sceneprior_living-room_exact"
     assert record["snapshot_content_sha256"] == _SNAPSHOT_DIGEST
+    assert record["calibration_fingerprint"] == _FINGERPRINT
+    assert record["world_frame"] == "backend_world_m"
+    assert record["world_frame_revision"] == "sceneprior_living-room_exact"
     assert registry.health_snapshot()["healthy"] is True
+
+
+def test_registry_rejects_mismatched_pcf_identity_tuple() -> None:
+    registry = ActiveFloorplanRegistry({"living-room": "living-room"})
+    payload = _pcf_payload()
+    payload["world_frame_revision"] = "sceneprior_other"
+
+    with pytest.raises(ActiveFloorplanError, match="identity tuple"):
+        registry.record_scene_prior(
+            "living-room",
+            payload,
+            calibration_fingerprint=_FINGERPRINT,
+        )
 
 
 def test_registry_rejects_noncanonical_scene_prior_authority() -> None:

@@ -14,6 +14,8 @@ Status: native-host baseline, 2026-08-15.
    skill routing and repository pin overrides.
 6. [`../DS9_REBUILD_AND_SMOKE_GATES.md`](../DS9_REBUILD_AND_SMOKE_GATES.md):
    affected-artifact rebuild and smoke guidance.
+7. [`../../docs/performance_invariants.md`](../../docs/performance_invariants.md):
+   hot-path memory, callback, queue, pooling, capability, and measurement rules.
 
 ## Current product/model docs
 

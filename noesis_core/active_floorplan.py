@@ -570,6 +570,41 @@ class ActiveFloorplanRegistry:
             {"calibration_fingerprint": calibration_fingerprint},
             "calibration_fingerprint",
         )
+        snapshot_id = _required_text(payload.get("snapshot_id"), "snapshot_id")
+        snapshot_content_sha256 = _sha256_field(
+            payload,
+            "snapshot_content_sha256",
+        )
+        payload_calibration = _sha256_field(payload, "calibration_fingerprint")
+        world_frame = _required_text(payload.get("world_frame"), "world_frame")
+        world_frame_revision = _required_text(
+            payload.get("world_frame_revision"),
+            "world_frame_revision",
+        )
+        frame_revision_valid = (
+            world_frame == "backend_world_m"
+            and (
+                world_frame_revision == prior_id
+                or (
+                    len(world_frame_revision) == 64
+                    and all(
+                        char in "0123456789abcdef"
+                        for char in world_frame_revision
+                    )
+                )
+            )
+        )
+        if (
+            snapshot_id != prior_id
+            or snapshot_content_sha256 != manifest_sha256
+            or payload_calibration != calibration_sha256
+            or not frame_revision_valid
+            or meta.get("source_frame") != world_frame
+            or meta.get("source_frame_revision") != world_frame_revision
+        ):
+            raise ActiveFloorplanError(
+                "scene-prior snapshot/calibration/frame identity tuple is inconsistent"
+            )
         diagnostic_meta = payload.get("scene_prior_diagnostic_meta")
         if not isinstance(diagnostic_meta, Mapping):
             raise ActiveFloorplanError("scene_prior_diagnostic_meta is required")
@@ -604,6 +639,8 @@ class ActiveFloorplanRegistry:
             "snapshot_id": prior_id,
             "snapshot_content_sha256": manifest_sha256,
             "calibration_fingerprint": calibration_sha256,
+            "world_frame": world_frame,
+            "world_frame_revision": world_frame_revision,
         }
         record: dict[str, Any] = {
             "camera_id": canonical,
@@ -623,6 +660,8 @@ class ActiveFloorplanRegistry:
             "snapshot_ref": snapshot_ref,
             "snapshot_id": prior_id,
             "snapshot_content_sha256": manifest_sha256,
+            "world_frame": world_frame,
+            "world_frame_revision": world_frame_revision,
             "snapshot_identity": snapshot_identity,
             "source": "active_floorplan",
             "authority_kind": "scene_prior_pcf",

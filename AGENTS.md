@@ -75,6 +75,38 @@ user approval. A canonical-path failure must be surfaced and fixed or reported.
 - Changes to native metadata plumbing require rebuilding only the affected
   binary and exercising its direct metadata consumer.
 
+## Hot-path and performance invariants
+
+The accepted runtime behavior is defined in
+`docs/performance_invariants.md`. Preserve it for pipeline, native bridge,
+tracking, identity, telemetry, persistence, dashboard, and media changes.
+
+- The always-on media path must not wait for optional depth, evidence,
+  persistence, reconstruction, external integration, or display work. Such
+  work uses finite queues/workers and degrades its own freshness when full.
+- Canonical `tracking`, `world_snapshot`, `world_event`, and `bev-frame`
+  publications are the exception to latest-only handling: they remain one
+  exact ordered cohort and may not be silently dropped, coalesced, or joined
+  by last-seen state.
+- Do not perform filesystem/database/network writes, process-wide CUDA
+  synchronization, cold model/backend initialization, or unbounded waits in an
+  always-on frame callback. A documented SDK-lifetime copy on an isolated,
+  request-gated capture branch is allowed only when it is bounded and measured.
+- Reuse bounded pools for device buffers, CUDA streams/events, pinned host
+  memory, and scratch state. Extract a native tensor or surface once per frame
+  and share the compact result instead of repeating conversion or copies.
+- Put explicit limits on work amplified by frames, detections, tracks, cameras,
+  clients, or retained evidence. Validate occupied scenes, not only empty-room
+  throughput.
+- Preserve selected models, input resolution, inference cadence, tracking
+  quality, and enabled outputs before considering any quality/throughput
+  tradeoff. Reducing capability requires explicit user approval and matched
+  quality evidence.
+- A zero-copy or performance claim requires end-to-end measurement of the
+  native consumer and direct media path. Config flags or dashboard FPS alone
+  are not proof; measure per-source progress, encoded access-unit cadence and
+  drops, and WebRTC decoded frames separately.
+
 ## Development and validation fast path
 
 Ordinary work uses direct application validation:

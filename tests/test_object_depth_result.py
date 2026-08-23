@@ -32,6 +32,14 @@ def test_object_depth_result_roundtrip() -> None:
         anchor_depth_m=1.25,
         anchor_sample_count=72,
         anchor_valid_fraction=0.91,
+        evidence_quality="good",
+        evidence_reason="pose_ankle_support",
+        depth_spread_m=0.22,
+        anchor_depth_spread_m=0.12,
+        measurement_frame_id=14,
+        measurement_ts_us=123456000,
+        measurement_age_us=789,
+        measurement_cached=True,
         world_point=(1.0, 0.0, 3.5),
         world_point_depth=(1.1, 0.2, 3.6),
         world_point_floor=(1.0, 0.0, 3.4),
@@ -55,6 +63,12 @@ def test_object_depth_result_roundtrip() -> None:
     assert as_dict["anchor_uv"] == [25.0, 57.5]
     assert as_dict["anchor_sample_count"] == 72
     assert as_dict["anchor_valid_fraction"] == 0.91
+    assert as_dict["evidence_quality"] == "good"
+    assert as_dict["anchor_depth_spread_m"] == 0.12
+    assert as_dict["measurement_frame_id"] == 14
+    assert as_dict["measurement_ts_us"] == 123456000
+    assert as_dict["measurement_age_us"] == 789
+    assert as_dict["measurement_cached"] is True
     assert as_dict["world_point"] == [1.0, 0.0, 3.5]
 
 

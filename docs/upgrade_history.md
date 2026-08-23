@@ -3,6 +3,56 @@
 This is the concise operational record of major runtime and behavior changes.
 Detailed work orders, evidence, and superseded diagrams remain in the archives.
 
+## 2026-08-23 — Canonical Family Room ground tracking and dashboard mapping
+
+- Bound the raw Family camera calibration to the active leveled room revision
+  without modifying raw `E`; live floor rays now use the same floor/world basis
+  as the Scene Prior.
+- Removed the dashboard BEV's independent registered-depth/floor-ray position
+  selection and second smoothing pass. Live dots are exact transforms of the
+  canonical filtered world point.
+- Replaced seated hip-floor projection with observed ankle/person support and
+  made furniture-contaminated or bbox-only depth fail closed as position
+  evidence while retaining diagnostics and original measurement age.
+- Bound frontend ingestion to exact tracking cohorts and exact floorplan
+  snapshot/content/calibration identity, clearing dots on errors, mismatches,
+  or transport loss.
+- Renamed the OSD optical-range fragment from `z=` to `depth=`.
+
+## 2026-08-23 — Occupied tracking performance recovery
+
+- Codified the recovered behavior as canonical hot-path invariants for future
+  pipeline/native work: GPU/NVMM ownership, nonblocking bounded optional work,
+  exact ordered publication cohorts, pooled reuse, occupancy-amplification
+  limits, capability preservation, and separate source/encode/WebRTC proof.
+- Moved the 3840x720 OSD surface to GPU mode, eliminating one full-frame
+  device-to-host and host-to-device transfer per mosaic frame.
+- Made the secondary DAv2 branch latest-frame-only and readiness-query-only;
+  aligned frames use bounded reusable device storage, while compact ROI
+  readbacks use private CUDA streams and pinned host buffers.
+- Moved identity evidence and gallery autosaves off the media callback and
+  prewarmed the production StableID CUDA similarity shape at startup.
+- Set explicit eight-surface streammux and tiler pools so short bounded
+  metadata work cannot exhaust the SDK defaults.
+- Replaced the world journal's per-publication 10,000-row retention scan with
+  direct sequence-boundary pruning and indexed age-boundary lookup while
+  preserving its hash chain, bounded retention, WAL, and full durability.
+- Made the live object-depth rendezvous nonblocking by default; already-ready
+  exact frames and bounded prior frames retain their existing provenance and
+  an explicit diagnostic wait remains available.
+- Increased only the Family Room RTSP jitter buffer from 100 ms to 250 ms after
+  a matched live ingest test measured a 197.9 ms Family gap at 100 ms and no
+  gaps above 100 ms at 250 ms; Living Room and Kitchen remain at 100 ms.
+- In a 45-second occupied live run with up to three Family Room tracks, all
+  sources finished at 29.6–29.8 FPS and the encoded mosaic sustained 30.79 FPS.
+  Its largest AU gap was 112.6 ms, with no gap above 200 ms, no source stall,
+  no slow-peer AU drop, no pipeline error, and zero CPU-copy violations.
+  Tracking publication fell from about 19.9 ms to 6.0 ms average.
+- A full three-room replay with the 82.7-second Family Room motion clip then
+  sustained 30.10 FPS. Encoded-AU p99 was 80 ms, the maximum gap was 144 ms,
+  no gap exceeded 150 or 250 ms, all sources remained healthy at about 30 FPS,
+  and WebRTC decoded 908 frames in 30 seconds without an error.
+
 ## 2026-08-19 — Kitchen/Family MV3DT promoted to explicit opt-in
 
 - Replaced the rejected room transform with independent Kitchen and Family

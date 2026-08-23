@@ -296,6 +296,21 @@ class StableIDManager:
         self.gallery_autosave_interval_s = float(gallery_autosave_interval_s)
         self._gallery_last_save_ts = 0.0
         self._gallery_loaded_sids = 0
+        # Autosave persistence must never make the frame callback wait for
+        # compression or filesystem I/O. The callback snapshots the small
+        # in-memory gallery under ``_lock``; a bounded daemon writer performs
+        # the atomic file replacement independently. Explicit ``save_gallery``
+        # calls (including shutdown) remain synchronous.
+        self._gallery_autosave_lock = threading.Lock()
+        self._gallery_autosave_thread: Optional[threading.Thread] = None
+        self._gallery_file_write_lock = threading.Lock()
+        # Snapshot order is independent of filesystem-lock acquisition order.
+        # An explicit save can therefore win the file lock before an older
+        # autosave writer and prevent that older snapshot from regressing the
+        # durable gallery.
+        self._gallery_save_order_lock = threading.Lock()
+        self._gallery_save_generation = 0
+        self._gallery_last_written_generation = 0
         self.pose_enabled = bool(pose_enabled)
         self.pose_weight = float(pose_weight)
         self.pose_sim_threshold = float(pose_sim_threshold)
@@ -515,6 +530,31 @@ class StableIDManager:
         self._torch_device = dev
         self._backend_mode = "gpu"
         self._gpu_enabled = True
+        # Force the first production-shaped similarity kernel and device-host
+        # synchronization during startup. Without this, Torch/CUDA lazy
+        # initialization lands inside the first frame that reaches a gallery
+        # match (observed as a one-time ~200 ms StableID callback tail).
+        try:
+            with torch.no_grad():
+                warm_query = torch.as_tensor(
+                    np.zeros((256,), dtype=np.float32),
+                    device=dev,
+                )
+                warm_gallery = torch.as_tensor(
+                    np.zeros((256, 256), dtype=np.float32),
+                    device=dev,
+                )
+                warm_query = warm_query / (torch.norm(warm_query) + 1e-12)
+                warm_gallery = warm_gallery / (
+                    torch.linalg.norm(warm_gallery, dim=1, keepdim=True) + 1e-12
+                )
+                torch.matmul(warm_gallery, warm_query).detach().cpu().numpy()
+        except Exception as exc:
+            self._backend_last_error = f"gpu_warmup:{type(exc).__name__}"
+            if strict_gpu:
+                raise RuntimeError(
+                    f"StableID GPU similarity warmup failed: {type(exc).__name__}"
+                ) from exc
 
     def _record_match_latency(self, start_ns: int) -> None:
         try:
@@ -1549,12 +1589,19 @@ class StableIDManager:
         except Exception:
             logger.warning("StableID gallery load failed (%s); starting with empty memory", path, exc_info=True)
 
-    def save_gallery(self) -> bool:
-        """Persist the identity gallery for long-term ReID memory. Thread-safe."""
+    def save_gallery(self, *, save_registry: bool = True) -> bool:
+        """Persist the identity gallery for long-term ReID memory.
+
+        Gallery compression and replacement are performed outside ``_lock``.
+        ``save_registry`` is disabled for periodic autosaves so their worker
+        never performs resident-registry I/O on behalf of the media path;
+        explicit and shutdown saves retain the registry update behavior.
+        """
         path = self.gallery_persist_file
         if not path:
             return False
         try:
+            registry_changed = False
             with self._lock:
                 now = time.time()
                 arrays: Dict[str, np.ndarray] = {}
@@ -1589,14 +1636,40 @@ class StableIDManager:
                         if int(resident.embedding_count) != actual_count:
                             resident.embedding_count = actual_count
                             registry_changed = True
-                    if registry_changed:
-                        self._resident_registry.save()
+                    # The registry write is intentionally deferred until after
+                    # the manager lock is released below. Autosave workers pass
+                    # save_registry=False and leave this small metadata update
+                    # in memory for the next explicit/shutdown save.
+            with self._gallery_save_order_lock:
+                self._gallery_save_generation += 1
+                save_generation = int(self._gallery_save_generation)
+            if registry_changed and save_registry and self._resident_registry is not None:
+                self._resident_registry.save()
             dir_path = os.path.dirname(path)
             if dir_path:
                 if self.household_mode:
                     ensure_private_directory(dir_path)
                 else:
                     os.makedirs(dir_path, exist_ok=True)
+            return self._write_gallery_snapshot(path, arrays, save_generation)
+        except Exception:
+            logger.warning("StableID gallery save failed (%s)", path, exc_info=True)
+            return False
+
+    def _write_gallery_snapshot(
+        self,
+        path: str,
+        arrays: Mapping[str, np.ndarray],
+        save_generation: int,
+    ) -> bool:
+        """Atomically write one ordered snapshot without taking ``_lock``."""
+        # Explicit saves and background autosaves share one temp path; the
+        # generation check prevents an older snapshot from overwriting a newer
+        # one if filesystem-lock acquisition happens out of order.
+        with self._gallery_file_write_lock:
+            with self._gallery_save_order_lock:
+                if int(save_generation) < int(self._gallery_last_written_generation):
+                    return True
             tmp_path = f"{path}.tmp"
             if self.household_mode:
                 fd = os.open(tmp_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, PRIVATE_FILE_MODE)
@@ -1609,10 +1682,19 @@ class StableIDManager:
             os.replace(tmp_path, path)
             if self.household_mode:
                 os.chmod(path, PRIVATE_FILE_MODE)
-            return True
-        except Exception:
-            logger.warning("StableID gallery save failed (%s)", path, exc_info=True)
-            return False
+            with self._gallery_save_order_lock:
+                self._gallery_last_written_generation = max(
+                    int(self._gallery_last_written_generation),
+                    int(save_generation),
+                )
+        return True
+
+    def _autosave_gallery_worker(self) -> None:
+        try:
+            self.save_gallery(save_registry=False)
+        finally:
+            with self._gallery_autosave_lock:
+                self._gallery_autosave_thread = None
 
     def _maybe_autosave_gallery(self, now_ts: float) -> None:
         if not self.gallery_persist_file or self.gallery_autosave_interval_s <= 0.0:
@@ -1620,7 +1702,19 @@ class StableIDManager:
         if (float(now_ts) - float(self._gallery_last_save_ts)) < self.gallery_autosave_interval_s:
             return
         self._gallery_last_save_ts = float(now_ts)
-        self.save_gallery()
+        # A single in-flight writer is enough: later due points do not create
+        # unbounded persistence work or block the media callback.
+        with self._gallery_autosave_lock:
+            thread = self._gallery_autosave_thread
+            if thread is not None and thread.is_alive():
+                return
+            thread = threading.Thread(
+                target=self._autosave_gallery_worker,
+                name="StableIDGalleryAutosave",
+                daemon=True,
+            )
+            self._gallery_autosave_thread = thread
+            thread.start()
 
     def _gallery_add(self, sid: int, ts: float, emb: np.ndarray) -> None:
         """Add an embedding to a SID's gallery, preserving exemplar diversity."""

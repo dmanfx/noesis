@@ -29,6 +29,9 @@ streammux:
   batch-size: 3
   live-source: 1
   batched-push-timeout: 40000
+  # Eight output surfaces absorb bounded telemetry/ROI timing spikes without
+  # starving the mux's output pool (the DeepStream default is only four).
+  buffer-pool-size: 8
   enable-padding: 1
   nvbuf-memory-type: 0
   sync-inputs: 0
@@ -80,7 +83,10 @@ sources:
     uri_secret: family-room
     gpu-id: 0
     cudadec-memtype: 0
-    latency: 100
+    # This camera has measured RTSP jitter bursts near 200 ms. Keep the
+    # jitter-buffer drop policy bounded while absorbing those bursts instead
+    # of presenting a frozen tile followed by a position jump.
+    latency: 250
     select-rtp-protocol: 4
     disable-audio: true
     dewarper:
@@ -214,7 +220,7 @@ bev:
     reset_after_s: 1.25
 
 osd:
-  process-mode: 0
+  process-mode: 1
   display-mask: 1
   display-bbox: 0
   display-text: 1

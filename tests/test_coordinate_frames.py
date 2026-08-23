@@ -4,9 +4,14 @@ import numpy as np
 import pytest
 
 from noesis_core.coordinate_frames import (
+    BACKEND_WORLD_FRAME_ID,
     CoordinateFrameError,
+    MetricFloorPlane,
+    RevisionedFrame,
+    RevisionedFrameTransform,
     camera_ground_frame_from_camera_to_world,
     camera_local_raster_indices,
+    revisioned_transform_sha256,
     transform_positions,
 )
 
@@ -65,3 +70,38 @@ def test_camera_ground_frame_rejects_improper_metric_pose() -> None:
     reflected[0, 0] = -1.0
     with pytest.raises(CoordinateFrameError, match="proper"):
         camera_ground_frame_from_camera_to_world(reflected)
+
+
+def test_revisioned_transform_fails_closed_on_digest_and_floor_mismatch() -> None:
+    source = RevisionedFrame(BACKEND_WORLD_FRAME_ID, "a" * 64)
+    target = RevisionedFrame(BACKEND_WORLD_FRAME_ID, "sceneprior_room_exact")
+    identity = tuple(float(value) for value in np.eye(4).flatten(order="F"))
+    source_floor = MetricFloorPlane(source, (0.0, 1.0, 0.0), 0.0)
+    target_floor = MetricFloorPlane(target, (0.0, 1.0, 0.0), 0.0)
+
+    with pytest.raises(CoordinateFrameError, match="digest does not match"):
+        RevisionedFrameTransform(
+            source_frame=source,
+            target_frame=target,
+            target_from_source_col_major=identity,
+            transform_sha256="0" * 64,
+            source_floor_plane=source_floor,
+            target_floor_plane=target_floor,
+        )
+
+    translated = np.eye(4, dtype=np.float64)
+    translated[1, 3] = 0.5
+    translated_values = tuple(float(value) for value in translated.flatten(order="F"))
+    with pytest.raises(CoordinateFrameError, match="floor offset"):
+        RevisionedFrameTransform(
+            source_frame=source,
+            target_frame=target,
+            target_from_source_col_major=translated_values,
+            transform_sha256=revisioned_transform_sha256(
+                source,
+                target,
+                translated_values,
+            ),
+            source_floor_plane=source_floor,
+            target_floor_plane=target_floor,
+        )

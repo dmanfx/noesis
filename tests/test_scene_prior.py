@@ -721,10 +721,14 @@ def test_scene_prior_preview_frame_composes_floor_corrected_camera_pose() -> Non
             "camera_calibration_bytes": b"camera-calibration",
             "target_revision_metadata": {
                 "schema": "target.v1",
+                "revision_id": "vt_camera-a_exact",
                 "floor_alignment": {
                     "world_correction_col_major": world_correction.flatten(
                         order="F"
                     ).tolist(),
+                    "source_floor_normal": [0.0, 1.0, 0.0],
+                    "source_floor_offset": 2.0,
+                    "target_floor_y": 0.0,
                 },
             },
             "target_revision_metadata_bytes": b"target-metadata",
@@ -734,3 +738,5 @@ def test_scene_prior_preview_frame_composes_floor_corrected_camera_pose() -> Non
     np.testing.assert_allclose(frame.camera_position_world_m, (3, 2, 4))
     np.testing.assert_allclose(frame.camera_right_world_xz, (0, -1), atol=1e-12)
     np.testing.assert_allclose(frame.camera_forward_world_xz, (1, 0), atol=1e-12)
+    assert frame.target_revision_id == "vt_camera-a_exact"
+    assert frame.source_floor_offset_m == pytest.approx(2.0)

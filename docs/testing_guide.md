@@ -106,9 +106,31 @@ test. Use WebRTC for media validation.
 Performance work starts with the `deepstream-profile-pipeline` skill and uses
 matched cameras/files, configs, model realization, warm-up, and duration. For a
 localized regression, collect only enough time to distinguish the change from
-normal variance and report per-camera FPS, aggregate FPS, CPU, GPU, VRAM, and
-pipeline errors. A single resource snapshot is adequate for changes that do not
-claim optimization.
+normal variance.
+
+Do not improve a performance number by silently reducing the model, input
+resolution, inference interval, tracker quality, depth/pose cadence, or enabled
+outputs. Hold those capabilities fixed unless the user explicitly requests a
+quality/throughput comparison.
+
+Measure the affected layers independently:
+
+1. per-camera decoded/dewarped FPS, progress age, stalls, and recoveries;
+2. affected callback/stage latency, including occupied-scene tail values;
+3. encoded H.264 access-unit FPS, gap percentiles/maxima, and feeder/queue drops;
+4. authenticated WebRTC decoded frames; and
+5. the affected perception outputs and canonical world/BEV behavior.
+
+The dashboard's combined receiver FPS, an open port, or a single utilization
+snapshot is not proof of source or encoded cadence. Use a motion/occupancy-heavy
+recorded sample and, when practical, a bounded live multi-person check. Visual
+review confirms macroblocking/corruption; numeric source, encoded, and decoded
+measurements establish stalls and drops.
+
+A single resource snapshot remains adequate for changes that do not claim an
+optimization. The full constraints and accepted reference are in
+[`performance_invariants.md`](performance_invariants.md) and
+[`runtime_baseline.md`](runtime_baseline.md).
 
 Current practical references are recorded in `runtime_baseline.md`.
 

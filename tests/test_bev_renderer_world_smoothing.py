@@ -522,13 +522,19 @@ def test_camera_local_bev_prefers_depth_fused_world_for_display() -> None:
     assert math.isclose(point["y"], 3.59, abs_tol=1e-3)
 
 
-def test_camera_local_bev_reports_live_fused_world_candidate_when_registered_depth_wins(monkeypatch) -> None:
+def test_camera_local_bev_keeps_depth_diagnostic_when_canonical_world_wins(monkeypatch) -> None:
     monkeypatch.setenv("NOESIS_BEV_ALIGNMENT_DEBUG", "1")
     ws = _FakeWs()
     renderer = BevRenderer(
         ws,
         trails_cfg={"enabled": False},
-        smoothing_cfg={"enabled": False},
+        smoothing_cfg={
+            "enabled": True,
+            "max_speed_mps": 0.0,
+            "max_jump_m": 0.05,
+            "alpha": 0.1,
+            "beta": 0.0,
+        },
         frame="camera_local_ground_m",
     )
     renderer.h_cache.get = lambda *args, **kwargs: np.array(  # type: ignore[method-assign]
@@ -576,6 +582,7 @@ def test_camera_local_bev_reports_live_fused_world_candidate_when_registered_dep
                 depth_m=6.0,
                 depth_source="depth_registered_m",
                 anchor_source="pose_depth_fused",
+                canonical_world_required=True,
             )
         ],
         timestamp_us=1_000_000,
@@ -584,13 +591,117 @@ def test_camera_local_bev_reports_live_fused_world_candidate_when_registered_dep
     payload = ws.messages[-1]
     point = payload["footpoints"][0]
 
-    assert point["displaySource"] == "registered_depth_anchor"
-    assert math.isclose(point["x"], 0.6, abs_tol=1e-3)
-    assert math.isclose(point["y"], 6.0, abs_tol=1e-3)
+    assert point["displaySource"] == "world_to_camera_local"
+    assert math.isclose(point["x"], 0.4, abs_tol=1e-3)
+    assert math.isclose(point["y"], 3.59, abs_tol=1e-3)
     selection = point["alignmentDebug"]["displaySelection"]
-    assert selection["selected"] == "registered_depth_anchor"
+    assert selection["selected"] == "world_to_camera_local"
+    assert selection["reason"] == "canonical_live_world_only"
     assert selection["registeredDepthCandidate"]["depthSource"] == "depth_registered_m"
     assert selection["worldCandidate"]["insideBounds"] is True
+
+    renderer.render_and_publish(
+        "cam0",
+        calib,
+        footpoints=[
+            Footpoint(
+                u=740.0,
+                v=760.0,
+                method="image_foot",
+                stable_id=7,
+                tracker_id=101,
+                world_x=1.4,
+                world_z=3.59,
+                depth_m=6.0,
+                depth_source="depth_registered_m",
+                anchor_source="pose_depth_fused",
+                canonical_world_required=True,
+            )
+        ],
+        timestamp_us=1_100_000,
+    )
+    second_payload = ws.messages[-1]
+    second = second_payload["footpoints"][0]
+    second_world = second["alignmentDebug"]["displaySelection"]["worldCandidate"]
+    assert math.isclose(second["x"], second_world["x"], abs_tol=1e-9)
+    assert math.isclose(second["y"], second_world["z"], abs_tol=1e-9)
+    assert second_payload["bev_points_smoothed"] is False
+
+
+def test_camera_local_bev_drops_canonical_track_without_valid_world() -> None:
+    ws = _FakeWs()
+    renderer = BevRenderer(
+        ws,
+        trails_cfg={"enabled": False},
+        smoothing_cfg={"enabled": False},
+        frame="camera_local_ground_m",
+    )
+    renderer.config_per_cam["cam0"] = renderer.config_per_cam.get("cam0") or renderer.set_overlay("cam0", True)
+    renderer.config_per_cam["cam0"].auto_fit_extents = False
+
+    renderer.render_and_publish(
+        "cam0",
+        _floor_camera_calibration(),
+        footpoints=[
+            Footpoint(
+                u=740.0,
+                v=626.0,
+                method="image_foot",
+                stable_id=7,
+                tracker_id=101,
+                depth_m=6.0,
+                depth_source="depth_registered_m",
+                canonical_world_required=True,
+            )
+        ],
+        timestamp_us=1_000_000,
+    )
+
+    assert ws.messages[-1]["footpoints"] == []
+
+
+def test_camera_local_bev_rejects_mismatched_canonical_world_revision(monkeypatch) -> None:
+    monkeypatch.setenv("NOESIS_BEV_ALIGNMENT_DEBUG", "1")
+    ws = _FakeWs()
+    renderer = BevRenderer(
+        ws,
+        trails_cfg={"enabled": False},
+        smoothing_cfg={"enabled": False},
+        frame="camera_local_ground_m",
+    )
+    renderer.config_per_cam["cam0"] = renderer.config_per_cam.get("cam0") or renderer.set_overlay("cam0", True)
+    renderer.config_per_cam["cam0"].auto_fit_extents = False
+    base = _floor_camera_calibration()
+    calib = SimpleNamespace(
+        **base.__dict__,
+        world_frame_id="backend_world_m",
+        world_frame_revision="active-revision",
+        frame_transform_sha256="a" * 64,
+    )
+
+    renderer.render_and_publish(
+        "cam0",
+        calib,
+        footpoints=[
+            Footpoint(
+                u=740.0,
+                v=626.0,
+                method="image_foot",
+                stable_id=7,
+                tracker_id=101,
+                world_x=0.4,
+                world_z=3.59,
+                canonical_world_required=True,
+                world_frame="backend_world_m",
+                world_frame_revision="stale-revision",
+            )
+        ],
+        timestamp_us=1_000_000,
+    )
+
+    payload = ws.messages[-1]
+    assert payload["footpoints"] == []
+    assert payload["droppedFootpoints"][0]["reason"] == "canonical_world_revision_mismatch"
 
 
 def test_camera_local_bev_prefers_depth_fused_world_when_it_disagrees_with_floor_contact_ray() -> None:

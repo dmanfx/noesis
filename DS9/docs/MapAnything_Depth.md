@@ -89,6 +89,11 @@ copy duration plus bytes are recorded under
 the bounded asynchronous postprocess queue, so alignment, masking, storage,
 and publication do not run on the Service Maker operator.
 
+This is the sole documented callback-copy exception in the canonical graph. It
+is justified by NVIDIA metadata lifetime, is request-gated and measured, and
+must not be generalized into full-frame host staging or blocking work on an
+always-on branch. See `../../docs/performance_invariants.md`.
+
 The worker is a runtime-owned non-daemon resource. Shutdown first drains
 external REST/WebSocket providers and stops WebSocket publication, then closes
 depth admission and proves pipeline EOS/wait so no probe can enter. Worker

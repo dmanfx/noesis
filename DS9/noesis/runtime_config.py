@@ -71,8 +71,8 @@ def mask_output_available(ini_props: Mapping[str, Any]) -> bool:
 
 def derive_osd_policy_from_ini(ini_props: Mapping[str, Any]) -> Dict[str, int]:
     if mask_output_available(ini_props):
-        return {"process-mode": 0, "display-mask": 1, "display-bbox": 1, "display-text": 1}
-    return {"process-mode": 0, "display-mask": 0, "display-bbox": 1, "display-text": 1}
+        return {"process-mode": 1, "display-mask": 1, "display-bbox": 1, "display-text": 1}
+    return {"process-mode": 1, "display-mask": 0, "display-bbox": 1, "display-text": 1}
 
 
 def apply_osd_from_pgie_ini(

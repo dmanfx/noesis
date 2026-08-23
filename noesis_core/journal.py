@@ -48,6 +48,43 @@ def _sha256(payload: Mapping[str, Any]) -> str:
     return hashlib.sha256(_canonical_bytes(payload)).hexdigest()
 
 
+def _record_sha256(
+    *,
+    sequence: int,
+    recorded_at_us: int,
+    payload_json: bytes,
+    previous_sha256: str,
+) -> str:
+    """Hash one journal core without serializing its payload a second time.
+
+    The journal core has a fixed, lexicographically sorted key order.  The
+    payload was already canonicalized for its SQLite column, so splice that
+    exact byte sequence into the equivalent canonical wrapper and encode only
+    the scalar hash field.  ``previous_sha256`` is deliberately JSON-encoded
+    rather than interpolated so malformed/corrupted state retains the same
+    escaping behavior as :func:`_canonical_bytes`.
+    """
+
+    previous_json = json.dumps(
+        str(previous_sha256),
+        separators=(",", ":"),
+        ensure_ascii=False,
+        allow_nan=False,
+    ).encode("utf-8")
+    encoded = (
+        b'{"payload":'
+        + payload_json
+        + b',"previous_sha256":'
+        + previous_json
+        + b',"recorded_at_us":'
+        + str(int(recorded_at_us)).encode("ascii")
+        + b',"sequence":'
+        + str(int(sequence)).encode("ascii")
+        + b"}"
+    )
+    return hashlib.sha256(encoded).hexdigest()
+
+
 def _normalized_schema_sql(value: str | None) -> str:
     return " ".join(str(value or "").split())
 
@@ -140,6 +177,10 @@ class ContractJournal:
         parent = self.path.parent.lstat()
         self._database_identity = (int(database.st_dev), int(database.st_ino))
         self._parent_identity = (int(parent.st_dev), int(parent.st_ino))
+        self._sidecar_path_cache = (
+            self.path.with_name(f"{self.path.name}-wal"),
+            self.path.with_name(f"{self.path.name}-shm"),
+        )
         self._sidecar_identities: dict[Path, tuple[int, int]] = {}
         try:
             self._initialize()
@@ -171,24 +212,33 @@ class ContractJournal:
         raise ContractJournalError("contract journal is closed")
 
     def _sidecar_paths(self) -> tuple[Path, Path]:
-        return (
-            self.path.with_name(f"{self.path.name}-wal"),
-            self.path.with_name(f"{self.path.name}-shm"),
-        )
+        return self._sidecar_path_cache
 
     def _validate_main_binding(self) -> None:
         """Require the configured path to name the exact opened database."""
 
         try:
-            validated = validate_private_file(self.path, label="contract journal")
+            validated = validate_private_file(
+                self.path,
+                label="contract journal",
+            )
+            # Re-stat after path-policy validation.  The first stat proves the
+            # named file was private; this second one is the binding receipt
+            # compared with the inode SQLite opened.  Reusing the validation
+            # stat would miss a rename/replacement performed between those two
+            # operations.
             database = validated.lstat()
             parent = validated.parent.lstat()
             if (
                 (int(database.st_dev), int(database.st_ino))
                 != self._database_identity
+                or not stat.S_ISREG(database.st_mode)
+                or database.st_uid != os.geteuid()
+                or stat.S_IMODE(database.st_mode) != 0o600
+                or database.st_nlink != 1
             ):
                 raise PrivatePathError(
-                    "contract journal database inode changed while open"
+                    "contract journal database inode changed or became unsafe while open"
                 )
             if (
                 (int(parent.st_dev), int(parent.st_ino)) != self._parent_identity
@@ -219,6 +269,16 @@ class ContractJournal:
                     label=f"contract journal sidecar {sidecar.name}",
                 )
                 info = validated_sidecar.lstat()
+                if (
+                    not stat.S_ISREG(info.st_mode)
+                    or info.st_uid != os.geteuid()
+                    or stat.S_IMODE(info.st_mode) != 0o600
+                    or info.st_nlink != 1
+                ):
+                    raise PrivatePathError(
+                        "contract journal sidecar changed or became unsafe while open: "
+                        f"{sidecar.name}"
+                    )
                 identity = (int(info.st_dev), int(info.st_ino))
                 expected = self._sidecar_identities.get(sidecar)
                 if bind_sidecars and expected is None:
@@ -704,28 +764,34 @@ class ContractJournal:
             connection.execute("BEGIN IMMEDIATE")
             try:
                 state = connection.execute(
-                    "SELECT next_sequence, anchor_previous_sha256 FROM journal_state WHERE singleton = 1"
+                    """
+                    SELECT next_sequence, anchor_previous_sha256,
+                           (SELECT record_sha256 FROM records
+                            ORDER BY sequence DESC LIMIT 1)
+                               AS last_record_sha256
+                    FROM journal_state WHERE singleton = 1
+                    """
                 ).fetchone()
                 if state is None:
                     raise ContractJournalError("contract journal state is missing")
                 sequence = int(state["next_sequence"])
                 append_start_sequence = sequence
-                last = connection.execute(
-                    "SELECT record_sha256 FROM records ORDER BY sequence DESC LIMIT 1"
-                ).fetchone()
                 previous = (
-                    str(last["record_sha256"])
-                    if last is not None
+                    str(state["last_record_sha256"])
+                    if state["last_record_sha256"] is not None
                     else str(state["anchor_previous_sha256"])
                 )
-                for payload, timestamp in validated:
-                    core = {
-                        "sequence": sequence,
-                        "recorded_at_us": timestamp,
-                        "payload": payload,
-                        "previous_sha256": previous,
-                    }
-                    record_sha = _sha256(core)
+                encoded_validated = [
+                    (payload, timestamp, _canonical_bytes(payload))
+                    for payload, timestamp in validated
+                ]
+                for payload, timestamp, payload_json in encoded_validated:
+                    record_sha = _record_sha256(
+                        sequence=sequence,
+                        recorded_at_us=timestamp,
+                        payload_json=payload_json,
+                        previous_sha256=previous,
+                    )
                     connection.execute(
                         """
                         INSERT INTO records(
@@ -737,7 +803,7 @@ class ContractJournal:
                             sequence,
                             timestamp,
                             str(payload["contract"]),
-                            _canonical_bytes(payload).decode("utf-8"),
+                            payload_json.decode("utf-8"),
                             previous,
                             record_sha,
                         ),
@@ -757,7 +823,11 @@ class ContractJournal:
                     "UPDATE journal_state SET next_sequence = ? WHERE singleton = 1",
                     (sequence,),
                 )
-                self._prune(connection, now_us=max(timestamp for _payload, timestamp in validated))
+                self._prune(
+                    connection,
+                    now_us=max(timestamp for _payload, timestamp in validated),
+                    last_sequence=sequence - 1,
+                )
                 retained = connection.execute(
                     """
                     SELECT COUNT(*) AS retained_count,
@@ -798,7 +868,13 @@ class ContractJournal:
                 raise
         return tuple(appended)
 
-    def _prune(self, connection: sqlite3.Connection, *, now_us: int) -> None:
+    def _prune(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        now_us: int,
+        last_sequence: int | None = None,
+    ) -> None:
         """Prune only a contiguous prefix so the retained hash chain stays valid.
 
         Capture/publication timestamps should normally be monotonic, but replay,
@@ -809,43 +885,29 @@ class ContractJournal:
         cutoff = int(now_us) - self.max_age_us
         delete_through: int | None = None
 
-        first_over_count = connection.execute(
-            """
-            SELECT sequence FROM records
-            ORDER BY sequence DESC LIMIT 1 OFFSET ?
-            """,
-            (self.max_records,),
-        ).fetchone()
-        if first_over_count is not None:
-            delete_through = int(first_over_count["sequence"])
-
-        first_fresh = connection.execute(
-            """
-            SELECT sequence FROM records
-            WHERE recorded_at_us >= ?
-            ORDER BY sequence ASC LIMIT 1
-            """,
-            (cutoff,),
-        ).fetchone()
-        if first_fresh is None:
+        if last_sequence is None:
             last = connection.execute(
                 "SELECT sequence FROM records ORDER BY sequence DESC LIMIT 1"
             ).fetchone()
-            age_delete_through = int(last["sequence"]) if last is not None else None
-        else:
-            previous = connection.execute(
-                """
-                SELECT sequence FROM records
-                WHERE sequence < ?
-                ORDER BY sequence DESC LIMIT 1
-                """,
-                (int(first_fresh["sequence"]),),
-            ).fetchone()
-            age_delete_through = (
-                int(previous["sequence"]) if previous is not None else None
+            observed_last_sequence = (
+                int(last["sequence"]) if last is not None else None
             )
+        else:
+            observed_last_sequence = int(last_sequence)
+        if observed_last_sequence is not None:
+            # Retained records are always one contiguous sequence range.  The
+            # previous OFFSET query walked that whole range on every append;
+            # derive the same boundary directly from its final sequence.
+            delete_through = observed_last_sequence - self.max_records
+
+        age_delete_through = self._age_delete_through(
+            connection,
+            cutoff=cutoff,
+            observed_last_sequence=observed_last_sequence,
+        )
         if age_delete_through is not None:
-            delete_through = max(delete_through or age_delete_through, age_delete_through)
+            if delete_through is None or age_delete_through > delete_through:
+                delete_through = age_delete_through
         if delete_through is None:
             return
 
@@ -863,6 +925,74 @@ class ContractJournal:
             "UPDATE journal_state SET anchor_previous_sha256 = ? WHERE singleton = 1",
             (str(last_deleted["record_sha256"]),),
         )
+
+    @staticmethod
+    def _age_delete_through(
+        connection: sqlite3.Connection,
+        *,
+        cutoff: int,
+        observed_last_sequence: int | None,
+    ) -> int | None:
+        """Return the final sequence in the safely age-prunable prefix."""
+
+        oldest = connection.execute(
+            """
+            SELECT sequence, recorded_at_us FROM records
+            ORDER BY sequence ASC LIMIT 1
+            """
+        ).fetchone()
+        if oldest is None or int(oldest["recorded_at_us"]) >= int(cutoff):
+            return None
+
+        age_delete_through: int | None = None
+        if oldest is not None:
+            # A short sequence-prefix probe is cheapest when only a few rows
+            # have just crossed the age boundary.  After a long idle period,
+            # avoid walking the entire old prefix synchronously: find the
+            # earliest fresh sequence through the timestamp index instead.
+            prefix = connection.execute(
+                """
+                SELECT sequence, recorded_at_us FROM records
+                ORDER BY sequence ASC LIMIT 256
+                """
+            ).fetchall()
+            first_fresh_sequence = next(
+                (
+                    int(row["sequence"])
+                    for row in prefix
+                    if int(row["recorded_at_us"]) >= cutoff
+                ),
+                None,
+            )
+            if first_fresh_sequence is None and len(prefix) == 256:
+                indexed_first_fresh = connection.execute(
+                    """
+                    SELECT MIN(sequence) AS sequence
+                    FROM records INDEXED BY records_recorded_at
+                    WHERE recorded_at_us >= ?
+                    """,
+                    (cutoff,),
+                ).fetchone()
+                if (
+                    indexed_first_fresh is not None
+                    and indexed_first_fresh["sequence"] is not None
+                ):
+                    first_fresh_sequence = int(indexed_first_fresh["sequence"])
+            if first_fresh_sequence is None:
+                age_delete_through = observed_last_sequence
+            else:
+                previous = connection.execute(
+                    """
+                    SELECT sequence FROM records
+                    WHERE sequence < ?
+                    ORDER BY sequence DESC LIMIT 1
+                    """,
+                    (first_fresh_sequence,),
+                ).fetchone()
+                age_delete_through = (
+                    int(previous["sequence"]) if previous is not None else None
+                )
+        return age_delete_through
 
     def records(self) -> tuple[JournalRecord, ...]:
         with self._lock, self._connection() as connection:

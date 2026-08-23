@@ -684,6 +684,7 @@ IDENTITY_V2_PROJECTION_FIELDS = (
     "resident_uuid",
     "visitor_generation",
     "fresh_embedding",
+    "evidence_persistence",
 )
 IDENTITY_OBSERVATION_KEY_PROJECTION_FIELDS = (
     "run_id",
@@ -1203,19 +1204,36 @@ class SemanticObservationCollector:
                     raise ValueError("embedding_present must be boolean")
                 identity, identity_fresh = _identity_continuity(raw_track)
                 identity_key = raw_track.get("identity_observation_key")
+                identity_raw = raw_track.get("identity_v2")
+                evidence_persistence = (
+                    identity_raw.get("evidence_persistence")
+                    if isinstance(identity_raw, Mapping)
+                    else None
+                )
                 identity_observation_id: str | None = None
                 if track_provenance is None:
-                    if embedding_present is True:
-                        raise ValueError("embedding_present=true lacks persisted provenance")
-                    if identity_key is not None:
+                    if evidence_persistence not in {"queued", "dropped"}:
+                        if embedding_present is True:
+                            raise ValueError(
+                                "live embedding requires durable, queued, or dropped persistence state"
+                            )
+                        if identity_key is not None:
+                            raise ValueError(
+                                "identity_observation_key requires durable or explicit pending persistence"
+                            )
+                        if identity_fresh:
+                            raise ValueError(
+                                "identity_v2 fresh embedding lacks persistence state"
+                            )
+                    elif embedding_present is not True or identity_fresh is not True:
                         raise ValueError(
-                            "identity_observation_key requires persisted provenance"
-                        )
-                    if identity_fresh:
-                        raise ValueError(
-                            "identity_v2 fresh embedding lacks persisted provenance"
+                            "queued/dropped evidence requires live embedding_present and fresh_embedding"
                         )
                 else:
+                    if evidence_persistence not in {None, "durable"}:
+                        raise ValueError(
+                            "persisted provenance cannot use queued or dropped persistence state"
+                        )
                     if embedding_present is not True:
                         raise ValueError(
                             "persisted provenance requires embedding_present=true"
@@ -1224,6 +1242,11 @@ class SemanticObservationCollector:
                         raise ValueError(
                             "persisted provenance requires a fresh identity_v2 decision"
                         )
+
+                if track_provenance is not None or evidence_persistence in {
+                    "queued",
+                    "dropped",
+                }:
                     if not isinstance(identity_key, Mapping):
                         raise ValueError("identity_observation_key is missing")
                     identity_run_id = str(identity_key.get("run_id") or "").strip()

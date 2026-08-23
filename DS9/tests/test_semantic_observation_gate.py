@@ -67,6 +67,7 @@ def _identity(
         "resident_uuid": resident_uuid,
         "visitor_generation": visitor_generation,
         "fresh_embedding": fresh_embedding,
+        "evidence_persistence": None,
     }
 
 
@@ -169,6 +170,7 @@ def _tracking_payload(
         else _identity(fresh_embedding=provenance)
     )
     identity_payload["fresh_embedding"] = provenance
+    identity_payload["evidence_persistence"] = "durable" if provenance else None
     observation_payload: dict[str, object] = {
         "tracklet": {
             "run_id": run_id,
@@ -735,6 +737,35 @@ def test_semantic_gate_rejects_partial_embedding_provenance_triad() -> None:
 
     assert any("partial embedding provenance" in error for error in collector.errors)
     assert report["ok"] is False
+
+
+@pytest.mark.parametrize("persistence", ("queued", "dropped"))
+def test_semantic_gate_accepts_live_embedding_with_explicit_pending_persistence(
+    persistence: str,
+) -> None:
+    payload = _tracking_payload(provenance=False)
+    track = payload["tracks"][0]
+    assert isinstance(track, dict)
+    track["embedding_present"] = True
+    track["identity_observation_key"] = {
+        "run_id": RUN_ID,
+        "camera_id": CAMERA_ID,
+        "tracker_id": str(TRACKER_ID),
+        "frame_id": 11,
+        "observation_id": "identity-observation-anchor",
+    }
+    identity = track["identity_v2"]
+    assert isinstance(identity, dict)
+    identity["fresh_embedding"] = True
+    identity["evidence_persistence"] = persistence
+
+    collector, _report = _evaluate(payload)
+
+    assert not any(
+        "requires persisted provenance" in error
+        or "lacks persisted provenance" in error
+        for error in collector.errors
+    )
 
 
 @pytest.mark.parametrize("surface", ("depth", "world"))

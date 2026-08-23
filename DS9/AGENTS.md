@@ -35,6 +35,34 @@ not valid implementation or validation paths.
 Do not create release candidates, selectors, state clones, bundles, promotion
 gates, or broad validation runs for ordinary DS9.1 work.
 
+## Hot-path invariants
+
+Read and preserve `../docs/performance_invariants.md` for any graph, callback,
+native bridge, telemetry, persistence, or media change.
+
+- The canonical core remains GPU/NVMM through GPU `nvdsosd` and NVENC. On the
+  installed DS9.1 stack `nvdsosd process-mode=1` is GPU mode; do not copy the
+  archived DS8 `process-mode=0` guidance.
+- Do not add full-frame host staging, `cudaDeviceSynchronize`, steady-state
+  per-frame CUDA allocation, or blocking I/O to an always-on operator/callback.
+- Keep the DAv2 secondary queue bounded and latest-frame-only, and keep its
+  CUDA readiness query-only. Optional work may lose freshness; it may not
+  back-pressure tracking, OSD, or encode.
+- Do not apply latest-only behavior to canonical tracking/world/BEV cohorts.
+  They retain exact order and revision identity through bounded admission.
+- Reuse device/pinned-host pools and private nonblocking streams/events. Share
+  one extraction/conversion among multiple consumers and bound work that grows
+  with detections, tracks, cameras, clients, or retained evidence.
+- `disable-output-host-copy=1` is not sufficient evidence for a zero-copy
+  claim. Inspect the native consumer and runtime counters for downstream copies
+  and synchronization.
+- Do not reduce model size, resolution, inference interval, tracker quality, or
+  enabled outputs as a performance fix unless the user explicitly accepts that
+  tradeoff after a matched comparison.
+- For hot-path changes, validate a motion/occupancy-heavy recorded input and a
+  bounded live run. Measure source progress, encoded-AU gaps/drops, and WebRTC
+  decode separately; do not use the dashboard's aggregate FPS as sole proof.
+
 ## Artifact and capability constraints
 
 - Engines: external root selected by `NOESIS_DS9_ARTIFACT_ROOT`; declarations

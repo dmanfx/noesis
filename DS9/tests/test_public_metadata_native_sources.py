@@ -168,15 +168,70 @@ def test_depth_tensor_uses_filtered_public_frame_iteration_and_typed_tensors() -
     assert '"output"' not in source
     assert "depth_hw(*entry.second)" not in source
     assert "unsigned int device_id_" in source
-    assert "aligned.release(), device_id" in source
-    assert source.count("CudaDeviceGuard device_guard(device_id_);") == 5
-    assert source.count("ensure_capacity(") == 6
-    assert source.count("ensure_capacity(sampled_count, device_id_)") == 3
-    assert source.count("ensure_capacity(mask_count, device_id_)") == 2
+    assert "std::move(aligned), frame_w, frame_h, depth_w, depth_h" in source
+    assert source.count("CudaDeviceGuard device_guard(device_id_);") >= 9
+    assert source.count("ensure_capacity(") >= 8
+    assert source.count("ensure_capacity(sampled_count, device_id)") == 3
+    assert source.count("ensure_capacity(mask_count, device_id)") == 2
     assert "allocate(count, device_id);" in source
     assert "device_id_ == static_cast<int>(device_id)" in source
     assert "CudaDeviceGuard device_guard(static_cast<unsigned int>(device_id_));" in source
+    assert "cudaEventSynchronize" in source
+    assert "bool is_ready() const" in source
+    assert "cudaEventQuery(ready_event_)" in source
+    assert '.def("is_ready", &AlignedDepthFrameDevice::is_ready' in source
+    assert "cudaDeviceSynchronize" not in source
+    assert "AlignedDepthFramePool" in source
+    assert "ensure_source_float" in source
+    assert "ensure_source_half" in source
     assert '.def_property_readonly("device_id"' in source
+    roi_sampler = source[
+        source.index("class CudaPinnedHostBuffer") :
+        source.index("int frame_width() const")
+    ]
+    assert "cudaHostAlloc" in roi_sampler
+    assert "cudaMemcpy2DAsync" in roi_sampler
+    assert "cudaMemcpyAsync" in roi_sampler
+    assert "cudaStreamCreateWithFlags(&stream_, cudaStreamNonBlocking)" in roi_sampler
+    assert "cudaStreamSynchronize(stream_)" in roi_sampler
+    assert "thread_local CudaRoiSamplerWorkspace roi_workspace" in roi_sampler
+
+
+def test_depth_tensor_alignment_is_bounded_async_and_gil_friendly() -> None:
+    source = DEPTH_TENSOR_SOURCE.read_text(encoding="utf-8")
+    alignment = source[
+        source.index("std::shared_ptr<AlignedDepthFrameDevice> align_depth_layer_to_frame") :
+        source.index("}  // namespace")
+    ]
+    pool = source[
+        source.index("class AlignedDepthFramePool") :
+        source.index("class AlignedDepthFrameDevice")
+    ]
+
+    assert "cudaStreamCreateWithFlags(&stream_, cudaStreamNonBlocking)" in source
+    assert "cudaEventDisableTiming | cudaEventBlockingSync" in source
+    assert "gstnvinfer.cpp:2675, 2772-2775" in source
+    assert "nvdsinfer_context_impl.cpp:2049-2061" in source
+    assert alignment.count("cudaMemcpyAsync(") == 2
+    assert "cudaMemcpy(" not in alignment
+    assert alignment.index("aligned->record_source_staged();") < alignment.index(
+        "nppiConvert_16f32f_C1R_Ctx("
+    )
+    ready_pos = alignment.index("aligned->record_ready();")
+    catch_pos = alignment.index("} catch (...)", ready_pos)
+    normal_source_wait_pos = alignment.rindex("wait_for_source_lifetime();")
+    assert ready_pos < catch_pos < normal_source_wait_pos
+    assert "kDepthFrameStoreCapacity = 24U" in source
+    assert "kDepthFrameInflightCapacity = 8U" in source
+    assert "kDepthFramePoolCapacity" in source
+    assert "std::lock_guard<std::mutex> lock(mutex_);" in pool
+    assert "thread_local AlignedDepthFramePool" not in source
+    assert "return std::make_shared<AlignedDepthFrameStorage>" not in pool
+    assert "Aligned depth frame pool exhausted" in pool
+    assert "exhaustions.fetch_add" in pool
+    assert "aligned_depth_frame_pool_health" in source
+    assert "aligned->wait_stream();" in alignment
+    assert source.count("py::gil_scoped_release release;") >= 7
 
 
 def test_depth_tensor_exposes_one_exact_mapanything_capture_contract() -> None:
